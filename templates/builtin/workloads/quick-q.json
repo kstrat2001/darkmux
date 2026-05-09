@@ -1,0 +1,12 @@
+{
+  "workload": {
+    "id": "quick-q",
+    "provider": "prompt",
+    "description": "Single-turn open-ended question. The simplest possible darkmux workload.",
+    "agent": "qa",
+    "prompt": "What is one observable difference between an MoE model with low active params and a dense model of the same total parameter count, when running on Apple Silicon via MLX? Answer in 2-3 sentences.",
+    "verify": {
+      "must_contain": ["active"]
+    }
+  }
+}

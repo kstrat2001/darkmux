@@ -1,0 +1,193 @@
+//! Resolves the active darkmux workspace directory.
+//!
+//!   1. ./.darkmux/         — project-local (preferred when present)
+//!   2. ~/.darkmux/         — cross-project user state (fallback)
+//!
+//! Lab runs, sandboxes, profiles, teams, and notebooks all live under one
+//! of these. Relative paths only — never absolute paths in any shipped
+//! manifest.
+
+use anyhow::{Context, Result};
+use std::env;
+use std::fs;
+use std::path::PathBuf;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    Project,
+    User,
+}
+
+#[derive(Debug, Clone)]
+pub struct DarkmuxPaths {
+    pub root: PathBuf,
+    pub runs: PathBuf,
+    pub sandboxes: PathBuf,
+    pub teams: PathBuf,
+    pub notebook: PathBuf,
+    pub profiles: PathBuf,
+    pub scope: Scope,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub enum ResolveScope {
+    #[default]
+    Auto,
+    ForceProject,
+    ForceUser,
+}
+
+pub fn resolve(scope: ResolveScope) -> DarkmuxPaths {
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let project_root = cwd.join(".darkmux");
+    let user_root = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".darkmux");
+
+    let (chosen, chosen_scope) = match scope {
+        ResolveScope::ForceProject => (project_root, Scope::Project),
+        ResolveScope::ForceUser => (user_root, Scope::User),
+        ResolveScope::Auto => {
+            if project_root.exists() {
+                (project_root, Scope::Project)
+            } else {
+                (user_root, Scope::User)
+            }
+        }
+    };
+
+    DarkmuxPaths {
+        runs: chosen.join("runs"),
+        sandboxes: chosen.join("sandboxes"),
+        teams: chosen.join("teams"),
+        notebook: chosen.join("notebook"),
+        profiles: chosen.join("profiles.yaml"),
+        scope: chosen_scope,
+        root: chosen,
+    }
+}
+
+pub fn ensure(paths: &DarkmuxPaths) -> Result<()> {
+    for p in [
+        &paths.root,
+        &paths.runs,
+        &paths.sandboxes,
+        &paths.teams,
+        &paths.notebook,
+    ] {
+        if !p.exists() {
+            fs::create_dir_all(p)
+                .with_context(|| format!("creating {}", p.display()))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[serial_test::serial]
+    #[test]
+    fn resolve_force_project_uses_cwd() {
+        let tmp = TempDir::new().unwrap();
+        let canonical_tmp = std::fs::canonicalize(tmp.path()).unwrap();
+        let prev = env::current_dir().unwrap();
+        env::set_current_dir(tmp.path()).unwrap();
+
+        let paths = resolve(ResolveScope::ForceProject);
+        assert_eq!(paths.scope, Scope::Project);
+        assert!(
+            paths.root.starts_with(&canonical_tmp) || paths.root.starts_with(tmp.path()),
+            "root {:?} doesn't start with tmp {:?} or canonical {:?}",
+            paths.root,
+            tmp.path(),
+            canonical_tmp
+        );
+        assert!(paths.root.ends_with(".darkmux"));
+
+        env::set_current_dir(prev).unwrap();
+    }
+
+    #[test]
+    fn resolve_force_user_uses_home() {
+        let paths = resolve(ResolveScope::ForceUser);
+        assert_eq!(paths.scope, Scope::User);
+        assert!(paths.root.ends_with(".darkmux"));
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn resolve_auto_prefers_project_when_present() {
+        let tmp = TempDir::new().unwrap();
+        let project_root = tmp.path().join(".darkmux");
+        fs::create_dir_all(&project_root).unwrap();
+        let canonical_tmp = std::fs::canonicalize(tmp.path()).unwrap();
+
+        let prev = env::current_dir().unwrap();
+        env::set_current_dir(tmp.path()).unwrap();
+
+        let paths = resolve(ResolveScope::Auto);
+        assert_eq!(paths.scope, Scope::Project);
+        assert!(
+            paths.root.starts_with(&canonical_tmp) || paths.root.starts_with(tmp.path()),
+            "root {:?} doesn't start with canonical tmp {:?}",
+            paths.root,
+            canonical_tmp
+        );
+
+        env::set_current_dir(prev).unwrap();
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn resolve_auto_falls_back_to_user_when_project_missing() {
+        let tmp = TempDir::new().unwrap();
+        // Crucially do NOT create .darkmux in tmp.
+        let prev = env::current_dir().unwrap();
+        env::set_current_dir(tmp.path()).unwrap();
+
+        let paths = resolve(ResolveScope::Auto);
+        assert_eq!(paths.scope, Scope::User);
+
+        env::set_current_dir(prev).unwrap();
+    }
+
+    #[test]
+    fn ensure_creates_all_subdirs() {
+        let tmp = TempDir::new().unwrap();
+        let paths = DarkmuxPaths {
+            root: tmp.path().join(".darkmux"),
+            runs: tmp.path().join(".darkmux/runs"),
+            sandboxes: tmp.path().join(".darkmux/sandboxes"),
+            teams: tmp.path().join(".darkmux/teams"),
+            notebook: tmp.path().join(".darkmux/notebook"),
+            profiles: tmp.path().join(".darkmux/profiles.yaml"),
+            scope: Scope::Project,
+        };
+        ensure(&paths).unwrap();
+        assert!(paths.root.exists());
+        assert!(paths.runs.exists());
+        assert!(paths.sandboxes.exists());
+        assert!(paths.teams.exists());
+        assert!(paths.notebook.exists());
+    }
+
+    #[test]
+    fn ensure_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let paths = DarkmuxPaths {
+            root: tmp.path().join(".darkmux"),
+            runs: tmp.path().join(".darkmux/runs"),
+            sandboxes: tmp.path().join(".darkmux/sandboxes"),
+            teams: tmp.path().join(".darkmux/teams"),
+            notebook: tmp.path().join(".darkmux/notebook"),
+            profiles: tmp.path().join(".darkmux/profiles.yaml"),
+            scope: Scope::Project,
+        };
+        ensure(&paths).unwrap();
+        ensure(&paths).unwrap(); // second call is a no-op
+        assert!(paths.runs.exists());
+    }
+}

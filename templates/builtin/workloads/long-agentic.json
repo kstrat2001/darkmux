@@ -1,0 +1,24 @@
+{
+  "_comment": "Long-agentic coding workload. The canonical Article 2 workload — multi-turn QA review of refresh-token rotation in a Node project. Expects an external sandbox; set DARKMUX_SANDBOX_LONG_AGENTIC=<path> to point at a Node project that has the expected service + test files. The ${SANDBOX_DIR} placeholder in the prompt is substituted with the resolved sandbox path at dispatch time.",
+
+  "workload": {
+    "id": "long-agentic",
+    "provider": "coding-task",
+    "agent": "qa",
+    "description": "Multi-turn QA review of a security-sensitive auth-rotation feature. Designed to exercise compaction at 30-50K tokens. Used as the headline workload for Article 2's bigctx vs v15.5 comparison.",
+    "prompt": "QA REVIEW REQUEST — refresh-token rotation feature\n\nA refresh-token rotation feature was recently merged. This is a security-sensitive surface — auth tokens, replay protection, persistent storage of secrets — and it needs adequate test coverage before deployment.\n\nWhat changed:\n\n- Refresh tokens are hashed at rest (SHA-256 + a per-environment pepper)\n- Rotation creates a new token, marks the predecessor revoked, and links the chain by hash\n- Replay detection: presenting an already-rotated token revokes the entire chain\n- Pessimistic-write DB lock during rotation\n- A boot-time guard that refuses to start in non-development environments if the dev placeholder pepper is still configured\n- Defensive parsing of expiry timestamps (NaN-safe, handles string and Date variations from the DB driver)\n\nThe implementation lives at:\n\n- ${SANDBOX_DIR}/src/services/refreshTokenService.ts\n- ${SANDBOX_DIR}/src/services/authenticationService.ts (consumes rotation)\n- ${SANDBOX_DIR}/src/services/userService.ts (consumes issuance on user creation)\n\nExisting tests:\n\n- ${SANDBOX_DIR}/tests/services/refreshTokenService.test.ts\n- ${SANDBOX_DIR}/tests/services/authenticationService.test.ts\n- ${SANDBOX_DIR}/tests/services/userService.test.ts\n\nSome coverage is already in place. Some isn't. Your job is to figure out the difference, decide what matters, and write the tests yourself.\n\n## Your task\n\nRead the implementation. Read the existing tests. Decide which behaviors of the change aren't covered and would matter to you in a real code review. Then write those tests — don't hand them back as a list of suggestions.\n\nTreat this as a real PR review where you have commit access: if you'd want a test to exist before approving, write it.\n\n## Constraints\n\n- Repo root: ${SANDBOX_DIR}. Use absolute paths.\n- Do not modify existing tests — only add new ones.\n- Do not modify source code under src/. Tests only.\n- Match the existing test file style. The mock infrastructure is already set up at the top of each test file — read those blocks first.\n- Iterate by running a single file at a time:\n  cd ${SANDBOX_DIR} && npm test -- tests/services/<file>.test.ts\n- Final verification:\n  cd ${SANDBOX_DIR} && npm test -- tests/services/refreshTokenService.test.ts tests/services/authenticationService.test.ts tests/services/userService.test.ts\n\n## When you're done\n\nYou're done when the tests you've added are sufficient for you to approve this PR. Quality over quantity. Stop when adding more tests would be padding rather than risk reduction.\n\nMost reviewers would land somewhere between 5 and 15 new test cases for a change of this surface area. If you're well outside that range in either direction, mention it in your reply.\n\n## Reply format\n\nKeep it tight:\n\n- Gaps you identified: behaviors that needed coverage, one-line rationale per gap\n- What you wrote: number of new tests, which files\n- What you decided NOT to test, and why: the negative space matters\n- Test result: the Tests: N passed line from your final run\n- Confidence: would you sign off on this PR after your additions?\n",
+
+    "verify": {
+      "command": "npm test -- tests/services/refreshTokenService.test.ts tests/services/authenticationService.test.ts tests/services/userService.test.ts",
+      "must_contain": [],
+      "must_not_contain": []
+    },
+
+    "expected": {
+      "fast_cluster_seconds": [197, 280],
+      "slow_cluster_seconds": [600, 950],
+      "slow_rate": 0.33,
+      "test_count_baseline": 77
+    }
+  }
+}
