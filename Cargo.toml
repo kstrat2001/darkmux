@@ -4,6 +4,7 @@ version = "0.2.0-dev"
 edition = "2021"
 description = "Lab and multiplexer for local LLM configurations"
 license = "MIT"
+homepage = "https://darkmux.com"
 repository = "https://github.com/kstrat2001/darkmux"
 authors = ["Kain Osterholt"]
 rust-version = "1.80"

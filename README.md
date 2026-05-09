@@ -1,6 +1,6 @@
 # darkmux
 
-**Task-class-aware multiplexer for local LLM configurations.**
+**[darkmux.com](https://darkmux.com) · Task-class-aware multiplexer for local LLM configurations.**
 
 Pick the right loaded model + context length + compaction profile for each task — automatically. Designed for agentic local-AI workflows on LMStudio (and Ollama / llama.cpp via the same OpenAI-compatible surface).
 

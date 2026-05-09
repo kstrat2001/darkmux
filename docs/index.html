@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>darkmux — task-class-aware multiplexer for local LLM configurations</title>
+<meta name="description" content="A Rust CLI for managing local LLM stacks on Apple Silicon. Profiles, swap, and a measurement lab — built on real benchmarks, not theoretical defaults.">
+<meta property="og:title" content="darkmux">
+<meta property="og:description" content="Task-class-aware multiplexer for local LLM configurations on Apple Silicon.">
+<meta property="og:url" content="https://darkmux.com">
+<meta property="og:type" content="website">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0a0a0b;
+    --bg-elev: #131316;
+    --border: #1f1f24;
+    --text: #e8e6e3;
+    --muted: #8a8a92;
+    --accent: #6df1ff;
+    --accent-dim: #2a8a96;
+    --warn: #ffb86b;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+    line-height: 1.55;
+    font-size: 16px;
+    -webkit-font-smoothing: antialiased;
+  }
+  code, pre, .mono { font-family: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; text-underline-offset: 3px; }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 0 24px; }
+
+  /* hero */
+  header {
+    padding: 96px 0 64px;
+    border-bottom: 1px solid var(--border);
+  }
+  .brand {
+    font-family: 'JetBrains Mono', monospace;
+    font-weight: 700;
+    font-size: 14px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 24px;
+  }
+  .brand .dot { color: var(--accent); }
+  h1 {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: clamp(48px, 9vw, 88px);
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    margin: 0 0 16px;
+    line-height: 1.0;
+  }
+  h1 .cursor {
+    display: inline-block;
+    width: 0.6ch;
+    margin-left: 0.1ch;
+    color: var(--accent);
+    animation: blink 1.1s steps(2,end) infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+  .tag {
+    font-size: 20px;
+    color: var(--text);
+    margin: 0 0 32px;
+    max-width: 580px;
+  }
+  .tag .accent { color: var(--accent); }
+
+  /* install block */
+  .install {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px 20px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 14px;
+    overflow-x: auto;
+    margin: 0 0 24px;
+    color: var(--text);
+  }
+  .install .prompt { color: var(--muted); user-select: none; }
+  .install .cmd { color: var(--accent); }
+
+  /* buttons */
+  .btns { display: flex; gap: 12px; flex-wrap: wrap; }
+  .btn {
+    display: inline-block;
+    padding: 10px 18px;
+    border-radius: 6px;
+    font-weight: 500;
+    font-size: 14px;
+    border: 1px solid var(--border);
+    transition: all 0.15s;
+  }
+  .btn-primary {
+    background: var(--accent);
+    color: var(--bg);
+    border-color: var(--accent);
+  }
+  .btn-primary:hover { background: #4ddfee; text-decoration: none; }
+  .btn-ghost {
+    background: transparent;
+    color: var(--text);
+  }
+  .btn-ghost:hover { border-color: var(--accent); color: var(--accent); text-decoration: none; }
+
+  /* sections */
+  section { padding: 64px 0; border-bottom: 1px solid var(--border); }
+  section:last-of-type { border-bottom: none; }
+  h2 {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 14px;
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    color: var(--accent);
+    font-weight: 500;
+    margin: 0 0 24px;
+  }
+  h3 {
+    font-size: 24px;
+    font-weight: 600;
+    margin: 0 0 12px;
+    letter-spacing: -0.01em;
+  }
+  p { margin: 0 0 16px; color: var(--text); }
+  p.muted { color: var(--muted); }
+  ul.plain {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+  }
+  ul.plain li {
+    padding: 14px 0;
+    border-top: 1px solid var(--border);
+  }
+  ul.plain li:last-child { border-bottom: 1px solid var(--border); }
+  ul.plain code {
+    color: var(--accent);
+    font-size: 13px;
+    background: var(--bg-elev);
+    padding: 2px 6px;
+    border-radius: 3px;
+  }
+
+  /* warn block (disclaimer pointer) */
+  .warn {
+    border-left: 3px solid var(--warn);
+    background: rgba(255, 184, 107, 0.06);
+    padding: 16px 20px;
+    border-radius: 0 6px 6px 0;
+    font-size: 14px;
+    color: var(--text);
+    margin: 24px 0 0;
+  }
+  .warn strong { color: var(--warn); }
+
+  /* footer */
+  footer {
+    padding: 48px 0 64px;
+    color: var(--muted);
+    font-size: 14px;
+  }
+  footer .row {
+    display: flex;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 16px;
+  }
+  footer a { color: var(--muted); }
+  footer a:hover { color: var(--accent); }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <div class="brand">darkly energized<span class="dot">·</span>open source</div>
+    <h1>darkmux<span class="cursor">_</span></h1>
+    <p class="tag">Task-class-aware multiplexer for local LLM configurations on <span class="accent">Apple Silicon</span>.</p>
+    <pre class="install"><span class="prompt">$ </span><span class="cmd">cargo install --git https://github.com/kstrat2001/darkmux</span></pre>
+    <div class="btns">
+      <a class="btn btn-primary" href="https://github.com/kstrat2001/darkmux">View on GitHub →</a>
+      <a class="btn btn-ghost" href="https://substack.com/@DarklyEnergized">Read the work</a>
+    </div>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <h2>What it does</h2>
+    <h3>Pick the right loaded model + context length + compaction profile for each task — automatically.</h3>
+    <p>You shouldn't have to remember whether your fast bounded-task stack is loaded right now, or whether the deep-agentic profile got swapped out an hour ago when you ran a different test. darkmux makes the loadout an explicit, named thing.</p>
+    <ul class="plain">
+      <li><code>darkmux profiles</code> — list named stacks (combinations of LMStudio models at specified context lengths)</li>
+      <li><code>darkmux status</code> — show what's loaded and which profile (if any) it matches</li>
+      <li><code>darkmux swap deep</code> — atomically transition the loadout, patch the agent runtime config</li>
+      <li><code>darkmux scan</code> — discover models in your LMStudio catalog not yet covered by any profile</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>The lab</h2>
+    <h3>A measurement harness, not a config tool dressed up as one.</h3>
+    <p>Every <code>darkmux lab run</code> writes a manifest, a trajectory, and per-turn timing under <code>.darkmux/runs/&lt;id&gt;/</code> — so wall-clock variance, compaction events, and per-profile behaviour are inspectable after the fact. Not in your head. On disk.</p>
+    <ul class="plain">
+      <li><code>lab run quick-q</code> — single-turn smoke prompt against the active profile</li>
+      <li><code>lab run long-agentic</code> — the workload that exercises compaction</li>
+      <li><code>lab inspect &lt;run&gt;</code> — turns, compactions, mode (fast/slow), notes</li>
+      <li><code>lab tune long-agentic --runs 6</code> — bimodal cluster detection across N dispatches</li>
+      <li><code>lab compare &lt;A&gt; &lt;B&gt;</code> — diff two runs for variance / regression</li>
+    </ul>
+    <p class="muted" style="margin-top: 24px;">Workloads are pluggable via a <code>WorkloadProvider</code> trait. Two ship out of the box (<code>prompt</code>, <code>coding-task</code>); add your own without forking.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Read the work</h2>
+    <h3>The article series this came from.</h3>
+    <p>darkmux didn't start as a tool — it started as a lab notebook for a series on faster local AI on Apple Silicon. The findings (compaction-mode defaults, bimodal wall-clock variance, the bigctx pivot, the compactor n_ctx cut) drove the design choices. The series lives at <a href="https://substack.com/@DarklyEnergized">substack.com/@DarklyEnergized</a>.</p>
+    <p class="muted">The repo is the evidence locker. The articles are the narrative.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Get going</h2>
+    <pre class="install"><span class="prompt">$ </span><span class="cmd">cargo install --git https://github.com/kstrat2001/darkmux</span>
+<span class="prompt">$ </span><span class="cmd">cp ~/.cargo/registry/src/*/darkmux-*/profiles.example.json ~/.darkmux/profiles.json</span>
+<span class="prompt">$ </span><span class="cmd">darkmux profiles</span></pre>
+    <p class="muted">Then edit <code>~/.darkmux/profiles.json</code> to point at your downloaded LMStudio models. <a href="https://github.com/kstrat2001/darkmux#quick-start">Full quick-start in the README.</a></p>
+    <div class="warn">
+      <strong>Heads up.</strong> darkmux orchestrates AI tools that execute on your machine. It modifies your local config files and — in lab mode — runs AI-generated code in a working directory that is not a security sandbox. Read the <a href="https://github.com/kstrat2001/darkmux/blob/main/DISCLAIMER.md">DISCLAIMER</a> before running.
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap row">
+    <div>
+      <a href="https://github.com/kstrat2001/darkmux">GitHub</a> ·
+      <a href="https://github.com/kstrat2001/darkmux/blob/main/DISCLAIMER.md">Disclaimer</a> ·
+      <a href="https://github.com/kstrat2001/darkmux/blob/main/LICENSE">MIT</a>
+    </div>
+    <div>
+      © Kain Osterholt · <a href="https://substack.com/@DarklyEnergized">Darkly Energized LLC</a>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>
