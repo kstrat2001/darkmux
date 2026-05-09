@@ -1,0 +1,34 @@
+{
+  "_comment": "darkmux profile registry — example. Three reference profiles in increasing capacity order: fast → balanced → deep. Replace the model ids with what you have downloaded in LMStudio (run `lms ls` to see).",
+
+  "profiles": {
+    "fast": {
+      "description": "Single-turn tasks. Slim primary, no compactor — fastest dispatch, lowest RAM.",
+      "models": [
+        {
+          "id": "<your-primary-model-id>",
+          "n_ctx": 32000,
+          "role": "primary"
+        }
+      ]
+    },
+
+    "balanced": {
+      "description": "Mid-range tasks. Tuned compaction with a small companion compactor — predictable behavior across mixed workloads.",
+      "models": [
+        { "id": "<your-primary-model-id>", "n_ctx": 100000, "role": "primary" },
+        { "id": "<your-compactor-model-id>", "n_ctx": 68000, "role": "compactor" }
+      ]
+    },
+
+    "deep": {
+      "description": "Long agentic tasks. Maximum primary context for fewer compactions; companion compactor as safety net.",
+      "models": [
+        { "id": "<your-primary-model-id>", "n_ctx": 200000, "role": "primary" },
+        { "id": "<your-compactor-model-id>", "n_ctx": 120000, "role": "compactor" }
+      ]
+    }
+  },
+
+  "default_profile": "balanced"
+}

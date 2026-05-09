@@ -1,0 +1,23 @@
+# Rust build artifacts
+target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# darkmux runtime state (project-local + defense-in-depth)
+.darkmux/
+runs/
+sandboxes/
+*.trajectory.jsonl
+qa-reply.json
+qa-reply.err
+cpu-samples.txt
+
+# dotenv files (local secrets)
+.env
+.env.local
+.env.*.local
+
+# OS / editor noise
+.DS_Store
+.idea/
+.vscode/

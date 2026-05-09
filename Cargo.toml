@@ -1,0 +1,32 @@
+[package]
+name = "darkmux"
+version = "0.2.0-dev"
+edition = "2021"
+description = "Lab and multiplexer for local LLM configurations"
+license = "MIT"
+repository = "https://github.com/kstrat2001/darkmux"
+authors = ["Kain Osterholt"]
+rust-version = "1.80"
+
+[[bin]]
+name = "darkmux"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+dirs = "5.0"
+
+[dev-dependencies]
+tempfile = "3.10"
+assert_cmd = "2.0"
+predicates = "3.1"
+serial_test = "3.1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = "symbols"
+codegen-units = 1
