@@ -136,7 +136,9 @@ fn status_runs_with_explicit_config() {
 #[test]
 fn unknown_command_exits_nonzero() {
     let mut cmd = Command::cargo_bin("darkmux").unwrap();
-    cmd.arg("nonexistent-command").assert().failure();
+    cmd.arg("nonexistent-command")
+        .assert()
+        .failure();
 }
 
 #[test]

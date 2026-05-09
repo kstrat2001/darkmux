@@ -94,6 +94,84 @@ fn parse_text_ps(text: &str) -> Vec<LoadedModel> {
     out
 }
 
+/// One row from `lms ls --json` — every model the LMStudio catalog knows
+/// about (downloaded), regardless of whether it's currently loaded. Used by
+/// `darkmux scan` to discover models the user could add to their profile
+/// registry.
+#[derive(Debug, Clone)]
+pub struct ModelMeta {
+    pub model_key: String,
+    pub display_name: String,
+    pub publisher: String,
+    pub size_bytes: u64,
+    pub params_string: Option<String>,
+    pub architecture: Option<String>,
+    pub max_context_length: Option<u32>,
+    pub trained_for_tool_use: bool,
+    /// Type per LMStudio: "llm", "embedding", etc. We typically filter to
+    /// `"llm"` since profiles are for chat/agentic dispatch.
+    pub model_type: String,
+}
+
+/// Enumerate all models LMStudio has on disk (catalog), via `lms ls --json`.
+/// Returns an empty vec on failure rather than erroring — the caller likely
+/// wants to render "(no models found)" rather than crash.
+pub fn list_available() -> Result<Vec<ModelMeta>> {
+    let out = Command::new(lms_bin())
+        .args(["ls", "--json"])
+        .output()
+        .with_context(|| "running `lms ls --json`")?;
+    if !out.status.success() {
+        return Ok(Vec::new());
+    }
+    let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
+        return Ok(Vec::new());
+    };
+    let Some(arr) = parsed.as_array() else {
+        return Ok(Vec::new());
+    };
+    Ok(arr.iter().filter_map(meta_from_json).collect())
+}
+
+fn meta_from_json(v: &serde_json::Value) -> Option<ModelMeta> {
+    let model_key = v.get("modelKey").and_then(|s| s.as_str())?.to_string();
+    Some(ModelMeta {
+        model_key,
+        display_name: v
+            .get("displayName")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string(),
+        publisher: v
+            .get("publisher")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string(),
+        size_bytes: v.get("sizeBytes").and_then(|n| n.as_u64()).unwrap_or(0),
+        params_string: v
+            .get("paramsString")
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string()),
+        architecture: v
+            .get("architecture")
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string()),
+        max_context_length: v
+            .get("maxContextLength")
+            .and_then(|n| n.as_u64())
+            .map(|n| n as u32),
+        trained_for_tool_use: v
+            .get("trainedForToolUse")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false),
+        model_type: v
+            .get("type")
+            .and_then(|s| s.as_str())
+            .unwrap_or("llm")
+            .to_string(),
+    })
+}
+
 pub fn unload(identifier: &str) -> Result<()> {
     let out = Command::new(lms_bin())
         .args(["unload", identifier])

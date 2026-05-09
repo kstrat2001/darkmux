@@ -1,0 +1,2 @@
+This sentinel marks a darkmux skills source directory.
+Used by `darkmux skills install` to confirm the source is genuinely darkmux's bundle, not an unrelated `skills/` directory that happens to be in the user's cwd.
