@@ -32,6 +32,7 @@ pub fn characterize(opts: &CharacterizeOpts) -> Result<CharacterizeReport> {
         runs: 1,
         config_path: opts.config.clone(),
         quiet: true,
+        instrument: false,
     };
     let outcomes = lab_run(run_opts)?;
     Ok(CharacterizeReport {

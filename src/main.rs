@@ -205,6 +205,13 @@ enum LabCmd {
         config: Option<String>,
         #[arg(long, short = 'q')]
         quiet: bool,
+        /// Capture cross-layer telemetry during the dispatch. Writes
+        /// `instruments.jsonl` to the run dir with periodic samples of
+        /// LMStudio state and gateway-process residency. Useful for
+        /// "trust-but-verify" — confirming what the stack was actually
+        /// doing, beyond the runtime's self-report. No root required.
+        #[arg(long)]
+        instrument: bool,
     },
     /// List recent runs (most recent first).
     Runs {
@@ -846,6 +853,7 @@ fn cmd_lab(sub: LabCmd) -> Result<i32> {
             runs,
             config,
             quiet,
+            instrument,
         } => {
             let outcomes = lab::run::lab_run(lab::run::RunOpts {
                 workload_id: workload,
@@ -853,6 +861,7 @@ fn cmd_lab(sub: LabCmd) -> Result<i32> {
                 runs,
                 config_path: config,
                 quiet,
+                instrument,
             })?;
             if !quiet {
                 println!("\n{} run(s) complete:", outcomes.len());
@@ -896,8 +905,30 @@ fn cmd_lab(sub: LabCmd) -> Result<i32> {
             for n in &report.notes {
                 println!("  - {n}");
             }
+            // Telemetry summary, if `--instrument` was used on the run.
+            // Detection is automatic: if instruments.jsonl is missing, this
+            // is a no-op silently. Surfaced before the compaction summary
+            // because operators usually want the cross-layer view first.
+            let run_dir = lab::inspect::resolve_run_path(&run);
+            if let Some(t) = lab::inspect::read_telemetry_summary(&run_dir)? {
+                println!();
+                println!("instruments:");
+                println!("  elapsed:       {}s", t.elapsed_s);
+                println!("  lms samples:   {}", t.lms_samples);
+                println!("  proc samples:  {}", t.process_samples);
+                if !t.model_identifiers_seen.is_empty() {
+                    println!("  models seen:   {}", t.model_identifiers_seen.join(", "));
+                }
+                println!("  gw peak RSS:   {} MB", t.gateway_peak_rss_mb);
+                println!("  gw mean CPU:   {:.1}%", t.gateway_mean_cpu);
+                if !t.anomalies.is_empty() {
+                    println!("  anomalies:");
+                    for a in &t.anomalies {
+                        println!("    ⚠ {a}");
+                    }
+                }
+            }
             if summary {
-                let run_dir = lab::inspect::resolve_run_path(&run);
                 let summaries = lab::inspect::read_compaction_summaries(&run_dir)?;
                 println!();
                 if summaries.is_empty() {

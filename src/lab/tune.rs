@@ -57,6 +57,7 @@ pub fn tune(opts: &TuneOpts) -> Result<TuneReport> {
         runs,
         config_path: opts.config.clone(),
         quiet: false,
+        instrument: false,
     })?;
     let stats = compute_stats(&outcomes);
     Ok(TuneReport {

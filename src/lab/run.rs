@@ -1,12 +1,13 @@
 //! `darkmux lab run <workload> [opts]` — execute a workload and capture output.
 
+use crate::lab::instrument::InstrumentSidecar;
 use crate::lab::paths::{self, ResolveScope};
 use crate::profiles::{get_profile, load_registry};
 use crate::workloads::load::{list_available, load};
 use crate::workloads::registry::with_provider;
 use anyhow::{Context, Result, anyhow};
 use std::fs;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub struct RunOpts {
     pub workload_id: String,
@@ -14,6 +15,10 @@ pub struct RunOpts {
     pub runs: u32,
     pub config_path: Option<String>,
     pub quiet: bool,
+    /// Enable cross-layer telemetry capture during the dispatch. When true,
+    /// each run dir gets an `instruments.jsonl` with periodic samples of
+    /// LMStudio state, gateway-process residency, and timing meta.
+    pub instrument: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -71,11 +76,47 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
         fs::create_dir_all(&run_dir)
             .with_context(|| format!("creating {}", run_dir.display()))?;
 
+        // Optional cross-layer telemetry. The sidecar runs on a background
+        // thread until we explicitly stop it after the dispatch completes.
+        // Failure to start the sidecar should not abort the dispatch — it's
+        // additive instrumentation, not load-bearing.
+        let sidecar = if opts.instrument {
+            match InstrumentSidecar::start(&run_dir, Duration::from_millis(2000)) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    if !opts.quiet {
+                        eprintln!("[lab] warning: failed to start instrument sidecar: {e}");
+                    }
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let provider_id = loaded_workload.manifest.workload.provider.clone();
         let result = with_provider(&provider_id, |p| {
             p.setup(&loaded_workload, &run_dir, &sandbox_dir)?;
             p.run(&loaded_workload, &run_dir, &sandbox_dir, profile, &profile_name)
         })??;
+
+        // Stop the sidecar before recording outcome notes — that way any
+        // last-second samples land on disk and the meta:end event is
+        // present for the inspector.
+        if let Some(s) = sidecar {
+            match s.stop() {
+                Ok(path) => {
+                    if !opts.quiet {
+                        println!("  instruments → {}", path.display());
+                    }
+                }
+                Err(e) => {
+                    if !opts.quiet {
+                        eprintln!("[lab] warning: instrument sidecar stop errored: {e}");
+                    }
+                }
+            }
+        }
 
         let mut notes = vec![
             format!("provider={}", provider_id),
@@ -179,6 +220,7 @@ mod tests {
             runs: 1,
             config_path: Some(cfg.to_str().unwrap().into()),
             quiet: true,
+            instrument: false,
         })
         .unwrap_err();
         std::env::set_current_dir(prev).unwrap();
