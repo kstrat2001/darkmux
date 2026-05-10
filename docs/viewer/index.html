@@ -489,7 +489,26 @@ function App() {
   const [playing, setPlaying] = useState(false);
   const [speed, setSpeed] = useState(1);
   const [dragOver, setDragOver] = useState(false);
+  // User-dragged positions, keyed by node id. Layered on top of the
+  // default positions so drag persists across the useMemo rebuilds that
+  // happen on every activation state change.
+  const [overridePositions, setOverridePositions] = useState({});
   const playTimer = useRef(null);
+
+  const onNodesChange = useCallback((changes) => {
+    for (const change of changes) {
+      if (change.type === 'position' && change.position && !change.dragging) {
+        // Only persist on drag-end (dragging=false in the final change),
+        // so we record the final resting position rather than every
+        // intermediate frame.
+        setOverridePositions(prev => ({ ...prev, [change.id]: change.position }));
+      }
+    }
+  }, []);
+
+  const resetLayout = useCallback(() => {
+    setOverridePositions({});
+  }, []);
 
   const ingestFile = useCallback(async (file) => {
     if (!file) return;
@@ -573,7 +592,9 @@ function App() {
   // right of LMStudio. Recomputed when samples change.
   const modelIdents = useMemo(() => distinctModelIdentifiers(samples), [samples]);
 
-  // Build ReactFlow nodes: 3 fixed + 1 per loaded model.
+  // Build ReactFlow nodes: 3 fixed + 1 per loaded model. User-dragged
+  // positions (overridePositions) win over the layout defaults — that's
+  // what makes manual reorganization stick across renders.
   const nodes = useMemo(() => {
     const fixed = FIXED_NODE_DEFS.map(n => {
       let live = '';
@@ -582,7 +603,7 @@ function App() {
       if (n.id === 'claude')   live = '(via gateway CPU)';
       return {
         id: n.id,
-        position: n.pos,
+        position: overridePositions[n.id] ?? n.pos,
         data: { title: n.title, name: n.name, live },
         type: 'darkmux',
         className: activeNodes.has(n.id) ? 'dx-active' : '',
@@ -590,9 +611,10 @@ function App() {
     });
     const modelNodes = modelIdents.map((ident, idx) => {
       const id = modelNodeId(ident);
+      const defaultPos = { x: MODEL_COL_X, y: MODEL_FIRST_ROW_Y + idx * MODEL_ROW_GAP };
       return {
         id,
-        position: { x: MODEL_COL_X, y: MODEL_FIRST_ROW_Y + idx * MODEL_ROW_GAP },
+        position: overridePositions[id] ?? defaultPos,
         data: {
           title: 'Model',
           name: ident,
@@ -603,7 +625,7 @@ function App() {
       };
     });
     return [...fixed, ...modelNodes];
-  }, [activeNodes, nodeState, modelIdents]);
+  }, [activeNodes, nodeState, modelIdents, overridePositions]);
 
   // Build edges: fixed (claude↔gateway, gateway↔lmstudio) + a request
   // and a response edge per model (lmstudio↔model-<ident>).
@@ -678,6 +700,14 @@ function App() {
           load instruments.jsonl
           <input type="file" accept=".jsonl,.json,.txt" onChange={onFile} />
         </label>
+        <button
+          className="file-pick"
+          onClick={resetLayout}
+          disabled={Object.keys(overridePositions).length === 0}
+          title="Reset all dragged node positions to defaults"
+        >
+          reset layout
+        </button>
         <div className="privacy">
           <strong>your file stays in your browser.</strong><br />
           no upload · no telemetry · static viewer
@@ -698,14 +728,15 @@ function App() {
             nodes={nodes}
             edges={edges}
             nodeTypes={NODE_TYPES}
+            onNodesChange={onNodesChange}
             fitView
             fitViewOptions={{ padding: 0.18 }}
             minZoom={0.4}
             maxZoom={1.2}
             proOptions={{ hideAttribution: true }}
-            nodesDraggable={false}
+            nodesDraggable={true}
             nodesConnectable={false}
-            elementsSelectable={false}
+            elementsSelectable={true}
           >
             {/* Lab-aesthetic graph paper: fine inner grid every 12px, bold
                 grid every 60px. Two Background components stacked. */}
