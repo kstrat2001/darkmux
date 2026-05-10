@@ -214,6 +214,25 @@
   }
   .empty-state h2 { font-size: 14px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--accent); margin: 0 0 12px; }
   .empty-state code { background: var(--bg-elev); padding: 2px 6px; border-radius: 3px; color: var(--text); font-size: 12px; }
+  .empty-state .hint { margin-top: 16px; font-size: 11px; color: var(--accent-dim); }
+
+  /* Drag-and-drop affordance. The whole window is a drop target; the
+     overlay just gives a visible signal during the drag. */
+  .drop-overlay {
+    position: fixed; inset: 0;
+    background: rgba(10, 10, 11, 0.85);
+    border: 3px dashed var(--accent);
+    z-index: 100;
+    display: none;
+    align-items: center; justify-content: center;
+    pointer-events: none;
+    color: var(--accent);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 18px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+  }
+  .drop-overlay.active { display: flex; }
 </style>
 </head>
 <body>
@@ -400,10 +419,10 @@ function App() {
   const [tMax, setTMax] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [speed, setSpeed] = useState(1);
+  const [dragOver, setDragOver] = useState(false);
   const playTimer = useRef(null);
 
-  const onFile = useCallback(async (e) => {
-    const file = e.target.files?.[0];
+  const ingestFile = useCallback(async (file) => {
     if (!file) return;
     const text = await file.text();
     const parsed = parseInstruments(text);
@@ -412,8 +431,54 @@ function App() {
       const lo = parsed[0].t;
       const hi = parsed[parsed.length - 1].t;
       setTMin(lo); setTMax(hi); setCurrentT(lo);
+      setPlaying(false);
     }
   }, []);
+
+  const onFile = useCallback((e) => {
+    const file = e.target.files?.[0];
+    if (file) ingestFile(file);
+  }, [ingestFile]);
+
+  // Page-wide drag-and-drop. dragenter/dragover must preventDefault to
+  // signal acceptance; without it, the browser opens the file in a new
+  // tab as a fallback. dragleave fires when leaving the window edge —
+  // we use a counter to ignore intra-window flicker between elements.
+  const dragCounter = useRef(0);
+  useEffect(() => {
+    const onDragEnter = (e) => {
+      if (!e.dataTransfer?.types?.includes('Files')) return;
+      e.preventDefault();
+      dragCounter.current += 1;
+      setDragOver(true);
+    };
+    const onDragOver = (e) => {
+      if (!e.dataTransfer?.types?.includes('Files')) return;
+      e.preventDefault();
+    };
+    const onDragLeave = (e) => {
+      e.preventDefault();
+      dragCounter.current = Math.max(0, dragCounter.current - 1);
+      if (dragCounter.current === 0) setDragOver(false);
+    };
+    const onDrop = (e) => {
+      e.preventDefault();
+      dragCounter.current = 0;
+      setDragOver(false);
+      const file = e.dataTransfer?.files?.[0];
+      if (file) ingestFile(file);
+    };
+    window.addEventListener('dragenter', onDragEnter);
+    window.addEventListener('dragover',  onDragOver);
+    window.addEventListener('dragleave', onDragLeave);
+    window.addEventListener('drop',      onDrop);
+    return () => {
+      window.removeEventListener('dragenter', onDragEnter);
+      window.removeEventListener('dragover',  onDragOver);
+      window.removeEventListener('dragleave', onDragLeave);
+      window.removeEventListener('drop',      onDrop);
+    };
+  }, [ingestFile]);
 
   // playback
   useEffect(() => {
@@ -475,6 +540,9 @@ function App() {
 
   return (
     <>
+      <div className={`drop-overlay ${dragOver ? 'active' : ''}`}>
+        drop instruments.jsonl to load
+      </div>
       <div className="topbar">
         <span className="brand">darkmux <span className="accent">·</span> viewer</span>
         <span className="title">cross-layer telemetry replay</span>
@@ -495,6 +563,7 @@ function App() {
             <p>capture telemetry on a run with:</p>
             <p><code>darkmux lab run &lt;workload&gt; --instrument</code></p>
             <p>then load <code>~/.darkmux/runs/&lt;run-id&gt;/instruments.jsonl</code></p>
+            <p className="hint">drag the file anywhere on this page, or click "load instruments.jsonl" above</p>
           </div>
         ) : (
           <ReactFlow
