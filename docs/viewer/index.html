@@ -32,17 +32,19 @@
 
 <style>
   :root {
-    --bg: #0a0a0b;
-    --bg-elev: #131316;
-    --bg-elev2: #1a1a1f;
-    --border: #1f1f24;
-    --border-hot: #2a8a96;
-    --text: #e8e6e3;
-    --muted: #8a8a92;
-    --accent: #6df1ff;
-    --accent-dim: #2a8a96;
-    --warn: #ffb86b;
-    --good: #5af0a3;
+    --bg:        #181820;   /* lab paper — dark grey, distinct from nodes */
+    --bg-grid:   #25252e;   /* graph-paper grid lines */
+    --bg-elev:   #0a0a0d;   /* nodes — darker than BG so they sit on top of the page */
+    --bg-elev2:  #14141a;
+    --bg-label:  #1f1f28;   /* edge label background — opaque, readable on grid */
+    --border:    #2a2a34;
+    --border-hot:#2a8a96;
+    --text:      #e8e6e3;
+    --muted:     #8a8a92;
+    --accent:    #6df1ff;
+    --accent-dim:#2a8a96;
+    --warn:      #ffb86b;
+    --good:      #5af0a3;
   }
   * { box-sizing: border-box; }
   html, body, #root {
@@ -125,16 +127,33 @@
   .node-meta { color: var(--muted); font-size: 11px; line-height: 1.5; }
   .node-meta .k { color: var(--text); font-family: 'JetBrains Mono', monospace; }
 
-  .react-flow__edge-path { stroke: var(--border); stroke-width: 2; }
+  .react-flow__edge-path { stroke: #3a3a44; stroke-width: 1.5; }
   .react-flow__edge.dx-active .react-flow__edge-path {
     stroke: var(--accent);
+    stroke-width: 2;
     stroke-dasharray: 4 4;
     animation: dashFlow 0.6s linear infinite;
   }
   @keyframes dashFlow { to { stroke-dashoffset: -16; } }
 
-  .react-flow__edge-label-bg { fill: var(--bg-elev) !important; }
-  .react-flow__edge-label-text { fill: var(--muted) !important; font-size: 11px; }
+  /* Edge labels: opaque background, padded, sit on top of edges. The
+     `.react-flow__edge-textbg` rect is the background plate; we fill it
+     with the dedicated label color so it visibly covers any edge that
+     happens to pass near a node. */
+  .react-flow__edge-textbg { fill: var(--bg-label) !important; rx: 4 !important; }
+  .react-flow__edge-text {
+    fill: var(--text) !important;
+    font-size: 11px;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  /* Bring edge labels above the node layer so they're not clipped by
+     adjacent nodes. We don't lift the whole edge — just the text/bg —
+     so edge lines still render below nodes at their crossing points. */
+  .react-flow__edges svg .react-flow__edge .react-flow__edge-textwrapper {
+    pointer-events: none;
+  }
+  .react-flow__edge { z-index: 1001 !important; }
+  .react-flow__node { z-index: 1000 !important; }
   .react-flow__controls { background: var(--bg-elev); border: 1px solid var(--border); }
   .react-flow__controls button {
     background: var(--bg-elev) !important; color: var(--text) !important;
@@ -281,17 +300,18 @@ const NODE_DEFS = [
 
 // Six edges — request path forward (top lane), response path back (bottom
 // lane). Each direction routes through dedicated handles so they don't
-// overlap each other or pass under the nodes.
+// overlap each other or pass under the nodes. Labels kept short so they
+// fit in the routed segments without clipping into adjacent nodes.
 const EDGE_DEFS = [
   // Request lane: req-out (right) → req-in (left)
-  { id: 'e1', source: 'claude',   target: 'gateway',  sourceHandle: 'req-out', targetHandle: 'req-in', label: 'request' },
-  { id: 'e2', source: 'gateway',  target: 'lmstudio', sourceHandle: 'req-out', targetHandle: 'req-in', label: 'POST /v1/chat/completions' },
+  { id: 'e1', source: 'claude',   target: 'gateway',  sourceHandle: 'req-out', targetHandle: 'req-in', label: 'dispatch' },
+  { id: 'e2', source: 'gateway',  target: 'lmstudio', sourceHandle: 'req-out', targetHandle: 'req-in', label: 'POST /v1/chat' },
   { id: 'e3', source: 'lmstudio', target: 'model',    sourceHandle: 'req-out', targetHandle: 'req-in', label: 'tokens' },
   // Response lane: res-out (left) → res-in (right). Source/target order
   // is reversed visually because tokens flow right-to-left on this lane.
-  { id: 'e4', source: 'model',    target: 'lmstudio', sourceHandle: 'res-out', targetHandle: 'res-in', label: 'tokens (harmony)' },
-  { id: 'e5', source: 'lmstudio', target: 'gateway',  sourceHandle: 'res-out', targetHandle: 'res-in', label: 'stream chunks (← bug site)' },
-  { id: 'e6', source: 'gateway',  target: 'claude',   sourceHandle: 'res-out', targetHandle: 'res-in', label: 'tool_call ready' },
+  { id: 'e4', source: 'model',    target: 'lmstudio', sourceHandle: 'res-out', targetHandle: 'res-in', label: 'harmony' },
+  { id: 'e5', source: 'lmstudio', target: 'gateway',  sourceHandle: 'res-out', targetHandle: 'res-in', label: 'stream ⚠ bug site' },
+  { id: 'e6', source: 'gateway',  target: 'claude',   sourceHandle: 'res-out', targetHandle: 'res-in', label: 'tool_call' },
 ];
 
 // ─── Sample parsing ─────────────────────────────────────────────────────
@@ -549,8 +569,10 @@ function App() {
     sourceHandle: e.sourceHandle,
     targetHandle: e.targetHandle,
     label: e.label,
+    labelBgPadding: [8, 4],
+    labelBgBorderRadius: 4,
     type: 'smoothstep',
-    pathOptions: { offset: 12, borderRadius: 8 },
+    pathOptions: { offset: 16, borderRadius: 12 },
     animated: false,
     className: activeEdges.has(e.id) ? 'dx-active' : '',
     markerEnd: { type: MarkerType.ArrowClosed, color: activeEdges.has(e.id) ? '#6df1ff' : '#3a3a44' },
@@ -610,7 +632,10 @@ function App() {
             nodesConnectable={false}
             elementsSelectable={false}
           >
-            <Background color="#1f1f24" gap={24} />
+            {/* Lab-aesthetic graph paper: fine inner grid every 12px, bold
+                grid every 60px. Two Background components stacked. */}
+            <Background id="grid-fine" gap={12} size={1} color="#23232c" />
+            <Background id="grid-bold" gap={60} size={1.5} color="#2e2e38" />
             <Controls showInteractive={false} />
           </ReactFlow>
         )}
