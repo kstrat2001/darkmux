@@ -351,14 +351,24 @@ function distinctModelIdentifiers(samples) {
   return [...set].sort();
 }
 
-// Given a current elapsed_ms, derive node/edge activations. Heuristics:
-//   - claude is active any time gateway-CPU is non-trivial
-//   - gateway is active when there's a process sample within last few s
-//   - lmstudio is active when an lms sample arrives (we polled it)
-//   - per-model: a model node is active when its status is non-idle in
-//     the most recent lms sample (the model is being decoded against),
-//     OR when the gateway is doing meaningful work and this model is in
-//     the loaded set (proxy: dispatch is in flight against it).
+// Given a current elapsed_ms, derive node/edge activations.
+//
+// Primary "is the dispatch active?" signal is the lms model status field
+// (e.g. "generating" vs "idle"). The gateway-process CPU is a secondary
+// hint at best — the gateway is a thin orchestrator and the heavy work
+// happens in LMStudio (a separate process whose CPU we don't sample),
+// so real long-agentic dispatches routinely show 0.1-0.5% mean gateway
+// CPU even while a model is hot. Threshold tuned accordingly.
+//
+// Rules:
+//   - lmstudio is active any time we have a recent lms sample (we
+//     polled it; LMStudio is up and we got back state).
+//   - per-model: active iff its status != "idle" in the most recent
+//     sample. That captures "generating" / "loaded and warming" /
+//     anything else lms might report.
+//   - gateway/claude/inter-block edges are active when the gateway is
+//     non-zero CPU (any value above its idle ceiling) — proxy for "the
+//     dispatch is currently in flight, not paused between turns".
 function computeActivations(samples, currentT) {
   const recent = (s) => Math.abs(s.t - currentT) < 3000;
   const lmsRecent  = samples.find(s => s.source === 'lms'     && recent(s));
@@ -368,33 +378,28 @@ function computeActivations(samples, currentT) {
   const activeEdges = new Set();
   const cpu = procRecent?.payload?.cpu_percent ?? 0;
 
-  if (procRecent) {
-    activeNodes.add('gateway');
-    if (cpu > 0.5) {
-      activeNodes.add('claude');
-      activeEdges.add('e1');
-      activeEdges.add('e6');
-    }
-    if (cpu > 1) {
-      activeEdges.add('e2');
-      activeEdges.add('e5');
-    }
+  if (procRecent) activeNodes.add('gateway');
+  // Gateway CPU above its idle floor (~0.05%) means a dispatch is in
+  // flight on the orchestration side. We use 0.2% as the threshold to
+  // give some buffer above true-idle without missing real activity.
+  const gwActive = cpu > 0.2;
+  if (gwActive) {
+    activeNodes.add('claude');
+    activeEdges.add('e1');
+    activeEdges.add('e2');
+    activeEdges.add('e5');
+    activeEdges.add('e6');
   }
 
   if (lmsRecent) {
     activeNodes.add('lmstudio');
-    activeEdges.add('e2');
-    activeEdges.add('e5');
     const models = lmsRecent.payload?.models ?? [];
     for (const m of models) {
       const ident = m.identifier;
       if (!ident) continue;
       const nodeId = modelNodeId(ident);
       const isBusy = m.status && m.status !== 'idle';
-      // Active when busy in lms OR gateway is doing real work (dispatch
-      // in flight; status field on lms is coarse and often stays idle
-      // even mid-stream because the poll cadence is 2s).
-      if (isBusy || cpu > 1) {
+      if (isBusy) {
         activeNodes.add(nodeId);
         activeEdges.add(`req-to-${ident}`);
         activeEdges.add(`res-from-${ident}`);

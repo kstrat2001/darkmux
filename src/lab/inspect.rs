@@ -227,14 +227,14 @@ pub fn read_telemetry_summary(run_dir: &Path) -> Result<Option<TelemetrySummary>
     if process_samples == 0 && lms_samples > 0 {
         anomalies.push("no gateway-process state captured — port-listener detection failed".into());
     }
-    // Mean CPU% near zero on a long run usually means the gateway was idle
-    // and the dispatch went elsewhere — flag it as a possible mis-routing.
-    if cpu_count > 5 && mean_cpu < 1.0 {
-        anomalies.push(format!(
-            "gateway mean CPU was {:.1}% over {} samples — dispatch may have gone to a different process",
-            mean_cpu, cpu_count
-        ));
-    }
+    // Note: a previous version of this rule flagged "mean gateway CPU < 1%
+    // = dispatch went to a different process." That's wrong-shaped. The
+    // gateway is a thin orchestrator; the heavy CPU+GPU work happens in
+    // LMStudio (a separate process) and isn't visible in `ps -p
+    // <gateway-pid>`. Real long-agentic dispatches routinely show 0.1-0.5%
+    // mean gateway CPU. The right "is dispatch active?" signal is the
+    // lms.payload.models[*].status field ("generating" vs "idle"), not
+    // gateway-process CPU. Rule dropped.
 
     Ok(Some(TelemetrySummary {
         elapsed_s,
