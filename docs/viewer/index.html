@@ -53,16 +53,22 @@
     font-family: 'Inter', -apple-system, system-ui, sans-serif;
     overflow: hidden;
   }
+  #root { display: grid; grid-template-rows: 56px 1fr auto; }
   code, pre, .mono { font-family: 'JetBrains Mono', ui-monospace, Menlo, monospace; }
   a { color: var(--accent); }
 
   .topbar {
-    position: absolute; top: 0; left: 0; right: 0; height: 56px;
+    height: 56px;
     background: var(--bg-elev);
     border-bottom: 1px solid var(--border);
     display: flex; align-items: center; padding: 0 20px; gap: 16px;
     z-index: 10;
+    overflow: hidden;
+    flex-wrap: nowrap;
+    white-space: nowrap;
   }
+  /* Privacy block hides on narrower windows so the topbar items don't wrap */
+  @media (max-width: 1100px) { .topbar .privacy { display: none; } }
   .topbar .brand {
     font-family: 'JetBrains Mono', monospace; font-weight: 700;
     font-size: 14px; letter-spacing: 0.18em; text-transform: uppercase;
@@ -93,8 +99,10 @@
   input[type=file] { display: none; }
 
   .stage {
-    position: absolute; top: 56px; left: 0; right: 0; bottom: 180px;
+    position: relative;
     background: var(--bg);
+    min-height: 0;
+    overflow: hidden;
   }
   /* React-Flow background */
   .react-flow__renderer { background: var(--bg) !important; }
@@ -160,14 +168,17 @@
     border-color: var(--border) !important;
   }
 
-  /* Bottom control panel */
+  /* Bottom control panel — fixed-row in the page grid; the inner panes
+     use flexbox with min-height: 0 so their internal scrollboxes shrink
+     correctly when the window is shorter. */
   .panel {
-    position: absolute; bottom: 0; left: 0; right: 0; height: 180px;
     background: var(--bg-elev);
     border-top: 1px solid var(--border);
-    padding: 16px 20px;
-    display: grid; grid-template-columns: 1fr 380px; gap: 24px;
+    padding: 14px 20px 16px;
+    display: grid; grid-template-columns: 1fr minmax(280px, 380px); gap: 24px;
+    min-height: 0;
   }
+  .panel > div { display: flex; flex-direction: column; min-height: 0; }
   .scrubber-row { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
   .scrubber-row button {
     background: var(--bg);
@@ -201,7 +212,9 @@
     border: 1px solid var(--border);
     border-radius: 4px;
     padding: 8px 12px;
-    height: 100px;
+    flex: 1 1 0;
+    min-height: 64px;
+    max-height: 120px;
     overflow-y: auto;
     font-family: 'JetBrains Mono', monospace; font-size: 11px;
     line-height: 1.6;
@@ -218,7 +231,9 @@
     border-left: 3px solid var(--warn);
     border-radius: 4px;
     padding: 8px 12px;
-    height: 100px;
+    flex: 1 1 0;
+    min-height: 64px;
+    max-height: 140px;
     overflow-y: auto;
     font-size: 11px;
     line-height: 1.5;
@@ -422,24 +437,48 @@ function summarizeAnomalies(samples) {
   const lms     = samples.filter(s => s.source === 'lms');
   const procs   = samples.filter(s => s.source === 'process');
   const issues  = [];
-  // PID change mid-run
-  const pids = new Set(procs.map(p => p.payload?.pid).filter(Boolean));
-  if (pids.size > 1) {
+
+  // PID-change rule, scoped to ACTIVE-DISPATCH samples only.
+  //
+  // Reason: an instrumentation race at sample-0 can pick up a gateway
+  // process that's about to be replaced (e.g., the operator swapped
+  // models or restarted the gateway just before invoking the run). We
+  // don't want to flag that as a within-dispatch PID change; only flag
+  // if at least two distinct PIDs are observed while CPU > 0.5%, which
+  // means the dispatch was actually running across the change.
+  const activePids = new Set(
+    procs
+      .filter(p => (p.payload?.cpu_percent ?? 0) > 0.5)
+      .map(p => p.payload?.pid)
+      .filter(Boolean)
+  );
+  if (activePids.size > 1) {
     issues.push({
-      title: 'Gateway PID changed during run',
-      detail: `Saw ${pids.size} distinct gateway PIDs. Possible launchd auto-restart or external swap.`,
+      title: 'Gateway PID changed during active dispatch',
+      detail: `Saw ${activePids.size} distinct gateway PIDs while the dispatch was running. Possible launchd auto-restart or external swap mid-run.`,
     });
   }
-  // model set change
-  const sets = new Set(lms.map(s =>
-    (s.payload?.models ?? []).map(m => m.identifier).sort().join(',')));
-  if (sets.size > 1) {
+
+  // model-set change — same scoping nuance: only flag if multiple
+  // distinct sets land while CPU > 0.5% (i.e., the workload was
+  // running, not bracketed by an operator swap that happens at idle).
+  const activeSets = new Set();
+  for (const s of lms) {
+    const proc = procs.find(p => Math.abs(p.t - s.t) < 1500);
+    const cpu = proc?.payload?.cpu_percent ?? 0;
+    if (cpu > 0.5) {
+      const ids = (s.payload?.models ?? []).map(m => m.identifier).sort().join(',');
+      activeSets.add(ids);
+    }
+  }
+  if (activeSets.size > 1) {
     issues.push({
-      title: 'Loaded-model set changed mid-run',
-      detail: `${sets.size} distinct sets observed — probable JIT load/unload event.`,
+      title: 'Loaded-model set changed mid-dispatch',
+      detail: `${activeSets.size} distinct sets observed while CPU was active — probable JIT load/unload during the run.`,
     });
   }
-  // No lms samples means lms CLI wasn't reachable
+
+  // No lms samples means lms CLI wasn't reachable.
   if (procs.length > 2 && lms.length === 0) {
     issues.push({
       title: 'No LMStudio state captured',
