@@ -263,54 +263,48 @@ const { useState, useEffect, useMemo, useRef, useCallback } = React;
 const ReactFlow = window.ReactFlow.default;
 const { Background, Controls, MarkerType, Handle, Position } = window.ReactFlow;
 
-// ─── Topology — the four blocks + their physical layout ─────────────────
-// Spaced wide enough that smoothstep edges have room to route up over the
-// top (request lane) and down under the bottom (response lane) without
-// visually crashing into adjacent nodes.
-const NODE_DEFS = [
+// ─── Topology — fixed nodes (data-independent) ──────────────────────────
+// The first three blocks are always present: dispatcher → gateway →
+// inference host. Model nodes are derived from the lms samples in the
+// loaded instruments.jsonl (one per identifier seen) and positioned
+// dynamically to the right of LMStudio.
+const FIXED_NODE_DEFS = [
   {
     id: 'claude',
-    pos: { x: 0,    y: 120 },
+    pos: { x: 0,    y: 200 },
     title: 'Claude',
     name:  'Agent dispatcher',
-    desc:  'OpenClaw orchestrator (Hudson) or Claude Code session — builds dispatch, maintains conversation history, executes returned tool calls.',
   },
   {
     id: 'gateway',
-    pos: { x: 340,  y: 120 },
+    pos: { x: 340,  y: 200 },
     title: 'OpenClaw Gateway',
     name:  'Runtime + recovery',
-    desc:  'Resolves agent → model, formats OpenAI-compat request via pi-ai. LMStudio extension runs the recovery path (ba2b033 lives here).',
   },
   {
     id: 'lmstudio',
-    pos: { x: 700,  y: 120 },
+    pos: { x: 700,  y: 200 },
     title: 'LMStudio',
     name:  'Inference host',
-    desc:  'OpenAI-compatible HTTP server. Chat-template wrapper translates wire format ↔ model native format. Manages KV cache.',
-  },
-  {
-    id: 'model',
-    pos: { x: 1060, y: 120 },
-    title: 'Model',
-    name:  'gpt-oss / qwen / etc.',
-    desc:  'Tokens via llama.cpp Metal or MLX-LM. Native output may include harmony / chatml / family-specific channel syntax.',
   },
 ];
 
-// Six edges — request path forward (top lane), response path back (bottom
-// lane). Each direction routes through dedicated handles so they don't
-// overlap each other or pass under the nodes. Labels kept short so they
-// fit in the routed segments without clipping into adjacent nodes.
-const EDGE_DEFS = [
+// Each model node gets an id of the form `model-<identifier>` so React
+// keeps stable references across re-renders.
+const modelNodeId = (identifier) => `model-${identifier}`;
+const MODEL_COL_X = 1060;
+const MODEL_ROW_GAP = 150;
+const MODEL_FIRST_ROW_Y = 60;
+
+// Fixed edges that exist regardless of how many models are loaded.
+// Per-model edges (lmstudio↔model-<id>) are derived dynamically below.
+const FIXED_EDGE_DEFS = [
   // Request lane: req-out (right) → req-in (left)
   { id: 'e1', source: 'claude',   target: 'gateway',  sourceHandle: 'req-out', targetHandle: 'req-in', label: 'dispatch' },
   { id: 'e2', source: 'gateway',  target: 'lmstudio', sourceHandle: 'req-out', targetHandle: 'req-in', label: 'POST /v1/chat' },
-  { id: 'e3', source: 'lmstudio', target: 'model',    sourceHandle: 'req-out', targetHandle: 'req-in', label: 'tokens' },
-  // Response lane: res-out (left) → res-in (right). Source/target order
-  // is reversed visually because tokens flow right-to-left on this lane.
-  { id: 'e4', source: 'model',    target: 'lmstudio', sourceHandle: 'res-out', targetHandle: 'res-in', label: 'harmony' },
-  { id: 'e5', source: 'lmstudio', target: 'gateway',  sourceHandle: 'res-out', targetHandle: 'res-in', label: 'stream ⚠ bug site' },
+  // Response lane: res-out (left) → res-in (right). Tokens flow right-to-
+  // left on this lane, so the source is the right-hand node visually.
+  { id: 'e5', source: 'lmstudio', target: 'gateway',  sourceHandle: 'res-out', targetHandle: 'res-in', label: 'stream' },
   { id: 'e6', source: 'gateway',  target: 'claude',   sourceHandle: 'res-out', targetHandle: 'res-in', label: 'tool_call' },
 ];
 
@@ -328,13 +322,28 @@ function parseInstruments(text) {
   return samples;
 }
 
-// Given a current elapsed_ms, derive node/edge activations.
-// Heuristics:
-//   - claude is active any time process-CPU is non-trivial
-//   - gateway is active when there's a non-zero process sample within last 4s
+// Pull the union of distinct model identifiers seen across the loaded
+// samples, in stable sort order. Used to materialize one node per model
+// and per-model edges to LMStudio.
+function distinctModelIdentifiers(samples) {
+  const set = new Set();
+  for (const s of samples) {
+    if (s.source !== 'lms') continue;
+    for (const m of s.payload?.models ?? []) {
+      if (m.identifier) set.add(m.identifier);
+    }
+  }
+  return [...set].sort();
+}
+
+// Given a current elapsed_ms, derive node/edge activations. Heuristics:
+//   - claude is active any time gateway-CPU is non-trivial
+//   - gateway is active when there's a process sample within last few s
 //   - lmstudio is active when an lms sample arrives (we polled it)
-//   - model is active when lms reports any model status != idle, OR proxied
-//     via gateway CPU surge
+//   - per-model: a model node is active when its status is non-idle in
+//     the most recent lms sample (the model is being decoded against),
+//     OR when the gateway is doing meaningful work and this model is in
+//     the loaded set (proxy: dispatch is in flight against it).
 function computeActivations(samples, currentT) {
   const recent = (s) => Math.abs(s.t - currentT) < 3000;
   const lmsRecent  = samples.find(s => s.source === 'lms'     && recent(s));
@@ -342,10 +351,10 @@ function computeActivations(samples, currentT) {
 
   const activeNodes = new Set();
   const activeEdges = new Set();
+  const cpu = procRecent?.payload?.cpu_percent ?? 0;
 
   if (procRecent) {
     activeNodes.add('gateway');
-    const cpu = procRecent.payload?.cpu_percent ?? 0;
     if (cpu > 0.5) {
       activeNodes.add('claude');
       activeEdges.add('e1');
@@ -356,33 +365,47 @@ function computeActivations(samples, currentT) {
       activeEdges.add('e5');
     }
   }
+
   if (lmsRecent) {
     activeNodes.add('lmstudio');
     activeEdges.add('e2');
     activeEdges.add('e5');
     const models = lmsRecent.payload?.models ?? [];
-    const anyBusy = models.some(m => m.status && m.status !== 'idle');
-    if (anyBusy) {
-      activeNodes.add('model');
-      activeEdges.add('e3');
-      activeEdges.add('e4');
+    for (const m of models) {
+      const ident = m.identifier;
+      if (!ident) continue;
+      const nodeId = modelNodeId(ident);
+      const isBusy = m.status && m.status !== 'idle';
+      // Active when busy in lms OR gateway is doing real work (dispatch
+      // in flight; status field on lms is coarse and often stays idle
+      // even mid-stream because the poll cadence is 2s).
+      if (isBusy || cpu > 1) {
+        activeNodes.add(nodeId);
+        activeEdges.add(`req-to-${ident}`);
+        activeEdges.add(`res-from-${ident}`);
+      }
     }
   }
   return { activeNodes, activeEdges };
 }
 
 // Per-node display state at a given time (latest values up to currentT).
+// Returns the gateway / lmstudio summary lines and a map of per-model
+// state keyed by identifier (the dynamic model nodes consume this).
 function deriveNodeState(samples, currentT) {
   const stateUpTo = samples.filter(s => s.t <= currentT);
   const lastLms  = [...stateUpTo].reverse().find(s => s.source === 'lms');
   const lastProc = [...stateUpTo].reverse().find(s => s.source === 'process');
 
   let lmsLine = '(no samples yet)';
-  let modelLine = '(no models yet)';
+  const perModel = {};
   if (lastLms) {
     const models = lastLms.payload?.models ?? [];
     lmsLine = `${models.length} model${models.length === 1 ? '' : 's'} loaded`;
-    modelLine = models.map(m => `${m.identifier} @ ${m.context}`).join(' · ') || '(none)';
+    for (const m of models) {
+      if (!m.identifier) continue;
+      perModel[m.identifier] = `ctx ${m.context} · ${m.status || 'idle'}`;
+    }
   }
 
   let gwLine = '(no samples yet)';
@@ -391,7 +414,7 @@ function deriveNodeState(samples, currentT) {
     gwLine = `pid=${p.pid} · ${p.rss_mb}MB · ${p.cpu_percent?.toFixed(1)}% cpu`;
   }
 
-  return { lmsLine, modelLine, gwLine };
+  return { lmsLine, gwLine, perModel };
 }
 
 function summarizeAnomalies(samples) {
@@ -546,38 +569,90 @@ function App() {
   const nodeState = useMemo(() => deriveNodeState(samples, currentT), [samples, currentT]);
   const anomalies = useMemo(() => summarizeAnomalies(samples), [samples]);
 
-  // Build ReactFlow nodes / edges with current activation state
-  const nodes = useMemo(() => NODE_DEFS.map(n => {
-    let live = '';
-    if (n.id === 'gateway')  live = nodeState.gwLine;
-    if (n.id === 'lmstudio') live = nodeState.lmsLine;
-    if (n.id === 'model')    live = nodeState.modelLine;
-    if (n.id === 'claude')   live = '(deduced from gateway CPU)';
-    return {
-      id: n.id,
-      position: n.pos,
-      data: { title: n.title, name: n.name, desc: n.desc, live },
-      type: 'darkmux',
-      className: activeNodes.has(n.id) ? 'dx-active' : '',
-    };
-  }), [activeNodes, nodeState]);
+  // Distinct model identifiers materialize as dedicated nodes to the
+  // right of LMStudio. Recomputed when samples change.
+  const modelIdents = useMemo(() => distinctModelIdentifiers(samples), [samples]);
 
-  const edges = useMemo(() => EDGE_DEFS.map(e => ({
-    id: e.id,
-    source: e.source,
-    target: e.target,
-    sourceHandle: e.sourceHandle,
-    targetHandle: e.targetHandle,
-    label: e.label,
-    labelBgPadding: [8, 4],
-    labelBgBorderRadius: 4,
-    type: 'smoothstep',
-    pathOptions: { offset: 16, borderRadius: 12 },
-    animated: false,
-    className: activeEdges.has(e.id) ? 'dx-active' : '',
-    markerEnd: { type: MarkerType.ArrowClosed, color: activeEdges.has(e.id) ? '#6df1ff' : '#3a3a44' },
-    style: { strokeWidth: 1.5 },
-  })), [activeEdges]);
+  // Build ReactFlow nodes: 3 fixed + 1 per loaded model.
+  const nodes = useMemo(() => {
+    const fixed = FIXED_NODE_DEFS.map(n => {
+      let live = '';
+      if (n.id === 'gateway')  live = nodeState.gwLine;
+      if (n.id === 'lmstudio') live = nodeState.lmsLine;
+      if (n.id === 'claude')   live = '(via gateway CPU)';
+      return {
+        id: n.id,
+        position: n.pos,
+        data: { title: n.title, name: n.name, live },
+        type: 'darkmux',
+        className: activeNodes.has(n.id) ? 'dx-active' : '',
+      };
+    });
+    const modelNodes = modelIdents.map((ident, idx) => {
+      const id = modelNodeId(ident);
+      return {
+        id,
+        position: { x: MODEL_COL_X, y: MODEL_FIRST_ROW_Y + idx * MODEL_ROW_GAP },
+        data: {
+          title: 'Model',
+          name: ident,
+          live: nodeState.perModel?.[ident] ?? '(loaded)',
+        },
+        type: 'darkmux',
+        className: activeNodes.has(id) ? 'dx-active' : '',
+      };
+    });
+    return [...fixed, ...modelNodes];
+  }, [activeNodes, nodeState, modelIdents]);
+
+  // Build edges: fixed (claude↔gateway, gateway↔lmstudio) + a request
+  // and a response edge per model (lmstudio↔model-<ident>).
+  const edges = useMemo(() => {
+    const baseStyle = (id) => ({
+      labelBgPadding: [8, 4],
+      labelBgBorderRadius: 4,
+      type: 'smoothstep',
+      pathOptions: { offset: 16, borderRadius: 12 },
+      animated: false,
+      className: activeEdges.has(id) ? 'dx-active' : '',
+      markerEnd: { type: MarkerType.ArrowClosed, color: activeEdges.has(id) ? '#6df1ff' : '#3a3a44' },
+      style: { strokeWidth: 1.5 },
+    });
+    const fixed = FIXED_EDGE_DEFS.map(e => ({
+      id: e.id,
+      source: e.source,
+      target: e.target,
+      sourceHandle: e.sourceHandle,
+      targetHandle: e.targetHandle,
+      label: e.label,
+      ...baseStyle(e.id),
+    }));
+    const modelEdges = modelIdents.flatMap(ident => {
+      const reqId = `req-to-${ident}`;
+      const resId = `res-from-${ident}`;
+      return [
+        {
+          id: reqId,
+          source: 'lmstudio',
+          target: modelNodeId(ident),
+          sourceHandle: 'req-out',
+          targetHandle: 'req-in',
+          label: 'tokens',
+          ...baseStyle(reqId),
+        },
+        {
+          id: resId,
+          source: modelNodeId(ident),
+          target: 'lmstudio',
+          sourceHandle: 'res-out',
+          targetHandle: 'res-in',
+          label: 'tokens',
+          ...baseStyle(resId),
+        },
+      ];
+    });
+    return [...fixed, ...modelEdges];
+  }, [activeEdges, modelIdents]);
 
   // Recent events log (window around currentT)
   const eventsToShow = useMemo(() => {
