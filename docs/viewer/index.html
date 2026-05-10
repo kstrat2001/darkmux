@@ -1,0 +1,556 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>darkmux viewer — telemetry replay</title>
+<meta name="description" content="React-Flow visualization of darkmux lab run telemetry. Replay instruments.jsonl across the four-block local-AI stack.">
+
+<!-- React + ReactDOM + Babel + ReactFlow via CDN. No build tooling. -->
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://unpkg.com/reactflow@11/dist/umd/index.js"></script>
+<link rel="stylesheet" href="https://unpkg.com/reactflow@11/dist/style.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+
+<style>
+  :root {
+    --bg: #0a0a0b;
+    --bg-elev: #131316;
+    --bg-elev2: #1a1a1f;
+    --border: #1f1f24;
+    --border-hot: #2a8a96;
+    --text: #e8e6e3;
+    --muted: #8a8a92;
+    --accent: #6df1ff;
+    --accent-dim: #2a8a96;
+    --warn: #ffb86b;
+    --good: #5af0a3;
+  }
+  * { box-sizing: border-box; }
+  html, body, #root {
+    margin: 0; padding: 0; width: 100%; height: 100vh;
+    background: var(--bg); color: var(--text);
+    font-family: 'Inter', -apple-system, system-ui, sans-serif;
+    overflow: hidden;
+  }
+  code, pre, .mono { font-family: 'JetBrains Mono', ui-monospace, Menlo, monospace; }
+  a { color: var(--accent); }
+
+  .topbar {
+    position: absolute; top: 0; left: 0; right: 0; height: 56px;
+    background: var(--bg-elev);
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; padding: 0 20px; gap: 16px;
+    z-index: 10;
+  }
+  .topbar .brand {
+    font-family: 'JetBrains Mono', monospace; font-weight: 700;
+    font-size: 14px; letter-spacing: 0.18em; text-transform: uppercase;
+    color: var(--muted);
+  }
+  .topbar .brand .accent { color: var(--accent); }
+  .topbar .title { font-size: 14px; color: var(--text); margin-left: 8px; }
+  .topbar .file-pick {
+    margin-left: auto;
+    font-size: 12px;
+    background: var(--bg);
+    color: var(--accent);
+    border: 1px solid var(--border-hot);
+    padding: 6px 12px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .topbar .file-pick:hover { background: var(--bg-elev2); }
+  input[type=file] { display: none; }
+
+  .stage {
+    position: absolute; top: 56px; left: 0; right: 0; bottom: 180px;
+    background: var(--bg);
+  }
+  /* React-Flow background */
+  .react-flow__renderer { background: var(--bg) !important; }
+  .react-flow__node {
+    border: 1px solid var(--border);
+    background: var(--bg-elev);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 12px 16px;
+    font-size: 13px;
+    min-width: 180px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+    transition: all 0.2s ease;
+  }
+  .react-flow__node.dx-active {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px rgba(109, 241, 255, 0.15), 0 4px 12px rgba(109, 241, 255, 0.3);
+  }
+  .react-flow__node.dx-warn {
+    border-color: var(--warn);
+    box-shadow: 0 0 0 2px rgba(255, 184, 107, 0.15);
+  }
+  .node-title {
+    font-family: 'JetBrains Mono', monospace; font-weight: 700;
+    font-size: 11px; letter-spacing: 0.15em; text-transform: uppercase;
+    color: var(--accent); margin-bottom: 4px;
+  }
+  .node-name { font-weight: 600; font-size: 14px; margin-bottom: 6px; }
+  .node-meta { color: var(--muted); font-size: 11px; line-height: 1.5; }
+  .node-meta .k { color: var(--text); font-family: 'JetBrains Mono', monospace; }
+
+  .react-flow__edge-path { stroke: var(--border); stroke-width: 2; }
+  .react-flow__edge.dx-active .react-flow__edge-path {
+    stroke: var(--accent);
+    stroke-dasharray: 4 4;
+    animation: dashFlow 0.6s linear infinite;
+  }
+  @keyframes dashFlow { to { stroke-dashoffset: -16; } }
+
+  .react-flow__edge-label-bg { fill: var(--bg-elev) !important; }
+  .react-flow__edge-label-text { fill: var(--muted) !important; font-size: 11px; }
+  .react-flow__controls { background: var(--bg-elev); border: 1px solid var(--border); }
+  .react-flow__controls button {
+    background: var(--bg-elev) !important; color: var(--text) !important;
+    border-color: var(--border) !important;
+  }
+
+  /* Bottom control panel */
+  .panel {
+    position: absolute; bottom: 0; left: 0; right: 0; height: 180px;
+    background: var(--bg-elev);
+    border-top: 1px solid var(--border);
+    padding: 16px 20px;
+    display: grid; grid-template-columns: 1fr 380px; gap: 24px;
+  }
+  .scrubber-row { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+  .scrubber-row button {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border-hot);
+    padding: 6px 12px;
+    border-radius: 4px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .scrubber-row button:hover { background: var(--bg-elev2); }
+  .scrubber-row button.primary { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+  .scrubber-row .speed { color: var(--muted); font-size: 11px; font-family: 'JetBrains Mono', monospace; }
+  .scrubber {
+    flex: 1; -webkit-appearance: none; height: 4px;
+    background: var(--border); border-radius: 2px; outline: none;
+  }
+  .scrubber::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none;
+    width: 14px; height: 14px; border-radius: 50%;
+    background: var(--accent); cursor: pointer;
+  }
+  .panel .label {
+    font-family: 'JetBrains Mono', monospace; font-size: 10px;
+    letter-spacing: 0.18em; text-transform: uppercase;
+    color: var(--muted); margin-bottom: 8px;
+  }
+  .events {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 8px 12px;
+    height: 100px;
+    overflow-y: auto;
+    font-family: 'JetBrains Mono', monospace; font-size: 11px;
+    line-height: 1.6;
+  }
+  .events .ev-row { color: var(--muted); }
+  .events .ev-row.ev-current { color: var(--text); }
+  .events .ev-row .t { color: var(--accent); }
+  .events .ev-row .src-lms { color: var(--good); }
+  .events .ev-row .src-process { color: var(--warn); }
+  .events .ev-row .src-meta { color: var(--muted); }
+  .anomalies {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--warn);
+    border-radius: 4px;
+    padding: 8px 12px;
+    height: 100px;
+    overflow-y: auto;
+    font-size: 11px;
+    line-height: 1.5;
+  }
+  .anomalies .none { color: var(--muted); }
+  .anomalies .item { color: var(--warn); margin-bottom: 4px; }
+  .anomalies strong { color: var(--text); }
+
+  .empty-state {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    text-align: center; color: var(--muted);
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .empty-state h2 { font-size: 14px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--accent); margin: 0 0 12px; }
+  .empty-state code { background: var(--bg-elev); padding: 2px 6px; border-radius: 3px; color: var(--text); font-size: 12px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo, useRef, useCallback } = React;
+const ReactFlow = window.ReactFlow.default;
+const { Background, Controls, MarkerType } = window.ReactFlow;
+
+// ─── Topology — the four blocks + their physical layout ─────────────────
+const NODE_DEFS = [
+  {
+    id: 'claude',
+    pos: { x: 0,    y: 80 },
+    title: 'Claude',
+    name:  'Agent dispatcher',
+    desc:  'OpenClaw orchestrator (Hudson) or Claude Code session — builds dispatch, maintains conversation history, executes returned tool calls.',
+  },
+  {
+    id: 'gateway',
+    pos: { x: 280,  y: 80 },
+    title: 'OpenClaw Gateway',
+    name:  'Runtime + recovery',
+    desc:  'Resolves agent → model, formats OpenAI-compat request via pi-ai. LMStudio extension runs the recovery path (ba2b033 lives here).',
+  },
+  {
+    id: 'lmstudio',
+    pos: { x: 580,  y: 80 },
+    title: 'LMStudio',
+    name:  'Inference host',
+    desc:  'OpenAI-compatible HTTP server. Chat-template wrapper translates wire format ↔ model native format. Manages KV cache.',
+  },
+  {
+    id: 'model',
+    pos: { x: 880,  y: 80 },
+    title: 'Model',
+    name:  'gpt-oss / qwen / etc.',
+    desc:  'Tokens via llama.cpp Metal or MLX-LM. Native output may include harmony / chatml / family-specific channel syntax.',
+  },
+];
+
+// Six edges — request path forward, response path back. Bug site labelled.
+const EDGE_DEFS = [
+  { id: 'e1', source: 'claude',   target: 'gateway',  label: 'request',  curve: 'top' },
+  { id: 'e2', source: 'gateway',  target: 'lmstudio', label: 'POST /v1/chat/completions', curve: 'top' },
+  { id: 'e3', source: 'lmstudio', target: 'model',    label: 'tokens',   curve: 'top' },
+  { id: 'e4', source: 'model',    target: 'lmstudio', label: 'tokens (harmony)', curve: 'bot' },
+  { id: 'e5', source: 'lmstudio', target: 'gateway',  label: 'stream chunks (← bug site)', curve: 'bot' },
+  { id: 'e6', source: 'gateway',  target: 'claude',   label: 'tool_call ready', curve: 'bot' },
+];
+
+// ─── Sample parsing ─────────────────────────────────────────────────────
+function parseInstruments(text) {
+  const samples = [];
+  for (const line of text.split('\n')) {
+    const t = line.trim();
+    if (!t) continue;
+    try {
+      samples.push(JSON.parse(t));
+    } catch { /* skip malformed */ }
+  }
+  samples.sort((a, b) => a.t - b.t);
+  return samples;
+}
+
+// Given a current elapsed_ms, derive node/edge activations.
+// Heuristics:
+//   - claude is active any time process-CPU is non-trivial
+//   - gateway is active when there's a non-zero process sample within last 4s
+//   - lmstudio is active when an lms sample arrives (we polled it)
+//   - model is active when lms reports any model status != idle, OR proxied
+//     via gateway CPU surge
+function computeActivations(samples, currentT) {
+  const recent = (s) => Math.abs(s.t - currentT) < 3000;
+  const lmsRecent  = samples.find(s => s.source === 'lms'     && recent(s));
+  const procRecent = samples.find(s => s.source === 'process' && recent(s));
+
+  const activeNodes = new Set();
+  const activeEdges = new Set();
+
+  if (procRecent) {
+    activeNodes.add('gateway');
+    const cpu = procRecent.payload?.cpu_percent ?? 0;
+    if (cpu > 0.5) {
+      activeNodes.add('claude');
+      activeEdges.add('e1');
+      activeEdges.add('e6');
+    }
+    if (cpu > 1) {
+      activeEdges.add('e2');
+      activeEdges.add('e5');
+    }
+  }
+  if (lmsRecent) {
+    activeNodes.add('lmstudio');
+    activeEdges.add('e2');
+    activeEdges.add('e5');
+    const models = lmsRecent.payload?.models ?? [];
+    const anyBusy = models.some(m => m.status && m.status !== 'idle');
+    if (anyBusy) {
+      activeNodes.add('model');
+      activeEdges.add('e3');
+      activeEdges.add('e4');
+    }
+  }
+  return { activeNodes, activeEdges };
+}
+
+// Per-node display state at a given time (latest values up to currentT).
+function deriveNodeState(samples, currentT) {
+  const stateUpTo = samples.filter(s => s.t <= currentT);
+  const lastLms  = [...stateUpTo].reverse().find(s => s.source === 'lms');
+  const lastProc = [...stateUpTo].reverse().find(s => s.source === 'process');
+
+  let lmsLine = '(no samples yet)';
+  let modelLine = '(no models yet)';
+  if (lastLms) {
+    const models = lastLms.payload?.models ?? [];
+    lmsLine = `${models.length} model${models.length === 1 ? '' : 's'} loaded`;
+    modelLine = models.map(m => `${m.identifier} @ ${m.context}`).join(' · ') || '(none)';
+  }
+
+  let gwLine = '(no samples yet)';
+  if (lastProc) {
+    const p = lastProc.payload;
+    gwLine = `pid=${p.pid} · ${p.rss_mb}MB · ${p.cpu_percent?.toFixed(1)}% cpu`;
+  }
+
+  return { lmsLine, modelLine, gwLine };
+}
+
+function summarizeAnomalies(samples) {
+  if (samples.length === 0) return [];
+  const lms     = samples.filter(s => s.source === 'lms');
+  const procs   = samples.filter(s => s.source === 'process');
+  const issues  = [];
+  // PID change mid-run
+  const pids = new Set(procs.map(p => p.payload?.pid).filter(Boolean));
+  if (pids.size > 1) {
+    issues.push({
+      title: 'Gateway PID changed during run',
+      detail: `Saw ${pids.size} distinct gateway PIDs. Possible launchd auto-restart or external swap.`,
+    });
+  }
+  // model set change
+  const sets = new Set(lms.map(s =>
+    (s.payload?.models ?? []).map(m => m.identifier).sort().join(',')));
+  if (sets.size > 1) {
+    issues.push({
+      title: 'Loaded-model set changed mid-run',
+      detail: `${sets.size} distinct sets observed — probable JIT load/unload event.`,
+    });
+  }
+  // No lms samples means lms CLI wasn't reachable
+  if (procs.length > 2 && lms.length === 0) {
+    issues.push({
+      title: 'No LMStudio state captured',
+      detail: '`lms` CLI may not be installed or queryable.',
+    });
+  }
+  return issues;
+}
+
+// ─── Components ─────────────────────────────────────────────────────────
+function NodeCard({ data }) {
+  return (
+    <div>
+      <div className="node-title">{data.title}</div>
+      <div className="node-name">{data.name}</div>
+      <div className="node-meta">
+        {data.live && data.live.split('\n').map((line, i) => (
+          <div key={i}>{line}</div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function App() {
+  const [samples, setSamples] = useState([]);
+  const [currentT, setCurrentT] = useState(0);
+  const [tMin, setTMin] = useState(0);
+  const [tMax, setTMax] = useState(0);
+  const [playing, setPlaying] = useState(false);
+  const [speed, setSpeed] = useState(1);
+  const playTimer = useRef(null);
+
+  const onFile = useCallback(async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const text = await file.text();
+    const parsed = parseInstruments(text);
+    setSamples(parsed);
+    if (parsed.length > 0) {
+      const lo = parsed[0].t;
+      const hi = parsed[parsed.length - 1].t;
+      setTMin(lo); setTMax(hi); setCurrentT(lo);
+    }
+  }, []);
+
+  // playback
+  useEffect(() => {
+    if (!playing || tMax === 0) return;
+    playTimer.current = setInterval(() => {
+      setCurrentT(t => {
+        const next = t + 200 * speed;
+        if (next >= tMax) { setPlaying(false); return tMax; }
+        return next;
+      });
+    }, 200);
+    return () => clearInterval(playTimer.current);
+  }, [playing, tMax, speed]);
+
+  const { activeNodes, activeEdges } = useMemo(
+    () => computeActivations(samples, currentT),
+    [samples, currentT]
+  );
+  const nodeState = useMemo(() => deriveNodeState(samples, currentT), [samples, currentT]);
+  const anomalies = useMemo(() => summarizeAnomalies(samples), [samples]);
+
+  // Build ReactFlow nodes / edges with current activation state
+  const nodes = useMemo(() => NODE_DEFS.map(n => {
+    let live = '';
+    if (n.id === 'gateway')  live = nodeState.gwLine;
+    if (n.id === 'lmstudio') live = nodeState.lmsLine;
+    if (n.id === 'model')    live = nodeState.modelLine;
+    if (n.id === 'claude')   live = '(deduced from gateway CPU)';
+    return {
+      id: n.id,
+      position: n.pos,
+      data: { title: n.title, name: n.name, desc: n.desc, live, label: <NodeCard data={{ title: n.title, name: n.name, live }} /> },
+      type: 'default',
+      className: activeNodes.has(n.id) ? 'dx-active' : '',
+    };
+  }), [activeNodes, nodeState]);
+
+  const edges = useMemo(() => EDGE_DEFS.map(e => ({
+    id: e.id,
+    source: e.source,
+    target: e.target,
+    label: e.label,
+    animated: false,
+    className: activeEdges.has(e.id) ? 'dx-active' : '',
+    markerEnd: { type: MarkerType.ArrowClosed, color: activeEdges.has(e.id) ? '#6df1ff' : '#1f1f24' },
+  })), [activeEdges]);
+
+  // Recent events log (window around currentT)
+  const eventsToShow = useMemo(() => {
+    if (samples.length === 0) return [];
+    return samples
+      .filter(s => s.t <= currentT && s.t > currentT - 8000)
+      .slice(-12)
+      .reverse();
+  }, [samples, currentT]);
+
+  const elapsedSec = ((currentT - tMin) / 1000).toFixed(1);
+  const totalSec = ((tMax - tMin) / 1000).toFixed(1);
+
+  return (
+    <>
+      <div className="topbar">
+        <span className="brand">darkmux <span className="accent">·</span> viewer</span>
+        <span className="title">cross-layer telemetry replay</span>
+        <label className="file-pick">
+          load instruments.jsonl
+          <input type="file" accept=".jsonl,.json,.txt" onChange={onFile} />
+        </label>
+      </div>
+
+      <div className="stage">
+        {samples.length === 0 ? (
+          <div className="empty-state">
+            <h2>no telemetry loaded</h2>
+            <p>capture telemetry on a run with:</p>
+            <p><code>darkmux lab run &lt;workload&gt; --instrument</code></p>
+            <p>then load <code>~/.darkmux/runs/&lt;run-id&gt;/instruments.jsonl</code></p>
+          </div>
+        ) : (
+          <ReactFlow
+            nodes={nodes}
+            edges={edges}
+            fitView
+            fitViewOptions={{ padding: 0.15 }}
+            minZoom={0.4}
+            maxZoom={1.2}
+            proOptions={{ hideAttribution: true }}
+            nodesDraggable={false}
+            nodesConnectable={false}
+            elementsSelectable={false}
+          >
+            <Background color="#1f1f24" gap={24} />
+            <Controls showInteractive={false} />
+          </ReactFlow>
+        )}
+      </div>
+
+      <div className="panel">
+        <div>
+          <div className="scrubber-row">
+            <button className="primary" onClick={() => setPlaying(p => !p)} disabled={samples.length === 0}>
+              {playing ? '⏸ pause' : '▶ play'}
+            </button>
+            <button onClick={() => { setCurrentT(tMin); setPlaying(false); }} disabled={samples.length === 0}>
+              ⏮ reset
+            </button>
+            <span className="speed">×</span>
+            {[1, 2, 5].map(s => (
+              <button key={s} onClick={() => setSpeed(s)} style={{ borderColor: speed === s ? 'var(--accent)' : 'var(--border-hot)' }}>
+                {s}
+              </button>
+            ))}
+            <span className="speed mono">{elapsedSec}s / {totalSec}s</span>
+          </div>
+          <input
+            type="range"
+            className="scrubber"
+            min={tMin}
+            max={tMax}
+            value={currentT}
+            disabled={samples.length === 0}
+            onChange={e => { setPlaying(false); setCurrentT(parseInt(e.target.value, 10)); }}
+          />
+          <div className="label" style={{ marginTop: 14 }}>recent events</div>
+          <div className="events">
+            {eventsToShow.length === 0 && <div className="ev-row">(no events yet)</div>}
+            {eventsToShow.map((s, i) => (
+              <div key={i} className="ev-row ev-current">
+                <span className="t">{((s.t - tMin) / 1000).toFixed(1).padStart(5, ' ')}s</span>
+                {' '}
+                <span className={`src-${s.source}`}>{s.source.padEnd(7, ' ')}</span>
+                {' '}
+                {s.source === 'lms' && `${s.payload?.models?.length ?? 0} models`}
+                {s.source === 'process' && `pid=${s.payload?.pid} rss=${s.payload?.rss_mb}MB cpu=${s.payload?.cpu_percent?.toFixed(1)}%`}
+                {s.source === 'meta' && (s.payload?.event ?? '?')}
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div>
+          <div className="label">anomalies</div>
+          <div className="anomalies">
+            {anomalies.length === 0
+              ? <div className="none">{samples.length === 0 ? 'load a run to begin' : 'no anomalies detected'}</div>
+              : anomalies.map((a, i) => (
+                  <div key={i} className="item">
+                    <strong>⚠ {a.title}</strong>
+                    <div>{a.detail}</div>
+                  </div>
+                ))}
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
