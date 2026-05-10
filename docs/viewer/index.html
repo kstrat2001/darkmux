@@ -101,9 +101,10 @@
     background: var(--bg-elev);
     color: var(--text);
     border-radius: 6px;
-    padding: 12px 16px;
+    padding: 14px 18px;
     font-size: 13px;
-    min-width: 180px;
+    width: 240px;
+    min-height: 110px;
     box-shadow: 0 2px 8px rgba(0,0,0,0.3);
     transition: all 0.2s ease;
   }
@@ -241,48 +242,56 @@
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useMemo, useRef, useCallback } = React;
 const ReactFlow = window.ReactFlow.default;
-const { Background, Controls, MarkerType } = window.ReactFlow;
+const { Background, Controls, MarkerType, Handle, Position } = window.ReactFlow;
 
 // ─── Topology — the four blocks + their physical layout ─────────────────
+// Spaced wide enough that smoothstep edges have room to route up over the
+// top (request lane) and down under the bottom (response lane) without
+// visually crashing into adjacent nodes.
 const NODE_DEFS = [
   {
     id: 'claude',
-    pos: { x: 0,    y: 80 },
+    pos: { x: 0,    y: 120 },
     title: 'Claude',
     name:  'Agent dispatcher',
     desc:  'OpenClaw orchestrator (Hudson) or Claude Code session — builds dispatch, maintains conversation history, executes returned tool calls.',
   },
   {
     id: 'gateway',
-    pos: { x: 280,  y: 80 },
+    pos: { x: 340,  y: 120 },
     title: 'OpenClaw Gateway',
     name:  'Runtime + recovery',
     desc:  'Resolves agent → model, formats OpenAI-compat request via pi-ai. LMStudio extension runs the recovery path (ba2b033 lives here).',
   },
   {
     id: 'lmstudio',
-    pos: { x: 580,  y: 80 },
+    pos: { x: 700,  y: 120 },
     title: 'LMStudio',
     name:  'Inference host',
     desc:  'OpenAI-compatible HTTP server. Chat-template wrapper translates wire format ↔ model native format. Manages KV cache.',
   },
   {
     id: 'model',
-    pos: { x: 880,  y: 80 },
+    pos: { x: 1060, y: 120 },
     title: 'Model',
     name:  'gpt-oss / qwen / etc.',
     desc:  'Tokens via llama.cpp Metal or MLX-LM. Native output may include harmony / chatml / family-specific channel syntax.',
   },
 ];
 
-// Six edges — request path forward, response path back. Bug site labelled.
+// Six edges — request path forward (top lane), response path back (bottom
+// lane). Each direction routes through dedicated handles so they don't
+// overlap each other or pass under the nodes.
 const EDGE_DEFS = [
-  { id: 'e1', source: 'claude',   target: 'gateway',  label: 'request',  curve: 'top' },
-  { id: 'e2', source: 'gateway',  target: 'lmstudio', label: 'POST /v1/chat/completions', curve: 'top' },
-  { id: 'e3', source: 'lmstudio', target: 'model',    label: 'tokens',   curve: 'top' },
-  { id: 'e4', source: 'model',    target: 'lmstudio', label: 'tokens (harmony)', curve: 'bot' },
-  { id: 'e5', source: 'lmstudio', target: 'gateway',  label: 'stream chunks (← bug site)', curve: 'bot' },
-  { id: 'e6', source: 'gateway',  target: 'claude',   label: 'tool_call ready', curve: 'bot' },
+  // Request lane: req-out (right) → req-in (left)
+  { id: 'e1', source: 'claude',   target: 'gateway',  sourceHandle: 'req-out', targetHandle: 'req-in', label: 'request' },
+  { id: 'e2', source: 'gateway',  target: 'lmstudio', sourceHandle: 'req-out', targetHandle: 'req-in', label: 'POST /v1/chat/completions' },
+  { id: 'e3', source: 'lmstudio', target: 'model',    sourceHandle: 'req-out', targetHandle: 'req-in', label: 'tokens' },
+  // Response lane: res-out (left) → res-in (right). Source/target order
+  // is reversed visually because tokens flow right-to-left on this lane.
+  { id: 'e4', source: 'model',    target: 'lmstudio', sourceHandle: 'res-out', targetHandle: 'res-in', label: 'tokens (harmony)' },
+  { id: 'e5', source: 'lmstudio', target: 'gateway',  sourceHandle: 'res-out', targetHandle: 'res-in', label: 'stream chunks (← bug site)' },
+  { id: 'e6', source: 'gateway',  target: 'claude',   sourceHandle: 'res-out', targetHandle: 'res-in', label: 'tool_call ready' },
 ];
 
 // ─── Sample parsing ─────────────────────────────────────────────────────
@@ -398,9 +407,24 @@ function summarizeAnomalies(samples) {
 }
 
 // ─── Components ─────────────────────────────────────────────────────────
+// Custom node with separated request/response handles. Top half of each
+// node hosts the request lane (left-target, right-source) and the bottom
+// half hosts the response lane (right-target, left-source). Edges then
+// route along separate horizontal channels above and below the nodes,
+// not crashing through them.
 function NodeCard({ data }) {
   return (
-    <div>
+    <>
+      {/* Request lane (top half): incoming on the left, outgoing on the right. */}
+      <Handle type="target" position={Position.Left}  id="req-in"
+              style={{ top: 14, background: '#2a8a96', border: 'none', width: 8, height: 8 }} />
+      <Handle type="source" position={Position.Right} id="req-out"
+              style={{ top: 14, background: '#2a8a96', border: 'none', width: 8, height: 8 }} />
+      {/* Response lane (bottom half): outgoing on the left, incoming on the right. */}
+      <Handle type="source" position={Position.Left}  id="res-out"
+              style={{ top: 'auto', bottom: 14, background: '#ffb86b', border: 'none', width: 8, height: 8 }} />
+      <Handle type="target" position={Position.Right} id="res-in"
+              style={{ top: 'auto', bottom: 14, background: '#ffb86b', border: 'none', width: 8, height: 8 }} />
       <div className="node-title">{data.title}</div>
       <div className="node-name">{data.name}</div>
       <div className="node-meta">
@@ -408,9 +432,11 @@ function NodeCard({ data }) {
           <div key={i}>{line}</div>
         ))}
       </div>
-    </div>
+    </>
   );
 }
+
+const NODE_TYPES = { darkmux: NodeCard };
 
 function App() {
   const [samples, setSamples] = useState([]);
@@ -510,8 +536,8 @@ function App() {
     return {
       id: n.id,
       position: n.pos,
-      data: { title: n.title, name: n.name, desc: n.desc, live, label: <NodeCard data={{ title: n.title, name: n.name, live }} /> },
-      type: 'default',
+      data: { title: n.title, name: n.name, desc: n.desc, live },
+      type: 'darkmux',
       className: activeNodes.has(n.id) ? 'dx-active' : '',
     };
   }), [activeNodes, nodeState]);
@@ -520,10 +546,15 @@ function App() {
     id: e.id,
     source: e.source,
     target: e.target,
+    sourceHandle: e.sourceHandle,
+    targetHandle: e.targetHandle,
     label: e.label,
+    type: 'smoothstep',
+    pathOptions: { offset: 12, borderRadius: 8 },
     animated: false,
     className: activeEdges.has(e.id) ? 'dx-active' : '',
-    markerEnd: { type: MarkerType.ArrowClosed, color: activeEdges.has(e.id) ? '#6df1ff' : '#1f1f24' },
+    markerEnd: { type: MarkerType.ArrowClosed, color: activeEdges.has(e.id) ? '#6df1ff' : '#3a3a44' },
+    style: { strokeWidth: 1.5 },
   })), [activeEdges]);
 
   // Recent events log (window around currentT)
@@ -569,8 +600,9 @@ function App() {
           <ReactFlow
             nodes={nodes}
             edges={edges}
+            nodeTypes={NODE_TYPES}
             fitView
-            fitViewOptions={{ padding: 0.15 }}
+            fitViewOptions={{ padding: 0.18 }}
             minZoom={0.4}
             maxZoom={1.2}
             proOptions={{ hideAttribution: true }}
