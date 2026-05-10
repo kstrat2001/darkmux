@@ -308,8 +308,12 @@ const FIXED_NODE_DEFS = [
 // keeps stable references across re-renders.
 const modelNodeId = (identifier) => `model-${identifier}`;
 const MODEL_COL_X = 1060;
-const MODEL_ROW_GAP = 150;
-const MODEL_FIRST_ROW_Y = 60;
+// Wider vertical spacing gives bezier edges room to separate visually.
+// All model edges leave LMStudio from the same handle point, so they
+// share an origin and only diverge over distance — too tight a row
+// gap and the curves overlap before they have time to spread.
+const MODEL_ROW_GAP = 220;
+const MODEL_FIRST_ROW_Y = 40;
 
 // Fixed edges that exist regardless of how many models are loaded.
 // Per-model edges (lmstudio↔model-<id>) are derived dynamically below.
@@ -540,14 +544,24 @@ function App() {
   const playTimer = useRef(null);
 
   const onNodesChange = useCallback((changes) => {
-    for (const change of changes) {
-      if (change.type === 'position' && change.position && !change.dragging) {
-        // Only persist on drag-end (dragging=false in the final change),
-        // so we record the final resting position rather than every
-        // intermediate frame.
-        setOverridePositions(prev => ({ ...prev, [change.id]: change.position }));
+    // Persist position on EVERY position change (intermediate + drag-end).
+    // Originally we only persisted on drag-end thinking it'd be cleaner,
+    // but the useMemo rebuilds nodes on every state tick from samples, so
+    // skipping intermediate updates meant the visual position kept
+    // snapping back to the layout default mid-drag — looked like dragging
+    // was disabled. Updating on every change keeps the visible position
+    // synced with the user's pointer.
+    setOverridePositions(prev => {
+      let next = prev;
+      let changed = false;
+      for (const change of changes) {
+        if (change.type === 'position' && change.position) {
+          if (!changed) { next = { ...prev }; changed = true; }
+          next[change.id] = change.position;
+        }
       }
-    }
+      return changed ? next : prev;
+    });
   }, []);
 
   const resetLayout = useCallback(() => {
@@ -693,9 +707,17 @@ function App() {
       label: e.label,
       ...baseStyle(e.id),
     }));
+    // Model↔LMStudio edges: short, adjacent, and there can be multiple
+    // pairs sharing the same source/target. Straight lines route them
+    // cleaner than smoothstep (which makes right-angle paths that cross
+    // each other when several pairs leave the same node side).
     const modelEdges = modelIdents.flatMap(ident => {
       const reqId = `req-to-${ident}`;
       const resId = `res-from-${ident}`;
+      const baseStraight = (id) => ({
+        ...baseStyle(id),
+        type: 'default', // bezier — naturally curves around adjacent edges
+      });
       return [
         {
           id: reqId,
@@ -704,7 +726,7 @@ function App() {
           sourceHandle: 'req-out',
           targetHandle: 'req-in',
           label: 'tokens',
-          ...baseStyle(reqId),
+          ...baseStraight(reqId),
         },
         {
           id: resId,
@@ -713,7 +735,7 @@ function App() {
           sourceHandle: 'res-out',
           targetHandle: 'res-in',
           label: 'tokens',
-          ...baseStyle(resId),
+          ...baseStraight(resId),
         },
       ];
     });
