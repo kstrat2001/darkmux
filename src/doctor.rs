@@ -18,6 +18,7 @@
 //! to the runtime, not to darkmux.
 
 use crate::agent_roles;
+use crate::eureka;
 use crate::hardware;
 use crate::heuristics;
 use crate::lms;
@@ -73,19 +74,52 @@ impl DoctorReport {
 }
 
 pub fn run() -> DoctorReport {
-    DoctorReport {
-        checks: vec![
-            check_profile_registry(),
-            check_lms_binary(),
-            check_models_loaded(),
-            check_profile_loaded_match(),
-            check_runtime_command(),
-            check_ram_headroom(),
-            check_power_state(),
-            check_platform_and_provider(),
-            check_agent_role_definitions(),
-        ],
-    }
+    let mut checks = vec![
+        check_profile_registry(),
+        check_lms_binary(),
+        check_models_loaded(),
+        check_profile_loaded_match(),
+        check_runtime_command(),
+        check_ram_headroom(),
+        check_power_state(),
+        check_platform_and_provider(),
+        check_agent_role_definitions(),
+    ];
+    checks.extend(eureka_checks());
+    DoctorReport { checks }
+}
+
+/// Run the eureka rule set and map each verdict to a doctor `Check`.
+/// Each rule produces one check row so the user sees which specific
+/// patterns matched/didn't match their setup.
+fn eureka_checks() -> Vec<Check> {
+    let ctx = eureka::Context::collect();
+    eureka::evaluate_all(&ctx)
+        .into_iter()
+        .map(|(def, verdict)| match verdict {
+            eureka::Verdict::Pass => Check {
+                name: format!("eureka: {}", def.id),
+                status: Status::Pass,
+                message: def.name.clone(),
+                hint: None,
+            },
+            eureka::Verdict::Fire { severity, message } => Check {
+                name: format!("eureka: {}", def.id),
+                status: match severity {
+                    eureka::Severity::Warn => Status::Warn,
+                    eureka::Severity::Fail => Status::Fail,
+                },
+                message: format!("{}: {message}", def.name),
+                hint: Some(def.fix_hint),
+            },
+            eureka::Verdict::Skipped(reason) => Check {
+                name: format!("eureka: {}", def.id),
+                status: Status::Pass,
+                message: format!("(skipped: {reason})"),
+                hint: None,
+            },
+        })
+        .collect()
 }
 
 // ─── Individual checks ──────────────────────────────────────────────────
@@ -670,11 +704,13 @@ mod tests {
     }
 
     #[test]
-    fn run_returns_nine_checks() {
+    fn run_returns_static_plus_eureka_checks() {
         let r = run();
-        // Every check we declare in `run()` should appear regardless of
-        // environment — even if the underlying probe couldn't read state.
-        assert_eq!(r.checks.len(), 9);
+        // 9 baseline checks + one per active eureka rule. Every check
+        // should appear regardless of environment — even if the
+        // underlying probe couldn't read state.
+        let expected = 9 + crate::eureka::all_rules().len();
+        assert_eq!(r.checks.len(), expected);
     }
 
     #[test]
