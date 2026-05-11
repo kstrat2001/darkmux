@@ -1,0 +1,58 @@
+name: CI
+
+# Runs on every pull request and on pushes to main. Fails the workflow
+# on ANY warning — see `RUSTFLAGS: "-D warnings"` and `cargo clippy -D warnings`
+# below. Tested locally via the same commands.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  # Treat all warnings (build + clippy + rustdoc) as errors. Any new dead-code
+  # or lint regression fails CI rather than accumulating silently.
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  build-test-lint:
+    name: build + test + lint (macos-latest)
+    runs-on: macos-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # The Cargo.lock hash determines the cache key — bumps invalidate it.
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Format check intentionally NOT enforced yet — the codebase has
+      # accumulated style drift that would mask the more important
+      # lints. Tracked as a follow-up (`cargo fmt --all` once, then
+      # re-enable here).
+
+      - name: Build release (no warnings allowed)
+        run: cargo build --release --all-targets
+
+      - name: Test release
+        run: cargo test --release
+
+      - name: Clippy (all targets, no warnings allowed)
+        run: cargo clippy --release --all-targets -- -D warnings

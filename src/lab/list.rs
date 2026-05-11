@@ -9,6 +9,10 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+/// `run_dir` is public-API surface for downstream tools that want the
+/// path alongside the summary (e.g. `darkmux notebook draft` flows).
+/// The CLI's table printer doesn't read it, hence the dead-code lint.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct RunSummary {
     pub run_id: String,
@@ -40,7 +44,7 @@ pub fn list_runs(limit: Option<usize>) -> Result<Vec<RunSummary>> {
             continue;
         }
         let Ok(meta) = fs::metadata(&manifest) else { continue };
-        let modified = meta.modified().unwrap_or_else(|_| SystemTime::UNIX_EPOCH);
+        let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
         let raw = match fs::read_to_string(&manifest) {
             Ok(s) => s,
             Err(_) => continue,

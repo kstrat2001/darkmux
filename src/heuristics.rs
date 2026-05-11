@@ -200,6 +200,8 @@ pub struct RuleResult {
 /// registered statically below and matched in order (first match wins);
 /// `generic` matches everything as a fallback. Each provider implements
 /// `matches` (claim a hardware shape) and `suggest` (the rules table).
+#[allow(dead_code)] // `description` is part of the public trait surface — providers
+// implement it; future surfaces (doctor verbose mode, scan output) consume it.
 pub trait HeuristicsProvider: Sync {
     /// Stable identifier used in `_notes` and doctor output.
     fn id(&self) -> &'static str;

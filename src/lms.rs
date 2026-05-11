@@ -98,6 +98,12 @@ fn parse_text_ps(text: &str) -> Vec<LoadedModel> {
 /// about (downloaded), regardless of whether it's currently loaded. Used by
 /// `darkmux scan` to discover models the user could add to their profile
 /// registry.
+///
+/// `publisher` is read from `lms ls --json` (e.g. "Qwen", "google",
+/// "lmstudio-community"). Surfaced through this struct as public API
+/// for downstream tools; the current `scan` command consumes other
+/// fields, hence the dead-code lint.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ModelMeta {
     pub model_key: String,

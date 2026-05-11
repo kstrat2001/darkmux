@@ -18,6 +18,11 @@ pub enum Scope {
     User,
 }
 
+/// `profiles` is the canonical registry path (`<root>/profiles.json`).
+/// Reserved public-API surface — the active loader in `profiles.rs`
+/// has its own resolution today, but downstream tools that want the
+/// canonical location read it from here.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct DarkmuxPaths {
     pub root: PathBuf,
@@ -29,6 +34,11 @@ pub struct DarkmuxPaths {
     pub scope: Scope,
 }
 
+/// `ForceProject` / `ForceUser` are used in tests (which the release-mode
+/// dead-code lint doesn't see) and reserved for explicit-override
+/// callers (e.g. an agent that wants to write a notebook entry into a
+/// specific scope regardless of the default Auto-resolve).
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Default)]
 pub enum ResolveScope {
     #[default]

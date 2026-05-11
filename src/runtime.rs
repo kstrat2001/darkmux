@@ -153,7 +153,7 @@ mod tests {
             runtime: None,
             use_when: None,
         };
-        assert_eq!(apply_runtime(&profile).unwrap(), false);
+        assert!(!apply_runtime(&profile).unwrap());
     }
 
     #[test]
@@ -164,7 +164,7 @@ mod tests {
             runtime: Some(ProfileRuntime::default()),
             use_when: None,
         };
-        assert_eq!(apply_runtime(&profile).unwrap(), false);
+        assert!(!apply_runtime(&profile).unwrap());
     }
 
     #[test]
@@ -190,7 +190,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let p = write_config(&tmp, r#"{"agents": {"defaults": {"contextTokens": 250000}}}"#);
         let profile = profile_with_runtime(p.to_str().unwrap(), Some(250000), None, vec![]);
-        assert_eq!(apply_runtime(&profile).unwrap(), false);
+        assert!(!apply_runtime(&profile).unwrap());
     }
 
     #[test]

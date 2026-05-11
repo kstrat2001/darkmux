@@ -39,7 +39,11 @@ pub fn with_provider<R>(id: &str, f: impl FnOnce(&dyn WorkloadProvider) -> R) ->
     Ok(f(p.as_ref()))
 }
 
-/// Snapshot of registered provider ids and descriptions, for `darkmux lab providers`.
+/// Snapshot of registered provider ids and descriptions, for
+/// `darkmux lab providers` (subcommand reserved — not wired in main.rs
+/// today; the registry surface is here so it can be added without
+/// touching this file).
+#[allow(dead_code)]
 pub fn list() -> Vec<(String, String)> {
     let map = registry().lock().expect("registry poisoned");
     map.iter()
