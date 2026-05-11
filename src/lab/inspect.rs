@@ -161,17 +161,19 @@ pub fn read_telemetry_summary(run_dir: &Path) -> Result<Option<TelemetrySummary>
         let Ok(ev) = serde_json::from_str::<Value>(line) else { continue };
         let source = ev.get("source").and_then(|v| v.as_str()).unwrap_or("");
         match source {
-            "meta" => {
-                if ev.get("payload").and_then(|p| p.get("event")).and_then(|v| v.as_str())
-                    == Some("end")
-                {
-                    elapsed_s = ev
-                        .get("payload")
-                        .and_then(|p| p.get("total_elapsed_ms"))
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0)
-                        / 1000;
-                }
+            "meta"
+                if ev
+                    .get("payload")
+                    .and_then(|p| p.get("event"))
+                    .and_then(|v| v.as_str())
+                    == Some("end") =>
+            {
+                elapsed_s = ev
+                    .get("payload")
+                    .and_then(|p| p.get("total_elapsed_ms"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0)
+                    / 1000;
             }
             "lms" => {
                 lms_samples += 1;

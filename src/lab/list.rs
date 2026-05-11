@@ -94,7 +94,7 @@ pub fn list_runs(limit: Option<usize>) -> Result<Vec<RunSummary>> {
     }
 
     // Most recent first.
-    summaries.sort_by(|a, b| b.modified.cmp(&a.modified));
+    summaries.sort_by_key(|s| std::cmp::Reverse(s.modified));
 
     if let Some(n) = limit {
         summaries.truncate(n);
