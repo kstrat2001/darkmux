@@ -4,6 +4,12 @@ use crate::lab::inspect::lab_inspect;
 use crate::workloads::types::InspectionReport;
 use anyhow::Result;
 
+/// Result of `darkmux lab compare`. Fields are read by the CLI's print
+/// path (formatted in main.rs); the dead-code lint doesn't see that
+/// because the formatter accesses via `{:?}`/`Debug` on the whole
+/// struct. Allowing keeps the public-API shape stable for downstream
+/// tools that may consume fields individually.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct CompareResult {
     pub a: InspectionReport,

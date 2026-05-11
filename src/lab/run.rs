@@ -21,6 +21,11 @@ pub struct RunOpts {
     pub instrument: bool,
 }
 
+/// `run_dir` is the canonical path to the run's output directory.
+/// Public-API surface — downstream tools (notebook drafting, viewer
+/// loading) read it after `lab run` completes. The CLI itself prints
+/// `run_id` and not the full path, hence the dead-code lint.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct RunOutcome {
     pub run_id: String,

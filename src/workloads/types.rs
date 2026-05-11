@@ -65,6 +65,12 @@ pub struct WorkloadManifest {
 
 /// A loaded workload manifest, plus where it came from on disk so that
 /// providers can resolve relative paths (promptFile, sandboxSeed) correctly.
+///
+/// `manifest_path` and `source` are reserved public-API surface — the
+/// existing providers consume `manifest` and `base_dir`; tools that
+/// want provenance metadata read from these. The dead-code lint sees
+/// no current callers.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct LoadedWorkload {
     pub manifest: WorkloadManifest,
@@ -85,6 +91,10 @@ pub struct VerifyOutcome {
     pub details: String,
 }
 
+/// `payload_text` and `trajectory_path` are public-API surface for
+/// downstream consumers (notebook drafting reads them); the CLI's run
+/// summary doesn't, hence the dead-code lint.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct RunResult {
     pub ok: bool,
@@ -95,6 +105,11 @@ pub struct RunResult {
     pub error: Option<String>,
 }
 
+/// `summary_chars` is the per-turn summary-length series collected
+/// during inspection. Public-API surface for tools that want to plot
+/// summary-size dynamics; the CLI's inspect summary doesn't use it
+/// directly, hence the dead-code lint.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct InspectionReport {
     pub run_id: String,
@@ -118,6 +133,13 @@ pub enum RunMode {
 /// in the registry. Methods are sync; long-running operations are still wrapped
 /// in `std::process::Command` calls (which block, but darkmux is a single-task
 /// CLI so blocking is fine).
+/// `description` and `teardown` are part of the trait's public surface.
+/// Implementations provide them (description for tooling, teardown
+/// optional with a default impl), but no current call site consumes
+/// them via dynamic dispatch — hence the dead-code lint. Keeping the
+/// trait shape stable for the `lab providers` subcommand + future
+/// per-workload cleanup needs.
+#[allow(dead_code)]
 pub trait WorkloadProvider: Send + Sync {
     fn id(&self) -> &'static str;
     fn description(&self) -> &'static str;
