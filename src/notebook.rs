@@ -266,11 +266,11 @@ fn extract_reply_text(stdout: &str) -> String {
     let Ok(parsed) = serde_json::from_str::<Value>(stdout) else {
         return stdout.to_string();
     };
-    if let Some(payloads) = parsed
-        .get("result")
-        .and_then(|r| r.get("payloads"))
-        .and_then(|p| p.as_array())
-    {
+    let payloads = parsed
+        .get("payloads")
+        .or_else(|| parsed.get("result").and_then(|r| r.get("payloads")))
+        .and_then(|p| p.as_array());
+    if let Some(payloads) = payloads {
         return payloads
             .iter()
             .filter_map(|p| p.get("text").and_then(|t| t.as_str()).map(|s| s.to_string()))
@@ -431,6 +431,12 @@ mod tests {
     #[test]
     fn extract_reply_payloads_array() {
         let json = r#"{"result":{"payloads":[{"text":"alpha"},{"text":"beta"}]}}"#;
+        assert_eq!(extract_reply_text(json), "alpha\n\nbeta");
+    }
+
+    #[test]
+    fn extract_reply_payloads_top_level() {
+        let json = r#"{"payloads":[{"text":"alpha","mediaUrl":null},{"text":"beta"}],"meta":{}}"#;
         assert_eq!(extract_reply_text(json), "alpha\n\nbeta");
     }
 
