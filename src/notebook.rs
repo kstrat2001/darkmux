@@ -140,9 +140,15 @@ pub fn draft_entry(opts: &DraftOptions) -> Result<DraftReport> {
         if !paths.notebook.exists() {
             fs::create_dir_all(&paths.notebook)?;
         }
+        // Include a machine-id tag so the same notebook directory (e.g.
+        // when pointed at an iCloud-synced path via DARKMUX_NOTEBOOK_DIR)
+        // can hold entries from multiple machines without ambiguity.
+        // Honors DARKMUX_MACHINE_ID env var; falls back to a fingerprint
+        // derived from hardware detection (e.g. `apple-silicon-128gb`).
+        let machine_id = machine_fingerprint();
         let header = format!(
-            "<!-- darkmux:notebook-entry: drafted from run {} on {} via 'darkmux notebook draft' -->\n\n",
-            opts.run_id, date
+            "<!-- darkmux:notebook-entry: run={} machine={} date={} -->\n\n",
+            opts.run_id, machine_id, date
         );
         fs::write(&entry_path, format!("{header}{entry_text}\n"))
             .with_context(|| format!("writing {}", entry_path.display()))?;
@@ -296,6 +302,39 @@ fn shortid(run_id: &str) -> String {
     run_id.chars().take(12).collect()
 }
 
+/// Identifier tag for the machine that drafted this notebook entry.
+///
+/// Priority:
+///   1. `DARKMUX_MACHINE_ID` env var (operator-named, e.g. `m5-max-home`)
+///   2. Auto-derived fingerprint: `<platform-slug>-<ram-gb>gb`
+///   3. Hard fallback: `"unknown"` if hardware detection somehow fails
+///
+/// Operators sharing a notebook directory across machines (typically via
+/// DARKMUX_NOTEBOOK_DIR pointing at an iCloud-synced path) should set
+/// DARKMUX_MACHINE_ID on each host so entries are unambiguously
+/// attributable in cross-machine readouts.
+fn machine_fingerprint() -> String {
+    if let Ok(explicit) = env::var("DARKMUX_MACHINE_ID") {
+        let trimmed = explicit.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    let spec = crate::hardware::detect();
+    let platform_slug = match spec.platform {
+        crate::hardware::Platform::AppleSilicon => "apple-silicon",
+        crate::hardware::Platform::MacIntel => "mac-intel",
+        crate::hardware::Platform::Linux => "linux",
+        crate::hardware::Platform::Windows => "windows",
+        crate::hardware::Platform::Other => "unknown-platform",
+    };
+    if spec.total_ram_gb == 0 {
+        platform_slug.to_string()
+    } else {
+        format!("{platform_slug}-{}gb", spec.total_ram_gb)
+    }
+}
+
 fn chrono_like_today() -> String {
     use std::time::Duration;
     // Avoid pulling in chrono just for this; format YYYY-MM-DD from the
@@ -330,6 +369,29 @@ fn epoch_secs_to_ymd(secs: i64) -> (i32, u32, u32) {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[serial_test::serial]
+    #[test]
+    fn machine_fingerprint_honors_explicit_env_var() {
+        let prev = env::var("DARKMUX_MACHINE_ID").ok();
+        // Safety: tests in this module are #[serial_test::serial] so env mutation
+        // is sequenced across the file's tests.
+        unsafe { env::set_var("DARKMUX_MACHINE_ID", "m5-max-home"); }
+        assert_eq!(machine_fingerprint(), "m5-max-home");
+
+        // Empty value falls back to auto-detection (not propagated as empty).
+        unsafe { env::set_var("DARKMUX_MACHINE_ID", "   "); }
+        let auto = machine_fingerprint();
+        assert_ne!(auto, "");
+        assert_ne!(auto, "   ");
+
+        unsafe {
+            match prev {
+                Some(v) => env::set_var("DARKMUX_MACHINE_ID", v),
+                None => env::remove_var("DARKMUX_MACHINE_ID"),
+            }
+        }
+    }
 
     #[test]
     fn slugify_lowercases_and_collapses() {

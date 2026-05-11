@@ -56,15 +56,44 @@ pub fn resolve(scope: ResolveScope) -> DarkmuxPaths {
         }
     };
 
+    // The notebook dir can be overridden via DARKMUX_NOTEBOOK_DIR — useful
+    // for pointing notebook entries at an iCloud-synced (or otherwise
+    // shared) path so multiple machines write to the same notebook. When
+    // unset, falls back to the standard `<root>/notebook` location.
+    //
+    // Tilde expansion is supported for ergonomics — most operators write
+    // `~/Library/...` rather than the literal expanded path.
+    let notebook = env::var("DARKMUX_NOTEBOOK_DIR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| expand_tilde(&s))
+        .unwrap_or_else(|| chosen.join("notebook"));
+
     DarkmuxPaths {
         runs: chosen.join("runs"),
         sandboxes: chosen.join("sandboxes"),
         teams: chosen.join("teams"),
-        notebook: chosen.join("notebook"),
+        notebook,
         profiles: chosen.join("profiles.yaml"),
         scope: chosen_scope,
         root: chosen,
     }
+}
+
+/// Expand a leading `~` to the user's home directory. Pass-through for
+/// any other shape. Returns the original path unchanged if no home is
+/// available (which is unusual; would mean a misconfigured environment).
+fn expand_tilde(s: &str) -> PathBuf {
+    if let Some(stripped) = s.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(stripped);
+        }
+    } else if s == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+    }
+    PathBuf::from(s)
 }
 
 pub fn ensure(paths: &DarkmuxPaths) -> Result<()> {
@@ -152,6 +181,60 @@ mod tests {
         assert_eq!(paths.scope, Scope::User);
 
         env::set_current_dir(prev).unwrap();
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn resolve_honors_darkmux_notebook_dir_env_var() {
+        let tmp = TempDir::new().unwrap();
+        let custom = tmp.path().join("iCloud-Drive").join("darkmux-notebook");
+        let prev = env::var("DARKMUX_NOTEBOOK_DIR").ok();
+        unsafe { env::set_var("DARKMUX_NOTEBOOK_DIR", &custom); }
+
+        let paths = resolve(ResolveScope::ForceUser);
+        assert_eq!(paths.notebook, custom, "notebook dir should be the env-var value");
+        // Other paths still resolve to the user root, not the custom path.
+        assert!(paths.runs.ends_with("runs"));
+        assert!(!paths.runs.starts_with(tmp.path()));
+
+        unsafe {
+            match prev {
+                Some(v) => env::set_var("DARKMUX_NOTEBOOK_DIR", v),
+                None => env::remove_var("DARKMUX_NOTEBOOK_DIR"),
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn resolve_falls_back_when_env_var_empty() {
+        let prev = env::var("DARKMUX_NOTEBOOK_DIR").ok();
+        unsafe { env::set_var("DARKMUX_NOTEBOOK_DIR", ""); }
+
+        let paths = resolve(ResolveScope::ForceUser);
+        // Empty env var should NOT override; notebook stays at <root>/notebook.
+        assert!(paths.notebook.ends_with("notebook"));
+        assert!(paths.notebook.starts_with(&paths.root));
+
+        unsafe {
+            match prev {
+                Some(v) => env::set_var("DARKMUX_NOTEBOOK_DIR", v),
+                None => env::remove_var("DARKMUX_NOTEBOOK_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    fn expand_tilde_handles_home_prefix() {
+        if let Some(home) = dirs::home_dir() {
+            let expanded = expand_tilde("~/foo/bar");
+            assert_eq!(expanded, home.join("foo").join("bar"));
+            let just_tilde = expand_tilde("~");
+            assert_eq!(just_tilde, home);
+        }
+        // Non-tilde paths pass through unchanged.
+        assert_eq!(expand_tilde("/abs/path"), PathBuf::from("/abs/path"));
+        assert_eq!(expand_tilde("relative/path"), PathBuf::from("relative/path"));
     }
 
     #[test]
