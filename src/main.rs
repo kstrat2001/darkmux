@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 
 mod agent_roles;
 mod doctor;
+mod eureka;
 mod hardware;
 mod heuristics;
 mod init;

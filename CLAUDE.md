@@ -59,6 +59,24 @@ tests/cli.rs                  Integration tests (spawn the binary)
 - **Manifests are JSON.** Workload manifests, profile registries, run manifests — all JSON. The repo briefly used YAML; that switch is done. Don't reintroduce YAML.
 - **Tests over prints.** Mutating-state tests (cwd, env vars) need `#[serial_test::serial]` to avoid races. Integration tests in `tests/cli.rs` use `assert_cmd` to spawn the binary.
 
+## Versioning — rules schema
+
+The `eureka` rules engine emits its definitions into `instruments.jsonl` so the viewer can render findings without duplicating rule data in JS. The viewer enforces compatibility on file drop. The contract is plain semver, applied to the rules **data shape** (not to darkmux itself):
+
+| Bump | Meaning | UI behavior |
+|---|---|---|
+| **Patch** (`1.0.0` → `1.0.1`) | Fully backward-compatible. Bug fix in a message, threshold tweak that doesn't change semantics, typo in a `fix_hint`. | Viewer parser ignores; works unchanged. |
+| **Minor** (`1.0` → `1.1`) | Additive. New rule `kind`, new optional field on `RuleDef`. Older viewers can't *evaluate* new rules but can SAFELY IGNORE them. | Viewer soft-warns; renders normally. New rules surface as "checked at pre-flight only" until the viewer gets a JS evaluator. |
+| **Major** (`1.x` → `2.0`) | Breaking. Rename/retype a field, change of `RuleKind` enum encoding, new required field. Older viewers cannot trust newer-major data. | Viewer **blocks** the Anomalies panel + shows an upgrade modal with the exact `cargo install --path . --force` command. User must update CLI or downgrade viewer. |
+
+Rule of thumb when changing the schema:
+
+- Adding a new rule? **Minor bump.**
+- Renaming or retyping a field on `RuleDef`? **Major bump.**
+- Fixing a typo in `fix_hint`? **Patch bump.**
+
+`RULES_SCHEMA_VERSION` lives in `src/eureka.rs` as a single constant. The viewer's `EXPECTED_RULES_SCHEMA_MAJOR` lives in `docs/viewer/index.html` near the top of the script block. **When you bump major, you bump both in the same PR** — the viewer-release-PR is the contract.
+
 ## Common tasks for an agent
 
 If a user asks you to:

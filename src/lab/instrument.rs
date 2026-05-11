@@ -71,15 +71,34 @@ impl InstrumentSidecar {
 
         let started_at = Instant::now();
         let started_unix = unix_ms_now();
+        // Build the meta payload. Carries:
+        //   - lifecycle: event, cadence_ms
+        //   - format version: `version` (instrument-file format, unchanged)
+        //   - CLI version: `darkmux_version` (semver from Cargo.toml)
+        //   - rules: `rules_schema_version` + `rules` (the active rule set
+        //     used by darkmux doctor, embedded so the viewer can render
+        //     findings without duplicating rule definitions)
+        let mut payload = serde_json::json!({
+            "event": "start",
+            "cadence_ms": cadence.as_millis() as u64,
+            "version": 1,
+            "darkmux_version": env!("CARGO_PKG_VERSION"),
+        });
+        // Splice rules_schema_version + rules into the meta payload. If
+        // the serialization fails (shouldn't), we ship the run without
+        // them rather than aborting the dispatch.
+        if let Ok(rules_fields) = crate::eureka::RulesPayload::current().as_meta_fields() {
+            if let Some(obj) = payload.as_object_mut() {
+                for (k, v) in rules_fields {
+                    obj.insert(k, v);
+                }
+            }
+        }
         let meta_start = Sample {
             t: started_unix,
             elapsed_ms: 0,
             source: "meta".into(),
-            payload: serde_json::json!({
-                "event": "start",
-                "cadence_ms": cadence.as_millis() as u64,
-                "version": 1,
-            }),
+            payload,
         };
         writeln!(writer, "{}", serde_json::to_string(&meta_start)?)?;
         writer.flush()?;

@@ -240,7 +240,90 @@
   }
   .anomalies .none { color: var(--muted); }
   .anomalies .item { color: var(--warn); margin-bottom: 4px; }
+  .anomalies .item.info { color: var(--muted); }
+  .anomalies .item.info strong { color: var(--accent-dim); }
   .anomalies strong { color: var(--text); }
+
+  /* Compat banner — non-blocking soft warning for minor schema diff. */
+  .compat-banner {
+    position: fixed; top: 56px; left: 50%; transform: translateX(-50%);
+    z-index: 50;
+    background: var(--bg-elev); border: 1px solid var(--warn);
+    border-radius: 4px; padding: 6px 14px;
+    font-size: 12px; color: var(--text);
+    display: flex; gap: 14px; align-items: center;
+  }
+  .compat-banner strong { color: var(--warn); }
+  .compat-banner .link-btn {
+    background: none; border: none; color: var(--accent); cursor: pointer;
+    font-size: 12px; text-decoration: underline; padding: 0;
+  }
+
+  /* Block overlay — major mismatch or missing meta. Sits under the
+     topbar so the (?) button + reset are still reachable. */
+  .compat-block {
+    position: fixed; top: 56px; left: 0; right: 0; bottom: 0;
+    background: rgba(10, 10, 11, 0.7);
+    z-index: 60;
+    display: flex; align-items: flex-start; justify-content: center;
+    padding-top: 40px;
+    pointer-events: none;
+  }
+  .compat-block-inner {
+    background: var(--bg-elev2); border: 2px solid var(--warn);
+    border-radius: 6px; padding: 24px 32px;
+    max-width: 560px; pointer-events: auto;
+    font-size: 13px; line-height: 1.5;
+  }
+  .compat-block-inner h2 { color: var(--warn); margin: 0 0 12px; font-size: 16px; }
+  .compat-block-inner pre {
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: 3px; padding: 10px 14px;
+    font-family: 'JetBrains Mono', monospace; font-size: 12px;
+    overflow-x: auto;
+  }
+  .compat-block-inner button {
+    margin-top: 12px;
+    background: var(--bg); border: 1px solid var(--border-hot);
+    color: var(--text); padding: 6px 14px; cursor: pointer; border-radius: 3px;
+  }
+
+  /* (?) info modal — backdrop + panel. */
+  .info-modal-bg {
+    position: fixed; inset: 0;
+    background: rgba(10, 10, 11, 0.7);
+    z-index: 200;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .info-modal {
+    background: var(--bg-elev2); border: 1px solid var(--border-hot);
+    border-radius: 6px; padding: 22px 28px;
+    max-width: 580px; max-height: 80vh; overflow-y: auto;
+    font-size: 13px; line-height: 1.5;
+  }
+  .info-modal h3 { margin: 0 0 16px; color: var(--accent); font-size: 15px; }
+  .info-modal h4 { margin: 18px 0 6px; color: var(--text); font-size: 13px; }
+  .info-modal .info-tbl { width: 100%; border-collapse: collapse; }
+  .info-modal .info-tbl td { padding: 4px 8px; border-bottom: 1px solid var(--border); }
+  .info-modal .info-tbl td:first-child { color: var(--muted); width: 50%; }
+  .info-modal .info-reason { color: var(--muted); margin: 8px 0 0; font-size: 12px; }
+  .info-modal .info-fineprint { color: var(--muted); margin-top: 14px; font-size: 11px; }
+  .info-modal pre {
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: 3px; padding: 8px 12px;
+    font-family: 'JetBrains Mono', monospace; font-size: 11px;
+    overflow-x: auto;
+  }
+  .info-modal button {
+    margin-top: 16px;
+    background: var(--bg); border: 1px solid var(--border-hot);
+    color: var(--text); padding: 6px 14px; cursor: pointer; border-radius: 3px;
+  }
+  .info-modal a { color: var(--accent); }
+
+  /* (?) button style — matches existing file-pick chip but slightly
+     smaller; turns warning-colored when compat is blocked. */
+  .info-btn { padding: 4px 10px; min-width: 36px; }
 
   .empty-state {
     position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
@@ -277,6 +360,16 @@
 const { useState, useEffect, useMemo, useRef, useCallback } = React;
 const ReactFlow = window.ReactFlow.default;
 const { Background, Controls, MarkerType, Handle, Position } = window.ReactFlow;
+
+// ─── Version / compat ────────────────────────────────────────────────────
+// Viewer version. Bump in sync with darkmux CLI releases that bundle a
+// matching viewer (the GH Pages deploy under docs/ goes with the cargo
+// release).
+const VIEWER_VERSION = '0.4.0';
+// Major component of the rules schema this viewer understands. Bump
+// ONLY on a breaking schema change in src/eureka.rs (RULES_SCHEMA_VERSION
+// major). See CLAUDE.md → "Versioning — rules schema" for the contract.
+const EXPECTED_RULES_SCHEMA_MAJOR = 1;
 
 // ─── Topology — fixed nodes (data-independent) ──────────────────────────
 // The first three blocks are always present: dispatcher → gateway →
@@ -339,6 +432,68 @@ function parseInstruments(text) {
   }
   samples.sort((a, b) => a.t - b.t);
   return samples;
+}
+
+// ─── Meta + compat ──────────────────────────────────────────────────────
+// Pull the meta-start payload (always the first row when emitted by a
+// darkmux CLI ≥ 0.4.0). Returns null for files that lack it (older CLI
+// or hand-constructed JSONL).
+function extractMeta(samples) {
+  const m = samples.find(s => s.source === 'meta' && s.payload?.event === 'start');
+  return m ? m.payload : null;
+}
+
+// Derive compat verdict between the file's rules_schema_version and the
+// viewer's EXPECTED_RULES_SCHEMA_MAJOR. Verdicts:
+//   - 'ok'         — same major; render normally
+//   - 'soft-warn'  — same major, minor/patch differs; banner + render
+//   - 'block'      — different major OR no version present; block UI
+//   - 'no-rules'   — file lacks rules payload entirely; soft warn
+function compatVerdict(meta) {
+  if (!meta) {
+    return { kind: 'block', reason: 'no darkmux meta payload in this file (CLI too old?)' };
+  }
+  const sv = meta.rules_schema_version;
+  if (!sv) {
+    return { kind: 'no-rules', reason: 'no rules_schema_version field — eureka rules unavailable for this run' };
+  }
+  const fileMajor = parseInt(String(sv).split('.')[0], 10);
+  if (Number.isNaN(fileMajor)) {
+    return { kind: 'block', reason: `rules_schema_version "${sv}" is not parseable as semver` };
+  }
+  if (fileMajor !== EXPECTED_RULES_SCHEMA_MAJOR) {
+    return {
+      kind: 'block',
+      reason: `rules schema major mismatch — file=${fileMajor}, viewer expects ${EXPECTED_RULES_SCHEMA_MAJOR}`,
+    };
+  }
+  // Same major. Compare full semver for minor/patch — info-level only.
+  const fileVer = String(sv);
+  const viewerVer = `${EXPECTED_RULES_SCHEMA_MAJOR}.0.0+`;
+  if (fileVer !== viewerVer) {
+    return { kind: 'soft-warn', reason: `schema versions differ on minor/patch — file=${fileVer}` };
+  }
+  return { kind: 'ok' };
+}
+
+// Eureka rules in the meta payload describe what the CLI's `darkmux doctor`
+// command checks pre-flight. The viewer can't actually re-evaluate them
+// from samples alone — config-vs-loaded rules need openclaw.json state
+// that doesn't live in instruments.jsonl.
+//
+// For now the viewer surfaces a single informational item pointing the
+// operator at `darkmux doctor` for the actual verdicts. The CLI-emitting-
+// verdicts pipeline (so the viewer renders real pass/warn/fail) is the
+// next iteration — tracked as a follow-up issue.
+function evaluateEurekaRules(samples, rules) {
+  if (!rules || rules.length === 0) return [];
+  const failCount = rules.filter(r => r.severity === 'fail').length;
+  const warnCount = rules.filter(r => r.severity === 'warn').length;
+  return [{
+    title: `eureka rules · pre-flight only`,
+    detail: `${rules.length} rules defined in this run's payload (${failCount} fail-class, ${warnCount} warn-class). Run \`darkmux doctor\` against your live setup for verdicts.`,
+    severity: 'info',
+  }];
 }
 
 // Pull the union of distinct model identifiers seen across the loaded
@@ -537,6 +692,7 @@ function App() {
   const [playing, setPlaying] = useState(false);
   const [speed, setSpeed] = useState(1);
   const [dragOver, setDragOver] = useState(false);
+  const [infoOpen, setInfoOpen] = useState(false);
   // User-dragged positions, keyed by node id. Layered on top of the
   // default positions so drag persists across the useMemo rebuilds that
   // happen on every activation state change.
@@ -644,7 +800,18 @@ function App() {
     [samples, currentT]
   );
   const nodeState = useMemo(() => deriveNodeState(samples, currentT), [samples, currentT]);
-  const anomalies = useMemo(() => summarizeAnomalies(samples), [samples]);
+  // Meta + compat: extract once per loaded file, drive (?) modal + banners.
+  const meta = useMemo(() => extractMeta(samples), [samples]);
+  const compat = useMemo(() => meta ? compatVerdict(meta) : null, [meta]);
+  const eurekaFindings = useMemo(
+    () => evaluateEurekaRules(samples, meta?.rules),
+    [samples, meta]
+  );
+  // Anomalies panel = runtime anomalies + eureka findings, in that order.
+  const anomalies = useMemo(
+    () => [...summarizeAnomalies(samples), ...eurekaFindings],
+    [samples, eurekaFindings]
+  );
 
   // Distinct model identifiers materialize as dedicated nodes to the
   // right of LMStudio. Recomputed when samples change.
@@ -774,11 +941,69 @@ function App() {
         >
           reset layout
         </button>
+        <button
+          className="file-pick info-btn"
+          onClick={() => setInfoOpen(true)}
+          title="Version + compatibility info"
+        >
+          {compat?.kind === 'block' ? '⚠ ?' : '?'}
+        </button>
         <div className="privacy">
           <strong>your file stays in your browser.</strong><br />
           no upload · no telemetry · static viewer
         </div>
       </div>
+
+      {/* Soft warning banner — non-blocking, render proceeds. */}
+      {compat && (compat.kind === 'soft-warn' || compat.kind === 'no-rules') && (
+        <div className="compat-banner soft">
+          <strong>compat note:</strong> {compat.reason}
+          <button onClick={() => setInfoOpen(true)} className="link-btn">details</button>
+        </div>
+      )}
+
+      {/* Blocking overlay — major mismatch or missing meta. Render still
+          shows topology (it's data-only and we can parse the JSONL), but
+          the Anomalies panel is disabled (rules data can't be trusted)
+          and the user is pushed at the upgrade modal. */}
+      {compat && compat.kind === 'block' && (
+        <div className="compat-block">
+          <div className="compat-block-inner">
+            <h2>⚠ darkmux CLI ↔ viewer version mismatch</h2>
+            <p className="mono">{compat.reason}</p>
+            <p>File from: <strong>darkmux {meta?.darkmux_version ?? '(unknown — pre-0.4)'}</strong></p>
+            <p>This viewer expects rules schema major <strong>{EXPECTED_RULES_SCHEMA_MAJOR}</strong>.</p>
+            <p>The topology still renders below from raw samples, but the Anomalies panel is disabled — rules data from this file can't be trusted by this viewer version.</p>
+            <p><strong>To fix:</strong> update darkmux to a release whose rules schema major matches:</p>
+            <pre>cd &lt;your-darkmux-repo&gt;{'\n'}git pull{'\n'}cargo install --path . --force</pre>
+            <button onClick={() => setInfoOpen(true)}>see version details</button>
+          </div>
+        </div>
+      )}
+
+      {/* (?) modal — always available, shows full compat info even when green. */}
+      {infoOpen && (
+        <div className="info-modal-bg" onClick={() => setInfoOpen(false)}>
+          <div className="info-modal" onClick={e => e.stopPropagation()}>
+            <h3>darkmux viewer · version info</h3>
+            <table className="info-tbl">
+              <tbody>
+                <tr><td>viewer version</td><td className="mono">{VIEWER_VERSION}</td></tr>
+                <tr><td>expected rules schema major</td><td className="mono">{EXPECTED_RULES_SCHEMA_MAJOR}</td></tr>
+                <tr><td>CLI version (from file)</td><td className="mono">{meta?.darkmux_version ?? '—'}</td></tr>
+                <tr><td>rules schema version (from file)</td><td className="mono">{meta?.rules_schema_version ?? '—'}</td></tr>
+                <tr><td>rules in payload</td><td className="mono">{meta?.rules?.length ?? 0}</td></tr>
+                <tr><td>compat verdict</td><td className="mono">{compat?.kind ?? '(no file loaded)'}</td></tr>
+              </tbody>
+            </table>
+            {compat?.reason && <p className="info-reason"><strong>note:</strong> {compat.reason}</p>}
+            <h4>updating darkmux</h4>
+            <pre>cd &lt;your-darkmux-repo&gt;{'\n'}git pull{'\n'}cargo install --path . --force</pre>
+            <p className="info-fineprint">The viewer expects the file's rules-schema major version to match its own. See <a href="https://github.com/kstrat2001/darkmux/blob/main/CLAUDE.md#versioning--rules-schema" target="_blank" rel="noopener">CLAUDE.md → Versioning</a> for the contract.</p>
+            <button onClick={() => setInfoOpen(false)}>close</button>
+          </div>
+        </div>
+      )}
 
       <div className="stage">
         {samples.length === 0 ? (
@@ -859,14 +1084,16 @@ function App() {
         <div>
           <div className="label">anomalies</div>
           <div className="anomalies">
-            {anomalies.length === 0
-              ? <div className="none">{samples.length === 0 ? 'load a run to begin' : 'no anomalies detected'}</div>
-              : anomalies.map((a, i) => (
-                  <div key={i} className="item">
-                    <strong>⚠ {a.title}</strong>
-                    <div>{a.detail}</div>
-                  </div>
-                ))}
+            {compat?.kind === 'block'
+              ? <div className="none">(disabled — version mismatch; click ⚠ ? for details)</div>
+              : anomalies.length === 0
+                ? <div className="none">{samples.length === 0 ? 'load a run to begin' : 'no anomalies detected'}</div>
+                : anomalies.map((a, i) => (
+                    <div key={i} className={`item${a.severity === 'info' ? ' info' : ''}`}>
+                      <strong>{a.severity === 'info' ? 'ℹ ' : '⚠ '}{a.title}</strong>
+                      <div>{a.detail}</div>
+                    </div>
+                  ))}
           </div>
         </div>
       </div>
