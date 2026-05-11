@@ -4,6 +4,8 @@
 
 Pick the right loaded model + context length + compaction profile for each task — automatically. Designed for agentic local-AI workflows on LMStudio (and Ollama / llama.cpp via the same OpenAI-compatible surface).
 
+**Build a diverse local-AI team that complements frontier models — not competes with them.**
+
 > **Heads up — read before running.**
 > darkmux orchestrates AI tools that execute on your machine. It modifies your local config files (`~/.openclaw/openclaw.json`), sends commands to your local LMStudio server, and — in lab mode — runs AI-generated code in a working directory that is **not a security sandbox**. AI agents can behave unexpectedly. Use it on a machine where that is acceptable. Performance numbers in this README and in the accompanying articles are measured on the author's hardware (M5 Max, 128 GB) and will differ on yours. See [DISCLAIMER.md](./DISCLAIMER.md) for details. MIT licensed, no warranty, use at your own risk.
 
@@ -11,13 +13,13 @@ Pick the right loaded model + context length + compaction profile for each task 
 
 Local AI is good at things frontier models aren't — fast iteration, repeatability across hardware, an offline foundation. darkmux exists to make frontier models *better* by giving them complementary teammates running locally. **Diversity-as-synergy, not replacement.**
 
-**The bet.** Faster and better outputs are mostly a *harness* problem, not a *modeling* problem. Articles 1 and 2 of [the series](https://darklyenergized.substack.com) measured this — the same model on the same machine ranged from 25 minutes to 5 minutes depending on which compaction settings the operator chose. darkmux is the engine that captures that knowledge.
+**The bet.** Faster and better LLM output require solving the *harness* problem, and go hand-in-hand with the *modeling* problem. Articles 1 and 2 of [the series](https://darklyenergized.substack.com) measured this — the same model on the same machine ranged from 25 minutes to 5 minutes depending on which compaction settings the operator chose. darkmux is the engine that captures that knowledge.
 
 **The arc.**
 
-- **Part 1** — sweep many models on the same workload, pick a few that work locally.
-- **Part 2** — tune the knobs scientifically; get the most out of the right model.
-- **Part 3** — does the methodology produce better real work? darkmux as the tool that runs the loop on *your* hardware, not just the author's.
+- **[Part 1](https://darklyenergized.substack.com/p/can-a-35b-local-model-write-your)** — sweep many models on the same workload, pick a few that work locally.
+- **[Part 2](https://darklyenergized.substack.com/p/part-2-charting-the-wake)** — tune the knobs scientifically; get the most out of the right model.
+- **Part 3** *(in progress)* — does the methodology produce better real work? darkmux as the tool that runs the loop on *your* hardware, not just the author's.
 
 **The long view.** Once a local stack is optimized, the next step is collaboration — frontier, local, and specialized models on the same task. The optimizing agent (Claude, by default) is part of the team being optimized; it maintains the team's integrity as new models arrive and hardware changes. Optimization is not the destination — it's how the team stays sharp.
 
