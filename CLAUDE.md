@@ -11,6 +11,22 @@ A pre-1.0 Rust CLI that does two things for users running local LLMs (LMStudio +
 
 The CLI is the *engine*; the empirical findings in the article series at <https://substack.com/@DarklyEnergized> are what it backs. The reproducibility story is the product story — users should be able to rerun a workload and get numbers comparable to the published claims.
 
+## darkmux's grand vision (agent-facing)
+
+The user-facing **"What darkmux is for"** section in `README.md` is the canonical version of the project's north-star. Below is how the same five claims translate into operational doctrine for an AI agent (Claude Code, OpenClaw, Cursor, etc.) working on darkmux or driving it on behalf of an operator.
+
+1. **Optimization, not replacement.** When the operator asks you to pick a model from `lms ls` or propose a profile, prefer *complement* over *duplicate*. A team where every model is a 35B reasoner is not a team — it's a stack of identical instruments. Read the existing profile registry first; propose additions that fill gaps (compactor, embeddings, specialized small model) rather than swapping like for like.
+
+2. **Harness, then model.** When the operator reports slow or wrong outputs, **check the harness before the model**. Compaction config, context-window mismatches, loaded-state drift, profile-vs-loaded model — all of these have produced 5×+ wall-clock regressions in Article 2's measurements. Default action: run `darkmux doctor`, read the eureka findings, surface those *before* suggesting the operator change models.
+
+3. **The lab + the loop.** darkmux is not just an inspection tool — it's the loop. When you have a tuning hypothesis (e.g., *"primary at 64K instead of 100K might fit this 32GB tier"*), the correct action sequence is: **baseline → single-variable change → re-measure → compare → record in notebook**. Each step has a darkmux primitive. Do NOT skip the baseline. Do NOT change two variables at once. The discipline is the point — without it, the comparison is uninterpretable.
+
+4. **Team integrity is your responsibility.** When proposing config changes, frame them in terms of *how this affects the team's shape*, not just an isolated metric. *"Drop the compactor to free RAM"* reduces working memory; consider whether the remaining team can still handle long-agentic dispatches before recommending. The operator is depending on you to maintain team coherence as new models arrive and hardware changes — that's the principal-engineer posture the maintainer named in [#35](https://github.com/kstrat2001/darkmux/issues/35).
+
+5. **The success criterion is recursive.** A fresh agent session, given only a clean-slate darkmux install + these docs + the bundled skills, should reach the same conclusion about *"what is darkmux for?"* as the maintainer's comment on #35. If you find yourself uncertain or having to infer from primitives, **the docs have drifted from the vision** — surface that to the operator. Doc drift is a bug, not a footnote.
+
+These claims compose with the existing **Anti-patterns** section below: anti-patterns are *what not to do*; the vision is *what to do instead*. If a request would violate both at once (e.g., *"silently roll back the compactor without telling me"*), the vision wins — surface the conflict and let the operator decide.
+
 ## Build and test
 
 ```bash
@@ -112,7 +128,9 @@ Live findings from cross-machine testing (M1 Max Studio fresh-Claude session, 20
 
 ## Project posture
 
-darkmux is positioned as **infrastructure**, not as an "agent." The README is intentionally honest about what darkmux does NOT do (not an inference engine, not an agent framework, not a cloud-provider router). Match that posture in any docs or copy you write — don't oversell.
+The **CLI binary** is infrastructure — not an inference engine, not an agent framework, not a cloud-provider router. The README is intentionally honest about what the binary does NOT do. Match that posture in any code, CLI copy, or `--help` text you write — don't oversell what `darkmux` (the executable) does.
+
+The **agent-facing surface** is where the *guided* part of "guided optimization" lives: this `CLAUDE.md`, the bundled skills under `skills/darkmux-*`, and the doctrine in **darkmux's grand vision** above. An agent working with darkmux doesn't replace the operator; it drives the loop the operator would otherwise drive by hand. Both surfaces are part of the same project — the dual posture is deliberate, not a contradiction.
 
 The default runtime is OpenClaw (`DARKMUX_RUNTIME_CMD=openclaw`) but the lab harness is runtime-pluggable via env var. Users running Aider, Cline, or anything with a `<cmd> agent --message` interface can point darkmux at it.
 
