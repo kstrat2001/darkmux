@@ -13,7 +13,7 @@ Pick the right loaded model + context length + compaction profile for each task 
 
 Local AI is good at things frontier models aren't — fast iteration, repeatability across hardware, an offline foundation. darkmux exists to make frontier models *better* by giving them complementary teammates running locally. **Diversity-as-synergy, not replacement.**
 
-**The bet.** Faster and better LLM output require solving the *harness* problem, and go hand-in-hand with the *modeling* problem. Articles 1 and 2 of [the series](https://darklyenergized.substack.com) measured this — the same model on the same machine ranged from 25 minutes to 5 minutes depending on which compaction settings the operator chose. darkmux is the engine that captures that knowledge.
+**The bet.** Faster and better LLM results require solving the *harness* problem, and go hand-in-hand with the *modeling* problem. Articles 1 and 2 of [the series](https://darklyenergized.substack.com) measured this — the same model on the same machine ranged from 25 minutes to 5 minutes depending on which compaction settings the operator chose. darkmux is the engine that captures that knowledge.
 
 **The arc.**
 
