@@ -1,10 +1,8 @@
 # darkmux
 
-**[darkmux.com](https://darkmux.com) · Task-class-aware multiplexer for local LLM configurations.**
+**[darkmux.com](https://darkmux.com) · Build a diverse local-AI team that complements frontier models — not competes with them.**
 
-Pick the right loaded model + context length + compaction profile for each task — automatically. Designed for agentic local-AI workflows on LMStudio (and Ollama / llama.cpp via the same OpenAI-compatible surface).
-
-**Build a diverse local-AI team that complements frontier models — not competes with them.**
+Task-class-aware multiplexer for local LLM configurations. Pick the right loaded model + context length + compaction profile for each task — automatically. Designed for agentic local-AI workflows on LMStudio (and Ollama / llama.cpp via the same OpenAI-compatible surface).
 
 > **Heads up — read before running.**
 > darkmux orchestrates AI tools that execute on your machine. It modifies your local config files (`~/.openclaw/openclaw.json`), sends commands to your local LMStudio server, and — in lab mode — runs AI-generated code in a working directory that is **not a security sandbox**. AI agents can behave unexpectedly. Use it on a machine where that is acceptable. Performance numbers in this README and in the accompanying articles are measured on the author's hardware (M5 Max, 128 GB) and will differ on yours. See [DISCLAIMER.md](./DISCLAIMER.md) for details. MIT licensed, no warranty, use at your own risk.
