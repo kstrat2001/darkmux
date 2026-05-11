@@ -1,6 +1,6 @@
 [package]
 name = "darkmux"
-version = "0.2.0-dev"
+version = "0.4.0"
 edition = "2021"
 description = "Lab and multiplexer for local LLM configurations"
 license = "MIT"

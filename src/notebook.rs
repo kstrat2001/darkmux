@@ -5,7 +5,7 @@
 //! `scribe` profile), and writes the draft to .darkmux/notebook/<date>-<slug>.md.
 
 use crate::lab::paths::{self, ResolveScope};
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use std::env;
 use std::fs;
