@@ -14,6 +14,7 @@ mod init;
 mod lab;
 mod lms;
 mod notebook;
+mod optimize;
 mod profiles;
 mod providers;
 mod runtime;
@@ -93,6 +94,10 @@ enum Cmd {
         #[command(subcommand)]
         sub: AgentCmd,
     },
+    /// Optimize for your workload — guided wizard (Phase 1 scaffold).
+    /// Composes scan, lab characterize/tune, heuristics, and eureka rules
+    /// into an opinionated optimization loop.
+    Optimize,
     /// One-command setup: install skills, optionally add session-start hook
     /// and CLAUDE.md integration so Claude Code knows about darkmux.
     Init {
@@ -290,6 +295,7 @@ fn run(cmd: Cmd) -> Result<i32> {
             force,
             dry_run,
         } => cmd_init(with_hook, with_claude_md, force, dry_run),
+        Cmd::Optimize => optimize::run(),
     }
 }
 

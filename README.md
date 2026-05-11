@@ -81,6 +81,7 @@ darkmux swap fast                 # swap to the "fast" profile (loads model into
 darkmux lab characterize          # one-command "QA my Mac" — dispatch a smoke workload, get a verdict
 darkmux lab run quick-q           # the smoke workload directly
 darkmux lab runs --limit 5        # see your recent runs
+darkmux optimize                 # guided "optimize for my workload" wizard (Phase 1 scaffold)
 darkmux lab inspect <run-id>      # full per-run breakdown
 darkmux notebook draft <run-id>   # ask the agent to author an EE-lab-style notebook entry
 ```
