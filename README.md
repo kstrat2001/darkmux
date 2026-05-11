@@ -28,12 +28,23 @@ darkmux is developed and tested on Apple Silicon. Linux should work; Intel Mac i
 
 ### Install + bootstrap
 
+One copy-pasteable block — works from a fresh machine that has LMStudio installed:
+
 ```bash
+# 1. Install Rust toolchain (skip if `cargo --version` already works)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"   # so this shell sees the new cargo immediately
+
+# 2. Clone + build darkmux
 git clone https://github.com/kstrat2001/darkmux
 cd darkmux
-cargo install --path .   # builds the self-contained binary, drops it on $PATH
-darkmux init             # creates ~/.darkmux/profiles.json + installs agent skills
+cargo install --path .      # builds the self-contained binary, drops it on $PATH
+
+# 3. Bootstrap config + agent skills
+darkmux init                # creates ~/.darkmux/profiles.json + installs agent skills
 ```
+
+If `cargo` is already on your PATH, skip Step 1. The `source "$HOME/.cargo/env"` line is the one most often missed by first-time-Rust users — without it, a fresh `cargo install` fails with `command not found: cargo` in the same shell that just ran the rustup installer.
 
 ### Verify your setup
 
