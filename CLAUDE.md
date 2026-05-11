@@ -96,6 +96,20 @@ If a user asks you to:
 - Anything that does `git push` or `git commit --amend` — irreversible-ish.
 - Adding external runtime dependencies — has knock-on effects on install size and license surface.
 
+## Anti-patterns — failure modes observed on fresh sessions
+
+Live findings from cross-machine testing (M1 Max Studio fresh-Claude session, 2026-05-11). Future fresh-Claude sessions: read these BEFORE acting on a user request that touches model selection, version compatibility, or issue tracking.
+
+- **Don't assume models — read the profile registry first.** Models live in `~/.darkmux/profiles.json` (or wherever `darkmux profiles` reports). If an agent role needs a model and one isn't declared, **ask the user**; do NOT pick a model from the LMStudio catalog at random. Older gemma family in particular ("gemma-4-e4b", "Gemma 4 26b", etc.) is known to produce looping garbage that poisons sessions across model swaps — never default-assume gemma. If the user has saved a memory about model selection, that supersedes any inference you'd make from the catalog.
+
+- **Don't silently roll back on regression.** If a feature appears to regress on an unfamiliar OpenClaw / LMStudio version (e.g., `systemPromptOverride` doesn't behave as expected, compaction settings don't take effect), **surface the finding to the user** with the version numbers you observed. Don't quietly revert config overrides "to make things work" — loud beats quiet. The user is debugging an unfamiliar env and needs the signal; a silent rollback hides the real bug.
+
+- **Check existing issues before filing.** Before `gh issue create`, run `gh issue list --search "<keywords>"` (include closed issues with `--state all`) and skim. Duplicates clutter the project board and dilute the eureka-detection roadmap. Default to **commenting on an existing issue** over filing a new one. If you're not sure whether something is a dupe, **ask the user**; don't file-and-hope.
+
+- **Cross-machine version awareness.** darkmux assumes a recent OpenClaw. Before applying any agent config (especially `systemPromptOverride`, compaction settings, or sampler tweaks), check `openclaw --version` and consider whether the feature you're about to use exists on the user's installed version. If you can't verify, ask. The currently-documented minimum is captured in `doctor` (when implemented — see open issue) and in the README's Prerequisites.
+
+- **The empirical findings in Article 2 are load-bearing, not decorative.** When choosing compaction modes, context windows, or compactor pairings, the article's data (`default` mode beats `safeguard` for local; small dedicated compactor at ~68K cuts wall-clock in half) reflects validated configurations, not arbitrary defaults. Don't deviate from a profile's settings without acknowledging the empirical reason — the operator has chosen them deliberately.
+
 ## Project posture
 
 darkmux is positioned as **infrastructure**, not as an "agent." The README is intentionally honest about what darkmux does NOT do (not an inference engine, not an agent framework, not a cloud-provider router). Match that posture in any docs or copy you write — don't oversell.
