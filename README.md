@@ -149,6 +149,41 @@ If you set `DARKMUX_RUNTIME_CMD=aider` (or `cline`, or your own wrapper), darkmu
 
 This means: **darkmux's profile-multiplexing is runtime-agnostic** today; the lab harness is *runtime-pluggable* via the env var. The empirical findings in the article series happened to be measured against OpenClaw; the routing thesis itself is independent.
 
+## Instrumentation
+
+`lab run --instrument` captures cross-layer telemetry alongside each dispatch — what LMStudio actually had loaded, where the gateway process sat across the run, and any anomalies (PID changes during active dispatch, loaded-model-set shifts, missing samplers). No root required.
+
+```bash
+darkmux lab run long-agentic --instrument
+```
+
+The flag adds a sidecar sampler that writes one JSON record per line to `~/.darkmux/runs/<run-id>/instruments.jsonl`. Each line has the shape:
+
+```json
+{"t": 1778466601846, "elapsed_ms": 0, "source": "meta", "payload": {...}}
+```
+
+Three sources:
+
+- **`meta`** — sampler lifecycle events (start, cadence, version)
+- **`lms`** — LMStudio's loaded-model snapshot from `lms ps --json` (identifier, context, status per model)
+- **`process`** — gateway-process residency from `ps -p`: PID, port, CPU%, RSS
+
+### Viewer
+
+The companion viewer at [darkmux.com/viewer](https://darkmux.com/viewer/) replays a captured run as a four-block topology you can scrub through.
+
+![darkmux viewer mid-replay — qwen3.6-35b primary processing a prompt, qwen3-4b compactor idle. Claude → OpenClaw Gateway → LMStudio backbone runs left-to-right; model nodes branch off the right edge.](docs/media/viewer-active-model.png)
+
+Drag your `instruments.jsonl` file onto the window. The topology renders:
+
+- **Agent client** → **OpenClaw Gateway** → **LMStudio** runs left-to-right
+- Loaded models branch off the right edge as separate nodes
+- Edges fire as request/response samples come in — active model gets cyan-dashed edges, idle models stay grey
+- The Anomalies panel surfaces inconsistencies (gateway PID changed during active dispatch, loaded-model set shifted mid-run, samples missing) — usually leading indicators of a misconfiguration worth investigating
+
+The viewer is a static page served from this repo's `docs/` folder. **Nothing is uploaded.** Your `instruments.jsonl` is parsed entirely in the browser. No backend, no telemetry on the telemetry.
+
 ## Status
 
 🚧 **Pre-alpha.** v0.1 (`swap`/`status`/`profiles`) and v0.2 lab foundation (`lab workloads`/`run`/`inspect`/`compare`) implemented. Real built-in workloads, notebook, and skills bundle pending.
