@@ -60,6 +60,17 @@ darkmux notebook draft <run-id>   # ask the agent to author an EE-lab-style note
 
 Using Claude Code? Run `darkmux init --with-claude-md ~/.claude/CLAUDE.md` to install the skills *and* teach Claude Code about darkmux at session start.
 
+### Updating darkmux
+
+After pulling new commits:
+
+```bash
+git pull
+cargo install --path . --force
+```
+
+The `--force` flag tells cargo to replace the existing binary even when the source path or version metadata hasn't changed. Without it, cargo can silently skip the reinstall and leave you running an older binary while reporting the same `darkmux --version`. If a new feature (like `--instrument`) is missing despite a fresh `git pull`, that's the most likely cause — re-run with `--force`.
+
 ## Why this exists
 
 Local-AI users hit a real workload-tax problem when they go agentic. A single static configuration can't be optimal across:
