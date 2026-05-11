@@ -97,7 +97,7 @@ pub fn snippet_for_agents_list(template: &RoleTemplate) -> serde_json::Value {
         ],
         "id": template.role,
         "systemPromptOverride": template.override_text,
-        "tools": template.recommended_tools,
+        "tools": { "allow": template.recommended_tools },
     })
 }
 
@@ -144,7 +144,11 @@ mod tests {
         let obj = snip.as_object().unwrap();
         assert_eq!(obj.get("id").and_then(|v| v.as_str()), Some("qa"));
         assert!(obj.get("systemPromptOverride").is_some());
-        assert!(obj.get("tools").and_then(|v| v.as_array()).map(|a| !a.is_empty()).unwrap_or(false));
+        // OpenClaw 2026.5+ schema: tools is an object whose `allow` field
+        // holds the recommended tool ids, not a bare array.
+        let tools = obj.get("tools").and_then(|v| v.as_object()).expect("tools must be an object");
+        let allow = tools.get("allow").and_then(|v| v.as_array()).expect("tools.allow must be an array");
+        assert!(!allow.is_empty(), "tools.allow must be non-empty");
         // _notes is included for self-documentation
         assert!(obj.get("_notes").is_some());
     }
