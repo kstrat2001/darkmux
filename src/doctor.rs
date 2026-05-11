@@ -80,6 +80,7 @@ pub fn run() -> DoctorReport {
         check_models_loaded(),
         check_profile_loaded_match(),
         check_runtime_command(),
+        check_runtime_version(),
         check_ram_headroom(),
         check_power_state(),
         check_platform_and_provider(),
@@ -88,6 +89,17 @@ pub fn run() -> DoctorReport {
     checks.extend(eureka_checks());
     DoctorReport { checks }
 }
+
+/// Minimum OpenClaw version darkmux has been validated against. Older
+/// versions may produce subtle feature regressions on agent config
+/// (`systemPromptOverride` in particular — observed during 2026-05-11
+/// cross-machine testing on an M1 Max Studio running OpenClaw 2026.3.13).
+///
+/// CalVer (YYYY, MM, DD). Bump this when:
+///   - You introduce a darkmux feature that depends on a newer OpenClaw
+///   - You confirm via cross-machine testing that an older OpenClaw breaks
+///     a current darkmux feature
+const MIN_OPENCLAW_VERSION: (u32, u32, u32) = (2026, 5, 4);
 
 /// Run the eureka rule set and map each verdict to a doctor `Check`.
 /// Each rule produces one check row so the user sees which specific
@@ -289,6 +301,98 @@ fn check_runtime_command() -> Check {
             hint: Some(
                 "install your agent runtime, or set DARKMUX_RUNTIME_CMD to override. \
                  `darkmux swap`/`status`/`profiles` work without a runtime; only `lab` features need it."
+                    .into(),
+            ),
+        }
+    }
+}
+
+/// Parse OpenClaw's `--version` output to a CalVer tuple. Accepts forms
+/// like `OpenClaw 2026.5.4 (325df3e)`; the leading word and trailing
+/// commit hash are tolerated. Returns `None` if the YYYY.MM.DD segment
+/// can't be located.
+fn parse_openclaw_version(raw: &str) -> Option<(u32, u32, u32)> {
+    // Scan tokens for the first one that splits into three numeric parts.
+    for token in raw.split_whitespace() {
+        let parts: Vec<&str> = token.split('.').collect();
+        if parts.len() != 3 {
+            continue;
+        }
+        let ymd: Result<Vec<u32>, _> = parts.iter().map(|p| p.parse::<u32>()).collect();
+        if let Ok(v) = ymd {
+            return Some((v[0], v[1], v[2]));
+        }
+    }
+    None
+}
+
+fn check_runtime_version() -> Check {
+    let cmd = env::var("DARKMUX_RUNTIME_CMD").unwrap_or_else(|_| "openclaw".to_string());
+    // Only check version for openclaw — other runtimes have their own
+    // version conventions. When DARKMUX_RUNTIME_CMD is set to something
+    // else (aider, cline), skip rather than guess at parsing.
+    if cmd != "openclaw" {
+        return Check {
+            name: "runtime version".into(),
+            status: Status::Pass,
+            message: format!("(skipped — runtime is `{cmd}`, version-check is openclaw-specific)"),
+            hint: None,
+        };
+    }
+
+    let output = Command::new(&cmd).arg("--version").output();
+    let raw = match output {
+        Ok(o) if o.status.success() => {
+            String::from_utf8_lossy(&o.stdout).to_string()
+                + &String::from_utf8_lossy(&o.stderr)
+        }
+        _ => {
+            return Check {
+                name: "runtime version".into(),
+                status: Status::Warn,
+                message: "could not run `openclaw --version`".into(),
+                hint: Some("ensure openclaw is on PATH and executable".into()),
+            };
+        }
+    };
+
+    let parsed = parse_openclaw_version(&raw);
+    let (y, m, d) = match parsed {
+        Some(v) => v,
+        None => {
+            return Check {
+                name: "runtime version".into(),
+                status: Status::Warn,
+                message: format!("could not parse version from: {}", first_line(&raw)),
+                hint: None,
+            };
+        }
+    };
+
+    let (min_y, min_m, min_d) = MIN_OPENCLAW_VERSION;
+    let installed = format!("{y}.{m}.{d}");
+    let minimum = format!("{min_y}.{min_m}.{min_d}");
+
+    if (y, m, d) >= (min_y, min_m, min_d) {
+        Check {
+            name: "runtime version".into(),
+            status: Status::Pass,
+            message: format!("OpenClaw {installed} (>= validated minimum {minimum})"),
+            hint: None,
+        }
+    } else {
+        Check {
+            name: "runtime version".into(),
+            status: Status::Warn,
+            message: format!(
+                "OpenClaw {installed} is older than darkmux's validated minimum ({minimum}). \
+                 `systemPromptOverride` and some compaction config may regress silently."
+            ),
+            hint: Some(
+                "upgrade OpenClaw to >= 2026.5.4. From your openclaw source checkout: \
+                 `git pull && <build/install steps per openclaw's own README>`. \
+                 If a feature appears not to work after this doctor warning, surface the \
+                 version mismatch loudly — don't silently roll back configs (see CLAUDE.md anti-patterns)."
                     .into(),
             ),
         }
@@ -706,11 +810,37 @@ mod tests {
     #[test]
     fn run_returns_static_plus_eureka_checks() {
         let r = run();
-        // 9 baseline checks + one per active eureka rule. Every check
-        // should appear regardless of environment — even if the
-        // underlying probe couldn't read state.
-        let expected = 9 + crate::eureka::all_rules().len();
+        // 10 baseline checks (incl. runtime version) + one per active
+        // eureka rule. Every check should appear regardless of
+        // environment — even if the underlying probe couldn't read state.
+        let expected = 10 + crate::eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
+    }
+
+    #[test]
+    fn parse_openclaw_version_handles_canonical_form() {
+        assert_eq!(
+            parse_openclaw_version("OpenClaw 2026.5.4 (325df3e)"),
+            Some((2026, 5, 4))
+        );
+        assert_eq!(
+            parse_openclaw_version("OpenClaw 2026.3.13 (61d171a)"),
+            Some((2026, 3, 13))
+        );
+    }
+
+    #[test]
+    fn parse_openclaw_version_handles_bare_version() {
+        // Edge case: just the version string with no leading word
+        assert_eq!(parse_openclaw_version("2026.5.4"), Some((2026, 5, 4)));
+    }
+
+    #[test]
+    fn parse_openclaw_version_rejects_garbage() {
+        assert_eq!(parse_openclaw_version("not a version"), None);
+        assert_eq!(parse_openclaw_version(""), None);
+        // Two-segment versions are not CalVer YYYY.MM.DD shaped
+        assert_eq!(parse_openclaw_version("OpenClaw 2026.5"), None);
     }
 
     #[test]
