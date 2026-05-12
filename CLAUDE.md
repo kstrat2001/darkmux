@@ -184,6 +184,11 @@ When writing a new feature that mutates state in LMStudio or OpenClaw on the ope
 2. **Filter on the namespace** at the point of read/cleanup. See `swap::is_darkmux_owned` for the LMStudio case.
 3. **Pass-through explicit overrides** — if the operator sets an explicit identifier in their profile, don't override it. The namespace is the *default*; the operator can opt out.
 
+### Operator-facing commands
+
+- `darkmux model status` — list `lms ps` results grouped by ownership (darkmux-managed vs user state). Read-only.
+- `darkmux model eject [--dry-run]` — unload everything in the `darkmux:` namespace; never touches user state. Use to release darkmux's RAM footprint without disturbing other tools.
+
 Tracked alongside operator sovereignty (#44) and issue [#52](https://github.com/kstrat2001/darkmux/issues/52) for the implementation history.
 
 ## Engagements (operator-defined dreamscapes)
