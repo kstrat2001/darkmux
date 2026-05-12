@@ -223,7 +223,7 @@ const REBUILD_TABLES: &[&str] = &[
 
 /// Default index path: `<paths.root>/index.db`. Resolved through the same
 /// project-vs-user precedence as `lab::paths`.
-fn default_index_path() -> PathBuf {
+pub(crate) fn default_index_path() -> PathBuf {
     resolve(ResolveScope::Auto).root.join("index.db")
 }
 
@@ -295,7 +295,7 @@ fn sprint_status_str(s: SprintStatus) -> &'static str {
     }
 }
 
-fn open_index(path: &Path) -> Result<Connection> {
+pub(crate) fn open_index(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)
@@ -515,7 +515,7 @@ fn read_meta(conn: &Connection, key: &str) -> Result<Option<String>> {
 }
 
 /// Internal entry point for tests + the public `rebuild()` wrapper.
-fn rebuild_at(path: &Path) -> Result<()> {
+pub(crate) fn rebuild_at(path: &Path) -> Result<()> {
     let mut conn = open_index(path)?;
     init_schema(&conn)?;
     populate(&mut conn)?;
