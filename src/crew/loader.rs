@@ -38,6 +38,16 @@ const BUILTIN_CAPABILITIES: &[(&str, &str)] = &[
     ("design-reviewing", include_str!("../../templates/builtin/crew/capabilities/design-reviewing.json")),
 ];
 
+/// Role system prompts (`.md`) compiled into the binary. Used as the
+/// fallback source when no user-side `<crew_root>/roles/<id>.md` exists.
+/// New roles' `.md` prompts are added here when Pair 2 of the bake-off
+/// (shape #2 — design-y prose) lands their content.
+const BUILTIN_ROLE_PROMPTS: &[(&str, &str)] = &[
+    ("coder", include_str!("../../templates/builtin/crew/roles/coder.md")),
+    ("scribe", include_str!("../../templates/builtin/crew/roles/scribe.md")),
+    ("code-reviewer", include_str!("../../templates/builtin/crew/roles/code-reviewer.md")),
+];
+
 /// Missions compiled into the binary at build time.
 const BUILTIN_MISSIONS: &[(&str, &str)] = &[];
 
@@ -52,6 +62,28 @@ fn crew_root() -> PathBuf {
         .filter(|s| !s.trim().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| resolve(ResolveScope::Auto).crew)
+}
+
+/// Resolve a role's system-prompt text. Search order:
+///   1. User dir: `<crew_root>/roles/<role-id>.md` (operator override)
+///   2. Embedded `BUILTIN_ROLE_PROMPTS` (binary-bundled defaults)
+///
+/// Returns the prompt content if found, `None` if neither source has a
+/// prompt for this role (e.g., the JSON manifest exists but no `.md`
+/// prompt has been authored yet — Pair 2 of the bake-off covers those).
+pub fn load_role_prompt(role_id: &str) -> Option<String> {
+    let user_path = crew_root().join("roles").join(format!("{role_id}.md"));
+    if user_path.is_file() {
+        if let Ok(content) = fs::read_to_string(&user_path) {
+            return Some(content);
+        }
+    }
+    for (id, content) in BUILTIN_ROLE_PROMPTS {
+        if *id == role_id {
+            return Some((*content).to_string());
+        }
+    }
+    None
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Result<T> {
