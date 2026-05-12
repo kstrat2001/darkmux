@@ -129,6 +129,61 @@ Live findings from cross-machine testing (M1 Max Studio fresh-Claude session, 20
 
 - **The empirical findings in Article 2 are load-bearing, not decorative.** When choosing compaction modes, context windows, or compactor pairings, the article's data (`default` mode beats `safeguard` for local; small dedicated compactor at ~68K cuts wall-clock in half) reflects validated configurations, not arbitrary defaults. Don't deviate from a profile's settings without acknowledging the empirical reason — the operator has chosen them deliberately.
 
+## Operator sovereignty (architectural principle)
+
+The operator is the agent of intent. The system surfaces, suggests, records, and supports — but does not substitute its judgment for the operator's at any decision point. Every default is overridable; every automatic action is auditable; every suggestion is explainable.
+
+Compressed to one rule: **the operator never has to wonder where a decision came from.**
+
+This is the principle that ties the anti-patterns above to darkmux's grand vision. Anti-patterns are *don'ts*; the grand vision is the *why*; operator sovereignty is the *architectural principle* every new design decision should test against. When designing any new surface — CLI, config file, agent doctrine, file layout, data model — ask: *"does this leave the operator in the loop, with provenance and override?"* If yes, the design fits. If no, it doesn't — even when it would be more "efficient" or "smart."
+
+Exemplars across darkmux's current surface:
+
+- **Anti-patterns** — every rule is operator-sided (don't assume, don't silent-rollback, check before filing)
+- **Preference fallthrough with provenance** — operator's intent at each layer; system never silently substitutes; unknown keys surfaced as typo warnings
+- **Allocator 80/20** — algorithm proposes; operator stays in the 20% of decisions that matter; override is always available; allocator emits reasoning + alternatives + confidence for orchestrator audit
+- **Confidence threshold per expertise** — operator self-rates per capability; system adjusts how often it asks vs decides
+- **Role + Crew (not Team)** — composition is operator's call per mission; no fixed membership
+- **JSON source-of-truth + SQLite derived index** — operator hand-edits any source file; system rebuilds derived state on demand; deleting the index is recoverable
+- **Don't mutate user state without confirmation** — `~/.darkmux/profiles.json`, `~/.openclaw/openclaw.json`, anything operator-owned. Read + propose; never write silently.
+- **Keyword vocabulary hybrid** — ship a starter; operator augments; system logs misses but never auto-mutates the vocabulary
+- **Operator-tunable preferences are numeric scales, not hidden enums** — discoverable via example values; supports continuous tuning; UI-ready
+
+The principle is recursive. It applies to documentation surface (this CLAUDE.md, READMEs), to CLI verbs, to data shapes on disk, to the architecture of future features. When a design decision feels like it should be made automatically by the system, that's the moment to surface it back to the operator instead.
+
+Tracked as #44.
+
+## Engagements (operator-defined dreamscapes)
+
+An engagement is operator-defined, never system-defined. The system doesn't enumerate engagements, doesn't impose a directory shape, doesn't have an `engagement` config file format. The operator decides what's an engagement and how much to describe it.
+
+An engagement can be:
+
+- *"It's just a repo at `~/my-project`"* — one-line; the orchestrator uses the path
+- *"I'm planning a 10-day Japan trip with a food focus"* — fuller context; the orchestrator may capture it in a `dreamscape.md` with tilts and constraints
+- *"Our wedding site is at knot.com/our-wedding"* — engagement lives at a URL; not a local dir; the orchestrator notes the URL and maps planning sub-tasks to missions
+- *"It's a Lovable.dev app I'm prototyping"* — hosted SaaS; the orchestrator references the workspace URL
+- *"My personal training goal is sub-5-minute mile"* — life goal; the orchestrator captures the aspiration as missions
+- *"I'm running a substack about local AI"* — long-form writing engagement; the orchestrator helps with drafts, editorial calendar, cross-post threading
+- *"I'm authoring a book on systems engineering"* — multi-month writing project; the orchestrator scaffolds chapters and tracks research threads
+- *"It's classified work I can't describe"* — the orchestrator respects opacity; engagement is named but content is operator-private
+- Unwritten entirely — operator carries it in their head; the orchestrator works from conversation
+
+If the operator is unsure what their engagement *is*, the orchestrator can offer a few of the above as starting shapes — picking a medium is itself one of the bridging moves the orchestrator is here to help with.
+
+**The orchestrator's bridging role.** When working on a mission within an engagement:
+
+- Read (or ask for) the engagement context — whatever form it takes
+- Capture it durably as an `.md` if the operator wants — location is operator's call (engagement repo root, `de-lab`, a private notes file, etc.)
+- Translate the soft free-form context into the structured concepts darkmux supports in code (Mission, Sprint, role tilts, preferences) — proposing this translation when it'd help the operator move forward is the orchestrator's by-design job, not a thing to withhold
+- Don't pry for structure the operator didn't volunteer — offer a suggestion once, let it land or get redirected, then drop it
+
+Engagements should not be well-defined. They are open-ended dreamscapes where ideas are meant to flourish. darkmux supports the engagements it can support (local dirs, local code work) and stays out of the way for the rest (SaaS, hosted, conceptual, classified). The Rust-level data model in the schema PR (#45) names Role, Crew, Mission, Sprint — concepts the system CAN model uniformly. Engagement isn't in that schema by design; it's the layer above where operator judgment lives.
+
+This is operator sovereignty (above) applied at the project-shape level: the operator decides what their projects look like; the system doesn't impose a schema.
+
+Tracked as #49.
+
 ## Project posture
 
 The **CLI binary** is infrastructure — not an inference engine, not an agent framework, not a cloud-provider router. The README is intentionally honest about what the binary does NOT do. Match that posture in any code, CLI copy, or `--help` text you write — don't oversell what `darkmux` (the executable) does.
