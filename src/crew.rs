@@ -13,5 +13,6 @@
 //!                  with binary-embedded built-ins as fallback
 
 pub mod dispatch;
+pub mod index;
 pub mod loader;
 pub mod types;
