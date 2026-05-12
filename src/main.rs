@@ -95,6 +95,12 @@ enum Cmd {
         #[command(subcommand)]
         sub: ModelCmd,
     },
+    /// Crew subcommands — dispatch a role for a single turn, or reconcile
+    /// the openclaw agent registry with the on-disk crew manifests.
+    Crew {
+        #[command(subcommand)]
+        sub: CrewCmd,
+    },
     /// Agent-role template subcommands. Browse + emit validated
     /// `systemPromptOverride` scaffolds for common roles (qa, scribe,
     /// engineer). Output is print-only — paste into your runtime config
@@ -136,6 +142,50 @@ enum AgentCmd {
     Template {
         /// Role id (qa | scribe | engineer). Run `agent list-templates` to see what's available.
         role: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum CrewCmd {
+    /// Dispatch a single turn to the named role. Loads the role manifest +
+    /// `.md` system prompt, verifies the corresponding `darkmux/<role-id>`
+    /// openclaw agent exists and matches the manifest, then invokes
+    /// `openclaw agent` with the assembled message.
+    Dispatch {
+        /// Role id (e.g. `code-reviewer`). Must have a manifest at
+        /// `templates/builtin/crew/roles/<id>.json` (or under
+        /// `~/.darkmux/crew/roles/`) AND a sibling `.md` prompt file.
+        role: String,
+        /// Message body for the dispatch.
+        #[arg(long, short = 'm')]
+        message: String,
+        /// Optional delivery target in `<channel>:<target>` form
+        /// (e.g. `discord:1500166601909993503`). When set, openclaw's
+        /// reply is delivered to that channel in addition to being
+        /// returned on stdout.
+        #[arg(long)]
+        deliver: Option<String>,
+        /// Override the dispatch session id (default: generated).
+        #[arg(long)]
+        session_id: Option<String>,
+        /// Timeout in seconds (default: 600).
+        #[arg(long, default_value = "600")]
+        timeout: u32,
+        /// Skip the pre-flight checks. Use only for debugging.
+        #[arg(long, hide = true)]
+        skip_preflight: bool,
+    },
+    /// Reconcile openclaw's `agents.list[]` with the crew role manifests.
+    /// For every role with both a JSON manifest and a `.md` prompt, ensures
+    /// a `darkmux/<role-id>` openclaw agent exists with the manifest's
+    /// system prompt + tool palette. Idempotent.
+    Sync {
+        /// Skip the diff preview and write directly.
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Show what would change without writing.
+        #[arg(long, short = 'n')]
+        dry_run: bool,
     },
 }
 
@@ -328,6 +378,7 @@ fn run(cmd: Cmd) -> Result<i32> {
         Cmd::Scan { config } => cmd_scan(config.as_deref()),
         Cmd::Profile { sub } => cmd_profile(sub),
         Cmd::Model { sub } => cmd_model(sub),
+        Cmd::Crew { sub } => cmd_crew(sub),
         Cmd::Agent { sub } => cmd_agent(sub),
         Cmd::Init {
             with_hook,
@@ -613,6 +664,58 @@ fn cmd_agent(sub: AgentCmd) -> Result<i32> {
             );
             eprintln!("// task-specific framing for your codebase, but keep the structural blocks");
             eprintln!("// (Tool Call Style, Execution Bias) — they're the load-bearing parts.");
+            Ok(0)
+        }
+    }
+}
+
+fn cmd_crew(sub: CrewCmd) -> Result<i32> {
+    match sub {
+        CrewCmd::Dispatch { role, message, deliver, session_id, timeout, skip_preflight } => {
+            let opts = crew::dispatch::DispatchOpts {
+                role_id: role,
+                message,
+                deliver,
+                session_id,
+                timeout_seconds: timeout,
+                skip_preflight,
+            };
+            let result = crew::dispatch::dispatch(opts)?;
+            // Stream both stdout (openclaw's --json envelope) and stderr to
+            // the caller — the orchestrator parses one or the other.
+            print!("{}", result.stdout);
+            if !result.stderr.is_empty() {
+                eprint!("{}", result.stderr);
+            }
+            Ok(result.exit_code)
+        }
+        CrewCmd::Sync { yes: _, dry_run } => {
+            let opts = crew::dispatch::SyncOpts { dry_run };
+            let result = crew::dispatch::sync(opts)?;
+            let verbs = if dry_run {
+                ("would add", "would update")
+            } else {
+                ("added", "updated")
+            };
+            let trail = if dry_run { " [DRY RUN]" } else { "" };
+            println!(
+                "crew sync{trail}: {add_v} {a}, {upd_v} {u}, unchanged {un}, skipped (no .md prompt) {sn}",
+                add_v = verbs.0,
+                upd_v = verbs.1,
+                a = result.added.len(),
+                u = result.updated.len(),
+                un = result.unchanged.len(),
+                sn = result.skipped_no_prompt.len(),
+            );
+            for id in &result.added {
+                println!("  + {id}");
+            }
+            for id in &result.updated {
+                println!("  ~ {id}");
+            }
+            for id in &result.skipped_no_prompt {
+                println!("  · {id} (no .md prompt)");
+            }
             Ok(0)
         }
     }

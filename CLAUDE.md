@@ -188,8 +188,10 @@ When writing a new feature that mutates state in LMStudio or OpenClaw on the ope
 
 - `darkmux model status` — list `lms ps` results grouped by ownership (darkmux-managed vs user state). Read-only.
 - `darkmux model eject [--dry-run]` — unload everything in the `darkmux:` namespace; never touches user state. Use to release darkmux's RAM footprint without disturbing other tools.
+- `darkmux crew sync [--dry-run]` — reconcile openclaw's `agents.list[]` with the crew role manifests. For each role with both a JSON manifest and `.md` system prompt, ensures a `darkmux/<role-id>` openclaw agent exists with the manifest-derived shape (system prompt + tool palette). Idempotent.
+- `darkmux crew dispatch <role-id> --message <text> [--deliver <chan>:<target>]` — dispatch a single turn to the named role. Looks up the role, pre-flight-verifies that the corresponding `darkmux/<role-id>` openclaw agent matches the manifest (bails loud on drift with a `darkmux crew sync` repair pointer), then invokes `openclaw agent` and returns the result.
 
-Tracked alongside operator sovereignty (#44) and issue [#52](https://github.com/kstrat2001/darkmux/issues/52) for the implementation history.
+Tracked alongside operator sovereignty (#44) and issues [#52](https://github.com/kstrat2001/darkmux/issues/52) (LMStudio namespace), [#55](https://github.com/kstrat2001/darkmux/issues/55) (full pre-flight checklist — partial coverage in `crew dispatch` today), and the `qa-review` migration that brought these verbs into the dispatch path.
 
 ## Engagements (operator-defined dreamscapes)
 
