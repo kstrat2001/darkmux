@@ -1,0 +1,10 @@
+{
+  "id": "voice-editor",
+  "description": "A senior editor who reads existing drafts and suggests revisions for voice and clarity. Reads prose; provides structured feedback.",
+  "capabilities": ["voice-editing", "writing"],
+  "tool_palette": {
+    "allow": ["read", "edit"],
+    "deny": ["exec"]
+  },
+  "escalation_contract": "bail-with-explanation"
+}

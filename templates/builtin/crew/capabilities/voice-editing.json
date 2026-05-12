@@ -1,0 +1,15 @@
+{
+  "id": "voice-editing",
+  "description": "Edits existing prose for voice, clarity, and consistency. Refinement of material, not first-draft writing.",
+  "keywords": [
+    {"keyword": "edit", "weight": 1.0},
+    {"keyword": "revise", "weight": 1.0},
+    {"keyword": "voice", "weight": 1.0},
+    {"keyword": "clarity", "weight": 0.9},
+    {"keyword": "consistency", "weight": 0.9},
+    {"keyword": "proofread", "weight": 0.8},
+    {"keyword": "style guide", "weight": 0.7},
+    {"keyword": "coherence", "weight": 0.6},
+    {"keyword": "sentence structure", "weight": 0.5}
+  ]
+}

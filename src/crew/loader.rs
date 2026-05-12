@@ -1,11 +1,11 @@
-//! Load team architecture manifests (roles, crews, missions, sprints) by id.
+//! Load crew architecture manifests (roles, crews, missions, sprints) by id.
 //!
 //! Search order: user dir → binary-embedded built-ins.
 
 #![allow(dead_code)]
 
+use crate::crew::types::*;
 use crate::lab::paths::{resolve, ResolveScope};
-use crate::team_types::*;
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 #[cfg(test)]
@@ -13,15 +13,29 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-/// Roles compiled into the binary at build time.
+/// Roles compiled into the binary at build time. Filename = `<id>.json`.
 const BUILTIN_ROLES: &[(&str, &str)] = &[
-    ("coder", include_str!("../templates/builtin/team/roles/coder.json")),
-    ("scribe", include_str!("../templates/builtin/team/roles/scribe.json")),
+    ("coder", include_str!("../../templates/builtin/crew/roles/coder.json")),
+    ("scribe", include_str!("../../templates/builtin/crew/roles/scribe.json")),
+    ("code-reviewer", include_str!("../../templates/builtin/crew/roles/code-reviewer.json")),
+    ("analyst", include_str!("../../templates/builtin/crew/roles/analyst.json")),
+    ("voice-editor", include_str!("../../templates/builtin/crew/roles/voice-editor.json")),
+    ("design-reviewer", include_str!("../../templates/builtin/crew/roles/design-reviewer.json")),
+    ("test-designer", include_str!("../../templates/builtin/crew/roles/test-designer.json")),
+    ("lab-runner", include_str!("../../templates/builtin/crew/roles/lab-runner.json")),
 ];
 
-/// Capabilities compiled into the binary at build time.
+/// Capabilities compiled into the binary at build time. Filename = `<id>.json`.
 const BUILTIN_CAPABILITIES: &[(&str, &str)] = &[
-    ("coding", include_str!("../templates/builtin/team/capabilities/coding.json")),
+    ("coding", include_str!("../../templates/builtin/crew/capabilities/coding.json")),
+    ("documenting", include_str!("../../templates/builtin/crew/capabilities/documenting.json")),
+    ("test-designing", include_str!("../../templates/builtin/crew/capabilities/test-designing.json")),
+    ("code-reviewing", include_str!("../../templates/builtin/crew/capabilities/code-reviewing.json")),
+    ("analyzing", include_str!("../../templates/builtin/crew/capabilities/analyzing.json")),
+    ("writing", include_str!("../../templates/builtin/crew/capabilities/writing.json")),
+    ("voice-editing", include_str!("../../templates/builtin/crew/capabilities/voice-editing.json")),
+    ("lab-running", include_str!("../../templates/builtin/crew/capabilities/lab-running.json")),
+    ("design-reviewing", include_str!("../../templates/builtin/crew/capabilities/design-reviewing.json")),
 ];
 
 /// Missions compiled into the binary at build time.
@@ -29,6 +43,16 @@ const BUILTIN_MISSIONS: &[(&str, &str)] = &[];
 
 /// Sprints compiled into the binary at build time.
 const BUILTIN_SPRINTS: &[(&str, &str)] = &[];
+
+/// The user-side crew root: `DARKMUX_CREW_DIR` if set, else `<paths.crew>`
+/// from the active workspace.
+fn crew_root() -> PathBuf {
+    std::env::var("DARKMUX_CREW_DIR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| resolve(ResolveScope::Auto).crew)
+}
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Result<T> {
     let raw = fs::read_to_string(path)
@@ -93,14 +117,13 @@ fn read_all_json<T: serde::de::DeserializeOwned>(dir: &std::path::Path) -> Resul
 
 /// Load all roles from the user dir, falling back to built-in templates.
 ///
-/// `DARKUX_TEAMS_DIR` overrides the root — useful for tests and custom setups.
+/// `DARKMUX_CREW_DIR` overrides the crew root — useful for tests and
+/// non-standard layouts. (The Phase A Era env var was `DARKMUX_CREW_DIR`;
+/// renamed for the Crew doctrine + to fix the typo. Anyone who set the old
+/// one needs to update.)
 pub fn load_roles() -> Result<Vec<Role>> {
-    let teams_dir = std::env::var("DARKUX_TEAMS_DIR")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| resolve(ResolveScope::Auto).teams);
-    let roles_dir = teams_dir.join("roles");
+    let crew_dir = crew_root();
+    let roles_dir = crew_dir.join("roles");
 
     // Load user-defined roles first.
     let mut map: BTreeMap<String, Role> = BTreeMap::new();
@@ -132,15 +155,13 @@ pub fn load_roles() -> Result<Vec<Role>> {
 
 /// Load all crews.
 pub fn load_crews() -> Result<Vec<Crew>> {
-    let paths = resolve(ResolveScope::Auto);
-    let user_dir = paths.teams.join("crews");
+    let user_dir = crew_root().join("crews");
     Ok(read_all_json::<Crew>(&user_dir)?.into_iter().map(|(_, c)| c).collect())
 }
 
 /// Load all missions.
 pub fn load_missions() -> Result<Vec<Mission>> {
-    let paths = resolve(ResolveScope::Auto);
-    let user_dir = paths.teams.join("missions");
+    let user_dir = crew_root().join("missions");
     let mut map: BTreeMap<String, Mission> = read_all_json::<Mission>(&user_dir)?
         .into_iter()
         .map(|(id, m)| (id.clone(), m))
@@ -158,8 +179,7 @@ pub fn load_missions() -> Result<Vec<Mission>> {
 
 /// Load all sprints.
 pub fn load_sprints() -> Result<Vec<Sprint>> {
-    let paths = resolve(ResolveScope::Auto);
-    let user_dir = paths.teams.join("sprints");
+    let user_dir = crew_root().join("sprints");
     let mut map: BTreeMap<String, Sprint> = read_all_json::<Sprint>(&user_dir)?
         .into_iter()
         .map(|(id, s)| (id.clone(), s))
@@ -177,8 +197,7 @@ pub fn load_sprints() -> Result<Vec<Sprint>> {
 
 /// Load all capabilities.
 pub fn load_capabilities() -> Result<Vec<Capability>> {
-    let paths = resolve(ResolveScope::Auto);
-    let user_dir = paths.teams.join("capabilities");
+    let user_dir = crew_root().join("capabilities");
     let mut map: BTreeMap<String, Capability> = read_all_json::<Capability>(&user_dir)?
         .into_iter()
         .map(|(id, c)| (id.clone(), c))
@@ -204,7 +223,7 @@ pub fn resolve_role_prompt_path(
     if let Some(p) = &role.prompt_path {
         return Some(p.clone());
     }
-    let roles_dir = paths.teams.join("roles");
+    let roles_dir = paths.crew.join("roles");
     let md_path = roles_dir.join(format!("{}.md", role.id));
     if md_path.is_file() { Some(md_path) } else { None }
 }
@@ -214,21 +233,21 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// RAII guard that points `DARKUX_TEAMS_DIR` at a TempDir for the test's
+    /// RAII guard that points `DARKMUX_CREW_DIR` at a TempDir for the test's
     /// duration, then restores the previous value (or unsets it) on drop.
     /// Uses the existing env-var hook in `load_roles` rather than mutating
     /// the process cwd — cwd mutation crashes follow-up tests when the
     /// guarded TempDir is dropped while the cwd still points inside it.
-    struct TeamsDirGuard {
+    struct CrewDirGuard {
         prev: Option<String>,
         _tmp: TempDir,
     }
 
-    impl TeamsDirGuard {
+    impl CrewDirGuard {
         fn new(tmp: TempDir) -> Self {
-            let prev = env::var("DARKUX_TEAMS_DIR").ok();
+            let prev = env::var("DARKMUX_CREW_DIR").ok();
             // SAFETY: serialized via #[serial_test::serial] on every caller.
-            unsafe { env::set_var("DARKUX_TEAMS_DIR", tmp.path()); }
+            unsafe { env::set_var("DARKMUX_CREW_DIR", tmp.path()); }
             Self { prev, _tmp: tmp }
         }
 
@@ -237,13 +256,13 @@ mod tests {
         }
     }
 
-    impl Drop for TeamsDirGuard {
+    impl Drop for CrewDirGuard {
         fn drop(&mut self) {
             // SAFETY: serialized via #[serial_test::serial] on every caller.
             unsafe {
                 match &self.prev {
-                    Some(v) => env::set_var("DARKUX_TEAMS_DIR", v),
-                    None => env::remove_var("DARKUX_TEAMS_DIR"),
+                    Some(v) => env::set_var("DARKMUX_CREW_DIR", v),
+                    None => env::remove_var("DARKMUX_CREW_DIR"),
                 }
             }
         }
@@ -300,7 +319,7 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn loader_picks_user_file_over_builtin() {
-        let guard = TeamsDirGuard::new(TempDir::new().unwrap());
+        let guard = CrewDirGuard::new(TempDir::new().unwrap());
         let roles_dir = guard.path().join("roles");
         fs::create_dir_all(&roles_dir).unwrap();
         let user_json = r#"{"id":"coder","description":"user override","capabilities":[],"tool_palette":{"allow":["read"],"deny":[]},"escalation_contract":"bail-with-explanation"}"#;
@@ -314,7 +333,7 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn loader_falls_through_to_builtin() {
-        let _guard = TeamsDirGuard::new(TempDir::new().unwrap());
+        let _guard = CrewDirGuard::new(TempDir::new().unwrap());
         // No user files written — loader should fall through to builtin coder.
         let roles = load_roles().unwrap();
         let coder = roles.iter().find(|r| r.id == "coder").expect("builtin coder should load");
@@ -324,7 +343,7 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn prompt_path_resolved_when_md_present() {
-        let guard = TeamsDirGuard::new(TempDir::new().unwrap());
+        let guard = CrewDirGuard::new(TempDir::new().unwrap());
         let roles_dir = guard.path().join("roles");
         fs::create_dir_all(&roles_dir).unwrap();
         let role_json = r#"{"id":"custom","description":"a custom role","capabilities":[],"tool_palette":{"allow":["read"],"deny":[]},"escalation_contract":"bail-with-explanation"}"#;
@@ -342,7 +361,7 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn prompt_path_none_when_md_absent() {
-        let guard = TeamsDirGuard::new(TempDir::new().unwrap());
+        let guard = CrewDirGuard::new(TempDir::new().unwrap());
         let roles_dir = guard.path().join("roles");
         fs::create_dir_all(&roles_dir).unwrap();
         let role_json = r#"{"id":"no-prompt","description":"no prompt file","capabilities":[],"tool_palette":{"allow":["read"],"deny":[]},"escalation_contract":"bail-with-explanation"}"#;

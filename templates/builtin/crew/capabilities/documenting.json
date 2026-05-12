@@ -1,0 +1,14 @@
+{
+  "id": "documenting",
+  "description": "Writes documentation that describes code, systems, or run outputs. Audience is the developer or operator, not the public.",
+  "keywords": [
+    {"keyword": "document", "weight": 1.0},
+    {"keyword": "README", "weight": 0.9},
+    {"keyword": "docstring", "weight": 0.8},
+    {"keyword": "code comment", "weight": 0.7},
+    {"keyword": "ADR", "weight": 0.7},
+    {"keyword": "changelog", "weight": 0.6},
+    {"keyword": "notebook entry", "weight": 0.6},
+    {"keyword": "explain code", "weight": 0.5}
+  ]
+}

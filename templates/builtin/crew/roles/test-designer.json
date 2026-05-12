@@ -1,0 +1,10 @@
+{
+  "id": "test-designer",
+  "description": "Plans test strategies, selects edge cases, and writes test fixtures. Implements tests using exec to run them.",
+  "capabilities": ["coding", "test-designing"],
+  "tool_palette": {
+    "allow": ["read", "edit", "write", "exec"],
+    "deny": []
+  },
+  "escalation_contract": "bail-with-explanation"
+}

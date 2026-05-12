@@ -1,0 +1,14 @@
+{
+  "id": "analyzing",
+  "description": "Analyzes data, logs, run outputs, system behavior. Identifies patterns, anomalies, root causes.",
+  "keywords": [
+    {"keyword": "analyze", "weight": 1.0},
+    {"keyword": "debugging", "weight": 0.9},
+    {"keyword": "root cause", "weight": 0.9},
+    {"keyword": "log analysis", "weight": 0.8},
+    {"keyword": "pattern recognition", "weight": 0.8},
+    {"keyword": "anomaly detection", "weight": 0.7},
+    {"keyword": "metrics", "weight": 0.6},
+    {"keyword": "troubleshooting", "weight": 0.5}
+  ]
+}

@@ -6,6 +6,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 mod agent_roles;
+mod crew;
 mod doctor;
 mod eureka;
 mod hardware;
@@ -20,8 +21,6 @@ mod providers;
 mod runtime;
 mod skills;
 mod swap;
-mod team_loader;
-mod team_types;
 mod types;
 mod workloads;
 

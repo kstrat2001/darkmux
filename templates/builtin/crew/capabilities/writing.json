@@ -1,0 +1,15 @@
+{
+  "id": "writing",
+  "description": "Drafts prose content: articles, blog posts, documentation, marketing copy. Voice and audience are operator-defined.",
+  "keywords": [
+    {"keyword": "draft", "weight": 1.0},
+    {"keyword": "write", "weight": 1.0},
+    {"keyword": "article", "weight": 0.9},
+    {"keyword": "blog post", "weight": 0.8},
+    {"keyword": "documentation", "weight": 0.9},
+    {"keyword": "marketing copy", "weight": 0.8},
+    {"keyword": "audience", "weight": 0.6},
+    {"keyword": "tone", "weight": 0.5},
+    {"keyword": "outline", "weight": 0.4}
+  ]
+}
