@@ -11,7 +11,7 @@
 
 use std::process::Command;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Platform {
     AppleSilicon,
     MacIntel,
@@ -35,7 +35,7 @@ impl Platform {
 /// Coarse RAM tiers used by provider matching. The boundaries roughly map
 /// to common Mac configurations (16/32/64/96/128/256 GB) but are platform-
 /// agnostic enough to apply to non-Mac systems too.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub enum RamTier {
     /// < 32 GB — most consumer Macs / commodity laptops.
     Small,
@@ -58,7 +58,7 @@ impl RamTier {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct HardwareSpec {
     pub platform: Platform,
     pub arch: String,

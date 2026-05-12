@@ -106,6 +106,7 @@ If a user asks you to:
 | "draft a notebook entry" | `darkmux notebook draft <run-id>` (optionally `--machine <id>` to override). |
 | "make the build self-contained" | Already is — `include_str!` for embedded workloads, no external assets needed at runtime. |
 | "review the diff before commit" | Run the suite (`cargo test`), eyeball `git diff`, propose a commit message — but **do not commit unless explicitly asked**. |
+| "run the optimize wizard" | `darkmux optimize` — Phase 1 scaffold prints six steps (all "todo"). For the full plan, see #35. Do NOT attempt full implementation of all six steps in one PR; land one phase at a time.
 
 ## Things to ASK before doing
 
