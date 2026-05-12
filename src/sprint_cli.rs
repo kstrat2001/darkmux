@@ -272,12 +272,13 @@ fn pick_profile(
     let risky_margin = (target_ceiling as f64 * RISKY_BAND) as u64;
     let borderline_margin = (target_safe as f64 * BORDERLINE_BAND) as u64;
 
+    // Confidence: "low" when near the hard ceiling (risky even with
+    // compaction), "medium" when near the safe-budget threshold (borderline
+    // decision the operator should know about), "high" otherwise. Tiny
+    // workloads that comfortably fit are "high" — small ≠ borderline.
     let confidence = if max_in + risky_margin >= target_ceiling {
         "low"
-    } else if max_in + borderline_margin >= target_safe || max_in <= borderline_margin {
-        // Within 10% of safe budget (above OR below — operator might want to
-        // know the workload is unusually large or unusually small for the
-        // chosen profile)
+    } else if max_in + borderline_margin >= target_safe {
         "medium"
     } else {
         "high"
@@ -318,6 +319,15 @@ fn build_reasoning(
     }
 }
 
+/// LMStudio endpoint (env-overridable for tests). Defaults to the public
+/// `LMSTUDIO_CHAT_URL` constant.
+fn lmstudio_chat_url() -> String {
+    std::env::var("DARKMUX_LMSTUDIO_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| LMSTUDIO_CHAT_URL.to_string())
+}
+
 /// Call the 4B compactor at LMStudio for the operator-facing narrative
 /// wrap. Returns the parsed JSON object from the model's response, or an
 /// error if the call/parse fails.
@@ -340,8 +350,9 @@ fn narrate_via_4b(output_so_far: &EstimateOutput) -> Result<Value> {
     });
     let payload_str = serde_json::to_string(&payload)?;
 
+    let url = lmstudio_chat_url();
     let output = Command::new("curl")
-        .args(["-s", LMSTUDIO_CHAT_URL, "-H", "Content-Type: application/json", "-d", &payload_str])
+        .args(["-s", "--fail", &url, "-H", "Content-Type: application/json", "-d", &payload_str])
         .output()
         .context("running curl to LMStudio")?;
     if !output.status.success() {
@@ -362,15 +373,16 @@ fn narrate_via_4b(output_so_far: &EstimateOutput) -> Result<Value> {
     Ok(narrative)
 }
 
-pub fn estimate(spec_path: &Path, narrate: bool) -> Result<i32> {
-    let raw = fs::read_to_string(spec_path)
-        .with_context(|| format!("reading workload spec at {}", spec_path.display()))?;
-    let spec: WorkloadSpec = serde_json::from_str(&raw)
-        .with_context(|| format!("parsing workload spec at {}", spec_path.display()))?;
-
-    let reg = crate::profiles::load_registry(None)
-        .context("loading profile registry for capacity lookup")?;
-    let capacities = collect_profile_capacities(&reg.registry);
+/// Core estimate logic — pure function over (spec, registry, narrate).
+/// Separated from `estimate()` so tests can drive it without depending on
+/// the file system or the live profile registry on disk. `estimate()`
+/// reads spec from disk + loads the registry, then delegates here.
+pub(crate) fn run_estimate(
+    spec: &WorkloadSpec,
+    reg: &crate::types::ProfileRegistry,
+    narrate: bool,
+) -> Result<EstimateOutput> {
+    let capacities = collect_profile_capacities(reg);
     let active = capacities
         .iter()
         .find(|(name, _)| name == &spec.active_profile)
@@ -387,8 +399,8 @@ pub fn estimate(spec_path: &Path, narrate: bool) -> Result<i32> {
             )
         })?;
 
-    let budget = compute_budget(&spec, &active);
-    let recommendation = pick_profile(&spec, &budget, &capacities);
+    let budget = compute_budget(spec, &active);
+    let recommendation = pick_profile(spec, &budget, &capacities);
 
     let mut output = EstimateOutput {
         workload_class: spec.workload_class.clone(),
@@ -409,6 +421,20 @@ pub fn estimate(spec_path: &Path, narrate: bool) -> Result<i32> {
             }
         }
     }
+
+    Ok(output)
+}
+
+pub fn estimate(spec_path: &Path, narrate: bool) -> Result<i32> {
+    let raw = fs::read_to_string(spec_path)
+        .with_context(|| format!("reading workload spec at {}", spec_path.display()))?;
+    let spec: WorkloadSpec = serde_json::from_str(&raw)
+        .with_context(|| format!("parsing workload spec at {}", spec_path.display()))?;
+
+    let reg = crate::profiles::load_registry(None)
+        .context("loading profile registry for capacity lookup")?;
+
+    let output = run_estimate(&spec, &reg.registry, narrate)?;
 
     let json = serde_json::to_string_pretty(&output)?;
     println!("{json}");
@@ -647,5 +673,109 @@ mod tests {
         let caps = collect_profile_capacities(&fixture_registry());
         let names: Vec<&str> = caps.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, vec!["fast", "balanced", "deep"]);
+    }
+
+    #[test]
+    fn tiny_workload_returns_high_confidence_not_medium() {
+        // Regression test for QA Flag 2 — fixture-04-style "stay on
+        // balanced" workload where max_cumulative is tiny relative to
+        // safe budget. Should be `high` confidence, not `medium`
+        // ("small" ≠ "borderline").
+        let spec = WorkloadSpec {
+            workload_class: "single-turn".into(),
+            active_profile: "fast".into(),
+            initial_state_tokens: 1000,
+            per_turn: PerTurn {
+                tool_schemas: 500,
+                file_reads: CountAndSize { count: 0, avg_bytes: 0 },
+                edits: CountAndSize { count: 0, avg_bytes: 0 },
+                exec_calls: CountAndOutputSize { count: 0, avg_output_bytes: 0 },
+                assistant_response: 500,
+            },
+            planned_turns: 1,
+        };
+        // max_cumulative = 1000 + 1*1000 = 2000; fast safe = 30400. Trivially fits.
+        let caps = collect_profile_capacities(&fixture_registry());
+        let active = caps.iter().find(|(n, _)| n == "fast").unwrap().1;
+        let report = compute_budget(&spec, &active);
+        let rec = pick_profile(&spec, &report, &caps);
+        assert_eq!(rec.target_profile, "fast");
+        assert_eq!(rec.action, "stay-on-fast");
+        assert_eq!(rec.confidence, "high", "tiny workload that comfortably fits should be high confidence");
+    }
+
+    #[test]
+    fn run_estimate_errors_on_unknown_profile() {
+        // Regression test for QA Flag 4 — when active_profile isn't in
+        // the registry, run_estimate should error with a helpful message
+        // listing the known profiles.
+        let spec = WorkloadSpec {
+            workload_class: "long-agentic".into(),
+            active_profile: "nonexistent-profile".into(),
+            initial_state_tokens: 1000,
+            per_turn: PerTurn {
+                tool_schemas: 100,
+                file_reads: CountAndSize { count: 0, avg_bytes: 0 },
+                edits: CountAndSize { count: 0, avg_bytes: 0 },
+                exec_calls: CountAndOutputSize { count: 0, avg_output_bytes: 0 },
+                assistant_response: 100,
+            },
+            planned_turns: 1,
+        };
+        let reg = fixture_registry();
+        let err = run_estimate(&spec, &reg, false).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("nonexistent-profile"), "error should name the missing profile: {msg}");
+        assert!(msg.contains("known profiles"), "error should list known profiles: {msg}");
+    }
+
+    #[test]
+    fn run_estimate_gracefully_degrades_when_narrate_fails() {
+        // Regression test for QA Flag 3 — when --narrate is requested
+        // but LMStudio is unreachable, the deterministic output still
+        // emits (narrative=None). Tested by pointing DARKMUX_LMSTUDIO_URL
+        // at an unreachable port.
+        let spec = WorkloadSpec {
+            workload_class: "long-agentic".into(),
+            active_profile: "balanced".into(),
+            initial_state_tokens: 50000,
+            per_turn: PerTurn {
+                tool_schemas: 3300,
+                file_reads: CountAndSize { count: 3, avg_bytes: 4000 },
+                edits: CountAndSize { count: 2, avg_bytes: 1500 },
+                exec_calls: CountAndOutputSize { count: 1, avg_output_bytes: 8000 },
+                assistant_response: 2500,
+            },
+            planned_turns: 8,
+        };
+        let reg = fixture_registry();
+
+        // Save the existing env var (if any), override with unreachable URL.
+        let prev = std::env::var("DARKMUX_LMSTUDIO_URL").ok();
+        // SAFETY: tests use serial_test::serial when needed; this test
+        // doesn't share state with others that rely on this env var.
+        unsafe {
+            std::env::set_var("DARKMUX_LMSTUDIO_URL", "http://127.0.0.1:1/v1/chat/completions");
+        }
+
+        let result = run_estimate(&spec, &reg, true);
+
+        // Restore env state before assertions.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_LMSTUDIO_URL", v),
+                None => std::env::remove_var("DARKMUX_LMSTUDIO_URL"),
+            }
+        }
+
+        // Deterministic output must still emit; narrative is None on failure.
+        let output = result.expect("run_estimate must succeed even when narrate fails");
+        assert!(
+            output.narrative.is_none(),
+            "narrate failure should result in narrative=None, got: {:?}",
+            output.narrative
+        );
+        // Deterministic recommendation still computed correctly.
+        assert_eq!(output.recommendation.target_profile, "deep");
     }
 }
