@@ -167,6 +167,19 @@ enum NotebookCmd {
         /// Build the prompt and target filename without dispatching the agent.
         #[arg(long, short = 'n')]
         dry_run: bool,
+        /// Override the machine id (overrides DARKMUX_MACHINE_ID env var).
+        #[arg(long)]
+        machine: Option<String>,
+    },
+    /// List notebook entries (parsed from entry headers).
+    ///
+    /// Enumerates .md files in the notebook directory, reads each entry's
+    /// `<!-- darkmux:notebook-entry: run=X machine=Y date=Z -->` header,
+    /// and prints a summary table.  Optionally filter entries by machine.
+    List {
+        /// Only show entries from this machine (optional).
+        #[arg(long)]
+        machine: Option<String>,
     },
 }
 
@@ -294,18 +307,21 @@ fn run(cmd: Cmd) -> Result<i32> {
 }
 
 fn cmd_notebook(sub: NotebookCmd) -> Result<i32> {
+    use crate::lab::paths;
     match sub {
         NotebookCmd::Draft {
             run_id,
             agent,
             slug,
             dry_run,
+            machine,
         } => {
             let report = notebook::draft_entry(&notebook::DraftOptions {
                 run_id,
                 agent,
                 slug,
                 dry_run,
+                machine_override: machine,
             })?;
             println!("source run: {}", report.run_dir.display());
             println!("entry path: {}", report.entry_path.display());
@@ -313,6 +329,37 @@ fn cmd_notebook(sub: NotebookCmd) -> Result<i32> {
             println!("reply chars:  {}", report.reply_chars);
             if dry_run {
                 println!("[DRY RUN — nothing was written]");
+            }
+            Ok(0)
+        }
+        NotebookCmd::List { machine } => {
+            let paths = paths::resolve(paths::ResolveScope::Auto);
+            if !paths.notebook.exists() {
+                println!("no notebook directory found: {}", paths.notebook.display());
+                return Ok(1);
+            }
+            let entries = notebook::list_entries(&paths.notebook, machine.as_deref())?;
+            if entries.is_empty() {
+                println!("no notebook entries found");
+                return Ok(0);
+            }
+            // Column widths (dynamic based on longest value).
+            let max_date: usize = entries.iter().map(|e| e.date.len()).max().unwrap_or(10);
+            let max_machine: usize = entries.iter()
+                .map(|e| e.machine.len()).max().unwrap_or(10);
+            let max_run: usize = entries.iter()
+                .map(|e| e.run.len()).max().unwrap_or(12);
+            for entry in &entries {
+                println!(
+                    "{date:<width_date$}  {machine:<width_machine$}  {run:<width_run$}  {path}",
+                    date = entry.date,
+                    width_date = max_date.max(4),
+                    machine = entry.machine,
+                    width_machine = max_machine.max(8),
+                    run = entry.run,
+                    width_run = max_run.max(4),
+                    path = entry.path.display(),
+                );
             }
             Ok(0)
         }

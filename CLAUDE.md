@@ -102,6 +102,8 @@ If a user asks you to:
 | "add a new workload" | Drop a JSON manifest at `templates/builtin/workloads/<id>.json`. If it's a `prompt` workload, register it in `EMBEDDED_WORKLOADS` in `src/workloads/load.rs`. coding-task workloads need a sandbox seed dir and CAN'T be embedded. |
 | "add a new provider" | Implement `WorkloadProvider` in `src/providers/<name>.rs`, register it in `src/workloads/registry.rs::register_builtins()`. |
 | "run the smoke test" | `cargo install --path . && darkmux lab run quick-q`. Should complete in ~6-10s if a model is loaded. |
+| "list notebook entries" | `darkmux notebook list` (optionally `--machine <id>` to filter). Enumerates `.md` files, parses headers. |
+| "draft a notebook entry" | `darkmux notebook draft <run-id>` (optionally `--machine <id>` to override). |
 | "make the build self-contained" | Already is — `include_str!` for embedded workloads, no external assets needed at runtime. |
 | "review the diff before commit" | Run the suite (`cargo test`), eyeball `git diff`, propose a commit message — but **do not commit unless explicitly asked**. |
 

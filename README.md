@@ -190,6 +190,21 @@ Set the same `DARKMUX_NOTEBOOK_DIR` on each machine; give each a distinct `DARKM
 
 If `DARKMUX_MACHINE_ID` is unset, darkmux falls back to an auto-derived fingerprint (e.g. `apple-silicon-128gb`) — fine for casual use, but a named id is recommended when more than one machine of the same tier exists.
 
+You can also override the machine id for a single draft via `--machine`:
+
+```bash
+darkmux notebook draft <run-id> --machine my-work-mac
+```
+
+To list all entries in the notebook directory (optionally filtered by machine):
+
+```bash
+darkmux notebook list           # all entries
+darkmux notebook list --machine m5-home  # only this machine's entries
+```
+
+`notebook list` outputs columns: **date | machine | run | path** (aligned, newest first). The `--machine` flag filters to only entries matching that machine id.
+
 ## Instrumentation
 
 `lab run --instrument` captures cross-layer telemetry alongside each dispatch — what LMStudio actually had loaded, where the gateway process sat across the run, and any anomalies (PID changes during active dispatch, loaded-model-set shifts, missing samplers). No root required.

@@ -232,3 +232,91 @@ fn lab_run_quick_q_from_clean_cwd_uses_embedded_workload() {
     assert_eq!(manifest["runId"].as_str(), Some(run_id.as_str()));
     assert_eq!(manifest["ok"].as_bool(), Some(true));
 }
+
+/// `notebook list` enumerates .md files and prints aligned columns.
+#[serial_test::serial]
+#[test]
+fn notebook_list_shows_entries() {
+    let tmp = TempDir::new().unwrap();
+    let nb_dir = tmp.path().join("notebook");
+    fs::create_dir_all(&nb_dir).unwrap();
+
+    // Create a few notebook entries.
+    fs::write(
+        nb_dir.join("2026-05-10-run-a.md"),
+        "<!-- darkmux:notebook-entry: run=abc123 machine=m5-home date=2026-05-10 -->\n\nContent A.",
+    )
+    .unwrap();
+    fs::write(
+        nb_dir.join("2026-05-11-run-b.md"),
+        "<!-- darkmux:notebook-entry: run=def456 machine=m3-laptop date=2026-05-11 -->\n\nContent B.",
+    )
+    .unwrap();
+
+    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    // Set notebook dir via env var.
+    cmd.env("DARKMUX_NOTEBOOK_DIR", nb_dir.to_str().unwrap())
+        .arg("notebook")
+        .arg("list")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("2026-05-11"))
+        .stdout(predicate::str::contains("2026-05-10"))
+        .stdout(predicate::str::contains("def456"))
+        .stdout(predicate::str::contains("abc123"));
+}
+
+/// `notebook list --machine` filters entries.
+#[serial_test::serial]
+#[test]
+fn notebook_list_machine_filter() {
+    let tmp = TempDir::new().unwrap();
+    let nb_dir = tmp.path().join("notebook");
+    fs::create_dir_all(&nb_dir).unwrap();
+
+    fs::write(
+        nb_dir.join("e1.md"),
+        "<!-- darkmux:notebook-entry: run=r1 machine=m5-home date=2026-05-10 -->\n",
+    )
+    .unwrap();
+    fs::write(
+        nb_dir.join("e2.md"),
+        "<!-- darkmux:notebook-entry: run=r2 machine=m3-laptop date=2026-05-11 -->\n",
+    )
+    .unwrap();
+
+    // Filter to m5-home.
+    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    cmd.env("DARKMUX_NOTEBOOK_DIR", nb_dir.to_str().unwrap())
+        .arg("notebook")
+        .arg("list")
+        .arg("--machine")
+        .arg("m5-home")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("r1"))
+        .stdout(predicate::str::contains("r2").not());
+
+    // Filter to nonexistent machine → no output.
+    let mut cmd2 = Command::cargo_bin("darkmux").unwrap();
+    cmd2.env("DARKMUX_NOTEBOOK_DIR", nb_dir.to_str().unwrap())
+        .arg("notebook")
+        .arg("list")
+        .arg("--machine")
+        .arg("nonexistent")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no notebook entries found"));
+}
+
+/// `notebook list` with no notebook dir returns error.
+#[test]
+fn notebook_list_no_dir() {
+    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    cmd.arg("notebook")
+        .arg("list")
+        .env("DARKMUX_NOTEBOOK_DIR", "/no/such/path/xyz")
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("no notebook directory found"));
+}

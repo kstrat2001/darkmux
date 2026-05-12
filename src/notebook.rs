@@ -19,6 +19,8 @@ pub struct DraftOptions {
     pub agent: String,
     pub slug: Option<String>,
     pub dry_run: bool,
+    /// Override the machine id (overrides DARKMUX_MACHINE_ID env var).
+    pub machine_override: Option<String>,
 }
 
 #[derive(Debug)]
@@ -143,9 +145,7 @@ pub fn draft_entry(opts: &DraftOptions) -> Result<DraftReport> {
         // Include a machine-id tag so the same notebook directory (e.g.
         // when pointed at an iCloud-synced path via DARKMUX_NOTEBOOK_DIR)
         // can hold entries from multiple machines without ambiguity.
-        // Honors DARKMUX_MACHINE_ID env var; falls back to a fingerprint
-        // derived from hardware detection (e.g. `apple-silicon-128gb`).
-        let machine_id = machine_fingerprint();
+        let machine_id = resolve_machine_id(opts);
         let header = format!(
             "<!-- darkmux:notebook-entry: run={} machine={} date={} -->\n\n",
             opts.run_id, machine_id, date
@@ -302,6 +302,21 @@ fn shortid(run_id: &str) -> String {
     run_id.chars().take(12).collect()
 }
 
+/// Resolve the machine id for a notebook entry. Priority:
+///   1. Explicit `--machine` flag (i.e. `DraftOptions::machine_override`)
+///   2. `DARKMUX_MACHINE_ID` env var
+///   3. Auto-derived hardware fingerprint
+///
+/// Extracted as a helper so the priority chain is testable without
+/// requiring the openclaw runtime to be installed (the dispatch path
+/// in `draft_entry` would otherwise prevent CI coverage on machines
+/// where openclaw isn't on PATH).
+pub(crate) fn resolve_machine_id(opts: &DraftOptions) -> String {
+    opts.machine_override
+        .clone()
+        .unwrap_or_else(machine_fingerprint)
+}
+
 /// Identifier tag for the machine that drafted this notebook entry.
 ///
 /// Priority:
@@ -363,6 +378,87 @@ fn epoch_secs_to_ymd(secs: i64) -> (i32, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d)
+}
+
+/// A single notebook entry parsed from file-header metadata.
+pub struct NotebookEntry {
+    pub date: String,
+    pub machine: String,
+    pub run: String,
+    pub path: PathBuf,
+}
+
+/// Enumerate notebook entries from a directory.
+///
+/// Reads each `.md` file in `dir`, parses the darkmux header comment
+/// to extract run/machine/date metadata, and returns a list of entries.
+/// Optionally filters by machine id (when `machine_filter` is Some).
+pub fn list_entries(dir: &Path, machine_filter: Option<&str>) -> Result<Vec<NotebookEntry>> {
+    let mut entries = Vec::new();
+    let read_dir = dir
+        .read_dir()
+        .with_context(|| format!("reading notebook directory: {}", dir.display()))?;
+
+    for entry in read_dir {
+        let file = entry?.file_name();
+        // Only process .md files.
+        if file.to_string_lossy().ends_with(".md") {
+            let path = dir.join(&file);
+            if let Ok(header) = std::fs::read_to_string(&path) {
+                // Parse the darkmux header comment.
+                if let Some(notebook_entry) = parse_notebook_header(&header, &path) {
+                    // Apply machine filter if specified.
+                    match machine_filter {
+                        Some(filter) if notebook_entry.machine != filter => continue,
+                        _ => {}
+                    }
+                    entries.push(notebook_entry);
+                }
+            }
+        }
+    }
+
+    // Sort by date descending (newest first).
+    entries.sort_by(|a, b| {
+        b.date
+            .cmp(&a.date)
+            .then(b.run.cmp(&a.run))
+    });
+
+    Ok(entries)
+}
+
+/// Parse a darkmux notebook-entry header from file content.
+pub fn parse_notebook_header(content: &str, path: &Path) -> Option<NotebookEntry> {
+    // Header is expected on line 1: `<!-- darkmux:notebook-entry: run=X machine=Y date=Z -->`
+    let line = content.lines().next()?;
+    // Strip HTML comment delimiters.
+    let inner = line.strip_prefix("<!--").and_then(|s| s.strip_suffix("-->"))?;
+    // Parse key=value pairs.
+    let mut run = String::new();
+    let mut machine = String::new();
+    let mut date = String::new();
+    for pair in inner.split_whitespace() {
+        if let Some((key, value)) = pair.split_once('=') {
+            match key {
+                "run" => run = value.to_string(),
+                "machine" => machine = value.to_string(),
+                "date" => date = value.to_string(),
+                _ => {}
+            }
+        }
+    }
+
+    if run.is_empty() || machine.is_empty() || date.is_empty() {
+        return None;
+    }
+
+    Some(NotebookEntry {
+        run,
+        machine,
+        date,
+        path: path.to_path_buf(),
+    })
 }
 
 #[cfg(test)]
@@ -556,6 +652,7 @@ mod tests {
             agent: "main".to_string(),
             slug: Some("test-slug".to_string()),
             dry_run: true,
+            machine_override: None,
         })
         .unwrap();
         env::set_current_dir(prev).unwrap();
@@ -577,8 +674,137 @@ mod tests {
             agent: "main".to_string(),
             slug: None,
             dry_run: true,
+            machine_override: None,
         });
         env::set_current_dir(prev).unwrap();
         assert!(result.is_err());
+    }
+
+    /// list_entries returns entries from .md files and ignores non-.md.
+    #[test]
+    fn list_entries_parses_md_files() {
+        let tmp = TempDir::new().unwrap();
+        // Create two .md files with headers.
+        fs::write(
+            tmp.path().join("2026-05-10-run-a.md"),
+            "<!-- darkmux:notebook-entry: run=abc123 machine=m5-home date=2026-05-10 -->\n\nSome content.",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("2026-05-11-run-b.md"),
+            "<!-- darkmux:notebook-entry: run=def456 machine=m3-laptop date=2026-05-11 -->\n\nOther content.",
+        )
+        .unwrap();
+        // A non-.md file should be ignored.
+        fs::write(tmp.path().join("readme.txt"), "not a notebook entry").unwrap();
+
+        let entries = list_entries(tmp.path(), None).unwrap();
+        assert_eq!(entries.len(), 2);
+        // Should be sorted newest first.
+        assert_eq!(entries[0].date, "2026-05-11");
+        assert_eq!(entries[1].date, "2026-05-10");
+    }
+
+    /// list_entries filters by machine when specified.
+    #[test]
+    fn list_entries_filters_by_machine() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("e1.md"),
+            "<!-- darkmux:notebook-entry: run=r1 machine=m5-home date=2026-05-10 -->\n\nc",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("e2.md"),
+            "<!-- darkmux:notebook-entry: run=r2 machine=m3-laptop date=2026-05-11 -->\n\nc",
+        )
+        .unwrap();
+
+        // Filter to m5-home: only 1 entry.
+        let filtered = list_entries(tmp.path(), Some("m5-home")).unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].machine, "m5-home");
+
+        // Filter to m3-laptop: only 1 entry.
+        let filtered2 = list_entries(tmp.path(), Some("m3-laptop")).unwrap();
+        assert_eq!(filtered2.len(), 1);
+        assert_eq!(filtered2[0].machine, "m3-laptop");
+
+        // Filter to nonexistent machine: 0 entries.
+        let filtered3 = list_entries(tmp.path(), Some("nonexistent")).unwrap();
+        assert!(filtered3.is_empty());
+    }
+
+    /// parse_notebook_header correctly extracts run/machine/date.
+    #[test]
+    fn parse_header_extracts_all_fields() {
+        let header = "<!-- darkmux:notebook-entry: run=xyz789 machine=m5-max-home date=2026-03-15 -->\n";
+        let entry = parse_notebook_header(header, Path::new("test.md")).unwrap();
+        assert_eq!(entry.run, "xyz789");
+        assert_eq!(entry.machine, "m5-max-home");
+        assert_eq!(entry.date, "2026-03-15");
+    }
+
+    /// parse_notebook_header returns None for malformed headers.
+    #[test]
+    fn parse_header_malformed_returns_none() {
+        // Missing one field.
+        let header = "<!-- darkmux:notebook-entry: run=abc machine=m5 date=2026-01-01 extra=val -->\n";
+        let entry = parse_notebook_header(header, Path::new("test.md")).unwrap();
+        assert_eq!(entry.run, "abc");
+        assert_eq!(entry.machine, "m5");
+        // Extra fields are ignored; entry still valid.
+
+        // Completely broken header (no darkmux key).
+        let bad = "<!-- not a darkmux comment -->\n";
+        assert!(parse_notebook_header(bad, Path::new("test.md")).is_none());
+
+        // Not a comment at all.
+        assert!(parse_notebook_header("plain text", Path::new("test.md")).is_none());
+    }
+
+    /// resolve_machine_id honors --machine flag > DARKMUX_MACHINE_ID > fingerprint.
+    /// Hits the helper directly so the test doesn't require the openclaw
+    /// runtime to be installed (avoids CI failures on macos-latest runners).
+    #[serial_test::serial]
+    #[test]
+    fn resolve_machine_id_priority_chain() {
+        let prev = env::var("DARKMUX_MACHINE_ID").ok();
+
+        // 1. Explicit override wins over both env var and fingerprint.
+        unsafe { env::set_var("DARKMUX_MACHINE_ID", "env-fingerprint"); }
+        let opts_with_override = DraftOptions {
+            run_id: "x".into(),
+            agent: "main".into(),
+            slug: None,
+            dry_run: true,
+            machine_override: Some("override-machine".into()),
+        };
+        assert_eq!(resolve_machine_id(&opts_with_override), "override-machine");
+
+        // 2. With no override, env var wins over fingerprint.
+        let opts_no_override = DraftOptions {
+            run_id: "x".into(),
+            agent: "main".into(),
+            slug: None,
+            dry_run: true,
+            machine_override: None,
+        };
+        assert_eq!(resolve_machine_id(&opts_no_override), "env-fingerprint");
+
+        // 3. With no override AND no env var, falls back to hardware fingerprint
+        //    (non-empty per machine_fingerprint() contract).
+        unsafe { env::remove_var("DARKMUX_MACHINE_ID"); }
+        let fp = resolve_machine_id(&opts_no_override);
+        assert!(!fp.is_empty(), "fingerprint must not be empty");
+        assert_ne!(fp, "override-machine");
+        assert_ne!(fp, "env-fingerprint");
+
+        unsafe {
+            match prev {
+                Some(v) => env::set_var("DARKMUX_MACHINE_ID", v),
+                None => env::remove_var("DARKMUX_MACHINE_ID"),
+            }
+        }
     }
 }
