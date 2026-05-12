@@ -1,0 +1,15 @@
+{
+  "id": "coding",
+  "description": "Writes code in a target language. Implements features from operator requirements.",
+  "keywords": [
+    {"keyword": "implement", "weight": 1.0},
+    {"keyword": "add feature", "weight": 0.9},
+    {"keyword": "function", "weight": 0.7},
+    {"keyword": "module", "weight": 0.6},
+    {"keyword": "refactor", "weight": 0.6},
+    {"keyword": "bug fix", "weight": 0.8},
+    {"keyword": "Rust", "weight": 0.4},
+    {"keyword": "TypeScript", "weight": 0.4},
+    {"keyword": "Python", "weight": 0.4}
+  ]
+}
