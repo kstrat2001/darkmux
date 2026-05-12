@@ -88,6 +88,14 @@ enum Cmd {
         #[command(subcommand)]
         sub: ProfileCmd,
     },
+    /// Model lifecycle subcommands — operate on the darkmux-managed model
+    /// group (anything in `lms ps` under the `darkmux:` namespace).
+    /// User-loaded models (non-namespaced identifiers) are off-limits to
+    /// these commands by design.
+    Model {
+        #[command(subcommand)]
+        sub: ModelCmd,
+    },
     /// Agent-role template subcommands. Browse + emit validated
     /// `systemPromptOverride` scaffolds for common roles (qa, scribe,
     /// engineer). Output is print-only — paste into your runtime config
@@ -129,6 +137,23 @@ enum AgentCmd {
     Template {
         /// Role id (qa | scribe | engineer). Run `agent list-templates` to see what's available.
         role: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ModelCmd {
+    /// Show models currently loaded in LMStudio, grouped by ownership:
+    /// darkmux-managed (under the `darkmux:` namespace) vs user state
+    /// (everything else). Read-only.
+    Status,
+    /// Eject all darkmux-managed model loads (anything in the `darkmux:`
+    /// namespace). User-loaded models are never touched. Use this when
+    /// you want to release darkmux's RAM footprint without affecting
+    /// other tools using LMStudio.
+    Eject {
+        /// Show what would be ejected without actually unloading.
+        #[arg(long, short = 'n')]
+        dry_run: bool,
     },
 }
 
@@ -303,6 +328,7 @@ fn run(cmd: Cmd) -> Result<i32> {
         Cmd::Doctor => cmd_doctor(),
         Cmd::Scan { config } => cmd_scan(config.as_deref()),
         Cmd::Profile { sub } => cmd_profile(sub),
+        Cmd::Model { sub } => cmd_model(sub),
         Cmd::Agent { sub } => cmd_agent(sub),
         Cmd::Init {
             with_hook,
@@ -593,6 +619,87 @@ fn cmd_agent(sub: AgentCmd) -> Result<i32> {
     }
 }
 
+fn cmd_model(sub: ModelCmd) -> Result<i32> {
+    match sub {
+        ModelCmd::Status => cmd_model_status(),
+        ModelCmd::Eject { dry_run } => cmd_model_eject(dry_run),
+    }
+}
+
+fn cmd_model_status() -> Result<i32> {
+    let loaded = lms::list_loaded()?;
+    let (managed, user): (Vec<_>, Vec<_>) = loaded
+        .iter()
+        .partition(|m| swap::is_darkmux_owned(&m.identifier));
+    println!(
+        "darkmux-managed ({}):",
+        managed.len()
+    );
+    if managed.is_empty() {
+        println!("  (none — `darkmux swap <profile>` to load)");
+    } else {
+        for m in &managed {
+            println!(
+                "  {:<46} ctx={:<8} {}",
+                m.identifier, m.context, m.size
+            );
+        }
+    }
+    println!();
+    println!("user state ({}):", user.len());
+    if user.is_empty() {
+        println!("  (none — LMStudio is exclusively darkmux's right now)");
+    } else {
+        for m in &user {
+            println!(
+                "  {:<46} ctx={:<8} {}",
+                m.identifier, m.context, m.size
+            );
+        }
+        println!();
+        println!("note: darkmux will never unload entries under `user state` — they're");
+        println!("      yours. Use `lms unload <identifier>` to remove them manually.");
+    }
+    Ok(0)
+}
+
+fn cmd_model_eject(dry_run: bool) -> Result<i32> {
+    let loaded = lms::list_loaded()?;
+    let managed: Vec<_> = loaded
+        .iter()
+        .filter(|m| swap::is_darkmux_owned(&m.identifier))
+        .collect();
+    let user_count = loaded.len() - managed.len();
+    if managed.is_empty() {
+        println!("no darkmux-managed loads to eject");
+        if user_count > 0 {
+            println!(
+                "({} user-loaded model(s) untouched — use `lms unload <identifier>` for those)",
+                user_count
+            );
+        }
+        return Ok(0);
+    }
+    for m in &managed {
+        if dry_run {
+            println!("would eject {} (ctx={})", m.identifier, m.context);
+        } else {
+            println!("eject {} (ctx={})", m.identifier, m.context);
+            lms::unload(&m.identifier)?;
+        }
+    }
+    let verb = if dry_run { "would eject" } else { "ejected" };
+    let mut summary = format!("{verb} {} model(s)", managed.len());
+    if user_count > 0 {
+        summary.push_str(&format!(", respected {user_count} user-loaded model(s)"));
+    }
+    if dry_run {
+        summary.push_str(" [DRY RUN]");
+    }
+    println!("{summary}");
+    Ok(0)
+}
+
 fn cmd_profile(sub: ProfileCmd) -> Result<i32> {
     match sub {
         ProfileCmd::Draft {
@@ -751,7 +858,11 @@ fn cmd_swap(profile_name: &str, config: Option<&str>, dry_run: bool, quiet: bool
             loaded.path.display()
         );
     }
-    let result = swap::swap(profile, &loaded.registry, swap::SwapOpts { quiet, dry_run })?;
+    let result = swap::swap(
+        profile,
+        &loaded.registry,
+        swap::SwapOpts { quiet, dry_run },
+    )?;
     if !quiet {
         let mut bits = vec![
             format!("done in {}ms", result.walltime_ms),

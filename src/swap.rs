@@ -1,15 +1,47 @@
 use crate::lms;
 use crate::runtime::apply_runtime;
-use crate::types::{Profile, ProfileHookCommand, ProfileRegistry};
+use crate::types::{Profile, ProfileHookCommand, ProfileModel, ProfileRegistry};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::process::Command;
 use std::time::Instant;
 
+/// Prefix attached to identifiers darkmux uses for its own LMStudio loads.
+/// Anything visible via `lms ps` starting with this prefix is owned by darkmux
+/// and safe to unload during swap; anything else is user state and off-limits.
+///
+/// See [issue #52](https://github.com/kstrat2001/darkmux/issues/52) for the
+/// design rationale (operator-sovereignty applied at model-state level —
+/// darkmux never touches state it didn't bring up).
+pub const DARKMUX_LMS_NAMESPACE: &str = "darkmux:";
+
+/// Compute the darkmux-namespaced LMStudio identifier for a profile model.
+///
+/// If the profile sets an explicit `identifier`, use it as-is (allows
+/// operators to opt out of the namespace for special cases). Otherwise wrap
+/// the model id under the `darkmux:` namespace so unload-filtering can
+/// distinguish darkmux's loads from user-managed ones.
+pub fn namespaced_identifier(m: &ProfileModel) -> String {
+    if let Some(explicit) = m.identifier.as_deref() {
+        return explicit.to_string();
+    }
+    format!("{}{}", DARKMUX_LMS_NAMESPACE, m.id)
+}
+
+/// `true` if this identifier was minted by darkmux (begins with our
+/// namespace). Used to filter `lms ps` results during swap.
+pub fn is_darkmux_owned(identifier: &str) -> bool {
+    identifier.starts_with(DARKMUX_LMS_NAMESPACE)
+}
+
 #[derive(Debug, Default)]
 pub struct SwapResult {
     pub unloaded: Vec<String>,
     pub loaded: Vec<String>,
+    /// Identifiers of loaded models we left alone because they're not in
+    /// the darkmux namespace — surfaced so callers can report respect for
+    /// user state when relevant.
+    pub user_state_respected: Vec<String>,
     pub runtime_modified: bool,
     pub hooks_ran: usize,
     pub walltime_ms: u128,
@@ -27,47 +59,56 @@ pub fn swap(profile: &Profile, registry: &ProfileRegistry, opts: SwapOpts) -> Re
     let pre = registry.hooks.as_ref().map(|h| h.pre_swap.as_slice()).unwrap_or(&[]);
     result.hooks_ran += run_hooks(pre, profile, &opts);
 
-    // desired state: identifier -> n_ctx
-    let mut want: HashMap<String, u64> = HashMap::new();
+    // Map of namespaced identifier → desired context length for everything
+    // the new profile wants loaded.
+    let mut want: HashMap<String, u32> = HashMap::new();
     for m in &profile.models {
-        let ident = m.identifier.clone().unwrap_or_else(|| m.id.clone());
-        want.insert(ident, m.n_ctx as u64);
+        want.insert(namespaced_identifier(m), m.n_ctx);
     }
 
     let loaded = lms::list_loaded()?;
-    let mut loaded_by_id: HashMap<String, &crate::types::LoadedModel> = HashMap::new();
-    for lm in &loaded {
-        loaded_by_id.insert(lm.identifier.clone(), lm);
-    }
 
-    // unload anything we don't want, OR want at a different ctx
+    // Pass 1 — unload anything in the darkmux namespace that doesn't match
+    // the new profile (wrong ctx, or absent from profile entirely). Never
+    // touch entries outside the namespace; those are user state.
     for cur in &loaded {
-        let desired = want.get(&cur.identifier).copied();
-        if desired.is_none() || desired != Some(cur.context) {
-            if !opts.quiet {
-                println!("unload {} (was ctx={})", cur.identifier, cur.context);
-            }
-            if !opts.dry_run {
-                lms::unload(&cur.identifier)?;
-            }
-            result.unloaded.push(cur.identifier.clone());
+        if !is_darkmux_owned(&cur.identifier) {
+            result.user_state_respected.push(cur.identifier.clone());
+            continue;
         }
+        let desired_ctx = want.get(&cur.identifier).copied();
+        let same_ctx = desired_ctx == Some(cur.context as u32);
+        if same_ctx {
+            continue; // already correctly loaded
+        }
+        if !opts.quiet {
+            println!("unload {} (was ctx={})", cur.identifier, cur.context);
+        }
+        if !opts.dry_run {
+            lms::unload(&cur.identifier)?;
+        }
+        result.unloaded.push(cur.identifier.clone());
     }
 
-    // load anything in profile that isn't already correctly loaded
+    // Pass 2 — load anything the profile wants that isn't already correctly
+    // loaded under our namespace.
+    let loaded_after_unload: HashMap<&str, &crate::types::LoadedModel> = loaded
+        .iter()
+        .filter(|lm| !result.unloaded.iter().any(|u| u == &lm.identifier))
+        .map(|lm| (lm.identifier.as_str(), lm))
+        .collect();
     for m in &profile.models {
-        let ident = m.identifier.clone().unwrap_or_else(|| m.id.clone());
-        let cur = loaded_by_id.get(&ident);
-        if let Some(c) = cur {
+        let ident = namespaced_identifier(m);
+        if let Some(c) = loaded_after_unload.get(ident.as_str()) {
             if c.context as u32 == m.n_ctx {
-                continue;
+                continue; // already correctly loaded under our namespace
             }
         }
         if !opts.quiet {
             println!("load {ident} @ ctx={}", m.n_ctx);
         }
         if !opts.dry_run {
-            lms::load(m, opts.quiet)?;
+            lms::load_with_identifier(&m.id, m.n_ctx, &ident, opts.quiet)?;
         }
         result.loaded.push(ident);
     }
@@ -136,6 +177,42 @@ mod tests {
             runtime,
             use_when: None,
         }
+    }
+
+    #[test]
+    fn namespaced_identifier_uses_prefix_when_no_override() {
+        let m = ProfileModel {
+            id: "qwen3.6-35b-a3b".into(),
+            n_ctx: 100_000,
+            role: ModelRole::Primary,
+            identifier: None,
+        };
+        assert_eq!(namespaced_identifier(&m), "darkmux:qwen3.6-35b-a3b");
+    }
+
+    #[test]
+    fn namespaced_identifier_passes_through_explicit_id() {
+        let m = ProfileModel {
+            id: "qwen3.6-35b-a3b".into(),
+            n_ctx: 100_000,
+            role: ModelRole::Primary,
+            identifier: Some("my-custom-alias".into()),
+        };
+        // Explicit override wins — operator opted out of the auto-namespace.
+        assert_eq!(namespaced_identifier(&m), "my-custom-alias");
+    }
+
+    #[test]
+    fn is_darkmux_owned_detects_namespace() {
+        assert!(is_darkmux_owned("darkmux:qwen3.6-35b-a3b"));
+        assert!(is_darkmux_owned("darkmux:anything-after"));
+        // Non-namespaced ids are user state — off-limits.
+        assert!(!is_darkmux_owned("qwen3.6-35b-a3b"));
+        assert!(!is_darkmux_owned("user-loaded-model"));
+        assert!(!is_darkmux_owned("my-custom-alias"));
+        // Partial match isn't enough.
+        assert!(!is_darkmux_owned("dark:foo"));
+        assert!(!is_darkmux_owned("predarkmux:foo"));
     }
 
     #[test]

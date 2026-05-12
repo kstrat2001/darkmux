@@ -146,12 +146,50 @@ Exemplars across darkmux's current surface:
 - **Role + Crew (not Team)** — composition is operator's call per mission; no fixed membership
 - **JSON source-of-truth + SQLite derived index** — operator hand-edits any source file; system rebuilds derived state on demand; deleting the index is recoverable
 - **Don't mutate user state without confirmation** — `~/.darkmux/profiles.json`, `~/.openclaw/openclaw.json`, anything operator-owned. Read + propose; never write silently.
+- **Namespace everything darkmux brings up in shared state** — LMStudio loaded models, OpenClaw agent definitions, channel routing, anything else darkmux writes into a system other systems also use. Conventions: LMStudio identifiers under `darkmux:<model-id>` (e.g. `darkmux:qwen3.6-35b-a3b`); OpenClaw agent ids under `darkmux/<role>` (e.g. `darkmux/coder`). Then darkmux's own state-mutating operations only touch the namespaced subset — user state is off-limits by construction, not by careful coding. The namespace is the contract.
 - **Keyword vocabulary hybrid** — ship a starter; operator augments; system logs misses but never auto-mutates the vocabulary
 - **Operator-tunable preferences are numeric scales, not hidden enums** — discoverable via example values; supports continuous tuning; UI-ready
 
 The principle is recursive. It applies to documentation surface (this CLAUDE.md, READMEs), to CLI verbs, to data shapes on disk, to the architecture of future features. When a design decision feels like it should be made automatically by the system, that's the moment to surface it back to the operator instead.
 
 Tracked as #44.
+
+## Namespace convention (darkmux state in shared systems)
+
+When darkmux maintains state in a system other consumers also use — LMStudio loaded instances, OpenClaw agent definitions, channel routing, anything operator-managed — **darkmux-owned entries are namespaced** so they can be recognized at a glance and so darkmux's own state-mutating operations can scope themselves to only the namespaced subset. User state is then off-limits by construction, not by careful coding.
+
+### Current namespaces
+
+| System | Form | Example |
+|---|---|---|
+| LMStudio loaded identifier (visible in `lms ps`) | `darkmux:<model-id>` | `darkmux:qwen3.6-35b-a3b` |
+| OpenClaw agent ids (`agents.list[].id`) | `darkmux/<role>` | `darkmux/coder` |
+| OpenClaw channel routing (`channels.modelByChannel.*`) — if darkmux ever manages it | `darkmux/<key>` | `darkmux/<channel-id>` |
+
+Different separators (`:` vs `/`) are deliberate — `:` reads naturally in LMStudio's ecosystem (which uses `:` to separate concepts like `mlx-community/foo:Q4_K_M`); `/` reads naturally in OpenClaw's config (which uses paths and ids that benefit from hierarchy). Both are clearly "this is darkmux's thing."
+
+### Why this matters
+
+Without the namespace, darkmux's operations have to fall back on heuristics or persistent state files to know "did I bring this up, or did the user?" Heuristics are fragile (the user might happen to use the same naming convention); state files go stale (user force-quits, LMStudio restarts, manual unloads). The namespace IS the state — durable, visible, self-describing. If `lms ps` shows `darkmux:qwen3.6-35b-a3b`, that's a darkmux load and `darkmux swap` can unload it. If it shows `qwen3.6-35b-a3b` with no prefix, that's user state and darkmux leaves it alone.
+
+### Transparency at dispatch time
+
+When darkmux loads a model under `darkmux:<id>`, the underlying LMStudio model key is unchanged — `lms ps` shows `identifier=darkmux:foo, modelKey=foo`. Dispatchers calling LMStudio's chat-completion API with the bare model id `foo` still resolve via the `modelKey` match (verified empirically 2026-05-12 against openclaw's lmstudio plugin). **The namespace is invisible at dispatch time** — only visible to darkmux and operators inspecting `lms ps`. Existing dispatcher configs continue to work without migration.
+
+### Conventions for new code
+
+When writing a new feature that mutates state in LMStudio or OpenClaw on the operator's behalf:
+
+1. **Generate the namespaced form** at the point of write. See `swap::namespaced_identifier` for the LMStudio case.
+2. **Filter on the namespace** at the point of read/cleanup. See `swap::is_darkmux_owned` for the LMStudio case.
+3. **Pass-through explicit overrides** — if the operator sets an explicit identifier in their profile, don't override it. The namespace is the *default*; the operator can opt out.
+
+### Operator-facing commands
+
+- `darkmux model status` — list `lms ps` results grouped by ownership (darkmux-managed vs user state). Read-only.
+- `darkmux model eject [--dry-run]` — unload everything in the `darkmux:` namespace; never touches user state. Use to release darkmux's RAM footprint without disturbing other tools.
+
+Tracked alongside operator sovereignty (#44) and issue [#52](https://github.com/kstrat2001/darkmux/issues/52) for the implementation history.
 
 ## Engagements (operator-defined dreamscapes)
 
