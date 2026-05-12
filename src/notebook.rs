@@ -145,12 +145,7 @@ pub fn draft_entry(opts: &DraftOptions) -> Result<DraftReport> {
         // Include a machine-id tag so the same notebook directory (e.g.
         // when pointed at an iCloud-synced path via DARKMUX_NOTEBOOK_DIR)
         // can hold entries from multiple machines without ambiguity.
-        // Priority: explicit --machine flag > DARKMUX_MACHINE_ID env var
-        // > auto-derived hardware fingerprint.
-        let machine_id = match &opts.machine_override {
-            Some(id) => id.clone(),
-            None => machine_fingerprint(),
-        };
+        let machine_id = resolve_machine_id(opts);
         let header = format!(
             "<!-- darkmux:notebook-entry: run={} machine={} date={} -->\n\n",
             opts.run_id, machine_id, date
@@ -305,6 +300,21 @@ fn slugify(input: &str) -> String {
 
 fn shortid(run_id: &str) -> String {
     run_id.chars().take(12).collect()
+}
+
+/// Resolve the machine id for a notebook entry. Priority:
+///   1. Explicit `--machine` flag (i.e. `DraftOptions::machine_override`)
+///   2. `DARKMUX_MACHINE_ID` env var
+///   3. Auto-derived hardware fingerprint
+///
+/// Extracted as a helper so the priority chain is testable without
+/// requiring the openclaw runtime to be installed (the dispatch path
+/// in `draft_entry` would otherwise prevent CI coverage on machines
+/// where openclaw isn't on PATH).
+pub(crate) fn resolve_machine_id(opts: &DraftOptions) -> String {
+    opts.machine_override
+        .clone()
+        .unwrap_or_else(machine_fingerprint)
 }
 
 /// Identifier tag for the machine that drafted this notebook entry.
@@ -753,44 +763,42 @@ mod tests {
         assert!(parse_notebook_header("plain text", Path::new("test.md")).is_none());
     }
 
-    /// draft_entry uses machine_override when provided (overrides env var).
+    /// resolve_machine_id honors --machine flag > DARKMUX_MACHINE_ID > fingerprint.
+    /// Hits the helper directly so the test doesn't require the openclaw
+    /// runtime to be installed (avoids CI failures on macos-latest runners).
     #[serial_test::serial]
     #[test]
-    fn draft_entry_machine_override_overrides_env_var() {
-        let tmp = TempDir::new().unwrap();
-        // Set env var.
+    fn resolve_machine_id_priority_chain() {
         let prev = env::var("DARKMUX_MACHINE_ID").ok();
+
+        // 1. Explicit override wins over both env var and fingerprint.
         unsafe { env::set_var("DARKMUX_MACHINE_ID", "env-fingerprint"); }
+        let opts_with_override = DraftOptions {
+            run_id: "x".into(),
+            agent: "main".into(),
+            slug: None,
+            dry_run: true,
+            machine_override: Some("override-machine".into()),
+        };
+        assert_eq!(resolve_machine_id(&opts_with_override), "override-machine");
 
-        // Create project-local .darkmux/runs/test-run/ directory.
-        let runs_dir = tmp.path().join(".darkmux/runs/test-run");
-        fs::create_dir_all(&runs_dir).unwrap();
-        fs::write(
-            runs_dir.join("manifest.json"),
-            r#"{"workload":"quick-q","provider":"prompt","profile":"scribe","sessionId":"s","durationMs":5000,"ok":true}"#,
-        )
-        .unwrap();
+        // 2. With no override, env var wins over fingerprint.
+        let opts_no_override = DraftOptions {
+            run_id: "x".into(),
+            agent: "main".into(),
+            slug: None,
+            dry_run: true,
+            machine_override: None,
+        };
+        assert_eq!(resolve_machine_id(&opts_no_override), "env-fingerprint");
 
-        let prev_cwd = env::current_dir().unwrap();
-        env::set_current_dir(tmp.path()).unwrap();
-
-        // Draft with machine_override — should use "override-machine".
-        let report = draft_entry(&DraftOptions {
-            run_id: "test-run".to_string(),
-            agent: "main".to_string(),
-            slug: Some("override-test".to_string()),
-            dry_run: false,
-            machine_override: Some("override-machine".to_string()),
-        })
-        .unwrap();
-
-        env::set_current_dir(prev_cwd).unwrap();
-
-        // Read the written file and verify machine tag.
-        let content = fs::read_to_string(&report.entry_path).unwrap();
-        assert!(content.contains("machine=override-machine"));
-        // Should NOT contain env var value.
-        assert!(!content.contains("machine=env-fingerprint"));
+        // 3. With no override AND no env var, falls back to hardware fingerprint
+        //    (non-empty per machine_fingerprint() contract).
+        unsafe { env::remove_var("DARKMUX_MACHINE_ID"); }
+        let fp = resolve_machine_id(&opts_no_override);
+        assert!(!fp.is_empty(), "fingerprint must not be empty");
+        assert_ne!(fp, "override-machine");
+        assert_ne!(fp, "env-fingerprint");
 
         unsafe {
             match prev {
