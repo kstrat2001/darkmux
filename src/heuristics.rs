@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod m_series_128;
 pub mod m_series_64;
+pub mod m_series_32;
 pub mod generic;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -232,6 +233,7 @@ pub trait HeuristicsProvider: Sync {
 static PROVIDERS: &[&dyn HeuristicsProvider] = &[
     &m_series_128::PROVIDER,
     &m_series_64::PROVIDER,
+    &m_series_32::PROVIDER,
     &generic::PROVIDER,
 ];
 
