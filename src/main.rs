@@ -20,6 +20,8 @@ mod providers;
 mod runtime;
 mod skills;
 mod swap;
+mod team_loader;
+mod team_types;
 mod types;
 mod workloads;
 

@@ -1,0 +1,10 @@
+{
+  "id": "coder",
+  "description": "Implements features described by the operator. Reads existing code first; follows patterns; runs tests before reporting done.",
+  "capabilities": ["coding", "test-designing"],
+  "tool_palette": {
+    "allow": ["read", "edit", "exec", "process"],
+    "deny": []
+  },
+  "escalation_contract": "bail-with-explanation"
+}

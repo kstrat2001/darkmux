@@ -1,0 +1,10 @@
+{
+  "id": "scribe",
+  "description": "Drafts lab notebook entries and prose from run data + operator findings. EE-lab-notebook aesthetic; date stamps; tables OK; methodology over polish.",
+  "capabilities": ["documenting"],
+  "tool_palette": {
+    "allow": ["read", "edit"],
+    "deny": ["exec"]
+  },
+  "escalation_contract": "bail-with-explanation"
+}
