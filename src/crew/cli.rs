@@ -327,6 +327,7 @@ mod tests {
         assert!(result.is_ok(), "crew_show_at should succeed: {:?}", result);
     }
 
+    #[serial_test::serial]
     #[test]
     fn crew_show_nonexistent_errors() {
         let guard = CrewDirGuard::new();

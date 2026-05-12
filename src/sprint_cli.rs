@@ -729,12 +729,15 @@ mod tests {
         assert!(msg.contains("known profiles"), "error should list known profiles: {msg}");
     }
 
+    #[serial_test::serial]
     #[test]
     fn run_estimate_gracefully_degrades_when_narrate_fails() {
         // Regression test for QA Flag 3 — when --narrate is requested
         // but LMStudio is unreachable, the deterministic output still
         // emits (narrative=None). Tested by pointing DARKMUX_LMSTUDIO_URL
-        // at an unreachable port.
+        // at an unreachable port. Marked serial because mutating env vars
+        // (DARKMUX_LMSTUDIO_URL) is process-global and races with any
+        // other test reading the same var.
         let spec = WorkloadSpec {
             workload_class: "long-agentic".into(),
             active_profile: "balanced".into(),
