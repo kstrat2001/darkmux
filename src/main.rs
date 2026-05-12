@@ -751,7 +751,11 @@ fn cmd_swap(profile_name: &str, config: Option<&str>, dry_run: bool, quiet: bool
             loaded.path.display()
         );
     }
-    let result = swap::swap(profile, &loaded.registry, swap::SwapOpts { quiet, dry_run })?;
+    let result = swap::swap(
+        profile,
+        &loaded.registry,
+        swap::SwapOpts { quiet, dry_run },
+    )?;
     if !quiet {
         let mut bits = vec![
             format!("done in {}ms", result.walltime_ms),

@@ -1,4 +1,4 @@
-use crate::types::{LoadedModel, ProfileModel};
+use crate::types::LoadedModel;
 use anyhow::{Context, Result, bail};
 use std::env;
 use std::process::Command;
@@ -192,16 +192,24 @@ pub fn unload(identifier: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn load(model: &ProfileModel, quiet: bool) -> Result<()> {
+/// Load a model into LMStudio under an explicit identifier. The caller is
+/// responsible for deciding whether the identifier should be darkmux-namespaced
+/// (see `swap::namespaced_identifier`) or pass-through for an operator-set
+/// custom name.
+pub fn load_with_identifier(
+    model_id: &str,
+    n_ctx: u32,
+    identifier: &str,
+    quiet: bool,
+) -> Result<()> {
     let mut cmd = Command::new(lms_bin());
-    let ident = model.identifier.as_deref().unwrap_or(&model.id);
     cmd.args([
         "load",
-        &model.id,
+        model_id,
         "--context-length",
-        &model.n_ctx.to_string(),
+        &n_ctx.to_string(),
         "--identifier",
-        ident,
+        identifier,
     ]);
     if !quiet {
         // inherit stdio so user sees the loading spinner
@@ -210,9 +218,9 @@ pub fn load(model: &ProfileModel, quiet: bool) -> Result<()> {
     }
     let status = cmd
         .status()
-        .with_context(|| format!("running `lms load {}`", model.id))?;
+        .with_context(|| format!("running `lms load {model_id}`"))?;
     if !status.success() {
-        bail!("lms load {} failed: exit {}", model.id, status.code().unwrap_or(-1));
+        bail!("lms load {model_id} failed: exit {}", status.code().unwrap_or(-1));
     }
     Ok(())
 }
