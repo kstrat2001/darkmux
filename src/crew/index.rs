@@ -1,12 +1,8 @@
 //! SQLite-backed derived index over crew manifests. **Phase B of issue #45.**
 //!
-//! # Synthesis: where the schema comes from
+//! # Schema rationale
 //!
-//! Three candidate schema designs were produced during Pair 3 of the
-//! dev-agent bake-off (2026-05-13). The implementation integrates the
-//! strongest elements of each rather than picking one wholesale:
-//!
-//! ## D's design — the baseline
+//! The non-obvious choices and why:
 //!
 //! - **Composite PK `(id, mission_id)` on sprints** — sprint IDs are scoped
 //!   per mission, not globally unique. The Rust `Sprint` struct's
@@ -18,39 +14,30 @@
 //!   mid-rebuild. Deferred enforcement runs at transaction commit.
 //! - **`PRAGMA foreign_keys = ON`** as a connection-default — FKs are off
 //!   by default in SQLite; explicit opt-in is required.
-//! - **`source_files.kind` covers ALL entity types** — `kind IN ('role',
-//!   'capability', 'crew', 'mission', 'sprint')`.
+//! - **`source_files.kind` covers ALL entity types** —
+//!   `kind IN ('role', 'capability', 'crew', 'mission', 'sprint')`.
 //! - **`PRAGMA user_version` for schema versioning** — SQLite-native; no
 //!   external migration tooling needed.
-//!
-//! ## B's design — additive insights
-//!
-//! - **`role_escalation_targets` table** — the `EscalationContract::HandOffTo(String)`
-//!   enum variant carries a `role_id` payload. Storing the enum variant
-//!   as a plain string in `roles.escalation_contract_tag` loses the FK
-//!   relationship. So: `roles.escalation_contract_tag` stores only the
-//!   tag (`'bail-with-explanation'` / `'retry-with-hint'` / `'hand-off-to'`)
+//! - **`role_escalation_targets` table** — the
+//!   `EscalationContract::HandOffTo(String)` enum variant carries a
+//!   `role_id` payload. Storing the enum variant as a plain string in
+//!   `roles.escalation_contract_tag` loses the FK relationship. So:
+//!   `roles.escalation_contract_tag` stores only the tag
+//!   (`'bail-with-explanation'` / `'retry-with-hint'` / `'hand-off-to'`)
 //!   and `'hand-off-to'` requires a row in `role_escalation_targets`.
 //! - **`unmatched_terms` table** — for allocator FTS fallback (terms in
 //!   ticket text that didn't match any capability keyword).
-//!
-//! ## A's design — operational detail
-//!
-//! - **FTS5 sync triggers** — automatic propagation of `capability_keywords`
-//!   INSERT/UPDATE/DELETE to `capability_keywords_fts`. Pattern documented
-//!   inline below the DDL.
-//!
-//! ## Spec concerns surfaced by D and resolved here
-//!
-//! 1. **Sprint ID scoping** — composite PK `(id, mission_id)`.
-//! 2. **`Mission.sprint_ids` is JSON-only**, NOT a denormalized DB column —
-//!    sprint membership is derived from `sprints WHERE mission_id = ?`.
-//!    The JSON-side field stays in the manifest for operator hand-editing.
-//! 3. **`outcomes.sprint_id` + `outcomes.mission_id`** — both columns
-//!    present. Application-side validation matches `sprints(id, mission_id)`.
-//!    A composite FK isn't expressible in SQLite without extra triggers;
-//!    the redundancy is a deliberate denormalization for query ergonomics.
-//! 4. **`source_files.kind` covers all 5 entity types** (see baseline).
+//! - **FTS5 sync triggers** — `capability_keywords_ai` / `_ad` / `_au`
+//!   propagate INSERT / DELETE / UPDATE on `capability_keywords` to the
+//!   `capability_keywords_fts` mirror automatically.
+//! - **`Mission.sprint_ids` is JSON-only**, NOT a denormalized DB column —
+//!   sprint membership is derived from `sprints WHERE mission_id = ?`.
+//!   The JSON-side field stays in the manifest for operator hand-editing.
+//! - **`outcomes.sprint_id` + `outcomes.mission_id`** — both columns
+//!   present. A composite FK to `sprints(id, mission_id)` isn't
+//!   expressible in SQLite without extra triggers; the redundancy is a
+//!   deliberate denormalization for query ergonomics + application-side
+//!   validation.
 //!
 //! # Public surface
 //!
