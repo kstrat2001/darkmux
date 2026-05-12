@@ -688,15 +688,10 @@ fn cmd_model_eject(dry_run: bool) -> Result<i32> {
             lms::unload(&m.identifier)?;
         }
     }
-    let mut summary = format!("ejected {} model(s)", managed.len());
-    if dry_run {
-        summary = format!("would eject {} model(s)", managed.len());
-    }
+    let verb = if dry_run { "would eject" } else { "ejected" };
+    let mut summary = format!("{verb} {} model(s)", managed.len());
     if user_count > 0 {
-        summary.push_str(&format!(
-            ", respected {} user-loaded model(s)",
-            user_count
-        ));
+        summary.push_str(&format!(", respected {user_count} user-loaded model(s)"));
     }
     if dry_run {
         summary.push_str(" [DRY RUN]");
