@@ -224,7 +224,7 @@ const REBUILD_TABLES: &[&str] = &[
 /// Default index path: `<paths.root>/index.db`. Resolved through the same
 /// project-vs-user precedence as `lab::paths`.
 pub(crate) fn default_index_path() -> PathBuf {
-    resolve(ResolveScope::Auto).root.join("index.db")
+    crew_root().join("index.db")
 }
 
 fn now_unix() -> i64 {
