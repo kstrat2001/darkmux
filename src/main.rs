@@ -20,6 +20,7 @@ mod profiles;
 mod providers;
 mod runtime;
 mod skills;
+mod role_cli;
 mod swap;
 mod types;
 mod workloads;
@@ -100,6 +101,11 @@ enum Cmd {
     Crew {
         #[command(subcommand)]
         sub: CrewCmd,
+    },
+    /// Role management — list and show role details from the SQLite index.
+    Role {
+        #[command(subcommand)]
+        sub: RoleCmd,
     },
     /// Agent-role template subcommands. Browse + emit validated
     /// `systemPromptOverride` scaffolds for common roles (qa, scribe,
@@ -204,6 +210,17 @@ enum CrewIndexCmd {
     /// Report index status: last-rebuild timestamp, source counts, drift.
     /// (Not yet implemented.)
     Status,
+}
+
+#[derive(Subcommand)]
+enum RoleCmd {
+    /// List every role in the index.
+    List,
+    /// Show full details for a single role.
+    Show {
+        /// Role id to show.
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -396,6 +413,7 @@ fn run(cmd: Cmd) -> Result<i32> {
         Cmd::Profile { sub } => cmd_profile(sub),
         Cmd::Model { sub } => cmd_model(sub),
         Cmd::Crew { sub } => cmd_crew(sub),
+        Cmd::Role { sub } => cmd_role(sub),
         Cmd::Agent { sub } => cmd_agent(sub),
         Cmd::Init {
             with_hook,
@@ -642,6 +660,13 @@ fn derive_profile_name(model_id: &str, task: heuristics::TaskClass) -> String {
 #[allow(dead_code)]
 fn has_stripped_publisher(model_id: &str) -> bool {
     model_id.contains('/')
+}
+
+fn cmd_role(sub: RoleCmd) -> Result<i32> {
+    match sub {
+        RoleCmd::List => role_cli::role_list(),
+        RoleCmd::Show { id } => role_cli::role_show(&id),
+    }
 }
 
 fn cmd_agent(sub: AgentCmd) -> Result<i32> {
