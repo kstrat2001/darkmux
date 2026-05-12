@@ -91,7 +91,12 @@ pub fn apply_runtime(profile: &Profile) -> Result<bool> {
         modified = true;
     }
 
-    // 3. models.providers.*.models[].contextWindow — match any model in profile
+    // 3. models.providers.*.models[].contextWindow — sync to profile n_ctx for
+    //    any entry whose id matches either a profile model's bare id OR its
+    //    namespaced form. Without the namespaced-form match, registry entries
+    //    that darkmux's section 4 below adds would drift on subsequent swaps
+    //    if the operator changed the profile's n_ctx (entries get added but
+    //    never re-synced).
     if let Some(providers) = config
         .get_mut("models")
         .and_then(|m| m.get_mut("providers"))
@@ -108,12 +113,14 @@ pub fn apply_runtime(profile: &Profile) -> Result<bool> {
                 let Some(id) = entry_obj.get("id").and_then(|x| x.as_str()) else {
                     continue;
                 };
-                if let Some(want) = profile
-                    .models
-                    .iter()
-                    .find(|pm| pm.id == id)
-                    .map(|pm| pm.n_ctx as u64)
-                {
+                let id = id.to_string();
+                if let Some(want) = profile.models.iter().find_map(|pm| {
+                    if pm.id == id || namespaced_identifier(pm) == id {
+                        Some(pm.n_ctx as u64)
+                    } else {
+                        None
+                    }
+                }) {
                     let cur = entry_obj.get("contextWindow").and_then(|x| x.as_u64());
                     if cur != Some(want) {
                         entry_obj.insert("contextWindow".to_string(), Value::Number(want.into()));
@@ -121,6 +128,69 @@ pub fn apply_runtime(profile: &Profile) -> Result<bool> {
                     }
                 }
             }
+        }
+    }
+
+    // 4. Ensure each namespaced profile model has a registry entry in the
+    //    lmstudio provider's models array. Closes the namespace-contract
+    //    metadata edge surfaced 2026-05-13: openclaw computes the compaction
+    //    trigger threshold from `contextWindow - reserveTokensFloor -
+    //    maxOutputTokens` against this registry entry; if the dispatched id
+    //    is `darkmux:<bare-id>` but the registry only has `<bare-id>`, the
+    //    lookup falls through to stale (or hardcoded-default) metadata and
+    //    compaction can fail to fire when it should — same bug class as
+    //    Eureka E5 (calibration drift, just mediated differently).
+    //
+    //    Strategy: clone the bare-id entry as the template (preserves
+    //    cost/input/maxTokens/name/reasoning), change `id` to the namespaced
+    //    form, set `contextWindow` to the profile's `n_ctx`. If no bare-id
+    //    template exists, synthesize a minimal entry — better an entry with
+    //    defaults than no entry at all.
+    if let Some(lmstudio_models) = config
+        .get_mut("models")
+        .and_then(|m| m.get_mut("providers"))
+        .and_then(|p| p.get_mut("lmstudio"))
+        .and_then(|l| l.get_mut("models"))
+        .and_then(|m| m.as_array_mut())
+    {
+        for pm in profile.models.iter() {
+            if pm.identifier.is_some() {
+                continue; // operator opted out of the namespace for this load
+            }
+            let ns_ident = namespaced_identifier(pm);
+            if ns_ident == pm.id {
+                continue; // no rewrite happened; no namespaced entry needed
+            }
+            let already_has_ns = lmstudio_models
+                .iter()
+                .any(|e| e.get("id").and_then(|v| v.as_str()) == Some(ns_ident.as_str()));
+            if already_has_ns {
+                continue; // section 3 keeps its contextWindow in sync
+            }
+            let template: Option<Value> = lmstudio_models
+                .iter()
+                .find(|e| e.get("id").and_then(|v| v.as_str()) == Some(pm.id.as_str()))
+                .cloned();
+            let mut entry = template.unwrap_or_else(|| {
+                serde_json::json!({
+                    "id": ns_ident,
+                    "contextWindow": pm.n_ctx as u64,
+                    "input": ["text"],
+                    "maxTokens": 8192,
+                    "cost": {"cacheRead": 0, "cacheWrite": 0, "input": 0, "output": 0},
+                    "name": format!("{ns_ident} (darkmux-managed)"),
+                    "reasoning": false
+                })
+            });
+            if let Some(obj) = entry.as_object_mut() {
+                obj.insert("id".to_string(), Value::String(ns_ident.clone()));
+                obj.insert(
+                    "contextWindow".to_string(),
+                    Value::Number((pm.n_ctx as u64).into()),
+                );
+            }
+            lmstudio_models.push(entry);
+            modified = true;
         }
     }
 
@@ -561,6 +631,243 @@ mod tests {
             after["agents"]["list"][0]["model"],
             "lmstudio/foo"
         );
+    }
+
+    #[test]
+    fn adds_namespaced_registry_entry_from_bare_template() {
+        // Bare-id entry exists; section 4 should clone it as a namespaced
+        // entry with the profile's contextWindow. Closes the metadata edge
+        // (2026-05-13 eureka).
+        let tmp = TempDir::new().unwrap();
+        let p = write_config(
+            &tmp,
+            r#"{
+                "models": {
+                    "providers": {
+                        "lmstudio": {
+                            "models": [
+                                {
+                                    "id": "qwen3.6-35b-a3b",
+                                    "contextWindow": 131072,
+                                    "cost": {"cacheRead": 0, "cacheWrite": 0, "input": 0, "output": 0},
+                                    "input": ["text"],
+                                    "maxTokens": 8192,
+                                    "name": "Qwen 3.6 35B A3B (LMStudio)",
+                                    "reasoning": true
+                                }
+                            ]
+                        }
+                    }
+                }
+            }"#,
+        );
+        let profile = profile_with_runtime(
+            p.to_str().unwrap(),
+            None,
+            None,
+            vec![ProfileModel {
+                id: "qwen3.6-35b-a3b".into(),
+                n_ctx: 101000,
+                role: ModelRole::Primary,
+                identifier: None,
+            }],
+        );
+        assert!(apply_runtime(&profile).unwrap());
+        let after: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+        let arr = after["models"]["providers"]["lmstudio"]["models"]
+            .as_array()
+            .unwrap();
+        assert_eq!(arr.len(), 2, "namespaced entry should have been added");
+
+        let ns_entry = arr
+            .iter()
+            .find(|e| e["id"] == "darkmux:qwen3.6-35b-a3b")
+            .expect("namespaced entry not found");
+        assert_eq!(ns_entry["contextWindow"], 101000);
+        // Template fields preserved from the bare-id entry.
+        assert_eq!(ns_entry["maxTokens"], 8192);
+        assert_eq!(ns_entry["reasoning"], true);
+        assert_eq!(ns_entry["input"][0], "text");
+        assert_eq!(ns_entry["cost"]["cacheRead"], 0);
+    }
+
+    #[test]
+    fn synthesizes_minimal_registry_entry_when_no_template() {
+        // No bare-id entry exists; section 4 should synthesize a minimal
+        // entry rather than leaving the namespaced load without metadata.
+        let tmp = TempDir::new().unwrap();
+        let p = write_config(
+            &tmp,
+            r#"{
+                "models": {
+                    "providers": {
+                        "lmstudio": {
+                            "models": []
+                        }
+                    }
+                }
+            }"#,
+        );
+        let profile = profile_with_runtime(
+            p.to_str().unwrap(),
+            None,
+            None,
+            vec![ProfileModel {
+                id: "unknown-model-id".into(),
+                n_ctx: 64000,
+                role: ModelRole::Primary,
+                identifier: None,
+            }],
+        );
+        assert!(apply_runtime(&profile).unwrap());
+        let after: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+        let arr = after["models"]["providers"]["lmstudio"]["models"]
+            .as_array()
+            .unwrap();
+        assert_eq!(arr.len(), 1);
+        let entry = &arr[0];
+        assert_eq!(entry["id"], "darkmux:unknown-model-id");
+        assert_eq!(entry["contextWindow"], 64000);
+        assert!(entry["maxTokens"].is_number());
+        assert!(entry["input"].is_array());
+    }
+
+    #[test]
+    fn does_not_duplicate_namespaced_entry_on_second_swap() {
+        // Section 4 must be idempotent — running apply_runtime twice should
+        // not add a second namespaced entry.
+        let tmp = TempDir::new().unwrap();
+        let p = write_config(
+            &tmp,
+            r#"{
+                "models": {
+                    "providers": {
+                        "lmstudio": {
+                            "models": [
+                                {"id": "foo", "contextWindow": 10000}
+                            ]
+                        }
+                    }
+                }
+            }"#,
+        );
+        let profile = profile_with_runtime(
+            p.to_str().unwrap(),
+            None,
+            None,
+            vec![ProfileModel {
+                id: "foo".into(),
+                n_ctx: 50000,
+                role: ModelRole::Primary,
+                identifier: None,
+            }],
+        );
+
+        // First swap: section 4 adds the namespaced entry.
+        assert!(apply_runtime(&profile).unwrap());
+        let mid: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+        let mid_arr = mid["models"]["providers"]["lmstudio"]["models"]
+            .as_array()
+            .unwrap();
+        assert_eq!(mid_arr.len(), 2);
+
+        // Second swap: idempotent — no further modification.
+        assert!(!apply_runtime(&profile).unwrap());
+        let after: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+        let arr = after["models"]["providers"]["lmstudio"]["models"]
+            .as_array()
+            .unwrap();
+        assert_eq!(arr.len(), 2, "second swap should not duplicate the namespaced entry");
+    }
+
+    #[test]
+    fn section_3_resyncs_namespaced_entry_context_window() {
+        // After section 4 adds a namespaced entry, a later swap with a
+        // different n_ctx should re-sync its contextWindow via section 3's
+        // extended id matching.
+        let tmp = TempDir::new().unwrap();
+        let p = write_config(
+            &tmp,
+            r#"{
+                "models": {
+                    "providers": {
+                        "lmstudio": {
+                            "models": [
+                                {"id": "foo", "contextWindow": 10000},
+                                {"id": "darkmux:foo", "contextWindow": 50000}
+                            ]
+                        }
+                    }
+                }
+            }"#,
+        );
+        // Profile now wants n_ctx=80000 (different from the stored 50000).
+        let profile = profile_with_runtime(
+            p.to_str().unwrap(),
+            None,
+            None,
+            vec![ProfileModel {
+                id: "foo".into(),
+                n_ctx: 80000,
+                role: ModelRole::Primary,
+                identifier: None,
+            }],
+        );
+        assert!(apply_runtime(&profile).unwrap());
+        let after: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+        let arr = after["models"]["providers"]["lmstudio"]["models"]
+            .as_array()
+            .unwrap();
+        let ns_entry = arr
+            .iter()
+            .find(|e| e["id"] == "darkmux:foo")
+            .expect("namespaced entry should still exist");
+        assert_eq!(ns_entry["contextWindow"], 80000);
+    }
+
+    #[test]
+    fn does_not_add_namespaced_entry_when_identifier_explicit() {
+        // Profile sets an explicit identifier → operator opted out of the
+        // namespace → section 4 should NOT add a namespaced entry.
+        let tmp = TempDir::new().unwrap();
+        let p = write_config(
+            &tmp,
+            r#"{
+                "models": {
+                    "providers": {
+                        "lmstudio": {
+                            "models": [
+                                {"id": "foo", "contextWindow": 10000}
+                            ]
+                        }
+                    }
+                }
+            }"#,
+        );
+        let profile = profile_with_runtime(
+            p.to_str().unwrap(),
+            None,
+            None,
+            vec![ProfileModel {
+                id: "foo".into(),
+                n_ctx: 50000,
+                role: ModelRole::Primary,
+                identifier: Some("my-alias".into()),
+            }],
+        );
+        let _ = apply_runtime(&profile).unwrap();
+        let after: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+        let arr = after["models"]["providers"]["lmstudio"]["models"]
+            .as_array()
+            .unwrap();
+        assert_eq!(arr.len(), 1, "no namespaced entry when identifier is explicit");
+        assert_eq!(arr[0]["id"], "foo");
     }
 
     #[test]
