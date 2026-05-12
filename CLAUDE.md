@@ -155,7 +155,7 @@ Tracked as #44.
 
 ## Engagement (operator-defined dreamscape)
 
-Engagement is operator-defined, never system-defined. The system doesn't enumerate engagements, doesn't impose a directory shape, doesn't have an `engagement` config file format. The operator decides what's an engagement and how much to describe it.
+An engagement is operator-defined, never system-defined. The system doesn't enumerate engagements, doesn't impose a directory shape, doesn't have an `engagement` config file format. The operator decides what's an engagement and how much to describe it.
 
 An engagement can be:
 
@@ -164,15 +164,19 @@ An engagement can be:
 - *"Our wedding site is at knot.com/our-wedding"* — engagement lives at a URL; not a local dir; the orchestrator notes the URL and maps planning sub-tasks to missions
 - *"It's a Lovable.dev app I'm prototyping"* — hosted SaaS; the orchestrator references the workspace URL
 - *"My personal training goal is sub-5-minute mile"* — life goal; the orchestrator captures the aspiration as missions
+- *"I'm running a substack about local AI"* — long-form writing engagement; the orchestrator helps with drafts, editorial calendar, cross-post threading
+- *"I'm authoring a book on systems engineering"* — multi-month writing project; the orchestrator scaffolds chapters and tracks research threads
 - *"It's classified work I can't describe"* — the orchestrator respects opacity; engagement is named but content is operator-private
 - Unwritten entirely — operator carries it in their head; the orchestrator works from conversation
+
+If the operator is unsure what their engagement *is*, the orchestrator can offer a few of the above as starting shapes — picking a medium is itself one of the bridging moves the orchestrator is here to help with.
 
 **The orchestrator's bridging role.** When working on a mission within an engagement:
 
 - Read (or ask for) the engagement context — whatever form it takes
 - Capture it durably as an `.md` if the operator wants — location is operator's call (engagement repo root, `de-lab`, a private notes file, etc.)
-- Translate the soft free-form context into the structured concepts darkmux supports in code (Mission, Sprint, role tilts, preferences)
-- Respect the level of detail the operator chose — don't pry for structure the operator didn't ask for
+- Translate the soft free-form context into the structured concepts darkmux supports in code (Mission, Sprint, role tilts, preferences) — proposing this translation when it'd help the operator move forward is the orchestrator's by-design job, not a thing to withhold
+- Don't pry for structure the operator didn't volunteer — offer a suggestion once, let it land or get redirected, then drop it
 
 Engagements should not be well-defined. They are open-ended dreamscapes where ideas are meant to flourish. darkmux supports the engagements it can support (local dirs, local code work) and stays out of the way for the rest (SaaS, hosted, conceptual, classified). The Rust-level data model in the schema PR (#45) names Role, Crew, Mission, Sprint — concepts the system CAN model uniformly. Engagement isn't in that schema by design; it's the layer above where operator judgment lives.
 
