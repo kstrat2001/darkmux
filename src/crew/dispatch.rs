@@ -109,7 +109,6 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         .output()
         .with_context(|| format!("running `openclaw agent {agent_id}`"))?;
 
-    let _ = agent_id; // computed for pre-flight; tracked in error messages there
     Ok(DispatchResult {
         exit_code: output.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
