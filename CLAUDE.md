@@ -153,7 +153,7 @@ The principle is recursive. It applies to documentation surface (this CLAUDE.md,
 
 Tracked as #44.
 
-## Engagement (operator-defined dreamscape)
+## Engagements (operator-defined dreamscapes)
 
 An engagement is operator-defined, never system-defined. The system doesn't enumerate engagements, doesn't impose a directory shape, doesn't have an `engagement` config file format. The operator decides what's an engagement and how much to describe it.
 
