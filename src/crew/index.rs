@@ -222,7 +222,10 @@ const REBUILD_TABLES: &[&str] = &[
 ];
 
 /// Default index path: `<paths.root>/index.db`. Resolved through the same
-/// project-vs-user precedence as `lab::paths`.
+/// project-vs-user precedence as `lab::paths`. Stable across releases —
+/// changing this silently invalidates every operator's existing index.
+/// Tests use the `_at(&path)` variants (`rebuild_at`, `role_list_at`,
+/// `crew_list_at`, etc.) rather than overriding this path.
 pub(crate) fn default_index_path() -> PathBuf {
     resolve(ResolveScope::Auto).root.join("index.db")
 }

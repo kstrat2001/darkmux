@@ -21,6 +21,7 @@ mod providers;
 mod runtime;
 mod skills;
 mod role_cli;
+mod sprint_cli;
 mod swap;
 mod types;
 mod workloads;
@@ -107,6 +108,14 @@ enum Cmd {
         #[command(subcommand)]
         sub: RoleCmd,
     },
+    /// Sprint planning — pre-dispatch budget oracle.
+    /// `darkmux sprint estimate <spec.json>` computes token consumption +
+    /// recommends a profile. `--narrate` adds a one-sentence operator-facing
+    /// wrap from the 4B compactor.
+    Sprint {
+        #[command(subcommand)]
+        sub: SprintCmd,
+    },
     /// Agent-role template subcommands. Browse + emit validated
     /// `systemPromptOverride` scaffolds for common roles (qa, scribe,
     /// engineer). Output is print-only — paste into your runtime config
@@ -153,6 +162,13 @@ enum AgentCmd {
 
 #[derive(Subcommand)]
 enum CrewCmd {
+    /// List every crew in the index.
+    List,
+    /// Show full details for a single crew.
+    Show {
+        /// Crew id to show.
+        id: String,
+    },
     /// Dispatch a single turn to the named role. Loads the role manifest +
     /// `.md` system prompt, verifies the corresponding `darkmux/<role-id>`
     /// openclaw agent exists and matches the manifest, then invokes
@@ -220,6 +236,22 @@ enum RoleCmd {
     Show {
         /// Role id to show.
         id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SprintCmd {
+    /// Pre-dispatch budget oracle. Reads a workload-spec JSON, computes
+    /// predicted token consumption across planned turns, picks the
+    /// smallest adequate profile, emits structured JSON.
+    Estimate {
+        /// Path to the workload-spec JSON file.
+        spec: std::path::PathBuf,
+        /// Add a one-sentence operator-facing recommendation wrap from the
+        /// 4B compactor (`darkmux:qwen3-4b-instruct-2507`). Adds ~500ms
+        /// latency; gracefully degrades if the model isn't loaded.
+        #[arg(long)]
+        narrate: bool,
     },
 }
 
@@ -414,6 +446,7 @@ fn run(cmd: Cmd) -> Result<i32> {
         Cmd::Model { sub } => cmd_model(sub),
         Cmd::Crew { sub } => cmd_crew(sub),
         Cmd::Role { sub } => cmd_role(sub),
+        Cmd::Sprint { sub } => cmd_sprint(sub),
         Cmd::Agent { sub } => cmd_agent(sub),
         Cmd::Init {
             with_hook,
@@ -669,6 +702,12 @@ fn cmd_role(sub: RoleCmd) -> Result<i32> {
     }
 }
 
+fn cmd_sprint(sub: SprintCmd) -> Result<i32> {
+    match sub {
+        SprintCmd::Estimate { spec, narrate } => sprint_cli::estimate(&spec, narrate),
+    }
+}
+
 fn cmd_agent(sub: AgentCmd) -> Result<i32> {
     match sub {
         AgentCmd::ListTemplates => {
@@ -713,6 +752,8 @@ fn cmd_agent(sub: AgentCmd) -> Result<i32> {
 
 fn cmd_crew(sub: CrewCmd) -> Result<i32> {
     match sub {
+        CrewCmd::List => crew::cli::crew_list(),
+        CrewCmd::Show { id } => crew::cli::crew_show(&id),
         CrewCmd::Dispatch { role, message, deliver, session_id, timeout, skip_preflight } => {
             let opts = crew::dispatch::DispatchOpts {
                 role_id: role,
