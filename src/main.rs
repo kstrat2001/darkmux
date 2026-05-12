@@ -187,6 +187,23 @@ enum CrewCmd {
         #[arg(long, short = 'n')]
         dry_run: bool,
     },
+    /// SQLite-backed derived index over crew manifests (Phase B of #45).
+    /// **Scaffold only** — `rebuild`/`status` return "not yet implemented".
+    /// See `src/crew/index.rs` for the synthesized schema design awaiting
+    /// implementation.
+    Index {
+        #[command(subcommand)]
+        sub: CrewIndexCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum CrewIndexCmd {
+    /// Rebuild the index from manifests on disk. (Not yet implemented.)
+    Rebuild,
+    /// Report index status: last-rebuild timestamp, source counts, drift.
+    /// (Not yet implemented.)
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -689,6 +706,10 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
             }
             Ok(result.exit_code)
         }
+        CrewCmd::Index { sub } => match sub {
+            CrewIndexCmd::Rebuild => crew::index::rebuild().map(|_| 0),
+            CrewIndexCmd::Status => crew::index::status().map(|_| 0),
+        },
         CrewCmd::Sync { yes: _, dry_run } => {
             let opts = crew::dispatch::SyncOpts { dry_run };
             let result = crew::dispatch::sync(opts)?;
