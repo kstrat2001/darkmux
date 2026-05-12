@@ -171,8 +171,8 @@ darkmux ships with three Apple Silicon heuristics providers, tuned for different
 | Provider | Target RAM | Status |
 |---|---|---|
 | `m-series-128` | 96 GB+ (M Max / Studio Ultra) | ✅ Validated |
-| `m-series-64` | 32–64 GB (M Pro) | ⚠️ Extrapolated from 128GB tier |
-| `m-series-32` | ≤32 GB (Mac Studio / MBP) | ⚠️ Extrapolated from 64GB tier |
+| `m-series-64` | 33–64 GB (M Pro) | ⚠️ Extrapolated from 128GB tier |
+| `m-series-32` | up to 32 GB (Mac Studio / MBP) | ⚠️ Extrapolated from 64GB tier |
 
 The `m-series-128` provider's rules are empirically validated against lab measurements. The 64 GB and 32 GB providers use conservative extrapolations — tune down `n_ctx` if you see swap pressure. Non-Apple-Silicon systems fall through to a generic fallback with unvalidated defaults.
 
