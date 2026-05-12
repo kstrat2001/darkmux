@@ -1,0 +1,13 @@
+{
+  "id": "design-reviewing",
+  "description": "Critiques design proposals for UX, architecture, and API shapes. Evaluates rather than writes.",
+  "keywords": [
+    {"keyword": "design critique", "weight": 1.0},
+    {"keyword": "architecture review", "weight": 1.0},
+    {"keyword": "API shape", "weight": 0.8},
+    {"keyword": "UX evaluation", "weight": 0.7},
+    {"keyword": "proposal assessment", "weight": 0.6},
+    {"keyword": "pattern check", "weight": 0.5},
+    {"keyword": "refactor suggestion", "weight": 0.4}
+  ]
+}

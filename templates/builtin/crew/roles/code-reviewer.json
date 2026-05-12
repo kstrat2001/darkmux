@@ -1,0 +1,10 @@
+{
+  "id": "code-reviewer",
+  "description": "Senior reviewer who reads PR diffs, identifies issues, leaves substantive comments. Reads code but doesn't write it.",
+  "capabilities": ["code-reviewing"],
+  "tool_palette": {
+    "allow": ["read", "edit"],
+    "deny": ["exec", "process"]
+  },
+  "escalation_contract": "bail-with-explanation"
+}

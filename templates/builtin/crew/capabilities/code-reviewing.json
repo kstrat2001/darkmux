@@ -1,0 +1,14 @@
+{
+  "id": "code-reviewing",
+  "description": "Reviews code for correctness, idioms, security gaps, missing tests. Reads PR diffs; leaves substantive comments.",
+  "keywords": [
+    {"keyword": "review", "weight": 1.0},
+    {"keyword": "code review", "weight": 1.0},
+    {"keyword": "correctness", "weight": 0.9},
+    {"keyword": "security audit", "weight": 0.8},
+    {"keyword": "PR diff", "weight": 0.8},
+    {"keyword": "missing tests", "weight": 0.7},
+    {"keyword": "idiomatic", "weight": 0.6},
+    {"keyword": "code quality", "weight": 0.5}
+  ]
+}

@@ -28,7 +28,7 @@ pub struct DarkmuxPaths {
     pub root: PathBuf,
     pub runs: PathBuf,
     pub sandboxes: PathBuf,
-    pub teams: PathBuf,
+    pub crew: PathBuf,
     pub notebook: PathBuf,
     pub profiles: PathBuf,
     pub scope: Scope,
@@ -82,7 +82,7 @@ pub fn resolve(scope: ResolveScope) -> DarkmuxPaths {
     DarkmuxPaths {
         runs: chosen.join("runs"),
         sandboxes: chosen.join("sandboxes"),
-        teams: chosen.join("teams"),
+        crew: chosen.join("crew"),
         notebook,
         profiles: chosen.join("profiles.yaml"),
         scope: chosen_scope,
@@ -111,7 +111,7 @@ pub fn ensure(paths: &DarkmuxPaths) -> Result<()> {
         &paths.root,
         &paths.runs,
         &paths.sandboxes,
-        &paths.teams,
+        &paths.crew,
         &paths.notebook,
     ] {
         if !p.exists() {
@@ -254,7 +254,7 @@ mod tests {
             root: tmp.path().join(".darkmux"),
             runs: tmp.path().join(".darkmux/runs"),
             sandboxes: tmp.path().join(".darkmux/sandboxes"),
-            teams: tmp.path().join(".darkmux/teams"),
+            crew: tmp.path().join(".darkmux/crew"),
             notebook: tmp.path().join(".darkmux/notebook"),
             profiles: tmp.path().join(".darkmux/profiles.yaml"),
             scope: Scope::Project,
@@ -263,7 +263,7 @@ mod tests {
         assert!(paths.root.exists());
         assert!(paths.runs.exists());
         assert!(paths.sandboxes.exists());
-        assert!(paths.teams.exists());
+        assert!(paths.crew.exists());
         assert!(paths.notebook.exists());
     }
 
@@ -274,7 +274,7 @@ mod tests {
             root: tmp.path().join(".darkmux"),
             runs: tmp.path().join(".darkmux/runs"),
             sandboxes: tmp.path().join(".darkmux/sandboxes"),
-            teams: tmp.path().join(".darkmux/teams"),
+            crew: tmp.path().join(".darkmux/crew"),
             notebook: tmp.path().join(".darkmux/notebook"),
             profiles: tmp.path().join(".darkmux/profiles.yaml"),
             scope: Scope::Project,

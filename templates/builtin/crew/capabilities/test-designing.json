@@ -1,0 +1,14 @@
+{
+  "id": "test-designing",
+  "description": "Designs tests for new behavior. Chooses assertions, picks edge cases, and writes fixtures.",
+  "keywords": [
+    {"keyword": "test design", "weight": 1.0},
+    {"keyword": "edge case", "weight": 0.9},
+    {"keyword": "assertion", "weight": 0.8},
+    {"keyword": "test fixture", "weight": 0.7},
+    {"keyword": "property test", "weight": 0.6},
+    {"keyword": "boundary analysis", "weight": 0.5},
+    {"keyword": "mock", "weight": 0.4},
+    {"keyword": "pytest", "weight": 0.4}
+  ]
+}

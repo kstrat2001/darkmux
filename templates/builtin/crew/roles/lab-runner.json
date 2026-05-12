@@ -1,0 +1,10 @@
+{
+  "id": "lab-runner",
+  "description": "Runs darkmux lab dispatches, captures run outputs, and summarizes results for the operator.",
+  "capabilities": ["lab-running", "documenting"],
+  "tool_palette": {
+    "allow": ["read", "edit", "write", "exec"],
+    "deny": []
+  },
+  "escalation_contract": "bail-with-explanation"
+}

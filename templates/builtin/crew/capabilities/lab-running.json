@@ -1,0 +1,14 @@
+{
+  "id": "lab-running",
+  "description": "Executes lab dispatches, records trajectories, and collects timing data from run harness.",
+  "keywords": [
+    {"keyword": "lab dispatch", "weight": 1.0},
+    {"keyword": "run harness", "weight": 1.0},
+    {"keyword": "trajectory recording", "weight": 0.8},
+    {"keyword": "timing data", "weight": 0.8},
+    {"keyword": "experiment run", "weight": 0.6},
+    {"keyword": "darkmux", "weight": 0.5},
+    {"keyword": "output capture", "weight": 0.4},
+    {"keyword": "benchmarking", "weight": 0.4}
+  ]
+}

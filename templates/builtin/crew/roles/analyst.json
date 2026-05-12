@@ -1,0 +1,10 @@
+{
+  "id": "analyst",
+  "description": "Data/system analyst who reads run outputs, logs, metrics, and writes findings reports. Reads broadly; writes reports but doesn't edit production code.",
+  "capabilities": ["analyzing"],
+  "tool_palette": {
+    "allow": ["read", "write", "edit"],
+    "deny": ["exec", "process"]
+  },
+  "escalation_contract": "bail-with-explanation"
+}

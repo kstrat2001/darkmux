@@ -1,0 +1,10 @@
+{
+  "id": "design-reviewer",
+  "description": "A senior reviewer who evaluates design proposals (UX, architecture, API shapes). Reads design docs; provides structured critique.",
+  "capabilities": ["design-reviewing", "coding"],
+  "tool_palette": {
+    "allow": ["read", "edit"],
+    "deny": ["exec"]
+  },
+  "escalation_contract": "bail-with-explanation"
+}
