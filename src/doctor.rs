@@ -399,32 +399,100 @@ fn check_runtime_version() -> Check {
     }
 }
 
+/// Default headroom we reserve outside the AI working set — covers macOS
+/// itself, Finder, lightweight background processes. Empirical: 1–2 GB is
+/// the right shape on Apple Silicon idle.
+const RAM_SAFETY_MARGIN_GB: u64 = 2;
+const RAM_PASS_THRESHOLD_GB: u64 = 25;
+const RAM_WARN_THRESHOLD_GB: u64 = 10;
+
 fn check_ram_headroom() -> Check {
-    match read_reclaimable_gb() {
-        Some(gb) if gb >= 25 => Check {
+    let reclaimable_gb = match read_reclaimable_gb() {
+        Some(g) => g,
+        None => {
+            return Check {
+                name: "RAM headroom".into(),
+                status: Status::Warn,
+                message: "could not read vm_stat (non-macOS?)".into(),
+                hint: None,
+            };
+        }
+    };
+
+    // What's already mapped to AI counts toward the real budget — it's
+    // memory the operator has *already chosen* to spend on AI, not a
+    // contention pressure to subtract. See issue #67.
+    let loaded_models_size_gb = lms::list_loaded()
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|m| eureka::parse_size_gb(&m.size))
+                .sum::<f64>()
+        })
+        .unwrap_or(0.0);
+
+    classify_ram_headroom(
+        reclaimable_gb,
+        loaded_models_size_gb,
+        RAM_SAFETY_MARGIN_GB,
+    )
+}
+
+/// Pure verdict logic for the RAM headroom check. Extracted so the
+/// formula can be unit-tested without an `lms` / `vm_stat` round-trip.
+///
+/// `real_headroom = reclaimable + resident − safety_margin` — the budget
+/// available to the operator for AI work, including memory already
+/// committed to a loaded model.
+fn classify_ram_headroom(
+    reclaimable_gb: u64,
+    loaded_models_size_gb: f64,
+    safety_margin_gb: u64,
+) -> Check {
+    let real_headroom_f = (reclaimable_gb as f64)
+        + loaded_models_size_gb
+        - (safety_margin_gb as f64);
+    let real_headroom_gb = real_headroom_f.max(0.0).round() as u64;
+    let resident_round = loaded_models_size_gb.round() as u64;
+
+    let breakdown = if loaded_models_size_gb >= 0.5 {
+        format!(
+            "{real_headroom_gb} GB available for AI ({reclaimable_gb} GB reclaimable + ~{resident_round} GB resident − {safety_margin_gb} GB safety)"
+        )
+    } else {
+        format!(
+            "{real_headroom_gb} GB available for AI ({reclaimable_gb} GB reclaimable − {safety_margin_gb} GB safety, no model resident)"
+        )
+    };
+
+    if real_headroom_gb >= RAM_PASS_THRESHOLD_GB {
+        Check {
             name: "RAM headroom".into(),
             status: Status::Pass,
-            message: format!("{} GB reclaimable", gb),
+            message: breakdown,
             hint: None,
-        },
-        Some(gb) if gb >= 10 => Check {
+        }
+    } else if real_headroom_gb >= RAM_WARN_THRESHOLD_GB {
+        Check {
             name: "RAM headroom".into(),
             status: Status::Warn,
-            message: format!("only {} GB reclaimable", gb),
-            hint: Some("close apps before measurement-grade lab runs".into()),
-        },
-        Some(gb) => Check {
+            message: breakdown,
+            hint: Some(
+                "close apps or shrink ctx before measurement-grade lab runs"
+                    .into(),
+            ),
+        }
+    } else {
+        Check {
             name: "RAM headroom".into(),
             status: Status::Fail,
-            message: format!("{} GB reclaimable — model may swap", gb),
-            hint: Some("free memory before running darkmux lab; swap pollutes wall-clock".into()),
-        },
-        None => Check {
-            name: "RAM headroom".into(),
-            status: Status::Warn,
-            message: "could not read vm_stat (non-macOS?)".into(),
-            hint: None,
-        },
+            message: format!("{breakdown} — model may swap"),
+            hint: Some(
+                "free memory or unload models before running darkmux lab; \
+                 swap pollutes wall-clock"
+                    .into(),
+            ),
+        }
     }
 }
 
@@ -742,6 +810,62 @@ mod tests {
             message: "x".into(),
             hint: None,
         }
+    }
+
+    // ─── classify_ram_headroom ─────────────────────────────────────────
+    // Verdicts must follow `real_headroom = reclaimable + resident − safety`,
+    // not raw reclaimable. Calibrated against the issue #67 table.
+
+    #[test]
+    fn ram_headroom_pass_when_real_budget_at_or_above_pass_threshold() {
+        // 64 GB tier, 12 GB model resident, 25 GB reclaimable, 2 safety
+        //   → 25 + 12 − 2 = 35 GB → Pass
+        let c = classify_ram_headroom(25, 12.0, 2);
+        assert_eq!(c.status, Status::Pass);
+        assert!(c.message.contains("35 GB available"));
+        assert!(c.message.contains("resident"));
+    }
+
+    #[test]
+    fn ram_headroom_warn_on_32gb_tier_with_20b_resident() {
+        // Issue #67 regression case: 32 GB Apple Silicon, gpt-oss-20b (12 GB)
+        // loaded, 7 GB reclaimable, 2 safety → 7 + 12 − 2 = 17 GB → Warn
+        // (was Fail under the old absolute-reclaimable formula).
+        let c = classify_ram_headroom(7, 12.0, 2);
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.message.contains("17 GB available"));
+        assert!(c.message.contains("12 GB resident"));
+    }
+
+    #[test]
+    fn ram_headroom_fail_when_real_budget_below_warn_threshold() {
+        // 32 GB tier, no model loaded, 8 GB reclaimable, 2 safety
+        //   → 8 − 2 = 6 GB → Fail
+        let c = classify_ram_headroom(8, 0.0, 2);
+        assert_eq!(c.status, Status::Fail);
+        assert!(c.message.contains("may swap"));
+        assert!(c.message.contains("no model resident"));
+    }
+
+    #[test]
+    fn ram_headroom_no_negative_real_budget() {
+        // Pathological: safety margin exceeds available memory. Real budget
+        // floors at 0 rather than wrapping/panicking.
+        let c = classify_ram_headroom(0, 0.0, 2);
+        assert_eq!(c.status, Status::Fail);
+        assert!(c.message.contains("0 GB available"));
+    }
+
+    #[test]
+    fn ram_headroom_treats_already_loaded_model_as_part_of_budget() {
+        // Same reclaimable, different residency: the resident-aware verdict
+        // should be *more permissive* than a model-blind one. Demonstrates
+        // the asymmetry that #67 fixes.
+        let with_model = classify_ram_headroom(7, 12.0, 2);
+        let no_model = classify_ram_headroom(7, 0.0, 2);
+        // 7 + 12 − 2 = 17 (Warn) vs 7 − 2 = 5 (Fail)
+        assert_eq!(with_model.status, Status::Warn);
+        assert_eq!(no_model.status, Status::Fail);
     }
 
     #[test]
