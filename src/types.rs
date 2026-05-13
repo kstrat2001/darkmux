@@ -63,7 +63,9 @@ pub struct ProfileRegistry {
     pub default_profile: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `Serialize` so `darkmux serve`'s `/model/status` endpoint (#87) can
+// return loaded-model state as JSON for the flow viewer's toolbar pill.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LoadedModel {
     pub identifier: String,
     pub model: String,

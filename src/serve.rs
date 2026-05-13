@@ -47,6 +47,7 @@ pub fn build_router(flows_dir: PathBuf) -> Router {
         .route("/health", get(health))
         .route("/flow/:date", get(flow_handler))
         .route("/flow/:date/stream", get(flow_stream_handler))
+        .route("/model/status", get(model_status_handler))
         .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(state)
 }
@@ -74,6 +75,35 @@ async fn health() -> axum::Json<serde_json::Value> {
     axum::Json(serde_json::json!({
         "darkmux_version": env!("CARGO_PKG_VERSION"),
         "flow_schema_version": crate::flow::FLOW_SCHEMA_VERSION,
+    }))
+}
+
+/// GET /model/status — returns currently-loaded models (per `lms ps --json`)
+/// as JSON so the flow viewer's toolbar pill / modal can render them
+/// without parsing `lms` output client-side. See issue #87 for the
+/// operator-facing motivation.
+///
+/// Always returns 200 with a structured body. `lms_unreachable: true`
+/// signals the binary couldn't be invoked (operator hasn't installed
+/// LMStudio's CLI, or it's not on PATH) — UI surfaces this as a
+/// degraded-state pill rather than treating it as a hard error.
+///
+/// `lms::list_loaded()` is sync (subprocess invocation), so it runs on
+/// the blocking pool to keep the axum executor free.
+async fn model_status_handler() -> axum::Json<serde_json::Value> {
+    let result = tokio::task::spawn_blocking(crate::lms::list_loaded).await;
+    let (models, unreachable) = match result {
+        Ok(Ok(m)) => (m, false),
+        _ => (Vec::new(), true),
+    };
+    let generated_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    axum::Json(serde_json::json!({
+        "models": models,
+        "lms_unreachable": unreachable,
+        "generated_at_ms": generated_at_ms,
     }))
 }
 
@@ -243,6 +273,46 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(!json["darkmux_version"].as_str().unwrap().is_empty());
         assert!(!json["flow_schema_version"].as_str().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn model_status_returns_200_with_structured_body() {
+        // The handler calls into `lms::list_loaded()`, which shells out to
+        // the `lms` binary. CI runners don't have it on PATH, so we expect
+        // `lms_unreachable: true` and `models: []` rather than a 500. This
+        // is the contract the viewer's pill relies on — degraded state
+        // shows up as a UI hint, not as a fetch error.
+        let app = build_router(PathBuf::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/model/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 200);
+
+        let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        // Structural assertions — operator-facing fields the viewer reads.
+        assert!(json.get("models").is_some(), "missing `models` array");
+        assert!(json["models"].is_array());
+        assert!(
+            json.get("lms_unreachable").is_some(),
+            "missing `lms_unreachable` flag"
+        );
+        assert!(json["lms_unreachable"].is_boolean());
+        let generated = json["generated_at_ms"]
+            .as_u64()
+            .expect("`generated_at_ms` must be a u64 epoch-millis");
+        // Sanity: timestamp should be after 2024 and before year 2100 — a
+        // wide check, just to ensure it's actually populated.
+        assert!(generated > 1_700_000_000_000);
+        assert!(generated < 4_000_000_000_000);
     }
 
     #[tokio::test]
