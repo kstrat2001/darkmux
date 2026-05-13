@@ -270,6 +270,9 @@ enum SprintCmd {
         /// Exit nonzero if any BLOCK-severity findings.
         #[arg(long)]
         require_clean: bool,
+        /// Optional sprint identifier passed through to flow records.
+        #[arg(long = "sprint-id")]
+        sprint_id: Option<String>,
     },
 }
 
@@ -727,8 +730,9 @@ fn cmd_role(sub: RoleCmd) -> Result<i32> {
 fn cmd_sprint(sub: SprintCmd) -> Result<i32> {
     match sub {
         SprintCmd::Estimate { spec, narrate } => sprint_cli::estimate(&spec, narrate),
-        SprintCmd::Review { base, require_clean } => {
-            sprint_cli::sprint_review(base.as_deref(), require_clean)
+        SprintCmd::Review { base, require_clean, sprint_id } => {
+            let sid = sprint_id.as_deref();
+            sprint_cli::sprint_review(base.as_deref(), require_clean, sid)
         }
     }
 }
