@@ -26,6 +26,7 @@ use crate::profiles;
 use crate::types::ModelRole;
 use anyhow::Result;
 use std::env;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -81,6 +82,7 @@ pub fn run() -> DoctorReport {
         check_profile_loaded_match(),
         check_runtime_command(),
         check_runtime_version(),
+        check_daemon_reachable(),
         check_ram_headroom(),
         check_ram_headroom_load_projection(),
         check_power_state(),
@@ -136,6 +138,103 @@ fn eureka_checks() -> Vec<Check> {
 }
 
 // ─── Individual checks ──────────────────────────────────────────────────
+
+fn check_daemon_reachable() -> Check {
+    // Check if the darkmux daemon is reachable at 127.0.0.1:8765/health.
+    // Pass when reachable, Warn otherwise (daemon being off doesn't break
+    // end-to-end; it just disables live viewing).
+    check_daemon_reachable_impl("127.0.0.1", 8765)
+}
+
+/// Core implementation that takes host/port so tests can inject mock servers.
+fn check_daemon_reachable_impl(host: &str, port: u16) -> Check {
+    let addr = format!("{}:{}", host, port);
+
+    // Use a short timeout since this is local loopback.
+    let addr_parsed = match addr.parse() {
+        Ok(a) => a,
+        Err(_) => {
+            return Check {
+                name: "daemon reachable".into(),
+                status: Status::Warn,
+                message: format!("invalid address {}", addr),
+                hint: None,
+            };
+        }
+    };
+
+    let mut stream = match std::net::TcpStream::connect_timeout(
+        &addr_parsed,
+        std::time::Duration::from_millis(500),
+    ) {
+        Ok(s) => s,
+        Err(_e) => {
+            return Check {
+                name: "daemon reachable".into(),
+                status: Status::Warn,
+                message: format!("daemon not reachable at {} (connection refused)", addr),
+                hint: Some(
+                    "run `darkmux serve` to start the daemon for live viewing features"
+                        .into(),
+                ),
+            };
+        }
+    };
+
+    // Set a read/write timeout for the HTTP exchange.
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(1000)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(1000)));
+
+    // Send minimal HTTP/1.1 request.
+    let request = format!(
+        "GET /health HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        addr
+    );
+    stream.write_all(request.as_bytes()).ok();
+    stream.flush().ok(); // Ensure the request is sent
+
+    // Read response.
+    let mut buf = [0u8; 1024];
+    let n = stream.read(&mut buf).ok().unwrap_or(0);
+
+    let response = String::from_utf8_lossy(&buf[..n]);
+    if n == 0 {
+        return Check {
+            name: "daemon reachable".into(),
+            status: Status::Warn,
+            message: format!("daemon at {} not responding to HTTP", addr),
+            hint: Some(
+                "run `darkmux serve` to start the daemon for live viewing features"
+                    .into(),
+            ),
+        };
+    }
+
+    if response.starts_with("HTTP/1.1 200") {
+        Check {
+            name: "daemon reachable".into(),
+            status: Status::Pass,
+            message: format!("daemon reachable at {} (health check OK)", addr),
+            hint: None,
+        }
+    } else {
+        // Port is open but not darkmux (or wrong endpoint).
+        let first_line = response.lines().next().unwrap_or("");
+        Check {
+            name: "daemon reachable".into(),
+            status: Status::Warn,
+            message: format!(
+                "daemon not responding correctly at {}: {}",
+                addr,
+                first_line
+            ),
+            hint: Some(
+                "ensure `darkmux serve` is running (port 8765 may be held by another process)"
+                    .into(),
+            ),
+        }
+    }
+}
 
 fn check_profile_registry() -> Check {
     match profiles::load_registry(None) {
@@ -1275,10 +1374,10 @@ mod tests {
     #[test]
     fn run_returns_static_plus_eureka_checks() {
         let r = run();
-        // 11 baseline checks (incl. runtime version + load projection) +
+        // 12 baseline checks (incl. runtime version + load projection + daemon reachable) +
         // one per active eureka rule. Every check should appear regardless
         // of environment — even if the underlying probe couldn't read state.
-        let expected = 11 + crate::eureka::all_rules().len();
+        let expected = 12 + crate::eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
@@ -1318,5 +1417,55 @@ mod tests {
     fn agent_role_check_always_present() {
         let r = run();
         assert!(r.checks.iter().any(|c| c.name.contains("agent role")));
+    }
+
+    // ─── check_daemon_reachable tests ──────────────────────────────────────
+
+    #[test]
+    fn daemon_reachable_check_passes_when_health_returns_200() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::Duration;
+
+        // Start a simple blocking TCP server that returns HTTP 200 on /health
+        let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind test server");
+        let port = listener.local_addr().unwrap().port();
+
+        let server_handle = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                // Read the request (we don't really need to parse it)
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+
+                // Send HTTP 200 response
+                let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        // Give the server a moment to start
+        thread::sleep(Duration::from_millis(50));
+
+        // Run the check against our mock server
+        let check = check_daemon_reachable_impl("127.0.0.1", port);
+
+        // Assert Pass status
+        assert_eq!(check.status, Status::Pass, "daemon reachable check should pass when health returns 200. Got message: {}", check.message);
+        assert!(check.message.contains("health check OK"));
+
+        // Shutdown the server by dropping the listener (via a separate scope)
+        drop(server_handle);
+    }
+
+    #[test]
+    fn daemon_reachable_check_warns_when_unreachable() {
+        // Point at a high ephemeral port where nothing will be listening
+        let check = check_daemon_reachable_impl("127.0.0.1", 59999);
+
+        // Assert Warn status with appropriate message
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.message.contains("connection refused"));
+        assert!(check.hint.as_ref().unwrap_or(&String::new()).contains("darkmux serve"));
     }
 }
