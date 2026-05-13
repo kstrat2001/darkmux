@@ -861,6 +861,11 @@ function renderRecord(r) {
   if (r.tier)     meta.push({ lbl: 'tier',     val: r.tier });
   if (r.stage)    meta.push({ lbl: 'stage',    val: r.stage });
   if (r.source)   meta.push({ lbl: 'source',   val: r.source });
+  // #106 (schema 1.2): `model` is the resolved LMStudio model id for
+  // dispatch records. Surfaced as a meta-pill so the operator can map
+  // "which model ran this dispatch" without cross-referencing the
+  // model-status pill in the header. Absent on lifecycle/review records.
+  if (r.model)    meta.push({ lbl: 'model',    val: r.model });
   if (r.sprint_id)  meta.push({ lbl: 'sprint',  val: r.sprint_id });
   if (r.session_id) meta.push({ lbl: 'session', val: r.session_id });
 

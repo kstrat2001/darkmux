@@ -136,6 +136,7 @@ fn emit_sprint_transition_record(sprint_id: &str, mission_id: &str, action: &str
         sprint_id: Some(sprint_id.to_string()),
         session_id: Some(format!("mission:{mission_id}")),
         source: Some("sprint_lifecycle".to_string()),
+        model: None,
     });
 }
 
@@ -151,6 +152,7 @@ fn emit_mission_transition_record(mission_id: &str, action: &str) {
         sprint_id: None,
         session_id: Some(format!("mission:{mission_id}")),
         source: Some("mission_lifecycle".to_string()),
+        model: None,
     });
 }
 
@@ -172,6 +174,7 @@ fn emit_sprint_added_record(sprint_id: &str, mission_id: &str) {
         sprint_id: Some(sprint_id.to_string()),
         session_id: Some(format!("mission:{mission_id}")),
         source: Some("mission_lifecycle".to_string()),
+        model: None,
     });
 }
 

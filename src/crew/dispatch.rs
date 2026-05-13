@@ -295,6 +295,14 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         .clone()
         .unwrap_or_else(|| fresh_session_id(&opts.role_id));
 
+    // Resolve the model openclaw will route to for this agent — stamped
+    // onto both the start and end flow records so the viewer can show
+    // "which model ran this dispatch" without cross-referencing the
+    // model-status pill (#106). Resolved once, reused for both records
+    // of the pair so they reference the same model even if the agent's
+    // config is edited mid-dispatch. Non-fatal: None on failure.
+    let resolved_model = resolve_dispatch_model(&agent_id);
+
     // Flow emission: dispatch_start lands on disk before openclaw is
     // even invoked, so the viewer sees the local-tier event the instant
     // we begin. Pairs with the dispatch_complete / dispatch_error
@@ -306,6 +314,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         "dispatch start",
         &opts.role_id,
         &resolved_session_id,
+        resolved_model.as_deref(),
     ));
 
     // 4. Invoke openclaw agent
@@ -337,6 +346,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         action,
         &opts.role_id,
         &resolved_session_id,
+        resolved_model.as_deref(),
     ));
 
     let output = output_result?;
@@ -366,12 +376,15 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
 /// `dispatch complete`, `dispatch error`). All three share the same
 /// session_id so the viewer pairs start↔end into a single wall-clock
 /// arc per dispatch. `handle` is the role id (operator-readable label);
-/// `session_id` is the full openclaw session identifier.
+/// `session_id` is the full openclaw session identifier; `model` is the
+/// resolved LMStudio model id (best-effort — `None` when the openclaw
+/// config can't be read or no model is pinned for this agent).
 pub(crate) fn build_dispatch_record(
     level: crate::flow::Level,
     action: &str,
     role_id: &str,
     session_id: &str,
+    model: Option<&str>,
 ) -> crate::flow::FlowRecord {
     crate::flow::FlowRecord {
         ts: crate::flow::ts_utc_now(),
@@ -384,7 +397,56 @@ pub(crate) fn build_dispatch_record(
         sprint_id: None,
         session_id: Some(session_id.to_string()),
         source: Some("crew_dispatch".to_string()),
+        model: model.map(String::from),
     }
+}
+
+/// Best-effort resolve the LMStudio model id openclaw will route this
+/// agent's dispatches to. Tries `agents.list[<agent-id>].model` first,
+/// falls back to `agents.defaults.model.primary`. Returns `None` when:
+///   - The openclaw config can't be located or parsed.
+///   - Neither path resolves to a string.
+///
+/// Non-fatal everywhere — a missing model annotation degrades to no
+/// `model` field on the flow record, not a failed dispatch.
+///
+/// Deliberately silent on failure: surfacing "no model resolved" as
+/// stderr noise on every dispatch would conflict with the dispatcher's
+/// existing minimal output. The structural "is the model pinned?"
+/// check belongs to `darkmux doctor`'s `agents-default-model-resolves`
+/// rule (#91/#102), which runs at operator-explicit pre-flight time
+/// and is the right place for that signal. The flow record's absent
+/// `model` field is operator-visible enough on its own — it shows as
+/// missing in the viewer, which is the same signal in the right place.
+pub(crate) fn resolve_dispatch_model(agent_id: &str) -> Option<String> {
+    let path = default_openclaw_config();
+    let raw = fs::read_to_string(&path).ok()?;
+    let config: Value = serde_json::from_str(&raw).ok()?;
+
+    // Try per-agent override in agents.list[].
+    if let Some(agents) = config
+        .get("agents")
+        .and_then(|a| a.get("list"))
+        .and_then(|l| l.as_array())
+    {
+        if let Some(m) = agents
+            .iter()
+            .find(|a| a.get("id").and_then(|i| i.as_str()) == Some(agent_id))
+            .and_then(|a| a.get("model"))
+            .and_then(|m| m.as_str())
+        {
+            return Some(m.to_string());
+        }
+    }
+
+    // Fall back to defaults.model.primary.
+    config
+        .get("agents")
+        .and_then(|a| a.get("defaults"))
+        .and_then(|d| d.get("model"))
+        .and_then(|m| m.get("primary"))
+        .and_then(|p| p.as_str())
+        .map(String::from)
 }
 
 fn load_role_or_bail(role_id: &str) -> Result<Role> {
@@ -964,11 +1026,13 @@ mod tests {
             "dispatch start",
             "coder",
             "crew-dispatch-coder-12345-1",
+            Some("darkmux:qwen3.6-35b-a3b"),
         );
         assert_eq!(rec.action, "dispatch start");
         assert_eq!(rec.handle, "coder");
         assert_eq!(rec.session_id.as_deref(), Some("crew-dispatch-coder-12345-1"));
         assert_eq!(rec.source.as_deref(), Some("crew_dispatch"));
+        assert_eq!(rec.model.as_deref(), Some("darkmux:qwen3.6-35b-a3b"));
         assert!(matches!(rec.tier, crate::flow::Tier::Local));
         assert!(matches!(rec.stage, crate::flow::Stage::Dispatch));
         assert!(matches!(rec.category, crate::flow::Category::Work));
@@ -982,6 +1046,24 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_record_omits_model_when_none() {
+        // None model => field is absent from serialized JSON entirely
+        // (per `skip_serializing_if = "Option::is_none"`). Old viewers
+        // tolerate the absent field; new viewers render "model: unknown"
+        // or similar.
+        let rec = build_dispatch_record(
+            crate::flow::Level::Info,
+            "dispatch start",
+            "coder",
+            "session-no-model",
+            None,
+        );
+        assert!(rec.model.is_none());
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(!json.contains("\"model\""), "absent field should serialize away: {json}");
+    }
+
+    #[test]
     fn dispatch_record_error_level_serializes_distinctly() {
         // Error-level records render differently in the viewer (red tag,
         // not green). Lock the error level on dispatch_error so the
@@ -991,12 +1073,14 @@ mod tests {
             "dispatch complete",
             "coder",
             "session-abc",
+            Some("darkmux:foo"),
         );
         let err = build_dispatch_record(
             crate::flow::Level::Error,
             "dispatch error",
             "coder",
             "session-abc",
+            Some("darkmux:foo"),
         );
         assert!(matches!(ok.level, crate::flow::Level::Info));
         assert!(matches!(err.level, crate::flow::Level::Error));
