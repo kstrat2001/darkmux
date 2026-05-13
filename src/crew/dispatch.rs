@@ -268,6 +268,12 @@ fn is_openclaw_noise(path: &Path) -> bool {
 
 /// Run a single dispatch end-to-end.
 pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
+    // 0. Pre-flight: nudge the operator if the daemon isn't up. The
+    //    dispatch will still write flow records to disk, but they
+    //    won't be observable in the viewer until the daemon comes up.
+    //    Non-blocking; the dispatch proceeds either way (#104 S3).
+    crate::serve::nudge_if_daemon_unreachable("crew dispatch");
+
     // 1. Load the role + its .md prompt
     let role = load_role_or_bail(&opts.role_id)?;
     let prompt = role_prompt_or_bail(&role)?;

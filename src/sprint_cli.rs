@@ -869,6 +869,12 @@ pub fn sprint_review(
     require_clean: bool,
     sprint_id: Option<&str>,
 ) -> Result<i32> {
+    // Pre-flight: nudge if the daemon isn't reachable. Sprint review
+    // dispatches code-reviewer internally and emits Review-category
+    // flow records; both surfaces are invisible in the viewer when
+    // the daemon is down. Non-blocking — review still runs (#104 S3).
+    crate::serve::nudge_if_daemon_unreachable("sprint review");
+
     let path = std::env::current_dir()?;
     sprint_review_at(&path, base, require_clean, sprint_id)
 }
