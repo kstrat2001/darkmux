@@ -127,6 +127,14 @@ enum Cmd {
         #[command(subcommand)]
         sub: SprintCmd,
     },
+    /// Mission lifecycle — transition missions through their state machine.
+    /// Mission status flows: Active ↔ Paused → Closed. All transitions are
+    /// operator-explicit; nothing auto-decides a mission is paused or done.
+    /// Wall-clock UI consumes mission timestamps via `darkmux serve`.
+    Mission {
+        #[command(subcommand)]
+        sub: MissionCmd,
+    },
     /// Agent-role template subcommands. Browse + emit validated
     /// `systemPromptOverride` scaffolds for common roles (qa, scribe,
     /// engineer). Output is print-only — paste into your runtime config
@@ -308,6 +316,52 @@ enum SprintCmd {
         /// Optional sprint identifier passed through to flow records.
         #[arg(long = "sprint-id")]
         sprint_id: Option<String>,
+    },
+    /// Transition a sprint to `Running`. From `Planned` (first start) or
+    /// `Abandoned` (restart — clears abandoned_ts). Stamps `started_ts=now()`.
+    Start {
+        /// Sprint id (filename stem under ~/.darkmux/crew/sprints/).
+        id: String,
+    },
+    /// Transition a `Running` sprint to `Complete` (terminal). Stamps
+    /// `completed_ts=now()`. Wall-clock duration = completed_ts - started_ts.
+    Complete {
+        id: String,
+    },
+    /// Transition a `Planned` or `Running` sprint to `Abandoned`. Operator-
+    /// sovereign: only the operator marks a sprint dead; nothing auto-
+    /// abandons on staleness. A subsequent `sprint start` clears the
+    /// abandonment (operator changed their mind).
+    Abandon {
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum MissionCmd {
+    /// Transition a mission to `Active`. Stamps `started_ts=now()` if not
+    /// already set. Mission must be currently `Active` with no started_ts,
+    /// OR — note: missions get created in `Active` status by convention,
+    /// so this is the "I'm starting to work on it now" verb, not a status
+    /// flip.
+    Start {
+        /// Mission id (filename stem under ~/.darkmux/crew/missions/).
+        id: String,
+    },
+    /// Transition a mission to `Closed` (terminal). From `Active` or `Paused`.
+    /// Stamps `closed_ts=now()`.
+    Close {
+        id: String,
+    },
+    /// Transition an `Active` mission to `Paused`. Stamps `paused_ts=now()`.
+    Pause {
+        id: String,
+    },
+    /// Transition a `Paused` mission back to `Active`. Does NOT clear
+    /// `paused_ts` — the operator may want to see when the most recent
+    /// pause occurred even after resuming.
+    Resume {
+        id: String,
     },
 }
 
@@ -503,6 +557,7 @@ fn run(cmd: Cmd) -> Result<i32> {
         Cmd::Crew { sub } => cmd_crew(sub),
         Cmd::Role { sub } => cmd_role(sub),
         Cmd::Sprint { sub } => cmd_sprint(sub),
+        Cmd::Mission { sub } => cmd_mission(sub),
         Cmd::Agent { sub } => cmd_agent(sub),
         Cmd::Flow { sub } => {
             flow_cli::run(sub)?;
@@ -801,6 +856,58 @@ fn cmd_sprint(sub: SprintCmd) -> Result<i32> {
         SprintCmd::Review { base, require_clean, sprint_id } => {
             let sid = sprint_id.as_deref();
             sprint_cli::sprint_review(base.as_deref(), require_clean, sid)
+        }
+        SprintCmd::Start { id } => {
+            let s = crew::lifecycle::sprint_start(&id)?;
+            println!("sprint `{}` → Running  started_ts={}", s.id, s.started_ts.unwrap_or(0));
+            Ok(0)
+        }
+        SprintCmd::Complete { id } => {
+            let s = crew::lifecycle::sprint_complete(&id)?;
+            let started = s.started_ts.unwrap_or(0);
+            let completed = s.completed_ts.unwrap_or(0);
+            let dur = completed.saturating_sub(started);
+            println!(
+                "sprint `{}` → Complete  duration={}s  completed_ts={}",
+                s.id, dur, completed
+            );
+            Ok(0)
+        }
+        SprintCmd::Abandon { id } => {
+            let s = crew::lifecycle::sprint_abandon(&id)?;
+            println!("sprint `{}` → Abandoned  abandoned_ts={}", s.id, s.abandoned_ts.unwrap_or(0));
+            Ok(0)
+        }
+    }
+}
+
+fn cmd_mission(sub: MissionCmd) -> Result<i32> {
+    match sub {
+        MissionCmd::Start { id } => {
+            let m = crew::lifecycle::mission_start(&id)?;
+            println!("mission `{}` → Active  started_ts={}", m.id, m.started_ts.unwrap_or(0));
+            Ok(0)
+        }
+        MissionCmd::Close { id } => {
+            let m = crew::lifecycle::mission_close(&id)?;
+            let started = m.started_ts.unwrap_or(0);
+            let closed = m.closed_ts.unwrap_or(0);
+            let dur = closed.saturating_sub(started);
+            println!(
+                "mission `{}` → Closed  duration={}s  closed_ts={}",
+                m.id, dur, closed
+            );
+            Ok(0)
+        }
+        MissionCmd::Pause { id } => {
+            let m = crew::lifecycle::mission_pause(&id)?;
+            println!("mission `{}` → Paused  paused_ts={}", m.id, m.paused_ts.unwrap_or(0));
+            Ok(0)
+        }
+        MissionCmd::Resume { id } => {
+            let m = crew::lifecycle::mission_resume(&id)?;
+            println!("mission `{}` → Active  (paused_ts preserved: {})", m.id, m.paused_ts.unwrap_or(0));
+            Ok(0)
         }
     }
 }

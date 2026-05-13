@@ -56,7 +56,7 @@ const BUILTIN_SPRINTS: &[(&str, &str)] = &[];
 
 /// The user-side crew root: `DARKMUX_CREW_DIR` if set, else `<paths.crew>`
 /// from the active workspace.
-fn crew_root() -> PathBuf {
+pub(crate) fn crew_root() -> PathBuf {
     std::env::var("DARKMUX_CREW_DIR")
         .ok()
         .filter(|s| !s.trim().is_empty())
