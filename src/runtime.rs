@@ -2,204 +2,351 @@ use crate::swap::namespaced_identifier;
 use crate::types::{Profile, ProfileModel};
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
+use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Resolve the openclaw config path for a given operation.
+///
+/// Lookup order:
+///   1. `explicit_path` — typically `profile.runtime.config_path` when set;
+///      respects the operator's pin to a specific config file
+///   2. `DARKMUX_OPENCLAW_CONFIG` env var — escape hatch for non-standard
+///      installs (also makes the path injectable from tests)
+///   3. Default `~/.openclaw/openclaw.json` when `DARKMUX_RUNTIME_CMD`
+///      targets openclaw (its default)
+///   4. `None` for unrecognized runtimes — caller decides whether to
+///      skip quietly or surface the gap
+///
+/// Exposed for `doctor --fix`, which has no profile context but still
+/// needs to find the openclaw config to apply ctx-window fixes.
+pub fn resolve_openclaw_config_path(explicit_path: Option<&str>) -> Option<PathBuf> {
+    if let Some(p) = explicit_path {
+        return Some(PathBuf::from(p));
+    }
+    if let Ok(p) = env::var("DARKMUX_OPENCLAW_CONFIG") {
+        let trimmed = p.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
+    let runtime_cmd =
+        env::var("DARKMUX_RUNTIME_CMD").unwrap_or_else(|_| "openclaw".to_string());
+    if runtime_cmd == "openclaw" {
+        if let Some(home) = dirs::home_dir() {
+            return Some(home.join(".openclaw/openclaw.json"));
+        }
+    }
+    None
+}
 
 /// Apply a profile's `runtime:` block to the configured runtime config file
 /// (e.g. ~/.openclaw/openclaw.json). Targeted JSON edits — never overwrites
 /// unrelated fields. Idempotent: a no-op if values already match.
 ///
-/// Updates:
-///   - agents.defaults.contextTokens (from runtime.contextTokens)
-///   - agents.defaults.compaction (merged with runtime.compaction)
-///   - models.providers.*.models[].contextWindow for any model id mentioned
-///     in profile.models (so OpenClaw's view of the model's ctx matches what
-///     LMStudio actually loaded)
-///   - agents.defaults.model.primary rewritten from `lmstudio/<bare-id>` to
-///     `lmstudio/darkmux:<bare-id>` when the bare id matches a profile model
-///     (so dispatchers hit the namespaced load by exact identifier, avoiding
-///     the silent-correctness gap when the user has the same model loaded
-///     for their own purposes — see issue #52)
-///   - agents.defaults.compaction.model rewritten the same way
+/// Two classes of edits:
+///   - **Genuinely runtime-customization** (gated on `profile.runtime`):
+///     - `agents.defaults.contextTokens` (from `runtime.contextTokens`)
+///     - `agents.defaults.compaction` (merged with `runtime.compaction`)
+///   - **Inherent to namespaced loading** (always runs whenever there's an
+///     openclaw config to update — these aren't customizations, they're
+///     consequences of `darkmux swap` issuing namespaced `lms load`s):
+///     - `agents.defaults.model.primary` / `agents.defaults.compaction.model`
+///       rewritten from `lmstudio/<bare-id>` to `lmstudio/darkmux:<bare-id>`
+///     - `models.providers.*.models[].contextWindow` synced to profile n_ctx
+///       for any matching bare-or-namespaced id
+///     - Namespaced registry entries added when missing (see #61)
+///
+/// Path resolution falls back to `~/.openclaw/openclaw.json` when the
+/// profile has no `runtime.config_path` and `DARKMUX_RUNTIME_CMD` targets
+/// openclaw (its default). On other runtimes, returns `Ok(false)` quietly.
 ///
 /// Returns true if the file was modified.
 pub fn apply_runtime(profile: &Profile) -> Result<bool> {
-    let Some(rt) = profile.runtime.as_ref() else {
+    let explicit_path = profile
+        .runtime
+        .as_ref()
+        .and_then(|rt| rt.config_path.as_deref());
+    let Some(path) = resolve_openclaw_config_path(explicit_path) else {
         return Ok(false);
     };
-    let Some(path_str) = rt.config_path.as_ref() else {
-        return Ok(false);
-    };
-    let path = Path::new(path_str);
     if !path.exists() {
-        bail!("darkmux: runtime configPath does not exist: {}", path.display());
+        // Operator pinned an explicit config_path that doesn't resolve —
+        // that's an error worth surfacing. Fallback-to-default with the
+        // file absent is a quiet skip (operator may not have run openclaw
+        // yet on this machine).
+        if explicit_path.is_some() {
+            bail!(
+                "darkmux: runtime configPath does not exist: {}",
+                path.display()
+            );
+        }
+        return Ok(false);
     }
 
-    let raw = fs::read_to_string(path)
+    let raw = fs::read_to_string(&path)
         .with_context(|| format!("reading {}", path.display()))?;
     let mut config: Value = serde_json::from_str(&raw)
         .with_context(|| format!("parsing JSON at {}", path.display()))?;
     let mut modified = false;
 
-    // 1. agents.defaults.contextTokens
-    if let Some(want) = rt.context_tokens {
-        let agents = config.as_object_mut().unwrap()
-            .entry("agents".to_string()).or_insert(Value::Object(Default::default()))
-            .as_object_mut().unwrap();
-        let defaults = agents
-            .entry("defaults".to_string()).or_insert(Value::Object(Default::default()))
-            .as_object_mut().unwrap();
-        let cur = defaults.get("contextTokens").and_then(|v| v.as_u64());
-        if cur != Some(want) {
-            defaults.insert("contextTokens".to_string(), Value::Number(want.into()));
-            modified = true;
+    // ─── Runtime-customization fields (require profile.runtime block) ──
+    if let Some(rt) = profile.runtime.as_ref() {
+        // 1. agents.defaults.contextTokens
+        if let Some(want) = rt.context_tokens {
+            let agents = config.as_object_mut().unwrap()
+                .entry("agents".to_string()).or_insert(Value::Object(Default::default()))
+                .as_object_mut().unwrap();
+            let defaults = agents
+                .entry("defaults".to_string()).or_insert(Value::Object(Default::default()))
+                .as_object_mut().unwrap();
+            let cur = defaults.get("contextTokens").and_then(|v| v.as_u64());
+            if cur != Some(want) {
+                defaults.insert("contextTokens".to_string(), Value::Number(want.into()));
+                modified = true;
+            }
+        }
+
+        // 2. agents.defaults.compaction (merge)
+        if let Some(comp) = rt.compaction.as_ref() {
+            let agents = config.as_object_mut().unwrap()
+                .entry("agents".to_string()).or_insert(Value::Object(Default::default()))
+                .as_object_mut().unwrap();
+            let defaults = agents
+                .entry("defaults".to_string()).or_insert(Value::Object(Default::default()))
+                .as_object_mut().unwrap();
+            let existing = defaults
+                .get("compaction")
+                .cloned()
+                .unwrap_or(Value::Object(Default::default()));
+            let mut merged = existing.as_object().cloned().unwrap_or_default();
+            for (k, v) in comp {
+                merged.insert(k.clone(), v.clone());
+            }
+            let new_compaction = Value::Object(merged);
+            if defaults.get("compaction") != Some(&new_compaction) {
+                defaults.insert("compaction".to_string(), new_compaction);
+                modified = true;
+            }
         }
     }
 
-    // 2. agents.defaults.compaction (merge)
-    if let Some(comp) = rt.compaction.as_ref() {
-        let agents = config.as_object_mut().unwrap()
-            .entry("agents".to_string()).or_insert(Value::Object(Default::default()))
-            .as_object_mut().unwrap();
-        let defaults = agents
-            .entry("defaults".to_string()).or_insert(Value::Object(Default::default()))
-            .as_object_mut().unwrap();
-        let existing = defaults
-            .get("compaction")
-            .cloned()
-            .unwrap_or(Value::Object(Default::default()));
-        let mut merged = existing.as_object().cloned().unwrap_or_default();
-        for (k, v) in comp {
-            merged.insert(k.clone(), v.clone());
-        }
-        let new_compaction = Value::Object(merged);
-        if defaults.get("compaction") != Some(&new_compaction) {
-            defaults.insert("compaction".to_string(), new_compaction);
-            modified = true;
-        }
-    }
-
-    // 2b. Namespace darkmux-managed model references — rewrite bare model ids
-    // in `agents.defaults.model.primary` and `agents.defaults.compaction.model`
-    // to their `darkmux:` namespaced form when they match a profile model.
-    //
-    // Dispatchers (e.g. openclaw's lmstudio plugin) then resolve these by
-    // *exact identifier match* against darkmux's load, avoiding the silent
-    // mis-routing when the user has the same model loaded for another purpose.
-    // See issue #52 for the empirical case that motivates this.
+    // ─── Namespaced-load sync (always runs when there's a config to update) ──
+    // These aren't operator customizations — they're consequences of issuing
+    // namespaced `lms load`s in swap.rs. Without them, openclaw's view of the
+    // model registry drifts from `lms ps` every swap (issue #72).
     if rewrite_namespaced_model_refs(&mut config, &profile.models) {
         modified = true;
     }
+    if sync_context_windows(&mut config, &profile.models) {
+        modified = true;
+    }
+    if ensure_namespaced_entries(&mut config, &profile.models) {
+        modified = true;
+    }
 
-    // 3. models.providers.*.models[].contextWindow — sync to profile n_ctx for
-    //    any entry whose id matches either a profile model's bare id OR its
-    //    namespaced form. Without the namespaced-form match, registry entries
-    //    that darkmux's section 4 below adds would drift on subsequent swaps
-    //    if the operator changed the profile's n_ctx (entries get added but
-    //    never re-synced).
+    if modified {
+        let pretty = serde_json::to_string_pretty(&config)?;
+        fs::write(&path, pretty + "\n")
+            .with_context(|| format!("writing {}", path.display()))?;
+    }
+    Ok(modified)
+}
+
+/// Sync `models.providers.*.models[].contextWindow` against profile n_ctx
+/// for any entry whose id matches the bare or namespaced form of a profile
+/// model. Internal helper for `apply_runtime`. See issue #72 for why this
+/// must run regardless of whether the profile has a `runtime` block.
+fn sync_context_windows(config: &mut Value, models: &[ProfileModel]) -> bool {
+    let Some(providers) = config
+        .get_mut("models")
+        .and_then(|m| m.get_mut("providers"))
+        .and_then(|p| p.as_object_mut())
+    else {
+        return false;
+    };
+    let mut modified = false;
+    for (_pname, prov) in providers.iter_mut() {
+        let Some(entries) = prov.get_mut("models").and_then(|m| m.as_array_mut()) else {
+            continue;
+        };
+        for entry in entries.iter_mut() {
+            let Some(entry_obj) = entry.as_object_mut() else { continue };
+            let Some(id) = entry_obj.get("id").and_then(|x| x.as_str()) else { continue };
+            let id = id.to_string();
+            let want = models.iter().find_map(|pm| {
+                if pm.id == id || namespaced_identifier(pm) == id {
+                    Some(pm.n_ctx as u64)
+                } else {
+                    None
+                }
+            });
+            if let Some(want) = want {
+                let cur = entry_obj.get("contextWindow").and_then(|x| x.as_u64());
+                if cur != Some(want) {
+                    entry_obj.insert(
+                        "contextWindow".to_string(),
+                        Value::Number(want.into()),
+                    );
+                    modified = true;
+                }
+            }
+        }
+    }
+    modified
+}
+
+/// Ensure every namespaced profile model has a registry entry in the
+/// lmstudio provider, cloning the bare-id entry as the template when
+/// available and synthesizing minimal metadata otherwise. See issue #61
+/// for the metadata-edge motivation (compaction trigger calculation
+/// needs registry entries that match the dispatched identifier).
+fn ensure_namespaced_entries(config: &mut Value, models: &[ProfileModel]) -> bool {
+    let Some(lmstudio_models) = config
+        .get_mut("models")
+        .and_then(|m| m.get_mut("providers"))
+        .and_then(|p| p.get_mut("lmstudio"))
+        .and_then(|l| l.get_mut("models"))
+        .and_then(|m| m.as_array_mut())
+    else {
+        return false;
+    };
+    let mut modified = false;
+    for pm in models.iter() {
+        if pm.identifier.is_some() {
+            continue; // operator opted out of the namespace for this load
+        }
+        let ns_ident = namespaced_identifier(pm);
+        if ns_ident == pm.id {
+            continue; // no rewrite happened; no namespaced entry needed
+        }
+        let already_has_ns = lmstudio_models
+            .iter()
+            .any(|e| e.get("id").and_then(|v| v.as_str()) == Some(ns_ident.as_str()));
+        if already_has_ns {
+            continue; // sync_context_windows keeps its contextWindow in sync
+        }
+        let template: Option<Value> = lmstudio_models
+            .iter()
+            .find(|e| e.get("id").and_then(|v| v.as_str()) == Some(pm.id.as_str()))
+            .cloned();
+        let mut entry = template.unwrap_or_else(|| {
+            serde_json::json!({
+                "id": ns_ident,
+                "contextWindow": pm.n_ctx as u64,
+                "input": ["text"],
+                "maxTokens": 8192,
+                "cost": {"cacheRead": 0, "cacheWrite": 0, "input": 0, "output": 0},
+                "name": format!("{ns_ident} (darkmux-managed)"),
+                "reasoning": false
+            })
+        });
+        if let Some(obj) = entry.as_object_mut() {
+            obj.insert("id".to_string(), Value::String(ns_ident.clone()));
+            obj.insert(
+                "contextWindow".to_string(),
+                Value::Number((pm.n_ctx as u64).into()),
+            );
+        }
+        lmstudio_models.push(entry);
+        modified = true;
+    }
+    modified
+}
+
+/// One openclaw.json `contextWindow` entry that was rewritten by
+/// `fix_ctx_window_to_loaded` to match the loaded ctx. Surfaced so
+/// callers (typically `doctor --fix`) can render *what* changed, not
+/// just *how many*.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CtxWindowChange {
+    /// `id` field of the openclaw.json model entry that was rewritten.
+    /// May be a bare id (`openai/gpt-oss-20b`) or namespaced
+    /// (`darkmux:openai/gpt-oss-20b`).
+    pub model_id: String,
+    /// Old `contextWindow` value in the openclaw entry before the fix.
+    pub from: u64,
+    /// New value — matches what `lms ps` reports loaded for this model.
+    pub to: u64,
+}
+
+/// Realign `models.providers.*.models[].contextWindow` to what `lms ps`
+/// actually has loaded right now. Used by `doctor --fix` to close the
+/// ctx-window-mismatch loop without needing an active profile.
+///
+/// Returns the list of rewritten entries — empty when openclaw.json
+/// already matches loaded state (the idempotent case).
+pub fn fix_ctx_window_to_loaded(
+    config_path: &Path,
+    loaded: &[crate::types::LoadedModel],
+) -> Result<Vec<CtxWindowChange>> {
+    if !config_path.exists() {
+        bail!(
+            "darkmux: openclaw config does not exist: {}",
+            config_path.display()
+        );
+    }
+    let raw = fs::read_to_string(config_path)
+        .with_context(|| format!("reading {}", config_path.display()))?;
+    let mut config: Value = serde_json::from_str(&raw)
+        .with_context(|| format!("parsing JSON at {}", config_path.display()))?;
+
+    // Build a map of loaded identifier (and its bare form, if namespaced)
+    // → loaded ctx. Both shapes get the same target so we patch matching
+    // entries regardless of which side carries the `darkmux:` prefix.
+    let mut want: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
+    for m in loaded {
+        let ctx = m.context;
+        want.insert(m.identifier.clone(), ctx);
+        if let Some(bare) = m.identifier.strip_prefix("darkmux:") {
+            want.insert(bare.to_string(), ctx);
+        }
+    }
+
+    let mut changes: Vec<CtxWindowChange> = Vec::new();
     if let Some(providers) = config
         .get_mut("models")
         .and_then(|m| m.get_mut("providers"))
         .and_then(|p| p.as_object_mut())
     {
         for (_pname, prov) in providers.iter_mut() {
-            let Some(models) = prov.get_mut("models").and_then(|m| m.as_array_mut()) else {
+            let Some(entries) = prov.get_mut("models").and_then(|m| m.as_array_mut())
+            else {
                 continue;
             };
-            for entry in models.iter_mut() {
-                let Some(entry_obj) = entry.as_object_mut() else {
-                    continue;
-                };
+            for entry in entries.iter_mut() {
+                let Some(entry_obj) = entry.as_object_mut() else { continue };
                 let Some(id) = entry_obj.get("id").and_then(|x| x.as_str()) else {
                     continue;
                 };
                 let id = id.to_string();
-                if let Some(want) = profile.models.iter().find_map(|pm| {
-                    if pm.id == id || namespaced_identifier(pm) == id {
-                        Some(pm.n_ctx as u64)
-                    } else {
-                        None
-                    }
-                }) {
-                    let cur = entry_obj.get("contextWindow").and_then(|x| x.as_u64());
-                    if cur != Some(want) {
-                        entry_obj.insert("contextWindow".to_string(), Value::Number(want.into()));
-                        modified = true;
-                    }
+                let Some(target) = want.get(&id).copied() else { continue };
+                let cur = entry_obj
+                    .get("contextWindow")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0);
+                if cur != target {
+                    entry_obj.insert(
+                        "contextWindow".to_string(),
+                        Value::Number(target.into()),
+                    );
+                    changes.push(CtxWindowChange {
+                        model_id: id,
+                        from: cur,
+                        to: target,
+                    });
                 }
             }
         }
     }
 
-    // 4. Ensure each namespaced profile model has a registry entry in the
-    //    lmstudio provider's models array. Closes the namespace-contract
-    //    metadata edge surfaced 2026-05-13: openclaw computes the compaction
-    //    trigger threshold from `contextWindow - reserveTokensFloor -
-    //    maxOutputTokens` against this registry entry; if the dispatched id
-    //    is `darkmux:<bare-id>` but the registry only has `<bare-id>`, the
-    //    lookup falls through to stale (or hardcoded-default) metadata and
-    //    compaction can fail to fire when it should — same bug class as
-    //    Eureka E5 (calibration drift, just mediated differently).
-    //
-    //    Strategy: clone the bare-id entry as the template (preserves
-    //    cost/input/maxTokens/name/reasoning), change `id` to the namespaced
-    //    form, set `contextWindow` to the profile's `n_ctx`. If no bare-id
-    //    template exists, synthesize a minimal entry — better an entry with
-    //    defaults than no entry at all.
-    if let Some(lmstudio_models) = config
-        .get_mut("models")
-        .and_then(|m| m.get_mut("providers"))
-        .and_then(|p| p.get_mut("lmstudio"))
-        .and_then(|l| l.get_mut("models"))
-        .and_then(|m| m.as_array_mut())
-    {
-        for pm in profile.models.iter() {
-            if pm.identifier.is_some() {
-                continue; // operator opted out of the namespace for this load
-            }
-            let ns_ident = namespaced_identifier(pm);
-            if ns_ident == pm.id {
-                continue; // no rewrite happened; no namespaced entry needed
-            }
-            let already_has_ns = lmstudio_models
-                .iter()
-                .any(|e| e.get("id").and_then(|v| v.as_str()) == Some(ns_ident.as_str()));
-            if already_has_ns {
-                continue; // section 3 keeps its contextWindow in sync
-            }
-            let template: Option<Value> = lmstudio_models
-                .iter()
-                .find(|e| e.get("id").and_then(|v| v.as_str()) == Some(pm.id.as_str()))
-                .cloned();
-            let mut entry = template.unwrap_or_else(|| {
-                serde_json::json!({
-                    "id": ns_ident,
-                    "contextWindow": pm.n_ctx as u64,
-                    "input": ["text"],
-                    "maxTokens": 8192,
-                    "cost": {"cacheRead": 0, "cacheWrite": 0, "input": 0, "output": 0},
-                    "name": format!("{ns_ident} (darkmux-managed)"),
-                    "reasoning": false
-                })
-            });
-            if let Some(obj) = entry.as_object_mut() {
-                obj.insert("id".to_string(), Value::String(ns_ident.clone()));
-                obj.insert(
-                    "contextWindow".to_string(),
-                    Value::Number((pm.n_ctx as u64).into()),
-                );
-            }
-            lmstudio_models.push(entry);
-            modified = true;
-        }
-    }
-
-    if modified {
+    if !changes.is_empty() {
         let pretty = serde_json::to_string_pretty(&config)?;
-        fs::write(path, pretty + "\n")
-            .with_context(|| format!("writing {}", path.display()))?;
+        fs::write(config_path, pretty + "\n")
+            .with_context(|| format!("writing {}", config_path.display()))?;
     }
-    Ok(modified)
+    Ok(changes)
 }
 
 /// Walk darkmux-managed model-reference sites and rewrite bare ids to their
@@ -896,5 +1043,216 @@ mod tests {
             after["agents"]["defaults"]["model"]["primary"],
             "openrouter/google/gemini-2.5"
         );
+    }
+
+    // ─── Issue #72: namespaced-load sync must run even without runtime block ──
+    //
+    // Tests below use #[serial_test::serial] because they mutate process env
+    // vars (DARKMUX_OPENCLAW_CONFIG / DARKMUX_RUNTIME_CMD) — running them in
+    // parallel races against any other test that touches those vars.
+
+    use crate::types::LoadedModel;
+    use serial_test::serial;
+
+    fn profile_without_runtime(models: Vec<ProfileModel>) -> Profile {
+        Profile {
+            description: None,
+            models,
+            runtime: None,
+            use_when: None,
+        }
+    }
+
+    /// The #72 regression case: profile has no `runtime` block, but
+    /// `darkmux swap` still loads namespaced models. The openclaw config
+    /// must still get its contextWindow + namespaced entries synced via
+    /// the env-var override (operators get this via `~/.openclaw/openclaw.json`
+    /// fallback; this test substitutes a tempfile via `DARKMUX_OPENCLAW_CONFIG`).
+    #[test]
+    #[serial]
+    fn no_runtime_block_still_syncs_namespaced_load() {
+        let tmp = TempDir::new().unwrap();
+        let p = write_config(
+            &tmp,
+            r#"{
+                "models": {
+                    "providers": {
+                        "lmstudio": {
+                            "models": [
+                                {"id": "openai/gpt-oss-20b", "contextWindow": 32768}
+                            ]
+                        }
+                    }
+                }
+            }"#,
+        );
+        let profile = profile_without_runtime(vec![ProfileModel {
+            id: "openai/gpt-oss-20b".into(),
+            n_ctx: 100000,
+            role: ModelRole::Primary,
+            identifier: None,
+        }]);
+
+        unsafe { env::set_var("DARKMUX_OPENCLAW_CONFIG", p.to_str().unwrap()) };
+        let modified = apply_runtime(&profile).unwrap();
+        unsafe { env::remove_var("DARKMUX_OPENCLAW_CONFIG") };
+
+        assert!(modified, "namespaced sync should fire without a runtime block");
+        let after: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+        let arr = after["models"]["providers"]["lmstudio"]["models"]
+            .as_array()
+            .unwrap();
+        // Bare-id entry got its contextWindow synced to profile n_ctx.
+        let bare = arr.iter().find(|m| m["id"] == "openai/gpt-oss-20b").unwrap();
+        assert_eq!(bare["contextWindow"], 100000);
+        // Namespaced entry was added.
+        let ns = arr
+            .iter()
+            .find(|m| m["id"] == "darkmux:openai/gpt-oss-20b")
+            .expect("namespaced entry should have been added");
+        assert_eq!(ns["contextWindow"], 100000);
+    }
+
+    /// Path resolution priority: explicit > env > openclaw default. Lock the
+    /// order so future changes don't accidentally reorder it.
+    #[test]
+    #[serial]
+    fn resolve_path_priority_explicit_over_env_over_default() {
+        unsafe { env::set_var("DARKMUX_OPENCLAW_CONFIG", "/from/env.json") };
+        // 1. Explicit wins over env.
+        assert_eq!(
+            resolve_openclaw_config_path(Some("/from/explicit.json")),
+            Some(PathBuf::from("/from/explicit.json"))
+        );
+        // 2. Env wins when no explicit.
+        assert_eq!(
+            resolve_openclaw_config_path(None),
+            Some(PathBuf::from("/from/env.json"))
+        );
+        // 3. Default kicks in when no explicit and no env (and runtime is openclaw).
+        unsafe { env::remove_var("DARKMUX_OPENCLAW_CONFIG") };
+        unsafe { env::remove_var("DARKMUX_RUNTIME_CMD") };
+        let resolved = resolve_openclaw_config_path(None);
+        // Can't assert exact path (depends on $HOME), but should end with the canonical suffix.
+        assert!(
+            resolved
+                .as_ref()
+                .map(|p| p.ends_with(".openclaw/openclaw.json"))
+                .unwrap_or(false),
+            "default should be $HOME/.openclaw/openclaw.json, got {resolved:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_path_returns_none_for_unrecognized_runtime() {
+        unsafe { env::remove_var("DARKMUX_OPENCLAW_CONFIG") };
+        unsafe { env::set_var("DARKMUX_RUNTIME_CMD", "aider") };
+        let resolved = resolve_openclaw_config_path(None);
+        unsafe { env::remove_var("DARKMUX_RUNTIME_CMD") };
+        assert!(resolved.is_none(), "unrecognized runtime should yield None, got {resolved:?}");
+    }
+
+    // ─── fix_ctx_window_to_loaded (doctor --fix handler) ──
+
+    fn loaded_model(identifier: &str, ctx: u64) -> LoadedModel {
+        LoadedModel {
+            identifier: identifier.into(),
+            model: identifier.into(),
+            status: "idle".into(),
+            size: "12.00 GB".into(),
+            context: ctx,
+        }
+    }
+
+    #[test]
+    fn fix_ctx_window_aligns_bare_and_namespaced_entries() {
+        let tmp = TempDir::new().unwrap();
+        let p = write_config(
+            &tmp,
+            r#"{
+                "models": {
+                    "providers": {
+                        "lmstudio": {
+                            "models": [
+                                {"id": "openai/gpt-oss-20b", "contextWindow": 32768},
+                                {"id": "darkmux:openai/gpt-oss-20b", "contextWindow": 32768},
+                                {"id": "unrelated/model", "contextWindow": 50000}
+                            ]
+                        }
+                    }
+                }
+            }"#,
+        );
+        // Loaded: namespaced form at 100000 ctx. Both bare and namespaced
+        // entries should be aligned; the unrelated entry stays put.
+        let loaded = vec![loaded_model("darkmux:openai/gpt-oss-20b", 100000)];
+        let changes = fix_ctx_window_to_loaded(&p, &loaded).unwrap();
+
+        // Assert exactly which two entries got rewritten — both shapes of
+        // the loaded id, with the right old→new transition. Order isn't
+        // guaranteed by the iteration, so collect by id before checking.
+        assert_eq!(changes.len(), 2, "both bare and namespaced should be patched");
+        let by_change_id: std::collections::HashMap<&str, &CtxWindowChange> =
+            changes.iter().map(|c| (c.model_id.as_str(), c)).collect();
+        let bare = by_change_id
+            .get("openai/gpt-oss-20b")
+            .expect("bare-id change missing");
+        assert_eq!(bare.from, 32768);
+        assert_eq!(bare.to, 100000);
+        let ns = by_change_id
+            .get("darkmux:openai/gpt-oss-20b")
+            .expect("namespaced change missing");
+        assert_eq!(ns.from, 32768);
+        assert_eq!(ns.to, 100000);
+        assert!(
+            !by_change_id.contains_key("unrelated/model"),
+            "unrelated entry should not appear in changes"
+        );
+
+        // And the on-disk state agrees.
+        let after: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+        let arr = after["models"]["providers"]["lmstudio"]["models"]
+            .as_array()
+            .unwrap();
+        let by_id = |id: &str| arr.iter().find(|m| m["id"] == id).unwrap()["contextWindow"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(by_id("openai/gpt-oss-20b"), 100000);
+        assert_eq!(by_id("darkmux:openai/gpt-oss-20b"), 100000);
+        assert_eq!(by_id("unrelated/model"), 50000); // untouched
+    }
+
+    #[test]
+    fn fix_ctx_window_is_idempotent_when_already_aligned() {
+        let tmp = TempDir::new().unwrap();
+        let p = write_config(
+            &tmp,
+            r#"{
+                "models": {
+                    "providers": {
+                        "lmstudio": {
+                            "models": [
+                                {"id": "openai/gpt-oss-20b", "contextWindow": 100000}
+                            ]
+                        }
+                    }
+                }
+            }"#,
+        );
+        let loaded = vec![loaded_model("openai/gpt-oss-20b", 100000)];
+        let changes = fix_ctx_window_to_loaded(&p, &loaded).unwrap();
+        assert!(changes.is_empty(), "no changes when config already matches loaded ctx");
+    }
+
+    #[test]
+    fn fix_ctx_window_errors_when_config_missing() {
+        let tmp = TempDir::new().unwrap();
+        let absent = tmp.path().join("does-not-exist.json");
+        let loaded = vec![loaded_model("foo", 1000)];
+        let err = fix_ctx_window_to_loaded(&absent, &loaded).unwrap_err();
+        assert!(err.to_string().contains("does not exist"));
     }
 }
