@@ -7,6 +7,7 @@
 //! atomically prepends a schema header so partial-file recovery is possible.
 
 use anyhow::{Context, Result};
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{ErrorKind, Write};
@@ -15,7 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const FLOW_SCHEMA_VERSION: &str = "1.0.0";
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum Level {
     Error,
@@ -25,7 +26,7 @@ pub enum Level {
     Trace,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum Category {
     Work,
@@ -34,7 +35,7 @@ pub enum Category {
     Review,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum Tier {
     Operator,
@@ -42,7 +43,7 @@ pub enum Tier {
     Local,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum Stage {
     Scope,
@@ -84,7 +85,7 @@ fn flows_dir() -> PathBuf {
 }
 
 /// ISO 8601 UTC date string from a `SystemTime`.
-fn ts_utc_now() -> String {
+pub(crate) fn ts_utc_now() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
