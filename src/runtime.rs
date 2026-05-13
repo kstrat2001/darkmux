@@ -442,7 +442,12 @@ fn rewrite_namespaced_model_refs(config: &mut Value, models: &[ProfileModel]) ->
 ///     the profile's first `role: Primary` model. No-op if the profile
 ///     has no Primary model.
 ///   - `agents.defaults.compaction.model` ← same shape, for the
-///     profile's first `role: Compactor` model. No-op if the profile
+///     profile's first `role: Compactor` model. (Note: `validate_profile`
+///     enforces exactly one Primary but doesn't bound the Compactor
+///     count; if a profile declares multiple Compactors, the first by
+///     declaration order is used. Documented "first wins" rather than
+///     adding a validator surface in this PR — the alternative would
+///     belong in `profiles::validate_profile`.) No-op if the profile
 ///     has no Compactor; in that case any existing `compaction.model`
 ///     is left alone (we don't promise to clear pins the new profile
 ///     doesn't speak to — that would be a stronger contract than the
@@ -486,22 +491,8 @@ fn sync_default_model_pins(config: &mut Value, models: &[ProfileModel]) -> bool 
             .and_then(|p| p.as_str())
             .map(String::from);
         if should_rewrite_lmstudio_pin(cur.as_deref()) && cur.as_deref() != Some(want.as_str()) {
-            let model_obj = config
-                .as_object_mut()
-                .expect("config root is an object")
-                .entry("agents".to_string())
-                .or_insert_with(|| Value::Object(Default::default()))
-                .as_object_mut()
-                .expect("agents must be an object")
-                .entry("defaults".to_string())
-                .or_insert_with(|| Value::Object(Default::default()))
-                .as_object_mut()
-                .expect("agents.defaults must be an object")
-                .entry("model".to_string())
-                .or_insert_with(|| Value::Object(Default::default()))
-                .as_object_mut()
-                .expect("agents.defaults.model must be an object");
-            model_obj.insert("primary".to_string(), Value::String(want));
+            ensure_object_at_path(config, &["agents", "defaults", "model"])
+                .insert("primary".to_string(), Value::String(want));
             modified = true;
         }
     }
@@ -515,22 +506,8 @@ fn sync_default_model_pins(config: &mut Value, models: &[ProfileModel]) -> bool 
             .and_then(|m| m.as_str())
             .map(String::from);
         if should_rewrite_lmstudio_pin(cur.as_deref()) && cur.as_deref() != Some(want.as_str()) {
-            let comp_obj = config
-                .as_object_mut()
-                .expect("config root is an object")
-                .entry("agents".to_string())
-                .or_insert_with(|| Value::Object(Default::default()))
-                .as_object_mut()
-                .expect("agents must be an object")
-                .entry("defaults".to_string())
-                .or_insert_with(|| Value::Object(Default::default()))
-                .as_object_mut()
-                .expect("agents.defaults must be an object")
-                .entry("compaction".to_string())
-                .or_insert_with(|| Value::Object(Default::default()))
-                .as_object_mut()
-                .expect("agents.defaults.compaction must be an object");
-            comp_obj.insert("model".to_string(), Value::String(want));
+            ensure_object_at_path(config, &["agents", "defaults", "compaction"])
+                .insert("model".to_string(), Value::String(want));
             modified = true;
         }
     }
@@ -538,14 +515,47 @@ fn sync_default_model_pins(config: &mut Value, models: &[ProfileModel]) -> bool 
     modified
 }
 
-/// True when an existing pin is darkmux's to rewrite: it points at the
-/// `lmstudio/` provider (where the darkmux namespace lives) or there's
-/// no pin at all yet. False when the pin uses any other provider prefix
-/// — those are operator routing decisions and we leave them alone.
+/// Walk `config` along `path`, creating missing intermediate objects.
+/// Returns a mutable reference to the innermost object so the caller
+/// can insert leaf fields. Panics if `config` is not an object at the
+/// root (`apply_runtime`'s JSON deserialization already guarantees
+/// this).
+fn ensure_object_at_path<'a>(
+    config: &'a mut Value,
+    path: &[&str],
+) -> &'a mut serde_json::Map<String, Value> {
+    let mut cursor = config
+        .as_object_mut()
+        .expect("config root must be a JSON object");
+    for key in path {
+        cursor = cursor
+            .entry((*key).to_string())
+            .or_insert_with(|| Value::Object(Default::default()))
+            .as_object_mut()
+            .expect("intermediate path entry must be a JSON object");
+    }
+    cursor
+}
+
+/// True when an existing pin is darkmux's to rewrite. False when the
+/// pin uses a non-LMStudio provider prefix (those are operator routing
+/// decisions and we leave them alone).
+///
+/// Three rewrite-eligible shapes:
+///   - `None` — no pin set yet
+///   - `Some("lmstudio/...")` — explicitly in the LMStudio provider
+///   - `Some("<bare-id>")` — no provider prefix at all. apply_runtime
+///     only enters this code path when `DARKMUX_RUNTIME_CMD=openclaw`
+///     and openclaw's default provider routing for bare ids resolves
+///     through LMStudio for darkmux-managed setups. A bare pin is most
+///     likely a hand-edited reference to the same target the prefixed
+///     form would reach (see #90 review M1 — without this, a stale
+///     bare pin survives swaps and reintroduces the bug).
 fn should_rewrite_lmstudio_pin(current: Option<&str>) -> bool {
     match current {
         None => true,
-        Some(c) => c.starts_with("lmstudio/"),
+        Some(c) if c.starts_with("lmstudio/") => true,
+        Some(c) => !c.contains('/'),
     }
 }
 
@@ -1442,6 +1452,60 @@ mod tests {
         }];
         assert!(sync_default_model_pins(&mut config, &models));
         assert!(!sync_default_model_pins(&mut config, &models));
+    }
+
+    /// Review M1: an unprefixed (bare) pin is still darkmux's to rewrite
+    /// — `apply_runtime` only runs under `DARKMUX_RUNTIME_CMD=openclaw`,
+    /// and a bare pin in that context resolves through openclaw's
+    /// default provider routing (LMStudio for darkmux setups). Without
+    /// this case, a hand-edited bare pin would survive a swap and
+    /// reintroduce the #90 bug for that operator.
+    #[test]
+    fn sync_default_model_pins_rewrites_unprefixed_pin() {
+        let mut config = serde_json::json!({
+            "agents": { "defaults": { "model": { "primary": "stale-bare-id" } } }
+        });
+        let models = vec![ProfileModel {
+            id: "new-model".into(),
+            n_ctx: 100000,
+            role: ModelRole::Primary,
+            identifier: None,
+        }];
+        assert!(sync_default_model_pins(&mut config, &models));
+        assert_eq!(
+            config["agents"]["defaults"]["model"]["primary"],
+            "lmstudio/darkmux:new-model"
+        );
+    }
+
+    /// Review M1 boundary: pins with a non-LMStudio provider prefix are
+    /// operator routing decisions and must be preserved. Pairs with
+    /// `leaves_non_lmstudio_provider_refs_alone` (file-level test) —
+    /// this is the pure-fn equivalent and covers more provider shapes
+    /// (`xai/`, `anthropic/`, etc.) without env-var setup overhead.
+    #[test]
+    fn sync_default_model_pins_preserves_non_lmstudio_provider_pins() {
+        for stale_pin in [
+            "openrouter/google/gemini-2.5",
+            "xai/grok-4",
+            "anthropic/claude-opus-4",
+        ] {
+            let mut config = serde_json::json!({
+                "agents": { "defaults": { "model": { "primary": stale_pin } } }
+            });
+            let models = vec![ProfileModel {
+                id: "lmstudio-side-model".into(),
+                n_ctx: 100000,
+                role: ModelRole::Primary,
+                identifier: None,
+            }];
+            let modified = sync_default_model_pins(&mut config, &models);
+            assert!(!modified, "non-LMStudio pin `{stale_pin}` should be left alone");
+            assert_eq!(
+                config["agents"]["defaults"]["model"]["primary"], stale_pin,
+                "non-LMStudio pin `{stale_pin}` must survive sync"
+            );
+        }
     }
 
     /// A profile with no managed roles (e.g. all Auxiliary) must not
