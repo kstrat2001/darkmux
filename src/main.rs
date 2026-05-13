@@ -20,6 +20,7 @@ mod optimize;
 mod profiles;
 mod providers;
 mod runtime;
+mod serve;
 mod skills;
 mod flow_cli;
 mod role_cli;
@@ -130,6 +131,15 @@ enum Cmd {
     Flow {
         #[command(subcommand)]
         sub: flow_cli::FlowCmd,
+    },
+    /// Start an HTTP daemon for flow record retrieval.
+    Serve {
+        /// Port to listen on (default: 8765).
+        #[arg(long, default_value = "8765")]
+        port: u16,
+        /// Address to bind (default: 127.0.0.1).
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
     },
     /// Optimize for your workload — guided wizard (Phase 1 scaffold).
     /// Composes scan, lab characterize/tune, heuristics, and eureka rules
@@ -479,6 +489,10 @@ fn run(cmd: Cmd) -> Result<i32> {
             force,
             dry_run,
         } => cmd_init(with_hook, with_claude_md, force, dry_run),
+        Cmd::Serve { port, bind } => {
+            serve::run(port, bind)?;
+            Ok(0)
+        }
         Cmd::Optimize => optimize::run(),
     }
 }
