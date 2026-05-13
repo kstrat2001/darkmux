@@ -60,18 +60,35 @@ pub fn build_router(flows_dir: PathBuf) -> Router {
 /// rather than discovering the silence only when they open the viewer.
 pub const DEFAULT_DAEMON_ADDR: &str = "127.0.0.1:8765";
 
+/// Probe-budget timeout for the every-dispatch reachability check.
+/// Shared between the production hardcoded probe and the test helpers
+/// so a future drift doesn't leave the budget assertions and the
+/// actual probe disagreeing.
+pub const PROBE_TIMEOUT_MS: u64 = 300;
+
 /// Best-effort TCP probe of the local daemon. Returns `true` when a
-/// connection can be opened to `DEFAULT_DAEMON_ADDR` within ~300ms.
-/// Intentionally lightweight (no HTTP request) — the more thorough
-/// `/health` probe lives in `doctor::check_daemon_reachable` and is
-/// run on operator-explicit `darkmux doctor` invocation; this helper
-/// is for the every-dispatch pre-flight nudge where probe cost matters.
+/// connection can be opened to `DEFAULT_DAEMON_ADDR` within
+/// `PROBE_TIMEOUT_MS`. Intentionally lightweight (no HTTP request) —
+/// the more thorough `/health` probe lives in
+/// `doctor::check_daemon_reachable` and is run on operator-explicit
+/// `darkmux doctor` invocation; this helper is for the every-dispatch
+/// pre-flight nudge where probe cost matters.
 pub fn is_daemon_reachable() -> bool {
     let addr: std::net::SocketAddr = match DEFAULT_DAEMON_ADDR.parse() {
         Ok(a) => a,
         Err(_) => return false,
     };
-    std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(300)).is_ok()
+    is_addr_reachable(addr, std::time::Duration::from_millis(PROBE_TIMEOUT_MS))
+}
+
+/// Pure-probe helper: TCP connect with timeout, no `/health` request.
+/// Extracted so tests can verify the return-value contract against a
+/// known-closed port without depending on the operator's running
+/// daemon state (`is_daemon_reachable` hardcodes the address, which
+/// would make a return-false assertion brittle in CI where 8765 may
+/// or may not be in use).
+fn is_addr_reachable(addr: std::net::SocketAddr, timeout: std::time::Duration) -> bool {
+    std::net::TcpStream::connect_timeout(&addr, timeout).is_ok()
 }
 
 /// Print the one-line stderr nudge if the daemon isn't reachable.
@@ -623,19 +640,44 @@ mod tests {
 
     // ─── is_daemon_reachable / nudge_if_daemon_unreachable (#104 S3) ─────
 
+    /// Test the actual return-value contract by binding a transient
+    /// listener (so its port IS reachable) and probing both that port
+    /// and a definitely-closed port. Doesn't depend on operator's
+    /// running daemon state at 127.0.0.1:8765.
     #[test]
-    fn is_daemon_reachable_returns_false_on_closed_port() {
-        // Default address is 127.0.0.1:8765 — even if a daemon is running
-        // on the operator's machine for the integration scenario, we can
-        // probe a known-closed port via a sibling helper to test the
-        // false path. The fn itself is hardcoded, so we test that by
-        // verifying the timeout returns quickly (probe budget ≤ 300ms).
+    fn is_addr_reachable_returns_true_for_listening_port_false_for_closed() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        let open_addr = listener.local_addr().expect("local_addr");
+
+        // Open port: reachable.
+        assert!(is_addr_reachable(open_addr, std::time::Duration::from_millis(PROBE_TIMEOUT_MS)));
+
+        // Close it; same address should now be unreachable.
+        drop(listener);
+        // OS may take a moment to release; the connect_timeout still
+        // either reports refused (fast) or times out within budget.
+        assert!(!is_addr_reachable(open_addr, std::time::Duration::from_millis(PROBE_TIMEOUT_MS)));
+    }
+
+    /// Lock the probe budget so a future timeout-doubling slip doesn't
+    /// silently make the every-dispatch nudge a noticeable pre-flight tax.
+    #[test]
+    fn is_addr_reachable_respects_probe_timeout_budget() {
+        // Probe a known-unroutable address (TEST-NET-1, RFC 5737) so
+        // the timeout path is exercised, not the connect-refused path.
+        let dead: std::net::SocketAddr = "192.0.2.1:1".parse().unwrap();
+        let timeout = std::time::Duration::from_millis(PROBE_TIMEOUT_MS);
         let start = std::time::Instant::now();
-        let _ = is_daemon_reachable();
+        let result = is_addr_reachable(dead, timeout);
         let elapsed = start.elapsed();
+
+        assert!(!result, "unroutable address must report unreachable");
+        // 2x budget gives slack for slow CI without papering over a
+        // regression that doubles the timeout (~600ms+ would catch).
         assert!(
-            elapsed < std::time::Duration::from_millis(500),
-            "probe should respect 300ms timeout, took {:?}",
+            elapsed < std::time::Duration::from_millis(PROBE_TIMEOUT_MS * 2),
+            "probe should respect ~{}ms budget, took {:?}",
+            PROBE_TIMEOUT_MS,
             elapsed
         );
     }
