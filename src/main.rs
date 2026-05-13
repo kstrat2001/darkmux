@@ -21,6 +21,7 @@ mod profiles;
 mod providers;
 mod runtime;
 mod skills;
+mod flow_cli;
 mod role_cli;
 mod sprint_cli;
 mod swap;
@@ -124,6 +125,11 @@ enum Cmd {
     Agent {
         #[command(subcommand)]
         sub: AgentCmd,
+    },
+    /// Flow observability — record operator-facing flow events.
+    Flow {
+        #[command(subcommand)]
+        sub: flow_cli::FlowCmd,
     },
     /// Optimize for your workload — guided wizard (Phase 1 scaffold).
     /// Composes scan, lab characterize/tune, heuristics, and eureka rules
@@ -460,6 +466,10 @@ fn run(cmd: Cmd) -> Result<i32> {
         Cmd::Role { sub } => cmd_role(sub),
         Cmd::Sprint { sub } => cmd_sprint(sub),
         Cmd::Agent { sub } => cmd_agent(sub),
+        Cmd::Flow { sub } => {
+            flow_cli::run(sub)?;
+            Ok(0)
+        }
         Cmd::Init {
             with_hook,
             with_claude_md,
