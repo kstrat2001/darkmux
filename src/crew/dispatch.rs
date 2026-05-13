@@ -44,6 +44,15 @@ fn agent_id_for(role_id: &str) -> String {
     format!("darkmux/{role_id}")
 }
 
+/// The role's openclaw workspace dir, derived from the standard
+/// `~/.openclaw/workspace-darkmux-<role-id>/` layout. Used as the default
+/// `--watch` target when the caller doesn't supply explicit paths (#89).
+pub fn default_workspace_for_role(role_id: &str) -> PathBuf {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    home.join(".openclaw")
+        .join(format!("workspace-darkmux-{role_id}"))
+}
+
 /// Slug for the agent's on-disk dirs. Translates the `darkmux/<role>` id
 /// to a filesystem-safe nested path (`agents/darkmux/<role>/agent`) and a
 /// flat workspace slug (`workspace-darkmux-<role>`).
@@ -64,6 +73,33 @@ pub struct DispatchOpts {
     pub timeout_seconds: u32,
     /// Skip the pre-flight checks. Use only when explicitly debugging.
     pub skip_preflight: bool,
+    /// Paths to capture post-dispatch filesystem state for (#89 —
+    /// SIGNOFF verification visibility). The dispatcher walks each
+    /// path (immediate children + one level deep into subdirs;
+    /// excludes openclaw state files) after the openclaw call returns
+    /// and emits a stderr summary so the operator can compare the
+    /// actual filesystem state against any "files written" claims in
+    /// the SIGNOFF block. Empty defaults to the role's openclaw
+    /// workspace dir.
+    pub watch_paths: Vec<PathBuf>,
+}
+
+/// One file's state for the watched-paths summary (#89).
+#[derive(Debug, Clone)]
+pub struct WatchedFile {
+    pub path: PathBuf,
+    pub size: u64,
+}
+
+/// Post-dispatch state of one watched path.
+#[derive(Debug, Clone)]
+pub struct WatchedPathState {
+    pub root: PathBuf,
+    pub files: Vec<WatchedFile>,
+    /// True if `root` itself didn't exist or wasn't readable at snapshot
+    /// time. The dispatcher reports the gap rather than silently dropping
+    /// the path.
+    pub unreachable: bool,
 }
 
 #[derive(Debug)]
@@ -77,6 +113,10 @@ pub struct DispatchResult {
     /// without an explicit `--session-id`, openclaw's per-agent session
     /// reuse caused cross-task context pollution).
     pub session_id: String,
+    /// Post-dispatch state of each `opts.watch_paths` entry, in the same
+    /// order. Surfaces the actual filesystem so the operator can compare
+    /// against the SIGNOFF block's "files written" claims (#89).
+    pub watched_state: Vec<WatchedPathState>,
 }
 
 /// Process-local monotonic counter — guarantees uniqueness for rapid
@@ -101,6 +141,129 @@ pub(crate) fn fresh_session_id(role_id: &str) -> String {
         .unwrap_or(0);
     let counter = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("crew-dispatch-{role_id}-{micros}-{counter}")
+}
+
+/// Bounded directory walk that's resilient to non-existent paths +
+/// permission errors. Returns the immediate-child + one-level-down
+/// regular files under `root`, excluding openclaw state files (which
+/// change on every dispatch and would drown out the operator's signal).
+///
+/// Symlinks are reported as files only when their target is a regular
+/// file. Symlinked directories are NOT followed (would unbounded-walk
+/// the live source tree the workspace symlinks into).
+///
+/// Cap: 200 files per `root`. The dispatcher's job is to surface the
+/// signal, not to dump entire repos.
+pub(crate) fn snapshot_watched_path(root: &Path) -> WatchedPathState {
+    const MAX_FILES_PER_ROOT: usize = 200;
+
+    if !root.exists() {
+        return WatchedPathState {
+            root: root.to_path_buf(),
+            files: Vec::new(),
+            unreachable: true,
+        };
+    }
+
+    let mut files: Vec<WatchedFile> = Vec::new();
+    walk_one_level(root, &mut files, MAX_FILES_PER_ROOT);
+
+    if files.len() >= MAX_FILES_PER_ROOT {
+        // Truncate; operator sees the cap was hit via the leading entries.
+        files.truncate(MAX_FILES_PER_ROOT);
+    }
+
+    // Sort by size descending so the operator sees the largest (often
+    // most-relevant — actual outputs vs scratch files) first.
+    files.sort_by(|a, b| b.size.cmp(&a.size));
+
+    WatchedPathState {
+        root: root.to_path_buf(),
+        files,
+        unreachable: false,
+    }
+}
+
+fn walk_one_level(dir: &Path, out: &mut Vec<WatchedFile>, cap: usize) {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        if out.len() >= cap {
+            return;
+        }
+        let path = entry.path();
+        if is_openclaw_noise(&path) {
+            continue;
+        }
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.is_file() {
+            out.push(WatchedFile {
+                path,
+                size: meta.len(),
+            });
+        } else if meta.is_dir() {
+            // One level only — don't recurse into subdirs of subdirs.
+            // (Distinguishes from symlinks via is_symlink check below.)
+            if path.is_symlink() {
+                continue;
+            }
+            // Walk the subdir flat (no further recursion).
+            let sub_entries = match fs::read_dir(&path) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            for sub in sub_entries.flatten() {
+                if out.len() >= cap {
+                    return;
+                }
+                let sub_path = sub.path();
+                if is_openclaw_noise(&sub_path) {
+                    continue;
+                }
+                let sub_meta = match sub.metadata() {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                if sub_meta.is_file() {
+                    out.push(WatchedFile {
+                        path: sub_path,
+                        size: sub_meta.len(),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Files the dispatcher excludes from watched-state snapshots — openclaw's
+/// own session bookkeeping, trajectory files, and the workspace bootstrap
+/// markdowns. These change on every dispatch and would drown out the
+/// signal the operator is actually looking for.
+fn is_openclaw_noise(path: &Path) -> bool {
+    let name = match path.file_name().and_then(|s| s.to_str()) {
+        Some(n) => n,
+        None => return false,
+    };
+    name.ends_with(".trajectory.jsonl")
+        || name.ends_with(".trajectory-path.json")
+        || name.ends_with(".checkpoint.jsonl")
+        || (name.ends_with(".jsonl") && name.contains("checkpoint"))
+        || matches!(
+            name,
+            "AGENTS.md"
+                | "BOOTSTRAP.md"
+                | "HEARTBEAT.md"
+                | "IDENTITY.md"
+                | "SOUL.md"
+                | "TOOLS.md"
+                | "USER.md"
+                | "sessions.json"
+        )
 }
 
 /// Run a single dispatch end-to-end.
@@ -149,11 +312,24 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         .output()
         .with_context(|| format!("running `openclaw agent {agent_id}`"))?;
 
+    // 5. Post-dispatch: snapshot filesystem state at each caller-supplied
+    //    watch path. Surfaces ground-truth file presence + sizes so SIGNOFF
+    //    claims are verifiable (#89). Empty watch_paths => empty snapshot
+    //    vector; the CLI handler decides whether to default to the role's
+    //    workspace dir, so library callers (e.g. sprint_cli's internal
+    //    dispatch) can opt out of the echo without ceremony.
+    let watched_state: Vec<WatchedPathState> = opts
+        .watch_paths
+        .iter()
+        .map(|p| snapshot_watched_path(p))
+        .collect();
+
     Ok(DispatchResult {
         exit_code: output.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
         stderr: String::from_utf8_lossy(&output.stderr).to_string(),
         session_id: resolved_session_id,
+        watched_state,
     })
 }
 
@@ -578,6 +754,141 @@ mod tests {
         assert_ne!(a, b);
         assert!(a.contains("-coder-"));
         assert!(b.contains("-scribe-"));
+    }
+
+    // ─── #89: watched-state snapshot ───────────────────────────────────────
+
+    use std::io::Write as _;
+
+    fn write_file(path: &Path, contents: &[u8]) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let mut f = fs::File::create(path).unwrap();
+        f.write_all(contents).unwrap();
+    }
+
+    #[test]
+    fn snapshot_reports_unreachable_for_missing_path() {
+        let s = snapshot_watched_path(Path::new("/no/such/path/anywhere"));
+        assert!(s.unreachable);
+        assert!(s.files.is_empty());
+    }
+
+    #[test]
+    fn snapshot_walks_top_level_files() {
+        let tmp = TempDir::new().unwrap();
+        write_file(&tmp.path().join("a.txt"), b"AAAAA");      // 5 bytes
+        write_file(&tmp.path().join("b.txt"), b"BB");          // 2 bytes
+        write_file(&tmp.path().join("c.txt"), b"CCCCCCCCCC");  // 10 bytes
+
+        let s = snapshot_watched_path(tmp.path());
+        assert!(!s.unreachable);
+        assert_eq!(s.files.len(), 3);
+        // Sort order: largest first.
+        assert_eq!(s.files[0].size, 10);
+        assert_eq!(s.files[1].size, 5);
+        assert_eq!(s.files[2].size, 2);
+    }
+
+    #[test]
+    fn snapshot_walks_one_level_into_subdirs() {
+        let tmp = TempDir::new().unwrap();
+        write_file(&tmp.path().join("top.txt"), b"top");
+        write_file(&tmp.path().join("sub").join("nested.txt"), b"nested");
+        write_file(
+            &tmp.path().join("sub").join("deeper").join("deep.txt"),
+            b"too-deep",
+        );
+
+        let s = snapshot_watched_path(tmp.path());
+        let names: std::collections::HashSet<String> = s
+            .files
+            .iter()
+            .map(|f| f.path.file_name().unwrap().to_str().unwrap().to_string())
+            .collect();
+        assert!(names.contains("top.txt"));
+        assert!(names.contains("nested.txt"));
+        // Recursion stops at one level deep — `deep.txt` is two levels in.
+        assert!(!names.contains("deep.txt"), "should not recurse beyond one level");
+    }
+
+    #[test]
+    fn snapshot_excludes_openclaw_noise() {
+        let tmp = TempDir::new().unwrap();
+        // Real output file the operator cares about.
+        write_file(&tmp.path().join("output.md"), b"real content");
+        // Openclaw bookkeeping that changes every dispatch — should NOT
+        // appear in the operator-facing summary.
+        write_file(
+            &tmp.path().join("abc-123.trajectory.jsonl"),
+            b"{\"type\":\"event\"}",
+        );
+        write_file(&tmp.path().join("BOOTSTRAP.md"), b"workspace bootstrap");
+        write_file(&tmp.path().join("HEARTBEAT.md"), b"heartbeat");
+        write_file(&tmp.path().join("AGENTS.md"), b"agents list");
+
+        let s = snapshot_watched_path(tmp.path());
+        let names: Vec<String> = s
+            .files
+            .iter()
+            .map(|f| f.path.file_name().unwrap().to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, vec!["output.md".to_string()]);
+    }
+
+    #[test]
+    fn snapshot_skips_symlinked_subdirs() {
+        let tmp = TempDir::new().unwrap();
+        let real = TempDir::new().unwrap();
+        // Real outside content — a symlinked subdir to it should NOT walk.
+        write_file(&real.path().join("should-not-appear.txt"), b"shadow");
+        // Symlink from `tmp/repo` -> `real.path()`. Skips into it would be
+        // unbounded across the operator's actual source tree.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(real.path(), tmp.path().join("repo")).unwrap();
+        // A regular top-level file in tmp — should appear.
+        write_file(&tmp.path().join("plain.txt"), b"x");
+
+        let s = snapshot_watched_path(tmp.path());
+        let names: Vec<String> = s
+            .files
+            .iter()
+            .map(|f| f.path.file_name().unwrap().to_str().unwrap().to_string())
+            .collect();
+        assert!(names.contains(&"plain.txt".to_string()));
+        assert!(!names.contains(&"should-not-appear.txt".to_string()),
+            "must not descend into symlinked subdir; got {names:?}");
+    }
+
+    #[test]
+    fn is_openclaw_noise_classifies_known_files() {
+        // Workspace bootstrap markdowns
+        assert!(is_openclaw_noise(Path::new("/x/AGENTS.md")));
+        assert!(is_openclaw_noise(Path::new("/x/BOOTSTRAP.md")));
+        assert!(is_openclaw_noise(Path::new("/x/HEARTBEAT.md")));
+        assert!(is_openclaw_noise(Path::new("/x/USER.md")));
+        // Session bookkeeping
+        assert!(is_openclaw_noise(Path::new(
+            "/x/abc-123.trajectory.jsonl"
+        )));
+        assert!(is_openclaw_noise(Path::new("/x/sessions.json")));
+        // Real operator content stays
+        assert!(!is_openclaw_noise(Path::new("/x/output.md")));
+        assert!(!is_openclaw_noise(Path::new("/x/decisions.md")));
+        assert!(!is_openclaw_noise(Path::new("/x/deck-revised.pptx")));
+        assert!(!is_openclaw_noise(Path::new("/x/2026-05-14.jsonl"))); // flow records aren't noise
+    }
+
+    #[test]
+    fn default_workspace_for_role_uses_namespace_convention() {
+        let p = default_workspace_for_role("code-reviewer");
+        // Path ends with the expected segment regardless of $HOME's shape.
+        let s = p.to_string_lossy();
+        assert!(
+            s.ends_with(".openclaw/workspace-darkmux-code-reviewer"),
+            "unexpected workspace path: {s}",
+        );
     }
 
     #[test]

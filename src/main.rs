@@ -225,6 +225,16 @@ enum CrewCmd {
         /// Timeout in seconds (default: 600).
         #[arg(long, default_value = "600")]
         timeout: u32,
+        /// Path to snapshot for the post-dispatch state echo (#89 — SIGNOFF
+        /// verification visibility). Repeatable: pass `--watch` multiple
+        /// times to capture multiple directories. If omitted, defaults to
+        /// the role's openclaw workspace dir (~/.openclaw/workspace-darkmux-<role>/).
+        /// After the dispatch returns, the dispatcher walks each path
+        /// (top-level + one level deep) and emits a stderr summary of
+        /// regular files + sizes so the operator can compare the actual
+        /// state on disk against the SIGNOFF block's "files written" claims.
+        #[arg(long = "watch", value_name = "PATH")]
+        watch: Vec<std::path::PathBuf>,
         /// Skip the pre-flight checks. Use only for debugging.
         #[arg(long, hide = true)]
         skip_preflight: bool,
@@ -841,7 +851,15 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
     match sub {
         CrewCmd::List => crew::cli::crew_list(),
         CrewCmd::Show { id } => crew::cli::crew_show(&id),
-        CrewCmd::Dispatch { role, message, deliver, session_id, timeout, skip_preflight } => {
+        CrewCmd::Dispatch { role, message, deliver, session_id, timeout, watch, skip_preflight } => {
+            // CLI default: if the operator didn't supply --watch, watch the
+            // role's openclaw workspace dir. Library callers (e.g.
+            // sprint_cli) pass an empty Vec directly to opt out.
+            let watch_paths = if watch.is_empty() {
+                vec![crew::dispatch::default_workspace_for_role(&role)]
+            } else {
+                watch
+            };
             let opts = crew::dispatch::DispatchOpts {
                 role_id: role,
                 message,
@@ -849,6 +867,7 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
                 session_id,
                 timeout_seconds: timeout,
                 skip_preflight,
+                watch_paths,
             };
             let result = crew::dispatch::dispatch(opts)?;
             // Announce the resolved session id on stderr so operators see
@@ -861,6 +880,10 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
             if !result.stderr.is_empty() {
                 eprint!("{}", result.stderr);
             }
+            // Surface the post-dispatch filesystem state at watched paths
+            // (#89). Ground-truth signal next to the SIGNOFF block's
+            // "files written" claims; operator/orchestrator compares.
+            print_watched_state(&result.watched_state);
             Ok(result.exit_code)
         }
         CrewCmd::Index { sub } => match sub {
@@ -896,6 +919,36 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
             }
             Ok(0)
         }
+    }
+}
+
+/// Render the post-dispatch watched-state summary to stderr. The output's
+/// purpose is to give the operator/orchestrator a ground-truth view of
+/// the filesystem at the watched paths so they can compare against any
+/// "files written" claims in the SIGNOFF block (#89).
+fn print_watched_state(states: &[crew::dispatch::WatchedPathState]) {
+    if states.is_empty() {
+        return;
+    }
+    eprintln!("darkmux crew dispatch: post-dispatch state at watched paths:");
+    for s in states {
+        if s.unreachable {
+            eprintln!("  {} (unreachable — path does not exist)", s.root.display());
+            continue;
+        }
+        if s.files.is_empty() {
+            eprintln!("  {}: (no files)", s.root.display());
+            continue;
+        }
+        eprintln!("  {}:", s.root.display());
+        for f in &s.files {
+            let rel = f
+                .path
+                .strip_prefix(&s.root)
+                .unwrap_or(&f.path);
+            eprintln!("    {:>10}  {}", f.size, rel.display());
+        }
+        eprintln!("    ({} file{})", s.files.len(), if s.files.len() == 1 { "" } else { "s" });
     }
 }
 
