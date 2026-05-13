@@ -38,11 +38,16 @@
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; }
+  /* Lock the document to viewport height so all scrolling happens inside
+   * named panes (filters / stepper / list) rather than scrolling the
+   * outer page and hiding the header. Critical once the right column is
+   * a flex column with the list as the scrolling tail — without this,
+   * the list's content would push body past 100vh. */
+  html, body { height: 100%; overflow: hidden; }
   body {
     background: var(--bg);
     color: var(--text);
     font: 14px/1.5 'Inter', system-ui, -apple-system, sans-serif;
-    min-height: 100vh;
     display: flex;
     flex-direction: column;
   }
@@ -118,6 +123,12 @@
     display: grid;
     grid-template-columns: 240px 1fr;
     overflow: hidden;
+    /* `min-height: 0` is the canonical escape from CSS flex's default
+     * `min-height: auto` (which sizes the item to its content). Without
+     * it, `main` would grow to its content's height and push the
+     * document past the viewport — see the same chain repeated on
+     * `.right-pane` and `.list`. */
+    min-height: 0;
   }
   aside.filters {
     padding: 16px;
@@ -151,6 +162,10 @@
     flex-direction: column;
     overflow: hidden;
     min-width: 0;
+    /* Same `min-height: 0` reasoning as on `main` — without it, the
+     * grid cell would let `.right-pane` grow to fit its content
+     * (stepper + full list), defeating the flex split below. */
+    min-height: 0;
   }
 
   /* ─── stepper view ──────────────────────────────────────────────── */
@@ -687,12 +702,15 @@ function render() {
   }
 
   const r = state.filtered[state.index];
-  // Controls render twice (top + bottom of the record) so the operator
-  // doesn't have to scroll to either edge after reading a long handle.
-  // Class selectors (not ids) — duplicate ids would be invalid HTML and
-  // `getElementById` only returns the first, which silently un-wires the
-  // bottom row's clicks. Both rows are now handled by the delegated
-  // listener attached once to `stepperEl` (see `wireStepperControls`).
+  // Controls render once *below* the record card. The pre-#85 layout had
+  // a duplicate row above too — necessary then because the record card
+  // was the only navigation surface, so the operator wanted nav near both
+  // edges of a long handle. With the list pane (#85) sitting directly
+  // below the card, the bottom-only row is sufficient: it sits between
+  // the card and the list as a natural separator, and any record is one
+  // row-click away from the list anyhow. Class selectors (not ids) keep
+  // the delegated `wireStepperControls` listener as the single click
+  // handler — same pattern as #84.
   const controls = `
     <div class="stepper-controls">
       <div>
@@ -707,7 +725,7 @@ function render() {
     </div>
   `;
 
-  stepperEl.innerHTML = controls + renderRecord(r) + controls;
+  stepperEl.innerHTML = renderRecord(r) + controls;
 
   // Keep the bird's-eye pane (#85) synced with the stepper. renderList honors
   // the scrollLock state — bottom-snap when locked, scroll preserved when
