@@ -441,6 +441,277 @@ pub fn estimate(spec_path: &Path, narrate: bool) -> Result<i32> {
     Ok(0)
 }
 
+/// Structured output for `sprint review` (stdout JSON).
+#[derive(Debug, Clone, Serialize)]
+pub struct SprintReviewOutput {
+    pub branch: String,
+    pub base: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reviewer_session_id: Option<String>,
+    pub diff_files_changed: usize,
+    pub total_findings: usize,
+    #[serde(rename = "by_severity")]
+    pub by_severity: SeverityCounts,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub findings: Vec<ReviewFinding>,
+    /// `clean` | `flags-only` | `blockers`
+    pub verdict: String,
+}
+
+/// Breakdown of findings by severity level.
+#[derive(Debug, Clone, Serialize)]
+pub struct SeverityCounts {
+    pub block: usize,
+    pub flag: usize,
+    pub nit: usize,
+}
+
+/// A single review finding: severity + freeform message.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReviewFinding {
+    pub severity: String,
+    pub text: String,
+}
+
+/// Parsed result from a QA-REVIEW-SIGNOFF block (internal, not serialized).
+/// Fields are module-private — `parse_signoff` returns the value; callers
+/// within `sprint_cli` read the fields directly. External `pub` was excessive.
+pub(crate) struct SignoffParse {
+    block: usize,
+    flag: usize,
+    nit: usize,
+    verdict: String,
+    findings: Vec<ReviewFinding>,
+}
+
+/// Unwrap the openclaw JSON envelope from `crew::dispatch` stdout to the
+/// inner assistant text. The envelope shape is
+/// `{"payloads": [{"text": "..."}], ...}`; we concatenate every payload's
+/// `text` field with newlines. Falls back to the raw input when it doesn't
+/// parse as JSON (so unit tests passing literal SIGNOFF strings work).
+pub fn unwrap_envelope_text(raw: &str) -> String {
+    let Ok(parsed) = serde_json::from_str::<Value>(raw) else {
+        return raw.to_string();
+    };
+    let Some(arr) = parsed.get("payloads").and_then(|p| p.as_array()) else {
+        return raw.to_string();
+    };
+    let parts: Vec<&str> = arr
+        .iter()
+        .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+        .collect();
+    if parts.is_empty() {
+        raw.to_string()
+    } else {
+        parts.join("\n")
+    }
+}
+
+/// Parse a QA-REVIEW-SIGNOFF block from already-unwrapped reviewer text.
+///
+/// Extracts findings from lines matching `- [SEVERITY] file:line — message`
+/// and returns BOTH the structured findings AND severity counts in one pass
+/// (single source of truth — earlier versions had two parsers that diverged
+/// on slice offsets). Handles malformed lines gracefully (skips them).
+pub fn parse_signoff(input: &str) -> SignoffParse {
+    let mut findings: Vec<ReviewFinding> = Vec::new();
+
+    for line in input.lines() {
+        let line = line.trim();
+        if !line.starts_with("- [") { continue; }
+
+        let Some(severity_end) = line.find(']') else { continue; };
+
+        // line is "- [SEVERITY] rest"; severity is line[3..severity_end]
+        let severity = &line[3..severity_end];
+        if !matches!(severity, "BLOCK" | "FLAG" | "NIT") {
+            continue;
+        }
+
+        let rest = line[severity_end + 1..].trim_start();
+        let finding_text = if let Some(pos) = rest.find(" — ") {
+            // " — " is 3 bytes (the em-dash is U+2014 = 3 UTF-8 bytes), plus
+            // the leading + trailing spaces = 5 bytes total. find() returns
+            // the byte index of the first space, so rest[pos+5..] is the
+            // start of the message.
+            let file_line = rest[..pos].trim();
+            let message = rest[pos + 5..].trim();
+            format!("{file_line} — {message}")
+        } else {
+            rest.trim().to_string()
+        };
+
+        findings.push(ReviewFinding { severity: severity.to_string(), text: finding_text });
+    }
+
+    let mut block = 0usize;
+    let mut flag = 0usize;
+    let mut nit = 0usize;
+    for f in &findings {
+        match f.severity.as_str() {
+            "BLOCK" => block += 1,
+            "FLAG" => flag += 1,
+            "NIT" => nit += 1,
+            _ => {}
+        }
+    }
+
+    let verdict = if block > 0 {
+        "blockers"
+    } else if flag > 0 || nit > 0 {
+        "flags-only"
+    } else if input.contains("No findings. PR is mergeable.") {
+        "clean"
+    } else {
+        // No findings, no explicit clean marker — reviewer may have failed
+        // to engage with the format. Surface as indeterminate so operator
+        // knows to inspect manually.
+        "indeterminate"
+    }.to_string();
+
+    SignoffParse { block, flag, nit, verdict, findings }
+}
+
+/// Count files changed between `base` and the working tree via `git diff
+/// --name-only <base>`. Returns 0 on any error (treated as "no files
+/// changed" — the empty-diff path short-circuits before this is called
+/// in practice, so the 0 fallback is only hit if `git` itself is missing).
+fn count_files_changed(path: &Path, base: &str) -> usize {
+    Command::new("git")
+        .args(["diff", "--name-only", base])
+        .current_dir(path)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().filter(|l| !l.is_empty()).count())
+        .unwrap_or(0)
+}
+
+/// Internal entry for `sprint review` taking an explicit repo path.
+pub(crate) fn sprint_review_at(path: &Path, base: Option<&str>, require_clean: bool) -> Result<i32> {
+    // Capture branch name.
+    let branch = Command::new("git")
+        .args(["branch", "--show-current"])
+        .current_dir(path)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok().map(|s| s.trim().to_string()))
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let session_id = format!("sprint-review-{}", std::time::UNIX_EPOCH.elapsed().unwrap_or_default().as_secs());
+
+    // Run `git diff <base>` (working-tree-inclusive). NOT `<base>..HEAD` —
+    // that would only see committed changes, missing the pre-PR review case
+    // (the whole point of `sprint review` is to review work before it ships,
+    // which is by definition uncommitted at the moment of review).
+    let base_ref = base.unwrap_or("main");
+    let diff_output = Command::new("git")
+        .args(["diff", base_ref])
+        .current_dir(path)
+        .output()
+        .context("running git diff")?;
+
+    let diff = String::from_utf8_lossy(&diff_output.stdout).to_string();
+
+    // Empty diff → no dispatch needed.
+    if diff.trim().is_empty() {
+        let output = SprintReviewOutput {
+            branch: branch.clone(),
+            base: base_ref.to_string(),
+            reviewer_session_id: Some(session_id.clone()),
+            diff_files_changed: 0,
+            total_findings: 0,
+            by_severity: SeverityCounts { block: 0, flag: 0, nit: 0 },
+            findings: vec![],
+            verdict: "clean".to_string(),
+        };
+        println!("{}", serde_json::to_string_pretty(&output)?);
+        return Ok(0);
+    }
+
+    // Count changed files from diff stat.
+    let files_changed = count_files_changed(path, base_ref);
+
+    // Build reviewer prompt. `MAX_CHARS` is a byte budget (line.len() returns
+    // bytes); for typical Rust + JSON diffs this is effectively chars, but
+    // a diff containing many multi-byte UTF-8 chars could under-count by up
+    // to ~4× and exceed the documented limit. Acceptable for this verb's use
+    // case; tighten if non-ASCII becomes common in reviewed diffs.
+    const MAX_CHARS: usize = 80_000;
+    let truncated_diff = if diff.len() > MAX_CHARS {
+        let mut end_pos = 0;
+        let mut char_count = 0;
+        for line in diff.lines() {
+            let next = end_pos + line.len() + 1;
+            if char_count + line.len() > MAX_CHARS {
+                break;
+            }
+            end_pos = next;
+            char_count += line.len() + 1; // \n
+        }
+        let remaining_lines = diff[end_pos..].lines().count();
+        format!("{}\n... [diff truncated, {} lines omitted]", &diff[..end_pos], remaining_lines)
+    } else {
+        diff
+    };
+
+    let prompt = format!(
+        "You are the darkmux `code-reviewer` role. Your job: read this PR's diff and emit a structured QA-REVIEW-SIGNOFF block.\n\n## The diff\n\nBranch `{branch}` vs base `{base_ref}`:\n\n```\n{truncated_diff}\n```\n\n## Reporting format (strict)\n\nEmit findings as:\n\nQA-REVIEW-SIGNOFF\n- [SEVERITY] <file>:<line> — <one-sentence finding>\n- ...\n\nSummary: <N blockers, M flags, K nits>\n\nSeverity levels:\n- BLOCK: must fix before merge (security, correctness, broken tests)\n- FLAG: should address but mergeable with operator awareness\n- NIT: style / consistency / minor\n\nIf you find no issues at all, say so explicitly: `No findings. PR is mergeable.`\n\nBe specific. \"logic error\" without a line is useless. \"src/foo.rs:192 — sum is missing `tool_schemas`\" is a real finding.",
+    );
+
+    let dispatch_opts = crate::crew::dispatch::DispatchOpts {
+        role_id: "code-reviewer".to_string(),
+        message: prompt,
+        deliver: None,
+        session_id: Some(session_id.clone()),
+        timeout_seconds: 600,
+        skip_preflight: false,
+    };
+
+    let dispatch_result = crate::crew::dispatch::dispatch(dispatch_opts)
+        .map_err(|e| {
+            eprintln!("warning: crew dispatch failed ({e}); emitting empty review");
+            anyhow::anyhow!("crew dispatch failed: {e}")
+        })?;
+
+    // Unwrap the openclaw JSON envelope FIRST — the SIGNOFF text lives inside
+    // .payloads[].text, escaped. Without unwrapping, parse_signoff sees JSON
+    // keys instead of the actual newline-separated SIGNOFF lines and finds
+    // zero matches. Recursive bug from sprint A's own dogfood. See
+    // unwrap_envelope_text.
+    let unwrapped = unwrap_envelope_text(&dispatch_result.stdout);
+    let signoff = parse_signoff(&unwrapped);
+
+    let output = SprintReviewOutput {
+        branch,
+        base: base_ref.to_string(),
+        reviewer_session_id: Some(session_id),
+        diff_files_changed: files_changed,
+        total_findings: signoff.block + signoff.flag + signoff.nit,
+        by_severity: SeverityCounts {
+            block: signoff.block,
+            flag: signoff.flag,
+            nit: signoff.nit,
+        },
+        findings: signoff.findings.clone(),
+        verdict: signoff.verdict.clone(),
+    };
+
+    println!("{}", serde_json::to_string_pretty(&output)?);
+
+    Ok(if require_clean && signoff.block > 0 { 1 } else { 0 })
+}
+
+/// Public entry for `sprint review` — delegates to `sprint_review_at`.
+pub fn sprint_review(
+    base: Option<&str>,
+    require_clean: bool,
+) -> Result<i32> {
+    let path = std::env::current_dir()?;
+    sprint_review_at(&path, base, require_clean)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -780,5 +1051,80 @@ mod tests {
         );
         // Deterministic recommendation still computed correctly.
         assert_eq!(output.recommendation.target_profile, "deep");
+    }
+
+    // ── sprint review tests ─────────────────────────────────────────────
+
+    fn sample_signoff() -> String {
+        "QA-REVIEW-SIGNOFF\n\
+            - [BLOCK] src/main.rs:42 — null pointer dereference on unwrap()\n\
+            - [FLAG] src/utils.rs:17 — unused variable `temp_buf`\n\
+            - [NIT] src/config.rs:8 — inconsistent spacing after `fn`\n\
+            Summary: 1 blockers, 1 flags, 1 nits".to_string()
+    }
+
+    #[test]
+    fn parse_signoff_extracts_findings() {
+        let input = sample_signoff();
+        let result = parse_signoff(&input);
+
+        assert_eq!(result.block, 1);
+        assert_eq!(result.flag, 1);
+        assert_eq!(result.nit, 1);
+    }
+
+    #[test]
+    fn parse_signoff_handles_clean_no_findings() {
+        let input = "QA-REVIEW-SIGNOFF\nNo findings. PR is mergeable.\nSummary: 0 blockers, 0 flags, 0 nits";
+        let result = parse_signoff(input);
+
+        assert_eq!(result.block, 0);
+        assert_eq!(result.flag, 0);
+        assert_eq!(result.nit, 0);
+        assert_eq!(result.verdict, "clean");
+    }
+
+    #[test]
+    fn parse_signoff_handles_malformed_gracefully() {
+        // Lines without brackets → skipped.
+        let input = "QA-REVIEW-SIGNOFF\nSome random finding line\n- [flag] src/foo.rs:1 — lowercase severity\n- [BLOCK] src/bar.rs:2 — valid finding\nSummary: 1 blockers";
+        let result = parse_signoff(input);
+
+        // Only the BLOCK line should be parsed (lowercase flag is skipped).
+        assert_eq!(result.block, 1);
+        assert_eq!(result.flag, 0);
+        assert_eq!(result.nit, 0);
+    }
+
+    #[test]
+    fn parse_signoff_handles_weird_lines_gracefully() {
+        // Lines with unrecognized severity → skipped.
+        let input = "QA-REVIEW-SIGNOFF\n- [ERROR] src/x.rs:1 — weird severity\n- [NIT] src/y.rs:2 — valid nit\nSummary: 1 nits";
+        let result = parse_signoff(input);
+
+        assert_eq!(result.block, 0);
+        assert_eq!(result.flag, 0);
+        assert_eq!(result.nit, 1);
+    }
+
+    #[test]
+    fn verdict_mapping_returns_clean() {
+        let input = "QA-REVIEW-SIGNOFF\nNo findings. PR is mergeable.";
+        let result = parse_signoff(input);
+        assert_eq!(result.verdict, "clean");
+    }
+
+    #[test]
+    fn verdict_mapping_returns_flags_only() {
+        let input = "QA-REVIEW-SIGNOFF\n- [FLAG] src/foo.rs:10 — unused variable";
+        let result = parse_signoff(input);
+        assert_eq!(result.verdict, "flags-only");
+    }
+
+    #[test]
+    fn verdict_mapping_returns_blockers() {
+        let input = "QA-REVIEW-SIGNOFF\n- [BLOCK] src/main.rs:5 — null pointer";
+        let result = parse_signoff(input);
+        assert_eq!(result.verdict, "blockers");
     }
 }

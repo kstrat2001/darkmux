@@ -253,6 +253,17 @@ enum SprintCmd {
         #[arg(long)]
         narrate: bool,
     },
+    /// Run a code review on the current branch vs base.  Auto-detects
+    /// target, computes `git diff`, dispatches the `code-reviewer` role,
+    /// parses the QA-REVIEW-SIGNOFF block, and emits structured JSON.
+    Review {
+        /// Base branch to diff against. Defaults to `main`.
+        #[arg(long)]
+        base: Option<String>,
+        /// Exit nonzero if any BLOCK-severity findings.
+        #[arg(long)]
+        require_clean: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -705,6 +716,9 @@ fn cmd_role(sub: RoleCmd) -> Result<i32> {
 fn cmd_sprint(sub: SprintCmd) -> Result<i32> {
     match sub {
         SprintCmd::Estimate { spec, narrate } => sprint_cli::estimate(&spec, narrate),
+        SprintCmd::Review { base, require_clean } => {
+            sprint_cli::sprint_review(base.as_deref(), require_clean)
+        }
     }
 }
 
