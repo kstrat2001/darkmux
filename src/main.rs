@@ -79,10 +79,11 @@ enum Cmd {
     /// registry, LMStudio, models, runtime, RAM, power) and reports
     /// pass/warn/fail with actionable hints. Exit 0 if no failures, else 1.
     Doctor {
-        /// Attempt to auto-apply known-safe fixes for failing checks
-        /// (currently: `eureka: ctx-window-mismatch` realigns openclaw.json
-        /// `contextWindow` values to match what `lms ps` reports). After the
-        /// fixes run, doctor re-evaluates and prints the updated report.
+        /// Attempt to auto-apply known-safe fixes for failing or warning
+        /// checks where a handler is registered (currently:
+        /// `eureka: ctx-window-mismatch` realigns openclaw.json
+        /// `contextWindow` values to match what `lms ps` reports). After
+        /// the fixes run, doctor re-evaluates and prints the updated report.
         #[arg(long)]
         fix: bool,
     },
@@ -572,37 +573,34 @@ fn cmd_doctor(fix: bool) -> Result<i32> {
     let report = doctor::run();
     doctor::print_report(&report)?;
 
-    if !fix {
-        return Ok(match report.worst_status() {
-            doctor::Status::Fail => 1,
-            _ => 0,
-        });
-    }
-
-    // --fix path: attempt known-safe auto-fixes for failing rules, then
-    // re-run the full check set so the operator sees the post-fix state.
-    let outcomes = doctor::try_fix(&report)?;
-    if outcomes.is_empty() {
-        println!();
-        println!("--fix: no auto-fix available for any failing check.");
-    } else {
-        println!();
-        println!("--fix: applied {} auto-fix(es):", outcomes.len());
-        for o in &outcomes {
-            let marker = if o.applied { "✓" } else { "·" };
-            println!("  {marker} {} — {}", o.rule_id, o.message);
+    // --fix path: attempt known-safe auto-fixes for failing/warning rules,
+    // then re-run the full check set so the operator sees the post-fix
+    // state. Without --fix, doctor is read-only — exits based on `report`.
+    let final_report = if fix {
+        let outcomes = doctor::try_fix(&report)?;
+        if outcomes.is_empty() {
+            println!();
+            println!("--fix: no auto-fix available for any failing or warning check.");
+            report
+        } else {
+            println!();
+            println!("--fix: applied {} auto-fix(es):", outcomes.len());
+            for o in &outcomes {
+                let marker = if o.applied { "✓" } else { "·" };
+                println!("  {marker} {} — {}", o.rule_id, o.message);
+            }
+            println!();
+            println!("Re-running doctor…");
+            println!();
+            let report2 = doctor::run();
+            doctor::print_report(&report2)?;
+            report2
         }
-        println!();
-        println!("Re-running doctor…");
-        println!();
-        let report2 = doctor::run();
-        doctor::print_report(&report2)?;
-        return Ok(match report2.worst_status() {
-            doctor::Status::Fail => 1,
-            _ => 0,
-        });
-    }
-    Ok(match report.worst_status() {
+    } else {
+        report
+    };
+
+    Ok(match final_report.worst_status() {
         doctor::Status::Fail => 1,
         _ => 0,
     })

@@ -780,12 +780,17 @@ pub fn try_fix(report: &DoctorReport) -> Result<Vec<FixOutcome>> {
         if !matches!(check.status, Status::Fail | Status::Warn) {
             continue;
         }
-        if check.name == "eureka: ctx-window-mismatch" {
-            outcomes.push(fix_ctx_window_mismatch()?);
+        // Eureka check names follow the convention `eureka: <rule-id>` —
+        // strip the prefix and dispatch by rule-id constant from the rules
+        // engine so a typo or rename can't silently break the handler.
+        if let Some(rule_id) = check.name.strip_prefix("eureka: ") {
+            if rule_id == eureka::RULE_ID_CTX_WINDOW_MISMATCH {
+                outcomes.push(fix_ctx_window_mismatch()?);
+            }
+            // Future fix handlers slot in here; keep additions narrow and
+            // documented in the issue tracker so operators can audit what
+            // `--fix` will and won't touch.
         }
-        // Future fix handlers slot in here; keep additions narrow and
-        // documented in the issue tracker so operators can audit what
-        // `--fix` will and won't touch.
     }
     Ok(outcomes)
 }
@@ -824,7 +829,7 @@ fn fix_ctx_window_mismatch() -> Result<FixOutcome> {
     } else {
         let summary = changes
             .iter()
-            .map(|(id, from, to)| format!("{id}: {from} → {to}"))
+            .map(|c| format!("{}: {} → {}", c.model_id, c.from, c.to))
             .collect::<Vec<_>>()
             .join("; ");
         Ok(FixOutcome {

@@ -254,16 +254,32 @@ fn ensure_namespaced_entries(config: &mut Value, models: &[ProfileModel]) -> boo
     modified
 }
 
+/// One openclaw.json `contextWindow` entry that was rewritten by
+/// `fix_ctx_window_to_loaded` to match the loaded ctx. Surfaced so
+/// callers (typically `doctor --fix`) can render *what* changed, not
+/// just *how many*.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CtxWindowChange {
+    /// `id` field of the openclaw.json model entry that was rewritten.
+    /// May be a bare id (`openai/gpt-oss-20b`) or namespaced
+    /// (`darkmux:openai/gpt-oss-20b`).
+    pub model_id: String,
+    /// Old `contextWindow` value in the openclaw entry before the fix.
+    pub from: u64,
+    /// New value — matches what `lms ps` reports loaded for this model.
+    pub to: u64,
+}
+
 /// Realign `models.providers.*.models[].contextWindow` to what `lms ps`
 /// actually has loaded right now. Used by `doctor --fix` to close the
 /// ctx-window-mismatch loop without needing an active profile.
 ///
-/// Returns the list of (model_id, old_ctx, new_ctx) tuples for entries
-/// that were rewritten, so the caller can surface what changed.
+/// Returns the list of rewritten entries — empty when openclaw.json
+/// already matches loaded state (the idempotent case).
 pub fn fix_ctx_window_to_loaded(
     config_path: &Path,
     loaded: &[crate::types::LoadedModel],
-) -> Result<Vec<(String, u64, u64)>> {
+) -> Result<Vec<CtxWindowChange>> {
     if !config_path.exists() {
         bail!(
             "darkmux: openclaw config does not exist: {}",
@@ -288,7 +304,7 @@ pub fn fix_ctx_window_to_loaded(
         }
     }
 
-    let mut changes: Vec<(String, u64, u64)> = Vec::new();
+    let mut changes: Vec<CtxWindowChange> = Vec::new();
     if let Some(providers) = config
         .get_mut("models")
         .and_then(|m| m.get_mut("providers"))
@@ -315,7 +331,11 @@ pub fn fix_ctx_window_to_loaded(
                         "contextWindow".to_string(),
                         Value::Number(target.into()),
                     );
-                    changes.push((id, cur, target));
+                    changes.push(CtxWindowChange {
+                        model_id: id,
+                        from: cur,
+                        to: target,
+                    });
                 }
             }
         }
@@ -1170,7 +1190,28 @@ mod tests {
         let loaded = vec![loaded_model("darkmux:openai/gpt-oss-20b", 100000)];
         let changes = fix_ctx_window_to_loaded(&p, &loaded).unwrap();
 
+        // Assert exactly which two entries got rewritten — both shapes of
+        // the loaded id, with the right old→new transition. Order isn't
+        // guaranteed by the iteration, so collect by id before checking.
         assert_eq!(changes.len(), 2, "both bare and namespaced should be patched");
+        let by_change_id: std::collections::HashMap<&str, &CtxWindowChange> =
+            changes.iter().map(|c| (c.model_id.as_str(), c)).collect();
+        let bare = by_change_id
+            .get("openai/gpt-oss-20b")
+            .expect("bare-id change missing");
+        assert_eq!(bare.from, 32768);
+        assert_eq!(bare.to, 100000);
+        let ns = by_change_id
+            .get("darkmux:openai/gpt-oss-20b")
+            .expect("namespaced change missing");
+        assert_eq!(ns.from, 32768);
+        assert_eq!(ns.to, 100000);
+        assert!(
+            !by_change_id.contains_key("unrelated/model"),
+            "unrelated entry should not appear in changes"
+        );
+
+        // And the on-disk state agrees.
         let after: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
         let arr = after["models"]["providers"]["lmstudio"]["models"]
