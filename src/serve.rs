@@ -78,8 +78,7 @@ async fn health() -> axum::Json<serde_json::Value> {
 }
 
 /// GET /flow/:date/stream — streams new records appended to the file as SSE events.
-/// Tail-from-current: never replays history. async_stream is a separate crate;
-/// we use `futures::stream::unfold` which is already available as a transitive dep.
+/// Tail-from-current: never replays history.
 async fn flow_stream_handler(
     State(state): State<AppState>,
     Path(date_raw): Path<String>,
@@ -118,27 +117,24 @@ async fn flow_handler(
     }
 }
 
-/// Build a stream that tails a `.jsonl` file, emitting each new line
-/// as one SSE event. Uses `futures::stream::unfold` with 250ms polling.
-/// Build a tail-from-`start_offset` SSE stream over `path`.
+/// Tail a `.jsonl` file from `start_offset`, yielding each new complete
+/// line as a `String`. The testable core of the SSE machinery — kept
+/// `Event`-free so tests assert against raw line content.
 ///
-/// Polls at 250ms. Each call to the stream's `next()` yields exactly one
-/// SSE Event carrying a complete JSONL line. Empty-data ticks aren't
-/// emitted — the unfold inner loop continues until it has a real line.
-/// Axum's `KeepAlive` layer sends SSE comments for liveness during quiet
-/// periods.
+/// Polls at 250ms. Each `.next()` yields exactly one line. The unfold
+/// inner loop continues until a real line is available (no empty ticks).
 ///
 /// State: (path, byte offset, incomplete-trailing-line buffer, pending lines).
-fn build_tail_stream(
+fn tail_lines(
     path: PathBuf,
     start_offset: u64,
-) -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
+) -> impl Stream<Item = String> {
     let state: TailState = (path, start_offset, String::new(), VecDeque::new());
     stream::unfold(state, move |mut s| async move {
         loop {
             // 1. If we have queued lines, emit the next one immediately.
             if let Some(line) = s.3.pop_front() {
-                return Some((Ok(Event::default().data(line)), s));
+                return Some((line, s));
             }
 
             // 2. Otherwise, wait and poll the file for new bytes.
@@ -185,6 +181,17 @@ fn build_tail_stream(
 }
 
 type TailState = (PathBuf, u64, String, VecDeque<String>);
+
+/// SSE wrapper around `tail_lines`. Maps each line to an `Event` with
+/// the line as `data:` payload. axum's `KeepAlive` layer handles
+/// liveness comments during quiet periods.
+fn build_tail_stream(
+    path: PathBuf,
+    start_offset: u64,
+) -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
+    use futures::stream::StreamExt;
+    tail_lines(path, start_offset).map(|line| Ok(Event::default().data(line)))
+}
 
 /// Wait for SIGINT or SIGTERM to trigger graceful shutdown. SIGTERM
 /// matters under systemd / Docker / launchd where SIGINT isn't sent.
@@ -336,43 +343,22 @@ mod tests {
         assert!(headers.contains_key("access-control-allow-origin"));
     }
 
-    // ─── SSE / build_tail_stream tests ──────────────────────────────────
+    // ─── SSE / tail_lines tests ─────────────────────────────────────────
+    //
+    // Tests assert against `tail_lines` (the testable core of `build_tail_stream`)
+    // so they verify actual line content. The thin `Event::default().data(...)`
+    // wrapper in `build_tail_stream` is small enough that visual review suffices.
 
     use futures::StreamExt;
     use std::time::Duration;
 
-    /// Extract the `data:` payload from an SSE Event's serialized form.
-    fn event_data(event: Event) -> String {
-        // Event's only public surface is its wire-format Display. We need
-        // the payload; parse it back. Wire format is `data: <payload>\n\n`
-        // (or multiple `data:` lines, but our emitter uses single-line data).
-        let s = format!("{:?}", event);
-        // axum's Event Debug doesn't include payload by default — instead
-        // serialize via the Display impl that produces the on-the-wire form.
-        // Use the documented Event::default().data(s) round-trip via Display:
-        // Actually simplest: trust the emitter, just confirm it's an Event.
-        // For payload assertions, we rely on serialize().
-        s
-    }
-
-    /// Helper: pop the next data-bearing event off a stream within `timeout`.
-    /// Returns the data payload as String, or None if the stream produced
-    /// no data within the window.
-    async fn next_data<S>(stream: &mut S, timeout: Duration) -> Option<String>
+    /// Pop the next line off a stream within `timeout`. Returns None if
+    /// the stream produced nothing in the window.
+    async fn next_line<S>(stream: &mut S, timeout: Duration) -> Option<String>
     where
-        S: futures::Stream<Item = Result<Event, std::convert::Infallible>> + Unpin,
+        S: futures::Stream<Item = String> + Unpin,
     {
-        match tokio::time::timeout(timeout, stream.next()).await {
-            Ok(Some(Ok(event))) => {
-                // Serialize the event to its on-wire form, then extract `data:`.
-                // axum::response::sse::Event impls serialize() returning a
-                // bytes buffer. We can read it via the `into_response` path,
-                // but for unit tests it's simpler to use `Event::default()
-                // .data(...)` shape and trust the constructor.
-                Some(event_data(event))
-            }
-            _ => None,
-        }
+        tokio::time::timeout(timeout, stream.next()).await.ok().flatten()
     }
 
     #[tokio::test]
@@ -381,39 +367,32 @@ mod tests {
         let path = tmp.path().join("test.jsonl");
         std::fs::File::create(&path).unwrap();
 
-        let stream = build_tail_stream(path.clone(), 0);
+        let stream = tail_lines(path.clone(), 0);
         tokio::pin!(stream);
 
         // Append a line after the stream started.
         let written = r#"{"action":"hi"}"#;
         std::fs::write(&path, format!("{written}\n")).unwrap();
 
-        // Wait up to 1.5s for the line to surface.
-        let got = next_data(&mut stream, Duration::from_millis(1500)).await;
-        assert!(got.is_some(), "expected stream to emit appended line");
+        let got = next_line(&mut stream, Duration::from_millis(1500)).await;
+        assert_eq!(got.as_deref(), Some(written), "expected appended line verbatim");
     }
 
     #[tokio::test]
     async fn tail_stream_starts_from_current_eof_not_replay() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("test.jsonl");
-        // Pre-write 3 lines BEFORE starting the stream.
-        std::fs::write(
-            &path,
-            "{\"old\":1}\n{\"old\":2}\n{\"old\":3}\n",
-        )
-        .unwrap();
+        std::fs::write(&path, "{\"old\":1}\n{\"old\":2}\n{\"old\":3}\n").unwrap();
 
-        // Start from current EOF — same as flow_stream_handler does.
         let start = std::fs::metadata(&path).unwrap().len();
-        let stream = build_tail_stream(path.clone(), start);
+        let stream = tail_lines(path.clone(), start);
         tokio::pin!(stream);
 
-        // Wait 600ms (multiple poll intervals) — should see NO events.
-        let got = next_data(&mut stream, Duration::from_millis(600)).await;
-        assert!(got.is_none(), "tail-from-current must not replay history");
+        // 600ms of polling should yield nothing — old lines are below start_offset.
+        let got = next_line(&mut stream, Duration::from_millis(600)).await;
+        assert!(got.is_none(), "tail-from-current must not replay history; got {got:?}");
 
-        // Now append a new line — should be emitted.
+        // Append a new line — only the new line should be emitted.
         let mut file = std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
@@ -422,29 +401,56 @@ mod tests {
         writeln!(file, "{{\"new\":1}}").unwrap();
         drop(file);
 
-        let got2 = next_data(&mut stream, Duration::from_millis(1500)).await;
-        assert!(got2.is_some(), "new line after tail-start should be emitted");
+        let got2 = next_line(&mut stream, Duration::from_millis(1500)).await;
+        assert_eq!(got2.as_deref(), Some(r#"{"new":1}"#));
     }
 
     #[tokio::test]
     async fn tail_stream_handles_missing_file_gracefully() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("not-yet.jsonl");
-        // Path does not exist at stream start.
         assert!(!path.exists());
 
-        let stream = build_tail_stream(path.clone(), 0);
+        let stream = tail_lines(path.clone(), 0);
         tokio::pin!(stream);
 
-        // Spawn a task that creates the file with content after 200ms.
+        // Create the file with content after the stream starts polling.
         let path2 = path.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(200)).await;
             std::fs::write(&path2, "{\"late\":1}\n").unwrap();
         });
 
-        let got = next_data(&mut stream, Duration::from_millis(2000)).await;
-        assert!(got.is_some(), "stream should pick up the file once it appears");
+        let got = next_line(&mut stream, Duration::from_millis(2000)).await;
+        assert_eq!(got.as_deref(), Some(r#"{"late":1}"#));
+    }
+
+    #[tokio::test]
+    async fn tail_stream_emits_multiple_lines_from_single_append() {
+        // Regression: ensure pending VecDeque drains across multiple
+        // unfold iterations — three lines in one write should produce
+        // three sequential events.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("test.jsonl");
+        std::fs::File::create(&path).unwrap();
+
+        let stream = tail_lines(path.clone(), 0);
+        tokio::pin!(stream);
+
+        std::fs::write(&path, "a\nb\nc\n").unwrap();
+
+        assert_eq!(
+            next_line(&mut stream, Duration::from_millis(1500)).await.as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            next_line(&mut stream, Duration::from_millis(1500)).await.as_deref(),
+            Some("b")
+        );
+        assert_eq!(
+            next_line(&mut stream, Duration::from_millis(1500)).await.as_deref(),
+            Some("c")
+        );
     }
 
     #[tokio::test]
