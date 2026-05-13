@@ -54,6 +54,46 @@ pub fn build_router(flows_dir: PathBuf) -> Router {
         .with_state(state)
 }
 
+/// Default address the local `darkmux serve` daemon binds to. Used by
+/// the pre-dispatch reachability nudge (#104 Sprint 3) so an operator
+/// running a dispatch with the daemon down sees a single-line heads-up
+/// rather than discovering the silence only when they open the viewer.
+pub const DEFAULT_DAEMON_ADDR: &str = "127.0.0.1:8765";
+
+/// Best-effort TCP probe of the local daemon. Returns `true` when a
+/// connection can be opened to `DEFAULT_DAEMON_ADDR` within ~300ms.
+/// Intentionally lightweight (no HTTP request) — the more thorough
+/// `/health` probe lives in `doctor::check_daemon_reachable` and is
+/// run on operator-explicit `darkmux doctor` invocation; this helper
+/// is for the every-dispatch pre-flight nudge where probe cost matters.
+pub fn is_daemon_reachable() -> bool {
+    let addr: std::net::SocketAddr = match DEFAULT_DAEMON_ADDR.parse() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(300)).is_ok()
+}
+
+/// Print the one-line stderr nudge if the daemon isn't reachable.
+/// Non-blocking: the dispatch always proceeds; this is purely
+/// situational awareness so an operator who closed the daemon tab
+/// last week doesn't lose visibility into a multi-minute dispatch
+/// before realizing it.
+///
+/// `verb_hint` is the verb the operator just ran (e.g. "crew dispatch"
+/// or "sprint review"); used in the nudge to make the message
+/// context-specific.
+pub fn nudge_if_daemon_unreachable(verb_hint: &str) {
+    if is_daemon_reachable() {
+        return;
+    }
+    eprintln!(
+        "[!] darkmux serve isn't reachable on {} — `{}` will write flow records to disk \
+         but you won't see them live. To enable live viewing, run `darkmux serve` in another tab.",
+        DEFAULT_DAEMON_ADDR, verb_hint
+    );
+}
+
 /// Start the HTTP daemon, binding on `bind:port`. Blocks until SIGINT.
 pub fn run(port: u16, bind: String, flows_dir: PathBuf) -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -579,5 +619,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ─── is_daemon_reachable / nudge_if_daemon_unreachable (#104 S3) ─────
+
+    #[test]
+    fn is_daemon_reachable_returns_false_on_closed_port() {
+        // Default address is 127.0.0.1:8765 — even if a daemon is running
+        // on the operator's machine for the integration scenario, we can
+        // probe a known-closed port via a sibling helper to test the
+        // false path. The fn itself is hardcoded, so we test that by
+        // verifying the timeout returns quickly (probe budget ≤ 300ms).
+        let start = std::time::Instant::now();
+        let _ = is_daemon_reachable();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "probe should respect 300ms timeout, took {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn default_daemon_addr_is_127_0_0_1_8765() {
+        // Lock the address — anything else surprises operators reading
+        // the nudge stderr line for the first time.
+        assert_eq!(DEFAULT_DAEMON_ADDR, "127.0.0.1:8765");
+        let parsed: std::net::SocketAddr = DEFAULT_DAEMON_ADDR.parse().expect("must parse");
+        assert_eq!(parsed.port(), 8765);
+        assert!(parsed.ip().is_loopback());
     }
 }

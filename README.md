@@ -144,9 +144,9 @@ Bigger context wins long tasks. Slim config wins bounded tasks. **No static conf
 
 2. **Multi-config registry** — a JSON file naming profiles (`fast`, `balanced`, `deep`, plus the bundled `gpt-oss` preset for the MXFP4 build of OpenAI's open-source 120B on Apple Silicon — note: `gpt-oss` requires OpenClaw ≥ v2026.5.9-beta.1 for the harmony-format / tool-payload fix) with model IDs, context lengths, compaction settings. Profiles can also encode "warm pair" (primary + companion compactor) configurations.
 
-3. **`darkmux serve` (proxy mode)** — OpenAI-compatible HTTP frontend. Intercepts requests, classifies the task (heuristics first, optional LLM-classifier later), routes to the right loaded profile, swaps if needed.
+3. **`darkmux serve` (observability daemon)** — local HTTP daemon that serves flow records and mission/sprint state to the `/flow` viewer. Endpoints: `/health`, `/flow/<date>(.jsonl)`, `/flow/<date>/stream` (SSE tail), `/model/status`, `/missions`, `/sprints`. Default bind `127.0.0.1:8765`. Foreground process — run in a separate terminal tab. `darkmux doctor` includes a `daemon: reachable` check (Warn severity) so an operator who closed the daemon tab gets surfaced rather than discovering it only when the viewer pane is empty; both `darkmux crew dispatch` and `darkmux sprint review` print a one-line stderr nudge when the daemon isn't reachable at dispatch time.
 
-Layers 1 and 2 ship from day one. Layer 3 is the smart-routing piece, optional.
+Layers 1 and 2 ship from day one. Layer 3 is the live-observability surface, optional but required for the `/flow` viewer.
 
 ## Why "darkmux"
 
