@@ -598,27 +598,53 @@ function render() {
   }
 
   const r = state.filtered[state.index];
+  // Controls render twice (top + bottom of the record) so the operator
+  // doesn't have to scroll to either edge after reading a long handle.
+  // Class selectors (not ids) — duplicate ids would be invalid HTML and
+  // `getElementById` only returns the first, which silently un-wires the
+  // bottom row's clicks. Both rows are now handled by the delegated
+  // listener attached once to `stepperEl` (see `wireStepperControls`).
   const controls = `
     <div class="stepper-controls">
       <div>
-        <button id="first-btn" ${state.index === 0 ? 'disabled' : ''}>« first</button>
-        <button id="prev-btn"  ${state.index === 0 ? 'disabled' : ''}>‹ prev</button>
+        <button class="step-first" ${state.index === 0 ? 'disabled' : ''}>« first</button>
+        <button class="step-prev"  ${state.index === 0 ? 'disabled' : ''}>‹ prev</button>
       </div>
       <span class="progress">${state.index + 1} / ${state.filtered.length}</span>
       <div>
-        <button id="next-btn" ${state.index >= state.filtered.length - 1 ? 'disabled' : ''}>next ›</button>
-        <button id="last-btn" ${state.index >= state.filtered.length - 1 ? 'disabled' : ''}>last »</button>
+        <button class="step-next" ${state.index >= state.filtered.length - 1 ? 'disabled' : ''}>next ›</button>
+        <button class="step-last" ${state.index >= state.filtered.length - 1 ? 'disabled' : ''}>last »</button>
       </div>
     </div>
   `;
 
   stepperEl.innerHTML = controls + renderRecord(r) + controls;
-
-  document.getElementById('first-btn').onclick = () => { state.index = 0; render(); };
-  document.getElementById('prev-btn').onclick  = () => { if (state.index > 0) { state.index--; render(); } };
-  document.getElementById('next-btn').onclick  = () => { if (state.index < state.filtered.length - 1) { state.index++; render(); } };
-  document.getElementById('last-btn').onclick  = () => { state.index = state.filtered.length - 1; render(); };
 }
+
+// Single delegated click handler on the stepper container — survives the
+// `innerHTML =` rewrites in `render()` and dispatches identically for the
+// top and bottom control rows. Attach once at startup, not per-render.
+function wireStepperControls() {
+  stepperEl.addEventListener('click', (e) => {
+    const btn = e.target.closest('button');
+    if (!btn || btn.disabled) return;
+    if (btn.classList.contains('step-first')) {
+      state.index = 0;
+    } else if (btn.classList.contains('step-prev')) {
+      if (state.index <= 0) return;
+      state.index--;
+    } else if (btn.classList.contains('step-next')) {
+      if (state.index >= state.filtered.length - 1) return;
+      state.index++;
+    } else if (btn.classList.contains('step-last')) {
+      state.index = state.filtered.length - 1;
+    } else {
+      return;
+    }
+    render();
+  });
+}
+wireStepperControls();
 
 // ─── sources ───────────────────────────────────────────────────────────
 document.getElementById('load-file-btn').onclick = () => document.getElementById('file-input').click();
