@@ -46,6 +46,14 @@ use serde::{Deserialize, Serialize};
 /// contract.
 pub const RULES_SCHEMA_VERSION: &str = "1.0.0";
 
+/// Stable rule-id string for `ctx-window-mismatch`. Single source of truth
+/// for both the rules table below *and* external dispatchers (like
+/// `doctor::try_fix`) that need to recognize this rule without string-typo
+/// risk. If the id is ever renamed, this constant is the only edit needed —
+/// per the module-level rules-schema versioning policy, an id rename is a
+/// **major** bump.
+pub const RULE_ID_CTX_WINDOW_MISMATCH: &str = "ctx-window-mismatch";
+
 /// Stable identifiers for the active rule set. Add new ones to the bottom.
 /// The `kind` field on `RuleDef` carries this discriminant in the wire
 /// format, so renames are a major version bump.
@@ -128,7 +136,7 @@ pub fn all_rules() -> Vec<RuleDef> {
         &str,
     )] = &[
         (
-            "ctx-window-mismatch",
+            RULE_ID_CTX_WINDOW_MISMATCH,
             RuleKind::ContextWindowMismatch,
             "Context window mismatch",
             "config_drift",
