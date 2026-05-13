@@ -105,6 +105,19 @@ pub struct Mission {
     #[serde(default)]
     pub sprint_ids: Vec<String>,
     pub created_ts: u64,
+    /// When the mission first transitioned to `Active`. None until
+    /// `darkmux mission start` runs. Used by the wall-clock UI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_ts: Option<u64>,
+    /// When the mission transitioned to `Closed`. Closed is terminal —
+    /// once set, lifecycle verbs can't move the mission elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_ts: Option<u64>,
+    /// When the mission most recently transitioned to `Paused`. Resume
+    /// flips status back to `Active` but does NOT clear this field —
+    /// the operator may want to see when the most recent pause occurred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_ts: Option<u64>,
 }
 
 /// Status of a sprint.
@@ -130,4 +143,20 @@ pub struct Sprint {
     #[serde(default)]
     pub depends_on: Vec<String>,
     pub created_ts: u64,
+    /// When the sprint first transitioned to `Running` (or last transitioned
+    /// to `Running` after being `Abandoned` and restarted). None until
+    /// `darkmux sprint start` runs. Wall-clock UI shows live elapsed when
+    /// `status == Running` (now - started_ts).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_ts: Option<u64>,
+    /// When the sprint transitioned to `Complete`. Complete is terminal —
+    /// once set, lifecycle verbs can't move the sprint elsewhere. Wall-clock
+    /// duration = completed_ts - started_ts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_ts: Option<u64>,
+    /// When the sprint transitioned to `Abandoned`. Cleared when the
+    /// operator changes their mind and runs `sprint start` again — the
+    /// state machine treats `Abandoned → Running` as a legal restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abandoned_ts: Option<u64>,
 }

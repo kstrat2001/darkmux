@@ -156,7 +156,10 @@ CREATE TABLE IF NOT EXISTS missions (
     id          TEXT PRIMARY KEY,
     description TEXT NOT NULL,
     status      TEXT NOT NULL CHECK (status IN ('active','closed','paused')),
-    created_ts  INTEGER NOT NULL
+    created_ts  INTEGER NOT NULL,
+    started_ts  INTEGER,  -- Active transition; #95
+    closed_ts   INTEGER,  -- Closed transition (terminal); #95
+    paused_ts   INTEGER   -- most-recent Paused transition; #95
 );
 
 CREATE TABLE IF NOT EXISTS sprints (
@@ -166,6 +169,9 @@ CREATE TABLE IF NOT EXISTS sprints (
     status          TEXT NOT NULL CHECK (status IN ('planned','running','complete','abandoned')),
     depends_on_json TEXT NOT NULL DEFAULT '[]',
     created_ts      INTEGER NOT NULL,
+    started_ts      INTEGER,  -- Running transition; #95
+    completed_ts    INTEGER,  -- Complete transition (terminal); #95
+    abandoned_ts    INTEGER,  -- Abandoned transition (cleared on restart); #95
     PRIMARY KEY (id, mission_id)
 );
 
@@ -442,12 +448,16 @@ fn populate(conn: &mut Connection) -> Result<()> {
     // Missions.
     for mission in &missions {
         tx.execute(
-            "INSERT INTO missions (id, description, status, created_ts) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO missions (id, description, status, created_ts, started_ts, closed_ts, paused_ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 mission.id,
                 mission.description,
                 mission_status_str(mission.status),
                 mission.created_ts as i64,
+                mission.started_ts.map(|t| t as i64),
+                mission.closed_ts.map(|t| t as i64),
+                mission.paused_ts.map(|t| t as i64),
             ],
         )?;
     }
@@ -456,8 +466,8 @@ fn populate(conn: &mut Connection) -> Result<()> {
     for sprint in &sprints {
         let depends_on_json = serde_json::to_string(&sprint.depends_on)?;
         tx.execute(
-            "INSERT INTO sprints (id, mission_id, description, status, depends_on_json, created_ts)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO sprints (id, mission_id, description, status, depends_on_json, created_ts, started_ts, completed_ts, abandoned_ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 sprint.id,
                 sprint.mission_id,
@@ -465,6 +475,9 @@ fn populate(conn: &mut Connection) -> Result<()> {
                 sprint_status_str(sprint.status),
                 depends_on_json,
                 sprint.created_ts as i64,
+                sprint.started_ts.map(|t| t as i64),
+                sprint.completed_ts.map(|t| t as i64),
+                sprint.abandoned_ts.map(|t| t as i64),
             ],
         )?;
     }
