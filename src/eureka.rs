@@ -44,7 +44,7 @@ use serde::{Deserialize, Serialize};
 /// **When bumping major:** update `EXPECTED_RULES_SCHEMA_MAJOR` in
 /// `docs/viewer/index.html` in the same PR. The viewer-release-PR is the
 /// contract.
-pub const RULES_SCHEMA_VERSION: &str = "1.0.0";
+pub const RULES_SCHEMA_VERSION: &str = "1.1.0";
 
 /// Stable rule-id string for `ctx-window-mismatch`. Single source of truth
 /// for both the rules table below *and* external dispatchers (like
@@ -53,6 +53,10 @@ pub const RULES_SCHEMA_VERSION: &str = "1.0.0";
 /// per the module-level rules-schema versioning policy, an id rename is a
 /// **major** bump.
 pub const RULE_ID_CTX_WINDOW_MISMATCH: &str = "ctx-window-mismatch";
+
+/// Stable rule-id string for `agents-default-model-resolves`. Same
+/// rename-bump-major contract as the constant above.
+pub const RULE_ID_AGENTS_DEFAULT_MODEL_RESOLVES: &str = "agents-default-model-resolves";
 
 /// Stable identifiers for the active rule set. Add new ones to the bottom.
 /// The `kind` field on `RuleDef` carries this discriminant in the wire
@@ -83,6 +87,11 @@ pub enum RuleKind {
     /// Estimated KV pre-allocation + working set exceeds unified memory
     /// budget. Dispatch will likely OOM mid-run.
     MemoryHeadroomTight,
+    /// `agents.defaults.model.primary` (or `agents.defaults.compaction.model`)
+    /// in openclaw.json points at a bare model id that doesn't appear in
+    /// `lms ls` — the pin is orphaned, and dispatch will fail with
+    /// "model not found" the first time the default is used.
+    AgentsDefaultModelResolves,
 }
 
 /// Severity of a rule firing.
@@ -216,6 +225,23 @@ pub fn all_rules() -> Vec<RuleDef> {
             "Either lower the primary or compactor `contextWindow`, unload other \
              models, or pick a slimmer darkmux profile (e.g. `balanced`/`fast`).",
         ),
+        (
+            RULE_ID_AGENTS_DEFAULT_MODEL_RESOLVES,
+            RuleKind::AgentsDefaultModelResolves,
+            "Default model pin resolves",
+            "config_drift",
+            Severity::Fail,
+            "`agents.defaults.model.primary` (and `agents.defaults.compaction.model` \
+             if set) in openclaw.json must point at a bare model id that exists in \
+             `lms ls`. Otherwise dispatch will fail the first time the default is \
+             used. This catches both orphaned pins (model evicted from LMStudio's \
+             cache) and stale defaults left behind by a `darkmux swap` that didn't \
+             rewrite the openclaw pointer.",
+            "Either (a) re-download the pinned model in LMStudio, (b) re-run \
+             `darkmux swap <profile>` so it loads what the pin expects, or (c) \
+             edit `agents.defaults.model.primary` in openclaw.json directly. \
+             `lms ls` shows what is currently downloadable.",
+        ),
     ];
     table
         .iter()
@@ -334,6 +360,7 @@ fn evaluate_one(kind: &RuleKind, ctx: &Context) -> Verdict {
         RuleKind::CompactorNotLoaded => eval_compactor_not_loaded(ctx),
         RuleKind::PrimaryConfigDrift => eval_primary_config_drift(ctx),
         RuleKind::MemoryHeadroomTight => eval_memory_headroom(ctx),
+        RuleKind::AgentsDefaultModelResolves => eval_agents_default_model_resolves(ctx),
     }
 }
 
@@ -463,6 +490,12 @@ fn eval_n_ctx_exceeds_max(ctx: &Context) -> Verdict {
     }
 }
 
+// Companion to `agents-default-model-resolves` (added #91): that rule
+// checks the `lms ls` (downloadable) half at Fail severity; this one
+// checks the `lms ps` (loaded-now) half at Warn severity. On a fully-
+// missing compactor both fire with complementary messages, which is
+// intentional — the operator sees both the "won't load at all" Fail
+// and the "won't be warm at dispatch time" Warn.
 fn eval_compactor_not_loaded(ctx: &Context) -> Verdict {
     let Some(config) = ctx.openclaw_config.as_ref() else {
         return Verdict::Skipped("no ~/.openclaw/openclaw.json".into());
@@ -563,6 +596,103 @@ fn eval_memory_headroom(ctx: &Context) -> Verdict {
     } else {
         Verdict::Pass
     }
+}
+
+/// Strip the provider prefix (`lmstudio/`, `ollama/`, etc.) and the darkmux
+/// namespace prefix (`darkmux:`) from a model id, leaving the bare key as
+/// it appears in `lms ls`'s `modelKey` field.
+///
+/// Examples:
+///   `"lmstudio/darkmux:qwen3.6-35b-a3b"` → `"qwen3.6-35b-a3b"`
+///   `"darkmux:foo"` → `"foo"`
+///   `"foo"` → `"foo"`
+///
+/// Assumes LMStudio's `modelKey` is a bare slug (no embedded `/`). Today
+/// that's the contract (see `lms.rs::meta_from_json`); if LMStudio ever
+/// surfaces HuggingFace-style `owner/repo` keys verbatim through
+/// `modelKey`, this strip becomes lossy and the rule's match logic needs
+/// to switch to a longest-suffix comparison.
+fn strip_model_id_prefixes(id: &str) -> &str {
+    let after_provider = id.rsplit('/').next().unwrap_or(id);
+    after_provider.strip_prefix("darkmux:").unwrap_or(after_provider)
+}
+
+/// Pure verdict logic for the `agents-default-model-resolves` check.
+/// Extracted so we can unit-test prefix-stripping + the downloaded/missing
+/// matrix without an `lms` round-trip.
+///
+/// `primary_id`/`compaction_id` are the raw strings as they appear in
+/// openclaw.json (i.e. may carry `lmstudio/` or `darkmux:` prefixes).
+/// `available_keys` is the `modelKey` set from `lms ls`. Per the issue
+/// spec, "Pass if the bare id appears in `lms ls` output" — loaded-state
+/// is informational, not blocking, so it's not consulted here.
+fn classify_default_model_resolves(
+    primary_id: Option<&str>,
+    compaction_id: Option<&str>,
+    available_keys: &[&str],
+) -> Verdict {
+    // Build (label, raw, bare) triples for whichever pins are configured.
+    let mut pins: Vec<(&str, &str, &str)> = Vec::new();
+    if let Some(p) = primary_id {
+        pins.push(("primary", p, strip_model_id_prefixes(p)));
+    }
+    if let Some(c) = compaction_id {
+        pins.push(("compaction", c, strip_model_id_prefixes(c)));
+    }
+    if pins.is_empty() {
+        return Verdict::Skipped("no agents.defaults.model.primary set".into());
+    }
+
+    let mut orphans: Vec<String> = Vec::new();
+    for (label, raw, bare) in &pins {
+        if !available_keys.contains(bare) {
+            orphans.push(format!("{label} `{raw}` (bare `{bare}`)"));
+        }
+    }
+
+    if orphans.is_empty() {
+        Verdict::Pass
+    } else {
+        // Top-3 lms-ls suggestions to help the operator pick a real id.
+        let suggestions: Vec<&str> = available_keys.iter().take(3).copied().collect();
+        let suggestion_line = if suggestions.is_empty() {
+            String::from("`lms ls` is empty")
+        } else {
+            format!("first ids in `lms ls`: {}", suggestions.join(", "))
+        };
+        Verdict::Fire {
+            severity: Severity::Fail,
+            message: format!(
+                "{} pin(s) not in `lms ls`: {}. {}",
+                orphans.len(),
+                orphans.join("; "),
+                suggestion_line
+            ),
+        }
+    }
+}
+
+fn eval_agents_default_model_resolves(ctx: &Context) -> Verdict {
+    let Some(config) = ctx.openclaw_config.as_ref() else {
+        return Verdict::Skipped("no ~/.openclaw/openclaw.json".into());
+    };
+    let Some(catalog) = ctx.available_models.as_ref() else {
+        return Verdict::Skipped("`lms ls` unavailable".into());
+    };
+
+    let defaults = config.get("agents").and_then(|a| a.get("defaults"));
+    let primary_id = defaults
+        .and_then(|d| d.get("model"))
+        .and_then(|m| m.get("primary"))
+        .and_then(|p| p.as_str());
+    let compaction_id = defaults
+        .and_then(|d| d.get("compaction"))
+        .and_then(|c| c.get("model"))
+        .and_then(|m| m.as_str());
+
+    let available_keys: Vec<&str> = catalog.iter().map(|m| m.model_key.as_str()).collect();
+
+    classify_default_model_resolves(primary_id, compaction_id, &available_keys)
 }
 
 pub fn parse_size_gb(s: &str) -> Option<f64> {
@@ -708,5 +838,113 @@ mod tests {
             }
             other => panic!("expected Fail fire, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn strip_model_id_prefixes_handles_both_layers() {
+        assert_eq!(strip_model_id_prefixes("lmstudio/darkmux:foo-bar"), "foo-bar");
+        assert_eq!(strip_model_id_prefixes("darkmux:foo-bar"), "foo-bar");
+        assert_eq!(strip_model_id_prefixes("lmstudio/foo-bar"), "foo-bar");
+        assert_eq!(strip_model_id_prefixes("foo-bar"), "foo-bar");
+        // Provider prefix that isn't lmstudio still strips — the contract
+        // is "everything before the last `/`", not "lmstudio specifically".
+        assert_eq!(strip_model_id_prefixes("ollama/foo-bar"), "foo-bar");
+    }
+
+    #[test]
+    fn default_model_resolves_passes_when_primary_in_lms_ls() {
+        // Per the issue spec: "Pass if the bare id appears in `lms ls`".
+        // Loaded-state is informational, not blocking — that's covered by
+        // other rules (compactor-not-loaded, primary-config-drift).
+        let v = classify_default_model_resolves(Some("lmstudio/foo"), None, &["foo", "bar"]);
+        assert!(matches!(v, Verdict::Pass), "got {v:?}");
+    }
+
+    #[test]
+    fn default_model_resolves_fails_when_primary_orphaned() {
+        let v = classify_default_model_resolves(
+            Some("lmstudio/darkmux:qwen3.6-35b-a3b-turboquant-mlx"),
+            None,
+            &["qwen3.6-35b-a3b", "qwen3.6-35b-a3b-oq6"],
+        );
+        match v {
+            Verdict::Fire { severity: Severity::Fail, message } => {
+                assert!(message.contains("primary"));
+                assert!(message.contains("turboquant"));
+                // Surfaces top suggestions from lms ls.
+                assert!(message.contains("qwen3.6-35b-a3b"));
+            }
+            other => panic!("expected Fail fire, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_model_resolves_fires_for_compaction_orphan_only() {
+        let v = classify_default_model_resolves(
+            Some("foo"),
+            Some("missing-compactor"),
+            &["foo", "bar"],
+        );
+        match v {
+            Verdict::Fire { severity: Severity::Fail, message } => {
+                assert!(message.contains("compaction"));
+                assert!(message.contains("missing-compactor"));
+                assert!(!message.contains("primary `"), "primary should not fire: {message}");
+            }
+            other => panic!("expected Fail fire, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_model_resolves_lists_both_orphans_when_both_missing() {
+        let v = classify_default_model_resolves(
+            Some("missing-primary"),
+            Some("missing-compactor"),
+            &["foo"],
+        );
+        match v {
+            Verdict::Fire { severity: Severity::Fail, message } => {
+                assert!(message.contains("2 pin(s)"));
+                assert!(message.contains("missing-primary"));
+                assert!(message.contains("missing-compactor"));
+            }
+            other => panic!("expected Fail fire, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_model_resolves_skipped_when_no_primary_set() {
+        let v = classify_default_model_resolves(None, None, &["foo"]);
+        assert!(matches!(v, Verdict::Skipped(_)), "got {v:?}");
+    }
+
+    #[test]
+    fn default_model_resolves_skipped_when_no_openclaw_config() {
+        let ctx = Context {
+            openclaw_config: None,
+            loaded_models: vec![],
+            available_models: Some(Vec::new()),
+            total_ram_gb: 0,
+        };
+        assert!(matches!(
+            eval_agents_default_model_resolves(&ctx),
+            Verdict::Skipped(_)
+        ));
+    }
+
+    #[test]
+    fn default_model_resolves_skipped_when_lms_ls_unavailable() {
+        let ctx = Context {
+            openclaw_config: Some(serde_json::json!({
+                "agents": { "defaults": { "model": { "primary": "foo" } } }
+            })),
+            loaded_models: vec![],
+            available_models: None,
+            total_ram_gb: 0,
+        };
+        assert!(matches!(
+            eval_agents_default_model_resolves(&ctx),
+            Verdict::Skipped(_)
+        ));
     }
 }
