@@ -181,9 +181,28 @@ fn check_daemon_reachable_impl(host: &str, port: u16) -> Check {
         }
     };
 
-    // Set a read/write timeout for the HTTP exchange.
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(1000)));
-    let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(1000)));
+    // Set read/write timeouts for the HTTP exchange. If the OS won't
+    // honor them (rare on macOS/Linux but possible on stripped builds
+    // or unusual sockets), bail with Warn rather than risk a hang in
+    // the subsequent stream.read() — this is the surface area #104
+    // review flagged ("silent error on stream timeout configuration").
+    let to = std::time::Duration::from_millis(1000);
+    if stream.set_read_timeout(Some(to)).is_err()
+        || stream.set_write_timeout(Some(to)).is_err()
+    {
+        return Check {
+            name: "daemon reachable".into(),
+            status: Status::Warn,
+            message: format!(
+                "daemon at {} answered TCP but the probe couldn't set socket timeouts — skipping read to avoid hang",
+                addr
+            ),
+            hint: Some(
+                "system may not support socket timeouts on this socket type; probe will work after daemon restart or OS update"
+                    .into(),
+            ),
+        };
+    }
 
     // Send minimal HTTP/1.1 request.
     let request = format!(
