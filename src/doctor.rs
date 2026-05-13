@@ -754,6 +754,90 @@ fn first_line(s: &str) -> &str {
     s.lines().next().unwrap_or("")
 }
 
+// ─── --fix path: auto-apply known-safe fixes ────────────────────────────
+
+/// Outcome of attempting an auto-fix for one rule. `applied=false` with a
+/// message starting "skipped:" means the handler reached a known-safe
+/// no-op (e.g., no openclaw config path resolvable); a non-skip
+/// `applied=false` means the handler ran but found nothing to change.
+#[derive(Debug, Clone)]
+pub struct FixOutcome {
+    pub rule_id: String,
+    pub applied: bool,
+    pub message: String,
+}
+
+/// Attempt to auto-apply known-safe fixes for failing checks in a doctor
+/// report. Only rules with a registered handler are touched; everything
+/// else is left for the operator. Each handler is responsible for its own
+/// idempotency — running `--fix` when nothing's broken is a no-op.
+///
+/// Returns the list of outcomes (one per fix attempt). Empty when no
+/// failing check had a registered handler.
+pub fn try_fix(report: &DoctorReport) -> Result<Vec<FixOutcome>> {
+    let mut outcomes = Vec::new();
+    for check in &report.checks {
+        if !matches!(check.status, Status::Fail | Status::Warn) {
+            continue;
+        }
+        if check.name == "eureka: ctx-window-mismatch" {
+            outcomes.push(fix_ctx_window_mismatch()?);
+        }
+        // Future fix handlers slot in here; keep additions narrow and
+        // documented in the issue tracker so operators can audit what
+        // `--fix` will and won't touch.
+    }
+    Ok(outcomes)
+}
+
+fn fix_ctx_window_mismatch() -> Result<FixOutcome> {
+    let Some(path) = crate::runtime::resolve_openclaw_config_path(None) else {
+        return Ok(FixOutcome {
+            rule_id: "ctx-window-mismatch".into(),
+            applied: false,
+            message: "skipped: no openclaw config path resolvable (set \
+                      DARKMUX_OPENCLAW_CONFIG or use a profile with \
+                      runtime.config_path)"
+                .into(),
+        });
+    };
+    let loaded = match lms::list_loaded() {
+        Ok(l) => l,
+        Err(e) => {
+            return Ok(FixOutcome {
+                rule_id: "ctx-window-mismatch".into(),
+                applied: false,
+                message: format!(
+                    "skipped: could not query lms ps — {}",
+                    first_line(&e.to_string())
+                ),
+            });
+        }
+    };
+    let changes = crate::runtime::fix_ctx_window_to_loaded(&path, &loaded)?;
+    if changes.is_empty() {
+        Ok(FixOutcome {
+            rule_id: "ctx-window-mismatch".into(),
+            applied: false,
+            message: "no contextWindow entries needed adjustment".into(),
+        })
+    } else {
+        let summary = changes
+            .iter()
+            .map(|(id, from, to)| format!("{id}: {from} → {to}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        Ok(FixOutcome {
+            rule_id: "ctx-window-mismatch".into(),
+            applied: true,
+            message: format!(
+                "aligned {} contextWindow entry/entries — {summary}",
+                changes.len()
+            ),
+        })
+    }
+}
+
 // ─── Result rendering ───────────────────────────────────────────────────
 
 pub fn print_report(r: &DoctorReport) -> Result<()> {

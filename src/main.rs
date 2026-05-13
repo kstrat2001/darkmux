@@ -78,7 +78,14 @@ enum Cmd {
     /// Run pre-flight diagnostic checks. Verifies the local setup (profile
     /// registry, LMStudio, models, runtime, RAM, power) and reports
     /// pass/warn/fail with actionable hints. Exit 0 if no failures, else 1.
-    Doctor,
+    Doctor {
+        /// Attempt to auto-apply known-safe fixes for failing checks
+        /// (currently: `eureka: ctx-window-mismatch` realigns openclaw.json
+        /// `contextWindow` values to match what `lms ps` reports). After the
+        /// fixes run, doctor re-evaluates and prints the updated report.
+        #[arg(long)]
+        fix: bool,
+    },
     /// Scan the LMStudio model catalog for downloaded models that aren't yet
     /// covered by any profile. For each uncovered model, suggests a task class
     /// and rough memory impact. Run after downloading a new model in LMStudio
@@ -474,7 +481,7 @@ fn run(cmd: Cmd) -> Result<i32> {
         Cmd::Lab { sub } => cmd_lab(sub),
         Cmd::Skills { sub } => cmd_skills(sub),
         Cmd::Notebook { sub } => cmd_notebook(sub),
-        Cmd::Doctor => cmd_doctor(),
+        Cmd::Doctor { fix } => cmd_doctor(fix),
         Cmd::Scan { config } => cmd_scan(config.as_deref()),
         Cmd::Profile { sub } => cmd_profile(sub),
         Cmd::Model { sub } => cmd_model(sub),
@@ -561,9 +568,40 @@ fn cmd_notebook(sub: NotebookCmd) -> Result<i32> {
     }
 }
 
-fn cmd_doctor() -> Result<i32> {
+fn cmd_doctor(fix: bool) -> Result<i32> {
     let report = doctor::run();
     doctor::print_report(&report)?;
+
+    if !fix {
+        return Ok(match report.worst_status() {
+            doctor::Status::Fail => 1,
+            _ => 0,
+        });
+    }
+
+    // --fix path: attempt known-safe auto-fixes for failing rules, then
+    // re-run the full check set so the operator sees the post-fix state.
+    let outcomes = doctor::try_fix(&report)?;
+    if outcomes.is_empty() {
+        println!();
+        println!("--fix: no auto-fix available for any failing check.");
+    } else {
+        println!();
+        println!("--fix: applied {} auto-fix(es):", outcomes.len());
+        for o in &outcomes {
+            let marker = if o.applied { "✓" } else { "·" };
+            println!("  {marker} {} — {}", o.rule_id, o.message);
+        }
+        println!();
+        println!("Re-running doctor…");
+        println!();
+        let report2 = doctor::run();
+        doctor::print_report(&report2)?;
+        return Ok(match report2.worst_status() {
+            doctor::Status::Fail => 1,
+            _ => 0,
+        });
+    }
     Ok(match report.worst_status() {
         doctor::Status::Fail => 1,
         _ => 0,
