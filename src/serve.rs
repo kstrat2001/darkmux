@@ -48,6 +48,8 @@ pub fn build_router(flows_dir: PathBuf) -> Router {
         .route("/flow/:date", get(flow_handler))
         .route("/flow/:date/stream", get(flow_stream_handler))
         .route("/model/status", get(model_status_handler))
+        .route("/missions", get(missions_handler))
+        .route("/sprints", get(sprints_handler))
         .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(state)
 }
@@ -90,6 +92,47 @@ async fn health() -> axum::Json<serde_json::Value> {
 ///
 /// `lms::list_loaded()` is sync (subprocess invocation), so it runs on
 /// the blocking pool to keep the axum executor free.
+/// GET /missions — list of all missions from the JSON source-of-truth
+/// (`~/.darkmux/crew/missions/`). Includes status + transition timestamps
+/// (started_ts/closed_ts/paused_ts) so the viewer can render wall-clock
+/// durations and the sprint-progress widget. Empty array on no missions
+/// or unreachable crew root; never errors.
+async fn missions_handler() -> axum::Json<serde_json::Value> {
+    let result = tokio::task::spawn_blocking(crate::crew::loader::load_missions).await;
+    let missions = match result {
+        Ok(Ok(m)) => m,
+        _ => Vec::new(),
+    };
+    axum::Json(serde_json::json!({
+        "missions": missions,
+        "generated_at_ms": current_millis(),
+    }))
+}
+
+/// GET /sprints — list of all sprints from the JSON source-of-truth
+/// (`~/.darkmux/crew/sprints/`). Includes status + transition timestamps
+/// (started_ts/completed_ts/abandoned_ts) so the viewer's wall-clock
+/// graphic can render Running sprints' live elapsed time + Complete
+/// sprints' frozen durations. Empty array on no sprints; never errors.
+async fn sprints_handler() -> axum::Json<serde_json::Value> {
+    let result = tokio::task::spawn_blocking(crate::crew::loader::load_sprints).await;
+    let sprints = match result {
+        Ok(Ok(s)) => s,
+        _ => Vec::new(),
+    };
+    axum::Json(serde_json::json!({
+        "sprints": sprints,
+        "generated_at_ms": current_millis(),
+    }))
+}
+
+fn current_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 async fn model_status_handler() -> axum::Json<serde_json::Value> {
     let result = tokio::task::spawn_blocking(crate::lms::list_loaded).await;
     let (models, unreachable) = match result {
