@@ -74,8 +74,7 @@ pub struct FlowRecord {
 /// Resolve the flows directory from env override (`DARKMUX_FLOWS_DIR`) or
 /// default (`~/.darkmux/flows/`). Falls back to `/tmp/darkmux/flows/` if
 /// neither is resolvable (CI / sandboxed environments without HOME).
-/// Tests use `record_at()` instead.
-fn flows_dir() -> PathBuf {
+pub(crate) fn flows_dir() -> PathBuf {
     std::env::var("DARKMUX_FLOWS_DIR")
         .ok()
         .filter(|s| !s.trim().is_empty())

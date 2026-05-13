@@ -140,6 +140,9 @@ enum Cmd {
         /// Address to bind (default: 127.0.0.1).
         #[arg(long, default_value = "127.0.0.1")]
         bind: String,
+        /// Directory to serve flow records from (default: ~/.darkmux/flows/).
+        #[arg(long = "flows-dir")]
+        flows_dir: Option<std::path::PathBuf>,
     },
     /// Optimize for your workload — guided wizard (Phase 1 scaffold).
     /// Composes scan, lab characterize/tune, heuristics, and eureka rules
@@ -489,8 +492,9 @@ fn run(cmd: Cmd) -> Result<i32> {
             force,
             dry_run,
         } => cmd_init(with_hook, with_claude_md, force, dry_run),
-        Cmd::Serve { port, bind } => {
-            serve::run(port, bind)?;
+        Cmd::Serve { port, bind, flows_dir } => {
+            let flows_dir = flows_dir.unwrap_or_else(crate::flow::flows_dir);
+            serve::run(port, bind, flows_dir)?;
             Ok(0)
         }
         Cmd::Optimize => optimize::run(),
