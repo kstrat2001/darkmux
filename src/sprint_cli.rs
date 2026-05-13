@@ -38,6 +38,33 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+/// Build a `FlowRecord` for sprint review verbs.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_review_record(
+    level: crate::flow::Level,
+    category: crate::flow::Category,
+    tier: crate::flow::Tier,
+    stage: crate::flow::Stage,
+    action: String,
+    handle: String,
+    session_id: &str,
+    sprint_id: Option<&str>,
+) -> crate::flow::FlowRecord {
+    use crate::flow::ts_utc_now;
+    crate::flow::FlowRecord {
+        ts: ts_utc_now(),
+        level,
+        category,
+        tier,
+        stage,
+        action,
+        handle,
+        sprint_id: sprint_id.map(String::from),
+        source: Some("sprint_review".to_string()),
+        session_id: Some(session_id.to_string()),
+    }
+}
+
 /// LMStudio endpoint for the optional `--narrate` flag.
 const LMSTUDIO_CHAT_URL: &str = "http://localhost:1234/v1/chat/completions";
 
@@ -316,6 +343,21 @@ fn build_reasoning(
             "max cumulative {max_in} comfortably under {target_name}'s safe budget {target_safe} (~{pct}% of context); {workload_class} workload fits",
             workload_class = spec.workload_class
         ),
+    }
+}
+
+/// Truncate a string to at most `max` bytes, adding "..." if truncated.
+/// Honors UTF-8 char boundaries — cuts at the largest valid boundary ≤ max
+/// so multi-byte chars in error messages (emojis, accents) don't panic.
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        let end = (0..=max)
+            .rev()
+            .find(|i| s.is_char_boundary(*i))
+            .unwrap_or(0);
+        format!("{}...", &s[..end])
     }
 }
 
@@ -633,7 +675,12 @@ fn count_files_changed(path: &Path, base: &str) -> usize {
 }
 
 /// Internal entry for `sprint review` taking an explicit repo path.
-pub(crate) fn sprint_review_at(path: &Path, base: Option<&str>, require_clean: bool) -> Result<i32> {
+pub(crate) fn sprint_review_at(
+    path: &Path,
+    base: Option<&str>,
+    require_clean: bool,
+    sprint_id: Option<&str>,
+) -> Result<i32> {
     // Capture branch name.
     let branch = Command::new("git")
         .args(["branch", "--show-current"])
@@ -645,6 +692,18 @@ pub(crate) fn sprint_review_at(path: &Path, base: Option<&str>, require_clean: b
         .unwrap_or_else(|| "unknown".to_string());
 
     let session_id = format!("sprint-review-{}", std::time::UNIX_EPOCH.elapsed().unwrap_or_default().as_secs());
+
+    // Emit review-start flow record.
+    let _ = crate::flow::record(build_review_record(
+        crate::flow::Level::Info,
+        crate::flow::Category::Review,
+        crate::flow::Tier::Frontier,
+        crate::flow::Stage::Review,
+        "sprint review begin".to_string(),
+        branch.clone(),
+        &session_id,
+        sprint_id,
+    ));
 
     // Run `git diff <base>` (working-tree-inclusive). NOT `<base>..HEAD` —
     // that would only see committed changes, missing the pre-PR review case
@@ -671,6 +730,17 @@ pub(crate) fn sprint_review_at(path: &Path, base: Option<&str>, require_clean: b
             findings: vec![],
             verdict: "clean".to_string(),
         };
+        // Emit verdict flow record.
+        let _ = crate::flow::record(build_review_record(
+            crate::flow::Level::Info,
+            crate::flow::Category::Review,
+            crate::flow::Tier::Frontier,
+            crate::flow::Stage::Review,
+            "verdict: clean".to_string(),
+            "0B / 0F / 0N".to_string(),
+            &session_id,
+            sprint_id,
+        ));
         println!("{}", serde_json::to_string_pretty(&output)?);
         return Ok(0);
     }
@@ -714,11 +784,35 @@ pub(crate) fn sprint_review_at(path: &Path, base: Option<&str>, require_clean: b
         skip_preflight: false,
     };
 
-    let dispatch_result = crate::crew::dispatch::dispatch(dispatch_opts)
-        .map_err(|e| {
+    // Emit dispatch flow record.
+    let _ = crate::flow::record(build_review_record(
+        crate::flow::Level::Info,
+        crate::flow::Category::Machinery,
+        crate::flow::Tier::Local,
+        crate::flow::Stage::Review,
+        "dispatch code-reviewer".to_string(),
+        session_id.clone(),
+        &session_id,
+        sprint_id,
+    ));
+
+    let dispatch_result = match crate::crew::dispatch::dispatch(dispatch_opts) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = crate::flow::record(build_review_record(
+                crate::flow::Level::Error,
+                crate::flow::Category::Machinery,
+                crate::flow::Tier::Local,
+                crate::flow::Stage::Review,
+                "dispatch failed".to_string(),
+                truncate(&format!("{e}"), 200),
+                &session_id,
+                sprint_id,
+            ));
             eprintln!("warning: crew dispatch failed ({e}); emitting empty review");
-            anyhow::anyhow!("crew dispatch failed: {e}")
-        })?;
+            return Err(anyhow::anyhow!("crew dispatch failed: {e}"));
+        }
+    };
 
     // Unwrap the openclaw JSON envelope FIRST — the SIGNOFF text lives inside
     // .payloads[].text, escaped. Without unwrapping, parse_signoff sees JSON
@@ -731,7 +825,7 @@ pub(crate) fn sprint_review_at(path: &Path, base: Option<&str>, require_clean: b
     let output = SprintReviewOutput {
         branch,
         base: base_ref.to_string(),
-        reviewer_session_id: Some(session_id),
+        reviewer_session_id: Some(session_id.clone()),
         diff_files_changed: files_changed,
         total_findings: signoff.block + signoff.flag + signoff.nit,
         by_severity: SeverityCounts {
@@ -743,6 +837,18 @@ pub(crate) fn sprint_review_at(path: &Path, base: Option<&str>, require_clean: b
         verdict: signoff.verdict.clone(),
     };
 
+    // Emit verdict flow record.
+    let _ = crate::flow::record(build_review_record(
+        crate::flow::Level::Info,
+        crate::flow::Category::Review,
+        crate::flow::Tier::Frontier,
+        crate::flow::Stage::Review,
+        format!("verdict: {}", signoff.verdict.clone()),
+        format!("{}B / {}F / {}N", signoff.block, signoff.flag, signoff.nit),
+        &session_id,
+        sprint_id,
+    ));
+
     println!("{}", serde_json::to_string_pretty(&output)?);
 
     Ok(if require_clean && signoff.block > 0 { 1 } else { 0 })
@@ -752,9 +858,10 @@ pub(crate) fn sprint_review_at(path: &Path, base: Option<&str>, require_clean: b
 pub fn sprint_review(
     base: Option<&str>,
     require_clean: bool,
+    sprint_id: Option<&str>,
 ) -> Result<i32> {
     let path = std::env::current_dir()?;
-    sprint_review_at(&path, base, require_clean)
+    sprint_review_at(&path, base, require_clean, sprint_id)
 }
 
 #[cfg(test)]
@@ -1222,5 +1329,215 @@ mod tests {
         let input = "QA-REVIEW-SIGNOFF\n- [BLOCK] src/main.rs:5 — null pointer";
         let result = parse_signoff(input);
         assert_eq!(result.verdict, "blockers");
+    }
+
+    // ── sprint review flow record tests ───────────────────────────────────
+
+    struct FlowsDirGuard {
+        prev: Option<String>,
+        tmp: tempfile::TempDir,
+    }
+
+    impl FlowsDirGuard {
+        fn new() -> Self {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+            // SAFETY: serialized via `#[serial_test::serial]`.
+            unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path()); }
+            Self { prev, tmp }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            self.tmp.path()
+        }
+    }
+
+    impl Drop for FlowsDirGuard {
+        fn drop(&mut self) {
+            // SAFETY: serialized via the test attribute.
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                    None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+                }
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn review_start_record_has_review_category_and_frontier_tier() {
+        let guard = FlowsDirGuard::new();
+
+        // Create a minimal git repo with NO diff (empty-diff path).
+        let repo = tempfile::TempDir::new().unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(repo.path())
+            .output()
+            .ok();
+
+        crate::sprint_cli::sprint_review_at(repo.path(), None, false, Some("66")).unwrap();
+
+        // Read all jsonl files; expect 2 records (start + verdict).
+        let files: Vec<_> = std::fs::read_dir(guard.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("jsonl"))
+            .collect();
+
+        let records: Vec<String> = files.iter()
+            .flat_map(|p| {
+                let content = std::fs::read_to_string(p).unwrap();
+                content.lines().map(String::from).collect::<Vec<_>>()
+            })
+            .filter(|l| !l.contains("\"_type\":\"schema\""))
+            .collect();
+
+        assert_eq!(records.len(), 2, "expected start + verdict records");
+
+        // Parse each and check the first is review-start.
+        let start: serde_json::Value = serde_json::from_str(&records[0]).unwrap();
+        assert_eq!(start["action"], "sprint review begin");
+        assert_eq!(start["category"], "review");
+        assert_eq!(start["tier"], "frontier");
+
+        // Second is verdict.
+        let verdict: serde_json::Value = serde_json::from_str(&records[1]).unwrap();
+        let action: &str = verdict["action"].as_str().unwrap();
+        assert!(action.starts_with("verdict:"));
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn verdict_record_handle_has_block_flag_nit_count_format() {
+        let guard = FlowsDirGuard::new();
+
+        // Empty diff → verdict handle = "0B / 0F / 0N".
+        let repo = tempfile::TempDir::new().unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(repo.path())
+            .output()
+            .ok();
+
+        crate::sprint_cli::sprint_review_at(repo.path(), None, false, Some("66")).unwrap();
+
+        let records = collect_records(guard.path());
+        // Find verdict record (action starts with "verdict:").
+        let verdict = records.iter()
+            .find(|r| {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(r) {
+                    if let Some(s) = v["action"].as_str() {
+                        return s.starts_with("verdict: ");
+                    }
+                }
+                false
+            })
+            .expect("expected verdict record");
+
+        let v: serde_json::Value = serde_json::from_str(verdict).unwrap();
+        assert_eq!(v["handle"], "0B / 0F / 0N");
+    }
+
+    #[test]
+    fn dispatch_failed_record_has_error_level_and_machinery_category() {
+        // Test the dispatch-failed record SHAPE directly via build_review_record.
+        // Triggering a real dispatch failure inside sprint_review_at requires a
+        // repo with a non-empty diff against `main` AND a guaranteed dispatch
+        // path — neither is reliable across CI envs (the temp repo has no
+        // `main` branch in CI's git defaults). Testing the helper directly
+        // captures the contract without env-coupling.
+        let record = crate::sprint_cli::build_review_record(
+            crate::flow::Level::Error,
+            crate::flow::Category::Machinery,
+            crate::flow::Tier::Local,
+            crate::flow::Stage::Review,
+            "dispatch failed".to_string(),
+            "openclaw exit 1".to_string(),
+            "sprint-review-12345",
+            Some("66"),
+        );
+
+        let json = serde_json::to_value(&record).unwrap();
+        assert_eq!(json["level"], "error");
+        assert_eq!(json["category"], "machinery");
+        assert_eq!(json["tier"], "local");
+        assert_eq!(json["stage"], "review");
+        assert_eq!(json["action"], "dispatch failed");
+        assert_eq!(json["source"], "sprint_review");
+        assert_eq!(json["sprint_id"], "66");
+        assert_eq!(json["session_id"], "sprint-review-12345");
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn flow_record_failure_does_not_crash_review() {
+        // Point DARKMUX_FLOWS_DIR at a read-only path so flow::record fails.
+        // The review should still complete normally (observability is non-fatal).
+        // Empty-diff repo: avoids dispatching to live LMStudio.
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Make the dir read-only — record() will fail to write.
+        let mut perms = std::fs::metadata(tmp.path()).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(tmp.path(), perms).unwrap();
+
+        // Empty-diff git repo: the empty-diff early-return path still emits
+        // both start and verdict flow records, exercising the non-fatal
+        // contract without going down the dispatch path.
+        let repo = tempfile::TempDir::new().unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(repo.path())
+            .output()
+            .ok();
+
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        // SAFETY: serial test.
+        unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path()); }
+
+        let result = crate::sprint_cli::sprint_review_at(repo.path(), None, false, Some("66"));
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+
+        // Even though flow recording fails, review should succeed (non-fatal).
+        assert!(result.is_ok(), "review verb succeeds despite flow record failure");
+
+        // Verify no records were written (flow recording failed non-fatally).
+        let jsonl_count: usize = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    == Some("jsonl")
+            })
+            .count();
+        assert_eq!(jsonl_count, 0, "expected no flow records written to read-only dir");
+    }
+
+    /// Read all non-schema record lines from jsonl files in a directory.
+    fn collect_records(dir: &std::path::Path) -> Vec<String> {
+        let paths: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("jsonl"))
+            .collect();
+        paths.iter()
+            .flat_map(|p| {
+                let content = std::fs::read_to_string(p).unwrap();
+                content.lines().map(String::from).collect::<Vec<_>>()
+            })
+            .filter(|l| !l.contains("\"_type\":\"schema\""))
+            .collect()
     }
 }
