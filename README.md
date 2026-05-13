@@ -142,7 +142,7 @@ Bigger context wins long tasks. Slim config wins bounded tasks. **No static conf
 
 1. **`darkmux swap <profile>`** — bare CLI for users who classify themselves. Unloads/loads models in LMStudio according to a named profile. ~10s wall to swap.
 
-2. **Multi-config registry** — a JSON file naming profiles (`fast`, `balanced`, `deep`) with model IDs, context lengths, compaction settings. Profiles can also encode "warm pair" (primary + companion compactor) configurations.
+2. **Multi-config registry** — a JSON file naming profiles (`fast`, `balanced`, `deep`, plus the bundled `gpt-oss` preset for the MXFP4 build of OpenAI's open-source 120B on Apple Silicon — note: `gpt-oss` requires OpenClaw ≥ v2026.5.9-beta.1 for the harmony-format / tool-payload fix) with model IDs, context lengths, compaction settings. Profiles can also encode "warm pair" (primary + companion compactor) configurations.
 
 3. **`darkmux serve` (proxy mode)** — OpenAI-compatible HTTP frontend. Intercepts requests, classifies the task (heuristics first, optional LLM-classifier later), routes to the right loaded profile, swaps if needed.
 
