@@ -436,6 +436,41 @@ pub fn suggestion_to_profile_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hardware::{HardwareSpec, Platform};
+
+    /// Synthesized M5 Max 128 GB fixture — falls into the `Xl` RAM tier
+    /// so `active_provider` returns `m_series_128`. Used by tests that pin
+    /// the M5-class rules table (262K bigctx, v15-5 shape, etc.) to assert
+    /// against the right provider regardless of where the test runs.
+    fn apple_silicon_128gb() -> HardwareSpec {
+        HardwareSpec {
+            platform: Platform::AppleSilicon,
+            arch: "aarch64".into(),
+            total_ram_gb: 128,
+            physical_cores: 14,
+            performance_cores: Some(10),
+            efficiency_cores: Some(4),
+            has_unified_memory: true,
+        }
+    }
+
+    /// Synthesized M1 Max 32 GB fixture — falls into the `Small` RAM tier
+    /// so `active_provider` returns `m_series_32`. Kept available for
+    /// future cross-tier coverage even when no current test uses it; the
+    /// allowance is intentional so adding a 32GB-tier regression doesn't
+    /// require re-declaring the fixture.
+    #[allow(dead_code)]
+    fn apple_silicon_32gb() -> HardwareSpec {
+        HardwareSpec {
+            platform: Platform::AppleSilicon,
+            arch: "aarch64".into(),
+            total_ram_gb: 32,
+            physical_cores: 10,
+            performance_cores: Some(8),
+            efficiency_cores: Some(2),
+            has_unified_memory: true,
+        }
+    }
 
     fn meta(key: &str, params: Option<&str>, arch: Option<&str>, max_ctx: u32, size: u64) -> ModelMeta {
         ModelMeta {
@@ -486,28 +521,28 @@ mod tests {
         assert_eq!(classify_architecture(&m), Architecture::Unknown);
     }
 
-    // Hardware-dependent: assumes the local hardware lands on a provider
-    // whose long-task rules produce the M5 Max 128GB numbers. On smaller
-    // runners (incl. GH Actions macos-latest), the heuristics pick the
-    // `generic` fallback with different shapes. Tracked separately; run
-    // locally on a matching machine via `cargo test -- --include-ignored`.
-    #[ignore = "hardware-dependent; assumes M5 Max 128GB-class runner"]
+    // These tests pin the M5 Max 128 GB-class rules table (262K bigctx,
+    // v15-5 shape, paired-compactor numbers). Previously `#[ignore]`d
+    // because they called `suggest_profile` which detects from the running
+    // host's hardware — fine on the dev rig, but CI's macos-latest runner
+    // lands on `generic` with different numbers. Switching to
+    // `suggest_profile_for` with the synthesized 128 GB fixture above
+    // makes them hardware-agnostic without losing the M5-class coverage.
     #[test]
     fn medium_long_picks_bigctx_shape() {
         // Article 2 reference: 35B-A3B at long → 262K + 120K compactor
         let m = meta("qwen3.6-35b-a3b", Some("35B"), Some("qwen3_5_moe"), 262_144, 0);
-        let s = suggest_profile(&m, TaskClass::Long);
+        let s = suggest_profile_for(&m, TaskClass::Long, &apple_silicon_128gb());
         assert_eq!(s.primary_n_ctx, 262_144);
         assert!(s.compactor.is_some());
         assert_eq!(s.compactor.as_ref().unwrap().n_ctx, 120_000);
         assert!(s.include_compaction_settings);
     }
 
-    #[ignore = "hardware-dependent; assumes M5 Max 128GB-class runner"]
     #[test]
     fn medium_mid_picks_v15_5_shape() {
         let m = meta("qwen3.6-35b-a3b", Some("35B"), Some("qwen3_5_moe"), 262_144, 0);
-        let s = suggest_profile(&m, TaskClass::Mid);
+        let s = suggest_profile_for(&m, TaskClass::Mid, &apple_silicon_128gb());
         assert_eq!(s.primary_n_ctx, 101_000);
         let c = s.compactor.as_ref().unwrap();
         assert_eq!(c.n_ctx, 68_000);
@@ -523,12 +558,13 @@ mod tests {
         }
     }
 
-    #[ignore = "hardware-dependent; rules table varies by RAM tier"]
     #[test]
     fn ctx_capped_at_max_context_length() {
-        // Model claims maxCtx=40K but rules suggest 100K → should cap at 40K.
+        // Model claims maxCtx=40K but the 128 GB-tier Mid rule suggests
+        // 101K → should cap at 40K. Pin to the 128 GB fixture so the cap
+        // behavior is exercised against the highest-ctx provider.
         let m = meta("x", Some("35B"), Some("qwen3_5_moe"), 40_000, 0);
-        let s = suggest_profile(&m, TaskClass::Mid);
+        let s = suggest_profile_for(&m, TaskClass::Mid, &apple_silicon_128gb());
         assert_eq!(s.primary_n_ctx, 40_000);
     }
 
@@ -539,11 +575,13 @@ mod tests {
         assert!(s.compactor.is_none());
     }
 
-    #[ignore = "hardware-dependent; assumes a paired-compactor rule fires on the runner"]
     #[test]
     fn suggestion_to_profile_json_emits_compaction_block_when_paired() {
+        // 128 GB-tier Long task pairs a compactor → JSON should carry a
+        // `runtime.compaction` block. Pin the fixture so the test doesn't
+        // depend on whether the local rig's tier pairs a compactor.
         let m = meta("qwen3.6-35b-a3b", Some("35B"), Some("qwen3_5_moe"), 262_144, 0);
-        let s = suggest_profile(&m, TaskClass::Long);
+        let s = suggest_profile_for(&m, TaskClass::Long, &apple_silicon_128gb());
         let json = suggestion_to_profile_json("test", "qwen3.6-35b-a3b", &s, None);
         let obj = json.as_object().unwrap().get("test").unwrap();
         let runtime = obj.get("runtime").unwrap();
@@ -581,11 +619,12 @@ mod tests {
     /// Regression for code review #7: when max_ctx caps the primary down
     /// below the canonical compactor n_ctx, the compactor must clamp too —
     /// otherwise we'd ship "compactor bigger than primary" which is broken.
-    #[ignore = "hardware-dependent; rules table varies by RAM tier"]
+    /// Pin to the 128 GB fixture to exercise the canonical 101K/68K shape
+    /// being capped down to 40K.
     #[test]
     fn compactor_n_ctx_clamps_to_capped_primary() {
         let m = meta("constrained-medium", Some("35B"), Some("qwen3_5_moe"), 40_000, 0);
-        let s = suggest_profile(&m, TaskClass::Mid);
+        let s = suggest_profile_for(&m, TaskClass::Mid, &apple_silicon_128gb());
         assert_eq!(s.primary_n_ctx, 40_000); // capped from canonical 101K
         let c = s.compactor.expect("Mid medium pairs a compactor");
         // Canonical Mid medium compactor is 68K, but primary capped at 40K
