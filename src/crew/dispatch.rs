@@ -409,6 +409,15 @@ pub(crate) fn build_dispatch_record(
 ///
 /// Non-fatal everywhere — a missing model annotation degrades to no
 /// `model` field on the flow record, not a failed dispatch.
+///
+/// Deliberately silent on failure: surfacing "no model resolved" as
+/// stderr noise on every dispatch would conflict with the dispatcher's
+/// existing minimal output. The structural "is the model pinned?"
+/// check belongs to `darkmux doctor`'s `agents-default-model-resolves`
+/// rule (#91/#102), which runs at operator-explicit pre-flight time
+/// and is the right place for that signal. The flow record's absent
+/// `model` field is operator-visible enough on its own — it shows as
+/// missing in the viewer, which is the same signal in the right place.
 pub(crate) fn resolve_dispatch_model(agent_id: &str) -> Option<String> {
     let path = default_openclaw_config();
     let raw = fs::read_to_string(&path).ok()?;

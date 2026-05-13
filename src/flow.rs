@@ -73,10 +73,11 @@ pub struct FlowRecord {
     /// dispatch records (`tier=local, stage=dispatch`) so the viewer
     /// can render which model ran the work without cross-referencing
     /// the model-status pill's timestamp. Resolved from openclaw config
-    /// at dispatch entry: `agents.list[<agent-id>].model` ?? `agents.
-    /// defaults.model.primary`. None for non-dispatch records (lifecycle
-    /// transitions, sprint review verdicts) and for dispatches where
-    /// the openclaw config can't be resolved. Schema 1.2 addition (#106).
+    /// at dispatch entry: first checks `agents.list[<agent-id>].model`,
+    /// then falls back to `agents.defaults.model.primary` when absent.
+    /// None for non-dispatch records (lifecycle transitions, sprint
+    /// review verdicts) and for dispatches where the openclaw config
+    /// can't be resolved. Schema 1.2 addition (#106).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 }
