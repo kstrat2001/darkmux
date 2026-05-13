@@ -490,6 +490,12 @@ fn eval_n_ctx_exceeds_max(ctx: &Context) -> Verdict {
     }
 }
 
+// Companion to `agents-default-model-resolves` (added #91): that rule
+// checks the `lms ls` (downloadable) half at Fail severity; this one
+// checks the `lms ps` (loaded-now) half at Warn severity. On a fully-
+// missing compactor both fire with complementary messages, which is
+// intentional — the operator sees both the "won't load at all" Fail
+// and the "won't be warm at dispatch time" Warn.
 fn eval_compactor_not_loaded(ctx: &Context) -> Verdict {
     let Some(config) = ctx.openclaw_config.as_ref() else {
         return Verdict::Skipped("no ~/.openclaw/openclaw.json".into());
@@ -600,6 +606,12 @@ fn eval_memory_headroom(ctx: &Context) -> Verdict {
 ///   `"lmstudio/darkmux:qwen3.6-35b-a3b"` → `"qwen3.6-35b-a3b"`
 ///   `"darkmux:foo"` → `"foo"`
 ///   `"foo"` → `"foo"`
+///
+/// Assumes LMStudio's `modelKey` is a bare slug (no embedded `/`). Today
+/// that's the contract (see `lms.rs::meta_from_json`); if LMStudio ever
+/// surfaces HuggingFace-style `owner/repo` keys verbatim through
+/// `modelKey`, this strip becomes lossy and the rule's match logic needs
+/// to switch to a longest-suffix comparison.
 fn strip_model_id_prefixes(id: &str) -> &str {
     let after_provider = id.rsplit('/').next().unwrap_or(id);
     after_provider.strip_prefix("darkmux:").unwrap_or(after_provider)
