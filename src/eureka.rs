@@ -557,7 +557,7 @@ fn eval_memory_headroom(ctx: &Context) -> Verdict {
     }
 }
 
-fn parse_size_gb(s: &str) -> Option<f64> {
+pub fn parse_size_gb(s: &str) -> Option<f64> {
     // LMStudio reports sizes like "18.45 GB" or "2.15 GB" — best-effort
     // parse, returns None on anything unexpected.
     let s = s.trim();

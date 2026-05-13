@@ -47,11 +47,20 @@ fn model_from_json(v: &serde_json::Value) -> LoadedModel {
         .and_then(|x| x.as_str())
         .unwrap_or_default()
         .to_string();
+    // Real `lms ps --json` reports `sizeBytes` (integer) — the string
+    // `size` field is only present in older / text-shimmed payloads.
+    // Format bytes to decimal GB (LMStudio's text-output convention)
+    // so downstream parsers see a consistent "X.XX GB" representation.
     let size = v
         .get("size")
         .and_then(|x| x.as_str())
-        .unwrap_or_default()
-        .to_string();
+        .map(str::to_string)
+        .or_else(|| {
+            v.get("sizeBytes")
+                .and_then(|x| x.as_u64())
+                .map(|b| format!("{:.2} GB", b as f64 / 1_000_000_000.0))
+        })
+        .unwrap_or_default();
     let context = v
         .get("contextLength")
         .or_else(|| v.get("context"))
@@ -264,6 +273,40 @@ mod tests {
         assert_eq!(m.identifier, "fallback-id");
         assert_eq!(m.model, "fallback-id");
         assert_eq!(m.context, 1000);
+    }
+
+    #[test]
+    fn parses_json_size_bytes_to_decimal_gb() {
+        // Real `lms ps --json` payload shape — `sizeBytes` integer, no
+        // `size` string. Verifies the production wire format produces a
+        // populated `size` field that downstream parsers can consume.
+        // 12,104,297,682 bytes is gpt-oss-20b observed live on 2026-05-13.
+        let v = json!({
+            "identifier": "openai/gpt-oss-20b",
+            "modelKey": "openai/gpt-oss-20b",
+            "status": "idle",
+            "sizeBytes": 12_104_297_682u64,
+            "contextLength": 32768
+        });
+        let m = model_from_json(&v);
+        assert_eq!(m.size, "12.10 GB");
+        assert_eq!(m.context, 32768);
+    }
+
+    #[test]
+    fn parses_json_prefers_size_string_when_both_present() {
+        // Defensive: if both fields are present, the explicit string wins
+        // so older shim payloads keep their pre-formatted display.
+        let v = json!({
+            "identifier": "x",
+            "modelKey": "x",
+            "status": "idle",
+            "size": "5.00 GB",
+            "sizeBytes": 9_999_999_999u64,
+            "contextLength": 1
+        });
+        let m = model_from_json(&v);
+        assert_eq!(m.size, "5.00 GB");
     }
 
     #[test]
