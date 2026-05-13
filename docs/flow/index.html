@@ -401,6 +401,100 @@
   .modal p { margin: 6px 0; color: var(--text); font-size: 14px; }
   .modal p.muted { color: var(--muted); font-size: 13px; margin-top: 14px; }
   .modal code { background: var(--bg-elev2); padding: 1px 5px; border-radius: 3px; }
+  /* Neutral variant — used by non-error modals (e.g. the model-status
+   * detail panel from #87). The schema-major BLOCK modal stays red. */
+  .modal.neutral { border-color: var(--accent-dim); max-width: 640px; }
+  .modal.neutral h2 { color: var(--accent); }
+  .modal-close {
+    float: right;
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    cursor: pointer;
+    padding: 2px 8px;
+    border-radius: 3px;
+    font-size: 13px;
+  }
+  .modal-close:hover { color: var(--accent); border-color: var(--accent-dim); }
+
+  /* ─── model-status pill in the toolbar (issue #87) ──────────────── */
+  .model-pill {
+    margin-left: auto; /* flush right; sits at the toolbar's tail */
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 10px;
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    font-size: 12px;
+    font-family: 'JetBrains Mono', monospace;
+    color: var(--muted);
+    cursor: pointer;
+    max-width: 360px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .model-pill:hover { border-color: var(--accent-dim); color: var(--accent); }
+  .model-pill .pill-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    background: var(--dim);
+  }
+  .model-pill.idle      .pill-dot { background: var(--good); }
+  .model-pill.busy      .pill-dot { background: var(--warn); }
+  .model-pill.empty     .pill-dot { background: var(--dim); }
+  .model-pill.offline   .pill-dot { background: var(--bad); }
+  .model-pill .pill-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
+  }
+
+  /* ─── model-status modal body ─────────────────────────────────── */
+  .model-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 10px;
+    font-size: 13px;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .model-table th, .model-table td {
+    text-align: left;
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border);
+  }
+  .model-table th {
+    color: var(--muted);
+    font-weight: 500;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .model-table tr:last-child td { border-bottom: none; }
+  .model-table .col-status {
+    text-transform: uppercase;
+    font-size: 11px;
+    letter-spacing: 0.04em;
+  }
+  .model-table .col-status.idle { color: var(--good); }
+  .model-table .col-status.busy { color: var(--warn); }
+  .modal-foot {
+    margin-top: 14px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .modal-foot button {
+    font-size: 12px;
+    padding: 3px 10px;
+  }
 </style>
 </head>
 <body>
@@ -424,6 +518,13 @@
     <input type="date" id="date-input">
     <span class="toolbar-label">filter:</span>
     <input type="text" id="search-input" placeholder="action / handle text…">
+    <!-- Model-status pill (#87). margin-left:auto in CSS flushes it right.
+         Click to open the detail modal. Hidden until the viewer connects
+         to a daemon (file/sample modes have no live model state to poll). -->
+    <button id="model-pill" class="model-pill" style="display:none" title="loaded models · click for details">
+      <span class="pill-dot"></span>
+      <span class="pill-label">checking…</span>
+    </button>
   </div>
 
   <main>
@@ -477,6 +578,21 @@
       <h2>Viewer out of date</h2>
       <p id="schema-modal-text"></p>
       <p class="muted">Update the viewer (or downgrade the daemon) and reload. See <a href="https://github.com/kstrat2001/darkmux/issues/66">#66</a>.</p>
+    </div>
+  </div>
+
+  <!-- Model-status detail modal (#87). Opened from the toolbar pill;
+       reuses the .modal-backdrop / .modal infrastructure from #83 with
+       the .neutral variant so the border isn't bad-red. -->
+  <div id="model-modal" class="modal-backdrop">
+    <div class="modal neutral">
+      <button class="modal-close" id="model-modal-close" title="close (Esc)">✕</button>
+      <h2>Loaded models</h2>
+      <div id="model-modal-body"></div>
+      <div class="modal-foot">
+        <span id="model-modal-stamp"></span>
+        <button id="model-modal-refresh">↻ refresh</button>
+      </div>
     </div>
   </div>
 
@@ -973,6 +1089,184 @@ setSource = function(label, kind) {
   else if (kind === 'daemon') cls += ' live';
   else if (kind === 'file')   cls += ' local';
   connEl.className = cls;
+};
+
+// ─── model-status pill + modal (issue #87) ────────────────────────────
+// Polls `GET /model/status` while connected to a daemon. Renders a
+// compact toolbar pill for ambient awareness; click opens the modal
+// with the full per-model table. Polling cadence is intentionally
+// loose (3s) — `lms ps` is fast but every poll forks a subprocess
+// server-side, and the pill is for "is my stack alive" not real-time
+// telemetry.
+const MODEL_POLL_INTERVAL_MS = 3000;
+const MODEL_PILL_TRUNC_CHARS  = 14;
+const MODEL_PILL_MAX_NAMES    = 2;
+
+let modelPollTimer  = null;
+let modelLastResp   = null;
+
+const modelPillEl     = document.getElementById('model-pill');
+const modelPillDot    = modelPillEl.querySelector('.pill-dot');
+const modelPillLabel  = modelPillEl.querySelector('.pill-label');
+const modelModalEl    = document.getElementById('model-modal');
+const modelModalBody  = document.getElementById('model-modal-body');
+const modelModalStamp = document.getElementById('model-modal-stamp');
+const modelModalClose = document.getElementById('model-modal-close');
+const modelModalRefresh = document.getElementById('model-modal-refresh');
+
+function truncIdentifier(id) {
+  // Drop the `darkmux:` namespace when present — the pill is space-tight
+  // and the operator already knows their loads are namespaced. Modal
+  // shows the full identifier.
+  const bare = id.startsWith('darkmux:') ? id.slice(8) : id;
+  if (bare.length <= MODEL_PILL_TRUNC_CHARS) return bare;
+  return bare.slice(0, MODEL_PILL_TRUNC_CHARS - 1) + '…';
+}
+
+function formatStamp(ms) {
+  if (!ms) return '';
+  const d = new Date(ms);
+  return d.toLocaleTimeString();
+}
+
+function renderModelPill(payload) {
+  modelPillEl.classList.remove('idle', 'busy', 'empty', 'offline');
+  if (!payload) {
+    modelPillEl.classList.add('offline');
+    modelPillLabel.textContent = 'daemon offline';
+    return;
+  }
+  if (payload.lms_unreachable) {
+    modelPillEl.classList.add('offline');
+    modelPillLabel.textContent = 'lms unreachable';
+    return;
+  }
+  const models = payload.models || [];
+  if (models.length === 0) {
+    modelPillEl.classList.add('empty');
+    modelPillLabel.textContent = 'no models loaded';
+    return;
+  }
+  // Any busy → pill is busy; else idle.
+  const anyBusy = models.some(m => (m.status || '').toLowerCase() === 'busy');
+  modelPillEl.classList.add(anyBusy ? 'busy' : 'idle');
+  const shown = models.slice(0, MODEL_PILL_MAX_NAMES).map(m => {
+    const ctxK = m.context ? Math.round(m.context / 1000) + 'k' : '?';
+    return `${truncIdentifier(m.identifier)}·${ctxK}`;
+  });
+  let label = shown.join(' + ');
+  if (models.length > MODEL_PILL_MAX_NAMES) {
+    label += ` +${models.length - MODEL_PILL_MAX_NAMES} more`;
+  }
+  modelPillLabel.textContent = label;
+}
+
+function renderModelModal(payload) {
+  if (!payload) {
+    modelModalBody.innerHTML = '<p class="muted">Daemon unreachable.</p>';
+    modelModalStamp.textContent = '';
+    return;
+  }
+  if (payload.lms_unreachable) {
+    modelModalBody.innerHTML = '<p class="muted">The <code>lms</code> binary couldn\'t be reached from the daemon — install LMStudio\'s CLI or start LMStudio.</p>';
+    modelModalStamp.textContent = `last polled: ${formatStamp(payload.generated_at_ms)}`;
+    return;
+  }
+  const models = payload.models || [];
+  if (models.length === 0) {
+    modelModalBody.innerHTML = '<p class="muted">No models currently loaded in LMStudio. Run <code>darkmux swap &lt;profile&gt;</code> or <code>lms load &lt;id&gt;</code>.</p>';
+    modelModalStamp.textContent = `last polled: ${formatStamp(payload.generated_at_ms)}`;
+    return;
+  }
+  const rows = models.map(m => {
+    const status = (m.status || '').toLowerCase();
+    const ctxK = m.context ? (m.context / 1000).toFixed(0) + 'k' : '—';
+    return `<tr>
+      <td>${escapeHtml(m.identifier || '')}</td>
+      <td>${escapeHtml(m.size || '')}</td>
+      <td>${escapeHtml(ctxK)}</td>
+      <td class="col-status ${status}">${escapeHtml(m.status || '')}</td>
+    </tr>`;
+  }).join('');
+  modelModalBody.innerHTML = `
+    <table class="model-table">
+      <thead><tr><th>identifier</th><th>size</th><th>ctx</th><th>status</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+  `;
+  modelModalStamp.textContent = `last polled: ${formatStamp(payload.generated_at_ms)} · ${models.length} model${models.length === 1 ? '' : 's'}`;
+}
+
+async function pollModelStatus() {
+  try {
+    const r = await fetch('http://localhost:8765/model/status');
+    if (!r.ok) {
+      modelLastResp = null;
+    } else {
+      modelLastResp = await r.json();
+    }
+  } catch (_) {
+    modelLastResp = null;
+  }
+  renderModelPill(modelLastResp);
+  if (modelModalEl.classList.contains('show')) {
+    renderModelModal(modelLastResp);
+  }
+}
+
+function startModelPolling() {
+  if (modelPollTimer) return;
+  modelPillEl.style.display = '';
+  pollModelStatus();
+  modelPollTimer = setInterval(pollModelStatus, MODEL_POLL_INTERVAL_MS);
+}
+
+function stopModelPolling() {
+  if (modelPollTimer) {
+    clearInterval(modelPollTimer);
+    modelPollTimer = null;
+  }
+  modelPillEl.style.display = 'none';
+  closeModelModal();
+}
+
+function openModelModal() {
+  modelModalEl.classList.add('show');
+  // Immediate refresh on open so the operator sees current state without
+  // waiting for the next poll tick.
+  pollModelStatus();
+  renderModelModal(modelLastResp);
+}
+function closeModelModal() {
+  modelModalEl.classList.remove('show');
+}
+
+modelPillEl.addEventListener('click', openModelModal);
+modelModalClose.addEventListener('click', closeModelModal);
+modelModalRefresh.addEventListener('click', () => {
+  modelModalRefresh.disabled = true;
+  pollModelStatus().finally(() => { modelModalRefresh.disabled = false; });
+});
+modelModalEl.addEventListener('click', (e) => {
+  // Backdrop click (outside the .modal box) closes the modal.
+  if (e.target === modelModalEl) closeModelModal();
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && modelModalEl.classList.contains('show')) {
+    closeModelModal();
+  }
+});
+
+// Hook the existing setSource override so pill polling tracks the
+// data-source lifecycle: enable when daemon/live, disable otherwise.
+const _prevSetSource = setSource;
+setSource = function(label, kind) {
+  _prevSetSource(label, kind);
+  if (kind === 'daemon' || kind === 'live') {
+    startModelPolling();
+  } else {
+    stopModelPolling();
+  }
 };
 
 // ─── auto-detect daemon on viewer load ─────────────────────────────────
