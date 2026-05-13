@@ -14,7 +14,7 @@ use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.0.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.1.0";
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -83,14 +83,29 @@ pub(crate) fn flows_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp/darkmux/flows"))
 }
 
-/// ISO 8601 UTC date string from a `SystemTime`.
-pub(crate) fn ts_utc_now() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+/// ISO 8601 UTC date string from current time — `YYYY-MM-DD`. Used for
+/// per-day file naming (one JSONL file per UTC day), NOT for record `ts`.
+pub(crate) fn day_utc_now() -> String {
+    let secs = current_epoch_secs();
     let (y, m, d) = epoch_to_yyyymmdd(secs);
     format!("{:04}-{:02}-{:02}", y, m, d)
+}
+
+/// ISO 8601 UTC datetime string from current time — `YYYY-MM-DDTHH:MM:SSZ`.
+/// Used for `FlowRecord.ts`. Seconds precision is sufficient for the
+/// dispatch / sprint timing surfaces; finer precision is a future bump.
+pub(crate) fn ts_utc_now() -> String {
+    let secs = current_epoch_secs();
+    let (y, mo, d) = epoch_to_yyyymmdd(secs);
+    let (h, mi, s) = epoch_to_hhmmss(secs);
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, mi, s)
+}
+
+fn current_epoch_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Convert unix epoch seconds to (year, month, day) in UTC.
@@ -110,6 +125,15 @@ fn epoch_to_yyyymmdd(epochs: i64) -> (i32, u8, u8) {
     (y, m as u8, d as u8)
 }
 
+/// Convert unix epoch seconds to (hour, minute, second) in UTC.
+fn epoch_to_hhmmss(epochs: i64) -> (u8, u8, u8) {
+    let secs_of_day = epochs.rem_euclid(86_400);
+    let h = (secs_of_day / 3600) as u8;
+    let mi = ((secs_of_day % 3600) / 60) as u8;
+    let s = (secs_of_day % 60) as u8;
+    (h, mi, s)
+}
+
 /// Append `record` to today's per-day JSONL file. Creates the file with a
 /// schema header as line 1 if it doesn't exist (written atomically with the
 /// first record so a partial file never ends up header-only).
@@ -119,7 +143,7 @@ fn epoch_to_yyyymmdd(epochs: i64) -> (i32, u8, u8) {
 /// explicit locking is needed.
 pub fn record(record: FlowRecord) -> Result<()> {
     let dir = flows_dir();
-    let day = ts_utc_now();
+    let day = day_utc_now();
     let path = dir.join(format!("{day}.jsonl"));
     record_at(&record, &path)
 }
@@ -430,11 +454,11 @@ mod tests {
         // Capture the day-key BEFORE calling record() so a midnight-UTC
         // crossing between record() and the assertion doesn't make the
         // file appear at a different name than we check. (record() reads
-        // ts_utc_now() once; we read it once too; both reads land in the
-        // same wall-clock window typically <1ms apart.)
-        let day_before = ts_utc_now();
+        // day_utc_now() once for the file path; we read it once too; both
+        // reads land in the same wall-clock window typically <1ms apart.)
+        let day_before = day_utc_now();
         super::record(rec).unwrap();
-        let day_after = ts_utc_now();
+        let day_after = day_utc_now();
 
         // SAFETY: same — serialized via the test attribute.
         unsafe {
@@ -482,6 +506,68 @@ mod tests {
         // Mid-year: 2024-07-04 = epoch 1_720_051_200
         let (y, m, d) = epoch_to_yyyymmdd(1_720_051_200);
         assert_eq!((y, m, d), (2024, 7, 4));
+    }
+
+    #[test]
+    fn epoch_to_hhmmss_known_times() {
+        // Midnight
+        assert_eq!(epoch_to_hhmmss(0), (0, 0, 0));
+        // 2024-01-01 00:00:00 UTC
+        assert_eq!(epoch_to_hhmmss(1_704_067_200), (0, 0, 0));
+        // 2024-01-01 12:34:56 UTC = epoch start + 12*3600 + 34*60 + 56 = 1_704_067_200 + 45_296
+        assert_eq!(epoch_to_hhmmss(1_704_067_200 + 45_296), (12, 34, 56));
+        // 23:59:59 boundary: midnight - 1 second
+        assert_eq!(epoch_to_hhmmss(86_400 - 1), (23, 59, 59));
+        // Mid-day check: epoch 1_720_094_400 = 2024-07-04 12:00:00 UTC
+        // (epoch 1_720_051_200 is 2024-07-04 00:00:00 UTC; +43_200s = noon)
+        assert_eq!(epoch_to_hhmmss(1_720_051_200 + 43_200), (12, 0, 0));
+    }
+
+    #[test]
+    fn ts_utc_now_returns_iso8601_datetime() {
+        // Schema 1.1: ts must be full datetime with time-of-day, not just a date.
+        let ts = ts_utc_now();
+        let bytes = ts.as_bytes();
+        assert_eq!(ts.len(), 20, "expected YYYY-MM-DDTHH:MM:SSZ (20 chars), got {ts:?}");
+        assert_eq!(bytes[4], b'-');
+        assert_eq!(bytes[7], b'-');
+        assert_eq!(bytes[10], b'T');
+        assert_eq!(bytes[13], b':');
+        assert_eq!(bytes[16], b':');
+        assert_eq!(bytes[19], b'Z');
+        // Digits in the expected positions
+        for &i in &[0usize, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18] {
+            assert!(
+                bytes[i].is_ascii_digit(),
+                "expected digit at index {i} in {ts:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn day_utc_now_returns_date_only() {
+        // day_utc_now() is for file naming — must stay YYYY-MM-DD regardless
+        // of the schema bump on ts_utc_now().
+        let day = day_utc_now();
+        let bytes = day.as_bytes();
+        assert_eq!(day.len(), 10, "expected YYYY-MM-DD (10 chars), got {day:?}");
+        assert_eq!(bytes[4], b'-');
+        assert_eq!(bytes[7], b'-');
+        for &i in &[0usize, 1, 2, 3, 5, 6, 8, 9] {
+            assert!(
+                bytes[i].is_ascii_digit(),
+                "expected digit at index {i} in {day:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn flow_schema_version_is_1_1_0() {
+        // Pin the schema version so an accidental rename can't ship silently;
+        // any bump beyond this should be a deliberate code change paired with
+        // an update to this assertion (and corresponding viewer EXPECTED_*
+        // bump if the change is breaking).
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.1.0");
     }
 
     #[test]
