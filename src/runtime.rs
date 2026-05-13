@@ -1,5 +1,5 @@
 use crate::swap::namespaced_identifier;
-use crate::types::{Profile, ProfileModel};
+use crate::types::{ModelRole, Profile, ProfileModel};
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use std::env;
@@ -52,7 +52,14 @@ pub fn resolve_openclaw_config_path(explicit_path: Option<&str>) -> Option<PathB
 ///     openclaw config to update — these aren't customizations, they're
 ///     consequences of `darkmux swap` issuing namespaced `lms load`s):
 ///     - `agents.defaults.model.primary` / `agents.defaults.compaction.model`
-///       rewritten from `lmstudio/<bare-id>` to `lmstudio/darkmux:<bare-id>`
+///       rewritten to the profile's `role: Primary` / `role: Compactor`
+///       namespaced identifier — replaces any prior pin, not just bare→
+///       namespaced (see #90; without this the operator can swap to a new
+///       profile and have dispatch keep requesting the prior profile's
+///       primary)
+///     - Legacy bare→namespaced rewrite still runs for any other
+///       darkmux-managed model references that may exist (extension point
+///       for future fields)
 ///     - `models.providers.*.models[].contextWindow` synced to profile n_ctx
 ///       for any matching bare-or-namespaced id
 ///     - Namespaced registry entries added when missing (see #61)
@@ -135,6 +142,9 @@ pub fn apply_runtime(profile: &Profile) -> Result<bool> {
     // These aren't operator customizations — they're consequences of issuing
     // namespaced `lms load`s in swap.rs. Without them, openclaw's view of the
     // model registry drifts from `lms ps` every swap (issue #72).
+    if sync_default_model_pins(&mut config, &profile.models) {
+        modified = true;
+    }
     if rewrite_namespaced_model_refs(&mut config, &profile.models) {
         modified = true;
     }
@@ -420,6 +430,135 @@ fn rewrite_namespaced_model_refs(config: &mut Value, models: &[ProfileModel]) ->
     modified
 }
 
+/// Rewrite the agent runtime's default model pins to match the active
+/// profile's roles. Closes #90 — without this, `darkmux swap` updates
+/// LMStudio's loaded state and openclaw's per-model `contextWindow`
+/// entries but leaves `agents.defaults.model.primary` pointing at the
+/// *prior* profile's primary, so the agent keeps requesting a model
+/// that may no longer be loaded (or downloaded).
+///
+/// Behavior:
+///   - `agents.defaults.model.primary` ← `lmstudio/<namespaced id>` of
+///     the profile's first `role: Primary` model. No-op if the profile
+///     has no Primary model.
+///   - `agents.defaults.compaction.model` ← same shape, for the
+///     profile's first `role: Compactor` model. (Note: `validate_profile`
+///     enforces exactly one Primary but doesn't bound the Compactor
+///     count; if a profile declares multiple Compactors, the first by
+///     declaration order is used. Documented "first wins" rather than
+///     adding a validator surface in this PR — the alternative would
+///     belong in `profiles::validate_profile`.) No-op if the profile
+///     has no Compactor; in that case any existing `compaction.model`
+///     is left alone (we don't promise to clear pins the new profile
+///     doesn't speak to — that would be a stronger contract than the
+///     issue asks for and could silently disable an operator's manual
+///     compactor pin).
+///   - **Only rewrites pins that are already `lmstudio/`-prefixed (or
+///     absent).** Pins with other provider prefixes (`openrouter/`,
+///     `xai/`, etc.) are operator routing decisions and are
+///     preserved — darkmux only manages the LMStudio surface.
+///   - When the operator opts out of the `darkmux:` namespace for a
+///     model (sets `identifier` explicitly), the explicit value is
+///     used: pin becomes `lmstudio/<explicit-identifier>`. The opt-out
+///     is the operator's chosen value, not a signal to skip the
+///     rewrite entirely.
+///   - Idempotent: a second call with the same profile is a no-op.
+///   - Creates any missing nesting in `agents.defaults.{model,compaction}`
+///     (matches the existing posture in `apply_runtime`'s
+///     context-tokens write).
+fn sync_default_model_pins(config: &mut Value, models: &[ProfileModel]) -> bool {
+    let primary_ref = models
+        .iter()
+        .find(|m| matches!(m.role, ModelRole::Primary))
+        .map(|m| format!("lmstudio/{}", namespaced_identifier(m)));
+    let compactor_ref = models
+        .iter()
+        .find(|m| matches!(m.role, ModelRole::Compactor))
+        .map(|m| format!("lmstudio/{}", namespaced_identifier(m)));
+
+    if primary_ref.is_none() && compactor_ref.is_none() {
+        return false;
+    }
+
+    let mut modified = false;
+
+    if let Some(want) = primary_ref {
+        let cur = config
+            .get("agents")
+            .and_then(|a| a.get("defaults"))
+            .and_then(|d| d.get("model"))
+            .and_then(|m| m.get("primary"))
+            .and_then(|p| p.as_str())
+            .map(String::from);
+        if should_rewrite_lmstudio_pin(cur.as_deref()) && cur.as_deref() != Some(want.as_str()) {
+            ensure_object_at_path(config, &["agents", "defaults", "model"])
+                .insert("primary".to_string(), Value::String(want));
+            modified = true;
+        }
+    }
+
+    if let Some(want) = compactor_ref {
+        let cur = config
+            .get("agents")
+            .and_then(|a| a.get("defaults"))
+            .and_then(|d| d.get("compaction"))
+            .and_then(|c| c.get("model"))
+            .and_then(|m| m.as_str())
+            .map(String::from);
+        if should_rewrite_lmstudio_pin(cur.as_deref()) && cur.as_deref() != Some(want.as_str()) {
+            ensure_object_at_path(config, &["agents", "defaults", "compaction"])
+                .insert("model".to_string(), Value::String(want));
+            modified = true;
+        }
+    }
+
+    modified
+}
+
+/// Walk `config` along `path`, creating missing intermediate objects.
+/// Returns a mutable reference to the innermost object so the caller
+/// can insert leaf fields. Panics if `config` is not an object at the
+/// root (`apply_runtime`'s JSON deserialization already guarantees
+/// this).
+fn ensure_object_at_path<'a>(
+    config: &'a mut Value,
+    path: &[&str],
+) -> &'a mut serde_json::Map<String, Value> {
+    let mut cursor = config
+        .as_object_mut()
+        .expect("config root must be a JSON object");
+    for key in path {
+        cursor = cursor
+            .entry((*key).to_string())
+            .or_insert_with(|| Value::Object(Default::default()))
+            .as_object_mut()
+            .expect("intermediate path entry must be a JSON object");
+    }
+    cursor
+}
+
+/// True when an existing pin is darkmux's to rewrite. False when the
+/// pin uses a non-LMStudio provider prefix (those are operator routing
+/// decisions and we leave them alone).
+///
+/// Three rewrite-eligible shapes:
+///   - `None` — no pin set yet
+///   - `Some("lmstudio/...")` — explicitly in the LMStudio provider
+///   - `Some("<bare-id>")` — no provider prefix at all. apply_runtime
+///     only enters this code path when `DARKMUX_RUNTIME_CMD=openclaw`
+///     and openclaw's default provider routing for bare ids resolves
+///     through LMStudio for darkmux-managed setups. A bare pin is most
+///     likely a hand-edited reference to the same target the prefixed
+///     form would reach (see #90 review M1 — without this, a stale
+///     bare pin survives swaps and reintroduces the bug).
+fn should_rewrite_lmstudio_pin(current: Option<&str>) -> bool {
+    match current {
+        None => true,
+        Some(c) if c.starts_with("lmstudio/") => true,
+        Some(c) => !c.contains('/'),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -687,8 +826,14 @@ mod tests {
         assert_eq!(after["agents"]["defaults"]["compaction"]["mode"], "default");
     }
 
+    /// Post-#90 contract: when the operator opts out of the `darkmux:`
+    /// namespace by setting `identifier` explicitly, the pin is rewritten
+    /// to use that operator-chosen value — `lmstudio/<explicit-identifier>`.
+    /// Previously (#77 era) this case skipped the pin entirely; #90's
+    /// force-rewrite respects the operator's explicit choice instead of
+    /// leaving the prior profile's pin in place.
     #[test]
-    fn skips_namespaced_rewrite_when_profile_sets_explicit_identifier() {
+    fn explicit_identifier_is_used_verbatim_in_primary_pin() {
         let tmp = TempDir::new().unwrap();
         let p = write_config(
             &tmp,
@@ -705,14 +850,13 @@ mod tests {
                 identifier: Some("my-explicit-alias".into()),
             }],
         );
-        // Profile sets explicit identifier → operator opted out of namespace
-        // for this load → primary reference should NOT be rewritten.
         let _ = apply_runtime(&profile).unwrap();
         let after: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
         assert_eq!(
             after["agents"]["defaults"]["model"]["primary"],
-            "lmstudio/foo"
+            "lmstudio/my-explicit-alias",
+            "explicit identifier is the operator's chosen value — pin uses it"
         );
     }
 
@@ -1112,6 +1256,277 @@ mod tests {
             .find(|m| m["id"] == "darkmux:openai/gpt-oss-20b")
             .expect("namespaced entry should have been added");
         assert_eq!(ns["contextWindow"], 100000);
+    }
+
+    /// The #90 repro: openclaw pins `primary` at one model id, operator
+    /// swaps to a profile whose Primary is a different model. After
+    /// apply, the pin must point at the new profile's namespaced
+    /// primary — otherwise the next dispatch requests an unloaded model.
+    #[test]
+    #[serial]
+    fn swap_rewrites_primary_pin_when_profile_diverges_from_openclaw() {
+        let tmp = TempDir::new().unwrap();
+        let p = write_config(
+            &tmp,
+            r#"{
+                "agents": {
+                    "defaults": {
+                        "model": { "primary": "lmstudio/darkmux:old-model" }
+                    }
+                }
+            }"#,
+        );
+        let profile = profile_without_runtime(vec![ProfileModel {
+            id: "new-model".into(),
+            n_ctx: 100000,
+            role: ModelRole::Primary,
+            identifier: None,
+        }]);
+
+        unsafe { env::set_var("DARKMUX_OPENCLAW_CONFIG", p.to_str().unwrap()) };
+        let modified = apply_runtime(&profile).unwrap();
+        unsafe { env::remove_var("DARKMUX_OPENCLAW_CONFIG") };
+
+        assert!(modified, "primary pin rewrite should fire");
+        let after: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(
+            after["agents"]["defaults"]["model"]["primary"],
+            "lmstudio/darkmux:new-model"
+        );
+    }
+
+    /// Same shape for the compaction pin: profile names a Compactor; the
+    /// existing pin (or its absence) gets replaced with the profile's
+    /// namespaced compactor id.
+    #[test]
+    #[serial]
+    fn swap_rewrites_compactor_pin_when_profile_has_role_compactor() {
+        let tmp = TempDir::new().unwrap();
+        let p = write_config(
+            &tmp,
+            r#"{
+                "agents": {
+                    "defaults": {
+                        "compaction": { "model": "lmstudio/darkmux:old-compactor" }
+                    }
+                }
+            }"#,
+        );
+        let profile = profile_without_runtime(vec![
+            ProfileModel {
+                id: "new-primary".into(),
+                n_ctx: 100000,
+                role: ModelRole::Primary,
+                identifier: None,
+            },
+            ProfileModel {
+                id: "new-compactor".into(),
+                n_ctx: 32000,
+                role: ModelRole::Compactor,
+                identifier: None,
+            },
+        ]);
+
+        unsafe { env::set_var("DARKMUX_OPENCLAW_CONFIG", p.to_str().unwrap()) };
+        let modified = apply_runtime(&profile).unwrap();
+        unsafe { env::remove_var("DARKMUX_OPENCLAW_CONFIG") };
+
+        assert!(modified);
+        let after: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(
+            after["agents"]["defaults"]["compaction"]["model"],
+            "lmstudio/darkmux:new-compactor"
+        );
+        assert_eq!(
+            after["agents"]["defaults"]["model"]["primary"],
+            "lmstudio/darkmux:new-primary"
+        );
+    }
+
+    /// Defensive: if the new profile has no Compactor, we don't clear the
+    /// existing `compaction.model` pin. Stronger contract than the issue
+    /// asks for and could silently disable an operator's manual setup.
+    #[test]
+    #[serial]
+    fn swap_leaves_compactor_pin_untouched_when_profile_has_no_compactor() {
+        let tmp = TempDir::new().unwrap();
+        let p = write_config(
+            &tmp,
+            r#"{
+                "agents": {
+                    "defaults": {
+                        "compaction": { "model": "lmstudio/darkmux:manual-compactor" }
+                    }
+                }
+            }"#,
+        );
+        // Primary-only profile (no Compactor role).
+        let profile = profile_without_runtime(vec![ProfileModel {
+            id: "primary-only".into(),
+            n_ctx: 100000,
+            role: ModelRole::Primary,
+            identifier: None,
+        }]);
+
+        unsafe { env::set_var("DARKMUX_OPENCLAW_CONFIG", p.to_str().unwrap()) };
+        let _ = apply_runtime(&profile).unwrap();
+        unsafe { env::remove_var("DARKMUX_OPENCLAW_CONFIG") };
+
+        let after: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(
+            after["agents"]["defaults"]["compaction"]["model"],
+            "lmstudio/darkmux:manual-compactor",
+            "compactor pin should be left alone when profile has no Compactor role"
+        );
+        // Primary was still rewritten — that role IS in the profile.
+        assert_eq!(
+            after["agents"]["defaults"]["model"]["primary"],
+            "lmstudio/darkmux:primary-only"
+        );
+    }
+
+    /// `apply_runtime` against a config with no `agents` block at all
+    /// must create the path on the way to writing the pin. Mirrors the
+    /// existing posture for `contextTokens` writes.
+    #[test]
+    #[serial]
+    fn swap_creates_agents_defaults_path_when_missing() {
+        let tmp = TempDir::new().unwrap();
+        // Minimal config — no `agents` block at all.
+        let p = write_config(&tmp, "{}");
+        let profile = profile_without_runtime(vec![ProfileModel {
+            id: "the-model".into(),
+            n_ctx: 100000,
+            role: ModelRole::Primary,
+            identifier: None,
+        }]);
+
+        unsafe { env::set_var("DARKMUX_OPENCLAW_CONFIG", p.to_str().unwrap()) };
+        let modified = apply_runtime(&profile).unwrap();
+        unsafe { env::remove_var("DARKMUX_OPENCLAW_CONFIG") };
+
+        assert!(modified);
+        let after: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(
+            after["agents"]["defaults"]["model"]["primary"],
+            "lmstudio/darkmux:the-model"
+        );
+    }
+
+    /// When the operator opts out of the `darkmux:` namespace for a model
+    /// (sets an explicit `identifier`), the pin must use that exact
+    /// identifier — not re-namespace it.
+    #[test]
+    fn sync_default_model_pins_uses_explicit_identifier_when_profile_opts_out() {
+        let mut config = serde_json::json!({});
+        let models = vec![ProfileModel {
+            id: "the-model".into(),
+            n_ctx: 100000,
+            role: ModelRole::Primary,
+            identifier: Some("my-custom-alias".into()),
+        }];
+        let modified = sync_default_model_pins(&mut config, &models);
+        assert!(modified);
+        assert_eq!(
+            config["agents"]["defaults"]["model"]["primary"],
+            "lmstudio/my-custom-alias"
+        );
+    }
+
+    /// Pure-fn check: a second call with the same profile is a no-op.
+    /// Important because `apply_runtime` only writes the file when at
+    /// least one sub-sync reports modified; a non-idempotent pin sync
+    /// would cause the file to keep being rewritten on every swap.
+    #[test]
+    fn sync_default_model_pins_is_idempotent() {
+        let mut config = serde_json::json!({});
+        let models = vec![ProfileModel {
+            id: "the-model".into(),
+            n_ctx: 100000,
+            role: ModelRole::Primary,
+            identifier: None,
+        }];
+        assert!(sync_default_model_pins(&mut config, &models));
+        assert!(!sync_default_model_pins(&mut config, &models));
+    }
+
+    /// Review M1: an unprefixed (bare) pin is still darkmux's to rewrite
+    /// — `apply_runtime` only runs under `DARKMUX_RUNTIME_CMD=openclaw`,
+    /// and a bare pin in that context resolves through openclaw's
+    /// default provider routing (LMStudio for darkmux setups). Without
+    /// this case, a hand-edited bare pin would survive a swap and
+    /// reintroduce the #90 bug for that operator.
+    #[test]
+    fn sync_default_model_pins_rewrites_unprefixed_pin() {
+        let mut config = serde_json::json!({
+            "agents": { "defaults": { "model": { "primary": "stale-bare-id" } } }
+        });
+        let models = vec![ProfileModel {
+            id: "new-model".into(),
+            n_ctx: 100000,
+            role: ModelRole::Primary,
+            identifier: None,
+        }];
+        assert!(sync_default_model_pins(&mut config, &models));
+        assert_eq!(
+            config["agents"]["defaults"]["model"]["primary"],
+            "lmstudio/darkmux:new-model"
+        );
+    }
+
+    /// Review M1 boundary: pins with a non-LMStudio provider prefix are
+    /// operator routing decisions and must be preserved. Pairs with
+    /// `leaves_non_lmstudio_provider_refs_alone` (file-level test) —
+    /// this is the pure-fn equivalent and covers more provider shapes
+    /// (`xai/`, `anthropic/`, etc.) without env-var setup overhead.
+    #[test]
+    fn sync_default_model_pins_preserves_non_lmstudio_provider_pins() {
+        for stale_pin in [
+            "openrouter/google/gemini-2.5",
+            "xai/grok-4",
+            "anthropic/claude-opus-4",
+        ] {
+            let mut config = serde_json::json!({
+                "agents": { "defaults": { "model": { "primary": stale_pin } } }
+            });
+            let models = vec![ProfileModel {
+                id: "lmstudio-side-model".into(),
+                n_ctx: 100000,
+                role: ModelRole::Primary,
+                identifier: None,
+            }];
+            let modified = sync_default_model_pins(&mut config, &models);
+            assert!(!modified, "non-LMStudio pin `{stale_pin}` should be left alone");
+            assert_eq!(
+                config["agents"]["defaults"]["model"]["primary"], stale_pin,
+                "non-LMStudio pin `{stale_pin}` must survive sync"
+            );
+        }
+    }
+
+    /// A profile with no managed roles (e.g. all Auxiliary) must not
+    /// touch any pin — there's nothing meaningful to write.
+    #[test]
+    fn sync_default_model_pins_no_op_when_profile_has_no_primary_or_compactor() {
+        let mut config = serde_json::json!({
+            "agents": { "defaults": { "model": { "primary": "lmstudio/whatever" } } }
+        });
+        let models = vec![ProfileModel {
+            id: "aux".into(),
+            n_ctx: 8192,
+            role: ModelRole::Auxiliary,
+            identifier: None,
+        }];
+        assert!(!sync_default_model_pins(&mut config, &models));
+        assert_eq!(
+            config["agents"]["defaults"]["model"]["primary"],
+            "lmstudio/whatever",
+            "no managed roles → pin left alone"
+        );
     }
 
     /// Path resolution priority: explicit > env > openclaw default. Lock the
