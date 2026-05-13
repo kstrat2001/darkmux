@@ -272,6 +272,42 @@
     padding: 0 5px;
     font-size: 11px;
   }
+
+  /* ─── auto-detect highlight on daemon button ───────────────────────── */
+  .btn-primary {
+    border-color: var(--accent-dim);
+    color: var(--accent);
+  }
+
+  /* ─── scroll-lock toggle (visible only when SSE is active) ─────────── */
+  #scroll-lock-btn { display: none; }
+  #scroll-lock-btn.active.live  { border-color: var(--good); color: var(--good); }
+  #scroll-lock-btn.active.paused { border-color: var(--warn); color: var(--warn); }
+  .conn-status.warn { color: var(--warn); border-color: var(--warn); }
+
+  /* ─── schema-major blocking modal ──────────────────────────────────── */
+  .modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.85);
+    z-index: 1000;
+    display: none;
+    align-items: center;
+    justify-content: center;
+  }
+  .modal-backdrop.show { display: flex; }
+  .modal {
+    background: var(--bg-elev);
+    border: 1px solid var(--bad);
+    border-radius: 6px;
+    padding: 24px 28px;
+    max-width: 480px;
+    box-shadow: 0 16px 48px rgba(0, 0, 0, 0.6);
+  }
+  .modal h2 { margin: 0 0 12px; color: var(--bad); font-size: 17px; }
+  .modal p { margin: 6px 0; color: var(--text); font-size: 14px; }
+  .modal p.muted { color: var(--muted); font-size: 13px; margin-top: 14px; }
+  .modal code { background: var(--bg-elev2); padding: 1px 5px; border-radius: 3px; }
 </style>
 </head>
 <body>
@@ -288,6 +324,9 @@
     <button id="load-file-btn">Load .jsonl</button>
     <button id="load-daemon-btn">Fetch from daemon</button>
     <button id="load-sample-btn">Sample</button>
+    <button id="scroll-lock-btn" title="Toggle live-follow (visible when SSE is connected)">
+      <span id="scroll-lock-icon">▶</span> <span id="scroll-lock-label">live</span>
+    </button>
     <span class="toolbar-label">date:</span>
     <input type="date" id="date-input">
     <span class="toolbar-label">filter:</span>
@@ -337,6 +376,14 @@
     </section>
   </main>
 
+  <div id="schema-modal" class="modal-backdrop">
+    <div class="modal">
+      <h2>Viewer out of date</h2>
+      <p id="schema-modal-text"></p>
+      <p class="muted">Update the viewer (or downgrade the daemon) and reload. See <a href="https://github.com/kstrat2001/darkmux/issues/66">#66</a>.</p>
+    </div>
+  </div>
+
   <footer>
     <div class="legend">
       <span><span class="swatch" style="background:var(--tier-operator)"></span>operator</span>
@@ -365,7 +412,13 @@ const state = {
   filtered: [],    // records after applying filters + search
   index: 0,        // current stepper position in filtered[]
   source: null,    // "file" | "daemon" | "sample"
+  sprintFilter: null, // ?sprint=... URL param; filters records by sprint_id
 };
+
+// SSE state lives outside the main state object so it can be reset
+// independently when switching sources.
+let eventSource = null;
+let scrollLock = true; // live-follow by default when SSE is active
 
 // ─── DOM refs ──────────────────────────────────────────────────────────
 const stepperEl = document.getElementById('stepper');
@@ -375,6 +428,12 @@ const dateInput = document.getElementById('date-input');
 const searchInput = document.getElementById('search-input');
 const schemaVerEl = document.getElementById('schema-version');
 const darkmuxVerEl = document.getElementById('darkmux-version');
+const scrollLockBtn = document.getElementById('scroll-lock-btn');
+const scrollLockIcon = document.getElementById('scroll-lock-icon');
+const scrollLockLabel = document.getElementById('scroll-lock-label');
+const schemaModal = document.getElementById('schema-modal');
+const schemaModalText = document.getElementById('schema-modal-text');
+const daemonBtn = document.getElementById('load-daemon-btn');
 
 // Default the date picker to today (UTC).
 function todayUtc() {
@@ -419,12 +478,33 @@ function loadFromText(text, sourceLabel, sourceKind) {
   if (schema) {
     schemaVerEl.textContent = schema.version || '?';
     darkmuxVerEl.textContent = schema.darkmux_version || '?';
+    enforceSchemaMajor(schema);
   } else {
     schemaVerEl.textContent = '(no header)';
     darkmuxVerEl.textContent = '—';
+    schemaModal.classList.remove('show');
   }
   setSource(sourceLabel, sourceKind);
   applyFilters();
+}
+
+/// Promote the schema-major check to a blocking modal when major version
+/// exceeds what this viewer was built against. Same posture as the eureka
+/// viewer's EXPECTED_RULES_SCHEMA_MAJOR enforcement.
+function enforceSchemaMajor(schema) {
+  if (!schema || !schema.version) {
+    schemaModal.classList.remove('show');
+    return;
+  }
+  const major = parseInt(String(schema.version).split('.')[0], 10);
+  if (Number.isFinite(major) && major > EXPECTED_FLOW_SCHEMA_MAJOR) {
+    schemaModalText.innerHTML =
+      `Source reports flow schema <code>${escapeHtml(schema.version)}</code>; ` +
+      `this viewer expects major <code>${EXPECTED_FLOW_SCHEMA_MAJOR}</code>.`;
+    schemaModal.classList.add('show');
+  } else {
+    schemaModal.classList.remove('show');
+  }
 }
 
 // ─── filtering ─────────────────────────────────────────────────────────
@@ -442,6 +522,7 @@ function applyFilters() {
   const q = searchInput.value.trim().toLowerCase();
 
   state.filtered = state.records.filter(r => {
+    if (state.sprintFilter && r.sprint_id !== state.sprintFilter) return false;
     if (r.level && !lvls.has(r.level)) return false;
     if (r.category && !cats.has(r.category)) return false;
     if (r.tier && !tiers.has(r.tier)) return false;
@@ -496,18 +577,7 @@ function renderRecord(r) {
 }
 
 function render() {
-  // Schema-compat banner
-  let banner = '';
-  if (state.schema && state.schema.version) {
-    const major = parseInt(state.schema.version.split('.')[0], 10);
-    if (major > EXPECTED_FLOW_SCHEMA_MAJOR) {
-      banner = `<div class="banner warn">
-        <strong>Schema major bump detected.</strong> File reports flow schema
-        ${escapeHtml(state.schema.version)}; this viewer expects major
-        ${EXPECTED_FLOW_SCHEMA_MAJOR}. Update the viewer or downgrade the daemon.
-      </div>`;
-    }
-  }
+  // Schema-major enforcement is now a blocking modal; no in-stepper banner.
 
   if (state.records.length === 0) {
     stepperEl.innerHTML = '';
@@ -518,7 +588,7 @@ function render() {
   emptyEl.style.display = 'none';
 
   if (state.filtered.length === 0) {
-    stepperEl.innerHTML = banner + `
+    stepperEl.innerHTML = `
       <div class="empty">
         <h2>No records match the current filters</h2>
         <p>Loosen a filter on the left, or clear the search box.</p>
@@ -542,7 +612,7 @@ function render() {
     </div>
   `;
 
-  stepperEl.innerHTML = banner + controls + renderRecord(r) + controls;
+  stepperEl.innerHTML = controls + renderRecord(r) + controls;
 
   document.getElementById('first-btn').onclick = () => { state.index = 0; render(); };
   document.getElementById('prev-btn').onclick  = () => { if (state.index > 0) { state.index--; render(); } };
@@ -555,31 +625,36 @@ document.getElementById('load-file-btn').onclick = () => document.getElementById
 document.getElementById('file-input').onchange = (e) => {
   const f = e.target.files[0];
   if (!f) return;
+  closeSse();
   const reader = new FileReader();
   reader.onload = () => loadFromText(reader.result, 'file: ' + f.name, 'file');
   reader.readAsText(f);
 };
 
-document.getElementById('load-daemon-btn').onclick = async () => {
+daemonBtn.onclick = async () => {
   const date = dateInput.value || todayUtc();
   const url = `http://localhost:8765/flow/${date}.jsonl`;
   setSource('fetching…', null);
   try {
     const resp = await fetch(url);
-    if (!resp.ok) {
+    if (!resp.ok && resp.status !== 404) {
       setSource(`daemon ${resp.status}`, null);
-      alert(`Daemon returned ${resp.status} for ${date}.jsonl. Is darkmux serve running?`);
+      alert(`Daemon returned ${resp.status} for ${date}.jsonl.`);
       return;
     }
-    const text = await resp.text();
+    // 404 is OK — the day file may not exist yet; we still tail-subscribe.
+    const text = resp.ok ? await resp.text() : '';
     loadFromText(text, `daemon · ${date}`, 'daemon');
+    openSse(date);
   } catch (e) {
+    closeSse();
     setSource('daemon offline', null);
     alert('Could not reach http://localhost:8765 — start darkmux serve, or check --bind / --port flags.');
   }
 };
 
 document.getElementById('load-sample-btn').onclick = () => {
+  closeSse();
   loadFromText(SAMPLE_JSONL, 'sample (in-memory)', 'sample');
 };
 
@@ -590,8 +665,115 @@ document.querySelectorAll('aside.filters input[type="checkbox"]').forEach(el => 
 searchInput.addEventListener('input', () => {
   // Debounce-lite: rAF coalesce keypresses.
   if (searchInput._raf) cancelAnimationFrame(searchInput._raf);
-  searchInput._raf = requestAnimationFrame(applyFilters);
+  searchInput._raf = requestAnimationFrame(() => { applyFilters(); writeUrlParams(); });
 });
+dateInput.addEventListener('change', writeUrlParams);
+
+// ─── SSE consumer ──────────────────────────────────────────────────────
+// Opens a tail-subscribe to GET /flow/<date>/stream. EventSource auto-
+// reconnects on connection loss — no custom retry logic needed; the
+// onerror handler just updates the UI to reflect the transient state.
+function openSse(date) {
+  closeSse();
+  try {
+    eventSource = new EventSource(`http://localhost:8765/flow/${date}/stream`);
+  } catch (e) {
+    return; // SSE not supported / blocked
+  }
+  setSource(`daemon · live`, 'live');
+  scrollLockBtn.classList.add('active');
+  updateScrollLockUi();
+  eventSource.onmessage = (ev) => {
+    let rec;
+    try { rec = JSON.parse(ev.data); } catch { return; }
+    state.records.push(rec);
+    applyFilters();
+    if (scrollLock && state.filtered.length > 0) {
+      state.index = state.filtered.length - 1;
+      render();
+    }
+  };
+  eventSource.onerror = () => {
+    if (eventSource && eventSource.readyState === EventSource.CONNECTING) {
+      setSource('daemon · reconnecting', 'warn');
+    }
+  };
+  eventSource.onopen = () => {
+    setSource(`daemon · live`, 'live');
+  };
+}
+
+function closeSse() {
+  if (eventSource) {
+    eventSource.close();
+    eventSource = null;
+  }
+  scrollLockBtn.classList.remove('active');
+}
+
+function updateScrollLockUi() {
+  scrollLockBtn.classList.remove('live', 'paused');
+  if (scrollLock) {
+    scrollLockBtn.classList.add('live');
+    scrollLockIcon.textContent = '▶';
+    scrollLockLabel.textContent = 'live';
+  } else {
+    scrollLockBtn.classList.add('paused');
+    scrollLockIcon.textContent = '⏸';
+    scrollLockLabel.textContent = 'paused';
+  }
+}
+
+scrollLockBtn.onclick = () => {
+  scrollLock = !scrollLock;
+  updateScrollLockUi();
+};
+
+// Extend setSource to handle the new SSE states.
+const _setSource = setSource;
+setSource = function(label, kind) {
+  state.source = kind;
+  connEl.textContent = label;
+  let cls = 'conn-status';
+  if (kind === 'live')    cls += ' live';
+  else if (kind === 'warn') cls += ' warn';
+  else if (kind === 'daemon') cls += ' live';
+  else if (kind === 'file')   cls += ' local';
+  connEl.className = cls;
+};
+
+// ─── auto-detect daemon on viewer load ─────────────────────────────────
+async function autoDetectDaemon() {
+  try {
+    const ctrl = new AbortController();
+    const tid = setTimeout(() => ctrl.abort(), 1000);
+    const r = await fetch('http://localhost:8765/health', { signal: ctrl.signal });
+    clearTimeout(tid);
+    if (r.ok) {
+      daemonBtn.classList.add('btn-primary');
+    }
+  } catch (_) {
+    // daemon unreachable; no UI change
+  }
+}
+
+// ─── URL routing ───────────────────────────────────────────────────────
+function readUrlParams() {
+  const p = new URLSearchParams(window.location.search);
+  if (p.has('date'))   dateInput.value = p.get('date');
+  if (p.has('q'))      searchInput.value = p.get('q');
+  if (p.has('sprint')) state.sprintFilter = p.get('sprint');
+}
+
+function writeUrlParams() {
+  const p = new URLSearchParams();
+  if (dateInput.value && dateInput.value !== todayUtc()) p.set('date', dateInput.value);
+  if (searchInput.value) p.set('q', searchInput.value);
+  if (state.sprintFilter) p.set('sprint', state.sprintFilter);
+  const query = p.toString();
+  const newUrl = window.location.pathname + (query ? '?' + query : '');
+  window.history.replaceState(null, '', newUrl);
+}
 
 // ─── keyboard nav ──────────────────────────────────────────────────────
 document.addEventListener('keydown', (e) => {
@@ -617,8 +799,16 @@ const SAMPLE_JSONL = `{"_type":"schema","version":"1.0.0","darkmux_version":"0.4
 {"ts":"2026-05-14","level":"info","category":"work","tier":"frontier","stage":"ship","action":"PR merged","handle":"#78 phase B (#66) Sprint 5: SSE endpoint","source":"orchestrator","sprint_id":"66-5"}
 {"ts":"2026-05-14","level":"info","category":"work","tier":"operator","stage":"retrospect","action":"note","handle":"first abandoned dispatch + hybrid-loop recovery; banked as methodology beat 16","source":"orchestrator","sprint_id":"66-5"}`;
 
+// Read URL params (date / q / sprint) BEFORE first render so the UI
+// reflects deep-linked state.
+readUrlParams();
+applyFilters();
+
 // Initial render shows the empty state.
 render();
+
+// Auto-detect a running daemon and highlight the daemon button if found.
+autoDetectDaemon();
 </script>
 </body>
 </html>
