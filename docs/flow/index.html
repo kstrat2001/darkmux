@@ -372,6 +372,62 @@
     color: var(--accent);
   }
 
+  /* ─── brand-home link ──────────────────────────────────────────────── */
+  /* The "darkmux" word in the upper-left is clickable nav-home to
+   * darkmux.com — operator review on 2026-05-14 surfaced that decorative
+   * branding feels wrong on a tool meant for navigation. */
+  .brand-home { text-decoration: none; }
+  .brand-home:hover .accent { opacity: 0.8; }
+
+  /* ─── sprint progress widget ───────────────────────────────────────── */
+  /* Hidden by default; shown when /sprints returns something useful.
+   * Surfaces "X / Y · current sprint · status" so the operator sees
+   * mission progress without leaving the viewer. (#93 item 7) */
+  .sprint-progress {
+    font-size: 12px;
+    color: var(--muted);
+    font-family: 'JetBrains Mono', monospace;
+    padding: 3px 8px;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+  }
+  .sprint-progress .running { color: var(--good); }
+  .sprint-progress .abandoned { color: var(--bad); }
+
+  /* ─── conn-status as a click-to-help affordance ─────────────────────── */
+  /* Operator review on 2026-05-14: "daemon offline" was a status indicator
+   * with no path forward; should be clickable to surface "how to start the
+   * daemon". (#93 item 5) */
+  .conn-status { cursor: pointer; user-select: none; }
+  .conn-status:hover { border-color: var(--accent-dim); color: var(--accent); }
+  .conn-status:focus { outline: 1px solid var(--accent-dim); outline-offset: 1px; }
+
+  /* ─── wall-clock graphic on record cards ──────────────────────────── */
+  /* SVG ring next to each dispatch record showing wall-clock duration
+   * (stopped) or live elapsed (running). Operator-flagged 2026-05-14:
+   * "wall clock" was the language used all session; making it visible
+   * turns shared language into a shared instrument. (#93 item 6) */
+  .record { position: relative; }
+  .wallclock {
+    position: absolute;
+    top: 14px;
+    right: 14px;
+    width: 48px;
+    height: 48px;
+  }
+  /* Animate stroke-dashoffset for the sweep — clean against the SVG's
+   * existing rotate(-90 ..) attribute. Two-second cycle; full sweep
+   * fills then unwinds. */
+  .wallclock-sweep {
+    stroke-dasharray: 94.25;
+    animation: wallclock-sweep-anim 2s ease-in-out infinite;
+  }
+  @keyframes wallclock-sweep-anim {
+    0%   { stroke-dashoffset: 94.25; }
+    50%  { stroke-dashoffset: 0; }
+    100% { stroke-dashoffset: -94.25; }
+  }
+
   /* ─── scroll-lock toggle (visible only when SSE is active) ─────────── */
   #scroll-lock-btn { display: none; }
   #scroll-lock-btn.active.live  { border-color: var(--good); color: var(--good); }
@@ -499,9 +555,14 @@
 </head>
 <body>
   <header>
-    <h1><span class="accent">darkmux</span> <span class="tag">/ flow viewer</span></h1>
+    <h1>
+      <a href="https://darkmux.com/" class="brand-home" title="darkmux home">
+        <span class="accent">darkmux</span></a>
+      <span class="tag">/ flow viewer</span>
+    </h1>
     <div class="header-right">
-      <span id="conn-status" class="conn-status">no source</span>
+      <span id="sprint-progress" class="sprint-progress" style="display:none"></span>
+      <span id="conn-status" class="conn-status" role="button" tabindex="0">no source</span>
     </div>
   </header>
 
@@ -509,7 +570,7 @@
     <span class="toolbar-label">source:</span>
     <input type="file" id="file-input" accept=".jsonl" style="display:none">
     <button id="load-file-btn">Load .jsonl</button>
-    <button id="load-daemon-btn">Fetch from daemon</button>
+    <button id="load-daemon-btn">Connect</button>
     <button id="load-sample-btn">Sample</button>
     <button id="scroll-lock-btn" title="Toggle live-follow (visible when SSE is connected)">
       <span id="scroll-lock-icon">▶</span> <span id="scroll-lock-label">live</span>
@@ -517,7 +578,9 @@
     <span class="toolbar-label">date:</span>
     <input type="date" id="date-input">
     <span class="toolbar-label">filter:</span>
-    <input type="text" id="search-input" placeholder="action / handle text…">
+    <input type="text" id="search-input" list="filter-suggestions"
+           placeholder="action / handle text… or level:error, tier:local, …">
+    <datalist id="filter-suggestions"></datalist>
     <!-- Model-status pill (#87). margin-left:auto in CSS flushes it right.
          Click to open the detail modal. Hidden until the viewer connects
          to a daemon (file/sample modes have no live model state to poll). -->
@@ -581,6 +644,20 @@
     </div>
   </div>
 
+  <!-- Connection-help modal (#93 item 5). Opened by clicking the
+       conn-status pill in the header. Tells the operator how to start
+       the daemon when it's offline. Closable via Esc or the X button. -->
+  <div id="conn-help-modal" class="modal-backdrop">
+    <div class="modal neutral">
+      <button class="modal-close" id="conn-help-modal-close" title="close (Esc)">✕</button>
+      <h2>Connecting to the daemon</h2>
+      <p>The viewer fetches flow records from a local <code>darkmux serve</code> daemon. To start it:</p>
+      <p><code>darkmux serve</code></p>
+      <p>Default bind is <code>127.0.0.1:8765</code>. Use <code>--port</code> or <code>--bind</code> to change. The viewer auto-detects a running daemon on load; if you don't see "daemon · live", refresh after starting.</p>
+      <p class="muted">For a file-based session (no daemon needed), use the <strong>Load .jsonl</strong> button instead.</p>
+    </div>
+  </div>
+
   <!-- Model-status detail modal (#87). Opened from the toolbar pill;
        reuses the .modal-backdrop / .modal infrastructure from #83 with
        the .neutral variant so the border isn't bad-red. -->
@@ -605,7 +682,7 @@
     <div>
       flow schema <span id="schema-version" class="mono">—</span> ·
       darkmux <span id="darkmux-version" class="mono">—</span> ·
-      <a href="https://github.com/kstrat2001/darkmux/issues/66">#66 epic</a>
+      <a href="https://darkmux.com/">darkmux.com</a>
     </div>
   </footer>
 
@@ -652,6 +729,8 @@ const scrollLockLabel = document.getElementById('scroll-lock-label');
 const schemaModal = document.getElementById('schema-modal');
 const schemaModalText = document.getElementById('schema-modal-text');
 const daemonBtn = document.getElementById('load-daemon-btn');
+const connHelpModal = document.getElementById('conn-help-modal');
+const sprintProgressEl = document.getElementById('sprint-progress');
 
 // Default the date picker to today (UTC).
 function todayUtc() {
@@ -752,6 +831,15 @@ function applyFilters() {
     return true;
   });
 
+  // Pre-compute dispatch durations (paired session_id records) so the
+  // wall-clock graphic in renderRecord() can look them up O(1). Refreshed
+  // each filter cycle since state.records can grow via SSE.
+  if (typeof computeDispatchDurations === 'function') computeDispatchDurations();
+
+  // Refresh autocomplete suggestions from the current record set so the
+  // filter input proposes keywords the operator can actually use.
+  if (typeof refreshFilterSuggestions === 'function') refreshFilterSuggestions();
+
   if (state.index >= state.filtered.length) state.index = Math.max(0, state.filtered.length - 1);
   render();
 }
@@ -776,6 +864,11 @@ function renderRecord(r) {
   if (r.sprint_id)  meta.push({ lbl: 'sprint',  val: r.sprint_id });
   if (r.session_id) meta.push({ lbl: 'session', val: r.session_id });
 
+  // #93 item 6: wall-clock graphic, when this record represents a model
+  // dispatch with a known duration (or is currently running). Empty for
+  // point-in-time records like flow note/catch.
+  const wallclockHtml = (typeof renderWallClock === 'function') ? renderWallClock(r) : '';
+
   return `
     <div class="record">
       <div class="tier-stripe ${stripeClass}"></div>
@@ -790,6 +883,7 @@ function renderRecord(r) {
           ${meta.map(m => `<span class="meta-pill"><span class="lbl">${escapeHtml(m.lbl)}</span><span class="val">${escapeHtml(m.val)}</span></span>`).join('')}
         </div>
       </div>
+      ${wallclockHtml}
     </div>
   `;
 }
@@ -1326,6 +1420,174 @@ const SAMPLE_JSONL = `{"_type":"schema","version":"1.0.0","darkmux_version":"0.4
 {"ts":"2026-05-14","level":"info","category":"work","tier":"frontier","stage":"ship","action":"PR merged","handle":"#78 phase B (#66) Sprint 5: SSE endpoint","source":"orchestrator","sprint_id":"66-5"}
 {"ts":"2026-05-14","level":"info","category":"work","tier":"operator","stage":"retrospect","action":"note","handle":"first abandoned dispatch + hybrid-loop recovery; banked as methodology beat 16","source":"orchestrator","sprint_id":"66-5"}`;
 
+// ─── #93 item 5: connection-help modal ─────────────────────────────────
+// Click the conn-status pill to open the modal (regardless of state —
+// even when connected the operator might want to see how the connection
+// is configured). Esc and the X button close it.
+connEl.addEventListener('click', () => connHelpModal.classList.add('show'));
+connEl.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' || e.key === ' ') {
+    e.preventDefault();
+    connHelpModal.classList.add('show');
+  }
+});
+document.getElementById('conn-help-modal-close').addEventListener('click', () => {
+  connHelpModal.classList.remove('show');
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && connHelpModal.classList.contains('show')) {
+    connHelpModal.classList.remove('show');
+  }
+});
+
+// ─── #93 item 7: sprint progress widget ────────────────────────────────
+// Fetches /sprints from the daemon; shows "running / N · current-id" or
+// "complete N of M" depending on what the indexed sprints say. Hidden
+// when the daemon is unreachable. Refreshes every 10s while a daemon
+// connection is healthy.
+async function refreshSprintProgress() {
+  let data;
+  try {
+    const r = await fetch('http://localhost:8765/sprints', { signal: AbortSignal.timeout(800) });
+    if (!r.ok) { sprintProgressEl.style.display = 'none'; return; }
+    data = await r.json();
+  } catch (_) {
+    sprintProgressEl.style.display = 'none';
+    return;
+  }
+  const sprints = data.sprints || [];
+  if (sprints.length === 0) { sprintProgressEl.style.display = 'none'; return; }
+  // Aggregate counts + find the active running sprint (if any).
+  const counts = { planned: 0, running: 0, complete: 0, abandoned: 0 };
+  for (const s of sprints) {
+    if (counts[s.status] !== undefined) counts[s.status]++;
+  }
+  const running = sprints.find((s) => s.status === 'running');
+  let text;
+  if (running) {
+    text = `${counts.complete}/${sprints.length} done · running: ${escapeHtml(running.id)}`;
+    sprintProgressEl.innerHTML = `<span class="running">●</span> ${text}`;
+  } else if (counts.complete === sprints.length) {
+    text = `${sprints.length} complete · 0 running`;
+    sprintProgressEl.textContent = text;
+  } else {
+    text = `${counts.complete}/${sprints.length} done · ${counts.planned} planned`;
+    if (counts.abandoned > 0) text += ` · <span class="abandoned">${counts.abandoned} abandoned</span>`;
+    sprintProgressEl.innerHTML = text;
+  }
+  sprintProgressEl.style.display = 'inline-block';
+}
+
+// Poll periodically when daemon-reachable. Initial detection sets it off;
+// once it succeeds, keep refreshing on a 10s cadence.
+let sprintProgressTimer = null;
+function startSprintProgressPolling() {
+  if (sprintProgressTimer) return;
+  refreshSprintProgress();
+  sprintProgressTimer = setInterval(refreshSprintProgress, 10_000);
+}
+
+// ─── #93 item 2: filter input autocomplete ────────────────────────────
+// Populates the <datalist> linked to #search-input with the discoverable
+// filter vocabulary. The operator types `level:` and gets `level:error`
+// / `level:warn` / ... as native browser autocomplete suggestions; same
+// for tier:, category:, stage:. Plus the top-N most common action+source
+// values from the loaded record set so they're discoverable too.
+function refreshFilterSuggestions() {
+  const dl = document.getElementById('filter-suggestions');
+  if (!dl) return;
+  const opts = [];
+  // Fixed-vocabulary axes — always offered regardless of loaded records.
+  ['error', 'warn', 'info', 'debug', 'trace'].forEach((v) => opts.push(`level:${v}`));
+  ['operator', 'frontier', 'local'].forEach((v) => opts.push(`tier:${v}`));
+  ['work', 'machinery', 'audit', 'review'].forEach((v) => opts.push(`category:${v}`));
+  ['scope', 'estimate', 'dispatch', 'review', 'ship', 'retrospect'].forEach((v) => opts.push(`stage:${v}`));
+  // Discoverable values from the loaded record set — top action + source
+  // strings so the operator sees what they actually have to filter on.
+  const counts = new Map();
+  for (const r of state.records) {
+    if (r.action) counts.set(r.action, (counts.get(r.action) || 0) + 1);
+    if (r.source) counts.set(`source:${r.source}`, (counts.get(`source:${r.source}`) || 0) + 1);
+  }
+  const top = Array.from(counts.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 20)
+    .map(([k]) => k);
+  for (const v of top) opts.push(v);
+
+  // Render fresh option list. Browser uses these as `list="filter-suggestions"`
+  // datalist entries; type-to-narrow is native.
+  dl.innerHTML = opts.map((v) => `<option value="${escapeHtml(v)}">`).join('');
+}
+
+// ─── #93 item 6: wall-clock graphic on record cards ────────────────────
+// Renders an SVG ring next to each model-performed event on the stepper
+// card. Three states:
+//   - "stopped"  (paired dispatch+verdict records) — frozen ring at duration
+//   - "running"  (dispatch with no verdict yet) — animated sweep
+//   - "instant"  (point-in-time records like flow note/catch) — hidden
+//
+// Duration is derived from session_id-paired records — Sprint 3 of #66
+// emits dispatch + verdict pairs with matching session_id. This pairing
+// is computed once per applyFilters() cycle into state.durations.
+function computeDispatchDurations() {
+  const starts = new Map();  // session_id -> ts (parsed Date)
+  const ends = new Map();    // session_id -> ts
+  for (const r of state.records) {
+    if (!r.session_id || !r.ts) continue;
+    const t = Date.parse(r.ts);
+    if (Number.isNaN(t)) continue;
+    if (r.action && r.action.startsWith('dispatch ')) {
+      starts.set(r.session_id, t);
+    } else if (r.action && (r.action.startsWith('verdict:') || r.action === 'dispatch failed')) {
+      ends.set(r.session_id, t);
+    }
+  }
+  state.durations = { starts, ends };
+}
+
+// Compose an SVG ring for one record. Returns HTML string or '' for
+// records with no duration data.
+function renderWallClock(r) {
+  if (!r.session_id || !r.ts) return '';
+  const d = state.durations;
+  if (!d) return '';
+  const t0 = d.starts.get(r.session_id);
+  const t1 = d.ends.get(r.session_id);
+  // Only show the clock on the dispatch beat itself — once per session.
+  if (!r.action || !r.action.startsWith('dispatch ')) return '';
+  if (!t0) return '';
+  // CSS custom properties resolve in modern browsers when passed via `style=`,
+  // which is the portable form vs. the SVG presentation attribute (which only
+  // resolves in some engines). Use `style="stroke: var(...)"` everywhere.
+  const tier = r.tier || 'operator';
+  const tierStyle = `style="stroke: var(--tier-${tier})"`;
+  const tierFillStyle = `style="fill: var(--tier-${tier})"`;
+  if (t1) {
+    // Stopped: show duration; full ring filled.
+    const secs = Math.round((t1 - t0) / 1000);
+    const label = secs >= 60 ? `${Math.floor(secs / 60)}m ${secs % 60}s` : `${secs}s`;
+    return `
+      <div class="wallclock" title="duration: ${label}">
+        <svg viewBox="0 0 36 36" width="48" height="48">
+          <circle cx="18" cy="18" r="15" fill="none" style="stroke: var(--border)" stroke-width="2"/>
+          <circle cx="18" cy="18" r="15" fill="none" ${tierStyle} stroke-width="2" stroke-dasharray="94.25" stroke-dashoffset="0" transform="rotate(-90 18 18)"/>
+          <text x="18" y="21" text-anchor="middle" font-size="9" style="fill: var(--text)" font-family="JetBrains Mono">${label}</text>
+        </svg>
+      </div>`;
+  } else {
+    // Running: animated sweep.
+    return `
+      <div class="wallclock running" title="dispatch running (started ${new Date(t0).toISOString()})">
+        <svg viewBox="0 0 36 36" width="48" height="48">
+          <circle cx="18" cy="18" r="15" fill="none" style="stroke: var(--border)" stroke-width="2"/>
+          <circle class="wallclock-sweep" cx="18" cy="18" r="15" fill="none" ${tierStyle} stroke-width="2" stroke-dasharray="94.25" stroke-dashoffset="0" transform="rotate(-90 18 18)"/>
+          <text x="18" y="21" text-anchor="middle" font-size="8" ${tierFillStyle} font-family="JetBrains Mono">▶</text>
+        </svg>
+      </div>`;
+  }
+}
+
 // Read URL params (date / q / sprint) BEFORE first render so the UI
 // reflects deep-linked state.
 readUrlParams();
@@ -1335,7 +1597,12 @@ applyFilters();
 render();
 
 // Auto-detect a running daemon and highlight the daemon button if found.
-autoDetectDaemon();
+autoDetectDaemon().then(() => {
+  // If daemon reachable, kick off sprint-progress polling.
+  if (daemonBtn.classList.contains('btn-primary')) {
+    startSprintProgressPolling();
+  }
+});
 </script>
 </body>
 </html>
