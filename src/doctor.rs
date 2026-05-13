@@ -82,6 +82,7 @@ pub fn run() -> DoctorReport {
         check_runtime_command(),
         check_runtime_version(),
         check_ram_headroom(),
+        check_ram_headroom_load_projection(),
         check_power_state(),
         check_platform_and_provider(),
         check_agent_role_definitions(),
@@ -494,6 +495,187 @@ fn classify_ram_headroom(
             ),
         }
     }
+}
+
+/// Predictive sibling to `check_ram_headroom`: answers *"will loading the
+/// rest of the active profile fit, or will it swap?"* Skips quietly when
+/// there's nothing meaningful to predict (no profile, no match, profile
+/// already fully resident). See issue #70 thread A for the operator-facing
+/// motivation — pre-#68 doctor under-reported drift after a swap-load
+/// sequence; post-#68 we can call it out before the operator hits it.
+fn check_ram_headroom_load_projection() -> Check {
+    const NAME: &str = "RAM headroom (load projection)";
+    let skip = |reason: &str| Check {
+        name: NAME.into(),
+        status: Status::Pass,
+        message: format!("(skipped: {reason})"),
+        hint: None,
+    };
+
+    let registry = match profiles::load_registry(None) {
+        Ok(r) => r,
+        Err(_) => return skip("no profile registry"),
+    };
+    let loaded = match lms::list_loaded() {
+        Ok(l) => l,
+        Err(_) => return skip("could not query lms"),
+    };
+    if loaded.is_empty() {
+        return skip("no models loaded — nothing to project against");
+    }
+
+    let Some((profile_name, profile)) = pick_active_profile(&registry, &loaded) else {
+        return skip("no profile matches loaded state");
+    };
+
+    let unloaded: Vec<&crate::types::ProfileModel> = profile
+        .models
+        .iter()
+        .filter(|pm| {
+            let ns = crate::swap::namespaced_identifier(pm);
+            !loaded.iter().any(|l| {
+                l.identifier == pm.id || l.model == pm.id || l.identifier == ns
+            })
+        })
+        .collect();
+    if unloaded.is_empty() {
+        return Check {
+            name: NAME.into(),
+            status: Status::Pass,
+            message: format!("active profile `{profile_name}` fully resident"),
+            hint: None,
+        };
+    }
+
+    // Catalog lookup for the unloaded models' on-disk sizes. Best-effort:
+    // we don't error if the catalog query fails — the projection just
+    // reports "size unknown" for those entries and the operator sees the
+    // partial picture rather than a missing check.
+    let catalog = lms::list_available().unwrap_or_default();
+    let mut total_unloaded_gb = 0.0_f64;
+    let mut pending: Vec<String> = Vec::new();
+    for pm in &unloaded {
+        let size_gb = catalog
+            .iter()
+            .find(|m| m.model_key == pm.id)
+            .map(|m| m.size_bytes as f64 / 1_000_000_000.0)
+            .unwrap_or(0.0);
+        total_unloaded_gb += size_gb;
+        if size_gb > 0.0 {
+            pending.push(format!("{} ~{:.1} GB", pm.id, size_gb));
+        } else {
+            pending.push(format!("{} (size unknown)", pm.id));
+        }
+    }
+
+    let reclaimable_gb = match read_reclaimable_gb() {
+        Some(g) => g as f64,
+        None => return skip("could not read vm_stat (non-macOS?)"),
+    };
+
+    classify_load_projection(
+        reclaimable_gb,
+        total_unloaded_gb,
+        &pending,
+        profile_name,
+    )
+}
+
+/// Pure verdict logic for the load-projection check. Extracted so the
+/// formula can be unit-tested without `lms` / `vm_stat` / registry I/O.
+///
+/// Compares `reclaimable_gb` against `total_unloaded_gb + safety_margin`:
+/// - Fail when reclaimable < unloaded total (load *will* swap or OOM)
+/// - Warn when reclaimable - unloaded total < safety margin (load fits
+///   but leaves no breathing room for KV growth)
+/// - Pass otherwise
+fn classify_load_projection(
+    reclaimable_gb: f64,
+    total_unloaded_gb: f64,
+    pending: &[String],
+    profile_name: &str,
+) -> Check {
+    const NAME: &str = "RAM headroom (load projection)";
+    let safety = RAM_SAFETY_MARGIN_GB as f64;
+    let post_load_reclaimable = reclaimable_gb - total_unloaded_gb;
+    let summary = format!(
+        "loading rest of profile `{profile_name}` would consume ~{:.1} GB \
+         ({}); leaves ~{:.1} GB reclaimable",
+        total_unloaded_gb,
+        pending.join(", "),
+        post_load_reclaimable.max(0.0)
+    );
+
+    if post_load_reclaimable < 0.0 {
+        Check {
+            name: NAME.into(),
+            status: Status::Fail,
+            message: format!("{summary} — load would swap or OOM"),
+            hint: Some(
+                "active profile demands more memory than is currently free; \
+                 close apps, unload other models, or pick a profile with \
+                 a smaller compactor / lower n_ctx"
+                    .into(),
+            ),
+        }
+    } else if post_load_reclaimable < safety {
+        Check {
+            name: NAME.into(),
+            status: Status::Warn,
+            message: format!(
+                "{summary} — within {RAM_SAFETY_MARGIN_GB} GB safety margin"
+            ),
+            hint: Some(
+                "load will likely succeed but leaves little headroom for KV \
+                 cache growth; watch for swap during long-context dispatches"
+                    .into(),
+            ),
+        }
+    } else {
+        Check {
+            name: NAME.into(),
+            status: Status::Pass,
+            message: summary,
+            hint: None,
+        }
+    }
+}
+
+/// Pick the active profile from a registry given currently-loaded models.
+/// Prefers the registry's `default_profile` when it matches; otherwise the
+/// first profile whose primary model is loaded. Mirrors the matching shape
+/// in `check_profile_loaded_match` so the two checks agree on what
+/// "active" means.
+fn pick_active_profile<'a>(
+    registry: &'a crate::profiles::LoadedRegistry,
+    loaded: &[crate::types::LoadedModel],
+) -> Option<(&'a str, &'a crate::types::Profile)> {
+    let matches: Vec<(&str, &crate::types::Profile)> = registry
+        .registry
+        .profiles
+        .iter()
+        .filter(|(_, p)| {
+            p.models
+                .iter()
+                .filter(|m| matches!(m.role, ModelRole::Primary))
+                .any(|pm| {
+                    let ns = crate::swap::namespaced_identifier(pm);
+                    loaded.iter().any(|l| {
+                        l.identifier == pm.id || l.model == pm.id || l.identifier == ns
+                    })
+                })
+        })
+        .map(|(name, p)| (name.as_str(), p))
+        .collect();
+    if matches.is_empty() {
+        return None;
+    }
+    if let Some(default) = registry.registry.default_profile.as_deref() {
+        if let Some(m) = matches.iter().find(|(n, _)| *n == default) {
+            return Some(*m);
+        }
+    }
+    Some(matches[0])
 }
 
 /// Read openclaw.json and flag agents whose names match a shipped role
@@ -957,6 +1139,76 @@ mod tests {
         assert_eq!(no_model.status, Status::Fail);
     }
 
+    // ─── classify_load_projection (issue #70 thread A) ─────────────────────
+
+    fn pending(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn load_projection_pass_when_reclaimable_covers_unloaded_plus_safety() {
+        // 32 GB tier, 8 GB free, 3 GB compactor pending. 8 − 3 = 5 GB
+        // remaining, > 2 GB safety → Pass.
+        let c = classify_load_projection(
+            8.0,
+            3.0,
+            &pending(&["google/gemma-3-4b ~3.0 GB"]),
+            "balanced",
+        );
+        assert_eq!(c.status, Status::Pass);
+        assert!(c.message.contains("`balanced`"));
+        assert!(c.message.contains("google/gemma-3-4b ~3.0 GB"));
+    }
+
+    #[test]
+    fn load_projection_warn_when_load_eats_into_safety_margin() {
+        // 8 GB free, 7 GB pending. 8 − 7 = 1 GB < 2 GB safety → Warn (load
+        // fits but leaves no headroom for KV cache growth mid-dispatch).
+        let c = classify_load_projection(
+            8.0,
+            7.0,
+            &pending(&["big/model ~7.0 GB"]),
+            "deep",
+        );
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.message.contains("safety margin"));
+    }
+
+    #[test]
+    fn load_projection_fail_when_load_exceeds_reclaimable() {
+        // 4 GB free, 8 GB compactor pending. Can't fit; would swap or OOM.
+        let c = classify_load_projection(
+            4.0,
+            8.0,
+            &pending(&["compactor ~8.0 GB"]),
+            "balanced",
+        );
+        assert_eq!(c.status, Status::Fail);
+        assert!(c.message.contains("swap or OOM"));
+        // Surfaces the actionable fix (close apps / smaller compactor /
+        // lower n_ctx) so the operator can recover without consulting the
+        // issue tracker.
+        assert!(c.hint.as_deref().unwrap_or("").contains("smaller compactor"));
+    }
+
+    #[test]
+    fn load_projection_includes_unknown_size_models_in_summary() {
+        // A profile model that doesn't appear in the lms catalog (yet)
+        // shouldn't poison the verdict — but its presence should still
+        // surface in the summary so the operator knows it'll load too.
+        let c = classify_load_projection(
+            10.0,
+            3.0,
+            &pending(&[
+                "google/gemma-3-4b ~3.0 GB",
+                "fresh-download (size unknown)",
+            ]),
+            "balanced",
+        );
+        assert_eq!(c.status, Status::Pass);
+        assert!(c.message.contains("size unknown"));
+    }
+
     #[test]
     fn worst_status_promotes_correctly() {
         let r = DoctorReport {
@@ -1023,10 +1275,10 @@ mod tests {
     #[test]
     fn run_returns_static_plus_eureka_checks() {
         let r = run();
-        // 10 baseline checks (incl. runtime version) + one per active
-        // eureka rule. Every check should appear regardless of
-        // environment — even if the underlying probe couldn't read state.
-        let expected = 10 + crate::eureka::all_rules().len();
+        // 11 baseline checks (incl. runtime version + load projection) +
+        // one per active eureka rule. Every check should appear regardless
+        // of environment — even if the underlying probe couldn't read state.
+        let expected = 11 + crate::eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
