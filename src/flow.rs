@@ -173,7 +173,8 @@ pub(crate) fn record_at(record: &FlowRecord, path: &Path) -> Result<()> {
         Ok(mut file) => {
             file.write_all(format!("{header_line}\n{record_line}\n").as_bytes())
                 .with_context(|| format!("writing initial flow log {}", path.display()))?;
-            file.sync_all().ok();
+            file.sync_all()
+                .with_context(|| format!("syncing flow log {}", path.display()))?;
             Ok(())
         }
         Err(e) if e.kind() == ErrorKind::AlreadyExists => {
@@ -183,7 +184,8 @@ pub(crate) fn record_at(record: &FlowRecord, path: &Path) -> Result<()> {
                 .with_context(|| format!("opening flow log for append {}", path.display()))?;
             writeln!(file, "{record_line}")
                 .with_context(|| format!("appending to flow log {}", path.display()))?;
-            file.sync_all().ok();
+            file.sync_all()
+                .with_context(|| format!("syncing flow log {}", path.display()))?;
             Ok(())
         }
         Err(e) => Err(e).with_context(|| format!("creating flow log {}", path.display())),
