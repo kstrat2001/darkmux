@@ -295,6 +295,19 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         .clone()
         .unwrap_or_else(|| fresh_session_id(&opts.role_id));
 
+    // Flow emission: dispatch_start lands on disk before openclaw is
+    // even invoked, so the viewer sees the local-tier event the instant
+    // we begin. Pairs with the dispatch_complete / dispatch_error
+    // record below via session_id (the viewer's computeDispatchDurations
+    // does the start↔end pairing). Non-fatal: emission errors are
+    // ignored so a flows-dir write problem doesn't sink the dispatch.
+    let _ = crate::flow::record(build_dispatch_record(
+        crate::flow::Level::Info,
+        "dispatch start",
+        &opts.role_id,
+        &resolved_session_id,
+    ));
+
     // 4. Invoke openclaw agent
     let mut cmd = Command::new("openclaw");
     cmd.args(["agent", "--local", "--agent", &agent_id, "--json"]);
@@ -308,9 +321,25 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     }
     cmd.args(["--message", &opts.message]);
 
-    let output = cmd
+    let output_result = cmd
         .output()
-        .with_context(|| format!("running `openclaw agent {agent_id}`"))?;
+        .with_context(|| format!("running `openclaw agent {agent_id}`"));
+
+    // Emit the dispatch end record BEFORE propagating any error or
+    // returning Ok — emission must reflect both success and failure paths
+    // so the viewer never sees a dangling start with no terminal event.
+    let (action, level) = match &output_result {
+        Ok(o) if o.status.success() => ("dispatch complete", crate::flow::Level::Info),
+        _ => ("dispatch error", crate::flow::Level::Error),
+    };
+    let _ = crate::flow::record(build_dispatch_record(
+        level,
+        action,
+        &opts.role_id,
+        &resolved_session_id,
+    ));
+
+    let output = output_result?;
 
     // 5. Post-dispatch: snapshot filesystem state at each caller-supplied
     //    watch path. Surfaces ground-truth file presence + sizes so SIGNOFF
@@ -331,6 +360,31 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         session_id: resolved_session_id,
         watched_state,
     })
+}
+
+/// Build a flow record for a dispatch lifecycle event (`dispatch start`,
+/// `dispatch complete`, `dispatch error`). All three share the same
+/// session_id so the viewer pairs start↔end into a single wall-clock
+/// arc per dispatch. `handle` is the role id (operator-readable label);
+/// `session_id` is the full openclaw session identifier.
+pub(crate) fn build_dispatch_record(
+    level: crate::flow::Level,
+    action: &str,
+    role_id: &str,
+    session_id: &str,
+) -> crate::flow::FlowRecord {
+    crate::flow::FlowRecord {
+        ts: crate::flow::ts_utc_now(),
+        level,
+        category: crate::flow::Category::Work,
+        tier: crate::flow::Tier::Local,
+        stage: crate::flow::Stage::Dispatch,
+        action: action.to_string(),
+        handle: role_id.to_string(),
+        sprint_id: None,
+        session_id: Some(session_id.to_string()),
+        source: Some("crew_dispatch".to_string()),
+    }
 }
 
 fn load_role_or_bail(role_id: &str) -> Result<Role> {
@@ -899,5 +953,56 @@ mod tests {
         assert!(id.starts_with("crew-dispatch-code-reviewer-"));
         // No double-hyphen artifact.
         assert!(!id.contains("crew-dispatch--"));
+    }
+
+    // ─── build_dispatch_record (Sprint 2 of #104) ──────────────────────────
+
+    #[test]
+    fn dispatch_record_carries_role_id_session_and_local_tier() {
+        let rec = build_dispatch_record(
+            crate::flow::Level::Info,
+            "dispatch start",
+            "coder",
+            "crew-dispatch-coder-12345-1",
+        );
+        assert_eq!(rec.action, "dispatch start");
+        assert_eq!(rec.handle, "coder");
+        assert_eq!(rec.session_id.as_deref(), Some("crew-dispatch-coder-12345-1"));
+        assert_eq!(rec.source.as_deref(), Some("crew_dispatch"));
+        assert!(matches!(rec.tier, crate::flow::Tier::Local));
+        assert!(matches!(rec.stage, crate::flow::Stage::Dispatch));
+        assert!(matches!(rec.category, crate::flow::Category::Work));
+        // sprint_id is None for dispatch records — crew dispatch is a
+        // lower-level concept than sprint, so the dispatcher doesn't
+        // assume a sprint context. The viewer joins via session_id.
+        assert!(rec.sprint_id.is_none());
+        // ts is set to a non-empty UTC datetime string.
+        assert!(!rec.ts.is_empty());
+        assert!(rec.ts.ends_with('Z'), "ts should be UTC: {}", rec.ts);
+    }
+
+    #[test]
+    fn dispatch_record_error_level_serializes_distinctly() {
+        // Error-level records render differently in the viewer (red tag,
+        // not green). Lock the error level on dispatch_error so the
+        // failure path is visually distinct from completion.
+        let ok = build_dispatch_record(
+            crate::flow::Level::Info,
+            "dispatch complete",
+            "coder",
+            "session-abc",
+        );
+        let err = build_dispatch_record(
+            crate::flow::Level::Error,
+            "dispatch error",
+            "coder",
+            "session-abc",
+        );
+        assert!(matches!(ok.level, crate::flow::Level::Info));
+        assert!(matches!(err.level, crate::flow::Level::Error));
+        // Same session_id so the viewer pairs them — this is the contract
+        // that makes computeDispatchDurations() work for the failure path
+        // too (an erroring dispatch still has a wall-clock arc).
+        assert_eq!(ok.session_id, err.session_id);
     }
 }
