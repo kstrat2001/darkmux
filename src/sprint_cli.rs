@@ -507,33 +507,78 @@ pub fn unwrap_envelope_text(raw: &str) -> String {
     }
 }
 
+/// Extract a severity marker from a finding line. Accepts THREE marker forms
+/// reviewers actually emit in practice:
+///
+///   `- [SEVERITY] rest`     ← the prompt's documented form (bracketed)
+///   `- **SEVERITY** rest`   ← markdown-bold form (very common — Claude / Llama / etc.)
+///   `- SEVERITY: rest`      ← plain-colon form (occasional)
+///
+/// Returns `(severity, rest_after_marker)` if the line matches AND the
+/// severity tag is one of BLOCK / FLAG / NIT. Returns None for any other
+/// line (header, prose, malformed marker, unknown severity).
+fn extract_severity_marker(line: &str) -> Option<(&str, &str)> {
+    let line = line.strip_prefix("- ")?;
+
+    // Bracket form: [SEVERITY]
+    if let Some(rest) = line.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            let severity = &rest[..end];
+            if matches!(severity, "BLOCK" | "FLAG" | "NIT") {
+                return Some((severity, rest[end + 1..].trim_start()));
+            }
+        }
+    }
+
+    // Markdown-bold form: **SEVERITY**
+    if let Some(rest) = line.strip_prefix("**") {
+        if let Some(end) = rest.find("**") {
+            let severity = &rest[..end];
+            if matches!(severity, "BLOCK" | "FLAG" | "NIT") {
+                return Some((severity, rest[end + 2..].trim_start()));
+            }
+        }
+    }
+
+    // Plain form: `SEVERITY:` or `SEVERITY ` (severity followed by a clean
+    // separator — colon, space, or tab). Tighter than "any non-uppercase
+    // char" because that would match things like `FLAG-suffix`, which is
+    // not a severity marker and shouldn't parse as one.
+    let first_word_end = line.find(|c: char| !c.is_ascii_uppercase()).unwrap_or(line.len());
+    if first_word_end > 0 {
+        let severity = &line[..first_word_end];
+        if matches!(severity, "BLOCK" | "FLAG" | "NIT") {
+            let separator = line.as_bytes().get(first_word_end).copied();
+            // Only accept separator = `:`, ` `, `\t`, or end-of-line.
+            if matches!(separator, Some(b':') | Some(b' ') | Some(b'\t') | None) {
+                let after = line[first_word_end..].trim_start();
+                let after = after.strip_prefix(':').unwrap_or(after).trim_start();
+                return Some((severity, after));
+            }
+        }
+    }
+
+    None
+}
+
 /// Parse a QA-REVIEW-SIGNOFF block from already-unwrapped reviewer text.
 ///
-/// Extracts findings from lines matching `- [SEVERITY] file:line — message`
-/// and returns BOTH the structured findings AND severity counts in one pass
-/// (single source of truth — earlier versions had two parsers that diverged
-/// on slice offsets). Handles malformed lines gracefully (skips them).
+/// Extracts findings from lines matching any of the three documented severity
+/// marker forms (see `extract_severity_marker`) and returns BOTH the structured
+/// findings AND severity counts in one pass (single source of truth — earlier
+/// versions had two parsers that diverged on slice offsets). Handles malformed
+/// lines gracefully (skips them).
 pub fn parse_signoff(input: &str) -> SignoffParse {
     let mut findings: Vec<ReviewFinding> = Vec::new();
 
     for line in input.lines() {
         let line = line.trim();
-        if !line.starts_with("- [") { continue; }
+        let Some((severity, rest)) = extract_severity_marker(line) else { continue; };
 
-        let Some(severity_end) = line.find(']') else { continue; };
-
-        // line is "- [SEVERITY] rest"; severity is line[3..severity_end]
-        let severity = &line[3..severity_end];
-        if !matches!(severity, "BLOCK" | "FLAG" | "NIT") {
-            continue;
-        }
-
-        let rest = line[severity_end + 1..].trim_start();
         let finding_text = if let Some(pos) = rest.find(" — ") {
-            // " — " is 3 bytes (the em-dash is U+2014 = 3 UTF-8 bytes), plus
-            // the leading + trailing spaces = 5 bytes total. find() returns
-            // the byte index of the first space, so rest[pos+5..] is the
-            // start of the message.
+            // " — " is 5 bytes total (em-dash is U+2014 = 3 UTF-8 bytes, plus
+            // leading + trailing ASCII space). find() returns the byte index
+            // of the first space, so rest[pos+5..] starts the message.
             let file_line = rest[..pos].trim();
             let message = rest[pos + 5..].trim();
             format!("{file_line} — {message}")
@@ -1105,6 +1150,57 @@ mod tests {
         assert_eq!(result.block, 0);
         assert_eq!(result.flag, 0);
         assert_eq!(result.nit, 1);
+    }
+
+    #[test]
+    fn parse_signoff_accepts_markdown_bold_marker() {
+        // Reviewers (especially Claude/Llama) often emit `- **FLAG**` instead
+        // of `- [FLAG]`. Empirically caught during Sprint 1 of #66's dogfood
+        // — the verb returned `indeterminate` despite reviewer producing real
+        // findings, because the parser only accepted bracketed markers.
+        let input = "QA-REVIEW-SIGNOFF\n\
+            - **BLOCK** src/flow.rs:1 — concurrent write race\n\
+            - **FLAG** src/flow.rs:2 — sync_all errors swallowed\n\
+            - **NIT** src/flow.rs:3 — variable shadowing\n\
+            Summary: 1 blockers, 1 flags, 1 nits";
+        let result = parse_signoff(input);
+
+        assert_eq!(result.block, 1);
+        assert_eq!(result.flag, 1);
+        assert_eq!(result.nit, 1);
+        assert_eq!(result.verdict, "blockers");
+        assert_eq!(result.findings.len(), 3);
+        assert!(result.findings[1].text.contains("sync_all errors swallowed"));
+    }
+
+    #[test]
+    fn parse_signoff_accepts_plain_colon_marker() {
+        // Occasional third form: `- SEVERITY: message`.
+        let input = "QA-REVIEW-SIGNOFF\n\
+            - FLAG: src/foo.rs:10 — first finding\n\
+            - NIT: src/bar.rs:20 — second finding\n\
+            Summary: 1 flags, 1 nits";
+        let result = parse_signoff(input);
+
+        assert_eq!(result.flag, 1);
+        assert_eq!(result.nit, 1);
+        assert_eq!(result.verdict, "flags-only");
+    }
+
+    #[test]
+    fn parse_signoff_mixed_marker_forms_in_one_block() {
+        // Real reviewers sometimes mix forms within one block. Parser must
+        // accept all three in the same SIGNOFF.
+        let input = "QA-REVIEW-SIGNOFF\n\
+            - [BLOCK] src/a.rs:1 — bracketed\n\
+            - **FLAG** src/b.rs:2 — bold\n\
+            - NIT: src/c.rs:3 — colon\n";
+        let result = parse_signoff(input);
+
+        assert_eq!(result.block, 1);
+        assert_eq!(result.flag, 1);
+        assert_eq!(result.nit, 1);
+        assert_eq!(result.verdict, "blockers");
     }
 
     #[test]
