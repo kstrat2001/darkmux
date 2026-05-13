@@ -22,6 +22,8 @@ use serde_json::{Map, Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Default openclaw config path. `DARKMUX_OPENCLAW_CONFIG` env var overrides
 /// (e.g., for tests).
@@ -69,6 +71,36 @@ pub struct DispatchResult {
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
+    /// The session id actually used for this dispatch. Echoes back the
+    /// caller-supplied `opts.session_id` when set, or the fresh one this
+    /// dispatch generated when `opts.session_id` was `None` (closes #88 —
+    /// without an explicit `--session-id`, openclaw's per-agent session
+    /// reuse caused cross-task context pollution).
+    pub session_id: String,
+}
+
+/// Process-local monotonic counter — guarantees uniqueness for rapid
+/// successive `fresh_session_id` calls in the same process even when the
+/// wall-clock micros component collides (loops faster than the system clock).
+static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Generate a fresh, unique session id for an unscoped `crew dispatch` call.
+/// Shape: `crew-dispatch-<role>-<unix_micros>-<process_counter>`.
+///
+/// The micros component distinguishes calls across processes (different
+/// invocations of `darkmux crew dispatch` from a shell each get their own
+/// process start time). The counter component distinguishes calls within
+/// the same process (scripted callers or future server backends could call
+/// faster than microsecond resolution allows). Together they guarantee no
+/// two `fresh_session_id` calls return the same string, closing the
+/// per-agent session reuse this helper is meant to prevent (#88).
+pub(crate) fn fresh_session_id(role_id: &str) -> String {
+    let micros = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros())
+        .unwrap_or(0);
+    let counter = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("crew-dispatch-{role_id}-{micros}-{counter}")
 }
 
 /// Run a single dispatch end-to-end.
@@ -90,12 +122,20 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             })?;
     }
 
-    // 3. Invoke openclaw agent
+    // 3. Resolve session id. Always pass `--session-id` to openclaw — when
+    //    the caller didn't supply one, generate a fresh `crew-dispatch-
+    //    <role>-<timestamp>`. Without this, openclaw silently reuses the
+    //    per-agent `agent:darkmux-<role>:main` session across dispatches,
+    //    leading to cross-task context pollution (#88).
+    let resolved_session_id = opts
+        .session_id
+        .clone()
+        .unwrap_or_else(|| fresh_session_id(&opts.role_id));
+
+    // 4. Invoke openclaw agent
     let mut cmd = Command::new("openclaw");
     cmd.args(["agent", "--local", "--agent", &agent_id, "--json"]);
-    if let Some(sess) = &opts.session_id {
-        cmd.args(["--session-id", sess]);
-    }
+    cmd.args(["--session-id", &resolved_session_id]);
     cmd.args(["--timeout", &opts.timeout_seconds.to_string()]);
     if let Some(deliver) = &opts.deliver {
         let (chan, target) = deliver
@@ -113,6 +153,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         exit_code: output.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
         stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        session_id: resolved_session_id,
     })
 }
 
@@ -491,5 +532,61 @@ mod tests {
             config["agents"]["list"][0]["id"],
             "darkmux/code-reviewer"
         );
+    }
+
+    // ─── #88: fresh session id per dispatch ────────────────────────────────
+
+    #[test]
+    fn fresh_session_id_includes_role_micros_and_counter() {
+        let id = fresh_session_id("code-reviewer");
+        // Shape: `crew-dispatch-<role>-<micros>-<counter>`
+        assert!(id.starts_with("crew-dispatch-code-reviewer-"), "got {id:?}");
+        let suffix = id.trim_start_matches("crew-dispatch-code-reviewer-");
+        // Suffix splits into <micros>-<counter>; both digit-only.
+        let parts: Vec<&str> = suffix.split('-').collect();
+        assert_eq!(parts.len(), 2, "expected <micros>-<counter>, got {suffix:?}");
+        let micros: u128 = parts[0].parse().expect("micros should parse as u128");
+        let _counter: u64 = parts[1].parse().expect("counter should parse as u64");
+        // Plausibly-recent timestamp (post-2020-01-01 in micros).
+        assert!(
+            micros > 1_577_836_800_000_000,
+            "suffix should be after 2020-01-01 (micros), got {micros}",
+        );
+    }
+
+    #[test]
+    fn fresh_session_id_uniqueness_under_rapid_calls() {
+        // Two back-to-back calls must not collide. Microsecond resolution
+        // guards against the same-second collision the prior implementation
+        // had (would have re-introduced the per-agent session reuse #88
+        // tried to fix). Generate a batch and assert all-unique.
+        let ids: Vec<String> = (0..50).map(|_| fresh_session_id("coder")).collect();
+        let unique: std::collections::HashSet<_> = ids.iter().cloned().collect();
+        assert_eq!(
+            unique.len(),
+            ids.len(),
+            "50 rapid calls produced {} unique ids (expected 50)",
+            unique.len(),
+        );
+    }
+
+    #[test]
+    fn fresh_session_id_differs_across_roles() {
+        // Same call instant, different roles → different ids.
+        let a = fresh_session_id("coder");
+        let b = fresh_session_id("scribe");
+        assert_ne!(a, b);
+        assert!(a.contains("-coder-"));
+        assert!(b.contains("-scribe-"));
+    }
+
+    #[test]
+    fn fresh_session_id_handles_roles_with_hyphens() {
+        // `code-reviewer` is one of the production roles and contains a
+        // hyphen; the format must preserve it cleanly (no escape, no split).
+        let id = fresh_session_id("code-reviewer");
+        assert!(id.starts_with("crew-dispatch-code-reviewer-"));
+        // No double-hyphen artifact.
+        assert!(!id.contains("crew-dispatch--"));
     }
 }

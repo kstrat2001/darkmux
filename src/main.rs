@@ -215,7 +215,11 @@ enum CrewCmd {
         /// returned on stdout.
         #[arg(long)]
         deliver: Option<String>,
-        /// Override the dispatch session id (default: generated).
+        /// Override the dispatch session id. Default: a fresh
+        /// `crew-dispatch-<role>-<unix-micros>-<process-counter>` is
+        /// generated per call, so consecutive dispatches don't share
+        /// openclaw session state (which would otherwise pollute one
+        /// task with another's context).
         #[arg(long)]
         session_id: Option<String>,
         /// Timeout in seconds (default: 600).
@@ -847,6 +851,10 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
                 skip_preflight,
             };
             let result = crew::dispatch::dispatch(opts)?;
+            // Announce the resolved session id on stderr so operators see
+            // which session openclaw was pointed at — without polluting
+            // the --json envelope on stdout that orchestrators parse.
+            eprintln!("darkmux crew dispatch: session id `{}`", result.session_id);
             // Stream both stdout (openclaw's --json envelope) and stderr to
             // the caller — the orchestrator parses one or the other.
             print!("{}", result.stdout);
