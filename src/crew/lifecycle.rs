@@ -154,6 +154,27 @@ fn emit_mission_transition_record(mission_id: &str, action: &str) {
     });
 }
 
+/// Distinct from `emit_sprint_transition_record` (which uses
+/// `source: sprint_lifecycle` for status flips on an already-tracked
+/// sprint). This one fires when the *mission's shape* changes — a
+/// new sprint joining the plan — so the `source` field reflects that
+/// the change came from the mission_lifecycle surface even though the
+/// `handle` is the new sprint id.
+fn emit_sprint_added_record(sprint_id: &str, mission_id: &str) {
+    let _ = flow::record(FlowRecord {
+        ts: flow::ts_utc_now(),
+        level: Level::Info,
+        category: Category::Work,
+        tier: Tier::Operator,
+        stage: Stage::Scope,
+        action: "sprint added".to_string(),
+        handle: sprint_id.to_string(),
+        sprint_id: Some(sprint_id.to_string()),
+        session_id: Some(format!("mission:{mission_id}")),
+        source: Some("mission_lifecycle".to_string()),
+    });
+}
+
 // ─── Sprint transitions ─────────────────────────────────────────────────
 
 /// `sprint start <id>` — Planned/Abandoned → Running.
@@ -277,6 +298,154 @@ pub fn mission_resume(id: &str) -> Result<Mission> {
     save_json(&mission_path(id), &mission)?;
     emit_mission_transition_record(id, "mission resume");
     Ok(mission)
+}
+
+// ─── Mission scope growth ──────────────────────────────────────────────
+
+/// `mission add-sprint` — operator-sovereign scope growth (#107).
+///
+/// Adds a new Sprint to an existing Mission mid-flight. The alternative
+/// today is one of: (a) hand-edit the Mission JSON to append a sprint id
+/// and hand-author a new Sprint JSON, (b) create a separate Mission that
+/// loses the *"this composes with what we're already doing"* signal, or
+/// (c) leave the discovery as a GH issue with no Mission/Sprint
+/// representation. None reflect how engineering work actually evolves
+/// during a sprint.
+///
+/// Behavior:
+///   - Writes a new Sprint JSON at `<crew_root>/sprints/<sprint-id>.json`
+///     with `status: Planned`, `mission_id`, `description`, `depends_on`,
+///     `created_ts: now()`.
+///   - Appends the sprint id to the Mission's `sprint_ids` array (atomic
+///     write per the existing `save_json` semantics).
+///   - Emits a `sprint added` flow record (tier=operator, source=
+///     mission_lifecycle) so the addition is observable in the viewer.
+///
+/// Idempotent on EXACT match: re-adding a sprint with the same id +
+/// mission + description is a no-op (no error). The sprint_ids array
+/// gets the sprint appended if it had drifted off (defensive). Non-
+/// matching descriptions error — we don't silently overwrite operator
+/// content.
+///
+/// Errors loudly when:
+///   - Mission doesn't exist.
+///   - Sprint id is already in use under a *different* mission (would
+///     break the unique-id-per-sprint invariant the loader relies on).
+///   - Sprint id is in use under SAME mission but with different
+///     description (operator probably meant a different id or wants to
+///     explicitly edit; either way, don't paper over the conflict).
+///   - Any `depends_on` id doesn't resolve to an existing sprint.
+pub fn add_sprint_to_mission(
+    mission_id: &str,
+    sprint_id: &str,
+    description: &str,
+    depends_on: Vec<String>,
+    after: Option<&str>,
+) -> Result<Sprint> {
+    let mut mission = load_mission(mission_id)?;
+
+    let all_sprints = load_sprints()?;
+
+    // Idempotency / collision check.
+    if let Some(existing) = all_sprints.iter().find(|s| s.id == sprint_id) {
+        if existing.mission_id != mission_id {
+            bail!(
+                "sprint id `{sprint_id}` already in use under mission `{}`; pick a fresh id",
+                existing.mission_id
+            );
+        }
+        if existing.description != description {
+            bail!(
+                "sprint id `{sprint_id}` already exists under this mission with a different description; \
+                 edit the existing JSON or pick a fresh id"
+            );
+        }
+        // Exact match — idempotent path. Defensive: ensure the mission's
+        // sprint_ids still includes this id (operator may have hand-
+        // edited the JSON and removed it). Idempotent re-adds do NOT
+        // reposition; the operator has to remove the existing entry
+        // first if they want a different position. That keeps re-runs
+        // safe even when `--after` is non-default.
+        let already_listed = mission.sprint_ids.iter().any(|s| s == sprint_id);
+        if !already_listed {
+            let pos = resolve_insert_position(&mission.sprint_ids, after)?;
+            mission.sprint_ids.insert(pos, sprint_id.to_string());
+            save_json(&mission_path(mission_id), &mission)?;
+        }
+        return Ok(existing.clone());
+    }
+
+    // depends_on dangling check — every referenced sprint must exist.
+    for dep in &depends_on {
+        if !all_sprints.iter().any(|s| s.id.as_str() == dep.as_str()) {
+            bail!(
+                "depends_on references unknown sprint `{}`; add it first or correct the id",
+                dep
+            );
+        }
+    }
+
+    // Pre-validate the `--after` target BEFORE writing any state, so a
+    // typo'd `--after` doesn't leave a sprint JSON on disk that's not
+    // referenced from any mission. Resolve to the insertion index now,
+    // then use it after the sprint JSON is written.
+    let insert_pos = resolve_insert_position(&mission.sprint_ids, after)?;
+
+    let sprint = Sprint {
+        id: sprint_id.to_string(),
+        mission_id: mission_id.to_string(),
+        description: description.to_string(),
+        status: SprintStatus::Planned,
+        depends_on,
+        created_ts: now_unix(),
+        started_ts: None,
+        completed_ts: None,
+        abandoned_ts: None,
+    };
+    save_json(&sprint_path(sprint_id), &sprint)?;
+
+    // Position into the mission's sprint_ids. Belt-and-suspenders: the
+    // collision check above means we shouldn't see a duplicate here,
+    // but the idempotent guard makes the operation safe to retry on
+    // partial-failure paths.
+    if !mission.sprint_ids.iter().any(|s| s == sprint_id) {
+        mission.sprint_ids.insert(insert_pos, sprint_id.to_string());
+        save_json(&mission_path(mission_id), &mission)?;
+    }
+
+    emit_sprint_added_record(sprint_id, mission_id);
+
+    Ok(sprint)
+}
+
+/// Compute the index at which a new sprint should be inserted into
+/// the mission's `sprint_ids` array. Pure — does NOT mutate the
+/// vector. Pre-validates `--after` so callers can write the new
+/// sprint JSON without risking an orphan record when the reference
+/// is stale.
+///
+/// When `after` is `None`, returns `sprint_ids.len()` (append). When
+/// `after` names a present sprint, returns the index immediately
+/// after it. Errors when `after` names an absent sprint — silently
+/// appending would obscure a typo or stale reference, which violates
+/// operator sovereignty (don't substitute system judgment for
+/// operator intent).
+fn resolve_insert_position(sprint_ids: &[String], after: Option<&str>) -> Result<usize> {
+    match after {
+        None => Ok(sprint_ids.len()),
+        Some(target) => {
+            let pos = sprint_ids
+                .iter()
+                .position(|s| s == target)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--after references sprint `{target}` which isn't in this mission's sprint_ids; \
+                         pick an id that's already in the plan (or omit --after to append)"
+                    )
+                })?;
+            Ok(pos + 1)
+        }
+    }
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────
@@ -580,5 +749,224 @@ mod tests {
         let _ = sprint_start("s-atomic").unwrap();
         let tmp_path = sprint_path("s-atomic").with_extension("json.tmp");
         assert!(!tmp_path.exists(), "atomic save should rename, leaving no .tmp");
+    }
+
+    // ─── add_sprint_to_mission (#107) ───────────────────────────────────
+
+    #[serial_test::serial]
+    #[test]
+    fn add_sprint_creates_planned_sprint_and_extends_mission() {
+        let _g = CrewGuard::new();
+        let mission = seed_mission("test-mission", MissionStatus::Active);
+        assert!(mission.sprint_ids.is_empty(), "starting state: empty sprint list");
+
+        let s = add_sprint_to_mission(
+            "test-mission",
+            "new-sprint",
+            "discovered mid-flight",
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(s.status, SprintStatus::Planned);
+        assert_eq!(s.mission_id, "test-mission");
+        assert_eq!(s.description, "discovered mid-flight");
+        assert!(s.started_ts.is_none());
+        // Sprint JSON exists on disk.
+        assert!(sprint_path("new-sprint").exists());
+        // Mission JSON's sprint_ids was updated.
+        let reloaded = load_mission("test-mission").unwrap();
+        assert_eq!(reloaded.sprint_ids, vec!["new-sprint".to_string()]);
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn add_sprint_is_idempotent_on_exact_match() {
+        let _g = CrewGuard::new();
+        seed_mission("m1", MissionStatus::Active);
+
+        let first = add_sprint_to_mission("m1", "s-once", "same desc", Vec::new(), None).unwrap();
+        let second = add_sprint_to_mission("m1", "s-once", "same desc", Vec::new(), None).unwrap();
+
+        // Same created_ts on the second call — we returned the existing sprint, not a fresh one.
+        assert_eq!(first.created_ts, second.created_ts);
+        // Mission's sprint_ids contains the id once, not twice.
+        let m = load_mission("m1").unwrap();
+        assert_eq!(m.sprint_ids.iter().filter(|s| *s == "s-once").count(), 1);
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn add_sprint_errors_when_id_collides_across_missions() {
+        let _g = CrewGuard::new();
+        seed_mission("m-a", MissionStatus::Active);
+        seed_mission("m-b", MissionStatus::Active);
+        add_sprint_to_mission("m-a", "shared", "first", Vec::new(), None).unwrap();
+
+        let err = add_sprint_to_mission("m-b", "shared", "second", Vec::new(), None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("already in use under mission `m-a`"), "got: {msg}");
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn add_sprint_errors_when_same_id_has_different_description() {
+        let _g = CrewGuard::new();
+        seed_mission("m1", MissionStatus::Active);
+        add_sprint_to_mission("m1", "s1", "original", Vec::new(), None).unwrap();
+
+        let err = add_sprint_to_mission("m1", "s1", "different", Vec::new(), None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("different description"), "got: {msg}");
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn add_sprint_errors_when_mission_missing() {
+        let _g = CrewGuard::new();
+        let err = add_sprint_to_mission(
+            "ghost-mission",
+            "new-sprint",
+            "desc",
+            Vec::new(),
+            None,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no mission") && msg.contains("ghost-mission"),
+            "got: {msg}",
+        );
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn add_sprint_errors_when_depends_on_dangles() {
+        let _g = CrewGuard::new();
+        seed_mission("m1", MissionStatus::Active);
+        let err = add_sprint_to_mission(
+            "m1",
+            "new-sprint",
+            "desc",
+            vec!["nonexistent".to_string()],
+            None,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("depends_on references unknown sprint `nonexistent`"),
+            "got: {msg}",
+        );
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn add_sprint_resolves_depends_on_against_existing_sprints() {
+        let _g = CrewGuard::new();
+        seed_mission("m1", MissionStatus::Active);
+        seed_sprint("dep-sprint", SprintStatus::Planned);
+
+        // Note: seed_sprint hard-codes mission_id="test-mission"; the dep
+        // doesn't have to live in the same mission for the resolution
+        // check (cross-mission deps are unusual but not invalid).
+        let s = add_sprint_to_mission(
+            "m1",
+            "new-sprint",
+            "desc",
+            vec!["dep-sprint".to_string()],
+            None,
+        )
+        .unwrap();
+        assert_eq!(s.depends_on, vec!["dep-sprint".to_string()]);
+    }
+
+    // ─── --after positioning (insert-in-middle) ─────────────────────────
+
+    #[serial_test::serial]
+    #[test]
+    fn add_sprint_with_after_inserts_in_middle_not_at_end() {
+        let _g = CrewGuard::new();
+        seed_mission("m1", MissionStatus::Active);
+        add_sprint_to_mission("m1", "alpha", "first", Vec::new(), None).unwrap();
+        add_sprint_to_mission("m1", "beta", "second", Vec::new(), None).unwrap();
+        add_sprint_to_mission("m1", "gamma", "third", Vec::new(), None).unwrap();
+
+        // Insert `delta` between `alpha` and `beta`.
+        add_sprint_to_mission("m1", "delta", "inserted", Vec::new(), Some("alpha")).unwrap();
+
+        let m = load_mission("m1").unwrap();
+        assert_eq!(
+            m.sprint_ids,
+            vec![
+                "alpha".to_string(),
+                "delta".to_string(),
+                "beta".to_string(),
+                "gamma".to_string(),
+            ],
+            "delta should land immediately after alpha, not at the end"
+        );
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn add_sprint_with_after_at_tail_inserts_after_last() {
+        // Edge case: --after the last sprint should append (not error).
+        let _g = CrewGuard::new();
+        seed_mission("m1", MissionStatus::Active);
+        add_sprint_to_mission("m1", "alpha", "first", Vec::new(), None).unwrap();
+        add_sprint_to_mission("m1", "beta", "second", Vec::new(), None).unwrap();
+
+        add_sprint_to_mission("m1", "gamma", "third", Vec::new(), Some("beta")).unwrap();
+
+        let m = load_mission("m1").unwrap();
+        assert_eq!(m.sprint_ids, vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn add_sprint_with_after_unknown_id_errors_loudly() {
+        let _g = CrewGuard::new();
+        seed_mission("m1", MissionStatus::Active);
+        add_sprint_to_mission("m1", "alpha", "first", Vec::new(), None).unwrap();
+
+        let err = add_sprint_to_mission(
+            "m1",
+            "beta",
+            "second",
+            Vec::new(),
+            Some("nonexistent-id"),
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--after references sprint `nonexistent-id`"),
+            "got: {msg}"
+        );
+        // Mission was not mutated on error — alpha is still the only sprint.
+        let m = load_mission("m1").unwrap();
+        assert_eq!(m.sprint_ids, vec!["alpha".to_string()]);
+        // The sprint JSON should NOT have been left behind either.
+        assert!(!sprint_path("beta").exists(), "errored insert must not leave orphan sprint");
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn add_sprint_emits_sprint_added_flow_record() {
+        let _g = CrewGuard::new();
+        seed_mission("m1", MissionStatus::Active);
+        add_sprint_to_mission("m1", "new-sprint", "desc", Vec::new(), None).unwrap();
+
+        // Read the day's flow file from the temp DARKMUX_FLOWS_DIR.
+        let flows_dir = env::var("DARKMUX_FLOWS_DIR").unwrap();
+        let day = crate::flow::day_utc_now();
+        let path = std::path::PathBuf::from(flows_dir).join(format!("{day}.jsonl"));
+        let raw = std::fs::read_to_string(&path).expect("flow file should have been created");
+        let found = raw.lines().any(|line| {
+            line.contains("\"action\":\"sprint added\"")
+                && line.contains("\"handle\":\"new-sprint\"")
+                && line.contains("\"source\":\"mission_lifecycle\"")
+        });
+        assert!(found, "expected a `sprint added` flow record, got:\n{raw}");
     }
 }

@@ -363,6 +363,35 @@ enum MissionCmd {
     Resume {
         id: String,
     },
+    /// Add a new Sprint to an existing Mission mid-flight (#107).
+    /// Operator-sovereign scope growth — alternative to either hand-
+    /// editing JSON or filing a separate Mission for work that
+    /// composes with the in-flight arc. Idempotent on exact-match
+    /// (same id + mission + description); errors on collision or
+    /// dangling depends_on.
+    AddSprint {
+        /// Mission id to extend (must exist).
+        mission_id: String,
+        /// Id for the new Sprint (must not collide with any existing
+        /// sprint under a different mission; idempotent if same).
+        #[arg(long = "sprint-id")]
+        sprint_id: String,
+        /// Description of the new Sprint's scope.
+        #[arg(long)]
+        description: String,
+        /// Optional dependencies — other sprint ids that should
+        /// complete first. Each must reference an existing sprint.
+        #[arg(long = "depends-on")]
+        depends_on: Vec<String>,
+        /// Insert the new sprint immediately after this existing
+        /// sprint id (insert-in-middle). When omitted, the new
+        /// sprint is appended to the end of the mission's sprint
+        /// list (queue-on-end). The named id must already be in
+        /// the mission's sprint_ids — errors otherwise to surface
+        /// typos and stale references.
+        #[arg(long)]
+        after: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -907,6 +936,24 @@ fn cmd_mission(sub: MissionCmd) -> Result<i32> {
         MissionCmd::Resume { id } => {
             let m = crew::lifecycle::mission_resume(&id)?;
             println!("mission `{}` → Active  (paused_ts preserved: {})", m.id, m.paused_ts.unwrap_or(0));
+            Ok(0)
+        }
+        MissionCmd::AddSprint { mission_id, sprint_id, description, depends_on, after } => {
+            let s = crew::lifecycle::add_sprint_to_mission(
+                &mission_id,
+                &sprint_id,
+                &description,
+                depends_on,
+                after.as_deref(),
+            )?;
+            let position = match after.as_deref() {
+                Some(a) => format!(" (after `{a}`)"),
+                None => String::new(),
+            };
+            println!(
+                "mission `{}` ← added sprint `{}`{}",
+                mission_id, s.id, position
+            );
             Ok(0)
         }
     }
