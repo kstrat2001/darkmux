@@ -175,7 +175,7 @@ pub(crate) fn snapshot_watched_path(root: &Path) -> WatchedPathState {
 
     // Sort by size descending so the operator sees the largest (often
     // most-relevant — actual outputs vs scratch files) first.
-    files.sort_by(|a, b| b.size.cmp(&a.size));
+    files.sort_by_key(|f| std::cmp::Reverse(f.size));
 
     WatchedPathState {
         root: root.to_path_buf(),
