@@ -632,7 +632,12 @@ mod tests {
         assert!(summary.contains("tokensBefore: 48000"));
     }
 
-    #[ignore = "needs HOME / cwd fixtures that don't reliably exist on CI runners"]
+    // Process-global state mutated below (cwd + DARKMUX_NOTEBOOK_DIR);
+    // `#[serial]` keeps this test from racing other env-touching tests in
+    // the same binary, and the explicit save/restore guards against any
+    // operator-set DARKMUX_NOTEBOOK_DIR (e.g. iCloud notebook on the dev
+    // rig) leaking the entry path outside the tempdir.
+    #[serial_test::serial]
     #[test]
     fn draft_entry_dry_run_does_not_dispatch() {
         let tmp = TempDir::new().unwrap();
@@ -645,8 +650,14 @@ mod tests {
         )
         .unwrap();
 
-        let prev = env::current_dir().unwrap();
+        let prev_cwd = env::current_dir().unwrap();
+        let prev_notebook = env::var("DARKMUX_NOTEBOOK_DIR").ok();
+        // set_var / remove_var are `unsafe` since the 2024 edition due to
+        // thread-safety; the surrounding `#[serial]` keeps this single-
+        // threaded across the test binary, so the contract holds.
+        unsafe { env::remove_var("DARKMUX_NOTEBOOK_DIR") };
         env::set_current_dir(tmp.path()).unwrap();
+
         let report = draft_entry(&DraftOptions {
             run_id: "test-run".to_string(),
             agent: "main".to_string(),
@@ -655,15 +666,29 @@ mod tests {
             machine_override: None,
         })
         .unwrap();
-        env::set_current_dir(prev).unwrap();
+
+        env::set_current_dir(&prev_cwd).unwrap();
+        unsafe {
+            match prev_notebook {
+                Some(v) => env::set_var("DARKMUX_NOTEBOOK_DIR", v),
+                None => env::remove_var("DARKMUX_NOTEBOOK_DIR"),
+            }
+        }
 
         assert!(report.run_dir.ends_with("test-run"));
         assert!(report.entry_path.to_str().unwrap().contains("test-slug"));
         assert!(report.prompt_chars > 100);
-        // Dry run: file not written.
+        // Dry run: file not written. The `remove_var` above ensures the
+        // entry would have landed in `<tmpdir>/.darkmux/notebook/` rather
+        // than the operator's iCloud notebook, so this can't false-positive
+        // off a same-slug entry that happens to live in the real notebook.
         assert!(!report.entry_path.exists());
     }
 
+    // Sibling to the dry-run test above — same cwd mutation, same
+    // serial requirement so the two don't race each other or any other
+    // env-touching test.
+    #[serial_test::serial]
     #[test]
     fn draft_entry_errors_on_missing_run() {
         let tmp = TempDir::new().unwrap();
