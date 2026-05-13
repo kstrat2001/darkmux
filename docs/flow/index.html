@@ -1,0 +1,624 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>darkmux flow — orchestrator-flow viewer</title>
+<meta name="description" content="Stepper + filters for darkmux flow JSONL records. File-drop or fetch from a local darkmux serve daemon at http://localhost:8765/flow/<date>.jsonl.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0a0a0b;
+    --bg-elev: #131316;
+    --bg-elev2: #1c1c22;
+    --border: #1f1f24;
+    --border-hot: #2a8a96;
+    --text: #e8e6e3;
+    --muted: #8a8a92;
+    --dim: #5a5a62;
+    --accent: #6df1ff;
+    --accent-dim: #2a8a96;
+    --warn: #ffb86b;
+    --good: #5af0a3;
+    --bad: #ff6b85;
+
+    /* tier colors — vertical-stripe accents */
+    --tier-operator: #6df1ff;   /* cyan — operator agency */
+    --tier-frontier: #c084fc;   /* violet — frontier reasoning */
+    --tier-local:    #5af0a3;   /* green — local computation */
+
+    /* level colors */
+    --lvl-error: #ff6b85;
+    --lvl-warn:  #ffb86b;
+    --lvl-info:  #e8e6e3;
+    --lvl-debug: #8a8a92;
+    --lvl-trace: #5a5a62;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 'Inter', system-ui, -apple-system, sans-serif;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+  code, pre, .mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
+
+  /* ─── header ────────────────────────────────────────────────────── */
+  header {
+    padding: 18px 24px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+  h1 { margin: 0; font-size: 18px; font-weight: 600; letter-spacing: -0.01em; }
+  h1 .accent { color: var(--accent); }
+  h1 .tag { color: var(--muted); font-weight: 500; }
+  .header-right { display: flex; gap: 12px; align-items: center; }
+  .conn-status {
+    font-size: 12px;
+    padding: 3px 8px;
+    border-radius: 3px;
+    border: 1px solid var(--border);
+    color: var(--muted);
+  }
+  .conn-status.live { color: var(--good); border-color: var(--good); }
+  .conn-status.local { color: var(--accent); border-color: var(--accent-dim); }
+
+  /* ─── toolbar ───────────────────────────────────────────────────── */
+  .toolbar {
+    padding: 12px 24px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    align-items: center;
+    background: var(--bg-elev);
+  }
+  .toolbar > * { flex-shrink: 0; }
+  button, .btn {
+    background: var(--bg-elev2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    padding: 6px 12px;
+    border-radius: 3px;
+    cursor: pointer;
+    font: inherit;
+    font-size: 13px;
+    transition: border-color 0.1s, color 0.1s;
+  }
+  button:hover, .btn:hover { border-color: var(--accent-dim); color: var(--accent); }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  button:disabled:hover { border-color: var(--border); color: var(--text); }
+  input[type="date"], input[type="text"], select {
+    background: var(--bg-elev2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    padding: 5px 8px;
+    border-radius: 3px;
+    font: inherit;
+    font-size: 13px;
+  }
+  input[type="date"]:focus, input[type="text"]:focus, select:focus {
+    outline: none;
+    border-color: var(--accent-dim);
+  }
+  .toolbar-label { color: var(--muted); font-size: 12px; }
+
+  /* ─── main layout ───────────────────────────────────────────────── */
+  main {
+    flex: 1;
+    display: grid;
+    grid-template-columns: 240px 1fr;
+    overflow: hidden;
+  }
+  aside.filters {
+    padding: 16px;
+    border-right: 1px solid var(--border);
+    background: var(--bg-elev);
+    overflow-y: auto;
+  }
+  .filter-group { margin-bottom: 18px; }
+  .filter-group h3 {
+    margin: 0 0 6px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+    font-weight: 600;
+  }
+  .filter-group label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 0;
+    cursor: pointer;
+    font-size: 13px;
+  }
+  .filter-group label:hover { color: var(--accent); }
+  .filter-group input[type="checkbox"] { cursor: pointer; }
+
+  /* ─── stepper view ──────────────────────────────────────────────── */
+  .stepper {
+    padding: 24px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+  .stepper-controls {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+  }
+  .progress {
+    color: var(--muted);
+    font-size: 13px;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .record {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    overflow: hidden;
+    display: flex;
+    min-height: 200px;
+  }
+  .tier-stripe {
+    width: 4px;
+    background: var(--dim);
+  }
+  .tier-stripe.operator { background: var(--tier-operator); }
+  .tier-stripe.frontier { background: var(--tier-frontier); }
+  .tier-stripe.local    { background: var(--tier-local); }
+  .record-body { padding: 16px 20px; flex: 1; }
+  .record-head {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    margin-bottom: 12px;
+    flex-wrap: wrap;
+  }
+  .level-pill, .meta-pill {
+    font-size: 11px;
+    padding: 2px 7px;
+    border-radius: 3px;
+    border: 1px solid var(--border);
+    font-family: 'JetBrains Mono', monospace;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .level-pill.error { color: var(--lvl-error); border-color: var(--lvl-error); }
+  .level-pill.warn  { color: var(--lvl-warn);  border-color: var(--lvl-warn); }
+  .level-pill.info  { color: var(--lvl-info); }
+  .level-pill.debug { color: var(--lvl-debug); }
+  .level-pill.trace { color: var(--lvl-trace); }
+  .ts { color: var(--muted); font-family: 'JetBrains Mono', monospace; font-size: 13px; }
+  .action {
+    margin: 6px 0;
+    font-size: 16px;
+    font-weight: 500;
+    color: var(--text);
+  }
+  .handle {
+    color: var(--muted);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    word-break: break-word;
+  }
+  .meta-row {
+    display: flex;
+    gap: 8px;
+    margin-top: 14px;
+    flex-wrap: wrap;
+  }
+  .meta-pill .lbl { color: var(--dim); }
+  .meta-pill .val { color: var(--muted); margin-left: 4px; }
+
+  /* ─── empty / banner states ─────────────────────────────────────── */
+  .empty, .banner {
+    background: var(--bg-elev);
+    border: 1px dashed var(--border);
+    border-radius: 4px;
+    padding: 32px;
+    text-align: center;
+    color: var(--muted);
+  }
+  .empty h2 { margin: 0 0 8px; font-size: 17px; color: var(--text); }
+  .empty p { margin: 4px 0; font-size: 13px; }
+  .banner.warn { border-color: var(--warn); color: var(--warn); border-style: solid; }
+  .banner.warn strong { color: var(--text); }
+
+  /* ─── footer ────────────────────────────────────────────────────── */
+  footer {
+    padding: 8px 24px;
+    border-top: 1px solid var(--border);
+    font-size: 11px;
+    color: var(--dim);
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+    background: var(--bg-elev);
+  }
+  footer a { color: var(--accent-dim); text-decoration: none; }
+  footer a:hover { color: var(--accent); }
+
+  /* ─── tier legend ───────────────────────────────────────────────── */
+  .legend { display: flex; gap: 14px; align-items: center; }
+  .legend .swatch {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+    margin-right: 5px;
+    vertical-align: middle;
+  }
+
+  /* keyboard hints */
+  kbd {
+    font-family: 'JetBrains Mono', monospace;
+    background: var(--bg-elev2);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 0 5px;
+    font-size: 11px;
+  }
+</style>
+</head>
+<body>
+  <header>
+    <h1><span class="accent">darkmux</span> <span class="tag">/ flow viewer</span></h1>
+    <div class="header-right">
+      <span id="conn-status" class="conn-status">no source</span>
+    </div>
+  </header>
+
+  <div class="toolbar">
+    <span class="toolbar-label">source:</span>
+    <input type="file" id="file-input" accept=".jsonl" style="display:none">
+    <button id="load-file-btn">Load .jsonl</button>
+    <button id="load-daemon-btn">Fetch from daemon</button>
+    <button id="load-sample-btn">Sample</button>
+    <span class="toolbar-label">date:</span>
+    <input type="date" id="date-input">
+    <span class="toolbar-label">filter:</span>
+    <input type="text" id="search-input" placeholder="action / handle text…">
+  </div>
+
+  <main>
+    <aside class="filters">
+      <div class="filter-group">
+        <h3>Level</h3>
+        <label><input type="checkbox" value="error" class="f-level" checked>error</label>
+        <label><input type="checkbox" value="warn"  class="f-level" checked>warn</label>
+        <label><input type="checkbox" value="info"  class="f-level" checked>info</label>
+        <label><input type="checkbox" value="debug" class="f-level" checked>debug</label>
+        <label><input type="checkbox" value="trace" class="f-level" checked>trace</label>
+      </div>
+      <div class="filter-group">
+        <h3>Category</h3>
+        <label><input type="checkbox" value="work"      class="f-category" checked>work</label>
+        <label><input type="checkbox" value="machinery" class="f-category" checked>machinery</label>
+        <label><input type="checkbox" value="audit"     class="f-category" checked>audit</label>
+        <label><input type="checkbox" value="review"    class="f-category" checked>review</label>
+      </div>
+      <div class="filter-group">
+        <h3>Tier</h3>
+        <label><input type="checkbox" value="operator" class="f-tier" checked><span class="swatch" style="background: var(--tier-operator)"></span>operator</label>
+        <label><input type="checkbox" value="frontier" class="f-tier" checked><span class="swatch" style="background: var(--tier-frontier)"></span>frontier</label>
+        <label><input type="checkbox" value="local"    class="f-tier" checked><span class="swatch" style="background: var(--tier-local)"></span>local</label>
+      </div>
+      <div class="filter-group">
+        <h3>Stage</h3>
+        <label><input type="checkbox" value="scope"     class="f-stage" checked>scope</label>
+        <label><input type="checkbox" value="estimate"  class="f-stage" checked>estimate</label>
+        <label><input type="checkbox" value="dispatch"  class="f-stage" checked>dispatch</label>
+        <label><input type="checkbox" value="review"    class="f-stage" checked>review</label>
+        <label><input type="checkbox" value="ship"      class="f-stage" checked>ship</label>
+        <label><input type="checkbox" value="retrospect" class="f-stage" checked>retrospect</label>
+      </div>
+    </aside>
+
+    <section class="stepper" id="stepper">
+      <div class="empty" id="empty">
+        <h2>No records loaded</h2>
+        <p>Drop a <code class="mono">.jsonl</code> file, fetch from a local <code class="mono">darkmux serve</code> daemon, or load the sample.</p>
+        <p style="margin-top:18px;color:var(--dim);"><kbd>←</kbd> <kbd>→</kbd> step · <kbd>Home</kbd> first · <kbd>End</kbd> last</p>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="legend">
+      <span><span class="swatch" style="background:var(--tier-operator)"></span>operator</span>
+      <span><span class="swatch" style="background:var(--tier-frontier)"></span>frontier</span>
+      <span><span class="swatch" style="background:var(--tier-local)"></span>local</span>
+    </div>
+    <div>
+      flow schema <span id="schema-version" class="mono">—</span> ·
+      darkmux <span id="darkmux-version" class="mono">—</span> ·
+      <a href="https://github.com/kstrat2001/darkmux/issues/66">#66 epic</a>
+    </div>
+  </footer>
+
+<script>
+'use strict';
+
+// ─── schema compatibility ──────────────────────────────────────────────
+// Bumped only when the flow schema breaks backward compatibility (rename
+// or retype a field). Minor schema bumps soft-warn; major bumps block.
+const EXPECTED_FLOW_SCHEMA_MAJOR = 1;
+
+// ─── state ─────────────────────────────────────────────────────────────
+const state = {
+  records: [],     // all parsed records (including the schema header if present)
+  schema: null,    // the first-line schema record if present
+  filtered: [],    // records after applying filters + search
+  index: 0,        // current stepper position in filtered[]
+  source: null,    // "file" | "daemon" | "sample"
+};
+
+// ─── DOM refs ──────────────────────────────────────────────────────────
+const stepperEl = document.getElementById('stepper');
+const emptyEl   = document.getElementById('empty');
+const connEl    = document.getElementById('conn-status');
+const dateInput = document.getElementById('date-input');
+const searchInput = document.getElementById('search-input');
+const schemaVerEl = document.getElementById('schema-version');
+const darkmuxVerEl = document.getElementById('darkmux-version');
+
+// Default the date picker to today (UTC).
+function todayUtc() {
+  const d = new Date();
+  return d.toISOString().slice(0, 10);
+}
+dateInput.value = todayUtc();
+
+// ─── parsing ───────────────────────────────────────────────────────────
+function parseJsonl(text) {
+  const lines = text.split('\n').filter(l => l.trim());
+  const records = [];
+  let schema = null;
+  for (const line of lines) {
+    let obj;
+    try {
+      obj = JSON.parse(line);
+    } catch (e) {
+      console.warn('skipping malformed line:', line);
+      continue;
+    }
+    if (obj._type === 'schema') {
+      schema = obj;
+    } else {
+      records.push(obj);
+    }
+  }
+  return { records, schema };
+}
+
+function setSource(label, kind) {
+  state.source = kind;
+  connEl.textContent = label;
+  connEl.className = 'conn-status' + (kind === 'daemon' ? ' live' : kind === 'file' ? ' local' : '');
+}
+
+function loadFromText(text, sourceLabel, sourceKind) {
+  const { records, schema } = parseJsonl(text);
+  state.records = records;
+  state.schema = schema;
+  state.index = 0;
+  if (schema) {
+    schemaVerEl.textContent = schema.version || '?';
+    darkmuxVerEl.textContent = schema.darkmux_version || '?';
+  } else {
+    schemaVerEl.textContent = '(no header)';
+    darkmuxVerEl.textContent = '—';
+  }
+  setSource(sourceLabel, sourceKind);
+  applyFilters();
+}
+
+// ─── filtering ─────────────────────────────────────────────────────────
+function getChecked(cls) {
+  return new Set(
+    Array.from(document.querySelectorAll('.' + cls + ':checked')).map(el => el.value)
+  );
+}
+
+function applyFilters() {
+  const lvls = getChecked('f-level');
+  const cats = getChecked('f-category');
+  const tiers = getChecked('f-tier');
+  const stages = getChecked('f-stage');
+  const q = searchInput.value.trim().toLowerCase();
+
+  state.filtered = state.records.filter(r => {
+    if (r.level && !lvls.has(r.level)) return false;
+    if (r.category && !cats.has(r.category)) return false;
+    if (r.tier && !tiers.has(r.tier)) return false;
+    if (r.stage && !stages.has(r.stage)) return false;
+    if (q) {
+      const blob = [r.action, r.handle, r.source].filter(Boolean).join(' ').toLowerCase();
+      if (!blob.includes(q)) return false;
+    }
+    return true;
+  });
+
+  if (state.index >= state.filtered.length) state.index = Math.max(0, state.filtered.length - 1);
+  render();
+}
+
+// ─── rendering ─────────────────────────────────────────────────────────
+function escapeHtml(s) {
+  if (s == null) return '';
+  return String(s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function renderRecord(r) {
+  const tier = r.tier || 'unknown';
+  const level = r.level || 'info';
+  const stripeClass = ['operator', 'frontier', 'local'].includes(tier) ? tier : '';
+  const meta = [];
+  if (r.category) meta.push({ lbl: 'category', val: r.category });
+  if (r.tier)     meta.push({ lbl: 'tier',     val: r.tier });
+  if (r.stage)    meta.push({ lbl: 'stage',    val: r.stage });
+  if (r.source)   meta.push({ lbl: 'source',   val: r.source });
+  if (r.sprint_id)  meta.push({ lbl: 'sprint',  val: r.sprint_id });
+  if (r.session_id) meta.push({ lbl: 'session', val: r.session_id });
+
+  return `
+    <div class="record">
+      <div class="tier-stripe ${stripeClass}"></div>
+      <div class="record-body">
+        <div class="record-head">
+          <span class="level-pill ${level}">${escapeHtml(level)}</span>
+          <span class="ts">${escapeHtml(r.ts || '')}</span>
+        </div>
+        <div class="action">${escapeHtml(r.action || '(no action)')}</div>
+        <div class="handle">${escapeHtml(r.handle || '')}</div>
+        <div class="meta-row">
+          ${meta.map(m => `<span class="meta-pill"><span class="lbl">${escapeHtml(m.lbl)}</span><span class="val">${escapeHtml(m.val)}</span></span>`).join('')}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function render() {
+  // Schema-compat banner
+  let banner = '';
+  if (state.schema && state.schema.version) {
+    const major = parseInt(state.schema.version.split('.')[0], 10);
+    if (major > EXPECTED_FLOW_SCHEMA_MAJOR) {
+      banner = `<div class="banner warn">
+        <strong>Schema major bump detected.</strong> File reports flow schema
+        ${escapeHtml(state.schema.version)}; this viewer expects major
+        ${EXPECTED_FLOW_SCHEMA_MAJOR}. Update the viewer or downgrade the daemon.
+      </div>`;
+    }
+  }
+
+  if (state.records.length === 0) {
+    stepperEl.innerHTML = '';
+    emptyEl.style.display = 'block';
+    stepperEl.appendChild(emptyEl);
+    return;
+  }
+  emptyEl.style.display = 'none';
+
+  if (state.filtered.length === 0) {
+    stepperEl.innerHTML = banner + `
+      <div class="empty">
+        <h2>No records match the current filters</h2>
+        <p>Loosen a filter on the left, or clear the search box.</p>
+      </div>
+    `;
+    return;
+  }
+
+  const r = state.filtered[state.index];
+  const controls = `
+    <div class="stepper-controls">
+      <div>
+        <button id="first-btn" ${state.index === 0 ? 'disabled' : ''}>« first</button>
+        <button id="prev-btn"  ${state.index === 0 ? 'disabled' : ''}>‹ prev</button>
+      </div>
+      <span class="progress">${state.index + 1} / ${state.filtered.length}</span>
+      <div>
+        <button id="next-btn" ${state.index >= state.filtered.length - 1 ? 'disabled' : ''}>next ›</button>
+        <button id="last-btn" ${state.index >= state.filtered.length - 1 ? 'disabled' : ''}>last »</button>
+      </div>
+    </div>
+  `;
+
+  stepperEl.innerHTML = banner + controls + renderRecord(r) + controls;
+
+  document.getElementById('first-btn').onclick = () => { state.index = 0; render(); };
+  document.getElementById('prev-btn').onclick  = () => { if (state.index > 0) { state.index--; render(); } };
+  document.getElementById('next-btn').onclick  = () => { if (state.index < state.filtered.length - 1) { state.index++; render(); } };
+  document.getElementById('last-btn').onclick  = () => { state.index = state.filtered.length - 1; render(); };
+}
+
+// ─── sources ───────────────────────────────────────────────────────────
+document.getElementById('load-file-btn').onclick = () => document.getElementById('file-input').click();
+document.getElementById('file-input').onchange = (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  const reader = new FileReader();
+  reader.onload = () => loadFromText(reader.result, 'file: ' + f.name, 'file');
+  reader.readAsText(f);
+};
+
+document.getElementById('load-daemon-btn').onclick = async () => {
+  const date = dateInput.value || todayUtc();
+  const url = `http://localhost:8765/flow/${date}.jsonl`;
+  setSource('fetching…', null);
+  try {
+    const resp = await fetch(url);
+    if (!resp.ok) {
+      setSource(`daemon ${resp.status}`, null);
+      alert(`Daemon returned ${resp.status} for ${date}.jsonl. Is darkmux serve running?`);
+      return;
+    }
+    const text = await resp.text();
+    loadFromText(text, `daemon · ${date}`, 'daemon');
+  } catch (e) {
+    setSource('daemon offline', null);
+    alert('Could not reach http://localhost:8765 — start darkmux serve, or check --bind / --port flags.');
+  }
+};
+
+document.getElementById('load-sample-btn').onclick = () => {
+  loadFromText(SAMPLE_JSONL, 'sample (in-memory)', 'sample');
+};
+
+// ─── filter bindings ───────────────────────────────────────────────────
+document.querySelectorAll('aside.filters input[type="checkbox"]').forEach(el => {
+  el.addEventListener('change', applyFilters);
+});
+searchInput.addEventListener('input', () => {
+  // Debounce-lite: rAF coalesce keypresses.
+  if (searchInput._raf) cancelAnimationFrame(searchInput._raf);
+  searchInput._raf = requestAnimationFrame(applyFilters);
+});
+
+// ─── keyboard nav ──────────────────────────────────────────────────────
+document.addEventListener('keydown', (e) => {
+  if (document.activeElement && ['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement.tagName)) {
+    return; // don't hijack input focus
+  }
+  if (state.filtered.length === 0) return;
+  if (e.key === 'ArrowLeft')  { if (state.index > 0) { state.index--; render(); e.preventDefault(); } }
+  if (e.key === 'ArrowRight') { if (state.index < state.filtered.length - 1) { state.index++; render(); e.preventDefault(); } }
+  if (e.key === 'Home')       { state.index = 0; render(); e.preventDefault(); }
+  if (e.key === 'End')        { state.index = state.filtered.length - 1; render(); e.preventDefault(); }
+});
+
+// ─── sample data ───────────────────────────────────────────────────────
+const SAMPLE_JSONL = `{"_type":"schema","version":"1.0.0","darkmux_version":"0.4.0"}
+{"ts":"2026-05-14","level":"info","category":"review","tier":"frontier","stage":"scope","action":"sprint 5 scope","handle":"agent/66-5-sse-stream","source":"orchestrator"}
+{"ts":"2026-05-14","level":"info","category":"machinery","tier":"local","stage":"estimate","action":"ran estimate","handle":"stay-on-deep / high confidence / 77% util","source":"sprint_estimate"}
+{"ts":"2026-05-14","level":"info","category":"machinery","tier":"local","stage":"dispatch","action":"dispatch coder","handle":"sprint-66-5-1778649123","source":"sprint_review","sprint_id":"66-5","session_id":"sprint-review-1778649123"}
+{"ts":"2026-05-14","level":"warn","category":"audit","tier":"operator","stage":"review","action":"catch","handle":"println regression in eprintln fix — D reverted prior sprint's change","source":"orchestrator"}
+{"ts":"2026-05-14","level":"info","category":"review","tier":"frontier","stage":"review","action":"sprint review begin","handle":"agent/66-5-sse-stream","source":"sprint_review","sprint_id":"66-5"}
+{"ts":"2026-05-14","level":"info","category":"machinery","tier":"local","stage":"review","action":"dispatch code-reviewer","handle":"sprint-review-1778650566","source":"sprint_review","sprint_id":"66-5"}
+{"ts":"2026-05-14","level":"info","category":"review","tier":"frontier","stage":"review","action":"verdict: flags-only","handle":"0B / 1F / 4N","source":"sprint_review","sprint_id":"66-5"}
+{"ts":"2026-05-14","level":"info","category":"work","tier":"frontier","stage":"ship","action":"PR merged","handle":"#78 phase B (#66) Sprint 5: SSE endpoint","source":"orchestrator","sprint_id":"66-5"}
+{"ts":"2026-05-14","level":"info","category":"work","tier":"operator","stage":"retrospect","action":"note","handle":"first abandoned dispatch + hybrid-loop recovery; banked as methodology beat 16","source":"orchestrator","sprint_id":"66-5"}`;
+
+// Initial render shows the empty state.
+render();
+</script>
+</body>
+</html>
