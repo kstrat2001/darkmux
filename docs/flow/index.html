@@ -145,6 +145,14 @@
   .filter-group label:hover { color: var(--accent); }
   .filter-group input[type="checkbox"] { cursor: pointer; }
 
+  /* ─── right pane: stepper above, list below (issue #85) ────────── */
+  .right-pane {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    min-width: 0;
+  }
+
   /* ─── stepper view ──────────────────────────────────────────────── */
   .stepper {
     padding: 24px;
@@ -152,6 +160,8 @@
     display: flex;
     flex-direction: column;
     gap: 16px;
+    flex: 0 0 auto;
+    max-height: 55vh;
   }
   .stepper-controls {
     display: flex;
@@ -236,6 +246,74 @@
   .empty p { margin: 4px 0; font-size: 13px; }
   .banner.warn { border-color: var(--warn); color: var(--warn); border-style: solid; }
   .banner.warn strong { color: var(--text); }
+
+  /* ─── list view (bird's-eye pane below the stepper card, #85) ───── */
+  .list {
+    flex: 1;
+    overflow-y: auto;
+    border-top: 1px solid var(--border);
+    background: var(--bg);
+    min-height: 0;
+  }
+  .list-row {
+    display: grid;
+    grid-template-columns: 38px 14px 56px 92px 124px 1fr auto;
+    gap: 10px;
+    align-items: center;
+    padding: 5px 24px;
+    font-size: 12px;
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    cursor: pointer;
+    border-left: 3px solid transparent;
+    border-bottom: 1px solid var(--bg-elev);
+    color: var(--text);
+    line-height: 1.4;
+  }
+  .list-row:hover { background: var(--bg-elev); }
+  .list-row.active {
+    background: rgba(109, 241, 255, 0.06);
+    border-left-color: var(--accent);
+  }
+  .list-row .seq { color: var(--dim); text-align: right; }
+  .list-row .tier-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--dim);
+    justify-self: center;
+  }
+  .list-row .tier-dot.operator { background: var(--tier-operator); }
+  .list-row .tier-dot.frontier { background: var(--tier-frontier); }
+  .list-row .tier-dot.local    { background: var(--tier-local); }
+  .list-row .lvl {
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-size: 10px;
+    color: var(--lvl-info);
+  }
+  .list-row .lvl.error { color: var(--lvl-error); }
+  .list-row .lvl.warn  { color: var(--lvl-warn); }
+  .list-row .lvl.info  { color: var(--lvl-info); }
+  .list-row .lvl.debug { color: var(--lvl-debug); }
+  .list-row .lvl.trace { color: var(--lvl-trace); }
+  .list-row .stage  { color: var(--muted); }
+  .list-row .action { color: var(--text); }
+  .list-row .handle-preview {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+  }
+  .list-row .src {
+    color: var(--dim);
+    text-align: right;
+    white-space: nowrap;
+    font-size: 11px;
+    max-width: 200px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
 
   /* ─── footer ────────────────────────────────────────────────────── */
   footer {
@@ -367,13 +445,16 @@
       </div>
     </aside>
 
-    <section class="stepper" id="stepper">
-      <div class="empty" id="empty">
-        <h2>No records loaded</h2>
-        <p>Drop a <code class="mono">.jsonl</code> file, fetch from a local <code class="mono">darkmux serve</code> daemon, or load the sample.</p>
-        <p style="margin-top:18px;color:var(--dim);"><kbd>←</kbd> <kbd>→</kbd> step · <kbd>Home</kbd> first · <kbd>End</kbd> last</p>
-      </div>
-    </section>
+    <div class="right-pane">
+      <section class="stepper" id="stepper">
+        <div class="empty" id="empty">
+          <h2>No records loaded</h2>
+          <p>Drop a <code class="mono">.jsonl</code> file, fetch from a local <code class="mono">darkmux serve</code> daemon, or load the sample.</p>
+          <p style="margin-top:18px;color:var(--dim);"><kbd>←</kbd> <kbd>→</kbd> step · <kbd>Home</kbd> first · <kbd>End</kbd> last</p>
+        </div>
+      </section>
+      <section class="list" id="list" aria-label="record list"></section>
+    </div>
   </main>
 
   <div id="schema-modal" class="modal-backdrop">
@@ -419,9 +500,15 @@ const state = {
 // independently when switching sources.
 let eventSource = null;
 let scrollLock = true; // live-follow by default when SSE is active
+// Distinguishes "user scrolled the list" from "we scrolled the list
+// programmatically" (e.g., to follow tail or to bring the active row into
+// view). The scroll handler consumes this flag on its next event so the
+// scrollLock auto-toggle only reacts to the operator's intent.
+let _listScrollProgrammatic = false;
 
 // ─── DOM refs ──────────────────────────────────────────────────────────
 const stepperEl = document.getElementById('stepper');
+const listEl   = document.getElementById('list');
 const emptyEl   = document.getElementById('empty');
 const connEl    = document.getElementById('conn-status');
 const dateInput = document.getElementById('date-input');
@@ -583,6 +670,7 @@ function render() {
     stepperEl.innerHTML = '';
     emptyEl.style.display = 'block';
     stepperEl.appendChild(emptyEl);
+    renderList(); // hides the list pane when there's nothing to show
     return;
   }
   emptyEl.style.display = 'none';
@@ -594,6 +682,7 @@ function render() {
         <p>Loosen a filter on the left, or clear the search box.</p>
       </div>
     `;
+    renderList();
     return;
   }
 
@@ -619,6 +708,13 @@ function render() {
   `;
 
   stepperEl.innerHTML = controls + renderRecord(r) + controls;
+
+  // Keep the bird's-eye pane (#85) synced with the stepper. renderList honors
+  // the scrollLock state — bottom-snap when locked, scroll preserved when
+  // the operator is reading historical context. The follow-up scrollIntoView
+  // is a no-op when the active row is already visible.
+  renderList();
+  scrollListActiveIntoView();
 }
 
 // Single delegated click handler on the stepper container — survives the
@@ -645,6 +741,99 @@ function wireStepperControls() {
   });
 }
 wireStepperControls();
+
+// ─── list view (issue #85) ─────────────────────────────────────────────
+// Bird's-eye pane below the stepper card. Same `state.filtered` array, same
+// `state.index` selection — single source of truth, two presentations.
+const LIST_HANDLE_PREVIEW_CHARS = 90;
+const LIST_AT_BOTTOM_THRESHOLD_PX = 30;
+
+function listRowHtml(r, idx, active) {
+  const tier = r.tier || '';
+  const tierClass = ['operator', 'frontier', 'local'].includes(tier) ? tier : '';
+  const level = r.level || '';
+  const handle = r.handle || '';
+  const preview = handle.length > LIST_HANDLE_PREVIEW_CHARS
+    ? handle.slice(0, LIST_HANDLE_PREVIEW_CHARS - 1) + '…'
+    : handle;
+  return `<div class="list-row${active ? ' active' : ''}" data-idx="${idx}">
+    <span class="seq">${idx + 1}</span>
+    <span class="tier-dot ${tierClass}" title="${escapeHtml(tier)}"></span>
+    <span class="lvl ${level}">${escapeHtml(level)}</span>
+    <span class="stage">${escapeHtml(r.stage || '')}</span>
+    <span class="action">${escapeHtml(r.action || '')}</span>
+    <span class="handle-preview" title="${escapeHtml(handle)}">${escapeHtml(preview)}</span>
+    <span class="src" title="${escapeHtml(r.source || '')}">${escapeHtml(r.source || '')}</span>
+  </div>`;
+}
+
+function isListAtBottom() {
+  return listEl.scrollHeight - listEl.scrollTop - listEl.clientHeight < LIST_AT_BOTTOM_THRESHOLD_PX;
+}
+
+function scrollListToBottom() {
+  _listScrollProgrammatic = true;
+  listEl.scrollTop = listEl.scrollHeight;
+}
+
+function scrollListActiveIntoView() {
+  const row = listEl.querySelector('.list-row.active');
+  if (!row) return;
+  // `nearest` so we only scroll when the active row is actually off-screen.
+  // Preserves the operator's scroll position when they're scrubbing within
+  // the visible window.
+  _listScrollProgrammatic = true;
+  row.scrollIntoView({ block: 'nearest' });
+}
+
+function renderList() {
+  if (state.filtered.length === 0) {
+    listEl.innerHTML = '';
+    listEl.style.display = 'none';
+    return;
+  }
+  listEl.style.display = '';
+  const prevScroll = listEl.scrollTop;
+  const rows = state.filtered.map((r, i) => listRowHtml(r, i, i === state.index)).join('');
+  listEl.innerHTML = rows;
+  if (scrollLock) {
+    scrollListToBottom();
+  } else {
+    // innerHTML rewrite drops scroll position — restore it so the operator's
+    // mid-list reading isn't disrupted by an unrelated state change.
+    listEl.scrollTop = prevScroll;
+  }
+}
+
+function wireListInteractions() {
+  // Click a row → stepper jumps to that record. Delegated so SSE-appended
+  // rows are clickable too without re-attaching handlers.
+  listEl.addEventListener('click', (e) => {
+    const row = e.target.closest('.list-row');
+    if (!row) return;
+    const idx = parseInt(row.dataset.idx, 10);
+    if (Number.isNaN(idx) || idx === state.index) return;
+    state.index = idx;
+    render();
+  });
+  // Auto-toggle scrollLock based on whether the operator is at the bottom of
+  // the list. `tmux` / `less +F` / Slack-channel-follow convention: scrolling
+  // up disables tail-follow; scrolling back to bottom re-enables it.
+  // Programmatic scrolls (renderList, scrollIntoView) carry a flag so they
+  // don't count as operator intent.
+  listEl.addEventListener('scroll', () => {
+    if (_listScrollProgrammatic) {
+      _listScrollProgrammatic = false;
+      return;
+    }
+    const atBottom = isListAtBottom();
+    if (atBottom !== scrollLock) {
+      scrollLock = atBottom;
+      updateScrollLockUi();
+    }
+  });
+}
+wireListInteractions();
 
 // ─── sources ───────────────────────────────────────────────────────────
 document.getElementById('load-file-btn').onclick = () => document.getElementById('file-input').click();
