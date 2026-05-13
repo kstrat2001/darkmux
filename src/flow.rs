@@ -14,7 +14,7 @@ use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.1.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.2.0";
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -69,6 +69,16 @@ pub struct FlowRecord {
     pub session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// LMStudio model id that handled this work, when known. Set on
+    /// dispatch records (`tier=local, stage=dispatch`) so the viewer
+    /// can render which model ran the work without cross-referencing
+    /// the model-status pill's timestamp. Resolved from openclaw config
+    /// at dispatch entry: `agents.list[<agent-id>].model` ?? `agents.
+    /// defaults.model.primary`. None for non-dispatch records (lifecycle
+    /// transitions, sprint review verdicts) and for dispatches where
+    /// the openclaw config can't be resolved. Schema 1.2 addition (#106).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// Resolve the flows directory from env override (`DARKMUX_FLOWS_DIR`) or
@@ -240,6 +250,7 @@ mod tests {
             sprint_id: None,
             session_id: None,
             source: None,
+            model: None,
         };
 
         record_at(&record, &path).unwrap();
@@ -272,6 +283,7 @@ mod tests {
             sprint_id: None,
             session_id: None,
             source: None,
+            model: None,
         };
 
         record_at(&r("first"), &path).unwrap();
@@ -312,6 +324,7 @@ mod tests {
             sprint_id: Some("sp-100".to_string()),
             session_id: Some("sess-abc".to_string()),
             source: Some("estimator".to_string()),
+            model: None,
         };
 
         record_at(&record, &path).unwrap();
@@ -369,6 +382,7 @@ mod tests {
                 sprint_id: None,
                 session_id: None,
                 source: Some("reviewer".to_string()),
+                model: None,
             },
             &tmp.path().join("custom.jsonl"),
         )
@@ -405,6 +419,7 @@ mod tests {
             sprint_id: None,
             session_id: None,
             source: None,
+            model: None,
         };
 
         record_at(&record, &path).unwrap();
@@ -449,6 +464,7 @@ mod tests {
             sprint_id: None,
             session_id: None,
             source: None,
+            model: None,
         };
 
         // Capture the day-key BEFORE calling record() so a midnight-UTC
@@ -562,12 +578,14 @@ mod tests {
     }
 
     #[test]
-    fn flow_schema_version_is_1_1_0() {
+    fn flow_schema_version_is_1_2_0() {
         // Pin the schema version so an accidental rename can't ship silently;
         // any bump beyond this should be a deliberate code change paired with
         // an update to this assertion (and corresponding viewer EXPECTED_*
-        // bump if the change is breaking).
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.1.0");
+        // bump if the change is breaking). 1.2.0 added the optional `model`
+        // field to FlowRecord (#106 — Sprint 4 of #104), minor since older
+        // viewers can safely ignore the absent/extra field.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.2.0");
     }
 
     #[test]
@@ -587,6 +605,7 @@ mod tests {
                 sprint_id: None,
                 session_id: None,
                 source: None,
+                model: None,
             },
             &path,
         )

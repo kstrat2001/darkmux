@@ -82,6 +82,7 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             sprint_id,
             session_id,
             source,
+            model: None,
         },
         FlowCmd::Catch { text, sprint_id, session_id, source } => FlowRecord {
             ts,
@@ -94,6 +95,7 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             sprint_id,
             session_id,
             source,
+            model: None,
         },
         FlowCmd::Record { level, category, tier, stage, action, handle, sprint_id, session_id, source } => FlowRecord {
             ts,
@@ -106,6 +108,7 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             sprint_id,
             session_id,
             source,
+            model: None,
         },
     }
 }

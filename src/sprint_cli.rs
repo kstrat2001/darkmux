@@ -62,6 +62,11 @@ pub(crate) fn build_review_record(
         sprint_id: sprint_id.map(String::from),
         source: Some("sprint_review".to_string()),
         session_id: Some(session_id.to_string()),
+        // Sprint review records describe the review verb's lifecycle —
+        // they don't represent a single model's work. The inner crew
+        // dispatch (`code-reviewer`) emits its own dispatch records via
+        // crew::dispatch::build_dispatch_record with model stamped.
+        model: None,
     }
 }
 
