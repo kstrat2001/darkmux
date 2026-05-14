@@ -2,7 +2,7 @@
 
 **[darkmux.com](https://darkmux.com) · Build a diverse local-AI team that complements frontier models — not competes with them.**
 
-Task-class-aware multiplexer for local LLM configurations. Pick the right loaded model + context length + compaction profile for each task — automatically. Designed for agentic local-AI workflows on LMStudio (and Ollama / llama.cpp via the same OpenAI-compatible surface).
+**AI-first local-AI orchestrator** — uses local-AI internally to manage your local-AI workflows. Task-class-aware profile multiplexing, admin-agent dispatch verbs, and a mission/sprint lifecycle, on top of LMStudio (and Ollama / llama.cpp via the same OpenAI-compatible surface). Developed on Apple Silicon.
 
 > **Heads up — read before running.**
 > darkmux orchestrates AI tools that execute on your machine. It modifies your local config files (`~/.openclaw/openclaw.json`), sends commands to your local LMStudio server, and — in lab mode — runs AI-generated code in a working directory that is **not a security sandbox**. AI agents can behave unexpectedly. Use it on a machine where that is acceptable. Performance numbers in this README and in the accompanying articles are measured on the author's hardware (M5 Max, 128 GB) and will differ on yours. See [DISCLAIMER.md](./DISCLAIMER.md) for details. MIT licensed, no warranty, use at your own risk.
@@ -103,7 +103,9 @@ The `--force` flag tells cargo to replace the existing binary even when the sour
 
 ## Why this exists
 
-Local-AI users hit a real workload-tax problem when they go agentic. A single static configuration can't be optimal across:
+**AI-first because today you'd be crazy not to.** Pre-AI, integrating a new source or structuring an unstructured intent meant writing a bespoke parser; tools for local-AI orchestration meant operators hand-authoring JSON for missions, sprints, and profiles. With AI in the loop — specifically a small, fast, dependable *admin agent* loaded locally — that authoring tax mostly evaporates. darkmux dispatches admin agents internally for compaction, sprint estimation, and (per [#113](https://github.com/kstrat2001/darkmux/issues/113)) mission proposal, so the operator gets structured output from vague intent without leaving the local tier. The frontier orchestrator stays on strategy; the admin agent absorbs the routine.
+
+The other half of the answer is the original one: local-AI users hit a real workload-tax problem when they go agentic. A single static configuration can't be optimal across:
 
 - **Bounded tasks** (TODO fills, single-turn reviews) — want a slim primary, no compaction overhead, fast decode
 - **Long agentic tasks** (multi-file refactors, exploratory test authoring) — want big context to avoid compaction cliffs, even at the cost of bigger KV pre-allocation
@@ -155,9 +157,9 @@ Layers 1 and 2 ship from day one. Layer 3 is the live-observability surface, opt
 - **dark** — Darkly Energized lineage (the experimental work that motivated it)
 - **mux** — multiplexer (well-known engineering jargon for routing N → 1 or 1 → N)
 
-OSS-published under personal GitHub: `github.com/kstrat2001/darkmux`. Darkly Energized is the brand context but darkmux is intentionally infrastructure (no commercial coupling).
+OSS-published under personal GitHub: `github.com/kstrat2001/darkmux`. Darkly Energized is the brand context but darkmux is intentionally independent (no commercial coupling).
 
-The project is brand-aligned but doesn't claim "agents" — positioning matters because the agent-X namespace is saturated and confused. darkmux is infrastructure, not an agent.
+The name comes from the multiplexer core — task-class-aware routing of LMStudio loadouts. The project has since grown into an AI-first local-AI orchestrator: small CLI primitives for the routing, plus AI-built-in verbs (`mission propose`, `sprint estimate`, `notebook draft`) that compose those primitives with admin-agent dispatch so the operator gets structured output without writing JSON by hand. Earlier framings of darkmux as *"infrastructure, not an agent framework"* were honest at the time, but the binary today embeds AI dispatch logic internally — calling it AI-first out loud is the honest move.
 
 ## Design principles
 
