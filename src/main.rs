@@ -426,6 +426,12 @@ enum MissionCmd {
         /// pipelines and tests.
         #[arg(long)]
         yes: bool,
+        /// After approval, immediately invoke `darkmux mission start <id>`
+        /// on the newly-persisted mission. Skips the manual two-step.
+        /// Defaults to false — operators who want to inspect the persisted
+        /// files before starting can omit this flag.
+        #[arg(long)]
+        start: bool,
     },
     /// Add a new Sprint to an existing Mission mid-flight (#107).
     /// Operator-sovereign scope growth — alternative to either hand-
@@ -1008,8 +1014,8 @@ fn cmd_mission(sub: MissionCmd) -> Result<i32> {
             println!("mission `{}` → Active  (paused_ts preserved: {})", m.id, m.paused_ts.unwrap_or(0));
             Ok(0)
         }
-        MissionCmd::Propose { from_stdin, from_file, yes } => {
-            mission_propose::propose(from_stdin, from_file.as_deref(), yes)
+        MissionCmd::Propose { from_stdin, from_file, yes, start } => {
+            mission_propose::propose(from_stdin, from_file.as_deref(), yes, start)
         }
         MissionCmd::AddSprint { mission_id, sprint_id, description, depends_on, after } => {
             let s = crew::lifecycle::add_sprint_to_mission(
