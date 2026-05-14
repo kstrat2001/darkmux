@@ -236,7 +236,19 @@ Three reasons the rule is load-bearing:
 
 For new CLI verbs that would benefit from "context-aware" output: the operator carries that context into the verb's primary input. No separate `--engagement`, no `--context`, no `--vibe`. If the operator has no frontier orchestrator and wants context-shaping, they write the context into the input prose where the admin agent reads it as part of its bounded structuring job.
 
-Surfaced 2026-05-14: Sprint 3 of #113 originally added `--engagement` to `darkmux mission propose`; operator caught it pre-merge as a doctrine violation against #49. Removed in the same PR, and the rule made explicit here so future verbs don't re-introduce it.
+### Why the line matters at scale — the lost-in-translation problem
+
+The mechanical reasons above (quantization, capability mismatch, etc.) are downstream of a deeper principle. **The pattern is older than AI:** in any organization, when admins translate vision → tasks, the vision quietly dies in the translation. The admin's role IS narrower — that's why an admin layer can absorb volume — but applying that layer to vision-bearing work is the antipattern. Same dynamic, same failure mode in the AI stack.
+
+What makes the line load-bearing:
+
+- **Engagement is where the *why* lives.** The frontier orchestrator can hold engagements because it can sit in operator context, hold contradictions, and carry nuance across turns. A 4B admin agent can't hold contradictions — it'll resolve them. That resolution is where vision gets lost. A `--engagement "wife time"` flag forces the admin to do that resolution before it has the context to do it well.
+- **The admin AI is the basic planning layer, not the strategic layer.** Capacity-matched to its actual job (bounded inputs, structured outputs, throughput). Asking it to ALSO carry *"what does this mean for the operator's broader life / org / book / engagement"* loads it past its capacity. Even when it produces something, that something is the small-picture compression of the big picture.
+- **The cost scales with org size.** A solo operator can correct admin output in the next turn — the loop is tight enough that drift gets caught. An organization where the admin layer is making decisions BEFORE the operator/frontier sees them is the scenario where *big dreams get eaten alive by small bugs written by admins who don't have capacity yet to hold the big picture vision.* darkmux's admin layer can have exactly that pathology if its scope leaks into engagement territory; the line drawn here is what prevents it.
+
+The frontier orchestrator's role in this layering is named below as **vision guard** — the layer that protects the operator's engagement-level intent from being compressed before it has been translated into structure the admin can handle. The cultivation discipline (how operators *shape* their frontier to actually hold their vision — CLAUDE.md files, skills, memory, conversation history) is the next-order concern; tracked separately (see related issue, filed alongside this doctrine).
+
+Surfaced 2026-05-14: Sprint 3 of #113 originally added `--engagement` to `darkmux mission propose`; operator caught it pre-merge as a doctrine violation against #49. Removed in the same PR, and the rule made explicit here so future verbs don't re-introduce it. The lost-in-translation framing came from the same exchange — codified here because the *why* is harder to reconstruct from the rule alone, and future verbs that look context-shaped will tempt the same drift.
 
 ## Project posture
 
