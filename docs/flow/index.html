@@ -502,9 +502,28 @@
     background: var(--dim);
   }
   .model-pill.idle      .pill-dot { background: var(--good); }
-  .model-pill.busy      .pill-dot { background: var(--warn); }
+  .model-pill.busy      .pill-dot {
+    background: var(--warn);
+    /* Slow pulse on busy — motion is a self-documenting affordance for
+     * "activity happening right now," independent of color (#127/#128
+     * follow-up). Color alone can be misread (colorblind, ambient
+     * lighting); the pulse makes the dot's meaning legible at a glance.
+     */
+    animation: pill-dot-pulse 1.6s ease-in-out infinite;
+  }
   .model-pill.empty     .pill-dot { background: var(--dim); }
   .model-pill.offline   .pill-dot { background: var(--bad); }
+  @keyframes pill-dot-pulse {
+    0%, 100% { opacity: 1;   transform: scale(1); }
+    50%      { opacity: 0.4; transform: scale(0.8); }
+  }
+  /* Respect operator system preference — users who set
+   * `prefers-reduced-motion: reduce` get a static dot. The color still
+   * carries the busy/idle signal.
+   */
+  @media (prefers-reduced-motion: reduce) {
+    .model-pill.busy .pill-dot { animation: none; }
+  }
   .model-pill .pill-label {
     overflow: hidden;
     text-overflow: ellipsis;
@@ -1253,18 +1272,16 @@ function renderModelPill(payload) {
     modelPillLabel.textContent = 'no models loaded';
     return;
   }
-  // Any busy → pill is busy; else idle.
+  // Any busy → pill is busy; else idle. The dot reflects aggregate
+  // activity ("is anything running?"); the modal carries the per-model
+  // truth on click. The pill used to render the first N model names in
+  // the toolbar, but that didn't scale past ~2-3 models and lied about
+  // per-model state given the coarse `lms ps` source (#127). Now it's
+  // honest: count in the pill, detail in the modal.
   const anyBusy = models.some(m => (m.status || '').toLowerCase() === 'busy');
   modelPillEl.classList.add(anyBusy ? 'busy' : 'idle');
-  const shown = models.slice(0, MODEL_PILL_MAX_NAMES).map(m => {
-    const ctxK = m.context ? Math.round(m.context / 1000) + 'k' : '?';
-    return `${truncIdentifier(m.identifier)}·${ctxK}`;
-  });
-  let label = shown.join(' + ');
-  if (models.length > MODEL_PILL_MAX_NAMES) {
-    label += ` +${models.length - MODEL_PILL_MAX_NAMES} more`;
-  }
-  modelPillLabel.textContent = label;
+  const noun = models.length === 1 ? 'model' : 'models';
+  modelPillLabel.textContent = `${models.length} ${noun} loaded`;
 }
 
 function renderModelModal(payload) {
