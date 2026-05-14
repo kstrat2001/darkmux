@@ -2,7 +2,7 @@
 
 **[darkmux.com](https://darkmux.com) · Build a diverse local-AI team that complements frontier models — not competes with them.**
 
-**AI-first local-AI orchestrator** — uses local-AI internally to manage your local-AI workflows. Task-class-aware profile multiplexing, admin-agent dispatch verbs, and a mission/sprint lifecycle, on top of LMStudio (and Ollama / llama.cpp via the same OpenAI-compatible surface). Developed on Apple Silicon.
+**AI-first local-AI orchestrator** — uses local-AI internally to manage your local-AI workflows. Task-class-aware profile multiplexing, admin-agent dispatch verbs (like `mission propose`), and a mission/sprint lifecycle, on top of LMStudio (and Ollama / llama.cpp via the same OpenAI-compatible surface). Developed on Apple Silicon.
 
 > **Heads up — read before running.**
 > darkmux orchestrates AI tools that execute on your machine. It modifies your local config files (`~/.openclaw/openclaw.json`), sends commands to your local LMStudio server, and — in lab mode — runs AI-generated code in a working directory that is **not a security sandbox**. AI agents can behave unexpectedly. Use it on a machine where that is acceptable. Performance numbers in this README and in the accompanying articles are measured on the author's hardware (M5 Max, 128 GB) and will differ on yours. See [DISCLAIMER.md](./DISCLAIMER.md) for details. MIT licensed, no warranty, use at your own risk.
@@ -86,6 +86,7 @@ darkmux lab runs --limit 5        # see your recent runs
 darkmux optimize                 # guided "optimize for my workload" wizard (Phase 1 scaffold)
 darkmux lab inspect <run-id>      # full per-run breakdown
 darkmux notebook draft <run-id>   # ask the agent to author an EE-lab-style notebook entry
+darkmux mission propose --from-stdin   # AI-built-in: vague intent → structured Mission + Sprint JSONs
 ```
 
 Using Claude Code? Run `darkmux init --with-claude-md ~/.claude/CLAUDE.md` to install the skills *and* teach Claude Code about darkmux at session start.

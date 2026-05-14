@@ -68,6 +68,7 @@ pub fn propose(
     from_stdin: bool,
     from_file: Option<&std::path::Path>,
     yes: bool,
+    start: bool,
 ) -> Result<i32> {
     // 1. Read input
     let input = read_input(from_stdin, from_file)?;
@@ -97,10 +98,10 @@ pub fn propose(
         // 5. Operator decision
         if yes {
             eprintln!("mission propose: --yes flag set, applying without prompt");
-            return persist(&proposal);
+            return persist_and_maybe_start(&proposal, start);
         }
         match prompt_decision()? {
-            Decision::Approve => return persist(&proposal),
+            Decision::Approve => return persist_and_maybe_start(&proposal, start),
             Decision::Reject  => {
                 eprintln!("mission propose: rejected. No files written.");
                 return Ok(1);
@@ -312,7 +313,21 @@ fn persist(p: &Proposal) -> Result<i32> {
     }
 
     eprintln!("mission propose: persisted {} mission + {} sprints", 1, p.sprints.len());
-    eprintln!("next: `darkmux mission start {}` to begin, or `--start` flag (#113 Sprint 4)", p.mission.id);
+    Ok(0)
+}
+
+/// Helper that persists a proposal and optionally starts the mission.
+fn persist_and_maybe_start(p: &Proposal, start: bool) -> Result<i32> {
+    let exit = persist(p)?;
+    if exit != 0 { return Ok(exit); }
+    if start {
+        eprintln!("mission propose: --start flag set, transitioning mission to Running …");
+        let m = crate::crew::lifecycle::mission_start(&p.mission.id)
+            .context("mission_start failed after successful persist")?;
+        println!("mission `{}` → Active  started_ts={}", m.id, m.started_ts.unwrap_or(0));
+    } else {
+        eprintln!("next: `darkmux mission start {}` to begin (or pass `--start` next time)", p.mission.id);
+    }
     Ok(0)
 }
 
@@ -394,5 +409,49 @@ some epilogue"#;
             !lower.contains("engagement context:"),
             "engagement must not be a labeled field in the compiler message"
         );
+    }
+
+    #[test]
+    fn persist_fails_on_existing_mission() {
+        // Regression test: verify that persist returns an error when the
+        // mission file already exists. This ensures persist_and_maybe_start
+        // won't call mission_start on a duplicate proposal.
+        use std::fs;
+
+        let crew_root = crate::crew::loader::crew_root();
+        let missions_dir = crew_root.join("missions");
+
+        // Create the mission file manually
+        let test_mission_id = "test-existing-mission";
+        fs::create_dir_all(&missions_dir).ok();
+        let mission_path = missions_dir.join(format!("{}.json", test_mission_id));
+        let existing_content = r#"{
+  "id": "test-existing-mission",
+  "description": "existing mission",
+  "status": "active",
+  "sprint_ids": [],
+  "created_ts": 0
+}
+"#;
+        fs::write(&mission_path, existing_content).expect("writing test mission");
+
+        // Create a proposal with the same id
+        let proposal = Proposal {
+            mission: ProposedMission {
+                id: test_mission_id.to_string(),
+                description: "new proposal".to_string(),
+                status: "active".to_string(),
+                sprint_ids: vec![],
+                created_ts: 0,
+            },
+            sprints: vec![],
+        };
+
+        // Assert that persist fails
+        let err = persist(&proposal).expect_err("persist should fail for existing mission");
+        assert!(err.to_string().contains("already exists"));
+
+        // Cleanup: remove the test file we created
+        fs::remove_file(&mission_path).ok();
     }
 }

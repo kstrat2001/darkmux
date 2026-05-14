@@ -81,12 +81,39 @@ darkmux crew sync --dry-run      <span class="comment"># preview without writing
   <div class="wrap">
     <h2>Missions + sprints</h2>
     <p>A <strong>mission</strong> is a named objective — a JSON file under <code>~/.darkmux/crew/missions/&lt;id&gt;.json</code> with a description, a list of <code>sprint_ids</code>, and a status (active/closed/paused). A <strong>sprint</strong> is a time-boxed work unit inside a mission — its own JSON file under <code>~/.darkmux/crew/sprints/&lt;id&gt;.json</code> with status (planned/running/complete/abandoned), depends_on, and timestamps.</p>
-    <p>These are <strong>operator-edited JSON files</strong>. Today darkmux doesn't have a creation verb — you write the file directly, then use the CLI to transition status. That's deliberate (operator owns the plan; the system manages the state).</p>
 
-    <div class="callout">
-      <strong>Coming soon: <a href="https://github.com/kstrat2001/darkmux/issues/113">darkmux mission propose</a></strong>
-      <p style="margin: 6px 0 0;">A CLI verb that takes unstructured input (pasted text, a Jira ticket via <code>acli</code>, a GitHub issue via <code>gh</code>, a URL via <code>agent-browser</code>) and dispatches a local admin-agent to <em>propose</em> the mission + sprint structure. Operator approves/edits before files land. Until that lands, the hand-authored path below is how you do it.</p>
-    </div>
+    <h3>Authoring a mission (recommended)</h3>
+    <p>The preferred path: use <code>darkmux mission propose</code>, which takes unstructured input (pasted text, a Jira ticket via <code>acli</code>, a GitHub issue via <code>gh</code>) and dispatches the mission-compiler admin agent to emit a structured proposal you approve before any file lands.</p>
+
+    <h4>Worked example: proposing a mission from stdin</h4>
+    <pre><code><span class="comment"># Pipe operator intent into the compiler</span>
+pbpaste | darkmux mission propose --from-stdin
+<span class="comment"># or use a file:  darkmux mission propose --from-file intent.txt</span></code></pre>
+
+    <p>The compiler returns a proposal summary:</p>
+    <pre><code>┌─ Proposal ──────────────────────────────
+  Mission: draft-blog-post
+  Description:
+    Draft a blog post on local-AI bounded-task patterns.
+
+  Sprints (2):
+    1. draft-blog-post-s1-outline (depends_on: —)
+       Write a one-page outline: thesis, three supporting sections.
+    2. draft-blog-post-s2-draft (depends_on: draft-blog-post-s1-outline)
+       Flesh out the outline into a full first draft.
+└─────────────────────────────────────────
+
+Approve [y] · Edit/regenerate with hint [e] · Reject [n]: y
+mission propose: persisted 1 mission + 2 sprints
+next: <code>darkmux mission start draft-blog-post</code> to begin (or pass <code>--start</code> next time)</code></pre>
+
+    <p>The proposal is persisted to disk as JSON files under <code>~/.darkmux/crew/missions/</code> and <code>~/.darkmux/crew/sprints/</code>. Pass <code>--start</code> to transition immediately:</p>
+    <pre><code>darkmux mission propose --from-stdin --start
+<span class="comment"># ... proposal approved, files written, mission → Active</span></code></pre>
+
+    <h3>Authoring by hand (low-level alternative)</h3>
+    <p>If you prefer to skip the propose step or are building automation, you can write the JSON files directly. This is the escape hatch — recommended for operators who want full control or are scripting workflows.</p>
+    <p>These are <strong>operator-edited JSON files</strong>. darkmux doesn't require a creation verb; you write the file directly, then use the CLI to transition status.</p>
 
     <h3>When to use missions vs. not</h3>
     <p>Mission/sprint is overhead. It pays back only when you'd benefit from <em>durable state</em> for the work. Three patterns to pick from:</p>
