@@ -15,7 +15,7 @@ The CLI is the *engine*; the empirical findings in the article series at <https:
 
 The user-facing **"What darkmux is for"** section in `README.md` is the canonical version of the project's north-star. Below is how the same five claims translate into operational doctrine for an AI agent (Claude Code, OpenClaw, Cursor, etc.) working on darkmux or driving it on behalf of an operator.
 
-1. **Optimization, not replacement.** When the operator asks you to pick a model from `lms ls` or propose a profile, prefer *complement* over *duplicate*. A team where every model is a 35B reasoner is not a team — it's a stack of identical instruments. Read the existing profile registry first; propose additions that fill gaps (compactor, embeddings, specialized small model) rather than swapping like for like.
+1. **Optimization, not replacement.** When the operator asks you to pick a model from `lms ls` or propose a profile, prefer *complement* over *duplicate*. A team where every model is a 35B reasoner is not a team — it's a stack of identical instruments. The same logic applies *within* each role family (see **Project posture → Role families** below): a profile with three different 35B specialists and no 4B admin agent is missing its compactor, scribe, and estimator; conversely, a profile of nothing but admin agents has no specialist to do the actual judgment-dependent work. Read the existing profile registry first; propose additions that fill gaps in the right family (admin: compactor / scribe / estimator / mission-compiler; specialist: coder / reviewer / analyst) rather than swapping like for like.
 
 2. **Harness, then model.** When the operator reports slow or wrong outputs, **check the harness before the model**. Compaction config, context-window mismatches, loaded-state drift, profile-vs-loaded model — all of these have produced 5×+ wall-clock regressions in Article 2's measurements. Default action: run `darkmux doctor`, read the eureka findings, surface those *before* suggesting the operator change models.
 
@@ -226,9 +226,18 @@ Tracked as #49.
 
 ## Project posture
 
-The **CLI binary** is infrastructure — not an inference engine, not an agent framework, not a cloud-provider router. The README is intentionally honest about what the binary does NOT do. Match that posture in any code, CLI copy, or `--help` text you write — don't oversell what `darkmux` (the executable) does.
+**darkmux is an AI-first local-AI orchestrator.** It uses local-AI internally to manage your local-AI workflows. The CLI binary embeds dispatch logic to call into LMStudio-loaded admin agents for structuring, planning, and routine bounded reasoning tasks (compaction, sprint estimation, mission proposal, notebook draft). The frontier-AI orchestrator (your Claude Code, Cursor, or OpenClaw session) remains the strategic reasoner; darkmux operates the local tier as a self-contained capability.
 
-The **agent-facing surface** is where the *guided* part of "guided optimization" lives: this `CLAUDE.md`, the bundled skills under `skills/darkmux-*`, and the doctrine in **darkmux's grand vision** above. An agent working with darkmux doesn't replace the operator; it drives the loop the operator would otherwise drive by hand. Both surfaces are part of the same project — the dual posture is deliberate, not a contradiction.
+The recursive shape is the point: **darkmux uses local-AI to manage your local-AI.** Operators running darkmux are running local-AI dispatches whose orchestration is itself done by local-AI. That's the AI-first move — not "AI bolted on," but AI as the obvious built-in capability of a tool whose reason for existing is local-AI orchestration. Earlier framings of darkmux as *"infrastructure, not an agent framework"* were honest at the time (one-thing-only swap tool, saturated agent-X namespace) but are now aspirational. The current posture matches what the binary does.
+
+### Role families
+
+Two role families compose to make this work, and the distinction matters when picking models or proposing additions to a profile:
+
+- **Admin agents** — small model (4B-class), bounded I/O, high throughput, structured output. Compactor, scribe, task estimator, mission-compiler. Each capability is asymmetric to its compute cost — one small model can fill several admin roles. darkmux dispatches admin agents internally for its own operations; the operator rarely invokes them directly. The category was named in Beat 21 of the lab notebook ("the dependable admin agent") — bounded inputs + structured outputs + low per-call failure cost + throughput matters + bounded reasoning rather than strategy.
+- **Specialist agents** — larger model (35B-class+), judgment-dependent, lower throughput, free-form output. Coder, code-reviewer, analyst. Operator's call: which specialist for which sprint, with what tilt. darkmux makes them addressable via `crew dispatch <role>` but doesn't substitute its judgment for the operator's.
+
+CLI primitives stay small and composable; the AI-built-in verbs (`mission propose`, `sprint estimate`, `notebook draft`) compose those primitives with admin-agent dispatches so the operator gets structured output without authoring JSON by hand. Both surfaces are part of the same project — the dual posture (small primitives + AI-built-in verbs) is deliberate.
 
 The default runtime is OpenClaw (`DARKMUX_RUNTIME_CMD=openclaw`) but the lab harness is runtime-pluggable via env var. Users running Aider, Cline, or anything with a `<cmd> agent --message` interface can point darkmux at it.
 
