@@ -111,20 +111,138 @@ pub fn nudge_if_daemon_unreachable(verb_hint: &str) {
     );
 }
 
-/// Start the HTTP daemon, binding on `bind:port`. Blocks until SIGINT.
+/// Grace period (seconds) between receiving a shutdown signal and
+/// force-exiting the process. SSE streams hold connections open
+/// indefinitely; axum's graceful shutdown would otherwise block forever
+/// waiting for them to drain.
+pub const SHUTDOWN_GRACE_SECS: u64 = 3;
+
+// Compile-time bounds: drift outside this range is the painful state
+// #121 fixed (operator hammering Ctrl-C / killing PID by hand at the
+// long end; killing clean disconnects mid-flight at the short end).
+// Build fails here if a future change pushes the const out of range.
+const _: () = assert!(
+    SHUTDOWN_GRACE_SECS <= 5,
+    "SHUTDOWN_GRACE_SECS too long — operators will fall back to kill <pid>"
+);
+const _: () = assert!(
+    SHUTDOWN_GRACE_SECS >= 1,
+    "SHUTDOWN_GRACE_SECS too short — clean disconnects deserve a beat"
+);
+
+/// Build the lines of the startup banner. Factored out so tests can
+/// assert content without spawning the daemon.
+///
+/// `mission_count` and `sprint_count` are loaded via
+/// `crate::crew::loader::load_missions`/`load_sprints` in production;
+/// tests pass synthetic counts.
+fn build_startup_banner(
+    addr: &std::net::SocketAddr,
+    flows_dir: &std::path::Path,
+    flows_dir_exists: bool,
+    crew_root: &std::path::Path,
+    crew_root_exists: bool,
+    mission_count: usize,
+    sprint_count: usize,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    let version = env!("CARGO_PKG_VERSION");
+    let flow_schema = crate::flow::FLOW_SCHEMA_VERSION;
+
+    lines.push(format!("darkmux serve · v{version}"));
+    lines.push(format!("  bind:           http://{addr}"));
+    lines.push(format!("  flow schema:    {flow_schema}"));
+    lines.push(format!("  flows dir:      {}", flows_dir.display()));
+    lines.push(format!("  missions:       {mission_count} loaded"));
+    lines.push(format!("  sprints:        {sprint_count} loaded"));
+
+    if !flows_dir_exists {
+        lines.push(
+            "  ! flows dir doesn't exist yet — will be created on first record write".to_string(),
+        );
+    }
+    if !crew_root_exists {
+        lines.push(format!(
+            "  ! crew root not found at {} (missions/sprints endpoints will return empty)",
+            crew_root.display()
+        ));
+    }
+
+    lines.push("  ready — Ctrl-C to stop".to_string());
+    lines
+}
+
+/// Start the HTTP daemon, binding on `bind:port`. Blocks until a
+/// shutdown signal (SIGINT or SIGTERM) is received. After the signal,
+/// axum gets `SHUTDOWN_GRACE_SECS` to drain in-flight connections
+/// before the process force-exits — SSE streams to the viewer would
+/// otherwise keep the daemon alive forever.
 pub fn run(port: u16, bind: String, flows_dir: PathBuf) -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
 
     rt.block_on(async move {
-        let app = build_router(flows_dir);
+        let app = build_router(flows_dir.clone());
         let addr: std::net::SocketAddr = format!("{bind}:{port}").parse()?;
-        println!("darkmux serve listening on http://{addr}");
         let listener = tokio::net::TcpListener::bind(addr).await?;
+
+        // Banner: print after bind succeeds so we don't claim "listening"
+        // before we actually are.
+        let flows_dir_exists = flows_dir.exists();
+        let crew_root = crate::crew::loader::crew_root();
+        let crew_root_exists = crew_root.exists();
+        let mission_count = crate::crew::loader::load_missions()
+            .map(|v| v.len())
+            .unwrap_or(0);
+        let sprint_count = crate::crew::loader::load_sprints()
+            .map(|v| v.len())
+            .unwrap_or(0);
+        for line in build_startup_banner(
+            &addr,
+            &flows_dir,
+            flows_dir_exists,
+            &crew_root,
+            crew_root_exists,
+            mission_count,
+            sprint_count,
+        ) {
+            println!("{line}");
+        }
+
+        // Shutdown plumbing: multiplex one signal to two consumers
+        // (axum's graceful shutdown future and the force-exit timer).
+        // `watch::channel` is the right shape — both consumers wait_for
+        // the same latch flip.
+        let (shutdown_tx, mut shutdown_rx_axum) = tokio::sync::watch::channel(false);
+        let mut shutdown_rx_force = shutdown_tx.subscribe();
+
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            let _ = shutdown_tx.send(true);
+        });
+
+        tokio::spawn(async move {
+            let _ = shutdown_rx_force.wait_for(|&v| v).await;
+            eprintln!(
+                "\ndarkmux serve: shutdown signal received, {SHUTDOWN_GRACE_SECS}s grace for in-flight connections"
+            );
+            tokio::time::sleep(Duration::from_secs(SHUTDOWN_GRACE_SECS)).await;
+            eprintln!(
+                "darkmux serve: force exit (open connections — typically SSE streams to the viewer — blocked graceful drain)"
+            );
+            std::process::exit(0);
+        });
+
+        let axum_shutdown = async move {
+            let _ = shutdown_rx_axum.wait_for(|&v| v).await;
+        };
+
         axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal())
+            .with_graceful_shutdown(axum_shutdown)
             .await?;
+
+        println!("darkmux serve: clean shutdown");
         Ok::<_, anyhow::Error>(())
     })
 }
@@ -691,4 +809,75 @@ mod tests {
         assert_eq!(parsed.port(), 8765);
         assert!(parsed.ip().is_loopback());
     }
+
+    fn sample_addr() -> std::net::SocketAddr {
+        "127.0.0.1:8765".parse().expect("addr parses")
+    }
+
+    #[test]
+    fn startup_banner_contains_core_info() {
+        let flows = PathBuf::from("/tmp/darkmux-flows-banner-test");
+        let crew = PathBuf::from("/tmp/darkmux-crew-banner-test");
+        let lines = build_startup_banner(&sample_addr(), &flows, true, &crew, true, 3, 9);
+
+        // Title carries the binary version that operators bump via cargo install.
+        let joined = lines.join("\n");
+        assert!(joined.contains("darkmux serve · v"), "title line present: {joined}");
+        assert!(joined.contains("bind:"), "bind line present");
+        assert!(joined.contains("http://127.0.0.1:8765"), "bind shows the addr");
+        assert!(joined.contains("flow schema:"), "schema line present");
+        assert!(joined.contains(crate::flow::FLOW_SCHEMA_VERSION), "schema version shown");
+        assert!(joined.contains("/tmp/darkmux-flows-banner-test"), "flows dir shown");
+        assert!(joined.contains("missions:       3 loaded"), "mission count rendered");
+        assert!(joined.contains("sprints:        9 loaded"), "sprint count rendered");
+        assert!(joined.contains("ready"), "ready line present");
+        assert!(joined.contains("Ctrl-C"), "Ctrl-C hint present");
+    }
+
+    #[test]
+    fn startup_banner_warns_on_missing_flows_dir() {
+        let flows = PathBuf::from("/tmp/darkmux-banner-missing-flows");
+        let crew = PathBuf::from("/tmp/darkmux-banner-present-crew");
+        let lines = build_startup_banner(&sample_addr(), &flows, false, &crew, true, 0, 0);
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("flows dir doesn't exist yet"),
+            "expected flows-dir warning; got: {joined}"
+        );
+        assert!(
+            !joined.contains("crew root not found"),
+            "should not warn about crew when crew root exists"
+        );
+    }
+
+    #[test]
+    fn startup_banner_warns_on_missing_crew_root() {
+        let flows = PathBuf::from("/tmp/darkmux-banner-present-flows");
+        let crew = PathBuf::from("/tmp/darkmux-banner-missing-crew");
+        let lines = build_startup_banner(&sample_addr(), &flows, true, &crew, false, 0, 0);
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("crew root not found"),
+            "expected crew-root warning; got: {joined}"
+        );
+        assert!(
+            joined.contains("/tmp/darkmux-banner-missing-crew"),
+            "crew-root warning should include the path"
+        );
+        assert!(
+            !joined.contains("flows dir doesn't exist yet"),
+            "should not warn about flows when flows dir exists"
+        );
+    }
+
+    #[test]
+    fn startup_banner_no_warnings_when_state_is_clean() {
+        let flows = PathBuf::from("/some/flows");
+        let crew = PathBuf::from("/some/crew");
+        let lines = build_startup_banner(&sample_addr(), &flows, true, &crew, true, 1, 4);
+        let joined = lines.join("\n");
+        assert!(!joined.contains("doesn't exist yet"), "no flows warning");
+        assert!(!joined.contains("crew root not found"), "no crew warning");
+    }
+
 }
