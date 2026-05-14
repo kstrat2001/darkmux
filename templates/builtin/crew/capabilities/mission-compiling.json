@@ -1,0 +1,12 @@
+{
+  "id": "mission-compiling",
+  "description": "Converts unstructured intent (operator notes, issue body, pasted text) into a structured Mission + Sprint JSON proposal.",
+  "keywords": [
+    {"keyword": "plan mission", "weight": 1.0},
+    {"keyword": "structure plan", "weight": 0.9},
+    {"keyword": "compile mission", "weight": 1.0},
+    {"keyword": "propose sprints", "weight": 0.9},
+    {"keyword": "break into sprints", "weight": 0.8},
+    {"keyword": "mission proposal", "weight": 1.0}
+  ]
+}
