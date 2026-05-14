@@ -1612,15 +1612,33 @@ function refreshFilterSuggestions() {
 // emits dispatch + verdict pairs with matching session_id. This pairing
 // is computed once per applyFilters() cycle into state.durations.
 function computeDispatchDurations() {
+  // Action vocabulary (confirmed against live records on 2026-05-14; same
+  // shape used by computeFlowBusyModels above):
+  //   `dispatch start`     → opens a session (start time recorded)
+  //   `dispatch complete`  → closes (end time recorded)
+  //   `dispatch failed`    → closes
+  //   `verdict:*`          → closes (sprint review / qa-style verdicts)
+  // Older logic treated ANY `dispatch *` as a start, which meant
+  // `dispatch complete` overwrote the start time AND was never matched
+  // as an end. Normal dispatch pairs (start → complete, no verdict)
+  // had `t1` undefined → the wall-clock renderer fell through to its
+  // "running" branch with an animated sweep, even on long-completed
+  // sessions. False indicator. Now the vocabulary covers all closers.
   const starts = new Map();  // session_id -> ts (parsed Date)
   const ends = new Map();    // session_id -> ts
   for (const r of state.records) {
-    if (!r.session_id || !r.ts) continue;
+    if (!r.session_id || !r.ts || !r.action) continue;
     const t = Date.parse(r.ts);
     if (Number.isNaN(t)) continue;
-    if (r.action && r.action.startsWith('dispatch ')) {
-      starts.set(r.session_id, t);
-    } else if (r.action && (r.action.startsWith('verdict:') || r.action === 'dispatch failed')) {
+    if (r.action === 'dispatch start') {
+      // Only set if absent so a later record can't overwrite the
+      // genuine first-start timestamp.
+      if (!starts.has(r.session_id)) starts.set(r.session_id, t);
+    } else if (
+      r.action === 'dispatch complete' ||
+      r.action === 'dispatch failed' ||
+      r.action.startsWith('verdict:')
+    ) {
       ends.set(r.session_id, t);
     }
   }
