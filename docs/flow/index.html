@@ -1179,7 +1179,12 @@ function openSse(date) {
     // flips it busy within milliseconds, not within the 3s poll window
     // (#127 follow-up — without this, the pulse animation lagged the
     // actual activity by up to one poll cycle).
-    renderModelPill(modelLastResp);
+    // Null-guard: `modelLastResp` is null until the first /model/status
+    // poll resolves. Without the guard, an SSE event arriving in the
+    // brief window between connect+SSE-open and the first poll causes
+    // renderModelPill to flip the pill to "daemon offline" — confusing
+    // false signal on viewer reload onto a busy daemon.
+    if (modelLastResp) renderModelPill(modelLastResp);
   };
   eventSource.onerror = () => {
     if (eventSource && eventSource.readyState === EventSource.CONNECTING) {
@@ -1662,8 +1667,14 @@ function renderWallClock(r) {
   if (!d) return '';
   const t0 = d.starts.get(r.session_id);
   const t1 = d.ends.get(r.session_id);
-  // Only show the clock on the dispatch beat itself — once per session.
-  if (!r.action || !r.action.startsWith('dispatch ')) return '';
+  // Only show the clock on the `dispatch start` beat — once per session.
+  // Prior version used `startsWith('dispatch ')` which now matches
+  // `dispatch start`, `dispatch complete`, AND `dispatch failed` after
+  // the vocabulary normalization in #131 (computeDispatchDurations and
+  // computeFlowBusyModels). Without this tighter check, three duplicate
+  // duration rings render per session — visible UI lie about activity
+  // multiplication.
+  if (r.action !== 'dispatch start') return '';
   if (!t0) return '';
   // CSS custom properties resolve in modern browsers when passed via `style=`,
   // which is the portable form vs. the SVG presentation attribute (which only
