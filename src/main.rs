@@ -22,6 +22,7 @@ mod providers;
 mod runtime;
 mod serve;
 mod skills;
+mod external;
 mod flow_cli;
 mod role_cli;
 mod sprint_cli;
@@ -181,6 +182,38 @@ enum Cmd {
         /// Show what would be installed without writing.
         #[arg(long, short = 'n')]
         dry_run: bool,
+    },
+    /// External-source plugins: pull text/markdown from a single artifact
+    /// out to stdout. Composes with `darkmux mission propose` and other
+    /// downstream commands via shell pipes. Each invocation hits exactly
+    /// one plugin (mutually exclusive flags).
+    External {
+        #[command(subcommand)]
+        sub: ExternalCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ExternalCmd {
+    /// Pull text/markdown from an external source to stdout. Plugin
+    /// contract: produce text/markdown (any reasonable shape) to
+    /// stdout; downstream verbs read it as input. Exactly one source
+    /// flag must be provided.
+    #[command(group(clap::ArgGroup::new("source").required(true).multiple(false).args(["gh", "url", "stdin"])))]
+    Pull {
+        /// Pull from a GitHub issue or PR URL (wraps `gh issue view`
+        /// or `gh pr view`). Requires `gh` on PATH.
+        #[arg(long, group = "source")]
+        gh: Option<String>,
+        /// Pull from any URL (HTTP GET via `curl -s -L --max-time 30`).
+        /// Output is whatever the URL responds with — HTML is
+        /// passed through unchanged for now.
+        #[arg(long, group = "source")]
+        url: Option<String>,
+        /// Read from stdin and echo to stdout (passthrough). Useful
+        /// for `pbpaste | darkmux external pull --stdin | ...`.
+        #[arg(long, group = "source")]
+        stdin: bool,
     },
 }
 
@@ -573,6 +606,12 @@ fn main() -> Result<()> {
 
 fn run(cmd: Cmd) -> Result<i32> {
     match cmd {
+        Cmd::External { sub } => match sub {
+            ExternalCmd::Pull { gh, url, stdin } => {
+                external::pull(gh.as_deref(), url.as_deref(), stdin)?;
+                Ok(0)
+            }
+        },
         Cmd::Swap { profile, config, dry_run, quiet } => cmd_swap(&profile, config.as_deref(), dry_run, quiet),
         Cmd::Status { config } => cmd_status(config.as_deref()),
         Cmd::Profiles { config } => cmd_profiles(config.as_deref()),
