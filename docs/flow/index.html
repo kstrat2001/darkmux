@@ -1253,18 +1253,16 @@ function renderModelPill(payload) {
     modelPillLabel.textContent = 'no models loaded';
     return;
   }
-  // Any busy → pill is busy; else idle.
+  // Any busy → pill is busy; else idle. The dot reflects aggregate
+  // activity ("is anything running?"); the modal carries the per-model
+  // truth on click. The pill used to render the first N model names in
+  // the toolbar, but that didn't scale past ~2-3 models and lied about
+  // per-model state given the coarse `lms ps` source (#127). Now it's
+  // honest: count in the pill, detail in the modal.
   const anyBusy = models.some(m => (m.status || '').toLowerCase() === 'busy');
   modelPillEl.classList.add(anyBusy ? 'busy' : 'idle');
-  const shown = models.slice(0, MODEL_PILL_MAX_NAMES).map(m => {
-    const ctxK = m.context ? Math.round(m.context / 1000) + 'k' : '?';
-    return `${truncIdentifier(m.identifier)}·${ctxK}`;
-  });
-  let label = shown.join(' + ');
-  if (models.length > MODEL_PILL_MAX_NAMES) {
-    label += ` +${models.length - MODEL_PILL_MAX_NAMES} more`;
-  }
-  modelPillLabel.textContent = label;
+  const noun = models.length === 1 ? 'model' : 'models';
+  modelPillLabel.textContent = `${models.length} ${noun} loaded`;
 }
 
 function renderModelModal(payload) {
