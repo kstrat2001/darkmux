@@ -1105,7 +1105,12 @@ document.getElementById('file-input').onchange = (e) => {
   reader.readAsText(f);
 };
 
-daemonBtn.onclick = async () => {
+/// Fetch the day's records from the daemon + open the SSE tail.
+/// Called from `daemonBtn.onclick` (silent=false, surfaces alerts on
+/// failure) and from the load-time auto-connect path (silent=true,
+/// the upper-right setSource indicator is the only UI signal — no
+/// popups). Returns true on success, false on any failure.
+async function connectToDaemon(silent) {
   const date = dateInput.value || todayUtc();
   const url = `http://localhost:8765/flow/${date}.jsonl`;
   setSource('fetching…', null);
@@ -1113,19 +1118,23 @@ daemonBtn.onclick = async () => {
     const resp = await fetch(url);
     if (!resp.ok && resp.status !== 404) {
       setSource(`daemon ${resp.status}`, null);
-      alert(`Daemon returned ${resp.status} for ${date}.jsonl.`);
-      return;
+      if (!silent) alert(`Daemon returned ${resp.status} for ${date}.jsonl.`);
+      return false;
     }
     // 404 is OK — the day file may not exist yet; we still tail-subscribe.
     const text = resp.ok ? await resp.text() : '';
     loadFromText(text, `daemon · ${date}`, 'daemon');
     openSse(date);
+    return true;
   } catch (e) {
     closeSse();
     setSource('daemon offline', null);
-    alert('Could not reach http://localhost:8765 — start darkmux serve, or check --bind / --port flags.');
+    if (!silent) alert('Could not reach http://localhost:8765 — start darkmux serve, or check --bind / --port flags.');
+    return false;
   }
-};
+}
+
+daemonBtn.onclick = () => connectToDaemon(false);
 
 document.getElementById('load-sample-btn').onclick = () => {
   closeSse();
@@ -1695,11 +1704,17 @@ applyFilters();
 // Initial render shows the empty state.
 render();
 
-// Auto-detect a running daemon and highlight the daemon button if found.
+// Auto-detect a running daemon. If reachable, highlight the daemon
+// button, start sprint-progress polling, AND attempt the
+// fetch+SSE-tail connection silently — so reload-the-viewer just
+// works. Errors flow into the upper-right status indicator
+// (setSource) instead of popping an alert; the operator already
+// sees state in the toolbar so they don't need a modal for a
+// transient daemon hiccup on load.
 autoDetectDaemon().then(() => {
-  // If daemon reachable, kick off sprint-progress polling.
   if (daemonBtn.classList.contains('btn-primary')) {
     startSprintProgressPolling();
+    connectToDaemon(true);
   }
 });
 </script>
