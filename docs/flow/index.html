@@ -771,7 +771,14 @@ function loadFromText(text, sourceLabel, sourceKind) {
   const { records, schema } = parseJsonl(text);
   state.records = records;
   state.schema = schema;
-  state.index = 0;
+  // Select the most-recent record on load — operators want to see
+  // "what's happening now" when they open the viewer, not "what
+  // happened first." The renderList path already scrolls to bottom
+  // when scrollLock is true (the default); this keeps the SELECTED
+  // row aligned with where the visual scroll lands. SSE-appended
+  // events follow the same tail-select behavior (line ~1140), so
+  // initial-load behavior now matches live-stream behavior.
+  state.index = Math.max(0, records.length - 1);
   if (schema) {
     schemaVerEl.textContent = schema.version || '?';
     darkmuxVerEl.textContent = schema.darkmux_version || '?';
