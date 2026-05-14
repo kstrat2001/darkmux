@@ -377,6 +377,25 @@ mod tests {
 
     #[serial_test::serial]
     #[test]
+    fn coder_role_can_create_new_files() {
+        // Regression guard for #124. Implementing features routinely requires
+        // creating new files (new modules, new templates, new fixtures).
+        // `edit` only modifies existing files; `write` is what the coder uses
+        // to create them. A dispatch with the previous palette
+        // (`read`/`edit`/`exec`/`process` — no `write`) dead-ends mid-task on
+        // any new-file step. Verified empirically on Sprint 2 of #113 (PR #123).
+        let _guard = CrewDirGuard::new(TempDir::new().unwrap());
+        let roles = load_roles().unwrap();
+        let coder = roles.iter().find(|r| r.id == "coder").expect("builtin coder should load");
+        assert!(
+            coder.tool_palette.allow.iter().any(|t| t == "write"),
+            "coder.tool_palette.allow must include 'write' (regression of #124); got {:?}",
+            coder.tool_palette.allow
+        );
+    }
+
+    #[serial_test::serial]
+    #[test]
     fn prompt_path_resolved_when_md_present() {
         let guard = CrewDirGuard::new(TempDir::new().unwrap());
         let roles_dir = guard.path().join("roles");
