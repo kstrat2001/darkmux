@@ -1166,6 +1166,11 @@ function openSse(date) {
       state.index = state.filtered.length - 1;
       render();
     }
+    // Re-render the pill on each SSE event so a fresh `dispatch <role>`
+    // flips it busy within milliseconds, not within the 3s poll window
+    // (#127 follow-up — without this, the pulse animation lagged the
+    // actual activity by up to one poll cycle).
+    renderModelPill(modelLastResp);
   };
   eventSource.onerror = () => {
     if (eventSource && eventSource.readyState === EventSource.CONNECTING) {
@@ -1254,6 +1259,48 @@ function formatStamp(ms) {
   return d.toLocaleTimeString();
 }
 
+/// Walk state.records and return the set of model ids that have an
+/// open dispatch (a `dispatch <role>` record whose session_id has not
+/// yet been matched by a `verdict:*` or `dispatch failed` end record).
+/// This composes with the daemon's `lms ps` status in renderModelPill —
+/// `lms ps` catches operator's direct LMStudio Chat sessions; flow
+/// records catch darkmux-orchestrated dispatches that `lms ps`
+/// undersells (it'd report `loaded` mid-generation, missing the
+/// `processingPrompt`/etc states only visible in the SDK).
+///
+/// Sourced from records the viewer already has via SSE; no extra
+/// daemon API needed. Records carry `model` since #110.
+function computeFlowBusyModels() {
+  // Action vocabulary (confirmed against live records on 2026-05-14):
+  //   `dispatch start`     → opens a session
+  //   `dispatch complete`  → closes
+  //   `dispatch failed`    → closes
+  //   `verdict:*`          → closes (sprint review / qa-style verdicts)
+  // Anything else is irrelevant to busy-state tracking.
+  const startsByModel = new Map();   // model -> Set<session_id>
+  const endedSessions = new Set();
+  for (const r of state.records) {
+    if (!r.session_id || !r.action) continue;
+    if (r.action === 'dispatch start' && r.model) {
+      if (!startsByModel.has(r.model)) startsByModel.set(r.model, new Set());
+      startsByModel.get(r.model).add(r.session_id);
+    } else if (
+      r.action === 'dispatch complete' ||
+      r.action === 'dispatch failed' ||
+      r.action.startsWith('verdict:')
+    ) {
+      endedSessions.add(r.session_id);
+    }
+  }
+  const busy = new Set();
+  for (const [model, sessions] of startsByModel) {
+    for (const sid of sessions) {
+      if (!endedSessions.has(sid)) { busy.add(model); break; }
+    }
+  }
+  return busy;
+}
+
 function renderModelPill(payload) {
   modelPillEl.classList.remove('idle', 'busy', 'empty', 'offline');
   if (!payload) {
@@ -1272,13 +1319,18 @@ function renderModelPill(payload) {
     modelPillLabel.textContent = 'no models loaded';
     return;
   }
-  // Any busy → pill is busy; else idle. The dot reflects aggregate
-  // activity ("is anything running?"); the modal carries the per-model
-  // truth on click. The pill used to render the first N model names in
-  // the toolbar, but that didn't scale past ~2-3 models and lied about
-  // per-model state given the coarse `lms ps` source (#127). Now it's
-  // honest: count in the pill, detail in the modal.
-  const anyBusy = models.some(m => (m.status || '').toLowerCase() === 'busy');
+  // Busy detection composes two signals (#127):
+  //   1. `lms ps` status (catches operator's direct LMStudio Chat sessions
+  //      that don't flow through darkmux)
+  //   2. Flow-record-derived in-flight set (catches darkmux-orchestrated
+  //      dispatches that `lms ps` undersells — it reports `loaded` mid-
+  //      generation, missing `processingPrompt`/etc states)
+  // Either signal → pill goes busy + pulses. Without (2), the pulse was a
+  // false indicator because `lms ps` rarely reports literal `'busy'` during
+  // active dispatch.
+  const lmsBusy = models.some(m => (m.status || '').toLowerCase() === 'busy');
+  const flowBusy = computeFlowBusyModels();
+  const anyBusy = lmsBusy || flowBusy.size > 0;
   modelPillEl.classList.add(anyBusy ? 'busy' : 'idle');
   const noun = models.length === 1 ? 'model' : 'models';
   modelPillLabel.textContent = `${models.length} ${noun} loaded`;
@@ -1560,15 +1612,33 @@ function refreshFilterSuggestions() {
 // emits dispatch + verdict pairs with matching session_id. This pairing
 // is computed once per applyFilters() cycle into state.durations.
 function computeDispatchDurations() {
+  // Action vocabulary (confirmed against live records on 2026-05-14; same
+  // shape used by computeFlowBusyModels above):
+  //   `dispatch start`     → opens a session (start time recorded)
+  //   `dispatch complete`  → closes (end time recorded)
+  //   `dispatch failed`    → closes
+  //   `verdict:*`          → closes (sprint review / qa-style verdicts)
+  // Older logic treated ANY `dispatch *` as a start, which meant
+  // `dispatch complete` overwrote the start time AND was never matched
+  // as an end. Normal dispatch pairs (start → complete, no verdict)
+  // had `t1` undefined → the wall-clock renderer fell through to its
+  // "running" branch with an animated sweep, even on long-completed
+  // sessions. False indicator. Now the vocabulary covers all closers.
   const starts = new Map();  // session_id -> ts (parsed Date)
   const ends = new Map();    // session_id -> ts
   for (const r of state.records) {
-    if (!r.session_id || !r.ts) continue;
+    if (!r.session_id || !r.ts || !r.action) continue;
     const t = Date.parse(r.ts);
     if (Number.isNaN(t)) continue;
-    if (r.action && r.action.startsWith('dispatch ')) {
-      starts.set(r.session_id, t);
-    } else if (r.action && (r.action.startsWith('verdict:') || r.action === 'dispatch failed')) {
+    if (r.action === 'dispatch start') {
+      // Only set if absent so a later record can't overwrite the
+      // genuine first-start timestamp.
+      if (!starts.has(r.session_id)) starts.set(r.session_id, t);
+    } else if (
+      r.action === 'dispatch complete' ||
+      r.action === 'dispatch failed' ||
+      r.action.startsWith('verdict:')
+    ) {
       ends.set(r.session_id, t);
     }
   }
