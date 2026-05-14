@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Getting started — darkmux user guide</title>
+<meta name="description" content="Install darkmux, run doctor, configure your first profile, swap to it. The on-ramp guide for new operators.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <div class="wrap">
+    <a href="../" class="brand">darkmux</a>
+    <span class="crumbs"><a href="index.html">guide</a> <span>/</span> getting started</span>
+    <div class="links">
+      <a href="index.html">Guide home</a>
+      <a href="observability.html">Next ›</a>
+    </div>
+  </div>
+</nav>
+
+<header class="page-head">
+  <div class="wrap">
+    <div class="label">01 <span class="dot">·</span> foundation</div>
+    <h1>Getting started</h1>
+    <p class="lede">Install darkmux, verify the setup, configure your first profile, swap to it, and run a smoke test. Everything else in the guide assumes you've done this.</p>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <h2>Prerequisites</h2>
+    <table>
+      <tr><th>Required</th><th>Why</th><th>Install</th></tr>
+      <tr>
+        <td><a href="https://lmstudio.ai/">LMStudio</a></td>
+        <td>darkmux drives LMStudio via the <code>lms</code> CLI for load/unload.</td>
+        <td>macOS / Windows / Linux installer.</td>
+      </tr>
+      <tr>
+        <td>At least one model in LMStudio</td>
+        <td>Nothing to swap to without one.</td>
+        <td>Download via the LMStudio UI; verify with <code>lms ls</code>.</td>
+      </tr>
+      <tr>
+        <td>Rust toolchain</td>
+        <td>To build darkmux itself.</td>
+        <td><code>curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh</code></td>
+      </tr>
+    </table>
+    <p class="muted">darkmux is developed and tested on Apple Silicon. Linux should work; Intel Mac is untested.</p>
+
+    <h3>Optional (but unlocks a lot)</h3>
+    <table>
+      <tr><th>Tool</th><th>When you need it</th></tr>
+      <tr>
+        <td>An agent runtime (e.g. <a href="https://github.com/openclaw/openclaw">OpenClaw</a>)</td>
+        <td>For <code>darkmux lab</code> dispatches and <code>darkmux crew dispatch</code>. Pure <code>swap</code>/<code>status</code>/<code>profiles</code> work without one. Override the default with <code>DARKMUX_RUNTIME_CMD=&lt;your-runtime&gt;</code>.</td>
+      </tr>
+      <tr>
+        <td><a href="https://claude.com/claude-code">Claude Code</a> (or any frontier orchestrator)</td>
+        <td>For agent-invokable skills and dispatching workflows. darkmux works as a CLI without it.</td>
+      </tr>
+    </table>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Install + bootstrap</h2>
+    <h3>One copy-pasteable block</h3>
+    <p>Works from a fresh machine that has LMStudio installed:</p>
+    <pre><code><span class="comment"># 1. Install Rust toolchain (skip if `cargo --version` already works)</span>
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+
+<span class="comment"># 2. Clone + build darkmux</span>
+git clone https://github.com/kstrat2001/darkmux
+cd darkmux
+cargo install --path .
+
+<span class="comment"># 3. Bootstrap config + agent skills</span>
+darkmux init</code></pre>
+    <div class="callout">
+      <strong>Heads up.</strong>
+      <p style="margin: 6px 0 0;">The <code>source "$HOME/.cargo/env"</code> line is the one most often missed. Without it, a fresh <code>cargo install</code> fails with <code>command not found: cargo</code> in the same shell that just ran the rustup installer.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Verify your setup</h2>
+    <p><code>darkmux doctor</code> runs pre-flight checks: profile registry, <code>lms</code> binary, models loaded, runtime command, RAM headroom, power state, agent role scaffolds, daemon reachability, and a battery of empirical rules from the <code>eureka</code> set.</p>
+    <pre><code>darkmux doctor</code></pre>
+    <p>Each check returns Pass, Warn, or Fail. Fail-level lines include actionable hints; the exit code is 0 on all-pass-or-warn, 1 if anything Fails.</p>
+
+    <p>Output is one line per check, color-coded: <code>✓</code> for Pass, <code>!</code> for Warn, <code>✗</code> for Fail. Run it yourself on a fresh setup — that's the canonical reference for what it looks like.</p>
+
+    <p>Common first-run warnings:</p>
+    <ul>
+      <li><strong><code>daemon: reachable</code> Warn</strong> — you haven't started <code>darkmux serve</code> yet. That's fine for now; you'll start it in the <a href="observability.html">Observability</a> section.</li>
+      <li><strong><code>profile match</code> Warn</strong> — your <code>~/.darkmux/profiles.json</code> doesn't yet reference what's loaded in LMStudio. That's also fine — we fix it next.</li>
+      <li><strong><code>runtime version</code> Warn</strong> — your installed agent runtime is older than darkmux's validated minimum. If you're not running an orchestrator, you can ignore this for now.</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Configure your first profile</h2>
+    <p>A profile is a named loadout — which model(s) to keep resident in LMStudio at which context length. Profiles live in <code>~/.darkmux/profiles.json</code> (created by <code>darkmux init</code>).</p>
+    <h3>Inspect what's already there</h3>
+    <pre><code>darkmux profiles                  <span class="comment"># list configured profiles</span>
+cat ~/.darkmux/profiles.json      <span class="comment"># see the actual JSON</span></code></pre>
+    <p>The bootstrap config ships with placeholder profiles (<code>fast</code>, <code>balanced</code>, <code>deep</code>, plus a <code>gpt-oss</code> preset for the 120B MXFP4 build on Apple Silicon). Each profile lists models with placeholder IDs like <code>&lt;your-primary-model-id&gt;</code>.</p>
+
+    <h3>Swap a real model id in</h3>
+    <p>Run <code>lms ls</code> to see what's downloaded in LMStudio. Pick one (start with whatever you've been using day-to-day) and replace a placeholder in <code>profiles.json</code>:</p>
+    <pre><code><span class="comment"># See what's available</span>
+lms ls
+
+<span class="comment"># Edit the file (use whatever editor)</span>
+${EDITOR:-vim} ~/.darkmux/profiles.json</code></pre>
+    <p>Each profile model has three fields that matter:</p>
+    <ul>
+      <li><code>id</code> — the LMStudio model id from <code>lms ls</code> output (e.g. <code>qwen3.6-35b-a3b</code>).</li>
+      <li><code>n_ctx</code> — context length to load at. Defaults are usually fine; <code>32768</code> is a safe starter for any model.</li>
+      <li><code>role</code> — one of <code>primary</code>, <code>compactor</code>, <code>auxiliary</code>. Every profile needs exactly one <code>primary</code>; the rest are optional.</li>
+    </ul>
+
+    <h3>Verify the edits</h3>
+    <pre><code>darkmux profiles                  <span class="comment"># the profile should now list your model</span>
+darkmux doctor                    <span class="comment"># confirm "profile match" is green or close</span></code></pre>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Your first swap</h2>
+    <p><code>darkmux swap &lt;profile&gt;</code> atomically transitions LMStudio's loaded model set to match the named profile. It unloads anything that doesn't belong, loads what does, and patches your agent runtime's config so the agent requests the right model identifier on its next dispatch.</p>
+    <pre><code>darkmux status                    <span class="comment"># what's loaded right now; which profile (if any) matches</span>
+darkmux swap fast                 <span class="comment"># load the "fast" profile</span>
+darkmux status                    <span class="comment"># confirm — should show "fast" as the active profile</span></code></pre>
+
+    <div class="callout good">
+      <strong>What just happened.</strong>
+      <p style="margin: 6px 0 0;">darkmux issued <code>lms load</code> for your profile's primary model with a <code>darkmux:</code> namespace prefix (so darkmux can recognize its own loads later), set the context length, updated <code>~/.openclaw/openclaw.json</code> (or your runtime's config) to reference the now-loaded identifier, and reported success. Your orchestrator's next dispatch will route to this model.</p>
+    </div>
+
+    <p>If swap reports a warning about RAM headroom or a model not found in <code>lms ls</code>, that's doctor-style feedback at swap time — usually fixable by either trimming context length or downloading the model first via the LMStudio UI.</p>
+
+    <h3>The smoke test</h3>
+    <pre><code>darkmux lab run quick-q           <span class="comment"># single-turn smoke prompt against the active profile</span>
+darkmux lab inspect &lt;run-id&gt;      <span class="comment"># quick look at what happened</span></code></pre>
+    <p>This requires an agent runtime (OpenClaw or override). If you don't have one configured, skip this step — you can come back to it after reading the <a href="lab.html">lab</a> section.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>What's next</h2>
+    <ul>
+      <li>If you want to see darkmux operate visually as you work: <a href="observability.html">Observability — daemon + viewer</a>.</li>
+      <li>If you want to benchmark / characterize your hardware against a workload: <a href="lab.html">The lab harness</a>.</li>
+      <li>If you're integrating with an orchestrator for agentic work: <a href="missions.html">Missions, sprints, and crew dispatch</a>.</li>
+    </ul>
+  </div>
+</section>
+
+<nav class="page-nav wrap">
+  <a href="index.html" class="prev">
+    <span class="dir">‹ Guide home</span>
+    <span class="title">Back to TOC</span>
+  </a>
+  <a href="observability.html" class="next">
+    <span class="dir">Next ›</span>
+    <span class="title">Observability: daemon + viewer</span>
+  </a>
+</nav>
+
+<footer>
+  <div class="wrap">
+    <div>
+      <a href="https://github.com/kstrat2001/darkmux">GitHub</a> ·
+      <a href="https://github.com/kstrat2001/darkmux/blob/main/DISCLAIMER.md">Disclaimer</a> ·
+      <a href="https://github.com/kstrat2001/darkmux/blob/main/LICENSE">MIT</a>
+    </div>
+    <div>
+      © Kain Osterholt · <a href="https://substack.com/@DarklyEnergized">Darkly Energized LLC</a>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>

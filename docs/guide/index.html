@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>darkmux user guide</title>
+<meta name="description" content="The user guide for darkmux — a Rust CLI for managing local LLM stacks. Workflow walkthroughs for install, profiles, observability, lab, and agentic missions.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <div class="wrap">
+    <a href="../" class="brand">darkmux</a>
+    <span class="crumbs"><span>/</span> guide</span>
+    <div class="links">
+      <a href="../">Home</a>
+      <a href="https://github.com/kstrat2001/darkmux">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<header class="page-head">
+  <div class="wrap">
+    <div class="label">user guide <span class="dot">·</span> v1</div>
+    <h1>Using darkmux</h1>
+    <p class="lede">Workflow walkthroughs for running darkmux on your own hardware. Pick a section by what you're trying to do — they don't depend on each other in strict order, except Getting Started, which everything else assumes you've done.</p>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <h2>Before you start — about consistency</h2>
+    <div class="callout warn">
+      <strong>Results will vary based on your frontier configuration.</strong>
+      <p style="margin: 8px 0 0;">The frontier models you use as the orchestrator (Claude Code, Cursor, OpenClaw, etc.) need proper guidance to make the most out of darkmux. This guide is a starting reference, not doctrine to enforce. Contradictory statements between this guide, your project's <code>CLAUDE.md</code>, and other frontier configs will cause more harm than good. Configure to your own strategy and goals; treat what's below as inspiration, not commandments.</p>
+    </div>
+    <p>darkmux deliberately leaves the operator in control of how their environment is shaped. The same command (<code>darkmux crew dispatch</code>, say) can feel different from one machine to another because the <em>frontier</em> driving it reads different doctrine. That's by design — see the <a href="https://github.com/kstrat2001/darkmux/issues/112">operator-sovereignty thread</a> for the architectural reasoning. The trade-off: don't expect identical experiences across operators. Expect <em>consistent foundations</em> (the CLI, the records, the viewer) and operator-shaped behavior on top.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Where to go from here</h2>
+    <div class="toc">
+      <a href="getting-started.html">
+        <span class="label">01 · Foundation</span>
+        <div class="title">Getting started</div>
+        <div class="desc">Install darkmux, run <code>doctor</code>, configure your first profile, swap to it.</div>
+      </a>
+      <a href="observability.html">
+        <span class="label">02 · See it work</span>
+        <div class="title">Observability: daemon + viewer</div>
+        <div class="desc">Start the daemon, point the <code>/flow</code> viewer at it, watch darkmux operate.</div>
+      </a>
+      <a href="lab.html">
+        <span class="label">03 · Measure</span>
+        <div class="title">The lab harness</div>
+        <div class="desc">Run workloads, characterize models, tune knobs, compare results across runs.</div>
+      </a>
+      <a href="missions.html">
+        <span class="label">04 · Advanced</span>
+        <div class="title">Missions, sprints, crew dispatch</div>
+        <div class="desc">Structured agentic work: dispatch local-AI roles, track multi-step plans as missions and sprints.</div>
+      </a>
+    </div>
+    <p class="muted">No troubleshooting page yet — that comes after the first round of operator feedback shapes which failure modes are worth dedicating a page to. For now, <code>darkmux doctor</code>'s output is the canonical troubleshooting surface.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>How darkmux is meant to be used</h2>
+    <h3>A complement to your frontier orchestrator — not a replacement.</h3>
+    <p>darkmux is an AI-first local-AI orchestrator: a CLI that manages local LLM stacks on your machine and dispatches admin-agent models internally for bounded structuring tasks (compaction, sprint estimation, mission proposal — see <a href="https://github.com/kstrat2001/darkmux/issues/115">#115</a>). The strategic reasoning loop lives in your <em>frontier orchestrator</em> — typically a frontier model (Claude, GPT, etc.) running in a session that has darkmux installed. The admin agent absorbs the routine bounded work; the orchestrator stays on strategy.</p>
+    <p>The intended division of labor:</p>
+    <ul>
+      <li><strong>Frontier orchestrator</strong> — design decisions, complex reasoning, code review, multi-step debugging, narrative for what's being built.</li>
+      <li><strong>Local specialist models (driven by darkmux)</strong> — routine implementation, scaffolding, bounded refactors, parallel work that doesn't need full session context.</li>
+      <li><strong>Local admin agent (dispatched internally by darkmux)</strong> — compaction, structured-output tasks (sprint estimates, mission proposals, notebook drafts). Small, fast, dependable on bounded reasoning. You rarely interact with it directly; darkmux dispatches it when a verb needs that capability.</li>
+      <li><strong>You</strong> — the operator: pick the tier per task, name your intent, override defaults when you have specific judgment.</li>
+    </ul>
+    <p>This guide assumes you have an orchestrator and want to use darkmux as the local-tier resource it dispatches to. If you're running darkmux purely as a CLI (no orchestrator), most of the guide still applies — just skip the agentic sections (crew dispatch, sprint review).</p>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div>
+      <a href="https://github.com/kstrat2001/darkmux">GitHub</a> ·
+      <a href="https://github.com/kstrat2001/darkmux/blob/main/DISCLAIMER.md">Disclaimer</a> ·
+      <a href="https://github.com/kstrat2001/darkmux/blob/main/LICENSE">MIT</a>
+    </div>
+    <div>
+      © Kain Osterholt · <a href="https://substack.com/@DarklyEnergized">Darkly Energized LLC</a>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>

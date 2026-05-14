@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Missions, sprints, and crew dispatch — darkmux user guide</title>
+<meta name="description" content="Structured agentic work in darkmux: dispatch local-AI roles, track multi-step plans as missions and sprints, drive QA via sprint review.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <div class="wrap">
+    <a href="../" class="brand">darkmux</a>
+    <span class="crumbs"><a href="index.html">guide</a> <span>/</span> missions</span>
+    <div class="links">
+      <a href="lab.html">‹ Prev</a>
+      <a href="index.html">Guide home</a>
+    </div>
+  </div>
+</nav>
+
+<header class="page-head">
+  <div class="wrap">
+    <div class="label">04 <span class="dot">·</span> advanced</div>
+    <h1>Missions, sprints, and crew dispatch</h1>
+    <p class="lede">The advanced agentic surface. Use darkmux's <em>crew</em> abstraction to dispatch local-AI roles (coder, code-reviewer, scribe), track multi-step work as <em>missions</em> made of <em>sprints</em>, and run structured QA via <code>sprint review</code>. Optional — everything in earlier sections works without these concepts.</p>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <h2>When you'd use this</h2>
+    <p>If you're driving darkmux as a CLI for personal model loadout management, you don't need this. The mission/sprint/crew layer is for operators using darkmux as the local-AI tier of an agentic workflow — where a frontier orchestrator (Claude, GPT, etc.) is delegating routine implementation work to local models.</p>
+    <p>Specifically, this section is useful if you want:</p>
+    <ul>
+      <li><strong>Named local-AI roles</strong> with specific tool palettes and system prompts (a "coder" that can edit files; a "code-reviewer" that can only read; a "scribe" that drafts prose).</li>
+      <li><strong>Multi-step plans with structure</strong> — missions that contain sprints, dependencies, lifecycle state (planned/running/complete/abandoned).</li>
+      <li><strong>QA-by-default discipline</strong> — every implementation sprint passes through <code>sprint review</code>, which dispatches a code-reviewer crew against the diff.</li>
+      <li><strong>Visible orchestration in the viewer</strong> — mission start, sprint transitions, dispatch start/complete, verdict, all rendered as a timeline in <code>/flow</code>.</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Crew: roles + dispatch</h2>
+    <p>A <strong>role</strong> is a named local-AI capability — a manifest under <code>templates/builtin/crew/roles/&lt;id&gt;.json</code> (or <code>~/.darkmux/crew/roles/&lt;id&gt;.json</code>) paired with a system prompt at the same path with a <code>.md</code> extension. The manifest declares:</p>
+    <ul>
+      <li><code>id</code>, <code>description</code>, <code>capabilities</code></li>
+      <li><code>tool_palette</code> — <code>allow</code> and <code>deny</code> lists of tools (read, exec, edit, etc.)</li>
+      <li><code>escalation_contract</code> — what the role does when it can't solve the task (bail, retry-with-hint, hand-off-to)</li>
+    </ul>
+
+    <h3>Inspect roles</h3>
+    <pre><code>darkmux role list                <span class="comment"># every role in the index</span>
+darkmux role show coder          <span class="comment"># full details for one role</span></code></pre>
+
+    <h3>Dispatch a role</h3>
+    <pre><code>darkmux crew dispatch coder --message "Add a tests for the new helper in src/foo.rs"</code></pre>
+    <p>What happens:</p>
+    <ol>
+      <li>darkmux loads the role manifest + the <code>.md</code> system prompt.</li>
+      <li><strong>Pre-flight</strong>: verifies the corresponding openclaw agent under <code>darkmux/&lt;role-id&gt;</code> matches the manifest's tool palette and system prompt. Bails loud if there's drift, pointing you at <code>darkmux crew sync</code> to fix.</li>
+      <li>Issues <code>openclaw agent --agent darkmux/&lt;role-id&gt; --message "..."</code> with a fresh session id (avoids cross-task context pollution).</li>
+      <li>Emits a <code>dispatch start</code> flow record (tier=local, with the resolved model stamped), then the actual model work, then a <code>dispatch complete</code> or <code>dispatch error</code> record.</li>
+      <li>After return, optionally snapshots filesystem state at <code>--watch</code> paths to verify the role's SIGNOFF claims.</li>
+    </ol>
+
+    <h3>Sync the role registry</h3>
+    <p>If you've edited a role's manifest or system prompt, run sync so the openclaw side picks up the change:</p>
+    <pre><code>darkmux crew sync                <span class="comment"># reconcile openclaw agents.list[] with manifests</span>
+darkmux crew sync --dry-run      <span class="comment"># preview without writing</span></code></pre>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Missions + sprints</h2>
+    <p>A <strong>mission</strong> is a named objective — a JSON file under <code>~/.darkmux/crew/missions/&lt;id&gt;.json</code> with a description, a list of <code>sprint_ids</code>, and a status (active/closed/paused). A <strong>sprint</strong> is a time-boxed work unit inside a mission — its own JSON file under <code>~/.darkmux/crew/sprints/&lt;id&gt;.json</code> with status (planned/running/complete/abandoned), depends_on, and timestamps.</p>
+    <p>These are <strong>operator-edited JSON files</strong>. Today darkmux doesn't have a creation verb — you write the file directly, then use the CLI to transition status. That's deliberate (operator owns the plan; the system manages the state).</p>
+
+    <div class="callout">
+      <strong>Coming soon: <a href="https://github.com/kstrat2001/darkmux/issues/113">darkmux mission propose</a></strong>
+      <p style="margin: 6px 0 0;">A CLI verb that takes unstructured input (pasted text, a Jira ticket via <code>acli</code>, a GitHub issue via <code>gh</code>, a URL via <code>agent-browser</code>) and dispatches a local admin-agent to <em>propose</em> the mission + sprint structure. Operator approves/edits before files land. Until that lands, the hand-authored path below is how you do it.</p>
+    </div>
+
+    <h3>When to use missions vs. not</h3>
+    <p>Mission/sprint is overhead. It pays back only when you'd benefit from <em>durable state</em> for the work. Three patterns to pick from:</p>
+    <table>
+      <tr><th>Pattern</th><th>Shape</th><th>When</th></tr>
+      <tr>
+        <td>Skip</td>
+        <td>No mission. Just <code>darkmux crew dispatch coder --message "..."</code> ad-hoc.</td>
+        <td>Single-shot work, no follow-up expected. The dispatch record itself is the only artifact you need.</td>
+      </tr>
+      <tr>
+        <td>Duration container</td>
+        <td>One mission with <code>sprint_ids: []</code>. Start it; close it; that's it.</td>
+        <td>You want start/close timestamps for an engagement-level chunk of work, but the work isn't decomposable into named sub-steps.</td>
+      </tr>
+      <tr>
+        <td>Decomposed plan</td>
+        <td>Mission + N sprints. Pre-plan or grow via <a href="https://github.com/kstrat2001/darkmux/issues/107"><code>mission add-sprint</code></a>.</td>
+        <td>Multi-step work where the wall-clock arcs per sprint matter, dependencies between sprints matter, or you want the viewer's timeline as an explicit feedback surface.</td>
+      </tr>
+    </table>
+    <p>The practical heuristic: <strong>if you can't articulate what the viewer would show you at the end of the mission, you probably don't need a mission.</strong> If the answer is *"a 3-arc timeline with these durations and these dispatch records"*, missions earn their keep.</p>
+
+    <h3>Mission JSON shape</h3>
+    <pre><code>{
+  "id": "deploy-rewrite",
+  "description": "Rewrite the deploy pipeline to use the new artifact store",
+  "status": "active",
+  "sprint_ids": ["deploy-s1-baseline", "deploy-s2-cutover"],
+  "created_ts": 1778685866
+}</code></pre>
+
+    <h3>Sprint JSON shape</h3>
+    <pre><code>{
+  "id": "deploy-s1-baseline",
+  "mission_id": "deploy-rewrite",
+  "description": "Capture a baseline of current deploy timing + artifact sizes",
+  "status": "planned",
+  "depends_on": [],
+  "created_ts": 1778685866
+}</code></pre>
+
+    <h3>Worked example: a minimum-viable mission</h3>
+    <p>The smallest useful shape: one mission, one sprint. Just enough to see the lifecycle move and the cyan records land in the viewer.</p>
+
+    <h4>1. Make sure the directories exist</h4>
+    <pre><code>mkdir -p ~/.darkmux/crew/missions ~/.darkmux/crew/sprints</code></pre>
+
+    <h4>2. Pick a current Unix epoch timestamp</h4>
+    <p>The <code>created_ts</code> field is just <em>seconds since the Unix epoch</em>. Get one:</p>
+    <pre><code>date +%s
+<span class="comment"># 1778685866   (your value will differ)</span></code></pre>
+
+    <h4>3. Save the mission JSON</h4>
+    <p>Save the following at <code>~/.darkmux/crew/missions/draft-blog-post.json</code> (replace the timestamp with what <code>date +%s</code> just gave you):</p>
+    <pre><code>{
+  "id": "draft-blog-post",
+  "description": "Draft a blog post on local-AI bounded-task patterns.",
+  "status": "active",
+  "sprint_ids": ["draft-blog-post-s1-outline"],
+  "created_ts": 1778685866
+}</code></pre>
+
+    <h4>4. Save the sprint JSON</h4>
+    <p>Save at <code>~/.darkmux/crew/sprints/draft-blog-post-s1-outline.json</code>:</p>
+    <pre><code>{
+  "id": "draft-blog-post-s1-outline",
+  "mission_id": "draft-blog-post",
+  "description": "Write a one-page outline: thesis, three supporting sections, closing reframe.",
+  "status": "planned",
+  "depends_on": [],
+  "created_ts": 1778685866
+}</code></pre>
+
+    <h4>5. Drive the lifecycle</h4>
+    <pre><code>darkmux mission start draft-blog-post
+<span class="comment"># mission `draft-blog-post` → Active</span>
+
+darkmux sprint start draft-blog-post-s1-outline
+<span class="comment"># sprint `draft-blog-post-s1-outline` → Running</span>
+
+<span class="comment"># …do the work, by hand or via `darkmux crew dispatch scribe ...`…</span>
+
+darkmux sprint complete draft-blog-post-s1-outline
+darkmux mission close draft-blog-post
+<span class="comment"># mission `draft-blog-post` → Closed   duration=&lt;wall-clock seconds&gt;</span></code></pre>
+    <p>Every transition emits a flow record — open <a href="../flow/">darkmux.com/flow/</a>, click <strong>Connect</strong>, and you'll see the cyan operator-tier records as the lifecycle moves.</p>
+
+    <h3>Mission without sprints (duration container)</h3>
+    <p>You can omit sprints entirely. A mission with <code>sprint_ids: []</code> is valid — it's just a start/close timestamp container for an engagement-level chunk of work that isn't decomposable.</p>
+    <pre><code>{
+  "id": "japan-trip-2026-05",
+  "description": "10-day Japan trip, May 20-30.",
+  "status": "active",
+  "sprint_ids": [],
+  "created_ts": 1778685866
+}</code></pre>
+    <p>Then just <code>darkmux mission start japan-trip-2026-05</code> when the trip begins and <code>darkmux mission close japan-trip-2026-05</code> when it ends. The viewer will show the wall-clock duration.</p>
+
+    <p>You can also <a href="https://github.com/kstrat2001/darkmux/issues/107"><code>mission add-sprint</code></a> later if structure emerges mid-trip — the empty-sprint mission grows into a decomposed one as needed.</p>
+
+    <h3>Growing the plan: the multi-sprint shape</h3>
+    <p>For mission-shaped work with clear decomposition — a campaign, a deploy, a multi-week research arc — the natural pattern is one mission JSON + one sprint JSON per planned step. Same shape as the minimum-viable example, just more sprint files.</p>
+    <p>For example, a marketing-campaign mission might have three sprints: positioning research, messaging draft, launch checklist. Each sprint JSON references the mission via <code>mission_id</code>, declares <code>depends_on</code> if it must follow another sprint, and the mission's <code>sprint_ids</code> array lists them all.</p>
+    <p>The depends_on edges encode <em>"must complete first"</em>, not display order. Display order in the viewer follows the mission's <code>sprint_ids</code> array.</p>
+
+    <div class="callout">
+      <strong>Mission/sprint is a generic plan abstraction.</strong>
+      <p style="margin: 6px 0 0;">The examples here aren't all software engineering — blog drafts, marketing campaigns, travel planning all fit. Anywhere you want explicit state for <em>"this is what I'm working toward"</em> and <em>"this is the named piece I'm currently on,"</em> mission + sprint is the shape. The schema doesn't care what the work is.</p>
+    </div>
+
+    <h3>Drive the lifecycle</h3>
+    <pre><code><span class="comment"># Mission state machine</span>
+darkmux mission start &lt;id&gt;        <span class="comment"># → Active (stamps started_ts)</span>
+darkmux mission pause &lt;id&gt;        <span class="comment"># Active → Paused</span>
+darkmux mission resume &lt;id&gt;       <span class="comment"># Paused → Active (paused_ts preserved)</span>
+darkmux mission close &lt;id&gt;        <span class="comment"># → Closed (terminal)</span>
+
+<span class="comment"># Sprint state machine</span>
+darkmux sprint start &lt;id&gt;         <span class="comment"># Planned/Abandoned → Running</span>
+darkmux sprint complete &lt;id&gt;      <span class="comment"># Running → Complete (terminal)</span>
+darkmux sprint abandon &lt;id&gt;       <span class="comment"># Planned/Running → Abandoned</span></code></pre>
+    <p>Every transition emits a flow record. Open <a href="../flow/" target="_blank" rel="noopener">the viewer in a new tab</a> as you run these — the sprint-progress widget in the header shows N/M done across active missions, and the record stream below shows the cyan operator-tier transitions in order.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Adding a sprint mid-flight</h2>
+    <p>If you discover scope mid-mission that belongs in the current plan rather than a new mission, use <code>darkmux mission add-sprint</code>:</p>
+    <pre><code><span class="comment"># Append a new sprint to the end of the mission's plan</span>
+darkmux mission add-sprint &lt;mission-id&gt; \
+  --sprint-id &lt;new-id&gt; \
+  --description "..." \
+  [--depends-on &lt;other-sprint-id&gt;]
+
+<span class="comment"># Insert in the middle — immediately after an existing sprint</span>
+darkmux mission add-sprint &lt;mission-id&gt; \
+  --sprint-id &lt;new-id&gt; \
+  --description "..." \
+  --after &lt;existing-sprint-id&gt;</code></pre>
+    <p>The verb writes the new Sprint JSON, updates the Mission's <code>sprint_ids</code> array (at the right position), and emits a <code>sprint added</code> flow record. Idempotent on exact-match (same id + mission + description); errors on collision or dangling <code>--after</code>.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Sprint review: QA-by-default</h2>
+    <p><code>darkmux sprint review</code> runs a code review against the current branch's diff vs. base. It dispatches the <code>code-reviewer</code> role, parses the structured QA-REVIEW-SIGNOFF block from the response, and emits a verdict.</p>
+    <pre><code>darkmux sprint review                          <span class="comment"># review current branch vs auto-detected base</span>
+darkmux sprint review --base main              <span class="comment"># explicit base</span>
+darkmux sprint review --sprint-id deploy-s1    <span class="comment"># tag the review with a sprint id</span>
+darkmux sprint review --require-clean          <span class="comment"># exit 1 if any blockers</span></code></pre>
+
+    <p>Verdict bucket reflects the worst severity found:</p>
+    <ul>
+      <li><strong>clean</strong> — zero findings.</li>
+      <li><strong>flags-only</strong> — no blockers; flags and/or nits present.</li>
+      <li><strong>blockers</strong> — at least one BLOCKER-severity finding.</li>
+    </ul>
+    <p>Output is structured JSON with the full findings list. Use <code>--require-clean</code> in CI or pre-commit scripts that need to gate on clean reviews.</p>
+
+    <p>The review emits its own flow records (Review category, frontier-tier for the orchestrator narrative, local-tier for the actual reviewer dispatch). Watch the viewer during a sprint review to see the full cascade.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Putting it together: a typical agentic workflow</h2>
+    <ol>
+      <li>Write a mission JSON describing what you're trying to do, with sprint ids planned.</li>
+      <li>Write the first sprint JSON.</li>
+      <li><code>darkmux mission start &lt;m&gt;</code> + <code>darkmux sprint start &lt;s1&gt;</code> — operator/cyan records land in the viewer.</li>
+      <li>Dispatch the work: <code>darkmux crew dispatch coder --message "&lt;sprint task&gt;"</code> — local/green records (start + complete) with the model field stamped.</li>
+      <li><code>darkmux sprint complete &lt;s1&gt;</code> — duration arc visible in the wall-clock graphic.</li>
+      <li><code>darkmux sprint review --sprint-id &lt;s1&gt;</code> — QA pass; verdict emits to the viewer. Address findings.</li>
+      <li>Open a PR. If the verdict was clean (or flags-only with nothing material), merge.</li>
+      <li>Repeat for subsequent sprints. Discover scope mid-flight? <code>darkmux mission add-sprint</code> rather than filing a separate mission.</li>
+      <li><code>darkmux mission close &lt;m&gt;</code> when the plan is done.</li>
+    </ol>
+    <p>Every step writes a flow record. The viewer renders them as an annotated timeline. Wall-clock arcs on the dispatch + sprint records show duration; the sprint-progress widget shows N/M done.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Operator sovereignty (a note)</h2>
+    <p>darkmux's mission/sprint/crew model is intentionally <em>operator-owned</em>: missions and sprints are JSON files you write; the CLI manages state transitions but never auto-creates or auto-abandons. The orchestrator is expected to propose structure — *"this looks like 3 sprints; want me to scaffold them?"* — but you accept or modify before files land.</p>
+    <p>If a sprint sits in <code>Running</code> status for hours, that's not a bug in darkmux; it's the operator deciding to leave it open. The viewer's wall-clock graphic shows an unbounded sweep on stale running sprints — clearly-wrong-looking signal that the operator forgot to close one. By design.</p>
+  </div>
+</section>
+
+<nav class="page-nav wrap">
+  <a href="lab.html" class="prev">
+    <span class="dir">‹ Previous</span>
+    <span class="title">The lab harness</span>
+  </a>
+  <a href="index.html" class="next">
+    <span class="dir">Guide home ›</span>
+    <span class="title">Back to TOC</span>
+  </a>
+</nav>
+
+<footer>
+  <div class="wrap">
+    <div>
+      <a href="https://github.com/kstrat2001/darkmux">GitHub</a> ·
+      <a href="https://github.com/kstrat2001/darkmux/blob/main/DISCLAIMER.md">Disclaimer</a> ·
+      <a href="https://github.com/kstrat2001/darkmux/blob/main/LICENSE">MIT</a>
+    </div>
+    <div>
+      © Kain Osterholt · <a href="https://substack.com/@DarklyEnergized">Darkly Energized LLC</a>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>

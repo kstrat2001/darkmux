@@ -190,8 +190,9 @@
     <p class="tag">Task-class-aware multiplexer for local LLM configurations on <span class="accent">Apple Silicon</span>.</p>
     <pre class="install"><span class="prompt">$ </span><span class="cmd">cargo install --git https://github.com/kstrat2001/darkmux</span></pre>
     <div class="btns">
-      <a class="btn btn-primary" href="https://github.com/kstrat2001/darkmux">View on GitHub →</a>
-      <a class="btn btn-ghost" href="/viewer/">Telemetry viewer</a>
+      <a class="btn btn-primary" href="guide/">User guide →</a>
+      <a class="btn btn-ghost" href="https://github.com/kstrat2001/darkmux">GitHub</a>
+      <a class="btn btn-ghost" href="flow/">Flow viewer</a>
       <a class="btn btn-ghost" href="https://substack.com/@DarklyEnergized">Read the work</a>
     </div>
   </div>
@@ -213,6 +214,21 @@
 
 <section>
   <div class="wrap">
+    <h2>Watch it work</h2>
+    <h3>A daemon + viewer for live observability of dispatches, sprints, and verdicts.</h3>
+    <p><code>darkmux serve</code> runs a small HTTP daemon (default <code>127.0.0.1:8765</code>) that exposes flow records written by every dispatch and mission/sprint transition. The <a href="flow/">flow viewer</a> tails those records and renders them as an annotated timeline — cyan for operator actions, violet for orchestrator narrative, green for local-AI work. Wall-clock arcs on dispatch records; <code>model</code> field tells you which LMStudio model ran the work.</p>
+    <ul class="plain">
+      <li><code>darkmux serve</code> — start the daemon in a separate terminal tab</li>
+      <li><code>darkmux doctor</code> — pre-flight checks including <code>daemon: reachable</code></li>
+      <li><a href="flow/">darkmux.com/flow/</a> — viewer; click <strong>Connect</strong> to fetch + tail today's records</li>
+      <li><code>darkmux crew dispatch</code> / <code>sprint review</code> — emit flow records as they run</li>
+    </ul>
+    <p class="muted" style="margin-top: 24px;">Full walkthrough in the <a href="guide/observability.html">observability section of the user guide</a>.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
     <h2>The lab</h2>
     <h3>A measurement harness, not a config tool dressed up as one.</h3>
     <p>Every <code>darkmux lab run</code> writes a manifest, a trajectory, and per-turn timing under <code>.darkmux/runs/&lt;id&gt;/</code> — so wall-clock variance, compaction events, and per-profile behaviour are inspectable after the fact. Not in your head. On disk.</p>
@@ -223,7 +239,22 @@
       <li><code>lab tune long-agentic --runs 6</code> — bimodal cluster detection across N dispatches</li>
       <li><code>lab compare &lt;A&gt; &lt;B&gt;</code> — diff two runs for variance / regression</li>
     </ul>
-    <p class="muted" style="margin-top: 24px;">Workloads are pluggable via a <code>WorkloadProvider</code> trait. Two ship out of the box (<code>prompt</code>, <code>coding-task</code>); add your own without forking.</p>
+    <p class="muted" style="margin-top: 24px;">Workloads are pluggable via a <code>WorkloadProvider</code> trait. Two ship out of the box (<code>prompt</code>, <code>coding-task</code>); add your own without forking. Full walkthrough in the <a href="guide/lab.html">lab section of the user guide</a>.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Advanced: missions, sprints, crew</h2>
+    <h3>Structured agentic work — for operators using darkmux as the local-AI tier of an orchestrator workflow.</h3>
+    <p>Beyond the swap/lab CLI surface, darkmux ships a <em>crew</em> abstraction: named local-AI roles (coder, code-reviewer, scribe) with declared tool palettes and system prompts, plus a <em>mission/sprint</em> lifecycle that tracks multi-step plans as JSON files the operator owns. Optional — none of this is required to use darkmux as a CLI.</p>
+    <ul class="plain">
+      <li><code>darkmux crew dispatch coder --message "..."</code> — invoke a named role; emits flow records</li>
+      <li><code>darkmux sprint review</code> — QA pass against the current branch's diff; dispatches code-reviewer, parses the SIGNOFF block</li>
+      <li><code>darkmux mission start/close/pause/resume</code> + <code>sprint start/complete/abandon</code> — drive lifecycle state</li>
+      <li><code>darkmux mission add-sprint --after &lt;s&gt;</code> — insert scope mid-mission without restructuring</li>
+    </ul>
+    <p class="muted" style="margin-top: 24px;">Full walkthrough in the <a href="guide/missions.html">missions section of the user guide</a>.</p>
   </div>
 </section>
 
@@ -240,11 +271,16 @@
   <div class="wrap">
     <h2>Get going</h2>
     <pre class="install"><span class="prompt">$ </span><span class="cmd">cargo install --git https://github.com/kstrat2001/darkmux</span>
-<span class="prompt">$ </span><span class="cmd">cp ~/.cargo/registry/src/*/darkmux-*/profiles.example.json ~/.darkmux/profiles.json</span>
-<span class="prompt">$ </span><span class="cmd">darkmux profiles</span></pre>
-    <p class="muted">Then edit <code>~/.darkmux/profiles.json</code> to point at your downloaded LMStudio models. <a href="https://github.com/kstrat2001/darkmux#quick-start">Full quick-start in the README.</a></p>
+<span class="prompt">$ </span><span class="cmd">darkmux init</span>
+<span class="prompt">$ </span><span class="cmd">darkmux doctor</span></pre>
+    <p class="muted">Then edit <code>~/.darkmux/profiles.json</code> to point at your downloaded LMStudio models. The <a href="guide/getting-started.html">getting-started page of the user guide</a> walks through this end-to-end, including verifying with doctor and running your first swap.</p>
+
     <div class="warn">
-      <strong>Heads up.</strong> darkmux orchestrates AI tools that execute on your machine. It modifies your local config files and — in lab mode — runs AI-generated code in a working directory that is not a security sandbox. Read the <a href="https://github.com/kstrat2001/darkmux/blob/main/DISCLAIMER.md">DISCLAIMER</a> before running.
+      <strong>Results will vary based on your frontier configuration.</strong> The frontier models you use as the orchestrator (Claude Code, Cursor, OpenClaw, etc.) need proper guidance to make the most out of darkmux. The user guide is a starting reference, not doctrine to enforce. Contradictory statements between this guide, your project's <code>CLAUDE.md</code>, and other frontier configs will cause more harm than good. Configure to your own strategy and goals. See <a href="https://github.com/kstrat2001/darkmux/issues/112">issue #112</a> for the architectural reasoning.
+    </div>
+
+    <div class="warn">
+      <strong>Safety note.</strong> darkmux orchestrates AI tools that execute on your machine. It modifies your local config files and — in lab mode — runs AI-generated code in a working directory that is not a security sandbox. Read the <a href="https://github.com/kstrat2001/darkmux/blob/main/DISCLAIMER.md">DISCLAIMER</a> before running.
     </div>
   </div>
 </section>
