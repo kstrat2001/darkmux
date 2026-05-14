@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>The lab harness — darkmux user guide</title>
+<meta name="description" content="Run workloads, characterize models, tune knobs, compare results across runs. The measurement harness behind darkmux's claims.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <div class="wrap">
+    <a href="../" class="brand">darkmux</a>
+    <span class="crumbs"><a href="index.html">guide</a> <span>/</span> lab</span>
+    <div class="links">
+      <a href="observability.html">‹ Prev</a>
+      <a href="index.html">Guide home</a>
+      <a href="missions.html">Next ›</a>
+    </div>
+  </div>
+</nav>
+
+<header class="page-head">
+  <div class="wrap">
+    <div class="label">03 <span class="dot">·</span> measure</div>
+    <h1>The lab harness</h1>
+    <p class="lede">A measurement harness, not a config tool dressed up as one. Every <code>darkmux lab run</code> writes a manifest, a trajectory, and per-turn timing under <code>.darkmux/runs/&lt;id&gt;/</code> — so wall-clock variance, compaction events, and per-profile behavior are inspectable after the fact, not in your head.</p>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <h2>The point of the lab</h2>
+    <p>Local AI claims are usually unfalsifiable. *"This profile is faster"* — measured how? On which workload? With which compaction settings? With which loaded state at start?</p>
+    <p>The lab harness exists to make those questions answerable on your own hardware:</p>
+    <ul>
+      <li><strong>Reproducible workloads</strong> — named JSON manifests under <code>templates/builtin/workloads/</code> (and your own under <code>~/.darkmux/workloads/</code>).</li>
+      <li><strong>On-disk artifacts</strong> — every run writes a manifest, trajectory, and verify outcome to <code>.darkmux/runs/&lt;id&gt;/</code>. No "I think I saw 30 seconds" hand-waving — the numbers are on disk, in JSON, comparable.</li>
+      <li><strong>Comparison primitives</strong> — <code>lab compare A B</code> diffs two runs by wall-clock, compaction events, and per-turn behavior.</li>
+      <li><strong>Trait-based extension</strong> — add your own workload kinds via the <code>WorkloadProvider</code> trait in <code>src/workloads/types.rs</code>.</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Prerequisites for lab</h2>
+    <p>Lab requires an agent runtime to dispatch against. Default is OpenClaw via the <code>openclaw agent</code> command. Override with <code>DARKMUX_RUNTIME_CMD=&lt;your-runtime&gt;</code> if you're using something else.</p>
+    <p>If you don't have a runtime installed, the <code>swap</code> / <code>status</code> / <code>profiles</code> / <code>doctor</code> verbs still work — you just can't run lab dispatches.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>The smoke workload</h2>
+    <p><code>quick-q</code> is a single-turn smoke prompt against the active profile. It's the "is this thing wired up at all" test — should complete in ~6–10 seconds if a model is loaded.</p>
+    <pre><code>darkmux lab run quick-q
+<span class="comment"># …
+# Captured run quick-q-deep-1778302418-1 in .darkmux/runs/quick-q-deep-1778302418-1/</span></code></pre>
+    <p>Each run prints its id; that's your handle for inspect/compare later.</p>
+
+    <h3>What the run wrote to disk</h3>
+    <pre><code>ls .darkmux/runs/quick-q-deep-1778302418-1/
+<span class="comment"># manifest.json     trajectory.jsonl   verify.json</span></code></pre>
+    <ul>
+      <li><strong><code>manifest.json</code></strong> — workload id, profile, loaded model state, hardware fingerprint, start/end time.</li>
+      <li><strong><code>trajectory.jsonl</code></strong> — per-turn detail: prompt, response, tool calls, timing, compaction events.</li>
+      <li><strong><code>verify.json</code></strong> — verify-command outcome (for workloads that have one). For <code>quick-q</code>, just "did the response come back."</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Inspect a run</h2>
+    <pre><code>darkmux lab inspect quick-q-deep-1778302418-1</code></pre>
+    <p>Shows: total wall-clock, turn count, compaction events, mode (fast vs slow per the Article 2 bimodality), notes from the trajectory.</p>
+
+    <p>The mode classification (fast/slow) comes from the empirical findings in <a href="https://darklyenergized.substack.com/p/part-2-charting-the-wake">Article 2</a> — wall-clock per turn distributes bimodally based on whether the prompt happened to hit a state that triggers heavy compaction or not. Inspect tells you which cluster a given run landed in. The output is a small report — best seen by running it on your own machine after a <code>quick-q</code> or <code>long-agentic</code> run.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Characterize your hardware</h2>
+    <p><code>darkmux lab characterize</code> is the one-command "QA my Mac" — dispatches a representative smoke workload, captures the run, and emits a verdict.</p>
+    <pre><code>darkmux lab characterize</code></pre>
+    <p>Output is a structured JSON verdict plus a human-readable summary. Used to:</p>
+    <ul>
+      <li>Compare two operators' machines against the same benchmark.</li>
+      <li>Catch drift after a profile change or LMStudio upgrade.</li>
+      <li>Establish a baseline before tuning (see below).</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Tune: detect bimodal variance</h2>
+    <p>Single runs lie about local-AI behavior. Wall-clock varies enough that one run isn't a reliable signal. <code>lab tune</code> dispatches N runs against the same workload and clusters the results — surfacing the bimodal "fast" vs "slow" mode shape if it's there.</p>
+    <pre><code>darkmux lab tune long-agentic --runs 6</code></pre>
+    <p>Output: a per-run table + a cluster verdict ("looks bimodal at fast=&lt;mean&gt;s, slow=&lt;mean&gt;s" or "single-mode").</p>
+    <p>Use this after changing a profile setting (context length, compaction mode, compactor model) to see whether the change actually shifted the distribution rather than just luck on a single run.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Compare runs</h2>
+    <p><code>darkmux lab compare A B</code> diffs two runs — typically a "before tuning" baseline vs "after" verification.</p>
+    <pre><code>darkmux lab compare quick-q-deep-1778302418-1 quick-q-deep-1778466601-1</code></pre>
+    <p>Reports: wall-clock delta, compaction-event delta, mode classification per side, any structural differences in the trajectory.</p>
+    <p>The discipline behind it: <strong>baseline → single-variable change → re-measure → compare → record in notebook</strong>. Each step has a darkmux primitive. Don't skip the baseline. Don't change two variables at once. Without this discipline, the comparison is uninterpretable.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>List your runs</h2>
+    <pre><code>darkmux lab runs --limit 10        <span class="comment"># most recent 10</span>
+darkmux lab runs --limit 50</code></pre>
+    <p>Each row shows: run id, workload, profile, wall-clock, mode, verify outcome. Quick way to spot which run id to inspect or compare.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Adding a workload</h2>
+    <p>Built-in workloads live in <code>templates/builtin/workloads/*.json</code> and are embedded into the binary at compile time via <code>include_str!</code> — they work from any directory without the source tree.</p>
+    <p>To add your own:</p>
+    <ol>
+      <li>Drop a JSON manifest at <code>~/.darkmux/workloads/&lt;id&gt;.json</code> (user-local) — picked up automatically on next <code>lab run</code>.</li>
+      <li>For deeper extension (new workload <em>kinds</em>, not just new prompts), implement the <code>WorkloadProvider</code> trait in <code>src/workloads/types.rs</code> and register it in <code>src/workloads/registry.rs::register_builtins()</code>. Requires a code change + reinstall.</li>
+    </ol>
+    <p>Two provider kinds ship out of the box: <code>prompt</code> (single prompt → response) and <code>coding-task</code> (sandbox + verify-command pattern).</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Notebook entries from runs</h2>
+    <p><code>darkmux notebook draft &lt;run-id&gt;</code> dispatches your orchestrator to author an EE-lab-style notebook entry from the run's manifest + trajectory.</p>
+    <pre><code>darkmux notebook draft quick-q-deep-1778302418-1</code></pre>
+    <p>The output is markdown — Action/Why/Result/Next blocks suitable for pasting into your lab notebook. If you have <code>DARKMUX_NOTEBOOK_DIR</code> set (typically to an iCloud-synced path), <code>darkmux notebook list</code> enumerates entries across machines.</p>
+  </div>
+</section>
+
+<nav class="page-nav wrap">
+  <a href="observability.html" class="prev">
+    <span class="dir">‹ Previous</span>
+    <span class="title">Observability: daemon + viewer</span>
+  </a>
+  <a href="missions.html" class="next">
+    <span class="dir">Next ›</span>
+    <span class="title">Missions, sprints, and crew dispatch</span>
+  </a>
+</nav>
+
+<footer>
+  <div class="wrap">
+    <div>
+      <a href="https://github.com/kstrat2001/darkmux">GitHub</a> ·
+      <a href="https://github.com/kstrat2001/darkmux/blob/main/DISCLAIMER.md">Disclaimer</a> ·
+      <a href="https://github.com/kstrat2001/darkmux/blob/main/LICENSE">MIT</a>
+    </div>
+    <div>
+      © Kain Osterholt · <a href="https://substack.com/@DarklyEnergized">Darkly Energized LLC</a>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>

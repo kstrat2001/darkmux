@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Observability — daemon + viewer — darkmux user guide</title>
+<meta name="description" content="Start the darkmux daemon, point the /flow viewer at it, watch darkmux operate. Covers doctor's daemon check and the pre-dispatch nudge too.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <div class="wrap">
+    <a href="../" class="brand">darkmux</a>
+    <span class="crumbs"><a href="index.html">guide</a> <span>/</span> observability</span>
+    <div class="links">
+      <a href="getting-started.html">‹ Prev</a>
+      <a href="index.html">Guide home</a>
+      <a href="lab.html">Next ›</a>
+    </div>
+  </div>
+</nav>
+
+<header class="page-head">
+  <div class="wrap">
+    <div class="label">02 <span class="dot">·</span> see it work</div>
+    <h1>Observability: daemon + viewer</h1>
+    <p class="lede">darkmux emits flow records as it works — what was dispatched, when, to which model, with what verdict. The daemon serves those records over HTTP; the <code>/flow</code> viewer renders them as a live timeline you can watch while darkmux operates.</p>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <h2>The big picture</h2>
+    <p>Three pieces work together:</p>
+    <ul>
+      <li><strong>Flow records on disk</strong> — every dispatch, every sprint transition, every QA verdict appends a JSON line to <code>~/.darkmux/flows/&lt;date&gt;.jsonl</code>. The CLI writes these; no daemon required.</li>
+      <li><strong><code>darkmux serve</code> daemon</strong> — a small HTTP server (default <code>127.0.0.1:8765</code>) that reads those JSONL files and exposes them via REST endpoints + SSE tail.</li>
+      <li><strong><code>/flow</code> viewer</strong> — a static HTML page that fetches from the daemon and renders the timeline with filters, a stepper, and a wall-clock graphic for dispatch duration.</li>
+    </ul>
+    <p>The daemon and viewer are decoupled: records keep landing on disk whether or not the daemon is running. The daemon being up is only required for <em>live viewing</em>.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Start the daemon</h2>
+    <p>Open a second terminal tab — the daemon is a foreground process that blocks until you Ctrl-C.</p>
+    <pre><code>darkmux serve</code></pre>
+    <p>Default bind: <code>127.0.0.1:8765</code>. Override with <code>--port</code> or <code>--bind</code> if you need to:</p>
+    <pre><code>darkmux serve --port 9000 --bind 127.0.0.1</code></pre>
+    <div class="callout warn">
+      <strong>Don't bind to 0.0.0.0 unless you know what you're doing.</strong>
+      <p style="margin: 6px 0 0;">The daemon currently has no authentication. Binding to <code>0.0.0.0</code> exposes your flow records — and the mission/sprint state of whatever you're working on — to anyone on your network. Stick with the loopback default for solo dev work.</p>
+    </div>
+
+    <h3>Verify it's up</h3>
+    <pre><code>curl -s http://127.0.0.1:8765/health
+<span class="comment"># {"darkmux_version":"0.4.0","flow_schema_version":"1.2.0"}</span></code></pre>
+    <p>Or just run <code>darkmux doctor</code> — the <code>daemon: reachable</code> check will report Pass.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Open the viewer</h2>
+    <p>The viewer lives at <a href="../flow/">darkmux.com/flow/</a>. It's a static page — no backend, just JS that fetches from your local daemon.</p>
+    <ol>
+      <li>Open <a href="../flow/">darkmux.com/flow/</a> in your browser.</li>
+      <li>The header shows a "daemon" pill. If the daemon is up, it's green. If not, it's grey with a "daemon offline" label.</li>
+      <li>Click <strong>Connect</strong> to fetch today's records and start tailing for new ones.</li>
+    </ol>
+    <p>Open <a href="../flow/" target="_blank" rel="noopener">the viewer in a new tab</a> while your daemon is running to see the live shape — the static screenshots in this guide deliberately don't exist, since the viewer is iterating fast in this phase.</p>
+
+    <p>The viewer renders records as cards in a stepper. Each card shows:</p>
+    <ul>
+      <li><strong>Tier stripe</strong> — colored bar on the left. Cyan = operator (manual mission/sprint actions), violet = frontier (orchestrator narrative), green = local (model work).</li>
+      <li><strong>Action + handle</strong> — what happened ("dispatch start", "sprint complete", "verdict: clean") and which entity it acted on (the role id, sprint id, or mission id).</li>
+      <li><strong>Meta pills</strong> — category, tier, stage, source, model (if known), sprint, session id. The <code>model</code> pill on dispatch cards shows which LMStudio model handled the work — your map from event-to-model.</li>
+      <li><strong>Wall-clock graphic</strong> — for dispatch records, an SVG ring shows the duration. Sweeping if the dispatch is mid-flight; frozen at the final duration if complete.</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Reading a live dispatch</h2>
+    <p>Run something that emits records and watch them land:</p>
+    <pre><code>darkmux mission start &lt;your-mission-id&gt;    <span class="comment"># cyan: mission start record</span>
+darkmux sprint start &lt;your-sprint-id&gt;      <span class="comment"># cyan: sprint start record</span>
+darkmux crew dispatch coder --message "..."<span class="comment"># green: dispatch start + (later) dispatch complete</span>
+darkmux sprint complete &lt;your-sprint-id&gt;   <span class="comment"># cyan: sprint complete + duration arc</span></code></pre>
+
+    <p>If you keep <a href="../flow/" target="_blank" rel="noopener">the viewer</a> open as you run those commands, the records appear in order: two cyan operator-tier records bracketing a green local-tier dispatch pair (with the model pill visible on each green card), followed by the cyan sprint-complete with its duration arc.</p>
+
+    <p>The records pair via <code>session_id</code> — dispatch start and dispatch complete share the same session id, which is how the wall-clock graphic computes duration. The viewer joins them automatically.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>What the doctor's daemon check does</h2>
+    <p><code>darkmux doctor</code> includes a <code>daemon: reachable</code> check that probes <code>127.0.0.1:8765/health</code> with a 500ms timeout. Three outcomes:</p>
+    <ul>
+      <li><strong>Pass</strong> — daemon is up and returning 200 OK. Live viewing works.</li>
+      <li><strong>Warn (connection refused)</strong> — daemon isn't running. The hint reminds you to run <code>darkmux serve</code> in another tab. Non-fatal — you can still do work; you just won't see it live.</li>
+      <li><strong>Warn (port held)</strong> — something is on 8765 but isn't responding HTTP 200. Hint: check whether another process is using the port.</li>
+    </ul>
+    <p>The check is <strong>Warn</strong>, not Fail — the daemon being off doesn't break anything end-to-end. It only disables live viewing.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>The pre-dispatch nudge</h2>
+    <p>When you run <code>darkmux crew dispatch</code> or <code>darkmux sprint review</code> while the daemon is off, you'll see a one-line stderr nudge:</p>
+    <pre><code>[!] darkmux serve isn't reachable on 127.0.0.1:8765 — `crew dispatch` will
+    write flow records to disk but you won't see them live. To enable live
+    viewing, run `darkmux serve` in another tab.</code></pre>
+    <p>The dispatch proceeds either way — this is situational awareness, not consent-gating. You won't commit to a multi-minute dispatch only to realize the viewer would have been empty.</p>
+    <p>If you started the daemon mid-dispatch, the records that landed before you started it are still visible. The viewer's <strong>Connect</strong> button fetches the whole day's file first, then opens an SSE stream for new records. No data lost.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Other daemon endpoints</h2>
+    <table>
+      <tr><th>Endpoint</th><th>What it returns</th></tr>
+      <tr>
+        <td><code>GET /health</code></td>
+        <td>darkmux version + flow schema version. Used by doctor.</td>
+      </tr>
+      <tr>
+        <td><code>GET /flow/&lt;YYYY-MM-DD&gt;.jsonl</code></td>
+        <td>That day's full flow file as JSONL.</td>
+      </tr>
+      <tr>
+        <td><code>GET /flow/&lt;YYYY-MM-DD&gt;/stream</code></td>
+        <td>Server-Sent Events stream — new records appended to that day's file, in real time.</td>
+      </tr>
+      <tr>
+        <td><code>GET /model/status</code></td>
+        <td>Snapshot of <code>lms ps --json</code>. Used by the viewer's model-status pill.</td>
+      </tr>
+      <tr>
+        <td><code>GET /missions</code></td>
+        <td>All missions from <code>~/.darkmux/crew/missions/</code> (status, sprint_ids, timestamps).</td>
+      </tr>
+      <tr>
+        <td><code>GET /sprints</code></td>
+        <td>All sprints from <code>~/.darkmux/crew/sprints/</code> (status, mission_id, depends_on, timestamps).</td>
+      </tr>
+    </table>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Stopping + restarting</h2>
+    <p>Ctrl-C the daemon's terminal tab to stop. To restart after upgrading darkmux:</p>
+    <pre><code>cargo install --path . --force    <span class="comment"># rebuild + install</span>
+<span class="comment"># Then in the daemon tab, Ctrl-C and re-run:</span>
+darkmux serve</code></pre>
+    <p>The viewer auto-reconnects on the next interaction; no need to refresh.</p>
+  </div>
+</section>
+
+<nav class="page-nav wrap">
+  <a href="getting-started.html" class="prev">
+    <span class="dir">‹ Previous</span>
+    <span class="title">Getting started</span>
+  </a>
+  <a href="lab.html" class="next">
+    <span class="dir">Next ›</span>
+    <span class="title">The lab harness</span>
+  </a>
+</nav>
+
+<footer>
+  <div class="wrap">
+    <div>
+      <a href="https://github.com/kstrat2001/darkmux">GitHub</a> ·
+      <a href="https://github.com/kstrat2001/darkmux/blob/main/DISCLAIMER.md">Disclaimer</a> ·
+      <a href="https://github.com/kstrat2001/darkmux/blob/main/LICENSE">MIT</a>
+    </div>
+    <div>
+      © Kain Osterholt · <a href="https://substack.com/@DarklyEnergized">Darkly Energized LLC</a>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>
