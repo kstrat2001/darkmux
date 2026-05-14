@@ -224,6 +224,32 @@ This is operator sovereignty (above) applied at the project-shape level: the ope
 
 Tracked as #49.
 
+### Engagement never enters CLI arg surface
+
+Concrete doctrine that follows from the above: **engagement context lives in the frontier orchestrator layer (CLAUDE.md files, skills, conversation). It never becomes a `--engagement <hint>`-style CLI arg on any `darkmux` verb.**
+
+Three reasons the rule is load-bearing:
+
+- **CLI args quantize.** A `--engagement <hint>` field forces the operator to compress a dreamscape into a single string-token. *"wife time"* as a token is worse than *"this is my marriage time, not a work trip — focus on relaxation, no aggressive sightseeing"* threaded through the actual intent text. The frontier carries that nuance natively; the CLI surface cannot.
+- **Admin agents are the wrong tier for engagement interpretation.** A 4B mission-compiler asked to *"interpret the operator's relationship to this engagement"* is the capability mismatch the admin-vs-specialist split (Beat 21 / role-families) exists to prevent. Engagement nuance interpretation is judgment-bearing work that belongs to the frontier — never to an admin agent and never to a CLI arg the admin agent will read.
+- **The frontier already handles it.** *"Plan our Japan trip — focus on relaxation, no aggressive sightseeing, this is for my marriage"* reads richer than `--engagement "wife time"` + `"plan Japan trip"` because the nuance threads through prose, not into a separate enum. A frontier-orchestrator-driven workflow gets engagement-shaping for free; a bare CLI invocation gets it by the operator putting context in the input text itself.
+
+For new CLI verbs that would benefit from "context-aware" output: the operator carries that context into the verb's primary input. No separate `--engagement`, no `--context`, no `--vibe`. If the operator has no frontier orchestrator and wants context-shaping, they write the context into the input prose where the admin agent reads it as part of its bounded structuring job.
+
+### Why the line matters at scale — the lost-in-translation problem
+
+The mechanical reasons above (quantization, capability mismatch, etc.) are downstream of a deeper principle. **The pattern is older than AI:** in any organization, when admins translate vision → tasks, the vision quietly dies in the translation. The admin's role IS narrower — that's why an admin layer can absorb volume — but applying that layer to vision-bearing work is the antipattern. Same dynamic, same failure mode in the AI stack.
+
+What makes the line load-bearing:
+
+- **Engagement is where the *why* lives.** The frontier orchestrator can hold engagements because it can sit in operator context, hold contradictions, and carry nuance across turns. A 4B admin agent can't hold contradictions — it'll resolve them. That resolution is where vision gets lost. A `--engagement "wife time"` flag forces the admin to do that resolution before it has the context to do it well.
+- **The admin AI is the basic planning layer, not the strategic layer.** Capacity-matched to its actual job (bounded inputs, structured outputs, throughput). Asking it to ALSO carry *"what does this mean for the operator's broader life / org / book / engagement"* loads it past its capacity. Even when it produces something, that something is the small-picture compression of the big picture.
+- **The cost scales with org size.** A solo operator can correct admin output in the next turn — the loop is tight enough that drift gets caught. An organization where the admin layer is making decisions BEFORE the operator/frontier sees them is the scenario where *big dreams get eaten alive by small bugs written by admins who don't have capacity yet to hold the big picture vision.* darkmux's admin layer can have exactly that pathology if its scope leaks into engagement territory; the line drawn here is what prevents it.
+
+The frontier orchestrator's role in this layering is named **vision guard** — the layer that protects the operator's engagement-level intent from being compressed before it has been translated into structure the admin can handle. The cultivation discipline (how operators *shape* their frontier to actually hold their vision — CLAUDE.md files, skills, memory, conversation history) is the next-order concern; tracked separately as [#130](https://github.com/kstrat2001/darkmux/issues/130), candidate for Article 4 of the series.
+
+Surfaced 2026-05-14: Sprint 3 of #113 originally added `--engagement` to `darkmux mission propose`; operator caught it pre-merge as a doctrine violation against #49. Removed in the same PR, and the rule made explicit here so future verbs don't re-introduce it. The lost-in-translation framing came from the same exchange — codified here because the *why* is harder to reconstruct from the rule alone, and future verbs that look context-shaped will tempt the same drift.
+
 ## Project posture
 
 **darkmux is an AI-first local-AI orchestrator.** It uses local-AI internally to manage your local-AI workflows. The CLI binary embeds dispatch logic to call into LMStudio-loaded admin agents for structuring, planning, and routine bounded reasoning tasks (compaction, sprint estimation, mission proposal, notebook draft). The frontier-AI orchestrator (your Claude Code, Cursor, or OpenClaw session) remains the strategic reasoner; darkmux operates the local tier as a self-contained capability.
