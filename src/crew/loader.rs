@@ -23,6 +23,7 @@ const BUILTIN_ROLES: &[(&str, &str)] = &[
     ("design-reviewer", include_str!("../../templates/builtin/crew/roles/design-reviewer.json")),
     ("test-designer", include_str!("../../templates/builtin/crew/roles/test-designer.json")),
     ("lab-runner", include_str!("../../templates/builtin/crew/roles/lab-runner.json")),
+    ("mission-compiler", include_str!("../../templates/builtin/crew/roles/mission-compiler.json")),
 ];
 
 /// Capabilities compiled into the binary at build time. Filename = `<id>.json`.
@@ -36,6 +37,7 @@ const BUILTIN_CAPABILITIES: &[(&str, &str)] = &[
     ("voice-editing", include_str!("../../templates/builtin/crew/capabilities/voice-editing.json")),
     ("lab-running", include_str!("../../templates/builtin/crew/capabilities/lab-running.json")),
     ("design-reviewing", include_str!("../../templates/builtin/crew/capabilities/design-reviewing.json")),
+    ("mission-compiling", include_str!("../../templates/builtin/crew/capabilities/mission-compiling.json")),
 ];
 
 /// Role system prompts (`.md`) compiled into the binary. Used as the
@@ -46,6 +48,7 @@ const BUILTIN_ROLE_PROMPTS: &[(&str, &str)] = &[
     ("coder", include_str!("../../templates/builtin/crew/roles/coder.md")),
     ("scribe", include_str!("../../templates/builtin/crew/roles/scribe.md")),
     ("code-reviewer", include_str!("../../templates/builtin/crew/roles/code-reviewer.md")),
+    ("mission-compiler", include_str!("../../templates/builtin/crew/roles/mission-compiler.md")),
 ];
 
 /// Missions compiled into the binary at build time.
@@ -405,5 +408,18 @@ mod tests {
             np.prompt_path.is_none(),
             "prompt_path should be None when .md doesn't exist"
         );
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn mission_compiler_role_loads_correctly() {
+        let _guard = CrewDirGuard::new(TempDir::new().unwrap());
+        // No user files written — loader should fall through to builtin mission-compiler.
+        let roles = load_roles().unwrap();
+        let mc = roles.iter().find(|r| r.id == "mission-compiler").expect("builtin mission-compiler should load");
+        assert_eq!(mc.id, "mission-compiler");
+        assert_eq!(mc.capabilities, vec!["mission-compiling".to_string()]);
+        assert_eq!(mc.tool_palette.allow, vec!["read".to_string()]);
+        assert_eq!(mc.tool_palette.deny, vec!["edit", "write", "exec", "process"]);
     }
 }

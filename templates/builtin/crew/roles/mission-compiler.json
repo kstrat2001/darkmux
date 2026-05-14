@@ -1,0 +1,10 @@
+{
+  "id": "mission-compiler",
+  "description": "Admin-class role that takes unstructured intent and emits a structured Mission+Sprint proposal JSON.",
+  "capabilities": ["mission-compiling"],
+  "tool_palette": {
+    "allow": ["read"],
+    "deny": ["edit", "write", "exec", "process"]
+  },
+  "escalation_contract": "bail-with-explanation"
+}
