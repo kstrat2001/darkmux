@@ -114,9 +114,21 @@ pub fn nudge_if_daemon_unreachable(verb_hint: &str) {
 /// Grace period (seconds) between receiving a shutdown signal and
 /// force-exiting the process. SSE streams hold connections open
 /// indefinitely; axum's graceful shutdown would otherwise block forever
-/// waiting for them to drain. Exposed as a const so the integration
-/// test can assert against it.
+/// waiting for them to drain.
 pub const SHUTDOWN_GRACE_SECS: u64 = 3;
+
+// Compile-time bounds: drift outside this range is the painful state
+// #121 fixed (operator hammering Ctrl-C / killing PID by hand at the
+// long end; killing clean disconnects mid-flight at the short end).
+// Build fails here if a future change pushes the const out of range.
+const _: () = assert!(
+    SHUTDOWN_GRACE_SECS <= 5,
+    "SHUTDOWN_GRACE_SECS too long — operators will fall back to kill <pid>"
+);
+const _: () = assert!(
+    SHUTDOWN_GRACE_SECS >= 1,
+    "SHUTDOWN_GRACE_SECS too short — clean disconnects deserve a beat"
+);
 
 /// Build the lines of the startup banner. Factored out so tests can
 /// assert content without spawning the daemon.
@@ -868,18 +880,4 @@ mod tests {
         assert!(!joined.contains("crew root not found"), "no crew warning");
     }
 
-    #[test]
-    fn shutdown_grace_secs_is_short_enough_to_feel_responsive() {
-        // Operators expect Ctrl-C to feel like Ctrl-C. Anything beyond
-        // ~5s and people start hammering it / killing the PID by hand,
-        // which is the exact pain #121 was filed to fix.
-        assert!(
-            SHUTDOWN_GRACE_SECS <= 5,
-            "grace period {SHUTDOWN_GRACE_SECS}s is too long — operators will fall back to kill <pid>"
-        );
-        assert!(
-            SHUTDOWN_GRACE_SECS >= 1,
-            "grace period {SHUTDOWN_GRACE_SECS}s is too short — clean disconnects deserve a beat"
-        );
-    }
 }
