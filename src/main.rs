@@ -23,6 +23,7 @@ mod runtime;
 mod serve;
 mod skills;
 mod external;
+mod mission_propose;
 mod flow_cli;
 mod role_cli;
 mod sprint_cli;
@@ -395,6 +396,34 @@ enum MissionCmd {
     /// pause occurred even after resuming.
     Resume {
         id: String,
+    },
+    /// Propose a Mission + Sprints from unstructured input (#113 Sprint 3).
+    /// Dispatches the `mission-compiler` admin agent against the input,
+    /// renders the proposal to the operator for approve/edit/reject/regen,
+    /// and writes the JSONs only after approval. The operator approval
+    /// gate is non-negotiable per operator-sovereignty (#44).
+    #[command(group(
+        clap::ArgGroup::new("input_source").required(true).multiple(false)
+    ))]
+    Propose {
+        /// Read the unstructured input from stdin. Useful for piping:
+        /// `pbpaste | darkmux mission propose --from-stdin`.
+        #[arg(long, group = "input_source")]
+        from_stdin: bool,
+        /// Read the unstructured input from a file path.
+        #[arg(long, group = "input_source", value_name = "PATH")]
+        from_file: Option<std::path::PathBuf>,
+        /// Engagement context hint (e.g. "wife time" or "darkmux"). Used
+        /// by the mission-compiler to shape tone/structure. If omitted,
+        /// the verb prompts interactively for one.
+        #[arg(long)]
+        engagement: Option<String>,
+        /// Bypass the interactive approval flow and accept the first
+        /// proposal as-is. Defaults to false — operator-approval gate
+        /// is mandatory by default. Provided for non-interactive
+        /// pipelines and tests.
+        #[arg(long)]
+        yes: bool,
     },
     /// Add a new Sprint to an existing Mission mid-flight (#107).
     /// Operator-sovereign scope growth — alternative to either hand-
@@ -976,6 +1005,9 @@ fn cmd_mission(sub: MissionCmd) -> Result<i32> {
             let m = crew::lifecycle::mission_resume(&id)?;
             println!("mission `{}` → Active  (paused_ts preserved: {})", m.id, m.paused_ts.unwrap_or(0));
             Ok(0)
+        }
+        MissionCmd::Propose { from_stdin, from_file, engagement, yes } => {
+            mission_propose::propose(from_stdin, from_file.as_deref(), engagement.as_deref(), yes)
         }
         MissionCmd::AddSprint { mission_id, sprint_id, description, depends_on, after } => {
             let s = crew::lifecycle::add_sprint_to_mission(
