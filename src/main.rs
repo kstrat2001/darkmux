@@ -402,6 +402,13 @@ enum MissionCmd {
     /// renders the proposal to the operator for approve/edit/reject/regen,
     /// and writes the JSONs only after approval. The operator approval
     /// gate is non-negotiable per operator-sovereignty (#44).
+    ///
+    /// Engagement context is intentionally NOT a CLI arg here — see
+    /// CLAUDE.md's "Engagements (operator-defined dreamscapes)" section
+    /// for doctrine. Operators carry engagement nuance into the input
+    /// text itself (where the frontier orchestrator can thread it
+    /// natively); the mission-compiler structures whatever's in the
+    /// input without needing to interpret engagement.
     #[command(group(
         clap::ArgGroup::new("input_source").required(true).multiple(false)
     ))]
@@ -413,11 +420,6 @@ enum MissionCmd {
         /// Read the unstructured input from a file path.
         #[arg(long, group = "input_source", value_name = "PATH")]
         from_file: Option<std::path::PathBuf>,
-        /// Engagement context hint (e.g. "wife time" or "darkmux"). Used
-        /// by the mission-compiler to shape tone/structure. If omitted,
-        /// the verb prompts interactively for one.
-        #[arg(long)]
-        engagement: Option<String>,
         /// Bypass the interactive approval flow and accept the first
         /// proposal as-is. Defaults to false — operator-approval gate
         /// is mandatory by default. Provided for non-interactive
@@ -1006,8 +1008,8 @@ fn cmd_mission(sub: MissionCmd) -> Result<i32> {
             println!("mission `{}` → Active  (paused_ts preserved: {})", m.id, m.paused_ts.unwrap_or(0));
             Ok(0)
         }
-        MissionCmd::Propose { from_stdin, from_file, engagement, yes } => {
-            mission_propose::propose(from_stdin, from_file.as_deref(), engagement.as_deref(), yes)
+        MissionCmd::Propose { from_stdin, from_file, yes } => {
+            mission_propose::propose(from_stdin, from_file.as_deref(), yes)
         }
         MissionCmd::AddSprint { mission_id, sprint_id, description, depends_on, after } => {
             let s = crew::lifecycle::add_sprint_to_mission(

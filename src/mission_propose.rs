@@ -5,14 +5,22 @@
 //! is only persisted to disk after the operator accepts (operator-
 //! sovereignty per #44).
 //!
+//! Engagement context is intentionally NOT a parameter of this verb —
+//! see CLAUDE.md's "Engagements (operator-defined dreamscapes)"
+//! section for doctrine. The frontier orchestrator carries engagement
+//! nuance natively into the input text it crafts; quantizing it into a
+//! CLI arg would (a) compress a dreamscape into a token, (b) push the
+//! interpretation tier onto a 4B admin agent that doesn't have the
+//! shape for it, (c) violate the #49 rule that engagement lives in the
+//! operator-judgment layer above the system.
+//!
 //! Flow:
 //!   1. Read unstructured input (stdin or file)
-//!   2. Resolve engagement context (CLI flag or interactive prompt)
-//!   3. Dispatch internally to `darkmux/mission-compiler`
-//!   4. Parse the proposal JSON from the response (fenced ```json block)
-//!   5. Render a human-readable summary
-//!   6. Prompt operator: approve / edit / reject / regenerate
-//!   7. On approve: write Mission + Sprint JSONs to
+//!   2. Dispatch internally to `darkmux/mission-compiler`
+//!   3. Parse the proposal JSON from the response (fenced ```json block)
+//!   4. Render a human-readable summary
+//!   5. Prompt operator: approve / edit / reject / regenerate
+//!   6. On approve: write Mission + Sprint JSONs to
 //!      `~/.darkmux/crew/missions/` and `~/.darkmux/crew/sprints/`
 
 use anyhow::{anyhow, Context, Result};
@@ -59,7 +67,6 @@ fn default_planned() -> String { "planned".to_string() }
 pub fn propose(
     from_stdin: bool,
     from_file: Option<&std::path::Path>,
-    engagement: Option<&str>,
     yes: bool,
 ) -> Result<i32> {
     // 1. Read input
@@ -68,19 +75,13 @@ pub fn propose(
         return Err(anyhow!("mission propose: empty input — nothing to compile"));
     }
 
-    // 2. Resolve engagement
-    let engagement = match engagement {
-        Some(s) => s.to_string(),
-        None => prompt_engagement()?,
-    };
-
     let mut hint: Option<String> = None;
     loop {
-        // 3. Dispatch
+        // 2. Dispatch
         eprintln!("mission propose: dispatching mission-compiler …");
-        let response = dispatch_compiler(&input, &engagement, hint.as_deref())?;
+        let response = dispatch_compiler(&input, hint.as_deref())?;
 
-        // 4. Parse the proposal
+        // 3. Parse the proposal
         let proposal = match parse_proposal(&response) {
             Ok(p) => p,
             Err(e) => {
@@ -90,10 +91,10 @@ pub fn propose(
             }
         };
 
-        // 5. Render summary
+        // 4. Render summary
         render_proposal(&proposal);
 
-        // 6. Operator decision
+        // 5. Operator decision
         if yes {
             eprintln!("mission propose: --yes flag set, applying without prompt");
             return persist(&proposal);
@@ -133,21 +134,8 @@ fn read_input(
     }
 }
 
-fn prompt_engagement() -> Result<String> {
-    eprint!("engagement context (e.g. \"darkmux\", \"wife time\", \"job hunt\"): ");
-    std::io::stderr().flush().ok();
-    let mut line = String::new();
-    std::io::stdin().lock().read_line(&mut line).context("reading engagement")?;
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        Err(anyhow!("mission propose: engagement required (empty input)"))
-    } else {
-        Ok(trimmed.to_string())
-    }
-}
-
-fn dispatch_compiler(input: &str, engagement: &str, hint: Option<&str>) -> Result<String> {
-    let message = build_compiler_message(input, engagement, hint);
+fn dispatch_compiler(input: &str, hint: Option<&str>) -> Result<String> {
+    let message = build_compiler_message(input, hint);
     let opts = crate::crew::dispatch::DispatchOpts {
         role_id: "mission-compiler".to_string(),
         message,
@@ -162,15 +150,16 @@ fn dispatch_compiler(input: &str, engagement: &str, hint: Option<&str>) -> Resul
     Ok(result.stdout)
 }
 
-/// Build the message the mission-compiler sees. Format chosen for
-/// clarity to the admin agent: the unstructured intent first, then
-/// the engagement, then any regeneration hint.
-fn build_compiler_message(input: &str, engagement: &str, hint: Option<&str>) -> String {
+/// Build the message the mission-compiler sees. The unstructured intent
+/// is the only required content; engagement context lives in the input
+/// itself (operator + frontier orchestrator threaded it there) and is
+/// never carried as a separate field — see CLAUDE.md's Engagements
+/// doctrine.
+fn build_compiler_message(input: &str, hint: Option<&str>) -> String {
     let mut msg = String::new();
     msg.push_str("Unstructured intent:\n---\n");
     msg.push_str(input.trim());
-    msg.push_str("\n---\n\n");
-    msg.push_str(&format!("Engagement context: {engagement}\n"));
+    msg.push_str("\n---\n");
     if let Some(h) = hint {
         msg.push_str("\nOperator-provided regeneration hint (apply this when restructuring):\n---\n");
         msg.push_str(h);
@@ -379,17 +368,31 @@ some epilogue"#;
 
     #[test]
     fn build_compiler_message_includes_hint_when_present() {
-        let msg = build_compiler_message("intent", "darkmux", Some("merge sprints 3 and 4"));
+        let msg = build_compiler_message("intent", Some("merge sprints 3 and 4"));
         assert!(msg.contains("intent"));
-        assert!(msg.contains("darkmux"));
         assert!(msg.contains("merge sprints 3 and 4"));
         assert!(msg.contains("regeneration hint"));
     }
 
     #[test]
     fn build_compiler_message_omits_hint_when_absent() {
-        let msg = build_compiler_message("intent", "darkmux", None);
+        let msg = build_compiler_message("intent", None);
         assert!(msg.contains("intent"));
         assert!(!msg.contains("regeneration hint"));
+    }
+
+    #[test]
+    fn build_compiler_message_never_mentions_engagement() {
+        // Doctrine regression guard: engagement context lives in the
+        // frontier orchestrator layer per CLAUDE.md, never in the
+        // mission-compiler's message scaffold. If a future change
+        // re-introduces a separate `engagement` arg or string in the
+        // builder, this test catches it.
+        let msg = build_compiler_message("plan a trip — relaxation focus, no work", None);
+        let lower = msg.to_lowercase();
+        assert!(
+            !lower.contains("engagement context:"),
+            "engagement must not be a labeled field in the compiler message"
+        );
     }
 }
