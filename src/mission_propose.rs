@@ -92,6 +92,17 @@ pub fn propose(
             }
         };
 
+        // 3b. Validate cross-references inside the proposal. A
+        // hallucinated mission_id, missing sprint_id, or dangling
+        // depends_on slips through serde happily but lands a broken
+        // mission on disk. Surface it now so the operator can hit `e`
+        // and regenerate with a hint instead of debugging the viewer.
+        if let Err(e) = validate_proposal_invariants(&proposal) {
+            eprintln!("mission propose: proposal failed validation: {e}");
+            eprintln!("--- raw response ---\n{response}\n--- end response ---");
+            return Err(anyhow!("mission propose: invalid proposal cross-references"));
+        }
+
         // 4. Render summary
         render_proposal(&proposal);
 
@@ -180,6 +191,55 @@ fn parse_proposal(response: &str) -> Result<Proposal> {
     serde_json::from_str(&json_str).with_context(|| format!("parsing proposal JSON:\n{json_str}"))
 }
 
+/// Validate cross-references inside a Proposal so a hallucinated /
+/// drifted admin-agent output can't land on disk as a broken
+/// mission+sprints set. `add_sprint_to_mission` already enforces these
+/// invariants for the mid-flight add-sprint path; `propose` should hold
+/// the same bar at first-write time. Three checks:
+///
+///   - Every `sprints[].mission_id` matches `mission.id`
+///   - Every entry in `mission.sprint_ids` exists as a `sprints[].id`
+///   - Every `sprints[].depends_on` value references an in-proposal id
+///
+/// Returns a readable error so the operator can hit `e` to regenerate
+/// with a hint instead of having to discover the problem post-persist
+/// in the viewer's sprint-progress widget.
+fn validate_proposal_invariants(p: &Proposal) -> Result<()> {
+    let sprint_ids: std::collections::HashSet<&str> =
+        p.sprints.iter().map(|s| s.id.as_str()).collect();
+
+    for s in &p.sprints {
+        if s.mission_id != p.mission.id {
+            return Err(anyhow!(
+                "proposal invariant: sprint `{}` has mission_id `{}` but mission is `{}`",
+                s.id,
+                s.mission_id,
+                p.mission.id
+            ));
+        }
+        for dep in &s.depends_on {
+            if !sprint_ids.contains(dep.as_str()) {
+                return Err(anyhow!(
+                    "proposal invariant: sprint `{}` depends_on `{}` which is not in the proposal",
+                    s.id,
+                    dep
+                ));
+            }
+        }
+    }
+
+    for sid in &p.mission.sprint_ids {
+        if !sprint_ids.contains(sid.as_str()) {
+            return Err(anyhow!(
+                "proposal invariant: mission.sprint_ids references `{}` which is not in sprints[]",
+                sid
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Find the first ```json … ``` fenced block (or just the first ``` …
 /// ``` if no language tag) and return its inner content. Forgiving
 /// about whitespace/case for the language tag.
@@ -237,7 +297,17 @@ fn prompt_decision() -> Result<Decision> {
     eprint!("Approve [y] · Edit/regenerate with hint [e] · Reject [n]: ");
     std::io::stderr().flush().ok();
     let mut line = String::new();
-    std::io::stdin().lock().read_line(&mut line).context("reading decision")?;
+    let bytes = std::io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .context("reading decision")?;
+    // EOF (Ctrl-D, closed-stdin pipe, etc.) reads 0 bytes. Treat as a
+    // clean reject so operators don't see a confusing
+    // "unrecognized decision" on what was effectively a cancel.
+    if bytes == 0 {
+        eprintln!("\nmission propose: no decision (EOF) — treating as reject");
+        return Ok(Decision::Reject);
+    }
     match line.trim().to_lowercase().chars().next() {
         Some('y') => Ok(Decision::Approve),
         Some('n') => Ok(Decision::Reject),
@@ -245,7 +315,15 @@ fn prompt_decision() -> Result<Decision> {
             eprint!("Hint (one line): ");
             std::io::stderr().flush().ok();
             let mut hint = String::new();
-            std::io::stdin().lock().read_line(&mut hint).context("reading hint")?;
+            let hbytes = std::io::stdin()
+                .lock()
+                .read_line(&mut hint)
+                .context("reading hint")?;
+            if hbytes == 0 {
+                // EOF mid-hint — same posture as the main prompt EOF.
+                eprintln!("\nmission propose: no hint (EOF) — treating as reject");
+                return Ok(Decision::Reject);
+            }
             let trimmed = hint.trim().to_string();
             if trimmed.is_empty() {
                 Err(anyhow!("regenerate requires a non-empty hint"))
@@ -296,24 +374,60 @@ fn persist(p: &Proposal) -> Result<i32> {
         }
     }
 
-    // Write everything (mission first, then sprints).
-    let mission_json = serde_json::to_string_pretty(&mission).context("serializing mission")?;
-    std::fs::write(&mission_path, format!("{mission_json}\n"))
-        .with_context(|| format!("writing {}", mission_path.display()))?;
-    println!("wrote mission: {}", mission_path.display());
-
-    for s in &p.sprints {
-        let mut sprint = s.clone();
-        if sprint.created_ts == 0 { sprint.created_ts = now; }
-        let sp = sprints_dir.join(format!("{}.json", sprint.id));
-        let sprint_json = serde_json::to_string_pretty(&sprint).context("serializing sprint")?;
-        std::fs::write(&sp, format!("{sprint_json}\n"))
-            .with_context(|| format!("writing {}", sp.display()))?;
-        println!("wrote sprint:  {}", sp.display());
+    // Atomic-ish persist: track every file we land on disk, and if any
+    // write later in the sequence fails, roll back the earlier ones so
+    // a partial-failure mid-loop (disk full, EPERM, signal) doesn't
+    // leave the operator with a half-written mission whose retry
+    // confusingly fails on the no-overwrite gate.
+    let mut written: Vec<std::path::PathBuf> = Vec::new();
+    let result = write_all(p, &mission, &mission_path, &sprints_dir, now, &mut written);
+    if let Err(e) = result {
+        for path in &written {
+            let _ = std::fs::remove_file(path);
+        }
+        eprintln!(
+            "mission propose: write failed mid-flight — rolled back {} file(s); state on disk matches pre-call",
+            written.len()
+        );
+        return Err(e);
     }
 
     eprintln!("mission propose: persisted {} mission + {} sprints", 1, p.sprints.len());
     Ok(0)
+}
+
+/// Inner write loop, factored so persist() can roll back on any failure.
+/// Pushes each successfully-written path into `written` BEFORE moving
+/// on to the next write — so the rollback in persist() sees only files
+/// that actually landed.
+fn write_all(
+    p: &Proposal,
+    mission: &ProposedMission,
+    mission_path: &std::path::Path,
+    sprints_dir: &std::path::Path,
+    now: u64,
+    written: &mut Vec<std::path::PathBuf>,
+) -> Result<()> {
+    let mission_json = serde_json::to_string_pretty(mission).context("serializing mission")?;
+    std::fs::write(mission_path, format!("{mission_json}\n"))
+        .with_context(|| format!("writing {}", mission_path.display()))?;
+    written.push(mission_path.to_path_buf());
+    println!("wrote mission: {}", mission_path.display());
+
+    for s in &p.sprints {
+        let mut sprint = s.clone();
+        if sprint.created_ts == 0 {
+            sprint.created_ts = now;
+        }
+        let sp = sprints_dir.join(format!("{}.json", sprint.id));
+        let sprint_json = serde_json::to_string_pretty(&sprint).context("serializing sprint")?;
+        std::fs::write(&sp, format!("{sprint_json}\n"))
+            .with_context(|| format!("writing {}", sp.display()))?;
+        written.push(sp.clone());
+        println!("wrote sprint:  {}", sp.display());
+    }
+
+    Ok(())
 }
 
 /// Helper that persists a proposal and optionally starts the mission.
@@ -334,6 +448,68 @@ fn persist_and_maybe_start(p: &Proposal, start: bool) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    /// RAII guard that points `DARKMUX_CREW_DIR` at a TempDir for the
+    /// test's duration, then restores the previous value (or unsets it)
+    /// on drop. Mirrors the `CrewDirGuard` in `src/crew/loader.rs` —
+    /// inlined here because that one is `#[cfg(test)]` inside its own
+    /// module and not reachable from a sibling crate module. Every
+    /// test using this guard MUST also be `#[serial_test::serial]`
+    /// because env-var mutation is a global concern.
+    struct CrewDirGuard {
+        prev: Option<String>,
+        _tmp: TempDir,
+    }
+
+    impl CrewDirGuard {
+        fn new(tmp: TempDir) -> Self {
+            let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+            // SAFETY: serialized via #[serial_test::serial] on every caller.
+            unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()); }
+            Self { prev, _tmp: tmp }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            self._tmp.path()
+        }
+    }
+
+    impl Drop for CrewDirGuard {
+        fn drop(&mut self) {
+            // SAFETY: serialized via #[serial_test::serial] on every caller.
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
+                    None => std::env::remove_var("DARKMUX_CREW_DIR"),
+                }
+            }
+        }
+    }
+
+    /// Minimal valid Proposal for tests. Adjust fields per-test as needed.
+    fn sample_proposal(mission_id: &str, sprint_ids: &[&str]) -> Proposal {
+        Proposal {
+            mission: ProposedMission {
+                id: mission_id.to_string(),
+                description: "test mission".to_string(),
+                status: "active".to_string(),
+                sprint_ids: sprint_ids.iter().map(|s| s.to_string()).collect(),
+                created_ts: 0,
+            },
+            sprints: sprint_ids
+                .iter()
+                .map(|sid| ProposedSprint {
+                    id: sid.to_string(),
+                    mission_id: mission_id.to_string(),
+                    description: format!("sprint {sid}"),
+                    status: "planned".to_string(),
+                    depends_on: Vec::new(),
+                    created_ts: 0,
+                })
+                .collect(),
+        }
+    }
 
     #[test]
     fn extract_json_block_finds_fenced_block() {
@@ -411,47 +587,105 @@ some epilogue"#;
         );
     }
 
+    #[serial_test::serial]
     #[test]
     fn persist_fails_on_existing_mission() {
-        // Regression test: verify that persist returns an error when the
-        // mission file already exists. This ensures persist_and_maybe_start
-        // won't call mission_start on a duplicate proposal.
-        use std::fs;
+        // Regression: persist must refuse to overwrite an existing
+        // mission file so a duplicate proposal can't clobber operator
+        // state. Wrapped in CrewDirGuard so the test runs in an
+        // isolated TempDir — earlier version of this test wrote into
+        // the operator's REAL ~/.darkmux/crew/missions/ which was a
+        // footgun on every CI run.
+        let guard = CrewDirGuard::new(TempDir::new().unwrap());
+        let missions_dir = guard.path().join("missions");
+        std::fs::create_dir_all(&missions_dir).unwrap();
 
-        let crew_root = crate::crew::loader::crew_root();
-        let missions_dir = crew_root.join("missions");
+        let existing_path = missions_dir.join("test-existing-mission.json");
+        std::fs::write(&existing_path, r#"{"id":"test-existing-mission","description":"existing","status":"active","sprint_ids":[],"created_ts":0}"#)
+            .expect("writing existing mission");
 
-        // Create the mission file manually
-        let test_mission_id = "test-existing-mission";
-        fs::create_dir_all(&missions_dir).ok();
-        let mission_path = missions_dir.join(format!("{}.json", test_mission_id));
-        let existing_content = r#"{
-  "id": "test-existing-mission",
-  "description": "existing mission",
-  "status": "active",
-  "sprint_ids": [],
-  "created_ts": 0
-}
-"#;
-        fs::write(&mission_path, existing_content).expect("writing test mission");
-
-        // Create a proposal with the same id
-        let proposal = Proposal {
-            mission: ProposedMission {
-                id: test_mission_id.to_string(),
-                description: "new proposal".to_string(),
-                status: "active".to_string(),
-                sprint_ids: vec![],
-                created_ts: 0,
-            },
-            sprints: vec![],
-        };
-
-        // Assert that persist fails
+        let proposal = sample_proposal("test-existing-mission", &[]);
         let err = persist(&proposal).expect_err("persist should fail for existing mission");
         assert!(err.to_string().contains("already exists"));
+    }
 
-        // Cleanup: remove the test file we created
-        fs::remove_file(&mission_path).ok();
+    #[serial_test::serial]
+    #[test]
+    fn persist_rolls_back_mission_when_sprint_write_fails() {
+        // Atomicity regression: if a sprint write fails mid-loop, the
+        // mission file + any earlier sprint files must be cleaned up
+        // so the operator's retry sees a clean slate.
+        //
+        // To trigger the failure DURING the write loop (not in the
+        // pre-flight `.exists()` check), the second sprint's id
+        // contains a `/`, so its target path is
+        // `<sprints_dir>/deep/test-s2.json` whose parent directory
+        // (`deep/`) doesn't exist. `.exists()` returns false on the
+        // full path (pre-flight passes); `std::fs::write` returns
+        // ENOENT during the loop (rollback fires).
+        //
+        // The slashed-id smell is acknowledged — sprint ids with `/`
+        // should arguably be rejected by `validate_proposal_invariants`
+        // as a path-traversal vector. Future hardening; tests-only
+        // use of the form is fine.
+        let guard = CrewDirGuard::new(TempDir::new().unwrap());
+        let missions_dir = guard.path().join("missions");
+        let sprints_dir = guard.path().join("sprints");
+        std::fs::create_dir_all(&sprints_dir).unwrap();
+
+        let proposal = sample_proposal("test-rollback", &["test-s1", "deep/test-s2"]);
+
+        let err = persist(&proposal).expect_err("persist should fail mid-loop");
+        assert!(
+            err.to_string().contains("writing"),
+            "expected a write error, got: {err}"
+        );
+
+        // Mission file and the first sprint file must both be cleaned up.
+        let mission_path = missions_dir.join("test-rollback.json");
+        let sprint1_path = sprints_dir.join("test-s1.json");
+        assert!(
+            !mission_path.exists(),
+            "mission file should have been rolled back; found {}",
+            mission_path.display()
+        );
+        assert!(
+            !sprint1_path.exists(),
+            "sprint 1 file should have been rolled back; found {}",
+            sprint1_path.display()
+        );
+    }
+
+    #[test]
+    fn validate_proposal_accepts_well_formed() {
+        let p = sample_proposal("m1", &["s1", "s2"]);
+        validate_proposal_invariants(&p).expect("well-formed proposal should pass");
+    }
+
+    #[test]
+    fn validate_proposal_rejects_dangling_sprint_id_in_mission() {
+        let mut p = sample_proposal("m1", &["s1"]);
+        // Add a sprint_id to the mission that doesn't exist in sprints[].
+        p.mission.sprint_ids.push("ghost".to_string());
+        let err = validate_proposal_invariants(&p).expect_err("should reject dangling sprint_id");
+        assert!(err.to_string().contains("ghost"));
+    }
+
+    #[test]
+    fn validate_proposal_rejects_dangling_depends_on() {
+        let mut p = sample_proposal("m1", &["s1"]);
+        // Reference a non-existent sprint id in depends_on.
+        p.sprints[0].depends_on = vec!["missing".to_string()];
+        let err = validate_proposal_invariants(&p).expect_err("should reject dangling depends_on");
+        assert!(err.to_string().contains("missing"));
+    }
+
+    #[test]
+    fn validate_proposal_rejects_mismatched_mission_id() {
+        let mut p = sample_proposal("m1", &["s1"]);
+        // Make a sprint claim a different mission_id than the mission's id.
+        p.sprints[0].mission_id = "other-mission".to_string();
+        let err = validate_proposal_invariants(&p).expect_err("should reject mismatched mission_id");
+        assert!(err.to_string().contains("other-mission"));
     }
 }
