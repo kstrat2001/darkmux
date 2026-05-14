@@ -320,3 +320,45 @@ fn notebook_list_no_dir() {
         .failure()
         .stdout(predicate::str::contains("no notebook directory found"));
 }
+
+/// `external pull --stdin` echoes stdin to stdout. The other two plugins
+/// (`--gh`, `--url`) shell out to `gh`/`curl` and aren't reliable to
+/// exercise in CI; their dispatch routing is covered by unit tests in
+/// `src/external/mod.rs`.
+#[test]
+fn external_pull_stdin_passes_through() {
+    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    cmd.arg("external")
+        .arg("pull")
+        .arg("--stdin")
+        .write_stdin("hello from #113")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hello from #113"));
+}
+
+/// `external pull` with no source flag fails with a clap-level error.
+#[test]
+fn external_pull_requires_a_source() {
+    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    cmd.arg("external")
+        .arg("pull")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("required"));
+}
+
+/// `external pull --gh ... --stdin` fails because the flags are
+/// mutually exclusive (clap enforces this via the `source` ArgGroup).
+#[test]
+fn external_pull_rejects_multiple_sources() {
+    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    cmd.arg("external")
+        .arg("pull")
+        .arg("--gh")
+        .arg("https://example.invalid/issues/1")
+        .arg("--stdin")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+}
