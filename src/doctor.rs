@@ -651,12 +651,13 @@ fn classify_version_vs_latest(installed: &str, latest: &str, name: &str) -> Chec
                 name: name.into(),
                 status,
                 message: format!("v{installed} → v{latest} ({label})"),
-                hint: Some(format!(
+                hint: Some(
                     "update with `git pull && cargo install --path . --force` in your darkmux checkout, \
                      or grab the latest release tarball from \
                      https://github.com/kstrat2001/darkmux/releases/latest. \
                      (set DARKMUX_CHECK_UPDATES=0 to silence this check.)"
-                )),
+                        .to_string(),
+                ),
             }
         }
     }
