@@ -82,6 +82,7 @@ pub fn run() -> DoctorReport {
         check_profile_loaded_match(),
         check_runtime_command(),
         check_runtime_version(),
+        check_darkmux_version_vs_latest_release(),
         check_daemon_reachable(),
         check_ram_headroom(),
         check_ram_headroom_load_projection(),
@@ -528,6 +529,156 @@ fn check_runtime_version() -> Check {
             ),
         }
     }
+}
+
+// ─── darkmux version vs latest GitHub release (issue #13) ─────────────
+
+const DARKMUX_RELEASES_URL: &str =
+    "https://api.github.com/repos/kstrat2001/darkmux/releases/latest";
+/// curl timeout in seconds. Short so the check doesn't stall `darkmux
+/// doctor` on a flaky network — `(skipped: offline)` is the right
+/// outcome here, not a long block.
+const DARKMUX_RELEASE_FETCH_TIMEOUT_SECS: &str = "5";
+
+/// Operator-facing doctor check: is the installed `darkmux` behind the
+/// latest GitHub release? Network-touched; opt-out via
+/// `DARKMUX_CHECK_UPDATES=0` for offline/CI environments.
+///
+/// Verdict tiers (per issue #13's spec):
+///   - Pass — installed == latest, or installed > latest (dev build)
+///   - Warn — installed < latest (minor / patch behind)
+///   - Fail — installed < latest (major behind — schema break possible)
+///   - Pass (skipped) — opt-out, offline, no releases tagged yet, or
+///     the response was unparseable
+fn check_darkmux_version_vs_latest_release() -> Check {
+    const NAME: &str = "darkmux version vs latest release";
+    let skip = |reason: &str| Check {
+        name: NAME.into(),
+        status: Status::Pass,
+        message: format!("(skipped: {reason})"),
+        hint: None,
+    };
+    let installed = env!("CARGO_PKG_VERSION");
+
+    // Operator-respect: explicit opt-out beats the network call.
+    match env::var("DARKMUX_CHECK_UPDATES").as_deref() {
+        Ok("0") | Ok("false") | Ok("no") => return skip("DARKMUX_CHECK_UPDATES=0"),
+        _ => {}
+    }
+
+    match fetch_latest_release_tag() {
+        Ok(latest) => classify_version_vs_latest(installed, &latest, NAME),
+        Err(reason) => skip(&reason),
+    }
+}
+
+/// Shell out to `curl` for the GitHub releases API. Avoids adding a
+/// reqwest-class dep for a single GET — `curl` is on every macOS and
+/// most Linux installs by default. CLAUDE.md: "Don't add dependencies
+/// casually."
+fn fetch_latest_release_tag() -> Result<String, String> {
+    let output = Command::new("curl")
+        .args([
+            "-sL",
+            "--max-time",
+            DARKMUX_RELEASE_FETCH_TIMEOUT_SECS,
+            "-H",
+            "User-Agent: darkmux-doctor",
+            "-H",
+            "Accept: application/vnd.github+json",
+            DARKMUX_RELEASES_URL,
+        ])
+        .output()
+        .map_err(|e| format!("couldn't invoke `curl`: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "curl exit {}",
+            output.status.code().unwrap_or(-1)
+        ));
+    }
+    let body = String::from_utf8_lossy(&output.stdout);
+    if body.trim().is_empty() {
+        return Err("offline / empty response".into());
+    }
+    let json: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("response parse: {e}"))?;
+    // GitHub returns `{"message": "Not Found"}` for repos that have no
+    // releases tagged. Match it explicitly so the operator sees an
+    // honest "no releases tagged yet" rather than a parse error.
+    if let Some(msg) = json.get("message").and_then(|v| v.as_str()) {
+        if msg.eq_ignore_ascii_case("not found") {
+            return Err("no releases tagged yet".into());
+        }
+        return Err(format!("github api: {msg}"));
+    }
+    let tag = json
+        .get("tag_name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing `tag_name` in response".to_string())?;
+    Ok(tag.trim_start_matches('v').to_string())
+}
+
+/// Pure verdict logic — extracted so tests pin the matrix without a
+/// network round-trip. `installed` and `latest` are the bare semver
+/// strings (no `v` prefix); `name` is the doctor-check label so the
+/// function can build a fully-shaped `Check` directly.
+fn classify_version_vs_latest(installed: &str, latest: &str, name: &str) -> Check {
+    let (Some(inst), Some(lat)) = (parse_semver(installed), parse_semver(latest)) else {
+        return Check {
+            name: name.into(),
+            status: Status::Pass,
+            message: format!(
+                "(skipped: couldn't parse semver — installed={installed}, latest={latest})"
+            ),
+            hint: None,
+        };
+    };
+    match inst.cmp(&lat) {
+        std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => Check {
+            name: name.into(),
+            status: Status::Pass,
+            message: format!("v{installed} (latest released: v{latest})"),
+            hint: None,
+        },
+        std::cmp::Ordering::Less => {
+            let major_behind = inst.0 < lat.0;
+            let (status, label) = if major_behind {
+                (Status::Fail, "major version behind — schema break possible")
+            } else {
+                (Status::Warn, "minor/patch behind")
+            };
+            Check {
+                name: name.into(),
+                status,
+                message: format!("v{installed} → v{latest} ({label})"),
+                hint: Some(
+                    "update with `git pull && cargo install --path . --force` in your darkmux checkout, \
+                     or grab the latest release tarball from \
+                     https://github.com/kstrat2001/darkmux/releases/latest. \
+                     (set DARKMUX_CHECK_UPDATES=0 to silence this check.)"
+                        .to_string(),
+                ),
+            }
+        }
+    }
+}
+
+/// Tolerant semver parser — drops `v` prefix, parses major.minor.patch
+/// as `u32`, ignores any pre-release / build-metadata suffix on the
+/// patch segment. `0.4.0-beta.1` parses as `(0, 4, 0)`.
+fn parse_semver(s: &str) -> Option<(u32, u32, u32)> {
+    let s = s.trim().trim_start_matches('v');
+    let mut parts = s.splitn(3, '.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch_seg = parts.next()?;
+    // Strip pre-release / build-metadata so e.g. `0-beta.1` reads as `0`.
+    let patch_digits: String = patch_seg
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    let patch = patch_digits.parse().ok()?;
+    Some((major, minor, patch))
 }
 
 /// Default headroom we reserve outside the AI working set — covers macOS
@@ -1405,11 +1556,79 @@ mod tests {
     #[test]
     fn run_returns_static_plus_eureka_checks() {
         let r = run();
-        // 12 baseline checks (incl. runtime version + load projection + daemon reachable) +
+        // 13 baseline checks (incl. runtime version + load projection +
+        // daemon reachable + darkmux-version-vs-latest-release [#13]) +
         // one per active eureka rule. Every check should appear regardless
         // of environment — even if the underlying probe couldn't read state.
-        let expected = 12 + crate::eureka::all_rules().len();
+        let expected = 13 + crate::eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
+    }
+
+    // ─── parse_semver / classify_version_vs_latest (issue #13) ───────────
+    const VERSION_CHECK_NAME: &str = "darkmux version vs latest release";
+
+    #[test]
+    fn parse_semver_strips_v_prefix_and_metadata() {
+        assert_eq!(parse_semver("0.4.0"), Some((0, 4, 0)));
+        assert_eq!(parse_semver("v0.4.0"), Some((0, 4, 0)));
+        assert_eq!(parse_semver("v1.2.3"), Some((1, 2, 3)));
+        // Pre-release suffix on patch is stripped to the leading digits.
+        assert_eq!(parse_semver("0.4.0-beta.1"), Some((0, 4, 0)));
+        assert_eq!(parse_semver("1.0.5-rc1+build.42"), Some((1, 0, 5)));
+        // Trim whitespace, tolerate "v" + spaces.
+        assert_eq!(parse_semver("  v0.4.0\n"), Some((0, 4, 0)));
+        // Malformed inputs → None (caller renders a skipped check).
+        assert_eq!(parse_semver("not-a-version"), None);
+        assert_eq!(parse_semver("0.4"), None);
+        assert_eq!(parse_semver(""), None);
+    }
+
+    #[test]
+    fn version_vs_latest_passes_when_installed_matches_latest() {
+        let c = classify_version_vs_latest("0.4.0", "0.4.0", VERSION_CHECK_NAME);
+        assert_eq!(c.status, Status::Pass);
+        assert!(c.message.contains("v0.4.0"));
+        assert!(c.message.contains("latest released: v0.4.0"));
+        assert!(c.hint.is_none());
+    }
+
+    #[test]
+    fn version_vs_latest_passes_when_installed_is_ahead() {
+        // Dev build ahead of last release — Pass (no upgrade nag).
+        let c = classify_version_vs_latest("0.5.0", "0.4.0", VERSION_CHECK_NAME);
+        assert_eq!(c.status, Status::Pass);
+    }
+
+    #[test]
+    fn version_vs_latest_warns_when_minor_behind() {
+        let c = classify_version_vs_latest("0.3.5", "0.4.0", VERSION_CHECK_NAME);
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.message.contains("minor/patch"));
+        let hint = c.hint.as_deref().unwrap_or("");
+        assert!(hint.contains("git pull"));
+        assert!(hint.contains("DARKMUX_CHECK_UPDATES=0"));
+    }
+
+    #[test]
+    fn version_vs_latest_warns_when_patch_behind() {
+        let c = classify_version_vs_latest("0.4.0", "0.4.3", VERSION_CHECK_NAME);
+        assert_eq!(c.status, Status::Warn);
+    }
+
+    #[test]
+    fn version_vs_latest_fails_when_major_behind() {
+        let c = classify_version_vs_latest("0.4.0", "1.0.0", VERSION_CHECK_NAME);
+        assert_eq!(c.status, Status::Fail);
+        assert!(c.message.contains("major version behind"));
+        assert!(c.message.contains("schema break"));
+    }
+
+    #[test]
+    fn version_vs_latest_skips_when_either_side_unparseable() {
+        let c = classify_version_vs_latest("not-a-version", "0.4.0", VERSION_CHECK_NAME);
+        assert_eq!(c.status, Status::Pass);
+        assert!(c.message.contains("skipped"));
+        assert!(c.message.contains("couldn't parse semver"));
     }
 
     #[test]
