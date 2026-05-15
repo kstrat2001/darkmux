@@ -606,16 +606,30 @@ fn eval_memory_headroom(ctx: &Context) -> Verdict {
 ///   `"lmstudio/darkmux:qwen3.6-35b-a3b"` → `"qwen3.6-35b-a3b"`
 ///   `"darkmux:foo"` → `"foo"`
 ///   `"foo"` → `"foo"`
+///   `"lmstudio/openai/gpt-oss-20b"` → `"openai/gpt-oss-20b"`
+///   `"lmstudio/darkmux:openai/gpt-oss-20b"` → `"openai/gpt-oss-20b"`
 ///
-/// Assumes LMStudio's `modelKey` is a bare slug (no embedded `/`). Today
-/// that's the contract (see `lms.rs::meta_from_json`); if LMStudio ever
-/// surfaces HuggingFace-style `owner/repo` keys verbatim through
-/// `modelKey`, this strip becomes lossy and the rule's match logic needs
-/// to switch to a longest-suffix comparison.
+/// LMStudio's `modelKey` is the publisher-prefixed form (`openai/gpt-oss-20b`,
+/// `google/gemma-3-4b`) — see `lms.rs::list_available`. The earlier
+/// `rsplit('/').next()` implementation over-stripped when the model id
+/// included a publisher segment, so any pin pointing at an LMStudio model
+/// with a publisher prefix would falsely fail the orphan check.
 fn strip_model_id_prefixes(id: &str) -> &str {
-    let after_provider = id.rsplit('/').next().unwrap_or(id);
+    let after_provider = KNOWN_PROVIDER_PREFIXES
+        .iter()
+        .find_map(|p| id.strip_prefix(p))
+        .unwrap_or(id);
     after_provider.strip_prefix("darkmux:").unwrap_or(after_provider)
 }
+
+// Provider tokens openclaw uses for routing — split from the model id
+// itself so a `<publisher>/<model>` pair (the standard LMStudio catalog
+// shape) survives. Add to this list when openclaw gains a new provider.
+const KNOWN_PROVIDER_PREFIXES: &[&str] = &[
+    "lmstudio/",
+    "ollama/",
+    "openrouter/",
+];
 
 /// Pure verdict logic for the `agents-default-model-resolves` check.
 /// Extracted so we can unit-test prefix-stripping + the downloaded/missing
@@ -846,9 +860,58 @@ mod tests {
         assert_eq!(strip_model_id_prefixes("darkmux:foo-bar"), "foo-bar");
         assert_eq!(strip_model_id_prefixes("lmstudio/foo-bar"), "foo-bar");
         assert_eq!(strip_model_id_prefixes("foo-bar"), "foo-bar");
-        // Provider prefix that isn't lmstudio still strips — the contract
-        // is "everything before the last `/`", not "lmstudio specifically".
+        // Known non-lmstudio provider prefixes also strip.
         assert_eq!(strip_model_id_prefixes("ollama/foo-bar"), "foo-bar");
+        assert_eq!(strip_model_id_prefixes("openrouter/foo-bar"), "foo-bar");
+    }
+
+    /// Regression — publisher-prefixed LMStudio model ids
+    /// (`openai/gpt-oss-20b`, `google/gemma-3-4b`, …) must keep the
+    /// `<publisher>/<model>` pair after stripping. The earlier
+    /// `rsplit('/').next()` implementation over-stripped to the final
+    /// segment, so any pin pointing at one of these models flagged as
+    /// orphaned in `agents-default-model-resolves` even when the model
+    /// was downloaded. Operator-observed on the M1 Max 32 GB Studio with
+    /// `gpt-oss-20b` loaded.
+    #[test]
+    fn strip_model_id_prefixes_keeps_publisher_segment() {
+        assert_eq!(
+            strip_model_id_prefixes("lmstudio/openai/gpt-oss-20b"),
+            "openai/gpt-oss-20b"
+        );
+        assert_eq!(
+            strip_model_id_prefixes("lmstudio/darkmux:openai/gpt-oss-20b"),
+            "openai/gpt-oss-20b"
+        );
+        assert_eq!(
+            strip_model_id_prefixes("lmstudio/google/gemma-3-4b"),
+            "google/gemma-3-4b"
+        );
+        assert_eq!(
+            strip_model_id_prefixes("lmstudio/darkmux:google/gemma-3-4b"),
+            "google/gemma-3-4b"
+        );
+        // Unknown provider prefix: leave alone rather than over-strip.
+        // Avoids misparsing a fresh `<publisher>/<model>` id that
+        // doesn't carry a provider segment.
+        assert_eq!(
+            strip_model_id_prefixes("openai/gpt-oss-20b"),
+            "openai/gpt-oss-20b"
+        );
+    }
+
+    /// End-to-end: the verdict resolves Pass when the pin points at a
+    /// publisher-prefixed model that's actually in `lms ls`. This is the
+    /// false-positive case the rule was previously producing on the
+    /// Studio with `gpt-oss-20b` loaded.
+    #[test]
+    fn default_model_resolves_passes_for_publisher_prefixed_primary() {
+        let v = classify_default_model_resolves(
+            Some("lmstudio/darkmux:openai/gpt-oss-20b"),
+            None,
+            &["openai/gpt-oss-20b", "google/gemma-3-4b"],
+        );
+        assert!(matches!(v, Verdict::Pass), "got {v:?}");
     }
 
     #[test]
