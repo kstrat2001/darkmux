@@ -327,6 +327,17 @@ fn read_openclaw_config() -> Option<serde_json::Value> {
 pub enum Verdict {
     /// Rule didn't fire — no misconfiguration matching this pattern.
     Pass,
+    /// Pass with an informational message — useful for diagnostics that
+    /// aren't a misconfiguration but the operator still benefits from
+    /// seeing. Example: `agents-default-model-resolves` resolves the pin
+    /// against `lms ls` (Pass), but the model isn't in `lms ps` yet, so
+    /// the first dispatch will JIT-load it. The verdict is Pass; the
+    /// payload is the JIT-load hint. See issue #101.
+    ///
+    /// Rust-internal today. When issue #11 lands and verdicts start
+    /// shipping to `instruments.jsonl`, this variant becomes part of the
+    /// wire format and the `RULES_SCHEMA_VERSION` contract gates that bump.
+    PassWith(String),
     /// Rule fired. Message describes the specific finding; severity comes
     /// from the rule def by default but may be downgraded at runtime.
     Fire {
@@ -632,18 +643,25 @@ const KNOWN_PROVIDER_PREFIXES: &[&str] = &[
 ];
 
 /// Pure verdict logic for the `agents-default-model-resolves` check.
-/// Extracted so we can unit-test prefix-stripping + the downloaded/missing
-/// matrix without an `lms` round-trip.
+/// Extracted so we can unit-test prefix-stripping + the
+/// orphaned/downloaded/loaded matrix without an `lms` round-trip.
 ///
 /// `primary_id`/`compaction_id` are the raw strings as they appear in
 /// openclaw.json (i.e. may carry `lmstudio/` or `darkmux:` prefixes).
-/// `available_keys` is the `modelKey` set from `lms ls`. Per the issue
-/// spec, "Pass if the bare id appears in `lms ls` output" — loaded-state
-/// is informational, not blocking, so it's not consulted here.
+/// `available_keys` is the `modelKey` set from `lms ls`.
+/// `loaded_idents` is the `identifier` set from `lms ps` (these typically
+/// carry the `darkmux:` namespace — the helper strips it for comparison).
+///
+/// Verdict tiers (per #91 spec + #101 follow-up):
+///   - Fail   — any pin not in `lms ls`
+///   - PassWith — all pins resolve, but at least one is downloaded-only
+///     (will JIT-load on first dispatch — operator-actionable signal)
+///   - Pass   — all pins resolve AND are already loaded
 fn classify_default_model_resolves(
     primary_id: Option<&str>,
     compaction_id: Option<&str>,
     available_keys: &[&str],
+    loaded_idents: &[&str],
 ) -> Verdict {
     // Build (label, raw, bare) triples for whichever pins are configured.
     let mut pins: Vec<(&str, &str, &str)> = Vec::new();
@@ -657,16 +675,32 @@ fn classify_default_model_resolves(
         return Verdict::Skipped("no agents.defaults.model.primary set".into());
     }
 
+    // Loaded ids normalize through the same prefix-strip pipeline so the
+    // pin (`lmstudio/darkmux:openai/gpt-oss-20b`) compares cleanly against
+    // the loaded identifier (`darkmux:openai/gpt-oss-20b`).
+    let loaded_bare: Vec<&str> = loaded_idents
+        .iter()
+        .map(|li| strip_model_id_prefixes(li))
+        .collect();
+
     let mut orphans: Vec<String> = Vec::new();
-    for (label, raw, bare) in &pins {
+    let mut downloaded_only: Vec<String> = Vec::new();
+    for (label, _raw, bare) in &pins {
         if !available_keys.contains(bare) {
-            orphans.push(format!("{label} `{raw}` (bare `{bare}`)"));
+            // Fail-tier: pin doesn't even exist in `lms ls`.
+            let raw_pin = pins
+                .iter()
+                .find(|(l, _, _)| l == label)
+                .map(|(_, raw, _)| *raw)
+                .unwrap_or("?");
+            orphans.push(format!("{label} `{raw_pin}` (bare `{bare}`)"));
+        } else if !loaded_bare.contains(bare) {
+            // Pass-with-hint: downloaded but not currently resident.
+            downloaded_only.push(format!("{label} `{bare}`"));
         }
     }
 
-    if orphans.is_empty() {
-        Verdict::Pass
-    } else {
+    if !orphans.is_empty() {
         // Top-3 lms-ls suggestions to help the operator pick a real id.
         let suggestions: Vec<&str> = available_keys.iter().take(3).copied().collect();
         let suggestion_line = if suggestions.is_empty() {
@@ -683,6 +717,13 @@ fn classify_default_model_resolves(
                 suggestion_line
             ),
         }
+    } else if !downloaded_only.is_empty() {
+        Verdict::PassWith(format!(
+            "downloaded but not loaded — will JIT-load on first dispatch: {}",
+            downloaded_only.join(", ")
+        ))
+    } else {
+        Verdict::Pass
     }
 }
 
@@ -705,8 +746,18 @@ fn eval_agents_default_model_resolves(ctx: &Context) -> Verdict {
         .and_then(|m| m.as_str());
 
     let available_keys: Vec<&str> = catalog.iter().map(|m| m.model_key.as_str()).collect();
+    let loaded_idents: Vec<&str> = ctx
+        .loaded_models
+        .iter()
+        .map(|m| m.identifier.as_str())
+        .collect();
 
-    classify_default_model_resolves(primary_id, compaction_id, &available_keys)
+    classify_default_model_resolves(
+        primary_id,
+        compaction_id,
+        &available_keys,
+        &loaded_idents,
+    )
 }
 
 pub fn parse_size_gb(s: &str) -> Option<f64> {
@@ -906,21 +957,74 @@ mod tests {
     /// Studio with `gpt-oss-20b` loaded.
     #[test]
     fn default_model_resolves_passes_for_publisher_prefixed_primary() {
+        // Loaded set includes the primary → bare Pass (no JIT hint).
         let v = classify_default_model_resolves(
             Some("lmstudio/darkmux:openai/gpt-oss-20b"),
             None,
             &["openai/gpt-oss-20b", "google/gemma-3-4b"],
+            &["darkmux:openai/gpt-oss-20b"],
         );
         assert!(matches!(v, Verdict::Pass), "got {v:?}");
     }
 
     #[test]
     fn default_model_resolves_passes_when_primary_in_lms_ls() {
-        // Per the issue spec: "Pass if the bare id appears in `lms ls`".
-        // Loaded-state is informational, not blocking — that's covered by
-        // other rules (compactor-not-loaded, primary-config-drift).
-        let v = classify_default_model_resolves(Some("lmstudio/foo"), None, &["foo", "bar"]);
+        // Primary in catalog AND in loaded set → bare Pass.
+        let v = classify_default_model_resolves(
+            Some("lmstudio/foo"),
+            None,
+            &["foo", "bar"],
+            &["foo"],
+        );
         assert!(matches!(v, Verdict::Pass), "got {v:?}");
+    }
+
+    /// Issue #101 regression — pin resolves in `lms ls` but isn't in
+    /// `lms ps`. Rule passes (the pin isn't orphaned) but emits a
+    /// `PassWith` hint so the operator knows the first dispatch will
+    /// pay a JIT-load tax.
+    #[test]
+    fn default_model_resolves_pass_with_jit_hint_when_downloaded_only() {
+        let v = classify_default_model_resolves(
+            Some("lmstudio/darkmux:openai/gpt-oss-20b"),
+            None,
+            &["openai/gpt-oss-20b", "google/gemma-3-4b"],
+            &[], // nothing loaded
+        );
+        match v {
+            Verdict::PassWith(message) => {
+                assert!(message.contains("downloaded but not loaded"));
+                assert!(message.contains("JIT-load"));
+                assert!(message.contains("primary"));
+                assert!(message.contains("openai/gpt-oss-20b"));
+            }
+            other => panic!("expected PassWith, got {other:?}"),
+        }
+    }
+
+    /// Same JIT-load hint path but on the compaction pin specifically —
+    /// covers the case where the primary is loaded but the compactor
+    /// hasn't been pulled into `lms ps` yet (e.g. operator loaded
+    /// primary manually without `darkmux swap`).
+    #[test]
+    fn default_model_resolves_pass_with_jit_hint_on_compaction_only() {
+        let v = classify_default_model_resolves(
+            Some("lmstudio/darkmux:openai/gpt-oss-20b"),
+            Some("lmstudio/darkmux:google/gemma-3-4b"),
+            &["openai/gpt-oss-20b", "google/gemma-3-4b"],
+            &["darkmux:openai/gpt-oss-20b"], // primary loaded; compactor not
+        );
+        match v {
+            Verdict::PassWith(message) => {
+                assert!(message.contains("compaction"));
+                assert!(message.contains("gemma-3-4b"));
+                assert!(
+                    !message.contains("primary"),
+                    "primary is loaded so it shouldn't appear in the hint: {message}"
+                );
+            }
+            other => panic!("expected PassWith, got {other:?}"),
+        }
     }
 
     #[test]
@@ -929,6 +1033,7 @@ mod tests {
             Some("lmstudio/darkmux:qwen3.6-35b-a3b-turboquant-mlx"),
             None,
             &["qwen3.6-35b-a3b", "qwen3.6-35b-a3b-oq6"],
+            &[],
         );
         match v {
             Verdict::Fire { severity: Severity::Fail, message } => {
@@ -947,6 +1052,7 @@ mod tests {
             Some("foo"),
             Some("missing-compactor"),
             &["foo", "bar"],
+            &["foo"],
         );
         match v {
             Verdict::Fire { severity: Severity::Fail, message } => {
@@ -964,6 +1070,7 @@ mod tests {
             Some("missing-primary"),
             Some("missing-compactor"),
             &["foo"],
+            &[],
         );
         match v {
             Verdict::Fire { severity: Severity::Fail, message } => {
@@ -977,7 +1084,7 @@ mod tests {
 
     #[test]
     fn default_model_resolves_skipped_when_no_primary_set() {
-        let v = classify_default_model_resolves(None, None, &["foo"]);
+        let v = classify_default_model_resolves(None, None, &["foo"], &[]);
         assert!(matches!(v, Verdict::Skipped(_)), "got {v:?}");
     }
 

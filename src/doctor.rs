@@ -118,6 +118,18 @@ fn eureka_checks() -> Vec<Check> {
                 message: def.name.clone(),
                 hint: None,
             },
+            // Pass-tier diagnostic: the rule passed but carries an
+            // informational message the operator should see (e.g. the
+            // JIT-load hint from #101). Renders with a `·` separator so
+            // it visually distinguishes from the harder Fire path — the
+            // operator sees a green checkmark with a follow-on sentence
+            // rather than just the rule name.
+            eureka::Verdict::PassWith(message) => Check {
+                name: format!("eureka: {}", def.id),
+                status: Status::Pass,
+                message: format!("{} · {message}", def.name),
+                hint: None,
+            },
             eureka::Verdict::Fire { severity, message } => Check {
                 name: format!("eureka: {}", def.id),
                 status: match severity {
