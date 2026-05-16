@@ -60,6 +60,13 @@ pub enum FlowCmd {
         /// Optional source label.
         #[arg(long)]
         source: Option<String>,
+        /// Optional operator-supplied reasoning. The audit substrate's
+        /// WHY layer for events emitted via this raw verb.
+        #[arg(long)]
+        reasoning: Option<String>,
+        /// Optional mission identifier this event is scoped to.
+        #[arg(long = "mission-id")]
+        mission_id: Option<String>,
     },
     /// Record a tier-decision — the frontier orchestrator's reasoning for
     /// routing a piece of work to local vs. holding in frontier (#136).
@@ -141,7 +148,19 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             reasoning: None,
             mission_id: None,
         },
-        FlowCmd::Record { level, category, tier, stage, action, handle, sprint_id, session_id, source } => FlowRecord {
+        FlowCmd::Record {
+            level,
+            category,
+            tier,
+            stage,
+            action,
+            handle,
+            sprint_id,
+            session_id,
+            source,
+            reasoning,
+            mission_id,
+        } => FlowRecord {
             ts,
             level,
             category,
@@ -153,8 +172,8 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             session_id,
             source,
             model: None,
-            reasoning: None,
-            mission_id: None,
+            reasoning,
+            mission_id,
         },
         FlowCmd::TierDecision {
             decision,
@@ -315,6 +334,8 @@ mod tests {
             sprint_id: None,
             session_id: None,
             source: None,
+            reasoning: None,
+            mission_id: None,
         })
         .unwrap();
 
@@ -341,6 +362,8 @@ mod tests {
             sprint_id: Some("66".to_string()),
             session_id: Some("abc".to_string()),
             source: Some("manual".to_string()),
+            reasoning: None,
+            mission_id: None,
         })
         .unwrap();
 

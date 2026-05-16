@@ -402,21 +402,35 @@ enum MissionCmd {
     Start {
         /// Mission id (filename stem under ~/.darkmux/crew/missions/).
         id: String,
+        /// Optional operator-supplied reasoning for the transition.
+        /// Lands on the emitted flow record so the audit substrate
+        /// captures *why* the state change happened.
+        #[arg(long)]
+        reasoning: Option<String>,
     },
     /// Transition a mission to `Closed` (terminal). From `Active` or `Paused`.
     /// Stamps `closed_ts=now()`.
     Close {
         id: String,
+        /// Optional operator-supplied reasoning for closing the mission.
+        #[arg(long)]
+        reasoning: Option<String>,
     },
     /// Transition an `Active` mission to `Paused`. Stamps `paused_ts=now()`.
     Pause {
         id: String,
+        /// Optional operator-supplied reasoning for pausing the mission.
+        #[arg(long)]
+        reasoning: Option<String>,
     },
     /// Transition a `Paused` mission back to `Active`. Does NOT clear
     /// `paused_ts` — the operator may want to see when the most recent
     /// pause occurred even after resuming.
     Resume {
         id: String,
+        /// Optional operator-supplied reasoning for resuming the mission.
+        #[arg(long)]
+        reasoning: Option<String>,
     },
     /// Propose a Mission + Sprints from unstructured input (#113 Sprint 3).
     /// Dispatches the `mission-compiler` admin agent against the input,
@@ -482,6 +496,11 @@ enum MissionCmd {
         /// typos and stale references.
         #[arg(long)]
         after: Option<String>,
+        /// Optional operator-supplied reasoning for the mid-flight
+        /// scope growth. Lands on the emitted flow record so the
+        /// audit substrate captures *why* the mission grew here.
+        #[arg(long)]
+        reasoning: Option<String>,
     },
 }
 
@@ -1009,13 +1028,13 @@ fn cmd_sprint(sub: SprintCmd) -> Result<i32> {
 
 fn cmd_mission(sub: MissionCmd) -> Result<i32> {
     match sub {
-        MissionCmd::Start { id } => {
-            let m = crew::lifecycle::mission_start(&id)?;
+        MissionCmd::Start { id, reasoning } => {
+            let m = crew::lifecycle::mission_start_with_reasoning(&id, reasoning.as_deref())?;
             println!("mission `{}` → Active  started_ts={}", m.id, m.started_ts.unwrap_or(0));
             Ok(0)
         }
-        MissionCmd::Close { id } => {
-            let m = crew::lifecycle::mission_close(&id)?;
+        MissionCmd::Close { id, reasoning } => {
+            let m = crew::lifecycle::mission_close_with_reasoning(&id, reasoning.as_deref())?;
             let started = m.started_ts.unwrap_or(0);
             let closed = m.closed_ts.unwrap_or(0);
             let dur = closed.saturating_sub(started);
@@ -1025,26 +1044,27 @@ fn cmd_mission(sub: MissionCmd) -> Result<i32> {
             );
             Ok(0)
         }
-        MissionCmd::Pause { id } => {
-            let m = crew::lifecycle::mission_pause(&id)?;
+        MissionCmd::Pause { id, reasoning } => {
+            let m = crew::lifecycle::mission_pause_with_reasoning(&id, reasoning.as_deref())?;
             println!("mission `{}` → Paused  paused_ts={}", m.id, m.paused_ts.unwrap_or(0));
             Ok(0)
         }
-        MissionCmd::Resume { id } => {
-            let m = crew::lifecycle::mission_resume(&id)?;
+        MissionCmd::Resume { id, reasoning } => {
+            let m = crew::lifecycle::mission_resume_with_reasoning(&id, reasoning.as_deref())?;
             println!("mission `{}` → Active  (paused_ts preserved: {})", m.id, m.paused_ts.unwrap_or(0));
             Ok(0)
         }
         MissionCmd::Propose { from_stdin, from_file, yes, start } => {
             mission_propose::propose(from_stdin, from_file.as_deref(), yes, start)
         }
-        MissionCmd::AddSprint { mission_id, sprint_id, description, depends_on, after } => {
-            let s = crew::lifecycle::add_sprint_to_mission(
+        MissionCmd::AddSprint { mission_id, sprint_id, description, depends_on, after, reasoning } => {
+            let s = crew::lifecycle::add_sprint_to_mission_with_reasoning(
                 &mission_id,
                 &sprint_id,
                 &description,
                 depends_on,
                 after.as_deref(),
+                reasoning.as_deref(),
             )?;
             let position = match after.as_deref() {
                 Some(a) => format!(" (after `{a}`)"),
