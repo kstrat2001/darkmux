@@ -47,6 +47,7 @@ pub fn build_router(flows_dir: PathBuf) -> Router {
         .route("/health", get(health))
         .route("/flow/:date", get(flow_handler))
         .route("/flow/:date/stream", get(flow_stream_handler))
+        .route("/flow-status", get(flow_status_handler))
         .route("/model/status", get(model_status_handler))
         .route("/missions", get(missions_handler))
         .route("/sprints", get(sprints_handler))
@@ -306,6 +307,27 @@ fn current_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// GET /flow-status — diagnostic snapshot of the flow substrate. Same
+/// data shape as `darkmux flow status --json`; the shared shell's
+/// store-status pill polls this every 30s. (#170)
+///
+/// `flow::collect_status()` opens a Redis connection when Redis is
+/// configured, so runs on the blocking pool to keep the axum executor
+/// free.
+async fn flow_status_handler() -> axum::Json<serde_json::Value> {
+    let result = tokio::task::spawn_blocking(crate::flow::collect_status).await;
+    match result {
+        Ok(status) => axum::Json(
+            serde_json::to_value(status)
+                .unwrap_or_else(|_| serde_json::json!({"error": "serialization failed"})),
+        ),
+        Err(_) => axum::Json(serde_json::json!({
+            "error": "flow status collector panicked",
+            "generated_at_ms": current_millis(),
+        })),
+    }
 }
 
 async fn model_status_handler() -> axum::Json<serde_json::Value> {

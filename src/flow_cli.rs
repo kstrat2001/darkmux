@@ -108,11 +108,42 @@ pub enum FlowCmd {
         #[arg(long)]
         source: Option<String>,
     },
+    /// Print a diagnostic snapshot of the flow substrate (sinks, Redis
+    /// health, disk health, schema state). The store-status pill in
+    /// the shared shell polls this via the daemon's `/flow-status`
+    /// endpoint; the verb is also useful standalone for operators
+    /// debugging substrate problems.
+    Status {
+        /// Emit machine-readable JSON instead of the human-formatted
+        /// summary. The daemon's `/flow-status` endpoint also returns
+        /// this shape so the shell pill and the CLI share one format.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub fn run(cmd: FlowCmd) -> Result<()> {
+    // Status is a read verb (doesn't emit a record). Handle it ahead of
+    // build_record so the latter only sees write verbs.
+    if let FlowCmd::Status { json } = cmd {
+        return print_status(json);
+    }
     let record = build_record(cmd);
     flow::record(record).context("writing flow record")
+}
+
+/// Render `darkmux flow status` to stdout. Calls `flow::collect_status()`
+/// for the snapshot; format gated by `--json`.
+fn print_status(json: bool) -> Result<()> {
+    let status = flow::collect_status();
+    if json {
+        let s = serde_json::to_string_pretty(&status)
+            .context("serializing FlowStatus to JSON")?;
+        println!("{s}");
+    } else {
+        print!("{}", flow::format_status_human(&status));
+    }
+    Ok(())
 }
 
 pub fn build_record(cmd: FlowCmd) -> FlowRecord {
@@ -205,6 +236,11 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             reasoning: Some(format!("[{decision}] {reasoning}")),
             mission_id,
         },
+        // Status is a read verb — intercepted by `run` before build_record.
+        // Reaching here would mean run() was bypassed; assert loudly.
+        FlowCmd::Status { .. } => unreachable!(
+            "FlowCmd::Status is a read verb and must be handled by run() before build_record"
+        ),
     }
 }
 

@@ -121,11 +121,109 @@ dx-shell .dx-shell-pills {
   flex-shrink: 0;
 }
 
-/* `.dx-pill` (shared pill base for future pills like store-status) is
- * intentionally not declared yet — current pills (conn-status,
- * model-status, sprint-progress) keep their existing per-page classes
- * for this plumbing PR. The shared class lands when the store-status
- * pill arrives in #170. */
+/* ─── shared pill base (used by the store-status pill in <dx-shell>) — */
+/* Existing per-page pills (conn-status, model-pill, sprint-progress) keep
+ * their original classes; .dx-pill is the new shared shape. */
+.dx-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+  user-select: none;
+  font-family: inherit;
+  transition: border-color 0.12s, color 0.12s;
+}
+.dx-pill:hover { border-color: var(--accent-dim); color: var(--accent); }
+.dx-pill:focus { outline: 1px solid var(--accent-dim); outline-offset: 1px; }
+
+/* ─── store-status pill — colored dot reflects substrate health */
+.dx-store-pill .dx-store-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--dim);
+  flex-shrink: 0;
+}
+.dx-store-pill.good .dx-store-dot { background: var(--good); }
+.dx-store-pill.warn .dx-store-dot { background: var(--warn); }
+.dx-store-pill.bad  .dx-store-dot { background: var(--bad); }
+.dx-store-pill.offline .dx-store-dot { background: var(--dim); }
+.dx-store-pill.good    { color: var(--good); border-color: var(--good); }
+.dx-store-pill.warn    { color: var(--warn); border-color: var(--warn); }
+.dx-store-pill.bad     { color: var(--bad);  border-color: var(--bad); }
+.dx-store-pill.offline { color: var(--muted); }
+.dx-store-pill .dx-store-label {
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  white-space: nowrap;
+}
+
+/* ─── shared modal infrastructure (used by the store-status detail) */
+.dx-modal-bg {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.65);
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+.dx-modal {
+  background: var(--bg-elev);
+  border: 1px solid var(--border-hot);
+  border-radius: 6px;
+  padding: 24px 28px;
+  max-width: 560px;
+  width: 100%;
+  position: relative;
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.55;
+}
+.dx-modal h2 {
+  margin: 0 0 14px;
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.dx-modal-close {
+  position: absolute;
+  top: 10px;
+  right: 12px;
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  font-size: 18px;
+  cursor: pointer;
+  padding: 4px 8px;
+}
+.dx-modal-close:hover { color: var(--accent); }
+.dx-modal .dx-kv {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  column-gap: 14px;
+  row-gap: 6px;
+  margin: 0;
+}
+.dx-modal .dx-kv dt { color: var(--muted); font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+.dx-modal .dx-kv dd { margin: 0; word-break: break-all; }
+.dx-modal code {
+  background: var(--bg-elev2);
+  padding: 1px 5px;
+  border-radius: 2px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+}
+.dx-modal .dx-warn { color: var(--warn); margin: 14px 0 0; }
+.dx-modal .dx-fail { color: var(--bad);  margin: 14px 0 0; }
+.dx-modal .dx-hint { color: var(--muted); font-size: 12px; margin: 14px 0 0; }
 
 /* Page-level :root blocks in /flow/, /lab/, /topology/ currently
  * re-declare these same tokens (matching values). The duplication is
