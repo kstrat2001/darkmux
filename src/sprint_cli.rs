@@ -67,6 +67,8 @@ pub(crate) fn build_review_record(
         // dispatch (`code-reviewer`) emits its own dispatch records via
         // crew::dispatch::build_dispatch_record with model stamped.
         model: None,
+        reasoning: None,
+        mission_id: None,
     }
 }
 

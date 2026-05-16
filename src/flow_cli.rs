@@ -61,6 +61,46 @@ pub enum FlowCmd {
         #[arg(long)]
         source: Option<String>,
     },
+    /// Record a tier-decision — the frontier orchestrator's reasoning for
+    /// routing a piece of work to local vs. holding in frontier (#136).
+    ///
+    /// Tier-decision records form the audit substrate's *why* layer.
+    /// Where dispatch records show *what* ran, tier-decision records
+    /// show *why this layer was chosen* — the missing provenance step
+    /// for compliance-bearing AI orchestration.
+    ///
+    /// Typical use: the frontier orchestrator runs this verb before
+    /// dispatching (or before deciding to hold work in frontier) and
+    /// captures the reasoning in operator-readable prose.
+    #[command(name = "tier-decision")]
+    TierDecision {
+        /// `dispatch` (work routed to local) or `direct` (work held in
+        /// frontier). Free-form, but those two are the conventional values.
+        #[arg(long)]
+        decision: String,
+        /// Operator-readable rationale. The prose that future audit will
+        /// read to understand *why* this routing was chosen. Required —
+        /// a tier-decision record without reasoning is just a dispatch.
+        #[arg(long)]
+        reasoning: String,
+        /// Optional role chosen (when `decision=dispatch`). E.g., `coder`,
+        /// `trip-researcher`. Captured in the `handle` field.
+        #[arg(long = "role-chosen")]
+        role_chosen: Option<String>,
+        /// Optional sprint identifier this decision is scoped to.
+        #[arg(long = "sprint-id")]
+        sprint_id: Option<String>,
+        /// Optional mission identifier this decision is scoped to.
+        #[arg(long = "mission-id")]
+        mission_id: Option<String>,
+        /// Optional session identifier (when the decision links to an
+        /// already-dispatched session — e.g., recorded after the fact).
+        #[arg(long = "session-id")]
+        session_id: Option<String>,
+        /// Optional source label (e.g., `frontier-claude`, `operator-manual`).
+        #[arg(long)]
+        source: Option<String>,
+    },
 }
 
 pub fn run(cmd: FlowCmd) -> Result<()> {
@@ -83,6 +123,8 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             session_id,
             source,
             model: None,
+            reasoning: None,
+            mission_id: None,
         },
         FlowCmd::Catch { text, sprint_id, session_id, source } => FlowRecord {
             ts,
@@ -96,6 +138,8 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             session_id,
             source,
             model: None,
+            reasoning: None,
+            mission_id: None,
         },
         FlowCmd::Record { level, category, tier, stage, action, handle, sprint_id, session_id, source } => FlowRecord {
             ts,
@@ -109,6 +153,38 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             session_id,
             source,
             model: None,
+            reasoning: None,
+            mission_id: None,
+        },
+        FlowCmd::TierDecision {
+            decision,
+            reasoning,
+            role_chosen,
+            sprint_id,
+            mission_id,
+            session_id,
+            source,
+        } => FlowRecord {
+            ts,
+            level: Level::Info,
+            category: Category::Audit,
+            // The frontier orchestrator is the tier doing the routing, so
+            // its decisions are frontier-tier records. Even when the
+            // decision routes work TO local, the act of deciding lives at
+            // frontier.
+            tier: Tier::Frontier,
+            stage: Stage::TierDecision,
+            // `action` is the operator-facing event name; `handle` carries
+            // role-chosen for searchability. When no role is chosen
+            // (decision=direct), handle is the decision itself.
+            action: "tier-decision".to_string(),
+            handle: role_chosen.clone().unwrap_or_else(|| decision.clone()),
+            sprint_id,
+            session_id,
+            source,
+            model: None,
+            reasoning: Some(format!("[{decision}] {reasoning}")),
+            mission_id,
         },
     }
 }
@@ -297,5 +373,62 @@ mod tests {
             })
             .sum();
         assert_eq!(total_records, 3);
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn tier_decision_dispatch_records_role_and_reasoning() {
+        let guard = FlowsDirGuard::new();
+
+        run(FlowCmd::TierDecision {
+            decision: "dispatch".into(),
+            reasoning: "Bounded mechanical translation; testable via cargo test".into(),
+            role_chosen: Some("coder".into()),
+            sprint_id: Some("113-s1".into()),
+            mission_id: Some("113-mission-propose-pipeline".into()),
+            session_id: None,
+            source: Some("frontier-claude".into()),
+        })
+        .unwrap();
+
+        let rec = single_record(&guard);
+        assert_eq!(rec["category"], "audit");
+        assert_eq!(rec["tier"], "frontier");
+        assert_eq!(rec["stage"], "tier-decision");
+        assert_eq!(rec["action"], "tier-decision");
+        // handle carries role-chosen when dispatch + role known.
+        assert_eq!(rec["handle"], "coder");
+        assert_eq!(rec["sprint_id"], "113-s1");
+        assert_eq!(rec["mission_id"], "113-mission-propose-pipeline");
+        assert_eq!(rec["source"], "frontier-claude");
+        // reasoning carries the decision prefix + the operator's prose.
+        let reasoning = rec["reasoning"].as_str().unwrap();
+        assert!(reasoning.starts_with("[dispatch] "), "got: {reasoning}");
+        assert!(reasoning.contains("Bounded mechanical"), "got: {reasoning}");
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn tier_decision_direct_records_decision_as_handle_when_no_role() {
+        let guard = FlowsDirGuard::new();
+
+        run(FlowCmd::TierDecision {
+            decision: "direct".into(),
+            reasoning: "Multi-variable holding, tone-critical; no testable threshold".into(),
+            role_chosen: None,
+            sprint_id: Some("japan-day-3".into()),
+            mission_id: Some("japan-trip-2026-may".into()),
+            session_id: None,
+            source: None,
+        })
+        .unwrap();
+
+        let rec = single_record(&guard);
+        assert_eq!(rec["stage"], "tier-decision");
+        // No role_chosen → handle falls back to the decision value.
+        assert_eq!(rec["handle"], "direct");
+        let reasoning = rec["reasoning"].as_str().unwrap();
+        assert!(reasoning.starts_with("[direct] "), "got: {reasoning}");
+        assert!(reasoning.contains("Multi-variable holding"), "got: {reasoning}");
     }
 }
