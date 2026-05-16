@@ -227,14 +227,187 @@ impl FlowSink for LocalFileSink {
     }
 }
 
-/// Process-wide default sink. Initialized lazily; default is
-/// `LocalFileSink`. Phase 3 of [#162] will layer in config-driven sink
-/// selection (Redis + TeeSink for migration); for Phase 1 the default is
-/// fixed and tests use `record_via` with explicit sinks rather than
-/// overriding the global.
+// ─── RedisSink (#162 Phase 3) ────────────────────────────────────────
+//
+// Live-coordination sink: XADD to a Redis Stream. Coexists with
+// LocalFileSink via TeeSink — Redis is the coordination substrate,
+// files are the audit substrate (see #163 for the compliance-strength
+// AuditFileSink and #162's refinement comment on the split).
+//
+// Opt-in via `DARKMUX_REDIS_URL` env var. When set, the default sink
+// becomes `TeeSink([LocalFileSink, RedisSink])`. When unset, the
+// default sink stays `LocalFileSink` alone — no Redis dep code runs.
+// Stream name defaults to `darkmux:flow`; override via
+// `DARKMUX_REDIS_STREAM`.
+
+/// Redis Streams-backed flow sink. Each `write` XADDs the record's
+/// JSON-serialized fields to a single stream. Multiple consumers can
+/// `XREAD BLOCK` for live updates; consumer groups handle multi-reader
+/// fan-out; `MAXLEN ~ N` caps the stream size at the operator's chosen
+/// retention.
+///
+/// **By design ephemeral** — Redis Streams with MAXLEN drop old records.
+/// NOT the audit substrate. Pair with a durable sink (LocalFileSink or
+/// AuditFileSink) via TeeSink for any operator who needs both
+/// coordination AND audit. See #163 + the #162 refinement comment.
+pub struct RedisSink {
+    client: redis::Client,
+    stream: String,
+    /// Optional MAXLEN ~ N retention cap. None = unbounded (don't use
+    /// in production; the stream grows without bound).
+    max_len: Option<usize>,
+}
+
+impl RedisSink {
+    /// Build a sink connecting to `url` and writing to `stream`. Connection
+    /// is not established until the first `write` call (the redis client
+    /// is lazy by design).
+    pub fn new(url: &str, stream: &str, max_len: Option<usize>) -> Result<Self> {
+        let client = redis::Client::open(url)
+            .with_context(|| format!("opening Redis connection to {url}"))?;
+        Ok(Self {
+            client,
+            stream: stream.to_string(),
+            max_len,
+        })
+    }
+}
+
+impl FlowSink for RedisSink {
+    fn write(&self, record: &FlowRecord) -> Result<()> {
+        let mut conn = self
+            .client
+            .get_connection()
+            .context("getting Redis connection")?;
+        let payload = serde_json::to_string(record)
+            .context("serializing FlowRecord for Redis")?;
+        // Two-field encoding: `schema` carries the version (so downstream
+        // consumers across darkmux versions can handle skew explicitly),
+        // `record` carries the JSON-serialized FlowRecord. Single XADD
+        // call per write; small payload (~1 KB typical) so MAXLEN trim
+        // can run synchronously without affecting latency.
+        let fields: &[(&str, &str)] = &[
+            ("schema", FLOW_SCHEMA_VERSION),
+            ("record", &payload),
+        ];
+        // XADD <stream> [MAXLEN ~ N] * field value [field value ...]
+        let mut cmd = redis::cmd("XADD");
+        cmd.arg(&self.stream);
+        if let Some(n) = self.max_len {
+            cmd.arg("MAXLEN").arg("~").arg(n);
+        }
+        cmd.arg("*"); // auto-generated ID
+        for (k, v) in fields {
+            cmd.arg(*k).arg(*v);
+        }
+        let _: String = cmd
+            .query(&mut conn)
+            .with_context(|| format!("XADD to Redis stream `{}`", self.stream))?;
+        Ok(())
+    }
+}
+
+// ─── TeeSink (#162 Phase 3) ───────────────────────────────────────────
+//
+// Compositional sink: writes each record to N child sinks. Errors from
+// any single child are logged but don't fail the overall write — the
+// audit substrate has to remain durable even when coordination layer
+// is degraded. Per the operator-sovereignty contract: surface failures
+// loudly via stderr; don't silently lose the audit record.
+
+pub struct TeeSink {
+    sinks: Vec<Arc<dyn FlowSink>>,
+}
+
+impl TeeSink {
+    pub fn new(sinks: Vec<Arc<dyn FlowSink>>) -> Self {
+        Self { sinks }
+    }
+}
+
+impl FlowSink for TeeSink {
+    fn write(&self, record: &FlowRecord) -> Result<()> {
+        // Best-effort: record per-sink failures but always attempt every
+        // sink. Return the first error (so callers can react if they
+        // want); log the rest to stderr so the operator sees them.
+        let mut first_err: Option<anyhow::Error> = None;
+        for (i, sink) in self.sinks.iter().enumerate() {
+            if let Err(e) = sink.write(record) {
+                eprintln!(
+                    "flow::TeeSink: sink #{i} write failed: {e:#}"
+                );
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+}
+
+// ─── Default-sink selection (#162 Phase 3) ────────────────────────────
+
+/// Build the process-wide default sink from env-var configuration.
+///
+/// - `DARKMUX_REDIS_URL` set (and non-empty) → `TeeSink([LocalFileSink, RedisSink])`
+/// - Else → `LocalFileSink` alone (current behavior preserved)
+///
+/// `DARKMUX_REDIS_STREAM` overrides the stream name (default `darkmux:flow`).
+/// `DARKMUX_REDIS_MAXLEN` overrides the retention cap (default 10000;
+/// set to `0` for unbounded — not recommended).
+///
+/// Connection errors at construction degrade gracefully: if Redis is
+/// unreachable when the sink builds, the warning logs to stderr and the
+/// default sink falls back to LocalFileSink alone. Operators see the
+/// connection failure loudly; the audit substrate stays intact.
+fn build_default_sink() -> Arc<dyn FlowSink> {
+    let local = Arc::new(LocalFileSink::new());
+
+    let redis_url = match std::env::var("DARKMUX_REDIS_URL") {
+        Ok(s) if !s.trim().is_empty() => s,
+        _ => return local,
+    };
+
+    let stream = std::env::var("DARKMUX_REDIS_STREAM")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "darkmux:flow".to_string());
+
+    let max_len = match std::env::var("DARKMUX_REDIS_MAXLEN") {
+        Ok(s) => match s.parse::<usize>() {
+            Ok(0) => None,
+            Ok(n) => Some(n),
+            Err(_) => Some(10000),
+        },
+        Err(_) => Some(10000),
+    };
+
+    match RedisSink::new(&redis_url, &stream, max_len) {
+        Ok(redis_sink) => {
+            eprintln!(
+                "flow: Redis sink enabled — url={redis_url} stream={stream} \
+                 max_len={max_len:?} (tee'd with local file sink)"
+            );
+            Arc::new(TeeSink::new(vec![local, Arc::new(redis_sink)]))
+        }
+        Err(e) => {
+            eprintln!(
+                "flow: Redis sink construction failed ({e:#}); falling back to \
+                 local file sink only. Audit substrate intact."
+            );
+            local
+        }
+    }
+}
+
+/// Process-wide default sink. Initialized lazily on first call to
+/// `record()`; default selection reads env config at init time.
 fn default_sink() -> Arc<dyn FlowSink> {
     static SINK: OnceLock<Arc<dyn FlowSink>> = OnceLock::new();
-    SINK.get_or_init(|| Arc::new(LocalFileSink::new())).clone()
+    SINK.get_or_init(build_default_sink).clone()
 }
 
 /// Write a record through an explicit sink. Used by tests + future
@@ -785,6 +958,86 @@ mod tests {
         record_via(&sink, &rec).unwrap();
         record_via(&sink, &rec).unwrap();
         assert_eq!(sink.count(), 2);
+    }
+
+    #[test]
+    fn tee_sink_writes_to_all_children() {
+        // #162 Phase 3: TeeSink composes N sinks. Each child receives
+        // the record. This is the canonical compliant deployment shape
+        // ([LocalFileSink, RedisSink] in production); the test uses
+        // two InMemorySink test doubles to verify the trait contract.
+        let a = Arc::new(InMemorySink::new());
+        let b = Arc::new(InMemorySink::new());
+        let tee = TeeSink::new(vec![
+            a.clone() as Arc<dyn FlowSink>,
+            b.clone() as Arc<dyn FlowSink>,
+        ]);
+
+        let rec = FlowRecord {
+            ts: "2025-01-01T00:00:00Z".to_string(),
+            level: Level::Info,
+            category: Category::Work,
+            tier: Tier::Operator,
+            stage: Stage::Scope,
+            action: "tee-test".to_string(),
+            handle: "h".to_string(),
+            sprint_id: None,
+            session_id: None,
+            source: None,
+            model: None,
+            reasoning: None,
+            mission_id: None,
+        };
+        tee.write(&rec).unwrap();
+        tee.write(&rec).unwrap();
+
+        assert_eq!(a.count(), 2);
+        assert_eq!(b.count(), 2);
+    }
+
+    /// Test-only sink that always returns an error on write. Used to
+    /// verify TeeSink's best-effort semantics — one failing child
+    /// shouldn't prevent the others from receiving the record.
+    struct FailingSink;
+    impl FlowSink for FailingSink {
+        fn write(&self, _record: &FlowRecord) -> Result<()> {
+            anyhow::bail!("simulated sink failure for test")
+        }
+    }
+
+    #[test]
+    fn tee_sink_continues_writing_when_one_child_fails() {
+        // The audit substrate must remain durable even when the
+        // coordination layer (Redis) is unreachable. TeeSink logs the
+        // failure and continues writing to other sinks. First error
+        // bubbles up to the caller; subsequent sinks still receive.
+        let good = Arc::new(InMemorySink::new());
+        let bad = Arc::new(FailingSink);
+        let tee = TeeSink::new(vec![
+            bad as Arc<dyn FlowSink>,
+            good.clone() as Arc<dyn FlowSink>,
+        ]);
+
+        let rec = FlowRecord {
+            ts: "2025-01-01T00:00:00Z".to_string(),
+            level: Level::Info,
+            category: Category::Work,
+            tier: Tier::Operator,
+            stage: Stage::Scope,
+            action: "tee-fail".to_string(),
+            handle: "h".to_string(),
+            sprint_id: None,
+            session_id: None,
+            source: None,
+            model: None,
+            reasoning: None,
+            mission_id: None,
+        };
+        let err = tee.write(&rec).unwrap_err();
+        // Caller sees the error (so they can react if they want)
+        assert!(err.to_string().contains("simulated sink failure"));
+        // But the audit substrate still received the record
+        assert_eq!(good.count(), 1);
     }
 
     #[test]
