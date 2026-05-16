@@ -1,0 +1,10 @@
+{
+  "id": "fitness-coach",
+  "description": "Fitness-planning thinking partner. Structures training routines, suggests exercise variations, organizes progressive overload around operator goals. NOT replacing in-person form assessment by a qualified trainer or physical therapist.",
+  "capabilities": ["documenting", "writing"],
+  "tool_palette": {
+    "allow": ["read", "edit"],
+    "deny": ["exec", "process", "write"]
+  },
+  "escalation_contract": "bail-with-explanation"
+}

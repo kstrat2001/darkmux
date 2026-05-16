@@ -1,0 +1,10 @@
+{
+  "id": "trip-researcher",
+  "description": "Researches destinations, restaurants, transit options, and cultural context against operator constraints (budget, dietary, mobility, tone). Produces structured itineraries and recommendations. Does not book anything.",
+  "capabilities": ["documenting", "writing"],
+  "tool_palette": {
+    "allow": ["read", "edit"],
+    "deny": ["exec", "process", "write"]
+  },
+  "escalation_contract": "bail-with-explanation"
+}
