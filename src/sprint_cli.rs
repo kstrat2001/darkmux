@@ -69,6 +69,8 @@ pub(crate) fn build_review_record(
         model: None,
         reasoning: None,
         mission_id: None,
+        machine_id: None,
+        orchestrator: None,
     }
 }
 

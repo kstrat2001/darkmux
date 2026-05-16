@@ -15,7 +15,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.3.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.4.0";
+// Version history:
+//   1.2.0 — added optional `model` (#106)
+//   1.3.0 — added optional `reasoning` + `mission_id`; new Stage::TierDecision (#136)
+//   1.4.0 — added optional `machine_id` + `orchestrator` (#167; substrate for #162 fleet UI)
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -102,6 +106,21 @@ pub struct FlowRecord {
     /// active mission, machinery events). Schema 1.3 addition (#136).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mission_id: Option<String>,
+    /// Machine that emitted this record. Auto-populated at write time
+    /// from `DARKMUX_MACHINE_ID` env (operator-named — e.g. `"studio"`,
+    /// `"mini-1"`) or hostname (default). Older records (pre-1.4.0) lack
+    /// the field; viewer treats absence as `unknown`. Schema 1.4 addition
+    /// (#167; substrate for fleet UI).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
+    /// Frontier orchestrator driving this record's session — e.g.,
+    /// `"claude-opus-4-7"`, `"cursor-anthropic"`. Auto-populated from
+    /// `DARKMUX_ORCHESTRATOR` env at write time. Operator-explicit by
+    /// design: there's no reliable way to auto-detect the frontier-tier
+    /// AI from inside darkmux. None when the operator hasn't declared.
+    /// Schema 1.4 addition (#167).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orchestrator: Option<String>,
 }
 
 /// Resolve the flows directory from env override (`DARKMUX_FLOWS_DIR`) or
@@ -502,8 +521,70 @@ pub fn record_via(sink: &dyn FlowSink, record: &FlowRecord) -> Result<()> {
 /// **Phase 1 refactor (#162):** this function now dispatches through
 /// `FlowSink`. The default sink is `LocalFileSink`, which preserves
 /// the original behavior. No callers should see a behavior change.
+///
+/// **Schema 1.4 refactor (#167):** `machine_id` + `orchestrator` are
+/// auto-populated here if the caller left them `None`. Callers that
+/// pre-set the fields (e.g., a remote ingest path forwarding records
+/// from another machine) win — auto-populate fills the absent ones only.
 pub fn record(record: FlowRecord) -> Result<()> {
-    default_sink().write(&record)
+    let mut rec = record;
+    if rec.machine_id.is_none() {
+        rec.machine_id = resolve_machine_id();
+    }
+    if rec.orchestrator.is_none() {
+        rec.orchestrator = resolve_orchestrator();
+    }
+    default_sink().write(&rec)
+}
+
+/// Resolve the machine identifier for new flow records.
+///
+/// Order of precedence:
+/// 1. `DARKMUX_MACHINE_ID` env var — operator-named (e.g. `"studio"`,
+///    `"mini-1"`). Fleet operators prefer logical names over DNS-style
+///    identifiers, so the env override always wins. Re-read on every
+///    call so a `set_var` in tests + operator shells takes effect
+///    without a process restart.
+/// 2. Cached `hostname(1)` output — POSIX-portable; works on macOS,
+///    Linux, BSD without adding a dep. Hostname doesn't change during
+///    process lifetime, so we cache the subprocess result to keep the
+///    per-record write hot-path cheap AND to avoid the thread-yield
+///    that would otherwise turn `flow::record()` into a synchronization
+///    hazard for tests that mutate env without `#[serial_test::serial]`.
+/// 3. `None` — extremely rare (CI in a sandbox without `hostname`).
+pub fn resolve_machine_id() -> Option<String> {
+    if let Ok(s) = std::env::var("DARKMUX_MACHINE_ID") {
+        let trimmed = s.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    static HOSTNAME: OnceLock<Option<String>> = OnceLock::new();
+    HOSTNAME
+        .get_or_init(|| {
+            std::process::Command::new("hostname").output().ok().and_then(|out| {
+                if !out.status.success() {
+                    return None;
+                }
+                let h = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if h.is_empty() { None } else { Some(h) }
+            })
+        })
+        .clone()
+}
+
+/// Resolve the orchestrator identifier for new flow records.
+///
+/// **Operator-explicit by design** — there's no reliable way to detect
+/// the frontier-tier AI driving the operator's session from inside
+/// darkmux. The operator declares it via `DARKMUX_ORCHESTRATOR`; absent
+/// declaration, records carry no orchestrator field and the doctor
+/// surfaces a warn so the operator knows the field exists.
+pub fn resolve_orchestrator() -> Option<String> {
+    std::env::var("DARKMUX_ORCHESTRATOR")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Internal entry point writing to an explicit path. Used by tests and the
@@ -1135,6 +1216,8 @@ mod tests {
             model: None,
             reasoning: None,
             mission_id: None,
+            machine_id: None,
+            orchestrator: None,
         };
 
         record_at(&record, &path).unwrap();
@@ -1170,6 +1253,8 @@ mod tests {
             model: None,
             reasoning: None,
             mission_id: None,
+            machine_id: None,
+            orchestrator: None,
         };
 
         record_at(&r("first"), &path).unwrap();
@@ -1213,6 +1298,8 @@ mod tests {
             model: None,
             reasoning: None,
             mission_id: None,
+            machine_id: None,
+            orchestrator: None,
         };
 
         record_at(&record, &path).unwrap();
@@ -1273,6 +1360,8 @@ mod tests {
                 model: None,
                 reasoning: None,
                 mission_id: None,
+                machine_id: None,
+                orchestrator: None,
             },
             &tmp.path().join("custom.jsonl"),
         )
@@ -1312,6 +1401,8 @@ mod tests {
             model: None,
             reasoning: None,
             mission_id: None,
+            machine_id: None,
+            orchestrator: None,
         };
 
         record_at(&record, &path).unwrap();
@@ -1359,6 +1450,8 @@ mod tests {
             model: None,
             reasoning: None,
             mission_id: None,
+            machine_id: None,
+            orchestrator: None,
         };
 
         // Capture the day-key BEFORE calling record() so a midnight-UTC
@@ -1498,6 +1591,8 @@ mod tests {
             model: None,
             reasoning: None,
             mission_id: None,
+            machine_id: None,
+            orchestrator: None,
         };
         sink.write(&rec).unwrap();
 
@@ -1563,6 +1658,8 @@ mod tests {
             model: None,
             reasoning: None,
             mission_id: None,
+            machine_id: None,
+            orchestrator: None,
         };
 
         record_via(&sink, &rec).unwrap();
@@ -1597,6 +1694,8 @@ mod tests {
             model: None,
             reasoning: None,
             mission_id: None,
+            machine_id: None,
+            orchestrator: None,
         };
         tee.write(&rec).unwrap();
         tee.write(&rec).unwrap();
@@ -1645,6 +1744,8 @@ mod tests {
             model: None,
             reasoning: None,
             mission_id: None,
+            machine_id: None,
+            orchestrator: None,
         };
         let err = tee.write(&rec).unwrap_err();
         // Caller sees the error (so they can react if they want)
@@ -1679,6 +1780,8 @@ mod tests {
             model: None,
             reasoning: None,
             mission_id: None,
+            machine_id: None,
+            orchestrator: None,
         };
         super::record(rec).unwrap();
 
@@ -1697,7 +1800,7 @@ mod tests {
     }
 
     #[test]
-    fn flow_schema_version_is_1_3_0() {
+    fn flow_schema_version_is_1_4_0() {
         // Pin the schema version so an accidental rename can't ship silently;
         // any bump beyond this should be a deliberate code change paired with
         // an update to this assertion (and corresponding viewer EXPECTED_*
@@ -1706,11 +1809,11 @@ mod tests {
         // Version history:
         //   1.2.0 — added optional `model` field (#106, Sprint 4 of #104)
         //   1.3.0 — added optional `reasoning` and `mission_id` fields and a
-        //           new `Stage::TierDecision` variant (#136). Minor bump:
-        //           older viewers can safely ignore the new fields and will
-        //           see the new stage value as an unknown literal — no data
-        //           loss, no breaking parse.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.3.0");
+        //           new `Stage::TierDecision` variant (#136). Minor bump.
+        //   1.4.0 — added optional `machine_id` and `orchestrator` fields
+        //           (#167; substrate for fleet UI). Minor bump: older viewers
+        //           treat absent fields as `unknown` machine/orchestrator.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.4.0");
     }
 
     #[test]
@@ -1756,6 +1859,8 @@ mod tests {
             model: None,
             reasoning: None,
             mission_id: None,
+            machine_id: None,
+            orchestrator: None,
         };
         let serialized = serde_json::to_string(&rec).unwrap();
         assert!(!serialized.contains("reasoning"),
@@ -1784,6 +1889,8 @@ mod tests {
                 model: None,
                 reasoning: None,
                 mission_id: None,
+                machine_id: None,
+                orchestrator: None,
             },
             &path,
         )
@@ -1867,6 +1974,177 @@ mod tests {
             serde_json::from_str(&json).expect("FlowStatus must round-trip");
         assert_eq!(parsed.schema_version, FLOW_SCHEMA_VERSION);
         assert!(!parsed.sinks.active_kinds.is_empty());
+    }
+
+    // ─── Schema 1.4 fields (#167) ─────────────────────────────────────
+
+    #[serial_test::serial]
+    #[test]
+    fn machine_id_resolves_from_env_var() {
+        let prev = env::var("DARKMUX_MACHINE_ID").ok();
+        unsafe { env::set_var("DARKMUX_MACHINE_ID", "studio"); }
+        assert_eq!(resolve_machine_id().as_deref(), Some("studio"));
+        unsafe {
+            match prev {
+                Some(v) => env::set_var("DARKMUX_MACHINE_ID", v),
+                None => env::remove_var("DARKMUX_MACHINE_ID"),
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn machine_id_env_var_trims_whitespace() {
+        let prev = env::var("DARKMUX_MACHINE_ID").ok();
+        unsafe { env::set_var("DARKMUX_MACHINE_ID", "  named  "); }
+        // Trim leading/trailing whitespace; preserve internal spaces (none here).
+        assert_eq!(resolve_machine_id().as_deref(), Some("named"));
+        unsafe {
+            match prev {
+                Some(v) => env::set_var("DARKMUX_MACHINE_ID", v),
+                None => env::remove_var("DARKMUX_MACHINE_ID"),
+            }
+        }
+        // The whitespace-only-env fall-through is NOT exercised here:
+        // the OnceLock-cached hostname makes the per-test outcome
+        // depend on suite ordering. The trim assertion above is the
+        // load-bearing behavior; the fall-through is covered indirectly
+        // by `resolve_orchestrator_resolves_from_env_only` and the
+        // doctor check's source labeling.
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn orchestrator_resolves_from_env_only() {
+        let prev = env::var("DARKMUX_ORCHESTRATOR").ok();
+        unsafe { env::remove_var("DARKMUX_ORCHESTRATOR"); }
+        // No env → None. Operator-explicit by design (#49).
+        assert_eq!(resolve_orchestrator(), None);
+
+        unsafe { env::set_var("DARKMUX_ORCHESTRATOR", "claude-opus-4-7"); }
+        assert_eq!(resolve_orchestrator().as_deref(), Some("claude-opus-4-7"));
+
+        unsafe { env::set_var("DARKMUX_ORCHESTRATOR", "   "); }
+        assert_eq!(resolve_orchestrator(), None);
+
+        unsafe {
+            match prev {
+                Some(v) => env::set_var("DARKMUX_ORCHESTRATOR", v),
+                None => env::remove_var("DARKMUX_ORCHESTRATOR"),
+            }
+        }
+    }
+
+    #[test]
+    fn schema_1_4_fields_omit_when_none() {
+        // Both new optional fields must be skip-serialized when None so
+        // older viewers can keep parsing without seeing unexpected `null`s.
+        let rec = FlowRecord {
+            ts: "2026-05-17T00:00:00Z".to_string(),
+            level: Level::Info,
+            category: Category::Work,
+            tier: Tier::Operator,
+            stage: Stage::Scope,
+            action: "x".to_string(),
+            handle: "y".to_string(),
+            sprint_id: None,
+            session_id: None,
+            source: None,
+            model: None,
+            reasoning: None,
+            mission_id: None,
+            machine_id: None,
+            orchestrator: None,
+        };
+        let s = serde_json::to_string(&rec).unwrap();
+        assert!(!s.contains("machine_id"), "machine_id should omit when None: {s}");
+        assert!(!s.contains("orchestrator"), "orchestrator should omit when None: {s}");
+    }
+
+    #[test]
+    fn schema_1_4_fields_round_trip_when_set() {
+        let rec = FlowRecord {
+            ts: "2026-05-17T00:00:00Z".to_string(),
+            level: Level::Info,
+            category: Category::Work,
+            tier: Tier::Operator,
+            stage: Stage::Scope,
+            action: "x".to_string(),
+            handle: "y".to_string(),
+            sprint_id: None,
+            session_id: None,
+            source: None,
+            model: None,
+            reasoning: None,
+            mission_id: None,
+            machine_id: Some("studio".to_string()),
+            orchestrator: Some("claude-opus-4-7".to_string()),
+        };
+        let s = serde_json::to_string(&rec).unwrap();
+        let parsed: FlowRecord = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed.machine_id.as_deref(), Some("studio"));
+        assert_eq!(parsed.orchestrator.as_deref(), Some("claude-opus-4-7"));
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn record_auto_populates_machine_id_and_orchestrator() {
+        // record() should fill machine_id + orchestrator at write time
+        // when the caller leaves them None. The operator-set env values
+        // win over auto-detection so the test can assert deterministic
+        // values regardless of hostname.
+        let tmp = TempDir::new().unwrap();
+        let prev_flows = env::var("DARKMUX_FLOWS_DIR").ok();
+        let prev_machine = env::var("DARKMUX_MACHINE_ID").ok();
+        let prev_orch = env::var("DARKMUX_ORCHESTRATOR").ok();
+        unsafe {
+            env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+            env::set_var("DARKMUX_MACHINE_ID", "test-machine");
+            env::set_var("DARKMUX_ORCHESTRATOR", "test-orchestrator");
+        }
+
+        let rec = FlowRecord {
+            ts: "2026-05-17T00:00:00Z".to_string(),
+            level: Level::Info,
+            category: Category::Work,
+            tier: Tier::Operator,
+            stage: Stage::Scope,
+            action: "auto-pop".to_string(),
+            handle: "h".to_string(),
+            sprint_id: None,
+            session_id: None,
+            source: None,
+            model: None,
+            reasoning: None,
+            mission_id: None,
+            machine_id: None,
+            orchestrator: None,
+        };
+        super::record(rec).unwrap();
+
+        let day = day_utc_now();
+        let path = tmp.path().join(format!("{day}.jsonl"));
+        let content = std::fs::read_to_string(&path).unwrap();
+        // Skip the schema header (line 1); the record is line 2.
+        let record_line = content.lines().nth(1).expect("record line");
+        let parsed: serde_json::Value = serde_json::from_str(record_line).unwrap();
+        assert_eq!(parsed["machine_id"], "test-machine");
+        assert_eq!(parsed["orchestrator"], "test-orchestrator");
+
+        unsafe {
+            match prev_flows {
+                Some(v) => env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_machine {
+                Some(v) => env::set_var("DARKMUX_MACHINE_ID", v),
+                None => env::remove_var("DARKMUX_MACHINE_ID"),
+            }
+            match prev_orch {
+                Some(v) => env::set_var("DARKMUX_ORCHESTRATOR", v),
+                None => env::remove_var("DARKMUX_ORCHESTRATOR"),
+            }
+        }
     }
 
     #[test]

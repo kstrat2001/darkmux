@@ -39,6 +39,22 @@ cargo install --path .   # install to ~/.cargo/bin/darkmux
 
 The release binary is self-contained (~1.1 MB). Built-in workloads under `templates/builtin/workloads/*.json` are embedded at compile time via `include_str!` — `cargo install --path .` produces a binary that works from any directory without the source tree.
 
+## Environment variables
+
+Flow records (the JSONL stream under `~/.darkmux/flows/` and, when configured, the Redis stream) carry per-record provenance fields that are auto-populated from env vars at write time. `darkmux doctor` surfaces what each resolves to.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `DARKMUX_MACHINE_ID` | hostname | Logical fleet name **stamped at record-write time** on every new flow record. Operator-named (`studio`, `mini-1`) reads better in the topology view than DNS-style hostnames. Pre-1.4.0 records lack the field (which the viewer renders as `unknown`). |
+| `DARKMUX_ORCHESTRATOR` | unset → field omitted | Frontier-tier AI driving this session (e.g. `claude-opus-4-7`, `cursor-anthropic`), **stamped at record-write time**. **Operator-explicit by design** — there's no reliable way to auto-detect the frontier model from inside darkmux. Doctor warns when unset. |
+| `DARKMUX_FLOWS_DIR` | `~/.darkmux/flows` | Where the per-day JSONL files live. |
+| `DARKMUX_REDIS_URL` | unset → LocalFile only | When set, flow records also XADD to the Redis stream (TeeSink with LocalFile + Redis). Coordination substrate; audit stays on disk. See [#162](https://github.com/kstrat2001/darkmux/issues/162) Phase 3. |
+| `DARKMUX_REDIS_STREAM` | `darkmux:flow` | Override the Redis stream name. |
+| `DARKMUX_REDIS_MAXLEN` | `10000` | Approximate retention cap for the Redis stream (`XADD MAXLEN ~ N`); `0` for unbounded. |
+| `DARKMUX_RUNTIME_CMD` | `openclaw` | The agent runtime `darkmux lab run` + `darkmux crew dispatch` shell out to. Point at Aider / Cline / anything with `<cmd> agent --message` to bench an alternative. |
+
+When working on darkmux from a Claude Code (or other frontier) session, export `DARKMUX_ORCHESTRATOR=<your-model>` in the shell so flow records carry orchestrator provenance. This is part of the cultivation discipline tracked in [#130](https://github.com/kstrat2001/darkmux/issues/130).
+
 ## Where things live
 
 ```

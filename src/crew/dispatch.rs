@@ -1032,6 +1032,8 @@ pub(crate) fn build_dispatch_record(
         model: model.map(String::from),
         reasoning: None,
         mission_id: None,
+        machine_id: None,
+        orchestrator: None,
     }
 }
 
