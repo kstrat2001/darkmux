@@ -179,6 +179,24 @@ fn epoch_to_hhmmss(epochs: i64) -> (u8, u8, u8) {
 // public `record()` dispatches through. Tests can override via
 // `set_default_sink_for_tests`.
 
+/// Structured snapshot of a sink's identity + config for diagnostics
+/// (`darkmux flow status`, `darkmux doctor` flow-sink-health). The
+/// tree mirrors the sink composition: a TeeSink reports its `children`,
+/// leaf sinks report empty `children`.
+///
+/// `config` is intentionally a flat key→string map (not a typed enum
+/// per sink) so a new sink kind can be added without touching every
+/// downstream consumer — the human formatter prints whatever's in
+/// `config`; the JSON serializer is a pass-through.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SinkInfo {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub config: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<SinkInfo>,
+}
+
 /// Abstraction over the destination of a flow record. Implementations
 /// own the persistence semantics for their backend (file append, network
 /// publish, etc.). All implementations must be `Send + Sync` because the
@@ -193,6 +211,11 @@ pub trait FlowSink: Send + Sync {
     /// coordinator might want to fall back to a local-file sink on
     /// network failure).
     fn write(&self, record: &FlowRecord) -> Result<()>;
+
+    /// Introspection for diagnostics. Required so `darkmux flow status`
+    /// and the doctor's `flow-sink-health` check can describe the active
+    /// sink graph without per-sink-type knowledge.
+    fn info(&self) -> SinkInfo;
 }
 
 /// File-based flow sink: appends to per-day JSONL files under
@@ -225,6 +248,12 @@ impl FlowSink for LocalFileSink {
         let path = dir.join(format!("{day}.jsonl"));
         record_at(record, &path)
     }
+
+    fn info(&self) -> SinkInfo {
+        let mut config = std::collections::BTreeMap::new();
+        config.insert("flows_dir".to_string(), flows_dir().display().to_string());
+        SinkInfo { kind: "LocalFile".to_string(), config, children: vec![] }
+    }
 }
 
 // ─── RedisSink (#162 Phase 3) ────────────────────────────────────────
@@ -252,6 +281,10 @@ impl FlowSink for LocalFileSink {
 /// coordination AND audit. See #163 + the #162 refinement comment.
 pub struct RedisSink {
     client: redis::Client,
+    /// URL the sink was constructed with — retained for diagnostics
+    /// (`SinkInfo`, `darkmux flow status`). The `redis::Client` consumes
+    /// the URL at construction but doesn't expose it back.
+    url: String,
     stream: String,
     /// Optional MAXLEN ~ N retention cap. None = unbounded (don't use
     /// in production; the stream grows without bound).
@@ -267,10 +300,24 @@ impl RedisSink {
             .with_context(|| format!("opening Redis connection to {url}"))?;
         Ok(Self {
             client,
+            url: url.to_string(),
             stream: stream.to_string(),
             max_len,
         })
     }
+
+    /// Connect + return a usable connection. Exposed for diagnostics
+    /// (status probe, doctor health check) that need to talk to the
+    /// same Redis the sink writes to.
+    pub fn connect(&self) -> Result<redis::Connection> {
+        self.client
+            .get_connection()
+            .with_context(|| format!("connecting to Redis at {}", self.url))
+    }
+
+    pub fn url(&self) -> &str { &self.url }
+    pub fn stream(&self) -> &str { &self.stream }
+    pub fn max_len(&self) -> Option<usize> { self.max_len }
 }
 
 impl FlowSink for RedisSink {
@@ -304,6 +351,17 @@ impl FlowSink for RedisSink {
             .query(&mut conn)
             .with_context(|| format!("XADD to Redis stream `{}`", self.stream))?;
         Ok(())
+    }
+
+    fn info(&self) -> SinkInfo {
+        let mut config = std::collections::BTreeMap::new();
+        config.insert("url".to_string(), self.url.clone());
+        config.insert("stream".to_string(), self.stream.clone());
+        config.insert(
+            "max_len".to_string(),
+            self.max_len.map(|n| n.to_string()).unwrap_or_else(|| "unbounded".to_string()),
+        );
+        SinkInfo { kind: "Redis".to_string(), config, children: vec![] }
     }
 }
 
@@ -344,6 +402,14 @@ impl FlowSink for TeeSink {
         match first_err {
             Some(e) => Err(e),
             None => Ok(()),
+        }
+    }
+
+    fn info(&self) -> SinkInfo {
+        SinkInfo {
+            kind: "Tee".to_string(),
+            config: std::collections::BTreeMap::new(),
+            children: self.sinks.iter().map(|s| s.info()).collect(),
         }
     }
 }
@@ -408,6 +474,13 @@ fn build_default_sink() -> Arc<dyn FlowSink> {
 fn default_sink() -> Arc<dyn FlowSink> {
     static SINK: OnceLock<Arc<dyn FlowSink>> = OnceLock::new();
     SINK.get_or_init(build_default_sink).clone()
+}
+
+/// Introspect the process-wide default sink for diagnostics. Stable
+/// pointer to the same singleton `record()` writes through, so the
+/// reported sink graph cannot drift from the actually-active one.
+pub fn default_sink_info() -> SinkInfo {
+    default_sink().info()
 }
 
 /// Write a record through an explicit sink. Used by tests + future
@@ -499,6 +572,540 @@ pub(crate) fn record_at(record: &FlowRecord, path: &Path) -> Result<()> {
         }
         Err(e) => Err(e).with_context(|| format!("creating flow log {}", path.display())),
     }
+}
+
+// ─── Status surface (#170) ────────────────────────────────────────────
+//
+// `darkmux flow status` and the doctor's `flow-sink-health` check both
+// read from `collect_status()`. The single collector ensures the CLI
+// surface and the doctor never drift — same probes, same data shape.
+//
+// Side effects: opens a Redis connection when Redis is configured (so
+// the operator gets accurate reachability + XLEN data). Disk probes are
+// read-only file I/O. No record writes.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlowStatus {
+    pub schema_version: String,
+    pub sinks: SinkSummary,
+    /// Present when Redis is configured (via `DARKMUX_REDIS_URL` env
+    /// or appearing in the sink graph); `None` otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redis: Option<RedisStatus>,
+    pub disk: DiskStatus,
+    pub schema: SchemaSkew,
+    pub overall_state: HealthState,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warn_reasons: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fail_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SinkSummary {
+    pub info: SinkInfo,
+    /// Flat list of active leaf sink kinds — e.g., `["LocalFile", "Redis"]`.
+    pub active_kinds: Vec<String>,
+    /// Human-readable composition string — e.g., `Tee([LocalFile, Redis])`.
+    pub composition: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedisStatus {
+    pub url: String,
+    pub stream: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_len: Option<usize>,
+    pub reachable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reachability_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub xlen: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_ts: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub newest_ts: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_probe_ms: Option<u128>,
+    /// True when XLEN is within 5% of MAXLEN — warns the operator the
+    /// stream is about to start trimming old records.
+    pub near_max_len: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiskStatus {
+    pub flows_dir: String,
+    pub exists: bool,
+    pub day_files: u64,
+    pub total_bytes: u64,
+    /// Distinct schema versions observed in day files (header line of
+    /// each `YYYY-MM-DD.jsonl`). Skew detection cross-references this
+    /// with `SchemaSkew.observed_versions` (which probes Redis).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observed_disk_schemas: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchemaSkew {
+    pub writer_version: String,
+    /// Distinct schema strings observed in the active Redis stream
+    /// (best-effort XREVRANGE of the last N entries). Empty when no
+    /// Redis is configured.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observed_versions: Vec<String>,
+    pub skew_detected: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skew_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum HealthState {
+    Ok,
+    Warn,
+    Fail,
+}
+
+/// Build a status snapshot. Cheap: ~10ms when Redis is reachable, sub-ms
+/// when it isn't. Safe to call from CLI + doctor + daemon endpoint without
+/// concern for throughput — the result is meant to be consumed by humans
+/// or by a polling UI (every 30s+).
+pub fn collect_status() -> FlowStatus {
+    let info = default_sink_info();
+    let (active_kinds, composition) = summarize_sink(&info);
+    let redis_cfg = find_redis_cfg(&info);
+
+    let (redis, redis_observed) = if let Some(cfg) = redis_cfg.clone() {
+        let (status, observed) = probe_redis(&cfg);
+        (Some(status), observed)
+    } else {
+        (None, vec![])
+    };
+
+    let disk = probe_disk();
+
+    let mut warn_reasons = Vec::new();
+    let mut fail_reasons = Vec::new();
+
+    // Skew detection: ONLY Redis-observed schemas count as "live writers".
+    // Disk-header schemas from older day files are historical artifacts of
+    // earlier writer versions and SHOULD NOT trigger skew warnings on every
+    // run — that would mean every operator who's been on darkmux >1 schema
+    // bump sees a permanent warn. The Redis stream, by contrast, reflects
+    // currently-active writers in the fleet.
+    //
+    // The disk-schemas data is still surfaced (in DiskStatus.observed_disk_schemas
+    // and SchemaSkew.observed_versions) for diagnostic transparency, but
+    // doesn't gate the warn_reasons rollup.
+    let mut all_versions: Vec<String> = disk
+        .observed_disk_schemas
+        .iter()
+        .chain(redis_observed.iter())
+        .cloned()
+        .collect();
+    all_versions.sort();
+    all_versions.dedup();
+    let live_foreign: Vec<String> = redis_observed
+        .iter()
+        .filter(|v| v.as_str() != FLOW_SCHEMA_VERSION)
+        .cloned()
+        .collect();
+    let skew_detected = !live_foreign.is_empty();
+    let skew_reason = if skew_detected {
+        Some(format!(
+            "writer is {} but live Redis stream shows {} — at least one other writer in the fleet is on a different schema",
+            FLOW_SCHEMA_VERSION,
+            live_foreign.join(", ")
+        ))
+    } else {
+        None
+    };
+    if skew_detected {
+        warn_reasons.push("schema_skew_detected".to_string());
+    }
+
+    if let Some(r) = redis.as_ref() {
+        if !r.reachable {
+            warn_reasons.push("redis_unreachable".to_string());
+        }
+        if r.near_max_len {
+            warn_reasons.push("redis_stream_near_maxlen".to_string());
+        }
+    }
+
+    if !disk.exists {
+        // Disk dir absent isn't fatal — first-write creates it — but the
+        // operator should know they have no flows yet.
+        warn_reasons.push("flows_dir_absent".to_string());
+    }
+
+    // Total sink unreachability: no active sinks (shouldn't happen — at
+    // minimum LocalFile is always available — but guard anyway).
+    if active_kinds.is_empty() {
+        fail_reasons.push("no_active_sinks".to_string());
+    }
+
+    let overall_state = if !fail_reasons.is_empty() {
+        HealthState::Fail
+    } else if !warn_reasons.is_empty() {
+        HealthState::Warn
+    } else {
+        HealthState::Ok
+    };
+
+    FlowStatus {
+        schema_version: FLOW_SCHEMA_VERSION.to_string(),
+        sinks: SinkSummary { info, active_kinds, composition },
+        redis,
+        disk,
+        schema: SchemaSkew {
+            writer_version: FLOW_SCHEMA_VERSION.to_string(),
+            observed_versions: all_versions,
+            skew_detected,
+            skew_reason,
+        },
+        overall_state,
+        warn_reasons,
+        fail_reasons,
+    }
+}
+
+/// Flat list of leaf kinds + composition string for a sink tree.
+fn summarize_sink(info: &SinkInfo) -> (Vec<String>, String) {
+    fn walk_kinds(info: &SinkInfo, out: &mut Vec<String>) {
+        if info.children.is_empty() {
+            out.push(info.kind.to_string());
+        } else {
+            for child in &info.children {
+                walk_kinds(child, out);
+            }
+        }
+    }
+    fn walk_composition(info: &SinkInfo) -> String {
+        if info.children.is_empty() {
+            info.kind.to_string()
+        } else {
+            let inner: Vec<String> = info.children.iter().map(walk_composition).collect();
+            format!("{}([{}])", info.kind, inner.join(", "))
+        }
+    }
+    let mut kinds = Vec::new();
+    walk_kinds(info, &mut kinds);
+    (kinds, walk_composition(info))
+}
+
+/// Redis config extracted from a SinkInfo tree.
+#[derive(Debug, Clone)]
+struct RedisCfg {
+    url: String,
+    stream: String,
+    max_len: Option<usize>,
+}
+
+fn find_redis_cfg(info: &SinkInfo) -> Option<RedisCfg> {
+    if info.kind == "Redis" {
+        return Some(RedisCfg {
+            url: info.config.get("url").cloned().unwrap_or_default(),
+            stream: info.config.get("stream").cloned().unwrap_or_default(),
+            max_len: info
+                .config
+                .get("max_len")
+                .and_then(|s| s.parse::<usize>().ok()),
+        });
+    }
+    info.children.iter().find_map(find_redis_cfg)
+}
+
+/// Redact `:password@` in a Redis URL for diagnostic display. Operators
+/// who put credentials in `DARKMUX_REDIS_URL` shouldn't have those creds
+/// echoed back through `darkmux flow status` (which is exposed via the
+/// daemon's permissive-CORS endpoint and shown in the browser modal).
+/// (#170 QA Q7)
+///
+/// Conservative: anything between the scheme and the host that contains
+/// `@` is treated as `<userinfo>@`; the password portion (after the first
+/// `:` in userinfo) is replaced with `***`. URLs without an `@` are
+/// returned unchanged.
+pub(crate) fn redact_url_creds(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let Some((userinfo, host)) = rest.split_once('@') else {
+        return url.to_string();
+    };
+    let masked_userinfo = if let Some((user, _pass)) = userinfo.split_once(':') {
+        format!("{user}:***")
+    } else {
+        // username only, no password — still keep the username visible.
+        userinfo.to_string()
+    };
+    format!("{scheme}://{masked_userinfo}@{host}")
+}
+
+/// Probe Redis: open a connection, run XLEN + XREVRANGE for oldest/newest,
+/// time the round-trip. Returns the status + the list of distinct schema
+/// strings observed in the last 100 entries (for skew detection).
+fn probe_redis(cfg: &RedisCfg) -> (RedisStatus, Vec<String>) {
+    let start = std::time::Instant::now();
+    let client = match redis::Client::open(cfg.url.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                RedisStatus {
+                    url: redact_url_creds(&cfg.url),
+                    stream: cfg.stream.clone(),
+                    max_len: cfg.max_len,
+                    reachable: false,
+                    reachability_error: Some(format!("client open: {e}")),
+                    xlen: None,
+                    oldest_ts: None,
+                    newest_ts: None,
+                    last_probe_ms: None,
+                    near_max_len: false,
+                },
+                vec![],
+            );
+        }
+    };
+
+    let mut conn = match client.get_connection() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                RedisStatus {
+                    url: redact_url_creds(&cfg.url),
+                    stream: cfg.stream.clone(),
+                    max_len: cfg.max_len,
+                    reachable: false,
+                    reachability_error: Some(format!("connect: {e}")),
+                    xlen: None,
+                    oldest_ts: None,
+                    newest_ts: None,
+                    last_probe_ms: None,
+                    near_max_len: false,
+                },
+                vec![],
+            );
+        }
+    };
+
+    let xlen_res: redis::RedisResult<u64> = redis::cmd("XLEN").arg(&cfg.stream).query(&mut conn);
+    let xlen = xlen_res.ok();
+
+    // XINFO STREAM <key> would give first-entry / last-entry IDs in one
+    // shot, but parsing its mixed-array response across redis-rs versions
+    // is fragile. XRANGE/XREVRANGE with COUNT 1 is unambiguous.
+    let oldest_id: Option<String> = redis::cmd("XRANGE")
+        .arg(&cfg.stream)
+        .arg("-")
+        .arg("+")
+        .arg("COUNT")
+        .arg(1)
+        .query::<Vec<(String, Vec<(String, String)>)>>(&mut conn)
+        .ok()
+        .and_then(|v| v.into_iter().next().map(|(id, _)| id));
+    let (newest_id, schemas) = redis::cmd("XREVRANGE")
+        .arg(&cfg.stream)
+        .arg("+")
+        .arg("-")
+        .arg("COUNT")
+        .arg(100)
+        .query::<Vec<(String, Vec<(String, String)>)>>(&mut conn)
+        .map(|entries| {
+            let newest = entries.first().map(|(id, _)| id.clone());
+            let schemas: Vec<String> = entries
+                .iter()
+                .filter_map(|(_, fields)| {
+                    fields
+                        .iter()
+                        .find(|(k, _)| k == "schema")
+                        .map(|(_, v)| v.clone())
+                })
+                .collect();
+            (newest, schemas)
+        })
+        .unwrap_or((None, vec![]));
+
+    let mut observed = schemas;
+    observed.sort();
+    observed.dedup();
+
+    let last_probe_ms = start.elapsed().as_millis();
+
+    let near_max_len = match (cfg.max_len, xlen) {
+        (Some(cap), Some(len)) if cap > 0 => (len as f64) / (cap as f64) >= 0.95,
+        _ => false,
+    };
+
+    (
+        RedisStatus {
+            url: redact_url_creds(&cfg.url),
+            stream: cfg.stream.clone(),
+            max_len: cfg.max_len,
+            reachable: true,
+            reachability_error: None,
+            xlen,
+            oldest_ts: oldest_id,
+            newest_ts: newest_id,
+            last_probe_ms: Some(last_probe_ms),
+            near_max_len,
+        },
+        observed,
+    )
+}
+
+/// Probe disk: count day files in flows_dir, sum sizes, gather header
+/// schema versions for skew detection.
+fn probe_disk() -> DiskStatus {
+    let dir = flows_dir();
+    let dir_str = dir.display().to_string();
+
+    let entries = match fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => {
+            return DiskStatus {
+                flows_dir: dir_str,
+                exists: false,
+                day_files: 0,
+                total_bytes: 0,
+                observed_disk_schemas: vec![],
+            };
+        }
+    };
+
+    let mut day_files = 0u64;
+    let mut total_bytes = 0u64;
+    let mut schemas: Vec<String> = Vec::new();
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        // YYYY-MM-DD.jsonl naming convention.
+        if !name.ends_with(".jsonl") || name.len() < 16 {
+            continue;
+        }
+        day_files += 1;
+        if let Ok(meta) = entry.metadata() {
+            total_bytes += meta.len();
+        }
+        // Read just the first line (schema header) without slurping the
+        // whole file. Capped at 64 KiB to guard against a corrupted
+        // newline-free file forcing an unbounded read — the actual schema
+        // header is ~80 bytes (#170 QA S3).
+        if let Ok(file) = fs::File::open(&path) {
+            use std::io::{BufRead, BufReader, Read};
+            let mut reader = BufReader::new(file.take(64 * 1024));
+            let mut first = String::new();
+            if reader.read_line(&mut first).is_ok() {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(first.trim()) {
+                    if let Some(v) = val.get("version").and_then(|v| v.as_str()) {
+                        schemas.push(v.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    schemas.sort();
+    schemas.dedup();
+
+    DiskStatus {
+        flows_dir: dir_str,
+        exists: true,
+        day_files,
+        total_bytes,
+        observed_disk_schemas: schemas,
+    }
+}
+
+/// Human-readable rendering of a `FlowStatus`. The CLI's default
+/// (non-`--json`) output.
+pub fn format_status_human(status: &FlowStatus) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+
+    let state_marker = match status.overall_state {
+        HealthState::Ok => "✓ ok",
+        HealthState::Warn => "⚠ warn",
+        HealthState::Fail => "✗ fail",
+    };
+    let _ = writeln!(out, "darkmux flow status — {state_marker}");
+    let _ = writeln!(out, "  schema:       {}", status.schema_version);
+    let _ = writeln!(out, "  composition:  {}", status.sinks.composition);
+
+    if let Some(r) = status.redis.as_ref() {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "Redis");
+        let _ = writeln!(out, "  url:          {}", r.url);
+        let _ = writeln!(out, "  stream:       {}", r.stream);
+        let _ = writeln!(
+            out,
+            "  max_len:      {}",
+            r.max_len.map(|n| n.to_string()).unwrap_or_else(|| "unbounded".into())
+        );
+        let _ = writeln!(out, "  reachable:    {}", r.reachable);
+        if let Some(err) = r.reachability_error.as_ref() {
+            let _ = writeln!(out, "  error:        {err}");
+        }
+        if let Some(n) = r.xlen {
+            let _ = writeln!(out, "  xlen:         {n}");
+        }
+        if let Some(id) = r.oldest_ts.as_ref() {
+            let _ = writeln!(out, "  oldest_id:    {id}");
+        }
+        if let Some(id) = r.newest_ts.as_ref() {
+            let _ = writeln!(out, "  newest_id:    {id}");
+        }
+        if let Some(ms) = r.last_probe_ms {
+            let _ = writeln!(out, "  probe_ms:     {ms}");
+        }
+        if r.near_max_len {
+            let _ = writeln!(out, "  ⚠ stream is ≥95% of max_len — older records will be trimmed soon");
+        }
+    } else {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "Redis: not configured (set DARKMUX_REDIS_URL to enable)");
+    }
+
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Disk");
+    let _ = writeln!(out, "  flows_dir:    {}", status.disk.flows_dir);
+    let _ = writeln!(out, "  exists:       {}", status.disk.exists);
+    let _ = writeln!(out, "  day_files:    {}", status.disk.day_files);
+    let _ = writeln!(out, "  total_bytes:  {}", status.disk.total_bytes);
+
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Schema");
+    let _ = writeln!(out, "  writer:       {}", status.schema.writer_version);
+    if status.schema.observed_versions.is_empty() {
+        let _ = writeln!(out, "  observed:     (none)");
+    } else {
+        let _ = writeln!(out, "  observed:     {}", status.schema.observed_versions.join(", "));
+    }
+    let _ = writeln!(out, "  skew:         {}", status.schema.skew_detected);
+    if let Some(reason) = status.schema.skew_reason.as_ref() {
+        let _ = writeln!(out, "  reason:       {reason}");
+    }
+
+    if !status.warn_reasons.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "Warnings:");
+        for r in &status.warn_reasons {
+            let _ = writeln!(out, "  - {r}");
+        }
+    }
+    if !status.fail_reasons.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "Failures:");
+        for r in &status.fail_reasons {
+            let _ = writeln!(out, "  - {r}");
+        }
+    }
+
+    out
 }
 
 #[cfg(test)]
@@ -930,6 +1537,9 @@ mod tests {
             self.captured.lock().unwrap().push(record.clone());
             Ok(())
         }
+        fn info(&self) -> SinkInfo {
+            SinkInfo { kind: "InMemory".to_string(), config: Default::default(), children: vec![] }
+        }
     }
 
     #[test]
@@ -1002,6 +1612,9 @@ mod tests {
     impl FlowSink for FailingSink {
         fn write(&self, _record: &FlowRecord) -> Result<()> {
             anyhow::bail!("simulated sink failure for test")
+        }
+        fn info(&self) -> SinkInfo {
+            SinkInfo { kind: "Failing".to_string(), config: Default::default(), children: vec![] }
         }
     }
 
@@ -1184,5 +1797,111 @@ mod tests {
         // CARGO_PKG_VERSION is set by cargo; check it's a non-empty string.
         let ver: &str = header["darkmux_version"].as_str().unwrap();
         assert!(!ver.is_empty());
+    }
+
+    // ─── Status surface tests (#170) ────────────────────────────────
+
+    #[test]
+    fn summarize_sink_flat_local() {
+        let info = LocalFileSink::new().info();
+        let (kinds, composition) = summarize_sink(&info);
+        assert_eq!(kinds, vec!["LocalFile"]);
+        assert_eq!(composition, "LocalFile");
+    }
+
+    #[test]
+    fn summarize_sink_nested_tee() {
+        let info = SinkInfo {
+            kind: "Tee".to_string(),
+            config: Default::default(),
+            children: vec![
+                LocalFileSink::new().info(),
+                SinkInfo {
+                    kind: "Redis".to_string(),
+                    config: Default::default(),
+                    children: vec![],
+                },
+            ],
+        };
+        let (kinds, composition) = summarize_sink(&info);
+        assert_eq!(kinds, vec!["LocalFile", "Redis"]);
+        assert_eq!(composition, "Tee([LocalFile, Redis])");
+    }
+
+    #[test]
+    fn find_redis_cfg_walks_into_tee() {
+        let info = SinkInfo {
+            kind: "Tee".to_string(),
+            config: Default::default(),
+            children: vec![
+                LocalFileSink::new().info(),
+                {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert("url".to_string(), "redis://x:1234".to_string());
+                    m.insert("stream".to_string(), "test:stream".to_string());
+                    m.insert("max_len".to_string(), "5000".to_string());
+                    SinkInfo { kind: "Redis".to_string(), config: m, children: vec![] }
+                },
+            ],
+        };
+        let cfg = find_redis_cfg(&info).expect("redis cfg should be found");
+        assert_eq!(cfg.url, "redis://x:1234");
+        assert_eq!(cfg.stream, "test:stream");
+        assert_eq!(cfg.max_len, Some(5000));
+    }
+
+    #[test]
+    fn find_redis_cfg_returns_none_when_absent() {
+        let info = LocalFileSink::new().info();
+        assert!(find_redis_cfg(&info).is_none());
+    }
+
+    #[test]
+    fn collect_status_produces_serializable_snapshot() {
+        // collect_status() reads real env + disk + Redis; we just verify
+        // the snapshot serializes round-trip without error. The expensive
+        // probes degrade gracefully when their backends are absent.
+        let status = collect_status();
+        let json = serde_json::to_string(&status).expect("FlowStatus must be serializable");
+        let parsed: FlowStatus =
+            serde_json::from_str(&json).expect("FlowStatus must round-trip");
+        assert_eq!(parsed.schema_version, FLOW_SCHEMA_VERSION);
+        assert!(!parsed.sinks.active_kinds.is_empty());
+    }
+
+    #[test]
+    fn redact_url_creds_masks_password() {
+        assert_eq!(
+            redact_url_creds("redis://kain:hunter2@redis.example.com:6379/0"),
+            "redis://kain:***@redis.example.com:6379/0"
+        );
+        // Password-only userinfo (empty user) — still mask the password.
+        assert_eq!(
+            redact_url_creds("redis://:onlypass@host:6379"),
+            "redis://:***@host:6379"
+        );
+        // Username-only (no colon) — leave as-is (no secret to hide).
+        assert_eq!(
+            redact_url_creds("redis://user@host:6379"),
+            "redis://user@host:6379"
+        );
+        // No creds at all — unchanged.
+        assert_eq!(
+            redact_url_creds("redis://127.0.0.1:6379"),
+            "redis://127.0.0.1:6379"
+        );
+        // Non-URL string — returned verbatim, no panic.
+        assert_eq!(redact_url_creds("garbage"), "garbage");
+    }
+
+    #[test]
+    fn human_format_includes_all_sections() {
+        let status = collect_status();
+        let text = format_status_human(&status);
+        assert!(text.contains("darkmux flow status"));
+        assert!(text.contains("schema:"));
+        assert!(text.contains("composition:"));
+        assert!(text.contains("Disk"));
+        assert!(text.contains("Schema"));
     }
 }

@@ -90,9 +90,67 @@ pub fn run() -> DoctorReport {
         check_platform_and_provider(),
         check_agent_role_definitions(),
         check_crew_role_prompt_coverage(),
+        check_flow_sink_health(),
     ];
     checks.extend(eureka_checks());
     DoctorReport { checks }
+}
+
+/// Roll up `flow::collect_status()` into a single doctor check. Pass when
+/// `overall_state=ok`; warn when warn (with the reasons listed); fail
+/// when fail. The full diagnostic detail lives in `darkmux flow status`;
+/// this check is the operator-glance signal that something needs a
+/// closer look. (#170)
+fn check_flow_sink_health() -> Check {
+    let status = crate::flow::collect_status();
+    let composition = status.sinks.composition.clone();
+    match status.overall_state {
+        crate::flow::HealthState::Ok => Check {
+            name: "flow sink health".into(),
+            status: Status::Pass,
+            message: format!(
+                "{composition} healthy · schema {} · {} day file(s)",
+                status.schema_version, status.disk.day_files
+            ),
+            hint: None,
+        },
+        crate::flow::HealthState::Warn => {
+            let reasons = if status.warn_reasons.is_empty() {
+                "(no specific warn reasons captured)".to_string()
+            } else {
+                status.warn_reasons.join(", ")
+            };
+            Check {
+                name: "flow sink health".into(),
+                status: Status::Warn,
+                message: format!("{composition} · warnings: {reasons}"),
+                hint: Some(
+                    "Run `darkmux flow status` for full detail. Common fixes: \
+                     start Redis (`brew services start redis`) if `redis_unreachable`; \
+                     raise `DARKMUX_REDIS_MAXLEN` if `redis_stream_near_maxlen`; \
+                     upgrade the lagging writer in the fleet if `schema_skew_detected`."
+                        .into(),
+                ),
+            }
+        }
+        crate::flow::HealthState::Fail => {
+            let reasons = if status.fail_reasons.is_empty() {
+                "(no specific failure reasons captured)".to_string()
+            } else {
+                status.fail_reasons.join(", ")
+            };
+            Check {
+                name: "flow sink health".into(),
+                status: Status::Fail,
+                message: format!("{composition} · failures: {reasons}"),
+                hint: Some(
+                    "Run `darkmux flow status` for diagnostic detail. Sink configuration is broken — \
+                     flow records may be silently dropped."
+                        .into(),
+                ),
+            }
+        }
+    }
 }
 
 /// Verify every embedded crew-role manifest has a sibling `.md` prompt
@@ -1606,12 +1664,13 @@ mod tests {
     #[test]
     fn run_returns_static_plus_eureka_checks() {
         let r = run();
-        // 14 baseline checks (incl. runtime version + load projection +
+        // 15 baseline checks (incl. runtime version + load projection +
         // daemon reachable + darkmux-version-vs-latest-release [#13] +
-        // crew-role-prompt-coverage [#141]) + one per active eureka rule.
-        // Every check should appear regardless of environment — even if
-        // the underlying probe couldn't read state.
-        let expected = 14 + crate::eureka::all_rules().len();
+        // crew-role-prompt-coverage [#141] + flow-sink-health [#170])
+        // + one per active eureka rule. Every check should appear
+        // regardless of environment — even if the underlying probe
+        // couldn't read state.
+        let expected = 15 + crate::eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
