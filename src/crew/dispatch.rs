@@ -20,10 +20,27 @@ use crate::crew::types::Role;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value, json};
 use std::fs;
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Roles whose prompts operate in domains regulated by professional
+/// licensure (health, law, athletics-as-RD-adjacent). Each prompt opens
+/// with a "You are NOT a physician / attorney / trainer" framing, but the
+/// operator never sees that text unless they go read the .md file. The
+/// CLI-side acknowledgment gate (`require_licensed_adjacent_ack`) makes
+/// the same disclaimer visible to the operator before first dispatch,
+/// and records the timestamped ack at
+/// `~/.darkmux/acks/<role>.ack`. The ack is operator-sovereign:
+/// the operator can pre-create the file (`touch ~/.darkmux/acks/<role>.ack`)
+/// to skip the prompt in scripted contexts, or delete it to re-trigger.
+const LICENSED_ADJACENT_ROLES: &[&str] = &[
+    "health-research",
+    "legal-research",
+    "fitness-coach",
+];
 
 /// Default openclaw config path. `DARKMUX_OPENCLAW_CONFIG` env var overrides
 /// (e.g., for tests).
@@ -60,6 +77,139 @@ fn agent_dirs_for(role_id: &str, openclaw_root: &Path) -> (PathBuf, PathBuf) {
     let agent_dir = openclaw_root.join("agents").join("darkmux").join(role_id).join("agent");
     let workspace = openclaw_root.join(format!("workspace-darkmux-{role_id}"));
     (agent_dir, workspace)
+}
+
+/// Resolve the directory where licensed-adjacent acknowledgment files
+/// live. Defaults to `~/.darkmux/acks/`. The `DARKMUX_ACK_DIR` env var
+/// overrides — used by tests, also available for operators who want to
+/// keep the acks in a different location.
+fn ack_dir() -> Result<PathBuf> {
+    if let Ok(p) = std::env::var("DARKMUX_ACK_DIR") {
+        let trimmed = p.trim();
+        if !trimmed.is_empty() {
+            return Ok(PathBuf::from(trimmed));
+        }
+    }
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("no home directory found"))?;
+    Ok(home.join(".darkmux").join("acks"))
+}
+
+fn ack_file_for(role_id: &str) -> Result<PathBuf> {
+    Ok(ack_dir()?.join(format!("{role_id}.ack")))
+}
+
+/// Print the licensed-adjacent disclosure banner to stderr. Separated so
+/// tests can verify the gate's behavior without coupling to terminal IO.
+fn print_licensed_adjacent_banner(role_id: &str) {
+    eprintln!();
+    eprintln!("=== licensed-adjacent role: {role_id} ===");
+    eprintln!(
+        "This role operates in a domain regulated by professional licensure."
+    );
+    eprintln!(
+        "It is a research / organization assistant — NOT a substitute for a"
+    );
+    eprintln!(
+        "licensed professional. The role's full doctrine is in the .md prompt"
+    );
+    eprintln!(
+        "at templates/builtin/crew/roles/{role_id}.md in the darkmux source"
+    );
+    eprintln!(
+        "(or your override at ~/.darkmux/crew/roles/{role_id}.md if set)."
+    );
+    eprintln!();
+    eprintln!("By acknowledging, you confirm you understand:");
+    eprintln!(
+        "  - The local LLM may deviate from its system prompt under adversarial"
+    );
+    eprintln!(
+        "    or persistent prompting. The prompt IS the only runtime boundary."
+    );
+    eprintln!(
+        "  - You are solely responsible for following jurisdiction-specific"
+    );
+    eprintln!(
+        "    licensure rules (UPL / UPM / scope-of-practice)."
+    );
+    eprintln!(
+        "  - Time-sensitive situations (medical emergency, served lawsuit,"
+    );
+    eprintln!(
+        "    acute pain) go to professionals, not this tool."
+    );
+    eprintln!();
+}
+
+/// Licensed-adjacent ACK gate. For roles whose prompts operate in
+/// regulated domains, require an operator acknowledgment on first
+/// dispatch. The ack persists at `~/.darkmux/acks/<role>.ack` (or
+/// `$DARKMUX_ACK_DIR/<role>.ack` if set).
+///
+/// **Operator-sovereign escape hatches:**
+/// - Pre-create the file (`mkdir -p ~/.darkmux/acks && touch
+///   ~/.darkmux/acks/<role>.ack`) to skip the prompt in scripted use.
+/// - Delete the file to re-trigger the prompt on next dispatch.
+///
+/// **Non-interactive without prior ack:** bails with a clear error and
+/// the operator-facing instruction for how to pre-acknowledge.
+///
+/// **No-op for non-licensed-adjacent roles.**
+fn require_licensed_adjacent_ack(role_id: &str) -> Result<()> {
+    if !LICENSED_ADJACENT_ROLES.contains(&role_id) {
+        return Ok(());
+    }
+    let ack_path = ack_file_for(role_id)?;
+    if ack_path.exists() {
+        return Ok(());
+    }
+
+    print_licensed_adjacent_banner(role_id);
+
+    // Non-interactive (stdin not a TTY) → bail with operator-facing
+    // remediation. The contract is that the ack is operator-explicit;
+    // we don't auto-acknowledge for scripted callers.
+    if !std::io::stdin().is_terminal() {
+        bail!(
+            "licensed-adjacent role `{role_id}` requires operator acknowledgment, \
+             but stdin is not a TTY. To pre-acknowledge in scripted contexts, run:\n\
+             \n  mkdir -p {} && touch {}\n\
+             \nThen re-run the dispatch.",
+            ack_dir()?.display(),
+            ack_path.display()
+        );
+    }
+
+    // Interactive: prompt for the ACKNOWLEDGE token. Anything else aborts.
+    eprint!("Type ACKNOWLEDGE to continue (or Ctrl-C to abort): ");
+    std::io::stderr().flush().ok();
+    let mut input = String::new();
+    let stdin = std::io::stdin();
+    stdin
+        .lock()
+        .read_line(&mut input)
+        .context("reading acknowledgment from stdin")?;
+    if input.trim() != "ACKNOWLEDGE" {
+        bail!(
+            "acknowledgment not given (got `{}`); dispatch aborted",
+            input.trim()
+        );
+    }
+
+    let dir = ack_dir()?;
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("creating ack directory at {}", dir.display()))?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let stamp = format!("acknowledged_at_unix_seconds={now}\n");
+    fs::write(&ack_path, stamp)
+        .with_context(|| format!("writing ack file at {}", ack_path.display()))?;
+    eprintln!();
+    eprintln!("Acknowledged. Recorded at {}.", ack_path.display());
+    eprintln!();
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -278,6 +428,14 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     let role = load_role_or_bail(&opts.role_id)?;
     let prompt = role_prompt_or_bail(&role)?;
     let agent_id = agent_id_for(&opts.role_id);
+
+    // 1.5. Licensed-adjacent ACK gate. For roles whose prompts operate
+    //      in domains regulated by professional licensure (health, law,
+    //      fitness), require an operator acknowledgment on first dispatch.
+    //      The prompts encode the boundary at runtime; this gate makes the
+    //      same boundary visible to the operator at the CLI surface.
+    require_licensed_adjacent_ack(&opts.role_id)
+        .context("licensed-adjacent role dispatch requires acknowledgment")?;
 
     // 2. Pre-flight against openclaw config
     if !opts.skip_preflight {
@@ -719,6 +877,66 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn licensed_adjacent_ack_passes_when_ack_file_exists() {
+        let tmp = TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_ACK_DIR").ok();
+        // Safety: tests mutate process env; the serial attribute keeps them
+        // from racing each other.
+        unsafe { std::env::set_var("DARKMUX_ACK_DIR", tmp.path()); }
+        std::fs::create_dir_all(tmp.path()).unwrap();
+        std::fs::write(tmp.path().join("health-research.ack"), "test").unwrap();
+
+        // ACK file present → returns Ok without prompting.
+        require_licensed_adjacent_ack("health-research").unwrap();
+
+        // Restore env.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_ACK_DIR", v),
+                None => std::env::remove_var("DARKMUX_ACK_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn licensed_adjacent_ack_is_noop_for_other_roles() {
+        // No DARKMUX_ACK_DIR set, no ack file, no TTY input — but for
+        // a non-licensed-adjacent role, the gate is a no-op and returns Ok.
+        // `serial_test::serial` is defensive: the function's current
+        // implementation short-circuits before reading any env, but if a
+        // future refactor moves env reads earlier this test must not race
+        // the other two serialized tests that mutate DARKMUX_ACK_DIR.
+        require_licensed_adjacent_ack("coder").unwrap();
+        require_licensed_adjacent_ack("analyst").unwrap();
+        require_licensed_adjacent_ack("scribe").unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn licensed_adjacent_ack_bails_when_no_tty_and_no_ack_file() {
+        let tmp = TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_ACK_DIR").ok();
+        // Safety: serialized.
+        unsafe { std::env::set_var("DARKMUX_ACK_DIR", tmp.path()); }
+
+        // Stdin in tests is not a TTY → the gate should bail with a
+        // clear remediation message rather than block on read.
+        let err = require_licensed_adjacent_ack("legal-research").unwrap_err();
+        let s = format!("{err:#}");
+        assert!(s.contains("requires operator acknowledgment"), "got: {s}");
+        assert!(s.contains("mkdir -p"), "got: {s}");
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_ACK_DIR", v),
+                None => std::env::remove_var("DARKMUX_ACK_DIR"),
+            }
+        }
+    }
+
+    #[test]
     fn agent_dirs_use_nested_namespace_for_agentdir() {
         let root = Path::new("/tmp/.openclaw");
         let (agent_dir, workspace) = agent_dirs_for("code-reviewer", root);
@@ -879,8 +1097,7 @@ mod tests {
     }
 
     // ─── #89: watched-state snapshot ───────────────────────────────────────
-
-    use std::io::Write as _;
+    // (std::io::Write is already imported at the top of the module.)
 
     fn write_file(path: &Path, contents: &[u8]) {
         if let Some(parent) = path.parent() {
