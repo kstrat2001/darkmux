@@ -42,14 +42,32 @@ const BUILTIN_CAPABILITIES: &[(&str, &str)] = &[
 
 /// Role system prompts (`.md`) compiled into the binary. Used as the
 /// fallback source when no user-side `<crew_root>/roles/<id>.md` exists.
-/// New roles' `.md` prompts are added here when Pair 2 of the bake-off
-/// (shape #2 — design-y prose) lands their content.
-const BUILTIN_ROLE_PROMPTS: &[(&str, &str)] = &[
+/// One entry per role advertised in `BUILTIN_ROLES`; the
+/// `crew_role_prompt_coverage` doctor check verifies this invariant.
+pub(crate) const BUILTIN_ROLE_PROMPTS: &[(&str, &str)] = &[
     ("coder", include_str!("../../templates/builtin/crew/roles/coder.md")),
     ("scribe", include_str!("../../templates/builtin/crew/roles/scribe.md")),
     ("code-reviewer", include_str!("../../templates/builtin/crew/roles/code-reviewer.md")),
     ("mission-compiler", include_str!("../../templates/builtin/crew/roles/mission-compiler.md")),
+    ("analyst", include_str!("../../templates/builtin/crew/roles/analyst.md")),
+    ("design-reviewer", include_str!("../../templates/builtin/crew/roles/design-reviewer.md")),
+    ("lab-runner", include_str!("../../templates/builtin/crew/roles/lab-runner.md")),
+    ("test-designer", include_str!("../../templates/builtin/crew/roles/test-designer.md")),
+    ("voice-editor", include_str!("../../templates/builtin/crew/roles/voice-editor.md")),
 ];
+
+/// Expose the embedded role-id list for callers that need to verify
+/// prompt coverage against `BUILTIN_ROLES` (e.g., doctor checks). Kept
+/// thin so the visibility surface stays minimal.
+pub(crate) fn builtin_roles_ids() -> Vec<&'static str> {
+    BUILTIN_ROLES.iter().map(|(id, _)| *id).collect()
+}
+
+/// Same shape for embedded role-prompt ids. Used by doctor's
+/// `crew_role_prompt_coverage` check.
+pub(crate) fn builtin_role_prompt_ids() -> Vec<&'static str> {
+    BUILTIN_ROLE_PROMPTS.iter().map(|(id, _)| *id).collect()
+}
 
 /// Missions compiled into the binary at build time.
 const BUILTIN_MISSIONS: &[(&str, &str)] = &[];

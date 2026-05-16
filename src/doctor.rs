@@ -89,9 +89,59 @@ pub fn run() -> DoctorReport {
         check_power_state(),
         check_platform_and_provider(),
         check_agent_role_definitions(),
+        check_crew_role_prompt_coverage(),
     ];
     checks.extend(eureka_checks());
     DoctorReport { checks }
+}
+
+/// Verify every embedded crew-role manifest has a sibling `.md` prompt
+/// embedded too. The dispatcher errors at runtime when a manifest exists
+/// without a prompt (`crew dispatch <role>` fails with *"role X has no
+/// .md system prompt"*); this check surfaces the gap pre-dispatch so
+/// operators don't discover it by failing a dispatch.
+///
+/// Surfaced empirically during the 2026-05-15 100%-local engagement
+/// experiment, when 6 dispatches to `analyst` failed instantly because
+/// the manifest existed but the prompt didn't. See
+/// kstrat2001/darkmux#141 for context.
+fn check_crew_role_prompt_coverage() -> Check {
+    use crate::crew::loader::{builtin_role_prompt_ids, builtin_roles_ids};
+    let manifests = builtin_roles_ids();
+    let prompts: std::collections::HashSet<&str> =
+        builtin_role_prompt_ids().into_iter().collect();
+    let missing: Vec<&str> = manifests
+        .into_iter()
+        .filter(|id| !prompts.contains(id))
+        .collect();
+    if missing.is_empty() {
+        Check {
+            name: "crew role prompt coverage".into(),
+            status: Status::Pass,
+            message: "every builtin role manifest has a `.md` prompt".into(),
+            hint: None,
+        }
+    } else {
+        let list = missing
+            .iter()
+            .map(|id| format!("`{id}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Check {
+            name: "crew role prompt coverage".into(),
+            status: Status::Warn,
+            message: format!(
+                "{} role manifest(s) ship without `.md` prompts and cannot be dispatched: {list}",
+                missing.len()
+            ),
+            hint: Some(
+                "Author the missing prompts at `templates/builtin/crew/roles/<id>.md` and \
+                 add them to `BUILTIN_ROLE_PROMPTS` in `src/crew/loader.rs`. Operators can \
+                 override at `~/.darkmux/crew/roles/<id>.md`."
+                    .into(),
+            ),
+        }
+    }
 }
 
 /// Minimum OpenClaw version darkmux has been validated against. Older
@@ -1556,11 +1606,12 @@ mod tests {
     #[test]
     fn run_returns_static_plus_eureka_checks() {
         let r = run();
-        // 13 baseline checks (incl. runtime version + load projection +
-        // daemon reachable + darkmux-version-vs-latest-release [#13]) +
-        // one per active eureka rule. Every check should appear regardless
-        // of environment — even if the underlying probe couldn't read state.
-        let expected = 13 + crate::eureka::all_rules().len();
+        // 14 baseline checks (incl. runtime version + load projection +
+        // daemon reachable + darkmux-version-vs-latest-release [#13] +
+        // crew-role-prompt-coverage [#141]) + one per active eureka rule.
+        // Every check should appear regardless of environment — even if
+        // the underlying probe couldn't read state.
+        let expected = 14 + crate::eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
