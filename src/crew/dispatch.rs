@@ -110,9 +110,14 @@ fn print_licensed_adjacent_banner(role_id: &str) {
         "It is a research / organization assistant — NOT a substitute for a"
     );
     eprintln!(
-        "licensed professional. The role's full doctrine is in:"
+        "licensed professional. The role's full doctrine is in the .md prompt"
     );
-    eprintln!("  templates/builtin/crew/roles/{role_id}.md");
+    eprintln!(
+        "at templates/builtin/crew/roles/{role_id}.md in the darkmux source"
+    );
+    eprintln!(
+        "(or your override at ~/.darkmux/crew/roles/{role_id}.md if set)."
+    );
     eprintln!();
     eprintln!("By acknowledging, you confirm you understand:");
     eprintln!(
@@ -895,9 +900,14 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn licensed_adjacent_ack_is_noop_for_other_roles() {
         // No DARKMUX_ACK_DIR set, no ack file, no TTY input — but for
         // a non-licensed-adjacent role, the gate is a no-op and returns Ok.
+        // `serial_test::serial` is defensive: the function's current
+        // implementation short-circuits before reading any env, but if a
+        // future refactor moves env reads earlier this test must not race
+        // the other two serialized tests that mutate DARKMUX_ACK_DIR.
         require_licensed_adjacent_ack("coder").unwrap();
         require_licensed_adjacent_ack("analyst").unwrap();
         require_licensed_adjacent_ack("scribe").unwrap();
@@ -1087,8 +1097,7 @@ mod tests {
     }
 
     // ─── #89: watched-state snapshot ───────────────────────────────────────
-
-    use std::io::Write as _;
+    // (std::io::Write is already imported at the top of the module.)
 
     fn write_file(path: &Path, contents: &[u8]) {
         if let Some(parent) = path.parent() {
