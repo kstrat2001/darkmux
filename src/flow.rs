@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const FLOW_SCHEMA_VERSION: &str = "1.3.0";
@@ -166,6 +167,84 @@ fn epoch_to_hhmmss(epochs: i64) -> (u8, u8, u8) {
     (h, mi, s)
 }
 
+// ─── FlowSink abstraction (#162 Phase 1) ─────────────────────────────────
+//
+// `FlowSink` is the trait every flow record is written through. The current
+// (and default) implementation is `LocalFileSink` — preserves the existing
+// per-day JSONL behavior. Future implementations (Phase 3+) include
+// `RedisSink` (XADD to a Redis Stream for fleet coordination) and `TeeSink`
+// (write to multiple sinks during migration). See [#162] for the full arc.
+//
+// Per-process default sink: `default_sink()` returns the singleton sink the
+// public `record()` dispatches through. Tests can override via
+// `set_default_sink_for_tests`.
+
+/// Abstraction over the destination of a flow record. Implementations
+/// own the persistence semantics for their backend (file append, network
+/// publish, etc.). All implementations must be `Send + Sync` because the
+/// default sink is a process-wide singleton accessed from multiple
+/// dispatch paths.
+pub trait FlowSink: Send + Sync {
+    /// Write a single record. Returns `Err` on persistence failure; the
+    /// caller decides whether to bail or proceed (most current callers
+    /// use `let _ = flow::record(...)` because audit-log writes are
+    /// best-effort, but the trait signature is fallible for callers
+    /// that DO want to react to write failures — e.g., a fleet
+    /// coordinator might want to fall back to a local-file sink on
+    /// network failure).
+    fn write(&self, record: &FlowRecord) -> Result<()>;
+}
+
+/// File-based flow sink: appends to per-day JSONL files under
+/// `~/.darkmux/flows/YYYY-MM-DD.jsonl`. The implementation darkmux has
+/// shipped since v1.0 of the flow schema; preserved verbatim under
+/// the trait abstraction.
+///
+/// Resolves the flows directory via `flows_dir()` at write time, NOT at
+/// construction — so tests + operators that override `DARKMUX_FLOWS_DIR`
+/// don't need to rebuild the sink to pick up the change. Symmetric with
+/// how `record_at()` behaves today; refactor preserves the contract.
+pub struct LocalFileSink;
+
+impl LocalFileSink {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for LocalFileSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FlowSink for LocalFileSink {
+    fn write(&self, record: &FlowRecord) -> Result<()> {
+        let dir = flows_dir();
+        let day = day_utc_now();
+        let path = dir.join(format!("{day}.jsonl"));
+        record_at(record, &path)
+    }
+}
+
+/// Process-wide default sink. Initialized lazily; default is
+/// `LocalFileSink`. Phase 3 of [#162] will layer in config-driven sink
+/// selection (Redis + TeeSink for migration); for Phase 1 the default is
+/// fixed and tests use `record_via` with explicit sinks rather than
+/// overriding the global.
+fn default_sink() -> Arc<dyn FlowSink> {
+    static SINK: OnceLock<Arc<dyn FlowSink>> = OnceLock::new();
+    SINK.get_or_init(|| Arc::new(LocalFileSink::new())).clone()
+}
+
+/// Write a record through an explicit sink. Used by tests + future
+/// config-driven dispatch paths where the caller picks the sink. The
+/// production code path uses `record()` which dispatches through the
+/// process-wide default sink.
+pub fn record_via(sink: &dyn FlowSink, record: &FlowRecord) -> Result<()> {
+    sink.write(record)
+}
+
 /// Append `record` to today's per-day JSONL file. Creates the file with a
 /// schema header as line 1 if it doesn't exist (written atomically with the
 /// first record so a partial file never ends up header-only).
@@ -173,11 +252,12 @@ fn epoch_to_hhmmss(epochs: i64) -> (u8, u8, u8) {
 /// Concurrent writes: append-on-Unix is atomic up to PIPE_BUF (~4 KB on
 /// macOS). Single-line JSONL records are well under this limit, so no
 /// explicit locking is needed.
+///
+/// **Phase 1 refactor (#162):** this function now dispatches through
+/// `FlowSink`. The default sink is `LocalFileSink`, which preserves
+/// the original behavior. No callers should see a behavior change.
 pub fn record(record: FlowRecord) -> Result<()> {
-    let dir = flows_dir();
-    let day = day_utc_now();
-    let path = dir.join(format!("{day}.jsonl"));
-    record_at(&record, &path)
+    default_sink().write(&record)
 }
 
 /// Internal entry point writing to an explicit path. Used by tests and the
@@ -608,6 +688,145 @@ mod tests {
                 bytes[i].is_ascii_digit(),
                 "expected digit at index {i} in {day:?}",
             );
+        }
+    }
+
+    // ─── #162 Phase 1: FlowSink trait ────────────────────────────────
+
+    #[test]
+    fn local_file_sink_writes_through_to_per_day_jsonl() {
+        // LocalFileSink should produce the same on-disk result as the
+        // historical `record_at` path — preserving behavior under the
+        // trait abstraction is the whole point of Phase 1.
+        use std::env;
+        let tmp = TempDir::new().unwrap();
+        let prev = env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe { env::set_var("DARKMUX_FLOWS_DIR", tmp.path()); }
+
+        let sink = LocalFileSink::new();
+        let rec = FlowRecord {
+            ts: "2025-01-01T00:00:00Z".to_string(),
+            level: Level::Info,
+            category: Category::Work,
+            tier: Tier::Operator,
+            stage: Stage::Scope,
+            action: "test".to_string(),
+            handle: "h".to_string(),
+            sprint_id: None,
+            session_id: None,
+            source: None,
+            model: None,
+            reasoning: None,
+            mission_id: None,
+        };
+        sink.write(&rec).unwrap();
+
+        // Result must be a per-day JSONL file at flows_dir() with the
+        // record's content as line 2 (line 1 is the schema header).
+        let day = day_utc_now();
+        let path = tmp.path().join(format!("{day}.jsonl"));
+        assert!(path.exists(), "sink should have created per-day file");
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert!(lines[0].contains("\"_type\":\"schema\""), "line 1 = header");
+        assert!(lines[1].contains("\"action\":\"test\""), "line 2 = record");
+
+        unsafe {
+            match prev {
+                Some(v) => env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+    }
+
+    /// Test-only sink that captures records in memory. Used to verify the
+    /// trait contract without filesystem interaction.
+    struct InMemorySink {
+        captured: std::sync::Mutex<Vec<FlowRecord>>,
+    }
+    impl InMemorySink {
+        fn new() -> Self {
+            Self { captured: std::sync::Mutex::new(Vec::new()) }
+        }
+        fn count(&self) -> usize {
+            self.captured.lock().unwrap().len()
+        }
+    }
+    impl FlowSink for InMemorySink {
+        fn write(&self, record: &FlowRecord) -> Result<()> {
+            self.captured.lock().unwrap().push(record.clone());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn record_via_dispatches_through_explicit_sink() {
+        // The trait's contract: any FlowSink impl receives the record on
+        // write. record_via is the public extension point for callers
+        // that want to override the default LocalFileSink (tests today;
+        // RedisSink + TeeSink in Phase 3 of #162).
+        let sink = InMemorySink::new();
+        let rec = FlowRecord {
+            ts: "2025-01-01T00:00:00Z".to_string(),
+            level: Level::Info,
+            category: Category::Work,
+            tier: Tier::Operator,
+            stage: Stage::Scope,
+            action: "explicit-sink".to_string(),
+            handle: "h".to_string(),
+            sprint_id: None,
+            session_id: None,
+            source: None,
+            model: None,
+            reasoning: None,
+            mission_id: None,
+        };
+
+        record_via(&sink, &rec).unwrap();
+        record_via(&sink, &rec).unwrap();
+        assert_eq!(sink.count(), 2);
+    }
+
+    #[test]
+    fn record_default_path_uses_local_file_sink() {
+        // The public `record()` should dispatch through the default sink
+        // and produce on-disk output (behavior-equivalent to pre-#162).
+        // We can't easily intercept the default sink from a test, but we
+        // can verify the round trip: write via record(), read from
+        // flows_dir(), see the record.
+        use std::env;
+        let tmp = TempDir::new().unwrap();
+        let prev = env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe { env::set_var("DARKMUX_FLOWS_DIR", tmp.path()); }
+
+        let rec = FlowRecord {
+            ts: "2025-01-01T00:00:00Z".to_string(),
+            level: Level::Info,
+            category: Category::Work,
+            tier: Tier::Operator,
+            stage: Stage::Scope,
+            action: "default-path".to_string(),
+            handle: "h".to_string(),
+            sprint_id: None,
+            session_id: None,
+            source: None,
+            model: None,
+            reasoning: None,
+            mission_id: None,
+        };
+        super::record(rec).unwrap();
+
+        let day = day_utc_now();
+        let path = tmp.path().join(format!("{day}.jsonl"));
+        assert!(path.exists(), "default sink should have written to {}", path.display());
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("\"action\":\"default-path\""));
+
+        unsafe {
+            match prev {
+                Some(v) => env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
         }
     }
 
