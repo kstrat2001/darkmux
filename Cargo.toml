@@ -28,6 +28,13 @@ dirs = "5.0"
 # `bundled` per #45 dep spec so users don't need libsqlite3 on PATH.
 rusqlite = { version = "0.31", features = ["bundled"] }
 
+# #162 Phase 3 — Redis client for the live-coordination flow sink.
+# Opt-in at runtime via DARKMUX_REDIS_URL env var; default deployments
+# don't connect to Redis even though the dep is linked. The "streams"
+# feature is what we use (XADD, XREAD). default-features = false skips
+# the bigger dep surface (async runtimes etc.) we don't need.
+redis = { version = "0.27", default-features = false, features = ["streams"] }
+
 [dev-dependencies]
 tempfile = "3.10"
 assert_cmd = "2.0"
