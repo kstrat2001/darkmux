@@ -1146,10 +1146,21 @@ fn preflight_check(config: &Value, agent_id: &str, role: &Role, expected_prompt:
         .and_then(|s| s.as_str())
         .ok_or_else(|| anyhow!("agent `{agent_id}` has no systemPromptOverride"))?;
     if actual_prompt.trim() != expected_prompt.trim() {
+        // After #147 the effective expected prompt may include
+        // operator-identity injected from `~/.darkmux/identity.md`.
+        // Mention both sources in the error so operators who edited
+        // identity.md don't go debugging the role manifest by mistake.
+        let identity_note = if load_operator_identity().is_some() {
+            " (Effective prompt includes operator-identity from \
+             `~/.darkmux/identity.md`; if you edited that file, run \
+             sync to update.)"
+        } else {
+            ""
+        };
         bail!(
             "agent `{agent_id}` systemPromptOverride drifted from the role manifest's `.md`. \
              Manifest expects {expected_chars} chars; openclaw has {actual_chars} chars. \
-             Run `darkmux crew sync` to reconcile.",
+             Run `darkmux crew sync` to reconcile.{identity_note}",
             expected_chars = expected_prompt.len(),
             actual_chars = actual_prompt.len(),
         );
