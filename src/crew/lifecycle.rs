@@ -147,7 +147,22 @@ fn emit_sprint_transition_record(sprint_id: &str, mission_id: &str, action: &str
     });
 }
 
+#[allow(dead_code)]
+// Kept for back-compat + test ergonomics; CLI path uses
+// `emit_mission_transition_record_with_reasoning` directly.
 fn emit_mission_transition_record(mission_id: &str, action: &str) {
+    emit_mission_transition_record_with_reasoning(mission_id, action, None);
+}
+
+/// Reasoning-aware variant. Optional operator-supplied prose explains
+/// *why* the mission transition happened — populates the audit substrate's
+/// WHY layer for lifecycle events, parallel to tier-decision records
+/// for routing events (#136).
+fn emit_mission_transition_record_with_reasoning(
+    mission_id: &str,
+    action: &str,
+    reasoning: Option<&str>,
+) {
     let _ = flow::record(FlowRecord {
         ts: flow::ts_utc_now(),
         level: Level::Info,
@@ -160,12 +175,7 @@ fn emit_mission_transition_record(mission_id: &str, action: &str) {
         session_id: Some(format!("mission:{mission_id}")),
         source: Some("mission_lifecycle".to_string()),
         model: None,
-        reasoning: None,
-        // #136 schema 1.3: first-class mission_id. The session_id
-        // workaround above (`mission:<id>`) stays in place this PR for
-        // back-compat with existing readers; future readers should
-        // prefer this field. The redundancy retires once readers
-        // migrate (follow-up).
+        reasoning: reasoning.map(String::from),
         mission_id: Some(mission_id.to_string()),
     });
 }
@@ -176,7 +186,18 @@ fn emit_mission_transition_record(mission_id: &str, action: &str) {
 /// new sprint joining the plan — so the `source` field reflects that
 /// the change came from the mission_lifecycle surface even though the
 /// `handle` is the new sprint id.
+#[allow(dead_code)]
+// Kept for back-compat + test ergonomics; CLI path uses
+// `emit_sprint_added_record_with_reasoning` directly.
 fn emit_sprint_added_record(sprint_id: &str, mission_id: &str) {
+    emit_sprint_added_record_with_reasoning(sprint_id, mission_id, None);
+}
+
+fn emit_sprint_added_record_with_reasoning(
+    sprint_id: &str,
+    mission_id: &str,
+    reasoning: Option<&str>,
+) {
     let _ = flow::record(FlowRecord {
         ts: flow::ts_utc_now(),
         level: Level::Info,
@@ -189,12 +210,7 @@ fn emit_sprint_added_record(sprint_id: &str, mission_id: &str) {
         session_id: Some(format!("mission:{mission_id}")),
         source: Some("mission_lifecycle".to_string()),
         model: None,
-        reasoning: None,
-        // #136 schema 1.3: first-class mission_id. The session_id
-        // workaround above (`mission:<id>`) stays in place this PR for
-        // back-compat with existing readers; future readers should
-        // prefer this field. The redundancy retires once readers
-        // migrate (follow-up).
+        reasoning: reasoning.map(String::from),
         mission_id: Some(mission_id.to_string()),
     });
 }
@@ -262,7 +278,12 @@ pub fn sprint_abandon(id: &str) -> Result<Sprint> {
 /// cares about. To restart a Paused mission, use `mission resume`. To
 /// continue an already-running mission, do nothing (status is preserved
 /// across other lifecycle operations).
+#[allow(dead_code)]
 pub fn mission_start(id: &str) -> Result<Mission> {
+    mission_start_with_reasoning(id, None)
+}
+
+pub fn mission_start_with_reasoning(id: &str, reasoning: Option<&str>) -> Result<Mission> {
     let mut mission = load_mission(id)?;
     match mission.status {
         MissionStatus::Active if mission.started_ts.is_some() => {
@@ -275,12 +296,17 @@ pub fn mission_start(id: &str) -> Result<Mission> {
     mission.status = MissionStatus::Active;
     mission.started_ts = Some(now_unix());
     save_json(&mission_path(id), &mission)?;
-    emit_mission_transition_record(id, "mission start");
+    emit_mission_transition_record_with_reasoning(id, "mission start", reasoning);
     Ok(mission)
 }
 
 /// `mission close <id>` — Active/Paused → Closed (terminal).
+#[allow(dead_code)]
 pub fn mission_close(id: &str) -> Result<Mission> {
+    mission_close_with_reasoning(id, None)
+}
+
+pub fn mission_close_with_reasoning(id: &str, reasoning: Option<&str>) -> Result<Mission> {
     let mut mission = load_mission(id)?;
     match mission.status {
         MissionStatus::Active | MissionStatus::Paused => {}
@@ -289,13 +315,18 @@ pub fn mission_close(id: &str) -> Result<Mission> {
     mission.status = MissionStatus::Closed;
     mission.closed_ts = Some(now_unix());
     save_json(&mission_path(id), &mission)?;
-    emit_mission_transition_record(id, "mission close");
+    emit_mission_transition_record_with_reasoning(id, "mission close", reasoning);
     Ok(mission)
 }
 
 /// `mission pause <id>` — Active → Paused. Updates `paused_ts` to now even
 /// if a prior pause was recorded (operator gets the most-recent pause time).
+#[allow(dead_code)]
 pub fn mission_pause(id: &str) -> Result<Mission> {
+    mission_pause_with_reasoning(id, None)
+}
+
+pub fn mission_pause_with_reasoning(id: &str, reasoning: Option<&str>) -> Result<Mission> {
     let mut mission = load_mission(id)?;
     match mission.status {
         MissionStatus::Active => {}
@@ -305,13 +336,18 @@ pub fn mission_pause(id: &str) -> Result<Mission> {
     mission.status = MissionStatus::Paused;
     mission.paused_ts = Some(now_unix());
     save_json(&mission_path(id), &mission)?;
-    emit_mission_transition_record(id, "mission pause");
+    emit_mission_transition_record_with_reasoning(id, "mission pause", reasoning);
     Ok(mission)
 }
 
 /// `mission resume <id>` — Paused → Active. Does NOT clear `paused_ts` —
 /// the operator may want to see how long the mission was paused.
+#[allow(dead_code)]
 pub fn mission_resume(id: &str) -> Result<Mission> {
+    mission_resume_with_reasoning(id, None)
+}
+
+pub fn mission_resume_with_reasoning(id: &str, reasoning: Option<&str>) -> Result<Mission> {
     let mut mission = load_mission(id)?;
     match mission.status {
         MissionStatus::Paused => {}
@@ -320,7 +356,7 @@ pub fn mission_resume(id: &str) -> Result<Mission> {
     }
     mission.status = MissionStatus::Active;
     save_json(&mission_path(id), &mission)?;
-    emit_mission_transition_record(id, "mission resume");
+    emit_mission_transition_record_with_reasoning(id, "mission resume", reasoning);
     Ok(mission)
 }
 
@@ -359,12 +395,34 @@ pub fn mission_resume(id: &str) -> Result<Mission> {
 ///     description (operator probably meant a different id or wants to
 ///     explicitly edit; either way, don't paper over the conflict).
 ///   - Any `depends_on` id doesn't resolve to an existing sprint.
+#[allow(dead_code)]
 pub fn add_sprint_to_mission(
     mission_id: &str,
     sprint_id: &str,
     description: &str,
     depends_on: Vec<String>,
     after: Option<&str>,
+) -> Result<Sprint> {
+    add_sprint_to_mission_with_reasoning(
+        mission_id,
+        sprint_id,
+        description,
+        depends_on,
+        after,
+        None,
+    )
+}
+
+/// `add_sprint_to_mission` with operator-supplied reasoning for the
+/// scope growth. Reasoning lands on the emitted flow record so the
+/// audit substrate captures *why* the mission grew here.
+pub fn add_sprint_to_mission_with_reasoning(
+    mission_id: &str,
+    sprint_id: &str,
+    description: &str,
+    depends_on: Vec<String>,
+    after: Option<&str>,
+    reasoning: Option<&str>,
 ) -> Result<Sprint> {
     let mut mission = load_mission(mission_id)?;
 
@@ -437,7 +495,7 @@ pub fn add_sprint_to_mission(
         save_json(&mission_path(mission_id), &mission)?;
     }
 
-    emit_sprint_added_record(sprint_id, mission_id);
+    emit_sprint_added_record_with_reasoning(sprint_id, mission_id, reasoning);
 
     Ok(sprint)
 }
