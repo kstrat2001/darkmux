@@ -12,6 +12,20 @@ darkmux is a personal project released under the MIT license. The license text a
 
 AI models — local or hosted — can produce unexpected, incorrect, or unsafe output. They can hallucinate file paths, generate destructive shell commands, edit files in ways you did not intend, and confidently explain why the wrong thing was the right thing to do. darkmux is an orchestration layer; it does not police what the model does. If a model misbehaves, darkmux will faithfully execute the misbehaviour. Review agent output before letting it touch anything you care about.
 
+## Licensed-adjacent role prompts
+
+darkmux ships role prompts under `templates/builtin/crew/roles/` that operate in domains regulated by professional licensure: `health-research.md`, `legal-research.md`, and `fitness-coach.md`. These prompts are written explicitly as research and organization assistants — **not** as substitutes for a physician, attorney, registered dietitian, physical therapist, or other licensed professional. They contain explicit "You are NOT" framings, scope MUST-NOTs, and escalation rules.
+
+Even with that framing:
+
+- **The prompt is the only runtime boundary.** These prompts drive a local LLM. LLMs can deviate from their system prompt under adversarial, leading, or persistent prompting. darkmux does not enforce the doctrine at runtime — the prompt IS the boundary.
+- **The MIT license permits anyone to modify these prompts.** A downstream fork that strips the "NOT a physician / NOT an attorney" framing and ships advice-shaped variants is the licensee's responsibility, not the author's. But an operator running this repo's prompts as shipped is still subject to the law of their jurisdiction.
+- **Unauthorized practice of law (UPL) and medicine (UPM) statutes exist in every US state and most jurisdictions globally** (e.g., Cal. Bus. & Prof. Code §6125–6126 for law, §2052 for medicine; NY Jud. Law §478; analogous statutes elsewhere). They generally apply to anyone who holds out as providing those services, regardless of disclaimer. A solo operator using these prompts privately on their own materials is the intended use case. Re-distributing the prompts as a service to third parties, or modifying them into advice-shaped variants, may expose the operator to UPL/UPM liability.
+- **Health privacy.** If you paste medical records, insurance documents, or symptom notes into the workspace for `health-research` to read, those files sit on your local disk in plaintext and pass through your local LLM. HIPAA does not apply to you-as-patient handling your own records, but it WILL apply if you are a covered entity (clinician, payer, business associate) reading a patient's records through this tool. Do not use these prompts on third-party PHI without your organization's HIPAA-compliance review.
+- **Attorney-client privilege.** Pasting privileged communications into a local LLM workspace generally does not waive privilege (local execution is not third-party disclosure), but privilege analysis is jurisdiction-specific. If you are an attorney using this on client work, confirm with your bar's ethics opinion on generative-AI tools (see ABA Formal Opinion 512, July 2024). If you are a client using it on communications from your attorney, the privilege is yours to assert and yours to risk.
+
+If you cannot accept these terms — including the residual risk that no prompt-level discipline is bulletproof against model misbehavior — do not use the licensed-adjacent roles.
+
 ## About the performance numbers
 
 Benchmarks, throughput claims, and "X tokens/sec" figures in this repository and in the accompanying article series at [substack.com/@DarklyEnergized](https://substack.com/@DarklyEnergized) were measured on the author's hardware: a MacBook Pro with the Apple M5 Max chip and 128 GB of unified memory. Your numbers will differ — sometimes by a lot — depending on chip generation, RAM, thermal conditions, model quantization, context length, and what else is running. Treat the numbers as one data point, not a guarantee.
@@ -33,6 +47,14 @@ darkmux helps you load models through LMStudio. It does not download, redistribu
 ## Hardware compatibility
 
 darkmux is developed and tested on Apple Silicon Macs, specifically on the author's M5 Max system. It should work on other M-series chips, but that is not validated. Intel Macs are not supported. Linux and Windows are not supported.
+
+## Two layers of liability
+
+darkmux involves two distinct legal personas, and the MIT license addresses only one of them.
+
+**The distributor** (the author of darkmux, Darkly Energized LLC) ships the binary and the prompts under MIT with no warranty. If darkmux corrupts a config, returns a wrong benchmark number, or produces an unexpected output, the author owes you nothing beyond the source you already have. The MIT "AS IS" clause is the contract.
+
+**The operator** (anyone running darkmux on their own machine) is subject to the law of their own jurisdiction independently of the MIT grant. The license does NOT insulate the operator from: unauthorized practice of law or medicine if they re-publish licensed-adjacent role outputs as a service to third parties; HIPAA if they are a covered entity processing PHI through a local LLM; their professional ethics rules if they are a licensed attorney, physician, RD, PT, or trainer using the tool on client/patient work; data-protection rules (GDPR, PDPA, CCPA) if they process personal data of others. These are operator-side obligations. darkmux makes no representation that running it satisfies any of them.
 
 ## The MIT bit, in human words
 
