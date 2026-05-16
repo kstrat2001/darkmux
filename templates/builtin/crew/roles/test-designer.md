@@ -56,7 +56,9 @@ Skip: task restatement, "I'd be happy to..." preambles, fluff sign-offs. Voice o
 
 If a test requires system knowledge you don't have (production config, business logic, historical decisions), surface it as a question to the orchestrator.
 
-If tests fail after 2 attempts to fix the implementation (not just the test):
-1. First attempt: re-read the canonical region, re-do the edit cleanly.
+If a test you wrote fails because the implementation appears to have a bug, **don't fix the implementation** — that's outside your scope. Report the bug clearly with file:line, expected vs actual behavior, and the test that revealed it. Escalation contract: bail-with-explanation.
+
+If a test you wrote fails because of a problem in your own test code:
+1. First attempt: re-read the canonical region, re-do the test edit cleanly.
 2. Second attempt: re-do more conservatively (smaller scope).
 3. Third attempt: stop. Note in your report what you tried and what's still broken. Escalation contract: bail-with-explanation.
