@@ -1,0 +1,140 @@
+/* darkmux shared shell — design tokens + top-strip layout
+ *
+ * Pages mount <dx-shell active-tab="…"> at the top of <body>. The shell
+ * renders brand, tab nav, and a pill row (page-contributed). This file
+ * is the source of truth for cross-page design tokens; page-specific
+ * overrides set [data-page="<id>"] on <html>.
+ *
+ * Per #168. */
+
+:root {
+  /* Base palette — Flow page baseline (deep near-black) */
+  --bg:        #0a0a0b;
+  --bg-elev:   #131316;
+  --bg-elev2:  #1c1c22;
+  --border:    #1f1f24;
+  --border-hot:#2a8a96;
+  --text:      #e8e6e3;
+  --muted:     #8a8a92;
+  --dim:       #5a5a62;
+  --accent:    #6df1ff;
+  --accent-dim:#2a8a96;
+  --warn:      #ffb86b;
+  --good:      #5af0a3;
+  --bad:       #ff6b85;
+
+  /* tier colors */
+  --tier-operator: #6df1ff;
+  --tier-frontier: #c084fc;
+  --tier-local:    #5af0a3;
+
+  /* level colors */
+  --lvl-error: #ff6b85;
+  --lvl-warn:  #ffb86b;
+  --lvl-info:  #e8e6e3;
+  --lvl-debug: #8a8a92;
+  --lvl-trace: #5a5a62;
+}
+
+/* Lab page — lighter "lab paper" surface; the React-Flow canvas reads
+ * better against a slightly elevated grey. */
+html[data-page="lab"] {
+  --bg:       #181820;
+  --bg-elev:  #0a0a0d;
+  --bg-elev2: #14141a;
+  --border:   #2a2a34;
+}
+
+/* ─── shell strip ─────────────────────────────────────────────────── */
+dx-shell {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  height: 56px;
+  padding: 0 24px;
+  background: var(--bg-elev);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  z-index: 100;
+  position: relative;
+  font: 14px/1.5 'Inter', system-ui, -apple-system, sans-serif;
+  color: var(--text);
+}
+
+dx-shell .dx-shell-brand {
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-weight: 700;
+  font-size: 14px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--muted);
+  text-decoration: none;
+  flex-shrink: 0;
+}
+dx-shell .dx-shell-brand .accent { color: var(--accent); }
+dx-shell .dx-shell-brand:hover { color: var(--text); }
+
+dx-shell .dx-shell-tabs {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+}
+dx-shell .dx-shell-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--muted);
+  text-decoration: none;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  transition: color 0.12s, border-color 0.12s, background 0.12s;
+  position: relative;
+}
+dx-shell .dx-shell-tab:hover {
+  color: var(--accent);
+  background: var(--bg-elev2);
+}
+dx-shell .dx-shell-tab[aria-current="page"] {
+  color: var(--accent);
+  background: var(--bg-elev2);
+  border-color: var(--accent-dim);
+}
+dx-shell .dx-shell-tab[aria-current="page"]::after {
+  content: '';
+  position: absolute;
+  left: 10%;
+  right: 10%;
+  bottom: -1px;
+  height: 2px;
+  background: var(--accent);
+  border-radius: 1px;
+}
+
+dx-shell .dx-shell-pills {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+/* `.dx-pill` (shared pill base for future pills like store-status) is
+ * intentionally not declared yet — current pills (conn-status,
+ * model-status, sprint-progress) keep their existing per-page classes
+ * for this plumbing PR. The shared class lands when the store-status
+ * pill arrives in #170. */
+
+/* Page-level :root blocks in /flow/, /lab/, /topology/ currently
+ * re-declare these same tokens (matching values). The duplication is
+ * a known cleanup item — consolidating into this file is the next
+ * pass once Step 2 stabilizes the consumers. Tracked under #168. */
+
+/* ─── narrow viewport ─────────────────────────────────────────────── */
+@media (max-width: 720px) {
+  dx-shell { padding: 0 12px; gap: 8px; }
+  dx-shell .dx-shell-brand { font-size: 11px; letter-spacing: 0.12em; }
+  dx-shell .dx-shell-tab { padding: 6px 10px; font-size: 12px; }
+}

@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en" data-page="topology">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>darkmux topology — fleet diagram</title>
+<meta name="description" content="Live + replay diagram of darkmux fleet activity: orchestrators, machines, crew roles, models, and missions. Coming in M3.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../shared/shell.css">
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 'Inter', system-ui, -apple-system, sans-serif;
+    display: flex;
+    flex-direction: column;
+  }
+  code, pre, .mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
+
+  main {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 32px;
+    min-height: 0;
+  }
+  .empty-state {
+    max-width: 640px;
+    text-align: center;
+  }
+  .empty-state h1 {
+    margin: 0 0 12px;
+    font-size: 22px;
+    font-weight: 600;
+    color: var(--text);
+    letter-spacing: -0.01em;
+  }
+  .empty-state .sub {
+    color: var(--muted);
+    font-size: 14px;
+    margin: 0 0 24px;
+  }
+  .empty-state .preview {
+    margin: 32px 0;
+    padding: 24px;
+    border: 1px dashed var(--border);
+    border-radius: 6px;
+    background: var(--bg-elev);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    color: var(--muted);
+    line-height: 1.6;
+    text-align: left;
+  }
+  .empty-state .preview strong { color: var(--accent); font-weight: 600; }
+  .empty-state .preview .dim { color: var(--dim); }
+  .empty-state .link {
+    color: var(--accent);
+    text-decoration: none;
+    border-bottom: 1px dotted var(--accent-dim);
+  }
+  .empty-state .link:hover { color: var(--text); border-bottom-color: var(--accent); }
+</style>
+</head>
+<body>
+  <dx-shell active-tab="topology"></dx-shell>
+  <main>
+    <div class="empty-state">
+      <h1>Topology view — coming in M3</h1>
+      <p class="sub">
+        Live + replay diagram of darkmux fleet activity: orchestrators, machines, crew roles, models, missions.
+      </p>
+      <div class="preview">
+        <strong>Planned nodes:</strong><br>
+        &nbsp;&nbsp;Machine (group) · Orchestrator · Crew role · Model · Mission<br>
+        <br>
+        <strong>Planned edges:</strong><br>
+        &nbsp;&nbsp;<span class="dim">stage:</span> dispatch · tier-decision · review · ship<br>
+        <br>
+        <strong>Modes:</strong><br>
+        &nbsp;&nbsp;Fleet (N≥3 machines) · Focus (single) · Mission (filtered)<br>
+        <br>
+        <strong>Live cues:</strong><br>
+        &nbsp;&nbsp;edge motion · node pulse · wall-clock arcs
+      </div>
+      <p class="sub">
+        Specification:
+        <a class="link" href="https://github.com/kstrat2001/darkmux/issues/169" target="_blank" rel="noopener">#169 — Topology view IA design spec</a>
+      </p>
+    </div>
+  </main>
+  <script src="../shared/shell.js"></script>
+</body>
+</html>
