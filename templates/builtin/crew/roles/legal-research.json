@@ -1,0 +1,10 @@
+{
+  "id": "legal-research",
+  "description": "Legal-research thinking partner. Reads contracts, surfaces clauses, summarizes regulatory text the operator brings, drafts questions for licensed counsel. NOT legal advice. NOT replacing an attorney.",
+  "capabilities": ["documenting", "writing"],
+  "tool_palette": {
+    "allow": ["read", "edit"],
+    "deny": ["exec", "process", "write"]
+  },
+  "escalation_contract": "bail-with-explanation"
+}

@@ -24,6 +24,16 @@ const BUILTIN_ROLES: &[(&str, &str)] = &[
     ("test-designer", include_str!("../../templates/builtin/crew/roles/test-designer.json")),
     ("lab-runner", include_str!("../../templates/builtin/crew/roles/lab-runner.json")),
     ("mission-compiler", include_str!("../../templates/builtin/crew/roles/mission-compiler.json")),
+    // Non-SWE engagement roles (#141): trip planning, health, athletics, legal.
+    // Each is bounded — research/organize/structure only; no exec, no execution
+    // of bookings or commitments. Each prompt's opening lines name what the role
+    // is NOT, to keep cross-bounds questions from leaking into licensed-
+    // professional territory.
+    ("trip-researcher", include_str!("../../templates/builtin/crew/roles/trip-researcher.json")),
+    ("logistics-coordinator", include_str!("../../templates/builtin/crew/roles/logistics-coordinator.json")),
+    ("health-research", include_str!("../../templates/builtin/crew/roles/health-research.json")),
+    ("fitness-coach", include_str!("../../templates/builtin/crew/roles/fitness-coach.json")),
+    ("legal-research", include_str!("../../templates/builtin/crew/roles/legal-research.json")),
 ];
 
 /// Capabilities compiled into the binary at build time. Filename = `<id>.json`.
@@ -54,6 +64,12 @@ pub(crate) const BUILTIN_ROLE_PROMPTS: &[(&str, &str)] = &[
     ("lab-runner", include_str!("../../templates/builtin/crew/roles/lab-runner.md")),
     ("test-designer", include_str!("../../templates/builtin/crew/roles/test-designer.md")),
     ("voice-editor", include_str!("../../templates/builtin/crew/roles/voice-editor.md")),
+    // Non-SWE engagement roles (#141). Order mirrors BUILTIN_ROLES.
+    ("trip-researcher", include_str!("../../templates/builtin/crew/roles/trip-researcher.md")),
+    ("logistics-coordinator", include_str!("../../templates/builtin/crew/roles/logistics-coordinator.md")),
+    ("health-research", include_str!("../../templates/builtin/crew/roles/health-research.md")),
+    ("fitness-coach", include_str!("../../templates/builtin/crew/roles/fitness-coach.md")),
+    ("legal-research", include_str!("../../templates/builtin/crew/roles/legal-research.md")),
 ];
 
 /// Expose the embedded role-id list for callers that need to verify
