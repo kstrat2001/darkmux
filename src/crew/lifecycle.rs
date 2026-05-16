@@ -138,7 +138,12 @@ fn emit_sprint_transition_record(sprint_id: &str, mission_id: &str, action: &str
         source: Some("sprint_lifecycle".to_string()),
         model: None,
         reasoning: None,
-        mission_id: None,
+        // #136 schema 1.3: first-class mission_id. The session_id
+        // workaround above (`mission:<id>`) stays in place this PR for
+        // back-compat with existing readers; future readers should
+        // prefer this field. The redundancy retires once readers
+        // migrate (follow-up).
+        mission_id: Some(mission_id.to_string()),
     });
 }
 
@@ -156,7 +161,12 @@ fn emit_mission_transition_record(mission_id: &str, action: &str) {
         source: Some("mission_lifecycle".to_string()),
         model: None,
         reasoning: None,
-        mission_id: None,
+        // #136 schema 1.3: first-class mission_id. The session_id
+        // workaround above (`mission:<id>`) stays in place this PR for
+        // back-compat with existing readers; future readers should
+        // prefer this field. The redundancy retires once readers
+        // migrate (follow-up).
+        mission_id: Some(mission_id.to_string()),
     });
 }
 
@@ -180,7 +190,12 @@ fn emit_sprint_added_record(sprint_id: &str, mission_id: &str) {
         source: Some("mission_lifecycle".to_string()),
         model: None,
         reasoning: None,
-        mission_id: None,
+        // #136 schema 1.3: first-class mission_id. The session_id
+        // workaround above (`mission:<id>`) stays in place this PR for
+        // back-compat with existing readers; future readers should
+        // prefer this field. The redundancy retires once readers
+        // migrate (follow-up).
+        mission_id: Some(mission_id.to_string()),
     });
 }
 

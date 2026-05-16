@@ -239,6 +239,18 @@
     font-size: 13px;
     word-break: break-word;
   }
+  /* #136 (schema 1.3): reasoning block for tier-decision records.
+     Subdued italic to read as commentary rather than identifier. */
+  .reasoning {
+    color: var(--muted);
+    font-size: 13px;
+    font-style: italic;
+    margin-top: 6px;
+    padding: 6px 10px;
+    background: rgba(255, 255, 255, 0.03);
+    border-left: 2px solid var(--dim);
+    word-break: break-word;
+  }
   .meta-row {
     display: flex;
     gap: 8px;
@@ -634,12 +646,13 @@
       </div>
       <div class="filter-group">
         <h3>Stage</h3>
-        <label><input type="checkbox" value="scope"     class="f-stage" checked>scope</label>
-        <label><input type="checkbox" value="estimate"  class="f-stage" checked>estimate</label>
-        <label><input type="checkbox" value="dispatch"  class="f-stage" checked>dispatch</label>
-        <label><input type="checkbox" value="review"    class="f-stage" checked>review</label>
-        <label><input type="checkbox" value="ship"      class="f-stage" checked>ship</label>
-        <label><input type="checkbox" value="retrospect" class="f-stage" checked>retrospect</label>
+        <label><input type="checkbox" value="scope"          class="f-stage" checked>scope</label>
+        <label><input type="checkbox" value="estimate"       class="f-stage" checked>estimate</label>
+        <label><input type="checkbox" value="dispatch"       class="f-stage" checked>dispatch</label>
+        <label><input type="checkbox" value="tier-decision"  class="f-stage" checked>tier-decision</label>
+        <label><input type="checkbox" value="review"         class="f-stage" checked>review</label>
+        <label><input type="checkbox" value="ship"           class="f-stage" checked>ship</label>
+        <label><input type="checkbox" value="retrospect"     class="f-stage" checked>retrospect</label>
       </div>
     </aside>
 
@@ -851,7 +864,12 @@ function applyFilters() {
     if (r.tier && !tiers.has(r.tier)) return false;
     if (r.stage && !stages.has(r.stage)) return false;
     if (q) {
-      const blob = [r.action, r.handle, r.source].filter(Boolean).join(' ').toLowerCase();
+      // #136 schema 1.3: include reasoning + mission_id in the search blob
+      // so operators can grep their audit substrate for the WHY layer.
+      const blob = [r.action, r.handle, r.source, r.reasoning, r.mission_id]
+        .filter(Boolean)
+        .join(' ')
+        .toLowerCase();
       if (!blob.includes(q)) return false;
     }
     return true;
@@ -894,11 +912,23 @@ function renderRecord(r) {
   if (r.model)    meta.push({ lbl: 'model',    val: r.model });
   if (r.sprint_id)  meta.push({ lbl: 'sprint',  val: r.sprint_id });
   if (r.session_id) meta.push({ lbl: 'session', val: r.session_id });
+  // #136 (schema 1.3): mission_id is a first-class field for tier-decision
+  // and mission-lifecycle records. Surface as a meta pill so the operator
+  // can scan "which mission did this routing decision belong to?"
+  if (r.mission_id) meta.push({ lbl: 'mission', val: r.mission_id });
 
   // #93 item 6: wall-clock graphic, when this record represents a model
   // dispatch with a known duration (or is currently running). Empty for
   // point-in-time records like flow note/catch.
   const wallclockHtml = (typeof renderWallClock === 'function') ? renderWallClock(r) : '';
+
+  // #136 (schema 1.3): reasoning block — operator-readable rationale for
+  // tier-decision records (the WHY layer of the audit substrate). When
+  // present, render as a dedicated block under the handle so the full
+  // prose is visible at a glance, not truncated inside a pill.
+  const reasoningHtml = r.reasoning
+    ? `<div class="reasoning">${escapeHtml(r.reasoning)}</div>`
+    : '';
 
   return `
     <div class="record">
@@ -910,6 +940,7 @@ function renderRecord(r) {
         </div>
         <div class="action">${escapeHtml(r.action || '(no action)')}</div>
         <div class="handle">${escapeHtml(r.handle || '')}</div>
+        ${reasoningHtml}
         <div class="meta-row">
           ${meta.map(m => `<span class="meta-pill"><span class="lbl">${escapeHtml(m.lbl)}</span><span class="val">${escapeHtml(m.val)}</span></span>`).join('')}
         </div>

@@ -629,6 +629,57 @@ mod tests {
     }
 
     #[test]
+    fn stage_tier_decision_round_trips_as_kebab_case() {
+        // Schema 1.3 introduced Stage::TierDecision and changed the
+        // serde rename from `lowercase` to `kebab-case`. Both directions
+        // (serialize + deserialize) must agree for the new variant AND
+        // for the existing single-word variants (which should be no-ops).
+        for (variant, expected) in [
+            (Stage::Scope, "scope"),
+            (Stage::Estimate, "estimate"),
+            (Stage::Dispatch, "dispatch"),
+            (Stage::Review, "review"),
+            (Stage::Ship, "ship"),
+            (Stage::Retrospect, "retrospect"),
+            (Stage::TierDecision, "tier-decision"),
+        ] {
+            let serialized = serde_json::to_string(&variant).unwrap();
+            assert_eq!(serialized.trim_matches('"'), expected,
+                "{variant:?} should serialize as {expected}");
+            let parsed: Stage = serde_json::from_str(&serialized).unwrap();
+            // Round-trip equality via Debug (Stage doesn't derive PartialEq).
+            assert_eq!(format!("{parsed:?}"), format!("{variant:?}"));
+        }
+    }
+
+    #[test]
+    fn reasoning_and_mission_id_omit_when_none() {
+        // schema_serialize_omit_when_none-style guarantee for the new
+        // schema-1.3 fields. When both are None, the serialized JSON
+        // must NOT contain "reasoning":null or "mission_id":null.
+        let rec = FlowRecord {
+            ts: "2025-01-01T00:00:00Z".to_string(),
+            level: Level::Info,
+            category: Category::Work,
+            tier: Tier::Operator,
+            stage: Stage::Scope,
+            action: "test".to_string(),
+            handle: "h".to_string(),
+            sprint_id: None,
+            session_id: None,
+            source: None,
+            model: None,
+            reasoning: None,
+            mission_id: None,
+        };
+        let serialized = serde_json::to_string(&rec).unwrap();
+        assert!(!serialized.contains("reasoning"),
+            "absent reasoning leaked into JSON: {serialized}");
+        assert!(!serialized.contains("mission_id"),
+            "absent mission_id leaked into JSON: {serialized}");
+    }
+
+    #[test]
     fn schema_header_contains_version_and_darkmux_version() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("2025-01-01.jsonl");
