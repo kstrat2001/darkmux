@@ -14,7 +14,7 @@ use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.2.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.3.0";
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -44,7 +44,7 @@ pub enum Tier {
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum Stage {
     Scope,
     Estimate,
@@ -52,6 +52,12 @@ pub enum Stage {
     Review,
     Ship,
     Retrospect,
+    /// Tier-decision record (#136): the frontier orchestrator's reasoning
+    /// for routing this piece of work to local vs. holding in frontier.
+    /// Emitted via `darkmux flow tier-decision`. Category typically
+    /// `audit`; the `reasoning` field carries the operator-visible
+    /// rationale. Serialized as `"tier-decision"`.
+    TierDecision,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -80,6 +86,21 @@ pub struct FlowRecord {
     /// can't be resolved. Schema 1.2 addition (#106).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Operator-facing reasoning for this record. Used primarily by
+    /// tier-decision records (#136) where the frontier orchestrator
+    /// explains WHY work was routed to local vs. held in frontier. The
+    /// audit substrate's "why" layer. Schema 1.3 addition.
+    ///
+    /// Non-tier-decision records typically leave this `None`. When set
+    /// on any record, it's free-form prose intended for human review
+    /// (compliance audit, post-mortem, retrospective).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    /// Parent mission id. Optional because some flow records aren't
+    /// scoped to a mission (operator-initiated dispatches without an
+    /// active mission, machinery events). Schema 1.3 addition (#136).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mission_id: Option<String>,
 }
 
 /// Resolve the flows directory from env override (`DARKMUX_FLOWS_DIR`) or
@@ -252,6 +273,8 @@ mod tests {
             session_id: None,
             source: None,
             model: None,
+            reasoning: None,
+            mission_id: None,
         };
 
         record_at(&record, &path).unwrap();
@@ -285,6 +308,8 @@ mod tests {
             session_id: None,
             source: None,
             model: None,
+            reasoning: None,
+            mission_id: None,
         };
 
         record_at(&r("first"), &path).unwrap();
@@ -326,6 +351,8 @@ mod tests {
             session_id: Some("sess-abc".to_string()),
             source: Some("estimator".to_string()),
             model: None,
+            reasoning: None,
+            mission_id: None,
         };
 
         record_at(&record, &path).unwrap();
@@ -384,6 +411,8 @@ mod tests {
                 session_id: None,
                 source: Some("reviewer".to_string()),
                 model: None,
+                reasoning: None,
+                mission_id: None,
             },
             &tmp.path().join("custom.jsonl"),
         )
@@ -421,6 +450,8 @@ mod tests {
             session_id: None,
             source: None,
             model: None,
+            reasoning: None,
+            mission_id: None,
         };
 
         record_at(&record, &path).unwrap();
@@ -466,6 +497,8 @@ mod tests {
             session_id: None,
             source: None,
             model: None,
+            reasoning: None,
+            mission_id: None,
         };
 
         // Capture the day-key BEFORE calling record() so a midnight-UTC
@@ -579,14 +612,20 @@ mod tests {
     }
 
     #[test]
-    fn flow_schema_version_is_1_2_0() {
+    fn flow_schema_version_is_1_3_0() {
         // Pin the schema version so an accidental rename can't ship silently;
         // any bump beyond this should be a deliberate code change paired with
         // an update to this assertion (and corresponding viewer EXPECTED_*
-        // bump if the change is breaking). 1.2.0 added the optional `model`
-        // field to FlowRecord (#106 — Sprint 4 of #104), minor since older
-        // viewers can safely ignore the absent/extra field.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.2.0");
+        // bump if the change is breaking).
+        //
+        // Version history:
+        //   1.2.0 — added optional `model` field (#106, Sprint 4 of #104)
+        //   1.3.0 — added optional `reasoning` and `mission_id` fields and a
+        //           new `Stage::TierDecision` variant (#136). Minor bump:
+        //           older viewers can safely ignore the new fields and will
+        //           see the new stage value as an unknown literal — no data
+        //           loss, no breaking parse.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.3.0");
     }
 
     #[test]
@@ -607,6 +646,8 @@ mod tests {
                 session_id: None,
                 source: None,
                 model: None,
+                reasoning: None,
+                mission_id: None,
             },
             &path,
         )

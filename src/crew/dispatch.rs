@@ -706,6 +706,8 @@ pub(crate) fn build_dispatch_record(
         session_id: Some(session_id.to_string()),
         source: Some("crew_dispatch".to_string()),
         model: model.map(String::from),
+        reasoning: None,
+        mission_id: None,
     }
 }
 
