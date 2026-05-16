@@ -422,6 +422,67 @@ fn walk_one_level(dir: &Path, out: &mut Vec<WatchedFile>, cap: usize) {
 /// own session bookkeeping, trajectory files, and the workspace bootstrap
 /// markdowns. These change on every dispatch and would drown out the
 /// signal the operator is actually looking for.
+/// Resolve the path to the optional operator-identity file (#147).
+/// Defaults to `~/.darkmux/identity.md`. The `DARKMUX_IDENTITY_PATH`
+/// env var overrides — used by tests, also available for operators
+/// with multi-user / multi-identity setups.
+fn identity_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("DARKMUX_IDENTITY_PATH") {
+        let trimmed = p.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
+    dirs::home_dir().map(|h| h.join(".darkmux").join("identity.md"))
+}
+
+/// Load the operator-identity content from `~/.darkmux/identity.md` if
+/// present. Returns `Some(content)` when the file exists and is
+/// non-empty, `None` otherwise. The file is optional — when absent, the
+/// bootstrap-chatter pain class observed in the experiment surfaces
+/// naturally and the operator can decide whether to author the file.
+///
+/// **Bounded scope** (#147): the identity file is intended for stable
+/// operator-identity primitives — name, pronouns, timezone, work-mode
+/// preference, language preference. Explicit non-goals: engagement
+/// context (lives in dispatch messages per the engagement-not-CLI
+/// doctrine), project-specific knowledge (lives in CLAUDE.md per
+/// project), vision-bearing content (lives in the frontier orchestrator,
+/// not in static files).
+fn load_operator_identity() -> Option<String> {
+    let path = identity_path()?;
+    let content = fs::read_to_string(&path).ok()?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(content)
+    }
+}
+
+/// Compute the "effective" system prompt for a role — the role's
+/// authored .md prompt, optionally augmented with operator-identity
+/// content from `~/.darkmux/identity.md` (#147).
+///
+/// When the identity file is absent or empty: returns the role prompt
+/// unchanged. The bootstrap chatter the operator sees is the agent's
+/// honest surfacing of the missing context.
+///
+/// When the identity file is present: appends an `## About the operator`
+/// section to the role prompt. Called at BOTH sync time (so the
+/// systemPromptOverride written to openclaw.json reflects the
+/// augmented form) AND preflight time (so drift detection compares
+/// like-for-like).
+pub(crate) fn augment_prompt_with_identity(role_prompt: &str) -> String {
+    match load_operator_identity() {
+        Some(identity) => format!(
+            "{role_prompt}\n\n---\n\n## About the operator\n\n{}\n",
+            identity.trim_end()
+        ),
+        None => role_prompt.to_string(),
+    }
+}
+
 /// Sprint-output file path for a given sprint id. Lives alongside the
 /// sprint manifest at `<crew_root>/sprints/<id>-output.txt`. Used by
 /// #146 Stage 1 (cross-sprint context) to:
@@ -724,7 +785,11 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
 
     // 1. Load the role + its .md prompt
     let role = load_role_or_bail(&opts.role_id)?;
-    let prompt = role_prompt_or_bail(&role)?;
+    let bare_prompt = role_prompt_or_bail(&role)?;
+    // #147: augment with operator-identity from ~/.darkmux/identity.md
+    // if present. Pre-flight compares against the augmented form so
+    // drift detection matches what `darkmux crew sync` wrote.
+    let prompt = augment_prompt_with_identity(&bare_prompt);
     let agent_id = agent_id_for(&opts.role_id);
 
     // 1.5. Licensed-adjacent ACK gate. For roles whose prompts operate
@@ -1176,13 +1241,16 @@ pub fn sync(opts: SyncOpts) -> Result<SyncResult> {
         // Only sync roles that have an authored `.md` prompt — otherwise
         // there's nothing to dispatch with. Checks user dir first, then
         // bundled BUILTIN_ROLE_PROMPTS.
-        let prompt = match load_role_prompt(&role.id) {
+        let bare_prompt = match load_role_prompt(&role.id) {
             Some(p) => p,
             None => {
                 result.skipped_no_prompt.push(role.id.clone());
                 continue;
             }
         };
+        // #147: inject operator-identity into the effective system prompt
+        // when ~/.darkmux/identity.md exists. No-op when absent.
+        let prompt = augment_prompt_with_identity(&bare_prompt);
 
         let agent_id = agent_id_for(&role.id);
         let (agent_dir, workspace_dir) = agent_dirs_for(&role.id, &openclaw_root);
@@ -1316,6 +1384,83 @@ mod tests {
         require_licensed_adjacent_ack("coder").unwrap();
         require_licensed_adjacent_ack("analyst").unwrap();
         require_licensed_adjacent_ack("scribe").unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn augment_prompt_with_identity_passes_through_when_file_absent() {
+        let tmp = TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_IDENTITY_PATH").ok();
+        // Point at a non-existent file so the lookup misses cleanly.
+        unsafe {
+            std::env::set_var(
+                "DARKMUX_IDENTITY_PATH",
+                tmp.path().join("does-not-exist.md"),
+            );
+        }
+
+        let augmented = augment_prompt_with_identity("# Role\n\nyou are X");
+        assert_eq!(augmented, "# Role\n\nyou are X");
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_IDENTITY_PATH", v),
+                None => std::env::remove_var("DARKMUX_IDENTITY_PATH"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn augment_prompt_with_identity_appends_section_when_file_present() {
+        let tmp = TempDir::new().unwrap();
+        let identity_path = tmp.path().join("identity.md");
+        fs::write(
+            &identity_path,
+            "Name: Kain.\nPronouns: He/Him.\nTimezone: Asia/Kuala_Lumpur.\n",
+        ).unwrap();
+        let prev = std::env::var("DARKMUX_IDENTITY_PATH").ok();
+        unsafe { std::env::set_var("DARKMUX_IDENTITY_PATH", &identity_path); }
+
+        let augmented = augment_prompt_with_identity("# Role\n\nyou are X");
+        // Role prompt preserved verbatim at the start.
+        assert!(augmented.starts_with("# Role\n\nyou are X"), "got: {augmented}");
+        // About-the-operator section appended.
+        assert!(augmented.contains("## About the operator"), "got: {augmented}");
+        // Identity content present.
+        assert!(augmented.contains("Name: Kain"), "got: {augmented}");
+        assert!(augmented.contains("Asia/Kuala_Lumpur"), "got: {augmented}");
+        // Separator between role prompt and identity.
+        assert!(augmented.contains("\n\n---\n\n"), "got: {augmented}");
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_IDENTITY_PATH", v),
+                None => std::env::remove_var("DARKMUX_IDENTITY_PATH"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn augment_prompt_with_identity_treats_empty_file_as_absent() {
+        let tmp = TempDir::new().unwrap();
+        let identity_path = tmp.path().join("identity.md");
+        fs::write(&identity_path, "   \n  \n").unwrap();
+        let prev = std::env::var("DARKMUX_IDENTITY_PATH").ok();
+        unsafe { std::env::set_var("DARKMUX_IDENTITY_PATH", &identity_path); }
+
+        let augmented = augment_prompt_with_identity("# Role\n\nyou are X");
+        // Empty/whitespace identity file = no augmentation. Operator
+        // hasn't actually authored content, so we don't fabricate a section.
+        assert_eq!(augmented, "# Role\n\nyou are X");
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_IDENTITY_PATH", v),
+                None => std::env::remove_var("DARKMUX_IDENTITY_PATH"),
+            }
+        }
     }
 
     #[test]
