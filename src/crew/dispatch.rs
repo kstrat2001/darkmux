@@ -544,30 +544,14 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     require_licensed_adjacent_ack(&opts.role_id)
         .context("licensed-adjacent role dispatch requires acknowledgment")?;
 
-    // 1.75. Apply --workdir override (#143 Stage 1). When the operator
-    //       passes an explicit workdir, set up the role's workspace
-    //       `repo` symlink to point at it. When omitted, the workspace
-    //       is left whatever state it was in (no auto-mutation).
+    // 2. Pre-flight against openclaw config. Run BEFORE --workdir
+    //    mutates state (per QA review on #143 Stage 1): cheap-and-
+    //    reversible checks come first so a pre-flight failure doesn't
+    //    leave the operator with a half-applied symlink. The
+    //    operator-never-has-to-wonder rule from CLAUDE.md says
+    //    silent-partial-state from a failed dispatch is exactly the
+    //    wondering this discipline prevents.
     let role_workspace = default_workspace_for_role(&opts.role_id);
-    let workdir_outcome = apply_workdir_override(
-        opts.workdir.as_deref(),
-        &role_workspace,
-    )?;
-    if let WorkdirOutcome::Applied { previous_target } = &workdir_outcome {
-        match previous_target {
-            Some(prev) => eprintln!(
-                "darkmux crew dispatch: --workdir replaced `{}/repo` (was -> {})",
-                role_workspace.display(),
-                prev.display()
-            ),
-            None => eprintln!(
-                "darkmux crew dispatch: --workdir installed `{}/repo` (no previous link)",
-                role_workspace.display()
-            ),
-        }
-    }
-
-    // 2. Pre-flight against openclaw config
     if !opts.skip_preflight {
         let openclaw_path = default_openclaw_config();
         let openclaw_config = read_openclaw_config(&openclaw_path)?;
@@ -577,6 +561,36 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
                     "pre-flight failed for `{agent_id}`. Run `darkmux crew sync` to update openclaw config from the manifests."
                 )
             })?;
+    }
+
+    // 2.5. Apply --workdir override (#143 Stage 1). State mutation only
+    //      after pre-flight has cleared. When the operator passes an
+    //      explicit workdir, set up the role's workspace `repo` symlink
+    //      to point at it. When omitted, the workspace is left whatever
+    //      state it was in (no auto-mutation).
+    let workdir_outcome = apply_workdir_override(
+        opts.workdir.as_deref(),
+        &role_workspace,
+    )?;
+    if let WorkdirOutcome::Applied { previous_target } = &workdir_outcome {
+        let absolute_target = opts
+            .workdir
+            .as_deref()
+            .and_then(|p| p.canonicalize().ok())
+            .unwrap_or_else(|| opts.workdir.clone().unwrap_or_default());
+        match previous_target {
+            Some(prev) => eprintln!(
+                "darkmux crew dispatch: --workdir replaced `{}/repo` (was -> {}; now -> {})",
+                role_workspace.display(),
+                prev.display(),
+                absolute_target.display()
+            ),
+            None => eprintln!(
+                "darkmux crew dispatch: --workdir installed `{}/repo` (now -> {})",
+                role_workspace.display(),
+                absolute_target.display()
+            ),
+        }
     }
 
     // 3. Resolve session id. Always pass `--session-id` to openclaw — when
