@@ -156,6 +156,8 @@ fn dispatch_compiler(input: &str, hint: Option<&str>) -> Result<String> {
         timeout_seconds: 600,
         skip_preflight: false,
         watch_paths: Vec::new(),
+        // mission-compiler reads stdin-piped intent; no scope override.
+        workdir: None,
     };
     let result = crate::crew::dispatch::dispatch(opts)
         .context("dispatch to mission-compiler failed")?;

@@ -277,6 +277,17 @@ enum CrewCmd {
         /// state on disk against the SIGNOFF block's "files written" claims.
         #[arg(long = "watch", value_name = "PATH")]
         watch: Vec<std::path::PathBuf>,
+        /// Explicit working directory override (#143). When set, the
+        /// dispatcher creates/replaces a `repo` symlink in the role's
+        /// openclaw workspace pointing at this path, so the agent
+        /// operates against the operator-named scope. When omitted, the
+        /// dispatcher does NOT touch the workspace — whatever symlink
+        /// already exists (or none at all) is what the agent sees. Per
+        /// the operator-sovereignty contract: darkmux doesn't auto-
+        /// fabricate scope, but it also doesn't auto-strip scope the
+        /// operator has set up manually.
+        #[arg(long = "workdir", value_name = "PATH")]
+        workdir: Option<std::path::PathBuf>,
         /// Skip the pre-flight checks. Use only for debugging.
         #[arg(long, hide = true)]
         skip_preflight: bool,
@@ -1084,7 +1095,7 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
     match sub {
         CrewCmd::List => crew::cli::crew_list(),
         CrewCmd::Show { id } => crew::cli::crew_show(&id),
-        CrewCmd::Dispatch { role, message, deliver, session_id, timeout, watch, skip_preflight } => {
+        CrewCmd::Dispatch { role, message, deliver, session_id, timeout, watch, workdir, skip_preflight } => {
             // CLI default: if the operator didn't supply --watch, watch the
             // role's openclaw workspace dir. Library callers (e.g.
             // sprint_cli) pass an empty Vec directly to opt out.
@@ -1101,6 +1112,7 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
                 timeout_seconds: timeout,
                 skip_preflight,
                 watch_paths,
+                workdir,
             };
             let result = crew::dispatch::dispatch(opts)?;
             // Announce the resolved session id on stderr so operators see

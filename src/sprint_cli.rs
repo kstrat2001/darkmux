@@ -791,6 +791,8 @@ pub(crate) fn sprint_review_at(
         // parses the SIGNOFF text from the dispatch's stdout. Skip the
         // watched-state echo to keep sprint review output focused.
         watch_paths: Vec::new(),
+        // Sprint review reads operator-supplied diffs; no scope override.
+        workdir: None,
     };
 
     // Emit dispatch flow record.

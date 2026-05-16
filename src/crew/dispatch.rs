@@ -232,6 +232,17 @@ pub struct DispatchOpts {
     /// the SIGNOFF block. Empty defaults to the role's openclaw
     /// workspace dir.
     pub watch_paths: Vec<PathBuf>,
+    /// Explicit working-directory override for the dispatch (#143).
+    /// When `Some(path)`, the dispatcher sets up
+    /// `~/.openclaw/workspace-darkmux-<role>/repo` as a symlink to
+    /// the given path before invoking openclaw. The agent then sees
+    /// the operator-named scope as `repo/` inside its workspace.
+    /// When `None`, the dispatcher does NOT touch the workspace —
+    /// whatever symlink the operator has set up (or none at all)
+    /// is what the agent gets. Per the operator-sovereignty contract
+    /// in #143, darkmux doesn't auto-create or auto-remove scope
+    /// links; --workdir is the explicit operator opt-in.
+    pub workdir: Option<PathBuf>,
 }
 
 /// One file's state for the watched-paths summary (#89).
@@ -394,6 +405,102 @@ fn walk_one_level(dir: &Path, out: &mut Vec<WatchedFile>, cap: usize) {
 /// own session bookkeeping, trajectory files, and the workspace bootstrap
 /// markdowns. These change on every dispatch and would drown out the
 /// signal the operator is actually looking for.
+/// Outcome of applying a `--workdir` override for a dispatch. Returned
+/// from `apply_workdir_override` so the caller can decide whether to
+/// emit any operator-facing notice.
+#[derive(Debug, PartialEq)]
+enum WorkdirOutcome {
+    /// `--workdir` not set; no change applied.
+    NoChange,
+    /// `repo` symlink created/replaced; previous state (if any) is
+    /// included so the operator can see what was overwritten.
+    Applied { previous_target: Option<PathBuf> },
+}
+
+/// Apply a `--workdir` override to the role's openclaw workspace. The
+/// override is a symlink at `<role-workspace>/repo` pointing at the
+/// operator-named path.
+///
+/// **Operator-sovereign contract** (#143):
+/// - When `workdir` is `None`, this function is a no-op. Whatever
+///   symlink already exists in the workspace (or none) is what the
+///   agent sees.
+/// - When `workdir` is `Some(path)`, the path MUST exist as a directory
+///   (or symlink to one) — we don't fabricate scope. The function
+///   replaces any existing `repo` symlink with one pointing at the
+///   operator's choice.
+/// - We do NOT remove the symlink after dispatch. The operator's
+///   explicit declaration persists until they `rm` it or pass a
+///   different `--workdir`. This avoids the crash-mid-dispatch
+///   restore-fragility class of bugs.
+fn apply_workdir_override(
+    workdir: Option<&Path>,
+    role_workspace: &Path,
+) -> Result<WorkdirOutcome> {
+    let Some(target) = workdir else {
+        return Ok(WorkdirOutcome::NoChange);
+    };
+
+    // Refuse to point at a nonexistent path — the operator-sovereignty
+    // contract is "operator declares scope; system refuses to fabricate
+    // scope on their behalf."
+    let metadata = fs::metadata(target).with_context(|| {
+        format!(
+            "--workdir path does not exist or is not readable: {}",
+            target.display()
+        )
+    })?;
+    if !metadata.is_dir() {
+        bail!(
+            "--workdir must point to a directory; {} is not a directory",
+            target.display()
+        );
+    }
+
+    fs::create_dir_all(role_workspace).with_context(|| {
+        format!("creating role workspace {}", role_workspace.display())
+    })?;
+
+    let link_path = role_workspace.join("repo");
+
+    // Read previous state for the operator-facing notice.
+    let previous_target = if link_path.is_symlink() {
+        fs::read_link(&link_path).ok()
+    } else if link_path.exists() {
+        // Not a symlink but exists — refuse to clobber. This catches
+        // the case where an operator has a real `repo/` directory in
+        // the workspace.
+        bail!(
+            "{} exists but is not a symlink; refusing to clobber. \
+             Remove it manually if you want --workdir to manage scope, \
+             or omit --workdir to use the existing path.",
+            link_path.display()
+        );
+    } else {
+        None
+    };
+
+    // Remove the existing symlink (if any) and create a fresh one.
+    if link_path.is_symlink() {
+        fs::remove_file(&link_path).with_context(|| {
+            format!("removing existing symlink at {}", link_path.display())
+        })?;
+    }
+
+    let absolute_target = target
+        .canonicalize()
+        .unwrap_or_else(|_| target.to_path_buf());
+    std::os::unix::fs::symlink(&absolute_target, &link_path).with_context(|| {
+        format!(
+            "creating symlink {} -> {}",
+            link_path.display(),
+            absolute_target.display()
+        )
+    })?;
+
+    Ok(WorkdirOutcome::Applied { previous_target })
+}
+
 fn is_openclaw_noise(path: &Path) -> bool {
     let name = match path.file_name().and_then(|s| s.to_str()) {
         Some(n) => n,
@@ -437,7 +544,14 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     require_licensed_adjacent_ack(&opts.role_id)
         .context("licensed-adjacent role dispatch requires acknowledgment")?;
 
-    // 2. Pre-flight against openclaw config
+    // 2. Pre-flight against openclaw config. Run BEFORE --workdir
+    //    mutates state (per QA review on #143 Stage 1): cheap-and-
+    //    reversible checks come first so a pre-flight failure doesn't
+    //    leave the operator with a half-applied symlink. The
+    //    operator-never-has-to-wonder rule from CLAUDE.md says
+    //    silent-partial-state from a failed dispatch is exactly the
+    //    wondering this discipline prevents.
+    let role_workspace = default_workspace_for_role(&opts.role_id);
     if !opts.skip_preflight {
         let openclaw_path = default_openclaw_config();
         let openclaw_config = read_openclaw_config(&openclaw_path)?;
@@ -447,6 +561,36 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
                     "pre-flight failed for `{agent_id}`. Run `darkmux crew sync` to update openclaw config from the manifests."
                 )
             })?;
+    }
+
+    // 2.5. Apply --workdir override (#143 Stage 1). State mutation only
+    //      after pre-flight has cleared. When the operator passes an
+    //      explicit workdir, set up the role's workspace `repo` symlink
+    //      to point at it. When omitted, the workspace is left whatever
+    //      state it was in (no auto-mutation).
+    let workdir_outcome = apply_workdir_override(
+        opts.workdir.as_deref(),
+        &role_workspace,
+    )?;
+    if let WorkdirOutcome::Applied { previous_target } = &workdir_outcome {
+        let absolute_target = opts
+            .workdir
+            .as_deref()
+            .and_then(|p| p.canonicalize().ok())
+            .unwrap_or_else(|| opts.workdir.clone().unwrap_or_default());
+        match previous_target {
+            Some(prev) => eprintln!(
+                "darkmux crew dispatch: --workdir replaced `{}/repo` (was -> {}; now -> {})",
+                role_workspace.display(),
+                prev.display(),
+                absolute_target.display()
+            ),
+            None => eprintln!(
+                "darkmux crew dispatch: --workdir installed `{}/repo` (now -> {})",
+                role_workspace.display(),
+                absolute_target.display()
+            ),
+        }
     }
 
     // 3. Resolve session id. Always pass `--session-id` to openclaw — when
@@ -911,6 +1055,89 @@ mod tests {
         require_licensed_adjacent_ack("coder").unwrap();
         require_licensed_adjacent_ack("analyst").unwrap();
         require_licensed_adjacent_ack("scribe").unwrap();
+    }
+
+    #[test]
+    fn apply_workdir_override_noop_when_workdir_is_none() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace-darkmux-coder");
+        // No --workdir; function should be a no-op + workspace stays empty.
+        let outcome = apply_workdir_override(None, &workspace).unwrap();
+        assert_eq!(outcome, WorkdirOutcome::NoChange);
+        // Workspace was NOT auto-created either — no scope = no side effect.
+        assert!(!workspace.exists());
+    }
+
+    #[test]
+    fn apply_workdir_override_creates_symlink_to_existing_dir() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().join("my-project");
+        fs::create_dir(&project).unwrap();
+        let workspace = tmp.path().join("workspace-darkmux-coder");
+
+        let outcome = apply_workdir_override(Some(&project), &workspace).unwrap();
+        assert!(matches!(outcome, WorkdirOutcome::Applied { previous_target: None }));
+
+        let link = workspace.join("repo");
+        assert!(link.is_symlink());
+        let target = fs::read_link(&link).unwrap();
+        // Symlink target is canonicalized to absolute.
+        assert_eq!(target, project.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn apply_workdir_override_replaces_existing_symlink_and_reports_prev() {
+        let tmp = TempDir::new().unwrap();
+        let old_project = tmp.path().join("old-project");
+        let new_project = tmp.path().join("new-project");
+        fs::create_dir(&old_project).unwrap();
+        fs::create_dir(&new_project).unwrap();
+        let workspace = tmp.path().join("workspace-darkmux-coder");
+        fs::create_dir(&workspace).unwrap();
+        std::os::unix::fs::symlink(&old_project, workspace.join("repo")).unwrap();
+
+        let outcome = apply_workdir_override(Some(&new_project), &workspace).unwrap();
+        match outcome {
+            WorkdirOutcome::Applied { previous_target } => {
+                let prev = previous_target.expect("previous target should be captured");
+                assert!(prev.ends_with("old-project"));
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+        let link_target = fs::read_link(workspace.join("repo")).unwrap();
+        assert_eq!(link_target, new_project.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn apply_workdir_override_refuses_when_workdir_does_not_exist() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace-darkmux-coder");
+        let missing = tmp.path().join("does-not-exist");
+
+        let err = apply_workdir_override(Some(&missing), &workspace).unwrap_err();
+        let s = format!("{err:#}");
+        assert!(s.contains("does not exist") || s.contains("not readable"), "got: {s}");
+    }
+
+    #[test]
+    fn apply_workdir_override_refuses_when_repo_path_is_real_dir() {
+        // If the workspace already has a REAL `repo` dir (not a symlink),
+        // refuse to clobber. Operator-sovereign: don't trash files we
+        // didn't put there.
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().join("my-project");
+        fs::create_dir(&project).unwrap();
+        let workspace = tmp.path().join("workspace-darkmux-coder");
+        fs::create_dir_all(&workspace).unwrap();
+        let real_repo = workspace.join("repo");
+        fs::create_dir(&real_repo).unwrap();
+        fs::write(real_repo.join("OPERATOR_FILE.txt"), "do not clobber").unwrap();
+
+        let err = apply_workdir_override(Some(&project), &workspace).unwrap_err();
+        let s = format!("{err:#}");
+        assert!(s.contains("not a symlink") || s.contains("refusing to clobber"), "got: {s}");
+        // And the operator file is intact.
+        assert!(real_repo.join("OPERATOR_FILE.txt").exists());
     }
 
     #[test]
