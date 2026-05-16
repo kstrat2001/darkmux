@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-page="flow">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -8,6 +8,8 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../shared/shell.css">
+<script src="../shared/shell.js" defer></script>
 <style>
   :root {
     --bg: #0a0a0b;
@@ -53,16 +55,9 @@
   }
   code, pre, .mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
 
-  /* ─── header ────────────────────────────────────────────────────── */
-  header {
-    padding: 18px 24px;
-    border-bottom: 1px solid var(--border);
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 16px;
-    flex-wrap: wrap;
-  }
+  /* ─── header — replaced by <dx-shell> (per #168); these legacy
+   *           selectors are kept as no-ops for any modal text that still
+   *           references h1/.tag/.accent. */
   h1 { margin: 0; font-size: 18px; font-weight: 600; letter-spacing: -0.01em; }
   h1 .accent { color: var(--accent); }
   h1 .tag { color: var(--muted); font-weight: 500; }
@@ -384,13 +379,6 @@
     color: var(--accent);
   }
 
-  /* ─── brand-home link ──────────────────────────────────────────────── */
-  /* The "darkmux" word in the upper-left is clickable nav-home to
-   * darkmux.com — operator review on 2026-05-14 surfaced that decorative
-   * branding feels wrong on a tool meant for navigation. */
-  .brand-home { text-decoration: none; }
-  .brand-home:hover .accent { opacity: 0.8; }
-
   /* ─── sprint progress widget ───────────────────────────────────────── */
   /* Hidden by default; shown when /sprints returns something useful.
    * Surfaces "X / Y · current sprint · status" so the operator sees
@@ -487,7 +475,9 @@
 
   /* ─── model-status pill in the toolbar (issue #87) ──────────────── */
   .model-pill {
-    margin-left: auto; /* flush right; sits at the toolbar's tail */
+    /* margin-left was 'auto' when the pill lived in the toolbar — now
+     * it lives inside <dx-shell>'s pill row which already right-aligns
+     * its container. */
     display: inline-flex;
     align-items: center;
     gap: 8px;
@@ -585,17 +575,14 @@
 </style>
 </head>
 <body>
-  <header>
-    <h1>
-      <a href="https://darkmux.com/" class="brand-home" title="darkmux home">
-        <span class="accent">darkmux</span></a>
-      <span class="tag">/ flow viewer</span>
-    </h1>
-    <div class="header-right">
-      <span id="sprint-progress" class="sprint-progress" style="display:none"></span>
-      <span id="conn-status" class="conn-status" role="button" tabindex="0">no source</span>
-    </div>
-  </header>
+  <dx-shell active-tab="flow">
+    <span id="sprint-progress" class="sprint-progress" slot="pills" style="display:none"></span>
+    <button id="model-pill" class="model-pill" slot="pills" style="display:none" title="loaded models · click for details">
+      <span class="pill-dot"></span>
+      <span class="pill-label">checking…</span>
+    </button>
+    <span id="conn-status" class="conn-status" slot="pills" role="button" tabindex="0">no source</span>
+  </dx-shell>
 
   <div class="toolbar">
     <span class="toolbar-label">source:</span>
@@ -612,13 +599,6 @@
     <input type="text" id="search-input" list="filter-suggestions"
            placeholder="action / handle text… or level:error, tier:local, …">
     <datalist id="filter-suggestions"></datalist>
-    <!-- Model-status pill (#87). margin-left:auto in CSS flushes it right.
-         Click to open the detail modal. Hidden until the viewer connects
-         to a daemon (file/sample modes have no live model state to poll). -->
-    <button id="model-pill" class="model-pill" style="display:none" title="loaded models · click for details">
-      <span class="pill-dot"></span>
-      <span class="pill-label">checking…</span>
-    </button>
   </div>
 
   <main>
@@ -720,6 +700,12 @@
 
 <script>
 'use strict';
+
+// Note (#168): pill elements (#conn-status, #model-pill, #sprint-progress)
+// are children of <dx-shell slot="pills"> in the HTML; the shell custom
+// element re-parents them into its pill row during connectedCallback.
+// Query by ID, never by DOM structure — the elements' parent changes but
+// their IDs and event listeners survive the relocation intact.
 
 // ─── schema compatibility ──────────────────────────────────────────────
 // Bumped only when the flow schema breaks backward compatibility (rename
