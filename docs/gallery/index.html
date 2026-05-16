@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Trip Gallery</title>
+<meta name="description" content="Photo gallery from the trip">
+<style>
+  :root {
+    --bg: #0a0a0b;
+    --bg-elev: #131316;
+    --border: #1f1f24;
+    --text: #e8e6e3;
+    --muted: #8a8a92;
+    --accent: #6df1ff;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+    line-height: 1.55;
+    font-size: 16px;
+  }
+
+  /* Header */
+  header {
+    padding: 48px 24px;
+    border-bottom: 1px solid var(--border);
+    text-align: center;
+  }
+  header h1 {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 32px;
+    margin: 0 0 8px;
+    letter-spacing: -0.02em;
+  }
+  header p {
+    margin: 0;
+    color: var(--muted);
+    font-size: 16px;
+  }
+
+  /* Gallery Grid */
+  .gallery {
+    padding: 48px 24px;
+    max-width: 1600px;
+    margin: 0 auto;
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    gap: 24px;
+  }
+  .photo {
+    position: relative;
+    background: var(--bg-elev);
+    border-radius: 8px;
+    overflow: hidden;
+    aspect-ratio: 4/3;
+  }
+  .photo img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    cursor: pointer;
+    transition: transform 0.2s;
+  }
+  .photo:hover img {
+    transform: scale(1.02);
+  }
+  .photo .caption {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background: linear-gradient(to top, rgba(0,0,0,0.7), transparent);
+    padding: 24px 16px 16px;
+    color: white;
+    font-size: 14px;
+    opacity: 0;
+    transition: opacity 0.2s;
+  }
+  .photo:hover .caption {
+    opacity: 1;
+  }
+
+  /* Lightbox */
+  .lightbox {
+    display: none;
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(0,0,0,0.95);
+    z-index: 1000;
+    justify-content: center;
+    align-items: center;
+  }
+  .lightbox.active {
+    display: flex;
+  }
+  .lightbox img {
+    max-width: 90vw;
+    max-height: 90vh;
+    border-radius: 4px;
+  }
+  .lightbox-close {
+    position: absolute;
+    top: 24px;
+    right: 24px;
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    color: var(--text);
+    width: 48px;
+    height: 48px;
+    border-radius: 50%;
+    font-size: 24px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .lightbox-close:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  /* Navigation */
+  .lightbox-nav {
+    position: absolute;
+    top: 50%;
+    transform: translateY(-50%);
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    color: var(--text);
+    width: 56px;
+    height: 56px;
+    border-radius: 50%;
+    font-size: 24px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .lightbox-prev { left: 24px; }
+  .lightbox-next { right: 24px; }
+
+  /* Footer */
+  footer {
+    padding: 32px 24px;
+    text-align: center;
+    color: var(--muted);
+    font-size: 14px;
+    border-top: 1px solid var(--border);
+  }
+
+  /* Responsive */
+  @media (max-width: 768px) {
+    header h1 { font-size: 24px; }
+    .grid { grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); }
+    .lightbox-nav { width: 48px; height: 48px; font-size: 20px; }
+  }
+
+  /* No images placeholder */
+  .empty {
+    text-align: center;
+    padding: 64px 24px;
+    color: var(--muted);
+  }
+  .empty code {
+    background: var(--bg-elev);
+    padding: 4px 8px;
+    border-radius: 4px;
+    color: var(--accent);
+  }
+
+  /* Font */
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Trip Gallery</h1>
+  <p>Photos from the journey</p>
+</header>
+
+<main class="gallery">
+  <div class="grid" id="gallery-grid">
+    <!-- Photos will be loaded here -->
+  </div>
+
+  <div class="empty" id="empty-msg">
+    <p>No photos yet.</p>
+    <p>Add images to <code>gallery/images/</code> as <code>.jpg</code>, <code>.png</code>, or <code>.webp</code>.</p>
+    <p>Files will appear automatically — just refresh the page.</p>
+  </div>
+</main>
+
+<!-- Lightbox -->
+<div class="lightbox" id="lightbox">
+  <button class="lightbox-close" onclick="closeLightbox()">&times;</button>
+  <button class="lightbox-nav lightbox-prev" onclick="prevPhoto()">&#10094;</button>
+  <img id="lightbox-img" src="" alt="">
+  <button class="lightbox-nav lightbox-next" onclick="nextPhoto()">&#10095;</button>
+</div>
+
+<footer>
+  <p>Static gallery — add photos to <code>gallery/images/</code></p>
+  <p style="margin-top:8px"><a href="../" style="color:var(--muted)">← Back to docs</a></p>
+</footer>
+
+<script>
+  // Image list — add your photos here in order (0-indexed)
+  const images = [
+    // Example: 'photo1.jpg', 'photo2.png', 'sunset.webp'
+    // Uncomment and add your filenames:
+    // 'IMG_001.jpg',
+    // 'IMG_002.jpg',
+  ];
+
+  const grid = document.getElementById('gallery-grid');
+  const emptyMsg = document.getElementById('empty-msg');
+  const lightbox = document.getElementById('lightbox');
+  const lightboxImg = document.getElementById('lightbox-img');
+
+  let currentIndex = 0;
+
+  // Build gallery
+  if (images.length > 0) {
+    emptyMsg.style.display = 'none';
+    images.forEach((img, idx) => {
+      const div = document.createElement('div');
+      div.className = 'photo';
+      div.innerHTML = `
+        <img src="images/${img}" alt="${img}" onclick="openLightbox(${idx})">
+        <div class="caption">${img}</div>
+      `;
+      grid.appendChild(div);
+    });
+  }
+
+  // Lightbox functions
+  function openLightbox(index) {
+    currentIndex = index;
+    lightboxImg.src = `images/${images[index]}`;
+    lightbox.classList.add('active');
+  }
+
+  function closeLightbox() {
+    lightbox.classList.remove('active');
+  }
+
+  function prevPhoto() {
+    currentIndex = (currentIndex - 1 + images.length) % images.length;
+    lightboxImg.src = `images/${images[currentIndex]}`;
+  }
+
+  function nextPhoto() {
+    currentIndex = (currentIndex + 1) % images.length;
+    lightboxImg.src = `images/${images[currentIndex]}`;
+  }
+
+  // Keyboard navigation
+  document.addEventListener('keydown', (e) => {
+    if (!lightbox.classList.contains('active')) return;
+    if (e.key === 'Escape') closeLightbox();
+    if (e.key === 'ArrowLeft') prevPhoto();
+    if (e.key === 'ArrowRight') nextPhoto();
+  });
+
+  // Close on background click
+  lightbox.addEventListener('click', (e) => {
+    if (e.target === lightbox) closeLightbox();
+  });
+</script>
+
+</body>
+</html>
