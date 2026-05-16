@@ -288,6 +288,16 @@ enum CrewCmd {
         /// operator has set up manually.
         #[arg(long = "workdir", value_name = "PATH")]
         workdir: Option<std::path::PathBuf>,
+        /// Sprint id binding this dispatch to a sprint in a mission
+        /// (#146 Stage 1). When set, the dispatcher reads the sprint's
+        /// `depends_on` parents and prepends each recorded output as a
+        /// "Prior sprint outputs" context block on the message. After
+        /// the dispatch returns, the agent's reply text is persisted to
+        /// `<crew_root>/sprints/<sprint-id>-output.txt` so downstream
+        /// sprints can read it on their own dispatch. One-hop only —
+        /// transitive ancestors are not walked (Stage 1 scope).
+        #[arg(long = "sprint-id", value_name = "ID")]
+        sprint_id: Option<String>,
         /// Skip the pre-flight checks. Use only for debugging.
         #[arg(long, hide = true)]
         skip_preflight: bool,
@@ -1095,7 +1105,7 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
     match sub {
         CrewCmd::List => crew::cli::crew_list(),
         CrewCmd::Show { id } => crew::cli::crew_show(&id),
-        CrewCmd::Dispatch { role, message, deliver, session_id, timeout, watch, workdir, skip_preflight } => {
+        CrewCmd::Dispatch { role, message, deliver, session_id, timeout, watch, workdir, sprint_id, skip_preflight } => {
             // CLI default: if the operator didn't supply --watch, watch the
             // role's openclaw workspace dir. Library callers (e.g.
             // sprint_cli) pass an empty Vec directly to opt out.
@@ -1113,6 +1123,7 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
                 skip_preflight,
                 watch_paths,
                 workdir,
+                sprint_id,
             };
             let result = crew::dispatch::dispatch(opts)?;
             // Announce the resolved session id on stderr so operators see

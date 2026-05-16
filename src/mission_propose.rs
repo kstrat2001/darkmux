@@ -158,6 +158,9 @@ fn dispatch_compiler(input: &str, hint: Option<&str>) -> Result<String> {
         watch_paths: Vec::new(),
         // mission-compiler reads stdin-piped intent; no scope override.
         workdir: None,
+        // mission-compiler runs BEFORE any mission/sprints exist on disk —
+        // there's nothing to bind to and no parent context to inject.
+        sprint_id: None,
     };
     let result = crate::crew::dispatch::dispatch(opts)
         .context("dispatch to mission-compiler failed")?;

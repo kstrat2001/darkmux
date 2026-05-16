@@ -15,7 +15,7 @@
 //! `agents.list[]` reflect the manifests on disk — writes/updates the
 //! `darkmux/<role>` entries to match what the manifests + `.md` prompts say.
 
-use crate::crew::loader::{load_role_prompt, load_roles};
+use crate::crew::loader::{crew_root, load_role_prompt, load_roles, load_sprints};
 use crate::crew::types::Role;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value, json};
@@ -243,6 +243,23 @@ pub struct DispatchOpts {
     /// in #143, darkmux doesn't auto-create or auto-remove scope
     /// links; --workdir is the explicit operator opt-in.
     pub workdir: Option<PathBuf>,
+    /// Optional sprint id binding this dispatch to a sprint in a
+    /// mission (#146 Stage 1). When set:
+    ///
+    ///   1. The dispatcher loads the sprint manifest and resolves
+    ///      `depends_on` parents. For each parent that has a recorded
+    ///      output file (`<sprint-id>-output.txt`), the parent's
+    ///      output text is prepended to the dispatch message as a
+    ///      "Prior sprint outputs" context block. One-hop only —
+    ///      transitive ancestors are NOT walked (Stage 1 scope).
+    ///   2. After the dispatch returns, the agent's reply text is
+    ///      persisted to `<sprint-id>-output.txt` alongside the sprint
+    ///      manifest, so downstream sprints with this sprint in their
+    ///      `depends_on` can read it on their own dispatch.
+    ///
+    /// When `None`, the dispatcher behaves as before — no sprint
+    /// awareness, no output persistence. Backwards-compatible default.
+    pub sprint_id: Option<String>,
 }
 
 /// One file's state for the watched-paths summary (#89).
@@ -405,6 +422,180 @@ fn walk_one_level(dir: &Path, out: &mut Vec<WatchedFile>, cap: usize) {
 /// own session bookkeeping, trajectory files, and the workspace bootstrap
 /// markdowns. These change on every dispatch and would drown out the
 /// signal the operator is actually looking for.
+/// Sprint-output file path for a given sprint id. Lives alongside the
+/// sprint manifest at `<crew_root>/sprints/<id>-output.txt`. Used by
+/// #146 Stage 1 (cross-sprint context) to:
+///
+///   - Read parent sprint outputs when dispatching a sprint with
+///     `depends_on` (one-hop only)
+///   - Persist this sprint's agent reply so downstream sprints can
+///     read it on their own dispatch
+///
+/// Plain text, not JSON — the agent's reply IS prose. Storing it raw
+/// keeps the inject-back-into-message format friction-free.
+///
+/// **Layout coupling**: this function and `crew::lifecycle::sprint_path`
+/// both compute `<crew_root>/sprints/...`. If #148's per-mission layout
+/// migration lands later, both sites must change in lockstep. The two
+/// functions are intentionally separate (manifest path vs. output path)
+/// but share a directory contract — keep them in sync.
+fn sprint_output_path(sprint_id: &str) -> PathBuf {
+    crew_root().join("sprints").join(format!("{sprint_id}-output.txt"))
+}
+
+/// Resolve the dispatch message: when `sprint_id` is `Some(id)`, look
+/// up the sprint's `depends_on` parents and prepend each parent's
+/// recorded output as a "Prior sprint outputs" context block. Returns
+/// the augmented message (or the original message unchanged if there
+/// are no parents, no recorded outputs, or no sprint_id at all).
+///
+/// One-hop only — transitive ancestors are NOT walked. Stage 1 scope
+/// per #146. The two-hop / DAG / context-budget refinements are Stage 2.
+///
+/// Missing parents / missing output files are NOT fatal — the dispatch
+/// proceeds with whatever outputs are available. The dispatcher logs
+/// to stderr which parents were found vs. missing so the operator can
+/// see what context the agent received.
+fn augment_message_with_sprint_context(
+    sprint_id: Option<&str>,
+    original_message: &str,
+) -> Result<String> {
+    let Some(sprint_id) = sprint_id else {
+        return Ok(original_message.to_string());
+    };
+
+    // Load all sprints (cheap — small number of JSONs on disk). Find
+    // the named sprint; if not found, log + dispatch as-is.
+    let sprints = match load_sprints() {
+        Ok(s) => s,
+        Err(_) => {
+            // Loader failure shouldn't block dispatch — just log.
+            eprintln!(
+                "darkmux crew dispatch: sprint loader unavailable; \
+                 dispatching `{sprint_id}` without cross-sprint context."
+            );
+            return Ok(original_message.to_string());
+        }
+    };
+    let sprint = match sprints.into_iter().find(|s| s.id == sprint_id) {
+        Some(s) => s,
+        None => {
+            eprintln!(
+                "darkmux crew dispatch: sprint `{sprint_id}` not found in \
+                 crew root; dispatching without cross-sprint context."
+            );
+            return Ok(original_message.to_string());
+        }
+    };
+
+    if sprint.depends_on.is_empty() {
+        // No dependencies declared; nothing to inject.
+        return Ok(original_message.to_string());
+    }
+
+    // For each parent, look up its recorded output. Missing outputs
+    // are accumulated in `missing_parents` so the operator sees which
+    // parents the agent didn't get context for.
+    let mut parent_blocks: Vec<String> = Vec::new();
+    let mut missing_parents: Vec<String> = Vec::new();
+    for parent_id in &sprint.depends_on {
+        let path = sprint_output_path(parent_id);
+        match fs::read_to_string(&path) {
+            Ok(content) if !content.trim().is_empty() => {
+                parent_blocks.push(format!(
+                    "### {parent_id}\n\n{}\n",
+                    content.trim_end()
+                ));
+            }
+            _ => {
+                missing_parents.push(parent_id.clone());
+            }
+        }
+    }
+
+    if parent_blocks.is_empty() {
+        if !missing_parents.is_empty() {
+            eprintln!(
+                "darkmux crew dispatch: sprint `{}` depends on {} \
+                 (no recorded output for any parent yet — dispatching with \
+                 bare message).",
+                sprint_id,
+                missing_parents.join(", ")
+            );
+        }
+        return Ok(original_message.to_string());
+    }
+
+    if !missing_parents.is_empty() {
+        eprintln!(
+            "darkmux crew dispatch: sprint `{sprint_id}` got context from {} \
+             parent(s); missing recorded output for: {}",
+            parent_blocks.len(),
+            missing_parents.join(", ")
+        );
+    } else {
+        eprintln!(
+            "darkmux crew dispatch: sprint `{sprint_id}` got context from {} \
+             parent(s).",
+            parent_blocks.len()
+        );
+    }
+
+    let context_block = format!(
+        "## Prior sprint outputs\n\n\
+         The following sprints in this mission have completed and produced \
+         output you can reference. Use them as context for your task below.\n\n\
+         {}\n\
+         ---\n\n\
+         ## Your task\n\n\
+         {original_message}",
+        parent_blocks.join("\n"),
+    );
+    Ok(context_block)
+}
+
+/// Persist the agent's reply text to the sprint's output file after a
+/// dispatch completes (#146 Stage 1). Operator-visible side effect:
+/// `<crew_root>/sprints/<sprint-id>-output.txt` is created or
+/// overwritten with the agent's text reply.
+///
+/// No-op when `sprint_id` is `None` (dispatcher was called without
+/// sprint context — typical for ad-hoc role dispatches).
+///
+/// Returns the path written when persistence happened, `None`
+/// otherwise. Errors are logged but don't fail the dispatch itself —
+/// the output is already on stdout to the caller; the persistence is
+/// best-effort for downstream sprints.
+fn persist_sprint_output(
+    sprint_id: Option<&str>,
+    reply_text: &str,
+) -> Option<PathBuf> {
+    let sprint_id = sprint_id?;
+    if reply_text.trim().is_empty() {
+        return None;
+    }
+    let path = sprint_output_path(sprint_id);
+    if let Some(parent) = path.parent() {
+        if let Err(e) = fs::create_dir_all(parent) {
+            eprintln!(
+                "darkmux crew dispatch: failed to create output dir {}: {e}",
+                parent.display()
+            );
+            return None;
+        }
+    }
+    match fs::write(&path, reply_text) {
+        Ok(()) => Some(path),
+        Err(e) => {
+            eprintln!(
+                "darkmux crew dispatch: failed to persist sprint output to {}: {e}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
 /// Outcome of applying a `--workdir` override for a dispatch. Returned
 /// from `apply_workdir_override` so the caller can decide whether to
 /// emit any operator-facing notice.
@@ -593,6 +784,17 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         }
     }
 
+    // 2.75. Cross-sprint context injection (#146 Stage 1). When a
+    //       --sprint-id was passed, look up the sprint's depends_on
+    //       parents and prepend each recorded output as a "Prior
+    //       sprint outputs" context block. One-hop only — transitive
+    //       ancestors are NOT walked. Missing parent outputs are
+    //       logged and the dispatch proceeds with whatever's available.
+    let augmented_message = augment_message_with_sprint_context(
+        opts.sprint_id.as_deref(),
+        &opts.message,
+    )?;
+
     // 3. Resolve session id. Always pass `--session-id` to openclaw — when
     //    the caller didn't supply one, generate a fresh `crew-dispatch-
     //    <role>-<timestamp>`. Without this, openclaw silently reuses the
@@ -636,7 +838,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             .ok_or_else(|| anyhow!("--deliver must be `<channel>:<target>`, got `{deliver}`"))?;
         cmd.args(["--channel", chan, "--reply-to", target, "--deliver"]);
     }
-    cmd.args(["--message", &opts.message]);
+    cmd.args(["--message", &augmented_message]);
 
     let output_result = cmd
         .output()
@@ -671,13 +873,70 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         .map(|p| snapshot_watched_path(p))
         .collect();
 
+    let stdout_text = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr_text = String::from_utf8_lossy(&output.stderr).to_string();
+
+    // 6. Persist sprint output for downstream context injection (#146
+    //    Stage 1). Best-effort — failures logged to stderr but don't
+    //    fail the dispatch. The reply text comes from openclaw's JSON
+    //    envelope on stdout; we extract `payloads[0].text` if present
+    //    and fall back to the full stdout otherwise.
+    //
+    //    **Gated on dispatch success** (QA review on #157): a failed
+    //    dispatch (timeout, agent error, partial truncation) must NOT
+    //    clobber a previously-clean output. Operators re-running a
+    //    sprint that already had a recorded parent output should not
+    //    have downstream sprints silently start reading garbage.
+    //    Stderr already tells them what failed; they can decide whether
+    //    to hand-edit the output file or accept the prior recording.
+    if output.status.success() {
+        if let Some(sprint_id) = opts.sprint_id.as_deref() {
+            let reply_text = extract_payload_text(&stdout_text)
+                .unwrap_or_else(|| stdout_text.clone());
+            if let Some(path) = persist_sprint_output(Some(sprint_id), &reply_text) {
+                eprintln!(
+                    "darkmux crew dispatch: sprint `{sprint_id}` output persisted to {}",
+                    path.display()
+                );
+            }
+        }
+    } else if opts.sprint_id.is_some() {
+        eprintln!(
+            "darkmux crew dispatch: dispatch failed (exit {}); NOT persisting sprint output. \
+             Any prior recorded output remains intact.",
+            output.status.code().unwrap_or(-1)
+        );
+    }
+
     Ok(DispatchResult {
         exit_code: output.status.code().unwrap_or(-1),
-        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        stdout: stdout_text,
+        stderr: stderr_text,
         session_id: resolved_session_id,
         watched_state,
     })
+}
+
+/// Extract the `payloads[0].text` field from openclaw's JSON envelope.
+/// Returns `None` if the stdout isn't JSON or the field is missing.
+/// Used for sprint-output persistence (#146 Stage 1) so the recorded
+/// file contains the agent's prose, not openclaw's outer envelope.
+///
+/// Trims leading/trailing whitespace before parsing — openclaw sometimes
+/// emits a trailing newline that would otherwise fail `serde_json::from_str`.
+///
+/// **First payload only** — if openclaw ever emits multi-payload replies
+/// (multiple `text` segments for a single turn), this returns the first.
+/// A future expansion that concats segments would be a Stage 2 concern.
+fn extract_payload_text(stdout: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
+    value
+        .get("payloads")?
+        .as_array()?
+        .first()?
+        .get("text")?
+        .as_str()
+        .map(|s| s.to_string())
 }
 
 /// Build a flow record for a dispatch lifecycle event (`dispatch start`,
@@ -1057,6 +1316,183 @@ mod tests {
         require_licensed_adjacent_ack("coder").unwrap();
         require_licensed_adjacent_ack("analyst").unwrap();
         require_licensed_adjacent_ack("scribe").unwrap();
+    }
+
+    #[test]
+    fn extract_payload_text_pulls_first_text_from_envelope() {
+        let stdout = r#"{"payloads":[{"text":"hello world","mediaUrl":null}],"meta":{}}"#;
+        assert_eq!(extract_payload_text(stdout).as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn extract_payload_text_none_on_malformed_or_missing_fields() {
+        assert!(extract_payload_text("not json").is_none());
+        assert!(extract_payload_text("{}").is_none());
+        assert!(extract_payload_text(r#"{"payloads":[]}"#).is_none());
+        assert!(extract_payload_text(r#"{"payloads":[{"mediaUrl":null}]}"#).is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn augment_message_passes_through_when_no_sprint_id() {
+        let result = augment_message_with_sprint_context(None, "do the thing").unwrap();
+        assert_eq!(result, "do the thing");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn augment_message_passes_through_when_sprint_has_no_deps() {
+        let tmp = TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+        unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()); }
+        let sprints_dir = tmp.path().join("sprints");
+        fs::create_dir_all(&sprints_dir).unwrap();
+        fs::write(
+            sprints_dir.join("solo-sprint.json"),
+            r#"{"id":"solo-sprint","mission_id":"m","description":"d","status":"planned","depends_on":[],"created_ts":0}"#,
+        ).unwrap();
+
+        let result = augment_message_with_sprint_context(Some("solo-sprint"), "task body").unwrap();
+        assert_eq!(result, "task body");
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
+                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn augment_message_injects_parent_output_when_recorded() {
+        let tmp = TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+        unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()); }
+        let sprints_dir = tmp.path().join("sprints");
+        fs::create_dir_all(&sprints_dir).unwrap();
+        // Parent + child sprint manifests.
+        fs::write(
+            sprints_dir.join("parent.json"),
+            r#"{"id":"parent","mission_id":"m","description":"d","status":"done","depends_on":[],"created_ts":0}"#,
+        ).unwrap();
+        fs::write(
+            sprints_dir.join("child.json"),
+            r#"{"id":"child","mission_id":"m","description":"d","status":"planned","depends_on":["parent"],"created_ts":0}"#,
+        ).unwrap();
+        // Parent's recorded output.
+        fs::write(sprints_dir.join("parent-output.txt"), "parent did X and Y").unwrap();
+
+        let result = augment_message_with_sprint_context(Some("child"), "task body").unwrap();
+        assert!(result.contains("## Prior sprint outputs"), "got: {result}");
+        assert!(result.contains("### parent"), "got: {result}");
+        assert!(result.contains("parent did X and Y"), "got: {result}");
+        assert!(result.contains("## Your task"), "got: {result}");
+        assert!(result.contains("task body"), "got: {result}");
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
+                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn augment_message_handles_mixed_recorded_and_missing_parents() {
+        // Realistic case: child depends on two parents; one has recorded
+        // output, the other doesn't. Child should get context for the
+        // recorded one and the stderr should flag the missing one.
+        let tmp = TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+        unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()); }
+        let sprints_dir = tmp.path().join("sprints");
+        fs::create_dir_all(&sprints_dir).unwrap();
+        fs::write(
+            sprints_dir.join("parent-a.json"),
+            r#"{"id":"parent-a","mission_id":"m","description":"d","status":"done","depends_on":[],"created_ts":0}"#,
+        ).unwrap();
+        fs::write(
+            sprints_dir.join("parent-b.json"),
+            r#"{"id":"parent-b","mission_id":"m","description":"d","status":"planned","depends_on":[],"created_ts":0}"#,
+        ).unwrap();
+        fs::write(
+            sprints_dir.join("child.json"),
+            r#"{"id":"child","mission_id":"m","description":"d","status":"planned","depends_on":["parent-a","parent-b"],"created_ts":0}"#,
+        ).unwrap();
+        // Only parent-a has a recorded output.
+        fs::write(sprints_dir.join("parent-a-output.txt"), "parent-a finished X").unwrap();
+
+        let result = augment_message_with_sprint_context(Some("child"), "child task").unwrap();
+        assert!(result.contains("### parent-a"), "got: {result}");
+        assert!(result.contains("parent-a finished X"), "got: {result}");
+        // parent-b shouldn't show up in the context block — it has no
+        // recorded output. The stderr line (not asserted here) flags it.
+        assert!(!result.contains("### parent-b"), "got: {result}");
+        assert!(result.contains("## Your task"), "got: {result}");
+        assert!(result.contains("child task"), "got: {result}");
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
+                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn augment_message_falls_back_to_bare_when_no_parent_outputs_recorded() {
+        let tmp = TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+        unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()); }
+        let sprints_dir = tmp.path().join("sprints");
+        fs::create_dir_all(&sprints_dir).unwrap();
+        fs::write(
+            sprints_dir.join("parent.json"),
+            r#"{"id":"parent","mission_id":"m","description":"d","status":"planned","depends_on":[],"created_ts":0}"#,
+        ).unwrap();
+        fs::write(
+            sprints_dir.join("child.json"),
+            r#"{"id":"child","mission_id":"m","description":"d","status":"planned","depends_on":["parent"],"created_ts":0}"#,
+        ).unwrap();
+        // No parent-output.txt — dispatch proceeds with bare message.
+
+        let result = augment_message_with_sprint_context(Some("child"), "task body").unwrap();
+        assert_eq!(result, "task body");
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
+                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn persist_sprint_output_writes_text_to_canonical_path() {
+        let tmp = TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+        unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()); }
+
+        let path = persist_sprint_output(Some("my-sprint"), "agent reply text").unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "agent reply text");
+        assert!(path.ends_with("sprints/my-sprint-output.txt"), "got: {}", path.display());
+
+        // No-op for None sprint_id.
+        assert!(persist_sprint_output(None, "ignored").is_none());
+        // No-op for empty reply.
+        assert!(persist_sprint_output(Some("my-sprint"), "").is_none());
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
+                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+            }
+        }
     }
 
     #[test]

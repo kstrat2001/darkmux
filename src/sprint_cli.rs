@@ -795,6 +795,9 @@ pub(crate) fn sprint_review_at(
         watch_paths: Vec::new(),
         // Sprint review reads operator-supplied diffs; no scope override.
         workdir: None,
+        // Sprint review is a code-reviewer dispatch on the sprint's diff,
+        // not on the sprint's own work. No cross-sprint context needed.
+        sprint_id: None,
     };
 
     // Emit dispatch flow record.
