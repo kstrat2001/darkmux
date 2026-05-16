@@ -433,6 +433,12 @@ fn walk_one_level(dir: &Path, out: &mut Vec<WatchedFile>, cap: usize) {
 ///
 /// Plain text, not JSON — the agent's reply IS prose. Storing it raw
 /// keeps the inject-back-into-message format friction-free.
+///
+/// **Layout coupling**: this function and `crew::lifecycle::sprint_path`
+/// both compute `<crew_root>/sprints/...`. If #148's per-mission layout
+/// migration lands later, both sites must change in lockstep. The two
+/// functions are intentionally separate (manifest path vs. output path)
+/// but share a directory contract — keep them in sync.
 fn sprint_output_path(sprint_id: &str) -> PathBuf {
     crew_root().join("sprints").join(format!("{sprint_id}-output.txt"))
 }
@@ -875,15 +881,31 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     //    fail the dispatch. The reply text comes from openclaw's JSON
     //    envelope on stdout; we extract `payloads[0].text` if present
     //    and fall back to the full stdout otherwise.
-    if let Some(sprint_id) = opts.sprint_id.as_deref() {
-        let reply_text = extract_payload_text(&stdout_text)
-            .unwrap_or_else(|| stdout_text.clone());
-        if let Some(path) = persist_sprint_output(Some(sprint_id), &reply_text) {
-            eprintln!(
-                "darkmux crew dispatch: sprint `{sprint_id}` output persisted to {}",
-                path.display()
-            );
+    //
+    //    **Gated on dispatch success** (QA review on #157): a failed
+    //    dispatch (timeout, agent error, partial truncation) must NOT
+    //    clobber a previously-clean output. Operators re-running a
+    //    sprint that already had a recorded parent output should not
+    //    have downstream sprints silently start reading garbage.
+    //    Stderr already tells them what failed; they can decide whether
+    //    to hand-edit the output file or accept the prior recording.
+    if output.status.success() {
+        if let Some(sprint_id) = opts.sprint_id.as_deref() {
+            let reply_text = extract_payload_text(&stdout_text)
+                .unwrap_or_else(|| stdout_text.clone());
+            if let Some(path) = persist_sprint_output(Some(sprint_id), &reply_text) {
+                eprintln!(
+                    "darkmux crew dispatch: sprint `{sprint_id}` output persisted to {}",
+                    path.display()
+                );
+            }
         }
+    } else if opts.sprint_id.is_some() {
+        eprintln!(
+            "darkmux crew dispatch: dispatch failed (exit {}); NOT persisting sprint output. \
+             Any prior recorded output remains intact.",
+            output.status.code().unwrap_or(-1)
+        );
     }
 
     Ok(DispatchResult {
@@ -899,8 +921,15 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
 /// Returns `None` if the stdout isn't JSON or the field is missing.
 /// Used for sprint-output persistence (#146 Stage 1) so the recorded
 /// file contains the agent's prose, not openclaw's outer envelope.
+///
+/// Trims leading/trailing whitespace before parsing — openclaw sometimes
+/// emits a trailing newline that would otherwise fail `serde_json::from_str`.
+///
+/// **First payload only** — if openclaw ever emits multi-payload replies
+/// (multiple `text` segments for a single turn), this returns the first.
+/// A future expansion that concats segments would be a Stage 2 concern.
 fn extract_payload_text(stdout: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(stdout).ok()?;
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
     value
         .get("payloads")?
         .as_array()?
@@ -1360,6 +1389,49 @@ mod tests {
         assert!(result.contains("parent did X and Y"), "got: {result}");
         assert!(result.contains("## Your task"), "got: {result}");
         assert!(result.contains("task body"), "got: {result}");
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
+                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn augment_message_handles_mixed_recorded_and_missing_parents() {
+        // Realistic case: child depends on two parents; one has recorded
+        // output, the other doesn't. Child should get context for the
+        // recorded one and the stderr should flag the missing one.
+        let tmp = TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+        unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()); }
+        let sprints_dir = tmp.path().join("sprints");
+        fs::create_dir_all(&sprints_dir).unwrap();
+        fs::write(
+            sprints_dir.join("parent-a.json"),
+            r#"{"id":"parent-a","mission_id":"m","description":"d","status":"done","depends_on":[],"created_ts":0}"#,
+        ).unwrap();
+        fs::write(
+            sprints_dir.join("parent-b.json"),
+            r#"{"id":"parent-b","mission_id":"m","description":"d","status":"planned","depends_on":[],"created_ts":0}"#,
+        ).unwrap();
+        fs::write(
+            sprints_dir.join("child.json"),
+            r#"{"id":"child","mission_id":"m","description":"d","status":"planned","depends_on":["parent-a","parent-b"],"created_ts":0}"#,
+        ).unwrap();
+        // Only parent-a has a recorded output.
+        fs::write(sprints_dir.join("parent-a-output.txt"), "parent-a finished X").unwrap();
+
+        let result = augment_message_with_sprint_context(Some("child"), "child task").unwrap();
+        assert!(result.contains("### parent-a"), "got: {result}");
+        assert!(result.contains("parent-a finished X"), "got: {result}");
+        // parent-b shouldn't show up in the context block — it has no
+        // recorded output. The stderr line (not asserted here) flags it.
+        assert!(!result.contains("### parent-b"), "got: {result}");
+        assert!(result.contains("## Your task"), "got: {result}");
+        assert!(result.contains("child task"), "got: {result}");
 
         unsafe {
             match prev {
