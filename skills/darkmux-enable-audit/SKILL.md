@@ -123,7 +123,7 @@ Then re-run doctor:
 darkmux doctor 2>&1 | grep "audit integrity"
 ```
 
-Should now show `✓ audit integrity   1 file(s), 1 record(s), all chains verified`.
+Should now show `✓ audit integrity   1 file(s), 1 record(s), all chains pass the integrity walk at this check`.
 
 ## Step 7 — Optional: wire integrity-check into cron / CI
 
