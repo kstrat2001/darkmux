@@ -95,7 +95,7 @@ darkmux init</code></pre>
 <section>
   <div class="wrap">
     <h2>Verify your setup</h2>
-    <p><code>darkmux doctor</code> runs pre-flight checks: profile registry, <code>lms</code> binary, models loaded, runtime command, RAM headroom, power state, agent role scaffolds, daemon reachability, and a battery of empirical rules from the <code>eureka</code> set.</p>
+    <p><code>darkmux doctor</code> runs pre-flight checks across the substrate: profile registry, <code>lms</code> binary, models loaded, runtime command, RAM headroom, power state, agent role scaffolds, crew role prompt coverage, daemon reachability, flow-sink health, audit integrity, machine_id resolution, orchestrator declaration, recommendation drift, per-role model-pin drift, plus a battery of empirical rules from the <code>eureka</code> set.</p>
     <pre><code>darkmux doctor</code></pre>
     <p>Each check returns Pass, Warn, or Fail. Fail-level lines include actionable hints; the exit code is 0 on all-pass-or-warn, 1 if anything Fails.</p>
 
@@ -136,6 +136,13 @@ ${EDITOR:-vim} ~/.darkmux/profiles.json</code></pre>
     <h3>Verify the edits</h3>
     <pre><code>darkmux profiles                  <span class="comment"># the profile should now list your model</span>
 darkmux doctor                    <span class="comment"># confirm "profile match" is green or close</span></code></pre>
+
+    <h3>The opinionated path: <code>swap recommended</code></h3>
+    <p>If you'd rather not author profile JSON by hand on a fresh install, darkmux ships a curated per-hardware-tier recommendation registry (per <a href="https://github.com/kstrat2001/darkmux/issues/159">#159</a>) with the bake-off-validated models for your machine class:</p>
+    <pre><code>darkmux swap recommended --dry-run    <span class="comment"># resolves your tier → validated profile → pre-flight checks</span>
+darkmux model pull-recommended        <span class="comment"># downloads any missing models via `lms get`</span>
+darkmux swap recommended              <span class="comment"># load them for real</span></code></pre>
+    <p>On Apple Silicon 96+ GB (<code>m-series-128</code>), the validated recommendation is the bake-off-hired D model (35B-A3B) with a 4B compactor. Other tiers carry a <code>pending-bake-off</code> status — the verb errors loudly with the rationale, surfacing the gap rather than silently picking. Doctor's <code>recommendation-drift</code> check warns when your loaded models don't match the registry's pick.</p>
   </div>
 </section>
 
@@ -164,6 +171,7 @@ darkmux lab inspect &lt;run-id&gt;      <span class="comment"># quick look at wh
 <section>
   <div class="wrap">
     <h2>What's next</h2>
+    <p><strong>If you have a Claude Code session running</strong>, the natural next step is to run <code>/darkmux-bootstrap</code> in it — a guided skill (installed by <code>darkmux init</code>) that walks through everything above interactively: detecting your hardware tier, downloading recommended models, registering profiles, declaring the orchestrator for flow-record provenance, and validating end state via <code>darkmux doctor</code>. The skill reads + proposes; you run the commands.</p>
     <ul>
       <li>If you want to see darkmux operate visually as you work: <a href="observability.html">Observability — daemon + viewer</a>.</li>
       <li>If you want to benchmark / characterize your hardware against a workload: <a href="lab.html">The lab harness</a>.</li>
