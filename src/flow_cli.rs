@@ -163,6 +163,8 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             model: None,
             reasoning: None,
             mission_id: None,
+            machine_id: None,
+            orchestrator: None,
         },
         FlowCmd::Catch { text, sprint_id, session_id, source } => FlowRecord {
             ts,
@@ -178,6 +180,8 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             model: None,
             reasoning: None,
             mission_id: None,
+            machine_id: None,
+            orchestrator: None,
         },
         FlowCmd::Record {
             level,
@@ -205,6 +209,8 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             model: None,
             reasoning,
             mission_id,
+            machine_id: None,
+            orchestrator: None,
         },
         FlowCmd::TierDecision {
             decision,
@@ -235,6 +241,8 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             model: None,
             reasoning: Some(format!("[{decision}] {reasoning}")),
             mission_id,
+            machine_id: None,
+            orchestrator: None,
         },
         // Status is a read verb — intercepted by `run` before build_record.
         // Reaching here would mean run() was bypassed; assert loudly.

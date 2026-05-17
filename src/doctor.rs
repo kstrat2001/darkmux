@@ -91,9 +91,69 @@ pub fn run() -> DoctorReport {
         check_agent_role_definitions(),
         check_crew_role_prompt_coverage(),
         check_flow_sink_health(),
+        check_machine_id_resolution(),
+        check_orchestrator_declared(),
     ];
     checks.extend(eureka_checks());
     DoctorReport { checks }
+}
+
+/// Surface the machine_id that flow records will be tagged with. Always
+/// passes — this is informational, since the operator can leave it at
+/// the hostname default. The check names the source (env vs hostname
+/// vs unknown) so operators can see whether their `DARKMUX_MACHINE_ID`
+/// override is taking effect. (#167)
+fn check_machine_id_resolution() -> Check {
+    let env_set = std::env::var("DARKMUX_MACHINE_ID")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let resolved = crate::flow::resolve_machine_id();
+    match (env_set, resolved) {
+        (Some(_), Some(id)) => Check {
+            name: "machine_id".into(),
+            status: Status::Pass,
+            message: format!("`{id}` (from DARKMUX_MACHINE_ID env)"),
+            hint: None,
+        },
+        (None, Some(id)) => Check {
+            name: "machine_id".into(),
+            status: Status::Pass,
+            message: format!("`{id}` (from hostname)"),
+            hint: Some(
+                "Set DARKMUX_MACHINE_ID for a logical fleet name (e.g. `studio`, `mini-1`) — operator-named identifiers read better in the topology view than DNS-style hostnames.".into(),
+            ),
+        },
+        (_, None) => Check {
+            name: "machine_id".into(),
+            status: Status::Warn,
+            message: "could not resolve a machine_id — flow records will lack machine provenance".into(),
+            hint: Some(
+                "Set DARKMUX_MACHINE_ID to a logical fleet name (e.g. `studio`, `mini-1`), or install `hostname(1)` on PATH.".into(),
+            ),
+        },
+    }
+}
+
+/// Surface whether the operator has declared an orchestrator for flow
+/// records. Warns when absent — the field is operator-explicit by design
+/// (#167 + #49) but the operator needs to know it exists.
+fn check_orchestrator_declared() -> Check {
+    match crate::flow::resolve_orchestrator() {
+        Some(name) => Check {
+            name: "orchestrator".into(),
+            status: Status::Pass,
+            message: format!("`{name}` (from DARKMUX_ORCHESTRATOR env)"),
+            hint: None,
+        },
+        None => Check {
+            name: "orchestrator".into(),
+            status: Status::Warn,
+            message: "not declared — flow records won't carry orchestrator provenance".into(),
+            hint: Some(
+                "Export DARKMUX_ORCHESTRATOR=<frontier-model-name> in the shell driving darkmux (e.g. `claude-opus-4-7`, `cursor-anthropic`). Operator-explicit by design (#49 cultivation discipline).".into(),
+            ),
+        },
+    }
 }
 
 /// Roll up `flow::collect_status()` into a single doctor check. Pass when
@@ -1664,13 +1724,13 @@ mod tests {
     #[test]
     fn run_returns_static_plus_eureka_checks() {
         let r = run();
-        // 15 baseline checks (incl. runtime version + load projection +
+        // 17 baseline checks (incl. runtime version + load projection +
         // daemon reachable + darkmux-version-vs-latest-release [#13] +
-        // crew-role-prompt-coverage [#141] + flow-sink-health [#170])
-        // + one per active eureka rule. Every check should appear
-        // regardless of environment — even if the underlying probe
-        // couldn't read state.
-        let expected = 15 + crate::eureka::all_rules().len();
+        // crew-role-prompt-coverage [#141] + flow-sink-health [#170] +
+        // machine_id + orchestrator [#167]) + one per active eureka rule.
+        // Every check should appear regardless of environment — even if
+        // the underlying probe couldn't read state.
+        let expected = 17 + crate::eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

@@ -144,6 +144,8 @@ fn emit_sprint_transition_record(sprint_id: &str, mission_id: &str, action: &str
         // prefer this field. The redundancy retires once readers
         // migrate (follow-up).
         mission_id: Some(mission_id.to_string()),
+        machine_id: None,
+        orchestrator: None,
     });
 }
 
@@ -177,6 +179,8 @@ fn emit_mission_transition_record_with_reasoning(
         model: None,
         reasoning: reasoning.map(String::from),
         mission_id: Some(mission_id.to_string()),
+        machine_id: None,
+        orchestrator: None,
     });
 }
 
@@ -212,6 +216,8 @@ fn emit_sprint_added_record_with_reasoning(
         model: None,
         reasoning: reasoning.map(String::from),
         mission_id: Some(mission_id.to_string()),
+        machine_id: None,
+        orchestrator: None,
     });
 }
 
