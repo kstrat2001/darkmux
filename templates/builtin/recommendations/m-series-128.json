@@ -1,0 +1,29 @@
+{
+  "tier": "m-series-128",
+  "status": "validated",
+  "rationale": "Bake-off 2026-05-13 (kstrat2001/darkmux#45 closure). D (qwen3.6-35b-a3b-turboquant-mlx) won 4/4 paired rounds for routine coding. A (qwen3.5-122b-a10b) reserved as heavy-reasoning defensive. B (qwen3-coder-next-mlx) reserved for single-shot prose quality. The 35B-A3B sweet spot pairs ~3GB active VRAM with the 4B compactor's working memory, giving headroom for long-agentic dispatches on 128GB systems.",
+  "bake_off_url": "https://github.com/kstrat2001/darkmux/issues/45",
+  "profile_name": "balanced",
+  "validated_against": [
+    "routine-coding",
+    "json-manifest",
+    "schema-design",
+    "prose-roles"
+  ],
+  "not_validated_against": [
+    "long-context-refactor",
+    "creative-prose",
+    "domain-specialty-research",
+    "non-SWE-engagement-roles"
+  ],
+  "primary": {
+    "model_id": "qwen3.6-35b-a3b-turboquant-mlx",
+    "role": "primary",
+    "n_ctx": 101000
+  },
+  "compactor": {
+    "model_id": "qwen3-4b-instruct-2507",
+    "role": "compactor",
+    "n_ctx": 68000
+  }
+}

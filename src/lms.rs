@@ -187,6 +187,28 @@ fn meta_from_json(v: &serde_json::Value) -> Option<ModelMeta> {
     })
 }
 
+/// Download a model from LMStudio's catalog via `lms get <model-id>`.
+/// Synchronous — the LMStudio CLI streams progress to stdout/stderr and
+/// returns once the model is on disk (or errors). darkmux passes through
+/// the streams unchanged so the operator sees standard `lms get`
+/// progress reporting in their terminal.
+///
+/// Used by `darkmux model pull-recommended` (#159) to batch-download
+/// the recommendation registry's prescribed models for the operator's
+/// hardware tier.
+pub fn get(model_id: &str) -> Result<()> {
+    let status = Command::new(lms_bin())
+        .args(["get", model_id])
+        .status()
+        .with_context(|| format!("running `lms get {model_id}`"))?;
+    if !status.success() {
+        bail!(
+            "`lms get {model_id}` exited with status {status}. See LMStudio output above for details."
+        );
+    }
+    Ok(())
+}
+
 pub fn unload(identifier: &str) -> Result<()> {
     let out = Command::new(lms_bin())
         .args(["unload", identifier])

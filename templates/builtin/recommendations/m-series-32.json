@@ -1,0 +1,13 @@
+{
+  "tier": "m-series-32",
+  "status": "pending-bake-off",
+  "rationale": "No bake-off has been run on a 32GB m-series machine. The 32GB tier has different model-size constraints than the 128GB tier (the 35B-A3B class may be too large; a 14B-dense or 8B-MoE pick is more likely the right answer). Community contributions welcome via #117. Until a recommendation lands, `darkmux swap recommended` errors with this explanation; operators select a profile manually.",
+  "bake_off_url": null,
+  "profile_name": null,
+  "validated_against": [],
+  "not_validated_against": [
+    "everything — no validated workload data exists for this tier"
+  ],
+  "primary": null,
+  "compactor": null
+}

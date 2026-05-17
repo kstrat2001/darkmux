@@ -2,7 +2,7 @@
 //!
 //! v0.2 in Rust. Ports the v0.1 TS prototype + the v0.2 lab foundation.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 mod agent_roles;
@@ -19,6 +19,7 @@ mod notebook;
 mod optimize;
 mod profiles;
 mod providers;
+mod recommendations;
 mod runtime;
 mod serve;
 mod skills;
@@ -519,6 +520,17 @@ enum ModelCmd {
         #[arg(long, short = 'n')]
         dry_run: bool,
     },
+    /// Download the bake-off-validated models for the active hardware
+    /// tier (per `templates/builtin/recommendations/<tier>.json`).
+    /// Composes with `darkmux swap recommended` — the swap verb errors
+    /// loudly when the prescribed models aren't on disk; this verb is
+    /// the fix-it.
+    ///
+    /// Skips models that are already downloaded. Errors with the
+    /// recommendation's rationale when the active tier has no
+    /// validated recommendation (pending-bake-off or no-recommendation
+    /// status). (#159)
+    PullRecommended,
 }
 
 #[derive(Subcommand)]
@@ -1232,6 +1244,7 @@ fn cmd_model(sub: ModelCmd) -> Result<i32> {
     match sub {
         ModelCmd::Status => cmd_model_status(),
         ModelCmd::Eject { dry_run } => cmd_model_eject(dry_run),
+        ModelCmd::PullRecommended => cmd_model_pull_recommended(),
     }
 }
 
@@ -1307,6 +1320,114 @@ fn cmd_model_eject(dry_run: bool) -> Result<i32> {
     }
     println!("{summary}");
     Ok(0)
+}
+
+/// `darkmux model pull-recommended` — batch-download the bake-off-validated
+/// models for the active hardware tier. Skips already-downloaded models;
+/// reports per-model progress; errors with the tier's rationale when the
+/// recommendation isn't validated. (#159)
+fn cmd_model_pull_recommended() -> Result<i32> {
+    let rec = recommendations::for_active_hardware()?;
+    if rec.status != recommendations::RecommendationStatus::Validated {
+        eprintln!(
+            "darkmux: no validated recommendation for tier `{}` (status: {:?}).\n\nRationale:\n  {}",
+            rec.tier, rec.status, rec.rationale
+        );
+        return Ok(2);
+    }
+    let required = rec.required_model_ids();
+    if required.is_empty() {
+        eprintln!(
+            "darkmux: recommendation for tier `{}` is validated but lists no required models — registry bug.",
+            rec.tier
+        );
+        return Ok(2);
+    }
+
+    let available = lms::list_available()?;
+    let downloaded_keys: std::collections::HashSet<&str> =
+        available.iter().map(|m| m.model_key.as_str()).collect();
+
+    let mut downloaded_now = 0u32;
+    let mut already_present = 0u32;
+    for model_id in &required {
+        if downloaded_keys.contains(model_id.as_str()) {
+            println!("✓ {model_id} (already downloaded)");
+            already_present += 1;
+            continue;
+        }
+        println!("⤓ {model_id} (downloading via `lms get`)");
+        lms::get(model_id)
+            .with_context(|| format!("downloading recommended model `{model_id}`"))?;
+        downloaded_now += 1;
+    }
+
+    println!(
+        "darkmux: tier `{}` — {downloaded_now} downloaded, {already_present} already present, {} total required",
+        rec.tier,
+        required.len()
+    );
+    Ok(0)
+}
+
+/// `darkmux swap recommended` — resolve the active hardware tier to its
+/// bake-off-validated profile and swap to it. Errors loudly when the
+/// recommendation status isn't `Validated`, or when the prescribed
+/// models aren't downloaded (with a one-command-fix pointer to
+/// `darkmux model pull-recommended`). (#159)
+fn cmd_swap_recommended(config: Option<&str>, dry_run: bool, quiet: bool) -> Result<i32> {
+    let rec = recommendations::for_active_hardware()?;
+    if !quiet {
+        println!(
+            "darkmux: matching tier `{}` → status `{:?}`",
+            rec.tier, rec.status
+        );
+    }
+
+    if rec.status != recommendations::RecommendationStatus::Validated {
+        eprintln!(
+            "darkmux: no validated recommendation for tier `{}`.\n\nRationale:\n  {}\n\nOptions:\n  - Pick a profile manually: `darkmux profiles` then `darkmux swap <name>`\n  - Contribute a bake-off for this tier — see kstrat2001/darkmux#117",
+            rec.tier, rec.rationale
+        );
+        return Ok(2);
+    }
+
+    let profile_name = rec.profile_name.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "validated recommendation for tier `{}` lacks `profile_name` — registry bug",
+            rec.tier
+        )
+    })?;
+
+    // Check the prescribed models are actually downloaded before kicking
+    // off the swap. The swap itself would also fail if models are missing,
+    // but a pre-flight check gives the operator a cleaner error + fix-it
+    // pointer than discovering it mid-swap.
+    let required = rec.required_model_ids();
+    let available = lms::list_available()?;
+    let downloaded_keys: std::collections::HashSet<&str> =
+        available.iter().map(|m| m.model_key.as_str()).collect();
+    let missing: Vec<&String> = required
+        .iter()
+        .filter(|id| !downloaded_keys.contains(id.as_str()))
+        .collect();
+    if !missing.is_empty() {
+        eprintln!("darkmux: required model(s) not downloaded for recommended swap:");
+        for id in &missing {
+            eprintln!("  - {id}");
+        }
+        eprintln!("\nFix: `darkmux model pull-recommended`, then re-try.");
+        return Ok(2);
+    }
+
+    if !quiet {
+        println!(
+            "darkmux: tier `{}` → profile `{profile_name}` (bake-off: {})",
+            rec.tier,
+            rec.bake_off_url.as_deref().unwrap_or("no url"),
+        );
+    }
+    cmd_swap(profile_name, config, dry_run, quiet)
 }
 
 fn cmd_profile(sub: ProfileCmd) -> Result<i32> {
@@ -1459,6 +1580,13 @@ fn cmd_init(
 }
 
 fn cmd_swap(profile_name: &str, config: Option<&str>, dry_run: bool, quiet: bool) -> Result<i32> {
+    // `swap recommended` is reserved — short-circuit to the recommendation-
+    // registry-driven dispatcher rather than looking up a profile literally
+    // named "recommended". Per #159: the prescriptive verb resolves the
+    // active hardware tier to the bake-off-validated profile.
+    if profile_name == "recommended" {
+        return cmd_swap_recommended(config, dry_run, quiet);
+    }
     let loaded = profiles::load_registry(config)?;
     let profile = profiles::get_profile(&loaded.registry, profile_name)?;
     if !quiet {

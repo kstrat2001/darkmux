@@ -94,6 +94,8 @@ pub fn run() -> DoctorReport {
         check_machine_id_resolution(),
         check_orchestrator_declared(),
         check_audit_integrity(),
+        check_recommendation_drift(),
+        check_recommended_profile_name_not_shadowed(),
     ];
     checks.extend(eureka_checks());
     DoctorReport { checks }
@@ -165,6 +167,135 @@ fn check_audit_integrity() -> Check {
                 "Audit log has been edited or a write was interleaved. Run `darkmux flow integrity-check` for the full per-file breakdown. If tampering is suspected, the chain break locates the affected line; older records before that line are still trustworthy."
                     .into(),
             ),
+        }
+    }
+}
+
+/// Warn when the operator's profile registry contains a profile literally
+/// named `recommended` — that name is reserved by `darkmux swap
+/// recommended`, so the operator-defined profile is shadowed and
+/// unreachable via the `swap` verb. (#159)
+fn check_recommended_profile_name_not_shadowed() -> Check {
+    let loaded = match crate::profiles::load_registry(None) {
+        Ok(l) => l,
+        Err(_) => {
+            // Registry load failures are surfaced by check_profile_registry;
+            // this check passes here to avoid duplicate noise.
+            return Check {
+                name: "recommended profile name not shadowed".into(),
+                status: Status::Pass,
+                message: "registry not loaded; check skipped".into(),
+                hint: None,
+            };
+        }
+    };
+    if crate::recommendations::operator_has_shadowed_recommended_profile(&loaded.registry) {
+        Check {
+            name: "recommended profile name not shadowed".into(),
+            status: Status::Warn,
+            message: "`recommended` is a reserved profile name; the literal profile in your registry is unreachable via `darkmux swap`".into(),
+            hint: Some(
+                "Rename the `recommended` profile in ~/.darkmux/profiles.json to something else (e.g. `my-recommended`). The reserved name routes through the bake-off recommendation registry — `darkmux swap recommended` resolves to the validated profile for your hardware tier."
+                    .into(),
+            ),
+        }
+    } else {
+        Check {
+            name: "recommended profile name not shadowed".into(),
+            status: Status::Pass,
+            message: "no shadowing — `recommended` is free to route to the recommendation registry".into(),
+            hint: None,
+        }
+    }
+}
+
+/// Warn (not fail) when the active LMStudio loads don't match the
+/// recommendation registry's pick for this hardware tier. The operator
+/// may have swapped intentionally — doctor surfaces the drift; doesn't
+/// block dispatches. (#159)
+fn check_recommendation_drift() -> Check {
+    let rec = match crate::recommendations::for_active_hardware() {
+        Ok(r) => r,
+        Err(e) => {
+            return Check {
+                name: "recommendation drift".into(),
+                status: Status::Warn,
+                message: format!("could not resolve recommendation: {e:#}"),
+                hint: None,
+            };
+        }
+    };
+
+    // Only `Validated` tiers have a recommendation to drift from. For
+    // pending-bake-off / no-recommendation tiers, the check warns
+    // because the operator's tier has no opinion they can align with —
+    // a passive "drift check inactive" would read as all-clear in
+    // doctor's red/yellow/green summary glance, hiding the gap.
+    if rec.status != crate::recommendations::RecommendationStatus::Validated {
+        return Check {
+            name: "recommendation drift".into(),
+            status: Status::Warn,
+            message: format!(
+                "tier `{}` has no validated recommendation (status: {:?}) — pick a profile manually",
+                rec.tier, rec.status
+            ),
+            hint: Some(rec.rationale.clone()),
+        };
+    }
+
+    let required = rec.required_model_ids();
+    let loaded = match crate::lms::list_loaded() {
+        Ok(l) => l,
+        Err(_) => {
+            return Check {
+                name: "recommendation drift".into(),
+                status: Status::Warn,
+                message: "could not query LMStudio for loaded models — `lms` unreachable".into(),
+                hint: Some(
+                    "Start LMStudio and ensure `lms ps` returns successfully. The drift check needs to know what's loaded to compare against the recommendation."
+                        .into(),
+                ),
+            };
+        }
+    };
+
+    // Match against the LMStudio `modelKey` regardless of the namespaced
+    // identifier (which may carry `darkmux:` prefix). `LoadedModel.model`
+    // holds the model_key in current lms ps --json output.
+    let loaded_keys: std::collections::HashSet<&str> =
+        loaded.iter().map(|m| m.model.as_str()).collect();
+    let missing: Vec<&String> = required
+        .iter()
+        .filter(|id| !loaded_keys.contains(id.as_str()))
+        .collect();
+
+    if missing.is_empty() {
+        Check {
+            name: "recommendation drift".into(),
+            status: Status::Pass,
+            message: format!(
+                "tier `{}` — all {} recommended model(s) loaded",
+                rec.tier,
+                required.len()
+            ),
+            hint: None,
+        }
+    } else {
+        let missing_list: Vec<String> = missing.iter().map(|s| s.to_string()).collect();
+        Check {
+            name: "recommendation drift".into(),
+            status: Status::Warn,
+            message: format!(
+                "tier `{}` — {} of {} recommended model(s) not loaded: {}",
+                rec.tier,
+                missing.len(),
+                required.len(),
+                missing_list.join(", ")
+            ),
+            hint: Some(format!(
+                "Run `darkmux swap recommended` to align with the bake-off pick ({}). Ignore if you swapped intentionally.",
+                rec.bake_off_url.as_deref().unwrap_or("see registry for rationale")
+            )),
         }
     }
 }
@@ -1795,14 +1926,15 @@ mod tests {
     #[test]
     fn run_returns_static_plus_eureka_checks() {
         let r = run();
-        // 18 baseline checks (incl. runtime version + load projection +
+        // 20 baseline checks (incl. runtime version + load projection +
         // daemon reachable + darkmux-version-vs-latest-release [#13] +
         // crew-role-prompt-coverage [#141] + flow-sink-health [#170] +
-        // machine_id + orchestrator [#167] + audit-integrity [#163])
+        // machine_id + orchestrator [#167] + audit-integrity [#163] +
+        // recommendation-drift + recommended-profile-not-shadowed [#159])
         // + one per active eureka rule. Every check should appear
         // regardless of environment — even if the underlying probe
         // couldn't read state.
-        let expected = 18 + crate::eureka::all_rules().len();
+        let expected = 20 + crate::eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
