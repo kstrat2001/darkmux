@@ -37,9 +37,9 @@
     <h2>The big picture</h2>
     <p>Three pieces work together:</p>
     <ul>
-      <li><strong>Flow records on disk</strong> — every dispatch, every sprint transition, every QA verdict appends a JSON line to <code>~/.darkmux/flows/&lt;date&gt;.jsonl</code>. The CLI writes these; no daemon required.</li>
-      <li><strong><code>darkmux serve</code> daemon</strong> — a small HTTP server (default <code>127.0.0.1:8765</code>) that reads those JSONL files and exposes them via REST endpoints + SSE tail.</li>
-      <li><strong><code>/flow</code> viewer</strong> — a static HTML page that fetches from the daemon and renders the timeline with filters, a stepper, and a wall-clock graphic for dispatch duration.</li>
+      <li><strong>Flow records on disk</strong> — every dispatch, every sprint transition, every QA verdict appends a JSON line to <code>~/.darkmux/flows/&lt;date&gt;.jsonl</code> via the <code>LocalFileSink</code>. Each record carries provenance fields (<code>machine_id</code>, <code>orchestrator</code>) auto-populated at write time from <code>DARKMUX_MACHINE_ID</code> / <code>DARKMUX_ORCHESTRATOR</code> env vars. The CLI writes these; no daemon required. Two opt-in sinks compose alongside via <code>TeeSink</code>: <code>AuditFileSink</code> (BLAKE3 hash-chained tamper-evident log, verifiable via <code>darkmux flow integrity-check</code>; enable via <code>DARKMUX_AUDIT_DIR</code>) and <code>RedisSink</code> (cross-machine coordination stream; enable via <code>DARKMUX_REDIS_URL</code>).</li>
+      <li><strong><code>darkmux serve</code> daemon</strong> — a small HTTP server (default <code>127.0.0.1:8765</code>) that reads those JSONL files and exposes them via REST endpoints + SSE tail, plus a <code>/flow-status</code> endpoint that introspects the sink composition + Redis health + schema drift.</li>
+      <li><strong>Web viewers</strong> — three pages share a chrome (<code>/flow</code> = live timeline + filters, <code>/lab</code> = instruments-replay graph for <code>lab run --instrument</code> captures, <code>/topology</code> = upcoming fleet diagram per <a href="https://github.com/kstrat2001/darkmux/issues/169">#169</a>). All static — JS fetches from your local daemon, nothing uploaded.</li>
     </ul>
     <p>The daemon and viewer are decoupled: records keep landing on disk whether or not the daemon is running. The daemon being up is only required for <em>live viewing</em>.</p>
   </div>
@@ -59,7 +59,7 @@
 
     <h3>Verify it's up</h3>
     <pre><code>curl -s http://127.0.0.1:8765/health
-<span class="comment"># {"darkmux_version":"0.4.0","flow_schema_version":"1.2.0"}</span></code></pre>
+<span class="comment"># {"darkmux_version":"0.4.0","flow_schema_version":"1.5.0"}</span></code></pre>
     <p>Or just run <code>darkmux doctor</code> — the <code>daemon: reachable</code> check will report Pass.</p>
   </div>
 </section>
@@ -153,6 +153,10 @@ darkmux sprint complete &lt;your-sprint-id&gt;   <span class="comment"># cyan: s
       <tr>
         <td><code>GET /sprints</code></td>
         <td>All sprints from <code>~/.darkmux/crew/sprints/</code> (status, mission_id, depends_on, timestamps).</td>
+      </tr>
+      <tr>
+        <td><code>GET /flow-status</code></td>
+        <td>Diagnostic snapshot of the flow substrate (active sinks, Redis health, disk health, schema drift). Same JSON shape as <code>darkmux flow status --json</code>; consumed by the store-status pill in the shared shell.</td>
       </tr>
     </table>
   </div>

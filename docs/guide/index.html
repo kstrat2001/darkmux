@@ -36,7 +36,7 @@
     <h2>Before you start — about consistency</h2>
     <div class="callout warn">
       <strong>Results will vary based on your frontier configuration.</strong>
-      <p style="margin: 8px 0 0;">The frontier models you use as the orchestrator (Claude Code, Cursor, OpenClaw, etc.) need proper guidance to make the most out of darkmux. This guide is a starting reference, not doctrine to enforce. Contradictory statements between this guide, your project's <code>CLAUDE.md</code>, and other frontier configs will cause more harm than good. Configure to your own strategy and goals; treat what's below as inspiration, not commandments.</p>
+      <p style="margin: 8px 0 0;">The frontier model you use as the orchestrator (Claude Code is the proven path today; other frontiers tracked in <a href="https://github.com/kstrat2001/darkmux/issues/179">#179</a>) needs proper guidance to make the most out of darkmux. This guide is a starting reference, not doctrine to enforce. Contradictory statements between this guide, your project's <code>CLAUDE.md</code>, and other frontier configs will cause more harm than good. Configure to your own strategy and goals; treat what's below as inspiration, not commandments.</p>
     </div>
     <p>darkmux deliberately leaves the operator in control of how their environment is shaped. The same command (<code>darkmux crew dispatch</code>, say) can feel different from one machine to another because the <em>frontier</em> driving it reads different doctrine. That's by design — see the <a href="https://github.com/kstrat2001/darkmux/issues/112">operator-sovereignty thread</a> for the architectural reasoning. The trade-off: don't expect identical experiences across operators. Expect <em>consistent foundations</em> (the CLI, the records, the viewer) and operator-shaped behavior on top.</p>
   </div>
@@ -75,7 +75,7 @@
   <div class="wrap">
     <h2>How darkmux is meant to be used</h2>
     <h3>A complement to your frontier orchestrator — not a replacement.</h3>
-    <p>darkmux is an AI-first local-AI orchestrator: a CLI that manages local LLM stacks on your machine and dispatches admin-agent models internally for bounded structuring tasks (compaction, sprint estimation, mission proposal — see <a href="https://github.com/kstrat2001/darkmux/issues/115">#115</a>). The strategic reasoning loop lives in your <em>frontier orchestrator</em> — typically a frontier model (Claude, GPT, etc.) running in a session that has darkmux installed. The admin agent absorbs the routine bounded work; the orchestrator stays on strategy.</p>
+    <p>darkmux is an AI-first local-AI orchestrator: a CLI that manages local LLM stacks on your machine and dispatches admin-agent models internally for bounded structuring tasks (compaction, sprint estimation, mission proposal — see <a href="https://github.com/kstrat2001/darkmux/issues/115">#115</a>). The strategic reasoning loop lives in your <em>frontier orchestrator</em> — Claude Code today, with other frontiers (Gemini, Codex, Copilot) tracked in <a href="https://github.com/kstrat2001/darkmux/issues/179">#179</a>. The admin agent absorbs the routine bounded work; the orchestrator stays on strategy.</p>
     <p>The intended division of labor:</p>
     <ul>
       <li><strong>Frontier orchestrator</strong> — design decisions, complex reasoning, code review, multi-step debugging, narrative for what's being built.</li>
