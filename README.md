@@ -284,7 +284,7 @@ The case for darkmux: **once you accept that static configs leave performance on
 - ✅ Crew + Role + Mission + Sprint schema with SQLite-backed index; `mission propose` + `sprint estimate` admin-AI verbs
 - ✅ Per-role `agent.model` pinning (#160) with bake-off-derived defaults; doctor surfaces drift
 - ✅ Recommendation registry per hardware tier (#159) with `swap recommended` + `model pull-recommended`; doctor surfaces drift
-- ✅ Flow substrate: `LocalFileSink` (always) + `AuditFileSink` (hash-chained, tamper-evident; opt-in) + `RedisSink` (coordination; opt-in), composed via `TeeSink`
+- ✅ Flow substrate: `LocalFileSink` (always) + `AuditFileSink` (BLAKE3 hash chain, verifiable via `flow integrity-check`; opt-in) + `RedisSink` (coordination; opt-in), composed via `TeeSink`
 - ✅ `darkmux flow status` + `darkmux flow integrity-check` diagnostic verbs
 - ✅ Observability daemon (`darkmux serve`) + `/flow` + `/lab` web viewers
 - ✅ Doctor: 20+ pre-flight checks with auto-fix path (`--fix`) for known-safe drift
@@ -295,7 +295,7 @@ The case for darkmux: **once you accept that static configs leave performance on
 - 🚧 Fleet primitives (`darkmux fleet add/status/route`) and cross-machine coordination (Phase 5 of #162)
 - 🚧 Event-sourced mission state (Phase 8 of #162)
 - 🚧 Sibling bootstrap skills: `/darkmux-add-machine` (#176), `/darkmux-enable-audit` (#177), `/darkmux-enable-redis` (#178)
-- 🚧 Compliance tooling: `flow export`, `flow archive`, OS-level append-only flags for audit files
+- 🚧 Audit log management: `flow export`, `flow archive`, OS-level append-only flags for audit files
 - 🚧 Multi-frontier orchestrator support (Gemini / Codex / Copilot bootstrap paths; #179)
 
 **Aspirational (later):**
