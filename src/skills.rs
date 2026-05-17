@@ -27,6 +27,10 @@ const EMBEDDED_SKILLS: &[(&str, &str)] = &[
         include_str!("../skills/darkmux-bootstrap/SKILL.md"),
     ),
     (
+        "darkmux-enable-audit",
+        include_str!("../skills/darkmux-enable-audit/SKILL.md"),
+    ),
+    (
         "darkmux-status",
         include_str!("../skills/darkmux-status/SKILL.md"),
     ),
