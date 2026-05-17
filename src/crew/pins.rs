@@ -27,7 +27,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
-use std::sync::OnceLock;
+use std::sync::Mutex;
 
 const EMBEDDED_PINS_JSON: &str =
     include_str!("../../templates/builtin/crew/role-model-pins.json");
@@ -67,21 +67,49 @@ impl PinTable {
 
 }
 
-/// Resolve the active pin table. Caches the result process-wide via
-/// `OnceLock` since the table doesn't change without restart. If the
-/// user-dir file exists and parses, it WINS; otherwise the embedded
-/// default is used. Parse errors on the user file return the parse
-/// error (operator-visible) rather than silently falling through —
-/// silent fallback to embedded on a malformed user file would hide
-/// the operator's intended override.
+/// Process-wide pin-table cache. Production callers never need to
+/// invalidate it (the table doesn't change without a restart in real
+/// deployments). Tests get a `clear_cache_for_tests()` helper to reset
+/// state between cases — see #183 for why a plain `OnceLock` was the
+/// previous design and what made it test-hostile.
+///
+/// `Box::leak` produces the `&'static PinTable` callers expect. Per-
+/// reload memory leak is bounded by how many times the cache is
+/// reset in a single process; tests reset between cases, production
+/// resets never, so leakage is `O(test-count)` at worst.
+static PIN_CACHE: Mutex<Option<&'static PinTable>> = Mutex::new(None);
+
+/// Resolve the active pin table. Caches the result process-wide. If
+/// the user-dir file exists and parses, it WINS; otherwise the
+/// embedded default is used. Parse errors on the user file return
+/// the parse error (operator-visible) rather than silently falling
+/// through — silent fallback to embedded on a malformed user file
+/// would hide the operator's intended override.
 pub fn load_pins() -> Result<&'static PinTable> {
-    static CACHE: OnceLock<PinTable> = OnceLock::new();
-    if let Some(t) = CACHE.get() {
+    let mut guard = PIN_CACHE.lock().expect("pin cache poisoned");
+    if let Some(t) = *guard {
         return Ok(t);
     }
     let table = load_pins_uncached()?;
-    let _ = CACHE.set(table);
-    Ok(CACHE.get().expect("OnceLock just set"))
+    let leaked: &'static PinTable = Box::leak(Box::new(table));
+    *guard = Some(leaked);
+    Ok(leaked)
+}
+
+/// Reset the pin-table cache. Tests use this when they mutate
+/// `DARKMUX_CREW_DIR` (or write to the user pin file) between cases
+/// and need `load_pins()` to re-read instead of returning a stale
+/// cached table.
+///
+/// Production never calls this — the cache lifetime is the process
+/// lifetime by intent. Test-only by `#[cfg(test)]` gate.
+#[cfg(test)]
+pub fn clear_cache_for_tests() {
+    let mut guard = PIN_CACHE.lock().expect("pin cache poisoned");
+    // The previously-leaked PinTable stays leaked (we don't have a
+    // safe way to reclaim it; the leak was the price of the &'static
+    // return type). Subsequent load_pins() will allocate fresh.
+    *guard = None;
 }
 
 /// Parse-only version that always re-reads from disk; used in tests
@@ -191,6 +219,49 @@ mod tests {
                 None => std::env::remove_var("DARKMUX_CREW_DIR"),
             }
         }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn clear_cache_for_tests_forces_reload() {
+        // Sequence: warm the cache with whatever's on disk, then set a
+        // user override that returns a known-different table, then call
+        // clear + load_pins again — must see the new table, not the
+        // cached one. Pre-#183 this would have silently returned the
+        // previously-cached table.
+        let tmp = TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+
+        // Warm cache with embedded default (no user override yet).
+        unsafe { std::env::remove_var("DARKMUX_CREW_DIR"); }
+        clear_cache_for_tests();
+        let first = load_pins().unwrap();
+        let first_default = first.default_pin.clone();
+
+        // Install a user override.
+        unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()); }
+        let user_table = r#"{
+            "rationale": "cache-clear test override",
+            "default_pin": "user:cache-reload-witness",
+            "per_role": {}
+        }"#;
+        std::fs::write(tmp.path().join("role-model-pins.json"), user_table).unwrap();
+
+        // Without clear_cache_for_tests, load_pins would return the
+        // cached embedded default. With it, the user override wins.
+        clear_cache_for_tests();
+        let second = load_pins().unwrap();
+        assert_eq!(second.default_pin, "user:cache-reload-witness");
+        assert_ne!(second.default_pin, first_default);
+
+        // Restore env + reset cache so subsequent tests aren't poisoned.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
+                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+            }
+        }
+        clear_cache_for_tests();
     }
 
     #[serial_test::serial]
