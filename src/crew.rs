@@ -17,4 +17,5 @@ pub mod dispatch;
 pub mod index;
 pub mod lifecycle;
 pub mod loader;
+pub mod pins;
 pub mod types;
