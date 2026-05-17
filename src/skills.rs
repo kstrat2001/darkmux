@@ -23,6 +23,10 @@ use std::path::{Path, PathBuf};
 /// a binary that can `darkmux init` from any directory.
 const EMBEDDED_SKILLS: &[(&str, &str)] = &[
     (
+        "darkmux-bootstrap",
+        include_str!("../skills/darkmux-bootstrap/SKILL.md"),
+    ),
+    (
         "darkmux-status",
         include_str!("../skills/darkmux-status/SKILL.md"),
     ),
