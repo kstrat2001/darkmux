@@ -1,0 +1,13 @@
+{
+  "tier": "generic",
+  "status": "no-recommendation",
+  "rationale": "The `generic` tier matches hardware that doesn't fit a more specific m-series-* profile (Intel Mac, Linux, Windows). darkmux's bake-off methodology hasn't been run on non-Apple-Silicon hardware, and the heuristic provider for generic hardware emits conservative defaults rather than tier-specific tuning. `darkmux swap recommended` errors with this explanation on the generic tier; the operator selects a profile manually based on their hardware's actual capabilities.",
+  "bake_off_url": null,
+  "profile_name": null,
+  "validated_against": [],
+  "not_validated_against": [
+    "everything — non-Apple-Silicon hardware has no validated workload data"
+  ],
+  "primary": null,
+  "compactor": null
+}

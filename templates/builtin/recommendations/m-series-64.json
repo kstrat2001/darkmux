@@ -1,0 +1,13 @@
+{
+  "tier": "m-series-64",
+  "status": "pending-bake-off",
+  "rationale": "No bake-off has been run on a 64GB m-series machine. The maintainer's primary hardware is 128GB; community contributions welcome via #117. Until a recommendation lands, `darkmux swap recommended` errors with this explanation; operators select a profile manually.",
+  "bake_off_url": null,
+  "profile_name": null,
+  "validated_against": [],
+  "not_validated_against": [
+    "everything — no validated workload data exists for this tier"
+  ],
+  "primary": null,
+  "compactor": null
+}
