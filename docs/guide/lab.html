@@ -73,7 +73,7 @@
     </ul>
 
     <h3>Capture cross-layer telemetry with <code>--instrument</code></h3>
-    <p>Add the <code>--instrument</code> flag to a run to capture a sidecar JSONL stream of cross-layer events alongside the trajectory — LMStudio's loaded-model snapshot, gateway-process residency, samples missing — useful for diagnosing where wall-clock latency actually lives.</p>
+    <p>Add the <code>--instrument</code> flag to a run to capture a sidecar JSONL stream of cross-layer events alongside the trajectory — LMStudio's loaded-model snapshot, gateway-process residency, samples missing — useful for diagnosing where wall-clock latency is concentrated.</p>
     <pre><code>darkmux lab run long-agentic --instrument</code></pre>
     <p>Output lands at <code>~/.darkmux/runs/&lt;run-id&gt;/instruments.jsonl</code>. Drag it onto <a href="../lab/">darkmux.com/lab/</a> to replay the run as a four-block topology with anomaly detection. (The <code>/lab</code> page was previously named <code>/viewer</code>; the old URL still redirects.)</p>
   </div>
