@@ -70,6 +70,9 @@ cargo install --path .      # builds the self-contained binary, drops it on $PAT
 
 # 3. Bootstrap config + agent skills
 darkmux init                # creates ~/.darkmux/profiles.json + installs agent skills
+                            # (skills include /darkmux-bootstrap — a guided
+                            # first-time setup workflow you run in your
+                            # Claude Code session after install)
 ```
 
 If `cargo` is already on your PATH, skip Step 1. The `source "$HOME/.cargo/env"` line is the one most often missed by first-time-Rust users — without it, a fresh `cargo install` fails with `command not found: cargo` in the same shell that just ran the rustup installer.
@@ -77,7 +80,8 @@ If `cargo` is already on your PATH, skip Step 1. The `source "$HOME/.cargo/env"`
 ### Verify your setup
 
 ```bash
-darkmux doctor          # 7 pre-flight checks: registry, LMStudio, models, runtime, RAM, power
+darkmux doctor          # pre-flight checks: registry, LMStudio, models, runtime, RAM, power,
+                        # flow substrate, audit integrity, model-pin drift, recommendation drift, …
 ```
 
 Doctor returns exit 0 if everything's wired up, 1 if a fail-level check needs fixing. Fail/warn lines include actionable hints.
@@ -99,7 +103,7 @@ darkmux notebook draft <run-id>   # ask the agent to author an EE-lab-style note
 darkmux mission propose --from-stdin   # AI-built-in: vague intent → structured Mission + Sprint JSONs
 ```
 
-Using Claude Code? Run `darkmux init --with-claude-md ~/.claude/CLAUDE.md` to install the skills *and* teach Claude Code about darkmux at session start.
+Using Claude Code? Run `darkmux init --with-claude-md ~/.claude/CLAUDE.md` to install the skills *and* teach Claude Code about darkmux at session start. Then run **`/darkmux-bootstrap`** in your Claude Code session — it walks through detecting your hardware tier, downloading the bake-off-validated models, registering profiles, and validating the end state. Operator-sovereign: the skill reads + proposes; you run the commands.
 
 ### Updating darkmux
 
@@ -133,35 +137,17 @@ Bigger context wins long tasks. Slim config wins bounded tasks. **No static conf
 
 ## What darkmux does
 
-```
-┌──────────────────┐
-│  Agent / IDE /   │  (Claude Code, OpenClaw, Aider, Cline, Continue, custom)
-│  Wrapper script  │
-└────────┬─────────┘
-         │ OpenAI-compatible HTTP
-         ▼
-┌──────────────────┐
-│     darkmux      │  task classifier + LMStudio orchestrator
-│   localhost:N    │
-└────────┬─────────┘
-         │ OpenAI-compatible HTTP
-         ▼
-┌──────────────────┐
-│    LMStudio /    │  the actual inference
-│    Ollama /      │
-│   llama.cpp      │
-└──────────────────┘
-```
+darkmux is a CLI binary, not an HTTP proxy. Your frontier session (Claude Code) invokes `darkmux` verbs directly to operate four substrates:
 
-### Three layers
+1. **Profile multiplexing.** `darkmux swap <profile>` unloads + loads models in LMStudio according to a named profile in `~/.darkmux/profiles.json`. `darkmux swap recommended` resolves the active hardware tier to the bake-off-validated profile + pre-flight-checks the required models are downloaded. `~10s` wall to swap.
 
-1. **`darkmux swap <profile>`** — bare CLI for users who classify themselves. Unloads/loads models in LMStudio according to a named profile. ~10s wall to swap.
+2. **Crew + mission + sprint lifecycle.** `darkmux crew dispatch <role>` invokes a per-role-pinned agent (coder, code-reviewer, scribe, …) via the configured agent runtime. `darkmux mission propose` + `darkmux sprint estimate` are admin-AI verbs that turn vague intent into structured Mission + Sprint JSONs without the operator authoring them by hand. Each dispatch emits a flow record carrying provenance: `machine_id`, `orchestrator`, role, model, mission, sprint.
 
-2. **Multi-config registry** — a JSON file naming profiles (`fast`, `balanced`, `deep`, plus the bundled `gpt-oss` preset for the MXFP4 build of OpenAI's open-source 120B on Apple Silicon — note: `gpt-oss` requires OpenClaw ≥ v2026.5.9-beta.1 for the harmony-format / tool-payload fix) with model IDs, context lengths, compaction settings. Profiles can also encode "warm pair" (primary + companion compactor) configurations.
+3. **Flow substrate.** Every dispatch, decision, and review is recorded as a structured JSONL event. `LocalFileSink` (always-on) writes to `~/.darkmux/flows/`. `AuditFileSink` (opt-in via `DARKMUX_AUDIT_DIR`) adds a BLAKE3 hash chain for tamper-evidence. `RedisSink` (opt-in via `DARKMUX_REDIS_URL`) adds a cross-machine coordination stream. `darkmux flow status` introspects the substrate; `darkmux flow integrity-check` walks the audit chain.
 
-3. **`darkmux serve` (observability daemon)** — local HTTP daemon that serves flow records and mission/sprint state to the `/flow` viewer. Endpoints: `/health`, `/flow/<date>(.jsonl)`, `/flow/<date>/stream` (SSE tail), `/model/status`, `/missions`, `/sprints`. Default bind `127.0.0.1:8765`. Foreground process — run in a separate terminal tab. `darkmux doctor` includes a `daemon: reachable` check (Warn severity) so an operator who closed the daemon tab gets surfaced rather than discovering it only when the viewer pane is empty; both `darkmux crew dispatch` and `darkmux sprint review` print a one-line stderr nudge when the daemon isn't reachable at dispatch time.
+4. **Observability daemon.** `darkmux serve` is a local HTTP daemon (default bind `127.0.0.1:8765`) that serves flow records + mission/sprint state + the new `/flow-status` endpoint to the `/flow` + `/lab` viewers. Endpoints: `/health`, `/flow/<date>(.jsonl)`, `/flow/<date>/stream` (SSE tail), `/model/status`, `/missions`, `/sprints`, `/flow-status`. Foreground process — run in a separate terminal tab. `darkmux doctor` includes a `daemon: reachable` check; dispatches print a one-line stderr nudge when the daemon isn't reachable.
 
-Layers 1 and 2 ship from day one. Layer 3 is the live-observability surface, optional but required for the `/flow` viewer.
+The agent runtime that `crew dispatch` and `lab run` shell out to is configurable via `DARKMUX_RUNTIME_CMD` (default: `openclaw`). The frontier session (Claude Code) orchestrates the whole thing — see the `/darkmux-bootstrap` skill for a guided walkthrough.
 
 ## Why "darkmux"
 
@@ -274,10 +260,6 @@ Drag your `instruments.jsonl` file onto the window. The topology renders:
 
 The viewer is a static page served from this repo's `docs/` folder. **Nothing is uploaded.** Your `instruments.jsonl` is parsed entirely in the browser. No backend, no telemetry on the telemetry.
 
-## Status
-
-🚧 **Pre-alpha.** v0.1 (`swap`/`status`/`profiles`) and v0.2 lab foundation (`lab workloads`/`run`/`inspect`/`compare`) implemented. Real built-in workloads, notebook, and skills bundle pending.
-
 ## Why this exists — empirical motivation
 
 Headline findings from the experimental work that produced darkmux's reference profiles:
@@ -291,13 +273,35 @@ The case for darkmux: **once you accept that static configs leave performance on
 
 ## Status
 
-- ✅ v0.1: profile registry, `swap`/`status`/`profiles` CLI
-- ✅ v0.2 foundation: `lab` subcommands, `WorkloadProvider` trait, `prompt` + `coding-task` providers, `quick-q` smoke workload
-- 🚧 v0.2 next: real built-in workloads with sandbox seeds, `lab tune`, knob introspection
-- 🚧 v0.3: notebook structure + agent-invocable skills
-- 🚧 v0.4: team templates (workflow → fleet of agents → profiles)
-- 🚧 v0.5: proxy mode (`darkmux serve`) with heuristic task classifier
-- 🚧 v0.6: plugin system for community providers and templates
+🚧 **Pre-1.0** — v0.4.0 on `main`; active development; APIs not yet frozen.
+
+**Shipped:**
+
+- ✅ Profile registry + `swap`/`status`/`profiles`/`scan` CLI
+- ✅ Lab subcommands (`run`/`inspect`/`compare`/`characterize`/`runs`), `WorkloadProvider` trait, embedded smoke workloads, `--instrument` sidecar sampler
+- ✅ Notebook (`notebook draft`/`list`) — cross-machine via `DARKMUX_NOTEBOOK_DIR`
+- ✅ Agent-invocable skills bundle (12 skills including `/darkmux-bootstrap`)
+- ✅ Crew + Role + Mission + Sprint schema with SQLite-backed index; `mission propose` + `sprint estimate` admin-AI verbs
+- ✅ Per-role `agent.model` pinning (#160) with bake-off-derived defaults; doctor surfaces drift
+- ✅ Recommendation registry per hardware tier (#159) with `swap recommended` + `model pull-recommended`; doctor surfaces drift
+- ✅ Flow substrate: `LocalFileSink` (always) + `AuditFileSink` (BLAKE3 hash chain, verifiable via `flow integrity-check`; opt-in) + `RedisSink` (coordination; opt-in), composed via `TeeSink`
+- ✅ `darkmux flow status` + `darkmux flow integrity-check` diagnostic verbs
+- ✅ Observability daemon (`darkmux serve`) + `/flow` + `/lab` web viewers
+- ✅ Doctor: 20+ pre-flight checks with auto-fix path (`--fix`) for known-safe drift
+
+**On the roadmap (active):**
+
+- 🚧 Topology view in the web viewer (live + replay diagram of fleet activity; #169)
+- 🚧 Fleet primitives (`darkmux fleet add/status/route`) and cross-machine coordination (Phase 5 of #162)
+- 🚧 Event-sourced mission state (Phase 8 of #162)
+- 🚧 Sibling bootstrap skills: `/darkmux-add-machine` (#176), `/darkmux-enable-audit` (#177), `/darkmux-enable-redis` (#178)
+- 🚧 Audit log management: `flow export`, `flow archive`, OS-level append-only flags for audit files
+- 🚧 Multi-frontier orchestrator support (Gemini / Codex / Copilot bootstrap paths; #179)
+
+**Aspirational (later):**
+
+- 🚧 Plugin system for community-contributed providers, workloads, role manifests
+- 🚧 Per-role bake-offs for non-SWE roles (trip-researcher, health-research, legal-research, …)
 
 ## License
 
