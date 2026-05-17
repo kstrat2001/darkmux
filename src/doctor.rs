@@ -93,9 +93,80 @@ pub fn run() -> DoctorReport {
         check_flow_sink_health(),
         check_machine_id_resolution(),
         check_orchestrator_declared(),
+        check_audit_integrity(),
     ];
     checks.extend(eureka_checks());
     DoctorReport { checks }
+}
+
+/// Walk the audit directory and roll up the integrity-check results
+/// into a single doctor check. Pass when every file's chain validates.
+/// Warn when no audit files exist (operator hasn't enabled AuditFileSink,
+/// or hasn't written through it yet). Fail when ANY chain is broken —
+/// chain break is the audit substrate's tampering signal, not a
+/// recoverable warning. (#163)
+fn check_audit_integrity() -> Check {
+    let reports = match crate::flow::integrity_check_all() {
+        Ok(r) => r,
+        Err(e) => {
+            return Check {
+                name: "audit integrity".into(),
+                status: Status::Warn,
+                message: format!("could not walk audit dir: {e:#}"),
+                hint: Some(
+                    "Check DARKMUX_AUDIT_DIR or the default `~/.darkmux/audit/` is readable."
+                        .into(),
+                ),
+            };
+        }
+    };
+
+    if reports.is_empty() {
+        let dir = crate::flow::audit_dir().display().to_string();
+        return Check {
+            name: "audit integrity".into(),
+            status: Status::Warn,
+            message: format!("no audit files under {dir}"),
+            hint: Some(
+                "AuditFileSink is opt-in: set DARKMUX_AUDIT_DIR to enable hash-chained tamper-evident audit alongside the casual LocalFile sink. For compliance deployments (ISO 27001, AI Act, etc.) this should be on."
+                    .into(),
+            ),
+        };
+    }
+
+    let broken: Vec<&crate::flow::IntegrityReport> =
+        reports.iter().filter(|r| !r.chain_valid).collect();
+    if broken.is_empty() {
+        let total_records: u64 = reports.iter().map(|r| r.records_checked).sum();
+        Check {
+            name: "audit integrity".into(),
+            status: Status::Pass,
+            message: format!(
+                "{} file(s), {total_records} record(s), all chains verified",
+                reports.len()
+            ),
+            hint: None,
+        }
+    } else {
+        let first = broken[0];
+        let summary = format!(
+            "{}/{} file(s) BROKEN — {} at line {} ({})",
+            broken.len(),
+            reports.len(),
+            first.path,
+            first.break_at_line.unwrap_or(0),
+            first.break_reason.clone().unwrap_or_else(|| "no reason captured".into()),
+        );
+        Check {
+            name: "audit integrity".into(),
+            status: Status::Fail,
+            message: summary,
+            hint: Some(
+                "Audit log has been edited or a write was interleaved. Run `darkmux flow integrity-check` for the full per-file breakdown. If tampering is suspected, the chain break locates the affected line; older records before that line are still trustworthy."
+                    .into(),
+            ),
+        }
+    }
 }
 
 /// Surface the machine_id that flow records will be tagged with. Always
@@ -1724,13 +1795,14 @@ mod tests {
     #[test]
     fn run_returns_static_plus_eureka_checks() {
         let r = run();
-        // 17 baseline checks (incl. runtime version + load projection +
+        // 18 baseline checks (incl. runtime version + load projection +
         // daemon reachable + darkmux-version-vs-latest-release [#13] +
         // crew-role-prompt-coverage [#141] + flow-sink-health [#170] +
-        // machine_id + orchestrator [#167]) + one per active eureka rule.
-        // Every check should appear regardless of environment — even if
-        // the underlying probe couldn't read state.
-        let expected = 17 + crate::eureka::all_rules().len();
+        // machine_id + orchestrator [#167] + audit-integrity [#163])
+        // + one per active eureka rule. Every check should appear
+        // regardless of environment — even if the underlying probe
+        // couldn't read state.
+        let expected = 18 + crate::eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

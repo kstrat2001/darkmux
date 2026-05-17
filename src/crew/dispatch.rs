@@ -1034,6 +1034,8 @@ pub(crate) fn build_dispatch_record(
         mission_id: None,
         machine_id: None,
         orchestrator: None,
+        prev_hash: None,
+        hash: None,
     }
 }
 

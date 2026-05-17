@@ -15,11 +15,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.4.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.5.0";
 // Version history:
 //   1.2.0 — added optional `model` (#106)
 //   1.3.0 — added optional `reasoning` + `mission_id`; new Stage::TierDecision (#136)
 //   1.4.0 — added optional `machine_id` + `orchestrator` (#167; substrate for #162 fleet UI)
+//   1.5.0 — added optional `prev_hash` + `hash` (#163; AuditFileSink chain-of-custody fields)
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -121,6 +122,22 @@ pub struct FlowRecord {
     /// Schema 1.4 addition (#167).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub orchestrator: Option<String>,
+    /// BLAKE3 hash of the previous record in this audit file's chain.
+    /// `None` on records written through LocalFileSink (the casual sink);
+    /// AuditFileSink (the compliance-strength sibling) populates this
+    /// with the prior record's `hash` value so tampering with any single
+    /// record is detectable via a linear walk. The first record in a
+    /// file points to the hash of the schema-header line. Schema 1.5
+    /// addition (#163).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prev_hash: Option<String>,
+    /// BLAKE3 hash of THIS record's content (excluding the `hash` field
+    /// itself — see `audit_hash_of()`). Populated only by AuditFileSink.
+    /// Together with `prev_hash` forms a tamper-evident chain. The
+    /// `darkmux flow integrity-check` verb recomputes the chain and
+    /// reports the first divergence. Schema 1.5 addition (#163).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
 }
 
 /// Resolve the flows directory from env override (`DARKMUX_FLOWS_DIR`) or
@@ -273,6 +290,377 @@ impl FlowSink for LocalFileSink {
         config.insert("flows_dir".to_string(), flows_dir().display().to_string());
         SinkInfo { kind: "LocalFile".to_string(), config, children: vec![] }
     }
+}
+
+// ─── AuditFileSink (#163) ────────────────────────────────────────────
+//
+// Compliance-strength sibling of LocalFileSink. Same per-day JSONL append
+// format, plus:
+//   - BLAKE3 hash chain — each record carries the prior record's hash,
+//     making any after-the-fact edit detectable via a linear walk.
+//   - Cross-process flock — concurrent CLI sessions writing the same
+//     day file serialize through `flock(2)` so the hash chain can't
+//     interleave (which would surface as a chain break the operator
+//     might mistake for tampering).
+//   - Separate directory (default `~/.darkmux/audit/`, overridable via
+//     `DARKMUX_AUDIT_DIR`) — keeps casual flow records visually
+//     distinct from compliance-strength records and lets the operator
+//     mount the audit dir on different storage (encrypted volume,
+//     read-only mirror, etc.).
+//
+// **POSIX-only** (`#[cfg(unix)]`) — `flock(2)` is the locking primitive.
+// On Windows builds, AuditFileSink doesn't exist and `build_default_sink`
+// silently skips it; the integrity-check verb + doctor check report
+// "audit sink is unix-only on this platform". Cross-platform support
+// would need `LockFileEx` and a separate code path — out of scope here.
+//
+// Tamper-evident, NOT tamper-proof. OS-level append-only flags
+// (`chflags uappend` / `chattr +a`) are a follow-up; this PR ships the
+// chain layer. Operators in regulated environments compose this with
+// disk encryption + filesystem-level immutability for layered defense.
+
+/// Resolve the audit directory from env override (`DARKMUX_AUDIT_DIR`)
+/// or default (`~/.darkmux/audit/`). Symmetric with `flows_dir()` but
+/// deliberately separate so audit and casual records never share a path.
+pub(crate) fn audit_dir() -> PathBuf {
+    std::env::var("DARKMUX_AUDIT_DIR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".darkmux").join("audit")))
+        .unwrap_or_else(|| PathBuf::from("/tmp/darkmux/audit"))
+}
+
+/// Hash-chained tamper-evident sink. See module-level comment for the
+/// design rationale. POSIX-only.
+#[cfg(unix)]
+pub struct AuditFileSink;
+
+#[cfg(unix)]
+impl AuditFileSink {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[cfg(unix)]
+impl Default for AuditFileSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(unix)]
+impl FlowSink for AuditFileSink {
+    fn write(&self, record: &FlowRecord) -> Result<()> {
+        let dir = audit_dir();
+        let day = day_utc_now();
+        let path = dir.join(format!("{day}.jsonl"));
+        audit_record_at(record, &path)
+    }
+
+    fn info(&self) -> SinkInfo {
+        let mut config = std::collections::BTreeMap::new();
+        config.insert("audit_dir".to_string(), audit_dir().display().to_string());
+        config.insert("hash".to_string(), "blake3".to_string());
+        SinkInfo { kind: "AuditFile".to_string(), config, children: vec![] }
+    }
+}
+
+/// Compute the BLAKE3 hash of a record's canonical form. The `hash` field
+/// is intentionally excluded (cloning the record and setting `hash =
+/// None` before serializing) so the chain doesn't self-reference. The
+/// `prev_hash` field IS included — that's what binds each record to the
+/// chain.
+pub fn audit_hash_of(record: &FlowRecord) -> Result<String> {
+    let mut to_hash = record.clone();
+    to_hash.hash = None;
+    let bytes = serde_json::to_vec(&to_hash).context("serializing record for hash")?;
+    Ok(blake3::hash(&bytes).to_hex().to_string())
+}
+
+/// Hash of the schema-header line — the chain's deterministic seed. Used
+/// as `prev_hash` for the first record in a fresh audit file so the
+/// chain starts with a well-defined value rather than `None`.
+fn audit_seed_hash(header_line: &str) -> String {
+    blake3::hash(header_line.as_bytes()).to_hex().to_string()
+}
+
+/// Append `record` to the audit file at `path`, populating `prev_hash`
+/// + `hash` from the existing chain. Cross-process safe via `flock(2)`:
+/// concurrent CLI sessions writing the same file serialize correctly.
+/// POSIX-only.
+#[cfg(unix)]
+///
+/// Atomicity model:
+///   1. Acquire exclusive flock on the file (creating it if absent).
+///   2. Read the last record (or the schema header for an empty file)
+///      to recover the chain's current tail hash.
+///   3. Populate `prev_hash` + recompute `hash` on a clone of the input.
+///   4. Append the line.
+///   5. Drop the file → flock released.
+///
+/// First-write-into-new-file emits the schema header AND the first
+/// record under the same lock so an interrupt can't leave a header-only
+/// file with no chain seed visible.
+fn audit_record_at(record: &FlowRecord, path: &Path) -> Result<()> {
+    use std::os::unix::io::AsRawFd;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating audit dir {}", parent.display()))?;
+    }
+
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .with_context(|| format!("opening audit log {}", path.display()))?;
+
+    // Acquire exclusive cross-process lock; auto-released on file drop.
+    let fd = file.as_raw_fd();
+    let lock_ret = unsafe { libc::flock(fd, libc::LOCK_EX) };
+    if lock_ret != 0 {
+        return Err(anyhow::anyhow!(
+            "flock(LOCK_EX) failed on audit log {}: errno {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    // RAII guard so the lock is released even if the function bails.
+    struct FlockGuard(std::os::unix::io::RawFd);
+    impl Drop for FlockGuard {
+        fn drop(&mut self) {
+            unsafe { libc::flock(self.0, libc::LOCK_UN) };
+        }
+    }
+    let _guard = FlockGuard(fd);
+
+    use std::io::{Read, Seek, SeekFrom, Write as _};
+    let mut contents = String::new();
+    file.seek(SeekFrom::Start(0))
+        .with_context(|| format!("seek to start of {}", path.display()))?;
+    file.read_to_string(&mut contents)
+        .with_context(|| format!("reading audit log {}", path.display()))?;
+
+    let (prev_hash, write_header) = if contents.is_empty() {
+        // Fresh file — the seed hash binds the chain to the schema header
+        // we're about to write.
+        let header = schema_header_line()?;
+        let seed = audit_seed_hash(&header);
+        (seed, Some(header))
+    } else {
+        // Existing file — find the last non-empty line.
+        let non_empty: Vec<&str> =
+            contents.lines().filter(|l| !l.trim().is_empty()).collect();
+        if non_empty.is_empty() {
+            // File exists but trims to nothing (whitespace-only) — treat as fresh.
+            let header = schema_header_line()?;
+            (audit_seed_hash(&header), Some(header))
+        } else {
+            let last_line = *non_empty.last().expect("non_empty is not empty per check above");
+            // Parse the last line. Unparseable = chain corrupted.
+            let parsed: serde_json::Value = serde_json::from_str(last_line).map_err(|e| {
+                anyhow::anyhow!(
+                    "audit log {} last line is unparseable JSON: {e}",
+                    path.display()
+                )
+            })?;
+            let last_hash = match parsed.get("hash").and_then(|h| h.as_str()) {
+                Some(h) => h.to_string(),
+                None => {
+                    // No `hash` field on the last line. Two cases:
+                    //   (a) File contains ONLY the schema header (process
+                    //       or OS crash between header write and first-
+                    //       record write — the within-process atomicity
+                    //       comment above only protects same-process
+                    //       interrupts). Recover by re-seeding from the
+                    //       existing header so we don't double-write it.
+                    //   (b) Audit log has been edited to remove hash
+                    //       fields, or a non-audit JSONL was placed here.
+                    //       Chain cannot continue — bail loudly.
+                    if non_empty.len() == 1 {
+                        audit_seed_hash(last_line)
+                    } else {
+                        return Err(anyhow::anyhow!(
+                            "audit log {} last line lacks `hash` field — chain corrupted",
+                            path.display()
+                        ));
+                    }
+                }
+            };
+            (last_hash, None)
+        }
+    };
+
+    // Build the record to write: stamp prev_hash, recompute hash.
+    let mut to_write = record.clone();
+    to_write.prev_hash = Some(prev_hash);
+    to_write.hash = None;
+    let hash = audit_hash_of(&to_write).context("computing audit hash")?;
+    to_write.hash = Some(hash);
+
+    let line = serde_json::to_string(&to_write).context("serializing audit record")?;
+
+    // Append (after seeking to end). flock holds; PIPE_BUF guarantee is
+    // belt-and-suspenders for the JSONL line.
+    file.seek(SeekFrom::End(0))
+        .with_context(|| format!("seek to end of {}", path.display()))?;
+    if let Some(header) = write_header {
+        file.write_all(header.as_bytes())
+            .with_context(|| format!("writing schema header to {}", path.display()))?;
+        file.write_all(b"\n")?;
+    }
+    file.write_all(line.as_bytes())
+        .with_context(|| format!("appending record to audit log {}", path.display()))?;
+    file.write_all(b"\n")?;
+    file.sync_all()
+        .with_context(|| format!("syncing audit log {}", path.display()))?;
+    Ok(())
+}
+
+/// Build the schema header line used by both LocalFileSink (via
+/// `record_at`) and AuditFileSink. Centralized so the two sinks emit
+/// byte-identical headers — the audit seed hash is then stable across
+/// sink kinds, and any future reader can recognize the line via
+/// `_type: "schema"`.
+fn schema_header_line() -> Result<String> {
+    let header = serde_json::json!({
+        "_type": "schema",
+        "version": FLOW_SCHEMA_VERSION,
+        "darkmux_version": env!("CARGO_PKG_VERSION"),
+    });
+    serde_json::to_string(&header).context("serializing schema header")
+}
+
+/// Walk a single audit file, recomputing the hash chain and reporting
+/// the first divergence (if any). Cheap — sequential read + per-line
+/// hash; throughput limited by disk read.
+pub fn integrity_check_file(path: &Path) -> Result<IntegrityReport> {
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("reading audit log {}", path.display()))?;
+    let lines: Vec<&str> = contents.lines().filter(|l| !l.trim().is_empty()).collect();
+
+    if lines.is_empty() {
+        return Ok(IntegrityReport {
+            path: path.display().to_string(),
+            records_checked: 0,
+            chain_valid: true,
+            break_at_line: None,
+            break_reason: None,
+        });
+    }
+
+    // Line 1 is the schema header (no hash); seed the expected prev_hash
+    // from its hash so the first record's `prev_hash` should equal it.
+    let header_line = lines[0];
+    let mut expected_prev = audit_seed_hash(header_line);
+    let mut records_checked = 0u64;
+
+    for (idx, line) in lines.iter().enumerate().skip(1) {
+        records_checked += 1;
+        let rec: FlowRecord = match serde_json::from_str(line) {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok(IntegrityReport {
+                    path: path.display().to_string(),
+                    records_checked,
+                    chain_valid: false,
+                    break_at_line: Some((idx + 1) as u64), // 1-indexed
+                    break_reason: Some(format!("unparseable JSON: {e}")),
+                });
+            }
+        };
+
+        let stored_prev = rec.prev_hash.clone().unwrap_or_default();
+        if stored_prev != expected_prev {
+            return Ok(IntegrityReport {
+                path: path.display().to_string(),
+                records_checked,
+                chain_valid: false,
+                break_at_line: Some((idx + 1) as u64),
+                break_reason: Some(format!(
+                    "prev_hash mismatch: stored `{stored_prev}` != expected `{expected_prev}` (audit log has been edited or a write was interleaved)"
+                )),
+            });
+        }
+
+        let stored_hash = match rec.hash.clone() {
+            Some(h) => h,
+            None => {
+                return Ok(IntegrityReport {
+                    path: path.display().to_string(),
+                    records_checked,
+                    chain_valid: false,
+                    break_at_line: Some((idx + 1) as u64),
+                    break_reason: Some(
+                        "record lacks `hash` field — not produced by AuditFileSink, or chain is corrupted".to_string(),
+                    ),
+                });
+            }
+        };
+
+        let recomputed = audit_hash_of(&rec).context("recomputing audit hash")?;
+        if recomputed != stored_hash {
+            return Ok(IntegrityReport {
+                path: path.display().to_string(),
+                records_checked,
+                chain_valid: false,
+                break_at_line: Some((idx + 1) as u64),
+                break_reason: Some(format!(
+                    "hash mismatch: stored `{stored_hash}` != recomputed `{recomputed}` (record content has been edited)"
+                )),
+            });
+        }
+
+        expected_prev = stored_hash;
+    }
+
+    Ok(IntegrityReport {
+        path: path.display().to_string(),
+        records_checked,
+        chain_valid: true,
+        break_at_line: None,
+        break_reason: None,
+    })
+}
+
+/// Walk every audit file under `audit_dir()`. Sorted by filename for
+/// stable output.
+pub fn integrity_check_all() -> Result<Vec<IntegrityReport>> {
+    let dir = audit_dir();
+    let entries = match fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(vec![]), // missing dir = nothing to check
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e == "jsonl")
+                .unwrap_or(false)
+        })
+        .collect();
+    paths.sort();
+    let mut reports = Vec::with_capacity(paths.len());
+    for p in paths {
+        reports.push(integrity_check_file(&p)?);
+    }
+    Ok(reports)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntegrityReport {
+    pub path: String,
+    pub records_checked: u64,
+    pub chain_valid: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub break_at_line: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub break_reason: Option<String>,
 }
 
 // ─── RedisSink (#162 Phase 3) ────────────────────────────────────────
@@ -437,8 +825,21 @@ impl FlowSink for TeeSink {
 
 /// Build the process-wide default sink from env-var configuration.
 ///
-/// - `DARKMUX_REDIS_URL` set (and non-empty) → `TeeSink([LocalFileSink, RedisSink])`
-/// - Else → `LocalFileSink` alone (current behavior preserved)
+/// Composition rules (#162, #163):
+/// - `DARKMUX_AUDIT_DIR` set (and non-empty) → AuditFileSink is included.
+/// - `DARKMUX_REDIS_URL` set (and non-empty) → RedisSink is included.
+/// - LocalFileSink is always present (casual write target).
+///
+/// The TeeSink wraps every enabled sink in order: `[Audit, LocalFile, Redis]`
+/// — **audit first** reflects the compliance hierarchy. The casual file
+/// sink is the operator-familiar one, but the audit sink is the
+/// load-bearing substrate for regulated deployments. A future short-
+/// circuit mode (e.g., fail-fast on audit failure) naturally fits this
+/// ordering.
+///
+/// Each record is broadcast to every active sink; failures are logged
+/// but don't block the others — every substrate remains durable even
+/// when one layer is degraded.
 ///
 /// `DARKMUX_REDIS_STREAM` overrides the stream name (default `darkmux:flow`).
 /// `DARKMUX_REDIS_MAXLEN` overrides the retention cap (default 10000;
@@ -446,45 +847,75 @@ impl FlowSink for TeeSink {
 ///
 /// Connection errors at construction degrade gracefully: if Redis is
 /// unreachable when the sink builds, the warning logs to stderr and the
-/// default sink falls back to LocalFileSink alone. Operators see the
-/// connection failure loudly; the audit substrate stays intact.
+/// default sink continues without it. Operators see the connection
+/// failure loudly; the audit + casual substrates stay intact.
 fn build_default_sink() -> Arc<dyn FlowSink> {
-    let local = Arc::new(LocalFileSink::new());
+    let mut sinks: Vec<Arc<dyn FlowSink>> = Vec::new();
 
-    let redis_url = match std::env::var("DARKMUX_REDIS_URL") {
-        Ok(s) if !s.trim().is_empty() => s,
-        _ => return local,
-    };
-
-    let stream = std::env::var("DARKMUX_REDIS_STREAM")
+    let audit_enabled = std::env::var("DARKMUX_AUDIT_DIR")
         .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "darkmux:flow".to_string());
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    if audit_enabled {
+        #[cfg(unix)]
+        {
+            let path = audit_dir().display().to_string();
+            eprintln!("flow: AuditFileSink enabled — audit_dir={path} (hash-chained, flock-serialized)");
+            sinks.push(Arc::new(AuditFileSink::new()));
+        }
+        #[cfg(not(unix))]
+        {
+            eprintln!(
+                "flow: DARKMUX_AUDIT_DIR set, but AuditFileSink is POSIX-only — skipping on this platform. \
+                 Casual + Redis sinks remain active."
+            );
+        }
+    }
 
-    let max_len = match std::env::var("DARKMUX_REDIS_MAXLEN") {
-        Ok(s) => match s.parse::<usize>() {
-            Ok(0) => None,
-            Ok(n) => Some(n),
+    // LocalFile is always present.
+    sinks.push(Arc::new(LocalFileSink::new()));
+
+    let redis_url = std::env::var("DARKMUX_REDIS_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+
+    if let Some(url) = redis_url {
+        let stream = std::env::var("DARKMUX_REDIS_STREAM")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "darkmux:flow".to_string());
+
+        let max_len = match std::env::var("DARKMUX_REDIS_MAXLEN") {
+            Ok(s) => match s.parse::<usize>() {
+                Ok(0) => None,
+                Ok(n) => Some(n),
+                Err(_) => Some(10000),
+            },
             Err(_) => Some(10000),
-        },
-        Err(_) => Some(10000),
-    };
+        };
 
-    match RedisSink::new(&redis_url, &stream, max_len) {
-        Ok(redis_sink) => {
-            eprintln!(
-                "flow: Redis sink enabled — url={redis_url} stream={stream} \
-                 max_len={max_len:?} (tee'd with local file sink)"
-            );
-            Arc::new(TeeSink::new(vec![local, Arc::new(redis_sink)]))
+        match RedisSink::new(&url, &stream, max_len) {
+            Ok(redis_sink) => {
+                eprintln!(
+                    "flow: Redis sink enabled — url={url} stream={stream} \
+                     max_len={max_len:?} (composed via TeeSink)"
+                );
+                sinks.push(Arc::new(redis_sink));
+            }
+            Err(e) => {
+                eprintln!(
+                    "flow: Redis sink construction failed ({e:#}); continuing without it. \
+                     Other sinks intact."
+                );
+            }
         }
-        Err(e) => {
-            eprintln!(
-                "flow: Redis sink construction failed ({e:#}); falling back to \
-                 local file sink only. Audit substrate intact."
-            );
-            local
-        }
+    }
+
+    if sinks.len() == 1 {
+        // Single sink — skip the Tee wrapper for clarity in diagnostics.
+        sinks.into_iter().next().unwrap()
+    } else {
+        Arc::new(TeeSink::new(sinks))
     }
 }
 
@@ -616,13 +1047,9 @@ pub(crate) fn record_at(record: &FlowRecord, path: &Path) -> Result<()> {
         }
     }
 
-    let darkmux_version = env!("CARGO_PKG_VERSION");
-    let schema_header = serde_json::json!({
-        "_type": "schema",
-        "version": FLOW_SCHEMA_VERSION,
-        "darkmux_version": darkmux_version,
-    });
-    let header_line = serde_json::to_string(&schema_header)?;
+    // Header is centralized so LocalFileSink + AuditFileSink emit
+    // byte-identical schema headers; audit's seed hash stays stable.
+    let header_line = schema_header_line()?;
     let record_line = serde_json::to_string(record)?;
 
     // Try the atomic-create path: we win the create race → write header +
@@ -1218,6 +1645,8 @@ mod tests {
             mission_id: None,
             machine_id: None,
             orchestrator: None,
+            prev_hash: None,
+            hash: None,
         };
 
         record_at(&record, &path).unwrap();
@@ -1255,6 +1684,8 @@ mod tests {
             mission_id: None,
             machine_id: None,
             orchestrator: None,
+            prev_hash: None,
+            hash: None,
         };
 
         record_at(&r("first"), &path).unwrap();
@@ -1300,6 +1731,8 @@ mod tests {
             mission_id: None,
             machine_id: None,
             orchestrator: None,
+            prev_hash: None,
+            hash: None,
         };
 
         record_at(&record, &path).unwrap();
@@ -1362,6 +1795,8 @@ mod tests {
                 mission_id: None,
                 machine_id: None,
                 orchestrator: None,
+                prev_hash: None,
+                hash: None,
             },
             &tmp.path().join("custom.jsonl"),
         )
@@ -1403,6 +1838,8 @@ mod tests {
             mission_id: None,
             machine_id: None,
             orchestrator: None,
+            prev_hash: None,
+            hash: None,
         };
 
         record_at(&record, &path).unwrap();
@@ -1452,6 +1889,8 @@ mod tests {
             mission_id: None,
             machine_id: None,
             orchestrator: None,
+            prev_hash: None,
+            hash: None,
         };
 
         // Capture the day-key BEFORE calling record() so a midnight-UTC
@@ -1593,6 +2032,8 @@ mod tests {
             mission_id: None,
             machine_id: None,
             orchestrator: None,
+            prev_hash: None,
+            hash: None,
         };
         sink.write(&rec).unwrap();
 
@@ -1660,6 +2101,8 @@ mod tests {
             mission_id: None,
             machine_id: None,
             orchestrator: None,
+            prev_hash: None,
+            hash: None,
         };
 
         record_via(&sink, &rec).unwrap();
@@ -1696,6 +2139,8 @@ mod tests {
             mission_id: None,
             machine_id: None,
             orchestrator: None,
+            prev_hash: None,
+            hash: None,
         };
         tee.write(&rec).unwrap();
         tee.write(&rec).unwrap();
@@ -1746,6 +2191,8 @@ mod tests {
             mission_id: None,
             machine_id: None,
             orchestrator: None,
+            prev_hash: None,
+            hash: None,
         };
         let err = tee.write(&rec).unwrap_err();
         // Caller sees the error (so they can react if they want)
@@ -1782,6 +2229,8 @@ mod tests {
             mission_id: None,
             machine_id: None,
             orchestrator: None,
+            prev_hash: None,
+            hash: None,
         };
         super::record(rec).unwrap();
 
@@ -1800,7 +2249,7 @@ mod tests {
     }
 
     #[test]
-    fn flow_schema_version_is_1_4_0() {
+    fn flow_schema_version_is_1_5_0() {
         // Pin the schema version so an accidental rename can't ship silently;
         // any bump beyond this should be a deliberate code change paired with
         // an update to this assertion (and corresponding viewer EXPECTED_*
@@ -1811,9 +2260,11 @@ mod tests {
         //   1.3.0 — added optional `reasoning` and `mission_id` fields and a
         //           new `Stage::TierDecision` variant (#136). Minor bump.
         //   1.4.0 — added optional `machine_id` and `orchestrator` fields
-        //           (#167; substrate for fleet UI). Minor bump: older viewers
-        //           treat absent fields as `unknown` machine/orchestrator.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.4.0");
+        //           (#167; substrate for fleet UI). Minor bump.
+        //   1.5.0 — added optional `prev_hash` and `hash` fields for
+        //           AuditFileSink's chain-of-custody (#163). Minor bump:
+        //           absent in records from LocalFileSink (casual write path).
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.5.0");
     }
 
     #[test]
@@ -1861,6 +2312,8 @@ mod tests {
             mission_id: None,
             machine_id: None,
             orchestrator: None,
+            prev_hash: None,
+            hash: None,
         };
         let serialized = serde_json::to_string(&rec).unwrap();
         assert!(!serialized.contains("reasoning"),
@@ -1891,6 +2344,8 @@ mod tests {
                 mission_id: None,
                 machine_id: None,
                 orchestrator: None,
+                prev_hash: None,
+                hash: None,
             },
             &path,
         )
@@ -2055,6 +2510,8 @@ mod tests {
             mission_id: None,
             machine_id: None,
             orchestrator: None,
+            prev_hash: None,
+            hash: None,
         };
         let s = serde_json::to_string(&rec).unwrap();
         assert!(!s.contains("machine_id"), "machine_id should omit when None: {s}");
@@ -2079,6 +2536,8 @@ mod tests {
             mission_id: None,
             machine_id: Some("studio".to_string()),
             orchestrator: Some("claude-opus-4-7".to_string()),
+            prev_hash: None,
+            hash: None,
         };
         let s = serde_json::to_string(&rec).unwrap();
         let parsed: FlowRecord = serde_json::from_str(&s).unwrap();
@@ -2119,6 +2578,8 @@ mod tests {
             mission_id: None,
             machine_id: None,
             orchestrator: None,
+            prev_hash: None,
+            hash: None,
         };
         super::record(rec).unwrap();
 
@@ -2143,6 +2604,302 @@ mod tests {
             match prev_orch {
                 Some(v) => env::set_var("DARKMUX_ORCHESTRATOR", v),
                 None => env::remove_var("DARKMUX_ORCHESTRATOR"),
+            }
+        }
+    }
+
+    // ─── AuditFileSink (#163) ────────────────────────────────────────
+
+    #[test]
+    fn audit_hash_excludes_hash_field() {
+        // hash() must NOT include the `hash` field in the input (would
+        // be circular). Two records identical except for `hash` should
+        // produce the same audit_hash_of() output.
+        let base = FlowRecord {
+            ts: "2026-05-17T00:00:00Z".to_string(),
+            level: Level::Info,
+            category: Category::Work,
+            tier: Tier::Operator,
+            stage: Stage::Scope,
+            action: "x".to_string(),
+            handle: "y".to_string(),
+            sprint_id: None,
+            session_id: None,
+            source: None,
+            model: None,
+            reasoning: None,
+            mission_id: None,
+            machine_id: None,
+            orchestrator: None,
+            prev_hash: Some("seed".to_string()),
+            hash: None,
+        };
+        let mut other = base.clone();
+        other.hash = Some("anything".to_string());
+
+        let h1 = audit_hash_of(&base).unwrap();
+        let h2 = audit_hash_of(&other).unwrap();
+        assert_eq!(h1, h2, "hash should not depend on the hash field itself");
+    }
+
+    #[test]
+    fn audit_hash_changes_when_content_changes() {
+        // Sanity: changing ANY chain-bearing field changes the hash.
+        let base = FlowRecord {
+            ts: "2026-05-17T00:00:00Z".to_string(),
+            level: Level::Info,
+            category: Category::Work,
+            tier: Tier::Operator,
+            stage: Stage::Scope,
+            action: "x".to_string(),
+            handle: "y".to_string(),
+            sprint_id: None,
+            session_id: None,
+            source: None,
+            model: None,
+            reasoning: None,
+            mission_id: None,
+            machine_id: None,
+            orchestrator: None,
+            prev_hash: Some("seed".to_string()),
+            hash: None,
+        };
+        let h1 = audit_hash_of(&base).unwrap();
+
+        let mut diff_handle = base.clone();
+        diff_handle.handle = "z".to_string();
+        assert_ne!(audit_hash_of(&diff_handle).unwrap(), h1);
+
+        let mut diff_prev = base.clone();
+        diff_prev.prev_hash = Some("different-seed".to_string());
+        assert_ne!(audit_hash_of(&diff_prev).unwrap(), h1);
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn audit_file_sink_writes_chained_records() {
+        let tmp = TempDir::new().unwrap();
+        let prev_audit = env::var("DARKMUX_AUDIT_DIR").ok();
+        unsafe { env::set_var("DARKMUX_AUDIT_DIR", tmp.path()); }
+
+        let sink = AuditFileSink::new();
+        for i in 0..3u32 {
+            let rec = FlowRecord {
+                ts: format!("2026-05-17T00:00:0{i}Z"),
+                level: Level::Info,
+                category: Category::Work,
+                tier: Tier::Operator,
+                stage: Stage::Scope,
+                action: format!("audit-{i}"),
+                handle: format!("rec-{i}"),
+                sprint_id: None,
+                session_id: None,
+                source: None,
+                model: None,
+                reasoning: None,
+                mission_id: None,
+                machine_id: None,
+                orchestrator: None,
+                prev_hash: None, // sink stamps this
+                hash: None,      // sink stamps this
+            };
+            sink.write(&rec).unwrap();
+        }
+
+        // Walk the file we just produced.
+        let day = day_utc_now();
+        let path = tmp.path().join(format!("{day}.jsonl"));
+        let report = integrity_check_file(&path).unwrap();
+        assert!(report.chain_valid, "chain should validate; reason: {report:?}");
+        assert_eq!(report.records_checked, 3);
+
+        unsafe {
+            match prev_audit {
+                Some(v) => env::set_var("DARKMUX_AUDIT_DIR", v),
+                None => env::remove_var("DARKMUX_AUDIT_DIR"),
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn integrity_check_detects_edited_record() {
+        let tmp = TempDir::new().unwrap();
+        let prev_audit = env::var("DARKMUX_AUDIT_DIR").ok();
+        unsafe { env::set_var("DARKMUX_AUDIT_DIR", tmp.path()); }
+
+        let sink = AuditFileSink::new();
+        for i in 0..3u32 {
+            let rec = FlowRecord {
+                ts: format!("2026-05-17T00:00:0{i}Z"),
+                level: Level::Info,
+                category: Category::Work,
+                tier: Tier::Operator,
+                stage: Stage::Scope,
+                action: format!("audit-{i}"),
+                handle: format!("rec-{i}"),
+                sprint_id: None,
+                session_id: None,
+                source: None,
+                model: None,
+                reasoning: None,
+                mission_id: None,
+                machine_id: None,
+                orchestrator: None,
+                prev_hash: None,
+                hash: None,
+            };
+            sink.write(&rec).unwrap();
+        }
+
+        let day = day_utc_now();
+        let path = tmp.path().join(format!("{day}.jsonl"));
+
+        // Tamper: replace one record's handle inline. The hash should
+        // no longer match the content.
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let tampered = contents.replace("rec-1", "rec-1-EDITED");
+        std::fs::write(&path, tampered).unwrap();
+
+        let report = integrity_check_file(&path).unwrap();
+        assert!(!report.chain_valid, "tampered record should break the chain");
+        assert!(report.break_at_line.is_some());
+
+        unsafe {
+            match prev_audit {
+                Some(v) => env::set_var("DARKMUX_AUDIT_DIR", v),
+                None => env::remove_var("DARKMUX_AUDIT_DIR"),
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn audit_file_sink_recovers_from_header_only_file() {
+        // OS-crash-between-header-and-first-record recovery: a file
+        // containing ONLY the schema header should not break the next
+        // write. The sink should seed the chain from the existing header
+        // (NOT re-emit it) and append the first record successfully.
+        let tmp = TempDir::new().unwrap();
+        let prev_audit = env::var("DARKMUX_AUDIT_DIR").ok();
+        unsafe { env::set_var("DARKMUX_AUDIT_DIR", tmp.path()); }
+
+        let day = day_utc_now();
+        let path = tmp.path().join(format!("{day}.jsonl"));
+        // Simulate the crash state: header line only, no records.
+        let header = schema_header_line().unwrap();
+        std::fs::write(&path, format!("{header}\n")).unwrap();
+
+        let sink = AuditFileSink::new();
+        let rec = FlowRecord {
+            ts: "2026-05-17T00:00:00Z".to_string(),
+            level: Level::Info,
+            category: Category::Work,
+            tier: Tier::Operator,
+            stage: Stage::Scope,
+            action: "post-recovery".to_string(),
+            handle: "h".to_string(),
+            sprint_id: None,
+            session_id: None,
+            source: None,
+            model: None,
+            reasoning: None,
+            mission_id: None,
+            machine_id: None,
+            orchestrator: None,
+            prev_hash: None,
+            hash: None,
+        };
+        sink.write(&rec).expect("recovery should not bail");
+
+        // File should now have: header (line 1) + one record (line 2).
+        let report = integrity_check_file(&path).unwrap();
+        assert!(report.chain_valid, "post-recovery chain should validate: {report:?}");
+        assert_eq!(report.records_checked, 1);
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let line_count = contents.lines().filter(|l| !l.trim().is_empty()).count();
+        assert_eq!(line_count, 2, "should have exactly header + one record");
+
+        unsafe {
+            match prev_audit {
+                Some(v) => env::set_var("DARKMUX_AUDIT_DIR", v),
+                None => env::remove_var("DARKMUX_AUDIT_DIR"),
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn integrity_check_empty_file_passes() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("empty.jsonl");
+        std::fs::write(&path, "").unwrap();
+        let report = integrity_check_file(&path).unwrap();
+        assert!(report.chain_valid);
+        assert_eq!(report.records_checked, 0);
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn audit_file_sink_recovers_chain_across_process_boundaries() {
+        // Two sink instances writing to the same file must produce a
+        // chain that validates. Simulates two CLI sessions (without
+        // actually forking — the flock + filesystem state covers it).
+        let tmp = TempDir::new().unwrap();
+        let prev_audit = env::var("DARKMUX_AUDIT_DIR").ok();
+        unsafe { env::set_var("DARKMUX_AUDIT_DIR", tmp.path()); }
+
+        let sink_a = AuditFileSink::new();
+        let sink_b = AuditFileSink::new();
+
+        let mk = |handle: &str| FlowRecord {
+            ts: "2026-05-17T00:00:00Z".to_string(),
+            level: Level::Info,
+            category: Category::Work,
+            tier: Tier::Operator,
+            stage: Stage::Scope,
+            action: "x".to_string(),
+            handle: handle.to_string(),
+            sprint_id: None,
+            session_id: None,
+            source: None,
+            model: None,
+            reasoning: None,
+            mission_id: None,
+            machine_id: None,
+            orchestrator: None,
+            prev_hash: None,
+            hash: None,
+        };
+
+        sink_a.write(&mk("a1")).unwrap();
+        sink_b.write(&mk("b1")).unwrap();
+        sink_a.write(&mk("a2")).unwrap();
+
+        let day = day_utc_now();
+        let path = tmp.path().join(format!("{day}.jsonl"));
+        let report = integrity_check_file(&path).unwrap();
+        assert!(report.chain_valid, "alternating sinks should still form a valid chain: {report:?}");
+        assert_eq!(report.records_checked, 3);
+
+        unsafe {
+            match prev_audit {
+                Some(v) => env::set_var("DARKMUX_AUDIT_DIR", v),
+                None => env::remove_var("DARKMUX_AUDIT_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    fn audit_dir_respects_env_override() {
+        let prev = std::env::var("DARKMUX_AUDIT_DIR").ok();
+        unsafe { std::env::set_var("DARKMUX_AUDIT_DIR", "/tmp/dm-audit-test"); }
+        assert_eq!(audit_dir(), std::path::PathBuf::from("/tmp/dm-audit-test"));
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_AUDIT_DIR", v),
+                None => std::env::remove_var("DARKMUX_AUDIT_DIR"),
             }
         }
     }
