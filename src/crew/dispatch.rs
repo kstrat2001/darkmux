@@ -1127,6 +1127,9 @@ fn read_openclaw_config(path: &Path) -> Result<Value> {
 ///   - inventory: the `darkmux/<role>` agent entry exists
 ///   - field consistency: systemPromptOverride matches the manifest's `.md`
 ///   - tool palette matches the manifest's `tool_palette`
+///   - **model pin (#182)**: `agents.list[].model` matches the active pin
+///     table's expectation for this role (closes the last silent-fallback
+///     hole — sync-time + doctor-time + dispatch-time enforcement chain)
 fn preflight_check(config: &Value, agent_id: &str, role: &Role, expected_prompt: &str) -> Result<()> {
     let agents_list = config
         .get("agents")
@@ -1196,6 +1199,32 @@ fn preflight_check(config: &Value, agent_id: &str, role: &Role, expected_prompt:
              Run `darkmux crew sync` to reconcile.",
             expected = expected_sorted,
             actual = actual_sorted,
+        );
+    }
+
+    // Model pin match (#182). Sync-time enforcement (#160) writes the
+    // pinned model into `agents.list[].model`; doctor's drift check
+    // catches stale state on operator-explicit doctor run; this check
+    // is the dispatch-time enforcement that closes the last silent-
+    // fallback hole. An operator who edited <crew_root>/role-model-
+    // pins.json (or pulled a new release with updated pins) but didn't
+    // run `darkmux crew sync` would otherwise dispatch to the stale
+    // model with no signal — the whole point of #160's "loud beats
+    // quiet" principle is to make that scenario impossible.
+    //
+    // Pin-table load failures bail with the underlying error so the
+    // operator sees what went wrong with their pin file; we don't
+    // swallow that into a generic warning. Dispatch hot path = strict.
+    let pin_table = crate::crew::pins::load_pins()
+        .context("loading pin table for dispatch-time preflight (#182)")?;
+    let expected_model = pin_table.pin_for(&role.id);
+    let actual_model = entry.get("model").and_then(|m| m.as_str());
+    if actual_model != Some(expected_model) {
+        let actual_display = actual_model.unwrap_or("(no model field)");
+        bail!(
+            "agent `{agent_id}` pinned model drifted from the pin table. \
+             Pin table expects `{expected_model}`; openclaw has `{actual_display}`. \
+             Run `darkmux crew sync` to reconcile, then re-try dispatch."
         );
     }
 
@@ -1811,6 +1840,58 @@ mod tests {
 
     #[test]
     fn preflight_passes_when_config_matches() {
+        // sample_role's id is "code-reviewer" which the shipped pin
+        // table maps to `darkmux:qwen3.6-35b-a3b-turboquant-mlx` — the
+        // config below has to include that model field for the new
+        // dispatch-time pin check (#182) to pass.
+        let role = sample_role();
+        let config = json!({
+            "agents": {
+                "list": [
+                    {
+                        "id": "darkmux/code-reviewer",
+                        "systemPromptOverride": "EXPECTED",
+                        "model": "darkmux:qwen3.6-35b-a3b-turboquant-mlx",
+                        "tools": {"allow": ["read", "exec"], "deny": ["edit", "write"]}
+                    }
+                ]
+            }
+        });
+        assert!(preflight_check(&config, "darkmux/code-reviewer", &role, "EXPECTED").is_ok());
+    }
+
+    #[test]
+    fn preflight_fails_when_pinned_model_drifts() {
+        // sync-time + doctor-time + dispatch-time enforcement chain.
+        // Operator edits pin file, doesn't run sync, then dispatches —
+        // dispatch must bail loudly with the fix-it pointer rather
+        // than silently routing to the stale model. (#182)
+        let role = sample_role();
+        let config = json!({
+            "agents": {
+                "list": [
+                    {
+                        "id": "darkmux/code-reviewer",
+                        "systemPromptOverride": "EXPECTED",
+                        "model": "darkmux:something-stale",
+                        "tools": {"allow": ["read", "exec"], "deny": ["edit", "write"]}
+                    }
+                ]
+            }
+        });
+        let err = preflight_check(&config, "darkmux/code-reviewer", &role, "EXPECTED").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("pinned model drifted"), "got: {msg}");
+        assert!(msg.contains("darkmux:something-stale"), "got: {msg}");
+        assert!(msg.contains("darkmux crew sync"), "got: {msg}");
+    }
+
+    #[test]
+    fn preflight_fails_when_model_field_absent() {
+        // Pre-#160 openclaw.json files written by `darkmux crew sync`
+        // had no `model` field at all (the field was added in #160).
+        // An operator who upgraded darkmux but didn't re-sync would
+        // hit this case — should bail loudly with the same fix-it.
         let role = sample_role();
         let config = json!({
             "agents": {
@@ -1823,7 +1904,11 @@ mod tests {
                 ]
             }
         });
-        assert!(preflight_check(&config, "darkmux/code-reviewer", &role, "EXPECTED").is_ok());
+        let err = preflight_check(&config, "darkmux/code-reviewer", &role, "EXPECTED").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("pinned model drifted"), "got: {msg}");
+        assert!(msg.contains("(no model field)"), "got: {msg}");
+        assert!(msg.contains("darkmux crew sync"), "got: {msg}");
     }
 
     #[test]
