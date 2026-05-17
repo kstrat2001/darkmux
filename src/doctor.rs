@@ -96,9 +96,148 @@ pub fn run() -> DoctorReport {
         check_audit_integrity(),
         check_recommendation_drift(),
         check_recommended_profile_name_not_shadowed(),
+        check_role_model_pin_drift(),
     ];
     checks.extend(eureka_checks());
     DoctorReport { checks }
+}
+
+/// Warn when openclaw's `agents.list[].model` for each `darkmux/<role>`
+/// agent doesn't match the active pin table. Drift means `darkmux crew
+/// sync` hasn't been run since the pin table changed (or the operator
+/// hand-edited openclaw.json). Recovery is one command: `darkmux crew
+/// sync`. (#160)
+fn check_role_model_pin_drift() -> Check {
+    let pins = match crate::crew::pins::load_pins() {
+        Ok(t) => t,
+        Err(e) => {
+            return Check {
+                name: "role-model pin drift".into(),
+                status: Status::Warn,
+                message: format!("could not load pin table: {e:#}"),
+                hint: Some(
+                    "Check the user override at <crew_root>/role-model-pins.json parses, or remove it to fall back to the embedded default."
+                        .into(),
+                ),
+            };
+        }
+    };
+
+    // Resolve through dispatch::default_openclaw_config so the doctor
+    // reads the same path sync writes to — respects DARKMUX_OPENCLAW_CONFIG.
+    // Without this, an operator using the env override sees doctor
+    // pass-silently while sync is actually writing to a different file.
+    let openclaw_path = crate::crew::dispatch::default_openclaw_config();
+    if !openclaw_path.exists() {
+        return Check {
+            name: "role-model pin drift".into(),
+            status: Status::Pass,
+            message: format!(
+                "(no openclaw config at {} — skipping; run `darkmux crew sync` once openclaw is configured)",
+                openclaw_path.display()
+            ),
+            hint: None,
+        };
+    }
+    let raw = match std::fs::read_to_string(&openclaw_path) {
+        Ok(r) => r,
+        Err(_) => {
+            return Check {
+                name: "role-model pin drift".into(),
+                status: Status::Warn,
+                message: format!("could not read {}", openclaw_path.display()),
+                hint: None,
+            };
+        }
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => {
+            return Check {
+                name: "role-model pin drift".into(),
+                status: Status::Warn,
+                message: "openclaw.json failed to parse — skipping".into(),
+                hint: None,
+            };
+        }
+    };
+
+    let Some(agents) = parsed
+        .get("agents")
+        .and_then(|a| a.get("list"))
+        .and_then(|l| l.as_array())
+    else {
+        return Check {
+            name: "role-model pin drift".into(),
+            status: Status::Pass,
+            message: "(no agents.list array in openclaw.json)".into(),
+            hint: None,
+        };
+    };
+
+    // Collect drift: (role_id, expected_pin, actual_value_or_None) per
+    // darkmux/-namespaced agent whose model field doesn't match the pin.
+    let mut drifts: Vec<(String, String, Option<String>)> = Vec::new();
+    let mut checked: u32 = 0;
+    for agent in agents {
+        let id = agent.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let Some(role_id) = id.strip_prefix("darkmux/") else { continue; };
+        checked += 1;
+        let expected = pins.pin_for(role_id);
+        let actual = agent
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let matches = actual.as_deref() == Some(expected);
+        if !matches {
+            drifts.push((role_id.to_string(), expected.to_string(), actual));
+        }
+    }
+
+    if checked == 0 {
+        return Check {
+            name: "role-model pin drift".into(),
+            status: Status::Pass,
+            message: "(no darkmux/* agents in openclaw.json — run `darkmux crew sync` to register them)".into(),
+            hint: None,
+        };
+    }
+
+    if drifts.is_empty() {
+        Check {
+            name: "role-model pin drift".into(),
+            status: Status::Pass,
+            message: format!("{checked} darkmux/* agent(s) pinned correctly"),
+            hint: None,
+        }
+    } else {
+        let summary = drifts
+            .iter()
+            .take(3)
+            .map(|(role, expected, actual)| {
+                let actual_str = actual.as_deref().unwrap_or("(no model field)");
+                format!("`{role}` expected `{expected}` got `{actual_str}`")
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let more = if drifts.len() > 3 {
+            format!(" (+{} more)", drifts.len() - 3)
+        } else {
+            String::new()
+        };
+        Check {
+            name: "role-model pin drift".into(),
+            status: Status::Warn,
+            message: format!(
+                "{} of {checked} darkmux/* agent(s) drift from pin table: {summary}{more}",
+                drifts.len()
+            ),
+            hint: Some(
+                "Run `darkmux crew sync` to re-write the agent entries with their pinned models. The pin table lives at templates/builtin/crew/role-model-pins.json (or <crew_root>/role-model-pins.json for operator overrides)."
+                    .into(),
+            ),
+        }
+    }
 }
 
 /// Walk the audit directory and roll up the integrity-check results
@@ -1926,15 +2065,15 @@ mod tests {
     #[test]
     fn run_returns_static_plus_eureka_checks() {
         let r = run();
-        // 20 baseline checks (incl. runtime version + load projection +
+        // 21 baseline checks (incl. runtime version + load projection +
         // daemon reachable + darkmux-version-vs-latest-release [#13] +
         // crew-role-prompt-coverage [#141] + flow-sink-health [#170] +
         // machine_id + orchestrator [#167] + audit-integrity [#163] +
-        // recommendation-drift + recommended-profile-not-shadowed [#159])
-        // + one per active eureka rule. Every check should appear
-        // regardless of environment — even if the underlying probe
-        // couldn't read state.
-        let expected = 20 + crate::eureka::all_rules().len();
+        // recommendation-drift + recommended-profile-not-shadowed [#159] +
+        // role-model-pin-drift [#160]) + one per active eureka rule.
+        // Every check should appear regardless of environment — even if
+        // the underlying probe couldn't read state.
+        let expected = 21 + crate::eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

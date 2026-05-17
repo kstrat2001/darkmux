@@ -43,8 +43,9 @@ const LICENSED_ADJACENT_ROLES: &[&str] = &[
 ];
 
 /// Default openclaw config path. `DARKMUX_OPENCLAW_CONFIG` env var overrides
-/// (e.g., for tests).
-fn default_openclaw_config() -> PathBuf {
+/// (e.g., for tests). Visible to other crates so the doctor pin-drift
+/// check (#160) reads from the same path sync writes to.
+pub(crate) fn default_openclaw_config() -> PathBuf {
     if let Ok(p) = std::env::var("DARKMUX_OPENCLAW_CONFIG") {
         let trimmed = p.trim();
         if !trimmed.is_empty() {
@@ -1327,7 +1328,18 @@ fn build_agent_entry(role: &Role, prompt: &str, agent_dir: &Path, workspace: &Pa
             Value::Array(role.tool_palette.deny.iter().cloned().map(Value::String).collect()),
         );
     }
-    json!({
+
+    // Per-role model pin (#160). Reads the active pin table (user-dir
+    // override → embedded default) and emits `agents.list[].model` so
+    // openclaw routes the dispatch to the hired model regardless of
+    // what's ambient-loaded. Pin-table read failures degrade to NO
+    // model field — agent loses pin protection but the sync itself
+    // doesn't fail; doctor's pin-drift check surfaces the gap.
+    let pinned_model = crate::crew::pins::load_pins()
+        .ok()
+        .map(|t| t.pin_for(&role.id).to_string());
+
+    let mut entry = json!({
         "id": agent_id_for(&role.id),
         "name": role.id,
         "agentDir": agent_dir.display().to_string(),
@@ -1335,7 +1347,13 @@ fn build_agent_entry(role: &Role, prompt: &str, agent_dir: &Path, workspace: &Pa
         "systemPromptOverride": prompt,
         "tools": Value::Object(tools),
         "skills": []
-    })
+    });
+    if let Some(model) = pinned_model {
+        if let Value::Object(map) = &mut entry {
+            map.insert("model".to_string(), Value::String(model));
+        }
+    }
+    entry
 }
 
 #[cfg(test)]

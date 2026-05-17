@@ -1,0 +1,11 @@
+{
+  "rationale": "Bake-off 2026-05-13 (kstrat2001/darkmux#45 closure). D (qwen3.6-35b-a3b-turboquant-mlx) hired for routine coding — won 4/4 paired rounds. B (qwen3-coder-next-mlx) reserved for single-shot prose quality (voice-editor was the Pair 2 Taste 5/5 standout). A (qwen3.5-122b-a10b) reserved as heavy-reasoning defensive — not pinned to any role; operators escalate manually. mission-compiler pinned to the 4B admin per CLAUDE.md Beat 21 (admin-agent role family — bounded structuring work, throughput matters). Non-SWE roles default to D until per-role bake-offs land for them.",
+  "bake_off_url": "https://github.com/kstrat2001/darkmux/issues/45",
+  "default_pin": "darkmux:qwen3.6-35b-a3b-turboquant-mlx",
+  "per_role": {
+    "voice-editor": "darkmux:qwen3-coder-next-mlx",
+    "code-reviewer": "darkmux:qwen3.6-35b-a3b-turboquant-mlx",
+    "coder": "darkmux:qwen3.6-35b-a3b-turboquant-mlx",
+    "mission-compiler": "darkmux:qwen3-4b-instruct-2507"
+  }
+}
