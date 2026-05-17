@@ -780,23 +780,36 @@ mod tests {
 
     // ─── is_daemon_reachable / nudge_if_daemon_unreachable (#104 S3) ─────
 
-    /// Test the actual return-value contract by binding a transient
-    /// listener (so its port IS reachable) and probing both that port
-    /// and a definitely-closed port. Doesn't depend on operator's
-    /// running daemon state at 127.0.0.1:8765.
+    /// Listening port reports reachable. Bound on an ephemeral
+    /// loopback port so the assertion is deterministic.
+    ///
+    /// Split into a separate test (formerly one combined assertion with
+    /// a drop-and-reprobe second leg, #188) because the drop+reprobe
+    /// pattern raced macOS TIME_WAIT semantics: the kernel briefly
+    /// kept the just-released port in a state where `connect_timeout`
+    /// could still report reachable. Disjoint resources for each
+    /// assertion eliminates the race.
     #[test]
-    fn is_addr_reachable_returns_true_for_listening_port_false_for_closed() {
+    fn is_addr_reachable_returns_true_for_listening_port() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
         let open_addr = listener.local_addr().expect("local_addr");
-
-        // Open port: reachable.
         assert!(is_addr_reachable(open_addr, std::time::Duration::from_millis(PROBE_TIMEOUT_MS)));
+        // Listener drops at end of scope — no second probe, no race.
+    }
 
-        // Close it; same address should now be unreachable.
-        drop(listener);
-        // OS may take a moment to release; the connect_timeout still
-        // either reports refused (fast) or times out within budget.
-        assert!(!is_addr_reachable(open_addr, std::time::Duration::from_millis(PROBE_TIMEOUT_MS)));
+    /// Closed port reports unreachable. Uses port 1 (tcpmux, reserved
+    /// in IANA's well-known range; not bound by any process on a normal
+    /// system). The connect attempt gets ECONNREFUSED essentially
+    /// instantly, well under PROBE_TIMEOUT_MS.
+    ///
+    /// Picked deliberately over: (a) drop-and-reprobe an ephemeral —
+    /// races TIME_WAIT (the #188 flake); (b) an arbitrary high port —
+    /// non-zero collision probability with whatever happens to be
+    /// running on the test machine.
+    #[test]
+    fn is_addr_reachable_returns_false_for_closed_port() {
+        let closed: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+        assert!(!is_addr_reachable(closed, std::time::Duration::from_millis(PROBE_TIMEOUT_MS)));
     }
 
     /// Lock the probe budget so a future timeout-doubling slip doesn't
