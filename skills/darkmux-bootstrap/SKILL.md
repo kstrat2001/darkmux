@@ -1,0 +1,161 @@
+---
+name: darkmux-bootstrap
+description: First-time darkmux setup walkthrough. Detects the operator's hardware tier, looks up the bake-off-validated recommendation, surfaces what needs downloading, helps confirm the profile registry + orchestrator declaration, and validates end state with `darkmux doctor`. Read + propose pattern — operator runs the commands; the skill confirms each step took effect. Run this once on a fresh machine, or any time `darkmux doctor` surfaces structural drift.
+user_invocable: true
+allowed-tools: "Bash(darkmux:*),Bash(lms:*),Read"
+---
+
+# Darkmux bootstrap
+
+This skill walks an operator through getting a fresh darkmux installation to a clean state on their machine. It works alongside the operator's frontier session: the skill reads state, names what's missing, and asks the operator before they run any mutating command. **Operator-sovereignty:** every change runs at the operator's hand, not the skill's.
+
+The skill assumes darkmux is installed (`darkmux --version` works). If not, point the operator at the Quick Start in the README.
+
+## Step 0 — Confirm darkmux + LMStudio are alive
+
+```bash
+darkmux --version
+lms --version
+darkmux doctor | head -40
+```
+
+If any of the three errors:
+
+- `darkmux --version`: stop the skill. Re-run after installing via `cargo install --path .` from the source tree (see README Quick Start).
+- `lms --version`: LMStudio CLI isn't on PATH. Tell the operator to install LMStudio (https://lmstudio.ai/) and verify `lms ls` works before re-running this skill.
+- `darkmux doctor` errors before producing any output: the binary built but env is misconfigured. Ask the operator to share the error and pause the skill.
+
+**Report to operator**: which of the three are alive, which are missing. Don't continue past this step unless `darkmux doctor` returns at least a partial report.
+
+## Step 1 — Detect hardware tier + look up the bake-off recommendation
+
+```bash
+darkmux doctor 2>&1 | grep -E "platform|machine_id|recommendation drift"
+```
+
+Look for:
+- `platform` line names the operator's hardware tier (`m-series-128`, `m-series-64`, `m-series-32`, `generic`)
+- `machine_id` line names the operator's machine identifier
+- `recommendation drift` line names what darkmux thinks should be loaded for this tier
+
+Three outcomes:
+
+**A. Tier is `m-series-128` (validated bake-off recommendation).** The skill knows what to recommend. Report to operator:
+> Your tier is `m-series-128`. The bake-off (#45) hired **D = `qwen3.6-35b-a3b-turboquant-mlx`** for routine coding, with a **4B compactor** (`qwen3-4b-instruct-2507`). I'll walk through making sure both are downloaded + profile-registered.
+
+**B. Tier is `m-series-64` / `m-series-32` / `generic` (no validated recommendation).** Tell the operator:
+> Your tier is `<tier>`. darkmux hasn't run a bake-off on this hardware class yet (tracked in #117). I'll help you set up *something* sensible, but the model selection is yours — you'll be picking from what LMStudio offers, not from a bake-off-validated list.
+>
+> Two ways forward:
+> - **Scan + suggest**: run `/darkmux-scan-and-suggest` (sibling skill) — it walks through your `lms ls` catalog and proposes profile shapes for each model you have.
+> - **Draft a profile manually**: pick a model from `lms ls`, then `darkmux profile draft <name> -m <model_key> -t mid` to generate a starter profile JSON. Copy the output into `~/.darkmux/profiles.json` and tune.
+
+**C. Doctor errors on the platform check.** Stop and surface the error.
+
+Continue with the operator's tier.
+
+## Step 2 — Verify the recommended models are downloaded (validated tiers only)
+
+For validated tiers, check whether the bake-off models are on disk:
+
+```bash
+lms ls | head -50
+```
+
+If the recommended models are missing, propose the one-command fix:
+> The recommendation registry says you need these models downloaded:
+> - `qwen3.6-35b-a3b-turboquant-mlx` (primary)
+> - `qwen3-4b-instruct-2507` (compactor)
+>
+> Want me to walk you through downloading them? The command is `darkmux model pull-recommended` — it skips already-downloaded models, so safe to run even if one of them is already present.
+
+**Wait for operator confirmation.** If they say yes, ask them to run:
+
+```bash
+darkmux model pull-recommended
+```
+
+This may take several minutes per model (multi-GB downloads). After it finishes, re-run `lms ls` to confirm the models appear.
+
+For non-validated tiers, skip this step; tell the operator to download whatever models they want via LMStudio.
+
+## Step 3 — Profile registry
+
+Check whether `~/.darkmux/profiles.json` has profiles:
+
+```bash
+darkmux profiles 2>&1 | head -20
+```
+
+Outcomes:
+
+**A. Profiles already exist.** Confirm with the operator that the relevant profile (`balanced` for `m-series-128`, or their custom one) is present. Move on.
+
+**B. No profiles file.** The operator hasn't run `darkmux init` yet. Propose:
+> Your profile registry is empty. The default `darkmux init` would create a starter `~/.darkmux/profiles.json` with placeholder profiles. Want to run it?
+>
+> ```bash
+> darkmux init
+> ```
+
+**C. Profiles file exists but doesn't include the recommended one.** For `m-series-128`, the recommendation expects a `balanced` profile. If absent, propose `darkmux profile draft balanced -m qwen3.6-35b-a3b-turboquant-mlx` and ask the operator to add it.
+
+## Step 4 — Validate the swap path
+
+Once profiles + models are in place, ask the operator to run:
+
+```bash
+darkmux swap recommended --dry-run
+```
+
+This resolves the active hardware tier → validated profile → pre-flight-checks all models are downloaded → shows what the swap would do. **No actual model loads happen with `--dry-run`.**
+
+Three outcomes:
+
+**A. Dry-run succeeds.** The recommendation path is wired up. Ask if the operator wants to swap for real:
+> Looks clean. Drop the `--dry-run` flag to actually load the recommended models?
+
+**B. Dry-run errors with rationale.** A non-validated tier — surface the rationale verbatim, ask the operator to pick a profile manually with `darkmux swap <name>`.
+
+**C. Dry-run errors with missing models.** Back to Step 2.
+
+## Step 5 — Optional: declare the orchestrator
+
+Flow records carry an `orchestrator` field that names the frontier session driving the work (e.g., `claude-opus-4-7`). Declaring it gives provenance to every flow record. Propose:
+
+> Want flow records to carry the orchestrator name? It's operator-explicit by design — no auto-detection. Export this in your shell rc:
+>
+> ```bash
+> export DARKMUX_ORCHESTRATOR=claude-opus-4-7
+> ```
+>
+> Replace `claude-opus-4-7` with the model driving this session. Doctor will surface a warning until it's declared.
+
+## Step 6 — Optional: enable the compliance substrates
+
+Two opt-in environment variables enable the heavier substrates:
+
+- `DARKMUX_AUDIT_DIR` → enables AuditFileSink (hash-chained tamper-evident log; #163)
+- `DARKMUX_REDIS_URL` → enables RedisSink (coordination substrate for cross-machine work; #162 Phase 3)
+
+These are out of scope for first-time bootstrap. **Sibling skills are planned but not yet shipped:**
+
+- `/darkmux-enable-audit` — walks through compliance posture (tracked in #177; not yet implemented)
+- `/darkmux-enable-redis` — walks through fleet coordination (tracked in #178; not yet implemented)
+
+For now, point the operator at the README's environment-variables table and the issue links above; tell them to come back to this skill once those ship. Don't suggest invoking the sibling skills yet — they won't be found.
+
+## Step 7 — Final validation
+
+```bash
+darkmux doctor
+```
+
+Walk through the output with the operator. Each `⚠` or `✗` line should now have a clear next-step. If everything is `✓` or `ⓘ`, the bootstrap is complete — confirm with the operator and let them get to work.
+
+**Don't auto-mutate state on `⚠` lines.** Surface the hint, propose the command, let the operator decide. This is the same posture as every other step.
+
+## Closing
+
+Report the final state to the operator in one sentence:
+> Bootstrap complete — your machine is on tier `<tier>`, profile `<active>`, with `<N>` doctor checks green and `<M>` warnings remaining. Run `darkmux doctor` any time to re-verify, or `/darkmux-status` for a quick look at what's loaded.

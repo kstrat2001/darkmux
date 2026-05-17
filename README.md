@@ -99,7 +99,7 @@ darkmux notebook draft <run-id>   # ask the agent to author an EE-lab-style note
 darkmux mission propose --from-stdin   # AI-built-in: vague intent → structured Mission + Sprint JSONs
 ```
 
-Using Claude Code? Run `darkmux init --with-claude-md ~/.claude/CLAUDE.md` to install the skills *and* teach Claude Code about darkmux at session start.
+Using Claude Code? Run `darkmux init --with-claude-md ~/.claude/CLAUDE.md` to install the skills *and* teach Claude Code about darkmux at session start. Then run **`/darkmux-bootstrap`** in your Claude Code session — it walks through detecting your hardware tier, downloading the bake-off-validated models, registering profiles, and validating the end state. Operator-sovereign: the skill reads + proposes; you run the commands.
 
 ### Updating darkmux
 
