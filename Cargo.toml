@@ -35,6 +35,17 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # the bigger dep surface (async runtimes etc.) we don't need.
 redis = { version = "0.27", default-features = false, features = ["streams"] }
 
+# #163 — AuditFileSink: hash-chained tamper-evident sink.
+# BLAKE3: fast cryptographic hash for the per-record chain. Audited
+# reference impl; ~120 lines of public API. Used here for content
+# hashing — the chain check is a linear walk recomputing each hash
+# and comparing against the stored value.
+blake3 = "1.5"
+# libc: flock(2) for cross-process locking on the per-day audit file.
+# Already a transitive dep (via tokio); declared explicitly here so
+# the unsafe blocks in src/flow.rs read against a known direct interface.
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3.10"
 assert_cmd = "2.0"

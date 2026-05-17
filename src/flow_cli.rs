@@ -120,13 +120,32 @@ pub enum FlowCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Walk every audit file under `DARKMUX_AUDIT_DIR` (or the default
+    /// `~/.darkmux/audit/`), recompute the hash chain, and report the
+    /// first divergence per file. Compliance verb (#163): proves the
+    /// AuditFileSink output hasn't been edited since write. Exits with
+    /// status 2 when any chain is broken so CI/cron can flag tampering.
+    #[command(name = "integrity-check")]
+    IntegrityCheck {
+        /// Restrict the walk to a single file path. Useful when the
+        /// operator just wants to check one day's audit log rather
+        /// than the entire directory.
+        #[arg(long)]
+        path: Option<std::path::PathBuf>,
+        /// Emit machine-readable JSON instead of the human-formatted
+        /// summary.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub fn run(cmd: FlowCmd) -> Result<()> {
-    // Status is a read verb (doesn't emit a record). Handle it ahead of
-    // build_record so the latter only sees write verbs.
-    if let FlowCmd::Status { json } = cmd {
-        return print_status(json);
+    // Read verbs are intercepted ahead of build_record so the latter
+    // only sees write verbs.
+    match cmd {
+        FlowCmd::Status { json } => return print_status(json),
+        FlowCmd::IntegrityCheck { path, json } => return print_integrity_check(path, json),
+        _ => {}
     }
     let record = build_record(cmd);
     flow::record(record).context("writing flow record")
@@ -142,6 +161,47 @@ fn print_status(json: bool) -> Result<()> {
         println!("{s}");
     } else {
         print!("{}", flow::format_status_human(&status));
+    }
+    Ok(())
+}
+
+/// Render `darkmux flow integrity-check` to stdout. Walks the audit dir
+/// (or a single `--path`), recomputes each file's hash chain, reports
+/// pass/break per file. Exits with status 2 when any chain is broken so
+/// CI / cron / monitoring can flag tampering.
+fn print_integrity_check(path: Option<std::path::PathBuf>, json: bool) -> Result<()> {
+    let reports = if let Some(p) = path {
+        vec![flow::integrity_check_file(&p)?]
+    } else {
+        flow::integrity_check_all()?
+    };
+
+    if json {
+        let s = serde_json::to_string_pretty(&reports)
+            .context("serializing integrity reports to JSON")?;
+        println!("{s}");
+    } else if reports.is_empty() {
+        println!(
+            "darkmux flow integrity-check — no audit files under {}",
+            flow::audit_dir().display()
+        );
+    } else {
+        for r in &reports {
+            let status = if r.chain_valid { "✓ valid" } else { "✗ BROKEN" };
+            println!("{status}  {}  ({} record(s))", r.path, r.records_checked);
+            if !r.chain_valid {
+                if let Some(line) = r.break_at_line {
+                    println!("       chain break at line {line}");
+                }
+                if let Some(reason) = r.break_reason.as_ref() {
+                    println!("       reason: {reason}");
+                }
+            }
+        }
+    }
+
+    if reports.iter().any(|r| !r.chain_valid) {
+        std::process::exit(2);
     }
     Ok(())
 }
@@ -165,6 +225,8 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             mission_id: None,
             machine_id: None,
             orchestrator: None,
+            prev_hash: None,
+            hash: None,
         },
         FlowCmd::Catch { text, sprint_id, session_id, source } => FlowRecord {
             ts,
@@ -182,6 +244,8 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             mission_id: None,
             machine_id: None,
             orchestrator: None,
+            prev_hash: None,
+            hash: None,
         },
         FlowCmd::Record {
             level,
@@ -211,6 +275,8 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             mission_id,
             machine_id: None,
             orchestrator: None,
+            prev_hash: None,
+            hash: None,
         },
         FlowCmd::TierDecision {
             decision,
@@ -243,11 +309,16 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             mission_id,
             machine_id: None,
             orchestrator: None,
+            prev_hash: None,
+            hash: None,
         },
-        // Status is a read verb — intercepted by `run` before build_record.
+        // Read verbs are intercepted by `run` before build_record.
         // Reaching here would mean run() was bypassed; assert loudly.
         FlowCmd::Status { .. } => unreachable!(
             "FlowCmd::Status is a read verb and must be handled by run() before build_record"
+        ),
+        FlowCmd::IntegrityCheck { .. } => unreachable!(
+            "FlowCmd::IntegrityCheck is a read verb and must be handled by run() before build_record"
         ),
     }
 }
