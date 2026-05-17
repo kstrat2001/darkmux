@@ -387,12 +387,12 @@ fn audit_seed_hash(header_line: &str) -> String {
 }
 
 /// Append `record` to the audit file at `path`, populating `prev_hash`
-/// + `hash` from the existing chain. Cross-process safe via `flock(2)`:
-/// concurrent CLI sessions writing the same file serialize correctly.
+/// and `hash` from the existing chain. Cross-process safe via `flock(2)`
+/// so concurrent CLI sessions writing the same file serialize correctly.
 /// POSIX-only.
-#[cfg(unix)]
 ///
 /// Atomicity model:
+///
 ///   1. Acquire exclusive flock on the file (creating it if absent).
 ///   2. Read the last record (or the schema header for an empty file)
 ///      to recover the chain's current tail hash.
@@ -403,6 +403,7 @@ fn audit_seed_hash(header_line: &str) -> String {
 /// First-write-into-new-file emits the schema header AND the first
 /// record under the same lock so an interrupt can't leave a header-only
 /// file with no chain seed visible.
+#[cfg(unix)]
 fn audit_record_at(record: &FlowRecord, path: &Path) -> Result<()> {
     use std::os::unix::io::AsRawFd;
     if let Some(parent) = path.parent() {
