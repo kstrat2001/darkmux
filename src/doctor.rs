@@ -282,8 +282,13 @@ fn check_audit_integrity() -> Check {
         Check {
             name: "audit integrity".into(),
             status: Status::Pass,
+            // "verified at this check" makes the point-in-time nature
+            // explicit — bare "verified" reads as a stronger claim than
+            // the implementation supports (#189). Verification is per
+            // `flow integrity-check` walk, not a continuous property
+            // of the artifact.
             message: format!(
-                "{} file(s), {total_records} record(s), all chains verified",
+                "{} file(s), {total_records} record(s), all chains pass the integrity walk at this check",
                 reports.len()
             ),
             hint: None,
