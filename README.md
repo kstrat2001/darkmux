@@ -1,8 +1,18 @@
 # darkmux
 
-**[darkmux.com](https://darkmux.com) · Build a diverse local-AI team that complements frontier models — not competes with them.**
+**[darkmux.com](https://darkmux.com) · Turn your frontier AI assistant into an engagement-aware orchestrator that distributes AI work across your machines.**
 
-**AI-first local-AI orchestrator** — uses local-AI internally to manage your local-AI workflows. Task-class-aware profile multiplexing, admin-agent dispatch verbs (like `mission propose`), and a mission/sprint lifecycle, on top of LMStudio (and Ollama / llama.cpp via the same OpenAI-compatible surface). Developed on Apple Silicon.
+darkmux is the substrate layer — profiles per role, missions per engagement, audit per record, coordination across the fleet. Your frontier holds the engagement context; darkmux gives it the local-AI fleet to operate on.
+
+Built for operators who need to see what their AI fleet did, when, and why.
+
+- 🔒 **Tamper-evident audit trail** — every dispatch, decision, and review captured in a hash-chained per-machine log. Any post-hoc edit to the chain is detectable via `darkmux flow integrity-check`.
+- 🤝 **Engagement-aware coordination** — sessions running on different machines share a flow stream, so two Claude Code sessions on two laptops compose into one fleet view rather than two siloed runs.
+- 🎯 **Methodology-driven role specialization** — per-role models selected through documented bake-off methodology; evaluation criteria recorded before the comparison runs.
+- 🔧 **Operator sovereignty by design** — defaults are overridable, writes are auditable, suggestions are explainable.
+- 📊 **Reproducible benchmarks** — `darkmux lab run <workload>` captures timing + trajectory + verify outcome, so empirical claims in the article series can be re-run by anyone with the binary.
+
+**AI-first local-AI orchestrator** — darkmux uses local-AI internally to manage your local-AI workflows. Task-class-aware profile multiplexing, admin-agent dispatch verbs (like `mission propose`), and a mission/sprint lifecycle, on top of LMStudio. Developed on Apple Silicon. **Assumes a frontier orchestrator** (Claude Code) — the engagement work happens in the frontier session.
 
 > **Heads up — read before running.**
 > darkmux orchestrates AI tools that execute on your machine. It modifies your local config files (`~/.openclaw/openclaw.json`), sends commands to your local LMStudio server, and — in lab mode — runs AI-generated code in a working directory that is **not a security sandbox**. AI agents can behave unexpectedly. Use it on a machine where that is acceptable. Performance numbers in this README and in the accompanying articles are measured on the author's hardware (M5 Max, 128 GB) and will differ on yours. See [DISCLAIMER.md](./DISCLAIMER.md) for details. MIT licensed, no warranty, use at your own risk.
@@ -296,3 +306,7 @@ MIT
 ## Author
 
 Kain Osterholt — [@DarklyEnergized](https://x.com/DarklyEnergized) — Darkly Energized LLC
+
+---
+
+*Claude, Claude Code are trademarks of Anthropic PBC. LMStudio is a trademark of Element Labs Inc. darkmux is not affiliated with either.*
