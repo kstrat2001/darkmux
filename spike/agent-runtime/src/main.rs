@@ -22,6 +22,7 @@ use std::env;
 use std::path::Path;
 use std::process::ExitCode;
 
+mod compaction;
 mod lmstudio;
 mod loop_runner;
 mod tools;
@@ -230,6 +231,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     println!();
     println!("--- metrics ---");
     println!("turns:             {}", outcome.turns);
+    println!("compactions:       {}", outcome.compactions);
     println!("prompt tokens:     {}", outcome.total_prompt_tokens);
     println!("completion tokens: {}", outcome.total_completion_tokens);
     println!("total messages:    {}", outcome.messages.len());

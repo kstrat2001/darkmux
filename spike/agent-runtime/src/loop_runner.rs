@@ -2,23 +2,22 @@
 //!
 //! Sends the conversation to LMStudio. If the model returns a
 //! `tool_calls` finish_reason, dispatches each tool, appends results,
-//! and re-sends. Loops until `stop`, or fails loudly on `length` /
-//! unexpected outcomes.
+//! checks whether the context budget needs compaction, and re-sends.
+//! Loops until `stop`, or fails loudly on `length` / unexpected outcomes.
 //!
-//! Deliberately omitted in Phase 2 (will be designed in Phase 6+ if the
-//! spike validates):
+//! Phase 6 added compaction via `crate::compaction`: token-count-aware
+//! middle-replace strategy that summarizes via a companion model.
 //!
-//! - No compaction. If a dispatch exceeds the model's `n_ctx` we fail
-//!   loudly; the runtime doesn't quietly summarize-and-retry.
-//! - No streaming. Single-shot completions only — the loop reads the
-//!   whole response before deciding what to do.
+//! Still omitted (Phase 7+ if measurements show they're needed):
+//!
+//! - No streaming. Single-shot completions only.
 //! - No retries on transient failures. A network blip aborts the loop.
-//!   Operator-visible failure is the right answer for spike work.
-//! - No turn budget cap. A model that ping-pongs in tool-calls forever
-//!   would loop forever; Phase 4 adds a `max_turns` guard.
+//! - No per-profile threshold derivation (compaction threshold is env-
+//!   tunable but global, not derived from active darkmux profile).
 
 use anyhow::{anyhow, Result};
 
+use crate::compaction;
 use crate::lmstudio::{ChatRequest, LmStudioClient, Message};
 use crate::tools::{dispatch, Tool};
 
@@ -46,6 +45,10 @@ pub struct LoopOutcome {
 
     /// Total completion tokens summed across all calls.
     pub total_completion_tokens: u32,
+
+    /// Number of compaction events that fired during the loop.
+    /// Phase 6: middle-replace via the companion compactor model.
+    pub compactions: u32,
 }
 
 /// Run the tool-call loop to completion.
@@ -61,6 +64,8 @@ pub fn run(
     let mut turns: u32 = 0;
     let mut total_prompt_tokens: u32 = 0;
     let mut total_completion_tokens: u32 = 0;
+    let mut compactions: u32 = 0;
+    let mut latest_prompt_tokens: u32 = 0;
 
     loop {
         if turns >= MAX_TURNS {
@@ -86,6 +91,7 @@ pub fn run(
             total_prompt_tokens = total_prompt_tokens.saturating_add(usage.prompt_tokens);
             total_completion_tokens =
                 total_completion_tokens.saturating_add(usage.completion_tokens);
+            latest_prompt_tokens = usage.prompt_tokens;
         }
 
         // Take the first choice — LMStudio's OpenAI-compatible endpoint
@@ -112,6 +118,7 @@ pub fn run(
                     turns,
                     total_prompt_tokens,
                     total_completion_tokens,
+                    compactions,
                 });
             }
             "tool_calls" => {
@@ -138,19 +145,32 @@ pub fn run(
                     ));
                 }
 
+                // Phase 6: check whether the most recent prompt's
+                // token count crossed the compaction threshold, AND
+                // whether the conversation is long enough to compact.
+                // If so, compact BEFORE the next chat() call so the
+                // next request sees a smaller message thread.
+                if compaction::needs_compaction(latest_prompt_tokens, messages.len()) {
+                    compactions = compactions.saturating_add(1);
+                    compaction::compact(client, &mut messages, compactions)?;
+                }
+
                 // Loop back and call chat() again.
                 continue;
             }
             "length" => {
                 return Err(anyhow!(
                     "model returned finish_reason=length — context overflow. \
-                     Phase 2 fails loudly here; Phase 6+ will add compaction."
+                     Compaction fires before the next call when prompt_tokens \
+                     crosses DARKMUX_AGENT_COMPACT_THRESHOLD_TOKENS, but the \
+                     current response itself was already cut off mid-generation. \
+                     Workload may need a smaller threshold or a larger n_ctx."
                 ));
             }
             other => {
                 return Err(anyhow!(
-                    "unexpected finish_reason: {other}. \
-                     Phase 2 doesn't know how to handle this; aborting."
+                    "unexpected finish_reason: {other} — runtime doesn't know \
+                     how to handle this. Aborting."
                 ));
             }
         }
