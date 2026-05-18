@@ -302,6 +302,14 @@ enum CrewCmd {
         /// Skip the pre-flight checks. Use only for debugging.
         #[arg(long, hide = true)]
         skip_preflight: bool,
+        /// Which agent runtime to dispatch through. **Phase 4 spike** —
+        /// the default `openclaw` path is the shipped production
+        /// runtime; `internal` opts into the spike runtime at
+        /// `spike/agent-runtime/` which runs the agent in an Alpine
+        /// docker container with workspace-rooted path enforcement.
+        /// See spike README for current scope + limitations.
+        #[arg(long, default_value = "openclaw")]
+        runtime: String,
     },
     /// Reconcile openclaw's `agents.list[]` with the crew role manifests.
     /// For every role with both a JSON manifest and a `.md` prompt, ensures
@@ -1137,7 +1145,7 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
     match sub {
         CrewCmd::List => crew::cli::crew_list(),
         CrewCmd::Show { id } => crew::cli::crew_show(&id),
-        CrewCmd::Dispatch { role, message, deliver, session_id, timeout, watch, workdir, sprint_id, skip_preflight } => {
+        CrewCmd::Dispatch { role, message, deliver, session_id, timeout, watch, workdir, sprint_id, skip_preflight, runtime } => {
             // CLI default: if the operator didn't supply --watch, watch the
             // role's openclaw workspace dir. Library callers (e.g.
             // sprint_cli) pass an empty Vec directly to opt out.
@@ -1146,6 +1154,10 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
             } else {
                 watch
             };
+            // Parse --runtime <openclaw|internal>; default openclaw.
+            // Internal is the Phase 4 spike path (see
+            // `spike/agent-runtime/`).
+            let runtime_flag = crew::dispatch::Runtime::parse(&runtime)?;
             let opts = crew::dispatch::DispatchOpts {
                 role_id: role,
                 message,
@@ -1156,6 +1168,7 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
                 watch_paths,
                 workdir,
                 sprint_id,
+                runtime: runtime_flag,
             };
             let result = crew::dispatch::dispatch(opts)?;
             // Announce the resolved session id on stderr so operators see

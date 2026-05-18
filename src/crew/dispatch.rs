@@ -213,6 +213,34 @@ fn require_licensed_adjacent_ack(role_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Which agent runtime services a dispatch. The default is the
+/// production path that's shipped since v0.1 — openclaw shell-out
+/// via `~/.openclaw/agents/darkmux-<role>/` workspaces.
+///
+/// `Internal` is the Phase 4 spike path (see `spike/agent-runtime/`
+/// and `dispatch_internal.rs`). Behind the `--runtime internal` flag
+/// while the spike is being measured against openclaw. Promotion to
+/// default depends on Phase 5 data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Runtime {
+    #[default]
+    Openclaw,
+    Internal,
+}
+
+impl Runtime {
+    pub fn parse(s: &str) -> Result<Self> {
+        match s {
+            "openclaw" => Ok(Runtime::Openclaw),
+            "internal" => Ok(Runtime::Internal),
+            other => bail!(
+                "unknown runtime: {other}. \
+                 Known: openclaw, internal"
+            ),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct DispatchOpts {
     pub role_id: String,
@@ -261,6 +289,9 @@ pub struct DispatchOpts {
     /// When `None`, the dispatcher behaves as before — no sprint
     /// awareness, no output persistence. Backwards-compatible default.
     pub sprint_id: Option<String>,
+    /// Which agent runtime to dispatch through. See [`Runtime`].
+    /// Default: `Runtime::Openclaw` (the shipped path).
+    pub runtime: Runtime,
 }
 
 /// One file's state for the watched-paths summary (#89).
@@ -778,6 +809,13 @@ fn is_openclaw_noise(path: &Path) -> bool {
 
 /// Run a single dispatch end-to-end.
 pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
+    // Phase 4 spike: route to the internal runtime when the operator
+    // explicitly opts in via `--runtime internal`. Default stays the
+    // openclaw path (everything below this branch).
+    if opts.runtime == Runtime::Internal {
+        return crate::crew::dispatch_internal::dispatch(opts);
+    }
+
     // 0. Pre-flight: nudge the operator if the daemon isn't up. The
     //    dispatch will still write flow records to disk, but they
     //    won't be observable in the viewer until the daemon comes up.
