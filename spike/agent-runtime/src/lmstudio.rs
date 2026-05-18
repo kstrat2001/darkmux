@@ -21,10 +21,16 @@ use std::time::Duration;
 /// configurable via env var or CLI arg.
 pub const DEFAULT_BASE_URL: &str = "http://host.docker.internal:1234/v1";
 
-/// HTTP timeout for a single chat-completion call. Local A-class models
-/// (122B-A10B at 100K ctx) can take a couple of minutes for long
-/// prompts; keep this generous for spike work and tighten later.
-pub const REQUEST_TIMEOUT_SECS: u64 = 300;
+/// HTTP timeout for a single chat-completion call. Long-agentic-shape
+/// workloads at 101K context with the bundled-tool-call pattern can
+/// have individual model turns that take 5+ minutes (the model is
+/// reading a large context, reasoning across multiple tool calls, and
+/// generating a response with several tool_calls in one shot). Phase
+/// 6d's first try at 300s timed out mid-generation; 900s gives 15min
+/// of headroom per turn. The container's outer wall-clock guard is a
+/// separate concern; tighten only when measurements show this is
+/// excessive.
+pub const REQUEST_TIMEOUT_SECS: u64 = 900;
 
 /// One message in the conversation. Mirrors the OpenAI shape exactly so
 /// LMStudio parses it without surprises.
