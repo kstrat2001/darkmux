@@ -178,16 +178,17 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     };
 
     // System prompt: a default that names the runtime + names the
-    // available tools. Real dispatches will get role-specific prompts
-    // from darkmux in Phase 4.
+    // available tools. Real dispatches override this via --system with
+    // the role's .md prompt (see darkmux's crew dispatch path).
     let system_prompt = system.unwrap_or_else(|| {
-        "You are running inside the darkmux-agent runtime (spike phase 3). \
-         You have access to four tools:\n\
+        "You are running inside the darkmux-agent runtime. \
+         You have access to five tools:\n\
          \n\
-         - `echo`  — echoes its `text` argument back (for round-trip checks)\n\
+         - `echo`  — echoes its `text` argument back (sanity check)\n\
          - `bash`  — runs a bash command with cwd=/workspace; returns exit + stdout + stderr\n\
          - `read`  — reads a file from inside /workspace\n\
-         - `write` — writes a file inside /workspace\n\
+         - `write` — writes a NEW file (or fully replaces one) inside /workspace\n\
+         - `edit`  — applies a targeted patch (replaces old_string with new_string) on an existing file; prefer this over `write` for modifications\n\
          \n\
          All file paths must resolve inside /workspace. Paths that escape \
          (via .. or symlinks or absolute paths outside /workspace) are \
@@ -206,7 +207,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         None => LmStudioClient::new(),
     };
 
-    let tools = [Tool::Echo, Tool::Bash, Tool::Read, Tool::Write];
+    let tools = [Tool::Echo, Tool::Bash, Tool::Read, Tool::Write, Tool::Edit];
 
     println!("dispatching to model: {model}");
     println!();

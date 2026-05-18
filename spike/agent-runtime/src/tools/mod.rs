@@ -1,11 +1,19 @@
 //! Agent tool implementations.
 //!
-//! Phase 3 ships four tools:
+//! Tools shipped in the spike palette:
 //!
-//! - `echo` — Phase 2 placeholder, kept for sanity tests
-//! - `bash` — run a bash command with cwd=/workspace
-//! - `read` — read a file from inside /workspace
+//! - `echo`  — Phase 2 placeholder, kept for sanity tests
+//! - `bash`  — run a bash command with cwd=/workspace
+//! - `read`  — read a file from inside /workspace
 //! - `write` — write a file to inside /workspace
+//! - `edit`  — targeted patch on an existing file (Phase 7-bis)
+//!
+//! `edit` was added after Phase 6d's diagnostic compared openclaw's
+//! coder palette (5 tools, including `edit`) to the spike's (4 tools,
+//! `write`-only). The spike was completing the same work openclaw did
+//! but needed 2× the tool calls for any file modification (read +
+//! full-write where openclaw uses one targeted edit). Adding `edit`
+//! closes that granularity gap.
 //!
 //! The path-validation contract is enforced in `workspace.rs` and is
 //! the security-critical piece. Every Read / Write / Bash invocation
@@ -44,6 +52,7 @@ pub enum Tool {
     Bash,
     Read,
     Write,
+    Edit,
 }
 
 impl Tool {
@@ -53,6 +62,7 @@ impl Tool {
             Tool::Bash => "bash",
             Tool::Read => "read",
             Tool::Write => "write",
+            Tool::Edit => "edit",
         }
     }
 
@@ -84,8 +94,22 @@ impl Tool {
                  absolute (/workspace/...) or relative. The parent \
                  directory must already exist (use `bash` with mkdir -p \
                  if it doesn't). Paths that resolve outside the workspace \
-                 are rejected. \
+                 are rejected. PREFER `edit` over `write` when modifying \
+                 an existing file — it's targeted, cheaper, and preserves \
+                 lines you didn't touch. \
                  Arguments: { path: string, content: string }."
+            }
+            Tool::Edit => {
+                "Applies a targeted patch to an existing file: replaces \
+                 occurrences of `old_string` with `new_string`. Default \
+                 mode requires `old_string` to appear EXACTLY ONCE in the \
+                 file — pass `replace_all: true` to replace every \
+                 occurrence. The file must exist; paths must resolve \
+                 inside the workspace. Preserves all other content. Use \
+                 this rather than `write` for any modification to an \
+                 existing file — far cheaper and safer than rewriting the \
+                 whole file. \
+                 Arguments: { path: string, old_string: string, new_string: string, replace_all?: bool }."
             }
         }
     }
@@ -139,6 +163,28 @@ impl Tool {
                 },
                 "required": ["path", "content"]
             }),
+            Tool::Edit => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to edit. File must exist. Absolute /workspace/... or workspace-relative."
+                    },
+                    "old_string": {
+                        "type": "string",
+                        "description": "Text to replace. Must appear in the file. Required to be unique unless replace_all=true."
+                    },
+                    "new_string": {
+                        "type": "string",
+                        "description": "Replacement text. Must differ from old_string."
+                    },
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "If true, replace ALL occurrences. Default false (require unique match)."
+                    }
+                },
+                "required": ["path", "old_string", "new_string"]
+            }),
         }
     }
 
@@ -159,6 +205,7 @@ impl Tool {
             Tool::Bash => execute_bash(raw_args, Path::new(DEFAULT_WORKSPACE)),
             Tool::Read => execute_read(raw_args, Path::new(DEFAULT_WORKSPACE)),
             Tool::Write => execute_write(raw_args, Path::new(DEFAULT_WORKSPACE)),
+            Tool::Edit => execute_edit(raw_args, Path::new(DEFAULT_WORKSPACE)),
         }
     }
 
@@ -168,6 +215,7 @@ impl Tool {
             "bash" => Some(Tool::Bash),
             "read" => Some(Tool::Read),
             "write" => Some(Tool::Write),
+            "edit" => Some(Tool::Edit),
             _ => None,
         }
     }
@@ -185,7 +233,7 @@ pub fn dispatch(name: &str, raw_args: &str) -> String {
         },
         None => format!(
             "tool '{name}' is not available in this runtime. \
-             known tools: echo, bash, read, write"
+             known tools: echo, bash, read, write, edit"
         ),
     }
 }
@@ -326,6 +374,68 @@ fn execute_write(raw_args: &str, workspace_root: &Path) -> Result<String> {
     ))
 }
 
+// ─── edit ─────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct EditArgs {
+    path: String,
+    old_string: String,
+    new_string: String,
+    #[serde(default)]
+    replace_all: bool,
+}
+
+fn execute_edit(raw_args: &str, workspace_root: &Path) -> Result<String> {
+    let args: EditArgs = serde_json::from_str(raw_args)
+        .with_context(|| format!("parsing edit arguments: {raw_args}"))?;
+
+    if args.old_string.is_empty() {
+        return Err(anyhow!("edit: old_string cannot be empty"));
+    }
+    if args.old_string == args.new_string {
+        return Err(anyhow!(
+            "edit: old_string and new_string are identical — no change to apply"
+        ));
+    }
+
+    // File must already exist (resolve_read enforces that).
+    let path = resolve_read(&args.path, workspace_root)?;
+
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading file for edit: {path:?}"))?;
+
+    let count = content.matches(&args.old_string).count();
+    if count == 0 {
+        return Err(anyhow!(
+            "edit: old_string not found in {path:?}. \
+             Did you mean to use `write` to create a new file?"
+        ));
+    }
+    if count > 1 && !args.replace_all {
+        return Err(anyhow!(
+            "edit: old_string appears {count} times in {path:?}. \
+             Pass replace_all=true to replace every occurrence, or \
+             provide more surrounding context to make old_string unique."
+        ));
+    }
+
+    let replacements = if args.replace_all { count } else { 1 };
+    let new_content = if args.replace_all {
+        content.replace(&args.old_string, &args.new_string)
+    } else {
+        content.replacen(&args.old_string, &args.new_string, 1)
+    };
+
+    std::fs::write(&path, new_content.as_bytes())
+        .with_context(|| format!("writing edited file: {path:?}"))?;
+
+    Ok(format!(
+        "Edited {} ({replacements} replacement{} applied)",
+        path.display(),
+        if replacements == 1 { "" } else { "s" }
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,6 +553,114 @@ mod tests {
         execute_write(&raw, ws.path()).unwrap();
         let written = fs::read_to_string(ws.path().join("a.txt")).unwrap();
         assert_eq!(written, "replaced");
+    }
+
+    // ─── edit ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn edit_replaces_unique_occurrence() {
+        let ws = fresh_workspace();
+        fs::write(ws.path().join("a.txt"), b"hello world").unwrap();
+        let raw = serde_json::json!({
+            "path": "a.txt",
+            "old_string": "world",
+            "new_string": "spike"
+        })
+        .to_string();
+        let result = execute_edit(&raw, ws.path()).unwrap();
+        assert!(result.contains("1 replacement"));
+        let after = fs::read_to_string(ws.path().join("a.txt")).unwrap();
+        assert_eq!(after, "hello spike");
+    }
+
+    #[test]
+    fn edit_rejects_non_unique_without_replace_all() {
+        let ws = fresh_workspace();
+        fs::write(ws.path().join("a.txt"), b"foo foo foo").unwrap();
+        let raw = serde_json::json!({
+            "path": "a.txt",
+            "old_string": "foo",
+            "new_string": "bar"
+        })
+        .to_string();
+        let err = execute_edit(&raw, ws.path()).unwrap_err();
+        assert!(err.to_string().contains("appears 3 times"));
+        // File unchanged
+        let after = fs::read_to_string(ws.path().join("a.txt")).unwrap();
+        assert_eq!(after, "foo foo foo");
+    }
+
+    #[test]
+    fn edit_replace_all_replaces_every_occurrence() {
+        let ws = fresh_workspace();
+        fs::write(ws.path().join("a.txt"), b"foo foo foo").unwrap();
+        let raw = serde_json::json!({
+            "path": "a.txt",
+            "old_string": "foo",
+            "new_string": "bar",
+            "replace_all": true
+        })
+        .to_string();
+        let result = execute_edit(&raw, ws.path()).unwrap();
+        assert!(result.contains("3 replacements"));
+        let after = fs::read_to_string(ws.path().join("a.txt")).unwrap();
+        assert_eq!(after, "bar bar bar");
+    }
+
+    #[test]
+    fn edit_rejects_old_string_not_found() {
+        let ws = fresh_workspace();
+        fs::write(ws.path().join("a.txt"), b"hello world").unwrap();
+        let raw = serde_json::json!({
+            "path": "a.txt",
+            "old_string": "missing",
+            "new_string": "x"
+        })
+        .to_string();
+        let err = execute_edit(&raw, ws.path()).unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn edit_rejects_identical_old_and_new() {
+        let ws = fresh_workspace();
+        fs::write(ws.path().join("a.txt"), b"hello").unwrap();
+        let raw = serde_json::json!({
+            "path": "a.txt",
+            "old_string": "hello",
+            "new_string": "hello"
+        })
+        .to_string();
+        let err = execute_edit(&raw, ws.path()).unwrap_err();
+        assert!(err.to_string().contains("identical"));
+    }
+
+    #[test]
+    fn edit_rejects_empty_old_string() {
+        let ws = fresh_workspace();
+        fs::write(ws.path().join("a.txt"), b"hello").unwrap();
+        let raw = serde_json::json!({
+            "path": "a.txt",
+            "old_string": "",
+            "new_string": "x"
+        })
+        .to_string();
+        let err = execute_edit(&raw, ws.path()).unwrap_err();
+        assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn edit_rejects_missing_file() {
+        let ws = fresh_workspace();
+        let raw = serde_json::json!({
+            "path": "nonexistent.txt",
+            "old_string": "x",
+            "new_string": "y"
+        })
+        .to_string();
+        let err = execute_edit(&raw, ws.path()).unwrap_err();
+        // resolve_read fails at canonicalize when the file doesn't exist
+        assert!(err.to_string().contains("resolving"));
     }
 
     // ─── dispatch (integration with tool resolution) ──────────────────────
