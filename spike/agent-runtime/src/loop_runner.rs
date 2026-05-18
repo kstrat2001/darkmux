@@ -20,12 +20,15 @@ use anyhow::{anyhow, Result};
 use crate::compaction;
 use crate::lmstudio::{ChatRequest, LmStudioClient, Message};
 use crate::tools::{dispatch, Tool};
+use crate::trajectory::Trajectory;
 
 /// Hard cap on tool-call turns inside a single dispatch. If the model
 /// hits this without returning `stop`, the loop aborts with a loud
-/// error — better than spinning forever. Tunable; raise it when
-/// genuine multi-step workflows need more rounds.
-const MAX_TURNS: u32 = 16;
+/// error — better than spinning forever. 100 was picked after the
+/// Phase 6d e2e found 16 was too tight for long-agentic-shape work
+/// (real coding workloads with ~3 files of test edits need 30-50+
+/// granular tool calls with the spike's current palette).
+const MAX_TURNS: u32 = 100;
 
 /// Outcome of a completed loop run.
 #[derive(Debug)]
@@ -52,11 +55,17 @@ pub struct LoopOutcome {
 }
 
 /// Run the tool-call loop to completion.
+///
+/// `trajectory` records each significant event (model.completed,
+/// tool.completed, compaction). When the recorder was opened against
+/// an unwritable path, its methods are no-ops — the loop runs the same
+/// either way.
 pub fn run(
     client: &LmStudioClient,
     model: &str,
     initial_messages: Vec<Message>,
     tools: &[Tool],
+    trajectory: &mut Trajectory,
 ) -> Result<LoopOutcome> {
     let mut messages = initial_messages;
     let tool_defs: Vec<_> = tools.iter().map(|t| t.to_tool_def()).collect();
@@ -93,6 +102,25 @@ pub fn run(
                 total_completion_tokens.saturating_add(usage.completion_tokens);
             latest_prompt_tokens = usage.prompt_tokens;
         }
+
+        // Record model.completed for trajectory. We grab the first
+        // choice's finish_reason + tool_calls below; mirror it here.
+        let trajectory_finish_reason = response
+            .choices
+            .first()
+            .map(|c| c.finish_reason.clone())
+            .unwrap_or_default();
+        let trajectory_tool_calls = response
+            .choices
+            .first()
+            .and_then(|c| c.message.tool_calls.as_ref())
+            .cloned();
+        trajectory.append_model_completed(
+            turns,
+            &trajectory_finish_reason,
+            response.usage.as_ref(),
+            trajectory_tool_calls.as_deref(),
+        );
 
         // Take the first choice — LMStudio's OpenAI-compatible endpoint
         // returns exactly one for non-streaming requests, but we don't
@@ -135,9 +163,18 @@ pub fn run(
 
                 // Dispatch each call; append a `tool` message per
                 // result so the next request shows the model exactly
-                // what each tool returned.
-                for call in calls {
+                // what each tool returned. Trajectory records each
+                // tool.completed event so the operator can see what
+                // ran post-dispatch.
+                for (tool_seq, call) in calls.into_iter().enumerate() {
                     let result = dispatch(&call.function.name, &call.function.arguments);
+                    trajectory.append_tool_completed(
+                        turns,
+                        tool_seq as u32,
+                        &call.function.name,
+                        call.function.arguments.len(),
+                        result.len(),
+                    );
                     messages.push(Message::tool_result(
                         call.id,
                         call.function.name,
@@ -151,8 +188,24 @@ pub fn run(
                 // If so, compact BEFORE the next chat() call so the
                 // next request sees a smaller message thread.
                 if compaction::needs_compaction(latest_prompt_tokens, messages.len()) {
+                    let before_count = messages.len();
                     compactions = compactions.saturating_add(1);
                     compaction::compact(client, &mut messages, compactions)?;
+                    let after_count = messages.len();
+                    // Approximate summary_chars from the inserted
+                    // synthetic user message (the last 5-from-end
+                    // position; head + 1 synthetic + tail-4).
+                    let summary_chars = messages
+                        .get(2)
+                        .and_then(|m| m.content.as_ref())
+                        .map(|c| c.len())
+                        .unwrap_or(0);
+                    trajectory.append_compaction(
+                        compactions,
+                        before_count,
+                        after_count,
+                        summary_chars,
+                    );
                 }
 
                 // Loop back and call chat() again.

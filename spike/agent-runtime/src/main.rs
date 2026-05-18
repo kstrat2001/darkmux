@@ -26,6 +26,7 @@ mod compaction;
 mod lmstudio;
 mod loop_runner;
 mod tools;
+mod trajectory;
 
 use lmstudio::{LmStudioClient, Message};
 use tools::Tool;
@@ -210,31 +211,91 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     println!("dispatching to model: {model}");
     println!();
 
-    let outcome = match loop_runner::run(&client, &model, initial_messages, &tools) {
-        Ok(o) => o,
+    // Open trajectory + metrics recorder against the mounted
+    // workspace. Phase 7: gives post-dispatch visibility because the
+    // container is --rm and otherwise everything except stderr is lost.
+    let mut traj = trajectory::Trajectory::open(Path::new("/workspace"));
+    let started_at_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let system_chars = initial_messages[0].content.as_deref().map(str::len).unwrap_or(0);
+    let prompt_chars = initial_messages[1].content.as_deref().map(str::len).unwrap_or(0);
+    traj.append_dispatch_start(&model, system_chars, prompt_chars);
+
+    let run_result = loop_runner::run(&client, &model, initial_messages, &tools, &mut traj);
+
+    let (outcome, success) = match run_result {
+        Ok(o) => (Some(o), true),
         Err(e) => {
             eprintln!("dispatch failed: {e:#}");
-            return ExitCode::from(1);
+            (None, false)
         }
     };
 
-    let final_assistant = outcome
-        .messages
-        .iter()
-        .rev()
-        .find(|m| m.role == "assistant")
-        .and_then(|m| m.content.clone())
-        .unwrap_or_else(|| "<empty>".into());
+    // Whether success or failure, write the trajectory close + metrics.
+    let wall_ms = traj.elapsed_ms();
+    let result_str = if success { "stop" } else { "error" };
+    traj.append_dispatch_complete(result_str, wall_ms);
 
-    println!("--- final assistant message ---");
-    println!("{final_assistant}");
-    println!();
-    println!("--- metrics ---");
-    println!("turns:             {}", outcome.turns);
-    println!("compactions:       {}", outcome.compactions);
-    println!("prompt tokens:     {}", outcome.total_prompt_tokens);
-    println!("completion tokens: {}", outcome.total_completion_tokens);
-    println!("total messages:    {}", outcome.messages.len());
+    if let Some(o) = &outcome {
+        let final_assistant = o
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant")
+            .and_then(|m| m.content.clone())
+            .unwrap_or_else(|| "<empty>".into());
+
+        let preview: String = final_assistant.chars().take(400).collect();
+        let metrics = trajectory::Metrics {
+            runtime: "darkmux-agent-spike",
+            version: VERSION,
+            model: model.clone(),
+            started_at_unix_ms,
+            wall_ms,
+            result: result_str.into(),
+            turns: o.turns,
+            compactions: o.compactions,
+            total_prompt_tokens: o.total_prompt_tokens,
+            total_completion_tokens: o.total_completion_tokens,
+            total_messages: o.messages.len(),
+            max_turns_reached: false,
+            final_assistant_preview: preview,
+        };
+        let _ = traj.save_metrics(&metrics);
+
+        println!("--- final assistant message ---");
+        println!("{final_assistant}");
+        println!();
+        println!("--- metrics ---");
+        println!("turns:             {}", o.turns);
+        println!("compactions:       {}", o.compactions);
+        println!("prompt tokens:     {}", o.total_prompt_tokens);
+        println!("completion tokens: {}", o.total_completion_tokens);
+        println!("total messages:    {}", o.messages.len());
+        println!("wall:              {wall_ms}ms");
+    } else {
+        // Loop returned an error — still write a minimal metrics file
+        // so the operator has a record of the failure.
+        let metrics = trajectory::Metrics {
+            runtime: "darkmux-agent-spike",
+            version: VERSION,
+            model: model.clone(),
+            started_at_unix_ms,
+            wall_ms,
+            result: result_str.into(),
+            turns: 0,
+            compactions: 0,
+            total_prompt_tokens: 0,
+            total_completion_tokens: 0,
+            total_messages: 0,
+            max_turns_reached: true,
+            final_assistant_preview: String::new(),
+        };
+        let _ = traj.save_metrics(&metrics);
+        return ExitCode::from(1);
+    }
 
     ExitCode::SUCCESS
 }

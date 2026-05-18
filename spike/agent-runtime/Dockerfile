@@ -60,7 +60,9 @@ RUN apk add --no-cache \
         gawk \
         git \
         curl \
-        ca-certificates
+        ca-certificates \
+        nodejs \
+        npm
 
 # Non-root user. UID 1000 is the convention; matches what a typical
 # host-side macOS user maps to inside Docker for Mac when sharing volumes.
