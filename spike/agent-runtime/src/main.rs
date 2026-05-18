@@ -182,13 +182,14 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // the role's .md prompt (see darkmux's crew dispatch path).
     let system_prompt = system.unwrap_or_else(|| {
         "You are running inside the darkmux-agent runtime. \
-         You have access to five tools:\n\
+         You have access to six tools:\n\
          \n\
-         - `echo`  — echoes its `text` argument back (sanity check)\n\
-         - `bash`  — runs a bash command with cwd=/workspace; returns exit + stdout + stderr\n\
-         - `read`  — reads a file from inside /workspace\n\
-         - `write` — writes a NEW file (or fully replaces one) inside /workspace\n\
-         - `edit`  — applies a targeted patch (replaces old_string with new_string) on an existing file; prefer this over `write` for modifications\n\
+         - `echo`   — echoes its `text` argument back (sanity check)\n\
+         - `bash`   — runs a bash command with cwd=/workspace; returns exit + stdout + stderr\n\
+         - `read`   — reads from a file inside /workspace; requires offset (1-indexed start line) and limit (max lines; 0 = read entire file from offset to end). Prefer specifying a small limit when you only need a region — pair with `search` to find the right offset. For multiple reads in one turn, emit multiple `read` tool_calls in one assistant response.\n\
+         - `write`  — writes a NEW file (or fully replaces one) inside /workspace\n\
+         - `edit`   — applies one or more targeted patches in a single call (edits[] array; each entry replaces old_string with new_string against the current file state); prefer this over `write` for modifications, and batch related changes into one call's edits[] array rather than emitting many edit calls\n\
+         - `search` — finds a literal substring pattern in a file or directory tree, returning `path:line:content` matches. Use this to LOCATE text (function names, imports, error strings) before reading or editing — much cheaper than reading whole files when you only need to find specific identifiers\n\
          \n\
          All file paths must resolve inside /workspace. Paths that escape \
          (via .. or symlinks or absolute paths outside /workspace) are \
@@ -207,7 +208,14 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         None => LmStudioClient::new(),
     };
 
-    let tools = [Tool::Echo, Tool::Bash, Tool::Read, Tool::Write, Tool::Edit];
+    // Tool order matters — LLMs have positional bias when picking between
+    // plausible candidates. Order reflects the workflow we want the model
+    // to consider: locate first (search), then read content, then modify
+    // (edit/write), with bash as the general-purpose escape hatch.
+    // `Tool::Echo` is excluded — it was a Phase 2 round-trip probe with
+    // no use in real dispatches; sending it adds tool-catalog overhead
+    // the model would never invoke.
+    let tools = [Tool::Search, Tool::Read, Tool::Edit, Tool::Write, Tool::Bash];
 
     println!("dispatching to model: {model}");
     println!();
