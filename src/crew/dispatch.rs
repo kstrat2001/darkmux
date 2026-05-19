@@ -15,7 +15,7 @@
 //! `agents.list[]` reflect the manifests on disk — writes/updates the
 //! `darkmux/<role>` entries to match what the manifests + `.md` prompts say.
 
-use crate::crew::loader::{crew_root, load_role_prompt, load_roles, load_sprints};
+use crate::crew::loader::{load_role_prompt, load_roles, load_sprints};
 use crate::crew::types::Role;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value, json};
@@ -527,13 +527,12 @@ pub(crate) fn augment_prompt_with_identity(role_prompt: &str) -> String {
 /// Plain text, not JSON — the agent's reply IS prose. Storing it raw
 /// keeps the inject-back-into-message format friction-free.
 ///
-/// **Layout coupling**: this function and `crew::lifecycle::sprint_path`
-/// both compute `<crew_root>/sprints/...`. If #148's per-mission layout
-/// migration lands later, both sites must change in lockstep. The two
-/// functions are intentionally separate (manifest path vs. output path)
-/// but share a directory contract — keep them in sync.
-fn sprint_output_path(sprint_id: &str) -> PathBuf {
-    crew_root().join("sprints").join(format!("{sprint_id}-output.txt"))
+/// Output file path for a sprint's recorded agent reply.
+///
+/// New layout (#148): `<crew_root>/missions/<mission_id>/sprints/<sprint_id>-output.txt`
+/// co-located with the sprint manifest under the per-mission directory.
+fn sprint_output_path(mission_id: &str, sprint_id: &str) -> PathBuf {
+    crate::crew::lifecycle::sprints_dir(mission_id).join(format!("{sprint_id}-output.txt"))
 }
 
 /// Resolve the dispatch message: when `sprint_id` is `Some(id)`, look
@@ -589,10 +588,14 @@ fn augment_message_with_sprint_context(
     // For each parent, look up its recorded output. Missing outputs
     // are accumulated in `missing_parents` so the operator sees which
     // parents the agent didn't get context for.
+    //
+    // Per-mission layout (#148): parent sprints are assumed to live in the
+    // same mission as the child sprint. Output files are co-located with
+    // sprint manifests under `missions/<mission_id>/sprints/`.
     let mut parent_blocks: Vec<String> = Vec::new();
     let mut missing_parents: Vec<String> = Vec::new();
     for parent_id in &sprint.depends_on {
-        let path = sprint_output_path(parent_id);
+        let path = sprint_output_path(&sprint.mission_id, parent_id);
         match fs::read_to_string(&path) {
             Ok(content) if !content.trim().is_empty() => {
                 parent_blocks.push(format!(
@@ -648,16 +651,20 @@ fn augment_message_with_sprint_context(
 }
 
 /// Persist the agent's reply text to the sprint's output file after a
-/// dispatch completes (#146 Stage 1). Operator-visible side effect:
-/// `<crew_root>/sprints/<sprint-id>-output.txt` is created or
-/// overwritten with the agent's text reply.
+/// dispatch completes (#146 Stage 1 / #148 layout). Operator-visible
+/// side effect: `<crew_root>/missions/<mission_id>/sprints/<sprint_id>-output.txt`
+/// is created or overwritten with the agent's text reply.
 ///
 /// No-op when `sprint_id` is `None` (dispatcher was called without
 /// sprint context — typical for ad-hoc role dispatches).
 ///
+/// The `mission_id` is resolved via `lifecycle::load_sprint_by_id` at
+/// persist time. If the sprint is not found (e.g. the loader is
+/// unavailable or the id is stale), persistence is skipped silently —
+/// the output is already on stdout.
+///
 /// Returns the path written when persistence happened, `None`
 /// otherwise. Errors are logged but don't fail the dispatch itself —
-/// the output is already on stdout to the caller; the persistence is
 /// best-effort for downstream sprints.
 fn persist_sprint_output(
     sprint_id: Option<&str>,
@@ -667,7 +674,19 @@ fn persist_sprint_output(
     if reply_text.trim().is_empty() {
         return None;
     }
-    let path = sprint_output_path(sprint_id);
+    // Resolve mission_id via lifecycle so the output file lands in the
+    // per-mission directory next to the sprint manifest (#148).
+    let mission_id = match crate::crew::lifecycle::load_sprint_by_id(sprint_id) {
+        Ok(s) => s.mission_id,
+        Err(_) => {
+            eprintln!(
+                "darkmux crew dispatch: sprint `{sprint_id}` not found; \
+                 skipping output persistence."
+            );
+            return None;
+        }
+    };
+    let path = sprint_output_path(&mission_id, sprint_id);
     if let Some(parent) = path.parent() {
         if let Err(e) = fs::create_dir_all(parent) {
             eprintln!(
@@ -1654,7 +1673,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let prev = std::env::var("DARKMUX_CREW_DIR").ok();
         unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()); }
-        let sprints_dir = tmp.path().join("sprints");
+        // Per-mission layout (#148): missions/<mission_id>/sprints/<sprint_id>.json
+        let sprints_dir = tmp.path().join("missions").join("m").join("sprints");
         fs::create_dir_all(&sprints_dir).unwrap();
         fs::write(
             sprints_dir.join("solo-sprint.json"),
@@ -1678,7 +1698,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let prev = std::env::var("DARKMUX_CREW_DIR").ok();
         unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()); }
-        let sprints_dir = tmp.path().join("sprints");
+        // Per-mission layout (#148): missions/<mission_id>/sprints/<sprint_id>.json
+        let sprints_dir = tmp.path().join("missions").join("m").join("sprints");
         fs::create_dir_all(&sprints_dir).unwrap();
         // Parent + child sprint manifests.
         fs::write(
@@ -1689,7 +1710,7 @@ mod tests {
             sprints_dir.join("child.json"),
             r#"{"id":"child","mission_id":"m","description":"d","status":"planned","depends_on":["parent"],"created_ts":0}"#,
         ).unwrap();
-        // Parent's recorded output.
+        // Parent's recorded output co-located with manifests.
         fs::write(sprints_dir.join("parent-output.txt"), "parent did X and Y").unwrap();
 
         let result = augment_message_with_sprint_context(Some("child"), "task body").unwrap();
@@ -1716,7 +1737,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let prev = std::env::var("DARKMUX_CREW_DIR").ok();
         unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()); }
-        let sprints_dir = tmp.path().join("sprints");
+        // Per-mission layout (#148): missions/<mission_id>/sprints/<sprint_id>.json
+        let sprints_dir = tmp.path().join("missions").join("m").join("sprints");
         fs::create_dir_all(&sprints_dir).unwrap();
         fs::write(
             sprints_dir.join("parent-a.json"),
@@ -1730,7 +1752,7 @@ mod tests {
             sprints_dir.join("child.json"),
             r#"{"id":"child","mission_id":"m","description":"d","status":"planned","depends_on":["parent-a","parent-b"],"created_ts":0}"#,
         ).unwrap();
-        // Only parent-a has a recorded output.
+        // Only parent-a has a recorded output; co-located with manifests.
         fs::write(sprints_dir.join("parent-a-output.txt"), "parent-a finished X").unwrap();
 
         let result = augment_message_with_sprint_context(Some("child"), "child task").unwrap();
@@ -1756,7 +1778,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let prev = std::env::var("DARKMUX_CREW_DIR").ok();
         unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()); }
-        let sprints_dir = tmp.path().join("sprints");
+        // Per-mission layout (#148): missions/<mission_id>/sprints/<sprint_id>.json
+        let sprints_dir = tmp.path().join("missions").join("m").join("sprints");
         fs::create_dir_all(&sprints_dir).unwrap();
         fs::write(
             sprints_dir.join("parent.json"),
@@ -1786,10 +1809,22 @@ mod tests {
         let prev = std::env::var("DARKMUX_CREW_DIR").ok();
         unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()); }
 
+        // Seed sprint manifest so load_sprint_by_id can resolve mission_id (#148).
+        let sprints_dir = tmp.path().join("missions").join("m").join("sprints");
+        fs::create_dir_all(&sprints_dir).unwrap();
+        fs::write(
+            sprints_dir.join("my-sprint.json"),
+            r#"{"id":"my-sprint","mission_id":"m","description":"d","status":"planned","depends_on":[],"created_ts":0}"#,
+        ).unwrap();
+
         let path = persist_sprint_output(Some("my-sprint"), "agent reply text").unwrap();
         let content = fs::read_to_string(&path).unwrap();
         assert_eq!(content, "agent reply text");
-        assert!(path.ends_with("sprints/my-sprint-output.txt"), "got: {}", path.display());
+        // New layout: missions/<mission_id>/sprints/<sprint_id>-output.txt
+        assert!(
+            path.ends_with("missions/m/sprints/my-sprint-output.txt"),
+            "got: {}", path.display()
+        );
 
         // No-op for None sprint_id.
         assert!(persist_sprint_output(None, "ignored").is_none());

@@ -362,3 +362,114 @@ fn external_pull_rejects_multiple_sources() {
         .failure()
         .stderr(predicate::str::contains("cannot be used with"));
 }
+
+// ── mission migrate integration tests (#148 Task 8) ───────────────────────
+
+fn write_flat_mission_file(root: &std::path::Path, id: &str) {
+    let dir = root.join("missions");
+    fs::create_dir_all(&dir).unwrap();
+    let body = serde_json::json!({
+        "id": id,
+        "description": "test",
+        "sprint_ids": [],
+        "created_ts": 1,
+    });
+    fs::write(
+        dir.join(format!("{id}.json")),
+        serde_json::to_string_pretty(&body).unwrap(),
+    )
+    .unwrap();
+}
+
+fn write_flat_sprint_file(root: &std::path::Path, id: &str, mission_id: &str) {
+    let dir = root.join("sprints");
+    fs::create_dir_all(&dir).unwrap();
+    let body = serde_json::json!({
+        "id": id,
+        "mission_id": mission_id,
+        "description": "test",
+        "depends_on": [],
+        "created_ts": 1,
+    });
+    fs::write(
+        dir.join(format!("{id}.json")),
+        serde_json::to_string_pretty(&body).unwrap(),
+    )
+    .unwrap();
+}
+
+/// Dry-run lists proposed moves but does NOT move files.
+#[test]
+fn mission_migrate_dry_run_shows_moves_without_moving() {
+    let tmp = TempDir::new().unwrap();
+    write_flat_mission_file(tmp.path(), "alpha");
+    write_flat_sprint_file(tmp.path(), "s1", "alpha");
+
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_CREW_DIR", tmp.path())
+        .args(["mission", "migrate"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("alpha"))
+        .stdout(predicate::str::contains("s1"))
+        .stdout(predicate::str::contains("Re-run with --apply"));
+
+    // Files must NOT have been moved.
+    assert!(tmp.path().join("missions/alpha.json").is_file(),
+            "dry-run must not move the flat mission file");
+    assert!(tmp.path().join("sprints/s1.json").is_file(),
+            "dry-run must not move the flat sprint file");
+}
+
+/// `--apply` actually moves files to the per-mission nested layout.
+#[test]
+fn mission_migrate_apply_moves_files() {
+    let tmp = TempDir::new().unwrap();
+    write_flat_mission_file(tmp.path(), "alpha");
+    write_flat_sprint_file(tmp.path(), "s1", "alpha");
+
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_CREW_DIR", tmp.path())
+        .args(["mission", "migrate", "--apply"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("applied"));
+
+    // New nested paths must exist.
+    assert!(tmp.path().join("missions/alpha/mission.json").is_file(),
+            "mission.json should be at nested path after --apply");
+    assert!(tmp.path().join("missions/alpha/sprints/s1.json").is_file(),
+            "sprint json should be at nested path after --apply");
+    // Old flat paths must be gone.
+    assert!(!tmp.path().join("missions/alpha.json").exists(),
+            "flat mission file should be gone after --apply");
+    assert!(!tmp.path().join("sprints/s1.json").exists(),
+            "flat sprint file should be gone after --apply");
+}
+
+/// Re-running `--apply` after a successful migration is a no-op (idempotent).
+#[test]
+fn mission_migrate_apply_is_idempotent() {
+    let tmp = TempDir::new().unwrap();
+    write_flat_mission_file(tmp.path(), "alpha");
+    write_flat_sprint_file(tmp.path(), "s1", "alpha");
+
+    // First apply.
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_CREW_DIR", tmp.path())
+        .args(["mission", "migrate", "--apply"])
+        .assert()
+        .success();
+
+    // Second apply: must succeed and report nothing to do.
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_CREW_DIR", tmp.path())
+        .args(["mission", "migrate", "--apply"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("nothing to do"));
+}

@@ -440,11 +440,7 @@ fn prompt_decision() -> Result<Decision> {
 }
 
 fn persist(p: &Proposal) -> Result<i32> {
-    let crew_root = crate::crew::loader::crew_root();
-    let missions_dir = crew_root.join("missions");
-    let sprints_dir = crew_root.join("sprints");
-    std::fs::create_dir_all(&missions_dir).with_context(|| format!("creating {}", missions_dir.display()))?;
-    std::fs::create_dir_all(&sprints_dir).with_context(|| format!("creating {}", sprints_dir.display()))?;
+    use crate::crew::lifecycle;
 
     // Stamp created_ts on everything that has 0 (the schema convention
     // the mission-compiler emits — see role .md).
@@ -456,8 +452,15 @@ fn persist(p: &Proposal) -> Result<i32> {
     let mut mission = p.mission.clone();
     if mission.created_ts == 0 { mission.created_ts = now; }
 
+    // Ensure the per-mission dir + its sprints/ subdir exist before any
+    // existence checks or writes. create_dir_all is idempotent and also
+    // creates the parent mission dir, so one call covers both.
+    let sprints_dir = lifecycle::sprints_dir(&mission.id);
+    std::fs::create_dir_all(&sprints_dir)
+        .with_context(|| format!("creating {}", sprints_dir.display()))?;
+
     // Refuse to overwrite existing mission file.
-    let mission_path = missions_dir.join(format!("{}.json", mission.id));
+    let mission_path = lifecycle::mission_path(&mission.id);
     if mission_path.exists() {
         return Err(anyhow!(
             "mission propose: mission `{}` already exists at {} — aborting (no overwrite)",
@@ -466,9 +469,9 @@ fn persist(p: &Proposal) -> Result<i32> {
         ));
     }
 
-    // Same for each sprint.
+    // Same for each sprint — scoped to the mission's sprints/ subdir.
     for s in &p.sprints {
-        let sp = sprints_dir.join(format!("{}.json", s.id));
+        let sp = lifecycle::sprint_path(&mission.id, &s.id);
         if sp.exists() {
             return Err(anyhow!(
                 "mission propose: sprint `{}` already exists at {} — aborting (no overwrite)",
@@ -484,7 +487,7 @@ fn persist(p: &Proposal) -> Result<i32> {
     // leave the operator with a half-written mission whose retry
     // confusingly fails on the no-overwrite gate.
     let mut written: Vec<std::path::PathBuf> = Vec::new();
-    let result = write_all(p, &mission, &mission_path, &sprints_dir, now, &mut written);
+    let result = write_all(p, &mission, &mission_path, now, &mut written);
     if let Err(e) = result {
         for path in &written {
             let _ = std::fs::remove_file(path);
@@ -508,10 +511,11 @@ fn write_all(
     p: &Proposal,
     mission: &ProposedMission,
     mission_path: &std::path::Path,
-    sprints_dir: &std::path::Path,
     now: u64,
     written: &mut Vec<std::path::PathBuf>,
 ) -> Result<()> {
+    use crate::crew::lifecycle;
+
     let mission_json = serde_json::to_string_pretty(mission).context("serializing mission")?;
     std::fs::write(mission_path, format!("{mission_json}\n"))
         .with_context(|| format!("writing {}", mission_path.display()))?;
@@ -523,7 +527,7 @@ fn write_all(
         if sprint.created_ts == 0 {
             sprint.created_ts = now;
         }
-        let sp = sprints_dir.join(format!("{}.json", sprint.id));
+        let sp = lifecycle::sprint_path(&mission.id, &sprint.id);
         let sprint_json = serde_json::to_string_pretty(&sprint).context("serializing sprint")?;
         std::fs::write(&sp, format!("{sprint_json}\n"))
             .with_context(|| format!("writing {}", sp.display()))?;
@@ -574,6 +578,7 @@ mod tests {
             Self { prev, _tmp: tmp }
         }
 
+        #[allow(dead_code)]
         fn path(&self) -> &std::path::Path {
             self._tmp.path()
         }
@@ -700,11 +705,11 @@ some epilogue"#;
         // isolated TempDir — earlier version of this test wrote into
         // the operator's REAL ~/.darkmux/crew/missions/ which was a
         // footgun on every CI run.
-        let guard = CrewDirGuard::new(TempDir::new().unwrap());
-        let missions_dir = guard.path().join("missions");
-        std::fs::create_dir_all(&missions_dir).unwrap();
+        let _guard = CrewDirGuard::new(TempDir::new().unwrap());
 
-        let existing_path = missions_dir.join("test-existing-mission.json");
+        // Seed the new nested layout: missions/<id>/mission.json
+        let existing_path = crate::crew::lifecycle::mission_path("test-existing-mission");
+        std::fs::create_dir_all(existing_path.parent().unwrap()).unwrap();
         std::fs::write(&existing_path, r#"{"id":"test-existing-mission","description":"existing","status":"active","sprint_ids":[],"created_ts":0}"#)
             .expect("writing existing mission");
 
@@ -732,11 +737,13 @@ some epilogue"#;
         // should arguably be rejected by `validate_proposal_invariants`
         // as a path-traversal vector. Future hardening; tests-only
         // use of the form is fine.
-        let guard = CrewDirGuard::new(TempDir::new().unwrap());
-        let missions_dir = guard.path().join("missions");
-        let sprints_dir = guard.path().join("sprints");
-        std::fs::create_dir_all(&sprints_dir).unwrap();
+        let _guard = CrewDirGuard::new(TempDir::new().unwrap());
 
+        // The second sprint id contains a `/` so its target path is
+        // `<sprints_dir>/deep/test-s2.json` whose parent directory
+        // (`deep/`) doesn't exist inside the mission sprints dir.
+        // `.exists()` returns false on the full path (pre-flight passes);
+        // `std::fs::write` returns ENOENT during the loop (rollback fires).
         let proposal = sample_proposal("test-rollback", &["test-s1", "deep/test-s2"]);
 
         let err = persist(&proposal).expect_err("persist should fail mid-loop");
@@ -746,8 +753,8 @@ some epilogue"#;
         );
 
         // Mission file and the first sprint file must both be cleaned up.
-        let mission_path = missions_dir.join("test-rollback.json");
-        let sprint1_path = sprints_dir.join("test-s1.json");
+        let mission_path = crate::crew::lifecycle::mission_path("test-rollback");
+        let sprint1_path = crate::crew::lifecycle::sprint_path("test-rollback", "test-s1");
         assert!(
             !mission_path.exists(),
             "mission file should have been rolled back; found {}",
