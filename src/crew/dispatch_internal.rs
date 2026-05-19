@@ -221,7 +221,9 @@ fn replay_trajectory_to_flow(
         Err(_) => return summary, // no trajectory; nothing to replay
     };
     let reader = std::io::BufReader::new(file);
-    for line in reader.lines().flatten() {
+    // `map_while(Result::ok)` stops at the first read error instead of
+    // spinning forever on persistent IO errors (clippy::lines_filter_map_ok).
+    for line in reader.lines().map_while(Result::ok) {
         let event: serde_json::Value = match serde_json::from_str(&line) {
             Ok(v) => v,
             Err(_) => continue,
