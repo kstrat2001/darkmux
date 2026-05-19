@@ -113,6 +113,70 @@
     // First test — proves the harness wires up. Real tests follow in later tasks.
     test('harness smoke', () => { assertEqual(1 + 1, 2); });
 
+    // ─── pure transforms ──────────────────────────────────────────────────
+    /**
+     * Aggregate FlowRecords by machine_id, deriving crew role counts, time range, missions, orchestrators.
+     * @param {FlowRecord[]} records
+     * @returns {Array<{ machine_id, role_count, last_ts, missions, orchestrators, roles }>}
+     */
+    function aggregateMachines(records) {
+      const byMachine = new Map();
+      for (const r of records) {
+        const id = r.machine_id || 'unknown';
+        let m = byMachine.get(id);
+        if (!m) {
+          m = { machine_id: id, role_count: 0, last_ts: r.ts, missions: new Set(), orchestrators: new Set(), roles: new Set() };
+          byMachine.set(id, m);
+        }
+        if (r.ts > m.last_ts) m.last_ts = r.ts;
+        if (r.mission_id) m.missions.add(r.mission_id);
+        if (r.orchestrator) m.orchestrators.add(r.orchestrator);
+        // Role: handle starting with "darkmux/" identifies a crew role.
+        if (r.handle?.startsWith('darkmux/')) m.roles.add(r.handle);
+      }
+      return Array.from(byMachine.values()).map(m => ({
+        ...m,
+        role_count: m.roles.size,
+        missions: Array.from(m.missions),
+        orchestrators: Array.from(m.orchestrators),
+        roles: Array.from(m.roles),
+      })).sort((a, b) => a.machine_id.localeCompare(b.machine_id));
+    }
+
+    // Tests for aggregateMachines
+    test('aggregateMachines: empty input', () => {
+      assertEqual(aggregateMachines([]), []);
+    });
+    test('aggregateMachines: one record produces one machine', () => {
+      const r = { ts: '2026-05-19T01:00:00Z', machine_id: 'studio', handle: 'note', stage: 'scope' };
+      const out = aggregateMachines([r]);
+      assertEqual(out.length, 1);
+      assertEqual(out[0].machine_id, 'studio');
+      assertEqual(out[0].role_count, 0);
+    });
+    test('aggregateMachines: crew handles count toward role_count', () => {
+      const recs = [
+        { ts: 't1', machine_id: 'studio', handle: 'darkmux/coder', stage: 'dispatch' },
+        { ts: 't2', machine_id: 'studio', handle: 'darkmux/scribe', stage: 'dispatch' },
+        { ts: 't3', machine_id: 'studio', handle: 'darkmux/coder', stage: 'dispatch' },
+      ];
+      assertEqual(aggregateMachines(recs)[0].role_count, 2);
+    });
+    test('aggregateMachines: missions + orchestrators dedup per machine', () => {
+      const recs = [
+        { ts: 't1', machine_id: 'studio', mission_id: 'm1', orchestrator: 'claude-opus-4-7', handle: 'note', stage: 'scope' },
+        { ts: 't2', machine_id: 'studio', mission_id: 'm1', orchestrator: 'claude-opus-4-7', handle: 'note', stage: 'scope' },
+        { ts: 't3', machine_id: 'studio', mission_id: 'm2', orchestrator: 'cursor-anthropic', handle: 'note', stage: 'scope' },
+      ];
+      const out = aggregateMachines(recs)[0];
+      assertEqual(out.missions.sort(), ['m1', 'm2']);
+      assertEqual(out.orchestrators.sort(), ['claude-opus-4-7', 'cursor-anthropic']);
+    });
+    test('aggregateMachines: undefined machine_id buckets to "unknown"', () => {
+      const out = aggregateMachines([{ ts: 't1', handle: 'note', stage: 'scope' }]);
+      assertEqual(out[0].machine_id, 'unknown');
+    });
+
     function App() {
       const nodes = [{ id: 'hello', position: { x: 0, y: 0 }, data: { label: 'Topology view — Task 1 smoke' } }];
       const edges = [];
