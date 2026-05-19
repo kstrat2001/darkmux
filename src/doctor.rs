@@ -97,6 +97,7 @@ pub fn run() -> DoctorReport {
         check_recommendation_drift(),
         check_recommended_profile_name_not_shadowed(),
         check_role_model_pin_drift(),
+        check_legacy_mission_layout(),
     ];
     checks.extend(eureka_checks());
     DoctorReport { checks }
@@ -1643,6 +1644,71 @@ fn check_power_state() -> Check {
     }
 }
 
+/// Warn when legacy flat mission/sprint files exist in the pre-#148 layout.
+/// Pass when neither legacy_missions_dir nor legacy_sprints_dir contain any
+/// top-level .json files. Fail never — legacy files don't break the system,
+/// but they're a signal that `darkmux mission migrate --apply` should be run
+/// to consolidate into the per-mission layout. (#148)
+fn check_legacy_mission_layout() -> Check {
+    let missions_dir = crate::crew::lifecycle::legacy_missions_dir();
+    let sprints_dir = crate::crew::lifecycle::legacy_sprints_dir();
+
+    let mut legacy_count = 0u32;
+
+    // Count legacy flat .json files in missions dir
+    if let Ok(entries) = std::fs::read_dir(&missions_dir) {
+        for entry in entries.flatten() {
+            if let Ok(metadata) = entry.metadata() {
+                if metadata.is_file() {
+                    if let Some(ext) = entry.path().extension() {
+                        if ext == "json" {
+                            legacy_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Count legacy flat .json files in sprints dir
+    if let Ok(entries) = std::fs::read_dir(&sprints_dir) {
+        for entry in entries.flatten() {
+            if let Ok(metadata) = entry.metadata() {
+                if metadata.is_file() {
+                    if let Some(ext) = entry.path().extension() {
+                        if ext == "json" {
+                            legacy_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if legacy_count > 0 {
+        let crew_root = crate::crew::loader::crew_root();
+        Check {
+            name: "legacy mission layout".into(),
+            status: Status::Warn,
+            message: format!(
+                "{legacy_count} legacy flat file(s) at {}/(missions|sprints)/<id>.json",
+                crew_root.display()
+            ),
+            hint: Some(
+                "Run `darkmux mission migrate --apply` to move them to the per-mission layout (#148)."
+                    .into(),
+            ),
+        }
+    } else {
+        Check {
+            name: "legacy mission layout".into(),
+            status: Status::Pass,
+            message: "no legacy flat files".into(),
+            hint: None,
+        }
+    }
+}
+
 // ─── Helpers ────────────────────────────────────────────────────────────
 
 fn which(cmd: &str) -> Option<PathBuf> {
@@ -2070,15 +2136,15 @@ mod tests {
     #[test]
     fn run_returns_static_plus_eureka_checks() {
         let r = run();
-        // 21 baseline checks (incl. runtime version + load projection +
+        // 22 baseline checks (incl. runtime version + load projection +
         // daemon reachable + darkmux-version-vs-latest-release [#13] +
         // crew-role-prompt-coverage [#141] + flow-sink-health [#170] +
         // machine_id + orchestrator [#167] + audit-integrity [#163] +
         // recommendation-drift + recommended-profile-not-shadowed [#159] +
-        // role-model-pin-drift [#160]) + one per active eureka rule.
-        // Every check should appear regardless of environment — even if
-        // the underlying probe couldn't read state.
-        let expected = 21 + crate::eureka::all_rules().len();
+        // role-model-pin-drift [#160] + legacy-mission-layout [#148]) +
+        // one per active eureka rule. Every check should appear regardless
+        // of environment — even if the underlying probe couldn't read state.
+        let expected = 22 + crate::eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
