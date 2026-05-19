@@ -154,6 +154,38 @@ impl Trajectory {
         }));
     }
 
+    /// model.reasoning — one per turn where the model emitted reasoning
+    /// content (parsed from inline `<think>...</think>` blocks in the
+    /// assistant message content, OR from a separate `reasoning_content`
+    /// field when the model uses that pattern). Schema 1.6 addition for
+    /// flow stream richer events (#204).
+    ///
+    /// Carries the FULL reasoning text — flow viewer renders as a
+    /// collapse/expand block per operator-discretion design. Reasoning
+    /// can be 5-10× the size of the actual response on hard problems;
+    /// expect trajectory.jsonl sizes to grow proportionally when
+    /// thinking-mode models are used.
+    ///
+    /// `format` is one of `"inline-think-tags"` (parsed from content)
+    /// or `"separate-field"` (extracted from a `reasoning_content`
+    /// field). Lets downstream consumers know how to interpret the
+    /// reasoning's relationship to the rest of the assistant message.
+    pub fn append_model_reasoning(
+        &mut self,
+        seq: u32,
+        reasoning_text: &str,
+        format: &str,
+    ) {
+        self.write_event(&serde_json::json!({
+            "type": "model.reasoning",
+            "seq": seq,
+            "ts": unix_ms(),
+            "reasoning_text": reasoning_text,
+            "reasoning_chars": reasoning_text.chars().count(),
+            "reasoning_format": format,
+        }));
+    }
+
     /// tool.completed — one per executed tool call. Records the
     /// tool name + arg/result sizes (not the content — that can be
     /// large; the trajectory is for shape, not for full payload).

@@ -133,6 +133,24 @@ pub fn run(
         let assistant_message = choice.message;
         let finish_reason = choice.finish_reason;
 
+        // Extract reasoning content from `<think>...</think>` blocks in
+        // the assistant message content (#204). Thinking-mode models
+        // (qwen 3.x line, in particular) emit reasoning inline; we
+        // surface it as a separate trajectory event so the flow
+        // stream + viewer can render it as a collapse/expand block
+        // (operator discretion to expand). The original content stays
+        // unchanged in `assistant_message` — downstream consumers
+        // (compaction, conversation history) see everything as-was.
+        if let Some(content) = assistant_message.content.as_deref() {
+            for reasoning_text in extract_think_blocks(content) {
+                trajectory.append_model_reasoning(
+                    turns,
+                    &reasoning_text,
+                    "inline-think-tags",
+                );
+            }
+        }
+
         // Append the assistant's message to the conversation before we
         // process its tool calls — that's the order the next request
         // needs to see things in.
@@ -226,5 +244,84 @@ pub fn run(
                 ));
             }
         }
+    }
+}
+
+/// Extract `<think>...</think>` block contents from a string. Returns
+/// each block's inner text (without the tags) in order. Returns empty
+/// vec when no blocks are present.
+///
+/// Used to surface reasoning content as separate trajectory events
+/// (#204). qwen 3.x thinking-mode models emit reasoning inline in the
+/// assistant message content wrapped in these tags; we extract for the
+/// flow stream + viewer but leave the original content untouched.
+///
+/// Implementation is a tag-scan, not a regex — keeps the runtime free
+/// of regex deps and handles nested tags by treating the outermost
+/// pairs as the boundary. Malformed (unclosed) tags are ignored.
+fn extract_think_blocks(content: &str) -> Vec<String> {
+    const OPEN: &str = "<think>";
+    const CLOSE: &str = "</think>";
+    let mut blocks = Vec::new();
+    let mut cursor = 0;
+    while let Some(open_at) = content[cursor..].find(OPEN) {
+        let start = cursor + open_at + OPEN.len();
+        if let Some(close_offset) = content[start..].find(CLOSE) {
+            blocks.push(content[start..start + close_offset].to_string());
+            cursor = start + close_offset + CLOSE.len();
+        } else {
+            // Unclosed tag — stop scanning to avoid runaway capture.
+            break;
+        }
+    }
+    blocks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_think_blocks_none() {
+        assert_eq!(extract_think_blocks("just plain content"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn extract_think_blocks_single() {
+        let content = "Before <think>my reasoning here</think> after.";
+        assert_eq!(extract_think_blocks(content), vec!["my reasoning here"]);
+    }
+
+    #[test]
+    fn extract_think_blocks_multiple() {
+        let content =
+            "<think>first thought</think>\nresponse\n<think>second thought</think>";
+        assert_eq!(
+            extract_think_blocks(content),
+            vec!["first thought", "second thought"]
+        );
+    }
+
+    #[test]
+    fn extract_think_blocks_multiline() {
+        let content = "<think>line one\nline two\nline three</think>";
+        assert_eq!(
+            extract_think_blocks(content),
+            vec!["line one\nline two\nline three"]
+        );
+    }
+
+    #[test]
+    fn extract_think_blocks_unclosed_tag_skipped() {
+        // Unclosed tag mid-content — return whatever closed blocks came
+        // before, ignore the unclosed one.
+        let content = "<think>closed</think> middle <think>unclosed forever";
+        assert_eq!(extract_think_blocks(content), vec!["closed"]);
+    }
+
+    #[test]
+    fn extract_think_blocks_empty_inside() {
+        let content = "<think></think>";
+        assert_eq!(extract_think_blocks(content), vec![""]);
     }
 }

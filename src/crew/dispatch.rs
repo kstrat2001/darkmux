@@ -923,13 +923,25 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // record below via session_id (the viewer's computeDispatchDurations
     // does the start↔end pairing). Non-fatal: emission errors are
     // ignored so a flows-dir write problem doesn't sink the dispatch.
-    let _ = crate::flow::record(build_dispatch_record(
+    //
+    // Schema 1.6 (#204) enriches the payload with runtime metadata so
+    // the viewer can render which runtime + prompt size handled the
+    // work without cross-referencing other state.
+    let dispatch_start_payload = serde_json::json!({
+        "runtime": "openclaw",
+        "prompt_chars": augmented_message.chars().count(),
+        "agent_id": agent_id,
+    });
+    let _ = crate::flow::record(build_dispatch_record_with_payload(
         crate::flow::Level::Info,
         "dispatch start",
         &opts.role_id,
         &resolved_session_id,
         resolved_model.as_deref(),
+        Some(dispatch_start_payload),
     ));
+
+    let dispatch_start_instant = std::time::Instant::now();
 
     // 4. Invoke openclaw agent
     let mut cmd = Command::new("openclaw");
@@ -948,6 +960,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         .output()
         .with_context(|| format!("running `openclaw agent {agent_id}`"));
 
+    let wall_ms = dispatch_start_instant.elapsed().as_millis() as u64;
+
     // Emit the dispatch end record BEFORE propagating any error or
     // returning Ok — emission must reflect both success and failure paths
     // so the viewer never sees a dangling start with no terminal event.
@@ -955,12 +969,33 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         Ok(o) if o.status.success() => ("dispatch complete", crate::flow::Level::Info),
         _ => ("dispatch error", crate::flow::Level::Error),
     };
-    let _ = crate::flow::record(build_dispatch_record(
+    let (stdout_chars, stderr_chars, exit_code) = match &output_result {
+        Ok(o) => (
+            o.stdout.len(),
+            o.stderr.len(),
+            o.status.code(),
+        ),
+        Err(_) => (0, 0, None),
+    };
+    let dispatch_complete_payload = serde_json::json!({
+        "runtime": "openclaw",
+        "wall_ms": wall_ms,
+        "stdout_chars": stdout_chars,
+        "stderr_chars": stderr_chars,
+        "exit_code": exit_code,
+        "result_class": if matches!(&output_result, Ok(o) if o.status.success()) {
+            "ok"
+        } else {
+            "error"
+        },
+    });
+    let _ = crate::flow::record(build_dispatch_record_with_payload(
         level,
         action,
         &opts.role_id,
         &resolved_session_id,
         resolved_model.as_deref(),
+        Some(dispatch_complete_payload),
     ));
 
     let output = output_result?;
@@ -1050,12 +1085,40 @@ fn extract_payload_text(stdout: &str) -> Option<String> {
 /// `session_id` is the full openclaw session identifier; `model` is the
 /// resolved LMStudio model id (best-effort — `None` when the openclaw
 /// config can't be read or no model is pinned for this agent).
+///
+/// Legacy wrapper around `build_dispatch_record_with_payload` for the
+/// pre-#204 call shape. The two main openclaw-path emit sites now go
+/// through `_with_payload` directly to carry runtime metadata; this
+/// wrapper survives for tests + future callers that don't need payload.
+#[allow(dead_code)]
 pub(crate) fn build_dispatch_record(
     level: crate::flow::Level,
     action: &str,
     role_id: &str,
     session_id: &str,
     model: Option<&str>,
+) -> crate::flow::FlowRecord {
+    build_dispatch_record_with_payload(
+        level,
+        action,
+        role_id,
+        session_id,
+        model,
+        None,
+    )
+}
+
+/// Same as `build_dispatch_record` but with an explicit `payload` for
+/// event-specific fields (#204). The richer dispatch events (turn,
+/// tool, compaction, reasoning) use this directly; the bare
+/// `build_dispatch_record` wrapper preserves the legacy call shape.
+pub(crate) fn build_dispatch_record_with_payload(
+    level: crate::flow::Level,
+    action: &str,
+    role_id: &str,
+    session_id: &str,
+    model: Option<&str>,
+    payload: Option<serde_json::Value>,
 ) -> crate::flow::FlowRecord {
     crate::flow::FlowRecord {
         ts: crate::flow::ts_utc_now(),
@@ -1075,6 +1138,7 @@ pub(crate) fn build_dispatch_record(
         orchestrator: None,
         prev_hash: None,
         hash: None,
+        payload,
     }
 }
 

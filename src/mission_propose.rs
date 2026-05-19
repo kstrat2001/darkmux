@@ -148,6 +148,32 @@ fn read_input(
 
 fn dispatch_compiler(input: &str, hint: Option<&str>) -> Result<String> {
     let message = build_compiler_message(input, hint);
+
+    // Emit mission.compile.start flow record (#204) — pairs with
+    // .complete below via the synthesized session_id so the viewer can
+    // measure compile wall-time + render the input/output sizes.
+    let synth_session_id = format!(
+        "mission-compile-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros())
+            .unwrap_or(0)
+    );
+    let input_chars = input.chars().count();
+    let compile_start_payload = serde_json::json!({
+        "input_chars": input_chars,
+        "has_hint": hint.is_some(),
+    });
+    let _ = crate::flow::record(crate::crew::dispatch::build_dispatch_record_with_payload(
+        crate::flow::Level::Info,
+        "mission.compile.start",
+        "mission-compiler",
+        &synth_session_id,
+        None,
+        Some(compile_start_payload),
+    ));
+    let compile_start_instant = std::time::Instant::now();
+
     let opts = crate::crew::dispatch::DispatchOpts {
         role_id: "mission-compiler".to_string(),
         message,
@@ -165,8 +191,34 @@ fn dispatch_compiler(input: &str, hint: Option<&str>) -> Result<String> {
         // default openclaw path while the internal runtime is opt-in only.
         runtime: crate::crew::dispatch::Runtime::Openclaw,
     };
-    let result = crate::crew::dispatch::dispatch(opts)
-        .context("dispatch to mission-compiler failed")?;
+    let dispatch_result = crate::crew::dispatch::dispatch(opts);
+
+    let wall_ms = compile_start_instant.elapsed().as_millis() as u64;
+    let (success, output_chars) = match &dispatch_result {
+        Ok(r) => (true, r.stdout.chars().count()),
+        Err(_) => (false, 0),
+    };
+    let compile_complete_payload = serde_json::json!({
+        "input_chars": input_chars,
+        "output_chars": output_chars,
+        "wall_ms": wall_ms,
+        "result_class": if success { "ok" } else { "error" },
+    });
+    let (action, level) = if success {
+        ("mission.compile.complete", crate::flow::Level::Info)
+    } else {
+        ("mission.compile.error", crate::flow::Level::Error)
+    };
+    let _ = crate::flow::record(crate::crew::dispatch::build_dispatch_record_with_payload(
+        level,
+        action,
+        "mission-compiler",
+        &synth_session_id,
+        None,
+        Some(compile_complete_payload),
+    ));
+
+    let result = dispatch_result.context("dispatch to mission-compiler failed")?;
     Ok(result.stdout)
 }
 

@@ -15,12 +15,18 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.5.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.6.0";
 // Version history:
 //   1.2.0 — added optional `model` (#106)
 //   1.3.0 — added optional `reasoning` + `mission_id`; new Stage::TierDecision (#136)
 //   1.4.0 — added optional `machine_id` + `orchestrator` (#167; substrate for #162 fleet UI)
 //   1.5.0 — added optional `prev_hash` + `hash` (#163; AuditFileSink chain-of-custody fields)
+//   1.6.0 — added optional `payload` JSON blob for event-specific fields. New action
+//           values for richer dispatch observability: `dispatch.turn`, `dispatch.tool`,
+//           `dispatch.compaction`, `dispatch.reasoning`, `mission.compile.start`,
+//           `mission.compile.complete`. Existing `dispatch.start/complete` carry
+//           runtime metadata in `payload` (runtime_path, prompt_chars, total_turns, etc.).
+//           Backward-compatible — older readers ignore the new field + new actions. (#204)
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -138,6 +144,25 @@ pub struct FlowRecord {
     /// reports the first divergence. Schema 1.5 addition (#163).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
+    /// Event-specific structured fields that aren't promoted to first-class
+    /// `FlowRecord` members. Schema 1.6 addition (#204) — gives new event
+    /// types (`dispatch.turn`, `dispatch.tool`, `dispatch.compaction`,
+    /// `dispatch.reasoning`, `mission.compile.start/complete`) a place to
+    /// carry their event-specific fields without growing the struct
+    /// indefinitely.
+    ///
+    /// Convention: keys are snake_case strings; values are typed by event
+    /// shape (e.g. `dispatch.tool` uses `tool_name: string`, `args_chars:
+    /// integer`, `result_chars: integer`, `success: boolean`). See the
+    /// emit sites in `dispatch.rs` / `dispatch_internal.rs` /
+    /// `mission_propose.rs` for the per-event-type payload shapes.
+    ///
+    /// Older records (pre-1.6) lack the field; viewer treats absence as
+    /// the empty object `{}`. New event types degrade to "action only" on
+    /// older viewers — they see the action string and the standard
+    /// FlowRecord fields, just not the event-specific extras.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
 }
 
 /// Resolve the flows directory from env override (`DARKMUX_FLOWS_DIR`) or
@@ -1648,6 +1673,7 @@ mod tests {
             orchestrator: None,
             prev_hash: None,
             hash: None,
+            payload: None,
         };
 
         record_at(&record, &path).unwrap();
@@ -1687,6 +1713,7 @@ mod tests {
             orchestrator: None,
             prev_hash: None,
             hash: None,
+            payload: None,
         };
 
         record_at(&r("first"), &path).unwrap();
@@ -1734,6 +1761,7 @@ mod tests {
             orchestrator: None,
             prev_hash: None,
             hash: None,
+            payload: None,
         };
 
         record_at(&record, &path).unwrap();
@@ -1798,6 +1826,7 @@ mod tests {
                 orchestrator: None,
                 prev_hash: None,
                 hash: None,
+                payload: None,
             },
             &tmp.path().join("custom.jsonl"),
         )
@@ -1841,6 +1870,7 @@ mod tests {
             orchestrator: None,
             prev_hash: None,
             hash: None,
+            payload: None,
         };
 
         record_at(&record, &path).unwrap();
@@ -1892,6 +1922,7 @@ mod tests {
             orchestrator: None,
             prev_hash: None,
             hash: None,
+            payload: None,
         };
 
         // Capture the day-key BEFORE calling record() so a midnight-UTC
@@ -2035,6 +2066,7 @@ mod tests {
             orchestrator: None,
             prev_hash: None,
             hash: None,
+            payload: None,
         };
         sink.write(&rec).unwrap();
 
@@ -2104,6 +2136,7 @@ mod tests {
             orchestrator: None,
             prev_hash: None,
             hash: None,
+            payload: None,
         };
 
         record_via(&sink, &rec).unwrap();
@@ -2142,6 +2175,7 @@ mod tests {
             orchestrator: None,
             prev_hash: None,
             hash: None,
+            payload: None,
         };
         tee.write(&rec).unwrap();
         tee.write(&rec).unwrap();
@@ -2194,6 +2228,7 @@ mod tests {
             orchestrator: None,
             prev_hash: None,
             hash: None,
+            payload: None,
         };
         let err = tee.write(&rec).unwrap_err();
         // Caller sees the error (so they can react if they want)
@@ -2232,6 +2267,7 @@ mod tests {
             orchestrator: None,
             prev_hash: None,
             hash: None,
+            payload: None,
         };
         super::record(rec).unwrap();
 
@@ -2265,7 +2301,11 @@ mod tests {
         //   1.5.0 — added optional `prev_hash` and `hash` fields for
         //           AuditFileSink's chain-of-custody (#163). Minor bump:
         //           absent in records from LocalFileSink (casual write path).
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.5.0");
+        //   1.6.0 — added optional `payload` JSON field for event-specific
+        //           data; new action types: dispatch.turn / .tool /
+        //           .compaction / .reasoning + mission.compile.start /
+        //           .complete (#204). Minor bump.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.6.0");
     }
 
     #[test]
@@ -2315,6 +2355,7 @@ mod tests {
             orchestrator: None,
             prev_hash: None,
             hash: None,
+            payload: None,
         };
         let serialized = serde_json::to_string(&rec).unwrap();
         assert!(!serialized.contains("reasoning"),
@@ -2347,6 +2388,7 @@ mod tests {
                 orchestrator: None,
                 prev_hash: None,
                 hash: None,
+                payload: None,
             },
             &path,
         )
@@ -2513,6 +2555,7 @@ mod tests {
             orchestrator: None,
             prev_hash: None,
             hash: None,
+            payload: None,
         };
         let s = serde_json::to_string(&rec).unwrap();
         assert!(!s.contains("machine_id"), "machine_id should omit when None: {s}");
@@ -2539,6 +2582,7 @@ mod tests {
             orchestrator: Some("claude-opus-4-7".to_string()),
             prev_hash: None,
             hash: None,
+            payload: None,
         };
         let s = serde_json::to_string(&rec).unwrap();
         let parsed: FlowRecord = serde_json::from_str(&s).unwrap();
@@ -2581,6 +2625,7 @@ mod tests {
             orchestrator: None,
             prev_hash: None,
             hash: None,
+            payload: None,
         };
         super::record(rec).unwrap();
 
@@ -2634,6 +2679,7 @@ mod tests {
             orchestrator: None,
             prev_hash: Some("seed".to_string()),
             hash: None,
+            payload: None,
         };
         let mut other = base.clone();
         other.hash = Some("anything".to_string());
@@ -2664,6 +2710,7 @@ mod tests {
             orchestrator: None,
             prev_hash: Some("seed".to_string()),
             hash: None,
+            payload: None,
         };
         let h1 = audit_hash_of(&base).unwrap();
 
@@ -2703,6 +2750,7 @@ mod tests {
                 orchestrator: None,
                 prev_hash: None, // sink stamps this
                 hash: None,      // sink stamps this
+                payload: None,
             };
             sink.write(&rec).unwrap();
         }
@@ -2749,6 +2797,7 @@ mod tests {
                 orchestrator: None,
                 prev_hash: None,
                 hash: None,
+                payload: None,
             };
             sink.write(&rec).unwrap();
         }
@@ -2810,6 +2859,7 @@ mod tests {
             orchestrator: None,
             prev_hash: None,
             hash: None,
+            payload: None,
         };
         sink.write(&rec).expect("recovery should not bail");
 
@@ -2872,6 +2922,7 @@ mod tests {
             orchestrator: None,
             prev_hash: None,
             hash: None,
+            payload: None,
         };
 
         sink_a.write(&mk("a1")).unwrap();
