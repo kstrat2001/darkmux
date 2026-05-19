@@ -24,6 +24,7 @@ mod runtime;
 mod serve;
 mod skills;
 mod external;
+mod migrate;
 mod mission_propose;
 mod flow_cli;
 mod role_cli;
@@ -510,6 +511,22 @@ enum MissionCmd {
         /// audit substrate captures *why* the mission grew here.
         #[arg(long)]
         reasoning: Option<String>,
+    },
+    /// Migrate mission + sprint storage from the pre-#148 flat layout
+    /// (`<crew>/missions/<id>.json`, `<crew>/sprints/<id>.json`) into the
+    /// per-mission nested layout (`<crew>/missions/<id>/mission.json`,
+    /// `<crew>/missions/<id>/sprints/<sprint-id>.json`).
+    ///
+    /// Dry-run by default — prints the proposed moves without touching any
+    /// files. Pass `--apply` to commit the migration. Idempotent: re-running
+    /// after a successful apply is a no-op. Orphan sprints (whose
+    /// `mission_id` has no matching mission on disk) are reported but never
+    /// auto-moved; operator resolves them manually.
+    Migrate {
+        /// Apply the migration. Without this flag, only the proposed
+        /// moves are printed (dry-run).
+        #[arg(long)]
+        apply: bool,
     },
 }
 
@@ -1094,6 +1111,24 @@ fn cmd_mission(sub: MissionCmd) -> Result<i32> {
                 "mission `{}` ← added sprint `{}`{}",
                 mission_id, s.id, position
             );
+            Ok(0)
+        }
+        MissionCmd::Migrate { apply } => {
+            let plan = migrate::plan_migration()?;
+            migrate::print_plan(&plan);
+            if !apply {
+                if !plan.is_empty() {
+                    println!("\nRe-run with --apply to commit.");
+                }
+                return Ok(0);
+            }
+            migrate::apply_migration(&plan)?;
+            if !plan.is_empty() {
+                println!(
+                    "\nmigrate: applied {} move(s).",
+                    plan.mission_moves.len() + plan.sprint_moves.len()
+                );
+            }
             Ok(0)
         }
     }
