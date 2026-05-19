@@ -72,6 +72,9 @@
       <option value="focus">Focus</option>
       <option value="mission">Mission</option>
     </select>
+    <select slot="pills" class="dx-pill" id="topology-mission-select" title="filter by mission (Mission mode)">
+      <option value="">(no mission selected)</option>
+    </select>
   </dx-shell>
   <main>
     <div id="topology-root"></div>
@@ -461,6 +464,29 @@
       return nodes;
     }
 
+    /**
+     * Mission mode reuses fleet layout, but dims non-mission nodes
+     * and highlights mission edges.
+     *
+     * @returns {Array<Node>} React Flow nodes — same shape as layoutFleet,
+     *   but with opacity and emphasis applied per mission membership.
+     */
+    function layoutMission({ orchestrators, machines, missions, mission_id }) {
+      const fleet = layoutFleet({ orchestrators, machines, missions });
+      if (!mission_id) return fleet.map(n => ({ ...n, style: { ...n.style, opacity: 0.3 } }));
+      const target = missions.find(m => m.mission_id === mission_id);
+      if (!target) return fleet.map(n => ({ ...n, style: { ...n.style, opacity: 0.3 } }));
+      const hotMachines = new Set(target.machines);
+      const hotOrchs = new Set(target.orchestrators);
+      return fleet.map(n => {
+        let hot = false;
+        if (n.id.startsWith('mach:')) hot = hotMachines.has(n.id.slice('mach:'.length));
+        else if (n.id.startsWith('orch:')) hot = hotOrchs.has(n.id.slice('orch:'.length));
+        else if (n.id.startsWith('miss:')) hot = n.id === `miss:${mission_id}`;
+        return { ...n, style: { ...n.style, opacity: hot ? 1 : 0.25 } };
+      });
+    }
+
     // ─── data sources ─────────────────────────────────────────────────────
     function parseJSONL(text) {
       return text.split('\n').filter(l => l.trim()).map(l => {
@@ -494,6 +520,7 @@
       const [records, setRecords] = useState([]);
       const [mode, setMode] = useState('fleet');
       const [focusMachine, setFocusMachine] = useState(null);
+      const [missionId, setMissionId] = useState(null);
 
       useEffect(() => {
         const f = new URLSearchParams(location.search).get('fixture');
@@ -533,10 +560,42 @@
         setFocusMachine(best?.machine_id || null);
       }, [mode, machines, focusMachine]);
 
-      const edges = useMemo(() =>
-        deriveEdges(records, { mode, focus_machine: focusMachine }),
-        [records, mode, focusMachine]
-      );
+      // Sync the mission-picker options with aggregated missions.
+      useEffect(() => {
+        const el = document.getElementById('topology-mission-select');
+        if (!el) return;
+        // Rebuild options: blank + each mission.
+        const current = el.value;
+        el.innerHTML = '<option value="">(no mission selected)</option>' +
+          missions.map(m => `<option value="${m.mission_id}">${m.mission_id}</option>`).join('');
+        // Preserve current selection if still valid.
+        el.value = missions.some(m => m.mission_id === current) ? current : '';
+      }, [missions]);
+
+      // Listen for picker change.
+      useEffect(() => {
+        const el = document.getElementById('topology-mission-select');
+        if (!el) return;
+        const onChange = () => setMissionId(el.value || null);
+        el.addEventListener('change', onChange);
+        return () => el.removeEventListener('change', onChange);
+      }, []);
+
+      // Hide picker when mode !== 'mission'.
+      useEffect(() => {
+        const el = document.getElementById('topology-mission-select');
+        if (!el) return;
+        el.style.display = mode === 'mission' ? '' : 'none';
+      }, [mode]);
+
+      const edges = useMemo(() => {
+        const opts = { mode, focus_machine: focusMachine, mission_id: missionId };
+        const raw = deriveEdges(records, opts);
+        if (mode === 'mission' && missionId) {
+          return raw.map(e => ({ ...e, style: { ...e.style, strokeWidth: 2.5 } }));
+        }
+        return raw;
+      }, [records, mode, focusMachine, missionId]);
 
       const nodes = useMemo(() => {
         if (records.length === 0) {
@@ -552,8 +611,9 @@
           const roles = aggregateRoles(records, focusMachine);
           return layoutFocus({ orchestrators, focus_machine: focusMachine, roles, missions });
         }
-        return []; // Mission mode in Task 9
-      }, [mode, records, orchestrators, machines, missions, focusMachine]);
+        if (mode === 'mission') return layoutMission({ orchestrators, machines, missions, mission_id: missionId });
+        return [];
+      }, [mode, records, orchestrators, machines, missions, focusMachine, missionId]);
 
       return (
         <>
