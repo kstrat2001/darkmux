@@ -1,0 +1,13 @@
+# Spike-local .gitignore.
+#
+# The repo's top-level .gitignore already excludes `target/` globally,
+# so this file is mostly redundant — kept for clarity so anyone landing
+# in this subdir directly (looking at the spike in isolation) sees the
+# crate's intent. Convention: bin crates with a committed Cargo.lock,
+# explicit /target ignore, no other secrets.
+
+/target
+
+# Editor / OS noise (redundant with root but kept local for clarity)
+*.swp
+.DS_Store

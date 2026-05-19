@@ -1,0 +1,36 @@
+[package]
+name = "darkmux-runtime"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Container-bounded in-house agent runtime for darkmux — see README.md"
+publish = false
+
+[[bin]]
+name = "darkmux-runtime"
+path = "src/main.rs"
+
+[dependencies]
+# Error handling — matches the main darkmux crate convention.
+anyhow = "1"
+
+# OpenAI chat-completions request/response shapes.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# HTTP client. ureq is blocking + tokio-free → smaller binary + simpler
+# call sites. The agent loop is inherently sequential per dispatch, so
+# async buys us nothing here.
+#
+# rustls-tls keeps the build alpine-friendly (no native openssl link).
+ureq = { version = "2", default-features = false, features = ["json", "tls"] }
+
+[dev-dependencies]
+# Workspace-root path validation tests need real filesystem with
+# tempdir + symlink support. tempdir is the simpler crate.
+tempdir = "0.3"
+
+[profile.release]
+strip = "symbols"
+lto = "thin"
+codegen-units = 1

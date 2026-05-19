@@ -161,6 +161,9 @@ fn dispatch_compiler(input: &str, hint: Option<&str>) -> Result<String> {
         // mission-compiler runs BEFORE any mission/sprints exist on disk —
         // there's nothing to bind to and no parent context to inject.
         sprint_id: None,
+        // Mission propose is a system-level admin dispatch; always the
+        // default openclaw path while the internal runtime is opt-in only.
+        runtime: crate::crew::dispatch::Runtime::Openclaw,
     };
     let result = crate::crew::dispatch::dispatch(opts)
         .context("dispatch to mission-compiler failed")?;

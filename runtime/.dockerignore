@@ -1,0 +1,30 @@
+# Build artifacts — never want these in the docker build context (they
+# would be sent to the daemon and slow the build down without ending up
+# in the image).
+target/
+**/target/
+
+# Rust-specific backup + temp files cargo may create
+**/*.rs.bk
+Cargo.lock.bak
+
+# Editor / OS noise
+*.swp
+*.swo
+.DS_Store
+.idea/
+.vscode/
+
+# Git state — the container doesn't need history
+.git/
+.gitignore
+.dockerignore
+
+# Logs + temp output from running the binary locally (testing on host)
+*.log
+*.tmp
+
+# Documentation isn't COPY'd by the Dockerfile so it would be wasted
+# context. Keep this exclusion explicit so the build context stays
+# minimal even if README.md grows.
+README.md
