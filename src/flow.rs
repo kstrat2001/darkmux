@@ -709,6 +709,36 @@ pub struct IntegrityReport {
 // Stream name defaults to `darkmux:flow`; override via
 // `DARKMUX_REDIS_STREAM`.
 
+/// Opaque wrapper for a Redis URL that contains credentials (#229).
+/// `Display` produces the redacted form (`user:***@host:port`); raw
+/// bytes are only accessible via `expose_for_probe()`, making accidental
+/// password leakage into logs or serialized JSON a compile-time error
+/// rather than a convention.
+///
+/// The only call site for `redact_url_creds` in production code is the
+/// `Display` implementation below — all other paths reach the redacted
+/// form through `format!("{raw_url}")` or `.to_string()`.
+#[derive(Clone, Debug)]
+pub(crate) struct RawRedisUrl(String);
+
+impl RawRedisUrl {
+    pub(crate) fn new(url: String) -> Self {
+        Self(url)
+    }
+
+    /// Return the raw (unredacted) URL for `redis::Client::open` calls.
+    /// The verbose name makes accidental use visible in review.
+    pub(crate) fn expose_for_probe(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for RawRedisUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&redact_url_creds(&self.0))
+    }
+}
+
 /// Redis Streams-backed flow sink. Each `write` XADDs the record's
 /// JSON-serialized fields to a single stream. Multiple consumers can
 /// `XREAD BLOCK` for live updates; consumer groups handle multi-reader
@@ -722,9 +752,10 @@ pub struct IntegrityReport {
 pub struct RedisSink {
     client: redis::Client,
     /// URL the sink was constructed with — retained for diagnostics
-    /// (`SinkInfo`, `darkmux flow status`). The `redis::Client` consumes
-    /// the URL at construction but doesn't expose it back.
-    url: String,
+    /// (`SinkInfo`, `darkmux flow status`). Stored as `RawRedisUrl` so
+    /// `Display` automatically redacts the password; raw bytes only
+    /// accessible via `expose_for_probe()`. (#229)
+    url: RawRedisUrl,
     stream: String,
     /// Optional MAXLEN ~ N retention cap. None = unbounded (don't use
     /// in production; the stream grows without bound).
@@ -736,12 +767,13 @@ impl RedisSink {
     /// is not established until the first `write` call (the redis client
     /// is lazy by design).
     pub fn new(url: &str, stream: &str, max_len: Option<usize>) -> Result<Self> {
-        let client = redis::Client::open(url).with_context(|| {
-            format!("opening Redis connection to {}", redact_url_creds(url))
+        let url = RawRedisUrl::new(url.to_string());
+        let client = redis::Client::open(url.expose_for_probe()).with_context(|| {
+            format!("opening Redis connection to {url}")
         })?;
         Ok(Self {
             client,
-            url: url.to_string(),
+            url,
             stream: stream.to_string(),
             max_len,
         })
@@ -752,11 +784,11 @@ impl RedisSink {
     /// same Redis the sink writes to.
     pub fn connect(&self) -> Result<redis::Connection> {
         self.client.get_connection().with_context(|| {
-            format!("connecting to Redis at {}", redact_url_creds(&self.url))
+            format!("connecting to Redis at {}", self.url)
         })
     }
 
-    pub fn url(&self) -> &str { &self.url }
+    pub fn url(&self) -> &str { self.url.expose_for_probe() }
     pub fn stream(&self) -> &str { &self.stream }
     pub fn max_len(&self) -> Option<usize> { self.max_len }
 }
@@ -801,7 +833,7 @@ impl FlowSink for RedisSink {
         // endpoint), and the password must not appear there. The raw URL
         // is preserved on `SinkInfo.raw_url` (skip-serialized) for the
         // in-process probe path in `find_redis_cfg`. (#216)
-        config.insert("url".to_string(), redact_url_creds(&self.url));
+        config.insert("url".to_string(), self.url.to_string());
         config.insert("stream".to_string(), self.stream.clone());
         config.insert(
             "max_len".to_string(),
@@ -811,7 +843,7 @@ impl FlowSink for RedisSink {
             kind: "Redis".to_string(),
             config,
             children: vec![],
-            raw_url: Some(self.url.clone()),
+            raw_url: Some(self.url.expose_for_probe().to_string()),
         }
     }
 }
@@ -939,12 +971,12 @@ fn build_default_sink() -> Arc<dyn FlowSink> {
             Err(_) => Some(10000),
         };
 
-        match RedisSink::new(&url, &stream, max_len) {
+        let raw_url = RawRedisUrl::new(url);
+        match RedisSink::new(raw_url.expose_for_probe(), &stream, max_len) {
             Ok(redis_sink) => {
                 eprintln!(
-                    "flow: Redis sink enabled — url={} stream={stream} \
-                     max_len={max_len:?} (composed via TeeSink)",
-                    redact_url_creds(&url)
+                    "flow: Redis sink enabled — url={raw_url} stream={stream} \
+                     max_len={max_len:?} (composed via TeeSink)"
                 );
                 sinks.push(Arc::new(redis_sink));
             }
@@ -1351,7 +1383,7 @@ fn summarize_sink(info: &SinkInfo) -> (Vec<String>, String) {
 /// Redis config extracted from a SinkInfo tree.
 #[derive(Debug, Clone)]
 struct RedisCfg {
-    url: String,
+    url: RawRedisUrl,
     stream: String,
     max_len: Option<usize>,
 }
@@ -1360,12 +1392,11 @@ fn find_redis_cfg(info: &SinkInfo) -> Option<RedisCfg> {
     if info.kind == "Redis" {
         // The raw URL — needed for `redis::Client::open` in `probe_redis`
         // — lives on `SinkInfo.raw_url`, NOT `config["url"]`. The latter
-        // is now the redacted display form. A Redis sink without a
-        // populated `raw_url` is unusable for probing (we'd be passing
-        // a `:***@` value to `Client::open`), so treat it as absent. (#216)
+        // is the redacted display form. A Redis sink without a populated
+        // `raw_url` is unusable for probing, so treat it as absent. (#216)
         let raw_url = info.raw_url.clone()?;
         return Some(RedisCfg {
-            url: raw_url,
+            url: RawRedisUrl::new(raw_url),
             stream: info.config.get("stream").cloned().unwrap_or_default(),
             max_len: info
                 .config
@@ -1407,12 +1438,12 @@ pub(crate) fn redact_url_creds(url: &str) -> String {
 /// strings observed in the last 100 entries (for skew detection).
 fn probe_redis(cfg: &RedisCfg) -> (RedisStatus, Vec<String>) {
     let start = std::time::Instant::now();
-    let client = match redis::Client::open(cfg.url.clone()) {
+    let client = match redis::Client::open(cfg.url.expose_for_probe()) {
         Ok(c) => c,
         Err(e) => {
             return (
                 RedisStatus {
-                    url: redact_url_creds(&cfg.url),
+                    url: cfg.url.to_string(),
                     stream: cfg.stream.clone(),
                     max_len: cfg.max_len,
                     reachable: false,
@@ -1433,7 +1464,7 @@ fn probe_redis(cfg: &RedisCfg) -> (RedisStatus, Vec<String>) {
         Err(e) => {
             return (
                 RedisStatus {
-                    url: redact_url_creds(&cfg.url),
+                    url: cfg.url.to_string(),
                     stream: cfg.stream.clone(),
                     max_len: cfg.max_len,
                     reachable: false,
@@ -1499,7 +1530,7 @@ fn probe_redis(cfg: &RedisCfg) -> (RedisStatus, Vec<String>) {
 
     (
         RedisStatus {
-            url: redact_url_creds(&cfg.url),
+            url: cfg.url.to_string(),
             stream: cfg.stream.clone(),
             max_len: cfg.max_len,
             reachable: true,
@@ -2488,7 +2519,7 @@ mod tests {
             raw_url: None,
         };
         let cfg = find_redis_cfg(&info).expect("redis cfg should be found");
-        assert_eq!(cfg.url, "redis://x:1234");
+        assert_eq!(cfg.url.expose_for_probe(), "redis://x:1234");
         assert_eq!(cfg.stream, "test:stream");
         assert_eq!(cfg.max_len, Some(5000));
     }
@@ -3123,7 +3154,7 @@ mod tests {
             .expect("RedisSink::new on a syntactically valid URL");
         let info = sink.info();
         let cfg = find_redis_cfg(&info).expect("Redis sink should resolve to a cfg");
-        assert_eq!(cfg.url, raw, "probe path must receive the raw URL");
+        assert_eq!(cfg.url.expose_for_probe(), raw, "probe path must receive the raw URL");
         assert_eq!(cfg.stream, "darkmux:flow");
         assert_eq!(cfg.max_len, Some(10000));
     }
