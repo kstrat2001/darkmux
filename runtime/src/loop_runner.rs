@@ -8,9 +8,17 @@
 //! Phase 6 added compaction via `crate::compaction`: token-count-aware
 //! middle-replace strategy that summarizes via a companion model.
 //!
-//! Still omitted (Phase 7+ if measurements show they're needed):
+//! Phase 7 (#205) added SSE streaming for the main turn chat() call:
+//! delta chunks accumulate into the same `ChatResponse` shape the loop
+//! used to receive from non-streaming, and per-chunk `model.partial`
+//! events land in the trajectory so a second observer can `tail -F`
+//! and see the dispatch making progress mid-turn. The companion
+//! compactor model (`compaction::compact`) stays non-streaming — it's a
+//! short fire-and-forget summarization call where mid-turn observability
+//! doesn't matter.
 //!
-//! - No streaming. Single-shot completions only.
+//! Still omitted (Phase 8+ if measurements show they're needed):
+//!
 //! - No retries on transient failures. A network blip aborts the loop.
 //! - No per-profile threshold derivation (compaction threshold is env-
 //!   tunable but global, not derived from active darkmux profile).
@@ -18,7 +26,7 @@
 use anyhow::{anyhow, Result};
 
 use crate::compaction;
-use crate::lmstudio::{ChatRequest, LmStudioClient, Message};
+use crate::lmstudio::{ChatRequest, ChunkAccumulator, LmStudioClient, Message};
 use crate::tools::{dispatch, Tool};
 use crate::trajectory::Trajectory;
 
@@ -59,12 +67,21 @@ pub struct LoopOutcome {
 /// tool.completed, compaction). When the recorder was opened against
 /// an unwritable path, its methods are no-ops — the loop runs the same
 /// either way.
+///
+/// `streaming` switches the per-turn chat call between SSE-streamed
+/// (default; emits model.partial trajectory events as chunks arrive)
+/// and single-shot non-streaming (opt-out for tests/benchmarks where
+/// determinism or simpler trajectory size matters). The accumulated
+/// final response is identical either way; the rest of the loop
+/// (tool dispatch, compaction triggering, finish_reason handling)
+/// doesn't change.
 pub fn run(
     client: &LmStudioClient,
     model: &str,
     initial_messages: Vec<Message>,
     tools: &[Tool],
     trajectory: &mut Trajectory,
+    streaming: bool,
 ) -> Result<LoopOutcome> {
     let mut messages = initial_messages;
     let tool_defs: Vec<_> = tools.iter().map(|t| t.to_tool_def()).collect();
@@ -92,7 +109,12 @@ pub fn run(
             max_tokens: None,
         };
 
-        let response = client.chat(&request)?;
+        let next_seq = turns + 1;
+        let response = if streaming {
+            run_streaming_turn(client, &request, next_seq, trajectory)?
+        } else {
+            client.chat(&request)?
+        };
         turns += 1;
 
         if let Some(usage) = &response.usage {
@@ -245,6 +267,58 @@ pub fn run(
             }
         }
     }
+}
+
+/// Run one SSE-streamed turn: consume the chunk iterator, emit a
+/// `model.partial` trajectory event per chunk (stats only — no content
+/// in the events to keep `trajectory.jsonl` bounded), and return the
+/// accumulated `ChatResponse` shaped identically to a non-streaming
+/// response. (#205)
+///
+/// Reasoning content delivered via the separate-field stream
+/// (`Delta.reasoning_content`, the Qwen 3 / DeepSeek pattern) is
+/// extracted from the accumulator and emitted as a `model.reasoning`
+/// trajectory event with `format=separate-field`, mirroring the
+/// inline-`<think>`-tag path that the caller handles post-turn.
+fn run_streaming_turn(
+    client: &LmStudioClient,
+    request: &ChatRequest,
+    seq: u32,
+    trajectory: &mut Trajectory,
+) -> Result<crate::lmstudio::ChatResponse> {
+    trajectory.append_model_streaming_start(seq);
+    let mut accumulator = ChunkAccumulator::new();
+    let mut last_content_bytes: usize = 0;
+    let stream = client.chat_streaming(request)?;
+    for chunk_result in stream {
+        let chunk = chunk_result?;
+        let partial_index = accumulator.ingest(&chunk);
+        let cumulative = accumulator.content_bytes();
+        let delta_bytes = cumulative.saturating_sub(last_content_bytes);
+        last_content_bytes = cumulative;
+        trajectory.append_model_partial(
+            seq,
+            partial_index,
+            delta_bytes,
+            cumulative,
+            accumulator.has_tool_calls(),
+        );
+    }
+    let partial_count = accumulator.partial_count();
+    let total_content = accumulator.content_bytes();
+    let reasoning_content = accumulator.take_reasoning_content();
+    let response = accumulator.into_response();
+    let tool_calls_count = response
+        .choices
+        .first()
+        .and_then(|c| c.message.tool_calls.as_ref())
+        .map(|tc| tc.len())
+        .unwrap_or(0);
+    trajectory.append_model_streaming_end(seq, partial_count, total_content, tool_calls_count);
+    if let Some(reasoning) = reasoning_content {
+        trajectory.append_model_reasoning(seq, &reasoning, "separate-field");
+    }
+    Ok(response)
 }
 
 /// Extract `<think>...</think>` block contents from a string. Returns

@@ -14,9 +14,9 @@
 //!
 //! - `--check`            → container environment probe
 //! - `--version`          → version
-//! - `run --model <id> --system <text> --prompt <text>`
-//!                        → run a single tool-call loop to completion;
-//!                          print the final assistant message + metrics
+//! - `run --model <id> --system <text> --prompt <text>` →
+//!   run a single tool-call loop to completion; print the final
+//!   assistant message + metrics
 //!
 //! See `README.md` for the architectural context.
 
@@ -57,7 +57,7 @@ fn main() -> ExitCode {
             println!("Usage:");
             println!("  darkmux-runtime --check");
             println!("  darkmux-runtime --version");
-            println!("  darkmux-runtime run --model <id> --system <text> --prompt <text>");
+            println!("  darkmux-runtime run --model <id> --system <text> --prompt <text> [--no-stream]");
             ExitCode::SUCCESS
         }
     }
@@ -116,6 +116,11 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     let mut prompt: Option<String> = None;
     let mut system: Option<String> = None;
     let mut base_url: Option<String> = None;
+    // Streaming is on by default (#205). Operators / tests pass
+    // `--no-stream` to fall back to the Phase 2 single-shot path —
+    // useful for deterministic benchmarks or when a runtime regression
+    // is suspected to involve the streaming layer specifically.
+    let mut streaming: bool = true;
 
     let mut i = 0;
     while i < args.len() {
@@ -155,6 +160,10 @@ fn run_dispatch(args: &[String]) -> ExitCode {
                     eprintln!("--base-url requires a value");
                     return ExitCode::from(2);
                 }
+            }
+            "--no-stream" => {
+                streaming = false;
+                i += 1;
             }
             other => {
                 eprintln!("unknown flag: {other}");
@@ -234,7 +243,14 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     let prompt_chars = initial_messages[1].content.as_deref().map(str::len).unwrap_or(0);
     traj.append_dispatch_start(&model, system_chars, prompt_chars);
 
-    let run_result = loop_runner::run(&client, &model, initial_messages, &tools, &mut traj);
+    let run_result = loop_runner::run(
+        &client,
+        &model,
+        initial_messages,
+        &tools,
+        &mut traj,
+        streaming,
+    );
 
     let (outcome, success) = match run_result {
         Ok(o) => (Some(o), true),
