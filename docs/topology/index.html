@@ -79,6 +79,38 @@
     const TOPOLOGY_VERSION = '0.5.0';
     const EXPECTED_FLOW_SCHEMA_MAJOR = 1;
 
+    // ─── pure-function unit harness ──────────────────────────────────────
+    // Runs at boot when ?test=1 is set. Each test pushes into `__tests`;
+    // summary is rendered into <pre id="dx-test-summary"> and console.
+
+    const __tests = [];
+    function test(name, fn) { __tests.push({ name, fn }); }
+    function assertEqual(actual, expected, msg = '') {
+      const a = JSON.stringify(actual);
+      const e = JSON.stringify(expected);
+      if (a !== e) throw new Error(`${msg} expected ${e}, got ${a}`);
+    }
+    function runUnitTests() {
+      const results = __tests.map(({ name, fn }) => {
+        try { fn(); return { name, ok: true }; }
+        catch (e) { return { name, ok: false, err: String(e.message || e) }; }
+      });
+      const pass = results.filter(r => r.ok).length;
+      const fail = results.length - pass;
+      const summary = `PASS ${pass} / FAIL ${fail}\n` +
+        results.map(r => r.ok ? `  ✓ ${r.name}` : `  ✗ ${r.name} — ${r.err}`).join('\n');
+      console.log(summary);
+      const out = document.createElement('pre');
+      out.id = 'dx-test-summary';
+      out.textContent = summary;
+      out.style.cssText = 'position:fixed;top:60px;right:12px;background:#0a0a0b;color:#e8e6e3;padding:12px;border:1px solid #1f1f24;font:11px/1.4 ui-monospace,monospace;max-width:480px;max-height:60vh;overflow:auto;z-index:9999;white-space:pre-wrap';
+      document.body.appendChild(out);
+      return { pass, fail };
+    }
+
+    // First test — proves the harness wires up. Real tests follow in later tasks.
+    test('harness smoke', () => { assertEqual(1 + 1, 2); });
+
     function App() {
       const nodes = [{ id: 'hello', position: { x: 0, y: 0 }, data: { label: 'Topology view — Task 1 smoke' } }];
       const edges = [];
@@ -91,6 +123,9 @@
         </div>
       );
     }
+
+    const params = new URLSearchParams(location.search);
+    if (params.get('test') === '1') runUnitTests();
 
     ReactDOM.createRoot(document.getElementById('topology-root')).render(<App />);
   </script>
