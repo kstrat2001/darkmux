@@ -8,6 +8,28 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+<!-- React + ReactDOM + Babel + ReactFlow via CDN, pinned + SRI-checked.
+     Browser refuses to execute scripts whose SHA-384 doesn't match. If
+     you upgrade a version below, regenerate the integrity hash via:
+       curl -sL <url> | openssl dgst -sha384 -binary | openssl base64 -A -->
+<script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"
+        integrity="sha384-DGyLxAyjq0f9SPpVevD6IgztCFlnMF6oW/XQGmfe+IsZ8TqEiDrcHkMLKI6fiB/Z"
+        crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"
+        integrity="sha384-gTGxhz21lVGYNMcdJOyq01Edg0jhn/c22nsx0kyqP0TxaV5WVdsSH1fSDUf5YJj1"
+        crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.4/babel.min.js"
+        integrity="sha384-qVgGRi0TCdh+xrBD9+4kG0YlkbOkWu2J3CB46EekpYQmtM96n9v+uaKIS5ipaqKb"
+        crossorigin="anonymous"></script>
+<script src="https://unpkg.com/reactflow@11.11.4/dist/umd/index.js"
+        integrity="sha384-lA1w00Vex5qXDv4/xYJO/e8SCjfdlNghbTP+s+2zl37rCEAC7trsSRpYrv/JQy5y"
+        crossorigin="anonymous"></script>
+<link rel="stylesheet"
+      href="https://unpkg.com/reactflow@11.11.4/dist/style.css"
+      integrity="sha384-uySezIHhsCs2A2+GIarZ89Bi2gd6yjY0I1FFVamfrk6hgEUWLuBYlXA7bYr6dHaJ"
+      crossorigin="anonymous">
+
 <link rel="stylesheet" href="../shared/shell.css">
 <style>
   * { box-sizing: border-box; }
@@ -24,76 +46,930 @@
   main {
     flex: 1;
     display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 32px;
+    align-items: stretch;
+    justify-content: stretch;
+    padding: 0;
     min-height: 0;
   }
-  .empty-state {
-    max-width: 640px;
-    text-align: center;
-  }
-  .empty-state h1 {
-    margin: 0 0 12px;
-    font-size: 22px;
-    font-weight: 600;
-    color: var(--text);
-    letter-spacing: -0.01em;
-  }
-  .empty-state .sub {
-    color: var(--muted);
-    font-size: 14px;
-    margin: 0 0 24px;
-  }
-  .empty-state .preview {
-    margin: 32px 0;
-    padding: 24px;
-    border: 1px dashed var(--border);
-    border-radius: 6px;
+
+  /* React Flow container */
+  .react-flow__renderer { background: var(--bg) !important; }
+  .react-flow__node {
+    border: 1px solid var(--border);
     background: var(--bg-elev);
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 12px;
-    color: var(--muted);
-    line-height: 1.6;
-    text-align: left;
+    color: var(--text);
+    border-radius: 6px;
+    padding: 14px 18px;
+    font-size: 13px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.3);
   }
-  .empty-state .preview strong { color: var(--accent); font-weight: 600; }
-  .empty-state .preview .dim { color: var(--dim); }
-  .empty-state .link {
-    color: var(--accent);
-    text-decoration: none;
-    border-bottom: 1px dotted var(--accent-dim);
+
+  /* replay scrubber bar */
+  .dx-scrubber {
+    position: fixed; left: 12px; right: 12px; bottom: 12px;
+    display: flex; gap: 10px; align-items: center;
+    padding: 8px 12px; background: var(--bg-elev); border: 1px solid var(--border);
+    border-radius: 6px; z-index: 30;
   }
-  .empty-state .link:hover { color: var(--text); border-bottom-color: var(--accent); }
+  .dx-scrubber input[type="range"] {
+    -webkit-appearance: none; appearance: none;
+    height: 4px; background: var(--border); border-radius: 2px;
+  }
+  .dx-scrubber input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none;
+    width: 14px; height: 14px; border-radius: 50%;
+    background: var(--accent); cursor: pointer;
+  }
+
+  /* live cue: recent edges flow dashes */
+  .topology-edge-active .react-flow__edge-path {
+    stroke-dasharray: 6 4;
+    animation: topology-flow-dash 0.6s linear infinite;
+  }
+  @keyframes topology-flow-dash {
+    to { stroke-dashoffset: -10; }
+  }
+
+  /* live cue: node pulse on record arrival */
+  .topology-node-pulse .react-flow__node-default,
+  .react-flow__node.topology-node-pulse {
+    animation: topology-pulse 2s ease-out;
+  }
+  @keyframes topology-pulse {
+    0%   { box-shadow: 0 0 0 0 var(--accent), 0 2px 8px rgba(0,0,0,0.3); }
+    100% { box-shadow: 0 0 0 14px transparent, 0 2px 8px rgba(0,0,0,0.3); }
+  }
+
+  /* schema-version mismatch banner */
+  .topology-schema-banner {
+    position: fixed; top: 56px; left: 12px; right: 12px;
+    padding: 10px 14px; background: var(--bg-elev2); color: var(--warn);
+    border: 1px solid var(--warn); border-radius: 6px;
+    font-size: 13px; z-index: 25;
+  }
+  .topology-schema-banner code { background: var(--bg); padding: 1px 5px; border-radius: 2px; }
+
+  /* narrow viewport polish */
+  @media (max-width: 720px) {
+    .react-flow__node { font-size: 11px; padding: 8px 10px; }
+    .dx-scrubber { left: 6px; right: 6px; bottom: 6px; padding: 6px 8px; gap: 6px; flex-wrap: wrap; }
+    .dx-scrubber #scrubber-range { min-width: 100%; order: 99; flex: 0 0 100%; }
+    .dx-scrubber #scrubber-readout { font-size: 10px; min-width: 0; }
+    .topology-schema-banner { top: 48px; font-size: 11px; padding: 8px 10px; }
+  }
 </style>
 </head>
 <body>
-  <dx-shell active-tab="topology"></dx-shell>
+  <dx-shell active-tab="topology">
+    <select slot="pills" class="dx-pill" id="topology-mode-select" title="topology view mode">
+      <option value="fleet">Fleet</option>
+      <option value="focus">Focus</option>
+      <option value="mission">Mission</option>
+    </select>
+    <select slot="pills" class="dx-pill" id="topology-mission-select" title="filter by mission (Mission mode)">
+      <option value="">(no mission selected)</option>
+    </select>
+    <button slot="pills" type="button" class="dx-pill" id="topology-source-pill" title="data source">
+      <span id="topology-source-label">source: …</span>
+    </button>
+  </dx-shell>
   <main>
-    <div class="empty-state">
-      <h1>Topology view — coming in M3</h1>
-      <p class="sub">
-        Live + replay diagram of darkmux fleet activity: orchestrators, machines, crew roles, models, missions.
-      </p>
-      <div class="preview">
-        <strong>Planned nodes:</strong><br>
-        &nbsp;&nbsp;Machine (group) · Orchestrator · Crew role · Model · Mission<br>
-        <br>
-        <strong>Planned edges:</strong><br>
-        &nbsp;&nbsp;<span class="dim">stage:</span> dispatch · tier-decision · review · ship<br>
-        <br>
-        <strong>Modes:</strong><br>
-        &nbsp;&nbsp;Fleet (N≥3 machines) · Focus (single) · Mission (filtered)<br>
-        <br>
-        <strong>Live cues:</strong><br>
-        &nbsp;&nbsp;edge motion · node pulse · wall-clock arcs
-      </div>
-      <p class="sub">
-        Specification:
-        <a class="link" href="https://github.com/kstrat2001/darkmux/issues/169" target="_blank" rel="noopener">#169 — Topology view IA design spec</a>
-      </p>
+    <div id="topology-root"></div>
+    <div id="topology-scrubber" class="dx-scrubber" hidden>
+      <button type="button" class="dx-pill" id="scrubber-step" title="step to next record">&#9654;|</button>
+      <select class="dx-pill" id="scrubber-speed" title="replay speed">
+        <option value="0">&#9208; pause</option>
+        <option value="1" selected>1&times;</option>
+        <option value="4">4&times;</option>
+        <option value="16">16&times;</option>
+      </select>
+      <input type="range" id="scrubber-range" min="0" max="100" value="0" step="1" style="flex:1">
+      <span id="scrubber-readout" class="mono" style="min-width:160px;text-align:right;font-size:11px;color:var(--muted)"></span>
     </div>
   </main>
-  <script src="../shared/shell.js"></script>
+  <script src="../shared/shell.js" defer></script>
+  <script type="text/babel" data-presets="react">
+    const { useState, useEffect, useMemo, useRef, useCallback } = React;
+    const ReactFlow = window.ReactFlow.default;
+    const { Background, Controls, MarkerType, Handle, Position } = window.ReactFlow;
+
+    const TOPOLOGY_VERSION = '0.5.0';
+    const EXPECTED_FLOW_SCHEMA_MAJOR = 1;
+
+    // ─── pure-function unit harness ──────────────────────────────────────
+    // Runs at boot when ?test=1 is set. Each test pushes into `__tests`;
+    // summary is rendered into <pre id="dx-test-summary"> and console.
+
+    const __tests = [];
+    function test(name, fn) { __tests.push({ name, fn }); }
+    function assertEqual(actual, expected, msg = '') {
+      const a = JSON.stringify(actual);
+      const e = JSON.stringify(expected);
+      if (a !== e) throw new Error(`${msg} expected ${e}, got ${a}`);
+    }
+    function runUnitTests() {
+      const results = __tests.map(({ name, fn }) => {
+        try { fn(); return { name, ok: true }; }
+        catch (e) { return { name, ok: false, err: String(e.message || e) }; }
+      });
+      const pass = results.filter(r => r.ok).length;
+      const fail = results.length - pass;
+      const summary = `PASS ${pass} / FAIL ${fail}\n` +
+        results.map(r => r.ok ? `  ✓ ${r.name}` : `  ✗ ${r.name} — ${r.err}`).join('\n');
+      console.log(summary);
+      const out = document.createElement('pre');
+      out.id = 'dx-test-summary';
+      out.textContent = summary;
+      out.style.cssText = 'position:fixed;top:60px;right:12px;background:#0a0a0b;color:#e8e6e3;padding:12px;border:1px solid #1f1f24;font:11px/1.4 ui-monospace,monospace;max-width:480px;max-height:60vh;overflow:auto;z-index:9999;white-space:pre-wrap';
+      const existing = document.getElementById('dx-test-summary');
+      if (existing) existing.remove();
+      document.body.appendChild(out);
+      return { pass, fail };
+    }
+
+    // First test — proves the harness wires up. Real tests follow in later tasks.
+    test('harness smoke', () => { assertEqual(1 + 1, 2); });
+
+    // ─── pure transforms ──────────────────────────────────────────────────
+    /**
+     * Aggregate FlowRecords by machine_id, deriving crew role counts, time range, missions, orchestrators.
+     * @param {FlowRecord[]} records
+     * @returns {Array<{ machine_id, role_count, last_ts, missions, orchestrators, roles }>}
+     */
+    function aggregateMachines(records) {
+      const byMachine = new Map();
+      for (const r of records) {
+        const id = r.machine_id || 'unknown';
+        let m = byMachine.get(id);
+        if (!m) {
+          m = { machine_id: id, role_count: 0, last_ts: r.ts, missions: new Set(), orchestrators: new Set(), roles: new Set() };
+          byMachine.set(id, m);
+        }
+        if (r.ts > m.last_ts) m.last_ts = r.ts;
+        if (r.mission_id) m.missions.add(r.mission_id);
+        if (r.orchestrator) m.orchestrators.add(r.orchestrator);
+        // Role: handle starting with "darkmux/" identifies a crew role.
+        if (r.handle?.startsWith('darkmux/')) m.roles.add(r.handle);
+      }
+      return Array.from(byMachine.values()).map(m => ({
+        ...m,
+        role_count: m.roles.size,
+        missions: Array.from(m.missions),
+        orchestrators: Array.from(m.orchestrators),
+        roles: Array.from(m.roles),
+      })).sort((a, b) => a.machine_id.localeCompare(b.machine_id));
+    }
+
+    // Tests for aggregateMachines
+    test('aggregateMachines: empty input', () => {
+      assertEqual(aggregateMachines([]), []);
+    });
+    test('aggregateMachines: one record produces one machine', () => {
+      const r = { ts: '2026-05-19T01:00:00Z', machine_id: 'studio', handle: 'note', stage: 'scope' };
+      const out = aggregateMachines([r]);
+      assertEqual(out.length, 1);
+      assertEqual(out[0].machine_id, 'studio');
+      assertEqual(out[0].role_count, 0);
+    });
+    test('aggregateMachines: crew handles count toward role_count', () => {
+      const recs = [
+        { ts: 't1', machine_id: 'studio', handle: 'darkmux/coder', stage: 'dispatch' },
+        { ts: 't2', machine_id: 'studio', handle: 'darkmux/scribe', stage: 'dispatch' },
+        { ts: 't3', machine_id: 'studio', handle: 'darkmux/coder', stage: 'dispatch' },
+      ];
+      assertEqual(aggregateMachines(recs)[0].role_count, 2);
+    });
+    test('aggregateMachines: missions + orchestrators dedup per machine', () => {
+      const recs = [
+        { ts: 't1', machine_id: 'studio', mission_id: 'm1', orchestrator: 'claude-opus-4-7', handle: 'note', stage: 'scope' },
+        { ts: 't2', machine_id: 'studio', mission_id: 'm1', orchestrator: 'claude-opus-4-7', handle: 'note', stage: 'scope' },
+        { ts: 't3', machine_id: 'studio', mission_id: 'm2', orchestrator: 'cursor-anthropic', handle: 'note', stage: 'scope' },
+      ];
+      const out = aggregateMachines(recs)[0];
+      assertEqual(out.missions.sort(), ['m1', 'm2']);
+      assertEqual(out.orchestrators.sort(), ['claude-opus-4-7', 'cursor-anthropic']);
+    });
+    test('aggregateMachines: undefined machine_id buckets to "unknown"', () => {
+      const out = aggregateMachines([{ ts: 't1', handle: 'note', stage: 'scope' }]);
+      assertEqual(out[0].machine_id, 'unknown');
+    });
+
+    /**
+     * Aggregate FlowRecords by orchestrator, collecting machines and engagement context.
+     * @param {FlowRecord[]} records
+     * @returns {Array<{ orchestrator, machines: string[], last_ts, engagement?: string }>}
+     */
+    function aggregateOrchestrators(records) {
+      const byOrch = new Map();
+      for (const r of records) {
+        if (!r.orchestrator) continue;
+        let o = byOrch.get(r.orchestrator);
+        if (!o) {
+          o = { orchestrator: r.orchestrator, machines: new Set(), last_ts: r.ts, engagement: undefined };
+          byOrch.set(r.orchestrator, o);
+        }
+        if (r.machine_id) o.machines.add(r.machine_id);
+        if (r.ts > o.last_ts) o.last_ts = r.ts;
+        // Engagement label (#169 decision-2) — only when explicitly declared in a future schema field.
+        if (r.orchestrator_engagement && !o.engagement) o.engagement = r.orchestrator_engagement;
+      }
+      return Array.from(byOrch.values()).map(o => ({ ...o, machines: Array.from(o.machines) }))
+        .sort((a, b) => a.orchestrator.localeCompare(b.orchestrator));
+    }
+
+    /**
+     * Aggregate FlowRecords by mission_id, collecting machines, orchestrators, and sprint count.
+     * @param {FlowRecord[]} records
+     * @returns {Array<{ mission_id, machines: string[], orchestrators: string[], last_ts, sprint_count: number }>}
+     */
+    function aggregateMissions(records) {
+      const byMission = new Map();
+      for (const r of records) {
+        if (!r.mission_id) continue;
+        let m = byMission.get(r.mission_id);
+        if (!m) {
+          m = { mission_id: r.mission_id, machines: new Set(), orchestrators: new Set(), sprints: new Set(), last_ts: r.ts };
+          byMission.set(r.mission_id, m);
+        }
+        if (r.machine_id) m.machines.add(r.machine_id);
+        if (r.orchestrator) m.orchestrators.add(r.orchestrator);
+        if (r.sprint_id) m.sprints.add(r.sprint_id);
+        if (r.ts > m.last_ts) m.last_ts = r.ts;
+      }
+      return Array.from(byMission.values()).map(m => ({
+        ...m,
+        machines: Array.from(m.machines),
+        orchestrators: Array.from(m.orchestrators),
+        sprint_count: m.sprints.size,
+        sprints: undefined,
+      })).sort((a, b) => a.mission_id.localeCompare(b.mission_id));
+    }
+
+    const EDGE_STYLES = {
+      'dispatch':       { stroke: 'var(--accent)',         label: 'dispatch'    },
+      'tier-decision':  { stroke: 'var(--tier-frontier)',  label: 'tier'        },
+      'review':         { stroke: 'var(--warn)',           label: 'review'      },
+      'ship':           { stroke: 'var(--good)',           label: 'ship'        },
+    };
+
+    /**
+     * Build edges from records. Source/target node ids are mode-dependent:
+     *   fleet:   orchestrator → machine; machine → mission (rolled-up)
+     *   focus:   orchestrator → role; role → mission (expanded per-role)
+     *   mission: only edges whose record.mission_id === opts.mission_id
+     *
+     * @param {FlowRecord[]} records
+     * @param {{ mode: 'fleet'|'focus'|'mission', focus_machine?: string, mission_id?: string }} opts
+     * @returns {Array<{ id, source, target, label, style, recent_ts, stage }>}
+     */
+    function deriveEdges(records, opts) {
+      const out = [];
+      const seen = new Map();
+      for (const r of records) {
+        if (!EDGE_STYLES[r.stage]) continue;
+        const eps = edgeEndpoints(r, opts);
+        if (!eps) continue;
+        const key = `${eps.source}|${eps.target}|${r.stage}`;
+        const existing = seen.get(key);
+        if (existing) {
+          if (r.ts > existing.recent_ts) existing.recent_ts = r.ts;
+          continue;
+        }
+        const edge = {
+          id: key,
+          source: eps.source,
+          target: eps.target,
+          label: EDGE_STYLES[r.stage].label,
+          style: { stroke: EDGE_STYLES[r.stage].stroke },
+          recent_ts: r.ts,
+          stage: r.stage,
+        };
+        seen.set(key, edge);
+        out.push(edge);
+      }
+      return out;
+    }
+
+    function edgeEndpoints(r, { mode, focus_machine, mission_id }) {
+      if (mode === 'mission' && r.mission_id !== mission_id) return null;
+      if (mode === 'focus' && r.machine_id !== focus_machine) return null;
+      const orch = r.orchestrator ? `orch:${r.orchestrator}` : null;
+      const mach = r.machine_id ? `mach:${r.machine_id}` : null;
+      const role = r.handle?.startsWith('darkmux/') ? `role:${r.machine_id}:${r.handle}` : null;
+      const miss = r.mission_id ? `miss:${r.mission_id}` : null;
+
+      if (mode === 'focus') {
+        if (r.stage === 'dispatch' && orch && role) return { source: orch, target: role };
+        if (r.stage === 'ship' && role && miss)     return { source: role, target: miss };
+        if (r.stage === 'review' && role)           return { source: role, target: role };
+        if (r.stage === 'tier-decision' && orch)    return { source: orch, target: orch };
+      } else {
+        if (orch && mach && (r.stage === 'dispatch' || r.stage === 'tier-decision'))
+          return { source: orch, target: mach };
+        if (mach && miss && (r.stage === 'ship' || r.stage === 'review'))
+          return { source: mach, target: miss };
+      }
+      return null;
+    }
+
+    test('aggregateOrchestrators: skips records without orchestrator', () => {
+      assertEqual(aggregateOrchestrators([{ ts: 't', handle: 'note', stage: 'scope' }]), []);
+    });
+    test('aggregateOrchestrators: collects machines per orchestrator', () => {
+      const recs = [
+        { ts: 't1', orchestrator: 'claude-opus-4-7', machine_id: 'studio', handle: 'note', stage: 'scope' },
+        { ts: 't2', orchestrator: 'claude-opus-4-7', machine_id: 'laptop', handle: 'note', stage: 'scope' },
+      ];
+      assertEqual(aggregateOrchestrators(recs)[0].machines.sort(), ['laptop', 'studio']);
+    });
+    test('aggregateMissions: skips records without mission_id', () => {
+      assertEqual(aggregateMissions([{ ts: 't', handle: 'note', stage: 'scope' }]), []);
+    });
+    test('aggregateMissions: collects machines + orchestrators + sprint count', () => {
+      const recs = [
+        { ts: 't1', mission_id: 'redis-tailnet', machine_id: 'studio', orchestrator: 'claude-opus-4-7', sprint_id: 's1', handle: 'note', stage: 'scope' },
+        { ts: 't2', mission_id: 'redis-tailnet', machine_id: 'laptop', orchestrator: 'claude-opus-4-7', sprint_id: 's2', handle: 'note', stage: 'scope' },
+        { ts: 't3', mission_id: 'redis-tailnet', machine_id: 'studio', orchestrator: 'claude-opus-4-7', sprint_id: 's1', handle: 'note', stage: 'scope' },
+      ];
+      const out = aggregateMissions(recs)[0];
+      assertEqual(out.machines.sort(), ['laptop', 'studio']);
+      assertEqual(out.sprint_count, 2);
+    });
+    test('deriveEdges: fleet mode — orchestrator→machine on dispatch', () => {
+      const recs = [{ ts: 't1', stage: 'dispatch', orchestrator: 'claude', machine_id: 'studio', handle: 'darkmux/coder' }];
+      const edges = deriveEdges(recs, { mode: 'fleet' });
+      assertEqual(edges.length, 1);
+      assertEqual(edges[0].source, 'orch:claude');
+      assertEqual(edges[0].target, 'mach:studio');
+    });
+    test('deriveEdges: mission mode filters by mission_id', () => {
+      const recs = [
+        { ts: 't1', stage: 'dispatch', orchestrator: 'claude', machine_id: 'studio', mission_id: 'A', handle: 'darkmux/coder' },
+        { ts: 't2', stage: 'dispatch', orchestrator: 'claude', machine_id: 'studio', mission_id: 'B', handle: 'darkmux/coder' },
+      ];
+      assertEqual(deriveEdges(recs, { mode: 'mission', mission_id: 'A' }).length, 1);
+    });
+    test('deriveEdges: focus mode goes orchestrator→role (not machine)', () => {
+      const recs = [{ ts: 't1', stage: 'dispatch', orchestrator: 'claude', machine_id: 'studio', handle: 'darkmux/coder' }];
+      const edges = deriveEdges(recs, { mode: 'focus', focus_machine: 'studio' });
+      assertEqual(edges[0].source, 'orch:claude');
+      assertEqual(edges[0].target, 'role:studio:darkmux/coder');
+    });
+    test('deriveEdges: dedup + recent_ts bumps to newest', () => {
+      const recs = [
+        { ts: '2026-05-19T01:00:00Z', stage: 'dispatch', orchestrator: 'claude', machine_id: 'studio', handle: 'darkmux/coder' },
+        { ts: '2026-05-19T02:00:00Z', stage: 'dispatch', orchestrator: 'claude', machine_id: 'studio', handle: 'darkmux/coder' },
+      ];
+      const edges = deriveEdges(recs, { mode: 'fleet' });
+      assertEqual(edges.length, 1);
+      assertEqual(edges[0].recent_ts, '2026-05-19T02:00:00Z');
+    });
+
+    /**
+     * Per-machine crew breakdown — `handle` (only `darkmux/*`) → record count + last stage + last ts.
+     * @param {FlowRecord[]} records
+     * @param {string} machine_id
+     * @returns {Array<{ handle, count, last_stage, last_ts }>}
+     */
+    function aggregateRoles(records, machine_id) {
+      const byRole = new Map();
+      for (const r of records) {
+        if (r.machine_id !== machine_id) continue;
+        if (!r.handle?.startsWith('darkmux/')) continue;
+        let role = byRole.get(r.handle);
+        if (!role) { role = { handle: r.handle, count: 0, last_stage: r.stage, last_ts: r.ts }; byRole.set(r.handle, role); }
+        role.count += 1;
+        if (r.ts > role.last_ts) { role.last_ts = r.ts; role.last_stage = r.stage; }
+      }
+      return Array.from(byRole.values()).sort((a, b) => a.handle.localeCompare(b.handle));
+    }
+
+    test('aggregateRoles: filters by machine_id', () => {
+      const recs = [
+        { ts: 't1', machine_id: 'studio', handle: 'darkmux/coder', stage: 'dispatch' },
+        { ts: 't2', machine_id: 'laptop', handle: 'darkmux/coder', stage: 'dispatch' },
+      ];
+      const out = aggregateRoles(recs, 'studio');
+      assertEqual(out.length, 1);
+      assertEqual(out[0].handle, 'darkmux/coder');
+      assertEqual(out[0].count, 1);
+    });
+    test('aggregateRoles: last_stage tracks newest record', () => {
+      const recs = [
+        { ts: 't1', machine_id: 'studio', handle: 'darkmux/coder', stage: 'dispatch' },
+        { ts: 't2', machine_id: 'studio', handle: 'darkmux/coder', stage: 'review' },
+      ];
+      assertEqual(aggregateRoles(recs, 'studio')[0].last_stage, 'review');
+    });
+
+    // ─── layout / render ─────────────────────────────────────────────────
+    // Three implicit columns: orchestrators (left), machines (middle), missions (right).
+    // Within a column, items stack vertically with ROW_GAP between centers.
+    const COL_X = { orch: 0, mach: 500, miss: 1000 };
+    const ROW_GAP = 140;
+
+    function layoutFleet({ orchestrators, machines, missions }) {
+      const nodes = [];
+      orchestrators.forEach((o, i) => nodes.push({
+        id: `orch:${o.orchestrator}`,
+        type: 'default',
+        position: { x: COL_X.orch, y: i * ROW_GAP },
+        data: { label: o.engagement ? `${o.orchestrator}\n${o.engagement}` : o.orchestrator },
+        style: { borderColor: 'var(--tier-frontier)', whiteSpace: 'pre' },
+      }));
+      machines.forEach((m, i) => nodes.push({
+        id: `mach:${m.machine_id}`,
+        type: 'default',
+        position: { x: COL_X.mach, y: i * ROW_GAP },
+        data: { label: `${m.machine_id}\n${m.role_count} role(s)` },
+        style: { borderColor: 'var(--tier-local)', whiteSpace: 'pre' },
+      }));
+      missions.forEach((m, i) => nodes.push({
+        id: `miss:${m.mission_id}`,
+        type: 'default',
+        position: { x: COL_X.miss, y: i * ROW_GAP },
+        data: { label: `${m.mission_id}\n${m.sprint_count} sprint(s)` },
+        style: { borderColor: 'var(--accent)', whiteSpace: 'pre' },
+      }));
+      return nodes;
+    }
+
+    const FOCUS_COL_X = { orch: 0, machineAnchor: 400, role: 700, miss: 1100 };
+    const FOCUS_ROW_GAP = 100;
+
+    function layoutFocus({ orchestrators, focus_machine, roles, missions }) {
+      const nodes = [];
+      orchestrators.forEach((o, i) => nodes.push({
+        id: `orch:${o.orchestrator}`,
+        type: 'default',
+        position: { x: FOCUS_COL_X.orch, y: i * FOCUS_ROW_GAP },
+        data: { label: o.engagement ? `${o.orchestrator}\n${o.engagement}` : o.orchestrator },
+        style: { borderColor: 'var(--tier-frontier)', whiteSpace: 'pre' },
+      }));
+      // Single machine anchor at the center column
+      nodes.push({
+        id: `mach:${focus_machine}`,
+        type: 'default',
+        position: { x: FOCUS_COL_X.machineAnchor, y: 0 },
+        data: { label: `${focus_machine}\n${roles.length} role(s)` },
+        style: { borderColor: 'var(--tier-local)', whiteSpace: 'pre', fontWeight: 600 },
+      });
+      // Crew role nodes stacked at x=700
+      roles.forEach((role, i) => nodes.push({
+        id: `role:${focus_machine}:${role.handle}`,
+        type: 'default',
+        position: { x: FOCUS_COL_X.role, y: i * FOCUS_ROW_GAP },
+        data: { label: `${role.handle}\nlast: ${role.last_stage} (×${role.count})` },
+        style: { borderColor: 'var(--accent-dim)', whiteSpace: 'pre', fontSize: 12 },
+      }));
+      missions.forEach((m, i) => nodes.push({
+        id: `miss:${m.mission_id}`,
+        type: 'default',
+        position: { x: FOCUS_COL_X.miss, y: i * FOCUS_ROW_GAP },
+        data: { label: `${m.mission_id}\n${m.sprint_count} sprint(s)` },
+        style: { borderColor: 'var(--accent)', whiteSpace: 'pre' },
+      }));
+      return nodes;
+    }
+
+    /**
+     * Mission mode reuses fleet layout, but dims non-mission nodes
+     * and highlights mission edges.
+     *
+     * @returns {Array<Node>} React Flow nodes — same shape as layoutFleet,
+     *   but with opacity and emphasis applied per mission membership.
+     */
+    function layoutMission({ orchestrators, machines, missions, mission_id }) {
+      const fleet = layoutFleet({ orchestrators, machines, missions });
+      if (!mission_id) return fleet.map(n => ({ ...n, style: { ...n.style, opacity: 0.3 } }));
+      const target = missions.find(m => m.mission_id === mission_id);
+      if (!target) return fleet.map(n => ({ ...n, style: { ...n.style, opacity: 0.3 } }));
+      const hotMachines = new Set(target.machines);
+      const hotOrchs = new Set(target.orchestrators);
+      return fleet.map(n => {
+        let hot = false;
+        if (n.id.startsWith('mach:')) hot = hotMachines.has(n.id.slice('mach:'.length));
+        else if (n.id.startsWith('orch:')) hot = hotOrchs.has(n.id.slice('orch:'.length));
+        else if (n.id.startsWith('miss:')) hot = n.id === `miss:${mission_id}`;
+        return { ...n, style: { ...n.style, opacity: hot ? 1 : 0.25 } };
+      });
+    }
+
+    // ─── live cue constants ───────────────────────────────────────────────
+    const RECENT_WINDOW_MS = 5000;
+    const PULSE_WINDOW_MS  = 2000;
+
+    // ─── DispatchArc: SVG ring showing elapsed time for an active dispatch ─
+    function DispatchArc({ startTs, clockT }) {
+      const elapsedMs  = Math.max(0, clockT - startTs);
+      const elapsedSec = elapsedMs / 1000;
+      // Sweep over a 60-second cycle; wraps for long dispatches.
+      const frac = (elapsedSec % 60) / 60;
+      const r = 10;
+      const c = 2 * Math.PI * r;
+      const dash = c * frac;
+      return (
+        <svg width={28} height={28} viewBox="0 0 28 28" style={{ verticalAlign: 'middle', marginLeft: 6 }}>
+          <circle cx={14} cy={14} r={r} fill="none" stroke="var(--border)" strokeWidth={2} />
+          <circle cx={14} cy={14} r={r} fill="none" stroke="var(--accent)" strokeWidth={2}
+            strokeDasharray={`${dash} ${c}`} transform="rotate(-90 14 14)" />
+          <text x={14} y={18} textAnchor="middle" fontSize={9} fill="var(--text)">{Math.floor(elapsedSec)}s</text>
+        </svg>
+      );
+    }
+
+    // ─── data sources ─────────────────────────────────────────────────────
+    function parseJSONL(text) {
+      return text.split('\n').filter(l => l.trim()).map(l => {
+        try { return JSON.parse(l); } catch { return null; }
+      }).filter(Boolean);
+    }
+
+    function FileDropZone({ onRecords, active }) {
+      const onDrop = useCallback(async (e) => {
+        e.preventDefault();
+        const file = e.dataTransfer.files?.[0];
+        if (!file) return;
+        const text = await file.text();
+        onRecords(parseJSONL(text));
+      }, [onRecords]);
+      return (
+        <div
+          onDragOver={e => e.preventDefault()}
+          onDrop={onDrop}
+          style={{
+            position: 'absolute', inset: 0, zIndex: 1,
+            pointerEvents: active ? 'auto' : 'none',
+            background: active ? 'rgba(109,241,255,0.05)' : 'transparent',
+          }}
+          title="drop a .jsonl flow file to replay"
+        />
+      );
+    }
+
+    function App() {
+      const [records, setRecords] = useState([]);
+      const [mode, setMode] = useState('fleet');
+      const [focusMachine, setFocusMachine] = useState(null);
+      const [missionId, setMissionId] = useState(null);
+      const [sourceLabel, setSourceLabel] = useState('source: …');
+      const [schemaWarning, setSchemaWarning] = useState(null);
+
+      // Derive replay mode once from URL (never changes during session).
+      const isReplay = useMemo(
+        () => new URLSearchParams(location.search).get('fixture') !== null,
+        []
+      );
+
+      // 250ms wall-clock tick — live: tracks Date.now(); replay: advances by (250ms * replaySpeed).
+      const [clockT, setClockT] = useState(() => Date.now());
+      const [replaySpeed, setReplaySpeed] = useState(1); // multiplier; 0 = pause
+
+      useEffect(() => {
+        if (!isReplay) {
+          // Live: tick to "now" every 250ms (same as before).
+          const id = setInterval(() => setClockT(Date.now()), 250);
+          return () => clearInterval(id);
+        }
+        // Replay: advance clockT by (250ms * replaySpeed) each tick.
+        if (replaySpeed === 0) return; // paused
+        const id = setInterval(() => setClockT(t => t + 250 * replaySpeed), 250);
+        return () => clearInterval(id);
+      }, [isReplay, replaySpeed]);
+
+      // Initialize replay clock to just before the earliest record ts (once).
+      const replayInitRef = useRef(false);
+      useEffect(() => {
+        if (!isReplay) return;
+        if (replayInitRef.current) return;
+        if (records.length === 0) return;
+        const ts = records.reduce((min, r) => {
+          const t = Date.parse(r.ts);
+          return (min === null || t < min) ? t : min;
+        }, null);
+        if (ts !== null) {
+          setClockT(ts - 1); // start 1ms before earliest so all records are "future"
+          replayInitRef.current = true;
+        }
+      }, [isReplay, records]);
+
+      // SSE + backfill: fires on mount; skips when ?fixture is present.
+      useEffect(() => {
+        const fixture = new URLSearchParams(location.search).get('fixture');
+        if (fixture) {
+          setSourceLabel(`source: replay (${fixture})`);
+          return; // fixture-load is handled in the existing effect below
+        }
+
+        const date = new Date().toISOString().slice(0, 10);
+        const base = 'http://127.0.0.1:8765';
+        setSourceLabel('source: connecting…');
+
+        // 1. Backfill today's records.
+        fetch(`${base}/flow/${date}`)
+          .then(r => r.ok ? r.json() : [])
+          .then(arr => {
+            if (Array.isArray(arr)) setRecords(arr);
+          })
+          .catch(err => {
+            console.warn('[topology] backfill fetch failed:', err);
+          });
+
+        // 2. SSE tail.
+        let es;
+        try {
+          es = new EventSource(`${base}/flow/${date}/stream`);
+        } catch (err) {
+          console.warn('[topology] EventSource creation failed:', err);
+          setSourceLabel('source: no daemon');
+          return;
+        }
+        es.onopen = () => setSourceLabel('source: live');
+        es.onerror = () => {
+          setSourceLabel('source: no daemon');
+        };
+        es.onmessage = (e) => {
+          try {
+            const rec = JSON.parse(e.data);
+            setRecords(prev => [...prev, rec]);
+          } catch (parseErr) {
+            console.warn('[topology] malformed SSE record:', parseErr);
+          }
+        };
+        return () => { try { es.close(); } catch {} };
+      }, []);
+
+      // Sync sourceLabel → DOM pill (pill lives in dx-shell, outside React tree).
+      useEffect(() => {
+        const el = document.getElementById('topology-source-label');
+        if (el) el.textContent = sourceLabel;
+      }, [sourceLabel]);
+
+      // Schema-major mismatch check via /health (live mode only).
+      useEffect(() => {
+        if (isReplay) return;
+        const base = 'http://127.0.0.1:8765';
+        fetch(`${base}/health`)
+          .then(r => r.ok ? r.json() : null)
+          .then(h => {
+            if (!h || !h.flow_schema_version) return;
+            const major = parseInt(h.flow_schema_version.split('.')[0], 10);
+            if (major !== EXPECTED_FLOW_SCHEMA_MAJOR) {
+              setSchemaWarning({ daemon: h.flow_schema_version, expected: EXPECTED_FLOW_SCHEMA_MAJOR });
+            }
+          })
+          .catch(() => {}); // silent — source pill handles daemon-offline state
+      }, [isReplay]);
+
+      useEffect(() => {
+        const f = new URLSearchParams(location.search).get('fixture');
+        if (!f) return;
+        fetch(`fixtures/${f}.jsonl`)
+          .then(r => r.ok ? r.text() : Promise.reject(new Error(`HTTP ${r.status}`)))
+          .then(t => setRecords(parseJSONL(t)))
+          .catch(e => console.error('[topology] fixture load failed:', e));
+      }, []);
+
+      // Sync mode select → React state (mount-only; we update imperatively on change)
+      useEffect(() => {
+        const el = document.getElementById('topology-mode-select');
+        if (!el) return;
+        const onChange = () => setMode(el.value);
+        el.value = mode; // sync initial
+        el.addEventListener('change', onChange);
+        return () => el.removeEventListener('change', onChange);
+      }, []);  // mount-only; we sync el.value imperatively when mode changes outside the listener
+
+      // Sync React mode state → select element
+      useEffect(() => {
+        const el = document.getElementById('topology-mode-select');
+        if (el) el.value = mode;
+      }, [mode]);
+
+      // In replay mode, only show records whose ts <= clockT.
+      const visibleRecords = useMemo(() => {
+        if (!isReplay) return records;
+        return records.filter(r => Date.parse(r.ts) <= clockT);
+      }, [isReplay, records, clockT]);
+
+      const machines = useMemo(() => aggregateMachines(visibleRecords), [visibleRecords]);
+      const orchestrators = useMemo(() => aggregateOrchestrators(visibleRecords), [visibleRecords]);
+      const missions = useMemo(() => aggregateMissions(visibleRecords), [visibleRecords]);
+
+      // Auto-default focusMachine when entering focus mode
+      useEffect(() => {
+        if (mode !== 'focus') return;
+        if (focusMachine && machines.some(m => m.machine_id === focusMachine)) return;
+        // Auto-pick most-recent machine.
+        const best = [...machines].sort((a, b) => (b.last_ts || '').localeCompare(a.last_ts || ''))[0];
+        setFocusMachine(best?.machine_id || null);
+      }, [mode, machines, focusMachine]);
+
+      // Sync the mission-picker options with aggregated missions.
+      useEffect(() => {
+        const el = document.getElementById('topology-mission-select');
+        if (!el) return;
+        // Rebuild options: blank + each mission.
+        const current = el.value;
+        el.innerHTML = '<option value="">(no mission selected)</option>' +
+          missions.map(m => `<option value="${m.mission_id}">${m.mission_id}</option>`).join('');
+        // Preserve current selection if still valid.
+        el.value = missions.some(m => m.mission_id === current) ? current : '';
+      }, [missions]);
+
+      // Listen for picker change.
+      useEffect(() => {
+        const el = document.getElementById('topology-mission-select');
+        if (!el) return;
+        const onChange = () => setMissionId(el.value || null);
+        el.addEventListener('change', onChange);
+        return () => el.removeEventListener('change', onChange);
+      }, []);
+
+      // Hide picker when mode !== 'mission'.
+      useEffect(() => {
+        const el = document.getElementById('topology-mission-select');
+        if (!el) return;
+        el.style.display = mode === 'mission' ? '' : 'none';
+      }, [mode]);
+
+      const edges = useMemo(() => {
+        const opts = { mode, focus_machine: focusMachine, mission_id: missionId };
+        const raw = deriveEdges(visibleRecords, opts);
+        const now = clockT;
+        return raw.map(e => {
+          const recent = e.recent_ts ? (now - Date.parse(e.recent_ts)) < RECENT_WINDOW_MS : false;
+          const className = recent ? 'topology-edge-active' : undefined;
+          let style = e.style;
+          if (mode === 'mission' && missionId) style = { ...style, strokeWidth: 2.5 };
+          return { ...e, className, style, animated: recent };
+        });
+      }, [visibleRecords, mode, focusMachine, missionId, clockT]);
+
+      const nodes = useMemo(() => {
+        if (records.length === 0) {
+          return [{
+            id: 'empty',
+            position: { x: 0, y: 0 },
+            data: { label: 'Drop a .jsonl flow file or use ?fixture=fleet-3-machines' },
+            style: { borderColor: 'var(--border)' },
+          }];
+        }
+        if (mode === 'fleet') return layoutFleet({ orchestrators, machines, missions });
+        if (mode === 'focus' && focusMachine) {
+          const roles = aggregateRoles(visibleRecords, focusMachine);
+          return layoutFocus({ orchestrators, focus_machine: focusMachine, roles, missions });
+        }
+        if (mode === 'mission') return layoutMission({ orchestrators, machines, missions, mission_id: missionId });
+        return [];
+      }, [mode, records, visibleRecords, orchestrators, machines, missions, focusMachine, missionId]);
+
+      // Most-recent record ts per node id — used for pulse cue.
+      const nodeRecentTs = useMemo(() => {
+        const map = new Map();
+        for (const r of visibleRecords) {
+          const ids = [];
+          if (r.machine_id) ids.push(`mach:${r.machine_id}`);
+          if (r.orchestrator) ids.push(`orch:${r.orchestrator}`);
+          if (r.mission_id) ids.push(`miss:${r.mission_id}`);
+          if (r.handle?.startsWith('darkmux/') && r.machine_id) ids.push(`role:${r.machine_id}:${r.handle}`);
+          const t = Date.parse(r.ts);
+          for (const id of ids) {
+            const prev = map.get(id) || 0;
+            if (t > prev) map.set(id, t);
+          }
+        }
+        return map;
+      }, [visibleRecords]);
+
+      // Active dispatch tracker: roleId → start ts when dispatch start seen but not yet completed.
+      const activeDispatches = useMemo(() => {
+        const m = new Map();
+        for (const r of visibleRecords) {
+          if (r.stage !== 'dispatch' || !r.handle?.startsWith('darkmux/') || !r.machine_id) continue;
+          const id = `role:${r.machine_id}:${r.handle}`;
+          if (r.action === 'dispatch start') m.set(id, Date.parse(r.ts));
+          else if (r.action === 'dispatch complete') m.delete(id);
+        }
+        return m;
+      }, [visibleRecords]);
+
+      // Decorate nodes with pulse className and dispatch-arc label overlay.
+      const nodesWithCues = useMemo(() => {
+        const now = clockT;
+        return nodes.map(n => {
+          const last = nodeRecentTs.get(n.id);
+          const pulsing = last && (now - last) < PULSE_WINDOW_MS;
+          const className = pulsing ? 'topology-node-pulse' : undefined;
+          let label = n.data?.label;
+          const activeStartTs = activeDispatches.get(n.id);
+          if (activeStartTs && n.id.startsWith('role:')) {
+            label = (
+              <>
+                {n.data?.label}
+                <DispatchArc startTs={activeStartTs} clockT={clockT} />
+              </>
+            );
+          }
+          return { ...n, className, data: { ...n.data, label } };
+        });
+      }, [nodes, nodeRecentTs, activeDispatches, clockT]);
+
+      // ─── scrubber wiring ────────────────────────────────────────────────
+
+      // Show/hide scrubber based on mode.
+      useEffect(() => {
+        const bar = document.getElementById('topology-scrubber');
+        if (!bar) return;
+        bar.hidden = !isReplay;
+      }, [isReplay]);
+
+      // Compute fixture ts range (min/max across ALL records, not just visible).
+      const tsRange = useMemo(() => {
+        if (records.length === 0) return null;
+        let min = Infinity, max = -Infinity;
+        for (const r of records) {
+          const t = Date.parse(r.ts);
+          if (t < min) min = t;
+          if (t > max) max = t;
+        }
+        if (!isFinite(min) || !isFinite(max)) return null;
+        return { min, max };
+      }, [records]);
+
+      // When user drags the slider, set clockT proportionally.
+      useEffect(() => {
+        if (!isReplay) return;
+        const el = document.getElementById('scrubber-range');
+        if (!el) return;
+        const onInput = () => {
+          if (!tsRange) return;
+          const frac = Number(el.value) / 100;
+          setClockT(tsRange.min + (tsRange.max - tsRange.min) * frac);
+        };
+        el.addEventListener('input', onInput);
+        return () => el.removeEventListener('input', onInput);
+      }, [isReplay, tsRange]);
+
+      // When clockT changes, update slider position + readout (one-way DOM sync).
+      useEffect(() => {
+        if (!isReplay || !tsRange) return;
+        const el = document.getElementById('scrubber-range');
+        const readout = document.getElementById('scrubber-readout');
+        if (!el || !readout) return;
+        const span = tsRange.max - tsRange.min;
+        const frac = span > 0 ? Math.min(1, Math.max(0, (clockT - tsRange.min) / span)) : 0;
+        el.value = String(frac * 100);
+        readout.textContent = `${new Date(clockT).toISOString().slice(11, 19)}  /  ${visibleRecords.length}/${records.length}`;
+      }, [clockT, tsRange, isReplay, visibleRecords.length, records.length]);
+
+      // Speed selector.
+      useEffect(() => {
+        const el = document.getElementById('scrubber-speed');
+        if (!el) return;
+        const onChange = () => setReplaySpeed(Number(el.value));
+        el.addEventListener('change', onChange);
+        return () => el.removeEventListener('change', onChange);
+      }, []);
+
+      // Step button: jump clockT to the next record's ts.
+      useEffect(() => {
+        const el = document.getElementById('scrubber-step');
+        if (!el) return;
+        const onClick = () => {
+          const next = records
+            .map(r => Date.parse(r.ts))
+            .filter(t => t > clockT)
+            .sort((a, b) => a - b)[0];
+          if (next !== undefined) setClockT(next);
+        };
+        el.addEventListener('click', onClick);
+        return () => el.removeEventListener('click', onClick);
+      }, [records, clockT]);
+
+      return (
+        <>
+          {schemaWarning && (
+            <div className="topology-schema-banner">
+              ⚠ daemon flow schema v{schemaWarning.daemon} doesn't match viewer expectation (major {schemaWarning.expected}).
+              Upgrade with <code>cargo install --path . --force</code> from the darkmux source tree, OR open this viewer from a darkmux release that matches the daemon's schema.
+            </div>
+          )}
+          <FileDropZone onRecords={setRecords} active={true} />
+          <div style={{ width: '100%', height: '100%' }}>
+            <ReactFlow nodes={nodesWithCues} edges={edges} fitView>
+              <Background />
+              <Controls />
+            </ReactFlow>
+          </div>
+        </>
+      );
+    }
+
+    const params = new URLSearchParams(location.search);
+    if (params.get('test') === '1') runUnitTests();
+
+    ReactDOM.createRoot(document.getElementById('topology-root')).render(<App />);
+  </script>
 </body>
 </html>
