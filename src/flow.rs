@@ -256,6 +256,13 @@ pub struct SinkInfo {
     pub config: std::collections::BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<SinkInfo>,
+    /// Credential-bearing identifier that must round-trip through the
+    /// in-process probe path (e.g., `RedisSink` URL) without ever
+    /// leaving the process. Never serialized — `config` carries the
+    /// redacted display form for any external surface (CLI JSON, daemon
+    /// HTTP endpoint). See `find_redis_cfg` for the consumer side. (#216)
+    #[serde(skip)]
+    pub raw_url: Option<String>,
 }
 
 /// Abstraction over the destination of a flow record. Implementations
@@ -313,7 +320,7 @@ impl FlowSink for LocalFileSink {
     fn info(&self) -> SinkInfo {
         let mut config = std::collections::BTreeMap::new();
         config.insert("flows_dir".to_string(), flows_dir().display().to_string());
-        SinkInfo { kind: "LocalFile".to_string(), config, children: vec![] }
+        SinkInfo { kind: "LocalFile".to_string(), config, children: vec![], raw_url: None }
     }
 }
 
@@ -388,7 +395,7 @@ impl FlowSink for AuditFileSink {
         let mut config = std::collections::BTreeMap::new();
         config.insert("audit_dir".to_string(), audit_dir().display().to_string());
         config.insert("hash".to_string(), "blake3".to_string());
-        SinkInfo { kind: "AuditFile".to_string(), config, children: vec![] }
+        SinkInfo { kind: "AuditFile".to_string(), config, children: vec![], raw_url: None }
     }
 }
 
@@ -789,13 +796,23 @@ impl FlowSink for RedisSink {
 
     fn info(&self) -> SinkInfo {
         let mut config = std::collections::BTreeMap::new();
-        config.insert("url".to_string(), self.url.clone());
+        // The displayed URL is redacted — `config` rides through to JSON
+        // output (`darkmux flow status --json` + the daemon's HTTP
+        // endpoint), and the password must not appear there. The raw URL
+        // is preserved on `SinkInfo.raw_url` (skip-serialized) for the
+        // in-process probe path in `find_redis_cfg`. (#216)
+        config.insert("url".to_string(), redact_url_creds(&self.url));
         config.insert("stream".to_string(), self.stream.clone());
         config.insert(
             "max_len".to_string(),
             self.max_len.map(|n| n.to_string()).unwrap_or_else(|| "unbounded".to_string()),
         );
-        SinkInfo { kind: "Redis".to_string(), config, children: vec![] }
+        SinkInfo {
+            kind: "Redis".to_string(),
+            config,
+            children: vec![],
+            raw_url: Some(self.url.clone()),
+        }
     }
 }
 
@@ -844,6 +861,7 @@ impl FlowSink for TeeSink {
             kind: "Tee".to_string(),
             config: std::collections::BTreeMap::new(),
             children: self.sinks.iter().map(|s| s.info()).collect(),
+            raw_url: None,
         }
     }
 }
@@ -1340,8 +1358,14 @@ struct RedisCfg {
 
 fn find_redis_cfg(info: &SinkInfo) -> Option<RedisCfg> {
     if info.kind == "Redis" {
+        // The raw URL — needed for `redis::Client::open` in `probe_redis`
+        // — lives on `SinkInfo.raw_url`, NOT `config["url"]`. The latter
+        // is now the redacted display form. A Redis sink without a
+        // populated `raw_url` is unusable for probing (we'd be passing
+        // a `:***@` value to `Client::open`), so treat it as absent. (#216)
+        let raw_url = info.raw_url.clone()?;
         return Some(RedisCfg {
-            url: info.config.get("url").cloned().unwrap_or_default(),
+            url: raw_url,
             stream: info.config.get("stream").cloned().unwrap_or_default(),
             max_len: info
                 .config
@@ -2109,7 +2133,7 @@ mod tests {
             Ok(())
         }
         fn info(&self) -> SinkInfo {
-            SinkInfo { kind: "InMemory".to_string(), config: Default::default(), children: vec![] }
+            SinkInfo { kind: "InMemory".to_string(), config: Default::default(), children: vec![], raw_url: None }
         }
     }
 
@@ -2195,7 +2219,7 @@ mod tests {
             anyhow::bail!("simulated sink failure for test")
         }
         fn info(&self) -> SinkInfo {
-            SinkInfo { kind: "Failing".to_string(), config: Default::default(), children: vec![] }
+            SinkInfo { kind: "Failing".to_string(), config: Default::default(), children: vec![], raw_url: None }
         }
     }
 
@@ -2427,8 +2451,10 @@ mod tests {
                     kind: "Redis".to_string(),
                     config: Default::default(),
                     children: vec![],
+                    raw_url: None,
                 },
             ],
+            raw_url: None,
         };
         let (kinds, composition) = summarize_sink(&info);
         assert_eq!(kinds, vec!["LocalFile", "Redis"]);
@@ -2437,6 +2463,10 @@ mod tests {
 
     #[test]
     fn find_redis_cfg_walks_into_tee() {
+        // Post-#216: `find_redis_cfg` reads the raw URL from
+        // `SinkInfo.raw_url`, not `config["url"]`. `config["url"]` is
+        // the redacted display form — a Redis sink without
+        // `raw_url` populated is treated as unprobable.
         let info = SinkInfo {
             kind: "Tee".to_string(),
             config: Default::default(),
@@ -2444,12 +2474,18 @@ mod tests {
                 LocalFileSink::new().info(),
                 {
                     let mut m = std::collections::BTreeMap::new();
-                    m.insert("url".to_string(), "redis://x:1234".to_string());
+                    m.insert("url".to_string(), "redis://x:***".to_string());
                     m.insert("stream".to_string(), "test:stream".to_string());
                     m.insert("max_len".to_string(), "5000".to_string());
-                    SinkInfo { kind: "Redis".to_string(), config: m, children: vec![] }
+                    SinkInfo {
+                        kind: "Redis".to_string(),
+                        config: m,
+                        children: vec![],
+                        raw_url: Some("redis://x:1234".to_string()),
+                    }
                 },
             ],
+            raw_url: None,
         };
         let cfg = find_redis_cfg(&info).expect("redis cfg should be found");
         assert_eq!(cfg.url, "redis://x:1234");
@@ -3028,6 +3064,94 @@ mod tests {
                 "error context missed redaction marker: {ctx}",
             );
         }
+    }
+
+    #[test]
+    fn redis_sink_info_redacts_url_in_serialized_json() {
+        // Regression for #216: `SinkInfo.config["url"]` previously carried
+        // the raw `DARKMUX_REDIS_URL` value through to JSON consumers
+        // — `darkmux flow status --json` and the daemon's CORS-permissive
+        // HTTP endpoint. The raw URL now lives on `SinkInfo.raw_url`
+        // (skip-serialized); `config["url"]` is the redacted display form.
+        let sink = RedisSink::new(
+            "redis://:supersecret@100.74.208.36:6379",
+            "darkmux:flow",
+            Some(10000),
+        )
+        .expect("RedisSink::new on a syntactically valid URL");
+        let info = sink.info();
+
+        // In-process path keeps the raw URL.
+        assert_eq!(
+            info.raw_url.as_deref(),
+            Some("redis://:supersecret@100.74.208.36:6379"),
+            "raw_url must round-trip the unredacted URL for the probe path",
+        );
+
+        // Display path strips it.
+        assert_eq!(
+            info.config.get("url").map(String::as_str),
+            Some("redis://:***@100.74.208.36:6379"),
+            "config[\"url\"] must be redacted",
+        );
+
+        // Serializing the SinkInfo (the exact path used by FlowStatus →
+        // JSON output → daemon HTTP) must not contain the password.
+        let json = serde_json::to_string(&info).expect("serialize SinkInfo");
+        assert!(
+            !json.contains("supersecret"),
+            "serialized SinkInfo leaked password: {json}",
+        );
+        assert!(
+            json.contains(":***@"),
+            "serialized SinkInfo missed redaction marker: {json}",
+        );
+        assert!(
+            !json.contains("raw_url"),
+            "raw_url field must be skip-serialized (no key in JSON): {json}",
+        );
+    }
+
+    #[test]
+    fn find_redis_cfg_recovers_raw_url_from_redis_sink_info() {
+        // Regression for #216: the probe path (`find_redis_cfg` →
+        // `probe_redis` → `redis::Client::open`) must still see the raw
+        // URL after #216 moved it off `config["url"]`. Round-trip:
+        //   RedisSink::new(raw) → info() → find_redis_cfg → cfg.url == raw
+        let raw = "redis://:hunter2@127.0.0.1:6379/0";
+        let sink = RedisSink::new(raw, "darkmux:flow", Some(10000))
+            .expect("RedisSink::new on a syntactically valid URL");
+        let info = sink.info();
+        let cfg = find_redis_cfg(&info).expect("Redis sink should resolve to a cfg");
+        assert_eq!(cfg.url, raw, "probe path must receive the raw URL");
+        assert_eq!(cfg.stream, "darkmux:flow");
+        assert_eq!(cfg.max_len, Some(10000));
+    }
+
+    #[test]
+    fn flow_status_serializes_without_leaking_redis_password() {
+        // End-to-end shape: build a Redis sink, embed it in a FlowStatus
+        // (via the SinkSummary path used by `collect_status`), serialize
+        // the whole thing as the daemon's HTTP endpoint would, and assert
+        // the password substring never appears anywhere in the JSON.
+        let redis_sink = RedisSink::new(
+            "redis://:supersecret@127.0.0.1:6379",
+            "darkmux:flow",
+            Some(10000),
+        )
+        .expect("RedisSink::new on a syntactically valid URL");
+        let info = redis_sink.info();
+        let (kinds, composition) = summarize_sink(&info);
+        let summary = SinkSummary {
+            info,
+            active_kinds: kinds,
+            composition,
+        };
+        let json = serde_json::to_string(&summary).expect("serialize SinkSummary");
+        assert!(
+            !json.contains("supersecret"),
+            "SinkSummary JSON leaked password: {json}",
+        );
     }
 
     #[test]
