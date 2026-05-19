@@ -97,7 +97,26 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         workspace.display()
     );
 
-    // 5. Spawn the docker container. Synchronous; stdout + stderr
+    // 5. Emit dispatch.start flow record with runtime metadata in payload
+    //    (#204). Pairs with dispatch.complete below via session_id, same
+    //    as the openclaw path does.
+    let dispatch_start_payload = serde_json::json!({
+        "runtime": "internal",
+        "prompt_chars": opts.message.chars().count(),
+        "system_chars": system_prompt.chars().count(),
+        "workspace": workspace.display().to_string(),
+    });
+    let _ = crate::flow::record(crate::crew::dispatch::build_dispatch_record_with_payload(
+        crate::flow::Level::Info,
+        "dispatch start",
+        &opts.role_id,
+        &session_id,
+        Some(&model),
+        Some(dispatch_start_payload),
+    ));
+    let dispatch_start_instant = std::time::Instant::now();
+
+    // 6. Spawn the docker container. Synchronous; stdout + stderr
     //    captured. The container runs to completion and is removed
     //    automatically (--rm).
     let mut cmd = Command::new("docker");
@@ -118,9 +137,50 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         .output()
         .context("spawning darkmux-runtime container")?;
 
+    let wall_ms = dispatch_start_instant.elapsed().as_millis() as u64;
     let exit_code = output.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    // 7. Replay the trajectory file as flow records (#204). Post-hoc — the
+    //    runtime writes per-event JSONL to `<workspace>/.darkmux-runtime/
+    //    trajectory.jsonl`; we read it after the container exits and
+    //    convert each event into the corresponding flow record. Closes
+    //    the per-dispatch observability gap that Beat 30 surfaced.
+    //    Best-effort: trajectory read failures are non-fatal (the dispatch
+    //    succeeded; flow records are observability, not correctness).
+    let trajectory_summary = replay_trajectory_to_flow(
+        &workspace,
+        &session_id,
+        &opts.role_id,
+        &model,
+    );
+
+    // 8. Emit dispatch.complete flow record with summary metadata.
+    let dispatch_complete_payload = serde_json::json!({
+        "runtime": "internal",
+        "wall_ms": wall_ms,
+        "stdout_chars": stdout.chars().count(),
+        "stderr_chars": stderr.chars().count(),
+        "exit_code": exit_code,
+        "result_class": if exit_code == 0 { "ok" } else { "error" },
+        "total_turns": trajectory_summary.turns,
+        "total_tools": trajectory_summary.tool_calls,
+        "total_compactions": trajectory_summary.compactions,
+    });
+    let (action, level) = if exit_code == 0 {
+        ("dispatch complete", crate::flow::Level::Info)
+    } else {
+        ("dispatch error", crate::flow::Level::Error)
+    };
+    let _ = crate::flow::record(crate::crew::dispatch::build_dispatch_record_with_payload(
+        level,
+        action,
+        &opts.role_id,
+        &session_id,
+        Some(&model),
+        Some(dispatch_complete_payload),
+    ));
 
     Ok(DispatchResult {
         exit_code,
@@ -129,6 +189,126 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         session_id,
         watched_state: Vec::new(),
     })
+}
+
+/// Summary of what the trajectory replay surfaced. Used to enrich the
+/// dispatch.complete payload with end-of-dispatch counts.
+#[derive(Default)]
+struct TrajectorySummary {
+    turns: u32,
+    tool_calls: u32,
+    compactions: u32,
+}
+
+/// Read the runtime's trajectory.jsonl after the dispatch completes and
+/// emit per-event flow records: dispatch.turn, dispatch.tool,
+/// dispatch.compaction, dispatch.reasoning. Best-effort — any error
+/// (file missing, malformed line, write failure) is silently skipped.
+/// Returns counts the caller uses to enrich the dispatch.complete record.
+fn replay_trajectory_to_flow(
+    workspace: &std::path::Path,
+    session_id: &str,
+    role_id: &str,
+    model: &str,
+) -> TrajectorySummary {
+    use std::io::BufRead;
+    let mut summary = TrajectorySummary::default();
+    let trajectory = workspace
+        .join(".darkmux-runtime")
+        .join("trajectory.jsonl");
+    let file = match std::fs::File::open(&trajectory) {
+        Ok(f) => f,
+        Err(_) => return summary, // no trajectory; nothing to replay
+    };
+    let reader = std::io::BufReader::new(file);
+    for line in reader.lines().flatten() {
+        let event: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        match event_type {
+            "model.completed" => {
+                summary.turns += 1;
+                let payload = serde_json::json!({
+                    "turn_seq": event.get("seq"),
+                    "finish_reason": event.get("finish_reason"),
+                    "tool_calls_count": event.get("tool_calls").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0),
+                    "usage": event.get("usage"),
+                });
+                let _ = crate::flow::record(crate::crew::dispatch::build_dispatch_record_with_payload(
+                    crate::flow::Level::Info,
+                    "dispatch.turn",
+                    role_id,
+                    session_id,
+                    Some(model),
+                    Some(payload),
+                ));
+            }
+            "tool.completed" => {
+                summary.tool_calls += 1;
+                let payload = serde_json::json!({
+                    "tool_seq": event.get("tool_seq"),
+                    "tool_name": event.get("tool_name"),
+                    "args_chars": event.get("args_chars"),
+                    "result_chars": event.get("result_chars"),
+                });
+                let _ = crate::flow::record(crate::crew::dispatch::build_dispatch_record_with_payload(
+                    crate::flow::Level::Info,
+                    "dispatch.tool",
+                    role_id,
+                    session_id,
+                    Some(model),
+                    Some(payload),
+                ));
+            }
+            "compaction" => {
+                summary.compactions += 1;
+                let payload = serde_json::json!({
+                    "generation": event.get("generation"),
+                    "before_messages": event.get("before_messages"),
+                    "after_messages": event.get("after_messages"),
+                    "summary_chars": event.get("summary_chars"),
+                });
+                let _ = crate::flow::record(crate::crew::dispatch::build_dispatch_record_with_payload(
+                    crate::flow::Level::Info,
+                    "dispatch.compaction",
+                    role_id,
+                    session_id,
+                    Some(model),
+                    Some(payload),
+                ));
+            }
+            "model.reasoning" => {
+                // The runtime emits these when it parses <think>...</think>
+                // blocks from the assistant content (#204). Carries the
+                // full reasoning text in payload so the flow viewer can
+                // render a collapse/expand block — operator discretion to
+                // expand. See runtime/src/loop_runner.rs.
+                let payload = serde_json::json!({
+                    "turn_seq": event.get("seq"),
+                    "reasoning_chars": event.get("reasoning_chars"),
+                    "reasoning_text": event.get("reasoning_text"),
+                    "reasoning_format": event.get("reasoning_format").unwrap_or(&serde_json::Value::String("inline-think-tags".into())),
+                });
+                let _ = crate::flow::record(crate::crew::dispatch::build_dispatch_record_with_payload(
+                    crate::flow::Level::Info,
+                    "dispatch.reasoning",
+                    role_id,
+                    session_id,
+                    Some(model),
+                    Some(payload),
+                ));
+            }
+            _ => {
+                // Unknown event types (dispatch.start, dispatch.complete
+                // from the runtime side) are intentionally ignored — the
+                // CLI emits the canonical dispatch.start/complete via
+                // build_dispatch_record_with_payload above.
+            }
+        }
+    }
+    summary
 }
 
 /// Shell out to curl to fetch `/v1/models` from the host's LMStudio and
