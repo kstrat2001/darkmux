@@ -73,6 +73,7 @@ pub(crate) fn build_review_record(
         orchestrator: None,
         prev_hash: None,
         hash: None,
+        payload: None,
     }
 }
 

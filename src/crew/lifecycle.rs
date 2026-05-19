@@ -148,6 +148,7 @@ fn emit_sprint_transition_record(sprint_id: &str, mission_id: &str, action: &str
         orchestrator: None,
         prev_hash: None,
         hash: None,
+        payload: None,
     });
 }
 
@@ -185,6 +186,7 @@ fn emit_mission_transition_record_with_reasoning(
         orchestrator: None,
         prev_hash: None,
         hash: None,
+        payload: None,
     });
 }
 
@@ -224,6 +226,7 @@ fn emit_sprint_added_record_with_reasoning(
         orchestrator: None,
         prev_hash: None,
         hash: None,
+        payload: None,
     });
 }
 

@@ -1075,6 +1075,7 @@ pub(crate) fn build_dispatch_record(
         orchestrator: None,
         prev_hash: None,
         hash: None,
+        payload: None,
     }
 }
 
