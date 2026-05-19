@@ -82,19 +82,59 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         )
     });
 
-    // 4. Per-dispatch workspace tempdir. NOT auto-cleaned — leaving the
-    //    workspace on disk gives the operator post-dispatch artifact
-    //    visibility (which is half the point of replacing the openclaw
-    //    workspace model). The path is announced on stderr.
-    let workspace = std::env::temp_dir().join(format!(
-        "darkmux-dispatch-{}-{unix_micros}",
-        opts.role_id
-    ));
-    fs::create_dir_all(&workspace)
-        .with_context(|| format!("creating dispatch workspace: {}", workspace.display()))?;
+    // 4. Workspace resolution. Two paths (#206):
+    //
+    //    a) `--workdir <path>` → mount operator's chosen path at
+    //       /workspace inside the container. The path must already
+    //       exist; container writes persist there post-dispatch.
+    //       This is the path real engagement work uses (refactor /
+    //       audit / feature dispatches against an existing repo).
+    //
+    //    b) No `--workdir` → allocate a fresh tempdir. Useful for
+    //       toy tests, sanity probes, and one-shot dispatches that
+    //       don't need persistent operator workspace state.
+    //
+    //    NEITHER path auto-cleans the workspace dir — the operator
+    //    can inspect trajectory.jsonl + any files the agent wrote
+    //    after the container exits. That's half the point of replacing
+    //    the openclaw workspace model (operator visibility into what
+    //    the dispatch did).
+    let workspace = match opts.workdir.as_deref() {
+        Some(custom) => {
+            if !custom.exists() {
+                bail!(
+                    "--workdir path does not exist: {} \
+                     (create it first or use a different path)",
+                    custom.display()
+                );
+            }
+            if !custom.is_dir() {
+                bail!(
+                    "--workdir path is not a directory: {}",
+                    custom.display()
+                );
+            }
+            custom.to_path_buf()
+        }
+        None => {
+            let auto = std::env::temp_dir().join(format!(
+                "darkmux-dispatch-{}-{unix_micros}",
+                opts.role_id
+            ));
+            fs::create_dir_all(&auto)
+                .with_context(|| format!("creating dispatch workspace: {}", auto.display()))?;
+            auto
+        }
+    };
+    let workspace_source = if opts.workdir.is_some() {
+        "operator-provided via --workdir"
+    } else {
+        "fresh tempdir (no --workdir given)"
+    };
     eprintln!(
-        "darkmux crew dispatch: workspace={} (preserved after dispatch)",
-        workspace.display()
+        "darkmux crew dispatch: workspace={} ({})",
+        workspace.display(),
+        workspace_source
     );
 
     // 5. Emit dispatch.start flow record with runtime metadata in payload
