@@ -228,14 +228,48 @@ pub fn load_crews() -> Result<Vec<Crew>> {
     Ok(read_all_json::<Crew>(&user_dir)?.into_iter().map(|(_, c)| c).collect())
 }
 
-/// Load all missions.
+/// Load all missions from the new per-mission nested layout.
+///
+/// Walks `<crew_root>/missions/` and for each **subdirectory** containing a
+/// `mission.json`, deserializes it.  Flat `.json` files directly under
+/// `<crew_root>/missions/` (pre-#148 legacy layout) are silently skipped —
+/// the migration verb (`darkmux mission migrate`) is the bridge.
+///
+/// Built-in missions (currently empty) are merged last, same as other loaders.
 pub fn load_missions() -> Result<Vec<Mission>> {
-    let user_dir = crew_root().join("missions");
-    let mut map: BTreeMap<String, Mission> = read_all_json::<Mission>(&user_dir)?
-        .into_iter()
-        .map(|(id, m)| (id.clone(), m))
-        .collect();
+    use crate::crew::lifecycle;
+    let missions_root = crew_root().join("missions");
+    if !missions_root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut map: BTreeMap<String, Mission> = BTreeMap::new();
+    for entry in fs::read_dir(&missions_root)
+        .with_context(|| format!("reading {}", missions_root.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            // Skip legacy flat <id>.json files. Migration verb is the bridge.
+            continue;
+        }
+        let mission_id = match path.file_name().and_then(|s| s.to_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        let mission_file = lifecycle::mission_path(&mission_id);
+        if !mission_file.is_file() {
+            // Empty subdir or partial state — skip silently.
+            continue;
+        }
+        let text = fs::read_to_string(&mission_file)
+            .with_context(|| format!("reading {}", mission_file.display()))?;
+        match serde_json::from_str::<Mission>(&text) {
+            Ok(m) => { map.insert(m.id.clone(), m); }
+            Err(e) => eprintln!("warning: failed to parse mission at {}: {e}", mission_file.display()),
+        }
+    }
 
+    // Merge built-in missions (currently empty — future-proofing).
     for (id, json) in BUILTIN_MISSIONS {
         match serde_json::from_str::<Mission>(json) {
             Ok(m) => { map.entry(id.to_string()).or_insert(m); }
@@ -243,17 +277,61 @@ pub fn load_missions() -> Result<Vec<Mission>> {
         }
     }
 
-    Ok(map.into_values().collect())
+    let mut out: Vec<Mission> = map.into_values().collect();
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(out)
 }
 
-/// Load all sprints.
+/// Load all sprints from the new per-mission nested layout.
+///
+/// Walks every `<crew_root>/missions/<mission-id>/sprints/*.json`.  The
+/// Sprint JSON already carries `mission_id`, so no inference from the dir
+/// name is needed.  Legacy flat sprint files under `<crew_root>/sprints/`
+/// are silently ignored — the migration verb is the bridge.
 pub fn load_sprints() -> Result<Vec<Sprint>> {
-    let user_dir = crew_root().join("sprints");
-    let mut map: BTreeMap<String, Sprint> = read_all_json::<Sprint>(&user_dir)?
-        .into_iter()
-        .map(|(id, s)| (id.clone(), s))
-        .collect();
+    use crate::crew::lifecycle;
+    let missions_root = crew_root().join("missions");
+    if !missions_root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut map: BTreeMap<String, Sprint> = BTreeMap::new();
+    for entry in fs::read_dir(&missions_root)
+        .with_context(|| format!("reading {}", missions_root.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let mission_id = match path.file_name().and_then(|s| s.to_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        let sprints_dir = lifecycle::sprints_dir(&mission_id);
+        if !sprints_dir.is_dir() {
+            continue;
+        }
+        for sprint_entry in fs::read_dir(&sprints_dir)
+            .with_context(|| format!("reading {}", sprints_dir.display()))?
+        {
+            let sprint_entry = sprint_entry?;
+            let sprint_path = sprint_entry.path();
+            if !sprint_path.is_file() {
+                continue;
+            }
+            if sprint_path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let text = fs::read_to_string(&sprint_path)
+                .with_context(|| format!("reading {}", sprint_path.display()))?;
+            match serde_json::from_str::<Sprint>(&text) {
+                Ok(s) => { map.insert(s.id.clone(), s); }
+                Err(e) => eprintln!("warning: failed to parse sprint at {}: {e}", sprint_path.display()),
+            }
+        }
+    }
 
+    // Built-in sprints (currently empty — future-proofing).
     for (id, json) in BUILTIN_SPRINTS {
         match serde_json::from_str::<Sprint>(json) {
             Ok(s) => { map.entry(id.to_string()).or_insert(s); }
@@ -261,7 +339,9 @@ pub fn load_sprints() -> Result<Vec<Sprint>> {
         }
     }
 
-    Ok(map.into_values().collect())
+    let mut out: Vec<Sprint> = map.into_values().collect();
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(out)
 }
 
 /// Load all capabilities.
@@ -474,5 +554,201 @@ mod tests {
         assert_eq!(mc.capabilities, vec!["mission-compiling".to_string()]);
         assert_eq!(mc.tool_palette.allow, vec!["read".to_string()]);
         assert_eq!(mc.tool_palette.deny, vec!["edit", "write", "exec", "process"]);
+    }
+}
+
+#[cfg(test)]
+mod load_per_mission_tests {
+    use super::*;
+    use serial_test::serial;
+
+    /// RAII guard: sets `DARKMUX_CREW_DIR` to a TempDir for the test's duration,
+    /// then restores (or unsets) on drop.  Mirrors `CrewDirGuard` in the sibling
+    /// `tests` module — kept local to this module to avoid cross-module coupling.
+    struct TestCrewRoot {
+        prev: Option<String>,
+        _tmp: tempfile::TempDir,
+    }
+
+    impl TestCrewRoot {
+        fn new() -> Self {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+            // SAFETY: serialized via #[serial] on every caller.
+            unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()); }
+            Self { prev, _tmp: tmp }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            self._tmp.path()
+        }
+    }
+
+    impl Drop for TestCrewRoot {
+        fn drop(&mut self) {
+            // SAFETY: serialized via #[serial] on every caller.
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
+                    None => std::env::remove_var("DARKMUX_CREW_DIR"),
+                }
+            }
+        }
+    }
+
+    fn seed_mission(root: &std::path::Path, id: &str) {
+        let dir = root.join("missions").join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mission = serde_json::json!({
+            "id": id,
+            "description": format!("test mission {id}"),
+            "sprint_ids": [],
+            "created_ts": 1_700_000_000u64,
+        });
+        std::fs::write(
+            dir.join("mission.json"),
+            serde_json::to_string_pretty(&mission).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn seed_sprint(root: &std::path::Path, mission_id: &str, sprint_id: &str) {
+        let sdir = root.join("missions").join(mission_id).join("sprints");
+        std::fs::create_dir_all(&sdir).unwrap();
+        let sprint = serde_json::json!({
+            "id": sprint_id,
+            "mission_id": mission_id,
+            "description": format!("test sprint {sprint_id}"),
+            "depends_on": [],
+            "created_ts": 1_700_000_000u64,
+        });
+        std::fs::write(
+            sdir.join(format!("{sprint_id}.json")),
+            serde_json::to_string_pretty(&sprint).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn load_missions_empty_root() {
+        let _guard = TestCrewRoot::new();
+        assert_eq!(load_missions().unwrap().len(), 0);
+    }
+
+    #[test]
+    #[serial]
+    fn load_sprints_empty_root() {
+        let _guard = TestCrewRoot::new();
+        assert_eq!(load_sprints().unwrap().len(), 0);
+    }
+
+    #[test]
+    #[serial]
+    fn load_missions_two_missions_one_sprint_each() {
+        let guard = TestCrewRoot::new();
+        let root = guard.path();
+
+        seed_mission(root, "alpha");
+        seed_mission(root, "beta");
+        seed_sprint(root, "alpha", "s1");
+        seed_sprint(root, "beta", "s2");
+
+        let missions = load_missions().unwrap();
+        assert_eq!(missions.len(), 2);
+        // Sorted by id.
+        assert_eq!(missions[0].id, "alpha");
+        assert_eq!(missions[1].id, "beta");
+
+        let sprints = load_sprints().unwrap();
+        assert_eq!(sprints.len(), 2);
+        let alpha_sprint = sprints.iter().find(|s| s.id == "s1").expect("sprint s1 missing");
+        let beta_sprint = sprints.iter().find(|s| s.id == "s2").expect("sprint s2 missing");
+        assert_eq!(alpha_sprint.mission_id, "alpha");
+        assert_eq!(beta_sprint.mission_id, "beta");
+    }
+
+    #[test]
+    #[serial]
+    fn load_missions_ignores_legacy_flat_files() {
+        let guard = TestCrewRoot::new();
+        let root = guard.path();
+
+        // New layout mission.
+        seed_mission(root, "current");
+
+        // Legacy flat mission file at <crew_root>/missions/old.json — should be IGNORED.
+        let missions_root = root.join("missions");
+        std::fs::write(
+            missions_root.join("old.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "id": "old",
+                "description": "legacy",
+                "sprint_ids": [],
+                "created_ts": 1u64,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Legacy flat sprint at <crew_root>/sprints/x.json — should be IGNORED.
+        let legacy_sprints = root.join("sprints");
+        std::fs::create_dir_all(&legacy_sprints).unwrap();
+        std::fs::write(
+            legacy_sprints.join("x.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "id": "x",
+                "mission_id": "old",
+                "description": "legacy",
+                "depends_on": [],
+                "created_ts": 1u64,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let missions = load_missions().unwrap();
+        assert_eq!(missions.len(), 1, "legacy flat file must be ignored; got {:?}", missions.iter().map(|m| &m.id).collect::<Vec<_>>());
+        assert_eq!(missions[0].id, "current");
+
+        // current has no sprints; legacy x.json under <crew_root>/sprints/ is ignored.
+        let sprints = load_sprints().unwrap();
+        assert_eq!(sprints.len(), 0, "legacy flat sprint must be ignored; got {:?}", sprints.iter().map(|s| &s.id).collect::<Vec<_>>());
+    }
+
+    #[test]
+    #[serial]
+    fn load_missions_skips_subdir_without_mission_json() {
+        let guard = TestCrewRoot::new();
+        let root = guard.path();
+
+        // Create a subdir with no mission.json inside it.
+        let partial = root.join("missions").join("partial");
+        std::fs::create_dir_all(&partial).unwrap();
+
+        // And a fully-formed mission alongside it.
+        seed_mission(root, "complete");
+
+        let missions = load_missions().unwrap();
+        assert_eq!(missions.len(), 1);
+        assert_eq!(missions[0].id, "complete");
+    }
+
+    #[test]
+    #[serial]
+    fn load_sprints_skips_non_json_files() {
+        let guard = TestCrewRoot::new();
+        let root = guard.path();
+
+        seed_mission(root, "mymission");
+        seed_sprint(root, "mymission", "s-real");
+
+        // Drop a non-JSON file into the sprints dir — should be ignored.
+        let sprints_dir = root.join("missions").join("mymission").join("sprints");
+        std::fs::write(sprints_dir.join("notes.txt"), "just a note").unwrap();
+
+        let sprints = load_sprints().unwrap();
+        assert_eq!(sprints.len(), 1);
+        assert_eq!(sprints[0].id, "s-real");
     }
 }
