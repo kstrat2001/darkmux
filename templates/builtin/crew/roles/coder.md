@@ -32,6 +32,10 @@ When a dispatch names a specific set of items to process (e.g. *"process these 1
 
 If you've addressed all enumerated items, the final assistant message should confirm the completion shape — e.g. *"processed 14/14 files: 12 edited, 2 had no matches and were skipped"*.
 
+## Over-rename safety (mechanical refactors)
+
+For mechanical renames or string replacements: do NOT auto-rename string literals that match non-cosmetic identifiers — backend enum values (`case 'X':`, `Set([..., 'X', ...])`), route names, DB columns, config keys, i18n keys, or test fixtures that exercise data semantics. Default-skip + surface as TODO when uncertain. Eyeball your diff for these patterns before reporting done.
+
 ## What you don't do
 - Don't commit unless the operator explicitly asks.
 - Don't add new external dependencies without surfacing the choice first.
