@@ -252,16 +252,64 @@
       assertEqual(out.sprint_count, 2);
     });
 
-    function App() {
-      const nodes = [{ id: 'hello', position: { x: 0, y: 0 }, data: { label: 'Topology view — Task 1 smoke' } }];
-      const edges = [];
+    // ─── data sources ─────────────────────────────────────────────────────
+    function parseJSONL(text) {
+      return text.split('\n').filter(l => l.trim()).map(l => {
+        try { return JSON.parse(l); } catch { return null; }
+      }).filter(Boolean);
+    }
+
+    function FileDropZone({ onRecords, active }) {
+      const onDrop = useCallback(async (e) => {
+        e.preventDefault();
+        const file = e.dataTransfer.files?.[0];
+        if (!file) return;
+        const text = await file.text();
+        onRecords(parseJSONL(text));
+      }, [onRecords]);
       return (
-        <div style={{ width: '100%', height: '100%' }}>
-          <ReactFlow nodes={nodes} edges={edges} fitView>
-            <Background />
-            <Controls />
-          </ReactFlow>
-        </div>
+        <div
+          onDragOver={e => e.preventDefault()}
+          onDrop={onDrop}
+          style={{
+            position: 'absolute', inset: 0, zIndex: 1,
+            pointerEvents: active ? 'auto' : 'none',
+            background: active ? 'rgba(109,241,255,0.05)' : 'transparent',
+          }}
+          title="drop a .jsonl flow file to replay"
+        />
+      );
+    }
+
+    function App() {
+      const [records, setRecords] = useState([]);
+
+      // Load fixture when ?fixture=NAME query param is present.
+      useEffect(() => {
+        const f = new URLSearchParams(location.search).get('fixture');
+        if (!f) return;
+        fetch(`fixtures/${f}.jsonl`)
+          .then(r => r.ok ? r.text() : Promise.reject(new Error(`HTTP ${r.status}`)))
+          .then(t => setRecords(parseJSONL(t)))
+          .catch(e => console.error('[topology] fixture load failed:', e));
+      }, []);
+
+      return (
+        <>
+          <FileDropZone onRecords={setRecords} active={true} />
+          <div style={{ width: '100%', height: '100%' }}>
+            <ReactFlow
+              nodes={records.length === 0
+                ? [{ id: 'empty', position: { x: 0, y: 0 }, data: { label: 'Drop a .jsonl flow file or use ?fixture=fleet-3-machines' } }]
+                : [{ id: 'records', position: { x: 0, y: 0 }, data: { label: `${records.length} record(s) loaded — renderer comes in Task 7` } }]}
+              edges={[]}
+              fitView
+            >
+              <Background />
+              <Controls />
+            </ReactFlow>
+          </div>
+        </>
       );
     }
 
