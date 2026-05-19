@@ -2301,7 +2301,11 @@ mod tests {
         //   1.5.0 — added optional `prev_hash` and `hash` fields for
         //           AuditFileSink's chain-of-custody (#163). Minor bump:
         //           absent in records from LocalFileSink (casual write path).
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.5.0");
+        //   1.6.0 — added optional `payload` JSON field for event-specific
+        //           data; new action types: dispatch.turn / .tool /
+        //           .compaction / .reasoning + mission.compile.start /
+        //           .complete (#204). Minor bump.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.6.0");
     }
 
     #[test]
@@ -2746,6 +2750,7 @@ mod tests {
                 orchestrator: None,
                 prev_hash: None, // sink stamps this
                 hash: None,      // sink stamps this
+                payload: None,
             };
             sink.write(&rec).unwrap();
         }
