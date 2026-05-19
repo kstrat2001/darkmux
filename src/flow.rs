@@ -729,8 +729,9 @@ impl RedisSink {
     /// is not established until the first `write` call (the redis client
     /// is lazy by design).
     pub fn new(url: &str, stream: &str, max_len: Option<usize>) -> Result<Self> {
-        let client = redis::Client::open(url)
-            .with_context(|| format!("opening Redis connection to {url}"))?;
+        let client = redis::Client::open(url).with_context(|| {
+            format!("opening Redis connection to {}", redact_url_creds(url))
+        })?;
         Ok(Self {
             client,
             url: url.to_string(),
@@ -743,9 +744,9 @@ impl RedisSink {
     /// (status probe, doctor health check) that need to talk to the
     /// same Redis the sink writes to.
     pub fn connect(&self) -> Result<redis::Connection> {
-        self.client
-            .get_connection()
-            .with_context(|| format!("connecting to Redis at {}", self.url))
+        self.client.get_connection().with_context(|| {
+            format!("connecting to Redis at {}", redact_url_creds(&self.url))
+        })
     }
 
     pub fn url(&self) -> &str { &self.url }
@@ -923,8 +924,9 @@ fn build_default_sink() -> Arc<dyn FlowSink> {
         match RedisSink::new(&url, &stream, max_len) {
             Ok(redis_sink) => {
                 eprintln!(
-                    "flow: Redis sink enabled — url={url} stream={stream} \
-                     max_len={max_len:?} (composed via TeeSink)"
+                    "flow: Redis sink enabled — url={} stream={stream} \
+                     max_len={max_len:?} (composed via TeeSink)",
+                    redact_url_creds(&url)
                 );
                 sinks.push(Arc::new(redis_sink));
             }
@@ -2979,6 +2981,53 @@ mod tests {
         );
         // Non-URL string — returned verbatim, no panic.
         assert_eq!(redact_url_creds("garbage"), "garbage");
+    }
+
+    #[test]
+    fn sink_init_banner_format_redacts_password() {
+        // Regression for #213: the Redis sink-init banner used to print
+        // the raw `DARKMUX_REDIS_URL` value with the password embedded.
+        // This test pins the on-the-wire banner format so a future
+        // refactor of the eprintln! at the construction site can't
+        // silently re-introduce the leak.
+        let url = "redis://:supersecret@100.74.208.36:6379";
+        let banner = format!(
+            "flow: Redis sink enabled — url={} stream={} max_len={:?} (composed via TeeSink)",
+            redact_url_creds(url),
+            "darkmux:flow",
+            Some(10000_usize),
+        );
+        assert!(
+            !banner.contains("supersecret"),
+            "banner leaked password substring: {banner}",
+        );
+        assert!(
+            banner.contains(":***@"),
+            "banner missed redaction marker: {banner}",
+        );
+    }
+
+    #[test]
+    fn redis_sink_error_context_redacts_password() {
+        // Regression for #213: `RedisSink::new` and `RedisSink::connect`
+        // wrap their inner errors with `with_context` strings that
+        // formerly embedded the raw URL. Both now route through
+        // `redact_url_creds`. We exercise the format strings directly to
+        // pin the contract — a future refactor that drops the redactor
+        // call would resurrect the leak.
+        let url = "redis://:supersecret@127.0.0.1:1/0";
+        let open_ctx = format!("opening Redis connection to {}", redact_url_creds(url));
+        let connect_ctx = format!("connecting to Redis at {}", redact_url_creds(url));
+        for ctx in [&open_ctx, &connect_ctx] {
+            assert!(
+                !ctx.contains("supersecret"),
+                "error context leaked password: {ctx}",
+            );
+            assert!(
+                ctx.contains(":***@"),
+                "error context missed redaction marker: {ctx}",
+            );
+        }
     }
 
     #[test]
