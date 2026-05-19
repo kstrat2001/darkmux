@@ -27,7 +27,7 @@ use crate::trajectory::Trajectory;
 /// error — better than spinning forever. 100 was picked after the
 /// Phase 6d e2e found 16 was too tight for long-agentic-shape work
 /// (real coding workloads with ~3 files of test edits need 30-50+
-/// granular tool calls with the spike's current palette).
+/// granular tool calls with the current tool palette).
 const MAX_TURNS: u32 = 100;
 
 /// Outcome of a completed loop run.
@@ -41,9 +41,8 @@ pub struct LoopOutcome {
     /// Number of model turns the loop took (each chat-completion call).
     pub turns: u32,
 
-    /// Total prompt tokens summed across all calls. Useful for spike
-    /// measurement; Phase 6 will use the per-call usage for compaction
-    /// triggering.
+    /// Total prompt tokens summed across all calls. Used for cumulative
+    /// cost reporting; per-call usage drives compaction triggering.
     pub total_prompt_tokens: u32,
 
     /// Total completion tokens summed across all calls.
@@ -215,7 +214,7 @@ pub fn run(
                 return Err(anyhow!(
                     "model returned finish_reason=length — context overflow. \
                      Compaction fires before the next call when prompt_tokens \
-                     crosses DARKMUX_AGENT_COMPACT_THRESHOLD_TOKENS, but the \
+                     crosses DARKMUX_RUNTIME_COMPACT_THRESHOLD_TOKENS, but the \
                      current response itself was already cut off mid-generation. \
                      Workload may need a smaller threshold or a larger n_ctx."
                 ));

@@ -1,22 +1,24 @@
-//! darkmux-agent — Phase 2 spike runner.
+//! darkmux-runtime — container-bounded agent runtime binary.
 //!
-//! Phase 1 was the container-builds-and-runs check. Phase 2 adds:
+//! Composition:
 //!
 //! - LMStudio HTTP client (`lmstudio` module)
 //! - Tool-call loop (`loop_runner` module)
-//! - One placeholder tool (`tools::Tool::Echo`)
+//! - Tool palette: `search`, `read`, `edit`, `write`, `bash`, `echo`
+//!   (echo retained for sanity-check unit tests; not in the production
+//!   dispatch palette — see `runtime/src/main.rs::run_dispatch`)
+//! - Token-count-aware compaction (`compaction` module)
+//! - Per-dispatch trajectory + metrics recorder (`trajectory` module)
 //!
-//! Subcommands the binary supports now:
+//! Subcommands:
 //!
-//! - `--check`            → Phase 1 environment probe (unchanged)
-//! - `--version`          → version + phase marker
-//! - `run --model <id> --prompt <text>`
-//!                        → run a single tool-call loop to completion,
-//!                          print the final assistant message + a few
-//!                          metrics
+//! - `--check`            → container environment probe
+//! - `--version`          → version
+//! - `run --model <id> --system <text> --prompt <text>`
+//!                        → run a single tool-call loop to completion;
+//!                          print the final assistant message + metrics
 //!
-//! See `README.md` for the architectural context and `loop_runner.rs`
-//! for what's deliberately omitted from this phase.
+//! See `README.md` for the architectural context.
 
 use std::env;
 use std::path::Path;
@@ -40,7 +42,7 @@ fn main() -> ExitCode {
     match subcommand {
         Some("--check") | Some("check") => run_check(),
         Some("--version") | Some("version") => {
-            println!("darkmux-agent {VERSION} (phase 2 spike)");
+            println!("darkmux-runtime {VERSION}");
             ExitCode::SUCCESS
         }
         Some("run") => run_dispatch(&args[2..]),
@@ -50,23 +52,23 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
         None => {
-            println!("darkmux-agent {VERSION} (phase 2 spike)");
+            println!("darkmux-runtime {VERSION}");
             println!();
             println!("Usage:");
-            println!("  darkmux-agent --check");
-            println!("  darkmux-agent --version");
-            println!("  darkmux-agent run --model <id> --prompt <text>");
+            println!("  darkmux-runtime --check");
+            println!("  darkmux-runtime --version");
+            println!("  darkmux-runtime run --model <id> --system <text> --prompt <text>");
             ExitCode::SUCCESS
         }
     }
 }
 
-/// Phase 1 sanity check. Kept verbatim from Phase 1 — still useful as
-/// the first thing a dispatch can run to verify the container is sound.
+/// Container environment probe. First thing a dispatch can run to
+/// verify the workspace mount + container layout are sound.
 fn run_check() -> ExitCode {
     let mut all_ok = true;
 
-    println!("darkmux-agent {VERSION} — phase 2 spike (phase 1 sanity check)");
+    println!("darkmux-runtime {VERSION} — container environment check");
     println!();
 
     let workspace = Path::new("/workspace");
@@ -97,17 +99,17 @@ fn run_check() -> ExitCode {
 }
 
 fn test_workspace_writable(workspace: &Path) -> bool {
-    let probe = workspace.join(".darkmux-agent-write-probe");
-    if std::fs::write(&probe, b"phase 2 probe").is_err() {
+    let probe = workspace.join(".darkmux-runtime-write-probe");
+    if std::fs::write(&probe, b"runtime write probe").is_err() {
         return false;
     }
     let _ = std::fs::remove_file(&probe);
     true
 }
 
-/// `darkmux-agent run --model <id> --prompt <text>` driver.
+/// `darkmux-runtime run --model <id> --system <text> --prompt <text>` driver.
 ///
-/// Parses flags by hand to keep zero clap dependency in the spike.
+/// Parses flags by hand to keep zero clap dependency in the runtime.
 /// Will gain a proper parser in Phase 4.
 fn run_dispatch(args: &[String]) -> ExitCode {
     let mut model: Option<String> = None;
@@ -181,7 +183,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // available tools. Real dispatches override this via --system with
     // the role's .md prompt (see darkmux's crew dispatch path).
     let system_prompt = system.unwrap_or_else(|| {
-        "You are running inside the darkmux-agent runtime. \
+        "You are running inside the darkmux-runtime container. \
          You have access to six tools:\n\
          \n\
          - `echo`   — echoes its `text` argument back (sanity check)\n\
@@ -258,7 +260,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
 
         let preview: String = final_assistant.chars().take(400).collect();
         let metrics = trajectory::Metrics {
-            runtime: "darkmux-agent-spike",
+            runtime: "darkmux-runtime",
             version: VERSION,
             model: model.clone(),
             started_at_unix_ms,
@@ -288,7 +290,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         // Loop returned an error — still write a minimal metrics file
         // so the operator has a record of the failure.
         let metrics = trajectory::Metrics {
-            runtime: "darkmux-agent-spike",
+            runtime: "darkmux-runtime",
             version: VERSION,
             model: model.clone(),
             started_at_unix_ms,

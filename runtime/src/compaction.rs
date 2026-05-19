@@ -1,11 +1,11 @@
-//! Compaction strategy for the spike runtime.
+//! Compaction strategy.
 //!
 //! When the conversation's prompt-token count approaches the model's
 //! loaded context window, the loop pauses to compact the middle of the
 //! conversation — summarizing it via a small companion model and
 //! replacing the summarized turns with a single synthetic user message.
 //!
-//! ## Architectural choices (Phase 6 spike)
+//! ## Architectural choices
 //!
 //! - **Middle-replace, not sliding-window.** Article 2's empirical
 //!   finding: keeping the system prompt stable across compactions is
@@ -17,7 +17,7 @@
 //!   model has immediate context for what's happening next.
 //! - **Companion compactor model.** Same approach openclaw uses — a
 //!   small 4B model summarizes via a separate chat-completion call
-//!   with no tools. Tunable via `DARKMUX_AGENT_COMPACTOR_MODEL`.
+//!   with no tools. Tunable via `DARKMUX_RUNTIME_COMPACTOR_MODEL`.
 //! - **Token-count-aware trigger, not heuristic percentage.** The
 //!   threshold compares the chat-completion API's reported
 //!   `usage.prompt_tokens` against an absolute number (env tunable).
@@ -32,7 +32,7 @@
 //!   intermediate tool results but keeps tool calls + assistant
 //!   reasoning). Could be added later if measurements show summarize
 //!   is too expensive.
-//! - No per-profile threshold (DARKMUX_AGENT_COMPACT_THRESHOLD_TOKENS
+//! - No per-profile threshold (DARKMUX_RUNTIME_COMPACT_THRESHOLD_TOKENS
 //!   is global). Phase 7+ could read the active darkmux profile and
 //!   derive per-profile thresholds automatically.
 
@@ -45,12 +45,12 @@ use crate::lmstudio::{ChatRequest, LmStudioClient, Message};
 /// crosses this, compact before the next chat() call. 60K leaves
 /// substantial headroom for the model's response generation when
 /// loaded at 101K (the `balanced` profile context). Tunable via
-/// `DARKMUX_AGENT_COMPACT_THRESHOLD_TOKENS`.
+/// `DARKMUX_RUNTIME_COMPACT_THRESHOLD_TOKENS`.
 const DEFAULT_THRESHOLD_TOKENS: u32 = 60_000;
 
 /// Default compactor model — the bake-off-hired admin agent
 /// (Beat 21: "the dependable admin agent"). Same model openclaw
-/// uses by convention. Tunable via `DARKMUX_AGENT_COMPACTOR_MODEL`.
+/// uses by convention. Tunable via `DARKMUX_RUNTIME_COMPACTOR_MODEL`.
 const DEFAULT_COMPACTOR_MODEL: &str = "darkmux:qwen3-4b-instruct-2507";
 
 /// Number of trailing messages to preserve uncompacted. Keeps the
@@ -64,7 +64,7 @@ const PRESERVE_HEAD: usize = 2;
 
 /// Read the threshold from env or use the default.
 pub fn threshold_tokens() -> u32 {
-    env::var("DARKMUX_AGENT_COMPACT_THRESHOLD_TOKENS")
+    env::var("DARKMUX_RUNTIME_COMPACT_THRESHOLD_TOKENS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_THRESHOLD_TOKENS)
@@ -72,7 +72,7 @@ pub fn threshold_tokens() -> u32 {
 
 /// Read the compactor model id from env or use the default.
 pub fn compactor_model() -> String {
-    env::var("DARKMUX_AGENT_COMPACTOR_MODEL")
+    env::var("DARKMUX_RUNTIME_COMPACTOR_MODEL")
         .unwrap_or_else(|_| DEFAULT_COMPACTOR_MODEL.to_string())
 }
 
@@ -138,7 +138,7 @@ pub fn compact(
     };
 
     eprintln!(
-        "darkmux-agent: compaction #{generation} — summarizing {middle_count} middle messages \
+        "darkmux-runtime: compaction #{generation} — summarizing {middle_count} middle messages \
          (preserving {PRESERVE_HEAD} head + {PRESERVE_TAIL} tail)"
     );
 
@@ -151,7 +151,7 @@ pub fn compact(
         .ok_or_else(|| anyhow!("compactor model returned no content"))?;
 
     eprintln!(
-        "darkmux-agent: compaction #{generation} — summary {} chars",
+        "darkmux-runtime: compaction #{generation} — summary {} chars",
         summary.len()
     );
 
@@ -198,7 +198,7 @@ mod tests {
         // serial_test because they leak across tests. The default
         // behavior is the load-bearing one — assert it's a reasonable
         // value.
-        std::env::remove_var("DARKMUX_AGENT_COMPACT_THRESHOLD_TOKENS");
+        std::env::remove_var("DARKMUX_RUNTIME_COMPACT_THRESHOLD_TOKENS");
         assert_eq!(threshold_tokens(), DEFAULT_THRESHOLD_TOKENS);
     }
 

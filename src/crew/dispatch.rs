@@ -217,10 +217,10 @@ fn require_licensed_adjacent_ack(role_id: &str) -> Result<()> {
 /// production path that's shipped since v0.1 — openclaw shell-out
 /// via `~/.openclaw/agents/darkmux-<role>/` workspaces.
 ///
-/// `Internal` is the Phase 4 spike path (see `spike/agent-runtime/`
+/// `Internal` is the in-house container-bounded path (see `runtime/`
 /// and `dispatch_internal.rs`). Behind the `--runtime internal` flag
-/// while the spike is being measured against openclaw. Promotion to
-/// default depends on Phase 5 data.
+/// while the in-house runtime is being measured against openclaw;
+/// promotion to default is a separate hardening decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Runtime {
     #[default]
@@ -809,7 +809,7 @@ fn is_openclaw_noise(path: &Path) -> bool {
 
 /// Run a single dispatch end-to-end.
 pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
-    // Phase 4 spike: route to the internal runtime when the operator
+    // Route to the in-house container-bounded runtime when the operator
     // explicitly opts in via `--runtime internal`. Default stays the
     // openclaw path (everything below this branch).
     if opts.runtime == Runtime::Internal {

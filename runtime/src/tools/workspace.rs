@@ -117,7 +117,7 @@ mod tests {
     /// Create a fresh tempdir to serve as the workspace root for one
     /// test. Returns the dir; drop = cleanup.
     fn fresh_workspace() -> tempdir::TempDir {
-        tempdir::TempDir::new("darkmux-agent-workspace-test")
+        tempdir::TempDir::new("darkmux-runtime-workspace-test")
             .expect("create tempdir")
     }
 

@@ -803,7 +803,7 @@ pub(crate) fn sprint_review_at(
         // not on the sprint's own work. No cross-sprint context needed.
         sprint_id: None,
         // Sprint review dispatches through the default openclaw runtime;
-        // internal spike runtime is opt-in via the CLI flag.
+        // internal in-house runtime is opt-in via the CLI flag.
         runtime: crate::crew::dispatch::Runtime::Openclaw,
     };
 

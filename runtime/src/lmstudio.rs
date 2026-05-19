@@ -17,8 +17,8 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-/// Default base URL the spike container talks to. Phase 4 will make this
-/// configurable via env var or CLI arg.
+/// Default base URL the runtime container talks to. Configurable via
+/// the `--base-url` CLI arg passed to `run`.
 pub const DEFAULT_BASE_URL: &str = "http://host.docker.internal:1234/v1";
 
 /// HTTP timeout for a single chat-completion call. Long-agentic-shape

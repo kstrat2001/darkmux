@@ -1,22 +1,24 @@
 //! Agent tool implementations.
 //!
-//! Tools shipped in the spike palette:
+//! Tools shipped in the runtime palette:
 //!
-//! - `echo`   — Phase 2 placeholder, kept for sanity tests
+//! - `echo`   — round-trip probe, retained for unit-test coverage only
+//!              (NOT exposed in the dispatch palette — see `main.rs`)
 //! - `bash`   — run a bash command with cwd=/workspace
-//! - `read`   — read a file from inside /workspace
+//! - `read`   — read a file from inside /workspace (requires offset+limit)
 //! - `write`  — write a file to inside /workspace
-//! - `edit`   — targeted patch (or batch of patches) on an existing file
+//! - `edit`   — apply one or more targeted patches via `edits[]` array
 //! - `search` — find a substring pattern in a file or directory tree
-//!              (Phase 6f addition — gives the model a cheap way to
-//!              locate code without reading whole files)
 //!
-//! `edit` was added after Phase 6d's diagnostic compared openclaw's
-//! coder palette (5 tools, including `edit`) to the spike's (4 tools,
-//! `write`-only). The spike was completing the same work openclaw did
-//! but needed 2× the tool calls for any file modification (read +
-//! full-write where openclaw uses one targeted edit). Adding `edit`
-//! closes that granularity gap.
+//! The shape converged through an empirical-evaluation arc against the
+//! canonical Article 2 long-agentic refresh-token QA workload. The
+//! load-bearing findings: `edits[]` array shape on `edit` enables batch
+//! reasoning; required `offset`/`limit` on `read` forces deliberate
+//! region thinking; `search` complements read for locating-by-name.
+//! Attempts to make `read` array-shaped (`regions[]`) broke the model's
+//! ability to call it (70% serde error rate); some tools are too
+//! canonical for restructuring. Full reasoning in lab notebook Beats
+//! 27-29.
 //!
 //! The path-validation contract is enforced in `workspace.rs` and is
 //! the security-critical piece. Every Read / Write / Bash invocation
@@ -814,7 +816,7 @@ mod tests {
     use tempdir::TempDir;
 
     fn fresh_workspace() -> TempDir {
-        TempDir::new("darkmux-agent-tools-test").expect("create tempdir")
+        TempDir::new("darkmux-runtime-tools-test").expect("create tempdir")
     }
 
     // ─── echo ─────────────────────────────────────────────────────────────

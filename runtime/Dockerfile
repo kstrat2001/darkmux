@@ -1,18 +1,21 @@
-# darkmux-agent — Phase 1 spike image.
+# darkmux-runtime — container image for the in-house agent runtime.
 #
 # Multi-stage build:
 #   1. Build the Rust binary against musl (alpine-native).
 #   2. Run it in a small Alpine image with the Unix toolkit agents need.
 #
-# Goal of this image (Phase 1): prove the build + runtime path works.
-# Subsequent phases add the LMStudio client + tool-call loop + tool set.
+# The runtime hosts a per-dispatch agent loop: receives a model + system
+# prompt + user message, runs the tool-call loop until stop, records
+# trajectory + metrics, exits. The container is the kernel-enforced
+# workspace boundary — workspace mounts at /workspace, and the binary's
+# path validators reject anything that resolves outside it.
 
 # ─── builder ──────────────────────────────────────────────────────────────
 # rust:alpine pulls the latest stable Rust on Alpine. Pinning to a
 # specific 1.NN-alpine tag caused MSRV-bump issues with transitive deps
 # (e.g. idna_adapter 1.2.2 requires Rust ≥1.83 as of 2026-05). Letting
-# the image float on the latest-stable tag keeps the spike build robust;
-# the production design can pin once we know exact dep versions.
+# the image float on the latest-stable tag keeps the build robust;
+# pin once exact dep versions stabilize.
 FROM rust:alpine AS builder
 
 # musl-dev: C runtime for musl-linked Rust
@@ -29,9 +32,9 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 
-# Build the release binary. The Phase 1 binary had no runtime deps;
-# Phase 2 adds ureq + serde so this step now does real work on first
-# build (~30s on cache miss, <2s on cache hit).
+# Build the release binary. Cargo does real work on first build
+# (~30s on cache miss, <2s on cache hit thanks to the manifest-first
+# COPY above keeping the dep cache hot when only src changes).
 RUN cargo build --release --locked || cargo build --release
 
 # ─── runtime ──────────────────────────────────────────────────────────────
@@ -68,17 +71,17 @@ RUN apk add --no-cache \
 # host-side macOS user maps to inside Docker for Mac when sharing volumes.
 RUN adduser -D -u 1000 -h /home/darkmux -s /bin/bash darkmux
 
-# Copy the agent binary from the builder stage.
-COPY --from=builder /build/target/release/darkmux-agent /usr/local/bin/darkmux-agent
+# Copy the runtime binary from the builder stage.
+COPY --from=builder /build/target/release/darkmux-runtime /usr/local/bin/darkmux-runtime
 
-# The dispatch protocol Phase 4 will wire up mounts the operator's
-# per-dispatch workspace at /workspace. Phase 1 just creates the dir so
-# the sanity check has something to probe against when no volume is mounted
-# (catches "you forgot to mount" failure mode loudly).
+# Dispatch mounts the operator's per-dispatch workspace at /workspace.
+# Pre-creating the dir means the sanity check (`--check`) has something
+# to probe against when no volume is mounted, surfacing "you forgot to
+# mount" failures loudly rather than silently no-oping.
 RUN mkdir -p /workspace && chown -R darkmux:darkmux /workspace
 
 USER darkmux
 WORKDIR /workspace
 
-ENTRYPOINT ["/usr/local/bin/darkmux-agent"]
+ENTRYPOINT ["/usr/local/bin/darkmux-runtime"]
 CMD ["--check"]

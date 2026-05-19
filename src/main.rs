@@ -302,12 +302,12 @@ enum CrewCmd {
         /// Skip the pre-flight checks. Use only for debugging.
         #[arg(long, hide = true)]
         skip_preflight: bool,
-        /// Which agent runtime to dispatch through. **Phase 4 spike** —
-        /// the default `openclaw` path is the shipped production
-        /// runtime; `internal` opts into the spike runtime at
-        /// `spike/agent-runtime/` which runs the agent in an Alpine
-        /// docker container with workspace-rooted path enforcement.
-        /// See spike README for current scope + limitations.
+        /// Which agent runtime to dispatch through. The default
+        /// `openclaw` path is the shipped production runtime; `internal`
+        /// opts into the in-house container-bounded runtime at
+        /// `runtime/` which runs the agent in an Alpine docker
+        /// container with workspace-rooted path enforcement.
+        /// See `runtime/README.md` for current scope + limitations.
         #[arg(long, default_value = "openclaw")]
         runtime: String,
     },
@@ -1155,8 +1155,8 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
                 watch
             };
             // Parse --runtime <openclaw|internal>; default openclaw.
-            // Internal is the Phase 4 spike path (see
-            // `spike/agent-runtime/`).
+            // `internal` routes to the in-house container-bounded
+            // runtime (see `runtime/`).
             let runtime_flag = crew::dispatch::Runtime::parse(&runtime)?;
             let opts = crew::dispatch::DispatchOpts {
                 role_id: role,

@@ -1,14 +1,13 @@
-//! Phase 4 spike: internal runtime dispatch path.
+//! Internal runtime dispatch path.
 //!
 //! Routes a `darkmux crew dispatch --runtime internal <role>` invocation
-//! to the `darkmux-agent-spike` docker container instead of openclaw.
+//! to the `darkmux-runtime` docker container instead of openclaw.
 //! Per-dispatch container, mounted workspace, structured output collected
 //! from stdout.
 //!
-//! **This is a spike path** — behind the explicit `--runtime internal`
-//! CLI flag while the in-house runtime is being measured. Phase 5 of
-//! `spike/agent-runtime/README.md` decides whether this graduates to the
-//! default path.
+//! Opt-in via the explicit `--runtime internal` CLI flag while the
+//! in-house runtime is being measured against openclaw. Promotion to
+//! default is a separate decision tracked in `runtime/README.md`.
 //!
 //! Deliberately simpler than the openclaw path:
 //!
@@ -16,11 +15,11 @@
 //! - No `--workdir` symlink injection (workspace is a fresh tempdir
 //!   per dispatch; the gallery-incident class of bug is structurally
 //!   impossible because there's nowhere persistent to leak into)
-//! - No sprint-output persistence (Phase 6+ design)
-//! - No watched-path post-dispatch echo (same — Phase 6+)
+//! - No sprint-output persistence (later iteration)
+//! - No watched-path post-dispatch echo (same)
 //! - No model pin enforcement (probes whatever LMStudio currently has loaded)
 //!
-//! See `spike/agent-runtime/` for the runtime image this dispatches to.
+//! See `runtime/` for the container image this dispatches to.
 
 use crate::crew::dispatch::DispatchResult;
 use crate::crew::dispatch::DispatchOpts;
@@ -30,24 +29,26 @@ use std::fs;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Docker image tag for the spike runtime. Built locally from
-/// `spike/agent-runtime/Dockerfile`. Phase 6 will make this configurable.
-const SPIKE_IMAGE: &str = "darkmux-agent-spike:latest";
+/// Docker image tag for the internal runtime. Built locally from
+/// `runtime/Dockerfile`. Will become configurable when production
+/// hardening lands.
+const RUNTIME_IMAGE: &str = "darkmux-runtime:latest";
 
 /// LMStudio /v1/models URL used to probe the currently-loaded model
-/// when no explicit model is provided. Phase 4 spike uses
-/// "whatever's loaded"; Phase 6 will resolve via the role pin table.
+/// when no explicit model is provided. Currently the internal runtime
+/// uses "whatever's loaded"; future iteration will resolve via the
+/// role pin table.
 const LMSTUDIO_MODELS_URL: &str = "http://localhost:1234/v1/models";
 
 pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     eprintln!(
-        "darkmux crew dispatch: runtime=internal (spike) — image: {SPIKE_IMAGE}"
+        "darkmux crew dispatch: runtime=internal — image: {RUNTIME_IMAGE}"
     );
 
     // 1. Load the role manifest + .md prompt. The internal runtime uses
     //    the SAME on-disk role definition as the openclaw path so the
-    //    prompts stay identical across runtimes — that's load-bearing
-    //    for Phase 5's comparison.
+    //    prompts stay identical across runtimes — load-bearing for the
+    //    runtime-vs-openclaw comparison.
     let roles = load_roles().context("loading crew roles for internal dispatch")?;
     let _role = roles
         .iter()
@@ -60,8 +61,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         )
     })?;
 
-    // 2. Resolve the model. Phase 4 spike: probe LMStudio for whatever's
-    //    currently loaded. Phase 6 will use the role pin + active profile.
+    // 2. Resolve the model. Currently probes LMStudio for whatever's
+    //    loaded; future iteration will use the role pin + active profile.
     let model = probe_loaded_model().context(
         "no model loaded in LMStudio. Load one (darkmux swap <profile>) before dispatching."
     )?;
@@ -104,7 +105,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         .arg("--rm")
         .arg("-v")
         .arg(format!("{}:/workspace", workspace.display()))
-        .arg(SPIKE_IMAGE)
+        .arg(RUNTIME_IMAGE)
         .arg("run")
         .arg("--model")
         .arg(&model)
@@ -115,7 +116,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
 
     let output = cmd
         .output()
-        .context("spawning darkmux-agent-spike container")?;
+        .context("spawning darkmux-runtime container")?;
 
     let exit_code = output.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -132,7 +133,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
 
 /// Shell out to curl to fetch `/v1/models` from the host's LMStudio and
 /// return the first model id. Uses curl so we don't drag a Rust HTTP
-/// client dep into darkmux's main crate for the spike path.
+/// client dep into darkmux's main crate for one probe call.
 fn probe_loaded_model() -> Result<String> {
     let output = Command::new("curl")
         .args([

@@ -1,10 +1,9 @@
-//! Trajectory + metrics recording for the spike runtime.
+//! Trajectory + metrics recording.
 //!
-//! Phase 7: gives the spike post-dispatch visibility. Writes a
-//! line-per-event JSONL trace to `/workspace/.darkmux-agent/trajectory.jsonl`
-//! plus a top-line `metrics.json` at exit. Operators inspect these
-//! after the container is gone (the `--rm` mode otherwise loses
-//! everything except stderr).
+//! Gives post-dispatch visibility. Writes a line-per-event JSONL trace
+//! to `/workspace/.darkmux-runtime/trajectory.jsonl` plus a top-line
+//! `metrics.json` at exit. Operators inspect these after the container
+//! is gone (the `--rm` mode otherwise loses everything except stderr).
 //!
 //! The shape of each event mirrors openclaw's trajectory format
 //! closely enough that a side-by-side diff between the two runtimes
@@ -29,7 +28,7 @@ use crate::lmstudio::{ToolCall, Usage};
 /// dot-prefix is a soft signal that this is runtime metadata rather
 /// than agent content; agents that respect "don't muck with dotfiles"
 /// conventions will leave it alone.
-const TRAJECTORY_SUBDIR: &str = ".darkmux-agent";
+const TRAJECTORY_SUBDIR: &str = ".darkmux-runtime";
 const TRAJECTORY_FILE: &str = "trajectory.jsonl";
 const METRICS_FILE: &str = "metrics.json";
 
@@ -66,7 +65,7 @@ pub struct Metrics {
 }
 
 impl Trajectory {
-    /// Open a trajectory file at `<workspace>/.darkmux-agent/`. If
+    /// Open a trajectory file at `<workspace>/.darkmux-runtime/`. If
     /// the directory can't be created (permission, missing workspace,
     /// etc.) returns a degraded no-op recorder rather than failing.
     pub fn open(workspace: &Path) -> Self {
@@ -77,7 +76,7 @@ impl Trajectory {
         match try_open(&dir, &trajectory_path) {
             Ok(file) => {
                 eprintln!(
-                    "darkmux-agent: trajectory → {}",
+                    "darkmux-runtime: trajectory → {}",
                     trajectory_path.display()
                 );
                 Self {
@@ -88,7 +87,7 @@ impl Trajectory {
             }
             Err(e) => {
                 eprintln!(
-                    "darkmux-agent: trajectory recording disabled ({e}); \
+                    "darkmux-runtime: trajectory recording disabled ({e}); \
                      dispatch will continue without it"
                 );
                 Self {
@@ -215,7 +214,7 @@ impl Trajectory {
         };
         let json = serde_json::to_string_pretty(metrics)?;
         fs::write(path, json)?;
-        eprintln!("darkmux-agent: metrics → {}", path.display());
+        eprintln!("darkmux-runtime: metrics → {}", path.display());
         Ok(())
     }
 
@@ -237,7 +236,7 @@ impl Trajectory {
         let mut line = serde_json::to_string(event).unwrap_or_default();
         line.push('\n');
         if let Err(e) = file.write_all(line.as_bytes()) {
-            eprintln!("darkmux-agent: trajectory write failed: {e}");
+            eprintln!("darkmux-runtime: trajectory write failed: {e}");
         }
     }
 }
@@ -308,7 +307,7 @@ mod tests {
         t.append_dispatch_start("model", 0, 0);
         // metrics save should also be a no-op:
         let m = Metrics {
-            runtime: "darkmux-agent",
+            runtime: "darkmux-runtime",
             version: "0.1.0",
             model: "test".into(),
             started_at_unix_ms: 0,

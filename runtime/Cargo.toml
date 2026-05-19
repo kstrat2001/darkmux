@@ -1,13 +1,13 @@
 [package]
-name = "darkmux-agent"
+name = "darkmux-runtime"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
-description = "Minimal agent runtime spike for darkmux — see README.md"
+description = "Container-bounded in-house agent runtime for darkmux — see README.md"
 publish = false
 
 [[bin]]
-name = "darkmux-agent"
+name = "darkmux-runtime"
 path = "src/main.rs"
 
 [dependencies]
