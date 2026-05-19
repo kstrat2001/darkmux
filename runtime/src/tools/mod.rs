@@ -2,8 +2,8 @@
 //!
 //! Tools shipped in the runtime palette:
 //!
-//! - `echo`   — round-trip probe, retained for unit-test coverage only
-//!              (NOT exposed in the dispatch palette — see `main.rs`)
+//! - `echo`   — round-trip probe, retained for unit-test coverage only;
+//!   NOT exposed in the dispatch palette — see `main.rs`
 //! - `bash`   — run a bash command with cwd=/workspace
 //! - `read`   — read a file from inside /workspace (requires offset+limit)
 //! - `write`  — write a file to inside /workspace

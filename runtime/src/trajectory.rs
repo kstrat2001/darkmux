@@ -239,6 +239,63 @@ impl Trajectory {
         }));
     }
 
+    /// model.streaming.start — fires when an SSE-streamed turn begins,
+    /// before any partial chunks arrive. (#205)
+    pub fn append_model_streaming_start(&mut self, seq: u32) {
+        self.write_event(&serde_json::json!({
+            "type": "model.streaming.start",
+            "seq": seq,
+            "ts": unix_ms(),
+        }));
+    }
+
+    /// model.partial — fires per SSE chunk during a streamed turn.
+    /// Carries STATS ONLY, never the chunk content itself: a streaming
+    /// 10K-token response would otherwise blow up `trajectory.jsonl` by
+    /// orders of magnitude. Operators tailing the file get a steady
+    /// line cadence (= dispatch is alive) plus a running byte count
+    /// (= roughly how much has been produced so far). (#205)
+    pub fn append_model_partial(
+        &mut self,
+        seq: u32,
+        partial_index: u32,
+        delta_chars: usize,
+        cumulative_chars: usize,
+        tool_calls_present: bool,
+    ) {
+        self.write_event(&serde_json::json!({
+            "type": "model.partial",
+            "seq": seq,
+            "partial_index": partial_index,
+            "delta_chars": delta_chars,
+            "cumulative_chars": cumulative_chars,
+            "tool_calls_present": tool_calls_present,
+            "ts": unix_ms(),
+        }));
+    }
+
+    /// model.streaming.end — fires when the SSE stream terminates
+    /// (either via `data: [DONE]` or EOF), before the `model.completed`
+    /// summary event for the same turn. Records totals collected during
+    /// the stream so the operator sees a one-line summary in
+    /// `trajectory.jsonl` even without parsing all the partials. (#205)
+    pub fn append_model_streaming_end(
+        &mut self,
+        seq: u32,
+        partial_count: u32,
+        total_content_chars: usize,
+        tool_calls_count: usize,
+    ) {
+        self.write_event(&serde_json::json!({
+            "type": "model.streaming.end",
+            "seq": seq,
+            "partial_count": partial_count,
+            "total_content_chars": total_content_chars,
+            "tool_calls_count": tool_calls_count,
+            "ts": unix_ms(),
+        }));
+    }
+
     /// Save the metrics.json summary. Called once at dispatch exit.
     pub fn save_metrics(&mut self, metrics: &Metrics) -> Result<()> {
         let Some(path) = self.metrics_path.as_ref() else {
