@@ -66,7 +66,13 @@
 </style>
 </head>
 <body>
-  <dx-shell active-tab="topology"></dx-shell>
+  <dx-shell active-tab="topology">
+    <select slot="pills" class="dx-pill" id="topology-mode-select" title="topology view mode">
+      <option value="fleet">Fleet</option>
+      <option value="focus">Focus</option>
+      <option value="mission">Mission</option>
+    </select>
+  </dx-shell>
   <main>
     <div id="topology-root"></div>
   </main>
@@ -348,6 +354,43 @@
       assertEqual(edges[0].recent_ts, '2026-05-19T02:00:00Z');
     });
 
+    /**
+     * Per-machine crew breakdown — `handle` (only `darkmux/*`) → record count + last stage + last ts.
+     * @param {FlowRecord[]} records
+     * @param {string} machine_id
+     * @returns {Array<{ handle, count, last_stage, last_ts }>}
+     */
+    function aggregateRoles(records, machine_id) {
+      const byRole = new Map();
+      for (const r of records) {
+        if (r.machine_id !== machine_id) continue;
+        if (!r.handle?.startsWith('darkmux/')) continue;
+        let role = byRole.get(r.handle);
+        if (!role) { role = { handle: r.handle, count: 0, last_stage: r.stage, last_ts: r.ts }; byRole.set(r.handle, role); }
+        role.count += 1;
+        if (r.ts > role.last_ts) { role.last_ts = r.ts; role.last_stage = r.stage; }
+      }
+      return Array.from(byRole.values()).sort((a, b) => a.handle.localeCompare(b.handle));
+    }
+
+    test('aggregateRoles: filters by machine_id', () => {
+      const recs = [
+        { ts: 't1', machine_id: 'studio', handle: 'darkmux/coder', stage: 'dispatch' },
+        { ts: 't2', machine_id: 'laptop', handle: 'darkmux/coder', stage: 'dispatch' },
+      ];
+      const out = aggregateRoles(recs, 'studio');
+      assertEqual(out.length, 1);
+      assertEqual(out[0].handle, 'darkmux/coder');
+      assertEqual(out[0].count, 1);
+    });
+    test('aggregateRoles: last_stage tracks newest record', () => {
+      const recs = [
+        { ts: 't1', machine_id: 'studio', handle: 'darkmux/coder', stage: 'dispatch' },
+        { ts: 't2', machine_id: 'studio', handle: 'darkmux/coder', stage: 'review' },
+      ];
+      assertEqual(aggregateRoles(recs, 'studio')[0].last_stage, 'review');
+    });
+
     // ─── layout / render ─────────────────────────────────────────────────
     // Three implicit columns: orchestrators (left), machines (middle), missions (right).
     // Within a column, items stack vertically with ROW_GAP between centers.
@@ -374,6 +417,44 @@
         id: `miss:${m.mission_id}`,
         type: 'default',
         position: { x: COL_X.miss, y: i * ROW_GAP },
+        data: { label: `${m.mission_id}\n${m.sprint_count} sprint(s)` },
+        style: { borderColor: 'var(--accent)', whiteSpace: 'pre' },
+      }));
+      return nodes;
+    }
+
+    const FOCUS_COL_X = { orch: 0, machineAnchor: 400, role: 700, miss: 1100 };
+    const FOCUS_ROW_GAP = 100;
+
+    function layoutFocus({ orchestrators, focus_machine, roles, missions }) {
+      const nodes = [];
+      orchestrators.forEach((o, i) => nodes.push({
+        id: `orch:${o.orchestrator}`,
+        type: 'default',
+        position: { x: FOCUS_COL_X.orch, y: i * FOCUS_ROW_GAP },
+        data: { label: o.engagement ? `${o.orchestrator}\n${o.engagement}` : o.orchestrator },
+        style: { borderColor: 'var(--tier-frontier)', whiteSpace: 'pre' },
+      }));
+      // Single machine anchor at the center column
+      nodes.push({
+        id: `mach:${focus_machine}`,
+        type: 'default',
+        position: { x: FOCUS_COL_X.machineAnchor, y: 0 },
+        data: { label: `${focus_machine}\n${roles.length} role(s)` },
+        style: { borderColor: 'var(--tier-local)', whiteSpace: 'pre', fontWeight: 600 },
+      });
+      // Crew role nodes stacked at x=700
+      roles.forEach((role, i) => nodes.push({
+        id: `role:${focus_machine}:${role.handle}`,
+        type: 'default',
+        position: { x: FOCUS_COL_X.role, y: i * FOCUS_ROW_GAP },
+        data: { label: `${role.handle}\nlast: ${role.last_stage} (×${role.count})` },
+        style: { borderColor: 'var(--accent-dim)', whiteSpace: 'pre', fontSize: 12 },
+      }));
+      missions.forEach((m, i) => nodes.push({
+        id: `miss:${m.mission_id}`,
+        type: 'default',
+        position: { x: FOCUS_COL_X.miss, y: i * FOCUS_ROW_GAP },
         data: { label: `${m.mission_id}\n${m.sprint_count} sprint(s)` },
         style: { borderColor: 'var(--accent)', whiteSpace: 'pre' },
       }));
@@ -412,6 +493,7 @@
     function App() {
       const [records, setRecords] = useState([]);
       const [mode, setMode] = useState('fleet');
+      const [focusMachine, setFocusMachine] = useState(null);
 
       useEffect(() => {
         const f = new URLSearchParams(location.search).get('fixture');
@@ -422,10 +504,39 @@
           .catch(e => console.error('[topology] fixture load failed:', e));
       }, []);
 
+      // Sync mode select → React state (mount-only; we update imperatively on change)
+      useEffect(() => {
+        const el = document.getElementById('topology-mode-select');
+        if (!el) return;
+        const onChange = () => setMode(el.value);
+        el.value = mode; // sync initial
+        el.addEventListener('change', onChange);
+        return () => el.removeEventListener('change', onChange);
+      }, []);  // mount-only; we sync el.value imperatively when mode changes outside the listener
+
+      // Sync React mode state → select element
+      useEffect(() => {
+        const el = document.getElementById('topology-mode-select');
+        if (el) el.value = mode;
+      }, [mode]);
+
       const machines = useMemo(() => aggregateMachines(records), [records]);
       const orchestrators = useMemo(() => aggregateOrchestrators(records), [records]);
       const missions = useMemo(() => aggregateMissions(records), [records]);
-      const edges = useMemo(() => deriveEdges(records, { mode }), [records, mode]);
+
+      // Auto-default focusMachine when entering focus mode
+      useEffect(() => {
+        if (mode !== 'focus') return;
+        if (focusMachine && machines.some(m => m.machine_id === focusMachine)) return;
+        // Auto-pick most-recent machine.
+        const best = [...machines].sort((a, b) => (b.last_ts || '').localeCompare(a.last_ts || ''))[0];
+        setFocusMachine(best?.machine_id || null);
+      }, [mode, machines, focusMachine]);
+
+      const edges = useMemo(() =>
+        deriveEdges(records, { mode, focus_machine: focusMachine }),
+        [records, mode, focusMachine]
+      );
 
       const nodes = useMemo(() => {
         if (records.length === 0) {
@@ -437,8 +548,12 @@
           }];
         }
         if (mode === 'fleet') return layoutFleet({ orchestrators, machines, missions });
-        return []; // Focus/Mission modes come in Tasks 8-9.
-      }, [mode, records.length, orchestrators, machines, missions]);
+        if (mode === 'focus' && focusMachine) {
+          const roles = aggregateRoles(records, focusMachine);
+          return layoutFocus({ orchestrators, focus_machine: focusMachine, roles, missions });
+        }
+        return []; // Mission mode in Task 9
+      }, [mode, records, orchestrators, machines, missions, focusMachine]);
 
       return (
         <>
