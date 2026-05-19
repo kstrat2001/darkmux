@@ -228,6 +228,73 @@
       })).sort((a, b) => a.mission_id.localeCompare(b.mission_id));
     }
 
+    const EDGE_STYLES = {
+      'dispatch':       { stroke: 'var(--accent)',         label: 'dispatch'    },
+      'tier-decision':  { stroke: 'var(--tier-frontier)',  label: 'tier'        },
+      'review':         { stroke: 'var(--warn)',           label: 'review'      },
+      'ship':           { stroke: 'var(--good)',           label: 'ship'        },
+    };
+
+    /**
+     * Build edges from records. Source/target node ids are mode-dependent:
+     *   fleet:   orchestrator → machine; machine → mission (rolled-up)
+     *   focus:   orchestrator → role; role → mission (expanded per-role)
+     *   mission: only edges whose record.mission_id === opts.mission_id
+     *
+     * @param {FlowRecord[]} records
+     * @param {{ mode: 'fleet'|'focus'|'mission', focus_machine?: string, mission_id?: string }} opts
+     * @returns {Array<{ id, source, target, label, style, recent_ts, stage }>}
+     */
+    function deriveEdges(records, opts) {
+      const out = [];
+      const seen = new Map();
+      for (const r of records) {
+        if (!EDGE_STYLES[r.stage]) continue;
+        const eps = edgeEndpoints(r, opts);
+        if (!eps) continue;
+        const key = `${eps.source}|${eps.target}|${r.stage}`;
+        const existing = seen.get(key);
+        if (existing) {
+          if (r.ts > existing.recent_ts) existing.recent_ts = r.ts;
+          continue;
+        }
+        const edge = {
+          id: key,
+          source: eps.source,
+          target: eps.target,
+          label: EDGE_STYLES[r.stage].label,
+          style: { stroke: EDGE_STYLES[r.stage].stroke },
+          recent_ts: r.ts,
+          stage: r.stage,
+        };
+        seen.set(key, edge);
+        out.push(edge);
+      }
+      return out;
+    }
+
+    function edgeEndpoints(r, { mode, focus_machine, mission_id }) {
+      if (mode === 'mission' && r.mission_id !== mission_id) return null;
+      if (mode === 'focus' && r.machine_id !== focus_machine) return null;
+      const orch = r.orchestrator ? `orch:${r.orchestrator}` : null;
+      const mach = r.machine_id ? `mach:${r.machine_id}` : null;
+      const role = r.handle?.startsWith('darkmux/') ? `role:${r.machine_id}:${r.handle}` : null;
+      const miss = r.mission_id ? `miss:${r.mission_id}` : null;
+
+      if (mode === 'focus') {
+        if (r.stage === 'dispatch' && orch && role) return { source: orch, target: role };
+        if (r.stage === 'ship' && role && miss)     return { source: role, target: miss };
+        if (r.stage === 'review' && role)           return { source: role, target: role };
+        if (r.stage === 'tier-decision' && orch)    return { source: orch, target: orch };
+      } else {
+        if (orch && mach && (r.stage === 'dispatch' || r.stage === 'tier-decision'))
+          return { source: orch, target: mach };
+        if (mach && miss && (r.stage === 'ship' || r.stage === 'review'))
+          return { source: mach, target: miss };
+      }
+      return null;
+    }
+
     test('aggregateOrchestrators: skips records without orchestrator', () => {
       assertEqual(aggregateOrchestrators([{ ts: 't', handle: 'note', stage: 'scope' }]), []);
     });
@@ -250,6 +317,35 @@
       const out = aggregateMissions(recs)[0];
       assertEqual(out.machines.sort(), ['laptop', 'studio']);
       assertEqual(out.sprint_count, 2);
+    });
+    test('deriveEdges: fleet mode — orchestrator→machine on dispatch', () => {
+      const recs = [{ ts: 't1', stage: 'dispatch', orchestrator: 'claude', machine_id: 'studio', handle: 'darkmux/coder' }];
+      const edges = deriveEdges(recs, { mode: 'fleet' });
+      assertEqual(edges.length, 1);
+      assertEqual(edges[0].source, 'orch:claude');
+      assertEqual(edges[0].target, 'mach:studio');
+    });
+    test('deriveEdges: mission mode filters by mission_id', () => {
+      const recs = [
+        { ts: 't1', stage: 'dispatch', orchestrator: 'claude', machine_id: 'studio', mission_id: 'A', handle: 'darkmux/coder' },
+        { ts: 't2', stage: 'dispatch', orchestrator: 'claude', machine_id: 'studio', mission_id: 'B', handle: 'darkmux/coder' },
+      ];
+      assertEqual(deriveEdges(recs, { mode: 'mission', mission_id: 'A' }).length, 1);
+    });
+    test('deriveEdges: focus mode goes orchestrator→role (not machine)', () => {
+      const recs = [{ ts: 't1', stage: 'dispatch', orchestrator: 'claude', machine_id: 'studio', handle: 'darkmux/coder' }];
+      const edges = deriveEdges(recs, { mode: 'focus', focus_machine: 'studio' });
+      assertEqual(edges[0].source, 'orch:claude');
+      assertEqual(edges[0].target, 'role:studio:darkmux/coder');
+    });
+    test('deriveEdges: dedup + recent_ts bumps to newest', () => {
+      const recs = [
+        { ts: '2026-05-19T01:00:00Z', stage: 'dispatch', orchestrator: 'claude', machine_id: 'studio', handle: 'darkmux/coder' },
+        { ts: '2026-05-19T02:00:00Z', stage: 'dispatch', orchestrator: 'claude', machine_id: 'studio', handle: 'darkmux/coder' },
+      ];
+      const edges = deriveEdges(recs, { mode: 'fleet' });
+      assertEqual(edges.length, 1);
+      assertEqual(edges[0].recent_ts, '2026-05-19T02:00:00Z');
     });
 
     // ─── data sources ─────────────────────────────────────────────────────
