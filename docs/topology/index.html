@@ -64,6 +64,23 @@
     box-shadow: 0 2px 8px rgba(0,0,0,0.3);
   }
 
+  /* replay scrubber bar */
+  .dx-scrubber {
+    position: fixed; left: 12px; right: 12px; bottom: 12px;
+    display: flex; gap: 10px; align-items: center;
+    padding: 8px 12px; background: var(--bg-elev); border: 1px solid var(--border);
+    border-radius: 6px; z-index: 30;
+  }
+  .dx-scrubber input[type="range"] {
+    -webkit-appearance: none; appearance: none;
+    height: 4px; background: var(--border); border-radius: 2px;
+  }
+  .dx-scrubber input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none;
+    width: 14px; height: 14px; border-radius: 50%;
+    background: var(--accent); cursor: pointer;
+  }
+
   /* live cue: recent edges flow dashes */
   .topology-edge-active .react-flow__edge-path {
     stroke-dasharray: 6 4;
@@ -100,6 +117,17 @@
   </dx-shell>
   <main>
     <div id="topology-root"></div>
+    <div id="topology-scrubber" class="dx-scrubber" hidden>
+      <button type="button" class="dx-pill" id="scrubber-step" title="step to next record">&#9654;|</button>
+      <select class="dx-pill" id="scrubber-speed" title="replay speed">
+        <option value="0">&#9208; pause</option>
+        <option value="1" selected>1&times;</option>
+        <option value="4">4&times;</option>
+        <option value="16">16&times;</option>
+      </select>
+      <input type="range" id="scrubber-range" min="0" max="100" value="0" step="1" style="flex:1">
+      <span id="scrubber-readout" class="mono" style="min-width:160px;text-align:right;font-size:11px;color:var(--muted)"></span>
+    </div>
   </main>
   <script src="../shared/shell.js" defer></script>
   <script type="text/babel" data-presets="react">
@@ -568,12 +596,43 @@
       const [missionId, setMissionId] = useState(null);
       const [sourceLabel, setSourceLabel] = useState('source: …');
 
-      // 250ms wall-clock tick for fading out edge-motion and node pulses.
+      // Derive replay mode once from URL (never changes during session).
+      const isReplay = useMemo(
+        () => new URLSearchParams(location.search).get('fixture') !== null,
+        []
+      );
+
+      // 250ms wall-clock tick — live: tracks Date.now(); replay: advances by (250ms * replaySpeed).
       const [clockT, setClockT] = useState(() => Date.now());
+      const [replaySpeed, setReplaySpeed] = useState(1); // multiplier; 0 = pause
+
       useEffect(() => {
-        const id = setInterval(() => setClockT(Date.now()), 250);
+        if (!isReplay) {
+          // Live: tick to "now" every 250ms (same as before).
+          const id = setInterval(() => setClockT(Date.now()), 250);
+          return () => clearInterval(id);
+        }
+        // Replay: advance clockT by (250ms * replaySpeed) each tick.
+        if (replaySpeed === 0) return; // paused
+        const id = setInterval(() => setClockT(t => t + 250 * replaySpeed), 250);
         return () => clearInterval(id);
-      }, []);
+      }, [isReplay, replaySpeed]);
+
+      // Initialize replay clock to just before the earliest record ts (once).
+      const replayInitRef = useRef(false);
+      useEffect(() => {
+        if (!isReplay) return;
+        if (replayInitRef.current) return;
+        if (records.length === 0) return;
+        const ts = records.reduce((min, r) => {
+          const t = Date.parse(r.ts);
+          return (min === null || t < min) ? t : min;
+        }, null);
+        if (ts !== null) {
+          setClockT(ts - 1); // start 1ms before earliest so all records are "future"
+          replayInitRef.current = true;
+        }
+      }, [isReplay, records]);
 
       // SSE + backfill: fires on mount; skips when ?fixture is present.
       useEffect(() => {
@@ -652,9 +711,15 @@
         if (el) el.value = mode;
       }, [mode]);
 
-      const machines = useMemo(() => aggregateMachines(records), [records]);
-      const orchestrators = useMemo(() => aggregateOrchestrators(records), [records]);
-      const missions = useMemo(() => aggregateMissions(records), [records]);
+      // In replay mode, only show records whose ts <= clockT.
+      const visibleRecords = useMemo(() => {
+        if (!isReplay) return records;
+        return records.filter(r => Date.parse(r.ts) <= clockT);
+      }, [isReplay, records, clockT]);
+
+      const machines = useMemo(() => aggregateMachines(visibleRecords), [visibleRecords]);
+      const orchestrators = useMemo(() => aggregateOrchestrators(visibleRecords), [visibleRecords]);
+      const missions = useMemo(() => aggregateMissions(visibleRecords), [visibleRecords]);
 
       // Auto-default focusMachine when entering focus mode
       useEffect(() => {
@@ -695,7 +760,7 @@
 
       const edges = useMemo(() => {
         const opts = { mode, focus_machine: focusMachine, mission_id: missionId };
-        const raw = deriveEdges(records, opts);
+        const raw = deriveEdges(visibleRecords, opts);
         const now = clockT;
         return raw.map(e => {
           const recent = e.recent_ts ? (now - Date.parse(e.recent_ts)) < RECENT_WINDOW_MS : false;
@@ -704,7 +769,7 @@
           if (mode === 'mission' && missionId) style = { ...style, strokeWidth: 2.5 };
           return { ...e, className, style, animated: recent };
         });
-      }, [records, mode, focusMachine, missionId, clockT]);
+      }, [visibleRecords, mode, focusMachine, missionId, clockT]);
 
       const nodes = useMemo(() => {
         if (records.length === 0) {
@@ -717,17 +782,17 @@
         }
         if (mode === 'fleet') return layoutFleet({ orchestrators, machines, missions });
         if (mode === 'focus' && focusMachine) {
-          const roles = aggregateRoles(records, focusMachine);
+          const roles = aggregateRoles(visibleRecords, focusMachine);
           return layoutFocus({ orchestrators, focus_machine: focusMachine, roles, missions });
         }
         if (mode === 'mission') return layoutMission({ orchestrators, machines, missions, mission_id: missionId });
         return [];
-      }, [mode, records, orchestrators, machines, missions, focusMachine, missionId]);
+      }, [mode, records, visibleRecords, orchestrators, machines, missions, focusMachine, missionId]);
 
       // Most-recent record ts per node id — used for pulse cue.
       const nodeRecentTs = useMemo(() => {
         const map = new Map();
-        for (const r of records) {
+        for (const r of visibleRecords) {
           const ids = [];
           if (r.machine_id) ids.push(`mach:${r.machine_id}`);
           if (r.orchestrator) ids.push(`orch:${r.orchestrator}`);
@@ -740,19 +805,19 @@
           }
         }
         return map;
-      }, [records]);
+      }, [visibleRecords]);
 
       // Active dispatch tracker: roleId → start ts when dispatch start seen but not yet completed.
       const activeDispatches = useMemo(() => {
         const m = new Map();
-        for (const r of records) {
+        for (const r of visibleRecords) {
           if (r.stage !== 'dispatch' || !r.handle?.startsWith('darkmux/') || !r.machine_id) continue;
           const id = `role:${r.machine_id}:${r.handle}`;
           if (r.action === 'dispatch start') m.set(id, Date.parse(r.ts));
           else if (r.action === 'dispatch complete') m.delete(id);
         }
         return m;
-      }, [records]);
+      }, [visibleRecords]);
 
       // Decorate nodes with pulse className and dispatch-arc label overlay.
       const nodesWithCues = useMemo(() => {
@@ -774,6 +839,78 @@
           return { ...n, className, data: { ...n.data, label } };
         });
       }, [nodes, nodeRecentTs, activeDispatches, clockT]);
+
+      // ─── scrubber wiring ────────────────────────────────────────────────
+
+      // Show/hide scrubber based on mode.
+      useEffect(() => {
+        const bar = document.getElementById('topology-scrubber');
+        if (!bar) return;
+        bar.hidden = !isReplay;
+      }, [isReplay]);
+
+      // Compute fixture ts range (min/max across ALL records, not just visible).
+      const tsRange = useMemo(() => {
+        if (records.length === 0) return null;
+        let min = Infinity, max = -Infinity;
+        for (const r of records) {
+          const t = Date.parse(r.ts);
+          if (t < min) min = t;
+          if (t > max) max = t;
+        }
+        if (!isFinite(min) || !isFinite(max)) return null;
+        return { min, max };
+      }, [records]);
+
+      // When user drags the slider, set clockT proportionally.
+      useEffect(() => {
+        if (!isReplay) return;
+        const el = document.getElementById('scrubber-range');
+        if (!el) return;
+        const onInput = () => {
+          if (!tsRange) return;
+          const frac = Number(el.value) / 100;
+          setClockT(tsRange.min + (tsRange.max - tsRange.min) * frac);
+        };
+        el.addEventListener('input', onInput);
+        return () => el.removeEventListener('input', onInput);
+      }, [isReplay, tsRange]);
+
+      // When clockT changes, update slider position + readout (one-way DOM sync).
+      useEffect(() => {
+        if (!isReplay || !tsRange) return;
+        const el = document.getElementById('scrubber-range');
+        const readout = document.getElementById('scrubber-readout');
+        if (!el || !readout) return;
+        const span = tsRange.max - tsRange.min;
+        const frac = span > 0 ? Math.min(1, Math.max(0, (clockT - tsRange.min) / span)) : 0;
+        el.value = String(frac * 100);
+        readout.textContent = `${new Date(clockT).toISOString().slice(11, 19)}  /  ${visibleRecords.length}/${records.length}`;
+      }, [clockT, tsRange, isReplay, visibleRecords.length, records.length]);
+
+      // Speed selector.
+      useEffect(() => {
+        const el = document.getElementById('scrubber-speed');
+        if (!el) return;
+        const onChange = () => setReplaySpeed(Number(el.value));
+        el.addEventListener('change', onChange);
+        return () => el.removeEventListener('change', onChange);
+      }, []);
+
+      // Step button: jump clockT to the next record's ts.
+      useEffect(() => {
+        const el = document.getElementById('scrubber-step');
+        if (!el) return;
+        const onClick = () => {
+          const next = records
+            .map(r => Date.parse(r.ts))
+            .filter(t => t > clockT)
+            .sort((a, b) => a - b)[0];
+          if (next !== undefined) setClockT(next);
+        };
+        el.addEventListener('click', onClick);
+        return () => el.removeEventListener('click', onClick);
+      }, [records, clockT]);
 
       return (
         <>
