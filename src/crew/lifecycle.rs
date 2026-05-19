@@ -71,13 +71,71 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ─── Paths ──────────────────────────────────────────────────────────────
+//
+// Per-mission nested layout (the target — see #148):
+//   <crew_root>/
+//     missions/
+//       <mission-id>/
+//         mission.json
+//         sprints/
+//           <sprint-id>.json
+//
+// Legacy flat layout (pre-#148):
+//   <crew_root>/
+//     missions/<mission-id>.json
+//     sprints/<sprint-id>.json
+//
+// Loaders + writers go through the new helpers below. The `legacy_*`
+// helpers exist for the `darkmux mission migrate` verb (Task 8) and the
+// `legacy-mission-layout` doctor check (Task 9). They are NOT used by any
+// normal CRUD path.
+//
+// Test isolation: `crew_root()` honors `DARKMUX_CREW_DIR` (see
+// `crew::loader::crew_root`). Tests should `std::env::set_var(
+// "DARKMUX_CREW_DIR", tmp.path())` and mark themselves
+// `#[serial_test::serial]` since env var mutation isn't thread-safe.
 
-fn sprint_path(sprint_id: &str) -> PathBuf {
+/// Directory holding the mission's JSON and its sprints/ subdir.
+pub fn mission_dir(mission_id: &str) -> PathBuf {
+    crew_root().join("missions").join(mission_id)
+}
+
+/// The mission JSON path under the per-mission directory.
+pub fn mission_path(mission_id: &str) -> PathBuf {
+    mission_dir(mission_id).join("mission.json")
+}
+
+/// Directory holding the mission's sprint JSONs.
+pub fn sprints_dir(mission_id: &str) -> PathBuf {
+    mission_dir(mission_id).join("sprints")
+}
+
+/// Path to a single sprint JSON within a mission.
+pub fn sprint_path(mission_id: &str, sprint_id: &str) -> PathBuf {
+    sprints_dir(mission_id).join(format!("{sprint_id}.json"))
+}
+
+/// Pre-#148 flat mission path: `<crew_root>/missions/<id>.json`. Only
+/// used by the migration verb and the doctor check.
+pub fn legacy_mission_path(mission_id: &str) -> PathBuf {
+    crew_root().join("missions").join(format!("{mission_id}.json"))
+}
+
+/// Pre-#148 flat sprint path: `<crew_root>/sprints/<id>.json`. Only
+/// used by the migration verb and the doctor check.
+pub fn legacy_sprint_path(sprint_id: &str) -> PathBuf {
     crew_root().join("sprints").join(format!("{sprint_id}.json"))
 }
 
-fn mission_path(mission_id: &str) -> PathBuf {
-    crew_root().join("missions").join(format!("{mission_id}.json"))
+/// Pre-#148 flat missions dir: `<crew_root>/missions/` (containing flat
+/// `<id>.json` files at the top level).
+pub fn legacy_missions_dir() -> PathBuf {
+    crew_root().join("missions")
+}
+
+/// Pre-#148 flat sprints dir: `<crew_root>/sprints/`.
+pub fn legacy_sprints_dir() -> PathBuf {
+    crew_root().join("sprints")
 }
 
 // ─── Time ───────────────────────────────────────────────────────────────
@@ -1065,5 +1123,44 @@ mod tests {
                 && line.contains("\"source\":\"mission_lifecycle\"")
         });
         assert!(found, "expected a `sprint added` flow record, got:\n{raw}");
+    }
+}
+
+#[cfg(test)]
+mod path_helper_tests {
+    use super::*;
+    use serial_test::serial;
+
+    fn with_test_root<F: FnOnce(&std::path::Path)>(f: F) {
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+        std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
+        f(tmp.path());
+        match prev {
+            Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
+            None => std::env::remove_var("DARKMUX_CREW_DIR"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn new_layout_resolvers() {
+        with_test_root(|root| {
+            assert_eq!(mission_dir("m"), root.join("missions/m"));
+            assert_eq!(mission_path("m"), root.join("missions/m/mission.json"));
+            assert_eq!(sprints_dir("m"), root.join("missions/m/sprints"));
+            assert_eq!(sprint_path("m", "s"), root.join("missions/m/sprints/s.json"));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn legacy_resolvers() {
+        with_test_root(|root| {
+            assert_eq!(legacy_mission_path("m"), root.join("missions/m.json"));
+            assert_eq!(legacy_sprint_path("s"), root.join("sprints/s.json"));
+            assert_eq!(legacy_missions_dir(), root.join("missions"));
+            assert_eq!(legacy_sprints_dir(), root.join("sprints"));
+        });
     }
 }
