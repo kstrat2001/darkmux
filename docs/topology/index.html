@@ -104,6 +104,8 @@
       out.id = 'dx-test-summary';
       out.textContent = summary;
       out.style.cssText = 'position:fixed;top:60px;right:12px;background:#0a0a0b;color:#e8e6e3;padding:12px;border:1px solid #1f1f24;font:11px/1.4 ui-monospace,monospace;max-width:480px;max-height:60vh;overflow:auto;z-index:9999;white-space:pre-wrap';
+      const existing = document.getElementById('dx-test-summary');
+      if (existing) existing.remove();
       document.body.appendChild(out);
       return { pass, fail };
     }
