@@ -62,7 +62,7 @@
 //! transition, not "this mission exists." That's why creation alone
 //! leaves `started_ts: None`.
 
-use crate::crew::loader::{crew_root, load_missions, load_sprints};
+use crate::crew::loader::{crew_root, load_sprints};
 use crate::crew::types::{Mission, MissionStatus, Sprint, SprintStatus};
 use crate::flow::{self, Category, FlowRecord, Level, Stage, Tier};
 use anyhow::{bail, Context, Result};
@@ -166,18 +166,83 @@ fn save_json<T: serde::Serialize>(path: &std::path::Path, value: &T) -> Result<(
 
 // ─── Load-by-id ────────────────────────────────────────────────────────
 
-fn load_sprint(id: &str) -> Result<Sprint> {
+/// Load a sprint by its fully-qualified (mission, sprint) coordinates. O(1).
+pub fn load_sprint(mission_id: &str, sprint_id: &str) -> Result<Sprint> {
+    let path = sprint_path(mission_id, sprint_id);
+    if !path.is_file() {
+        anyhow::bail!(
+            "no sprint with id `{sprint_id}` found at {} (mission `{mission_id}`)",
+            path.display()
+        );
+    }
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let sprint: Sprint = serde_json::from_str(&text)
+        .with_context(|| format!("parsing {}", path.display()))?;
+    Ok(sprint)
+}
+
+/// Load a sprint by sprint-id alone — scans every mission's sprints dir
+/// and returns the first match. Used by the operator CLI which accepts
+/// `darkmux sprint start <id>` without a mission qualifier.
+///
+/// If two missions both contain a sprint with this id (possible only
+/// during a partial #148 migration since post-migration the uniqueness
+/// is per-mission), the first match in `(mission_id, sprint_id)` sort
+/// order wins and a flow record is emitted.
+pub fn load_sprint_by_id(sprint_id: &str) -> Result<Sprint> {
     let all = load_sprints()?;
-    all.into_iter()
-        .find(|s| s.id == id)
-        .ok_or_else(|| anyhow::anyhow!("no sprint with id `{id}` found in {}", crew_root().join("sprints").display()))
+    let mut matches: Vec<&Sprint> = all.iter().filter(|s| s.id == sprint_id).collect();
+    match matches.as_slice() {
+        [] => anyhow::bail!(
+            "no sprint with id `{sprint_id}` found in any mission under {}",
+            crew_root().join("missions").display()
+        ),
+        [_one] => Ok(matches.remove(0).clone()),
+        _ => {
+            // Multiple matches — should be impossible post-migration. Pick
+            // deterministically and emit a warning flow record.
+            matches.sort_by_key(|s| (s.mission_id.as_str(), s.id.as_str()));
+            let chosen = matches[0];
+            let count = matches.len();
+            let _ = flow::record(FlowRecord {
+                ts: flow::ts_utc_now(),
+                level: Level::Warn,
+                category: Category::Machinery,
+                tier: Tier::Operator,
+                stage: Stage::Scope,
+                action: "ambiguous-sprint-id".into(),
+                handle: format!(
+                    "sprint id `{sprint_id}` found in {count} missions; using `{}`",
+                    chosen.mission_id
+                ),
+                sprint_id: Some(sprint_id.to_string()),
+                session_id: None,
+                source: Some("sprint_lifecycle".to_string()),
+                model: None,
+                reasoning: None,
+                mission_id: Some(chosen.mission_id.clone()),
+                machine_id: None,
+                orchestrator: None,
+                prev_hash: None,
+                hash: None,
+                payload: None,
+            });
+            Ok(chosen.clone())
+        }
+    }
 }
 
 fn load_mission(id: &str) -> Result<Mission> {
-    let all = load_missions()?;
-    all.into_iter()
-        .find(|m| m.id == id)
-        .ok_or_else(|| anyhow::anyhow!("no mission with id `{id}` found in {}", crew_root().join("missions").display()))
+    let path = mission_path(id);
+    if !path.is_file() {
+        anyhow::bail!("no mission with id `{id}` found at {}", path.display());
+    }
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let mission: Mission = serde_json::from_str(&text)
+        .with_context(|| format!("parsing {}", path.display()))?;
+    Ok(mission)
 }
 
 // ─── Flow record emission ──────────────────────────────────────────────
@@ -293,7 +358,7 @@ fn emit_sprint_added_record_with_reasoning(
 /// `sprint start <id>` — Planned/Abandoned → Running.
 /// Sets `started_ts = now()`; clears `abandoned_ts` if it was set.
 pub fn sprint_start(id: &str) -> Result<Sprint> {
-    let mut sprint = load_sprint(id)?;
+    let mut sprint = load_sprint_by_id(id)?;
     match sprint.status {
         SprintStatus::Planned | SprintStatus::Abandoned => {}
         SprintStatus::Running => bail!("sprint `{id}` is already Running"),
@@ -302,14 +367,14 @@ pub fn sprint_start(id: &str) -> Result<Sprint> {
     sprint.status = SprintStatus::Running;
     sprint.started_ts = Some(now_unix());
     sprint.abandoned_ts = None; // restart clears the prior abandonment
-    save_json(&sprint_path(id), &sprint)?;
+    save_json(&sprint_path(&sprint.mission_id, id), &sprint)?;
     emit_sprint_transition_record(id, &sprint.mission_id, "sprint start");
     Ok(sprint)
 }
 
 /// `sprint complete <id>` — Running → Complete (terminal).
 pub fn sprint_complete(id: &str) -> Result<Sprint> {
-    let mut sprint = load_sprint(id)?;
+    let mut sprint = load_sprint_by_id(id)?;
     match sprint.status {
         SprintStatus::Running => {}
         SprintStatus::Planned => bail!("sprint `{id}` is Planned — must `sprint start` first"),
@@ -318,7 +383,7 @@ pub fn sprint_complete(id: &str) -> Result<Sprint> {
     }
     sprint.status = SprintStatus::Complete;
     sprint.completed_ts = Some(now_unix());
-    save_json(&sprint_path(id), &sprint)?;
+    save_json(&sprint_path(&sprint.mission_id, id), &sprint)?;
     emit_sprint_transition_record(id, &sprint.mission_id, "sprint complete");
     Ok(sprint)
 }
@@ -326,7 +391,7 @@ pub fn sprint_complete(id: &str) -> Result<Sprint> {
 /// `sprint abandon <id>` — Planned/Running → Abandoned.
 /// Cannot abandon a `Complete` sprint (terminal in the other direction).
 pub fn sprint_abandon(id: &str) -> Result<Sprint> {
-    let mut sprint = load_sprint(id)?;
+    let mut sprint = load_sprint_by_id(id)?;
     match sprint.status {
         SprintStatus::Planned | SprintStatus::Running => {}
         SprintStatus::Abandoned => bail!("sprint `{id}` is already Abandoned"),
@@ -334,7 +399,7 @@ pub fn sprint_abandon(id: &str) -> Result<Sprint> {
     }
     sprint.status = SprintStatus::Abandoned;
     sprint.abandoned_ts = Some(now_unix());
-    save_json(&sprint_path(id), &sprint)?;
+    save_json(&sprint_path(&sprint.mission_id, id), &sprint)?;
     emit_sprint_transition_record(id, &sprint.mission_id, "sprint abandon");
     Ok(sprint)
 }
@@ -557,7 +622,7 @@ pub fn add_sprint_to_mission_with_reasoning(
         completed_ts: None,
         abandoned_ts: None,
     };
-    save_json(&sprint_path(sprint_id), &sprint)?;
+    save_json(&sprint_path(mission_id, sprint_id), &sprint)?;
 
     // Position into the mission's sprint_ids. Belt-and-suspenders: the
     // collision check above means we shouldn't see a duplicate here,
@@ -670,7 +735,7 @@ mod tests {
             completed_ts: None,
             abandoned_ts: None,
         };
-        save_json(&sprint_path(id), &s).unwrap();
+        save_json(&sprint_path("test-mission", id), &s).unwrap();
         s
     }
 
@@ -729,7 +794,7 @@ mod tests {
         let _g = CrewGuard::new();
         let mut s = seed_sprint("s4", SprintStatus::Abandoned);
         s.abandoned_ts = Some(1_700_000_500);
-        save_json(&sprint_path("s4"), &s).unwrap();
+        save_json(&sprint_path("test-mission", "s4"), &s).unwrap();
 
         let updated = sprint_start("s4").unwrap();
         assert_eq!(updated.status, SprintStatus::Running);
@@ -743,7 +808,7 @@ mod tests {
         let _g = CrewGuard::new();
         let mut s = seed_sprint("s5", SprintStatus::Running);
         s.started_ts = Some(1_700_000_100);
-        save_json(&sprint_path("s5"), &s).unwrap();
+        save_json(&sprint_path("test-mission", "s5"), &s).unwrap();
 
         let updated = sprint_complete("s5").unwrap();
         assert_eq!(updated.status, SprintStatus::Complete);
@@ -902,7 +967,7 @@ mod tests {
         let _g = CrewGuard::new();
         seed_sprint("s-atomic", SprintStatus::Planned);
         let _ = sprint_start("s-atomic").unwrap();
-        let tmp_path = sprint_path("s-atomic").with_extension("json.tmp");
+        let tmp_path = sprint_path("test-mission", "s-atomic").with_extension("json.tmp");
         assert!(!tmp_path.exists(), "atomic save should rename, leaving no .tmp");
     }
 
@@ -929,7 +994,7 @@ mod tests {
         assert_eq!(s.description, "discovered mid-flight");
         assert!(s.started_ts.is_none());
         // Sprint JSON exists on disk.
-        assert!(sprint_path("new-sprint").exists());
+        assert!(sprint_path("test-mission", "new-sprint").exists());
         // Mission JSON's sprint_ids was updated.
         let reloaded = load_mission("test-mission").unwrap();
         assert_eq!(reloaded.sprint_ids, vec!["new-sprint".to_string()]);
@@ -1102,7 +1167,7 @@ mod tests {
         let m = load_mission("m1").unwrap();
         assert_eq!(m.sprint_ids, vec!["alpha".to_string()]);
         // The sprint JSON should NOT have been left behind either.
-        assert!(!sprint_path("beta").exists(), "errored insert must not leave orphan sprint");
+        assert!(!sprint_path("m1", "beta").exists(), "errored insert must not leave orphan sprint");
     }
 
     #[serial_test::serial]
