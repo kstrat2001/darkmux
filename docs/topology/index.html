@@ -177,6 +177,81 @@
       assertEqual(out[0].machine_id, 'unknown');
     });
 
+    /**
+     * Aggregate FlowRecords by orchestrator, collecting machines and engagement context.
+     * @param {FlowRecord[]} records
+     * @returns {Array<{ orchestrator, machines: string[], last_ts, engagement?: string }>}
+     */
+    function aggregateOrchestrators(records) {
+      const byOrch = new Map();
+      for (const r of records) {
+        if (!r.orchestrator) continue;
+        let o = byOrch.get(r.orchestrator);
+        if (!o) {
+          o = { orchestrator: r.orchestrator, machines: new Set(), last_ts: r.ts, engagement: undefined };
+          byOrch.set(r.orchestrator, o);
+        }
+        if (r.machine_id) o.machines.add(r.machine_id);
+        if (r.ts > o.last_ts) o.last_ts = r.ts;
+        // Engagement label (#169 decision-2) — only when explicitly declared in a future schema field.
+        if (r.orchestrator_engagement && !o.engagement) o.engagement = r.orchestrator_engagement;
+      }
+      return Array.from(byOrch.values()).map(o => ({ ...o, machines: Array.from(o.machines) }))
+        .sort((a, b) => a.orchestrator.localeCompare(b.orchestrator));
+    }
+
+    /**
+     * Aggregate FlowRecords by mission_id, collecting machines, orchestrators, and sprint count.
+     * @param {FlowRecord[]} records
+     * @returns {Array<{ mission_id, machines: string[], orchestrators: string[], last_ts, sprint_count: number }>}
+     */
+    function aggregateMissions(records) {
+      const byMission = new Map();
+      for (const r of records) {
+        if (!r.mission_id) continue;
+        let m = byMission.get(r.mission_id);
+        if (!m) {
+          m = { mission_id: r.mission_id, machines: new Set(), orchestrators: new Set(), sprints: new Set(), last_ts: r.ts };
+          byMission.set(r.mission_id, m);
+        }
+        if (r.machine_id) m.machines.add(r.machine_id);
+        if (r.orchestrator) m.orchestrators.add(r.orchestrator);
+        if (r.sprint_id) m.sprints.add(r.sprint_id);
+        if (r.ts > m.last_ts) m.last_ts = r.ts;
+      }
+      return Array.from(byMission.values()).map(m => ({
+        ...m,
+        machines: Array.from(m.machines),
+        orchestrators: Array.from(m.orchestrators),
+        sprint_count: m.sprints.size,
+        sprints: undefined,
+      })).sort((a, b) => a.mission_id.localeCompare(b.mission_id));
+    }
+
+    test('aggregateOrchestrators: skips records without orchestrator', () => {
+      assertEqual(aggregateOrchestrators([{ ts: 't', handle: 'note', stage: 'scope' }]), []);
+    });
+    test('aggregateOrchestrators: collects machines per orchestrator', () => {
+      const recs = [
+        { ts: 't1', orchestrator: 'claude-opus-4-7', machine_id: 'studio', handle: 'note', stage: 'scope' },
+        { ts: 't2', orchestrator: 'claude-opus-4-7', machine_id: 'laptop', handle: 'note', stage: 'scope' },
+      ];
+      assertEqual(aggregateOrchestrators(recs)[0].machines.sort(), ['laptop', 'studio']);
+    });
+    test('aggregateMissions: skips records without mission_id', () => {
+      assertEqual(aggregateMissions([{ ts: 't', handle: 'note', stage: 'scope' }]), []);
+    });
+    test('aggregateMissions: collects machines + orchestrators + sprint count', () => {
+      const recs = [
+        { ts: 't1', mission_id: 'redis-tailnet', machine_id: 'studio', orchestrator: 'claude-opus-4-7', sprint_id: 's1', handle: 'note', stage: 'scope' },
+        { ts: 't2', mission_id: 'redis-tailnet', machine_id: 'laptop', orchestrator: 'claude-opus-4-7', sprint_id: 's2', handle: 'note', stage: 'scope' },
+        { ts: 't3', mission_id: 'redis-tailnet', machine_id: 'studio', orchestrator: 'claude-opus-4-7', sprint_id: 's1', handle: 'note', stage: 'scope' },
+      ];
+      const out = aggregateMissions(recs)[0];
+      assertEqual(out.machines.sort(), ['laptop', 'studio']);
+      assertEqual(out.sprint_count, 2);
+    });
+
     function App() {
       const nodes = [{ id: 'hello', position: { x: 0, y: 0 }, data: { label: 'Topology view — Task 1 smoke' } }];
       const edges = [];
