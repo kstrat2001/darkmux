@@ -51,8 +51,36 @@ pub fn build_router(flows_dir: PathBuf) -> Router {
         .route("/model/status", get(model_status_handler))
         .route("/missions", get(missions_handler))
         .route("/sprints", get(sprints_handler))
-        .layer(tower_http::cors::CorsLayer::permissive())
+        .layer(local_only_cors())
         .with_state(state)
+}
+
+/// CORS layer permitting only localhost-originating browser requests
+/// (#225). Prevents cross-origin exfiltration of flow records (which
+/// include `payload.reasoning_text` and crew structure) by arbitrary
+/// web pages.
+///
+/// Allowed origins:
+/// - `null`                  — `file://` pages (topology viewer from disk)
+/// - `http://localhost*`     — any local dev server port
+/// - `http://127.0.0.1*`    — explicit loopback
+///
+/// Non-browser clients (curl, darkmux CLI, probe) are unaffected — CORS
+/// is browser-enforced; the header simply isn't set for unmatched origins
+/// and the response is returned normally.
+fn local_only_cors() -> tower_http::cors::CorsLayer {
+    use axum::http::{HeaderValue, Method};
+    use tower_http::cors::AllowOrigin;
+    tower_http::cors::CorsLayer::new()
+        .allow_origin(AllowOrigin::predicate(
+            |origin: &HeaderValue, _parts: &axum::http::request::Parts| {
+                let s = origin.to_str().unwrap_or("");
+                s == "null"
+                    || s.starts_with("http://localhost")
+                    || s.starts_with("http://127.0.0.1")
+            },
+        ))
+        .allow_methods([Method::GET])
 }
 
 /// Default address the local `darkmux serve` daemon binds to. Used by
@@ -635,22 +663,92 @@ mod tests {
         assert_eq!(bytes.as_ref(), content.as_bytes());
     }
 
+    /// Localhost-origin requests get CORS headers (topology viewer on any
+    /// local port can read the response).
     #[tokio::test]
-    async fn cors_headers_present_on_responses() {
+    async fn cors_allows_localhost_origin() {
         let app = build_router(PathBuf::new());
-
         let response = app
             .oneshot(
                 Request::builder()
                     .uri("/health")
+                    .header("Origin", "http://localhost:5173")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
 
-        let headers = response.headers();
-        assert!(headers.contains_key("access-control-allow-origin"));
+        assert!(
+            response.headers().contains_key("access-control-allow-origin"),
+            "localhost origin must receive CORS headers"
+        );
+    }
+
+    /// 127.0.0.1 variant — same localhost, explicit IP form.
+    #[tokio::test]
+    async fn cors_allows_loopback_ip_origin() {
+        let app = build_router(PathBuf::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header("Origin", "http://127.0.0.1:8765")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            response.headers().contains_key("access-control-allow-origin"),
+            "127.0.0.1 origin must receive CORS headers"
+        );
+    }
+
+    /// `null` origin = topology viewer opened directly from disk (file://).
+    #[tokio::test]
+    async fn cors_allows_file_protocol_origin() {
+        let app = build_router(PathBuf::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header("Origin", "null")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            response.headers().contains_key("access-control-allow-origin"),
+            "file:// (null) origin must receive CORS headers for the topology viewer"
+        );
+    }
+
+    /// Arbitrary external origins must NOT get CORS headers — this is the
+    /// cross-origin exfiltration guard (#225). The response body is still
+    /// returned (CORS is browser-enforced); the missing header causes the
+    /// browser to block the script from reading it.
+    #[tokio::test]
+    async fn cors_denies_external_origin() {
+        let app = build_router(PathBuf::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header("Origin", "https://malicious.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !response.headers().contains_key("access-control-allow-origin"),
+            "external origin must NOT receive CORS headers"
+        );
     }
 
     // ─── SSE / tail_lines tests ─────────────────────────────────────────
