@@ -101,20 +101,42 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     //    the dispatch did).
     let workspace = match opts.workdir.as_deref() {
         Some(custom) => {
-            if !custom.exists() {
-                bail!(
-                    "--workdir path does not exist: {} \
-                     (create it first or use a different path)",
+            // Symlink-escape guard (#227). canonicalize() follows all
+            // symlinks and resolves .. to the real absolute path. absolute()
+            // resolves .. lexically without following symlinks. If they
+            // differ, the operator-supplied path traverses a symlink —
+            // bail rather than silently mounting an unintended directory
+            // inside the container (e.g. ~/.ssh, /etc, ~/.darkmux/audit/).
+            let resolved = custom.canonicalize().with_context(|| {
+                format!(
+                    "--workdir path does not exist or cannot be resolved: {}",
                     custom.display()
+                )
+            })?;
+            let no_symlink = std::path::absolute(custom)
+                .unwrap_or_else(|_| custom.to_path_buf());
+            if resolved != no_symlink {
+                eprintln!(
+                    "darkmux crew dispatch: [!] --workdir symlink detected: {} → {}",
+                    custom.display(),
+                    resolved.display()
+                );
+                bail!(
+                    "--workdir resolves through a symlink:\n  \
+                     input:    {}\n  \
+                     resolved: {}\n  \
+                     Use the real directory path directly to prevent unintended container r/w.",
+                    custom.display(),
+                    resolved.display()
                 );
             }
-            if !custom.is_dir() {
+            if !resolved.is_dir() {
                 bail!(
                     "--workdir path is not a directory: {}",
-                    custom.display()
+                    resolved.display()
                 );
             }
-            custom.to_path_buf()
+            resolved
         }
         None => {
             let auto = std::env::temp_dir().join(format!(
