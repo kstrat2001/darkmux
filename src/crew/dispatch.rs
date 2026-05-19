@@ -15,7 +15,7 @@
 //! `agents.list[]` reflect the manifests on disk — writes/updates the
 //! `darkmux/<role>` entries to match what the manifests + `.md` prompts say.
 
-use crate::crew::loader::{crew_root, load_role_prompt, load_roles, load_sprints};
+use crate::crew::loader::{load_role_prompt, load_roles, load_sprints};
 use crate::crew::types::Role;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value, json};

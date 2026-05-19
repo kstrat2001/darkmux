@@ -578,6 +578,7 @@ mod tests {
             Self { prev, _tmp: tmp }
         }
 
+        #[allow(dead_code)]
         fn path(&self) -> &std::path::Path {
             self._tmp.path()
         }

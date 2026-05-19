@@ -115,14 +115,20 @@ pub fn sprint_path(mission_id: &str, sprint_id: &str) -> PathBuf {
     sprints_dir(mission_id).join(format!("{sprint_id}.json"))
 }
 
-/// Pre-#148 flat mission path: `<crew_root>/missions/<id>.json`. Only
-/// used by the migration verb and the doctor check.
+/// Pre-#148 flat mission path: `<crew_root>/missions/<id>.json`. Held
+/// as public API for symmetry with the dir helpers; the migration verb
+/// constructs target paths via `mission_path(id)` and walks
+/// `legacy_missions_dir()`, so this per-id resolver isn't currently
+/// called. Keep for any future migration-back verb or external tool.
+#[allow(dead_code)]
 pub fn legacy_mission_path(mission_id: &str) -> PathBuf {
     crew_root().join("missions").join(format!("{mission_id}.json"))
 }
 
-/// Pre-#148 flat sprint path: `<crew_root>/sprints/<id>.json`. Only
-/// used by the migration verb and the doctor check.
+/// Pre-#148 flat sprint path: `<crew_root>/sprints/<id>.json`. Held
+/// as public API for symmetry with the dir helpers; see
+/// `legacy_mission_path` for why.
+#[allow(dead_code)]
 pub fn legacy_sprint_path(sprint_id: &str) -> PathBuf {
     crew_root().join("sprints").join(format!("{sprint_id}.json"))
 }
@@ -167,6 +173,11 @@ fn save_json<T: serde::Serialize>(path: &std::path::Path, value: &T) -> Result<(
 // ─── Load-by-id ────────────────────────────────────────────────────────
 
 /// Load a sprint by its fully-qualified (mission, sprint) coordinates. O(1).
+/// Currently every internal caller routes through `load_sprint_by_id` (since
+/// the CLI verbs accept a bare sprint id and discover the mission from the
+/// JSON itself). Kept as the primary public surface for code that *does*
+/// have both ids in scope (e.g., crew dispatch when `--mission` lands).
+#[allow(dead_code)]
 pub fn load_sprint(mission_id: &str, sprint_id: &str) -> Result<Sprint> {
     let path = sprint_path(mission_id, sprint_id);
     if !path.is_file() {
