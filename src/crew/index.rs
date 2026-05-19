@@ -802,7 +802,8 @@ mod tests {
     }
 
     fn write_mission(crew_root: &Path, id: &str, description: &str) {
-        let dir = crew_root.join("missions");
+        // Per-mission layout (#148): <crew_root>/missions/<id>/mission.json
+        let dir = crew_root.join("missions").join(id);
         fs::create_dir_all(&dir).unwrap();
         let json = format!(
             r#"{{
@@ -813,11 +814,12 @@ mod tests {
               "created_ts": 1700000000
             }}"#
         );
-        fs::write(dir.join(format!("{id}.json")), json).unwrap();
+        fs::write(dir.join("mission.json"), json).unwrap();
     }
 
     fn write_sprint(crew_root: &Path, id: &str, mission_id: &str, description: &str) {
-        let dir = crew_root.join("sprints");
+        // Per-mission layout (#148): <crew_root>/missions/<mission_id>/sprints/<id>.json
+        let dir = crew_root.join("missions").join(mission_id).join("sprints");
         fs::create_dir_all(&dir).unwrap();
         let json = format!(
             r#"{{
@@ -829,11 +831,7 @@ mod tests {
               "created_ts": 1700000000
             }}"#
         );
-        fs::write(
-            dir.join(format!("{mission_id}__{id}.json")),
-            json,
-        )
-        .unwrap();
+        fs::write(dir.join(format!("{id}.json")), json).unwrap();
     }
 
     fn index_path(root: &Path) -> PathBuf {

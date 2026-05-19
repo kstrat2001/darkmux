@@ -294,7 +294,9 @@ pub fn load_sprints() -> Result<Vec<Sprint>> {
     if !missions_root.is_dir() {
         return Ok(Vec::new());
     }
-    let mut map: BTreeMap<String, Sprint> = BTreeMap::new();
+    // Key by (mission_id, sprint_id) so the same sprint id is allowed across
+    // different missions — that's the composite-PK invariant #148 establishes.
+    let mut map: BTreeMap<(String, String), Sprint> = BTreeMap::new();
     for entry in fs::read_dir(&missions_root)
         .with_context(|| format!("reading {}", missions_root.display()))?
     {
@@ -325,22 +327,22 @@ pub fn load_sprints() -> Result<Vec<Sprint>> {
             let text = fs::read_to_string(&sprint_path)
                 .with_context(|| format!("reading {}", sprint_path.display()))?;
             match serde_json::from_str::<Sprint>(&text) {
-                Ok(s) => { map.insert(s.id.clone(), s); }
+                Ok(s) => { map.insert((s.mission_id.clone(), s.id.clone()), s); }
                 Err(e) => eprintln!("warning: failed to parse sprint at {}: {e}", sprint_path.display()),
             }
         }
     }
 
     // Built-in sprints (currently empty — future-proofing).
-    for (id, json) in BUILTIN_SPRINTS {
+    for (_id, json) in BUILTIN_SPRINTS {
         match serde_json::from_str::<Sprint>(json) {
-            Ok(s) => { map.entry(id.to_string()).or_insert(s); }
-            Err(e) => eprintln!("warning: failed to parse builtin sprint \"{id}\": {e}"),
+            Ok(s) => { map.entry((s.mission_id.clone(), s.id.clone())).or_insert(s); }
+            Err(e) => eprintln!("warning: failed to parse builtin sprint \"{_id}\": {e}"),
         }
     }
 
     let mut out: Vec<Sprint> = map.into_values().collect();
-    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out.sort_by(|a, b| (&a.mission_id, &a.id).cmp(&(&b.mission_id, &b.id)));
     Ok(out)
 }
 
