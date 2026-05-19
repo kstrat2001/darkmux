@@ -1,11 +1,11 @@
 {
-  "rationale": "Bake-off 2026-05-13 (kstrat2001/darkmux#45 closure). D (qwen3.6-35b-a3b-turboquant-mlx) hired for routine coding — won 4/4 paired rounds. B (qwen3-coder-next-mlx) reserved for single-shot prose quality (voice-editor was the Pair 2 Taste 5/5 standout). A (qwen3.5-122b-a10b) reserved as heavy-reasoning defensive — not pinned to any role; operators escalate manually. mission-compiler pinned to the 4B admin per CLAUDE.md Beat 21 (admin-agent role family — bounded structuring work, throughput matters). Non-SWE roles default to D until per-role bake-offs land for them.",
+  "rationale": "Bake-off 2026-05-13 (kstrat2001/darkmux#45 closure). D (qwen3.6-35b-a3b-turboquant-mlx) hired for routine coding — won 4/4 paired rounds. B (qwen3-coder-next-mlx) reserved for single-shot prose quality (voice-editor was the Pair 2 Taste 5/5 standout). A (qwen3.5-122b-a10b) reserved as heavy-reasoning defensive — not pinned to any role; operators escalate manually. mission-compiler promoted to D 2026-05-19 (#203): the original 4B admin pinning followed the bounded-structuring framing from CLAUDE.md Beat 21, but the FinHub SYS-2476 dispatch (Beat 30) made the architectural mismatch visceral — mission planning is judgment-bearing strategy work that sets the shape for every downstream dispatch, not bounded structuring. The 4B model under-decomposes by default (returned 1 sprint for clearly multi-tree work); the fan-out compounds — bad decomposition → oversized sprint scope → first-try dispatch fails on scope persistence → recovery cycles all the way down. Mission planning belongs at the specialist tier, even at the cost of slower per-propose wall time (infrequent operation, not throughput-sensitive). Non-SWE roles default to D until per-role bake-offs land for them.",
   "bake_off_url": "https://github.com/kstrat2001/darkmux/issues/45",
   "default_pin": "darkmux:qwen3.6-35b-a3b-turboquant-mlx",
   "per_role": {
     "voice-editor": "darkmux:qwen3-coder-next-mlx",
     "code-reviewer": "darkmux:qwen3.6-35b-a3b-turboquant-mlx",
     "coder": "darkmux:qwen3.6-35b-a3b-turboquant-mlx",
-    "mission-compiler": "darkmux:qwen3-4b-instruct-2507"
+    "mission-compiler": "darkmux:qwen3.6-35b-a3b-turboquant-mlx"
   }
 }
