@@ -348,6 +348,38 @@
       assertEqual(edges[0].recent_ts, '2026-05-19T02:00:00Z');
     });
 
+    // ─── layout / render ─────────────────────────────────────────────────
+    // Three implicit columns: orchestrators (left), machines (middle), missions (right).
+    // Within a column, items stack vertically with ROW_GAP between centers.
+    const COL_X = { orch: 0, mach: 500, miss: 1000 };
+    const ROW_GAP = 140;
+
+    function layoutFleet({ orchestrators, machines, missions }) {
+      const nodes = [];
+      orchestrators.forEach((o, i) => nodes.push({
+        id: `orch:${o.orchestrator}`,
+        type: 'default',
+        position: { x: COL_X.orch, y: i * ROW_GAP },
+        data: { label: o.engagement ? `${o.orchestrator}\n${o.engagement}` : o.orchestrator },
+        style: { borderColor: 'var(--tier-frontier)', whiteSpace: 'pre' },
+      }));
+      machines.forEach((m, i) => nodes.push({
+        id: `mach:${m.machine_id}`,
+        type: 'default',
+        position: { x: COL_X.mach, y: i * ROW_GAP },
+        data: { label: `${m.machine_id}\n${m.role_count} role(s)` },
+        style: { borderColor: 'var(--tier-local)', whiteSpace: 'pre' },
+      }));
+      missions.forEach((m, i) => nodes.push({
+        id: `miss:${m.mission_id}`,
+        type: 'default',
+        position: { x: COL_X.miss, y: i * ROW_GAP },
+        data: { label: `${m.mission_id}\n${m.sprint_count} sprint(s)` },
+        style: { borderColor: 'var(--accent)', whiteSpace: 'pre' },
+      }));
+      return nodes;
+    }
+
     // ─── data sources ─────────────────────────────────────────────────────
     function parseJSONL(text) {
       return text.split('\n').filter(l => l.trim()).map(l => {
@@ -379,8 +411,8 @@
 
     function App() {
       const [records, setRecords] = useState([]);
+      const [mode, setMode] = useState('fleet');
 
-      // Load fixture when ?fixture=NAME query param is present.
       useEffect(() => {
         const f = new URLSearchParams(location.search).get('fixture');
         if (!f) return;
@@ -390,17 +422,29 @@
           .catch(e => console.error('[topology] fixture load failed:', e));
       }, []);
 
+      const machines = useMemo(() => aggregateMachines(records), [records]);
+      const orchestrators = useMemo(() => aggregateOrchestrators(records), [records]);
+      const missions = useMemo(() => aggregateMissions(records), [records]);
+      const edges = useMemo(() => deriveEdges(records, { mode }), [records, mode]);
+
+      const nodes = useMemo(() => {
+        if (records.length === 0) {
+          return [{
+            id: 'empty',
+            position: { x: 0, y: 0 },
+            data: { label: 'Drop a .jsonl flow file or use ?fixture=fleet-3-machines' },
+            style: { borderColor: 'var(--border)' },
+          }];
+        }
+        if (mode === 'fleet') return layoutFleet({ orchestrators, machines, missions });
+        return []; // Focus/Mission modes come in Tasks 8-9.
+      }, [mode, records.length, orchestrators, machines, missions]);
+
       return (
         <>
           <FileDropZone onRecords={setRecords} active={true} />
           <div style={{ width: '100%', height: '100%' }}>
-            <ReactFlow
-              nodes={records.length === 0
-                ? [{ id: 'empty', position: { x: 0, y: 0 }, data: { label: 'Drop a .jsonl flow file or use ?fixture=fleet-3-machines' } }]
-                : [{ id: 'records', position: { x: 0, y: 0 }, data: { label: `${records.length} record(s) loaded — renderer comes in Task 7` } }]}
-              edges={[]}
-              fitView
-            >
+            <ReactFlow nodes={nodes} edges={edges} fitView>
               <Background />
               <Controls />
             </ReactFlow>
