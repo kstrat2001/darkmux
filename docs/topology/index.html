@@ -99,6 +99,24 @@
     0%   { box-shadow: 0 0 0 0 var(--accent), 0 2px 8px rgba(0,0,0,0.3); }
     100% { box-shadow: 0 0 0 14px transparent, 0 2px 8px rgba(0,0,0,0.3); }
   }
+
+  /* schema-version mismatch banner */
+  .topology-schema-banner {
+    position: fixed; top: 56px; left: 12px; right: 12px;
+    padding: 10px 14px; background: var(--bg-elev2); color: var(--warn);
+    border: 1px solid var(--warn); border-radius: 6px;
+    font-size: 13px; z-index: 25;
+  }
+  .topology-schema-banner code { background: var(--bg); padding: 1px 5px; border-radius: 2px; }
+
+  /* narrow viewport polish */
+  @media (max-width: 720px) {
+    .react-flow__node { font-size: 11px; padding: 8px 10px; }
+    .dx-scrubber { left: 6px; right: 6px; bottom: 6px; padding: 6px 8px; gap: 6px; flex-wrap: wrap; }
+    .dx-scrubber #scrubber-range { min-width: 100%; order: 99; flex: 0 0 100%; }
+    .dx-scrubber #scrubber-readout { font-size: 10px; min-width: 0; }
+    .topology-schema-banner { top: 48px; font-size: 11px; padding: 8px 10px; }
+  }
 </style>
 </head>
 <body>
@@ -595,6 +613,7 @@
       const [focusMachine, setFocusMachine] = useState(null);
       const [missionId, setMissionId] = useState(null);
       const [sourceLabel, setSourceLabel] = useState('source: …');
+      const [schemaWarning, setSchemaWarning] = useState(null);
 
       // Derive replay mode once from URL (never changes during session).
       const isReplay = useMemo(
@@ -685,6 +704,22 @@
         const el = document.getElementById('topology-source-label');
         if (el) el.textContent = sourceLabel;
       }, [sourceLabel]);
+
+      // Schema-major mismatch check via /health (live mode only).
+      useEffect(() => {
+        if (isReplay) return;
+        const base = 'http://127.0.0.1:8765';
+        fetch(`${base}/health`)
+          .then(r => r.ok ? r.json() : null)
+          .then(h => {
+            if (!h || !h.flow_schema_version) return;
+            const major = parseInt(h.flow_schema_version.split('.')[0], 10);
+            if (major !== EXPECTED_FLOW_SCHEMA_MAJOR) {
+              setSchemaWarning({ daemon: h.flow_schema_version, expected: EXPECTED_FLOW_SCHEMA_MAJOR });
+            }
+          })
+          .catch(() => {}); // silent — source pill handles daemon-offline state
+      }, [isReplay]);
 
       useEffect(() => {
         const f = new URLSearchParams(location.search).get('fixture');
@@ -914,6 +949,12 @@
 
       return (
         <>
+          {schemaWarning && (
+            <div className="topology-schema-banner">
+              ⚠ daemon flow schema v{schemaWarning.daemon} doesn't match viewer expectation (major {schemaWarning.expected}).
+              Upgrade with <code>cargo install --path . --force</code> from the darkmux source tree, OR open this viewer from a darkmux release that matches the daemon's schema.
+            </div>
+          )}
           <FileDropZone onRecords={setRecords} active={true} />
           <div style={{ width: '100%', height: '100%' }}>
             <ReactFlow nodes={nodesWithCues} edges={edges} fitView>
