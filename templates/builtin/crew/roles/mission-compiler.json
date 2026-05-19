@@ -1,6 +1,6 @@
 {
   "id": "mission-compiler",
-  "description": "Admin-class role that takes unstructured intent and emits a structured Mission+Sprint proposal JSON.",
+  "description": "Specialist-class role that takes unstructured intent and emits a structured Mission+Sprint proposal JSON. Promoted from admin-tier (4B) to specialist-tier (#203) — mission planning is judgment-bearing strategy work that sets the shape for every downstream dispatch in the mission.",
   "capabilities": ["mission-compiling"],
   "tool_palette": {
     "allow": ["read"],
