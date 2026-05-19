@@ -3,7 +3,7 @@
 //!   1. ./.darkmux/         — project-local (preferred when present)
 //!   2. ~/.darkmux/         — cross-project user state (fallback)
 //!
-//! Lab runs, sandboxes, profiles, teams, and notebooks all live under one
+//! Lab runs, sandboxes, profiles, crews, and notebooks all live under one
 //! of these. Relative paths only — never absolute paths in any shipped
 //! manifest.
 

@@ -1,4 +1,4 @@
-//! Schema types for the darkmux team architecture.
+//! Schema types for the darkmux crew architecture.
 //!
 //! These are scaffolding types — consumed by downstream phases (crew orchestration,
 //! mission management) but not yet wired into any CLI command.
