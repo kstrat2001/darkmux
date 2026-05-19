@@ -75,6 +75,9 @@
     <select slot="pills" class="dx-pill" id="topology-mission-select" title="filter by mission (Mission mode)">
       <option value="">(no mission selected)</option>
     </select>
+    <button slot="pills" type="button" class="dx-pill" id="topology-source-pill" title="data source">
+      <span id="topology-source-label">source: …</span>
+    </button>
   </dx-shell>
   <main>
     <div id="topology-root"></div>
@@ -521,6 +524,59 @@
       const [mode, setMode] = useState('fleet');
       const [focusMachine, setFocusMachine] = useState(null);
       const [missionId, setMissionId] = useState(null);
+      const [sourceLabel, setSourceLabel] = useState('source: …');
+
+      // SSE + backfill: fires on mount; skips when ?fixture is present.
+      useEffect(() => {
+        const fixture = new URLSearchParams(location.search).get('fixture');
+        if (fixture) {
+          setSourceLabel(`source: replay (${fixture})`);
+          return; // fixture-load is handled in the existing effect below
+        }
+
+        const date = new Date().toISOString().slice(0, 10);
+        const base = 'http://127.0.0.1:8765';
+        setSourceLabel('source: connecting…');
+
+        // 1. Backfill today's records.
+        fetch(`${base}/flow/${date}`)
+          .then(r => r.ok ? r.json() : [])
+          .then(arr => {
+            if (Array.isArray(arr)) setRecords(arr);
+          })
+          .catch(err => {
+            console.warn('[topology] backfill fetch failed:', err);
+          });
+
+        // 2. SSE tail.
+        let es;
+        try {
+          es = new EventSource(`${base}/flow/${date}/stream`);
+        } catch (err) {
+          console.warn('[topology] EventSource creation failed:', err);
+          setSourceLabel('source: no daemon');
+          return;
+        }
+        es.onopen = () => setSourceLabel('source: live');
+        es.onerror = () => {
+          setSourceLabel('source: no daemon');
+        };
+        es.onmessage = (e) => {
+          try {
+            const rec = JSON.parse(e.data);
+            setRecords(prev => [...prev, rec]);
+          } catch (parseErr) {
+            console.warn('[topology] malformed SSE record:', parseErr);
+          }
+        };
+        return () => { try { es.close(); } catch {} };
+      }, []);
+
+      // Sync sourceLabel → DOM pill (pill lives in dx-shell, outside React tree).
+      useEffect(() => {
+        const el = document.getElementById('topology-source-label');
+        if (el) el.textContent = sourceLabel;
+      }, [sourceLabel]);
 
       useEffect(() => {
         const f = new URLSearchParams(location.search).get('fixture');
