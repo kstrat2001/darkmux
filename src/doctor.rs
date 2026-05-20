@@ -93,6 +93,7 @@ pub fn run() -> DoctorReport {
         check_flow_sink_health(),
         check_machine_id_resolution(),
         check_orchestrator_declared(),
+        check_machine_tier_declared(),
         check_audit_integrity(),
         check_recommendation_drift(),
         check_recommended_profile_name_not_shadowed(),
@@ -498,6 +499,41 @@ fn check_orchestrator_declared() -> Check {
             message: "not declared — flow records won't carry orchestrator provenance".into(),
             hint: Some(
                 "Export DARKMUX_ORCHESTRATOR=<frontier-model-name> in the shell driving darkmux (e.g. `claude-opus-4-7`, `cursor-anthropic`). Operator-explicit by design (#49 cultivation discipline).".into(),
+            ),
+        },
+    }
+}
+
+/// `machine-tier`: pass when DARKMUX_MACHINE_TIER is set to a recognized
+/// tier value (`inference` / `hub` / `client`). Warns when absent or set
+/// to an unrecognized value — fleet routing depends on this declaration
+/// (#246). Single-machine fleets work without it; multi-machine
+/// dispatch routing will bail loud at use.
+fn check_machine_tier_declared() -> Check {
+    const RECOGNIZED: &[&str] = &["inference", "hub", "client"];
+    match crate::flow::resolve_machine_tier() {
+        Some(tier) if RECOGNIZED.contains(&tier.as_str()) => Check {
+            name: "machine-tier".into(),
+            status: Status::Pass,
+            message: format!("`{tier}` (from DARKMUX_MACHINE_TIER env)"),
+            hint: None,
+        },
+        Some(other) => Check {
+            name: "machine-tier".into(),
+            status: Status::Warn,
+            message: format!(
+                "`{other}` — not one of inference/hub/client; tier-aware routing may not match"
+            ),
+            hint: Some(
+                "Set DARKMUX_MACHINE_TIER to one of: inference (heavy-model peer), hub (always-on infra + 4B admin agents), client (UI only).".into(),
+            ),
+        },
+        None => Check {
+            name: "machine-tier".into(),
+            status: Status::Warn,
+            message: "not declared — fleet routing will treat this machine as `any` tier only".into(),
+            hint: Some(
+                "Export DARKMUX_MACHINE_TIER=<tier> in this machine's shell. `inference` for heavy-model peers (M-series w/ 64GB+); `hub` for always-on infrastructure machines; `client` for UI-only devices. Operator-explicit by design (#246).".into(),
             ),
         },
     }
@@ -2136,15 +2172,16 @@ mod tests {
     #[test]
     fn run_returns_static_plus_eureka_checks() {
         let r = run();
-        // 22 baseline checks (incl. runtime version + load projection +
+        // 23 baseline checks (incl. runtime version + load projection +
         // daemon reachable + darkmux-version-vs-latest-release [#13] +
         // crew-role-prompt-coverage [#141] + flow-sink-health [#170] +
-        // machine_id + orchestrator [#167] + audit-integrity [#163] +
-        // recommendation-drift + recommended-profile-not-shadowed [#159] +
-        // role-model-pin-drift [#160] + legacy-mission-layout [#148]) +
-        // one per active eureka rule. Every check should appear regardless
-        // of environment — even if the underlying probe couldn't read state.
-        let expected = 22 + crate::eureka::all_rules().len();
+        // machine_id + orchestrator [#167] + machine_tier [#246] +
+        // audit-integrity [#163] + recommendation-drift +
+        // recommended-profile-not-shadowed [#159] + role-model-pin-drift
+        // [#160] + legacy-mission-layout [#148]) + one per active eureka
+        // rule. Every check should appear regardless of environment —
+        // even if the underlying probe couldn't read state.
+        let expected = 23 + crate::eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

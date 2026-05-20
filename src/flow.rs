@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.7.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.8.0";
 // Version history:
 //   1.2.0 — added optional `model` (#106)
 //   1.3.0 — added optional `reasoning` + `mission_id`; new Stage::TierDecision (#136)
@@ -32,6 +32,15 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.7.0";
 //           chunks at most once per 2s. Keeps topology edges animated mid-turn and
 //           closes the post-exit-only observability gap. Backward-compatible —
 //           older readers safely ignore the new action. (#231)
+//   1.8.0 — added optional `machine_tier` (the hardware tier of the emitting machine —
+//           `"inference"` / `"hub"` / `"client"`), `work_id` (the work-queue claim id
+//           for parallel-dispatch jobs), and `attempt` (retry counter; 1 = first try)
+//           for the Article 4 parallel-dispatch substrate (#246). `machine_tier` is
+//           auto-populated from `DARKMUX_MACHINE_TIER` env at record-write time, same
+//           pattern as `machine_id`. `work_id` and `attempt` are populated by the
+//           dispatch path when the work flowed through the queue; absent on direct
+//           local dispatches. Backward-compatible — older readers ignore the new
+//           fields. (#246 PR-A tier substrate)
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -168,6 +177,33 @@ pub struct FlowRecord {
     /// FlowRecord fields, just not the event-specific extras.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payload: Option<serde_json::Value>,
+    /// Hardware tier of the machine that emitted this record — one of
+    /// `"inference"` (heavy-model peer), `"hub"` (always-on infrastructure
+    /// for admin agents), `"client"` (UI-only). Auto-populated at record
+    /// write time from `DARKMUX_MACHINE_TIER` env, same pattern as
+    /// `machine_id`. None when the operator hasn't declared a tier — the
+    /// fleet topology still works for single-machine setups but tier-aware
+    /// routing will bail loud. Schema 1.8 addition (#246).
+    ///
+    /// Distinct from the existing `tier: Tier` enum at the top of this
+    /// struct: that field classifies the *record* (local-vs-frontier-vs-
+    /// audit), while `machine_tier` classifies the *machine* (capacity
+    /// class). Both can be set independently on the same record.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine_tier: Option<String>,
+    /// Work-queue claim id when this record was produced by a job that
+    /// flowed through `darkmux:work:<tier>`. Absent on direct local
+    /// dispatches (the operator ran `darkmux crew dispatch <role>` on the
+    /// local machine and tier matched). Populated by the dispatch path
+    /// when it claims work from the queue. Schema 1.8 addition (#246).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub work_id: Option<String>,
+    /// Retry counter for queued work — 1 on first attempt, 2+ on retries
+    /// after lease expiry. Surfaces in `darkmux doctor` as a "recent
+    /// retries" rollup. Absent on direct local dispatches (no retry
+    /// semantics outside the queue). Schema 1.8 addition (#246).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
 }
 
 /// Resolve the flows directory from env override (`DARKMUX_FLOWS_DIR`) or
@@ -1048,6 +1084,9 @@ pub fn record(record: FlowRecord) -> Result<()> {
     if rec.orchestrator.is_none() {
         rec.orchestrator = resolve_orchestrator();
     }
+    if rec.machine_tier.is_none() {
+        rec.machine_tier = resolve_machine_tier();
+    }
     default_sink().write(&rec)
 }
 
@@ -1096,6 +1135,26 @@ pub fn resolve_machine_id() -> Option<String> {
 /// surfaces a warn so the operator knows the field exists.
 pub fn resolve_orchestrator() -> Option<String> {
     std::env::var("DARKMUX_ORCHESTRATOR")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Resolve the machine's hardware-tier declaration for new flow records.
+///
+/// **Operator-explicit by design** — same posture as `DARKMUX_ORCHESTRATOR`:
+/// there's no reliable way to auto-detect whether a machine should serve
+/// as an inference peer, hub, or client from inside darkmux. The operator
+/// declares it via `DARKMUX_MACHINE_TIER`; absent declaration, records
+/// carry no `machine_tier` field and tier-aware routing bails loud at the
+/// dispatch path rather than silently substituting. (#246)
+///
+/// Valid values are `"inference"`, `"hub"`, `"client"`. Other values are
+/// passed through unchanged (forward-compat with future tier names); the
+/// dispatch path validates membership at the moment a routing decision
+/// would consume the value.
+pub fn resolve_machine_tier() -> Option<String> {
+    std::env::var("DARKMUX_MACHINE_TIER")
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -1736,6 +1795,9 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
+            machine_tier: None,
+            work_id: None,
+            attempt: None,
         };
 
         record_at(&record, &path).unwrap();
@@ -1776,6 +1838,9 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
+            machine_tier: None,
+            work_id: None,
+            attempt: None,
         };
 
         record_at(&r("first"), &path).unwrap();
@@ -1824,6 +1889,9 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
+            machine_tier: None,
+            work_id: None,
+            attempt: None,
         };
 
         record_at(&record, &path).unwrap();
@@ -1889,6 +1957,9 @@ mod tests {
                 prev_hash: None,
                 hash: None,
                 payload: None,
+                machine_tier: None,
+                work_id: None,
+                attempt: None,
             },
             &tmp.path().join("custom.jsonl"),
         )
@@ -1933,6 +2004,9 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
+            machine_tier: None,
+            work_id: None,
+            attempt: None,
         };
 
         record_at(&record, &path).unwrap();
@@ -1985,6 +2059,9 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
+            machine_tier: None,
+            work_id: None,
+            attempt: None,
         };
 
         // Capture the day-key BEFORE calling record() so a midnight-UTC
@@ -2129,6 +2206,9 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
+            machine_tier: None,
+            work_id: None,
+            attempt: None,
         };
         sink.write(&rec).unwrap();
 
@@ -2199,6 +2279,9 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
+            machine_tier: None,
+            work_id: None,
+            attempt: None,
         };
 
         record_via(&sink, &rec).unwrap();
@@ -2238,6 +2321,9 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
+            machine_tier: None,
+            work_id: None,
+            attempt: None,
         };
         tee.write(&rec).unwrap();
         tee.write(&rec).unwrap();
@@ -2291,6 +2377,9 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
+            machine_tier: None,
+            work_id: None,
+            attempt: None,
         };
         let err = tee.write(&rec).unwrap_err();
         // Caller sees the error (so they can react if they want)
@@ -2330,6 +2419,9 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
+            machine_tier: None,
+            work_id: None,
+            attempt: None,
         };
         super::record(rec).unwrap();
 
@@ -2372,7 +2464,14 @@ mod tests {
         //           animated during long streaming turns; pairs with
         //           runtime-side `model.partial` SSE chunks (#231). Minor
         //           bump — older readers safely ignore the new action type.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.7.0");
+        //   1.8.0 — added optional `machine_tier`, `work_id`, and `attempt`
+        //           fields on FlowRecord for the parallel-dispatch substrate
+        //           (#246 PR-A tier substrate). `machine_tier` auto-populated
+        //           from `DARKMUX_MACHINE_TIER` env at record-write time;
+        //           `work_id` + `attempt` populated by the dispatch path
+        //           when work flowed through the queue. Minor bump — older
+        //           readers safely ignore the new fields.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.8.0");
     }
 
     #[test]
@@ -2423,6 +2522,9 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
+            machine_tier: None,
+            work_id: None,
+            attempt: None,
         };
         let serialized = serde_json::to_string(&rec).unwrap();
         assert!(!serialized.contains("reasoning"),
@@ -2456,6 +2558,9 @@ mod tests {
                 prev_hash: None,
                 hash: None,
                 payload: None,
+                machine_tier: None,
+                work_id: None,
+                attempt: None,
             },
             &path,
         )
@@ -2635,6 +2740,9 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
+            machine_tier: None,
+            work_id: None,
+            attempt: None,
         };
         let s = serde_json::to_string(&rec).unwrap();
         assert!(!s.contains("machine_id"), "machine_id should omit when None: {s}");
@@ -2662,6 +2770,9 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
+            machine_tier: None,
+            work_id: None,
+            attempt: None,
         };
         let s = serde_json::to_string(&rec).unwrap();
         let parsed: FlowRecord = serde_json::from_str(&s).unwrap();
@@ -2705,6 +2816,9 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
+            machine_tier: None,
+            work_id: None,
+            attempt: None,
         };
         super::record(rec).unwrap();
 
@@ -2759,6 +2873,9 @@ mod tests {
             prev_hash: Some("seed".to_string()),
             hash: None,
             payload: None,
+            machine_tier: None,
+            work_id: None,
+            attempt: None,
         };
         let mut other = base.clone();
         other.hash = Some("anything".to_string());
@@ -2790,6 +2907,9 @@ mod tests {
             prev_hash: Some("seed".to_string()),
             hash: None,
             payload: None,
+            machine_tier: None,
+            work_id: None,
+            attempt: None,
         };
         let h1 = audit_hash_of(&base).unwrap();
 
@@ -2830,6 +2950,9 @@ mod tests {
                 prev_hash: None, // sink stamps this
                 hash: None,      // sink stamps this
                 payload: None,
+                machine_tier: None,
+                work_id: None,
+                attempt: None,
             };
             sink.write(&rec).unwrap();
         }
@@ -2877,6 +3000,9 @@ mod tests {
                 prev_hash: None,
                 hash: None,
                 payload: None,
+                machine_tier: None,
+                work_id: None,
+                attempt: None,
             };
             sink.write(&rec).unwrap();
         }
@@ -2939,6 +3065,9 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
+            machine_tier: None,
+            work_id: None,
+            attempt: None,
         };
         sink.write(&rec).expect("recovery should not bail");
 
@@ -3002,6 +3131,9 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
+            machine_tier: None,
+            work_id: None,
+            attempt: None,
         };
 
         sink_a.write(&mk("a1")).unwrap();
