@@ -284,12 +284,10 @@ pub struct ReachabilityResult {
 /// Prefix for per-tier Redis Streams that carry work jobs.
 /// Composed with a tier name to form the full stream key:
 /// `darkmux:work:inference`, `darkmux:work:hub`, etc.
-#[allow(dead_code)] // PR-C.1 substrate; consumed by PR-C.2 (worker loop) + PR-C.3 (client push)
 pub const WORK_STREAM_PREFIX: &str = "darkmux:work:";
 
 /// Compose the per-tier work stream name. Used by both publisher and
 /// claimer so the convention lives in one place.
-#[allow(dead_code)] // PR-C.1 substrate; consumed by PR-C.2 (worker loop) + PR-C.3 (client push)
 pub fn work_stream_name(tier: &str) -> String {
     format!("{WORK_STREAM_PREFIX}{tier}")
 }
@@ -312,8 +310,14 @@ pub const WORK_STREAM_MAXLEN: usize = 1000;
 /// trickery) so any change to this struct is a deliberate schema bump.
 /// Older worker code seeing a newer-shaped job will fail to deserialize
 /// loudly rather than dispatching with missing context.
+///
+/// `#[serde(deny_unknown_fields)]` (PR-C.2) — a publisher cannot inject
+/// extra fields that future-PR consumer code might inadvertently start
+/// interpreting. Pairs with the schema-version contract; a real shape
+/// change is a deliberate `WORK_JOB_SCHEMA_VERSION` bump + struct edit,
+/// not a silent field smuggling.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[allow(dead_code)] // PR-C.1 substrate; consumed by PR-C.2 (worker loop) + PR-C.3 (client push)
+#[serde(deny_unknown_fields)]
 pub struct WorkJob {
     /// Target hardware tier — used to pick which work stream to publish
     /// onto. The worker on a matching-tier machine claims via that
@@ -323,7 +327,7 @@ pub struct WorkJob {
 
     /// Optional pre-claim hint — when set, the dispatching orchestrator
     /// asserts this specific machine should handle the job. PR-C.1 just
-    /// carries the field; routing enforcement lands in PR-C.3 (the
+    /// carries the field; routing enforcement lands in PR-C.2 (the
     /// claim path validates `target_machine` matches the local
     /// `DARKMUX_MACHINE_ID`). When `None`, the first matching-tier
     /// worker claims it (pull semantics).
@@ -385,9 +389,103 @@ pub struct WorkJob {
     pub attempt: u32,
 }
 
-#[allow(dead_code)] // PR-C.1 substrate; consumed by PR-C.2 (worker loop) + PR-C.3 (client push)
 fn default_runtime() -> String {
     "openclaw".to_string()
+}
+
+/// Max byte size of a `WorkJob.message` accepted by the queue. A
+/// publisher cannot XADD a multi-megabyte prompt that would force every
+/// worker to allocate it on deserialize. 256 KiB matches the
+/// reasoning-text cap in `dispatch_internal.rs` (#231 / S6) — same
+/// rationale, same number. (#246 PR-C.2 boundary defense)
+pub const MAX_WORK_MESSAGE_BYTES: usize = 256 * 1024;
+
+/// Max byte size of `WorkJob.workdir` (the operator-supplied path
+/// string). Filesystem path limits vary by platform; 4 KiB is generous
+/// and prevents a publisher from filling memory with a multi-megabyte
+/// path string. (#246 PR-C.2)
+pub const MAX_WORK_WORKDIR_BYTES: usize = 4 * 1024;
+
+/// Max length for identifier fields (`target_tier`, `target_machine`,
+/// `role_id`). 64 chars is plenty for any realistic operator-named
+/// machine or role id and forecloses identifier-as-payload attacks
+/// (e.g. an `role_id` of 100MB). (#246 PR-C.2)
+pub const MAX_WORK_IDENTIFIER_LEN: usize = 64;
+
+impl WorkJob {
+    /// Validate a `WorkJob` at the queue boundary — called by both the
+    /// publisher (in `publish_job`) and the consumer (after claim, before
+    /// dispatch). Enforces charset + size invariants that protect the
+    /// downstream dispatch path from a hostile or buggy publisher.
+    ///
+    /// Validated:
+    /// - Identifier fields (`target_tier`, optional `target_machine`,
+    ///   `role_id`) match `[a-z0-9_-]{1,MAX_WORK_IDENTIFIER_LEN}`. Rejects
+    ///   path-traversal (`../`), null bytes, command-injection chars,
+    ///   and over-long values.
+    /// - `runtime` is one of `"openclaw"` or `"internal"`. Future
+    ///   runtime names require a deliberate code change here.
+    /// - `message` ≤ `MAX_WORK_MESSAGE_BYTES`. Prevents memory
+    ///   exhaustion at deserialize time.
+    /// - Optional `workdir` ≤ `MAX_WORK_WORKDIR_BYTES`. The
+    ///   symlink-escape check on the resolved path is done by the
+    ///   worker (PR-C.2b / follow-up).
+    pub fn validate(&self) -> Result<()> {
+        validate_work_identifier("target_tier", &self.target_tier)?;
+        if let Some(m) = &self.target_machine {
+            validate_work_identifier("target_machine", m)?;
+        }
+        validate_work_identifier("role_id", &self.role_id)?;
+        if !matches!(self.runtime.as_str(), "openclaw" | "internal") {
+            return Err(anyhow!(
+                "WorkJob.runtime must be 'openclaw' or 'internal' (got {:?})",
+                self.runtime
+            ));
+        }
+        if self.message.len() > MAX_WORK_MESSAGE_BYTES {
+            return Err(anyhow!(
+                "WorkJob.message exceeds {}-byte cap (was {} bytes)",
+                MAX_WORK_MESSAGE_BYTES,
+                self.message.len()
+            ));
+        }
+        if let Some(w) = &self.workdir {
+            if w.len() > MAX_WORK_WORKDIR_BYTES {
+                return Err(anyhow!(
+                    "WorkJob.workdir exceeds {}-byte cap (was {} bytes)",
+                    MAX_WORK_WORKDIR_BYTES,
+                    w.len()
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Charset+length check for an identifier-shaped field. Allowlist:
+/// `[a-z0-9_-]` (ASCII lowercase + digits + underscore + hyphen), length
+/// 1..=MAX_WORK_IDENTIFIER_LEN.
+fn validate_work_identifier(field: &str, value: &str) -> Result<()> {
+    if value.is_empty() {
+        return Err(anyhow!("WorkJob.{field} must be non-empty"));
+    }
+    if value.len() > MAX_WORK_IDENTIFIER_LEN {
+        return Err(anyhow!(
+            "WorkJob.{field} exceeds {}-char limit (was {} chars): {value:?}",
+            MAX_WORK_IDENTIFIER_LEN,
+            value.len()
+        ));
+    }
+    let bad = value
+        .chars()
+        .find(|c| !(c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-' || *c == '_'));
+    if let Some(c) = bad {
+        return Err(anyhow!(
+            "WorkJob.{field} contains invalid char {c:?} \
+             (allowlist [a-z0-9_-]): {value:?}"
+        ));
+    }
+    Ok(())
 }
 
 /// Result of a successful `claim_job` — the worker now owns the job.
@@ -395,7 +493,6 @@ fn default_runtime() -> String {
 /// (canonical form: `<ms>-<seq>`); `ack_job` uses it to acknowledge
 /// completion.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // PR-C.1 substrate; consumed by PR-C.2 (worker loop) + PR-C.3 (client push)
 pub struct ClaimedJob {
     pub work_id: String,
     pub job: WorkJob,
@@ -413,6 +510,11 @@ pub struct ClaimedJob {
 /// can't grow the stream unboundedly.
 #[allow(dead_code)] // PR-C.1 substrate; consumed by PR-C.2 (worker loop) + PR-C.3 (client push)
 pub fn publish_job(client: &redis::Client, job: &WorkJob) -> Result<String> {
+    // Fail-fast at the queue boundary — better to reject a malformed
+    // job at publish than to ship it across the network and trip the
+    // consumer-side validator after one or more workers waste their
+    // claim budget on it. (#246 PR-C.2)
+    job.validate().context("validating WorkJob before publish")?;
     let mut conn = client
         .get_connection()
         .context("opening Redis connection to publish work job")?;
@@ -446,7 +548,6 @@ pub const WORK_JOB_SCHEMA_VERSION: &str = "1";
 /// (XGROUP CREATE on a non-existent stream would otherwise error).
 ///
 /// Call once per daemon-startup per tier. Safe to call repeatedly.
-#[allow(dead_code)] // PR-C.1 substrate; consumed by PR-C.2 (worker loop) + PR-C.3 (client push)
 pub fn init_consumer_group(
     client: &redis::Client,
     tier: &str,
@@ -466,9 +567,11 @@ pub fn init_consumer_group(
     match result {
         Ok(_) => Ok(()),
         Err(e) => {
-            // BUSYGROUP — group already exists, treat as success.
-            let msg = e.to_string();
-            if msg.contains("BUSYGROUP") {
+            // BUSYGROUP → group already exists; treat as success. Use the
+            // typed error code (redis-rs 0.27+ `RedisError::code()`) rather
+            // than substring-matching the Display string — survives future
+            // crate-version reformatting of error messages.
+            if matches!(e.code(), Some("BUSYGROUP")) {
                 Ok(())
             } else {
                 Err(anyhow!("XGROUP CREATE on {stream}: {e}"))
@@ -488,7 +591,6 @@ pub fn init_consumer_group(
 /// `consumer` is the per-worker identity (typically `DARKMUX_MACHINE_ID`)
 /// — Redis tracks per-consumer pending-entries lists for lease semantics
 /// (PR-E will consume these).
-#[allow(dead_code)] // PR-C.1 substrate; consumed by PR-C.2 (worker loop) + PR-C.3 (client push)
 pub fn claim_job(
     client: &redis::Client,
     tier: &str,
@@ -526,7 +628,6 @@ pub fn claim_job(
 /// Parse XREADGROUP's nested-array response into an optional ClaimedJob.
 /// Returns `Ok(None)` when the response is empty (timeout / no work);
 /// extracted as a pure function so it's unit-testable without Redis.
-#[allow(dead_code)] // PR-C.1 substrate; consumed by PR-C.2 (worker loop) + PR-C.3 (client push)
 fn parse_xreadgroup_response(value: &redis::Value) -> Result<Option<ClaimedJob>> {
     use redis::Value as V;
 
@@ -582,7 +683,6 @@ fn parse_xreadgroup_response(value: &redis::Value) -> Result<Option<ClaimedJob>>
 
 /// Pull a field's value out of a Redis field-list (`[k, v, k, v, ...]`).
 /// Returns `None` if the key isn't present.
-#[allow(dead_code)] // PR-C.1 substrate; consumed by PR-C.2 (worker loop) + PR-C.3 (client push)
 fn extract_field(fields: &[redis::Value], key: &str) -> Option<String> {
     use redis::Value as V;
     let mut i = 0;
@@ -614,7 +714,6 @@ fn extract_field(fields: &[redis::Value], key: &str) -> Option<String> {
 /// Worker MUST call this after the dispatch completes, regardless of
 /// dispatch success — the `dispatch.complete` flow record carries the
 /// success/error signal; the ack just releases the queue lease.
-#[allow(dead_code)] // PR-C.1 substrate; consumed by PR-C.2 (worker loop) + PR-C.3 (client push)
 pub fn ack_job(
     client: &redis::Client,
     tier: &str,
@@ -632,6 +731,222 @@ pub fn ack_job(
         .query(&mut conn)
         .with_context(|| format!("XACK on {stream}"))?;
     Ok(())
+}
+
+// ─── Daemon worker loop (PR-C.2) ──────────────────────────────────────
+//
+// Runs on a dedicated `std::thread` (not a tokio task) inside the
+// `darkmux serve` daemon. Polls `darkmux:work:<own-tier>` via XREADGROUP
+// with a short BLOCK budget; on claim, invokes the existing synchronous
+// `crew::dispatch::dispatch(opts)` and acks on completion. The dispatch
+// path is unchanged — whether work arrives via local CLI invocation OR
+// queue claim, it lands at the same entry point.
+//
+// **Why a dedicated thread, not a tokio task:** the redis crate (sync)
+// + `crew::dispatch::dispatch` (shells out to docker / openclaw, blocks
+// 5+ minutes) would saturate the tokio executor. The thread runs
+// independently of the axum server's runtime.
+
+/// Consumer group name used by all darkmux workers. Per-tier; combined
+/// with the stream name, every worker for a given tier shares the
+/// group → exactly-one-consumer-per-job delivery.
+pub const WORKER_CONSUMER_GROUP: &str = "darkmux-workers";
+
+/// XREADGROUP BLOCK budget per poll. 2 seconds is short enough that
+/// shutdown latency is bounded (the worker rechecks the shutdown flag
+/// every BLOCK round) and long enough that a quiet queue doesn't
+/// hot-spin Redis. (#246 PR-C.2)
+const WORKER_BLOCK_MS: u64 = 2_000;
+
+/// Spawn the daemon worker thread. Returns the JoinHandle so callers
+/// can monitor (typically the daemon never joins — the worker runs
+/// for the daemon's lifetime and dies when the process exits).
+///
+/// Reads three env vars at spawn time:
+/// - `DARKMUX_REDIS_URL` — required; absent → worker doesn't start
+/// - `DARKMUX_MACHINE_TIER` — required; absent → worker doesn't start
+/// - `DARKMUX_MACHINE_ID` — used as consumer name (per-machine identity)
+///
+/// When prerequisites are missing, logs to stderr and returns a thread
+/// that exits immediately (caller still gets a JoinHandle). This keeps
+/// the daemon usable as an observability node even without queue
+/// participation — same posture as the existing single-machine-fleet
+/// default in `fleet status`.
+pub fn spawn_worker_thread() -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("darkmux-worker".to_string())
+        .spawn(worker_main)
+        .expect("spawn darkmux-worker thread")
+}
+
+/// Entry point for the worker thread. Reads env config, opens Redis,
+/// initializes the consumer group, then loops on claim/dispatch/ack.
+fn worker_main() {
+    let Some(redis_url) = std::env::var("DARKMUX_REDIS_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    else {
+        eprintln!(
+            "darkmux-worker: DARKMUX_REDIS_URL not set — fleet work queue disabled. \
+             Daemon continues as observability/serve node only."
+        );
+        return;
+    };
+
+    let Some(tier) = crate::flow::resolve_machine_tier() else {
+        eprintln!(
+            "darkmux-worker: DARKMUX_MACHINE_TIER not set — fleet work queue disabled. \
+             Set DARKMUX_MACHINE_TIER=<inference|hub|client> to enable."
+        );
+        return;
+    };
+
+    let machine_id = crate::flow::resolve_machine_id()
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let url = crate::flow::RawRedisUrl::new(redis_url);
+    let client = match redis::Client::open(url.expose_for_probe()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "darkmux-worker: failed to open Redis client ({url}): {e}. \
+                 Queue worker disabled."
+            );
+            return;
+        }
+    };
+
+    if let Err(e) = init_consumer_group(&client, &tier, WORKER_CONSUMER_GROUP) {
+        eprintln!(
+            "darkmux-worker: init_consumer_group on darkmux:work:{tier} failed: {e}. \
+             Queue worker disabled."
+        );
+        return;
+    }
+
+    eprintln!(
+        "darkmux-worker: started — tier={tier} consumer={machine_id} \
+         stream={} group={}",
+        work_stream_name(&tier),
+        WORKER_CONSUMER_GROUP
+    );
+
+    loop {
+        match claim_job(&client, &tier, WORKER_CONSUMER_GROUP, &machine_id, WORKER_BLOCK_MS) {
+            Ok(None) => {
+                // BLOCK timeout — no work. Loop and re-block.
+                continue;
+            }
+            Ok(Some(claimed)) => {
+                handle_claimed_job(&client, &tier, claimed);
+            }
+            Err(e) => {
+                eprintln!(
+                    "darkmux-worker: claim_job failed ({e}); backing off 1s"
+                );
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+    }
+}
+
+/// Validate, dispatch, and ack one claimed job. Errors are logged and
+/// the job is acked anyway — the `dispatch.complete` flow record (or
+/// its absence) is the operator-visible signal; the ack just releases
+/// the queue lease.
+fn handle_claimed_job(
+    client: &redis::Client,
+    tier: &str,
+    claimed: ClaimedJob,
+) {
+    let ClaimedJob { work_id, job } = claimed;
+    let session_id = job.session_id.clone();
+    let role_id = job.role_id.clone();
+    eprintln!(
+        "darkmux-worker: claimed work_id={work_id} role={role_id} \
+         session={session_id} target_machine={:?} attempt={}",
+        job.target_machine, job.attempt
+    );
+
+    // Boundary validation — reject malformed jobs at the consumer too,
+    // even though `publish_job` validated. Belt-and-braces against a
+    // hostile publisher who bypassed our publish path.
+    if let Err(e) = job.validate() {
+        eprintln!(
+            "darkmux-worker: REJECTED claimed job {work_id}: {e:#}. \
+             Acking to release queue lease; dispatch NOT invoked."
+        );
+        let _ = ack_job(client, tier, WORKER_CONSUMER_GROUP, &work_id);
+        return;
+    }
+
+    // Optional target_machine pre-claim hint: when set, the publisher
+    // asserted this specific machine should handle the job. If it
+    // doesn't match the local machine_id, log a warning but proceed —
+    // the queue already gave us the claim, refusing would orphan the
+    // job (PR-E will handle this properly via lease re-publish).
+    let local_machine = crate::flow::resolve_machine_id();
+    if let Some(target) = &job.target_machine {
+        if local_machine.as_deref() != Some(target.as_str()) {
+            eprintln!(
+                "darkmux-worker: target_machine={target:?} doesn't match \
+                 local machine_id={local_machine:?}; proceeding (queue \
+                 already claimed; PR-E will add lease re-publish)."
+            );
+        }
+    }
+
+    // Convert + dispatch. The dispatch function is synchronous and may
+    // block several minutes for long-agentic dispatches.
+    let opts = job.into_dispatch_opts();
+    let dispatch_result = crate::crew::dispatch::dispatch(opts);
+
+    match dispatch_result {
+        Ok(outcome) => {
+            eprintln!(
+                "darkmux-worker: dispatched work_id={work_id} → exit_code={} \
+                 stdout_bytes={} stderr_bytes={}",
+                outcome.exit_code,
+                outcome.stdout.len(),
+                outcome.stderr.len(),
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "darkmux-worker: dispatch ERROR work_id={work_id}: {e:#}. \
+                 Acking to release queue lease; dispatch.complete flow \
+                 record carries the failure detail."
+            );
+        }
+    }
+
+    if let Err(e) = ack_job(client, tier, WORKER_CONSUMER_GROUP, &work_id) {
+        eprintln!("darkmux-worker: XACK failed for {work_id}: {e:#}");
+    }
+}
+
+impl WorkJob {
+    /// Convert a claimed `WorkJob` into the `DispatchOpts` shape the
+    /// `crew::dispatch::dispatch` entry point consumes. Centralizes the
+    /// queue → in-process boundary so PR-C.3's client path can be checked
+    /// against this shape for round-trip parity.
+    pub fn into_dispatch_opts(self) -> crate::crew::dispatch::DispatchOpts {
+        use crate::crew::dispatch::{DispatchOpts, Runtime};
+        let runtime = Runtime::parse(&self.runtime).unwrap_or(Runtime::Openclaw);
+        DispatchOpts {
+            role_id: self.role_id,
+            message: self.message,
+            deliver: self.deliver,
+            session_id: Some(self.session_id),
+            timeout_seconds: self.timeout_seconds,
+            skip_preflight: false,
+            watch_paths: vec![],
+            workdir: self.workdir.map(PathBuf::from),
+            sprint_id: self.sprint_id,
+            runtime,
+        }
+    }
 }
 
 /// Convenience constructor — build a WorkJob from the components the
@@ -1008,5 +1323,152 @@ mod tests {
             V::SimpleString("1".to_string()),
         ];
         assert_eq!(extract_field(&fields, "schema").as_deref(), Some("1"));
+    }
+
+    // ─── WorkJob::validate() (PR-C.2 boundary defense) ────────────────
+
+    fn good_job() -> WorkJob {
+        build_work_job(
+            "inference".to_string(),
+            None,
+            "coder".to_string(),
+            "do a thing".to_string(),
+            "s-1".to_string(),
+            None,
+            None,
+            None,
+            "openclaw".to_string(),
+            600,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn validate_accepts_well_formed_job() {
+        assert!(good_job().validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_path_traversal_in_role_id() {
+        let mut j = good_job();
+        j.role_id = "../../etc/passwd".to_string();
+        let err = j.validate().unwrap_err().to_string();
+        assert!(err.contains("invalid char") || err.contains("role_id"));
+    }
+
+    #[test]
+    fn validate_rejects_uppercase_in_identifier() {
+        let mut j = good_job();
+        j.role_id = "Coder".to_string();
+        assert!(j.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_too_long_identifier() {
+        let mut j = good_job();
+        j.role_id = "a".repeat(MAX_WORK_IDENTIFIER_LEN + 1);
+        let err = j.validate().unwrap_err().to_string();
+        assert!(err.contains("exceeds") && err.contains("role_id"));
+    }
+
+    #[test]
+    fn validate_rejects_unknown_runtime() {
+        let mut j = good_job();
+        j.runtime = "nuclear".to_string();
+        let err = j.validate().unwrap_err().to_string();
+        assert!(err.contains("runtime"));
+    }
+
+    #[test]
+    fn validate_rejects_empty_runtime() {
+        let mut j = good_job();
+        j.runtime = "".to_string();
+        assert!(j.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_oversize_message() {
+        let mut j = good_job();
+        j.message = "x".repeat(MAX_WORK_MESSAGE_BYTES + 1);
+        let err = j.validate().unwrap_err().to_string();
+        assert!(err.contains("message") && err.contains("exceeds"));
+    }
+
+    #[test]
+    fn validate_accepts_message_at_cap() {
+        let mut j = good_job();
+        j.message = "x".repeat(MAX_WORK_MESSAGE_BYTES);
+        assert!(j.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_oversize_workdir() {
+        let mut j = good_job();
+        j.workdir = Some("x".repeat(MAX_WORK_WORKDIR_BYTES + 1));
+        let err = j.validate().unwrap_err().to_string();
+        assert!(err.contains("workdir") && err.contains("exceeds"));
+    }
+
+    #[test]
+    fn validate_rejects_target_machine_with_special_chars() {
+        let mut j = good_job();
+        j.target_machine = Some("studio$rm-rf".to_string());
+        let err = j.validate().unwrap_err().to_string();
+        assert!(err.contains("target_machine") || err.contains("invalid char"));
+    }
+
+    #[test]
+    fn validate_accepts_target_machine_none() {
+        let mut j = good_job();
+        j.target_machine = None;
+        assert!(j.validate().is_ok());
+    }
+
+    // ─── #[serde(deny_unknown_fields)] (PR-C.2) ───────────────────────
+
+    #[test]
+    fn workjob_deserialize_rejects_unknown_field() {
+        // A future-PR field smuggled by a malicious publisher must fail
+        // to deserialize, not silently roundtrip.
+        let json = r#"{
+            "target_tier": "inference",
+            "role_id": "coder",
+            "message": "hi",
+            "session_id": "s-1",
+            "runtime": "openclaw",
+            "timeout_seconds": 300,
+            "published_at_unix_ms": 0,
+            "attempt": 1,
+            "future_priority_field": 999
+        }"#;
+        let result: Result<WorkJob, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "deny_unknown_fields must reject smuggled field; got: {:?}",
+            result
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("future_priority_field") || err.contains("unknown field"),
+            "error should name the unknown field: {err}"
+        );
+    }
+
+    #[test]
+    fn workjob_deserialize_accepts_known_fields_only() {
+        // Sanity: the strict shape still accepts a valid job.
+        let json = r#"{
+            "target_tier": "inference",
+            "role_id": "coder",
+            "message": "hi",
+            "session_id": "s-1",
+            "runtime": "openclaw",
+            "timeout_seconds": 300,
+            "published_at_unix_ms": 0,
+            "attempt": 1
+        }"#;
+        let parsed: WorkJob = serde_json::from_str(json).expect("valid job parses");
+        assert_eq!(parsed.target_tier, "inference");
     }
 }
