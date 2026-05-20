@@ -27,8 +27,11 @@ use crate::crew::loader::{load_role_prompt, load_roles};
 use anyhow::{anyhow, bail, Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Docker image tag for the internal runtime. Built locally from
 /// `runtime/Dockerfile`. Will become configurable when production
@@ -182,9 +185,11 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     ));
     let dispatch_start_instant = std::time::Instant::now();
 
-    // 6. Spawn the docker container. Synchronous; stdout + stderr
-    //    captured. The container runs to completion and is removed
-    //    automatically (--rm).
+    // 6. Spawn the docker container. Async via `spawn()` (vs the older
+    //    `output()`) so the live trajectory tailer (step 7) can run in
+    //    parallel and emit flow records mid-dispatch — without that,
+    //    topology edges go stale during long streaming turns (#231).
+    //    `--rm` cleans up the container on exit.
     let mut cmd = Command::new("docker");
     cmd.arg("run")
         .arg("--rm")
@@ -197,30 +202,54 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         .arg("--system")
         .arg(&system_prompt)
         .arg("--prompt")
-        .arg(&opts.message);
+        .arg(&opts.message)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
-    let output = cmd
-        .output()
-        .context("spawning darkmux-runtime container")?;
+    let child = cmd.spawn().context("spawning darkmux-runtime container")?;
+
+    // 7. Live trajectory tailer (#231). Background thread polls
+    //    `<workspace>/.darkmux-runtime/trajectory.jsonl` every 250ms while
+    //    the container runs; emits flow records in real time:
+    //
+    //      - `model.completed`  → `dispatch.turn`
+    //      - `tool.completed`   → `dispatch.tool`
+    //      - `compaction`       → `dispatch.compaction`
+    //      - `model.reasoning`  → `dispatch.reasoning` (with S6 size cap)
+    //      - `model.partial`    → `dispatch.turn.heartbeat` (rate-limited)
+    //
+    //    Best-effort: read failures are non-fatal (flow records are
+    //    observability, not correctness). After the container exits, the
+    //    main thread signals stop; the tailer does one final flush pass
+    //    so straggler lines written between the last poll and exit are
+    //    not lost.
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let tailer_handle = {
+        let stop = Arc::clone(&stop_flag);
+        let workspace = workspace.clone();
+        let session_id = session_id.clone();
+        let role_id = opts.role_id.clone();
+        let model = model.clone();
+        thread::spawn(move || run_tailer(workspace, session_id, role_id, model, stop))
+    };
+
+    let output = child
+        .wait_with_output()
+        .context("waiting for darkmux-runtime container")?;
 
     let wall_ms = dispatch_start_instant.elapsed().as_millis() as u64;
     let exit_code = output.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
 
-    // 7. Replay the trajectory file as flow records (#204). Post-hoc — the
-    //    runtime writes per-event JSONL to `<workspace>/.darkmux-runtime/
-    //    trajectory.jsonl`; we read it after the container exits and
-    //    convert each event into the corresponding flow record. Closes
-    //    the per-dispatch observability gap that Beat 30 surfaced.
-    //    Best-effort: trajectory read failures are non-fatal (the dispatch
-    //    succeeded; flow records are observability, not correctness).
-    let trajectory_summary = replay_trajectory_to_flow(
-        &workspace,
-        &session_id,
-        &opts.role_id,
-        &model,
-    );
+    // Signal the tailer to do its final flush + return. join() can
+    // theoretically panic if the tailer thread panicked; degrade to a
+    // default summary rather than failing the dispatch over a
+    // best-effort observability path.
+    stop_flag.store(true, Ordering::SeqCst);
+    let trajectory_summary = tailer_handle
+        .join()
+        .unwrap_or_else(|_| TrajectorySummary::default());
 
     // 8. Emit dispatch.complete flow record with summary metadata.
     let dispatch_complete_payload = serde_json::json!({
@@ -257,126 +286,268 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     })
 }
 
-/// Summary of what the trajectory replay surfaced. Used to enrich the
+/// Summary of what the trajectory tailer surfaced. Used to enrich the
 /// dispatch.complete payload with end-of-dispatch counts.
-#[derive(Default)]
+#[derive(Default, Debug, Clone)]
 struct TrajectorySummary {
     turns: u32,
     tool_calls: u32,
     compactions: u32,
+    heartbeats: u32,
 }
 
-/// Read the runtime's trajectory.jsonl after the dispatch completes and
-/// emit per-event flow records: dispatch.turn, dispatch.tool,
-/// dispatch.compaction, dispatch.reasoning. Best-effort — any error
-/// (file missing, malformed line, write failure) is silently skipped.
-/// Returns counts the caller uses to enrich the dispatch.complete record.
-fn replay_trajectory_to_flow(
-    workspace: &std::path::Path,
-    session_id: &str,
-    role_id: &str,
-    model: &str,
+/// How often the live tailer polls `trajectory.jsonl` while the container
+/// is alive. 250ms matches the daemon's `tail_lines` poll cadence in
+/// `serve.rs` — short enough for sub-second responsiveness, long enough
+/// to keep CPU+IO cost negligible for an idle dispatch.
+const TAILER_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Minimum interval between consecutive `dispatch.turn.heartbeat` flow
+/// records. The runtime emits one `model.partial` trajectory event per
+/// SSE chunk (potentially hundreds per second on a streaming turn);
+/// the tailer coalesces them into a coarser heartbeat so the topology
+/// viewer's edge-animation 5s decay window stays alive without
+/// flooding the flow stream + audit chain. (#231)
+const HEARTBEAT_MIN_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Hard cap on `reasoning_text` carried in a `dispatch.reasoning` flow
+/// record payload. Thinking-mode models can emit 10MB+ of reasoning on
+/// hard problems; without this cap the full text flows through audit +
+/// Redis + browser. Truncated payloads carry a marker indicating the
+/// original size so the operator knows it was capped. (#231 / S6)
+const MAX_REASONING_TEXT_BYTES: usize = 256 * 1024;
+
+/// Run the live trajectory tailer to completion. Polls until `stop_flag`
+/// is set, then does one final flush pass to drain any straggler lines
+/// the container wrote between the last poll tick and exit. Returns the
+/// accumulated event-count summary; never errors (observability path).
+fn run_tailer(
+    workspace: PathBuf,
+    session_id: String,
+    role_id: String,
+    model: String,
+    stop_flag: Arc<AtomicBool>,
 ) -> TrajectorySummary {
-    use std::io::BufRead;
-    let mut summary = TrajectorySummary::default();
-    let trajectory = workspace
+    let trajectory_path = workspace
         .join(".darkmux-runtime")
         .join("trajectory.jsonl");
-    let file = match std::fs::File::open(&trajectory) {
-        Ok(f) => f,
-        Err(_) => return summary, // no trajectory; nothing to replay
-    };
-    let reader = std::io::BufReader::new(file);
-    // `map_while(Result::ok)` stops at the first read error instead of
-    // spinning forever on persistent IO errors (clippy::lines_filter_map_ok).
-    for line in reader.lines().map_while(Result::ok) {
-        let event: serde_json::Value = match serde_json::from_str(&line) {
+    let mut state = TailerState::new(trajectory_path, session_id, role_id, model);
+
+    loop {
+        state.poll_and_emit();
+        if stop_flag.load(Ordering::SeqCst) {
+            // Final flush — pick up anything written between the last
+            // sleep tick and the container's exit signal.
+            state.poll_and_emit();
+            break;
+        }
+        thread::sleep(TAILER_POLL_INTERVAL);
+    }
+
+    state.summary
+}
+
+/// State machine for tailing `trajectory.jsonl`. Tracks the file offset,
+/// any partial-line tail bytes carried across polls, and the last
+/// heartbeat instant for rate limiting.
+struct TailerState {
+    trajectory_path: PathBuf,
+    offset: u64,
+    /// Trailing partial line carried from one poll to the next when the
+    /// file ends mid-line (a write was in progress at our read).
+    pending: String,
+    session_id: String,
+    role_id: String,
+    model: String,
+    last_heartbeat_at: Option<Instant>,
+    summary: TrajectorySummary,
+}
+
+impl TailerState {
+    fn new(
+        trajectory_path: PathBuf,
+        session_id: String,
+        role_id: String,
+        model: String,
+    ) -> Self {
+        Self {
+            trajectory_path,
+            offset: 0,
+            pending: String::new(),
+            session_id,
+            role_id,
+            model,
+            last_heartbeat_at: None,
+            summary: TrajectorySummary::default(),
+        }
+    }
+
+    /// One poll round: open the trajectory file, read new bytes since
+    /// the previous offset, drain complete lines, dispatch each event.
+    /// Silent on errors — file may not exist yet (container hasn't
+    /// written) and any IO hiccup is best-effort.
+    fn poll_and_emit(&mut self) {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let mut file = match std::fs::File::open(&self.trajectory_path) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        let size = match file.metadata() {
+            Ok(m) => m.len(),
+            Err(_) => return,
+        };
+        // File truncated below our offset (shouldn't happen in practice
+        // since the runtime writes append-only, but defensive): reset.
+        if size < self.offset {
+            self.offset = 0;
+            self.pending.clear();
+        }
+        if size <= self.offset {
+            return;
+        }
+
+        if file.seek(SeekFrom::Start(self.offset)).is_err() {
+            return;
+        }
+        let mut buf = Vec::with_capacity((size - self.offset) as usize);
+        if file.read_to_end(&mut buf).is_err() {
+            return;
+        }
+        self.offset = size;
+
+        self.pending.push_str(&String::from_utf8_lossy(&buf));
+        while let Some(nl) = self.pending.find('\n') {
+            let line: String = self.pending.drain(..nl).collect();
+            self.pending.drain(..1); // consume the \n
+            if !line.is_empty() {
+                self.handle_event(&line);
+            }
+        }
+    }
+
+    fn handle_event(&mut self, line: &str) {
+        let event: serde_json::Value = match serde_json::from_str(line) {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(_) => return,
         };
         let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
         match event_type {
             "model.completed" => {
-                summary.turns += 1;
+                self.summary.turns += 1;
                 let payload = serde_json::json!({
                     "turn_seq": event.get("seq"),
                     "finish_reason": event.get("finish_reason"),
                     "tool_calls_count": event.get("tool_calls").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0),
                     "usage": event.get("usage"),
                 });
-                let _ = crate::flow::record(crate::crew::dispatch::build_dispatch_record_with_payload(
-                    crate::flow::Level::Info,
-                    "dispatch.turn",
-                    role_id,
-                    session_id,
-                    Some(model),
-                    Some(payload),
-                ));
+                self.emit("dispatch.turn", crate::flow::Level::Info, payload);
             }
             "tool.completed" => {
-                summary.tool_calls += 1;
+                self.summary.tool_calls += 1;
                 let payload = serde_json::json!({
                     "tool_seq": event.get("tool_seq"),
                     "tool_name": event.get("tool_name"),
                     "args_chars": event.get("args_chars"),
                     "result_chars": event.get("result_chars"),
                 });
-                let _ = crate::flow::record(crate::crew::dispatch::build_dispatch_record_with_payload(
-                    crate::flow::Level::Info,
-                    "dispatch.tool",
-                    role_id,
-                    session_id,
-                    Some(model),
-                    Some(payload),
-                ));
+                self.emit("dispatch.tool", crate::flow::Level::Info, payload);
             }
             "compaction" => {
-                summary.compactions += 1;
+                self.summary.compactions += 1;
                 let payload = serde_json::json!({
                     "generation": event.get("generation"),
                     "before_messages": event.get("before_messages"),
                     "after_messages": event.get("after_messages"),
                     "summary_chars": event.get("summary_chars"),
                 });
-                let _ = crate::flow::record(crate::crew::dispatch::build_dispatch_record_with_payload(
-                    crate::flow::Level::Info,
-                    "dispatch.compaction",
-                    role_id,
-                    session_id,
-                    Some(model),
-                    Some(payload),
-                ));
+                self.emit("dispatch.compaction", crate::flow::Level::Info, payload);
             }
             "model.reasoning" => {
                 // The runtime emits these when it parses <think>...</think>
-                // blocks from the assistant content (#204). Carries the
-                // full reasoning text in payload so the flow viewer can
-                // render a collapse/expand block — operator discretion to
-                // expand. See runtime/src/loop_runner.rs.
+                // blocks from the assistant content (#204). The full
+                // reasoning text rides in payload so the flow viewer can
+                // render a collapse/expand block. Capped at
+                // MAX_REASONING_TEXT_BYTES so a single huge thinking
+                // session can't blow up downstream storage. (#231 / S6)
+                let reasoning_text = cap_reasoning_text(event.get("reasoning_text"));
                 let payload = serde_json::json!({
                     "turn_seq": event.get("seq"),
                     "reasoning_chars": event.get("reasoning_chars"),
-                    "reasoning_text": event.get("reasoning_text"),
+                    "reasoning_text": reasoning_text,
                     "reasoning_format": event.get("reasoning_format").unwrap_or(&serde_json::Value::String("inline-think-tags".into())),
                 });
-                let _ = crate::flow::record(crate::crew::dispatch::build_dispatch_record_with_payload(
-                    crate::flow::Level::Info,
-                    "dispatch.reasoning",
-                    role_id,
-                    session_id,
-                    Some(model),
-                    Some(payload),
-                ));
+                self.emit("dispatch.reasoning", crate::flow::Level::Info, payload);
+            }
+            "model.partial" => {
+                // Per-SSE-chunk events coalesced into a coarser heartbeat
+                // (rate-limited via HEARTBEAT_MIN_INTERVAL). Keeps
+                // topology edges animated during long streaming turns
+                // without flooding the flow stream + audit chain. (#231)
+                let now = Instant::now();
+                let should_emit = match self.last_heartbeat_at {
+                    None => true,
+                    Some(prev) => now.duration_since(prev) >= HEARTBEAT_MIN_INTERVAL,
+                };
+                if should_emit {
+                    self.last_heartbeat_at = Some(now);
+                    self.summary.heartbeats += 1;
+                    let payload = serde_json::json!({
+                        "runtime": "internal",
+                        "turn_seq": event.get("seq"),
+                        "partial_index": event.get("partial_index"),
+                        "cumulative_chars": event.get("cumulative_chars"),
+                    });
+                    self.emit("dispatch.turn.heartbeat", crate::flow::Level::Info, payload);
+                }
             }
             _ => {
-                // Unknown event types (dispatch.start, dispatch.complete
-                // from the runtime side) are intentionally ignored — the
-                // CLI emits the canonical dispatch.start/complete via
-                // build_dispatch_record_with_payload above.
+                // Other event types (dispatch.start/complete from the
+                // runtime side; model.streaming.start/end) are ignored —
+                // the CLI emits canonical dispatch bookends; streaming
+                // start/end events are runtime-internal observability
+                // with no flow-stream consumer yet.
             }
         }
     }
-    summary
+
+    fn emit(&self, action: &str, level: crate::flow::Level, payload: serde_json::Value) {
+        let _ = crate::flow::record(crate::crew::dispatch::build_dispatch_record_with_payload(
+            level,
+            action,
+            &self.role_id,
+            &self.session_id,
+            Some(&self.model),
+            Some(payload),
+        ));
+    }
+}
+
+/// Cap a JSON string value at `MAX_REASONING_TEXT_BYTES`, appending a
+/// human-readable marker so downstream consumers know it was truncated.
+/// Truncates at a UTF-8 char boundary to avoid invalid encoding.
+/// Non-string values pass through unchanged. (#231 / S6)
+fn cap_reasoning_text(value: Option<&serde_json::Value>) -> serde_json::Value {
+    let Some(v) = value else {
+        return serde_json::Value::Null;
+    };
+    let Some(s) = v.as_str() else {
+        return v.clone();
+    };
+    if s.len() <= MAX_REASONING_TEXT_BYTES {
+        return v.clone();
+    }
+    // Truncate at a UTF-8 char boundary so the resulting string is valid.
+    let mut cut = MAX_REASONING_TEXT_BYTES;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let original_bytes = s.len();
+    let original_chars = s.chars().count();
+    serde_json::Value::String(format!(
+        "{}… [truncated; original {original_chars} chars / {original_bytes} bytes]",
+        &s[..cut]
+    ))
 }
 
 /// Shell out to curl to fetch `/v1/models` from the host's LMStudio and
@@ -447,8 +618,181 @@ pub(crate) fn is_macos_firmlink(p: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::os::unix::fs::symlink;
     use tempfile::TempDir;
+
+    // ─── cap_reasoning_text (S6) ──────────────────────────────────────
+
+    #[test]
+    fn cap_reasoning_text_passes_through_short_string() {
+        let v = serde_json::Value::String("short".into());
+        let out = cap_reasoning_text(Some(&v));
+        assert_eq!(out, v);
+    }
+
+    #[test]
+    fn cap_reasoning_text_passes_through_null() {
+        assert_eq!(cap_reasoning_text(None), serde_json::Value::Null);
+    }
+
+    #[test]
+    fn cap_reasoning_text_passes_through_non_string() {
+        let v = serde_json::Value::Number(42.into());
+        let out = cap_reasoning_text(Some(&v));
+        assert_eq!(out, v);
+    }
+
+    #[test]
+    fn cap_reasoning_text_truncates_oversize_and_marks() {
+        let oversize = "x".repeat(MAX_REASONING_TEXT_BYTES + 100);
+        let v = serde_json::Value::String(oversize.clone());
+        let out = cap_reasoning_text(Some(&v));
+        let s = out.as_str().expect("output is string");
+        assert!(s.len() < oversize.len(), "must be shorter than input");
+        assert!(s.contains("[truncated"), "must carry truncation marker");
+        assert!(s.contains(&oversize.len().to_string()), "marker must include original byte count");
+    }
+
+    #[test]
+    fn cap_reasoning_text_truncates_at_utf8_boundary() {
+        // Build a string where the byte just past the cap is mid-codepoint
+        // (4-byte emoji starting at a position near the cap). Result must
+        // still be valid UTF-8.
+        let pad_bytes = MAX_REASONING_TEXT_BYTES - 1;
+        let mut s = "a".repeat(pad_bytes);
+        s.push('🦀'); // 4 bytes, starts at pad_bytes
+        s.push_str(&"b".repeat(50));
+        let v = serde_json::Value::String(s);
+        let out = cap_reasoning_text(Some(&v));
+        let truncated = out.as_str().expect("output is string");
+        // The marker is appended; the actual truncated content is valid UTF-8
+        // because String::from_utf8_lossy isn't used — we sliced on a boundary.
+        assert!(truncated.is_char_boundary(0));
+        assert!(truncated.contains("[truncated"));
+    }
+
+    // ─── TailerState::poll_and_emit (live tailing) ────────────────────
+
+    fn fixture_state(trajectory_path: PathBuf) -> TailerState {
+        TailerState::new(
+            trajectory_path,
+            "test-session".into(),
+            "test-role".into(),
+            "test-model".into(),
+        )
+    }
+
+    #[test]
+    fn tailer_state_handles_missing_file() {
+        // poll_and_emit must be a no-op when the trajectory file doesn't
+        // exist yet (container hasn't written anything).
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("never-written.jsonl");
+        let mut state = fixture_state(path);
+        state.poll_and_emit(); // no panic; no events
+        assert_eq!(state.offset, 0);
+        assert!(state.pending.is_empty());
+    }
+
+    #[test]
+    fn tailer_state_carries_partial_line_across_polls() {
+        // Write the first half of a line, poll, write the second half,
+        // poll again — the state's pending buffer must stitch them together
+        // and only dispatch the event once the newline arrives.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("trajectory.jsonl");
+        let mut state = fixture_state(path.clone());
+
+        // First write: incomplete (no newline)
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            write!(f, "{{\"type\":\"model.compl").unwrap();
+        }
+        state.poll_and_emit();
+        assert_eq!(state.summary.turns, 0, "no complete line yet");
+        assert!(!state.pending.is_empty(), "partial line carried");
+
+        // Second write: appends the rest of the line with newline
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            writeln!(f, "eted\",\"seq\":1,\"finish_reason\":\"stop\"}}").unwrap();
+        }
+        state.poll_and_emit();
+        assert_eq!(state.summary.turns, 1, "complete line dispatched after second poll");
+        assert!(state.pending.is_empty(), "pending drained after newline");
+    }
+
+    #[test]
+    fn tailer_state_resets_on_truncation() {
+        // Defensive path: if the file shrinks below our offset, the
+        // tailer must reset its offset to 0 rather than trying to seek
+        // past EOF.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("trajectory.jsonl");
+        let mut state = fixture_state(path.clone());
+
+        std::fs::write(&path, b"some-bytes\n").unwrap();
+        state.poll_and_emit();
+        let offset_before = state.offset;
+        assert!(offset_before > 0);
+
+        // Truncate to a smaller size.
+        std::fs::write(&path, b"").unwrap();
+        state.poll_and_emit();
+        // After truncation poll, offset should reset to 0 (file is empty,
+        // so 0 ≤ size = 0 and offset is 0).
+        assert_eq!(state.offset, 0);
+    }
+
+    #[test]
+    fn tailer_skips_malformed_lines() {
+        // A non-JSON line in the trajectory must not crash the tailer or
+        // stop later events from being processed.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("trajectory.jsonl");
+        let mut state = fixture_state(path.clone());
+
+        let lines = "not json\n\
+            {\"type\":\"tool.completed\",\"tool_seq\":1,\"tool_name\":\"bash\"}\n";
+        std::fs::write(&path, lines).unwrap();
+        state.poll_and_emit();
+        assert_eq!(state.summary.tool_calls, 1, "later valid event still processed");
+    }
+
+    // ─── Heartbeat rate limiting ──────────────────────────────────────
+
+    #[test]
+    fn heartbeat_first_partial_emits() {
+        // The very first model.partial should produce a heartbeat (no
+        // prior last_heartbeat_at).
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("trajectory.jsonl");
+        let mut state = fixture_state(path.clone());
+
+        let line = r#"{"type":"model.partial","seq":1,"partial_index":0,"cumulative_chars":10}"#;
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+        state.poll_and_emit();
+        assert_eq!(state.summary.heartbeats, 1);
+        assert!(state.last_heartbeat_at.is_some());
+    }
+
+    #[test]
+    fn heartbeat_rate_limits_consecutive_partials() {
+        // Two model.partial events back-to-back (under the 2s window)
+        // should produce exactly one heartbeat.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("trajectory.jsonl");
+        let mut state = fixture_state(path.clone());
+
+        let lines = "\
+            {\"type\":\"model.partial\",\"seq\":1,\"partial_index\":0,\"cumulative_chars\":10}\n\
+            {\"type\":\"model.partial\",\"seq\":1,\"partial_index\":1,\"cumulative_chars\":20}\n";
+        std::fs::write(&path, lines).unwrap();
+        state.poll_and_emit();
+        assert_eq!(state.summary.heartbeats, 1, "second partial within window must be coalesced");
+    }
+
 
     // ─── first_user_symlink_in / is_macos_firmlink (#232) ─────────────
 

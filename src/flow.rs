@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.6.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.7.0";
 // Version history:
 //   1.2.0 — added optional `model` (#106)
 //   1.3.0 — added optional `reasoning` + `mission_id`; new Stage::TierDecision (#136)
@@ -27,6 +27,11 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.6.0";
 //           `mission.compile.complete`. Existing `dispatch.start/complete` carry
 //           runtime metadata in `payload` (runtime_path, prompt_chars, total_turns, etc.).
 //           Backward-compatible — older readers ignore the new field + new actions. (#204)
+//   1.7.0 — added action `dispatch.turn.heartbeat` emitted by the live trajectory
+//           tailer (`crew/dispatch_internal.rs`) from streaming `model.partial` SSE
+//           chunks at most once per 2s. Keeps topology edges animated mid-turn and
+//           closes the post-exit-only observability gap. Backward-compatible —
+//           older readers safely ignore the new action. (#231)
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -2362,7 +2367,12 @@ mod tests {
         //           data; new action types: dispatch.turn / .tool /
         //           .compaction / .reasoning + mission.compile.start /
         //           .complete (#204). Minor bump.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.6.0");
+        //   1.7.0 — added action type `dispatch.turn.heartbeat` emitted by
+        //           the live trajectory tailer to keep topology edges
+        //           animated during long streaming turns; pairs with
+        //           runtime-side `model.partial` SSE chunks (#231). Minor
+        //           bump — older readers safely ignore the new action type.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.7.0");
     }
 
     #[test]

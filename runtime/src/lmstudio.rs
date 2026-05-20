@@ -511,6 +511,70 @@ impl Default for ChunkAccumulator {
     }
 }
 
+/// Maximum bytes `ChunkStream` will accumulate in a single SSE line.
+/// A compromised LMStudio or MITM could send a `data: ` line with no
+/// terminating newline; without a cap, `read_line` would grow RAM until
+/// the runtime container is OOM-killed. Realistic chunks are a few KB;
+/// 1 MiB is several orders above realistic and bounds the memory ceiling.
+/// Hit on a real stream → the iterator emits one `Err` and terminates.
+/// (#231 / S4)
+pub const MAX_SSE_LINE_BYTES: usize = 1 << 20;
+
+/// Read one `\n`-terminated line via `BufRead` with a hard byte cap.
+/// Returns the number of bytes consumed (including the newline if found,
+/// or the remaining bytes at EOF). Returns `Err(InvalidData)` if the cap
+/// is exceeded before a newline or EOF is reached. Memory growth is
+/// bounded by `max_bytes + BufReader::DEFAULT_BUF_SIZE` since each
+/// `fill_buf()` round is checked before its bytes are appended to `out`.
+///
+/// Tested separately so the cap semantics are auditable independent of
+/// the `ChunkStream` iterator that uses it.
+fn read_line_capped<R: BufRead>(
+    reader: &mut R,
+    out: &mut String,
+    max_bytes: usize,
+) -> std::io::Result<usize> {
+    let mut total: usize = 0;
+    loop {
+        let buf = match reader.fill_buf() {
+            Ok(b) => b,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if buf.is_empty() {
+            return Ok(total); // EOF
+        }
+        match buf.iter().position(|&b| b == b'\n') {
+            Some(pos) => {
+                let take = pos + 1;
+                if total + take > max_bytes {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("SSE line exceeded {max_bytes}-byte cap"),
+                    ));
+                }
+                out.push_str(&String::from_utf8_lossy(&buf[..take]));
+                let n = take;
+                reader.consume(n);
+                total += n;
+                return Ok(total);
+            }
+            None => {
+                if total + buf.len() > max_bytes {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("SSE line exceeded {max_bytes}-byte cap (no terminator)"),
+                    ));
+                }
+                let n = buf.len();
+                out.push_str(&String::from_utf8_lossy(buf));
+                reader.consume(n);
+                total += n;
+            }
+        }
+    }
+}
+
 /// Iterator over SSE-encoded `ChatChunk`s from a streamed
 /// chat-completions response.
 ///
@@ -524,7 +588,9 @@ impl Default for ChunkAccumulator {
 /// then `None` — the caller can't usefully retry mid-stream.
 ///
 /// Generic over `R: BufRead` so tests can construct from a `&[u8]`;
-/// production wraps the `ureq` response body in `BufReader`.
+/// production wraps the `ureq` response body in `BufReader`. Per-line
+/// byte cap (`MAX_SSE_LINE_BYTES`) bounds OOM from a pathological no-
+/// newline stream. (#231 / S4)
 pub struct ChunkStream<R: BufRead> {
     reader: R,
     done: bool,
@@ -546,7 +612,7 @@ impl<R: BufRead> Iterator for ChunkStream<R> {
         let mut line = String::new();
         loop {
             line.clear();
-            match self.reader.read_line(&mut line) {
+            match read_line_capped(&mut self.reader, &mut line, MAX_SSE_LINE_BYTES) {
                 Ok(0) => {
                     self.done = true;
                     return None;
@@ -585,6 +651,84 @@ impl<R: BufRead> Iterator for ChunkStream<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── read_line_capped (S4 byte cap) ────────────────────────
+
+    #[test]
+    fn read_line_capped_reads_terminated_line() {
+        let input = b"hello\nworld\n";
+        let mut r = std::io::BufReader::new(&input[..]);
+        let mut out = String::new();
+        let n = read_line_capped(&mut r, &mut out, 1024).unwrap();
+        assert_eq!(n, 6);
+        assert_eq!(out, "hello\n");
+    }
+
+    #[test]
+    fn read_line_capped_returns_zero_at_eof() {
+        let input: &[u8] = b"";
+        let mut r = std::io::BufReader::new(input);
+        let mut out = String::new();
+        let n = read_line_capped(&mut r, &mut out, 1024).unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn read_line_capped_returns_bytes_when_eof_without_newline() {
+        let input = b"no-terminator-line";
+        let mut r = std::io::BufReader::new(&input[..]);
+        let mut out = String::new();
+        let n = read_line_capped(&mut r, &mut out, 1024).unwrap();
+        assert_eq!(n, input.len());
+        assert_eq!(out, "no-terminator-line");
+    }
+
+    #[test]
+    fn read_line_capped_rejects_over_limit_without_terminator() {
+        // No newline, length exceeds cap → InvalidData error.
+        let input = vec![b'x'; 2048];
+        let mut r = std::io::BufReader::new(&input[..]);
+        let mut out = String::new();
+        let err = read_line_capped(&mut r, &mut out, 512).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("512"));
+    }
+
+    #[test]
+    fn read_line_capped_rejects_over_limit_even_with_terminator() {
+        // Line is bigger than cap, terminator exists at the end.
+        let mut input = vec![b'x'; 2048];
+        input.push(b'\n');
+        let mut r = std::io::BufReader::new(&input[..]);
+        let mut out = String::new();
+        let err = read_line_capped(&mut r, &mut out, 512).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn chunk_stream_terminates_on_oversize_sse_line() {
+        // Construct a `data: ` line that exceeds MAX_SSE_LINE_BYTES; the
+        // iterator must emit one Err and stop rather than allocate
+        // arbitrary RAM. Use a small custom MAX is not possible
+        // (compile-time const) so this directly exercises the wired-up
+        // production cap by sending an oversize buffer.
+        // The cap is 1 MiB; 1.5 MiB of `x` will trip it.
+        let mut sse = b"data: ".to_vec();
+        sse.extend(std::iter::repeat(b'x').take(1_500_000));
+        // No newline — the iterator's read must error out.
+        let mut iter = ChunkStream::new(&sse[..]);
+        let first = iter.next();
+        assert!(first.is_some(), "iterator must emit at least one Result");
+        let err = first.unwrap().unwrap_err();
+        assert!(
+            err.to_string().contains("SSE read failed")
+                || err.to_string().contains("cap"),
+            "expected cap-violation error; got: {err}"
+        );
+        // After the error, iterator is exhausted.
+        assert!(iter.next().is_none(), "iterator must terminate after cap error");
+    }
 
     // ─── ChunkStream (SSE framing) ─────────────────────────────
 
