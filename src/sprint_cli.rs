@@ -809,6 +809,8 @@ pub(crate) fn sprint_review_at(
         // Sprint review dispatches through the default openclaw runtime;
         // internal in-house runtime is opt-in via the CLI flag.
         runtime: crate::crew::dispatch::Runtime::Openclaw,
+        machine: None,
+        wait: true,
     };
 
     // Emit dispatch flow record.

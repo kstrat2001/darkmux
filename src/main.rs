@@ -322,6 +322,26 @@ enum CrewCmd {
         /// See `runtime/README.md` for current scope + limitations.
         #[arg(long, default_value = "openclaw")]
         runtime: String,
+        /// Target machine for the dispatch (#246 PR-C.3). When set to
+        /// an id that's NOT the local `DARKMUX_MACHINE_ID`, the
+        /// dispatch is published to the fleet work queue
+        /// (`darkmux:work:<role-tier>`) and a worker on the named
+        /// machine picks it up. When omitted (today's default), the
+        /// dispatch runs locally. Requires `DARKMUX_REDIS_URL` to be
+        /// set on the dispatching machine + `darkmux serve` running
+        /// with `DARKMUX_MACHINE_TIER` declared on the target.
+        #[arg(long, value_name = "ID")]
+        machine: Option<String>,
+        /// Return immediately after publishing to the queue instead of
+        /// blocking on the worker's `dispatch.complete` (#246 PR-C.3).
+        /// Default is `--wait` (block) so today's "spawn, see result"
+        /// ergonomics are preserved. With `--no-wait`, the CLI prints
+        /// the `session_id` and exits 0; the operator polls completion
+        /// via `darkmux flow tail --session <id>` (or `darkmux mission
+        /// dispatch` for fan-out — PR-D). Ignored for local
+        /// dispatches (those are always synchronous).
+        #[arg(long)]
+        no_wait: bool,
     },
     /// Reconcile openclaw's `agents.list[]` with the crew role manifests.
     /// For every role with both a JSON manifest and a `.md` prompt, ensures
@@ -1354,7 +1374,7 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
     match sub {
         CrewCmd::List => crew::cli::crew_list(),
         CrewCmd::Show { id } => crew::cli::crew_show(&id),
-        CrewCmd::Dispatch { role, message, deliver, session_id, timeout, watch, workdir, sprint_id, skip_preflight, runtime } => {
+        CrewCmd::Dispatch { role, message, deliver, session_id, timeout, watch, workdir, sprint_id, skip_preflight, runtime, machine, no_wait } => {
             // CLI default: if the operator didn't supply --watch, watch the
             // role's openclaw workspace dir. Library callers (e.g.
             // sprint_cli) pass an empty Vec directly to opt out.
@@ -1378,6 +1398,8 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
                 workdir,
                 sprint_id,
                 runtime: runtime_flag,
+                machine,
+                wait: !no_wait,
             };
             let result = crew::dispatch::dispatch(opts)?;
             // Announce the resolved session id on stderr so operators see

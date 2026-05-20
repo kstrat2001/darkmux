@@ -190,6 +190,8 @@ fn dispatch_compiler(input: &str, hint: Option<&str>) -> Result<String> {
         // Mission propose is a system-level admin dispatch; always the
         // default openclaw path while the internal runtime is opt-in only.
         runtime: crate::crew::dispatch::Runtime::Openclaw,
+        machine: None,
+        wait: true,
     };
     let dispatch_result = crate::crew::dispatch::dispatch(opts);
 
