@@ -239,6 +239,16 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf) -> Result<()> {
             println!("{line}");
         }
 
+        // Spawn the fleet work-queue worker thread (#246 PR-C.2). Runs
+        // on a dedicated std::thread (not a tokio task) so the sync
+        // redis client + sync crew::dispatch::dispatch don't saturate
+        // the tokio executor. Worker self-disables when its
+        // prerequisites (DARKMUX_REDIS_URL + DARKMUX_MACHINE_TIER) aren't
+        // declared — single-machine fleets continue to work unchanged.
+        // The thread runs for the daemon's lifetime; the process
+        // force-exit in the SHUTDOWN_GRACE_SECS path kills it cleanly.
+        let _worker_handle = crate::fleet::spawn_worker_thread();
+
         // Shutdown plumbing: multiplex one signal to two consumers
         // (axum's graceful shutdown future and the force-exit timer).
         // `watch::channel` is the right shape — both consumers wait_for
