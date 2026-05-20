@@ -11,6 +11,7 @@ pub mod flow;
 mod doctor;
 mod eureka;
 mod hardware;
+mod fleet;
 mod heuristics;
 mod init;
 mod lab;
@@ -111,6 +112,16 @@ enum Cmd {
     Model {
         #[command(subcommand)]
         sub: ModelCmd,
+    },
+    /// Fleet management — declare which machines compose your darkmux
+    /// fleet and probe their reachability. The substrate for tier-aware
+    /// dispatch routing (PR-C / #247) and the topology view's fleet
+    /// pane. Single-machine fleets work without any roster entries;
+    /// multi-machine fleets need `darkmux fleet add <id>` per peer.
+    /// (#246 / #248)
+    Fleet {
+        #[command(subcommand)]
+        sub: FleetCmd,
     },
     /// Crew subcommands — dispatch a role for a single turn, or reconcile
     /// the openclaw agent registry with the on-disk crew manifests.
@@ -559,6 +570,47 @@ enum ModelCmd {
 }
 
 #[derive(Subcommand)]
+enum FleetCmd {
+    /// Register a machine in the fleet roster. Idempotent — calling
+    /// again with the same `<id>` updates fields but preserves the
+    /// original `added_unix_ms` so the fleet-age signal stays honest.
+    Add {
+        /// Logical machine id (what flow records carry as `machine_id`).
+        /// Example: `studio`, `laptop`, `mini-1`.
+        id: String,
+        /// Hardware tier: `inference` (heavy-model peer), `hub`
+        /// (always-on infra + admin agents), `client` (UI-only).
+        #[arg(long)]
+        tier: String,
+        /// Tailnet address or DNS name to reach the daemon on. Example:
+        /// `100.74.208.36`, `100.74.208.36:8765`, `studio.tailnet`. If
+        /// no `:port` suffix, port 8765 is assumed.
+        #[arg(long)]
+        address: String,
+        /// Optional one-line description for `fleet status` + topology
+        /// tooltips.
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// Remove a machine from the fleet roster. Doesn't touch the actual
+    /// remote machine — just removes the local routing reference.
+    /// Historical flow records from that machine remain in the audit
+    /// chain and are still visible in the topology view.
+    Remove {
+        /// Logical machine id to remove.
+        id: String,
+    },
+    /// Print the fleet roster + per-machine reachability. Each machine
+    /// gets a TCP-probe to its daemon port (300ms budget per probe).
+    /// `--json` for scripting; default is a table for operator eyes.
+    Status {
+        /// Emit JSON instead of the human-readable table.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum ProfileCmd {
     /// Generate a starter profile JSON for a model + task class. Output is
     /// printed to stdout — copy-paste into your `~/.darkmux/profiles.json`
@@ -736,6 +788,7 @@ fn run(cmd: Cmd) -> Result<i32> {
         Cmd::Scan { config } => cmd_scan(config.as_deref()),
         Cmd::Profile { sub } => cmd_profile(sub),
         Cmd::Model { sub } => cmd_model(sub),
+        Cmd::Fleet { sub } => cmd_fleet(sub),
         Cmd::Crew { sub } => cmd_crew(sub),
         Cmd::Role { sub } => cmd_role(sub),
         Cmd::Sprint { sub } => cmd_sprint(sub),
@@ -1174,6 +1227,127 @@ fn cmd_agent(sub: AgentCmd) -> Result<i32> {
             Ok(0)
         }
     }
+}
+
+fn cmd_fleet(sub: FleetCmd) -> Result<i32> {
+    match sub {
+        FleetCmd::Add { id, tier, address, description } => {
+            cmd_fleet_add(&id, &tier, &address, description.as_deref())
+        }
+        FleetCmd::Remove { id } => cmd_fleet_remove(&id),
+        FleetCmd::Status { json } => cmd_fleet_status(json),
+    }
+}
+
+fn cmd_fleet_add(
+    id: &str,
+    tier: &str,
+    address: &str,
+    description: Option<&str>,
+) -> Result<i32> {
+    let mut roster = fleet::load_roster()?;
+    let was_present = roster.machines.contains_key(id);
+    fleet::add_machine(&mut roster, id, tier, address, description)?;
+    fleet::save_roster(&roster)?;
+    let verb = if was_present { "updated" } else { "added" };
+    println!("fleet: {verb} {id} (tier={tier}, address={address})");
+    if let Some(d) = description {
+        println!("  description: {d}");
+    }
+    println!("  roster: {}", fleet::roster_path().display());
+    Ok(0)
+}
+
+fn cmd_fleet_remove(id: &str) -> Result<i32> {
+    let mut roster = fleet::load_roster()?;
+    match fleet::remove_machine(&mut roster, id) {
+        Some(entry) => {
+            fleet::save_roster(&roster)?;
+            println!("fleet: removed {id} (tier was {})", entry.tier);
+            println!("  roster: {}", fleet::roster_path().display());
+            Ok(0)
+        }
+        None => {
+            eprintln!("fleet: no machine `{id}` in roster — nothing to remove");
+            Ok(2)
+        }
+    }
+}
+
+fn cmd_fleet_status(emit_json: bool) -> Result<i32> {
+    let roster = fleet::load_roster()?;
+
+    // Probe each machine's reachability (TCP connect to its daemon port).
+    // Done sequentially — the roster is small and the budget per probe
+    // is 300ms; total wall is bounded.
+    let probes: Vec<(fleet::MachineEntry, fleet::ReachabilityResult)> = roster
+        .machines
+        .values()
+        .map(|m| {
+            let probe = fleet::probe_reachability(&m.address);
+            (m.clone(), probe)
+        })
+        .collect();
+
+    if emit_json {
+        let local_tier = flow::resolve_machine_tier();
+        let local_id = flow::resolve_machine_id();
+        let payload = serde_json::json!({
+            "roster_path": fleet::roster_path().display().to_string(),
+            "roster_version": roster.version,
+            "local_machine_id": local_id,
+            "local_machine_tier": local_tier,
+            "machines": probes
+                .iter()
+                .map(|(m, p)| serde_json::json!({
+                    "id": m.id,
+                    "tier": m.tier,
+                    "address": m.address,
+                    "description": m.description,
+                    "added_unix_ms": m.added_unix_ms,
+                    "reachable": p.reachable,
+                    "resolved_address": p.resolved_address,
+                    "probe_ms": p.elapsed_ms,
+                    "probe_error": p.error,
+                }))
+                .collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(0);
+    }
+
+    // Human-readable table.
+    println!("darkmux fleet status");
+    println!("  roster:           {}", fleet::roster_path().display());
+    println!("  local machine_id: {}", flow::resolve_machine_id().unwrap_or_else(|| "<unknown>".into()));
+    println!("  local tier:       {}", flow::resolve_machine_tier().unwrap_or_else(|| "<not declared>".into()));
+    println!();
+    if probes.is_empty() {
+        println!("(no peers in roster — single-machine fleet)");
+        println!();
+        println!("Add a peer: darkmux fleet add <id> --tier <inference|hub|client> --address <tailnet-addr>");
+        return Ok(0);
+    }
+    println!(
+        "{:<14} {:<10} {:<26} {:<10} DESCRIPTION",
+        "MACHINE", "TIER", "ADDRESS", "PROBE"
+    );
+    for (m, p) in &probes {
+        let status = if p.reachable {
+            format!("✓ {}ms", p.elapsed_ms)
+        } else {
+            format!("✗ {}ms", p.elapsed_ms)
+        };
+        let desc = m.description.as_deref().unwrap_or("");
+        println!(
+            "{:<14} {:<10} {:<26} {:<10} {}",
+            m.id, m.tier, m.address, status, desc
+        );
+        if let Some(err) = &p.error {
+            println!("               error: {err}");
+        }
+    }
+    Ok(0)
 }
 
 fn cmd_crew(sub: CrewCmd) -> Result<i32> {

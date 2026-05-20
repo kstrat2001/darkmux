@@ -2920,6 +2920,116 @@ mod tests {
         let mut diff_prev = base.clone();
         diff_prev.prev_hash = Some("different-seed".to_string());
         assert_ne!(audit_hash_of(&diff_prev).unwrap(), h1);
+
+        // PR-A schema 1.8 fields — must each contribute to the hash so a
+        // future refactor that accidentally swapped `skip_serializing_if`
+        // for `skip` (which omits the field from serialization entirely)
+        // can't silently weaken the tamper-evidence invariant. (#246
+        // PR-A review M1)
+        let mut diff_machine_tier = base.clone();
+        diff_machine_tier.machine_tier = Some("inference".to_string());
+        assert_ne!(
+            audit_hash_of(&diff_machine_tier).unwrap(),
+            h1,
+            "machine_tier must contribute to audit hash"
+        );
+
+        let mut diff_work_id = base.clone();
+        diff_work_id.work_id = Some("1716192000000-0".to_string());
+        assert_ne!(
+            audit_hash_of(&diff_work_id).unwrap(),
+            h1,
+            "work_id must contribute to audit hash"
+        );
+
+        let mut diff_attempt = base.clone();
+        diff_attempt.attempt = Some(2);
+        assert_ne!(
+            audit_hash_of(&diff_attempt).unwrap(),
+            h1,
+            "attempt must contribute to audit hash"
+        );
+    }
+
+    /// Cross-version audit-chain walk: records that lack the schema-1.8
+    /// fields (machine_tier / work_id / attempt) must still validate
+    /// under 1.8 reader code. The invariant rides on
+    /// `skip_serializing_if = "Option::is_none"` — re-serialization of
+    /// a None-valued field produces the same bytes a pre-1.8 writer
+    /// would have produced, so the hash chain walks cleanly across the
+    /// version boundary. (#246 PR-A review M2)
+    #[serial_test::serial]
+    #[test]
+    fn integrity_walks_pre_1_8_records() {
+        let tmp = TempDir::new().unwrap();
+        let prev_audit = env::var("DARKMUX_AUDIT_DIR").ok();
+        unsafe { env::set_var("DARKMUX_AUDIT_DIR", tmp.path()); }
+
+        // Write records with all new schema-1.8 fields explicitly None.
+        // The on-disk JSON lines omit those keys (skip_serializing_if),
+        // which is byte-identical to what a pre-1.8 writer produced.
+        let sink = AuditFileSink::new();
+        for i in 0..3u32 {
+            let rec = FlowRecord {
+                ts: format!("2026-05-15T00:00:0{i}Z"),
+                level: Level::Info,
+                category: Category::Work,
+                tier: Tier::Operator,
+                stage: Stage::Scope,
+                action: "pre-1.8-record".to_string(),
+                handle: format!("h-{i}"),
+                sprint_id: None,
+                session_id: None,
+                source: None,
+                model: None,
+                reasoning: None,
+                mission_id: None,
+                machine_id: None,
+                orchestrator: None,
+                prev_hash: None,
+                hash: None,
+                payload: None,
+                machine_tier: None,
+                work_id: None,
+                attempt: None,
+            };
+            sink.write(&rec).unwrap();
+        }
+
+        // Confirm the on-disk JSON does NOT carry the new keys — that's
+        // the "pre-1.8 shape" assertion.
+        let day = day_utc_now();
+        let path = tmp.path().join(format!("{day}.jsonl"));
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !raw.contains("machine_tier"),
+            "None-valued machine_tier must be omitted from serialized form (skip_serializing_if). \
+             Otherwise pre-1.8 audit chains break under 1.8 reader. Raw:\n{raw}"
+        );
+        assert!(
+            !raw.contains("\"work_id\""),
+            "None-valued work_id must be omitted"
+        );
+        assert!(
+            !raw.contains("\"attempt\""),
+            "None-valued attempt must be omitted"
+        );
+
+        // The chain walks cleanly — same invariant as a real pre-1.8 file
+        // produced by an older darkmux build.
+        let report = integrity_check_file(&path).unwrap();
+        assert!(
+            report.chain_valid,
+            "cross-version chain must validate; reason: {report:?}"
+        );
+        assert_eq!(report.records_checked, 3);
+
+        unsafe {
+            match prev_audit {
+                Some(v) => env::set_var("DARKMUX_AUDIT_DIR", v),
+                None => env::remove_var("DARKMUX_AUDIT_DIR"),
+            }
+        }
     }
 
     #[serial_test::serial]
