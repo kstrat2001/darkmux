@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>darkmux topology — fleet diagram</title>
-<meta name="description" content="Live + replay diagram of darkmux fleet activity: orchestrators, machines, crew roles, models, and missions. Coming in M3.">
+<meta name="description" content="Live + replay diagram of darkmux fleet activity: orchestrators, machines, crew roles, models, and missions.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -100,6 +100,26 @@
     100% { box-shadow: 0 0 0 14px transparent, 0 2px 8px rgba(0,0,0,0.3); }
   }
 
+  /* prefers-reduced-motion (#235 U1): disable the two CSS animations.
+     The 250ms clock tick is handled in JS (slowed to 2s). Live edges
+     and pulsing nodes fall back to static styling — operators who
+     opt out of motion still see the topology + states without the
+     "edge-is-active" / "node-just-fired" cues. */
+  @media (prefers-reduced-motion: reduce) {
+    .topology-edge-active .react-flow__edge-path { animation: none; }
+    .topology-node-pulse .react-flow__node-default,
+    .react-flow__node.topology-node-pulse { animation: none; }
+  }
+
+  /* Mode pill radiogroup (#235 U3): selected button is visually
+     distinct so the operator sees the active mode without parsing the
+     aria-checked attribute. */
+  .dx-pill[role="radio"][aria-checked="true"] {
+    background: var(--accent-bg, var(--bg-elev2));
+    color: var(--accent);
+    border-color: var(--accent);
+  }
+
   /* schema-version mismatch banner */
   .topology-schema-banner {
     position: fixed; top: 56px; left: 12px; right: 12px;
@@ -121,30 +141,51 @@
 </head>
 <body>
   <dx-shell active-tab="topology">
-    <select slot="pills" class="dx-pill" id="topology-mode-select" title="topology view mode">
-      <option value="fleet">Fleet</option>
-      <option value="focus">Focus</option>
-      <option value="mission">Mission</option>
-    </select>
-    <select slot="pills" class="dx-pill" id="topology-mission-select" title="filter by mission (Mission mode)">
+    <div slot="pills"
+         role="radiogroup"
+         aria-label="Topology view mode"
+         id="topology-mode-group"
+         style="display:inline-flex;gap:4px">
+      <button type="button" class="dx-pill" role="radio" aria-checked="true"
+              data-mode="fleet" id="topology-mode-fleet"
+              aria-label="Fleet view: all machines in the fleet">Fleet</button>
+      <button type="button" class="dx-pill" role="radio" aria-checked="false"
+              data-mode="focus" id="topology-mode-focus"
+              aria-label="Focus view: detail of a single machine">Focus</button>
+      <button type="button" class="dx-pill" role="radio" aria-checked="false"
+              data-mode="mission" id="topology-mode-mission"
+              aria-label="Mission view: filter by mission">Mission</button>
+    </div>
+    <select slot="pills" class="dx-pill" id="topology-mission-select"
+            title="filter by mission (Mission mode)"
+            aria-label="Filter by mission (Mission mode only)">
       <option value="">(no mission selected)</option>
     </select>
-    <button slot="pills" type="button" class="dx-pill" id="topology-source-pill" title="data source">
+    <span slot="pills" class="dx-pill" id="topology-source-pill"
+          title="data source"
+          aria-label="Data source status">
       <span id="topology-source-label">source: …</span>
-    </button>
+    </span>
   </dx-shell>
   <main>
     <div id="topology-root"></div>
-    <div id="topology-scrubber" class="dx-scrubber" hidden>
-      <button type="button" class="dx-pill" id="scrubber-step" title="step to next record">&#9654;|</button>
-      <select class="dx-pill" id="scrubber-speed" title="replay speed">
-        <option value="0">&#9208; pause</option>
-        <option value="1" selected>1&times;</option>
-        <option value="4">4&times;</option>
-        <option value="16">16&times;</option>
+    <div id="topology-scrubber" class="dx-scrubber" hidden role="group" aria-label="Replay controls">
+      <button type="button" class="dx-pill" id="scrubber-step"
+              title="step to next record"
+              aria-label="Step to next record">Step &#9654;</button>
+      <select class="dx-pill" id="scrubber-speed"
+              title="replay speed"
+              aria-label="Replay speed">
+        <option value="0">&#9208; Paused</option>
+        <option value="1" selected>1&times; speed</option>
+        <option value="4">4&times; speed</option>
+        <option value="16">16&times; speed</option>
       </select>
-      <input type="range" id="scrubber-range" min="0" max="100" value="0" step="1" style="flex:1">
-      <span id="scrubber-readout" class="mono" style="min-width:160px;text-align:right;font-size:11px;color:var(--muted)"></span>
+      <input type="range" id="scrubber-range" min="0" max="100" value="0" step="1"
+             style="flex:1"
+             title="seek through replay"
+             aria-label="Seek through replay timeline">
+      <span id="scrubber-readout" class="mono" style="min-width:160px;text-align:right;font-size:11px;color:var(--muted)" aria-live="polite"></span>
     </div>
   </main>
   <script src="../shared/shell.js" defer></script>
@@ -155,6 +196,46 @@
 
     const TOPOLOGY_VERSION = '0.5.0';
     const EXPECTED_FLOW_SCHEMA_MAJOR = 1;
+
+    /**
+     * Sliding-window cap on records held in state (#235 B2). Long-running
+     * tabs receiving the SSE stream would otherwise grow this array
+     * unboundedly. 5000 records is roughly an hour of moderate-activity
+     * dispatch traffic and bounds browser memory at a comfortable level.
+     * Older records are dropped first; the viewer's replay scrubber still
+     * works against the bounded window (live-mode behavior — historical
+     * replay loads from a fixture file and isn't affected by this cap).
+     */
+    const MAX_FLOW_RECORDS = 5000;
+    function capRecords(arr) {
+      return arr.length > MAX_FLOW_RECORDS
+        ? arr.slice(arr.length - MAX_FLOW_RECORDS)
+        : arr;
+    }
+
+    /**
+     * React hook returning the operator's prefers-reduced-motion setting,
+     * with live updates when the OS-level toggle changes. (#235 U1)
+     */
+    function useReducedMotion() {
+      const [reduced, setReduced] = useState(() =>
+        typeof window !== 'undefined' &&
+        window.matchMedia?.('(prefers-reduced-motion: reduce)').matches === true
+      );
+      useEffect(() => {
+        if (typeof window === 'undefined' || !window.matchMedia) return;
+        const mq = window.matchMedia('(prefers-reduced-motion: reduce)');
+        const handler = (e) => setReduced(e.matches);
+        // addEventListener is preferred; older Safari only has addListener.
+        if (mq.addEventListener) {
+          mq.addEventListener('change', handler);
+          return () => mq.removeEventListener('change', handler);
+        }
+        mq.addListener(handler);
+        return () => mq.removeListener(handler);
+      }, []);
+      return reduced;
+    }
 
     // ─── pure-function unit harness ──────────────────────────────────────
     // Runs at boot when ?test=1 is set. Each test pushes into `__tests`;
@@ -622,20 +703,27 @@
       );
 
       // 250ms wall-clock tick — live: tracks Date.now(); replay: advances by (250ms * replaySpeed).
+      // When prefers-reduced-motion is set, the tick slows to 2000ms so the
+      // viewer still updates but isn't a continuous strobe of micro-changes. (#235 U1)
       const [clockT, setClockT] = useState(() => Date.now());
       const [replaySpeed, setReplaySpeed] = useState(1); // multiplier; 0 = pause
+      const prefersReducedMotion = useReducedMotion();
+      const tickIntervalMs = prefersReducedMotion ? 2000 : 250;
 
       useEffect(() => {
         if (!isReplay) {
-          // Live: tick to "now" every 250ms (same as before).
-          const id = setInterval(() => setClockT(Date.now()), 250);
+          // Live: tick to "now" every tickIntervalMs.
+          const id = setInterval(() => setClockT(Date.now()), tickIntervalMs);
           return () => clearInterval(id);
         }
-        // Replay: advance clockT by (250ms * replaySpeed) each tick.
+        // Replay: advance clockT by (tickIntervalMs * replaySpeed) each tick.
         if (replaySpeed === 0) return; // paused
-        const id = setInterval(() => setClockT(t => t + 250 * replaySpeed), 250);
+        const id = setInterval(
+          () => setClockT(t => t + tickIntervalMs * replaySpeed),
+          tickIntervalMs
+        );
         return () => clearInterval(id);
-      }, [isReplay, replaySpeed]);
+      }, [isReplay, replaySpeed, tickIntervalMs]);
 
       // Initialize replay clock to just before the earliest record ts (once).
       const replayInitRef = useRef(false);
@@ -653,11 +741,14 @@
         }
       }, [isReplay, records]);
 
-      // SSE + backfill: fires on mount; skips when ?fixture is present.
+      // SSE + backfill: fires on mount. In replay mode (`?fixture=...`)
+      // the SSE stream is skipped — the fixture-load effect below handles
+      // it. (#235 B1: depend on `isReplay` so a future UI-driven replay
+      // toggle cleanly tears down the SSE connection.)
       useEffect(() => {
-        const fixture = new URLSearchParams(location.search).get('fixture');
-        if (fixture) {
-          setSourceLabel(`source: replay (${fixture})`);
+        if (isReplay) {
+          const fixture = new URLSearchParams(location.search).get('fixture');
+          if (fixture) setSourceLabel(`source: replay (${fixture})`);
           return; // fixture-load is handled in the existing effect below
         }
 
@@ -665,17 +756,19 @@
         const base = 'http://127.0.0.1:8765';
         setSourceLabel('source: connecting…');
 
-        // 1. Backfill today's records.
+        // 1. Backfill today's records (capped at MAX_FLOW_RECORDS so a
+        //    long daily file can't flood the tab on first paint).
         fetch(`${base}/flow/${date}`)
           .then(r => r.ok ? r.json() : [])
           .then(arr => {
-            if (Array.isArray(arr)) setRecords(arr);
+            if (Array.isArray(arr)) setRecords(capRecords(arr));
           })
           .catch(err => {
             console.warn('[topology] backfill fetch failed:', err);
           });
 
-        // 2. SSE tail.
+        // 2. SSE tail. Each append is capped via capRecords (#235 B2)
+        //    so a long-running tab stays bounded in memory.
         let es;
         try {
           es = new EventSource(`${base}/flow/${date}/stream`);
@@ -691,13 +784,13 @@
         es.onmessage = (e) => {
           try {
             const rec = JSON.parse(e.data);
-            setRecords(prev => [...prev, rec]);
+            setRecords(prev => capRecords([...prev, rec]));
           } catch (parseErr) {
             console.warn('[topology] malformed SSE record:', parseErr);
           }
         };
         return () => { try { es.close(); } catch {} };
-      }, []);
+      }, [isReplay]);
 
       // Sync sourceLabel → DOM pill (pill lives in dx-shell, outside React tree).
       useEffect(() => {
@@ -730,20 +823,34 @@
           .catch(e => console.error('[topology] fixture load failed:', e));
       }, []);
 
-      // Sync mode select → React state (mount-only; we update imperatively on change)
+      // Sync mode-group buttons → React state (#235 U3). The mode pills are
+      // a button-based radiogroup (see the dx-shell pills slot in the body):
+      // role="radiogroup" + role="radio" + aria-checked, announced by screen
+      // readers as "Topology view mode, radio group, Fleet selected" rather
+      // than the older `<select>`'s bare "combobox".
       useEffect(() => {
-        const el = document.getElementById('topology-mode-select');
-        if (!el) return;
-        const onChange = () => setMode(el.value);
-        el.value = mode; // sync initial
-        el.addEventListener('change', onChange);
-        return () => el.removeEventListener('change', onChange);
-      }, []);  // mount-only; we sync el.value imperatively when mode changes outside the listener
+        const group = document.getElementById('topology-mode-group');
+        if (!group) return;
+        const buttons = Array.from(group.querySelectorAll('[role="radio"]'));
+        const handlers = buttons.map((btn) => {
+          const onClick = () => {
+            const m = btn.dataset.mode;
+            if (m) setMode(m);
+          };
+          btn.addEventListener('click', onClick);
+          return [btn, onClick];
+        });
+        return () => handlers.forEach(([btn, onClick]) => btn.removeEventListener('click', onClick));
+      }, []);
 
-      // Sync React mode state → select element
+      // Sync React mode state → aria-checked on each radio button.
       useEffect(() => {
-        const el = document.getElementById('topology-mode-select');
-        if (el) el.value = mode;
+        const group = document.getElementById('topology-mode-group');
+        if (!group) return;
+        const buttons = group.querySelectorAll('[role="radio"]');
+        buttons.forEach((btn) => {
+          btn.setAttribute('aria-checked', String(btn.dataset.mode === mode));
+        });
       }, [mode]);
 
       // In replay mode, only show records whose ts <= clockT.
@@ -961,6 +1068,25 @@
               <Background />
               <Controls />
             </ReactFlow>
+            {mode === 'mission' && !missionId && (
+              <div
+                role="status"
+                aria-live="polite"
+                style={{
+                  position: 'absolute', top: '50%', left: '50%',
+                  transform: 'translate(-50%, -50%)',
+                  padding: '14px 22px',
+                  background: 'var(--bg-elev)',
+                  border: '1px solid var(--border)',
+                  borderRadius: 6,
+                  color: 'var(--muted)',
+                  pointerEvents: 'none',
+                  fontSize: 13,
+                }}
+              >
+                (no mission selected) — pick one from the pill above to filter the view
+              </div>
+            )}
           </div>
         </>
       );
