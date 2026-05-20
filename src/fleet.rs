@@ -983,18 +983,25 @@ impl WorkJob {
 // immediately (fire-and-forget; the operator polls flow stream from
 // elsewhere) OR block until the worker's `dispatch.complete` flow
 // record lands for the matching `session_id`. The `--wait` wrapper
-// implements the blocking form by tailing the local LocalFileSink
-// JSONL (`~/.darkmux/flows/<today>.jsonl`).
+// implements the blocking form by **polling the Redis flow stream**
+// (`darkmux:flow`) — NOT the local file, because in a cross-machine
+// dispatch the completion record lands on the WORKER's local file,
+// not the publisher's. The Redis stream is the only substrate both
+// machines write to (via the shared TeeSink → RedisSink composition).
 //
-// Why poll the local file vs. read from Redis: the LocalFileSink is
-// always present (the file substrate is the canonical observability
-// path); reading from Redis would couple --wait to the Redis sink
-// being live, which is needlessly fragile (the daemon writes through
-// TeeSink so the file gets the record even if Redis is degraded).
+// This is the architectural pivot that makes cross-machine `--wait`
+// actually work — a CRITICAL fix surfaced in PR-C.3 review where the
+// initial local-file-polling implementation would always time out.
 
-/// Poll interval for the `wait_for_completion` flow tail. Matches the
-/// daemon's tail_lines cadence in `serve.rs`. (#246 PR-C.3)
+/// Poll interval for the `wait_for_completion` Redis polling. (#246 PR-C.3)
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Cap on XRANGE entries scanned per poll iteration. Matches the typical
+/// Redis stream MAXLEN of 10000 (set via `DARKMUX_REDIS_MAXLEN`); covers
+/// a full re-scan per poll without pagination. If the stream legitimately
+/// exceeds this in a single poll window the caller will see a delayed
+/// completion (corrects on the next iteration). (#246 PR-C.3)
+const WAIT_XRANGE_COUNT: usize = 10000;
 
 /// Result of `wait_for_completion`. Outcome is the dispatch's
 /// `result_class` from the flow record's payload — typically `"ok"` or
@@ -1014,84 +1021,124 @@ pub struct CompletionResult {
 }
 
 /// Block until a `dispatch.complete` flow record for `session_id` lands
-/// in the local LocalFileSink JSONL, or `timeout` elapses. Returns the
+/// in the Redis flow stream, or `timeout` elapses. Returns the
 /// completion result on success; bails when the timeout fires (the job
 /// may still be running on the remote worker — the operator can re-tail
 /// via `darkmux flow tail --session <id>` to keep watching).
 ///
-/// Polls at `WAIT_POLL_INTERVAL` (250ms) against the per-day flow file.
-/// The file may not exist yet at the moment we start polling (fresh
-/// install or daemon hasn't received the first record from the worker
-/// yet) — that's treated as "no record yet, keep polling."
+/// Polls the Redis stream (default `darkmux:flow`; override via
+/// `DARKMUX_REDIS_STREAM`) every `WAIT_POLL_INTERVAL` (250ms). Each
+/// poll runs `XRANGE - + COUNT 10000` and scans for an entry whose
+/// `record` field matches both the target `session_id` AND a
+/// `dispatch complete` action. The full-scan-per-poll trades CPU for
+/// correctness — the stream is bounded by `DARKMUX_REDIS_MAXLEN`
+/// (typically 10000), so the worst-case scan is bounded too. v1 cost
+/// model is fine; PR-E may add last-id tracking for efficiency.
 ///
-/// Day-boundary handling: this poll watches the file for the day at
-/// poll-start time. If the dispatch crosses midnight UTC, the
-/// completion record lands in the NEXT day's file and this function
-/// will time out without finding it. Acceptable for v1 — dispatches
-/// longer than ~24h are out of scope. Improvement deferred.
+/// **Why poll Redis, not the local file:** in a cross-machine dispatch
+/// the worker writes the `dispatch.complete` record to its OWN local
+/// `~/.darkmux/flows/<day>.jsonl`, not the publisher's. The Redis
+/// stream is the only substrate both machines write to (the shared
+/// `darkmux:flow` stream via the TeeSink → RedisSink composition).
+/// (CRITICAL fix from PR-C.3 review)
 pub fn wait_for_completion(
+    redis_url: &crate::flow::RawRedisUrl,
     session_id: &str,
     timeout: Duration,
 ) -> Result<CompletionResult> {
-    let flows_dir = crate::flow::flows_dir();
-    let day = crate::flow::day_utc_now();
-    let path = flows_dir.join(format!("{day}.jsonl"));
+    let client = redis::Client::open(redis_url.expose_for_probe())
+        .with_context(|| format!("opening Redis to wait for completion of {session_id}"))?;
+    let mut conn = client
+        .get_connection()
+        .with_context(|| format!("connecting to Redis to wait for completion of {session_id}"))?;
+
+    let stream = std::env::var("DARKMUX_REDIS_STREAM")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "darkmux:flow".to_string());
+
     let start = std::time::Instant::now();
-    // Track our position in the file so we don't re-parse already-read
-    // records each poll. Starting at 0 means we DO read backwards into
-    // any pre-existing same-session records — that's the right call:
-    // a queue-roundtrip publishes, then the dispatch.start record from
-    // the worker may have already landed by the time we start polling.
-    let mut offset: u64 = 0;
-    let mut pending = String::new();
     loop {
         if start.elapsed() > timeout {
             return Err(anyhow!(
                 "wait_for_completion: no dispatch.complete for session_id={session_id} \
-                 within {}s. The job may still be running — tail \
-                 `darkmux flow tail --session {session_id}` to keep watching.",
+                 within {}s in Redis stream {stream}. The job may still be running on the \
+                 worker — tail `darkmux flow tail --session {session_id}` to keep watching.",
                 timeout.as_secs()
             ));
         }
 
-        if let Ok(meta) = std::fs::metadata(&path) {
-            let size = meta.len();
-            if size > offset {
-                if let Ok(mut file) = std::fs::File::open(&path) {
-                    use std::io::{Read, Seek, SeekFrom};
-                    if file.seek(SeekFrom::Start(offset)).is_ok() {
-                        let mut buf = Vec::with_capacity((size - offset) as usize);
-                        if file.read_to_end(&mut buf).is_ok() {
-                            offset = size;
-                            pending.push_str(&String::from_utf8_lossy(&buf));
-                            while let Some(nl) = pending.find('\n') {
-                                let line: String = pending.drain(..nl).collect();
-                                pending.drain(..1);
-                                if let Some(result) = match_completion(&line, session_id) {
-                                    return Ok(result);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            // File shrank (rotation/truncation) — reset and re-scan.
-            if size < offset {
-                offset = 0;
-                pending.clear();
-            }
+        // XRANGE darkmux:flow - + COUNT 10000 — full-scan each poll. The
+        // stream is bounded (MAXLEN ~ 10000) so the scan is bounded too.
+        let raw: redis::Value = redis::cmd("XRANGE")
+            .arg(&stream)
+            .arg("-")
+            .arg("+")
+            .arg("COUNT")
+            .arg(WAIT_XRANGE_COUNT)
+            .query(&mut conn)
+            .with_context(|| format!("XRANGE on flow stream {stream}"))?;
+
+        if let Some(result) = scan_flow_entries_for_completion(&raw, session_id)? {
+            return Ok(result);
         }
+
         std::thread::sleep(WAIT_POLL_INTERVAL);
     }
 }
 
-/// Parse one JSONL line; return `Some(CompletionResult)` when it's a
-/// `dispatch.complete` for the target session_id. Extracted as a pure
-/// function so it's unit-testable without filesystem polling.
+/// Walk XRANGE's nested-array response, scanning each entry's `record`
+/// field for a `dispatch.complete` event matching `session_id`. Returns
+/// the first match's CompletionResult, or `None` if no entry matches.
+/// Pure function; unit-testable independent of live Redis.
+fn scan_flow_entries_for_completion(
+    raw: &redis::Value,
+    session_id: &str,
+) -> Result<Option<CompletionResult>> {
+    use redis::Value as V;
+    // Expected shape: Array([Array([id, Array([k, v, k, v, ...])])])
+    let entries = match raw {
+        V::Array(a) => a,
+        V::Nil => return Ok(None),
+        other => return Err(anyhow!("XRANGE: unexpected outer shape: {other:?}")),
+    };
+    for entry in entries {
+        let parts = match entry {
+            V::Array(p) => p,
+            _ => continue,
+        };
+        if parts.len() < 2 {
+            continue;
+        }
+        let fields = match &parts[1] {
+            V::Array(f) => f,
+            _ => continue,
+        };
+        let Some(record_str) = extract_field(fields, "record") else {
+            continue;
+        };
+        if let Some(result) = match_completion(&record_str, session_id) {
+            return Ok(Some(result));
+        }
+    }
+    Ok(None)
+}
+
+/// Parse one record JSON; return `Some(CompletionResult)` when it's a
+/// dispatch-completion event for the target `session_id`. Pure function;
+/// unit-testable without live Redis.
+///
+/// Canonical action shape is `"dispatch complete"` (space, NOT dot) —
+/// that's what every production emit site uses today
+/// (`crew::dispatch::dispatch` openclaw path + `dispatch_internal::dispatch`
+/// internal-runtime path). The dotted form `"dispatch.complete"` is
+/// accepted as forward-compat in case a future cleanup migrates the
+/// emitters to match the dotted-per-action-type convention of
+/// `dispatch.turn` / `dispatch.tool` / etc. (PR-C.3 review HIGH-2)
 fn match_completion(line: &str, target_session_id: &str) -> Option<CompletionResult> {
     let value: serde_json::Value = serde_json::from_str(line).ok()?;
     let action = value.get("action").and_then(|v| v.as_str())?;
-    if action != "dispatch.complete" && action != "dispatch complete" {
+    if action != "dispatch complete" && action != "dispatch.complete" {
         return None;
     }
     let session = value.get("session_id").and_then(|v| v.as_str())?;
@@ -1619,8 +1666,11 @@ mod tests {
 
     #[test]
     fn match_completion_matches_canonical_action() {
+        // Canonical form today is "dispatch complete" (space) — every
+        // production emit site uses this. PR-C.3 review HIGH-2 caught
+        // the labels swapped in an earlier draft of this file.
         let line = r#"{
-            "action": "dispatch.complete",
+            "action": "dispatch complete",
             "session_id": "sess-A",
             "payload": {"result_class": "ok", "wall_ms": 12345}
         }"#;
@@ -1631,11 +1681,12 @@ mod tests {
     }
 
     #[test]
-    fn match_completion_matches_legacy_action_with_space() {
-        // Some emit-sites use `dispatch complete` (space, not dot) —
-        // accept both for cross-version compat.
+    fn match_completion_matches_dotted_action_forward_compat() {
+        // Forward-compat for a future emitter migration to the dotted
+        // convention used by `dispatch.turn` / `dispatch.tool` / etc.
+        // No production emit-site uses this today.
         let line = r#"{
-            "action": "dispatch complete",
+            "action": "dispatch.complete",
             "session_id": "sess-B",
             "payload": {"result_class": "error"}
         }"#;
@@ -1647,7 +1698,7 @@ mod tests {
     #[test]
     fn match_completion_rejects_unrelated_session() {
         let line = r#"{
-            "action": "dispatch.complete",
+            "action": "dispatch complete",
             "session_id": "sess-A",
             "payload": {"result_class": "ok"}
         }"#;
@@ -1666,7 +1717,7 @@ mod tests {
     #[test]
     fn match_completion_handles_missing_payload() {
         let line = r#"{
-            "action": "dispatch.complete",
+            "action": "dispatch complete",
             "session_id": "sess-A"
         }"#;
         let result = match_completion(line, "sess-A").expect("matches");
@@ -1678,7 +1729,69 @@ mod tests {
     fn match_completion_ignores_malformed_line() {
         assert!(match_completion("not json", "sess-A").is_none());
         assert!(match_completion("{}", "sess-A").is_none());
-        assert!(match_completion(r#"{"action": "dispatch.complete"}"#, "sess-A").is_none());
+        assert!(match_completion(r#"{"action": "dispatch complete"}"#, "sess-A").is_none());
+    }
+
+    // ─── scan_flow_entries_for_completion (PR-C.3 Redis-poll path) ────
+
+    #[test]
+    fn scan_flow_entries_handles_empty_stream() {
+        // Empty XRANGE response = no entries yet, return None (not an error).
+        let resp = redis::Value::Array(vec![]);
+        let result = scan_flow_entries_for_completion(&resp, "sess-X").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn scan_flow_entries_handles_nil() {
+        // Nil response (some redis-rs versions) — same as empty.
+        let result = scan_flow_entries_for_completion(&redis::Value::Nil, "sess-X").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn scan_flow_entries_finds_completion_for_session() {
+        use redis::Value as V;
+        let record = r#"{
+            "action": "dispatch complete",
+            "session_id": "sess-target",
+            "payload": {"result_class": "ok", "wall_ms": 5000}
+        }"#;
+        // Mock XRANGE response: Array([Array([id, Array([k,v,k,v])])])
+        let resp = V::Array(vec![V::Array(vec![
+            V::BulkString(b"1716192000000-0".to_vec()),
+            V::Array(vec![
+                V::BulkString(b"schema".to_vec()),
+                V::BulkString(b"1.8.0".to_vec()),
+                V::BulkString(b"record".to_vec()),
+                V::BulkString(record.as_bytes().to_vec()),
+            ]),
+        ])]);
+        let result = scan_flow_entries_for_completion(&resp, "sess-target").unwrap();
+        let c = result.expect("matches");
+        assert_eq!(c.session_id, "sess-target");
+        assert_eq!(c.result_class, "ok");
+        assert_eq!(c.wall_ms, Some(5000));
+    }
+
+    #[test]
+    fn scan_flow_entries_skips_non_matching_sessions() {
+        use redis::Value as V;
+        let record_a = r#"{"action":"dispatch complete","session_id":"sess-A","payload":{"result_class":"ok"}}"#;
+        let record_b = r#"{"action":"dispatch start","session_id":"sess-target"}"#;
+        let resp = V::Array(vec![
+            V::Array(vec![
+                V::BulkString(b"1-0".to_vec()),
+                V::Array(vec![V::BulkString(b"record".to_vec()), V::BulkString(record_a.as_bytes().to_vec())]),
+            ]),
+            V::Array(vec![
+                V::BulkString(b"2-0".to_vec()),
+                V::Array(vec![V::BulkString(b"record".to_vec()), V::BulkString(record_b.as_bytes().to_vec())]),
+            ]),
+        ]);
+        let result = scan_flow_entries_for_completion(&resp, "sess-target").unwrap();
+        // No `dispatch complete` for sess-target → None
+        assert!(result.is_none());
     }
 
     // ─── #[serde(deny_unknown_fields)] (PR-C.2) ───────────────────────

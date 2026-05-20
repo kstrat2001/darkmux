@@ -1148,10 +1148,35 @@ fn dispatch_via_queue(opts: DispatchOpts, target_machine: &str) -> Result<Dispat
     use crate::fleet;
 
     // Determine the role's tier requirement (drives the work stream
-    // selection). Roles without an explicit `tier` field default to
-    // "any" — they're acceptable on any machine class.
+    // selection). Roles MUST declare a concrete tier for cross-machine
+    // dispatch — workers register on `darkmux:work:<inference|hub|client>`
+    // streams; a role with `tier: None` would publish to
+    // `darkmux:work:any` which has no consumer and the wait loop would
+    // time out without explanation. Bail loud with operator-actionable
+    // hints. (PR-C.3 review HIGH-1)
     let role = load_role_or_bail(&opts.role_id)?;
-    let role_tier = role.tier.clone().unwrap_or_else(|| "any".to_string());
+    let role_tier = match role.tier.clone() {
+        Some(t) if !t.trim().is_empty() && t != "any" => t,
+        Some(t) => {
+            bail!(
+                "role `{}` has tier={:?} which has no fleet consumer (workers \
+                 register on inference/hub/client streams). Either: (a) edit \
+                 the role manifest to declare a concrete tier, or (b) omit \
+                 --machine to dispatch locally.",
+                opts.role_id, t
+            );
+        }
+        None => {
+            bail!(
+                "role `{}` has no tier declaration in its manifest. \
+                 Cross-machine dispatch requires the role to declare which \
+                 machine class it runs on. Either: (a) add \"tier\": \
+                 \"inference\" (or \"hub\") to the role's JSON manifest, or \
+                 (b) omit --machine to dispatch locally.",
+                opts.role_id
+            );
+        }
+    };
 
     // The Redis URL is required for cross-machine dispatch. If it's
     // unset, the operator hasn't configured the fleet substrate — bail
@@ -1198,7 +1223,8 @@ fn dispatch_via_queue(opts: DispatchOpts, target_machine: &str) -> Result<Dispat
     );
 
     // Open the Redis client lazily here (not at darkmux startup) so the
-    // local-dispatch path doesn't pay any connection cost.
+    // local-dispatch path doesn't pay any connection cost. The same
+    // `raw_url` is reused by `wait_for_completion` below.
     let raw_url = crate::flow::RawRedisUrl::new(redis_url);
     let client = redis::Client::open(raw_url.expose_for_probe())
         .with_context(|| format!("opening Redis client {raw_url} for --machine dispatch"))?;
@@ -1237,7 +1263,7 @@ fn dispatch_via_queue(opts: DispatchOpts, target_machine: &str) -> Result<Dispat
          timeout={}s)…",
         wait_timeout.as_secs()
     );
-    let completion = fleet::wait_for_completion(&session_id, wait_timeout)
+    let completion = fleet::wait_for_completion(&raw_url, &session_id, wait_timeout)
         .context("waiting for remote dispatch completion")?;
 
     eprintln!(
