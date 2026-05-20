@@ -428,6 +428,7 @@ mod tests {
             tool_palette: ToolPalette { allow: vec!["read".to_string(), "edit".to_string()], deny: vec![] },
             escalation_contract: EscalationContract::BailWithExplanation,
             prompt_path: None,
+            tier: None,
         };
         let json = serde_json::to_string(&role).unwrap();
         let back: Role = serde_json::from_str(&json).unwrap();

@@ -58,6 +58,17 @@ pub struct Role {
     /// does NOT read the prompt content — just stores the resolvable path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_path: Option<PathBuf>,
+    /// Hardware-tier requirement for the work this role does. One of
+    /// `"inference"` (heavy-model peer; needs GPU + memory headroom for
+    /// 35B+ specialists), `"hub"` (always-on infrastructure tier; suited
+    /// to 4B admin agents), or `"any"` (no preference; routes to whatever
+    /// machine is available). Absent in older manifests; the loader
+    /// treats absence as `"any"`. Consumed by tier-aware dispatch
+    /// routing (#246 / #247). Schema-compatible with existing role
+    /// manifests — operator-edited roles without `tier` continue to work
+    /// against single-machine fleets unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
 }
 
 /// Which tool operations a role is allowed or denied.

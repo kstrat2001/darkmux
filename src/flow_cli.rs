@@ -228,6 +228,9 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             prev_hash: None,
             hash: None,
             payload: None,
+            machine_tier: None,
+            work_id: None,
+            attempt: None,
         },
         FlowCmd::Catch { text, sprint_id, session_id, source } => FlowRecord {
             ts,
@@ -248,6 +251,9 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             prev_hash: None,
             hash: None,
             payload: None,
+            machine_tier: None,
+            work_id: None,
+            attempt: None,
         },
         FlowCmd::Record {
             level,
@@ -280,6 +286,9 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             prev_hash: None,
             hash: None,
             payload: None,
+            machine_tier: None,
+            work_id: None,
+            attempt: None,
         },
         FlowCmd::TierDecision {
             decision,
@@ -315,6 +324,9 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             prev_hash: None,
             hash: None,
             payload: None,
+            machine_tier: None,
+            work_id: None,
+            attempt: None,
         },
         // Read verbs are intercepted by `run` before build_record.
         // Reaching here would mean run() was bypassed; assert loudly.
