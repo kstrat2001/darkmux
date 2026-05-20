@@ -26,6 +26,7 @@ use crate::crew::dispatch::DispatchOpts;
 use crate::crew::loader::{load_role_prompt, load_roles};
 use anyhow::{anyhow, bail, Context, Result};
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -101,35 +102,38 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     //    the dispatch did).
     let workspace = match opts.workdir.as_deref() {
         Some(custom) => {
-            // Symlink-escape guard (#227). canonicalize() follows all
-            // symlinks and resolves .. to the real absolute path. absolute()
-            // resolves .. lexically without following symlinks. If they
-            // differ, the operator-supplied path traverses a symlink —
-            // bail rather than silently mounting an unintended directory
-            // inside the container (e.g. ~/.ssh, /etc, ~/.darkmux/audit/).
+            // Symlink-escape guard (#227 + #232). Walk each operator-typed
+            // component and bail if any is a symlink — except for known
+            // macOS firmlinks (/tmp, /var, /etc) which operators traverse
+            // routinely without realizing they're symlinks.
+            //
+            // Scope (#232 Issue 2): symlink-only. `..`-traversal paths
+            // like /tmp/safe/../../../etc are operator-explicit (typed
+            // intentionally) and out of scope — the original threat was
+            // an operator surprised by indirection, not by their own
+            // deliberate path arithmetic.
+            //
+            // Why the component-walk over canonicalize-vs-absolute (PR
+            // #228 / the canonical-to-canonical pattern proposed in #232):
+            // both .canonicalize() calls resolve all symlinks including
+            // user-named leaf symlinks, so they always agree on simple
+            // path/symlink cases — the comparison silently passes the
+            // attack from #227 back through.
+            if let Some(offending) = first_user_symlink_in(custom)
+                .with_context(|| format!("checking --workdir for symlinks: {}", custom.display()))?
+            {
+                bail!(
+                    "--workdir traverses an operator-named symlink at {} — refusing to follow.\n  \
+                     Use the real directory path directly to prevent unintended container r/w.",
+                    offending.display()
+                );
+            }
             let resolved = custom.canonicalize().with_context(|| {
                 format!(
                     "--workdir path does not exist or cannot be resolved: {}",
                     custom.display()
                 )
             })?;
-            let no_symlink = std::path::absolute(custom)
-                .unwrap_or_else(|_| custom.to_path_buf());
-            if resolved != no_symlink {
-                eprintln!(
-                    "darkmux crew dispatch: [!] --workdir symlink detected: {} → {}",
-                    custom.display(),
-                    resolved.display()
-                );
-                bail!(
-                    "--workdir resolves through a symlink:\n  \
-                     input:    {}\n  \
-                     resolved: {}\n  \
-                     Use the real directory path directly to prevent unintended container r/w.",
-                    custom.display(),
-                    resolved.display()
-                );
-            }
             if !resolved.is_dir() {
                 bail!(
                     "--workdir path is not a directory: {}",
@@ -402,4 +406,159 @@ fn probe_loaded_model() -> Result<String> {
         .and_then(|m| m["id"].as_str())
         .map(String::from)
         .ok_or_else(|| anyhow!("LMStudio /v1/models returned no models"))
+}
+
+/// Walk each component of an operator-typed `--workdir` path and return
+/// the first symlink encountered that ISN'T a known macOS system
+/// firmlink. Returns `Ok(None)` when no operator-named symlink is
+/// present along the path. Returns the offending accumulated path so
+/// the caller can name it in the error message. (#232)
+///
+/// The walk stops short (with `Ok(None)`) when a component doesn't
+/// exist — the subsequent canonicalize() will surface that as the
+/// canonical "does not exist" error.
+pub(crate) fn first_user_symlink_in(path: &Path) -> std::io::Result<Option<PathBuf>> {
+    let mut acc = PathBuf::new();
+    for component in path.components() {
+        acc.push(component);
+        let meta = match std::fs::symlink_metadata(&acc) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if meta.file_type().is_symlink() && !is_macos_firmlink(&acc) {
+            return Ok(Some(acc));
+        }
+    }
+    Ok(None)
+}
+
+/// True for the macOS top-level firmlinks operators routinely traverse
+/// without thinking. Deliberately narrow: only the three that real
+/// `--workdir` paths cross (`/tmp`, `/var`, `/etc`). Other macOS
+/// firmlinks (`/Applications`, `/Library`, `/Users`, `/Volumes`, ...)
+/// aren't typical workdir destinations; if an operator hits one, the
+/// bail is correct behavior. On Linux those paths are real
+/// directories, so this never trips. (#232)
+pub(crate) fn is_macos_firmlink(p: &Path) -> bool {
+    matches!(p.to_str(), Some("/tmp" | "/var" | "/etc"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+    use tempfile::TempDir;
+
+    // ─── first_user_symlink_in / is_macos_firmlink (#232) ─────────────
+
+    #[test]
+    fn first_user_symlink_in_returns_none_for_real_path() {
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let result = first_user_symlink_in(&real).unwrap();
+        assert!(result.is_none(), "non-symlink path must pass");
+    }
+
+    #[test]
+    fn first_user_symlink_in_detects_leaf_symlink() {
+        // The original #227 attack vector: a user-named symlink as the
+        // last component of the path. Must be caught.
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let sym = tmp.path().join("evilsym");
+        symlink(&target, &sym).unwrap();
+
+        let result = first_user_symlink_in(&sym).unwrap();
+        assert_eq!(result, Some(sym), "leaf symlink must be detected");
+    }
+
+    #[test]
+    fn first_user_symlink_in_detects_middle_component_symlink() {
+        // A middle-of-path symlink — also catchable.
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::create_dir(real.join("child")).unwrap();
+        let sym = tmp.path().join("sym");
+        symlink(&real, &sym).unwrap();
+        let probe = sym.join("child");
+
+        let result = first_user_symlink_in(&probe).unwrap();
+        assert_eq!(result, Some(sym), "middle-component symlink must be detected");
+    }
+
+    #[test]
+    fn first_user_symlink_in_returns_none_when_path_does_not_exist() {
+        // canonicalize() will surface the not-exists error; the symlink
+        // check should not pre-empt it with a spurious result.
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        let result = first_user_symlink_in(&missing).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn first_user_symlink_in_tolerates_macos_tmp_firmlink() {
+        // `/tmp/<real-dir>` traverses the macOS firmlink `/tmp` →
+        // `/private/tmp`. The check must NOT bail on this. (#232 Issue 1)
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_micros();
+        let path = std::path::PathBuf::from(format!("/tmp/dm_firmlink_test_{unique}"));
+        std::fs::create_dir(&path).unwrap();
+        let result = first_user_symlink_in(&path);
+        let _ = std::fs::remove_dir(&path);
+        assert!(
+            result.unwrap().is_none(),
+            "/tmp/foo must not trip on macOS firmlink"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn first_user_symlink_in_still_catches_user_symlink_under_tmp() {
+        // A user-named symlink one level under /tmp must still be caught
+        // even though /tmp itself is a tolerated firmlink. (#232 Issue 1
+        // can't be paid for by reopening #227 — both have to hold.)
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_micros();
+        let target = std::path::PathBuf::from(format!("/tmp/dm_target_{unique}"));
+        let sym = std::path::PathBuf::from(format!("/tmp/dm_sym_{unique}"));
+        std::fs::create_dir(&target).unwrap();
+        symlink(&target, &sym).unwrap();
+
+        let result = first_user_symlink_in(&sym);
+        let _ = std::fs::remove_file(&sym);
+        let _ = std::fs::remove_dir(&target);
+
+        let offending = result.unwrap().expect("user symlink under /tmp must still be caught");
+        // The matched component is the symlink itself (under either /tmp
+        // or its resolved canonical /private/tmp).
+        assert!(
+            offending.to_string_lossy().contains(&format!("dm_sym_{unique}")),
+            "expected sym in offending path; got {offending:?}"
+        );
+    }
+
+    #[test]
+    fn is_macos_firmlink_allowlist_is_narrow() {
+        assert!(is_macos_firmlink(Path::new("/tmp")));
+        assert!(is_macos_firmlink(Path::new("/var")));
+        assert!(is_macos_firmlink(Path::new("/etc")));
+        // Subpaths under firmlinks are NOT tolerated — only the anchors.
+        assert!(!is_macos_firmlink(Path::new("/tmp/sub")));
+        assert!(!is_macos_firmlink(Path::new("/var/log")));
+        assert!(!is_macos_firmlink(Path::new("/")));
+        assert!(!is_macos_firmlink(Path::new("/home")));
+        assert!(!is_macos_firmlink(Path::new("/Users")));
+    }
 }
