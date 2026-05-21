@@ -221,7 +221,8 @@ fn require_licensed_adjacent_ack(role_id: &str) -> Result<()> {
 /// and `dispatch_internal.rs`). Behind the `--runtime internal` flag
 /// while the in-house runtime is being measured against openclaw;
 /// promotion to default is a separate hardening decision.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Runtime {
     #[default]
     Openclaw,
@@ -229,6 +230,11 @@ pub enum Runtime {
 }
 
 impl Runtime {
+    /// String parse for CLI-flag plumbing (`--runtime <name>`). The
+    /// queue boundary uses `serde::Deserialize` directly — a mistyped
+    /// runtime on a WorkJob is rejected at JSON parse time rather than
+    /// in `validate()`, which is what Wave-E.14 lifted into the type
+    /// (#255 / PR-C.1 code-reviewer MEDIUM).
     pub fn parse(s: &str) -> Result<Self> {
         match s {
             "openclaw" => Ok(Runtime::Openclaw),
@@ -1216,10 +1222,6 @@ fn dispatch_via_queue(opts: DispatchOpts, target_machine: &str) -> Result<Dispat
     // Build the WorkJob from DispatchOpts. The shape mirrors what the
     // worker side reconstructs via `WorkJob::into_dispatch_opts` —
     // round-trip parity matters for cross-machine dispatch.
-    let runtime_str = match opts.runtime {
-        Runtime::Openclaw => "openclaw",
-        Runtime::Internal => "internal",
-    };
     let job = fleet::build_work_job(
         role_tier,
         Some(target_machine.to_string()),
@@ -1229,7 +1231,7 @@ fn dispatch_via_queue(opts: DispatchOpts, target_machine: &str) -> Result<Dispat
         opts.deliver.clone(),
         opts.workdir.as_ref().map(|p| p.display().to_string()),
         opts.sprint_id.clone(),
-        runtime_str.to_string(),
+        opts.runtime,
         opts.timeout_seconds,
         crate::flow::resolve_machine_id(),
         crate::flow::resolve_orchestrator(),
