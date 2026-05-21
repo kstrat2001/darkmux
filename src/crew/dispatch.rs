@@ -876,15 +876,33 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
                      If you intended a local dispatch, set DARKMUX_MACHINE_ID to make \
                      tier-routing decisions deterministic."
                 );
-                return dispatch_via_queue(opts, &target);
+                return dispatch_via_queue(opts, Some(&target));
             }
             RoutingDecision::Remote { target, local_unknown: false } => {
-                return dispatch_via_queue(opts, &target);
+                return dispatch_via_queue(opts, Some(&target));
             }
             RoutingDecision::Local { matches_was_explicit: false } => {
                 // Unreachable in this branch (we matched Some(target) above)
                 // — but the enum's total shape covers it.
             }
+        }
+    } else {
+        // #247 PR-B — auto-route by tier when no explicit --machine.
+        // If the role's tier doesn't match the local machine's tier
+        // AND the fleet has a peer in the role's tier, publish to
+        // the tier-stream and let the consumer group claim. The
+        // worker that picks it up does its own preflight — we skip
+        // the local one (same shape as the explicit --machine path
+        // above).
+        if let Some(auto_target_tier) = auto_route_target_tier(&opts)? {
+            eprintln!(
+                "darkmux crew dispatch: auto-routing role=`{}` via tier=`{}` \
+                 (local tier=`{}`, no --machine — consumer group claims).",
+                opts.role_id,
+                auto_target_tier,
+                crate::flow::resolve_machine_tier().unwrap_or_else(|| "<unknown>".into()),
+            );
+            return dispatch_via_queue(opts, None);
         }
     }
 
@@ -1163,7 +1181,12 @@ fn extract_payload_text(stdout: &str) -> Option<String> {
 /// `crew dispatch`), blocks on the worker's `dispatch.complete` flow
 /// record before returning; otherwise returns immediately with a
 /// fire-and-forget synthetic result.
-fn dispatch_via_queue(opts: DispatchOpts, target_machine: &str) -> Result<DispatchResult> {
+/// `target_machine: Some(id)` stamps the WorkJob's hint field so the
+/// audit trail and topology view see the operator-pinned target.
+/// `None` is the auto-route case (#247 PR-B) — the role's tier
+/// alone drives the work-stream choice; consumer-group claim picks
+/// whichever matching-tier worker is free first.
+fn dispatch_via_queue(opts: DispatchOpts, target_machine: Option<&str>) -> Result<DispatchResult> {
     use crate::fleet;
 
     // Determine the role's tier requirement (drives the work stream
@@ -1205,10 +1228,16 @@ fn dispatch_via_queue(opts: DispatchOpts, target_machine: &str) -> Result<Dispat
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
+            let context = match target_machine {
+                Some(m) => format!("--machine={m}"),
+                None => format!(
+                    "cross-tier auto-route (local tier != role tier=`{role_tier}`)"
+                ),
+            };
             anyhow!(
-                "--machine={target_machine} requires DARKMUX_REDIS_URL to be set \
+                "{context} requires DARKMUX_REDIS_URL to be set \
                  (the fleet work queue lives on Redis). \
-                 Single-machine fleets shouldn't pass --machine."
+                 Single-machine fleets shouldn't dispatch cross-tier."
             )
         })?;
 
@@ -1224,7 +1253,7 @@ fn dispatch_via_queue(opts: DispatchOpts, target_machine: &str) -> Result<Dispat
     // round-trip parity matters for cross-machine dispatch.
     let job = fleet::build_work_job(
         role_tier,
-        Some(target_machine.to_string()),
+        target_machine.map(|s| s.to_string()),
         opts.role_id.clone(),
         opts.message.clone(),
         session_id.clone(),
@@ -1251,8 +1280,9 @@ fn dispatch_via_queue(opts: DispatchOpts, target_machine: &str) -> Result<Dispat
 
     eprintln!(
         "darkmux crew dispatch: published work_id={work_id} tier={} \
-         target_machine={target_machine} session={session_id}",
-        job.target_tier
+         target_machine={} session={session_id}",
+        job.target_tier,
+        target_machine.unwrap_or("<auto-route>"),
     );
 
     if !opts.wait {
@@ -1330,6 +1360,55 @@ pub enum RoutingDecision {
 /// - `(Some(t), Some(l))` where `t != l` → Remote (normal cross-machine)
 /// - `(Some(t), None)` → Remote with `local_unknown=true` (operator-
 ///   visible warning; PR-C.3 review MEDIUM)
+///
+/// Decide whether the dispatch should auto-route via the work queue
+/// because the role's declared tier doesn't match the local machine's
+/// tier. Returns:
+/// - `Ok(None)` — dispatch locally (role.tier ∈ {None, "any"}, OR
+///   role.tier == local tier, OR auto-route would be pointless)
+/// - `Ok(Some(role_tier))` — fleet has a peer in `role_tier`; publish
+///   via queue. Caller (dispatch entry) emits the banner and calls
+///   `dispatch_via_queue(opts, None)`.
+/// - `Err(_)` — role.tier doesn't match local AND no fleet peer
+///   matches; bail loud with operator-actionable hint pointing at
+///   `darkmux fleet add`. (#247 PR-B)
+fn auto_route_target_tier(opts: &DispatchOpts) -> Result<Option<String>> {
+    let role = load_role_or_bail(&opts.role_id)?;
+    let role_tier = match role.tier.as_deref().map(str::trim) {
+        Some("") | Some("any") | None => return Ok(None), // local
+        Some(t) => t.to_string(),
+    };
+    let local_tier = crate::flow::resolve_machine_tier();
+    if local_tier.as_deref() == Some(role_tier.as_str()) {
+        // Local matches role's tier — dispatch locally; no queue cost.
+        return Ok(None);
+    }
+    // Tier mismatch — consult the fleet roster.
+    let roster = match crate::fleet::load_roster() {
+        Ok(r) => r,
+        Err(e) => bail!(
+            "role `{}` requires tier=`{role_tier}` (local tier=`{}`) but the fleet \
+             roster couldn't be loaded: {e}. Run `darkmux fleet status` to inspect.",
+            opts.role_id,
+            local_tier.as_deref().unwrap_or("<unset>"),
+        ),
+    };
+    let candidates = crate::fleet::candidates_for_tier(&roster, &role_tier);
+    if candidates.is_empty() {
+        bail!(
+            "role `{}` requires tier=`{role_tier}` but no fleet peer is in that \
+             tier (local tier=`{}`). Either: \
+             (a) add a peer with `darkmux fleet add <id> --tier {role_tier} --address <addr>`, \
+             or (b) edit the role manifest to declare `tier: \"{}\"` if this work belongs \
+             on the local machine.",
+            opts.role_id,
+            local_tier.as_deref().unwrap_or("<unset>"),
+            local_tier.as_deref().unwrap_or("any"),
+        );
+    }
+    Ok(Some(role_tier))
+}
+
 pub fn routing_decision(
     machine: Option<&str>,
     local_machine_id: Option<&str>,
