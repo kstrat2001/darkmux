@@ -1774,6 +1774,19 @@ fn is_executable(p: &std::path::Path) -> bool {
     }
 }
 
+/// Shim exposing `read_reclaimable_gb` to other modules — kept narrow
+/// (just the GB count, no doctor framing) so `serve` can read RAM
+/// headroom for /machine/specs without depending on the doctor's
+/// classify-into-status flow. (#275)
+pub(crate) fn reclaimable_gb_for_specs() -> Option<u64> {
+    read_reclaimable_gb()
+}
+
+/// Same shim shape for the safety-margin constant — exposes the
+/// doctor's per-machine reserve so callers compute the same
+/// real-headroom expression. (#275)
+pub(crate) const RAM_SAFETY_MARGIN_GB_FOR_SPECS: u64 = RAM_SAFETY_MARGIN_GB;
+
 fn read_reclaimable_gb() -> Option<u64> {
     let out = Command::new("vm_stat").output().ok()?;
     if !out.status.success() {

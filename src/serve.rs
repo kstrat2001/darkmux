@@ -49,6 +49,7 @@ pub fn build_router(flows_dir: PathBuf) -> Router {
         .route("/flow/:date/stream", get(flow_stream_handler))
         .route("/flow-status", get(flow_status_handler))
         .route("/model/status", get(model_status_handler))
+        .route("/machine/specs", get(machine_specs_handler))
         .route("/missions", get(missions_handler))
         .route("/sprints", get(sprints_handler))
         .layer(local_only_cors())
@@ -418,6 +419,157 @@ async fn model_status_handler() -> axum::Json<serde_json::Value> {
         "lms_unreachable": unreachable,
         "generated_at_ms": generated_at_ms,
     }))
+}
+
+/// GET /machine/specs — local-machine spec sheet for `darkmux fleet
+/// status --deep` aggregation. Composes:
+/// - identity (machine_id, machine_tier from env)
+/// - hardware (ram_total_bytes, ram_free_for_ai_bytes, cpu_brand, os)
+/// - software (darkmux_version, flow_schema_version)
+/// - state (loaded_models from lms ps; redacted Redis URL from env)
+///
+/// All fields are best-effort: a missing sysctl, an unreachable `lms`,
+/// or an unset env var degrades to `null` (or `[]` / `0` for typed
+/// fields) rather than 500-ing. This is the contract `fleet status
+/// --deep` relies on — degraded state is a visible cell, not a failed
+/// command. (#275 PR-A)
+async fn machine_specs_handler() -> axum::Json<serde_json::Value> {
+    // Shell-out probes run in spawn_blocking so the async runtime stays
+    // responsive. Each result is independent — one failure doesn't
+    // cascade.
+    let lms_result = tokio::task::spawn_blocking(crate::lms::list_loaded).await;
+    let (loaded_models, lms_unreachable) = match lms_result {
+        Ok(Ok(m)) => (m, false),
+        _ => (Vec::new(), true),
+    };
+    let ram_total = tokio::task::spawn_blocking(read_ram_total_bytes)
+        .await
+        .ok()
+        .flatten();
+    let ram_free = tokio::task::spawn_blocking(read_ram_free_for_ai_bytes)
+        .await
+        .ok()
+        .flatten();
+    let cpu_brand = tokio::task::spawn_blocking(read_cpu_brand)
+        .await
+        .ok()
+        .flatten();
+
+    let machine_id = crate::flow::resolve_machine_id();
+    let machine_tier = crate::flow::resolve_machine_tier();
+    let redis_url_redacted = std::env::var("DARKMUX_REDIS_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(|raw| crate::flow::redact_url_creds(&raw));
+
+    let generated_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    axum::Json(serde_json::json!({
+        "darkmux_version": env!("CARGO_PKG_VERSION"),
+        "flow_schema_version": crate::flow::FLOW_SCHEMA_VERSION,
+        "machine_id": machine_id,
+        "machine_tier": machine_tier,
+        "os": format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
+        "ram_total_bytes": ram_total,
+        "ram_free_for_ai_bytes": ram_free,
+        "cpu_brand": cpu_brand,
+        "loaded_models": loaded_models,
+        "lms_unreachable": lms_unreachable,
+        "redis_url_redacted": redis_url_redacted,
+        "generated_at_ms": generated_at_ms,
+    }))
+}
+
+/// Read total system RAM in bytes. macOS uses `sysctl hw.memsize` which
+/// returns the raw byte count. Linux reads `/proc/meminfo`'s
+/// `MemTotal` line. Other platforms return `None`. Sync — wrap in
+/// `spawn_blocking` for async contexts.
+fn read_ram_total_bytes() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("MemTotal:") {
+                let kb: u64 = rest
+                    .trim()
+                    .trim_end_matches(" kB")
+                    .trim()
+                    .parse()
+                    .ok()?;
+                return Some(kb.saturating_mul(1024));
+            }
+        }
+        None
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
+}
+
+/// Read the AI-available RAM ceiling in bytes — the same "real
+/// headroom" doctor reports, expressed in bytes for JSON precision.
+/// Wraps doctor's existing `reclaimable + resident − safety_margin`
+/// computation. Returns `None` on non-macOS (today's doctor is
+/// macOS-shaped).
+fn read_ram_free_for_ai_bytes() -> Option<u64> {
+    let gb = crate::doctor::reclaimable_gb_for_specs()?;
+    let resident_gb = crate::lms::list_loaded()
+        .ok()
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|m| crate::eureka::parse_size_gb(&m.size))
+                .sum::<f64>()
+        })
+        .unwrap_or(0.0);
+    let safety_gb = crate::doctor::RAM_SAFETY_MARGIN_GB_FOR_SPECS as f64;
+    let real_gb = (gb as f64) + resident_gb - safety_gb;
+    if real_gb < 0.0 {
+        return Some(0);
+    }
+    let bytes = (real_gb * 1024.0 * 1024.0 * 1024.0).round() as u64;
+    Some(bytes)
+}
+
+/// Read the CPU brand string. macOS: `sysctl machdep.cpu.brand_string`
+/// (e.g. `"Apple M5 Max"`). Other platforms return `None`. Sync — wrap
+/// in `spawn_blocking` for async contexts.
+fn read_cpu_brand() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("sysctl")
+            .args(["-n", "machdep.cpu.brand_string"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
 }
 
 /// GET /flow/:date/stream — SSE-tails new flow records for a UTC day.
@@ -1066,6 +1218,147 @@ mod tests {
         // wide check, just to ensure it's actually populated.
         assert!(generated > 1_700_000_000_000);
         assert!(generated < 4_000_000_000_000);
+    }
+
+    // ─── #275 PR-A: /machine/specs endpoint ──────────────────────────
+
+    /// GET /machine/specs returns a JSON object with the local machine's
+    /// versioned spec sheet — version + machine_id/tier + RAM + CPU + OS
+    /// + loaded models + redacted Redis URL. Tested at the contract level
+    /// rather than the value level so the test doesn't depend on the
+    /// machine actually running it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn machine_specs_endpoint_returns_versioned_payload() {
+        // Defensive — make sure no env from another test bleeds in.
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::remove_var("DARKMUX_MACHINE_ID");
+            std::env::remove_var("DARKMUX_MACHINE_TIER");
+        }
+        let app = build_router(PathBuf::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/machine/specs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "expected 200 from /machine/specs");
+
+        let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON body");
+        // Top-level contract — fields are present (values may be null on
+        // non-macOS / missing-lms runners, but the keys must exist).
+        for key in [
+            "darkmux_version",
+            "flow_schema_version",
+            "machine_id",
+            "machine_tier",
+            "os",
+            "ram_total_bytes",
+            "ram_free_for_ai_bytes",
+            "cpu_brand",
+            "loaded_models",
+            "redis_url_redacted",
+            "generated_at_ms",
+        ] {
+            assert!(
+                json.get(key).is_some(),
+                "/machine/specs response missing key `{key}`: {json}"
+            );
+        }
+        // `darkmux_version` must equal the build's CARGO_PKG_VERSION.
+        assert_eq!(
+            json["darkmux_version"].as_str(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        // `loaded_models` is an array even when lms is unreachable.
+        assert!(json["loaded_models"].is_array());
+    }
+
+    /// /machine/specs MUST redact the Redis URL's password. Wide-open
+    /// redaction is already in place via `flow::RawRedisUrl` (#216); this
+    /// test pins that the new endpoint doesn't bypass it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn machine_specs_endpoint_redacts_redis_password() {
+        unsafe {
+            std::env::set_var("DARKMUX_REDIS_URL", "redis://user:s3cr3t-p4ss@example.com:6379");
+        }
+        let app = build_router(PathBuf::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/machine/specs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        unsafe { std::env::remove_var("DARKMUX_REDIS_URL"); }
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body_str = String::from_utf8_lossy(&bytes).into_owned();
+        // The literal password must NOT appear anywhere in the body.
+        assert!(
+            !body_str.contains("s3cr3t-p4ss"),
+            "Redis password leaked through /machine/specs: {body_str}"
+        );
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let redacted = json["redis_url_redacted"]
+            .as_str()
+            .expect("redis_url_redacted must be a string when DARKMUX_REDIS_URL is set");
+        // Sanity: redaction surface should mention example.com (it's the
+        // host, not the secret) so the operator can confirm WHICH Redis
+        // is being targeted without exposing creds.
+        assert!(
+            redacted.contains("example.com"),
+            "redacted form should keep the host visible: {redacted}"
+        );
+    }
+
+    /// /machine/specs reports operator-stamped provenance — `machine_id`
+    /// from `DARKMUX_MACHINE_ID` (default: hostname) and `machine_tier`
+    /// from `DARKMUX_MACHINE_TIER` (no default — surfaces `null` when
+    /// unset, which is the contract `flow::resolve_machine_tier` uses).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn machine_specs_endpoint_reports_machine_id_and_tier_from_env() {
+        unsafe {
+            std::env::set_var("DARKMUX_MACHINE_ID", "test-laptop");
+            std::env::set_var("DARKMUX_MACHINE_TIER", "inference");
+        }
+        let app = build_router(PathBuf::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/machine/specs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        unsafe {
+            std::env::remove_var("DARKMUX_MACHINE_ID");
+            std::env::remove_var("DARKMUX_MACHINE_TIER");
+        }
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            json["machine_id"].as_str(),
+            Some("test-laptop"),
+            "machine_id env not surfaced: {json}"
+        );
+        assert_eq!(
+            json["machine_tier"].as_str(),
+            Some("inference"),
+            "machine_tier env not surfaced: {json}"
+        );
     }
 
     #[tokio::test]
