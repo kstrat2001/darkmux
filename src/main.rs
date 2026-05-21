@@ -658,11 +658,19 @@ enum FleetCmd {
     },
     /// Print the fleet roster + per-machine reachability. Each machine
     /// gets a TCP-probe to its daemon port (300ms budget per probe).
-    /// `--json` for scripting; default is a table for operator eyes.
+    /// `--deep` additionally fetches each reachable peer's spec sheet
+    /// (RAM, CPU, loaded models, darkmux version) via the daemon's
+    /// `/machine/specs` endpoint (#275). `--json` for scripting;
+    /// default is a table for operator eyes.
     Status {
         /// Emit JSON instead of the human-readable table.
         #[arg(long)]
         json: bool,
+        /// Aggregate `/machine/specs` from each reachable peer in
+        /// addition to the reachability probe. Adds one HTTP GET per
+        /// peer (~hundreds of ms over a tailnet).
+        #[arg(long)]
+        deep: bool,
     },
 }
 
@@ -1635,7 +1643,7 @@ fn cmd_fleet(sub: FleetCmd) -> Result<i32> {
             cmd_fleet_add(&id, &tier, &address, description.as_deref())
         }
         FleetCmd::Remove { id } => cmd_fleet_remove(&id),
-        FleetCmd::Status { json } => cmd_fleet_status(json),
+        FleetCmd::Status { json, deep } => cmd_fleet_status(json, deep),
     }
 }
 
@@ -1674,7 +1682,7 @@ fn cmd_fleet_remove(id: &str) -> Result<i32> {
     }
 }
 
-fn cmd_fleet_status(emit_json: bool) -> Result<i32> {
+fn cmd_fleet_status(emit_json: bool, deep: bool) -> Result<i32> {
     let roster = fleet::load_roster()?;
 
     // Probe each machine's reachability (TCP connect to its daemon port).
@@ -1688,6 +1696,26 @@ fn cmd_fleet_status(emit_json: bool) -> Result<i32> {
             (m.clone(), probe)
         })
         .collect();
+
+    // When --deep, fetch /machine/specs from each reachable peer. One
+    // HTTP GET per peer; ~1s budget each. Failures are surfaced per-row
+    // (Some(None) in the resolved vector) — they MUST NOT fail the
+    // whole command. (#275 PR-B)
+    let specs_by_id: std::collections::BTreeMap<String, Option<serde_json::Value>> = if deep {
+        probes
+            .iter()
+            .map(|(m, p)| {
+                let value = if p.reachable {
+                    fetch_machine_specs(&m.address)
+                } else {
+                    None
+                };
+                (m.id.clone(), value)
+            })
+            .collect()
+    } else {
+        std::collections::BTreeMap::new()
+    };
 
     if emit_json {
         let local_tier = flow::resolve_machine_tier();
@@ -1709,6 +1737,9 @@ fn cmd_fleet_status(emit_json: bool) -> Result<i32> {
                     "resolved_address": p.resolved_address,
                     "probe_ms": p.elapsed_ms,
                     "probe_error": p.error,
+                    // Only present when --deep was passed; null when
+                    // --deep was passed but the fetch failed.
+                    "specs": specs_by_id.get(&m.id).cloned().flatten().unwrap_or(serde_json::Value::Null),
                 }))
                 .collect::<Vec<_>>(),
         });
@@ -1728,26 +1759,114 @@ fn cmd_fleet_status(emit_json: bool) -> Result<i32> {
         println!("Add a peer: darkmux fleet add <id> --tier <inference|hub|client> --address <tailnet-addr>");
         return Ok(0);
     }
-    println!(
-        "{:<14} {:<10} {:<26} {:<10} DESCRIPTION",
-        "MACHINE", "TIER", "ADDRESS", "PROBE"
-    );
+    if deep {
+        println!(
+            "{:<14} {:<10} {:<22} {:<10} {:<11} {:<10} VERSION  MODELS",
+            "MACHINE", "TIER", "ADDRESS", "PROBE", "RAM-FREE", "OS"
+        );
+    } else {
+        println!(
+            "{:<14} {:<10} {:<26} {:<10} DESCRIPTION",
+            "MACHINE", "TIER", "ADDRESS", "PROBE"
+        );
+    }
     for (m, p) in &probes {
         let status = if p.reachable {
             format!("✓ {}ms", p.elapsed_ms)
         } else {
             format!("✗ {}ms", p.elapsed_ms)
         };
-        let desc = m.description.as_deref().unwrap_or("");
-        println!(
-            "{:<14} {:<10} {:<26} {:<10} {}",
-            m.id, m.tier, m.address, status, desc
-        );
+        if deep {
+            let specs = specs_by_id.get(&m.id).cloned().unwrap_or(None);
+            let (ram_free, os_str, version, models_summary) = match &specs {
+                Some(s) => {
+                    let ram = s
+                        .get("ram_free_for_ai_bytes")
+                        .and_then(|v| v.as_u64())
+                        .map(human_gb)
+                        .unwrap_or_else(|| "—".into());
+                    let os = s
+                        .get("os")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("—")
+                        .to_string();
+                    let v = s
+                        .get("darkmux_version")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("—")
+                        .to_string();
+                    let models = s
+                        .get("loaded_models")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|m| {
+                                    m.get("identifier").and_then(|i| i.as_str())
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .unwrap_or_else(|| "—".into());
+                    (ram, os, v, if models.is_empty() { "—".into() } else { models })
+                }
+                None => (
+                    "specs?".into(),
+                    "—".into(),
+                    "—".into(),
+                    "—".into(),
+                ),
+            };
+            println!(
+                "{:<14} {:<10} {:<22} {:<10} {:<11} {:<10} {:<8} {}",
+                m.id, m.tier, m.address, status, ram_free, os_str, version, models_summary
+            );
+        } else {
+            let desc = m.description.as_deref().unwrap_or("");
+            println!(
+                "{:<14} {:<10} {:<26} {:<10} {}",
+                m.id, m.tier, m.address, status, desc
+            );
+        }
         if let Some(err) = &p.error {
             println!("               error: {err}");
         }
     }
     Ok(0)
+}
+
+/// Fetch `/machine/specs` from a peer's daemon at `address`. Returns
+/// `None` if the URL can't be parsed, the HTTP request fails (timeout,
+/// connection refused, non-200), or the body isn't valid JSON. Bounded
+/// at 1s total — the operator gets a row per peer even when one is
+/// slow or wedged. (#275 PR-B)
+fn fetch_machine_specs(address: &str) -> Option<serde_json::Value> {
+    let normalized = if address.contains("://") {
+        address.to_string()
+    } else if address.contains(':') {
+        format!("http://{address}")
+    } else {
+        format!(
+            "http://{address}:{}",
+            crate::serve::DEFAULT_DAEMON_ADDR
+                .split(':')
+                .nth(1)
+                .unwrap_or("8765")
+        )
+    };
+    let url = format!("{normalized}/machine/specs");
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_millis(1000))
+        .build();
+    let body = agent.get(&url).call().ok()?.into_string().ok()?;
+    serde_json::from_str(&body).ok()
+}
+
+/// Format a byte count as a human-friendly "N GB" string for the
+/// `fleet status --deep` table. Round to whole GB — the precision the
+/// `RAM-FREE` column wants. (#275 PR-B)
+fn human_gb(bytes: u64) -> String {
+    let gb = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    format!("{:.0} GB", gb.round())
 }
 
 fn cmd_crew(sub: CrewCmd) -> Result<i32> {
