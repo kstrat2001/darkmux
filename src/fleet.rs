@@ -214,12 +214,19 @@ where
     }
 }
 
-/// Write the roster to disk via atomic rename — write to `.tmp`, then
-/// rename over the target. Prevents partial-write corruption if darkmux
-/// is killed mid-save. On POSIX, the file is created with mode `0o600`
-/// (Wave-E.11 / PR-B review): machine addresses, tier assignments, and
-/// any future bearer-token fields stay owner-only even under a permissive
-/// user umask.
+/// Write the roster to disk via durable atomic rename:
+///   1. serialize roster to JSON
+///   2. write to `<roster>.tmp` with mode `0o600` (Wave-E.11)
+///   3. `fsync(2)` the tmp file so contents reach stable storage
+///   4. `rename(2)` the tmp onto the target path (atomic on POSIX)
+///   5. `fsync(2)` the parent directory so the rename itself reaches
+///      stable storage
+///
+/// Steps 3 and 5 are the durability legs the doc comment previously
+/// claimed but the code skipped (PR-B M-2 / Wave-E.13 #255). Without
+/// them, a power failure between the rename and the next dirty-page
+/// flush could leave the directory entry pointing at an old inode or
+/// at no inode at all.
 ///
 /// **Cross-process concurrency:** prefer `mutate_roster` for any
 /// load-modify-save cycle. Direct `save_roster` callers must hold their
@@ -228,7 +235,8 @@ where
 /// two parallel `save_roster` calls race on the shared `.tmp` path.
 pub fn save_roster(roster: &FleetRoster) -> Result<()> {
     let path = roster_path();
-    if let Some(parent) = path.parent() {
+    let parent = path.parent().map(|p| p.to_path_buf());
+    if let Some(parent) = parent.as_ref() {
         fs::create_dir_all(parent)
             .with_context(|| format!("creating fleet roster directory {}", parent.display()))?;
     }
@@ -240,12 +248,17 @@ pub fn save_roster(roster: &FleetRoster) -> Result<()> {
         .with_context(|| format!("writing fleet roster temp file {}", tmp.display()))?;
     fs::rename(&tmp, &path)
         .with_context(|| format!("atomic-renaming {} → {}", tmp.display(), path.display()))?;
+    if let Some(parent) = parent {
+        fsync_dir(&parent)
+            .with_context(|| format!("fsync parent directory {}", parent.display()))?;
+    }
     Ok(())
 }
 
 /// Write `bytes` to `path` with mode `0o600` on POSIX (owner read/write
-/// only). Wave-E.11 — keeps roster data off group/other readability
-/// even when the user's umask is `0o022`.
+/// only) AND `fsync(2)` the file before the handle drops, so contents
+/// reach stable storage before the caller's subsequent rename. Wave-E.11
+/// added the mode; Wave-E.13 added the sync_all call (PR-B M-2).
 fn write_owner_only(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     #[cfg(unix)]
     {
@@ -266,12 +279,35 @@ fn write_owner_only(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
             .with_context(|| format!("setting 0o600 on {}", path.display()))?;
         file.write_all(bytes)
             .with_context(|| format!("writing bytes to {}", path.display()))?;
+        // Force data + metadata to disk before the handle drops, so the
+        // caller can rely on the file being durable before its rename.
+        file.sync_all()
+            .with_context(|| format!("fsync {}", path.display()))?;
         Ok(())
     }
     #[cfg(not(unix))]
     {
         fs::write(path, bytes)
             .with_context(|| format!("writing {}", path.display()))
+    }
+}
+
+/// `fsync(2)` a directory so the rename(2) that just landed inside it
+/// reaches stable storage. POSIX-only — on non-Unix this is a no-op
+/// (NTFS journaling provides similar guarantees automatically).
+fn fsync_dir(dir: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let f = fs::File::open(dir)
+            .with_context(|| format!("open dir {} for fsync", dir.display()))?;
+        f.sync_all()
+            .with_context(|| format!("sync_all on dir {}", dir.display()))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
     }
 }
 
