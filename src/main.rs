@@ -1645,10 +1645,11 @@ fn cmd_fleet_add(
     address: &str,
     description: Option<&str>,
 ) -> Result<i32> {
-    let mut roster = fleet::load_roster()?;
-    let was_present = roster.machines.contains_key(id);
-    fleet::add_machine(&mut roster, id, tier, address, description)?;
-    fleet::save_roster(&roster)?;
+    let was_present = fleet::mutate_roster(|roster| {
+        let was_present = roster.machines.contains_key(id);
+        fleet::add_machine(roster, id, tier, address, description)?;
+        Ok(was_present)
+    })?;
     let verb = if was_present { "updated" } else { "added" };
     println!("fleet: {verb} {id} (tier={tier}, address={address})");
     if let Some(d) = description {
@@ -1659,10 +1660,9 @@ fn cmd_fleet_add(
 }
 
 fn cmd_fleet_remove(id: &str) -> Result<i32> {
-    let mut roster = fleet::load_roster()?;
-    match fleet::remove_machine(&mut roster, id) {
+    let removed = fleet::mutate_roster(|roster| Ok(fleet::remove_machine(roster, id)))?;
+    match removed {
         Some(entry) => {
-            fleet::save_roster(&roster)?;
             println!("fleet: removed {id} (tier was {})", entry.tier);
             println!("  roster: {}", fleet::roster_path().display());
             Ok(0)

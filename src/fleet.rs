@@ -138,12 +138,94 @@ pub fn load_roster() -> Result<FleetRoster> {
     Ok(roster)
 }
 
+/// Run `f` against a freshly-loaded roster + persist the result, with
+/// the whole load-modify-save cycle serialized by an exclusive
+/// `flock(2)` on a sentinel file at `<roster_path>.lock`. Wave-E.12
+/// (#255 / PR-B review): concurrent invocations (e.g. two operators
+/// each running `darkmux fleet add` on the same machine, or a CLI
+/// session racing with a background daemon update) previously dropped
+/// entries to a last-writer-wins race — load, modify, save with no
+/// serialization meant the second writer's `save_roster` clobbered the
+/// first writer's add. With the flock guard, concurrent calls
+/// serialize and every mutation is preserved.
+///
+/// The sentinel is a separate `.lock` file so the roster file itself
+/// keeps the `0o600` mode set by `write_owner_only` (Wave-E.11) without
+/// having to be opened+truncated by the lock acquisition.
+///
+/// POSIX-only — non-Unix falls through to a plain load-modify-save
+/// (race window remains; tracked alongside the rest of the Windows
+/// portability gaps).
+pub fn mutate_roster<F, T>(f: F) -> Result<T>
+where
+    F: FnOnce(&mut FleetRoster) -> Result<T>,
+{
+    let path = roster_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating fleet roster directory {}", parent.display()))?;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let lock_path = path.with_extension("json.lock");
+        let lock_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| format!("opening fleet lock file {}", lock_path.display()))?;
+        let fd = lock_file.as_raw_fd();
+        // Blocking exclusive lock — auto-released on file drop OR on
+        // explicit LOCK_UN below (RAII guard).
+        let lock_ret = unsafe { libc::flock(fd, libc::LOCK_EX) };
+        if lock_ret != 0 {
+            return Err(anyhow!(
+                "flock(LOCK_EX) failed on fleet lock {}: errno {}",
+                lock_path.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        struct FlockGuard(std::os::unix::io::RawFd);
+        impl Drop for FlockGuard {
+            fn drop(&mut self) {
+                unsafe { libc::flock(self.0, libc::LOCK_UN) };
+            }
+        }
+        let _guard = FlockGuard(fd);
+
+        let mut roster = load_roster()?;
+        let result = f(&mut roster)?;
+        save_roster(&roster)?;
+        // `lock_file` lives to here — explicit drop after save so the
+        // lock isn't released until the rename has completed.
+        drop(lock_file);
+        Ok(result)
+    }
+
+    #[cfg(not(unix))]
+    {
+        let mut roster = load_roster()?;
+        let result = f(&mut roster)?;
+        save_roster(&roster)?;
+        Ok(result)
+    }
+}
+
 /// Write the roster to disk via atomic rename — write to `.tmp`, then
 /// rename over the target. Prevents partial-write corruption if darkmux
 /// is killed mid-save. On POSIX, the file is created with mode `0o600`
 /// (Wave-E.11 / PR-B review): machine addresses, tier assignments, and
 /// any future bearer-token fields stay owner-only even under a permissive
 /// user umask.
+///
+/// **Cross-process concurrency:** prefer `mutate_roster` for any
+/// load-modify-save cycle. Direct `save_roster` callers must hold their
+/// own external serialization (the existing call sites in tests do
+/// because they're single-threaded). Without a flock-equivalent guard,
+/// two parallel `save_roster` calls race on the shared `.tmp` path.
 pub fn save_roster(roster: &FleetRoster) -> Result<()> {
     let path = roster_path();
     if let Some(parent) = path.parent() {
