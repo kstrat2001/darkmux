@@ -46,6 +46,15 @@ blake3 = "1.5"
 # the unsafe blocks in src/flow.rs read against a known direct interface.
 libc = "0.2"
 
+# #275 PR-B — synchronous HTTP client for `darkmux fleet status --deep`
+# (and any future CLI verb that fetches another daemon's REST surface).
+# Chosen as the smallest viable client: no async runtime at use-site,
+# no tokio dep, no hyper-style transitive stack. Default features cover
+# what we need (HTTP/1.1 GET, timeouts; response body read as Vec<u8>
+# and parsed by serde_json). `default-features = false` keeps the
+# dep-set discipline this project values.
+ureq = { version = "2.10", default-features = false }
+
 [dev-dependencies]
 tempfile = "3.10"
 assert_cmd = "2.0"
