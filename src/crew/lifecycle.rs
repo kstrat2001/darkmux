@@ -155,8 +155,14 @@ fn now_unix() -> u64 {
 
 // ─── Atomic save ────────────────────────────────────────────────────────
 
+/// Durable atomic-rename save: serialize → write `.json.tmp` with mode
+/// `0o600` + fsync → rename onto target → fsync parent directory. The
+/// fsyncs (Wave-E.13 / PR-B M-2) make the rename durable across power
+/// failure; without them a crash between rename(2) and the next
+/// dirty-page flush could leave the directory entry inconsistent.
 fn save_json<T: serde::Serialize>(path: &std::path::Path, value: &T) -> Result<()> {
-    if let Some(parent) = path.parent() {
+    let parent = path.parent().map(|p| p.to_path_buf());
+    if let Some(parent) = parent.as_ref() {
         fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
@@ -167,15 +173,18 @@ fn save_json<T: serde::Serialize>(path: &std::path::Path, value: &T) -> Result<(
         .with_context(|| format!("writing {}", tmp.display()))?;
     fs::rename(&tmp, path)
         .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
+    if let Some(parent) = parent {
+        fsync_dir(&parent)
+            .with_context(|| format!("fsync parent dir {}", parent.display()))?;
+    }
     Ok(())
 }
 
 /// Write `bytes` to `path` with mode `0o600` on POSIX (owner read/write
-/// only). Falls back to the default umask-respecting write on non-POSIX
-/// (Windows ACLs are a separate story; tracked alongside #255 Wave-E.11).
-///
-/// Pre-existing files: explicitly re-set the mode to `0o600` after open
-/// since `OpenOptions::mode` only applies on creation.
+/// only) AND `fsync(2)` the file before the handle drops. Falls back to
+/// the default umask-respecting write on non-POSIX. Wave-E.11 added the
+/// mode; Wave-E.13 added the sync_all call so the doc claim about
+/// "durable atomic rename" actually holds across power failure.
 fn write_owner_only(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     #[cfg(unix)]
     {
@@ -195,12 +204,32 @@ fn write_owner_only(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
             .with_context(|| format!("setting 0o600 on {}", path.display()))?;
         file.write_all(bytes)
             .with_context(|| format!("writing bytes to {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("fsync {}", path.display()))?;
         Ok(())
     }
     #[cfg(not(unix))]
     {
         fs::write(path, bytes)
             .with_context(|| format!("writing {}", path.display()))
+    }
+}
+
+/// `fsync(2)` a directory so a rename(2) that landed inside it reaches
+/// stable storage. POSIX-only — on non-Unix this is a no-op.
+fn fsync_dir(dir: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let f = fs::File::open(dir)
+            .with_context(|| format!("open dir {} for fsync", dir.display()))?;
+        f.sync_all()
+            .with_context(|| format!("sync_all on dir {}", dir.display()))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
     }
 }
 
