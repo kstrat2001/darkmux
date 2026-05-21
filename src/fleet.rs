@@ -35,6 +35,15 @@ const REACHABILITY_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 /// Matches `serve::DEFAULT_DAEMON_ADDR`'s 8765.
 const DEFAULT_DAEMON_PORT: u16 = 8765;
 
+/// Hard cap on DNS resolution time inside `parse_address` (Wave-E.10
+/// #255). `std::net::ToSocketAddrs::to_socket_addrs` blocks on the
+/// system resolver with no timeout — a wedged DNS server can stall it
+/// for seconds-to-minutes, making the 300ms `REACHABILITY_PROBE_TIMEOUT`
+/// claim hollow. 2 seconds is generous for a healthy resolver
+/// (typical lookup ≤ 50ms) and bounds the per-probe pre-flight cost
+/// at a known ceiling. (PR-B review M-1)
+const DNS_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// One machine in the fleet roster — operator-declared. Hand-edits OK;
 /// CLI verbs preserve unknown fields via the BTreeMap shape.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -234,27 +243,94 @@ pub fn probe_reachability(address: &str) -> ReachabilityResult {
 /// - host:port: `100.74.208.36:8765` or `studio.tailnet:9999`
 /// - DNS names: `studio.tailnet` (resolved via std)
 fn parse_address(address: &str) -> Result<std::net::SocketAddr> {
-    use std::net::ToSocketAddrs;
     let trimmed = address.trim();
     if trimmed.is_empty() {
         return Err(anyhow!("empty address"));
     }
     // First try as-is (covers `host:port` and `ip:port`).
-    if let Ok(mut iter) = trimmed.to_socket_addrs() {
-        if let Some(a) = iter.next() {
-            return Ok(a);
-        }
+    if let Some(a) = resolve_with_timeout(trimmed)? {
+        return Ok(a);
     }
     // Fall back to default port if no `:` in the string.
     if !trimmed.contains(':') {
         let with_port = format!("{trimmed}:{DEFAULT_DAEMON_PORT}");
-        if let Ok(mut iter) = with_port.to_socket_addrs() {
-            if let Some(a) = iter.next() {
-                return Ok(a);
-            }
+        if let Some(a) = resolve_with_timeout(&with_port)? {
+            return Ok(a);
         }
     }
     Err(anyhow!("could not resolve address: {address}"))
+}
+
+/// Spawn `to_socket_addrs` in a thread + wait up to
+/// `DNS_RESOLUTION_TIMEOUT` for the first socket address.
+/// Returns:
+/// - `Ok(Some(addr))` — resolution succeeded
+/// - `Ok(None)` — resolution succeeded but returned no addresses
+///   (caller distinguishes from "wrong format" — typically means the
+///   host has no A/AAAA records of the right family)
+/// - `Err` — DNS resolution timed out OR returned an error
+///
+/// Wave-E.10 #255: bounds the DNS leg of address parsing so
+/// `probe_reachability`'s 300ms TCP budget claim isn't undermined
+/// by an unbounded resolver lookup. Costs one thread spawn per
+/// `parse_address` call — acceptable for the per-machine probe
+/// frequency (≤ N per `fleet status`).
+fn resolve_with_timeout(input: &str) -> Result<Option<std::net::SocketAddr>> {
+    use std::net::ToSocketAddrs;
+    use std::sync::mpsc;
+    let owned = input.to_string();
+    let (tx, rx) = mpsc::channel();
+    let handle = std::thread::Builder::new()
+        .name("darkmux-dns-resolve".to_string())
+        .spawn(move || {
+            let result: Result<Option<std::net::SocketAddr>, std::io::Error> = owned
+                .to_socket_addrs()
+                .map(|mut iter| iter.next());
+            // Ignore send errors — receiver may have already given up
+            // on timeout. The thread cleans up on its own.
+            let _ = tx.send(result);
+        })
+        .map_err(|e| anyhow!("spawning DNS-resolution thread: {e}"))?;
+
+    match rx.recv_timeout(DNS_RESOLUTION_TIMEOUT) {
+        Ok(Ok(Some(addr))) => {
+            // Best-effort join — thread already done.
+            let _ = handle.join();
+            Ok(Some(addr))
+        }
+        Ok(Ok(None)) => {
+            let _ = handle.join();
+            Ok(None)
+        }
+        Ok(Err(e)) => {
+            // to_socket_addrs surfaced a parse / NXDOMAIN error.
+            let _ = handle.join();
+            // For unparseable inputs (not a host:port shape) the OS
+            // typically returns InvalidInput; treat as "no addresses"
+            // so the caller's port-fallback path runs. For real
+            // resolver errors (host not found), bubble up.
+            if e.kind() == std::io::ErrorKind::InvalidInput {
+                Ok(None)
+            } else {
+                Err(anyhow!("DNS resolution failed for {input}: {e}"))
+            }
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // The thread will continue running until the OS resolver
+            // returns; the parent has given up. This is the same
+            // "leak the thread" tradeoff std uses everywhere for
+            // unbounded I/O — better than blocking the caller forever.
+            Err(anyhow!(
+                "DNS resolution timed out for {input} after {}ms — \
+                 check resolver health (`scutil --dns` on macOS, \
+                 `resolvectl status` on systemd Linux)",
+                DNS_RESOLUTION_TIMEOUT.as_millis()
+            ))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(anyhow!(
+            "DNS resolution thread panicked or exited without sending result for {input}"
+        )),
+    }
 }
 
 /// Result of `probe_reachability` — surfaced in `fleet status` table.
@@ -1356,6 +1432,54 @@ mod tests {
     fn parse_address_rejects_empty() {
         assert!(parse_address("").is_err());
         assert!(parse_address("   ").is_err());
+    }
+
+    #[test]
+    fn parse_address_returns_within_bounded_time_for_real_ip() {
+        // Sanity for the Wave-E.10 DNS timeout wrapper: real IPs
+        // resolve well under the 2s DNS_RESOLUTION_TIMEOUT cap and
+        // certainly under 1s. Catches a regression where the
+        // wrapper added ms-scale latency to the happy path.
+        let start = std::time::Instant::now();
+        let _ = parse_address("127.0.0.1:8765").expect("real IP resolves");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "real-IP parse should be fast; took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn parse_address_returns_bounded_for_invalid_format() {
+        // A syntactically invalid input should bail fast (not wait the
+        // full DNS_RESOLUTION_TIMEOUT). resolve_with_timeout converts
+        // InvalidInput → Ok(None), so the caller's port-fallback path
+        // runs; total bounded by 2 × DNS_RESOLUTION_TIMEOUT worst case.
+        let start = std::time::Instant::now();
+        let _ = parse_address("not::a::valid::addr");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "invalid-format parse should not hang; took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn parse_address_dns_timeout_is_bounded() {
+        // Wave-E.10 invariant: even pathological-looking inputs
+        // (e.g. a `.invalid` TLD per RFC 6761 — guaranteed NXDOMAIN)
+        // must return within roughly DNS_RESOLUTION_TIMEOUT. The
+        // resolver typically returns NXDOMAIN well under the cap;
+        // this test asserts the WRAPPER bounds the worst case.
+        let start = std::time::Instant::now();
+        let _ = parse_address("definitely-not-a-real-hostname-12345.example.invalid");
+        let elapsed = start.elapsed();
+        // 2× DNS_RESOLUTION_TIMEOUT covers the host-then-host:port
+        // double-attempt + scheduler jitter; still bounded.
+        assert!(
+            elapsed < std::time::Duration::from_secs(6),
+            "DNS-failed parse should bounce within ~2 * DNS_RESOLUTION_TIMEOUT; took {elapsed:?}"
+        );
     }
 
     #[test]
