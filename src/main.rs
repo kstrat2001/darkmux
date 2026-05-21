@@ -1288,11 +1288,11 @@ fn cmd_mission_dispatch(
     };
 
     // 3. Filter sprints: this mission + depends_on=[] + status=Planned.
-    //    `Running` is NOT included — a sprint already running locally
-    //    would be re-dispatched, racing two workers on the same work
-    //    (both reviewers HIGH-1 from PR-D.1 review). Operator who
-    //    wants to re-dispatch a Running sprint should explicitly
-    //    `darkmux sprint abandon` first.
+    //    `Running` is NOT included — PR-D.1 filter-level guard. Wave-E.3
+    //    adds the state-machine gate: each filtered sprint goes through
+    //    `lifecycle::sprint_start` BEFORE publish, flipping Planned →
+    //    Running. A second `mission dispatch` invocation finds 0
+    //    dispatchable sprints (all Running now) and bails with exit 2.
     let sprints = load_sprints()?;
     let initial: Vec<_> = sprints
         .iter()
@@ -1303,7 +1303,33 @@ fn cmd_mission_dispatch(
     if initial.is_empty() {
         eprintln!(
             "darkmux mission dispatch: no sprints with depends_on=[] in mission `{mission_id}` \
-             that are in Planned/Running status. Nothing to fan out."
+             in Planned status. Nothing to fan out. (Running sprints from a previous \
+             dispatch must be `darkmux sprint complete` or `sprint abandon` before \
+             they're eligible again.)"
+        );
+        return Ok(2);
+    }
+
+    // 3b. Flip each filtered sprint Planned → Running BEFORE publishing.
+    //     If a sprint flipped between the filter and this call (unlikely
+    //     in single-operator scenarios but possible under racing CLIs),
+    //     `sprint_start` bails on already-Running; skip and warn.
+    let mut started: Vec<&crew::types::Sprint> = Vec::with_capacity(initial.len());
+    for sprint in &initial {
+        match crew::lifecycle::sprint_start(&sprint.id) {
+            Ok(_) => started.push(*sprint),
+            Err(e) => {
+                eprintln!(
+                    "darkmux mission dispatch: skipping sprint `{}` — sprint_start failed: {e:#}",
+                    sprint.id
+                );
+            }
+        }
+    }
+    if started.is_empty() {
+        eprintln!(
+            "darkmux mission dispatch: no sprints survived sprint_start (all were \
+             already Running/Complete). Nothing to fan out."
         );
         return Ok(2);
     }
@@ -1333,7 +1359,7 @@ fn cmd_mission_dispatch(
         .map(|d| d.as_micros())
         .unwrap_or(0);
     let mut jobs: Vec<(String, String, fleet::WorkJob)> = Vec::new(); // (sprint_id, session_id, job)
-    for (idx, sprint) in initial.iter().enumerate() {
+    for (idx, sprint) in started.iter().enumerate() {
         let session_id = format!(
             "mission-{}-sprint-{}-{}-{}",
             mission_id, sprint.id, dispatch_micros, idx
