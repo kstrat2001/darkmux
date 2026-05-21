@@ -482,16 +482,23 @@ impl WorkJob {
     }
 }
 
-/// Charset+length check for an identifier-shaped field. Allowlist:
-/// `[a-z0-9_-]` (ASCII lowercase + digits + underscore + hyphen), length
-/// 1..=MAX_WORK_IDENTIFIER_LEN.
-fn validate_work_identifier(field: &str, value: &str) -> Result<()> {
+/// Charset+length check for an identifier-shaped field — the canonical
+/// validator used both at the queue boundary (`WorkJob::validate`) and
+/// at the CLI boundary (`darkmux mission dispatch <mission_id>` etc.,
+/// Wave-E.5 #255).
+///
+/// Allowlist: `[a-z0-9_-]` (ASCII lowercase + digits + underscore +
+/// hyphen), length 1..=MAX_WORK_IDENTIFIER_LEN. The full `label`
+/// parameter lets callers name the offending field as the operator
+/// thinks of it (`"mission_id"`, `"WorkJob.target_tier"`, etc.) so
+/// errors are operator-actionable rather than internal-shape-leaky.
+pub(crate) fn validate_identifier(label: &str, value: &str) -> Result<()> {
     if value.is_empty() {
-        return Err(anyhow!("WorkJob.{field} must be non-empty"));
+        return Err(anyhow!("{label} must be non-empty"));
     }
     if value.len() > MAX_WORK_IDENTIFIER_LEN {
         return Err(anyhow!(
-            "WorkJob.{field} exceeds {}-char limit (was {} chars): {value:?}",
+            "{label} exceeds {}-char limit (was {} chars): {value:?}",
             MAX_WORK_IDENTIFIER_LEN,
             value.len()
         ));
@@ -501,11 +508,17 @@ fn validate_work_identifier(field: &str, value: &str) -> Result<()> {
         .find(|c| !(c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-' || *c == '_'));
     if let Some(c) = bad {
         return Err(anyhow!(
-            "WorkJob.{field} contains invalid char {c:?} \
-             (allowlist [a-z0-9_-]): {value:?}"
+            "{label} contains invalid char {c:?} (allowlist [a-z0-9_-]): {value:?}"
         ));
     }
     Ok(())
+}
+
+/// Wraps `validate_identifier` with the `"WorkJob.{field}"` label
+/// prefix used throughout `WorkJob::validate`. Kept as a thin shim so
+/// the existing internal call-sites read tightly.
+fn validate_work_identifier(field: &str, value: &str) -> Result<()> {
+    validate_identifier(&format!("WorkJob.{field}"), value)
 }
 
 /// Result of a successful `claim_job` — the worker now owns the job.
