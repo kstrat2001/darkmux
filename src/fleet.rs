@@ -905,6 +905,23 @@ fn handle_claimed_job(
         return;
     }
 
+    // Workdir symlink-escape guard via the shared validator (Wave-E.2 /
+    // #255). The dispatch path itself ALSO validates, but doing it
+    // here is the canonical "queue boundary" check — operator sees
+    // the rejection in the worker's flow records via dispatch.error,
+    // not buried deep in the internal/openclaw dispatch path.
+    if let Some(workdir_str) = &job.workdir {
+        let path = std::path::Path::new(workdir_str);
+        if let Err(e) = crate::workdir::validate_workdir(path) {
+            eprintln!(
+                "darkmux-worker: REJECTED claimed job {work_id}: workdir validation failed: {e:#}. \
+                 Acking to release queue lease; dispatch NOT invoked."
+            );
+            let _ = ack_job(client, tier, WORKER_CONSUMER_GROUP, &work_id);
+            return;
+        }
+    }
+
     // Optional target_machine pre-claim hint: when set, the publisher
     // asserted this specific machine should handle the job. If it
     // doesn't match the local machine_id, log a warning but proceed —

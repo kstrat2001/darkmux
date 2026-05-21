@@ -13,6 +13,7 @@ mod eureka;
 mod hardware;
 mod fleet;
 mod heuristics;
+mod workdir;
 mod init;
 mod lab;
 mod lms;
