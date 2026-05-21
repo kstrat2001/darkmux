@@ -55,29 +55,43 @@ pub fn build_router(flows_dir: PathBuf) -> Router {
         .with_state(state)
 }
 
-/// CORS layer permitting only localhost-originating browser requests
-/// (#225). Prevents cross-origin exfiltration of flow records (which
-/// include `payload.reasoning_text` and crew structure) by arbitrary
-/// web pages.
+/// CORS layer for the daemon's browser-facing endpoints. **Default**:
+/// `null` only (i.e. `file://` pages — the bundled topology + flow
+/// viewers run from disk). **Operator override**: set
+/// `DARKMUX_DAEMON_CORS_ORIGINS=<comma-list>` to extend the allowlist
+/// with specific origins (e.g. `http://localhost:5173` for a Vite dev
+/// server). Each entry is matched **exactly** — no prefix wildcard.
 ///
-/// Allowed origins:
-/// - `null`                  — `file://` pages (topology viewer from disk)
-/// - `http://localhost*`     — any local dev server port
-/// - `http://127.0.0.1*`    — explicit loopback
+/// The tightening from "any localhost origin" (#225) to "null only by
+/// default" (#273) follows from #270 elevating the daemon's data
+/// surface to fleet-wide. A compromised tab at any localhost origin
+/// would otherwise be able to exfiltrate fleet activity via CORS;
+/// requiring an explicit opt-in matches operator-sovereignty (default
+/// is the safer choice; operator names the dev-server origins they
+/// actually run).
 ///
-/// Non-browser clients (curl, darkmux CLI, probe) are unaffected — CORS
-/// is browser-enforced; the header simply isn't set for unmatched origins
-/// and the response is returned normally.
+/// Non-browser clients (curl, darkmux CLI, probe) are unaffected —
+/// CORS is browser-enforced; the header simply isn't set for unmatched
+/// origins and the response is returned normally.
 fn local_only_cors() -> tower_http::cors::CorsLayer {
     use axum::http::{HeaderValue, Method};
     use tower_http::cors::AllowOrigin;
+
+    let extra_origins: Vec<String> = std::env::var("DARKMUX_DAEMON_CORS_ORIGINS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
     tower_http::cors::CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(
-            |origin: &HeaderValue, _parts: &axum::http::request::Parts| {
+            move |origin: &HeaderValue, _parts: &axum::http::request::Parts| {
                 let s = origin.to_str().unwrap_or("");
-                s == "null"
-                    || s.starts_with("http://localhost")
-                    || s.starts_with("http://127.0.0.1")
+                if s == "null" {
+                    return true;
+                }
+                extra_origins.iter().any(|allowed| allowed == s)
             },
         ))
         .allow_methods([Method::GET])
@@ -184,6 +198,27 @@ fn build_startup_banner(
     lines.push(format!("  flows dir:      {}", flows_dir.display()));
     lines.push(format!("  missions:       {mission_count} loaded"));
     lines.push(format!("  sprints:        {sprint_count} loaded"));
+
+    // CORS allowlist surface (#273) — operators with a localhost dev
+    // server origin need to opt in via DARKMUX_DAEMON_CORS_ORIGINS;
+    // surface the resolved state so failure-to-connect is debuggable.
+    let cors_extras = std::env::var("DARKMUX_DAEMON_CORS_ORIGINS").unwrap_or_default();
+    let extra_list: Vec<&str> = cors_extras
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if extra_list.is_empty() {
+        lines.push(
+            "  cors allowlist: null (file://) only — set DARKMUX_DAEMON_CORS_ORIGINS to opt in"
+                .to_string(),
+        );
+    } else {
+        lines.push(format!(
+            "  cors allowlist: null (file://) + {}",
+            extra_list.join(", ")
+        ));
+    }
 
     if !flows_dir_exists {
         lines.push(
@@ -1116,7 +1151,14 @@ mod tests {
     /// Localhost-origin requests get CORS headers (topology viewer on any
     /// local port can read the response).
     #[tokio::test]
-    async fn cors_allows_localhost_origin() {
+    /// Post-#270/#273: localhost dev-server origins are NOT allowed by
+    /// default. The same browser tab that runs an operator's localhost
+    /// app should not be able to exfiltrate fleet-wide flow data via
+    /// CORS. Operators with a legitimate dev-server-origin need set
+    /// `DARKMUX_DAEMON_CORS_ORIGINS` to opt that origin in.
+    async fn cors_denies_localhost_origin_by_default() {
+        // Defensive — make sure no inherited env from another test changes the default behavior.
+        unsafe { std::env::remove_var("DARKMUX_DAEMON_CORS_ORIGINS"); }
         let app = build_router(PathBuf::new());
         let response = app
             .oneshot(
@@ -1130,14 +1172,15 @@ mod tests {
             .unwrap();
 
         assert!(
-            response.headers().contains_key("access-control-allow-origin"),
-            "localhost origin must receive CORS headers"
+            !response.headers().contains_key("access-control-allow-origin"),
+            "localhost origin must NOT receive CORS headers by default (#273)"
         );
     }
 
-    /// 127.0.0.1 variant — same localhost, explicit IP form.
+    /// 127.0.0.1 variant — same as localhost; denied by default post-#273.
     #[tokio::test]
-    async fn cors_allows_loopback_ip_origin() {
+    async fn cors_denies_loopback_ip_origin_by_default() {
+        unsafe { std::env::remove_var("DARKMUX_DAEMON_CORS_ORIGINS"); }
         let app = build_router(PathBuf::new());
         let response = app
             .oneshot(
@@ -1151,8 +1194,69 @@ mod tests {
             .unwrap();
 
         assert!(
+            !response.headers().contains_key("access-control-allow-origin"),
+            "127.0.0.1 origin must NOT receive CORS headers by default (#273)"
+        );
+    }
+
+    /// Operator-opt-in: `DARKMUX_DAEMON_CORS_ORIGINS` extends the
+    /// default null-only allowlist. Comma-separated. Origins in the
+    /// list receive CORS headers. (#273)
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cors_allows_origin_in_env_override() {
+        unsafe {
+            std::env::set_var(
+                "DARKMUX_DAEMON_CORS_ORIGINS",
+                "http://localhost:5173,http://localhost:3000",
+            );
+        }
+        let app = build_router(PathBuf::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header("Origin", "http://localhost:5173")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        unsafe { std::env::remove_var("DARKMUX_DAEMON_CORS_ORIGINS"); }
+
+        assert!(
             response.headers().contains_key("access-control-allow-origin"),
-            "127.0.0.1 origin must receive CORS headers"
+            "origin in DARKMUX_DAEMON_CORS_ORIGINS must receive CORS headers (#273)"
+        );
+    }
+
+    /// Negative side of the env-override: a localhost port NOT in the
+    /// override list still gets denied.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cors_denies_localhost_port_not_in_env_override() {
+        unsafe {
+            std::env::set_var(
+                "DARKMUX_DAEMON_CORS_ORIGINS",
+                "http://localhost:5173",
+            );
+        }
+        let app = build_router(PathBuf::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header("Origin", "http://localhost:9999")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        unsafe { std::env::remove_var("DARKMUX_DAEMON_CORS_ORIGINS"); }
+
+        assert!(
+            !response.headers().contains_key("access-control-allow-origin"),
+            "localhost port outside the env override list must still be denied (#273)"
         );
     }
 
