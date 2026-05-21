@@ -292,6 +292,30 @@ pub struct DispatchOpts {
     /// Which agent runtime to dispatch through. See [`Runtime`].
     /// Default: `Runtime::Openclaw` (the shipped path).
     pub runtime: Runtime,
+    /// Target machine for the dispatch (#246 PR-C.3). When `Some(<id>)`
+    /// and `<id>` differs from the local `DARKMUX_MACHINE_ID`, the
+    /// dispatch is published to `darkmux:work:<role-tier>` via
+    /// `fleet::publish_job` instead of running locally; a worker on
+    /// the target machine picks it up. When `None`, the dispatch runs
+    /// locally (today's behavior; preserved for backward compat).
+    ///
+    /// PR-D will add implicit tier-aware routing (no `--machine` flag
+    /// required); this field is the operator-explicit override that
+    /// will continue to win over implicit routing per
+    /// operator-sovereignty doctrine.
+    pub machine: Option<String>,
+    /// Whether to block on completion when the dispatch routes to a
+    /// remote machine (#246 PR-C.3). `true` — the default for
+    /// `crew dispatch` — tails the local flow stream for the matching
+    /// `session_id`'s `dispatch.complete` record and returns the
+    /// outcome (preserves today's "spawn, block, see result" CLI
+    /// ergonomics). `false` returns immediately with a synthetic
+    /// success result; the operator polls via `darkmux flow tail`
+    /// (or PR-D's `mission dispatch --no-wait` path).
+    ///
+    /// Ignored when the dispatch runs locally — local dispatches are
+    /// always synchronous.
+    pub wait: bool,
 }
 
 /// One file's state for the watched-paths summary (#89).
@@ -828,6 +852,23 @@ fn is_openclaw_noise(path: &Path) -> bool {
 
 /// Run a single dispatch end-to-end.
 pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
+    // PR-C.3 tier-routing branch (#246): when --machine is set AND it's
+    // not the local machine, publish to the work queue and (if --wait)
+    // block on the worker's dispatch.complete flow record. Local
+    // dispatches (no --machine, OR --machine == local) fall through to
+    // the existing local path unchanged.
+    if let Some(target) = opts.machine.clone() {
+        let local = crate::flow::resolve_machine_id();
+        let matches_local = local.as_deref() == Some(target.as_str());
+        if !matches_local {
+            return dispatch_via_queue(opts, &target);
+        }
+        eprintln!(
+            "darkmux crew dispatch: --machine={target} matches local machine_id; \
+             routing locally."
+        );
+    }
+
     // Route to the in-house container-bounded runtime when the operator
     // explicitly opts in via `--runtime internal`. Default stays the
     // openclaw path (everything below this branch).
@@ -1095,6 +1136,159 @@ fn extract_payload_text(stdout: &str) -> Option<String> {
         .get("text")?
         .as_str()
         .map(|s| s.to_string())
+}
+
+/// Publish a dispatch to the fleet work queue instead of running it
+/// locally (#246 PR-C.3). Called from `dispatch` when `opts.machine`
+/// is set to a non-local id. If `opts.wait` is true (the default for
+/// `crew dispatch`), blocks on the worker's `dispatch.complete` flow
+/// record before returning; otherwise returns immediately with a
+/// fire-and-forget synthetic result.
+fn dispatch_via_queue(opts: DispatchOpts, target_machine: &str) -> Result<DispatchResult> {
+    use crate::fleet;
+
+    // Determine the role's tier requirement (drives the work stream
+    // selection). Roles MUST declare a concrete tier for cross-machine
+    // dispatch — workers register on `darkmux:work:<inference|hub|client>`
+    // streams; a role with `tier: None` would publish to
+    // `darkmux:work:any` which has no consumer and the wait loop would
+    // time out without explanation. Bail loud with operator-actionable
+    // hints. (PR-C.3 review HIGH-1)
+    let role = load_role_or_bail(&opts.role_id)?;
+    let role_tier = match role.tier.clone() {
+        Some(t) if !t.trim().is_empty() && t != "any" => t,
+        Some(t) => {
+            bail!(
+                "role `{}` has tier={:?} which has no fleet consumer (workers \
+                 register on inference/hub/client streams). Either: (a) edit \
+                 the role manifest to declare a concrete tier, or (b) omit \
+                 --machine to dispatch locally.",
+                opts.role_id, t
+            );
+        }
+        None => {
+            bail!(
+                "role `{}` has no tier declaration in its manifest. \
+                 Cross-machine dispatch requires the role to declare which \
+                 machine class it runs on. Either: (a) add \"tier\": \
+                 \"inference\" (or \"hub\") to the role's JSON manifest, or \
+                 (b) omit --machine to dispatch locally.",
+                opts.role_id
+            );
+        }
+    };
+
+    // The Redis URL is required for cross-machine dispatch. If it's
+    // unset, the operator hasn't configured the fleet substrate — bail
+    // loud with the fix-it pointer.
+    let redis_url = std::env::var("DARKMUX_REDIS_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "--machine={target_machine} requires DARKMUX_REDIS_URL to be set \
+                 (the fleet work queue lives on Redis). \
+                 Single-machine fleets shouldn't pass --machine."
+            )
+        })?;
+
+    // Resolve session_id up front — the worker needs it to stamp on
+    // the dispatch.complete record, and --wait needs it as the join key.
+    let session_id = opts
+        .session_id
+        .clone()
+        .unwrap_or_else(|| fresh_session_id(&opts.role_id));
+
+    // Build the WorkJob from DispatchOpts. The shape mirrors what the
+    // worker side reconstructs via `WorkJob::into_dispatch_opts` —
+    // round-trip parity matters for cross-machine dispatch.
+    let runtime_str = match opts.runtime {
+        Runtime::Openclaw => "openclaw",
+        Runtime::Internal => "internal",
+    };
+    let job = fleet::build_work_job(
+        role_tier,
+        Some(target_machine.to_string()),
+        opts.role_id.clone(),
+        opts.message.clone(),
+        session_id.clone(),
+        opts.deliver.clone(),
+        opts.workdir.as_ref().map(|p| p.display().to_string()),
+        opts.sprint_id.clone(),
+        runtime_str.to_string(),
+        opts.timeout_seconds,
+        crate::flow::resolve_machine_id(),
+        crate::flow::resolve_orchestrator(),
+    );
+
+    // Open the Redis client lazily here (not at darkmux startup) so the
+    // local-dispatch path doesn't pay any connection cost. The same
+    // `raw_url` is reused by `wait_for_completion` below.
+    let raw_url = crate::flow::RawRedisUrl::new(redis_url);
+    let client = redis::Client::open(raw_url.expose_for_probe())
+        .with_context(|| format!("opening Redis client {raw_url} for --machine dispatch"))?;
+
+    // Publish — `publish_job` runs validate() before XADD, so a
+    // malformed job bails before crossing the network.
+    let work_id = fleet::publish_job(&client, &job)
+        .context("publishing WorkJob to fleet queue")?;
+
+    eprintln!(
+        "darkmux crew dispatch: published work_id={work_id} tier={} \
+         target_machine={target_machine} session={session_id}",
+        job.target_tier
+    );
+
+    if !opts.wait {
+        // Fire-and-forget. Return a synthetic success result; the
+        // operator polls via `darkmux flow tail --session <id>`.
+        return Ok(DispatchResult {
+            exit_code: 0,
+            stdout: format!("published; not waiting (session_id={session_id})\n"),
+            stderr: String::new(),
+            session_id,
+            watched_state: Vec::new(),
+        });
+    }
+
+    // Block on the worker's dispatch.complete. Timeout = the job's own
+    // timeout + a small slack (the worker's clock starts at claim, so
+    // the dispatching client's wait must outlast the worker's budget).
+    let wait_timeout = std::time::Duration::from_secs(
+        (opts.timeout_seconds as u64).saturating_add(30),
+    );
+    eprintln!(
+        "darkmux crew dispatch: waiting for dispatch.complete (session={session_id}, \
+         timeout={}s)…",
+        wait_timeout.as_secs()
+    );
+    let completion = fleet::wait_for_completion(&raw_url, &session_id, wait_timeout)
+        .context("waiting for remote dispatch completion")?;
+
+    eprintln!(
+        "darkmux crew dispatch: completed session={} result={} wall_ms={:?}",
+        completion.session_id, completion.result_class, completion.wall_ms
+    );
+
+    // Translate completion → DispatchResult. We don't have stdout from
+    // the worker side (it lives in the worker's flow records, not the
+    // dispatching CLI's stdout); surface the result_class + wall_ms in
+    // the synthetic stdout so the operator sees something useful.
+    let exit_code = if completion.result_class == "ok" { 0 } else { 1 };
+    let stdout = format!(
+        "remote dispatch complete; result_class={} wall_ms={:?} session={}\n\
+         (full output in worker's flow records — \
+          tail `~/.darkmux/flows/<date>.jsonl` for session={})\n",
+        completion.result_class, completion.wall_ms, completion.session_id, completion.session_id,
+    );
+    Ok(DispatchResult {
+        exit_code,
+        stdout,
+        stderr: String::new(),
+        session_id: completion.session_id,
+        watched_state: Vec::new(),
+    })
 }
 
 /// Build a flow record for a dispatch lifecycle event (`dispatch start`,

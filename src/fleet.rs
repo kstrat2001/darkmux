@@ -412,6 +412,14 @@ pub const MAX_WORK_WORKDIR_BYTES: usize = 4 * 1024;
 /// (e.g. an `role_id` of 100MB). (#246 PR-C.2)
 pub const MAX_WORK_IDENTIFIER_LEN: usize = 64;
 
+/// Max allowed `timeout_seconds` on a queued `WorkJob`. 1 hour bounds
+/// the worst-case "publisher pins this machine's single worker" surface.
+/// Legitimate dispatches measured in this codebase top out around 15
+/// minutes (long-agentic-shape workloads at large context); 1 hour is
+/// 4× that headroom. A publisher specifying `u32::MAX` (136 years) is
+/// rejected at the queue boundary. (#246 PR-C.3 / PR-C.2 review carry-over)
+pub const MAX_WORK_TIMEOUT_SECONDS: u32 = 60 * 60;
+
 impl WorkJob {
     /// Validate a `WorkJob` at the queue boundary — called by both the
     /// publisher (in `publish_job`) and the consumer (after claim, before
@@ -457,6 +465,18 @@ impl WorkJob {
                     w.len()
                 ));
             }
+        }
+        if self.timeout_seconds == 0 {
+            return Err(anyhow!(
+                "WorkJob.timeout_seconds must be non-zero (0 would never complete)"
+            ));
+        }
+        if self.timeout_seconds > MAX_WORK_TIMEOUT_SECONDS {
+            return Err(anyhow!(
+                "WorkJob.timeout_seconds exceeds {}-second cap (was {})",
+                MAX_WORK_TIMEOUT_SECONDS,
+                self.timeout_seconds
+            ));
         }
         Ok(())
     }
@@ -809,8 +829,12 @@ fn worker_main() {
     let client = match redis::Client::open(url.expose_for_probe()) {
         Ok(c) => c,
         Err(e) => {
+            // `{e:#}` walks the anyhow context chain — single-level
+            // `{e}` would hide the underlying redis-rs cause behind
+            // our `.with_context` wrapper. Operator needs the full
+            // chain to diagnose. (PR-C.2 review carry-over)
             eprintln!(
-                "darkmux-worker: failed to open Redis client ({url}): {e}. \
+                "darkmux-worker: failed to open Redis client ({url}): {e:#}. \
                  Queue worker disabled."
             );
             return;
@@ -819,7 +843,7 @@ fn worker_main() {
 
     if let Err(e) = init_consumer_group(&client, &tier, WORKER_CONSUMER_GROUP) {
         eprintln!(
-            "darkmux-worker: init_consumer_group on darkmux:work:{tier} failed: {e}. \
+            "darkmux-worker: init_consumer_group on darkmux:work:{tier} failed: {e:#}. \
              Queue worker disabled."
         );
         return;
@@ -945,8 +969,199 @@ impl WorkJob {
             workdir: self.workdir.map(PathBuf::from),
             sprint_id: self.sprint_id,
             runtime,
+            // Worker-side opts: never recurse into the queue (would
+            // ping-pong jobs back to redis); always run local synchronous.
+            machine: None,
+            wait: true,
         }
     }
+}
+
+// ─── Client-side --wait wrapper (PR-C.3) ──────────────────────────────
+//
+// After `publish_job` returns, the dispatching client can either return
+// immediately (fire-and-forget; the operator polls flow stream from
+// elsewhere) OR block until the worker's `dispatch.complete` flow
+// record lands for the matching `session_id`. The `--wait` wrapper
+// implements the blocking form by **polling the Redis flow stream**
+// (`darkmux:flow`) — NOT the local file, because in a cross-machine
+// dispatch the completion record lands on the WORKER's local file,
+// not the publisher's. The Redis stream is the only substrate both
+// machines write to (via the shared TeeSink → RedisSink composition).
+//
+// This is the architectural pivot that makes cross-machine `--wait`
+// actually work — a CRITICAL fix surfaced in PR-C.3 review where the
+// initial local-file-polling implementation would always time out.
+
+/// Poll interval for the `wait_for_completion` Redis polling. (#246 PR-C.3)
+const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Cap on XRANGE entries scanned per poll iteration. Matches the typical
+/// Redis stream MAXLEN of 10000 (set via `DARKMUX_REDIS_MAXLEN`); covers
+/// a full re-scan per poll without pagination. If the stream legitimately
+/// exceeds this in a single poll window the caller will see a delayed
+/// completion (corrects on the next iteration). (#246 PR-C.3)
+const WAIT_XRANGE_COUNT: usize = 10000;
+
+/// Result of `wait_for_completion`. Outcome is the dispatch's
+/// `result_class` from the flow record's payload — typically `"ok"` or
+/// `"error"` (see `crew::dispatch::dispatch` for the canonical values).
+/// `wall_ms` is from the same payload.
+#[derive(Debug, Clone)]
+pub struct CompletionResult {
+    pub session_id: String,
+    pub result_class: String,
+    pub wall_ms: Option<u64>,
+    /// Raw payload JSON for downstream consumers that want richer
+    /// fields (e.g. `exit_code`, `total_turns`, `result_class`).
+    /// Currently surfaced via `--json` only (PR-D mission dispatch
+    /// reads this for sprint-level aggregation).
+    #[allow(dead_code)] // consumed by PR-D mission dispatch fan-out aggregator
+    pub payload: Option<serde_json::Value>,
+}
+
+/// Block until a `dispatch.complete` flow record for `session_id` lands
+/// in the Redis flow stream, or `timeout` elapses. Returns the
+/// completion result on success; bails when the timeout fires (the job
+/// may still be running on the remote worker — the operator can re-tail
+/// via `darkmux flow tail --session <id>` to keep watching).
+///
+/// Polls the Redis stream (default `darkmux:flow`; override via
+/// `DARKMUX_REDIS_STREAM`) every `WAIT_POLL_INTERVAL` (250ms). Each
+/// poll runs `XRANGE - + COUNT 10000` and scans for an entry whose
+/// `record` field matches both the target `session_id` AND a
+/// `dispatch complete` action. The full-scan-per-poll trades CPU for
+/// correctness — the stream is bounded by `DARKMUX_REDIS_MAXLEN`
+/// (typically 10000), so the worst-case scan is bounded too. v1 cost
+/// model is fine; PR-E may add last-id tracking for efficiency.
+///
+/// **Why poll Redis, not the local file:** in a cross-machine dispatch
+/// the worker writes the `dispatch.complete` record to its OWN local
+/// `~/.darkmux/flows/<day>.jsonl`, not the publisher's. The Redis
+/// stream is the only substrate both machines write to (the shared
+/// `darkmux:flow` stream via the TeeSink → RedisSink composition).
+/// (CRITICAL fix from PR-C.3 review)
+pub fn wait_for_completion(
+    redis_url: &crate::flow::RawRedisUrl,
+    session_id: &str,
+    timeout: Duration,
+) -> Result<CompletionResult> {
+    let client = redis::Client::open(redis_url.expose_for_probe())
+        .with_context(|| format!("opening Redis to wait for completion of {session_id}"))?;
+    let mut conn = client
+        .get_connection()
+        .with_context(|| format!("connecting to Redis to wait for completion of {session_id}"))?;
+
+    let stream = std::env::var("DARKMUX_REDIS_STREAM")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "darkmux:flow".to_string());
+
+    let start = std::time::Instant::now();
+    loop {
+        if start.elapsed() > timeout {
+            return Err(anyhow!(
+                "wait_for_completion: no dispatch.complete for session_id={session_id} \
+                 within {}s in Redis stream {stream}. The job may still be running on the \
+                 worker — tail `darkmux flow tail --session {session_id}` to keep watching.",
+                timeout.as_secs()
+            ));
+        }
+
+        // XRANGE darkmux:flow - + COUNT 10000 — full-scan each poll. The
+        // stream is bounded (MAXLEN ~ 10000) so the scan is bounded too.
+        let raw: redis::Value = redis::cmd("XRANGE")
+            .arg(&stream)
+            .arg("-")
+            .arg("+")
+            .arg("COUNT")
+            .arg(WAIT_XRANGE_COUNT)
+            .query(&mut conn)
+            .with_context(|| format!("XRANGE on flow stream {stream}"))?;
+
+        if let Some(result) = scan_flow_entries_for_completion(&raw, session_id)? {
+            return Ok(result);
+        }
+
+        std::thread::sleep(WAIT_POLL_INTERVAL);
+    }
+}
+
+/// Walk XRANGE's nested-array response, scanning each entry's `record`
+/// field for a `dispatch.complete` event matching `session_id`. Returns
+/// the first match's CompletionResult, or `None` if no entry matches.
+/// Pure function; unit-testable independent of live Redis.
+fn scan_flow_entries_for_completion(
+    raw: &redis::Value,
+    session_id: &str,
+) -> Result<Option<CompletionResult>> {
+    use redis::Value as V;
+    // Expected shape: Array([Array([id, Array([k, v, k, v, ...])])])
+    let entries = match raw {
+        V::Array(a) => a,
+        V::Nil => return Ok(None),
+        other => return Err(anyhow!("XRANGE: unexpected outer shape: {other:?}")),
+    };
+    for entry in entries {
+        let parts = match entry {
+            V::Array(p) => p,
+            _ => continue,
+        };
+        if parts.len() < 2 {
+            continue;
+        }
+        let fields = match &parts[1] {
+            V::Array(f) => f,
+            _ => continue,
+        };
+        let Some(record_str) = extract_field(fields, "record") else {
+            continue;
+        };
+        if let Some(result) = match_completion(&record_str, session_id) {
+            return Ok(Some(result));
+        }
+    }
+    Ok(None)
+}
+
+/// Parse one record JSON; return `Some(CompletionResult)` when it's a
+/// dispatch-completion event for the target `session_id`. Pure function;
+/// unit-testable without live Redis.
+///
+/// Canonical action shape is `"dispatch complete"` (space, NOT dot) —
+/// that's what every production emit site uses today
+/// (`crew::dispatch::dispatch` openclaw path + `dispatch_internal::dispatch`
+/// internal-runtime path). The dotted form `"dispatch.complete"` is
+/// accepted as forward-compat in case a future cleanup migrates the
+/// emitters to match the dotted-per-action-type convention of
+/// `dispatch.turn` / `dispatch.tool` / etc. (PR-C.3 review HIGH-2)
+fn match_completion(line: &str, target_session_id: &str) -> Option<CompletionResult> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    let action = value.get("action").and_then(|v| v.as_str())?;
+    if action != "dispatch complete" && action != "dispatch.complete" {
+        return None;
+    }
+    let session = value.get("session_id").and_then(|v| v.as_str())?;
+    if session != target_session_id {
+        return None;
+    }
+    let payload = value.get("payload").cloned();
+    let result_class = payload
+        .as_ref()
+        .and_then(|p| p.get("result_class"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let wall_ms = payload
+        .as_ref()
+        .and_then(|p| p.get("wall_ms"))
+        .and_then(|v| v.as_u64());
+    Some(CompletionResult {
+        session_id: target_session_id.to_string(),
+        result_class,
+        wall_ms,
+        payload,
+    })
 }
 
 /// Convenience constructor — build a WorkJob from the components the
@@ -954,7 +1169,6 @@ impl WorkJob {
 /// defaults (attempt=1, published_at=now, etc.) so PR-C.3 doesn't
 /// duplicate the shape.
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)] // PR-C.1 substrate; consumed by PR-C.2 (worker loop) + PR-C.3 (client push)
 pub fn build_work_job(
     target_tier: String,
     target_machine: Option<String>,
@@ -1423,6 +1637,161 @@ mod tests {
         let mut j = good_job();
         j.target_machine = None;
         assert!(j.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_timeout() {
+        let mut j = good_job();
+        j.timeout_seconds = 0;
+        let err = j.validate().unwrap_err().to_string();
+        assert!(err.contains("timeout_seconds") && err.contains("non-zero"));
+    }
+
+    #[test]
+    fn validate_rejects_oversize_timeout() {
+        let mut j = good_job();
+        j.timeout_seconds = MAX_WORK_TIMEOUT_SECONDS + 1;
+        let err = j.validate().unwrap_err().to_string();
+        assert!(err.contains("timeout_seconds") && err.contains("exceeds"));
+    }
+
+    #[test]
+    fn validate_accepts_max_timeout() {
+        let mut j = good_job();
+        j.timeout_seconds = MAX_WORK_TIMEOUT_SECONDS;
+        assert!(j.validate().is_ok());
+    }
+
+    // ─── match_completion (PR-C.3 --wait wrapper) ─────────────────────
+
+    #[test]
+    fn match_completion_matches_canonical_action() {
+        // Canonical form today is "dispatch complete" (space) — every
+        // production emit site uses this. PR-C.3 review HIGH-2 caught
+        // the labels swapped in an earlier draft of this file.
+        let line = r#"{
+            "action": "dispatch complete",
+            "session_id": "sess-A",
+            "payload": {"result_class": "ok", "wall_ms": 12345}
+        }"#;
+        let result = match_completion(line, "sess-A").expect("matches");
+        assert_eq!(result.session_id, "sess-A");
+        assert_eq!(result.result_class, "ok");
+        assert_eq!(result.wall_ms, Some(12345));
+    }
+
+    #[test]
+    fn match_completion_matches_dotted_action_forward_compat() {
+        // Forward-compat for a future emitter migration to the dotted
+        // convention used by `dispatch.turn` / `dispatch.tool` / etc.
+        // No production emit-site uses this today.
+        let line = r#"{
+            "action": "dispatch.complete",
+            "session_id": "sess-B",
+            "payload": {"result_class": "error"}
+        }"#;
+        let result = match_completion(line, "sess-B").expect("matches");
+        assert_eq!(result.result_class, "error");
+        assert_eq!(result.wall_ms, None);
+    }
+
+    #[test]
+    fn match_completion_rejects_unrelated_session() {
+        let line = r#"{
+            "action": "dispatch complete",
+            "session_id": "sess-A",
+            "payload": {"result_class": "ok"}
+        }"#;
+        assert!(match_completion(line, "sess-B").is_none());
+    }
+
+    #[test]
+    fn match_completion_rejects_dispatch_start() {
+        let line = r#"{
+            "action": "dispatch.start",
+            "session_id": "sess-A"
+        }"#;
+        assert!(match_completion(line, "sess-A").is_none());
+    }
+
+    #[test]
+    fn match_completion_handles_missing_payload() {
+        let line = r#"{
+            "action": "dispatch complete",
+            "session_id": "sess-A"
+        }"#;
+        let result = match_completion(line, "sess-A").expect("matches");
+        assert_eq!(result.result_class, "unknown");
+        assert_eq!(result.wall_ms, None);
+    }
+
+    #[test]
+    fn match_completion_ignores_malformed_line() {
+        assert!(match_completion("not json", "sess-A").is_none());
+        assert!(match_completion("{}", "sess-A").is_none());
+        assert!(match_completion(r#"{"action": "dispatch complete"}"#, "sess-A").is_none());
+    }
+
+    // ─── scan_flow_entries_for_completion (PR-C.3 Redis-poll path) ────
+
+    #[test]
+    fn scan_flow_entries_handles_empty_stream() {
+        // Empty XRANGE response = no entries yet, return None (not an error).
+        let resp = redis::Value::Array(vec![]);
+        let result = scan_flow_entries_for_completion(&resp, "sess-X").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn scan_flow_entries_handles_nil() {
+        // Nil response (some redis-rs versions) — same as empty.
+        let result = scan_flow_entries_for_completion(&redis::Value::Nil, "sess-X").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn scan_flow_entries_finds_completion_for_session() {
+        use redis::Value as V;
+        let record = r#"{
+            "action": "dispatch complete",
+            "session_id": "sess-target",
+            "payload": {"result_class": "ok", "wall_ms": 5000}
+        }"#;
+        // Mock XRANGE response: Array([Array([id, Array([k,v,k,v])])])
+        let resp = V::Array(vec![V::Array(vec![
+            V::BulkString(b"1716192000000-0".to_vec()),
+            V::Array(vec![
+                V::BulkString(b"schema".to_vec()),
+                V::BulkString(b"1.8.0".to_vec()),
+                V::BulkString(b"record".to_vec()),
+                V::BulkString(record.as_bytes().to_vec()),
+            ]),
+        ])]);
+        let result = scan_flow_entries_for_completion(&resp, "sess-target").unwrap();
+        let c = result.expect("matches");
+        assert_eq!(c.session_id, "sess-target");
+        assert_eq!(c.result_class, "ok");
+        assert_eq!(c.wall_ms, Some(5000));
+    }
+
+    #[test]
+    fn scan_flow_entries_skips_non_matching_sessions() {
+        use redis::Value as V;
+        let record_a = r#"{"action":"dispatch complete","session_id":"sess-A","payload":{"result_class":"ok"}}"#;
+        let record_b = r#"{"action":"dispatch start","session_id":"sess-target"}"#;
+        let resp = V::Array(vec![
+            V::Array(vec![
+                V::BulkString(b"1-0".to_vec()),
+                V::Array(vec![V::BulkString(b"record".to_vec()), V::BulkString(record_a.as_bytes().to_vec())]),
+            ]),
+            V::Array(vec![
+                V::BulkString(b"2-0".to_vec()),
+                V::Array(vec![V::BulkString(b"record".to_vec()), V::BulkString(record_b.as_bytes().to_vec())]),
+            ]),
+        ]);
+        let result = scan_flow_entries_for_completion(&resp, "sess-target").unwrap();
+        // No `dispatch complete` for sess-target → None
+        assert!(result.is_none());
     }
 
     // ─── #[serde(deny_unknown_fields)] (PR-C.2) ───────────────────────
