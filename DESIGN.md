@@ -68,7 +68,7 @@ This is what would let users find the predictive correlate for fast vs slow mode
 - Not an inference framework (vLLM/SGLang have that covered)
 - Not an agent framework (LangChain/AutoGen have that covered)
 - Not a prompt router across providers (LiteLLM has that covered, and it's cloud-oriented)
-- Not multi-tenant (single-user local-AI scope)
+- Not *designed* for multi-tenant deployment. **darkmux is single-operator, multi-machine.** A hobbyist or individual engineer's "few Macs joined over a mesh VPN" is the natural deployment shape. Trust boundary is the operator-controlled tailnet, not enforcement in darkmux's code: `DARKMUX_REDIS_URL` carries no auth beyond what the underlying mesh + Redis ACLs already provide; `DARKMUX_ORCHESTRATOR` and `DARKMUX_MACHINE_ID` are operator-asserted provenance, not authenticated identity; cross-machine state on the shared substrate assumes all participants are the same operator. Fork-friendly if multi-tenant matters to you — the substrate is a reasonable starting point and the missing pieces (auth, ACLs, fairness across distrusting users) are well-trodden territory in other systems.
 
 ## Composability
 
