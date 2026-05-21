@@ -589,10 +589,13 @@ pub struct WorkJob {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sprint_id: Option<String>,
 
-    /// Which runtime the worker should use — `"openclaw"` (default) or
-    /// `"internal"`.
-    #[serde(default = "default_runtime")]
-    pub runtime: String,
+    /// Which runtime the worker should use — `Openclaw` (default) or
+    /// `Internal`. Wave-E.14 lifted this from `String` to the
+    /// `Runtime` enum: a mistyped runtime is rejected at JSON-parse
+    /// time by serde rather than at `validate()`, eliminating a class
+    /// of "publisher snuck through validate, worker crashed" bugs.
+    #[serde(default)]
+    pub runtime: crate::crew::dispatch::Runtime,
 
     /// Per-turn timeout (seconds) — passes through to the runtime's
     /// turn timeout.
@@ -616,10 +619,6 @@ pub struct WorkJob {
     /// Attempt counter — 1 on first publish, 2+ after a lease-expiry
     /// re-publish (PR-E semantics). PR-C.1 always publishes with 1.
     pub attempt: u32,
-}
-
-fn default_runtime() -> String {
-    "openclaw".to_string()
 }
 
 /// Max byte size of a `WorkJob.message` accepted by the queue. A
@@ -660,25 +659,22 @@ impl WorkJob {
     ///   `role_id`) match `[a-z0-9_-]{1,MAX_WORK_IDENTIFIER_LEN}`. Rejects
     ///   path-traversal (`../`), null bytes, command-injection chars,
     ///   and over-long values.
-    /// - `runtime` is one of `"openclaw"` or `"internal"`. Future
-    ///   runtime names require a deliberate code change here.
     /// - `message` ≤ `MAX_WORK_MESSAGE_BYTES`. Prevents memory
     ///   exhaustion at deserialize time.
     /// - Optional `workdir` ≤ `MAX_WORK_WORKDIR_BYTES`. The
     ///   symlink-escape check on the resolved path is done by the
     ///   worker (PR-C.2b / follow-up).
+    ///
+    /// `runtime` is not checked here — the field is the `Runtime` enum,
+    /// so an unknown variant is rejected at JSON deserialization
+    /// (Wave-E.14 #255). A new runtime requires a deliberate variant
+    /// add to `Runtime`.
     pub fn validate(&self) -> Result<()> {
         validate_work_identifier("target_tier", &self.target_tier)?;
         if let Some(m) = &self.target_machine {
             validate_work_identifier("target_machine", m)?;
         }
         validate_work_identifier("role_id", &self.role_id)?;
-        if !matches!(self.runtime.as_str(), "openclaw" | "internal") {
-            return Err(anyhow!(
-                "WorkJob.runtime must be 'openclaw' or 'internal' (got {:?})",
-                self.runtime
-            ));
-        }
         if self.message.len() > MAX_WORK_MESSAGE_BYTES {
             return Err(anyhow!(
                 "WorkJob.message exceeds {}-byte cap (was {} bytes)",
@@ -1215,8 +1211,7 @@ impl WorkJob {
     /// queue → in-process boundary so PR-C.3's client path can be checked
     /// against this shape for round-trip parity.
     pub fn into_dispatch_opts(self) -> crate::crew::dispatch::DispatchOpts {
-        use crate::crew::dispatch::{DispatchOpts, Runtime};
-        let runtime = Runtime::parse(&self.runtime).unwrap_or(Runtime::Openclaw);
+        use crate::crew::dispatch::DispatchOpts;
         DispatchOpts {
             role_id: self.role_id,
             message: self.message,
@@ -1227,7 +1222,7 @@ impl WorkJob {
             watch_paths: vec![],
             workdir: self.workdir.map(PathBuf::from),
             sprint_id: self.sprint_id,
-            runtime,
+            runtime: self.runtime,
             // Worker-side opts: never recurse into the queue (would
             // ping-pong jobs back to redis); always run local synchronous.
             machine: None,
@@ -1437,7 +1432,7 @@ pub fn build_work_job(
     deliver: Option<String>,
     workdir: Option<String>,
     sprint_id: Option<String>,
-    runtime: String,
+    runtime: crate::crew::dispatch::Runtime,
     timeout_seconds: u32,
     published_by_machine: Option<String>,
     published_by_orchestrator: Option<String>,
@@ -1693,7 +1688,7 @@ mod tests {
             None,
             Some("/tmp/workspace".to_string()),
             None,
-            "openclaw".to_string(),
+            crate::crew::dispatch::Runtime::Openclaw,
             600,
             Some("studio".to_string()),
             Some("claude-opus-4-7".to_string()),
@@ -1719,7 +1714,7 @@ mod tests {
             None, // deliver None
             None, // workdir None
             None, // sprint_id None
-            "openclaw".to_string(),
+            crate::crew::dispatch::Runtime::Openclaw,
             300,
             None, // published_by_machine None
             None, // published_by_orchestrator None
@@ -1745,7 +1740,49 @@ mod tests {
             "attempt": 1
         }"#;
         let parsed: WorkJob = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed.runtime, "openclaw");
+        assert_eq!(parsed.runtime, crate::crew::dispatch::Runtime::Openclaw);
+    }
+
+    /// Wave-E.14: lifting `runtime` from String to enum moves the
+    /// "unknown runtime" check from `validate()` to JSON-parse time. A
+    /// publisher that XADD's a job with `"runtime": "nuclear"` is
+    /// rejected before the job ever enters the worker's WorkJob in-memory
+    /// shape — the consumer's `serde_json::from_str` fails loud rather
+    /// than going through validate.
+    #[test]
+    fn work_job_unknown_runtime_rejected_at_deserialize() {
+        let json = r#"{
+            "target_tier": "any",
+            "role_id": "scribe",
+            "message": "hi",
+            "session_id": "s-1",
+            "runtime": "nuclear",
+            "timeout_seconds": 300,
+            "published_at_unix_ms": 0,
+            "attempt": 1
+        }"#;
+        let err = serde_json::from_str::<WorkJob>(json).unwrap_err().to_string();
+        assert!(
+            err.contains("variant") || err.contains("runtime") || err.contains("nuclear"),
+            "expected serde to name the unknown variant; got: {err}"
+        );
+    }
+
+    /// Round-trip parity: Runtime::Openclaw serializes as "openclaw"
+    /// (lowercase) and Runtime::Internal as "internal", matching the
+    /// CLI-flag plumbing and the pre-enum String values so older
+    /// JSON-on-disk records keep loading.
+    #[test]
+    fn runtime_enum_serdes_as_lowercase_string() {
+        use crate::crew::dispatch::Runtime;
+        let oc = serde_json::to_string(&Runtime::Openclaw).unwrap();
+        assert_eq!(oc, "\"openclaw\"");
+        let ic = serde_json::to_string(&Runtime::Internal).unwrap();
+        assert_eq!(ic, "\"internal\"");
+        let oc_back: Runtime = serde_json::from_str("\"openclaw\"").unwrap();
+        assert_eq!(oc_back, Runtime::Openclaw);
+        let ic_back: Runtime = serde_json::from_str("\"internal\"").unwrap();
+        assert_eq!(ic_back, Runtime::Internal);
     }
 
     #[test]
@@ -1776,7 +1813,7 @@ mod tests {
             None,
             None,
             None,
-            "openclaw".to_string(),
+            crate::crew::dispatch::Runtime::Openclaw,
             600,
             None,
             None,
@@ -1858,7 +1895,7 @@ mod tests {
             None,
             None,
             None,
-            "openclaw".to_string(),
+            crate::crew::dispatch::Runtime::Openclaw,
             600,
             None,
             None,
@@ -1893,20 +1930,11 @@ mod tests {
         assert!(err.contains("exceeds") && err.contains("role_id"));
     }
 
-    #[test]
-    fn validate_rejects_unknown_runtime() {
-        let mut j = good_job();
-        j.runtime = "nuclear".to_string();
-        let err = j.validate().unwrap_err().to_string();
-        assert!(err.contains("runtime"));
-    }
-
-    #[test]
-    fn validate_rejects_empty_runtime() {
-        let mut j = good_job();
-        j.runtime = "".to_string();
-        assert!(j.validate().is_err());
-    }
+    // Wave-E.14 (#255): `validate_rejects_unknown_runtime` /
+    // `validate_rejects_empty_runtime` removed — `runtime` is now a
+    // `Runtime` enum, so unknown/empty values are rejected at
+    // `serde::Deserialize` time before the WorkJob exists. See
+    // `work_job_unknown_runtime_rejected_at_deserialize` above.
 
     #[test]
     fn validate_rejects_oversize_message() {

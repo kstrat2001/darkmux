@@ -1385,7 +1385,7 @@ fn cmd_mission_dispatch(
             None,
             None,
             Some(sprint.id.clone()),
-            "openclaw".to_string(),
+            crate::crew::dispatch::Runtime::Openclaw,
             timeout_seconds,
             local_machine.clone(),
             local_orchestrator.clone(),
