@@ -1286,12 +1286,17 @@ fn cmd_mission_dispatch(
         ),
     };
 
-    // 3. Filter sprints: this mission + depends_on=[].
+    // 3. Filter sprints: this mission + depends_on=[] + status=Planned.
+    //    `Running` is NOT included — a sprint already running locally
+    //    would be re-dispatched, racing two workers on the same work
+    //    (both reviewers HIGH-1 from PR-D.1 review). Operator who
+    //    wants to re-dispatch a Running sprint should explicitly
+    //    `darkmux sprint abandon` first.
     let sprints = load_sprints()?;
     let initial: Vec<_> = sprints
         .iter()
         .filter(|s| s.mission_id == mission_id && s.depends_on.is_empty())
-        .filter(|s| matches!(s.status, crew::types::SprintStatus::Planned | crew::types::SprintStatus::Running))
+        .filter(|s| matches!(s.status, crew::types::SprintStatus::Planned))
         .collect();
 
     if initial.is_empty() {
@@ -1314,26 +1319,23 @@ fn cmd_mission_dispatch(
     let client = redis::Client::open(raw_url.expose_for_probe())
         .with_context(|| format!("opening Redis client {raw_url} for mission dispatch"))?;
 
-    // 5. Publish one WorkJob per sprint. Capture session_ids for the
-    //    wait-aggregation phase.
+    // 5. Build + pre-validate all WorkJobs BEFORE publishing any
+    //    (HIGH-2 from review). All-or-nothing semantics: if any sprint
+    //    would trip validate() (oversize description, etc.), the
+    //    operator finds out before ANY orphan job lands on Redis.
+    //    Loop-index suffix on session_id defeats microsecond collisions
+    //    under sub-microsecond loop iterations (review M-session-id).
     let local_machine = flow::resolve_machine_id();
     let local_orchestrator = flow::resolve_orchestrator();
-    let mut sessions: Vec<(String, String, String)> = Vec::new(); // (sprint_id, session_id, work_id)
-    eprintln!(
-        "darkmux mission dispatch: mission={mission_id} role={role_id} tier={role_tier} \
-         sprints={} target_machine={:?}",
-        initial.len(),
-        machine
-    );
-    for sprint in &initial {
+    let dispatch_micros = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros())
+        .unwrap_or(0);
+    let mut jobs: Vec<(String, String, fleet::WorkJob)> = Vec::new(); // (sprint_id, session_id, job)
+    for (idx, sprint) in initial.iter().enumerate() {
         let session_id = format!(
-            "mission-{}-sprint-{}-{}",
-            mission_id,
-            sprint.id,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_micros())
-                .unwrap_or(0)
+            "mission-{}-sprint-{}-{}-{}",
+            mission_id, sprint.id, dispatch_micros, idx
         );
         let job = fleet::build_work_job(
             role_tier.clone(),
@@ -1341,21 +1343,57 @@ fn cmd_mission_dispatch(
             role_id.to_string(),
             sprint.description.clone(),
             session_id.clone(),
-            None, // deliver
-            None, // workdir
+            None,
+            None,
             Some(sprint.id.clone()),
             "openclaw".to_string(),
             timeout_seconds,
             local_machine.clone(),
             local_orchestrator.clone(),
         );
-        let work_id = fleet::publish_job(&client, &job)
-            .with_context(|| format!("publishing sprint `{}` as WorkJob", sprint.id))?;
-        eprintln!(
-            "  sprint={} work_id={work_id} session={session_id}",
-            sprint.id
-        );
-        sessions.push((sprint.id.clone(), session_id, work_id));
+        // Pre-validate. Surfaces oversize/charset failures BEFORE any
+        // partial publish lands on the queue.
+        job.validate().with_context(|| {
+            format!("pre-publish validation failed for sprint `{}`", sprint.id)
+        })?;
+        jobs.push((sprint.id.clone(), session_id, job));
+    }
+
+    // 6. Publish. Capture sessions for wait-aggregation. If a mid-loop
+    //    publish fails (Redis network blip), the operator gets the
+    //    list of already-published (sprint_id, session_id, work_id)
+    //    triples on stderr so they can dedup / clean up via flow tail.
+    eprintln!(
+        "darkmux mission dispatch: mission={mission_id} role={role_id} tier={role_tier} \
+         sprints={} target_machine={}",
+        jobs.len(),
+        machine.unwrap_or("<any>")
+    );
+    let mut sessions: Vec<(String, String, String)> = Vec::new(); // (sprint_id, session_id, work_id)
+    for (sprint_id, session_id, job) in &jobs {
+        match fleet::publish_job(&client, job) {
+            Ok(work_id) => {
+                eprintln!("  sprint={sprint_id} work_id={work_id} session={session_id}");
+                sessions.push((sprint_id.clone(), session_id.clone(), work_id));
+            }
+            Err(e) => {
+                eprintln!(
+                    "\ndarkmux mission dispatch: ERROR — publish failed for sprint `{sprint_id}` \
+                     after {} successful publishes. Already-published jobs are in flight on workers:",
+                    sessions.len()
+                );
+                for (sid, sess, wid) in &sessions {
+                    eprintln!("  ORPHAN sprint={sid} session={sess} work_id={wid}");
+                }
+                eprintln!(
+                    "Tail each via `darkmux flow tail --session <id>` (when implemented) OR \
+                     XRANGE darkmux:flow against the published session_ids to track completion. \
+                     Do NOT re-run mission dispatch without checking — re-publish would \
+                     double-fire the orphans."
+                );
+                return Err(e).with_context(|| format!("publishing sprint `{sprint_id}` as WorkJob"));
+            }
+        }
     }
 
     if !wait {
