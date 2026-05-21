@@ -1478,21 +1478,80 @@ fn cmd_mission_dispatch(
          wall_ms={mission_wall_ms} sum_sprint_wall_ms={sum_sprint_wall_ms}",
         sessions.len()
     );
-    if sum_sprint_wall_ms > 0 {
-        let speedup = (sum_sprint_wall_ms as f64) / (mission_wall_ms as f64).max(1.0);
-        if speedup >= 1.5 {
-            println!(
-                "  → parallel dispatch confirmed: {speedup:.2}× speedup vs serial baseline."
-            );
-        } else if sessions.len() > 1 {
-            println!(
-                "  ⚠ wall_ms ≈ sum of sprint wall_ms ({speedup:.2}×) — sprints may have run serially. \
-                 Check fleet roster + worker reachability."
-            );
-        }
+    match speedup_verdict(sum_sprint_wall_ms, mission_wall_ms, sessions.len()) {
+        SpeedupVerdict::ParallelConfirmed { speedup } => println!(
+            "  → wall-clock indicates parallel execution: {speedup:.2}× speedup vs the \
+             sum of per-sprint wall_ms (worker self-reported; not authenticated)."
+        ),
+        SpeedupVerdict::SeriallySuspect { speedup } => println!(
+            "  ⚠ wall_ms ≈ sum of sprint wall_ms ({speedup:.2}×) — sprints may have run \
+             serially. Check fleet roster + worker reachability."
+        ),
+        SpeedupVerdict::Inconclusive => {}
     }
 
     if failures > 0 { Ok(1) } else { Ok(0) }
+}
+
+/// Minimum speedup ratio (sum_sprint_wall_ms / mission_wall_ms) at which
+/// the mission-dispatch summary asserts "parallel execution." Below this,
+/// the metric is reported with a serially-suspect warning OR nothing
+/// (n=1 case). 1.5 is a conservative threshold for 2-machine fleets —
+/// noise and per-sprint setup overhead can push a truly-parallel run
+/// below 2.0× speedup. Adjust upward if false-positives appear.
+const PARALLELISM_CONFIRMED_THRESHOLD: f64 = 1.5;
+
+/// Verdict from the empirical parallelism metric computed at the end of
+/// `mission dispatch --wait`. Extracted as a pure function (#255 Wave-E.4)
+/// so the math + thresholding are unit-testable independent of the rest
+/// of the dispatch handler.
+#[derive(Debug, PartialEq)]
+pub enum SpeedupVerdict {
+    /// Wall-clock indicates parallel execution: speedup ≥
+    /// `PARALLELISM_CONFIRMED_THRESHOLD` AND more than one sprint
+    /// completed. Caller renders an operator-facing
+    /// "parallel execution: Nx speedup" line.
+    ParallelConfirmed { speedup: f64 },
+    /// Wall-clock ≈ sum-of-sprints (`speedup < threshold`) with multiple
+    /// sprints — sprints may have run serially under the hood. Caller
+    /// renders the operator-warning line pointing at fleet roster +
+    /// worker reachability.
+    SeriallySuspect { speedup: f64 },
+    /// Insufficient data to assert parallel vs serial: either zero
+    /// sprints completed (`sum_sprint_wall_ms == 0`) OR exactly one
+    /// sprint (parallelism is undefined for n=1). Caller stays silent.
+    Inconclusive,
+}
+
+/// Pure-function speedup verdict computation. Inputs are the metric
+/// summaries collected during `mission dispatch --wait`:
+///
+/// - `sum_sprint_wall_ms` — sum of `wall_ms` from each
+///   `dispatch.complete` flow record. Worker self-reported.
+/// - `mission_wall_ms` — wall time from `mission dispatch` invocation
+///   to the last completion seen, measured by the publisher.
+/// - `n_sprints` — number of sprints dispatched (sessions.len()).
+pub fn speedup_verdict(
+    sum_sprint_wall_ms: u64,
+    mission_wall_ms: u64,
+    n_sprints: usize,
+) -> SpeedupVerdict {
+    if sum_sprint_wall_ms == 0 || n_sprints == 0 {
+        return SpeedupVerdict::Inconclusive;
+    }
+    // Avoid divide-by-zero on instantaneous missions; the `.max(1.0)`
+    // floor doesn't materially change any non-degenerate case.
+    let speedup = (sum_sprint_wall_ms as f64) / (mission_wall_ms as f64).max(1.0);
+    if n_sprints > 1 && speedup >= PARALLELISM_CONFIRMED_THRESHOLD {
+        SpeedupVerdict::ParallelConfirmed { speedup }
+    } else if n_sprints > 1 {
+        SpeedupVerdict::SeriallySuspect { speedup }
+    } else {
+        // n == 1: parallelism is undefined for a single sprint. Stay
+        // silent even if the math says speedup >= threshold (which can
+        // only happen via clock skew or wall_ms misreporting).
+        SpeedupVerdict::Inconclusive
+    }
 }
 
 fn cmd_agent(sub: AgentCmd) -> Result<i32> {
@@ -2428,6 +2487,82 @@ fn cmd_lab(sub: LabCmd) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── speedup_verdict (Wave-E.4 #255) ──────────────────────────────
+
+    #[test]
+    fn speedup_verdict_confirms_parallel_when_speedup_above_threshold() {
+        // 2 sprints, each 5000ms, mission wall 5000ms → speedup = 2.0
+        let v = speedup_verdict(10_000, 5_000, 2);
+        match v {
+            SpeedupVerdict::ParallelConfirmed { speedup } => {
+                assert!((speedup - 2.0).abs() < 0.01, "speedup ≈ 2.0; got {speedup}");
+            }
+            other => panic!("expected ParallelConfirmed; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn speedup_verdict_warns_serial_when_speedup_below_threshold() {
+        // 2 sprints, sum 10000ms, mission wall 8500ms → speedup ≈ 1.18 (< 1.5)
+        let v = speedup_verdict(10_000, 8_500, 2);
+        match v {
+            SpeedupVerdict::SeriallySuspect { speedup } => {
+                assert!((speedup - 1.18).abs() < 0.05, "speedup ≈ 1.18; got {speedup}");
+            }
+            other => panic!("expected SeriallySuspect; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn speedup_verdict_inconclusive_when_no_sprints_completed() {
+        assert_eq!(
+            speedup_verdict(0, 100, 2),
+            SpeedupVerdict::Inconclusive,
+            "zero sum (e.g. all dispatch errors) → Inconclusive"
+        );
+    }
+
+    #[test]
+    fn speedup_verdict_inconclusive_when_single_sprint() {
+        // Parallelism is undefined for a single sprint — stay silent
+        // even if the math would otherwise say "confirmed".
+        let v = speedup_verdict(10_000, 5_000, 1);
+        assert_eq!(v, SpeedupVerdict::Inconclusive);
+    }
+
+    #[test]
+    fn speedup_verdict_inconclusive_when_zero_sessions() {
+        let v = speedup_verdict(10_000, 5_000, 0);
+        assert_eq!(v, SpeedupVerdict::Inconclusive);
+    }
+
+    #[test]
+    fn speedup_verdict_handles_zero_wall_ms_safely() {
+        // Instantaneous mission (clock granularity). Math floor at 1ms
+        // prevents divide-by-zero; verdict is still computed.
+        let v = speedup_verdict(5_000, 0, 2);
+        match v {
+            SpeedupVerdict::ParallelConfirmed { speedup } => {
+                assert!(speedup >= PARALLELISM_CONFIRMED_THRESHOLD);
+            }
+            other => panic!("expected ParallelConfirmed (degenerate); got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn speedup_verdict_threshold_boundary_exact_match_confirms() {
+        // 1.5× exactly → ParallelConfirmed (boundary inclusive). Sum=1500, wall=1000.
+        let v = speedup_verdict(1_500, 1_000, 2);
+        assert!(matches!(v, SpeedupVerdict::ParallelConfirmed { .. }));
+    }
+
+    #[test]
+    fn speedup_verdict_threshold_boundary_just_below_warns() {
+        // 1.49× → SeriallySuspect (just below the inclusive threshold).
+        let v = speedup_verdict(1_490, 1_000, 2);
+        assert!(matches!(v, SpeedupVerdict::SeriallySuspect { .. }));
+    }
 
     #[test]
     fn derive_profile_name_strips_publisher_and_lowercases() {
