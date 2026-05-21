@@ -1451,9 +1451,8 @@ fn cmd_mission_dispatch(
         (timeout_seconds as u64).saturating_add(60),
     );
     eprintln!(
-        "\ndarkmux mission dispatch: waiting for {} completion(s) (per-sprint timeout {}s + 60s slack)…",
-        sessions.len(),
-        timeout_seconds
+        "\n{}",
+        worst_case_wait_banner(sessions.len(), timeout_seconds, wait_timeout.as_secs())
     );
     let mut completed: usize = 0;
     let mut failures: usize = 0;
@@ -1503,6 +1502,28 @@ fn cmd_mission_dispatch(
     }
 
     if failures > 0 { Ok(1) } else { Ok(0) }
+}
+
+/// Render the operator-facing "waiting for N completion(s)" banner with
+/// the worst-case wall-clock bound named up front (Wave-E.9 #255). The
+/// wait loop is sequential-per-sprint, so worst case is
+/// `N × (per_sprint_timeout + slack)`. Surfacing this lets the operator
+/// decide whether to SIGINT before the second per-sprint timeout if the
+/// first sprint hangs — closes the PR-D.1 review MEDIUM where the
+/// unbounded total wait could quietly run hours.
+pub fn worst_case_wait_banner(
+    n_sessions: usize,
+    per_sprint_timeout_seconds: u32,
+    wait_timeout_seconds: u64,
+) -> String {
+    let worst_case_secs = (n_sessions as u64).saturating_mul(wait_timeout_seconds);
+    format!(
+        "darkmux mission dispatch: waiting for {n_sessions} completion(s) \
+         (per-sprint timeout {per_sprint_timeout_seconds}s + 60s slack; \
+         worst-case total wall ≈ {worst_case_secs}s = {worst_case_min}min). \
+         SIGINT cleanly aborts.",
+        worst_case_min = worst_case_secs / 60,
+    )
 }
 
 /// Minimum speedup ratio (sum_sprint_wall_ms / mission_wall_ms) at which
@@ -2499,6 +2520,41 @@ fn cmd_lab(sub: LabCmd) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── worst_case_wait_banner (Wave-E.9 #255) ──────────────────────
+
+    #[test]
+    fn worst_case_wait_banner_names_total_bound() {
+        let s = worst_case_wait_banner(3, 600, 660);
+        assert!(s.contains("3 completion(s)"));
+        assert!(s.contains("worst-case total wall ≈ 1980s"));
+        assert!(s.contains("33min")); // 1980 / 60
+        assert!(s.contains("SIGINT"));
+    }
+
+    #[test]
+    fn worst_case_wait_banner_handles_single_sprint() {
+        let s = worst_case_wait_banner(1, 60, 120);
+        assert!(s.contains("1 completion(s)"));
+        assert!(s.contains("worst-case total wall ≈ 120s"));
+        assert!(s.contains("2min"));
+    }
+
+    #[test]
+    fn worst_case_wait_banner_handles_zero_sessions_gracefully() {
+        // Defensive: should NOT panic on degenerate inputs even if the
+        // caller's flow normally guards against this.
+        let s = worst_case_wait_banner(0, 600, 660);
+        assert!(s.contains("0 completion(s)"));
+        assert!(s.contains("worst-case total wall ≈ 0s"));
+    }
+
+    #[test]
+    fn worst_case_wait_banner_uses_saturating_arithmetic() {
+        // u64 overflow check: large N × large wait_timeout shouldn't panic.
+        let s = worst_case_wait_banner(u64::MAX as usize, 3600, 3660);
+        assert!(s.contains("worst-case"));
+    }
 
     // ─── speedup_verdict (Wave-E.4 #255) ──────────────────────────────
 
