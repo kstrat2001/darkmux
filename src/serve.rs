@@ -406,23 +406,197 @@ async fn flow_stream_handler(
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
 }
 
-/// GET /flow/:date.jsonl — returns file contents for validated dates.
+/// GET /flow/:date — returns flow records for a UTC day.
+///
+/// Two response shapes, picked by URL suffix:
+/// - `<date>.jsonl` → newline-delimited JSON (`application/x-ndjson`),
+///   served from the local file. Used by the legacy `/flow` viewer
+///   page; behavior unchanged since pre-#270.
+/// - `<date>` (no extension) → JSON array (`application/json`). When
+///   `DARKMUX_REDIS_URL` is set + reachable, the array is aggregated
+///   from Redis (`darkmux:flow` stream, filtered by date) — the
+///   **fleet-wide** view across every machine writing to the same
+///   stream. When Redis is unconfigured OR unreachable, the array
+///   comes from the local `<date>.jsonl` file (#270). The topology
+///   viewer's backfill consumes this shape.
 async fn flow_handler(
     State(state): State<AppState>,
     Path(segment): Path<String>,
 ) -> impl IntoResponse {
-    let Some(date) = is_valid_date_jsonl(&segment) else {
+    // Legacy ndjson path — preserve byte-for-byte for the /flow page.
+    if let Some(date) = is_valid_date_jsonl(&segment) {
+        let file = state.flows_dir.join(format!("{date}.jsonl"));
+        return match tokio::fs::read(&file).await {
+            Ok(bytes) => (
+                StatusCode::OK,
+                [("content-type", "application/x-ndjson")],
+                bytes,
+            )
+                .into_response(),
+            Err(_) => (StatusCode::NOT_FOUND, "not found").into_response(),
+        };
+    }
+
+    // JSON-array path — used by the topology viewer. Aggregates from
+    // Redis when available; falls back to the local file otherwise.
+    let Some(date) = is_valid_date(&segment) else {
         return (StatusCode::BAD_REQUEST, "bad date format").into_response();
     };
-    let file = state.flows_dir.join(format!("{date}.jsonl"));
-    match tokio::fs::read(&file).await {
-        Ok(bytes) => (
-            StatusCode::OK,
-            [("content-type", "application/x-ndjson")],
-            bytes,
-        ).into_response(),
-        Err(_) => (StatusCode::NOT_FOUND, "not found").into_response(),
+    let records = aggregate_flow_records_for_date(date, &state.flows_dir).await;
+    axum::Json(records).into_response()
+}
+
+/// Aggregate the day's flow records — Redis-when-available, file-otherwise.
+///
+/// Resolution order:
+/// 1. `DARKMUX_REDIS_URL` set + reachable → `XRANGE darkmux:flow - + COUNT N`,
+///    parse each entry's `record` field, filter by `record.ts.starts_with(date)`.
+///    `darkmux:flow` stream override honored via `DARKMUX_REDIS_STREAM`.
+/// 2. Redis configured but unreachable → log the fallback once and read
+///    the local file. Daemon stays serving rather than 500-ing.
+/// 3. `DARKMUX_REDIS_URL` unset → read the local file directly.
+///
+/// Missing-file is not an error here: empty array is the correct response
+/// for a date the local machine has no record of. The viewer can ask
+/// `flow-status` to know whether Redis is participating.
+async fn aggregate_flow_records_for_date(
+    date: &str,
+    flows_dir: &std::path::Path,
+) -> Vec<serde_json::Value> {
+    let redis_url = std::env::var("DARKMUX_REDIS_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    if let Some(url) = redis_url {
+        let date_owned = date.to_string();
+        let url_owned = url.clone();
+        let redis_result = tokio::task::spawn_blocking(move || {
+            read_flow_records_from_redis(&url_owned, &date_owned)
+        })
+        .await;
+        match redis_result {
+            Ok(Ok(records)) => return records,
+            Ok(Err(e)) => {
+                eprintln!(
+                    "darkmux serve: GET /flow/{date} Redis aggregation failed ({e}); \
+                     falling back to local file"
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "darkmux serve: GET /flow/{date} blocking task join error ({e}); \
+                     falling back to local file"
+                );
+            }
+        }
     }
+
+    read_flow_records_from_file(date, flows_dir).await
+}
+
+/// XRANGE the flow stream + filter by `record.ts` matching `<date>`.
+/// Synchronous (uses the sync `redis::Client`) — call site wraps in
+/// `spawn_blocking` so the daemon's async runtime stays responsive.
+fn read_flow_records_from_redis(
+    url: &str,
+    date: &str,
+) -> Result<Vec<serde_json::Value>, anyhow::Error> {
+    use anyhow::Context;
+    let client = redis::Client::open(url)
+        .with_context(|| format!("opening Redis client for /flow aggregation: {url}"))?;
+    let mut conn = client
+        .get_connection()
+        .with_context(|| format!("connecting to Redis for /flow aggregation: {url}"))?;
+    let stream = std::env::var("DARKMUX_REDIS_STREAM")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "darkmux:flow".to_string());
+    // Bounded by DARKMUX_REDIS_MAXLEN at write time (default 10k) — same
+    // count as wait_for_completion's XRANGE in fleet.rs:1332.
+    let raw: redis::Value = redis::cmd("XRANGE")
+        .arg(&stream)
+        .arg("-")
+        .arg("+")
+        .arg("COUNT")
+        .arg(10000)
+        .query(&mut conn)
+        .with_context(|| format!("XRANGE on {stream}"))?;
+    let entries = match raw {
+        redis::Value::Array(v) => v,
+        other => {
+            return Err(anyhow::anyhow!(
+                "unexpected XRANGE response shape: {other:?}"
+            ));
+        }
+    };
+    let mut records = Vec::with_capacity(entries.len().min(10000));
+    for entry in entries {
+        // Each entry is [id, [k, v, k, v, ...]]. Find the `record` field.
+        let pairs = match entry {
+            redis::Value::Array(v) if v.len() >= 2 => v,
+            _ => continue,
+        };
+        let fields = match &pairs[1] {
+            redis::Value::Array(f) => f,
+            _ => continue,
+        };
+        let mut record_json: Option<&str> = None;
+        let mut i = 0;
+        while i + 1 < fields.len() {
+            let key = match &fields[i] {
+                redis::Value::BulkString(b) => std::str::from_utf8(b).ok(),
+                redis::Value::SimpleString(s) => Some(s.as_str()),
+                _ => None,
+            };
+            if key == Some("record") {
+                record_json = match &fields[i + 1] {
+                    redis::Value::BulkString(b) => std::str::from_utf8(b).ok(),
+                    redis::Value::SimpleString(s) => Some(s.as_str()),
+                    _ => None,
+                };
+                break;
+            }
+            i += 2;
+        }
+        let Some(json) = record_json else { continue };
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json) else {
+            continue;
+        };
+        // Filter by record.ts prefix — `YYYY-MM-DDTHH:MM:SSZ` (see
+        // flow::ts_utc_now). Records without a parseable ts are dropped
+        // because they can't be assigned to a UTC day reliably.
+        let matches_date = parsed
+            .get("ts")
+            .and_then(|v| v.as_str())
+            .map(|ts| ts.starts_with(date))
+            .unwrap_or(false);
+        if matches_date {
+            records.push(parsed);
+        }
+    }
+    Ok(records)
+}
+
+/// Parse `<flows_dir>/<date>.jsonl` into a Vec of JSON values. Missing
+/// file = empty Vec (not an error).
+async fn read_flow_records_from_file(
+    date: &str,
+    flows_dir: &std::path::Path,
+) -> Vec<serde_json::Value> {
+    let path = flows_dir.join(format!("{date}.jsonl"));
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(b) => b,
+        Err(_) => return Vec::new(),
+    };
+    let text = match std::str::from_utf8(&bytes) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .collect()
 }
 
 /// Tail a `.jsonl` file from `start_offset`, yielding each new complete
@@ -1023,4 +1197,237 @@ mod tests {
         assert!(!joined.contains("crew root not found"), "no crew warning");
     }
 
+    // ─── #270 Redis aggregation tests ─────────────────────────────────
+    //
+    // Verify `GET /flow/<date>` (no `.jsonl`) returns a JSON array,
+    // aggregating from Redis when `DARKMUX_REDIS_URL` is set + reachable
+    // and falling back to the local file otherwise. POSIX-only because
+    // the tests spawn a real `redis-server`. Tagged `#[serial]` because
+    // they mutate `DARKMUX_REDIS_URL`.
+
+    #[cfg(unix)]
+    mod redis_aggregation {
+        use super::*;
+        use serial_test::serial;
+        use std::process::{Child, Command, Stdio};
+        use std::time::Instant;
+
+        const REDIS_READY_TIMEOUT: Duration = Duration::from_secs(5);
+
+        fn redis_server_available() -> bool {
+            Command::new("redis-server")
+                .arg("--version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
+
+        struct RedisFixture {
+            child: Child,
+            url: String,
+        }
+
+        impl Drop for RedisFixture {
+            fn drop(&mut self) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+
+        fn spawn_redis() -> RedisFixture {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")
+                .expect("bind ephemeral port");
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+
+            // clippy's zombie-processes lint can't see through the
+            // `Drop` impl below that kill+waits the child. Suppress at
+            // the spawn site; the Drop guarantees no leaks.
+            #[allow(clippy::zombie_processes)]
+            let child = Command::new("redis-server")
+                .args([
+                    "--port", &port.to_string(),
+                    "--save", "",
+                    "--appendonly", "no",
+                    "--bind", "127.0.0.1",
+                    "--protected-mode", "no",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("redis-server spawn");
+
+            let url = format!("redis://127.0.0.1:{port}");
+            let client = redis::Client::open(url.as_str()).expect("redis client");
+            let start = Instant::now();
+            while start.elapsed() < REDIS_READY_TIMEOUT {
+                if let Ok(mut conn) = client.get_connection() {
+                    let ping: redis::RedisResult<String> = redis::cmd("PING").query(&mut conn);
+                    if let Ok(s) = ping {
+                        if s == "PONG" {
+                            return RedisFixture { child, url };
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            panic!("redis-server failed to come ready within {REDIS_READY_TIMEOUT:?}");
+        }
+
+        fn xadd_flow_record(url: &str, record_json: &str) {
+            let client = redis::Client::open(url).expect("redis client");
+            let mut conn = client.get_connection().expect("conn");
+            let _: String = redis::cmd("XADD")
+                .arg("darkmux:flow")
+                .arg("*")
+                .arg("schema")
+                .arg("1.8.0")
+                .arg("record")
+                .arg(record_json)
+                .query(&mut conn)
+                .expect("XADD");
+        }
+
+        fn today_utc_date() -> String {
+            crate::flow::day_utc_now()
+        }
+
+        async fn body_as_array(
+            response: axum::response::Response,
+        ) -> Vec<serde_json::Value> {
+            let bytes = to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .expect("body bytes");
+            let body: serde_json::Value = serde_json::from_slice(&bytes)
+                .expect("body parses as JSON");
+            body.as_array().expect("body is JSON array").clone()
+        }
+
+        /// New behavior: GET /flow/<date> (no `.jsonl`) returns a JSON
+        /// array sourced from Redis when DARKMUX_REDIS_URL is reachable.
+        /// Records from other dates are filtered out.
+        #[tokio::test]
+        #[serial]
+        async fn flow_endpoint_reads_from_redis_when_url_set() {
+            if !redis_server_available() {
+                eprintln!("skipping: redis-server not on PATH");
+                return;
+            }
+            let redis = spawn_redis();
+            let today = today_utc_date();
+
+            let today_record = format!(
+                r#"{{"ts":"{today}T12:00:00Z","action":"redis-today","machine_id":"laptop"}}"#
+            );
+            let other_record = r#"{"ts":"2020-01-01T12:00:00Z","action":"redis-other","machine_id":"laptop"}"#;
+            xadd_flow_record(&redis.url, &today_record);
+            xadd_flow_record(&redis.url, other_record);
+
+            // SAFETY: serial-tagged test owns the env mutation window.
+            unsafe { std::env::set_var("DARKMUX_REDIS_URL", &redis.url); }
+
+            let tmp = TempDir::new().unwrap();
+            let app = build_router(tmp.path().to_path_buf());
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/flow/{today}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            unsafe { std::env::remove_var("DARKMUX_REDIS_URL"); }
+
+            assert_eq!(response.status(), StatusCode::OK, "expected 200");
+            let arr = body_as_array(response).await;
+            assert!(
+                arr.iter().any(|r| r.get("action").and_then(|v| v.as_str()) == Some("redis-today")),
+                "expected `redis-today` record in response: {arr:?}"
+            );
+            assert!(
+                arr.iter().all(|r| r.get("action").and_then(|v| v.as_str()) != Some("redis-other")),
+                "expected `redis-other` (other date) filtered out: {arr:?}"
+            );
+        }
+
+        /// Fallback path: DARKMUX_REDIS_URL set but pointing at an
+        /// unreachable endpoint → daemon serves the local file's records
+        /// as a JSON array.
+        #[tokio::test]
+        #[serial]
+        async fn flow_endpoint_falls_back_to_file_when_redis_unreachable() {
+            let today = today_utc_date();
+            let tmp = TempDir::new().unwrap();
+            let local_record = format!(
+                r#"{{"ts":"{today}T12:00:00Z","action":"local-fallback","machine_id":"local"}}"#
+            );
+            fs::write(
+                tmp.path().join(format!("{today}.jsonl")),
+                format!("{local_record}\n"),
+            )
+            .unwrap();
+
+            unsafe { std::env::set_var("DARKMUX_REDIS_URL", "redis://127.0.0.1:1"); }
+
+            let app = build_router(tmp.path().to_path_buf());
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/flow/{today}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            unsafe { std::env::remove_var("DARKMUX_REDIS_URL"); }
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let arr = body_as_array(response).await;
+            assert!(
+                arr.iter().any(|r| r.get("action").and_then(|v| v.as_str()) == Some("local-fallback")),
+                "expected fallback to local file when Redis unreachable: {arr:?}"
+            );
+        }
+
+        /// Regression: DARKMUX_REDIS_URL unset → local file as JSON array.
+        /// (Today this URL shape returns 400 because the handler only
+        /// accepts `<date>.jsonl`. Post-fix it returns the array.)
+        #[tokio::test]
+        #[serial]
+        async fn flow_endpoint_reads_local_file_when_redis_url_unset() {
+            let today = today_utc_date();
+            let tmp = TempDir::new().unwrap();
+            let local_record = format!(
+                r#"{{"ts":"{today}T12:00:00Z","action":"local-only","machine_id":"local"}}"#
+            );
+            fs::write(
+                tmp.path().join(format!("{today}.jsonl")),
+                format!("{local_record}\n"),
+            )
+            .unwrap();
+
+            unsafe { std::env::remove_var("DARKMUX_REDIS_URL"); }
+
+            let app = build_router(tmp.path().to_path_buf());
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/flow/{today}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let arr = body_as_array(response).await;
+            assert!(
+                arr.iter().any(|r| r.get("action").and_then(|v| v.as_str()) == Some("local-only")),
+                "expected local-only record: {arr:?}"
+            );
+        }
+    }
 }
