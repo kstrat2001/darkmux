@@ -385,25 +385,73 @@ async fn model_status_handler() -> axum::Json<serde_json::Value> {
     }))
 }
 
-/// GET /flow/:date/stream — streams new records appended to the file as SSE events.
-/// Tail-from-current: never replays history.
+/// GET /flow/:date/stream — SSE-tails new flow records for a UTC day.
+///
+/// When `DARKMUX_REDIS_URL` is set + reachable at request time, the
+/// stream comes from `XREAD BLOCK darkmux:flow $` — the **fleet-wide**
+/// tail of new records from every machine writing to the shared
+/// stream. When Redis is unset OR unreachable at probe time, falls
+/// back to file-tailing `<flows_dir>/<date>.jsonl` (today's
+/// per-machine behavior). #270 PR-B.
+///
+/// Tail-from-now semantics on both paths: pre-existing entries are
+/// NOT replayed.
 async fn flow_stream_handler(
     State(state): State<AppState>,
     Path(date_raw): Path<String>,
-) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, (StatusCode, &'static str)> {
+) -> Result<Sse<futures::stream::BoxStream<'static, Result<Event, std::convert::Infallible>>>, (StatusCode, &'static str)> {
     let Some(date) = is_valid_date(&date_raw) else {
         return Err((StatusCode::BAD_REQUEST, "bad date format"));
     };
-    let path = state.flows_dir.join(format!("{date}.jsonl"));
-    // Tail-from-current: start at the file's current EOF so existing
-    // history isn't replayed. Treat missing file as offset 0 (file will
-    // appear later; the poll loop picks it up).
-    let start_offset = tokio::fs::metadata(&path)
+    let date_owned = date.to_string();
+
+    // Probe Redis once at request time. If the URL is set AND we can
+    // open a connection, use the XREAD path. Otherwise fall back to
+    // the file-tail. Probe is cheap (~ms) and bounds the failure mode
+    // to "operator misconfigured DARKMUX_REDIS_URL → degraded but
+    // serving" rather than 500.
+    let redis_url = std::env::var("DARKMUX_REDIS_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let redis_reachable = if let Some(url) = &redis_url {
+        let probe_url = url.clone();
+        tokio::task::spawn_blocking(move || {
+            redis::Client::open(probe_url.as_str())
+                .and_then(|c| c.get_connection().map(|_| ()))
+                .is_ok()
+        })
         .await
-        .map(|m| m.len())
-        .unwrap_or(0);
-    let stream = build_tail_stream(path, start_offset);
-    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
+        .unwrap_or(false)
+    } else {
+        false
+    };
+
+    use futures::stream::StreamExt;
+    let event_stream: futures::stream::BoxStream<'static, Result<Event, std::convert::Infallible>> =
+        if redis_reachable {
+            let url = redis_url.expect("redis_reachable implies url");
+            let stream_name = std::env::var("DARKMUX_REDIS_STREAM")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "darkmux:flow".to_string());
+            Box::pin(
+                redis_tail_lines(url, stream_name, date_owned)
+                    .map(|line| Ok(Event::default().data(line))),
+            )
+        } else {
+            if redis_url.is_some() {
+                eprintln!(
+                    "darkmux serve: GET /flow/{date_owned}/stream Redis probe failed; \
+                     falling back to file tail"
+                );
+            }
+            let path = state.flows_dir.join(format!("{date_owned}.jsonl"));
+            let start_offset = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
+            Box::pin(build_tail_stream(path, start_offset))
+        };
+
+    Ok(Sse::new(event_stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
 }
 
 /// GET /flow/:date — returns flow records for a UTC day.
@@ -541,39 +589,14 @@ fn read_flow_records_from_redis(
             redis::Value::Array(f) => f,
             _ => continue,
         };
-        let mut record_json: Option<&str> = None;
-        let mut i = 0;
-        while i + 1 < fields.len() {
-            let key = match &fields[i] {
-                redis::Value::BulkString(b) => std::str::from_utf8(b).ok(),
-                redis::Value::SimpleString(s) => Some(s.as_str()),
-                _ => None,
-            };
-            if key == Some("record") {
-                record_json = match &fields[i + 1] {
-                    redis::Value::BulkString(b) => std::str::from_utf8(b).ok(),
-                    redis::Value::SimpleString(s) => Some(s.as_str()),
-                    _ => None,
-                };
-                break;
-            }
-            i += 2;
+        let Some(json) = extract_record_field(fields) else { continue };
+        if !record_ts_matches_date(json, date) {
+            continue;
         }
-        let Some(json) = record_json else { continue };
         let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json) else {
             continue;
         };
-        // Filter by record.ts prefix — `YYYY-MM-DDTHH:MM:SSZ` (see
-        // flow::ts_utc_now). Records without a parseable ts are dropped
-        // because they can't be assigned to a UTC day reliably.
-        let matches_date = parsed
-            .get("ts")
-            .and_then(|v| v.as_str())
-            .map(|ts| ts.starts_with(date))
-            .unwrap_or(false);
-        if matches_date {
-            records.push(parsed);
-        }
+        records.push(parsed);
     }
     Ok(records)
 }
@@ -673,6 +696,249 @@ fn build_tail_stream(
 ) -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
     use futures::stream::StreamExt;
     tail_lines(path, start_offset).map(|line| Ok(Event::default().data(line)))
+}
+
+/// Long-poll Redis `XREAD BLOCK` and yield each matching record as a
+/// JSON line. Tail-from-now semantics — pre-existing entries are NOT
+/// replayed.
+///
+/// **Eager subscription**: `redis_tail_lines` spawns a background
+/// tokio task at call time (not lazily on first poll). The task
+/// resolves the current `last-generated-id` via `XINFO STREAM`
+/// immediately, pins that as the watermark, and starts `XREAD BLOCK`
+/// against it. Records pass through an unbounded mpsc channel; the
+/// returned Stream is just the receiver. Eagerness matters because
+/// otherwise — between `redis_tail_lines(...)` returning and the
+/// caller's first `await` — every XADD slips below `"$"` (which
+/// `XREAD` re-interprets as "current max RIGHT NOW" on every call).
+///
+/// Filter: emit only records whose `ts` field begins with
+/// `date_filter` (the UTC date the viewer is looking at). On Redis
+/// errors mid-stream the task backs off 500ms and retries; the
+/// consumer sees a quiet stream until Redis returns. The background
+/// task exits when the receiver is dropped (channel closes on next
+/// send). (#270 PR-B)
+fn redis_tail_lines(
+    url: String,
+    stream_name: String,
+    date_filter: String,
+) -> impl Stream<Item = String> {
+    // Unbounded channel — flow records are small (~1 KB) and
+    // bounded by Redis stream MAXLEN upstream. Backpressure on the
+    // SSE client side is handled by hyper, not here.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    tokio::spawn(async move {
+        // Eager: resolve the watermark NOW, before the consumer can
+        // race with us.
+        let url_for_resolve = url.clone();
+        let stream_for_resolve = stream_name.clone();
+        let mut last_id = match tokio::task::spawn_blocking(move || {
+            resolve_current_last_id(&url_for_resolve, &stream_for_resolve)
+        })
+        .await
+        {
+            Ok(Ok(id)) => id,
+            Ok(Err(e)) => {
+                eprintln!(
+                    "darkmux serve: XINFO STREAM on {stream_name} failed ({e}); \
+                     starting at 0-0"
+                );
+                "0-0".to_string()
+            }
+            Err(e) => {
+                eprintln!(
+                    "darkmux serve: XINFO blocking task join error ({e}); starting at 0-0"
+                );
+                "0-0".to_string()
+            }
+        };
+
+        loop {
+            let url_call = url.clone();
+            let stream_call = stream_name.clone();
+            let last_id_call = last_id.clone();
+            let date_filter_call = date_filter.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                xread_block_once(&url_call, &stream_call, &last_id_call, &date_filter_call)
+            })
+            .await;
+            match result {
+                Ok(Ok((records, new_last_id))) => {
+                    last_id = new_last_id;
+                    for r in records {
+                        if tx.send(r).is_err() {
+                            // Receiver dropped — consumer disconnected.
+                            return;
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    eprintln!(
+                        "darkmux serve: XREAD on {stream_name} failed ({e}); backing off 500ms"
+                    );
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "darkmux serve: XREAD blocking task join error ({e}); backing off 500ms"
+                    );
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+        }
+    });
+
+    tokio_stream::wrappers::UnboundedReceiverStream::new(rx)
+}
+
+/// Query `XINFO STREAM <stream>` for `last-generated-id`. Returns
+/// `"0-0"` when the stream doesn't exist yet (Redis errors with
+/// `ERR no such key`) — meaning "watch every future XADD" since auto-
+/// assigned ids will all be greater than `0-0`.
+fn resolve_current_last_id(
+    url: &str,
+    stream_name: &str,
+) -> Result<String, anyhow::Error> {
+    use anyhow::Context as _;
+    let client = redis::Client::open(url)
+        .with_context(|| format!("opening Redis for XINFO on {stream_name}"))?;
+    let mut conn = client
+        .get_connection()
+        .with_context(|| format!("connecting to Redis for XINFO on {stream_name}"))?;
+    let raw: redis::RedisResult<redis::Value> = redis::cmd("XINFO")
+        .arg("STREAM")
+        .arg(stream_name)
+        .query(&mut conn);
+    let items = match raw {
+        Ok(redis::Value::Array(v)) => v,
+        Ok(other) => return Err(anyhow::anyhow!("XINFO STREAM unexpected shape: {other:?}")),
+        Err(e) if e.code() == Some("ERR") => {
+            // Stream doesn't exist yet — "0-0" is the right watermark
+            // (every future auto-id will sort above it).
+            return Ok("0-0".to_string());
+        }
+        Err(e) => return Err(anyhow::anyhow!("XINFO STREAM {stream_name}: {e}")),
+    };
+    let mut i = 0;
+    while i + 1 < items.len() {
+        if redis_value_as_str(&items[i]) == Some("last-generated-id") {
+            if let Some(id) = redis_value_as_str(&items[i + 1]) {
+                return Ok(id.to_string());
+            }
+        }
+        i += 2;
+    }
+    // Defensive: XINFO didn't surface last-generated-id — start fresh.
+    Ok("0-0".to_string())
+}
+
+/// One BLOCK iteration of `XREAD`. Returns `(matching_records,
+/// updated_last_id)`. Synchronous — call site wraps in
+/// `spawn_blocking`. Uses BLOCK=500ms so the unfold loop can poll
+/// without burning CPU but still surfaces new records quickly.
+fn xread_block_once(
+    url: &str,
+    stream_name: &str,
+    last_id: &str,
+    date_filter: &str,
+) -> Result<(Vec<String>, String), anyhow::Error> {
+    use anyhow::Context as _;
+    let client = redis::Client::open(url)
+        .with_context(|| format!("opening Redis for XREAD on {stream_name}"))?;
+    let mut conn = client
+        .get_connection()
+        .with_context(|| format!("connecting to Redis for XREAD on {stream_name}"))?;
+    let raw: redis::Value = redis::cmd("XREAD")
+        .arg("BLOCK")
+        .arg(500u64)
+        .arg("COUNT")
+        .arg(100u64)
+        .arg("STREAMS")
+        .arg(stream_name)
+        .arg(last_id)
+        .query(&mut conn)
+        .with_context(|| format!("XREAD BLOCK on {stream_name}"))?;
+
+    // XREAD returns:
+    //   - Nil (BLOCK timeout) — no new entries; keep current last_id
+    //   - [[stream_name, [[id, [k, v, ...]], ...]]] — one or more entries
+    let mut records = Vec::new();
+    let mut new_last_id = last_id.to_string();
+    let outer = match raw {
+        redis::Value::Nil => return Ok((records, new_last_id)),
+        redis::Value::Array(v) => v,
+        other => {
+            return Err(anyhow::anyhow!(
+                "XREAD: unexpected outer shape: {other:?}"
+            ));
+        }
+    };
+    for stream_block in outer {
+        let pair = match stream_block {
+            redis::Value::Array(v) if v.len() >= 2 => v,
+            _ => continue,
+        };
+        let entries = match &pair[1] {
+            redis::Value::Array(v) => v,
+            _ => continue,
+        };
+        for entry in entries {
+            let parts = match entry {
+                redis::Value::Array(v) if v.len() >= 2 => v,
+                _ => continue,
+            };
+            // Entry id — update last_id no matter whether we emit, so
+            // a filtered-out record still advances the cursor.
+            if let Some(id) = redis_value_as_str(&parts[0]) {
+                new_last_id = id.to_string();
+            }
+            let fields = match &parts[1] {
+                redis::Value::Array(v) => v,
+                _ => continue,
+            };
+            let Some(record_json) = extract_record_field(fields) else {
+                continue;
+            };
+            if record_ts_matches_date(record_json, date_filter) {
+                records.push(record_json.to_string());
+            }
+        }
+    }
+    Ok((records, new_last_id))
+}
+
+/// Extract the `record` field's string value from an XADD/XREAD/XRANGE
+/// flat field-vector. Returns None if absent. Shared by the JSON
+/// backfill path (#270 PR-A) and the SSE tail path (#270 PR-B).
+fn extract_record_field(fields: &[redis::Value]) -> Option<&str> {
+    let mut i = 0;
+    while i + 1 < fields.len() {
+        let key = redis_value_as_str(&fields[i]);
+        if key == Some("record") {
+            return redis_value_as_str(&fields[i + 1]);
+        }
+        i += 2;
+    }
+    None
+}
+
+/// True if the record's `ts` field begins with `date` (YYYY-MM-DD).
+/// Matches `flow::ts_utc_now()` format (`YYYY-MM-DDTHH:MM:SSZ`).
+fn record_ts_matches_date(record_json: &str, date: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(record_json)
+        .ok()
+        .and_then(|v| v.get("ts").and_then(|t| t.as_str()).map(String::from))
+        .map(|ts| ts.starts_with(date))
+        .unwrap_or(false)
+}
+
+fn redis_value_as_str(v: &redis::Value) -> Option<&str> {
+    match v {
+        redis::Value::BulkString(b) => std::str::from_utf8(b).ok(),
+        redis::Value::SimpleString(s) => Some(s.as_str()),
+        _ => None,
+    }
 }
 
 /// Wait for SIGINT or SIGTERM to trigger graceful shutdown. SIGTERM
@@ -1427,6 +1693,174 @@ mod tests {
             assert!(
                 arr.iter().any(|r| r.get("action").and_then(|v| v.as_str()) == Some("local-only")),
                 "expected local-only record: {arr:?}"
+            );
+        }
+
+        // ─── #270 PR-B: redis_tail_lines (SSE Redis tail) ────────────────
+
+        /// XADD'd records after the stream opens are emitted as lines.
+        /// Parallel to `tail_stream_emits_appended_lines` for the file-tail
+        /// path. Tail-from-now: existing entries in the stream are not
+        /// replayed (semantics matches the file-tail handler).
+        #[tokio::test]
+        #[serial]
+        async fn redis_tail_lines_emits_xadded_records_for_today() {
+            if !redis_server_available() {
+                eprintln!("skipping: redis-server not on PATH");
+                return;
+            }
+            let redis = spawn_redis();
+            let today = today_utc_date();
+
+            // Pre-existing entry — must NOT be emitted (tail-from-now).
+            let pre = format!(
+                r#"{{"ts":"{today}T08:00:00Z","action":"pre-existing"}}"#
+            );
+            xadd_flow_record(&redis.url, &pre);
+
+            let stream = redis_tail_lines(
+                redis.url.clone(),
+                "darkmux:flow".to_string(),
+                today.clone(),
+            );
+            tokio::pin!(stream);
+
+            // Give the stream a moment to read the current last-id before
+            // we XADD the next one.
+            tokio::time::sleep(Duration::from_millis(150)).await;
+
+            let post = format!(
+                r#"{{"ts":"{today}T12:00:00Z","action":"post-open"}}"#
+            );
+            xadd_flow_record(&redis.url, &post);
+
+            let got = next_line(&mut stream, Duration::from_millis(3000)).await;
+            assert!(
+                got.as_ref().is_some_and(|s| s.contains("post-open")),
+                "expected post-open record to arrive over the tail; got {got:?}"
+            );
+            assert!(
+                !got.as_ref().unwrap().contains("pre-existing"),
+                "tail-from-now must NOT replay history; got {got:?}"
+            );
+        }
+
+        /// Records for OTHER dates are filtered out by the tail.
+        #[tokio::test]
+        #[serial]
+        async fn redis_tail_lines_filters_records_for_other_dates() {
+            if !redis_server_available() {
+                eprintln!("skipping: redis-server not on PATH");
+                return;
+            }
+            let redis = spawn_redis();
+            let today = today_utc_date();
+
+            let stream = redis_tail_lines(
+                redis.url.clone(),
+                "darkmux:flow".to_string(),
+                today.clone(),
+            );
+            tokio::pin!(stream);
+
+            tokio::time::sleep(Duration::from_millis(150)).await;
+
+            // First XADD: other date — should be filtered out.
+            xadd_flow_record(
+                &redis.url,
+                r#"{"ts":"2020-01-01T12:00:00Z","action":"other-date"}"#,
+            );
+            // Second XADD: today — should be emitted.
+            let today_record = format!(
+                r#"{{"ts":"{today}T12:00:00Z","action":"matching-date"}}"#
+            );
+            xadd_flow_record(&redis.url, &today_record);
+
+            // First emit must be the matching-date one — other-date was
+            // dropped on the way through.
+            let got = next_line(&mut stream, Duration::from_millis(3000)).await;
+            assert!(
+                got.as_ref().is_some_and(|s| s.contains("matching-date")),
+                "expected matching-date record; got {got:?}"
+            );
+            assert!(
+                !got.as_ref().unwrap().contains("other-date"),
+                "other-date record must be filtered: {got:?}"
+            );
+        }
+
+        /// Handler-level smoke: GET /flow/<date>/stream with Redis URL set
+        /// returns 200 + content-type `text/event-stream` and surfaces an
+        /// XADD'd record as an SSE `data: ...` line. End-to-end coverage
+        /// for the integration path.
+        #[tokio::test]
+        #[serial]
+        async fn flow_stream_handler_uses_redis_when_url_set() {
+            if !redis_server_available() {
+                eprintln!("skipping: redis-server not on PATH");
+                return;
+            }
+            let redis = spawn_redis();
+            let today = today_utc_date();
+            unsafe { std::env::set_var("DARKMUX_REDIS_URL", &redis.url); }
+
+            let tmp = TempDir::new().unwrap();
+            let app = build_router(tmp.path().to_path_buf());
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/flow/{today}/stream"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let content_type = response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            assert!(
+                content_type.starts_with("text/event-stream"),
+                "expected SSE content-type; got {content_type}"
+            );
+
+            // Pull the SSE body as a stream; XADD; look for the line.
+            use futures::StreamExt;
+            let mut body = response.into_body().into_data_stream();
+
+            // Give the handler a beat to probe Redis + start XREAD.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            let record = format!(
+                r#"{{"ts":"{today}T12:00:00Z","action":"sse-redis-end-to-end"}}"#
+            );
+            xadd_flow_record(&redis.url, &record);
+
+            // Read up to 3s waiting for the SSE chunk that includes the line.
+            let read_fut = async {
+                let mut acc = Vec::new();
+                while let Some(Ok(chunk)) = body.next().await {
+                    acc.extend_from_slice(&chunk);
+                    let s = String::from_utf8_lossy(&acc);
+                    if s.contains("sse-redis-end-to-end") {
+                        return s.into_owned();
+                    }
+                }
+                String::from_utf8_lossy(&acc).into_owned()
+            };
+            let got = tokio::time::timeout(Duration::from_secs(3), read_fut)
+                .await
+                .unwrap_or_default();
+
+            unsafe { std::env::remove_var("DARKMUX_REDIS_URL"); }
+
+            assert!(
+                got.contains("sse-redis-end-to-end"),
+                "expected XADD'd record to surface as SSE event; got: {got:?}"
             );
         }
     }
