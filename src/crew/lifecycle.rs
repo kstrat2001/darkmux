@@ -163,11 +163,45 @@ fn save_json<T: serde::Serialize>(path: &std::path::Path, value: &T) -> Result<(
     let body = serde_json::to_string_pretty(value)
         .with_context(|| format!("serializing to {}", path.display()))?;
     let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, body + "\n")
+    write_owner_only(&tmp, (body + "\n").as_bytes())
         .with_context(|| format!("writing {}", tmp.display()))?;
     fs::rename(&tmp, path)
         .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
     Ok(())
+}
+
+/// Write `bytes` to `path` with mode `0o600` on POSIX (owner read/write
+/// only). Falls back to the default umask-respecting write on non-POSIX
+/// (Windows ACLs are a separate story; tracked alongside #255 Wave-E.11).
+///
+/// Pre-existing files: explicitly re-set the mode to `0o600` after open
+/// since `OpenOptions::mode` only applies on creation.
+fn write_owner_only(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("opening {} for owner-only write", path.display()))?;
+        // Defensive: enforce mode even on pre-existing files (where
+        // `OpenOptions::mode` is a no-op).
+        let perms = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(path, perms)
+            .with_context(|| format!("setting 0o600 on {}", path.display()))?;
+        file.write_all(bytes)
+            .with_context(|| format!("writing bytes to {}", path.display()))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, bytes)
+            .with_context(|| format!("writing {}", path.display()))
+    }
 }
 
 // ─── Load-by-id ────────────────────────────────────────────────────────

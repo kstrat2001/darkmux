@@ -138,9 +138,12 @@ pub fn load_roster() -> Result<FleetRoster> {
     Ok(roster)
 }
 
-/// Write the roster to disk via atomic rename — write to `.tmp`, fsync,
+/// Write the roster to disk via atomic rename — write to `.tmp`, then
 /// rename over the target. Prevents partial-write corruption if darkmux
-/// is killed mid-save.
+/// is killed mid-save. On POSIX, the file is created with mode `0o600`
+/// (Wave-E.11 / PR-B review): machine addresses, tier assignments, and
+/// any future bearer-token fields stay owner-only even under a permissive
+/// user umask.
 pub fn save_roster(roster: &FleetRoster) -> Result<()> {
     let path = roster_path();
     if let Some(parent) = path.parent() {
@@ -151,11 +154,43 @@ pub fn save_roster(roster: &FleetRoster) -> Result<()> {
     tmp.set_extension("tmp");
     let json = serde_json::to_string_pretty(roster)
         .context("serializing fleet roster")?;
-    fs::write(&tmp, json)
+    write_owner_only(&tmp, json.as_bytes())
         .with_context(|| format!("writing fleet roster temp file {}", tmp.display()))?;
     fs::rename(&tmp, &path)
         .with_context(|| format!("atomic-renaming {} → {}", tmp.display(), path.display()))?;
     Ok(())
+}
+
+/// Write `bytes` to `path` with mode `0o600` on POSIX (owner read/write
+/// only). Wave-E.11 — keeps roster data off group/other readability
+/// even when the user's umask is `0o022`.
+fn write_owner_only(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("opening {} for owner-only write", path.display()))?;
+        // `OpenOptions::mode` only applies on creation — explicitly
+        // chmod for pre-existing files (e.g. the `.tmp` from a prior
+        // crashed save).
+        let perms = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(path, perms)
+            .with_context(|| format!("setting 0o600 on {}", path.display()))?;
+        file.write_all(bytes)
+            .with_context(|| format!("writing bytes to {}", path.display()))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, bytes)
+            .with_context(|| format!("writing {}", path.display()))
+    }
 }
 
 /// Add or replace a machine entry in the roster. Idempotent — calling
