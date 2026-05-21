@@ -559,6 +559,41 @@ enum MissionCmd {
         #[arg(long)]
         apply: bool,
     },
+    /// Fan-out dispatch all initial-depends sprints (depends_on=[]) of a
+    /// mission across the fleet in parallel (#247, PR-D.1). One role
+    /// applies to every dispatched sprint — operator-explicit per the
+    /// CLAUDE.md doctrine that mission planning is judgment-bearing
+    /// work the operator owns.
+    ///
+    /// Each sprint becomes a WorkJob published to `darkmux:work:<role-tier>`;
+    /// workers on matching-tier machines claim and run them. Default
+    /// `--wait` blocks until all sprints emit `dispatch.complete` (or
+    /// timeout). `--no-wait` returns immediately with the session_ids
+    /// for later polling.
+    ///
+    /// This is the keystone for Article 4's "operator hands off a
+    /// mission and the fleet runs it" narrative.
+    Dispatch {
+        /// Mission id to dispatch.
+        mission_id: String,
+        /// Role to dispatch each sprint under (e.g. `coder`,
+        /// `code-reviewer`). The role's manifest tier drives which
+        /// per-tier work stream the jobs publish to.
+        #[arg(long)]
+        role: String,
+        /// Optional target machine for every sprint. When omitted, jobs
+        /// publish to the tier stream with no `target_machine` hint —
+        /// any matching-tier worker claims (pull semantics).
+        #[arg(long, value_name = "ID")]
+        machine: Option<String>,
+        /// Per-sprint dispatch timeout (seconds). Default 600.
+        #[arg(long, default_value = "600")]
+        timeout: u32,
+        /// Return immediately after publishing all sprint jobs instead
+        /// of blocking on each `dispatch.complete`. Default is `--wait`.
+        #[arg(long)]
+        no_wait: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1204,7 +1239,195 @@ fn cmd_mission(sub: MissionCmd) -> Result<i32> {
             }
             Ok(0)
         }
+        MissionCmd::Dispatch { mission_id, role, machine, timeout, no_wait } => {
+            cmd_mission_dispatch(&mission_id, &role, machine.as_deref(), timeout, !no_wait)
+        }
     }
+}
+
+fn cmd_mission_dispatch(
+    mission_id: &str,
+    role_id: &str,
+    machine: Option<&str>,
+    timeout_seconds: u32,
+    wait: bool,
+) -> Result<i32> {
+    use crew::loader::{load_missions, load_sprints, load_roles};
+
+    // 1. Validate the mission exists.
+    let missions = load_missions()?;
+    let mission = missions
+        .iter()
+        .find(|m| m.id == mission_id)
+        .ok_or_else(|| anyhow::anyhow!(
+            "mission `{mission_id}` not found. Run `darkmux mission propose` first or check the id."
+        ))?;
+    if !matches!(mission.status, crew::types::MissionStatus::Active) {
+        eprintln!(
+            "darkmux mission dispatch: warning — mission `{mission_id}` status is {:?}, not Active. \
+             Proceeding anyway (operator-explicit override).",
+            mission.status
+        );
+    }
+
+    // 2. Resolve role tier — same validation as crew dispatch --machine.
+    let roles = load_roles()?;
+    let role = roles
+        .iter()
+        .find(|r| r.id == role_id)
+        .ok_or_else(|| anyhow::anyhow!("role `{role_id}` not found"))?;
+    let role_tier = match role.tier.clone() {
+        Some(t) if !t.trim().is_empty() && t != "any" => t,
+        _ => anyhow::bail!(
+            "role `{role_id}` has no concrete tier declaration. Cross-machine dispatch \
+             requires a tier (\"inference\" or \"hub\"). Add `\"tier\": \"inference\"` \
+             to the role's JSON manifest, or use `darkmux crew dispatch` (single-shot, \
+             local) instead."
+        ),
+    };
+
+    // 3. Filter sprints: this mission + depends_on=[].
+    let sprints = load_sprints()?;
+    let initial: Vec<_> = sprints
+        .iter()
+        .filter(|s| s.mission_id == mission_id && s.depends_on.is_empty())
+        .filter(|s| matches!(s.status, crew::types::SprintStatus::Planned | crew::types::SprintStatus::Running))
+        .collect();
+
+    if initial.is_empty() {
+        eprintln!(
+            "darkmux mission dispatch: no sprints with depends_on=[] in mission `{mission_id}` \
+             that are in Planned/Running status. Nothing to fan out."
+        );
+        return Ok(2);
+    }
+
+    // 4. Redis URL required for cross-machine fan-out.
+    let redis_url = std::env::var("DARKMUX_REDIS_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!(
+            "mission dispatch requires DARKMUX_REDIS_URL to be set (the fleet work queue lives on Redis)."
+        ))?;
+    let raw_url = flow::RawRedisUrl::new(redis_url);
+    let client = redis::Client::open(raw_url.expose_for_probe())
+        .with_context(|| format!("opening Redis client {raw_url} for mission dispatch"))?;
+
+    // 5. Publish one WorkJob per sprint. Capture session_ids for the
+    //    wait-aggregation phase.
+    let local_machine = flow::resolve_machine_id();
+    let local_orchestrator = flow::resolve_orchestrator();
+    let mut sessions: Vec<(String, String, String)> = Vec::new(); // (sprint_id, session_id, work_id)
+    eprintln!(
+        "darkmux mission dispatch: mission={mission_id} role={role_id} tier={role_tier} \
+         sprints={} target_machine={:?}",
+        initial.len(),
+        machine
+    );
+    for sprint in &initial {
+        let session_id = format!(
+            "mission-{}-sprint-{}-{}",
+            mission_id,
+            sprint.id,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_micros())
+                .unwrap_or(0)
+        );
+        let job = fleet::build_work_job(
+            role_tier.clone(),
+            machine.map(String::from),
+            role_id.to_string(),
+            sprint.description.clone(),
+            session_id.clone(),
+            None, // deliver
+            None, // workdir
+            Some(sprint.id.clone()),
+            "openclaw".to_string(),
+            timeout_seconds,
+            local_machine.clone(),
+            local_orchestrator.clone(),
+        );
+        let work_id = fleet::publish_job(&client, &job)
+            .with_context(|| format!("publishing sprint `{}` as WorkJob", sprint.id))?;
+        eprintln!(
+            "  sprint={} work_id={work_id} session={session_id}",
+            sprint.id
+        );
+        sessions.push((sprint.id.clone(), session_id, work_id));
+    }
+
+    if !wait {
+        println!("Published {} sprint job(s); operator polls for completion via flow stream.", sessions.len());
+        for (sprint_id, session_id, work_id) in &sessions {
+            println!("  sprint={sprint_id} session_id={session_id} work_id={work_id}");
+        }
+        return Ok(0);
+    }
+
+    // 6. Wait for each completion. Sequential polling is correct (XRANGE
+    //    full-scan returns ALL records; finding session A doesn't preclude
+    //    finding session B in the same pass). Net wall-clock is bounded by
+    //    the slowest sprint's completion.
+    let wait_timeout = std::time::Duration::from_secs(
+        (timeout_seconds as u64).saturating_add(60),
+    );
+    eprintln!(
+        "\ndarkmux mission dispatch: waiting for {} completion(s) (per-sprint timeout {}s + 60s slack)…",
+        sessions.len(),
+        timeout_seconds
+    );
+    let mut completed: usize = 0;
+    let mut failures: usize = 0;
+    let mission_start = std::time::Instant::now();
+    let mut sum_sprint_wall_ms: u64 = 0;
+    for (sprint_id, session_id, _work_id) in &sessions {
+        match fleet::wait_for_completion(&raw_url, session_id, wait_timeout) {
+            Ok(c) => {
+                completed += 1;
+                if c.result_class != "ok" {
+                    failures += 1;
+                }
+                if let Some(ms) = c.wall_ms {
+                    sum_sprint_wall_ms += ms;
+                }
+                eprintln!(
+                    "  ✓ sprint={sprint_id} result={} wall_ms={:?}",
+                    c.result_class, c.wall_ms
+                );
+            }
+            Err(e) => {
+                failures += 1;
+                eprintln!("  ✗ sprint={sprint_id} wait error: {e:#}");
+            }
+        }
+    }
+    let mission_wall_ms = mission_start.elapsed().as_millis() as u64;
+
+    // Empirical parallelism check (#246 Q3 risk #3): if total wall-clock
+    // is meaningfully less than sum of sprint wall-clocks, dispatches
+    // ran in parallel. Otherwise they were serial under the hood.
+    println!(
+        "\nmission dispatch: completed={completed}/{} failures={failures} \
+         wall_ms={mission_wall_ms} sum_sprint_wall_ms={sum_sprint_wall_ms}",
+        sessions.len()
+    );
+    if sum_sprint_wall_ms > 0 {
+        let speedup = (sum_sprint_wall_ms as f64) / (mission_wall_ms as f64).max(1.0);
+        if speedup >= 1.5 {
+            println!(
+                "  → parallel dispatch confirmed: {speedup:.2}× speedup vs serial baseline."
+            );
+        } else if sessions.len() > 1 {
+            println!(
+                "  ⚠ wall_ms ≈ sum of sprint wall_ms ({speedup:.2}×) — sprints may have run serially. \
+                 Check fleet roster + worker reachability."
+            );
+        }
+    }
+
+    if failures > 0 { Ok(1) } else { Ok(0) }
 }
 
 fn cmd_agent(sub: AgentCmd) -> Result<i32> {
