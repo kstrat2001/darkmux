@@ -355,6 +355,37 @@ pub fn remove_machine(roster: &mut FleetRoster, id: &str) -> Option<MachineEntry
     roster.machines.remove(id)
 }
 
+/// Return the roster entries whose `tier` matches `tier`. Used by the
+/// dispatch routing path (#247) to answer "is the role's tier supported
+/// by the current fleet?" before publishing a WorkJob — without a
+/// matching-tier machine in the fleet the publish would XADD to a
+/// stream no worker is reading.
+#[allow(dead_code)] // consumed by #247 PR-B (dispatch auto-route)
+///
+/// Comparison is exact-match. `"any"` returns every machine (no
+/// filter), matching the WorkJob-validation contract that treats `any`
+/// as the catch-all tier. Empty input returns an empty Vec; never
+/// allocates more than `roster.machines.len()` entries.
+///
+/// The returned `Vec<&MachineEntry>` preserves the roster's iteration
+/// order (BTreeMap-by-id ordering, which is operator-deterministic via
+/// `darkmux fleet add` order of insertion + the alphabetic id sort).
+/// Callers picking "the" machine for a tier use whichever element they
+/// want — for dispatch, today's pattern is publish-to-stream and let
+/// the consumer group claim, so the picker really just needs *some*
+/// match.
+pub fn candidates_for_tier<'a>(
+    roster: &'a FleetRoster,
+    tier: &str,
+) -> Vec<&'a MachineEntry> {
+    let any_match = tier == "any";
+    roster
+        .machines
+        .values()
+        .filter(|m| any_match || m.tier == tier)
+        .collect()
+}
+
 /// Reachability check via TCP connect to the daemon port. Same
 /// short-budget shape as `serve::is_addr_reachable` — non-blocking;
 /// degrades to "unreachable" on any error. Returns the elapsed probe
@@ -1546,6 +1577,69 @@ mod tests {
         let mut r = FleetRoster::default();
         let err = add_machine(&mut r, "studio", "hub", "", None).unwrap_err();
         assert!(err.to_string().contains("address must be non-empty"));
+    }
+
+    // ─── #247 PR-A: candidates_for_tier ──────────────────────────────
+
+    /// Exact-match: only inference-tier machines come back when the
+    /// query is "inference".
+    #[test]
+    fn candidates_for_tier_returns_only_exact_matches() {
+        let mut r = FleetRoster::default();
+        add_machine(&mut r, "laptop", "inference", "100.64.1.5:8765", None).unwrap();
+        add_machine(&mut r, "studio", "hub", "100.64.2.1:8765", None).unwrap();
+        add_machine(&mut r, "laptop-2", "inference", "100.64.1.6:8765", None).unwrap();
+        let inf = candidates_for_tier(&r, "inference");
+        assert_eq!(inf.len(), 2, "expected two inference matches");
+        let ids: Vec<&str> = inf.iter().map(|m| m.id.as_str()).collect();
+        assert!(ids.contains(&"laptop"));
+        assert!(ids.contains(&"laptop-2"));
+        assert!(!ids.contains(&"studio"));
+    }
+
+    /// Empty roster → empty result; no allocation panic.
+    #[test]
+    fn candidates_for_tier_empty_roster_returns_empty() {
+        let r = FleetRoster::default();
+        assert!(candidates_for_tier(&r, "inference").is_empty());
+        assert!(candidates_for_tier(&r, "any").is_empty());
+    }
+
+    /// `"any"` returns every machine in the roster regardless of tier.
+    /// Matches the WorkJob-validation contract that treats `any` as
+    /// the catch-all.
+    #[test]
+    fn candidates_for_tier_any_returns_all_machines() {
+        let mut r = FleetRoster::default();
+        add_machine(&mut r, "laptop", "inference", "100.64.1.5:8765", None).unwrap();
+        add_machine(&mut r, "studio", "hub", "100.64.2.1:8765", None).unwrap();
+        add_machine(&mut r, "mobile", "client", "100.64.3.1:8765", None).unwrap();
+        let all = candidates_for_tier(&r, "any");
+        assert_eq!(all.len(), 3);
+    }
+
+    /// No machine in the queried tier → empty result. This is the
+    /// signal the dispatch routing path will use to bail loud: if the
+    /// role's tier has zero candidates in the fleet, the WorkJob
+    /// would XADD to a stream with no consumers.
+    #[test]
+    fn candidates_for_tier_no_match_returns_empty() {
+        let mut r = FleetRoster::default();
+        add_machine(&mut r, "laptop", "inference", "100.64.1.5:8765", None).unwrap();
+        add_machine(&mut r, "studio", "hub", "100.64.2.1:8765", None).unwrap();
+        let none = candidates_for_tier(&r, "client");
+        assert!(none.is_empty());
+    }
+
+    /// Unknown / mistyped tier (e.g. typo "infernce") returns empty —
+    /// the exact-match doctrine. Callers translate this to "no fleet
+    /// machine in the tier, bail with the operator-actionable hint."
+    #[test]
+    fn candidates_for_tier_unknown_tier_returns_empty() {
+        let mut r = FleetRoster::default();
+        add_machine(&mut r, "laptop", "inference", "100.64.1.5:8765", None).unwrap();
+        let none = candidates_for_tier(&r, "infernce"); // typo
+        assert!(none.is_empty());
     }
 
     #[test]
