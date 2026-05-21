@@ -102,7 +102,7 @@ impl FleetNode {
             .env("DARKMUX_REDIS_URL", &self.redis_url)
             .env("DARKMUX_FLOWS_DIR", &self.flows_dir)
             .env("DARKMUX_FLEET_FILE", &self.fleet_file)
-            .env("DARKMUX_CREW_ROOT", &self.crew_root)
+            .env("DARKMUX_CREW_DIR", &self.crew_root)
             .env("DARKMUX_OPENCLAW_CONFIG", &self.openclaw_config)
             .env("DARKMUX_ORCHESTRATOR", "darkmux-e2e-test");
         cmd
@@ -313,7 +313,7 @@ fn spawn_daemon(
         .env("DARKMUX_REDIS_URL", redis_url)
         .env("DARKMUX_FLOWS_DIR", &flows_dir)
         .env("DARKMUX_FLEET_FILE", &fleet_file)
-        .env("DARKMUX_CREW_ROOT", &crew_root)
+        .env("DARKMUX_CREW_DIR", &crew_root)
         .env("DARKMUX_OPENCLAW_CONFIG", &openclaw_config)
         .env("DARKMUX_ORCHESTRATOR", "darkmux-e2e-test")
         // Point any runtime/openclaw paths at our mock LMStudio.
