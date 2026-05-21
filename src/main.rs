@@ -1255,6 +1255,18 @@ fn cmd_mission_dispatch(
 ) -> Result<i32> {
     use crew::loader::{load_missions, load_sprints, load_roles};
 
+    // 0. CLI-boundary charset validation (Wave-E.5 #255 — security-
+    //    auditor MEDIUM from PR-D.1 review). `mission_id` flows into
+    //    the session_id format string + WorkJob payload + audit chain
+    //    + future "look up by mission" filters; charset enforcement
+    //    at the boundary protects all current AND future use of the
+    //    value. Rejects path-traversal, special chars, over-long ids.
+    fleet::validate_identifier("mission_id", mission_id)?;
+    fleet::validate_identifier("role_id", role_id)?;
+    if let Some(m) = machine {
+        fleet::validate_identifier("--machine", m)?;
+    }
+
     // 1. Validate the mission exists.
     let missions = load_missions()?;
     let mission = missions
