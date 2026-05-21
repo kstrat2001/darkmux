@@ -1268,20 +1268,42 @@ fn dispatch_via_queue(opts: DispatchOpts, target_machine: &str) -> Result<Dispat
     // the worker side (it lives in the worker's flow records, not the
     // dispatching CLI's stdout); surface the result_class + wall_ms in
     // the synthetic stdout so the operator sees something useful.
-    let exit_code = if completion.result_class == "ok" { 0 } else { 1 };
+    Ok(completion_to_dispatch_result(completion))
+}
+
+/// Translate a queue completion (from `fleet::wait_for_completion`)
+/// into the `DispatchResult` shape the CLI returns. Pulls the actual
+/// `exit_code` out of the dispatch.complete payload when present;
+/// falls back to a binary 0/1 derived from `result_class` only when
+/// the payload lacks an explicit exit_code.
+///
+/// Closes the PR-C.3 review MEDIUM: the prior code unconditionally
+/// squashed to `exit_code = if result_class == "ok" { 0 } else { 1 }`,
+/// discarding the worker's actual exit code (which dispatchers reading
+/// the flow record DO see). Operators relying on specific exit codes
+/// for CI gating or shell scripting lost that signal in the cross-
+/// machine path. (#255 Wave-E.6)
+fn completion_to_dispatch_result(c: crate::fleet::CompletionResult) -> DispatchResult {
+    let payload_exit_code = c
+        .payload
+        .as_ref()
+        .and_then(|p| p.get("exit_code"))
+        .and_then(|v| v.as_i64())
+        .map(|n| n as i32);
+    let exit_code = payload_exit_code.unwrap_or(if c.result_class == "ok" { 0 } else { 1 });
     let stdout = format!(
-        "remote dispatch complete; result_class={} wall_ms={:?} session={}\n\
+        "remote dispatch complete; result_class={} exit_code={exit_code} wall_ms={:?} session={}\n\
          (full output in worker's flow records — \
           tail `~/.darkmux/flows/<date>.jsonl` for session={})\n",
-        completion.result_class, completion.wall_ms, completion.session_id, completion.session_id,
+        c.result_class, c.wall_ms, c.session_id, c.session_id,
     );
-    Ok(DispatchResult {
+    DispatchResult {
         exit_code,
         stdout,
         stderr: String::new(),
-        session_id: completion.session_id,
+        session_id: c.session_id,
         watched_state: Vec::new(),
-    })
+    }
 }
 
 /// Build a flow record for a dispatch lifecycle event (`dispatch start`,
@@ -1701,6 +1723,84 @@ mod tests {
     use super::*;
     use crate::crew::types::{EscalationContract, Role, ToolPalette};
     use tempfile::TempDir;
+
+    // ─── completion_to_dispatch_result (Wave-E.6 #255) ────────────────
+
+    fn completion(result_class: &str, payload: Option<serde_json::Value>) -> crate::fleet::CompletionResult {
+        crate::fleet::CompletionResult {
+            session_id: "test-sess".to_string(),
+            result_class: result_class.to_string(),
+            wall_ms: Some(1234),
+            payload,
+        }
+    }
+
+    #[test]
+    fn completion_extracts_explicit_exit_code_from_payload() {
+        // Worker emitted exit_code=42 (e.g. a build script's exit
+        // code). Translation must surface it verbatim, NOT squash
+        // to 1 via result_class.
+        let c = completion(
+            "error",
+            Some(serde_json::json!({"result_class": "error", "exit_code": 42})),
+        );
+        let r = completion_to_dispatch_result(c);
+        assert_eq!(r.exit_code, 42, "operator-facing exit code must match worker's");
+        assert!(r.stdout.contains("exit_code=42"), "stdout includes exit code");
+    }
+
+    #[test]
+    fn completion_extracts_zero_exit_code_even_on_ok() {
+        let c = completion(
+            "ok",
+            Some(serde_json::json!({"result_class": "ok", "exit_code": 0})),
+        );
+        let r = completion_to_dispatch_result(c);
+        assert_eq!(r.exit_code, 0);
+    }
+
+    #[test]
+    fn completion_falls_back_to_zero_on_ok_without_exit_code() {
+        // Payload present but no exit_code field; result_class=ok →
+        // fallback 0.
+        let c = completion("ok", Some(serde_json::json!({"result_class": "ok"})));
+        let r = completion_to_dispatch_result(c);
+        assert_eq!(r.exit_code, 0);
+    }
+
+    #[test]
+    fn completion_falls_back_to_one_on_error_without_exit_code() {
+        let c = completion("error", Some(serde_json::json!({"result_class": "error"})));
+        let r = completion_to_dispatch_result(c);
+        assert_eq!(r.exit_code, 1);
+    }
+
+    #[test]
+    fn completion_falls_back_when_payload_absent() {
+        let c = completion("error", None);
+        let r = completion_to_dispatch_result(c);
+        assert_eq!(r.exit_code, 1);
+    }
+
+    #[test]
+    fn completion_passes_session_id_through() {
+        let mut c = completion("ok", None);
+        c.session_id = "mission-foo-sprint-bar-12345-0".to_string();
+        let r = completion_to_dispatch_result(c);
+        assert_eq!(r.session_id, "mission-foo-sprint-bar-12345-0");
+        assert!(r.stdout.contains("mission-foo-sprint-bar-12345-0"));
+    }
+
+    #[test]
+    fn completion_handles_negative_exit_code() {
+        // SIGKILL-style exit codes can be negative (per std::process::ExitStatus).
+        let c = completion(
+            "error",
+            Some(serde_json::json!({"result_class": "error", "exit_code": -9})),
+        );
+        let r = completion_to_dispatch_result(c);
+        assert_eq!(r.exit_code, -9);
+    }
 
     fn sample_role() -> Role {
         Role {
