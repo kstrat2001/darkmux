@@ -852,14 +852,34 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // the existing local path unchanged.
     if let Some(target) = opts.machine.clone() {
         let local = crate::flow::resolve_machine_id();
-        let matches_local = local.as_deref() == Some(target.as_str());
-        if !matches_local {
-            return dispatch_via_queue(opts, &target);
+        match routing_decision(Some(target.as_str()), local.as_deref()) {
+            RoutingDecision::Local { matches_was_explicit: true } => {
+                eprintln!(
+                    "darkmux crew dispatch: --machine={target} matches local machine_id; \
+                     routing locally."
+                );
+            }
+            RoutingDecision::Remote { target, local_unknown: true } => {
+                // PR-C.3 review MEDIUM (Wave-E.7): local machine_id is
+                // unresolvable (no DARKMUX_MACHINE_ID, hostname failed).
+                // Routing via queue is the only option — surface the
+                // ambiguity loudly so the operator sees what happened.
+                eprintln!(
+                    "darkmux crew dispatch: WARNING — local DARKMUX_MACHINE_ID is unresolvable. \
+                     --machine={target} routes via the queue regardless. \
+                     If you intended a local dispatch, set DARKMUX_MACHINE_ID to make \
+                     tier-routing decisions deterministic."
+                );
+                return dispatch_via_queue(opts, &target);
+            }
+            RoutingDecision::Remote { target, local_unknown: false } => {
+                return dispatch_via_queue(opts, &target);
+            }
+            RoutingDecision::Local { matches_was_explicit: false } => {
+                // Unreachable in this branch (we matched Some(target) above)
+                // — but the enum's total shape covers it.
+            }
         }
-        eprintln!(
-            "darkmux crew dispatch: --machine={target} matches local machine_id; \
-             routing locally."
-        );
     }
 
     // Route to the in-house container-bounded runtime when the operator
@@ -1283,6 +1303,51 @@ fn dispatch_via_queue(opts: DispatchOpts, target_machine: &str) -> Result<Dispat
 /// the flow record DO see). Operators relying on specific exit codes
 /// for CI gating or shell scripting lost that signal in the cross-
 /// machine path. (#255 Wave-E.6)
+/// Outcome of the `dispatch()` routing-decision branch. Extracted as a
+/// pure shape so the (Some(machine), local_machine_id) matrix is
+/// unit-testable without filesystem / env-var setup. (Wave-E.7 #255)
+#[derive(Debug, PartialEq)]
+pub enum RoutingDecision {
+    /// Run locally. `matches_was_explicit=true` when the operator
+    /// passed `--machine` matching the local id (vs. the no-`--machine`
+    /// case where local is the implicit default).
+    Local { matches_was_explicit: bool },
+    /// Route via the work queue to `target`. `local_unknown=true`
+    /// signals the publisher couldn't resolve its own machine_id —
+    /// caller should emit an operator-visible warning before routing.
+    Remote { target: String, local_unknown: bool },
+}
+
+/// Pure-function routing decision. `machine` is the operator's
+/// `--machine` flag (None when omitted); `local_machine_id` is what
+/// `flow::resolve_machine_id()` returned for the current process.
+///
+/// Decision matrix:
+/// - `(None, _)` → Local (no override; existing local-path behavior)
+/// - `(Some(t), Some(l))` where `t == l` → Local (matches_was_explicit=true)
+/// - `(Some(t), Some(l))` where `t != l` → Remote (normal cross-machine)
+/// - `(Some(t), None)` → Remote with `local_unknown=true` (operator-
+///   visible warning; PR-C.3 review MEDIUM)
+pub fn routing_decision(
+    machine: Option<&str>,
+    local_machine_id: Option<&str>,
+) -> RoutingDecision {
+    match (machine, local_machine_id) {
+        (None, _) => RoutingDecision::Local { matches_was_explicit: false },
+        (Some(t), Some(l)) if t == l => {
+            RoutingDecision::Local { matches_was_explicit: true }
+        }
+        (Some(t), Some(_)) => RoutingDecision::Remote {
+            target: t.to_string(),
+            local_unknown: false,
+        },
+        (Some(t), None) => RoutingDecision::Remote {
+            target: t.to_string(),
+            local_unknown: true,
+        },
+    }
+}
+
 fn completion_to_dispatch_result(c: crate::fleet::CompletionResult) -> DispatchResult {
     let payload_exit_code = c
         .payload
@@ -1800,6 +1865,53 @@ mod tests {
         );
         let r = completion_to_dispatch_result(c);
         assert_eq!(r.exit_code, -9);
+    }
+
+    // ─── routing_decision (Wave-E.7 #255) ─────────────────────────────
+
+    #[test]
+    fn routing_decision_no_machine_is_local() {
+        assert_eq!(
+            routing_decision(None, Some("laptop")),
+            RoutingDecision::Local { matches_was_explicit: false }
+        );
+        assert_eq!(
+            routing_decision(None, None),
+            RoutingDecision::Local { matches_was_explicit: false }
+        );
+    }
+
+    #[test]
+    fn routing_decision_machine_matches_local_is_local_explicit() {
+        assert_eq!(
+            routing_decision(Some("laptop"), Some("laptop")),
+            RoutingDecision::Local { matches_was_explicit: true }
+        );
+    }
+
+    #[test]
+    fn routing_decision_machine_differs_is_remote_known_local() {
+        assert_eq!(
+            routing_decision(Some("studio"), Some("laptop")),
+            RoutingDecision::Remote {
+                target: "studio".to_string(),
+                local_unknown: false,
+            }
+        );
+    }
+
+    #[test]
+    fn routing_decision_machine_set_but_local_unknown_warns() {
+        // The case PR-C.3 review M flagged: DARKMUX_MACHINE_ID unset +
+        // hostname failure means we can't tell if --machine matches
+        // local. Route via queue + signal the warning condition.
+        assert_eq!(
+            routing_decision(Some("studio"), None),
+            RoutingDecision::Remote {
+                target: "studio".to_string(),
+                local_unknown: true,
+            }
+        );
     }
 
     fn sample_role() -> Role {
