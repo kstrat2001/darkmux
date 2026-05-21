@@ -161,6 +161,11 @@
             aria-label="Filter by mission (Mission mode only)">
       <option value="">(no mission selected)</option>
     </select>
+    <select slot="pills" class="dx-pill" id="topology-focus-machine-select"
+            title="focused machine (Focus mode)"
+            aria-label="Focused machine (Focus mode only) — defaults to most-recent activity; operator can override here">
+      <option value="">(no machine selected)</option>
+    </select>
     <span slot="pills" class="dx-pill" id="topology-source-pill"
           title="data source"
           aria-label="Data source status">
@@ -496,6 +501,21 @@
       assertEqual(edges[0].source, 'orch:claude');
       assertEqual(edges[0].target, 'role:studio:darkmux/coder');
     });
+    test('pickDefaultFocus: picks most-recent-activity machine_id', () => {
+      const machines = [
+        { machine_id: 'a', last_ts: '2026-05-19T01:00:00Z' },
+        { machine_id: 'b', last_ts: '2026-05-19T03:00:00Z' },
+        { machine_id: 'c', last_ts: '2026-05-19T02:00:00Z' },
+      ];
+      assertEqual(pickDefaultFocus(machines), 'b');
+    });
+    test('pickDefaultFocus: returns null for empty list', () => {
+      assertEqual(pickDefaultFocus([]), null);
+    });
+    test('pickDefaultFocus: tolerates missing last_ts', () => {
+      const machines = [{ machine_id: 'a', last_ts: '2026-05-19T01:00:00Z' }, { machine_id: 'b' }];
+      assertEqual(pickDefaultFocus(machines), 'a');
+    });
     test('deriveEdges: dedup + recent_ts bumps to newest', () => {
       const recs = [
         { ts: '2026-05-19T01:00:00Z', stage: 'dispatch', orchestrator: 'claude', machine_id: 'studio', handle: 'darkmux/coder' },
@@ -505,6 +525,22 @@
       assertEqual(edges.length, 1);
       assertEqual(edges[0].recent_ts, '2026-05-19T02:00:00Z');
     });
+
+    /**
+     * Pick the most-recent-activity machine_id to focus on by default
+     * when entering Focus mode without an explicit selection. Operator
+     * sovereignty: when this fires, the UI labels the choice `(auto)`
+     * so the operator knows the system picked. Override via the
+     * `topology-focus-machine-select` picker. (#240)
+     * @param {Array<{machine_id: string, last_ts?: string}>} machines
+     * @returns {string|null}
+     */
+    function pickDefaultFocus(machines) {
+      if (!Array.isArray(machines) || machines.length === 0) return null;
+      const best = [...machines]
+        .sort((a, b) => (b.last_ts || '').localeCompare(a.last_ts || ''))[0];
+      return best?.machine_id || null;
+    }
 
     /**
      * Per-machine crew breakdown — `handle` (only `darkmux/*`) → record count + last stage + last ts.
@@ -692,6 +728,12 @@
       const [records, setRecords] = useState([]);
       const [mode, setMode] = useState('fleet');
       const [focusMachine, setFocusMachine] = useState(null);
+      // True when the current `focusMachine` was picked by the auto-
+      // default effect rather than chosen by the operator. The picker
+      // labels its current option `(auto)` while this is true so the
+      // operator knows the system made the call. Operator-driven
+      // selections via the picker flip it back to false. (#240)
+      const [focusAutoPicked, setFocusAutoPicked] = useState(false);
       const [missionId, setMissionId] = useState(null);
       const [sourceLabel, setSourceLabel] = useState('source: …');
       const [schemaWarning, setSchemaWarning] = useState(null);
@@ -863,13 +905,17 @@
       const orchestrators = useMemo(() => aggregateOrchestrators(visibleRecords), [visibleRecords]);
       const missions = useMemo(() => aggregateMissions(visibleRecords), [visibleRecords]);
 
-      // Auto-default focusMachine when entering focus mode
+      // Auto-default focusMachine when entering focus mode. Sets
+      // `focusAutoPicked` so the picker UI can surface that the
+      // selection wasn't operator-driven (#240).
       useEffect(() => {
         if (mode !== 'focus') return;
         if (focusMachine && machines.some(m => m.machine_id === focusMachine)) return;
-        // Auto-pick most-recent machine.
-        const best = [...machines].sort((a, b) => (b.last_ts || '').localeCompare(a.last_ts || ''))[0];
-        setFocusMachine(best?.machine_id || null);
+        const picked = pickDefaultFocus(machines);
+        if (picked) {
+          setFocusMachine(picked);
+          setFocusAutoPicked(true);
+        }
       }, [mode, machines, focusMachine]);
 
       // Sync the mission-picker options with aggregated missions.
@@ -898,6 +944,47 @@
         const el = document.getElementById('topology-mission-select');
         if (!el) return;
         el.style.display = mode === 'mission' ? '' : 'none';
+      }, [mode]);
+
+      // ─── #240 Focus mode picker — operator-sovereignty for the
+      // focused machine. Pill is hidden outside Focus mode; in Focus
+      // mode, current selection has an `(auto)` suffix when the system
+      // picked vs. when the operator did.
+
+      // Sync the focus-machine options with the aggregated machine
+      // list. The current option's label gets `(auto)` decoration
+      // when `focusAutoPicked` is true.
+      useEffect(() => {
+        const el = document.getElementById('topology-focus-machine-select');
+        if (!el) return;
+        const optionsHtml = '<option value="">(no machine selected)</option>' +
+          machines.map(m => {
+            const isCurrent = m.machine_id === focusMachine;
+            const suffix = isCurrent && focusAutoPicked ? ' (auto)' : '';
+            return `<option value="${m.machine_id}">${m.machine_id}${suffix}</option>`;
+          }).join('');
+        el.innerHTML = optionsHtml;
+        el.value = focusMachine || '';
+      }, [machines, focusMachine, focusAutoPicked]);
+
+      // Listen for picker change — operator-driven selection clears
+      // the auto-picked flag (the operator now owns the decision).
+      useEffect(() => {
+        const el = document.getElementById('topology-focus-machine-select');
+        if (!el) return;
+        const onChange = () => {
+          setFocusMachine(el.value || null);
+          setFocusAutoPicked(false);
+        };
+        el.addEventListener('change', onChange);
+        return () => el.removeEventListener('change', onChange);
+      }, []);
+
+      // Hide focus-machine picker when mode !== 'focus'.
+      useEffect(() => {
+        const el = document.getElementById('topology-focus-machine-select');
+        if (!el) return;
+        el.style.display = mode === 'focus' ? '' : 'none';
       }, [mode]);
 
       const edges = useMemo(() => {
