@@ -26,5 +26,11 @@
 //! - Containerization (Docker compose would give cleaner isolation;
 //!   process-based is the v1 since it works with `cargo test` directly)
 
+// Each integration-test binary compiles this module independently
+// (via `#[path]` include). Different scenarios use different harness
+// helpers; "never used in this binary" would noise out CI without
+// helping.
+#![allow(dead_code)]
+
 pub mod mock_lmstudio;
 pub mod harness;

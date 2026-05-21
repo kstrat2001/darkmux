@@ -768,21 +768,14 @@ fn apply_workdir_override(
         return Ok(WorkdirOutcome::NoChange);
     };
 
-    // Refuse to point at a nonexistent path — the operator-sovereignty
-    // contract is "operator declares scope; system refuses to fabricate
-    // scope on their behalf."
-    let metadata = fs::metadata(target).with_context(|| {
-        format!(
-            "--workdir path does not exist or is not readable: {}",
-            target.display()
-        )
-    })?;
-    if !metadata.is_dir() {
-        bail!(
-            "--workdir must point to a directory; {} is not a directory",
-            target.display()
-        );
-    }
+    // Symlink-escape guard + existence + is-dir check via the shared
+    // validator (#255 Wave-E.2). Closes the long-deferred parity gap
+    // where the openclaw path silently followed symlinks while
+    // dispatch_internal had the guard since #232. Validator returns
+    // the canonical (symlink-free) path — operations below use the
+    // operator-supplied `target` for messages but the canonical path
+    // for filesystem ops is captured at the link-create site below.
+    let _resolved = crate::workdir::validate_workdir(target)?;
 
     fs::create_dir_all(role_workspace).with_context(|| {
         format!("creating role workspace {}", role_workspace.display())

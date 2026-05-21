@@ -1,6 +1,11 @@
 //! `FleetHarness` — boots a dual-node (or N-node) darkmux fleet for
 //! end-to-end tests.
 //!
+//! `#![allow(dead_code)]` at the module level: each `tests/e2e_*.rs`
+//! integration binary compiles the harness independently via `#[path]`
+//! include. Different scenarios use different harness helpers; flagging
+//! "never used in this binary" would noise out CI without helping.
+//!
 //! Spawns `redis-server` on a random port, an in-process mock LMStudio,
 //! and N `darkmux serve` daemons with distinct
 //! `DARKMUX_MACHINE_ID` / `DARKMUX_MACHINE_TIER` / `DARKMUX_REDIS_URL`
