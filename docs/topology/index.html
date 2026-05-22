@@ -516,6 +516,47 @@
       const machines = [{ machine_id: 'a', last_ts: '2026-05-19T01:00:00Z' }, { machine_id: 'b' }];
       assertEqual(pickDefaultFocus(machines), 'a');
     });
+    test('computeNodeRecentTs: salient dispatch start bumps role recent_ts', () => {
+      const recs = [
+        { ts: '2026-05-22T10:00:00Z', stage: 'dispatch', action: 'dispatch start',
+          orchestrator: 'claude', machine_id: 'studio', handle: 'darkmux/coder' },
+      ];
+      const map = computeNodeRecentTs(recs);
+      assertEqual(map.get('role:studio:darkmux/coder'), Date.parse('2026-05-22T10:00:00Z'));
+      assertEqual(map.get('mach:studio'), Date.parse('2026-05-22T10:00:00Z'));
+    });
+    test('computeNodeRecentTs: heartbeat does NOT bump pulse timer', () => {
+      const recs = [
+        { ts: '2026-05-22T10:00:00Z', stage: 'dispatch', action: 'dispatch start',
+          orchestrator: 'claude', machine_id: 'studio', handle: 'darkmux/coder' },
+        { ts: '2026-05-22T10:00:30Z', stage: 'dispatch', action: 'dispatch.turn.heartbeat',
+          machine_id: 'studio', handle: 'darkmux/coder' },
+        { ts: '2026-05-22T10:01:00Z', stage: 'dispatch', action: 'dispatch.turn.heartbeat',
+          machine_id: 'studio', handle: 'darkmux/coder' },
+      ];
+      const map = computeNodeRecentTs(recs);
+      // Without heartbeat exclusion, recent_ts would be 10:01:00.
+      // With exclusion, the only salient record is the start at 10:00:00.
+      assertEqual(map.get('role:studio:darkmux/coder'), Date.parse('2026-05-22T10:00:00Z'));
+    });
+    test('computeNodeRecentTs: dispatch complete is salient (bumps timer)', () => {
+      const recs = [
+        { ts: '2026-05-22T10:00:00Z', stage: 'dispatch', action: 'dispatch start',
+          orchestrator: 'claude', machine_id: 'studio', handle: 'darkmux/coder' },
+        { ts: '2026-05-22T10:05:00Z', stage: 'dispatch', action: 'dispatch.turn.heartbeat',
+          machine_id: 'studio', handle: 'darkmux/coder' },
+        { ts: '2026-05-22T10:10:00Z', stage: 'dispatch', action: 'dispatch complete',
+          orchestrator: 'claude', machine_id: 'studio', handle: 'darkmux/coder' },
+      ];
+      const map = computeNodeRecentTs(recs);
+      assertEqual(map.get('role:studio:darkmux/coder'), Date.parse('2026-05-22T10:10:00Z'));
+    });
+    test('isLivenessOnlyRecord: heartbeat is liveness, start is not', () => {
+      assertEqual(isLivenessOnlyRecord({ action: 'dispatch.turn.heartbeat' }), true);
+      assertEqual(isLivenessOnlyRecord({ action: 'dispatch start' }), false);
+      assertEqual(isLivenessOnlyRecord({ action: 'dispatch complete' }), false);
+      assertEqual(isLivenessOnlyRecord({ action: 'dispatch route' }), false);
+    });
     test('deriveEdges: dedup + recent_ts bumps to newest', () => {
       const recs = [
         { ts: '2026-05-19T01:00:00Z', stage: 'dispatch', orchestrator: 'claude', machine_id: 'studio', handle: 'darkmux/coder' },
@@ -525,6 +566,57 @@
       assertEqual(edges.length, 1);
       assertEqual(edges[0].recent_ts, '2026-05-19T02:00:00Z');
     });
+
+    /**
+     * Classify a record as "liveness-only" vs "salient." Liveness-only
+     * records (today: `dispatch.turn.heartbeat`) keep edges alive
+     * during long mid-turn waits but should NOT trigger the role-node
+     * pulse animation — heartbeats fire every 2s by default and the
+     * pulse CSS animation is 2s, so per-heartbeat pulse would strobe.
+     *
+     * Pulse fires only on salient events (start, complete, route,
+     * tier-decision, review verdict, ship). Heartbeat liveness is
+     * carried by the edge motion (recent_ts on the dispatch edge).
+     * (#222)
+     * @param {FlowRecord} r
+     * @returns {boolean}
+     */
+    function isLivenessOnlyRecord(r) {
+      return r.action === 'dispatch.turn.heartbeat';
+    }
+
+    /**
+     * Compute the most-recent salient-record ts per node id. Heartbeat
+     * records (per `isLivenessOnlyRecord`) are dropped — the role
+     * node's pulse fires on dispatch start/complete/route, not on
+     * every 2-second mid-turn heartbeat.
+     *
+     * Returned map's keys match the node-id convention used elsewhere
+     * (`mach:<machine_id>`, `orch:<orchestrator>`, `miss:<mission_id>`,
+     * `role:<machine_id>:<handle>`).
+     * @param {FlowRecord[]} records
+     * @returns {Map<string, number>} id → epoch ms
+     */
+    function computeNodeRecentTs(records) {
+      const map = new Map();
+      for (const r of records) {
+        if (isLivenessOnlyRecord(r)) continue;
+        const ids = [];
+        if (r.machine_id) ids.push(`mach:${r.machine_id}`);
+        if (r.orchestrator) ids.push(`orch:${r.orchestrator}`);
+        if (r.mission_id) ids.push(`miss:${r.mission_id}`);
+        if (r.handle?.startsWith('darkmux/') && r.machine_id) {
+          ids.push(`role:${r.machine_id}:${r.handle}`);
+        }
+        const t = Date.parse(r.ts);
+        if (!Number.isFinite(t)) continue;
+        for (const id of ids) {
+          const prev = map.get(id) || 0;
+          if (t > prev) map.set(id, t);
+        }
+      }
+      return map;
+    }
 
     /**
      * Pick the most-recent-activity machine_id to focus on by default
@@ -1018,23 +1110,17 @@
         return [];
       }, [mode, records, visibleRecords, orchestrators, machines, missions, focusMachine, missionId]);
 
-      // Most-recent record ts per node id — used for pulse cue.
-      const nodeRecentTs = useMemo(() => {
-        const map = new Map();
-        for (const r of visibleRecords) {
-          const ids = [];
-          if (r.machine_id) ids.push(`mach:${r.machine_id}`);
-          if (r.orchestrator) ids.push(`orch:${r.orchestrator}`);
-          if (r.mission_id) ids.push(`miss:${r.mission_id}`);
-          if (r.handle?.startsWith('darkmux/') && r.machine_id) ids.push(`role:${r.machine_id}:${r.handle}`);
-          const t = Date.parse(r.ts);
-          for (const id of ids) {
-            const prev = map.get(id) || 0;
-            if (t > prev) map.set(id, t);
-          }
-        }
-        return map;
-      }, [visibleRecords]);
+      // Most-recent salient record ts per node id — used for pulse cue.
+      // Liveness-only records (dispatch.turn.heartbeat) are EXCLUDED so
+      // the role-node pulse doesn't strobe during long mid-turn waits
+      // (heartbeats arrive every ~2s; pulse animation is 2s — without
+      // this filter the role node would re-pulse every cycle). The
+      // edge animation keeps the liveness story via `recent_ts` on
+      // the dispatch edge (deriveEdges/heartbeat path, separate). (#222)
+      const nodeRecentTs = useMemo(
+        () => computeNodeRecentTs(visibleRecords),
+        [visibleRecords]
+      );
 
       // Active dispatch tracker: roleId → start ts when dispatch start seen but not yet completed.
       const activeDispatches = useMemo(() => {
