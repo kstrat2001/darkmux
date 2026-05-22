@@ -1449,6 +1449,12 @@ mod tests {
     /// app should not be able to exfiltrate fleet-wide flow data via
     /// CORS. Operators with a legitimate dev-server-origin need set
     /// `DARKMUX_DAEMON_CORS_ORIGINS` to opt that origin in.
+    ///
+    /// `#[serial]` because the sibling `cors_allows_origin_in_env_override`
+    /// sets `DARKMUX_DAEMON_CORS_ORIGINS` and the default-deny assertion
+    /// races against it under cargo's parallel runner. (Race surfaced
+    /// post-merge in CI on main; not flagged on PR-level CI.)
+    #[serial_test::serial]
     async fn cors_denies_localhost_origin_by_default() {
         // Defensive — make sure no inherited env from another test changes the default behavior.
         unsafe { std::env::remove_var("DARKMUX_DAEMON_CORS_ORIGINS"); }
@@ -1471,7 +1477,9 @@ mod tests {
     }
 
     /// 127.0.0.1 variant — same as localhost; denied by default post-#273.
+    /// `#[serial]` for the same reason as `cors_denies_localhost_origin_by_default`.
     #[tokio::test]
+    #[serial_test::serial]
     async fn cors_denies_loopback_ip_origin_by_default() {
         unsafe { std::env::remove_var("DARKMUX_DAEMON_CORS_ORIGINS"); }
         let app = build_router(PathBuf::new());
