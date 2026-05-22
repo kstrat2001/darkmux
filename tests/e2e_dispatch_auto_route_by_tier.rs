@@ -127,6 +127,69 @@ fn dispatch_from_hub_for_inference_role_auto_routes_to_inference_peer() {
         combined.contains("tier") && (combined.contains("auto") || combined.contains("route")),
         "expected an auto-route banner mentioning tier; got:\n{combined}"
     );
+
+    // #247 PR-C — the dispatch-route flow record must land in the
+    // local flow file so the topology UI can render WHY the work
+    // went to the tier-stream. Today's flow date is the file name.
+    let today = today_utc_date();
+    let flow_file = studio.flows_dir.join(format!("{today}.jsonl"));
+    let flow_body = std::fs::read_to_string(&flow_file)
+        .unwrap_or_else(|e| panic!("read flow file {}: {e}", flow_file.display()));
+    let has_route_record = flow_body
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .any(|rec| {
+            rec.get("action").and_then(|v| v.as_str()) == Some("dispatch route")
+                && rec
+                    .get("payload")
+                    .and_then(|p| p.get("decision"))
+                    .and_then(|d| d.as_str())
+                    == Some("auto-route")
+                && rec
+                    .get("payload")
+                    .and_then(|p| p.get("role_tier"))
+                    .and_then(|t| t.as_str())
+                    == Some("inference")
+        });
+    assert!(
+        has_route_record,
+        "expected `dispatch route` flow record with decision=auto-route + role_tier=inference; \
+         flow body:\n{flow_body}"
+    );
+}
+
+/// UTC date as YYYY-MM-DD — matches flow::day_utc_now() for the
+/// flow file's name.
+fn today_utc_date() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let days = secs / 86400;
+    let mut year = 1970i64;
+    let mut day_of_year = days;
+    loop {
+        let leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+        let year_days = if leap { 366 } else { 365 };
+        if day_of_year < year_days {
+            break;
+        }
+        day_of_year -= year_days;
+        year += 1;
+    }
+    let leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+    let month_lens = if leap {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+    let mut month = 0;
+    let mut day = day_of_year as i32;
+    while day >= month_lens[month] {
+        day -= month_lens[month];
+        month += 1;
+    }
+    format!("{year:04}-{:02}-{:02}", month + 1, day + 1)
 }
 
 /// Hub-tier machine asks for an inference role, but NO inference peer
