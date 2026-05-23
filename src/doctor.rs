@@ -1087,14 +1087,39 @@ fn check_profile_loaded_match() -> Check {
     }
 }
 
+/// Sprint-G: openclaw-as-active gate.
+///
+/// Returns true when openclaw is configured on this machine — defined
+/// as: `~/.openclaw/openclaw.json` (or the path the dispatch resolver
+/// reports, honoring `DARKMUX_OPENCLAW_CONFIG`) exists on disk.
+///
+/// The gate is intentionally "config-on-disk" rather than "binary on
+/// PATH": post-Beat-36 openclaw is opt-in per dispatch, and the
+/// operator's choice to leave openclaw uninstalled / unconfigured IS
+/// the signal that they don't intend to use it. An operator who has
+/// `openclaw` on PATH but no config (fresh install, partial setup)
+/// gets a silent skip — when they configure openclaw, doctor surfaces
+/// the binary/version checks automatically.
+fn openclaw_active() -> bool {
+    crate::crew::dispatch::default_openclaw_config().exists()
+}
+
 fn check_runtime_command() -> Check {
-    // Post-Sprint-E: doctor checks for openclaw specifically. Operators
-    // who use Aider / Cline / a custom runtime invoke them per-dispatch
-    // via `--runtime openclaw --runtime-cmd <path>`; that operator-explicit
-    // flag isn't visible to doctor. The internal runtime (default for
-    // dispatch + lab) doesn't need an external binary. Sprint-G will
-    // scope this check to "only when openclaw is the active runtime in
-    // the operator's profile."
+    // Sprint-G: skip when no openclaw config on disk. The internal
+    // runtime is the default and needs no external binary; checking
+    // for `openclaw` on PATH only matters when the operator has
+    // declared OC is part of their setup (config file present).
+    if !openclaw_active() {
+        return Check {
+            name: "runtime command".into(),
+            status: Status::Pass,
+            message: format!(
+                "(skipped — no {} on disk; openclaw not configured on this machine)",
+                crate::crew::dispatch::default_openclaw_config().display()
+            ),
+            hint: None,
+        };
+    }
     let cmd = "openclaw";
     if which(cmd).is_some() {
         Check {
@@ -1107,11 +1132,12 @@ fn check_runtime_command() -> Check {
         Check {
             name: "runtime command".into(),
             status: Status::Warn,
-            message: format!("`{cmd}` not on PATH"),
+            message: format!("`{cmd}` not on PATH despite openclaw config being present"),
             hint: Some(
-                "darkmux's internal runtime is the default and needs no external binary; \
-                 install openclaw only if you want to opt into `--runtime openclaw` per dispatch. \
-                 `swap`/`status`/`profiles` work without any runtime."
+                "your openclaw config exists but the binary isn't on PATH. \
+                 Either install openclaw, or remove the config if you don't \
+                 intend to use openclaw (darkmux's internal runtime is the default \
+                 and needs no external binary)."
                     .into(),
             ),
         }
@@ -1138,10 +1164,20 @@ fn parse_openclaw_version(raw: &str) -> Option<(u32, u32, u32)> {
 }
 
 fn check_runtime_version() -> Check {
-    // Post-Sprint-E: doctor only checks openclaw's version. Aider /
-    // Cline / custom runtimes are invoked per-dispatch via
-    // `--runtime openclaw --runtime-cmd <path>` and have their own
-    // version conventions; doctor doesn't try to interpret them.
+    // Sprint-G: skip when openclaw not configured on this machine (no
+    // config file on disk). Same gate as check_runtime_command — when
+    // OC isn't active, version-checking it is noise.
+    if !openclaw_active() {
+        return Check {
+            name: "runtime version".into(),
+            status: Status::Pass,
+            message: format!(
+                "(skipped — no {} on disk; openclaw not configured on this machine)",
+                crate::crew::dispatch::default_openclaw_config().display()
+            ),
+            hint: None,
+        };
+    }
     let cmd = "openclaw";
     let output = Command::new(cmd).arg("--version").output();
     let raw = match output {
@@ -2581,6 +2617,81 @@ mod tests {
         assert!(
             !hint.contains("operator-private-stuff"),
             "mv script must not propose moving operator-authored subdirs"
+        );
+    }
+
+    // ─── Sprint-G: OC-active gate on doctor runtime checks ──
+
+    /// Helper that points `DARKMUX_OPENCLAW_CONFIG` at a non-existent
+    /// path for the test's duration so `default_openclaw_config()`
+    /// resolves to a missing file (the "openclaw not configured"
+    /// signal Sprint-G keys on).
+    struct OpenclawConfigGuard {
+        prev: Option<String>,
+        _tmp: tempfile::TempDir,
+    }
+
+    impl OpenclawConfigGuard {
+        fn missing() -> Self {
+            let tmp = tempfile::TempDir::new().expect("tempdir");
+            let bogus = tmp.path().join("does-not-exist.json");
+            let prev = std::env::var("DARKMUX_OPENCLAW_CONFIG").ok();
+            // SAFETY: tests using this guard MUST be #[serial].
+            unsafe {
+                std::env::set_var("DARKMUX_OPENCLAW_CONFIG", &bogus);
+            }
+            Self { prev, _tmp: tmp }
+        }
+    }
+
+    impl Drop for OpenclawConfigGuard {
+        fn drop(&mut self) {
+            // SAFETY: tests using this guard MUST be #[serial].
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("DARKMUX_OPENCLAW_CONFIG", v),
+                    None => std::env::remove_var("DARKMUX_OPENCLAW_CONFIG"),
+                }
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_runtime_command_skips_when_openclaw_not_configured() {
+        let _guard = OpenclawConfigGuard::missing();
+        let check = check_runtime_command();
+        assert_eq!(
+            check.status,
+            Status::Pass,
+            "no openclaw config → check must pass-with-skip, not warn"
+        );
+        assert!(
+            check.message.contains("skipped"),
+            "expected `skipped` in message; got: {}",
+            check.message
+        );
+        assert!(
+            check.message.contains("openclaw not configured"),
+            "expected `openclaw not configured` framing; got: {}",
+            check.message
+        );
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_runtime_version_skips_when_openclaw_not_configured() {
+        let _guard = OpenclawConfigGuard::missing();
+        let check = check_runtime_version();
+        assert_eq!(
+            check.status,
+            Status::Pass,
+            "no openclaw config → version check must pass-with-skip"
+        );
+        assert!(
+            check.message.contains("skipped"),
+            "expected `skipped` in message; got: {}",
+            check.message
         );
     }
 }
