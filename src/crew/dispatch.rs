@@ -876,9 +876,37 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
                      If you intended a local dispatch, set DARKMUX_MACHINE_ID to make \
                      tier-routing decisions deterministic."
                 );
+                // #290 — emit the pinned route record so the audit
+                // trail + topology UI see the operator-pinned routing
+                // decision (parity with the auto-route path's record).
+                // Validation runs BEFORE the emit so a role-load
+                // failure OR an invalid tier doesn't leave a misleading
+                // "pinned" record in the audit chain.
+                let role_tier = resolve_role_tier_for_record(&opts)?;
+                let session_id = emit_route_record_and_resolve_session(
+                    &opts,
+                    &role_tier,
+                    Some(&target),
+                );
+                let mut opts = opts;
+                opts.session_id = Some(session_id);
                 return dispatch_via_queue(opts, Some(&target));
             }
             RoutingDecision::Remote { target, local_unknown: false } => {
+                // #290 — emit the pinned route record so the audit
+                // trail + topology UI see the operator-pinned routing
+                // decision (parity with the auto-route path's record).
+                // Validation runs BEFORE the emit so a role-load
+                // failure OR an invalid tier doesn't leave a misleading
+                // "pinned" record in the audit chain.
+                let role_tier = resolve_role_tier_for_record(&opts)?;
+                let session_id = emit_route_record_and_resolve_session(
+                    &opts,
+                    &role_tier,
+                    Some(&target),
+                );
+                let mut opts = opts;
+                opts.session_id = Some(session_id);
                 return dispatch_via_queue(opts, Some(&target));
             }
             RoutingDecision::Local { matches_was_explicit: false } => {
@@ -905,32 +933,17 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             );
             // Emit the dispatch-route flow record so the topology UI
             // and the audit trail can render WHY the work went to the
-            // tier-stream rather than running locally. Pre-emission
-            // session id matches what dispatch_via_queue will use as
-            // the join key, so the route record pairs with the worker's
-            // dispatch.start↔complete pair downstream. (#247 PR-C)
-            let route_session_id = opts
-                .session_id
-                .clone()
-                .unwrap_or_else(|| fresh_session_id(&opts.role_id));
-            let route_payload = build_route_payload(
+            // tier-stream rather than running locally. (#247 PR-C)
+            // Session id resolved + re-attached so dispatch_via_queue
+            // uses the same one — the worker's start/complete records
+            // pair with this route record by session_id.
+            let session_id = emit_route_record_and_resolve_session(
+                &opts,
                 &auto_target_tier,
-                local_tier.as_deref(),
-                None, // target_machine: None — consumer group claims
+                None, // auto-route — consumer group claims
             );
-            let _ = crate::flow::record(build_dispatch_record_with_payload(
-                crate::flow::Level::Info,
-                "dispatch route",
-                &opts.role_id,
-                &route_session_id,
-                None,
-                Some(route_payload),
-            ));
-            // Re-attach the resolved session_id so dispatch_via_queue
-            // uses the same one (otherwise it generates a new one and
-            // the route record can't be paired with start/complete).
             let mut opts = opts;
-            opts.session_id = Some(route_session_id);
+            opts.session_id = Some(session_id);
             return dispatch_via_queue(opts, None);
         }
     }
@@ -1377,6 +1390,76 @@ pub enum RoutingDecision {
     /// signals the publisher couldn't resolve its own machine_id —
     /// caller should emit an operator-visible warning before routing.
     Remote { target: String, local_unknown: bool },
+}
+
+/// Look up the role's tier for stamping into a `dispatch route`
+/// record's payload + validating it's acceptable for cross-machine
+/// dispatch (#290). Returns the concrete tier on success. Returns
+/// `Err` on:
+/// - role manifest not found / unreadable / unparseable (B1)
+/// - role.tier is `None`, empty, or `"any"` — cross-machine
+///   dispatch needs a concrete tier; bailing here means the
+///   record never lands in the audit chain claiming a "pinned"
+///   decision for a role the substrate would then reject (B2)
+///
+/// Bailing BEFORE the record emit keeps the audit substrate honest:
+/// every persisted `dispatch route` record corresponds to a routing
+/// decision the substrate actually accepted.
+fn resolve_role_tier_for_record(opts: &DispatchOpts) -> Result<String> {
+    let role = load_role_or_bail(&opts.role_id)?;
+    match role.tier.as_deref().map(str::trim) {
+        Some(t) if !t.is_empty() && t != "any" => Ok(t.to_string()),
+        Some(t) => bail!(
+            "role `{}` has tier={t:?} which is invalid for cross-machine \
+             dispatch (workers register on inference/hub/client streams). \
+             Either edit the role manifest to declare a concrete tier, or \
+             omit --machine to dispatch locally.",
+            opts.role_id,
+        ),
+        None => bail!(
+            "role `{}` has no tier declaration in its manifest. \
+             Cross-machine dispatch requires the role to declare which \
+             machine class it runs on. Either add \"tier\": \"inference\" \
+             (or \"hub\") to the role's JSON manifest, or omit --machine \
+             to dispatch locally.",
+            opts.role_id,
+        ),
+    }
+}
+
+/// Emit a `dispatch route` flow record at the moment the routing
+/// decision is made and return the resolved session_id so the caller
+/// can re-attach it to `opts.session_id`. This ensures the route
+/// record's session_id matches the worker's subsequent `dispatch
+/// start` / `dispatch complete` records — the topology UI's pair-
+/// rendering depends on session_id continuity.
+///
+/// Called from BOTH the auto-route path (`target_machine: None`,
+/// `decision: "auto-route"`) AND the explicit-`--machine` path
+/// (`target_machine: Some(id)`, `decision: "pinned"`) — #290 closed
+/// the gap where #285 PR-C only emitted on the auto-route arm,
+/// leaving operator-pinned routing decisions unrecorded in the audit
+/// trail.
+fn emit_route_record_and_resolve_session(
+    opts: &DispatchOpts,
+    role_tier: &str,
+    target_machine: Option<&str>,
+) -> String {
+    let local_tier = crate::flow::resolve_machine_tier();
+    let session_id = opts
+        .session_id
+        .clone()
+        .unwrap_or_else(|| fresh_session_id(&opts.role_id));
+    let payload = build_route_payload(role_tier, local_tier.as_deref(), target_machine);
+    let _ = crate::flow::record(build_dispatch_record_with_payload(
+        crate::flow::Level::Info,
+        "dispatch route",
+        &opts.role_id,
+        &session_id,
+        None,
+        Some(payload),
+    ));
+    session_id
 }
 
 /// Construct the payload for a `dispatch route` flow record (#247
