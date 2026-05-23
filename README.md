@@ -70,7 +70,8 @@ darkmux orchestrates LMStudio + your agent runtime. Install these once:
 
 | Optional | When you need it |
 |---|---|
-| **An agent runtime** (e.g. [OpenClaw](https://github.com/openclaw/openclaw), Aider, Cline) | Only for the `lab` subcommand (workload dispatch, characterize, notebook). `swap`/`status`/`profiles` work without one. Override with `DARKMUX_RUNTIME_CMD=<your-runtime>`. |
+| **[Docker](https://www.docker.com/products/docker-desktop)** | For `darkmux crew dispatch`'s default internal runtime. The dispatch runs in a per-invocation `darkmux-runtime` container; build the image once with `docker build -t darkmux-runtime:latest runtime/`. Skip this if you opt out via `--runtime openclaw`. |
+| **An agent runtime** (e.g. [OpenClaw](https://github.com/openclaw/openclaw), Aider, Cline) | Only if you opt out of the default internal runtime via `--runtime openclaw`, OR for the `lab` subcommand (workload dispatch, characterize, notebook). `swap`/`status`/`profiles` work without one. Override with `DARKMUX_RUNTIME_CMD=<your-runtime>`. |
 | **[Claude Code](https://claude.com/claude-code)** | Only for the agent-invokable skills (`/darkmux-status`, etc.). darkmux as a CLI works without it. |
 
 darkmux is developed and tested on Apple Silicon. Linux should work; Intel Mac is untested.
@@ -162,13 +163,13 @@ darkmux is a CLI binary, not an HTTP proxy. Your frontier session (Claude Code) 
 
 1. **Profile multiplexing.** `darkmux swap <profile>` unloads + loads models in LMStudio according to a named profile in `~/.darkmux/profiles.json`. `darkmux swap recommended` resolves the active hardware tier to the bake-off-validated profile + pre-flight-checks the required models are downloaded. `~10s` wall to swap.
 
-2. **Crew + mission + sprint lifecycle.** `darkmux crew dispatch <role>` invokes a per-role-pinned agent (coder, code-reviewer, scribe, …) via the configured agent runtime. `darkmux mission propose` + `darkmux sprint estimate` are admin-AI verbs that turn vague intent into structured Mission + Sprint JSONs without the operator authoring them by hand. Each dispatch emits a flow record carrying provenance: `machine_id`, `orchestrator`, role, model, mission, sprint.
+2. **Crew + mission + sprint lifecycle.** `darkmux crew dispatch <role>` invokes a per-role-pinned agent (coder, code-reviewer, scribe, …) via the in-house container-bounded runtime by default (or openclaw via `--runtime openclaw`). `darkmux mission propose` + `darkmux sprint estimate` are admin-AI verbs that turn vague intent into structured Mission + Sprint JSONs without the operator authoring them by hand. Each dispatch emits a flow record carrying provenance: `machine_id`, `orchestrator`, role, model, mission, sprint.
 
 3. **Flow substrate.** Every dispatch, decision, and review is recorded as a structured JSONL event. `LocalFileSink` (always-on) writes to `~/.darkmux/flows/`. `AuditFileSink` (opt-in via `DARKMUX_AUDIT_DIR`) adds a BLAKE3 hash chain for tamper-evidence. `RedisSink` (opt-in via `DARKMUX_REDIS_URL`) adds a cross-machine coordination stream. `darkmux flow status` introspects the substrate; `darkmux flow integrity-check` walks the audit chain.
 
 4. **Observability daemon.** `darkmux serve` is a local HTTP daemon (default bind `127.0.0.1:8765`) that serves flow records + mission/sprint state + the new `/flow-status` endpoint to the `/flow` + `/lab` viewers. Endpoints: `/health`, `/flow/<date>(.jsonl)`, `/flow/<date>/stream` (SSE tail), `/model/status`, `/missions`, `/sprints`, `/flow-status`. Foreground process — run in a separate terminal tab. `darkmux doctor` includes a `daemon: reachable` check; dispatches print a one-line stderr nudge when the daemon isn't reachable.
 
-The agent runtime that `crew dispatch` and `lab run` shell out to is configurable via `DARKMUX_RUNTIME_CMD` (default: `openclaw`). The frontier session (Claude Code) orchestrates the whole thing — see the `/darkmux-bootstrap` skill for a guided walkthrough.
+`crew dispatch` uses the internal Docker-bounded runtime by default; pass `--runtime openclaw` to opt into the openclaw path. `lab run` shells out to whatever `DARKMUX_RUNTIME_CMD` resolves to (default: `openclaw`). The frontier session (Claude Code) orchestrates the whole thing — see the `/darkmux-bootstrap` skill for a guided walkthrough.
 
 ## Why "darkmux"
 
@@ -199,23 +200,30 @@ darkmux ships with three Apple Silicon heuristics providers, tuned for different
 
 The `m-series-128` provider's rules are empirically validated against lab measurements. The 64 GB and 32 GB providers use conservative extrapolations — tune down `n_ctx` if you see swap pressure. Non-Apple-Silicon systems fall through to a generic fallback with unvalidated defaults.
 
-## Runtime — agnostic by default
+## Runtime
 
-The `lab` subcommand dispatches workloads against an *agent runtime* — by default this is `openclaw` (the runtime darkmux was developed against). The runtime is invoked via:
+`darkmux crew dispatch` uses the **internal runtime** by default — an in-house Rust agent loop running inside a per-dispatch `darkmux-runtime` Docker container with a mounted workspace tempdir. Kernel-enforced workspace isolation, no cross-task context leak by construction. The image is small (~50 MB) and built once from `runtime/`:
 
 ```bash
-DARKMUX_RUNTIME_CMD=<command>   # default: openclaw
+# build the image once from the darkmux repo root
+docker build -t darkmux-runtime:latest runtime/
 ```
 
-If you set `DARKMUX_RUNTIME_CMD=aider` (or `cline`, or your own wrapper), darkmux invokes that binary instead with the same `agent --message` calling convention. Anything that exposes a single-shot `<cmd> agent --message <text> --json` surface is a candidate. The `swap` / `status` / `profiles` subcommands don't depend on the runtime at all — they orchestrate LMStudio directly.
+Opt into openclaw per-dispatch if you already have it installed:
 
-When the runtime is openclaw (the default), `darkmux swap` and `darkmux doctor --fix` patch the openclaw config file in place. Path resolution: any profile's `runtime.config_path` wins; otherwise darkmux honors the `DARKMUX_OPENCLAW_CONFIG` env var; otherwise it falls back to `~/.openclaw/openclaw.json`. Set the env var if your openclaw lives somewhere non-standard:
+```bash
+darkmux crew dispatch coder --runtime openclaw --message "..."
+```
+
+The `lab` subcommand is separate — it shells out to whatever `DARKMUX_RUNTIME_CMD` resolves to (default `openclaw`). Anything that exposes a single-shot `<cmd> agent --message <text> --json` surface is a candidate (Aider, Cline, your own wrapper). The `swap` / `status` / `profiles` subcommands don't depend on any runtime at all — they orchestrate LMStudio directly.
+
+When openclaw is in the picture (either as the lab harness or the explicit `--runtime openclaw` dispatch path), `darkmux swap` and `darkmux doctor --fix` patch the openclaw config file in place. Path resolution: any profile's `runtime.config_path` wins; otherwise darkmux honors the `DARKMUX_OPENCLAW_CONFIG` env var; otherwise it falls back to `~/.openclaw/openclaw.json`. Set the env var if your openclaw lives somewhere non-standard:
 
 ```bash
 export DARKMUX_OPENCLAW_CONFIG="$HOME/work/openclaw-staging/openclaw.json"
 ```
 
-This means: **darkmux's profile-multiplexing is runtime-agnostic** today; the lab harness is *runtime-pluggable* via the env var. The empirical findings in the article series happened to be measured against OpenClaw; the routing thesis itself is independent.
+This means: **darkmux's profile-multiplexing is runtime-agnostic** today; `crew dispatch` ships with a self-contained internal runtime so new users don't need an openclaw install to get going; the lab harness is *runtime-pluggable* via the env var. The empirical findings in the article series happened to be measured against OpenClaw; the routing thesis itself is independent.
 
 ### Cross-machine notebook (multi-environment lab notes)
 
