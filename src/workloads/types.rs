@@ -41,8 +41,18 @@ pub struct WorkloadSpec {
     pub provider: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Darkmux role manifest id to dispatch the workload through.
+    /// Looks up `templates/builtin/roles/<role>.json` for the system
+    /// prompt + tool palette. Beat 36 directional principle: DM's
+    /// concepts are primary — workloads reference DM roles, not OC
+    /// agent personas.
+    ///
+    /// When `None`, providers fall back to a generic system prompt
+    /// (today: `code-reviewer` as the default for prompt-shape
+    /// workloads, since it's the role best-suited to single-turn
+    /// QA-flavored tasks).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent: Option<String>,
+    pub role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "promptFile")]
@@ -144,6 +154,11 @@ pub trait WorkloadProvider: Send + Sync {
     fn id(&self) -> &'static str;
     fn description(&self) -> &'static str;
     fn setup(&self, loaded: &LoadedWorkload, run_dir: &Path, sandbox_dir: &Path) -> Result<()>;
+    /// Run the workload through the operator-selected runtime.
+    /// `runtime` selects between darkmux's in-house container-bounded
+    /// runtime (default; Beat 36 — no openclaw install required) and
+    /// the legacy openclaw shell-out path (opt-in via `--runtime
+    /// openclaw` on `darkmux lab run`).
     fn run(
         &self,
         loaded: &LoadedWorkload,
@@ -151,6 +166,7 @@ pub trait WorkloadProvider: Send + Sync {
         sandbox_dir: &Path,
         profile: &Profile,
         profile_name: &str,
+        runtime: crate::crew::dispatch::Runtime,
     ) -> Result<RunResult>;
     fn inspect(&self, loaded: &LoadedWorkload, run_dir: &Path) -> Result<InspectionReport>;
     fn teardown(&self, _run_dir: &Path, _sandbox_dir: &Path) -> Result<()> {
@@ -169,7 +185,7 @@ mod tests {
                 "id": "quick-q",
                 "provider": "prompt",
                 "description": "A trivial demonstration workload.",
-                "agent": "qa",
+                "role": "code-reviewer",
                 "prompt": "What is one observable difference?",
                 "verify": {"must_contain": ["active"]}
             }
@@ -177,7 +193,7 @@ mod tests {
         let parsed: WorkloadManifest = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.workload.id, "quick-q");
         assert_eq!(parsed.workload.provider, "prompt");
-        assert_eq!(parsed.workload.agent.as_deref(), Some("qa"));
+        assert_eq!(parsed.workload.role.as_deref(), Some("code-reviewer"));
         let v = parsed.workload.verify.as_ref().unwrap();
         assert_eq!(v.must_contain, vec!["active".to_string()]);
     }

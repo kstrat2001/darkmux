@@ -57,6 +57,9 @@ pub fn tune(opts: &TuneOpts) -> Result<TuneReport> {
         runs,
         config_path: opts.config.clone(),
         quiet: false,
+        // tune() runs the workload through the default runtime
+        // (internal, post-Sprint-D).
+        runtime: crate::crew::dispatch::Runtime::Internal,
         instrument: false,
     })?;
     let stats = compute_stats(&outcomes);

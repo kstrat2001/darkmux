@@ -49,8 +49,9 @@
 <section>
   <div class="wrap">
     <h2>Prerequisites for lab</h2>
-    <p>The lab harness shells out to an agent runtime to dispatch workloads against. By default that's <code>openclaw</code> (via the <code>openclaw agent</code> command — runtime measurements in the article series were taken against this path). Override with <code>DARKMUX_RUNTIME_CMD=&lt;your-runtime&gt;</code> for Aider, Cline, or anything else with a <code>&lt;cmd&gt; agent --message</code> surface.</p>
-    <p>Lab and <code>crew dispatch</code> are separate codepaths — <code>crew dispatch</code> defaults to darkmux's in-house internal runtime (Docker container, see <a href="missions.html">missions</a>), while <code>lab run</code> continues to use the external runtime above. If you don't have either installed, the <code>swap</code> / <code>status</code> / <code>profiles</code> / <code>doctor</code> verbs still work — you just can't run lab dispatches.</p>
+    <p>By default, <code>darkmux lab run</code> uses the same internal Docker-bounded runtime as <code>darkmux crew dispatch</code> — no openclaw install needed. Workloads dispatch through a per-invocation <code>darkmux-runtime</code> container; build the image once with <code>docker build -t darkmux-runtime:latest runtime/</code> from the darkmux repo root.</p>
+    <p>Operators who already have openclaw installed (or who want the runtime the article-series numbers were measured against) can opt in per-run with <code>darkmux lab run &lt;workload&gt; --runtime openclaw</code>. The openclaw shell-out binary defaults to <code>openclaw</code> on PATH; override with <code>DARKMUX_RUNTIME_CMD=&lt;your-runtime&gt;</code> for Aider, Cline, or anything else with a <code>&lt;cmd&gt; agent --message</code> surface. (That env var is only consulted under <code>--runtime openclaw</code>; pure-internal operators never touch it.)</p>
+    <p>If you have neither Docker nor an external runtime, the <code>swap</code> / <code>status</code> / <code>profiles</code> / <code>doctor</code> verbs still work — you just can't run lab dispatches.</p>
   </div>
 </section>
 

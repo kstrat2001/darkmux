@@ -15,6 +15,11 @@ pub struct RunOpts {
     pub runs: u32,
     pub config_path: Option<String>,
     pub quiet: bool,
+    /// Which agent runtime to dispatch the workload through.
+    /// `Runtime::Internal` (default) uses darkmux's container-bounded
+    /// runtime; `Runtime::Openclaw` shells out to the openclaw CLI
+    /// (legacy path; requires DARKMUX_RUNTIME_CMD-resolved binary).
+    pub runtime: crate::crew::dispatch::Runtime,
     /// Enable cross-layer telemetry capture during the dispatch. When true,
     /// each run dir gets an `instruments.jsonl` with periodic samples of
     /// LMStudio state, gateway-process residency, and timing meta.
@@ -100,9 +105,10 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
         };
 
         let provider_id = loaded_workload.manifest.workload.provider.clone();
+        let runtime = opts.runtime;
         let result = with_provider(&provider_id, |p| {
             p.setup(&loaded_workload, &run_dir, &sandbox_dir)?;
-            p.run(&loaded_workload, &run_dir, &sandbox_dir, profile, &profile_name)
+            p.run(&loaded_workload, &run_dir, &sandbox_dir, profile, &profile_name, runtime)
         })??;
 
         // Stop the sidecar before recording outcome notes — that way any
@@ -225,6 +231,7 @@ mod tests {
             runs: 1,
             config_path: Some(cfg.to_str().unwrap().into()),
             quiet: true,
+            runtime: crate::crew::dispatch::Runtime::Internal,
             instrument: false,
         })
         .unwrap_err();

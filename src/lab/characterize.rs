@@ -32,6 +32,9 @@ pub fn characterize(opts: &CharacterizeOpts) -> Result<CharacterizeReport> {
         runs: 1,
         config_path: opts.config.clone(),
         quiet: true,
+        // characterize() is an internal admin operation — uses default
+        // runtime (internal, post-Sprint-D).
+        runtime: crate::crew::dispatch::Runtime::Internal,
         instrument: false,
     };
     let outcomes = lab_run(run_opts)?;

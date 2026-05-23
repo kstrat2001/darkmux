@@ -71,7 +71,7 @@ darkmux orchestrates LMStudio + your agent runtime. Install these once:
 | Optional | When you need it |
 |---|---|
 | **[Docker](https://www.docker.com/products/docker-desktop)** | For `darkmux crew dispatch`'s default internal runtime. The dispatch runs in a per-invocation `darkmux-runtime` container; build the image once with `docker build -t darkmux-runtime:latest runtime/`. Skip this if you opt out via `--runtime openclaw`. |
-| **An agent runtime** (e.g. [OpenClaw](https://github.com/openclaw/openclaw), Aider, Cline) | Only if you opt out of the default internal runtime via `--runtime openclaw`, OR for the `lab` subcommand (workload dispatch, characterize, notebook). `swap`/`status`/`profiles` work without one. Override with `DARKMUX_RUNTIME_CMD=<your-runtime>`. |
+| **An agent runtime** (e.g. [OpenClaw](https://github.com/openclaw/openclaw), Aider, Cline) | Only if you opt out of the default internal runtime via `--runtime openclaw` (on `crew dispatch` or `lab run`). `swap`/`status`/`profiles` work without one. Override the openclaw shell-out binary with `DARKMUX_RUNTIME_CMD=<your-runtime>` (used only under `--runtime openclaw`). |
 | **[Claude Code](https://claude.com/claude-code)** | Only for the agent-invokable skills (`/darkmux-status`, etc.). darkmux as a CLI works without it. |
 
 darkmux is developed and tested on Apple Silicon. Linux should work; Intel Mac is untested.

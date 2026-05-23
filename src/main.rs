@@ -777,6 +777,13 @@ enum LabCmd {
         config: Option<String>,
         #[arg(long, short = 'q')]
         quiet: bool,
+        /// Which agent runtime to dispatch through. Default `internal`
+        /// is darkmux's in-house container-bounded Rust runtime.
+        /// `openclaw` opts into the legacy shell-out path. Beat 36
+        /// directional principle: openclaw is a downstream translation
+        /// target the operator opts into per dispatch.
+        #[arg(long, default_value = "internal")]
+        runtime: String,
         /// Capture cross-layer telemetry during the dispatch. Writes
         /// `instruments.jsonl` to the run dir with periodic samples of
         /// LMStudio state and gateway-process residency. Useful for
@@ -2515,14 +2522,17 @@ fn cmd_lab(sub: LabCmd) -> Result<i32> {
             runs,
             config,
             quiet,
+            runtime,
             instrument,
         } => {
+            let runtime_flag = crew::dispatch::Runtime::parse(&runtime)?;
             let outcomes = lab::run::lab_run(lab::run::RunOpts {
                 workload_id: workload,
                 profile_name: profile,
                 runs,
                 config_path: config,
                 quiet,
+                runtime: runtime_flag,
                 instrument,
             })?;
             if !quiet {
