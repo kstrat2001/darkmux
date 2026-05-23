@@ -1003,11 +1003,18 @@ fn redis_tail_lines(
     stream_name: String,
     date_filter: String,
 ) -> impl Stream<Item = String> {
-    // Unbounded channel — flow records are small (~1 KB) and
-    // bounded by Redis stream MAXLEN upstream. Backpressure on the
-    // SSE client side is handled by hyper, not here. (Slow-consumer
-    // mpsc-growth is tracked separately as #294.)
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    // Bounded channel — hyper's TCP backpressure only reaches as far
+    // as the SSE stream's `.poll_next`; the channel between the
+    // spawned XREAD task and the SSE stream is an application-layer
+    // buffer not covered by that backpressure. With the pre-#294
+    // `unbounded_channel`, a slow consumer (paused tab, bad network,
+    // pathological reader) let the producer fill the channel
+    // indefinitely — daemon RAM grew linearly with the duration of
+    // the consumer's lag. The fleet-wide /flow data surface makes
+    // this a daemon-level DoS surface a single misbehaving tab can
+    // hit. Bound at `SSE_MPSC_CAPACITY` records; drop-newest on full
+    // with operator-visible log. (#294)
+    let (tx, rx) = tokio::sync::mpsc::channel::<String>(SSE_MPSC_CAPACITY);
 
     tokio::spawn(async move {
         // Eager: resolve the watermark NOW, before the consumer can
@@ -1049,6 +1056,12 @@ fn redis_tail_lines(
         // clean terminal event and can reconnect (or surface the
         // failure to the user); the spawned task exits.
         let mut consecutive_failures: u32 = 0;
+        // Local counter — only this spawn task increments + reads via
+        // the eprintln below. Plain u64 (not Arc<AtomicU64>) keeps
+        // the hot path zero-overhead; if a future operator-visible
+        // counter surfaces (metrics endpoint, /healthz), promote to
+        // shared atomic at that time.
+        let mut dropped_records: u64 = 0;
 
         loop {
             let url_call = url.clone();
@@ -1064,9 +1077,23 @@ fn redis_tail_lines(
                     last_id = new_last_id;
                     consecutive_failures = 0; // recovered
                     for r in records {
-                        if tx.send(r).is_err() {
-                            // Receiver dropped — consumer disconnected.
-                            return;
+                        match try_send_or_drop_newest(&tx, r) {
+                            SendOutcome::Sent => {}
+                            SendOutcome::Dropped => {
+                                dropped_records += 1;
+                                // Log on every drop — operator visibility
+                                // matters more than log noise. Rate-limit
+                                // is a future hardening if it surfaces.
+                                eprintln!(
+                                    "darkmux serve: SSE channel full ({SSE_MPSC_CAPACITY}); \
+                                     dropping newest record on stream `{stream_name}` \
+                                     (total dropped: {dropped_records})"
+                                );
+                            }
+                            SendOutcome::Closed => {
+                                // Receiver dropped — consumer disconnected.
+                                return;
+                            }
                         }
                     }
                 }
@@ -1083,7 +1110,20 @@ fn redis_tail_lines(
                             consecutive_failures,
                             &format!("XREAD failed: {e}"),
                         );
-                        let _ = tx.send(synthetic);
+                        // Best-effort synthetic delivery. If the
+                        // channel is closed (receiver gone) or full,
+                        // the operator still sees the eprintln above —
+                        // but log the synthetic-drop separately so the
+                        // daemon log preserves the "we tried" record
+                        // for forensics. (#293 reviewer B1 follow-up
+                        // surfaced via #294 review)
+                        if let Err(e) = tx.try_send(synthetic) {
+                            eprintln!(
+                                "darkmux serve: stream-error synthetic not delivered \
+                                 on stream `{stream_name}` ({e}); SSE consumer will see \
+                                 silent stream close instead of explicit terminal record"
+                            );
+                        }
                         return;
                     }
                     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -1101,7 +1141,20 @@ fn redis_tail_lines(
                             consecutive_failures,
                             &format!("blocking task join error: {e}"),
                         );
-                        let _ = tx.send(synthetic);
+                        // Best-effort synthetic delivery. If the
+                        // channel is closed (receiver gone) or full,
+                        // the operator still sees the eprintln above —
+                        // but log the synthetic-drop separately so the
+                        // daemon log preserves the "we tried" record
+                        // for forensics. (#293 reviewer B1 follow-up
+                        // surfaced via #294 review)
+                        if let Err(e) = tx.try_send(synthetic) {
+                            eprintln!(
+                                "darkmux serve: stream-error synthetic not delivered \
+                                 on stream `{stream_name}` ({e}); SSE consumer will see \
+                                 silent stream close instead of explicit terminal record"
+                            );
+                        }
                         return;
                     }
                     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -1110,7 +1163,7 @@ fn redis_tail_lines(
         }
     });
 
-    tokio_stream::wrappers::UnboundedReceiverStream::new(rx)
+    tokio_stream::wrappers::ReceiverStream::new(rx)
 }
 
 /// Max consecutive `XREAD` failures before `redis_tail_lines` emits
@@ -1120,6 +1173,63 @@ fn redis_tail_lines(
 /// surface within seconds rather than the task leaking + log-spam
 /// forever.
 const MAX_CONSECUTIVE_XREAD_FAILURES: u32 = 10;
+
+// ── #294 SSE channel bounding ────────────────────────────────────────
+
+/// Bounded SSE channel capacity (#294). 256 entries × ~1 KB/record
+/// typical = ~256 KB worst-case buffer per open SSE stream. Picked
+/// to be generous enough that a healthy consumer on a normal network
+/// never hits the bound, but small enough that a single pathological
+/// tab can't grow the daemon's RAM without limit.
+///
+/// **Overflow strategy: drop-newest.** On Full, the new record is
+/// discarded and existing buffered records are preserved. Trade-off
+/// considered (and rejected):
+/// - `broadcast::Sender` with drop-oldest semantics — preserves
+///   recent records (which is arguably what a "live tail" UX wants).
+///   Rejected because the broadcast channel returns `Result<T,
+///   BroadcastStreamRecvError>` from Stream, complicating the SSE
+///   producer's error-handling story, and the multi-receiver shape
+///   is overkill for a one-receiver-per-stream daemon.
+///
+/// Drop-newest preserves timeline arrival order for the consumer
+/// that is keeping up; the consumer that fell behind sees a gap
+/// for the most-recent records. Acceptable: SSE clients typically
+/// reconnect to recover, and the topology UI's record-display
+/// already handles gaps gracefully.
+const SSE_MPSC_CAPACITY: usize = 256;
+
+/// Outcome of a `try_send_or_drop_newest` call. `Closed` lets the
+/// caller distinguish "consumer left" (exit cleanly) from "consumer
+/// is slow" (drop + continue).
+#[derive(Debug, PartialEq)]
+enum SendOutcome {
+    Sent,
+    Dropped,
+    Closed,
+}
+
+/// Try to send `item` on a bounded mpsc channel. Returns a
+/// `SendOutcome` so the caller can distinguish the three cases:
+/// - `Sent` — record delivered to the consumer
+/// - `Dropped` — channel was full; record discarded. Caller logs
+///   + increments its own local drop counter
+/// - `Closed` — receiver dropped; caller should exit
+///
+/// Drop-newest is the chosen overflow strategy (see the comment
+/// near `SSE_MPSC_CAPACITY`). Extracted as a pure helper for
+/// unit-testability without spinning up a tokio runtime per test.
+fn try_send_or_drop_newest(
+    tx: &tokio::sync::mpsc::Sender<String>,
+    item: String,
+) -> SendOutcome {
+    use tokio::sync::mpsc::error::TrySendError;
+    match tx.try_send(item) {
+        Ok(()) => SendOutcome::Sent,
+        Err(TrySendError::Full(_dropped_item)) => SendOutcome::Dropped,
+        Err(TrySendError::Closed(_)) => SendOutcome::Closed,
+    }
+}
 
 /// Build a synthetic flow-record line representing an unrecoverable
 /// stream-error condition. Emitted by `redis_tail_lines` before exit
@@ -1707,6 +1817,64 @@ mod tests {
             response.headers().contains_key("access-control-allow-origin"),
             "origin in DARKMUX_DAEMON_CORS_ORIGINS must receive CORS headers (#273)"
         );
+    }
+
+    // ─── #294 try_send_or_drop_newest ─────────────────────────────────
+
+    /// Bounded channel + producer outpaces consumer → SendOutcome::
+    /// Dropped returned; the records that fit make it through. Pre-
+    /// #294, the channel was unbounded and would grow indefinitely.
+    #[tokio::test]
+    async fn try_send_or_drop_newest_drops_when_channel_full() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(2);
+
+        assert_eq!(
+            try_send_or_drop_newest(&tx, "a".to_string()),
+            SendOutcome::Sent
+        );
+        assert_eq!(
+            try_send_or_drop_newest(&tx, "b".to_string()),
+            SendOutcome::Sent
+        );
+        // Capacity is 2; third send should drop (newest-dropped).
+        assert_eq!(
+            try_send_or_drop_newest(&tx, "c".to_string()),
+            SendOutcome::Dropped
+        );
+        assert_eq!(
+            try_send_or_drop_newest(&tx, "d".to_string()),
+            SendOutcome::Dropped
+        );
+
+        // The consumer pulls — gets the records that fit (a, b);
+        // c and d were dropped (drop-newest semantics).
+        assert_eq!(rx.recv().await, Some("a".to_string()));
+        assert_eq!(rx.recv().await, Some("b".to_string()));
+    }
+
+    /// Receiver dropped → SendOutcome::Closed returned.
+    #[tokio::test]
+    async fn try_send_or_drop_newest_signals_closed_on_receiver_drop() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(16);
+        drop(rx); // consumer leaves
+        assert_eq!(
+            try_send_or_drop_newest(&tx, "post-drop".to_string()),
+            SendOutcome::Closed
+        );
+    }
+
+    /// Consumer that drains keeps up — no drops.
+    #[tokio::test]
+    async fn try_send_or_drop_newest_no_drops_when_consumer_keeps_up() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(2);
+        for i in 0..10 {
+            assert_eq!(
+                try_send_or_drop_newest(&tx, format!("r{i}")),
+                SendOutcome::Sent
+            );
+            // Consumer drains immediately after each send.
+            let _ = rx.recv().await;
+        }
     }
 
     // ─── #288 normalize trailing-slash + case + reject wildcard ─────────
