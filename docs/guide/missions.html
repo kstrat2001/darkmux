@@ -61,18 +61,23 @@
 darkmux role show coder          <span class="comment"># full details for one role</span></code></pre>
 
     <h3>Dispatch a role</h3>
-    <pre><code>darkmux crew dispatch coder --message "Add a tests for the new helper in src/foo.rs"</code></pre>
-    <p>What happens:</p>
+    <pre><code>darkmux crew dispatch coder --message "Add tests for the new helper in src/foo.rs"</code></pre>
+    <p>What happens (default runtime &mdash; internal):</p>
     <ol>
       <li>darkmux loads the role manifest + the <code>.md</code> system prompt.</li>
-      <li><strong>Pre-flight</strong>: verifies the corresponding openclaw agent under <code>darkmux/&lt;role-id&gt;</code> matches the manifest's tool palette and system prompt. Bails loud if there's drift, pointing you at <code>darkmux crew sync</code> to fix.</li>
-      <li>Issues <code>openclaw agent --agent darkmux/&lt;role-id&gt; --message "..."</code> with a fresh session id (avoids cross-task context pollution).</li>
-      <li>Emits a <code>dispatch start</code> flow record (tier=local, with the resolved model stamped), then the actual model work, then a <code>dispatch complete</code> or <code>dispatch error</code> record.</li>
-      <li>After return, optionally snapshots filesystem state at <code>--watch</code> paths to verify the role's SIGNOFF claims.</li>
+      <li><strong>Pre-flight</strong>: verifies Docker is reachable and the <code>darkmux-runtime:latest</code> image is present locally. Bails loud with build instructions if either is missing.</li>
+      <li>Spins up a fresh <code>darkmux-runtime</code> container per dispatch with a mounted workspace tempdir &mdash; kernel-enforced isolation, no cross-task context leak by construction.</li>
+      <li>Streams the model's reasoning and tool calls via the in-house Rust loop; emits <code>dispatch.turn</code>, <code>dispatch.tool</code>, and <code>dispatch.reasoning</code> flow records as they happen.</li>
+      <li>Emits a final <code>dispatch complete</code> or <code>dispatch error</code> record; optionally snapshots <code>--watch</code> paths to verify the role's SIGNOFF claims.</li>
     </ol>
 
-    <h3>Sync the role registry</h3>
-    <p>If you've edited a role's manifest or system prompt, run sync so the openclaw side picks up the change:</p>
+    <h4>Opting into openclaw</h4>
+    <p>If you already have openclaw installed and prefer its dispatch path:</p>
+    <pre><code>darkmux crew dispatch coder --runtime openclaw --message "..."</code></pre>
+    <p>The openclaw path uses <code>darkmux/&lt;role-id&gt;</code> agents in openclaw's config; run <code>darkmux crew sync</code> first if you've edited a role manifest since the last sync.</p>
+
+    <h3>Sync the role registry (openclaw only)</h3>
+    <p>Only needed if you use <code>--runtime openclaw</code>. The internal runtime reads role manifests directly each dispatch &mdash; no registry to reconcile.</p>
     <pre><code>darkmux crew sync                <span class="comment"># reconcile openclaw agents.list[] with manifests</span>
 darkmux crew sync --dry-run      <span class="comment"># preview without writing</span></code></pre>
   </div>
