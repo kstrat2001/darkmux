@@ -1,13 +1,12 @@
 //! Internal runtime dispatch path.
 //!
-//! Routes a `darkmux crew dispatch --runtime internal <role>` invocation
-//! to the `darkmux-runtime` docker container instead of openclaw.
-//! Per-dispatch container, mounted workspace, structured output collected
-//! from stdout.
+//! Routes a `darkmux crew dispatch <role>` invocation to the
+//! `darkmux-runtime` docker container. Per-dispatch container, mounted
+//! workspace, structured output collected from stdout.
 //!
-//! Opt-in via the explicit `--runtime internal` CLI flag while the
-//! in-house runtime is being measured against openclaw. Promotion to
-//! default is a separate decision tracked in `runtime/README.md`.
+//! Default runtime as of the runtime-default flip. Openclaw remains
+//! available via the explicit `--runtime openclaw` flag for operators
+//! who already have it installed and configured.
 //!
 //! Deliberately simpler than the openclaw path:
 //!
@@ -48,6 +47,15 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     eprintln!(
         "darkmux crew dispatch: runtime=internal — image: {RUNTIME_IMAGE}"
     );
+
+    // Pre-flight: Docker reachable + runtime image present. The
+    // internal runtime is the default as of the runtime-default flip;
+    // these are the prereqs a new user might not have set up yet. Bail
+    // loud + operator-actionable BEFORE we run the role-load / model-
+    // probe / workspace-setup work below.
+    if !opts.skip_preflight {
+        check_docker_preflight()?;
+    }
 
     // 1. Load the role manifest + .md prompt. The internal runtime uses
     //    the SAME on-disk role definition as the openclaw path so the
@@ -516,6 +524,60 @@ fn cap_reasoning_text(value: Option<&serde_json::Value>) -> serde_json::Value {
 }
 
 /// Shell out to curl to fetch `/v1/models` from the host's LMStudio and
+/// Verify Docker is reachable + the runtime image exists. Called by
+/// `dispatch()` BEFORE the role-load / model-probe / workspace setup
+/// so a new user without Docker (or with Docker but no runtime image)
+/// gets a clean, operator-actionable bail message instead of an
+/// opaque `Command::new("docker")` "No such file or directory" or
+/// a runtime-time "Unable to find image" failure mid-dispatch.
+fn check_docker_preflight() -> Result<()> {
+    // Step 1: docker binary exists + daemon is reachable.
+    let docker_check = Command::new("docker")
+        .args(["version", "--format", "{{.Server.Version}}"])
+        .output();
+    match docker_check {
+        Ok(out) if out.status.success() => {} // Docker daemon up
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            bail!(
+                "darkmux's default runtime (`--runtime internal`) requires Docker, \
+                 but `docker version` failed:\n  {}\n\
+                 Options:\n  \
+                 - Start Docker Desktop, OR\n  \
+                 - Re-run with `--runtime openclaw` if you have openclaw installed",
+                stderr.trim()
+            );
+        }
+        Err(_) => {
+            bail!(
+                "darkmux's default runtime (`--runtime internal`) requires Docker, \
+                 but the `docker` binary isn't on PATH.\n\
+                 Options:\n  \
+                 - Install Docker Desktop (https://www.docker.com/products/docker-desktop), OR\n  \
+                 - Re-run with `--runtime openclaw` if you have openclaw installed"
+            );
+        }
+    }
+
+    // Step 2: runtime image exists locally. `docker images -q <tag>`
+    // exits 0 even when the image is missing; the load-bearing signal
+    // is empty stdout (no image id printed). Daemon-unreachable cases
+    // were already caught in Step 1.
+    let image_check = Command::new("docker")
+        .args(["images", "-q", RUNTIME_IMAGE])
+        .output()
+        .context("running `docker images` to check for runtime image")?;
+    if image_check.stdout.is_empty() {
+        bail!(
+            "darkmux runtime image `{RUNTIME_IMAGE}` not found locally.\n\
+             Build it once from the darkmux repo root:\n  \
+             docker build -t {RUNTIME_IMAGE} runtime/\n\
+             (Or use `--runtime openclaw` if you have openclaw installed.)"
+        );
+    }
+    Ok(())
+}
+
 /// return the first model id. Uses curl so we don't drag a Rust HTTP
 /// client dep into darkmux's main crate for one probe call.
 fn probe_loaded_model() -> Result<String> {
