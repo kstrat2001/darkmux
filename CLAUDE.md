@@ -208,7 +208,7 @@ When writing a new feature that mutates state in LMStudio or OpenClaw on the ope
 - `darkmux model status` — list `lms ps` results grouped by ownership (darkmux-managed vs user state). Read-only.
 - `darkmux model eject [--dry-run]` — unload everything in the `darkmux:` namespace; never touches user state. Use to release darkmux's RAM footprint without disturbing other tools.
 - `darkmux crew sync [--dry-run]` — reconcile openclaw's `agents.list[]` with the crew role manifests. For each role with both a JSON manifest and `.md` system prompt, ensures a `darkmux/<role-id>` openclaw agent exists with the manifest-derived shape (system prompt + tool palette). Idempotent.
-- `darkmux crew dispatch <role-id> --message <text> [--deliver <chan>:<target>]` — dispatch a single turn to the named role. Looks up the role, pre-flight-verifies that the corresponding `darkmux/<role-id>` openclaw agent matches the manifest (bails loud on drift with a `darkmux crew sync` repair pointer), then invokes `openclaw agent` and returns the result.
+- `darkmux crew dispatch <role-id> --message <text> [--deliver <chan>:<target>]` — dispatch a single turn to the named role. Looks up the role manifest + `.md` system prompt, then runs the role through the **internal runtime** by default (per-dispatch `darkmux-runtime` Docker container, mounted workspace tempdir, in-house Rust agent loop with streamed flow records). Pass `--runtime openclaw` to opt into the openclaw shell-out path; that path pre-flight-verifies the `darkmux/<role-id>` openclaw agent matches the manifest (bails loud on drift with a `darkmux crew sync` repair pointer) before invoking `openclaw agent`.
 
 Tracked alongside operator sovereignty (#44) and issues [#52](https://github.com/kstrat2001/darkmux/issues/52) (LMStudio namespace), [#55](https://github.com/kstrat2001/darkmux/issues/55) (full pre-flight checklist — partial coverage in `crew dispatch` today), and the `qa-review` migration that brought these verbs into the dispatch path.
 
@@ -284,7 +284,7 @@ Two role families compose to make this work, and the distinction matters when pi
 
 CLI primitives stay small and composable; the AI-built-in verbs (`mission propose`, `sprint estimate`, `notebook draft`) compose those primitives with admin-agent dispatches so the operator gets structured output without authoring JSON by hand. Both surfaces are part of the same project — the dual posture (small primitives + AI-built-in verbs) is deliberate.
 
-The default runtime is OpenClaw (`DARKMUX_RUNTIME_CMD=openclaw`) but the lab harness is runtime-pluggable via env var. Users running Aider, Cline, or anything with a `<cmd> agent --message` interface can point darkmux at it.
+`darkmux crew dispatch` uses the internal Docker-bounded runtime by default; pass `--runtime openclaw` to opt into the openclaw path for operators who already have it. The lab harness (`darkmux lab run`) is a separate codepath that still shells out to `DARKMUX_RUNTIME_CMD` (default `openclaw`) and is runtime-pluggable via env var — users running Aider, Cline, or anything with a `<cmd> agent --message` interface can point the lab harness at it.
 
 ## When in doubt
 

@@ -58,8 +58,12 @@
     <table>
       <tr><th>Tool</th><th>When you need it</th></tr>
       <tr>
-        <td>An agent runtime (e.g. <a href="https://github.com/openclaw/openclaw">OpenClaw</a>)</td>
-        <td>For <code>darkmux lab</code> dispatches and <code>darkmux crew dispatch</code>. Pure <code>swap</code>/<code>status</code>/<code>profiles</code> work without one. Override the default with <code>DARKMUX_RUNTIME_CMD=&lt;your-runtime&gt;</code>.</td>
+        <td><a href="https://www.docker.com/products/docker-desktop">Docker</a></td>
+        <td>For <code>darkmux crew dispatch</code>'s default internal runtime. The dispatch runs in a per-invocation <code>darkmux-runtime</code> container; build the image once with <code>docker build -t darkmux-runtime:latest runtime/</code>. Skip this if you opt out via <code>--runtime openclaw</code>.</td>
+      </tr>
+      <tr>
+        <td>An agent runtime (e.g. <a href="https://github.com/openclaw/openclaw">OpenClaw</a>, Aider, Cline)</td>
+        <td>For <code>darkmux lab</code> dispatches (default <code>openclaw</code>; override with <code>DARKMUX_RUNTIME_CMD=&lt;your-runtime&gt;</code>), OR if you opt into <code>darkmux crew dispatch --runtime openclaw</code>. Pure <code>swap</code>/<code>status</code>/<code>profiles</code> work without one.</td>
       </tr>
       <tr>
         <td><a href="https://claude.com/claude-code">Claude Code</a> (or any frontier orchestrator)</td>

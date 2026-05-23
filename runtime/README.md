@@ -2,7 +2,7 @@
 
 In-house container-bounded agent runtime for darkmux. Replaces the openclaw shell-out path for `darkmux crew dispatch` with a lean Alpine container that darkmux owns end-to-end.
 
-Opt-in today via `darkmux crew dispatch --runtime internal <role>`; the default remains `openclaw` until production hardening lands.
+**Default for `darkmux crew dispatch` as of v0.4.** Operators with an existing openclaw setup can opt back into the legacy path via `darkmux crew dispatch --runtime openclaw <role>`.
 
 ## Why this exists
 
@@ -65,7 +65,7 @@ docker run --rm -v "$(pwd):/workspace" darkmux-runtime run \
   --prompt "your task here"
 ```
 
-For routine use, the wrapper is `darkmux crew dispatch --runtime internal <role-id> -m "<message>"` (handles role loading, workspace allocation, model probe).
+For routine use, the wrapper is `darkmux crew dispatch <role-id> -m "<message>"` (default runtime — handles role loading, workspace allocation, model probe, and Docker pre-flight).
 
 ## Environment variables
 
@@ -84,16 +84,14 @@ cargo test --release
 
 ## What's NOT in the runtime today
 
-- `--workdir` plumbing through `darkmux crew dispatch --runtime internal` (each dispatch creates a fresh tempdir; required before this is useful for non-toy work)
-- Multi-agent parallelism inside one container (the runtime hosts a single agent loop per invocation today; nothing precludes extending to multiple `--agent` flags + parallel loops sharing the workspace)
-- Streaming chat completions (single-shot only)
+- Multi-agent parallelism inside one container (single agent loop per invocation today; nothing precludes extending to multiple `--agent` flags + parallel loops sharing the workspace)
 - Audit-chain wiring at the volume-mount boundary
-- Production migration story (operators with existing openclaw configurations)
-- Distribution: the image is built locally from this Dockerfile, not pushed to a registry
+- Distribution: the image is built locally from this Dockerfile, not pushed to a registry — `docker build -t darkmux-runtime:latest runtime/` from the darkmux repo root is the install step
 
-## Open follow-ups before promotion to default
+## Known gaps post-flip (v0.4)
 
-- Variance bounded against openclaw across enough samples to be statistically meaningful (current data: 5-sample distribution of converged config showed median 2-3× faster than openclaw, with 8.5× wall variance — single-run rankings are noisy)
-- Migration of crew role definitions (`templates/builtin/crew/roles/*.md`) — several roles assume openclaw's tool palette (`exec`, `update_plan`, `process`) which don't exist here
-- `darkmux init` integration: ensure Docker is present + image is pulled
-- Operator-explicit promotion: when does `--runtime internal` become the default?
+The internal runtime is the default for `darkmux crew dispatch` as of v0.4, but a few rough edges remain:
+
+- Variance vs openclaw across a larger sample set — current data: 5-sample distribution of converged config showed median 2-3× faster than openclaw, with 8.5× wall variance, so single-run rankings are noisy
+- Migration of crew role definitions (`templates/builtin/crew/roles/*.md`) — several roles still reference openclaw's tool palette (`exec`, `update_plan`, `process`) which don't exist here; the internal runtime ignores them gracefully but the manifests would be cleaner without
+- `darkmux init` integration: today's pre-flight is at dispatch time (Docker reachable + image present); a separate setup pass during `darkmux init` would catch the prerequisite earlier
