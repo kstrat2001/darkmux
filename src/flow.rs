@@ -803,6 +803,98 @@ pub struct RedisSink {
     max_len: Option<usize>,
 }
 
+/// Hard cap on the wall-clock spent connecting + handshaking to Redis
+/// from any `RedisSink` or sink-diagnostic probe (#278). The OS default
+/// TCP-connect + handshake budget is platform-dependent and on macOS
+/// can wait ~75 seconds when the host is reachable at the IP layer but
+/// silent at the TCP/Redis layer (the canonical "Tailscale peer just
+/// dropped" failure mode). Without this cap, every flow-record write
+/// blocks the caller for the full OS budget — multiplied across the
+/// ~30 tests that touch the flow pipeline, it turned a 5-second
+/// `cargo test` into the 51-minute debacle from 2026-05-22.
+///
+/// 500ms is generous for a healthy LAN/tailnet round-trip (typical
+/// connect+handshake ≤ 50ms) and bounds the worst-case per-write
+/// cost at a known ceiling. The cost of the bound is that operators
+/// running Redis behind a slow VPN where 500ms isn't enough will see
+/// flow-record writes fail; if that surfaces in practice we'll need
+/// to make the cap operator-configurable.
+pub(crate) const REDIS_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Test-only env scrubber (#278). Tests in `flow::tests` write flow
+/// records via the default sink path which respects the
+/// `DARKMUX_REDIS_URL` and `DARKMUX_AUDIT_DIR` env vars. An operator
+/// running tests from their daily shell with these env vars pointing
+/// at an unreachable peer (the Studio-offline scenario from
+/// 2026-05-21) saw the test bin wall-clock balloon by 75s/record.
+/// This helper scrubs the env in any flow test that writes records
+/// via the default sink path; idempotent and safe to call multiple
+/// times. Uses `OnceLock` so the scrub fires exactly once per
+/// test-binary invocation.
+#[cfg(test)]
+pub(crate) fn isolate_test_env_once() {
+    static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INIT.get_or_init(|| {
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::remove_var("DARKMUX_AUDIT_DIR");
+        }
+    });
+}
+
+/// Wall-clock-bounded wrapper around `redis::Client::get_connection_with_timeout`
+/// (#278). The redis crate's own timeout-bearing API bounds the TCP
+/// connect phase only — the post-connect handshake (HELLO / AUTH /
+/// HELLO etc.) is unbounded. A peer that ACCEPTS the TCP connection
+/// but never completes the handshake (e.g. a half-functional Redis,
+/// a TCP listener that does nothing, certain VPN-flap states) can
+/// wedge the caller indefinitely. This wrapper runs the full
+/// connect-and-handshake in a worker thread and bails at
+/// `timeout * 2` wall-clock regardless of which phase is stuck —
+/// same shape as the DNS-resolution wrapper in `fleet::parse_address`
+/// (#265 Wave-E.10).
+///
+/// `timeout * 2` is the wall ceiling because the redis crate uses
+/// the same `Duration` for the TCP connect; doubling gives the
+/// handshake the same budget so a healthy peer with a 400ms RTT
+/// completes inside the bound.
+fn open_redis_connection_bounded(
+    client: &redis::Client,
+    timeout: std::time::Duration,
+) -> Result<redis::Connection> {
+    let client_clone = client.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("redis-connect-bounded".to_string())
+        .spawn(move || {
+            let result = client_clone.get_connection_with_timeout(timeout);
+            // Ignore send errors — receiver may have given up on
+            // timeout. The worker thread keeps running until the
+            // underlying socket gives up (post-connect handshake
+            // hangs are bounded by the OS TCP keepalive + the redis-
+            // crate's handshake, which can be minutes on a peer that
+            // accepts but never responds). The leak is per-wedge, not
+            // unbounded growth — but operators with a long-running
+            // daemon hitting a half-functional peer may accumulate
+            // worker threads over time. Acceptable for the personal-
+            // scope target; revisit if it bites.
+            let _ = tx.send(result);
+        })
+        .map_err(|e| anyhow::anyhow!("spawning redis-connect thread: {e}"))?;
+    match rx.recv_timeout(timeout * 2) {
+        Ok(Ok(conn)) => Ok(conn),
+        Ok(Err(e)) => Err(anyhow::anyhow!("redis connect failed: {e}")),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(anyhow::anyhow!(
+            "redis connect exceeded {}ms wall-clock budget — peer may be \
+             reachable at TCP but silent at Redis handshake",
+            (timeout * 2).as_millis()
+        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(anyhow::anyhow!(
+            "redis-connect worker thread panicked or exited without sending result"
+        )),
+    }
+}
+
 impl RedisSink {
     /// Build a sink connecting to `url` and writing to `stream`. Connection
     /// is not established until the first `write` call (the redis client
@@ -822,11 +914,12 @@ impl RedisSink {
 
     /// Connect + return a usable connection. Exposed for diagnostics
     /// (status probe, doctor health check) that need to talk to the
-    /// same Redis the sink writes to.
+    /// same Redis the sink writes to. Bounded by `REDIS_CONNECT_TIMEOUT`
+    /// (#278) so a peer that's silent at the TCP/Redis layer bails
+    /// fast instead of wedging the caller for the OS default.
     pub fn connect(&self) -> Result<redis::Connection> {
-        self.client.get_connection().with_context(|| {
-            format!("connecting to Redis at {}", self.url)
-        })
+        open_redis_connection_bounded(&self.client, REDIS_CONNECT_TIMEOUT)
+            .with_context(|| format!("connecting to Redis at {}", self.url))
     }
 
     pub fn url(&self) -> &str { self.url.expose_for_probe() }
@@ -836,9 +929,7 @@ impl RedisSink {
 
 impl FlowSink for RedisSink {
     fn write(&self, record: &FlowRecord) -> Result<()> {
-        let mut conn = self
-            .client
-            .get_connection()
+        let mut conn = open_redis_connection_bounded(&self.client, REDIS_CONNECT_TIMEOUT)
             .context("getting Redis connection")?;
         let payload = serde_json::to_string(record)
             .context("serializing FlowRecord for Redis")?;
@@ -1040,7 +1131,17 @@ fn build_default_sink() -> Arc<dyn FlowSink> {
 
 /// Process-wide default sink. Initialized lazily on first call to
 /// `record()`; default selection reads env config at init time.
+///
+/// `#[cfg(test)]`-only: scrubs `DARKMUX_REDIS_URL` / `DARKMUX_AUDIT_DIR`
+/// once before the sink is built so the cached sink doesn't capture
+/// the operator's daily-shell env. Critical because the OnceLock
+/// freezes the sink shape — any test that runs `record()` BEFORE
+/// other isolation runs would otherwise lock in a RedisSink pointing
+/// at the operator's real (possibly-unreachable) Redis. (#278)
 fn default_sink() -> Arc<dyn FlowSink> {
+    #[cfg(test)]
+    isolate_test_env_once();
+
     static SINK: OnceLock<Arc<dyn FlowSink>> = OnceLock::new();
     SINK.get_or_init(build_default_sink).clone()
 }
@@ -1523,7 +1624,12 @@ fn probe_redis(cfg: &RedisCfg) -> (RedisStatus, Vec<String>) {
         }
     };
 
-    let mut conn = match client.get_connection() {
+    // Bounded by REDIS_CONNECT_TIMEOUT (#278) — a silent-at-TCP-layer
+    // OR accept-but-don't-respond peer must not wedge the doctor.
+    // Uses the wall-clock-bounded wrapper, not just redis-rs's TCP-
+    // connect timeout (which doesn't cover the post-connect handshake
+    // hang the Studio-offline scenario can trigger).
+    let mut conn = match open_redis_connection_bounded(&client, REDIS_CONNECT_TIMEOUT) {
         Ok(c) => c,
         Err(e) => {
             return (
@@ -2032,6 +2138,7 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn flows_dir_respects_env_override() {
+        isolate_test_env_once();
         let tmp = TempDir::new().unwrap();
 
         // SAFETY: serialized via `#[serial_test::serial]` on every test that
@@ -2396,6 +2503,7 @@ mod tests {
         // can verify the round trip: write via record(), read from
         // flows_dir(), see the record.
         use std::env;
+        isolate_test_env_once();
         let tmp = TempDir::new().unwrap();
         let prev = env::var("DARKMUX_FLOWS_DIR").ok();
         unsafe { env::set_var("DARKMUX_FLOWS_DIR", tmp.path()); }
@@ -2787,6 +2895,7 @@ mod tests {
         // when the caller leaves them None. The operator-set env values
         // win over auto-detection so the test can assert deterministic
         // values regardless of hostname.
+        isolate_test_env_once();
         let tmp = TempDir::new().unwrap();
         let prev_flows = env::var("DARKMUX_FLOWS_DIR").ok();
         let prev_machine = env::var("DARKMUX_MACHINE_ID").ok();
@@ -3409,6 +3518,99 @@ mod tests {
         assert_eq!(cfg.url.expose_for_probe(), raw, "probe path must receive the raw URL");
         assert_eq!(cfg.stream, "darkmux:flow");
         assert_eq!(cfg.max_len, Some(10000));
+    }
+
+    /// #278 — `RedisSink::write` against an unresponsive Redis URL
+    /// MUST bail within a bounded time, NOT wait the OS default 75s
+    /// TCP-connect-or-handshake timeout. With the operator's normal-
+    /// shell env var `DARKMUX_REDIS_URL` pointing at an offline peer
+    /// (e.g. Studio during the 2026-05-21 incident), every flow-record
+    /// write was wedging tests for 75s/record — the canonical 51-minute
+    /// `cargo test` debacle from 2026-05-22.
+    ///
+    /// Repro: spawn a TCP listener that accepts connections but NEVER
+    /// reads/writes (no SYN-ACK refusal; no handshake response). The
+    /// pre-fix `get_connection()` hangs at the post-connect handshake
+    /// step waiting for Redis's AUTH/INFO response. The post-fix
+    /// `get_connection_with_timeout(REDIS_CONNECT_TIMEOUT)` bails at
+    /// the timeout regardless of which phase is stuck.
+    ///
+    /// Contract: a single `.write()` against an unresponsive listener
+    /// completes within 3 seconds (gives ~6× headroom on the new
+    /// 500ms connect+handshake timeout for slow-loopback test runners).
+    #[test]
+    fn redis_sink_write_against_unresponsive_listener_completes_within_bounded_time() {
+        // Spawn a TCP listener that accepts but never responds.
+        // Mimics the Studio-offline failure mode: the network path
+        // exists, the connect succeeds at the TCP layer, but no
+        // Redis handshake response ever comes back.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind ephemeral port");
+        let port = listener.local_addr().unwrap().port();
+        // Background thread: accept the connection then hang on it
+        // (drop the stream when test ends).
+        std::thread::spawn(move || {
+            // accept() blocks; one accept is enough for this test.
+            // Leak the accepted stream — test will drop the listener.
+            if let Ok((stream, _)) = listener.accept() {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+                drop(stream);
+            }
+        });
+        // Give the listener a beat to be ready.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let url = format!("redis://127.0.0.1:{port}");
+        let sink = RedisSink::new(&url, "darkmux:flow", Some(10000))
+            .expect("RedisSink::new on a syntactically valid URL");
+
+        let rec = FlowRecord {
+            ts: ts_utc_now(),
+            level: Level::Info,
+            category: Category::Work,
+            tier: Tier::Local,
+            stage: Stage::Dispatch,
+            action: "test-unresponsive-redis".to_string(),
+            handle: "test".to_string(),
+            sprint_id: None,
+            session_id: None,
+            source: None,
+            model: None,
+            reasoning: None,
+            mission_id: None,
+            machine_id: None,
+            orchestrator: None,
+            prev_hash: None,
+            hash: None,
+            payload: None,
+            machine_tier: None,
+            work_id: None,
+            attempt: None,
+        };
+
+        let start = std::time::Instant::now();
+        let result = sink.write(&rec);
+        let elapsed = start.elapsed();
+
+        // Write MUST fail (no Redis handshake possible); the value
+        // we're asserting is the bounded wall-clock.
+        assert!(
+            result.is_err(),
+            "expected failure writing to unresponsive listener; got Ok"
+        );
+        // Bound is `REDIS_CONNECT_TIMEOUT * 2` (1000ms from the
+        // wall-clock wrapper) + small slack for thread spawn +
+        // mpsc plumbing. 1500ms is 50% headroom on the named contract;
+        // a regression that bumps REDIS_CONNECT_TIMEOUT beyond ~700ms
+        // will fail this test — the right behavior for "we changed
+        // the connect budget without thinking about per-write wall."
+        assert!(
+            elapsed < std::time::Duration::from_millis(1500),
+            "RedisSink::write against unresponsive listener took {elapsed:?}; \
+             expected < 1500ms (REDIS_CONNECT_TIMEOUT * 2 + slack). \
+             Was effectively unbounded before #278's connect-timeout fix. \
+             This is the substrate test for the Studio-offline scenario."
+        );
     }
 
     #[test]
