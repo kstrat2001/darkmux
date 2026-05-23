@@ -75,6 +75,35 @@ darkmux role show coder          <span class="comment"># full details for one ro
     <p>If you've edited a role's manifest or system prompt, run sync so the openclaw side picks up the change:</p>
     <pre><code>darkmux crew sync                <span class="comment"># reconcile openclaw agents.list[] with manifests</span>
 darkmux crew sync --dry-run      <span class="comment"># preview without writing</span></code></pre>
+
+    <h3>Choose a runtime: <code>openclaw</code> (default) or <code>internal</code> (container-sandboxed)</h3>
+    <p>Every dispatch picks a runtime — the engine that actually runs the role's model loop. darkmux ships two:</p>
+    <ul>
+      <li><strong><code>openclaw</code> (default)</strong> — darkmux shells out to the <code>openclaw</code> CLI (or whatever <code>DARKMUX_RUNTIME_CMD</code> points at — Aider, Cline, anything with <code>&lt;cmd&gt; agent --message</code>). Workspace isolation is <em>discipline-enforced</em>: the role's system prompt names a workspace dir; the agent agrees to stay inside it. Battle-tested; this is the runtime the empirical findings in the article series were measured against.</li>
+      <li><strong><code>internal</code> (opt-in, experimental)</strong> — darkmux runs the role's model loop inside a Docker container (<code>darkmux-runtime:latest</code>). Workspace isolation is <em>kernel-enforced</em>: the operator's <code>--workdir</code> is the only filesystem the agent can touch; nothing else is mounted. Pure Rust runtime; bypasses the shell-out entirely.</li>
+    </ul>
+    <p>Pick the runtime per dispatch with the <code>--runtime</code> flag:</p>
+    <pre><code>darkmux crew dispatch coder --message "..." --runtime internal --workdir ~/projects/myrepo</code></pre>
+    <p>Or default to openclaw with no flag (today's behavior — unchanged):</p>
+    <pre><code>darkmux crew dispatch coder --message "..."</code></pre>
+
+    <h4>When to pick which</h4>
+    <ul>
+      <li><strong>Use <code>openclaw</code></strong> if: you've been using darkmux's lab harness without trouble, you don't have Docker installed, you want the runtime that the article-series numbers were measured against, or your role needs tools/files outside a single working directory (the openclaw workspace is more permissive).</li>
+      <li><strong>Use <code>internal</code></strong> if: you want kernel-enforced workspace isolation (rather than trusting the model to stay inside its workspace), you've seen <em>over-eager file writes</em> from openclaw-driven dispatches (the discipline-vs-kernel difference matters here), you're benchmarking the in-house runtime against openclaw for your workload, or you want a runtime that doesn't depend on an external binary.</li>
+    </ul>
+
+    <h4>Prerequisites for <code>--runtime internal</code></h4>
+    <ul>
+      <li><strong>Docker</strong> installed and reachable (<code>docker ps</code> must work without sudo for your user)</li>
+      <li><strong>The runtime image</strong> built locally as <code>darkmux-runtime:latest</code>. The build recipe lives in the <code>runtime/</code> directory at the repo root; <code>docker build -t darkmux-runtime:latest runtime/</code> from a clean checkout works today.</li>
+      <li><strong>A <code>--workdir</code></strong> — the internal runtime needs an explicit operator-supplied workspace. Symlink-escape and path-traversal are rejected at the CLI boundary (<code>validate_workdir</code>).</li>
+    </ul>
+
+    <div class="callout warn">
+      <strong>The <code>internal</code> runtime is still being measured against openclaw.</strong>
+      <p style="margin: 6px 0 0;">Phases 1-7 + Phase 6d (compaction validation) of the spike are in (#226 epic; see <code>src/crew/dispatch_internal.rs</code>). Promotion to default is a separate hardening decision — for now, <code>openclaw</code> stays the default and <code>--runtime internal</code> is opt-in. Operators benchmarking the two runtimes against their own workloads are exactly the validation work that gates promotion; flow records carry a <code>runtime</code> field in the <code>dispatch start</code> payload so comparisons across runs are tractable.</p>
+    </div>
   </div>
 </section>
 
