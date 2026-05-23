@@ -327,15 +327,16 @@ fn init_schema(conn: &Connection) -> Result<()> {
 
 /// Enumerate user-side manifest files for one entity kind. Returns
 /// (path, role-or-cap-or-..-id, content) tuples. Only enumerates the
-/// crew_root/<kind>s/ directory; builtins are intentionally excluded so
-/// drift detection scopes to operator-owned state.
-fn enumerate_user_files(crew_root: &Path, subdir: &str) -> Result<Vec<(PathBuf, String, Vec<u8>)>> {
-    let dir = crew_root.join(subdir);
+/// caller-resolved directory; builtins are intentionally excluded so
+/// drift detection scopes to operator-owned state. Caller is
+/// responsible for resolving the right dir (e.g., `loader::roles_dir()`)
+/// so the post-Beat-33 dual-read fallback is honored.
+fn enumerate_user_files(dir: &Path) -> Result<Vec<(PathBuf, String, Vec<u8>)>> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
-    for entry in fs::read_dir(&dir)
+    for entry in fs::read_dir(dir)
         .with_context(|| format!("reading {}", dir.display()))?
     {
         let entry = match entry {
@@ -361,12 +362,19 @@ fn enumerate_user_files(crew_root: &Path, subdir: &str) -> Result<Vec<(PathBuf, 
     Ok(out)
 }
 
-fn crew_root() -> PathBuf {
-    std::env::var("DARKMUX_CREW_DIR")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| resolve(ResolveScope::Auto).crew)
+/// Resolve the per-kind directory through the loader's dual-read helpers
+/// so the index respects the post-Beat-33 layout (canonical-first,
+/// legacy fallback). Centralized here so populate() + status_at() never
+/// drift apart.
+fn kind_to_dir(kind: &str) -> PathBuf {
+    match kind {
+        "role" => loader::roles_dir(),
+        "capability" => loader::capabilities_dir(),
+        "crew" => loader::crews_dir(),
+        "mission" => loader::missions_dir(),
+        "sprint" => loader::sprints_dir(),
+        _ => unreachable!("unknown index kind: {kind}"),
+    }
 }
 
 /// Insert merged-effective entities into all derived tables, plus populate
@@ -483,17 +491,13 @@ fn populate(conn: &mut Connection) -> Result<()> {
     }
 
     // source_files — scan user-side disk only (builtins are version-gated by
-    // the stored darkmux_version in meta_kv, not by per-file mtime).
-    let root = crew_root();
-    let kinds: &[(&str, &str)] = &[
-        ("role", "roles"),
-        ("capability", "capabilities"),
-        ("crew", "crews"),
-        ("mission", "missions"),
-        ("sprint", "sprints"),
-    ];
-    for (kind, subdir) in kinds {
-        for (path, _id, bytes) in enumerate_user_files(&root, subdir)? {
+    // the stored darkmux_version in meta_kv, not by per-file mtime). Each
+    // kind's directory is resolved through the loader's dual-read helpers
+    // so the legacy <root>/crew/<subdir>/ layout still indexes correctly.
+    let kinds: &[&str] = &["role", "capability", "crew", "mission", "sprint"];
+    for kind in kinds {
+        let dir = kind_to_dir(kind);
+        for (path, _id, bytes) in enumerate_user_files(&dir)? {
             let mtime = file_mtime(&path)?;
             let hash = content_hash_hex(&bytes);
             tx.execute(
@@ -589,15 +593,10 @@ fn status_at(path: &Path) -> Result<StatusReport> {
         report.per_kind_counts.push(row?);
     }
 
-    // Drift detection: compare on-disk state to source_files.
-    let root = crew_root();
-    let kinds: &[(&str, &str)] = &[
-        ("role", "roles"),
-        ("capability", "capabilities"),
-        ("crew", "crews"),
-        ("mission", "missions"),
-        ("sprint", "sprints"),
-    ];
+    // Drift detection: compare on-disk state to source_files. Each kind's
+    // directory is resolved through the loader's dual-read helpers so
+    // a legacy <root>/crew/<subdir>/ layout still drift-detects correctly.
+    let kinds: &[&str] = &["role", "capability", "crew", "mission", "sprint"];
 
     // Build set of all paths currently recorded.
     let mut recorded_paths: std::collections::BTreeMap<String, (String, i64, String)> =
@@ -619,8 +618,9 @@ fn status_at(path: &Path) -> Result<StatusReport> {
     }
 
     let mut seen_on_disk: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for (kind, subdir) in kinds {
-        for (path, _id, bytes) in enumerate_user_files(&root, subdir)? {
+    for kind in kinds {
+        let dir = kind_to_dir(kind);
+        for (path, _id, bytes) in enumerate_user_files(&dir)? {
             let path_str = path.to_string_lossy().into_owned();
             seen_on_disk.insert(path_str.clone());
             match recorded_paths.get(&path_str) {
@@ -994,6 +994,51 @@ mod tests {
         assert!(report.added.is_empty(), "no additions expected, got {:?}", report.added);
         assert!(report.modified.is_empty(), "no modifications expected, got {:?}", report.modified);
         assert!(report.deleted.is_empty(), "no deletions expected, got {:?}", report.deleted);
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn index_picks_up_legacy_layout_roles() {
+        // Regression for the Beat-33 dual-read miss: index.rs previously
+        // had its own private crew_root() that bypassed the loader's
+        // dual-read helpers. An operator on the legacy <root>/crew/roles/
+        // layout would `darkmux crew index rebuild` and silently record
+        // zero source_files — then status would report every role as
+        // `deleted` against the empty snapshot.
+        let guard = CrewDirGuard::new();
+        // Seed a role at the LEGACY path (<root>/crew/roles/) instead of
+        // the canonical (<root>/roles/) — emulates an operator who hasn't
+        // run PR-3b's mv script yet.
+        let legacy_roles = guard.path().join("crew").join("roles");
+        std::fs::create_dir_all(&legacy_roles).unwrap();
+        std::fs::write(
+            legacy_roles.join("alpha.json"),
+            r#"{"id":"alpha","description":"legacy-layout role","capabilities":[],"tool_palette":{"allow":["read"],"deny":[]},"escalation_contract":"bail-with-explanation"}"#,
+        )
+        .unwrap();
+
+        let idx = index_path(guard.path());
+        rebuild_at(&idx).unwrap();
+
+        // Drift detection should see the legacy-layout file. If the dual-
+        // read miss recurs, the file is invisible to the index and the
+        // status report will be "clean" against an empty snapshot — a
+        // silent data-integrity failure for legacy-layout operators.
+        let conn = open_index(&idx).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT path FROM source_files WHERE kind = 'role'")
+            .unwrap();
+        let rows: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(rows.len(), 1, "legacy-layout role should index — got rows={:?}", rows);
+        assert!(
+            rows[0].contains("/crew/roles/alpha.json"),
+            "indexed path should be the legacy location, got: {}",
+            rows[0]
+        );
     }
 
     #[serial_test::serial]

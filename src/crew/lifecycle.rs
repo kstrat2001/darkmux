@@ -62,7 +62,7 @@
 //! transition, not "this mission exists." That's why creation alone
 //! leaves `started_ts: None`.
 
-use crate::crew::loader::{crew_root, load_sprints};
+use crate::crew::loader::load_sprints;
 use crate::crew::types::{Mission, MissionStatus, Sprint, SprintStatus};
 use crate::flow::{self, Category, FlowRecord, Level, Stage, Tier};
 use anyhow::{bail, Context, Result};
@@ -97,7 +97,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Directory holding the mission's JSON and its sprints/ subdir.
 pub fn mission_dir(mission_id: &str) -> PathBuf {
-    crew_root().join("missions").join(mission_id)
+    crate::crew::loader::missions_dir().join(mission_id)
 }
 
 /// The mission JSON path under the per-mission directory.
@@ -115,33 +115,35 @@ pub fn sprint_path(mission_id: &str, sprint_id: &str) -> PathBuf {
     sprints_dir(mission_id).join(format!("{sprint_id}.json"))
 }
 
-/// Pre-#148 flat mission path: `<crew_root>/missions/<id>.json`. Held
-/// as public API for symmetry with the dir helpers; the migration verb
-/// constructs target paths via `mission_path(id)` and walks
-/// `legacy_missions_dir()`, so this per-id resolver isn't currently
-/// called. Keep for any future migration-back verb or external tool.
+/// Pre-#148 flat mission path: `<missions_dir>/<id>.json`. Two layers
+/// of "legacy" stack here: this describes pre-#148 flat *content shape*,
+/// while the parent `missions_dir()` itself resolves the Beat-33 dual-
+/// read (canonical-first, pre-flatten-`crew/`-fallback). Held as public
+/// API for symmetry with the dir helpers; the migration verb constructs
+/// target paths via `mission_path(id)` and walks `legacy_missions_dir()`,
+/// so this per-id resolver isn't currently called.
 #[allow(dead_code)]
 pub fn legacy_mission_path(mission_id: &str) -> PathBuf {
-    crew_root().join("missions").join(format!("{mission_id}.json"))
+    crate::crew::loader::missions_dir().join(format!("{mission_id}.json"))
 }
 
-/// Pre-#148 flat sprint path: `<crew_root>/sprints/<id>.json`. Held
-/// as public API for symmetry with the dir helpers; see
+/// Pre-#148 flat sprint path: `<sprints_dir>/<id>.json`. Held as
+/// public API for symmetry with the dir helpers; see
 /// `legacy_mission_path` for why.
 #[allow(dead_code)]
 pub fn legacy_sprint_path(sprint_id: &str) -> PathBuf {
-    crew_root().join("sprints").join(format!("{sprint_id}.json"))
+    crate::crew::loader::sprints_dir().join(format!("{sprint_id}.json"))
 }
 
-/// Pre-#148 flat missions dir: `<crew_root>/missions/` (containing flat
+/// Pre-#148 flat missions dir: `<missions_dir>/` (containing flat
 /// `<id>.json` files at the top level).
 pub fn legacy_missions_dir() -> PathBuf {
-    crew_root().join("missions")
+    crate::crew::loader::missions_dir()
 }
 
-/// Pre-#148 flat sprints dir: `<crew_root>/sprints/`.
+/// Pre-#148 flat sprints dir: `<sprints_dir>/`.
 pub fn legacy_sprints_dir() -> PathBuf {
-    crew_root().join("sprints")
+    crate::crew::loader::sprints_dir()
 }
 
 // ─── Time ───────────────────────────────────────────────────────────────
@@ -270,7 +272,7 @@ pub fn load_sprint_by_id(sprint_id: &str) -> Result<Sprint> {
     match matches.as_slice() {
         [] => anyhow::bail!(
             "no sprint with id `{sprint_id}` found in any mission under {}",
-            crew_root().join("missions").display()
+            crate::crew::loader::missions_dir().display()
         ),
         [_one] => Ok(matches.remove(0).clone()),
         _ => {

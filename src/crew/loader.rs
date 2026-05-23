@@ -93,12 +93,106 @@ const BUILTIN_SPRINTS: &[(&str, &str)] = &[];
 
 /// The user-side crew root: `DARKMUX_CREW_DIR` if set, else `<paths.crew>`
 /// from the active workspace.
+///
+/// **Deprecated direction (Beat 33):** prefer the per-subdir helpers
+/// `roles_dir()`, `missions_dir()`, `sprints_dir()`, `crews_dir()`,
+/// `capabilities_dir()`, and `role_pins_path()` for new code. They
+/// resolve the post-flatten `<root>/<subdir>/` layout with a backward-
+/// compatibility fallback to the legacy `<root>/crew/<subdir>/` layout.
+/// `crew_root()` is retained for callers that need the parent directory
+/// itself (e.g., daemon banner messages).
 pub fn crew_root() -> PathBuf {
     std::env::var("DARKMUX_CREW_DIR")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| resolve(ResolveScope::Auto).crew)
+}
+
+/// User-state root for the post-Beat-33 flattened layout. Returns
+/// `DARKMUX_CREW_DIR` if set (operator override; unchanged semantics —
+/// the env var points at the directory CONTAINING the subdirs, with no
+/// `crew/` nesting), otherwise `<paths.root>` (e.g., `~/.darkmux/`).
+fn user_state_root() -> PathBuf {
+    std::env::var("DARKMUX_CREW_DIR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| resolve(ResolveScope::Auto).root)
+}
+
+/// Resolve a user-state subdirectory with backward-compat fallback.
+///
+/// Resolution order:
+///   1. `<root>/<subdir>/` (post-flatten canonical) — if exists
+///   2. `<root>/crew/<subdir>/` (pre-flatten legacy) — if exists
+///   3. `<root>/<subdir>/` (canonical, returned even when missing so a
+///      fresh write creates the new layout)
+///
+/// Writes follow reads: if legacy exists and canonical doesn't, BOTH
+/// reads AND new writes go to legacy. State never silently splits
+/// across the two locations. Operators migrate explicitly via the
+/// `mv` script that `darkmux doctor` emits when it detects the legacy
+/// layout (PR-3b).
+fn resolve_user_subdir(subdir: &str) -> PathBuf {
+    let root = user_state_root();
+    let canonical = root.join(subdir);
+    if canonical.exists() {
+        return canonical;
+    }
+    let legacy = root.join("crew").join(subdir);
+    if legacy.exists() {
+        return legacy;
+    }
+    canonical
+}
+
+/// User-side roles directory. Post-Beat-33: `<root>/roles/`. Falls back
+/// to `<root>/crew/roles/` for operators on the legacy layout.
+pub fn roles_dir() -> PathBuf {
+    resolve_user_subdir("roles")
+}
+
+/// User-side missions directory. Post-Beat-33: `<root>/missions/`.
+/// Falls back to `<root>/crew/missions/` for operators on the legacy
+/// layout.
+pub fn missions_dir() -> PathBuf {
+    resolve_user_subdir("missions")
+}
+
+/// User-side sprints directory. Post-Beat-33: `<root>/sprints/`. Falls
+/// back to `<root>/crew/sprints/` for operators on the legacy layout.
+pub fn sprints_dir() -> PathBuf {
+    resolve_user_subdir("sprints")
+}
+
+/// User-side crews directory (operator overrides). Post-Beat-33:
+/// `<root>/crews/`. Falls back to `<root>/crew/crews/` for legacy.
+pub fn crews_dir() -> PathBuf {
+    resolve_user_subdir("crews")
+}
+
+/// User-side capabilities directory (operator overrides). Post-Beat-33:
+/// `<root>/capabilities/`. Falls back to `<root>/crew/capabilities/`
+/// for legacy.
+pub fn capabilities_dir() -> PathBuf {
+    resolve_user_subdir("capabilities")
+}
+
+/// User-side role-model-pins.json path. Post-Beat-33:
+/// `<root>/role-model-pins.json`. Falls back to
+/// `<root>/crew/role-model-pins.json` for legacy.
+pub fn role_pins_path() -> PathBuf {
+    let root = user_state_root();
+    let canonical = root.join("role-model-pins.json");
+    if canonical.is_file() {
+        return canonical;
+    }
+    let legacy = root.join("crew").join("role-model-pins.json");
+    if legacy.is_file() {
+        return legacy;
+    }
+    canonical
 }
 
 /// Resolve a role's system-prompt text. Search order:
@@ -109,7 +203,7 @@ pub fn crew_root() -> PathBuf {
 /// prompt for this role (e.g., the JSON manifest exists but no `.md`
 /// prompt has been authored yet — Pair 2 of the bake-off covers those).
 pub fn load_role_prompt(role_id: &str) -> Option<String> {
-    let user_path = crew_root().join("roles").join(format!("{role_id}.md"));
+    let user_path = roles_dir().join(format!("{role_id}.md"));
     if user_path.is_file() {
         if let Ok(content) = fs::read_to_string(&user_path) {
             return Some(content);
@@ -191,8 +285,7 @@ fn read_all_json<T: serde::de::DeserializeOwned>(dir: &std::path::Path) -> Resul
 /// renamed for the Crew doctrine + to fix the typo. Anyone who set the old
 /// one needs to update.)
 pub fn load_roles() -> Result<Vec<Role>> {
-    let crew_dir = crew_root();
-    let roles_dir = crew_dir.join("roles");
+    let roles_dir = roles_dir();
 
     // Load user-defined roles first.
     let mut map: BTreeMap<String, Role> = BTreeMap::new();
@@ -224,7 +317,7 @@ pub fn load_roles() -> Result<Vec<Role>> {
 
 /// Load all crews.
 pub fn load_crews() -> Result<Vec<Crew>> {
-    let user_dir = crew_root().join("crews");
+    let user_dir = crews_dir();
     Ok(read_all_json::<Crew>(&user_dir)?.into_iter().map(|(_, c)| c).collect())
 }
 
@@ -238,7 +331,7 @@ pub fn load_crews() -> Result<Vec<Crew>> {
 /// Built-in missions (currently empty) are merged last, same as other loaders.
 pub fn load_missions() -> Result<Vec<Mission>> {
     use crate::crew::lifecycle;
-    let missions_root = crew_root().join("missions");
+    let missions_root = missions_dir();
     if !missions_root.is_dir() {
         return Ok(Vec::new());
     }
@@ -290,7 +383,7 @@ pub fn load_missions() -> Result<Vec<Mission>> {
 /// are silently ignored — the migration verb is the bridge.
 pub fn load_sprints() -> Result<Vec<Sprint>> {
     use crate::crew::lifecycle;
-    let missions_root = crew_root().join("missions");
+    let missions_root = missions_dir();
     if !missions_root.is_dir() {
         return Ok(Vec::new());
     }
@@ -348,7 +441,7 @@ pub fn load_sprints() -> Result<Vec<Sprint>> {
 
 /// Load all capabilities.
 pub fn load_capabilities() -> Result<Vec<Capability>> {
-    let user_dir = crew_root().join("capabilities");
+    let user_dir = capabilities_dir();
     let mut map: BTreeMap<String, Capability> = read_all_json::<Capability>(&user_dir)?
         .into_iter()
         .map(|(id, c)| (id.clone(), c))
@@ -366,6 +459,13 @@ pub fn load_capabilities() -> Result<Vec<Capability>> {
 
 /// Resolve the prompt file path for a role at runtime. Used when an operator
 /// needs to read the actual system prompt text (the loader only stores path).
+///
+/// TODO(Beat-33 dual-read): this function takes a `DarkmuxPaths` and joins
+/// `paths.crew.join("roles")` directly, bypassing the canonical-vs-legacy
+/// fallback that `roles_dir()` performs. Currently `#[allow(dead_code)]` —
+/// when revived, migrate to use `roles_dir()` (and either drop the
+/// `paths` arg or document that it's only consulted for `prompt_path`'s
+/// absolute-path passthrough).
 #[allow(dead_code)]
 pub fn resolve_role_prompt_path(
     role: &Role,
@@ -753,5 +853,99 @@ mod load_per_mission_tests {
         let sprints = load_sprints().unwrap();
         assert_eq!(sprints.len(), 1);
         assert_eq!(sprints[0].id, "s-real");
+    }
+
+    // ─── Beat-33 dual-read fallback tests ────────────────────────────────
+    //
+    // `resolve_user_subdir` prefers the post-flatten canonical path
+    // (`<root>/<subdir>/`) and falls back to the legacy pre-flatten path
+    // (`<root>/crew/<subdir>/`) for operators who haven't migrated. These
+    // tests pin the resolution table so a regression that silently flips
+    // preference (e.g., always prefer legacy) fails loudly.
+
+    #[serial]
+    #[test]
+    fn resolve_user_subdir_prefers_canonical_when_only_canonical_exists() {
+        let guard = TestCrewRoot::new();
+        let canonical = guard.path().join("roles");
+        std::fs::create_dir_all(&canonical).unwrap();
+        assert_eq!(roles_dir(), canonical);
+    }
+
+    #[serial]
+    #[test]
+    fn resolve_user_subdir_falls_back_to_legacy_when_only_legacy_exists() {
+        let guard = TestCrewRoot::new();
+        let legacy = guard.path().join("crew").join("roles");
+        std::fs::create_dir_all(&legacy).unwrap();
+        assert_eq!(roles_dir(), legacy);
+    }
+
+    #[serial]
+    #[test]
+    fn resolve_user_subdir_prefers_canonical_when_both_exist() {
+        // Operator partway through a migration — canonical should win so
+        // future reads + writes consolidate at the new layout (legacy
+        // becomes operator-visible-but-not-touched, doctor PR-3b
+        // surfaces it for cleanup).
+        let guard = TestCrewRoot::new();
+        let canonical = guard.path().join("missions");
+        let legacy = guard.path().join("crew").join("missions");
+        std::fs::create_dir_all(&canonical).unwrap();
+        std::fs::create_dir_all(&legacy).unwrap();
+        assert_eq!(missions_dir(), canonical);
+    }
+
+    #[serial]
+    #[test]
+    fn resolve_user_subdir_returns_canonical_when_neither_exists() {
+        // Fresh install — neither layout exists. The canonical path is
+        // returned so a subsequent write creates the new layout
+        // (operator-sovereignty: no silent migration of legacy state).
+        let guard = TestCrewRoot::new();
+        let canonical = guard.path().join("sprints");
+        assert!(!canonical.exists());
+        assert!(!guard.path().join("crew").join("sprints").exists());
+        assert_eq!(sprints_dir(), canonical);
+    }
+
+    #[serial]
+    #[test]
+    fn role_pins_path_resolves_canonical_first_then_legacy_then_canonical() {
+        // Pins is a file (not a dir) so it has its own resolution. Mirror
+        // the same four-case table.
+        let guard = TestCrewRoot::new();
+        let canonical = guard.path().join("role-model-pins.json");
+        let legacy = guard.path().join("crew").join("role-model-pins.json");
+
+        // Neither: canonical
+        assert!(!canonical.is_file());
+        assert!(!legacy.is_file());
+        assert_eq!(role_pins_path(), canonical);
+
+        // Legacy only: legacy
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "{}").unwrap();
+        assert_eq!(role_pins_path(), legacy);
+
+        // Both: canonical wins
+        std::fs::write(&canonical, "{}").unwrap();
+        assert_eq!(role_pins_path(), canonical);
+    }
+
+    #[serial]
+    #[test]
+    fn loader_finds_user_role_override_in_legacy_layout() {
+        // End-to-end: an operator with the legacy `<root>/crew/roles/`
+        // layout still gets their override picked up by load_roles().
+        let guard = TestCrewRoot::new();
+        let legacy_roles = guard.path().join("crew").join("roles");
+        std::fs::create_dir_all(&legacy_roles).unwrap();
+        let user_json = r#"{"id":"coder","description":"legacy-layout override","capabilities":[],"tool_palette":{"allow":["read"],"deny":[]},"escalation_contract":"bail-with-explanation"}"#;
+        std::fs::write(legacy_roles.join("coder.json"), user_json).unwrap();
+
+        let roles = load_roles().unwrap();
+        let coder = roles.iter().find(|r| r.id == "coder").expect("coder must load");
+        assert_eq!(coder.description, "legacy-layout override");
     }
 }
