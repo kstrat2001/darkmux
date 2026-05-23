@@ -80,7 +80,14 @@ src/
   providers/
     prompt.rs                Trivial single-prompt provider
     coding_task.rs           Sandbox + verify-command provider
-templates/builtin/workloads/  Workload manifests embedded at compile time
+templates/builtin/
+  roles/                      Crew role library (manifest + .md) embedded at compile time
+  capabilities/               Capability library embedded at compile time
+  workloads/                  Workload manifests embedded at compile time
+  recommendations/            Tier-aware recommendation registry
+  role-model-pins.json        Default per-role model pins
+integrations/openclaw/
+  agent-scaffolds/            Openclaw-integration export scaffolds (NOT engine-internal)
 skills/darkmux-<name>/        Agent-invokable skill wrappers
 tests/cli.rs                  Integration tests (spawn the binary)
 ```

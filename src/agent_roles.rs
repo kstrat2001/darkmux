@@ -1,13 +1,19 @@
-//! Validated role-prompt scaffolds for agents.
+//! Validated role-prompt scaffolds for the openclaw integration target.
 //!
+//! These are darkmux's opinionated *starting-point exports* for operators
+//! who run dispatches through openclaw — NOT engine-internal libraries.
 //! Each scaffold is a `systemPromptOverride` body + recommended profile
 //! pairing + recommended tool subset, derived from the empirical lab work
 //! in PERFORMANCE.md and the article-2 lab notebook.
 //!
-//! The user owns their agent definitions. darkmux just ships *opinionated
-//! starting points* via `darkmux agent template <role>`. Output is a JSON
-//! snippet ready to paste into `agents.list[]` in openclaw.json (or the
-//! equivalent under another runtime).
+//! The user owns their agent definitions. darkmux just ships opinionated
+//! starting points via `darkmux agent template <role>`. Output is a JSON
+//! snippet ready to paste into `agents.list[]` in openclaw.json.
+//!
+//! Source-of-truth files live under `integrations/openclaw/agent-scaffolds/`
+//! (NOT `templates/builtin/`) to keep openclaw-integration scope visibly
+//! separate from the darkmux engine's own role/capability/workload
+//! libraries.
 //!
 //! ## Why three roles only
 //!
@@ -18,9 +24,9 @@
 //! code-review, planner) are deferrable to v0.3+ when they have similar
 //! grounding.
 //!
-//! ## Adding a new role
+//! ## Adding a new scaffold
 //!
-//! 1. Add a JSON file under `templates/builtin/agent-roles/<role>.json`
+//! 1. Add a JSON file under `integrations/openclaw/agent-scaffolds/<role>.json`
 //!    matching the `RoleTemplate` schema below.
 //! 2. Append it to `EMBEDDED_ROLES`.
 //! 3. Tests + doctor check pick it up automatically.
@@ -45,15 +51,15 @@ pub struct RoleTemplate {
 const EMBEDDED_ROLES: &[(&str, &str)] = &[
     (
         "qa",
-        include_str!("../templates/builtin/agent-roles/qa.json"),
+        include_str!("../integrations/openclaw/agent-scaffolds/qa.json"),
     ),
     (
         "scribe",
-        include_str!("../templates/builtin/agent-roles/scribe.json"),
+        include_str!("../integrations/openclaw/agent-scaffolds/scribe.json"),
     ),
     (
         "engineer",
-        include_str!("../templates/builtin/agent-roles/engineer.json"),
+        include_str!("../integrations/openclaw/agent-scaffolds/engineer.json"),
     ),
 ];
 
