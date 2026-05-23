@@ -109,14 +109,16 @@ export DARKMUX_ORCHESTRATOR=<claude-opus-4-7 / cursor / etc.>
 
 `DARKMUX_AUDIT_DIR` is intentionally NOT set here — audit substrate is the `/darkmux-enable-audit` skill's territory. Only run that if the operator wants the compliance posture.
 
-After editing, the operator runs:
+After editing, the operator reloads the shell + verifies the vars are set (presence-only — do NOT print the values, which would expose the Redis password to shell history and screen-share workflows):
 
 ```bash
 source ~/.zshrc   # or open a new terminal
-env | grep DARKMUX
+[ -n "${DARKMUX_MACHINE_ID:-}" ]  && echo "machine_id set" || echo "machine_id UNSET"
+[ -n "${DARKMUX_MACHINE_TIER:-}" ] && echo "machine_tier set" || echo "machine_tier UNSET"
+[ -n "${DARKMUX_REDIS_URL:-}" ]   && echo "redis_url set" || echo "redis_url UNSET"
 ```
 
-All three vars should appear. If `DARKMUX_REDIS_URL` shows up with the password visible — that's expected in `env` output; the variable is local to the operator's shell.
+All three should report "set." Resist the temptation to `env | grep DARKMUX` or `echo $DARKMUX_REDIS_URL` to verify — those commands enter shell history with the Redis password embedded and expose it on screen-share / screen-grab. The full value-bearing verification happens at Step 6 below via `darkmux doctor`, which prints the URL with the password **redacted**.
 
 ## Step 6 — Verify with `darkmux doctor`
 
