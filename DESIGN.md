@@ -62,6 +62,29 @@ Telemetry:
 
 This is what would let users find the predictive correlate for fast vs slow modes. Make darkmux the place where that data lives.
 
+## v0.4 — multi-machine substrate ("many machines become one")
+
+Single-operator multi-machine is the design target. Operator owns a couple of Macs on a tailnet they control; darkmux makes them function as one development environment without becoming team tooling.
+
+**Architecture** (shipped as of v0.4):
+
+- **Coordination substrate**: Redis Streams via `RedisSink` (opt-in via `DARKMUX_REDIS_URL`). Two stream classes:
+  - `darkmux:work:<tier>` — per-tier work queue. Publishers `XADD`; workers `XREADGROUP` + `XACK` via consumer group. First-claimant-wins is the allocation algorithm.
+  - `darkmux:flow` — fleet-wide event log. Every machine's `TeeSink` includes a `RedisSink` leg; `XADD` per record. Read by the daemon's `/flow/<date>` endpoint for the decentralized topology UI.
+- **Audit substrate**: `AuditFileSink` (opt-in via `DARKMUX_AUDIT_DIR`). BLAKE3-chained, `flock(2)`-serialized, per-machine per-day. `darkmux flow integrity-check` walks the chain, exits 2 on break. Composes with the casual `LocalFileSink` via `TeeSink`.
+- **Provenance fields** (FlowRecord schema 1.8.0): `machine_id`, `machine_tier`, `orchestrator`, `work_id`, `attempt`. All operator-asserted (env-stamped); no authenticated identity.
+- **Tier-aware dispatch routing**: roles declare `tier` in their JSON manifest. `darkmux crew dispatch <role>` (no `--machine`) auto-routes to a fleet peer when `role.tier != local DARKMUX_MACHINE_TIER`. Bails loud with hint when no peer matches. Emits a `dispatch route` flow record so the topology UI + audit chain capture *why* work went where.
+- **Per-machine introspection**: `GET /machine/specs` returns version, machine_id/tier, RAM total/free, CPU brand, OS, loaded models from `lms ps`, redacted Redis URL. Consumed by `darkmux fleet status --deep` (HTTP fan-out across reachable peers).
+- **Daemon resilience**: SSE Redis tail at `GET /flow/<date>/stream` is bounded — connect wedges bounded by `REDIS_CONNECT_TIMEOUT` (500ms × 2 wall-clock), persistent failures exit cleanly via a synthetic `stream.error` record after `MAX_CONSECUTIVE_XREAD_FAILURES`, and the producer→consumer channel is capped at `SSE_MPSC_CAPACITY` (256 records) with drop-newest semantics. A misbehaving viewer tab can't OOM the daemon.
+- **CORS posture** (#225 → #273 → #288): default `null` (file://) only — bundled viewer from disk works; arbitrary localhost dev-server origins are denied. Operator opts in to specific origins via `DARKMUX_DAEMON_CORS_ORIGINS` (exact-match, normalized lowercase + no trailing slash). Literal `*` rejected with stderr hint.
+
+**Out of scope (today; may revisit)**:
+
+- Multi-tenant authn/authz (see "Not multi-tenant" above)
+- Cross-machine mission/sprint state replication (per-machine FS today; tracked as a future architectural pivot, [#280](https://github.com/kstrat2001/darkmux/issues/280))
+- Mission priority + cross-fleet pause/resume ([#282](https://github.com/kstrat2001/darkmux/issues/282))
+- Elastic-hub failover (any peer can be promoted to hub) — would close the SPOF of a fixed-hub deployment
+
 ## What darkmux is NOT
 
 - Not a model-swap optimization (LMStudio handles the actual load — we orchestrate)
