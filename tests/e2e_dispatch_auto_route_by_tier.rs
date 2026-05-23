@@ -278,3 +278,183 @@ fn dispatch_runs_locally_when_role_tier_matches_local_tier() {
          stdout={stdout}\nstderr={stderr}"
     );
 }
+
+/// #290 — `--machine X` dispatch (explicit-machine path) MUST emit a
+/// `dispatch route` flow record with `decision: "pinned"` +
+/// `target_machine: "X"`. PR-C of #247 (#285) wired this for the
+/// auto-route path but missed the explicit-machine path; #290 closes
+/// the gap so the audit trail and topology UI see operator-pinned
+/// routing decisions too.
+#[test]
+fn dispatch_with_explicit_machine_emits_pinned_route_record() {
+    if !redis_available() {
+        eprintln!("skipping: redis-server not on PATH");
+        return;
+    }
+    let harness = FleetHarness::boot(vec![
+        NodeSpec::hub("studio"),
+        NodeSpec::inference("laptop"),
+    ])
+    .expect("FleetHarness::boot");
+
+    let studio = harness.node("studio").expect("studio");
+    let laptop = harness.node("laptop").expect("laptop");
+
+    // Role lives on studio's crew dir; tier matches studio's local
+    // tier (hub) so the implicit auto-route doesn't fire — only the
+    // explicit --machine path can route this dispatch off-machine.
+    write_role(&studio.crew_root, "pinned-role", "hub");
+
+    // Register laptop in studio's roster (we need a target id resolvable
+    // to a different machine for routing_decision to pick Remote).
+    let add = studio
+        .cmd()
+        .args([
+            "fleet", "add", "laptop",
+            "--tier", "inference",
+            "--address", &format!("127.0.0.1:{}", laptop.daemon_port),
+        ])
+        .output()
+        .expect("running `darkmux fleet add laptop`");
+    assert!(
+        add.status.success(),
+        "fleet add failed: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+
+    // Explicit-machine dispatch: --machine laptop forces remote routing.
+    let out = studio
+        .cmd()
+        .args([
+            "crew", "dispatch", "pinned-role",
+            "--message", "explicit machine target",
+            "--machine", "laptop",
+            "--no-wait",
+        ])
+        .output()
+        .expect("running `darkmux crew dispatch --machine laptop`");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "explicit-machine dispatch should succeed; stdout={stdout}\nstderr={stderr}"
+    );
+
+    // Scan studio's local flow file for the pinned route record.
+    let today = today_utc_date();
+    let flow_file = studio.flows_dir.join(format!("{today}.jsonl"));
+    let flow_body = std::fs::read_to_string(&flow_file)
+        .unwrap_or_else(|e| panic!("read flow file {}: {e}", flow_file.display()));
+    let pinned_record = flow_body
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|rec| {
+            rec.get("action").and_then(|v| v.as_str()) == Some("dispatch route")
+                && rec
+                    .get("payload")
+                    .and_then(|p| p.get("decision"))
+                    .and_then(|d| d.as_str())
+                    == Some("pinned")
+        });
+    let record = pinned_record.unwrap_or_else(|| {
+        panic!(
+            "expected a `dispatch route` record with decision=pinned in studio's flow file; \
+             body:\n{flow_body}"
+        )
+    });
+    assert_eq!(
+        record["payload"]["target_machine"].as_str(),
+        Some("laptop"),
+        "pinned route record must stamp target_machine=laptop; got: {record}"
+    );
+    assert_eq!(
+        record["handle"].as_str(),
+        Some("pinned-role"),
+        "pinned route record's handle must be the role id; got: {record}"
+    );
+    // Regression guard for the #290 reviewer B1 finding: role_tier
+    // MUST be the role's actual declared tier, not the "any" fallback
+    // (the pre-fix shape silently substituted "any" on role-load
+    // failure — misleading the audit chain).
+    assert_eq!(
+        record["payload"]["role_tier"].as_str(),
+        Some("hub"),
+        "pinned route record's role_tier must match the role's actual tier; got: {record}"
+    );
+}
+
+/// #290 reviewer B2 + B1: an explicit `--machine X` dispatch where
+/// the role's manifest is missing OR has an invalid tier (None / "" /
+/// "any") MUST bail with the operator-actionable error BEFORE
+/// emitting any `dispatch route` flow record. Pre-fix-of-reviewer-
+/// findings, the substrate would emit a "pinned" record with
+/// `role_tier: "any"` and THEN error — leaving misleading entries
+/// in the audit chain.
+#[test]
+fn dispatch_with_explicit_machine_bails_before_emit_on_invalid_role_tier() {
+    if !redis_available() {
+        eprintln!("skipping: redis-server not on PATH");
+        return;
+    }
+    let harness = FleetHarness::boot(vec![
+        NodeSpec::hub("studio"),
+        NodeSpec::inference("laptop"),
+    ])
+    .expect("FleetHarness::boot");
+    let studio = harness.node("studio").expect("studio");
+    let laptop = harness.node("laptop").expect("laptop");
+
+    // Role with tier="any" — invalid for cross-machine dispatch per
+    // the WorkJob-validation contract; `dispatch_via_queue` would
+    // bail on this. The #290 reviewer B2 finding asks: does the
+    // route record emit BEFORE that bail?
+    write_role(&studio.crew_root, "any-tier-role", "any");
+    let add = studio
+        .cmd()
+        .args([
+            "fleet", "add", "laptop",
+            "--tier", "inference",
+            "--address", &format!("127.0.0.1:{}", laptop.daemon_port),
+        ])
+        .output()
+        .expect("running `darkmux fleet add laptop`");
+    assert!(add.status.success());
+
+    let out = studio
+        .cmd()
+        .args([
+            "crew", "dispatch", "any-tier-role",
+            "--message", "any-tier with explicit machine",
+            "--machine", "laptop",
+            "--no-wait",
+        ])
+        .output()
+        .expect("running dispatch with invalid tier + --machine");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // Dispatch MUST fail — invalid tier for cross-machine.
+    assert!(
+        !out.status.success(),
+        "explicit-machine dispatch with tier=any should fail; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("tier") || stderr.contains("any"),
+        "operator-actionable bail message expected; got: {stderr}"
+    );
+
+    // CRITICAL — no `dispatch route` record landed despite the dispatch
+    // attempt. Audit chain stays honest: only successful routing
+    // decisions get recorded.
+    let today = today_utc_date();
+    let flow_file = studio.flows_dir.join(format!("{today}.jsonl"));
+    let flow_body = std::fs::read_to_string(&flow_file).unwrap_or_default();
+    let any_route_record = flow_body
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .any(|rec| rec.get("action").and_then(|v| v.as_str()) == Some("dispatch route"));
+    assert!(
+        !any_route_record,
+        "no `dispatch route` record should land when the substrate bails before emit; \
+         got body:\n{flow_body}"
+    );
+}
