@@ -71,7 +71,7 @@ darkmux orchestrates LMStudio + your agent runtime. Install these once:
 | Optional | When you need it |
 |---|---|
 | **[Docker](https://www.docker.com/products/docker-desktop)** | For `darkmux crew dispatch`'s default internal runtime. The dispatch runs in a per-invocation `darkmux-runtime` container; build the image once with `docker build -t darkmux-runtime:latest runtime/`. Skip this if you opt out via `--runtime openclaw`. |
-| **An agent runtime** (e.g. [OpenClaw](https://github.com/openclaw/openclaw), Aider, Cline) | Only if you opt out of the default internal runtime via `--runtime openclaw` (on `crew dispatch` or `lab run`). `swap`/`status`/`profiles` work without one. Override the openclaw shell-out binary with `DARKMUX_RUNTIME_CMD=<your-runtime>` (used only under `--runtime openclaw`). |
+| **An agent runtime** (e.g. [OpenClaw](https://github.com/openclaw/openclaw), Aider, Cline) | Only if you opt out of the default internal runtime via `--runtime openclaw` (on `crew dispatch` or `lab run`). `swap`/`status`/`profiles` work without one. Override the openclaw shell-out binary per dispatch with `--runtime-cmd <path>` (only consulted under `--runtime openclaw`). |
 | **[Claude Code](https://claude.com/claude-code)** | Only for the agent-invokable skills (`/darkmux-status`, etc.). darkmux as a CLI works without it. |
 
 darkmux is developed and tested on Apple Silicon. Linux should work; Intel Mac is untested.
@@ -169,7 +169,7 @@ darkmux is a CLI binary, not an HTTP proxy. Your frontier session (Claude Code) 
 
 4. **Observability daemon.** `darkmux serve` is a local HTTP daemon (default bind `127.0.0.1:8765`) that serves flow records + mission/sprint state + the new `/flow-status` endpoint to the `/flow` + `/lab` viewers. Endpoints: `/health`, `/flow/<date>(.jsonl)`, `/flow/<date>/stream` (SSE tail), `/model/status`, `/missions`, `/sprints`, `/flow-status`. Foreground process — run in a separate terminal tab. `darkmux doctor` includes a `daemon: reachable` check; dispatches print a one-line stderr nudge when the daemon isn't reachable.
 
-`crew dispatch` uses the internal Docker-bounded runtime by default; pass `--runtime openclaw` to opt into the openclaw path. `lab run` shells out to whatever `DARKMUX_RUNTIME_CMD` resolves to (default: `openclaw`). The frontier session (Claude Code) orchestrates the whole thing — see the `/darkmux-bootstrap` skill for a guided walkthrough.
+Both `crew dispatch` and `lab run` use the internal Docker-bounded runtime by default; pass `--runtime openclaw` to opt into the openclaw shell-out path. Override the openclaw binary path per dispatch with `--runtime-cmd <path>` (e.g. for Aider, Cline, or any tool exposing the `<cmd> agent --message` surface). The frontier session (Claude Code) orchestrates the whole thing — see the `/darkmux-bootstrap` skill for a guided walkthrough.
 
 ## Why "darkmux"
 
@@ -215,7 +215,7 @@ Opt into openclaw per-dispatch if you already have it installed:
 darkmux crew dispatch coder --runtime openclaw --message "..."
 ```
 
-The `lab` subcommand is separate — it shells out to whatever `DARKMUX_RUNTIME_CMD` resolves to (default `openclaw`). Anything that exposes a single-shot `<cmd> agent --message <text> --json` surface is a candidate (Aider, Cline, your own wrapper). The `swap` / `status` / `profiles` subcommands don't depend on any runtime at all — they orchestrate LMStudio directly.
+The `lab` subcommand mirrors `crew dispatch`'s contract: internal runtime by default, `--runtime openclaw --runtime-cmd <path>` to opt into any tool exposing a `<cmd> agent --message <text> --json` surface (Aider, Cline, your own wrapper). The `swap` / `status` / `profiles` subcommands don't depend on any runtime at all — they orchestrate LMStudio directly.
 
 When openclaw is in the picture (either as the lab harness or the explicit `--runtime openclaw` dispatch path), `darkmux swap` and `darkmux doctor --fix` patch the openclaw config file in place. Path resolution: any profile's `runtime.config_path` wins; otherwise darkmux honors the `DARKMUX_OPENCLAW_CONFIG` env var; otherwise it falls back to `~/.openclaw/openclaw.json`. Set the env var if your openclaw lives somewhere non-standard:
 

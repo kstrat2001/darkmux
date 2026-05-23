@@ -9,7 +9,7 @@
 //! distribution. For now this is a thin polish layer over a single dispatch
 //! so a fresh user can answer *"does my Mac handle this?"* with one command.
 
-use crate::lab::run::{RunOpts, RunOutcome, lab_run};
+use crate::lab::run::{lab_run, RunOpts, RunOutcome};
 use anyhow::Result;
 
 #[derive(Debug, Clone)]
@@ -35,6 +35,9 @@ pub fn characterize(opts: &CharacterizeOpts) -> Result<CharacterizeReport> {
         // characterize() is an internal admin operation — uses default
         // runtime (internal, post-Sprint-D).
         runtime: crate::crew::dispatch::Runtime::Internal,
+        // runtime_cmd is unused by the internal path; "openclaw" for
+        // codebase parity (Sprint-E).
+        runtime_cmd: "openclaw".to_string(),
         instrument: false,
     };
     let outcomes = lab_run(run_opts)?;
@@ -49,7 +52,12 @@ pub fn print_report(r: &CharacterizeReport) {
     println!();
     for o in &r.outcomes {
         let status = if o.ok { "✓" } else { "✗" };
-        println!("  {} {} — {}", status, o.run_id, format_seconds(o.duration_ms));
+        println!(
+            "  {} {} — {}",
+            status,
+            o.run_id,
+            format_seconds(o.duration_ms)
+        );
         for note in &o.notes {
             println!("      {note}");
         }

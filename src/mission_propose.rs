@@ -60,8 +60,12 @@ struct ProposedSprint {
     created_ts: u64,
 }
 
-fn default_active() -> String { "active".to_string() }
-fn default_planned() -> String { "planned".to_string() }
+fn default_active() -> String {
+    "active".to_string()
+}
+fn default_planned() -> String {
+    "planned".to_string()
+}
 
 /// Top-level entry called from main.rs's dispatch table.
 pub fn propose(
@@ -100,7 +104,9 @@ pub fn propose(
         if let Err(e) = validate_proposal_invariants(&proposal) {
             eprintln!("mission propose: proposal failed validation: {e}");
             eprintln!("--- raw response ---\n{response}\n--- end response ---");
-            return Err(anyhow!("mission propose: invalid proposal cross-references"));
+            return Err(anyhow!(
+                "mission propose: invalid proposal cross-references"
+            ));
         }
 
         // 4. Render summary
@@ -113,7 +119,7 @@ pub fn propose(
         }
         match prompt_decision()? {
             Decision::Approve => return persist_and_maybe_start(&proposal, start),
-            Decision::Reject  => {
+            Decision::Reject => {
                 eprintln!("mission propose: rejected. No files written.");
                 return Ok(1);
             }
@@ -131,18 +137,20 @@ enum Decision {
     Regenerate(String),
 }
 
-fn read_input(
-    from_stdin: bool,
-    from_file: Option<&std::path::Path>,
-) -> Result<String> {
+fn read_input(from_stdin: bool, from_file: Option<&std::path::Path>) -> Result<String> {
     if from_stdin {
         let mut buf = String::new();
-        std::io::stdin().lock().read_to_string(&mut buf).context("reading stdin")?;
+        std::io::stdin()
+            .lock()
+            .read_to_string(&mut buf)
+            .context("reading stdin")?;
         Ok(buf)
     } else if let Some(p) = from_file {
         std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))
     } else {
-        Err(anyhow!("internal: exactly one of --from-stdin / --from-file required"))
+        Err(anyhow!(
+            "internal: exactly one of --from-stdin / --from-file required"
+        ))
     }
 }
 
@@ -196,6 +204,9 @@ fn dispatch_compiler(input: &str, hint: Option<&str>) -> Result<String> {
         // principle: openclaw is a downstream translation target, not
         // a hardcoded admin-dispatch dependency.
         runtime: crate::crew::dispatch::Runtime::Internal,
+        // mission-compiler pins Runtime::Internal; runtime_cmd is unused
+        // by the internal path. Default "openclaw" for codebase parity.
+        runtime_cmd: "openclaw".to_string(),
         machine: None,
         wait: true,
     };
@@ -241,7 +252,9 @@ fn build_compiler_message(input: &str, hint: Option<&str>) -> String {
     msg.push_str(input.trim());
     msg.push_str("\n---\n");
     if let Some(h) = hint {
-        msg.push_str("\nOperator-provided regeneration hint (apply this when restructuring):\n---\n");
+        msg.push_str(
+            "\nOperator-provided regeneration hint (apply this when restructuring):\n---\n",
+        );
         msg.push_str(h);
         msg.push_str("\n---\n");
     }
@@ -362,7 +375,11 @@ fn extract_json_block(response: &str) -> Result<String> {
     let mut inside = false;
     for line in &mut lines {
         let trimmed = line.trim_start();
-        if !inside && (trimmed.starts_with("```json") || trimmed.starts_with("```JSON") || trimmed == "```") {
+        if !inside
+            && (trimmed.starts_with("```json")
+                || trimmed.starts_with("```JSON")
+                || trimmed == "```")
+        {
             inside = true;
             continue;
         }
@@ -458,7 +475,9 @@ fn persist(p: &Proposal) -> Result<i32> {
         .unwrap_or(0);
 
     let mut mission = p.mission.clone();
-    if mission.created_ts == 0 { mission.created_ts = now; }
+    if mission.created_ts == 0 {
+        mission.created_ts = now;
+    }
 
     // Ensure the per-mission dir + its sprints/ subdir exist before any
     // existence checks or writes. create_dir_all is idempotent and also
@@ -507,7 +526,11 @@ fn persist(p: &Proposal) -> Result<i32> {
         return Err(e);
     }
 
-    eprintln!("mission propose: persisted {} mission + {} sprints", 1, p.sprints.len());
+    eprintln!(
+        "mission propose: persisted {} mission + {} sprints",
+        1,
+        p.sprints.len()
+    );
     Ok(0)
 }
 
@@ -549,14 +572,23 @@ fn write_all(
 /// Helper that persists a proposal and optionally starts the mission.
 fn persist_and_maybe_start(p: &Proposal, start: bool) -> Result<i32> {
     let exit = persist(p)?;
-    if exit != 0 { return Ok(exit); }
+    if exit != 0 {
+        return Ok(exit);
+    }
     if start {
         eprintln!("mission propose: --start flag set, transitioning mission to Running …");
         let m = crate::crew::lifecycle::mission_start(&p.mission.id)
             .context("mission_start failed after successful persist")?;
-        println!("mission `{}` → Active  started_ts={}", m.id, m.started_ts.unwrap_or(0));
+        println!(
+            "mission `{}` → Active  started_ts={}",
+            m.id,
+            m.started_ts.unwrap_or(0)
+        );
     } else {
-        eprintln!("next: `darkmux mission start {}` to begin (or pass `--start` next time)", p.mission.id);
+        eprintln!(
+            "next: `darkmux mission start {}` to begin (or pass `--start` next time)",
+            p.mission.id
+        );
     }
     Ok(0)
 }
@@ -582,7 +614,9 @@ mod tests {
         fn new(tmp: TempDir) -> Self {
             let prev = std::env::var("DARKMUX_CREW_DIR").ok();
             // SAFETY: serialized via #[serial_test::serial] on every caller.
-            unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()); }
+            unsafe {
+                std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
+            }
             Self { prev, _tmp: tmp }
         }
 
@@ -871,7 +905,8 @@ some epilogue"#;
         let mut p = sample_proposal("m1", &["s1"]);
         // Make a sprint claim a different mission_id than the mission's id.
         p.sprints[0].mission_id = "other-mission".to_string();
-        let err = validate_proposal_invariants(&p).expect_err("should reject mismatched mission_id");
+        let err =
+            validate_proposal_invariants(&p).expect_err("should reject mismatched mission_id");
         assert!(err.to_string().contains("other-mission"));
     }
 }

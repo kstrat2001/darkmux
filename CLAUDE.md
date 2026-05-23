@@ -52,7 +52,8 @@ Flow records (the JSONL stream under `~/.darkmux/flows/` and, when configured, t
 | `DARKMUX_REDIS_URL` | unset → Redis off | When set, flow records also XADD to the Redis stream (coordination substrate; not the audit substrate). Combined with `DARKMUX_AUDIT_DIR` produces the canonical compliant composition: `TeeSink([LocalFile, Audit, Redis])`. See [#162](https://github.com/kstrat2001/darkmux/issues/162) Phase 3. |
 | `DARKMUX_REDIS_STREAM` | `darkmux:flow` | Override the Redis stream name. |
 | `DARKMUX_REDIS_MAXLEN` | `10000` | Approximate retention cap for the Redis stream (`XADD MAXLEN ~ N`); `0` for unbounded. |
-| `DARKMUX_RUNTIME_CMD` | `openclaw` | The agent runtime `darkmux lab run` + `darkmux crew dispatch` shell out to. Point at Aider / Cline / anything with `<cmd> agent --message` to bench an alternative. |
+
+The previously-documented `DARKMUX_RUNTIME_CMD` env var was removed in Sprint-E (Beat 36). Per-dispatch operators now pass `--runtime-cmd <path>` alongside `--runtime openclaw` on `darkmux crew dispatch` and `darkmux lab run` to point at Aider, Cline, or any tool exposing the `<cmd> agent --message` calling convention. The internal runtime is the default and needs no external binary.
 
 When working on darkmux from a Claude Code (or other frontier) session, export `DARKMUX_ORCHESTRATOR=<your-model>` in the shell so flow records carry orchestrator provenance. This is part of the cultivation discipline tracked in [#130](https://github.com/kstrat2001/darkmux/issues/130).
 
@@ -291,7 +292,7 @@ Two role families compose to make this work, and the distinction matters when pi
 
 CLI primitives stay small and composable; the AI-built-in verbs (`mission propose`, `sprint estimate`, `notebook draft`) compose those primitives with admin-agent dispatches so the operator gets structured output without authoring JSON by hand. Both surfaces are part of the same project — the dual posture (small primitives + AI-built-in verbs) is deliberate.
 
-`darkmux crew dispatch` uses the internal Docker-bounded runtime by default; pass `--runtime openclaw` to opt into the openclaw path for operators who already have it. The lab harness (`darkmux lab run`) is a separate codepath that still shells out to `DARKMUX_RUNTIME_CMD` (default `openclaw`) and is runtime-pluggable via env var — users running Aider, Cline, or anything with a `<cmd> agent --message` interface can point the lab harness at it.
+`darkmux crew dispatch` and `darkmux lab run` both default to the internal Docker-bounded runtime; pass `--runtime openclaw` to opt into the openclaw shell-out path for operators who already have it. The openclaw binary path defaults to `openclaw`-on-PATH; override per dispatch with `--runtime-cmd <path>` (Sprint-E flag) to point at Aider, Cline, or anything with a `<cmd> agent --message` interface.
 
 ## When in doubt
 

@@ -7,7 +7,7 @@ use crate::types::Profile;
 use crate::workloads::types::{
     InspectionReport, LoadedWorkload, RunResult, VerifyOutcome, WorkloadProvider,
 };
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -40,6 +40,7 @@ impl WorkloadProvider for PromptProvider {
         profile: &Profile,
         profile_name: &str,
         runtime: crate::crew::dispatch::Runtime,
+        runtime_cmd: &str,
     ) -> Result<RunResult> {
         let prompt = resolve_prompt(loaded)?;
         let role = pick_role(loaded);
@@ -54,12 +55,12 @@ impl WorkloadProvider for PromptProvider {
 
         let started = std::time::Instant::now();
         let (stdout, stderr, ok) = match runtime {
-            crate::crew::dispatch::Runtime::Internal => dispatch_via_internal(
-                &role, &prompt, &session_id,
-            )?,
-            crate::crew::dispatch::Runtime::Openclaw => dispatch_via_openclaw(
-                &role, &prompt, &session_id,
-            )?,
+            crate::crew::dispatch::Runtime::Internal => {
+                dispatch_via_internal(&role, &prompt, &session_id)?
+            }
+            crate::crew::dispatch::Runtime::Openclaw => {
+                dispatch_via_openclaw(runtime_cmd, &role, &prompt, &session_id)?
+            }
         };
         let duration_ms = started.elapsed().as_millis();
 
@@ -100,7 +101,11 @@ impl WorkloadProvider for PromptProvider {
             payload_text: Some(reply),
             trajectory_path: None,
             verify: Some(verify),
-            error: if ok { None } else { Some(format!("runtime exit: {stderr}")) },
+            error: if ok {
+                None
+            } else {
+                Some(format!("runtime exit: {stderr}"))
+            },
         })
     }
 
@@ -150,16 +155,16 @@ impl WorkloadProvider for PromptProvider {
     }
 }
 
-fn runtime_cmd() -> String {
-    env::var("DARKMUX_RUNTIME_CMD").unwrap_or_else(|_| "openclaw".to_string())
-}
-
 /// Dispatch via darkmux's internal Docker-bounded runtime through the
 /// crew::dispatch substrate. The runtime emits a JSON envelope per
 /// `runtime/src/main.rs::build_json_envelope` which becomes the
 /// provider's stdout artifact — same as openclaw's JSON envelope, just
 /// from DM's substrate. Beat 36: no openclaw install required.
-fn dispatch_via_internal(role_id: &str, prompt: &str, session_id: &str) -> Result<(String, String, bool)> {
+fn dispatch_via_internal(
+    role_id: &str,
+    prompt: &str,
+    session_id: &str,
+) -> Result<(String, String, bool)> {
     use crate::crew::dispatch::{dispatch, DispatchOpts, Runtime};
     let opts = DispatchOpts {
         role_id: role_id.to_string(),
@@ -173,6 +178,7 @@ fn dispatch_via_internal(role_id: &str, prompt: &str, session_id: &str) -> Resul
         workdir: None,
         sprint_id: None,
         runtime: Runtime::Internal,
+        runtime_cmd: "openclaw".to_string(),
         machine: None,
         wait: true,
     };
@@ -180,13 +186,18 @@ fn dispatch_via_internal(role_id: &str, prompt: &str, session_id: &str) -> Resul
     Ok((result.stdout, result.stderr, result.exit_code == 0))
 }
 
-/// Dispatch via the legacy openclaw shell-out path. Reads
-/// `DARKMUX_RUNTIME_CMD` (default `openclaw`) and shells out with the
-/// `<cmd> agent --agent <role> --json ...` calling convention. Kept
-/// for operators who explicitly opt in via `--runtime openclaw`.
-fn dispatch_via_openclaw(role: &str, prompt: &str, session_id: &str) -> Result<(String, String, bool)> {
-    let runtime_cmd = runtime_cmd();
-    let output = Command::new(&runtime_cmd)
+/// Dispatch via the legacy openclaw shell-out path. Shells out with the
+/// `<cmd> agent --agent <role> --json ...` calling convention.
+/// `runtime_cmd` is the operator-supplied binary path (Sprint-E:
+/// `--runtime-cmd <path>` flag; defaults to `"openclaw"`). Kept for
+/// operators who explicitly opt in via `--runtime openclaw`.
+fn dispatch_via_openclaw(
+    runtime_cmd: &str,
+    role: &str,
+    prompt: &str,
+    session_id: &str,
+) -> Result<(String, String, bool)> {
+    let output = Command::new(runtime_cmd)
         .args([
             "agent",
             "--agent",
@@ -249,10 +260,18 @@ pub(crate) fn extract_reply_text(stdout: &str) -> String {
     }
     // openclaw --json envelope (legacy path; `--runtime openclaw`):
     // `{"result": {"payloads": [{"text": "..."}], ...}}`.
-    if let Some(payloads) = parsed.get("result").and_then(|r| r.get("payloads")).and_then(|p| p.as_array()) {
+    if let Some(payloads) = parsed
+        .get("result")
+        .and_then(|r| r.get("payloads"))
+        .and_then(|p| p.as_array())
+    {
         let parts: Vec<String> = payloads
             .iter()
-            .filter_map(|p| p.get("text").and_then(|t| t.as_str()).map(|s| s.to_string()))
+            .filter_map(|p| {
+                p.get("text")
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.to_string())
+            })
             .collect();
         return parts.join("\n\n");
     }
@@ -272,7 +291,11 @@ pub(crate) fn run_verify(loaded: &LoadedWorkload, text: &str) -> VerifyOutcome {
             };
         }
     };
-    let missing: Vec<&String> = v.must_contain.iter().filter(|s| !text.contains(s.as_str())).collect();
+    let missing: Vec<&String> = v
+        .must_contain
+        .iter()
+        .filter(|s| !text.contains(s.as_str()))
+        .collect();
     let present: Vec<&String> = v
         .must_not_contain
         .iter()
@@ -323,9 +346,7 @@ fn _bail_unused() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workloads::types::{
-        VerifySpec, WorkloadManifest, WorkloadSource, WorkloadSpec,
-    };
+    use crate::workloads::types::{VerifySpec, WorkloadManifest, WorkloadSource, WorkloadSpec};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -530,7 +551,9 @@ mod tests {
         let run_dir = tmp.path().join("run");
         let sandbox_dir = tmp.path().join("sandbox");
         let loaded = make_loaded(spec_with_prompt("x"), tmp.path().to_path_buf());
-        PromptProvider.setup(&loaded, &run_dir, &sandbox_dir).unwrap();
+        PromptProvider
+            .setup(&loaded, &run_dir, &sandbox_dir)
+            .unwrap();
         assert!(run_dir.exists());
     }
 

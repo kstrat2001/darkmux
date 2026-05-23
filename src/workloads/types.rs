@@ -55,9 +55,17 @@ pub struct WorkloadSpec {
     pub role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "promptFile")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "promptFile"
+    )]
     pub prompt_file: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "sandboxSeed")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "sandboxSeed"
+    )]
     pub sandbox_seed: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verify: Option<VerifySpec>,
@@ -159,6 +167,17 @@ pub trait WorkloadProvider: Send + Sync {
     /// runtime (default; Beat 36 — no openclaw install required) and
     /// the legacy openclaw shell-out path (opt-in via `--runtime
     /// openclaw` on `darkmux lab run`).
+    ///
+    /// `runtime_cmd` is the executable path for the openclaw shell-out
+    /// (default `"openclaw"`, override via `--runtime-cmd <path>`).
+    /// Ignored when `runtime == Runtime::Internal`. Sprint-E replacement
+    /// for the removed `DARKMUX_RUNTIME_CMD` env var.
+    ///
+    /// Argument count exceeds clippy's default threshold (8 vs 7); the
+    /// trait shape mirrors the dispatch contract closely (profile,
+    /// runtime, runtime_cmd are inherent to a dispatch). A `RunContext`
+    /// struct is a candidate cleanup but out of Sprint-E's scope.
+    #[allow(clippy::too_many_arguments)]
     fn run(
         &self,
         loaded: &LoadedWorkload,
@@ -167,6 +186,7 @@ pub trait WorkloadProvider: Send + Sync {
         profile: &Profile,
         profile_name: &str,
         runtime: crate::crew::dispatch::Runtime,
+        runtime_cmd: &str,
     ) -> Result<RunResult>;
     fn inspect(&self, loaded: &LoadedWorkload, run_dir: &Path) -> Result<InspectionReport>;
     fn teardown(&self, _run_dir: &Path, _sandbox_dir: &Path) -> Result<()> {

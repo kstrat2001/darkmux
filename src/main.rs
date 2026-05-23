@@ -7,32 +7,32 @@ use clap::{Parser, Subcommand};
 
 mod agent_roles;
 mod crew;
-pub mod flow;
 mod doctor;
 mod eureka;
-mod hardware;
+mod external;
 mod fleet;
+pub mod flow;
+mod flow_cli;
+mod hardware;
 mod heuristics;
-mod workdir;
 mod init;
 mod lab;
 mod lms;
+mod migrate;
+mod mission_propose;
 mod notebook;
 mod optimize;
 mod profiles;
 mod providers;
 mod recommendations;
+mod role_cli;
 mod runtime;
 mod serve;
 mod skills;
-mod external;
-mod migrate;
-mod mission_propose;
-mod flow_cli;
-mod role_cli;
 mod sprint_cli;
 mod swap;
 mod types;
+mod workdir;
 mod workloads;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -244,6 +244,13 @@ enum AgentCmd {
     },
 }
 
+// The `Dispatch` variant aggregates the full operator-visible dispatch
+// surface (role + message + ~15 flags) and crosses clippy's enum-size
+// threshold relative to the smaller `List`/`Show` variants. Boxing the
+// variant would require pattern-match adjustments throughout the
+// dispatch handler; the variant is constructed once per CLI invocation
+// so the stack-size hit doesn't matter at runtime.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum CrewCmd {
     /// List every crew in the index.
@@ -332,6 +339,14 @@ enum CrewCmd {
         /// `runtime/README.md` for the internal runtime's scope.
         #[arg(long, default_value = "internal")]
         runtime: String,
+        /// Executable to invoke for the openclaw shell-out (Sprint-E
+        /// replacement for the removed `DARKMUX_RUNTIME_CMD` env var).
+        /// Defaults to `openclaw`; override to point at Aider, Cline,
+        /// or any tool exposing the `<cmd> agent --agent <id> --json
+        /// ...` calling convention. **Only consulted when `--runtime
+        /// openclaw`** — the internal runtime ignores this flag.
+        #[arg(long = "runtime-cmd", value_name = "PATH", default_value = "openclaw")]
+        runtime_cmd: String,
         /// Target machine for the dispatch (#246 PR-C.3). When set to
         /// an id that's NOT the local `DARKMUX_MACHINE_ID`, the
         /// dispatch is published to the fleet work queue
@@ -431,16 +446,12 @@ enum SprintCmd {
     },
     /// Transition a `Running` sprint to `Complete` (terminal). Stamps
     /// `completed_ts=now()`. Wall-clock duration = completed_ts - started_ts.
-    Complete {
-        id: String,
-    },
+    Complete { id: String },
     /// Transition a `Planned` or `Running` sprint to `Abandoned`. Operator-
     /// sovereign: only the operator marks a sprint dead; nothing auto-
     /// abandons on staleness. A subsequent `sprint start` clears the
     /// abandonment (operator changed their mind).
-    Abandon {
-        id: String,
-    },
+    Abandon { id: String },
 }
 
 #[derive(Subcommand)]
@@ -784,6 +795,14 @@ enum LabCmd {
         /// target the operator opts into per dispatch.
         #[arg(long, default_value = "internal")]
         runtime: String,
+        /// Executable to invoke for the openclaw shell-out (Sprint-E
+        /// replacement for the removed `DARKMUX_RUNTIME_CMD` env var).
+        /// Defaults to `openclaw`; override to point at Aider, Cline,
+        /// or any tool exposing the `<cmd> agent --message` calling
+        /// convention. **Only consulted when `--runtime openclaw`** —
+        /// the internal runtime ignores this flag.
+        #[arg(long = "runtime-cmd", value_name = "PATH", default_value = "openclaw")]
+        runtime_cmd: String,
         /// Capture cross-layer telemetry during the dispatch. Writes
         /// `instruments.jsonl` to the run dir with periodic samples of
         /// LMStudio state and gateway-process residency. Useful for
@@ -858,7 +877,12 @@ fn run(cmd: Cmd) -> Result<i32> {
                 Ok(0)
             }
         },
-        Cmd::Swap { profile, config, dry_run, quiet } => cmd_swap(&profile, config.as_deref(), dry_run, quiet),
+        Cmd::Swap {
+            profile,
+            config,
+            dry_run,
+            quiet,
+        } => cmd_swap(&profile, config.as_deref(), dry_run, quiet),
         Cmd::Status { config } => cmd_status(config.as_deref()),
         Cmd::Profiles { config } => cmd_profiles(config.as_deref()),
         Cmd::Lab { sub } => cmd_lab(sub),
@@ -884,7 +908,11 @@ fn run(cmd: Cmd) -> Result<i32> {
             force,
             dry_run,
         } => cmd_init(with_hook, with_claude_md, force, dry_run),
-        Cmd::Serve { port, bind, flows_dir } => {
+        Cmd::Serve {
+            port,
+            bind,
+            flows_dir,
+        } => {
             let flows_dir = flows_dir.unwrap_or_else(crate::flow::flows_dir);
             serve::run(port, bind, flows_dir)?;
             Ok(0)
@@ -932,10 +960,8 @@ fn cmd_notebook(sub: NotebookCmd) -> Result<i32> {
             }
             // Column widths (dynamic based on longest value).
             let max_date: usize = entries.iter().map(|e| e.date.len()).max().unwrap_or(10);
-            let max_machine: usize = entries.iter()
-                .map(|e| e.machine.len()).max().unwrap_or(10);
-            let max_run: usize = entries.iter()
-                .map(|e| e.run.len()).max().unwrap_or(12);
+            let max_machine: usize = entries.iter().map(|e| e.machine.len()).max().unwrap_or(10);
+            let max_run: usize = entries.iter().map(|e| e.run.len()).max().unwrap_or(12);
             for entry in &entries {
                 println!(
                     "{date:<width_date$}  {machine:<width_machine$}  {run:<width_run$}  {path}",
@@ -1024,10 +1050,7 @@ fn cmd_scan(config: Option<&str>) -> Result<i32> {
     };
 
     let available = lms::list_available()?;
-    let llms: Vec<&lms::ModelMeta> = available
-        .iter()
-        .filter(|m| m.model_type == "llm")
-        .collect();
+    let llms: Vec<&lms::ModelMeta> = available.iter().filter(|m| m.model_type == "llm").collect();
 
     let uncovered: Vec<&lms::ModelMeta> = llms
         .iter()
@@ -1106,9 +1129,7 @@ fn cmd_scan(config: Option<&str>) -> Result<i32> {
                 .unwrap_or_else(|| "none".into())
         );
         if !m.trained_for_tool_use {
-            println!(
-                "    ⚠ NOT marked trainedForToolUse — agentic dispatch may be unreliable"
-            );
+            println!("    ⚠ NOT marked trainedForToolUse — agentic dispatch may be unreliable");
         }
         let safe_name = derive_profile_name(&m.model_key, suggested_class);
         if name_collisions.get(&safe_name).copied().unwrap_or(0) > 1 {
@@ -1136,12 +1157,22 @@ fn derive_profile_name(model_id: &str, task: heuristics::TaskClass) -> String {
     let last_segment = model_id.rsplit('/').next().unwrap_or(model_id);
     let cleaned: String = last_segment
         .chars()
-        .map(|c| if c == '_' || c == ' ' { '-' } else { c.to_ascii_lowercase() })
+        .map(|c| {
+            if c == '_' || c == ' ' {
+                '-'
+            } else {
+                c.to_ascii_lowercase()
+            }
+        })
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '.')
         .collect();
     let trimmed = cleaned.trim_matches('-').to_string();
     let safe_base = if trimmed.is_empty()
-        || !trimmed.chars().next().map(|c| c.is_ascii_alphanumeric()).unwrap_or(false)
+        || !trimmed
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_alphanumeric())
+            .unwrap_or(false)
     {
         format!("model-{}", trimmed.trim_start_matches('-'))
     } else {
@@ -1168,13 +1199,21 @@ fn cmd_role(sub: RoleCmd) -> Result<i32> {
 fn cmd_sprint(sub: SprintCmd) -> Result<i32> {
     match sub {
         SprintCmd::Estimate { spec, narrate } => sprint_cli::estimate(&spec, narrate),
-        SprintCmd::Review { base, require_clean, sprint_id } => {
+        SprintCmd::Review {
+            base,
+            require_clean,
+            sprint_id,
+        } => {
             let sid = sprint_id.as_deref();
             sprint_cli::sprint_review(base.as_deref(), require_clean, sid)
         }
         SprintCmd::Start { id } => {
             let s = crew::lifecycle::sprint_start(&id)?;
-            println!("sprint `{}` → Running  started_ts={}", s.id, s.started_ts.unwrap_or(0));
+            println!(
+                "sprint `{}` → Running  started_ts={}",
+                s.id,
+                s.started_ts.unwrap_or(0)
+            );
             Ok(0)
         }
         SprintCmd::Complete { id } => {
@@ -1190,7 +1229,11 @@ fn cmd_sprint(sub: SprintCmd) -> Result<i32> {
         }
         SprintCmd::Abandon { id } => {
             let s = crew::lifecycle::sprint_abandon(&id)?;
-            println!("sprint `{}` → Abandoned  abandoned_ts={}", s.id, s.abandoned_ts.unwrap_or(0));
+            println!(
+                "sprint `{}` → Abandoned  abandoned_ts={}",
+                s.id,
+                s.abandoned_ts.unwrap_or(0)
+            );
             Ok(0)
         }
     }
@@ -1200,7 +1243,11 @@ fn cmd_mission(sub: MissionCmd) -> Result<i32> {
     match sub {
         MissionCmd::Start { id, reasoning } => {
             let m = crew::lifecycle::mission_start_with_reasoning(&id, reasoning.as_deref())?;
-            println!("mission `{}` → Active  started_ts={}", m.id, m.started_ts.unwrap_or(0));
+            println!(
+                "mission `{}` → Active  started_ts={}",
+                m.id,
+                m.started_ts.unwrap_or(0)
+            );
             Ok(0)
         }
         MissionCmd::Close { id, reasoning } => {
@@ -1216,18 +1263,36 @@ fn cmd_mission(sub: MissionCmd) -> Result<i32> {
         }
         MissionCmd::Pause { id, reasoning } => {
             let m = crew::lifecycle::mission_pause_with_reasoning(&id, reasoning.as_deref())?;
-            println!("mission `{}` → Paused  paused_ts={}", m.id, m.paused_ts.unwrap_or(0));
+            println!(
+                "mission `{}` → Paused  paused_ts={}",
+                m.id,
+                m.paused_ts.unwrap_or(0)
+            );
             Ok(0)
         }
         MissionCmd::Resume { id, reasoning } => {
             let m = crew::lifecycle::mission_resume_with_reasoning(&id, reasoning.as_deref())?;
-            println!("mission `{}` → Active  (paused_ts preserved: {})", m.id, m.paused_ts.unwrap_or(0));
+            println!(
+                "mission `{}` → Active  (paused_ts preserved: {})",
+                m.id,
+                m.paused_ts.unwrap_or(0)
+            );
             Ok(0)
         }
-        MissionCmd::Propose { from_stdin, from_file, yes, start } => {
-            mission_propose::propose(from_stdin, from_file.as_deref(), yes, start)
-        }
-        MissionCmd::AddSprint { mission_id, sprint_id, description, depends_on, after, reasoning } => {
+        MissionCmd::Propose {
+            from_stdin,
+            from_file,
+            yes,
+            start,
+        } => mission_propose::propose(from_stdin, from_file.as_deref(), yes, start),
+        MissionCmd::AddSprint {
+            mission_id,
+            sprint_id,
+            description,
+            depends_on,
+            after,
+            reasoning,
+        } => {
             let s = crew::lifecycle::add_sprint_to_mission_with_reasoning(
                 &mission_id,
                 &sprint_id,
@@ -1264,9 +1329,13 @@ fn cmd_mission(sub: MissionCmd) -> Result<i32> {
             }
             Ok(0)
         }
-        MissionCmd::Dispatch { mission_id, role, machine, timeout, no_wait } => {
-            cmd_mission_dispatch(&mission_id, &role, machine.as_deref(), timeout, !no_wait)
-        }
+        MissionCmd::Dispatch {
+            mission_id,
+            role,
+            machine,
+            timeout,
+            no_wait,
+        } => cmd_mission_dispatch(&mission_id, &role, machine.as_deref(), timeout, !no_wait),
     }
 }
 
@@ -1277,7 +1346,7 @@ fn cmd_mission_dispatch(
     timeout_seconds: u32,
     wait: bool,
 ) -> Result<i32> {
-    use crew::loader::{load_missions, load_sprints, load_roles};
+    use crew::loader::{load_missions, load_roles, load_sprints};
 
     // 0. CLI-boundary charset validation (Wave-E.5 #255 — security-
     //    auditor MEDIUM from PR-D.1 review). `mission_id` flows into
@@ -1296,9 +1365,11 @@ fn cmd_mission_dispatch(
     let mission = missions
         .iter()
         .find(|m| m.id == mission_id)
-        .ok_or_else(|| anyhow::anyhow!(
+        .ok_or_else(|| {
+            anyhow::anyhow!(
             "mission `{mission_id}` not found. Run `darkmux mission propose` first or check the id."
-        ))?;
+        )
+        })?;
     if !matches!(mission.status, crew::types::MissionStatus::Active) {
         eprintln!(
             "darkmux mission dispatch: warning — mission `{mission_id}` status is {:?}, not Active. \
@@ -1421,9 +1492,8 @@ fn cmd_mission_dispatch(
         );
         // Pre-validate. Surfaces oversize/charset failures BEFORE any
         // partial publish lands on the queue.
-        job.validate().with_context(|| {
-            format!("pre-publish validation failed for sprint `{}`", sprint.id)
-        })?;
+        job.validate()
+            .with_context(|| format!("pre-publish validation failed for sprint `{}`", sprint.id))?;
         jobs.push((sprint.id.clone(), session_id, job));
     }
 
@@ -1459,13 +1529,17 @@ fn cmd_mission_dispatch(
                      Do NOT re-run mission dispatch without checking — re-publish would \
                      double-fire the orphans."
                 );
-                return Err(e).with_context(|| format!("publishing sprint `{sprint_id}` as WorkJob"));
+                return Err(e)
+                    .with_context(|| format!("publishing sprint `{sprint_id}` as WorkJob"));
             }
         }
     }
 
     if !wait {
-        println!("Published {} sprint job(s); operator polls for completion via flow stream.", sessions.len());
+        println!(
+            "Published {} sprint job(s); operator polls for completion via flow stream.",
+            sessions.len()
+        );
         for (sprint_id, session_id, work_id) in &sessions {
             println!("  sprint={sprint_id} session_id={session_id} work_id={work_id}");
         }
@@ -1476,9 +1550,7 @@ fn cmd_mission_dispatch(
     //    full-scan returns ALL records; finding session A doesn't preclude
     //    finding session B in the same pass). Net wall-clock is bounded by
     //    the slowest sprint's completion.
-    let wait_timeout = std::time::Duration::from_secs(
-        (timeout_seconds as u64).saturating_add(60),
-    );
+    let wait_timeout = std::time::Duration::from_secs((timeout_seconds as u64).saturating_add(60));
     eprintln!(
         "\n{}",
         worst_case_wait_banner(sessions.len(), timeout_seconds, wait_timeout.as_secs())
@@ -1530,7 +1602,11 @@ fn cmd_mission_dispatch(
         SpeedupVerdict::Inconclusive => {}
     }
 
-    if failures > 0 { Ok(1) } else { Ok(0) }
+    if failures > 0 {
+        Ok(1)
+    } else {
+        Ok(0)
+    }
 }
 
 /// Render the operator-facing "waiting for N completion(s)" banner with
@@ -1660,20 +1736,18 @@ fn cmd_agent(sub: AgentCmd) -> Result<i32> {
 
 fn cmd_fleet(sub: FleetCmd) -> Result<i32> {
     match sub {
-        FleetCmd::Add { id, tier, address, description } => {
-            cmd_fleet_add(&id, &tier, &address, description.as_deref())
-        }
+        FleetCmd::Add {
+            id,
+            tier,
+            address,
+            description,
+        } => cmd_fleet_add(&id, &tier, &address, description.as_deref()),
         FleetCmd::Remove { id } => cmd_fleet_remove(&id),
         FleetCmd::Status { json, deep } => cmd_fleet_status(json, deep),
     }
 }
 
-fn cmd_fleet_add(
-    id: &str,
-    tier: &str,
-    address: &str,
-    description: Option<&str>,
-) -> Result<i32> {
+fn cmd_fleet_add(id: &str, tier: &str, address: &str, description: Option<&str>) -> Result<i32> {
     let was_present = fleet::mutate_roster(|roster| {
         let was_present = roster.machines.contains_key(id);
         fleet::add_machine(roster, id, tier, address, description)?;
@@ -1771,8 +1845,14 @@ fn cmd_fleet_status(emit_json: bool, deep: bool) -> Result<i32> {
     // Human-readable table.
     println!("darkmux fleet status");
     println!("  roster:           {}", fleet::roster_path().display());
-    println!("  local machine_id: {}", flow::resolve_machine_id().unwrap_or_else(|| "<unknown>".into()));
-    println!("  local tier:       {}", flow::resolve_machine_tier().unwrap_or_else(|| "<not declared>".into()));
+    println!(
+        "  local machine_id: {}",
+        flow::resolve_machine_id().unwrap_or_else(|| "<unknown>".into())
+    );
+    println!(
+        "  local tier:       {}",
+        flow::resolve_machine_tier().unwrap_or_else(|| "<not declared>".into())
+    );
     println!();
     if probes.is_empty() {
         println!("(no peers in roster — single-machine fleet)");
@@ -1821,21 +1901,23 @@ fn cmd_fleet_status(emit_json: bool, deep: bool) -> Result<i32> {
                         .and_then(|v| v.as_array())
                         .map(|arr| {
                             arr.iter()
-                                .filter_map(|m| {
-                                    m.get("identifier").and_then(|i| i.as_str())
-                                })
+                                .filter_map(|m| m.get("identifier").and_then(|i| i.as_str()))
                                 .collect::<Vec<_>>()
                                 .join(", ")
                         })
                         .unwrap_or_else(|| "—".into());
-                    (ram, os, v, if models.is_empty() { "—".into() } else { models })
+                    (
+                        ram,
+                        os,
+                        v,
+                        if models.is_empty() {
+                            "—".into()
+                        } else {
+                            models
+                        },
+                    )
                 }
-                None => (
-                    "specs?".into(),
-                    "—".into(),
-                    "—".into(),
-                    "—".into(),
-                ),
+                None => ("specs?".into(), "—".into(), "—".into(), "—".into()),
             };
             println!(
                 "{:<14} {:<10} {:<22} {:<10} {:<11} {:<10} {:<8} {}",
@@ -1894,7 +1976,22 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
     match sub {
         CrewCmd::List => crew::cli::crew_list(),
         CrewCmd::Show { id } => crew::cli::crew_show(&id),
-        CrewCmd::Dispatch { role, message, deliver, session_id, timeout, watch, workdir, sprint_id, skip_preflight, json, runtime, machine, no_wait } => {
+        CrewCmd::Dispatch {
+            role,
+            message,
+            deliver,
+            session_id,
+            timeout,
+            watch,
+            workdir,
+            sprint_id,
+            skip_preflight,
+            json,
+            runtime,
+            runtime_cmd,
+            machine,
+            no_wait,
+        } => {
             // CLI default: if the operator didn't supply --watch, watch the
             // role's openclaw workspace dir. Library callers (e.g.
             // sprint_cli) pass an empty Vec directly to opt out.
@@ -1907,6 +2004,17 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
             // `internal` routes to the in-house container-bounded
             // runtime (see `runtime/`).
             let runtime_flag = crew::dispatch::Runtime::parse(&runtime)?;
+            // Sprint-E QA: bail loud when --runtime-cmd is set without
+            // --runtime openclaw. The flag is only consulted by the
+            // openclaw shell-out; silently ignoring it under Internal
+            // would re-introduce the "implicit state surprising the
+            // operator" pattern Sprint-E removed.
+            if runtime_flag != crew::dispatch::Runtime::Openclaw && runtime_cmd != "openclaw" {
+                anyhow::bail!(
+                    "--runtime-cmd `{runtime_cmd}` is only valid with --runtime openclaw \
+                     (got --runtime {runtime}). Either drop --runtime-cmd, or add --runtime openclaw."
+                );
+            }
             let opts = crew::dispatch::DispatchOpts {
                 role_id: role,
                 message,
@@ -1919,6 +2027,7 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
                 workdir,
                 sprint_id,
                 runtime: runtime_flag,
+                runtime_cmd,
                 machine,
                 wait: !no_wait,
             };
@@ -1995,13 +2104,14 @@ fn print_watched_state(states: &[crew::dispatch::WatchedPathState]) {
         }
         eprintln!("  {}:", s.root.display());
         for f in &s.files {
-            let rel = f
-                .path
-                .strip_prefix(&s.root)
-                .unwrap_or(&f.path);
+            let rel = f.path.strip_prefix(&s.root).unwrap_or(&f.path);
             eprintln!("    {:>10}  {}", f.size, rel.display());
         }
-        eprintln!("    ({} file{})", s.files.len(), if s.files.len() == 1 { "" } else { "s" });
+        eprintln!(
+            "    ({} file{})",
+            s.files.len(),
+            if s.files.len() == 1 { "" } else { "s" }
+        );
     }
 }
 
@@ -2018,18 +2128,12 @@ fn cmd_model_status() -> Result<i32> {
     let (managed, user): (Vec<_>, Vec<_>) = loaded
         .iter()
         .partition(|m| swap::is_darkmux_owned(&m.identifier));
-    println!(
-        "darkmux-managed ({}):",
-        managed.len()
-    );
+    println!("darkmux-managed ({}):", managed.len());
     if managed.is_empty() {
         println!("  (none — `darkmux swap <profile>` to load)");
     } else {
         for m in &managed {
-            println!(
-                "  {:<46} ctx={:<8} {}",
-                m.identifier, m.context, m.size
-            );
+            println!("  {:<46} ctx={:<8} {}", m.identifier, m.context, m.size);
         }
     }
     println!();
@@ -2038,10 +2142,7 @@ fn cmd_model_status() -> Result<i32> {
         println!("  (none — LMStudio is exclusively darkmux's right now)");
     } else {
         for m in &user {
-            println!(
-                "  {:<46} ctx={:<8} {}",
-                m.identifier, m.context, m.size
-            );
+            println!("  {:<46} ctx={:<8} {}", m.identifier, m.context, m.size);
         }
         println!();
         println!("note: darkmux will never unload entries under `user state` — they're");
@@ -2205,9 +2306,7 @@ fn cmd_profile(sub: ProfileCmd) -> Result<i32> {
             max_ctx,
         } => {
             let task = heuristics::TaskClass::parse(&task_class).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "unknown task-class '{task_class}'. Try: fast | mid | long"
-                )
+                anyhow::anyhow!("unknown task-class '{task_class}'. Try: fast | mid | long")
             })?;
             // Try to find the model in `lms ls`. If not found, the user MUST
             // supply --params (otherwise we'd silently bucket the unknown
@@ -2252,12 +2351,7 @@ fn cmd_profile(sub: ProfileCmd) -> Result<i32> {
             };
 
             let suggestion = heuristics::suggest_profile(&meta, task);
-            let json = heuristics::suggestion_to_profile_json(
-                &name,
-                &model,
-                &suggestion,
-                None,
-            );
+            let json = heuristics::suggestion_to_profile_json(&name, &model, &suggestion, None);
             // Pretty-print
             println!("{}", serde_json::to_string_pretty(&json)?);
             eprintln!();
@@ -2360,11 +2454,7 @@ fn cmd_swap(profile_name: &str, config: Option<&str>, dry_run: bool, quiet: bool
             loaded.path.display()
         );
     }
-    let result = swap::swap(
-        profile,
-        &loaded.registry,
-        swap::SwapOpts { quiet, dry_run },
-    )?;
+    let result = swap::swap(profile, &loaded.registry, swap::SwapOpts { quiet, dry_run })?;
     if !quiet {
         let mut bits = vec![
             format!("done in {}ms", result.walltime_ms),
@@ -2391,10 +2481,7 @@ fn cmd_status(config: Option<&str>) -> Result<i32> {
     println!("registry: {}", loaded.path.display());
     println!("loaded models ({}):", models.len());
     for m in &models {
-        println!(
-            "  {:<40} ctx={:<8} {}",
-            m.identifier, m.context, m.status
-        );
+        println!("  {:<40} ctx={:<8} {}", m.identifier, m.context, m.status);
     }
     let matches: Vec<&String> = loaded
         .registry
@@ -2523,9 +2610,20 @@ fn cmd_lab(sub: LabCmd) -> Result<i32> {
             config,
             quiet,
             runtime,
+            runtime_cmd,
             instrument,
         } => {
             let runtime_flag = crew::dispatch::Runtime::parse(&runtime)?;
+            // Sprint-E QA: bail loud when --runtime-cmd is set without
+            // --runtime openclaw — see CrewCmd::Dispatch for the same
+            // gate; doctrine is "no implicit state, operator-explicit
+            // intent only" (Beat 36).
+            if runtime_flag != crew::dispatch::Runtime::Openclaw && runtime_cmd != "openclaw" {
+                anyhow::bail!(
+                    "--runtime-cmd `{runtime_cmd}` is only valid with --runtime openclaw \
+                     (got --runtime {runtime}). Either drop --runtime-cmd, or add --runtime openclaw."
+                );
+            }
             let outcomes = lab::run::lab_run(lab::run::RunOpts {
                 workload_id: workload,
                 profile_name: profile,
@@ -2533,6 +2631,7 @@ fn cmd_lab(sub: LabCmd) -> Result<i32> {
                 config_path: config,
                 quiet,
                 runtime: runtime_flag,
+                runtime_cmd,
                 instrument,
             })?;
             if !quiet {
@@ -2557,11 +2656,8 @@ fn cmd_lab(sub: LabCmd) -> Result<i32> {
             println!("turns:       {}", report.turns);
             println!("compactions: {}", report.compactions);
             if !report.tokens_before.is_empty() {
-                let listed: Vec<String> = report
-                    .tokens_before
-                    .iter()
-                    .map(|n| n.to_string())
-                    .collect();
+                let listed: Vec<String> =
+                    report.tokens_before.iter().map(|n| n.to_string()).collect();
                 println!("tokensBefore: {}", listed.join(", "));
             }
             if let Some(m) = report.mode {
@@ -2641,7 +2737,11 @@ fn cmd_lab(sub: LabCmd) -> Result<i32> {
                 config,
             })?;
             lab::characterize::print_report(&report);
-            Ok(if report.outcomes.iter().all(|o| o.ok) { 0 } else { 1 })
+            Ok(if report.outcomes.iter().all(|o| o.ok) {
+                0
+            } else {
+                1
+            })
         }
         LabCmd::Tune {
             workload,
@@ -2656,7 +2756,11 @@ fn cmd_lab(sub: LabCmd) -> Result<i32> {
                 config,
             })?;
             lab::tune::print_report(&report);
-            Ok(if report.outcomes.iter().all(|o| o.ok) { 0 } else { 1 })
+            Ok(if report.outcomes.iter().all(|o| o.ok) {
+                0
+            } else {
+                1
+            })
         }
     }
 }
@@ -2720,7 +2824,10 @@ mod tests {
         let v = speedup_verdict(10_000, 8_500, 2);
         match v {
             SpeedupVerdict::SeriallySuspect { speedup } => {
-                assert!((speedup - 1.18).abs() < 0.05, "speedup ≈ 1.18; got {speedup}");
+                assert!(
+                    (speedup - 1.18).abs() < 0.05,
+                    "speedup ≈ 1.18; got {speedup}"
+                );
             }
             other => panic!("expected SeriallySuspect; got {other:?}"),
         }
@@ -2804,7 +2911,11 @@ mod tests {
     fn derive_profile_name_handles_empty_id() {
         let n = derive_profile_name("", heuristics::TaskClass::Fast);
         assert!(
-            n.starts_with("model-") || n.chars().next().map(|c| c.is_ascii_alphanumeric()).unwrap_or(false),
+            n.starts_with("model-")
+                || n.chars()
+                    .next()
+                    .map(|c| c.is_ascii_alphanumeric())
+                    .unwrap_or(false),
             "expected name to start with alphanumeric or 'model-', got: {n}"
         );
     }

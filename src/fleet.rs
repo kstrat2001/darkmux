@@ -131,8 +131,8 @@ pub fn load_roster() -> Result<FleetRoster> {
     if !path.exists() {
         return Ok(FleetRoster::default());
     }
-    let bytes = fs::read(&path)
-        .with_context(|| format!("reading fleet roster from {}", path.display()))?;
+    let bytes =
+        fs::read(&path).with_context(|| format!("reading fleet roster from {}", path.display()))?;
     let roster: FleetRoster = serde_json::from_slice(&bytes)
         .with_context(|| format!("parsing fleet roster JSON at {}", path.display()))?;
     Ok(roster)
@@ -242,8 +242,7 @@ pub fn save_roster(roster: &FleetRoster) -> Result<()> {
     }
     let mut tmp = path.clone();
     tmp.set_extension("tmp");
-    let json = serde_json::to_string_pretty(roster)
-        .context("serializing fleet roster")?;
+    let json = serde_json::to_string_pretty(roster).context("serializing fleet roster")?;
     write_owner_only(&tmp, json.as_bytes())
         .with_context(|| format!("writing fleet roster temp file {}", tmp.display()))?;
     fs::rename(&tmp, &path)
@@ -287,8 +286,7 @@ fn write_owner_only(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     }
     #[cfg(not(unix))]
     {
-        fs::write(path, bytes)
-            .with_context(|| format!("writing {}", path.display()))
+        fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))
     }
 }
 
@@ -298,8 +296,8 @@ fn write_owner_only(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
 fn fsync_dir(dir: &std::path::Path) -> Result<()> {
     #[cfg(unix)]
     {
-        let f = fs::File::open(dir)
-            .with_context(|| format!("open dir {} for fsync", dir.display()))?;
+        let f =
+            fs::File::open(dir).with_context(|| format!("open dir {} for fsync", dir.display()))?;
         f.sync_all()
             .with_context(|| format!("sync_all on dir {}", dir.display()))?;
         Ok(())
@@ -334,10 +332,7 @@ pub fn add_machine(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let existing_added_at = roster
-        .machines
-        .get(id)
-        .map(|m| m.added_unix_ms);
+    let existing_added_at = roster.machines.get(id).map(|m| m.added_unix_ms);
     let entry = MachineEntry {
         id: id.to_string(),
         tier: tier.to_string(),
@@ -374,10 +369,7 @@ pub fn remove_machine(roster: &mut FleetRoster, id: &str) -> Option<MachineEntry
 /// want — for dispatch, today's pattern is publish-to-stream and let
 /// the consumer group claim, so the picker really just needs *some*
 /// match.
-pub fn candidates_for_tier<'a>(
-    roster: &'a FleetRoster,
-    tier: &str,
-) -> Vec<&'a MachineEntry> {
+pub fn candidates_for_tier<'a>(roster: &'a FleetRoster, tier: &str) -> Vec<&'a MachineEntry> {
     let any_match = tier == "any";
     roster
         .machines
@@ -467,9 +459,8 @@ fn resolve_with_timeout(input: &str) -> Result<Option<std::net::SocketAddr>> {
     let handle = std::thread::Builder::new()
         .name("darkmux-dns-resolve".to_string())
         .spawn(move || {
-            let result: Result<Option<std::net::SocketAddr>, std::io::Error> = owned
-                .to_socket_addrs()
-                .map(|mut iter| iter.next());
+            let result: Result<Option<std::net::SocketAddr>, std::io::Error> =
+                owned.to_socket_addrs().map(|mut iter| iter.next());
             // Ignore send errors — receiver may have already given up
             // on timeout. The thread cleans up on its own.
             let _ = tx.send(result);
@@ -803,13 +794,13 @@ pub fn publish_job(client: &redis::Client, job: &WorkJob) -> Result<String> {
     // job at publish than to ship it across the network and trip the
     // consumer-side validator after one or more workers waste their
     // claim budget on it. (#246 PR-C.2)
-    job.validate().context("validating WorkJob before publish")?;
+    job.validate()
+        .context("validating WorkJob before publish")?;
     let mut conn = client
         .get_connection()
         .context("opening Redis connection to publish work job")?;
     let stream = work_stream_name(&job.target_tier);
-    let payload =
-        serde_json::to_string(job).context("serializing WorkJob")?;
+    let payload = serde_json::to_string(job).context("serializing WorkJob")?;
     let mut cmd = redis::cmd("XADD");
     cmd.arg(&stream)
         .arg("MAXLEN")
@@ -837,11 +828,7 @@ pub const WORK_JOB_SCHEMA_VERSION: &str = "1";
 /// (XGROUP CREATE on a non-existent stream would otherwise error).
 ///
 /// Call once per daemon-startup per tier. Safe to call repeatedly.
-pub fn init_consumer_group(
-    client: &redis::Client,
-    tier: &str,
-    group: &str,
-) -> Result<()> {
+pub fn init_consumer_group(client: &redis::Client, tier: &str, group: &str) -> Result<()> {
     let mut conn = client
         .get_connection()
         .context("opening Redis connection to init consumer group")?;
@@ -1003,12 +990,7 @@ fn extract_field(fields: &[redis::Value], key: &str) -> Option<String> {
 /// Worker MUST call this after the dispatch completes, regardless of
 /// dispatch success — the `dispatch.complete` flow record carries the
 /// success/error signal; the ack just releases the queue lease.
-pub fn ack_job(
-    client: &redis::Client,
-    tier: &str,
-    group: &str,
-    work_id: &str,
-) -> Result<()> {
+pub fn ack_job(client: &redis::Client, tier: &str, group: &str, work_id: &str) -> Result<()> {
     let mut conn = client
         .get_connection()
         .context("opening Redis connection to ack work job")?;
@@ -1091,8 +1073,7 @@ fn worker_main() {
         return;
     };
 
-    let machine_id = crate::flow::resolve_machine_id()
-        .unwrap_or_else(|| "unknown".to_string());
+    let machine_id = crate::flow::resolve_machine_id().unwrap_or_else(|| "unknown".to_string());
 
     let url = crate::flow::RawRedisUrl::new(redis_url);
     let client = match redis::Client::open(url.expose_for_probe()) {
@@ -1126,7 +1107,13 @@ fn worker_main() {
     );
 
     loop {
-        match claim_job(&client, &tier, WORKER_CONSUMER_GROUP, &machine_id, WORKER_BLOCK_MS) {
+        match claim_job(
+            &client,
+            &tier,
+            WORKER_CONSUMER_GROUP,
+            &machine_id,
+            WORKER_BLOCK_MS,
+        ) {
             Ok(None) => {
                 // BLOCK timeout — no work. Loop and re-block.
                 continue;
@@ -1135,9 +1122,7 @@ fn worker_main() {
                 handle_claimed_job(&client, &tier, claimed);
             }
             Err(e) => {
-                eprintln!(
-                    "darkmux-worker: claim_job failed ({e}); backing off 1s"
-                );
+                eprintln!("darkmux-worker: claim_job failed ({e}); backing off 1s");
                 std::thread::sleep(Duration::from_secs(1));
             }
         }
@@ -1148,11 +1133,7 @@ fn worker_main() {
 /// the job is acked anyway — the `dispatch.complete` flow record (or
 /// its absence) is the operator-visible signal; the ack just releases
 /// the queue lease.
-fn handle_claimed_job(
-    client: &redis::Client,
-    tier: &str,
-    claimed: ClaimedJob,
-) {
+fn handle_claimed_job(client: &redis::Client, tier: &str, claimed: ClaimedJob) {
     let ClaimedJob { work_id, job } = claimed;
     let session_id = job.session_id.clone();
     let role_id = job.role_id.clone();
@@ -1260,6 +1241,16 @@ impl WorkJob {
             workdir: self.workdir.map(PathBuf::from),
             sprint_id: self.sprint_id,
             runtime: self.runtime,
+            // Worker-side runtime_cmd hardcoded to "openclaw" —
+            // intentionally NOT threaded from the publisher's WorkJob.
+            // A publisher-local binary path (`/opt/aider/aider` on the
+            // dispatcher) doesn't translate to a remote worker's
+            // filesystem; when cross-machine openclaw becomes a
+            // first-class use case the field belongs to the WORKER's
+            // local config (read at claim-time), not to the WorkJob
+            // serialized off the publisher. Internal-runtime jobs
+            // ignore the field entirely.
+            runtime_cmd: "openclaw".to_string(),
             // Worker-side opts: never recurse into the queue (would
             // ping-pong jobs back to redis); always run local synchronous.
             machine: None,
@@ -1506,11 +1497,17 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("fleet.json");
         let prev = std::env::var("DARKMUX_FLEET_FILE").ok();
-        unsafe { std::env::set_var("DARKMUX_FLEET_FILE", &path); }
+        unsafe {
+            std::env::set_var("DARKMUX_FLEET_FILE", &path);
+        }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&path)));
         match prev {
-            Some(v) => unsafe { std::env::set_var("DARKMUX_FLEET_FILE", v); },
-            None => unsafe { std::env::remove_var("DARKMUX_FLEET_FILE"); },
+            Some(v) => unsafe {
+                std::env::set_var("DARKMUX_FLEET_FILE", v);
+            },
+            None => unsafe {
+                std::env::remove_var("DARKMUX_FLEET_FILE");
+            },
         }
         if let Err(e) = result {
             std::panic::resume_unwind(e);
@@ -1532,7 +1529,14 @@ mod tests {
     fn add_then_load_round_trips() {
         with_roster_env(|_| {
             let mut r = FleetRoster::default();
-            add_machine(&mut r, "studio", "hub", "100.74.208.36", Some("always-on m1 max")).unwrap();
+            add_machine(
+                &mut r,
+                "studio",
+                "hub",
+                "100.74.208.36",
+                Some("always-on m1 max"),
+            )
+            .unwrap();
             save_roster(&r).unwrap();
 
             let loaded = load_roster().unwrap();
@@ -1558,7 +1562,10 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(2));
             add_machine(&mut r, "studio", "hub", "addr-2", Some("updated desc")).unwrap();
             let entry = r.machines.get("studio").unwrap();
-            assert_eq!(entry.added_unix_ms, first_added, "added_ts must be preserved");
+            assert_eq!(
+                entry.added_unix_ms, first_added,
+                "added_ts must be preserved"
+            );
             assert_eq!(entry.address, "addr-2", "address must update");
             assert_eq!(entry.description.as_deref(), Some("updated desc"));
         });
@@ -1736,7 +1743,11 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().unwrap();
         let r = probe_reachability(&addr.to_string());
-        assert!(r.reachable, "listening port must be reachable; got error: {:?}", r.error);
+        assert!(
+            r.reachable,
+            "listening port must be reachable; got error: {:?}",
+            r.error
+        );
     }
 
     #[test]
@@ -1820,12 +1831,30 @@ mod tests {
             None, // published_by_orchestrator None
         );
         let json = serde_json::to_string(&job).unwrap();
-        assert!(!json.contains("target_machine"), "None target_machine must be omitted: {json}");
-        assert!(!json.contains("deliver"), "None deliver must be omitted: {json}");
-        assert!(!json.contains("workdir"), "None workdir must be omitted: {json}");
-        assert!(!json.contains("sprint_id"), "None sprint_id must be omitted: {json}");
-        assert!(!json.contains("published_by_machine"), "None published_by_machine must be omitted: {json}");
-        assert!(!json.contains("published_by_orchestrator"), "None published_by_orchestrator must be omitted: {json}");
+        assert!(
+            !json.contains("target_machine"),
+            "None target_machine must be omitted: {json}"
+        );
+        assert!(
+            !json.contains("deliver"),
+            "None deliver must be omitted: {json}"
+        );
+        assert!(
+            !json.contains("workdir"),
+            "None workdir must be omitted: {json}"
+        );
+        assert!(
+            !json.contains("sprint_id"),
+            "None sprint_id must be omitted: {json}"
+        );
+        assert!(
+            !json.contains("published_by_machine"),
+            "None published_by_machine must be omitted: {json}"
+        );
+        assert!(
+            !json.contains("published_by_orchestrator"),
+            "None published_by_orchestrator must be omitted: {json}"
+        );
     }
 
     /// Default runtime is `Internal` as of the runtime-default flip
@@ -1866,7 +1895,9 @@ mod tests {
             "published_at_unix_ms": 0,
             "attempt": 1
         }"#;
-        let err = serde_json::from_str::<WorkJob>(json).unwrap_err().to_string();
+        let err = serde_json::from_str::<WorkJob>(json)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("variant") || err.contains("runtime") || err.contains("nuclear"),
             "expected serde to name the unknown variant; got: {err}"
@@ -1972,7 +2003,10 @@ mod tests {
             V::BulkString(b"{\"k\":\"v\"}".to_vec()),
         ];
         assert_eq!(extract_field(&fields, "schema").as_deref(), Some("1"));
-        assert_eq!(extract_field(&fields, "record").as_deref(), Some("{\"k\":\"v\"}"));
+        assert_eq!(
+            extract_field(&fields, "record").as_deref(),
+            Some("{\"k\":\"v\"}")
+        );
         assert_eq!(extract_field(&fields, "absent"), None);
     }
 
@@ -2222,11 +2256,17 @@ mod tests {
         let resp = V::Array(vec![
             V::Array(vec![
                 V::BulkString(b"1-0".to_vec()),
-                V::Array(vec![V::BulkString(b"record".to_vec()), V::BulkString(record_a.as_bytes().to_vec())]),
+                V::Array(vec![
+                    V::BulkString(b"record".to_vec()),
+                    V::BulkString(record_a.as_bytes().to_vec()),
+                ]),
             ]),
             V::Array(vec![
                 V::BulkString(b"2-0".to_vec()),
-                V::Array(vec![V::BulkString(b"record".to_vec()), V::BulkString(record_b.as_bytes().to_vec())]),
+                V::Array(vec![
+                    V::BulkString(b"record".to_vec()),
+                    V::BulkString(record_b.as_bytes().to_vec()),
+                ]),
             ]),
         ]);
         let result = scan_flow_entries_for_completion(&resp, "sess-target").unwrap();

@@ -10,7 +10,7 @@ use crate::types::Profile;
 use crate::workloads::types::{
     InspectionReport, LoadedWorkload, RunMode, RunResult, WorkloadProvider,
 };
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -57,6 +57,7 @@ impl WorkloadProvider for CodingTaskProvider {
         profile: &Profile,
         profile_name: &str,
         runtime: crate::crew::dispatch::Runtime,
+        runtime_cmd: &str,
     ) -> Result<RunResult> {
         let prompt = expand_placeholders(&resolve_prompt(loaded)?, sandbox_dir);
         let role = pick_role(loaded);
@@ -71,12 +72,12 @@ impl WorkloadProvider for CodingTaskProvider {
 
         let started = std::time::Instant::now();
         let (stdout, stderr, ok) = match runtime {
-            crate::crew::dispatch::Runtime::Internal => dispatch_via_internal(
-                &role, &prompt, &session_id,
-            )?,
-            crate::crew::dispatch::Runtime::Openclaw => dispatch_via_openclaw(
-                &role, &prompt, &session_id,
-            )?,
+            crate::crew::dispatch::Runtime::Internal => {
+                dispatch_via_internal(&role, &prompt, &session_id)?
+            }
+            crate::crew::dispatch::Runtime::Openclaw => {
+                dispatch_via_openclaw(runtime_cmd, &role, &prompt, &session_id)?
+            }
         };
         let duration_ms = started.elapsed().as_millis();
 
@@ -128,7 +129,11 @@ impl WorkloadProvider for CodingTaskProvider {
             payload_text: Some(extract_reply_text(&stdout)),
             trajectory_path,
             verify: verify_outcome,
-            error: if ok { None } else { Some(format!("runtime exit: {stderr}")) },
+            error: if ok {
+                None
+            } else {
+                Some(format!("runtime exit: {stderr}"))
+            },
         })
     }
 
@@ -169,11 +174,8 @@ impl WorkloadProvider for CodingTaskProvider {
                         }
                         let key: String = summary_str.chars().take(80).collect();
                         if seen_summaries.insert(key) {
-                            tokens_before.push(
-                                m.get("tokensBefore")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0),
-                            );
+                            tokens_before
+                                .push(m.get("tokensBefore").and_then(|v| v.as_u64()).unwrap_or(0));
                             summary_chars.push(summary_str.len() as u64);
                         }
                     }
@@ -199,7 +201,12 @@ impl WorkloadProvider for CodingTaskProvider {
                 }
             ));
         }
-        let verify = run_verify(loaded, &extract_reply_text(&fs::read_to_string(run_dir.join("qa-reply.json")).unwrap_or_default()));
+        let verify = run_verify(
+            loaded,
+            &extract_reply_text(
+                &fs::read_to_string(run_dir.join("qa-reply.json")).unwrap_or_default(),
+            ),
+        );
         notes.push(format!(
             "verify: {}",
             if verify.passed { "ok" } else { "fail" }
@@ -279,7 +286,11 @@ fn pick_role(loaded: &LoadedWorkload) -> String {
 
 /// Dispatch via darkmux's internal Docker-bounded runtime through the
 /// crew::dispatch substrate. Beat 36: no openclaw install required.
-fn dispatch_via_internal(role_id: &str, prompt: &str, session_id: &str) -> Result<(String, String, bool)> {
+fn dispatch_via_internal(
+    role_id: &str,
+    prompt: &str,
+    session_id: &str,
+) -> Result<(String, String, bool)> {
     use crate::crew::dispatch::{dispatch, DispatchOpts, Runtime};
     let opts = DispatchOpts {
         role_id: role_id.to_string(),
@@ -293,6 +304,7 @@ fn dispatch_via_internal(role_id: &str, prompt: &str, session_id: &str) -> Resul
         workdir: None,
         sprint_id: None,
         runtime: Runtime::Internal,
+        runtime_cmd: "openclaw".to_string(),
         machine: None,
         wait: true,
     };
@@ -300,12 +312,17 @@ fn dispatch_via_internal(role_id: &str, prompt: &str, session_id: &str) -> Resul
     Ok((result.stdout, result.stderr, result.exit_code == 0))
 }
 
-/// Dispatch via the legacy openclaw shell-out path. Reads
-/// DARKMUX_RUNTIME_CMD (default openclaw) and shells out with the
+/// Dispatch via the legacy openclaw shell-out path. Shells out with the
 /// `<cmd> agent --agent <role> --json ...` calling convention.
-fn dispatch_via_openclaw(role: &str, prompt: &str, session_id: &str) -> Result<(String, String, bool)> {
-    let runtime_cmd = runtime_cmd();
-    let output = Command::new(&runtime_cmd)
+/// `runtime_cmd` is the operator-supplied binary path (Sprint-E:
+/// `--runtime-cmd <path>` flag; defaults to `"openclaw"`).
+fn dispatch_via_openclaw(
+    runtime_cmd: &str,
+    role: &str,
+    prompt: &str,
+    session_id: &str,
+) -> Result<(String, String, bool)> {
+    let output = Command::new(runtime_cmd)
         .args([
             "agent",
             "--agent",
@@ -323,10 +340,6 @@ fn dispatch_via_openclaw(role: &str, prompt: &str, session_id: &str) -> Result<(
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     Ok((stdout, stderr, output.status.success()))
-}
-
-fn runtime_cmd() -> String {
-    env::var("DARKMUX_RUNTIME_CMD").unwrap_or_else(|_| "openclaw".to_string())
 }
 
 /// Best-effort trajectory lookup for the active runtime.
