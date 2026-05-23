@@ -146,7 +146,7 @@ darkmux doctor                    <span class="comment"># confirm "profile match
     <pre><code>darkmux swap recommended --dry-run    <span class="comment"># resolves your tier → validated profile → pre-flight checks</span>
 darkmux model pull-recommended        <span class="comment"># downloads any missing models via `lms get`</span>
 darkmux swap recommended              <span class="comment"># load them for real</span></code></pre>
-    <p>On Apple Silicon 96+ GB (<code>m-series-128</code>), the validated recommendation is the bake-off-hired D model (35B-A3B) with a 4B compactor. Other tiers carry a <code>pending-bake-off</code> status — the verb errors loudly with the rationale, surfacing the gap rather than silently picking. Doctor's <code>recommendation-drift</code> check warns when your loaded models don't match the registry's pick.</p>
+    <p>On Apple Silicon 96+ GB (<code>m-series-128</code>), the validated recommendation pairs a 35B-A3B MoE primary with a 4B compactor (specific model ids in the registry). Other tiers carry a <code>pending-bake-off</code> status — the verb errors loudly with the rationale, surfacing the gap rather than silently picking. Doctor's <code>recommendation-drift</code> check warns when your loaded models don't match the registry's pick.</p>
   </div>
 </section>
 

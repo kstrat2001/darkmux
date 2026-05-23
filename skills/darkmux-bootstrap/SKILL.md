@@ -40,11 +40,17 @@ Look for:
 
 Three outcomes:
 
-**A. Tier is `m-series-128` (validated bake-off recommendation).** The skill knows what to recommend. Report to operator:
-> Your tier is `m-series-128`. The bake-off (#45) hired **D = `qwen3.6-35b-a3b-turboquant-mlx`** for routine coding, with a **4B compactor** (`qwen3-4b-instruct-2507`). I'll walk through making sure both are downloaded + profile-registered.
+**A. Tier has a validated recommendation** (currently `m-series-128`; check `darkmux recommendations show <tier>` for the live list). Pull the registry's pick and report to the operator:
 
-**B. Tier is `m-series-64` / `m-series-32` / `generic` (no validated recommendation).** Tell the operator:
-> Your tier is `<tier>`. darkmux hasn't run a bake-off on this hardware class yet (tracked in #117). I'll help you set up *something* sensible, but the model selection is yours — you'll be picking from what LMStudio offers, not from a bake-off-validated list.
+```bash
+darkmux recommendations show <tier>
+```
+
+Then report:
+> Your tier is `<tier>`. The recommendation registry has a validated pick for this hardware class — a primary model and a compactor model selected through a documented bake-off (head-to-head comparison with evaluation criteria recorded before the runs). I'll walk through making sure both are downloaded + profile-registered.
+
+**B. Tier has a `pending-bake-off` status** (currently `m-series-64` / `m-series-32` / `generic`). Tell the operator:
+> Your tier is `<tier>`. The recommendation registry hasn't validated this hardware class yet — no head-to-head comparison has been run on this RAM band ([#117](https://github.com/kstrat2001/darkmux/issues/117) tracks the gap). I'll help you set up *something* sensible, but the model selection is yours: you'll be picking from what LMStudio offers, not from a validated list.
 >
 > Two ways forward:
 > - **Scan + suggest**: run `/darkmux-scan-and-suggest` (sibling skill) — it walks through your `lms ls` catalog and proposes profile shapes for each model you have.
@@ -56,18 +62,14 @@ Continue with the operator's tier.
 
 ## Step 2 — Verify the recommended models are downloaded (validated tiers only)
 
-For validated tiers, check whether the bake-off models are on disk:
+For validated tiers, check whether the registry's recommended models are on disk:
 
 ```bash
 lms ls | head -50
 ```
 
-If the recommended models are missing, propose the one-command fix:
-> The recommendation registry says you need these models downloaded:
-> - `qwen3.6-35b-a3b-turboquant-mlx` (primary)
-> - `qwen3-4b-instruct-2507` (compactor)
->
-> Want me to walk you through downloading them? The command is `darkmux model pull-recommended` — it skips already-downloaded models, so safe to run even if one of them is already present.
+If the recommended models are missing, propose the one-command fix. Read the model ids from the recommendation registry (`darkmux recommendations show <tier>` if you haven't already), then:
+> The recommendation registry says these models should be downloaded for your tier (primary + compactor). Want me to walk you through downloading them? The command is `darkmux model pull-recommended` — it skips already-downloaded models, so safe to run even if one is already present.
 
 **Wait for operator confirmation.** If they say yes, ask them to run:
 
@@ -89,7 +91,7 @@ darkmux profiles 2>&1 | head -20
 
 Outcomes:
 
-**A. Profiles already exist.** Confirm with the operator that the relevant profile (`balanced` for `m-series-128`, or their custom one) is present. Move on.
+**A. Profiles already exist.** Confirm with the operator that the profile their tier's recommendation expects (check `darkmux recommendations show <tier>` for the expected profile name — `balanced` for `m-series-128` today) is present. Move on.
 
 **B. No profiles file.** The operator hasn't run `darkmux init` yet. Propose:
 > Your profile registry is empty. The default `darkmux init` would create a starter `~/.darkmux/profiles.json` with placeholder profiles. Want to run it?
@@ -98,7 +100,7 @@ Outcomes:
 > darkmux init
 > ```
 
-**C. Profiles file exists but doesn't include the recommended one.** For `m-series-128`, the recommendation expects a `balanced` profile. If absent, propose `darkmux profile draft balanced -m qwen3.6-35b-a3b-turboquant-mlx` and ask the operator to add it.
+**C. Profiles file exists but doesn't include the recommended one.** Check `darkmux recommendations show <tier>` for the expected profile name + model id. Propose `darkmux profile draft <profile-name> -m <model-id>` and ask the operator to add it to `~/.darkmux/profiles.json`.
 
 ## Step 4 — Validate the swap path
 

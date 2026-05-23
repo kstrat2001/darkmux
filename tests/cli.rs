@@ -637,6 +637,37 @@ fn mission_migrate_apply_is_idempotent() {
         .stdout(predicate::str::contains("nothing to do"));
 }
 
+/// Sprint-F: `darkmux recommendations show <tier>` prints the registry
+/// entry for a known tier. This verb is referenced by the bootstrap
+/// skill to read the live primary + compactor model ids; if the verb
+/// regresses the skill breaks for every new operator.
+#[test]
+fn recommendations_show_known_tier_prints_validated_entry() {
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .args(["recommendations", "show", "m-series-128"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Tier:     m-series-128"))
+        .stdout(predicate::str::contains("Status:"))
+        .stdout(predicate::str::contains("Primary:"))
+        .stdout(predicate::str::contains("Compactor:"))
+        .stdout(predicate::str::contains("Rationale:"));
+}
+
+/// Sprint-F: `recommendations show <unknown-tier>` errors clearly.
+/// The bootstrap skill's tier-resolution path depends on the verb
+/// bailing loud rather than silently returning an empty placeholder.
+#[test]
+fn recommendations_show_unknown_tier_errors() {
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .args(["recommendations", "show", "no-such-tier"])
+        .assert()
+        .failure();
+}
+
+
 /// Sprint-H: `notebook draft --role <id>` is the new flag (renamed
 /// from `--agent` per Beat 36). The old `--agent` flag must NOT be
 /// accepted — clap should reject it as an unknown argument so
