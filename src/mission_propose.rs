@@ -29,7 +29,7 @@ use std::io::{BufRead, Read, Write};
 
 /// The shape the mission-compiler emits inside its fenced ```json block.
 /// Matches the schema documented in
-/// `templates/builtin/crew/roles/mission-compiler.md`.
+/// `templates/builtin/roles/mission-compiler.md`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Proposal {
     mission: ProposedMission,

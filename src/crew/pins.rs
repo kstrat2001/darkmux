@@ -16,7 +16,7 @@
 //!
 //! Mirrors the role-prompt loader (`crew::loader::load_role_prompt`):
 //! 1. User dir: `<crew_root>/role-model-pins.json` (operator override)
-//! 2. Embedded `templates/builtin/crew/role-model-pins.json` (binary-bundled default)
+//! 2. Embedded `templates/builtin/role-model-pins.json` (binary-bundled default)
 //!
 //! User pins fully override the embedded table — partial overlays are
 //! not supported in v1. The operator either uses the shipped table or
@@ -30,7 +30,7 @@ use std::fs;
 use std::sync::Mutex;
 
 const EMBEDDED_PINS_JSON: &str =
-    include_str!("../../templates/builtin/crew/role-model-pins.json");
+    include_str!("../../templates/builtin/role-model-pins.json");
 
 /// The deserialized pin table. `BTreeMap` for `per_role` so doctor
 /// output / diagnostic dumps come out in a stable alphabetical order
@@ -133,12 +133,12 @@ fn load_pins_uncached() -> Result<PinTable> {
     // if anything ever evaluated the pin as a profile. Defensive:
     // empty pins fail loudly at startup.
     if parsed.default_pin.trim().is_empty() {
-        panic!("BUG: embedded pin table has empty `default_pin` — fix template/builtin/crew/role-model-pins.json");
+        panic!("BUG: embedded pin table has empty `default_pin` — fix templates/builtin/role-model-pins.json");
     }
     for (role, pin) in &parsed.per_role {
         if pin.trim().is_empty() {
             panic!(
-                "BUG: embedded pin table has empty pin for role `{role}` — fix template/builtin/crew/role-model-pins.json"
+                "BUG: embedded pin table has empty pin for role `{role}` — fix templates/builtin/role-model-pins.json"
             );
         }
     }
