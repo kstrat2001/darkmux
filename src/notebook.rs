@@ -1,9 +1,14 @@
-//! `darkmux notebook draft <run-id>` — agent-as-scribe for lab notebook entries.
+//! `darkmux notebook draft <run-id>` — role-as-scribe for lab notebook entries.
 //!
 //! Reads a lab run's manifest + trajectory, builds a prompt asking the active
 //! runtime to draft a lab-notebook entry, dispatches it (typically against the
-//! `scribe` profile), and writes the draft to .darkmux/notebook/<date>-<slug>.md.
+//! `scribe` role), and writes the draft to .darkmux/notebook/<date>-<slug>.md.
+//!
+//! Sprint-H (Beat 36 finish): routes through the internal Docker-bounded
+//! runtime by default — same default as `crew dispatch` / `lab run`. The
+//! openclaw shell-out path remains available via `--runtime openclaw`.
 
+use crate::crew::dispatch::{DispatchOpts, Runtime};
 use crate::lab::paths::{self, ResolveScope};
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
@@ -16,11 +21,23 @@ use std::time::SystemTime;
 #[derive(Debug, Clone)]
 pub struct DraftOptions {
     pub run_id: String,
-    pub agent: String,
+    /// DM role id to dispatch the drafting prompt through (Sprint-H:
+    /// renamed from `agent` per Beat 36 directional principle — DM
+    /// concepts are primary on DM-side CLI surfaces). The role
+    /// resolves through `templates/builtin/roles/<role>.{json,md}`
+    /// under the internal runtime; under `--runtime openclaw` it's
+    /// passed verbatim as openclaw's `--agent <id>` arg.
+    pub role: String,
     pub slug: Option<String>,
     pub dry_run: bool,
     /// Override the machine id (overrides DARKMUX_MACHINE_ID env var).
     pub machine_override: Option<String>,
+    /// Which agent runtime to dispatch the drafting prompt through.
+    /// Default: `Runtime::Internal` (Sprint-H — Beat 36 finish).
+    pub runtime: Runtime,
+    /// Executable path for the openclaw shell-out (Sprint-E pattern).
+    /// Defaults to `"openclaw"`; ignored when `runtime == Internal`.
+    pub runtime_cmd: String,
 }
 
 #[derive(Debug)]
@@ -83,15 +100,12 @@ pub fn draft_entry(opts: &DraftOptions) -> Result<DraftReport> {
     let run_data = build_run_data_summary(&run_dir, &manifest)?;
     let prompt = NOTEBOOK_PROMPT_TEMPLATE.replace("{run_data}", &run_data);
 
-    // Dispatch to the runtime. Post-Sprint-E: notebook draft is
-    // openclaw-coupled today (uses `openclaw agent --agent <id>` shell-
-    // out). Sprint-G will decouple this surface — either route through
-    // the internal runtime or surface a `--runtime-cmd` flag. For
-    // Sprint-E the path is hardcoded to `openclaw`; operators using
-    // Aider / Cline for notebook drafts will lose that hatch (rare;
-    // env var was the only mechanism, and pure-DM notebook drafting
-    // is the strategic direction).
-    let runtime_cmd = "openclaw";
+    // Sprint-H (Beat 36 finish): dispatch through the operator-selected
+    // runtime. `Internal` is the default — uses darkmux's in-house
+    // Docker-bounded runtime via `crew::dispatch::dispatch()`, mirroring
+    // the Sprint-D/E pattern used by `lab run` + `crew dispatch`.
+    // `Openclaw` is the opt-in shell-out path, preserved for operators
+    // who already use openclaw.
     let session_id = format!(
         "darkmux-notebook-{}-{}",
         opts.run_id,
@@ -102,32 +116,21 @@ pub fn draft_entry(opts: &DraftOptions) -> Result<DraftReport> {
     );
 
     let entry_text = if opts.dry_run {
-        format!("[DRY RUN — would have dispatched the prompt below to '{runtime_cmd} agent --agent {} --message ...']\n\n{prompt}", opts.agent)
+        let runtime_label = match opts.runtime {
+            Runtime::Internal => "internal runtime".to_string(),
+            Runtime::Openclaw => format!("openclaw shell-out (`{}`)", opts.runtime_cmd),
+        };
+        format!(
+            "[DRY RUN — would have dispatched the prompt below to {runtime_label} via role `{}`]\n\n{prompt}",
+            opts.role
+        )
     } else {
-        let output = Command::new(runtime_cmd)
-            .args([
-                "agent",
-                "--agent",
-                &opts.agent,
-                "--session-id",
-                &session_id,
-                "--json",
-                "--timeout",
-                "1800",
-                "--message",
-                &prompt,
-            ])
-            .output()
-            .with_context(|| format!("running `{runtime_cmd} agent ...`"))?;
-        if !output.status.success() {
-            bail!(
-                "agent dispatch failed (exit {}): {}",
-                output.status.code().unwrap_or(-1),
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
+        match opts.runtime {
+            Runtime::Internal => dispatch_draft_via_internal(&opts.role, &prompt, &session_id)?,
+            Runtime::Openclaw => {
+                dispatch_draft_via_openclaw(&opts.runtime_cmd, &opts.role, &prompt, &session_id)?
+            }
         }
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        extract_reply_text(&stdout)
     };
 
     // Compose the entry path: <date>-<slug>.md
@@ -166,6 +169,79 @@ pub fn draft_entry(opts: &DraftOptions) -> Result<DraftReport> {
         prompt_chars: prompt.len(),
         reply_chars: entry_text.len(),
     })
+}
+
+/// Dispatch the drafting prompt through darkmux's internal Docker-bounded
+/// runtime via `crew::dispatch::dispatch()`. Sprint-H (Beat 36 finish):
+/// notebook draft no longer requires openclaw — the internal runtime
+/// reads the role manifest from `templates/builtin/roles/<role>.{json,md}`
+/// (or the operator's override under `~/.darkmux/roles/`).
+fn dispatch_draft_via_internal(role: &str, prompt: &str, session_id: &str) -> Result<String> {
+    let opts = DispatchOpts {
+        role_id: role.to_string(),
+        message: prompt.to_string(),
+        deliver: None,
+        session_id: Some(session_id.to_string()),
+        timeout_seconds: 1800,
+        skip_preflight: false,
+        // notebook draft parses reply text from the JSON envelope's
+        // `.final_assistant` field (same shape Sprint-B established
+        // for qa-review).
+        json: true,
+        watch_paths: Vec::new(),
+        workdir: None,
+        sprint_id: None,
+        runtime: Runtime::Internal,
+        // Ignored when runtime == Internal; see DispatchOpts::runtime_cmd
+        // doc (Sprint-E). Hardcoded "openclaw" preserves codebase parity.
+        runtime_cmd: "openclaw".to_string(),
+        machine: None,
+        wait: true,
+    };
+    let result = crate::crew::dispatch::dispatch(opts)
+        .context("internal-runtime dispatch for notebook draft")?;
+    if result.exit_code != 0 {
+        bail!(
+            "internal-runtime notebook draft failed (exit {}): {}",
+            result.exit_code,
+            result.stderr.trim()
+        );
+    }
+    Ok(extract_reply_text(&result.stdout))
+}
+
+/// Dispatch the drafting prompt via the legacy openclaw shell-out path.
+/// `runtime_cmd` is the operator-supplied binary path (Sprint-E flag).
+fn dispatch_draft_via_openclaw(
+    runtime_cmd: &str,
+    role: &str,
+    prompt: &str,
+    session_id: &str,
+) -> Result<String> {
+    let output = Command::new(runtime_cmd)
+        .args([
+            "agent",
+            "--agent",
+            role,
+            "--session-id",
+            session_id,
+            "--json",
+            "--timeout",
+            "1800",
+            "--message",
+            prompt,
+        ])
+        .output()
+        .with_context(|| format!("running `{runtime_cmd} agent ...`"))?;
+    if !output.status.success() {
+        bail!(
+            "openclaw notebook-draft dispatch failed (exit {}): {}",
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    Ok(extract_reply_text(&stdout))
 }
 
 fn build_run_data_summary(run_dir: &Path, manifest: &Value) -> Result<String> {
@@ -276,6 +352,13 @@ fn extract_reply_text(stdout: &str) -> String {
     let Ok(parsed) = serde_json::from_str::<Value>(stdout) else {
         return stdout.to_string();
     };
+    // Sprint-H: try the DM internal-runtime JSON envelope first
+    // (Sprint-A shape: `{result, final_assistant, metrics,
+    // trajectory_path}`). Falls through to openclaw's `payloads[]`
+    // / `reply` shapes for the `--runtime openclaw` path.
+    if let Some(final_assistant) = parsed.get("final_assistant").and_then(|v| v.as_str()) {
+        return final_assistant.to_string();
+    }
     let payloads = parsed
         .get("payloads")
         .or_else(|| parsed.get("result").and_then(|r| r.get("payloads")))
@@ -568,6 +651,30 @@ mod tests {
         assert_eq!(extract_reply_text(""), "");
     }
 
+    /// Sprint-H: extract_reply_text understands DM's internal-runtime
+    /// JSON envelope (`final_assistant`). Without this, notebook draft
+    /// against `--runtime internal` would return empty for the reply.
+    #[test]
+    fn extract_reply_dm_internal_envelope() {
+        let json = r#"{"result":"stop","final_assistant":"Notebook draft body here.","metrics":{"turns":1},"trajectory_path":"/x/y.jsonl"}"#;
+        assert_eq!(
+            extract_reply_text(json),
+            "Notebook draft body here."
+        );
+    }
+
+    /// Sprint-H: when both shapes are present (shouldn't happen in
+    /// practice, but be deterministic), `final_assistant` wins — that's
+    /// the DM-side envelope, and notebook draft now defaults internal.
+    #[test]
+    fn extract_reply_prefers_final_assistant_over_payloads() {
+        let json = r#"{
+            "final_assistant":"DM envelope wins",
+            "payloads":[{"text":"OC envelope"}]
+        }"#;
+        assert_eq!(extract_reply_text(json), "DM envelope wins");
+    }
+
     #[test]
     fn build_run_data_summary_works() {
         let tmp = TempDir::new().unwrap();
@@ -680,10 +787,12 @@ mod tests {
 
         let report = draft_entry(&DraftOptions {
             run_id: "test-run".to_string(),
-            agent: "main".to_string(),
+            role: "scribe".to_string(),
             slug: Some("test-slug".to_string()),
             dry_run: true,
             machine_override: None,
+            runtime: Runtime::Internal,
+            runtime_cmd: "openclaw".to_string(),
         })
         .unwrap();
 
@@ -716,10 +825,12 @@ mod tests {
         env::set_current_dir(tmp.path()).unwrap();
         let result = draft_entry(&DraftOptions {
             run_id: "nonexistent".to_string(),
-            agent: "main".to_string(),
+            role: "scribe".to_string(),
             slug: None,
             dry_run: true,
             machine_override: None,
+            runtime: Runtime::Internal,
+            runtime_cmd: "openclaw".to_string(),
         });
         env::set_current_dir(prev).unwrap();
         assert!(result.is_err());
@@ -824,20 +935,24 @@ mod tests {
         }
         let opts_with_override = DraftOptions {
             run_id: "x".into(),
-            agent: "main".into(),
+            role: "scribe".into(),
             slug: None,
             dry_run: true,
             machine_override: Some("override-machine".into()),
+            runtime: Runtime::Internal,
+            runtime_cmd: "openclaw".to_string(),
         };
         assert_eq!(resolve_machine_id(&opts_with_override), "override-machine");
 
         // 2. With no override, env var wins over fingerprint.
         let opts_no_override = DraftOptions {
             run_id: "x".into(),
-            agent: "main".into(),
+            role: "scribe".into(),
             slug: None,
             dry_run: true,
             machine_override: None,
+            runtime: Runtime::Internal,
+            runtime_cmd: "openclaw".to_string(),
         };
         assert_eq!(resolve_machine_id(&opts_no_override), "env-fingerprint");
 

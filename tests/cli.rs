@@ -636,3 +636,112 @@ fn mission_migrate_apply_is_idempotent() {
         .success()
         .stdout(predicate::str::contains("nothing to do"));
 }
+
+/// Sprint-H: `notebook draft --role <id>` is the new flag (renamed
+/// from `--agent` per Beat 36). The old `--agent` flag must NOT be
+/// accepted — clap should reject it as an unknown argument so
+/// operators with stale scripts get a loud failure instead of a
+/// silent mis-dispatch.
+#[test]
+fn notebook_draft_rejects_old_agent_flag() {
+    let tmp = TempDir::new().unwrap();
+    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    cmd.current_dir(tmp.path());
+    let output = cmd
+        .args([
+            "notebook",
+            "draft",
+            "nonexistent",
+            "--agent",
+            "main",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "expected --agent to be rejected by clap; got success: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // QA NIT 3: tighten to "unexpected argument" specifically — `agent`
+    // alone could appear in clap's help suggestion text and false-pass.
+    assert!(
+        stderr.contains("unexpected argument"),
+        "expected clap to flag `--agent` as unexpected argument; got: {stderr}"
+    );
+}
+
+/// Sprint-H: `notebook draft --role <id>` accepts the new flag and
+/// proceeds. Uses --dry-run + an absolute manifest path so we don't
+/// need a real dispatch.
+#[test]
+fn notebook_draft_accepts_role_flag_under_dry_run() {
+    let tmp = TempDir::new().unwrap();
+    let darkmux = tmp.path().join(".darkmux");
+    let runs_dir = darkmux.join("runs/test-run-h");
+    fs::create_dir_all(&runs_dir).unwrap();
+    fs::write(
+        runs_dir.join("manifest.json"),
+        r#"{"workload":"quick-q","provider":"prompt","profile":"scribe","sessionId":"s","durationMs":5000,"ok":true}"#,
+    )
+    .unwrap();
+
+    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    cmd.current_dir(tmp.path());
+    cmd.env("DARKMUX_NOTEBOOK_DIR", darkmux.join("notebook").to_str().unwrap());
+    cmd.args([
+        "notebook",
+        "draft",
+        "test-run-h",
+        "--role",
+        "scribe",
+        "--dry-run",
+        "--slug",
+        "sprint-h-test",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("sprint-h-test"));
+}
+
+/// Sprint-H + Sprint-E loud-bail gate: notebook draft also enforces
+/// "--runtime-cmd is only valid under --runtime openclaw."
+#[test]
+fn notebook_draft_runtime_cmd_without_openclaw_bails_loud() {
+    let tmp = TempDir::new().unwrap();
+    let darkmux = tmp.path().join(".darkmux");
+    let runs_dir = darkmux.join("runs/test-run-h2");
+    fs::create_dir_all(&runs_dir).unwrap();
+    fs::write(
+        runs_dir.join("manifest.json"),
+        r#"{"workload":"quick-q","provider":"prompt","profile":"scribe","sessionId":"s","durationMs":5000,"ok":true}"#,
+    )
+    .unwrap();
+
+    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    cmd.current_dir(tmp.path());
+    let output = cmd
+        .args([
+            "notebook",
+            "draft",
+            "test-run-h2",
+            "--runtime",
+            "internal",
+            "--runtime-cmd",
+            "/opt/aider/aider",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit when --runtime-cmd set without --runtime openclaw"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--runtime openclaw"),
+        "expected stderr to point operator at `--runtime openclaw`; got: {stderr}"
+    );
+}
