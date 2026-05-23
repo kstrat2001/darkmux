@@ -1489,13 +1489,23 @@ fn build_route_payload(
 /// because the role's declared tier doesn't match the local machine's
 /// tier. Returns:
 /// - `Ok(None)` — dispatch locally (role.tier ∈ {None, "any"}, OR
-///   role.tier == local tier, OR auto-route would be pointless)
+///   role.tier == local tier, OR roster is empty so there's no fleet
+///   to route across, OR auto-route would be pointless)
 /// - `Ok(Some(role_tier))` — fleet has a peer in `role_tier`; publish
 ///   via queue. Caller (dispatch entry) emits the banner and calls
 ///   `dispatch_via_queue(opts, None)`.
-/// - `Err(_)` — role.tier doesn't match local AND no fleet peer
-///   matches; bail loud with operator-actionable hint pointing at
-///   `darkmux fleet add`. (#247 PR-B)
+/// - `Err(_)` — operator HAS a fleet with peers in other tiers but
+///   none in `role_tier`; bail loud since the operator's existing
+///   fleet is deliberately partitioned but missing this tier.
+///   (#247 PR-B; graceful-degradation refinement per LAB_NOTEBOOK
+///   Beat 35.)
+///
+/// **Graceful-degradation principle (Beat 35):** hardware constraints
+/// should never be a refusal condition for single-machine operators.
+/// If no fleet is declared at all (empty roster), the tier hint is
+/// treated as advisory — dispatch locally with a one-line nudge. The
+/// hard bail only fires when the operator HAS configured a fleet but
+/// it's missing the required tier (an actionable misconfiguration).
 fn auto_route_target_tier(opts: &DispatchOpts) -> Result<Option<String>> {
     let role = load_role_or_bail(&opts.role_id)?;
     let role_tier = match role.tier.as_deref().map(str::trim) {
@@ -1507,27 +1517,51 @@ fn auto_route_target_tier(opts: &DispatchOpts) -> Result<Option<String>> {
         // Local matches role's tier — dispatch locally; no queue cost.
         return Ok(None);
     }
-    // Tier mismatch — consult the fleet roster.
-    let roster = match crate::fleet::load_roster() {
-        Ok(r) => r,
-        Err(e) => bail!(
-            "role `{}` requires tier=`{role_tier}` (local tier=`{}`) but the fleet \
-             roster couldn't be loaded: {e}. Run `darkmux fleet status` to inspect.",
-            opts.role_id,
-            local_tier.as_deref().unwrap_or("<unset>"),
-        ),
-    };
+    // Tier mismatch — consult the fleet roster. `load_roster()`
+    // already returns `Ok(FleetRoster::default())` for the missing-
+    // file case (single-machine operator legitimately has no
+    // fleet.json), so we only need to propagate genuine parse
+    // failures here. Silently swallowing parse errors would route
+    // local without surfacing that the operator's hand-edited
+    // roster.json is broken — exactly the silent-divergence-from-
+    // intent the operator-sovereignty doctrine forbids.
+    let roster = crate::fleet::load_roster().with_context(|| {
+        format!(
+            "role `{}` requires tier=`{role_tier}` and the fleet roster failed to load. \
+             Run `darkmux fleet status` to inspect.",
+            opts.role_id
+        )
+    })?;
     let candidates = crate::fleet::candidates_for_tier(&roster, &role_tier);
     if candidates.is_empty() {
+        if roster.machines.is_empty() {
+            // Single-machine operator — no fleet declared at all. Tier
+            // constraints don't apply when there's nothing to route
+            // across. Run locally with a teaching nudge so multi-
+            // machine ops can wire it up later. Operator-sovereignty
+            // applied per Beat 35.
+            eprintln!(
+                "darkmux crew dispatch: role `{}` declares tier=`{role_tier}` but no \
+                 fleet peers are declared — running locally. To enable multi-machine \
+                 routing later: `darkmux fleet add <id> --tier <tier> --address <addr>`.",
+                opts.role_id
+            );
+            return Ok(None);
+        }
+        // Roster has peers, but none in this tier — operator HAS a
+        // fleet that's deliberately partitioned, just missing the
+        // required tier. This is an actionable misconfiguration the
+        // operator wants to know about.
+        let peer_count = roster.machines.len();
+        let peer_word = if peer_count == 1 { "peer" } else { "peers" };
         bail!(
             "role `{}` requires tier=`{role_tier}` but no fleet peer is in that \
-             tier (local tier=`{}`). Either: \
+             tier (local tier=`{}`, {peer_count} other {peer_word} declared). Either: \
              (a) add a peer with `darkmux fleet add <id> --tier {role_tier} --address <addr>`, \
-             or (b) edit the role manifest to declare `tier: \"{}\"` if this work belongs \
-             on the local machine.",
+             or (b) edit the role manifest to declare `tier: \"any\"` if this work \
+             belongs on whatever's available.",
             opts.role_id,
             local_tier.as_deref().unwrap_or("<unset>"),
-            local_tier.as_deref().unwrap_or("any"),
         );
     }
     Ok(Some(role_tier))
@@ -3032,5 +3066,284 @@ mod tests {
         // that makes computeDispatchDurations() work for the failure path
         // too (an erroring dispatch still has a wall-clock arc).
         assert_eq!(ok.session_id, err.session_id);
+    }
+
+    // ─── L1 / Beat 35: tier-routing graceful degradation ─────────────
+    //
+    // Pre-fix: a single-machine operator who ran
+    // `darkmux crew dispatch coder` (where coder has tier=inference and
+    // local has no DARKMUX_MACHINE_TIER set) hit a bail before the first
+    // dispatch ever produced a record. The bail message instructed them
+    // to either add a fleet peer OR edit the role manifest — both ask
+    // the operator to learn the multi-machine model at first dispatch.
+    //
+    // Post-fix: when the roster is empty (no fleet declared at all),
+    // tier mismatch falls back to local with a one-line nudge. The
+    // hard bail only fires when the operator HAS configured a fleet
+    // but it's missing the required tier (actionable misconfiguration).
+    //
+    // Tests run serially because they mutate DARKMUX_CREW_DIR,
+    // DARKMUX_FLEET_FILE, and DARKMUX_MACHINE_TIER — process-global.
+
+    /// RAII: scrub the three env vars + restore on drop.
+    struct TierRouteEnvGuard {
+        prev_crew: Option<String>,
+        prev_fleet: Option<String>,
+        prev_tier: Option<String>,
+        _tmp: TempDir,
+    }
+
+    impl TierRouteEnvGuard {
+        fn new() -> Self {
+            let tmp = TempDir::new().unwrap();
+            let prev_crew = std::env::var("DARKMUX_CREW_DIR").ok();
+            let prev_fleet = std::env::var("DARKMUX_FLEET_FILE").ok();
+            let prev_tier = std::env::var("DARKMUX_MACHINE_TIER").ok();
+            // SAFETY: serialized via #[serial_test::serial] on every caller.
+            unsafe {
+                std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
+                std::env::remove_var("DARKMUX_FLEET_FILE");
+                std::env::remove_var("DARKMUX_MACHINE_TIER");
+            }
+            Self {
+                prev_crew,
+                prev_fleet,
+                prev_tier,
+                _tmp: tmp,
+            }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            self._tmp.path()
+        }
+
+        fn set_fleet_file(&self, path: &std::path::Path) {
+            // SAFETY: serialized via #[serial].
+            unsafe { std::env::set_var("DARKMUX_FLEET_FILE", path); }
+        }
+
+        fn set_local_tier(&self, tier: &str) {
+            // SAFETY: serialized via #[serial].
+            unsafe { std::env::set_var("DARKMUX_MACHINE_TIER", tier); }
+        }
+    }
+
+    impl Drop for TierRouteEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: serialized via #[serial].
+            unsafe {
+                match &self.prev_crew {
+                    Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
+                    None => std::env::remove_var("DARKMUX_CREW_DIR"),
+                }
+                match &self.prev_fleet {
+                    Some(v) => std::env::set_var("DARKMUX_FLEET_FILE", v),
+                    None => std::env::remove_var("DARKMUX_FLEET_FILE"),
+                }
+                match &self.prev_tier {
+                    Some(v) => std::env::set_var("DARKMUX_MACHINE_TIER", v),
+                    None => std::env::remove_var("DARKMUX_MACHINE_TIER"),
+                }
+            }
+        }
+    }
+
+    /// Seed an operator-override role with a specific tier value.
+    /// `auto_route_target_tier` only needs the role manifest (it reads
+    /// `role.tier`), not the system-prompt `.md` — that's consumed
+    /// later in the dispatch pipeline via `role_prompt_or_bail`, which
+    /// these routing tests don't reach.
+    fn seed_role_with_tier(crew_root: &std::path::Path, role_id: &str, tier: &str) {
+        let roles_dir = crew_root.join("roles");
+        std::fs::create_dir_all(&roles_dir).unwrap();
+        let json = format!(
+            r#"{{
+              "id": "{role_id}",
+              "description": "L1 test role",
+              "capabilities": [],
+              "tool_palette": {{"allow": ["read"], "deny": []}},
+              "escalation_contract": "bail-with-explanation",
+              "tier": "{tier}"
+            }}"#
+        );
+        std::fs::write(roles_dir.join(format!("{role_id}.json")), json).unwrap();
+    }
+
+    fn opts_for_role(role_id: &str) -> DispatchOpts {
+        DispatchOpts {
+            role_id: role_id.to_string(),
+            message: "test".to_string(),
+            deliver: None,
+            session_id: None,
+            timeout_seconds: 30,
+            skip_preflight: true,
+            watch_paths: Vec::new(),
+            workdir: None,
+            sprint_id: None,
+            runtime: Runtime::Internal,
+            machine: None,
+            wait: true,
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn auto_route_falls_back_to_local_when_roster_empty() {
+        // The Beat-35 graceful-degradation path. Single-machine operator
+        // with no fleet declared, no local tier, role declares
+        // tier=inference. Should dispatch locally (Ok(None)) rather
+        // than bail.
+        let guard = TierRouteEnvGuard::new();
+        seed_role_with_tier(guard.path(), "l1-test-coder", "inference");
+        // Point fleet file at a nonexistent path — load_roster returns
+        // FleetRoster::default() (empty machines).
+        guard.set_fleet_file(&guard.path().join("nonexistent-fleet.json"));
+
+        let result = auto_route_target_tier(&opts_for_role("l1-test-coder"));
+        assert!(
+            matches!(result, Ok(None)),
+            "expected Ok(None) for empty-roster fallback; got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn auto_route_falls_back_to_local_even_with_local_tier_unset() {
+        // Variant: explicitly unset DARKMUX_MACHINE_TIER (the smoke-test
+        // scenario that surfaced Beat 35). The fix must not depend on
+        // the operator having declared a tier.
+        let guard = TierRouteEnvGuard::new();
+        seed_role_with_tier(guard.path(), "l1-test-coder-2", "inference");
+        // DARKMUX_MACHINE_TIER stays unset (guard scrubs it on new).
+
+        let result = auto_route_target_tier(&opts_for_role("l1-test-coder-2"));
+        assert!(
+            matches!(result, Ok(None)),
+            "expected Ok(None); got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn auto_route_bails_when_fleet_has_peers_but_missing_required_tier() {
+        // The "operator HAS a fleet but deliberately partitioned, just
+        // missing this tier" case. Preserves the existing actionable-
+        // misconfiguration bail. This is the case that should STILL
+        // fail loudly even post-Beat-35 — the operator has expressed
+        // intent (the fleet roster exists with peers) but the
+        // configuration is incomplete.
+        let guard = TierRouteEnvGuard::new();
+        seed_role_with_tier(guard.path(), "l1-test-coder-3", "inference");
+        let fleet_path = guard.path().join("fleet.json");
+        // Roster with one peer in `hub` tier — none in `inference`.
+        std::fs::write(
+            &fleet_path,
+            r#"{
+              "version": "1",
+              "machines": {
+                "studio": {
+                  "id": "studio",
+                  "tier": "hub",
+                  "address": "100.74.208.36",
+                  "added_unix_ms": 1700000000000
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+        guard.set_fleet_file(&fleet_path);
+        guard.set_local_tier("client");
+
+        let result = auto_route_target_tier(&opts_for_role("l1-test-coder-3"));
+        let err = result.expect_err("expected bail for fleet-missing-tier case");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("inference"),
+            "error should mention the required tier; got: {msg}"
+        );
+        assert!(
+            msg.contains("1 other peer"),
+            "error should count the declared peers; got: {msg}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn auto_route_routes_to_queue_when_fleet_has_matching_tier() {
+        // Sanity check: pre-existing multi-machine routing still works.
+        // Roster has a peer in the role's required tier — auto_route
+        // returns Ok(Some(role_tier)) so the caller publishes via the
+        // work queue.
+        let guard = TierRouteEnvGuard::new();
+        seed_role_with_tier(guard.path(), "l1-test-coder-4", "inference");
+        let fleet_path = guard.path().join("fleet.json");
+        std::fs::write(
+            &fleet_path,
+            r#"{
+              "version": "1",
+              "machines": {
+                "laptop": {
+                  "id": "laptop",
+                  "tier": "inference",
+                  "address": "100.74.208.99",
+                  "added_unix_ms": 1700000000000
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+        guard.set_fleet_file(&fleet_path);
+        guard.set_local_tier("hub");
+
+        let result = auto_route_target_tier(&opts_for_role("l1-test-coder-4"));
+        match result {
+            Ok(Some(tier)) => assert_eq!(tier, "inference"),
+            other => panic!("expected Ok(Some(\"inference\")); got: {:?}", other),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn auto_route_dispatches_locally_when_role_tier_matches_local() {
+        // Sanity: the existing local-tier-matches-role-tier early-exit
+        // still works (operator on inference peer, role wants
+        // inference, no queue indirection needed).
+        let guard = TierRouteEnvGuard::new();
+        seed_role_with_tier(guard.path(), "l1-test-coder-5", "inference");
+        guard.set_local_tier("inference");
+
+        let result = auto_route_target_tier(&opts_for_role("l1-test-coder-5"));
+        assert!(
+            matches!(result, Ok(None)),
+            "expected Ok(None) for local-matches-role; got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn auto_route_bails_when_roster_file_exists_but_is_corrupted() {
+        // Reviewer B-1: a hand-edited roster with a JSON typo must not
+        // silently degrade to local — the operator believes they have
+        // a fleet, and silent divergence from intent is exactly the
+        // failure mode operator-sovereignty forbids. Missing file is
+        // still graceful (load_roster returns Ok(default) upstream);
+        // parse failure stays loud here.
+        let guard = TierRouteEnvGuard::new();
+        seed_role_with_tier(guard.path(), "l1-test-coder-6", "inference");
+        let fleet_path = guard.path().join("fleet.json");
+        // Trailing garbage after the JSON object — operator typo or
+        // editor corruption. serde_json rejects.
+        std::fs::write(&fleet_path, r#"{ "version": "1", "machines": {} this is broken"#).unwrap();
+        guard.set_fleet_file(&fleet_path);
+
+        let err = auto_route_target_tier(&opts_for_role("l1-test-coder-6"))
+            .expect_err("corrupted roster must surface as Err, not silently degrade");
+        let msg = format!("{err:#}");
+        // Top-level context names the dispatch surface; underlying error
+        // is the parse failure from load_roster. Both should be visible.
+        assert!(msg.contains("fleet roster failed to load"), "got: {msg}");
     }
 }
