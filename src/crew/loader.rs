@@ -113,7 +113,7 @@ pub fn crew_root() -> PathBuf {
 /// `DARKMUX_CREW_DIR` if set (operator override; unchanged semantics —
 /// the env var points at the directory CONTAINING the subdirs, with no
 /// `crew/` nesting), otherwise `<paths.root>` (e.g., `~/.darkmux/`).
-fn user_state_root() -> PathBuf {
+pub(crate) fn user_state_root() -> PathBuf {
     std::env::var("DARKMUX_CREW_DIR")
         .ok()
         .filter(|s| !s.trim().is_empty())

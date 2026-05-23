@@ -98,10 +98,110 @@ pub fn run() -> DoctorReport {
         check_recommendation_drift(),
         check_recommended_profile_name_not_shadowed(),
         check_role_model_pin_drift(),
+        check_beat33_legacy_crew_dir(),
         check_legacy_mission_layout(),
     ];
     checks.extend(eureka_checks());
     DoctorReport { checks }
+}
+
+/// Detect operators still on the pre-Beat-33 `<root>/crew/{roles,
+/// missions,sprints,crews,capabilities,role-model-pins.json}` layout
+/// and emit an mv-script they can copy-paste to flatten. The loader's
+/// dual-read keeps the legacy layout working, so this is a Warn (not
+/// Fail) — operator-sovereignty: doctor proposes, operator runs.
+///
+/// The script writes to stderr-friendly stdout (the hint field), so a
+/// fresh-Claude session can read it back and offer to execute. Doctor
+/// itself never mutates operator state.
+fn check_beat33_legacy_crew_dir() -> Check {
+    use crate::crew::loader::user_state_root;
+    let root = user_state_root();
+    let legacy_dir = root.join("crew");
+    if !legacy_dir.is_dir() {
+        return Check {
+            name: "beat-33 crew/ layout".into(),
+            status: Status::Pass,
+            message: "user state already on the flattened layout".into(),
+            hint: None,
+        };
+    }
+
+    // Inventory what's actually under <root>/crew/ so the message is
+    // specific. We only care about the post-Beat-33 promoted subdirs +
+    // the pinned file; anything else under crew/ is operator-authored
+    // territory we won't recommend moving.
+    let promoted_subdirs = ["roles", "missions", "sprints", "crews", "capabilities"];
+    let promoted_file = "role-model-pins.json";
+    let mut present_subdirs: Vec<&str> = promoted_subdirs
+        .iter()
+        .filter(|s| legacy_dir.join(s).is_dir())
+        .copied()
+        .collect();
+    let pins_present = legacy_dir.join(promoted_file).is_file();
+    present_subdirs.sort();
+
+    if present_subdirs.is_empty() && !pins_present {
+        // <root>/crew/ exists but is empty / has no promoted content.
+        // Likely a directory the operator created themselves — leave alone.
+        return Check {
+            name: "beat-33 crew/ layout".into(),
+            status: Status::Pass,
+            message: format!(
+                "{} exists but holds no promoted subdirs — leaving alone",
+                legacy_dir.display()
+            ),
+            hint: None,
+        };
+    }
+
+    // Build the mv-script. One line per existing promoted subdir + the
+    // pins file. `mv -n` (no-clobber) is deliberate: if the operator has
+    // partial state at both locations, we never overwrite the canonical
+    // side; they merge manually.
+    let mut script_lines: Vec<String> = Vec::new();
+    for subdir in &present_subdirs {
+        script_lines.push(format!(
+            "mv -n {legacy}/{subdir} {root}/{subdir}",
+            legacy = legacy_dir.display(),
+            root = root.display(),
+            subdir = subdir
+        ));
+    }
+    if pins_present {
+        script_lines.push(format!(
+            "mv -n {legacy}/{file} {root}/{file}",
+            legacy = legacy_dir.display(),
+            root = root.display(),
+            file = promoted_file
+        ));
+    }
+    script_lines.push(format!("rmdir {} 2>/dev/null || true", legacy_dir.display()));
+
+    let mut listed = present_subdirs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+    if pins_present {
+        listed.push(promoted_file.to_string());
+    }
+    let listed_str = listed.join(", ");
+
+    Check {
+        name: "beat-33 crew/ layout".into(),
+        status: Status::Warn,
+        message: format!(
+            "operator state still under {}/ (found: {listed_str}); flattening is recommended",
+            legacy_dir.display()
+        ),
+        hint: Some(format!(
+            "darkmux still reads the legacy layout via the loader's dual-read fallback — no \
+             rush. When you're ready to flatten, copy-paste this (uses `mv -n` so existing \
+             canonical files are never overwritten):\n\n{script}\n\n\
+             Note: if you set DARKMUX_CREW_DIR explicitly, this check assumes the env var \
+             points at the post-flatten root (e.g. `~/.darkmux/`). If you instead set it \
+             at the legacy `crew/` dir (`~/.darkmux/crew/`), the dual-read keeps working \
+             but this script's paths are computed from the env var value as-given.",
+            script = script_lines.join("\n")
+        )),
+    }
 }
 
 /// Warn when openclaw's `agents.list[].model` for each `darkmux/<role>`
@@ -1722,13 +1822,18 @@ fn check_legacy_mission_layout() -> Check {
     }
 
     if legacy_count > 0 {
-        let crew_root = crate::crew::loader::crew_root();
+        // Display the actual dirs the legacy files live under (resolved
+        // through dual-read so the path shown is the one the operator
+        // can cd into, regardless of canonical vs Beat-33-legacy layout).
+        let missions = crate::crew::loader::missions_dir();
+        let sprints = crate::crew::loader::sprints_dir();
         Check {
             name: "legacy mission layout".into(),
             status: Status::Warn,
             message: format!(
-                "{legacy_count} legacy flat file(s) at {}/(missions|sprints)/<id>.json",
-                crew_root.display()
+                "{legacy_count} legacy flat file(s) at {}/<id>.json or {}/<id>.json",
+                missions.display(),
+                sprints.display()
             ),
             hint: Some(
                 "Run `darkmux mission migrate --apply` to move them to the per-mission layout (#148)."
@@ -2191,10 +2296,11 @@ mod tests {
         // machine_id + orchestrator [#167] + machine_tier [#246] +
         // audit-integrity [#163] + recommendation-drift +
         // recommended-profile-not-shadowed [#159] + role-model-pin-drift
-        // [#160] + legacy-mission-layout [#148]) + one per active eureka
-        // rule. Every check should appear regardless of environment —
-        // even if the underlying probe couldn't read state.
-        let expected = 23 + crate::eureka::all_rules().len();
+        // [#160] + legacy-mission-layout [#148] + beat-33-crew-dir
+        // [Beat 33 directory flatten]) + one per active eureka rule.
+        // Every check should appear regardless of environment — even if
+        // the underlying probe couldn't read state.
+        let expected = 24 + crate::eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
@@ -2351,5 +2457,127 @@ mod tests {
         assert_eq!(check.status, Status::Warn);
         assert!(check.message.contains("connection refused"));
         assert!(check.hint.as_ref().unwrap_or(&String::new()).contains("darkmux serve"));
+    }
+
+    // ─── check_beat33_legacy_crew_dir ─────────────────────────────────
+    //
+    // The doctor check detects an operator on the pre-Beat-33
+    // `<root>/crew/{subdirs}` layout and emits an mv-script. Tests run
+    // serially because they mutate DARKMUX_CREW_DIR — the env var is
+    // process-global.
+
+    /// RAII: redirect DARKMUX_CREW_DIR to a TempDir for the test's duration.
+    struct CrewRootGuard {
+        prev: Option<String>,
+        tmp: tempfile::TempDir,
+    }
+
+    impl CrewRootGuard {
+        fn new() -> Self {
+            let tmp = tempfile::TempDir::new().expect("tempdir");
+            let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+            // SAFETY: tests using this guard MUST be #[serial].
+            unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()); }
+            Self { prev, tmp }
+        }
+        fn path(&self) -> &std::path::Path {
+            self.tmp.path()
+        }
+    }
+
+    impl Drop for CrewRootGuard {
+        fn drop(&mut self) {
+            // SAFETY: tests using this guard MUST be #[serial].
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
+                    None => std::env::remove_var("DARKMUX_CREW_DIR"),
+                }
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn beat33_legacy_crew_dir_passes_when_no_crew_subdir_exists() {
+        let _guard = CrewRootGuard::new();
+        let check = check_beat33_legacy_crew_dir();
+        assert_eq!(check.status, Status::Pass);
+        assert!(check.message.contains("flattened layout"));
+        assert!(check.hint.is_none());
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn beat33_legacy_crew_dir_passes_when_crew_dir_is_empty() {
+        let guard = CrewRootGuard::new();
+        // <root>/crew/ exists but has nothing inside — operator may have
+        // created it manually, leave alone.
+        std::fs::create_dir_all(guard.path().join("crew")).unwrap();
+        let check = check_beat33_legacy_crew_dir();
+        assert_eq!(check.status, Status::Pass);
+        assert!(check.message.contains("holds no promoted subdirs"));
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn beat33_legacy_crew_dir_warns_with_mv_script_when_subdirs_present() {
+        let guard = CrewRootGuard::new();
+        // Seed the legacy layout with the subdirs an upgrading operator
+        // would actually have.
+        std::fs::create_dir_all(guard.path().join("crew").join("roles")).unwrap();
+        std::fs::create_dir_all(guard.path().join("crew").join("missions")).unwrap();
+        std::fs::write(
+            guard.path().join("crew").join("role-model-pins.json"),
+            "{}",
+        )
+        .unwrap();
+
+        let check = check_beat33_legacy_crew_dir();
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.message.contains("operator state still under"));
+        assert!(check.message.contains("missions"));
+        assert!(check.message.contains("roles"));
+        assert!(check.message.contains("role-model-pins.json"));
+
+        let hint = check.hint.as_ref().expect("warn must carry an mv-script hint");
+        // Script must be operator-runnable: mv -n (no-clobber) for safety,
+        // plus a final rmdir to clean up the now-empty parent.
+        assert!(hint.contains("mv -n"));
+        assert!(hint.contains("/crew/roles"));
+        assert!(hint.contains("/crew/missions"));
+        assert!(hint.contains("/crew/role-model-pins.json"));
+        assert!(hint.contains("rmdir"));
+        // Operator-sovereignty: the hint explicitly notes that nothing is
+        // urgent (loader's dual-read keeps the legacy layout working).
+        // Strip newlines before substring-match so rustfmt re-wrapping
+        // doesn't move the assertion's goalposts.
+        assert!(hint.replace('\n', " ").contains("no rush"));
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn beat33_legacy_crew_dir_only_reports_promoted_subdirs() {
+        let guard = CrewRootGuard::new();
+        // Create only one promoted subdir + one NON-promoted subdir;
+        // doctor should only mention the promoted one.
+        std::fs::create_dir_all(guard.path().join("crew").join("roles")).unwrap();
+        std::fs::create_dir_all(
+            guard.path().join("crew").join("operator-private-stuff"),
+        )
+        .unwrap();
+
+        let check = check_beat33_legacy_crew_dir();
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.message.contains("roles"));
+        assert!(
+            !check.message.contains("operator-private-stuff"),
+            "doctor must not recommend touching operator-authored subdirs"
+        );
+        let hint = check.hint.unwrap();
+        assert!(
+            !hint.contains("operator-private-stuff"),
+            "mv script must not propose moving operator-authored subdirs"
+        );
     }
 }
