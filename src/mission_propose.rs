@@ -190,9 +190,12 @@ fn dispatch_compiler(input: &str, hint: Option<&str>) -> Result<String> {
         // mission-compiler runs BEFORE any mission/sprints exist on disk —
         // there's nothing to bind to and no parent context to inject.
         sprint_id: None,
-        // Mission propose is a system-level admin dispatch; always the
-        // default openclaw path while the internal runtime is opt-in only.
-        runtime: crate::crew::dispatch::Runtime::Openclaw,
+        // Mission propose is a system-level admin dispatch; runs
+        // through the internal Docker-bounded runtime — same default
+        // as `darkmux crew dispatch` (#309). Beat 36 directional
+        // principle: openclaw is a downstream translation target, not
+        // a hardcoded admin-dispatch dependency.
+        runtime: crate::crew::dispatch::Runtime::Internal,
         machine: None,
         wait: true,
     };

@@ -809,9 +809,13 @@ pub(crate) fn sprint_review_at(
         // Sprint review is a code-reviewer dispatch on the sprint's diff,
         // not on the sprint's own work. No cross-sprint context needed.
         sprint_id: None,
-        // Sprint review dispatches through the default openclaw runtime;
-        // internal in-house runtime is opt-in via the CLI flag.
-        runtime: crate::crew::dispatch::Runtime::Openclaw,
+        // Sprint review dispatches through the internal Docker-bounded
+        // runtime — same default as `darkmux crew dispatch` (#309).
+        // Operators who prefer openclaw can run the underlying
+        // `darkmux crew dispatch code-reviewer --runtime openclaw` by
+        // hand; sprint review itself goes through DM's substrate so
+        // openclaw is genuinely optional (Beat 36).
+        runtime: crate::crew::dispatch::Runtime::Internal,
         machine: None,
         wait: true,
     };

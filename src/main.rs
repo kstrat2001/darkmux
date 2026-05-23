@@ -1402,7 +1402,12 @@ fn cmd_mission_dispatch(
             None,
             None,
             Some(sprint.id.clone()),
-            crate::crew::dispatch::Runtime::Openclaw,
+            // Mission dispatch publishes work jobs to peers; the worker
+            // on the receiving machine runs the role through the
+            // internal Docker-bounded runtime (same default as local
+            // dispatch — Beat 36 directional principle, openclaw
+            // optional everywhere).
+            crate::crew::dispatch::Runtime::Internal,
             timeout_seconds,
             local_machine.clone(),
             local_orchestrator.clone(),
