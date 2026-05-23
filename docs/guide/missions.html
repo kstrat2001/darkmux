@@ -49,7 +49,7 @@
 <section>
   <div class="wrap">
     <h2>Crew: roles + dispatch</h2>
-    <p>A <strong>role</strong> is a named local-AI capability — a manifest under <code>templates/builtin/roles/&lt;id&gt;.json</code> (or <code>~/.darkmux/crew/roles/&lt;id&gt;.json</code>) paired with a system prompt at the same path with a <code>.md</code> extension. The manifest declares:</p>
+    <p>A <strong>role</strong> is a named local-AI capability — a manifest under <code>templates/builtin/roles/&lt;id&gt;.json</code> (or <code>~/.darkmux/roles/&lt;id&gt;.json</code> for operator overrides) paired with a system prompt at the same path with a <code>.md</code> extension. The manifest declares:</p>
     <ul>
       <li><code>id</code>, <code>description</code>, <code>capabilities</code></li>
       <li><code>tool_palette</code> — <code>allow</code> and <code>deny</code> lists of tools (read, exec, edit, etc.)</li>
@@ -86,7 +86,9 @@ darkmux crew sync --dry-run      <span class="comment"># preview without writing
 <section>
   <div class="wrap">
     <h2>Missions + sprints</h2>
-    <p>A <strong>mission</strong> is a named objective — a JSON file under <code>~/.darkmux/crew/missions/&lt;id&gt;.json</code> with a description, a list of <code>sprint_ids</code>, and a status (active/closed/paused). A <strong>sprint</strong> is a time-boxed work unit inside a mission — its own JSON file under <code>~/.darkmux/crew/sprints/&lt;id&gt;.json</code> with status (planned/running/complete/abandoned), depends_on, and timestamps.</p>
+    <p>A <strong>mission</strong> is a named objective — a JSON file under <code>~/.darkmux/missions/&lt;id&gt;.json</code> with a description, a list of <code>sprint_ids</code>, and a status (active/closed/paused). A <strong>sprint</strong> is a time-boxed work unit inside a mission — its own JSON file under <code>~/.darkmux/sprints/&lt;id&gt;.json</code> with status (planned/running/complete/abandoned), depends_on, and timestamps.</p>
+
+    <p class="muted"><em>Note for operators with existing state:</em> earlier versions of darkmux nested everything under <code>~/.darkmux/crew/</code> (<code>roles/</code>, <code>missions/</code>, <code>sprints/</code>). The loader transparently falls back to that layout, so existing state keeps working. Run <code>darkmux doctor</code> for a copy-pasteable <code>mv</code> script to flatten when you're ready.</p>
 
     <h3>Authoring a mission (recommended)</h3>
     <p>The preferred path: use <code>darkmux mission propose</code>, which takes unstructured input (pasted text, a Jira ticket via <code>acli</code>, a GitHub issue via <code>gh</code>) and dispatches the mission-compiler admin agent to emit a structured proposal you approve before any file lands.</p>
@@ -113,7 +115,7 @@ Approve [y] · Edit/regenerate with hint [e] · Reject [n]: y
 mission propose: persisted 1 mission + 2 sprints
 next: <code>darkmux mission start draft-blog-post</code> to begin (or pass <code>--start</code> next time)</code></pre>
 
-    <p>The proposal is persisted to disk as JSON files under <code>~/.darkmux/crew/missions/</code> and <code>~/.darkmux/crew/sprints/</code>. Pass <code>--start</code> to transition immediately:</p>
+    <p>The proposal is persisted to disk as JSON files under <code>~/.darkmux/missions/</code> and <code>~/.darkmux/sprints/</code>. Pass <code>--start</code> to transition immediately:</p>
     <pre><code>darkmux mission propose --from-stdin --start
 <span class="comment"># ... proposal approved, files written, mission → Active</span></code></pre>
 
@@ -166,7 +168,7 @@ next: <code>darkmux mission start draft-blog-post</code> to begin (or pass <code
     <p>The smallest useful shape: one mission, one sprint. Just enough to see the lifecycle move and the cyan records land in the viewer.</p>
 
     <h4>1. Make sure the directories exist</h4>
-    <pre><code>mkdir -p ~/.darkmux/crew/missions ~/.darkmux/crew/sprints</code></pre>
+    <pre><code>mkdir -p ~/.darkmux/missions ~/.darkmux/sprints</code></pre>
 
     <h4>2. Pick a current Unix epoch timestamp</h4>
     <p>The <code>created_ts</code> field is just <em>seconds since the Unix epoch</em>. Get one:</p>
@@ -174,7 +176,7 @@ next: <code>darkmux mission start draft-blog-post</code> to begin (or pass <code
 <span class="comment"># 1778685866   (your value will differ)</span></code></pre>
 
     <h4>3. Save the mission JSON</h4>
-    <p>Save the following at <code>~/.darkmux/crew/missions/draft-blog-post.json</code> (replace the timestamp with what <code>date +%s</code> just gave you):</p>
+    <p>Save the following at <code>~/.darkmux/missions/draft-blog-post.json</code> (replace the timestamp with what <code>date +%s</code> just gave you):</p>
     <pre><code>{
   "id": "draft-blog-post",
   "description": "Draft a blog post on local-AI bounded-task patterns.",
@@ -184,7 +186,7 @@ next: <code>darkmux mission start draft-blog-post</code> to begin (or pass <code
 }</code></pre>
 
     <h4>4. Save the sprint JSON</h4>
-    <p>Save at <code>~/.darkmux/crew/sprints/draft-blog-post-s1-outline.json</code>:</p>
+    <p>Save at <code>~/.darkmux/sprints/draft-blog-post-s1-outline.json</code>:</p>
     <pre><code>{
   "id": "draft-blog-post-s1-outline",
   "mission_id": "draft-blog-post",

@@ -260,7 +260,7 @@ enum CrewCmd {
     Dispatch {
         /// Role id (e.g. `code-reviewer`). Must have a manifest at
         /// `templates/builtin/roles/<id>.json` (or under
-        /// `~/.darkmux/crew/roles/`) AND a sibling `.md` prompt file.
+        /// `~/.darkmux/roles/`) AND a sibling `.md` prompt file.
         role: String,
         /// Message body for the dispatch.
         #[arg(long, short = 'm')]
@@ -419,7 +419,7 @@ enum SprintCmd {
     /// Transition a sprint to `Running`. From `Planned` (first start) or
     /// `Abandoned` (restart — clears abandoned_ts). Stamps `started_ts=now()`.
     Start {
-        /// Sprint id (filename stem under ~/.darkmux/crew/sprints/).
+        /// Sprint id (filename stem under ~/.darkmux/sprints/).
         id: String,
     },
     /// Transition a `Running` sprint to `Complete` (terminal). Stamps
@@ -444,7 +444,7 @@ enum MissionCmd {
     /// so this is the "I'm starting to work on it now" verb, not a status
     /// flip.
     Start {
-        /// Mission id (filename stem under ~/.darkmux/crew/missions/).
+        /// Mission id (filename stem under ~/.darkmux/missions/).
         id: String,
         /// Optional operator-supplied reasoning for the transition.
         /// Lands on the emitted flow record so the audit substrate

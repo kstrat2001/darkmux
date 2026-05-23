@@ -738,7 +738,7 @@ fn check_crew_role_prompt_coverage() -> Check {
             hint: Some(
                 "Author the missing prompts at `templates/builtin/roles/<id>.md` and \
                  add them to `BUILTIN_ROLE_PROMPTS` in `src/crew/loader.rs`. Operators can \
-                 override at `~/.darkmux/crew/roles/<id>.md`."
+                 override at `~/.darkmux/roles/<id>.md`."
                     .into(),
             ),
         }
