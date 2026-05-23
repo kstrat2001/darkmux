@@ -1,7 +1,7 @@
 //! Dispatch a crew member (role) for a single turn.
 //!
 //! This is the operator-facing entry point that ties the crew schema
-//! (`templates/builtin/crew/roles/<id>.{json,md}`) to the actual runtime
+//! (`templates/builtin/roles/<id>.{json,md}`) to the actual runtime
 //! (openclaw). Three responsibilities:
 //!
 //!   1. **Load the role** — manifest + `.md` system prompt
@@ -114,7 +114,7 @@ fn print_licensed_adjacent_banner(role_id: &str) {
         "licensed professional. The role's full doctrine is in the .md prompt"
     );
     eprintln!(
-        "at templates/builtin/crew/roles/{role_id}.md in the darkmux source"
+        "at templates/builtin/roles/{role_id}.md in the darkmux source"
     );
     eprintln!(
         "(or your override at ~/.darkmux/crew/roles/{role_id}.md if set)."
@@ -1713,7 +1713,7 @@ fn role_prompt_or_bail(role: &Role) -> Result<String> {
     load_role_prompt(&role.id).ok_or_else(|| {
         anyhow!(
             "role `{}` has no `.md` system prompt. Author one at \
-             `templates/builtin/crew/roles/{}.md` (or override at \
+             `templates/builtin/roles/{}.md` (or override at \
              `<crew_root>/roles/{}.md`).",
             role.id, role.id, role.id
         )

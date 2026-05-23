@@ -7,7 +7,7 @@ allowed-tools: "Bash(darkmux:*),Bash(git:*),Bash(openclaw:*),Bash(jq:*),Bash(plu
 
 # Darkmux QA review
 
-Dispatches the **darkmux/code-reviewer** agent against the current branch's diff via `darkmux crew dispatch --runtime openclaw`. The dispatch path uses the role manifest at `templates/builtin/crew/roles/code-reviewer.json` + the bundled `.md` system prompt, with pre-flight checks that verify the openclaw agent registry matches the manifest before running. Operator-sovereignty: drift in the openclaw config (stale system prompt, wrong tool palette) bails before launching, with a clear `darkmux crew sync` repair pointer.
+Dispatches the **darkmux/code-reviewer** agent against the current branch's diff via `darkmux crew dispatch --runtime openclaw`. The dispatch path uses the role manifest at `templates/builtin/roles/code-reviewer.json` + the bundled `.md` system prompt, with pre-flight checks that verify the openclaw agent registry matches the manifest before running. Operator-sovereignty: drift in the openclaw config (stale system prompt, wrong tool palette) bails before launching, with a clear `darkmux crew sync` repair pointer.
 
 > **Why openclaw, not the default internal runtime?** This skill currently parses openclaw's JSON envelope (`.result.meta.finalAssistantVisibleText` / `.result.payloads[]`) to extract the reviewer's reply. The internal runtime emits a different plain-text envelope (`--- final assistant message ---` separator). Until the skill is updated to handle both, it pins `--runtime openclaw` explicitly. Tracked as a follow-up.
 

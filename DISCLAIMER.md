@@ -14,7 +14,7 @@ AI models — local or hosted — can produce unexpected, incorrect, or unsafe o
 
 ## Licensed-adjacent role prompts
 
-darkmux ships role prompts under `templates/builtin/crew/roles/` that operate in domains regulated by professional licensure: `health-research.md`, `legal-research.md`, and `fitness-coach.md`. These prompts are written explicitly as research and organization assistants — **not** as substitutes for a physician, attorney, registered dietitian, physical therapist, or other licensed professional. They contain explicit "You are NOT" framings, scope MUST-NOTs, and escalation rules.
+darkmux ships role prompts under `templates/builtin/roles/` that operate in domains regulated by professional licensure: `health-research.md`, `legal-research.md`, and `fitness-coach.md`. These prompts are written explicitly as research and organization assistants — **not** as substitutes for a physician, attorney, registered dietitian, physical therapist, or other licensed professional. They contain explicit "You are NOT" framings, scope MUST-NOTs, and escalation rules.
 
 Even with that framing:
 

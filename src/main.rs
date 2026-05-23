@@ -259,7 +259,7 @@ enum CrewCmd {
     /// `openclaw agent` with the assembled message.
     Dispatch {
         /// Role id (e.g. `code-reviewer`). Must have a manifest at
-        /// `templates/builtin/crew/roles/<id>.json` (or under
+        /// `templates/builtin/roles/<id>.json` (or under
         /// `~/.darkmux/crew/roles/`) AND a sibling `.md` prompt file.
         role: String,
         /// Message body for the dispatch.

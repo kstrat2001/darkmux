@@ -235,7 +235,7 @@ fn check_role_model_pin_drift() -> Check {
                 drifts.len()
             ),
             hint: Some(
-                "Run `darkmux crew sync` to re-write the agent entries with their pinned models. The pin table lives at templates/builtin/crew/role-model-pins.json (or <crew_root>/role-model-pins.json for operator overrides)."
+                "Run `darkmux crew sync` to re-write the agent entries with their pinned models. The pin table lives at templates/builtin/role-model-pins.json (or <crew_root>/role-model-pins.json for operator overrides)."
                     .into(),
             ),
         }
@@ -636,7 +636,7 @@ fn check_crew_role_prompt_coverage() -> Check {
                 missing.len()
             ),
             hint: Some(
-                "Author the missing prompts at `templates/builtin/crew/roles/<id>.md` and \
+                "Author the missing prompts at `templates/builtin/roles/<id>.md` and \
                  add them to `BUILTIN_ROLE_PROMPTS` in `src/crew/loader.rs`. Operators can \
                  override at `~/.darkmux/crew/roles/<id>.md`."
                     .into(),
