@@ -175,9 +175,18 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         .arg("--system")
         .arg(&system_prompt)
         .arg("--prompt")
-        .arg(&opts.message)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .arg(&opts.message);
+    if opts.json {
+        // Plumb the operator's `--json` request through to the
+        // container CLI so downstream parsers (qa-review skill, lab
+        // adapter, ad-hoc `jq` users) get a structured envelope on
+        // stdout instead of the human-readable separator format. The
+        // runtime emits status lines to stderr in JSON mode so stdout
+        // stays clean. See `runtime/src/main.rs::build_json_envelope`
+        // for the schema contract.
+        cmd.arg("--json");
+    }
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let child = cmd.spawn().context("spawning darkmux-runtime container")?;
 

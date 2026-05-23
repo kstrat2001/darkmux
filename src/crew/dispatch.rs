@@ -261,6 +261,12 @@ pub struct DispatchOpts {
     pub timeout_seconds: u32,
     /// Skip the pre-flight checks. Use only when explicitly debugging.
     pub skip_preflight: bool,
+    /// When `true`, request the runtime emit a machine-parseable JSON
+    /// envelope on stdout instead of the human-readable format. Today
+    /// only the internal runtime honors this — it's plumbed through to
+    /// `--json` on the container's CLI. The openclaw path always
+    /// returns its own JSON envelope, so this flag is a no-op there.
+    pub json: bool,
     /// Paths to capture post-dispatch filesystem state for (#89 —
     /// SIGNOFF verification visibility). The dispatcher walks each
     /// path (immediate children + one level deep into subdirs;
@@ -3177,6 +3183,7 @@ mod tests {
             session_id: None,
             timeout_seconds: 30,
             skip_preflight: true,
+            json: false,
             watch_paths: Vec::new(),
             workdir: None,
             sprint_id: None,

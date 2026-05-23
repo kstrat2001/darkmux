@@ -1250,6 +1250,12 @@ impl WorkJob {
             session_id: Some(self.session_id),
             timeout_seconds: self.timeout_seconds,
             skip_preflight: false,
+            // Worker-side dispatches preserve today's human-readable
+            // stdout shape — JSON-envelope mode is operator-explicit
+            // and only fires when the originating CLI used --json.
+            // (When cross-machine plumbing eventually carries the flag
+            // through WorkJob, this can read self.json.)
+            json: false,
             watch_paths: vec![],
             workdir: self.workdir.map(PathBuf::from),
             sprint_id: self.sprint_id,
