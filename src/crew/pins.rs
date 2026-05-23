@@ -115,7 +115,7 @@ pub fn clear_cache_for_tests() {
 /// Parse-only version that always re-reads from disk; used in tests
 /// where the cache would interfere with overriding the user dir.
 fn load_pins_uncached() -> Result<PinTable> {
-    let user_path = crate::crew::loader::crew_root().join("role-model-pins.json");
+    let user_path = crate::crew::loader::role_pins_path();
     if user_path.is_file() {
         let raw = fs::read_to_string(&user_path)
             .with_context(|| format!("reading user pin table at {}", user_path.display()))?;
