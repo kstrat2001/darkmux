@@ -254,12 +254,15 @@ const _: () = assert!(
 /// `mission_count` and `sprint_count` are loaded via
 /// `crate::crew::loader::load_missions`/`load_sprints` in production;
 /// tests pass synthetic counts.
+#[allow(clippy::too_many_arguments)]
 fn build_startup_banner(
     addr: &std::net::SocketAddr,
     flows_dir: &std::path::Path,
     flows_dir_exists: bool,
-    crew_root: &std::path::Path,
-    crew_root_exists: bool,
+    missions_dir: &std::path::Path,
+    missions_dir_exists: bool,
+    sprints_dir: &std::path::Path,
+    sprints_dir_exists: bool,
     mission_count: usize,
     sprint_count: usize,
 ) -> Vec<String> {
@@ -304,10 +307,19 @@ fn build_startup_banner(
             "  ! flows dir doesn't exist yet — will be created on first record write".to_string(),
         );
     }
-    if !crew_root_exists {
+    if !missions_dir_exists {
+        // Per-endpoint message uses the loader's dual-read-resolved dir
+        // so the path printed is the one the operator can `ls` or
+        // `mkdir` (canonical post-Beat-33 if no legacy state exists).
         lines.push(format!(
-            "  ! crew root not found at {} (missions/sprints endpoints will return empty)",
-            crew_root.display()
+            "  ! missions dir not found at {} (/missions endpoint returns empty)",
+            missions_dir.display()
+        ));
+    }
+    if !sprints_dir_exists {
+        lines.push(format!(
+            "  ! sprints dir not found at {} (/sprints endpoint returns empty)",
+            sprints_dir.display()
         ));
     }
 
@@ -333,8 +345,10 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf) -> Result<()> {
         // Banner: print after bind succeeds so we don't claim "listening"
         // before we actually are.
         let flows_dir_exists = flows_dir.exists();
-        let crew_root = crate::crew::loader::crew_root();
-        let crew_root_exists = crew_root.exists();
+        let missions_dir = crate::crew::loader::missions_dir();
+        let missions_dir_exists = missions_dir.exists();
+        let sprints_dir = crate::crew::loader::sprints_dir();
+        let sprints_dir_exists = sprints_dir.exists();
         let mission_count = crate::crew::loader::load_missions()
             .map(|v| v.len())
             .unwrap_or(0);
@@ -345,8 +359,10 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf) -> Result<()> {
             &addr,
             &flows_dir,
             flows_dir_exists,
-            &crew_root,
-            crew_root_exists,
+            &missions_dir,
+            missions_dir_exists,
+            &sprints_dir,
+            sprints_dir_exists,
             mission_count,
             sprint_count,
         ) {
@@ -2311,8 +2327,11 @@ mod tests {
     #[test]
     fn startup_banner_contains_core_info() {
         let flows = PathBuf::from("/tmp/darkmux-flows-banner-test");
-        let crew = PathBuf::from("/tmp/darkmux-crew-banner-test");
-        let lines = build_startup_banner(&sample_addr(), &flows, true, &crew, true, 3, 9);
+        let missions = PathBuf::from("/tmp/darkmux-missions-banner-test");
+        let sprints = PathBuf::from("/tmp/darkmux-sprints-banner-test");
+        let lines = build_startup_banner(
+            &sample_addr(), &flows, true, &missions, true, &sprints, true, 3, 9,
+        );
 
         // Title carries the binary version that operators bump via cargo install.
         let joined = lines.join("\n");
@@ -2331,47 +2350,80 @@ mod tests {
     #[test]
     fn startup_banner_warns_on_missing_flows_dir() {
         let flows = PathBuf::from("/tmp/darkmux-banner-missing-flows");
-        let crew = PathBuf::from("/tmp/darkmux-banner-present-crew");
-        let lines = build_startup_banner(&sample_addr(), &flows, false, &crew, true, 0, 0);
+        let missions = PathBuf::from("/tmp/darkmux-banner-present-missions");
+        let sprints = PathBuf::from("/tmp/darkmux-banner-present-sprints");
+        let lines = build_startup_banner(
+            &sample_addr(), &flows, false, &missions, true, &sprints, true, 0, 0,
+        );
         let joined = lines.join("\n");
         assert!(
             joined.contains("flows dir doesn't exist yet"),
             "expected flows-dir warning; got: {joined}"
         );
         assert!(
-            !joined.contains("crew root not found"),
-            "should not warn about crew when crew root exists"
+            !joined.contains("missions dir not found"),
+            "should not warn about missions when missions dir exists"
+        );
+        assert!(
+            !joined.contains("sprints dir not found"),
+            "should not warn about sprints when sprints dir exists"
         );
     }
 
     #[test]
-    fn startup_banner_warns_on_missing_crew_root() {
+    fn startup_banner_warns_on_missing_missions_dir() {
         let flows = PathBuf::from("/tmp/darkmux-banner-present-flows");
-        let crew = PathBuf::from("/tmp/darkmux-banner-missing-crew");
-        let lines = build_startup_banner(&sample_addr(), &flows, true, &crew, false, 0, 0);
+        let missions = PathBuf::from("/tmp/darkmux-banner-missing-missions");
+        let sprints = PathBuf::from("/tmp/darkmux-banner-present-sprints");
+        let lines = build_startup_banner(
+            &sample_addr(), &flows, true, &missions, false, &sprints, true, 0, 0,
+        );
         let joined = lines.join("\n");
         assert!(
-            joined.contains("crew root not found"),
-            "expected crew-root warning; got: {joined}"
+            joined.contains("missions dir not found"),
+            "expected missions warning; got: {joined}"
         );
         assert!(
-            joined.contains("/tmp/darkmux-banner-missing-crew"),
-            "crew-root warning should include the path"
+            joined.contains("/tmp/darkmux-banner-missing-missions"),
+            "missions warning should include the path"
         );
         assert!(
-            !joined.contains("flows dir doesn't exist yet"),
-            "should not warn about flows when flows dir exists"
+            !joined.contains("sprints dir not found"),
+            "should not warn about sprints when sprints dir exists"
+        );
+    }
+
+    #[test]
+    fn startup_banner_warns_on_missing_sprints_dir() {
+        let flows = PathBuf::from("/tmp/darkmux-banner-present-flows");
+        let missions = PathBuf::from("/tmp/darkmux-banner-present-missions");
+        let sprints = PathBuf::from("/tmp/darkmux-banner-missing-sprints");
+        let lines = build_startup_banner(
+            &sample_addr(), &flows, true, &missions, true, &sprints, false, 0, 0,
+        );
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("sprints dir not found"),
+            "expected sprints warning; got: {joined}"
+        );
+        assert!(
+            joined.contains("/tmp/darkmux-banner-missing-sprints"),
+            "sprints warning should include the path"
         );
     }
 
     #[test]
     fn startup_banner_no_warnings_when_state_is_clean() {
         let flows = PathBuf::from("/some/flows");
-        let crew = PathBuf::from("/some/crew");
-        let lines = build_startup_banner(&sample_addr(), &flows, true, &crew, true, 1, 4);
+        let missions = PathBuf::from("/some/missions");
+        let sprints = PathBuf::from("/some/sprints");
+        let lines = build_startup_banner(
+            &sample_addr(), &flows, true, &missions, true, &sprints, true, 1, 4,
+        );
         let joined = lines.join("\n");
         assert!(!joined.contains("doesn't exist yet"), "no flows warning");
-        assert!(!joined.contains("crew root not found"), "no crew warning");
+        assert!(!joined.contains("missions dir not found"), "no missions warning");
+        assert!(!joined.contains("sprints dir not found"), "no sprints warning");
     }
 
     // ─── #270 Redis aggregation tests ─────────────────────────────────
