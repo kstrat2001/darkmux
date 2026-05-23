@@ -987,10 +987,17 @@ fn build_tail_stream(
 ///
 /// Filter: emit only records whose `ts` field begins with
 /// `date_filter` (the UTC date the viewer is looking at). On Redis
-/// errors mid-stream the task backs off 500ms and retries; the
-/// consumer sees a quiet stream until Redis returns. The background
-/// task exits when the receiver is dropped (channel closes on next
-/// send). (#270 PR-B)
+/// errors mid-stream the task backs off 500ms per attempt and tracks
+/// consecutive failures. The background task exits via two paths:
+///
+/// 1. **Receiver-drop**: consumer disconnected — `tx.send` returns
+///    Err on the next attempted produce, task returns silently
+///    (channel close not separately signaled). (#270 PR-B)
+/// 2. **Persistent failure**: `MAX_CONSECUTIVE_XREAD_FAILURES`
+///    (10) consecutive XREAD errors → emit a synthetic
+///    `stream.error` flow record + return. Operator with a viewer
+///    tab open during a Redis outage sees a clean terminal event
+///    + the channel closes. (#293)
 fn redis_tail_lines(
     url: String,
     stream_name: String,
@@ -998,7 +1005,8 @@ fn redis_tail_lines(
 ) -> impl Stream<Item = String> {
     // Unbounded channel — flow records are small (~1 KB) and
     // bounded by Redis stream MAXLEN upstream. Backpressure on the
-    // SSE client side is handled by hyper, not here.
+    // SSE client side is handled by hyper, not here. (Slow-consumer
+    // mpsc-growth is tracked separately as #294.)
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
     tokio::spawn(async move {
@@ -1027,6 +1035,21 @@ fn redis_tail_lines(
             }
         };
 
+        // #293 — bounded retry budget. The XREAD loop pre-fix retried
+        // forever on any error, sleeping 500ms per attempt. On a
+        // permanent-Redis-failure scenario (Studio drops; operator
+        // left a viewer tab open) this produced "XREAD failed ...
+        // backing off 500ms" 2x/sec forever per open SSE stream;
+        // tasks leaked because the receiver-drop check at `tx.send`
+        // only fires when the task tries to PRODUCE, which never
+        // happens on a permanent failure.
+        //
+        // After MAX_CONSECUTIVE_XREAD_FAILURES, emit a synthetic
+        // stream-error record + return. The SSE consumer sees a
+        // clean terminal event and can reconnect (or surface the
+        // failure to the user); the spawned task exits.
+        let mut consecutive_failures: u32 = 0;
+
         loop {
             let url_call = url.clone();
             let stream_call = stream_name.clone();
@@ -1039,6 +1062,7 @@ fn redis_tail_lines(
             match result {
                 Ok(Ok((records, new_last_id))) => {
                     last_id = new_last_id;
+                    consecutive_failures = 0; // recovered
                     for r in records {
                         if tx.send(r).is_err() {
                             // Receiver dropped — consumer disconnected.
@@ -1047,15 +1071,39 @@ fn redis_tail_lines(
                     }
                 }
                 Ok(Err(e)) => {
+                    consecutive_failures += 1;
                     eprintln!(
-                        "darkmux serve: XREAD on {stream_name} failed ({e}); backing off 500ms"
+                        "darkmux serve: XREAD on {stream_name} failed ({e}); \
+                         backing off 500ms (attempt {consecutive_failures}/{MAX})",
+                        MAX = MAX_CONSECUTIVE_XREAD_FAILURES
                     );
+                    if consecutive_failures >= MAX_CONSECUTIVE_XREAD_FAILURES {
+                        let synthetic = synthetic_stream_error_record(
+                            &stream_name,
+                            consecutive_failures,
+                            &format!("XREAD failed: {e}"),
+                        );
+                        let _ = tx.send(synthetic);
+                        return;
+                    }
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
                 Err(e) => {
+                    consecutive_failures += 1;
                     eprintln!(
-                        "darkmux serve: XREAD blocking task join error ({e}); backing off 500ms"
+                        "darkmux serve: XREAD blocking task join error ({e}); \
+                         backing off 500ms (attempt {consecutive_failures}/{MAX})",
+                        MAX = MAX_CONSECUTIVE_XREAD_FAILURES
                     );
+                    if consecutive_failures >= MAX_CONSECUTIVE_XREAD_FAILURES {
+                        let synthetic = synthetic_stream_error_record(
+                            &stream_name,
+                            consecutive_failures,
+                            &format!("blocking task join error: {e}"),
+                        );
+                        let _ = tx.send(synthetic);
+                        return;
+                    }
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
             }
@@ -1063,6 +1111,46 @@ fn redis_tail_lines(
     });
 
     tokio_stream::wrappers::UnboundedReceiverStream::new(rx)
+}
+
+/// Max consecutive `XREAD` failures before `redis_tail_lines` emits
+/// a synthetic stream-error record and exits the spawned task (#293).
+/// 10 × 500ms backoff = ~5s total budget — operator who left a
+/// topology viewer tab open during a Studio drop sees the failure
+/// surface within seconds rather than the task leaking + log-spam
+/// forever.
+const MAX_CONSECUTIVE_XREAD_FAILURES: u32 = 10;
+
+/// Build a synthetic flow-record line representing an unrecoverable
+/// stream-error condition. Emitted by `redis_tail_lines` before exit
+/// when consecutive XREAD failures exceed the budget. The SSE
+/// consumer (topology viewer) sees this as a `data:` line with a
+/// recognizable action and can surface it to the user.
+fn synthetic_stream_error_record(stream_name: &str, attempts: u32, reason: &str) -> String {
+    // Field values MUST match the FlowRecord schema (`flow::Tier`,
+    // `Category`, `Stage`, `Level` enums) so a strict consumer
+    // (AuditFileSink path, `flow integrity-check`) deserializing
+    // the synthetic as FlowRecord doesn't reject it. `tier: "local"`
+    // because the daemon process emitting this IS a local-tier
+    // observation; `stage: "scope"` because the event is about the
+    // stream's lifecycle (not a dispatch / review / ship). Note:
+    // the topology viewer's EDGE_STYLES filter at
+    // docs/topology/index.html doesn't currently render
+    // `stage: scope` records as edges — separate follow-up to add
+    // a stream-error pill / toast in the viewer surface.
+    serde_json::json!({
+        "ts": crate::flow::ts_utc_now(),
+        "level": "warn",
+        "category": "audit",
+        "tier": "local",
+        "stage": "scope",
+        "action": "stream.error",
+        "handle": "redis_tail_lines",
+        "reasoning": format!(
+            "redis tail exited after {attempts} consecutive failures on stream `{stream_name}`: {reason}"
+        ),
+    })
+    .to_string()
 }
 
 /// Query `XINFO STREAM <stream>` for `last-generated-id`. Returns
@@ -2441,6 +2529,77 @@ mod tests {
             assert!(
                 !got.as_ref().unwrap().contains("other-date"),
                 "other-date record must be filtered: {got:?}"
+            );
+        }
+
+        /// #293 — `redis_tail_lines` against a permanently-unreachable
+        /// Redis MUST eventually emit a synthetic `stream.error` record
+        /// and exit the spawned task. Pre-fix it retried forever (log
+        /// spam + leaked spawned tasks per open SSE connection); the
+        /// receiver-drop check only fired on a successful produce,
+        /// which never happens on permanent failure.
+        ///
+        /// Contract: after MAX_CONSECUTIVE_XREAD_FAILURES (10) failures
+        /// at 500ms backoff (≈5s wall-clock), the stream sends a
+        /// synthetic record with `action: "stream.error"` and the
+        /// receiver sees the channel close on its next `.next()`
+        /// after that record.
+        ///
+        /// **Coverage caveat**: this exercises the TCP-refuses-fast
+        /// path (127.0.0.1:1). The operator's actual Studio-offline
+        /// path is structurally similar (Tailscale-routed peer,
+        /// REDIS_CONNECT_TIMEOUT=500ms per connect → also ≈10s total
+        /// budget) but takes 2× longer per iteration. Both are
+        /// bounded by the 10s test budget, but only the
+        /// refused-connect case is DIRECTLY verified here — would
+        /// need a netem/tarpit fixture for the silent-timeout case.
+        #[tokio::test]
+        async fn redis_tail_lines_exits_after_persistent_xread_failures() {
+            use futures::StreamExt;
+            // 127.0.0.1:1 — privileged port; nothing listens. TCP
+            // refuses fast → XREAD errors fast → ~10 failures × 500ms
+            // ≈ 5s before the synthetic record + exit.
+            let stream = redis_tail_lines(
+                "redis://127.0.0.1:1".to_string(),
+                "darkmux:flow".to_string(),
+                "2026-05-23".to_string(),
+            );
+            tokio::pin!(stream);
+
+            let read_synthetic = async {
+                while let Some(line) = stream.next().await {
+                    if line.contains("\"stream.error\"") {
+                        return Some(line);
+                    }
+                }
+                None
+            };
+            // Budget: MAX × 500ms backoff + slack = 10s wall.
+            let synthetic = tokio::time::timeout(Duration::from_secs(10), read_synthetic)
+                .await
+                .expect("redis_tail_lines should emit synthetic + exit within 10s");
+            assert!(
+                synthetic.is_some(),
+                "expected a stream.error synthetic record before the channel closed"
+            );
+            let line = synthetic.unwrap();
+            assert!(
+                line.contains("redis_tail_lines"),
+                "synthetic record's handle should name the source; got: {line}"
+            );
+            assert!(
+                line.contains("darkmux:flow"),
+                "synthetic record's reasoning should name the stream; got: {line}"
+            );
+
+            // The next pull should yield None (channel closed because
+            // the spawned task returned after emitting the synthetic).
+            let post = tokio::time::timeout(Duration::from_secs(2), stream.next())
+                .await
+                .expect("channel close should be observable within 2s of synthetic");
+            assert!(
+                post.is_none(),
+                "channel must close after the synthetic; got: {post:?}"
             );
         }
 
