@@ -348,19 +348,53 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::TempDir;
 
+    /// Isolates the flow-write env vars so a test runs against a clean
+    /// flows-dir AND doesn't inherit the operator's daily-shell
+    /// `DARKMUX_REDIS_URL` / `DARKMUX_AUDIT_DIR` (which would route
+    /// flow records to a possibly-unreachable Redis or to the
+    /// operator's real audit log). Pre-#278, an operator with their
+    /// daily Redis URL exported saw flow tests run 75s/record while
+    /// the connect-timeout wedged; even with the timeout fix landed,
+    /// flow records were still being shipped at an unreachable peer
+    /// and TeeSink::write returned errors that legitimately failed
+    /// the asserts. Two layers of fix: (a) flow.rs bounds the wall-
+    /// clock per write; (b) THIS guard removes the env vars at the
+    /// start of any test that uses it.
     struct FlowsDirGuard {
-        prev: Option<String>,
+        prev_flows_dir: Option<String>,
+        prev_redis_url: Option<String>,
+        prev_audit_dir: Option<String>,
         tmp: TempDir,
     }
 
     impl FlowsDirGuard {
         fn new() -> Self {
+            // Scrub the binary-wide env once (#278). The OnceLock at
+            // `flow::isolate_test_env_once` handles the common case
+            // (operator's daily-shell env var pollution). The
+            // per-instance removes below are belt-and-suspenders for
+            // a future test that might set these env vars mid-run —
+            // no current test in this module does that, but the
+            // restore-in-Drop semantics make the guard safe to
+            // extend later without re-thinking isolation.
+            crate::flow::isolate_test_env_once();
             let tmp = TempDir::new().unwrap();
-            let prev = env::var("DARKMUX_FLOWS_DIR").ok();
+            let prev_flows_dir = env::var("DARKMUX_FLOWS_DIR").ok();
+            let prev_redis_url = env::var("DARKMUX_REDIS_URL").ok();
+            let prev_audit_dir = env::var("DARKMUX_AUDIT_DIR").ok();
             // SAFETY: serialized via `#[serial_test::serial]` on every test
             // that mutates this env var.
-            unsafe { env::set_var("DARKMUX_FLOWS_DIR", tmp.path()); }
-            Self { prev, tmp }
+            unsafe {
+                env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+                env::remove_var("DARKMUX_REDIS_URL");
+                env::remove_var("DARKMUX_AUDIT_DIR");
+            }
+            Self {
+                prev_flows_dir,
+                prev_redis_url,
+                prev_audit_dir,
+                tmp,
+            }
         }
 
         fn path(&self) -> &std::path::Path {
@@ -372,9 +406,17 @@ mod tests {
         fn drop(&mut self) {
             // SAFETY: serialized via the test attribute.
             unsafe {
-                match &self.prev {
+                match &self.prev_flows_dir {
                     Some(v) => env::set_var("DARKMUX_FLOWS_DIR", v),
                     None => env::remove_var("DARKMUX_FLOWS_DIR"),
+                }
+                match &self.prev_redis_url {
+                    Some(v) => env::set_var("DARKMUX_REDIS_URL", v),
+                    None => env::remove_var("DARKMUX_REDIS_URL"),
+                }
+                match &self.prev_audit_dir {
+                    Some(v) => env::set_var("DARKMUX_AUDIT_DIR", v),
+                    None => env::remove_var("DARKMUX_AUDIT_DIR"),
                 }
             }
         }

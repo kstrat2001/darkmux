@@ -604,9 +604,15 @@ async fn flow_stream_handler(
     let redis_reachable = if let Some(url) = &redis_url {
         let probe_url = url.clone();
         tokio::task::spawn_blocking(move || {
+            // Bounded by REDIS_CONNECT_TIMEOUT (#278) — Studio-offline
+            // scenarios must not wedge the SSE-handler probe.
             redis::Client::open(probe_url.as_str())
-                .and_then(|c| c.get_connection().map(|_| ()))
-                .is_ok()
+                .ok()
+                .and_then(|c| {
+                    c.get_connection_with_timeout(crate::flow::REDIS_CONNECT_TIMEOUT)
+                        .ok()
+                })
+                .is_some()
         })
         .await
         .unwrap_or(false)
@@ -740,8 +746,10 @@ fn read_flow_records_from_redis(
     use anyhow::Context;
     let client = redis::Client::open(url)
         .with_context(|| format!("opening Redis client for /flow aggregation: {url}"))?;
+    // Bounded by REDIS_CONNECT_TIMEOUT (#278) — Studio-offline scenarios
+    // must not wedge the HTTP handler thread for the OS default 75s.
     let mut conn = client
-        .get_connection()
+        .get_connection_with_timeout(crate::flow::REDIS_CONNECT_TIMEOUT)
         .with_context(|| format!("connecting to Redis for /flow aggregation: {url}"))?;
     let stream = std::env::var("DARKMUX_REDIS_STREAM")
         .ok()
@@ -990,8 +998,9 @@ fn resolve_current_last_id(
     use anyhow::Context as _;
     let client = redis::Client::open(url)
         .with_context(|| format!("opening Redis for XINFO on {stream_name}"))?;
+    // Bounded by REDIS_CONNECT_TIMEOUT (#278).
     let mut conn = client
-        .get_connection()
+        .get_connection_with_timeout(crate::flow::REDIS_CONNECT_TIMEOUT)
         .with_context(|| format!("connecting to Redis for XINFO on {stream_name}"))?;
     let raw: redis::RedisResult<redis::Value> = redis::cmd("XINFO")
         .arg("STREAM")
@@ -1033,8 +1042,11 @@ fn xread_block_once(
     use anyhow::Context as _;
     let client = redis::Client::open(url)
         .with_context(|| format!("opening Redis for XREAD on {stream_name}"))?;
+    // Bounded by REDIS_CONNECT_TIMEOUT (#278). NOTE: the per-iteration
+    // XREAD BLOCK timeout below (500ms) is separate — that's the
+    // long-poll budget, not the connect budget.
     let mut conn = client
-        .get_connection()
+        .get_connection_with_timeout(crate::flow::REDIS_CONNECT_TIMEOUT)
         .with_context(|| format!("connecting to Redis for XREAD on {stream_name}"))?;
     let raw: redis::Value = redis::cmd("XREAD")
         .arg("BLOCK")
