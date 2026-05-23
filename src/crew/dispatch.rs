@@ -117,7 +117,7 @@ fn print_licensed_adjacent_banner(role_id: &str) {
         "at templates/builtin/roles/{role_id}.md in the darkmux source"
     );
     eprintln!(
-        "(or your override at ~/.darkmux/crew/roles/{role_id}.md if set)."
+        "(or your override at ~/.darkmux/roles/{role_id}.md if set)."
     );
     eprintln!();
     eprintln!("By acknowledging, you confirm you understand:");
