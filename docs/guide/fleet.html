@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Multi-machine fleet — darkmux user guide</title>
+<meta name="description" content="Run darkmux across a few Macs as one development environment. Tier-aware dispatch, fleet status with specs, decentralized flow UI, add-machine walkthrough.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <div class="wrap">
+    <a href="../" class="brand">darkmux</a>
+    <span class="crumbs"><a href="index.html">guide</a> <span>/</span> fleet</span>
+    <div class="links">
+      <a href="missions.html">‹ Prev</a>
+      <a href="index.html">Guide home</a>
+    </div>
+  </div>
+</nav>
+
+<header class="page-head">
+  <div class="wrap">
+    <div class="label">05 <span class="dot">·</span> multi-machine</div>
+    <h1>Many machines become one</h1>
+    <p class="lede">If you have more than one Mac on a tailnet, darkmux makes them work as a single development environment. Operator names a role; darkmux figures out which machine runs it. Open the topology viewer from any node — you see the whole fleet. This page walks through setting that up, using it, and what to expect when a machine drops off.</p>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <h2>The big picture</h2>
+    <p>darkmux's multi-machine substrate has three layers:</p>
+    <ul>
+      <li><strong>Identity</strong> — each machine declares its <em>tier</em> (<code>inference</code>, <code>hub</code>, or <code>client</code>) and a logical fleet name (<code>DARKMUX_MACHINE_ID</code>). Per-tier separation matters: dispatch routing uses it to send work to the right hardware class.</li>
+      <li><strong>Coordination</strong> — a Redis instance running on the always-on member (typically the <code>hub</code>-tier machine). Two stream classes: <code>darkmux:work:&lt;tier&gt;</code> for the work queue (publishers <code>XADD</code>; workers claim via consumer groups) and <code>darkmux:flow</code> for the fleet-wide event log (every machine writes; any daemon's <code>/flow</code> endpoint reads).</li>
+      <li><strong>Observability</strong> — the topology viewer at <a href="../topology/">darkmux.com/topology/</a> aggregates events from every machine writing to the shared stream. The <code>darkmux fleet status --deep</code> CLI does the same for per-machine specs (RAM-free, loaded models, version).</li>
+    </ul>
+    <p>Redis is <strong>optional</strong>. Without it, single-machine usage works exactly as before; flow records still land on disk per-machine via <code>LocalFileSink</code>. With it, the fleet members start seeing each other.</p>
+
+    <div class="callout warn">
+      <strong>Scope: single operator, multiple machines.</strong>
+      <p style="margin: 6px 0 0;">The trust boundary is your tailnet (Tailscale, ZeroTier, WireGuard — your call), not enforcement in darkmux's code. <code>DARKMUX_REDIS_URL</code> carries no auth beyond what your mesh VPN + Redis ACLs already provide; provenance fields are operator-asserted. This works because everyone on the substrate is you. Multi-tenant deployment is explicitly out of scope — see <a href="https://github.com/kstrat2001/darkmux/blob/main/DESIGN.md">DESIGN.md</a> for the rationale and fork-friendly invitation.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Before you start — harden your hub</h2>
+    <p>The most painful failure mode in a multi-machine darkmux deployment is the operator-default-macOS one: hub machine sleeps overnight, drops Tailscale, your other Macs' dispatch starts timing out, and you don't notice until you try to use it. That happened in the maintainer's own setup; the lesson is in the field notebook.</p>
+    <p>Before joining a Mac as your hub, walk through this checklist on it once:</p>
+    <pre><code><span class="comment"># Stop sleeping. Mac defaults assume "laptop closed = sleep"; that's wrong for a 24/7 hub.</span>
+sudo pmset -a sleep 0 disksleep 0 autorestart 1
+
+<span class="comment"># Verify the settings landed.</span>
+pmset -g
+
+<span class="comment"># Tailscale: System Settings → Tailscale → enable "Run at login" + "Always on"</span>
+<span class="comment"># Auto-login: System Settings → Users &amp; Groups → Login Options → Automatic login</span>
+<span class="comment"># Software updates: switch to "Install in background" OFF; manual install scheduled.</span></code></pre>
+    <p>The pmset config keeps the machine awake; <code>autorestart 1</code> recovers from a brief power blip. Tailscale "Run at login" + an auto-login user means: after a reboot (intentional or accidental), the machine boots straight into a logged-in session where Tailscale + your daemon services start automatically. Without that, the machine sits at the login screen with Tailscale down and your other Macs see "the hub is offline" with no remote way to recover.</p>
+    <p>The hardening matters more than the model choice. Same hardware class, same OS — different config produces different reliability. Apply it once when you set the machine up.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Set up the fleet</h2>
+
+    <h3>On the hub machine (always-on, runs Redis)</h3>
+    <p>Install Redis if you don't already have one. macOS:</p>
+    <pre><code>brew install redis
+brew services start redis</code></pre>
+    <p>Decide on a Redis URL — typically <code>redis://default:&lt;password&gt;@&lt;tailnet-addr&gt;:6379</code> where <code>&lt;tailnet-addr&gt;</code> is the hub's Tailscale IP or Magic DNS name. Set a password (<code>requirepass</code> in <code>redis.conf</code>) even on a trusted tailnet — defense-in-depth is cheap.</p>
+    <p>Then in the hub's shell rc (<code>~/.zshrc</code>):</p>
+    <pre><code><span class="comment"># darkmux fleet membership — hub tier</span>
+export DARKMUX_MACHINE_ID=studio        <span class="comment"># operator-named, not hostname</span>
+export DARKMUX_MACHINE_TIER=hub
+export DARKMUX_REDIS_URL=redis://default:&lt;password&gt;@&lt;hub-tailnet-addr&gt;:6379
+export DARKMUX_ORCHESTRATOR=claude-opus-4-7   <span class="comment"># or whichever frontier you use</span></code></pre>
+    <p>Reload your shell and verify with <code>darkmux doctor</code> — <code>machine-tier</code>, <code>machine_id</code>, and <code>flow sink health</code> should all read <code>✓</code>.</p>
+
+    <h3>On each inference / client peer</h3>
+    <p>Same shape, different tier + id:</p>
+    <pre><code>export DARKMUX_MACHINE_ID=laptop
+export DARKMUX_MACHINE_TIER=inference
+export DARKMUX_REDIS_URL=redis://default:&lt;password&gt;@&lt;hub-tailnet-addr&gt;:6379
+export DARKMUX_ORCHESTRATOR=claude-opus-4-7</code></pre>
+    <p>Same Redis URL on every peer — that's how they coordinate. Same orchestrator string per session (lets you trace which frontier drove which dispatch in flow records).</p>
+    <p>Reload + <code>darkmux doctor</code> on each peer. All checks should green.</p>
+
+    <h3>Add peers to each machine's roster</h3>
+    <p>Each machine has its own <code>~/.darkmux/fleet.json</code> roster — the list of machines IT knows about. Today this is per-machine hand-maintained (cross-machine state replication tracked in <a href="https://github.com/kstrat2001/darkmux/issues/280">#280</a>).</p>
+    <p>From the hub, register every peer:</p>
+    <pre><code>darkmux fleet add laptop --tier inference --address &lt;laptop-tailnet-addr&gt;:8765
+darkmux fleet add ipad-pi --tier client    --address &lt;ipad-tailnet-addr&gt;:8765</code></pre>
+    <p>From each peer, register the hub + any peers it should know about:</p>
+    <pre><code>darkmux fleet add studio --tier hub      --address &lt;hub-tailnet-addr&gt;:8765
+darkmux fleet add laptop --tier inference --address 127.0.0.1:8765   <span class="comment"># self</span></code></pre>
+    <p>Verify with <code>darkmux fleet status</code> on each machine — reachability probes confirm the addresses resolve and the daemon ports are open.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Add a new machine to an existing fleet</h2>
+    <p>Once the initial fleet is up, joining the next Mac is a 10-step walkthrough that lives in the <code>/darkmux-add-machine</code> Claude Code skill:</p>
+    <pre><code><span class="comment"># From your frontier orchestrator (Claude Code, etc.):</span>
+/darkmux-add-machine</code></pre>
+    <p>The skill reads your existing fleet state, asks the operator a handful of questions (which tier, what id, which Redis URL), and proposes the configuration. It then waits for you to apply each step and verifies the outcome before continuing. Read+propose throughout — every state-mutating command runs at your hand, not the skill's.</p>
+    <p>If you don't use a Claude Code orchestrator: the steps are mechanical and the same as the "Set up the fleet" section above. The skill is a convenience, not a requirement.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Use the fleet</h2>
+
+    <h3>Dispatch a role and let darkmux pick the machine</h3>
+    <p>This is the big payoff. Each role's manifest declares its tier:</p>
+    <pre><code><span class="comment"># ~/.darkmux/crew/roles/coder.json</span>
+{
+  "id": "coder",
+  "tier": "inference",
+  "description": "...",
+  "tool_palette": { ... }
+}</code></pre>
+    <p>From any machine in the fleet:</p>
+    <pre><code>darkmux crew dispatch coder --message "implement the X feature"</code></pre>
+    <p>If you're on a machine whose tier matches the role's tier, dispatch runs locally. If not, darkmux auto-routes to a fleet peer in the matching tier — publishes the work to <code>darkmux:work:&lt;role.tier&gt;</code> and lets a peer's consumer group claim it. The banner makes the decision visible:</p>
+    <pre><code>darkmux crew dispatch: auto-routing role=`coder` via tier=`inference`
+ (local tier=`hub`, no --machine — consumer group claims).</code></pre>
+    <p>If no fleet peer matches the role's tier, the command bails with an operator-actionable hint:</p>
+    <pre><code>Error: role `coder` requires tier=`inference` but no fleet peer is in
+that tier (local tier=`hub`). Either: (a) add a peer with
+`darkmux fleet add &lt;id&gt; --tier inference --address &lt;addr&gt;`, or (b)
+edit the role manifest to declare `tier: "hub"` if this work belongs
+on the local machine.</code></pre>
+    <p>Override with <code>--machine &lt;id&gt;</code> when you want to pin a specific peer (operator-sovereignty: the default is the suggestion; you can always override).</p>
+
+    <h3>See what's on every machine — <code>fleet status --deep</code></h3>
+    <pre><code>darkmux fleet status --deep</code></pre>
+    <p>Fans out across every reachable peer's <code>/machine/specs</code> endpoint and renders a table:</p>
+    <pre><code>MACHINE        TIER       ADDRESS                PROBE      RAM-FREE    OS              VERSION  MODELS
+laptop         inference  100.64.1.5:8765        ✓ 23ms     78 GB       macos aarch64   0.4.0    darkmux:qwen3.6-35b-a3b-mlx
+studio         hub        100.64.2.1:8765        ✓ 45ms     12 GB       macos aarch64   0.4.0    darkmux:qwen3-4b-instruct</code></pre>
+    <p>Bounded at 1s per peer; degraded peers render with <code>specs?</code> in the RAM-FREE column rather than failing the whole command. This is the "what's actually going on right now?" view across your fleet — the answer to "is the laptop's RAM full?" or "did the studio reboot and lose the model I had loaded?"</p>
+
+    <h3>Watch fleet activity from any machine — topology viewer</h3>
+    <p>Open <a href="../topology/">darkmux.com/topology/</a> (or the local-disk equivalent if you've installed the docs) and point its <code>daemon-base</code> at any machine running <code>darkmux serve</code>. When <code>DARKMUX_REDIS_URL</code> is set on that daemon, the viewer's <code>/flow/&lt;date&gt;</code> + <code>/flow/&lt;date&gt;/stream</code> endpoints aggregate events from every machine writing to the shared <code>darkmux:flow</code> stream — fleet-wide events, not just the host's local file.</p>
+    <p>Source-pill on the toolbar tells you the truth about the data path:</p>
+    <ul>
+      <li><strong>source: live</strong> — Redis aggregation is working; you're seeing the whole fleet</li>
+      <li><strong>source: no daemon</strong> — can't reach the daemon at <code>daemon-base</code>; check the daemon's running</li>
+      <li><strong>source: replay (&lt;fixture&gt;)</strong> — you're viewing a static fixture, not live data</li>
+    </ul>
+    <p>The viewer is a static HTML page. Nothing uploaded; all rendering happens client-side from the daemon's JSON.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>When things go wrong</h2>
+    <p>The substrate degrades gracefully — knowing the modes saves you from confused debugging.</p>
+
+    <h3>Hub machine drops off the network</h3>
+    <p>The most common failure. Other Macs' flow writes fall back to <code>LocalFileSink</code> only (records still land on disk; Redis sink errors are logged + skipped). Cross-machine dispatch bails loud with the operator-actionable hint shown above. <code>darkmux doctor</code> reports the Redis sink as unreachable.</p>
+    <p>If you've left a topology viewer tab open, the SSE Redis tail retries for a bounded budget (<code>MAX_CONSECUTIVE_XREAD_FAILURES</code>, ≈5 seconds wall-clock), then emits a synthetic <code>stream.error</code> record and exits cleanly. The viewer sees the channel close — not a forever-spinning loader.</p>
+    <p>Recovery: bring the hub back up (physical access usually required). Once Redis is reachable again, the substrate self-heals on the next operation — no manual intervention.</p>
+
+    <h3>Slow / paused viewer tab</h3>
+    <p>The SSE channel between the daemon's Redis-tail task and the SSE stream is bounded at <code>SSE_MPSC_CAPACITY</code> (256 records, ~256 KB worst-case per stream). When the consumer falls behind, the daemon drops the newest records and logs the drop with a running total. Operator-visible: viewer might miss a few recent events; reconnect or refresh to recover.</p>
+
+    <h3>"Why didn't my dispatch land where I expected?"</h3>
+    <p>Every routing decision emits a <code>dispatch route</code> flow record. Tail the flow stream or open the topology viewer; filter for <code>action: dispatch route</code>. The record's payload shows <code>role_tier</code>, <code>local_tier</code>, <code>target_machine</code>, and <code>decision</code> (<code>auto-route</code> or <code>pinned</code>) — the substrate's reasoning is in the audit chain, not hidden.</p>
+
+    <h3>Two operators on the same machine</h3>
+    <p>Out of scope. <code>DARKMUX_MACHINE_ID</code> is per-machine, not per-user. If you ever need per-user provenance on a shared Mac, darkmux has outgrown its target — fork it.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>What's not yet built</h2>
+    <p>The substrate works; some operator-experience polish is still ahead. Watch these issues if they sound relevant:</p>
+    <ul>
+      <li><a href="https://github.com/kstrat2001/darkmux/issues/280">#280</a> — cross-machine mission / sprint state replication. Today missions you create on machine A are not visible from machine B. The fix is event-sourced state on Redis; tracked as the next architectural arc.</li>
+      <li><a href="https://github.com/kstrat2001/darkmux/issues/282">#282</a> — mission priority + cross-fleet pause/resume from any node. Today's mission lifecycle verbs only affect future dispatches on the machine where they ran.</li>
+      <li><a href="https://github.com/kstrat2001/darkmux/issues/302">#302</a> — topology viewer surface for <code>stream.error</code> records. The synthetic-record substrate is in place; the viewer needs a UI element (pill or toast) to surface it explicitly.</li>
+      <li><strong>Elastic-hub failover</strong> — promote any peer to hub when the current one drops. Not yet filed; the workflow today is operator-manual.</li>
+    </ul>
+    <p>If any of these block a real workflow, comment on the issue and that work will move up the queue.</p>
+  </div>
+</section>
+
+<nav class="page-nav wrap">
+  <a href="missions.html" class="prev">
+    <span class="dir">‹ Previous</span>
+    <span class="title">Missions, sprints, crew dispatch</span>
+  </a>
+  <a href="index.html" class="next">
+    <span class="dir">Guide home ›</span>
+    <span class="title">Back to TOC</span>
+  </a>
+</nav>
+
+<footer>
+  <div class="wrap">
+    <div>
+      <a href="https://github.com/kstrat2001/darkmux">GitHub</a> ·
+      <a href="https://github.com/kstrat2001/darkmux/blob/main/DISCLAIMER.md">Disclaimer</a> ·
+      <a href="https://github.com/kstrat2001/darkmux/blob/main/LICENSE">MIT</a>
+    </div>
+    <div>
+      © Kain Osterholt · <a href="https://substack.com/@DarklyEnergized">Darkly Energized LLC</a>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>
