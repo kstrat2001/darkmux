@@ -724,21 +724,36 @@ enum ProfileCmd {
 
 #[derive(Subcommand)]
 enum NotebookCmd {
-    /// Draft a notebook entry from a recorded run via the active agent.
+    /// Draft a notebook entry from a recorded run via the active role.
     Draft {
         run_id: String,
-        /// Agent to dispatch the drafting prompt to (default: "main").
-        #[arg(long, default_value = "main")]
-        agent: String,
+        /// DM role id to dispatch the drafting prompt through (Sprint-H
+        /// rename from `--agent`; Beat 36 — DM concepts primary on
+        /// DM-side surfaces). Resolves through
+        /// `templates/builtin/roles/<role>.{json,md}` under the
+        /// internal runtime; under `--runtime openclaw` it's passed
+        /// verbatim to openclaw's `--agent <id>` flag.
+        #[arg(long, default_value = "scribe")]
+        role: String,
         /// Override the entry's filename slug (default derived from workload + run id).
         #[arg(long)]
         slug: Option<String>,
-        /// Build the prompt and target filename without dispatching the agent.
+        /// Build the prompt and target filename without dispatching the role.
         #[arg(long, short = 'n')]
         dry_run: bool,
         /// Override the machine id (overrides DARKMUX_MACHINE_ID env var).
         #[arg(long)]
         machine: Option<String>,
+        /// Which agent runtime to dispatch through. Default `internal`
+        /// is darkmux's in-house container-bounded runtime (Sprint-H
+        /// — Beat 36 finish); `openclaw` opts into the legacy
+        /// shell-out path.
+        #[arg(long, default_value = "internal")]
+        runtime: String,
+        /// Executable to invoke for the openclaw shell-out (Sprint-E
+        /// pattern). Only consulted when `--runtime openclaw`.
+        #[arg(long = "runtime-cmd", value_name = "PATH", default_value = "openclaw")]
+        runtime_cmd: String,
     },
     /// List notebook entries (parsed from entry headers).
     ///
@@ -926,17 +941,31 @@ fn cmd_notebook(sub: NotebookCmd) -> Result<i32> {
     match sub {
         NotebookCmd::Draft {
             run_id,
-            agent,
+            role,
             slug,
             dry_run,
             machine,
+            runtime,
+            runtime_cmd,
         } => {
+            let runtime_flag = crew::dispatch::Runtime::parse(&runtime)?;
+            // Sprint-E loud-bail gate: --runtime-cmd is only valid under
+            // --runtime openclaw. Silent ignore would re-introduce the
+            // implicit-state pattern Sprint-E removed.
+            if runtime_flag != crew::dispatch::Runtime::Openclaw && runtime_cmd != "openclaw" {
+                anyhow::bail!(
+                    "--runtime-cmd `{runtime_cmd}` is only valid with --runtime openclaw \
+                     (got --runtime {runtime}). Either drop --runtime-cmd, or add --runtime openclaw."
+                );
+            }
             let report = notebook::draft_entry(&notebook::DraftOptions {
                 run_id,
-                agent,
+                role,
                 slug,
                 dry_run,
                 machine_override: machine,
+                runtime: runtime_flag,
+                runtime_cmd,
             })?;
             println!("source run: {}", report.run_dir.display());
             println!("entry path: {}", report.entry_path.display());
