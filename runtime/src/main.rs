@@ -57,7 +57,11 @@ fn main() -> ExitCode {
             println!("Usage:");
             println!("  darkmux-runtime --check");
             println!("  darkmux-runtime --version");
-            println!("  darkmux-runtime run --model <id> --system <text> --prompt <text> [--no-stream]");
+            println!("  darkmux-runtime run --model <id> --system <text> --prompt <text> [--no-stream] [--json]");
+            println!();
+            println!("Flags:");
+            println!("  --json       Emit structured envelope on stdout (status to stderr).");
+            println!("               Schema: {{ result, final_assistant, metrics, trajectory_path }}");
             ExitCode::SUCCESS
         }
     }
@@ -121,6 +125,12 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // useful for deterministic benchmarks or when a runtime regression
     // is suspected to involve the streaming layer specifically.
     let mut streaming: bool = true;
+    // `--json` flips stdout to a single structured envelope at end of
+    // dispatch (Sprint-A). Default stays human-readable for direct CLI
+    // use; JSON is opt-in for consumers like the qa-review skill that
+    // need machine-parseable output. All progress/status lines go to
+    // stderr when JSON is set so stdout is clean for `jq`.
+    let mut json_mode: bool = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -163,6 +173,10 @@ fn run_dispatch(args: &[String]) -> ExitCode {
             }
             "--no-stream" => {
                 streaming = false;
+                i += 1;
+            }
+            "--json" => {
+                json_mode = true;
                 i += 1;
             }
             other => {
@@ -228,8 +242,15 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // the model would never invoke.
     let tools = [Tool::Search, Tool::Read, Tool::Edit, Tool::Write, Tool::Bash];
 
-    println!("dispatching to model: {model}");
-    println!();
+    // Status lines go to stderr in JSON mode so stdout stays clean for
+    // `jq`-style consumers. In human-readable mode they print to stdout
+    // alongside the eventual final-message block.
+    if json_mode {
+        eprintln!("dispatching to model: {model}");
+    } else {
+        println!("dispatching to model: {model}");
+        println!();
+    }
 
     // Open trajectory + metrics recorder against the mounted
     // workspace. Phase 7: gives post-dispatch visibility because the
@@ -292,16 +313,32 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         };
         let _ = traj.save_metrics(&metrics);
 
-        println!("--- final assistant message ---");
-        println!("{final_assistant}");
-        println!();
-        println!("--- metrics ---");
-        println!("turns:             {}", o.turns);
-        println!("compactions:       {}", o.compactions);
-        println!("prompt tokens:     {}", o.total_prompt_tokens);
-        println!("completion tokens: {}", o.total_completion_tokens);
-        println!("total messages:    {}", o.messages.len());
-        println!("wall:              {wall_ms}ms");
+        if json_mode {
+            let envelope = build_json_envelope(
+                result_str,
+                Some(&final_assistant),
+                &model,
+                started_at_unix_ms,
+                wall_ms,
+                o.turns,
+                o.compactions,
+                o.total_prompt_tokens,
+                o.total_completion_tokens,
+                o.messages.len(),
+            );
+            println!("{}", serde_json::to_string(&envelope).unwrap_or_else(|_| "{}".into()));
+        } else {
+            println!("--- final assistant message ---");
+            println!("{final_assistant}");
+            println!();
+            println!("--- metrics ---");
+            println!("turns:             {}", o.turns);
+            println!("compactions:       {}", o.compactions);
+            println!("prompt tokens:     {}", o.total_prompt_tokens);
+            println!("completion tokens: {}", o.total_completion_tokens);
+            println!("total messages:    {}", o.messages.len());
+            println!("wall:              {wall_ms}ms");
+        }
     } else {
         // Loop returned an error — still write a minimal metrics file
         // so the operator has a record of the failure.
@@ -321,8 +358,136 @@ fn run_dispatch(args: &[String]) -> ExitCode {
             final_assistant_preview: String::new(),
         };
         let _ = traj.save_metrics(&metrics);
+
+        if json_mode {
+            let envelope = build_json_envelope(
+                "error", None, &model, started_at_unix_ms, wall_ms,
+                0, 0, 0, 0, 0,
+            );
+            println!("{}", serde_json::to_string(&envelope).unwrap_or_else(|_| "{}".into()));
+        }
         return ExitCode::from(1);
     }
 
     ExitCode::SUCCESS
+}
+
+/// Construct the `--json` envelope. Pure function — extracted so the
+/// schema is tested independently of the dispatch shell-out (which
+/// requires LMStudio + Docker). Same shape for success + error paths so
+/// consumers (qa-review skill, lab harness adapter) parse uniformly.
+///
+/// `final_assistant = None` produces a JSON `null` for the field —
+/// error envelopes use this; success envelopes always carry a string.
+///
+/// Arg types mirror the source types in `trajectory::Metrics` +
+/// `loop_runner::Outcome` so callers don't need casts.
+#[allow(clippy::too_many_arguments)]
+fn build_json_envelope(
+    result: &str,
+    final_assistant: Option<&str>,
+    model: &str,
+    started_at_unix_ms: u64,
+    wall_ms: u128,
+    turns: u32,
+    compactions: u32,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    total_messages: usize,
+) -> serde_json::Value {
+    serde_json::json!({
+        "result": result,
+        "final_assistant": match final_assistant {
+            Some(s) => serde_json::Value::String(s.to_string()),
+            None => serde_json::Value::Null,
+        },
+        "metrics": {
+            "runtime": "darkmux-runtime",
+            "version": VERSION,
+            "model": model,
+            "started_at_unix_ms": started_at_unix_ms,
+            // u128 wall_ms is safe to narrow for JSON numeric encoding —
+            // u64 covers 584 million years of milliseconds.
+            "wall_ms": wall_ms as u64,
+            "turns": turns,
+            "compactions": compactions,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_messages": total_messages,
+        },
+        "trajectory_path": "/workspace/.darkmux-runtime/trajectory.jsonl",
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_envelope_success_carries_final_assistant_and_metrics() {
+        let env = build_json_envelope(
+            "stop",
+            Some("hello world"),
+            "darkmux:qwen3.6-35b-a3b",
+            1700000000000,
+            2135,
+            1,
+            0,
+            2970,
+            112,
+            3,
+        );
+        // Top-level contract — qa-review + lab adapter parse these.
+        assert_eq!(env["result"], "stop");
+        assert_eq!(env["final_assistant"], "hello world");
+        assert_eq!(env["trajectory_path"], "/workspace/.darkmux-runtime/trajectory.jsonl");
+        // Metrics block — mirrors trajectory::Metrics field names so the
+        // two surfaces stay aligned.
+        assert_eq!(env["metrics"]["runtime"], "darkmux-runtime");
+        assert_eq!(env["metrics"]["model"], "darkmux:qwen3.6-35b-a3b");
+        assert_eq!(env["metrics"]["wall_ms"], 2135);
+        assert_eq!(env["metrics"]["turns"], 1);
+        assert_eq!(env["metrics"]["prompt_tokens"], 2970);
+        assert_eq!(env["metrics"]["completion_tokens"], 112);
+        assert_eq!(env["metrics"]["total_messages"], 3);
+    }
+
+    #[test]
+    fn json_envelope_error_carries_null_final_assistant() {
+        // Failure path emits same envelope shape so consumers can parse
+        // uniformly without branching on success/error.
+        let env = build_json_envelope(
+            "error", None, "darkmux:foo", 1700000000000, 500, 0, 0, 0, 0, 0,
+        );
+        assert_eq!(env["result"], "error");
+        assert!(env["final_assistant"].is_null(), "error envelope must have null final_assistant");
+        assert_eq!(env["metrics"]["model"], "darkmux:foo");
+        assert_eq!(env["metrics"]["wall_ms"], 500);
+        assert_eq!(env["metrics"]["turns"], 0);
+    }
+
+    #[test]
+    fn json_envelope_serializes_as_single_line() {
+        // qa-review parses with `jq -c` — verify the serialized form is
+        // single-line + valid JSON. (No surprise whitespace, etc.)
+        let env = build_json_envelope("stop", Some("x"), "m", 0, 0, 0, 0, 0, 0, 0);
+        let s = serde_json::to_string(&env).unwrap();
+        assert!(!s.contains('\n'), "envelope must serialize on one line; got: {s}");
+        // Round-trip must produce identical structure.
+        let back: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, env);
+    }
+
+    #[test]
+    fn json_envelope_handles_final_assistant_with_special_chars() {
+        // The final assistant message can contain newlines, quotes,
+        // backslashes — serde_json must escape them so the envelope
+        // stays parseable. Regression guard for "naive println escaping"
+        // mistakes that would tempt a future refactor.
+        let tricky = "line1\nline2\twith \"quotes\" and \\backslash";
+        let env = build_json_envelope("stop", Some(tricky), "m", 0, 0, 0, 0, 0, 0, 0);
+        let s = serde_json::to_string(&env).unwrap();
+        let back: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(back["final_assistant"], tricky);
+    }
 }
