@@ -90,6 +90,7 @@ mod tests {
             _: &Path,
             _: &Profile,
             _: &str,
+            _: crate::crew::dispatch::Runtime,
         ) -> Result<RunResult> {
             Ok(RunResult {
                 ok: true,

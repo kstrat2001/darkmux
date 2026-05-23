@@ -154,10 +154,13 @@ fn lab_with_no_subcommand_reports() {
 /// approach — `cargo install --path .` produces a binary that doesn't need
 /// the source tree at runtime.
 ///
-/// We point `DARKMUX_RUNTIME_CMD` at `/usr/bin/true` so the dispatch always
-/// "succeeds" without actually hitting LMStudio. The test verifies that the
-/// surrounding plumbing (workload load → provider dispatch → manifest write
-/// → run dir creation) works end-to-end from a clean tempdir.
+/// Test passes `--runtime openclaw` because the default-internal runtime
+/// (post-Sprint-D) requires Docker + LMStudio, which CI doesn't have. The
+/// openclaw shell-out path is mockable: we point `DARKMUX_RUNTIME_CMD` at
+/// `/usr/bin/true` so the dispatch always "succeeds" without actually
+/// hitting any backend. The test verifies that the surrounding plumbing
+/// (workload load → provider dispatch → manifest write → run dir creation)
+/// works end-to-end from a clean tempdir.
 #[test]
 fn lab_run_quick_q_from_clean_cwd_uses_embedded_workload() {
     let tmp = TempDir::new().unwrap();
@@ -186,7 +189,8 @@ fn lab_run_quick_q_from_clean_cwd_uses_embedded_workload() {
 
     let mut cmd = Command::cargo_bin("darkmux").unwrap();
     // /usr/bin/true exits 0 with empty stdout — the prompt provider treats
-    // this as a successful (but empty-reply) dispatch.
+    // this as a successful (but empty-reply) dispatch under the openclaw
+    // shell-out path.
     cmd.env("DARKMUX_RUNTIME_CMD", "/usr/bin/true");
     // Force an empty templates dir so on-disk lookup doesn't accidentally
     // resolve before the embedded fallback. This proves the embedded path.
@@ -199,6 +203,11 @@ fn lab_run_quick_q_from_clean_cwd_uses_embedded_workload() {
         "lab",
         "run",
         "quick-q",
+        // Force openclaw so the DARKMUX_RUNTIME_CMD=/usr/bin/true mock
+        // applies. Internal-runtime path requires Docker + LMStudio,
+        // unavailable in CI.
+        "--runtime",
+        "openclaw",
         "--config",
         cfg.to_str().unwrap(),
         "--quiet",

@@ -192,13 +192,19 @@ fn today_utc_date() -> String {
     format!("{year:04}-{:02}-{:02}", month + 1, day + 1)
 }
 
-/// Hub-tier machine asks for an inference role, but NO inference peer
-/// is in the roster. The dispatch MUST fail loud — operator wants the
-/// operator-actionable hint pointing at `darkmux fleet add`. Today
-/// (pre-fix), this case silently dispatches locally and runs on the
-/// wrong-tier machine.
+/// Hub-tier machine asks for an inference role, but the roster has
+/// peers in OTHER tiers — none matching `inference`. The dispatch MUST
+/// fail loud with operator-actionable hint pointing at `darkmux fleet
+/// add` (the operator has a fleet but it's misconfigured).
+///
+/// Post-PR-#323 (Beat 35 graceful-degradation): an EMPTY roster falls
+/// back local with a one-line nudge — that case is for single-machine
+/// operators who haven't declared a fleet. This test specifically
+/// exercises the OTHER branch: roster has peers, just none in the
+/// required tier. That's an actionable misconfiguration the operator
+/// wants to know about.
 #[test]
-fn dispatch_bails_when_no_fleet_peer_matches_role_tier() {
+fn dispatch_bails_when_fleet_has_peers_but_none_match_role_tier() {
     if !redis_available() {
         eprintln!("skipping: redis-server not on PATH");
         return;
@@ -207,7 +213,25 @@ fn dispatch_bails_when_no_fleet_peer_matches_role_tier() {
         .expect("FleetHarness::boot");
     let studio = harness.node("studio").expect("studio");
 
-    // Role tier = inference; no inference peer in studio's roster.
+    // Populate studio's roster with a peer in a DIFFERENT tier
+    // (client). Address doesn't need to be reachable — the dispatch
+    // bail fires on roster inspection BEFORE any peer connection.
+    let add = studio
+        .cmd()
+        .args([
+            "fleet", "add", "fake-client",
+            "--tier", "client",
+            "--address", "127.0.0.1:1",
+        ])
+        .output()
+        .expect("running `darkmux fleet add fake-client`");
+    assert!(
+        add.status.success(),
+        "fleet add (setup) failed: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+
+    // Role tier = inference; roster has only client-tier peer.
     write_role(&studio.crew_root, "auto-route-coder", "inference");
 
     let out = studio
@@ -224,7 +248,7 @@ fn dispatch_bails_when_no_fleet_peer_matches_role_tier() {
 
     assert!(
         !out.status.success(),
-        "dispatch should fail when no fleet peer matches the role's tier; \
+        "dispatch should fail when fleet has peers but none in role's tier; \
          stdout={stdout}\nstderr={stderr}"
     );
     let combined = format!("{stdout}\n{stderr}");

@@ -39,9 +39,10 @@ impl WorkloadProvider for PromptProvider {
         _sandbox_dir: &Path,
         profile: &Profile,
         profile_name: &str,
+        runtime: crate::crew::dispatch::Runtime,
     ) -> Result<RunResult> {
         let prompt = resolve_prompt(loaded)?;
-        let agent = pick_agent(loaded);
+        let role = pick_role(loaded);
         let session_id = format!(
             "darkmux-prompt-{}-{}",
             loaded.manifest.workload.id,
@@ -51,27 +52,16 @@ impl WorkloadProvider for PromptProvider {
                 .unwrap_or(0)
         );
 
-        let runtime_cmd = runtime_cmd();
         let started = std::time::Instant::now();
-        let output = Command::new(&runtime_cmd)
-            .args([
-                "agent",
-                "--agent",
-                &agent,
-                "--session-id",
-                &session_id,
-                "--json",
-                "--timeout",
-                "3600",
-                "--message",
-                &prompt,
-            ])
-            .output()
-            .with_context(|| format!("running `{runtime_cmd} agent ...`"))?;
+        let (stdout, stderr, ok) = match runtime {
+            crate::crew::dispatch::Runtime::Internal => dispatch_via_internal(
+                &role, &prompt, &session_id,
+            )?,
+            crate::crew::dispatch::Runtime::Openclaw => dispatch_via_openclaw(
+                &role, &prompt, &session_id,
+            )?,
+        };
         let duration_ms = started.elapsed().as_millis();
-        let ok = output.status.success();
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
         fs::write(run_dir.join("qa-reply.json"), &stdout)?;
         if !stderr.is_empty() {
@@ -164,6 +154,58 @@ fn runtime_cmd() -> String {
     env::var("DARKMUX_RUNTIME_CMD").unwrap_or_else(|_| "openclaw".to_string())
 }
 
+/// Dispatch via darkmux's internal Docker-bounded runtime through the
+/// crew::dispatch substrate. The runtime emits a JSON envelope per
+/// `runtime/src/main.rs::build_json_envelope` which becomes the
+/// provider's stdout artifact — same as openclaw's JSON envelope, just
+/// from DM's substrate. Beat 36: no openclaw install required.
+fn dispatch_via_internal(role_id: &str, prompt: &str, session_id: &str) -> Result<(String, String, bool)> {
+    use crate::crew::dispatch::{dispatch, DispatchOpts, Runtime};
+    let opts = DispatchOpts {
+        role_id: role_id.to_string(),
+        message: prompt.to_string(),
+        deliver: None,
+        session_id: Some(session_id.to_string()),
+        timeout_seconds: 3600,
+        skip_preflight: false,
+        json: true,
+        watch_paths: Vec::new(),
+        workdir: None,
+        sprint_id: None,
+        runtime: Runtime::Internal,
+        machine: None,
+        wait: true,
+    };
+    let result = dispatch(opts).context("internal-runtime dispatch via lab harness")?;
+    Ok((result.stdout, result.stderr, result.exit_code == 0))
+}
+
+/// Dispatch via the legacy openclaw shell-out path. Reads
+/// `DARKMUX_RUNTIME_CMD` (default `openclaw`) and shells out with the
+/// `<cmd> agent --agent <role> --json ...` calling convention. Kept
+/// for operators who explicitly opt in via `--runtime openclaw`.
+fn dispatch_via_openclaw(role: &str, prompt: &str, session_id: &str) -> Result<(String, String, bool)> {
+    let runtime_cmd = runtime_cmd();
+    let output = Command::new(&runtime_cmd)
+        .args([
+            "agent",
+            "--agent",
+            role,
+            "--session-id",
+            session_id,
+            "--json",
+            "--timeout",
+            "3600",
+            "--message",
+            prompt,
+        ])
+        .output()
+        .with_context(|| format!("running `{runtime_cmd} agent ...`"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    Ok((stdout, stderr, output.status.success()))
+}
+
 fn resolve_prompt(loaded: &LoadedWorkload) -> Result<String> {
     if let Some(p) = loaded.manifest.workload.prompt.as_ref() {
         return Ok(p.clone());
@@ -179,11 +221,18 @@ fn resolve_prompt(loaded: &LoadedWorkload) -> Result<String> {
     ))
 }
 
-fn pick_agent(loaded: &LoadedWorkload) -> String {
-    if let Some(a) = loaded.manifest.workload.agent.as_deref() {
-        return a.to_string();
+/// Resolve which darkmux role to dispatch the workload through.
+///
+/// Beat 36 directional principle: workloads reference DM role manifest
+/// ids, not OC agent personas. Default falls back to `code-reviewer`
+/// (the role best-suited to single-turn QA-flavored prompt workloads).
+/// Override via the workload's `role:` field or the
+/// `DARKMUX_DEFAULT_ROLE` env var.
+fn pick_role(loaded: &LoadedWorkload) -> String {
+    if let Some(r) = loaded.manifest.workload.role.as_deref() {
+        return r.to_string();
     }
-    env::var("DARKMUX_DEFAULT_AGENT").unwrap_or_else(|_| "main".to_string())
+    env::var("DARKMUX_DEFAULT_ROLE").unwrap_or_else(|_| "code-reviewer".to_string())
 }
 
 pub(crate) fn extract_reply_text(stdout: &str) -> String {
@@ -193,6 +242,13 @@ pub(crate) fn extract_reply_text(stdout: &str) -> String {
     let Ok(parsed) = serde_json::from_str::<serde_json::Value>(stdout) else {
         return stdout.to_string();
     };
+    // darkmux internal-runtime --json envelope (Beat 36 / Sprint-A):
+    // `{"final_assistant": "...", "result": "stop", ...}`.
+    if let Some(final_assistant) = parsed.get("final_assistant").and_then(|v| v.as_str()) {
+        return final_assistant.to_string();
+    }
+    // openclaw --json envelope (legacy path; `--runtime openclaw`):
+    // `{"result": {"payloads": [{"text": "..."}], ...}}`.
     if let Some(payloads) = parsed.get("result").and_then(|r| r.get("payloads")).and_then(|p| p.as_array()) {
         let parts: Vec<String> = payloads
             .iter()
@@ -288,7 +344,7 @@ mod tests {
             id: "t".into(),
             provider: "prompt".into(),
             description: None,
-            agent: None,
+            role: None,
             prompt: Some(prompt.into()),
             prompt_file: None,
             sandbox_seed: None,
@@ -335,26 +391,48 @@ mod tests {
     }
 
     #[test]
-    fn pick_agent_from_manifest() {
+    fn pick_role_from_manifest() {
         let tmp = TempDir::new().unwrap();
         let mut spec = spec_with_prompt("x");
-        spec.agent = Some("legal".into());
+        spec.role = Some("analyst".into());
         let loaded = make_loaded(spec, tmp.path().to_path_buf());
-        assert_eq!(pick_agent(&loaded), "legal");
+        assert_eq!(pick_role(&loaded), "analyst");
     }
 
     #[test]
-    fn pick_agent_default_main() {
+    fn pick_role_default_code_reviewer() {
         let tmp = TempDir::new().unwrap();
         let loaded = make_loaded(spec_with_prompt("x"), tmp.path().to_path_buf());
-        unsafe { env::remove_var("DARKMUX_DEFAULT_AGENT") };
-        assert_eq!(pick_agent(&loaded), "main");
+        unsafe { env::remove_var("DARKMUX_DEFAULT_ROLE") };
+        assert_eq!(pick_role(&loaded), "code-reviewer");
     }
 
     #[test]
     fn extract_reply_handles_payloads_array() {
         let json = r#"{"result":{"payloads":[{"text":"hello"},{"text":"world"}]}}"#;
         assert_eq!(extract_reply_text(json), "hello\n\nworld");
+    }
+
+    #[test]
+    fn extract_reply_handles_internal_runtime_envelope() {
+        // Sprint-A's darkmux-runtime --json envelope. Beat 36: this
+        // branch should be checked FIRST in extract_reply_text so the
+        // DM-first parsing wins over the openclaw fallback chain.
+        let json = r#"{"result":"stop","final_assistant":"hello from internal runtime","metrics":{"wall_ms":2135}}"#;
+        assert_eq!(extract_reply_text(json), "hello from internal runtime");
+    }
+
+    #[test]
+    fn extract_reply_prefers_internal_envelope_over_openclaw_when_both_present() {
+        // Defensive: if a future envelope contains BOTH shapes (e.g.
+        // a translation layer that wraps openclaw output in the DM
+        // envelope), Beat 36 says DM concept wins — we read
+        // final_assistant first.
+        let json = r#"{
+            "final_assistant": "from DM envelope",
+            "result": {"payloads": [{"text": "from OC envelope"}]}
+        }"#;
+        assert_eq!(extract_reply_text(json), "from DM envelope");
     }
 
     #[test]
