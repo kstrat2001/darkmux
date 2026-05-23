@@ -78,12 +78,9 @@ fn local_only_cors() -> tower_http::cors::CorsLayer {
     use axum::http::{HeaderValue, Method};
     use tower_http::cors::AllowOrigin;
 
-    let extra_origins: Vec<String> = std::env::var("DARKMUX_DAEMON_CORS_ORIGINS")
-        .unwrap_or_default()
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let extra_origins = parse_cors_origins(
+        &std::env::var("DARKMUX_DAEMON_CORS_ORIGINS").unwrap_or_default(),
+    );
 
     tower_http::cors::CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(
@@ -92,10 +89,87 @@ fn local_only_cors() -> tower_http::cors::CorsLayer {
                 if s == "null" {
                     return true;
                 }
-                extra_origins.iter().any(|allowed| allowed == s)
+                // Normalize the incoming Origin so trailing-slash /
+                // uppercase mismatches between what the browser sends
+                // and what the operator typed in their env var don't
+                // silently deny. Browsers DO emit canonical Origin
+                // (lowercase scheme+host, no trailing slash) but
+                // belt-and-suspenders: normalize both sides.
+                let normalized_incoming = normalize_cors_origin(s);
+                extra_origins
+                    .iter()
+                    .any(|allowed| allowed == &normalized_incoming)
             },
         ))
         .allow_methods([Method::GET])
+}
+
+/// Parse `DARKMUX_DAEMON_CORS_ORIGINS` env value into a normalized
+/// allowlist (#288). Each entry is trimmed, normalized via
+/// `normalize_cors_origin` (lowercase scheme + host, strip trailing
+/// slash), and filtered for emptiness.
+///
+/// **What's rejected**: only the literal `*` (with a stderr warning
+/// pointing operators at a real fix). Other wildcard-shaped patterns
+/// (`**`, `https://*.example.com`) and oddities (`null`) are kept
+/// as-is + normalized; they pass through as exact-match strings.
+/// Subdomain-wildcard patterns silently never match anything (no
+/// browser sends `*.example.com` as Origin). `null` is the one
+/// special case the predicate ALREADY allows unconditionally (it's
+/// the file:// origin); adding it to the env list is harmless-but-
+/// redundant.
+///
+/// Shared by `local_only_cors` (predicate construction) and
+/// `build_startup_banner` (operator-visible allowlist report).
+pub(crate) fn parse_cors_origins(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|entry| {
+            if entry == "*" {
+                eprintln!(
+                    "darkmux serve: DARKMUX_DAEMON_CORS_ORIGINS contains `*` — \
+                     CORS does not wildcard via a literal `*` Origin header value; \
+                     this entry is being ignored. Use specific origins like \
+                     `http://localhost:5173` instead."
+                );
+                return None;
+            }
+            Some(normalize_cors_origin(entry))
+        })
+        .collect()
+}
+
+/// Normalize a CORS origin string: lowercase the scheme + host (RFC
+/// 6454 origins are case-insensitive for scheme + host), strip any
+/// trailing slash (browsers don't send one; operator's env value
+/// might). Path / query / fragment have no meaning in an Origin
+/// header — caller has already filtered the input to the env-var
+/// shape, not a full URL. (#288)
+///
+/// **Constraints (operator-side input contract):**
+/// - RFC 6454 origins are `scheme + host + optional port` only. No
+///   userinfo / path / query / fragment. An entry containing those
+///   IS operator error — the function does NOT special-case them;
+///   userinfo will be destructively lowercased (e.g.
+///   `http://User:Pass@host` → `http://user:pass@host`) which is
+///   harmless for case-insensitive fields and meaningless for an
+///   Origin header that should not have userinfo.
+/// - Default-port equivalence is NOT collapsed. `http://localhost`
+///   and `http://localhost:80` are spec-equivalent but kept distinct
+///   here — operators using non-dev ports must type the port
+///   consistently on both sides of the env / browser. Dev servers
+///   (Vite 5173, Next 3000, etc.) never hit this edge.
+pub(crate) fn normalize_cors_origin(s: &str) -> String {
+    let trimmed = s.trim().trim_end_matches('/');
+    // Lowercase the scheme + authority. Origins don't have paths in
+    // the proper sense; if the operator typed `http://Foo:5173`, this
+    // produces `http://foo:5173`. Conservative split-on-`://` so a
+    // malformed entry without scheme isn't mangled.
+    match trimmed.split_once("://") {
+        Some((scheme, rest)) => format!("{}://{}", scheme.to_lowercase(), rest.to_lowercase()),
+        None => trimmed.to_lowercase(),
+    }
 }
 
 /// Default address the local `darkmux serve` daemon binds to. Used by
@@ -203,20 +277,24 @@ fn build_startup_banner(
     // CORS allowlist surface (#273) — operators with a localhost dev
     // server origin need to opt in via DARKMUX_DAEMON_CORS_ORIGINS;
     // surface the resolved state so failure-to-connect is debuggable.
-    let cors_extras = std::env::var("DARKMUX_DAEMON_CORS_ORIGINS").unwrap_or_default();
-    let extra_list: Vec<&str> = cors_extras
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
+    // Routed through `parse_cors_origins` (#288) so the banner shows
+    // the same normalized form the predicate uses — operators who type
+    // `http://Foo:5173/` see `http://foo:5173` in the banner and can
+    // verify the normalization landed.
+    let extra_list = parse_cors_origins(
+        &std::env::var("DARKMUX_DAEMON_CORS_ORIGINS").unwrap_or_default(),
+    );
     if extra_list.is_empty() {
         lines.push(
             "  cors allowlist: null (file://) only — set DARKMUX_DAEMON_CORS_ORIGINS to opt in"
                 .to_string(),
         );
     } else {
+        // Put the normalization hint on the populated branch where it
+        // matters — operators who SEE entries are the ones who might
+        // wonder why their typed env value looks different here.
         lines.push(format!(
-            "  cors allowlist: null (file://) + {}",
+            "  cors allowlist: null (file://) + {} (exact-match, normalized lowercase + no trailing slash)",
             extra_list.join(", ")
         ));
     }
@@ -1541,6 +1619,166 @@ mod tests {
             response.headers().contains_key("access-control-allow-origin"),
             "origin in DARKMUX_DAEMON_CORS_ORIGINS must receive CORS headers (#273)"
         );
+    }
+
+    // ─── #288 normalize trailing-slash + case + reject wildcard ─────────
+
+    /// Operator types `http://localhost:5173/` (trailing slash, what
+    /// you copy out of a browser address bar) → must allow the
+    /// browser's actual Origin `http://localhost:5173` (no trailing
+    /// slash). Pre-#288 this was a silent deny.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cors_env_normalizes_trailing_slash_in_origin() {
+        unsafe {
+            std::env::set_var(
+                "DARKMUX_DAEMON_CORS_ORIGINS",
+                "http://localhost:5173/", // trailing slash
+            );
+        }
+        let app = build_router(PathBuf::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header("Origin", "http://localhost:5173") // no slash
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        unsafe { std::env::remove_var("DARKMUX_DAEMON_CORS_ORIGINS"); }
+
+        assert!(
+            response.headers().contains_key("access-control-allow-origin"),
+            "trailing slash in env entry should still allow the canonical Origin (#288)"
+        );
+    }
+
+    /// Operator types `HTTP://Localhost:5173` (uppercase scheme+host)
+    /// → must allow the browser's lowercase Origin. Pre-#288 silent
+    /// deny.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cors_env_normalizes_uppercase_scheme_and_host() {
+        unsafe {
+            std::env::set_var(
+                "DARKMUX_DAEMON_CORS_ORIGINS",
+                "HTTP://Localhost:5173",
+            );
+        }
+        let app = build_router(PathBuf::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header("Origin", "http://localhost:5173")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        unsafe { std::env::remove_var("DARKMUX_DAEMON_CORS_ORIGINS"); }
+
+        assert!(
+            response.headers().contains_key("access-control-allow-origin"),
+            "uppercase scheme+host in env entry should still allow the canonical Origin (#288)"
+        );
+    }
+
+    /// Literal `*` in the env value is non-functional (browsers don't
+    /// send `*` as Origin) — the parser MUST reject it with a stderr
+    /// warning so operators who paste a wildcard don't think it works.
+    /// The end-to-end behavior: a request with arbitrary external
+    /// Origin must still be denied.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cors_env_rejects_literal_wildcard() {
+        unsafe { std::env::set_var("DARKMUX_DAEMON_CORS_ORIGINS", "*"); }
+        let app = build_router(PathBuf::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header("Origin", "https://malicious.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        unsafe { std::env::remove_var("DARKMUX_DAEMON_CORS_ORIGINS"); }
+
+        assert!(
+            !response.headers().contains_key("access-control-allow-origin"),
+            "literal `*` in env must NOT wildcard-allow arbitrary origins (#288)"
+        );
+    }
+
+    // ─── parse_cors_origins / normalize_cors_origin unit tests ──────────
+
+    #[test]
+    fn normalize_cors_origin_strips_trailing_slash() {
+        assert_eq!(
+            normalize_cors_origin("http://localhost:5173/"),
+            "http://localhost:5173"
+        );
+        assert_eq!(
+            normalize_cors_origin("http://localhost:5173"),
+            "http://localhost:5173"
+        );
+    }
+
+    #[test]
+    fn normalize_cors_origin_lowercases_scheme_and_host() {
+        assert_eq!(
+            normalize_cors_origin("HTTP://Localhost:5173"),
+            "http://localhost:5173"
+        );
+        assert_eq!(
+            normalize_cors_origin("HTTPS://Example.COM"),
+            "https://example.com"
+        );
+    }
+
+    /// Realistic operator paste-from-browser-bar shape: both case +
+    /// trailing slash. Each transform tested independently above;
+    /// this guards the combined case (which is what operators
+    /// actually paste).
+    #[test]
+    fn normalize_cors_origin_handles_uppercase_and_trailing_slash_together() {
+        assert_eq!(
+            normalize_cors_origin("HTTP://Localhost:5173/"),
+            "http://localhost:5173"
+        );
+    }
+
+    #[test]
+    fn normalize_cors_origin_handles_no_scheme() {
+        // Edge case: operator types just `localhost:5173` without scheme.
+        // Defensible: lowercase as a string.
+        assert_eq!(normalize_cors_origin("Localhost:5173"), "localhost:5173");
+    }
+
+    #[test]
+    fn parse_cors_origins_filters_empty_and_normalizes() {
+        let result = parse_cors_origins("HTTP://Localhost:5173/,, http://other:3000 ,");
+        assert_eq!(result.len(), 2);
+        assert!(result.contains(&"http://localhost:5173".to_string()));
+        assert!(result.contains(&"http://other:3000".to_string()));
+    }
+
+    #[test]
+    fn parse_cors_origins_rejects_literal_wildcard() {
+        let result = parse_cors_origins("*,http://localhost:5173");
+        assert_eq!(result, vec!["http://localhost:5173".to_string()]);
+        // Wildcard entry filtered; non-wildcard entry preserved + normalized.
+    }
+
+    #[test]
+    fn parse_cors_origins_empty_returns_empty_vec() {
+        assert!(parse_cors_origins("").is_empty());
+        assert!(parse_cors_origins("   ").is_empty());
+        assert!(parse_cors_origins(",,,").is_empty());
     }
 
     /// Negative side of the env-override: a localhost port NOT in the
