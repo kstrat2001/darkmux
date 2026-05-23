@@ -1822,8 +1822,13 @@ mod tests {
         assert!(!json.contains("published_by_orchestrator"), "None published_by_orchestrator must be omitted: {json}");
     }
 
+    /// Default runtime is `Internal` as of the runtime-default flip
+    /// (in-house container-bounded Rust runtime is darkmux's default;
+    /// openclaw shell-out stays as `--runtime openclaw` opt-in).
+    /// A WorkJob with no `runtime` field serializes/deserializes
+    /// against the Runtime enum's `#[default]` annotation.
     #[test]
-    fn work_job_default_runtime_is_openclaw() {
+    fn work_job_default_runtime_is_internal() {
         let json = r#"{
             "target_tier": "any",
             "role_id": "scribe",
@@ -1834,7 +1839,7 @@ mod tests {
             "attempt": 1
         }"#;
         let parsed: WorkJob = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed.runtime, crate::crew::dispatch::Runtime::Openclaw);
+        assert_eq!(parsed.runtime, crate::crew::dispatch::Runtime::Internal);
     }
 
     /// Wave-E.14: lifting `runtime` from String to enum moves the

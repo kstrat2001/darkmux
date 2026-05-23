@@ -316,12 +316,14 @@ enum CrewCmd {
         #[arg(long, hide = true)]
         skip_preflight: bool,
         /// Which agent runtime to dispatch through. The default
-        /// `openclaw` path is the shipped production runtime; `internal`
-        /// opts into the in-house container-bounded runtime at
-        /// `runtime/` which runs the agent in an Alpine docker
-        /// container with workspace-rooted path enforcement.
-        /// See `runtime/README.md` for current scope + limitations.
-        #[arg(long, default_value = "openclaw")]
+        /// `internal` path is darkmux's in-house container-bounded
+        /// Rust runtime at `runtime/` (Alpine docker container with
+        /// kernel-enforced workspace path isolation). `openclaw`
+        /// opts into the legacy shell-out path — available for
+        /// operators who already use openclaw or want the runtime
+        /// the article-series numbers were measured against. See
+        /// `runtime/README.md` for the internal runtime's scope.
+        #[arg(long, default_value = "internal")]
         runtime: String,
         /// Target machine for the dispatch (#246 PR-C.3). When set to
         /// an id that's NOT the local `DARKMUX_MACHINE_ID`, the

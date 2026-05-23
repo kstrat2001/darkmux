@@ -213,20 +213,23 @@ fn require_licensed_adjacent_ack(role_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Which agent runtime services a dispatch. The default is the
-/// production path that's shipped since v0.1 — openclaw shell-out
-/// via `~/.openclaw/agents/darkmux-<role>/` workspaces.
+/// Which agent runtime services a dispatch. `Internal` is the default
+/// as of the runtime-default flip: darkmux's in-house container-
+/// bounded Rust runtime (see `runtime/` and `dispatch_internal.rs`).
+/// Kernel-enforced workspace isolation via Docker; no external runtime
+/// binary to install, no separate config to maintain.
 ///
-/// `Internal` is the in-house container-bounded path (see `runtime/`
-/// and `dispatch_internal.rs`). Behind the `--runtime internal` flag
-/// while the in-house runtime is being measured against openclaw;
-/// promotion to default is a separate hardening decision.
+/// `Openclaw` is the legacy shell-out path that's shipped since v0.1.
+/// Available via the explicit `--runtime openclaw` flag for operators
+/// who already use openclaw, want the runtime the article-series
+/// numbers were measured against, or need workspace-permissive
+/// behavior the container doesn't allow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Runtime {
     #[default]
-    Openclaw,
     Internal,
+    Openclaw,
 }
 
 impl Runtime {
@@ -296,7 +299,7 @@ pub struct DispatchOpts {
     /// awareness, no output persistence. Backwards-compatible default.
     pub sprint_id: Option<String>,
     /// Which agent runtime to dispatch through. See [`Runtime`].
-    /// Default: `Runtime::Openclaw` (the shipped path).
+    /// Default: `Runtime::Internal` (the in-house container-bounded path).
     pub runtime: Runtime,
     /// Target machine for the dispatch (#246 PR-C.3). When `Some(<id>)`
     /// and `<id>` differs from the local `DARKMUX_MACHINE_ID`, the
