@@ -1,15 +1,13 @@
 ---
 name: darkmux-qa-review
-description: Dispatch the darkmux `code-reviewer` crew member against the current branch's diff via `darkmux crew dispatch --runtime openclaw`. Pre-flight-verifies the openclaw agent matches the role manifest before invoking. Findings return inline.
+description: Dispatch the darkmux `code-reviewer` role against the current branch's diff via `darkmux crew dispatch --json`. Uses the default internal runtime; findings return inline.
 user_invocable: true
-allowed-tools: "Bash(darkmux:*),Bash(git:*),Bash(openclaw:*),Bash(jq:*),Bash(plutil:*)"
+allowed-tools: "Bash(darkmux:*),Bash(git:*),Bash(jq:*)"
 ---
 
 # Darkmux QA review
 
-Dispatches the **darkmux/code-reviewer** agent against the current branch's diff via `darkmux crew dispatch --runtime openclaw`. The dispatch path uses the role manifest at `templates/builtin/roles/code-reviewer.json` + the bundled `.md` system prompt, with pre-flight checks that verify the openclaw agent registry matches the manifest before running. Operator-sovereignty: drift in the openclaw config (stale system prompt, wrong tool palette) bails before launching, with a clear `darkmux crew sync` repair pointer.
-
-> **Why openclaw, not the default internal runtime?** This skill currently parses openclaw's JSON envelope (`.result.meta.finalAssistantVisibleText` / `.result.payloads[]`) to extract the reviewer's reply. The internal runtime emits a different plain-text envelope (`--- final assistant message ---` separator). Until the skill is updated to handle both, it pins `--runtime openclaw` explicitly. Tracked as a follow-up.
+Dispatches the **code-reviewer** role against the current branch's diff via `darkmux crew dispatch` (default internal runtime, container-bounded). The dispatch reads the role manifest at `templates/builtin/roles/code-reviewer.json` + the bundled `.md` system prompt, runs in a fresh per-dispatch Docker container, and returns a structured JSON envelope via `--json`.
 
 ## Step 1 — Determine review scope
 
@@ -38,24 +36,14 @@ echo "$CHANGES"
 
 If empty, stop and report "no reviewable changes."
 
-## Step 2 — Verify dispatch is ready
-
-Before sending, run a fast pre-flight via `darkmux crew dispatch ... --skip-preflight` is NOT used; the real `dispatch` invocation runs the pre-flight automatically and bails loud on drift. But you can verify ahead of time:
-
-```bash
-darkmux crew sync --dry-run
-```
-
-If output shows `would add` or `would update` for `darkmux/code-reviewer`, run `darkmux crew sync` first to bring the openclaw agent registry in line with the manifest — otherwise the dispatch will bail with a "drift" message and the repair pointer.
-
-## Step 3 — Dispatch the review
+## Step 2 — Dispatch the review
 
 ```bash
 DIFF=$(git diff "$MERGE_BASE" HEAD 2>/dev/null | head -300)
 RUN_ID="darkmux-qa-review-$(date +%s)-$$"
 
-darkmux crew dispatch code-reviewer \
-  --runtime openclaw \
+OUTPUT=$(darkmux crew dispatch code-reviewer \
+  --json \
   --session-id "$RUN_ID" \
   --timeout 600 \
   --message "QA review request.
@@ -71,19 +59,33 @@ Diff (truncated to 300 lines):
 $DIFF
 \`\`\`
 
-Provide concise, actionable findings (3–7 bullets max). For each finding, classify as **MUST FIX** (security/correctness — blocks merge) or **CONSIDER** (style/clarity/follow-up). Avoid the framing 'acceptable but worth documenting' — if the behavior is acceptable, MUST it be documented? If yes, the docs are MUST FIX. If no, drop the finding. Trace through inputs at each finding so the reasoning is visible. Start your reply with **\"code-reviewer review for $REPO/$BRANCH:\"** so the speaker is clear."
+Provide concise, actionable findings (3–7 bullets max). For each finding, classify as **MUST FIX** (security/correctness — blocks merge) or **CONSIDER** (style/clarity/follow-up). Avoid the framing 'acceptable but worth documenting' — if the behavior is acceptable, MUST it be documented? If yes, the docs are MUST FIX. If no, drop the finding. Trace through inputs at each finding so the reasoning is visible. Start your reply with **\"code-reviewer review for $REPO/$BRANCH:\"** so the speaker is clear.")
 ```
 
-The dispatch's stdout is openclaw's JSON envelope. The final reply is at `.result.meta.finalAssistantVisibleText` (or `.result.payloads[].text` joined). Parse with:
+## Step 3 — Parse the JSON envelope
+
+With `--json`, the dispatch's stdout is a single-line structured envelope per the darkmux-runtime contract:
+
+```json
+{
+  "result": "stop" | "error",
+  "final_assistant": "...",
+  "metrics": { "model": "...", "wall_ms": 2135, "turns": 1, ... },
+  "trajectory_path": "/workspace/.darkmux-runtime/trajectory.jsonl"
+}
+```
+
+Extract the reply text:
 
 ```bash
-REPLY=$(echo "$OUTPUT" | jq -r '
-  (if .result and .result.meta and .result.meta.finalAssistantVisibleText
-     then .result.meta.finalAssistantVisibleText
-     elif .result and .result.payloads
-     then (.result.payloads | map(.text // empty) | map(select(length > 0)) | join("\n\n"))
-     else .reply // empty
-   end)')
+REPLY=$(echo "$OUTPUT" | jq -r '.final_assistant // empty')
+RESULT=$(echo "$OUTPUT" | jq -r '.result // "unknown"')
+
+if [ "$RESULT" != "stop" ] || [ -z "$REPLY" ]; then
+  echo "dispatch did not complete cleanly (result=$RESULT)"
+  echo "$OUTPUT" | jq '.'
+  exit 1
+fi
 ```
 
 ## Step 4 — Hand off
@@ -94,6 +96,6 @@ Show the user the reply. Ask: "Want to address any of these findings, or move on
 
 - **No Discord delivery by default.** Unlike the FH `qa-review` skill (which posts to `#finhero-qa`), the darkmux variant returns findings inline only. If you want Discord delivery, add `--deliver discord:<channel-id>` to the dispatch command.
 - **No multi-auditor dispatch.** Darkmux currently only ships a `code-reviewer` role. `devops` and `legal` roles are not yet in the schema — they'd be added when the team is staffed for those concerns.
-- **Pre-flight is automatic** (under `--runtime openclaw`). If the openclaw agent's system prompt or tool palette has drifted from the manifest, the dispatch bails before sending. Run `darkmux crew sync` to reconcile.
-- **This skill pins `--runtime openclaw`** because its reply parser is openclaw-envelope-specific. The default `darkmux crew dispatch` (no `--runtime` flag) goes through darkmux's internal Docker-bounded runtime, which emits a different envelope.
+- **Out-of-the-box runtime is internal (Docker container).** This skill uses darkmux's in-house container-bounded runtime — no openclaw install needed. Operators who prefer openclaw can opt in via `--runtime openclaw`, but the parser below assumes the `--json` envelope shape that the internal runtime emits.
+- **No `crew sync` step needed.** The internal runtime reads role manifests directly each dispatch — no agent-registry reconciliation required.
 - **Why this skill instead of `qa-review`:** the FH skill is scoped to FinHero-era infrastructure (Discord channel, qa/devops/legal openclaw agents). This darkmux variant routes through the namespace-managed agent and respects the operator-sovereignty contract.

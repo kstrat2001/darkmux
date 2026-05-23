@@ -181,6 +181,9 @@ fn dispatch_compiler(input: &str, hint: Option<&str>) -> Result<String> {
         session_id: None,
         timeout_seconds: 600,
         skip_preflight: false,
+        // mission-compiler parses its compiled output from the dispatch's
+        // human-readable stdout — no JSON envelope needed.
+        json: false,
         watch_paths: Vec::new(),
         // mission-compiler reads stdin-piped intent; no scope override.
         workdir: None,

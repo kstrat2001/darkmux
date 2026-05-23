@@ -315,6 +315,13 @@ enum CrewCmd {
         /// Skip the pre-flight checks. Use only for debugging.
         #[arg(long, hide = true)]
         skip_preflight: bool,
+        /// Emit the runtime's response as a machine-parseable JSON
+        /// envelope on stdout, with status lines routed to stderr.
+        /// Schema: `{ result, final_assistant, metrics, trajectory_path }`.
+        /// Today only the internal runtime honors this flag; the
+        /// openclaw path emits its own JSON envelope regardless.
+        #[arg(long)]
+        json: bool,
         /// Which agent runtime to dispatch through. The default
         /// `internal` path is darkmux's in-house container-bounded
         /// Rust runtime at `runtime/` (Alpine docker container with
@@ -1875,7 +1882,7 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
     match sub {
         CrewCmd::List => crew::cli::crew_list(),
         CrewCmd::Show { id } => crew::cli::crew_show(&id),
-        CrewCmd::Dispatch { role, message, deliver, session_id, timeout, watch, workdir, sprint_id, skip_preflight, runtime, machine, no_wait } => {
+        CrewCmd::Dispatch { role, message, deliver, session_id, timeout, watch, workdir, sprint_id, skip_preflight, json, runtime, machine, no_wait } => {
             // CLI default: if the operator didn't supply --watch, watch the
             // role's openclaw workspace dir. Library callers (e.g.
             // sprint_cli) pass an empty Vec directly to opt out.
@@ -1895,6 +1902,7 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
                 session_id,
                 timeout_seconds: timeout,
                 skip_preflight,
+                json,
                 watch_paths,
                 workdir,
                 sprint_id,

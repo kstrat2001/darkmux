@@ -797,6 +797,9 @@ pub(crate) fn sprint_review_at(
         session_id: Some(session_id.clone()),
         timeout_seconds: 600,
         skip_preflight: false,
+        // Sprint review parses the SIGNOFF text from the dispatch's
+        // human-readable stdout — no JSON envelope needed.
+        json: false,
         // Sprint review doesn't ask the reviewer to write files — it
         // parses the SIGNOFF text from the dispatch's stdout. Skip the
         // watched-state echo to keep sprint review output focused.
