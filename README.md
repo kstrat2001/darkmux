@@ -41,6 +41,21 @@ Hobbyists building local-AI workflows on their own Macs. Individual engineers wh
 
 Not *designed* as team tooling or a multi-tenant platform. The technical surface (no auth on `DARKMUX_REDIS_URL` beyond what your mesh VPN already provides, operator-asserted provenance fields, cross-machine state on a shared substrate) assumes everyone reachable on the substrate is you. If team scope is interesting to you, the substrate is a reasonable starting point — fork it, layer in auth where you need it, and the project's design will likely benefit from the lessons. Bigger orgs have their own infrastructure for the multi-tenant problem and darkmux stays focused on the one-operator-many-Macs case; that's not a fence, it's a focus.
 
+## Many machines become one
+
+If you have more than one Mac, darkmux makes them work as a single development environment. Operator names a role; darkmux figures out which machine runs it. Open the topology viewer from any node — you see the whole fleet. Open the fleet status from any node — you see specs, RAM, loaded models per machine.
+
+Concretely, the capabilities the multi-machine substrate ships today:
+
+- **Tier-aware dispatch routing.** Declare each machine's tier (`inference` / `hub` / `client`) once in `DARKMUX_MACHINE_TIER`. Tag each role's manifest with the tier it belongs on. `darkmux crew dispatch coder` from a hub-tier machine auto-routes to an inference-tier peer; consumer-group claim decides which one (#247).
+- **Fleet status with specs.** `darkmux fleet status --deep` fans out across every reachable peer's `/machine/specs` endpoint — RAM-free, loaded models, OS, darkmux version, redacted Redis URL — in one table (#275).
+- **Decentralized flow UI.** The topology viewer at `docs/topology/index.html` aggregates events from every machine writing to the shared `darkmux:flow` Redis stream. Open it on any peer running the daemon and see the fleet, not just the host machine (#270).
+- **`/darkmux-add-machine` skill.** Walkthrough for joining a new Mac to an existing fleet — env vars, roster setup, smoke test. Run `darkmux init` to install all skills locally (#176).
+
+Deployment shape that this assumes: a couple of Macs on a tailnet you control (Tailscale, ZeroTier, WireGuard — your call), with Redis running on the always-on member (typically `hub` tier). Redis is optional; without it, single-machine usage works fine and `LocalFileSink` captures provenance on disk per-machine.
+
+If your hub machine drops off the network, the substrate degrades gracefully — flow writes fall back to `LocalFileSink`, dispatch bails loud with operator-actionable hints, `darkmux doctor` surfaces the degraded state, and the SSE Redis tail exits cleanly after a bounded number of failures rather than leaking spawned tasks. The verification discipline that matters here is "make sure your hub is hardened for the absences you plan" — `pmset` config + Tailscale "Run at login" + auto-login user. macOS defaults assume "laptop closed = sleep"; they're wrong for a 24/7 hub.
+
 ## Quick start
 
 ### Prerequisites
