@@ -49,8 +49,8 @@
 <section>
   <div class="wrap">
     <h2>Prerequisites for lab</h2>
-    <p>Lab requires an agent runtime to dispatch against. Default is OpenClaw via the <code>openclaw agent</code> command. Override with <code>DARKMUX_RUNTIME_CMD=&lt;your-runtime&gt;</code> if you're using something else.</p>
-    <p>If you don't have a runtime installed, the <code>swap</code> / <code>status</code> / <code>profiles</code> / <code>doctor</code> verbs still work — you just can't run lab dispatches.</p>
+    <p>The lab harness shells out to an agent runtime to dispatch workloads against. By default that's <code>openclaw</code> (via the <code>openclaw agent</code> command — runtime measurements in the article series were taken against this path). Override with <code>DARKMUX_RUNTIME_CMD=&lt;your-runtime&gt;</code> for Aider, Cline, or anything else with a <code>&lt;cmd&gt; agent --message</code> surface.</p>
+    <p>Lab and <code>crew dispatch</code> are separate codepaths — <code>crew dispatch</code> defaults to darkmux's in-house internal runtime (Docker container, see <a href="missions.html">missions</a>), while <code>lab run</code> continues to use the external runtime above. If you don't have either installed, the <code>swap</code> / <code>status</code> / <code>profiles</code> / <code>doctor</code> verbs still work — you just can't run lab dispatches.</p>
   </div>
 </section>
 
