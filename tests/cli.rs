@@ -136,9 +136,7 @@ fn status_runs_with_explicit_config() {
 #[test]
 fn unknown_command_exits_nonzero() {
     let mut cmd = Command::cargo_bin("darkmux").unwrap();
-    cmd.arg("nonexistent-command")
-        .assert()
-        .failure();
+    cmd.arg("nonexistent-command").assert().failure();
 }
 
 #[test]
@@ -156,11 +154,12 @@ fn lab_with_no_subcommand_reports() {
 ///
 /// Test passes `--runtime openclaw` because the default-internal runtime
 /// (post-Sprint-D) requires Docker + LMStudio, which CI doesn't have. The
-/// openclaw shell-out path is mockable: we point `DARKMUX_RUNTIME_CMD` at
-/// `/usr/bin/true` so the dispatch always "succeeds" without actually
-/// hitting any backend. The test verifies that the surrounding plumbing
-/// (workload load → provider dispatch → manifest write → run dir creation)
-/// works end-to-end from a clean tempdir.
+/// openclaw shell-out path is mockable: we point `--runtime-cmd` at
+/// `/usr/bin/true` (Sprint-E replacement for the removed
+/// `DARKMUX_RUNTIME_CMD` env var) so the dispatch always "succeeds"
+/// without actually hitting any backend. The test verifies that the
+/// surrounding plumbing (workload load → provider dispatch → manifest
+/// write → run dir creation) works end-to-end from a clean tempdir.
 #[test]
 fn lab_run_quick_q_from_clean_cwd_uses_embedded_workload() {
     let tmp = TempDir::new().unwrap();
@@ -188,10 +187,6 @@ fn lab_run_quick_q_from_clean_cwd_uses_embedded_workload() {
     fs::create_dir_all(tmp.path().join(".darkmux")).unwrap();
 
     let mut cmd = Command::cargo_bin("darkmux").unwrap();
-    // /usr/bin/true exits 0 with empty stdout — the prompt provider treats
-    // this as a successful (but empty-reply) dispatch under the openclaw
-    // shell-out path.
-    cmd.env("DARKMUX_RUNTIME_CMD", "/usr/bin/true");
     // Force an empty templates dir so on-disk lookup doesn't accidentally
     // resolve before the embedded fallback. This proves the embedded path.
     cmd.env(
@@ -203,11 +198,15 @@ fn lab_run_quick_q_from_clean_cwd_uses_embedded_workload() {
         "lab",
         "run",
         "quick-q",
-        // Force openclaw so the DARKMUX_RUNTIME_CMD=/usr/bin/true mock
-        // applies. Internal-runtime path requires Docker + LMStudio,
-        // unavailable in CI.
+        // Force openclaw so the --runtime-cmd=/usr/bin/true mock applies.
+        // Internal-runtime path requires Docker + LMStudio, unavailable
+        // in CI. /usr/bin/true exits 0 with empty stdout — the prompt
+        // provider treats this as a successful (but empty-reply)
+        // dispatch under the openclaw shell-out path.
         "--runtime",
         "openclaw",
+        "--runtime-cmd",
+        "/usr/bin/true",
         "--config",
         cfg.to_str().unwrap(),
         "--quiet",
@@ -218,7 +217,11 @@ fn lab_run_quick_q_from_clean_cwd_uses_embedded_workload() {
     // The run dir should exist under .darkmux/runs/<id>/ in the tempdir,
     // and contain a v2 manifest with the right runId.
     let runs_dir = tmp.path().join(".darkmux").join("runs");
-    assert!(runs_dir.is_dir(), "expected {} to exist", runs_dir.display());
+    assert!(
+        runs_dir.is_dir(),
+        "expected {} to exist",
+        runs_dir.display()
+    );
     let entries: Vec<_> = fs::read_dir(&runs_dir)
         .unwrap()
         .filter_map(|e| e.ok())
@@ -240,6 +243,145 @@ fn lab_run_quick_q_from_clean_cwd_uses_embedded_workload() {
     assert_eq!(manifest["profile"].as_str(), Some("deep"));
     assert_eq!(manifest["runId"].as_str(), Some(run_id.as_str()));
     assert_eq!(manifest["ok"].as_bool(), Some(true));
+}
+
+/// Sprint-E: `--runtime-cmd <path>` overrides the openclaw binary used
+/// by the shell-out path, replacing the pre-Sprint-E `DARKMUX_RUNTIME_CMD`
+/// env var.
+///
+/// The test points `--runtime-cmd` at a binary that DOES NOT EXIST and
+/// confirms the dispatch fails with an error mentioning that exact path
+/// — proving the flag is reaching the Command::new() call rather than
+/// silently falling through to the default `openclaw`. Inverse signal:
+/// if the flag weren't plumbed through, we'd either get a clap parse
+/// error or a "no such binary `openclaw`" message depending on whether
+/// openclaw is on PATH in the test env.
+#[test]
+fn lab_run_runtime_cmd_flag_overrides_openclaw_binary() {
+    let tmp = TempDir::new().unwrap();
+    let cfg = tmp.path().join("profiles.json");
+    fs::write(
+        &cfg,
+        r#"{
+            "profiles": {
+                "deep": {
+                    "description": "test deep stack",
+                    "models": [
+                        {"id": "model-a", "n_ctx": 100000, "role": "primary"}
+                    ]
+                }
+            },
+            "default_profile": "deep"
+        }"#,
+    )
+    .unwrap();
+    fs::create_dir_all(tmp.path().join(".darkmux")).unwrap();
+
+    let bogus_path = "/this/binary/definitely/does/not/exist/darkmux-sprint-e";
+    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    cmd.env(
+        "DARKMUX_TEMPLATES_DIR",
+        tmp.path().join("nope").to_str().unwrap(),
+    );
+    cmd.current_dir(tmp.path());
+    let output = cmd
+        .args([
+            "lab",
+            "run",
+            "quick-q",
+            "--runtime",
+            "openclaw",
+            "--runtime-cmd",
+            bogus_path,
+            "--config",
+            cfg.to_str().unwrap(),
+            "--quiet",
+        ])
+        .output()
+        .unwrap();
+
+    // Dispatch should NOT succeed (the binary doesn't exist).
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit when --runtime-cmd points at a non-existent binary, got stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Error should mention the bogus path — proves the flag reached the
+    // Command::new call.
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains(bogus_path),
+        "expected error to mention `{bogus_path}` (proving --runtime-cmd plumbed through); got: {combined}"
+    );
+}
+
+/// Sprint-E QA: passing `--runtime-cmd` without `--runtime openclaw` is
+/// an operator-intent conflict (the flag is only consulted under
+/// openclaw shell-out). The CLI must bail loudly rather than silently
+/// ignoring the flag — Beat 36 doctrine: "no implicit state, operator-
+/// explicit intent only."
+///
+/// `--runtime internal` (the default) + `--runtime-cmd /some/path` →
+/// must NOT succeed; error must reference `--runtime openclaw`.
+#[test]
+fn lab_run_runtime_cmd_without_openclaw_bails_loud() {
+    let tmp = TempDir::new().unwrap();
+    let cfg = tmp.path().join("profiles.json");
+    fs::write(
+        &cfg,
+        r#"{
+            "profiles": {
+                "deep": {
+                    "description": "test",
+                    "models": [
+                        {"id": "model-a", "n_ctx": 100000, "role": "primary"}
+                    ]
+                }
+            },
+            "default_profile": "deep"
+        }"#,
+    )
+    .unwrap();
+    fs::create_dir_all(tmp.path().join(".darkmux")).unwrap();
+
+    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    cmd.env(
+        "DARKMUX_TEMPLATES_DIR",
+        tmp.path().join("nope").to_str().unwrap(),
+    );
+    cmd.current_dir(tmp.path());
+    let output = cmd
+        .args([
+            "lab",
+            "run",
+            "quick-q",
+            // --runtime defaults to "internal" — explicit here for
+            // clarity that the test exercises the conflict path.
+            "--runtime",
+            "internal",
+            "--runtime-cmd",
+            "/opt/aider/aider",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--quiet",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit when --runtime-cmd set without --runtime openclaw"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--runtime openclaw"),
+        "expected stderr to point operator at `--runtime openclaw`; got: {stderr}"
+    );
 }
 
 /// `notebook list` enumerates .md files and prints aligned columns.
@@ -425,10 +567,14 @@ fn mission_migrate_dry_run_shows_moves_without_moving() {
         .stdout(predicate::str::contains("Re-run with --apply"));
 
     // Files must NOT have been moved.
-    assert!(tmp.path().join("missions/alpha.json").is_file(),
-            "dry-run must not move the flat mission file");
-    assert!(tmp.path().join("sprints/s1.json").is_file(),
-            "dry-run must not move the flat sprint file");
+    assert!(
+        tmp.path().join("missions/alpha.json").is_file(),
+        "dry-run must not move the flat mission file"
+    );
+    assert!(
+        tmp.path().join("sprints/s1.json").is_file(),
+        "dry-run must not move the flat sprint file"
+    );
 }
 
 /// `--apply` actually moves files to the per-mission nested layout.
@@ -447,15 +593,23 @@ fn mission_migrate_apply_moves_files() {
         .stdout(predicate::str::contains("applied"));
 
     // New nested paths must exist.
-    assert!(tmp.path().join("missions/alpha/mission.json").is_file(),
-            "mission.json should be at nested path after --apply");
-    assert!(tmp.path().join("missions/alpha/sprints/s1.json").is_file(),
-            "sprint json should be at nested path after --apply");
+    assert!(
+        tmp.path().join("missions/alpha/mission.json").is_file(),
+        "mission.json should be at nested path after --apply"
+    );
+    assert!(
+        tmp.path().join("missions/alpha/sprints/s1.json").is_file(),
+        "sprint json should be at nested path after --apply"
+    );
     // Old flat paths must be gone.
-    assert!(!tmp.path().join("missions/alpha.json").exists(),
-            "flat mission file should be gone after --apply");
-    assert!(!tmp.path().join("sprints/s1.json").exists(),
-            "flat sprint file should be gone after --apply");
+    assert!(
+        !tmp.path().join("missions/alpha.json").exists(),
+        "flat mission file should be gone after --apply"
+    );
+    assert!(
+        !tmp.path().join("sprints/s1.json").exists(),
+        "flat sprint file should be gone after --apply"
+    );
 }
 
 /// Re-running `--apply` after a successful migration is a no-op (idempotent).

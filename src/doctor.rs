@@ -64,13 +64,22 @@ impl DoctorReport {
     }
 
     pub fn pass_count(&self) -> usize {
-        self.checks.iter().filter(|c| c.status == Status::Pass).count()
+        self.checks
+            .iter()
+            .filter(|c| c.status == Status::Pass)
+            .count()
     }
     pub fn warn_count(&self) -> usize {
-        self.checks.iter().filter(|c| c.status == Status::Warn).count()
+        self.checks
+            .iter()
+            .filter(|c| c.status == Status::Warn)
+            .count()
     }
     pub fn fail_count(&self) -> usize {
-        self.checks.iter().filter(|c| c.status == Status::Fail).count()
+        self.checks
+            .iter()
+            .filter(|c| c.status == Status::Fail)
+            .count()
     }
 }
 
@@ -176,9 +185,15 @@ fn check_beat33_legacy_crew_dir() -> Check {
             file = promoted_file
         ));
     }
-    script_lines.push(format!("rmdir {} 2>/dev/null || true", legacy_dir.display()));
+    script_lines.push(format!(
+        "rmdir {} 2>/dev/null || true",
+        legacy_dir.display()
+    ));
 
-    let mut listed = present_subdirs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+    let mut listed = present_subdirs
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect::<Vec<_>>();
     if pins_present {
         listed.push(promoted_file.to_string());
     }
@@ -283,7 +298,9 @@ fn check_role_model_pin_drift() -> Check {
     let mut checked: u32 = 0;
     for agent in agents {
         let id = agent.get("id").and_then(|v| v.as_str()).unwrap_or("");
-        let Some(role_id) = id.strip_prefix("darkmux/") else { continue; };
+        let Some(role_id) = id.strip_prefix("darkmux/") else {
+            continue;
+        };
         checked += 1;
         let expected = pins.pin_for(role_id);
         let actual = agent
@@ -300,7 +317,9 @@ fn check_role_model_pin_drift() -> Check {
         return Check {
             name: "role-model pin drift".into(),
             status: Status::Pass,
-            message: "(no darkmux/* agents in openclaw.json — run `darkmux crew sync` to register them)".into(),
+            message:
+                "(no darkmux/* agents in openclaw.json — run `darkmux crew sync` to register them)"
+                    .into(),
             hint: None,
         };
     }
@@ -403,7 +422,10 @@ fn check_audit_integrity() -> Check {
             reports.len(),
             first.path,
             first.break_at_line.unwrap_or(0),
-            first.break_reason.clone().unwrap_or_else(|| "no reason captured".into()),
+            first
+                .break_reason
+                .clone()
+                .unwrap_or_else(|| "no reason captured".into()),
         );
         Check {
             name: "audit integrity".into(),
@@ -449,7 +471,8 @@ fn check_recommended_profile_name_not_shadowed() -> Check {
         Check {
             name: "recommended profile name not shadowed".into(),
             status: Status::Pass,
-            message: "no shadowing — `recommended` is free to route to the recommendation registry".into(),
+            message: "no shadowing — `recommended` is free to route to the recommendation registry"
+                .into(),
             hint: None,
         }
     }
@@ -709,8 +732,7 @@ fn check_flow_sink_health() -> Check {
 fn check_crew_role_prompt_coverage() -> Check {
     use crate::crew::loader::{builtin_role_prompt_ids, builtin_roles_ids};
     let manifests = builtin_roles_ids();
-    let prompts: std::collections::HashSet<&str> =
-        builtin_role_prompt_ids().into_iter().collect();
+    let prompts: std::collections::HashSet<&str> = builtin_role_prompt_ids().into_iter().collect();
     let missing: Vec<&str> = manifests
         .into_iter()
         .filter(|id| !prompts.contains(id))
@@ -838,8 +860,7 @@ fn check_daemon_reachable_impl(host: &str, port: u16) -> Check {
                 status: Status::Warn,
                 message: format!("daemon not reachable at {} (connection refused)", addr),
                 hint: Some(
-                    "run `darkmux serve` to start the daemon for live viewing features"
-                        .into(),
+                    "run `darkmux serve` to start the daemon for live viewing features".into(),
                 ),
             };
         }
@@ -851,9 +872,7 @@ fn check_daemon_reachable_impl(host: &str, port: u16) -> Check {
     // the subsequent stream.read() — this is the surface area #104
     // review flagged ("silent error on stream timeout configuration").
     let to = std::time::Duration::from_millis(1000);
-    if stream.set_read_timeout(Some(to)).is_err()
-        || stream.set_write_timeout(Some(to)).is_err()
-    {
+    if stream.set_read_timeout(Some(to)).is_err() || stream.set_write_timeout(Some(to)).is_err() {
         return Check {
             name: "daemon reachable".into(),
             status: Status::Warn,
@@ -886,10 +905,7 @@ fn check_daemon_reachable_impl(host: &str, port: u16) -> Check {
             name: "daemon reachable".into(),
             status: Status::Warn,
             message: format!("daemon at {} not responding to HTTP", addr),
-            hint: Some(
-                "run `darkmux serve` to start the daemon for live viewing features"
-                    .into(),
-            ),
+            hint: Some("run `darkmux serve` to start the daemon for live viewing features".into()),
         };
     }
 
@@ -908,8 +924,7 @@ fn check_daemon_reachable_impl(host: &str, port: u16) -> Check {
             status: Status::Warn,
             message: format!(
                 "daemon not responding correctly at {}: {}",
-                addr,
-                first_line
+                addr, first_line
             ),
             hint: Some(
                 "ensure `darkmux serve` is running (port 8765 may be held by another process)"
@@ -933,7 +948,12 @@ fn check_profile_registry() -> Check {
         Err(e) => Check {
             name: "profile registry".into(),
             status: Status::Fail,
-            message: e.to_string().lines().next().unwrap_or("load failed").to_string(),
+            message: e
+                .to_string()
+                .lines()
+                .next()
+                .unwrap_or("load failed")
+                .to_string(),
             hint: Some("run `darkmux init` to create one".into()),
         },
     }
@@ -1068,12 +1088,19 @@ fn check_profile_loaded_match() -> Check {
 }
 
 fn check_runtime_command() -> Check {
-    let cmd = env::var("DARKMUX_RUNTIME_CMD").unwrap_or_else(|_| "openclaw".to_string());
-    if which(&cmd).is_some() {
+    // Post-Sprint-E: doctor checks for openclaw specifically. Operators
+    // who use Aider / Cline / a custom runtime invoke them per-dispatch
+    // via `--runtime openclaw --runtime-cmd <path>`; that operator-explicit
+    // flag isn't visible to doctor. The internal runtime (default for
+    // dispatch + lab) doesn't need an external binary. Sprint-G will
+    // scope this check to "only when openclaw is the active runtime in
+    // the operator's profile."
+    let cmd = "openclaw";
+    if which(cmd).is_some() {
         Check {
             name: "runtime command".into(),
             status: Status::Pass,
-            message: format!("found `{cmd}` on PATH (used by `darkmux lab`)"),
+            message: format!("found `{cmd}` on PATH (used when `--runtime openclaw` opt-in fires)"),
             hint: None,
         }
     } else {
@@ -1082,8 +1109,9 @@ fn check_runtime_command() -> Check {
             status: Status::Warn,
             message: format!("`{cmd}` not on PATH"),
             hint: Some(
-                "install your agent runtime, or set DARKMUX_RUNTIME_CMD to override. \
-                 `darkmux swap`/`status`/`profiles` work without a runtime; only `lab` features need it."
+                "darkmux's internal runtime is the default and needs no external binary; \
+                 install openclaw only if you want to opt into `--runtime openclaw` per dispatch. \
+                 `swap`/`status`/`profiles` work without any runtime."
                     .into(),
             ),
         }
@@ -1110,24 +1138,15 @@ fn parse_openclaw_version(raw: &str) -> Option<(u32, u32, u32)> {
 }
 
 fn check_runtime_version() -> Check {
-    let cmd = env::var("DARKMUX_RUNTIME_CMD").unwrap_or_else(|_| "openclaw".to_string());
-    // Only check version for openclaw — other runtimes have their own
-    // version conventions. When DARKMUX_RUNTIME_CMD is set to something
-    // else (aider, cline), skip rather than guess at parsing.
-    if cmd != "openclaw" {
-        return Check {
-            name: "runtime version".into(),
-            status: Status::Pass,
-            message: format!("(skipped — runtime is `{cmd}`, version-check is openclaw-specific)"),
-            hint: None,
-        };
-    }
-
-    let output = Command::new(&cmd).arg("--version").output();
+    // Post-Sprint-E: doctor only checks openclaw's version. Aider /
+    // Cline / custom runtimes are invoked per-dispatch via
+    // `--runtime openclaw --runtime-cmd <path>` and have their own
+    // version conventions; doctor doesn't try to interpret them.
+    let cmd = "openclaw";
+    let output = Command::new(cmd).arg("--version").output();
     let raw = match output {
         Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout).to_string()
-                + &String::from_utf8_lossy(&o.stderr)
+            String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr)
         }
         _ => {
             return Check {
@@ -1242,10 +1261,7 @@ fn fetch_latest_release_tag() -> Result<String, String> {
         .output()
         .map_err(|e| format!("couldn't invoke `curl`: {e}"))?;
     if !output.status.success() {
-        return Err(format!(
-            "curl exit {}",
-            output.status.code().unwrap_or(-1)
-        ));
+        return Err(format!("curl exit {}", output.status.code().unwrap_or(-1)));
     }
     let body = String::from_utf8_lossy(&output.stdout);
     if body.trim().is_empty() {
@@ -1364,11 +1380,7 @@ fn check_ram_headroom() -> Check {
         })
         .unwrap_or(0.0);
 
-    classify_ram_headroom(
-        reclaimable_gb,
-        loaded_models_size_gb,
-        RAM_SAFETY_MARGIN_GB,
-    )
+    classify_ram_headroom(reclaimable_gb, loaded_models_size_gb, RAM_SAFETY_MARGIN_GB)
 }
 
 /// Pure verdict logic for the RAM headroom check. Extracted so the
@@ -1382,9 +1394,8 @@ fn classify_ram_headroom(
     loaded_models_size_gb: f64,
     safety_margin_gb: u64,
 ) -> Check {
-    let real_headroom_f = (reclaimable_gb as f64)
-        + loaded_models_size_gb
-        - (safety_margin_gb as f64);
+    let real_headroom_f =
+        (reclaimable_gb as f64) + loaded_models_size_gb - (safety_margin_gb as f64);
     let real_headroom_gb = real_headroom_f.max(0.0).round() as u64;
     let resident_round = loaded_models_size_gb.round() as u64;
 
@@ -1410,10 +1421,7 @@ fn classify_ram_headroom(
             name: "RAM headroom".into(),
             status: Status::Warn,
             message: breakdown,
-            hint: Some(
-                "close apps or shrink ctx before measurement-grade lab runs"
-                    .into(),
-            ),
+            hint: Some("close apps or shrink ctx before measurement-grade lab runs".into()),
         }
     } else {
         Check {
@@ -1465,9 +1473,9 @@ fn check_ram_headroom_load_projection() -> Check {
         .iter()
         .filter(|pm| {
             let ns = crate::swap::namespaced_identifier(pm);
-            !loaded.iter().any(|l| {
-                l.identifier == pm.id || l.model == pm.id || l.identifier == ns
-            })
+            !loaded
+                .iter()
+                .any(|l| l.identifier == pm.id || l.model == pm.id || l.identifier == ns)
         })
         .collect();
     if unloaded.is_empty() {
@@ -1505,12 +1513,7 @@ fn check_ram_headroom_load_projection() -> Check {
         None => return skip("could not read vm_stat (non-macOS?)"),
     };
 
-    classify_load_projection(
-        reclaimable_gb,
-        total_unloaded_gb,
-        &pending,
-        profile_name,
-    )
+    classify_load_projection(reclaimable_gb, total_unloaded_gb, &pending, profile_name)
 }
 
 /// Pure verdict logic for the load-projection check. Extracted so the
@@ -1554,9 +1557,7 @@ fn classify_load_projection(
         Check {
             name: NAME.into(),
             status: Status::Warn,
-            message: format!(
-                "{summary} — within {RAM_SAFETY_MARGIN_GB} GB safety margin"
-            ),
+            message: format!("{summary} — within {RAM_SAFETY_MARGIN_GB} GB safety margin"),
             hint: Some(
                 "load will likely succeed but leaves little headroom for KV \
                  cache growth; watch for swap during long-context dispatches"
@@ -1592,9 +1593,9 @@ fn pick_active_profile<'a>(
                 .filter(|m| matches!(m.role, ModelRole::Primary))
                 .any(|pm| {
                     let ns = crate::swap::namespaced_identifier(pm);
-                    loaded.iter().any(|l| {
-                        l.identifier == pm.id || l.model == pm.id || l.identifier == ns
-                    })
+                    loaded
+                        .iter()
+                        .any(|l| l.identifier == pm.id || l.model == pm.id || l.identifier == ns)
                 })
         })
         .map(|(name, p)| (name.as_str(), p))
@@ -2179,12 +2180,7 @@ mod tests {
     fn load_projection_warn_when_load_eats_into_safety_margin() {
         // 8 GB free, 7 GB pending. 8 − 7 = 1 GB < 2 GB safety → Warn (load
         // fits but leaves no headroom for KV cache growth mid-dispatch).
-        let c = classify_load_projection(
-            8.0,
-            7.0,
-            &pending(&["big/model ~7.0 GB"]),
-            "deep",
-        );
+        let c = classify_load_projection(8.0, 7.0, &pending(&["big/model ~7.0 GB"]), "deep");
         assert_eq!(c.status, Status::Warn);
         assert!(c.message.contains("safety margin"));
     }
@@ -2192,18 +2188,17 @@ mod tests {
     #[test]
     fn load_projection_fail_when_load_exceeds_reclaimable() {
         // 4 GB free, 8 GB compactor pending. Can't fit; would swap or OOM.
-        let c = classify_load_projection(
-            4.0,
-            8.0,
-            &pending(&["compactor ~8.0 GB"]),
-            "balanced",
-        );
+        let c = classify_load_projection(4.0, 8.0, &pending(&["compactor ~8.0 GB"]), "balanced");
         assert_eq!(c.status, Status::Fail);
         assert!(c.message.contains("swap or OOM"));
         // Surfaces the actionable fix (close apps / smaller compactor /
         // lower n_ctx) so the operator can recover without consulting the
         // issue tracker.
-        assert!(c.hint.as_deref().unwrap_or("").contains("smaller compactor"));
+        assert!(c
+            .hint
+            .as_deref()
+            .unwrap_or("")
+            .contains("smaller compactor"));
     }
 
     #[test]
@@ -2214,10 +2209,7 @@ mod tests {
         let c = classify_load_projection(
             10.0,
             3.0,
-            &pending(&[
-                "google/gemma-3-4b ~3.0 GB",
-                "fresh-download (size unknown)",
-            ]),
+            &pending(&["google/gemma-3-4b ~3.0 GB", "fresh-download (size unknown)"]),
             "balanced",
         );
         assert_eq!(c.status, Status::Pass);
@@ -2264,7 +2256,10 @@ mod tests {
     #[test]
     fn parse_pages_field_handles_commas_and_dot() {
         // vm_stat lines look like "Pages free:                  1234567."
-        assert_eq!(parse_pages_field("                  1234567."), Some(1234567));
+        assert_eq!(
+            parse_pages_field("                  1234567."),
+            Some(1234567)
+        );
         assert_eq!(parse_pages_field(" 1.234.567."), Some(1234567));
         assert_eq!(parse_pages_field("        ."), None);
     }
@@ -2429,7 +2424,8 @@ mod tests {
                 let _ = stream.read(&mut buf);
 
                 // Send HTTP 200 response
-                let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+                let response =
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
                 let _ = stream.write_all(response.as_bytes());
             }
         });
@@ -2441,7 +2437,12 @@ mod tests {
         let check = check_daemon_reachable_impl("127.0.0.1", port);
 
         // Assert Pass status
-        assert_eq!(check.status, Status::Pass, "daemon reachable check should pass when health returns 200. Got message: {}", check.message);
+        assert_eq!(
+            check.status,
+            Status::Pass,
+            "daemon reachable check should pass when health returns 200. Got message: {}",
+            check.message
+        );
         assert!(check.message.contains("health check OK"));
 
         // Shutdown the server by dropping the listener (via a separate scope)
@@ -2456,7 +2457,11 @@ mod tests {
         // Assert Warn status with appropriate message
         assert_eq!(check.status, Status::Warn);
         assert!(check.message.contains("connection refused"));
-        assert!(check.hint.as_ref().unwrap_or(&String::new()).contains("darkmux serve"));
+        assert!(check
+            .hint
+            .as_ref()
+            .unwrap_or(&String::new())
+            .contains("darkmux serve"));
     }
 
     // ─── check_beat33_legacy_crew_dir ─────────────────────────────────
@@ -2477,7 +2482,9 @@ mod tests {
             let tmp = tempfile::TempDir::new().expect("tempdir");
             let prev = std::env::var("DARKMUX_CREW_DIR").ok();
             // SAFETY: tests using this guard MUST be #[serial].
-            unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()); }
+            unsafe {
+                std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
+            }
             Self { prev, tmp }
         }
         fn path(&self) -> &std::path::Path {
@@ -2527,11 +2534,7 @@ mod tests {
         // would actually have.
         std::fs::create_dir_all(guard.path().join("crew").join("roles")).unwrap();
         std::fs::create_dir_all(guard.path().join("crew").join("missions")).unwrap();
-        std::fs::write(
-            guard.path().join("crew").join("role-model-pins.json"),
-            "{}",
-        )
-        .unwrap();
+        std::fs::write(guard.path().join("crew").join("role-model-pins.json"), "{}").unwrap();
 
         let check = check_beat33_legacy_crew_dir();
         assert_eq!(check.status, Status::Warn);
@@ -2540,7 +2543,10 @@ mod tests {
         assert!(check.message.contains("roles"));
         assert!(check.message.contains("role-model-pins.json"));
 
-        let hint = check.hint.as_ref().expect("warn must carry an mv-script hint");
+        let hint = check
+            .hint
+            .as_ref()
+            .expect("warn must carry an mv-script hint");
         // Script must be operator-runnable: mv -n (no-clobber) for safety,
         // plus a final rmdir to clean up the now-empty parent.
         assert!(hint.contains("mv -n"));
@@ -2562,10 +2568,7 @@ mod tests {
         // Create only one promoted subdir + one NON-promoted subdir;
         // doctor should only mention the promoted one.
         std::fs::create_dir_all(guard.path().join("crew").join("roles")).unwrap();
-        std::fs::create_dir_all(
-            guard.path().join("crew").join("operator-private-stuff"),
-        )
-        .unwrap();
+        std::fs::create_dir_all(guard.path().join("crew").join("operator-private-stuff")).unwrap();
 
         let check = check_beat33_legacy_crew_dir();
         assert_eq!(check.status, Status::Warn);

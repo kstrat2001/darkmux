@@ -5,7 +5,7 @@ use crate::lab::paths::{self, ResolveScope};
 use crate::profiles::{get_profile, load_registry};
 use crate::workloads::load::{list_available, load};
 use crate::workloads::registry::with_provider;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use std::fs;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -18,8 +18,15 @@ pub struct RunOpts {
     /// Which agent runtime to dispatch the workload through.
     /// `Runtime::Internal` (default) uses darkmux's container-bounded
     /// runtime; `Runtime::Openclaw` shells out to the openclaw CLI
-    /// (legacy path; requires DARKMUX_RUNTIME_CMD-resolved binary).
+    /// (legacy path).
     pub runtime: crate::crew::dispatch::Runtime,
+    /// Executable path for the openclaw shell-out (Sprint-E
+    /// replacement for the removed `DARKMUX_RUNTIME_CMD` env var).
+    /// Defaults to `"openclaw"`; override via `--runtime-cmd <path>`
+    /// to point at Aider / Cline / any tool exposing the
+    /// `<cmd> agent --message` calling convention. Ignored when
+    /// `runtime == Runtime::Internal`.
+    pub runtime_cmd: String,
     /// Enable cross-layer telemetry capture during the dispatch. When true,
     /// each run dir gets an `instruments.jsonl` with periodic samples of
     /// LMStudio state, gateway-process residency, and timing meta.
@@ -83,8 +90,7 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
             );
         }
 
-        fs::create_dir_all(&run_dir)
-            .with_context(|| format!("creating {}", run_dir.display()))?;
+        fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
 
         // Optional cross-layer telemetry. The sidecar runs on a background
         // thread until we explicitly stop it after the dispatch completes.
@@ -106,9 +112,18 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
 
         let provider_id = loaded_workload.manifest.workload.provider.clone();
         let runtime = opts.runtime;
+        let runtime_cmd = opts.runtime_cmd.as_str();
         let result = with_provider(&provider_id, |p| {
             p.setup(&loaded_workload, &run_dir, &sandbox_dir)?;
-            p.run(&loaded_workload, &run_dir, &sandbox_dir, profile, &profile_name, runtime)
+            p.run(
+                &loaded_workload,
+                &run_dir,
+                &sandbox_dir,
+                profile,
+                &profile_name,
+                runtime,
+                runtime_cmd,
+            )
         })??;
 
         // Stop the sidecar before recording outcome notes — that way any
@@ -177,10 +192,7 @@ pub fn lab_workloads() -> Vec<String> {
 /// Example: workload `long-agentic` looks at
 /// `DARKMUX_SANDBOX_LONG_AGENTIC`. If set and the path exists, that's the
 /// sandbox; otherwise the default path is used.
-pub fn resolve_sandbox_dir(
-    workload_id: &str,
-    paths: &paths::DarkmuxPaths,
-) -> std::path::PathBuf {
+pub fn resolve_sandbox_dir(workload_id: &str, paths: &paths::DarkmuxPaths) -> std::path::PathBuf {
     let env_key = format!(
         "DARKMUX_SANDBOX_{}",
         workload_id.replace('-', "_").to_ascii_uppercase()
@@ -232,6 +244,7 @@ mod tests {
             config_path: Some(cfg.to_str().unwrap().into()),
             quiet: true,
             runtime: crate::crew::dispatch::Runtime::Internal,
+            runtime_cmd: "openclaw".to_string(),
             instrument: false,
         })
         .unwrap_err();

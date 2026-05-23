@@ -290,7 +290,8 @@ fn pick_profile(
                         action: format!("stay-on-{}", spec.active_profile),
                         target_profile: spec.active_profile.clone(),
                         confidence: "low".to_string(),
-                        reasoning: "no profiles available in the registry — cannot recommend".to_string(),
+                        reasoning: "no profiles available in the registry — cannot recommend"
+                            .to_string(),
                     };
                 }
             }
@@ -409,15 +410,26 @@ fn narrate_via_4b(output_so_far: &EstimateOutput) -> Result<Value> {
 
     let url = lmstudio_chat_url();
     let output = Command::new("curl")
-        .args(["-s", "--fail", &url, "-H", "Content-Type: application/json", "-d", &payload_str])
+        .args([
+            "-s",
+            "--fail",
+            &url,
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            &payload_str,
+        ])
         .output()
         .context("running curl to LMStudio")?;
     if !output.status.success() {
-        anyhow::bail!("curl to LMStudio failed: {}", String::from_utf8_lossy(&output.stderr));
+        anyhow::bail!(
+            "curl to LMStudio failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
-    let resp: Value = serde_json::from_slice(&output.stdout)
-        .context("parsing LMStudio response as JSON")?;
+    let resp: Value =
+        serde_json::from_slice(&output.stdout).context("parsing LMStudio response as JSON")?;
     if let Some(err) = resp.get("error") {
         anyhow::bail!("LMStudio returned an error: {err}");
     }
@@ -425,8 +437,8 @@ fn narrate_via_4b(output_so_far: &EstimateOutput) -> Result<Value> {
         .pointer("/choices/0/message/content")
         .and_then(|v| v.as_str())
         .context("LMStudio response missing /choices/0/message/content")?;
-    let narrative: Value = serde_json::from_str(content)
-        .context("4B's narrative response is not valid JSON")?;
+    let narrative: Value =
+        serde_json::from_str(content).context("4B's narrative response is not valid JSON")?;
     Ok(narrative)
 }
 
@@ -601,7 +613,9 @@ fn extract_severity_marker(line: &str) -> Option<(&str, &str)> {
     // separator — colon, space, or tab). Tighter than "any non-uppercase
     // char" because that would match things like `FLAG-suffix`, which is
     // not a severity marker and shouldn't parse as one.
-    let first_word_end = line.find(|c: char| !c.is_ascii_uppercase()).unwrap_or(line.len());
+    let first_word_end = line
+        .find(|c: char| !c.is_ascii_uppercase())
+        .unwrap_or(line.len());
     if first_word_end > 0 {
         let severity = &line[..first_word_end];
         if matches!(severity, "BLOCK" | "FLAG" | "NIT") {
@@ -630,7 +644,9 @@ pub fn parse_signoff(input: &str) -> SignoffParse {
 
     for line in input.lines() {
         let line = line.trim();
-        let Some((severity, rest)) = extract_severity_marker(line) else { continue; };
+        let Some((severity, rest)) = extract_severity_marker(line) else {
+            continue;
+        };
 
         let finding_text = if let Some(pos) = rest.find(" — ") {
             // " — " is 5 bytes total (em-dash is U+2014 = 3 UTF-8 bytes, plus
@@ -643,7 +659,10 @@ pub fn parse_signoff(input: &str) -> SignoffParse {
             rest.trim().to_string()
         };
 
-        findings.push(ReviewFinding { severity: severity.to_string(), text: finding_text });
+        findings.push(ReviewFinding {
+            severity: severity.to_string(),
+            text: finding_text,
+        });
     }
 
     let mut block = 0usize;
@@ -669,9 +688,16 @@ pub fn parse_signoff(input: &str) -> SignoffParse {
         // to engage with the format. Surface as indeterminate so operator
         // knows to inspect manually.
         "indeterminate"
-    }.to_string();
+    }
+    .to_string();
 
-    SignoffParse { block, flag, nit, verdict, findings }
+    SignoffParse {
+        block,
+        flag,
+        nit,
+        verdict,
+        findings,
+    }
 }
 
 /// Count files changed between `base` and the working tree via `git diff
@@ -685,7 +711,12 @@ fn count_files_changed(path: &Path, base: &str) -> usize {
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).lines().filter(|l| !l.is_empty()).count())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter(|l| !l.is_empty())
+                .count()
+        })
         .unwrap_or(0)
 }
 
@@ -703,10 +734,20 @@ pub(crate) fn sprint_review_at(
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok().map(|s| s.trim().to_string()))
+        .and_then(|o| {
+            String::from_utf8(o.stdout)
+                .ok()
+                .map(|s| s.trim().to_string())
+        })
         .unwrap_or_else(|| "unknown".to_string());
 
-    let session_id = format!("sprint-review-{}", std::time::UNIX_EPOCH.elapsed().unwrap_or_default().as_secs());
+    let session_id = format!(
+        "sprint-review-{}",
+        std::time::UNIX_EPOCH
+            .elapsed()
+            .unwrap_or_default()
+            .as_secs()
+    );
 
     // Emit review-start flow record.
     let _ = crate::flow::record(build_review_record(
@@ -741,7 +782,11 @@ pub(crate) fn sprint_review_at(
             reviewer_session_id: Some(session_id.clone()),
             diff_files_changed: 0,
             total_findings: 0,
-            by_severity: SeverityCounts { block: 0, flag: 0, nit: 0 },
+            by_severity: SeverityCounts {
+                block: 0,
+                flag: 0,
+                nit: 0,
+            },
             findings: vec![],
             verdict: "clean".to_string(),
         };
@@ -781,7 +826,11 @@ pub(crate) fn sprint_review_at(
             char_count += line.len() + 1; // \n
         }
         let remaining_lines = diff[end_pos..].lines().count();
-        format!("{}\n... [diff truncated, {} lines omitted]", &diff[..end_pos], remaining_lines)
+        format!(
+            "{}\n... [diff truncated, {} lines omitted]",
+            &diff[..end_pos],
+            remaining_lines
+        )
     } else {
         diff
     };
@@ -816,6 +865,10 @@ pub(crate) fn sprint_review_at(
         // hand; sprint review itself goes through DM's substrate so
         // openclaw is genuinely optional (Beat 36).
         runtime: crate::crew::dispatch::Runtime::Internal,
+        // Sprint review pins Runtime::Internal; runtime_cmd is unused
+        // by the internal path. Default to "openclaw" for parity with
+        // the rest of the codebase post-Sprint-E.
+        runtime_cmd: "openclaw".to_string(),
         machine: None,
         wait: true,
     };
@@ -887,7 +940,11 @@ pub(crate) fn sprint_review_at(
 
     println!("{}", serde_json::to_string_pretty(&output)?);
 
-    Ok(if require_clean && signoff.block > 0 { 1 } else { 0 })
+    Ok(if require_clean && signoff.block > 0 {
+        1
+    } else {
+        0
+    })
 }
 
 /// Public entry for `sprint review` — delegates to `sprint_review_at`.
@@ -1152,9 +1209,18 @@ mod tests {
             initial_state_tokens: 1000,
             per_turn: PerTurn {
                 tool_schemas: 500,
-                file_reads: CountAndSize { count: 0, avg_bytes: 0 },
-                edits: CountAndSize { count: 0, avg_bytes: 0 },
-                exec_calls: CountAndOutputSize { count: 0, avg_output_bytes: 0 },
+                file_reads: CountAndSize {
+                    count: 0,
+                    avg_bytes: 0,
+                },
+                edits: CountAndSize {
+                    count: 0,
+                    avg_bytes: 0,
+                },
+                exec_calls: CountAndOutputSize {
+                    count: 0,
+                    avg_output_bytes: 0,
+                },
                 assistant_response: 500,
             },
             planned_turns: 1,
@@ -1166,7 +1232,10 @@ mod tests {
         let rec = pick_profile(&spec, &report, &caps);
         assert_eq!(rec.target_profile, "fast");
         assert_eq!(rec.action, "stay-on-fast");
-        assert_eq!(rec.confidence, "high", "tiny workload that comfortably fits should be high confidence");
+        assert_eq!(
+            rec.confidence, "high",
+            "tiny workload that comfortably fits should be high confidence"
+        );
     }
 
     #[test]
@@ -1180,9 +1249,18 @@ mod tests {
             initial_state_tokens: 1000,
             per_turn: PerTurn {
                 tool_schemas: 100,
-                file_reads: CountAndSize { count: 0, avg_bytes: 0 },
-                edits: CountAndSize { count: 0, avg_bytes: 0 },
-                exec_calls: CountAndOutputSize { count: 0, avg_output_bytes: 0 },
+                file_reads: CountAndSize {
+                    count: 0,
+                    avg_bytes: 0,
+                },
+                edits: CountAndSize {
+                    count: 0,
+                    avg_bytes: 0,
+                },
+                exec_calls: CountAndOutputSize {
+                    count: 0,
+                    avg_output_bytes: 0,
+                },
                 assistant_response: 100,
             },
             planned_turns: 1,
@@ -1190,8 +1268,14 @@ mod tests {
         let reg = fixture_registry();
         let err = run_estimate(&spec, &reg, false).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("nonexistent-profile"), "error should name the missing profile: {msg}");
-        assert!(msg.contains("known profiles"), "error should list known profiles: {msg}");
+        assert!(
+            msg.contains("nonexistent-profile"),
+            "error should name the missing profile: {msg}"
+        );
+        assert!(
+            msg.contains("known profiles"),
+            "error should list known profiles: {msg}"
+        );
     }
 
     #[serial_test::serial]
@@ -1209,9 +1293,18 @@ mod tests {
             initial_state_tokens: 50000,
             per_turn: PerTurn {
                 tool_schemas: 3300,
-                file_reads: CountAndSize { count: 3, avg_bytes: 4000 },
-                edits: CountAndSize { count: 2, avg_bytes: 1500 },
-                exec_calls: CountAndOutputSize { count: 1, avg_output_bytes: 8000 },
+                file_reads: CountAndSize {
+                    count: 3,
+                    avg_bytes: 4000,
+                },
+                edits: CountAndSize {
+                    count: 2,
+                    avg_bytes: 1500,
+                },
+                exec_calls: CountAndOutputSize {
+                    count: 1,
+                    avg_output_bytes: 8000,
+                },
                 assistant_response: 2500,
             },
             planned_turns: 8,
@@ -1223,7 +1316,10 @@ mod tests {
         // SAFETY: tests use serial_test::serial when needed; this test
         // doesn't share state with others that rely on this env var.
         unsafe {
-            std::env::set_var("DARKMUX_LMSTUDIO_URL", "http://127.0.0.1:1/v1/chat/completions");
+            std::env::set_var(
+                "DARKMUX_LMSTUDIO_URL",
+                "http://127.0.0.1:1/v1/chat/completions",
+            );
         }
 
         let result = run_estimate(&spec, &reg, true);
@@ -1254,7 +1350,8 @@ mod tests {
             - [BLOCK] src/main.rs:42 — null pointer dereference on unwrap()\n\
             - [FLAG] src/utils.rs:17 — unused variable `temp_buf`\n\
             - [NIT] src/config.rs:8 — inconsistent spacing after `fn`\n\
-            Summary: 1 blockers, 1 flags, 1 nits".to_string()
+            Summary: 1 blockers, 1 flags, 1 nits"
+            .to_string()
     }
 
     #[test]
@@ -1319,7 +1416,9 @@ mod tests {
         assert_eq!(result.nit, 1);
         assert_eq!(result.verdict, "blockers");
         assert_eq!(result.findings.len(), 3);
-        assert!(result.findings[1].text.contains("sync_all errors swallowed"));
+        assert!(result.findings[1]
+            .text
+            .contains("sync_all errors swallowed"));
     }
 
     #[test]
@@ -1385,7 +1484,9 @@ mod tests {
             let tmp = tempfile::TempDir::new().unwrap();
             let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
             // SAFETY: serialized via `#[serial_test::serial]`.
-            unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path()); }
+            unsafe {
+                std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+            }
             Self { prev, tmp }
         }
 
@@ -1429,7 +1530,8 @@ mod tests {
             .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("jsonl"))
             .collect();
 
-        let records: Vec<String> = files.iter()
+        let records: Vec<String> = files
+            .iter()
             .flat_map(|p| {
                 let content = std::fs::read_to_string(p).unwrap();
                 content.lines().map(String::from).collect::<Vec<_>>()
@@ -1468,7 +1570,8 @@ mod tests {
 
         let records = collect_records(guard.path());
         // Find verdict record (action starts with "verdict:").
-        let verdict = records.iter()
+        let verdict = records
+            .iter()
             .find(|r| {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(r) {
                     if let Some(s) = v["action"].as_str() {
@@ -1538,7 +1641,9 @@ mod tests {
 
         let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
         // SAFETY: serial test.
-        unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path()); }
+        unsafe {
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
 
         let result = crate::sprint_cli::sprint_review_at(repo.path(), None, false, Some("66"));
 
@@ -1550,20 +1655,21 @@ mod tests {
         }
 
         // Even though flow recording fails, review should succeed (non-fatal).
-        assert!(result.is_ok(), "review verb succeeds despite flow record failure");
+        assert!(
+            result.is_ok(),
+            "review verb succeeds despite flow record failure"
+        );
 
         // Verify no records were written (flow recording failed non-fatally).
         let jsonl_count: usize = std::fs::read_dir(tmp.path())
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .and_then(|s| s.to_str())
-                    == Some("jsonl")
-            })
+            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("jsonl"))
             .count();
-        assert_eq!(jsonl_count, 0, "expected no flow records written to read-only dir");
+        assert_eq!(
+            jsonl_count, 0,
+            "expected no flow records written to read-only dir"
+        );
     }
 
     /// Read all non-schema record lines from jsonl files in a directory.
@@ -1574,7 +1680,8 @@ mod tests {
             .map(|e| e.path())
             .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("jsonl"))
             .collect();
-        paths.iter()
+        paths
+            .iter()
             .flat_map(|p| {
                 let content = std::fs::read_to_string(p).unwrap();
                 content.lines().map(String::from).collect::<Vec<_>>()

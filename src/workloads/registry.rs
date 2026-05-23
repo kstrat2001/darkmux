@@ -3,7 +3,7 @@
 //! behind a `OnceLock<Mutex<...>>` keeps it simple and test-friendly.
 
 use crate::workloads::types::WorkloadProvider;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -33,9 +33,12 @@ pub fn register(provider: Box<dyn WorkloadProvider>) -> Result<()> {
 /// the box's reference under the lock.
 pub fn with_provider<R>(id: &str, f: impl FnOnce(&dyn WorkloadProvider) -> R) -> Result<R> {
     let map = registry().lock().expect("registry poisoned");
-    let p = map
-        .get(id)
-        .ok_or_else(|| anyhow!("unknown workload provider: \"{id}\". Registered: {}", list_inner(&map)))?;
+    let p = map.get(id).ok_or_else(|| {
+        anyhow!(
+            "unknown workload provider: \"{id}\". Registered: {}",
+            list_inner(&map)
+        )
+    })?;
     Ok(f(p.as_ref()))
 }
 
@@ -57,7 +60,10 @@ fn list_inner(map: &HashMap<String, Box<dyn WorkloadProvider>>) -> String {
     if keys.is_empty() {
         "(none)".to_string()
     } else {
-        keys.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+        keys.iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -65,9 +71,7 @@ fn list_inner(map: &HashMap<String, Box<dyn WorkloadProvider>>) -> String {
 mod tests {
     use super::*;
     use crate::types::Profile;
-    use crate::workloads::types::{
-        InspectionReport, LoadedWorkload, RunResult, VerifyOutcome,
-    };
+    use crate::workloads::types::{InspectionReport, LoadedWorkload, RunResult, VerifyOutcome};
     use std::path::Path;
 
     /// A minimal stub provider for tests. We use a unique id per test so
@@ -91,6 +95,7 @@ mod tests {
             _: &Profile,
             _: &str,
             _: crate::crew::dispatch::Runtime,
+            _: &str,
         ) -> Result<RunResult> {
             Ok(RunResult {
                 ok: true,

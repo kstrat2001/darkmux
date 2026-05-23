@@ -5,7 +5,7 @@
 //! `scribe` profile), and writes the draft to .darkmux/notebook/<date>-<slug>.md.
 
 use crate::lab::paths::{self, ResolveScope};
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::env;
 use std::fs;
@@ -83,8 +83,15 @@ pub fn draft_entry(opts: &DraftOptions) -> Result<DraftReport> {
     let run_data = build_run_data_summary(&run_dir, &manifest)?;
     let prompt = NOTEBOOK_PROMPT_TEMPLATE.replace("{run_data}", &run_data);
 
-    // Dispatch to the runtime.
-    let runtime_cmd = env::var("DARKMUX_RUNTIME_CMD").unwrap_or_else(|_| "openclaw".to_string());
+    // Dispatch to the runtime. Post-Sprint-E: notebook draft is
+    // openclaw-coupled today (uses `openclaw agent --agent <id>` shell-
+    // out). Sprint-G will decouple this surface — either route through
+    // the internal runtime or surface a `--runtime-cmd` flag. For
+    // Sprint-E the path is hardcoded to `openclaw`; operators using
+    // Aider / Cline for notebook drafts will lose that hatch (rare;
+    // env var was the only mechanism, and pure-DM notebook drafting
+    // is the strategic direction).
+    let runtime_cmd = "openclaw";
     let session_id = format!(
         "darkmux-notebook-{}-{}",
         opts.run_id,
@@ -97,7 +104,7 @@ pub fn draft_entry(opts: &DraftOptions) -> Result<DraftReport> {
     let entry_text = if opts.dry_run {
         format!("[DRY RUN — would have dispatched the prompt below to '{runtime_cmd} agent --agent {} --message ...']\n\n{prompt}", opts.agent)
     } else {
-        let output = Command::new(&runtime_cmd)
+        let output = Command::new(runtime_cmd)
             .args([
                 "agent",
                 "--agent",
@@ -125,17 +132,16 @@ pub fn draft_entry(opts: &DraftOptions) -> Result<DraftReport> {
 
     // Compose the entry path: <date>-<slug>.md
     let date = chrono_like_today();
-    let slug = opts
-        .slug
-        .clone()
-        .unwrap_or_else(|| slugify(&format!(
+    let slug = opts.slug.clone().unwrap_or_else(|| {
+        slugify(&format!(
             "{}-{}",
             manifest
                 .get("workload")
                 .and_then(|v| v.as_str())
                 .unwrap_or("run"),
             shortid(&opts.run_id)
-        )));
+        ))
+    });
     let entry_path = paths.notebook.join(format!("{date}-{slug}.md"));
 
     if !opts.dry_run {
@@ -183,7 +189,10 @@ fn build_run_data_summary(run_dir: &Path, manifest: &Value) -> Result<String> {
         .get("durationMs")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
-    let ok = manifest.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+    let ok = manifest
+        .get("ok")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     // Trajectory-derived metrics (best effort). The prompt provider doesn't
     // write a trajectory file — its runs are structurally single-turn, so we
@@ -203,7 +212,9 @@ fn build_run_data_summary(run_dir: &Path, manifest: &Value) -> Result<String> {
             if line.trim().is_empty() {
                 continue;
             }
-            let Ok(ev) = serde_json::from_str::<Value>(line) else { continue };
+            let Ok(ev) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
             if ev.get("type").and_then(|t| t.as_str()) != Some("prompt.submitted") {
                 continue;
             }
@@ -222,11 +233,8 @@ fn build_run_data_summary(run_dir: &Path, manifest: &Value) -> Result<String> {
                         let key: String = summary_str.chars().take(80).collect();
                         if seen_summaries.insert(key) {
                             compactions += 1;
-                            tokens_before.push(
-                                m.get("tokensBefore")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0),
-                            );
+                            tokens_before
+                                .push(m.get("tokensBefore").and_then(|v| v.as_u64()).unwrap_or(0));
                         }
                     }
                 }
@@ -251,7 +259,9 @@ fn build_run_data_summary(run_dir: &Path, manifest: &Value) -> Result<String> {
             let preview = extract_reply_text(&raw);
             if !preview.is_empty() {
                 let truncated: String = preview.chars().take(800).collect();
-                summary.push_str(&format!("\n## reply preview (first 800 chars)\n\n{truncated}\n"));
+                summary.push_str(&format!(
+                    "\n## reply preview (first 800 chars)\n\n{truncated}\n"
+                ));
             }
         }
     }
@@ -273,7 +283,11 @@ fn extract_reply_text(stdout: &str) -> String {
     if let Some(payloads) = payloads {
         return payloads
             .iter()
-            .filter_map(|p| p.get("text").and_then(|t| t.as_str()).map(|s| s.to_string()))
+            .filter_map(|p| {
+                p.get("text")
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.to_string())
+            })
             .collect::<Vec<_>>()
             .join("\n\n");
     }
@@ -368,7 +382,11 @@ fn chrono_like_today() -> String {
 fn epoch_secs_to_ymd(secs: i64) -> (i32, u32, u32) {
     let days = secs.div_euclid(86_400);
     let z = days + 719_468;
-    let era = if z >= 0 { z / 146_097 } else { (z - 146_096) / 146_097 };
+    let era = if z >= 0 {
+        z / 146_097
+    } else {
+        (z - 146_096) / 146_097
+    };
     let doe = (z - era * 146_097) as u32;
     let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
     let y = yoe as i32 + era as i32 * 400;
@@ -419,11 +437,7 @@ pub fn list_entries(dir: &Path, machine_filter: Option<&str>) -> Result<Vec<Note
     }
 
     // Sort by date descending (newest first).
-    entries.sort_by(|a, b| {
-        b.date
-            .cmp(&a.date)
-            .then(b.run.cmp(&a.run))
-    });
+    entries.sort_by(|a, b| b.date.cmp(&a.date).then(b.run.cmp(&a.run)));
 
     Ok(entries)
 }
@@ -433,7 +447,9 @@ pub fn parse_notebook_header(content: &str, path: &Path) -> Option<NotebookEntry
     // Header is expected on line 1: `<!-- darkmux:notebook-entry: run=X machine=Y date=Z -->`
     let line = content.lines().next()?;
     // Strip HTML comment delimiters.
-    let inner = line.strip_prefix("<!--").and_then(|s| s.strip_suffix("-->"))?;
+    let inner = line
+        .strip_prefix("<!--")
+        .and_then(|s| s.strip_suffix("-->"))?;
     // Parse key=value pairs.
     let mut run = String::new();
     let mut machine = String::new();
@@ -472,11 +488,15 @@ mod tests {
         let prev = env::var("DARKMUX_MACHINE_ID").ok();
         // Safety: tests in this module are #[serial_test::serial] so env mutation
         // is sequenced across the file's tests.
-        unsafe { env::set_var("DARKMUX_MACHINE_ID", "m5-max-home"); }
+        unsafe {
+            env::set_var("DARKMUX_MACHINE_ID", "m5-max-home");
+        }
         assert_eq!(machine_fingerprint(), "m5-max-home");
 
         // Empty value falls back to auto-detection (not propagated as empty).
-        unsafe { env::set_var("DARKMUX_MACHINE_ID", "   "); }
+        unsafe {
+            env::set_var("DARKMUX_MACHINE_ID", "   ");
+        }
         let auto = machine_fingerprint();
         assert_ne!(auto, "");
         assert_ne!(auto, "   ");
@@ -763,7 +783,8 @@ mod tests {
     /// parse_notebook_header correctly extracts run/machine/date.
     #[test]
     fn parse_header_extracts_all_fields() {
-        let header = "<!-- darkmux:notebook-entry: run=xyz789 machine=m5-max-home date=2026-03-15 -->\n";
+        let header =
+            "<!-- darkmux:notebook-entry: run=xyz789 machine=m5-max-home date=2026-03-15 -->\n";
         let entry = parse_notebook_header(header, Path::new("test.md")).unwrap();
         assert_eq!(entry.run, "xyz789");
         assert_eq!(entry.machine, "m5-max-home");
@@ -774,7 +795,8 @@ mod tests {
     #[test]
     fn parse_header_malformed_returns_none() {
         // Missing one field.
-        let header = "<!-- darkmux:notebook-entry: run=abc machine=m5 date=2026-01-01 extra=val -->\n";
+        let header =
+            "<!-- darkmux:notebook-entry: run=abc machine=m5 date=2026-01-01 extra=val -->\n";
         let entry = parse_notebook_header(header, Path::new("test.md")).unwrap();
         assert_eq!(entry.run, "abc");
         assert_eq!(entry.machine, "m5");
@@ -797,7 +819,9 @@ mod tests {
         let prev = env::var("DARKMUX_MACHINE_ID").ok();
 
         // 1. Explicit override wins over both env var and fingerprint.
-        unsafe { env::set_var("DARKMUX_MACHINE_ID", "env-fingerprint"); }
+        unsafe {
+            env::set_var("DARKMUX_MACHINE_ID", "env-fingerprint");
+        }
         let opts_with_override = DraftOptions {
             run_id: "x".into(),
             agent: "main".into(),
@@ -819,7 +843,9 @@ mod tests {
 
         // 3. With no override AND no env var, falls back to hardware fingerprint
         //    (non-empty per machine_fingerprint() contract).
-        unsafe { env::remove_var("DARKMUX_MACHINE_ID"); }
+        unsafe {
+            env::remove_var("DARKMUX_MACHINE_ID");
+        }
         let fp = resolve_machine_id(&opts_no_override);
         assert!(!fp.is_empty(), "fingerprint must not be empty");
         assert_ne!(fp, "override-machine");

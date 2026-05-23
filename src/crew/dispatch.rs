@@ -17,8 +17,8 @@
 
 use crate::crew::loader::{load_role_prompt, load_roles, load_sprints};
 use crate::crew::types::Role;
-use anyhow::{Context, Result, anyhow, bail};
-use serde_json::{Map, Value, json};
+use anyhow::{anyhow, bail, Context, Result};
+use serde_json::{json, Map, Value};
 use std::fs;
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -36,11 +36,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// `~/.darkmux/acks/<role>.ack`. The ack is operator-sovereign:
 /// the operator can pre-create the file (`touch ~/.darkmux/acks/<role>.ack`)
 /// to skip the prompt in scripted contexts, or delete it to re-trigger.
-const LICENSED_ADJACENT_ROLES: &[&str] = &[
-    "health-research",
-    "legal-research",
-    "fitness-coach",
-];
+const LICENSED_ADJACENT_ROLES: &[&str] = &["health-research", "legal-research", "fitness-coach"];
 
 /// Default openclaw config path. `DARKMUX_OPENCLAW_CONFIG` env var overrides
 /// (e.g., for tests). Visible to other crates so the doctor pin-drift
@@ -75,7 +71,11 @@ pub fn default_workspace_for_role(role_id: &str) -> PathBuf {
 /// to a filesystem-safe nested path (`agents/darkmux/<role>/agent`) and a
 /// flat workspace slug (`workspace-darkmux-<role>`).
 fn agent_dirs_for(role_id: &str, openclaw_root: &Path) -> (PathBuf, PathBuf) {
-    let agent_dir = openclaw_root.join("agents").join("darkmux").join(role_id).join("agent");
+    let agent_dir = openclaw_root
+        .join("agents")
+        .join("darkmux")
+        .join(role_id)
+        .join("agent");
     let workspace = openclaw_root.join(format!("workspace-darkmux-{role_id}"));
     (agent_dir, workspace)
 }
@@ -104,41 +104,19 @@ fn ack_file_for(role_id: &str) -> Result<PathBuf> {
 fn print_licensed_adjacent_banner(role_id: &str) {
     eprintln!();
     eprintln!("=== licensed-adjacent role: {role_id} ===");
-    eprintln!(
-        "This role operates in a domain regulated by professional licensure."
-    );
-    eprintln!(
-        "It is a research / organization assistant — NOT a substitute for a"
-    );
-    eprintln!(
-        "licensed professional. The role's full doctrine is in the .md prompt"
-    );
-    eprintln!(
-        "at templates/builtin/roles/{role_id}.md in the darkmux source"
-    );
-    eprintln!(
-        "(or your override at ~/.darkmux/roles/{role_id}.md if set)."
-    );
+    eprintln!("This role operates in a domain regulated by professional licensure.");
+    eprintln!("It is a research / organization assistant — NOT a substitute for a");
+    eprintln!("licensed professional. The role's full doctrine is in the .md prompt");
+    eprintln!("at templates/builtin/roles/{role_id}.md in the darkmux source");
+    eprintln!("(or your override at ~/.darkmux/roles/{role_id}.md if set).");
     eprintln!();
     eprintln!("By acknowledging, you confirm you understand:");
-    eprintln!(
-        "  - The local LLM may deviate from its system prompt under adversarial"
-    );
-    eprintln!(
-        "    or persistent prompting. The prompt IS the only runtime boundary."
-    );
-    eprintln!(
-        "  - You are solely responsible for following jurisdiction-specific"
-    );
-    eprintln!(
-        "    licensure rules (UPL / UPM / scope-of-practice)."
-    );
-    eprintln!(
-        "  - Time-sensitive situations (medical emergency, served lawsuit,"
-    );
-    eprintln!(
-        "    acute pain) go to professionals, not this tool."
-    );
+    eprintln!("  - The local LLM may deviate from its system prompt under adversarial");
+    eprintln!("    or persistent prompting. The prompt IS the only runtime boundary.");
+    eprintln!("  - You are solely responsible for following jurisdiction-specific");
+    eprintln!("    licensure rules (UPL / UPM / scope-of-practice).");
+    eprintln!("  - Time-sensitive situations (medical emergency, served lawsuit,");
+    eprintln!("    acute pain) go to professionals, not this tool.");
     eprintln!();
 }
 
@@ -307,6 +285,17 @@ pub struct DispatchOpts {
     /// Which agent runtime to dispatch through. See [`Runtime`].
     /// Default: `Runtime::Internal` (the in-house container-bounded path).
     pub runtime: Runtime,
+    /// Executable path for the openclaw shell-out (Sprint-E). Defaults
+    /// to `"openclaw"`; operators override via `--runtime-cmd <path>`
+    /// to point at Aider / Cline / any tool exposing the
+    /// `<cmd> agent --agent <id> --json ...` calling convention.
+    /// **Ignored when `runtime == Runtime::Internal`** — internal-runtime
+    /// dispatches use the in-house Rust loop and don't shell out.
+    ///
+    /// Replaces the pre-Sprint-E global env var `DARKMUX_RUNTIME_CMD`.
+    /// Per-dispatch override (operator sovereignty); no implicit global
+    /// state to surprise the operator across sessions.
+    pub runtime_cmd: String,
     /// Target machine for the dispatch (#246 PR-C.3). When `Some(<id>)`
     /// and `<id>` differs from the local `DARKMUX_MACHINE_ID`, the
     /// dispatch is published to `darkmux:work:<role-tier>` via
@@ -637,10 +626,7 @@ fn augment_message_with_sprint_context(
         let path = sprint_output_path(&sprint.mission_id, parent_id);
         match fs::read_to_string(&path) {
             Ok(content) if !content.trim().is_empty() => {
-                parent_blocks.push(format!(
-                    "### {parent_id}\n\n{}\n",
-                    content.trim_end()
-                ));
+                parent_blocks.push(format!("### {parent_id}\n\n{}\n", content.trim_end()));
             }
             _ => {
                 missing_parents.push(parent_id.clone());
@@ -705,10 +691,7 @@ fn augment_message_with_sprint_context(
 /// Returns the path written when persistence happened, `None`
 /// otherwise. Errors are logged but don't fail the dispatch itself —
 /// best-effort for downstream sprints.
-fn persist_sprint_output(
-    sprint_id: Option<&str>,
-    reply_text: &str,
-) -> Option<PathBuf> {
+fn persist_sprint_output(sprint_id: Option<&str>, reply_text: &str) -> Option<PathBuf> {
     let sprint_id = sprint_id?;
     if reply_text.trim().is_empty() {
         return None;
@@ -775,10 +758,7 @@ enum WorkdirOutcome {
 ///   explicit declaration persists until they `rm` it or pass a
 ///   different `--workdir`. This avoids the crash-mid-dispatch
 ///   restore-fragility class of bugs.
-fn apply_workdir_override(
-    workdir: Option<&Path>,
-    role_workspace: &Path,
-) -> Result<WorkdirOutcome> {
+fn apply_workdir_override(workdir: Option<&Path>, role_workspace: &Path) -> Result<WorkdirOutcome> {
     let Some(target) = workdir else {
         return Ok(WorkdirOutcome::NoChange);
     };
@@ -792,9 +772,8 @@ fn apply_workdir_override(
     // for filesystem ops is captured at the link-create site below.
     let _resolved = crate::workdir::validate_workdir(target)?;
 
-    fs::create_dir_all(role_workspace).with_context(|| {
-        format!("creating role workspace {}", role_workspace.display())
-    })?;
+    fs::create_dir_all(role_workspace)
+        .with_context(|| format!("creating role workspace {}", role_workspace.display()))?;
 
     let link_path = role_workspace.join("repo");
 
@@ -817,9 +796,8 @@ fn apply_workdir_override(
 
     // Remove the existing symlink (if any) and create a fresh one.
     if link_path.is_symlink() {
-        fs::remove_file(&link_path).with_context(|| {
-            format!("removing existing symlink at {}", link_path.display())
-        })?;
+        fs::remove_file(&link_path)
+            .with_context(|| format!("removing existing symlink at {}", link_path.display()))?;
     }
 
     let absolute_target = target
@@ -868,13 +846,18 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     if let Some(target) = opts.machine.clone() {
         let local = crate::flow::resolve_machine_id();
         match routing_decision(Some(target.as_str()), local.as_deref()) {
-            RoutingDecision::Local { matches_was_explicit: true } => {
+            RoutingDecision::Local {
+                matches_was_explicit: true,
+            } => {
                 eprintln!(
                     "darkmux crew dispatch: --machine={target} matches local machine_id; \
                      routing locally."
                 );
             }
-            RoutingDecision::Remote { target, local_unknown: true } => {
+            RoutingDecision::Remote {
+                target,
+                local_unknown: true,
+            } => {
                 // PR-C.3 review MEDIUM (Wave-E.7): local machine_id is
                 // unresolvable (no DARKMUX_MACHINE_ID, hostname failed).
                 // Routing via queue is the only option — surface the
@@ -892,16 +875,16 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
                 // failure OR an invalid tier doesn't leave a misleading
                 // "pinned" record in the audit chain.
                 let role_tier = resolve_role_tier_for_record(&opts)?;
-                let session_id = emit_route_record_and_resolve_session(
-                    &opts,
-                    &role_tier,
-                    Some(&target),
-                );
+                let session_id =
+                    emit_route_record_and_resolve_session(&opts, &role_tier, Some(&target));
                 let mut opts = opts;
                 opts.session_id = Some(session_id);
                 return dispatch_via_queue(opts, Some(&target));
             }
-            RoutingDecision::Remote { target, local_unknown: false } => {
+            RoutingDecision::Remote {
+                target,
+                local_unknown: false,
+            } => {
                 // #290 — emit the pinned route record so the audit
                 // trail + topology UI see the operator-pinned routing
                 // decision (parity with the auto-route path's record).
@@ -909,16 +892,15 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
                 // failure OR an invalid tier doesn't leave a misleading
                 // "pinned" record in the audit chain.
                 let role_tier = resolve_role_tier_for_record(&opts)?;
-                let session_id = emit_route_record_and_resolve_session(
-                    &opts,
-                    &role_tier,
-                    Some(&target),
-                );
+                let session_id =
+                    emit_route_record_and_resolve_session(&opts, &role_tier, Some(&target));
                 let mut opts = opts;
                 opts.session_id = Some(session_id);
                 return dispatch_via_queue(opts, Some(&target));
             }
-            RoutingDecision::Local { matches_was_explicit: false } => {
+            RoutingDecision::Local {
+                matches_was_explicit: false,
+            } => {
                 // Unreachable in this branch (we matched Some(target) above)
                 // — but the enum's total shape covers it.
             }
@@ -1011,10 +993,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     //      explicit workdir, set up the role's workspace `repo` symlink
     //      to point at it. When omitted, the workspace is left whatever
     //      state it was in (no auto-mutation).
-    let workdir_outcome = apply_workdir_override(
-        opts.workdir.as_deref(),
-        &role_workspace,
-    )?;
+    let workdir_outcome = apply_workdir_override(opts.workdir.as_deref(), &role_workspace)?;
     if let WorkdirOutcome::Applied { previous_target } = &workdir_outcome {
         let absolute_target = opts
             .workdir
@@ -1042,10 +1021,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     //       sprint outputs" context block. One-hop only — transitive
     //       ancestors are NOT walked. Missing parent outputs are
     //       logged and the dispatch proceeds with whatever's available.
-    let augmented_message = augment_message_with_sprint_context(
-        opts.sprint_id.as_deref(),
-        &opts.message,
-    )?;
+    let augmented_message =
+        augment_message_with_sprint_context(opts.sprint_id.as_deref(), &opts.message)?;
 
     // 3. Resolve session id. Always pass `--session-id` to openclaw — when
     //    the caller didn't supply one, generate a fresh `crew-dispatch-
@@ -1091,8 +1068,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
 
     let dispatch_start_instant = std::time::Instant::now();
 
-    // 4. Invoke openclaw agent
-    let mut cmd = Command::new("openclaw");
+    // 4. Invoke openclaw agent (or operator-supplied --runtime-cmd binary)
+    let mut cmd = Command::new(&opts.runtime_cmd);
     cmd.args(["agent", "--local", "--agent", &agent_id, "--json"]);
     cmd.args(["--session-id", &resolved_session_id]);
     cmd.args(["--timeout", &opts.timeout_seconds.to_string()]);
@@ -1106,7 +1083,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
 
     let output_result = cmd
         .output()
-        .with_context(|| format!("running `openclaw agent {agent_id}`"));
+        .with_context(|| format!("running `{} agent {agent_id}`", opts.runtime_cmd));
 
     let wall_ms = dispatch_start_instant.elapsed().as_millis() as u64;
 
@@ -1118,11 +1095,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         _ => ("dispatch error", crate::flow::Level::Error),
     };
     let (stdout_chars, stderr_chars, exit_code) = match &output_result {
-        Ok(o) => (
-            o.stdout.len(),
-            o.stderr.len(),
-            o.status.code(),
-        ),
+        Ok(o) => (o.stdout.len(), o.stderr.len(), o.status.code()),
         Err(_) => (0, 0, None),
     };
     let dispatch_complete_payload = serde_json::json!({
@@ -1178,8 +1151,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     //    to hand-edit the output file or accept the prior recording.
     if output.status.success() {
         if let Some(sprint_id) = opts.sprint_id.as_deref() {
-            let reply_text = extract_payload_text(&stdout_text)
-                .unwrap_or_else(|| stdout_text.clone());
+            let reply_text =
+                extract_payload_text(&stdout_text).unwrap_or_else(|| stdout_text.clone());
             if let Some(path) = persist_sprint_output(Some(sprint_id), &reply_text) {
                 eprintln!(
                     "darkmux crew dispatch: sprint `{sprint_id}` output persisted to {}",
@@ -1256,7 +1229,8 @@ fn dispatch_via_queue(opts: DispatchOpts, target_machine: Option<&str>) -> Resul
                  register on inference/hub/client streams). Either: (a) edit \
                  the role manifest to declare a concrete tier, or (b) omit \
                  --machine to dispatch locally.",
-                opts.role_id, t
+                opts.role_id,
+                t
             );
         }
         None => {
@@ -1281,9 +1255,7 @@ fn dispatch_via_queue(opts: DispatchOpts, target_machine: Option<&str>) -> Resul
         .ok_or_else(|| {
             let context = match target_machine {
                 Some(m) => format!("--machine={m}"),
-                None => format!(
-                    "cross-tier auto-route (local tier != role tier=`{role_tier}`)"
-                ),
+                None => format!("cross-tier auto-route (local tier != role tier=`{role_tier}`)"),
             };
             anyhow!(
                 "{context} requires DARKMUX_REDIS_URL to be set \
@@ -1326,8 +1298,7 @@ fn dispatch_via_queue(opts: DispatchOpts, target_machine: Option<&str>) -> Resul
 
     // Publish — `publish_job` runs validate() before XADD, so a
     // malformed job bails before crossing the network.
-    let work_id = fleet::publish_job(&client, &job)
-        .context("publishing WorkJob to fleet queue")?;
+    let work_id = fleet::publish_job(&client, &job).context("publishing WorkJob to fleet queue")?;
 
     eprintln!(
         "darkmux crew dispatch: published work_id={work_id} tier={} \
@@ -1351,9 +1322,8 @@ fn dispatch_via_queue(opts: DispatchOpts, target_machine: Option<&str>) -> Resul
     // Block on the worker's dispatch.complete. Timeout = the job's own
     // timeout + a small slack (the worker's clock starts at claim, so
     // the dispatching client's wait must outlast the worker's budget).
-    let wait_timeout = std::time::Duration::from_secs(
-        (opts.timeout_seconds as u64).saturating_add(30),
-    );
+    let wait_timeout =
+        std::time::Duration::from_secs((opts.timeout_seconds as u64).saturating_add(30));
     eprintln!(
         "darkmux crew dispatch: waiting for dispatch.complete (session={session_id}, \
          timeout={}s)…",
@@ -1583,15 +1553,14 @@ fn auto_route_target_tier(opts: &DispatchOpts) -> Result<Option<String>> {
 /// - `(Some(t), Some(l))` where `t != l` → Remote (normal cross-machine)
 /// - `(Some(t), None)` → Remote with `local_unknown=true` (operator-
 ///   visible warning; PR-C.3 review MEDIUM)
-pub fn routing_decision(
-    machine: Option<&str>,
-    local_machine_id: Option<&str>,
-) -> RoutingDecision {
+pub fn routing_decision(machine: Option<&str>, local_machine_id: Option<&str>) -> RoutingDecision {
     match (machine, local_machine_id) {
-        (None, _) => RoutingDecision::Local { matches_was_explicit: false },
-        (Some(t), Some(l)) if t == l => {
-            RoutingDecision::Local { matches_was_explicit: true }
-        }
+        (None, _) => RoutingDecision::Local {
+            matches_was_explicit: false,
+        },
+        (Some(t), Some(l)) if t == l => RoutingDecision::Local {
+            matches_was_explicit: true,
+        },
         (Some(t), Some(_)) => RoutingDecision::Remote {
             target: t.to_string(),
             local_unknown: false,
@@ -1646,14 +1615,7 @@ pub(crate) fn build_dispatch_record(
     session_id: &str,
     model: Option<&str>,
 ) -> crate::flow::FlowRecord {
-    build_dispatch_record_with_payload(
-        level,
-        action,
-        role_id,
-        session_id,
-        model,
-        None,
-    )
+    build_dispatch_record_with_payload(level, action, role_id, session_id, model, None)
 }
 
 /// Same as `build_dispatch_record` but with an explicit `payload` for
@@ -1755,7 +1717,9 @@ fn role_prompt_or_bail(role: &Role) -> Result<String> {
             "role `{}` has no `.md` system prompt. Author one at \
              `templates/builtin/roles/{}.md` (or override at \
              `<crew_root>/roles/{}.md`).",
-            role.id, role.id, role.id
+            role.id,
+            role.id,
+            role.id
         )
     })
 }
@@ -1783,7 +1747,12 @@ fn read_openclaw_config(path: &Path) -> Result<Value> {
 ///   - **model pin (#182)**: `agents.list[].model` matches the active pin
 ///     table's expectation for this role (closes the last silent-fallback
 ///     hole — sync-time + doctor-time + dispatch-time enforcement chain)
-fn preflight_check(config: &Value, agent_id: &str, role: &Role, expected_prompt: &str) -> Result<()> {
+fn preflight_check(
+    config: &Value,
+    agent_id: &str,
+    role: &Role,
+    expected_prompt: &str,
+) -> Result<()> {
     let agents_list = config
         .get("agents")
         .and_then(|a| a.get("list"))
@@ -1914,7 +1883,12 @@ pub fn sync(opts: SyncOpts) -> Result<SyncResult> {
     let mut config = read_openclaw_config(&openclaw_path)?;
     let openclaw_root = openclaw_path
         .parent()
-        .ok_or_else(|| anyhow!("openclaw config path has no parent: {}", openclaw_path.display()))?
+        .ok_or_else(|| {
+            anyhow!(
+                "openclaw config path has no parent: {}",
+                openclaw_path.display()
+            )
+        })?
         .to_path_buf();
 
     let mut result = SyncResult::default();
@@ -1954,9 +1928,9 @@ pub fn sync(opts: SyncOpts) -> Result<SyncResult> {
         let (agent_dir, workspace_dir) = agent_dirs_for(&role.id, &openclaw_root);
 
         let expected_entry = build_agent_entry(role, &prompt, &agent_dir, &workspace_dir);
-        let existing_pos = agents_list.iter().position(|a| {
-            a.get("id").and_then(|s| s.as_str()) == Some(&agent_id)
-        });
+        let existing_pos = agents_list
+            .iter()
+            .position(|a| a.get("id").and_then(|s| s.as_str()) == Some(&agent_id));
 
         match existing_pos {
             None => {
@@ -2002,12 +1976,26 @@ fn build_agent_entry(role: &Role, prompt: &str, agent_dir: &Path, workspace: &Pa
     let mut tools = Map::new();
     tools.insert(
         "allow".to_string(),
-        Value::Array(role.tool_palette.allow.iter().cloned().map(Value::String).collect()),
+        Value::Array(
+            role.tool_palette
+                .allow
+                .iter()
+                .cloned()
+                .map(Value::String)
+                .collect(),
+        ),
     );
     if !role.tool_palette.deny.is_empty() {
         tools.insert(
             "deny".to_string(),
-            Value::Array(role.tool_palette.deny.iter().cloned().map(Value::String).collect()),
+            Value::Array(
+                role.tool_palette
+                    .deny
+                    .iter()
+                    .cloned()
+                    .map(Value::String)
+                    .collect(),
+            ),
         );
     }
 
@@ -2084,7 +2072,10 @@ mod tests {
 
     // ─── completion_to_dispatch_result (Wave-E.6 #255) ────────────────
 
-    fn completion(result_class: &str, payload: Option<serde_json::Value>) -> crate::fleet::CompletionResult {
+    fn completion(
+        result_class: &str,
+        payload: Option<serde_json::Value>,
+    ) -> crate::fleet::CompletionResult {
         crate::fleet::CompletionResult {
             session_id: "test-sess".to_string(),
             result_class: result_class.to_string(),
@@ -2103,8 +2094,14 @@ mod tests {
             Some(serde_json::json!({"result_class": "error", "exit_code": 42})),
         );
         let r = completion_to_dispatch_result(c);
-        assert_eq!(r.exit_code, 42, "operator-facing exit code must match worker's");
-        assert!(r.stdout.contains("exit_code=42"), "stdout includes exit code");
+        assert_eq!(
+            r.exit_code, 42,
+            "operator-facing exit code must match worker's"
+        );
+        assert!(
+            r.stdout.contains("exit_code=42"),
+            "stdout includes exit code"
+        );
     }
 
     #[test]
@@ -2166,11 +2163,15 @@ mod tests {
     fn routing_decision_no_machine_is_local() {
         assert_eq!(
             routing_decision(None, Some("laptop")),
-            RoutingDecision::Local { matches_was_explicit: false }
+            RoutingDecision::Local {
+                matches_was_explicit: false
+            }
         );
         assert_eq!(
             routing_decision(None, None),
-            RoutingDecision::Local { matches_was_explicit: false }
+            RoutingDecision::Local {
+                matches_was_explicit: false
+            }
         );
     }
 
@@ -2178,7 +2179,9 @@ mod tests {
     fn routing_decision_machine_matches_local_is_local_explicit() {
         assert_eq!(
             routing_decision(Some("laptop"), Some("laptop")),
-            RoutingDecision::Local { matches_was_explicit: true }
+            RoutingDecision::Local {
+                matches_was_explicit: true
+            }
         );
     }
 
@@ -2235,7 +2238,9 @@ mod tests {
         let prev = std::env::var("DARKMUX_ACK_DIR").ok();
         // Safety: tests mutate process env; the serial attribute keeps them
         // from racing each other.
-        unsafe { std::env::set_var("DARKMUX_ACK_DIR", tmp.path()); }
+        unsafe {
+            std::env::set_var("DARKMUX_ACK_DIR", tmp.path());
+        }
         std::fs::create_dir_all(tmp.path()).unwrap();
         std::fs::write(tmp.path().join("health-research.ack"), "test").unwrap();
 
@@ -2297,15 +2302,24 @@ mod tests {
         fs::write(
             &identity_path,
             "Name: Kain.\nPronouns: He/Him.\nTimezone: Asia/Kuala_Lumpur.\n",
-        ).unwrap();
+        )
+        .unwrap();
         let prev = std::env::var("DARKMUX_IDENTITY_PATH").ok();
-        unsafe { std::env::set_var("DARKMUX_IDENTITY_PATH", &identity_path); }
+        unsafe {
+            std::env::set_var("DARKMUX_IDENTITY_PATH", &identity_path);
+        }
 
         let augmented = augment_prompt_with_identity("# Role\n\nyou are X");
         // Role prompt preserved verbatim at the start.
-        assert!(augmented.starts_with("# Role\n\nyou are X"), "got: {augmented}");
+        assert!(
+            augmented.starts_with("# Role\n\nyou are X"),
+            "got: {augmented}"
+        );
         // About-the-operator section appended.
-        assert!(augmented.contains("## About the operator"), "got: {augmented}");
+        assert!(
+            augmented.contains("## About the operator"),
+            "got: {augmented}"
+        );
         // Identity content present.
         assert!(augmented.contains("Name: Kain"), "got: {augmented}");
         assert!(augmented.contains("Asia/Kuala_Lumpur"), "got: {augmented}");
@@ -2327,7 +2341,9 @@ mod tests {
         let identity_path = tmp.path().join("identity.md");
         fs::write(&identity_path, "   \n  \n").unwrap();
         let prev = std::env::var("DARKMUX_IDENTITY_PATH").ok();
-        unsafe { std::env::set_var("DARKMUX_IDENTITY_PATH", &identity_path); }
+        unsafe {
+            std::env::set_var("DARKMUX_IDENTITY_PATH", &identity_path);
+        }
 
         let augmented = augment_prompt_with_identity("# Role\n\nyou are X");
         // Empty/whitespace identity file = no augmentation. Operator
@@ -2368,7 +2384,9 @@ mod tests {
     fn augment_message_passes_through_when_sprint_has_no_deps() {
         let tmp = TempDir::new().unwrap();
         let prev = std::env::var("DARKMUX_CREW_DIR").ok();
-        unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()); }
+        unsafe {
+            std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
+        }
         // Per-mission layout (#148): missions/<mission_id>/sprints/<sprint_id>.json
         let sprints_dir = tmp.path().join("missions").join("m").join("sprints");
         fs::create_dir_all(&sprints_dir).unwrap();
@@ -2393,7 +2411,9 @@ mod tests {
     fn augment_message_injects_parent_output_when_recorded() {
         let tmp = TempDir::new().unwrap();
         let prev = std::env::var("DARKMUX_CREW_DIR").ok();
-        unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()); }
+        unsafe {
+            std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
+        }
         // Per-mission layout (#148): missions/<mission_id>/sprints/<sprint_id>.json
         let sprints_dir = tmp.path().join("missions").join("m").join("sprints");
         fs::create_dir_all(&sprints_dir).unwrap();
@@ -2432,7 +2452,9 @@ mod tests {
         // recorded one and the stderr should flag the missing one.
         let tmp = TempDir::new().unwrap();
         let prev = std::env::var("DARKMUX_CREW_DIR").ok();
-        unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()); }
+        unsafe {
+            std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
+        }
         // Per-mission layout (#148): missions/<mission_id>/sprints/<sprint_id>.json
         let sprints_dir = tmp.path().join("missions").join("m").join("sprints");
         fs::create_dir_all(&sprints_dir).unwrap();
@@ -2449,7 +2471,11 @@ mod tests {
             r#"{"id":"child","mission_id":"m","description":"d","status":"planned","depends_on":["parent-a","parent-b"],"created_ts":0}"#,
         ).unwrap();
         // Only parent-a has a recorded output; co-located with manifests.
-        fs::write(sprints_dir.join("parent-a-output.txt"), "parent-a finished X").unwrap();
+        fs::write(
+            sprints_dir.join("parent-a-output.txt"),
+            "parent-a finished X",
+        )
+        .unwrap();
 
         let result = augment_message_with_sprint_context(Some("child"), "child task").unwrap();
         assert!(result.contains("### parent-a"), "got: {result}");
@@ -2473,7 +2499,9 @@ mod tests {
     fn augment_message_falls_back_to_bare_when_no_parent_outputs_recorded() {
         let tmp = TempDir::new().unwrap();
         let prev = std::env::var("DARKMUX_CREW_DIR").ok();
-        unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()); }
+        unsafe {
+            std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
+        }
         // Per-mission layout (#148): missions/<mission_id>/sprints/<sprint_id>.json
         let sprints_dir = tmp.path().join("missions").join("m").join("sprints");
         fs::create_dir_all(&sprints_dir).unwrap();
@@ -2503,7 +2531,9 @@ mod tests {
     fn persist_sprint_output_writes_text_to_canonical_path() {
         let tmp = TempDir::new().unwrap();
         let prev = std::env::var("DARKMUX_CREW_DIR").ok();
-        unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()); }
+        unsafe {
+            std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
+        }
 
         // Seed sprint manifest so load_sprint_by_id can resolve mission_id (#148).
         let sprints_dir = tmp.path().join("missions").join("m").join("sprints");
@@ -2519,7 +2549,8 @@ mod tests {
         // New layout: missions/<mission_id>/sprints/<sprint_id>-output.txt
         assert!(
             path.ends_with("missions/m/sprints/my-sprint-output.txt"),
-            "got: {}", path.display()
+            "got: {}",
+            path.display()
         );
 
         // No-op for None sprint_id.
@@ -2554,7 +2585,12 @@ mod tests {
         let workspace = tmp.path().join("workspace-darkmux-coder");
 
         let outcome = apply_workdir_override(Some(&project), &workspace).unwrap();
-        assert!(matches!(outcome, WorkdirOutcome::Applied { previous_target: None }));
+        assert!(matches!(
+            outcome,
+            WorkdirOutcome::Applied {
+                previous_target: None
+            }
+        ));
 
         let link = workspace.join("repo");
         assert!(link.is_symlink());
@@ -2594,7 +2630,10 @@ mod tests {
 
         let err = apply_workdir_override(Some(&missing), &workspace).unwrap_err();
         let s = format!("{err:#}");
-        assert!(s.contains("does not exist") || s.contains("not readable"), "got: {s}");
+        assert!(
+            s.contains("does not exist") || s.contains("not readable"),
+            "got: {s}"
+        );
     }
 
     #[test]
@@ -2613,7 +2652,10 @@ mod tests {
 
         let err = apply_workdir_override(Some(&project), &workspace).unwrap_err();
         let s = format!("{err:#}");
-        assert!(s.contains("not a symlink") || s.contains("refusing to clobber"), "got: {s}");
+        assert!(
+            s.contains("not a symlink") || s.contains("refusing to clobber"),
+            "got: {s}"
+        );
         // And the operator file is intact.
         assert!(real_repo.join("OPERATOR_FILE.txt").exists());
     }
@@ -2624,7 +2666,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let prev = std::env::var("DARKMUX_ACK_DIR").ok();
         // Safety: serialized.
-        unsafe { std::env::set_var("DARKMUX_ACK_DIR", tmp.path()); }
+        unsafe {
+            std::env::set_var("DARKMUX_ACK_DIR", tmp.path());
+        }
 
         // Stdin in tests is not a TTY → the gate should bail with a
         // clear remediation message rather than block on read.
@@ -2645,8 +2689,14 @@ mod tests {
     fn agent_dirs_use_nested_namespace_for_agentdir() {
         let root = Path::new("/tmp/.openclaw");
         let (agent_dir, workspace) = agent_dirs_for("code-reviewer", root);
-        assert_eq!(agent_dir, Path::new("/tmp/.openclaw/agents/darkmux/code-reviewer/agent"));
-        assert_eq!(workspace, Path::new("/tmp/.openclaw/workspace-darkmux-code-reviewer"));
+        assert_eq!(
+            agent_dir,
+            Path::new("/tmp/.openclaw/agents/darkmux/code-reviewer/agent")
+        );
+        assert_eq!(
+            workspace,
+            Path::new("/tmp/.openclaw/workspace-darkmux-code-reviewer")
+        );
     }
 
     #[test]
@@ -2799,16 +2849,22 @@ mod tests {
         // single-role write path here, then exercise the integration path
         // via a CLI test (in tests/cli.rs).
         let role = sample_role();
-        let mut config: Value = serde_json::from_str(&fs::read_to_string(&openclaw_path).unwrap()).unwrap();
-        let agents = config.as_object_mut().unwrap().entry("agents".to_string()).or_insert_with(|| json!({}));
-        let list = agents.as_object_mut().unwrap().entry("list".to_string()).or_insert_with(|| json!([]));
+        let mut config: Value =
+            serde_json::from_str(&fs::read_to_string(&openclaw_path).unwrap()).unwrap();
+        let agents = config
+            .as_object_mut()
+            .unwrap()
+            .entry("agents".to_string())
+            .or_insert_with(|| json!({}));
+        let list = agents
+            .as_object_mut()
+            .unwrap()
+            .entry("list".to_string())
+            .or_insert_with(|| json!([]));
         let entry = build_agent_entry(&role, "PROMPT", Path::new("/x"), Path::new("/y"));
         list.as_array_mut().unwrap().push(entry);
 
-        assert_eq!(
-            config["agents"]["list"][0]["id"],
-            "darkmux/code-reviewer"
-        );
+        assert_eq!(config["agents"]["list"][0]["id"], "darkmux/code-reviewer");
     }
 
     // ─── #88: fresh session id per dispatch ────────────────────────────────
@@ -2821,7 +2877,11 @@ mod tests {
         let suffix = id.trim_start_matches("crew-dispatch-code-reviewer-");
         // Suffix splits into <micros>-<counter>; both digit-only.
         let parts: Vec<&str> = suffix.split('-').collect();
-        assert_eq!(parts.len(), 2, "expected <micros>-<counter>, got {suffix:?}");
+        assert_eq!(
+            parts.len(),
+            2,
+            "expected <micros>-<counter>, got {suffix:?}"
+        );
         let micros: u128 = parts[0].parse().expect("micros should parse as u128");
         let _counter: u64 = parts[1].parse().expect("counter should parse as u64");
         // Plausibly-recent timestamp (post-2020-01-01 in micros).
@@ -2878,9 +2938,9 @@ mod tests {
     #[test]
     fn snapshot_walks_top_level_files() {
         let tmp = TempDir::new().unwrap();
-        write_file(&tmp.path().join("a.txt"), b"AAAAA");      // 5 bytes
-        write_file(&tmp.path().join("b.txt"), b"BB");          // 2 bytes
-        write_file(&tmp.path().join("c.txt"), b"CCCCCCCCCC");  // 10 bytes
+        write_file(&tmp.path().join("a.txt"), b"AAAAA"); // 5 bytes
+        write_file(&tmp.path().join("b.txt"), b"BB"); // 2 bytes
+        write_file(&tmp.path().join("c.txt"), b"CCCCCCCCCC"); // 10 bytes
 
         let s = snapshot_watched_path(tmp.path());
         assert!(!s.unreachable);
@@ -2910,7 +2970,10 @@ mod tests {
         assert!(names.contains("top.txt"));
         assert!(names.contains("nested.txt"));
         // Recursion stops at one level deep — `deep.txt` is two levels in.
-        assert!(!names.contains("deep.txt"), "should not recurse beyond one level");
+        assert!(
+            !names.contains("deep.txt"),
+            "should not recurse beyond one level"
+        );
     }
 
     #[test]
@@ -2957,8 +3020,10 @@ mod tests {
             .map(|f| f.path.file_name().unwrap().to_str().unwrap().to_string())
             .collect();
         assert!(names.contains(&"plain.txt".to_string()));
-        assert!(!names.contains(&"should-not-appear.txt".to_string()),
-            "must not descend into symlinked subdir; got {names:?}");
+        assert!(
+            !names.contains(&"should-not-appear.txt".to_string()),
+            "must not descend into symlinked subdir; got {names:?}"
+        );
     }
 
     #[test]
@@ -2969,9 +3034,7 @@ mod tests {
         assert!(is_openclaw_noise(Path::new("/x/HEARTBEAT.md")));
         assert!(is_openclaw_noise(Path::new("/x/USER.md")));
         // Session bookkeeping
-        assert!(is_openclaw_noise(Path::new(
-            "/x/abc-123.trajectory.jsonl"
-        )));
+        assert!(is_openclaw_noise(Path::new("/x/abc-123.trajectory.jsonl")));
         assert!(is_openclaw_noise(Path::new("/x/sessions.json")));
         // Real operator content stays
         assert!(!is_openclaw_noise(Path::new("/x/output.md")));
@@ -3014,7 +3077,10 @@ mod tests {
         );
         assert_eq!(rec.action, "dispatch start");
         assert_eq!(rec.handle, "coder");
-        assert_eq!(rec.session_id.as_deref(), Some("crew-dispatch-coder-12345-1"));
+        assert_eq!(
+            rec.session_id.as_deref(),
+            Some("crew-dispatch-coder-12345-1")
+        );
         assert_eq!(rec.source.as_deref(), Some("crew_dispatch"));
         assert_eq!(rec.model.as_deref(), Some("darkmux:qwen3.6-35b-a3b"));
         assert!(matches!(rec.tier, crate::flow::Tier::Local));
@@ -3044,7 +3110,10 @@ mod tests {
         );
         assert!(rec.model.is_none());
         let json = serde_json::to_string(&rec).unwrap();
-        assert!(!json.contains("\"model\""), "absent field should serialize away: {json}");
+        assert!(
+            !json.contains("\"model\""),
+            "absent field should serialize away: {json}"
+        );
     }
 
     #[test]
@@ -3125,12 +3194,16 @@ mod tests {
 
         fn set_fleet_file(&self, path: &std::path::Path) {
             // SAFETY: serialized via #[serial].
-            unsafe { std::env::set_var("DARKMUX_FLEET_FILE", path); }
+            unsafe {
+                std::env::set_var("DARKMUX_FLEET_FILE", path);
+            }
         }
 
         fn set_local_tier(&self, tier: &str) {
             // SAFETY: serialized via #[serial].
-            unsafe { std::env::set_var("DARKMUX_MACHINE_TIER", tier); }
+            unsafe {
+                std::env::set_var("DARKMUX_MACHINE_TIER", tier);
+            }
         }
     }
 
@@ -3188,6 +3261,7 @@ mod tests {
             workdir: None,
             sprint_id: None,
             runtime: Runtime::Internal,
+            runtime_cmd: "openclaw".to_string(),
             machine: None,
             wait: true,
         }
@@ -3343,7 +3417,11 @@ mod tests {
         let fleet_path = guard.path().join("fleet.json");
         // Trailing garbage after the JSON object — operator typo or
         // editor corruption. serde_json rejects.
-        std::fs::write(&fleet_path, r#"{ "version": "1", "machines": {} this is broken"#).unwrap();
+        std::fs::write(
+            &fleet_path,
+            r#"{ "version": "1", "machines": {} this is broken"#,
+        )
+        .unwrap();
         guard.set_fleet_file(&fleet_path);
 
         let err = auto_route_target_tier(&opts_for_role("l1-test-coder-6"))

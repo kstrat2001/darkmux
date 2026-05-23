@@ -11,7 +11,7 @@
 //! See `~/.openclaw/PERFORMANCE.md` §1.4.3 (or LAB_NOTEBOOK.md §1960) for
 //! the empirical motivation behind the bimodal model.
 
-use crate::lab::run::{RunOpts, RunOutcome, lab_run};
+use crate::lab::run::{lab_run, RunOpts, RunOutcome};
 use anyhow::Result;
 
 #[derive(Debug, Clone)]
@@ -60,6 +60,9 @@ pub fn tune(opts: &TuneOpts) -> Result<TuneReport> {
         // tune() runs the workload through the default runtime
         // (internal, post-Sprint-D).
         runtime: crate::crew::dispatch::Runtime::Internal,
+        // runtime_cmd is unused by the internal path; "openclaw" for
+        // codebase parity (Sprint-E).
+        runtime_cmd: "openclaw".to_string(),
         instrument: false,
     })?;
     let stats = compute_stats(&outcomes);
@@ -78,10 +81,7 @@ pub fn tune(opts: &TuneOpts) -> Result<TuneReport> {
 /// runs are within 1.5× of each other, treat as a single cluster (no
 /// meaningful bimodal signal).
 pub fn compute_stats(outcomes: &[RunOutcome]) -> DistributionStats {
-    let secs: Vec<u128> = outcomes
-        .iter()
-        .map(|o| o.duration_ms / 1000)
-        .collect();
+    let secs: Vec<u128> = outcomes.iter().map(|o| o.duration_ms / 1000).collect();
     let n = secs.len();
     if n == 0 {
         return DistributionStats {
@@ -299,11 +299,7 @@ mod tests {
 
     #[test]
     fn slow_rate_is_fraction_of_total() {
-        let s = compute_stats(&[
-            outcome(200),
-            outcome(220),
-            outcome(900),
-        ]);
+        let s = compute_stats(&[outcome(200), outcome(220), outcome(900)]);
         assert!((s.slow_rate - 1.0 / 3.0).abs() < 0.01);
     }
 

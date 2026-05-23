@@ -63,7 +63,7 @@
       </tr>
       <tr>
         <td>An agent runtime (e.g. <a href="https://github.com/openclaw/openclaw">OpenClaw</a>, Aider, Cline)</td>
-        <td>For <code>darkmux lab</code> dispatches (default <code>openclaw</code>; override with <code>DARKMUX_RUNTIME_CMD=&lt;your-runtime&gt;</code>), OR if you opt into <code>darkmux crew dispatch --runtime openclaw</code>. Pure <code>swap</code>/<code>status</code>/<code>profiles</code> work without one.</td>
+        <td>Only when you opt into <code>--runtime openclaw</code> on <code>darkmux crew dispatch</code> or <code>darkmux lab run</code> (both default to the internal Docker-bounded runtime). Override the openclaw binary path per dispatch with <code>--runtime-cmd &lt;path&gt;</code> (e.g. for Aider / Cline). Pure <code>swap</code>/<code>status</code>/<code>profiles</code> work without any runtime.</td>
       </tr>
       <tr>
         <td><a href="https://claude.com/claude-code">Claude Code</a> (or any frontier orchestrator)</td>
