@@ -30,6 +30,18 @@ ureq = { version = "2", default-features = false, features = ["json", "tls"] }
 # tempdir + symlink support. tempdir is the simpler crate.
 tempdir = "0.3"
 
+# In-process HTTP mock server. Used by the compaction-loop integration
+# test to stand in for LMStudio without needing a real model loaded —
+# deterministic verification that the runtime's compaction code path
+# actually invokes the compactor model when the threshold trips, vs
+# just verifying the threshold predicate in isolation.
+httpmock = "0.7"
+
+# Serialized test execution for tests that mutate process env vars
+# (compaction threshold, compactor model id). Matches the main crate's
+# convention; same crate version is used there.
+serial_test = "3"
+
 [profile.release]
 strip = "symbols"
 lto = "thin"

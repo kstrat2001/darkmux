@@ -82,6 +82,22 @@ impl Message {
         }
     }
 
+    /// Construct an `assistant` role message. Currently only used by
+    /// tests (real assistant messages come from chat-completion
+    /// responses, where the role is set by the server). Kept on the
+    /// public surface for symmetry with `system`/`user` and so tests
+    /// can build realistic conversation shapes.
+    #[cfg(test)]
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self {
+            role: "assistant".into(),
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
     pub fn tool_result(
         tool_call_id: impl Into<String>,
         name: impl Into<String>,
