@@ -21,6 +21,10 @@ const EMBEDDED_WORKLOADS: &[(&str, &str)] = &[
         "long-agentic",
         include_str!("../../templates/builtin/workloads/long-agentic.json"),
     ),
+    (
+        "quick-coding",
+        include_str!("../../templates/builtin/workloads/quick-coding.json"),
+    ),
 ];
 
 fn find_embedded(id: &str) -> Option<&'static str> {

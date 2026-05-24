@@ -53,6 +53,13 @@ FROM alpine:3.20
 #   curl       — host-networking sanity checks + future HTTP probes from
 #                inside the container
 #   ca-certificates — for any TLS-bearing tool the agent invokes
+#   python3    — stdlib unittest runs out of the box; lets coding-task
+#                workloads with `setupContent: { "*.py": ... }` run their
+#                verify commands inside the container without an external
+#                pip install (#338).
+#   py3-pip    — for workloads that need third-party Python packages
+#                (pytest, requests, etc.); operators install per-dispatch
+#                or per-sandbox as needed.
 RUN apk add --no-cache \
         bash \
         jq \
@@ -65,7 +72,9 @@ RUN apk add --no-cache \
         curl \
         ca-certificates \
         nodejs \
-        npm
+        npm \
+        python3 \
+        py3-pip
 
 # Non-root user. UID 1000 is the convention; matches what a typical
 # host-side macOS user maps to inside Docker for Mac when sharing volumes.

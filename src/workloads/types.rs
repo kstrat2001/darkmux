@@ -67,6 +67,49 @@ pub struct WorkloadSpec {
         rename = "sandboxSeed"
     )]
     pub sandbox_seed: Option<String>,
+    /// Inline sandbox files shipped with the workload manifest itself
+    /// — keys are paths relative to the sandbox dir, values are full
+    /// file contents. The coding-task provider writes each pair into
+    /// the sandbox before dispatch. Lets a workload bring a complete
+    /// runnable scaffold without requiring an external project on
+    /// disk; works with embedded workloads (unlike `sandboxSeed`,
+    /// which needs a sibling directory). Example: a small Python
+    /// file + a unittest that pairs with it.
+    ///
+    /// **Precedence with `sandboxSeed`**: when both are present, the
+    /// seed copy runs first and `setupContent` overlays on top — keys
+    /// in `setupContent` overwrite same-named files from the seed.
+    /// Lets an embedded workload patch a specific file over a copied
+    /// external seed.
+    ///
+    /// **Re-application**: applied on every dispatch (not skip-if-
+    /// exists). The sandbox is operator-mutated by each run (the
+    /// agent edits files); re-applying gives every dispatch a
+    /// deterministic starting point.
+    ///
+    /// **Path safety**: keys MUST be relative paths under the sandbox.
+    /// Absolute paths, `..` components, and Windows drive prefixes are
+    /// rejected at setup time by the coding-task provider — prevents
+    /// untrusted operator-installed workload manifests from writing
+    /// outside the sandbox.
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        rename = "setupContent"
+    )]
+    pub setup_content: BTreeMap<String, String>,
+    /// Marks workloads that depend on an external sandbox (a Node
+    /// project, a real repo checkout) that the operator must provide.
+    /// When true, the coding-task provider checks at setup time
+    /// whether the sandbox dir is empty AND no inline `setupContent`
+    /// is present; if so, bails loud with an operator-actionable
+    /// hint instead of dispatching against an empty workspace.
+    #[serde(
+        default,
+        skip_serializing_if = "std::ops::Not::not",
+        rename = "requiresExternalSandbox"
+    )]
+    pub requires_external_sandbox: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verify: Option<VerifySpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

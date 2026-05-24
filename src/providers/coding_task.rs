@@ -34,18 +34,110 @@ impl WorkloadProvider for CodingTaskProvider {
         if !sandbox_dir.exists() {
             fs::create_dir_all(sandbox_dir)?;
         }
-        let seed_rel = manifest_seed_path(loaded);
-        if seed_rel.is_none() {
-            return Ok(());
+
+        // 1. Apply external sandbox seed (sibling directory referenced
+        //    via `sandboxSeed`). Embedded workloads can't use this
+        //    because include_str! only handles individual files.
+        if let Some(seed_rel) = manifest_seed_path(loaded) {
+            let seed_path = loaded.base_dir.join(&seed_rel);
+            if seed_path.exists() {
+                copy_dir_recursive(&seed_path, sandbox_dir)
+                    .with_context(|| format!("seeding sandbox from {}", seed_path.display()))?;
+            }
         }
-        let seed_rel = seed_rel.unwrap();
-        let seed_path = loaded.base_dir.join(&seed_rel);
-        if !seed_path.exists() {
-            // No seed shipped with this workload — ok, run in empty sandbox.
-            return Ok(());
+
+        // 2. Apply inline setupContent (works with embedded workloads).
+        //    Writes each (relative-path → content) pair into the
+        //    sandbox dir, creating parent directories as needed.
+        //
+        //    Precedence: setupContent OVERLAYS on top of sandboxSeed.
+        //    If both target the same file, setupContent wins. This lets
+        //    an embedded workload patch a specific file over a copied
+        //    seed directory.
+        //
+        //    Re-applies on every dispatch (no skip-if-exists). The
+        //    sandbox is operator-mutated by each run (agent edits land
+        //    on disk); re-applying setupContent gives every dispatch a
+        //    deterministic starting point so re-runs don't measure
+        //    cached agent edits as "instant fixes."
+        if !loaded.manifest.workload.setup_content.is_empty() {
+            for (rel_path, content) in &loaded.manifest.workload.setup_content {
+                // Path-traversal hardening: reject absolute paths, `..`
+                // components, and any key that would resolve outside
+                // sandbox_dir. Embedded workloads are trusted (compiled
+                // in), but `~/.darkmux/workloads/<id>.json` is operator-
+                // installed and may come from a gist / friend / future
+                // install verb. Validate at the receiver, not at install.
+                validate_setup_content_key(rel_path).with_context(|| {
+                    format!("setupContent key `{rel_path}` is unsafe")
+                })?;
+                let target = sandbox_dir.join(rel_path);
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent).with_context(|| {
+                        format!(
+                            "creating parent dir {} for setupContent file {}",
+                            parent.display(),
+                            rel_path
+                        )
+                    })?;
+                }
+                fs::write(&target, content).with_context(|| {
+                    format!("writing setupContent file {}", target.display())
+                })?;
+            }
+            // Operator-visible signal that the sandbox was reset before
+            // the agent ran. Without this, an operator looking at a
+            // mutated `~/.darkmux/sandboxes/<workload>/` couldn't tell
+            // whether the dispatch ran against fresh state or stale
+            // post-prior-edit state.
+            eprintln!(
+                "[lab] setupContent re-applied to {} ({} file(s))",
+                sandbox_dir.display(),
+                loaded.manifest.workload.setup_content.len()
+            );
         }
-        copy_dir_recursive(&seed_path, sandbox_dir)
-            .with_context(|| format!("seeding sandbox from {}", seed_path.display()))?;
+
+        // 3. Loud-fail when the workload declares requiresExternalSandbox
+        //    but the sandbox is empty AND no inline setup content was
+        //    applied. Without this check, the dispatch would proceed
+        //    against an empty workspace and the agent would hallucinate
+        //    files that don't exist — wasting wall-clock for unactionable
+        //    output. Operator-actionable hint names the env var.
+        if loaded.manifest.workload.requires_external_sandbox
+            && loaded.manifest.workload.setup_content.is_empty()
+            && sandbox_is_empty(sandbox_dir)
+        {
+            let env_key = format!(
+                "DARKMUX_SANDBOX_{}",
+                loaded
+                    .manifest
+                    .workload
+                    .id
+                    .replace('-', "_")
+                    .to_ascii_uppercase()
+            );
+            bail!(
+                "workload `{}` requires an external sandbox but `{}` is empty.\n\
+                 \n\
+                 This workload expects a pre-existing project (e.g. a Node repo with the source\n\
+                 files the prompt references). Two ways forward:\n\
+                 \n\
+                   1. Point at an existing project on disk:\n\
+                        export {}=<path-to-your-project>\n\
+                 \n\
+                   2. If you don't have a fitting project, see the workload manifest's `_comment`\n\
+                      field for the expected sandbox shape:\n\
+                        darkmux lab workloads | grep `{}`\n\
+                 \n\
+                 For a coding-task workload that runs out of the box (no external setup), try:\n\
+                   darkmux lab run quick-coding",
+                loaded.manifest.workload.id,
+                sandbox_dir.display(),
+                env_key,
+                loaded.manifest.workload.id,
+            );
+        }
+
         Ok(())
     }
 
@@ -59,7 +151,21 @@ impl WorkloadProvider for CodingTaskProvider {
         runtime: crate::crew::dispatch::Runtime,
         runtime_cmd: &str,
     ) -> Result<RunResult> {
-        let prompt = expand_placeholders(&resolve_prompt(loaded)?, sandbox_dir);
+        // Per-runtime sandbox-path substitution:
+        //   - Openclaw runs on host → agent sees the host sandbox path.
+        //   - Internal runtime mounts sandbox_dir at /workspace in the
+        //     container → agent sees /workspace. Substituting the host
+        //     path here would point the agent at a path invisible
+        //     inside Docker (#337 root cause).
+        let raw_prompt = resolve_prompt(loaded)?;
+        let prompt = match runtime {
+            crate::crew::dispatch::Runtime::Internal => {
+                expand_placeholders_with(&raw_prompt, "/workspace")
+            }
+            crate::crew::dispatch::Runtime::Openclaw => {
+                expand_placeholders(&raw_prompt, sandbox_dir)
+            }
+        };
         let role = pick_role(loaded);
         let session_id = format!(
             "darkmux-coding-{}-{}",
@@ -73,7 +179,10 @@ impl WorkloadProvider for CodingTaskProvider {
         let started = std::time::Instant::now();
         let (stdout, stderr, ok) = match runtime {
             crate::crew::dispatch::Runtime::Internal => {
-                dispatch_via_internal(&role, &prompt, &session_id)?
+                // Pass sandbox_dir as --workdir so the runtime mounts
+                // it at /workspace, matching the placeholder
+                // substitution above (#337 fix).
+                dispatch_via_internal(&role, &prompt, &session_id, Some(sandbox_dir.to_path_buf()))?
             }
             crate::crew::dispatch::Runtime::Openclaw => {
                 dispatch_via_openclaw(runtime_cmd, &role, &prompt, &session_id)?
@@ -242,11 +351,26 @@ impl WorkloadProvider for CodingTaskProvider {
 /// manifest be portable — the manifest references `${SANDBOX_DIR}` and the
 /// runtime supplies the actual on-disk path (which may come from the
 /// `DARKMUX_SANDBOX_<workload>` env var).
+///
+/// For prompts dispatched through the internal Docker-bounded runtime
+/// (where `sandbox_dir` is mounted at `/workspace` inside the container —
+/// see `src/crew/dispatch_internal.rs:99`), callers should use
+/// `expand_placeholders_with("/workspace")` instead. Otherwise the agent
+/// reads the prompt's host path, can't find files at that path inside
+/// the container, and produces an empty trajectory. Verify commands
+/// run on the host and continue to use the host path.
 fn expand_placeholders(input: &str, sandbox_dir: &Path) -> String {
-    let p = sandbox_dir.display().to_string();
+    expand_placeholders_with(input, &sandbox_dir.display().to_string())
+}
+
+/// Lower-level helper: substitute `${SANDBOX_DIR}` / `${SANDBOX}` with
+/// an explicit view-path string. Used to swap between host paths
+/// (openclaw / verify command) and container-internal paths (internal
+/// runtime agent prompts) at the call site.
+fn expand_placeholders_with(input: &str, view_path: &str) -> String {
     input
-        .replace("${SANDBOX_DIR}", &p)
-        .replace("${SANDBOX}", &p)
+        .replace("${SANDBOX_DIR}", view_path)
+        .replace("${SANDBOX}", view_path)
 }
 
 fn manifest_seed_path(loaded: &LoadedWorkload) -> Option<String> {
@@ -254,6 +378,60 @@ fn manifest_seed_path(loaded: &LoadedWorkload) -> Option<String> {
         return Some(s.clone());
     }
     Some("sandbox".to_string())
+}
+
+/// True when `path` either doesn't exist, isn't a directory, or is an
+/// empty directory. Used by the requires-external-sandbox loud-fail
+/// check to distinguish "operator set up the sandbox" from "operator
+/// expected the workload to magically work."
+fn sandbox_is_empty(path: &Path) -> bool {
+    match fs::read_dir(path) {
+        Ok(mut iter) => iter.next().is_none(),
+        Err(_) => true,
+    }
+}
+
+/// Reject setupContent keys that would write outside the sandbox dir.
+///
+/// Three classes of attack-shape this catches:
+///   1. **Absolute paths**: `PathBuf::from(sandbox).join("/etc/passwd")`
+///      returns `/etc/passwd` — `Path::join` silently replaces when the
+///      arg is absolute. A workload manifest's setupContent key of
+///      `"/etc/cron.d/evil"` would write to system state.
+///   2. **Parent traversal**: `"../../etc/shadow"` walks out of the
+///      sandbox via `create_dir_all` + `write`.
+///   3. **Windows drive letters / UNC prefixes**: same risk class as
+///      absolute paths on Windows. Reject defensively even though
+///      darkmux is Apple-Silicon-tested.
+///
+/// Embedded workloads (compiled-in JSON via `include_str!`) are trusted
+/// by construction. Operator-installed workloads under
+/// `~/.darkmux/workloads/<id>.json` may come from anywhere; validate at
+/// the consumer rather than at install. The cost is tiny and the
+/// invariant is much stronger.
+fn validate_setup_content_key(key: &str) -> Result<()> {
+    if key.is_empty() {
+        bail!("setupContent key is empty");
+    }
+    let path = Path::new(key);
+    if path.is_absolute() {
+        bail!(
+            "setupContent key `{key}` is an absolute path; only relative paths under the sandbox are allowed"
+        );
+    }
+    for component in path.components() {
+        use std::path::Component;
+        match component {
+            Component::Normal(_) | Component::CurDir => continue,
+            Component::ParentDir => bail!(
+                "setupContent key `{key}` contains `..` — would escape the sandbox"
+            ),
+            Component::Prefix(_) | Component::RootDir => bail!(
+                "setupContent key `{key}` contains a root/prefix component — only relative paths under the sandbox are allowed"
+            ),
+        }
+    }
+    Ok(())
 }
 
 fn resolve_prompt(loaded: &LoadedWorkload) -> Result<String> {
@@ -285,11 +463,15 @@ fn pick_role(loaded: &LoadedWorkload) -> String {
 }
 
 /// Dispatch via darkmux's internal Docker-bounded runtime through the
-/// crew::dispatch substrate. Beat 36: no openclaw install required.
+/// crew::dispatch substrate. `workdir` (when `Some`) passes as
+/// `--workdir` so the runtime mounts the host path at `/workspace`
+/// inside the container, giving the agent access to the workload's
+/// sandbox files (#337 fix).
 fn dispatch_via_internal(
     role_id: &str,
     prompt: &str,
     session_id: &str,
+    workdir: Option<PathBuf>,
 ) -> Result<(String, String, bool)> {
     use crate::crew::dispatch::{dispatch, DispatchOpts, Runtime};
     let opts = DispatchOpts {
@@ -301,7 +483,7 @@ fn dispatch_via_internal(
         skip_preflight: false,
         json: true,
         watch_paths: Vec::new(),
-        workdir: None,
+        workdir,
         sprint_id: None,
         runtime: Runtime::Internal,
         runtime_cmd: "openclaw".to_string(),
@@ -503,6 +685,8 @@ mod tests {
             prompt: Some("write tests".into()),
             prompt_file: None,
             sandbox_seed: None,
+            setup_content: BTreeMap::new(),
+            requires_external_sandbox: false,
             verify: None,
             expected: None,
             extras: BTreeMap::new(),
@@ -680,6 +864,174 @@ not-valid-json
         assert_eq!(
             fs::read_to_string(sandbox_dir.join("foo.txt")).unwrap(),
             "seeded"
+        );
+    }
+
+    /// `setupContent` writes each (path → content) pair into the sandbox
+    /// dir at setup() time. Lets embedded workloads ship a complete
+    /// runnable scaffold without needing an external project.
+    #[test]
+    fn setup_content_writes_inline_files_to_sandbox() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run");
+        let sandbox_dir = tmp.path().join("sandbox");
+        let mut spec = basic_spec();
+        spec.setup_content
+            .insert("bug.py".into(), "def buggy():\n    return None\n".into());
+        spec.setup_content.insert(
+            "tests/test_bug.py".into(),
+            "import unittest\n\n# nested path created\n".into(),
+        );
+        let loaded = make_loaded(spec, tmp.path().to_path_buf());
+        CodingTaskProvider
+            .setup(&loaded, &run_dir, &sandbox_dir)
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(sandbox_dir.join("bug.py")).unwrap(),
+            "def buggy():\n    return None\n"
+        );
+        assert!(sandbox_dir.join("tests/test_bug.py").exists());
+    }
+
+    /// `requiresExternalSandbox` + empty sandbox + no inline setupContent
+    /// → bail with operator-actionable error. This catches the new-user
+    /// failure mode where the workload prompt references files the
+    /// operator hasn't provided.
+    #[test]
+    fn setup_bails_loud_when_external_sandbox_required_but_empty() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run");
+        let sandbox_dir = tmp.path().join("sandbox");
+        let mut spec = basic_spec();
+        spec.id = "long-agentic-style".into();
+        spec.requires_external_sandbox = true;
+        let loaded = make_loaded(spec, tmp.path().to_path_buf());
+        let err = CodingTaskProvider
+            .setup(&loaded, &run_dir, &sandbox_dir)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("requires an external sandbox"),
+            "expected actionable error; got: {msg}"
+        );
+        assert!(
+            msg.contains("DARKMUX_SANDBOX_LONG_AGENTIC_STYLE"),
+            "expected env-var hint with derived name; got: {msg}"
+        );
+        assert!(
+            msg.contains("quick-coding"),
+            "expected fallback pointer to quick-coding; got: {msg}"
+        );
+    }
+
+    /// `requiresExternalSandbox` is a no-op when inline setupContent
+    /// satisfies the dependency — embedded workloads can declare the
+    /// flag for documentation purposes without breaking the run.
+    #[test]
+    fn setup_does_not_bail_when_setup_content_satisfies_external_requirement() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run");
+        let sandbox_dir = tmp.path().join("sandbox");
+        let mut spec = basic_spec();
+        spec.requires_external_sandbox = true;
+        spec.setup_content
+            .insert("file.txt".into(), "content".into());
+        let loaded = make_loaded(spec, tmp.path().to_path_buf());
+        CodingTaskProvider
+            .setup(&loaded, &run_dir, &sandbox_dir)
+            .expect("setupContent should satisfy requires_external_sandbox");
+    }
+
+    /// Path-traversal hardening on setupContent keys (QA BLOCK fix).
+    /// An operator-installed workload manifest from a gist / friend /
+    /// future install verb might include an absolute or `..`-walking
+    /// key. The provider must reject before writing.
+    #[test]
+    fn setup_content_rejects_absolute_path() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run");
+        let sandbox_dir = tmp.path().join("sandbox");
+        let mut spec = basic_spec();
+        spec.setup_content
+            .insert("/etc/passwd".into(), "evil".into());
+        let loaded = make_loaded(spec, tmp.path().to_path_buf());
+        let err = CodingTaskProvider
+            .setup(&loaded, &run_dir, &sandbox_dir)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("setupContent key") && msg.contains("/etc/passwd"),
+            "expected error to name the offending key; got: {msg}"
+        );
+        assert!(
+            !std::path::Path::new("/etc/passwd-evil-test").exists(),
+            "sanity: no host file should have been written"
+        );
+    }
+
+    #[test]
+    fn setup_content_rejects_parent_traversal() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run");
+        let sandbox_dir = tmp.path().join("sandbox");
+        let mut spec = basic_spec();
+        spec.setup_content
+            .insert("../escape.txt".into(), "evil".into());
+        let loaded = make_loaded(spec, tmp.path().to_path_buf());
+        let err = CodingTaskProvider
+            .setup(&loaded, &run_dir, &sandbox_dir)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains(".."),
+            "expected error to mention the traversal component; got: {err}"
+        );
+        assert!(
+            !sandbox_dir.parent().unwrap().join("escape.txt").exists(),
+            "no file should have been written outside sandbox"
+        );
+    }
+
+    #[test]
+    fn setup_content_accepts_safe_nested_path() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run");
+        let sandbox_dir = tmp.path().join("sandbox");
+        let mut spec = basic_spec();
+        spec.setup_content
+            .insert("a/b/c.txt".into(), "ok".into());
+        let loaded = make_loaded(spec, tmp.path().to_path_buf());
+        CodingTaskProvider
+            .setup(&loaded, &run_dir, &sandbox_dir)
+            .expect("nested relative paths must be allowed");
+        assert_eq!(
+            fs::read_to_string(sandbox_dir.join("a/b/c.txt")).unwrap(),
+            "ok"
+        );
+    }
+
+    /// QA reviewer's recommendation: pin the per-runtime substitution
+    /// contract. `${SANDBOX_DIR}` resolves to the operator-supplied
+    /// view_path; verify substitution + the dispatch-side branching
+    /// produce different paths for openclaw (host) vs internal
+    /// (`/workspace`).
+    #[test]
+    fn expand_placeholders_with_substitutes_view_path() {
+        let host = "/Users/kain/.darkmux/sandboxes/quick-coding";
+        let inside_container = "/workspace";
+        let prompt = "Fix the bug in ${SANDBOX_DIR}/bug.py — run python3 ${SANDBOX}/test.py";
+
+        let host_view = expand_placeholders_with(prompt, host);
+        assert!(host_view.contains(host), "openclaw path should be substituted");
+        assert!(!host_view.contains("/workspace"));
+
+        let container_view = expand_placeholders_with(prompt, inside_container);
+        assert!(
+            container_view.contains("/workspace/bug.py")
+                && container_view.contains("/workspace/test.py")
+        );
+        assert!(
+            !container_view.contains("/Users/"),
+            "container view must NOT leak host path"
         );
     }
 
