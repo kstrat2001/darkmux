@@ -4,8 +4,8 @@
   "workload": {
     "id": "quick-coding",
     "provider": "coding-task",
-    "role": "code-reviewer",
-    "description": "Minimal coding-task smoke. Agent reads a buggy Python function, fixes it, confirms the unittest passes. Runs out of the box on any machine with python3 (Mac default).",
+    "role": "coder",
+    "description": "Minimal coding-task smoke. Agent reads a buggy Python function, fixes it, confirms the unittest passes. Runs out of the box on any machine with python3 (Mac default). Uses the `coder` role (allowed to edit) — pairing with `code-reviewer` is a role/task mismatch since reviewers are forbidden from modifying code by their doctrine.",
 
     "setupContent": {
       "bug.py": "def add_positive(a, b):\n    \"\"\"Return the sum of two positive integers. Raises ValueError if either is non-positive.\"\"\"\n    if a <= 0 or b <= 0:\n        raise ValueError(\"both inputs must be positive\")\n    # Bug: subtraction instead of addition.\n    return a - b\n",

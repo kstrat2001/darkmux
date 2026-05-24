@@ -62,7 +62,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     //    prompts stay identical across runtimes — load-bearing for the
     //    runtime-vs-openclaw comparison.
     let roles = load_roles().context("loading crew roles for internal dispatch")?;
-    let _role = roles
+    let role = roles
         .iter()
         .find(|r| r.id == opts.role_id)
         .ok_or_else(|| anyhow!("role not found: {}", opts.role_id))?;
@@ -72,6 +72,15 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             opts.role_id
         )
     })?;
+    // Compute the runtime tool catalog from the role's tool_palette
+    // (allow minus deny). When the palette is empty, returns None and
+    // the runtime falls back to its full catalog (back-compat). When
+    // restrictive, denied tools never reach the model — they're not in
+    // the chat-completions `tools[]` field, so the model structurally
+    // cannot call them. This is the runtime-side gate that prevents
+    // a model from ignoring its .md doctrine and calling a denied tool
+    // (the gap that let D call `edit` despite code-reviewer denying it).
+    let allowed_tools = compute_runtime_allowed_tools(&role.tool_palette);
 
     // 2. Resolve the model. Currently probes LMStudio for whatever's
     //    loaded; future iteration will use the role pin + active profile.
@@ -185,6 +194,14 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // stays clean. See `runtime/src/main.rs::build_json_envelope`
         // for the schema contract.
         cmd.arg("--json");
+    }
+    if let Some(allowed) = allowed_tools.as_ref() {
+        let csv = allowed.join(",");
+        eprintln!(
+            "darkmux crew dispatch: tool_palette filtered to [{}] (role={})",
+            csv, opts.role_id
+        );
+        cmd.arg("--allowed-tools").arg(csv);
     }
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
@@ -619,11 +636,181 @@ fn probe_loaded_model() -> Result<String> {
 // `crate::workdir` as part of Wave-E.2 (#255). Workers + both runtime
 // paths now share one implementation via `workdir::validate_workdir`.
 
+/// Map a role's tool_palette (allow/deny in role-vocab) to the list of
+/// runtime-vocab tool names that should be exposed to the model via
+/// `--allowed-tools`.
+///
+/// Role-vocab and runtime-vocab don't align 1-to-1:
+///   - role "read" → runtime ["read", "search"] (search is a specialized
+///     read; "you may read files" implies it)
+///   - role "edit" → runtime ["edit"]
+///   - role "write" → runtime ["write"]
+///   - role "exec" → runtime ["bash"]
+///   - role "process", "update_plan" → no runtime equivalent (silently
+///     dropped; no runtime tool implements these concepts today)
+///
+/// Allow first, then deny removes. Deny wins on conflict. Unknown
+/// role-vocab tokens are silently dropped — keeps forward-compatibility
+/// for roles that name tools the runtime doesn't yet implement.
+///
+/// Returns `None` when the palette is empty (no allow, no deny) so the
+/// caller can decide between "fail loud (no tools)" and "back-compat
+/// default (full catalog)." Today the caller passes `None` →
+/// runtime's `--allowed-tools` flag is omitted → runtime exposes full
+/// catalog. The empty-palette case usually means "role definition is
+/// incomplete," not "no tools allowed."
+fn compute_runtime_allowed_tools(palette: &crate::crew::types::ToolPalette) -> Option<Vec<String>> {
+    // Empty palette: caller decides; today we return None so the
+    // runtime exposes its full catalog (back-compat).
+    if palette.allow.is_empty() && palette.deny.is_empty() {
+        return None;
+    }
+
+    // Single source of truth for role-vocab → runtime-vocab. Add new
+    // mappings here when the runtime gains a new tool or roles gain
+    // new capability tokens.
+    fn role_to_runtime(role_name: &str) -> &'static [&'static str] {
+        match role_name {
+            "read" => &["read", "search"],
+            "edit" => &["edit"],
+            "write" => &["write"],
+            "exec" => &["bash"],
+            // No runtime equivalent today; silently dropped.
+            "process" | "update_plan" => &[],
+            _ => &[],
+        }
+    }
+
+    // Allow first.
+    let mut allowed: Vec<String> = palette
+        .allow
+        .iter()
+        .flat_map(|name| role_to_runtime(name).iter().map(|s| s.to_string()))
+        .collect();
+
+    // Deny removes. Deny wins on conflict.
+    let denied: Vec<String> = palette
+        .deny
+        .iter()
+        .flat_map(|name| role_to_runtime(name).iter().map(|s| s.to_string()))
+        .collect();
+    allowed.retain(|t| !denied.contains(t));
+
+    // Dedupe while preserving order (a role manifest could allow both
+    // "read" and "edit" — `read` brings ["read","search"] and we don't
+    // want duplicates of either if some future mapping overlaps).
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    allowed.retain(|t| seen.insert(t.clone()));
+
+    Some(allowed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::TempDir;
+
+    // ─── role tool_palette → runtime allowed-tools mapping ────────────
+
+    fn palette(allow: &[&str], deny: &[&str]) -> crate::crew::types::ToolPalette {
+        crate::crew::types::ToolPalette {
+            allow: allow.iter().map(|s| s.to_string()).collect(),
+            deny: deny.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn allowed_tools_empty_palette_returns_none_so_runtime_uses_full_catalog() {
+        let p = palette(&[], &[]);
+        assert_eq!(compute_runtime_allowed_tools(&p), None);
+    }
+
+    #[test]
+    fn allowed_tools_coder_palette_exposes_all_runtime_tools() {
+        // coder role: allow [read, edit, write, exec, process], deny []
+        let p = palette(&["read", "edit", "write", "exec", "process"], &[]);
+        let result = compute_runtime_allowed_tools(&p).expect("non-empty palette → Some");
+        // Expected: read + search (from "read"), edit, write, bash (from "exec").
+        // "process" has no runtime equivalent; silently dropped.
+        let mut sorted = result.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec!["bash", "edit", "read", "search", "write"]);
+    }
+
+    #[test]
+    fn allowed_tools_code_reviewer_palette_excludes_edit_and_write() {
+        // code-reviewer: allow [read, exec, update_plan], deny [edit, write, process]
+        let p = palette(&["read", "exec", "update_plan"], &["edit", "write", "process"]);
+        let result = compute_runtime_allowed_tools(&p).expect("non-empty palette → Some");
+        let mut sorted = result.clone();
+        sorted.sort();
+        // Expected: read + search (from "read"), bash (from "exec").
+        // "update_plan" has no runtime equivalent.
+        assert_eq!(sorted, vec!["bash", "read", "search"]);
+        // Hard regression guard: code-reviewer must NEVER see edit/write.
+        assert!(!result.contains(&"edit".to_string()));
+        assert!(!result.contains(&"write".to_string()));
+    }
+
+    #[test]
+    fn allowed_tools_deny_overrides_allow() {
+        // Pathological: same tool in both lists. Deny wins.
+        let p = palette(&["edit"], &["edit"]);
+        let result = compute_runtime_allowed_tools(&p).expect("non-empty palette → Some");
+        assert!(result.is_empty(), "deny must win over allow; got {result:?}");
+    }
+
+    #[test]
+    fn allowed_tools_unknown_role_vocab_silently_dropped() {
+        let p = palette(&["fake-tool", "not-a-thing"], &[]);
+        let result = compute_runtime_allowed_tools(&p).expect("non-empty palette → Some");
+        assert!(result.is_empty(), "unknown role-vocab → empty; got {result:?}");
+    }
+
+    #[test]
+    fn allowed_tools_role_read_expands_to_runtime_read_and_search() {
+        // Conceptual contract: role "read" means "the model may read";
+        // runtime "search" is a specialized read (find pattern in tree)
+        // that's implied by the broader "read" allowance.
+        let p = palette(&["read"], &[]);
+        let result = compute_runtime_allowed_tools(&p).expect("non-empty palette → Some");
+        let mut sorted = result.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec!["read", "search"]);
+    }
+
+    #[test]
+    fn allowed_tools_role_exec_maps_to_runtime_bash() {
+        let p = palette(&["exec"], &[]);
+        let result = compute_runtime_allowed_tools(&p).expect("non-empty palette → Some");
+        assert_eq!(result, vec!["bash".to_string()]);
+    }
+
+    /// QA NIT 1 — deny strips ALL of a role-vocab token's runtime
+    /// expansions, not just the literal name. Pins the contract: if a
+    /// future refactor switched deny to "literal-string only," role
+    /// "read" denied would still leak `search` (which expands from
+    /// "read"). Regression guard for the expansion-stripping invariant.
+    #[test]
+    fn allowed_tools_deny_role_read_strips_both_read_and_search() {
+        let p = palette(&["read"], &["read"]);
+        let result = compute_runtime_allowed_tools(&p).expect("non-empty palette → Some");
+        assert!(
+            result.is_empty(),
+            "denying role-vocab `read` must strip BOTH runtime `read` and `search`; got {result:?}"
+        );
+    }
+
+    /// Sibling: partial overlap. `allow:["read","exec"], deny:["read"]`
+    /// must result in `["bash"]` only — both `read` and `search` removed
+    /// by the deny.
+    #[test]
+    fn allowed_tools_deny_role_read_alongside_allowed_exec_leaves_only_bash() {
+        let p = palette(&["read", "exec"], &["read"]);
+        let result = compute_runtime_allowed_tools(&p).expect("non-empty palette → Some");
+        assert_eq!(result, vec!["bash".to_string()]);
+    }
 
     // ─── cap_reasoning_text (S6) ──────────────────────────────────────
 
