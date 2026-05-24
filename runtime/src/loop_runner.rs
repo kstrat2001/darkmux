@@ -38,9 +38,31 @@ use crate::trajectory::Trajectory;
 /// granular tool calls with the current tool palette).
 const MAX_TURNS: u32 = 100;
 
+/// How the loop terminated. Distinguishes "model said stop" from
+/// "loop hit the safety cap and gave up" — semantically different
+/// outcomes for downstream consumers (a max_turns hit means the
+/// reply is partial/wedged and a re-dispatch with a fresh session
+/// might be the right move; a stop means use the reply).
+///
+/// Pre-fix the MAX_TURNS path was an `Err(...)` indistinguishable
+/// from infrastructure failures (Docker died, LMStudio went away).
+/// Operators reading the JSON envelope's `result` field saw `error`
+/// for both cases; structured terminal reason lets the runtime emit
+/// `result: "max_turns"` instead. (#325)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalReason {
+    /// Model returned finish_reason=stop.
+    Stop,
+    /// Loop hit MAX_TURNS without reaching a stop. Reply is whatever
+    /// the last assistant message produced — likely partial.
+    MaxTurns,
+}
+
 /// Outcome of a completed loop run.
 #[derive(Debug)]
 pub struct LoopOutcome {
+    /// Why the loop terminated. See [`TerminalReason`].
+    pub terminal_reason: TerminalReason,
     /// Full conversation, in order, including system / user / assistant
     /// / tool messages. The final assistant message has the model's
     /// terminal response.
@@ -94,10 +116,24 @@ pub fn run(
 
     loop {
         if turns >= MAX_TURNS {
-            return Err(anyhow!(
-                "loop exceeded max turns ({MAX_TURNS}) without reaching stop; \
-                 last assistant message did not produce a terminal response"
-            ));
+            // #325: structured terminal reason instead of an opaque
+            // Err. The JSON envelope's `result` field can now be
+            // "max_turns" (the runtime tried; the model didn't stop)
+            // rather than "error" (indistinguishable from Docker /
+            // LMStudio failures). Reply is whatever the last
+            // assistant message produced — likely partial.
+            eprintln!(
+                "darkmux-runtime: loop hit MAX_TURNS={MAX_TURNS} without reaching stop; \
+                 returning partial outcome"
+            );
+            return Ok(LoopOutcome {
+                terminal_reason: TerminalReason::MaxTurns,
+                messages,
+                turns,
+                total_prompt_tokens,
+                total_completion_tokens,
+                compactions,
+            });
         }
 
         let request = ChatRequest {
@@ -181,6 +217,7 @@ pub fn run(
         match finish_reason.as_str() {
             "stop" => {
                 return Ok(LoopOutcome {
+                    terminal_reason: TerminalReason::Stop,
                     messages,
                     turns,
                     total_prompt_tokens,
@@ -460,6 +497,64 @@ mod tests {
         })
     }
 
+    /// #325: terminal_reason discriminates loop outcomes. A finish_reason=
+    /// stop response from the model produces TerminalReason::Stop;
+    /// a loop that runs out the MAX_TURNS clock produces
+    /// TerminalReason::MaxTurns (NOT an Err — that path was reserved
+    /// for infrastructure failures).
+    ///
+    /// This test pairs with the existing
+    /// `loop_runs_against_mock_and_terminates_on_stop` (Stop case)
+    /// to lock both terminal reasons. MaxTurns specifically asserts
+    /// the loop returns Ok(outcome) — the JSON envelope path in
+    /// main.rs reads outcome.terminal_reason and emits result=max_turns.
+    #[test]
+    #[serial_test::serial]
+    fn loop_returns_maxturns_terminal_reason_when_cap_hit() {
+        let server = MockServer::start();
+        // Primary mock: every call returns finish_reason=tool_calls.
+        // The loop will never see stop; will run MAX_TURNS=100 turns
+        // and bail with the structured terminal_reason.
+        let _primary = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_json(
+                None,
+                Some(serde_json::json!([{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "arguments": "{\"path\":\"/workspace/missing.txt\",\"offset\":1,\"limit\":0}",
+                    },
+                }])),
+                "tool_calls",
+                100,
+                10,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempdir::TempDir::new("maxturns").unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("loop forever")];
+        let tools = [Tool::Read];
+
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false)
+            .expect("MAX_TURNS path returns Ok(outcome), not Err");
+
+        assert_eq!(
+            outcome.terminal_reason,
+            TerminalReason::MaxTurns,
+            "expected MaxTurns terminal_reason after exhausting the loop"
+        );
+        // Sanity: hit the cap.
+        assert!(
+            outcome.turns >= 100,
+            "expected >= MAX_TURNS turns; got {}",
+            outcome.turns
+        );
+    }
+
     /// Smoke: mock returns finish_reason=stop on first call. Loop
     /// terminates cleanly, no compaction. Proves the mock + LmStudioClient
     /// + loop_runner integration plumbing works.
@@ -498,6 +593,8 @@ mod tests {
         assert_eq!(outcome.turns, 1);
         assert_eq!(outcome.compactions, 0);
         assert_eq!(outcome.total_prompt_tokens, 1234);
+        // #325: pin the Stop terminal_reason on this clean-exit path.
+        assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
     }
 
     /// The real signal: drive the loop into a compaction by escalating

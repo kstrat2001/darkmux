@@ -301,17 +301,32 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         streaming,
     );
 
-    let (outcome, success) = match run_result {
-        Ok(o) => (Some(o), true),
+    let outcome = match run_result {
+        Ok(o) => Some(o),
         Err(e) => {
             eprintln!("dispatch failed: {e:#}");
-            (None, false)
+            None
         }
+    };
+
+    // Three-way result discrimination (#325):
+    //   - Some(outcome) + terminal_reason=Stop  → "stop"
+    //   - Some(outcome) + terminal_reason=MaxTurns → "max_turns"
+    //   - None (loop errored) → "error"
+    // Pre-fix MAX_TURNS was an Err indistinguishable from
+    // infrastructure failures; structured terminal reason lets
+    // downstream consumers (qa-review skill, lab adapter, future
+    // heuristic engine) tell "model got stuck" from "container died."
+    let result_str: &str = match outcome.as_ref() {
+        Some(o) => match o.terminal_reason {
+            loop_runner::TerminalReason::Stop => "stop",
+            loop_runner::TerminalReason::MaxTurns => "max_turns",
+        },
+        None => "error",
     };
 
     // Whether success or failure, write the trajectory close + metrics.
     let wall_ms = traj.elapsed_ms();
-    let result_str = if success { "stop" } else { "error" };
     traj.append_dispatch_complete(result_str, wall_ms);
 
     if let Some(o) = &outcome {
@@ -324,6 +339,8 @@ fn run_dispatch(args: &[String]) -> ExitCode {
             .unwrap_or_else(|| "<empty>".into());
 
         let preview: String = final_assistant.chars().take(400).collect();
+        let max_turns_reached =
+            matches!(o.terminal_reason, loop_runner::TerminalReason::MaxTurns);
         let metrics = trajectory::Metrics {
             runtime: "darkmux-runtime",
             version: VERSION,
@@ -336,7 +353,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
             total_prompt_tokens: o.total_prompt_tokens,
             total_completion_tokens: o.total_completion_tokens,
             total_messages: o.messages.len(),
-            max_turns_reached: false,
+            max_turns_reached,
             final_assistant_preview: preview,
         };
         let _ = traj.save_metrics(&metrics);
