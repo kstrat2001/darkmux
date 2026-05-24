@@ -159,6 +159,13 @@ enum Cmd {
         #[command(subcommand)]
         sub: AgentCmd,
     },
+    /// Per-hardware-tier recommendations — primary + compactor model
+    /// picks validated via the project's bake-off methodology. Read-only;
+    /// surfaces the registry's pick for the active or a specified tier.
+    Recommendations {
+        #[command(subcommand)]
+        sub: RecommendationsCmd,
+    },
     /// Flow observability — record operator-facing flow events.
     Flow {
         #[command(subcommand)]
@@ -241,6 +248,20 @@ enum AgentCmd {
     Template {
         /// Role id (qa | scribe | engineer). Run `agent list-templates` to see what's available.
         role: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum RecommendationsCmd {
+    /// Show the recommendation registry entry for a hardware tier.
+    /// Defaults to the active tier (resolved via the same hardware
+    /// fingerprint `darkmux doctor` uses); pass `<tier>` to inspect a
+    /// non-active tier (`m-series-128`, `m-series-64`, `m-series-32`,
+    /// `generic`). Operator-readable output: status, profile name,
+    /// primary + compactor model ids, rationale.
+    Show {
+        /// Optional tier id; defaults to the active hardware tier.
+        tier: Option<String>,
     },
 }
 
@@ -913,6 +934,7 @@ fn run(cmd: Cmd) -> Result<i32> {
         Cmd::Sprint { sub } => cmd_sprint(sub),
         Cmd::Mission { sub } => cmd_mission(sub),
         Cmd::Agent { sub } => cmd_agent(sub),
+        Cmd::Recommendations { sub } => cmd_recommendations(sub),
         Cmd::Flow { sub } => {
             flow_cli::run(sub)?;
             Ok(0)
@@ -1758,6 +1780,56 @@ fn cmd_agent(sub: AgentCmd) -> Result<i32> {
             );
             eprintln!("// task-specific framing for your codebase, but keep the structural blocks");
             eprintln!("// (Tool Call Style, Execution Bias) — they're the load-bearing parts.");
+            Ok(0)
+        }
+    }
+}
+
+/// Print a per-tier recommendation entry in operator-readable form.
+/// Wraps `recommendations::for_tier` / `for_active_hardware` so the
+/// `/darkmux-bootstrap` skill (and ad-hoc operator use) has a single
+/// way to ask "what does darkmux recommend for my hardware?".
+fn cmd_recommendations(sub: RecommendationsCmd) -> Result<i32> {
+    match sub {
+        RecommendationsCmd::Show { tier } => {
+            let rec = match tier.as_deref() {
+                Some(t) => recommendations::for_tier(t)?,
+                None => recommendations::for_active_hardware()?,
+            };
+            println!("Tier:     {}", rec.tier);
+            println!("Status:   {:?}", rec.status);
+            if let Some(name) = &rec.profile_name {
+                println!("Profile:  {name}");
+            }
+            if let Some(p) = &rec.primary {
+                println!(
+                    "Primary:  {} (n_ctx={}, role={})",
+                    p.model_id, p.n_ctx, p.role
+                );
+            }
+            if let Some(c) = &rec.compactor {
+                println!(
+                    "Compactor: {} (n_ctx={}, role={})",
+                    c.model_id, c.n_ctx, c.role
+                );
+            }
+            if !rec.validated_against.is_empty() {
+                println!("Validated against: {}", rec.validated_against.join(", "));
+            }
+            if !rec.not_validated_against.is_empty() {
+                println!(
+                    "NOT validated against: {}",
+                    rec.not_validated_against.join(", ")
+                );
+            }
+            if let Some(url) = &rec.bake_off_url {
+                println!("Bake-off:  {url}");
+            }
+            println!();
+            println!("Rationale:");
+            for line in rec.rationale.lines() {
+                println!("  {line}");
+            }
             Ok(0)
         }
     }

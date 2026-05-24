@@ -60,25 +60,25 @@ If your hub machine drops off the network, the substrate degrades gracefully —
 
 ### Prerequisites
 
-darkmux orchestrates LMStudio + your agent runtime. Install these once:
+**Out of the box, darkmux works with LMStudio + Docker.** Nothing else is required for the full dispatch + lab path. Other agent runtimes are opt-in.
 
 | Required | Why | Install |
 |---|---|---|
 | **[LMStudio](https://lmstudio.ai/)** | Loads/unloads models. darkmux drives it via the `lms` CLI. | macOS / Windows / Linux installer |
 | **At least one model in LMStudio** | Nothing to swap to without one. | Download via the LMStudio UI; verify with `lms ls`. |
+| **[Docker](https://www.docker.com/products/docker-desktop)** | Hosts darkmux's internal Rust runtime — the default for `darkmux crew dispatch` and `darkmux lab run`. Each dispatch runs in a per-invocation `darkmux-runtime` container with kernel-enforced workspace isolation. Build the image once: `docker build -t darkmux-runtime:latest runtime/`. | Docker Desktop or equivalent daemon |
 | **Rust toolchain** | To build darkmux itself. | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh` |
 
 | Optional | When you need it |
 |---|---|
-| **[Docker](https://www.docker.com/products/docker-desktop)** | For `darkmux crew dispatch`'s default internal runtime. The dispatch runs in a per-invocation `darkmux-runtime` container; build the image once with `docker build -t darkmux-runtime:latest runtime/`. Skip this if you opt out via `--runtime openclaw`. |
-| **An agent runtime** (e.g. [OpenClaw](https://github.com/openclaw/openclaw), Aider, Cline) | Only if you opt out of the default internal runtime via `--runtime openclaw` (on `crew dispatch` or `lab run`). `swap`/`status`/`profiles` work without one. Override the openclaw shell-out binary per dispatch with `--runtime-cmd <path>` (only consulted under `--runtime openclaw`). |
+| **An alternative agent runtime** (e.g. [OpenClaw](https://github.com/openclaw/openclaw), Aider, Cline) | Only if you opt out of the default internal runtime via `--runtime openclaw` (on `crew dispatch` or `lab run`). `swap`/`status`/`profiles` work without one. Override the openclaw shell-out binary per dispatch with `--runtime-cmd <path>` (only consulted under `--runtime openclaw`). |
 | **[Claude Code](https://claude.com/claude-code)** | Only for the agent-invokable skills (`/darkmux-status`, etc.). darkmux as a CLI works without it. |
 
 darkmux is developed and tested on Apple Silicon. Linux should work; Intel Mac is untested.
 
 ### Install + bootstrap
 
-One copy-pasteable block — works from a fresh machine that has LMStudio installed:
+One copy-pasteable block — works from a fresh machine with LMStudio + Docker installed:
 
 ```bash
 # 1. Install Rust toolchain (skip if `cargo --version` already works)
@@ -90,7 +90,10 @@ git clone https://github.com/kstrat2001/darkmux
 cd darkmux
 cargo install --path .      # builds the self-contained binary, drops it on $PATH
 
-# 3. Bootstrap config + agent skills
+# 3. Build the internal-runtime container image (one-time, ~50 MB)
+docker build -t darkmux-runtime:latest runtime/
+
+# 4. Bootstrap config + agent skills
 darkmux init                # creates ~/.darkmux/profiles.json + installs agent skills
                             # (skills include /darkmux-bootstrap — a guided
                             # first-time setup workflow you run in your
@@ -121,11 +124,11 @@ darkmux lab run quick-q           # the smoke workload directly
 darkmux lab runs --limit 5        # see your recent runs
 darkmux optimize                 # guided "optimize for my workload" wizard (Phase 1 scaffold)
 darkmux lab inspect <run-id>      # full per-run breakdown
-darkmux notebook draft <run-id>   # ask the agent to author an EE-lab-style notebook entry
+darkmux notebook draft <run-id>   # ask the active role to author a lab-style notebook entry
 darkmux mission propose --from-stdin   # AI-built-in: vague intent → structured Mission + Sprint JSONs
 ```
 
-Using Claude Code? Run `darkmux init --with-claude-md ~/.claude/CLAUDE.md` to install the skills *and* teach Claude Code about darkmux at session start. Then run **`/darkmux-bootstrap`** in your Claude Code session — it walks through detecting your hardware tier, downloading the bake-off-validated models, registering profiles, and validating the end state. Operator-sovereign: the skill reads + proposes; you run the commands.
+Using Claude Code? Run `darkmux init --with-claude-md ~/.claude/CLAUDE.md` to install the skills *and* teach Claude Code about darkmux at session start. Then run **`/darkmux-bootstrap`** in your Claude Code session — it walks through detecting your hardware tier, downloading the recommended models, registering profiles, and validating the end state. (The recommendation registry's picks are surfaced via `darkmux recommendations show`; the underlying methodology is bake-off — head-to-head comparison with evaluation criteria recorded before the runs.) Operator-sovereign: the skill reads + proposes; you run the commands.
 
 ### Updating darkmux
 
