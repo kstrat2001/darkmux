@@ -41,6 +41,17 @@ Hobbyists building local-AI workflows on their own Macs. Individual engineers wh
 
 Not *designed* as team tooling or a multi-tenant platform. The technical surface (no auth on `DARKMUX_REDIS_URL` beyond what your mesh VPN already provides, operator-asserted provenance fields, cross-machine state on a shared substrate) assumes everyone reachable on the substrate is you. If team scope is interesting to you, the substrate is a reasonable starting point — fork it, layer in auth where you need it, and the project's design will likely benefit from the lessons. Bigger orgs have their own infrastructure for the multi-tenant problem and darkmux stays focused on the one-operator-many-Macs case; that's not a fence, it's a focus.
 
+## Two ways to run darkmux
+
+Pick whichever matches your setup — switchable per dispatch, not a one-time install decision:
+
+- **Standalone** (default): with just Docker + LMStudio, darkmux dispatches through its built-in internal runtime. No external agent runtime to install or configure. The out-of-box path for `darkmux crew dispatch`, `darkmux lab run`, and the mission/sprint lifecycle.
+- **With your existing openclaw**: if openclaw is already in your stack, `darkmux crew dispatch --runtime openclaw` (or `darkmux lab run --runtime openclaw`) routes through it. Your existing sessions, channel routing, custom agents, and openclaw-specific tools (`update_plan`, `process`) keep working as-is. `darkmux crew sync` aligns openclaw's `agents.list[]` with darkmux's role manifests so the two stay in step.
+
+**darkmux is not a replacement for openclaw.** The standalone path exists so fresh operators don't need to install a second tool to get started. The openclaw path exists so operators with openclaw already wired in keep their workflow without translation. Both are first-class; the choice is per-dispatch.
+
+See [DESIGN.md → "Relationship to openclaw"](DESIGN.md#relationship-to-openclaw) for the side-by-side comparison (install footprint, isolation model, session model, tool surface) and the scope filter for what gets added to each path.
+
 ## Many machines become one
 
 If you have more than one Mac, darkmux makes them work as a single development environment. Operator names a role; darkmux figures out which machine runs it. Open the topology viewer from any node — you see the whole fleet. Open the fleet status from any node — you see specs, RAM, loaded models per machine.
@@ -69,9 +80,9 @@ If your hub machine drops off the network, the substrate degrades gracefully —
 | **[Docker](https://www.docker.com/products/docker-desktop)** | Hosts darkmux's internal Rust runtime — the default for `darkmux crew dispatch` and `darkmux lab run`. Each dispatch runs in a per-invocation `darkmux-runtime` container with kernel-enforced workspace isolation. Build the image once: `docker build -t darkmux-runtime:latest runtime/`. | Docker Desktop or equivalent daemon |
 | **Rust toolchain** | To build darkmux itself. | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh` |
 
-| Optional | When you need it |
+| Optional | When you'd want it |
 |---|---|
-| **An alternative agent runtime** (e.g. [OpenClaw](https://github.com/openclaw/openclaw), Aider, Cline) | Only if you opt out of the default internal runtime via `--runtime openclaw` (on `crew dispatch` or `lab run`). `swap`/`status`/`profiles` work without one. Override the openclaw shell-out binary per dispatch with `--runtime-cmd <path>` (only consulted under `--runtime openclaw`). |
+| **[OpenClaw](https://github.com/openclaw/openclaw)** (or Aider / Cline) | If you're already running openclaw and want darkmux to dispatch through it instead of (or alongside) the internal runtime — pass `--runtime openclaw` per dispatch. `darkmux crew sync` aligns openclaw's agent registry with darkmux's role manifests. See [the dual-mode framing](#two-ways-to-run-darkmux) above. `swap`/`status`/`profiles` work without any external runtime. Override the openclaw binary path per dispatch with `--runtime-cmd <path>`. |
 | **[Claude Code](https://claude.com/claude-code)** | Only for the agent-invokable skills (`/darkmux-status`, etc.). darkmux as a CLI works without it. |
 
 darkmux is developed and tested on Apple Silicon. Linux should work; Intel Mac is untested.

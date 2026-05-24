@@ -93,6 +93,42 @@ Single-operator multi-machine is the design target. Operator owns a couple of Ma
 - Not a prompt router across providers (LiteLLM has that covered, and it's cloud-oriented)
 - Not *designed* for multi-tenant deployment. **darkmux is single-operator, multi-machine.** A hobbyist or individual engineer's "few Macs joined over a mesh VPN" is the natural deployment shape. Trust boundary is the operator-controlled tailnet, not enforcement in darkmux's code: `DARKMUX_REDIS_URL` carries no auth beyond what the underlying mesh + Redis ACLs already provide; `DARKMUX_ORCHESTRATOR` and `DARKMUX_MACHINE_ID` are operator-asserted provenance, not authenticated identity; cross-machine state on the shared substrate assumes all participants are the same operator. Fork-friendly if multi-tenant matters to you — the substrate is a reasonable starting point and the missing pieces (auth, ACLs, fairness across distrusting users) are well-trodden territory in other systems.
 
+## Relationship to openclaw
+
+**darkmux works two ways — pick whichever matches your setup, switchable per-dispatch:**
+
+- **Standalone** (default): with just Docker + LMStudio, darkmux runs dispatches through its built-in internal runtime — an in-house Rust agent loop in a per-dispatch container. No external runtime to install or configure. This is what `darkmux crew dispatch` and `darkmux lab run` use out of the box.
+- **With your existing openclaw**: if openclaw is already in your stack, darkmux dispatches through it via `--runtime openclaw`. The agent runs as a host process under openclaw's normal session/agent model — no translation layer, no "darkmux mode" inside openclaw. Pre-flight sync (`darkmux crew sync`) keeps openclaw's `agents.list[]` aligned with the darkmux role manifests; otherwise the integration is transparent.
+
+**darkmux is not a replacement for openclaw.** The standalone path exists for fresh operators who shouldn't need to install a second tool to get started. The openclaw path exists so operators with openclaw already wired in keep their workflow — including any existing sessions, channel routing, custom agents, and the openclaw-specific tools (`update_plan`, `process`) that darkmux's internal runtime doesn't ship. Both paths are first-class; the choice is per-dispatch, not a one-time install decision.
+
+The two runtimes overlap on the basic shape — model + system prompt + tools + chat loop → final reply + trajectory. They diverge on the surrounding concerns:
+
+| Aspect | Internal runtime | OpenClaw |
+|---|---|---|
+| Install footprint | Docker image (~150 MB) | openclaw binary + `~/.openclaw/openclaw.json` |
+| Workspace isolation | per-dispatch container (kernel-enforced) | host process + symlink fences |
+| Session model | per-dispatch tempdir; cross-dispatch state is file-mediated (sprint-as-contract) | persistent sessions at `~/.openclaw/agents/<id>/sessions/` |
+| Agent registry | role manifests under `templates/builtin/roles/` (re-read every dispatch) | `agents.list[]` in `openclaw.json` (synced via `darkmux crew sync`) |
+| Tool surface | `read`, `edit`, `write`, `search`, `bash` | broader (adds `update_plan`, `process`, background lifecycle) |
+| Reach for it when | new install; out-of-box dispatching; sprint-as-contract workflows | already openclaw-wired; want session persistence; need `update_plan` / `process` |
+
+The internal runtime has stricter isolation and a tighter feature surface scoped to darkmux's specific workflow needs. Openclaw has the broader feature surface and the mature ecosystem an existing operator may already depend on.
+
+### Scope of the internal runtime: workflow-fit, not feature-parity
+
+When deciding what to add to the internal runtime, the filter is **workflow-fit**, not feature-parity with openclaw. darkmux is shaped by three load-bearing decisions:
+
+- **Mission-as-contract.** A sprint is a bounded unit of work with explicit inputs (prior sprint outputs, scope file), explicit outputs (typed text file persisted to disk), and explicit verify criteria. Cross-sprint memory is file-mediated by design — the frontier orchestrator sees what state moves between sprints. Hidden session-state that survives across dispatches breaks this contract.
+
+- **Admin/specialist split.** Admin agents (4B-class: compactor, scribe, estimator, mission-compiler) handle bounded structured work at high throughput. Specialist agents (35B+: coder, code-reviewer, analyst) handle judgment-dependent work at lower throughput. Features that push specialists toward admin work (mid-dispatch planning, todo tracking, autonomous replanning) collapse the layering that makes the split valuable — and turn judgment-bearing work into hidden admin work.
+
+- **Operator sovereignty + frontier-as-strategic-layer.** The frontier orchestrator (Claude Code) holds the strategic context; admin agents structure under that context; specialists execute within it. Features that move strategic choices *down* into admin or specialist dispatches — opaque session state, automated replanning, scoped planning verbs — quietly relocate decision authority into tiers that lack the context to make them well.
+
+The filter for any proposed internal-runtime feature: **does this reinforce mission-as-contract, the admin/specialist split, and frontier-as-strategic-layer — or does it blur them?** Features that reinforce land cleanly even when they're small. Features that blur produce "works technically but feels wrong" outcomes that surface as bugs months later.
+
+Openclaw's broader surface is a strength for openclaw's own use cases. When operators need a feature openclaw has and the internal runtime doesn't, the answer is usually `--runtime openclaw`, not "let's add it to the internal runtime." Both paths stay viable on purpose.
+
 ## Composability
 
 Designed to live BELOW agent frameworks and ABOVE inference engines:
