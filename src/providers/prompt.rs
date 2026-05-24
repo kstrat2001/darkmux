@@ -369,6 +369,8 @@ mod tests {
             prompt: Some(prompt.into()),
             prompt_file: None,
             sandbox_seed: None,
+            setup_content: BTreeMap::new(),
+            requires_external_sandbox: false,
             verify: None,
             expected: None,
             extras: BTreeMap::new(),

@@ -1,0 +1,24 @@
+{
+  "_comment": "Quick coding-task workload. Self-contained — ships its own minimal Python sandbox via setupContent, so it runs out of the box with no external project setup. Pairs the chat-completion smoke (`quick-q`) with a tool-call smoke at the same scale. Verifies that the dispatched role can read a file, identify a bug, edit the file, and confirm via a test run. Uses Python's stdlib unittest so no pip install is required on a fresh Mac.",
+
+  "workload": {
+    "id": "quick-coding",
+    "provider": "coding-task",
+    "role": "code-reviewer",
+    "description": "Minimal coding-task smoke. Agent reads a buggy Python function, fixes it, confirms the unittest passes. Runs out of the box on any machine with python3 (Mac default).",
+
+    "setupContent": {
+      "bug.py": "def add_positive(a, b):\n    \"\"\"Return the sum of two positive integers. Raises ValueError if either is non-positive.\"\"\"\n    if a <= 0 or b <= 0:\n        raise ValueError(\"both inputs must be positive\")\n    # Bug: subtraction instead of addition.\n    return a - b\n",
+      "test_bug.py": "import unittest\nfrom bug import add_positive\n\n\nclass TestAddPositive(unittest.TestCase):\n    def test_basic_sum(self):\n        self.assertEqual(add_positive(2, 3), 5)\n\n    def test_larger_sum(self):\n        self.assertEqual(add_positive(10, 7), 17)\n\n    def test_rejects_zero(self):\n        with self.assertRaises(ValueError):\n            add_positive(0, 1)\n\n    def test_rejects_negative(self):\n        with self.assertRaises(ValueError):\n            add_positive(-1, 5)\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+    },
+
+    "prompt": "There is a bug in ${SANDBOX_DIR}/bug.py. The function `add_positive(a, b)` is supposed to return the sum of two positive integers, but it returns the difference instead.\n\nFix the bug. Constraints:\n\n- Modify ONLY ${SANDBOX_DIR}/bug.py.\n- Do NOT modify ${SANDBOX_DIR}/test_bug.py.\n- The fix should preserve the existing ValueError on non-positive inputs.\n- After your edit, the unittest must pass:\n    cd ${SANDBOX_DIR} && python3 -m unittest test_bug.py\n\nReply with a one-line summary of the fix.",
+
+    "verify": {
+      "command": "python3 -m unittest test_bug.py",
+      "cwd": "${SANDBOX_DIR}",
+      "must_contain": ["OK"],
+      "must_not_contain": ["FAILED"]
+    }
+  }
+}
