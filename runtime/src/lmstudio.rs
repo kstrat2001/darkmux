@@ -545,9 +545,16 @@ pub const MAX_SSE_LINE_BYTES: usize = 1 << 20;
 ///
 /// Tested separately so the cap semantics are auditable independent of
 /// the `ChunkStream` iterator that uses it.
+/// `out` is now `&mut Vec<u8>` (was `&mut String`): partial reads
+/// of multi-byte UTF-8 sequences cannot be decoded losslessly, so
+/// the caller must decode the full line buffer once after this
+/// function returns. Pre-fix, the per-fill_buf `from_utf8_lossy` on
+/// partial bytes silently replaced split codepoints with U+FFFD,
+/// corrupting any SSE chunk that crossed an 8 KiB BufReader
+/// boundary mid-emoji or mid-CJK char (#329).
 fn read_line_capped<R: BufRead>(
     reader: &mut R,
-    out: &mut String,
+    out: &mut Vec<u8>,
     max_bytes: usize,
 ) -> std::io::Result<usize> {
     let mut total: usize = 0;
@@ -569,7 +576,7 @@ fn read_line_capped<R: BufRead>(
                         format!("SSE line exceeded {max_bytes}-byte cap"),
                     ));
                 }
-                out.push_str(&String::from_utf8_lossy(&buf[..take]));
+                out.extend_from_slice(&buf[..take]);
                 let n = take;
                 reader.consume(n);
                 total += n;
@@ -583,7 +590,7 @@ fn read_line_capped<R: BufRead>(
                     ));
                 }
                 let n = buf.len();
-                out.push_str(&String::from_utf8_lossy(buf));
+                out.extend_from_slice(buf);
                 reader.consume(n);
                 total += n;
             }
@@ -625,15 +632,20 @@ impl<R: BufRead> Iterator for ChunkStream<R> {
         if self.done {
             return None;
         }
-        let mut line = String::new();
+        // Bytes buffer per #329: decode-per-line, not per-fill_buf.
+        let mut line_bytes: Vec<u8> = Vec::new();
         loop {
-            line.clear();
-            match read_line_capped(&mut self.reader, &mut line, MAX_SSE_LINE_BYTES) {
+            line_bytes.clear();
+            match read_line_capped(&mut self.reader, &mut line_bytes, MAX_SSE_LINE_BYTES) {
                 Ok(0) => {
                     self.done = true;
                     return None;
                 }
                 Ok(_) => {
+                    // Decode the COMPLETE line once. from_utf8_lossy is
+                    // still defense-in-depth for genuinely malformed
+                    // payloads, but it's never run on a partial read.
+                    let line = String::from_utf8_lossy(&line_bytes);
                     let trimmed = line.trim_end_matches(['\r', '\n']);
                     if trimmed.is_empty() || trimmed.starts_with(':') {
                         continue; // event separator or comment / keepalive
@@ -674,30 +686,30 @@ mod tests {
     fn read_line_capped_reads_terminated_line() {
         let input = b"hello\nworld\n";
         let mut r = std::io::BufReader::new(&input[..]);
-        let mut out = String::new();
+        let mut out: Vec<u8> = Vec::new();
         let n = read_line_capped(&mut r, &mut out, 1024).unwrap();
         assert_eq!(n, 6);
-        assert_eq!(out, "hello\n");
+        assert_eq!(out, b"hello\n");
     }
 
     #[test]
     fn read_line_capped_returns_zero_at_eof() {
         let input: &[u8] = b"";
         let mut r = std::io::BufReader::new(input);
-        let mut out = String::new();
+        let mut out: Vec<u8> = Vec::new();
         let n = read_line_capped(&mut r, &mut out, 1024).unwrap();
         assert_eq!(n, 0);
-        assert_eq!(out, "");
+        assert!(out.is_empty());
     }
 
     #[test]
     fn read_line_capped_returns_bytes_when_eof_without_newline() {
         let input = b"no-terminator-line";
         let mut r = std::io::BufReader::new(&input[..]);
-        let mut out = String::new();
+        let mut out: Vec<u8> = Vec::new();
         let n = read_line_capped(&mut r, &mut out, 1024).unwrap();
         assert_eq!(n, input.len());
-        assert_eq!(out, "no-terminator-line");
+        assert_eq!(out, b"no-terminator-line");
     }
 
     #[test]
@@ -705,7 +717,7 @@ mod tests {
         // No newline, length exceeds cap → InvalidData error.
         let input = vec![b'x'; 2048];
         let mut r = std::io::BufReader::new(&input[..]);
-        let mut out = String::new();
+        let mut out: Vec<u8> = Vec::new();
         let err = read_line_capped(&mut r, &mut out, 512).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("512"));
@@ -717,9 +729,44 @@ mod tests {
         let mut input = vec![b'x'; 2048];
         input.push(b'\n');
         let mut r = std::io::BufReader::new(&input[..]);
-        let mut out = String::new();
+        let mut out: Vec<u8> = Vec::new();
         let err = read_line_capped(&mut r, &mut out, 512).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// Regression guard for #329 — a 4-byte emoji that spans a
+    /// `fill_buf` boundary must round-trip intact. Pre-fix,
+    /// `read_line_capped` called `from_utf8_lossy` on each partial
+    /// buf, corrupting the split bytes to U+FFFD. Post-fix, the
+    /// function accumulates bytes; caller decodes the complete line
+    /// once after read returns.
+    ///
+    /// Forces the split by wrapping the input in a `BufReader` with
+    /// capacity 2 — each `fill_buf` returns at most 2 bytes, so the
+    /// 4-byte 🦀 must straddle at least one boundary.
+    #[test]
+    fn read_line_capped_preserves_multibyte_across_fill_buf_boundary() {
+        // 🦀 (F0 9F A6 80) + " reactor\n"
+        let payload: Vec<u8> = {
+            let mut v = Vec::new();
+            v.extend_from_slice(b"\xF0\x9F\xA6\x80");
+            v.extend_from_slice(b" reactor\n");
+            v
+        };
+        let mut reader = std::io::BufReader::with_capacity(2, &payload[..]);
+        let mut out: Vec<u8> = Vec::new();
+        let n = read_line_capped(&mut reader, &mut out, 1024).unwrap();
+        assert_eq!(n, payload.len(), "all bytes consumed");
+        // Decode and verify the emoji is intact.
+        let decoded = String::from_utf8_lossy(&out);
+        assert!(
+            decoded.contains("🦀 reactor"),
+            "multi-byte char must round-trip; got: {decoded:?}"
+        );
+        assert!(
+            !decoded.contains('\u{FFFD}'),
+            "no replacement chars should appear; got: {decoded:?}"
+        );
     }
 
     #[test]
