@@ -72,6 +72,22 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             opts.role_id
         )
     })?;
+    // #340 — surface unknown role-vocab tokens loudly. Unknown tokens
+    // (typos like "exce" for "exec", future tokens not yet wired)
+    // get silently dropped by `role_to_runtime`; without this warning
+    // the operator sees `tool_palette filtered to []` and has no
+    // signal about WHY their role got zero tools.
+    let unknown_tokens = unknown_role_vocab_tokens(&role.tool_palette);
+    if !unknown_tokens.is_empty() {
+        eprintln!(
+            "darkmux crew dispatch: role `{}` declares unknown tool-vocab tokens: [{}] \
+             — these will be silently dropped from the runtime catalog (likely typos). \
+             Known tokens: {}",
+            opts.role_id,
+            unknown_tokens.join(", "),
+            known_role_vocab_csv()
+        );
+    }
     // Compute the runtime tool catalog from the role's tool_palette
     // (allow minus deny). When the palette is empty, returns None and
     // the runtime falls back to its full catalog (back-compat). When
@@ -693,26 +709,63 @@ fn probe_loaded_model() -> Result<String> {
 /// runtime's `--allowed-tools` flag is omitted → runtime exposes full
 /// catalog. The empty-palette case usually means "role definition is
 /// incomplete," not "no tools allowed."
+/// All role-vocab tokens darkmux currently knows how to map to
+/// runtime tools. Source of truth for `role_to_runtime` (mapping)
+/// AND `unknown_role_vocab_tokens` (typo detection). When the
+/// runtime gains a new tool or roles gain a new capability token,
+/// add it here AND to the match in `role_to_runtime`.
+const KNOWN_ROLE_VOCAB: &[&str] = &["read", "edit", "write", "exec", "process", "update_plan"];
+
+/// Single source of truth for role-vocab → runtime-vocab. Add new
+/// mappings here when the runtime gains a new tool or roles gain
+/// new capability tokens. Unknown tokens return an empty slice;
+/// detection of unknowns lives in `unknown_role_vocab_tokens` so
+/// the caller can warn loudly (#340).
+fn role_to_runtime(role_name: &str) -> &'static [&'static str] {
+    match role_name {
+        "read" => &["read", "search"],
+        "edit" => &["edit"],
+        "write" => &["write"],
+        "exec" => &["bash"],
+        // Known role-vocab tokens with no runtime equivalent today.
+        // NOT typos — silently dropped is correct behavior.
+        "process" | "update_plan" => &[],
+        // Truly unknown. Empty result here; the caller should run
+        // `unknown_role_vocab_tokens` separately to surface this as
+        // an operator-visible warning (#340 — silent drops are
+        // typo-prone). Don't bail here; doing so would break valid
+        // dispatches when a future role manifest references a token
+        // we haven't wired yet.
+        _ => &[],
+    }
+}
+
+/// Tokens in a role's tool_palette that aren't in [`KNOWN_ROLE_VOCAB`]
+/// — typos, future tokens, vendor-specific names. Returned sorted +
+/// deduplicated. Empty when the palette only contains known tokens.
+///
+/// Caller pattern: call before dispatch; if non-empty, warn the
+/// operator with the unknown tokens + the list of known ones so
+/// they can correct the manifest. Doctor uses the same helper to
+/// surface unknowns across all role manifests proactively (#340).
+pub(crate) fn unknown_role_vocab_tokens(palette: &crate::crew::types::ToolPalette) -> Vec<String> {
+    let mut unknowns: Vec<String> = palette
+        .allow
+        .iter()
+        .chain(palette.deny.iter())
+        .filter(|name| !KNOWN_ROLE_VOCAB.contains(&name.as_str()))
+        .cloned()
+        .collect();
+    unknowns.sort();
+    unknowns.dedup();
+    unknowns
+}
+
 fn compute_runtime_allowed_tools(palette: &crate::crew::types::ToolPalette) -> Option<Vec<String>> {
     // Empty palette: caller decides; today we return None so the
     // runtime exposes its full catalog (back-compat).
     if palette.allow.is_empty() && palette.deny.is_empty() {
         return None;
-    }
-
-    // Single source of truth for role-vocab → runtime-vocab. Add new
-    // mappings here when the runtime gains a new tool or roles gain
-    // new capability tokens.
-    fn role_to_runtime(role_name: &str) -> &'static [&'static str] {
-        match role_name {
-            "read" => &["read", "search"],
-            "edit" => &["edit"],
-            "write" => &["write"],
-            "exec" => &["bash"],
-            // No runtime equivalent today; silently dropped.
-            "process" | "update_plan" => &[],
-            _ => &[],
-        }
     }
 
     // Allow first.
@@ -737,6 +790,13 @@ fn compute_runtime_allowed_tools(palette: &crate::crew::types::ToolPalette) -> O
     allowed.retain(|t| seen.insert(t.clone()));
 
     Some(allowed)
+}
+
+/// Comma-separated list of all known role-vocab tokens, for use in
+/// operator-facing warning messages (#340). Wrapped in a helper so
+/// the formatting stays consistent across dispatch + doctor surfaces.
+pub(crate) fn known_role_vocab_csv() -> String {
+    KNOWN_ROLE_VOCAB.join(", ")
 }
 
 #[cfg(test)]
@@ -812,6 +872,81 @@ mod tests {
         let mut sorted = result.clone();
         sorted.sort();
         assert_eq!(sorted, vec!["read", "search"]);
+    }
+
+    // ─── #340: unknown role-vocab token detection ───────────────────
+
+    #[test]
+    fn unknown_role_vocab_empty_palette_returns_empty() {
+        let p = palette(&[], &[]);
+        assert!(unknown_role_vocab_tokens(&p).is_empty());
+    }
+
+    #[test]
+    fn unknown_role_vocab_all_known_tokens_returns_empty() {
+        let p = palette(&["read", "edit", "write"], &["exec", "process", "update_plan"]);
+        assert!(unknown_role_vocab_tokens(&p).is_empty());
+    }
+
+    /// Typo in allow list (the canonical failure shape from #340 spec —
+    /// "exce" instead of "exec" silently drops the agent's only exec
+    /// capability).
+    #[test]
+    fn unknown_role_vocab_typo_in_allow_is_surfaced() {
+        let p = palette(&["read", "exce"], &[]);
+        assert_eq!(unknown_role_vocab_tokens(&p), vec!["exce".to_string()]);
+    }
+
+    /// Typos in both lists are deduplicated + sorted.
+    #[test]
+    fn unknown_role_vocab_dedupes_and_sorts_across_allow_and_deny() {
+        let p = palette(&["fake-tool", "exce"], &["fake-tool", "another-typo"]);
+        let unknowns = unknown_role_vocab_tokens(&p);
+        assert_eq!(
+            unknowns,
+            vec![
+                "another-typo".to_string(),
+                "exce".to_string(),
+                "fake-tool".to_string(),
+            ]
+        );
+    }
+
+    /// Future tokens (vendor-specific, not yet wired) are flagged as
+    /// unknown — operator-facing signal that the manifest references
+    /// a token darkmux doesn't know how to map yet. NOT a hard error;
+    /// the dispatch can still proceed (the unknown just drops from
+    /// the runtime catalog) but the operator gets warned.
+    #[test]
+    fn unknown_role_vocab_future_token_is_flagged() {
+        let p = palette(&["read", "vendor-specific-tool"], &[]);
+        assert_eq!(
+            unknown_role_vocab_tokens(&p),
+            vec!["vendor-specific-tool".to_string()]
+        );
+    }
+
+    /// Known tokens (including those with no runtime equivalent like
+    /// `process` and `update_plan`) MUST NOT be flagged. They're
+    /// intentionally dropped, not accidentally.
+    #[test]
+    fn unknown_role_vocab_does_not_flag_known_no_runtime_tokens() {
+        let p = palette(&["process", "update_plan"], &[]);
+        assert!(
+            unknown_role_vocab_tokens(&p).is_empty(),
+            "process and update_plan are known role-vocab; should NOT be flagged"
+        );
+    }
+
+    #[test]
+    fn known_role_vocab_csv_contains_all_known_tokens() {
+        let csv = known_role_vocab_csv();
+        for token in ["read", "edit", "write", "exec", "process", "update_plan"] {
+            assert!(
+                csv.contains(token),
+                "known_role_vocab_csv missing `{token}`; got: {csv}"
+            );
+        }
     }
 
     #[test]
