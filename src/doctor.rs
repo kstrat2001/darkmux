@@ -1722,22 +1722,22 @@ fn pick_active_profile<'a>(
 /// names. Custom-named agents (e.g. "my-app-bot") can have any shape;
 /// darkmux doesn't have an opinion about those.
 fn check_agent_role_definitions() -> Check {
-    let openclaw_path = match dirs::home_dir() {
-        Some(h) => h.join(".openclaw").join("openclaw.json"),
-        None => {
-            return Check {
-                name: "agent role scaffolds".into(),
-                status: Status::Pass,
-                message: "(no home directory — skipping)".into(),
-                hint: None,
-            };
-        }
-    };
+    // #332 — use the canonical openclaw-config resolver so the
+    // `DARKMUX_OPENCLAW_CONFIG` env var is honored consistently
+    // with every other OC-touching surface (dispatcher, swap's
+    // apply_runtime, Sprint-G's openclaw-active gate). Pre-fix this
+    // check hardcoded `~/.openclaw/openclaw.json` and silently
+    // probed the wrong file when the operator pointed the env var
+    // somewhere else.
+    let openclaw_path = crate::crew::dispatch::default_openclaw_config();
     if !openclaw_path.exists() {
         return Check {
             name: "agent role scaffolds".into(),
             status: Status::Pass,
-            message: "(no ~/.openclaw/openclaw.json — skipping)".into(),
+            message: format!(
+                "(no {} on disk — skipping)",
+                openclaw_path.display()
+            ),
             hint: None,
         };
     }
@@ -2757,6 +2757,112 @@ mod tests {
         assert!(
             check.message.contains("skipped"),
             "expected `skipped` in message; got: {}",
+            check.message
+        );
+    }
+
+    // ─── #332: doctor OC-config probe normalization ─────────────────
+
+    /// Helper that points `DARKMUX_OPENCLAW_CONFIG` at a path the
+    /// caller chooses (so the test can ALSO supply contents for the
+    /// resolver to read). Distinct from `OpenclawConfigGuard::missing`
+    /// which points at a known-missing path.
+    struct OpenclawConfigPointGuard {
+        prev: Option<String>,
+        _tmp: tempfile::TempDir,
+    }
+
+    impl OpenclawConfigPointGuard {
+        /// Point env var at a file under a freshly-created tempdir.
+        /// Returns the guard + the full path the env var was set to.
+        fn at_tempfile(filename: &str) -> (Self, std::path::PathBuf) {
+            let tmp = tempfile::TempDir::new().expect("tempdir");
+            let path = tmp.path().join(filename);
+            let prev = std::env::var("DARKMUX_OPENCLAW_CONFIG").ok();
+            // SAFETY: tests using this guard MUST be #[serial].
+            unsafe {
+                std::env::set_var("DARKMUX_OPENCLAW_CONFIG", &path);
+            }
+            (Self { prev, _tmp: tmp }, path)
+        }
+    }
+
+    impl Drop for OpenclawConfigPointGuard {
+        fn drop(&mut self) {
+            // SAFETY: tests using this guard MUST be #[serial].
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("DARKMUX_OPENCLAW_CONFIG", v),
+                    None => std::env::remove_var("DARKMUX_OPENCLAW_CONFIG"),
+                }
+            }
+        }
+    }
+
+    /// #332 — `check_agent_role_definitions` must honor
+    /// `DARKMUX_OPENCLAW_CONFIG`. Pre-fix it hardcoded
+    /// `~/.openclaw/openclaw.json` and silently probed the wrong
+    /// file when the env var was set elsewhere.
+    ///
+    /// Test: point env var at a custom path that doesn't exist on
+    /// disk. The check must report the env-var-resolved path in its
+    /// "skipping" message (proving the resolver was consulted), NOT
+    /// the hardcoded `~/.openclaw/openclaw.json`.
+    #[serial_test::serial]
+    #[test]
+    fn check_agent_role_definitions_honors_openclaw_config_env_var() {
+        let (_guard, env_path) = OpenclawConfigPointGuard::at_tempfile("custom-oc.json");
+        // env_path does NOT exist on disk — the missing-config skip
+        // path fires. Its message names the resolved path.
+        let check = check_agent_role_definitions();
+        assert_eq!(
+            check.status,
+            Status::Pass,
+            "missing custom OC config → pass-with-skip"
+        );
+        let expected_fragment = env_path.display().to_string();
+        assert!(
+            check.message.contains(&expected_fragment),
+            "check message must name the env-var-resolved path `{expected_fragment}` \
+             (pre-fix it hardcoded `~/.openclaw/openclaw.json`); got: {}",
+            check.message
+        );
+        // Defensive: ensure the message does NOT mention the
+        // hardcoded default path — that would be the pre-fix bug.
+        // (Skip this assertion if HOME happens to contain the same
+        // tempdir prefix, which can't happen here.)
+        let hardcoded = format!(
+            "{}/.openclaw/openclaw.json",
+            dirs::home_dir().unwrap().display()
+        );
+        assert!(
+            !check.message.contains(&hardcoded),
+            "check message must not leak the hardcoded default path; got: {}",
+            check.message
+        );
+    }
+
+    /// Sibling: with the env var pointing at a REAL openclaw.json,
+    /// the check reads it (success path). Verifies the resolver isn't
+    /// just used for the skip path — the actual file read also goes
+    /// through the env-var-resolved location.
+    #[serial_test::serial]
+    #[test]
+    fn check_agent_role_definitions_reads_env_var_path_when_file_exists() {
+        let (_guard, env_path) = OpenclawConfigPointGuard::at_tempfile("custom-oc.json");
+        // Write a minimal valid openclaw.json (no agents.list means
+        // the check returns its "no darkmux/* agents" pass message,
+        // not an error).
+        std::fs::write(&env_path, r#"{"agents":{"list":[]}}"#).unwrap();
+        let check = check_agent_role_definitions();
+        // Either Pass with "no darkmux/* agents" message, or some
+        // other non-error outcome. The important assertion: the
+        // check didn't bail with the missing-config skip message,
+        // which would prove it read the env-var path.
+        assert!(
+            !check.message.contains("on disk — skipping"),
+            "with a real file at the env-var path, the missing-config skip path \
+             must NOT fire; got: {}",
             check.message
         );
     }
