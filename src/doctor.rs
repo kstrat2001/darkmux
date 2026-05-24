@@ -107,6 +107,7 @@ pub fn run() -> DoctorReport {
         check_recommendation_drift(),
         check_recommended_profile_name_not_shadowed(),
         check_role_model_pin_drift(),
+        check_role_tool_vocab_typos(),
         check_beat33_legacy_crew_dir(),
         check_legacy_mission_layout(),
     ];
@@ -215,6 +216,70 @@ fn check_beat33_legacy_crew_dir() -> Check {
              at the legacy `crew/` dir (`~/.darkmux/crew/`), the dual-read keeps working \
              but this script's paths are computed from the env var value as-given.",
             script = script_lines.join("\n")
+        )),
+    }
+}
+
+/// Warn when any role manifest declares unknown tool-vocab tokens
+/// (typos like "exce" for "exec", future tokens not yet wired).
+///
+/// Without this check, the only operator-visible signal of a typo
+/// was the `darkmux crew dispatch: tool_palette filtered to []`
+/// line at dispatch time — easy to miss, and only surfaces AFTER
+/// the operator tried to use the role. Doctor walks every role
+/// manifest proactively. (#340)
+fn check_role_tool_vocab_typos() -> Check {
+    let roles = match crate::crew::loader::load_roles() {
+        Ok(rs) => rs,
+        Err(e) => {
+            return Check {
+                name: "role tool-vocab".into(),
+                status: Status::Warn,
+                message: format!("could not load role manifests: {e:#}"),
+                hint: None,
+            };
+        }
+    };
+
+    // Collect (role_id, [unknown tokens]) pairs for roles with any
+    // unknowns. Sorted by role id for stable output.
+    let mut findings: Vec<(String, Vec<String>)> = Vec::new();
+    for role in &roles {
+        let unknowns =
+            crate::crew::dispatch_internal::unknown_role_vocab_tokens(&role.tool_palette);
+        if !unknowns.is_empty() {
+            findings.push((role.id.clone(), unknowns));
+        }
+    }
+    findings.sort_by(|a, b| a.0.cmp(&b.0));
+
+    if findings.is_empty() {
+        return Check {
+            name: "role tool-vocab".into(),
+            status: Status::Pass,
+            message: format!(
+                "all {} role manifest(s) use known tool-vocab tokens",
+                roles.len()
+            ),
+            hint: None,
+        };
+    }
+
+    let summary = findings
+        .iter()
+        .map(|(role, unknowns)| format!("`{role}`: [{}]", unknowns.join(", ")))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Check {
+        name: "role tool-vocab".into(),
+        status: Status::Warn,
+        message: format!(
+            "{} role(s) declare unknown tool-vocab tokens: {summary}",
+            findings.len()
+        ),
+        hint: Some(format!(
+            "Edit the offending role manifest(s) — likely typos. Known tokens: {}.",
+            crate::crew::dispatch_internal::known_role_vocab_csv()
         )),
     }
 }
@@ -2328,10 +2393,11 @@ mod tests {
         // audit-integrity [#163] + recommendation-drift +
         // recommended-profile-not-shadowed [#159] + role-model-pin-drift
         // [#160] + legacy-mission-layout [#148] + beat-33-crew-dir
-        // [Beat 33 directory flatten]) + one per active eureka rule.
+        // [Beat 33 directory flatten] + role-tool-vocab [#340]) + one
+        // per active eureka rule.
         // Every check should appear regardless of environment — even if
         // the underlying probe couldn't read state.
-        let expected = 24 + crate::eureka::all_rules().len();
+        let expected = 25 + crate::eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
