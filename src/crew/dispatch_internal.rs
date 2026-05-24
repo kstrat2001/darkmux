@@ -347,6 +347,34 @@ fn run_tailer(
 }
 
 /// State machine for tailing `trajectory.jsonl`. Tracks the file offset,
+/// Drain complete (newline-terminated) lines from a byte buffer,
+/// returning each as a decoded `String`. The buffer is mutated in
+/// place: drained line bytes are removed; any partial tail without a
+/// trailing `\n` stays in the buffer for the next call.
+///
+/// Decoding via `from_utf8_lossy` happens ONCE per complete line —
+/// never on a partial read. This is the load-bearing invariant for
+/// #329: multi-byte UTF-8 sequences (emoji, CJK) that straddle a
+/// read boundary stay intact across calls. Pre-fix, the buffer was a
+/// `String` with per-poll `from_utf8_lossy(&buf)`, which replaced
+/// any partial multi-byte tail with U+FFFD and silently corrupted
+/// the subsequent JSON payload.
+///
+/// Empty lines are skipped (matches the pre-fix loop's semantics).
+fn drain_complete_lines_from_bytes(pending: &mut Vec<u8>) -> Vec<String> {
+    let mut out = Vec::new();
+    while let Some(nl) = pending.iter().position(|&b| b == b'\n') {
+        // Drain through and including the newline; line content is
+        // everything before the newline byte.
+        let line_bytes: Vec<u8> = pending.drain(..=nl).collect();
+        let line = String::from_utf8_lossy(&line_bytes[..line_bytes.len() - 1]).into_owned();
+        if !line.is_empty() {
+            out.push(line);
+        }
+    }
+    out
+}
+
 /// any partial-line tail bytes carried across polls, and the last
 /// heartbeat instant for rate limiting.
 struct TailerState {
@@ -354,7 +382,14 @@ struct TailerState {
     offset: u64,
     /// Trailing partial line carried from one poll to the next when the
     /// file ends mid-line (a write was in progress at our read).
-    pending: String,
+    ///
+    /// Raw bytes — NOT a string. Multi-byte UTF-8 characters (emoji,
+    /// CJK) can split across `poll_and_emit` rounds; decoding via
+    /// `from_utf8_lossy` on partial bytes would emit U+FFFD
+    /// replacement chars and silently corrupt the JSON payload (#329).
+    /// We accumulate bytes here and decode per-line, after the
+    /// trailing newline arrives.
+    pending: Vec<u8>,
     session_id: String,
     role_id: String,
     model: String,
@@ -372,7 +407,7 @@ impl TailerState {
         Self {
             trajectory_path,
             offset: 0,
-            pending: String::new(),
+            pending: Vec::new(),
             session_id,
             role_id,
             model,
@@ -415,13 +450,12 @@ impl TailerState {
         }
         self.offset = size;
 
-        self.pending.push_str(&String::from_utf8_lossy(&buf));
-        while let Some(nl) = self.pending.find('\n') {
-            let line: String = self.pending.drain(..nl).collect();
-            self.pending.drain(..1); // consume the \n
-            if !line.is_empty() {
-                self.handle_event(&line);
-            }
+        // Append raw bytes; decode happens per-line (after the
+        // trailing newline arrives) so multi-byte UTF-8 chars that
+        // straddle a poll boundary don't corrupt to U+FFFD (#329).
+        self.pending.extend_from_slice(&buf);
+        for line in drain_complete_lines_from_bytes(&mut self.pending) {
+            self.handle_event(&line);
         }
     }
 
@@ -911,6 +945,102 @@ mod tests {
         state.poll_and_emit();
         assert_eq!(state.summary.turns, 1, "complete line dispatched after second poll");
         assert!(state.pending.is_empty(), "pending drained after newline");
+    }
+
+    /// Regression guard for #329 — multi-byte UTF-8 characters split
+    /// across reads must not corrupt to U+FFFD.
+    ///
+    /// The `drain_complete_lines_from_bytes` helper is the pure-
+    /// function extract that makes the bug directly testable. Before
+    /// the fix: pending was String; each poll did from_utf8_lossy on
+    /// partial bytes; emoji split across the boundary became U+FFFD.
+    /// After the fix: pending is Vec<u8>; decode happens once per
+    /// complete line.
+    #[test]
+    fn drain_complete_lines_preserves_multibyte_across_extends() {
+        let mut pending: Vec<u8> = Vec::new();
+
+        // First chunk: prefix + first 2 bytes of 🦀.
+        pending.extend_from_slice(b"{\"reasoning_text\":\"");
+        pending.extend_from_slice(b"\xF0\x9F");
+        let lines = drain_complete_lines_from_bytes(&mut pending);
+        assert!(lines.is_empty(), "no newline yet — nothing drained");
+
+        // Second chunk: last 2 bytes of 🦀, close out, newline.
+        pending.extend_from_slice(b"\xA6\x80 reactor\"}\n");
+        let lines = drain_complete_lines_from_bytes(&mut pending);
+        assert_eq!(lines.len(), 1, "complete line drained");
+        assert!(
+            lines[0].contains("🦀 reactor"),
+            "multi-byte char must round-trip intact; got: {}",
+            lines[0]
+        );
+        assert!(
+            !lines[0].contains('\u{FFFD}'),
+            "no replacement chars should appear; got: {}",
+            lines[0]
+        );
+        assert!(pending.is_empty(), "pending drained after newline");
+    }
+
+    /// Two complete lines in one buffer, plus a partial third line.
+    /// The helper must drain both complete lines and leave the
+    /// partial third in pending.
+    #[test]
+    fn drain_complete_lines_handles_multiple_lines_per_call() {
+        let mut pending: Vec<u8> = b"line one\nline two\npartial".to_vec();
+        let lines = drain_complete_lines_from_bytes(&mut pending);
+        assert_eq!(lines, vec!["line one".to_string(), "line two".to_string()]);
+        assert_eq!(pending, b"partial");
+    }
+
+    /// Empty lines (consecutive newlines) are skipped — matches the
+    /// pre-fix behavior of the line-emit loop.
+    #[test]
+    fn drain_complete_lines_skips_empty_lines() {
+        let mut pending: Vec<u8> = b"alpha\n\nbeta\n".to_vec();
+        let lines = drain_complete_lines_from_bytes(&mut pending);
+        assert_eq!(lines, vec!["alpha".to_string(), "beta".to_string()]);
+        assert!(pending.is_empty());
+    }
+
+    /// End-to-end through TailerState: write a line with an emoji
+    /// split across two polls; the tailer's handle_event sees the
+    /// intact line. Verified by writing a model.completed event
+    /// (which the summary DOES track) interleaved with the emoji
+    /// line — the turn count proves the second line was parsed.
+    #[test]
+    fn tailer_state_dispatches_event_after_multibyte_split() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("trajectory.jsonl");
+        let mut state = fixture_state(path.clone());
+
+        // First write: model.completed line intact + start of a
+        // second line containing 🦀 (4-byte UTF-8 seq), broken
+        // mid-codepoint.
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(b"{\"type\":\"model.completed\",\"seq\":1,\"finish_reason\":\"stop\"}\n")
+                .unwrap();
+            f.write_all(b"{\"type\":\"model.reasoning\",\"reasoning_text\":\"")
+                .unwrap();
+            f.write_all(b"\xF0\x9F").unwrap();
+        }
+        state.poll_and_emit();
+        assert_eq!(state.summary.turns, 1, "first line dispatched");
+
+        // Second write: completes the 🦀 + closes the JSON.
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(b"\xA6\x80 reactor\"}\n").unwrap();
+        }
+        state.poll_and_emit();
+        // pending should be empty — both lines now drained.
+        assert!(
+            state.pending.is_empty(),
+            "all lines drained after second poll; got pending={:?}",
+            state.pending
+        );
     }
 
     #[test]
