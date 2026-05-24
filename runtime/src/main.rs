@@ -131,6 +131,19 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // need machine-parseable output. All progress/status lines go to
     // stderr when JSON is set so stdout is clean for `jq`.
     let mut json_mode: bool = false;
+    // `--allowed-tools <comma-separated-names>` filters the runtime's
+    // hardcoded tool catalog to a subset (computed dispatcher-side from
+    // the role's tool_palette.allow minus tool_palette.deny). When
+    // absent, the runtime exposes the full catalog (back-compat).
+    //
+    // The catalog IS the capability surface — the model can only call
+    // tools that appear in the `tools[]` field of the chat-completions
+    // request. Filtering here ensures denied tools never reach the
+    // model, regardless of whether the model follows its system-prompt
+    // doctrine. Pre-filter, a model could ignore "you must not edit"
+    // in the system prompt and call `edit` anyway because the tool
+    // existed in the catalog.
+    let mut allowed_tools: Option<Vec<String>> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -178,6 +191,20 @@ fn run_dispatch(args: &[String]) -> ExitCode {
             "--json" => {
                 json_mode = true;
                 i += 1;
+            }
+            "--allowed-tools" => {
+                if let Some(v) = args.get(i + 1) {
+                    let names: Vec<String> = v
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    allowed_tools = Some(names);
+                    i += 2;
+                } else {
+                    eprintln!("--allowed-tools requires a comma-separated list");
+                    return ExitCode::from(2);
+                }
             }
             other => {
                 eprintln!("unknown flag: {other}");
@@ -240,7 +267,8 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // `Tool::Echo` is excluded — it was a Phase 2 round-trip probe with
     // no use in real dispatches; sending it adds tool-catalog overhead
     // the model would never invoke.
-    let tools = [Tool::Search, Tool::Read, Tool::Edit, Tool::Write, Tool::Bash];
+    let full_catalog = [Tool::Search, Tool::Read, Tool::Edit, Tool::Write, Tool::Bash];
+    let tools = filter_tools_by_allowed(&full_catalog, allowed_tools.as_deref());
 
     // Status lines go to stderr in JSON mode so stdout stays clean for
     // `jq`-style consumers. In human-readable mode they print to stdout
@@ -419,9 +447,94 @@ fn build_json_envelope(
     })
 }
 
+/// Filter the runtime's tool catalog by an allow-list of tool names
+/// (the role's tool_palette.allow minus tool_palette.deny, computed
+/// dispatcher-side and passed via `--allowed-tools`).
+///
+/// When `allowed` is `None`, returns the full catalog (back-compat for
+/// callers that haven't been updated to pass the flag).
+/// When `allowed` is `Some(list)`, returns only tools whose `name()`
+/// appears in the list.
+///
+/// **This is the runtime-side enforcement of role.tool_palette.deny.**
+/// Before this enforcement existed, every role saw all runtime tools
+/// regardless of its declared deny list — a model that ignored its
+/// .md system prompt's "you must not edit" doctrine could still call
+/// the edit tool because the tool existed in the catalog. With this
+/// filter, denied tools are never in the catalog the LMStudio chat-
+/// completions API sees, so the model cannot call them.
+fn filter_tools_by_allowed(tools: &[Tool], allowed: Option<&[String]>) -> Vec<Tool> {
+    match allowed {
+        None => tools.to_vec(),
+        Some(names) => tools
+            .iter()
+            .filter(|t| names.iter().any(|n| n == t.name()))
+            .copied()
+            .collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── tool catalog filter (runtime-side enforcement of role tool_palette) ──
+
+    #[test]
+    fn filter_tools_allowed_none_returns_full_catalog() {
+        let full = [Tool::Search, Tool::Read, Tool::Edit, Tool::Write, Tool::Bash];
+        let result = filter_tools_by_allowed(&full, None);
+        assert_eq!(result.len(), 5);
+    }
+
+    #[test]
+    fn filter_tools_allowed_subset_returns_only_those_tools() {
+        let full = [Tool::Search, Tool::Read, Tool::Edit, Tool::Write, Tool::Bash];
+        let allow: Vec<String> = vec!["read".into(), "search".into(), "bash".into()];
+        let result = filter_tools_by_allowed(&full, Some(&allow));
+        assert_eq!(result.len(), 3, "expected 3 tools after filter, got {result:?}");
+        assert!(
+            !result.iter().any(|t| matches!(t, Tool::Edit | Tool::Write)),
+            "filtered catalog must NOT include Edit or Write; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn filter_tools_allowed_empty_list_returns_nothing() {
+        let full = [Tool::Search, Tool::Read, Tool::Edit, Tool::Write, Tool::Bash];
+        let allow: Vec<String> = vec![];
+        let result = filter_tools_by_allowed(&full, Some(&allow));
+        assert_eq!(
+            result.len(),
+            0,
+            "empty allowed-list → empty filtered catalog; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn filter_tools_allowed_unknown_names_silently_dropped() {
+        let full = [Tool::Search, Tool::Read, Tool::Edit, Tool::Write, Tool::Bash];
+        let allow: Vec<String> = vec!["nonexistent".into(), "made-up-tool".into()];
+        let result = filter_tools_by_allowed(&full, Some(&allow));
+        assert_eq!(
+            result.len(),
+            0,
+            "unknown tool names must not match anything; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn filter_tools_allowed_preserves_input_order() {
+        let full = [Tool::Search, Tool::Read, Tool::Edit, Tool::Write, Tool::Bash];
+        let allow: Vec<String> = vec!["bash".into(), "read".into()];
+        let result = filter_tools_by_allowed(&full, Some(&allow));
+        // Order should follow the input catalog (Read before Bash),
+        // not the allow-list arg order. LMStudio's tool-call bias is
+        // sensitive to position; the catalog order is the contract.
+        assert_eq!(result.len(), 2);
+        assert!(matches!(result[0], Tool::Read));
+        assert!(matches!(result[1], Tool::Bash));
+    }
 
     #[test]
     fn json_envelope_success_carries_final_assistant_and_metrics() {

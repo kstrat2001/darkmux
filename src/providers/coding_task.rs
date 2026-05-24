@@ -97,7 +97,44 @@ impl WorkloadProvider for CodingTaskProvider {
             );
         }
 
-        // 3. Loud-fail when the workload declares requiresExternalSandbox
+        // 3. Validate workload+role pairing. Coding-task workloads are
+        //    editing-shaped; pairing with a role whose tool_palette
+        //    denies both `edit` and `write` (e.g. code-reviewer) gives
+        //    the agent a contradiction it can't resolve. Bail at setup
+        //    time with an operator-actionable hint — better than
+        //    dispatching against a model that will inevitably
+        //    "describe the fix without executing it" because the role
+        //    forbids the only tools for execution.
+        //
+        //    The validator silently skips when the role can't be loaded
+        //    (unknown id) so the existing dispatch path produces its
+        //    own canonical "role not found" error without double-failing.
+        let role_id = pick_role(loaded);
+        if let Ok(roles) = crate::crew::loader::load_roles() {
+            if let Some(role) = roles.iter().find(|r| r.id == role_id) {
+                if !role_can_modify_files(&role.tool_palette) {
+                    bail!(
+                        "coding-task workload `{}` is paired with role `{}` whose \
+                         tool_palette denies both `edit` and `write` — the agent has no \
+                         tools to apply a fix and the dispatch will inevitably waste \
+                         wall-clock on a 'describe-but-don't-execute' pattern.\n\
+                         \n\
+                         Fix one of:\n\
+                         \n\
+                           1. Set the workload's `role:` field to one that allows edit\n\
+                              (e.g. `\"role\": \"coder\"`).\n\
+                           2. Unset / override `DARKMUX_DEFAULT_ROLE` if it's pointing\n\
+                              at a review-shaped role.\n\
+                           3. Use a different workload that's review-shaped (where the\n\
+                              prompt asks the agent to FIND issues, not FIX them).",
+                        loaded.manifest.workload.id,
+                        role_id
+                    );
+                }
+            }
+        }
+
+        // 4. Loud-fail when the workload declares requiresExternalSandbox
         //    but the sandbox is empty AND no inline setup content was
         //    applied. Without this check, the dispatch would proceed
         //    against an empty workspace and the agent would hallucinate
@@ -391,6 +428,25 @@ fn sandbox_is_empty(path: &Path) -> bool {
     }
 }
 
+/// True when the role's tool_palette permits either `edit` or `write`
+/// (after applying the deny list). Coding-task workloads are editing-
+/// shaped by definition; if neither tool is available the agent can't
+/// satisfy the prompt no matter how good the model is.
+///
+/// Catches the methodology bug from 2026-05-24: pairing a coding-task
+/// workload with `code-reviewer` (whose tool_palette denies edit AND
+/// write) gives the agent a contradiction it can't resolve. Better to
+/// bail at setup time with an operator-actionable hint than to dispatch
+/// against a model that will inevitably "describe the fix without
+/// executing it" because it has no tools for execution.
+fn role_can_modify_files(palette: &crate::crew::types::ToolPalette) -> bool {
+    let allows = |name: &str| {
+        palette.allow.iter().any(|a| a == name)
+            && !palette.deny.iter().any(|d| d == name)
+    };
+    allows("edit") || allows("write")
+}
+
 /// Reject setupContent keys that would write outside the sandbox dir.
 ///
 /// Three classes of attack-shape this catches:
@@ -450,16 +506,20 @@ fn resolve_prompt(loaded: &LoadedWorkload) -> Result<String> {
 }
 
 /// Resolve which darkmux role to dispatch the coding-task workload
-/// through. Beat 36 directional principle: workloads reference DM role
-/// manifest ids, not OC agent personas. Default: `code-reviewer` —
-/// best-suited to the long-agentic review-shaped tasks coding_task
-/// workloads exercise. Override via the workload's `role:` field or
-/// `DARKMUX_DEFAULT_ROLE`.
+/// through. Workloads reference DM role manifest ids, not OC agent
+/// personas. Default: `coder` — coding-task workloads ARE editing-shaped
+/// by definition (the agent reads code + modifies it + runs tests).
+/// The earlier default of `code-reviewer` was a methodology bug
+/// surfaced 2026-05-24: code-reviewer's tool_palette denies edit/write,
+/// so any coding-task workload that defaulted to it would hand the
+/// agent a contradiction (prompt: "fix the bug"; doctrine: "you must
+/// not modify code"). Override via the workload's `role:` field or
+/// `DARKMUX_DEFAULT_ROLE` env var.
 fn pick_role(loaded: &LoadedWorkload) -> String {
     if let Some(r) = loaded.manifest.workload.role.as_deref() {
         return r.to_string();
     }
-    env::var("DARKMUX_DEFAULT_ROLE").unwrap_or_else(|_| "code-reviewer".to_string())
+    env::var("DARKMUX_DEFAULT_ROLE").unwrap_or_else(|_| "coder".to_string())
 }
 
 /// Dispatch via darkmux's internal Docker-bounded runtime through the
@@ -716,12 +776,122 @@ mod tests {
         assert_eq!(manifest_seed_path(&loaded), Some("custom-seed".into()));
     }
 
+    /// Coding-task default role is `coder` (allows edit) — NOT
+    /// code-reviewer. The earlier default of `code-reviewer` was the
+    /// methodology bug from 2026-05-24: coding-task workloads are
+    /// editing-shaped by definition; pairing them with a role whose
+    /// tool_palette denies edit produces a contradiction the agent
+    /// can't satisfy. Regression guard.
     #[test]
-    fn pick_role_default_code_reviewer() {
+    #[serial_test::serial]
+    fn pick_role_default_coder() {
         let tmp = TempDir::new().unwrap();
         let loaded = make_loaded(basic_spec(), tmp.path().to_path_buf());
         unsafe { env::remove_var("DARKMUX_DEFAULT_ROLE") };
-        assert_eq!(pick_role(&loaded), "code-reviewer");
+        assert_eq!(pick_role(&loaded), "coder");
+    }
+
+    // ─── role_can_modify_files (workload-role contradiction validator) ──
+
+    fn palette(allow: &[&str], deny: &[&str]) -> crate::crew::types::ToolPalette {
+        crate::crew::types::ToolPalette {
+            allow: allow.iter().map(|s| s.to_string()).collect(),
+            deny: deny.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn role_can_modify_coder_palette_yes() {
+        // coder: allow [read, edit, write, exec, process], deny []
+        let p = palette(&["read", "edit", "write", "exec", "process"], &[]);
+        assert!(role_can_modify_files(&p));
+    }
+
+    #[test]
+    fn role_can_modify_code_reviewer_palette_no() {
+        // code-reviewer: allow [read, exec, update_plan], deny [edit, write, process]
+        // This is the regression guard for the 2026-05-24 methodology bug.
+        let p = palette(
+            &["read", "exec", "update_plan"],
+            &["edit", "write", "process"],
+        );
+        assert!(
+            !role_can_modify_files(&p),
+            "code-reviewer must NOT be classified as able to modify files"
+        );
+    }
+
+    #[test]
+    fn role_can_modify_empty_palette_no() {
+        let p = palette(&[], &[]);
+        assert!(!role_can_modify_files(&p));
+    }
+
+    #[test]
+    fn role_can_modify_deny_overrides_allow() {
+        let p = palette(&["edit", "write"], &["edit", "write"]);
+        assert!(!role_can_modify_files(&p));
+    }
+
+    #[test]
+    fn role_can_modify_only_write_allowed_yes() {
+        let p = palette(&["read", "write"], &[]);
+        assert!(role_can_modify_files(&p));
+    }
+
+    #[test]
+    fn role_can_modify_only_edit_allowed_yes() {
+        let p = palette(&["read", "edit"], &[]);
+        assert!(role_can_modify_files(&p));
+    }
+
+    /// Integration: pairing a coding-task workload with `code-reviewer`
+    /// (the methodology bug class) bails at setup() with the
+    /// operator-actionable hint. Uses the embedded role manifests so
+    /// the test doesn't depend on user state.
+    #[test]
+    #[serial_test::serial]
+    fn setup_bails_when_workload_role_is_code_reviewer() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run");
+        let sandbox_dir = tmp.path().join("sandbox");
+        let mut spec = basic_spec();
+        spec.role = Some("code-reviewer".to_string());
+        let loaded = make_loaded(spec, tmp.path().to_path_buf());
+
+        let err = CodingTaskProvider
+            .setup(&loaded, &run_dir, &sandbox_dir)
+            .expect_err("setup must bail when role denies modification");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("code-reviewer"),
+            "expected error to name the offending role; got: {msg}"
+        );
+        assert!(
+            msg.contains("`edit`") && msg.contains("`write`"),
+            "expected error to name the missing tools; got: {msg}"
+        );
+        assert!(
+            msg.contains("coder"),
+            "expected error to point at `coder` as the fix; got: {msg}"
+        );
+    }
+
+    /// Integration regression: the default role (`coder`, post-2026-05-24
+    /// fix) passes the validator and setup() proceeds without bail.
+    #[test]
+    #[serial_test::serial]
+    fn setup_does_not_bail_when_default_role_is_coder() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run");
+        let sandbox_dir = tmp.path().join("sandbox");
+        // basic_spec has role=None → pick_role defaults to "coder".
+        let loaded = make_loaded(basic_spec(), tmp.path().to_path_buf());
+        unsafe { env::remove_var("DARKMUX_DEFAULT_ROLE") };
+
+        CodingTaskProvider
+            .setup(&loaded, &run_dir, &sandbox_dir)
+            .expect("default coder role must pass validation");
     }
 
     #[test]
