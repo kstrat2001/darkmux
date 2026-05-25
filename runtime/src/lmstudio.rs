@@ -169,6 +169,16 @@ pub struct ChatRequest {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+
+    /// OpenAI-compatible response-format constraint. Set to
+    /// `Some(serde_json::json!({"type": "json_object"}))` for
+    /// JSON-mode requests (#372 T2-B tier-2 structured-slot
+    /// compactor). LMStudio + most other OpenAI-compatible servers
+    /// enforce parseable JSON when this is set; reduces the
+    /// "compactor returned prose-prefixed JSON" failure mode the
+    /// runtime would otherwise have to handle defensively.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<serde_json::Value>,
 }
 
 /// One chat-completion response.
@@ -717,6 +727,7 @@ mod tests {
             tool_choice: None,
             temperature: 0.2,
             max_tokens: None,
+            response_format: None,
         };
         let body = build_streaming_request_body(&req).expect("body builds");
         let obj = body.as_object().expect("object shape");

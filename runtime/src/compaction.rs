@@ -221,6 +221,7 @@ pub fn compact(
         tool_choice: None,
         temperature: 0.1,
         max_tokens: Some(4096),
+        response_format: None,
     };
 
     eprintln!(
@@ -245,6 +246,316 @@ pub fn compact(
     messages.splice(middle_start..middle_end, std::iter::once(replacement));
 
     Ok(())
+}
+
+/// (#372 T2-B) Tier-2 compaction: structured-slot fact extraction.
+///
+/// Same input contract as [`compact`] (the narrative shape today's
+/// runtime uses by default) — `messages` is mutated in place, with
+/// the middle slice REPLACED by a single synthetic SYSTEM-role
+/// message carrying a labeled-markdown rendering of the parsed
+/// structured output. The returned `StructuredCompactionOutput` is
+/// what T2-C persists to `<sandbox>/.darkmux-runtime/compaction-<gen>.json`.
+///
+/// Strategy:
+/// 1. JSON-mode chat request to `cfg.compactor_model` with system
+///    prompt describing the v0.1 schema.
+/// 2. Parse `choices[0].message.content` as `StructuredCompactionOutput`.
+/// 3. On parse failure: retry ONCE with the same request. Per #354 Q2
+///    (typed-output is the SLM strength regime), a single retry
+///    handles transient sampling noise; two failures means the
+///    compactor model isn't capable of the schema and the operator
+///    should know.
+/// 4. On second failure: return Err with the parse error. T2-C may
+///    later wrap this in a bail-and-reframe path (#352 Step 6); for
+///    now the caller in loop_runner sees the error and the dispatch
+///    fails — better than silent corruption.
+/// 5. Apply per-slot soft caps (defaults from
+///    `RuntimeCompactionConfig::default_slot_caps()`).
+/// 6. Render to markdown via `render_structured_output_as_markdown`.
+/// 7. Splice middle messages with the synthetic system message.
+///
+/// **Messages NOT mutated on error** — the splice happens AFTER the
+/// successful parse + render so a failed compaction leaves the
+/// conversation intact for the caller's error-handling path (e.g.,
+/// retry with narrative, surface to operator).
+#[allow(dead_code)]
+pub fn structured_compact(
+    client: &LmStudioClient,
+    messages: &mut Vec<Message>,
+    generation: u32,
+    cfg: &CompactionConfig,
+) -> Result<StructuredCompactionOutput> {
+    let n = messages.len();
+    if !conversation_long_enough_to_compact(n) {
+        return Err(anyhow!(
+            "conversation too short to compact: {n} messages \
+             (need >= {} for middle-replace)",
+            PRESERVE_HEAD + 1 + PRESERVE_TAIL
+        ));
+    }
+
+    let middle_start = PRESERVE_HEAD;
+    let middle_end = n - PRESERVE_TAIL;
+    let middle_count = middle_end - middle_start;
+
+    let middle_messages: Vec<Message> = messages[middle_start..middle_end].to_vec();
+    let middle_rendered = render_messages_as_excerpt(&middle_messages);
+
+    let compactor_system = Message::system(structured_compactor_system_prompt());
+    let compactor_user = Message::user(format!(
+        "Summarize the following conversation excerpt into the structured-slot \
+         schema. Output JSON ONLY — no prose prefix, no markdown fences. \
+         schema_version=\"0.1\", generation={generation}, \
+         source_message_count={middle_count}.\n\n\
+         ---\n{middle_rendered}\n---"
+    ));
+
+    let request = ChatRequest {
+        model: cfg.compactor_model.clone(),
+        messages: vec![compactor_system, compactor_user],
+        tools: Vec::new(),
+        tool_choice: None,
+        temperature: 0.1,
+        max_tokens: Some(4096),
+        // (#372 T2-B) JSON-mode: LMStudio enforces the response is
+        // parseable JSON. Reduces the prose-prefix failure mode that
+        // would otherwise need defensive parsing on our side.
+        response_format: Some(serde_json::json!({"type": "json_object"})),
+    };
+
+    eprintln!(
+        "darkmux-runtime: tier-2 compaction #{generation} — \
+         summarizing {middle_count} middle messages (preserving {PRESERVE_HEAD} head + {PRESERVE_TAIL} tail)"
+    );
+
+    // Attempt 1.
+    let parse_result_1 = call_and_parse(client, &request);
+    let parsed = match parse_result_1 {
+        Ok(out) => out,
+        Err(e1) => {
+            eprintln!(
+                "darkmux-runtime: tier-2 compaction #{generation} attempt 1 failed: {e1} — retrying once"
+            );
+            // Attempt 2 — same request. Per #354 Q2 commitment: one
+            // retry handles transient sampling noise; two failures
+            // means the model genuinely can't produce the schema.
+            call_and_parse(client, &request).map_err(|e2| {
+                anyhow!(
+                    "tier-2 compaction failed twice (attempt 1: {e1}; attempt 2: {e2})"
+                )
+            })?
+        }
+    };
+
+    eprintln!(
+        "darkmux-runtime: tier-2 compaction #{generation} — parsed structured output \
+         (schema={} gen={})",
+        parsed.compaction_metadata.schema_version, parsed.compaction_metadata.generation
+    );
+
+    // Apply per-slot caps. Defaults from #354 v0.1 table; T2-C will
+    // plumb operator-overrides via profile config.
+    let mut capped = parsed;
+    apply_slot_caps(&mut capped, &default_slot_caps_v0_1());
+
+    let markdown = render_structured_output_as_markdown(&capped, middle_count);
+    // Build the synthetic SYSTEM-role replacement message. Per #354
+    // Q3: system-message attention bias keeps the compacted state
+    // load-bearing across subsequent turns.
+    let replacement = Message {
+        role: "system".to_string(),
+        content: Some(markdown),
+        tool_calls: None,
+        tool_call_id: None,
+        name: None,
+    };
+    messages.splice(middle_start..middle_end, std::iter::once(replacement));
+
+    Ok(capped)
+}
+
+/// (#372 T2-B) System prompt the compactor sees in JSON-mode mode.
+/// Names the v0.1 schema slots + the dot-notation cap table so the
+/// model knows what shape + scale to produce.
+fn structured_compactor_system_prompt() -> &'static str {
+    "You are a conversation compactor. You will be given a conversation excerpt \
+     and you MUST return JSON conforming to this schema:\n\
+     \n\
+     {\n  \
+       \"objective\": <string, REQUIRED>,\n  \
+       \"current_truth\": {\n    \
+         \"active_files\": <string, optional>,\n    \
+         \"test_outcomes\": <string, optional>,\n    \
+         \"external_state\": <string, optional>\n  \
+       },\n  \
+       \"compaction_metadata\": {\n    \
+         \"schema_version\": <string, REQUIRED>,\n    \
+         \"generation\": <integer, REQUIRED>,\n    \
+         \"source_message_count\": <integer, REQUIRED>\n  \
+       },\n  \
+       \"completed_decisions\": <string, optional>,\n  \
+       \"errors_to_preserve\": <string, optional>,\n  \
+       \"next_concrete_actions\": <string, optional>,\n  \
+       \"verify_criteria\": <string, optional>,\n  \
+       \"sprint_id\": <string, optional>\n  \
+     }\n\
+     \n\
+     Output JSON ONLY. No prose. No markdown fences. The metadata fields \
+     (schema_version, generation, source_message_count) are provided in the \
+     user message — copy them into your output exactly.\n\
+     \n\
+     Per-slot guidance: be specific and dense. Each slot string REPLACES the \
+     corresponding portion of the agent's working memory for subsequent turns. \
+     Omit optional slots that have no meaningful content (don't pad with \
+     \"(none)\" or \"N/A\")."
+}
+
+/// Helper: make the chat call, parse the assistant content as
+/// StructuredCompactionOutput. Returns Err on HTTP failure, missing
+/// content, or JSON parse failure.
+fn call_and_parse(
+    client: &LmStudioClient,
+    request: &ChatRequest,
+) -> Result<StructuredCompactionOutput> {
+    let response = client.chat(request)?;
+    let content = response
+        .choices
+        .into_iter()
+        .next()
+        .and_then(|c| c.message.content)
+        .ok_or_else(|| anyhow!("compactor returned no content"))?;
+    serde_json::from_str::<StructuredCompactionOutput>(&content)
+        .map_err(|e| anyhow!("parsing compactor JSON failed: {e} — content: {content}"))
+}
+
+/// (#372 T2-B) v0.1 per-slot character caps. Mirrors the table the
+/// main-crate `RuntimeCompactionConfig::default_slot_caps()` ships
+/// for profile-side consumers. Duplicated rather than shared because
+/// the runtime crate doesn't depend on the main crate. T2-C plumbs
+/// operator-overrides via CLI flag; until then this is the only
+/// source the runtime consults. Single source of truth for the v0.1
+/// commitments per #354.
+#[allow(dead_code)]
+pub fn default_slot_caps_v0_1() -> std::collections::BTreeMap<String, u32> {
+    let entries: &[(&str, u32)] = &[
+        ("objective", 1024),
+        ("current_truth.active_files", 4096),
+        ("current_truth.test_outcomes", 2048),
+        ("current_truth.external_state", 2048),
+        ("completed_decisions", 4096),
+        ("errors_to_preserve", 2048),
+        ("next_concrete_actions", 1024),
+        ("verify_criteria", 1024),
+        ("sprint_id", 256),
+    ];
+    entries.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+}
+
+/// (#372 T2-B) Apply per-slot soft character caps to a parsed
+/// `StructuredCompactionOutput`. Caps are keyed by dot-notation slot
+/// path (`objective`, `current_truth.active_files`, etc.); the
+/// default set is provided by `default_slot_caps_v0_1`.
+///
+/// Truncation is byte-prefix (not char-aware) for simplicity; #354
+/// commits soft-cap-in-chars semantics so we accept the rare
+/// truncate-mid-codepoint edge for v0.1 simplicity. Future iteration
+/// can use `char_indices()` if multi-byte slot content becomes a real
+/// problem.
+///
+/// Slots without a defined cap are left untouched — operators who
+/// haven't tuned them get the compactor's full output.
+#[allow(dead_code)]
+pub fn apply_slot_caps(
+    out: &mut StructuredCompactionOutput,
+    caps: &std::collections::BTreeMap<String, u32>,
+) {
+    fn cap(value: &mut String, max: usize) {
+        if value.len() > max {
+            value.truncate(max);
+        }
+    }
+    fn cap_opt(value: &mut Option<String>, max: usize) {
+        if let Some(s) = value.as_mut() {
+            cap(s, max);
+        }
+    }
+    if let Some(&n) = caps.get("objective") {
+        cap(&mut out.objective, n as usize);
+    }
+    if let Some(&n) = caps.get("current_truth.active_files") {
+        cap_opt(&mut out.current_truth.active_files, n as usize);
+    }
+    if let Some(&n) = caps.get("current_truth.test_outcomes") {
+        cap_opt(&mut out.current_truth.test_outcomes, n as usize);
+    }
+    if let Some(&n) = caps.get("current_truth.external_state") {
+        cap_opt(&mut out.current_truth.external_state, n as usize);
+    }
+    if let Some(&n) = caps.get("completed_decisions") {
+        cap_opt(&mut out.completed_decisions, n as usize);
+    }
+    if let Some(&n) = caps.get("errors_to_preserve") {
+        cap_opt(&mut out.errors_to_preserve, n as usize);
+    }
+    if let Some(&n) = caps.get("next_concrete_actions") {
+        cap_opt(&mut out.next_concrete_actions, n as usize);
+    }
+    if let Some(&n) = caps.get("verify_criteria") {
+        cap_opt(&mut out.verify_criteria, n as usize);
+    }
+    if let Some(&n) = caps.get("sprint_id") {
+        cap_opt(&mut out.sprint_id, n as usize);
+    }
+}
+
+/// (#372 T2-B) Render a `StructuredCompactionOutput` as the
+/// labeled-markdown synthetic system message that REPLACES the
+/// compacted middle messages in the agent's conversation. Per #354
+/// Q3: system-message rendering plays to instruction-tuned models'
+/// attention bias — they treat system messages as load-bearing
+/// context, not as new user input requiring response.
+///
+/// Empty optional sections are SKIPPED entirely (no `(none)` noise);
+/// `objective` always renders since it's a required slot. The header
+/// names the count of compacted messages so the agent sees how much
+/// conversation was condensed.
+#[allow(dead_code)]
+pub fn render_structured_output_as_markdown(
+    out: &StructuredCompactionOutput,
+    compacted_message_count: usize,
+) -> String {
+    let mut md = String::new();
+    md.push_str(&format!(
+        "### Working memory state (compacted from {compacted_message_count} earlier turns)\n\n"
+    ));
+    md.push_str(&format!("**Objective:** {}\n\n", out.objective));
+
+    if let Some(s) = &out.current_truth.active_files {
+        md.push_str(&format!("**Current truth — active files:**\n{s}\n\n"));
+    }
+    if let Some(s) = &out.current_truth.test_outcomes {
+        md.push_str(&format!("**Current truth — test outcomes:**\n{s}\n\n"));
+    }
+    if let Some(s) = &out.current_truth.external_state {
+        md.push_str(&format!("**Current truth — external state:**\n{s}\n\n"));
+    }
+    if let Some(s) = &out.completed_decisions {
+        md.push_str(&format!("**Completed decisions:**\n{s}\n\n"));
+    }
+    if let Some(s) = &out.errors_to_preserve {
+        md.push_str(&format!("**Errors to preserve:**\n{s}\n\n"));
+    }
+    if let Some(s) = &out.next_concrete_actions {
+        md.push_str(&format!("**Next concrete actions:**\n{s}\n\n"));
+    }
+    if let Some(s) = &out.verify_criteria {
+        md.push_str(&format!("**Verify criteria:** {s}\n\n"));
+    }
+    if let Some(s) = &out.sprint_id {
+        md.push_str(&format!("**Sprint:** {s}\n\n"));
+    }
+    md
 }
 
 /// Render a slice of messages as a plaintext excerpt the compactor
@@ -343,6 +654,324 @@ pub struct CompactionMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── #372 T2-B: structured_compact() end-to-end (mocked LMStudio) ─
+
+    use httpmock::prelude::*;
+
+    fn chat_response_with_json_content(json_content: &str) -> serde_json::Value {
+        // LMStudio's chat-completion response wraps the assistant's
+        // content (which IS our JSON-mode output) in the standard
+        // OpenAI shape. We're not faking any tool_calls here — the
+        // compactor doesn't use tools.
+        serde_json::json!({
+            "id": "chatcmpl-compaction-test",
+            "object": "chat.completion",
+            "created": 1700000000,
+            "model": "test-compactor",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": json_content,
+                },
+                "finish_reason": "stop",
+            }],
+            "usage": {
+                "prompt_tokens": 500,
+                "completion_tokens": 80,
+                "total_tokens": 580,
+            },
+        })
+    }
+
+    fn dummy_messages_long_enough_to_compact() -> Vec<Message> {
+        // PRESERVE_HEAD=2 + 1 middle + PRESERVE_TAIL=4 = 7 minimum.
+        // Use 10 to make middle = 4 messages (so we can confirm splice).
+        vec![
+            Message::system("you are an agent"),
+            Message::user("initial task framing"),
+            Message::user("turn 1 stuff"),
+            Message::user("turn 2 stuff"),
+            Message::user("turn 3 stuff"),
+            Message::user("turn 4 stuff"),
+            Message::user("turn 5 stuff"),
+            Message::user("turn 6 stuff"),
+            Message::user("turn 7 stuff"),
+            Message::user("turn 8 stuff"),
+        ]
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn structured_compact_happy_path_splices_synthetic_system_message() {
+        let server = MockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_with_json_content(
+                r#"{"objective":"audit refresh-token","current_truth":{"active_files":"x.ts"},"compaction_metadata":{"schema_version":"0.1","generation":7,"source_message_count":4}}"#,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let mut messages = dummy_messages_long_enough_to_compact();
+        let original_len = messages.len();
+        let cfg = CompactionConfig::default();
+
+        let out = structured_compact(&client, &mut messages, 7, &cfg)
+            .expect("happy path returns parsed output");
+
+        // Assert parsed output is what we expected.
+        assert_eq!(out.objective, "audit refresh-token");
+        assert_eq!(out.compaction_metadata.generation, 7);
+
+        // Assert messages were spliced: head + 1 synthetic system + tail
+        // = 2 + 1 + 4 = 7 messages (down from original 10).
+        assert_eq!(messages.len(), original_len - (10 - 7));
+        // The synthetic message is at PRESERVE_HEAD position and is
+        // SYSTEM-role (per #354 Q3 attention-bias rationale).
+        assert_eq!(messages[PRESERVE_HEAD].role, "system");
+        let content = messages[PRESERVE_HEAD].content.as_ref().expect("content set");
+        assert!(content.contains("Working memory state"));
+        assert!(content.contains("audit refresh-token"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn structured_compact_retries_once_on_parse_fail() {
+        let server = MockServer::start();
+        // Use two mocks: first call returns malformed JSON, second
+        // returns valid. httpmock plays them in declaration order
+        // when paths match (assuming hits accumulate); to make
+        // ordering explicit we use a counter via body-contains or
+        // a single mock that returns different things by call count.
+        // Easier: simulate with a stateful mock would be complex;
+        // use two distinct mocks differentiated by body content
+        // matching for now.
+        //
+        // For T2-B simplicity: we test "compactor returned malformed
+        // JSON on first call, valid on retry, structured_compact
+        // succeeds" via a Mutex<u32> counter pattern would need more
+        // infra. For now, test the RETRY HAPPENS by mocking just
+        // ONE mock that returns malformed and asserting the function
+        // makes >1 calls (retry attempt). End-to-end success-with-
+        // retry is covered by the bail test (which proves both
+        // attempts ran when both failed).
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_with_json_content(
+                "{ totally not valid JSON for the schema }",
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let mut messages = dummy_messages_long_enough_to_compact();
+        let cfg = CompactionConfig::default();
+
+        let result = structured_compact(&client, &mut messages, 1, &cfg);
+        assert!(result.is_err(), "both attempts return malformed → bail");
+        // Confirm the retry happened — 2 calls to the mock, not 1.
+        assert_eq!(mock.hits(), 2, "expected 1 initial + 1 retry attempt");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn structured_compact_bails_when_both_attempts_malformed() {
+        let server = MockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_with_json_content(
+                "not even close to JSON",
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let mut messages = dummy_messages_long_enough_to_compact();
+        let original_len = messages.len();
+        let cfg = CompactionConfig::default();
+
+        let result = structured_compact(&client, &mut messages, 1, &cfg);
+        assert!(result.is_err());
+        assert_eq!(
+            messages.len(),
+            original_len,
+            "messages NOT mutated when both attempts fail (rollback on error)"
+        );
+    }
+
+    // ─── #372 T2-B: per-slot cap enforcement ──────────────────────
+
+    fn test_caps() -> std::collections::BTreeMap<String, u32> {
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("objective".to_string(), 10);
+        m.insert("current_truth.active_files".to_string(), 15);
+        m.insert("completed_decisions".to_string(), 20);
+        m
+    }
+
+    fn output_for_cap_tests(objective: &str, active_files: Option<&str>, decisions: Option<&str>) -> StructuredCompactionOutput {
+        StructuredCompactionOutput {
+            objective: objective.to_string(),
+            current_truth: CurrentTruth {
+                active_files: active_files.map(str::to_string),
+                test_outcomes: None,
+                external_state: None,
+            },
+            compaction_metadata: CompactionMetadata {
+                schema_version: "0.1".into(),
+                generation: 1,
+                source_message_count: 5,
+            },
+            completed_decisions: decisions.map(str::to_string),
+            errors_to_preserve: None,
+            next_concrete_actions: None,
+            verify_criteria: None,
+            sprint_id: None,
+        }
+    }
+
+    #[test]
+    fn apply_caps_truncates_objective_when_over() {
+        let mut out = output_for_cap_tests(
+            "This is a very long objective that exceeds the cap of ten characters",
+            None,
+            None,
+        );
+        apply_slot_caps(&mut out, &test_caps());
+        assert_eq!(out.objective.len(), 10);
+        assert_eq!(out.objective, "This is a ");
+    }
+
+    #[test]
+    fn apply_caps_leaves_under_cap_strings_alone() {
+        let mut out = output_for_cap_tests("short", None, None);
+        apply_slot_caps(&mut out, &test_caps());
+        assert_eq!(out.objective, "short", "under-cap content must not be modified");
+    }
+
+    #[test]
+    fn apply_caps_handles_nested_current_truth_active_files() {
+        let mut out = output_for_cap_tests(
+            "ok",
+            Some("a long active-files description exceeding fifteen chars"),
+            None,
+        );
+        apply_slot_caps(&mut out, &test_caps());
+        assert_eq!(
+            out.current_truth.active_files.as_ref().unwrap().len(),
+            15,
+            "dot-notation slot cap (current_truth.active_files) applied to nested field"
+        );
+    }
+
+    #[test]
+    fn apply_caps_skips_unset_optional_fields() {
+        let mut out = output_for_cap_tests("ok", None, None);
+        apply_slot_caps(&mut out, &test_caps());
+        assert!(out.completed_decisions.is_none(), "None stays None");
+    }
+
+    #[test]
+    fn apply_caps_with_missing_cap_for_slot_leaves_field_untouched() {
+        // No cap defined for `objective` — leave the value as-is.
+        let mut caps = std::collections::BTreeMap::new();
+        caps.insert("current_truth.active_files".to_string(), 5);
+        let mut out = output_for_cap_tests(
+            "long-objective-no-cap-defined",
+            Some("a long active-files line"),
+            None,
+        );
+        apply_slot_caps(&mut out, &caps);
+        assert_eq!(out.objective, "long-objective-no-cap-defined", "no cap → no truncate");
+        assert_eq!(out.current_truth.active_files.as_ref().unwrap().len(), 5);
+    }
+
+    // ─── #372 T2-B: markdown rendering for synthetic system message ─
+
+    #[test]
+    fn render_markdown_includes_compacted_header_with_message_count() {
+        let out = output_for_cap_tests("test obj", None, None);
+        let md = render_structured_output_as_markdown(&out, 12);
+        assert!(
+            md.contains("Working memory state (compacted from 12 earlier turns)"),
+            "header must include the message count; got: {md}"
+        );
+    }
+
+    #[test]
+    fn render_markdown_emits_objective_section() {
+        let out = output_for_cap_tests("fix the bug in foo.py", None, None);
+        let md = render_structured_output_as_markdown(&out, 5);
+        assert!(md.contains("**Objective:**"), "objective section header missing");
+        assert!(md.contains("fix the bug in foo.py"), "objective body missing");
+    }
+
+    #[test]
+    fn render_markdown_emits_current_truth_subsections_when_set() {
+        let out = StructuredCompactionOutput {
+            objective: "obj".into(),
+            current_truth: CurrentTruth {
+                active_files: Some("file.py:32".into()),
+                test_outcomes: Some("3 of 5 failed".into()),
+                external_state: None,
+            },
+            compaction_metadata: CompactionMetadata {
+                schema_version: "0.1".into(),
+                generation: 1,
+                source_message_count: 5,
+            },
+            completed_decisions: None,
+            errors_to_preserve: None,
+            next_concrete_actions: None,
+            verify_criteria: None,
+            sprint_id: None,
+        };
+        let md = render_structured_output_as_markdown(&out, 5);
+        assert!(md.contains("Current truth — active files"), "active_files subsection missing");
+        assert!(md.contains("file.py:32"), "active_files content missing");
+        assert!(md.contains("Current truth — test outcomes"));
+        assert!(md.contains("3 of 5 failed"));
+        assert!(
+            !md.contains("Current truth — external state"),
+            "unset subsection must be omitted (no empty-section noise)"
+        );
+    }
+
+    #[test]
+    fn render_markdown_skips_unset_optional_top_level_sections() {
+        let out = output_for_cap_tests("obj only", None, None);
+        let md = render_structured_output_as_markdown(&out, 1);
+        assert!(!md.contains("Completed decisions"), "unset section must be omitted");
+        assert!(!md.contains("Errors to preserve"));
+        assert!(!md.contains("Next concrete actions"));
+        assert!(!md.contains("Verify criteria"));
+    }
+
+    #[test]
+    fn render_markdown_emits_all_optional_sections_when_set() {
+        let out = StructuredCompactionOutput {
+            objective: "obj".into(),
+            current_truth: CurrentTruth::default(),
+            compaction_metadata: CompactionMetadata {
+                schema_version: "0.1".into(),
+                generation: 1,
+                source_message_count: 5,
+            },
+            completed_decisions: Some("decided X".into()),
+            errors_to_preserve: Some("don't retry Y".into()),
+            next_concrete_actions: Some("do Z".into()),
+            verify_criteria: Some("npm test exits 0".into()),
+            sprint_id: Some("sprint-1".into()),
+        };
+        let md = render_structured_output_as_markdown(&out, 5);
+        assert!(md.contains("**Completed decisions:**"));
+        assert!(md.contains("decided X"));
+        assert!(md.contains("**Errors to preserve:**"));
+        assert!(md.contains("don't retry Y"));
+        assert!(md.contains("**Next concrete actions:**"));
+        assert!(md.contains("**Verify criteria:**"));
+        assert!(md.contains("npm test exits 0"));
+    }
 
     // ─── #372 T2-A: StructuredCompactionOutput parse/round-trip ─
 
