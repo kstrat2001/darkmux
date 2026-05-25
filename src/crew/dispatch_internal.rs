@@ -1029,13 +1029,16 @@ mod tests {
     #[test]
     fn from_profile_derives_typed_threshold_ratio() {
         // (#368 clean break) `threshold_ratio` reads ONLY from the
-        // typed schema field, not from openclaw-shape extras. The
-        // `model` (compactor) field still reads from extras since
-        // #357 didn't promote it to typed.
+        // typed schema field. `compactor_model` does NOT read from
+        // extras at all (Beat-39 smoke caught HTTP 400 when openclaw's
+        // `lmstudio/<id>` format was passed to LMStudio's direct API
+        // which only knows the bare/namespaced form). Until a typed
+        // `compaction.compactor_model` lands, runtime uses default.
         use crate::types::{
             ModelRole, Profile, ProfileModel, ProfileRuntime, RuntimeCompactionConfig,
         };
         let mut extras = serde_json::Map::new();
+        // This openclaw-flavored value must NOT influence the dispatch.
         extras.insert(
             "model".into(),
             serde_json::json!("lmstudio/qwen3-4b-instruct-2507"),
@@ -1065,9 +1068,10 @@ mod tests {
         };
         let args = crate::crew::dispatch::CompactionDispatchArgs::from_profile(&profile);
         assert_eq!(args.threshold_ratio, Some(0.35));
-        assert_eq!(
-            args.compactor_model.as_deref(),
-            Some("lmstudio/qwen3-4b-instruct-2507")
+        assert!(
+            args.compactor_model.is_none(),
+            "clean break: openclaw extras `model` must NOT auto-populate compactor_model \
+             (would pass `lmstudio/<id>` prefix to LMStudio's direct API → HTTP 400)"
         );
         assert_eq!(args.context_window, Some(101_000));
     }

@@ -374,10 +374,20 @@ impl CompactionDispatchArgs {
         let threshold_tokens = comp
             .and_then(|c| c.threshold_tokens)
             .and_then(|v| u32::try_from(v).ok());
-        let compactor_model = comp
-            .and_then(|c| c.extras.get("model"))
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
+        // (#368 clean break) Compactor model is NOT read from
+        // openclaw-shape `extras["model"]`. Openclaw convention
+        // prefixes the id with `lmstudio/` (e.g.
+        // `lmstudio/qwen3-4b-instruct-2507`), which LMStudio's direct
+        // chat-completions API doesn't recognize — produces HTTP 400
+        // on the compactor call. Silently translating across that
+        // format boundary would mask operator intent. Until #368.x
+        // adds a typed `compaction.compactor_model` field, the runtime
+        // uses its hardcoded default `darkmux:qwen3-4b-instruct-2507`,
+        // which matches what LMStudio has loaded in the standard
+        // `darkmux swap`-based workflow. Surfaced by Beat-39 smoke
+        // dispatch (2026-05-25): turn 4's compactor call failed with
+        // HTTP 400 when this read-from-extras was active.
+        let compactor_model: Option<String> = None;
         // (#368 clean break) Read from the typed schema field, NOT
         // openclaw-shape extras. Operators wanting the adaptive
         // trigger set `profile.runtime.compaction.threshold_ratio`
