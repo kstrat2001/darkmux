@@ -37,6 +37,21 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// hardening lands.
 const RUNTIME_IMAGE: &str = "darkmux-runtime:latest";
 
+/// Default per-dispatch wall-clock deadline. 10 minutes covers
+/// realistic long-agentic dispatches (Article-2 era `long-agentic`
+/// historical slow_cluster_seconds maxed ~950s, so 600s is conservative
+/// for medium workloads and most operators). Override with the env
+/// var. Phase B dogfood (Beat 39) showed thinking-mode hangs can
+/// burn unbounded wall-clock without this cap.
+const DEFAULT_DISPATCH_DEADLINE_SECS: u64 = 600;
+
+fn dispatch_deadline_seconds() -> u64 {
+    std::env::var("DARKMUX_RUNTIME_DEADLINE_SECONDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_DISPATCH_DEADLINE_SECS)
+}
+
 /// LMStudio /v1/models URL used to probe the currently-loaded model
 /// when no explicit model is provided. Currently the internal runtime
 /// uses "whatever's loaded"; future iteration will resolve via the
@@ -188,9 +203,29 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     //    parallel and emit flow records mid-dispatch — without that,
     //    topology edges go stale during long streaming turns (#231).
     //    `--rm` cleans up the container on exit.
+    // (#363) Generate a unique container name so the watchdog thread
+    // (below) can `docker kill` it after the wall-clock deadline.
+    // Without --name, we'd have no stable handle to kill. session_id
+    // is already unique-per-dispatch and reads well in `docker ps`
+    // when debugging. Sanitize since docker container names allow only
+    // [a-zA-Z0-9][a-zA-Z0-9_.-]*.
+    let container_name = format!(
+        "darkmux-dispatch-{}",
+        session_id
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-' {
+                c
+            } else {
+                '-'
+            })
+            .collect::<String>()
+    );
+
     let mut cmd = Command::new("docker");
     cmd.arg("run")
         .arg("--rm")
+        .arg("--name")
+        .arg(&container_name)
         .arg("-v")
         .arg(format!("{}:/workspace", workspace.display()))
         .arg(RUNTIME_IMAGE)
@@ -248,14 +283,79 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         thread::spawn(move || run_tailer(workspace, session_id, role_id, model, stop))
     };
 
+    // (#363) Wall-clock deadline watchdog. Phase B dogfood (Beat 39,
+    // 2026-05-25) surfaced: thinking-mode models can hang intra-turn
+    // for arbitrary wall-clock with the agent loop's MAX_TURNS cap
+    // never firing. The watchdog runs `docker kill <name>` after the
+    // deadline; the container dies with SIGKILL (exit 137); the main
+    // thread's `wait_with_output()` returns; the harness detects the
+    // timeout via the watchdog's atomic flag + the 137 exit code and
+    // surfaces a structured `dispatch.timeout` failure rather than
+    // letting the dispatch hang forever.
+    let deadline_secs = dispatch_deadline_seconds();
+    let timeout_fired = Arc::new(AtomicBool::new(false));
+    let watchdog_done = Arc::new(AtomicBool::new(false));
+    let watchdog_handle = {
+        let timeout_fired = Arc::clone(&timeout_fired);
+        let watchdog_done = Arc::clone(&watchdog_done);
+        let container_name = container_name.clone();
+        thread::spawn(move || {
+            // Poll every 500ms so we don't oversleep the natural exit by
+            // a full deadline. When the main thread signals
+            // `watchdog_done`, exit promptly without firing the kill.
+            let deadline = Instant::now() + Duration::from_secs(deadline_secs);
+            while Instant::now() < deadline {
+                if watchdog_done.load(Ordering::SeqCst) {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(500));
+            }
+            // Race window: a natural exit can land in the final 500ms
+            // sleep above — the loop condition `Instant::now() < deadline`
+            // goes false, but `watchdog_done` may have been set during
+            // the sleep. Re-check before firing to avoid stamping a
+            // spurious timeout on a clean exit (QA finding 2026-05-25).
+            if watchdog_done.load(Ordering::SeqCst) {
+                return;
+            }
+            // Deadline genuinely hit before the dispatch completed.
+            // Mark timeout BEFORE the kill so the post-wait detection
+            // sees the flag, then SIGKILL the container.
+            timeout_fired.store(true, Ordering::SeqCst);
+            let _ = Command::new("docker")
+                .args(["kill", &container_name])
+                .output();
+        })
+    };
+
     let output = child
         .wait_with_output()
         .context("waiting for darkmux-runtime container")?;
 
+    // Tell the watchdog we're done so it doesn't fire spuriously after
+    // a natural exit. Best-effort join (it's a kill-only thread —
+    // panic-resilience isn't load-bearing).
+    watchdog_done.store(true, Ordering::SeqCst);
+    let _ = watchdog_handle.join();
+
     let wall_ms = dispatch_start_instant.elapsed().as_millis() as u64;
     let exit_code = output.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    // (#363) If the watchdog fired, prepend a structured timeout
+    // marker to stderr so the lab harness can detect + surface the
+    // timeout. The container died via SIGKILL (exit ~137); without
+    // this marker the harness would just see "non-zero exit" with no
+    // diagnostic detail about why.
+    if timeout_fired.load(Ordering::SeqCst) {
+        stderr = format!(
+            "darkmux dispatch: TIMEOUT after {deadline_secs}s — container `{container_name}` \
+             was killed by the watchdog. Override the default deadline with \
+             DARKMUX_RUNTIME_DEADLINE_SECONDS=<N>. Thinking-mode hangs are the most common \
+             cause (see #363).\n{stderr}"
+        );
+    }
 
     // Signal the tailer to do its final flush + return. join() can
     // theoretically panic if the tailer thread panicked; degrade to a
@@ -802,8 +902,47 @@ pub(crate) fn known_role_vocab_csv() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::io::Write;
     use tempfile::TempDir;
+
+    // ─── #363: dispatch wall-clock deadline ────────────────────────────
+
+    #[test]
+    #[serial]
+    fn deadline_defaults_when_env_unset() {
+        // Saved + restored — tests share process env, so be polite.
+        let prev = std::env::var("DARKMUX_RUNTIME_DEADLINE_SECONDS").ok();
+        unsafe { std::env::remove_var("DARKMUX_RUNTIME_DEADLINE_SECONDS") };
+        assert_eq!(dispatch_deadline_seconds(), DEFAULT_DISPATCH_DEADLINE_SECS);
+        if let Some(v) = prev {
+            unsafe { std::env::set_var("DARKMUX_RUNTIME_DEADLINE_SECONDS", v) };
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn deadline_reads_env_override() {
+        let prev = std::env::var("DARKMUX_RUNTIME_DEADLINE_SECONDS").ok();
+        unsafe { std::env::set_var("DARKMUX_RUNTIME_DEADLINE_SECONDS", "30") };
+        assert_eq!(dispatch_deadline_seconds(), 30);
+        unsafe { std::env::remove_var("DARKMUX_RUNTIME_DEADLINE_SECONDS") };
+        if let Some(v) = prev {
+            unsafe { std::env::set_var("DARKMUX_RUNTIME_DEADLINE_SECONDS", v) };
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn deadline_falls_back_on_garbage_env() {
+        let prev = std::env::var("DARKMUX_RUNTIME_DEADLINE_SECONDS").ok();
+        unsafe { std::env::set_var("DARKMUX_RUNTIME_DEADLINE_SECONDS", "not-a-number") };
+        assert_eq!(dispatch_deadline_seconds(), DEFAULT_DISPATCH_DEADLINE_SECS);
+        unsafe { std::env::remove_var("DARKMUX_RUNTIME_DEADLINE_SECONDS") };
+        if let Some(v) = prev {
+            unsafe { std::env::set_var("DARKMUX_RUNTIME_DEADLINE_SECONDS", v) };
+        }
+    }
 
     // ─── role tool_palette → runtime allowed-tools mapping ────────────
 
