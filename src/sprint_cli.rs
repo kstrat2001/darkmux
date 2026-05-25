@@ -202,13 +202,16 @@ fn collect_profile_capacities(
                 .models
                 .iter()
                 .any(|m| matches!(m.role, ModelRole::Compactor));
-            // Read max_history_share from runtime.compaction if present;
-            // default to 0.35 (openclaw's typical setting in `balanced`).
+            // Read max_history_share from runtime.compaction.extras if
+            // present; default to 0.35 (openclaw's typical setting in
+            // `balanced`). maxHistoryShare is an openclaw-shape
+            // passthrough field; lives in `.extras` after the v0.1
+            // schema extension (#357) added typed fields alongside.
             let max_history_share = profile
                 .runtime
                 .as_ref()
                 .and_then(|r| r.compaction.as_ref())
-                .and_then(|m| m.get("maxHistoryShare"))
+                .and_then(|c| c.extras.get("maxHistoryShare"))
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.35);
             Some((
