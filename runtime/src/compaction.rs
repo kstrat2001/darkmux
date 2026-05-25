@@ -17,14 +17,20 @@
 //!   model has immediate context for what's happening next.
 //! - **Companion compactor model.** Same approach openclaw uses — a
 //!   small 4B model summarizes via a separate chat-completion call
-//!   with no tools. Tunable via `DARKMUX_RUNTIME_COMPACTOR_MODEL`.
+//!   with no tools.
 //! - **Token-count-aware trigger, not heuristic percentage.** The
 //!   threshold compares the chat-completion API's reported
-//!   `usage.prompt_tokens` against an absolute number (env tunable).
-//!   No guessing what the model's "believed" context window is —
-//!   openclaw's heuristic-percentage approach is what produced
-//!   spurious compactions at ambient mid-turn moments per the Article
-//!   2 findings.
+//!   `usage.prompt_tokens` against an absolute number — no guessing
+//!   what the model's "believed" context window is, the way openclaw's
+//!   heuristic-percentage approach did per Article 2 findings.
+//! - **Config via host-passed CLI args, not env vars (#368).** All
+//!   tunables (threshold, compactor model, optional
+//!   max_history_share) arrive as explicit parameters from the host's
+//!   `dispatch_via_internal`, which derives them from
+//!   `profile.runtime.compaction.*` (the typed schema landed in #357).
+//!   No `std::env::var()` reads in this module — operator's tuning
+//!   surface is the profile JSON, not shell env. Env vars are a
+//!   hurdle, brittle, and ergonomically wrong for per-profile state.
 //!
 //! ## Deliberately NOT done in this phase
 //!
@@ -32,26 +38,25 @@
 //!   intermediate tool results but keeps tool calls + assistant
 //!   reasoning). Could be added later if measurements show summarize
 //!   is too expensive.
-//! - No per-profile threshold (DARKMUX_RUNTIME_COMPACT_THRESHOLD_TOKENS
-//!   is global). Phase 7+ could read the active darkmux profile and
-//!   derive per-profile thresholds automatically.
 
 use anyhow::{anyhow, Result};
-use std::env;
 
 use crate::lmstudio::{ChatRequest, LmStudioClient, Message};
 
 /// Default threshold: when an incoming prompt's `prompt_tokens`
 /// crosses this, compact before the next chat() call. 60K leaves
 /// substantial headroom for the model's response generation when
-/// loaded at 101K (the `balanced` profile context). Tunable via
-/// `DARKMUX_RUNTIME_COMPACT_THRESHOLD_TOKENS`.
-const DEFAULT_THRESHOLD_TOKENS: u32 = 60_000;
+/// loaded at 101K (the `balanced` profile context). Override via
+/// `profile.runtime.compaction.threshold_tokens` (typed v0.1 field
+/// landed in #357) → host passes as `--compact-threshold-tokens N`.
+pub const DEFAULT_THRESHOLD_TOKENS: u32 = 60_000;
 
 /// Default compactor model — the bake-off-hired admin agent
-/// (Beat 21: "the dependable admin agent"). Same model openclaw
-/// uses by convention. Tunable via `DARKMUX_RUNTIME_COMPACTOR_MODEL`.
-const DEFAULT_COMPACTOR_MODEL: &str = "darkmux:qwen3-4b-instruct-2507";
+/// (Beat 21: "the dependable admin agent"). Same model openclaw uses
+/// by convention. Override via `profile.runtime.compaction.extras.model`
+/// (openclaw-shape passthrough that survived the #357 typed schema)
+/// → host passes as `--compactor-model <id>`.
+pub const DEFAULT_COMPACTOR_MODEL: &str = "darkmux:qwen3-4b-instruct-2507";
 
 /// Number of trailing messages to preserve uncompacted. Keeps the
 /// active tool-call / tool-result thread + the last assistant turn.
@@ -62,29 +67,63 @@ const PRESERVE_TAIL: usize = 4;
 /// are load-bearing for the agent to know what it's doing.
 const PRESERVE_HEAD: usize = 2;
 
-/// Read the threshold from env or use the default.
-pub fn threshold_tokens() -> u32 {
-    env::var("DARKMUX_RUNTIME_COMPACT_THRESHOLD_TOKENS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_THRESHOLD_TOKENS)
+/// Operator-tunable compaction config. Constructed on the host from
+/// `profile.runtime.compaction.*` and passed into the runtime as
+/// explicit CLI args (#368) — replaces the pre-fix env-var read path
+/// that silently dropped operator overrides inside the docker
+/// container. Single source of truth for compaction parameters that
+/// the loop runner consults at trigger-check time.
+#[derive(Debug, Clone)]
+pub struct CompactionConfig {
+    /// Absolute token threshold. When `latest_prompt_tokens` reaches
+    /// this, compaction fires. Set to the typed
+    /// `profile.runtime.compaction.threshold_tokens` or the default.
+    pub threshold_tokens: u32,
+    /// Compactor model id (e.g. `darkmux:qwen3-4b-instruct-2507`).
+    pub compactor_model: String,
 }
 
-/// Read the compactor model id from env or use the default.
-pub fn compactor_model() -> String {
-    env::var("DARKMUX_RUNTIME_COMPACTOR_MODEL")
-        .unwrap_or_else(|_| DEFAULT_COMPACTOR_MODEL.to_string())
+impl CompactionConfig {
+    /// Resolve a CompactionConfig from optional explicit overrides.
+    /// `None` for either field uses the corresponding default. This is
+    /// the host's choice point — it reads the operator's profile and
+    /// passes Some(N) when set, None when not. Encodes the precedence
+    /// (explicit value → default) without an env-var fallback layer.
+    pub fn from_overrides(threshold_tokens: Option<u32>, compactor_model: Option<String>) -> Self {
+        Self {
+            threshold_tokens: threshold_tokens.unwrap_or(DEFAULT_THRESHOLD_TOKENS),
+            compactor_model: compactor_model
+                .unwrap_or_else(|| DEFAULT_COMPACTOR_MODEL.to_string()),
+        }
+    }
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self::from_overrides(None, None)
+    }
 }
 
 /// Decide whether the conversation needs compaction before the next
 /// chat() call. True when:
-/// - `latest_prompt_tokens` crossed the threshold (the most recent
-///   request's input was big), AND
+/// - `latest_prompt_tokens` crossed the configured threshold (the most
+///   recent request's input was big), AND
 /// - The conversation is long enough that middle-replace has
 ///   something meaningful to replace (head + 1 middle + tail).
-pub fn needs_compaction(latest_prompt_tokens: u32, message_count: usize) -> bool {
-    latest_prompt_tokens >= threshold_tokens()
-        && message_count >= PRESERVE_HEAD + 1 + PRESERVE_TAIL
+pub fn needs_compaction(
+    latest_prompt_tokens: u32,
+    message_count: usize,
+    cfg: &CompactionConfig,
+) -> bool {
+    latest_prompt_tokens >= cfg.threshold_tokens
+        && conversation_long_enough_to_compact(message_count)
+}
+
+/// Sanity-check: middle-replace needs `head + 1 middle + tail`
+/// messages to have something meaningful to replace. The compact()
+/// pre-flight uses this independently of any token threshold.
+fn conversation_long_enough_to_compact(message_count: usize) -> bool {
+    message_count >= PRESERVE_HEAD + 1 + PRESERVE_TAIL
 }
 
 /// Apply middle-replace compaction in-place on `messages`.
@@ -97,9 +136,10 @@ pub fn compact(
     client: &LmStudioClient,
     messages: &mut Vec<Message>,
     generation: u32,
+    cfg: &CompactionConfig,
 ) -> Result<()> {
     let n = messages.len();
-    if !needs_compaction(u32::MAX, n) {
+    if !conversation_long_enough_to_compact(n) {
         return Err(anyhow!(
             "conversation too short to compact: {n} messages \
              (need >= {} for middle-replace)",
@@ -129,7 +169,7 @@ pub fn compact(
     ));
 
     let request = ChatRequest {
-        model: compactor_model(),
+        model: cfg.compactor_model.clone(),
         messages: vec![compactor_system, compactor_user],
         tools: Vec::new(),
         tool_choice: None,
@@ -192,35 +232,79 @@ fn render_messages_as_excerpt(messages: &[Message]) -> String {
 mod tests {
     use super::*;
 
+    // ─── #368: explicit-param CompactionConfig (no env-var reads) ─
+
+    /// Defaults preserve pre-#368 behavior: 60K threshold + canonical
+    /// 4B compactor. Operator overrides arrive via host's profile
+    /// JSON → CLI flags, not env vars.
     #[test]
-    fn threshold_uses_env_when_set() {
-        // We can't reliably set/unset env vars in unit tests without
-        // serial_test because they leak across tests. The default
-        // behavior is the load-bearing one — assert it's a reasonable
-        // value.
-        std::env::remove_var("DARKMUX_RUNTIME_COMPACT_THRESHOLD_TOKENS");
-        assert_eq!(threshold_tokens(), DEFAULT_THRESHOLD_TOKENS);
+    fn default_cfg_matches_pre_368_defaults() {
+        let cfg = CompactionConfig::default();
+        assert_eq!(cfg.threshold_tokens, DEFAULT_THRESHOLD_TOKENS);
+        assert_eq!(cfg.compactor_model, DEFAULT_COMPACTOR_MODEL);
+    }
+
+    #[test]
+    fn from_overrides_threshold_only_uses_default_model() {
+        let cfg = CompactionConfig::from_overrides(Some(30_000), None);
+        assert_eq!(cfg.threshold_tokens, 30_000);
+        assert_eq!(cfg.compactor_model, DEFAULT_COMPACTOR_MODEL);
+    }
+
+    #[test]
+    fn from_overrides_model_only_uses_default_threshold() {
+        let cfg = CompactionConfig::from_overrides(None, Some("custom-compactor".to_string()));
+        assert_eq!(cfg.threshold_tokens, DEFAULT_THRESHOLD_TOKENS);
+        assert_eq!(cfg.compactor_model, "custom-compactor");
+    }
+
+    #[test]
+    fn from_overrides_both_set() {
+        let cfg = CompactionConfig::from_overrides(
+            Some(45_000),
+            Some("alt-compactor".to_string()),
+        );
+        assert_eq!(cfg.threshold_tokens, 45_000);
+        assert_eq!(cfg.compactor_model, "alt-compactor");
     }
 
     #[test]
     fn needs_compaction_requires_both_size_and_length() {
+        let cfg = CompactionConfig::default();
         // Tokens below threshold → no compaction even with many messages
-        assert!(!needs_compaction(1000, 100));
+        assert!(!needs_compaction(1000, 100, &cfg));
         // Tokens above threshold but conversation too short
-        assert!(!needs_compaction(100_000, 5));
+        assert!(!needs_compaction(100_000, 5, &cfg));
         // Both conditions met
-        assert!(needs_compaction(100_000, 10));
+        assert!(needs_compaction(100_000, 10, &cfg));
     }
 
     #[test]
     fn needs_compaction_boundary() {
+        let cfg = CompactionConfig::default();
         // Exactly at threshold + minimum length
         let min_len = PRESERVE_HEAD + 1 + PRESERVE_TAIL;
-        assert!(needs_compaction(DEFAULT_THRESHOLD_TOKENS, min_len));
-        // One below
-        assert!(!needs_compaction(DEFAULT_THRESHOLD_TOKENS - 1, min_len));
+        assert!(needs_compaction(DEFAULT_THRESHOLD_TOKENS, min_len, &cfg));
+        // One below threshold
+        assert!(!needs_compaction(DEFAULT_THRESHOLD_TOKENS - 1, min_len, &cfg));
         // Length-1 below
-        assert!(!needs_compaction(DEFAULT_THRESHOLD_TOKENS, min_len - 1));
+        assert!(!needs_compaction(DEFAULT_THRESHOLD_TOKENS, min_len - 1, &cfg));
+    }
+
+    #[test]
+    fn needs_compaction_uses_per_cfg_threshold() {
+        let cfg_low = CompactionConfig {
+            threshold_tokens: 5_000,
+            compactor_model: DEFAULT_COMPACTOR_MODEL.to_string(),
+        };
+        let cfg_high = CompactionConfig {
+            threshold_tokens: 100_000,
+            compactor_model: DEFAULT_COMPACTOR_MODEL.to_string(),
+        };
+        // 10K crosses low (5K) but not high (100K) — assert per-cfg.
+        let min_len = PRESERVE_HEAD + 1 + PRESERVE_TAIL;
+        assert!(needs_compaction(10_000, min_len, &cfg_low));
+        assert!(!needs_compaction(10_000, min_len, &cfg_high));
     }
 
     #[test]

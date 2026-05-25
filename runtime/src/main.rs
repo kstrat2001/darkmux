@@ -292,6 +292,11 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     let prompt_chars = initial_messages[1].content.as_deref().map(str::len).unwrap_or(0);
     traj.append_dispatch_start(&model, system_chars, prompt_chars);
 
+    // (#368) Compaction config from explicit CLI args; no env-var
+    // fallback (operator's tuning surface is the profile JSON, not
+    // shell env). For now build the default; cycle B wires the actual
+    // --compact-threshold-tokens / --compactor-model flags through.
+    let compaction_cfg = compaction::CompactionConfig::default();
     let run_result = loop_runner::run(
         &client,
         &model,
@@ -299,6 +304,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         &tools,
         &mut traj,
         streaming,
+        &compaction_cfg,
     );
 
     let outcome = match run_result {
