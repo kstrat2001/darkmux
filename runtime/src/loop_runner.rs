@@ -769,7 +769,7 @@ mod tests {
         let cfg = compaction::CompactionConfig {
             threshold_tokens: 1000,
             compactor_model: "test-compactor".to_string(),
-            max_history_share: None,
+            threshold_ratio: None,
             context_window: None,
         };
 

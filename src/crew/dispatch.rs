@@ -351,13 +351,14 @@ pub struct CompactionDispatchArgs {
     /// passthrough; the typed schema in #357 didn't promote `model` to
     /// a typed field since it's openclaw-flavored).
     pub compactor_model: Option<String>,
-    /// Formula-trigger fraction (0.1-0.9). Set from
-    /// `profile.runtime.compaction.extras["maxHistoryShare"]`.
-    pub max_history_share: Option<f32>,
+    /// Adaptive-trigger fraction (0.1-0.9). Set from typed
+    /// `profile.runtime.compaction.threshold_ratio` (#368 clean
+    /// break — no openclaw-shape `maxHistoryShare` extras fallback).
+    pub threshold_ratio: Option<f32>,
     /// Primary model's loaded context window. Set from
     /// `profile.models[primary].n_ctx`. Required for the formula
     /// trigger to compute; absent ⇒ formula trigger is disabled
-    /// even when `max_history_share` is set.
+    /// even when `threshold_ratio` is set.
     pub context_window: Option<u32>,
 }
 
@@ -377,10 +378,14 @@ impl CompactionDispatchArgs {
             .and_then(|c| c.extras.get("model"))
             .and_then(|v| v.as_str())
             .map(str::to_string);
-        let max_history_share = comp
-            .and_then(|c| c.extras.get("maxHistoryShare"))
-            .and_then(|v| v.as_f64())
-            .map(|f| f as f32);
+        // (#368 clean break) Read from the typed schema field, NOT
+        // openclaw-shape extras. Operators wanting the adaptive
+        // trigger set `profile.runtime.compaction.threshold_ratio`
+        // directly. The openclaw-passthrough `maxHistoryShare` is a
+        // SEPARATE concept (their post-compaction history cap, not
+        // a pre-compaction trigger) and would be confusing to silently
+        // map across the semantic boundary.
+        let threshold_ratio = comp.and_then(|c| c.threshold_ratio).map(|f| f as f32);
         let context_window = profile
             .models
             .iter()
@@ -389,7 +394,7 @@ impl CompactionDispatchArgs {
         Self {
             threshold_tokens,
             compactor_model,
-            max_history_share,
+            threshold_ratio,
             context_window,
         }
     }

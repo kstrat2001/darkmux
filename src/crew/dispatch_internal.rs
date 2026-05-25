@@ -53,8 +53,8 @@ fn apply_compaction_flags(
     if let Some(model) = &compaction.compactor_model {
         cmd.arg("--compactor-model").arg(model);
     }
-    if let Some(share) = compaction.max_history_share {
-        cmd.arg("--compact-max-history-share").arg(share.to_string());
+    if let Some(share) = compaction.threshold_ratio {
+        cmd.arg("--compact-threshold-ratio").arg(share.to_string());
     }
     if let Some(window) = compaction.context_window {
         cmd.arg("--context-window").arg(window.to_string());
@@ -979,7 +979,7 @@ mod tests {
         let compaction = crate::crew::dispatch::CompactionDispatchArgs {
             threshold_tokens: Some(45_000),
             compactor_model: Some("custom-compactor".to_string()),
-            max_history_share: Some(0.35),
+            threshold_ratio: Some(0.35),
             context_window: Some(101_000),
         };
         apply_compaction_flags(&mut cmd, &compaction);
@@ -988,7 +988,7 @@ mod tests {
         assert!(args.iter().any(|a| a == "45000"));
         assert!(args.iter().any(|a| a == "--compactor-model"));
         assert!(args.iter().any(|a| a == "custom-compactor"));
-        assert!(args.iter().any(|a| a == "--compact-max-history-share"));
+        assert!(args.iter().any(|a| a == "--compact-threshold-ratio"));
         assert!(args.iter().any(|a| a == "--context-window"));
         assert!(args.iter().any(|a| a == "101000"));
     }
@@ -1012,6 +1012,7 @@ mod tests {
                 compaction: Some(RuntimeCompactionConfig {
                     strategy: None,
                     threshold_tokens: Some(40_000),
+                    threshold_ratio: None,
                     tier1: None,
                     tier2: None,
                     reserve: None,
@@ -1026,12 +1027,15 @@ mod tests {
     }
 
     #[test]
-    fn from_profile_derives_extras_passthroughs() {
+    fn from_profile_derives_typed_threshold_ratio() {
+        // (#368 clean break) `threshold_ratio` reads ONLY from the
+        // typed schema field, not from openclaw-shape extras. The
+        // `model` (compactor) field still reads from extras since
+        // #357 didn't promote it to typed.
         use crate::types::{
             ModelRole, Profile, ProfileModel, ProfileRuntime, RuntimeCompactionConfig,
         };
         let mut extras = serde_json::Map::new();
-        extras.insert("maxHistoryShare".into(), serde_json::json!(0.35));
         extras.insert(
             "model".into(),
             serde_json::json!("lmstudio/qwen3-4b-instruct-2507"),
@@ -1050,6 +1054,7 @@ mod tests {
                 compaction: Some(RuntimeCompactionConfig {
                     strategy: None,
                     threshold_tokens: None,
+                    threshold_ratio: Some(0.35),
                     tier1: None,
                     tier2: None,
                     reserve: None,
@@ -1059,12 +1064,58 @@ mod tests {
             use_when: None,
         };
         let args = crate::crew::dispatch::CompactionDispatchArgs::from_profile(&profile);
-        assert_eq!(args.max_history_share, Some(0.35));
+        assert_eq!(args.threshold_ratio, Some(0.35));
         assert_eq!(
             args.compactor_model.as_deref(),
             Some("lmstudio/qwen3-4b-instruct-2507")
         );
         assert_eq!(args.context_window, Some(101_000));
+    }
+
+    /// (#368 clean break invariant) When ONLY `extras["maxHistoryShare"]`
+    /// is set — no typed `threshold_ratio` — the host MUST NOT silently
+    /// translate openclaw's history-cap to darkmux's pre-trigger ratio.
+    /// They're different concepts; mapping across would surface in
+    /// methodology citations as "this run tuned to X" when the operator
+    /// never actually expressed X in the darkmux-side surface.
+    #[test]
+    fn from_profile_ignores_openclaw_maxhistoryshare_extras() {
+        use crate::types::{
+            ModelRole, Profile, ProfileModel, ProfileRuntime, RuntimeCompactionConfig,
+        };
+        let mut extras = serde_json::Map::new();
+        // Operator carries openclaw's historical config — this should
+        // pass through untouched in extras (for any downstream
+        // openclaw-aware consumer) but NOT influence darkmux's trigger.
+        extras.insert("maxHistoryShare".into(), serde_json::json!(0.35));
+        let profile = Profile {
+            description: None,
+            models: vec![ProfileModel {
+                id: "primary-x".into(),
+                n_ctx: 100_000,
+                role: ModelRole::Primary,
+                identifier: None,
+            }],
+            runtime: Some(ProfileRuntime {
+                config_path: None,
+                context_tokens: None,
+                compaction: Some(RuntimeCompactionConfig {
+                    strategy: None,
+                    threshold_tokens: None,
+                    threshold_ratio: None,
+                    tier1: None,
+                    tier2: None,
+                    reserve: None,
+                    extras,
+                }),
+            }),
+            use_when: None,
+        };
+        let args = crate::crew::dispatch::CompactionDispatchArgs::from_profile(&profile);
+        assert!(
+            args.threshold_ratio.is_none(),
+            "clean break: openclaw extras must NOT auto-populate threshold_ratio"
+        );
     }
 
     #[test]
@@ -1084,7 +1135,7 @@ mod tests {
         let args = crate::crew::dispatch::CompactionDispatchArgs::from_profile(&profile);
         assert!(args.threshold_tokens.is_none());
         assert!(args.compactor_model.is_none());
-        assert!(args.max_history_share.is_none());
+        assert!(args.threshold_ratio.is_none());
         // Primary n_ctx still captured even without compaction block.
         assert_eq!(args.context_window, Some(50_000));
     }

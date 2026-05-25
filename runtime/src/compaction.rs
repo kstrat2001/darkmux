@@ -25,7 +25,7 @@
 //!   heuristic-percentage approach did per Article 2 findings.
 //! - **Config via host-passed CLI args, not env vars (#368).** All
 //!   tunables (threshold, compactor model, optional
-//!   max_history_share) arrive as explicit parameters from the host's
+//!   threshold_ratio) arrive as explicit parameters from the host's
 //!   `dispatch_via_internal`, which derives them from
 //!   `profile.runtime.compaction.*` (the typed schema landed in #357).
 //!   No `std::env::var()` reads in this module — operator's tuning
@@ -84,17 +84,17 @@ pub struct CompactionConfig {
     /// Optional fraction-of-context-window trigger (0.1-0.9 per
     /// openclaw's range). When set AND `context_window` is also set,
     /// compaction fires when `latest_prompt_tokens >= context_window *
-    /// max_history_share` — independent of `threshold_tokens`.
+    /// threshold_ratio` — independent of `threshold_tokens`.
     /// Either trigger fires first wins.
     ///
     /// Mirrors openclaw's `agents.defaults.compaction.maxHistoryShare`
     /// (operator passthrough field in #357 `extras` map). The formula
     /// trigger is the load-bearing answer to operator's #368 critique:
     /// "absolute tokens is brittle — fractions adapt across loads."
-    pub max_history_share: Option<f32>,
+    pub threshold_ratio: Option<f32>,
     /// Loaded model's context window in tokens (e.g. 101000 for the
     /// `balanced` profile's D primary). Needed to compute the
-    /// `max_history_share` formula trigger. Host derives from the
+    /// `threshold_ratio` formula trigger. Host derives from the
     /// active profile's primary model `n_ctx`. `None` disables the
     /// formula trigger entirely (back-compat / absolute-only mode).
     pub context_window: Option<u32>,
@@ -109,25 +109,25 @@ impl CompactionConfig {
     pub fn from_overrides(
         threshold_tokens: Option<u32>,
         compactor_model: Option<String>,
-        max_history_share: Option<f32>,
+        threshold_ratio: Option<f32>,
         context_window: Option<u32>,
     ) -> Self {
         Self {
             threshold_tokens: threshold_tokens.unwrap_or(DEFAULT_THRESHOLD_TOKENS),
             compactor_model: compactor_model
                 .unwrap_or_else(|| DEFAULT_COMPACTOR_MODEL.to_string()),
-            max_history_share,
+            threshold_ratio,
             context_window,
         }
     }
 
     /// Compute the formula-trigger threshold in tokens, if both
-    /// `max_history_share` and `context_window` are configured.
+    /// `threshold_ratio` and `context_window` are configured.
     /// Returns `None` when the formula trigger is disabled (either
     /// input absent). The result is the prompt-token level at which
     /// the formula trigger would fire.
     pub fn formula_trigger_tokens(&self) -> Option<u32> {
-        match (self.max_history_share, self.context_window) {
+        match (self.threshold_ratio, self.context_window) {
             (Some(share), Some(window)) => {
                 let trigger = (window as f32) * share;
                 Some(trigger.floor() as u32)
@@ -295,7 +295,7 @@ mod tests {
         let cfg = CompactionConfig::from_overrides(Some(30_000), None, None, None);
         assert_eq!(cfg.threshold_tokens, 30_000);
         assert_eq!(cfg.compactor_model, DEFAULT_COMPACTOR_MODEL);
-        assert!(cfg.max_history_share.is_none());
+        assert!(cfg.threshold_ratio.is_none());
         assert!(cfg.context_window.is_none());
     }
 
@@ -321,7 +321,7 @@ mod tests {
         );
         assert_eq!(cfg.threshold_tokens, 45_000);
         assert_eq!(cfg.compactor_model, "alt-compactor");
-        assert_eq!(cfg.max_history_share, Some(0.35));
+        assert_eq!(cfg.threshold_ratio, Some(0.35));
         assert_eq!(cfg.context_window, Some(101_000));
     }
 
@@ -353,13 +353,13 @@ mod tests {
         let cfg_low = CompactionConfig {
             threshold_tokens: 5_000,
             compactor_model: DEFAULT_COMPACTOR_MODEL.to_string(),
-            max_history_share: None,
+            threshold_ratio: None,
             context_window: None,
         };
         let cfg_high = CompactionConfig {
             threshold_tokens: 100_000,
             compactor_model: DEFAULT_COMPACTOR_MODEL.to_string(),
-            max_history_share: None,
+            threshold_ratio: None,
             context_window: None,
         };
         // 10K crosses low (5K) but not high (100K) — assert per-cfg.
@@ -368,7 +368,7 @@ mod tests {
         assert!(!needs_compaction(10_000, min_len, &cfg_high));
     }
 
-    // ─── #368: formula trigger (max_history_share * context_window) ─
+    // ─── #368: formula trigger (threshold_ratio * context_window) ─
 
     #[test]
     fn formula_trigger_disabled_when_either_input_missing() {
@@ -393,7 +393,7 @@ mod tests {
         let cfg = CompactionConfig {
             threshold_tokens: 60_000,
             compactor_model: DEFAULT_COMPACTOR_MODEL.to_string(),
-            max_history_share: Some(0.35),
+            threshold_ratio: Some(0.35),
             context_window: Some(100_000),
         };
         let min_len = PRESERVE_HEAD + 1 + PRESERVE_TAIL;
@@ -410,7 +410,7 @@ mod tests {
         let cfg = CompactionConfig {
             threshold_tokens: 40_000,
             compactor_model: DEFAULT_COMPACTOR_MODEL.to_string(),
-            max_history_share: Some(0.6),
+            threshold_ratio: Some(0.6),
             context_window: Some(100_000),
         };
         let min_len = PRESERVE_HEAD + 1 + PRESERVE_TAIL;
@@ -426,7 +426,7 @@ mod tests {
         let cfg = CompactionConfig {
             threshold_tokens: 50_000,
             compactor_model: DEFAULT_COMPACTOR_MODEL.to_string(),
-            max_history_share: Some(0.35),
+            threshold_ratio: Some(0.35),
             context_window: Some(100_000),
         };
         let min_len = PRESERVE_HEAD + 1 + PRESERVE_TAIL;
