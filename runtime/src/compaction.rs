@@ -360,10 +360,15 @@ pub fn structured_compact(
         tool_choice: None,
         temperature: 0.1,
         max_tokens: Some(4096),
-        // (#372 T2-B) JSON-mode: LMStudio enforces the response is
-        // parseable JSON. Reduces the prose-prefix failure mode that
-        // would otherwise need defensive parsing on our side.
-        response_format: Some(serde_json::json!({"type": "json_object"})),
+        // (#375) Schema-enforced JSON via LMStudio's `json_schema`
+        // response-format. LMStudio's API rejects `"type": "json_object"`
+        // (OpenAI's generic-JSON mode) with `'response_format.type'
+        // must be 'json_schema' or 'text'` — caught by Beat-40 tier-2
+        // smoke. Switching to `json_schema` is strictly BETTER: server
+        // enforces shape, not just validity. #354 Q4 v0.1 was based on
+        // an incorrect assumption about LMStudio's compat; this is the
+        // correct surface.
+        response_format: Some(structured_output_response_format_schema()),
     };
 
     eprintln!(
@@ -415,6 +420,55 @@ pub fn structured_compact(
     messages.splice(middle_start..middle_end, std::iter::once(replacement));
 
     Ok(capped)
+}
+
+/// (#375) Build the `response_format` value for LMStudio's
+/// `json_schema` constraint. Mirrors `StructuredCompactionOutput`'s
+/// shape so the server enforces the schema at decode time — stricter
+/// than OpenAI's generic `json_object` mode. Top-level
+/// `additionalProperties: true` preserves the forward-compat
+/// tolerance for unknown fields (#354 Q5 — per-role extensions
+/// deferred to v0.2 may emit fields the schema doesn't yet name).
+fn structured_output_response_format_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "json_schema",
+        "json_schema": {
+            "name": "StructuredCompactionOutput",
+            "strict": false,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "objective": {"type": "string"},
+                    "current_truth": {
+                        "type": "object",
+                        "properties": {
+                            "active_files": {"type": "string"},
+                            "test_outcomes": {"type": "string"},
+                            "external_state": {"type": "string"}
+                        },
+                        "additionalProperties": false
+                    },
+                    "compaction_metadata": {
+                        "type": "object",
+                        "properties": {
+                            "schema_version": {"type": "string"},
+                            "generation": {"type": "integer"},
+                            "source_message_count": {"type": "integer"}
+                        },
+                        "required": ["schema_version", "generation", "source_message_count"],
+                        "additionalProperties": false
+                    },
+                    "completed_decisions": {"type": "string"},
+                    "errors_to_preserve": {"type": "string"},
+                    "next_concrete_actions": {"type": "string"},
+                    "verify_criteria": {"type": "string"},
+                    "sprint_id": {"type": "string"}
+                },
+                "required": ["objective", "current_truth", "compaction_metadata"],
+                "additionalProperties": true
+            }
+        }
+    })
 }
 
 /// (#372 T2-B) System prompt the compactor sees in JSON-mode mode.
