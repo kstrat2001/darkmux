@@ -240,12 +240,28 @@ impl Trajectory {
     }
 
     /// model.streaming.start — fires when an SSE-streamed turn begins,
-    /// before any partial chunks arrive. (#205)
-    pub fn append_model_streaming_start(&mut self, seq: u32) {
+    /// before any partial chunks arrive. (#205, #361)
+    ///
+    /// `system_chars` is the total character length of system-role
+    /// messages in the request; `prompt_chars` is the total length of
+    /// all non-system messages (the accumulated conversation context).
+    /// Together they give per-turn context-size telemetry from the
+    /// trajectory alone, independent of whether LMStudio's `usage`
+    /// field came through on the SSE close. Surfaced as a Phase B
+    /// dogfood finding (#361) — pre-fix the fields existed in the
+    /// schema but the producer never populated them.
+    pub fn append_model_streaming_start(
+        &mut self,
+        seq: u32,
+        system_chars: usize,
+        prompt_chars: usize,
+    ) {
         self.write_event(&serde_json::json!({
             "type": "model.streaming.start",
             "seq": seq,
             "ts": unix_ms(),
+            "system_chars": system_chars,
+            "prompt_chars": prompt_chars,
         }));
     }
 
