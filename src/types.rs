@@ -85,10 +85,32 @@ pub struct ReserveConfig {
 /// today's middle-replace shape; when `tier1`/`tier2`/`reserve` are
 /// absent their future consumers see "no config" and skip the new
 /// behavior.
+/// Compaction strategy — which compactor implementation runs when
+/// the trigger fires. (#352 tier-2 work, scaffolded T2-A #372)
+///
+/// - **`Narrative`** (default, today's behavior): single-call to the
+///   companion model with a prose-summary prompt; replaces middle
+///   messages with a synthetic user-role message carrying the prose.
+///   Article-2-era compactor shape.
+/// - **`StructuredSlot`**: JSON-mode call to the compactor; output is
+///   a typed `StructuredCompactionOutput` matching #354 v0.1 schema;
+///   replaces middle messages with a synthetic SYSTEM-role message
+///   carrying a labeled-markdown rendering of the slots. Operator-
+///   opt-in via `profile.runtime.compaction.strategy: "structured-
+///   slot"`. T2-B implements the compactor; T2-C wires the routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CompactionStrategy {
+    /// Today's default — narrative middle-replace via prose summary.
+    Narrative,
+    /// #352 tier-2 — structured-slot fact extraction.
+    StructuredSlot,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RuntimeCompactionConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub strategy: Option<String>,
+    pub strategy: Option<CompactionStrategy>,
     /// Absolute compaction trigger in tokens (hard ceiling). When
     /// `latest_prompt_tokens` reaches this, compaction fires —
     /// regardless of loaded context window. Sibling to
@@ -204,6 +226,63 @@ pub struct LoadedModel {
 }
 
 #[cfg(test)]
+mod compaction_strategy_tests {
+    //! (#372 T2-A) Tests gate the new `CompactionStrategy` typed enum.
+    //! Pre-T2-A: `strategy: Option<String>` — accepts any string,
+    //! consumer has to parse + validate. T2-A: typed enum with
+    //! kebab-case serde names matching the user-facing strings, so
+    //! serde rejects unknown values at parse time.
+    use super::*;
+
+    #[test]
+    fn strategy_narrative_serializes_kebab() {
+        let s = CompactionStrategy::Narrative;
+        assert_eq!(serde_json::to_string(&s).unwrap(), "\"narrative\"");
+    }
+
+    #[test]
+    fn strategy_structured_slot_serializes_kebab() {
+        let s = CompactionStrategy::StructuredSlot;
+        assert_eq!(serde_json::to_string(&s).unwrap(), "\"structured-slot\"");
+    }
+
+    #[test]
+    fn strategy_round_trip_through_compaction_config() {
+        let cfg = RuntimeCompactionConfig {
+            strategy: Some(CompactionStrategy::StructuredSlot),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("\"strategy\":\"structured-slot\""));
+        let back: RuntimeCompactionConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.strategy, Some(CompactionStrategy::StructuredSlot));
+    }
+
+    #[test]
+    fn strategy_default_unset_is_none() {
+        let cfg = RuntimeCompactionConfig::default();
+        assert_eq!(cfg.strategy, None);
+    }
+
+    #[test]
+    fn strategy_unknown_value_errors_at_parse() {
+        let json = r#"{"strategy": "fancy-new-thing"}"#;
+        let result: Result<RuntimeCompactionConfig, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "unknown strategy must error at parse time, not silently fall back"
+        );
+    }
+
+    #[test]
+    fn strategy_parses_narrative_from_kebab_string() {
+        let json = r#"{"strategy": "narrative"}"#;
+        let cfg: RuntimeCompactionConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.strategy, Some(CompactionStrategy::Narrative));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -297,7 +376,7 @@ mod tests {
             "reserve": {"bail_after_token_count": 95000, "bail_after_compactions": 3}
         }"#;
         let cfg: RuntimeCompactionConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(cfg.strategy.as_deref(), Some("structured-slot"));
+        assert_eq!(cfg.strategy, Some(CompactionStrategy::StructuredSlot));
         assert_eq!(cfg.threshold_tokens, Some(60000));
         let t1 = cfg.tier1.as_ref().expect("tier1 set");
         assert_eq!(t1.eviction_after_unreferenced_turns, Some(5));
@@ -457,7 +536,7 @@ mod tests {
         let p = reg.profiles.get("balanced").unwrap();
         let rt = p.runtime.as_ref().unwrap();
         let comp = rt.compaction.as_ref().unwrap();
-        assert_eq!(comp.strategy.as_deref(), Some("structured-slot"));
+        assert_eq!(comp.strategy, Some(CompactionStrategy::StructuredSlot));
         assert_eq!(comp.threshold_tokens, Some(60000));
         assert_eq!(
             comp.tier1
