@@ -25,6 +25,10 @@ const EMBEDDED_WORKLOADS: &[(&str, &str)] = &[
         "quick-coding",
         include_str!("../../templates/builtin/workloads/quick-coding.json"),
     ),
+    (
+        "medium-coding",
+        include_str!("../../templates/builtin/workloads/medium-coding.json"),
+    ),
 ];
 
 fn find_embedded(id: &str) -> Option<&'static str> {
@@ -368,6 +372,70 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("parsing embedded workload"), "got: {msg}");
         assert!(msg.contains("\"broken\""), "got: {msg}");
+    }
+
+    /// Phase B compaction workload: verify the embedded manifest parses
+    /// cleanly, ships the expected sandbox layout (4 src modules + 3
+    /// partial-coverage test files + 2 __init__.py), and points at the
+    /// `coder` role with a unittest-discover verify command. Catches
+    /// regressions where someone edits the manifest content and breaks
+    /// either the JSON shape or the gap-list shape that makes it useful
+    /// for compaction-exercise dispatch.
+    #[test]
+    fn medium_coding_embedded_manifest_has_expected_shape() {
+        let json = find_embedded("medium-coding").expect("medium-coding should be embedded");
+        let manifest: WorkloadManifest =
+            serde_json::from_str(json).expect("medium-coding manifest should parse");
+        let w = &manifest.workload;
+        assert_eq!(w.id, "medium-coding");
+        assert_eq!(w.provider, "coding-task");
+        assert_eq!(w.role.as_deref(), Some("coder"));
+        let expected_files = [
+            "src/__init__.py",
+            "src/parser.py",
+            "src/validator.py",
+            "src/aggregator.py",
+            "src/storage.py",
+            "tests/__init__.py",
+            "tests/test_parser.py",
+            "tests/test_validator.py",
+            "tests/test_aggregator.py",
+        ];
+        for path in expected_files {
+            assert!(
+                w.setup_content.contains_key(path),
+                "setupContent missing expected file: {path}"
+            );
+        }
+        // No test_storage.py — storage is the whole-file-gap module by design.
+        assert!(
+            !w.setup_content.contains_key("tests/test_storage.py"),
+            "tests/test_storage.py should NOT ship (it's the whole-file gap)"
+        );
+        let verify = w.verify.as_ref().expect("verify spec required");
+        let cmd = verify.command.as_deref().expect("verify command required");
+        assert!(
+            cmd.contains("unittest discover"),
+            "verify command should use unittest discover: {cmd}"
+        );
+        assert_eq!(verify.cwd.as_deref(), Some("${SANDBOX_DIR}"));
+        assert_eq!(verify.must_contain, vec!["OK".to_string()]);
+        assert_eq!(verify.must_not_contain, vec!["FAILED".to_string()]);
+        // Lock the prompt to its anchor heading + the storage-module reference.
+        // The storage reference is load-bearing: it ties the prompt's gap list
+        // to the actual file layout that the file-presence assertions above
+        // validate. If someone reorganizes modules without updating the
+        // prompt, this fails — preventing operationally-confusing dispatches
+        // where the prompt promises files that don't exist.
+        let prompt = w.prompt.as_deref().expect("prompt required");
+        assert!(
+            prompt.contains("COVERAGE AUDIT"),
+            "prompt should retain its anchor heading"
+        );
+        assert!(
+            prompt.contains("${SANDBOX_DIR}/src/storage.py"),
+            "prompt should reference the storage module (the whole-file gap)"
+        );
     }
 
     /// Forward-compat: asking for an embedded workload by id resolves it from
