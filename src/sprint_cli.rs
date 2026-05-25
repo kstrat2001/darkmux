@@ -202,17 +202,23 @@ fn collect_profile_capacities(
                 .models
                 .iter()
                 .any(|m| matches!(m.role, ModelRole::Compactor));
-            // Read max_history_share from runtime.compaction.extras if
-            // present; default to 0.35 (openclaw's typical setting in
-            // `balanced`). maxHistoryShare is an openclaw-shape
-            // passthrough field; lives in `.extras` after the v0.1
-            // schema extension (#357) added typed fields alongside.
-            let max_history_share = profile
-                .runtime
-                .as_ref()
-                .and_then(|r| r.compaction.as_ref())
-                .and_then(|c| c.extras.get("maxHistoryShare"))
-                .and_then(|v| v.as_f64())
+            // Resolve the compaction ratio for sprint budget projections.
+            // Precedence: typed `threshold_ratio` (#368 clean-break
+            // primary surface) → openclaw-shape `extras["maxHistoryShare"]`
+            // (back-compat for operators still on openclaw-only profiles)
+            // → 0.35 default. Pre-#370 this read ONLY the openclaw
+            // extras, which silently diverged from what the internal
+            // runtime used after #369's clean break — operators setting
+            // `threshold_ratio` got sprint planning that ignored their
+            // expressed value.
+            let compaction = profile.runtime.as_ref().and_then(|r| r.compaction.as_ref());
+            let max_history_share = compaction
+                .and_then(|c| c.threshold_ratio)
+                .or_else(|| {
+                    compaction
+                        .and_then(|c| c.extras.get("maxHistoryShare"))
+                        .and_then(|v| v.as_f64())
+                })
                 .unwrap_or(0.35);
             Some((
                 name.clone(),
