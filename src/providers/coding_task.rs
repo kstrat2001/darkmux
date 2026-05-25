@@ -188,6 +188,15 @@ impl WorkloadProvider for CodingTaskProvider {
         runtime: crate::crew::dispatch::Runtime,
         runtime_cmd: &str,
     ) -> Result<RunResult> {
+        // (#365) Warn when the requested profile's primary model doesn't
+        // match what's currently loaded in LMStudio. The dispatch will
+        // still go through (operator-sovereignty: we don't auto-swap),
+        // but the operator sees the divergence — methodology data later
+        // citing "this run used profile X" will be wrong otherwise.
+        // Best-effort: lms query failures (LMStudio offline, parse
+        // errors) silently skip the check rather than block dispatch.
+        warn_on_profile_loaded_mismatch(profile, profile_name);
+
         // Per-runtime sandbox-path substitution:
         //   - Openclaw runs on host → agent sees the host sandbox path.
         //   - Internal runtime mounts sandbox_dir at /workspace in the
@@ -232,14 +241,53 @@ impl WorkloadProvider for CodingTaskProvider {
             fs::write(run_dir.join("qa-reply.err"), &stderr)?;
         }
 
-        // Best-effort copy of the trajectory before any next dispatch wipes it.
+        // (#364) Per-run preservation of the runtime's trajectory +
+        // metrics.json. The runtime writes both into
+        // `<sandbox>/.darkmux-runtime/` — but the sandbox is shared
+        // across all dispatches of the same workload, so the NEXT
+        // dispatch overwrites these files. Copy them into run_dir
+        // before that can happen. Phase B dogfood (Beat 39, 2026-05-25)
+        // surfaced the methodology gap: per-run aggregator-side
+        // analysis was reading the latest dispatch's data for every
+        // historical run.
         let mut trajectory_path: Option<PathBuf> = None;
-        if let Some(t) = guess_trajectory_path(&session_id) {
-            let dst = run_dir.join("trajectory.jsonl");
-            if let Err(e) = fs::copy(&t, &dst) {
-                eprintln!("darkmux: warn — failed copying trajectory: {e}");
-            } else {
-                trajectory_path = Some(dst);
+        match runtime {
+            crate::crew::dispatch::Runtime::Internal => {
+                let runtime_dir = sandbox_dir.join(".darkmux-runtime");
+                // `src.exists()` gate is intentional: a #363-timeout
+                // dispatch may have written partial trajectory but no
+                // metrics.json. Copying what's there preserves forensic
+                // data; missing files just don't copy. Don't "fix" this
+                // by aborting when either is absent.
+                for (name, dst_name) in [
+                    ("trajectory.jsonl", "trajectory.jsonl"),
+                    ("metrics.json", "metrics.json"),
+                ] {
+                    let src = runtime_dir.join(name);
+                    if src.exists() {
+                        let dst = run_dir.join(dst_name);
+                        if let Err(e) = fs::copy(&src, &dst) {
+                            eprintln!(
+                                "darkmux: warn — failed copying runtime {name} into run dir: {e}"
+                            );
+                        } else if name == "trajectory.jsonl" {
+                            trajectory_path = Some(dst);
+                        }
+                    }
+                }
+            }
+            crate::crew::dispatch::Runtime::Openclaw => {
+                // Openclaw writes per-session trajectory under
+                // `~/.openclaw/agents/<agent>/sessions/<session-id>.trajectory.jsonl`.
+                // Best-effort lookup via guess_trajectory_path.
+                if let Some(t) = guess_trajectory_path(&session_id) {
+                    let dst = run_dir.join("trajectory.jsonl");
+                    if let Err(e) = fs::copy(&t, &dst) {
+                        eprintln!("darkmux: warn — failed copying trajectory: {e}");
+                    } else {
+                        trajectory_path = Some(dst);
+                    }
+                }
             }
         }
 
@@ -315,10 +363,23 @@ impl WorkloadProvider for CodingTaskProvider {
         // start` / `model.completed` and never writes `prompt.submitted`.
         // Pre-fix (#359) the openclaw-shape consumer silently dropped
         // turn counts to 0 on every internal-runtime dispatch.
-        let runtime_metrics = meta
-            .get("sandbox")
-            .and_then(|v| v.as_str())
-            .and_then(|sandbox| read_internal_runtime_metrics(Path::new(sandbox)));
+        //
+        // Preference order (after #364):
+        //   1. `<run_dir>/metrics.json` — per-run preserved copy. Safe
+        //      against subsequent dispatches that would overwrite the
+        //      sandbox source.
+        //   2. `<sandbox>/.darkmux-runtime/metrics.json` — live source.
+        //      Backward-compat for runs predating #364 that don't have
+        //      the per-run copy yet.
+        let runtime_metrics = read_metrics_json(&run_dir.join("metrics.json")).or_else(|| {
+            meta.get("sandbox")
+                .and_then(|v| v.as_str())
+                .and_then(|sandbox| {
+                    read_metrics_json(
+                        &Path::new(sandbox).join(".darkmux-runtime").join("metrics.json"),
+                    )
+                })
+        });
 
         let prompt_submitted: Vec<&serde_json::Value> = events
             .iter()
@@ -717,18 +778,100 @@ struct InternalRuntimeMetrics {
     compactions: Option<u32>,
 }
 
-/// Read the internal runtime's `metrics.json` from the conventional
-/// path inside the operator's sandbox. Returns `None` if the file
-/// doesn't exist (openclaw shell-out dispatches won't have one) or
-/// if it can't be parsed (older runtime versions may emit a
-/// different shape). The fallback in the caller (#359) is to derive
-/// counts from the trajectory.
+/// (#365) Emit a warning to stderr when the loaded model state doesn't
+/// match the profile the dispatch claims to be using. Compares the
+/// primary model: the profile declares an id + n_ctx; LMStudio reports
+/// the actually-loaded identifier + context. Differences mean future
+/// methodology citations of "this run used profile <name>" will be
+/// wrong.
 ///
-/// Conventional path: `<sandbox>/.darkmux-runtime/metrics.json` —
-/// see `runtime/src/main.rs` for the producer side.
-fn read_internal_runtime_metrics(sandbox: &Path) -> Option<InternalRuntimeMetrics> {
-    let path = sandbox.join(".darkmux-runtime").join("metrics.json");
-    let raw = fs::read_to_string(&path).ok()?;
+/// Silent skip when:
+///   - LMStudio query fails (offline, lms binary missing, etc.) —
+///     dispatch will fail with a clearer error downstream.
+///   - Profile declares no primary model — nothing to compare against.
+///   - The primary model isn't found in `lms ps` under either bare or
+///     namespaced identifier — could be openclaw passthrough or a
+///     pre-load race; defer to runtime to surface the dispatch
+///     failure if any.
+///
+/// Operator-sovereignty: warn-only. Doesn't auto-swap, doesn't bail.
+/// Phase B dogfood (Beat 39, 2026-05-25) surfaced this gap when a
+/// `darkmux swap recommended` loaded `balanced` but `darkmux lab run`
+/// tagged manifests with `default_profile=deep`.
+fn warn_on_profile_loaded_mismatch(profile: &Profile, profile_name: &str) {
+    let loaded = match crate::lms::list_loaded() {
+        Ok(v) => v,
+        Err(e) => {
+            // Surface the failure mode distinctly from "match silent" —
+            // a silent return would leave the operator believing the
+            // check passed when in fact it never ran. Methodology
+            // citations depend on knowing the verification status.
+            eprintln!(
+                "darkmux lab dispatch: warn — could not verify profile-load match: \
+                 `lms ps` failed ({e}). Methodology citations of `profile={profile_name}` \
+                 are unverified. (#365)"
+            );
+            return;
+        }
+    };
+    if let Some(msg) = profile_loaded_mismatch_message(profile, profile_name, &loaded) {
+        eprintln!("{msg}");
+    }
+}
+
+/// Pure comparison: returns the warning message to print, or `None`
+/// when the loaded primary matches the profile's declared primary.
+/// Extracted from `warn_on_profile_loaded_mismatch` so the comparison
+/// logic is unit-testable without `lms ps`.
+fn profile_loaded_mismatch_message(
+    profile: &Profile,
+    profile_name: &str,
+    loaded: &[crate::types::LoadedModel],
+) -> Option<String> {
+    use crate::types::ModelRole;
+    let declared_primary = profile
+        .models
+        .iter()
+        .find(|m| matches!(m.role, ModelRole::Primary))?;
+    // Match by either bare id or `darkmux:<id>` namespace.
+    let namespaced = format!("darkmux:{}", declared_primary.id);
+    let found = loaded.iter().find(|m| {
+        m.identifier == declared_primary.id
+            || m.identifier == namespaced
+            || m.model == declared_primary.id
+    });
+    let Some(loaded_primary) = found else {
+        return Some(format!(
+            "darkmux lab dispatch: warn — profile `{profile_name}` declares primary `{}` \
+             but it is NOT in `lms ps`. Manifest will be stamped `profile={profile_name}` \
+             — methodology citations may not match the actually-dispatched model. (#365)",
+            declared_primary.id
+        ));
+    };
+    if loaded_primary.context != declared_primary.n_ctx as u64 {
+        return Some(format!(
+            "darkmux lab dispatch: warn — profile `{profile_name}` declares primary `{}` \
+             at ctx={} but `lms ps` reports it loaded at ctx={}. Manifest will be stamped \
+             `profile={profile_name}` — methodology citations may not match the actual \
+             context envelope. (#365)",
+            declared_primary.id, declared_primary.n_ctx, loaded_primary.context
+        ));
+    }
+    None
+}
+
+/// Read a runtime-emitted `metrics.json` from a specific path.
+/// Returns `None` if the file doesn't exist (openclaw shell-out
+/// dispatches won't have one; some run dirs don't yet have the
+/// per-run copy from #364) or if it can't be parsed (older runtime
+/// versions may emit a different shape). The fallback in the caller
+/// is to derive counts from the trajectory (#359).
+///
+/// Caller-chooses the path so the preference chain (per-run copy
+/// first, sandbox-live fallback) lives at the consumer, not split
+/// across multiple helpers.
+fn read_metrics_json(path: &Path) -> Option<InternalRuntimeMetrics> {
+    let raw = fs::read_to_string(path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
     Some(InternalRuntimeMetrics {
         turns: v.get("turns").and_then(|x| x.as_u64()).map(|n| n as u32),
@@ -1372,6 +1515,136 @@ not-valid-json
         // Pre-fix: turns=0, compactions=0. Post-fix: runtime values flow through.
         assert_eq!(report.turns, 10);
         assert_eq!(report.compactions, 2);
+    }
+
+    // ─── #364: inspect prefers run_dir/metrics.json over sandbox ──
+
+    /// When both `<run_dir>/metrics.json` (per-run preserved) AND
+    /// `<sandbox>/.darkmux-runtime/metrics.json` (live source) exist,
+    /// inspect prefers the run_dir copy — that's the one not subject
+    /// to sandbox-overwrite by subsequent dispatches. The live source
+    /// remains as a backward-compat fallback for runs predating #364
+    /// (no per-run copy yet).
+    #[test]
+    fn inspect_prefers_run_dir_metrics_over_sandbox() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run");
+        let sandbox = tmp.path().join("sandbox");
+        let runtime_dir = sandbox.join(".darkmux-runtime");
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::create_dir_all(&runtime_dir).unwrap();
+        fs::write(
+            run_dir.join("manifest.json"),
+            format!(
+                r#"{{"sessionId":"sess","durationMs":60000,"sandbox":"{}"}}"#,
+                sandbox.display()
+            ),
+        )
+        .unwrap();
+        // Per-run copy: 7 turns, 1 compaction. Should be picked.
+        fs::write(
+            run_dir.join("metrics.json"),
+            r#"{"turns":7,"compactions":1}"#,
+        )
+        .unwrap();
+        // Sandbox live source: 99 turns, 99 compactions. Should be
+        // IGNORED in favor of the per-run copy.
+        fs::write(
+            runtime_dir.join("metrics.json"),
+            r#"{"turns":99,"compactions":99}"#,
+        )
+        .unwrap();
+        fs::write(run_dir.join("trajectory.jsonl"), "").unwrap();
+        let loaded = make_loaded(basic_spec(), tmp.path().to_path_buf());
+        let report = CodingTaskProvider.inspect(&loaded, &run_dir).unwrap();
+        // Per-run copy wins.
+        assert_eq!(report.turns, 7);
+        assert_eq!(report.compactions, 1);
+    }
+
+    // ─── #365: profile-loaded mismatch detection ──────────────────
+
+    fn loaded(identifier: &str, model: &str, ctx: u64) -> crate::types::LoadedModel {
+        crate::types::LoadedModel {
+            identifier: identifier.to_string(),
+            model: model.to_string(),
+            status: "idle".to_string(),
+            size: "1G".to_string(),
+            context: ctx,
+        }
+    }
+
+    fn profile_with_primary(model_id: &str, ctx: u32) -> Profile {
+        Profile {
+            description: None,
+            models: vec![crate::types::ProfileModel {
+                id: model_id.to_string(),
+                n_ctx: ctx,
+                role: crate::types::ModelRole::Primary,
+                identifier: None,
+            }],
+            runtime: None,
+            use_when: None,
+        }
+    }
+
+    #[test]
+    fn mismatch_none_when_primary_loaded_with_matching_ctx() {
+        let p = profile_with_primary("qwen3.6", 101_000);
+        // Loaded under the darkmux: namespace at matching ctx → match.
+        let lms = vec![loaded("darkmux:qwen3.6", "qwen3.6", 101_000)];
+        assert!(profile_loaded_mismatch_message(&p, "balanced", &lms).is_none());
+    }
+
+    #[test]
+    fn mismatch_none_when_loaded_by_bare_identifier() {
+        let p = profile_with_primary("qwen3.6", 101_000);
+        // Some setups load with the bare model id as identifier.
+        let lms = vec![loaded("qwen3.6", "qwen3.6", 101_000)];
+        assert!(profile_loaded_mismatch_message(&p, "balanced", &lms).is_none());
+    }
+
+    #[test]
+    fn mismatch_when_ctx_differs() {
+        let p = profile_with_primary("qwen3.6", 101_000);
+        // Loaded but at a different context window — Beat 39's
+        // `deep`-tag-but-`balanced`-loaded scenario.
+        let lms = vec![loaded("darkmux:qwen3.6", "qwen3.6", 262_144)];
+        let msg = profile_loaded_mismatch_message(&p, "deep", &lms)
+            .expect("ctx mismatch should warn");
+        assert!(msg.contains("ctx=101000"));
+        assert!(msg.contains("loaded at ctx=262144"));
+        assert!(msg.contains("(#365)"));
+    }
+
+    #[test]
+    fn mismatch_when_primary_not_loaded_at_all() {
+        let p = profile_with_primary("qwen3.6", 101_000);
+        // LMStudio has something completely different loaded.
+        let lms = vec![loaded("darkmux:gpt-oss-120b", "gpt-oss-120b", 50_000)];
+        let msg = profile_loaded_mismatch_message(&p, "balanced", &lms)
+            .expect("not-loaded primary should warn");
+        assert!(msg.contains("`qwen3.6`"));
+        assert!(msg.contains("NOT in `lms ps`"));
+    }
+
+    #[test]
+    fn mismatch_silent_when_profile_has_no_primary() {
+        // Profile with only auxiliary / compactor — no primary to check.
+        // Returning None (not warning) is the right call; the consumer
+        // can decide whether to surface a different message.
+        let p = Profile {
+            description: None,
+            models: vec![crate::types::ProfileModel {
+                id: "compactor-only".into(),
+                n_ctx: 32_000,
+                role: crate::types::ModelRole::Compactor,
+                identifier: None,
+            }],
+            runtime: None,
+            use_when: None,
+        };
+        assert!(profile_loaded_mismatch_message(&p, "x", &[]).is_none());
     }
 
     /// (#359 QA follow-up) When `.darkmux-runtime/metrics.json` exists
