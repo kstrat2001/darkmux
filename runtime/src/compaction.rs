@@ -274,9 +274,200 @@ fn render_messages_as_excerpt(messages: &[Message]) -> String {
     out
 }
 
+// ─── #372 T2-A: structured-slot output schema (#354 v0.1) ──────────
+
+/// Tier-2 compactor output shape. The compactor model returns JSON
+/// matching this struct (via LMStudio `response_format: {type:
+/// "json_object"}`); the runtime parses it, renders to labeled
+/// markdown for the synthetic system message, AND persists the raw
+/// JSON to `<sandbox>/.darkmux-runtime/compaction-<gen>.json` (#352
+/// Step 5 persistence — falls out for free).
+///
+/// Required slots per #354 v0.1 commitments: `objective`,
+/// `current_truth`, `compaction_metadata`. Other slots are optional —
+/// the compactor populates them when the conversation actually has
+/// content for that slot.
+///
+/// Unknown fields are tolerated for forward-compat (#354 Q5: per-role
+/// schema extensions deferred to v0.2; compactor may emit fields the
+/// schema doesn't yet name, runtime ignores them rather than fails).
+///
+/// T2-A ships the SHAPE only; T2-B implements `structured_compact()`
+/// which actually parses these from the compactor's JSON-mode response.
+/// Until then no production code path constructs these — only tests.
+#[allow(dead_code)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct StructuredCompactionOutput {
+    pub objective: String,
+    pub current_truth: CurrentTruth,
+    pub compaction_metadata: CompactionMetadata,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_decisions: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub errors_to_preserve: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_concrete_actions: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_criteria: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sprint_id: Option<String>,
+}
+
+/// Nested under `StructuredCompactionOutput.current_truth`. Sub-slots
+/// for the dimensions of "what's the agent's working-memory state
+/// right now." All optional — small workloads only have a subset.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+pub struct CurrentTruth {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_files: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_outcomes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_state: Option<String>,
+}
+
+/// Provenance metadata the compactor MUST emit so the runtime + any
+/// downstream replayer can reason about which compaction produced
+/// which artifact. `generation` matches the runtime's compaction
+/// counter; `source_message_count` is how many messages the
+/// compactor was asked to summarize (the middle slice size).
+#[allow(dead_code)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct CompactionMetadata {
+    pub schema_version: String,
+    pub generation: u32,
+    pub source_message_count: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── #372 T2-A: StructuredCompactionOutput parse/round-trip ─
+
+    #[test]
+    fn structured_output_parses_minimal_with_only_required_slots() {
+        let json = r#"{
+            "objective": "Fix the bug in bug.py",
+            "current_truth": {},
+            "compaction_metadata": {
+                "schema_version": "0.1",
+                "generation": 1,
+                "source_message_count": 5
+            }
+        }"#;
+        let out: StructuredCompactionOutput = serde_json::from_str(json).unwrap();
+        assert_eq!(out.objective, "Fix the bug in bug.py");
+        assert_eq!(out.compaction_metadata.schema_version, "0.1");
+        assert_eq!(out.compaction_metadata.generation, 1);
+        assert_eq!(out.compaction_metadata.source_message_count, 5);
+        assert!(out.completed_decisions.is_none());
+        assert!(out.current_truth.active_files.is_none());
+    }
+
+    #[test]
+    fn structured_output_parses_full_shape() {
+        let json = r#"{
+            "objective": "Audit refresh-token rotation tests",
+            "current_truth": {
+                "active_files": "refreshTokenService.test.ts — 5 failures",
+                "test_outcomes": "npm test → 5 failed, 86 passed",
+                "external_state": "config mock state shared across tests"
+            },
+            "compaction_metadata": {
+                "schema_version": "0.1",
+                "generation": 2,
+                "source_message_count": 30
+            },
+            "completed_decisions": "Decided to fix mock isolation",
+            "errors_to_preserve": "mockImplementation persists across tests",
+            "next_concrete_actions": "Switch to mockImplementationOnce",
+            "verify_criteria": "npm test exits 0",
+            "sprint_id": "sprint-42"
+        }"#;
+        let out: StructuredCompactionOutput = serde_json::from_str(json).unwrap();
+        assert_eq!(out.objective, "Audit refresh-token rotation tests");
+        assert_eq!(
+            out.current_truth.active_files.as_deref(),
+            Some("refreshTokenService.test.ts — 5 failures")
+        );
+        assert_eq!(out.completed_decisions.as_deref(), Some("Decided to fix mock isolation"));
+        assert_eq!(out.sprint_id.as_deref(), Some("sprint-42"));
+    }
+
+    #[test]
+    fn structured_output_errors_when_objective_missing() {
+        let json = r#"{
+            "current_truth": {},
+            "compaction_metadata": {
+                "schema_version": "0.1",
+                "generation": 1,
+                "source_message_count": 5
+            }
+        }"#;
+        let result: Result<StructuredCompactionOutput, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "missing required `objective` must error");
+    }
+
+    #[test]
+    fn structured_output_errors_when_compaction_metadata_missing() {
+        let json = r#"{
+            "objective": "x",
+            "current_truth": {}
+        }"#;
+        let result: Result<StructuredCompactionOutput, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "missing required `compaction_metadata` must error");
+    }
+
+    #[test]
+    fn structured_output_tolerates_unknown_extra_fields() {
+        // Forward-compat for #354 Q5 (per-role schema extensions
+        // deferred to v0.2): compactor may emit slots the runtime
+        // doesn't yet name. Don't fail — quietly drop unknown fields.
+        let json = r#"{
+            "objective": "x",
+            "current_truth": {},
+            "compaction_metadata": {
+                "schema_version": "0.2",
+                "generation": 1,
+                "source_message_count": 5
+            },
+            "future_role_specific_slot": "some content from v0.2 compactor"
+        }"#;
+        let result: Result<StructuredCompactionOutput, _> = serde_json::from_str(json);
+        assert!(
+            result.is_ok(),
+            "unknown extra fields tolerated for forward-compat"
+        );
+    }
+
+    #[test]
+    fn structured_output_round_trips_through_json() {
+        let original = StructuredCompactionOutput {
+            objective: "test objective".into(),
+            current_truth: CurrentTruth {
+                active_files: Some("file.py".into()),
+                test_outcomes: None,
+                external_state: None,
+            },
+            compaction_metadata: CompactionMetadata {
+                schema_version: "0.1".into(),
+                generation: 1,
+                source_message_count: 10,
+            },
+            completed_decisions: None,
+            errors_to_preserve: None,
+            next_concrete_actions: None,
+            verify_criteria: None,
+            sprint_id: None,
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let back: StructuredCompactionOutput = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.objective, original.objective);
+        assert_eq!(back.current_truth.active_files, original.current_truth.active_files);
+        assert_eq!(back.compaction_metadata.generation, original.compaction_metadata.generation);
+    }
 
     // ─── #368: explicit-param CompactionConfig (no env-var reads) ─
 
