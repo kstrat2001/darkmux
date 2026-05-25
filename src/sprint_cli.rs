@@ -874,6 +874,9 @@ pub(crate) fn sprint_review_at(
         runtime_cmd: "openclaw".to_string(),
         machine: None,
         wait: true,
+        // Sprint dispatch defaults to runtime's built-in compaction;
+        // sprint context isn't tied to a profile in this entry path.
+        compaction: crate::crew::dispatch::CompactionDispatchArgs::default(),
     };
 
     // Emit dispatch flow record.

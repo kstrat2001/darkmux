@@ -57,7 +57,10 @@ fn main() -> ExitCode {
             println!("Usage:");
             println!("  darkmux-runtime --check");
             println!("  darkmux-runtime --version");
-            println!("  darkmux-runtime run --model <id> --system <text> --prompt <text> [--no-stream] [--json]");
+            println!("  darkmux-runtime run --model <id> --system <text> --prompt <text>");
+            println!("    [--no-stream] [--json] [--allowed-tools csv]");
+            println!("    [--compact-threshold-tokens N] [--compactor-model id]");
+            println!("    [--compact-threshold-ratio 0.1-0.9] [--context-window N]");
             println!();
             println!("Flags:");
             println!("  --json       Emit structured envelope on stdout (status to stderr).");
@@ -144,6 +147,18 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // in the system prompt and call `edit` anyway because the tool
     // existed in the catalog.
     let mut allowed_tools: Option<Vec<String>> = None;
+    // (#368) Compaction config flags — explicit values from the host
+    // (which derives them from `profile.runtime.compaction.*` in the
+    // typed schema landed in #357). When absent, the runtime uses
+    // CompactionConfig::default(). Env vars are NOT consulted.
+    let mut compact_threshold_tokens: Option<u32> = None;
+    let mut compactor_model: Option<String> = None;
+    // (#368) Formula-based trigger: max_history_share fraction +
+    // loaded context_window. Mirrors openclaw's `maxHistoryShare`.
+    // Both must be set for the formula trigger to activate; either
+    // missing → formula disabled, absolute-threshold-only behavior.
+    let mut compact_threshold_ratio: Option<f32> = None;
+    let mut context_window: Option<u32> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -203,6 +218,78 @@ fn run_dispatch(args: &[String]) -> ExitCode {
                     i += 2;
                 } else {
                     eprintln!("--allowed-tools requires a comma-separated list");
+                    return ExitCode::from(2);
+                }
+            }
+            "--compact-threshold-tokens" => {
+                if let Some(v) = args.get(i + 1) {
+                    match v.parse::<u32>() {
+                        Ok(n) => {
+                            compact_threshold_tokens = Some(n);
+                            i += 2;
+                        }
+                        Err(_) => {
+                            eprintln!(
+                                "--compact-threshold-tokens requires a positive integer (got: {v})"
+                            );
+                            return ExitCode::from(2);
+                        }
+                    }
+                } else {
+                    eprintln!("--compact-threshold-tokens requires a value");
+                    return ExitCode::from(2);
+                }
+            }
+            "--compactor-model" => {
+                if let Some(v) = args.get(i + 1) {
+                    compactor_model = Some(v.clone());
+                    i += 2;
+                } else {
+                    eprintln!("--compactor-model requires a value");
+                    return ExitCode::from(2);
+                }
+            }
+            "--compact-threshold-ratio" => {
+                if let Some(v) = args.get(i + 1) {
+                    match v.parse::<f32>() {
+                        Ok(f) if (0.1..=0.9).contains(&f) => {
+                            compact_threshold_ratio = Some(f);
+                            i += 2;
+                        }
+                        Ok(f) => {
+                            eprintln!(
+                                "--compact-threshold-ratio must be in range 0.1-0.9 (got: {f})"
+                            );
+                            return ExitCode::from(2);
+                        }
+                        Err(_) => {
+                            eprintln!(
+                                "--compact-threshold-ratio requires a fraction in 0.1-0.9 (got: {v})"
+                            );
+                            return ExitCode::from(2);
+                        }
+                    }
+                } else {
+                    eprintln!("--compact-threshold-ratio requires a value");
+                    return ExitCode::from(2);
+                }
+            }
+            "--context-window" => {
+                if let Some(v) = args.get(i + 1) {
+                    match v.parse::<u32>() {
+                        Ok(n) => {
+                            context_window = Some(n);
+                            i += 2;
+                        }
+                        Err(_) => {
+                            eprintln!(
+                                "--context-window requires a positive integer (got: {v})"
+                            );
+                            return ExitCode::from(2);
+                        }
+                    }
+                } else {
+                    eprintln!("--context-window requires a value");
                     return ExitCode::from(2);
                 }
             }
@@ -292,6 +379,16 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     let prompt_chars = initial_messages[1].content.as_deref().map(str::len).unwrap_or(0);
     traj.append_dispatch_start(&model, system_chars, prompt_chars);
 
+    // (#368) Compaction config from explicit CLI args; no env-var
+    // fallback (operator's tuning surface is the profile JSON, not
+    // shell env). The host's `dispatch_via_internal` derives values
+    // from `profile.runtime.compaction.*` and passes them as flags.
+    let compaction_cfg = compaction::CompactionConfig::from_overrides(
+        compact_threshold_tokens,
+        compactor_model,
+        compact_threshold_ratio,
+        context_window,
+    );
     let run_result = loop_runner::run(
         &client,
         &model,
@@ -299,6 +396,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         &tools,
         &mut traj,
         streaming,
+        &compaction_cfg,
     );
 
     let outcome = match run_result {

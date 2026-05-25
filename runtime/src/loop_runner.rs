@@ -104,6 +104,7 @@ pub fn run(
     tools: &[Tool],
     trajectory: &mut Trajectory,
     streaming: bool,
+    compaction_cfg: &compaction::CompactionConfig,
 ) -> Result<LoopOutcome> {
     let mut messages = initial_messages;
     let tool_defs: Vec<_> = tools.iter().map(|t| t.to_tool_def()).collect();
@@ -263,10 +264,14 @@ pub fn run(
                 // whether the conversation is long enough to compact.
                 // If so, compact BEFORE the next chat() call so the
                 // next request sees a smaller message thread.
-                if compaction::needs_compaction(latest_prompt_tokens, messages.len()) {
+                if compaction::needs_compaction(
+                    latest_prompt_tokens,
+                    messages.len(),
+                    compaction_cfg,
+                ) {
                     let before_count = messages.len();
                     compactions = compactions.saturating_add(1);
-                    compaction::compact(client, &mut messages, compactions)?;
+                    compaction::compact(client, &mut messages, compactions, compaction_cfg)?;
                     let after_count = messages.len();
                     // Approximate summary_chars from the inserted
                     // synthetic user message (the last 5-from-end
@@ -675,7 +680,8 @@ mod tests {
         let initial = vec![Message::system("test"), Message::user("loop forever")];
         let tools = [Tool::Read];
 
-        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false)
+        let cfg = compaction::CompactionConfig::default();
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg)
             .expect("MAX_TURNS path returns Ok(outcome), not Err");
 
         assert_eq!(
@@ -722,7 +728,8 @@ mod tests {
         ];
         let tools = [Tool::Read, Tool::Edit, Tool::Bash];
 
-        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false)
+        let cfg = compaction::CompactionConfig::default();
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg)
             .expect("loop should terminate cleanly on first-turn stop");
 
         stop_mock.assert();
@@ -741,57 +748,29 @@ mod tests {
     ///   4. compactor returns summary
     ///   5. primary returns stop
     ///
-    /// We set DARKMUX_RUNTIME_COMPACT_THRESHOLD_TOKENS=1000 so the
-    /// mock doesn't have to fake huge prompt sizes. Distinguishes the
-    /// compactor call from primary calls by inspecting the request's
-    /// `model` field — they differ.
+    /// We pass an explicit `CompactionConfig { threshold_tokens: 1000,
+    /// compactor_model: "test-compactor" }` so the mock doesn't have
+    /// to fake huge prompt sizes. Distinguishes the compactor call
+    /// from primary calls by inspecting the request's `model` field —
+    /// they differ.
+    ///
+    /// Pre-#368 this test set/unset
+    /// `DARKMUX_RUNTIME_COMPACT_THRESHOLD_TOKENS` env var with a 40-
+    /// line EnvGuard for restore-on-drop and required serial
+    /// execution. Post-#368 the runtime reads compaction config from
+    /// explicit params (no env), so this is just a struct literal.
     ///
     /// Asserts:
     ///   - outcome.compactions == 1
     ///   - compactor mock was hit exactly once
     ///   - primary mock was hit at least twice (before + after compaction)
     #[test]
-    #[serial_test::serial]
     fn loop_triggers_compaction_when_threshold_crossed() {
-        // Lower threshold so the mock's reported prompt_tokens (small
-        // integer) crosses it without us having to forge 60K-token
-        // responses. Body-of-test reset after.
-        let prev = std::env::var("DARKMUX_RUNTIME_COMPACT_THRESHOLD_TOKENS").ok();
-        // SAFETY: #[serial_test::serial] keeps the test single-threaded
-        // across the test binary.
-        unsafe {
-            std::env::set_var("DARKMUX_RUNTIME_COMPACT_THRESHOLD_TOKENS", "1000");
-        }
-        // Override the compactor model id so the mock can route on it.
-        let prev_compactor = std::env::var("DARKMUX_RUNTIME_COMPACTOR_MODEL").ok();
-        unsafe {
-            std::env::set_var(
-                "DARKMUX_RUNTIME_COMPACTOR_MODEL",
-                "test-compactor",
-            );
-        }
-        // Restore on drop, even if assertion panics.
-        struct EnvGuard {
-            prev_threshold: Option<String>,
-            prev_compactor: Option<String>,
-        }
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                unsafe {
-                    match &self.prev_threshold {
-                        Some(v) => std::env::set_var("DARKMUX_RUNTIME_COMPACT_THRESHOLD_TOKENS", v),
-                        None => std::env::remove_var("DARKMUX_RUNTIME_COMPACT_THRESHOLD_TOKENS"),
-                    }
-                    match &self.prev_compactor {
-                        Some(v) => std::env::set_var("DARKMUX_RUNTIME_COMPACTOR_MODEL", v),
-                        None => std::env::remove_var("DARKMUX_RUNTIME_COMPACTOR_MODEL"),
-                    }
-                }
-            }
-        }
-        let _guard = EnvGuard {
-            prev_threshold: prev,
-            prev_compactor,
+        let cfg = compaction::CompactionConfig {
+            threshold_tokens: 1000,
+            compactor_model: "test-compactor".to_string(),
+            threshold_ratio: None,
+            context_window: None,
         };
 
         let server = MockServer::start();
@@ -869,7 +848,7 @@ mod tests {
         // tool_calls; will hit MAX_TURNS); we don't care about the
         // outcome's Ok/Err — just whether the compactor was invoked
         // along the way. The result IS the side-effect assertion below.
-        let outcome = run(&client, "test-primary", initial, &tools, &mut traj, false);
+        let outcome = run(&client, "test-primary", initial, &tools, &mut traj, false, &cfg);
 
         // Core assertion: compactor was invoked at least once. This is
         // the layer-boundary signal — the runtime's loop translated

@@ -89,8 +89,30 @@ pub struct ReserveConfig {
 pub struct RuntimeCompactionConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strategy: Option<String>,
+    /// Absolute compaction trigger in tokens (hard ceiling). When
+    /// `latest_prompt_tokens` reaches this, compaction fires —
+    /// regardless of loaded context window. Sibling to
+    /// `threshold_ratio` (the adaptive scale-with-context-window
+    /// variant); either fires first wins. Documented as the rarely-
+    /// needed power-user override; ratio is the recommended primary
+    /// tuning surface. (#357 + #368)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threshold_tokens: Option<u64>,
+    /// Compaction trigger as a fraction of the loaded primary's
+    /// context window (e.g. 0.6 = fire when prompt reaches 60% of
+    /// context). Adaptive — scales naturally across 50K / 100K / 200K
+    /// model loads without per-load retuning. Sibling to
+    /// `threshold_tokens` (the absolute hard ceiling); either fires
+    /// first wins.
+    ///
+    /// Range 0.1-0.9 (mirrors openclaw's range for similar fields).
+    /// Defaults: unset → only the absolute threshold trigger applies.
+    /// Replaces the operator-frustrating openclaw-shape
+    /// `maxHistoryShare` extras passthrough — darkmux owns this knob
+    /// with a name that reflects what it actually does (a TRIGGER, not
+    /// openclaw's post-compaction history cap). (#368 clean break)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold_ratio: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier1: Option<Tier1Config>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

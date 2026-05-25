@@ -320,6 +320,94 @@ pub struct DispatchOpts {
     /// Ignored when the dispatch runs locally — local dispatches are
     /// always synchronous.
     pub wait: bool,
+    /// Compaction config to pass to the internal runtime (#368). Each
+    /// field is operator-derived from the active
+    /// `profile.runtime.compaction.*` and translated to a runtime CLI
+    /// flag. When `None`, the runtime falls back to its default. Env
+    /// vars are NOT consulted by the runtime — the operator's tuning
+    /// surface is the profile JSON, with these struct fields as the
+    /// in-process plumbing layer between profile-read and CLI-emit.
+    ///
+    /// Ignored when `runtime == Runtime::Openclaw` (openclaw's
+    /// compaction config lives in its own `openclaw.json`).
+    pub compaction: CompactionDispatchArgs,
+}
+
+/// Host-side compaction config passthrough to the internal runtime
+/// (#368). Each field maps 1:1 to a runtime CLI flag. The host
+/// constructs from a `Profile`; `crew::dispatch_internal::dispatch`
+/// translates to `--compact-threshold-tokens N`, `--compactor-model
+/// id`, `--compact-max-history-share f`, `--context-window N` flags.
+///
+/// All optional: `None` ⇒ don't pass the flag ⇒ runtime uses its
+/// hardcoded default for that knob.
+#[derive(Debug, Clone, Default)]
+pub struct CompactionDispatchArgs {
+    /// Absolute trigger. Set from `profile.runtime.compaction.threshold_tokens`
+    /// (typed v0.1 field, #357).
+    pub threshold_tokens: Option<u32>,
+    /// Compactor model override. Set from
+    /// `profile.runtime.compaction.extras["model"]` (openclaw-shape
+    /// passthrough; the typed schema in #357 didn't promote `model` to
+    /// a typed field since it's openclaw-flavored).
+    pub compactor_model: Option<String>,
+    /// Adaptive-trigger fraction (0.1-0.9). Set from typed
+    /// `profile.runtime.compaction.threshold_ratio` (#368 clean
+    /// break — no openclaw-shape `maxHistoryShare` extras fallback).
+    pub threshold_ratio: Option<f32>,
+    /// Primary model's loaded context window. Set from
+    /// `profile.models[primary].n_ctx`. Required for the formula
+    /// trigger to compute; absent ⇒ formula trigger is disabled
+    /// even when `threshold_ratio` is set.
+    pub context_window: Option<u32>,
+}
+
+impl CompactionDispatchArgs {
+    /// Derive from a profile (operator's tuning source-of-truth).
+    /// Reads the typed `threshold_tokens` field plus the operator-
+    /// supplied openclaw-shape passthroughs (`maxHistoryShare`,
+    /// `model`) from the `extras` map. Picks the primary model's
+    /// `n_ctx` as the context_window (needed for formula trigger).
+    pub fn from_profile(profile: &crate::types::Profile) -> Self {
+        use crate::types::ModelRole;
+        let comp = profile.runtime.as_ref().and_then(|r| r.compaction.as_ref());
+        let threshold_tokens = comp
+            .and_then(|c| c.threshold_tokens)
+            .and_then(|v| u32::try_from(v).ok());
+        // (#368 clean break) Compactor model is NOT read from
+        // openclaw-shape `extras["model"]`. Openclaw convention
+        // prefixes the id with `lmstudio/` (e.g.
+        // `lmstudio/qwen3-4b-instruct-2507`), which LMStudio's direct
+        // chat-completions API doesn't recognize — produces HTTP 400
+        // on the compactor call. Silently translating across that
+        // format boundary would mask operator intent. Until #368.x
+        // adds a typed `compaction.compactor_model` field, the runtime
+        // uses its hardcoded default `darkmux:qwen3-4b-instruct-2507`,
+        // which matches what LMStudio has loaded in the standard
+        // `darkmux swap`-based workflow. Surfaced by Beat-39 smoke
+        // dispatch (2026-05-25): turn 4's compactor call failed with
+        // HTTP 400 when this read-from-extras was active.
+        let compactor_model: Option<String> = None;
+        // (#368 clean break) Read from the typed schema field, NOT
+        // openclaw-shape extras. Operators wanting the adaptive
+        // trigger set `profile.runtime.compaction.threshold_ratio`
+        // directly. The openclaw-passthrough `maxHistoryShare` is a
+        // SEPARATE concept (their post-compaction history cap, not
+        // a pre-compaction trigger) and would be confusing to silently
+        // map across the semantic boundary.
+        let threshold_ratio = comp.and_then(|c| c.threshold_ratio).map(|f| f as f32);
+        let context_window = profile
+            .models
+            .iter()
+            .find(|m| matches!(m.role, ModelRole::Primary))
+            .map(|m| m.n_ctx);
+        Self {
+            threshold_tokens,
+            compactor_model,
+            threshold_ratio,
+            context_window,
+        }
+    }
 }
 
 /// One file's state for the watched-paths summary (#89).
@@ -3264,6 +3352,7 @@ mod tests {
             runtime_cmd: "openclaw".to_string(),
             machine: None,
             wait: true,
+            compaction: CompactionDispatchArgs::default(),
         }
     }
 

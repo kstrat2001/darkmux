@@ -37,6 +37,30 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// hardening lands.
 const RUNTIME_IMAGE: &str = "darkmux-runtime:latest";
 
+/// (#368) Translate the host-side `CompactionDispatchArgs` into
+/// runtime CLI flags. Each `Some(v)` becomes a `--flag v` pair on
+/// the docker run command; `None` is omitted so the runtime falls
+/// back to its hardcoded default for that knob. Extracted from the
+/// docker-spawn site so the translation rule is unit-testable
+/// without spawning a container.
+fn apply_compaction_flags(
+    cmd: &mut Command,
+    compaction: &crate::crew::dispatch::CompactionDispatchArgs,
+) {
+    if let Some(n) = compaction.threshold_tokens {
+        cmd.arg("--compact-threshold-tokens").arg(n.to_string());
+    }
+    if let Some(model) = &compaction.compactor_model {
+        cmd.arg("--compactor-model").arg(model);
+    }
+    if let Some(share) = compaction.threshold_ratio {
+        cmd.arg("--compact-threshold-ratio").arg(share.to_string());
+    }
+    if let Some(window) = compaction.context_window {
+        cmd.arg("--context-window").arg(window.to_string());
+    }
+}
+
 /// Default per-dispatch wall-clock deadline. 10 minutes covers
 /// realistic long-agentic dispatches (Article-2 era `long-agentic`
 /// historical slow_cluster_seconds maxed ~950s, so 600s is conservative
@@ -254,6 +278,13 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         );
         cmd.arg("--allowed-tools").arg(csv);
     }
+    // (#368) Compaction config passthrough to the runtime CLI. Each
+    // flag is optional: when the operator's profile didn't set a
+    // value, no flag is passed and the runtime uses its hardcoded
+    // default. End-state: operator tunes via profile JSON → these
+    // four flags flow into the container → no env vars touch the
+    // surface anywhere.
+    apply_compaction_flags(&mut cmd, &opts.compaction);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let child = cmd.spawn().context("spawning darkmux-runtime container")?;
@@ -905,6 +936,213 @@ mod tests {
     use serial_test::serial;
     use std::io::Write;
     use tempfile::TempDir;
+
+    // ─── #368: compaction-flag passthrough to runtime CLI ────────────
+
+    fn args_of(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn apply_compaction_flags_omits_when_all_none() {
+        let mut cmd = Command::new("docker");
+        let compaction = crate::crew::dispatch::CompactionDispatchArgs::default();
+        apply_compaction_flags(&mut cmd, &compaction);
+        let args = args_of(&cmd);
+        assert!(
+            !args.iter().any(|a| a.starts_with("--compact") || a == "--context-window"),
+            "default config should emit no compaction flags; got {args:?}"
+        );
+    }
+
+    #[test]
+    fn apply_compaction_flags_emits_threshold_when_set() {
+        let mut cmd = Command::new("docker");
+        let compaction = crate::crew::dispatch::CompactionDispatchArgs {
+            threshold_tokens: Some(35_000),
+            ..Default::default()
+        };
+        apply_compaction_flags(&mut cmd, &compaction);
+        let args = args_of(&cmd);
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--compact-threshold-tokens" && w[1] == "35000"),
+            "expected --compact-threshold-tokens 35000; got {args:?}"
+        );
+    }
+
+    #[test]
+    fn apply_compaction_flags_emits_all_when_set() {
+        let mut cmd = Command::new("docker");
+        let compaction = crate::crew::dispatch::CompactionDispatchArgs {
+            threshold_tokens: Some(45_000),
+            compactor_model: Some("custom-compactor".to_string()),
+            threshold_ratio: Some(0.35),
+            context_window: Some(101_000),
+        };
+        apply_compaction_flags(&mut cmd, &compaction);
+        let args = args_of(&cmd);
+        assert!(args.iter().any(|a| a == "--compact-threshold-tokens"));
+        assert!(args.iter().any(|a| a == "45000"));
+        assert!(args.iter().any(|a| a == "--compactor-model"));
+        assert!(args.iter().any(|a| a == "custom-compactor"));
+        assert!(args.iter().any(|a| a == "--compact-threshold-ratio"));
+        assert!(args.iter().any(|a| a == "--context-window"));
+        assert!(args.iter().any(|a| a == "101000"));
+    }
+
+    #[test]
+    fn from_profile_derives_typed_threshold() {
+        use crate::types::{
+            ModelRole, Profile, ProfileModel, ProfileRuntime, RuntimeCompactionConfig,
+        };
+        let profile = Profile {
+            description: None,
+            models: vec![ProfileModel {
+                id: "primary-x".into(),
+                n_ctx: 100_000,
+                role: ModelRole::Primary,
+                identifier: None,
+            }],
+            runtime: Some(ProfileRuntime {
+                config_path: None,
+                context_tokens: None,
+                compaction: Some(RuntimeCompactionConfig {
+                    strategy: None,
+                    threshold_tokens: Some(40_000),
+                    threshold_ratio: None,
+                    tier1: None,
+                    tier2: None,
+                    reserve: None,
+                    extras: Default::default(),
+                }),
+            }),
+            use_when: None,
+        };
+        let args = crate::crew::dispatch::CompactionDispatchArgs::from_profile(&profile);
+        assert_eq!(args.threshold_tokens, Some(40_000));
+        assert_eq!(args.context_window, Some(100_000), "primary n_ctx");
+    }
+
+    #[test]
+    fn from_profile_derives_typed_threshold_ratio() {
+        // (#368 clean break) `threshold_ratio` reads ONLY from the
+        // typed schema field. `compactor_model` does NOT read from
+        // extras at all (Beat-39 smoke caught HTTP 400 when openclaw's
+        // `lmstudio/<id>` format was passed to LMStudio's direct API
+        // which only knows the bare/namespaced form). Until a typed
+        // `compaction.compactor_model` lands, runtime uses default.
+        use crate::types::{
+            ModelRole, Profile, ProfileModel, ProfileRuntime, RuntimeCompactionConfig,
+        };
+        let mut extras = serde_json::Map::new();
+        // This openclaw-flavored value must NOT influence the dispatch.
+        extras.insert(
+            "model".into(),
+            serde_json::json!("lmstudio/qwen3-4b-instruct-2507"),
+        );
+        let profile = Profile {
+            description: None,
+            models: vec![ProfileModel {
+                id: "primary-x".into(),
+                n_ctx: 101_000,
+                role: ModelRole::Primary,
+                identifier: None,
+            }],
+            runtime: Some(ProfileRuntime {
+                config_path: None,
+                context_tokens: None,
+                compaction: Some(RuntimeCompactionConfig {
+                    strategy: None,
+                    threshold_tokens: None,
+                    threshold_ratio: Some(0.35),
+                    tier1: None,
+                    tier2: None,
+                    reserve: None,
+                    extras,
+                }),
+            }),
+            use_when: None,
+        };
+        let args = crate::crew::dispatch::CompactionDispatchArgs::from_profile(&profile);
+        assert_eq!(args.threshold_ratio, Some(0.35));
+        assert!(
+            args.compactor_model.is_none(),
+            "clean break: openclaw extras `model` must NOT auto-populate compactor_model \
+             (would pass `lmstudio/<id>` prefix to LMStudio's direct API → HTTP 400)"
+        );
+        assert_eq!(args.context_window, Some(101_000));
+    }
+
+    /// (#368 clean break invariant) When ONLY `extras["maxHistoryShare"]`
+    /// is set — no typed `threshold_ratio` — the host MUST NOT silently
+    /// translate openclaw's history-cap to darkmux's pre-trigger ratio.
+    /// They're different concepts; mapping across would surface in
+    /// methodology citations as "this run tuned to X" when the operator
+    /// never actually expressed X in the darkmux-side surface.
+    #[test]
+    fn from_profile_ignores_openclaw_maxhistoryshare_extras() {
+        use crate::types::{
+            ModelRole, Profile, ProfileModel, ProfileRuntime, RuntimeCompactionConfig,
+        };
+        let mut extras = serde_json::Map::new();
+        // Operator carries openclaw's historical config — this should
+        // pass through untouched in extras (for any downstream
+        // openclaw-aware consumer) but NOT influence darkmux's trigger.
+        extras.insert("maxHistoryShare".into(), serde_json::json!(0.35));
+        let profile = Profile {
+            description: None,
+            models: vec![ProfileModel {
+                id: "primary-x".into(),
+                n_ctx: 100_000,
+                role: ModelRole::Primary,
+                identifier: None,
+            }],
+            runtime: Some(ProfileRuntime {
+                config_path: None,
+                context_tokens: None,
+                compaction: Some(RuntimeCompactionConfig {
+                    strategy: None,
+                    threshold_tokens: None,
+                    threshold_ratio: None,
+                    tier1: None,
+                    tier2: None,
+                    reserve: None,
+                    extras,
+                }),
+            }),
+            use_when: None,
+        };
+        let args = crate::crew::dispatch::CompactionDispatchArgs::from_profile(&profile);
+        assert!(
+            args.threshold_ratio.is_none(),
+            "clean break: openclaw extras must NOT auto-populate threshold_ratio"
+        );
+    }
+
+    #[test]
+    fn from_profile_handles_missing_compaction_block() {
+        use crate::types::{ModelRole, Profile, ProfileModel};
+        let profile = Profile {
+            description: None,
+            models: vec![ProfileModel {
+                id: "primary-x".into(),
+                n_ctx: 50_000,
+                role: ModelRole::Primary,
+                identifier: None,
+            }],
+            runtime: None,
+            use_when: None,
+        };
+        let args = crate::crew::dispatch::CompactionDispatchArgs::from_profile(&profile);
+        assert!(args.threshold_tokens.is_none());
+        assert!(args.compactor_model.is_none());
+        assert!(args.threshold_ratio.is_none());
+        // Primary n_ctx still captured even without compaction block.
+        assert_eq!(args.context_window, Some(50_000));
+    }
 
     // ─── #363: dispatch wall-clock deadline ────────────────────────────
 

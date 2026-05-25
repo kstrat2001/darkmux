@@ -209,6 +209,10 @@ fn dispatch_compiler(input: &str, hint: Option<&str>) -> Result<String> {
         runtime_cmd: "openclaw".to_string(),
         machine: None,
         wait: true,
+        // Mission-compile dispatch uses runtime-default compaction;
+        // mission-compiler role is admin-tier and doesn't accumulate
+        // large per-turn context.
+        compaction: crate::crew::dispatch::CompactionDispatchArgs::default(),
     };
     let dispatch_result = crate::crew::dispatch::dispatch(opts);
 

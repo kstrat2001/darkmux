@@ -181,6 +181,11 @@ fn dispatch_via_internal(
         runtime_cmd: "openclaw".to_string(),
         machine: None,
         wait: true,
+        // Prompt-only workloads don't accumulate context across turns
+        // (single-shot dispatches); leaving compaction at runtime
+        // defaults is fine. If future prompt workloads grow multi-
+        // turn, derive from profile like coding_task does.
+        compaction: crate::crew::dispatch::CompactionDispatchArgs::default(),
     };
     let result = dispatch(opts).context("internal-runtime dispatch via lab harness")?;
     Ok((result.stdout, result.stderr, result.exit_code == 0))

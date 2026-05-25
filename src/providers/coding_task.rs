@@ -225,10 +225,23 @@ impl WorkloadProvider for CodingTaskProvider {
         let started = std::time::Instant::now();
         let (stdout, stderr, ok) = match runtime {
             crate::crew::dispatch::Runtime::Internal => {
+                // (#368) Derive compaction config from the active
+                // profile so the runtime honors operator's
+                // profile.runtime.compaction.* without env-var
+                // gymnastics. Profile is the operator's tuning
+                // source-of-truth; this is the host-side bridge.
+                let compaction =
+                    crate::crew::dispatch::CompactionDispatchArgs::from_profile(profile);
                 // Pass sandbox_dir as --workdir so the runtime mounts
                 // it at /workspace, matching the placeholder
                 // substitution above (#337 fix).
-                dispatch_via_internal(&role, &prompt, &session_id, Some(sandbox_dir.to_path_buf()))?
+                dispatch_via_internal(
+                    &role,
+                    &prompt,
+                    &session_id,
+                    Some(sandbox_dir.to_path_buf()),
+                    compaction,
+                )?
             }
             crate::crew::dispatch::Runtime::Openclaw => {
                 dispatch_via_openclaw(runtime_cmd, &role, &prompt, &session_id)?
@@ -626,6 +639,7 @@ fn dispatch_via_internal(
     prompt: &str,
     session_id: &str,
     workdir: Option<PathBuf>,
+    compaction: crate::crew::dispatch::CompactionDispatchArgs,
 ) -> Result<(String, String, bool)> {
     use crate::crew::dispatch::{dispatch, DispatchOpts, Runtime};
     let opts = DispatchOpts {
@@ -643,6 +657,7 @@ fn dispatch_via_internal(
         runtime_cmd: "openclaw".to_string(),
         machine: None,
         wait: true,
+        compaction,
     };
     let result = dispatch(opts).context("internal-runtime dispatch via lab harness")?;
     Ok((result.stdout, result.stderr, result.exit_code == 0))
