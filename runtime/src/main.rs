@@ -159,6 +159,11 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // missing → formula disabled, absolute-threshold-only behavior.
     let mut compact_threshold_ratio: Option<f32> = None;
     let mut context_window: Option<u32> = None;
+    // (#372 T2-C) Compaction strategy override. When None, runtime
+    // uses default Narrative; operator opts into tier-2 by setting
+    // `profile.runtime.compaction.strategy: "structured-slot"` which
+    // host plumbs via `--compact-strategy structured-slot`.
+    let mut compact_strategy: Option<compaction::CompactionStrategy> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -293,6 +298,25 @@ fn run_dispatch(args: &[String]) -> ExitCode {
                     return ExitCode::from(2);
                 }
             }
+            "--compact-strategy" => {
+                if let Some(v) = args.get(i + 1) {
+                    match compaction::CompactionStrategy::from_cli_str(v) {
+                        Ok(s) => {
+                            compact_strategy = Some(s);
+                            i += 2;
+                        }
+                        Err(msg) => {
+                            eprintln!("--compact-strategy: {msg}");
+                            return ExitCode::from(2);
+                        }
+                    }
+                } else {
+                    eprintln!(
+                        "--compact-strategy requires a value (`narrative` or `structured-slot`)"
+                    );
+                    return ExitCode::from(2);
+                }
+            }
             other => {
                 eprintln!("unknown flag: {other}");
                 return ExitCode::from(2);
@@ -388,6 +412,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         compactor_model,
         compact_threshold_ratio,
         context_window,
+        compact_strategy,
     );
     let run_result = loop_runner::run(
         &client,

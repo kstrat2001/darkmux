@@ -272,11 +272,46 @@ pub fn run(
                 ) {
                     let before_count = messages.len();
                     compactions = compactions.saturating_add(1);
-                    compaction::compact(client, &mut messages, compactions, compaction_cfg)?;
+                    // (#372 T2-C) Route by strategy. Narrative is
+                    // today's default (prose summary as synthetic
+                    // USER message). StructuredSlot is tier-2 (typed
+                    // schema + JSON mode + SYSTEM message); on
+                    // success the parsed output is persisted to
+                    // `/workspace/.darkmux-runtime/compaction-<gen>.json`
+                    // per #352 Step 5 "persistence falls out for free."
+                    match compaction_cfg.strategy {
+                        compaction::CompactionStrategy::Narrative => {
+                            compaction::compact(
+                                client,
+                                &mut messages,
+                                compactions,
+                                compaction_cfg,
+                            )?;
+                        }
+                        compaction::CompactionStrategy::StructuredSlot => {
+                            let parsed = compaction::structured_compact(
+                                client,
+                                &mut messages,
+                                compactions,
+                                compaction_cfg,
+                            )?;
+                            // Persist the JSON for downstream
+                            // consumers (replay, methodology
+                            // research, cross-sprint memory). Best-
+                            // effort: a write failure logs but does
+                            // NOT fail the dispatch — observability,
+                            // not correctness.
+                            persist_structured_compaction_output(
+                                std::path::Path::new("/workspace/.darkmux-runtime"),
+                                compactions,
+                                &parsed,
+                            );
+                        }
+                    }
                     let after_count = messages.len();
                     // Approximate summary_chars from the inserted
-                    // synthetic user message (the last 5-from-end
-                    // position; head + 1 synthetic + tail-4).
+                    // synthetic message at PRESERVE_HEAD position
+                    // (works for both Narrative=user + StructuredSlot=system).
                     let summary_chars = messages
                         .get(2)
                         .and_then(|m| m.content.as_ref())
@@ -405,6 +440,41 @@ fn measure_request_context(messages: &[Message]) -> (usize, usize) {
     (system_chars, prompt_chars)
 }
 
+/// (#372 T2-C) Best-effort write of the parsed structured-compaction
+/// output to `<runtime_dir>/compaction-<generation>.json`. Creates
+/// the parent directory if needed. Write failures log to stderr but
+/// do NOT propagate — persistence is observability (replay,
+/// methodology research, cross-sprint memory) not correctness, per
+/// #352 "persistence falls out for free" framing.
+fn persist_structured_compaction_output(
+    runtime_dir: &std::path::Path,
+    generation: u32,
+    output: &compaction::StructuredCompactionOutput,
+) {
+    if let Err(e) = std::fs::create_dir_all(runtime_dir) {
+        eprintln!(
+            "darkmux-runtime: persist compaction #{generation} — create dir failed: {e}"
+        );
+        return;
+    }
+    let path = runtime_dir.join(format!("compaction-{generation}.json"));
+    let json = match serde_json::to_string_pretty(output) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!(
+                "darkmux-runtime: persist compaction #{generation} — serialize failed: {e}"
+            );
+            return;
+        }
+    };
+    if let Err(e) = std::fs::write(&path, json) {
+        eprintln!(
+            "darkmux-runtime: persist compaction #{generation} — write to {} failed: {e}",
+            path.display()
+        );
+    }
+}
+
 /// Extract `<think>...</think>` block contents from a string. Returns
 /// each block's inner text (without the tags) in order. Returns empty
 /// vec when no blocks are present.
@@ -439,6 +509,70 @@ fn extract_think_blocks(content: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::lmstudio::{FunctionCall, ToolCall};
+
+    // ─── #372 T2-C: persist_structured_compaction_output ──────────
+
+    use crate::compaction::{CompactionMetadata, CurrentTruth, StructuredCompactionOutput};
+
+    fn dummy_structured_output(generation: u32) -> StructuredCompactionOutput {
+        StructuredCompactionOutput {
+            objective: "test obj".into(),
+            current_truth: CurrentTruth::default(),
+            compaction_metadata: CompactionMetadata {
+                schema_version: "0.1".into(),
+                generation,
+                source_message_count: 5,
+            },
+            completed_decisions: None,
+            errors_to_preserve: None,
+            next_concrete_actions: None,
+            verify_criteria: None,
+            sprint_id: None,
+        }
+    }
+
+    #[test]
+    fn persist_writes_compaction_json_to_runtime_dir() {
+        let tmp = tempdir::TempDir::new("persist-compaction").unwrap();
+        let runtime_dir = tmp.path().join(".darkmux-runtime");
+        let out = dummy_structured_output(3);
+        persist_structured_compaction_output(&runtime_dir, 3, &out);
+        let written = runtime_dir.join("compaction-3.json");
+        assert!(
+            written.exists(),
+            "expected compaction-3.json at {}",
+            written.display()
+        );
+        let body = std::fs::read_to_string(&written).unwrap();
+        let parsed: StructuredCompactionOutput =
+            serde_json::from_str(&body).expect("written JSON round-trips");
+        assert_eq!(parsed.compaction_metadata.generation, 3);
+        assert_eq!(parsed.objective, "test obj");
+    }
+
+    #[test]
+    fn persist_creates_runtime_dir_if_missing() {
+        let tmp = tempdir::TempDir::new("persist-mkdir").unwrap();
+        // Subdir that doesn't exist yet — persist must create it.
+        let runtime_dir = tmp.path().join("nested").join("not-yet").join(".darkmux-runtime");
+        let out = dummy_structured_output(1);
+        persist_structured_compaction_output(&runtime_dir, 1, &out);
+        assert!(runtime_dir.join("compaction-1.json").exists());
+    }
+
+    #[test]
+    fn persist_silently_skips_when_dir_unwritable() {
+        // Path under a regular file (can't be a dir) — write should
+        // fail silently, NOT panic or propagate. Persistence is
+        // observability, not correctness.
+        let tmp = tempdir::TempDir::new("persist-unwritable").unwrap();
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, b"i am a file not a dir").unwrap();
+        let runtime_dir = blocker.join("under-a-file");
+        let out = dummy_structured_output(2);
+        // Should NOT panic.
+        persist_structured_compaction_output(&runtime_dir, 2, &out);
+    }
 
     // ─── measure_request_context (#361 fix) ─────────────────────────
 
@@ -772,6 +906,7 @@ mod tests {
             compactor_model: "test-compactor".to_string(),
             threshold_ratio: None,
             context_window: None,
+            strategy: compaction::CompactionStrategy::Narrative,
         };
 
         let server = MockServer::start();
