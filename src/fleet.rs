@@ -1255,6 +1255,12 @@ impl WorkJob {
             // ping-pong jobs back to redis); always run local synchronous.
             machine: None,
             wait: true,
+            // Fleet-deserialized dispatch jobs: producer didn't
+            // capture compaction config (pre-#368 wire shape). Use
+            // runtime defaults. Future iteration could propagate via
+            // the job payload if cross-machine compaction tuning
+            // becomes a real requirement.
+            compaction: crate::crew::dispatch::CompactionDispatchArgs::default(),
         }
     }
 }

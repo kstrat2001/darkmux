@@ -2131,6 +2131,10 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
                 runtime_cmd,
                 machine,
                 wait: !no_wait,
+                // Bare `crew dispatch` doesn't carry a profile in
+                // context; runtime falls back to its hardcoded
+                // defaults. Lab + sprint paths derive from profile.
+                compaction: crew::dispatch::CompactionDispatchArgs::default(),
             };
             let result = crew::dispatch::dispatch(opts)?;
             // Announce the resolved session id on stderr so operators see

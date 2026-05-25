@@ -197,6 +197,9 @@ fn dispatch_draft_via_internal(role: &str, prompt: &str, session_id: &str) -> Re
         runtime_cmd: "openclaw".to_string(),
         machine: None,
         wait: true,
+        // Notebook draft is single-shot prompt-style; compaction
+        // defaults are fine.
+        compaction: crate::crew::dispatch::CompactionDispatchArgs::default(),
     };
     let result = crate::crew::dispatch::dispatch(opts)
         .context("internal-runtime dispatch for notebook draft")?;

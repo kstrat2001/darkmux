@@ -320,6 +320,79 @@ pub struct DispatchOpts {
     /// Ignored when the dispatch runs locally — local dispatches are
     /// always synchronous.
     pub wait: bool,
+    /// Compaction config to pass to the internal runtime (#368). Each
+    /// field is operator-derived from the active
+    /// `profile.runtime.compaction.*` and translated to a runtime CLI
+    /// flag. When `None`, the runtime falls back to its default. Env
+    /// vars are NOT consulted by the runtime — the operator's tuning
+    /// surface is the profile JSON, with these struct fields as the
+    /// in-process plumbing layer between profile-read and CLI-emit.
+    ///
+    /// Ignored when `runtime == Runtime::Openclaw` (openclaw's
+    /// compaction config lives in its own `openclaw.json`).
+    pub compaction: CompactionDispatchArgs,
+}
+
+/// Host-side compaction config passthrough to the internal runtime
+/// (#368). Each field maps 1:1 to a runtime CLI flag. The host
+/// constructs from a `Profile`; `crew::dispatch_internal::dispatch`
+/// translates to `--compact-threshold-tokens N`, `--compactor-model
+/// id`, `--compact-max-history-share f`, `--context-window N` flags.
+///
+/// All optional: `None` ⇒ don't pass the flag ⇒ runtime uses its
+/// hardcoded default for that knob.
+#[derive(Debug, Clone, Default)]
+pub struct CompactionDispatchArgs {
+    /// Absolute trigger. Set from `profile.runtime.compaction.threshold_tokens`
+    /// (typed v0.1 field, #357).
+    pub threshold_tokens: Option<u32>,
+    /// Compactor model override. Set from
+    /// `profile.runtime.compaction.extras["model"]` (openclaw-shape
+    /// passthrough; the typed schema in #357 didn't promote `model` to
+    /// a typed field since it's openclaw-flavored).
+    pub compactor_model: Option<String>,
+    /// Formula-trigger fraction (0.1-0.9). Set from
+    /// `profile.runtime.compaction.extras["maxHistoryShare"]`.
+    pub max_history_share: Option<f32>,
+    /// Primary model's loaded context window. Set from
+    /// `profile.models[primary].n_ctx`. Required for the formula
+    /// trigger to compute; absent ⇒ formula trigger is disabled
+    /// even when `max_history_share` is set.
+    pub context_window: Option<u32>,
+}
+
+impl CompactionDispatchArgs {
+    /// Derive from a profile (operator's tuning source-of-truth).
+    /// Reads the typed `threshold_tokens` field plus the operator-
+    /// supplied openclaw-shape passthroughs (`maxHistoryShare`,
+    /// `model`) from the `extras` map. Picks the primary model's
+    /// `n_ctx` as the context_window (needed for formula trigger).
+    pub fn from_profile(profile: &crate::types::Profile) -> Self {
+        use crate::types::ModelRole;
+        let comp = profile.runtime.as_ref().and_then(|r| r.compaction.as_ref());
+        let threshold_tokens = comp
+            .and_then(|c| c.threshold_tokens)
+            .and_then(|v| u32::try_from(v).ok());
+        let compactor_model = comp
+            .and_then(|c| c.extras.get("model"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let max_history_share = comp
+            .and_then(|c| c.extras.get("maxHistoryShare"))
+            .and_then(|v| v.as_f64())
+            .map(|f| f as f32);
+        let context_window = profile
+            .models
+            .iter()
+            .find(|m| matches!(m.role, ModelRole::Primary))
+            .map(|m| m.n_ctx);
+        Self {
+            threshold_tokens,
+            compactor_model,
+            max_history_share,
+            context_window,
+        }
+    }
 }
 
 /// One file's state for the watched-paths summary (#89).
@@ -3264,6 +3337,7 @@ mod tests {
             runtime_cmd: "openclaw".to_string(),
             machine: None,
             wait: true,
+            compaction: CompactionDispatchArgs::default(),
         }
     }
 
