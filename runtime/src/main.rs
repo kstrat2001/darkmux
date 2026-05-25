@@ -57,7 +57,9 @@ fn main() -> ExitCode {
             println!("Usage:");
             println!("  darkmux-runtime --check");
             println!("  darkmux-runtime --version");
-            println!("  darkmux-runtime run --model <id> --system <text> --prompt <text> [--no-stream] [--json]");
+            println!("  darkmux-runtime run --model <id> --system <text> --prompt <text>");
+            println!("    [--no-stream] [--json] [--allowed-tools csv]");
+            println!("    [--compact-threshold-tokens N] [--compactor-model id]");
             println!();
             println!("Flags:");
             println!("  --json       Emit structured envelope on stdout (status to stderr).");
@@ -144,6 +146,12 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // in the system prompt and call `edit` anyway because the tool
     // existed in the catalog.
     let mut allowed_tools: Option<Vec<String>> = None;
+    // (#368) Compaction config flags — explicit values from the host
+    // (which derives them from `profile.runtime.compaction.*` in the
+    // typed schema landed in #357). When absent, the runtime uses
+    // CompactionConfig::default(). Env vars are NOT consulted.
+    let mut compact_threshold_tokens: Option<u32> = None;
+    let mut compactor_model: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -203,6 +211,34 @@ fn run_dispatch(args: &[String]) -> ExitCode {
                     i += 2;
                 } else {
                     eprintln!("--allowed-tools requires a comma-separated list");
+                    return ExitCode::from(2);
+                }
+            }
+            "--compact-threshold-tokens" => {
+                if let Some(v) = args.get(i + 1) {
+                    match v.parse::<u32>() {
+                        Ok(n) => {
+                            compact_threshold_tokens = Some(n);
+                            i += 2;
+                        }
+                        Err(_) => {
+                            eprintln!(
+                                "--compact-threshold-tokens requires a positive integer (got: {v})"
+                            );
+                            return ExitCode::from(2);
+                        }
+                    }
+                } else {
+                    eprintln!("--compact-threshold-tokens requires a value");
+                    return ExitCode::from(2);
+                }
+            }
+            "--compactor-model" => {
+                if let Some(v) = args.get(i + 1) {
+                    compactor_model = Some(v.clone());
+                    i += 2;
+                } else {
+                    eprintln!("--compactor-model requires a value");
                     return ExitCode::from(2);
                 }
             }
@@ -294,9 +330,10 @@ fn run_dispatch(args: &[String]) -> ExitCode {
 
     // (#368) Compaction config from explicit CLI args; no env-var
     // fallback (operator's tuning surface is the profile JSON, not
-    // shell env). For now build the default; cycle B wires the actual
-    // --compact-threshold-tokens / --compactor-model flags through.
-    let compaction_cfg = compaction::CompactionConfig::default();
+    // shell env). The host's `dispatch_via_internal` derives values
+    // from `profile.runtime.compaction.*` and passes them as flags.
+    let compaction_cfg =
+        compaction::CompactionConfig::from_overrides(compact_threshold_tokens, compactor_model);
     let run_result = loop_runner::run(
         &client,
         &model,
