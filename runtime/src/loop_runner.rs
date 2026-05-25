@@ -144,6 +144,7 @@ pub fn run(
             tool_choice: Some("auto".into()),
             temperature: 0.2,
             max_tokens: None,
+            response_format: None,
         };
 
         let next_seq = turns + 1;
