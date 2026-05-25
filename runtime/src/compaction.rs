@@ -73,6 +73,40 @@ const PRESERVE_HEAD: usize = 2;
 /// that silently dropped operator overrides inside the docker
 /// container. Single source of truth for compaction parameters that
 /// the loop runner consults at trigger-check time.
+/// (#372 T2-C) Which compactor implementation runs when the trigger
+/// fires. Runtime-crate-local enum (mirrors the main-crate
+/// `types::CompactionStrategy`). Duplicated because runtime doesn't
+/// depend on main; host translates main-crate enum → CLI flag → this
+/// enum at parse time. Single source of truth for the values is the
+/// kebab-case spelling used on the wire (`narrative` /
+/// `structured-slot`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompactionStrategy {
+    /// Today's default — narrative middle-replace via prose summary
+    /// (the `compact()` function). Article-2-era shape.
+    #[default]
+    Narrative,
+    /// Tier-2 (#352 Step 4) — structured-slot fact extraction via
+    /// `structured_compact()` with JSON-mode + typed schema +
+    /// SYSTEM-role markdown replacement message.
+    StructuredSlot,
+}
+
+impl CompactionStrategy {
+    /// Parse from the kebab-case CLI flag value.
+    /// `Err(s)` on unknown values so the runtime exits with a clear
+    /// message instead of silently falling back.
+    pub fn from_cli_str(s: &str) -> std::result::Result<Self, String> {
+        match s {
+            "narrative" => Ok(Self::Narrative),
+            "structured-slot" => Ok(Self::StructuredSlot),
+            other => Err(format!(
+                "unknown compaction strategy `{other}` (expected `narrative` or `structured-slot`)"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CompactionConfig {
     /// Absolute token threshold. When `latest_prompt_tokens` reaches
@@ -81,6 +115,12 @@ pub struct CompactionConfig {
     pub threshold_tokens: u32,
     /// Compactor model id (e.g. `darkmux:qwen3-4b-instruct-2507`).
     pub compactor_model: String,
+    /// Which compactor implementation runs when the trigger fires.
+    /// Operator opts into tier-2 by setting
+    /// `profile.runtime.compaction.strategy: "structured-slot"` (host
+    /// plumbs via `--compact-strategy` CLI flag). Default Narrative
+    /// preserves pre-T2-C behavior.
+    pub strategy: CompactionStrategy,
     /// Optional fraction-of-context-window trigger (0.1-0.9 per
     /// openclaw's range). When set AND `context_window` is also set,
     /// compaction fires when `latest_prompt_tokens >= context_window *
@@ -111,6 +151,7 @@ impl CompactionConfig {
         compactor_model: Option<String>,
         threshold_ratio: Option<f32>,
         context_window: Option<u32>,
+        strategy: Option<CompactionStrategy>,
     ) -> Self {
         Self {
             threshold_tokens: threshold_tokens.unwrap_or(DEFAULT_THRESHOLD_TOKENS),
@@ -118,6 +159,7 @@ impl CompactionConfig {
                 .unwrap_or_else(|| DEFAULT_COMPACTOR_MODEL.to_string()),
             threshold_ratio,
             context_window,
+            strategy: strategy.unwrap_or_default(),
         }
     }
 
@@ -139,7 +181,7 @@ impl CompactionConfig {
 
 impl Default for CompactionConfig {
     fn default() -> Self {
-        Self::from_overrides(None, None, None, None)
+        Self::from_overrides(None, None, None, None, None)
     }
 }
 
@@ -1112,7 +1154,7 @@ mod tests {
 
     #[test]
     fn from_overrides_threshold_only_uses_default_model() {
-        let cfg = CompactionConfig::from_overrides(Some(30_000), None, None, None);
+        let cfg = CompactionConfig::from_overrides(Some(30_000), None, None, None, None);
         assert_eq!(cfg.threshold_tokens, 30_000);
         assert_eq!(cfg.compactor_model, DEFAULT_COMPACTOR_MODEL);
         assert!(cfg.threshold_ratio.is_none());
@@ -1124,6 +1166,7 @@ mod tests {
         let cfg = CompactionConfig::from_overrides(
             None,
             Some("custom-compactor".to_string()),
+            None,
             None,
             None,
         );
@@ -1138,6 +1181,7 @@ mod tests {
             Some("alt-compactor".to_string()),
             Some(0.35),
             Some(101_000),
+            None,
         );
         assert_eq!(cfg.threshold_tokens, 45_000);
         assert_eq!(cfg.compactor_model, "alt-compactor");
@@ -1175,12 +1219,14 @@ mod tests {
             compactor_model: DEFAULT_COMPACTOR_MODEL.to_string(),
             threshold_ratio: None,
             context_window: None,
+            strategy: CompactionStrategy::Narrative,
         };
         let cfg_high = CompactionConfig {
             threshold_tokens: 100_000,
             compactor_model: DEFAULT_COMPACTOR_MODEL.to_string(),
             threshold_ratio: None,
             context_window: None,
+            strategy: CompactionStrategy::Narrative,
         };
         // 10K crosses low (5K) but not high (100K) — assert per-cfg.
         let min_len = PRESERVE_HEAD + 1 + PRESERVE_TAIL;
@@ -1192,16 +1238,16 @@ mod tests {
 
     #[test]
     fn formula_trigger_disabled_when_either_input_missing() {
-        let cfg = CompactionConfig::from_overrides(None, None, Some(0.35), None);
+        let cfg = CompactionConfig::from_overrides(None, None, Some(0.35), None, None);
         assert!(cfg.formula_trigger_tokens().is_none(), "missing window");
 
-        let cfg = CompactionConfig::from_overrides(None, None, None, Some(101_000));
+        let cfg = CompactionConfig::from_overrides(None, None, None, Some(101_000), None);
         assert!(cfg.formula_trigger_tokens().is_none(), "missing share");
     }
 
     #[test]
     fn formula_trigger_computes_correctly() {
-        let cfg = CompactionConfig::from_overrides(None, None, Some(0.35), Some(101_000));
+        let cfg = CompactionConfig::from_overrides(None, None, Some(0.35), Some(101_000), None);
         // 101000 * 0.35 = 35350
         assert_eq!(cfg.formula_trigger_tokens(), Some(35_350));
     }
@@ -1215,6 +1261,7 @@ mod tests {
             compactor_model: DEFAULT_COMPACTOR_MODEL.to_string(),
             threshold_ratio: Some(0.35),
             context_window: Some(100_000),
+            strategy: CompactionStrategy::Narrative,
         };
         let min_len = PRESERVE_HEAD + 1 + PRESERVE_TAIL;
         // 36K > 35K formula trigger but < 60K absolute → still fires.
@@ -1232,6 +1279,7 @@ mod tests {
             compactor_model: DEFAULT_COMPACTOR_MODEL.to_string(),
             threshold_ratio: Some(0.6),
             context_window: Some(100_000),
+            strategy: CompactionStrategy::Narrative,
         };
         let min_len = PRESERVE_HEAD + 1 + PRESERVE_TAIL;
         // 45K > 40K absolute (formula trigger is 60K, untouched).
@@ -1248,6 +1296,7 @@ mod tests {
             compactor_model: DEFAULT_COMPACTOR_MODEL.to_string(),
             threshold_ratio: Some(0.35),
             context_window: Some(100_000),
+            strategy: CompactionStrategy::Narrative,
         };
         let min_len = PRESERVE_HEAD + 1 + PRESERVE_TAIL;
         assert!(needs_compaction(36_000, min_len, &cfg));

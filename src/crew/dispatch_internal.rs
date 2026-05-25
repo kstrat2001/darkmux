@@ -59,6 +59,17 @@ fn apply_compaction_flags(
     if let Some(window) = compaction.context_window {
         cmd.arg("--context-window").arg(window.to_string());
     }
+    // (#372 T2-C) Strategy → `--compact-strategy <kebab>`. Runtime
+    // parses it back to its local enum; None ⇒ flag omitted ⇒
+    // runtime uses Narrative default.
+    if let Some(strategy) = compaction.strategy {
+        use crate::types::CompactionStrategy;
+        let kebab = match strategy {
+            CompactionStrategy::Narrative => "narrative",
+            CompactionStrategy::StructuredSlot => "structured-slot",
+        };
+        cmd.arg("--compact-strategy").arg(kebab);
+    }
 }
 
 /// Default per-dispatch wall-clock deadline. 10 minutes covers
@@ -981,6 +992,7 @@ mod tests {
             compactor_model: Some("custom-compactor".to_string()),
             threshold_ratio: Some(0.35),
             context_window: Some(101_000),
+            strategy: Some(crate::types::CompactionStrategy::StructuredSlot),
         };
         apply_compaction_flags(&mut cmd, &compaction);
         let args = args_of(&cmd);
@@ -991,6 +1003,60 @@ mod tests {
         assert!(args.iter().any(|a| a == "--compact-threshold-ratio"));
         assert!(args.iter().any(|a| a == "--context-window"));
         assert!(args.iter().any(|a| a == "101000"));
+        assert!(args.iter().any(|a| a == "--compact-strategy"));
+        assert!(args.iter().any(|a| a == "structured-slot"));
+    }
+
+    /// (#372 T2-C) Strategy alone (no other overrides) still emits
+    /// just `--compact-strategy <kebab>` so the runtime can pick up
+    /// the operator's tier-2 opt-in without requiring the operator
+    /// to also override threshold/model/etc.
+    #[test]
+    fn apply_compaction_flags_strategy_only_emits_just_strategy_flag() {
+        let mut cmd = Command::new("docker");
+        let compaction = crate::crew::dispatch::CompactionDispatchArgs {
+            strategy: Some(crate::types::CompactionStrategy::StructuredSlot),
+            ..Default::default()
+        };
+        apply_compaction_flags(&mut cmd, &compaction);
+        let args = args_of(&cmd);
+        assert!(args.windows(2).any(|w| w[0] == "--compact-strategy" && w[1] == "structured-slot"));
+        // Only the strategy flag should be present.
+        assert!(!args.iter().any(|a| a == "--compact-threshold-tokens"));
+        assert!(!args.iter().any(|a| a == "--context-window"));
+    }
+
+    #[test]
+    fn from_profile_reads_typed_strategy_field() {
+        use crate::types::{
+            CompactionStrategy, ModelRole, Profile, ProfileModel, ProfileRuntime,
+            RuntimeCompactionConfig,
+        };
+        let profile = Profile {
+            description: None,
+            models: vec![ProfileModel {
+                id: "primary".into(),
+                n_ctx: 100_000,
+                role: ModelRole::Primary,
+                identifier: None,
+            }],
+            runtime: Some(ProfileRuntime {
+                config_path: None,
+                context_tokens: None,
+                compaction: Some(RuntimeCompactionConfig {
+                    strategy: Some(CompactionStrategy::StructuredSlot),
+                    threshold_tokens: None,
+                    threshold_ratio: None,
+                    tier1: None,
+                    tier2: None,
+                    reserve: None,
+                    extras: Default::default(),
+                }),
+            }),
+            use_when: None,
+        };
+        let args = crate::crew::dispatch::CompactionDispatchArgs::from_profile(&profile);
+        assert_eq!(args.strategy, Some(CompactionStrategy::StructuredSlot));
     }
 
     #[test]

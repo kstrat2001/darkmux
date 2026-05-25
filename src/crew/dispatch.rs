@@ -360,6 +360,11 @@ pub struct CompactionDispatchArgs {
     /// trigger to compute; absent ⇒ formula trigger is disabled
     /// even when `threshold_ratio` is set.
     pub context_window: Option<u32>,
+    /// Compaction strategy. Set from typed
+    /// `profile.runtime.compaction.strategy` (#372 T2-A). When
+    /// `None`, runtime uses default Narrative. Setting
+    /// `Some(StructuredSlot)` opts the dispatch into tier-2.
+    pub strategy: Option<crate::types::CompactionStrategy>,
 }
 
 impl CompactionDispatchArgs {
@@ -401,11 +406,16 @@ impl CompactionDispatchArgs {
             .iter()
             .find(|m| matches!(m.role, ModelRole::Primary))
             .map(|m| m.n_ctx);
+        // (#372 T2-A/T2-C) Strategy is a typed field on the schema;
+        // read directly. When operator hasn't set it, runtime falls
+        // back to Narrative default.
+        let strategy = comp.and_then(|c| c.strategy);
         Self {
             threshold_tokens,
             compactor_model,
             threshold_ratio,
             context_window,
+            strategy,
         }
     }
 }
