@@ -769,6 +769,8 @@ mod tests {
         let cfg = compaction::CompactionConfig {
             threshold_tokens: 1000,
             compactor_model: "test-compactor".to_string(),
+            max_history_share: None,
+            context_window: None,
         };
 
         let server = MockServer::start();

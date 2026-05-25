@@ -60,6 +60,7 @@ fn main() -> ExitCode {
             println!("  darkmux-runtime run --model <id> --system <text> --prompt <text>");
             println!("    [--no-stream] [--json] [--allowed-tools csv]");
             println!("    [--compact-threshold-tokens N] [--compactor-model id]");
+            println!("    [--compact-max-history-share 0.1-0.9] [--context-window N]");
             println!();
             println!("Flags:");
             println!("  --json       Emit structured envelope on stdout (status to stderr).");
@@ -152,6 +153,12 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // CompactionConfig::default(). Env vars are NOT consulted.
     let mut compact_threshold_tokens: Option<u32> = None;
     let mut compactor_model: Option<String> = None;
+    // (#368) Formula-based trigger: max_history_share fraction +
+    // loaded context_window. Mirrors openclaw's `maxHistoryShare`.
+    // Both must be set for the formula trigger to activate; either
+    // missing → formula disabled, absolute-threshold-only behavior.
+    let mut compact_max_history_share: Option<f32> = None;
+    let mut context_window: Option<u32> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -239,6 +246,50 @@ fn run_dispatch(args: &[String]) -> ExitCode {
                     i += 2;
                 } else {
                     eprintln!("--compactor-model requires a value");
+                    return ExitCode::from(2);
+                }
+            }
+            "--compact-max-history-share" => {
+                if let Some(v) = args.get(i + 1) {
+                    match v.parse::<f32>() {
+                        Ok(f) if (0.1..=0.9).contains(&f) => {
+                            compact_max_history_share = Some(f);
+                            i += 2;
+                        }
+                        Ok(f) => {
+                            eprintln!(
+                                "--compact-max-history-share must be in range 0.1-0.9 (got: {f})"
+                            );
+                            return ExitCode::from(2);
+                        }
+                        Err(_) => {
+                            eprintln!(
+                                "--compact-max-history-share requires a fraction in 0.1-0.9 (got: {v})"
+                            );
+                            return ExitCode::from(2);
+                        }
+                    }
+                } else {
+                    eprintln!("--compact-max-history-share requires a value");
+                    return ExitCode::from(2);
+                }
+            }
+            "--context-window" => {
+                if let Some(v) = args.get(i + 1) {
+                    match v.parse::<u32>() {
+                        Ok(n) => {
+                            context_window = Some(n);
+                            i += 2;
+                        }
+                        Err(_) => {
+                            eprintln!(
+                                "--context-window requires a positive integer (got: {v})"
+                            );
+                            return ExitCode::from(2);
+                        }
+                    }
+                } else {
+                    eprintln!("--context-window requires a value");
                     return ExitCode::from(2);
                 }
             }
@@ -332,8 +383,12 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // fallback (operator's tuning surface is the profile JSON, not
     // shell env). The host's `dispatch_via_internal` derives values
     // from `profile.runtime.compaction.*` and passes them as flags.
-    let compaction_cfg =
-        compaction::CompactionConfig::from_overrides(compact_threshold_tokens, compactor_model);
+    let compaction_cfg = compaction::CompactionConfig::from_overrides(
+        compact_threshold_tokens,
+        compactor_model,
+        compact_max_history_share,
+        context_window,
+    );
     let run_result = loop_runner::run(
         &client,
         &model,

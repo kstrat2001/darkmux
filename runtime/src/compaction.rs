@@ -81,26 +81,65 @@ pub struct CompactionConfig {
     pub threshold_tokens: u32,
     /// Compactor model id (e.g. `darkmux:qwen3-4b-instruct-2507`).
     pub compactor_model: String,
+    /// Optional fraction-of-context-window trigger (0.1-0.9 per
+    /// openclaw's range). When set AND `context_window` is also set,
+    /// compaction fires when `latest_prompt_tokens >= context_window *
+    /// max_history_share` — independent of `threshold_tokens`.
+    /// Either trigger fires first wins.
+    ///
+    /// Mirrors openclaw's `agents.defaults.compaction.maxHistoryShare`
+    /// (operator passthrough field in #357 `extras` map). The formula
+    /// trigger is the load-bearing answer to operator's #368 critique:
+    /// "absolute tokens is brittle — fractions adapt across loads."
+    pub max_history_share: Option<f32>,
+    /// Loaded model's context window in tokens (e.g. 101000 for the
+    /// `balanced` profile's D primary). Needed to compute the
+    /// `max_history_share` formula trigger. Host derives from the
+    /// active profile's primary model `n_ctx`. `None` disables the
+    /// formula trigger entirely (back-compat / absolute-only mode).
+    pub context_window: Option<u32>,
 }
 
 impl CompactionConfig {
     /// Resolve a CompactionConfig from optional explicit overrides.
-    /// `None` for either field uses the corresponding default. This is
-    /// the host's choice point — it reads the operator's profile and
-    /// passes Some(N) when set, None when not. Encodes the precedence
-    /// (explicit value → default) without an env-var fallback layer.
-    pub fn from_overrides(threshold_tokens: Option<u32>, compactor_model: Option<String>) -> Self {
+    /// `None` for any field uses the corresponding default (or
+    /// disables the optional trigger). This is the host's choice
+    /// point — it reads the operator's profile and passes `Some(v)`
+    /// when set, `None` when not.
+    pub fn from_overrides(
+        threshold_tokens: Option<u32>,
+        compactor_model: Option<String>,
+        max_history_share: Option<f32>,
+        context_window: Option<u32>,
+    ) -> Self {
         Self {
             threshold_tokens: threshold_tokens.unwrap_or(DEFAULT_THRESHOLD_TOKENS),
             compactor_model: compactor_model
                 .unwrap_or_else(|| DEFAULT_COMPACTOR_MODEL.to_string()),
+            max_history_share,
+            context_window,
+        }
+    }
+
+    /// Compute the formula-trigger threshold in tokens, if both
+    /// `max_history_share` and `context_window` are configured.
+    /// Returns `None` when the formula trigger is disabled (either
+    /// input absent). The result is the prompt-token level at which
+    /// the formula trigger would fire.
+    pub fn formula_trigger_tokens(&self) -> Option<u32> {
+        match (self.max_history_share, self.context_window) {
+            (Some(share), Some(window)) => {
+                let trigger = (window as f32) * share;
+                Some(trigger.floor() as u32)
+            }
+            _ => None,
         }
     }
 }
 
 impl Default for CompactionConfig {
     fn default() -> Self {
-        Self::from_overrides(None, None)
+        Self::from_overrides(None, None, None, None)
     }
 }
 
@@ -115,8 +154,15 @@ pub fn needs_compaction(
     message_count: usize,
     cfg: &CompactionConfig,
 ) -> bool {
-    latest_prompt_tokens >= cfg.threshold_tokens
-        && conversation_long_enough_to_compact(message_count)
+    if !conversation_long_enough_to_compact(message_count) {
+        return false;
+    }
+    // Two independent triggers; either fires first wins.
+    let absolute_tripped = latest_prompt_tokens >= cfg.threshold_tokens;
+    let formula_tripped = cfg
+        .formula_trigger_tokens()
+        .is_some_and(|t| latest_prompt_tokens >= t);
+    absolute_tripped || formula_tripped
 }
 
 /// Sanity-check: middle-replace needs `head + 1 middle + tail`
@@ -246,26 +292,37 @@ mod tests {
 
     #[test]
     fn from_overrides_threshold_only_uses_default_model() {
-        let cfg = CompactionConfig::from_overrides(Some(30_000), None);
+        let cfg = CompactionConfig::from_overrides(Some(30_000), None, None, None);
         assert_eq!(cfg.threshold_tokens, 30_000);
         assert_eq!(cfg.compactor_model, DEFAULT_COMPACTOR_MODEL);
+        assert!(cfg.max_history_share.is_none());
+        assert!(cfg.context_window.is_none());
     }
 
     #[test]
     fn from_overrides_model_only_uses_default_threshold() {
-        let cfg = CompactionConfig::from_overrides(None, Some("custom-compactor".to_string()));
+        let cfg = CompactionConfig::from_overrides(
+            None,
+            Some("custom-compactor".to_string()),
+            None,
+            None,
+        );
         assert_eq!(cfg.threshold_tokens, DEFAULT_THRESHOLD_TOKENS);
         assert_eq!(cfg.compactor_model, "custom-compactor");
     }
 
     #[test]
-    fn from_overrides_both_set() {
+    fn from_overrides_all_set() {
         let cfg = CompactionConfig::from_overrides(
             Some(45_000),
             Some("alt-compactor".to_string()),
+            Some(0.35),
+            Some(101_000),
         );
         assert_eq!(cfg.threshold_tokens, 45_000);
         assert_eq!(cfg.compactor_model, "alt-compactor");
+        assert_eq!(cfg.max_history_share, Some(0.35));
+        assert_eq!(cfg.context_window, Some(101_000));
     }
 
     #[test]
@@ -296,15 +353,84 @@ mod tests {
         let cfg_low = CompactionConfig {
             threshold_tokens: 5_000,
             compactor_model: DEFAULT_COMPACTOR_MODEL.to_string(),
+            max_history_share: None,
+            context_window: None,
         };
         let cfg_high = CompactionConfig {
             threshold_tokens: 100_000,
             compactor_model: DEFAULT_COMPACTOR_MODEL.to_string(),
+            max_history_share: None,
+            context_window: None,
         };
         // 10K crosses low (5K) but not high (100K) — assert per-cfg.
         let min_len = PRESERVE_HEAD + 1 + PRESERVE_TAIL;
         assert!(needs_compaction(10_000, min_len, &cfg_low));
         assert!(!needs_compaction(10_000, min_len, &cfg_high));
+    }
+
+    // ─── #368: formula trigger (max_history_share * context_window) ─
+
+    #[test]
+    fn formula_trigger_disabled_when_either_input_missing() {
+        let cfg = CompactionConfig::from_overrides(None, None, Some(0.35), None);
+        assert!(cfg.formula_trigger_tokens().is_none(), "missing window");
+
+        let cfg = CompactionConfig::from_overrides(None, None, None, Some(101_000));
+        assert!(cfg.formula_trigger_tokens().is_none(), "missing share");
+    }
+
+    #[test]
+    fn formula_trigger_computes_correctly() {
+        let cfg = CompactionConfig::from_overrides(None, None, Some(0.35), Some(101_000));
+        // 101000 * 0.35 = 35350
+        assert_eq!(cfg.formula_trigger_tokens(), Some(35_350));
+    }
+
+    #[test]
+    fn formula_trigger_fires_independently_of_absolute() {
+        // Absolute threshold deliberately high (won't trip); formula
+        // (0.35 of 100K = 35K) trips at 36K prompt tokens.
+        let cfg = CompactionConfig {
+            threshold_tokens: 60_000,
+            compactor_model: DEFAULT_COMPACTOR_MODEL.to_string(),
+            max_history_share: Some(0.35),
+            context_window: Some(100_000),
+        };
+        let min_len = PRESERVE_HEAD + 1 + PRESERVE_TAIL;
+        // 36K > 35K formula trigger but < 60K absolute → still fires.
+        assert!(needs_compaction(36_000, min_len, &cfg));
+        // 34K below formula trigger AND below absolute → does NOT fire.
+        assert!(!needs_compaction(34_000, min_len, &cfg));
+    }
+
+    #[test]
+    fn absolute_trigger_fires_independently_of_formula() {
+        // Formula trigger high (60K of 100K = 60K, requires 60K
+        // prompt). Absolute lower at 40K — trips first.
+        let cfg = CompactionConfig {
+            threshold_tokens: 40_000,
+            compactor_model: DEFAULT_COMPACTOR_MODEL.to_string(),
+            max_history_share: Some(0.6),
+            context_window: Some(100_000),
+        };
+        let min_len = PRESERVE_HEAD + 1 + PRESERVE_TAIL;
+        // 45K > 40K absolute (formula trigger is 60K, untouched).
+        assert!(needs_compaction(45_000, min_len, &cfg));
+    }
+
+    #[test]
+    fn either_trigger_fires_whichever_is_first() {
+        // Both triggers configured; whichever has the LOWER threshold
+        // fires first. With absolute=50K and formula=35K (0.35*100K),
+        // the formula's lower trigger should fire at 36K.
+        let cfg = CompactionConfig {
+            threshold_tokens: 50_000,
+            compactor_model: DEFAULT_COMPACTOR_MODEL.to_string(),
+            max_history_share: Some(0.35),
+            context_window: Some(100_000),
+        };
+        let min_len = PRESERVE_HEAD + 1 + PRESERVE_TAIL;
+        assert!(needs_compaction(36_000, min_len, &cfg));
     }
 
     #[test]
