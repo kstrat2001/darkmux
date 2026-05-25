@@ -262,7 +262,16 @@ impl WorkloadProvider for CodingTaskProvider {
             "durationMs": duration_ms,
             "ok": ok,
             "sessionId": session_id,
-            "sandbox": pathdiff::diff_paths(sandbox_dir, env::current_dir().unwrap_or_else(|_| PathBuf::from("."))).map(|p| p.display().to_string()).unwrap_or_else(|| sandbox_dir.display().to_string()),
+            // Always store the sandbox path as absolute in the
+            // manifest. Prior to #359 (QA finding), this stored a
+            // relative path when sandbox_dir was under cwd — making
+            // the manifest non-portable: `darkmux lab inspect`
+            // resolving the path against ITS cwd (different from the
+            // dispatch cwd) silently failed to find the runtime's
+            // metrics.json, falling back to the trajectory-derived
+            // counts with turns=0 (the very bug #359 fixes). Always-
+            // absolute makes the manifest cwd-independent.
+            "sandbox": sandbox_dir.canonicalize().unwrap_or_else(|_| sandbox_dir.to_path_buf()).display().to_string(),
         });
         fs::write(
             run_dir.join("manifest.json"),
@@ -297,11 +306,25 @@ impl WorkloadProvider for CodingTaskProvider {
             Vec::new()
         };
 
+        // Internal-runtime dispatches write a metrics.json next to the
+        // trajectory inside the sandbox dir. When present, it's the
+        // source-of-truth for turns + compactions — the runtime counts
+        // them directly. Trajectory-derived counts (below) work for the
+        // openclaw shell-out path which emits `prompt.submitted` events
+        // but not for the internal-runtime which emits `model.streaming.
+        // start` / `model.completed` and never writes `prompt.submitted`.
+        // Pre-fix (#359) the openclaw-shape consumer silently dropped
+        // turn counts to 0 on every internal-runtime dispatch.
+        let runtime_metrics = meta
+            .get("sandbox")
+            .and_then(|v| v.as_str())
+            .and_then(|sandbox| read_internal_runtime_metrics(Path::new(sandbox)));
+
         let prompt_submitted: Vec<&serde_json::Value> = events
             .iter()
             .filter(|e| e.get("type").and_then(|t| t.as_str()) == Some("prompt.submitted"))
             .collect();
-        let turns = prompt_submitted.len() as u32;
+        let trajectory_turns = prompt_submitted.len() as u32;
 
         let mut tokens_before: Vec<u64> = Vec::new();
         let mut summary_chars: Vec<u64> = Vec::new();
@@ -332,7 +355,17 @@ impl WorkloadProvider for CodingTaskProvider {
         let walltime_ms = meta.get("durationMs").and_then(|v| v.as_u64()).unwrap_or(0) as u128;
         let mode = classify_mode(walltime_ms, loaded);
 
-        let compactions = tokens_before.len() as u32;
+        // Prefer runtime metrics when present (internal-runtime path);
+        // fall back to trajectory-derived counts (openclaw shell-out
+        // path or any other dispatch source).
+        let turns = runtime_metrics
+            .as_ref()
+            .and_then(|m| m.turns)
+            .unwrap_or(trajectory_turns);
+        let compactions = runtime_metrics
+            .as_ref()
+            .and_then(|m| m.compactions)
+            .unwrap_or(tokens_before.len() as u32);
         let mut notes = vec![
             format!("turns={}", turns),
             format!("compactions={}", compactions),
@@ -669,6 +702,43 @@ fn classify_mode(walltime_ms: u128, loaded: &LoadedWorkload) -> Option<RunMode> 
     None
 }
 
+/// Snapshot of the internal runtime's per-dispatch metrics.json
+/// (written by `runtime/src/main.rs` next to trajectory.jsonl inside
+/// the sandbox dir). Only the fields the lab inspect surface consumes
+/// — the runtime writes more (model id, version, finish reason, etc.)
+/// but inspect doesn't need them.
+///
+/// Optional fields use `None` rather than `0` to discriminate
+/// "runtime didn't report this" from "runtime reported zero." Lets
+/// the consumer prefer runtime data only when it's actually present.
+#[derive(Debug, Clone, Default)]
+struct InternalRuntimeMetrics {
+    turns: Option<u32>,
+    compactions: Option<u32>,
+}
+
+/// Read the internal runtime's `metrics.json` from the conventional
+/// path inside the operator's sandbox. Returns `None` if the file
+/// doesn't exist (openclaw shell-out dispatches won't have one) or
+/// if it can't be parsed (older runtime versions may emit a
+/// different shape). The fallback in the caller (#359) is to derive
+/// counts from the trajectory.
+///
+/// Conventional path: `<sandbox>/.darkmux-runtime/metrics.json` —
+/// see `runtime/src/main.rs` for the producer side.
+fn read_internal_runtime_metrics(sandbox: &Path) -> Option<InternalRuntimeMetrics> {
+    let path = sandbox.join(".darkmux-runtime").join("metrics.json");
+    let raw = fs::read_to_string(&path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    Some(InternalRuntimeMetrics {
+        turns: v.get("turns").and_then(|x| x.as_u64()).map(|n| n as u32),
+        compactions: v
+            .get("compactions")
+            .and_then(|x| x.as_u64())
+            .map(|n| n as u32),
+    })
+}
+
 fn read_jsonl(path: &Path) -> Vec<serde_json::Value> {
     let raw = match fs::read_to_string(path) {
         Ok(s) => s,
@@ -702,21 +772,10 @@ fn _unused_bail() -> Result<()> {
     bail!("unused")
 }
 
-// Tiny dependency-free stand-in for `pathdiff` (don't add a crate just for one fn).
-mod pathdiff {
-    use std::path::{Path, PathBuf};
-    pub fn diff_paths<P: AsRef<Path>, B: AsRef<Path>>(path: P, base: B) -> Option<PathBuf> {
-        let path = path.as_ref();
-        let base = base.as_ref();
-        if path == base {
-            return Some(PathBuf::from("."));
-        }
-        if let Ok(stripped) = path.strip_prefix(base) {
-            return Some(stripped.to_path_buf());
-        }
-        Some(path.to_path_buf())
-    }
-}
+// Note: a small `pathdiff` mod used to live here for computing
+// relative paths in the manifest. Removed in #359 when the manifest
+// switched to always-absolute sandbox paths (the relative form was
+// the root cause of inspect resolving against the wrong cwd).
 
 #[cfg(test)]
 mod tests {
@@ -1267,6 +1326,127 @@ not-valid-json
         assert_eq!(report.tokens_before, vec![48000, 50000]);
     }
 
+    /// (#359) Internal-runtime dispatches write `metrics.json` to
+    /// `<sandbox>/.darkmux-runtime/metrics.json`. Inspect must read it
+    /// as the source-of-truth for turns + compactions — the
+    /// trajectory's `prompt.submitted` events that the openclaw path
+    /// emits are absent on the internal-runtime path, so the
+    /// trajectory-derived fallback would report turns=0 by mistake.
+    #[test]
+    fn inspect_prefers_runtime_metrics_json_when_present() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run");
+        let sandbox = tmp.path().join("sandbox");
+        let runtime_dir = sandbox.join(".darkmux-runtime");
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::create_dir_all(&runtime_dir).unwrap();
+        // Manifest points at the sandbox so inspect can locate metrics.json.
+        fs::write(
+            run_dir.join("manifest.json"),
+            format!(
+                r#"{{"sessionId":"sess","durationMs":60000,"sandbox":"{}"}}"#,
+                sandbox.display()
+            ),
+        )
+        .unwrap();
+        // Runtime metrics: 10 turns, 2 compactions — what the runtime
+        // counted directly. No `prompt.submitted` events anywhere in
+        // the trajectory because internal-runtime emits a different
+        // shape; this is the pre-fix failure mode.
+        fs::write(
+            runtime_dir.join("metrics.json"),
+            r#"{"runtime":"darkmux-runtime","version":"0.1.0","turns":10,"compactions":2}"#,
+        )
+        .unwrap();
+        // Trajectory has zero `prompt.submitted` events on purpose —
+        // representative of an internal-runtime dispatch.
+        fs::write(
+            run_dir.join("trajectory.jsonl"),
+            r#"{"type":"model.streaming.start","seq":1,"system_chars":1000,"prompt_chars":2000}
+{"type":"model.completed","seq":1}
+"#,
+        )
+        .unwrap();
+        let loaded = make_loaded(basic_spec(), tmp.path().to_path_buf());
+        let report = CodingTaskProvider.inspect(&loaded, &run_dir).unwrap();
+        // Pre-fix: turns=0, compactions=0. Post-fix: runtime values flow through.
+        assert_eq!(report.turns, 10);
+        assert_eq!(report.compactions, 2);
+    }
+
+    /// (#359 QA follow-up) When `.darkmux-runtime/metrics.json` exists
+    /// but is malformed, inspect must fall back to trajectory-derived
+    /// counts rather than surfacing a parse error. The
+    /// `read_internal_runtime_metrics` helper uses `.ok()` short-
+    /// circuits at every step; this test locks that contract so a
+    /// future refactor doesn't accidentally start propagating the
+    /// error.
+    #[test]
+    fn inspect_falls_back_when_runtime_metrics_is_malformed() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run");
+        let sandbox = tmp.path().join("sandbox");
+        let runtime_dir = sandbox.join(".darkmux-runtime");
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::create_dir_all(&runtime_dir).unwrap();
+        fs::write(
+            run_dir.join("manifest.json"),
+            format!(
+                r#"{{"sessionId":"sess","durationMs":60000,"sandbox":"{}"}}"#,
+                sandbox.display()
+            ),
+        )
+        .unwrap();
+        // Garbage instead of valid JSON.
+        fs::write(runtime_dir.join("metrics.json"), "not valid json {{ <}}").unwrap();
+        let trajectory = r#"{"type":"prompt.submitted","data":{"messages":[]}}
+{"type":"prompt.submitted","data":{"messages":[{"role":"compactionSummary","summary":"a summary","tokensBefore":42000}]}}
+"#;
+        fs::write(run_dir.join("trajectory.jsonl"), trajectory).unwrap();
+        let loaded = make_loaded(basic_spec(), tmp.path().to_path_buf());
+        let report = CodingTaskProvider
+            .inspect(&loaded, &run_dir)
+            .expect("malformed runtime metrics must not abort inspect");
+        // Trajectory-derived counts kick in; matches the existing
+        // `inspect_counts_turns_and_compactions` shape.
+        assert_eq!(report.turns, 2);
+        assert_eq!(report.compactions, 1);
+    }
+
+    /// Backward-compat: when no runtime metrics.json exists (the
+    /// openclaw shell-out path), inspect falls back to deriving
+    /// turns + compactions from the trajectory's `prompt.submitted`
+    /// events. The existing
+    /// `inspect_counts_turns_and_compactions` test covers the happy
+    /// path; this one specifically asserts the fallback fires when
+    /// `manifest.sandbox` points at a directory with no
+    /// `.darkmux-runtime/metrics.json`.
+    #[test]
+    fn inspect_falls_back_to_trajectory_when_no_runtime_metrics() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run");
+        let sandbox = tmp.path().join("sandbox");
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::create_dir_all(&sandbox).unwrap();
+        // sandbox exists but no .darkmux-runtime subdir — fallback path.
+        fs::write(
+            run_dir.join("manifest.json"),
+            format!(
+                r#"{{"sessionId":"sess","durationMs":60000,"sandbox":"{}"}}"#,
+                sandbox.display()
+            ),
+        )
+        .unwrap();
+        let trajectory = r#"{"type":"prompt.submitted","data":{"messages":[]}}
+{"type":"prompt.submitted","data":{"messages":[{"role":"compactionSummary","summary":"a summary","tokensBefore":42000}]}}
+"#;
+        fs::write(run_dir.join("trajectory.jsonl"), trajectory).unwrap();
+        let loaded = make_loaded(basic_spec(), tmp.path().to_path_buf());
+        let report = CodingTaskProvider.inspect(&loaded, &run_dir).unwrap();
+        assert_eq!(report.turns, 2, "trajectory-derived fallback");
+        assert_eq!(report.compactions, 1, "trajectory-derived fallback");
+    }
+
     #[test]
     fn inspect_classifies_fast_when_expected_set() {
         let tmp = TempDir::new().unwrap();
@@ -1288,21 +1468,8 @@ not-valid-json
         assert_eq!(report.mode, Some(RunMode::Fast));
     }
 
-    #[test]
-    fn pathdiff_relative() {
-        let tmp = TempDir::new().unwrap();
-        let base = tmp.path();
-        let inside = base.join("sub/dir");
-        let rel = pathdiff::diff_paths(&inside, base).unwrap();
-        assert_eq!(rel, PathBuf::from("sub/dir"));
-    }
-
-    #[test]
-    fn pathdiff_same() {
-        let tmp = TempDir::new().unwrap();
-        let rel = pathdiff::diff_paths(tmp.path(), tmp.path()).unwrap();
-        assert_eq!(rel, PathBuf::from("."));
-    }
+    // Note: `pathdiff_relative` and `pathdiff_same` tests removed in
+    // #359 along with the `pathdiff` mod they covered.
 
     #[test]
     fn run_verify_command_returns_none_when_no_command() {

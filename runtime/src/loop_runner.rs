@@ -323,7 +323,8 @@ fn run_streaming_turn(
     seq: u32,
     trajectory: &mut Trajectory,
 ) -> Result<crate::lmstudio::ChatResponse> {
-    trajectory.append_model_streaming_start(seq);
+    let (system_chars, prompt_chars) = measure_request_context(&request.messages);
+    trajectory.append_model_streaming_start(seq, system_chars, prompt_chars);
     let mut accumulator = ChunkAccumulator::new();
     let mut last_content_bytes: usize = 0;
     let stream = client.chat_streaming(request)?;
@@ -356,6 +357,46 @@ fn run_streaming_turn(
         trajectory.append_model_reasoning(seq, &reasoning, "separate-field");
     }
     Ok(response)
+}
+
+/// Measure per-turn context size: returns `(system_chars, prompt_chars)`.
+/// `system_chars` is the total length of system-role message content;
+/// `prompt_chars` is the total length of every other message — user
+/// content, assistant text, assistant tool-call args (function name +
+/// arguments JSON string), tool-result content. Stamped on
+/// `model.streaming.start` (#361) so operators can read per-turn
+/// context growth straight from the trajectory, independent of
+/// whether LMStudio's `usage` field arrived (#360).
+///
+/// **Counting choice**: we measure what the MODEL ATTENDS TO, not the
+/// wire-framing bytes. `tool_call.id` / `tool_call.kind` (always
+/// `"function"`) / message-envelope fields are excluded — those are
+/// transport-shape that doesn't carry semantic information the model
+/// reasons over. Future telemetry layers that need wire bytes (for
+/// API-cost calculations) should compute that separately rather than
+/// extend this function.
+fn measure_request_context(messages: &[Message]) -> (usize, usize) {
+    let mut system_chars = 0usize;
+    let mut prompt_chars = 0usize;
+    for m in messages {
+        let content_len = m.content.as_ref().map(|s| s.len()).unwrap_or(0);
+        let tool_args_len: usize = m
+            .tool_calls
+            .as_ref()
+            .map(|tcs| {
+                tcs.iter()
+                    .map(|tc| tc.function.name.len() + tc.function.arguments.len())
+                    .sum()
+            })
+            .unwrap_or(0);
+        let total = content_len + tool_args_len;
+        if m.role == "system" {
+            system_chars += total;
+        } else {
+            prompt_chars += total;
+        }
+    }
+    (system_chars, prompt_chars)
 }
 
 /// Extract `<think>...</think>` block contents from a string. Returns
@@ -391,6 +432,101 @@ fn extract_think_blocks(content: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lmstudio::{FunctionCall, ToolCall};
+
+    // ─── measure_request_context (#361 fix) ─────────────────────────
+
+    #[test]
+    fn measure_empty_messages_returns_zero_zero() {
+        let (s, p) = measure_request_context(&[]);
+        assert_eq!(s, 0);
+        assert_eq!(p, 0);
+    }
+
+    #[test]
+    fn measure_system_and_user_routes_to_correct_bucket() {
+        let messages = vec![Message::system("sys prompt"), Message::user("hello")];
+        let (system, prompt) = measure_request_context(&messages);
+        assert_eq!(system, "sys prompt".len());
+        assert_eq!(prompt, "hello".len());
+    }
+
+    #[test]
+    fn measure_counts_assistant_tool_calls_into_prompt() {
+        let assistant_with_tools = Message {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".into(),
+                kind: "function".into(),
+                function: FunctionCall {
+                    name: "read".into(),
+                    arguments: r#"{"path":"/workspace/file.py"}"#.into(),
+                },
+            }]),
+            tool_call_id: None,
+            name: None,
+        };
+        let (system, prompt) = measure_request_context(&[assistant_with_tools]);
+        assert_eq!(system, 0);
+        // name + arguments lengths — sanity-check the sum.
+        assert_eq!(
+            prompt,
+            "read".len() + r#"{"path":"/workspace/file.py"}"#.len()
+        );
+    }
+
+    #[test]
+    fn measure_counts_tool_result_into_prompt() {
+        let messages = vec![Message {
+            role: "tool".into(),
+            content: Some("file contents".into()),
+            tool_calls: None,
+            tool_call_id: Some("call_1".into()),
+            name: Some("read".into()),
+        }];
+        let (system, prompt) = measure_request_context(&messages);
+        assert_eq!(system, 0);
+        assert_eq!(prompt, "file contents".len());
+    }
+
+    #[test]
+    fn measure_typical_turn_buckets_correctly() {
+        // System + user + assistant (with content + tool calls) + tool result.
+        let messages = vec![
+            Message::system("you are coder"),
+            Message::user("fix the bug"),
+            Message {
+                role: "assistant".into(),
+                content: Some("I'll read the file first.".into()),
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".into(),
+                    kind: "function".into(),
+                    function: FunctionCall {
+                        name: "read".into(),
+                        arguments: r#"{"path":"/x"}"#.into(),
+                    },
+                }]),
+                tool_call_id: None,
+                name: None,
+            },
+            Message {
+                role: "tool".into(),
+                content: Some("def foo():\n    pass".into()),
+                tool_calls: None,
+                tool_call_id: Some("call_1".into()),
+                name: Some("read".into()),
+            },
+        ];
+        let (system, prompt) = measure_request_context(&messages);
+        assert_eq!(system, "you are coder".len());
+        let expected_prompt = "fix the bug".len()
+            + "I'll read the file first.".len()
+            + "read".len()
+            + r#"{"path":"/x"}"#.len()
+            + "def foo():\n    pass".len();
+        assert_eq!(prompt, expected_prompt);
+    }
 
     #[test]
     fn extract_think_blocks_none() {

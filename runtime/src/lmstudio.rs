@@ -259,10 +259,7 @@ impl LmStudioClient {
         req: &ChatRequest,
     ) -> Result<ChunkStream<BufReader<Box<dyn Read + Send + Sync>>>> {
         let url = format!("{}/chat/completions", self.base_url);
-        let mut body = serde_json::to_value(req)?;
-        body.as_object_mut()
-            .ok_or_else(|| anyhow!("chat request did not serialize to a JSON object"))?
-            .insert("stream".to_string(), serde_json::Value::Bool(true));
+        let body = build_streaming_request_body(req)?;
         let resp = self
             .agent
             .post(&url)
@@ -285,6 +282,31 @@ impl Default for LmStudioClient {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Build the SSE-streaming request body — start from the typed `ChatRequest`
+/// shape, inject `stream: true`, and inject `stream_options.include_usage:
+/// true` so LMStudio (and any OpenAI-compatible server) emits per-dispatch
+/// `usage` in the final SSE chunk (#360). Extracted to a free function so
+/// the body-building rule is unit-testable without an HTTP round-trip.
+pub(crate) fn build_streaming_request_body(req: &ChatRequest) -> Result<serde_json::Value> {
+    let mut body = serde_json::to_value(req)?;
+    let body_obj = body
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("chat request did not serialize to a JSON object"))?;
+    body_obj.insert("stream".to_string(), serde_json::Value::Bool(true));
+    // (#360) OpenAI-compatible servers only emit `usage` on the final SSE
+    // chunk when `stream_options.include_usage` is true. Without this,
+    // LMStudio omits the usage field entirely — every `model.completed`
+    // event ends up with `usage: null` and the runtime's per-turn /
+    // dispatch-total token accumulators stay at 0, breaking compaction-
+    // trigger telemetry + threshold analysis. Empirically surfaced via
+    // Phase B dogfood (medium-coding × D, 2026-05-25).
+    body_obj.insert(
+        "stream_options".to_string(),
+        serde_json::json!({"include_usage": true}),
+    );
+    Ok(body)
 }
 
 // ─── Streaming chat-completions (#205) ──────────────────────────────
@@ -679,6 +701,42 @@ impl<R: BufRead> Iterator for ChunkStream<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── build_streaming_request_body (#360) ──────────────────
+
+    /// (#360) The streaming request body MUST include
+    /// `stream_options.include_usage: true` — without it, LMStudio
+    /// (and any OpenAI-compatible server) omits `usage` from the
+    /// final SSE chunk, leaving the runtime with zero token counts.
+    #[test]
+    fn streaming_request_body_includes_include_usage_flag() {
+        let req = ChatRequest {
+            model: "test-model".to_string(),
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            tool_choice: None,
+            temperature: 0.2,
+            max_tokens: None,
+        };
+        let body = build_streaming_request_body(&req).expect("body builds");
+        let obj = body.as_object().expect("object shape");
+        assert_eq!(
+            obj.get("stream"),
+            Some(&serde_json::Value::Bool(true)),
+            "stream flag must be true for SSE endpoint"
+        );
+        let opts = obj.get("stream_options").expect("stream_options present");
+        assert_eq!(
+            opts.get("include_usage"),
+            Some(&serde_json::Value::Bool(true)),
+            "include_usage must be true to receive per-dispatch usage on the final chunk"
+        );
+        // Sanity: typed fields from the original ChatRequest survived
+        // the body massaging — body construction doesn't drop messages
+        // or model.
+        assert_eq!(obj.get("model").and_then(|v| v.as_str()), Some("test-model"));
+        assert!(obj.get("messages").and_then(|v| v.as_array()).is_some());
+    }
 
     // ─── read_line_capped (S4 byte cap) ────────────────────────
 
