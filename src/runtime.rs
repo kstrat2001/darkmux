@@ -136,8 +136,16 @@ pub fn apply_runtime(profile: &Profile) -> Result<bool> {
                 .cloned()
                 .unwrap_or(Value::Object(Default::default()));
             let mut merged = existing.as_object().cloned().unwrap_or_default();
-            for (k, v) in comp {
-                merged.insert(k.clone(), v.clone());
+            // Serialize the typed compaction config back to a JSON
+            // Value to recover the same key set the pre-#357 untyped
+            // Map carried (typed fields + `extras` overflow flatten
+            // into a single object). Preserves the on-wire merge
+            // semantics so openclaw's agents.defaults.compaction sees
+            // exactly the same keys it did before the schema extension.
+            if let Ok(Value::Object(comp_obj)) = serde_json::to_value(comp) {
+                for (k, v) in comp_obj {
+                    merged.insert(k, v);
+                }
             }
             let new_compaction = Value::Object(merged);
             if defaults.get("compaction") != Some(&new_compaction) {
@@ -577,10 +585,28 @@ fn should_rewrite_lmstudio_pin(current: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ModelRole, Profile, ProfileModel, ProfileRuntime};
+    use crate::types::{ModelRole, Profile, ProfileModel, ProfileRuntime, RuntimeCompactionConfig};
     use serde_json::Value as JsonValue;
     use tempfile::TempDir;
-    type Compaction = serde_json::Map<String, JsonValue>;
+
+    /// Build a `RuntimeCompactionConfig` from a flat (key, value) list
+    /// — every pair lands in `extras`. Lets these tests keep their
+    /// pre-#357 shape (operator-owned passthrough fields like
+    /// `model` / `maxHistoryShare` are not typed v0.1 fields — they
+    /// belong in `extras`) without inflating the call sites.
+    fn compaction_with_extras<I>(entries: I) -> RuntimeCompactionConfig
+    where
+        I: IntoIterator<Item = (&'static str, JsonValue)>,
+    {
+        let mut extras = serde_json::Map::new();
+        for (k, v) in entries {
+            extras.insert(k.to_string(), v);
+        }
+        RuntimeCompactionConfig {
+            extras,
+            ..Default::default()
+        }
+    }
 
     fn write_config(dir: &TempDir, contents: &str) -> std::path::PathBuf {
         let p = dir.path().join("config.json");
@@ -591,7 +617,7 @@ mod tests {
     fn profile_with_runtime(
         config_path: &str,
         context_tokens: Option<u64>,
-        compaction: Option<Compaction>,
+        compaction: Option<RuntimeCompactionConfig>,
         models: Vec<ProfileModel>,
     ) -> Profile {
         Profile {
@@ -667,9 +693,10 @@ mod tests {
             &tmp,
             r#"{"agents":{"defaults":{"compaction":{"mode":"default","model":"old-model"}}}}"#,
         );
-        let mut comp = Compaction::new();
-        comp.insert("model".into(), JsonValue::String("new-model".into()));
-        comp.insert("maxHistoryShare".into(), JsonValue::from(0.35));
+        let comp = compaction_with_extras([
+            ("model", JsonValue::String("new-model".into())),
+            ("maxHistoryShare", JsonValue::from(0.35)),
+        ]);
         let profile = profile_with_runtime(p.to_str().unwrap(), None, Some(comp), vec![]);
         assert!(apply_runtime(&profile).unwrap());
         let after: serde_json::Value =
