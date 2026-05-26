@@ -218,6 +218,32 @@ pub fn run(
             );
         }
 
+        // (#406) Clear `reasoning_content` from the response message
+        // now that the promoter has had its chance to scan it. The
+        // Message struct's `reasoning_content` field carries a
+        // documented invariant (`runtime/src/lmstudio.rs` Message
+        // doc): "skip-serialize so outgoing request messages never
+        // emit it (always None on the request side)". The streaming
+        // path used to enforce this by stripping reasoning via
+        // `accumulator.take_reasoning_content()` BEFORE building the
+        // response; #406 re-attached it so the promoter could scan
+        // it. The original invariant must hold from this point on —
+        // the response message is about to be cloned into the
+        // conversation history (`messages.push(assistant_message)`)
+        // and shipped back to LMStudio on the next request. Carrying
+        // reasoning_content into request-side history caused a
+        // recursive-feedback regression (Beat 47 attempt 2: run 2
+        // hit MAX_TURNS with 100 thinking-mode entries; run 3 went
+        // 1235s before runtime exit). Clearing here restores the
+        // pre-#406 behavior for the conversation history while
+        // preserving the promoter's ability to scan reasoning above.
+        // (Promotion-from-reasoning path also clears reasoning_content
+        // inside `apply_promotion`, so this is idempotent on that
+        // path.)
+        if let Some(choice) = response.choices.first_mut() {
+            choice.message.reasoning_content = None;
+        }
+
         if let Some(usage) = &response.usage {
             total_prompt_tokens = total_prompt_tokens.saturating_add(usage.prompt_tokens);
             total_completion_tokens =
@@ -1108,6 +1134,105 @@ mod tests {
             outcome.turns
         );
         assert_eq!(outcome.terminal_reason, TerminalReason::MaxTurns);
+    }
+
+    /// (#406 regression guard, Beat 47) The streaming path used to
+    /// strip reasoning_content via `accumulator.take_reasoning_content`
+    /// before building the response, enforcing the documented Message
+    /// invariant ("outgoing request messages never emit
+    /// reasoning_content"). PR #407 re-attached reasoning so the
+    /// promoter could scan it; that re-attachment must be cleared
+    /// BEFORE the response message gets pushed into conversation
+    /// history. Otherwise the next turn's request carries the model's
+    /// prior reasoning text — recursive feedback that caused 100-turn
+    /// MAX_TURNS bails in attempt 2 of the validation.
+    ///
+    /// This test pins the invariant: an assistant message in the
+    /// returned conversation MUST have reasoning_content=None,
+    /// regardless of whether the model emitted reasoning.
+    #[test]
+    #[serial_test::serial]
+    fn assistant_messages_in_history_never_carry_reasoning_content() {
+        let server = MockServer::start();
+        // First call: model emits reasoning + a structured tool call
+        // (promotion does NOT fire — tool_calls field is populated).
+        // The reasoning is set on the response; without the post-
+        // promoter clear, it would leak into the next request.
+        let _turn1 = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("\"role\":\"user\"");
+            then.status(200).json_body(serde_json::json!({
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "created": 1700000000,
+                "model": "test-model",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "reasoning_content": "Let me think about this and call a tool",
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "read",
+                                "arguments": "{\"path\":\"/workspace/x.txt\",\"offset\":1,\"limit\":1}",
+                            },
+                        }],
+                    },
+                    "finish_reason": "tool_calls",
+                }],
+                "usage": { "prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150 },
+            }));
+        });
+        // Second call (after tool result): model finishes with stop.
+        let _turn2 = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("\"role\":\"tool\"");
+            then.status(200).json_body(chat_response_json(
+                Some("done"),
+                None,
+                "stop",
+                200,
+                10,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempdir::TempDir::new("reasoning-invariant").unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("read x.txt")];
+        let tools = [Tool::Read];
+
+        let cfg = compaction::CompactionConfig::default();
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg)
+            .expect("clean two-turn dispatch");
+
+        // The first assistant message in the conversation must have
+        // reasoning_content stripped — even though the model emitted
+        // reasoning. The promoter scanned it; the conversation
+        // history does not retain it.
+        let assistant_msgs: Vec<&Message> = outcome
+            .messages
+            .iter()
+            .filter(|m| m.role == "assistant")
+            .collect();
+        assert!(
+            !assistant_msgs.is_empty(),
+            "expected at least one assistant message in history"
+        );
+        for (idx, m) in assistant_msgs.iter().enumerate() {
+            assert!(
+                m.reasoning_content.is_none(),
+                "assistant message #{idx} in history must have reasoning_content=None \
+                 (invariant: lmstudio.rs Message doc — request-side never emits it). \
+                 Got: {:?}",
+                m.reasoning_content
+            );
+        }
     }
 
     /// Smoke: mock returns finish_reason=stop on first call. Loop
