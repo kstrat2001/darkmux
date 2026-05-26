@@ -89,6 +89,27 @@ pub struct Role {
     /// branch on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub escalation_posture: Option<String>,
+    /// (#425) Role family — distinguishes specialist roles (multi-
+    /// turn agent-loop driven; need the autonomous-dispatch preamble
+    /// prepended to their system prompt) from admin roles (bounded-
+    /// I/O transformers; no agent loop, can't enter asking-mode
+    /// failure shape, no preamble needed). One of `"specialist"` or
+    /// `"admin"`. Absent ⇒ treat as `"specialist"` (preventive
+    /// safety: better to prepend an unneeded preamble than to miss
+    /// prepending a needed one). The mission-compiler is the
+    /// canonical admin role today; all others default to specialist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_family: Option<String>,
+}
+
+impl Role {
+    /// (#425) True when this role drives a multi-turn agent loop and
+    /// therefore needs the autonomous-dispatch preamble prepended to
+    /// its system prompt. Default (field absent) = specialist =
+    /// needs preamble. Explicit `"admin"` opts out.
+    pub fn is_specialist(&self) -> bool {
+        !matches!(self.role_family.as_deref(), Some("admin"))
+    }
 }
 
 /// Which tool operations a role is allowed or denied.

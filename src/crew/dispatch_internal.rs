@@ -22,7 +22,7 @@
 
 use crate::crew::dispatch::DispatchResult;
 use crate::crew::dispatch::DispatchOpts;
-use crate::crew::loader::{load_role_prompt, load_roles};
+use crate::crew::loader::{load_autonomous_dispatch_preamble, load_role_prompt, load_roles};
 use anyhow::{anyhow, bail, Context, Result};
 use std::fs;
 use std::path::PathBuf;
@@ -134,12 +134,28 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         .iter()
         .find(|r| r.id == opts.role_id)
         .ok_or_else(|| anyhow!("role not found: {}", opts.role_id))?;
-    let system_prompt = load_role_prompt(&opts.role_id).ok_or_else(|| {
+    let role_prompt = load_role_prompt(&opts.role_id).ok_or_else(|| {
         anyhow!(
             "role '{}' has no .md system prompt — internal runtime requires one",
             opts.role_id
         )
     })?;
+    // (#425) Prepend the autonomous-dispatch preamble for specialist
+    // roles. Admin roles (bounded-I/O transformers like mission-
+    // compiler) skip it — they don't run agent loops and structurally
+    // can't enter the asking-mode failure shape the preamble guards
+    // against. Default (role_family unset) = specialist (preventive
+    // safety: better to prepend an unneeded preamble than to miss
+    // prepending a needed one).
+    let system_prompt = if role.is_specialist() {
+        // Trim + always insert a `\n\n` separator so operator-edited
+        // override files that forgot a trailing newline still produce
+        // a well-shaped joined prompt (no `...content# Role…` smashing).
+        let preamble = load_autonomous_dispatch_preamble();
+        format!("{}\n\n{}", preamble.trim_end(), role_prompt)
+    } else {
+        role_prompt
+    };
     // #340 — surface unknown role-vocab tokens loudly. Unknown tokens
     // (typos like "exce" for "exec", future tokens not yet wired)
     // get silently dropped by `role_to_runtime`; without this warning
@@ -1218,6 +1234,7 @@ mod tests {
             tier: None,
             bail_after_compactions: Some(2), // role pin
             escalation_posture: None,
+            role_family: None,
         };
         args.apply_role_override(&role);
         assert_eq!(args.bail_after_compactions, Some(2), "role pin wins");
@@ -1246,6 +1263,7 @@ mod tests {
             tier: None,
             bail_after_compactions: None, // role didn't pin
             escalation_posture: None,
+            role_family: None,
         };
         args.apply_role_override(&role);
         assert_eq!(
