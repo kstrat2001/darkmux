@@ -1,0 +1,13 @@
+Summarize the following conversation excerpt into the structured-slot schema. Output JSON ONLY — no prose prefix, no markdown fences. schema_version="0.1", generation=7, source_message_count=13.
+
+---
+[user]: please add tests for the rotation feature
+
+[assistant]: 
+  tool_call: read({"path":"src/refreshTokenService.ts","offset":1,"limit":50})
+
+[tool]: <file contents elided for fixture brevity>
+  (tool result for: read)
+
+
+---

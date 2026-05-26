@@ -1,0 +1,71 @@
+{
+  "json_schema": {
+    "name": "StructuredCompactionOutput",
+    "schema": {
+      "additionalProperties": true,
+      "properties": {
+        "compaction_metadata": {
+          "additionalProperties": false,
+          "properties": {
+            "generation": {
+              "type": "integer"
+            },
+            "schema_version": {
+              "type": "string"
+            },
+            "source_message_count": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "schema_version",
+            "generation",
+            "source_message_count"
+          ],
+          "type": "object"
+        },
+        "completed_decisions": {
+          "type": "string"
+        },
+        "current_truth": {
+          "additionalProperties": false,
+          "properties": {
+            "active_files": {
+              "type": "string"
+            },
+            "external_state": {
+              "type": "string"
+            },
+            "test_outcomes": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "errors_to_preserve": {
+          "type": "string"
+        },
+        "next_concrete_actions": {
+          "type": "string"
+        },
+        "objective": {
+          "type": "string"
+        },
+        "sprint_id": {
+          "type": "string"
+        },
+        "verify_criteria": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "objective",
+        "current_truth",
+        "compaction_metadata"
+      ],
+      "type": "object"
+    },
+    "strict": false
+  },
+  "type": "json_schema"
+}

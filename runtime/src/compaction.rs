@@ -377,32 +377,7 @@ pub fn structured_compact(
     let middle_messages: Vec<Message> = messages[middle_start..middle_end].to_vec();
     let middle_rendered = render_messages_as_excerpt(&middle_messages);
 
-    let compactor_system = Message::system(structured_compactor_system_prompt());
-    let compactor_user = Message::user(format!(
-        "Summarize the following conversation excerpt into the structured-slot \
-         schema. Output JSON ONLY — no prose prefix, no markdown fences. \
-         schema_version=\"0.1\", generation={generation}, \
-         source_message_count={middle_count}.\n\n\
-         ---\n{middle_rendered}\n---"
-    ));
-
-    let request = ChatRequest {
-        model: cfg.compactor_model.clone(),
-        messages: vec![compactor_system, compactor_user],
-        tools: Vec::new(),
-        tool_choice: None,
-        temperature: 0.1,
-        max_tokens: Some(4096),
-        // (#375) Schema-enforced JSON via LMStudio's `json_schema`
-        // response-format. LMStudio's API rejects `"type": "json_object"`
-        // (OpenAI's generic-JSON mode) with `'response_format.type'
-        // must be 'json_schema' or 'text'` — caught by Beat-40 tier-2
-        // smoke. Switching to `json_schema` is strictly BETTER: server
-        // enforces shape, not just validity. #354 Q4 v0.1 was based on
-        // an incorrect assumption about LMStudio's compat; this is the
-        // correct surface.
-        response_format: Some(structured_output_response_format_schema()),
-    };
+    let request = build_structured_compaction_request(cfg, generation, middle_count, &middle_rendered);
 
     eprintln!(
         "darkmux-runtime: tier-2 compaction #{generation} — \
@@ -454,6 +429,58 @@ pub fn structured_compact(
     messages.splice(middle_start..middle_end, std::iter::once(replacement));
 
     Ok(capped)
+}
+
+/// (#381 Independence S1) Build the user message sent to the compactor
+/// model. Extracted from `structured_compact()` so snapshot tests can
+/// pin the template independently of the live LMStudio call path.
+/// Behavior unchanged from the prior inline construction.
+fn build_compactor_user_message(
+    generation: u32,
+    middle_count: usize,
+    middle_rendered: &str,
+) -> String {
+    format!(
+        "Summarize the following conversation excerpt into the structured-slot \
+         schema. Output JSON ONLY — no prose prefix, no markdown fences. \
+         schema_version=\"0.1\", generation={generation}, \
+         source_message_count={middle_count}.\n\n\
+         ---\n{middle_rendered}\n---"
+    )
+}
+
+/// (#381 Independence S1) Build the full `ChatRequest` sent to the
+/// compactor model. Extracted so snapshot tests can pin the wire shape
+/// (model id, hyperparameters, response_format) independently of the
+/// live LMStudio call path. Behavior unchanged from the prior inline
+/// construction.
+fn build_structured_compaction_request(
+    cfg: &CompactionConfig,
+    generation: u32,
+    middle_count: usize,
+    middle_rendered: &str,
+) -> ChatRequest {
+    let compactor_system = Message::system(structured_compactor_system_prompt());
+    let compactor_user =
+        Message::user(build_compactor_user_message(generation, middle_count, middle_rendered));
+
+    ChatRequest {
+        model: cfg.compactor_model.clone(),
+        messages: vec![compactor_system, compactor_user],
+        tools: Vec::new(),
+        tool_choice: None,
+        temperature: 0.1,
+        max_tokens: Some(4096),
+        // (#375) Schema-enforced JSON via LMStudio's `json_schema`
+        // response-format. LMStudio's API rejects `"type": "json_object"`
+        // (OpenAI's generic-JSON mode) with `'response_format.type'
+        // must be 'json_schema' or 'text'` — caught by Beat-40 tier-2
+        // smoke. Switching to `json_schema` is strictly BETTER: server
+        // enforces shape, not just validity. #354 Q4 v0.1 was based on
+        // an incorrect assumption about LMStudio's compat; this is the
+        // correct surface.
+        response_format: Some(structured_output_response_format_schema()),
+    }
 }
 
 /// (#375) Build the `response_format` value for LMStudio's
@@ -854,8 +881,19 @@ mod tests {
     #[serial_test::serial]
     fn structured_compact_happy_path_splices_synthetic_system_message() {
         let server = MockServer::start();
-        let _mock = server.mock(|when, then| {
-            when.method(POST).path("/v1/chat/completions");
+        // (#381 Independence S1) `body_contains` ties this integration
+        // path to the extracted `build_compactor_user_message` helper.
+        // Without it, a future refactor could leave the helper +
+        // snapshot tests intact while `structured_compact()` builds
+        // its request inline with different wording, and CI stays
+        // green. The match string is the helper's literal opening
+        // phrase — distinct enough that any drift fails this mock.
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains(
+                    "Summarize the following conversation excerpt into the structured-slot schema",
+                );
             then.status(200).json_body(chat_response_with_json_content(
                 r#"{"objective":"audit refresh-token","current_truth":{"active_files":"x.ts"},"compaction_metadata":{"schema_version":"0.1","generation":7,"source_message_count":4}}"#,
             ));
@@ -868,6 +906,10 @@ mod tests {
 
         let out = structured_compact(&client, &mut messages, 7, &cfg)
             .expect("happy path returns parsed output");
+
+        // Confirms the mock actually matched — proving the wire body
+        // carried the helper's signature phrase.
+        mock.assert_hits(1);
 
         // Assert parsed output is what we expected.
         assert_eq!(out.objective, "audit refresh-token");
@@ -1492,6 +1534,147 @@ mod tests {
         let m = msg_with(Some(""), Some(""));
         let err = extract_compactor_content(m).unwrap_err();
         assert!(err.to_string().contains("no content or reasoning_content"));
+    }
+
+    // ─── #381 Independence S1: snapshot tests pin compactor wire shape ──
+    //
+    // These tests catch silent mutations to what we send TO the
+    // compactor — system prompt body, user-message template,
+    // response_format JSON shape, request hyperparameters. The existing
+    // tests pin every downstream consequence (parsing, slot caps,
+    // markdown render, retry logic) but nothing pinned the wire input
+    // until now, leaving the surfaces about to be mutated by S2+ open
+    // to invisible regressions. See DESIGN.md "Schema isolation:
+    // each runtime owns its own config".
+    //
+    // When an intentional change to the wire shape lands (e.g. S2
+    // appending operator-tunable customInstructions to the system
+    // prompt), regenerate the affected fixture via:
+    //     cargo test -p darkmux-runtime --release dump_snapshot_fixtures -- --ignored
+    // and include the fixture diff in the same PR as the code change.
+
+    /// Deterministic excerpt body used in the user-message template
+    /// snapshot. Kept short + structured so the fixture stays
+    /// human-readable and review-friendly. The actual production
+    /// excerpts are much longer (rendered from real middle messages),
+    /// but the template's substitution shape is independent of length.
+    const FIXTURE_EXCERPT: &str =
+        "[user]: please add tests for the rotation feature\n\n\
+         [assistant]: \n  tool_call: read({\"path\":\"src/refreshTokenService.ts\",\"offset\":1,\"limit\":50})\n\n\
+         [tool]: <file contents elided for fixture brevity>\n  (tool result for: read)\n\n";
+
+    const FIXTURE_GENERATION: u32 = 7;
+    const FIXTURE_MIDDLE_COUNT: usize = 13;
+
+    /// Manual regeneration entrypoint. Writes the three fixtures to
+    /// `runtime/tests/fixtures/` from the current production output of
+    /// the helpers below. Marked `#[ignore]` so it only runs on
+    /// explicit invocation, never on a normal `cargo test`. Idempotent:
+    /// running it without source changes produces byte-identical
+    /// fixtures.
+    #[test]
+    #[ignore = "fixture regeneration; run explicitly when wire shape intentionally changes"]
+    fn dump_snapshot_fixtures() {
+        let fixtures_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures");
+        std::fs::create_dir_all(&fixtures_dir).expect("create fixtures dir");
+
+        std::fs::write(
+            fixtures_dir.join("compactor_system_v0.txt"),
+            structured_compactor_system_prompt(),
+        )
+        .expect("write compactor_system_v0.txt");
+
+        std::fs::write(
+            fixtures_dir.join("compactor_user_message_v0.txt"),
+            build_compactor_user_message(FIXTURE_GENERATION, FIXTURE_MIDDLE_COUNT, FIXTURE_EXCERPT),
+        )
+        .expect("write compactor_user_message_v0.txt");
+
+        let response_format_json =
+            serde_json::to_string_pretty(&structured_output_response_format_schema())
+                .expect("serialize response_format");
+        std::fs::write(
+            fixtures_dir.join("compactor_response_format_v0.json"),
+            response_format_json,
+        )
+        .expect("write compactor_response_format_v0.json");
+    }
+
+    #[test]
+    fn system_prompt_v0_matches_fixture() {
+        let actual = structured_compactor_system_prompt();
+        let expected = include_str!("../tests/fixtures/compactor_system_v0.txt");
+        assert_eq!(
+            actual, expected,
+            "compactor system prompt changed — if intentional, regenerate fixture via \
+             `cargo test -p darkmux-runtime --release dump_snapshot_fixtures -- --ignored` \
+             and include the diff in your PR (see DESIGN.md Schema Isolation)"
+        );
+    }
+
+    #[test]
+    fn user_message_template_v0_matches_fixture() {
+        let actual =
+            build_compactor_user_message(FIXTURE_GENERATION, FIXTURE_MIDDLE_COUNT, FIXTURE_EXCERPT);
+        let expected = include_str!("../tests/fixtures/compactor_user_message_v0.txt");
+        assert_eq!(
+            actual, expected,
+            "compactor user-message template changed — if intentional, regenerate fixture via \
+             `cargo test -p darkmux-runtime --release dump_snapshot_fixtures -- --ignored` \
+             and include the diff in your PR"
+        );
+    }
+
+    #[test]
+    fn response_format_schema_v0_matches_fixture() {
+        let actual = structured_output_response_format_schema();
+        let expected_str =
+            include_str!("../tests/fixtures/compactor_response_format_v0.json");
+        let expected: serde_json::Value =
+            serde_json::from_str(expected_str).expect("fixture parses as JSON");
+        assert_eq!(
+            actual, expected,
+            "compactor response_format JSON schema changed — if intentional, regenerate via \
+             `cargo test -p darkmux-runtime --release dump_snapshot_fixtures -- --ignored` \
+             and include the diff in your PR"
+        );
+    }
+
+    /// Hyperparameter snapshot. Kept as a separate test (rather than
+    /// part of the response_format fixture) because hyperparameters are
+    /// per-call concerns the compactor model sees, whereas
+    /// response_format is the structural contract on its output. A
+    /// silent regression like `temperature: 0.7` would break the
+    /// determinism Beat 41 baselines were measured against — pinned
+    /// here.
+    #[test]
+    fn request_hyperparameters_v0_pinned() {
+        let cfg = CompactionConfig {
+            threshold_tokens: DEFAULT_THRESHOLD_TOKENS,
+            compactor_model: DEFAULT_COMPACTOR_MODEL.to_string(),
+            threshold_ratio: None,
+            context_window: None,
+            strategy: CompactionStrategy::StructuredSlot,
+            bail_after_compactions: None,
+        };
+        let req = build_structured_compaction_request(
+            &cfg,
+            FIXTURE_GENERATION,
+            FIXTURE_MIDDLE_COUNT,
+            FIXTURE_EXCERPT,
+        );
+
+        assert_eq!(req.model, DEFAULT_COMPACTOR_MODEL, "compactor model");
+        assert_eq!(req.temperature, 0.1, "temperature");
+        assert_eq!(req.max_tokens, Some(4096), "max_tokens");
+        assert!(req.tools.is_empty(), "compactor must not advertise tools");
+        assert!(req.tool_choice.is_none(), "compactor must not constrain tool_choice");
+        assert!(req.response_format.is_some(), "compactor must enforce json_schema response_format");
+        assert_eq!(req.messages.len(), 2, "compactor request must be system + user only");
+        assert_eq!(req.messages[0].role, "system", "first message is system prompt");
+        assert_eq!(req.messages[1].role, "user", "second message is user (excerpt)");
     }
 
 }
