@@ -56,6 +56,30 @@ pub enum TerminalReason {
     /// Loop hit MAX_TURNS without reaching a stop. Reply is whatever
     /// the last assistant message produced — likely partial.
     MaxTurns,
+    /// (#377) Operator-set bound was hit and the dispatch escalated
+    /// out of local-tier rather than continuing. The bound + the
+    /// specific condition that fired live in [`EscalationReason`].
+    /// Salvageable state (final messages, partial work, completed
+    /// turns) is in the rest of [`LoopOutcome`] so the frontier-tier
+    /// handoff skill can pick up where local-tier left off. KISS-
+    /// doubled (Beat 44 closure): bound the cost, don't optimize it.
+    EscalationTriggered(EscalationReason),
+}
+
+/// (#377) Which operator-set bound was crossed when an
+/// [`TerminalReason::EscalationTriggered`] terminal fires. Designed
+/// as an enum (not a single variant on TerminalReason) so future
+/// escalation conditions — token-budget exhaustion, hang-timeout,
+/// role-explicit bail — can join under the same terminal without
+/// fragmenting the JSON envelope's `result` field. v0.1 ships
+/// `CompactionLimitReached` only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EscalationReason {
+    /// Compaction count reached the operator-configured
+    /// `bail_after_compactions` threshold (typed field
+    /// `profile.runtime.compaction.reserve.bail_after_compactions`,
+    /// schema landed in #357, consumer in #377).
+    CompactionLimitReached,
 }
 
 /// Outcome of a completed loop run.
@@ -323,6 +347,38 @@ pub fn run(
                         after_count,
                         summary_chars,
                     );
+
+                    // (#377) Escalation bound check. After persisting
+                    // this compaction's trajectory entry, see whether
+                    // we've crossed the operator-configured
+                    // `bail_after_compactions`. If yes, bail with
+                    // EscalationTriggered so the frontier-tier handoff
+                    // skill picks up the salvageable state instead of
+                    // burning more local-tier cycles. KISS-doubled
+                    // (Beat 44 closure): bound the cost, escalate past
+                    // the bound. The check is AFTER the trajectory
+                    // append so the bound-crossing compaction is still
+                    // observable + persisted; only the next chat()
+                    // call is skipped.
+                    if let Some(bail) = compaction_cfg.bail_after_compactions {
+                        if compactions >= bail {
+                            eprintln!(
+                                "darkmux-runtime: escalation_triggered — \
+                                 compactions ({compactions}) reached bail_after_compactions ({bail}); \
+                                 emitting EscalationTriggered terminal for frontier handoff"
+                            );
+                            return Ok(LoopOutcome {
+                                terminal_reason: TerminalReason::EscalationTriggered(
+                                    EscalationReason::CompactionLimitReached,
+                                ),
+                                messages,
+                                turns,
+                                total_prompt_tokens,
+                                total_completion_tokens,
+                                compactions,
+                            });
+                        }
+                    }
                 }
 
                 // Loop back and call chat() again.
@@ -606,6 +662,7 @@ mod tests {
             }]),
             tool_call_id: None,
             name: None,
+            reasoning_content: None,
         };
         let (system, prompt) = measure_request_context(&[assistant_with_tools]);
         assert_eq!(system, 0);
@@ -624,6 +681,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: Some("call_1".into()),
             name: Some("read".into()),
+            reasoning_content: None,
         }];
         let (system, prompt) = measure_request_context(&messages);
         assert_eq!(system, 0);
@@ -649,6 +707,7 @@ mod tests {
                 }]),
                 tool_call_id: None,
                 name: None,
+                reasoning_content: None,
             },
             Message {
                 role: "tool".into(),
@@ -656,6 +715,7 @@ mod tests {
                 tool_calls: None,
                 tool_call_id: Some("call_1".into()),
                 name: Some("read".into()),
+                reasoning_content: None,
             },
         ];
         let (system, prompt) = measure_request_context(&messages);
@@ -907,6 +967,7 @@ mod tests {
             threshold_ratio: None,
             context_window: None,
             strategy: compaction::CompactionStrategy::Narrative,
+            bail_after_compactions: None,
         };
 
         let server = MockServer::start();
@@ -1016,5 +1077,177 @@ mod tests {
                 compactor_mock.hits()
             );
         }
+    }
+
+    /// (#377) When `bail_after_compactions = N` is set and N
+    /// compactions have fired, the loop must exit with
+    /// `TerminalReason::EscalationTriggered(CompactionLimitReached)`
+    /// rather than continuing to MAX_TURNS. Same mock setup as the
+    /// preceding test except: bail=1 so the FIRST compaction trips
+    /// the bound + the loop bails immediately after persisting the
+    /// trajectory entry.
+    ///
+    /// This is the load-bearing chunk-3 invariant: the bound is
+    /// observed, the salvageable state ships in LoopOutcome, and the
+    /// terminal reason is the specific escalation variant (NOT a
+    /// generic timeout or Err). Frontier handoff skill branches on
+    /// the variant.
+    #[test]
+    fn loop_bails_with_escalation_when_compaction_limit_reached() {
+        let cfg = compaction::CompactionConfig {
+            threshold_tokens: 1000,
+            compactor_model: "test-compactor".to_string(),
+            threshold_ratio: None,
+            context_window: None,
+            strategy: compaction::CompactionStrategy::Narrative,
+            bail_after_compactions: Some(1),
+        };
+
+        let server = MockServer::start();
+
+        let _primary_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("\"model\":\"test-primary\"");
+            then.status(200).json_body(chat_response_json(
+                None,
+                Some(serde_json::json!([{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "arguments": "{\"path\":\"/workspace/x.txt\",\"offset\":1,\"limit\":0}",
+                    },
+                }])),
+                "tool_calls",
+                5000,
+                50,
+            ));
+        });
+
+        let compactor_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("\"model\":\"test-compactor\"");
+            then.status(200).json_body(chat_response_json(
+                Some("Summary: assistant read a file."),
+                None,
+                "stop",
+                500,
+                30,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempdir::TempDir::new("compaction-bail").unwrap();
+        std::fs::create_dir_all(tmp.path()).unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let mut initial = vec![Message::system("test system"), Message::user("seed")];
+        for i in 0..3 {
+            initial.push(Message::user(format!("padding user {i}")));
+            initial.push(Message::assistant(format!("padding assistant {i}")));
+        }
+        let tools = [Tool::Read];
+
+        let outcome = run(&client, "test-primary", initial, &tools, &mut traj, false, &cfg)
+            .expect("bail should produce Ok with EscalationTriggered, not Err");
+
+        assert_eq!(
+            outcome.terminal_reason,
+            TerminalReason::EscalationTriggered(EscalationReason::CompactionLimitReached),
+            "bail must produce the specific escalation variant, not a generic terminal"
+        );
+        assert_eq!(
+            outcome.compactions, 1,
+            "the bound-crossing compaction is counted"
+        );
+        assert_eq!(
+            compactor_mock.hits(),
+            1,
+            "exactly one compactor call before the bail"
+        );
+        // Salvageable state: messages vec must be non-empty so the
+        // frontier handoff can pick up where local-tier left off.
+        assert!(
+            !outcome.messages.is_empty(),
+            "LoopOutcome.messages must carry salvageable state for frontier handoff"
+        );
+    }
+
+    /// (#377) When `bail_after_compactions = None` is set (operator
+    /// hasn't configured a bound), the loop must NOT bail — it
+    /// continues through subsequent compactions as before. Catches
+    /// the regression class where the bail check fires on the
+    /// default None case.
+    #[test]
+    fn loop_does_not_bail_when_bail_after_compactions_is_none() {
+        let cfg = compaction::CompactionConfig {
+            threshold_tokens: 1000,
+            compactor_model: "test-compactor".to_string(),
+            threshold_ratio: None,
+            context_window: None,
+            strategy: compaction::CompactionStrategy::Narrative,
+            bail_after_compactions: None,
+        };
+
+        let server = MockServer::start();
+        let _primary_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("\"model\":\"test-primary\"");
+            then.status(200).json_body(chat_response_json(
+                None,
+                Some(serde_json::json!([{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "arguments": "{\"path\":\"/workspace/x.txt\",\"offset\":1,\"limit\":0}",
+                    },
+                }])),
+                "tool_calls",
+                5000,
+                50,
+            ));
+        });
+        let _compactor_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("\"model\":\"test-compactor\"");
+            then.status(200).json_body(chat_response_json(
+                Some("Summary: assistant read a file."),
+                None,
+                "stop",
+                500,
+                30,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempdir::TempDir::new("compaction-no-bail").unwrap();
+        std::fs::create_dir_all(tmp.path()).unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let mut initial = vec![Message::system("test system"), Message::user("seed")];
+        for i in 0..3 {
+            initial.push(Message::user(format!("padding user {i}")));
+            initial.push(Message::assistant(format!("padding assistant {i}")));
+        }
+        let tools = [Tool::Read];
+
+        // Loop hits MAX_TURNS (mock loops forever). The key
+        // assertion: terminal_reason must be MaxTurns, NOT
+        // EscalationTriggered, even though compactions fired.
+        let outcome = run(&client, "test-primary", initial, &tools, &mut traj, false, &cfg)
+            .expect("loop should hit MAX_TURNS, not error");
+
+        assert_eq!(
+            outcome.terminal_reason,
+            TerminalReason::MaxTurns,
+            "with bail_after_compactions=None, MAX_TURNS is the only bound that fires"
+        );
+        assert!(
+            outcome.compactions >= 1,
+            "compaction still fires; bail just doesn't kick in"
+        );
     }
 }

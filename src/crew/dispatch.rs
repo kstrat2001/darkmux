@@ -365,6 +365,14 @@ pub struct CompactionDispatchArgs {
     /// `None`, runtime uses default Narrative. Setting
     /// `Some(StructuredSlot)` opts the dispatch into tier-2.
     pub strategy: Option<crate::types::CompactionStrategy>,
+    /// (#377) Escalation bound — after this many compactions, the
+    /// runtime emits `TerminalReason::EscalationTriggered` and exits
+    /// instead of continuing the agent loop. Set from
+    /// `profile.runtime.compaction.reserve.bail_after_compactions`
+    /// (typed field that landed in #357). The KISS-doubled answer
+    /// from Beat 44 closure: *bound the cost and escalate past the
+    /// bound*. `None` disables (back-compat / unbounded).
+    pub bail_after_compactions: Option<u32>,
 }
 
 impl CompactionDispatchArgs {
@@ -410,12 +418,38 @@ impl CompactionDispatchArgs {
         // read directly. When operator hasn't set it, runtime falls
         // back to Narrative default.
         let strategy = comp.and_then(|c| c.strategy);
+        // (#377) Escalation bound — read from typed
+        // `compaction.reserve.bail_after_compactions` field that
+        // landed in #357. The profile-level value here is the
+        // FALLBACK; `apply_role_override` (called by dispatchers
+        // that know the role) overlays the per-role pin from the
+        // role manifest's `bail_after_compactions` field.
+        let bail_after_compactions = comp
+            .and_then(|c| c.reserve.as_ref())
+            .and_then(|r| r.bail_after_compactions);
         Self {
             threshold_tokens,
             compactor_model,
             threshold_ratio,
             context_window,
             strategy,
+            bail_after_compactions,
+        }
+    }
+
+    /// (#377) Apply per-role overrides on top of profile defaults.
+    /// Lookup chain: role override > profile default > None
+    /// (runtime default ⇒ unbounded). Call after `from_profile` from
+    /// any dispatcher that knows which role is about to run; sites
+    /// that don't have a role (sprint_cli adhoc) can skip the call
+    /// and the profile-level fallback applies.
+    ///
+    /// The role's `escalation_posture` field is parsed here too but
+    /// is currently informational only — the host/skill layer in
+    /// chunk 5 will branch on it when frontier handoff lands.
+    pub fn apply_role_override(&mut self, role: &crate::crew::types::Role) {
+        if let Some(role_bail) = role.bail_after_compactions {
+            self.bail_after_compactions = Some(role_bail);
         }
     }
 }
@@ -2320,6 +2354,8 @@ mod tests {
             escalation_contract: EscalationContract::BailWithExplanation,
             prompt_path: None,
             tier: None,
+            bail_after_compactions: None,
+            escalation_posture: None,
         }
     }
 

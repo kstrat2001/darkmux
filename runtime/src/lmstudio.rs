@@ -59,6 +59,20 @@ pub struct Message {
     /// convenience. Some models care; others don't.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+
+    /// (#376) Present on RESPONSE messages from thinking-mode models
+    /// (qwen 3.x line, deepseek-r1, etc.) — LMStudio routes their
+    /// `<think>...</think>` output to this field rather than
+    /// `content`. When the model is asked for JSON-mode output via
+    /// `response_format: json_schema`, thinking-mode models put the
+    /// JSON HERE, leaving `content` empty.
+    ///
+    /// Skip-serialize so outgoing request messages never emit it
+    /// (always None on the request side); deserialize-populated on
+    /// the response side. Consumers (compaction.rs's call_and_parse)
+    /// should fall back to this field when `content` is empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 impl Message {
@@ -69,6 +83,7 @@ impl Message {
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            reasoning_content: None,
         }
     }
 
@@ -79,6 +94,7 @@ impl Message {
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            reasoning_content: None,
         }
     }
 
@@ -95,6 +111,7 @@ impl Message {
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            reasoning_content: None,
         }
     }
 
@@ -109,6 +126,7 @@ impl Message {
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
             name: Some(name.into()),
+            reasoning_content: None,
         }
     }
 }
@@ -527,6 +545,11 @@ impl ChunkAccumulator {
             },
             tool_call_id: None,
             name: None,
+            reasoning_content: if self.reasoning_content.is_empty() {
+                None
+            } else {
+                Some(self.reasoning_content)
+            },
         };
         ChatResponse {
             id: self.id,

@@ -138,6 +138,16 @@ pub struct CompactionConfig {
     /// active profile's primary model `n_ctx`. `None` disables the
     /// formula trigger entirely (back-compat / absolute-only mode).
     pub context_window: Option<u32>,
+    /// (#377) Escalation bound: after this many compactions, the
+    /// runtime bails with `TerminalReason::EscalationTriggered`
+    /// (reason `CompactionLimitReached`) instead of continuing the
+    /// agent loop. The KISS-doubled answer from Beat 44 closure:
+    /// *bound the cost and escalate past the bound*. Past this
+    /// threshold, frontier-tier picks up the salvageable work via the
+    /// `darkmux-escalation-handler` skill — the operator-explicit
+    /// hand-off point for "local-tier has done what it can; time for
+    /// frontier." `None` disables (back-compat / no bound).
+    pub bail_after_compactions: Option<u32>,
 }
 
 impl CompactionConfig {
@@ -153,6 +163,28 @@ impl CompactionConfig {
         context_window: Option<u32>,
         strategy: Option<CompactionStrategy>,
     ) -> Self {
+        Self::from_overrides_with_bail(
+            threshold_tokens,
+            compactor_model,
+            threshold_ratio,
+            context_window,
+            strategy,
+            None,
+        )
+    }
+
+    /// Same as `from_overrides` plus the (#377) escalation bound.
+    /// New call sites that thread the operator's
+    /// `bail_after_compactions` setting use this; existing tests
+    /// keep the 5-arg signature via the back-compat delegate above.
+    pub fn from_overrides_with_bail(
+        threshold_tokens: Option<u32>,
+        compactor_model: Option<String>,
+        threshold_ratio: Option<f32>,
+        context_window: Option<u32>,
+        strategy: Option<CompactionStrategy>,
+        bail_after_compactions: Option<u32>,
+    ) -> Self {
         Self {
             threshold_tokens: threshold_tokens.unwrap_or(DEFAULT_THRESHOLD_TOKENS),
             compactor_model: compactor_model
@@ -160,6 +192,7 @@ impl CompactionConfig {
             threshold_ratio,
             context_window,
             strategy: strategy.unwrap_or_default(),
+            bail_after_compactions,
         }
     }
 
@@ -416,6 +449,7 @@ pub fn structured_compact(
         tool_calls: None,
         tool_call_id: None,
         name: None,
+        reasoning_content: None,
     };
     messages.splice(middle_start..middle_end, std::iter::once(replacement));
 
@@ -515,14 +549,32 @@ fn call_and_parse(
     request: &ChatRequest,
 ) -> Result<StructuredCompactionOutput> {
     let response = client.chat(request)?;
-    let content = response
+    let message = response
         .choices
         .into_iter()
         .next()
-        .and_then(|c| c.message.content)
-        .ok_or_else(|| anyhow!("compactor returned no content"))?;
+        .map(|c| c.message)
+        .ok_or_else(|| anyhow!("compactor returned no choice"))?;
+    let content = extract_compactor_content(message)?;
     serde_json::from_str::<StructuredCompactionOutput>(&content)
         .map_err(|e| anyhow!("parsing compactor JSON failed: {e} — content: {content}"))
+}
+
+/// (#376) Pull the structured-output JSON string out of a chat-
+/// completion message, with a fallback to `reasoning_content` for
+/// thinking-mode models. Qwen 3.x line, deepseek-r1, and other
+/// thinking-mode admin candidates route their `<think>...</think>`
+/// output into `reasoning_content` rather than `content`. When asked
+/// for JSON-mode output via `response_format: json_schema`, those
+/// models put the JSON THERE, leaving `content` empty (or `None`).
+/// The narrative-compaction path doesn't hit this because it doesn't
+/// enable response_format; tier-2 does.
+fn extract_compactor_content(message: Message) -> Result<String> {
+    let content = message.content.filter(|s| !s.is_empty());
+    let reasoning = message.reasoning_content.filter(|s| !s.is_empty());
+    content
+        .or(reasoning)
+        .ok_or_else(|| anyhow!("compactor returned no content or reasoning_content"))
 }
 
 /// (#372 T2-B) v0.1 per-slot character caps. Mirrors the table the
@@ -1274,6 +1326,7 @@ mod tests {
             threshold_ratio: None,
             context_window: None,
             strategy: CompactionStrategy::Narrative,
+            bail_after_compactions: None,
         };
         let cfg_high = CompactionConfig {
             threshold_tokens: 100_000,
@@ -1281,6 +1334,7 @@ mod tests {
             threshold_ratio: None,
             context_window: None,
             strategy: CompactionStrategy::Narrative,
+            bail_after_compactions: None,
         };
         // 10K crosses low (5K) but not high (100K) — assert per-cfg.
         let min_len = PRESERVE_HEAD + 1 + PRESERVE_TAIL;
@@ -1316,6 +1370,7 @@ mod tests {
             threshold_ratio: Some(0.35),
             context_window: Some(100_000),
             strategy: CompactionStrategy::Narrative,
+            bail_after_compactions: None,
         };
         let min_len = PRESERVE_HEAD + 1 + PRESERVE_TAIL;
         // 36K > 35K formula trigger but < 60K absolute → still fires.
@@ -1334,6 +1389,7 @@ mod tests {
             threshold_ratio: Some(0.6),
             context_window: Some(100_000),
             strategy: CompactionStrategy::Narrative,
+            bail_after_compactions: None,
         };
         let min_len = PRESERVE_HEAD + 1 + PRESERVE_TAIL;
         // 45K > 40K absolute (formula trigger is 60K, untouched).
@@ -1351,6 +1407,7 @@ mod tests {
             threshold_ratio: Some(0.35),
             context_window: Some(100_000),
             strategy: CompactionStrategy::Narrative,
+            bail_after_compactions: None,
         };
         let min_len = PRESERVE_HEAD + 1 + PRESERVE_TAIL;
         assert!(needs_compaction(36_000, min_len, &cfg));
@@ -1382,9 +1439,59 @@ mod tests {
             }]),
             tool_call_id: None,
             name: None,
+            reasoning_content: None,
         };
         let out = render_messages_as_excerpt(std::slice::from_ref(&msg));
         assert!(out.contains("[assistant]: thinking"));
         assert!(out.contains("tool_call: read({\"path\":\"foo\"})"));
     }
+
+    fn msg_with(content: Option<&str>, reasoning: Option<&str>) -> Message {
+        Message {
+            role: "assistant".into(),
+            content: content.map(str::to_string),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            reasoning_content: reasoning.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn extract_prefers_content_when_present() {
+        let m = msg_with(Some(r#"{"objective":"x"}"#), Some(r#"{"objective":"y"}"#));
+        let got = extract_compactor_content(m).unwrap();
+        assert_eq!(got, r#"{"objective":"x"}"#);
+    }
+
+    #[test]
+    fn extract_falls_back_to_reasoning_when_content_none() {
+        let m = msg_with(None, Some(r#"{"objective":"y"}"#));
+        let got = extract_compactor_content(m).unwrap();
+        assert_eq!(got, r#"{"objective":"y"}"#);
+    }
+
+    #[test]
+    fn extract_falls_back_to_reasoning_when_content_empty_string() {
+        // (#376) Thinking-mode models commonly return `content: ""`
+        // (Some, but empty) with the JSON in `reasoning_content`.
+        let m = msg_with(Some(""), Some(r#"{"objective":"y"}"#));
+        let got = extract_compactor_content(m).unwrap();
+        assert_eq!(got, r#"{"objective":"y"}"#);
+    }
+
+    #[test]
+    fn extract_errors_when_both_absent() {
+        let m = msg_with(None, None);
+        let err = extract_compactor_content(m).unwrap_err();
+        assert!(err.to_string().contains("no content or reasoning_content"));
+    }
+
+    #[test]
+    fn extract_errors_when_both_empty_strings() {
+        let m = msg_with(Some(""), Some(""));
+        let err = extract_compactor_content(m).unwrap_err();
+        assert!(err.to_string().contains("no content or reasoning_content"));
+    }
+
 }
