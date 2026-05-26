@@ -186,6 +186,29 @@ impl Trajectory {
         }));
     }
 
+    /// dispatch.tool.repeated_failure — fires (edge-triggered) when
+    /// one tool's consecutive-failure counter crosses the threshold
+    /// (#419). Sibling to dispatch.cycle.suspected: that catches
+    /// repeated SUCCESS patterns; this catches repeated FAILURE
+    /// patterns. Observability-only in the MVP — no behavioral
+    /// change. Pattern observed empirically Beat 45: agent kept
+    /// retrying gcc inside dispatch sandbox where it doesn't exist;
+    /// burned ~20 turns before MAX_TURNS bailed.
+    pub fn append_tool_repeated_failure(
+        &mut self,
+        seq: u32,
+        tool_name: &str,
+        consecutive_failures: u32,
+    ) {
+        self.write_event(&serde_json::json!({
+            "type": "dispatch.tool.repeated_failure",
+            "seq": seq,
+            "ts": unix_ms(),
+            "tool_name": tool_name,
+            "consecutive_failures": consecutive_failures,
+        }));
+    }
+
     /// dispatch.cycle.suspected — fires (edge-triggered) when the
     /// cycle detector observes the same tool_name+canonical_args
     /// hash appearing K times within the recent window of N tool
