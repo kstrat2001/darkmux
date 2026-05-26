@@ -373,6 +373,11 @@ pub struct CompactionDispatchArgs {
     /// from Beat 44 closure: *bound the cost and escalate past the
     /// bound*. `None` disables (back-compat / unbounded).
     pub bail_after_compactions: Option<u32>,
+    /// (#383) Operator-tunable text appended to the compactor's
+    /// system prompt at compaction time. Set from typed
+    /// `profile.runtime.compaction.custom_instructions`. Schema
+    /// isolation: reads ONLY the typed field — no extras fallback.
+    pub custom_instructions: Option<String>,
 }
 
 impl CompactionDispatchArgs {
@@ -427,6 +432,10 @@ impl CompactionDispatchArgs {
         let bail_after_compactions = comp
             .and_then(|c| c.reserve.as_ref())
             .and_then(|r| r.bail_after_compactions);
+        // (#383) Custom instructions — read from typed field only.
+        // Schema isolation: no extras fallback (DESIGN.md "Schema
+        // isolation: each runtime owns its own config").
+        let custom_instructions = comp.and_then(|c| c.custom_instructions.clone());
         Self {
             threshold_tokens,
             compactor_model,
@@ -434,6 +443,7 @@ impl CompactionDispatchArgs {
             context_window,
             strategy,
             bail_after_compactions,
+            custom_instructions,
         }
     }
 

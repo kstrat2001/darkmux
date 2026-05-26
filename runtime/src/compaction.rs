@@ -148,6 +148,16 @@ pub struct CompactionConfig {
     /// hand-off point for "local-tier has done what it can; time for
     /// frontier." `None` disables (back-compat / no bound).
     pub bail_after_compactions: Option<u32>,
+    /// (#383) Operator-tunable text appended to the compactor's
+    /// system prompt at compaction time. When `Some`, the runtime
+    /// appends it to the base structured-compactor system prompt so
+    /// the compactor model receives operator guidance for slot
+    /// population. When `None`, behavior is unchanged from pre-#383.
+    ///
+    /// Plumbed via `--compactor-custom-instructions` CLI flag from
+    /// the host's `profile.runtime.compaction.custom_instructions`
+    /// (typed field, schema-isolation doctrine: no extras fallback).
+    pub custom_instructions: Option<String>,
 }
 
 impl CompactionConfig {
@@ -185,6 +195,29 @@ impl CompactionConfig {
         strategy: Option<CompactionStrategy>,
         bail_after_compactions: Option<u32>,
     ) -> Self {
+        Self::from_overrides_with_bail_and_custom(
+            threshold_tokens,
+            compactor_model,
+            threshold_ratio,
+            context_window,
+            strategy,
+            bail_after_compactions,
+            None,
+        )
+    }
+
+    /// Full override constructor with custom_instructions. All fields
+    /// accept `Option` — `None` uses defaults (or disables optional
+    /// triggers). This is the host's choice point.
+    pub fn from_overrides_with_bail_and_custom(
+        threshold_tokens: Option<u32>,
+        compactor_model: Option<String>,
+        threshold_ratio: Option<f32>,
+        context_window: Option<u32>,
+        strategy: Option<CompactionStrategy>,
+        bail_after_compactions: Option<u32>,
+        custom_instructions: Option<String>,
+    ) -> Self {
         Self {
             threshold_tokens: threshold_tokens.unwrap_or(DEFAULT_THRESHOLD_TOKENS),
             compactor_model: compactor_model
@@ -193,6 +226,7 @@ impl CompactionConfig {
             context_window,
             strategy: strategy.unwrap_or_default(),
             bail_after_compactions,
+            custom_instructions,
         }
     }
 
@@ -460,7 +494,9 @@ fn build_structured_compaction_request(
     middle_count: usize,
     middle_rendered: &str,
 ) -> ChatRequest {
-    let compactor_system = Message::system(structured_compactor_system_prompt());
+    let compactor_system = Message::system(structured_compactor_system_prompt_with_custom(
+        cfg.custom_instructions.as_deref(),
+    ));
     let compactor_user =
         Message::user(build_compactor_user_message(generation, middle_count, middle_rendered));
 
@@ -532,7 +568,7 @@ fn structured_output_response_format_schema() -> serde_json::Value {
     })
 }
 
-/// (#372 T2-B) System prompt the compactor sees in JSON-mode mode.
+/// (#372) System prompt the compactor sees in JSON-mode mode.
 /// Names the v0.1 schema slots + the dot-notation cap table so the
 /// model knows what shape + scale to produce.
 fn structured_compactor_system_prompt() -> &'static str {
@@ -566,6 +602,21 @@ fn structured_compactor_system_prompt() -> &'static str {
      corresponding portion of the agent's working memory for subsequent turns. \
      Omit optional slots that have no meaningful content (don't pad with \
      \"(none)\" or \"N/A\")."
+}
+
+/// (#383) Build the system prompt with operator-tunable custom
+/// instructions appended. When `custom_instructions` is `Some`,
+/// appends the operator's text after a section header. When `None`,
+/// returns the base prompt unchanged (V0 baseline).
+pub fn structured_compactor_system_prompt_with_custom(
+    custom_instructions: Option<&str>,
+) -> String {
+    let mut prompt = structured_compactor_system_prompt().to_string();
+    if let Some(custom) = custom_instructions {
+        prompt.push_str("\n\nOperator guidance for slot population:\n");
+        prompt.push_str(custom);
+    }
+    prompt
 }
 
 /// Helper: make the chat call, parse the assistant content as
@@ -1369,6 +1420,7 @@ mod tests {
             context_window: None,
             strategy: CompactionStrategy::Narrative,
             bail_after_compactions: None,
+            custom_instructions: None,
         };
         let cfg_high = CompactionConfig {
             threshold_tokens: 100_000,
@@ -1377,6 +1429,7 @@ mod tests {
             context_window: None,
             strategy: CompactionStrategy::Narrative,
             bail_after_compactions: None,
+            custom_instructions: None,
         };
         // 10K crosses low (5K) but not high (100K) — assert per-cfg.
         let min_len = PRESERVE_HEAD + 1 + PRESERVE_TAIL;
@@ -1413,6 +1466,7 @@ mod tests {
             context_window: Some(100_000),
             strategy: CompactionStrategy::Narrative,
             bail_after_compactions: None,
+            custom_instructions: None,
         };
         let min_len = PRESERVE_HEAD + 1 + PRESERVE_TAIL;
         // 36K > 35K formula trigger but < 60K absolute → still fires.
@@ -1432,6 +1486,7 @@ mod tests {
             context_window: Some(100_000),
             strategy: CompactionStrategy::Narrative,
             bail_after_compactions: None,
+            custom_instructions: None,
         };
         let min_len = PRESERVE_HEAD + 1 + PRESERVE_TAIL;
         // 45K > 40K absolute (formula trigger is 60K, untouched).
@@ -1450,6 +1505,7 @@ mod tests {
             context_window: Some(100_000),
             strategy: CompactionStrategy::Narrative,
             bail_after_compactions: None,
+            custom_instructions: None,
         };
         let min_len = PRESERVE_HEAD + 1 + PRESERVE_TAIL;
         assert!(needs_compaction(36_000, min_len, &cfg));
@@ -1566,6 +1622,12 @@ mod tests {
     const FIXTURE_GENERATION: u32 = 7;
     const FIXTURE_MIDDLE_COUNT: usize = 13;
 
+    /// (#383) Deterministic operator-tunable text used in the
+    /// augmented-system-prompt snapshot. Kept terse + concrete to
+    /// match the shape an operator would actually provide.
+    const FIXTURE_CUSTOM_INSTRUCTIONS: &str =
+        "In current_truth.active_files, list each file the agent has read or edited with one line per file naming what was learned about it.";
+
     /// Manual regeneration entrypoint. Writes the three fixtures to
     /// `runtime/tests/fixtures/` from the current production output of
     /// the helpers below. Marked `#[ignore]` so it only runs on
@@ -1600,6 +1662,18 @@ mod tests {
             response_format_json,
         )
         .expect("write compactor_response_format_v0.json");
+
+        // (#383) The augmented system prompt — V0 baseline plus
+        // operator-tunable custom instructions appended. The V0
+        // baseline (no augmentation) is pinned by the
+        // `compactor_system_v0.txt` fixture above; this fixture
+        // pins what the compactor sees when an operator sets
+        // `profile.runtime.compaction.custom_instructions`.
+        std::fs::write(
+            fixtures_dir.join("compactor_system_with_custom_v0.txt"),
+            structured_compactor_system_prompt_with_custom(Some(FIXTURE_CUSTOM_INSTRUCTIONS)),
+        )
+        .expect("write compactor_system_with_custom_v0.txt");
     }
 
     #[test]
@@ -1658,6 +1732,7 @@ mod tests {
             context_window: None,
             strategy: CompactionStrategy::StructuredSlot,
             bail_after_compactions: None,
+            custom_instructions: None,
         };
         let req = build_structured_compaction_request(
             &cfg,
@@ -1675,6 +1750,76 @@ mod tests {
         assert_eq!(req.messages.len(), 2, "compactor request must be system + user only");
         assert_eq!(req.messages[0].role, "system", "first message is system prompt");
         assert_eq!(req.messages[1].role, "user", "second message is user (excerpt)");
+    }
+
+    /// (#383) When `custom_instructions` is None, the augmented
+    /// helper returns the V0 baseline byte-for-byte. This is the
+    /// back-compat invariant — operators who haven't set the field
+    /// see no behavior change.
+    #[test]
+    fn system_prompt_with_custom_none_equals_v0_baseline() {
+        let with_none = structured_compactor_system_prompt_with_custom(None);
+        let v0 = structured_compactor_system_prompt();
+        assert_eq!(
+            with_none, v0,
+            "custom_instructions=None must produce the V0 baseline system prompt unchanged"
+        );
+    }
+
+    /// (#383) When `custom_instructions` is set, the system prompt
+    /// matches the augmented fixture. This is the operator-tunable
+    /// behavior this PR ships. Regeneration via the same
+    /// `dump_snapshot_fixtures` helper as the V0 baseline.
+    #[test]
+    fn system_prompt_with_custom_v0_matches_fixture() {
+        let actual = structured_compactor_system_prompt_with_custom(Some(FIXTURE_CUSTOM_INSTRUCTIONS));
+        let expected = include_str!("../tests/fixtures/compactor_system_with_custom_v0.txt");
+        assert_eq!(
+            actual, expected,
+            "augmented compactor system prompt changed — if intentional, regenerate fixture via \
+             `cargo test -p darkmux-runtime --release dump_snapshot_fixtures -- --ignored` \
+             and include the diff in your PR (see DESIGN.md Schema Isolation)"
+        );
+    }
+
+    /// (#383) Integration test: when `CompactionConfig.custom_instructions`
+    /// is Some, the wire body sent to LMStudio contains the operator's
+    /// text. Mirror of `structured_compact_happy_path_splices_synthetic_system_message`
+    /// but with custom_instructions set. `body_contains` proves the
+    /// operator's string actually reaches the wire.
+    ///
+    /// Note: `body_contains` matches anywhere in the request body, not
+    /// specifically the system message. Structural placement (custom
+    /// instructions land in the system prompt, NOT smuggled into the
+    /// user message or response_format schema) is pinned by the unit
+    /// tests `system_prompt_with_custom_v0_matches_fixture` and
+    /// `system_prompt_with_custom_none_equals_v0_baseline` above; this
+    /// integration test confirms the helper-level structure flows
+    /// end-to-end through `structured_compact` to the wire.
+    #[test]
+    #[serial_test::serial]
+    fn structured_compact_with_custom_instructions_appends_to_system_prompt() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("operator-test-guidance-string-7c4a");
+            then.status(200).json_body(chat_response_with_json_content(
+                r#"{"objective":"audit refresh-token","current_truth":{"active_files":"x.ts"},"compaction_metadata":{"schema_version":"0.1","generation":9,"source_message_count":4}}"#,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let mut messages = dummy_messages_long_enough_to_compact();
+        let cfg = CompactionConfig {
+            custom_instructions: Some("operator-test-guidance-string-7c4a".to_string()),
+            ..CompactionConfig::default()
+        };
+
+        let _out = structured_compact(&client, &mut messages, 9, &cfg)
+            .expect("happy path with custom_instructions returns parsed output");
+
+        mock.assert_hits(1);
     }
 
 }

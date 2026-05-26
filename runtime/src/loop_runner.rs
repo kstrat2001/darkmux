@@ -968,6 +968,7 @@ mod tests {
             context_window: None,
             strategy: compaction::CompactionStrategy::Narrative,
             bail_after_compactions: None,
+            custom_instructions: None,
         };
 
         let server = MockServer::start();
@@ -1101,6 +1102,7 @@ mod tests {
             context_window: None,
             strategy: compaction::CompactionStrategy::Narrative,
             bail_after_compactions: Some(1),
+            custom_instructions: None,
         };
 
         let server = MockServer::start();
@@ -1188,6 +1190,7 @@ mod tests {
             context_window: None,
             strategy: compaction::CompactionStrategy::Narrative,
             bail_after_compactions: None,
+            custom_instructions: None,
         };
 
         let server = MockServer::start();
