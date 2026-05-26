@@ -41,6 +41,31 @@ use crate::trajectory::Trajectory;
 /// granular tool calls with the current tool palette).
 const MAX_TURNS: u32 = 100;
 
+/// Per-call cap on completion tokens. LMStudio counts BOTH content
+/// tokens AND reasoning_content tokens against this cap (verified
+/// empirically — `usage.completion_tokens_details.reasoning_tokens`
+/// is included in the total). So the cap bounds runaway-reasoning
+/// emission too, not just runaway content.
+///
+/// **Why an absolute value, not a ratio of `n_ctx`** — this cap is a
+/// **failure-boundary**, not a context-budget allocation. A 14-min
+/// reasoning hang generates roughly the same token count regardless
+/// of whether context is 32K or 1M. Ratio-of-context would give a
+/// 1M-context operator 100K tokens per turn under a 10% ratio —
+/// "more RAM = more rope = worse outcomes," an anti-incentive. The
+/// cap should land below the unstuck-but-burning-tokens threshold
+/// AND above the legitimate-useful-turn ceiling — both bounded by
+/// the WORK shape, not the RAM tier.
+///
+/// **Why 10000** — 2× the observed max-useful-turn (5082 tokens
+/// across 170 turns in 4 baseline runs, lab notebook Beat 47).
+/// Comfortable ceiling for legitimately verbose turns; still well
+/// below the runaway-emission territory (~50K tokens in a 14-min
+/// reasoning hang per Beat 47 run 3). Roughly 22% above openclaw's
+/// `SELF_HOSTED_DEFAULT_MAX_TOKENS = 8192` — same defensive shape,
+/// slightly more headroom for thoughtful turns. (#415)
+const MAX_TOKENS_PER_CALL: u32 = 10000;
+
 /// How the loop terminated. Distinguishes "model said stop" from
 /// "loop hit the safety cap and gave up" — semantically different
 /// outcomes for downstream consumers (a max_turns hit means the
@@ -176,7 +201,7 @@ pub fn run(
             tools: tool_defs.clone(),
             tool_choice: Some("auto".into()),
             temperature: 0.2,
-            max_tokens: None,
+            max_tokens: Some(MAX_TOKENS_PER_CALL),
             response_format: None,
         };
 
@@ -451,11 +476,17 @@ pub fn run(
             }
             "length" => {
                 return Err(anyhow!(
-                    "model returned finish_reason=length — context overflow. \
-                     Compaction fires before the next call when prompt_tokens \
-                     crosses DARKMUX_RUNTIME_COMPACT_THRESHOLD_TOKENS, but the \
-                     current response itself was already cut off mid-generation. \
-                     Workload may need a smaller threshold or a larger n_ctx."
+                    "model returned finish_reason=length — the response was \
+                     cut off mid-generation. Two causes are possible: \
+                     (1) per-call cap fired (MAX_TOKENS_PER_CALL = {MAX_TOKENS_PER_CALL}); \
+                     the model emitted that many tokens (content + reasoning) \
+                     in this single turn, often a runaway-thinking-mode hang. \
+                     (2) context overflow; prompt_tokens crossed the model's \
+                     loaded context window. Check `usage.completion_tokens` in \
+                     the trajectory's model.completed event: if it equals \
+                     {MAX_TOKENS_PER_CALL}, cause (1); otherwise cause (2). \
+                     If (1), see #414 (intra-turn stall recovery). If (2), \
+                     compaction may need a smaller threshold or a larger n_ctx."
                 ));
             }
             other => {
@@ -1233,6 +1264,49 @@ mod tests {
                 m.reasoning_content
             );
         }
+    }
+
+    /// (#415) Every outgoing chat completion request must carry
+    /// `max_tokens: Some(MAX_TOKENS_PER_CALL)` — the server-side
+    /// cap that bounds runaway emission (including reasoning-channel
+    /// emission, since LMStudio counts those tokens too). Asserts
+    /// the request body contains the cap value.
+    ///
+    /// Regression guard: if a future change sets `max_tokens: None`
+    /// on the agent-loop chat path, an unattended dispatch could
+    /// stream tokens indefinitely until the 1500s dispatch deadline
+    /// (#363) fires — the silent-runaway pattern Beat 47 run 3
+    /// demonstrated empirically.
+    #[test]
+    #[serial_test::serial]
+    fn loop_request_carries_max_tokens_cap() {
+        let server = MockServer::start();
+        // Captures the request body so the test can verify max_tokens.
+        let captured = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("\"max_tokens\":10000");
+            then.status(200).json_body(chat_response_json(
+                Some("done"),
+                None,
+                "stop",
+                100,
+                10,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempdir::TempDir::new("max-tokens-cap").unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("hi")];
+        let tools = [Tool::Read];
+
+        let cfg = compaction::CompactionConfig::default();
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg)
+            .expect("clean single-turn dispatch");
+
+        captured.assert();
+        assert_eq!(outcome.turns, 1);
     }
 
     /// Smoke: mock returns finish_reason=stop on first call. Loop
