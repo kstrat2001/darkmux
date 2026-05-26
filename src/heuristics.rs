@@ -113,8 +113,9 @@ pub struct ProfileSuggestion {
 /// Public so providers in submodules can reference it.
 pub const DEFAULT_COMPACTOR_ID: &str = "qwen3-4b-instruct-2507";
 
-/// The validated v15.5 compaction.customInstructions string, copied from
-/// the article. Used whenever a compactor is paired.
+/// Default value for the typed `custom_instructions` darkmux field.
+/// Contains compactor guidance copied from the article; used whenever
+/// a compactor is paired.
 pub const DEFAULT_COMPACTION_INSTRUCTIONS: &str = "Preserve verbatim: numeric SLAs, version identifiers, codenames, named constants, file paths, magic numbers, and any user-provided values referenced by name elsewhere. These can look like decoration but are often referenced by later turns.";
 
 pub fn classify_size_from_meta(meta: &ModelMeta) -> SizeBucket {
@@ -398,7 +399,8 @@ pub fn suggestion_to_profile_json(
     );
     if suggestion.include_compaction_settings {
         let mut compaction = serde_json::Map::new();
-        compaction.insert("mode".into(), serde_json::Value::String("default".into()));
+        // (#385) Drop dead-letter openclaw-shape fields per schema-isolation doctrine.
+        // Only darkmux-typed fields are written into heuristic-generated profiles.
         if let Some(c) = suggestion.compactor.as_ref() {
             compaction.insert(
                 "model".into(),
@@ -406,15 +408,7 @@ pub fn suggestion_to_profile_json(
             );
         }
         compaction.insert(
-            "maxHistoryShare".into(),
-            serde_json::json!(0.35),
-        );
-        compaction.insert(
-            "recentTurnsPreserve".into(),
-            serde_json::Value::Number(5u32.into()),
-        );
-        compaction.insert(
-            "customInstructions".into(),
+            "custom_instructions".into(),
             serde_json::Value::String(DEFAULT_COMPACTION_INSTRUCTIONS.into()),
         );
         runtime.insert(
@@ -586,11 +580,16 @@ mod tests {
         let obj = json.as_object().unwrap().get("test").unwrap();
         let runtime = obj.get("runtime").unwrap();
         let compaction = runtime.get("compaction").unwrap();
-        assert_eq!(compaction.get("mode").and_then(|v| v.as_str()), Some("default"));
-        assert!(
-            compaction.get("model").unwrap().as_str().unwrap().starts_with("lmstudio/")
-        );
-        assert!(compaction.get("customInstructions").is_some());
+
+        // (#385) Verify darkmux-typed fields are present.
+        assert!(compaction.get("model").unwrap().as_str().unwrap().starts_with("lmstudio/"));
+        assert!(compaction.get("custom_instructions").is_some());
+
+        // (#385) Verify dead-letter openclaw-shape fields are absent.
+        assert!(compaction.get("mode").is_none(), "mode should be absent (openclaw-shape)");
+        assert!(compaction.get("maxHistoryShare").is_none(), "maxHistoryShare should be absent (openclaw-shape)");
+        assert!(compaction.get("recentTurnsPreserve").is_none(), "recentTurnsPreserve should be absent (openclaw-shape)");
+        assert!(compaction.get("customInstructions").is_none(), "customInstructions should be absent (openclaw-shape)");
     }
 
     #[test]
