@@ -27,6 +27,7 @@ use std::process::ExitCode;
 mod compaction;
 mod lmstudio;
 mod loop_runner;
+mod plain_text_tool_calls;
 mod tools;
 mod trajectory;
 
