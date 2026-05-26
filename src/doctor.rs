@@ -110,9 +110,113 @@ pub fn run() -> DoctorReport {
         check_role_tool_vocab_typos(),
         check_beat33_legacy_crew_dir(),
         check_legacy_mission_layout(),
+        check_legacy_compaction_extras(),
     ];
     checks.extend(eureka_checks());
     DoctorReport { checks }
+}
+
+/// Surface profiles whose `runtime.compaction.extras` map still carries
+/// legacy openclaw-shape passthrough keys that darkmux no longer consumes.
+/// The internal runtime now reads typed fields (`custom_instructions`,
+/// `threshold_ratio`, etc.) — legacy extras keys are silently ignored.
+///
+/// This is a Warn (not Fail) because darkmux's loader preserves
+/// back-compat parsing of the `extras` map (`serde_json::Map<String,
+/// Value>` via `#[serde(flatten)]`); the check only reads, never
+/// mutates. Operators who also use `~/.openclaw/openclaw.json` may still
+/// need those keys there — darkmux's default output stays neutral and
+/// internal-runtime-only. (#380)
+fn check_legacy_compaction_extras() -> Check {
+    let registry = match profiles::load_registry(None) {
+        Ok(r) => r,
+        Err(e) => {
+            return Check {
+                name: "legacy compaction extras".into(),
+                status: Status::Warn,
+                message: format!("can't check compaction extras (profile registry load failed: {e})"),
+                hint: None,
+            };
+        }
+    };
+
+    let legacy_keys: std::collections::HashSet<&str> = [
+        "mode",
+        "maxHistoryShare",
+        "recentTurnsPreserve",
+        "customInstructions",
+    ]
+    .into_iter()
+    .collect();
+
+    let mut offending_profiles: Vec<(String, Vec<String>)> = Vec::new();
+
+    for (name, profile) in &registry.registry.profiles {
+        let extras = profile
+            .runtime
+            .as_ref()
+            .and_then(|r| r.compaction.as_ref())
+            .map(|c| &c.extras);
+
+        if let Some(extras) = extras {
+            let found: Vec<String> = legacy_keys
+                .iter()
+                .filter(|k| extras.contains_key(**k))
+                .map(|s| s.to_string())
+                .collect();
+
+            if !found.is_empty() {
+                offending_profiles.push((name.clone(), found));
+            }
+        }
+    }
+
+    if offending_profiles.is_empty() {
+        Check {
+            name: "legacy compaction extras".into(),
+            status: Status::Pass,
+            message: "no legacy compaction extras found".into(),
+            hint: None,
+        }
+    } else {
+        let details = offending_profiles
+            .iter()
+            .map(|(name, keys)| {
+                let key_list = keys.join(", ");
+                format!("profile `{name}` has fields not consumed by the internal runtime: {key_list}")
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+
+        // Tailored hint: name the typed migration target where one
+        // exists (customInstructions → custom_instructions, from
+        // PR #384); name "remove" for the three keys with no typed
+        // replacement (mode / maxHistoryShare / recentTurnsPreserve —
+        // darkmux's typed schema deliberately doesn't expose these;
+        // see DESIGN.md "Schema isolation: each runtime owns its own
+        // config"). Operators who hit the warning ONLY because of
+        // one of the three see "remove" not "migrate", which is the
+        // accurate guidance.
+        let any_has_custom = offending_profiles
+            .iter()
+            .any(|(_, keys)| keys.iter().any(|k| k == "customInstructions"));
+        let any_has_other = offending_profiles
+            .iter()
+            .any(|(_, keys)| keys.iter().any(|k| k != "customInstructions"));
+        let hint = match (any_has_custom, any_has_other) {
+            (true, true) => "Migrate `customInstructions` to typed `custom_instructions` field; remove `mode` / `maxHistoryShare` / `recentTurnsPreserve` (darkmux's typed schema doesn't expose these — see DESIGN.md Schema isolation).".to_string(),
+            (true, false) => "Migrate `customInstructions` to typed `custom_instructions` field (see PR #384).".to_string(),
+            (false, true) => "Remove `mode` / `maxHistoryShare` / `recentTurnsPreserve` from profile (darkmux's typed schema deliberately doesn't expose these — see DESIGN.md Schema isolation).".to_string(),
+            (false, false) => unreachable!("offending_profiles is non-empty by the outer if"),
+        };
+
+        Check {
+            name: "legacy compaction extras".into(),
+            status: Status::Warn,
+            message: details,
+            hint: Some(hint),
+        }
+    }
 }
 
 /// Detect operators still on the pre-Beat-33 `<root>/crew/{roles,
@@ -2393,11 +2497,11 @@ mod tests {
         // audit-integrity [#163] + recommendation-drift +
         // recommended-profile-not-shadowed [#159] + role-model-pin-drift
         // [#160] + legacy-mission-layout [#148] + beat-33-crew-dir
-        // [Beat 33 directory flatten] + role-tool-vocab [#340]) + one
-        // per active eureka rule.
+        // [Beat 33 directory flatten] + role-tool-vocab [#340]
+        // + legacy-compaction-extras [#380]) + one per active eureka rule.
         // Every check should appear regardless of environment — even if
         // the underlying probe couldn't read state.
-        let expected = 25 + crate::eureka::all_rules().len();
+        let expected = 26 + crate::eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
@@ -2759,6 +2863,160 @@ mod tests {
             "expected `skipped` in message; got: {}",
             check.message
         );
+    }
+
+    // ─── #380: check_legacy_compaction_extras tests ─────────────
+
+    /// Helper that points `DARKMUX_CONFIG` at a tempdir for the test's
+    /// duration so `load_registry()` reads from a controlled path.
+    struct ConfigPathGuard {
+        prev: Option<String>,
+        _tmp: tempfile::TempDir,
+    }
+
+    impl ConfigPathGuard {
+        fn at_tempfile(filename: &str) -> (Self, std::path::PathBuf) {
+            let tmp = tempfile::TempDir::new().expect("tempdir");
+            let path = tmp.path().join(filename);
+            // Ensure parent dir exists
+            std::fs::create_dir_all(tmp.path()).unwrap();
+            let prev = std::env::var("DARKMUX_CONFIG").ok();
+            // SAFETY: tests using this guard MUST be #[serial].
+            unsafe {
+                std::env::set_var("DARKMUX_CONFIG", &path);
+            }
+            (Self { prev, _tmp: tmp }, path)
+        }
+    }
+
+    impl Drop for ConfigPathGuard {
+        fn drop(&mut self) {
+            // SAFETY: tests using this guard MUST be #[serial].
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("DARKMUX_CONFIG", v),
+                    None => std::env::remove_var("DARKMUX_CONFIG"),
+                }
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_legacy_compaction_extras_warns_when_present() {
+        let (_guard, config_path) = ConfigPathGuard::at_tempfile("profiles.json");
+        // Write a profile with extras.customInstructions set
+        let registry_json = r#"{
+            "profiles": {
+                "test-profile": {
+                    "models": [{"id": "primary-x", "n_ctx": 100000, "role": "primary"}],
+                    "runtime": {
+                        "compaction": {
+                            "customInstructions": "some legacy value",
+                            "strategy": "narrative"
+                        }
+                    }
+                }
+            }
+        }"#;
+        std::fs::write(&config_path, registry_json).unwrap();
+
+        let check = check_legacy_compaction_extras();
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.message.contains("test-profile"));
+        assert!(check.message.contains("customInstructions"));
+        let hint = check.hint.as_deref().unwrap_or("");
+        assert!(hint.contains("custom_instructions"), "hint must mention typed custom_instructions field");
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_legacy_compaction_extras_passes_when_absent() {
+        let (_guard, config_path) = ConfigPathGuard::at_tempfile("profiles.json");
+        // Write a profile with empty/absent extras
+        let registry_json = r#"{
+            "profiles": {
+                "clean-profile": {
+                    "models": [{"id": "primary-x", "n_ctx": 100000, "role": "primary"}],
+                    "runtime": {
+                        "compaction": {}
+                    }
+                }
+            }
+        }"#;
+        std::fs::write(&config_path, registry_json).unwrap();
+
+        let check = check_legacy_compaction_extras();
+        assert_eq!(check.status, Status::Pass);
+        assert!(check.message.contains("no legacy compaction extras"));
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_legacy_compaction_extras_handles_multiple_keys() {
+        let (_guard, config_path) = ConfigPathGuard::at_tempfile("profiles.json");
+        // Write a profile with multiple legacy keys
+        let registry_json = r#"{
+            "profiles": {
+                "multi-key-profile": {
+                    "models": [{"id": "primary-x", "n_ctx": 100000, "role": "primary"}],
+                    "runtime": {
+                        "compaction": {
+                            "mode": "balanced",
+                            "maxHistoryShare": 0.7,
+                            "customInstructions": "keep important stuff",
+                            "strategy": "narrative"
+                        }
+                    }
+                }
+            }
+        }"#;
+        std::fs::write(&config_path, registry_json).unwrap();
+
+        let check = check_legacy_compaction_extras();
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.message.contains("multi-key-profile"));
+        // All four legacy keys should be listed
+        assert!(check.message.contains("mode"));
+        assert!(check.message.contains("maxHistoryShare"));
+        assert!(check.message.contains("customInstructions"));
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_legacy_compaction_extras_passes_when_no_runtime() {
+        let (_guard, config_path) = ConfigPathGuard::at_tempfile("profiles.json");
+        // Write a profile without runtime section at all
+        let registry_json = r#"{
+            "profiles": {
+                "no-runtime-profile": {
+                    "models": [{"id": "primary-x", "n_ctx": 100000, "role": "primary"}]
+                }
+            }
+        }"#;
+        std::fs::write(&config_path, registry_json).unwrap();
+
+        let check = check_legacy_compaction_extras();
+        assert_eq!(check.status, Status::Pass);
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_legacy_compaction_extras_passes_when_no_compaction() {
+        let (_guard, config_path) = ConfigPathGuard::at_tempfile("profiles.json");
+        // Write a profile with runtime but no compaction
+        let registry_json = r#"{
+            "profiles": {
+                "no-compaction-profile": {
+                    "models": [{"id": "primary-x", "n_ctx": 100000, "role": "primary"}],
+                    "runtime": {}
+                }
+            }
+        }"#;
+        std::fs::write(&config_path, registry_json).unwrap();
+
+        let check = check_legacy_compaction_extras();
+        assert_eq!(check.status, Status::Pass);
     }
 
     // ─── #332: doctor OC-config probe normalization ─────────────────
