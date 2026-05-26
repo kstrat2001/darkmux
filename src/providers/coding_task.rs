@@ -222,6 +222,22 @@ impl WorkloadProvider for CodingTaskProvider {
                 .unwrap_or(0)
         );
 
+        // (#421) Pre-dispatch workspace snapshot. Pure observability:
+        // the diff against the post-dispatch snapshot becomes
+        // `workspace_delta` in qa-reply.json. Walk failures (oversized
+        // workspace, IO errors) are logged but don't fail the dispatch
+        // — observability is optional, dispatching the work is not.
+        let pre_snapshot = match crate::providers::workspace_delta::compute_snapshot(sandbox_dir) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!(
+                    "darkmux: warn — pre-dispatch workspace snapshot skipped: {e}. \
+                     `workspace_delta` will be absent from qa-reply.json for this run."
+                );
+                None
+            }
+        };
+
         let started = std::time::Instant::now();
         let (stdout, stderr, ok) = match runtime {
             crate::crew::dispatch::Runtime::Internal => {
@@ -332,6 +348,26 @@ impl WorkloadProvider for CodingTaskProvider {
             // observability augmentation into a dispatch failure.
             // Matches the doctrine documented on the helper itself.
             let _ = augment_qa_reply_with_mismatch(run_dir, &mismatch);
+        }
+
+        // (#421) Post-dispatch workspace snapshot + diff. Surfaces
+        // `workspace_delta` in qa-reply.json with added / modified /
+        // removed paths + total_bytes_changed. Same best-effort
+        // discipline as the claim-mismatch augmentation: log + skip
+        // on failure; never block the dispatch result.
+        if let Some(before) = pre_snapshot.as_ref() {
+            match crate::providers::workspace_delta::compute_snapshot(sandbox_dir) {
+                Ok(after) => {
+                    let delta = crate::providers::workspace_delta::diff_snapshots(before, &after);
+                    let _ = augment_qa_reply_with_workspace_delta(run_dir, &delta);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "darkmux: warn — post-dispatch workspace snapshot skipped: {e}. \
+                         `workspace_delta` will be absent from qa-reply.json for this run."
+                    );
+                }
+            }
         }
 
         let run_id = run_dir
@@ -909,6 +945,79 @@ fn augment_qa_reply_with_mismatch(
         if let Ok(reserialized) = serde_json::to_string(&parsed) {
             if let Err(e) = fs::write(&path, reserialized) {
                 eprintln!("darkmux: warn — couldn't write augmented qa-reply.json: {e}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// (#421) Augment the runtime's qa-reply.json with the workspace
+/// delta. Mirrors the structure of `augment_qa_reply_with_mismatch`
+/// (#420): parse-add-write, best-effort, log + skip on failure.
+///
+/// Operator-facing shape:
+///
+/// ```json
+/// {
+///   ...,
+///   "workspace_delta": {
+///     "added":   ["tests/foo.test.ts"],
+///     "modified": ["src/services/refreshTokenService.ts"],
+///     "removed": [],
+///     "total_bytes_changed": 1240
+///   }
+/// }
+/// ```
+///
+/// Path lists are sorted (BTreeMap iteration in the diff) so two
+/// runs on the same inputs produce byte-identical JSON.
+fn augment_qa_reply_with_workspace_delta(
+    run_dir: &Path,
+    delta: &crate::providers::workspace_delta::WorkspaceDelta,
+) -> Result<()> {
+    let path = run_dir.join("qa-reply.json");
+    let raw = match fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("darkmux: warn — couldn't read qa-reply.json to augment with delta: {e}");
+            return Ok(());
+        }
+    };
+    let mut parsed: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("darkmux: warn — couldn't parse qa-reply.json to augment with delta: {e}");
+            return Ok(());
+        }
+    };
+    if let Some(obj) = parsed.as_object_mut() {
+        let added: Vec<String> = delta
+            .added
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        let modified: Vec<String> = delta
+            .modified
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        let removed: Vec<String> = delta
+            .removed
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        obj.insert(
+            "workspace_delta".to_string(),
+            serde_json::json!({
+                "added": added,
+                "modified": modified,
+                "removed": removed,
+                "total_bytes_changed": delta.total_bytes_changed,
+            }),
+        );
+        if let Ok(reserialized) = serde_json::to_string(&parsed) {
+            if let Err(e) = fs::write(&path, reserialized) {
+                eprintln!("darkmux: warn — couldn't write delta-augmented qa-reply.json: {e}");
             }
         }
     }
@@ -2176,5 +2285,103 @@ not-valid-json
         // Original content preserved (parse failure path).
         let raw = fs::read_to_string(run_dir.join("qa-reply.json")).unwrap();
         assert_eq!(raw, "not valid json {");
+    }
+
+    // ─── #421: workspace_delta augmentation ──────────────────────────────
+
+    #[test]
+    fn augment_qa_reply_adds_workspace_delta_field() {
+        use crate::providers::workspace_delta::WorkspaceDelta;
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path();
+        let initial = serde_json::json!({
+            "final_assistant": "done",
+            "result": "stop",
+            "metrics": { "turns": 5 }
+        });
+        fs::write(
+            run_dir.join("qa-reply.json"),
+            serde_json::to_string(&initial).unwrap(),
+        )
+        .unwrap();
+
+        let delta = WorkspaceDelta {
+            added: vec![PathBuf::from("tests/new.test.ts")],
+            modified: vec![PathBuf::from("src/services/foo.ts")],
+            removed: vec![],
+            total_bytes_changed: 1240,
+        };
+        augment_qa_reply_with_workspace_delta(run_dir, &delta).unwrap();
+
+        let raw = fs::read_to_string(run_dir.join("qa-reply.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let wd = parsed.get("workspace_delta").expect("field must be present");
+        assert_eq!(wd["added"], serde_json::json!(["tests/new.test.ts"]));
+        assert_eq!(wd["modified"], serde_json::json!(["src/services/foo.ts"]));
+        assert_eq!(wd["removed"], serde_json::json!([] as [String; 0]));
+        assert_eq!(wd["total_bytes_changed"], 1240);
+        // Existing fields preserved
+        assert_eq!(parsed["result"], "stop");
+        assert_eq!(parsed["metrics"]["turns"], 5);
+    }
+
+    #[test]
+    fn augment_qa_reply_workspace_delta_silently_skips_when_file_missing() {
+        use crate::providers::workspace_delta::WorkspaceDelta;
+        let tmp = TempDir::new().unwrap();
+        let delta = WorkspaceDelta::default();
+        let result = augment_qa_reply_with_workspace_delta(tmp.path(), &delta);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn augment_qa_reply_workspace_delta_silently_skips_when_file_malformed() {
+        use crate::providers::workspace_delta::WorkspaceDelta;
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path();
+        fs::write(run_dir.join("qa-reply.json"), "garbage {").unwrap();
+        let delta = WorkspaceDelta::default();
+        let result = augment_qa_reply_with_workspace_delta(run_dir, &delta);
+        assert!(result.is_ok());
+        // Preserved on parse failure
+        assert_eq!(fs::read_to_string(run_dir.join("qa-reply.json")).unwrap(), "garbage {");
+    }
+
+    #[test]
+    fn augment_qa_reply_workspace_delta_composes_with_claim_mismatch() {
+        // Both #420 augmentation and #421 augmentation should be able
+        // to compose on the same qa-reply.json. Calling them in
+        // sequence should leave BOTH fields present.
+        use crate::providers::workspace_delta::WorkspaceDelta;
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path();
+        fs::write(
+            run_dir.join("qa-reply.json"),
+            serde_json::to_string(&serde_json::json!({
+                "final_assistant": "x",
+                "result": "stop"
+            })).unwrap(),
+        )
+        .unwrap();
+
+        let mm = ClaimVerifyMismatch {
+            claim_excerpt: "All tests pass.".into(),
+            verify_details: "exit 1".into(),
+        };
+        augment_qa_reply_with_mismatch(run_dir, &mm).unwrap();
+
+        let delta = WorkspaceDelta {
+            added: vec![],
+            modified: vec![PathBuf::from("src/foo.rs")],
+            removed: vec![],
+            total_bytes_changed: 100,
+        };
+        augment_qa_reply_with_workspace_delta(run_dir, &delta).unwrap();
+
+        let raw = fs::read_to_string(run_dir.join("qa-reply.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(parsed.get("claim_verify_mismatch").is_some(), "claim_verify_mismatch must survive");
+        assert!(parsed.get("workspace_delta").is_some(), "workspace_delta must land");
+        assert_eq!(parsed["result"], "stop");
     }
 }

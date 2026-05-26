@@ -1,5 +1,6 @@
 pub mod coding_task;
 pub mod prompt;
+pub mod workspace_delta;
 
 use crate::workloads::registry;
 use anyhow::Result;
