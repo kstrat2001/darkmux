@@ -204,21 +204,15 @@ fn collect_profile_capacities(
                 .any(|m| matches!(m.role, ModelRole::Compactor));
             // Resolve the compaction ratio for sprint budget projections.
             // Precedence: typed `threshold_ratio` (#368 clean-break
-            // primary surface) → openclaw-shape `extras["maxHistoryShare"]`
-            // (back-compat for operators still on openclaw-only profiles)
-            // → 0.35 default. Pre-#370 this read ONLY the openclaw
-            // extras, which silently diverged from what the internal
-            // runtime used after #369's clean break — operators setting
-            // `threshold_ratio` got sprint planning that ignored their
-            // expressed value.
+            // primary surface) → 0.35 default.
+            // (#394) Schema-isolation doctrine — the internal runtime reads ONLY
+            // the typed `threshold_ratio` field. Legacy operator profiles with
+            // openclaw-shape `extras["maxHistoryShare"]` get the default 0.35
+            // here; doctor warns them to migrate (see PR #394). See DESIGN.md
+            // "Schema isolation: each runtime owns its own config".
             let compaction = profile.runtime.as_ref().and_then(|r| r.compaction.as_ref());
             let max_history_share = compaction
                 .and_then(|c| c.threshold_ratio)
-                .or_else(|| {
-                    compaction
-                        .and_then(|c| c.extras.get("maxHistoryShare"))
-                        .and_then(|v| v.as_f64())
-                })
                 .unwrap_or(0.35);
             Some((
                 name.clone(),
