@@ -309,6 +309,31 @@ impl WorkloadProvider for CodingTaskProvider {
 
         let verify_outcome = run_verify_command(loaded, run_dir, sandbox_dir)?;
 
+        // (#420) Verify-claim disagreement detection — the "agent
+        // thinks it's done; it isn't" failure mode. Compares the
+        // agent's final-message claim against verify's outcome and
+        // surfaces a structured mismatch when the agent claims
+        // completion that verify contradicts. Augments qa-reply.json
+        // with `claim_verify_mismatch` so downstream automation can
+        // dispatch on the signal without re-parsing verify-output.txt.
+        let final_assistant_text = extract_reply_text(&stdout);
+        if let Some(mismatch) = detect_claim_verify_mismatch(
+            &final_assistant_text,
+            verify_outcome.as_ref(),
+        ) {
+            eprintln!(
+                "darkmux: ⚠ verify-claim disagreement detected — agent claimed completion \
+                 but verify failed.\n  claim: {}\n  verify: {}",
+                mismatch.claim_excerpt, mismatch.verify_details
+            );
+            // (#420) Best-effort augmentation: discard the Result so a
+            // future change inside the helper that introduces an Err
+            // path (e.g., a stray `?`) cannot silently turn a dispatch
+            // observability augmentation into a dispatch failure.
+            // Matches the doctrine documented on the helper itself.
+            let _ = augment_qa_reply_with_mismatch(run_dir, &mismatch);
+        }
+
         let run_id = run_dir
             .file_name()
             .and_then(|n| n.to_str())
@@ -722,6 +747,172 @@ fn guess_trajectory_path(session_id: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// (#420) Result of comparing the agent's final-message claim against
+/// the verify command's outcome. Surfaces the "agent thinks it's
+/// done; it isn't" failure mode — worse than a silent bail because
+/// the dispatch succeeds *misleadingly* (final_assistant looks
+/// substantive, downstream automation takes the agent's claim as
+/// canonical, the verify-output.txt failure goes uninspected).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClaimVerifyMismatch {
+    /// The phrase from final_assistant that triggered the claim
+    /// detector (truncated for compactness in qa-reply.json).
+    pub claim_excerpt: String,
+    /// Verify's `details` field at the time of detection. Stored so
+    /// post-hoc analysis sees both sides of the disagreement
+    /// together.
+    pub verify_details: String,
+}
+
+/// (#420) Pure detector: given the agent's final message + the
+/// verify outcome, decide whether the agent claimed completion in a
+/// way that contradicts what verify observed.
+///
+/// Returns `Some(ClaimVerifyMismatch)` only when ALL of:
+/// - verify ran and reported `passed: false`
+/// - final_assistant contains a positive-claim pattern (*"tests
+///   pass"*, *"successfully completed"*, *"no failures"*, etc.)
+/// - final_assistant does NOT contain an honesty marker that would
+///   override the positive claim (*"still failing"*, *"remaining"*,
+///   *"partial"*, etc.)
+///
+/// Conservative by design: false positives (flagging clean dispatches
+/// as mismatches) erode trust faster than missing real disagreements.
+/// The patterns start narrow; operators can broaden empirically as
+/// more failure traces accumulate.
+pub fn detect_claim_verify_mismatch(
+    final_assistant: &str,
+    verify: Option<&crate::workloads::types::VerifyOutcome>,
+) -> Option<ClaimVerifyMismatch> {
+    let v = verify?;
+    if v.passed {
+        return None;
+    }
+    let lowered = final_assistant.to_lowercase();
+
+    // Honesty markers override any positive claim — agent
+    // acknowledging the failure means no disagreement.
+    const HONESTY_MARKERS: &[&str] = &[
+        "still failing",
+        "still fails",
+        "failing test",
+        "failed test",
+        "tests still",
+        "remaining issue",
+        "remaining failure",
+        "remaining test",
+        "tests remain",
+        "partial",
+        "incomplete",
+        "not done",
+        "unfinished",
+        "blocked",
+        "could not complete",
+        "couldn't complete",
+        "not complete",
+    ];
+    for m in HONESTY_MARKERS {
+        if lowered.contains(m) {
+            return None;
+        }
+    }
+
+    // Positive-claim patterns. Conservative starting set.
+    const POSITIVE_CLAIMS: &[&str] = &[
+        "all tests pass",
+        "all tests passed",
+        "all tests passing",
+        "all green",
+        "successfully completed",
+        "completed successfully",
+        "no failures",
+        "no errors",
+        "no remaining issues",
+        "no remaining issues remain",
+        "everything works",
+        "everything passes",
+        "everything green",
+    ];
+    let mut matched: Option<&str> = None;
+    for c in POSITIVE_CLAIMS {
+        if lowered.contains(c) {
+            matched = Some(c);
+            break;
+        }
+    }
+    let claim = matched?;
+
+    // Build an excerpt centered on the matched claim for forensic
+    // visibility. ~80 chars on either side, clipped at message
+    // boundaries.
+    let idx = lowered.find(claim).expect("claim was just matched");
+    let start = idx.saturating_sub(80);
+    let end = (idx + claim.len() + 80).min(final_assistant.len());
+    let excerpt = final_assistant[start..end].trim().to_string();
+
+    Some(ClaimVerifyMismatch {
+        claim_excerpt: excerpt,
+        verify_details: v.details.clone(),
+    })
+}
+
+/// (#420) Augment the runtime's qa-reply.json with the detected
+/// claim-verify mismatch. Parse-add-write rather than touching the
+/// runtime crate: the runtime owns the envelope shape and shouldn't
+/// know about the host's post-dispatch verification. Operator-facing
+/// shape:
+///
+/// ```json
+/// {
+///   "final_assistant": "...",
+///   "result": "stop",
+///   ...,
+///   "claim_verify_mismatch": {
+///     "claim_excerpt": "...",
+///     "verify_details": "exit 1"
+///   }
+/// }
+/// ```
+///
+/// Best-effort: a parse or write failure logs a warning but does NOT
+/// fail the dispatch — observability augmentation isn't worth
+/// aborting the result over.
+fn augment_qa_reply_with_mismatch(
+    run_dir: &Path,
+    mismatch: &ClaimVerifyMismatch,
+) -> Result<()> {
+    let path = run_dir.join("qa-reply.json");
+    let raw = match fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("darkmux: warn — couldn't read qa-reply.json to augment: {e}");
+            return Ok(());
+        }
+    };
+    let mut parsed: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("darkmux: warn — couldn't parse qa-reply.json to augment: {e}");
+            return Ok(());
+        }
+    };
+    if let Some(obj) = parsed.as_object_mut() {
+        obj.insert(
+            "claim_verify_mismatch".to_string(),
+            serde_json::json!({
+                "claim_excerpt": mismatch.claim_excerpt,
+                "verify_details": mismatch.verify_details,
+            }),
+        );
+        if let Ok(reserialized) = serde_json::to_string(&parsed) {
+            if let Err(e) = fs::write(&path, reserialized) {
+                eprintln!("darkmux: warn — couldn't write augmented qa-reply.json: {e}");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn run_verify_command(
@@ -1807,5 +1998,183 @@ not-valid-json
             .unwrap();
         assert!(!result.passed);
         assert!(result.details.contains("exit"));
+    }
+
+    // ─── #420: verify-claim disagreement detection ──────────────────────
+
+    fn verify_passed() -> crate::workloads::types::VerifyOutcome {
+        crate::workloads::types::VerifyOutcome {
+            passed: true,
+            details: "verify command exited 0".into(),
+        }
+    }
+
+    fn verify_failed() -> crate::workloads::types::VerifyOutcome {
+        crate::workloads::types::VerifyOutcome {
+            passed: false,
+            details: "exit 1".into(),
+        }
+    }
+
+    #[test]
+    fn mismatch_detected_when_agent_claims_all_tests_pass_but_verify_failed() {
+        let final_msg = "I made the edits. All tests pass. Ready for review.";
+        let mm = detect_claim_verify_mismatch(final_msg, Some(&verify_failed()));
+        assert!(mm.is_some(), "expected mismatch on positive claim + verify fail");
+        let mm = mm.unwrap();
+        assert!(mm.claim_excerpt.contains("All tests pass"));
+        assert_eq!(mm.verify_details, "exit 1");
+    }
+
+    #[test]
+    fn mismatch_detected_for_successfully_completed_phrasing() {
+        let final_msg = "Implementation done. Successfully completed all 3 files.";
+        let mm = detect_claim_verify_mismatch(final_msg, Some(&verify_failed()));
+        assert!(mm.is_some());
+    }
+
+    #[test]
+    fn mismatch_detected_for_no_failures_phrasing() {
+        let final_msg = "Reviewed the changes. No failures observed.";
+        let mm = detect_claim_verify_mismatch(final_msg, Some(&verify_failed()));
+        assert!(mm.is_some());
+    }
+
+    #[test]
+    fn no_mismatch_when_agent_acknowledges_still_failing() {
+        // Agent was honest about the partial state; no claim of completion.
+        let final_msg = "I fixed 2 of 3 tests. The third is still failing — \
+                         I need help understanding the mock setup. All tests pass once that's resolved.";
+        let mm = detect_claim_verify_mismatch(final_msg, Some(&verify_failed()));
+        assert!(mm.is_none(), "honesty marker 'still failing' must override positive claim");
+    }
+
+    #[test]
+    fn no_mismatch_when_agent_says_partial() {
+        let final_msg = "Partial completion. Ran out of context budget. \
+                         All tests pass for the files I did edit.";
+        let mm = detect_claim_verify_mismatch(final_msg, Some(&verify_failed()));
+        assert!(mm.is_none(), "honesty marker 'partial' must override");
+    }
+
+    #[test]
+    fn no_mismatch_when_agent_acknowledges_remaining_failure() {
+        let final_msg = "Edits applied. All tests pass on services/foo. \
+                         1 remaining failure in services/bar — pepper config issue.";
+        let mm = detect_claim_verify_mismatch(final_msg, Some(&verify_failed()));
+        assert!(mm.is_none(), "honesty marker 'remaining failure' must override");
+    }
+
+    #[test]
+    fn no_mismatch_when_no_completion_claim_in_message() {
+        // Agent provided a substantive summary but didn't claim
+        // completion. Detector returns None — we can't tell either way.
+        let final_msg = "I edited 3 files. The diff is ready for your review.";
+        let mm = detect_claim_verify_mismatch(final_msg, Some(&verify_failed()));
+        assert!(mm.is_none(), "no positive claim → no detection signal");
+    }
+
+    #[test]
+    fn no_mismatch_when_verify_passed() {
+        let final_msg = "All tests pass. Ready for review.";
+        let mm = detect_claim_verify_mismatch(final_msg, Some(&verify_passed()));
+        assert!(mm.is_none(), "verify passing means claim is correct, not a mismatch");
+    }
+
+    #[test]
+    fn no_mismatch_when_no_verify_outcome_at_all() {
+        // Workload has no verify command; we can't compare.
+        let final_msg = "All tests pass. Ready for review.";
+        let mm = detect_claim_verify_mismatch(final_msg, None);
+        assert!(mm.is_none(), "no verify outcome → no detection signal");
+    }
+
+    #[test]
+    fn no_mismatch_on_empty_final_assistant() {
+        // Silent bail (per the V4 N=5 Run 2 pattern). No claim to detect.
+        let mm = detect_claim_verify_mismatch("", Some(&verify_failed()));
+        assert!(mm.is_none());
+    }
+
+    #[test]
+    fn detection_is_case_insensitive() {
+        let final_msg = "ALL TESTS PASS now.";
+        let mm = detect_claim_verify_mismatch(final_msg, Some(&verify_failed()));
+        assert!(mm.is_some(), "match should be case-insensitive");
+    }
+
+    #[test]
+    fn claim_excerpt_centers_on_matched_phrase() {
+        let final_msg = "I refactored the auth module to use the new pepper config. \
+                         All tests pass. The diff is ~200 lines.";
+        let mm = detect_claim_verify_mismatch(final_msg, Some(&verify_failed())).unwrap();
+        assert!(mm.claim_excerpt.contains("All tests pass"));
+        // Excerpt should include surrounding context, not just the bare match.
+        assert!(mm.claim_excerpt.len() > "All tests pass".len());
+    }
+
+    #[test]
+    fn augment_qa_reply_adds_claim_verify_mismatch_field() {
+        // Integration: write a representative qa-reply.json, run the
+        // augmentor, parse back, assert the new field landed and the
+        // existing fields are preserved.
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path();
+        let initial = serde_json::json!({
+            "final_assistant": "All tests pass.",
+            "result": "stop",
+            "metrics": { "turns": 5, "wall_ms": 1000 }
+        });
+        fs::write(
+            run_dir.join("qa-reply.json"),
+            serde_json::to_string(&initial).unwrap(),
+        )
+        .unwrap();
+
+        let mm = ClaimVerifyMismatch {
+            claim_excerpt: "All tests pass.".into(),
+            verify_details: "exit 1".into(),
+        };
+        augment_qa_reply_with_mismatch(run_dir, &mm).unwrap();
+
+        let raw = fs::read_to_string(run_dir.join("qa-reply.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        // New field landed
+        let cvm = parsed.get("claim_verify_mismatch").expect("field must be present");
+        assert_eq!(cvm["claim_excerpt"], "All tests pass.");
+        assert_eq!(cvm["verify_details"], "exit 1");
+        // Existing fields preserved
+        assert_eq!(parsed["result"], "stop");
+        assert_eq!(parsed["metrics"]["turns"], 5);
+        assert_eq!(parsed["final_assistant"], "All tests pass.");
+    }
+
+    #[test]
+    fn augment_qa_reply_silently_skips_when_file_missing() {
+        // Best-effort: missing qa-reply.json is logged but doesn't
+        // fail the dispatch.
+        let tmp = TempDir::new().unwrap();
+        let mm = ClaimVerifyMismatch {
+            claim_excerpt: "x".into(),
+            verify_details: "y".into(),
+        };
+        let result = augment_qa_reply_with_mismatch(tmp.path(), &mm);
+        assert!(result.is_ok(), "missing qa-reply.json must not bubble up an error");
+    }
+
+    #[test]
+    fn augment_qa_reply_silently_skips_when_file_malformed() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path();
+        fs::write(run_dir.join("qa-reply.json"), "not valid json {").unwrap();
+        let mm = ClaimVerifyMismatch {
+            claim_excerpt: "x".into(),
+            verify_details: "y".into(),
+        };
+        let result = augment_qa_reply_with_mismatch(run_dir, &mm);
+        assert!(result.is_ok(), "malformed qa-reply.json must not bubble up an error");
+        // Original content preserved (parse failure path).
+        let raw = fs::read_to_string(run_dir.join("qa-reply.json")).unwrap();
+        assert_eq!(raw, "not valid json {");
     }
 }
