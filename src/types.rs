@@ -141,9 +141,28 @@ pub struct RuntimeCompactionConfig {
     pub tier2: Option<Tier2Config>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reserve: Option<ReserveConfig>,
+    /// Operator-tunable text appended to the compactor's system prompt
+    /// at compaction time. When set, darkmux injects this guidance into
+    /// the structured-slot compactor's system prompt so operators can
+    /// steer what the compactor preserves (e.g. "Preserve verbatim X /
+    /// list active files with what was learned").
+    ///
+    /// **Schema isolation**: each runtime owns its own config — this
+    /// field is the typed replacement for the dead-letter
+    /// `extras["customInstructions"]` openclaw passthrough. The
+    /// internal runtime now reads this typed field only; the
+    /// migration off the extras shape (heuristic generator + doctor
+    /// warning for legacy operator profiles) is tracked under
+    /// [#380](https://github.com/kstrat2001/darkmux/issues/380) and
+    /// has not landed yet — operators with `extras["customInstructions"]`
+    /// in their profile silently get the value ignored until that
+    /// follow-up ships.
+    /// See DESIGN.md "Schema isolation: each runtime owns its own config".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_instructions: Option<String>,
     /// Openclaw-shape passthrough + forward-compat overflow. Read by
-    /// existing consumers (`sprint_cli` reads `maxHistoryShare`;
-    /// openclaw runtime config-patching reads `model` / `mode` /
+    /// existing consumers (`sprint_cli` reads `maxHistoryShare`; openclaw
+    /// runtime config-patching reads `model` / `mode` /
     /// `customInstructions`). Future Step 7 of #352 will stamp the
     /// resolved config onto each dispatch's flow record; until then
     /// the field is operator-owned passthrough.
@@ -562,5 +581,31 @@ mod tests {
         assert_eq!(a, b);
         b.context = 2000;
         assert_ne!(a, b);
+    }
+
+    /// (#383) custom_instructions field round-trips through JSON:
+    /// parses when present, omits from output when None.
+    #[test]
+    fn custom_instructions_round_trips() {
+        // With value set — parses and round-trips.
+        let json = r#"{"custom_instructions":"Preserve verbatim X / list active files"}"#;
+        let cfg: RuntimeCompactionConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            cfg.custom_instructions.as_deref(),
+            Some("Preserve verbatim X / list active files")
+        );
+        // Re-serialize — value appears in output.
+        let out: serde_json::Value = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(
+            out["custom_instructions"],
+            "Preserve verbatim X / list active files"
+        );
+
+        // Without value — None, omits from output.
+        let json2 = r#"{"strategy":"structured-slot"}"#;
+        let cfg2: RuntimeCompactionConfig = serde_json::from_str(json2).unwrap();
+        assert!(cfg2.custom_instructions.is_none());
+        let out2: serde_json::Value = serde_json::to_value(&cfg2).unwrap();
+        assert!(!out2.as_object().unwrap().contains_key("custom_instructions"));
     }
 }

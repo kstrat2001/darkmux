@@ -77,6 +77,17 @@ fn apply_compaction_flags(
     if let Some(n) = compaction.bail_after_compactions {
         cmd.arg("--bail-after-compactions").arg(n.to_string());
     }
+    // (#383) Operator-tunable custom instructions →
+    // `--compactor-custom-instructions <text>`. Runtime appends to the
+    // compactor's system prompt at compaction time. None ⇒ flag
+    // omitted ⇒ runtime uses the V0 baseline system prompt.
+    // Schema-isolation doctrine: this comes from the typed
+    // `profile.runtime.compaction.custom_instructions` only — never
+    // from `extras["customInstructions"]` (the dead-letter openclaw
+    // passthrough). See DESIGN.md "Schema isolation".
+    if let Some(text) = compaction.custom_instructions.as_deref() {
+        cmd.arg("--compactor-custom-instructions").arg(text);
+    }
 }
 
 /// Default per-dispatch wall-clock deadline. 10 minutes covers
@@ -1007,6 +1018,7 @@ mod tests {
             context_window: Some(101_000),
             strategy: Some(crate::types::CompactionStrategy::StructuredSlot),
             bail_after_compactions: None,
+            custom_instructions: None,
         };
         apply_compaction_flags(&mut cmd, &compaction);
         let args = args_of(&cmd);
@@ -1029,6 +1041,7 @@ mod tests {
         let mut cmd = Command::new("docker");
         let compaction = crate::crew::dispatch::CompactionDispatchArgs {
             bail_after_compactions: Some(3),
+            custom_instructions: None,
             ..Default::default()
         };
         apply_compaction_flags(&mut cmd, &compaction);
@@ -1049,6 +1062,42 @@ mod tests {
         assert!(
             !args.iter().any(|a| a == "--bail-after-compactions"),
             "no bail flag should appear when bail_after_compactions is None; got {args:?}"
+        );
+    }
+
+    /// (#383) Custom instructions emit `--compactor-custom-instructions
+    /// <text>` when set; omitted when None. Schema-isolation contract:
+    /// the typed `profile.runtime.compaction.custom_instructions` is
+    /// the only source the runtime sees — extras["customInstructions"]
+    /// is dead-letter (handled by the `from_profile_ignores_extras_*`
+    /// tests below).
+    #[test]
+    fn apply_compaction_flags_emits_custom_instructions_when_set() {
+        let mut cmd = Command::new("docker");
+        let compaction = crate::crew::dispatch::CompactionDispatchArgs {
+            custom_instructions: Some(
+                "Preserve verbatim X / list active files with what was learned".into(),
+            ),
+            ..Default::default()
+        };
+        apply_compaction_flags(&mut cmd, &compaction);
+        let args = args_of(&cmd);
+        assert!(
+            args.windows(2).any(|w| w[0] == "--compactor-custom-instructions"
+                && w[1] == "Preserve verbatim X / list active files with what was learned"),
+            "expected --compactor-custom-instructions with operator text; got {args:?}"
+        );
+    }
+
+    #[test]
+    fn apply_compaction_flags_omits_custom_instructions_when_none() {
+        let mut cmd = Command::new("docker");
+        let compaction = crate::crew::dispatch::CompactionDispatchArgs::default();
+        apply_compaction_flags(&mut cmd, &compaction);
+        let args = args_of(&cmd);
+        assert!(
+            !args.iter().any(|a| a == "--compactor-custom-instructions"),
+            "no custom-instructions flag should appear when None; got {args:?}"
         );
     }
 
@@ -1095,6 +1144,7 @@ mod tests {
                     tier1: None,
                     tier2: None,
                     reserve: None,
+                    custom_instructions: None,
                     extras: Default::default(),
                 }),
             }),
@@ -1136,6 +1186,7 @@ mod tests {
                         bail_after_token_count: None,
                         bail_after_compactions: Some(3),
                     }),
+                    custom_instructions: None,
                     extras: Default::default(),
                 }),
             }),
@@ -1227,6 +1278,7 @@ mod tests {
                     tier1: None,
                     tier2: None,
                     reserve: None,
+                    custom_instructions: None,
                     extras: Default::default(),
                 }),
             }),
@@ -1259,6 +1311,7 @@ mod tests {
                     tier1: None,
                     tier2: None,
                     reserve: None,
+                    custom_instructions: None,
                     extras: Default::default(),
                 }),
             }),
@@ -1304,6 +1357,7 @@ mod tests {
                     tier1: None,
                     tier2: None,
                     reserve: None,
+                    custom_instructions: None,
                     extras,
                 }),
             }),
@@ -1353,6 +1407,7 @@ mod tests {
                     tier1: None,
                     tier2: None,
                     reserve: None,
+                    custom_instructions: None,
                     extras,
                 }),
             }),
@@ -1362,6 +1417,98 @@ mod tests {
         assert!(
             args.threshold_ratio.is_none(),
             "clean break: openclaw extras must NOT auto-populate threshold_ratio"
+        );
+    }
+
+    /// (#383) `from_profile` reads the typed `custom_instructions`
+    /// field. Schema-isolation invariant: typed field is the only
+    /// source the internal runtime sees.
+    #[test]
+    fn from_profile_reads_typed_custom_instructions() {
+        use crate::types::{
+            ModelRole, Profile, ProfileModel, ProfileRuntime, RuntimeCompactionConfig,
+        };
+        let profile = Profile {
+            description: None,
+            models: vec![ProfileModel {
+                id: "primary-x".into(),
+                n_ctx: 100_000,
+                role: ModelRole::Primary,
+                identifier: None,
+            }],
+            runtime: Some(ProfileRuntime {
+                config_path: None,
+                context_tokens: None,
+                compaction: Some(RuntimeCompactionConfig {
+                    strategy: None,
+                    threshold_tokens: None,
+                    threshold_ratio: None,
+                    tier1: None,
+                    tier2: None,
+                    reserve: None,
+                    custom_instructions: Some(
+                        "Preserve verbatim X / list active files".into(),
+                    ),
+                    extras: Default::default(),
+                }),
+            }),
+            use_when: None,
+        };
+        let args = crate::crew::dispatch::CompactionDispatchArgs::from_profile(&profile);
+        assert_eq!(
+            args.custom_instructions.as_deref(),
+            Some("Preserve verbatim X / list active files")
+        );
+    }
+
+    /// (#383) `from_profile` IGNORES the openclaw-shape
+    /// `extras["customInstructions"]` passthrough — schema-isolation
+    /// doctrine (DESIGN.md "Schema isolation: each runtime owns its
+    /// own config"). Operators on legacy profiles need to migrate to
+    /// the typed `custom_instructions` field; a follow-up under [#380](https://github.com/kstrat2001/darkmux/issues/380) surfaces them via
+    /// doctor warning.
+    #[test]
+    fn from_profile_ignores_openclaw_custom_instructions_extras() {
+        use crate::types::{
+            ModelRole, Profile, ProfileModel, ProfileRuntime, RuntimeCompactionConfig,
+        };
+        let mut extras = serde_json::Map::new();
+        // Operator carries an openclaw-era `customInstructions` string
+        // in their profile (the heuristic used to write this; will
+        // stop in a follow-up under #380). The internal runtime MUST NOT pick it up — the
+        // typed field is the only valid source.
+        extras.insert(
+            "customInstructions".into(),
+            serde_json::json!("openclaw-shape passthrough — must be ignored by internal runtime"),
+        );
+        let profile = Profile {
+            description: None,
+            models: vec![ProfileModel {
+                id: "primary-x".into(),
+                n_ctx: 100_000,
+                role: ModelRole::Primary,
+                identifier: None,
+            }],
+            runtime: Some(ProfileRuntime {
+                config_path: None,
+                context_tokens: None,
+                compaction: Some(RuntimeCompactionConfig {
+                    strategy: None,
+                    threshold_tokens: None,
+                    threshold_ratio: None,
+                    tier1: None,
+                    tier2: None,
+                    reserve: None,
+                    custom_instructions: None,
+                    extras,
+                }),
+            }),
+            use_when: None,
+        };
+        let args = crate::crew::dispatch::CompactionDispatchArgs::from_profile(&profile);
+        assert!(
+            args.custom_instructions.is_none(),
+            "schema isolation: openclaw extras[customInstructions] must NOT auto-populate typed custom_instructions"
         );
     }
 

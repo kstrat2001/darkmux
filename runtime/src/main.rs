@@ -171,6 +171,10 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // plumbs from `profile.runtime.compaction.reserve.bail_after_compactions`
     // (typed field landed in #357; consumer is #377). None = unbounded.
     let mut bail_after_compactions: Option<u32> = None;
+    // (#383) Operator-tunable custom instructions for the compactor.
+    // Host plumbs from `profile.runtime.compaction.custom_instructions`
+    // (typed field, schema-isolation doctrine). None = no augmentation.
+    let mut compactor_custom_instructions: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -343,6 +347,15 @@ fn run_dispatch(args: &[String]) -> ExitCode {
                     return ExitCode::from(2);
                 }
             }
+            "--compactor-custom-instructions" => {
+                if let Some(v) = args.get(i + 1) {
+                    compactor_custom_instructions = Some(v.clone());
+                    i += 2;
+                } else {
+                    eprintln!("--compactor-custom-instructions requires a value");
+                    return ExitCode::from(2);
+                }
+            }
             other => {
                 eprintln!("unknown flag: {other}");
                 return ExitCode::from(2);
@@ -433,13 +446,14 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // fallback (operator's tuning surface is the profile JSON, not
     // shell env). The host's `dispatch_via_internal` derives values
     // from `profile.runtime.compaction.*` and passes them as flags.
-    let compaction_cfg = compaction::CompactionConfig::from_overrides_with_bail(
+    let compaction_cfg = compaction::CompactionConfig::from_overrides_with_bail_and_custom(
         compact_threshold_tokens,
         compactor_model,
         compact_threshold_ratio,
         context_window,
         compact_strategy,
         bail_after_compactions,
+        compactor_custom_instructions,
     );
     let run_result = loop_runner::run(
         &client,
