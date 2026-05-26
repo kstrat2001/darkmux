@@ -496,6 +496,9 @@ fn run_dispatch(args: &[String]) -> ExitCode {
             loop_runner::TerminalReason::EscalationTriggered(
                 loop_runner::EscalationReason::CompactionLimitReached,
             ) => "escalation_compaction_limit_reached",
+            loop_runner::TerminalReason::EscalationTriggered(
+                loop_runner::EscalationReason::CumulativeTokensExceeded,
+            ) => "escalation_cumulative_tokens_exceeded",
         },
         None => "error",
     };
