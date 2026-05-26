@@ -72,6 +72,33 @@ pub(crate) const BUILTIN_ROLE_PROMPTS: &[(&str, &str)] = &[
     ("legal-research", include_str!("../../templates/builtin/roles/legal-research.md")),
 ];
 
+/// (#425) Autonomous-dispatch preamble — prepended to specialist
+/// role prompts at dispatch-time so the model knows upfront it
+/// can't ask questions, can't pause, and should escalate
+/// explicitly if blocked. Admin roles (bounded-I/O transformers
+/// like mission-compiler) skip the preamble since they don't run
+/// agent loops.
+const AUTONOMOUS_DISPATCH_PREAMBLE: &str =
+    include_str!("../../templates/builtin/AUTONOMOUS_DISPATCH_PREAMBLE.md");
+
+/// (#425) Resolve the autonomous-dispatch preamble — operator-side
+/// override at `<crew_root>/AUTONOMOUS_DISPATCH_PREAMBLE.md` wins
+/// if present; otherwise the embedded default is returned.
+///
+/// The override path lets operators tune nudge wording per fleet /
+/// per machine without recompiling. Lives in the crew root rather
+/// than per-role so the preamble stays uniform across the
+/// specialist set.
+pub fn load_autonomous_dispatch_preamble() -> String {
+    let user_path = crew_root().join("AUTONOMOUS_DISPATCH_PREAMBLE.md");
+    if user_path.is_file() {
+        if let Ok(content) = fs::read_to_string(&user_path) {
+            return content;
+        }
+    }
+    AUTONOMOUS_DISPATCH_PREAMBLE.to_string()
+}
+
 /// Expose the embedded role-id list for callers that need to verify
 /// prompt coverage against `BUILTIN_ROLES` (e.g., doctor checks). Kept
 /// thin so the visibility surface stays minimal.
@@ -531,6 +558,7 @@ mod tests {
             tier: None,
             bail_after_compactions: None,
             escalation_posture: None,
+            role_family: None,
         };
         let json = serde_json::to_string(&role).unwrap();
         let back: Role = serde_json::from_str(&json).unwrap();
@@ -949,5 +977,129 @@ mod load_per_mission_tests {
         let roles = load_roles().unwrap();
         let coder = roles.iter().find(|r| r.id == "coder").expect("coder must load");
         assert_eq!(coder.description, "legacy-layout override");
+    }
+
+    // ─── #425: autonomous-dispatch preamble ─────────────────────────────
+
+    #[test]
+    fn embedded_preamble_contains_load_bearing_directives() {
+        // Smoke-check that the embedded preamble file has the
+        // directives it's meant to carry. A future edit that
+        // accidentally truncated the file or removed key phrasing
+        // would fail this test.
+        let preamble = AUTONOMOUS_DISPATCH_PREAMBLE;
+        assert!(preamble.contains("autonomous dispatch mode"));
+        assert!(preamble.contains("cannot ask questions"));
+        assert!(preamble.contains("cannot pause"));
+        assert!(preamble.contains("BLOCKED:"));
+    }
+
+    #[serial]
+    #[test]
+    fn load_preamble_returns_embedded_when_no_user_override() {
+        let _guard = TestCrewRoot::new();
+        let preamble = load_autonomous_dispatch_preamble();
+        assert!(preamble.contains("autonomous dispatch mode"));
+    }
+
+    #[serial]
+    #[test]
+    fn load_preamble_returns_user_override_when_present() {
+        let guard = TestCrewRoot::new();
+        let override_path = guard.path().join("AUTONOMOUS_DISPATCH_PREAMBLE.md");
+        std::fs::write(&override_path, "# CUSTOM OPERATOR PREAMBLE\nbe brief.").unwrap();
+        let preamble = load_autonomous_dispatch_preamble();
+        assert!(preamble.contains("CUSTOM OPERATOR PREAMBLE"));
+        assert!(!preamble.contains("autonomous dispatch mode"));
+    }
+
+    #[test]
+    fn role_family_default_is_specialist() {
+        // Field absent on Role manifests defaults to specialist
+        // (preventive: better to prepend an unneeded preamble than to
+        // miss prepending a needed one).
+        let role = Role {
+            id: "test-role".into(),
+            description: "A test role".into(),
+            capabilities: vec![],
+            tool_palette: ToolPalette { allow: vec!["read".into()], deny: vec![] },
+            escalation_contract: EscalationContract::BailWithExplanation,
+            prompt_path: None,
+            tier: None,
+            bail_after_compactions: None,
+            escalation_posture: None,
+            role_family: None,
+        };
+        assert!(role.is_specialist());
+    }
+
+    #[test]
+    fn role_family_admin_opts_out_of_specialist() {
+        let role = Role {
+            id: "test-role".into(),
+            description: "A test role".into(),
+            capabilities: vec![],
+            tool_palette: ToolPalette { allow: vec!["read".into()], deny: vec![] },
+            escalation_contract: EscalationContract::BailWithExplanation,
+            prompt_path: None,
+            tier: None,
+            bail_after_compactions: None,
+            escalation_posture: None,
+            role_family: Some("admin".into()),
+        };
+        assert!(!role.is_specialist());
+    }
+
+    #[test]
+    fn role_family_explicit_specialist_matches_default() {
+        let role = Role {
+            id: "test-role".into(),
+            description: "A test role".into(),
+            capabilities: vec![],
+            tool_palette: ToolPalette { allow: vec!["read".into()], deny: vec![] },
+            escalation_contract: EscalationContract::BailWithExplanation,
+            prompt_path: None,
+            tier: None,
+            bail_after_compactions: None,
+            escalation_posture: None,
+            role_family: Some("specialist".into()),
+        };
+        assert!(role.is_specialist());
+    }
+
+    #[serial]
+    #[test]
+    fn mission_compiler_manifest_declares_role_family_admin() {
+        // The one canonical admin role today. Pins the manifest's
+        // role_family value so a future edit that accidentally
+        // removed it would fail loudly + force a conscious decision.
+        let _guard = TestCrewRoot::new();
+        let roles = load_roles().expect("load_roles must succeed against embedded defaults");
+        let mc = roles.iter()
+            .find(|r| r.id == "mission-compiler")
+            .expect("mission-compiler must be in the embedded role registry");
+        assert_eq!(mc.role_family.as_deref(), Some("admin"),
+            "mission-compiler must be tagged role_family: admin — it's the canonical bounded-I/O role; \
+             retagging requires explicit operator decision since it changes preamble behavior");
+        assert!(!mc.is_specialist());
+    }
+
+    #[serial]
+    #[test]
+    fn other_embedded_roles_default_to_specialist() {
+        // Every embedded role OTHER than mission-compiler should
+        // default to specialist (either via absent field or explicit
+        // "specialist"). The preamble-prepend logic depends on this
+        // invariant being stable.
+        let _guard = TestCrewRoot::new();
+        let roles = load_roles().expect("load_roles must succeed against embedded defaults");
+        for r in &roles {
+            if r.id == "mission-compiler" {
+                continue;
+            }
+            assert!(r.is_specialist(),
+                "role `{}` must be specialist (default or explicit) — only mission-compiler is admin today",
+                r.id);
+        }
     }
 }

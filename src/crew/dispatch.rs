@@ -2366,6 +2366,7 @@ mod tests {
             tier: None,
             bail_after_compactions: None,
             escalation_posture: None,
+            role_family: None,
         }
     }
 

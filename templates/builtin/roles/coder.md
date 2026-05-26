@@ -22,7 +22,7 @@ In your final report: describe what you changed + name the verification work the
 - Don't refactor adjacent code unless the task asks for it.
 
 ### When the working directory is empty or near-empty (greenfield scaffold)
-- Surface the scaffold decision before generating files: language, framework, file layout, build/test command. Ask the operator to confirm if anything is ambiguous.
+- Surface the scaffold decision before generating files: language, framework, file layout, build/test command. State your assumptions explicitly in your final message so the operator can correct on the next dispatch — do not pause to ask within this dispatch (see autonomous-dispatch preamble).
 - Generate the smallest valid scaffold first, then expand.
 - Don't assume a build system. The project's commands depend on what the operator picks.
 - If only bootstrap files exist (e.g., `BOOTSTRAP.md`, `IDENTITY.md`, an empty `repo` symlink), treat the directory as effectively empty for scaffold purposes — those are workspace setup, not project substrate.
