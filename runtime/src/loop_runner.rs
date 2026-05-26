@@ -29,6 +29,7 @@ use anyhow::{anyhow, Result};
 
 use crate::compaction;
 use crate::cycle_detector::{CycleDetector, CycleSignal};
+use crate::failure_rate::{FailureCascadeSignal, FailureRateDetector};
 use crate::lmstudio::{ChatRequest, ChunkAccumulator, LmStudioClient, Message};
 use crate::plain_text_tool_calls::promote_plain_text_tool_calls;
 use crate::tools::{dispatch, Tool};
@@ -177,6 +178,11 @@ pub fn run(
     // calls within a sliding window. Observability-only in the MVP;
     // bail-on-cycle is a follow-up if warn alone proves insufficient.
     let mut cycle_detector = CycleDetector::new();
+    // (#419) Per-dispatch tool-failure-rate detector — warns on
+    // consecutive failures of one tool (e.g., agent retrying gcc
+    // inside sandbox where it doesn't exist). Sibling to the cycle
+    // detector; same MVP shape (warn-only).
+    let mut failure_rate_detector = FailureRateDetector::new();
 
     loop {
         if turns >= MAX_TURNS {
@@ -398,6 +404,27 @@ pub fn run(
                         call.function.arguments.len(),
                         result.len(),
                     );
+                    // (#419) Record into the failure-rate detector
+                    // AFTER dispatch so the result is available to
+                    // classify. Edge-triggered: counter resets on a
+                    // single success, warn fires once per cascade.
+                    if let Some(FailureCascadeSignal::Suspected {
+                        tool_name,
+                        consecutive_failures,
+                    }) = failure_rate_detector.record(&call.function.name, &result)
+                    {
+                        eprintln!(
+                            "darkmux-runtime: ✕ tool-failure cascade — `{}` failed {} times in a \
+                             row. The tool or its environment may need operator attention. \
+                             Operator-visible only; no behavior change.",
+                            tool_name, consecutive_failures
+                        );
+                        trajectory.append_tool_repeated_failure(
+                            turns,
+                            &tool_name,
+                            consecutive_failures,
+                        );
+                    }
                     messages.push(Message::tool_result(
                         call.id,
                         call.function.name,
@@ -1024,6 +1051,73 @@ mod tests {
             outcome.turns >= 100,
             "expected >= MAX_TURNS turns; got {}",
             outcome.turns
+        );
+    }
+
+    /// (#419) Mock returns the same `bash` tool call repeatedly;
+    /// the bash command targets a nonexistent path so each dispatch
+    /// returns a non-zero exit ("tool 'bash' returned error: ..."
+    /// pattern). After 3 consecutive failures, the failure-rate
+    /// detector should emit `dispatch.tool.repeated_failure` into
+    /// the trajectory. Edge-triggered: only one event despite many
+    /// more failed calls.
+    #[test]
+    #[serial_test::serial]
+    fn loop_emits_tool_repeated_failure_event_after_third_consecutive_bash_failure() {
+        let server = MockServer::start();
+        // Each turn the mock returns a bash call against a path that
+        // doesn't exist in the test workspace → tool returns
+        // "exit: N" with non-zero exit. The dispatch wrapper still
+        // returns Ok(text), but the text classifies as a failure.
+        let _bail_mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_json(
+                None,
+                Some(serde_json::json!([{
+                    "id": "call_failboat",
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "arguments": "{\"command\":\"false\",\"timeout_seconds\":5}",
+                    },
+                }])),
+                "tool_calls",
+                100,
+                10,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempdir::TempDir::new("failure-rate").unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("loop fail")];
+        let tools = [Tool::Bash];
+
+        let cfg = compaction::CompactionConfig::default();
+        let _outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg)
+            .expect("loop completes (MaxTurns)");
+
+        // Read the trajectory and find the failure-cascade event.
+        let traj_file = tmp.path().join(".darkmux-runtime").join("trajectory.jsonl");
+        let raw = std::fs::read_to_string(&traj_file).expect("trajectory file must exist");
+        let failure_events: Vec<_> = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["type"] == "dispatch.tool.repeated_failure")
+            .collect();
+        assert!(
+            !failure_events.is_empty(),
+            "expected at least one dispatch.tool.repeated_failure event"
+        );
+        let first = &failure_events[0];
+        assert_eq!(first["tool_name"], "bash");
+        assert_eq!(first["consecutive_failures"], 3);
+        // Edge-triggered: even though the loop runs 100 turns of
+        // failures, we should see exactly one cascade event for the
+        // single uninterrupted streak.
+        assert_eq!(
+            failure_events.len(), 1,
+            "edge-triggered detector must emit one event per cascade, not per failed turn"
         );
     }
 

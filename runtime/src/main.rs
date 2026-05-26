@@ -26,6 +26,7 @@ use std::process::ExitCode;
 
 mod compaction;
 mod cycle_detector;
+mod failure_rate;
 mod lmstudio;
 mod loop_runner;
 mod plain_text_tool_calls;
