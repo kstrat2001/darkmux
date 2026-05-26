@@ -83,21 +83,18 @@ impl DoctorReport {
     }
 }
 
-pub fn run() -> DoctorReport {
+pub fn run(include_openclaw: bool) -> DoctorReport {
     let mut checks = vec![
         check_profile_registry(),
         check_lms_binary(),
         check_models_loaded(),
         check_profile_loaded_match(),
-        check_runtime_command(),
-        check_runtime_version(),
         check_darkmux_version_vs_latest_release(),
         check_daemon_reachable(),
         check_ram_headroom(),
         check_ram_headroom_load_projection(),
         check_power_state(),
         check_platform_and_provider(),
-        check_agent_role_definitions(),
         check_crew_role_prompt_coverage(),
         check_flow_sink_health(),
         check_machine_id_resolution(),
@@ -106,13 +103,18 @@ pub fn run() -> DoctorReport {
         check_audit_integrity(),
         check_recommendation_drift(),
         check_recommended_profile_name_not_shadowed(),
-        check_role_model_pin_drift(),
         check_role_tool_vocab_typos(),
         check_beat33_legacy_crew_dir(),
         check_legacy_mission_layout(),
         check_legacy_compaction_extras(),
     ];
-    checks.extend(eureka_checks());
+    if include_openclaw {
+        checks.push(check_role_model_pin_drift());
+        checks.push(check_runtime_command());
+        checks.push(check_runtime_version());
+        checks.push(check_agent_role_definitions());
+    }
+    checks.extend(eureka_checks(include_openclaw));
     DoctorReport { checks }
 }
 
@@ -950,7 +952,7 @@ const MIN_OPENCLAW_VERSION: (u32, u32, u32) = (2026, 5, 4);
 /// Run the eureka rule set and map each verdict to a doctor `Check`.
 /// Each rule produces one check row so the user sees which specific
 /// patterns matched/didn't match their setup.
-fn eureka_checks() -> Vec<Check> {
+fn eureka_checks(include_openclaw: bool) -> Vec<Check> {
     let ctx = eureka::Context::collect();
     eureka::evaluate_all(&ctx)
         .into_iter()
@@ -988,6 +990,31 @@ fn eureka_checks() -> Vec<Check> {
                 message: format!("(skipped: {reason})"),
                 hint: None,
             },
+        })
+        // (#393) Suppress all openclaw-mentioning eureka checks from
+        // default doctor output per the schema-isolation doctrine
+        // (DESIGN.md "Schema isolation: each runtime owns its own
+        // config"). The OC-coupled eureka rules (ctx-window-mismatch,
+        // safeguard-compaction-mode, n-ctx-exceeds-model-max,
+        // compactor-not-loaded, primary-config-drift,
+        // agents-default-model-resolves) still execute but their
+        // resulting Check is filtered out when its message OR hint
+        // mentions openclaw — covers Skipped("no ~/.openclaw/...")
+        // verdicts, Fire verdicts whose remediation hints point at
+        // openclaw.json, and any other OC-leaking surface. With
+        // `--include-openclaw` set, the operator opts in and these
+        // surface normally.
+        .filter(|check| {
+            if include_openclaw {
+                return true;
+            }
+            let mentions_oc = check.message.to_lowercase().contains("openclaw")
+                || check
+                    .hint
+                    .as_deref()
+                    .map(|h| h.to_lowercase().contains("openclaw"))
+                    .unwrap_or(false);
+            !mentions_oc
         })
         .collect()
 }
@@ -2489,7 +2516,7 @@ mod tests {
 
     #[test]
     fn run_returns_static_plus_eureka_checks() {
-        let r = run();
+        let r = run(true);
         // 23 baseline checks (incl. runtime version + load projection +
         // daemon reachable + darkmux-version-vs-latest-release [#13] +
         // crew-role-prompt-coverage [#141] + flow-sink-health [#170] +
@@ -2600,13 +2627,13 @@ mod tests {
 
     #[test]
     fn platform_check_always_present() {
-        let r = run();
+        let r = run(true);
         assert!(r.checks.iter().any(|c| c.name.contains("platform")));
     }
 
     #[test]
     fn agent_role_check_always_present() {
-        let r = run();
+        let r = run(true);
         assert!(r.checks.iter().any(|c| c.name.contains("agent role")));
     }
 
@@ -3122,6 +3149,92 @@ mod tests {
             "with a real file at the env-var path, the missing-config skip path \
              must NOT fire; got: {}",
             check.message
+        );
+    }
+
+    // ─── #387: --include-openclaw flag gate tests ─────────────
+
+    /// Default `run(false)` must NOT include any OC-specific checks.
+    /// The four gated checks are: role-model pin drift, runtime command,
+    /// runtime version, agent role scaffolds.
+    #[test]
+    fn doctor_default_skips_openclaw_checks() {
+        let report = run(false);
+
+        // Collect names of checks that match OC-specific patterns.
+        let oc_names: Vec<&str> = report
+            .checks
+            .iter()
+            .filter(|c| {
+                let n = c.name.to_lowercase();
+                n.contains("runtime command")
+                    || n.contains("runtime version")
+                    || n.contains("role-model pin drift")
+                    || n.contains("agent role scaffolds")
+            })
+            .map(|c| c.name.as_str())
+            .collect();
+
+        assert!(
+            oc_names.is_empty(),
+            "default doctor (include_openclaw=false) must not run OC checks; \
+             found: {:?}",
+            oc_names
+        );
+
+        // (#393) The schema-isolation success criterion also requires that
+        // OC-reading eureka rules (ctx-window-mismatch, n-ctx-exceeds-max,
+        // etc.) don't emit their "no ~/.openclaw/openclaw.json — skipping"
+        // messages in default mode. The eureka_checks filter strips these
+        // Skipped("openclaw...") verdicts when include_openclaw=false.
+        let openclaw_mentions: Vec<&str> = report
+            .checks
+            .iter()
+            .filter(|c| {
+                c.message.to_lowercase().contains("openclaw")
+                    || c.name.to_lowercase().contains("openclaw")
+                    || c
+                        .hint
+                        .as_deref()
+                        .map(|h| h.to_lowercase().contains("openclaw"))
+                        .unwrap_or(false)
+            })
+            .map(|c| c.name.as_str())
+            .collect();
+
+        assert!(
+            openclaw_mentions.is_empty(),
+            "default doctor must not surface any check that mentions openclaw \
+             (schema-isolation success criterion); found: {:?}",
+            openclaw_mentions
+        );
+    }
+
+    /// `run(true)` must include all four OC-specific checks.
+    #[test]
+    fn doctor_with_include_openclaw_runs_them() {
+        let report = run(true);
+
+        // Collect names of checks that match OC-specific patterns.
+        let oc_names: Vec<&str> = report
+            .checks
+            .iter()
+            .filter(|c| {
+                let n = c.name.to_lowercase();
+                n.contains("runtime command")
+                    || n.contains("runtime version")
+                    || n.contains("role-model pin drift")
+                    || n.contains("agent role scaffolds")
+            })
+            .map(|c| c.name.as_str())
+            .collect();
+
+        assert!(
+            oc_names.len() == 4,
+            "doctor with include_openclaw=true must run all 4 OC checks; \
+             found {} (expected 4): {:?}",
+            oc_names.len(),
+            oc_names
         );
     }
 }

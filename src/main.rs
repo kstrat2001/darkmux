@@ -84,6 +84,12 @@ enum Cmd {
     /// Run pre-flight diagnostic checks. Verifies the local setup (profile
     /// registry, LMStudio, models, runtime, RAM, power) and reports
     /// pass/warn/fail with actionable hints. Exit 0 if no failures, else 1.
+    ///
+    /// By default only runs internal-runtime-relevant checks. Pass
+    /// `--include-openclaw` to also run checks against
+    /// ~/.openclaw/openclaw.json (model pin drift, runtime binary
+    /// discovery, version, agent definitions). See DESIGN.md "Schema
+    /// isolation: each runtime owns its own config".
     Doctor {
         /// Attempt to auto-apply known-safe fixes for failing or warning
         /// checks where a handler is registered (currently:
@@ -92,6 +98,14 @@ enum Cmd {
         /// the fixes run, doctor re-evaluates and prints the updated report.
         #[arg(long)]
         fix: bool,
+        /// (#393) Include openclaw-specific checks.
+        /// Default: doctor output is internal-runtime-only. With this
+        /// flag, also runs checks against ~/.openclaw/openclaw.json
+        /// (model pin drift, runtime binary discovery, version, agent
+        /// definitions). See DESIGN.md "Schema isolation: each runtime
+        /// owns its own config".
+        #[arg(long)]
+        include_openclaw: bool,
     },
     /// Scan the LMStudio model catalog for downloaded models that aren't yet
     /// covered by any profile. For each uncovered model, suggests a task class
@@ -924,7 +938,7 @@ fn run(cmd: Cmd) -> Result<i32> {
         Cmd::Lab { sub } => cmd_lab(sub),
         Cmd::Skills { sub } => cmd_skills(sub),
         Cmd::Notebook { sub } => cmd_notebook(sub),
-        Cmd::Doctor { fix } => cmd_doctor(fix),
+        Cmd::Doctor { fix, include_openclaw } => cmd_doctor(fix, include_openclaw),
         Cmd::Scan { config } => cmd_scan(config.as_deref()),
         Cmd::Profile { sub } => cmd_profile(sub),
         Cmd::Model { sub } => cmd_model(sub),
@@ -1030,8 +1044,8 @@ fn cmd_notebook(sub: NotebookCmd) -> Result<i32> {
     }
 }
 
-fn cmd_doctor(fix: bool) -> Result<i32> {
-    let report = doctor::run();
+fn cmd_doctor(fix: bool, include_openclaw: bool) -> Result<i32> {
+    let report = doctor::run(include_openclaw);
     doctor::print_report(&report)?;
 
     // --fix path: attempt known-safe auto-fixes for failing/warning rules,
@@ -1053,7 +1067,7 @@ fn cmd_doctor(fix: bool) -> Result<i32> {
             println!();
             println!("Re-running doctor…");
             println!();
-            let report2 = doctor::run();
+            let report2 = doctor::run(include_openclaw);
             doctor::print_report(&report2)?;
             report2
         }
