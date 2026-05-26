@@ -529,6 +529,8 @@ mod tests {
             escalation_contract: EscalationContract::BailWithExplanation,
             prompt_path: None,
             tier: None,
+            bail_after_compactions: None,
+            escalation_posture: None,
         };
         let json = serde_json::to_string(&role).unwrap();
         let back: Role = serde_json::from_str(&json).unwrap();

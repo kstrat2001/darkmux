@@ -69,6 +69,26 @@ pub struct Role {
     /// against single-machine fleets unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier: Option<String>,
+    /// (#377) Per-role escalation bound — overrides
+    /// `profile.runtime.compaction.reserve.bail_after_compactions`
+    /// when set. Sprint-shaped roles (coder, reviewer) typically pin
+    /// a low value (2-3) for tight bound; long-arc roles (researcher,
+    /// mission-compiler) may pin higher (5-7) for more local-tier
+    /// runway. Absent ⇒ profile default ⇒ runtime default (unbounded).
+    /// Schema-compatible: older role manifests without the field
+    /// continue to work unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bail_after_compactions: Option<u32>,
+    /// (#377) What to do when an escalation bound fires. `"auto"`
+    /// (default) emits the `EscalationTriggered` terminal and exits
+    /// the dispatch — frontier-tier picks up via the
+    /// `darkmux-escalation-handler` skill. `"pause"` is the operator
+    /// opt-in for roles where work should NOT auto-escalate (e.g. a
+    /// human-supervised long-arc role). The runtime treats both the
+    /// same today; the field is plumbed for the host/skill layer to
+    /// branch on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalation_posture: Option<String>,
 }
 
 /// Which tool operations a role is allowed or denied.

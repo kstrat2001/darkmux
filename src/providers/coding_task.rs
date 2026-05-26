@@ -230,6 +230,9 @@ impl WorkloadProvider for CodingTaskProvider {
                 // profile.runtime.compaction.* without env-var
                 // gymnastics. Profile is the operator's tuning
                 // source-of-truth; this is the host-side bridge.
+                // (#377) Per-role override applied inside
+                // dispatch_via_internal where the role manifest is
+                // already loaded — single lookup point.
                 let compaction =
                     crate::crew::dispatch::CompactionDispatchArgs::from_profile(profile);
                 // Pass sandbox_dir as --workdir so the runtime mounts

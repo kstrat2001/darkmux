@@ -61,6 +61,8 @@ fn main() -> ExitCode {
             println!("    [--no-stream] [--json] [--allowed-tools csv]");
             println!("    [--compact-threshold-tokens N] [--compactor-model id]");
             println!("    [--compact-threshold-ratio 0.1-0.9] [--context-window N]");
+            println!("    [--compact-strategy narrative|structured-slot]");
+            println!("    [--bail-after-compactions N]");
             println!();
             println!("Flags:");
             println!("  --json       Emit structured envelope on stdout (status to stderr).");
@@ -164,6 +166,11 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // `profile.runtime.compaction.strategy: "structured-slot"` which
     // host plumbs via `--compact-strategy structured-slot`.
     let mut compact_strategy: Option<compaction::CompactionStrategy> = None;
+    // (#377) Escalation bound — after this many compactions, the
+    // runtime exits with TerminalReason::EscalationTriggered. Host
+    // plumbs from `profile.runtime.compaction.reserve.bail_after_compactions`
+    // (typed field landed in #357; consumer is #377). None = unbounded.
+    let mut bail_after_compactions: Option<u32> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -317,6 +324,25 @@ fn run_dispatch(args: &[String]) -> ExitCode {
                     return ExitCode::from(2);
                 }
             }
+            "--bail-after-compactions" => {
+                if let Some(v) = args.get(i + 1) {
+                    match v.parse::<u32>() {
+                        Ok(n) => {
+                            bail_after_compactions = Some(n);
+                            i += 2;
+                        }
+                        Err(_) => {
+                            eprintln!(
+                                "--bail-after-compactions requires a positive integer (got: {v})"
+                            );
+                            return ExitCode::from(2);
+                        }
+                    }
+                } else {
+                    eprintln!("--bail-after-compactions requires a value");
+                    return ExitCode::from(2);
+                }
+            }
             other => {
                 eprintln!("unknown flag: {other}");
                 return ExitCode::from(2);
@@ -407,12 +433,13 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // fallback (operator's tuning surface is the profile JSON, not
     // shell env). The host's `dispatch_via_internal` derives values
     // from `profile.runtime.compaction.*` and passes them as flags.
-    let compaction_cfg = compaction::CompactionConfig::from_overrides(
+    let compaction_cfg = compaction::CompactionConfig::from_overrides_with_bail(
         compact_threshold_tokens,
         compactor_model,
         compact_threshold_ratio,
         context_window,
         compact_strategy,
+        bail_after_compactions,
     );
     let run_result = loop_runner::run(
         &client,
@@ -444,6 +471,14 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         Some(o) => match o.terminal_reason {
             loop_runner::TerminalReason::Stop => "stop",
             loop_runner::TerminalReason::MaxTurns => "max_turns",
+            // (#377) The `result` field is operator-visible in the
+            // JSON envelope; consumers (qa-review skill, lab adapter,
+            // future heuristic engine) branch on it. New variants get
+            // distinct snake-case strings so existing consumers can
+            // add a case without grepping for hidden behavior.
+            loop_runner::TerminalReason::EscalationTriggered(
+                loop_runner::EscalationReason::CompactionLimitReached,
+            ) => "escalation_compaction_limit_reached",
         },
         None => "error",
     };

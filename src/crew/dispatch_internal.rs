@@ -70,6 +70,13 @@ fn apply_compaction_flags(
         };
         cmd.arg("--compact-strategy").arg(kebab);
     }
+    // (#377) Escalation bound → `--bail-after-compactions N`.
+    // Runtime exits with EscalationTriggered when this many
+    // compactions have occurred. None ⇒ flag omitted ⇒ runtime is
+    // unbounded (back-compat with pre-#377 behavior).
+    if let Some(n) = compaction.bail_after_compactions {
+        cmd.arg("--bail-after-compactions").arg(n.to_string());
+    }
 }
 
 /// Default per-dispatch wall-clock deadline. 10 minutes covers
@@ -295,7 +302,13 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // default. End-state: operator tunes via profile JSON → these
     // four flags flow into the container → no env vars touch the
     // surface anywhere.
-    apply_compaction_flags(&mut cmd, &opts.compaction);
+    // (#377) Per-role escalation-bound overlay: role manifest's
+    // `bail_after_compactions` wins over profile fallback when set.
+    // Lookup chain: role > profile > unset. The role was already
+    // loaded at the top of this function.
+    let mut compaction = opts.compaction.clone();
+    compaction.apply_role_override(role);
+    apply_compaction_flags(&mut cmd, &compaction);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let child = cmd.spawn().context("spawning darkmux-runtime container")?;
@@ -993,6 +1006,7 @@ mod tests {
             threshold_ratio: Some(0.35),
             context_window: Some(101_000),
             strategy: Some(crate::types::CompactionStrategy::StructuredSlot),
+            bail_after_compactions: None,
         };
         apply_compaction_flags(&mut cmd, &compaction);
         let args = args_of(&cmd);
@@ -1005,6 +1019,37 @@ mod tests {
         assert!(args.iter().any(|a| a == "101000"));
         assert!(args.iter().any(|a| a == "--compact-strategy"));
         assert!(args.iter().any(|a| a == "structured-slot"));
+    }
+
+    /// (#377) Escalation bound emits `--bail-after-compactions N`
+    /// when set; omitted when None (back-compat with pre-#377 runtime
+    /// + back-compat with operators who haven't configured the bound).
+    #[test]
+    fn apply_compaction_flags_emits_bail_when_set() {
+        let mut cmd = Command::new("docker");
+        let compaction = crate::crew::dispatch::CompactionDispatchArgs {
+            bail_after_compactions: Some(3),
+            ..Default::default()
+        };
+        apply_compaction_flags(&mut cmd, &compaction);
+        let args = args_of(&cmd);
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--bail-after-compactions" && w[1] == "3"),
+            "expected --bail-after-compactions 3; got {args:?}"
+        );
+    }
+
+    #[test]
+    fn apply_compaction_flags_omits_bail_when_none() {
+        let mut cmd = Command::new("docker");
+        let compaction = crate::crew::dispatch::CompactionDispatchArgs::default();
+        apply_compaction_flags(&mut cmd, &compaction);
+        let args = args_of(&cmd);
+        assert!(
+            !args.iter().any(|a| a == "--bail-after-compactions"),
+            "no bail flag should appear when bail_after_compactions is None; got {args:?}"
+        );
     }
 
     /// (#372 T2-C) Strategy alone (no other overrides) still emits
@@ -1057,6 +1102,138 @@ mod tests {
         };
         let args = crate::crew::dispatch::CompactionDispatchArgs::from_profile(&profile);
         assert_eq!(args.strategy, Some(CompactionStrategy::StructuredSlot));
+    }
+
+    /// (#377) `from_profile` reads `compaction.reserve.bail_after_compactions`
+    /// (typed field that landed in #357) and surfaces it on
+    /// `CompactionDispatchArgs` so apply_compaction_flags can plumb the
+    /// `--bail-after-compactions N` CLI flag to the runtime. Profile-
+    /// level only at this chunk; per-role override comes in chunk 4.
+    #[test]
+    fn from_profile_derives_bail_after_compactions_from_reserve() {
+        use crate::types::{
+            ModelRole, Profile, ProfileModel, ProfileRuntime, ReserveConfig,
+            RuntimeCompactionConfig,
+        };
+        let profile = Profile {
+            description: None,
+            models: vec![ProfileModel {
+                id: "primary-x".into(),
+                n_ctx: 100_000,
+                role: ModelRole::Primary,
+                identifier: None,
+            }],
+            runtime: Some(ProfileRuntime {
+                config_path: None,
+                context_tokens: None,
+                compaction: Some(RuntimeCompactionConfig {
+                    strategy: None,
+                    threshold_tokens: None,
+                    threshold_ratio: None,
+                    tier1: None,
+                    tier2: None,
+                    reserve: Some(ReserveConfig {
+                        bail_after_token_count: None,
+                        bail_after_compactions: Some(3),
+                    }),
+                    extras: Default::default(),
+                }),
+            }),
+            use_when: None,
+        };
+        let args = crate::crew::dispatch::CompactionDispatchArgs::from_profile(&profile);
+        assert_eq!(args.bail_after_compactions, Some(3));
+    }
+
+    /// (#377) Per-role override wins over profile fallback. Operator
+    /// pins `bail_after_compactions = 2` on the coder role; profile
+    /// default is 5. Resolved value must be the role's 2, NOT the
+    /// profile's 5.
+    #[test]
+    fn apply_role_override_overlays_role_bail_on_top_of_profile() {
+        use crate::crew::dispatch::CompactionDispatchArgs;
+        use crate::crew::types::{EscalationContract, Role, ToolPalette};
+        let mut args = CompactionDispatchArgs {
+            bail_after_compactions: Some(5), // profile default
+            ..Default::default()
+        };
+        let role = Role {
+            id: "coder".into(),
+            description: "test".into(),
+            capabilities: vec![],
+            tool_palette: ToolPalette::default(),
+            escalation_contract: EscalationContract::BailWithExplanation,
+            prompt_path: None,
+            tier: None,
+            bail_after_compactions: Some(2), // role pin
+            escalation_posture: None,
+        };
+        args.apply_role_override(&role);
+        assert_eq!(args.bail_after_compactions, Some(2), "role pin wins");
+    }
+
+    /// (#377) When the role's `bail_after_compactions` is None, the
+    /// profile fallback survives. Catches the regression where
+    /// apply_role_override unconditionally writes the field (would
+    /// clobber profile defaults to None for roles that haven't opted
+    /// into per-role escalation pinning).
+    #[test]
+    fn apply_role_override_preserves_profile_default_when_role_unset() {
+        use crate::crew::dispatch::CompactionDispatchArgs;
+        use crate::crew::types::{EscalationContract, Role, ToolPalette};
+        let mut args = CompactionDispatchArgs {
+            bail_after_compactions: Some(5), // profile default
+            ..Default::default()
+        };
+        let role = Role {
+            id: "coder".into(),
+            description: "test".into(),
+            capabilities: vec![],
+            tool_palette: ToolPalette::default(),
+            escalation_contract: EscalationContract::BailWithExplanation,
+            prompt_path: None,
+            tier: None,
+            bail_after_compactions: None, // role didn't pin
+            escalation_posture: None,
+        };
+        args.apply_role_override(&role);
+        assert_eq!(
+            args.bail_after_compactions,
+            Some(5),
+            "profile fallback survives when role doesn't pin"
+        );
+    }
+
+    #[test]
+    fn from_profile_bail_after_compactions_is_none_when_reserve_absent() {
+        use crate::types::{
+            ModelRole, Profile, ProfileModel, ProfileRuntime, RuntimeCompactionConfig,
+        };
+        let profile = Profile {
+            description: None,
+            models: vec![ProfileModel {
+                id: "primary-x".into(),
+                n_ctx: 100_000,
+                role: ModelRole::Primary,
+                identifier: None,
+            }],
+            runtime: Some(ProfileRuntime {
+                config_path: None,
+                context_tokens: None,
+                compaction: Some(RuntimeCompactionConfig {
+                    strategy: None,
+                    threshold_tokens: None,
+                    threshold_ratio: None,
+                    tier1: None,
+                    tier2: None,
+                    reserve: None,
+                    extras: Default::default(),
+                }),
+            }),
+            use_when: None,
+        };
+        let args = crate::crew::dispatch::CompactionDispatchArgs::from_profile(&profile);
+        assert_eq!(args.bail_after_compactions, None);
     }
 
     #[test]
