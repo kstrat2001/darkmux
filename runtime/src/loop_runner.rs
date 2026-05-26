@@ -28,6 +28,7 @@ use std::collections::HashSet;
 use anyhow::{anyhow, Result};
 
 use crate::compaction;
+use crate::cycle_detector::{CycleDetector, CycleSignal};
 use crate::lmstudio::{ChatRequest, ChunkAccumulator, LmStudioClient, Message};
 use crate::plain_text_tool_calls::promote_plain_text_tool_calls;
 use crate::tools::{dispatch, Tool};
@@ -172,6 +173,10 @@ pub fn run(
     let mut total_completion_tokens: u32 = 0;
     let mut compactions: u32 = 0;
     let mut latest_prompt_tokens: u32 = 0;
+    // (#418) Per-dispatch cycle detector — warns on repeated tool
+    // calls within a sliding window. Observability-only in the MVP;
+    // bail-on-cycle is a follow-up if warn alone proves insufficient.
+    let mut cycle_detector = CycleDetector::new();
 
     loop {
         if turns >= MAX_TURNS {
@@ -359,6 +364,32 @@ pub fn run(
                 // tool.completed event so the operator can see what
                 // ran post-dispatch.
                 for (tool_seq, call) in calls.into_iter().enumerate() {
+                    // (#418) Record the call into the cycle detector
+                    // BEFORE dispatch so the suspicion event lands
+                    // immediately next to the tool.completed event in
+                    // trajectory order. Edge-triggered: same hash
+                    // continuing to repeat does NOT re-fire.
+                    if let Some(CycleSignal::Suspected {
+                        tool_name,
+                        canonical_args,
+                        count,
+                        window_size,
+                    }) = cycle_detector.record(&call.function.name, &call.function.arguments)
+                    {
+                        eprintln!(
+                            "darkmux-runtime: ⟳ cycle suspected — tool `{}` called {} times in \
+                             the last {} turns with the same canonical args. Operator-visible \
+                             only; no behavior change.",
+                            tool_name, count, window_size
+                        );
+                        trajectory.append_cycle_suspected(
+                            turns,
+                            &tool_name,
+                            &canonical_args,
+                            count,
+                            window_size,
+                        );
+                    }
                     let result = dispatch(&call.function.name, &call.function.arguments);
                     trajectory.append_tool_completed(
                         turns,
@@ -994,6 +1025,67 @@ mod tests {
             "expected >= MAX_TURNS turns; got {}",
             outcome.turns
         );
+    }
+
+    /// (#418) Mock always returns the same `read` tool call with the
+    /// same path; loop dispatches; cycle detector should fire a
+    /// `dispatch.cycle.suspected` event into the trajectory after
+    /// the third occurrence in the default window. Edge-triggered:
+    /// later calls in the same dispatch do NOT add more events
+    /// (unless the hash drops out of the window and re-crosses).
+    #[test]
+    #[serial_test::serial]
+    fn loop_emits_cycle_suspected_event_after_third_identical_tool_call() {
+        let server = MockServer::start();
+        // Mock returns the SAME read call every time. Loop will keep
+        // dispatching (`tool_calls` finish_reason) until MAX_TURNS.
+        let _bail_mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_json(
+                None,
+                Some(serde_json::json!([{
+                    "id": "call_loop",
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "arguments": "{\"path\":\"/workspace/x.txt\",\"offset\":1,\"limit\":50}",
+                    },
+                }])),
+                "tool_calls",
+                100,
+                10,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempdir::TempDir::new("cycle-detect").unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("loop")];
+        let tools = [Tool::Read];
+
+        let cfg = compaction::CompactionConfig::default();
+        // Let the loop run to MAX_TURNS — the cycle should fire well before.
+        let _outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg)
+            .expect("loop completes (MaxTurns)");
+
+        // Read the trajectory and count cycle.suspected events.
+        // Trajectory::open writes under `<dir>/.darkmux-runtime/trajectory.jsonl`.
+        let traj_file = tmp.path().join(".darkmux-runtime").join("trajectory.jsonl");
+        let raw = std::fs::read_to_string(&traj_file).expect("trajectory file must exist");
+        let cycle_events: Vec<_> = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["type"] == "dispatch.cycle.suspected")
+            .collect();
+        assert!(
+            !cycle_events.is_empty(),
+            "expected at least one dispatch.cycle.suspected event in trajectory"
+        );
+        // First event should have count==3 (default warn threshold)
+        let first = &cycle_events[0];
+        assert_eq!(first["tool_name"], "read");
+        assert_eq!(first["count"], 3);
+        assert!(first["canonical_args"].as_str().unwrap().contains("x.txt"));
     }
 
     /// (#406) The 20% silent-bail scenario: model returned
