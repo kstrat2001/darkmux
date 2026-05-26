@@ -186,6 +186,35 @@ impl Trajectory {
         }));
     }
 
+    /// dispatch.cycle.suspected — fires (edge-triggered) when the
+    /// cycle detector observes the same tool_name+canonical_args
+    /// hash appearing K times within the recent window of N tool
+    /// calls (#418). Observability-only in the MVP — no behavioral
+    /// change. The "model keeps reading the same file" pattern that
+    /// MAX_TURNS catches LATE; this catches it EARLY for operator
+    /// visibility. Hash collisions across compactions: yes, expected
+    /// (the same file may legitimately be re-read after compaction
+    /// evicts it from history); the warn is informational, not
+    /// accusatory.
+    pub fn append_cycle_suspected(
+        &mut self,
+        seq: u32,
+        tool_name: &str,
+        canonical_args: &str,
+        count: usize,
+        window_size: usize,
+    ) {
+        self.write_event(&serde_json::json!({
+            "type": "dispatch.cycle.suspected",
+            "seq": seq,
+            "ts": unix_ms(),
+            "tool_name": tool_name,
+            "canonical_args": canonical_args,
+            "count": count,
+            "window_size": window_size,
+        }));
+    }
+
     /// tool_call.promoted — recovery event when the runtime promoted
     /// plain-text tool-call markup back into structured tool_calls
     /// (#406). `source` is either `"content"` or `"reasoning"`
