@@ -23,10 +23,13 @@
 //! - No per-profile threshold derivation (compaction threshold is env-
 //!   tunable but global, not derived from active darkmux profile).
 
+use std::collections::HashSet;
+
 use anyhow::{anyhow, Result};
 
 use crate::compaction;
 use crate::lmstudio::{ChatRequest, ChunkAccumulator, LmStudioClient, Message};
+use crate::plain_text_tool_calls::promote_plain_text_tool_calls;
 use crate::tools::{dispatch, Tool};
 use crate::trajectory::Trajectory;
 
@@ -132,6 +135,12 @@ pub fn run(
 ) -> Result<LoopOutcome> {
     let mut messages = initial_messages;
     let tool_defs: Vec<_> = tools.iter().map(|t| t.to_tool_def()).collect();
+    // Set of tool names the model is allowed to call. Drives the
+    // plain-text-tool-call promoter (#406): any tool name in the
+    // promoted markup that isn't here is rejected so adversarial /
+    // malformed output can't smuggle arbitrary tool names into the
+    // dispatch pipeline.
+    let allowed_tool_names: HashSet<String> = tools.iter().map(|t| t.name().to_string()).collect();
 
     let mut turns: u32 = 0;
     let mut total_prompt_tokens: u32 = 0;
@@ -172,12 +181,68 @@ pub fn run(
         };
 
         let next_seq = turns + 1;
-        let response = if streaming {
+        let mut response = if streaming {
             run_streaming_turn(client, &request, next_seq, trajectory)?
         } else {
             client.chat(&request)?
         };
         turns += 1;
+
+        // (#406) Recover plain-text tool calls the model emitted in
+        // `content` or `reasoning_content` instead of the structured
+        // `tool_calls` field. Three formats recognized: bracket /
+        // harmony (mirrors openclaw's `promoteLmstudioPlainTextToolCalls`)
+        // and XML (the Qwen 3.x thinking-mode case openclaw doesn't
+        // handle today). When promotion fires we flip `finish_reason`
+        // to `"tool_calls"` regardless of its incoming value so the
+        // downstream match below routes into the dispatch branch — the
+        // model intended to call a tool, it just emitted the markup
+        // in the wrong field. This catches both `"stop"` (the V4 N=5
+        // bail shape) and the rarer `"length"` (which would otherwise
+        // hit the context-overflow Err path and throw away a perfectly
+        // good recovered call).
+        let promotion = response
+            .choices
+            .first_mut()
+            .and_then(|choice| {
+                let info = promote_plain_text_tool_calls(&mut choice.message, &allowed_tool_names)?;
+                choice.finish_reason = "tool_calls".to_string();
+                Some(info)
+            });
+        if let Some(info) = promotion {
+            trajectory.append_tool_call_promoted(
+                turns,
+                info.source.as_str(),
+                info.format.as_str(),
+                info.call_count,
+            );
+        }
+
+        // (#406) Clear `reasoning_content` from the response message
+        // now that the promoter has had its chance to scan it. The
+        // Message struct's `reasoning_content` field carries a
+        // documented invariant (`runtime/src/lmstudio.rs` Message
+        // doc): "skip-serialize so outgoing request messages never
+        // emit it (always None on the request side)". The streaming
+        // path used to enforce this by stripping reasoning via
+        // `accumulator.take_reasoning_content()` BEFORE building the
+        // response; #406 re-attached it so the promoter could scan
+        // it. The original invariant must hold from this point on —
+        // the response message is about to be cloned into the
+        // conversation history (`messages.push(assistant_message)`)
+        // and shipped back to LMStudio on the next request. Carrying
+        // reasoning_content into request-side history caused a
+        // recursive-feedback regression (Beat 47 attempt 2: run 2
+        // hit MAX_TURNS with 100 thinking-mode entries; run 3 went
+        // 1235s before runtime exit). Clearing here restores the
+        // pre-#406 behavior for the conversation history while
+        // preserving the promoter's ability to scan reasoning above.
+        // (Promotion-from-reasoning path also clears reasoning_content
+        // inside `apply_promotion`, so this is idempotent on that
+        // path.)
+        if let Some(choice) = response.choices.first_mut() {
+            choice.message.reasoning_content = None;
+        }
 
         if let Some(usage) = &response.usage {
             total_prompt_tokens = total_prompt_tokens.saturating_add(usage.prompt_tokens);
@@ -442,7 +507,7 @@ fn run_streaming_turn(
     let partial_count = accumulator.partial_count();
     let total_content = accumulator.content_bytes();
     let reasoning_content = accumulator.take_reasoning_content();
-    let response = accumulator.into_response();
+    let mut response = accumulator.into_response();
     let tool_calls_count = response
         .choices
         .first()
@@ -452,6 +517,14 @@ fn run_streaming_turn(
     trajectory.append_model_streaming_end(seq, partial_count, total_content, tool_calls_count);
     if let Some(reasoning) = reasoning_content {
         trajectory.append_model_reasoning(seq, &reasoning, "separate-field");
+        // (#406) Surface reasoning_content on the response message so
+        // the caller's plain-text-tool-call promoter can scan it.
+        // Without this the streaming path loses the reasoning field
+        // before promotion runs — and Qwen 3.x thinking-mode bails
+        // ride in reasoning, not content.
+        if let Some(choice) = response.choices.first_mut() {
+            choice.message.reasoning_content = Some(reasoning);
+        }
     }
     Ok(response)
 }
@@ -890,6 +963,276 @@ mod tests {
             "expected >= MAX_TURNS turns; got {}",
             outcome.turns
         );
+    }
+
+    /// (#406) The 20% silent-bail scenario: model returned
+    /// `finish_reason=stop` with `content` containing an XML-format
+    /// tool call but EMPTY `tool_calls` field. The promoter must
+    /// recover the call from content, flip finish_reason to
+    /// `tool_calls`, and the loop must continue (NOT exit after one
+    /// turn). Asserts:
+    ///   - outcome.turns > 1 (the bail was promoted, not exited)
+    ///   - terminal_reason is MaxTurns (mock keeps returning bail
+    ///     shape; we run out the clock — that's fine, what matters
+    ///     is the first turn didn't terminate as Stop)
+    ///
+    /// Before #406 this test would assert turns==1 + Stop, which is
+    /// the silent-bail behavior that compounded across multi-dispatch
+    /// dogfood to 67% chance of seeing at least one bail per
+    /// five-dispatch workflow.
+    #[test]
+    #[serial_test::serial]
+    fn loop_recovers_tool_call_from_xml_in_content_when_finish_reason_is_stop() {
+        let server = MockServer::start();
+        // Every call returns the bail shape: finish=stop, content has
+        // an XML tool_call, tool_calls field is null. Without the
+        // promoter, loop exits at turn 1. With the promoter, loop
+        // promotes the call, dispatches `read` (will fail on missing
+        // /workspace/x.txt — that's fine, a failed tool dispatch is
+        // still a successful loop iteration), and loops back.
+        let _bail_mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_json(
+                Some(
+                    "Let me read the file:\n\
+                    <tool_call>\
+                    <function=read>\
+                    <parameter=path>/workspace/x.txt</parameter>\
+                    <parameter=offset>1</parameter>\
+                    <parameter=limit>50</parameter>\
+                    </function>\
+                    </tool_call>",
+                ),
+                None,
+                "stop",
+                100,
+                10,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempdir::TempDir::new("xml-promote").unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("read x.txt")];
+        let tools = [Tool::Read];
+
+        let cfg = compaction::CompactionConfig::default();
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg)
+            .expect("promoted XML tool call should drive the loop, not error");
+
+        assert!(
+            outcome.turns > 1,
+            "promotion must continue the loop past turn 1; got turns={} (pre-#406 silent bail at turn 1)",
+            outcome.turns
+        );
+        // The mock keeps returning the bail shape, so the loop runs
+        // until MAX_TURNS. That's the right outcome for this synthetic
+        // test — the load-bearing assertion is the turns>1 above.
+        assert_eq!(
+            outcome.terminal_reason,
+            TerminalReason::MaxTurns,
+            "expected MaxTurns after the promoter kept the loop alive past MAX_TURNS"
+        );
+    }
+
+    /// (#406) Promotion also recovers calls when `finish_reason` is
+    /// `"length"`. Pre-fix the downstream match treated `"length"` as
+    /// a hard context-overflow error and threw away the recovered
+    /// call. Asserts the loop continues past turn 1 just like the
+    /// finish_reason=stop case.
+    #[test]
+    #[serial_test::serial]
+    fn loop_recovers_tool_call_from_xml_when_finish_reason_is_length() {
+        let server = MockServer::start();
+        let _bail_mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_json(
+                Some(
+                    "<tool_call>\
+                    <function=read>\
+                    <parameter=path>/workspace/x.txt</parameter>\
+                    <parameter=offset>1</parameter>\
+                    <parameter=limit>50</parameter>\
+                    </function>\
+                    </tool_call>",
+                ),
+                None,
+                "length", // Pre-fix: hard error. Post-fix: promotion flips to tool_calls.
+                100,
+                10,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempdir::TempDir::new("xml-promote-length").unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("read x.txt")];
+        let tools = [Tool::Read];
+
+        let cfg = compaction::CompactionConfig::default();
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg)
+            .expect("recovered call from length-truncated response should drive the loop");
+
+        assert!(
+            outcome.turns > 1,
+            "promotion must continue the loop even when finish_reason=length; got turns={}",
+            outcome.turns
+        );
+    }
+
+    /// (#406) Reasoning-channel variant of the bail scenario: the XML
+    /// tool call lands in `reasoning_content` rather than `content`
+    /// (the Qwen 3.x thinking-mode case from V4 N=5 Run 2). The
+    /// promoter must fall back from content to reasoning_content.
+    #[test]
+    #[serial_test::serial]
+    fn loop_recovers_tool_call_from_xml_in_reasoning_when_finish_reason_is_stop() {
+        let server = MockServer::start();
+        let _bail_mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            // content is null; reasoning_content carries the call —
+            // exactly the V4 N=5 Run 2 bail shape.
+            then.status(200).json_body(serde_json::json!({
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "created": 1700000000,
+                "model": "ignored-by-test",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "reasoning_content":
+                            "Now I should read the file:\n\
+                            <tool_call>\
+                            <function=read>\
+                            <parameter=path>/workspace/x.txt</parameter>\
+                            <parameter=offset>1</parameter>\
+                            <parameter=limit>50</parameter>\
+                            </function>\
+                            </tool_call>",
+                    },
+                    "finish_reason": "stop",
+                }],
+                "usage": { "prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110 },
+            }));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempdir::TempDir::new("xml-promote-reason").unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("read x.txt")];
+        let tools = [Tool::Read];
+
+        let cfg = compaction::CompactionConfig::default();
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg)
+            .expect("promoted XML tool call from reasoning_content should drive the loop");
+
+        assert!(
+            outcome.turns > 1,
+            "reasoning-channel promotion must keep the loop alive past turn 1; got turns={}",
+            outcome.turns
+        );
+        assert_eq!(outcome.terminal_reason, TerminalReason::MaxTurns);
+    }
+
+    /// (#406 regression guard, Beat 47) The streaming path used to
+    /// strip reasoning_content via `accumulator.take_reasoning_content`
+    /// before building the response, enforcing the documented Message
+    /// invariant ("outgoing request messages never emit
+    /// reasoning_content"). PR #407 re-attached reasoning so the
+    /// promoter could scan it; that re-attachment must be cleared
+    /// BEFORE the response message gets pushed into conversation
+    /// history. Otherwise the next turn's request carries the model's
+    /// prior reasoning text — recursive feedback that caused 100-turn
+    /// MAX_TURNS bails in attempt 2 of the validation.
+    ///
+    /// This test pins the invariant: an assistant message in the
+    /// returned conversation MUST have reasoning_content=None,
+    /// regardless of whether the model emitted reasoning.
+    #[test]
+    #[serial_test::serial]
+    fn assistant_messages_in_history_never_carry_reasoning_content() {
+        let server = MockServer::start();
+        // First call: model emits reasoning + a structured tool call
+        // (promotion does NOT fire — tool_calls field is populated).
+        // The reasoning is set on the response; without the post-
+        // promoter clear, it would leak into the next request.
+        let _turn1 = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("\"role\":\"user\"");
+            then.status(200).json_body(serde_json::json!({
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "created": 1700000000,
+                "model": "test-model",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "reasoning_content": "Let me think about this and call a tool",
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "read",
+                                "arguments": "{\"path\":\"/workspace/x.txt\",\"offset\":1,\"limit\":1}",
+                            },
+                        }],
+                    },
+                    "finish_reason": "tool_calls",
+                }],
+                "usage": { "prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150 },
+            }));
+        });
+        // Second call (after tool result): model finishes with stop.
+        let _turn2 = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("\"role\":\"tool\"");
+            then.status(200).json_body(chat_response_json(
+                Some("done"),
+                None,
+                "stop",
+                200,
+                10,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempdir::TempDir::new("reasoning-invariant").unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("read x.txt")];
+        let tools = [Tool::Read];
+
+        let cfg = compaction::CompactionConfig::default();
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg)
+            .expect("clean two-turn dispatch");
+
+        // The first assistant message in the conversation must have
+        // reasoning_content stripped — even though the model emitted
+        // reasoning. The promoter scanned it; the conversation
+        // history does not retain it.
+        let assistant_msgs: Vec<&Message> = outcome
+            .messages
+            .iter()
+            .filter(|m| m.role == "assistant")
+            .collect();
+        assert!(
+            !assistant_msgs.is_empty(),
+            "expected at least one assistant message in history"
+        );
+        for (idx, m) in assistant_msgs.iter().enumerate() {
+            assert!(
+                m.reasoning_content.is_none(),
+                "assistant message #{idx} in history must have reasoning_content=None \
+                 (invariant: lmstudio.rs Message doc — request-side never emits it). \
+                 Got: {:?}",
+                m.reasoning_content
+            );
+        }
     }
 
     /// Smoke: mock returns finish_reason=stop on first call. Loop

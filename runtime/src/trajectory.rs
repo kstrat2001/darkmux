@@ -186,6 +186,31 @@ impl Trajectory {
         }));
     }
 
+    /// tool_call.promoted — recovery event when the runtime promoted
+    /// plain-text tool-call markup back into structured tool_calls
+    /// (#406). `source` is either `"content"` or `"reasoning"`
+    /// indicating which message channel the markup was found in;
+    /// `format` is one of `"bracket"`, `"harmony"`, or `"xml"`.
+    /// Observability matters: every promotion is a model wire-format
+    /// failure the runtime caught — operators monitoring bail rates
+    /// want this rate visible alongside `dispatch.complete`.
+    pub fn append_tool_call_promoted(
+        &mut self,
+        seq: u32,
+        source: &str,
+        format: &str,
+        promoted_call_count: usize,
+    ) {
+        self.write_event(&serde_json::json!({
+            "type": "tool_call.promoted",
+            "seq": seq,
+            "ts": unix_ms(),
+            "source": source,
+            "format": format,
+            "promoted_call_count": promoted_call_count,
+        }));
+    }
+
     /// tool.completed — one per executed tool call. Records the
     /// tool name + arg/result sizes (not the content — that can be
     /// large; the trajectory is for shape, not for full payload).
