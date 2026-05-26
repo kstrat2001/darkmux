@@ -113,10 +113,32 @@ pub struct ProfileSuggestion {
 /// Public so providers in submodules can reference it.
 pub const DEFAULT_COMPACTOR_ID: &str = "qwen3-4b-instruct-2507";
 
-/// Default value for the typed `custom_instructions` darkmux field.
-/// Contains compactor guidance copied from the article; used whenever
-/// a compactor is paired.
-pub const DEFAULT_COMPACTION_INSTRUCTIONS: &str = "Preserve verbatim: numeric SLAs, version identifiers, codenames, named constants, file paths, magic numbers, and any user-provided values referenced by name elsewhere. These can look like decoration but are often referenced by later turns.";
+/// Default value for the typed `custom_instructions` darkmux field on
+/// the tier-2 structured-slot compactor. V4 of the compactor-prompt
+/// iteration (#402) — empirically validated via path-1 synthetic
+/// harness (#239) + path-2 long-agentic pepper-test dispatch (issue
+/// #402 PR body has the numbers).
+///
+/// Three guidance blocks, all generic across task shapes (works for
+/// coder, code-reviewer, analyst, scribe, mission-compiler, etc.):
+/// 1. Per-slot framing for `active_files` — agent's working knowledge
+///    of files/artifacts; prevents post-compaction re-read rampage
+/// 2. Per-slot framing for `verify_criteria` — operator-actionable
+///    verification step rather than hallucinated tests-as-written
+/// 3. Universal reality-discipline anchor — "every slot must reflect
+///    what the excerpt SHOWS"; suppresses the optimistic-completion
+///    hallucination V0-V3 baseline produced
+///
+/// Previous value was the v15.5-era openclaw-compatible string
+/// ("Preserve verbatim: numeric SLAs..."); migrated 2026-05-26 after
+/// Beat 41/45's retrace pattern surfaced the need for per-slot
+/// reality-discipline framing. See PR #402 + Beat 45 lab notebook
+/// for the empirical comparison.
+pub const DEFAULT_COMPACTION_INSTRUCTIONS: &str = "In `current_truth.active_files`, list each file or artifact the agent has read or modified, with one line per item naming WHAT was learned, decided, or changed about it. Format: `<path or URL>: <what was learned/decided/changed>`. Use a newline between items. This is the agent's working knowledge; the agent must NOT re-read these after compaction.
+
+In `verify_criteria`, describe what an observer would RUN or LOOK AT to verify the agent's work is correct. Be specific about the verification ACTION (a command, an inspection step, a comparison) — NOT the expected outcome. Do NOT assume the work is done or correct; describe how someone would CHECK whether it is.
+
+Reality-discipline (load-bearing): every slot must reflect what the excerpt SHOWS. Identifying an item ≠ completing it. Planning an edit ≠ making it. Naming a verification step ≠ running it. If the excerpt ends mid-task, every \"I will do X\" remains pending.";
 
 pub fn classify_size_from_meta(meta: &ModelMeta) -> SizeBucket {
     if let Some(p) = meta.params_string.as_deref() {
@@ -645,6 +667,55 @@ mod tests {
             s.notes.iter().any(|n| n.contains("trainedForToolUse")),
             "expected tool-use warning in notes: {:?}",
             s.notes
+        );
+    }
+
+    /// (#402) Pin the content of `DEFAULT_COMPACTION_INSTRUCTIONS` so a
+    /// future silent edit of the constant fails CI. V4 was empirically
+    /// validated (path-1 synthetic harness + path-2 long-agentic pepper
+    /// test produced 100/100 tests pass with rich slot fills); the
+    /// invariants below capture the load-bearing content that the
+    /// empirical wins depended on:
+    ///   1. Per-slot framing for `active_files` (prevents read-rampage)
+    ///   2. Per-slot framing for `verify_criteria` (action-focused)
+    ///   3. Universal reality-discipline anchor (suppresses optimistic
+    ///      completion hallucinations)
+    ///
+    /// If you intentionally evolve the value, update the invariants
+    /// here to match — or replace with an exact string snapshot if a
+    /// more stringent pin is needed.
+    #[test]
+    fn default_compaction_instructions_carries_v4_invariants() {
+        let v = DEFAULT_COMPACTION_INSTRUCTIONS;
+
+        // Invariant 1: per-slot framing for active_files
+        assert!(
+            v.contains("`current_truth.active_files`"),
+            "DEFAULT_COMPACTION_INSTRUCTIONS must include per-slot framing for active_files"
+        );
+        assert!(
+            v.contains("must NOT re-read"),
+            "DEFAULT_COMPACTION_INSTRUCTIONS must instruct against post-compaction re-reading (the Beat 41 retrace lever)"
+        );
+
+        // Invariant 2: per-slot framing for verify_criteria
+        assert!(
+            v.contains("`verify_criteria`"),
+            "DEFAULT_COMPACTION_INSTRUCTIONS must include per-slot framing for verify_criteria"
+        );
+        assert!(
+            v.contains("verification ACTION") || v.contains("verification action"),
+            "DEFAULT_COMPACTION_INSTRUCTIONS verify_criteria framing must be action-focused"
+        );
+
+        // Invariant 3: universal reality-discipline anchor
+        assert!(
+            v.contains("Reality-discipline") || v.contains("reality-discipline"),
+            "DEFAULT_COMPACTION_INSTRUCTIONS must include a reality-discipline anchor"
+        );
+        assert!(
+            v.contains("Identifying an item ≠ completing it"),
+            "DEFAULT_COMPACTION_INSTRUCTIONS must carry the chained negative-constraint pattern (the V4-fingerprint that empirically beat V0-V3)"
         );
     }
 }
