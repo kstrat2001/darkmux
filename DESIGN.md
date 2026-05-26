@@ -129,6 +129,32 @@ The filter for any proposed internal-runtime feature: **does this reinforce miss
 
 Openclaw's broader surface is a strength for openclaw's own use cases. When operators need a feature openclaw has and the internal runtime doesn't, the answer is usually `--runtime openclaw`, not "let's add it to the internal runtime." Both paths stay viable on purpose.
 
+### Schema isolation: each runtime owns its own config
+
+The internal runtime and openclaw dispatch are separate runtime paths with separate config schemas. **Neither runtime translates the other's config shape.** This separation enforces operator-sovereignty at the schema level: every field an operator sees in a darkmux profile maps to a darkmux-typed schema entry that the internal runtime consumes — no decorative fields that look tunable but have no effect.
+
+The codebase distinguishes three code-path categories with distinct rules for what they may read:
+
+**1. Internal-runtime path** (`src/crew/dispatch_internal.rs`, `runtime/src/`): reads only darkmux-native typed fields from `profile.runtime.*` — the schema defined in `src/types.rs::RuntimeCompactionConfig` and siblings. darkmux owns these field names, their semantics, and their evolution. The untyped `extras: BTreeMap` field on `RuntimeCompactionConfig` exists for legacy back-compat parse only; nothing in the internal-runtime path reads from it. The clean break was enforced consumer-side in #369 with explicit "must not auto-populate" tests `from_profile_derives_typed_threshold_ratio` and `from_profile_ignores_openclaw_maxhistoryshare_extras` in `src/crew/dispatch_internal.rs`.
+
+**2. OC dispatch path** (`--runtime openclaw`, `src/crew/dispatch.rs`): shells out to `openclaw agent darkmux/<role-id>`. Openclaw reads its own `~/.openclaw/openclaw.json`. darkmux does not forward profile fields into openclaw's config, and openclaw never sees the darkmux profile. Operators using openclaw configure it through openclaw's own surfaces (`openclaw.json` editing, `openclaw agent` CLI flags, openclaw's own documentation). No schema bridging in either direction.
+
+**3. OC helper tooling** (`darkmux crew sync`, OC config patcher in `src/runtime.rs`, eureka OC config diagnostics): legitimate openclaw-aware code that operates ON `~/.openclaw/openclaw.json` directly. Knows the openclaw schema because that's its job — these are *helper verbs for openclaw users*, not part of the internal-runtime path. The doctrine permits these freely; they're clearly labeled as OC tooling rather than embedded in dispatch config plumbing.
+
+**Profile generation discipline.** Heuristics in `src/heuristics.rs` write only darkmux-typed fields. Existing operator profiles with openclaw-shape `extras` keys (legacy `mode`, `maxHistoryShare`, `recentTurnsPreserve`, `customInstructions`) continue to load via back-compat parse, but `darkmux doctor` flags them as inactive with a migration hint to the typed equivalent (where one exists) or a removal suggestion (where it doesn't).
+
+**Doctor scoping.** `darkmux doctor` defaults to internal-runtime-only output. Operators who use `--runtime openclaw` opt into OC-specific checks via `--include-openclaw` (covers OC binary discovery, OC version validation, OC agents.list drift, OC config role definitions). Internal-runtime-only operators get a clean doctor report without OC noise.
+
+**Maintenance risk this prevents.** When darkmux's profile schema is purely darkmux-typed, an upstream openclaw schema change (e.g., openclaw v2026.8 redefining `maxHistoryShare` semantics) has zero impact on darkmux — because no darkmux code path consumes openclaw-shape fields on either runtime path. The maintenance dependency only exists in OC helper tooling, where it's explicit and scoped to verbs that exist to serve openclaw users.
+
+**Implementation status** (as of 2026-05-26). Rule 1's internal-runtime consumer path is enforced today (see the named tests above). Rules 2 + 3 (OC dispatch / OC helper tooling) are structurally enforced — there is no schema-bridging code on either path. The remaining cleanup work — making the **generator** side honor the doctrine — is in flight under the [Independence mission (#380)](https://github.com/kstrat2001/darkmux/issues/380):
+
+- **Profile generation discipline** — current `src/heuristics.rs` still writes openclaw-shape `mode` / `maxHistoryShare` / `recentTurnsPreserve` / `customInstructions` into generated profiles. Sprint S3 removes the dead-letter writes and migrates `customInstructions` to a typed darkmux field.
+- **`darkmux doctor` legacy-extras warning** — not yet implemented. Sprint S4 adds the "fields not consumed by internal runtime" surface so operators can clean up legacy profiles.
+- **`darkmux doctor --include-openclaw` flag** — not yet implemented. Sprint S5 gates the OC-specific doctor checks behind this flag so default output is internal-runtime-only.
+
+Contributors reading this doctrine: the rules above describe the target architecture. Until the Independence mission completes, the *generator* and *doctor* surfaces lag the rules above — patches that move them toward conformance are welcome, but verify the relevant sprint isn't already in flight first.
+
 ## Composability
 
 Designed to live BELOW agent frameworks and ABOVE inference engines:
