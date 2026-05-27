@@ -224,6 +224,43 @@ pub struct Profile {
     pub use_when: Option<serde_json::Value>,
 }
 
+impl Profile {
+    /// (#450, E14 refactor 1b) Returns the id of this profile's
+    /// Primary-role model — the worker model dispatch routes to by
+    /// default. Profile schema enforces "exactly one primary" at load
+    /// time (see `profiles::validate_profile`), so this is the model
+    /// every worker-class role uses under phase-1 trivial selection.
+    /// Phase-2 scoring layers on top: candidate set comes from ALL
+    /// `models[]` entries, scoring picks per-role, primary is the
+    /// fallback when no candidate scores above threshold.
+    pub fn primary_model_id(&self) -> Option<&str> {
+        self.models
+            .iter()
+            .find(|m| matches!(m.role, ModelRole::Primary))
+            .map(|m| m.id.as_str())
+    }
+
+    /// (#450, E14 refactor 1b) Returns the id of this profile's
+    /// Compactor-role model — the utility model darkmux uses for its
+    /// internal AI-first functions (compaction today; future
+    /// mission-planner-auto, scribe-helper, etc.). Lives in a
+    /// separate `[internal]`-style layer from worker-tier roles;
+    /// always-loaded for the runtime session per Beat 50 doctrine.
+    ///
+    /// Unused in refactor 1b's dispatch wiring (compactor selection
+    /// today flows through `RuntimeCompactionConfig.compactor_model`
+    /// directly). Phase-1c will wire this when the utility-loading
+    /// orchestration lands; the helper exists now as the public API
+    /// surface phase-1c will consume.
+    #[allow(dead_code)]
+    pub fn compactor_model_id(&self) -> Option<&str> {
+        self.models
+            .iter()
+            .find(|m| matches!(m.role, ModelRole::Compactor))
+            .map(|m| m.id.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProfileRegistry {
     pub profiles: BTreeMap<String, Profile>,
