@@ -19,4 +19,5 @@ pub mod index;
 pub mod lifecycle;
 pub mod loader;
 pub mod pins;
+pub mod select;
 pub mod types;

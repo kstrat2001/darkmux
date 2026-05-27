@@ -182,10 +182,22 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // (the gap that let D call `edit` despite code-reviewer denying it).
     let allowed_tools = compute_runtime_allowed_tools(&role.tool_palette);
 
-    // 2. Resolve the model. Currently probes LMStudio for whatever's
-    //    loaded; future iteration will use the role pin + active profile.
-    let model = probe_loaded_model().context(
-        "no model loaded in LMStudio. Load one (darkmux swap <profile>) before dispatching."
+    // 2. Resolve the model. (#450, E14 refactor 1b) Phase-1 selection
+    //    consults the active profile's Primary-role model via
+    //    `select_model(role, profile)`. Phase 2+ extends this into
+    //    capability-scored selection. If no profile is configured (or
+    //    has no Primary), falls back to `probe_loaded_model()` with a
+    //    deprecation warning — back-compat for operators on the
+    //    pre-refactor-1b config shape; the warning surfaces the gap
+    //    so they migrate.
+    //
+    //    NOT the long-form probe-then-pin path documented in #408 —
+    //    that's phase 2+ scope when the recommendation registry
+    //    activates per-hardware tuple selection.
+    let model = resolve_dispatch_model_internal(role).context(
+        "model selection failed. Ensure `~/.darkmux/profiles.json` has \
+         a profile with a model `role: \"primary\"`, or load a model in \
+         LMStudio (darkmux swap <profile>) as the deprecated fallback."
     )?;
     eprintln!("darkmux crew dispatch: model={model}");
 
@@ -834,6 +846,85 @@ fn check_docker_preflight() -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// (#450, E14 refactor 1b) Resolve the model id this internal-runtime
+/// dispatch should target for the given role.
+///
+/// Selection chain:
+/// 1. Load the profile registry. Get the active profile name from
+///    `registry.default_profile` (phase-1 simplification — operators
+///    set the default; if they want a different profile, they swap
+///    the default). Phase 2+ adds `--profile <name>` plumbing through
+///    `DispatchOpts` for per-dispatch override.
+/// 2. Look up the profile + call `select_model(role, profile)`. Phase 1
+///    trivially returns the profile's Primary-role model id.
+/// 3. On any failure (no registry, no default, no profile, no Primary),
+///    log a deprecation warning + fall back to `probe_loaded_model()`.
+///    Back-compat for pre-refactor-1b configurations; the warning
+///    points the operator at the migration.
+///
+/// The fallback is intentional but loud. Per memory note
+/// `feedback_model_unload_load_authority`, silent reliance on "whatever
+/// LMStudio happens to have loaded" is the contaminating-dispatch
+/// anti-pattern. The deprecation warning makes the misconfiguration
+/// operator-visible while keeping pre-refactor-1b setups working.
+fn resolve_dispatch_model_internal(role: &crate::crew::types::Role) -> Result<String> {
+    use crate::crew::select::select_model;
+    use crate::profiles::{get_profile, load_registry};
+
+    let loaded = match load_registry(None) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            eprintln!(
+                "darkmux crew dispatch: profile registry not loadable ({e}); \
+                 falling back to probe_loaded_model() — deprecated, configure \
+                 ~/.darkmux/profiles.json. (#450 refactor 1b)"
+            );
+            return probe_loaded_model();
+        }
+    };
+
+    let active_name = match loaded.registry.default_profile.as_deref() {
+        Some(name) => name,
+        None => {
+            eprintln!(
+                "darkmux crew dispatch: profile registry has no default_profile set; \
+                 falling back to probe_loaded_model() — deprecated, set \
+                 default_profile in ~/.darkmux/profiles.json. (#450 refactor 1b)"
+            );
+            return probe_loaded_model();
+        }
+    };
+
+    let profile = match get_profile(&loaded.registry, active_name) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "darkmux crew dispatch: default_profile `{active_name}` not in \
+                 registry ({e}); falling back to probe_loaded_model() — \
+                 deprecated. (#450 refactor 1b)"
+            );
+            return probe_loaded_model();
+        }
+    };
+
+    match select_model(role, profile) {
+        Ok(id) => {
+            eprintln!(
+                "darkmux crew dispatch: model selected via profile `{active_name}` Primary"
+            );
+            Ok(id)
+        }
+        Err(e) => {
+            eprintln!(
+                "darkmux crew dispatch: select_model error ({e}); falling back \
+                 to probe_loaded_model() — deprecated. Add a Primary-role \
+                 model to profile `{active_name}` to migrate. (#450 refactor 1b)"
+            );
+            probe_loaded_model()
+        }
+    }
 }
 
 /// return the first model id. Uses curl so we don't drag a Rust HTTP
