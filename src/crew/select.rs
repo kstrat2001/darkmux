@@ -46,6 +46,13 @@ use anyhow::{anyhow, Result};
 /// against each candidate model's capability vector and picks best
 /// match.
 ///
+/// **Phase-2 signature note**: when scoring activates, this function
+/// will likely need a third argument — the skill lookup table the
+/// `role.capabilities(skill_lookup)` derivation requires. Call sites
+/// will need updating then. The phase-1 → phase-2 transition is not
+/// fully signature-stable; the boundary is documented here so future-
+/// you isn't surprised.
+///
 /// **Errors** with an operator-actionable message when the active
 /// profile has no Primary model configured. The caller decides
 /// whether to bail or fall back (`dispatch_internal::dispatch` falls
