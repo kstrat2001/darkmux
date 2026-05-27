@@ -29,6 +29,10 @@ const EMBEDDED_WORKLOADS: &[(&str, &str)] = &[
         "medium-coding",
         include_str!("../../templates/builtin/workloads/medium-coding.json"),
     ),
+    (
+        "cross-file-refactor",
+        include_str!("../../templates/builtin/workloads/cross-file-refactor.json"),
+    ),
 ];
 
 fn find_embedded(id: &str) -> Option<&'static str> {
