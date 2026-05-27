@@ -419,6 +419,14 @@ pub fn structured_compact(
     );
 
     // Attempt 1.
+    //
+    // (#401 layer 1+2 note) Each `call_and_parse` now bundles
+    // lexical-repair + schema-patch internally. So the retry below
+    // is empirically near-useless for the truncation-class failure —
+    // attempt 2 typically produces an identically-truncated output
+    // and the patcher inserts the same defaults. Kept for variance
+    // against transient HTTP / no-content failures (which the
+    // recovery layers can't catch) per the #354 Q2 commitment.
     let parse_result_1 = call_and_parse(client, &request);
     let parsed = match parse_result_1 {
         Ok(out) => out,
@@ -430,9 +438,7 @@ pub fn structured_compact(
             // retry handles transient sampling noise; two failures
             // means the model genuinely can't produce the schema.
             call_and_parse(client, &request).map_err(|e2| {
-                anyhow!(
-                    "tier-2 compaction failed twice (attempt 1: {e1}; attempt 2: {e2})"
-                )
+                anyhow!("tier-2 compaction failed twice (attempt 1: {e1}; attempt 2: {e2})")
             })?
         }
     };
@@ -623,16 +629,25 @@ pub fn structured_compactor_system_prompt_with_custom(
 /// StructuredCompactionOutput. Returns Err on HTTP failure, missing
 /// content, or JSON parse failure.
 ///
-/// (#401) When the raw parse fails, attempts best-effort repair via
-/// [`crate::json_repair::parse_with_repair`] before bailing. The 4B
-/// compactor occasionally enters thinking mode and emits runaway
-/// `\n` escapes that exhaust the token budget mid-string-value —
-/// `parse_with_repair` terminates the unterminated string + balances
-/// open containers so a partial parse can land. Repair emits a
-/// stderr warning so operators see the rate; the parsed output is
-/// lossy (the model's intended content past the truncation point is
-/// gone) but produces forward progress instead of bailing the whole
-/// dispatch.
+/// (#401) Two-layer recovery:
+///
+/// 1. **Lexical**: [`crate::json_repair::parse_with_repair`] terminates
+///    unterminated strings + balances containers when the compactor
+///    truncated mid-string with runaway `\n` escapes. Lossy at the
+///    truncation point but produces a parseable Value.
+///
+/// 2. **Schema**: when the post-repair Value parses as JSON but is
+///    missing required schema fields (typically `objective` — the
+///    compactor empirically truncates mid-`active_files` before
+///    emitting `objective`), [`patch_missing_required_fields`]
+///    inserts safe defaults and re-deserializes. `truncation_patched`
+///    is set on the metadata so downstream consumers can flag these
+///    compactions for separate analysis.
+///
+/// Both layers preserve the structured-slot data shape — no narrative
+/// fallback, no per-call data-shape branching. Operator's call: keeps
+/// the persistence file (`compaction-N.json`), the replay surface,
+/// and the methodology-research aggregations uniform.
 fn call_and_parse(
     client: &LmStudioClient,
     request: &ChatRequest,
@@ -645,21 +660,117 @@ fn call_and_parse(
         .map(|c| c.message)
         .ok_or_else(|| anyhow!("compactor returned no choice"))?;
     let content = extract_compactor_content(message)?;
-    match crate::json_repair::parse_with_repair::<StructuredCompactionOutput>(&content) {
-        Ok((parsed, repaired)) => {
-            if repaired {
-                eprintln!(
-                    "darkmux-runtime: ⚒ compactor JSON repaired — original output was truncated, \
-                     state machine balanced open string + containers to land a partial parse. \
-                     Repair is lossy (model's intended content past truncation is gone). (#401)"
-                );
-            }
-            Ok(parsed)
-        }
-        Err(e) => Err(anyhow!(
-            "parsing compactor JSON failed (even after repair): {e} — content: {content}"
-        )),
+
+    // Layer 1: lexical repair via the generic json_repair module.
+    let (value, repaired) =
+        crate::json_repair::parse_with_repair::<serde_json::Value>(&content).map_err(|e| {
+            anyhow!("parsing compactor JSON failed (even after repair): {e} — content: {content}")
+        })?;
+    if repaired {
+        eprintln!(
+            "darkmux-runtime: ⚒ compactor JSON repaired — original output was truncated, \
+             state machine balanced open string + containers to land a partial parse. \
+             Repair is lossy (model's intended content past truncation is gone). (#401 layer 1)"
+        );
     }
+
+    // Layer 2: schema-level patch — fill in safe defaults for missing
+    // required top-level fields. Empirically, when the compactor
+    // truncates mid-`active_files`, only `objective` is missing; the
+    // patcher is general enough to cover other required fields too.
+    let (patched_value, was_patched) = patch_missing_required_fields(value);
+    if was_patched {
+        eprintln!(
+            "darkmux-runtime: ⚙ compactor output patched — required schema fields were missing \
+             after lexical repair (model truncated before emitting them); inserted defaults so \
+             the partial compaction still lands. truncation_patched=true on metadata. (#401 layer 2)"
+        );
+    }
+
+    serde_json::from_value::<StructuredCompactionOutput>(patched_value).map_err(|e| {
+        anyhow!(
+            "parsing compactor JSON failed (even after repair + schema patch): {e} \
+             — content: {content}"
+        )
+    })
+}
+
+/// (#401 layer 2) Procedural patch for missing required schema fields
+/// on a JSON Value that parses successfully but doesn't match
+/// [`StructuredCompactionOutput`]'s typed shape.
+///
+/// Returns `(patched_value, was_patched)`. `was_patched=true` when at
+/// least one field was inserted; the caller propagates this to the
+/// metadata + stderr observability.
+///
+/// **Defaults inserted:**
+/// - `objective` → sentinel string naming the truncation
+/// - `current_truth` → empty object (sub-fields are all `Option`)
+/// - `compaction_metadata` → minimal default (rarely missing —
+///   compactor emits it first — but defensive)
+/// - Sets `compaction_metadata.truncation_patched = true` when any
+///   patching fired
+///
+/// Optional fields (`completed_decisions`, `errors_to_preserve`, etc.)
+/// are not patched — absence is valid for those.
+///
+/// **Generation in defensive-metadata branch is 0**: when the
+/// compactor's output omitted `compaction_metadata` ENTIRELY (rare —
+/// model emits this slot first), the patcher inserts a default with
+/// `generation: 0`. The runtime knows the real generation at the call
+/// site but threading it through to the patcher would couple this
+/// generic helper to request-side context. The `truncation_patched`
+/// flag is the load-bearing signal for downstream consumers anyway;
+/// the spurious `generation: 0` on the rare path is acceptable noise.
+fn patch_missing_required_fields(
+    mut value: serde_json::Value,
+) -> (serde_json::Value, bool) {
+    let mut was_patched = false;
+
+    let Some(obj) = value.as_object_mut() else {
+        // Top-level isn't an object — we can't patch; let the caller's
+        // serde_json::from_value bubble the error.
+        return (value, false);
+    };
+
+    if !obj.contains_key("objective") {
+        obj.insert(
+            "objective".to_string(),
+            serde_json::Value::String(
+                "(compaction output truncated; objective slot not emitted by model)".to_string(),
+            ),
+        );
+        was_patched = true;
+    }
+
+    if !obj.contains_key("current_truth") {
+        obj.insert(
+            "current_truth".to_string(),
+            serde_json::json!({}),
+        );
+        was_patched = true;
+    }
+
+    if !obj.contains_key("compaction_metadata") {
+        obj.insert(
+            "compaction_metadata".to_string(),
+            serde_json::json!({
+                "schema_version": "0.1",
+                "generation": 0,
+                "source_message_count": 0,
+            }),
+        );
+        was_patched = true;
+    }
+
+    // Flag the metadata so downstream consumers see the marker.
+    if was_patched {
+        if let Some(meta) = obj.get_mut("compaction_metadata").and_then(|v| v.as_object_mut()) {
+            meta.insert("truncation_patched".to_string(), serde_json::Value::Bool(true));
+        }
+    }
+
+    (value, was_patched)
 }
 
 /// (#376) Pull the structured-output JSON string out of a chat-
@@ -899,6 +1010,16 @@ pub struct CompactionMetadata {
     pub schema_version: String,
     pub generation: u32,
     pub source_message_count: u32,
+    /// (#401 layer 2) `Some(true)` when the runtime had to
+    /// procedurally patch missing required fields in the compactor
+    /// output (typically because the compactor truncated mid-string
+    /// after emitting `current_truth` but before `objective`).
+    /// Absent / `None` on clean compactions. Downstream replayers
+    /// and methodology research consumers can flag patched
+    /// compactions for separate analysis without changing the
+    /// data shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation_patched: Option<bool>,
 }
 
 #[cfg(test)]
@@ -1086,6 +1207,7 @@ mod tests {
                 schema_version: "0.1".into(),
                 generation: 1,
                 source_message_count: 5,
+            truncation_patched: None,
             },
             completed_decisions: decisions.map(str::to_string),
             errors_to_preserve: None,
@@ -1184,6 +1306,7 @@ mod tests {
                 schema_version: "0.1".into(),
                 generation: 1,
                 source_message_count: 5,
+            truncation_patched: None,
             },
             completed_decisions: None,
             errors_to_preserve: None,
@@ -1221,6 +1344,7 @@ mod tests {
                 schema_version: "0.1".into(),
                 generation: 1,
                 source_message_count: 5,
+            truncation_patched: None,
             },
             completed_decisions: Some("decided X".into()),
             errors_to_preserve: Some("don't retry Y".into()),
@@ -1349,6 +1473,7 @@ mod tests {
                 schema_version: "0.1".into(),
                 generation: 1,
                 source_message_count: 10,
+            truncation_patched: None,
             },
             completed_decisions: None,
             errors_to_preserve: None,
@@ -1846,4 +1971,164 @@ mod tests {
         mock.assert_hits(1);
     }
 
+    // ─── #401 layer 2: procedural patch for missing required fields ─────
+
+    #[test]
+    fn patcher_passes_through_complete_payload_unchanged() {
+        let complete = serde_json::json!({
+            "objective": "do the thing",
+            "current_truth": {"active_files": "/x.ts"},
+            "compaction_metadata": {
+                "schema_version": "0.1",
+                "generation": 1,
+                "source_message_count": 6
+            }
+        });
+        let (out, was_patched) = patch_missing_required_fields(complete.clone());
+        assert!(!was_patched, "complete payload must not be flagged as patched");
+        assert_eq!(out, complete);
+    }
+
+    #[test]
+    fn patcher_fills_missing_objective() {
+        // The empirical failure shape: model truncated mid-active_files
+        // before emitting `objective`. Patcher fills it with the sentinel.
+        let truncated = serde_json::json!({
+            "current_truth": {"active_files": "/x.ts"},
+            "compaction_metadata": {
+                "schema_version": "0.1",
+                "generation": 1,
+                "source_message_count": 6
+            }
+        });
+        let (out, was_patched) = patch_missing_required_fields(truncated);
+        assert!(was_patched);
+        let obj = out.as_object().unwrap();
+        let objective = obj.get("objective").unwrap().as_str().unwrap();
+        assert!(objective.contains("truncated"), "sentinel must name the truncation");
+        // Patched flag landed on metadata
+        let meta = obj.get("compaction_metadata").unwrap();
+        assert_eq!(meta["truncation_patched"], true);
+    }
+
+    #[test]
+    fn patcher_fills_missing_current_truth_with_empty_object() {
+        // Hypothetical: model truncated EVEN earlier — only emitted
+        // compaction_metadata. Defensive: fill current_truth with {}
+        // so the deserialization into CurrentTruth (whose fields are
+        // all Option) succeeds.
+        let very_truncated = serde_json::json!({
+            "compaction_metadata": {
+                "schema_version": "0.1",
+                "generation": 1,
+                "source_message_count": 6
+            }
+        });
+        let (out, was_patched) = patch_missing_required_fields(very_truncated);
+        assert!(was_patched);
+        assert_eq!(out["current_truth"], serde_json::json!({}));
+        assert_eq!(out["compaction_metadata"]["truncation_patched"], true);
+    }
+
+    #[test]
+    fn patcher_fills_missing_compaction_metadata() {
+        // Edge case: model omitted compaction_metadata entirely.
+        let no_meta = serde_json::json!({
+            "objective": "x",
+            "current_truth": {}
+        });
+        let (out, was_patched) = patch_missing_required_fields(no_meta);
+        assert!(was_patched);
+        let meta = out["compaction_metadata"].as_object().unwrap();
+        assert_eq!(meta["schema_version"], "0.1");
+        assert_eq!(meta["generation"], 0);
+        assert_eq!(meta["source_message_count"], 0);
+        assert_eq!(meta["truncation_patched"], true);
+    }
+
+    #[test]
+    fn patcher_does_not_touch_optional_fields() {
+        // Optional fields absent → patcher does nothing for them
+        // (their absence is valid per the Option<> in the struct).
+        let minimal_complete = serde_json::json!({
+            "objective": "x",
+            "current_truth": {},
+            "compaction_metadata": {
+                "schema_version": "0.1",
+                "generation": 1,
+                "source_message_count": 6
+            }
+        });
+        let (out, was_patched) = patch_missing_required_fields(minimal_complete);
+        assert!(!was_patched, "no Option fields → no patching needed");
+        let obj = out.as_object().unwrap();
+        assert!(!obj.contains_key("completed_decisions"));
+        assert!(!obj.contains_key("errors_to_preserve"));
+        assert!(!obj.contains_key("next_concrete_actions"));
+        assert!(obj.get("compaction_metadata")
+            .and_then(|m| m.get("truncation_patched")).is_none(),
+            "unpatched compaction must not carry the truncation_patched flag");
+    }
+
+    #[test]
+    fn patcher_handles_non_object_value() {
+        // Defensive: if the JSON parses as something other than an
+        // object (array, string, etc.), the patcher leaves it alone
+        // and the downstream serde_json::from_value bubbles the
+        // schema-shape error.
+        let arr = serde_json::json!([1, 2, 3]);
+        let (out, was_patched) = patch_missing_required_fields(arr.clone());
+        assert!(!was_patched);
+        assert_eq!(out, arr);
+    }
+
+    #[test]
+    fn patched_payload_deserializes_into_structured_compaction_output() {
+        // End-to-end: a truncated payload, patched, then deserialized
+        // into the typed struct. Verifies the contract holds.
+        let truncated = serde_json::json!({
+            "current_truth": {"active_files": "/x.ts:\n\nrefresh-token rotation"},
+            "compaction_metadata": {
+                "schema_version": "0.1",
+                "generation": 2,
+                "source_message_count": 7
+            }
+        });
+        let (patched, _) = patch_missing_required_fields(truncated);
+        let out: StructuredCompactionOutput = serde_json::from_value(patched)
+            .expect("patched payload must deserialize into StructuredCompactionOutput");
+        assert!(out.objective.contains("truncated"));
+        assert_eq!(out.current_truth.active_files.as_deref(), Some("/x.ts:\n\nrefresh-token rotation"));
+        assert_eq!(out.compaction_metadata.generation, 2);
+        assert_eq!(out.compaction_metadata.truncation_patched, Some(true));
+    }
+
+    #[test]
+    fn clean_compaction_metadata_has_no_truncation_patched_flag() {
+        // The flag's Option<> + skip_serializing_if = "is_none" means
+        // a clean compaction emits no `truncation_patched` field at
+        // all in its JSON serialization — downstream consumers don't
+        // see the flag unless it's true.
+        let meta = CompactionMetadata {
+            schema_version: "0.1".to_string(),
+            generation: 1,
+            source_message_count: 6,
+            truncation_patched: None,
+        };
+        let serialized = serde_json::to_value(&meta).unwrap();
+        assert!(serialized.get("truncation_patched").is_none(),
+            "clean metadata must not serialize the truncation_patched field");
+    }
+
+    #[test]
+    fn patched_compaction_metadata_serializes_the_flag() {
+        let meta = CompactionMetadata {
+            schema_version: "0.1".to_string(),
+            generation: 1,
+            source_message_count: 6,
+            truncation_patched: Some(true),
+        };
+        let serialized = serde_json::to_value(&meta).unwrap();
+        assert_eq!(serialized["truncation_patched"], true);
+    }
 }

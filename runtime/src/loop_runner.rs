@@ -799,6 +799,7 @@ mod tests {
                 schema_version: "0.1".into(),
                 generation,
                 source_message_count: 5,
+            truncation_patched: None,
             },
             completed_decisions: None,
             errors_to_preserve: None,
