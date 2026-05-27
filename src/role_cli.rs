@@ -28,10 +28,10 @@ pub(crate) fn role_list_at(path: &Path) -> Result<i32> {
     let mut stmt = conn.prepare(
         "SELECT r.id, \
          CASE WHEN LENGTH(r.description) > 60 THEN SUBSTR(r.description, 1, 57) || '…' ELSE r.description END, \
-         COALESCE(rc.cap_count, 0), \
+         COALESCE(rc.skill_count, 0), \
          r.escalation_contract_tag \
          FROM roles r \
-         LEFT JOIN (SELECT role_id, COUNT(*) AS cap_count FROM role_skills GROUP BY role_id) rc \
+         LEFT JOIN (SELECT role_id, COUNT(*) AS skill_count FROM role_skills GROUP BY role_id) rc \
          ON r.id = rc.role_id \
          ORDER BY r.id"
     )?;
@@ -56,25 +56,25 @@ pub(crate) fn role_list_at(path: &Path) -> Result<i32> {
 
     let mut id_w: usize = 2;
     let mut desc_w: usize = 12;
-    let mut cap_w: usize = 11;
+    let mut skill_w: usize = 11;
     let mut esc_w: usize = 11;
 
-    for (id, desc, caps, esc) in &rows {
+    for (id, desc, skills, esc) in &rows {
         id_w = id_w.max(id.len());
         desc_w = desc_w.max(desc.len());
-        cap_w = cap_w.max(caps.to_string().len());
+        skill_w = skill_w.max(skills.to_string().len());
         esc_w = esc_w.max(esc.len());
     }
 
     println!(
-        "{:<id_w$}  {:<desc_w$}  {:<cap_w$}  escalation",
+        "{:<id_w$}  {:<desc_w$}  {:<skill_w$}  escalation",
         "id", "description", "skills"
     );
 
-    for (id, desc, caps, esc) in &rows {
+    for (id, desc, skills, esc) in &rows {
         println!(
-            "{:<id_w$}  {:<desc_w$}  {:<cap_w$}  {}",
-            id, desc, caps, esc
+            "{:<id_w$}  {:<desc_w$}  {:<skill_w$}  {}",
+            id, desc, skills, esc
         );
     }
 
@@ -124,20 +124,20 @@ pub(crate) fn role_show_at(path: &Path, role_id: &str) -> Result<i32> {
         println!("prompt_path: {}", p);
     }
 
-    let mut cap_stmt = conn.prepare(
+    let mut skill_stmt = conn.prepare(
         "SELECT skill_id FROM role_skills WHERE role_id = ?1 ORDER BY skill_id"
     )?;
-    let mut caps: Vec<String> = Vec::new();
-    for row in cap_stmt.query_map(params![role_id], |r| r.get::<_, String>(0))? {
-        caps.push(row?);
+    let mut skills: Vec<String> = Vec::new();
+    for row in skill_stmt.query_map(params![role_id], |r| r.get::<_, String>(0))? {
+        skills.push(row?);
     }
 
     println!("skills:");
-    if caps.is_empty() {
+    if skills.is_empty() {
         println!("  (none)");
     } else {
-        for cap in &caps {
-            println!("  - {}", cap);
+        for skill in &skills {
+            println!("  - {}", skill);
         }
     }
 

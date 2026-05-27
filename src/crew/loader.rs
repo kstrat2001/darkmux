@@ -36,8 +36,8 @@ const BUILTIN_ROLES: &[(&str, &str)] = &[
     ("legal-research", include_str!("../../templates/builtin/roles/legal-research.json")),
 ];
 
-/// Capabilities compiled into the binary at build time. Filename = `<id>.json`.
-const BUILTIN_CAPABILITIES: &[(&str, &str)] = &[
+/// Skills compiled into the binary at build time. Filename = `<id>.json`.
+const BUILTIN_SKILLS: &[(&str, &str)] = &[
     ("coding", include_str!("../../templates/builtin/skills/coding.json")),
     ("documenting", include_str!("../../templates/builtin/skills/documenting.json")),
     ("test-designing", include_str!("../../templates/builtin/skills/test-designing.json")),
@@ -474,7 +474,7 @@ pub fn load_skills() -> Result<Vec<Skill>> {
         .map(|(id, c)| (id.clone(), c))
         .collect();
 
-    for (id, json) in BUILTIN_CAPABILITIES {
+    for (id, json) in BUILTIN_SKILLS {
         match serde_json::from_str::<Skill>(json) {
             Ok(c) => { map.entry(id.to_string()).or_insert(c); }
             Err(e) => eprintln!("warning: failed to parse builtin skill \"{id}\": {e}"),

@@ -110,7 +110,7 @@ CREATE TABLE IF NOT EXISTS role_skills (
     skill_id TEXT NOT NULL REFERENCES skills(id) ON DELETE CASCADE,
     PRIMARY KEY (role_id, skill_id)
 );
-CREATE INDEX IF NOT EXISTS idx_role_skills_cap ON role_skills(skill_id);
+CREATE INDEX IF NOT EXISTS idx_role_skills_skill_id ON role_skills(skill_id);
 
 CREATE TABLE IF NOT EXISTS skill_keywords (
     skill_id TEXT NOT NULL REFERENCES skills(id) ON DELETE CASCADE,
@@ -461,10 +461,10 @@ fn populate(conn: &mut Connection) -> Result<()> {
                 params![role.id, target],
             )?;
         }
-        for cap_id in &role.skills {
+        for skill_id in &role.skills {
             tx.execute(
                 "INSERT INTO role_skills (role_id, skill_id) VALUES (?1, ?2)",
-                params![role.id, cap_id],
+                params![role.id, skill_id],
             )?;
         }
     }
@@ -1131,5 +1131,115 @@ mod tests {
         let report = status_at(&idx).unwrap();
         assert_eq!(report.modified.len(), 1, "expected one modification, got {:?}", report.modified);
         assert_eq!(report.modified[0].0, "role");
+    }
+
+    /// (#448 refactor 0) Verifies the v1 → v2 schema migration: a DB
+    /// seeded with the legacy `capabilities` / `role_capabilities` /
+    /// `capability_keywords` / `capability_keywords_fts` tables +
+    /// triggers gets cleanly migrated to v2 when `init_schema` runs.
+    /// Asserts: legacy artifacts gone, new `skills`-named artifacts
+    /// present, `PRAGMA user_version = 2`. Then re-opens to confirm
+    /// idempotency (second init_schema on a v2 DB is a no-op).
+    #[serial_test::serial]
+    #[test]
+    fn migration_v1_to_v2_drops_legacy_capability_artifacts() {
+        let tmp = TempDir::new().unwrap();
+        let idx_path = tmp.path().join("v1.db");
+
+        // Seed a v1-shaped DB with the legacy artifacts populated.
+        {
+            let conn = Connection::open(&idx_path).unwrap();
+            conn.execute_batch(
+                "
+                PRAGMA user_version = 1;
+                CREATE TABLE capabilities (id TEXT PRIMARY KEY, description TEXT NOT NULL);
+                CREATE TABLE roles (id TEXT PRIMARY KEY, description TEXT NOT NULL);
+                CREATE TABLE role_capabilities (
+                    role_id TEXT NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+                    capability_id TEXT NOT NULL REFERENCES capabilities(id) ON DELETE CASCADE,
+                    PRIMARY KEY (role_id, capability_id)
+                );
+                CREATE INDEX idx_role_capabilities_cap ON role_capabilities(capability_id);
+                CREATE TABLE capability_keywords (
+                    capability_id TEXT NOT NULL REFERENCES capabilities(id) ON DELETE CASCADE,
+                    keyword TEXT NOT NULL,
+                    weight REAL NOT NULL,
+                    PRIMARY KEY (capability_id, keyword)
+                );
+                CREATE VIRTUAL TABLE capability_keywords_fts USING fts5(
+                    keyword, capability_id UNINDEXED, weight UNINDEXED
+                );
+                CREATE TRIGGER capability_keywords_ai
+                AFTER INSERT ON capability_keywords
+                BEGIN
+                    INSERT INTO capability_keywords_fts(keyword, capability_id, weight)
+                    VALUES (NEW.keyword, NEW.capability_id, NEW.weight);
+                END;
+                INSERT INTO capabilities (id, description) VALUES ('coding','seed');
+                INSERT INTO roles (id, description) VALUES ('coder','seed');
+                INSERT INTO role_capabilities (role_id, capability_id) VALUES ('coder','coding');
+                INSERT INTO capability_keywords (capability_id, keyword, weight) VALUES ('coding','seed-kw',0.5);
+                ",
+            )
+            .unwrap();
+        }
+
+        // First open: triggers the v1 → v2 migration.
+        let conn = Connection::open(&idx_path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        init_schema(&conn).unwrap();
+
+        let table_exists = |name: &str| -> bool {
+            conn.query_row(
+                "SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name = ?1",
+                params![name],
+                |_| Ok(()),
+            )
+            .optional()
+            .unwrap()
+            .is_some()
+        };
+
+        // Legacy artifacts dropped.
+        assert!(!table_exists("capabilities"), "legacy `capabilities` table must be dropped");
+        assert!(!table_exists("role_capabilities"), "legacy `role_capabilities` must be dropped");
+        assert!(!table_exists("capability_keywords"), "legacy `capability_keywords` must be dropped");
+        assert!(!table_exists("capability_keywords_fts"), "legacy FTS virtual must be dropped");
+
+        // New schema applied.
+        assert!(table_exists("skills"), "new `skills` table must exist");
+        assert!(table_exists("role_skills"), "new `role_skills` table must exist");
+        assert!(table_exists("skill_keywords"), "new `skill_keywords` table must exist");
+        assert!(table_exists("skill_keywords_fts"), "new `skill_keywords_fts` must exist");
+
+        // Version bumped.
+        let v: i32 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+
+        drop(conn);
+
+        // Second open: idempotency check. The migration block must not
+        // re-run (DROP IF EXISTS is technically idempotent, but on a v2
+        // DB `current_version < 2` is false, so the block is skipped
+        // entirely). init_schema must complete cleanly.
+        let conn2 = Connection::open(&idx_path).unwrap();
+        conn2.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        init_schema(&conn2).unwrap();
+        let v2: i32 = conn2
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v2, SCHEMA_VERSION);
+        let skills_exists: bool = conn2
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name = 'skills'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()
+            .unwrap()
+            .is_some();
+        assert!(skills_exists);
     }
 }
