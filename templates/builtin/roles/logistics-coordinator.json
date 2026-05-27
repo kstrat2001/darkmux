@@ -1,10 +1,20 @@
 {
   "id": "logistics-coordinator",
-  "description": "Organizes trip logistics — booking deadlines, document timelines, packing checklists, transit legs. Produces deadline-prioritized action lists. Does not execute bookings.",
-  "capabilities": ["documenting", "writing"],
+  "description": "Organizes trip logistics \u2014 booking deadlines, document timelines, packing checklists, transit legs. Produces deadline-prioritized action lists. Does not execute bookings.",
+  "skills": [
+    "documenting",
+    "writing"
+  ],
   "tool_palette": {
-    "allow": ["read", "edit"],
-    "deny": ["exec", "process", "write"]
+    "allow": [
+      "read",
+      "edit"
+    ],
+    "deny": [
+      "exec",
+      "process",
+      "write"
+    ]
   },
   "escalation_contract": "bail-with-explanation"
 }

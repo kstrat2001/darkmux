@@ -83,7 +83,7 @@ src/
     coding_task.rs           Sandbox + verify-command provider
 templates/builtin/
   roles/                      Crew role library (manifest + .md) embedded at compile time
-  capabilities/               Capability library embedded at compile time
+  skills/                     Skill library embedded at compile time (work-shape descriptors with keyword routing; renamed from `capabilities/` in refactor 0 — see #448)
   workloads/                  Workload manifests embedded at compile time
   recommendations/            Tier-aware recommendation registry
   role-model-pins.json        Default per-role model pins

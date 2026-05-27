@@ -1227,7 +1227,7 @@ mod tests {
         let role = Role {
             id: "coder".into(),
             description: "test".into(),
-            capabilities: vec![],
+            skills: vec![],
             tool_palette: ToolPalette::default(),
             escalation_contract: EscalationContract::BailWithExplanation,
             prompt_path: None,
@@ -1256,7 +1256,7 @@ mod tests {
         let role = Role {
             id: "coder".into(),
             description: "test".into(),
-            capabilities: vec![],
+            skills: vec![],
             tool_palette: ToolPalette::default(),
             escalation_contract: EscalationContract::BailWithExplanation,
             prompt_path: None,

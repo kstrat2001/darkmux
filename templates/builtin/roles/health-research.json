@@ -1,10 +1,20 @@
 {
   "id": "health-research",
   "description": "Health-research thinking partner. Reads symptoms/research/insurance materials the operator brings, organizes records, surfaces questions for their licensed physician, drafts conversation prep. NOT a doctor. NOT diagnosis. NOT treatment recommendation.",
-  "capabilities": ["documenting", "writing"],
+  "skills": [
+    "documenting",
+    "writing"
+  ],
   "tool_palette": {
-    "allow": ["read", "edit"],
-    "deny": ["exec", "process", "write"]
+    "allow": [
+      "read",
+      "edit"
+    ],
+    "deny": [
+      "exec",
+      "process",
+      "write"
+    ]
   },
   "escalation_contract": "bail-with-explanation"
 }

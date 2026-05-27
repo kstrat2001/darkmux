@@ -12,7 +12,7 @@
 //!
 //! Source-of-truth files live under `integrations/openclaw/agent-scaffolds/`
 //! (NOT `templates/builtin/`) to keep openclaw-integration scope visibly
-//! separate from the darkmux engine's own role/capability/workload
+//! separate from the darkmux engine's own role/skill/workload
 //! libraries.
 //!
 //! ## Why three roles only

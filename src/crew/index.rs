@@ -15,7 +15,7 @@
 //! - **`PRAGMA foreign_keys = ON`** as a connection-default — FKs are off
 //!   by default in SQLite; explicit opt-in is required.
 //! - **`source_files.kind` covers ALL entity types** —
-//!   `kind IN ('role', 'capability', 'crew', 'mission', 'sprint')`.
+//!   `kind IN ('role', 'skill', 'crew', 'mission', 'sprint')`.
 //! - **`PRAGMA user_version` for schema versioning** — SQLite-native; no
 //!   external migration tooling needed.
 //! - **`role_escalation_targets` table** — the
@@ -26,10 +26,10 @@
 //!   (`'bail-with-explanation'` / `'retry-with-hint'` / `'hand-off-to'`)
 //!   and `'hand-off-to'` requires a row in `role_escalation_targets`.
 //! - **`unmatched_terms` table** — for allocator FTS fallback (terms in
-//!   ticket text that didn't match any capability keyword).
-//! - **FTS5 sync triggers** — `capability_keywords_ai` / `_ad` / `_au`
-//!   propagate INSERT / DELETE / UPDATE on `capability_keywords` to the
-//!   `capability_keywords_fts` mirror automatically.
+//!   ticket text that did not match any skill keyword).
+//! - **FTS5 sync triggers** — `skill_keywords_ai` / `_ad` / `_au`
+//!   propagate INSERT / DELETE / UPDATE on `skill_keywords` to the
+//!   `skill_keywords_fts` mirror automatically.
 //! - **`Mission.sprint_ids` is JSON-only**, NOT a denormalized DB column —
 //!   sprint membership is derived from `sprints WHERE mission_id = ?`.
 //!   The JSON-side field stays in the manifest for operator hand-editing.
@@ -49,7 +49,7 @@
 //! # Acceptance criteria (from #45) covered here
 //!
 //! - Index rebuild from a clean state produces a queryable DB
-//! - FTS5 keyword search produces ranked capabilities for a known fixture
+//! - FTS5 keyword search produces ranked skills for a known fixture
 //! - Index rebuild is idempotent (running twice produces the same state)
 //! - `darkmux crew index status` flags drift (file mtime + content_hash)
 //!
@@ -67,12 +67,20 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const SCHEMA_VERSION: i32 = 1;
+/// Bumped to 2 in refactor 0 (`capability` → `skill` rename, #448). The
+/// migration block at the top of [`init_schema`] drops the old
+/// `capabilities`, `role_capabilities`, `capability_keywords`,
+/// `capability_keywords_fts` artifacts when an existing user DB is at
+/// version < 2. `rebuild()` then repopulates from manifests under
+/// `templates/builtin/skills/` (and operator overrides under
+/// `<crew_root>/skills/`). No data is lost — skill definitions are
+/// derived from on-disk manifests, not stored canonical state.
+const SCHEMA_VERSION: i32 = 2;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS source_files (
     path          TEXT PRIMARY KEY,
-    kind          TEXT NOT NULL CHECK (kind IN ('role','capability','crew','mission','sprint')),
+    kind          TEXT NOT NULL CHECK (kind IN ('role','skill','crew','mission','sprint')),
     mtime         INTEGER NOT NULL,
     content_hash  TEXT NOT NULL
 );
@@ -92,52 +100,52 @@ CREATE TABLE IF NOT EXISTS role_escalation_targets (
     target_role_id TEXT NOT NULL REFERENCES roles(id)
 );
 
-CREATE TABLE IF NOT EXISTS capabilities (
+CREATE TABLE IF NOT EXISTS skills (
     id          TEXT PRIMARY KEY,
     description TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS role_capabilities (
+CREATE TABLE IF NOT EXISTS role_skills (
     role_id       TEXT NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
-    capability_id TEXT NOT NULL REFERENCES capabilities(id) ON DELETE CASCADE,
-    PRIMARY KEY (role_id, capability_id)
+    skill_id TEXT NOT NULL REFERENCES skills(id) ON DELETE CASCADE,
+    PRIMARY KEY (role_id, skill_id)
 );
-CREATE INDEX IF NOT EXISTS idx_role_capabilities_cap ON role_capabilities(capability_id);
+CREATE INDEX IF NOT EXISTS idx_role_skills_skill_id ON role_skills(skill_id);
 
-CREATE TABLE IF NOT EXISTS capability_keywords (
-    capability_id TEXT NOT NULL REFERENCES capabilities(id) ON DELETE CASCADE,
+CREATE TABLE IF NOT EXISTS skill_keywords (
+    skill_id TEXT NOT NULL REFERENCES skills(id) ON DELETE CASCADE,
     keyword       TEXT NOT NULL,
     weight        REAL NOT NULL,
-    PRIMARY KEY (capability_id, keyword)
+    PRIMARY KEY (skill_id, keyword)
 );
 
-CREATE VIRTUAL TABLE IF NOT EXISTS capability_keywords_fts USING fts5(
+CREATE VIRTUAL TABLE IF NOT EXISTS skill_keywords_fts USING fts5(
     keyword,
-    capability_id UNINDEXED,
+    skill_id UNINDEXED,
     weight        UNINDEXED
 );
 
-CREATE TRIGGER IF NOT EXISTS capability_keywords_ai
-AFTER INSERT ON capability_keywords
+CREATE TRIGGER IF NOT EXISTS skill_keywords_ai
+AFTER INSERT ON skill_keywords
 BEGIN
-    INSERT INTO capability_keywords_fts(keyword, capability_id, weight)
-    VALUES (NEW.keyword, NEW.capability_id, NEW.weight);
+    INSERT INTO skill_keywords_fts(keyword, skill_id, weight)
+    VALUES (NEW.keyword, NEW.skill_id, NEW.weight);
 END;
 
-CREATE TRIGGER IF NOT EXISTS capability_keywords_ad
-AFTER DELETE ON capability_keywords
+CREATE TRIGGER IF NOT EXISTS skill_keywords_ad
+AFTER DELETE ON skill_keywords
 BEGIN
-    DELETE FROM capability_keywords_fts
-    WHERE keyword = OLD.keyword AND capability_id = OLD.capability_id;
+    DELETE FROM skill_keywords_fts
+    WHERE keyword = OLD.keyword AND skill_id = OLD.skill_id;
 END;
 
-CREATE TRIGGER IF NOT EXISTS capability_keywords_au
-AFTER UPDATE ON capability_keywords
+CREATE TRIGGER IF NOT EXISTS skill_keywords_au
+AFTER UPDATE ON skill_keywords
 BEGIN
-    DELETE FROM capability_keywords_fts
-    WHERE keyword = OLD.keyword AND capability_id = OLD.capability_id;
-    INSERT INTO capability_keywords_fts(keyword, capability_id, weight)
-    VALUES (NEW.keyword, NEW.capability_id, NEW.weight);
+    DELETE FROM skill_keywords_fts
+    WHERE keyword = OLD.keyword AND skill_id = OLD.skill_id;
+    INSERT INTO skill_keywords_fts(keyword, skill_id, weight)
+    VALUES (NEW.keyword, NEW.skill_id, NEW.weight);
 END;
 
 CREATE TABLE IF NOT EXISTS crews (
@@ -217,14 +225,14 @@ CREATE TABLE IF NOT EXISTS meta_kv (
 const REBUILD_TABLES: &[&str] = &[
     "source_files",
     "role_escalation_targets",
-    "role_capabilities",
-    "capability_keywords",
+    "role_skills",
+    "skill_keywords",
     "crew_members",
     "sprints",
     "missions",
     "crews",
     "roles",
-    "capabilities",
+    "skills",
 ];
 
 /// Default index path: `<paths.root>/index.db`. Resolved through the same
@@ -318,6 +326,28 @@ pub(crate) fn open_index(path: &Path) -> Result<Connection> {
 }
 
 fn init_schema(conn: &Connection) -> Result<()> {
+    // Migration: refactor 0 renamed `capability` → `skill` (#448). Drop
+    // the legacy tables / triggers / index / virtual table BEFORE
+    // applying the new schema so the IF-NOT-EXISTS in SCHEMA_SQL
+    // creates fresh `skill`-named state and the old ones don't linger.
+    // Idempotent + no-op on fresh DBs (DROP IF EXISTS).
+    let current_version: i32 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap_or(0);
+    if current_version < 2 {
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS capability_keywords_ai;
+             DROP TRIGGER IF EXISTS capability_keywords_ad;
+             DROP TRIGGER IF EXISTS capability_keywords_au;
+             DROP TABLE IF EXISTS capability_keywords_fts;
+             DROP TABLE IF EXISTS capability_keywords;
+             DROP INDEX IF EXISTS idx_role_capabilities_cap;
+             DROP TABLE IF EXISTS role_capabilities;
+             DROP TABLE IF EXISTS capabilities;",
+        )
+        .context("dropping pre-rename legacy tables (refactor 0, #448)")?;
+    }
+
     conn.execute_batch(SCHEMA_SQL)
         .context("applying index schema")?;
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))
@@ -369,7 +399,7 @@ fn enumerate_user_files(dir: &Path) -> Result<Vec<(PathBuf, String, Vec<u8>)>> {
 fn kind_to_dir(kind: &str) -> PathBuf {
     match kind {
         "role" => loader::roles_dir(),
-        "capability" => loader::capabilities_dir(),
+        "skill" => loader::skills_dir(),
         "crew" => loader::crews_dir(),
         "mission" => loader::missions_dir(),
         "sprint" => loader::sprints_dir(),
@@ -381,7 +411,7 @@ fn kind_to_dir(kind: &str) -> PathBuf {
 /// `source_files` with whichever user-side files exist on disk.
 fn populate(conn: &mut Connection) -> Result<()> {
     let roles = loader::load_roles()?;
-    let capabilities = loader::load_capabilities()?;
+    let skills = loader::load_skills()?;
     let crews = loader::load_crews()?;
     let missions = loader::load_missions()?;
     let sprints = loader::load_sprints()?;
@@ -392,22 +422,22 @@ fn populate(conn: &mut Connection) -> Result<()> {
     for tbl in REBUILD_TABLES {
         tx.execute(&format!("DELETE FROM {tbl};"), [])?;
     }
-    // FTS5 mirror has triggers wired to capability_keywords, but the
-    // DELETE-cascade only fires per-row — clearing capability_keywords
+    // FTS5 mirror has triggers wired to skill_keywords, but the
+    // DELETE-cascade only fires per-row — clearing skill_keywords
     // above already empties the FTS mirror via the AD trigger. Belt and
     // braces: ensure FTS is empty before re-INSERT.
-    tx.execute("DELETE FROM capability_keywords_fts;", [])?;
+    tx.execute("DELETE FROM skill_keywords_fts;", [])?;
 
-    // Insert capabilities + keywords first (roles depend on capabilities via FK).
-    for cap in &capabilities {
+    // Insert skills + keywords first (roles depend on skills via FK).
+    for skill in &skills {
         tx.execute(
-            "INSERT INTO capabilities (id, description) VALUES (?1, ?2)",
-            params![cap.id, cap.description],
+            "INSERT INTO skills (id, description) VALUES (?1, ?2)",
+            params![skill.id, skill.description],
         )?;
-        for kw in &cap.keywords {
+        for kw in &skill.keywords {
             tx.execute(
-                "INSERT INTO capability_keywords (capability_id, keyword, weight) VALUES (?1, ?2, ?3)",
-                params![cap.id, kw.keyword, kw.weight as f64],
+                "INSERT INTO skill_keywords (skill_id, keyword, weight) VALUES (?1, ?2, ?3)",
+                params![skill.id, kw.keyword, kw.weight as f64],
             )?;
         }
     }
@@ -431,10 +461,10 @@ fn populate(conn: &mut Connection) -> Result<()> {
                 params![role.id, target],
             )?;
         }
-        for cap_id in &role.capabilities {
+        for skill_id in &role.skills {
             tx.execute(
-                "INSERT INTO role_capabilities (role_id, capability_id) VALUES (?1, ?2)",
-                params![role.id, cap_id],
+                "INSERT INTO role_skills (role_id, skill_id) VALUES (?1, ?2)",
+                params![role.id, skill_id],
             )?;
         }
     }
@@ -494,7 +524,7 @@ fn populate(conn: &mut Connection) -> Result<()> {
     // the stored darkmux_version in meta_kv, not by per-file mtime). Each
     // kind's directory is resolved through the loader's dual-read helpers
     // so the legacy <root>/crew/<subdir>/ layout still indexes correctly.
-    let kinds: &[&str] = &["role", "capability", "crew", "mission", "sprint"];
+    let kinds: &[&str] = &["role", "skill", "crew", "mission", "sprint"];
     for kind in kinds {
         let dir = kind_to_dir(kind);
         for (path, _id, bytes) in enumerate_user_files(&dir)? {
@@ -596,7 +626,7 @@ fn status_at(path: &Path) -> Result<StatusReport> {
     // Drift detection: compare on-disk state to source_files. Each kind's
     // directory is resolved through the loader's dual-read helpers so
     // a legacy <root>/crew/<subdir>/ layout still drift-detects correctly.
-    let kinds: &[&str] = &["role", "capability", "crew", "mission", "sprint"];
+    let kinds: &[&str] = &["role", "skill", "crew", "mission", "sprint"];
 
     // Build set of all paths currently recorded.
     let mut recorded_paths: std::collections::BTreeMap<String, (String, i64, String)> =
@@ -751,13 +781,13 @@ mod tests {
         crew_root: &Path,
         id: &str,
         description: &str,
-        capabilities: &[&str],
+        skills: &[&str],
         escalation: &str,
         handoff_to: Option<&str>,
     ) {
         let roles_dir = crew_root.join("roles");
         fs::create_dir_all(&roles_dir).unwrap();
-        let caps_json: String = capabilities
+        let skills_json: String = skills
             .iter()
             .map(|c| format!("\"{c}\""))
             .collect::<Vec<_>>()
@@ -770,7 +800,7 @@ mod tests {
             r#"{{
               "id": "{id}",
               "description": "{description}",
-              "capabilities": [{caps_json}],
+              "skills": [{skills_json}],
               "tool_palette": {{"allow": ["read"], "deny": []}},
               "escalation_contract": {escalation_json}
             }}"#
@@ -778,14 +808,14 @@ mod tests {
         fs::write(roles_dir.join(format!("{id}.json")), json).unwrap();
     }
 
-    fn write_capability(
+    fn write_skill(
         crew_root: &Path,
         id: &str,
         description: &str,
         keywords: &[(&str, f32)],
     ) {
-        let caps_dir = crew_root.join("capabilities");
-        fs::create_dir_all(&caps_dir).unwrap();
+        let skills_dir = crew_root.join("skills");
+        fs::create_dir_all(&skills_dir).unwrap();
         let kws: String = keywords
             .iter()
             .map(|(k, w)| format!("{{\"keyword\":\"{k}\",\"weight\":{w}}}"))
@@ -798,7 +828,7 @@ mod tests {
               "keywords": [{kws}]
             }}"#
         );
-        fs::write(caps_dir.join(format!("{id}.json")), json).unwrap();
+        fs::write(skills_dir.join(format!("{id}.json")), json).unwrap();
     }
 
     fn write_mission(crew_root: &Path, id: &str, description: &str) {
@@ -932,7 +962,7 @@ mod tests {
     #[test]
     fn fts5_ranks_known_keyword() {
         let guard = CrewDirGuard::new();
-        write_capability(
+        write_skill(
             guard.path(),
             "widget-engineering",
             "Designs widgets",
@@ -944,7 +974,7 @@ mod tests {
         let conn = open_index(&idx).unwrap();
         let hit: String = conn
             .query_row(
-                "SELECT capability_id FROM capability_keywords_fts WHERE keyword MATCH 'widget' LIMIT 1",
+                "SELECT skill_id FROM skill_keywords_fts WHERE keyword MATCH 'widget' LIMIT 1",
                 [],
                 |r| r.get(0),
             )
@@ -1013,7 +1043,7 @@ mod tests {
         std::fs::create_dir_all(&legacy_roles).unwrap();
         std::fs::write(
             legacy_roles.join("alpha.json"),
-            r#"{"id":"alpha","description":"legacy-layout role","capabilities":[],"tool_palette":{"allow":["read"],"deny":[]},"escalation_contract":"bail-with-explanation"}"#,
+            r#"{"id":"alpha","description":"legacy-layout role","skills":[],"tool_palette":{"allow":["read"],"deny":[]},"escalation_contract":"bail-with-explanation"}"#,
         )
         .unwrap();
 
@@ -1101,5 +1131,115 @@ mod tests {
         let report = status_at(&idx).unwrap();
         assert_eq!(report.modified.len(), 1, "expected one modification, got {:?}", report.modified);
         assert_eq!(report.modified[0].0, "role");
+    }
+
+    /// (#448 refactor 0) Verifies the v1 → v2 schema migration: a DB
+    /// seeded with the legacy `capabilities` / `role_capabilities` /
+    /// `capability_keywords` / `capability_keywords_fts` tables +
+    /// triggers gets cleanly migrated to v2 when `init_schema` runs.
+    /// Asserts: legacy artifacts gone, new `skills`-named artifacts
+    /// present, `PRAGMA user_version = 2`. Then re-opens to confirm
+    /// idempotency (second init_schema on a v2 DB is a no-op).
+    #[serial_test::serial]
+    #[test]
+    fn migration_v1_to_v2_drops_legacy_capability_artifacts() {
+        let tmp = TempDir::new().unwrap();
+        let idx_path = tmp.path().join("v1.db");
+
+        // Seed a v1-shaped DB with the legacy artifacts populated.
+        {
+            let conn = Connection::open(&idx_path).unwrap();
+            conn.execute_batch(
+                "
+                PRAGMA user_version = 1;
+                CREATE TABLE capabilities (id TEXT PRIMARY KEY, description TEXT NOT NULL);
+                CREATE TABLE roles (id TEXT PRIMARY KEY, description TEXT NOT NULL);
+                CREATE TABLE role_capabilities (
+                    role_id TEXT NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+                    capability_id TEXT NOT NULL REFERENCES capabilities(id) ON DELETE CASCADE,
+                    PRIMARY KEY (role_id, capability_id)
+                );
+                CREATE INDEX idx_role_capabilities_cap ON role_capabilities(capability_id);
+                CREATE TABLE capability_keywords (
+                    capability_id TEXT NOT NULL REFERENCES capabilities(id) ON DELETE CASCADE,
+                    keyword TEXT NOT NULL,
+                    weight REAL NOT NULL,
+                    PRIMARY KEY (capability_id, keyword)
+                );
+                CREATE VIRTUAL TABLE capability_keywords_fts USING fts5(
+                    keyword, capability_id UNINDEXED, weight UNINDEXED
+                );
+                CREATE TRIGGER capability_keywords_ai
+                AFTER INSERT ON capability_keywords
+                BEGIN
+                    INSERT INTO capability_keywords_fts(keyword, capability_id, weight)
+                    VALUES (NEW.keyword, NEW.capability_id, NEW.weight);
+                END;
+                INSERT INTO capabilities (id, description) VALUES ('coding','seed');
+                INSERT INTO roles (id, description) VALUES ('coder','seed');
+                INSERT INTO role_capabilities (role_id, capability_id) VALUES ('coder','coding');
+                INSERT INTO capability_keywords (capability_id, keyword, weight) VALUES ('coding','seed-kw',0.5);
+                ",
+            )
+            .unwrap();
+        }
+
+        // First open: triggers the v1 → v2 migration.
+        let conn = Connection::open(&idx_path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        init_schema(&conn).unwrap();
+
+        let table_exists = |name: &str| -> bool {
+            conn.query_row(
+                "SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name = ?1",
+                params![name],
+                |_| Ok(()),
+            )
+            .optional()
+            .unwrap()
+            .is_some()
+        };
+
+        // Legacy artifacts dropped.
+        assert!(!table_exists("capabilities"), "legacy `capabilities` table must be dropped");
+        assert!(!table_exists("role_capabilities"), "legacy `role_capabilities` must be dropped");
+        assert!(!table_exists("capability_keywords"), "legacy `capability_keywords` must be dropped");
+        assert!(!table_exists("capability_keywords_fts"), "legacy FTS virtual must be dropped");
+
+        // New schema applied.
+        assert!(table_exists("skills"), "new `skills` table must exist");
+        assert!(table_exists("role_skills"), "new `role_skills` table must exist");
+        assert!(table_exists("skill_keywords"), "new `skill_keywords` table must exist");
+        assert!(table_exists("skill_keywords_fts"), "new `skill_keywords_fts` must exist");
+
+        // Version bumped.
+        let v: i32 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+
+        drop(conn);
+
+        // Second open: idempotency check. The migration block must not
+        // re-run (DROP IF EXISTS is technically idempotent, but on a v2
+        // DB `current_version < 2` is false, so the block is skipped
+        // entirely). init_schema must complete cleanly.
+        let conn2 = Connection::open(&idx_path).unwrap();
+        conn2.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        init_schema(&conn2).unwrap();
+        let v2: i32 = conn2
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v2, SCHEMA_VERSION);
+        let skills_exists: bool = conn2
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name = 'skills'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()
+            .unwrap()
+            .is_some();
+        assert!(skills_exists);
     }
 }

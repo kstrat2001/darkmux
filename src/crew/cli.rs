@@ -178,12 +178,12 @@ mod tests {
         crew_root: &std::path::Path,
         id: &str,
         description: &str,
-        capabilities: &[&str],
+        skills: &[&str],
         escalation: &str,
     ) {
         let roles_dir = crew_root.join("roles");
         std::fs::create_dir_all(&roles_dir).unwrap();
-        let caps_json: String = capabilities
+        let skills_json: String = skills
             .iter()
             .map(|c| format!("\"{c}\""))
             .collect::<Vec<_>>()
@@ -192,7 +192,7 @@ mod tests {
             r#"{{
               "id": "{id}",
               "description": "{description}",
-              "capabilities": [{caps_json}],
+              "skills": [{skills_json}],
               "tool_palette": {{"allow": ["read"], "deny": []}},
               "escalation_contract": "{escalation}"
             }}"#
