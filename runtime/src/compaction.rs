@@ -909,6 +909,12 @@ pub fn render_structured_output_as_markdown(
     // omit this block entirely (graceful). Phrasing is intentionally
     // neutral status ("X of N used") rather than urgency-laden to
     // avoid inducing premature wrap-up.
+    //
+    // (#442) Trailing reminder mirrors the budget-prompt section in
+    // AUTONOMOUS_DISPATCH_PREAMBLE.md — the system-prompt explains
+    // *what* the numbers mean and *how* to reason with them; the
+    // in-compaction block is a compressed reminder so the framing is
+    // reinforced at every compaction.
     let m = &out.compaction_metadata;
     if let (Some(used), Some(max)) = (m.turns_used, m.max_turns) {
         let remaining = max.saturating_sub(used);
@@ -927,11 +933,16 @@ pub fn render_structured_output_as_markdown(
         }
         if let Some(per_call) = m.max_tokens_per_call {
             md.push_str(&format!(
-                "- Per-call token cap: {per_call} (your per-turn emission ceiling)\n"
+                "- Per-call token cap: {per_call} (per-turn emission ceiling)\n"
             ));
         }
-        md.push_str("\nIf the work won't fit in the remaining budget, wrap up narratively or \
-                     escalate via `BLOCKED: <one-line>. Need decision on: <specifics>.`\n\n");
+        md.push_str(
+            "\nTreat these as a *floor*, not a *ceiling* — finishing in fewer turns is better \
+             than filling them. Reasoning tokens count toward both per-turn and cumulative caps. \
+             Group reads/searches; don't re-verify confirmed facts. When you have enough to \
+             answer, emit your final answer and stop. If the budget won't fit the remaining \
+             work, escalate via `BLOCKED: <one-line>. Need decision on: <specifics>.`\n\n",
+        );
     }
 
     md.push_str(&format!("**Objective:** {}\n\n", out.objective));
@@ -2323,6 +2334,28 @@ mod tests {
         assert!(md.contains("Cumulative completion tokens: 16830 of 250000 used (233170 remaining)"));
         assert!(md.contains("Per-call token cap: 10000"));
         assert!(md.contains("BLOCKED:"), "escalation hint surfaced");
+    }
+
+    /// (#442) The budget block's trailing prompt-engineering text
+    /// frames the numbers as a *floor* (efficiency-first), not a
+    /// *ceiling* (which risks Parkinson's-law expansion). This test
+    /// pins the framing so a future edit doesn't silently revert it.
+    #[test]
+    fn markdown_render_budget_block_uses_floor_not_ceiling_framing() {
+        let out = make_output_with_metadata(make_metadata_with_budget(budget_snapshot_v1()));
+        let md = render_structured_output_as_markdown(&out, 6);
+        assert!(
+            md.contains("*floor*, not a *ceiling*"),
+            "framing must explicitly contrast floor vs ceiling (both italicized — must match the preamble's exact phrasing per #442 review)"
+        );
+        assert!(
+            md.contains("fewer turns is better"),
+            "efficiency-first guidance must be present"
+        );
+        assert!(
+            md.contains("Reasoning tokens count"),
+            "must remind that reasoning tokens count against the caps"
+        );
     }
 
     #[test]

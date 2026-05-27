@@ -994,6 +994,72 @@ mod load_per_mission_tests {
         assert!(preamble.contains("BLOCKED:"));
     }
 
+    /// (#442) Budget-aware prompt-engineering section pins the four
+    /// bounds, their failure modes, and the floor-not-ceiling framing.
+    /// Future edits that silently revert these load-bearing phrases
+    /// would dilute the budget-awareness signal and reopen the
+    /// Parkinson's-law concern.
+    ///
+    /// Deliberately does NOT assert specific numeric values — the
+    /// preamble describes the bounds conceptually; the live values
+    /// surface in the dynamic Dispatch budget block at compaction
+    /// time. Pinning numerics here would couple the prompt to the
+    /// runtime's current tuning and silently lie after a retune.
+    #[test]
+    fn embedded_preamble_carries_bounded_dispatch_prompt_engineering() {
+        let preamble = AUTONOMOUS_DISPATCH_PREAMBLE;
+        // Four-bound enumeration — by concept, not value.
+        assert!(
+            preamble.contains("Turn cap"),
+            "preamble must name the turn cap"
+        );
+        assert!(
+            preamble.contains("Per-turn token cap"),
+            "preamble must name the per-turn cap"
+        );
+        assert!(
+            preamble.contains("Cumulative completion-token cap"),
+            "preamble must name the cumulative-token cap"
+        );
+        assert!(
+            preamble.contains("Wall-clock deadline"),
+            "preamble must name the wall-clock deadline"
+        );
+        // Failure-mode names each bound emits — these are operator-
+        // visible JSON envelope strings, stable contract.
+        assert!(
+            preamble.contains("result: \"max_turns\""),
+            "preamble must name the max_turns terminal"
+        );
+        assert!(
+            preamble.contains("escalation_intra_turn_stall_exhausted"),
+            "preamble must name the intra-turn-stall escalation"
+        );
+        assert!(
+            preamble.contains("escalation_cumulative_tokens_exceeded"),
+            "preamble must name the cumulative-tokens escalation"
+        );
+        // Floor-not-ceiling framing — the key prompt-engineering move
+        // that guards against Parkinson's-law expansion.
+        assert!(
+            preamble.contains("*floor*, not a *ceiling*"),
+            "preamble must use floor-not-ceiling framing"
+        );
+        // Behavioral guidance must mention reasoning tokens count
+        // (the dominant failure mode from Beat 47).
+        assert!(
+            preamble.contains("Reasoning tokens count"),
+            "preamble must warn that reasoning tokens count toward the caps"
+        );
+        // Operator-tunable signal — names that values live in the
+        // dynamic Dispatch budget block, not in the preamble.
+        assert!(
+            preamble.contains("operator-configurable"),
+            "preamble must signal that cap values are operator-tunable, \
+             not hardcoded into the prompt"
+        );
+    }
+
     #[serial]
     #[test]
     fn load_preamble_returns_embedded_when_no_user_override() {
