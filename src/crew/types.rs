@@ -9,7 +9,7 @@
 #![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// AI-industry-conventional model capabilities — orthogonal optimization
@@ -31,7 +31,7 @@ use std::path::PathBuf;
 /// Serialized form: `snake_case` (e.g., `"code"`, `"agentic_tool_use"`).
 /// Parse-time validation: unknown variant names fail to deserialize
 /// with a clear error — no silent typo-induced zero-weight bugs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
     /// Code generation + understanding. Benchmarks: HumanEval, MBPP,
@@ -57,7 +57,13 @@ pub enum Capability {
 /// weights**: magnitudes are advisory; ratios drive scoring. Operators
 /// can author weights on any non-negative scale (0..1, 0..100,
 /// arbitrary); normalization happens at scoring time.
-pub type CapabilityProfile = HashMap<Capability, f32>;
+///
+/// **`BTreeMap` for deterministic iteration** — phase-1b dispatch /
+/// `darkmux doctor` display / flow-record stamping all benefit from
+/// stable ordering. Map size is small (4-10 entries today, capped by
+/// the `Capability` enum's variant count); cost vs `HashMap` is
+/// negligible.
+pub type CapabilityProfile = BTreeMap<Capability, f32>;
 
 /// A named skill with keyword-based relevance scoring + an intrinsic
 /// capability profile. A role declares which skills it has; the
@@ -196,12 +202,24 @@ impl Role {
     where
         F: Fn(&str) -> Option<&'a Skill>,
     {
-        let mut profile: CapabilityProfile = HashMap::new();
+        let mut profile: CapabilityProfile = CapabilityProfile::new();
         for skill_id in &self.skills {
             let Some(skill) = skill_lookup(skill_id) else {
                 continue;
             };
             for (cap, weight) in &skill.capabilities {
+                // Defensive guard: skip non-finite (NaN/Infinity) and
+                // negative weights. The docstring promises "non-
+                // negative weights"; this enforces it at composition
+                // time so phase-2 scoring never divides into garbage
+                // values seeded from an operator-edited manifest with
+                // a typo (e.g., `"reasoning": NaN` or `"code": -0.5`).
+                // `NaN > x` is always false in IEEE-754, which would
+                // otherwise silently no-op and seed 0.0; explicit
+                // guard makes the intent visible.
+                if !weight.is_finite() || *weight < 0.0 {
+                    continue;
+                }
                 let entry = profile.entry(*cap).or_insert(0.0);
                 if *weight > *entry {
                     *entry = *weight;
@@ -507,5 +525,90 @@ mod tests {
         // Only the resolvable skill contributes.
         assert_eq!(profile.len(), 1);
         assert_eq!(profile.get(&Capability::Code).copied(), Some(0.9));
+    }
+
+    /// (#450, E14) Same-skill-twice idempotency. A role with
+    /// `skills: ["coding", "coding"]` should produce the same
+    /// effective profile as a role with `skills: ["coding"]`.
+    /// Union-via-max is naturally idempotent (max(x, x) = x), but
+    /// pinning this prevents a future refactor from accidentally
+    /// breaking the invariant via e.g. sum-composition.
+    #[test]
+    fn role_capabilities_is_idempotent_under_duplicate_skill_ids() {
+        let coding = skill_with(
+            "coding",
+            &[(Capability::Code, 0.9), (Capability::Reasoning, 0.5)],
+        );
+        let skills = [coding.clone()];
+        let lookup = |id: &str| skills.iter().find(|s| s.id == id);
+
+        let single = make_role("single", &["coding"]).capabilities(lookup);
+        let duplicate = make_role("duplicate", &["coding", "coding"]).capabilities(lookup);
+
+        assert_eq!(single, duplicate, "same-skill-twice must equal single declaration");
+        assert_eq!(duplicate.get(&Capability::Code).copied(), Some(0.9));
+    }
+
+    /// (#450, E14) Defensive guard against NaN / Infinity / negative
+    /// weights in skill manifests. The docstring promises non-
+    /// negative finite weights; the impl enforces it at composition.
+    /// `NaN > x` is always false in IEEE-754, which would otherwise
+    /// silently no-op and seed 0.0 — phase-2 scoring would then
+    /// divide into garbage. Explicit skip makes the intent visible.
+    #[test]
+    fn role_capabilities_skips_nan_infinity_and_negative_weights() {
+        let bad_skill = Skill {
+            id: "bad".into(),
+            description: "test".into(),
+            keywords: vec![],
+            capabilities: [
+                (Capability::Code, f32::NAN),
+                (Capability::Reasoning, f32::INFINITY),
+                (Capability::InstructionFollowing, -0.5),
+                (Capability::AgenticToolUse, 0.7), // the only valid one
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let skills = [bad_skill.clone()];
+        let lookup = |id: &str| skills.iter().find(|s| s.id == id);
+
+        let role = make_role("defensive", &["bad"]);
+        let profile = role.capabilities(lookup);
+
+        // Only the finite non-negative weight survives.
+        assert_eq!(profile.len(), 1);
+        assert_eq!(profile.get(&Capability::AgenticToolUse).copied(), Some(0.7));
+        assert!(!profile.contains_key(&Capability::Code), "NaN must be skipped");
+        assert!(!profile.contains_key(&Capability::Reasoning), "Infinity must be skipped");
+        assert!(!profile.contains_key(&Capability::InstructionFollowing), "negative must be skipped");
+    }
+
+    /// (#450 follow-up to review note) `BTreeMap` iteration is
+    /// deterministic — verifies the `CapabilityProfile` ordering
+    /// guarantee phase-1b dispatch + `darkmux doctor` display will
+    /// rely on for stable, reproducible-by-flow-record output.
+    #[test]
+    fn capability_profile_iteration_is_deterministic() {
+        let mut profile = CapabilityProfile::new();
+        // Insert in non-enum-declaration order
+        profile.insert(Capability::AgenticToolUse, 0.7);
+        profile.insert(Capability::Code, 0.9);
+        profile.insert(Capability::Reasoning, 0.8);
+        profile.insert(Capability::InstructionFollowing, 0.5);
+
+        // BTreeMap orders by key (Capability's derived Ord — enum
+        // declaration order: Code, Reasoning, InstructionFollowing,
+        // AgenticToolUse).
+        let keys: Vec<Capability> = profile.keys().copied().collect();
+        assert_eq!(
+            keys,
+            vec![
+                Capability::Code,
+                Capability::Reasoning,
+                Capability::InstructionFollowing,
+                Capability::AgenticToolUse,
+            ],
+        );
     }
 }

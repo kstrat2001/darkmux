@@ -43,6 +43,6 @@
     "code": 0.9,
     "agentic_tool_use": 0.7,
     "reasoning": 0.5,
-    "instruction_following": 0.5
+    "instruction_following": 0.65
   }
 }
