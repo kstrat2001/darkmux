@@ -57,6 +57,14 @@ const SKIPPED_DIR_NAMES: &[&str] = &[
     ".mypy_cache",
     ".pytest_cache",
     ".next",
+    // Empirical addition (2026-05-27): the first real-world post-#421
+    // dispatch (Beat 47 follow-up validation) surfaced 159 entries
+    // in `coverage/` (Jest/Vitest/c8/nyc HTML output from the verify
+    // command). These are build artifacts, not operator-meaningful
+    // changes — workspace_delta operators want signal about what the
+    // AGENT changed, not what the post-dispatch verify command
+    // generated as a side effect.
+    "coverage",
 ];
 
 /// Per-file snapshot entry. `hash` is `None` when the file exceeded
@@ -299,6 +307,24 @@ mod tests {
         write(tmp.path(), "target/debug/foo", b"x");
         write(tmp.path(), ".git/HEAD", b"x");
         write(tmp.path(), ".darkmux-runtime/trajectory.jsonl", b"x");
+
+        let s = compute_snapshot(tmp.path()).unwrap();
+        let keys: Vec<_> = s.files.keys().collect();
+        assert_eq!(keys, vec![&PathBuf::from("src/main.rs")]);
+    }
+
+    #[test]
+    fn snapshot_skips_coverage_dir() {
+        // Empirical addition surfaced by the Beat 47 follow-up
+        // dispatch — verify-generated Jest/Vitest HTML coverage
+        // output was producing 159 false "modified" entries.
+        // Regression guard: a future change that drops `coverage`
+        // from the skip list will fail this test.
+        let tmp = TempDir::new().unwrap();
+        write(tmp.path(), "src/main.rs", b"fn main(){}");
+        write(tmp.path(), "coverage/index.html", b"<html/>");
+        write(tmp.path(), "coverage/src/foo.ts.html", b"<html/>");
+        write(tmp.path(), "coverage/lcov-report/index.html", b"<html/>");
 
         let s = compute_snapshot(tmp.path()).unwrap();
         let keys: Vec<_> = s.files.keys().collect();
