@@ -340,16 +340,61 @@ impl Tool {
 /// runtime should put back into the conversation as a `role: tool`
 /// message. Tool-execution errors are converted to a returned error
 /// message string (not panics) so the model gets a chance to recover.
+///
+/// (#424) When the error came from argument parsing (the per-tool
+/// `serde_json::from_str` failing with a "parsing X arguments"
+/// context), the error message is enriched with the tool's
+/// JSON-Schema. Without this enrichment the model sees a generic
+/// parse failure and may retry with the same wrong shape; with the
+/// schema in the result message the model has concrete signal about
+/// what shape is expected. Reduces wasted-turn cycles where the
+/// agent keeps emitting args that don't match the tool contract.
 pub fn dispatch(name: &str, raw_args: &str) -> String {
     match Tool::from_name(name) {
         Some(tool) => match tool.execute(raw_args) {
             Ok(result) => result,
-            Err(e) => format!("tool '{name}' returned error: {e:#}"),
+            Err(e) => format_dispatch_error(tool, name, &e),
         },
         None => format!(
             "tool '{name}' is not available in this runtime. \
              known tools: echo, bash, read, write, edit, search"
         ),
+    }
+}
+
+/// (#424) Format a tool-dispatch error message. Preserves the
+/// `"tool 'NAME' returned error:"` prefix that #419's failure-rate
+/// detector matches against. For argument-parsing errors, appends
+/// the tool's JSON-Schema so the model can correct its arg shape on
+/// the next turn rather than blindly retrying.
+///
+/// **Detection safety**: the substring marker `"parsing {name}
+/// arguments"` is bounded on BOTH sides by literal text from the
+/// `with_context` calls in each `execute_*` function. Adding a new
+/// tool with a name that's a substring of an existing tool's name
+/// (e.g., `"bashlike"` vs `"bash"`) does NOT cause cross-pollution
+/// because the trailing ` arguments` boundary forces an exact name
+/// match — the marker `"parsing bash arguments"` does not appear in
+/// the message `"parsing bashlike arguments"`. Adversarial / model-
+/// supplied `raw_args` content can contain the marker text only for
+/// the same tool's own marker (the `{name}` in the marker is the
+/// dispatch-time tool name, not anything from `raw_args`), so the
+/// only side effect is the same tool's schema being appended to a
+/// non-parse error path — harmless.
+fn format_dispatch_error(tool: Tool, name: &str, e: &anyhow::Error) -> String {
+    let err_str = format!("{e:#}");
+    let arg_parse_marker = format!("parsing {name} arguments");
+    if err_str.contains(&arg_parse_marker) {
+        let schema = tool.parameters_schema();
+        let schema_text = serde_json::to_string_pretty(&schema)
+            .unwrap_or_else(|_| schema.to_string());
+        format!(
+            "tool '{name}' returned error: {err_str}\n\n\
+             EXPECTED argument schema for '{name}':\n{schema_text}\n\n\
+             Correct the argument shape and try again."
+        )
+    } else {
+        format!("tool '{name}' returned error: {err_str}")
     }
 }
 
@@ -1332,5 +1377,103 @@ mod tests {
             },
             _ => dispatch(name, raw_args),
         }
+    }
+
+    // ─── #424: tool-argument pre-flight ───────────────────────────────────
+
+    #[test]
+    fn dispatch_arg_parse_error_message_includes_schema_for_bash() {
+        // Malformed JSON: `command` field missing. dispatch should
+        // return an error string that includes the bash JSON-Schema
+        // so the model can correct on the next turn.
+        let result = dispatch("bash", r#"{"not_command": "ls"}"#);
+        assert!(
+            result.contains("EXPECTED argument schema for 'bash'"),
+            "arg-parse error must include schema-augmentation header. Got: {result}"
+        );
+        assert!(
+            result.contains("\"command\""),
+            "schema must mention the expected `command` field. Got: {result}"
+        );
+        // Preserves the #419 failure-rate-detection prefix.
+        assert!(
+            result.starts_with("tool 'bash' returned error:"),
+            "must preserve the failure-marker prefix #419 depends on. Got: {result}"
+        );
+    }
+
+    #[test]
+    fn dispatch_arg_parse_error_message_includes_schema_for_read() {
+        // Read requires `path`, `offset`, `limit`. Sending none of them.
+        let result = dispatch("read", r#"{}"#);
+        assert!(result.contains("EXPECTED argument schema for 'read'"));
+        assert!(result.contains("\"path\""));
+        assert!(result.contains("\"offset\""));
+        assert!(result.contains("\"limit\""));
+        assert!(result.starts_with("tool 'read' returned error:"));
+    }
+
+    #[test]
+    fn dispatch_arg_parse_error_message_includes_schema_for_edit() {
+        let result = dispatch("edit", r#"{"path": "/x"}"#); // missing edits[]
+        assert!(result.contains("EXPECTED argument schema for 'edit'"));
+        assert!(result.contains("\"edits\""));
+    }
+
+    #[test]
+    fn dispatch_non_arg_parse_error_does_not_add_schema() {
+        // A non-arg-parse error path — `read` with a well-shaped
+        // args object but a path that doesn't exist in the test
+        // environment. The arg-parser succeeds; the error fires
+        // downstream (file IO). Should still get wrapped with the
+        // "tool 'NAME' returned error:" prefix but NOT augmented
+        // with the schema — schema enrichment is specific to the
+        // arg-parsing failure mode #424 targets.
+        //
+        // Using `read` with a definitely-nonexistent path rather
+        // than `bash`-can't-spawn-in-/workspace because the latter
+        // is environment-dependent (silently becomes a different
+        // test if execute_bash ever tolerates a missing cwd).
+        let result = dispatch(
+            "read",
+            r#"{"path": "/definitely/not/a/real/path", "offset": 1, "limit": 0}"#,
+        );
+        assert!(
+            result.starts_with("tool 'read' returned error:"),
+            "non-arg-parse error must keep the wrapper prefix. Got: {result}"
+        );
+        assert!(
+            !result.contains("EXPECTED argument schema"),
+            "schema augmentation must only fire on arg-parse errors. Got: {result}"
+        );
+    }
+
+    #[test]
+    fn dispatch_successful_call_returns_unaugmented_result() {
+        // No error, no schema in output.
+        let result = dispatch("echo", r#"{"text": "hi"}"#);
+        assert_eq!(result, "hi");
+        assert!(!result.contains("EXPECTED argument schema"));
+    }
+
+    #[test]
+    fn dispatch_unknown_tool_does_not_add_schema() {
+        // Unknown tools never had a schema-aware path — message
+        // shape preserved.
+        let result = dispatch("nonexistent_tool", r#"{}"#);
+        assert!(result.contains("not available"));
+        assert!(!result.contains("EXPECTED argument schema"));
+    }
+
+    #[test]
+    fn dispatch_arg_parse_error_includes_underlying_serde_error() {
+        // Should preserve serde's specific error message so the model
+        // gets BOTH "what was wrong" and "what's expected" in one
+        // result.
+        let result = dispatch("echo", r#"{"wrong_field": "hi"}"#);
+        // serde error names the missing field
+        assert!(result.contains("text"), "must mention the expected field name. Got: {result}");
+        // schema also included
+        assert!(result.contains("EXPECTED argument schema for 'echo'"));
     }
 }
