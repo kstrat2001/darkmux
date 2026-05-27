@@ -68,6 +68,35 @@ const MAX_TURNS: u32 = 100;
 /// slightly more headroom for thoughtful turns. (#415)
 const MAX_TOKENS_PER_CALL: u32 = 10000;
 
+/// (#423) Per-dispatch cap on cumulative `usage.completion_tokens`
+/// summed across all turns. The third token-bound in the defense-in-
+/// depth stack (per-call cap is [`MAX_TOKENS_PER_CALL`]; turn count
+/// is [`MAX_TURNS`]; wall-clock deadline is #363's 1500s).
+///
+/// **Why a third bound** — a dispatch can stay under per-call cap
+/// (10000) AND under MAX_TURNS (100) and still burn ~1M tokens
+/// (100 turns × ~10000 tokens). Per-call caps prevent unbounded
+/// single-turn emission; turn count prevents unbounded iteration;
+/// this bound catches the "death by a thousand cuts" pattern where
+/// each turn is individually reasonable but the cumulative cost
+/// accumulates without convergence.
+///
+/// **Value: 250000**
+/// - Empirical healthy avg: ~520 tokens/turn (Beat 47 baseline) ×
+///   100 turns = ~52K total. 250000 is ~5× that — comfortable
+///   ceiling for substantive work that happens to be verbose.
+/// - 25× the per-call cap. A dispatch reaching this number is
+///   averaging 2500 tokens/turn across 100 turns, OR has had several
+///   max-cap turns. Either pattern is worth surfacing.
+/// - Roughly the cost of a long-form essay generation worth of
+///   completion tokens — defensible as "the operator should look at
+///   this dispatch before it generates more."
+///
+/// Absolute (not ratio of n_ctx) for the same reason as
+/// [`MAX_TOKENS_PER_CALL`]: this is a failure-boundary, not a
+/// context-budget allocation. Bigger context doesn't earn more rope.
+const MAX_CUMULATIVE_COMPLETION_TOKENS: u32 = 250_000;
+
 /// How the loop terminated. Distinguishes "model said stop" from
 /// "loop hit the safety cap and gave up" — semantically different
 /// outcomes for downstream consumers (a max_turns hit means the
@@ -101,8 +130,7 @@ pub enum TerminalReason {
 /// as an enum (not a single variant on TerminalReason) so future
 /// escalation conditions — token-budget exhaustion, hang-timeout,
 /// role-explicit bail — can join under the same terminal without
-/// fragmenting the JSON envelope's `result` field. v0.1 ships
-/// `CompactionLimitReached` only.
+/// fragmenting the JSON envelope's `result` field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EscalationReason {
     /// Compaction count reached the operator-configured
@@ -110,6 +138,15 @@ pub enum EscalationReason {
     /// `profile.runtime.compaction.reserve.bail_after_compactions`,
     /// schema landed in #357, consumer in #377).
     CompactionLimitReached,
+    /// (#423) Sum of `usage.completion_tokens` across all turns
+    /// crossed [`MAX_CUMULATIVE_COMPLETION_TOKENS`]. Catches the
+    /// "death by a thousand cuts" pattern that per-call max_tokens
+    /// (#415) and MAX_TURNS individually don't: a dispatch can stay
+    /// under both individual caps yet still burn through hundreds of
+    /// thousands of cumulative tokens. Salvageable partial state
+    /// flows through `LoopOutcome` as with the other escalation
+    /// reasons.
+    CumulativeTokensExceeded,
 }
 
 /// Outcome of a completed loop run.
@@ -198,6 +235,28 @@ pub fn run(
             );
             return Ok(LoopOutcome {
                 terminal_reason: TerminalReason::MaxTurns,
+                messages,
+                turns,
+                total_prompt_tokens,
+                total_completion_tokens,
+                compactions,
+            });
+        }
+        // (#423) Cumulative completion-tokens cap. Catches the
+        // "death by a thousand cuts" pattern where each turn is
+        // individually reasonable but cumulative cost accumulates
+        // without convergence. Checked at the TOP of the loop so the
+        // bound applies before the next chat call goes out.
+        if total_completion_tokens >= MAX_CUMULATIVE_COMPLETION_TOKENS {
+            eprintln!(
+                "darkmux-runtime: cumulative completion_tokens={total_completion_tokens} \
+                 reached cap MAX_CUMULATIVE_COMPLETION_TOKENS={MAX_CUMULATIVE_COMPLETION_TOKENS}; \
+                 escalating out of local tier with partial outcome (#423)"
+            );
+            return Ok(LoopOutcome {
+                terminal_reason: TerminalReason::EscalationTriggered(
+                    EscalationReason::CumulativeTokensExceeded,
+                ),
                 messages,
                 turns,
                 total_prompt_tokens,
@@ -1001,6 +1060,101 @@ mod tests {
     /// TerminalReason::MaxTurns (NOT an Err — that path was reserved
     /// for infrastructure failures).
     ///
+    /// (#423) Mock returns turns that each report high completion_tokens
+    /// (close to per-call cap). After enough turns, cumulative crosses
+    /// MAX_CUMULATIVE_COMPLETION_TOKENS=250000 and the loop should
+    /// escalate with `EscalationTriggered(CumulativeTokensExceeded)`
+    /// BEFORE hitting MAX_TURNS. Distinguishes from MaxTurns because
+    /// the cumulative bail fires earlier in the dispatch lifecycle on
+    /// pathological emission patterns.
+    #[test]
+    #[serial_test::serial]
+    fn loop_escalates_when_cumulative_completion_tokens_exceeds_cap() {
+        let server = MockServer::start();
+        // Each turn reports 10000 completion tokens (the per-call
+        // cap). After 25 turns cumulative = 250000 == cap → next
+        // iteration's pre-loop check trips the escalation.
+        let _bail_mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_json(
+                None,
+                Some(serde_json::json!([{
+                    "id": "call_burner",
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "arguments": "{\"path\":\"/workspace/x.txt\",\"offset\":1,\"limit\":0}",
+                    },
+                }])),
+                "tool_calls",
+                100,
+                10000, // per-turn completion_tokens hits the per-call cap
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempdir::TempDir::new("cumtokens").unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("burn budget")];
+        let tools = [Tool::Read];
+
+        let cfg = compaction::CompactionConfig::default();
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg)
+            .expect("cumulative-budget escalation returns Ok(outcome)");
+
+        assert_eq!(
+            outcome.terminal_reason,
+            TerminalReason::EscalationTriggered(EscalationReason::CumulativeTokensExceeded),
+            "expected CumulativeTokensExceeded escalation, got {:?}",
+            outcome.terminal_reason
+        );
+        // Sanity: bailed BEFORE MAX_TURNS — must have hit the cap.
+        assert!(
+            outcome.turns < 100,
+            "cumulative bail must fire before MAX_TURNS; got turns={}",
+            outcome.turns
+        );
+        // The cumulative-tokens sum must have crossed the cap.
+        assert!(
+            outcome.total_completion_tokens >= 250_000,
+            "cumulative bail fires when sum >= 250000; got {}",
+            outcome.total_completion_tokens
+        );
+    }
+
+    /// (#423) Negative case: when each turn reports modest token
+    /// usage and the loop terminates normally on stop, the
+    /// cumulative-budget check must NOT trip. Asserts the normal
+    /// stop path still fires for healthy dispatches.
+    #[test]
+    #[serial_test::serial]
+    fn loop_does_not_escalate_when_under_cumulative_budget() {
+        let server = MockServer::start();
+        let _stop_mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_json(
+                Some("done"),
+                None,
+                "stop",
+                100,
+                500, // healthy per-turn usage, well under any cap
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempdir::TempDir::new("under-budget").unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("hi")];
+        let tools = [Tool::Read];
+
+        let cfg = compaction::CompactionConfig::default();
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg)
+            .expect("healthy stop should not bail");
+
+        assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
+        assert!(outcome.total_completion_tokens < 250_000);
+    }
+
     /// This test pairs with the existing
     /// `loop_runs_against_mock_and_terminates_on_stop` (Stop case)
     /// to lock both terminal reasons. MaxTurns specifically asserts
