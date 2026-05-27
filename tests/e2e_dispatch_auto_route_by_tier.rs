@@ -34,7 +34,7 @@ fn write_role(crew_root: &std::path::Path, id: &str, tier: &str) {
     let role_json = serde_json::json!({
         "id": id,
         "description": format!("test role {id}"),
-        "capabilities": [],
+        "skills": [],
         "tool_palette": {"allow": [], "deny": []},
         "escalation_contract": "bail-with-explanation",
         "tier": tier,

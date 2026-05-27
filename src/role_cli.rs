@@ -31,7 +31,7 @@ pub(crate) fn role_list_at(path: &Path) -> Result<i32> {
          COALESCE(rc.cap_count, 0), \
          r.escalation_contract_tag \
          FROM roles r \
-         LEFT JOIN (SELECT role_id, COUNT(*) AS cap_count FROM role_capabilities GROUP BY role_id) rc \
+         LEFT JOIN (SELECT role_id, COUNT(*) AS cap_count FROM role_skills GROUP BY role_id) rc \
          ON r.id = rc.role_id \
          ORDER BY r.id"
     )?;
@@ -68,7 +68,7 @@ pub(crate) fn role_list_at(path: &Path) -> Result<i32> {
 
     println!(
         "{:<id_w$}  {:<desc_w$}  {:<cap_w$}  escalation",
-        "id", "description", "capabilities"
+        "id", "description", "skills"
     );
 
     for (id, desc, caps, esc) in &rows {
@@ -125,14 +125,14 @@ pub(crate) fn role_show_at(path: &Path, role_id: &str) -> Result<i32> {
     }
 
     let mut cap_stmt = conn.prepare(
-        "SELECT capability_id FROM role_capabilities WHERE role_id = ?1 ORDER BY capability_id"
+        "SELECT skill_id FROM role_skills WHERE role_id = ?1 ORDER BY skill_id"
     )?;
     let mut caps: Vec<String> = Vec::new();
     for row in cap_stmt.query_map(params![role_id], |r| r.get::<_, String>(0))? {
         caps.push(row?);
     }
 
-    println!("capabilities:");
+    println!("skills:");
     if caps.is_empty() {
         println!("  (none)");
     } else {
@@ -230,7 +230,7 @@ mod tests {
         crew_root: &std::path::Path,
         id: &str,
         description: &str,
-        capabilities: &[&str],
+        skills: &[&str],
         escalation: &str,
         handoff_to: Option<&str>,
     ) {
@@ -243,8 +243,8 @@ mod tests {
         let json = serde_json::json!({
             "id": id,
             "description": description,
-            "capabilities": serde_json::Value::Array(
-                capabilities.iter().map(|s| serde_json::Value::String(s.to_string())).collect()
+            "skills": serde_json::Value::Array(
+                skills.iter().map(|s| serde_json::Value::String(s.to_string())).collect()
             ),
             "tool_palette": {
                 "allow": ["read"],

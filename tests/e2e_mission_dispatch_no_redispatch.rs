@@ -86,7 +86,7 @@ fn second_mission_dispatch_finds_nothing_to_fan_out() {
     let role_json = serde_json::json!({
         "id": "tdd-coder",
         "description": "test role",
-        "capabilities": [],
+        "skills": [],
         "tool_palette": {"allow": [], "deny": []},
         "escalation_contract": "bail-with-explanation",
         "tier": "inference"

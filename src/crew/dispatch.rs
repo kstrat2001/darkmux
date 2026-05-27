@@ -2356,7 +2356,7 @@ mod tests {
         Role {
             id: "code-reviewer".to_string(),
             description: "test".to_string(),
-            capabilities: vec!["code-reviewing".to_string()],
+            skills: vec!["code-reviewing".to_string()],
             tool_palette: ToolPalette {
                 allow: vec!["read".to_string(), "exec".to_string()],
                 deny: vec!["edit".to_string(), "write".to_string()],
@@ -3384,7 +3384,7 @@ mod tests {
             r#"{{
               "id": "{role_id}",
               "description": "L1 test role",
-              "capabilities": [],
+              "skills": [],
               "tool_palette": {{"allow": ["read"], "deny": []}},
               "escalation_contract": "bail-with-explanation",
               "tier": "{tier}"

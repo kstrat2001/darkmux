@@ -38,16 +38,16 @@ const BUILTIN_ROLES: &[(&str, &str)] = &[
 
 /// Capabilities compiled into the binary at build time. Filename = `<id>.json`.
 const BUILTIN_CAPABILITIES: &[(&str, &str)] = &[
-    ("coding", include_str!("../../templates/builtin/capabilities/coding.json")),
-    ("documenting", include_str!("../../templates/builtin/capabilities/documenting.json")),
-    ("test-designing", include_str!("../../templates/builtin/capabilities/test-designing.json")),
-    ("code-reviewing", include_str!("../../templates/builtin/capabilities/code-reviewing.json")),
-    ("analyzing", include_str!("../../templates/builtin/capabilities/analyzing.json")),
-    ("writing", include_str!("../../templates/builtin/capabilities/writing.json")),
-    ("voice-editing", include_str!("../../templates/builtin/capabilities/voice-editing.json")),
-    ("lab-running", include_str!("../../templates/builtin/capabilities/lab-running.json")),
-    ("design-reviewing", include_str!("../../templates/builtin/capabilities/design-reviewing.json")),
-    ("mission-compiling", include_str!("../../templates/builtin/capabilities/mission-compiling.json")),
+    ("coding", include_str!("../../templates/builtin/skills/coding.json")),
+    ("documenting", include_str!("../../templates/builtin/skills/documenting.json")),
+    ("test-designing", include_str!("../../templates/builtin/skills/test-designing.json")),
+    ("code-reviewing", include_str!("../../templates/builtin/skills/code-reviewing.json")),
+    ("analyzing", include_str!("../../templates/builtin/skills/analyzing.json")),
+    ("writing", include_str!("../../templates/builtin/skills/writing.json")),
+    ("voice-editing", include_str!("../../templates/builtin/skills/voice-editing.json")),
+    ("lab-running", include_str!("../../templates/builtin/skills/lab-running.json")),
+    ("design-reviewing", include_str!("../../templates/builtin/skills/design-reviewing.json")),
+    ("mission-compiling", include_str!("../../templates/builtin/skills/mission-compiling.json")),
 ];
 
 /// Role system prompts (`.md`) compiled into the binary. Used as the
@@ -123,7 +123,7 @@ const BUILTIN_SPRINTS: &[(&str, &str)] = &[];
 ///
 /// **Deprecated direction (Beat 33):** prefer the per-subdir helpers
 /// `roles_dir()`, `missions_dir()`, `sprints_dir()`, `crews_dir()`,
-/// `capabilities_dir()`, and `role_pins_path()` for new code. They
+/// `skills_dir()`, and `role_pins_path()` for new code. They
 /// resolve the post-flatten `<root>/<subdir>/` layout with a backward-
 /// compatibility fallback to the legacy `<root>/crew/<subdir>/` layout.
 /// `crew_root()` is retained for callers that need the parent directory
@@ -199,11 +199,11 @@ pub fn crews_dir() -> PathBuf {
     resolve_user_subdir("crews")
 }
 
-/// User-side capabilities directory (operator overrides). Post-Beat-33:
-/// `<root>/capabilities/`. Falls back to `<root>/crew/capabilities/`
+/// User-side skills directory (operator overrides). Post-Beat-33:
+/// `<root>/skills/`. Falls back to `<root>/crew/skills/`
 /// for legacy.
-pub fn capabilities_dir() -> PathBuf {
-    resolve_user_subdir("capabilities")
+pub fn skills_dir() -> PathBuf {
+    resolve_user_subdir("skills")
 }
 
 /// User-side role-model-pins.json path. Post-Beat-33:
@@ -466,18 +466,18 @@ pub fn load_sprints() -> Result<Vec<Sprint>> {
     Ok(out)
 }
 
-/// Load all capabilities.
-pub fn load_capabilities() -> Result<Vec<Capability>> {
-    let user_dir = capabilities_dir();
-    let mut map: BTreeMap<String, Capability> = read_all_json::<Capability>(&user_dir)?
+/// Load all skills.
+pub fn load_skills() -> Result<Vec<Skill>> {
+    let user_dir = skills_dir();
+    let mut map: BTreeMap<String, Skill> = read_all_json::<Skill>(&user_dir)?
         .into_iter()
         .map(|(id, c)| (id.clone(), c))
         .collect();
 
     for (id, json) in BUILTIN_CAPABILITIES {
-        match serde_json::from_str::<Capability>(json) {
+        match serde_json::from_str::<Skill>(json) {
             Ok(c) => { map.entry(id.to_string()).or_insert(c); }
-            Err(e) => eprintln!("warning: failed to parse builtin capability \"{id}\": {e}"),
+            Err(e) => eprintln!("warning: failed to parse builtin skill \"{id}\": {e}"),
         }
     }
 
@@ -551,7 +551,7 @@ mod tests {
         let role = Role {
             id: "test".into(),
             description: "A test role".into(),
-            capabilities: vec![String::from("coding")],
+            skills: vec![String::from("coding")],
             tool_palette: ToolPalette { allow: vec!["read".to_string(), "edit".to_string()], deny: vec![] },
             escalation_contract: EscalationContract::BailWithExplanation,
             prompt_path: None,
@@ -564,18 +564,18 @@ mod tests {
         let back: Role = serde_json::from_str(&json).unwrap();
         assert_eq!(back.id, "test");
         assert_eq!(back.description, "A test role");
-        assert_eq!(back.capabilities, vec![String::from("coding")]);
+        assert_eq!(back.skills, vec![String::from("coding")]);
     }
 
     #[test]
-    fn capabilities_round_trip() {
-        let cap = Capability {
+    fn skills_round_trip() {
+        let cap = Skill {
             id: "coding".into(),
             description: "Writes code".into(),
             keywords: vec![KeywordWeight { keyword: "implement".into(), weight: 1.0 }],
         };
         let json = serde_json::to_string(&cap).unwrap();
-        let back: Capability = serde_json::from_str(&json).unwrap();
+        let back: Skill = serde_json::from_str(&json).unwrap();
         assert_eq!(back.id, "coding");
         assert_eq!(back.keywords[0].keyword, "implement");
     }
@@ -604,7 +604,7 @@ mod tests {
         let guard = CrewDirGuard::new(TempDir::new().unwrap());
         let roles_dir = guard.path().join("roles");
         fs::create_dir_all(&roles_dir).unwrap();
-        let user_json = r#"{"id":"coder","description":"user override","capabilities":[],"tool_palette":{"allow":["read"],"deny":[]},"escalation_contract":"bail-with-explanation"}"#;
+        let user_json = r#"{"id":"coder","description":"user override","skills":[],"tool_palette":{"allow":["read"],"deny":[]},"escalation_contract":"bail-with-explanation"}"#;
         fs::write(roles_dir.join("coder.json"), user_json).unwrap();
 
         let roles = load_roles().unwrap();
@@ -647,7 +647,7 @@ mod tests {
         let guard = CrewDirGuard::new(TempDir::new().unwrap());
         let roles_dir = guard.path().join("roles");
         fs::create_dir_all(&roles_dir).unwrap();
-        let role_json = r#"{"id":"custom","description":"a custom role","capabilities":[],"tool_palette":{"allow":["read"],"deny":[]},"escalation_contract":"bail-with-explanation"}"#;
+        let role_json = r#"{"id":"custom","description":"a custom role","skills":[],"tool_palette":{"allow":["read"],"deny":[]},"escalation_contract":"bail-with-explanation"}"#;
         fs::write(roles_dir.join("custom.json"), role_json).unwrap();
         fs::write(roles_dir.join("custom.md"), "# Custom Role\nDo stuff.").unwrap();
 
@@ -665,7 +665,7 @@ mod tests {
         let guard = CrewDirGuard::new(TempDir::new().unwrap());
         let roles_dir = guard.path().join("roles");
         fs::create_dir_all(&roles_dir).unwrap();
-        let role_json = r#"{"id":"no-prompt","description":"no prompt file","capabilities":[],"tool_palette":{"allow":["read"],"deny":[]},"escalation_contract":"bail-with-explanation"}"#;
+        let role_json = r#"{"id":"no-prompt","description":"no prompt file","skills":[],"tool_palette":{"allow":["read"],"deny":[]},"escalation_contract":"bail-with-explanation"}"#;
         fs::write(roles_dir.join("no-prompt.json"), role_json).unwrap();
 
         let roles = load_roles().unwrap();
@@ -684,7 +684,7 @@ mod tests {
         let roles = load_roles().unwrap();
         let mc = roles.iter().find(|r| r.id == "mission-compiler").expect("builtin mission-compiler should load");
         assert_eq!(mc.id, "mission-compiler");
-        assert_eq!(mc.capabilities, vec!["mission-compiling".to_string()]);
+        assert_eq!(mc.skills, vec!["mission-compiling".to_string()]);
         assert_eq!(mc.tool_palette.allow, vec!["read".to_string()]);
         assert_eq!(mc.tool_palette.deny, vec!["edit", "write", "exec", "process"]);
     }
@@ -971,7 +971,7 @@ mod load_per_mission_tests {
         let guard = TestCrewRoot::new();
         let legacy_roles = guard.path().join("crew").join("roles");
         std::fs::create_dir_all(&legacy_roles).unwrap();
-        let user_json = r#"{"id":"coder","description":"legacy-layout override","capabilities":[],"tool_palette":{"allow":["read"],"deny":[]},"escalation_contract":"bail-with-explanation"}"#;
+        let user_json = r#"{"id":"coder","description":"legacy-layout override","skills":[],"tool_palette":{"allow":["read"],"deny":[]},"escalation_contract":"bail-with-explanation"}"#;
         std::fs::write(legacy_roles.join("coder.json"), user_json).unwrap();
 
         let roles = load_roles().unwrap();
@@ -1087,7 +1087,7 @@ mod load_per_mission_tests {
         let role = Role {
             id: "test-role".into(),
             description: "A test role".into(),
-            capabilities: vec![],
+            skills: vec![],
             tool_palette: ToolPalette { allow: vec!["read".into()], deny: vec![] },
             escalation_contract: EscalationContract::BailWithExplanation,
             prompt_path: None,
@@ -1104,7 +1104,7 @@ mod load_per_mission_tests {
         let role = Role {
             id: "test-role".into(),
             description: "A test role".into(),
-            capabilities: vec![],
+            skills: vec![],
             tool_palette: ToolPalette { allow: vec!["read".into()], deny: vec![] },
             escalation_contract: EscalationContract::BailWithExplanation,
             prompt_path: None,
@@ -1121,7 +1121,7 @@ mod load_per_mission_tests {
         let role = Role {
             id: "test-role".into(),
             description: "A test role".into(),
-            capabilities: vec![],
+            skills: vec![],
             tool_palette: ToolPalette { allow: vec!["read".into()], deny: vec![] },
             escalation_contract: EscalationContract::BailWithExplanation,
             prompt_path: None,

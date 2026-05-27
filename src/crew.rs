@@ -8,7 +8,7 @@
 //!
 //! Module layout:
 //!
-//!   crew::types  — schema (Role, Crew, Mission, Sprint, Capability, …)
+//!   crew::types  — schema (Role, Crew, Mission, Sprint, Skill, …)
 //!   crew::loader — read JSON manifests from `~/.darkmux/crew/<entity>/`
 //!                  with binary-embedded built-ins as fallback
 

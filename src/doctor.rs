@@ -222,7 +222,7 @@ fn check_legacy_compaction_extras() -> Check {
 }
 
 /// Detect operators still on the pre-Beat-33 `<root>/crew/{roles,
-/// missions,sprints,crews,capabilities,role-model-pins.json}` layout
+/// missions,sprints,crews,skills,role-model-pins.json}` layout
 /// and emit an mv-script they can copy-paste to flatten. The loader's
 /// dual-read keeps the legacy layout working, so this is a Warn (not
 /// Fail) — operator-sovereignty: doctor proposes, operator runs.
@@ -247,7 +247,7 @@ fn check_beat33_legacy_crew_dir() -> Check {
     // specific. We only care about the post-Beat-33 promoted subdirs +
     // the pinned file; anything else under crew/ is operator-authored
     // territory we won't recommend moving.
-    let promoted_subdirs = ["roles", "missions", "sprints", "crews", "capabilities"];
+    let promoted_subdirs = ["roles", "missions", "sprints", "crews", "skills"];
     let promoted_file = "role-model-pins.json";
     let mut present_subdirs: Vec<&str> = promoted_subdirs
         .iter()

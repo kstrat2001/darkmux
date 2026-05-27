@@ -112,7 +112,7 @@ fn oversize_sprint_aborts_publish_with_no_orphans() {
     let role_json = serde_json::json!({
         "id": "tdd-coder",
         "description": "test role",
-        "capabilities": [],
+        "skills": [],
         "tool_palette": {"allow": [], "deny": []},
         "escalation_contract": "bail-with-explanation",
         "tier": "inference"

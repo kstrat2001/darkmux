@@ -11,9 +11,13 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// A named capability with keyword-based relevance scoring.
+/// A named skill with keyword-based relevance scoring. A role declares
+/// which skills it has; the allocator matches mission keywords against
+/// role skills to route work. Renamed from `Capability` to free the
+/// word for the industry-conventional model-capability meaning that
+/// refactor 1 introduces (E14).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Capability {
+pub struct Skill {
     pub id: String,
     pub description: String,
     #[serde(default)]
@@ -44,13 +48,13 @@ pub enum EscalationContract {
     HandOffTo(String), // role id to hand off to
 }
 
-/// A single role definition: capabilities, tool palette, escalation behavior.
+/// A single role definition: skills, tool palette, escalation behavior.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Role {
     pub id: String,
     pub description: String,
     #[serde(default)]
-    pub capabilities: Vec<String>, // capability ids
+    pub skills: Vec<String>, // skill ids
     pub tool_palette: ToolPalette,
     pub escalation_contract: EscalationContract,
     /// Path to the sibling `<role-id>.md` prompt file if present. The loader
