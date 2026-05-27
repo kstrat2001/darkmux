@@ -994,6 +994,45 @@ mod load_per_mission_tests {
         assert!(preamble.contains("BLOCKED:"));
     }
 
+    /// (#442) Budget-aware prompt-engineering section pins the four
+    /// caps, their failure modes, and the floor-not-ceiling framing.
+    /// Future edits that silently revert these load-bearing phrases
+    /// would dilute the budget-awareness signal and reopen the
+    /// Parkinson's-law concern.
+    #[test]
+    fn embedded_preamble_carries_bounded_dispatch_prompt_engineering() {
+        let preamble = AUTONOMOUS_DISPATCH_PREAMBLE;
+        // Four-bound enumeration.
+        assert!(
+            preamble.contains("MAX_TURNS"),
+            "preamble must name the turn cap"
+        );
+        assert!(
+            preamble.contains("MAX_TOKENS_PER_CALL"),
+            "preamble must name the per-turn cap"
+        );
+        assert!(
+            preamble.contains("Cumulative completion-token cap"),
+            "preamble must name the cumulative-token cap"
+        );
+        assert!(
+            preamble.contains("Wall-clock deadline"),
+            "preamble must name the wall-clock deadline"
+        );
+        // Floor-not-ceiling framing — the key prompt-engineering move
+        // that guards against Parkinson's-law expansion.
+        assert!(
+            preamble.contains("*floor*, not a *ceiling*"),
+            "preamble must use floor-not-ceiling framing"
+        );
+        // Behavioral guidance must mention reasoning tokens count
+        // (the dominant failure mode from Beat 47).
+        assert!(
+            preamble.contains("Reasoning tokens count"),
+            "preamble must warn that reasoning tokens count toward the caps"
+        );
+    }
+
     #[serial]
     #[test]
     fn load_preamble_returns_embedded_when_no_user_override() {

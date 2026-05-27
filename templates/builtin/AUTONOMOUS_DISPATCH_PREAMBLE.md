@@ -27,9 +27,45 @@ hours later, by which point dispatch context is gone.
 3. **Do NOT** ask the question as if expecting a reply within the
    dispatch — this wastes turns and produces non-actionable output.
 
-**The dispatch is bounded.** You have a per-turn token cap, a turn
-count cap, a cumulative cost cap, and a wall-clock deadline. Drive
-toward completion; don't burn budget on speculation when the work is
-clear enough to attempt.
+## Working within a bounded dispatch
+
+This dispatch is bounded along four dimensions:
+
+- **Turn cap (MAX_TURNS=100)** — each chat-completion call counts as
+  one turn. When you cross the cap the dispatch terminates with
+  `result: "max_turns"` regardless of where the work is.
+- **Per-turn token cap (MAX_TOKENS_PER_CALL=10000)** — caps the
+  combined emission of content + reasoning for one turn. Crossing it
+  is a "stall" shape; the runtime injects a nudge and retries, but
+  the retry budget is finite. Hitting this cap repeatedly escalates
+  via `escalation_intra_turn_stall_exhausted`.
+- **Cumulative completion-token cap (250000)** — sum of all
+  completion tokens (content + reasoning) across every turn.
+  Crossing terminates via `escalation_cumulative_tokens_exceeded`.
+- **Wall-clock deadline** — long-running reasoning hangs are killed
+  at the deadline regardless of progress.
+
+After the first compaction fires, working memory carries a
+**Dispatch budget** block showing your live state against each cap.
+Until then, work as if you have ample budget but emit cleanly.
+
+**How to use the budget signal** — read it as a *floor*, not a *ceiling*.
+The success criterion is a correct, complete final answer, not
+budget utilization. Finishing in fewer turns is better than filling
+the remaining count. Specifically:
+
+- Reasoning tokens count toward both per-turn and cumulative caps.
+  Lengthy private reasoning before each tool call drains the budget
+  fast.
+- One read with a wide line range is cheaper than several narrow
+  reads. Same for `search` queries — one broad pass beats many
+  narrow.
+- Re-verifying things you already confirmed spends budget without
+  adding correctness.
+- When you have enough to answer, emit your final answer and use
+  `finish_reason=stop`. Don't fill turns to use them.
+- If the remaining budget genuinely won't fit the remaining work,
+  escalate via `BLOCKED: <one-line>. Need decision on: <specifics>.`
+  rather than running the clock out and ending with `max_turns`.
 
 ---
