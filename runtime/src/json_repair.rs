@@ -312,4 +312,34 @@ mod tests {
         let result = parse_with_repair::<TestEnv>(input);
         assert!(result.is_err(), "unrepairable input must surface the parse error");
     }
+
+    // ─── Real-world fixture replays (#437 / E13) ─────────────────────────
+
+    /// (Fixture: Beat 47 — pre-#435 production trace)
+    ///
+    /// The original empirical failure that motivated #435: 4B compactor
+    /// truncated mid-`active_files` with runaway `\n` escapes, leaving
+    /// an unterminated string and unclosed objects. Pre-#435 this
+    /// produced `EOF while parsing a string at line 1 column N` →
+    /// dispatch bailed.
+    ///
+    /// Post-#435: `repair_truncated_json` must terminate the open
+    /// string + balance containers so the result parses as a
+    /// `serde_json::Value`. Regression guard: if a future change drops
+    /// the EOF-string handling, this test fails.
+    #[test]
+    fn fixture_beat47_runaway_newlines_repairs_and_parses() {
+        let raw = include_str!(
+            "../tests/fixtures/compactor-malformed/beat47-runaway-newlines-active-files.json"
+        );
+        // Raw input must FAIL parse (that's why it's a fixture).
+        assert!(
+            serde_json::from_str::<serde_json::Value>(raw).is_err(),
+            "fixture's raw form must reproduce the parse failure"
+        );
+        // After repair: parses as a Value.
+        let repaired = repair_truncated_json(raw);
+        serde_json::from_str::<serde_json::Value>(&repaired)
+            .expect("repaired fixture must parse as serde_json::Value");
+    }
 }
