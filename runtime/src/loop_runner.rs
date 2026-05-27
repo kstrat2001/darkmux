@@ -520,11 +520,26 @@ pub fn run(
                             )?;
                         }
                         compaction::CompactionStrategy::StructuredSlot => {
+                            // (#439) Build budget snapshot so the
+                            // compacted SYSTEM message can surface
+                            // remaining budget to the model. Lets
+                            // the model pace within bounds + use the
+                            // BLOCKED: escalation convention before
+                            // cap exhaustion.
+                            let budget = compaction::BudgetSnapshot {
+                                turns_used: turns,
+                                max_turns: MAX_TURNS,
+                                cumulative_completion_tokens_used: total_completion_tokens,
+                                max_cumulative_completion_tokens:
+                                    MAX_CUMULATIVE_COMPLETION_TOKENS,
+                                max_tokens_per_call: MAX_TOKENS_PER_CALL,
+                            };
                             let parsed = compaction::structured_compact(
                                 client,
                                 &mut messages,
                                 compactions,
                                 compaction_cfg,
+                                Some(budget),
                             )?;
                             // Persist the JSON for downstream
                             // consumers (replay, methodology
@@ -800,6 +815,11 @@ mod tests {
                 generation,
                 source_message_count: 5,
             truncation_patched: None,
+            turns_used: None,
+            max_turns: None,
+            cumulative_completion_tokens_used: None,
+            max_cumulative_completion_tokens: None,
+            max_tokens_per_call: None,
             },
             completed_decisions: None,
             errors_to_preserve: None,
