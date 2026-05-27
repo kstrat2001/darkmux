@@ -97,6 +97,28 @@ const MAX_TOKENS_PER_CALL: u32 = 10000;
 /// context-budget allocation. Bigger context doesn't earn more rope.
 const MAX_CUMULATIVE_COMPLETION_TOKENS: u32 = 250_000;
 
+/// (#414 PR A) Per-dispatch budget for intra-turn stall recoveries.
+/// Each recovery costs one extra chat() call + a small nudge message;
+/// the budget caps the cost while still tolerating a transient stall.
+///
+/// **Why 2** — Beat 47/48 showed runs that hit one runaway-reasoning
+/// turn then recovered on the next normal call. A budget of 2 gives
+/// the loop one "free" retry after the first stall, plus a second if
+/// the next turn also stalls. Three consecutive stalls is the
+/// pathology signal — escalate rather than burn more turns trying.
+const MAX_STALL_RECOVERIES: u32 = 2;
+
+/// (#414 PR A) Nudge text injected as a system message when the loop
+/// recovers from a length-finish stall. Names BOTH valid next moves
+/// (tool call OR final answer) so the model has explicit alternatives
+/// to the reasoning-spiral pattern that triggered the stall. The
+/// `[darkmux-runtime]` prefix flags the message as runtime-injected so
+/// the operator + reviewer can recognize it in trajectory replay.
+const STALL_NUDGE_MESSAGE: &str = "[darkmux-runtime] Your previous response \
+emitted reasoning tokens up to the per-call cap without producing a tool \
+call or a final answer. Please either invoke a tool to make progress, or \
+provide a direct final answer.";
+
 /// How the loop terminated. Distinguishes "model said stop" from
 /// "loop hit the safety cap and gave up" — semantically different
 /// outcomes for downstream consumers (a max_turns hit means the
@@ -147,6 +169,13 @@ pub enum EscalationReason {
     /// flows through `LoopOutcome` as with the other escalation
     /// reasons.
     CumulativeTokensExceeded,
+    /// (#414 PR A) Intra-turn stall recovery budget
+    /// ([`MAX_STALL_RECOVERIES`]) exhausted. Fires when the model
+    /// returned `finish_reason=length` with no content and no
+    /// tool_calls more times than the budget allows — the recovery
+    /// nudge isn't breaking the pattern, so the dispatch escalates
+    /// rather than burn more turns on the same stall.
+    IntraTurnStallExhausted,
 }
 
 /// Outcome of a completed loop run.
@@ -211,6 +240,13 @@ pub fn run(
     let mut total_completion_tokens: u32 = 0;
     let mut compactions: u32 = 0;
     let mut latest_prompt_tokens: u32 = 0;
+    // (#414 PR A) Per-dispatch budget for intra-turn stall recoveries.
+    // Each occurrence of `finish_reason=length` with empty content +
+    // no tool_calls (the classic Beat 47 / Run 1 runaway-reasoning
+    // shape) consumes one slot. Exhausted budget escalates the
+    // dispatch via `IntraTurnStallExhausted` so the operator/frontier
+    // can intervene instead of burning more turns on the same stall.
+    let mut stall_recoveries_used: u32 = 0;
     // (#418) Per-dispatch cycle detector — warns on repeated tool
     // calls within a sliding window. Observability-only in the MVP;
     // bail-on-cycle is a follow-up if warn alone proves insufficient.
@@ -339,6 +375,11 @@ pub fn run(
             choice.message.reasoning_content = None;
         }
 
+        // (#414 PR A) Capture this turn's completion-token count BEFORE
+        // it folds into the cumulative total, so the stall-recovery
+        // branch below can record it in the trajectory event.
+        let this_turn_completion_tokens =
+            response.usage.as_ref().map(|u| u.completion_tokens).unwrap_or(0);
         if let Some(usage) = &response.usage {
             total_prompt_tokens = total_prompt_tokens.saturating_add(usage.prompt_tokens);
             total_completion_tokens =
@@ -607,19 +648,92 @@ pub fn run(
                 continue;
             }
             "length" => {
-                return Err(anyhow!(
-                    "model returned finish_reason=length — the response was \
-                     cut off mid-generation. Two causes are possible: \
-                     (1) per-call cap fired (MAX_TOKENS_PER_CALL = {MAX_TOKENS_PER_CALL}); \
-                     the model emitted that many tokens (content + reasoning) \
-                     in this single turn, often a runaway-thinking-mode hang. \
-                     (2) context overflow; prompt_tokens crossed the model's \
-                     loaded context window. Check `usage.completion_tokens` in \
-                     the trajectory's model.completed event: if it equals \
-                     {MAX_TOKENS_PER_CALL}, cause (1); otherwise cause (2). \
-                     If (1), see #414 (intra-turn stall recovery). If (2), \
-                     compaction may need a smaller threshold or a larger n_ctx."
-                ));
+                // (#414 PR A) Detect the runaway-reasoning shape:
+                // finish_reason=length AND content empty AND no
+                // tool_calls. This is the Beat 47 / Run 1 pattern —
+                // the model emitted up to the per-call cap entirely
+                // in reasoning tokens, producing nothing actionable.
+                // The other length-shape (real content truncated
+                // mid-emission, OR truncated mid-tool-args) is not
+                // recoverable in the same way and stays a hard error.
+                let last = messages
+                    .last()
+                    .expect("assistant message was just pushed");
+                let content_empty = last
+                    .content
+                    .as_deref()
+                    .map(|s| s.trim().is_empty())
+                    .unwrap_or(true);
+                let no_tool_calls = last
+                    .tool_calls
+                    .as_ref()
+                    .map(|tc| tc.is_empty())
+                    .unwrap_or(true);
+                let is_useless_stall = content_empty && no_tool_calls;
+
+                if !is_useless_stall {
+                    return Err(anyhow!(
+                        "model returned finish_reason=length with partial \
+                         content or partial tool_calls — the response was \
+                         cut off mid-generation but salvage isn't safe. \
+                         Two causes are possible: \
+                         (1) per-call cap fired (MAX_TOKENS_PER_CALL = {MAX_TOKENS_PER_CALL}); \
+                         the model emitted that many tokens (content + reasoning) \
+                         in this single turn. \
+                         (2) context overflow; prompt_tokens crossed the model's \
+                         loaded context window. Check `usage.completion_tokens` in \
+                         the trajectory's model.completed event: if it equals \
+                         {MAX_TOKENS_PER_CALL}, cause (1); otherwise cause (2). \
+                         If (2), compaction may need a smaller threshold or a larger n_ctx."
+                    ));
+                }
+
+                // Budget check FIRST so an exhausted-budget escalation
+                // doesn't have to also account for the unproductive
+                // turn that just landed.
+                if stall_recoveries_used >= MAX_STALL_RECOVERIES {
+                    eprintln!(
+                        "darkmux-runtime: escalation_triggered — intra-turn \
+                         stall recovery budget ({MAX_STALL_RECOVERIES}) exhausted; \
+                         {stall_recoveries_used} prior recoveries didn't break the \
+                         pattern. Emitting EscalationTriggered for frontier handoff."
+                    );
+                    return Ok(LoopOutcome {
+                        terminal_reason: TerminalReason::EscalationTriggered(
+                            EscalationReason::IntraTurnStallExhausted,
+                        ),
+                        messages,
+                        turns,
+                        total_prompt_tokens,
+                        total_completion_tokens,
+                        compactions,
+                    });
+                }
+
+                // Recover: drop the useless turn from history (it's
+                // pure reasoning noise — leaving it would anchor the
+                // model on the same failed pattern), record a stall-
+                // recovered trajectory event for observability, then
+                // append a system-role nudge naming the two valid
+                // next moves (tool call or final answer). The next
+                // iteration's chat() call will see the augmented
+                // conversation.
+                messages.pop();
+                stall_recoveries_used = stall_recoveries_used.saturating_add(1);
+                trajectory.append_intra_turn_stall_recovered(
+                    turns,
+                    this_turn_completion_tokens,
+                    stall_recoveries_used,
+                    MAX_STALL_RECOVERIES,
+                );
+                messages.push(Message::system(STALL_NUDGE_MESSAGE));
+                eprintln!(
+                    "darkmux-runtime: ⏸ intra-turn stall recovered — turn {turns} \
+                     emitted {this_turn_completion_tokens} completion tokens with no \
+                     content and no tool calls (runaway-reasoning shape). Dropped \
+                     the useless turn, injected a nudge; budget {stall_recoveries_used}/{MAX_STALL_RECOVERIES} used. (#414)"
+                );
+                continue;
             }
             other => {
                 return Err(anyhow!(
@@ -2029,6 +2143,264 @@ mod tests {
         assert!(
             outcome.compactions >= 1,
             "compaction still fires; bail just doesn't kick in"
+        );
+    }
+
+    // ===== (#414 PR A) Length-finish stall recovery tests =====
+
+    /// (#414 PR A) The Run 1 / Beat 47 shape: model returns
+    /// `finish_reason=length` with NO content and NO tool_calls — pure
+    /// reasoning hang. The loop must recover via nudge+retry instead
+    /// of bailing. Mock uses two stages: stall on the FIRST request
+    /// (the one with no nudge yet), then stop on the SECOND request
+    /// (which carries the nudge). The state-discrimination relies on
+    /// httpmock's `body_contains` against the nudge sentinel — the
+    /// retried request will carry the nudge text in its messages
+    /// payload; the first will not.
+    #[test]
+    #[serial_test::serial]
+    fn loop_recovers_from_length_stall_when_content_empty_and_no_tool_calls() {
+        let server = MockServer::start();
+        // First call: no nudge in payload → stall response.
+        let _stall = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .matches(|req| {
+                    let body = req.body.as_deref().and_then(|b| std::str::from_utf8(b).ok()).unwrap_or("");
+                    !body.contains("darkmux-runtime] Your previous response")
+                });
+            then.status(200).json_body(chat_response_json(
+                None,                       // content = null
+                None,                       // no tool_calls
+                "length",                   // per-call cap fired
+                100,
+                MAX_TOKENS_PER_CALL,
+            ));
+        });
+        // Second call: nudge present in payload → clean stop.
+        let _stop = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("darkmux-runtime] Your previous response");
+            then.status(200).json_body(chat_response_json(
+                Some("answered after the nudge"),
+                None,
+                "stop",
+                150,
+                10,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempdir::TempDir::new("stall-recover").unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("answer the question")];
+        let tools = [Tool::Read];
+
+        let cfg = compaction::CompactionConfig::default();
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg)
+            .expect("stall recovery should drive the loop to Stop, not Err");
+
+        assert_eq!(
+            outcome.terminal_reason,
+            TerminalReason::Stop,
+            "post-nudge turn produced clean stop"
+        );
+        assert!(
+            outcome.turns >= 2,
+            "expected at least 2 turns (stall + recovery); got {}",
+            outcome.turns
+        );
+        // The useless turn must have been popped from history — only
+        // the post-nudge assistant message survives.
+        let assistant_msgs: Vec<&Message> = outcome
+            .messages
+            .iter()
+            .filter(|m| m.role == "assistant")
+            .collect();
+        assert_eq!(
+            assistant_msgs.len(),
+            1,
+            "stalled turn must be popped from history; got {} assistant msgs",
+            assistant_msgs.len()
+        );
+        assert_eq!(
+            assistant_msgs[0].content.as_deref(),
+            Some("answered after the nudge"),
+            "the surviving assistant message is the post-recovery one"
+        );
+        // The nudge system message must appear in the conversation
+        // (it was injected by the recovery branch).
+        let nudge_present = outcome
+            .messages
+            .iter()
+            .any(|m| m.role == "system" && m.content.as_deref().map(|c| c.contains("[darkmux-runtime]")).unwrap_or(false));
+        assert!(nudge_present, "nudge system message must be present in final conversation");
+    }
+
+    /// (#414 PR A) Negative case — the OTHER length shape: model
+    /// returned content (a partial answer) along with
+    /// `finish_reason=length`. This is genuine truncation, NOT a
+    /// runaway-reasoning stall; salvage isn't safe (the partial reply
+    /// may mislead). The loop must still bail in this case.
+    #[test]
+    #[serial_test::serial]
+    fn loop_bails_on_length_when_content_is_present() {
+        let server = MockServer::start();
+        let _truncated = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_json(
+                Some("here is half my answer before I got cut o"),  // real partial content
+                None,
+                "length",
+                100,
+                MAX_TOKENS_PER_CALL,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempdir::TempDir::new("length-truncated").unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("verbose answer")];
+        let tools = [Tool::Read];
+
+        let cfg = compaction::CompactionConfig::default();
+        let result = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg);
+
+        assert!(
+            result.is_err(),
+            "finish_reason=length with content present must bail (truncated answer, not stall)"
+        );
+    }
+
+    /// (#414 PR A) When the model stalls more times than
+    /// [`MAX_STALL_RECOVERIES`] tolerates, the dispatch escalates via
+    /// `EscalationTriggered(IntraTurnStallExhausted)` instead of
+    /// burning more turns or returning Err. Asserts the escalation
+    /// path delivers a salvageable outcome (consistent with the other
+    /// EscalationReason cases).
+    #[test]
+    #[serial_test::serial]
+    fn loop_escalates_when_stall_recovery_budget_exhausted() {
+        let server = MockServer::start();
+        // Every call returns the stall shape: length + no content +
+        // no tool_calls. The loop will recover twice (consuming the
+        // budget), then escalate on the third stall.
+        let _stall = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_json(
+                None,
+                None,
+                "length",
+                100,
+                MAX_TOKENS_PER_CALL,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempdir::TempDir::new("stall-budget-exhaust").unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("ask")];
+        let tools = [Tool::Read];
+
+        let cfg = compaction::CompactionConfig::default();
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg)
+            .expect("budget exhaustion returns Ok(EscalationTriggered)");
+
+        assert_eq!(
+            outcome.terminal_reason,
+            TerminalReason::EscalationTriggered(EscalationReason::IntraTurnStallExhausted),
+            "expected IntraTurnStallExhausted escalation, got {:?}",
+            outcome.terminal_reason
+        );
+        // The 3rd stall is what trips escalation: recoveries 1 and 2
+        // already ran the loop back through chat(); the 3rd sees the
+        // budget exhausted and escalates.
+        assert_eq!(
+            outcome.turns, MAX_STALL_RECOVERIES + 1,
+            "expected exactly MAX_STALL_RECOVERIES+1 turns (=={}); got {}",
+            MAX_STALL_RECOVERIES + 1,
+            outcome.turns
+        );
+    }
+
+    /// (#414 PR A) The stall-recovery trajectory event must fire each
+    /// time the recovery branch runs, recording the per-turn
+    /// completion-token count and the budget consumption. Operators
+    /// watching `dispatch.intra_turn_stall.recovered` events get a
+    /// direct rate signal alongside the existing `tool_call.promoted`
+    /// rate.
+    #[test]
+    #[serial_test::serial]
+    fn loop_emits_intra_turn_stall_recovered_trajectory_event() {
+        let server = MockServer::start();
+        let _stall = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .matches(|req| {
+                    let body = req.body.as_deref().and_then(|b| std::str::from_utf8(b).ok()).unwrap_or("");
+                    !body.contains("darkmux-runtime] Your previous response")
+                });
+            then.status(200).json_body(chat_response_json(
+                None,
+                None,
+                "length",
+                100,
+                MAX_TOKENS_PER_CALL,
+            ));
+        });
+        let _stop = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("darkmux-runtime] Your previous response");
+            then.status(200).json_body(chat_response_json(
+                Some("recovered"),
+                None,
+                "stop",
+                150,
+                10,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempdir::TempDir::new("stall-traj").unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("ask")];
+        let tools = [Tool::Read];
+
+        let cfg = compaction::CompactionConfig::default();
+        let _outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg)
+            .expect("recovery succeeds");
+
+        // Read the trajectory JSONL and assert the event landed.
+        // (Trajectory::open creates `.darkmux-runtime/trajectory.jsonl`
+        // under the given root, so we mirror that path here.)
+        let traj_path = tmp.path().join(".darkmux-runtime/trajectory.jsonl");
+        let raw = std::fs::read_to_string(&traj_path).expect("trajectory file exists");
+        let mut found_recovered = false;
+        for line in raw.lines() {
+            let v: serde_json::Value = serde_json::from_str(line).expect("each line is JSON");
+            if v.get("type").and_then(|t| t.as_str()) == Some("dispatch.intra_turn_stall.recovered") {
+                found_recovered = true;
+                assert_eq!(
+                    v.get("completion_tokens").and_then(|x| x.as_u64()),
+                    Some(MAX_TOKENS_PER_CALL as u64),
+                    "completion_tokens must equal per-call cap on the runaway turn"
+                );
+                assert_eq!(
+                    v.get("recoveries_used").and_then(|x| x.as_u64()),
+                    Some(1),
+                    "first recovery records recoveries_used=1"
+                );
+                assert_eq!(
+                    v.get("recoveries_budget").and_then(|x| x.as_u64()),
+                    Some(MAX_STALL_RECOVERIES as u64),
+                );
+            }
+        }
+        assert!(
+            found_recovered,
+            "trajectory must contain dispatch.intra_turn_stall.recovered event"
         );
     }
 }
