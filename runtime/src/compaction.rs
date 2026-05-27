@@ -937,7 +937,7 @@ pub fn render_structured_output_as_markdown(
             ));
         }
         md.push_str(
-            "\nTreat these as a *floor*, not a ceiling — finishing in fewer turns is better \
+            "\nTreat these as a *floor*, not a *ceiling* — finishing in fewer turns is better \
              than filling them. Reasoning tokens count toward both per-turn and cumulative caps. \
              Group reads/searches; don't re-verify confirmed facts. When you have enough to \
              answer, emit your final answer and stop. If the budget won't fit the remaining \
@@ -2345,8 +2345,8 @@ mod tests {
         let out = make_output_with_metadata(make_metadata_with_budget(budget_snapshot_v1()));
         let md = render_structured_output_as_markdown(&out, 6);
         assert!(
-            md.contains("*floor*, not a ceiling"),
-            "framing must explicitly contrast floor vs ceiling"
+            md.contains("*floor*, not a *ceiling*"),
+            "framing must explicitly contrast floor vs ceiling (both italicized — must match the preamble's exact phrasing per #442 review)"
         );
         assert!(
             md.contains("fewer turns is better"),

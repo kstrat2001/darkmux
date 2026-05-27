@@ -994,6 +994,47 @@ mod load_per_mission_tests {
         assert!(preamble.contains("BLOCKED:"));
     }
 
+    /// (#442) Drift guard — the preamble names the four bounds with
+    /// their literal numeric values (e.g. `MAX_TURNS=100`). Those
+    /// values are sourced from constants in `runtime/src/loop_runner.rs`.
+    /// If a future retune (say MAX_TURNS=80, or cumulative cap to
+    /// 500000) doesn't also update the preamble, the prompt becomes a
+    /// lie — silently. This test asserts the loop_runner source file
+    /// contains the constant declaration with the exact value the
+    /// preamble advertises. Cross-crate string-search at test time
+    /// rather than `include_str!` to keep the main crate independent
+    /// of the runtime crate.
+    #[test]
+    fn embedded_preamble_numerics_match_loop_runner_constants() {
+        let loop_runner_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("runtime/src/loop_runner.rs");
+        let source = std::fs::read_to_string(&loop_runner_path)
+            .expect("loop_runner.rs must be readable from CARGO_MANIFEST_DIR");
+        let preamble = AUTONOMOUS_DISPATCH_PREAMBLE;
+
+        // Each tuple: (preamble fragment, loop_runner constant decl)
+        // The constants are declared with `: u32 = <N>;`; numeric
+        // separators are normalized when comparing — loop_runner uses
+        // `250_000` while the preamble uses `250000`.
+        let pairings = [
+            ("MAX_TURNS=100", "MAX_TURNS: u32 = 100;"),
+            ("MAX_TOKENS_PER_CALL=10000", "MAX_TOKENS_PER_CALL: u32 = 10000;"),
+            ("Cumulative completion-token cap (250000)", "MAX_CUMULATIVE_COMPLETION_TOKENS: u32 = 250_000;"),
+        ];
+        for (preamble_frag, source_decl) in pairings {
+            assert!(
+                preamble.contains(preamble_frag),
+                "preamble must carry the fragment `{preamble_frag}` — found this list of \
+                 budget-related substrings in the file: drift-guard for #442"
+            );
+            assert!(
+                source.contains(source_decl),
+                "loop_runner.rs must still declare `{source_decl}` — if you retuned this \
+                 constant, also update AUTONOMOUS_DISPATCH_PREAMBLE.md (#442 drift guard)"
+            );
+        }
+    }
+
     /// (#442) Budget-aware prompt-engineering section pins the four
     /// caps, their failure modes, and the floor-not-ceiling framing.
     /// Future edits that silently revert these load-bearing phrases

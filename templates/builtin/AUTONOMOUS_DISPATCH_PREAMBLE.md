@@ -1,3 +1,12 @@
+<!--
+This file is embedded into specialist-role system prompts at dispatch
+time. Replacing it with an operator-owned copy at
+`<crew_root>/AUTONOMOUS_DISPATCH_PREAMBLE.md` replaces ALL of the
+content below — including the dispatch-budget guidance in the
+"Working within a bounded dispatch" section. If you override and want
+to keep that guidance, copy it from upstream into your custom file.
+-->
+
 # Autonomous dispatch context (read first)
 
 You are operating in autonomous dispatch mode. The operator who started
