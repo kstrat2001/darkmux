@@ -232,15 +232,24 @@ impl Trajectory {
     pub fn append_intra_turn_stall_recovered(
         &mut self,
         seq: u32,
-        completion_tokens: u32,
+        completion_tokens: Option<u32>,
         recoveries_used: u32,
         recoveries_budget: u32,
     ) {
+        // The event's analytic purpose is to discriminate per-call-cap
+        // stalls (completion_tokens ≈ MAX_TOKENS_PER_CALL) from
+        // context-overflow stalls (count well below cap). When the
+        // upstream response omits `usage` (rare but possible), emit
+        // the field as null so consumers see "unknown" rather than a
+        // misleading 0 that reads identical to a real small count.
+        let completion_tokens_value = completion_tokens
+            .map(serde_json::Value::from)
+            .unwrap_or(serde_json::Value::Null);
         self.write_event(&serde_json::json!({
             "type": "dispatch.intra_turn_stall.recovered",
             "seq": seq,
             "ts": unix_ms(),
-            "completion_tokens": completion_tokens,
+            "completion_tokens": completion_tokens_value,
             "recoveries_used": recoveries_used,
             "recoveries_budget": recoveries_budget,
         }));

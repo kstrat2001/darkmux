@@ -13,7 +13,7 @@ This skill picks up where a local-tier dispatch left off when it hit an operator
 
 You're looking at one of:
 
-- A `darkmux lab run` or `darkmux crew dispatch` that ended with `result: "escalation_compaction_limit_reached"` (today's only variant; future variants share the `escalation_*` prefix).
+- A `darkmux lab run` or `darkmux crew dispatch` that ended with `result: "escalation_compaction_limit_reached"`, `result: "escalation_cumulative_tokens_exceeded"`, or `result: "escalation_intra_turn_stall_exhausted"`. All escalation results share the `escalation_*` prefix; future variants will too.
 - A run manifest under `~/.darkmux/runs/<run-id>/manifest.json` whose `ok: false` carries an escalation-shaped error string.
 - A flow record on the topology viewer with `terminal_reason: EscalationTriggered`.
 
@@ -40,7 +40,7 @@ cat $RUN_DIR/manifest.json | jq '.'
 What you're looking for in the manifest:
 
 - `ok: false` (escalation manifests as non-ok in the host layer for back-compat with consumers that grep on ok)
-- An error string containing `escalation_compaction_limit_reached` or similar
+- An error string containing one of `escalation_compaction_limit_reached`, `escalation_cumulative_tokens_exceeded`, or `escalation_intra_turn_stall_exhausted`
 - `sandbox` — the workspace path the agent was working in (this is your continuation workspace)
 - `workload` + `profile` — context for what was being attempted
 

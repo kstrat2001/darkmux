@@ -377,9 +377,14 @@ pub fn run(
 
         // (#414 PR A) Capture this turn's completion-token count BEFORE
         // it folds into the cumulative total, so the stall-recovery
-        // branch below can record it in the trajectory event.
-        let this_turn_completion_tokens =
-            response.usage.as_ref().map(|u| u.completion_tokens).unwrap_or(0);
+        // branch below can record it in the trajectory event. Kept as
+        // Option so an absent-usage response (rare) is distinguishable
+        // from a legitimate zero in the trajectory event — the event's
+        // purpose is to discriminate per-call-cap stalls (count ≈
+        // MAX_TOKENS_PER_CALL) from context-overflow stalls, so the
+        // distinction matters.
+        let this_turn_completion_tokens: Option<u32> =
+            response.usage.as_ref().map(|u| u.completion_tokens);
         if let Some(usage) = &response.usage {
             total_prompt_tokens = total_prompt_tokens.saturating_add(usage.prompt_tokens);
             total_completion_tokens =
@@ -656,15 +661,16 @@ pub fn run(
                 // The other length-shape (real content truncated
                 // mid-emission, OR truncated mid-tool-args) is not
                 // recoverable in the same way and stays a hard error.
-                let last = messages
-                    .last()
-                    .expect("assistant message was just pushed");
-                let content_empty = last
+                // Read the just-landed turn shape directly from
+                // `assistant_message` (still in scope) rather than from
+                // `messages.last()`. Avoids a brittle `.expect()` on a
+                // future refactor that pushes the message conditionally.
+                let content_empty = assistant_message
                     .content
                     .as_deref()
                     .map(|s| s.trim().is_empty())
                     .unwrap_or(true);
-                let no_tool_calls = last
+                let no_tool_calls = assistant_message
                     .tool_calls
                     .as_ref()
                     .map(|tc| tc.is_empty())
@@ -727,9 +733,12 @@ pub fn run(
                     MAX_STALL_RECOVERIES,
                 );
                 messages.push(Message::system(STALL_NUDGE_MESSAGE));
+                let tokens_str = this_turn_completion_tokens
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "<unknown>".to_string());
                 eprintln!(
                     "darkmux-runtime: ⏸ intra-turn stall recovered — turn {turns} \
-                     emitted {this_turn_completion_tokens} completion tokens with no \
+                     emitted {tokens_str} completion tokens with no \
                      content and no tool calls (runaway-reasoning shape). Dropped \
                      the useless turn, injected a nudge; budget {stall_recoveries_used}/{MAX_STALL_RECOVERIES} used. (#414)"
                 );
@@ -2271,6 +2280,92 @@ mod tests {
             result.is_err(),
             "finish_reason=length with content present must bail (truncated answer, not stall)"
         );
+    }
+
+    /// (#414 PR A) Coverage for the `tool_calls: []` empty-array
+    /// shape (distinct from `tool_calls: null`/absent). Some OpenAI-
+    /// compatible servers serialize the absent case as an empty
+    /// array; the recovery detection should treat both identically.
+    /// Also pins that content-PRESENT + tool_calls-EMPTY-ARRAY still
+    /// routes to the hard-error branch (it's truncated content, not
+    /// a stall).
+    #[test]
+    #[serial_test::serial]
+    fn loop_bails_on_length_with_content_and_empty_tool_calls_array() {
+        let server = MockServer::start();
+        let _truncated = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_json(
+                Some("half answer before"),
+                Some(serde_json::json!([])),
+                "length",
+                100,
+                MAX_TOKENS_PER_CALL,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempdir::TempDir::new("length-empty-tc-array").unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("ask")];
+        let tools = [Tool::Read];
+
+        let cfg = compaction::CompactionConfig::default();
+        let result = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg);
+
+        assert!(
+            result.is_err(),
+            "length + content + empty-array tool_calls must bail (truncated answer shape)"
+        );
+    }
+
+    /// (#414 PR A) Coverage for the `tool_calls: []` empty-array
+    /// shape WITHOUT content. The runaway-reasoning detection should
+    /// treat `tool_calls: []` identically to `tool_calls: null` and
+    /// recover via nudge+retry just like the null-tool_calls case.
+    #[test]
+    #[serial_test::serial]
+    fn loop_recovers_from_length_stall_when_tool_calls_is_empty_array() {
+        let server = MockServer::start();
+        let _stall = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .matches(|req| {
+                    let body = req.body.as_deref().and_then(|b| std::str::from_utf8(b).ok()).unwrap_or("");
+                    !body.contains("darkmux-runtime] Your previous response")
+                });
+            then.status(200).json_body(chat_response_json(
+                None,
+                Some(serde_json::json!([])), // empty array, not null
+                "length",
+                100,
+                MAX_TOKENS_PER_CALL,
+            ));
+        });
+        let _stop = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("darkmux-runtime] Your previous response");
+            then.status(200).json_body(chat_response_json(
+                Some("answered after nudge"),
+                None,
+                "stop",
+                150,
+                10,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempdir::TempDir::new("stall-recover-empty-array").unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("ask")];
+        let tools = [Tool::Read];
+
+        let cfg = compaction::CompactionConfig::default();
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg)
+            .expect("recovery should drive the loop to Stop");
+
+        assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
     }
 
     /// (#414 PR A) When the model stalls more times than
