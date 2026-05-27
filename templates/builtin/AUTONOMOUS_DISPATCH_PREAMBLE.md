@@ -40,23 +40,24 @@ hours later, by which point dispatch context is gone.
 
 This dispatch is bounded along four dimensions:
 
-- **Turn cap (MAX_TURNS=100)** — each chat-completion call counts as
-  one turn. When you cross the cap the dispatch terminates with
+- **Turn cap** — each chat-completion call counts as one turn. When
+  you cross the cap, the dispatch terminates with
   `result: "max_turns"` regardless of where the work is.
-- **Per-turn token cap (MAX_TOKENS_PER_CALL=10000)** — caps the
-  combined emission of content + reasoning for one turn. Crossing it
-  is a "stall" shape; the runtime injects a nudge and retries, but
-  the retry budget is finite. Hitting this cap repeatedly escalates
-  via `escalation_intra_turn_stall_exhausted`.
-- **Cumulative completion-token cap (250000)** — sum of all
-  completion tokens (content + reasoning) across every turn.
-  Crossing terminates via `escalation_cumulative_tokens_exceeded`.
+- **Per-turn token cap** — caps the combined emission of content +
+  reasoning for one turn. Crossing it is a "stall" shape; the runtime
+  injects a nudge and retries, but the retry budget is finite.
+  Hitting this cap repeatedly escalates via
+  `escalation_intra_turn_stall_exhausted`.
+- **Cumulative completion-token cap** — sum of all completion tokens
+  (content + reasoning) across every turn. Crossing terminates via
+  `escalation_cumulative_tokens_exceeded`.
 - **Wall-clock deadline** — long-running reasoning hangs are killed
   at the deadline regardless of progress.
 
-After the first compaction fires, working memory carries a
-**Dispatch budget** block showing your live state against each cap.
-Until then, work as if you have ample budget but emit cleanly.
+The actual cap values are operator-configurable and surface live in
+the **Dispatch budget** block of working memory once compaction has
+fired. Until then, work as if you have ample budget but emit
+cleanly — don't pace yourself by speculation.
 
 **How to use the budget signal** — read it as a *floor*, not a *ceiling*.
 The success criterion is a correct, complete final answer, not

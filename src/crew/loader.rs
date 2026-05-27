@@ -994,62 +994,27 @@ mod load_per_mission_tests {
         assert!(preamble.contains("BLOCKED:"));
     }
 
-    /// (#442) Drift guard — the preamble names the four bounds with
-    /// their literal numeric values (e.g. `MAX_TURNS=100`). Those
-    /// values are sourced from constants in `runtime/src/loop_runner.rs`.
-    /// If a future retune (say MAX_TURNS=80, or cumulative cap to
-    /// 500000) doesn't also update the preamble, the prompt becomes a
-    /// lie — silently. This test asserts the loop_runner source file
-    /// contains the constant declaration with the exact value the
-    /// preamble advertises. Cross-crate string-search at test time
-    /// rather than `include_str!` to keep the main crate independent
-    /// of the runtime crate.
-    #[test]
-    fn embedded_preamble_numerics_match_loop_runner_constants() {
-        let loop_runner_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("runtime/src/loop_runner.rs");
-        let source = std::fs::read_to_string(&loop_runner_path)
-            .expect("loop_runner.rs must be readable from CARGO_MANIFEST_DIR");
-        let preamble = AUTONOMOUS_DISPATCH_PREAMBLE;
-
-        // Each tuple: (preamble fragment, loop_runner constant decl)
-        // The constants are declared with `: u32 = <N>;`; numeric
-        // separators are normalized when comparing — loop_runner uses
-        // `250_000` while the preamble uses `250000`.
-        let pairings = [
-            ("MAX_TURNS=100", "MAX_TURNS: u32 = 100;"),
-            ("MAX_TOKENS_PER_CALL=10000", "MAX_TOKENS_PER_CALL: u32 = 10000;"),
-            ("Cumulative completion-token cap (250000)", "MAX_CUMULATIVE_COMPLETION_TOKENS: u32 = 250_000;"),
-        ];
-        for (preamble_frag, source_decl) in pairings {
-            assert!(
-                preamble.contains(preamble_frag),
-                "preamble must carry the fragment `{preamble_frag}` — found this list of \
-                 budget-related substrings in the file: drift-guard for #442"
-            );
-            assert!(
-                source.contains(source_decl),
-                "loop_runner.rs must still declare `{source_decl}` — if you retuned this \
-                 constant, also update AUTONOMOUS_DISPATCH_PREAMBLE.md (#442 drift guard)"
-            );
-        }
-    }
-
     /// (#442) Budget-aware prompt-engineering section pins the four
-    /// caps, their failure modes, and the floor-not-ceiling framing.
+    /// bounds, their failure modes, and the floor-not-ceiling framing.
     /// Future edits that silently revert these load-bearing phrases
     /// would dilute the budget-awareness signal and reopen the
     /// Parkinson's-law concern.
+    ///
+    /// Deliberately does NOT assert specific numeric values — the
+    /// preamble describes the bounds conceptually; the live values
+    /// surface in the dynamic Dispatch budget block at compaction
+    /// time. Pinning numerics here would couple the prompt to the
+    /// runtime's current tuning and silently lie after a retune.
     #[test]
     fn embedded_preamble_carries_bounded_dispatch_prompt_engineering() {
         let preamble = AUTONOMOUS_DISPATCH_PREAMBLE;
-        // Four-bound enumeration.
+        // Four-bound enumeration — by concept, not value.
         assert!(
-            preamble.contains("MAX_TURNS"),
+            preamble.contains("Turn cap"),
             "preamble must name the turn cap"
         );
         assert!(
-            preamble.contains("MAX_TOKENS_PER_CALL"),
+            preamble.contains("Per-turn token cap"),
             "preamble must name the per-turn cap"
         );
         assert!(
@@ -1059,6 +1024,20 @@ mod load_per_mission_tests {
         assert!(
             preamble.contains("Wall-clock deadline"),
             "preamble must name the wall-clock deadline"
+        );
+        // Failure-mode names each bound emits — these are operator-
+        // visible JSON envelope strings, stable contract.
+        assert!(
+            preamble.contains("result: \"max_turns\""),
+            "preamble must name the max_turns terminal"
+        );
+        assert!(
+            preamble.contains("escalation_intra_turn_stall_exhausted"),
+            "preamble must name the intra-turn-stall escalation"
+        );
+        assert!(
+            preamble.contains("escalation_cumulative_tokens_exceeded"),
+            "preamble must name the cumulative-tokens escalation"
         );
         // Floor-not-ceiling framing — the key prompt-engineering move
         // that guards against Parkinson's-law expansion.
@@ -1071,6 +1050,13 @@ mod load_per_mission_tests {
         assert!(
             preamble.contains("Reasoning tokens count"),
             "preamble must warn that reasoning tokens count toward the caps"
+        );
+        // Operator-tunable signal — names that values live in the
+        // dynamic Dispatch budget block, not in the preamble.
+        assert!(
+            preamble.contains("operator-configurable"),
+            "preamble must signal that cap values are operator-tunable, \
+             not hardcoded into the prompt"
         );
     }
 
