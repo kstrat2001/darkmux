@@ -394,6 +394,7 @@ pub fn structured_compact(
     messages: &mut Vec<Message>,
     generation: u32,
     cfg: &CompactionConfig,
+    budget: Option<BudgetSnapshot>,
 ) -> Result<StructuredCompactionOutput> {
     let n = messages.len();
     if !conversation_long_enough_to_compact(n) {
@@ -453,6 +454,18 @@ pub fn structured_compact(
     // plumb operator-overrides via profile config.
     let mut capped = parsed;
     apply_slot_caps(&mut capped, &default_slot_caps_v0_1());
+
+    // (#439) Inject the budget snapshot into compaction_metadata so
+    // the markdown render surfaces it to the model.
+    if let Some(b) = budget {
+        capped.compaction_metadata.turns_used = Some(b.turns_used);
+        capped.compaction_metadata.max_turns = Some(b.max_turns);
+        capped.compaction_metadata.cumulative_completion_tokens_used =
+            Some(b.cumulative_completion_tokens_used);
+        capped.compaction_metadata.max_cumulative_completion_tokens =
+            Some(b.max_cumulative_completion_tokens);
+        capped.compaction_metadata.max_tokens_per_call = Some(b.max_tokens_per_call);
+    }
 
     let markdown = render_structured_output_as_markdown(&capped, middle_count);
     // Build the synthetic SYSTEM-role replacement message. Per #354
@@ -890,6 +903,37 @@ pub fn render_structured_output_as_markdown(
     md.push_str(&format!(
         "### Working memory state (compacted from {compacted_message_count} earlier turns)\n\n"
     ));
+
+    // (#439) Dispatch budget — surfaced only when the metadata
+    // carries the snapshot. Pre-#439 metadata + budget-less callers
+    // omit this block entirely (graceful). Phrasing is intentionally
+    // neutral status ("X of N used") rather than urgency-laden to
+    // avoid inducing premature wrap-up.
+    let m = &out.compaction_metadata;
+    if let (Some(used), Some(max)) = (m.turns_used, m.max_turns) {
+        let remaining = max.saturating_sub(used);
+        md.push_str("**Dispatch budget**:\n");
+        md.push_str(&format!(
+            "- Turns: {used} of {max} used ({remaining} remaining)\n"
+        ));
+        if let (Some(tu), Some(tmax)) = (
+            m.cumulative_completion_tokens_used,
+            m.max_cumulative_completion_tokens,
+        ) {
+            let trem = tmax.saturating_sub(tu);
+            md.push_str(&format!(
+                "- Cumulative completion tokens: {tu} of {tmax} used ({trem} remaining)\n"
+            ));
+        }
+        if let Some(per_call) = m.max_tokens_per_call {
+            md.push_str(&format!(
+                "- Per-call token cap: {per_call} (your per-turn emission ceiling)\n"
+            ));
+        }
+        md.push_str("\nIf the work won't fit in the remaining budget, wrap up narratively or \
+                     escalate via `BLOCKED: <one-line>. Need decision on: <specifics>.`\n\n");
+    }
+
     md.push_str(&format!("**Objective:** {}\n\n", out.objective));
 
     if let Some(s) = &out.current_truth.active_files {
@@ -1020,6 +1064,37 @@ pub struct CompactionMetadata {
     /// data shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truncation_patched: Option<bool>,
+    /// (#439) Dispatch-budget snapshot at compaction time. Surfaced
+    /// to the model via the synthesized SYSTEM message's markdown
+    /// render so it can pace within bounds + escalate explicitly
+    /// before cap exhaustion. Skip-serialize when None so backwards-
+    /// compatible with pre-#439 compactor outputs in replay /
+    /// methodology archives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turns_used: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cumulative_completion_tokens_used: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cumulative_completion_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens_per_call: Option<u32>,
+}
+
+/// (#439) Dispatch-budget snapshot passed from the agent loop into
+/// `structured_compact` so the model sees its remaining budget on
+/// the synthesized SYSTEM compaction message. Wall-clock budget is
+/// deliberately NOT included — empirically models have poor
+/// intuition for seconds-elapsed; token + turn budgets map to units
+/// the model operates in natively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BudgetSnapshot {
+    pub turns_used: u32,
+    pub max_turns: u32,
+    pub cumulative_completion_tokens_used: u32,
+    pub max_cumulative_completion_tokens: u32,
+    pub max_tokens_per_call: u32,
 }
 
 #[cfg(test)]
@@ -1100,7 +1175,7 @@ mod tests {
         let original_len = messages.len();
         let cfg = CompactionConfig::default();
 
-        let out = structured_compact(&client, &mut messages, 7, &cfg)
+        let out = structured_compact(&client, &mut messages, 7, &cfg, None)
             .expect("happy path returns parsed output");
 
         // Confirms the mock actually matched — proving the wire body
@@ -1154,7 +1229,7 @@ mod tests {
         let mut messages = dummy_messages_long_enough_to_compact();
         let cfg = CompactionConfig::default();
 
-        let result = structured_compact(&client, &mut messages, 1, &cfg);
+        let result = structured_compact(&client, &mut messages, 1, &cfg, None);
         assert!(result.is_err(), "both attempts return malformed → bail");
         // Confirm the retry happened — 2 calls to the mock, not 1.
         assert_eq!(mock.hits(), 2, "expected 1 initial + 1 retry attempt");
@@ -1176,7 +1251,7 @@ mod tests {
         let original_len = messages.len();
         let cfg = CompactionConfig::default();
 
-        let result = structured_compact(&client, &mut messages, 1, &cfg);
+        let result = structured_compact(&client, &mut messages, 1, &cfg, None);
         assert!(result.is_err());
         assert_eq!(
             messages.len(),
@@ -1208,6 +1283,11 @@ mod tests {
                 generation: 1,
                 source_message_count: 5,
             truncation_patched: None,
+            turns_used: None,
+            max_turns: None,
+            cumulative_completion_tokens_used: None,
+            max_cumulative_completion_tokens: None,
+            max_tokens_per_call: None,
             },
             completed_decisions: decisions.map(str::to_string),
             errors_to_preserve: None,
@@ -1307,6 +1387,11 @@ mod tests {
                 generation: 1,
                 source_message_count: 5,
             truncation_patched: None,
+            turns_used: None,
+            max_turns: None,
+            cumulative_completion_tokens_used: None,
+            max_cumulative_completion_tokens: None,
+            max_tokens_per_call: None,
             },
             completed_decisions: None,
             errors_to_preserve: None,
@@ -1345,6 +1430,11 @@ mod tests {
                 generation: 1,
                 source_message_count: 5,
             truncation_patched: None,
+            turns_used: None,
+            max_turns: None,
+            cumulative_completion_tokens_used: None,
+            max_cumulative_completion_tokens: None,
+            max_tokens_per_call: None,
             },
             completed_decisions: Some("decided X".into()),
             errors_to_preserve: Some("don't retry Y".into()),
@@ -1474,6 +1564,11 @@ mod tests {
                 generation: 1,
                 source_message_count: 10,
             truncation_patched: None,
+            turns_used: None,
+            max_turns: None,
+            cumulative_completion_tokens_used: None,
+            max_cumulative_completion_tokens: None,
+            max_tokens_per_call: None,
             },
             completed_decisions: None,
             errors_to_preserve: None,
@@ -1965,7 +2060,7 @@ mod tests {
             ..CompactionConfig::default()
         };
 
-        let _out = structured_compact(&client, &mut messages, 9, &cfg)
+        let _out = structured_compact(&client, &mut messages, 9, &cfg, None)
             .expect("happy path with custom_instructions returns parsed output");
 
         mock.assert_hits(1);
@@ -2114,6 +2209,11 @@ mod tests {
             generation: 1,
             source_message_count: 6,
             truncation_patched: None,
+        turns_used: None,
+        max_turns: None,
+        cumulative_completion_tokens_used: None,
+        max_cumulative_completion_tokens: None,
+        max_tokens_per_call: None,
         };
         let serialized = serde_json::to_value(&meta).unwrap();
         assert!(serialized.get("truncation_patched").is_none(),
@@ -2127,6 +2227,11 @@ mod tests {
             generation: 1,
             source_message_count: 6,
             truncation_patched: Some(true),
+        turns_used: None,
+        max_turns: None,
+        cumulative_completion_tokens_used: None,
+        max_cumulative_completion_tokens: None,
+        max_tokens_per_call: None,
         };
         let serialized = serde_json::to_value(&meta).unwrap();
         assert_eq!(serialized["truncation_patched"], true);
@@ -2168,5 +2273,133 @@ mod tests {
             .expect("post-patch fixture must deserialize");
         assert!(out.objective.contains("truncated"));
         assert_eq!(out.compaction_metadata.truncation_patched, Some(true));
+    }
+
+    // ─── #439: budget-awareness in compaction metadata ──────────────────
+
+    fn budget_snapshot_v1() -> BudgetSnapshot {
+        BudgetSnapshot {
+            turns_used: 35,
+            max_turns: 100,
+            cumulative_completion_tokens_used: 16830,
+            max_cumulative_completion_tokens: 250000,
+            max_tokens_per_call: 10000,
+        }
+    }
+
+    fn make_metadata_with_budget(b: BudgetSnapshot) -> CompactionMetadata {
+        CompactionMetadata {
+            schema_version: "0.1".to_string(),
+            generation: 1,
+            source_message_count: 6,
+            truncation_patched: None,
+            turns_used: Some(b.turns_used),
+            max_turns: Some(b.max_turns),
+            cumulative_completion_tokens_used: Some(b.cumulative_completion_tokens_used),
+            max_cumulative_completion_tokens: Some(b.max_cumulative_completion_tokens),
+            max_tokens_per_call: Some(b.max_tokens_per_call),
+        }
+    }
+
+    fn make_output_with_metadata(metadata: CompactionMetadata) -> StructuredCompactionOutput {
+        StructuredCompactionOutput {
+            objective: "test objective".to_string(),
+            current_truth: CurrentTruth::default(),
+            compaction_metadata: metadata,
+            completed_decisions: None,
+            errors_to_preserve: None,
+            next_concrete_actions: None,
+            verify_criteria: None,
+            sprint_id: None,
+        }
+    }
+
+    #[test]
+    fn markdown_render_includes_budget_section_when_metadata_carries_snapshot() {
+        let out = make_output_with_metadata(make_metadata_with_budget(budget_snapshot_v1()));
+        let md = render_structured_output_as_markdown(&out, 6);
+        assert!(md.contains("**Dispatch budget**"), "budget header present");
+        assert!(md.contains("Turns: 35 of 100 used (65 remaining)"));
+        assert!(md.contains("Cumulative completion tokens: 16830 of 250000 used (233170 remaining)"));
+        assert!(md.contains("Per-call token cap: 10000"));
+        assert!(md.contains("BLOCKED:"), "escalation hint surfaced");
+    }
+
+    #[test]
+    fn markdown_render_omits_budget_section_when_metadata_has_no_snapshot() {
+        let out = make_output_with_metadata(CompactionMetadata {
+            schema_version: "0.1".to_string(),
+            generation: 1,
+            source_message_count: 6,
+            truncation_patched: None,
+            turns_used: None,
+            max_turns: None,
+            cumulative_completion_tokens_used: None,
+            max_cumulative_completion_tokens: None,
+            max_tokens_per_call: None,
+        });
+        let md = render_structured_output_as_markdown(&out, 6);
+        assert!(!md.contains("**Dispatch budget**"), "no budget header when metadata is None");
+        assert!(md.contains("**Objective:** test objective"), "objective still renders");
+    }
+
+    #[test]
+    fn budget_metadata_serializes_fields_when_present() {
+        let meta = make_metadata_with_budget(budget_snapshot_v1());
+        let s = serde_json::to_value(&meta).unwrap();
+        assert_eq!(s["turns_used"], 35);
+        assert_eq!(s["max_turns"], 100);
+        assert_eq!(s["cumulative_completion_tokens_used"], 16830);
+        assert_eq!(s["max_cumulative_completion_tokens"], 250000);
+        assert_eq!(s["max_tokens_per_call"], 10000);
+    }
+
+    #[test]
+    fn budget_metadata_omits_fields_when_none() {
+        let meta = CompactionMetadata {
+            schema_version: "0.1".to_string(),
+            generation: 1,
+            source_message_count: 6,
+            truncation_patched: None,
+            turns_used: None,
+            max_turns: None,
+            cumulative_completion_tokens_used: None,
+            max_cumulative_completion_tokens: None,
+            max_tokens_per_call: None,
+        };
+        let s = serde_json::to_value(&meta).unwrap();
+        for field in [
+            "turns_used",
+            "max_turns",
+            "cumulative_completion_tokens_used",
+            "max_cumulative_completion_tokens",
+            "max_tokens_per_call",
+        ] {
+            assert!(s.get(field).is_none(), "field `{field}` must not serialize when None");
+        }
+    }
+
+    #[test]
+    fn budget_metadata_remains_parseable_from_pre_439_json() {
+        let json = r#"{"schema_version": "0.1", "generation": 1, "source_message_count": 6}"#;
+        let parsed: CompactionMetadata = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.turns_used, None);
+        assert_eq!(parsed.max_turns, None);
+        assert_eq!(parsed.cumulative_completion_tokens_used, None);
+    }
+
+    #[test]
+    fn render_uses_saturating_sub_for_remaining_calculations() {
+        let over_budget = BudgetSnapshot {
+            turns_used: 150,
+            max_turns: 100,
+            cumulative_completion_tokens_used: 300000,
+            max_cumulative_completion_tokens: 250000,
+            max_tokens_per_call: 10000,
+        };
+        let out = make_output_with_metadata(make_metadata_with_budget(over_budget));
+        let md = render_structured_output_as_markdown(&out, 6);
+        assert!(md.contains("(0 remaining)"), "saturating sub on turns");
+        assert!(md.contains("Cumulative completion tokens: 300000 of 250000 used (0 remaining)"));
     }
 }
