@@ -1,0 +1,20 @@
+The issue is that my old_string has a trailing newline after `})` but the actual file content doesn't match exactly. Let me try with exact whitespace matching. The lines are:
+- `    })` (line 195)
+- `` (empty line 196)
+- `    it("rejects empty string", () => {` (line 197)
+- `      expect(() => hashToken("")).toThrow()` (line 198)
+- `    })` (line 199)
+- `  })` (line 200)
+
+So I need to match exactly:
+```
+    it("rejects empty string", () => {
+      expect(() => hashToken("")).toThrow()
+    })
+  })
+```
+
+Let me try with exact matching including the closing `})` of describe block.
+</parameter>
+</function>
+</tool_call>

@@ -979,4 +979,34 @@ mod tests {
         // Reasoning channel preserved when promotion came from content.
         assert!(m.reasoning_content.is_some());
     }
+
+    // ─── Real-world fixture replays (#437 / E13) ─────────────────────────
+
+    /// (Fixture: Beat 48 run-5 — production trace)
+    ///
+    /// New micro-pattern observed in N=5 validation: the model emitted
+    /// only XML CLOSING tags (`</parameter></function></tool_call>`)
+    /// inside `reasoning_content` without the OPENING `<tool_call>`.
+    /// Model "intended" a tool call but never formulated the open
+    /// half. `finish_reason=stop`, dispatch terminated.
+    ///
+    /// The promoter must correctly NOT match this — there's no
+    /// extractable structure (orphan-close ≠ tool-call). Regression
+    /// guard against a future parser change that would over-match on
+    /// closing tags alone.
+    #[test]
+    fn fixture_beat48_run5_orphan_xml_close_tags_not_promoted() {
+        let raw = include_str!(
+            "../tests/fixtures/promoter-emissions/beat48-run5-orphan-xml-close-tags.txt"
+        );
+        let allowed: HashSet<String> = ["read", "edit", "write", "bash", "search"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let result = parse_plain_text_tool_call_blocks(raw, &allowed, DEFAULT_MAX_PAYLOAD_BYTES);
+        assert!(
+            result.is_none(),
+            "orphan XML closing tags (no opening <tool_call>) must not produce a match"
+        );
+    }
 }

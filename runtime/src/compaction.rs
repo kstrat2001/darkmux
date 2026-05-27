@@ -2131,4 +2131,42 @@ mod tests {
         let serialized = serde_json::to_value(&meta).unwrap();
         assert_eq!(serialized["truncation_patched"], true);
     }
+
+    // ─── Real-world fixture replays (#437 / E13) ─────────────────────────
+
+    /// (Fixture: Beat 48 — post-#435 pre-#436 production trace)
+    ///
+    /// The empirical case that motivated #436: lexical repair succeeded
+    /// (the JSON parses as a Value) but schema validation failed with
+    /// `missing field 'objective'` because the 4B compactor truncated
+    /// mid-`active_files` before emitting the required `objective`
+    /// slot.
+    ///
+    /// Post-#436: `patch_missing_required_fields` must insert the
+    /// sentinel `objective` + flag `truncation_patched: true`, then
+    /// `from_value::<StructuredCompactionOutput>` must succeed.
+    /// Regression guard against a future change dropping the
+    /// missing-field patcher.
+    #[test]
+    fn fixture_beat48_truncated_missing_objective_patches_and_deserializes() {
+        let raw = include_str!(
+            "../tests/fixtures/compactor-malformed/beat48-truncated-missing-objective.json"
+        );
+        // Layer 1: lexical repair (succeeds — JSON is balanceable).
+        let (value, _repaired) =
+            crate::json_repair::parse_with_repair::<serde_json::Value>(raw)
+                .expect("fixture must parse-with-repair into a Value");
+        // Raw value lacks `objective` — direct deserialize FAILS.
+        assert!(
+            serde_json::from_value::<StructuredCompactionOutput>(value.clone()).is_err(),
+            "fixture must reproduce the schema-deficient failure pre-patch"
+        );
+        // Layer 2: schema patch (inserts sentinel objective + flag).
+        let (patched, was_patched) = patch_missing_required_fields(value);
+        assert!(was_patched, "fixture must trip the patcher");
+        let out: StructuredCompactionOutput = serde_json::from_value(patched)
+            .expect("post-patch fixture must deserialize");
+        assert!(out.objective.contains("truncated"));
+        assert_eq!(out.compaction_metadata.truncation_patched, Some(true));
+    }
 }
