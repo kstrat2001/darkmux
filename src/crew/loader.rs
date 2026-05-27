@@ -573,6 +573,7 @@ mod tests {
             id: "coding".into(),
             description: "Writes code".into(),
             keywords: vec![KeywordWeight { keyword: "implement".into(), weight: 1.0 }],
+            capabilities: Default::default(),
         };
         let json = serde_json::to_string(&cap).unwrap();
         let back: Skill = serde_json::from_str(&json).unwrap();

@@ -9,19 +9,78 @@
 #![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
-/// A named skill with keyword-based relevance scoring. A role declares
-/// which skills it has; the allocator matches mission keywords against
-/// role skills to route work. Renamed from `Capability` to free the
-/// word for the industry-conventional model-capability meaning that
-/// refactor 1 introduces (E14).
+/// AI-industry-conventional model capabilities — orthogonal optimization
+/// dimensions that map directly to how Anthropic, OpenAI, HuggingFace,
+/// Google, Cohere, Mistral, and Meta describe their models.
+///
+/// Each variant represents a *kind* of work optimization. Models score
+/// independently across variants (a model can be code-strong but
+/// reasoning-weak, or vision-only); roles declare which variants they
+/// need (via the skills they declare); machines bind one model per
+/// variant via the profile's `[models]` section.
+///
+/// Phase 1 ships the four variants existing roles actually need; future
+/// variants (`Vision`, `Math`, `LongContext`, future `MultimodalAudio`,
+/// future `AgenticCodeUse` split from `Code`) land as the industry's
+/// vocabulary evolves. Pre-1.0 schema growth is fine; removing a
+/// variant is breaking, so seed conservatively.
+///
+/// Serialized form: `snake_case` (e.g., `"code"`, `"agentic_tool_use"`).
+/// Parse-time validation: unknown variant names fail to deserialize
+/// with a clear error — no silent typo-induced zero-weight bugs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Capability {
+    /// Code generation + understanding. Benchmarks: HumanEval, MBPP,
+    /// BigCodeBench. Phase-1 variant — most worker roles need this.
+    Code,
+    /// Multi-step reasoning + judgment. Benchmarks: MMLU, GPQA,
+    /// ARC-Challenge, MMLU-Pro. Phase-1 variant — analyst,
+    /// design-reviewer, mission-compiler, etc.
+    Reasoning,
+    /// Adherence to structured prompts. Benchmarks: IFEval, ChatRAG.
+    /// Phase-1 variant — scribe, voice-editor, structured-output
+    /// generation in general.
+    InstructionFollowing,
+    /// Tool-call quality + agent loops. Benchmarks: SWE-Bench,
+    /// AgentBench, Berkeley Function Calling Leaderboard. Phase-1
+    /// variant — any role driving multi-turn tool dispatches.
+    AgenticToolUse,
+}
+
+/// A weighted capability profile. Maps each capability dimension to a
+/// non-negative weight. **Sparse-as-zero semantics**: an absent
+/// capability key means weight=0 for that dimension. **Relative
+/// weights**: magnitudes are advisory; ratios drive scoring. Operators
+/// can author weights on any non-negative scale (0..1, 0..100,
+/// arbitrary); normalization happens at scoring time.
+pub type CapabilityProfile = HashMap<Capability, f32>;
+
+/// A named skill with keyword-based relevance scoring + an intrinsic
+/// capability profile. A role declares which skills it has; the
+/// allocator matches mission keywords against role skills to route
+/// work (the keyword routing); the dispatch's model selection composes
+/// per-skill capability profiles via union-via-max into a per-role
+/// capability vector (the capability routing). Renamed from
+/// `Capability` to free the word for the industry-conventional
+/// model-capability meaning (E14).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Skill {
     pub id: String,
     pub description: String,
     #[serde(default)]
     pub keywords: Vec<KeywordWeight>,
+    /// Intrinsic capability profile — which AI capabilities this skill
+    /// inherently demands at what relative weights. Phase-1 schema
+    /// addition (E14). Absent in older manifests; defaults to empty
+    /// map (sparse-as-zero — the skill demands nothing). Phase-1
+    /// dispatch routing falls back to `default` regardless, so absence
+    /// is harmless until phase 2 activates scoring.
+    #[serde(default)]
+    pub capabilities: CapabilityProfile,
 }
 
 /// A keyword paired with a relevance weight (0.0–1.0).
@@ -113,6 +172,43 @@ impl Role {
     /// needs preamble. Explicit `"admin"` opts out.
     pub fn is_specialist(&self) -> bool {
         !matches!(self.role_family.as_deref(), Some("admin"))
+    }
+
+    /// (#450, E14) Derive this role's effective capability profile from
+    /// the union-via-max composition of its declared skills' profiles.
+    ///
+    /// Composition rule: for each capability dimension, take the
+    /// maximum weight from any of the role's skills. A role with
+    /// `skills: ["coding", "code-reviewing"]` ends up needing whichever
+    /// skill demands MORE on each dimension — the model has to satisfy
+    /// the strongest demand from ANY of the role's skills.
+    ///
+    /// Sparse-as-zero: a skill that doesn't declare a capability is
+    /// treated as weight=0 for that dimension. A capability that no
+    /// skill declares stays absent in the output (also weight=0 for
+    /// the role).
+    ///
+    /// `skill_lookup` returns the `Skill` for a given id, or `None` if
+    /// the id is unknown. Unknown skills are silently skipped (with
+    /// the assumption that the index-rebuild phase already validated
+    /// skill ids exist; future hardening could log a warning).
+    pub fn capabilities<'a, F>(&self, skill_lookup: F) -> CapabilityProfile
+    where
+        F: Fn(&str) -> Option<&'a Skill>,
+    {
+        let mut profile: CapabilityProfile = HashMap::new();
+        for skill_id in &self.skills {
+            let Some(skill) = skill_lookup(skill_id) else {
+                continue;
+            };
+            for (cap, weight) in &skill.capabilities {
+                let entry = profile.entry(*cap).or_insert(0.0);
+                if *weight > *entry {
+                    *entry = *weight;
+                }
+            }
+        }
+        profile
     }
 }
 
@@ -215,4 +311,201 @@ pub struct Sprint {
     /// state machine treats `Abandoned → Running` as a legal restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub abandoned_ts: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn skill_with(id: &str, caps: &[(Capability, f32)]) -> Skill {
+        Skill {
+            id: id.into(),
+            description: format!("test skill {id}"),
+            keywords: vec![],
+            capabilities: caps.iter().copied().collect(),
+        }
+    }
+
+    fn make_role(id: &str, skill_ids: &[&str]) -> Role {
+        Role {
+            id: id.into(),
+            description: format!("test role {id}"),
+            skills: skill_ids.iter().map(|s| s.to_string()).collect(),
+            tool_palette: ToolPalette::default(),
+            escalation_contract: EscalationContract::BailWithExplanation,
+            prompt_path: None,
+            tier: None,
+            bail_after_compactions: None,
+            escalation_posture: None,
+            role_family: None,
+        }
+    }
+
+    /// (#450) Capability serde — snake_case round-trip. Verifies the
+    /// AI-industry-conventional naming convention is the wire format.
+    #[test]
+    fn capability_snake_case_round_trip() {
+        let cases = [
+            (Capability::Code, "\"code\""),
+            (Capability::Reasoning, "\"reasoning\""),
+            (Capability::InstructionFollowing, "\"instruction_following\""),
+            (Capability::AgenticToolUse, "\"agentic_tool_use\""),
+        ];
+        for (variant, expected_json) in cases {
+            let s = serde_json::to_string(&variant).unwrap();
+            assert_eq!(s, expected_json, "serialize {:?}", variant);
+            let back: Capability = serde_json::from_str(&s).unwrap();
+            assert_eq!(back, variant, "round-trip {:?}", variant);
+        }
+    }
+
+    /// (#450) Parse-time validation: unknown capability names fail to
+    /// deserialize. This is what guards against silent zero-weight
+    /// bugs from typos in operator-edited skill manifests.
+    #[test]
+    fn capability_unknown_variant_fails_to_deserialize() {
+        let bad_json = "\"coding\""; // not a Capability (it's a Skill id)
+        let result: Result<Capability, _> = serde_json::from_str(bad_json);
+        assert!(
+            result.is_err(),
+            "unknown capability name `coding` must fail to deserialize, got {:?}",
+            result
+        );
+
+        let typo = "\"reason\""; // typo of `reasoning`
+        let result: Result<Capability, _> = serde_json::from_str(typo);
+        assert!(
+            result.is_err(),
+            "typo capability name `reason` must fail to deserialize"
+        );
+    }
+
+    /// (#450) Skill capabilities field — JSON round-trip with the new
+    /// schema. Verifies sparse-as-zero by absence (the JSON doesn't
+    /// have to list every capability).
+    #[test]
+    fn skill_capabilities_field_round_trips() {
+        let json = r#"{
+            "id": "coding",
+            "description": "test",
+            "keywords": [],
+            "capabilities": { "code": 0.9, "reasoning": 0.5 }
+        }"#;
+        let s: Skill = serde_json::from_str(json).unwrap();
+        assert_eq!(s.id, "coding");
+        assert_eq!(s.capabilities.len(), 2);
+        assert_eq!(s.capabilities.get(&Capability::Code).copied(), Some(0.9));
+        assert_eq!(s.capabilities.get(&Capability::Reasoning).copied(), Some(0.5));
+        // Sparse-as-zero: absent dimensions are absent in the map.
+        assert!(!s.capabilities.contains_key(&Capability::InstructionFollowing));
+        assert!(!s.capabilities.contains_key(&Capability::AgenticToolUse));
+    }
+
+    /// (#450) Older skill manifests (refactor-0 era) without the
+    /// `capabilities` field continue to parse — the field is
+    /// `#[serde(default)]`, so absence yields empty map (no demands).
+    /// Backward-compat is required for pre-refactor-1 user-edited
+    /// skill manifests under `~/.darkmux/skills/`.
+    #[test]
+    fn skill_without_capabilities_field_parses_with_empty_profile() {
+        let legacy_json = r#"{
+            "id": "old-skill",
+            "description": "from refactor-0 era",
+            "keywords": []
+        }"#;
+        let s: Skill = serde_json::from_str(legacy_json).unwrap();
+        assert!(s.capabilities.is_empty());
+    }
+
+    /// (#450, E14) Role capability derivation — union-via-max across
+    /// the role's declared skills. The composed profile reflects the
+    /// strongest demand from ANY of the role's skills on each
+    /// dimension. This is the model-selection input.
+    #[test]
+    fn role_capabilities_union_via_max_composition() {
+        let coding = skill_with(
+            "coding",
+            &[
+                (Capability::Code, 0.9),
+                (Capability::Reasoning, 0.5),
+                (Capability::AgenticToolUse, 0.7),
+            ],
+        );
+        let reviewing = skill_with(
+            "code-reviewing",
+            &[
+                (Capability::Code, 0.7),
+                (Capability::Reasoning, 0.85),
+                (Capability::InstructionFollowing, 0.7),
+            ],
+        );
+        let skills = [coding.clone(), reviewing.clone()];
+        let lookup = |id: &str| skills.iter().find(|s| s.id == id);
+
+        let role = make_role("multi-skill", &["coding", "code-reviewing"]);
+        let profile = role.capabilities(lookup);
+
+        // max(0.9, 0.7) = 0.9 — coding demands more code than reviewing
+        assert_eq!(profile.get(&Capability::Code).copied(), Some(0.9));
+        // max(0.5, 0.85) = 0.85 — reviewing demands more reasoning
+        assert_eq!(profile.get(&Capability::Reasoning).copied(), Some(0.85));
+        // Only reviewing declares it; sparse-as-zero treats coding as 0
+        assert_eq!(profile.get(&Capability::InstructionFollowing).copied(), Some(0.7));
+        // Only coding declares it
+        assert_eq!(profile.get(&Capability::AgenticToolUse).copied(), Some(0.7));
+    }
+
+    /// (#450, E14) Sparse-as-zero semantics — a capability dimension
+    /// that NO skill declares is absent from the role's profile (not
+    /// present-with-zero). Distinguishes "unspecified" from "demanded
+    /// at zero" — same effective behavior under union-via-max but
+    /// cleaner in iteration (no zero-padding entries).
+    #[test]
+    fn role_capabilities_absent_dimensions_stay_absent() {
+        let analyzing = skill_with(
+            "analyzing",
+            &[(Capability::Reasoning, 0.9), (Capability::InstructionFollowing, 0.6)],
+        );
+        let skills = [analyzing.clone()];
+        let lookup = |id: &str| skills.iter().find(|s| s.id == id);
+
+        let role = make_role("analyst", &["analyzing"]);
+        let profile = role.capabilities(lookup);
+
+        assert_eq!(profile.len(), 2);
+        assert!(profile.contains_key(&Capability::Reasoning));
+        assert!(profile.contains_key(&Capability::InstructionFollowing));
+        // Code + AgenticToolUse aren't declared by analyzing → absent.
+        assert!(!profile.contains_key(&Capability::Code));
+        assert!(!profile.contains_key(&Capability::AgenticToolUse));
+    }
+
+    /// (#450, E14) Empty-skills role → empty profile. Edge case worth
+    /// pinning since some roles (or in-flight role manifests) may
+    /// declare zero skills.
+    #[test]
+    fn role_capabilities_empty_skills_yields_empty_profile() {
+        let role = make_role("bare", &[]);
+        let profile = role.capabilities(|_: &str| None);
+        assert!(profile.is_empty());
+    }
+
+    /// (#450, E14) Unknown skill ids are silently skipped — the
+    /// derivation doesn't fail when a role references a skill that
+    /// doesn't exist in the lookup. Index-rebuild phase is expected
+    /// to validate skill-id references; this layer is defensive only.
+    #[test]
+    fn role_capabilities_skips_unknown_skill_ids() {
+        let coding = skill_with("coding", &[(Capability::Code, 0.9)]);
+        let skills = [coding.clone()];
+        let lookup = |id: &str| skills.iter().find(|s| s.id == id);
+
+        // Role declares two skills; one doesn't exist in the lookup.
+        let role = make_role("partial", &["coding", "ghost-skill"]);
+        let profile = role.capabilities(lookup);
+
+        // Only the resolvable skill contributes.
+        assert_eq!(profile.len(), 1);
+        assert_eq!(profile.get(&Capability::Code).copied(), Some(0.9));
+    }
 }
