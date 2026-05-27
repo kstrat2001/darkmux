@@ -961,31 +961,46 @@ fn resolve_dispatch_model_internal(role: &crate::crew::types::Role) -> Result<St
     }
 }
 
-/// (#450 review note) Return the full list of currently-loaded
-/// LMStudio model ids — used to cross-check `select_model`'s pick
-/// against reality. Returns `Err` on probe failure (caller treats as
-/// "can't validate" and proceeds without the warning).
+/// (#450 review note) Return the list of currently-LOADED LMStudio
+/// model identifiers — both `modelKey` (bare, what profiles reference)
+/// and `identifier` (namespaced, what darkmux-loaded models surface as).
+///
+/// Uses `lms ps --json` because LMStudio's `/v1/models` endpoint
+/// returns the full CATALOG (including unloaded models), not the
+/// loaded set — so `/v1/models` would silently match any catalogued
+/// model and defeat the cross-check.
+///
+/// Returns `Err` on probe failure (caller treats as "can't validate"
+/// and proceeds without the warning). The function intentionally
+/// returns BOTH modelKey and identifier so a profile that names
+/// either form (`qwen3.6-35b-a3b-turboquant-mlx` OR
+/// `darkmux:qwen3.6-35b-a3b-turboquant-mlx`) can match correctly.
 fn probe_loaded_model_list() -> Result<Vec<String>> {
-    let output = Command::new("curl")
-        .args(["-sf", "-m", "5", LMSTUDIO_MODELS_URL])
+    let output = Command::new("lms")
+        .args(["ps", "--json"])
         .output()
-        .context("running curl to probe LMStudio for full model list")?;
+        .context("running `lms ps --json` to enumerate loaded models")?;
     if !output.status.success() {
         bail!(
-            "LMStudio /v1/models probe failed (curl exit {})",
+            "`lms ps --json` failed (exit {})",
             output.status.code().unwrap_or(-1)
         );
     }
     let body: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .context("parsing LMStudio /v1/models response as JSON")?;
-    Ok(body["data"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|m| m["id"].as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default())
+        .context("parsing `lms ps --json` output")?;
+    let mut ids = Vec::new();
+    if let Some(arr) = body.as_array() {
+        for entry in arr {
+            // Both forms a profile id could match against.
+            if let Some(key) = entry["modelKey"].as_str() {
+                ids.push(key.to_string());
+            }
+            if let Some(ident) = entry["identifier"].as_str() {
+                ids.push(ident.to_string());
+            }
+        }
+    }
+    Ok(ids)
 }
 
 /// return the first model id. Uses curl so we don't drag a Rust HTTP
