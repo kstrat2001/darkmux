@@ -622,6 +622,17 @@ pub fn structured_compactor_system_prompt_with_custom(
 /// Helper: make the chat call, parse the assistant content as
 /// StructuredCompactionOutput. Returns Err on HTTP failure, missing
 /// content, or JSON parse failure.
+///
+/// (#401) When the raw parse fails, attempts best-effort repair via
+/// [`crate::json_repair::parse_with_repair`] before bailing. The 4B
+/// compactor occasionally enters thinking mode and emits runaway
+/// `\n` escapes that exhaust the token budget mid-string-value —
+/// `parse_with_repair` terminates the unterminated string + balances
+/// open containers so a partial parse can land. Repair emits a
+/// stderr warning so operators see the rate; the parsed output is
+/// lossy (the model's intended content past the truncation point is
+/// gone) but produces forward progress instead of bailing the whole
+/// dispatch.
 fn call_and_parse(
     client: &LmStudioClient,
     request: &ChatRequest,
@@ -634,8 +645,21 @@ fn call_and_parse(
         .map(|c| c.message)
         .ok_or_else(|| anyhow!("compactor returned no choice"))?;
     let content = extract_compactor_content(message)?;
-    serde_json::from_str::<StructuredCompactionOutput>(&content)
-        .map_err(|e| anyhow!("parsing compactor JSON failed: {e} — content: {content}"))
+    match crate::json_repair::parse_with_repair::<StructuredCompactionOutput>(&content) {
+        Ok((parsed, repaired)) => {
+            if repaired {
+                eprintln!(
+                    "darkmux-runtime: ⚒ compactor JSON repaired — original output was truncated, \
+                     state machine balanced open string + containers to land a partial parse. \
+                     Repair is lossy (model's intended content past truncation is gone). (#401)"
+                );
+            }
+            Ok(parsed)
+        }
+        Err(e) => Err(anyhow!(
+            "parsing compactor JSON failed (even after repair): {e} — content: {content}"
+        )),
+    }
 }
 
 /// (#376) Pull the structured-output JSON string out of a chat-
