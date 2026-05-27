@@ -219,6 +219,42 @@ impl Trajectory {
     /// (the same file may legitimately be re-read after compaction
     /// evicts it from history); the warn is informational, not
     /// accusatory.
+    /// (#414 PR A) dispatch.intra_turn_stall.recovered — recovery event
+    /// when the loop caught a `finish_reason=length` response that had
+    /// no content and no tool_calls (the runaway-reasoning shape from
+    /// Beat 47 / N=5-post-#439 Run 1) and salvaged the dispatch by
+    /// dropping the useless turn, injecting a nudge system message,
+    /// and retrying. Records the per-turn completion-token count so
+    /// trajectory replay can confirm the stall was per-call-cap-shaped
+    /// (count ≈ MAX_TOKENS_PER_CALL) vs context-overflow-shaped (count
+    /// well below cap), and the recovery budget consumption so
+    /// repeated stalls in one dispatch are visible at a glance.
+    pub fn append_intra_turn_stall_recovered(
+        &mut self,
+        seq: u32,
+        completion_tokens: Option<u32>,
+        recoveries_used: u32,
+        recoveries_budget: u32,
+    ) {
+        // The event's analytic purpose is to discriminate per-call-cap
+        // stalls (completion_tokens ≈ MAX_TOKENS_PER_CALL) from
+        // context-overflow stalls (count well below cap). When the
+        // upstream response omits `usage` (rare but possible), emit
+        // the field as null so consumers see "unknown" rather than a
+        // misleading 0 that reads identical to a real small count.
+        let completion_tokens_value = completion_tokens
+            .map(serde_json::Value::from)
+            .unwrap_or(serde_json::Value::Null);
+        self.write_event(&serde_json::json!({
+            "type": "dispatch.intra_turn_stall.recovered",
+            "seq": seq,
+            "ts": unix_ms(),
+            "completion_tokens": completion_tokens_value,
+            "recoveries_used": recoveries_used,
+            "recoveries_budget": recoveries_budget,
+        }));
+    }
+
     pub fn append_cycle_suspected(
         &mut self,
         seq: u32,

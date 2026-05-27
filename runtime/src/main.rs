@@ -500,6 +500,9 @@ fn run_dispatch(args: &[String]) -> ExitCode {
             loop_runner::TerminalReason::EscalationTriggered(
                 loop_runner::EscalationReason::CumulativeTokensExceeded,
             ) => "escalation_cumulative_tokens_exceeded",
+            loop_runner::TerminalReason::EscalationTriggered(
+                loop_runner::EscalationReason::IntraTurnStallExhausted,
+            ) => "escalation_intra_turn_stall_exhausted",
         },
         None => "error",
     };
