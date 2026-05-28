@@ -28,7 +28,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -90,19 +90,35 @@ fn apply_compaction_flags(
     }
 }
 
-/// Default per-dispatch wall-clock deadline. 10 minutes covers
-/// realistic long-agentic dispatches (Article-2 era `long-agentic`
-/// historical slow_cluster_seconds maxed ~950s, so 600s is conservative
-/// for medium workloads and most operators). Override with the env
-/// var. Phase B dogfood (Beat 39) showed thinking-mode hangs can
-/// burn unbounded wall-clock without this cap.
-const DEFAULT_DISPATCH_DEADLINE_SECS: u64 = 600;
+/// Default **inactivity** timeout — kills the dispatch if no
+/// compaction signal lands within this many seconds. RESETS each
+/// time a compaction event fires in the trajectory, because a
+/// successful compaction is observable proof the dispatch isn't
+/// pathologically hung (compactor model ran, primary accepted new
+/// state, turns continued).
+///
+/// **600s** is the same value the prior absolute deadline used.
+/// Under inactivity-reset semantics it bounds the time between
+/// progress signals rather than total dispatch wall-clock —
+/// dispatches making compactions every ~5-10 min stay alive
+/// indefinitely up to the runtime's other bounds (per-call token
+/// cap, cumulative-tokens cap, MAX_TURNS).
+///
+/// Override per dispatch via `DARKMUX_INACTIVITY_TIMEOUT_SECONDS`.
+///
+/// (#457) Renamed from `DEFAULT_DISPATCH_DEADLINE_SECS` /
+/// `DARKMUX_RUNTIME_DEADLINE_SECONDS`. The prior absolute-deadline
+/// semantics killed dispatches making observable progress (Beat 53b:
+/// 88 passing tests, killed at 600s with the model still iterating).
+/// Progress-signal-based limits trust empirical evidence; absolute
+/// caps embed a guess about how long good work should take.
+const DEFAULT_INACTIVITY_TIMEOUT_SECS: u64 = 600;
 
-fn dispatch_deadline_seconds() -> u64 {
-    std::env::var("DARKMUX_RUNTIME_DEADLINE_SECONDS")
+fn inactivity_timeout_seconds() -> u64 {
+    std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_DISPATCH_DEADLINE_SECS)
+        .unwrap_or(DEFAULT_INACTIVITY_TIMEOUT_SECS)
 }
 
 /// LMStudio /v1/models URL used to probe the currently-loaded model
@@ -367,6 +383,21 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     //    main thread signals stop; the tailer does one final flush pass
     //    so straggler lines written between the last poll and exit are
     //    not lost.
+    // (#457) Inactivity deadline shared between the trajectory tailer
+    // (writes — resets on compaction events) and the watchdog (reads —
+    // fires when now > deadline). `Mutex<Instant>` is the simplest
+    // primitive for this 2-thread / low-contention case (compaction
+    // fires every few minutes; watchdog polls every 500ms).
+    //
+    // Initialized to `now + inactivity_secs`; first compaction event
+    // resets it forward. A dispatch that never compacts hits the
+    // initial deadline. A dispatch making compactions every ~5-10 min
+    // stays alive indefinitely (bounded by the other runtime caps).
+    let inactivity_secs = inactivity_timeout_seconds();
+    let inactivity_deadline = Arc::new(Mutex::new(
+        Instant::now() + Duration::from_secs(inactivity_secs),
+    ));
+
     let stop_flag = Arc::new(AtomicBool::new(false));
     let tailer_handle = {
         let stop = Arc::clone(&stop_flag);
@@ -374,40 +405,62 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         let session_id = session_id.clone();
         let role_id = opts.role_id.clone();
         let model = model.clone();
-        thread::spawn(move || run_tailer(workspace, session_id, role_id, model, stop))
+        let inactivity_deadline = Arc::clone(&inactivity_deadline);
+        thread::spawn(move || {
+            run_tailer(
+                workspace,
+                session_id,
+                role_id,
+                model,
+                stop,
+                inactivity_deadline,
+                inactivity_secs,
+            )
+        })
     };
 
-    // (#363) Wall-clock deadline watchdog. Phase B dogfood (Beat 39,
+    // (#363, then #457) Inactivity watchdog. Phase B dogfood (Beat 39,
     // 2026-05-25) surfaced: thinking-mode models can hang intra-turn
     // for arbitrary wall-clock with the agent loop's MAX_TURNS cap
-    // never firing. The watchdog runs `docker kill <name>` after the
-    // deadline; the container dies with SIGKILL (exit 137); the main
-    // thread's `wait_with_output()` returns; the harness detects the
-    // timeout via the watchdog's atomic flag + the 137 exit code and
-    // surfaces a structured `dispatch.timeout` failure rather than
-    // letting the dispatch hang forever.
-    let deadline_secs = dispatch_deadline_seconds();
+    // never firing. Beat 53b (2026-05-28) surfaced: an absolute
+    // wall-clock deadline kills dispatches making observable progress
+    // (88 passing tests written by the model, killed mid-iteration at
+    // 600s). #457 reframed: trust progress signals — the deadline
+    // resets each time a compaction event fires (compactor model
+    // ran, primary accepted new state, dispatch is alive).
+    //
+    // The watchdog runs `docker kill <name>` when the *current*
+    // inactivity deadline passes; the container dies with SIGKILL
+    // (exit 137); the main thread's `wait_with_output()` returns;
+    // the harness detects the timeout via the watchdog's atomic flag
+    // + the 137 exit code and surfaces a structured
+    // `dispatch.timeout` failure rather than letting the dispatch
+    // hang forever.
     let timeout_fired = Arc::new(AtomicBool::new(false));
     let watchdog_done = Arc::new(AtomicBool::new(false));
     let watchdog_handle = {
         let timeout_fired = Arc::clone(&timeout_fired);
         let watchdog_done = Arc::clone(&watchdog_done);
         let container_name = container_name.clone();
+        let inactivity_deadline = Arc::clone(&inactivity_deadline);
         thread::spawn(move || {
-            // Poll every 500ms so we don't oversleep the natural exit by
-            // a full deadline. When the main thread signals
+            // Poll every 500ms. Each iteration reads the CURRENT
+            // deadline (which the tailer may have just reset on a
+            // compaction event). When the main thread signals
             // `watchdog_done`, exit promptly without firing the kill.
-            let deadline = Instant::now() + Duration::from_secs(deadline_secs);
-            while Instant::now() < deadline {
+            loop {
                 if watchdog_done.load(Ordering::SeqCst) {
                     return;
+                }
+                let now = Instant::now();
+                let deadline = *inactivity_deadline.lock().unwrap();
+                if now >= deadline {
+                    break;
                 }
                 thread::sleep(Duration::from_millis(500));
             }
             // Race window: a natural exit can land in the final 500ms
-            // sleep above — the loop condition `Instant::now() < deadline`
-            // goes false, but `watchdog_done` may have been set during
-            // the sleep. Re-check before firing to avoid stamping a
+            // sleep above. Re-check before firing to avoid stamping a
             // spurious timeout on a clean exit (QA finding 2026-05-25).
             if watchdog_done.load(Ordering::SeqCst) {
                 return;
@@ -444,10 +497,12 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // diagnostic detail about why.
     if timeout_fired.load(Ordering::SeqCst) {
         stderr = format!(
-            "darkmux dispatch: TIMEOUT after {deadline_secs}s — container `{container_name}` \
-             was killed by the watchdog. Override the default deadline with \
-             DARKMUX_RUNTIME_DEADLINE_SECONDS=<N>. Thinking-mode hangs are the most common \
-             cause (see #363).\n{stderr}"
+            "darkmux dispatch: INACTIVITY TIMEOUT — no compaction signal in {inactivity_secs}s — \
+             container `{container_name}` was killed by the watchdog. The inactivity timer \
+             resets on each successful compaction (a compaction is observable proof the \
+             dispatch is alive). Genuine thinking-mode hangs and diagnostic-loop runaways \
+             trigger this; productive dispatches that compact regularly stay alive. \
+             Override the default with DARKMUX_INACTIVITY_TIMEOUT_SECONDS=<N>. (#363, #457)\n{stderr}"
         );
     }
 
@@ -530,17 +585,31 @@ const MAX_REASONING_TEXT_BYTES: usize = 256 * 1024;
 /// is set, then does one final flush pass to drain any straggler lines
 /// the container wrote between the last poll tick and exit. Returns the
 /// accumulated event-count summary; never errors (observability path).
+///
+/// (#457) `inactivity_deadline` is shared with the watchdog thread;
+/// the tailer writes a new deadline to it each time a `compaction`
+/// trajectory event lands. `inactivity_secs` is the timeout window
+/// used to compute the new deadline (`now + inactivity_secs`).
 fn run_tailer(
     workspace: PathBuf,
     session_id: String,
     role_id: String,
     model: String,
     stop_flag: Arc<AtomicBool>,
+    inactivity_deadline: Arc<Mutex<Instant>>,
+    inactivity_secs: u64,
 ) -> TrajectorySummary {
     let trajectory_path = workspace
         .join(".darkmux-runtime")
         .join("trajectory.jsonl");
-    let mut state = TailerState::new(trajectory_path, session_id, role_id, model);
+    let mut state = TailerState::new(
+        trajectory_path,
+        session_id,
+        role_id,
+        model,
+        inactivity_deadline,
+        inactivity_secs,
+    );
 
     loop {
         state.poll_and_emit();
@@ -605,10 +674,43 @@ struct TailerState {
     model: String,
     last_heartbeat_at: Option<Instant>,
     summary: TrajectorySummary,
+    /// (#457) Shared with the watchdog thread. Tailer writes a new
+    /// deadline (`now + inactivity_secs`) when a `compaction` event
+    /// fires; watchdog reads each tick to decide whether to kill the
+    /// container. `None` in test fixtures that don't exercise the
+    /// reset path.
+    inactivity_deadline: Option<Arc<Mutex<Instant>>>,
+    inactivity_secs: u64,
 }
 
 impl TailerState {
     fn new(
+        trajectory_path: PathBuf,
+        session_id: String,
+        role_id: String,
+        model: String,
+        inactivity_deadline: Arc<Mutex<Instant>>,
+        inactivity_secs: u64,
+    ) -> Self {
+        Self {
+            trajectory_path,
+            offset: 0,
+            pending: Vec::new(),
+            session_id,
+            role_id,
+            model,
+            last_heartbeat_at: None,
+            summary: TrajectorySummary::default(),
+            inactivity_deadline: Some(inactivity_deadline),
+            inactivity_secs,
+        }
+    }
+
+    /// Test-only constructor — no inactivity-deadline plumbing. Used by
+    /// the unit tests that exercise event-handling shape without
+    /// spawning a watchdog thread.
+    #[cfg(test)]
+    fn new_for_test(
         trajectory_path: PathBuf,
         session_id: String,
         role_id: String,
@@ -623,6 +725,8 @@ impl TailerState {
             model,
             last_heartbeat_at: None,
             summary: TrajectorySummary::default(),
+            inactivity_deadline: None,
+            inactivity_secs: 600,
         }
     }
 
@@ -698,6 +802,20 @@ impl TailerState {
             }
             "compaction" => {
                 self.summary.compactions += 1;
+                // (#457) Reset the inactivity deadline shared with the
+                // watchdog thread. A successful compaction is observable
+                // proof the dispatch is alive (compactor model ran,
+                // primary accepted new state, turns continued). Without
+                // this reset, productive dispatches that legitimately
+                // need many minutes between compactions get killed by
+                // the absolute-deadline shape we replaced.
+                if let Some(deadline) = &self.inactivity_deadline {
+                    let new_deadline =
+                        Instant::now() + Duration::from_secs(self.inactivity_secs);
+                    if let Ok(mut guard) = deadline.lock() {
+                        *guard = new_deadline;
+                    }
+                }
                 let payload = serde_json::json!({
                     "generation": event.get("generation"),
                     "before_messages": event.get("before_messages"),
@@ -1737,42 +1855,165 @@ mod tests {
         assert_eq!(args.context_window, Some(50_000));
     }
 
-    // ─── #363: dispatch wall-clock deadline ────────────────────────────
+    // ─── #363, #457: inactivity timeout (formerly wall-clock deadline) ─
 
     #[test]
     #[serial]
-    fn deadline_defaults_when_env_unset() {
+    fn inactivity_timeout_defaults_when_env_unset() {
         // Saved + restored — tests share process env, so be polite.
-        let prev = std::env::var("DARKMUX_RUNTIME_DEADLINE_SECONDS").ok();
-        unsafe { std::env::remove_var("DARKMUX_RUNTIME_DEADLINE_SECONDS") };
-        assert_eq!(dispatch_deadline_seconds(), DEFAULT_DISPATCH_DEADLINE_SECS);
+        let prev = std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS").ok();
+        unsafe { std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS") };
+        assert_eq!(inactivity_timeout_seconds(), DEFAULT_INACTIVITY_TIMEOUT_SECS);
         if let Some(v) = prev {
-            unsafe { std::env::set_var("DARKMUX_RUNTIME_DEADLINE_SECONDS", v) };
+            unsafe { std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", v) };
         }
     }
 
     #[test]
     #[serial]
-    fn deadline_reads_env_override() {
-        let prev = std::env::var("DARKMUX_RUNTIME_DEADLINE_SECONDS").ok();
-        unsafe { std::env::set_var("DARKMUX_RUNTIME_DEADLINE_SECONDS", "30") };
-        assert_eq!(dispatch_deadline_seconds(), 30);
-        unsafe { std::env::remove_var("DARKMUX_RUNTIME_DEADLINE_SECONDS") };
+    fn inactivity_timeout_reads_env_override() {
+        let prev = std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS").ok();
+        unsafe { std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", "30") };
+        assert_eq!(inactivity_timeout_seconds(), 30);
+        unsafe { std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS") };
         if let Some(v) = prev {
-            unsafe { std::env::set_var("DARKMUX_RUNTIME_DEADLINE_SECONDS", v) };
+            unsafe { std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", v) };
         }
     }
 
     #[test]
     #[serial]
-    fn deadline_falls_back_on_garbage_env() {
-        let prev = std::env::var("DARKMUX_RUNTIME_DEADLINE_SECONDS").ok();
-        unsafe { std::env::set_var("DARKMUX_RUNTIME_DEADLINE_SECONDS", "not-a-number") };
-        assert_eq!(dispatch_deadline_seconds(), DEFAULT_DISPATCH_DEADLINE_SECS);
-        unsafe { std::env::remove_var("DARKMUX_RUNTIME_DEADLINE_SECONDS") };
+    fn inactivity_timeout_falls_back_on_garbage_env() {
+        let prev = std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS").ok();
+        unsafe { std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", "not-a-number") };
+        assert_eq!(inactivity_timeout_seconds(), DEFAULT_INACTIVITY_TIMEOUT_SECS);
+        unsafe { std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS") };
         if let Some(v) = prev {
-            unsafe { std::env::set_var("DARKMUX_RUNTIME_DEADLINE_SECONDS", v) };
+            unsafe { std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", v) };
         }
+    }
+
+    /// (#457) Compaction-reset: when the tailer processes a `compaction`
+    /// trajectory event, it must push the shared inactivity deadline
+    /// forward by `inactivity_secs`. The watchdog thread reads this
+    /// deadline each tick; without the reset, productive dispatches
+    /// that legitimately need many minutes between compactions get
+    /// killed at the absolute initial deadline.
+    ///
+    /// This test exercises the `TailerState::poll_and_emit` path that
+    /// fires the reset; the watchdog mechanism itself (polling + kill)
+    /// is integration-tested empirically since it requires a real
+    /// docker container.
+    #[test]
+    fn tailer_compaction_event_resets_inactivity_deadline() {
+        use std::io::Write;
+
+        let tmp = TempDir::new().unwrap();
+        let traj_path = tmp.path().join("trajectory.jsonl");
+
+        // Initialize the shared deadline to a value far in the past so
+        // we can observe whether the reset moved it forward.
+        let inactivity_secs = 600u64;
+        let original_deadline =
+            Instant::now() - Duration::from_secs(3600); // 1hr in the past
+        let shared = Arc::new(Mutex::new(original_deadline));
+
+        let mut state = TailerState::new(
+            traj_path.clone(),
+            "test-session".into(),
+            "test-role".into(),
+            "test-model".into(),
+            Arc::clone(&shared),
+            inactivity_secs,
+        );
+
+        // Write a compaction event to the trajectory file.
+        let mut f = std::fs::File::create(&traj_path).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"compaction","seq":1,"generation":1,"before_messages":40,"after_messages":7,"summary_chars":1500}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        let before_reset = Instant::now();
+        state.poll_and_emit();
+        let after_reset = Instant::now();
+
+        let new_deadline = *shared.lock().unwrap();
+
+        // The new deadline must be at least `inactivity_secs` ahead of
+        // when poll_and_emit ran — confirms the reset fired. Allow a
+        // small slop (1s) so the test isn't brittle on slow CI.
+        let expected_min =
+            before_reset + Duration::from_secs(inactivity_secs) - Duration::from_millis(50);
+        let expected_max =
+            after_reset + Duration::from_secs(inactivity_secs) + Duration::from_secs(1);
+        assert!(
+            new_deadline >= expected_min,
+            "deadline must advance by ~inactivity_secs after compaction event; \
+             saw new_deadline at less than expected_min"
+        );
+        assert!(
+            new_deadline <= expected_max,
+            "deadline must not advance by more than ~inactivity_secs; \
+             saw new_deadline at more than expected_max (off by a multiplier?)"
+        );
+        // Also: the new deadline must be strictly later than the
+        // original (1hr-in-the-past) — proves the reset overwrote the
+        // stale value rather than no-oping.
+        assert!(
+            new_deadline > original_deadline,
+            "reset must overwrite the prior stale deadline"
+        );
+    }
+
+    /// (#457) Counter-test: non-compaction events (turn, tool, reasoning,
+    /// heartbeat, etc.) must NOT reset the inactivity deadline. Only
+    /// compaction is the progress signal that proves the dispatch is
+    /// alive in the meta-architectural sense; per-turn / per-tool
+    /// events are too cheap to game.
+    #[test]
+    fn tailer_non_compaction_events_do_not_reset_inactivity_deadline() {
+        use std::io::Write;
+
+        let tmp = TempDir::new().unwrap();
+        let traj_path = tmp.path().join("trajectory.jsonl");
+
+        let original_deadline = Instant::now() - Duration::from_secs(3600);
+        let shared = Arc::new(Mutex::new(original_deadline));
+
+        let mut state = TailerState::new(
+            traj_path.clone(),
+            "test-session".into(),
+            "test-role".into(),
+            "test-model".into(),
+            Arc::clone(&shared),
+            600,
+        );
+
+        // Write a turn event (not compaction).
+        let mut f = std::fs::File::create(&traj_path).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"model.completed","seq":1,"finish_reason":"stop","usage":{{"completion_tokens":100}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"tool.completed","seq":1,"tool_seq":0,"tool_name":"read","args_chars":50,"result_chars":1000}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        state.poll_and_emit();
+
+        let unchanged_deadline = *shared.lock().unwrap();
+        assert_eq!(
+            unchanged_deadline, original_deadline,
+            "non-compaction events must not reset the inactivity deadline; \
+             only compaction is the progress signal"
+        );
     }
 
     // ─── role tool_palette → runtime allowed-tools mapping ────────────
@@ -2004,7 +2245,7 @@ mod tests {
     // ─── TailerState::poll_and_emit (live tailing) ────────────────────
 
     fn fixture_state(trajectory_path: PathBuf) -> TailerState {
-        TailerState::new(
+        TailerState::new_for_test(
             trajectory_path,
             "test-session".into(),
             "test-role".into(),

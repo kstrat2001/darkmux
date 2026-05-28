@@ -52,6 +52,7 @@ Flow records (the JSONL stream under `~/.darkmux/flows/` and, when configured, t
 | `DARKMUX_REDIS_URL` | unset → Redis off | When set, flow records also XADD to the Redis stream (coordination substrate; not the audit substrate). Combined with `DARKMUX_AUDIT_DIR` produces the canonical compliant composition: `TeeSink([LocalFile, Audit, Redis])`. See [#162](https://github.com/kstrat2001/darkmux/issues/162) Phase 3. |
 | `DARKMUX_REDIS_STREAM` | `darkmux:flow` | Override the Redis stream name. |
 | `DARKMUX_REDIS_MAXLEN` | `10000` | Approximate retention cap for the Redis stream (`XADD MAXLEN ~ N`); `0` for unbounded. |
+| `DARKMUX_INACTIVITY_TIMEOUT_SECONDS` | `600` | Per-dispatch inactivity timeout — kills the container if no `compaction` trajectory event lands within this many seconds. **Resets** each time a compaction fires (compaction = observable proof the dispatch is alive). Dispatches making compactions every ~5-10 min stay alive indefinitely. Genuine thinking-mode hangs and diagnostic-loop runaways trigger this. (#457; renamed from `DARKMUX_RUNTIME_DEADLINE_SECONDS`) |
 
 The previously-documented `DARKMUX_RUNTIME_CMD` env var was removed when the openclaw shell-out path became opt-in. Per-dispatch operators now pass `--runtime-cmd <path>` alongside `--runtime openclaw` on `darkmux crew dispatch` and `darkmux lab run` to point at Aider, Cline, or any tool exposing the `<cmd> agent --message` calling convention. The internal runtime is the default and needs no external binary.
 
