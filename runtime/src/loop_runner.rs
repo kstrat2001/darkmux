@@ -261,17 +261,24 @@ pub fn run(
     // into a BTreeMap and passes here. Empty map = all defaults.
     let mut feedback_injector = FeedbackInjector::with_templates(feedback_templates);
 
-    // (#457 Step 3) Test-cadence-drift counter. Increments on edit /
-    // write tool calls; resets on bash. Fires the feedback nudge
-    // when it crosses TEST_CADENCE_DRIFT_THRESHOLD (5) — edge-
-    // triggered: counter resets to 0 after firing to avoid repeated
-    // nudges on every subsequent edit. Roles without edit/write in
-    // their tool palette never see the counter move; roles without
-    // bash never see it reset (and so will eventually fire — which
-    // is the right behavior for read-only roles that should NOT be
-    // editing in the first place).
-    const TEST_CADENCE_DRIFT_THRESHOLD: u32 = 5;
-    let mut edits_since_last_bash: u32 = 0;
+    // (#465) Test-cadence-drift detector — REDESIGNED from #457's
+    // edits-since-last-bash counter. The prior shape mis-fired on
+    // productive multi-file edit campaigns and missed genuine
+    // single-file thrash (Beat 54 N=5). New shape: track the most
+    // recently edited path + a same-file repetition counter.
+    //
+    // - Edit/write to a NEW path → reset counter to 1, remember path
+    // - Edit/write to the SAME path as last edit → increment counter
+    // - Bash → reset both (verification cleared the slate)
+    // - Counter hits THRESHOLD → fire signal, edge-trigger reset
+    //
+    // Multi-file campaign (one edit per file) never trips. Single-
+    // file thrash trips at the 3rd consecutive edit. The path is
+    // surfaced into the feedback nudge so the model knows which file
+    // it's been thrashing on.
+    const TEST_CADENCE_DRIFT_THRESHOLD: u32 = 3;
+    let mut last_edited_path: Option<String> = None;
+    let mut consecutive_same_file_edits: u32 = 0;
 
     loop {
         // Drain any feedback messages queued by signal producers in
@@ -569,30 +576,57 @@ pub fn run(
                         call.function.arguments.len(),
                         result.len(),
                     );
-                    // (#457 Step 3) Track test-cadence drift. Edits
-                    // (and writes) increment the counter; bash resets
-                    // it. The counter accumulates across turns until
-                    // a bash call lands OR the threshold is crossed.
+                    // (#465) Track test-cadence drift via same-file
+                    // repetition. See state-machine doc above the
+                    // declaration of `last_edited_path` for full
+                    // rationale. Edge-triggered: counter + path reset
+                    // after firing so the next nudge requires another
+                    // THRESHOLD consecutive same-file edits.
                     match call.function.name.as_str() {
                         "edit" | "write" => {
-                            edits_since_last_bash = edits_since_last_bash.saturating_add(1);
-                            if edits_since_last_bash >= TEST_CADENCE_DRIFT_THRESHOLD {
+                            let path =
+                                extract_edit_target_path(&call.function.arguments);
+                            match (path.as_deref(), last_edited_path.as_deref()) {
+                                (Some(p), Some(last)) if p == last => {
+                                    consecutive_same_file_edits =
+                                        consecutive_same_file_edits.saturating_add(1);
+                                }
+                                (Some(p), _) => {
+                                    last_edited_path = Some(p.to_string());
+                                    consecutive_same_file_edits = 1;
+                                }
+                                (None, _) => {
+                                    // Malformed args (or path-less write
+                                    // shape we don't recognize) — degrade
+                                    // safely; don't count toward drift.
+                                    last_edited_path = None;
+                                    consecutive_same_file_edits = 0;
+                                }
+                            }
+                            if consecutive_same_file_edits >= TEST_CADENCE_DRIFT_THRESHOLD {
+                                let path_for_signal =
+                                    last_edited_path.clone().unwrap_or_default();
                                 eprintln!(
-                                    "darkmux-runtime: ⚠ test-cadence drift — {} edits without a \
-                                     bash verification call. Queueing feedback nudge.",
-                                    edits_since_last_bash
+                                    "darkmux-runtime: ⚠ test-cadence drift — {} \
+                                     consecutive edits to `{}` without a bash \
+                                     verification call. Queueing feedback nudge.",
+                                    consecutive_same_file_edits, path_for_signal
                                 );
-                                feedback_injector
-                                    .queue_test_cadence_drift(edits_since_last_bash);
-                                // Edge-trigger: reset so the nudge
-                                // doesn't fire on every subsequent
-                                // edit. Next firing requires N more
-                                // edits without a bash.
-                                edits_since_last_bash = 0;
+                                feedback_injector.queue_test_cadence_drift(
+                                    consecutive_same_file_edits,
+                                    &path_for_signal,
+                                );
+                                // Edge-trigger reset: next firing
+                                // requires another full THRESHOLD
+                                // consecutive same-file edits.
+                                consecutive_same_file_edits = 0;
+                                last_edited_path = None;
                             }
                         }
                         "bash" => {
-                            edits_since_last_bash = 0;
+                            // Verification cleared the slate.
+                            consecutive_same_file_edits = 0;
+                            last_edited_path = None;
                         }
                         _ => {}
                     }
@@ -941,6 +975,20 @@ fn run_streaming_turn(
 /// reasons over. Future telemetry layers that need wire bytes (for
 /// API-cost calculations) should compute that separately rather than
 /// extend this function.
+/// (#465) Extract the `path` field from a tool call's JSON arguments —
+/// used by the test-cadence-drift detector to recognize "same file
+/// edited again" vs "moved to a different file" without coupling to
+/// the typed `EditArgs`/`WriteArgs` structs in the tools module.
+///
+/// Returns `None` if the JSON doesn't parse, or if `path` is missing
+/// or non-string. Callers degrade safely on `None` (don't increment
+/// the repetition counter — treat as "unknown target").
+fn extract_edit_target_path(raw_args: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(raw_args)
+        .ok()
+        .and_then(|v| v.get("path").and_then(|p| p.as_str()).map(String::from))
+}
+
 fn measure_request_context(messages: &[Message]) -> (usize, usize) {
     let mut system_chars = 0usize;
     let mut prompt_chars = 0usize;
@@ -2731,5 +2779,50 @@ mod tests {
             found_recovered,
             "trajectory must contain dispatch.intra_turn_stall.recovered event"
         );
+    }
+
+    // ─── (#465) extract_edit_target_path — same-file detector helper ──
+
+    #[test]
+    fn extract_edit_target_path_pulls_path_from_edit_args() {
+        let args = r#"{"path":"/workspace/src/lib.rs","edits":[{"old_string":"a","new_string":"b"}]}"#;
+        assert_eq!(
+            extract_edit_target_path(args).as_deref(),
+            Some("/workspace/src/lib.rs")
+        );
+    }
+
+    #[test]
+    fn extract_edit_target_path_pulls_path_from_write_args() {
+        let args = r#"{"path":"/workspace/foo.md","content":"hello"}"#;
+        assert_eq!(
+            extract_edit_target_path(args).as_deref(),
+            Some("/workspace/foo.md")
+        );
+    }
+
+    #[test]
+    fn extract_edit_target_path_returns_none_on_malformed_json() {
+        // Malformed JSON degrades safely — the state machine treats
+        // None as "unknown target" and resets the counter, which is
+        // the correct conservative behavior for a signal that should
+        // not fire on uncertain inputs.
+        assert_eq!(extract_edit_target_path("{not valid json"), None);
+    }
+
+    #[test]
+    fn extract_edit_target_path_returns_none_when_path_missing() {
+        // Path is the discriminator; a tool call without one cannot
+        // contribute to same-file repetition detection.
+        let args = r#"{"edits":[{"old_string":"a","new_string":"b"}]}"#;
+        assert_eq!(extract_edit_target_path(args), None);
+    }
+
+    #[test]
+    fn extract_edit_target_path_returns_none_when_path_is_not_string() {
+        // Defensive: model emits {"path": 123}. Don't panic; treat
+        // as malformed.
+        let args = r#"{"path":123,"content":"x"}"#;
+        assert_eq!(extract_edit_target_path(args), None);
     }
 }
