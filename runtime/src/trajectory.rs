@@ -274,6 +274,30 @@ impl Trajectory {
         }));
     }
 
+    /// dispatch.feedback.injected — fires when the runtime injects one
+    /// or more synthetic system messages into the next-turn prompt as
+    /// model-facing telemetry (cycle warnings, tool-failure cascades,
+    /// future signal kinds). Companion to the existing per-signal
+    /// trajectory events (`dispatch.cycle.suspected`,
+    /// `dispatch.tool.repeated_failure`) which record that the SIGNAL
+    /// fired; this event records that the message was DELIVERED to
+    /// the model's prompt. Step-1 scaffold of the feedback-injection
+    /// primitive — see `feedback.rs`.
+    pub fn append_feedback_injected(
+        &mut self,
+        seq: u32,
+        message_count: usize,
+        signal_kinds: &[&str],
+    ) {
+        self.write_event(&serde_json::json!({
+            "type": "dispatch.feedback.injected",
+            "seq": seq,
+            "ts": unix_ms(),
+            "message_count": message_count,
+            "signal_kinds": signal_kinds,
+        }));
+    }
+
     /// tool_call.promoted — recovery event when the runtime promoted
     /// plain-text tool-call markup back into structured tool_calls
     /// (#406). `source` is either `"content"` or `"reasoning"`
