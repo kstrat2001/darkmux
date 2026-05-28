@@ -72,6 +72,38 @@ const DEFAULT_TOOL_FAILURE_CASCADE_TEMPLATE: &str =
      wrong for the next step, switch tools. If none of those apply, \
      stop and summarize what you have so the operator can review.";
 
+/// (#457 Step 3) Default template for the post-compaction signal —
+/// fires after a successful compaction event. Placeholder `{turn}`
+/// is the current turn number when the compaction completed.
+///
+/// Compaction compresses the prior conversation into a synthetic
+/// summary; the model's working state changes shape. Re-orientation
+/// is the stall-prevention move: pick the smallest concrete next
+/// step toward the goal and do that, rather than re-reading
+/// everything to rebuild context (the Beat 45 retrace pattern).
+const DEFAULT_POST_COMPACTION_TEMPLATE: &str =
+    "[darkmux-runtime] Working memory was just compressed (compaction \
+     fired after turn {turn}). Re-orient: identify the smallest \
+     concrete next step toward the goal, and do that. Do not re-read \
+     files you already have summarized state for; the summary is \
+     load-bearing.";
+
+/// (#457 Step 3) Default template for the test-cadence-drift signal —
+/// fires when N edits have happened without an intervening `bash`
+/// tool call (which is the verification step for coder-shaped work).
+/// Placeholder `{count}` is the edit-without-verification count.
+///
+/// Beat 51/53b surfaced: a model that edits without running tests
+/// accumulates uncertainty about whether its changes are correct.
+/// The nudge is to verify before accumulating more edits — catches
+/// issues early when they're cheap to fix.
+const DEFAULT_TEST_CADENCE_DRIFT_TEMPLATE: &str =
+    "[darkmux-runtime] You've made {count} edits without running a \
+     verification command (bash). If your instructions name test or \
+     lint commands, run them now to catch issues early. Stacking more \
+     edits without verification accumulates uncertainty that's harder \
+     to debug later.";
+
 /// Per-dispatch state — queue of pending feedback messages to inject
 /// at the top of the next loop iteration.
 ///
@@ -86,6 +118,17 @@ const DEFAULT_TOOL_FAILURE_CASCADE_TEMPLATE: &str =
 /// hardcoded defaults shipped in PR #455. Empty map = all defaults.
 pub struct FeedbackInjector {
     pending: Vec<String>,
+    /// (#457 Step 3) Parallel vec to `pending` — each queued message
+    /// also pushes its signal-kind name here. Allows the trajectory
+    /// event to discriminate per-kind instead of Step 1's combined
+    /// `cycle_or_cascade` bucket. Drained alongside `pending`.
+    pending_kinds: Vec<&'static str>,
+    /// (#457 Step 3) Snapshot of the kinds from the most recent
+    /// `drain()` call. Caller reads via `last_drained_kinds()`
+    /// AFTER drain — pattern that keeps the existing
+    /// `drain() -> Vec<Message>` signature stable across the API
+    /// expansion.
+    drained_kinds: Vec<&'static str>,
     enabled: bool,
     templates: BTreeMap<String, String>,
 }
@@ -107,9 +150,19 @@ impl FeedbackInjector {
             .unwrap_or(true);
         Self {
             pending: Vec::new(),
+            pending_kinds: Vec::new(),
+            drained_kinds: Vec::new(),
             enabled,
             templates,
         }
+    }
+
+    /// (#457 Step 3) Returns the signal-kind names that were drained
+    /// by the most recent call to `drain()`. Caller reads after drain
+    /// to populate the trajectory event's `signal_kinds` field with
+    /// per-signal discrimination instead of Step 1's combined bucket.
+    pub fn last_drained_kinds(&self) -> &[&'static str] {
+        &self.drained_kinds
     }
 
     /// Resolve a template by signal-kind key — operator override
@@ -122,6 +175,8 @@ impl FeedbackInjector {
             .unwrap_or_else(|| match key {
                 "cycle_suspected" => DEFAULT_CYCLE_SUSPECTED_TEMPLATE,
                 "tool_failure_cascade" => DEFAULT_TOOL_FAILURE_CASCADE_TEMPLATE,
+                "post_compaction" => DEFAULT_POST_COMPACTION_TEMPLATE,
+                "test_cadence_drift" => DEFAULT_TEST_CADENCE_DRIFT_TEMPLATE,
                 _ => "",
             })
     }
@@ -164,6 +219,7 @@ impl FeedbackInjector {
             .replace("{count}", &count.to_string())
             .replace("{window_size}", &window_size.to_string());
         self.pending.push(message);
+        self.pending_kinds.push("cycle_suspected");
     }
 
     /// Queue a tool-failure-cascade feedback message. Called when the
@@ -189,6 +245,37 @@ impl FeedbackInjector {
             .replace("{tool_name}", tool_name)
             .replace("{count}", &consecutive_failures.to_string());
         self.pending.push(message);
+        self.pending_kinds.push("tool_failure_cascade");
+    }
+
+    /// (#457 Step 3) Queue a post-compaction nudge. Called by the
+    /// loop runner immediately after a compaction event lands —
+    /// model's working state was just compressed; the nudge orients
+    /// it toward the smallest concrete next step rather than the
+    /// Beat 45 retrace pattern (re-read everything to rebuild context).
+    pub fn queue_post_compaction(&mut self, turn: u32) {
+        if !self.enabled {
+            return;
+        }
+        let template = self.template_for("post_compaction");
+        let message = template.replace("{turn}", &turn.to_string());
+        self.pending.push(message);
+        self.pending_kinds.push("post_compaction");
+    }
+
+    /// (#457 Step 3) Queue a test-cadence-drift nudge. Called by the
+    /// loop runner when N consecutive edits have happened without an
+    /// intervening `bash` tool call (the verification step for
+    /// coder-shaped work). Edge-triggered upstream: the loop runner
+    /// fires once per threshold crossing, then resets its counter.
+    pub fn queue_test_cadence_drift(&mut self, edits_count: u32) {
+        if !self.enabled {
+            return;
+        }
+        let template = self.template_for("test_cadence_drift");
+        let message = template.replace("{count}", &edits_count.to_string());
+        self.pending.push(message);
+        self.pending_kinds.push("test_cadence_drift");
     }
 
     /// Number of pending messages waiting to be drained. Tests use
@@ -203,11 +290,19 @@ impl FeedbackInjector {
     /// `Message::system()` instances. Resets the queue. Call at the
     /// top of each loop iteration; if the queue is empty, returns an
     /// empty Vec (no message injected, no work done).
+    ///
+    /// (#457 Step 3) Also moves `pending_kinds` into `drained_kinds`
+    /// so the caller can read which signal kinds were drained via
+    /// `last_drained_kinds()`. API for the existing `drain() -> Vec<Message>`
+    /// caller surface unchanged.
     pub fn drain(&mut self) -> Vec<Message> {
         if !self.enabled {
             self.pending.clear();
+            self.pending_kinds.clear();
+            self.drained_kinds.clear();
             return Vec::new();
         }
+        self.drained_kinds = std::mem::take(&mut self.pending_kinds);
         self.pending.drain(..).map(Message::system).collect()
     }
 }

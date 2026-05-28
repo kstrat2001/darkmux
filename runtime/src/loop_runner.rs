@@ -261,6 +261,18 @@ pub fn run(
     // into a BTreeMap and passes here. Empty map = all defaults.
     let mut feedback_injector = FeedbackInjector::with_templates(feedback_templates);
 
+    // (#457 Step 3) Test-cadence-drift counter. Increments on edit /
+    // write tool calls; resets on bash. Fires the feedback nudge
+    // when it crosses TEST_CADENCE_DRIFT_THRESHOLD (5) — edge-
+    // triggered: counter resets to 0 after firing to avoid repeated
+    // nudges on every subsequent edit. Roles without edit/write in
+    // their tool palette never see the counter move; roles without
+    // bash never see it reset (and so will eventually fire — which
+    // is the right behavior for read-only roles that should NOT be
+    // editing in the first place).
+    const TEST_CADENCE_DRIFT_THRESHOLD: u32 = 5;
+    let mut edits_since_last_bash: u32 = 0;
+
     loop {
         // Drain any feedback messages queued by signal producers in
         // the prior iteration (cycle/cascade today, more signals in
@@ -279,16 +291,15 @@ pub fn run(
         let pending_feedback = feedback_injector.drain();
         if !pending_feedback.is_empty() {
             let count = pending_feedback.len();
+            // (#457 Step 3) Replace Step 1's combined "cycle_or_cascade"
+            // bucket with per-signal-kind discrimination. The injector
+            // tracks which kinds were drained on the most recent call;
+            // we read them and stamp on the trajectory event so
+            // analytics can distinguish cycle / cascade / compaction /
+            // cadence-drift firings.
+            let kinds = feedback_injector.last_drained_kinds().to_vec();
             messages.extend(pending_feedback);
-            trajectory.append_feedback_injected(
-                turns,
-                count,
-                // Step-1 scaffold ships with a single combined signal
-                // bucket — `cycle_or_cascade` covers both producers
-                // wired so far. Step 3 will discriminate per-signal
-                // when more producers (compaction, budget) wire in.
-                &["cycle_or_cascade"],
-            );
+            trajectory.append_feedback_injected(turns, count, &kinds);
         }
         // (#325, #457) max_turns is operator-opt-in. When set, hitting
         // the cap returns a structured `result: "max_turns"` terminal —
@@ -558,6 +569,33 @@ pub fn run(
                         call.function.arguments.len(),
                         result.len(),
                     );
+                    // (#457 Step 3) Track test-cadence drift. Edits
+                    // (and writes) increment the counter; bash resets
+                    // it. The counter accumulates across turns until
+                    // a bash call lands OR the threshold is crossed.
+                    match call.function.name.as_str() {
+                        "edit" | "write" => {
+                            edits_since_last_bash = edits_since_last_bash.saturating_add(1);
+                            if edits_since_last_bash >= TEST_CADENCE_DRIFT_THRESHOLD {
+                                eprintln!(
+                                    "darkmux-runtime: ⚠ test-cadence drift — {} edits without a \
+                                     bash verification call. Queueing feedback nudge.",
+                                    edits_since_last_bash
+                                );
+                                feedback_injector
+                                    .queue_test_cadence_drift(edits_since_last_bash);
+                                // Edge-trigger: reset so the nudge
+                                // doesn't fire on every subsequent
+                                // edit. Next firing requires N more
+                                // edits without a bash.
+                                edits_since_last_bash = 0;
+                            }
+                        }
+                        "bash" => {
+                            edits_since_last_bash = 0;
+                        }
+                        _ => {}
+                    }
                     // (#419) Record into the failure-rate detector
                     // AFTER dispatch so the result is available to
                     // classify. Edge-triggered: counter resets on a
@@ -676,6 +714,17 @@ pub fn run(
                         after_count,
                         summary_chars,
                     );
+
+                    // (#457 Step 3) Post-compaction feedback nudge.
+                    // The model's working state was just compressed
+                    // (compactions of 26+ messages → ~1500-char
+                    // summary); orient it toward the smallest concrete
+                    // next step rather than re-reading everything
+                    // (Beat 45's retrace pattern). Fires once per
+                    // compaction event; drains at the top of the next
+                    // loop iteration alongside any cycle/cascade
+                    // signals from this turn.
+                    feedback_injector.queue_post_compaction(turns);
 
                     // (#377) Escalation bound check. After persisting
                     // this compaction's trajectory entry, see whether
@@ -1629,15 +1678,17 @@ mod tests {
             first["message_count"].as_u64().unwrap_or(0) >= 1,
             "feedback.injected event must report message_count >= 1"
         );
-        // Step-1 bucket is `cycle_or_cascade`; this assertion locks in
-        // the contract and will fail loudly when Step 3 discriminates
-        // per-signal — at which point this test gets updated.
+        // (#457 Step 3) Per-signal discrimination replaces Step 1's
+        // combined `cycle_or_cascade` bucket. The mock fires cycles
+        // (same read call repeatedly), so the kinds should include
+        // `cycle_suspected`.
         let kinds = first["signal_kinds"]
             .as_array()
             .expect("signal_kinds is an array");
         assert!(
-            kinds.iter().any(|k| k == "cycle_or_cascade"),
-            "Step-1 trajectory event must carry the `cycle_or_cascade` signal kind"
+            kinds.iter().any(|k| k == "cycle_suspected"),
+            "feedback.injected trajectory event must carry per-signal kinds; \
+             expected `cycle_suspected` to be present, got: {kinds:?}"
         );
 
         // (2) The conversation contains the synthetic system message
