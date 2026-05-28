@@ -375,10 +375,26 @@ impl WorkloadProvider for CodingTaskProvider {
             .and_then(|n| n.to_str())
             .unwrap_or("")
             .to_string();
+        // (#488) Phase 1 — record final_hash of the per-run sandbox so
+        // post-hoc analysis can verify "what state did the model leave
+        // the sandbox in." Phase 2 will add baseline_hash (the source
+        // fixture's hash at clone time) for full provenance.
+        // Best-effort: hash failures log a warning but don't abort the
+        // dispatch — the data is observability, not correctness.
+        let final_hash = match crate::lab::sandbox_hash::hash_sandbox_dir(sandbox_dir) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                eprintln!(
+                    "darkmux: warn — final_hash for {} skipped: {e}",
+                    sandbox_dir.display()
+                );
+                None
+            }
+        };
         let manifest_json = serde_json::json!({
             // v2 added: runId, profile (now the profile NAME), profileDescription.
-            // v1 had: sessionId, profile (was the description text), workload, provider, durationMs, ok, sandbox.
-            "schemaVersion": 2,
+            // v3 (#488) added: final_hash (Phase 1). baseline_hash added in Phase 2.
+            "schemaVersion": 3,
             "runId": run_id,
             "workload": loaded.manifest.workload.id,
             "provider": self.id(),
@@ -397,6 +413,7 @@ impl WorkloadProvider for CodingTaskProvider {
             // counts with turns=0 (the very bug #359 fixes). Always-
             // absolute makes the manifest cwd-independent.
             "sandbox": sandbox_dir.canonicalize().unwrap_or_else(|_| sandbox_dir.to_path_buf()).display().to_string(),
+            "final_hash": final_hash,
         });
         fs::write(
             run_dir.join("manifest.json"),
