@@ -88,6 +88,24 @@ const DEFAULT_POST_COMPACTION_TEMPLATE: &str =
      files you already have summarized state for; the summary is \
      load-bearing.";
 
+/// (#461) Default template for the reasoning-loop signal — fires
+/// when the same normalized reasoning content appears N+ times in a
+/// sliding window of recent turns. Placeholders `{count}` and
+/// `{window_size}` substituted at injection.
+///
+/// Beat 54 Run 5 surfaced a case where the model produced heavy
+/// reasoning across multiple turns while every tool call looked
+/// unique. Zero tool-side detectors fired. The reasoning was
+/// visibly stuck to the operator; nothing surfaced it to the model.
+/// This signal is the runtime's reasoning-side equivalent of the
+/// cycle detector — same shape, applied to thinking instead of tools.
+const DEFAULT_REASONING_LOOP_TEMPLATE: &str =
+    "[darkmux-runtime] You've revisited the same line of reasoning \
+     {count} times in {window_size} turns. The prior attempts at this \
+     line did not change the situation; another pass will not either. \
+     Commit to a different approach. If no productive next step is \
+     available, stop and summarize what you have so the user can review.";
+
 /// (#466) Default template for the inactivity-approach signal —
 /// fires when the dispatch has gone `{elapsed}`s without a proof-of-
 /// work signal (compaction or tool.completed) and is approaching the
@@ -198,6 +216,7 @@ impl FeedbackInjector {
                 "post_compaction" => DEFAULT_POST_COMPACTION_TEMPLATE,
                 "test_cadence_drift" => DEFAULT_TEST_CADENCE_DRIFT_TEMPLATE,
                 "inactivity_approach" => DEFAULT_INACTIVITY_APPROACH_TEMPLATE,
+                "reasoning_loop" => DEFAULT_REASONING_LOOP_TEMPLATE,
                 _ => "",
             })
     }
@@ -282,6 +301,24 @@ impl FeedbackInjector {
         let message = template.replace("{turn}", &turn.to_string());
         self.pending.push(message);
         self.pending_kinds.push("post_compaction");
+    }
+
+    /// (#461) Queue a reasoning-loop nudge. Called by the loop runner
+    /// when the reasoning-loop detector flags that the same
+    /// normalized reasoning content has appeared `count` times in a
+    /// sliding window of `window_size` recent turns. Sibling of
+    /// `queue_cycle_suspected` — same shape applied to thinking
+    /// instead of tools.
+    pub fn queue_reasoning_loop(&mut self, count: usize, window_size: usize) {
+        if !self.enabled {
+            return;
+        }
+        let template = self.template_for("reasoning_loop");
+        let message = template
+            .replace("{count}", &count.to_string())
+            .replace("{window_size}", &window_size.to_string());
+        self.pending.push(message);
+        self.pending_kinds.push("reasoning_loop");
     }
 
     /// (#466) Queue an inactivity-approach soft warning. Called by
@@ -567,6 +604,68 @@ mod tests {
             "runtime telemetry prefix is the boundary marker that tells the model \
              this is system-internal, not user input: {content}"
         );
+    }
+
+    // ─── (#461) reasoning-loop signal ────────────────────────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn reasoning_loop_message_includes_count_and_window() {
+        std::env::remove_var("DARKMUX_FEEDBACK_INJECTION");
+        let mut f = FeedbackInjector::new();
+        f.queue_reasoning_loop(3, 10);
+        let msgs = f.drain();
+        let content = msgs[0].content.as_ref().expect("system message has content");
+        assert!(content.contains("3 times"), "must name count: {content}");
+        assert!(content.contains("10 turns"), "must name window: {content}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reasoning_loop_message_has_runtime_prefix() {
+        std::env::remove_var("DARKMUX_FEEDBACK_INJECTION");
+        let mut f = FeedbackInjector::new();
+        f.queue_reasoning_loop(3, 10);
+        let msgs = f.drain();
+        let content = msgs[0].content.as_ref().expect("system message has content");
+        assert!(content.starts_with("[darkmux-runtime]"), "{content}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reasoning_loop_drain_kinds_discriminates_signal() {
+        std::env::remove_var("DARKMUX_FEEDBACK_INJECTION");
+        let mut f = FeedbackInjector::new();
+        f.queue_reasoning_loop(3, 10);
+        let _ = f.drain();
+        assert_eq!(f.last_drained_kinds(), &["reasoning_loop"]);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reasoning_loop_is_noop_when_disabled_via_env_var() {
+        std::env::set_var("DARKMUX_FEEDBACK_INJECTION", "0");
+        let mut f = FeedbackInjector::new();
+        f.queue_reasoning_loop(3, 10);
+        assert_eq!(f.pending_count(), 0);
+        std::env::remove_var("DARKMUX_FEEDBACK_INJECTION");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reasoning_loop_per_role_override_substitutes_both_placeholders() {
+        std::env::remove_var("DARKMUX_FEEDBACK_INJECTION");
+        let mut templates = BTreeMap::new();
+        templates.insert(
+            "reasoning_loop".to_string(),
+            "[darkmux-runtime] Override: reasoning repeated {count}/{window_size}.".to_string(),
+        );
+        let mut f = FeedbackInjector::with_templates(templates);
+        f.queue_reasoning_loop(3, 10);
+        let msgs = f.drain();
+        let content = msgs[0].content.as_ref().expect("system message has content");
+        assert!(content.contains("3/10"), "{content}");
+        assert!(content.starts_with("[darkmux-runtime] Override:"), "{content}");
     }
 
     // ─── (#466) inactivity-approach soft warning ────────────────────
