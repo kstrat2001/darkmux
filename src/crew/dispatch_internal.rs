@@ -2133,6 +2133,15 @@ mod tests {
     /// Per-mole-hole detectors (cycle, cascade, drift, reasoning-loop)
     /// guard against pathological tool patterns. The deadline trusts
     /// activity; the detectors catch struggle.
+    ///
+    /// **Known gap** (#469): the `tool.completed` schema doesn't carry
+    /// a success/failure discriminator today, so failed tool calls
+    /// also reset the deadline. A model fast-failing with varying
+    /// args (e.g., bash with different broken commands interleaved
+    /// with successful reads) evades both the cycle detector and the
+    /// failure-rate detector. Tracked in #469 as a schema follow-up;
+    /// the cluster's cadence-drift v2 (#465) + reasoning-loop (#461)
+    /// detectors reduce the impact in the meantime.
     #[test]
     fn tailer_tool_completed_event_resets_inactivity_deadline() {
         use std::io::Write;
