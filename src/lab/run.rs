@@ -1,5 +1,6 @@
 //! `darkmux lab run <workload> [opts]` — execute a workload and capture output.
 
+use crate::lab::cow_clone::cow_clone_dir;
 use crate::lab::instrument::InstrumentSidecar;
 use crate::lab::paths::{self, ResolveScope};
 use crate::profiles::{get_profile, load_registry};
@@ -81,7 +82,16 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
             .unwrap_or(0);
         let run_id = format!("{}-{}-{}-{}", opts.workload_id, profile_name, stamp, i);
         let run_dir = paths.runs.join(&run_id);
-        let sandbox_dir = resolve_sandbox_dir(&opts.workload_id, &paths);
+        // (#488) Phase 1 — the workload's *source* sandbox is what
+        // gets COW-cloned per run. Phase 3 will replace this resolver
+        // with a fixture-registry lookup.
+        let source_sandbox_dir = resolve_sandbox_dir(&opts.workload_id, &paths);
+        // (#488) Phase 1 — the per-run sandbox lives UNDER the per-run
+        // dir, isolated from every other run's edits. Each run starts
+        // either as a COW clone of the source sandbox (if it exists)
+        // OR as a fresh empty dir that the provider's setup() will
+        // populate (workloads with setupContent).
+        let per_run_sandbox_dir = run_dir.join("sandbox");
 
         if !opts.quiet {
             println!(
@@ -91,6 +101,26 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
         }
 
         fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
+
+        // (#488) Phase 1 — materialize the per-run sandbox. If the
+        // source exists, COW-clone it (cheap on APFS/btrfs/xfs;
+        // fallback to deep copy elsewhere). If not, create an empty
+        // dir for the provider's setup() to populate. This is the
+        // load-bearing isolation: subsequent runs get fresh sandboxes
+        // and never observe prior runs' edits.
+        if source_sandbox_dir.exists() {
+            cow_clone_dir(&source_sandbox_dir, &per_run_sandbox_dir).with_context(|| {
+                format!(
+                    "cow-cloning source sandbox {} → {}",
+                    source_sandbox_dir.display(),
+                    per_run_sandbox_dir.display()
+                )
+            })?;
+        } else {
+            fs::create_dir_all(&per_run_sandbox_dir).with_context(|| {
+                format!("creating empty per-run sandbox {}", per_run_sandbox_dir.display())
+            })?;
+        }
 
         // Optional cross-layer telemetry. The sidecar runs on a background
         // thread until we explicitly stop it after the dispatch completes.
@@ -113,12 +143,15 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
         let provider_id = loaded_workload.manifest.workload.provider.clone();
         let runtime = opts.runtime;
         let runtime_cmd = opts.runtime_cmd.as_str();
+        // (#488) Phase 1 — provider operates against the per-run
+        // sandbox, not the source. Provider has no awareness of the
+        // COW step; it just gets a sandbox dir and works against it.
         let result = with_provider(&provider_id, |p| {
-            p.setup(&loaded_workload, &run_dir, &sandbox_dir)?;
+            p.setup(&loaded_workload, &run_dir, &per_run_sandbox_dir)?;
             p.run(
                 &loaded_workload,
                 &run_dir,
-                &sandbox_dir,
+                &per_run_sandbox_dir,
                 profile,
                 &profile_name,
                 runtime,
@@ -214,6 +247,109 @@ mod tests {
     fn workloads_returns_strings_without_panicking() {
         // Just verify the function doesn't panic on a fresh user dir.
         let _ = lab_workloads();
+    }
+
+    // (#488) Phase 1 — per-run COW sandbox isolation invariants. These
+    // tests exercise the lab/run.rs orchestration directly (not via
+    // provider dispatch) so they don't require a live runtime / docker /
+    // LMStudio. The provider-side `sandbox` field substitution is
+    // tested elsewhere in coding_task.rs's test module.
+
+    /// Two consecutive runs against the same workload must produce
+    /// two distinct per-run sandbox dirs, each independent of the
+    /// other. This is the load-bearing isolation that eliminates
+    /// the cross-run contamination surfaced in Beat 55.
+    ///
+    /// Test-only flow: we invoke `cow_clone_dir` + `per_run_sandbox`
+    /// construction directly, simulating what `lab_run` does without
+    /// requiring a working provider/runtime stack.
+    #[test]
+    fn per_run_sandbox_dirs_are_isolated() {
+        use crate::lab::cow_clone::cow_clone_dir;
+
+        let tmp = TempDir::new().unwrap();
+        // Simulate a source sandbox (what a workload's
+        // resolve_sandbox_dir() would return).
+        let source_sandbox = tmp.path().join("source-sandbox");
+        std::fs::create_dir_all(&source_sandbox).unwrap();
+        std::fs::write(source_sandbox.join("baseline.txt"), "baseline").unwrap();
+        std::fs::create_dir_all(source_sandbox.join("tests")).unwrap();
+        std::fs::write(source_sandbox.join("tests/a.test.js"), "test('a')").unwrap();
+
+        // Simulate two per-run dirs (what lab_run loops produce).
+        let runs_dir = tmp.path().join("runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        let run_1_dir = runs_dir.join("run-1");
+        let run_2_dir = runs_dir.join("run-2");
+        std::fs::create_dir_all(&run_1_dir).unwrap();
+        std::fs::create_dir_all(&run_2_dir).unwrap();
+
+        let run_1_sandbox = run_1_dir.join("sandbox");
+        let run_2_sandbox = run_2_dir.join("sandbox");
+
+        cow_clone_dir(&source_sandbox, &run_1_sandbox).unwrap();
+        cow_clone_dir(&source_sandbox, &run_2_sandbox).unwrap();
+
+        // Each per-run sandbox has the baseline content.
+        assert_eq!(
+            std::fs::read_to_string(run_1_sandbox.join("baseline.txt")).unwrap(),
+            "baseline"
+        );
+        assert_eq!(
+            std::fs::read_to_string(run_2_sandbox.join("baseline.txt")).unwrap(),
+            "baseline"
+        );
+
+        // Mutate run 1 — it should NOT affect run 2 OR the source.
+        std::fs::write(run_1_sandbox.join("baseline.txt"), "run-1-edit").unwrap();
+        std::fs::write(run_1_sandbox.join("tests/a.test.js"), "test('a-modified')").unwrap();
+
+        // Run 2 still has the original baseline.
+        assert_eq!(
+            std::fs::read_to_string(run_2_sandbox.join("baseline.txt")).unwrap(),
+            "baseline",
+            "run 2's sandbox got run 1's edit — isolation broken"
+        );
+        assert_eq!(
+            std::fs::read_to_string(run_2_sandbox.join("tests/a.test.js")).unwrap(),
+            "test('a')",
+            "run 2's test file got run 1's edit — isolation broken"
+        );
+
+        // Source is also untouched.
+        assert_eq!(
+            std::fs::read_to_string(source_sandbox.join("baseline.txt")).unwrap(),
+            "baseline",
+            "source sandbox got run 1's edit — COW invariant broken"
+        );
+    }
+
+    /// If the source sandbox doesn't exist (self-contained workload
+    /// that will be populated by setupContent), the per-run dir is
+    /// created empty for the provider's setup() to fill in.
+    #[test]
+    fn missing_source_sandbox_yields_empty_per_run_dir() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("does-not-exist");
+        let runs_dir = tmp.path().join("runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        let run_dir = runs_dir.join("run-1");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let per_run_sandbox = run_dir.join("sandbox");
+
+        // The orchestration in lab_run does: if source exists → COW,
+        // else create_dir_all. Mirror that here.
+        if source.exists() {
+            crate::lab::cow_clone::cow_clone_dir(&source, &per_run_sandbox).unwrap();
+        } else {
+            std::fs::create_dir_all(&per_run_sandbox).unwrap();
+        }
+
+        assert!(per_run_sandbox.exists());
+        assert!(per_run_sandbox.is_dir());
+        // Empty: ready for the provider's setupContent.
+        let entries: Vec<_> = std::fs::read_dir(&per_run_sandbox).unwrap().collect();
+        assert_eq!(entries.len(), 0, "per-run sandbox should be empty");
     }
 
     #[serial_test::serial]
