@@ -31,9 +31,9 @@ use crate::compaction;
 use crate::cycle_detector::{CycleDetector, CycleSignal};
 use crate::failure_rate::{FailureCascadeSignal, FailureRateDetector};
 use crate::feedback::FeedbackInjector;
-use crate::reasoning_loop::{ReasoningLoopDetector, ReasoningLoopSignal};
 use crate::lmstudio::{ChatRequest, ChunkAccumulator, LmStudioClient, Message};
 use crate::plain_text_tool_calls::promote_plain_text_tool_calls;
+use crate::reasoning_loop::{ReasoningLoopDetector, ReasoningLoopSignal};
 use crate::tools::{dispatch, Tool};
 use crate::trajectory::Trajectory;
 

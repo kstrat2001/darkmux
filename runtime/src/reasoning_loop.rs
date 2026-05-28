@@ -39,7 +39,14 @@
 //! - When the same hash appears K times within the window (default K=3),
 //!   emit a [`ReasoningLoopSignal::Suspected`].
 //! - Edge-triggered: the same hash continuing to recur at or above
-//!   threshold returns no further signal until a different hash lands.
+//!   threshold returns no further signal until **any** non-fired hash
+//!   lands. The suppression is intentionally permissive — a returning
+//!   stuck pattern (e.g., model briefly diverges then re-enters the
+//!   loop) can fire again on its next threshold crossing, which is
+//!   the right direction for an observability signal (false positives
+//!   are mild; false negatives miss the case the detector exists for).
+//!   See [#476] for the tighter "must move on with multiple distinct
+//!   hashes" alternative — deferred per pre-N=5 reviewer guidance.
 //! - One instance per dispatch.
 //!
 //! ## Non-cryptographic hash
@@ -351,6 +358,49 @@ mod tests {
         assert!(
             matches!(sig, Some(ReasoningLoopSignal::Suspected { count: 3, .. })),
             "fourth recording (3rd b in window) should fire: {sig:?}"
+        );
+    }
+
+    #[test]
+    fn returning_pattern_after_full_window_rotation_re_fires() {
+        // Pins current (intentionally permissive) re-arm semantics:
+        // after a fire, if a SINGLE different reasoning lands,
+        // suppression clears. A subsequent recurrence of the original
+        // pattern that crosses threshold again WILL fire.
+        //
+        // Captured behavior, not aspirational. The tighter "must see
+        // multiple distinct hashes" alternative is tracked as #476;
+        // see the docstring at the module-level for the rationale
+        // behind keeping the permissive shape pre-1.0.
+        let mut d = ReasoningLoopDetector::new();
+        let stuck = long_reasoning("stuck");
+        d.record(&stuck);
+        d.record(&stuck);
+        let first_fire = d.record(&stuck);
+        assert!(first_fire.is_some(), "first crossing fires");
+
+        // Single divergence clears suppression (permissive shape).
+        let divergent = long_reasoning("brief sidebar");
+        d.record(&divergent);
+
+        // The stuck pattern re-enters. The 3 prior X-hashes are
+        // still in the 10-slot window, so count crosses threshold on
+        // the very next record. With permissive suppression
+        // (last_fired_hash was cleared by the single divergence), this
+        // re-fires immediately — pins the behavior.
+        let refire = d.record(&stuck);
+        assert!(
+            refire.is_some(),
+            "returning stuck pattern re-fires after a single divergence; \
+             see #476 for the tighter alternative: {refire:?}"
+        );
+        // The very next record of the same stuck pattern is suppressed
+        // again until another divergence lands. Documents the
+        // once-per-fire shape on the new firing window.
+        assert_eq!(
+            d.record(&stuck),
+            None,
+            "suppression re-engages immediately after the re-fire"
         );
     }
 
