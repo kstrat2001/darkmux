@@ -559,6 +559,7 @@ mod tests {
             bail_after_compactions: None,
             escalation_posture: None,
             role_family: None,
+            feedback_templates: None,
         };
         let json = serde_json::to_string(&role).unwrap();
         let back: Role = serde_json::from_str(&json).unwrap();
@@ -1096,6 +1097,7 @@ mod load_per_mission_tests {
             bail_after_compactions: None,
             escalation_posture: None,
             role_family: None,
+            feedback_templates: None,
         };
         assert!(role.is_specialist());
     }
@@ -1113,6 +1115,7 @@ mod load_per_mission_tests {
             bail_after_compactions: None,
             escalation_posture: None,
             role_family: Some("admin".into()),
+            feedback_templates: None,
         };
         assert!(!role.is_specialist());
     }
@@ -1130,6 +1133,7 @@ mod load_per_mission_tests {
             bail_after_compactions: None,
             escalation_posture: None,
             role_family: Some("specialist".into()),
+            feedback_templates: None,
         };
         assert!(role.is_specialist());
     }

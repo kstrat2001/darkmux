@@ -188,6 +188,13 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     let mut max_turns: Option<u32> = None;
     let mut max_tokens: Option<u32> = None;
 
+    // (#457 Step 2) Per-role feedback-template overrides. Dispatcher
+    // serializes Role.feedback_templates to JSON; runtime parses into
+    // a BTreeMap<signal_kind, template_string>. Empty/absent = the
+    // FeedbackInjector uses its hardcoded defaults.
+    let mut feedback_templates: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -402,6 +409,27 @@ fn run_dispatch(args: &[String]) -> ExitCode {
                     return ExitCode::from(2);
                 }
             }
+            "--feedback-templates-json" => {
+                if let Some(v) = args.get(i + 1) {
+                    match serde_json::from_str::<std::collections::BTreeMap<String, String>>(v) {
+                        Ok(map) => {
+                            feedback_templates = map;
+                            i += 2;
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "--feedback-templates-json failed to parse: {e}. \
+                                 Expected JSON object of {{signal_kind: template_string}}. \
+                                 Ignoring; runtime will use defaults. (#457 Step 2)"
+                            );
+                            i += 2;
+                        }
+                    }
+                } else {
+                    eprintln!("--feedback-templates-json requires a JSON-string value");
+                    return ExitCode::from(2);
+                }
+            }
             other => {
                 eprintln!("unknown flag: {other}");
                 return ExitCode::from(2);
@@ -511,6 +539,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         &compaction_cfg,
         max_turns,
         max_tokens,
+        feedback_templates,
     );
 
     let outcome = match run_result {
