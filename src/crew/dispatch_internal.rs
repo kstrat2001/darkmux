@@ -90,6 +90,45 @@ fn apply_compaction_flags(
     }
 }
 
+/// (#457 Changes 2+3) Apply operator-opt-in per-dispatch caps.
+/// Reads two env vars on host side; passes them to the runtime via
+/// `--max-turns` / `--max-tokens` CLI flags. Both default unlimited;
+/// when neither env var is set, no flag is added and the runtime's
+/// `Option<u32>` parameters stay `None`.
+///
+/// Unparseable values fall back to "unset" (no flag added) with a
+/// stderr warning rather than aborting the dispatch — keeps the
+/// dispatch alive on operator-typo'd values, surfaces the issue.
+fn apply_runtime_limit_flags(cmd: &mut Command) {
+    if let Ok(raw) = std::env::var("DARKMUX_RUNTIME_MAX_TURNS") {
+        match raw.parse::<u32>() {
+            Ok(n) => {
+                cmd.arg("--max-turns").arg(n.to_string());
+            }
+            Err(_) => {
+                eprintln!(
+                    "darkmux crew dispatch: DARKMUX_RUNTIME_MAX_TURNS=`{raw}` is not a \
+                     positive integer; ignoring (runtime defaults to unlimited turns). (#457)"
+                );
+            }
+        }
+    }
+    if let Ok(raw) = std::env::var("DARKMUX_RUNTIME_MAX_TOKENS") {
+        match raw.parse::<u32>() {
+            Ok(n) => {
+                cmd.arg("--max-tokens").arg(n.to_string());
+            }
+            Err(_) => {
+                eprintln!(
+                    "darkmux crew dispatch: DARKMUX_RUNTIME_MAX_TOKENS=`{raw}` is not a \
+                     positive integer; ignoring (runtime defaults to unlimited cumulative \
+                     completion tokens). (#457)"
+                );
+            }
+        }
+    }
+}
+
 /// Default **inactivity** timeout — kills the dispatch if no
 /// compaction signal lands within this many seconds. RESETS each
 /// time a compaction event fires in the trajectory, because a
@@ -364,6 +403,14 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     let mut compaction = opts.compaction.clone();
     compaction.apply_role_override(role);
     apply_compaction_flags(&mut cmd, &compaction);
+
+    // (#457 Changes 2+3) Operator-opt-in per-dispatch caps on turn
+    // count + cumulative completion tokens. Read from env vars on
+    // host side; pass via --max-turns / --max-tokens CLI flags to
+    // the runtime container. Both default unlimited (omitted flag
+    // → runtime's `Option<u32>` stays None → no cap applied).
+    apply_runtime_limit_flags(&mut cmd);
+
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let child = cmd.spawn().context("spawning darkmux-runtime container")?;

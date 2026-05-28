@@ -459,11 +459,15 @@ pub fn structured_compact(
     // the markdown render surfaces it to the model.
     if let Some(b) = budget {
         capped.compaction_metadata.turns_used = Some(b.turns_used);
-        capped.compaction_metadata.max_turns = Some(b.max_turns);
+        // (#457) max_turns and max_cumulative_completion_tokens are
+        // now `Option<u32>` on the BudgetSnapshot — pass through
+        // directly so the renderer's `if let (Some, Some)` check
+        // correctly skips lines when the operator hasn't set a cap.
+        capped.compaction_metadata.max_turns = b.max_turns;
         capped.compaction_metadata.cumulative_completion_tokens_used =
             Some(b.cumulative_completion_tokens_used);
         capped.compaction_metadata.max_cumulative_completion_tokens =
-            Some(b.max_cumulative_completion_tokens);
+            b.max_cumulative_completion_tokens;
         capped.compaction_metadata.max_tokens_per_call = Some(b.max_tokens_per_call);
     }
 
@@ -1102,9 +1106,14 @@ pub struct CompactionMetadata {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BudgetSnapshot {
     pub turns_used: u32,
-    pub max_turns: u32,
+    /// Operator-set turn cap; `None` = unlimited (no MAX_TURNS bound
+    /// applied). Renderer skips the "turns used / max" line when
+    /// `None` rather than displaying a misleading "0 / 0". (#457)
+    pub max_turns: Option<u32>,
     pub cumulative_completion_tokens_used: u32,
-    pub max_cumulative_completion_tokens: u32,
+    /// Operator-set cumulative-tokens cap; `None` = unlimited.
+    /// Renderer skips the corresponding line when `None`. (#457)
+    pub max_cumulative_completion_tokens: Option<u32>,
     pub max_tokens_per_call: u32,
 }
 
@@ -2291,9 +2300,9 @@ mod tests {
     fn budget_snapshot_v1() -> BudgetSnapshot {
         BudgetSnapshot {
             turns_used: 35,
-            max_turns: 100,
+            max_turns: Some(100),
             cumulative_completion_tokens_used: 16830,
-            max_cumulative_completion_tokens: 250000,
+            max_cumulative_completion_tokens: Some(250000),
             max_tokens_per_call: 10000,
         }
     }
@@ -2305,9 +2314,9 @@ mod tests {
             source_message_count: 6,
             truncation_patched: None,
             turns_used: Some(b.turns_used),
-            max_turns: Some(b.max_turns),
+            max_turns: b.max_turns,
             cumulative_completion_tokens_used: Some(b.cumulative_completion_tokens_used),
-            max_cumulative_completion_tokens: Some(b.max_cumulative_completion_tokens),
+            max_cumulative_completion_tokens: b.max_cumulative_completion_tokens,
             max_tokens_per_call: Some(b.max_tokens_per_call),
         }
     }
@@ -2425,9 +2434,9 @@ mod tests {
     fn render_uses_saturating_sub_for_remaining_calculations() {
         let over_budget = BudgetSnapshot {
             turns_used: 150,
-            max_turns: 100,
+            max_turns: Some(100),
             cumulative_completion_tokens_used: 300000,
-            max_cumulative_completion_tokens: 250000,
+            max_cumulative_completion_tokens: Some(250000),
             max_tokens_per_call: 10000,
         };
         let out = make_output_with_metadata(make_metadata_with_budget(over_budget));
