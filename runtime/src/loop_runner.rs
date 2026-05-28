@@ -36,13 +36,17 @@ use crate::plain_text_tool_calls::promote_plain_text_tool_calls;
 use crate::tools::{dispatch, Tool};
 use crate::trajectory::Trajectory;
 
-/// Hard cap on tool-call turns inside a single dispatch. If the model
-/// hits this without returning `stop`, the loop aborts with a loud
-/// error — better than spinning forever. 100 was picked after the
-/// Phase 6d e2e found 16 was too tight for long-agentic-shape work
-/// (real coding workloads with ~3 files of test edits need 30-50+
-/// granular tool calls with the current tool palette).
-const MAX_TURNS: u32 = 100;
+// (#457) Cap on tool-call turns inside a single dispatch — REMOVED
+// as a hardcoded constant. Now passed as `Option<u32>` to `run()` via
+// the `--max-turns` runtime CLI flag; host derives the value from the
+// `DARKMUX_RUNTIME_MAX_TURNS` env var. Default `None` = unlimited.
+//
+// Pre-#457 this was a const `100`. Beat 47 run 5 hit it mid-coding
+// with 100 turns and an active edit loop; #416 named the fix as
+// "operator-tunable per profile, no default ceiling." The inactivity
+// timeout (#458) now catches the genuine-stuck case; a productive
+// dispatch making real progress turn-by-turn shouldn't be killed by
+// an arbitrary turn count.
 
 /// Per-call cap on completion tokens. LMStudio counts BOTH content
 /// tokens AND reasoning_content tokens against this cap (verified
@@ -69,34 +73,18 @@ const MAX_TURNS: u32 = 100;
 /// slightly more headroom for thoughtful turns. (#415)
 const MAX_TOKENS_PER_CALL: u32 = 10000;
 
-/// (#423) Per-dispatch cap on cumulative `usage.completion_tokens`
-/// summed across all turns. The third token-bound in the defense-in-
-/// depth stack (per-call cap is [`MAX_TOKENS_PER_CALL`]; turn count
-/// is [`MAX_TURNS`]; wall-clock deadline is #363's 1500s).
-///
-/// **Why a third bound** — a dispatch can stay under per-call cap
-/// (10000) AND under MAX_TURNS (100) and still burn ~1M tokens
-/// (100 turns × ~10000 tokens). Per-call caps prevent unbounded
-/// single-turn emission; turn count prevents unbounded iteration;
-/// this bound catches the "death by a thousand cuts" pattern where
-/// each turn is individually reasonable but the cumulative cost
-/// accumulates without convergence.
-///
-/// **Value: 250000**
-/// - Empirical healthy avg: ~520 tokens/turn (Beat 47 baseline) ×
-///   100 turns = ~52K total. 250000 is ~5× that — comfortable
-///   ceiling for substantive work that happens to be verbose.
-/// - 25× the per-call cap. A dispatch reaching this number is
-///   averaging 2500 tokens/turn across 100 turns, OR has had several
-///   max-cap turns. Either pattern is worth surfacing.
-/// - Roughly the cost of a long-form essay generation worth of
-///   completion tokens — defensible as "the operator should look at
-///   this dispatch before it generates more."
-///
-/// Absolute (not ratio of n_ctx) for the same reason as
-/// [`MAX_TOKENS_PER_CALL`]: this is a failure-boundary, not a
-/// context-budget allocation. Bigger context doesn't earn more rope.
-const MAX_CUMULATIVE_COMPLETION_TOKENS: u32 = 250_000;
+// (#457) Per-dispatch cumulative-completion-tokens cap — REMOVED as
+// a hardcoded constant. Now passed as `Option<u32>` to `run()` via
+// the `--max-tokens` runtime CLI flag; host derives the value from
+// the `DARKMUX_RUNTIME_MAX_TOKENS` env var. Default `None` =
+// unlimited.
+//
+// Pre-#457 this was a const `250_000`. Same reframe as `MAX_TURNS`:
+// absolute caps embed a guess about how long good work should take,
+// which doesn't generalize across the workload distribution operators
+// will encounter. The inactivity timeout (#458) catches the
+// genuine-stuck case; the operator can layer their own ceiling here
+// for cost-conscious cloud-billed or supervised-only dispatches.
 
 /// (#414 PR A) Per-dispatch budget for intra-turn stall recoveries.
 /// Each recovery costs one extra chat() call + a small nudge message;
@@ -218,6 +206,7 @@ pub struct LoopOutcome {
 /// final response is identical either way; the rest of the loop
 /// (tool dispatch, compaction triggering, finish_reason handling)
 /// doesn't change.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     client: &LmStudioClient,
     model: &str,
@@ -226,6 +215,8 @@ pub fn run(
     trajectory: &mut Trajectory,
     streaming: bool,
     compaction_cfg: &compaction::CompactionConfig,
+    max_turns: Option<u32>,
+    max_cumulative_tokens: Option<u32>,
 ) -> Result<LoopOutcome> {
     let mut messages = initial_messages;
     let tool_defs: Vec<_> = tools.iter().map(|t| t.to_tool_def()).collect();
@@ -295,47 +286,54 @@ pub fn run(
                 &["cycle_or_cascade"],
             );
         }
-        if turns >= MAX_TURNS {
-            // #325: structured terminal reason instead of an opaque
-            // Err. The JSON envelope's `result` field can now be
-            // "max_turns" (the runtime tried; the model didn't stop)
-            // rather than "error" (indistinguishable from Docker /
-            // LMStudio failures). Reply is whatever the last
-            // assistant message produced — likely partial.
-            eprintln!(
-                "darkmux-runtime: loop hit MAX_TURNS={MAX_TURNS} without reaching stop; \
-                 returning partial outcome"
-            );
-            return Ok(LoopOutcome {
-                terminal_reason: TerminalReason::MaxTurns,
-                messages,
-                turns,
-                total_prompt_tokens,
-                total_completion_tokens,
-                compactions,
-            });
+        // (#325, #457) max_turns is operator-opt-in. When set, hitting
+        // the cap returns a structured `result: "max_turns"` terminal —
+        // distinguishable from Docker / LMStudio failures (which would
+        // surface as `result: "error"`). When unset (`None`), the loop
+        // runs unbounded turn-count-wise; other bounds (inactivity
+        // timeout, per-call token cap, cumulative-tokens cap) still
+        // apply if set.
+        if let Some(cap) = max_turns {
+            if turns >= cap {
+                eprintln!(
+                    "darkmux-runtime: loop hit max_turns={cap} without reaching stop; \
+                     returning partial outcome"
+                );
+                return Ok(LoopOutcome {
+                    terminal_reason: TerminalReason::MaxTurns,
+                    messages,
+                    turns,
+                    total_prompt_tokens,
+                    total_completion_tokens,
+                    compactions,
+                });
+            }
         }
-        // (#423) Cumulative completion-tokens cap. Catches the
-        // "death by a thousand cuts" pattern where each turn is
-        // individually reasonable but cumulative cost accumulates
-        // without convergence. Checked at the TOP of the loop so the
-        // bound applies before the next chat call goes out.
-        if total_completion_tokens >= MAX_CUMULATIVE_COMPLETION_TOKENS {
-            eprintln!(
-                "darkmux-runtime: cumulative completion_tokens={total_completion_tokens} \
-                 reached cap MAX_CUMULATIVE_COMPLETION_TOKENS={MAX_CUMULATIVE_COMPLETION_TOKENS}; \
-                 escalating out of local tier with partial outcome (#423)"
-            );
-            return Ok(LoopOutcome {
-                terminal_reason: TerminalReason::EscalationTriggered(
-                    EscalationReason::CumulativeTokensExceeded,
-                ),
-                messages,
-                turns,
-                total_prompt_tokens,
-                total_completion_tokens,
-                compactions,
-            });
+        // (#423, #457) Cumulative completion-tokens cap is operator-
+        // opt-in. When set, hitting it triggers an
+        // `EscalationTriggered(CumulativeTokensExceeded)` terminal so
+        // the operator's intervention layer can investigate without
+        // unbounded cost. When unset (`None`), no cap applies —
+        // operators running on their own hardware can let long-arc
+        // work continue.
+        if let Some(cap) = max_cumulative_tokens {
+            if total_completion_tokens >= cap {
+                eprintln!(
+                    "darkmux-runtime: cumulative completion_tokens={total_completion_tokens} \
+                     reached cap max_tokens={cap}; escalating out of local tier with \
+                     partial outcome (#423, #457)"
+                );
+                return Ok(LoopOutcome {
+                    terminal_reason: TerminalReason::EscalationTriggered(
+                        EscalationReason::CumulativeTokensExceeded,
+                    ),
+                    messages,
+                    turns,
+                    total_prompt_tokens,
+                    total_completion_tokens,
+                    compactions,
+                });
+            }
         }
 
         let request = ChatRequest {
@@ -631,10 +629,12 @@ pub fn run(
                             // cap exhaustion.
                             let budget = compaction::BudgetSnapshot {
                                 turns_used: turns,
-                                max_turns: MAX_TURNS,
+                                // (#457) Pass-through of the operator-
+                                // set caps (None = unlimited; renderer
+                                // skips the corresponding budget line).
+                                max_turns,
                                 cumulative_completion_tokens_used: total_completion_tokens,
-                                max_cumulative_completion_tokens:
-                                    MAX_CUMULATIVE_COMPLETION_TOKENS,
+                                max_cumulative_completion_tokens: max_cumulative_tokens,
                                 max_tokens_per_call: MAX_TOKENS_PER_CALL,
                             };
                             let parsed = compaction::structured_compact(
@@ -1300,7 +1300,13 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::default();
-        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg)
+        // (#457) Test specifically exercises the cumulative-tokens cap.
+        // After the cap became operator-opt-in (default None = unlimited),
+        // we have to pass an explicit Some() here or the loop runs
+        // unbounded against a mock that returns infinite identical
+        // length-finish responses. 250000 matches the prior hardcoded
+        // default value the test was originally written against.
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), Some(250_000))
             .expect("cumulative-budget escalation returns Ok(outcome)");
 
         assert_eq!(
@@ -1349,7 +1355,10 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::default();
-        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg)
+        // (#457) Counter-test to the cap-fire path. Set Some(250_000)
+        // for parity with the cap-fire test; the mock returns a stop
+        // turn quickly so we never approach it.
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), Some(250_000))
             .expect("healthy stop should not bail");
 
         assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
@@ -1393,7 +1402,9 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::default();
-        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg)
+        // (#457) Test exercises the MaxTurns terminal — needs Some(N)
+        // for the cap to fire. 100 matches the prior hardcoded default.
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None)
             .expect("MAX_TURNS path returns Ok(outcome), not Err");
 
         assert_eq!(
@@ -1449,7 +1460,9 @@ mod tests {
         let tools = [Tool::Bash];
 
         let cfg = compaction::CompactionConfig::default();
-        let _outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg)
+        // (#457) Test relies on MaxTurns to terminate the loop — needs
+        // Some(100) explicitly now that the cap is operator-opt-in.
+        let _outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None)
             .expect("loop completes (MaxTurns)");
 
         // Read the trajectory and find the failure-cascade event.
@@ -1513,8 +1526,11 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::default();
-        // Let the loop run to MAX_TURNS — the cycle should fire well before.
-        let _outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg)
+        // Let the loop run to MAX_TURNS — the cycle should fire well
+        // before. (#457) Cap is operator-opt-in now; pass Some(100)
+        // explicitly so the loop terminates at the same point this
+        // test was originally written against.
+        let _outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None)
             .expect("loop completes (MaxTurns)");
 
         // Read the trajectory and count cycle.suspected events.
@@ -1585,7 +1601,9 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::default();
-        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg)
+        // (#457) Same MaxTurns-relying pattern as the cycle/cascade
+        // tests above; needs Some(100) now that the cap is opt-in.
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None)
             .expect("loop completes (MaxTurns)");
 
         // (1) Trajectory contains feedback.injected events — proves
@@ -1693,7 +1711,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::default();
-        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg)
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None)
             .expect("promoted XML tool call should drive the loop, not error");
 
         assert!(
@@ -1746,7 +1764,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::default();
-        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg)
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None)
             .expect("recovered call from length-truncated response should drive the loop");
 
         assert!(
@@ -1801,7 +1819,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::default();
-        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg)
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None)
             .expect("promoted XML tool call from reasoning_content should drive the loop");
 
         assert!(
@@ -1884,7 +1902,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::default();
-        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg)
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None)
             .expect("clean two-turn dispatch");
 
         // The first assistant message in the conversation must have
@@ -1947,7 +1965,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::default();
-        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg)
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None)
             .expect("clean single-turn dispatch");
 
         captured.assert();
@@ -1986,7 +2004,7 @@ mod tests {
         let tools = [Tool::Read, Tool::Edit, Tool::Bash];
 
         let cfg = compaction::CompactionConfig::default();
-        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg)
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None)
             .expect("loop should terminate cleanly on first-turn stop");
 
         stop_mock.assert();
@@ -2108,7 +2126,7 @@ mod tests {
         // tool_calls; will hit MAX_TURNS); we don't care about the
         // outcome's Ok/Err — just whether the compactor was invoked
         // along the way. The result IS the side-effect assertion below.
-        let outcome = run(&client, "test-primary", initial, &tools, &mut traj, false, &cfg);
+        let outcome = run(&client, "test-primary", initial, &tools, &mut traj, false, &cfg, Some(100), None);
 
         // Core assertion: compactor was invoked at least once. This is
         // the layer-boundary signal — the runtime's loop translated
@@ -2213,7 +2231,7 @@ mod tests {
         }
         let tools = [Tool::Read];
 
-        let outcome = run(&client, "test-primary", initial, &tools, &mut traj, false, &cfg)
+        let outcome = run(&client, "test-primary", initial, &tools, &mut traj, false, &cfg, Some(100), None)
             .expect("bail should produce Ok with EscalationTriggered, not Err");
 
         assert_eq!(
@@ -2302,7 +2320,7 @@ mod tests {
         // Loop hits MAX_TURNS (mock loops forever). The key
         // assertion: terminal_reason must be MaxTurns, NOT
         // EscalationTriggered, even though compactions fired.
-        let outcome = run(&client, "test-primary", initial, &tools, &mut traj, false, &cfg)
+        let outcome = run(&client, "test-primary", initial, &tools, &mut traj, false, &cfg, Some(100), None)
             .expect("loop should hit MAX_TURNS, not error");
 
         assert_eq!(
@@ -2368,7 +2386,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::default();
-        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg)
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None)
             .expect("stall recovery should drive the loop to Stop, not Err");
 
         assert_eq!(
@@ -2435,7 +2453,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::default();
-        let result = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg);
+        let result = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None);
 
         assert!(
             result.is_err(),
@@ -2472,7 +2490,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::default();
-        let result = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg);
+        let result = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None);
 
         assert!(
             result.is_err(),
@@ -2523,7 +2541,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::default();
-        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg)
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None)
             .expect("recovery should drive the loop to Stop");
 
         assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
@@ -2560,7 +2578,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::default();
-        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg)
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None)
             .expect("budget exhaustion returns Ok(EscalationTriggered)");
 
         assert_eq!(
@@ -2625,7 +2643,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::default();
-        let _outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg)
+        let _outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None)
             .expect("recovery succeeds");
 
         // Read the trajectory JSONL and assert the event landed.

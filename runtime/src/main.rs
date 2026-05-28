@@ -181,6 +181,13 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // (typed field, schema-isolation doctrine). None = no augmentation.
     let mut compactor_custom_instructions: Option<String> = None;
 
+    // (#457) Operator-opt-in caps on per-dispatch turn count + cumulative
+    // completion tokens. Host derives from `DARKMUX_RUNTIME_MAX_TURNS` /
+    // `DARKMUX_RUNTIME_MAX_TOKENS` env vars. Both default unlimited;
+    // the inactivity timeout (#458) catches the genuine-stuck case.
+    let mut max_turns: Option<u32> = None;
+    let mut max_tokens: Option<u32> = None;
+
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -361,6 +368,40 @@ fn run_dispatch(args: &[String]) -> ExitCode {
                     return ExitCode::from(2);
                 }
             }
+            "--max-turns" => {
+                if let Some(v) = args.get(i + 1) {
+                    match v.parse::<u32>() {
+                        Ok(n) => {
+                            max_turns = Some(n);
+                            i += 2;
+                        }
+                        Err(_) => {
+                            eprintln!("--max-turns requires a positive integer (got: {v})");
+                            return ExitCode::from(2);
+                        }
+                    }
+                } else {
+                    eprintln!("--max-turns requires a value");
+                    return ExitCode::from(2);
+                }
+            }
+            "--max-tokens" => {
+                if let Some(v) = args.get(i + 1) {
+                    match v.parse::<u32>() {
+                        Ok(n) => {
+                            max_tokens = Some(n);
+                            i += 2;
+                        }
+                        Err(_) => {
+                            eprintln!("--max-tokens requires a positive integer (got: {v})");
+                            return ExitCode::from(2);
+                        }
+                    }
+                } else {
+                    eprintln!("--max-tokens requires a value");
+                    return ExitCode::from(2);
+                }
+            }
             other => {
                 eprintln!("unknown flag: {other}");
                 return ExitCode::from(2);
@@ -468,6 +509,8 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         &mut traj,
         streaming,
         &compaction_cfg,
+        max_turns,
+        max_tokens,
     );
 
     let outcome = match run_result {
