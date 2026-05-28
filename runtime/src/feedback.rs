@@ -88,6 +88,24 @@ const DEFAULT_POST_COMPACTION_TEMPLATE: &str =
      files you already have summarized state for; the summary is \
      load-bearing.";
 
+/// (#466) Default template for the inactivity-approach signal —
+/// fires when the dispatch has gone `{elapsed}`s without a proof-of-
+/// work signal (compaction or tool.completed) and is approaching the
+/// host-side hard watchdog kill at `{budget}`s.
+///
+/// The soft warning gives the model a chance to wrap up gracefully
+/// before the hard kill. Beat 54 N=5 surfaced 4/5 runs that produced
+/// 87-88 passing tests at the 600s killpoint but never emitted
+/// `result: stop` in time — they had the work done but no chance
+/// to declare it.
+const DEFAULT_INACTIVITY_APPROACH_TEMPLATE: &str =
+    "[darkmux-runtime] You've gone {elapsed}s of your {budget}s \
+     inactivity budget without a proof-of-work signal (no successful \
+     tool call, no compaction). The dispatch will be killed if no \
+     progress lands soon. Wrap up: if your work is mostly done, emit \
+     your final answer now. If you're truly stuck, escalate via \
+     `BLOCKED: <reason>. Need decision on: <specifics>.`";
+
 /// (#465) Default template for the test-cadence-drift signal —
 /// fires when N CONSECUTIVE edits have hit the SAME FILE without an
 /// intervening `bash` verification call. Placeholders `{path}` and
@@ -179,6 +197,7 @@ impl FeedbackInjector {
                 "tool_failure_cascade" => DEFAULT_TOOL_FAILURE_CASCADE_TEMPLATE,
                 "post_compaction" => DEFAULT_POST_COMPACTION_TEMPLATE,
                 "test_cadence_drift" => DEFAULT_TEST_CADENCE_DRIFT_TEMPLATE,
+                "inactivity_approach" => DEFAULT_INACTIVITY_APPROACH_TEMPLATE,
                 _ => "",
             })
     }
@@ -263,6 +282,33 @@ impl FeedbackInjector {
         let message = template.replace("{turn}", &turn.to_string());
         self.pending.push(message);
         self.pending_kinds.push("post_compaction");
+    }
+
+    /// (#466) Queue an inactivity-approach soft warning. Called by
+    /// the loop runner when the dispatch has gone `elapsed_secs`
+    /// without a proof-of-work signal (compaction or tool.completed)
+    /// AND the elapsed crossed the soft-warning threshold (75% of
+    /// `budget_secs`).
+    ///
+    /// Edge-triggered upstream: the loop runner fires once per
+    /// deadline window — each proof-of-work signal resets both the
+    /// deadline AND the "already-warned" flag, so a long-running but
+    /// productive dispatch may see the warning multiple times across
+    /// its lifetime (once per stuck window between productive bursts).
+    ///
+    /// Hard kill (the 100% deadline) remains the host-side watchdog's
+    /// responsibility; the soft warning is the runtime-side wrap-up
+    /// chance that precedes it.
+    pub fn queue_inactivity_approach(&mut self, elapsed_secs: u64, budget_secs: u64) {
+        if !self.enabled {
+            return;
+        }
+        let template = self.template_for("inactivity_approach");
+        let message = template
+            .replace("{elapsed}", &elapsed_secs.to_string())
+            .replace("{budget}", &budget_secs.to_string());
+        self.pending.push(message);
+        self.pending_kinds.push("inactivity_approach");
     }
 
     /// (#465) Queue a test-cadence-drift nudge. Called by the loop
@@ -521,6 +567,95 @@ mod tests {
             "runtime telemetry prefix is the boundary marker that tells the model \
              this is system-internal, not user input: {content}"
         );
+    }
+
+    // ─── (#466) inactivity-approach soft warning ────────────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn inactivity_approach_message_includes_elapsed_and_budget() {
+        std::env::remove_var("DARKMUX_FEEDBACK_INJECTION");
+        let mut f = FeedbackInjector::new();
+        f.queue_inactivity_approach(450, 600);
+        let msgs = f.drain();
+        let content = msgs[0].content.as_ref().expect("system message has content");
+        assert!(content.contains("450s"), "must name elapsed seconds: {content}");
+        assert!(content.contains("600s"), "must name budget seconds: {content}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn inactivity_approach_message_has_runtime_prefix() {
+        std::env::remove_var("DARKMUX_FEEDBACK_INJECTION");
+        let mut f = FeedbackInjector::new();
+        f.queue_inactivity_approach(450, 600);
+        let msgs = f.drain();
+        let content = msgs[0].content.as_ref().expect("system message has content");
+        assert!(
+            content.starts_with("[darkmux-runtime]"),
+            "runtime telemetry prefix is the boundary marker: {content}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn inactivity_approach_drain_kinds_discriminates_signal() {
+        std::env::remove_var("DARKMUX_FEEDBACK_INJECTION");
+        let mut f = FeedbackInjector::new();
+        f.queue_inactivity_approach(450, 600);
+        let _ = f.drain();
+        // Per-signal-kind discrimination so the trajectory event can
+        // distinguish this from cycle / cascade / cadence-drift firings.
+        assert_eq!(f.last_drained_kinds(), &["inactivity_approach"]);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn inactivity_approach_is_noop_when_disabled_via_env_var() {
+        // Per-signal invariant: every queue_* must respect the
+        // operator's master disable. Documented at PR #473 review.
+        std::env::set_var("DARKMUX_FEEDBACK_INJECTION", "0");
+        let mut f = FeedbackInjector::new();
+        f.queue_inactivity_approach(450, 600);
+        assert_eq!(f.pending_count(), 0);
+        let msgs = f.drain();
+        assert!(msgs.is_empty());
+        std::env::remove_var("DARKMUX_FEEDBACK_INJECTION");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn inactivity_approach_two_queues_without_drain_both_land() {
+        // FeedbackInjector is permissive by design — once-per-window
+        // edge-trigger enforcement is the loop runner's job, not the
+        // injector's. This test documents the contract: if the loop
+        // runner ever fails to set its edge-trigger flag and calls
+        // queue twice, BOTH queue. The model would see two stacked
+        // warnings, which is recoverable but noisy.
+        std::env::remove_var("DARKMUX_FEEDBACK_INJECTION");
+        let mut f = FeedbackInjector::new();
+        f.queue_inactivity_approach(450, 600);
+        f.queue_inactivity_approach(460, 600);
+        assert_eq!(f.pending_count(), 2);
+        let msgs = f.drain();
+        assert_eq!(msgs.len(), 2);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn inactivity_approach_per_role_override_substitutes_both_placeholders() {
+        std::env::remove_var("DARKMUX_FEEDBACK_INJECTION");
+        let mut templates = BTreeMap::new();
+        templates.insert(
+            "inactivity_approach".to_string(),
+            "[darkmux-runtime] Override: {elapsed}/{budget}. Finish or escalate.".to_string(),
+        );
+        let mut f = FeedbackInjector::with_templates(templates);
+        f.queue_inactivity_approach(450, 600);
+        let msgs = f.drain();
+        let content = msgs[0].content.as_ref().expect("system message has content");
+        assert!(content.contains("450/600"), "{content}");
+        assert!(content.starts_with("[darkmux-runtime] Override:"), "{content}");
     }
 
     #[test]

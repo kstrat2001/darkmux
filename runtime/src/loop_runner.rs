@@ -261,6 +261,40 @@ pub fn run(
     // into a BTreeMap and passes here. Empty map = all defaults.
     let mut feedback_injector = FeedbackInjector::with_templates(feedback_templates);
 
+    // (#466) Inactivity-approach soft-warning detector. Tracks the
+    // same proof-of-work signals the host-side hard watchdog does
+    // (#468: tool.completed and compaction) so a productive
+    // dispatch never sees the warning, while a stuck or stalling
+    // one gets a graceful wrap-up chance before the 100% hard kill.
+    //
+    // **Wedged-LMStudio = host-only territory.** When the model is
+    // mid-stream in an LMStudio call, the `loop {}` cannot iterate,
+    // so the soft check below never runs. The host's hard kill at
+    // 100% is the safety net for that case. Soft is best-effort
+    // between-turn telemetry; hard is the unconditional kill.
+    //
+    // - `INACTIVITY_SOFT_THRESHOLD_RATIO` (0.75): fires at 75% of
+    //   the inactivity budget. Operator-visible via the runtime
+    //   stderr; queued into the feedback injector for the model.
+    // - `inactivity_budget_secs`: read once from
+    //   `DARKMUX_INACTIVITY_TIMEOUT_SECONDS` (matches the host's
+    //   default of 600s). The host-side watchdog also reads this;
+    //   runtime-side tracking mirrors so the soft warning fires
+    //   before the host's hard kill at 100% of the same budget.
+    // - `last_proof_of_work`: instant of the most recent reset.
+    //   Initialized at run() entry; updated on tool.completed and
+    //   compaction completed.
+    // - `inactivity_soft_warning_fired_in_window`: edge-trigger
+    //   flag so the warning fires once per stuck window, not on
+    //   every loop iteration.
+    const INACTIVITY_SOFT_THRESHOLD_RATIO: f64 = 0.75;
+    let inactivity_budget_secs: u64 = std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(600);
+    let mut last_proof_of_work = std::time::Instant::now();
+    let mut inactivity_soft_warning_fired_in_window = false;
+
     // (#465) Test-cadence-drift detector — REDESIGNED from #457's
     // edits-since-last-bash counter. The prior shape mis-fired on
     // productive multi-file edit campaigns and missed genuine
@@ -281,6 +315,31 @@ pub fn run(
     let mut consecutive_same_file_edits: u32 = 0;
 
     loop {
+        // (#466) Check soft-deadline approach before draining. If the
+        // dispatch has gone past 75% of the inactivity budget without
+        // a proof-of-work signal AND we haven't already warned in
+        // this window, queue the warning so it drains alongside any
+        // other pending signals on this iteration. Edge-triggered:
+        // the flag clears on the next proof-of-work reset.
+        {
+            let elapsed_secs = last_proof_of_work.elapsed().as_secs();
+            let soft_threshold_secs =
+                ((inactivity_budget_secs as f64) * INACTIVITY_SOFT_THRESHOLD_RATIO) as u64;
+            if !inactivity_soft_warning_fired_in_window
+                && elapsed_secs >= soft_threshold_secs
+            {
+                eprintln!(
+                    "darkmux-runtime: ⚠ inactivity-approach — {}s of {}s budget elapsed \
+                     without a proof-of-work signal. Queueing soft warning before the \
+                     host-side hard kill.",
+                    elapsed_secs, inactivity_budget_secs
+                );
+                feedback_injector
+                    .queue_inactivity_approach(elapsed_secs, inactivity_budget_secs);
+                inactivity_soft_warning_fired_in_window = true;
+            }
+        }
+
         // Drain any feedback messages queued by signal producers in
         // the prior iteration (cycle/cascade today, more signals in
         // Step 3 of the feedback-injection ladder). Pushes
@@ -576,6 +635,15 @@ pub fn run(
                         call.function.arguments.len(),
                         result.len(),
                     );
+                    // (#466) Proof-of-work signal for the inactivity-
+                    // approach detector. Mirrors the host-side #468
+                    // reset trigger so the runtime-side soft warning
+                    // and the host-side hard kill share the same
+                    // deadline semantics. Fires on success AND failure
+                    // (same gap as #469); the cycle + failure-rate
+                    // detectors guard the fast-fail seam.
+                    last_proof_of_work = std::time::Instant::now();
+                    inactivity_soft_warning_fired_in_window = false;
                     // (#465) Track test-cadence drift via same-file
                     // repetition. See state-machine doc above the
                     // declaration of `last_edited_path` for full
@@ -759,6 +827,11 @@ pub fn run(
                     // loop iteration alongside any cycle/cascade
                     // signals from this turn.
                     feedback_injector.queue_post_compaction(turns);
+                    // (#466) Compaction is a proof-of-work signal for
+                    // the inactivity-approach detector. Same trigger
+                    // set as #468 on the host-side reset.
+                    last_proof_of_work = std::time::Instant::now();
+                    inactivity_soft_warning_fired_in_window = false;
 
                     // (#377) Escalation bound check. After persisting
                     // this compaction's trajectory entry, see whether
