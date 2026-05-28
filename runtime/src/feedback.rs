@@ -88,21 +88,23 @@ const DEFAULT_POST_COMPACTION_TEMPLATE: &str =
      files you already have summarized state for; the summary is \
      load-bearing.";
 
-/// (#457 Step 3) Default template for the test-cadence-drift signal —
-/// fires when N edits have happened without an intervening `bash`
-/// tool call (which is the verification step for coder-shaped work).
-/// Placeholder `{count}` is the edit-without-verification count.
+/// (#465) Default template for the test-cadence-drift signal —
+/// fires when N CONSECUTIVE edits have hit the SAME FILE without an
+/// intervening `bash` verification call. Placeholders `{path}` and
+/// `{count}` substituted at injection.
 ///
-/// Beat 51/53b surfaced: a model that edits without running tests
-/// accumulates uncertainty about whether its changes are correct.
-/// The nudge is to verify before accumulating more edits — catches
-/// issues early when they're cheap to fix.
+/// Beat 54 N=5 surfaced that the prior "edits-since-last-bash COUNT"
+/// detector mis-fired on productive multi-file work and missed
+/// genuine drift. The redesign discriminates by REPETITION on a
+/// single file — that pattern correlates with thrash-on-single-bug
+/// behavior that should pause for verification.
 const DEFAULT_TEST_CADENCE_DRIFT_TEMPLATE: &str =
-    "[darkmux-runtime] You've made {count} edits without running a \
-     verification command (bash). If your instructions name test or \
-     lint commands, run them now to catch issues early. Stacking more \
-     edits without verification accumulates uncertainty that's harder \
-     to debug later.";
+    "[darkmux-runtime] You've edited `{path}` {count} times in a row \
+     without running a verification command (bash). Repeated edits to \
+     the same file without verification usually mean an earlier change \
+     didn't land the way you expected. If your instructions name test \
+     or lint commands, run them now. Otherwise re-read the file before \
+     stacking another edit.";
 
 /// Per-dispatch state — queue of pending feedback messages to inject
 /// at the top of the next loop iteration.
@@ -263,17 +265,24 @@ impl FeedbackInjector {
         self.pending_kinds.push("post_compaction");
     }
 
-    /// (#457 Step 3) Queue a test-cadence-drift nudge. Called by the
-    /// loop runner when N consecutive edits have happened without an
-    /// intervening `bash` tool call (the verification step for
-    /// coder-shaped work). Edge-triggered upstream: the loop runner
-    /// fires once per threshold crossing, then resets its counter.
-    pub fn queue_test_cadence_drift(&mut self, edits_count: u32) {
+    /// (#465) Queue a test-cadence-drift nudge. Called by the loop
+    /// runner when N CONSECUTIVE edits hit the SAME `path` without an
+    /// intervening `bash` tool call. Edge-triggered upstream: the
+    /// loop runner fires once per threshold crossing, then resets its
+    /// counter.
+    ///
+    /// Pre-#465 this took a count of "edits since last bash" across
+    /// any files; that mis-fired on productive multi-file work (Beat
+    /// 54 N=5). Same-file repetition is the discriminator that
+    /// correlates with single-bug thrash patterns.
+    pub fn queue_test_cadence_drift(&mut self, consecutive_count: u32, path: &str) {
         if !self.enabled {
             return;
         }
         let template = self.template_for("test_cadence_drift");
-        let message = template.replace("{count}", &edits_count.to_string());
+        let message = template
+            .replace("{count}", &consecutive_count.to_string())
+            .replace("{path}", path);
         self.pending.push(message);
         self.pending_kinds.push("test_cadence_drift");
     }
@@ -477,5 +486,60 @@ mod tests {
         f.queue_tool_failure_cascade("bash", 3);
         let third = f.drain();
         assert_eq!(third.len(), 1);
+    }
+
+    // ─── (#465) test-cadence-drift v2: same-file repetition semantics ────
+
+    #[test]
+    #[serial_test::serial]
+    fn cadence_drift_message_includes_path_and_count() {
+        std::env::remove_var("DARKMUX_FEEDBACK_INJECTION");
+        let mut f = FeedbackInjector::new();
+        f.queue_test_cadence_drift(3, "/workspace/src/main.rs");
+        let msgs = f.drain();
+        let content = msgs[0].content.as_ref().expect("system message has content");
+        assert!(
+            content.contains("`/workspace/src/main.rs`"),
+            "must name the repeatedly-edited path so the model knows which file: {content}"
+        );
+        assert!(
+            content.contains("3 times"),
+            "must name the repeat count so the model has the right calibration: {content}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cadence_drift_message_has_runtime_prefix() {
+        std::env::remove_var("DARKMUX_FEEDBACK_INJECTION");
+        let mut f = FeedbackInjector::new();
+        f.queue_test_cadence_drift(3, "/workspace/x.rs");
+        let msgs = f.drain();
+        let content = msgs[0].content.as_ref().expect("system message has content");
+        assert!(
+            content.starts_with("[darkmux-runtime]"),
+            "runtime telemetry prefix is the boundary marker that tells the model \
+             this is system-internal, not user input: {content}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cadence_drift_per_role_override_substitutes_both_placeholders() {
+        std::env::remove_var("DARKMUX_FEEDBACK_INJECTION");
+        let mut templates = BTreeMap::new();
+        templates.insert(
+            "test_cadence_drift".to_string(),
+            "[darkmux-runtime] Override: {path} edited {count} times. \
+             Stop and verify before editing again."
+                .to_string(),
+        );
+        let mut f = FeedbackInjector::with_templates(templates);
+        f.queue_test_cadence_drift(4, "/workspace/lib.rs");
+        let msgs = f.drain();
+        let content = msgs[0].content.as_ref().expect("system message has content");
+        assert!(content.contains("/workspace/lib.rs"), "{content}");
+        assert!(content.contains("4 times"), "{content}");
+        assert!(content.starts_with("[darkmux-runtime] Override:"), "{content}");
     }
 }
