@@ -274,6 +274,28 @@ impl Trajectory {
         }));
     }
 
+    /// dispatch.reasoning_loop.suspected — fires when the runtime's
+    /// reasoning-loop detector (#461) flags that the same normalized
+    /// reasoning content has appeared `count` times in a sliding window
+    /// of `window_size` recent turns. Sibling of
+    /// `dispatch.cycle.suspected` — same shape applied to reasoning
+    /// instead of tools. Observability + feedback-injection (no bail
+    /// in the MVP).
+    pub fn append_reasoning_loop_suspected(
+        &mut self,
+        seq: u32,
+        count: usize,
+        window_size: usize,
+    ) {
+        self.write_event(&serde_json::json!({
+            "type": "dispatch.reasoning_loop.suspected",
+            "seq": seq,
+            "ts": unix_ms(),
+            "count": count,
+            "window_size": window_size,
+        }));
+    }
+
     /// dispatch.feedback.injected — fires when the runtime injects one
     /// or more synthetic system messages into the next-turn prompt as
     /// model-facing telemetry (cycle warnings, tool-failure cascades,

@@ -33,6 +33,7 @@ use crate::failure_rate::{FailureCascadeSignal, FailureRateDetector};
 use crate::feedback::FeedbackInjector;
 use crate::lmstudio::{ChatRequest, ChunkAccumulator, LmStudioClient, Message};
 use crate::plain_text_tool_calls::promote_plain_text_tool_calls;
+use crate::reasoning_loop::{ReasoningLoopDetector, ReasoningLoopSignal};
 use crate::tools::{dispatch, Tool};
 use crate::trajectory::Trajectory;
 
@@ -249,6 +250,13 @@ pub fn run(
     // inside sandbox where it doesn't exist). Sibling to the cycle
     // detector; same MVP shape (warn-only).
     let mut failure_rate_detector = FailureRateDetector::new();
+    // (#461) Per-dispatch reasoning-loop detector — warns when the
+    // model's reasoning stream repeats across turns. Catches the
+    // Beat 54 Run 5 case where every tool call looks unique but
+    // the reasoning is visibly stuck. Sibling of cycle_detector;
+    // same sliding-window shape applied to reasoning text instead
+    // of tool args.
+    let mut reasoning_loop_detector = ReasoningLoopDetector::new();
     // Feedback injection — Step 1 of the feedback-injection primitive
     // (see `feedback.rs`). When cycle/cascade signals fire, the
     // injector queues a synthetic system message; the message is
@@ -547,6 +555,7 @@ pub fn run(
         // (operator discretion to expand). The original content stays
         // unchanged in `assistant_message` — downstream consumers
         // (compaction, conversation history) see everything as-was.
+        let mut per_turn_reasoning = String::new();
         if let Some(content) = assistant_message.content.as_deref() {
             for reasoning_text in extract_think_blocks(content) {
                 trajectory.append_model_reasoning(
@@ -554,7 +563,26 @@ pub fn run(
                     &reasoning_text,
                     "inline-think-tags",
                 );
+                per_turn_reasoning.push_str(&reasoning_text);
+                per_turn_reasoning.push('\n');
             }
+        }
+        if let Some(separate) = assistant_message.reasoning_content.as_deref() {
+            per_turn_reasoning.push_str(separate);
+        }
+        // (#461) Feed the combined reasoning to the loop detector. The
+        // detector skips empty / too-short reasoning internally so
+        // turns without reasoning content don't pollute the window.
+        if let Some(ReasoningLoopSignal::Suspected { count, window_size }) =
+            reasoning_loop_detector.record(&per_turn_reasoning)
+        {
+            eprintln!(
+                "darkmux-runtime: ⚠ reasoning-loop suspected — same reasoning content \
+                 appeared {} times in {} turns. Queueing feedback nudge.",
+                count, window_size
+            );
+            trajectory.append_reasoning_loop_suspected(turns, count, window_size);
+            feedback_injector.queue_reasoning_loop(count, window_size);
         }
 
         // Append the assistant's message to the conversation before we

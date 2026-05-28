@@ -32,6 +32,7 @@ mod json_repair;
 mod lmstudio;
 mod loop_runner;
 mod plain_text_tool_calls;
+mod reasoning_loop;
 mod tools;
 mod trajectory;
 
