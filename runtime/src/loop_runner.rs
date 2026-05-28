@@ -217,6 +217,7 @@ pub fn run(
     compaction_cfg: &compaction::CompactionConfig,
     max_turns: Option<u32>,
     max_cumulative_tokens: Option<u32>,
+    feedback_templates: std::collections::BTreeMap<String, String>,
 ) -> Result<LoopOutcome> {
     let mut messages = initial_messages;
     let tool_defs: Vec<_> = tools.iter().map(|t| t.to_tool_def()).collect();
@@ -255,7 +256,10 @@ pub fn run(
     // the conversation so the model sees runtime telemetry as
     // model-facing context, not just operator-stderr noise.
     // Operator-disable via `DARKMUX_FEEDBACK_INJECTION=0`.
-    let mut feedback_injector = FeedbackInjector::new();
+    // (#457 Step 2) Per-role template overrides come in from the
+    // dispatcher via `--feedback-templates-json`; main.rs parses
+    // into a BTreeMap and passes here. Empty map = all defaults.
+    let mut feedback_injector = FeedbackInjector::with_templates(feedback_templates);
 
     loop {
         // Drain any feedback messages queued by signal producers in
@@ -1306,7 +1310,7 @@ mod tests {
         // unbounded against a mock that returns infinite identical
         // length-finish responses. 250000 matches the prior hardcoded
         // default value the test was originally written against.
-        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), Some(250_000))
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), Some(250_000), std::collections::BTreeMap::new())
             .expect("cumulative-budget escalation returns Ok(outcome)");
 
         assert_eq!(
@@ -1358,7 +1362,7 @@ mod tests {
         // (#457) Counter-test to the cap-fire path. Set Some(250_000)
         // for parity with the cap-fire test; the mock returns a stop
         // turn quickly so we never approach it.
-        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), Some(250_000))
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), Some(250_000), std::collections::BTreeMap::new())
             .expect("healthy stop should not bail");
 
         assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
@@ -1404,7 +1408,7 @@ mod tests {
         let cfg = compaction::CompactionConfig::default();
         // (#457) Test exercises the MaxTurns terminal — needs Some(N)
         // for the cap to fire. 100 matches the prior hardcoded default.
-        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None)
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new())
             .expect("MAX_TURNS path returns Ok(outcome), not Err");
 
         assert_eq!(
@@ -1462,7 +1466,7 @@ mod tests {
         let cfg = compaction::CompactionConfig::default();
         // (#457) Test relies on MaxTurns to terminate the loop — needs
         // Some(100) explicitly now that the cap is operator-opt-in.
-        let _outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None)
+        let _outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new())
             .expect("loop completes (MaxTurns)");
 
         // Read the trajectory and find the failure-cascade event.
@@ -1530,7 +1534,7 @@ mod tests {
         // before. (#457) Cap is operator-opt-in now; pass Some(100)
         // explicitly so the loop terminates at the same point this
         // test was originally written against.
-        let _outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None)
+        let _outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new())
             .expect("loop completes (MaxTurns)");
 
         // Read the trajectory and count cycle.suspected events.
@@ -1603,7 +1607,7 @@ mod tests {
         let cfg = compaction::CompactionConfig::default();
         // (#457) Same MaxTurns-relying pattern as the cycle/cascade
         // tests above; needs Some(100) now that the cap is opt-in.
-        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None)
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new())
             .expect("loop completes (MaxTurns)");
 
         // (1) Trajectory contains feedback.injected events — proves
@@ -1711,7 +1715,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::default();
-        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None)
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new())
             .expect("promoted XML tool call should drive the loop, not error");
 
         assert!(
@@ -1764,7 +1768,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::default();
-        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None)
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new())
             .expect("recovered call from length-truncated response should drive the loop");
 
         assert!(
@@ -1819,7 +1823,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::default();
-        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None)
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new())
             .expect("promoted XML tool call from reasoning_content should drive the loop");
 
         assert!(
@@ -1902,7 +1906,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::default();
-        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None)
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new())
             .expect("clean two-turn dispatch");
 
         // The first assistant message in the conversation must have
@@ -1965,7 +1969,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::default();
-        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None)
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new())
             .expect("clean single-turn dispatch");
 
         captured.assert();
@@ -2004,7 +2008,7 @@ mod tests {
         let tools = [Tool::Read, Tool::Edit, Tool::Bash];
 
         let cfg = compaction::CompactionConfig::default();
-        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None)
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new())
             .expect("loop should terminate cleanly on first-turn stop");
 
         stop_mock.assert();
@@ -2126,7 +2130,7 @@ mod tests {
         // tool_calls; will hit MAX_TURNS); we don't care about the
         // outcome's Ok/Err — just whether the compactor was invoked
         // along the way. The result IS the side-effect assertion below.
-        let outcome = run(&client, "test-primary", initial, &tools, &mut traj, false, &cfg, Some(100), None);
+        let outcome = run(&client, "test-primary", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new());
 
         // Core assertion: compactor was invoked at least once. This is
         // the layer-boundary signal — the runtime's loop translated
@@ -2231,7 +2235,7 @@ mod tests {
         }
         let tools = [Tool::Read];
 
-        let outcome = run(&client, "test-primary", initial, &tools, &mut traj, false, &cfg, Some(100), None)
+        let outcome = run(&client, "test-primary", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new())
             .expect("bail should produce Ok with EscalationTriggered, not Err");
 
         assert_eq!(
@@ -2320,7 +2324,7 @@ mod tests {
         // Loop hits MAX_TURNS (mock loops forever). The key
         // assertion: terminal_reason must be MaxTurns, NOT
         // EscalationTriggered, even though compactions fired.
-        let outcome = run(&client, "test-primary", initial, &tools, &mut traj, false, &cfg, Some(100), None)
+        let outcome = run(&client, "test-primary", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new())
             .expect("loop should hit MAX_TURNS, not error");
 
         assert_eq!(
@@ -2386,7 +2390,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::default();
-        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None)
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new())
             .expect("stall recovery should drive the loop to Stop, not Err");
 
         assert_eq!(
@@ -2453,7 +2457,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::default();
-        let result = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None);
+        let result = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new());
 
         assert!(
             result.is_err(),
@@ -2490,7 +2494,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::default();
-        let result = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None);
+        let result = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new());
 
         assert!(
             result.is_err(),
@@ -2541,7 +2545,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::default();
-        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None)
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new())
             .expect("recovery should drive the loop to Stop");
 
         assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
@@ -2578,7 +2582,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::default();
-        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None)
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new())
             .expect("budget exhaustion returns Ok(EscalationTriggered)");
 
         assert_eq!(
@@ -2643,7 +2647,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::default();
-        let _outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None)
+        let _outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new())
             .expect("recovery succeeds");
 
         // Read the trajectory JSONL and assert the event landed.

@@ -52,6 +52,25 @@
 //! stack. The model reads each independently as runtime context.
 
 use crate::lmstudio::Message;
+use std::collections::BTreeMap;
+
+/// (#457 Step 2) Default template for the cycle-suspected signal —
+/// used when no per-role override is supplied. Placeholders
+/// `{tool_name}`, `{count}`, `{window_size}` substituted at injection.
+const DEFAULT_CYCLE_SUSPECTED_TEMPLATE: &str =
+    "[darkmux-runtime] You've called `{tool_name}` {count} times in \
+     {window_size} turns with the same arguments. Regroup and \
+     change the strategy. If no productive next step is available, \
+     stop and summarize what you have so the operator can review.";
+
+/// (#457 Step 2) Default template for the tool-failure-cascade signal.
+/// Placeholders `{tool_name}`, `{count}` substituted at injection.
+const DEFAULT_TOOL_FAILURE_CASCADE_TEMPLATE: &str =
+    "[darkmux-runtime] `{tool_name}` has failed {count} \
+     times in a row with the same call pattern. Re-read the affected \
+     files or state, then change the inputs. If the tool itself is \
+     wrong for the next step, switch tools. If none of those apply, \
+     stop and summarize what you have so the operator can review.";
 
 /// Per-dispatch state — queue of pending feedback messages to inject
 /// at the top of the next loop iteration.
@@ -59,20 +78,52 @@ use crate::lmstudio::Message;
 /// Construction reads `DARKMUX_FEEDBACK_INJECTION` once; when set to
 /// `0`/`off`/`false`/`no`, `queue_*` is a no-op and `drain` returns
 /// empty. Default (env var unset or any other value) is enabled.
+///
+/// (#457 Step 2) Accepts a per-role template override map at
+/// construction. Keys are signal-kind names (`cycle_suspected`,
+/// `tool_failure_cascade`); values are template strings with
+/// `{placeholder}` substitution. Missing keys fall back to the
+/// hardcoded defaults shipped in PR #455. Empty map = all defaults.
 pub struct FeedbackInjector {
     pending: Vec<String>,
     enabled: bool,
+    templates: BTreeMap<String, String>,
 }
 
 impl FeedbackInjector {
     pub fn new() -> Self {
+        Self::with_templates(BTreeMap::new())
+    }
+
+    /// (#457 Step 2) Construct with per-role template overrides.
+    /// The dispatcher serializes `Role.feedback_templates` to JSON
+    /// and passes via `--feedback-templates-json` CLI flag; the
+    /// runtime parses and supplies the map here. Keys with no
+    /// matching producer (typos, future-only signal kinds) are
+    /// stored but never looked up — harmless.
+    pub fn with_templates(templates: BTreeMap<String, String>) -> Self {
         let enabled = std::env::var("DARKMUX_FEEDBACK_INJECTION")
             .map(|v| !matches!(v.as_str(), "0" | "off" | "false" | "no"))
             .unwrap_or(true);
         Self {
             pending: Vec::new(),
             enabled,
+            templates,
         }
+    }
+
+    /// Resolve a template by signal-kind key — operator override
+    /// wins; built-in default is the fallback. Substitution caller's
+    /// responsibility (placeholder vocab differs per signal).
+    fn template_for(&self, key: &str) -> &str {
+        self.templates
+            .get(key)
+            .map(String::as_str)
+            .unwrap_or_else(|| match key {
+                "cycle_suspected" => DEFAULT_CYCLE_SUSPECTED_TEMPLATE,
+                "tool_failure_cascade" => DEFAULT_TOOL_FAILURE_CASCADE_TEMPLATE,
+                _ => "",
+            })
     }
 
     /// True if `DARKMUX_FEEDBACK_INJECTION` is enabled. Public so
@@ -107,12 +158,12 @@ impl FeedbackInjector {
         if !self.enabled {
             return;
         }
-        self.pending.push(format!(
-            "[darkmux-runtime] You've called `{tool_name}` {count} times in \
-             {window_size} turns with the same arguments. Regroup and \
-             change the strategy. If no productive next step is available, \
-             stop and summarize what you have so the operator can review."
-        ));
+        let template = self.template_for("cycle_suspected");
+        let message = template
+            .replace("{tool_name}", tool_name)
+            .replace("{count}", &count.to_string())
+            .replace("{window_size}", &window_size.to_string());
+        self.pending.push(message);
     }
 
     /// Queue a tool-failure-cascade feedback message. Called when the
@@ -133,13 +184,11 @@ impl FeedbackInjector {
         if !self.enabled {
             return;
         }
-        self.pending.push(format!(
-            "[darkmux-runtime] `{tool_name}` has failed {consecutive_failures} \
-             times in a row with the same call pattern. Re-read the affected \
-             files or state, then change the inputs. If the tool itself is \
-             wrong for the next step, switch tools. If none of those apply, \
-             stop and summarize what you have so the operator can review."
-        ));
+        let template = self.template_for("tool_failure_cascade");
+        let message = template
+            .replace("{tool_name}", tool_name)
+            .replace("{count}", &consecutive_failures.to_string());
+        self.pending.push(message);
     }
 
     /// Number of pending messages waiting to be drained. Tests use

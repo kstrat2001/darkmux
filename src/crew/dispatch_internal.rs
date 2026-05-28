@@ -411,6 +411,30 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // → runtime's `Option<u32>` stays None → no cap applied).
     apply_runtime_limit_flags(&mut cmd);
 
+    // (#457 Step 2) Per-role feedback-template overrides. If the
+    // role manifest declares `feedback_templates`, serialize the
+    // map to JSON and pass via `--feedback-templates-json`. The
+    // runtime parses and overrides the FeedbackInjector's defaults
+    // for any signal-kind key present. Absent field ⇒ no flag ⇒
+    // runtime uses its hardcoded defaults across all signals.
+    if let Some(templates) = role.feedback_templates.as_ref() {
+        if !templates.is_empty() {
+            match serde_json::to_string(templates) {
+                Ok(json) => {
+                    cmd.arg("--feedback-templates-json").arg(json);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "darkmux crew dispatch: failed to serialize role `{}` \
+                         feedback_templates: {e}. Runtime will use defaults. \
+                         (#457 Step 2)",
+                        opts.role_id
+                    );
+                }
+            }
+        }
+    }
+
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let child = cmd.spawn().context("spawning darkmux-runtime container")?;
@@ -1585,6 +1609,7 @@ mod tests {
             bail_after_compactions: Some(2), // role pin
             escalation_posture: None,
             role_family: None,
+            feedback_templates: None,
         };
         args.apply_role_override(&role);
         assert_eq!(args.bail_after_compactions, Some(2), "role pin wins");
@@ -1614,6 +1639,7 @@ mod tests {
             bail_after_compactions: None, // role didn't pin
             escalation_posture: None,
             role_family: None,
+            feedback_templates: None,
         };
         args.apply_role_override(&role);
         assert_eq!(

@@ -169,6 +169,33 @@ pub struct Role {
     /// canonical admin role today; all others default to specialist.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role_family: Option<String>,
+    /// (#457 Step 2) Per-role overrides for the runtime's feedback-
+    /// injection templates. Keys are signal-kind names matching
+    /// `FeedbackInjector::queue_*` methods today:
+    ///
+    /// - `cycle_suspected` — fired when the cycle detector observes
+    ///   the same tool+args called 3+ times in 10 turns
+    /// - `tool_failure_cascade` — fired when a tool fails 3+ times
+    ///   in a row
+    ///
+    /// Values are template strings with placeholder substitution.
+    /// Supported placeholders depend on the signal kind:
+    ///
+    /// - `cycle_suspected`: `{tool_name}`, `{count}`, `{window_size}`
+    /// - `tool_failure_cascade`: `{tool_name}`, `{count}`
+    ///
+    /// Missing key ⇒ runtime falls back to the hardcoded default
+    /// (the [darkmux-runtime]-prefixed directive shipped in PR #455).
+    /// Absent field entirely ⇒ all defaults apply.
+    ///
+    /// **Per-role nuance the operator named** (Beat 53 roadmap):
+    /// a coder hitting a cycle gets the imperative *"regroup and
+    /// change the strategy"*; a code-reviewer (read-only palette)
+    /// might benefit from *"narrow the scope of your review;
+    /// commit to a verdict"* instead — same signal, different
+    /// actionable next move per the role's tool surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feedback_templates: Option<std::collections::BTreeMap<String, String>>,
 }
 
 impl Role {
@@ -356,6 +383,7 @@ mod tests {
             bail_after_compactions: None,
             escalation_posture: None,
             role_family: None,
+            feedback_templates: None,
         }
     }
 
