@@ -544,7 +544,7 @@ pub fn run(
             .next()
             .ok_or_else(|| anyhow!("LMStudio returned no choices"))?;
 
-        let assistant_message = choice.message;
+        let mut assistant_message = choice.message;
         let finish_reason = choice.finish_reason;
 
         // Extract reasoning content from `<think>...</think>` blocks in
@@ -585,11 +585,6 @@ pub fn run(
             feedback_injector.queue_reasoning_loop(count, window_size);
         }
 
-        // Append the assistant's message to the conversation before we
-        // process its tool calls — that's the order the next request
-        // needs to see things in.
-        messages.push(assistant_message.clone());
-
         // (#479) Per-turn-cap salvage. The model hit MAX_TOKENS_PER_CALL
         // on this turn AND the tool call args were well-formed JSON.
         // Discard the truncated content (probably mid-emission) and
@@ -599,35 +594,49 @@ pub fn run(
         // nudge so the model knows what happened. Beat 55 Run 1 was
         // the empirical case: 31K reasoning chars + 1 well-formed
         // tool call → bail pre-#479; salvage post-#479.
+        //
+        // **Detection runs BEFORE the assistant_message push.** The
+        // truncated content (probably reasoning that ran past the cap)
+        // is cleared to None when salvage fires, mirroring the
+        // stall-arm's `messages.pop()` rationale: leaving the noise
+        // in history would anchor the model on the failed pattern
+        // AND inflate prompt_tokens on every subsequent turn.
         let salvaged_per_turn_cap = finish_reason == "length"
             && this_turn_completion_tokens == Some(MAX_TOKENS_PER_CALL)
             && assistant_message_has_well_formed_tool_calls(&assistant_message);
-        let effective_finish_reason = if salvaged_per_turn_cap {
-            let salvaged_count = assistant_message
-                .tool_calls
-                .as_ref()
-                .map(|tcs| tcs.iter().filter(|tc| {
-                    serde_json::from_str::<serde_json::Value>(&tc.function.arguments).is_ok()
-                }).count())
-                .unwrap_or(0);
+        if salvaged_per_turn_cap {
+            let salvaged_count = count_well_formed_tool_calls(&assistant_message);
+            let observed_tokens = this_turn_completion_tokens.unwrap_or(MAX_TOKENS_PER_CALL);
             eprintln!(
                 "darkmux-runtime: ⚡ per-turn-cap salvage — completion_tokens=\
                  {} hit cap {}; dispatching {} well-formed tool call(s) and \
-                 nudging the model to be more concise.",
-                MAX_TOKENS_PER_CALL, MAX_TOKENS_PER_CALL, salvaged_count
+                 nudging the model to reduce per-call reasoning.",
+                observed_tokens, MAX_TOKENS_PER_CALL, salvaged_count
             );
             trajectory.append_per_turn_cap_salvaged(
                 turns,
-                MAX_TOKENS_PER_CALL,
+                observed_tokens,
                 MAX_TOKENS_PER_CALL,
                 salvaged_count,
             );
             feedback_injector
-                .queue_per_turn_cap_approach(MAX_TOKENS_PER_CALL, MAX_TOKENS_PER_CALL);
+                .queue_per_turn_cap_approach(observed_tokens, MAX_TOKENS_PER_CALL);
+            // Clear truncated content — keep tool_calls. Mirrors the
+            // stall-arm's pop reason: anchoring + prompt-token bloat.
+            assistant_message.content = None;
+        }
+        let effective_finish_reason = if salvaged_per_turn_cap {
             "tool_calls"
         } else {
             finish_reason.as_str()
         };
+
+        // Append the assistant's message to the conversation before we
+        // process its tool calls — that's the order the next request
+        // needs to see things in. When salvage fired, the content
+        // field was cleared above so the truncated reasoning doesn't
+        // leak into history.
+        messages.push(assistant_message.clone());
 
         match effective_finish_reason {
             "stop" => {
@@ -1133,6 +1142,25 @@ fn assistant_message_has_well_formed_tool_calls(msg: &Message) -> bool {
                     .any(|tc| serde_json::from_str::<serde_json::Value>(&tc.function.arguments).is_ok())
         })
         .unwrap_or(false)
+}
+
+/// (#479) Count tool calls with well-formed JSON arguments. Companion
+/// to `assistant_message_has_well_formed_tool_calls` — the boolean
+/// predicate is for the detection decision; this returns the exact
+/// count for the trajectory event + operator-visible eprintln. Sharing
+/// the "well-formed" definition between predicate + count keeps the
+/// two in sync if the definition ever evolves.
+fn count_well_formed_tool_calls(msg: &Message) -> usize {
+    msg.tool_calls
+        .as_ref()
+        .map(|tcs| {
+            tcs.iter()
+                .filter(|tc| {
+                    serde_json::from_str::<serde_json::Value>(&tc.function.arguments).is_ok()
+                })
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 /// (#465) Extract the `path` field from a tool call's JSON arguments —
@@ -2123,6 +2151,143 @@ mod tests {
         assert!(
             salvaged_seen,
             "trajectory must record dispatch.per_turn_cap.salvaged when salvage fires"
+        );
+    }
+
+    /// Salvage must still dispatch the tool call even when feedback
+    /// injection is disabled. The nudge is a no-op but the salvage
+    /// path itself stays active — separating queueing from routing.
+    #[test]
+    #[serial_test::serial]
+    fn loop_salvages_tool_call_even_when_feedback_injection_disabled() {
+        std::env::set_var("DARKMUX_FEEDBACK_INJECTION", "0");
+        let server = MockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_json(
+                Some("partial truncated content"),
+                Some(serde_json::json!([{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "arguments": "{\"path\":\"/workspace/x.txt\",\"offset\":1,\"limit\":50}",
+                    },
+                }])),
+                "length",
+                100,
+                MAX_TOKENS_PER_CALL,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempdir::TempDir::new("salvage-feedback-disabled").unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("read x.txt")];
+        let tools = [Tool::Read];
+
+        let cfg = compaction::CompactionConfig::default();
+        let outcome = run(
+            &client,
+            "test-model",
+            initial,
+            &tools,
+            &mut traj,
+            false,
+            &cfg,
+            Some(3),
+            None,
+            std::collections::BTreeMap::new(),
+        )
+        .expect(
+            "salvage routing must work independently of feedback queueing — \
+             DARKMUX_FEEDBACK_INJECTION=0 disables the nudge, not the salvage",
+        );
+
+        assert!(
+            outcome.turns >= 1,
+            "salvage must still drive the loop when feedback is disabled (got turns={})",
+            outcome.turns
+        );
+        // Trajectory event still fires — observability isn't gated on
+        // the feedback-injection switch.
+        let traj_path = tmp.path().join(".darkmux-runtime/trajectory.jsonl");
+        let raw = std::fs::read_to_string(&traj_path).expect("trajectory file exists");
+        let salvaged_seen = raw.lines().any(|line| {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap_or_default();
+            v.get("type").and_then(|t| t.as_str())
+                == Some("dispatch.per_turn_cap.salvaged")
+        });
+        assert!(salvaged_seen, "trajectory event must fire regardless of feedback gate");
+
+        std::env::remove_var("DARKMUX_FEEDBACK_INJECTION");
+    }
+
+    /// When salvage fires, the assistant message's truncated content
+    /// must be cleared before push so the next turn's prompt doesn't
+    /// carry the runaway reasoning forward (anchors the model on the
+    /// failed pattern + inflates prompt_tokens). Mirrors the stall-
+    /// arm's messages.pop() rationale.
+    #[test]
+    #[serial_test::serial]
+    fn salvage_clears_truncated_content_from_history() {
+        let server = MockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_json(
+                Some("31k chars of truncated reasoning would land here in the real case"),
+                Some(serde_json::json!([{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "arguments": "{\"path\":\"/workspace/x.txt\",\"offset\":1,\"limit\":50}",
+                    },
+                }])),
+                "length",
+                100,
+                MAX_TOKENS_PER_CALL,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempdir::TempDir::new("salvage-clear-content").unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("read x.txt")];
+        let tools = [Tool::Read];
+
+        let cfg = compaction::CompactionConfig::default();
+        let outcome = run(
+            &client,
+            "test-model",
+            initial,
+            &tools,
+            &mut traj,
+            false,
+            &cfg,
+            Some(2),
+            None,
+            std::collections::BTreeMap::new(),
+        )
+        .expect("salvage should drive the loop");
+
+        // Find the assistant message that landed during the salvaged
+        // turn — it should have tool_calls present but content cleared
+        // to None so the truncated noise doesn't anchor future turns.
+        let salvaged_assistant_msg = outcome
+            .messages
+            .iter()
+            .find(|m| m.role == "assistant" && m.tool_calls.is_some());
+        let m = salvaged_assistant_msg
+            .expect("salvaged turn's assistant message should be in history");
+        assert!(
+            m.content.is_none(),
+            "salvage must clear assistant_message.content to prevent anchoring + bloat; got content={:?}",
+            m.content
+        );
+        assert!(
+            m.tool_calls.as_ref().map(|tcs| !tcs.is_empty()).unwrap_or(false),
+            "salvage must preserve tool_calls for dispatch"
         );
     }
 

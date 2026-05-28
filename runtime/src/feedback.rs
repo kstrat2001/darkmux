@@ -119,10 +119,14 @@ const DEFAULT_REASONING_LOOP_TEMPLATE: &str =
 /// `result: error` and threw the salvageable tool call away.
 const DEFAULT_PER_TURN_CAP_APPROACH_TEMPLATE: &str =
     "[darkmux-runtime] You hit the per-turn token cap ({completion_tokens}/{cap}) \
-     with truncated content but a well-formed tool call survived. The tool \
-     call is being dispatched. Be more concise next turn — lengthy reasoning \
-     before each tool call eats the per-turn budget. If the work needs more \
-     space, break it into smaller turns.";
+     with truncated output but a well-formed tool call survived. The tool \
+     call is being dispatched. \
+     Reduce reasoning length before each tool call: emit at most one \
+     short paragraph of reasoning per call. \
+     If a complex plan is needed, split it across turns as a series of \
+     smaller tool calls rather than packing the analysis into one turn. \
+     \"Concise\" here means less reasoning per turn, not a shorter final \
+     answer.";
 
 /// (#466) Default template for the inactivity-approach signal —
 /// fires when the dispatch has gone `{elapsed}`s without a proof-of-
