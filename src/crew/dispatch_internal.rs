@@ -722,6 +722,24 @@ impl TailerState {
                 });
                 self.emit("dispatch.reasoning", crate::flow::Level::Info, payload);
             }
+            "dispatch.feedback.injected" => {
+                // (#454 feedback-injection scaffold) Forward the new
+                // runtime trajectory event into the flow stream so
+                // fleet observability surfaces (flow tail, topology
+                // viewer, audit chain) can see when the runtime's
+                // meta-awareness channel delivered a system message
+                // to the model. Companion to the per-signal flow
+                // forwarders (cycle/cascade trajectory events today
+                // do NOT have flow forwarders, but feedback.injected
+                // is the model-visible delivery event that operators
+                // monitoring fleet behavior most want surfaced).
+                let payload = serde_json::json!({
+                    "turn_seq": event.get("seq"),
+                    "message_count": event.get("message_count"),
+                    "signal_kinds": event.get("signal_kinds"),
+                });
+                self.emit("dispatch.feedback.injected", crate::flow::Level::Info, payload);
+            }
             "model.partial" => {
                 // Per-SSE-chunk events coalesced into a coarser heartbeat
                 // (rate-limited via HEARTBEAT_MIN_INTERVAL). Keeps

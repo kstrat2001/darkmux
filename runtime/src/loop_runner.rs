@@ -30,6 +30,7 @@ use anyhow::{anyhow, Result};
 use crate::compaction;
 use crate::cycle_detector::{CycleDetector, CycleSignal};
 use crate::failure_rate::{FailureCascadeSignal, FailureRateDetector};
+use crate::feedback::FeedbackInjector;
 use crate::lmstudio::{ChatRequest, ChunkAccumulator, LmStudioClient, Message};
 use crate::plain_text_tool_calls::promote_plain_text_tool_calls;
 use crate::tools::{dispatch, Tool};
@@ -256,8 +257,44 @@ pub fn run(
     // inside sandbox where it doesn't exist). Sibling to the cycle
     // detector; same MVP shape (warn-only).
     let mut failure_rate_detector = FailureRateDetector::new();
+    // Feedback injection — Step 1 of the feedback-injection primitive
+    // (see `feedback.rs`). When cycle/cascade signals fire, the
+    // injector queues a synthetic system message; the message is
+    // drained at the top of the next loop iteration and prepended to
+    // the conversation so the model sees runtime telemetry as
+    // model-facing context, not just operator-stderr noise.
+    // Operator-disable via `DARKMUX_FEEDBACK_INJECTION=0`.
+    let mut feedback_injector = FeedbackInjector::new();
 
     loop {
+        // Drain any feedback messages queued by signal producers in
+        // the prior iteration (cycle/cascade today, more signals in
+        // Step 3 of the feedback-injection ladder). Pushes
+        // `Message::system()` instances into the conversation BEFORE
+        // the next ChatRequest is built, so the model sees the
+        // telemetry on its next turn. No-op when the queue is empty
+        // or when `DARKMUX_FEEDBACK_INJECTION` is disabled.
+        //
+        // **Drained-or-discarded**: signals that fire on a turn which
+        // then routes to a terminal exit (MAX_TURNS, compaction bail,
+        // stall-budget exhausted, stop) are queued but never drained
+        // — the loop ends before the next iteration. Acceptable: the
+        // signal still reached stderr + trajectory, and the model is
+        // about to stop receiving any further nudges anyway.
+        let pending_feedback = feedback_injector.drain();
+        if !pending_feedback.is_empty() {
+            let count = pending_feedback.len();
+            messages.extend(pending_feedback);
+            trajectory.append_feedback_injected(
+                turns,
+                count,
+                // Step-1 scaffold ships with a single combined signal
+                // bucket — `cycle_or_cascade` covers both producers
+                // wired so far. Step 3 will discriminate per-signal
+                // when more producers (compaction, budget) wire in.
+                &["cycle_or_cascade"],
+            );
+        }
         if turns >= MAX_TURNS {
             // #325: structured terminal reason instead of an opaque
             // Err. The JSON envelope's `result` field can now be
@@ -500,6 +537,16 @@ pub fn run(
                             count,
                             window_size,
                         );
+                        // Step 1 of feedback injection — route the
+                        // same signal that goes to stderr/trajectory
+                        // INTO the model's next-turn prompt as a
+                        // synthetic system message. Drains at top of
+                        // next loop iteration.
+                        feedback_injector.queue_cycle_suspected(
+                            &tool_name,
+                            count,
+                            window_size,
+                        );
                     }
                     let result = dispatch(&call.function.name, &call.function.arguments);
                     trajectory.append_tool_completed(
@@ -528,6 +575,16 @@ pub fn run(
                             turns,
                             &tool_name,
                             consecutive_failures,
+                        );
+                        // Step 1 of feedback injection — see cycle-
+                        // suspected callsite above for the rationale.
+                        // `consecutive_failures` is `u32` at the
+                        // signal layer; cast to `usize` to match the
+                        // injector's API (which uses `usize` for
+                        // counter fields uniformly).
+                        feedback_injector.queue_tool_failure_cascade(
+                            &tool_name,
+                            consecutive_failures as usize,
                         );
                     }
                     messages.push(Message::tool_result(
@@ -1478,6 +1535,110 @@ mod tests {
         assert_eq!(first["tool_name"], "read");
         assert_eq!(first["count"], 3);
         assert!(first["canonical_args"].as_str().unwrap().contains("x.txt"));
+    }
+
+    /// (Feedback injection scaffold — Step 1) End-to-end test that the
+    /// `FeedbackInjector` actually delivers messages into the
+    /// conversation, not just into a side queue. Drives the loop with
+    /// a cycle-inducing mock and asserts BOTH:
+    ///   1. `dispatch.feedback.injected` events land in the trajectory
+    ///      (the observability path is wired)
+    ///   2. The final `LoopOutcome.messages` contains at least one
+    ///      `[darkmux-runtime]`-prefixed system message naming the
+    ///      cycle (the model-facing path is wired)
+    ///
+    /// The code-reviewer for this PR flagged that the unit tests in
+    /// `feedback.rs` exercise the primitive in isolation but the
+    /// `loop_runner.rs` integration (drain → `messages.extend()`) was
+    /// uncovered. Catches any future refactor that drops the
+    /// `messages.extend(pending_feedback)` call.
+    #[test]
+    #[serial_test::serial]
+    fn feedback_injection_delivers_to_conversation_when_cycle_fires() {
+        // Ensure feedback injection is enabled for this test (not
+        // disabled by a prior test's env mutation that didn't unset).
+        std::env::remove_var("DARKMUX_FEEDBACK_INJECTION");
+
+        let server = MockServer::start();
+        let _bail_mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_json(
+                None,
+                Some(serde_json::json!([{
+                    "id": "call_loop",
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "arguments": "{\"path\":\"/workspace/x.txt\",\"offset\":1,\"limit\":50}",
+                    },
+                }])),
+                "tool_calls",
+                100,
+                10,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempdir::TempDir::new("feedback-injection").unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("loop")];
+        let tools = [Tool::Read];
+
+        let cfg = compaction::CompactionConfig::default();
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg)
+            .expect("loop completes (MaxTurns)");
+
+        // (1) Trajectory contains feedback.injected events — proves
+        // the drain ran and recorded its delivery.
+        let traj_file = tmp.path().join(".darkmux-runtime").join("trajectory.jsonl");
+        let raw = std::fs::read_to_string(&traj_file).expect("trajectory file must exist");
+        let injected_events: Vec<_> = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["type"] == "dispatch.feedback.injected")
+            .collect();
+        assert!(
+            !injected_events.is_empty(),
+            "expected at least one dispatch.feedback.injected event in trajectory \
+             — the drain path must run when cycle signals fire"
+        );
+        let first = &injected_events[0];
+        assert!(
+            first["message_count"].as_u64().unwrap_or(0) >= 1,
+            "feedback.injected event must report message_count >= 1"
+        );
+        // Step-1 bucket is `cycle_or_cascade`; this assertion locks in
+        // the contract and will fail loudly when Step 3 discriminates
+        // per-signal — at which point this test gets updated.
+        let kinds = first["signal_kinds"]
+            .as_array()
+            .expect("signal_kinds is an array");
+        assert!(
+            kinds.iter().any(|k| k == "cycle_or_cascade"),
+            "Step-1 trajectory event must carry the `cycle_or_cascade` signal kind"
+        );
+
+        // (2) The conversation contains the synthetic system message
+        // — proves `messages.extend(pending_feedback)` is wired.
+        let runtime_system_msgs: Vec<_> = outcome
+            .messages
+            .iter()
+            .filter(|m| m.role == "system")
+            .filter_map(|m| m.content.as_deref())
+            .filter(|c| c.starts_with("[darkmux-runtime]"))
+            .collect();
+        assert!(
+            !runtime_system_msgs.is_empty(),
+            "expected at least one [darkmux-runtime]-prefixed system message \
+             in the final conversation — the cycle warning must reach the model"
+        );
+        // At least one should name the tool that cycled.
+        assert!(
+            runtime_system_msgs.iter().any(|c| c.contains("`read`")),
+            "at least one runtime system message should name the cycling tool: \
+             saw {:?}",
+            runtime_system_msgs
+        );
     }
 
     /// (#406) The 20% silent-bail scenario: model returned
