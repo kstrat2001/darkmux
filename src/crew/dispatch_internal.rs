@@ -568,12 +568,14 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // diagnostic detail about why.
     if timeout_fired.load(Ordering::SeqCst) {
         stderr = format!(
-            "darkmux dispatch: INACTIVITY TIMEOUT — no compaction signal in {inactivity_secs}s — \
+            "darkmux dispatch: INACTIVITY TIMEOUT — no proof-of-work signal in {inactivity_secs}s — \
              container `{container_name}` was killed by the watchdog. The inactivity timer \
-             resets on each successful compaction (a compaction is observable proof the \
-             dispatch is alive). Genuine thinking-mode hangs and diagnostic-loop runaways \
-             trigger this; productive dispatches that compact regularly stay alive. \
-             Override the default with DARKMUX_INACTIVITY_TIMEOUT_SECONDS=<N>. (#363, #457)\n{stderr}"
+             resets on each successful tool call (read / bash / edit / write) and on each \
+             compaction event. Genuine thinking-mode hangs and total stalls trigger this; \
+             productive dispatches making any tool calls stay alive. Pathological tool patterns \
+             are caught by their dedicated detectors (cycle / cascade / cadence-drift) so the \
+             deadline can trust activity. Override the default with \
+             DARKMUX_INACTIVITY_TIMEOUT_SECONDS=<N>. (#363, #457, #464)\n{stderr}"
         );
     }
 
@@ -863,6 +865,29 @@ impl TailerState {
             }
             "tool.completed" => {
                 self.summary.tool_calls += 1;
+                // (#464) Tool completion is the second proof-of-work signal
+                // (alongside compaction). Reset the inactivity deadline:
+                // the model is actively producing or inspecting state,
+                // which means the dispatch is alive in a way the deadline
+                // should respect. Pathological tool patterns (cycle on
+                // same args, cascade of failures, edit-drift on same file,
+                // reasoning loops) are caught by their dedicated detectors
+                // — per-mole-hole guards make this generous reset safe.
+                //
+                // Operator-stated principle (Beat 54): "at least one guard
+                // per mole hole." Read alone isn't proof-of-work in
+                // isolation, but read patterns that look like spinning
+                // are caught by the cycle detector. Edit drift is caught
+                // by the cadence-drift detector (post-#465 redesign).
+                // The deadline trusts activity; the detectors catch
+                // struggle.
+                if let Some(deadline) = &self.inactivity_deadline {
+                    let new_deadline =
+                        Instant::now() + Duration::from_secs(self.inactivity_secs);
+                    if let Ok(mut guard) = deadline.lock() {
+                        *guard = new_deadline;
+                    }
+                }
                 let payload = serde_json::json!({
                     "tool_seq": event.get("tool_seq"),
                     "tool_name": event.get("tool_name"),
@@ -2041,13 +2066,14 @@ mod tests {
         );
     }
 
-    /// (#457) Counter-test: non-compaction events (turn, tool, reasoning,
-    /// heartbeat, etc.) must NOT reset the inactivity deadline. Only
-    /// compaction is the progress signal that proves the dispatch is
-    /// alive in the meta-architectural sense; per-turn / per-tool
-    /// events are too cheap to game.
+    /// (#457 → #464) Counter-test: events that don't indicate
+    /// observable progress (model turn completions, reasoning,
+    /// streaming markers) must NOT reset the inactivity deadline.
+    /// Compaction and tool.completed DO reset (covered by their own
+    /// tests). Per-mole-hole detectors guard against pathological
+    /// tool patterns (cycle / cascade / drift / reasoning-loop).
     #[test]
-    fn tailer_non_compaction_events_do_not_reset_inactivity_deadline() {
+    fn tailer_non_progress_events_do_not_reset_inactivity_deadline() {
         use std::io::Write;
 
         let tmp = TempDir::new().unwrap();
@@ -2065,7 +2091,9 @@ mod tests {
             600,
         );
 
-        // Write a turn event (not compaction).
+        // Write events that are NOT progress signals — turn boundary,
+        // reasoning, streaming markers. None of these indicate the
+        // model produced verified output.
         let mut f = std::fs::File::create(&traj_path).unwrap();
         writeln!(
             f,
@@ -2074,7 +2102,12 @@ mod tests {
         .unwrap();
         writeln!(
             f,
-            r#"{{"type":"tool.completed","seq":1,"tool_seq":0,"tool_name":"read","args_chars":50,"result_chars":1000}}"#
+            r#"{{"type":"model.reasoning","seq":1,"reasoning_chars":500,"reasoning_text":"thinking..."}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"model.streaming.start","seq":1,"ts":1234567890}}"#
         )
         .unwrap();
         drop(f);
@@ -2084,8 +2117,119 @@ mod tests {
         let unchanged_deadline = *shared.lock().unwrap();
         assert_eq!(
             unchanged_deadline, original_deadline,
-            "non-compaction events must not reset the inactivity deadline; \
-             only compaction is the progress signal"
+            "non-progress events (turn / reasoning / streaming) must not \
+             reset the inactivity deadline; only proof-of-work signals \
+             (compaction, tool.completed) qualify"
+        );
+    }
+
+    /// (#464) Tool completion is the second proof-of-work signal
+    /// (alongside compaction). A successful tool call — read, bash,
+    /// edit, write — means the model is actively producing or
+    /// inspecting state. The deadline pushes forward so productive
+    /// dispatches don't get killed by a deadline that was designed
+    /// around compaction frequency.
+    ///
+    /// Per-mole-hole detectors (cycle, cascade, drift, reasoning-loop)
+    /// guard against pathological tool patterns. The deadline trusts
+    /// activity; the detectors catch struggle.
+    #[test]
+    fn tailer_tool_completed_event_resets_inactivity_deadline() {
+        use std::io::Write;
+
+        let tmp = TempDir::new().unwrap();
+        let traj_path = tmp.path().join("trajectory.jsonl");
+
+        let inactivity_secs = 600u64;
+        let original_deadline = Instant::now() - Duration::from_secs(3600);
+        let shared = Arc::new(Mutex::new(original_deadline));
+
+        let mut state = TailerState::new(
+            traj_path.clone(),
+            "test-session".into(),
+            "test-role".into(),
+            "test-model".into(),
+            Arc::clone(&shared),
+            inactivity_secs,
+        );
+
+        let mut f = std::fs::File::create(&traj_path).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"tool.completed","seq":3,"tool_seq":0,"tool_name":"bash","args_chars":50,"result_chars":1024}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        let before_reset = Instant::now();
+        state.poll_and_emit();
+        let after_reset = Instant::now();
+
+        let new_deadline = *shared.lock().unwrap();
+        let expected_min =
+            before_reset + Duration::from_secs(inactivity_secs) - Duration::from_millis(50);
+        let expected_max =
+            after_reset + Duration::from_secs(inactivity_secs) + Duration::from_secs(1);
+        assert!(
+            new_deadline >= expected_min,
+            "tool.completed must reset deadline by ~inactivity_secs"
+        );
+        assert!(
+            new_deadline <= expected_max,
+            "deadline must not advance more than ~inactivity_secs"
+        );
+        assert!(
+            new_deadline > original_deadline,
+            "reset must overwrite stale deadline"
+        );
+    }
+
+    /// (#464) Multiple proof-of-work events in one poll cycle move
+    /// the deadline to the LATEST reset (not stale to the first).
+    /// Compaction + tool.completed in the same poll → deadline ≈
+    /// now + inactivity_secs, not stale to whichever fired first.
+    #[test]
+    fn tailer_multiple_proof_of_work_events_advance_to_latest() {
+        use std::io::Write;
+
+        let tmp = TempDir::new().unwrap();
+        let traj_path = tmp.path().join("trajectory.jsonl");
+
+        let inactivity_secs = 600u64;
+        let original_deadline = Instant::now() - Duration::from_secs(3600);
+        let shared = Arc::new(Mutex::new(original_deadline));
+
+        let mut state = TailerState::new(
+            traj_path.clone(),
+            "test-session".into(),
+            "test-role".into(),
+            "test-model".into(),
+            Arc::clone(&shared),
+            inactivity_secs,
+        );
+
+        let mut f = std::fs::File::create(&traj_path).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"compaction","seq":1,"generation":1,"before_messages":40,"after_messages":7,"summary_chars":1500}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"tool.completed","seq":2,"tool_seq":0,"tool_name":"edit","args_chars":500,"result_chars":100}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        let before_reset = Instant::now();
+        state.poll_and_emit();
+
+        let new_deadline = *shared.lock().unwrap();
+        let expected_min =
+            before_reset + Duration::from_secs(inactivity_secs) - Duration::from_millis(50);
+        assert!(
+            new_deadline >= expected_min,
+            "deadline must reflect the latest reset, not stale to an earlier event"
         );
     }
 
