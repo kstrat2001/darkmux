@@ -106,6 +106,24 @@ const DEFAULT_REASONING_LOOP_TEMPLATE: &str =
      Commit to a different approach. If no productive next step is \
      available, stop and summarize what you have so the user can review.";
 
+/// (#479) Default template for the per-turn-cap-approach signal —
+/// fires when the model hits `MAX_TOKENS_PER_CALL` ({cap} completion
+/// tokens) in a single turn AND at least one well-formed tool call
+/// survived the truncation. The runtime salvages the tool call(s)
+/// and routes the dispatch through the standard tool-call path; this
+/// nudge tells the model what just happened and how to avoid it.
+///
+/// Beat 55 Run 1 surfaced the case: 31,516 chars of reasoning in one
+/// turn exhausted the 10,000-token per-call cap with one well-formed
+/// tool call truncated mid-stream. Pre-#479 the runtime bailed with
+/// `result: error` and threw the salvageable tool call away.
+const DEFAULT_PER_TURN_CAP_APPROACH_TEMPLATE: &str =
+    "[darkmux-runtime] You hit the per-turn token cap ({completion_tokens}/{cap}) \
+     with truncated content but a well-formed tool call survived. The tool \
+     call is being dispatched. Be more concise next turn — lengthy reasoning \
+     before each tool call eats the per-turn budget. If the work needs more \
+     space, break it into smaller turns.";
+
 /// (#466) Default template for the inactivity-approach signal —
 /// fires when the dispatch has gone `{elapsed}`s without a proof-of-
 /// work signal (compaction or tool.completed) and is approaching the
@@ -217,6 +235,7 @@ impl FeedbackInjector {
                 "test_cadence_drift" => DEFAULT_TEST_CADENCE_DRIFT_TEMPLATE,
                 "inactivity_approach" => DEFAULT_INACTIVITY_APPROACH_TEMPLATE,
                 "reasoning_loop" => DEFAULT_REASONING_LOOP_TEMPLATE,
+                "per_turn_cap_approach" => DEFAULT_PER_TURN_CAP_APPROACH_TEMPLATE,
                 _ => "",
             })
     }
@@ -319,6 +338,27 @@ impl FeedbackInjector {
             .replace("{window_size}", &window_size.to_string());
         self.pending.push(message);
         self.pending_kinds.push("reasoning_loop");
+    }
+
+    /// (#479) Queue a per-turn-cap-approach nudge. Called by the loop
+    /// runner when the model hit `MAX_TOKENS_PER_CALL` on a turn AND
+    /// at least one well-formed tool call survived the truncation.
+    /// The runtime salvages the tool call(s); this nudge tells the
+    /// model what happened so it can adjust pacing.
+    ///
+    /// Different from the empty-content + no-tool-calls stall (PR
+    /// #441 / `STALL_NUDGE_MESSAGE`) — that case has nothing to
+    /// salvage; this case has at least one tool call surviving.
+    pub fn queue_per_turn_cap_approach(&mut self, completion_tokens: u32, cap: u32) {
+        if !self.enabled {
+            return;
+        }
+        let template = self.template_for("per_turn_cap_approach");
+        let message = template
+            .replace("{completion_tokens}", &completion_tokens.to_string())
+            .replace("{cap}", &cap.to_string());
+        self.pending.push(message);
+        self.pending_kinds.push("per_turn_cap_approach");
     }
 
     /// (#466) Queue an inactivity-approach soft warning. Called by
@@ -665,6 +705,67 @@ mod tests {
         let msgs = f.drain();
         let content = msgs[0].content.as_ref().expect("system message has content");
         assert!(content.contains("3/10"), "{content}");
+        assert!(content.starts_with("[darkmux-runtime] Override:"), "{content}");
+    }
+
+    // ─── (#479) per-turn-cap-approach salvage signal ────────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn per_turn_cap_message_includes_tokens_and_cap() {
+        std::env::remove_var("DARKMUX_FEEDBACK_INJECTION");
+        let mut f = FeedbackInjector::new();
+        f.queue_per_turn_cap_approach(10000, 10000);
+        let msgs = f.drain();
+        let content = msgs[0].content.as_ref().expect("system message has content");
+        assert!(content.contains("10000/10000"), "must name tokens/cap: {content}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn per_turn_cap_message_has_runtime_prefix() {
+        std::env::remove_var("DARKMUX_FEEDBACK_INJECTION");
+        let mut f = FeedbackInjector::new();
+        f.queue_per_turn_cap_approach(10000, 10000);
+        let msgs = f.drain();
+        let content = msgs[0].content.as_ref().expect("system message has content");
+        assert!(content.starts_with("[darkmux-runtime]"), "{content}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn per_turn_cap_drain_kinds_discriminates_signal() {
+        std::env::remove_var("DARKMUX_FEEDBACK_INJECTION");
+        let mut f = FeedbackInjector::new();
+        f.queue_per_turn_cap_approach(10000, 10000);
+        let _ = f.drain();
+        assert_eq!(f.last_drained_kinds(), &["per_turn_cap_approach"]);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn per_turn_cap_is_noop_when_disabled_via_env_var() {
+        std::env::set_var("DARKMUX_FEEDBACK_INJECTION", "0");
+        let mut f = FeedbackInjector::new();
+        f.queue_per_turn_cap_approach(10000, 10000);
+        assert_eq!(f.pending_count(), 0);
+        std::env::remove_var("DARKMUX_FEEDBACK_INJECTION");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn per_turn_cap_per_role_override_substitutes_both_placeholders() {
+        std::env::remove_var("DARKMUX_FEEDBACK_INJECTION");
+        let mut templates = BTreeMap::new();
+        templates.insert(
+            "per_turn_cap_approach".to_string(),
+            "[darkmux-runtime] Override: {completion_tokens}/{cap} cap hit. Be concise.".to_string(),
+        );
+        let mut f = FeedbackInjector::with_templates(templates);
+        f.queue_per_turn_cap_approach(9999, 10000);
+        let msgs = f.drain();
+        let content = msgs[0].content.as_ref().expect("system message has content");
+        assert!(content.contains("9999/10000"), "{content}");
         assert!(content.starts_with("[darkmux-runtime] Override:"), "{content}");
     }
 
