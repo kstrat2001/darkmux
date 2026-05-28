@@ -274,6 +274,30 @@ impl Trajectory {
         }));
     }
 
+    /// dispatch.per_turn_cap.salvaged — fires when the runtime
+    /// salvages tool call(s) on a `finish_reason=length` turn where
+    /// `completion_tokens` hit `MAX_TOKENS_PER_CALL` but the tool
+    /// call args were well-formed JSON. The truncated content is
+    /// discarded; the tool call is dispatched as if `finish_reason`
+    /// had been `tool_calls`. Companion to the feedback nudge so the
+    /// model knows what happened. (#479)
+    pub fn append_per_turn_cap_salvaged(
+        &mut self,
+        seq: u32,
+        completion_tokens: u32,
+        cap: u32,
+        salvaged_tool_calls: usize,
+    ) {
+        self.write_event(&serde_json::json!({
+            "type": "dispatch.per_turn_cap.salvaged",
+            "seq": seq,
+            "ts": unix_ms(),
+            "completion_tokens": completion_tokens,
+            "cap": cap,
+            "salvaged_tool_calls": salvaged_tool_calls,
+        }));
+    }
+
     /// dispatch.reasoning_loop.suspected — fires when the runtime's
     /// reasoning-loop detector (#461) flags that the same normalized
     /// reasoning content has appeared `count` times in a sliding window
