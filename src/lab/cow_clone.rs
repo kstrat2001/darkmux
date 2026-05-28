@@ -53,7 +53,15 @@ pub fn cow_clone_dir(src: &Path, dst: &Path) -> Result<()> {
         }
     }
 
+    // Shell-out security: `Command::new("cp")` does NOT invoke a shell;
+    // args are passed as a vec, so paths containing spaces / metachars
+    // are safe (no metacharacter interpretation). The first failure's
+    // error is preserved across fallback attempts so operator debugging
+    // can see WHICH attempt failed first (typically the most precise
+    // signal — e.g., clonefile-specific errors lost if only the
+    // fallback's error is surfaced).
     let attempts = cow_attempts();
+    let mut first_err: Option<String> = None;
     let mut last_err: Option<String> = None;
     for attempt in &attempts {
         let mut cmd = Command::new("cp");
@@ -65,24 +73,33 @@ pub fn cow_clone_dir(src: &Path, dst: &Path) -> Result<()> {
         match cmd.output() {
             Ok(out) if out.status.success() => return Ok(()),
             Ok(out) => {
-                last_err = Some(format!(
+                let msg = format!(
                     "cp {:?} returned status {}: {}",
                     attempt,
                     out.status.code().unwrap_or(-1),
                     String::from_utf8_lossy(&out.stderr).trim()
-                ));
+                );
+                if first_err.is_none() {
+                    first_err = Some(msg.clone());
+                }
+                last_err = Some(msg);
                 // Clean up partial dst before retrying with the next attempt.
                 let _ = std::fs::remove_dir_all(dst);
             }
             Err(e) => {
-                last_err = Some(format!("cp {:?} failed to spawn: {}", attempt, e));
+                let msg = format!("cp {:?} failed to spawn: {}", attempt, e);
+                if first_err.is_none() {
+                    first_err = Some(msg.clone());
+                }
+                last_err = Some(msg);
             }
         }
     }
     Err(anyhow!(
-        "all cp attempts failed for {} → {}: {}",
+        "all cp attempts failed for {} → {}:\n  first attempt: {}\n  last attempt:  {}",
         src.display(),
         dst.display(),
+        first_err.unwrap_or_else(|| "no attempts ran".into()),
         last_err.unwrap_or_else(|| "no attempts ran".into())
     ))
     .context("cow_clone_dir")
