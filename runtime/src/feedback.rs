@@ -90,11 +90,14 @@ impl FeedbackInjector {
     /// when the cycle detector fires. The message will be injected
     /// into the model's next-turn prompt as a system-role message.
     ///
-    /// **Step-1 template is terse on purpose** — one template serves
-    /// every role until Step 2 ships per-role customization. Admin
-    /// agents respond better to imperative + short; specialists can
-    /// handle nuance. Step 2's per-role templates will let specialist
-    /// roles re-add explanatory framing.
+    /// Wording uses imperative verbs and concrete nouns ("regroup
+    /// and change the strategy") rather than colloquial phrases
+    /// ("try a different angle"). Words with ambiguous interpretation
+    /// in technical contexts (angle, approach, lens) risk being read
+    /// as domain references rather than figurative directives.
+    ///
+    /// Step-1 template is terse on purpose — one template serves
+    /// every role until Step 2 ships per-role customization.
     pub fn queue_cycle_suspected(
         &mut self,
         tool_name: &str,
@@ -106,14 +109,22 @@ impl FeedbackInjector {
         }
         self.pending.push(format!(
             "[darkmux-runtime] You've called `{tool_name}` {count} times in \
-             {window_size} turns with the same arguments. Try a different \
-             angle or stop with a summary."
+             {window_size} turns with the same arguments. Regroup and \
+             change the strategy. If no productive next step is available, \
+             stop and summarize what you have so the operator can review."
         ));
     }
 
     /// Queue a tool-failure-cascade feedback message. Called when the
     /// failure-rate detector fires (e.g., 3 consecutive failures of
     /// the same tool).
+    ///
+    /// **Wording — directive and literal** (same doctrine as the
+    /// cycle template). Imperative verbs ("re-read", "change",
+    /// "stop") and concrete next actions. Beat 51 observed an
+    /// `edit`-cascade where the operator-stale `old_string` was
+    /// the root cause; calling out "re-read affected files" first
+    /// targets that common case before listing the broader fallbacks.
     pub fn queue_tool_failure_cascade(
         &mut self,
         tool_name: &str,
@@ -124,9 +135,10 @@ impl FeedbackInjector {
         }
         self.pending.push(format!(
             "[darkmux-runtime] `{tool_name}` has failed {consecutive_failures} \
-             times in a row. The same call pattern won't suddenly succeed — \
-             either change your inputs, switch to a different tool, or stop \
-             with a summary of what you have so the operator can investigate."
+             times in a row with the same call pattern. Re-read the affected \
+             files or state, then change the inputs. If the tool itself is \
+             wrong for the next step, switch tools. If none of those apply, \
+             stop and summarize what you have so the operator can review."
         ));
     }
 
