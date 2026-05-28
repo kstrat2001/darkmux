@@ -267,6 +267,12 @@ pub fn run(
     // dispatch never sees the warning, while a stuck or stalling
     // one gets a graceful wrap-up chance before the 100% hard kill.
     //
+    // **Wedged-LMStudio = host-only territory.** When the model is
+    // mid-stream in an LMStudio call, the `loop {}` cannot iterate,
+    // so the soft check below never runs. The host's hard kill at
+    // 100% is the safety net for that case. Soft is best-effort
+    // between-turn telemetry; hard is the unconditional kill.
+    //
     // - `INACTIVITY_SOFT_THRESHOLD_RATIO` (0.75): fires at 75% of
     //   the inactivity budget. Operator-visible via the runtime
     //   stderr; queued into the feedback injector for the model.

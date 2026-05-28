@@ -611,6 +611,38 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn inactivity_approach_is_noop_when_disabled_via_env_var() {
+        // Per-signal invariant: every queue_* must respect the
+        // operator's master disable. Documented at PR #473 review.
+        std::env::set_var("DARKMUX_FEEDBACK_INJECTION", "0");
+        let mut f = FeedbackInjector::new();
+        f.queue_inactivity_approach(450, 600);
+        assert_eq!(f.pending_count(), 0);
+        let msgs = f.drain();
+        assert!(msgs.is_empty());
+        std::env::remove_var("DARKMUX_FEEDBACK_INJECTION");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn inactivity_approach_two_queues_without_drain_both_land() {
+        // FeedbackInjector is permissive by design — once-per-window
+        // edge-trigger enforcement is the loop runner's job, not the
+        // injector's. This test documents the contract: if the loop
+        // runner ever fails to set its edge-trigger flag and calls
+        // queue twice, BOTH queue. The model would see two stacked
+        // warnings, which is recoverable but noisy.
+        std::env::remove_var("DARKMUX_FEEDBACK_INJECTION");
+        let mut f = FeedbackInjector::new();
+        f.queue_inactivity_approach(450, 600);
+        f.queue_inactivity_approach(460, 600);
+        assert_eq!(f.pending_count(), 2);
+        let msgs = f.drain();
+        assert_eq!(msgs.len(), 2);
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn inactivity_approach_per_role_override_substitutes_both_placeholders() {
         std::env::remove_var("DARKMUX_FEEDBACK_INJECTION");
         let mut templates = BTreeMap::new();
