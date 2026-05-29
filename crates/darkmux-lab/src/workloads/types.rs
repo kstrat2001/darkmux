@@ -5,7 +5,7 @@
 //! mean for each kind of workload (prompt-only, coding-task, web-research,
 //! document-analysis, creative-writing, etc.).
 
-use crate::types::Profile;
+use darkmux_types::Profile;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -244,7 +244,7 @@ pub trait WorkloadProvider: Send + Sync {
         sandbox_dir: &Path,
         profile: &Profile,
         profile_name: &str,
-        runtime: crate::crew::dispatch::Runtime,
+        runtime: darkmux_crew::dispatch::Runtime,
         runtime_cmd: &str,
     ) -> Result<RunResult>;
     fn inspect(&self, loaded: &LoadedWorkload, run_dir: &Path) -> Result<InspectionReport>;

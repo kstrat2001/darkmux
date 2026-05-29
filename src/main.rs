@@ -32,12 +32,14 @@ pub use darkmux_hardware as hardware;
 // crate::heuristics::* resolving for recommendations/optimize/doctor.
 pub use darkmux_heuristics as heuristics;
 mod init;
-mod lab;
+// #515 — lab harness extracted (lab + workloads + providers). Re-exports keep
+// crate::{lab,workloads,providers}::* resolving for main + notebook.
+pub use darkmux_lab::lab;
 mod migrate;
 mod mission_propose;
 mod notebook;
 mod optimize;
-mod providers;
+pub use darkmux_lab::providers;
 // #515 — recommendation registry extracted (deps hardware/heuristics/types,
 // all crates). Re-export keeps crate::recommendations::* resolving for doctor.
 pub use darkmux_recommendations as recommendations;
@@ -59,7 +61,7 @@ pub use darkmux_types as types;
 // so crew can use it without a binary-resident edge). Re-export keeps
 // crate::workdir::* resolving for fleet + other binary modules.
 pub use darkmux_types::workdir;
-mod workloads;
+pub use darkmux_lab::workloads;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 

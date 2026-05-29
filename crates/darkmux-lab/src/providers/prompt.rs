@@ -3,7 +3,7 @@
 //!
 //! Dispatches via the active runtime's CLI (default: `openclaw agent`).
 
-use crate::types::Profile;
+use darkmux_types::Profile;
 use crate::workloads::types::{
     InspectionReport, LoadedWorkload, RunResult, VerifyOutcome, WorkloadProvider,
 };
@@ -39,7 +39,7 @@ impl WorkloadProvider for PromptProvider {
         _sandbox_dir: &Path,
         profile: &Profile,
         profile_name: &str,
-        runtime: crate::crew::dispatch::Runtime,
+        runtime: darkmux_crew::dispatch::Runtime,
         runtime_cmd: &str,
     ) -> Result<RunResult> {
         let prompt = resolve_prompt(loaded)?;
@@ -55,10 +55,10 @@ impl WorkloadProvider for PromptProvider {
 
         let started = std::time::Instant::now();
         let (stdout, stderr, ok) = match runtime {
-            crate::crew::dispatch::Runtime::Internal => {
+            darkmux_crew::dispatch::Runtime::Internal => {
                 dispatch_via_internal(&role, &prompt, &session_id)?
             }
-            crate::crew::dispatch::Runtime::Openclaw => {
+            darkmux_crew::dispatch::Runtime::Openclaw => {
                 dispatch_via_openclaw(runtime_cmd, &role, &prompt, &session_id)?
             }
         };
@@ -165,7 +165,7 @@ fn dispatch_via_internal(
     prompt: &str,
     session_id: &str,
 ) -> Result<(String, String, bool)> {
-    use crate::crew::dispatch::{dispatch, DispatchOpts, Runtime};
+    use darkmux_crew::dispatch::{dispatch, DispatchOpts, Runtime};
     let opts = DispatchOpts {
         role_id: role_id.to_string(),
         message: prompt.to_string(),
@@ -185,7 +185,7 @@ fn dispatch_via_internal(
         // (single-shot dispatches); leaving compaction at runtime
         // defaults is fine. If future prompt workloads grow multi-
         // turn, derive from profile like coding_task does.
-        compaction: crate::crew::dispatch::CompactionDispatchArgs::default(),
+        compaction: darkmux_crew::dispatch::CompactionDispatchArgs::default(),
     };
     let result = dispatch(opts).context("internal-runtime dispatch via lab harness")?;
     Ok((result.stdout, result.stderr, result.exit_code == 0))

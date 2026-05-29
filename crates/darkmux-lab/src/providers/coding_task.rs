@@ -6,7 +6,7 @@
 //! Inspect: parse trajectory, identify compactions, classify mode.
 
 use crate::providers::prompt::{extract_reply_text, run_verify};
-use crate::types::Profile;
+use darkmux_types::Profile;
 use crate::workloads::types::{
     InspectionReport, LoadedWorkload, RunMode, RunResult, WorkloadProvider,
 };
@@ -110,7 +110,7 @@ impl WorkloadProvider for CodingTaskProvider {
         //    (unknown id) so the existing dispatch path produces its
         //    own canonical "role not found" error without double-failing.
         let role_id = pick_role(loaded);
-        if let Ok(roles) = crate::crew::loader::load_roles() {
+        if let Ok(roles) = darkmux_crew::loader::load_roles() {
             if let Some(role) = roles.iter().find(|r| r.id == role_id) {
                 if !role_can_modify_files(&role.tool_palette) {
                     bail!(
@@ -195,7 +195,7 @@ impl WorkloadProvider for CodingTaskProvider {
         sandbox_dir: &Path,
         profile: &Profile,
         profile_name: &str,
-        runtime: crate::crew::dispatch::Runtime,
+        runtime: darkmux_crew::dispatch::Runtime,
         runtime_cmd: &str,
     ) -> Result<RunResult> {
         // (#365) Warn when the requested profile's primary model doesn't
@@ -215,10 +215,10 @@ impl WorkloadProvider for CodingTaskProvider {
         //     inside Docker (#337 root cause).
         let raw_prompt = resolve_prompt(loaded)?;
         let prompt = match runtime {
-            crate::crew::dispatch::Runtime::Internal => {
+            darkmux_crew::dispatch::Runtime::Internal => {
                 expand_placeholders_with(&raw_prompt, "/workspace")
             }
-            crate::crew::dispatch::Runtime::Openclaw => {
+            darkmux_crew::dispatch::Runtime::Openclaw => {
                 expand_placeholders(&raw_prompt, sandbox_dir)
             }
         };
@@ -250,7 +250,7 @@ impl WorkloadProvider for CodingTaskProvider {
 
         let started = std::time::Instant::now();
         let (stdout, stderr, ok) = match runtime {
-            crate::crew::dispatch::Runtime::Internal => {
+            darkmux_crew::dispatch::Runtime::Internal => {
                 // (#368) Derive compaction config from the active
                 // profile so the runtime honors operator's
                 // profile.runtime.compaction.* without env-var
@@ -260,7 +260,7 @@ impl WorkloadProvider for CodingTaskProvider {
                 // dispatch_via_internal where the role manifest is
                 // already loaded — single lookup point.
                 let compaction =
-                    crate::crew::dispatch::CompactionDispatchArgs::from_profile(profile);
+                    darkmux_crew::dispatch::CompactionDispatchArgs::from_profile(profile);
                 // Pass sandbox_dir as --workdir so the runtime mounts
                 // it at /workspace, matching the placeholder
                 // substitution above (#337 fix).
@@ -272,7 +272,7 @@ impl WorkloadProvider for CodingTaskProvider {
                     compaction,
                 )?
             }
-            crate::crew::dispatch::Runtime::Openclaw => {
+            darkmux_crew::dispatch::Runtime::Openclaw => {
                 dispatch_via_openclaw(runtime_cmd, &role, &prompt, &session_id)?
             }
         };
@@ -294,7 +294,7 @@ impl WorkloadProvider for CodingTaskProvider {
         // historical run.
         let mut trajectory_path: Option<PathBuf> = None;
         match runtime {
-            crate::crew::dispatch::Runtime::Internal => {
+            darkmux_crew::dispatch::Runtime::Internal => {
                 let runtime_dir = sandbox_dir.join(".darkmux-runtime");
                 // `src.exists()` gate is intentional: a #363-timeout
                 // dispatch may have written partial trajectory but no
@@ -318,7 +318,7 @@ impl WorkloadProvider for CodingTaskProvider {
                     }
                 }
             }
-            crate::crew::dispatch::Runtime::Openclaw => {
+            darkmux_crew::dispatch::Runtime::Openclaw => {
                 // Openclaw writes per-session trajectory under
                 // `~/.openclaw/agents/<agent>/sessions/<session-id>.trajectory.jsonl`.
                 // Best-effort lookup via guess_trajectory_path.
@@ -637,7 +637,7 @@ fn sandbox_is_empty(path: &Path) -> bool {
 /// bail at setup time with an operator-actionable hint than to dispatch
 /// against a model that will inevitably "describe the fix without
 /// executing it" because it has no tools for execution.
-fn role_can_modify_files(palette: &crate::crew::types::ToolPalette) -> bool {
+fn role_can_modify_files(palette: &darkmux_crew::types::ToolPalette) -> bool {
     let allows = |name: &str| {
         palette.allow.iter().any(|a| a == name)
             && !palette.deny.iter().any(|d| d == name)
@@ -730,9 +730,9 @@ fn dispatch_via_internal(
     prompt: &str,
     session_id: &str,
     workdir: Option<PathBuf>,
-    compaction: crate::crew::dispatch::CompactionDispatchArgs,
+    compaction: darkmux_crew::dispatch::CompactionDispatchArgs,
 ) -> Result<(String, String, bool)> {
-    use crate::crew::dispatch::{dispatch, DispatchOpts, Runtime};
+    use darkmux_crew::dispatch::{dispatch, DispatchOpts, Runtime};
     let opts = DispatchOpts {
         role_id: role_id.to_string(),
         message: prompt.to_string(),
@@ -1144,7 +1144,7 @@ struct InternalRuntimeMetrics {
 /// `darkmux swap recommended` loaded `balanced` but `darkmux lab run`
 /// tagged manifests with `default_profile=deep`.
 fn warn_on_profile_loaded_mismatch(profile: &Profile, profile_name: &str) {
-    let loaded = match crate::lms::list_loaded() {
+    let loaded = match darkmux_profiles::lms::list_loaded() {
         Ok(v) => v,
         Err(e) => {
             // Surface the failure mode distinctly from "match silent" —
@@ -1171,9 +1171,9 @@ fn warn_on_profile_loaded_mismatch(profile: &Profile, profile_name: &str) {
 fn profile_loaded_mismatch_message(
     profile: &Profile,
     profile_name: &str,
-    loaded: &[crate::types::LoadedModel],
+    loaded: &[darkmux_types::LoadedModel],
 ) -> Option<String> {
-    use crate::types::ModelRole;
+    use darkmux_types::ModelRole;
     let declared_primary = profile
         .models
         .iter()
@@ -1341,8 +1341,8 @@ mod tests {
 
     // ─── role_can_modify_files (workload-role contradiction validator) ──
 
-    fn palette(allow: &[&str], deny: &[&str]) -> crate::crew::types::ToolPalette {
-        crate::crew::types::ToolPalette {
+    fn palette(allow: &[&str], deny: &[&str]) -> darkmux_crew::types::ToolPalette {
+        darkmux_crew::types::ToolPalette {
             allow: allow.iter().map(|s| s.to_string()).collect(),
             deny: deny.iter().map(|s| s.to_string()).collect(),
         }
@@ -1917,8 +1917,8 @@ not-valid-json
 
     // ─── #365: profile-loaded mismatch detection ──────────────────
 
-    fn loaded(identifier: &str, model: &str, ctx: u64) -> crate::types::LoadedModel {
-        crate::types::LoadedModel {
+    fn loaded(identifier: &str, model: &str, ctx: u64) -> darkmux_types::LoadedModel {
+        darkmux_types::LoadedModel {
             identifier: identifier.to_string(),
             model: model.to_string(),
             status: "idle".to_string(),
@@ -1930,10 +1930,10 @@ not-valid-json
     fn profile_with_primary(model_id: &str, ctx: u32) -> Profile {
         Profile {
             description: None,
-            models: vec![crate::types::ProfileModel {
+            models: vec![darkmux_types::ProfileModel {
                 id: model_id.to_string(),
                 n_ctx: ctx,
-                role: crate::types::ModelRole::Primary,
+                role: darkmux_types::ModelRole::Primary,
                 identifier: None,
             }],
             runtime: None,
@@ -1988,10 +1988,10 @@ not-valid-json
         // can decide whether to surface a different message.
         let p = Profile {
             description: None,
-            models: vec![crate::types::ProfileModel {
+            models: vec![darkmux_types::ProfileModel {
                 id: "compactor-only".into(),
                 n_ctx: 32_000,
-                role: crate::types::ModelRole::Compactor,
+                role: darkmux_types::ModelRole::Compactor,
                 identifier: None,
             }],
             runtime: None,

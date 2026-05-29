@@ -59,7 +59,7 @@ pub fn tune(opts: &TuneOpts) -> Result<TuneReport> {
         quiet: false,
         // tune() runs the workload through the default runtime
         // (internal, post-Sprint-D).
-        runtime: crate::crew::dispatch::Runtime::Internal,
+        runtime: darkmux_crew::dispatch::Runtime::Internal,
         // runtime_cmd is unused by the internal path; "openclaw" for
         // codebase parity (Sprint-E).
         runtime_cmd: "openclaw".to_string(),

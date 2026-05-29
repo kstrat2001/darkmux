@@ -4,7 +4,7 @@ use crate::lab::cow_clone::cow_clone_dir;
 use crate::lab::instrument::InstrumentSidecar;
 use crate::lab::paths::{self, ResolveScope};
 use crate::lab::sandbox_hash::hash_sandbox_dir;
-use crate::profiles::{get_profile, load_registry};
+use darkmux_profiles::profiles::{get_profile, load_registry};
 use crate::workloads::load::{list_available, load};
 use crate::workloads::registry::with_provider;
 use anyhow::{anyhow, Context, Result};
@@ -22,7 +22,7 @@ pub struct RunOpts {
     /// `Runtime::Internal` (default) uses darkmux's container-bounded
     /// runtime; `Runtime::Openclaw` shells out to the openclaw CLI
     /// (legacy path).
-    pub runtime: crate::crew::dispatch::Runtime,
+    pub runtime: darkmux_crew::dispatch::Runtime,
     /// Executable path for the openclaw shell-out (Sprint-E
     /// replacement for the removed `DARKMUX_RUNTIME_CMD` env var).
     /// Defaults to `"openclaw"`; override via `--runtime-cmd <path>`
@@ -806,7 +806,7 @@ mod tests {
             runs: 1,
             config_path: Some(cfg.to_str().unwrap().into()),
             quiet: true,
-            runtime: crate::crew::dispatch::Runtime::Internal,
+            runtime: darkmux_crew::dispatch::Runtime::Internal,
             runtime_cmd: "openclaw".to_string(),
             instrument: false,
         })

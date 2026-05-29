@@ -34,7 +34,7 @@ pub fn characterize(opts: &CharacterizeOpts) -> Result<CharacterizeReport> {
         quiet: true,
         // characterize() is an internal admin operation — uses default
         // runtime (internal, post-Sprint-D).
-        runtime: crate::crew::dispatch::Runtime::Internal,
+        runtime: darkmux_crew::dispatch::Runtime::Internal,
         // runtime_cmd is unused by the internal path; "openclaw" for
         // codebase parity (Sprint-E).
         runtime_cmd: "openclaw".to_string(),
