@@ -3,11 +3,13 @@
 use crate::lab::cow_clone::cow_clone_dir;
 use crate::lab::instrument::InstrumentSidecar;
 use crate::lab::paths::{self, ResolveScope};
+use crate::lab::sandbox_hash::hash_sandbox_dir;
 use crate::profiles::{get_profile, load_registry};
 use crate::workloads::load::{list_available, load};
 use crate::workloads::registry::with_provider;
 use anyhow::{anyhow, Context, Result};
 use std::fs;
+use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub struct RunOpts {
@@ -108,6 +110,30 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
         // dir for the provider's setup() to populate. This is the
         // load-bearing isolation: subsequent runs get fresh sandboxes
         // and never observe prior runs' edits.
+        //
+        // (#489) Phase 2 — compute baseline_hash of the source fixture
+        // BEFORE the COW clone (so the hash reflects exactly what the
+        // model started from, not any pre-run mutations a future hook
+        // might inject). Best-effort: skip silently for self-contained
+        // workloads (no source yet) — Phase 2's resolver-based path
+        // (Phase 3) always has a source.
+        let baseline_hash: Option<String> = if source_sandbox_dir.exists() {
+            match hash_sandbox_dir(&source_sandbox_dir) {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    if !opts.quiet {
+                        eprintln!(
+                            "[lab] warn: baseline_hash for {} skipped: {e}",
+                            source_sandbox_dir.display()
+                        );
+                    }
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         if source_sandbox_dir.exists() {
             cow_clone_dir(&source_sandbox_dir, &per_run_sandbox_dir).with_context(|| {
                 format!(
@@ -158,6 +184,24 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
                 runtime_cmd,
             )
         })??;
+
+        // (#489) Phase 2 — enrich the provider-written manifest.json
+        // with fixture provenance (baseline_hash + source_fixture_path).
+        // Provider's manifest stays workload/runtime-focused; lab adds
+        // the cross-cutting fixture-integrity fields. Best-effort: a
+        // missing or malformed manifest is logged but doesn't fail the
+        // run (observability data, not correctness).
+        if let Err(e) = enrich_manifest_with_fixture_info(
+            &run_dir,
+            baseline_hash.as_deref(),
+            &source_sandbox_dir,
+        ) {
+            if !opts.quiet {
+                eprintln!(
+                    "[lab] warn: enriching manifest with fixture info skipped: {e}"
+                );
+            }
+        }
 
         // Stop the sidecar before recording outcome notes — that way any
         // last-second samples land on disk and the meta:end event is
@@ -214,6 +258,54 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
 pub fn lab_workloads() -> Vec<String> {
     let paths = paths::resolve(ResolveScope::Auto);
     list_available(Some(&paths.root))
+}
+
+/// (#489) Phase 2 — read the provider-written `<run_dir>/manifest.json`,
+/// merge in a `fixture` section carrying baseline_hash + source path,
+/// bump schemaVersion to 4, write it back. Provider stays unaware of
+/// fixture provenance; lab is the orchestration layer that knows what
+/// source fed the COW clone.
+///
+/// Best-effort: errors are returned (caller decides how loudly to log)
+/// but never abort the dispatch — fixture metadata is observability,
+/// not correctness.
+fn enrich_manifest_with_fixture_info(
+    run_dir: &Path,
+    baseline_hash: Option<&str>,
+    source_sandbox_dir: &Path,
+) -> Result<()> {
+    let manifest_path = run_dir.join("manifest.json");
+    if !manifest_path.exists() {
+        return Err(anyhow!("manifest.json not present at {}", manifest_path.display()));
+    }
+    let raw = fs::read_to_string(&manifest_path)
+        .with_context(|| format!("reading {}", manifest_path.display()))?;
+    let mut manifest: serde_json::Value = serde_json::from_str(&raw)
+        .with_context(|| format!("parsing {} as JSON", manifest_path.display()))?;
+
+    // The fixture object names what the model started from. Phase 3
+    // will add `name` + `satisfies` + `manifest_version` once the
+    // registry resolver is wired in.
+    let source_path_str = source_sandbox_dir
+        .canonicalize()
+        .unwrap_or_else(|_| source_sandbox_dir.to_path_buf())
+        .display()
+        .to_string();
+    let fixture = serde_json::json!({
+        "source_path": source_path_str,
+        "baseline_hash": baseline_hash,
+    });
+
+    if let Some(obj) = manifest.as_object_mut() {
+        obj.insert("fixture".to_string(), fixture);
+        obj.insert("schemaVersion".to_string(), serde_json::json!(4));
+    } else {
+        return Err(anyhow!("manifest is not a JSON object"));
+    }
+
+    fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)
+        .with_context(|| format!("writing {}", manifest_path.display()))?;
+    Ok(())
 }
 
 /// Resolve the sandbox directory for a workload. By default, lives under
@@ -322,6 +414,79 @@ mod tests {
             "baseline",
             "source sandbox got run 1's edit — COW invariant broken"
         );
+    }
+
+    /// (#489) Phase 2 — `enrich_manifest_with_fixture_info` adds the
+    /// `fixture` section to a provider-written manifest.json, bumps
+    /// schemaVersion to 4, preserves all existing fields.
+    #[test]
+    fn enrich_adds_fixture_section_to_existing_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run-1");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let source_sandbox = tmp.path().join("source-sandbox");
+        std::fs::create_dir_all(&source_sandbox).unwrap();
+        // Pretend the provider already wrote manifest.json with v3
+        // shape (Phase 1's shape: has final_hash but no fixture obj).
+        std::fs::write(
+            run_dir.join("manifest.json"),
+            r#"{
+                "schemaVersion": 3,
+                "runId": "test-run-1",
+                "workload": "demo",
+                "final_hash": "blake3:abc"
+            }"#,
+        )
+        .unwrap();
+
+        enrich_manifest_with_fixture_info(
+            &run_dir,
+            Some("blake3:source-hash"),
+            &source_sandbox,
+        )
+        .unwrap();
+
+        let raw = std::fs::read_to_string(run_dir.join("manifest.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        // Schema bumped to v4.
+        assert_eq!(parsed["schemaVersion"], 4);
+        // Existing fields preserved.
+        assert_eq!(parsed["runId"], "test-run-1");
+        assert_eq!(parsed["final_hash"], "blake3:abc");
+        // New fixture section.
+        assert_eq!(parsed["fixture"]["baseline_hash"], "blake3:source-hash");
+        assert!(parsed["fixture"]["source_path"].is_string());
+    }
+
+    /// `baseline_hash: None` is recorded as JSON null (operator-visible
+    /// "this run had no baseline" — distinct from missing key).
+    #[test]
+    fn enrich_records_null_when_baseline_hash_missing() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run-1");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let source_sandbox = tmp.path().join("source-sandbox");
+        std::fs::write(
+            run_dir.join("manifest.json"),
+            r#"{"schemaVersion": 3, "runId": "r1"}"#,
+        )
+        .unwrap();
+
+        enrich_manifest_with_fixture_info(&run_dir, None, &source_sandbox).unwrap();
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(run_dir.join("manifest.json")).unwrap())
+                .unwrap();
+        assert!(parsed["fixture"]["baseline_hash"].is_null());
+    }
+
+    #[test]
+    fn enrich_errors_on_missing_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run-1");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let err = enrich_manifest_with_fixture_info(&run_dir, None, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("manifest.json not present"), "got: {err}");
     }
 
     /// If the source sandbox doesn't exist (self-contained workload
