@@ -57,7 +57,7 @@ use anyhow::{anyhow, Result};
 /// profile has no Primary model configured. The caller decides
 /// whether to bail or fall back (`dispatch_internal::dispatch` falls
 /// back to probing for back-compat with a loud deprecation warning).
-pub fn select_model(role: &Role, profile: &Profile) -> Result<String> {
+pub(crate) fn select_model(role: &Role, profile: &Profile) -> Result<String> {
     // Phase 1: role unused (stub). Phase 2 reads
     // `role.capabilities(skill_lookup)` to score candidates.
     let _ = role;

@@ -28,7 +28,7 @@ pub const PROBE_TIMEOUT_MS: u64 = 300;
 /// `doctor::check_daemon_reachable` and is run on operator-explicit
 /// `darkmux doctor` invocation; this helper is for the every-dispatch
 /// pre-flight nudge where probe cost matters.
-pub fn is_daemon_reachable() -> bool {
+pub(crate) fn is_daemon_reachable() -> bool {
     let addr: std::net::SocketAddr = match DEFAULT_DAEMON_ADDR.parse() {
         Ok(a) => a,
         Err(_) => return false,

@@ -17,7 +17,7 @@ fn registry() -> &'static Registry {
 
 /// Register a provider. Errors if a provider with the same id is already
 /// registered (calling-order programming bug).
-pub fn register(provider: Box<dyn WorkloadProvider>) -> Result<()> {
+pub(crate) fn register(provider: Box<dyn WorkloadProvider>) -> Result<()> {
     let mut map = registry().lock().expect("registry poisoned");
     let id = provider.id().to_string();
     if map.contains_key(&id) {
@@ -31,7 +31,7 @@ pub fn register(provider: Box<dyn WorkloadProvider>) -> Result<()> {
 /// plus a closure-style invoker that holds the registry lock long enough to call
 /// the provider's methods. For darkmux's single-threaded CLI use, just return
 /// the box's reference under the lock.
-pub fn with_provider<R>(id: &str, f: impl FnOnce(&dyn WorkloadProvider) -> R) -> Result<R> {
+pub(crate) fn with_provider<R>(id: &str, f: impl FnOnce(&dyn WorkloadProvider) -> R) -> Result<R> {
     let map = registry().lock().expect("registry poisoned");
     let p = map.get(id).ok_or_else(|| {
         anyhow!(

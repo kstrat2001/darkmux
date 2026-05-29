@@ -43,13 +43,13 @@ const DEFAULT_EXCLUDES: &[&str] = &[
 /// exclusions. Output is the BLAKE3 hash prefixed with `blake3:`.
 ///
 /// Returns an error if `sandbox_dir` doesn't exist or can't be walked.
-pub fn hash_sandbox_dir(sandbox_dir: &Path) -> Result<String> {
+pub(crate) fn hash_sandbox_dir(sandbox_dir: &Path) -> Result<String> {
     hash_sandbox_dir_with_excludes(sandbox_dir, DEFAULT_EXCLUDES)
 }
 
 /// Same as `hash_sandbox_dir` but with a caller-supplied exclusion
 /// set. Used by Phase 2 (fixture manifest) and tests.
-pub fn hash_sandbox_dir_with_excludes(sandbox_dir: &Path, excludes: &[&str]) -> Result<String> {
+pub(crate) fn hash_sandbox_dir_with_excludes(sandbox_dir: &Path, excludes: &[&str]) -> Result<String> {
     if !sandbox_dir.exists() {
         return Err(anyhow::anyhow!(
             "sandbox dir does not exist: {}",

@@ -54,7 +54,7 @@ const BUILTIN_SKILLS: &[(&str, &str)] = &[
 /// fallback source when no user-side `<crew_root>/roles/<id>.md` exists.
 /// One entry per role advertised in `BUILTIN_ROLES`; the
 /// `crew_role_prompt_coverage` doctor check verifies this invariant.
-pub const BUILTIN_ROLE_PROMPTS: &[(&str, &str)] = &[
+pub(crate) const BUILTIN_ROLE_PROMPTS: &[(&str, &str)] = &[
     ("coder", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/coder.md"))),
     ("scribe", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/scribe.md"))),
     ("code-reviewer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/code-reviewer.md"))),
@@ -89,7 +89,7 @@ const AUTONOMOUS_DISPATCH_PREAMBLE: &str =
 /// per machine without recompiling. Lives in the crew root rather
 /// than per-role so the preamble stays uniform across the
 /// specialist set.
-pub fn load_autonomous_dispatch_preamble() -> String {
+pub(crate) fn load_autonomous_dispatch_preamble() -> String {
     let user_path = crew_root().join("AUTONOMOUS_DISPATCH_PREAMBLE.md");
     if user_path.is_file() {
         if let Ok(content) = fs::read_to_string(&user_path) {
@@ -128,7 +128,7 @@ const BUILTIN_SPRINTS: &[(&str, &str)] = &[];
 /// compatibility fallback to the legacy `<root>/crew/<subdir>/` layout.
 /// `crew_root()` is retained for callers that need the parent directory
 /// itself (e.g., daemon banner messages).
-pub fn crew_root() -> PathBuf {
+pub(crate) fn crew_root() -> PathBuf {
     std::env::var("DARKMUX_CREW_DIR")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -176,7 +176,7 @@ fn resolve_user_subdir(subdir: &str) -> PathBuf {
 
 /// User-side roles directory. Post-Beat-33: `<root>/roles/`. Falls back
 /// to `<root>/crew/roles/` for operators on the legacy layout.
-pub fn roles_dir() -> PathBuf {
+pub(crate) fn roles_dir() -> PathBuf {
     resolve_user_subdir("roles")
 }
 
@@ -195,21 +195,21 @@ pub fn sprints_dir() -> PathBuf {
 
 /// User-side crews directory (operator overrides). Post-Beat-33:
 /// `<root>/crews/`. Falls back to `<root>/crew/crews/` for legacy.
-pub fn crews_dir() -> PathBuf {
+pub(crate) fn crews_dir() -> PathBuf {
     resolve_user_subdir("crews")
 }
 
 /// User-side skills directory (operator overrides). Post-Beat-33:
 /// `<root>/skills/`. Falls back to `<root>/crew/skills/`
 /// for legacy.
-pub fn skills_dir() -> PathBuf {
+pub(crate) fn skills_dir() -> PathBuf {
     resolve_user_subdir("skills")
 }
 
 /// User-side role-model-pins.json path. Post-Beat-33:
 /// `<root>/role-model-pins.json`. Falls back to
 /// `<root>/crew/role-model-pins.json` for legacy.
-pub fn role_pins_path() -> PathBuf {
+pub(crate) fn role_pins_path() -> PathBuf {
     let root = user_state_root();
     let canonical = root.join("role-model-pins.json");
     if canonical.is_file() {
@@ -229,7 +229,7 @@ pub fn role_pins_path() -> PathBuf {
 /// Returns the prompt content if found, `None` if neither source has a
 /// prompt for this role (e.g., the JSON manifest exists but no `.md`
 /// prompt has been authored yet — Pair 2 of the bake-off covers those).
-pub fn load_role_prompt(role_id: &str) -> Option<String> {
+pub(crate) fn load_role_prompt(role_id: &str) -> Option<String> {
     let user_path = roles_dir().join(format!("{role_id}.md"));
     if user_path.is_file() {
         if let Ok(content) = fs::read_to_string(&user_path) {
@@ -343,7 +343,7 @@ pub fn load_roles() -> Result<Vec<Role>> {
 }
 
 /// Load all crews.
-pub fn load_crews() -> Result<Vec<Crew>> {
+pub(crate) fn load_crews() -> Result<Vec<Crew>> {
     let user_dir = crews_dir();
     Ok(read_all_json::<Crew>(&user_dir)?.into_iter().map(|(_, c)| c).collect())
 }
@@ -467,7 +467,7 @@ pub fn load_sprints() -> Result<Vec<Sprint>> {
 }
 
 /// Load all skills.
-pub fn load_skills() -> Result<Vec<Skill>> {
+pub(crate) fn load_skills() -> Result<Vec<Skill>> {
     let user_dir = skills_dir();
     let mut map: BTreeMap<String, Skill> = read_all_json::<Skill>(&user_dir)?
         .into_iter()
@@ -494,7 +494,7 @@ pub fn load_skills() -> Result<Vec<Skill>> {
 /// `paths` arg or document that it's only consulted for `prompt_path`'s
 /// absolute-path passthrough).
 #[allow(dead_code)]
-pub fn resolve_role_prompt_path(
+pub(crate) fn resolve_role_prompt_path(
     role: &Role,
     paths: &darkmux_types::paths::DarkmuxPaths,
 ) -> Option<PathBuf> {

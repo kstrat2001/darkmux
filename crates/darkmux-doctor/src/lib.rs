@@ -63,19 +63,19 @@ impl DoctorReport {
         worst
     }
 
-    pub fn pass_count(&self) -> usize {
+    pub(crate) fn pass_count(&self) -> usize {
         self.checks
             .iter()
             .filter(|c| c.status == Status::Pass)
             .count()
     }
-    pub fn warn_count(&self) -> usize {
+    pub(crate) fn warn_count(&self) -> usize {
         self.checks
             .iter()
             .filter(|c| c.status == Status::Warn)
             .count()
     }
-    pub fn fail_count(&self) -> usize {
+    pub(crate) fn fail_count(&self) -> usize {
         self.checks
             .iter()
             .filter(|c| c.status == Status::Fail)

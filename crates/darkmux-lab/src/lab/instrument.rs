@@ -31,7 +31,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// `{t, source, payload}` envelope. `t` is unix-ms; `source` names the
 /// telemetry stream; `payload` is source-specific JSON.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Sample {
+pub(crate) struct Sample {
     /// Unix milliseconds since epoch.
     pub t: u64,
     /// Milliseconds since the sidecar was started — convenient for plotting.
@@ -45,7 +45,7 @@ pub struct Sample {
 /// caller calls `stop()` explicitly so the dispatch can decide when to
 /// flush. `start()` writes a `meta` event with the sidecar config; `stop()`
 /// writes a `meta` close event.
-pub struct InstrumentSidecar {
+pub(crate) struct InstrumentSidecar {
     stop_flag: Arc<AtomicBool>,
     join_handle: Option<thread::JoinHandle<Result<()>>>,
     output_path: PathBuf,
@@ -56,7 +56,7 @@ impl InstrumentSidecar {
     /// Begin sampling at `cadence` until `stop()` is called. Output goes to
     /// `<run_dir>/instruments.jsonl`. Returns immediately; sampling runs on
     /// a background thread.
-    pub fn start(run_dir: &Path, cadence: Duration) -> Result<Self> {
+    pub(crate) fn start(run_dir: &Path, cadence: Duration) -> Result<Self> {
         let output_path = run_dir.join("instruments.jsonl");
 
         // Open and write a meta-start event so partial captures are still
@@ -127,7 +127,7 @@ impl InstrumentSidecar {
 
     /// Signal the sidecar to stop and wait for the background thread to
     /// finish flushing. Writes a `meta:end` event with elapsed time.
-    pub fn stop(mut self) -> Result<PathBuf> {
+    pub(crate) fn stop(mut self) -> Result<PathBuf> {
         self.stop_flag.store(true, Ordering::SeqCst);
         if let Some(h) = self.join_handle.take() {
             // Join can fail if the thread panicked; surface but don't lose

@@ -71,7 +71,7 @@ const SKIPPED_DIR_NAMES: &[&str] = &[
 /// the per-file size cap (we still track its existence + size, but
 /// don't hash it for cost reasons).
 #[derive(Debug, Clone, PartialEq)]
-pub struct FileSnapshot {
+pub(crate) struct FileSnapshot {
     pub size: u64,
     pub hash: Option<[u8; 32]>,
 }
@@ -80,13 +80,13 @@ pub struct FileSnapshot {
 /// path (relative to the snapshot root) so two snapshots taken with
 /// the same root produce comparable keys.
 #[derive(Debug, Clone, Default)]
-pub struct WorkspaceSnapshot {
+pub(crate) struct WorkspaceSnapshot {
     pub files: BTreeMap<PathBuf, FileSnapshot>,
 }
 
 /// Differential between two snapshots taken at the same root.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct WorkspaceDelta {
+pub(crate) struct WorkspaceDelta {
     pub added: Vec<PathBuf>,
     pub modified: Vec<PathBuf>,
     pub removed: Vec<PathBuf>,
@@ -97,7 +97,7 @@ pub struct WorkspaceDelta {
 }
 
 #[derive(Debug)]
-pub enum WalkError {
+pub(crate) enum WalkError {
     Overflow { count_at_overflow: usize },
     Io(std::io::Error),
 }
@@ -126,7 +126,7 @@ impl From<std::io::Error> for WalkError {
 /// Walk the workspace and produce a snapshot. Skipped dirs are not
 /// descended into. Files over the size cap have their size recorded
 /// but `hash` set to `None`.
-pub fn compute_snapshot(root: &Path) -> Result<WorkspaceSnapshot, WalkError> {
+pub(crate) fn compute_snapshot(root: &Path) -> Result<WorkspaceSnapshot, WalkError> {
     let mut snapshot = WorkspaceSnapshot::default();
     let mut count = 0usize;
     walk_dir(root, root, &mut snapshot, &mut count)?;
@@ -208,7 +208,7 @@ fn hash_file(path: &Path) -> Result<[u8; 32], WalkError> {
 /// Diff two snapshots taken at the same root. Order-stable (sorted
 /// via the underlying BTreeMap) so two runs on the same inputs
 /// produce byte-identical output.
-pub fn diff_snapshots(before: &WorkspaceSnapshot, after: &WorkspaceSnapshot) -> WorkspaceDelta {
+pub(crate) fn diff_snapshots(before: &WorkspaceSnapshot, after: &WorkspaceSnapshot) -> WorkspaceDelta {
     let mut delta = WorkspaceDelta::default();
     // Iterate the union of paths.
     for (path, after_entry) in &after.files {

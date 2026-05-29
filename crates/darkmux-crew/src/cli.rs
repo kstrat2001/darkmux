@@ -15,7 +15,7 @@ pub fn crew_show(crew_id: &str) -> Result<i32> {
 
 /// Internal entry for `crew list` taking an explicit index path. Tests use
 /// this to avoid querying the live `~/.darkmux/index.db`.
-pub fn crew_list_at(path: &Path) -> Result<i32> {
+pub(crate) fn crew_list_at(path: &Path) -> Result<i32> {
     if !path.exists() {
         bail!(
             "no index at {} — run `darkmux crew index rebuild` first",
@@ -73,7 +73,7 @@ pub fn crew_list_at(path: &Path) -> Result<i32> {
 }
 
 /// Internal entry for `crew show` taking an explicit index path.
-pub fn crew_show_at(path: &Path, crew_id: &str) -> Result<i32> {
+pub(crate) fn crew_show_at(path: &Path, crew_id: &str) -> Result<i32> {
     if !path.exists() {
         bail!(
             "no index at {} — run `darkmux crew index rebuild` first",

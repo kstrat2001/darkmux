@@ -334,7 +334,7 @@ fn enrich_manifest_with_fixture_info(
 /// The pre-#490 `DARKMUX_SANDBOX_<WORKLOAD-ID>` env-var path has been
 /// removed cleanly per the `no-compat-baggage-pre-1.0` doctrine. The
 /// fixture registry (Phase 2 + 4) is the only persistent binding.
-pub fn resolve_source_sandbox(
+pub(crate) fn resolve_source_sandbox(
     loaded: &crate::workloads::types::LoadedWorkload,
     paths: &paths::DarkmuxPaths,
 ) -> Result<std::path::PathBuf> {
