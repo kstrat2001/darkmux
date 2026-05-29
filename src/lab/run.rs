@@ -494,6 +494,142 @@ mod tests {
         assert_eq!(resolved, paths.sandboxes.join("demo"));
     }
 
+    /// (#490) Phase 3 — happy path: register a fixture whose
+    /// `.fixture.json::satisfies` matches a workload's
+    /// `requires_fixture`, resolve → returns the fixture's path.
+    /// Pins the load-bearing end-to-end resolution.
+    #[test]
+    #[serial_test::serial]
+    fn resolver_returns_registered_fixture_path_when_requires_matches() {
+        use crate::lab::registry::{default_registry_path, LabRegistry};
+        use crate::workloads::types::{
+            LoadedWorkload, WorkloadManifest, WorkloadSource, WorkloadSpec,
+        };
+        use std::collections::BTreeMap;
+        let tmp = TempDir::new().unwrap();
+        // Realistic darkmux home layout — registry lives at root.
+        let paths = paths::DarkmuxPaths {
+            root: tmp.path().to_path_buf(),
+            runs: tmp.path().join("runs"),
+            sandboxes: tmp.path().join("sandboxes"),
+            crew: tmp.path().join("crew"),
+            notebook: tmp.path().join("notebook"),
+            profiles: tmp.path().join("profiles.json"),
+            scope: paths::Scope::User,
+        };
+        // Create fixture dir with .fixture.json declaring satisfies.
+        let fixture_dir = tmp.path().join("my-fx");
+        std::fs::create_dir_all(&fixture_dir).unwrap();
+        std::fs::write(
+            fixture_dir.join(".fixture.json"),
+            r#"{"name": "my-fx", "satisfies": "demo-shape@1.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(fixture_dir.join("source.txt"), "baseline").unwrap();
+
+        // Register the fixture (mimics what dm lab register does).
+        let mut registry = LabRegistry::default();
+        registry.register(&fixture_dir, None, false).unwrap();
+        registry.save(&default_registry_path(&paths)).unwrap();
+
+        // Workload declares the matching requires_fixture.
+        let loaded = LoadedWorkload {
+            manifest: WorkloadManifest {
+                workload: WorkloadSpec {
+                    id: "demo".into(),
+                    provider: "coding-task".into(),
+                    description: None,
+                    role: Some("coder".into()),
+                    prompt: Some("do work".into()),
+                    prompt_file: None,
+                    sandbox_seed: None,
+                    setup_content: BTreeMap::new(),
+                    requires_external_sandbox: true,
+                    requires_fixture: Some("demo-shape@1.0".into()),
+                    verify: None,
+                    expected: None,
+                    extras: BTreeMap::new(),
+                },
+            },
+            manifest_path: tmp.path().join("workloads/demo.json"),
+            base_dir: tmp.path().to_path_buf(),
+            source: WorkloadSource::Builtin,
+        };
+
+        let resolved = resolve_source_sandbox(&loaded, &paths).unwrap();
+        // Expect the canonicalized fixture dir.
+        let expected = fixture_dir.canonicalize().unwrap();
+        assert_eq!(resolved, expected);
+    }
+
+    /// (#490, #496) Phase 3 ships LITERAL string-matching in
+    /// `find_satisfying`. Workloads that use semver operators like
+    /// `>=1.0` will NOT resolve against fixtures declaring `1.0`.
+    /// This test pins the gap until semver matching lands so the
+    /// behavior change becomes explicit if/when semver is added.
+    #[test]
+    #[serial_test::serial]
+    fn resolver_does_not_match_semver_operator_yet() {
+        use crate::lab::registry::{default_registry_path, LabRegistry};
+        use crate::workloads::types::{
+            LoadedWorkload, WorkloadManifest, WorkloadSource, WorkloadSpec,
+        };
+        use std::collections::BTreeMap;
+        let tmp = TempDir::new().unwrap();
+        let paths = paths::DarkmuxPaths {
+            root: tmp.path().to_path_buf(),
+            runs: tmp.path().join("runs"),
+            sandboxes: tmp.path().join("sandboxes"),
+            crew: tmp.path().join("crew"),
+            notebook: tmp.path().join("notebook"),
+            profiles: tmp.path().join("profiles.json"),
+            scope: paths::Scope::User,
+        };
+        let fixture_dir = tmp.path().join("my-fx");
+        std::fs::create_dir_all(&fixture_dir).unwrap();
+        std::fs::write(
+            fixture_dir.join(".fixture.json"),
+            r#"{"name": "my-fx", "satisfies": "shape@1.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(fixture_dir.join("s.txt"), "x").unwrap();
+        let mut registry = LabRegistry::default();
+        registry.register(&fixture_dir, None, false).unwrap();
+        registry.save(&default_registry_path(&paths)).unwrap();
+
+        // Workload uses semver operator — current resolver does
+        // literal compare, so this MUST NOT match. When semver
+        // lands, this test flips intentionally.
+        let loaded = LoadedWorkload {
+            manifest: WorkloadManifest {
+                workload: WorkloadSpec {
+                    id: "demo".into(),
+                    provider: "coding-task".into(),
+                    description: None,
+                    role: Some("coder".into()),
+                    prompt: Some("x".into()),
+                    prompt_file: None,
+                    sandbox_seed: None,
+                    setup_content: BTreeMap::new(),
+                    requires_external_sandbox: true,
+                    requires_fixture: Some("shape@>=1.0".into()),
+                    verify: None,
+                    expected: None,
+                    extras: BTreeMap::new(),
+                },
+            },
+            manifest_path: tmp.path().join("workloads/demo.json"),
+            base_dir: tmp.path().to_path_buf(),
+            source: WorkloadSource::Builtin,
+        };
+        let err = resolve_source_sandbox(&loaded, &paths).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("shape@>=1.0"),
+            "expected error to name the unsatisfied requirement: {msg}"
+        );
+    }
+
     /// (#490) Phase 3 — when `requires_fixture` is set, the resolver
     /// consults the lab registry. Missing registry / unsatisfied
     /// requirement → operator-actionable error pointing at the

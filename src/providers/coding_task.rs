@@ -162,20 +162,25 @@ impl WorkloadProvider for CodingTaskProvider {
                  This workload expects a pre-existing project (e.g. a Node repo with the source\n\
                  files the prompt references). Fix:\n\
                  \n\
-                   1. Register your existing project as a fixture (first create\n\
-                      <path>/.fixture.json declaring `name` + `satisfies`):\n\
+                   1. Create <path>/.fixture.json in your project dir with at minimum:\n\
+                        {{\"name\": \"<your-name>\", \"satisfies\": \"{}\"}}\n\
+                      The `satisfies` value MUST exactly match the workload's `requires_fixture`\n\
+                      (resolver does literal-string matching today; semver support tracked in #496).\n\
+                 \n\
+                   2. Register the project as a fixture:\n\
                         darkmux lab register <path-to-your-project>\n\
                  \n\
-                   2. Make sure the workload manifest declares what it needs:\n\
+                   3. Make sure the workload manifest declares what it needs:\n\
                         \"requires_fixture\": \"{}\"\n\
                  \n\
-                   3. Inspect what's registered:\n\
+                   4. Inspect what's registered:\n\
                         darkmux lab fixtures\n\
                  \n\
                  For a coding-task workload that runs out of the box (no external setup), try:\n\
                    darkmux lab run quick-coding",
                 loaded.manifest.workload.id,
                 sandbox_dir.display(),
+                requires_hint,
                 requires_hint,
             );
         }
