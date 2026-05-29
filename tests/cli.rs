@@ -237,12 +237,35 @@ fn lab_run_quick_q_from_clean_cwd_uses_embedded_workload() {
 
     let manifest_raw = fs::read_to_string(run_dir.join("manifest.json")).unwrap();
     let manifest: serde_json::Value = serde_json::from_str(&manifest_raw).unwrap();
-    assert_eq!(manifest["schemaVersion"].as_u64(), Some(2));
+    // (#487, #489) Phase 2 of the lab cluster: lab/run.rs's
+    // enrich_manifest_with_fixture_info adds the `fixture` section
+    // post-provider and bumps schemaVersion to 4. Pre-Phase-1 was v2;
+    // Phase 1 (coding-task only) was v3; Phase 2 brings v4 to ALL
+    // providers via the enrich step.
+    assert_eq!(manifest["schemaVersion"].as_u64(), Some(4));
     assert_eq!(manifest["workload"].as_str(), Some("quick-q"));
     assert_eq!(manifest["provider"].as_str(), Some("prompt"));
     assert_eq!(manifest["profile"].as_str(), Some("deep"));
     assert_eq!(manifest["runId"].as_str(), Some(run_id.as_str()));
     assert_eq!(manifest["ok"].as_bool(), Some(true));
+    // Phase 2 fixture section: baseline_hash is null for self-contained
+    // workloads (quick-q has no source sandbox); source_path is recorded
+    // either way (canonicalize-fallback per #496).
+    assert!(
+        manifest["fixture"].is_object(),
+        "expected fixture section, got: {}",
+        manifest["fixture"]
+    );
+    assert!(
+        manifest["fixture"]["baseline_hash"].is_null(),
+        "expected null baseline_hash for self-contained workload, got: {}",
+        manifest["fixture"]["baseline_hash"]
+    );
+    assert!(
+        manifest["fixture"]["source_path"].is_string(),
+        "expected string source_path, got: {}",
+        manifest["fixture"]["source_path"]
+    );
 }
 
 /// Sprint-E: `--runtime-cmd <path>` overrides the openclaw binary used
