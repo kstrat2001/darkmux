@@ -237,6 +237,19 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // (the gap that let D call `edit` despite code-reviewer denying it).
     let allowed_tools = compute_runtime_allowed_tools(&role.tool_palette);
 
+    // (#510) Validate the operator-provided `--workdir` BEFORE the model-
+    // selection step below. Workdir validation is a cheap, deterministic,
+    // network-free guard (symlink check + canonicalize + is_dir); model
+    // selection needs LMStudio. Validating first means a bad workdir
+    // (symlink escape, missing dir) fails fast with the right error
+    // instead of surfacing a confusing "model selection failed" when no
+    // model happens to be loaded. The canonical path is reused at
+    // workspace resolution (step 4) so we validate exactly once.
+    let validated_workdir = match opts.workdir.as_deref() {
+        Some(custom) => Some(darkmux_types::workdir::validate_workdir(custom)?),
+        None => None,
+    };
+
     // 2. Resolve the model. (#450, E14 refactor 1b) Phase-1 selection
     //    consults the active profile's Primary-role model via
     //    `select_model(role, profile)`. Phase 2+ extends this into
@@ -287,13 +300,12 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     //    after the container exits. That's half the point of replacing
     //    the openclaw workspace model (operator visibility into what
     //    the dispatch did).
-    let workspace = match opts.workdir.as_deref() {
-        Some(custom) => {
-            // Symlink-escape guard via the shared validator (#255 Wave-E.2).
-            // Same scope as #227 + #232 — symlink-only; `..`-traversal
-            // is operator-explicit and intentionally out of scope.
-            darkmux_types::workdir::validate_workdir(custom)?
-        }
+    let workspace = match validated_workdir {
+        // Already validated above (#510) — reuse the canonical path.
+        // Symlink-escape guard via the shared validator (#255 Wave-E.2);
+        // same scope as #227 + #232 — symlink-only, `..`-traversal is
+        // operator-explicit and intentionally out of scope.
+        Some(validated) => validated,
         None => {
             let auto = std::env::temp_dir().join(format!(
                 "darkmux-dispatch-{}-{unix_micros}",
