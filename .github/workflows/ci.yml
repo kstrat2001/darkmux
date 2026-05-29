@@ -3,6 +3,18 @@ name: CI
 # Runs on every pull request and on pushes to main. Fails the workflow
 # on ANY warning — see `RUSTFLAGS: "-D warnings"` and `cargo clippy -D warnings`
 # below. Tested locally via the same commands.
+#
+# Two performance notes (#523):
+#   * Caching is via Swatinem/rust-cache — it keys on the lockfile + rustc
+#     version, scopes per-job, and prunes the stale `target/` artifacts that
+#     made the old hand-rolled actions/cache grow slower over time.
+#   * The heavy build/test/lint steps are gated behind a paths-filter so a
+#     docs-only / viewer-only PR reports green in seconds instead of paying
+#     the full ~15-min Rust pipeline. We deliberately do NOT split this into
+#     per-crate test jobs: a change to a foundational crate (e.g. darkmux-flow)
+#     must still exercise its reverse-dependents, so any Rust change runs the
+#     full workspace build+test+clippy. The filter only distinguishes
+#     "Rust-relevant changed" from "nothing Rust-relevant changed".
 
 on:
   pull_request:
@@ -26,22 +38,32 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Decide whether this change touches anything that can affect the build,
+      # tests, or lints. `templates/**` is included because workload/role/skill
+      # assets are `include_str!`'d into the binary, so editing them changes
+      # compiled output and the tests that assert on it. The workflow file
+      # itself is included so CI changes always self-test.
+      - name: Detect Rust-relevant changes
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            rust:
+              - '**/*.rs'
+              - '**/Cargo.toml'
+              - '**/Cargo.lock'
+              - 'templates/**'
+              - '.github/workflows/ci.yml'
+
       - name: Install Rust stable toolchain
+        if: steps.filter.outputs.rust == 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
 
-      - name: Cache cargo registry + build
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          # The Cargo.lock hash determines the cache key — bumps invalidate it.
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+      - name: Cache cargo registry + build artifacts
+        if: steps.filter.outputs.rust == 'true'
+        uses: Swatinem/rust-cache@v2
 
       # Format check intentionally NOT enforced yet — the codebase has
       # accumulated style drift that would mask the more important
@@ -49,10 +71,17 @@ jobs:
       # re-enable here).
 
       - name: Build release (no warnings allowed)
+        if: steps.filter.outputs.rust == 'true'
         run: cargo build --release --all-targets
 
       - name: Test release
+        if: steps.filter.outputs.rust == 'true'
         run: cargo test --release
 
       - name: Clippy (all targets, no warnings allowed)
+        if: steps.filter.outputs.rust == 'true'
         run: cargo clippy --release --all-targets -- -D warnings
+
+      - name: No Rust-relevant changes — pipeline skipped
+        if: steps.filter.outputs.rust != 'true'
+        run: echo "No Rust / Cargo / template / workflow changes detected; build+test+lint skipped (reports green)."
