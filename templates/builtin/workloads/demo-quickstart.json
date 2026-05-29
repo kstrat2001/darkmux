@@ -1,0 +1,21 @@
+{
+  "_comment": "Phase 5 (#492) quickstart workload — exercises the full lab pipeline end-to-end against the built-in `demo-tiny-py` fixture. Operator does: `scripts/lab-init.sh` (registers built-in fixtures) → `darkmux lab run demo-quickstart` → verify the COW-clone + per-run sandbox + verify-command + manifest-with-baseline_hash all land correctly. No external setup required beyond `python3` being on PATH.",
+  "workload": {
+    "id": "demo-quickstart",
+    "provider": "coding-task",
+    "role": "coder",
+    "requiresExternalSandbox": true,
+    "requires_fixture": "tiny-python-suite@1.0",
+    "prompt": "TINY TEST GAP\n\nThe `parse_line()` function in ${SANDBOX_DIR}/src/parser.py handles\nstructured log lines of the form `<timestamp>  <LEVEL>  <message>`.\nIt requires 2+ spaces between fields and returns None for malformed\ninput.\n\nThe existing tests under ${SANDBOX_DIR}/tests/test_parser.py cover\nthe basic shapes (well-formed, blank, message-with-spaces, totally\nunparseable, single-space-fails). One canonical case is missing:\n\n  - A line that has the right shape but has an EMPTY message after\n    the second separator (e.g. `\"2026-05-29  INFO  \"` — two spaces,\n    then trailing whitespace). The parser returns None for this; add\n    one new test pinning that behavior.\n\nAdd exactly one new test method to the existing TestParseLine class.\nKeep it under 5 lines of test code. Run the test suite after editing\nto confirm it passes.\n\n## Constraints\n\n- Repo root: ${SANDBOX_DIR}. Use absolute paths.\n- Modify ONLY tests/test_parser.py — add one method.\n- Verify with: cd ${SANDBOX_DIR} && python3 -m unittest discover -s tests\n\n## Reply format\n\n- The test method you added (single code block)\n- Final unittest summary line (\"OK\" / counts)\n",
+    "verify": {
+      "command": "python3 -m unittest discover -s tests",
+      "cwd": "${SANDBOX_DIR}",
+      "must_contain": ["OK"],
+      "must_not_contain": ["FAILED"]
+    },
+    "expected": {
+      "fast_cluster_seconds": [15, 60],
+      "test_count_baseline": 5
+    }
+  }
+}
