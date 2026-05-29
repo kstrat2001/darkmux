@@ -51,9 +51,11 @@
     <h2>Crew: roles + dispatch</h2>
     <p>A <strong>role</strong> is a named local-AI capability — a manifest under <code>templates/builtin/roles/&lt;id&gt;.json</code> (or <code>~/.darkmux/roles/&lt;id&gt;.json</code> for operator overrides) paired with a system prompt at the same path with a <code>.md</code> extension. The manifest declares:</p>
     <ul>
-      <li><code>id</code>, <code>description</code>, <code>capabilities</code></li>
+      <li><code>id</code>, <code>description</code>, <code>skills</code> — the <code>skills</code> list names work-shape descriptors the role is good at (renamed from <code>capabilities</code> in <a href="https://github.com/kstrat2001/darkmux/issues/448">#448</a>; existing manifests must use the new key). Each skill in turn declares an intrinsic capability profile (<code>code</code>, <code>reasoning</code>, <code>instruction_following</code>, <code>agentic_tool_use</code>) that role-to-model selection will score against.</li>
       <li><code>tool_palette</code> — <code>allow</code> and <code>deny</code> lists of tools (read, exec, edit, etc.)</li>
       <li><code>escalation_contract</code> — what the role does when it can't solve the task (bail, retry-with-hint, hand-off-to)</li>
+      <li><code>role_family</code> (optional) — <code>specialist</code> (default) or <code>admin</code>; specialist roles get the autonomous-dispatch preamble injected ahead of their prompt (they can't ask questions mid-dispatch, so they escalate with a <code>BLOCKED:</code> line instead).</li>
+      <li><code>feedback_templates</code> (optional) — per-signal overrides for the runtime's model-facing nudges (cycle/loop/cascade/etc.); falls back to the built-in wording when unset.</li>
     </ul>
 
     <h3>Inspect roles</h3>
@@ -70,6 +72,10 @@ darkmux role show coder          <span class="comment"># full details for one ro
       <li>Streams the model's reasoning and tool calls via the in-house Rust loop; emits <code>dispatch.turn</code>, <code>dispatch.tool</code>, and <code>dispatch.reasoning</code> flow records as they happen.</li>
       <li>Emits a final <code>dispatch complete</code> or <code>dispatch error</code> record; optionally snapshots <code>--watch</code> paths to verify the role's SIGNOFF claims.</li>
     </ol>
+    <div class="callout">
+      <strong>Verification boundary.</strong>
+      <p style="margin: 8px 0 0;">The dispatch container is intentionally minimal — no project toolchains. The <code>coder</code>, <code>code-reviewer</code>, and <code>test-designer</code> roles are instructed (<a href="https://github.com/kstrat2001/darkmux/issues/398">#398</a>) <em>not</em> to install toolchains or run build/test/lint inside the container: their job ends at "the edit is in place + the tests are written," and they name the verification commands the frontier should run on the host afterward. So a role's report won't claim "tests passed" for commands it never ran — verification is the frontier orchestrator's step, by design.</p>
+    </div>
 
     <h4>Opting into openclaw</h4>
     <p>If you already have openclaw installed and prefer its dispatch path:</p>

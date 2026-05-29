@@ -62,7 +62,7 @@ There are four distinct files with overlapping but **non-identical** schemas. Mi
 
 | File | Path template | Authoritative for | NOT authoritative for |
 |---|---|---|---|
-| **Run manifest** | `~/.darkmux/runs/<run-id>/manifest.json` | host's view of the run: `runId`, `workload`, `profile`, `provider`, `sandbox`, `ok`, `durationMs`, `sessionId`, `schemaVersion` | per-turn metrics; final assistant text; tool calls |
+| **Run manifest** | `~/.darkmux/runs/<run-id>/manifest.json` | host's view of the run: `runId`, `workload`, `profile`, `provider`, `sandbox`, `ok`, `durationMs`, `sessionId`, `schemaVersion`. **schemaVersion 3+** adds `final_hash` (post-dispatch sandbox content hash, `blake3:<hex>`); **schemaVersion 4+** adds a `fixture` block (`source_path`, `baseline_hash`) for fixture-backed coding-task runs | per-turn metrics; final assistant text; tool calls |
 | **QA reply** | `~/.darkmux/runs/<run-id>/qa-reply.json` | runtime's JSON envelope: `final_assistant` (string), `metrics.{turns, prompt_tokens, completion_tokens, compactions, wall_ms, total_messages}`, `result` ("stop"/"max_turns"/"escalation_*"/"error"), `trajectory_path` | per-turn breakdown; tool calls; reasoning |
 | **Runtime metrics** | `<sandbox>/.darkmux-runtime/metrics.json` (sandbox path is in manifest.json's `.sandbox`) | aggregate totals using `total_prompt_tokens` / `total_completion_tokens` naming (DIFFERENT from qa-reply's nested `metrics.prompt_tokens`) | history; stale on watchdog-killed dispatches |
 | **Trajectory** | `<sandbox>/.darkmux-runtime/trajectory.jsonl` | event-by-event ground truth. JSONL — one event per line. Source for all derived analyses. | aggregates (derive them yourself) |
@@ -136,11 +136,42 @@ Carries FULL reasoning text — can be 5-10× the response size on hard problems
 { "type": "compaction", "generation": <int>, "ts": <unix_ms>, "before_messages": <int>, "after_messages": <int>, "summary_chars": <int> }
 ```
 
+### Runtime signal events (0+ per dispatch — heuristics + recovery)
+
+These are emitted by the runtime's struggle-detectors and recovery paths (landed 2026-05; see `runtime/src/loop_runner.rs`). Most are **edge-triggered** (fire once per threshold crossing, not once per turn) and most are **observability-only** — they don't change dispatch behavior, they record that a pattern was seen. They pair with `dispatch.feedback.injected` (the same signal delivered to the model as a nudge). When investigating a stuck or pathological run, grep these first.
+
+```
+{ "type": "dispatch.cycle.suspected", "seq": <turn>, "ts": <ms>, "tool_name": <str>, "canonical_args": <str>, "count": <int>, "window_size": <int> }
+  # same tool + canonicalized args seen `count` times in the last `window_size` (10) tool calls (#418)
+
+{ "type": "dispatch.reasoning_loop.suspected", "seq": <turn>, "ts": <ms>, "count": <int>, "window_size": <int> }
+  # same normalized reasoning text repeated `count` times in `window_size` (10) turns — sibling of cycle detector (#461)
+
+{ "type": "dispatch.tool.repeated_failure", "seq": <turn>, "ts": <ms>, "tool_name": <str>, "consecutive_failures": <int> }
+  # one tool failed `consecutive_failures` times in a row (resets on any success) (#419)
+
+{ "type": "dispatch.per_turn_cap.salvaged", "seq": <turn>, "ts": <ms>, "completion_tokens": <int>, "cap": <int>, "salvaged_tool_calls": <int> }
+  # turn hit MAX_TOKENS_PER_CALL (10000) on finish_reason=length but well-formed tool calls survived; truncated content discarded, calls dispatched anyway (#479)
+
+{ "type": "dispatch.intra_turn_stall.recovered", "seq": <turn>, "ts": <ms>, "completion_tokens": <int>|null, "recoveries_used": <int>, "recoveries_budget": <int> }
+  # finish_reason=length with no content AND no tool calls (runaway reasoning); useless turn dropped, nudge injected, retried. completion_tokens≈cap ⇒ per-call-cap stall; well below ⇒ context-overflow stall (#414)
+
+{ "type": "tool_call.promoted", "seq": <turn>, "ts": <ms>, "source": "content"|"reasoning", "format": "bracket"|"harmony"|"xml", "promoted_call_count": <int> }
+  # LMStudio didn't extract tool_calls; runtime recovered them from plain-text markup and rerouted to the tool path. Each one is a model wire-format failure the runtime caught (#406)
+
+{ "type": "dispatch.feedback.injected", "seq": <turn>, "ts": <ms>, "message_count": <int>, "signal_kinds": [<str>, …] }
+  # `message_count` synthetic [darkmux-runtime] system messages delivered to the next-turn prompt; `signal_kinds` names which signals (cycle_suspected, tool_failure_cascade, reasoning_loop, post_compaction, test_cadence_drift, inactivity_approach, per_turn_cap_approach). Disable globally with DARKMUX_FEEDBACK_INJECTION=0 (#454)
+```
+
+**Diagnostic use:** a high `tool_call.promoted` rate means the loaded model emits malformed tool-call wire format (consider a different model); repeated `dispatch.cycle.suspected` / `reasoning_loop.suspected` mean the model is stuck and burning budget; `intra_turn_stall.recovered` with `completion_tokens` ≈ 10000 confirms a per-call-cap runaway rather than genuine context overflow.
+
 ### `dispatch.complete` (1 per dispatch, last event — unless watchdog-killed)
 
 ```
 { "type": "dispatch.complete", "ts": <unix_ms>, "result": <str>, "wall_ms": <u128> }
 ```
+
+`result` discriminates terminal reason: `"stop"` (clean), `"max_turns"` (hit operator `--max-turns`), `"escalation_cumulative_tokens_exceeded"` (hit `--max-tokens`), `"escalation_intra_turn_stall_exhausted"` (stall budget exhausted), `"escalation_compaction_limit_reached"` (hit `bail_after_compactions`), `"error"`.
 
 ## Naming-convention traps — gotchas worth memorizing
 
@@ -257,6 +288,19 @@ done
 ```
 
 Beat 41/42 forensic methodology: track which slots stay populated vs empty across compactions to grade compactor capability.
+
+### Reproducibility hashes (fixture-backed coding-task runs)
+
+For runs whose workload declared `requires_fixture`, the manifest carries content hashes. Compare them across two runs of the same fixture to check reproducibility:
+
+```bash
+for r in <run-a> <run-b>; do
+  jq -c '{run: .runId, baseline: .fixture.baseline_hash, final: .final_hash}' \
+    ~/.darkmux/runs/$r/manifest.json
+done
+```
+
+Equal `baseline_hash` ⇒ both runs started from the same source state. Equal `final_hash` ⇒ both runs left the sandbox bitwise-identical (the strongest reproducibility signal). A `final_hash` of `null` means hashing was skipped (non-coding-task provider, or a best-effort failure logged at run time).
 
 ## Notes
 

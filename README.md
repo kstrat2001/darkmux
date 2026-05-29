@@ -239,6 +239,16 @@ export DARKMUX_OPENCLAW_CONFIG="$HOME/work/openclaw-staging/openclaw.json"
 
 This means: **darkmux's profile-multiplexing is runtime-agnostic** today; `crew dispatch` ships with a self-contained internal runtime so new users don't need an openclaw install to get going; the lab harness is *runtime-pluggable* via the env var. The empirical findings in the article series happened to be measured against OpenClaw; the routing thesis itself is independent.
 
+### Internal-runtime safety net + model-facing telemetry
+
+The internal runtime watches each dispatch for the failure modes that waste local-AI time, and surfaces what it sees both to the operator (in the trajectory) and to the model (as `[darkmux-runtime]` system-message nudges, the *feedback-injection* channel). All detectors are observability-first — they record and nudge before they ever bail.
+
+- **Struggle detectors** — repeated identical tool calls (*cycle detection*), the same idea re-reasoned in a loop (*reasoning-loop detection*), a tool failing several times in a row (*tool-failure cascade*), and editing one file repeatedly without ever verifying (*cadence drift*). Each writes a trajectory event and, by default, a model-facing nudge.
+- **Recovery paths** — well-formed tool calls are *salvaged* when a turn hits the per-call token cap mid-output; runaway "reasoning with no action" turns are dropped, nudged, and retried (*intra-turn stall recovery*); and tool calls the model emitted as plain text instead of structured JSON are *promoted* back to real tool calls.
+- **Budget + deadline** — a per-call cap bounds runaway emission; opt-in `--max-turns` / `--max-tokens` (env: `DARKMUX_RUNTIME_MAX_TURNS` / `DARKMUX_RUNTIME_MAX_TOKENS`) bound a whole dispatch; and an inactivity deadline (`DARKMUX_INACTIVITY_TIMEOUT_SECONDS`, default 600) fires a soft model-facing warning at 75% before the host hard-kills at 100%, resetting on any tool call or compaction.
+
+Roles can override the nudge wording per signal via a `feedback_templates` block on the role manifest; operators can disable injection entirely with `DARKMUX_FEEDBACK_INJECTION=0`. The trajectory event reference lives in the `darkmux-analyze-run` skill.
+
 ### Cross-machine notebook (multi-environment lab notes)
 
 If you run darkmux on more than one machine and want a single notebook that collates entries from all of them — for example, comparing wall-clock distributions across hardware tiers — point the notebook directory at an iCloud-synced (or otherwise shared) path:
@@ -321,7 +331,8 @@ The case for darkmux: **once you accept that static configs leave performance on
 **Shipped:**
 
 - ✅ Profile registry + `swap`/`status`/`profiles`/`scan` CLI
-- ✅ Lab subcommands (`run`/`inspect`/`compare`/`characterize`/`runs`), `WorkloadProvider` trait, embedded smoke workloads, `--instrument` sidecar sampler
+- ✅ Lab subcommands (`run`/`inspect`/`compare`/`characterize`/`tune`/`runs`), `WorkloadProvider` trait, embedded smoke workloads, `--instrument` sidecar sampler
+- ✅ Lab reproducibility (#487): per-run copy-on-write sandbox isolation (source never mutated), `baseline_hash` + `final_hash` content hashing in the run manifest, a fixture registry with `lab register`/`unregister`/`fixtures`/`doctor` verbs, workload `requires_fixture` resolution, and `scripts/lab-init.sh` + the built-in `demo-tiny-py` fixture
 - ✅ Notebook (`notebook draft`/`list`) — cross-machine via `DARKMUX_NOTEBOOK_DIR`
 - ✅ Agent-invocable skills bundle (12 skills including `/darkmux-bootstrap`)
 - ✅ Crew + Role + Mission + Sprint schema with SQLite-backed index; `mission propose` + `sprint estimate` admin-AI verbs
@@ -330,7 +341,7 @@ The case for darkmux: **once you accept that static configs leave performance on
 - ✅ Flow substrate: `LocalFileSink` (always) + `AuditFileSink` (BLAKE3 hash chain, verifiable via `flow integrity-check`; opt-in) + `RedisSink` (coordination; opt-in), composed via `TeeSink`
 - ✅ `darkmux flow status` + `darkmux flow integrity-check` diagnostic verbs
 - ✅ Observability daemon (`darkmux serve`) + `/flow` + `/lab` web viewers
-- ✅ Doctor: 20+ pre-flight checks with auto-fix path (`--fix`) for known-safe drift
+- ✅ Doctor: 20+ pre-flight checks with auto-fix path (`--fix`) for known-safe drift; `--include-openclaw` gates openclaw-specific checks so internal-runtime operators get a clean report, plus a legacy-extras warning that flags profiles still carrying openclaw-shape compaction keys (`mode`, `maxHistoryShare`, …)
 
 **On the roadmap (active):**
 
