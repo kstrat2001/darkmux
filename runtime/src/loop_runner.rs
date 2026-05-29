@@ -781,7 +781,11 @@ pub fn run(
                     if let Some(FailureCascadeSignal::Suspected {
                         tool_name,
                         consecutive_failures,
-                    }) = failure_rate_detector.record(&call.function.name, &result)
+                    }) = failure_rate_detector.record(
+                        &call.function.name,
+                        &call.function.arguments,
+                        &result,
+                    )
                     {
                         eprintln!(
                             "darkmux-runtime: ✕ tool-failure cascade — `{}` failed {} times in a \

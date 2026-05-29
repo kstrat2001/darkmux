@@ -77,14 +77,30 @@ impl FailureRateDetector {
     }
 
     /// Record a tool result. Returns `Some(Suspected)` only on the
-    /// edge where this tool's counter first crosses the threshold.
-    pub fn record(&mut self, tool_name: &str, result: &str) -> Option<FailureCascadeSignal> {
+    /// edge where this tool+args signature's counter first crosses the
+    /// threshold.
+    ///
+    /// Counters are keyed on `(tool_name, canonical_args)` — NOT tool
+    /// name alone (#484). A model running `npm test fileA`, `npm test
+    /// fileB`, `npm test fileC` and getting an assertion failure on each
+    /// is doing legitimate iterative diagnostic work, not cascading on a
+    /// broken tool; those are three distinct signatures, each count=1, so
+    /// no cascade fires. Three failures of the *same* command (the #419
+    /// `gcc`-isn't-installed case) share a signature and still cascade.
+    /// Canonicalization mirrors [`crate::cycle_detector::canonical_args`].
+    pub fn record(
+        &mut self,
+        tool_name: &str,
+        raw_args: &str,
+        result: &str,
+    ) -> Option<FailureCascadeSignal> {
+        let sig = signature(tool_name, raw_args);
         if is_failure_result(tool_name, result) {
-            let count = self.counters.entry(tool_name.to_string()).or_insert(0);
+            let count = self.counters.entry(sig.clone()).or_insert(0);
             *count += 1;
             let count_now = *count;
-            if count_now >= self.threshold && !self.warned.contains(tool_name) {
-                self.warned.insert(tool_name.to_string());
+            if count_now >= self.threshold && !self.warned.contains(&sig) {
+                self.warned.insert(sig);
                 return Some(FailureCascadeSignal::Suspected {
                     tool_name: tool_name.to_string(),
                     consecutive_failures: count_now,
@@ -92,10 +108,10 @@ impl FailureRateDetector {
             }
             None
         } else {
-            // Success resets this tool's counter AND clears its warn
+            // Success resets this signature's counter AND clears its warn
             // flag so a future cascade can re-fire.
-            self.counters.remove(tool_name);
-            self.warned.remove(tool_name);
+            self.counters.remove(&sig);
+            self.warned.remove(&sig);
             None
         }
     }
@@ -105,6 +121,18 @@ impl Default for FailureRateDetector {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Counter key for one tool call: `tool_name` + the cycle-detector's
+/// canonical args. Reusing [`crate::cycle_detector::canonical_args`]
+/// keeps the two sibling detectors' notion of "the same call" identical
+/// — e.g. `bash` keys on the full command, so different `npm test <file>`
+/// invocations are distinct signatures (#484).
+fn signature(tool_name: &str, raw_args: &str) -> String {
+    format!(
+        "{tool_name}|{}",
+        crate::cycle_detector::canonical_args(tool_name, raw_args)
+    )
 }
 
 /// (#419) Classify a tool-result string as success or failure.
@@ -228,19 +256,30 @@ mod tests {
         }
     }
 
+    // Canonical arg builders so a test's cascade intent is explicit:
+    // same string ⇒ same signature ⇒ a real cascade.
+    fn bash_args(cmd: &str) -> String {
+        format!(r#"{{"command":"{cmd}"}}"#)
+    }
+    fn read_args(path: &str) -> String {
+        format!(r#"{{"path":"{path}"}}"#)
+    }
+
     #[test]
     fn detector_does_not_fire_under_threshold() {
         let mut d = FailureRateDetector::with_threshold(3);
-        assert!(d.record("bash", &err_for("bash")).is_none());
-        assert!(d.record("bash", &err_for("bash")).is_none());
+        assert!(d.record("bash", &bash_args("gcc x.c"), &err_for("bash")).is_none());
+        assert!(d.record("bash", &bash_args("gcc x.c"), &err_for("bash")).is_none());
     }
 
     #[test]
     fn detector_fires_on_third_consecutive_failure() {
+        // The #419 case: the SAME command failing repeatedly (e.g. `gcc`
+        // isn't installed) — three identical signatures → cascade.
         let mut d = FailureRateDetector::with_threshold(3);
-        d.record("bash", &err_for("bash"));
-        d.record("bash", &err_for("bash"));
-        let signal = d.record("bash", &err_for("bash"));
+        d.record("bash", &bash_args("gcc x.c"), &err_for("bash"));
+        d.record("bash", &bash_args("gcc x.c"), &err_for("bash"));
+        let signal = d.record("bash", &bash_args("gcc x.c"), &err_for("bash"));
         let Some(FailureCascadeSignal::Suspected { tool_name, consecutive_failures }) = signal else {
             panic!("expected Suspected, got {signal:?}");
         };
@@ -249,29 +288,42 @@ mod tests {
     }
 
     #[test]
+    fn detector_does_not_fire_on_distinct_bash_commands() {
+        // #484 regression: `npm test fileA`, `npm test fileB`, `npm test
+        // fileC` each failing once is legitimate iterative diagnosis, not
+        // a broken-tool cascade. Three distinct signatures, each count=1.
+        let mut d = FailureRateDetector::with_threshold(3);
+        assert!(d.record("bash", &bash_args("npm test fileA"), &err_for("bash")).is_none());
+        assert!(d.record("bash", &bash_args("npm test fileB"), &err_for("bash")).is_none());
+        assert!(d.record("bash", &bash_args("npm test fileC"), &err_for("bash")).is_none());
+        // A fourth distinct command still doesn't cascade.
+        assert!(d.record("bash", &bash_args("npm test fileD"), &err_for("bash")).is_none());
+    }
+
+    #[test]
     fn detector_edge_triggers_does_not_warn_repeatedly() {
         let mut d = FailureRateDetector::with_threshold(3);
-        d.record("bash", &err_for("bash"));
-        d.record("bash", &err_for("bash"));
-        let first = d.record("bash", &err_for("bash"));
+        d.record("bash", &bash_args("gcc x.c"), &err_for("bash"));
+        d.record("bash", &bash_args("gcc x.c"), &err_for("bash"));
+        let first = d.record("bash", &bash_args("gcc x.c"), &err_for("bash"));
         assert!(first.is_some());
-        // Same tool continuing to fail → silent (already warned)
-        assert!(d.record("bash", &err_for("bash")).is_none());
-        assert!(d.record("bash", &err_for("bash")).is_none());
+        // Same signature continuing to fail → silent (already warned)
+        assert!(d.record("bash", &bash_args("gcc x.c"), &err_for("bash")).is_none());
+        assert!(d.record("bash", &bash_args("gcc x.c"), &err_for("bash")).is_none());
     }
 
     #[test]
     fn detector_resets_counter_and_warn_on_success() {
         let mut d = FailureRateDetector::with_threshold(3);
-        d.record("bash", &err_for("bash"));
-        d.record("bash", &err_for("bash"));
-        let first = d.record("bash", &err_for("bash"));
+        d.record("bash", &bash_args("gcc x.c"), &err_for("bash"));
+        d.record("bash", &bash_args("gcc x.c"), &err_for("bash"));
+        let first = d.record("bash", &bash_args("gcc x.c"), &err_for("bash"));
         assert!(first.is_some());
-        // Success resets — next failure cascade should re-fire.
-        d.record("bash", &ok_for("bash"));
-        d.record("bash", &err_for("bash"));
-        d.record("bash", &err_for("bash"));
-        let re_fire = d.record("bash", &err_for("bash"));
+        // Success of the same signature resets — next cascade re-fires.
+        d.record("bash", &bash_args("gcc x.c"), &ok_for("bash"));
+        d.record("bash", &bash_args("gcc x.c"), &err_for("bash"));
+        d.record("bash", &bash_args("gcc x.c"), &err_for("bash"));
+        let re_fire = d.record("bash", &bash_args("gcc x.c"), &err_for("bash"));
         assert!(re_fire.is_some(), "detector must re-arm after a success");
     }
 
@@ -280,11 +332,11 @@ mod tests {
         // bash fails 3×, read succeeds → bail attribution should
         // name bash specifically; read's counter never increments.
         let mut d = FailureRateDetector::with_threshold(3);
-        d.record("bash", &err_for("bash"));
-        d.record("read", &ok_for("read"));
-        d.record("bash", &err_for("bash"));
-        d.record("read", &ok_for("read"));
-        let signal = d.record("bash", &err_for("bash"));
+        d.record("bash", &bash_args("gcc x.c"), &err_for("bash"));
+        d.record("read", &read_args("/x.ts"), &ok_for("read"));
+        d.record("bash", &bash_args("gcc x.c"), &err_for("bash"));
+        d.record("read", &read_args("/x.ts"), &ok_for("read"));
+        let signal = d.record("bash", &bash_args("gcc x.c"), &err_for("bash"));
         let Some(FailureCascadeSignal::Suspected { tool_name, .. }) = signal else {
             panic!("expected bash cascade, got {signal:?}");
         };
@@ -294,16 +346,16 @@ mod tests {
     #[test]
     fn detector_fires_for_each_tool_independently() {
         let mut d = FailureRateDetector::with_threshold(3);
-        // Three bash failures → fire for bash
-        d.record("bash", &err_for("bash"));
-        d.record("bash", &err_for("bash"));
-        let bash_fire = d.record("bash", &err_for("bash"));
+        // Three bash failures of the same command → fire for bash
+        d.record("bash", &bash_args("gcc x.c"), &err_for("bash"));
+        d.record("bash", &bash_args("gcc x.c"), &err_for("bash"));
+        let bash_fire = d.record("bash", &bash_args("gcc x.c"), &err_for("bash"));
         assert!(matches!(bash_fire, Some(FailureCascadeSignal::Suspected { ref tool_name, .. }) if tool_name == "bash"));
 
-        // Three read failures → fire for read independently
-        d.record("read", &err_for("read"));
-        d.record("read", &err_for("read"));
-        let read_fire = d.record("read", &err_for("read"));
+        // Three read failures of the same path → fire for read independently
+        d.record("read", &read_args("/x.ts"), &err_for("read"));
+        d.record("read", &read_args("/x.ts"), &err_for("read"));
+        let read_fire = d.record("read", &read_args("/x.ts"), &err_for("read"));
         assert!(matches!(read_fire, Some(FailureCascadeSignal::Suspected { ref tool_name, .. }) if tool_name == "read"));
     }
 
@@ -312,21 +364,21 @@ mod tests {
         // Failure - success - failure - failure pattern should NOT
         // trip the cascade (counter resets on success).
         let mut d = FailureRateDetector::with_threshold(3);
-        d.record("bash", &err_for("bash"));
-        d.record("bash", &ok_for("bash"));    // resets
-        d.record("bash", &err_for("bash"));
-        d.record("bash", &err_for("bash"));
+        d.record("bash", &bash_args("gcc x.c"), &err_for("bash"));
+        d.record("bash", &bash_args("gcc x.c"), &ok_for("bash"));    // resets
+        d.record("bash", &bash_args("gcc x.c"), &err_for("bash"));
+        d.record("bash", &bash_args("gcc x.c"), &err_for("bash"));
         // Only 2 consecutive failures since the last success.
-        assert!(d.record("bash", &ok_for("bash")).is_none(), "intermittent should not trip");
+        assert!(d.record("bash", &bash_args("gcc x.c"), &ok_for("bash")).is_none(), "intermittent should not trip");
     }
 
     #[test]
     fn detector_handles_bash_timeout_as_failure() {
         let mut d = FailureRateDetector::with_threshold(3);
         let timeout = "exit: 124 (TIMED OUT after 30s)\n--- stdout ---\n\n--- stderr ---\n";
-        d.record("bash", timeout);
-        d.record("bash", timeout);
-        let signal = d.record("bash", timeout);
+        d.record("bash", &bash_args("sleep 99"), timeout);
+        d.record("bash", &bash_args("sleep 99"), timeout);
+        let signal = d.record("bash", &bash_args("sleep 99"), timeout);
         assert!(signal.is_some(), "bash timeout (exit 124) must count as failure");
     }
 

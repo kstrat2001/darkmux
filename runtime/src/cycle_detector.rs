@@ -23,7 +23,8 @@
 //! - Sliding window of the most recent N tool calls (default N=10)
 //! - Per call, compute a similarity hash from `tool_name + canonical(args)`
 //!   - `canonical` strips noise irrelevant to whether two calls "are
-//!     looking at the same thing": `read` ignores offset/limit; `edit`
+//!     looking at the same thing": `read` keeps path+offset+limit so
+//!     distinct ranges of one file aren't a cycle (#483); `edit`
 //!     ignores edit content (path is the cycle signal); `bash` keeps
 //!     full command (different commands aren't cycles); `search` keeps
 //!     pattern + path
@@ -139,7 +140,9 @@ impl Default for CycleDetector {
 /// what makes two calls *semantically equivalent for cycle-detection
 /// purposes*?
 ///
-/// - `read` — path. offset / limit / max_bytes are non-cycle-bearing.
+/// - `read` — path + offset + limit. Different ranges of one file are
+///   legitimate paging, not a cycle (#483); only a repeated *same range*
+///   counts. `max_bytes` remains non-cycle-bearing (dropped).
 /// - `edit` — path. Edit content changes per attempt but path
 ///   identifies the file being repeatedly modified.
 /// - `write` — path. Same reasoning as edit.
@@ -171,7 +174,13 @@ pub fn canonical_args(tool_name: &str, raw_args: &str) -> String {
         return raw_args.to_string();
     };
     let keep: &[&str] = match tool_name {
-        "read" | "edit" | "write" => &["path"],
+        // `read` keeps the range (offset/limit) too: reading *different*
+        // slices of one large file is legitimate paging, not a cycle (#483).
+        // Re-reading the *same* slice repeatedly is still a cycle.
+        "read" => &["path", "offset", "limit"],
+        // `edit`/`write` keep only path — edit content changes per attempt
+        // but the file being repeatedly modified is the cycle discriminator.
+        "edit" | "write" => &["path"],
         "bash" => &["command"],
         "search" => &["pattern", "path"],
         _ => return raw_args.to_string(),
@@ -192,13 +201,19 @@ mod tests {
     // ─── canonical_args ──────────────────────────────────────────────────
 
     #[test]
-    fn canonical_read_keeps_path_drops_offset_and_limit() {
+    fn canonical_read_keeps_path_and_range() {
+        // #483: distinct ranges of the same file are legitimate paging,
+        // so they must produce DIFFERENT canonical forms (not a cycle).
         let a = canonical_args("read", r#"{"path":"/x.ts","offset":1,"limit":50}"#);
         let b = canonical_args("read", r#"{"path":"/x.ts","offset":100,"limit":200}"#);
-        assert_eq!(a, b, "two reads of the same path with different offsets must be canonically equal");
+        assert_ne!(a, b, "reads of different ranges must NOT be canonically equal (#483)");
+        // Re-reading the exact same range IS a cycle → equal canonical form.
+        let c = canonical_args("read", r#"{"path":"/x.ts","offset":1,"limit":50}"#);
+        assert_eq!(a, c, "re-reading the identical range is still a cycle");
         assert!(a.contains("/x.ts"));
-        assert!(!a.contains("offset"));
-        assert!(!a.contains("limit"));
+        // max_bytes stays non-cycle-bearing (dropped).
+        let d = canonical_args("read", r#"{"path":"/x.ts","offset":1,"limit":50,"max_bytes":999}"#);
+        assert_eq!(a, d, "max_bytes is noise; dropped from the canonical form");
     }
 
     #[test]
@@ -256,17 +271,19 @@ mod tests {
     #[test]
     fn detector_does_not_fire_under_threshold() {
         let mut d = CycleDetector::with_thresholds(10, 3);
+        // Two re-reads of the IDENTICAL range — a real (sub-threshold) cycle.
         assert!(d.record("read", r#"{"path":"/x.ts","offset":1,"limit":50}"#).is_none());
-        assert!(d.record("read", r#"{"path":"/x.ts","offset":50,"limit":50}"#).is_none());
+        assert!(d.record("read", r#"{"path":"/x.ts","offset":1,"limit":50}"#).is_none());
         // Second occurrence — under threshold of 3.
     }
 
     #[test]
     fn detector_fires_when_third_occurrence_crosses_threshold() {
         let mut d = CycleDetector::with_thresholds(10, 3);
+        // Three reads of the SAME range — a genuine cycle.
         d.record("read", r#"{"path":"/x.ts","offset":1,"limit":50}"#);
-        d.record("read", r#"{"path":"/x.ts","offset":50,"limit":50}"#);
-        let signal = d.record("read", r#"{"path":"/x.ts","offset":100,"limit":50}"#);
+        d.record("read", r#"{"path":"/x.ts","offset":1,"limit":50}"#);
+        let signal = d.record("read", r#"{"path":"/x.ts","offset":1,"limit":50}"#);
         let Some(CycleSignal::Suspected { tool_name, count, window_size, .. }) = signal else {
             panic!("expected Suspected, got {signal:?}");
         };
@@ -276,17 +293,28 @@ mod tests {
     }
 
     #[test]
+    fn detector_does_not_fire_on_distinct_range_reads() {
+        // #483 regression: paging through a large file (distinct ranges)
+        // must NOT trip the cycle warn, even past the repeat threshold.
+        let mut d = CycleDetector::with_thresholds(10, 3);
+        assert!(d.record("read", r#"{"path":"/big.ts","offset":0,"limit":100}"#).is_none());
+        assert!(d.record("read", r#"{"path":"/big.ts","offset":100,"limit":100}"#).is_none());
+        assert!(d.record("read", r#"{"path":"/big.ts","offset":200,"limit":100}"#).is_none());
+        assert!(d.record("read", r#"{"path":"/big.ts","offset":300,"limit":100}"#).is_none());
+    }
+
+    #[test]
     fn detector_edge_triggers_does_not_warn_repeatedly() {
         let mut d = CycleDetector::with_thresholds(10, 3);
-        // 3 reads → warn
+        // 3 reads of the same range → warn
         d.record("read", r#"{"path":"/x.ts","offset":1,"limit":50}"#);
-        d.record("read", r#"{"path":"/x.ts","offset":50,"limit":50}"#);
-        let first = d.record("read", r#"{"path":"/x.ts","offset":100,"limit":50}"#);
+        d.record("read", r#"{"path":"/x.ts","offset":1,"limit":50}"#);
+        let first = d.record("read", r#"{"path":"/x.ts","offset":1,"limit":50}"#);
         assert!(first.is_some(), "first crossing should fire");
         // 4th and 5th of the same → silent (already warned)
-        let second = d.record("read", r#"{"path":"/x.ts","offset":150,"limit":50}"#);
+        let second = d.record("read", r#"{"path":"/x.ts","offset":1,"limit":50}"#);
         assert!(second.is_none(), "edge-triggered detector must not fire repeatedly");
-        let third = d.record("read", r#"{"path":"/x.ts","offset":200,"limit":50}"#);
+        let third = d.record("read", r#"{"path":"/x.ts","offset":1,"limit":50}"#);
         assert!(third.is_none());
     }
 
@@ -304,10 +332,10 @@ mod tests {
     #[test]
     fn detector_re_arms_when_hash_drops_out_of_window() {
         let mut d = CycleDetector::with_thresholds(5, 3);
-        // 3 of same → warn
+        // 3 of the same range → warn
         d.record("read", r#"{"path":"/x.ts","offset":1}"#);
-        d.record("read", r#"{"path":"/x.ts","offset":50}"#);
-        let first = d.record("read", r#"{"path":"/x.ts","offset":100}"#);
+        d.record("read", r#"{"path":"/x.ts","offset":1}"#);
+        let first = d.record("read", r#"{"path":"/x.ts","offset":1}"#);
         assert!(first.is_some());
 
         // Fill the window with other calls so the /x.ts entries drop out.
@@ -319,10 +347,10 @@ mod tests {
         d.record("bash", r#"{"command":"echo hi"}"#);
         // Window now: 5 distinct bashes; /x.ts is fully evicted.
 
-        // /x.ts re-enters; another 3 → should re-warn
+        // /x.ts re-enters; another 3 of the same range → should re-warn
         d.record("read", r#"{"path":"/x.ts","offset":1}"#);
-        d.record("read", r#"{"path":"/x.ts","offset":50}"#);
-        let re_fire = d.record("read", r#"{"path":"/x.ts","offset":100}"#);
+        d.record("read", r#"{"path":"/x.ts","offset":1}"#);
+        let re_fire = d.record("read", r#"{"path":"/x.ts","offset":1}"#);
         assert!(re_fire.is_some(), "detector must re-arm after hash drops out of window");
     }
 
