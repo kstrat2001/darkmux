@@ -23,8 +23,8 @@
 //! The provider's `matches` function decides what hardware it claims; ordering
 //! in the array is matching priority (most-specific first, generic last).
 
-use crate::hardware::HardwareSpec;
-use crate::lms::ModelMeta;
+use darkmux_hardware::HardwareSpec;
+use darkmux_profiles::lms::ModelMeta;
 use serde::{Deserialize, Serialize};
 
 pub mod m_series_128;
@@ -278,7 +278,7 @@ pub fn active_provider(hw: &HardwareSpec) -> &'static dyn HeuristicsProvider {
 /// vec captures reasoning about non-obvious choices (e.g., RAM-driven ctx
 /// cuts) so the user understands what they can change vs what's load-bearing.
 pub fn suggest_profile(meta: &ModelMeta, task: TaskClass) -> ProfileSuggestion {
-    let hw = crate::hardware::detect();
+    let hw = darkmux_hardware::detect();
     suggest_profile_for(meta, task, &hw)
 }
 
@@ -452,7 +452,7 @@ pub fn suggestion_to_profile_json(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hardware::{HardwareSpec, Platform};
+    use darkmux_hardware::{HardwareSpec, Platform};
 
     /// Synthesized M5 Max 128 GB fixture — falls into the `Xl` RAM tier
     /// so `active_provider` returns `m_series_128`. Used by tests that pin

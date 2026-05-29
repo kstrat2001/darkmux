@@ -11,8 +11,8 @@
 //! lower bound matters — at 32GB even 13B models are tight; users on that
 //! tier fall through to `generic`.
 
-use crate::hardware::{HardwareSpec, Platform, RamTier};
-use crate::heuristics::{
+use darkmux_hardware::{HardwareSpec, Platform, RamTier};
+use crate::{
     Architecture, CompactorChoice, HeuristicsProvider, RuleResult, SizeBucket, TaskClass,
     DEFAULT_COMPACTOR_ID,
 };
