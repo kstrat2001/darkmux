@@ -177,6 +177,7 @@ mod tests {
         assert_eq!(t.pin_for("anything-else"), "darkmux:default-model");
     }
 
+    #[serial_test::serial]
     #[test]
     fn embedded_table_parses_and_has_known_pins() {
         // Sanity: the shipped table parses and contains the bake-off-derived
