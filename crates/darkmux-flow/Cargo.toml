@@ -1,0 +1,33 @@
+[package]
+name = "darkmux-flow"
+version = "0.4.0"
+edition = "2021"
+description = "darkmux flow observability — structured JSONL records + sinks (LocalFile/Audit/Redis)"
+license = "MIT"
+homepage = "https://darkmux.com"
+repository = "https://github.com/kstrat2001/darkmux"
+authors = ["Kain Osterholt"]
+rust-version = "1.80"
+
+[features]
+# Exposes test-only helpers (e.g. `isolate_test_env_once`) to downstream
+# crates' test builds without compiling them into release binaries. Enabled
+# from the binary's dev-dependency on this crate. See #463.
+test-support = []
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+dirs = "5.0"
+# #163 — AuditFileSink: hash-chained tamper-evident sink.
+blake3 = "1.5"
+# libc: flock(2) for cross-process locking on the per-day audit file.
+libc = "0.2"
+# #162 Phase 3 — Redis client for the live-coordination flow sink.
+redis = { version = "0.27", default-features = false, features = ["streams"] }
+
+[dev-dependencies]
+tempfile = "3.10"
+serial_test = "3.1"

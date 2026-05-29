@@ -1,3 +1,12 @@
+//! darkmux-types — foundation crate.
+//!
+//! Profile / ProfileRegistry / ProfileModel schema (extracted whole from the
+//! former `src/types.rs`) plus the workspace-path resolver (`paths`, lifted
+//! from `src/lab/paths.rs`) so downstream crates can depend on path resolution
+//! without pulling in the lab crate.
+
+pub mod paths;
+
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 

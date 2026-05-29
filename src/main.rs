@@ -11,7 +11,9 @@ mod doctor;
 mod eureka;
 mod external;
 mod fleet;
-pub mod flow;
+// #463 workspace split — flow extracted to the darkmux-flow crate. The
+// re-export keeps all existing `crate::flow::*` paths resolving unchanged.
+pub use darkmux_flow as flow;
 mod flow_cli;
 mod hardware;
 mod heuristics;
@@ -31,7 +33,9 @@ mod serve;
 mod skills;
 mod sprint_cli;
 mod swap;
-mod types;
+// #463 workspace split — types extracted to the darkmux-types crate. The
+// re-export keeps all existing `crate::types::*` paths resolving unchanged.
+pub use darkmux_types as types;
 mod workdir;
 mod workloads;
 

@@ -1,3 +1,9 @@
+[workspace]
+members = [".", "crates/darkmux-types", "crates/darkmux-flow"]
+# runtime/ is a separate crate with its own Cargo.lock; it stays out of the
+# workspace per #463 ("stays as-is").
+exclude = ["runtime"]
+
 [package]
 name = "darkmux"
 version = "0.4.0"
@@ -14,6 +20,9 @@ name = "darkmux"
 path = "src/main.rs"
 
 [dependencies]
+# #463 workspace split — foundation crates extracted from this binary.
+darkmux-types = { path = "crates/darkmux-types" }
+darkmux-flow = { path = "crates/darkmux-flow" }
 anyhow = "1.0"
 axum = "0.7"
 clap = { version = "4.5", features = ["derive"] }
@@ -56,6 +65,10 @@ libc = "0.2"
 ureq = { version = "2.10", default-features = false }
 
 [dev-dependencies]
+# #463 — enable flow's test-only helpers (isolate_test_env_once) for the
+# binary's test build. Feature-unification turns this on only for tests/
+# examples/benches, not for a plain `cargo build` of the release binary.
+darkmux-flow = { path = "crates/darkmux-flow", features = ["test-support"] }
 tempfile = "3.10"
 assert_cmd = "2.0"
 tower = "0.5"
