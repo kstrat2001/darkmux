@@ -214,7 +214,7 @@ where
 /// own external serialization (the existing call sites in tests do
 /// because they're single-threaded). Without a flock-equivalent guard,
 /// two parallel `save_roster` calls race on the shared `.tmp` path.
-pub fn save_roster(roster: &FleetRoster) -> Result<()> {
+pub(crate) fn save_roster(roster: &FleetRoster) -> Result<()> {
     let path = roster_path();
     let parent = path.parent().map(|p| p.to_path_buf());
     if let Some(parent) = parent.as_ref() {
@@ -350,7 +350,7 @@ pub fn remove_machine(roster: &mut FleetRoster, id: &str) -> Option<MachineEntry
 /// want — for dispatch, today's pattern is publish-to-stream and let
 /// the consumer group claim, so the picker really just needs *some*
 /// match.
-pub fn candidates_for_tier<'a>(roster: &'a FleetRoster, tier: &str) -> Vec<&'a MachineEntry> {
+pub(crate) fn candidates_for_tier<'a>(roster: &'a FleetRoster, tier: &str) -> Vec<&'a MachineEntry> {
     let any_match = tier == "any";
     roster
         .machines

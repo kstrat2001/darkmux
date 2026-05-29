@@ -21,7 +21,7 @@ use std::time::Duration;
 /// Consumer group name used by all darkmux workers. Per-tier; combined
 /// with the stream name, every worker for a given tier shares the
 /// group → exactly-one-consumer-per-job delivery.
-pub const WORKER_CONSUMER_GROUP: &str = "darkmux-workers";
+pub(crate) const WORKER_CONSUMER_GROUP: &str = "darkmux-workers";
 
 /// XREADGROUP BLOCK budget per poll. 2 seconds is short enough that
 /// shutdown latency is bounded (the worker rechecks the shutdown flag

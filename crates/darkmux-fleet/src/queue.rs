@@ -3,11 +3,11 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
-pub const WORK_STREAM_PREFIX: &str = "darkmux:work:";
+pub(crate) const WORK_STREAM_PREFIX: &str = "darkmux:work:";
 
 /// Compose the per-tier work stream name. Used by both publisher and
 /// claimer so the convention lives in one place.
-pub fn work_stream_name(tier: &str) -> String {
+pub(crate) fn work_stream_name(tier: &str) -> String {
     format!("{WORK_STREAM_PREFIX}{tier}")
 }
 
@@ -17,7 +17,7 @@ pub fn work_stream_name(tier: &str) -> String {
 /// in-flight count (typically 1-2). The cap exists to prevent a stuck
 /// or crashed worker from growing the stream unboundedly.
 #[allow(dead_code)] // PR-C.1 substrate; consumed by PR-C.2 (worker loop) + PR-C.3 (client push)
-pub const WORK_STREAM_MAXLEN: usize = 1000;
+pub(crate) const WORK_STREAM_MAXLEN: usize = 1000;
 
 /// One unit of dispatch work flowing through the queue. The producing
 /// orchestrator constructs and publishes; the consuming worker reads,
@@ -116,19 +116,19 @@ pub struct WorkJob {
 /// worker to allocate it on deserialize. 256 KiB matches the
 /// reasoning-text cap in `dispatch_internal.rs` (#231 / S6) — same
 /// rationale, same number. (#246 PR-C.2 boundary defense)
-pub const MAX_WORK_MESSAGE_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_WORK_MESSAGE_BYTES: usize = 256 * 1024;
 
 /// Max byte size of `WorkJob.workdir` (the operator-supplied path
 /// string). Filesystem path limits vary by platform; 4 KiB is generous
 /// and prevents a publisher from filling memory with a multi-megabyte
 /// path string. (#246 PR-C.2)
-pub const MAX_WORK_WORKDIR_BYTES: usize = 4 * 1024;
+pub(crate) const MAX_WORK_WORKDIR_BYTES: usize = 4 * 1024;
 
 /// Max length for identifier fields (`target_tier`, `target_machine`,
 /// `role_id`). 64 chars is plenty for any realistic operator-named
 /// machine or role id and forecloses identifier-as-payload attacks
 /// (e.g. an `role_id` of 100MB). (#246 PR-C.2)
-pub const MAX_WORK_IDENTIFIER_LEN: usize = 64;
+pub(crate) const MAX_WORK_IDENTIFIER_LEN: usize = 64;
 
 /// Max allowed `timeout_seconds` on a queued `WorkJob`. 1 hour bounds
 /// the worst-case "publisher pins this machine's single worker" surface.
@@ -136,7 +136,7 @@ pub const MAX_WORK_IDENTIFIER_LEN: usize = 64;
 /// minutes (long-agentic-shape workloads at large context); 1 hour is
 /// 4× that headroom. A publisher specifying `u32::MAX` (136 years) is
 /// rejected at the queue boundary. (#246 PR-C.3 / PR-C.2 review carry-over)
-pub const MAX_WORK_TIMEOUT_SECONDS: u32 = 60 * 60;
+pub(crate) const MAX_WORK_TIMEOUT_SECONDS: u32 = 60 * 60;
 
 impl WorkJob {
     /// Validate a `WorkJob` at the queue boundary — called by both the
@@ -241,7 +241,7 @@ fn validate_work_identifier(field: &str, value: &str) -> Result<()> {
 /// (canonical form: `<ms>-<seq>`); `ack_job` uses it to acknowledge
 /// completion.
 #[derive(Debug, Clone)]
-pub struct ClaimedJob {
+pub(crate) struct ClaimedJob {
     pub work_id: String,
     pub job: WorkJob,
 }
@@ -288,7 +288,7 @@ pub fn publish_job(client: &redis::Client, job: &WorkJob) -> Result<String> {
 /// Wire-schema version tag carried alongside each job. Bumped when
 /// `WorkJob` shape changes in a way old workers can't safely parse.
 #[allow(dead_code)] // PR-C.1 substrate; consumed by PR-C.2 (worker loop) + PR-C.3 (client push)
-pub const WORK_JOB_SCHEMA_VERSION: &str = "1";
+pub(crate) const WORK_JOB_SCHEMA_VERSION: &str = "1";
 
 /// Ensure the consumer group exists on the per-tier stream. Idempotent —
 /// returns `Ok(())` whether the group was just created OR already
@@ -296,7 +296,7 @@ pub const WORK_JOB_SCHEMA_VERSION: &str = "1";
 /// (XGROUP CREATE on a non-existent stream would otherwise error).
 ///
 /// Call once per daemon-startup per tier. Safe to call repeatedly.
-pub fn init_consumer_group(client: &redis::Client, tier: &str, group: &str) -> Result<()> {
+pub(crate) fn init_consumer_group(client: &redis::Client, tier: &str, group: &str) -> Result<()> {
     let mut conn = client
         .get_connection()
         .context("opening Redis connection to init consumer group")?;
@@ -335,7 +335,7 @@ pub fn init_consumer_group(client: &redis::Client, tier: &str, group: &str) -> R
 /// `consumer` is the per-worker identity (typically `DARKMUX_MACHINE_ID`)
 /// — Redis tracks per-consumer pending-entries lists for lease semantics
 /// (PR-E will consume these).
-pub fn claim_job(
+pub(crate) fn claim_job(
     client: &redis::Client,
     tier: &str,
     group: &str,
@@ -458,7 +458,7 @@ pub(crate) fn extract_field(fields: &[redis::Value], key: &str) -> Option<String
 /// Worker MUST call this after the dispatch completes, regardless of
 /// dispatch success — the `dispatch.complete` flow record carries the
 /// success/error signal; the ack just releases the queue lease.
-pub fn ack_job(client: &redis::Client, tier: &str, group: &str, work_id: &str) -> Result<()> {
+pub(crate) fn ack_job(client: &redis::Client, tier: &str, group: &str, work_id: &str) -> Result<()> {
     let mut conn = client
         .get_connection()
         .context("opening Redis connection to ack work job")?;
