@@ -281,9 +281,11 @@ pub fn run(
     // 100% is the safety net for that case. Soft is best-effort
     // between-turn telemetry; hard is the unconditional kill.
     //
-    // - `INACTIVITY_SOFT_THRESHOLD_RATIO` (0.75): fires at 75% of
-    //   the inactivity budget. Operator-visible via the runtime
-    //   stderr; queued into the feedback injector for the model.
+    // - soft threshold: `inactivity_soft_threshold_secs(budget)` — a
+    //   linear 75% of the inactivity budget, floored so it's never zero
+    //   and capped to leave headroom before the hard kill on small
+    //   budgets (#474). Operator-visible via the runtime stderr; queued
+    //   into the feedback injector for the model.
     // - `inactivity_budget_secs`: read once from
     //   `DARKMUX_INACTIVITY_TIMEOUT_SECONDS` (matches the host's
     //   default of 600s). The host-side watchdog also reads this;
@@ -295,7 +297,6 @@ pub fn run(
     // - `inactivity_soft_warning_fired_in_window`: edge-trigger
     //   flag so the warning fires once per stuck window, not on
     //   every loop iteration.
-    const INACTIVITY_SOFT_THRESHOLD_RATIO: f64 = 0.75;
     let inactivity_budget_secs: u64 = std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -310,7 +311,12 @@ pub fn run(
     // recently edited path + a same-file repetition counter.
     //
     // - Edit/write to a NEW path → reset counter to 1, remember path
+    //   (path is normalized lexically first, #471, so `./src/x` and
+    //   `src/x` aren't seen as different files)
     // - Edit/write to the SAME path as last edit → increment counter
+    // - Edit/write with unparseable/path-less args → HOLD state (#472):
+    //   no increment, no reset — a transient malformed edit must not
+    //   erase an in-progress thrash run
     // - Bash → reset both (verification cleared the slate)
     // - Counter hits THRESHOLD → fire signal, edge-trigger reset
     //
@@ -332,7 +338,7 @@ pub fn run(
         {
             let elapsed_secs = last_proof_of_work.elapsed().as_secs();
             let soft_threshold_secs =
-                ((inactivity_budget_secs as f64) * INACTIVITY_SOFT_THRESHOLD_RATIO) as u64;
+                inactivity_soft_threshold_secs(inactivity_budget_secs);
             if !inactivity_soft_warning_fired_in_window
                 && elapsed_secs >= soft_threshold_secs
             {
@@ -704,22 +710,34 @@ pub fn run(
                         );
                     }
                     let result = dispatch(&call.function.name, &call.function.arguments);
+                    // (#469) Classify success/failure with the same
+                    // predicate the failure-rate detector uses, and record
+                    // it on the trajectory event so the host watchdog can
+                    // gate its deadline reset.
+                    let tool_ok = !crate::failure_rate::is_failure_result(
+                        &call.function.name,
+                        &result,
+                    );
                     trajectory.append_tool_completed(
                         turns,
                         tool_seq as u32,
                         &call.function.name,
                         call.function.arguments.len(),
                         result.len(),
+                        tool_ok,
                     );
-                    // (#466) Proof-of-work signal for the inactivity-
-                    // approach detector. Mirrors the host-side #468
-                    // reset trigger so the runtime-side soft warning
-                    // and the host-side hard kill share the same
-                    // deadline semantics. Fires on success AND failure
-                    // (same gap as #469); the cycle + failure-rate
-                    // detectors guard the fast-fail seam.
-                    last_proof_of_work = std::time::Instant::now();
-                    inactivity_soft_warning_fired_in_window = false;
+                    // (#466/#469) Proof-of-work signal for the inactivity-
+                    // approach detector. Mirrors the host-side reset
+                    // trigger so the runtime-side soft warning and the
+                    // host-side hard kill share the same deadline
+                    // semantics. Only a SUCCESSFUL tool call counts as
+                    // proof-of-work (#469): a stream of failures must not
+                    // keep the deadline alive — that's the fast-fail seam
+                    // the cycle + failure-rate detectors also guard.
+                    if tool_ok {
+                        last_proof_of_work = std::time::Instant::now();
+                        inactivity_soft_warning_fired_in_window = false;
+                    }
                     // (#465) Track test-cadence drift via same-file
                     // repetition. See state-machine doc above the
                     // declaration of `last_edited_path` for full
@@ -730,41 +748,25 @@ pub fn run(
                         "edit" | "write" => {
                             let path =
                                 extract_edit_target_path(&call.function.arguments);
-                            match (path.as_deref(), last_edited_path.as_deref()) {
-                                (Some(p), Some(last)) if p == last => {
-                                    consecutive_same_file_edits =
-                                        consecutive_same_file_edits.saturating_add(1);
-                                }
-                                (Some(p), _) => {
-                                    last_edited_path = Some(p.to_string());
-                                    consecutive_same_file_edits = 1;
-                                }
-                                (None, _) => {
-                                    // Malformed args (or path-less write
-                                    // shape we don't recognize) — degrade
-                                    // safely; don't count toward drift.
-                                    last_edited_path = None;
-                                    consecutive_same_file_edits = 0;
-                                }
-                            }
-                            if consecutive_same_file_edits >= TEST_CADENCE_DRIFT_THRESHOLD {
-                                let path_for_signal =
-                                    last_edited_path.clone().unwrap_or_default();
+                            let (new_last, new_count, fired_path) = cadence_drift_step(
+                                path.as_deref(),
+                                last_edited_path.take(),
+                                consecutive_same_file_edits,
+                                TEST_CADENCE_DRIFT_THRESHOLD,
+                            );
+                            last_edited_path = new_last;
+                            consecutive_same_file_edits = new_count;
+                            if let Some(fired_path) = fired_path {
                                 eprintln!(
                                     "darkmux-runtime: ⚠ test-cadence drift — {} \
                                      consecutive edits to `{}` without a bash \
                                      verification call. Queueing feedback nudge.",
-                                    consecutive_same_file_edits, path_for_signal
+                                    TEST_CADENCE_DRIFT_THRESHOLD, fired_path
                                 );
                                 feedback_injector.queue_test_cadence_drift(
-                                    consecutive_same_file_edits,
-                                    &path_for_signal,
+                                    TEST_CADENCE_DRIFT_THRESHOLD,
+                                    &fired_path,
                                 );
-                                // Edge-trigger reset: next firing
-                                // requires another full THRESHOLD
-                                // consecutive same-file edits.
-                                consecutive_same_file_edits = 0;
-                                last_edited_path = None;
                             }
                         }
                         "bash" => {
@@ -781,7 +783,11 @@ pub fn run(
                     if let Some(FailureCascadeSignal::Suspected {
                         tool_name,
                         consecutive_failures,
-                    }) = failure_rate_detector.record(&call.function.name, &result)
+                    }) = failure_rate_detector.record(
+                        &call.function.name,
+                        &call.function.arguments,
+                        &result,
+                    )
                     {
                         eprintln!(
                             "darkmux-runtime: ✕ tool-failure cascade — `{}` failed {} times in a \
@@ -1175,6 +1181,99 @@ fn extract_edit_target_path(raw_args: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(raw_args)
         .ok()
         .and_then(|v| v.get("path").and_then(|p| p.as_str()).map(String::from))
+        .map(|p| {
+            // (#471) Lexically normalize so `./src/lib.rs`, `src/lib.rs/`,
+            // and `src/../src/lib.rs` all compare equal in the same-file
+            // drift check. Purely lexical — no filesystem access (the
+            // sandbox path may not exist on the host, and canonicalize
+            // would add a syscall per edit).
+            let n = normalize_path_lexical(&p);
+            if n.is_empty() {
+                p
+            } else {
+                n
+            }
+        })
+}
+
+/// Inactivity soft-warning threshold (seconds) for a given budget (#466,
+/// hardened in #474). The linear 75% point, floored so it never fires on
+/// loop iteration 1 (budget=1 → 0 without the floor) and held strictly
+/// below the budget so a soft warning always precedes the host's hard
+/// kill.
+///
+/// We deliberately do NOT impose an absolute minimum headroom (e.g.
+/// "always ≥30s before the kill"). For any budget below ~120s such a cap
+/// forces the warning earlier than 75% — and for small budgets it
+/// collapses to "fire on iteration 1" and becomes non-monotonic (a 31s
+/// budget would warn EARLIER than a 30s one — the bug #474's first cut
+/// shipped). Proportional 25% headroom is the coherent, monotonic model;
+/// the hard kill at 100% is the unconditional safety net for the
+/// small-budget edge.
+fn inactivity_soft_threshold_secs(budget_secs: u64) -> u64 {
+    const RATIO: f64 = 0.75;
+    let linear = ((budget_secs as f64) * RATIO) as u64;
+    // clamp(low, high): never zero; never >= budget (always some headroom).
+    linear.clamp(1, budget_secs.saturating_sub(1).max(1))
+}
+
+/// One step of the same-file test-cadence-drift state machine (#465/#472).
+/// Given the just-edited path (`None` when the edit args were malformed or
+/// path-less), the previously-edited path, the current consecutive-edit
+/// counter, and the fire threshold, returns the new
+/// `(last_edited_path, counter, fired_path)`:
+///
+/// - same path as last → increment the counter
+/// - a new path        → reset counter to 1, remember the path
+/// - `None` (#472)      → HOLD state: neither increment nor reset, so a
+///   transient malformed-args edit can't erase an in-progress thrash run
+/// - counter reaches `threshold` → `fired_path = Some(path)` and the
+///   counter + path edge-reset, so the next nudge needs another full run
+///
+/// Pure + total so the detector is unit-testable independent of `run()`.
+fn cadence_drift_step(
+    path: Option<&str>,
+    last_edited_path: Option<String>,
+    counter: u32,
+    threshold: u32,
+) -> (Option<String>, u32, Option<String>) {
+    let (last, count) = match path {
+        Some(p) if last_edited_path.as_deref() == Some(p) => {
+            (Some(p.to_string()), counter.saturating_add(1))
+        }
+        Some(p) => (Some(p.to_string()), 1),
+        None => (last_edited_path, counter), // #472: hold on malformed args
+    };
+    if count >= threshold {
+        (None, 0, last) // edge-reset; surface the offending path to the caller
+    } else {
+        (last, count, None)
+    }
+}
+
+/// Lexically clean a path: drop `.` components, fold `..` against the
+/// preceding normal component, and drop trailing separators — without
+/// touching the filesystem (unlike `Path::canonicalize`). Leading `..`
+/// (no preceding component to pop) is preserved. (#471)
+fn normalize_path_lexical(p: &str) -> String {
+    use std::path::{Component, Path, PathBuf};
+    let mut out = PathBuf::new();
+    for comp in Path::new(p).components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else {
+                    out.push("..");
+                }
+            }
+            Component::RootDir => out.push(std::path::MAIN_SEPARATOR.to_string()),
+            Component::Prefix(pre) => out.push(pre.as_os_str()),
+            Component::Normal(seg) => out.push(seg),
+        }
+    }
+    out.to_string_lossy().into_owned()
 }
 
 fn measure_request_context(messages: &[Message]) -> (usize, usize) {
@@ -3313,11 +3412,140 @@ mod tests {
 
     #[test]
     fn extract_edit_target_path_returns_none_on_malformed_json() {
-        // Malformed JSON degrades safely — the state machine treats
-        // None as "unknown target" and resets the counter, which is
-        // the correct conservative behavior for a signal that should
-        // not fire on uncertain inputs.
+        // Malformed JSON degrades safely to None. The state machine (#472)
+        // treats a None target as a no-op — it HOLDS the in-progress
+        // same-file counter rather than resetting it, so a transient
+        // malformed-args edit can't erase an in-progress drift run. Only a
+        // real bash verification clears the slate.
         assert_eq!(extract_edit_target_path("{not valid json"), None);
+    }
+
+    // ─── (#471) path normalization in the same-file detector ─────────
+
+    #[test]
+    fn extract_edit_target_path_normalizes_current_dir_prefix() {
+        let with = extract_edit_target_path(r#"{"path":"./src/lib.rs"}"#);
+        let without = extract_edit_target_path(r#"{"path":"src/lib.rs"}"#);
+        assert_eq!(with, without, "./src/lib.rs must equal src/lib.rs (#471)");
+    }
+
+    #[test]
+    fn extract_edit_target_path_normalizes_trailing_slash() {
+        let with = extract_edit_target_path(r#"{"path":"src/lib.rs/"}"#);
+        let without = extract_edit_target_path(r#"{"path":"src/lib.rs"}"#);
+        assert_eq!(with, without, "trailing slash must not distinguish (#471)");
+    }
+
+    #[test]
+    fn extract_edit_target_path_normalizes_parent_dir_traversal() {
+        let with = extract_edit_target_path(r#"{"path":"src/../src/lib.rs"}"#);
+        let without = extract_edit_target_path(r#"{"path":"src/lib.rs"}"#);
+        assert_eq!(with, without, "src/../src/lib.rs must equal src/lib.rs (#471)");
+    }
+
+    #[test]
+    fn normalize_path_lexical_preserves_leading_parent_dir() {
+        // No preceding component to fold against — keep the `..`.
+        assert_eq!(normalize_path_lexical("../foo.rs"), "../foo.rs");
+    }
+
+    // ─── (#465/#472) cadence_drift_step state machine ────────────────
+
+    #[test]
+    fn cadence_step_increments_on_same_path() {
+        let (last, count, fired) = cadence_drift_step(Some("a.rs"), Some("a.rs".into()), 1, 3);
+        assert_eq!(last.as_deref(), Some("a.rs"));
+        assert_eq!(count, 2);
+        assert!(fired.is_none());
+    }
+
+    #[test]
+    fn cadence_step_resets_to_one_on_new_path() {
+        let (last, count, fired) = cadence_drift_step(Some("b.rs"), Some("a.rs".into()), 2, 3);
+        assert_eq!(last.as_deref(), Some("b.rs"));
+        assert_eq!(count, 1);
+        assert!(fired.is_none());
+    }
+
+    #[test]
+    fn cadence_step_holds_state_on_malformed_args() {
+        // #472: a None path (malformed/path-less edit) must NOT reset an
+        // in-progress run — it holds the counter and last path.
+        let (last, count, fired) = cadence_drift_step(None, Some("a.rs".into()), 2, 3);
+        assert_eq!(last.as_deref(), Some("a.rs"), "last path must be held");
+        assert_eq!(count, 2, "counter must be held, not reset");
+        assert!(fired.is_none());
+    }
+
+    #[test]
+    fn cadence_step_fires_and_edge_resets_at_threshold() {
+        // Third same-file edit crosses threshold=3: fires with the path,
+        // then edge-resets so the next nudge needs another full run.
+        let (last, count, fired) = cadence_drift_step(Some("a.rs"), Some("a.rs".into()), 2, 3);
+        assert_eq!(fired.as_deref(), Some("a.rs"));
+        assert_eq!(count, 0, "counter edge-resets after firing");
+        assert!(last.is_none(), "last path edge-resets after firing");
+    }
+
+    #[test]
+    fn cadence_step_full_sequence_with_malformed_interruption() {
+        // Integration of the transitions: two same-file edits, a malformed
+        // edit (held), then a third same-file edit fires — the malformed
+        // args in the middle did NOT let the model dodge the detector.
+        let thr = 3;
+        let (last, count, fired) = cadence_drift_step(Some("a.rs"), None, 0, thr);
+        assert!(fired.is_none() && count == 1);
+        let (last, count, fired) = cadence_drift_step(Some("a.rs"), last, count, thr);
+        assert!(fired.is_none() && count == 2);
+        let (last, count, fired) = cadence_drift_step(None, last, count, thr); // malformed
+        assert!(fired.is_none() && count == 2, "held across malformed args");
+        let (_last, _count, fired) = cadence_drift_step(Some("a.rs"), last, count, thr);
+        assert_eq!(fired.as_deref(), Some("a.rs"), "fires despite the malformed interruption");
+    }
+
+    // ─── (#474) inactivity soft-threshold floor + headroom ───────────
+
+    #[test]
+    fn soft_threshold_default_budget_is_linear_75pct() {
+        assert_eq!(inactivity_soft_threshold_secs(600), 450);
+    }
+
+    #[test]
+    fn soft_threshold_never_zero_for_tiny_budget() {
+        assert!(inactivity_soft_threshold_secs(1) >= 1, "must never fire on iteration 1");
+    }
+
+    #[test]
+    fn soft_threshold_small_budgets_keep_some_headroom() {
+        // Proportional 75% point; always strictly < budget so a warning
+        // precedes the hard kill.
+        assert_eq!(inactivity_soft_threshold_secs(10), 7);
+        assert_eq!(inactivity_soft_threshold_secs(30), 22);
+        assert_eq!(inactivity_soft_threshold_secs(100), 75);
+        for b in [2u64, 5, 10, 30, 100] {
+            assert!(inactivity_soft_threshold_secs(b) < b, "budget {b}: soft must be < budget");
+        }
+    }
+
+    #[test]
+    fn soft_threshold_is_monotonic_no_headroom_cliff() {
+        // Regression for the #474 first-cut bug the QA review caught: a
+        // budget=31 fired the soft warning at 1s while budget=30 fired at
+        // 22s (a non-monotonic cliff in the (30, ~120] band). The
+        // threshold must be non-decreasing in the budget and never jump
+        // backward.
+        assert_eq!(inactivity_soft_threshold_secs(30), 22);
+        assert_eq!(inactivity_soft_threshold_secs(31), 23);
+        let mut prev = 0;
+        for b in 1u64..=600 {
+            let soft = inactivity_soft_threshold_secs(b);
+            assert!(soft >= prev, "budget {b}: soft {soft} regressed below {prev}");
+            assert!(soft >= 1, "budget {b}: soft must never be zero");
+            if b >= 2 {
+                assert!(soft < b, "budget {b}: soft {soft} must leave headroom");
+            }
+            prev = soft;
+        }
     }
 
     #[test]

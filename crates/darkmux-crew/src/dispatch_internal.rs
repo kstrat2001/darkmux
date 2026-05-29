@@ -893,11 +893,27 @@ impl TailerState {
                 // by the cadence-drift detector (post-#465 redesign).
                 // The deadline trusts activity; the detectors catch
                 // struggle.
-                if let Some(deadline) = &self.inactivity_deadline {
-                    let new_deadline =
-                        Instant::now() + Duration::from_secs(self.inactivity_secs);
-                    if let Ok(mut guard) = deadline.lock() {
-                        *guard = new_deadline;
+                //
+                // (#469) ONLY a successful tool call resets the deadline.
+                // A model fast-failing with varying tool calls (different
+                // args each time, so the cycle detector misses; failures
+                // interleaved with reads, so the failure-rate detector's
+                // consecutive-count never trips) would otherwise keep the
+                // deadline alive indefinitely. The `ok` field closes that
+                // loophole. Backward-compat: events predating the field
+                // (no `ok`) are treated as success so old trajectories
+                // behave as before.
+                let tool_ok = event
+                    .get("ok")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                if tool_ok {
+                    if let Some(deadline) = &self.inactivity_deadline {
+                        let new_deadline =
+                            Instant::now() + Duration::from_secs(self.inactivity_secs);
+                        if let Ok(mut guard) = deadline.lock() {
+                            *guard = new_deadline;
+                        }
                     }
                 }
                 let payload = serde_json::json!({
@@ -905,6 +921,7 @@ impl TailerState {
                     "tool_name": event.get("tool_name"),
                     "args_chars": event.get("args_chars"),
                     "result_chars": event.get("result_chars"),
+                    "ok": tool_ok,
                 });
                 self.emit("dispatch.tool", darkmux_flow::Level::Info, payload);
             }
@@ -2206,14 +2223,10 @@ mod tests {
     /// guard against pathological tool patterns. The deadline trusts
     /// activity; the detectors catch struggle.
     ///
-    /// **Known gap** (#469): the `tool.completed` schema doesn't carry
-    /// a success/failure discriminator today, so failed tool calls
-    /// also reset the deadline. A model fast-failing with varying
-    /// args (e.g., bash with different broken commands interleaved
-    /// with successful reads) evades both the cycle detector and the
-    /// failure-rate detector. Tracked in #469 as a schema follow-up;
-    /// the cluster's cadence-drift v2 (#465) + reasoning-loop (#461)
-    /// detectors reduce the impact in the meantime.
+    /// (#469) Resolved: the `tool.completed` schema now carries an `ok`
+    /// discriminator and ONLY a successful tool call resets the deadline
+    /// — see `tailer_failed_tool_completed_does_not_reset_inactivity_deadline`
+    /// for the failure case. This test covers the success path (`ok:true`).
     #[test]
     fn tailer_tool_completed_event_resets_inactivity_deadline() {
         use std::io::Write;
@@ -2237,7 +2250,7 @@ mod tests {
         let mut f = std::fs::File::create(&traj_path).unwrap();
         writeln!(
             f,
-            r#"{{"type":"tool.completed","seq":3,"tool_seq":0,"tool_name":"bash","args_chars":50,"result_chars":1024}}"#
+            r#"{{"type":"tool.completed","seq":3,"tool_seq":0,"tool_name":"bash","args_chars":50,"result_chars":1024,"ok":true}}"#
         )
         .unwrap();
         drop(f);
@@ -2253,7 +2266,7 @@ mod tests {
             after_reset + Duration::from_secs(inactivity_secs) + Duration::from_secs(1);
         assert!(
             new_deadline >= expected_min,
-            "tool.completed must reset deadline by ~inactivity_secs"
+            "successful tool.completed must reset deadline by ~inactivity_secs"
         );
         assert!(
             new_deadline <= expected_max,
@@ -2262,6 +2275,90 @@ mod tests {
         assert!(
             new_deadline > original_deadline,
             "reset must overwrite stale deadline"
+        );
+    }
+
+    /// (#469) A FAILED tool call (`ok:false`) must NOT reset the
+    /// inactivity deadline. This closes the fast-fail loophole: a model
+    /// emitting varying failing tool calls (different args → cycle
+    /// detector misses; failures interleaved with reads → failure-rate
+    /// detector's consecutive count never trips) can no longer keep the
+    /// deadline alive indefinitely.
+    #[test]
+    fn tailer_failed_tool_completed_does_not_reset_inactivity_deadline() {
+        use std::io::Write;
+
+        let tmp = TempDir::new().unwrap();
+        let traj_path = tmp.path().join("trajectory.jsonl");
+
+        let inactivity_secs = 600u64;
+        let original_deadline = Instant::now() - Duration::from_secs(3600);
+        let shared = Arc::new(Mutex::new(original_deadline));
+
+        let mut state = TailerState::new(
+            traj_path.clone(),
+            "test-session".into(),
+            "test-role".into(),
+            "test-model".into(),
+            Arc::clone(&shared),
+            inactivity_secs,
+        );
+
+        let mut f = std::fs::File::create(&traj_path).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"tool.completed","seq":3,"tool_seq":0,"tool_name":"bash","args_chars":50,"result_chars":80,"ok":false}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        state.poll_and_emit();
+
+        let unchanged_deadline = *shared.lock().unwrap();
+        assert_eq!(
+            unchanged_deadline, original_deadline,
+            "a failed tool.completed (ok:false) must NOT reset the deadline (#469)"
+        );
+    }
+
+    /// (#469) Backward-compat: a `tool.completed` event with no `ok`
+    /// field (pre-#469 trajectory) is treated as success and resets the
+    /// deadline, so old data behaves as it did before the field landed.
+    #[test]
+    fn tailer_tool_completed_without_ok_field_resets_deadline() {
+        use std::io::Write;
+
+        let tmp = TempDir::new().unwrap();
+        let traj_path = tmp.path().join("trajectory.jsonl");
+
+        let inactivity_secs = 600u64;
+        let original_deadline = Instant::now() - Duration::from_secs(3600);
+        let shared = Arc::new(Mutex::new(original_deadline));
+
+        let mut state = TailerState::new(
+            traj_path.clone(),
+            "test-session".into(),
+            "test-role".into(),
+            "test-model".into(),
+            Arc::clone(&shared),
+            inactivity_secs,
+        );
+
+        let mut f = std::fs::File::create(&traj_path).unwrap();
+        // No `ok` field — pre-#469 shape.
+        writeln!(
+            f,
+            r#"{{"type":"tool.completed","seq":3,"tool_seq":0,"tool_name":"bash","args_chars":50,"result_chars":1024}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        state.poll_and_emit();
+
+        let new_deadline = *shared.lock().unwrap();
+        assert!(
+            new_deadline > original_deadline,
+            "missing ok defaults to success → deadline resets (backward compat)"
         );
     }
 
