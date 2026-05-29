@@ -343,6 +343,7 @@ dependencies = [
  "darkmux-lab",
  "darkmux-profiles",
  "darkmux-recommendations",
+ "darkmux-serve",
  "darkmux-types",
  "dirs",
  "futures",
@@ -508,6 +509,30 @@ dependencies = [
  "darkmux-types",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "darkmux-serve"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "darkmux-crew",
+ "darkmux-doctor",
+ "darkmux-eureka",
+ "darkmux-fleet",
+ "darkmux-flow",
+ "darkmux-profiles",
+ "darkmux-types",
+ "futures",
+ "redis",
+ "serde_json",
+ "serial_test",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tower",
+ "tower-http",
 ]
 
 [[package]]

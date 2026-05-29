@@ -46,7 +46,10 @@ pub use darkmux_lab::providers;
 // all crates). Re-export keeps crate::recommendations::* resolving for doctor.
 pub use darkmux_recommendations as recommendations;
 mod role_cli;
-mod serve;
+// #515 — serve daemon extracted (final crate; deps doctor/eureka/fleet/crew/
+// flow/profiles all crates). Re-export keeps crate::serve::* resolving for
+// main + sprint_cli.
+pub use darkmux_serve as serve;
 mod skills;
 mod sprint_cli;
 // #463 workspace split (PR2) — profiles/swap/lms/runtime extracted to the
