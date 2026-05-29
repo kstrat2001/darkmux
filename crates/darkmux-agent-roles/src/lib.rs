@@ -51,15 +51,15 @@ pub struct RoleTemplate {
 const EMBEDDED_ROLES: &[(&str, &str)] = &[
     (
         "qa",
-        include_str!("../../../integrations/openclaw/agent-scaffolds/qa.json"),
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../integrations/openclaw/agent-scaffolds/qa.json")),
     ),
     (
         "scribe",
-        include_str!("../../../integrations/openclaw/agent-scaffolds/scribe.json"),
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../integrations/openclaw/agent-scaffolds/scribe.json")),
     ),
     (
         "engineer",
-        include_str!("../../../integrations/openclaw/agent-scaffolds/engineer.json"),
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../integrations/openclaw/agent-scaffolds/engineer.json")),
     ),
 ];
 
