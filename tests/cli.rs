@@ -978,3 +978,58 @@ fn lab_doctor_warns_on_hash_drift() {
         "expected recovery hint: {stdout}"
     );
 }
+
+// ─── (#492) Phase 5: built-in fixture + lab-init.sh + demo-quickstart workload ──
+
+/// The built-in `demo-tiny-py` fixture ships with a valid
+/// `.fixture.json` that registers successfully.
+#[test]
+fn lab_register_builtin_demo_tiny_py_succeeds() {
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir_all(tmp.path().join(".darkmux")).unwrap();
+
+    // Resolve the in-tree built-in fixture path from CARGO_MANIFEST_DIR.
+    let repo_root = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo");
+    let fixture_path = format!(
+        "{}/templates/builtin/lab-fixtures/demo-tiny-py",
+        repo_root
+    );
+
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .current_dir(tmp.path())
+        .args(["lab", "register", &fixture_path])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Registered fixture `demo-tiny-py`"))
+        .stdout(predicate::str::contains("tiny-python-suite@1.0"));
+}
+
+/// `darkmux lab doctor` passes against the freshly-registered
+/// `demo-tiny-py` built-in — schema check, required_files present,
+/// hash matches.
+#[test]
+fn lab_doctor_passes_for_builtin_demo_tiny_py() {
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir_all(tmp.path().join(".darkmux")).unwrap();
+    let repo_root = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let fixture_path = format!(
+        "{}/templates/builtin/lab-fixtures/demo-tiny-py",
+        repo_root
+    );
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .current_dir(tmp.path())
+        .args(["lab", "register", &fixture_path])
+        .assert()
+        .success();
+
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .current_dir(tmp.path())
+        .args(["lab", "doctor"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("demo-tiny-py"))
+        .stdout(predicate::str::contains("1 pass"));
+}

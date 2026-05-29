@@ -1,0 +1,13 @@
+{
+  "name": "demo-tiny-py",
+  "version": "1.0",
+  "satisfies": "tiny-python-suite@1.0",
+  "language": "python",
+  "verify_command": "python3 -m unittest discover -s tests",
+  "baseline": { "test_count": 5 },
+  "required_files": [
+    "src/parser.py",
+    "tests/test_parser.py"
+  ],
+  "hash_exclude": ["__pycache__", ".pytest_cache"]
+}
