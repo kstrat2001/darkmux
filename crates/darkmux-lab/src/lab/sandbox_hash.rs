@@ -365,6 +365,67 @@ mod tests {
         );
     }
 
+    #[test]
+    fn golden_hash_locks_file_only_algorithm_against_regression() {
+        // Frozen known-answer test: a fixed file-only UTF-8 sandbox must
+        // always hash to this exact value. This is what makes the
+        // "#494 doesn't change file-only hashes" claim enforceable — any
+        // future change to the File-branch hashing (path/content framing,
+        // sort order, exclude defaults) breaks this loudly. If you change
+        // the algorithm intentionally, update the constant AND note the
+        // baseline-hash compatibility impact in the commit.
+        let tmp = TempDir::new().unwrap();
+        let s = tmp.path().join("s");
+        std::fs::create_dir_all(s.join("sub")).unwrap();
+        std::fs::write(s.join("a.txt"), "hello\n").unwrap();
+        std::fs::write(s.join("sub/b.txt"), "world").unwrap();
+        assert_eq!(
+            hash_sandbox_dir(&s).unwrap(),
+            "blake3:ce6f703d8a29636e4b95beea2773af4bc4176e239842d69a446b2ce2727e9cb9",
+            "file-only hash changed — if intentional, update the golden + check baseline-hash impact"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_is_hashed_not_an_error() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let s = tmp.path().join("s");
+        std::fs::create_dir_all(&s).unwrap();
+        // Target doesn't exist — read_link returns the target path
+        // without stat'ing, so this must hash cleanly (no error) and the
+        // dangling link still contributes.
+        symlink("nonexistent-target", s.join("dangling")).unwrap();
+        let with = hash_sandbox_dir(&s).unwrap();
+        let empty = tmp.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_ne!(with, hash_sandbox_dir(&empty).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_directory_is_recorded_not_traversed() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let s = tmp.path().join("s");
+        std::fs::create_dir_all(s.join("realdir")).unwrap();
+        std::fs::write(s.join("realdir/inner.txt"), "x").unwrap();
+        // A symlink pointing at the directory is recorded as a symlink
+        // (its target), NOT followed/traversed into.
+        symlink("realdir", s.join("dirlink")).unwrap();
+        let with_link = hash_sandbox_dir(&s).unwrap();
+
+        let without = tmp.path().join("without");
+        std::fs::create_dir_all(without.join("realdir")).unwrap();
+        std::fs::write(without.join("realdir/inner.txt"), "x").unwrap();
+        assert_ne!(
+            with_link,
+            hash_sandbox_dir(&without).unwrap(),
+            "a dir-symlink must contribute (as a symlink target), not be skipped"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn non_utf8_filename_hashes_deterministically_and_distinctly() {
