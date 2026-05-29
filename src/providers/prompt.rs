@@ -376,6 +376,7 @@ mod tests {
             sandbox_seed: None,
             setup_content: BTreeMap::new(),
             requires_external_sandbox: false,
+            requires_fixture: None,
             verify: None,
             expected: None,
             extras: BTreeMap::new(),

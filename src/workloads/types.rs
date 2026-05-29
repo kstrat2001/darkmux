@@ -110,6 +110,22 @@ pub struct WorkloadSpec {
         rename = "requiresExternalSandbox"
     )]
     pub requires_external_sandbox: bool,
+    /// (#490) Declares which abstract fixture definition this workload
+    /// needs at dispatch time. Format: `<name>@<version-req>` (e.g.
+    /// `"node-refresh-token-rotation@>=1.0"`). When set, the lab
+    /// resolver consults `~/.darkmux/lab-registry.json` for a fixture
+    /// whose `.fixture.json::satisfies` matches; COW-clones it as the
+    /// per-run sandbox source.
+    ///
+    /// When unset, falls back to the default sandbox path
+    /// `{paths.sandboxes}/<workload-id>/` (the current convention for
+    /// workloads with `setupContent` or no external dependency).
+    ///
+    /// Replaces the pre-#490 `DARKMUX_SANDBOX_<WORKLOAD-ID>` env-var
+    /// resolution. Per the `no_compat_baggage_pre_1_0` doctrine, no
+    /// env-var fallback ships.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_fixture: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verify: Option<VerifySpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
