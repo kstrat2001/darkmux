@@ -353,6 +353,14 @@ impl Default for LocalFileSink {
 }
 
 impl FlowSink for LocalFileSink {
+    // NOTE (#507): LocalFileSink still resolves `flows_dir()` per write,
+    // unlike AuditFileSink (which captures its dir at construction below).
+    // Capturing here too is the right end-state, but it changes the
+    // default sink's "honor a live DARKMUX_FLOWS_DIR" behavior that ~9
+    // tests across the binary + crew rely on — converting those to
+    // explicit sinks is its own scoped task, tracked as a #507 follow-up.
+    // FLOWS_DIR (unlike AUDIT_DIR) is not concurrently scrubbed by the
+    // test-isolation helper, so this path is not a demonstrated race.
     fn write(&self, record: &FlowRecord) -> Result<()> {
         let dir = flows_dir();
         let day = day_utc_now();
@@ -409,12 +417,26 @@ pub fn audit_dir() -> PathBuf {
 /// Hash-chained tamper-evident sink. See module-level comment for the
 /// design rationale. POSIX-only.
 #[cfg(unix)]
-pub struct AuditFileSink;
+pub struct AuditFileSink {
+    // #507 — captured once at construction (see LocalFileSink). Capturing
+    // the audit dir up front is what makes the cross-process hash chain
+    // robust against a mid-sequence `DARKMUX_AUDIT_DIR` change (the
+    // `records_checked == 1` flake the #463 cycle-break worked around at
+    // the isolate layer; this removes the underlying per-write re-read).
+    dir: PathBuf,
+}
 
 #[cfg(unix)]
 impl AuditFileSink {
+    /// Capture the audit dir from the environment (`DARKMUX_AUDIT_DIR` →
+    /// default) at construction time.
     pub fn new() -> Self {
-        Self
+        Self { dir: audit_dir() }
+    }
+
+    /// Construct against an explicit dir (tests / config-driven dispatch).
+    pub fn with_dir(dir: PathBuf) -> Self {
+        Self { dir }
     }
 }
 
@@ -428,15 +450,14 @@ impl Default for AuditFileSink {
 #[cfg(unix)]
 impl FlowSink for AuditFileSink {
     fn write(&self, record: &FlowRecord) -> Result<()> {
-        let dir = audit_dir();
         let day = day_utc_now();
-        let path = dir.join(format!("{day}.jsonl"));
+        let path = self.dir.join(format!("{day}.jsonl"));
         audit_record_at(record, &path)
     }
 
     fn info(&self) -> SinkInfo {
         let mut config = std::collections::BTreeMap::new();
-        config.insert("audit_dir".to_string(), audit_dir().display().to_string());
+        config.insert("audit_dir".to_string(), self.dir.display().to_string());
         config.insert("hash".to_string(), "blake3".to_string());
         SinkInfo { kind: "AuditFile".to_string(), config, children: vec![], raw_url: None }
     }
@@ -1195,6 +1216,16 @@ pub fn record_via(sink: &dyn FlowSink, record: &FlowRecord) -> Result<()> {
 /// pre-set the fields (e.g., a remote ingest path forwarding records
 /// from another machine) win — auto-populate fills the absent ones only.
 pub fn record(record: FlowRecord) -> Result<()> {
+    record_to(default_sink().as_ref(), record)
+}
+
+/// Stamp provenance (machine_id / orchestrator / machine_tier when the
+/// caller left them `None`) and write to an explicit sink. `record()` is
+/// `record_to(default_sink(), …)`. Split out (#507) so callers — and
+/// tests — can target a sink built against an explicit dir instead of
+/// depending on the process-global default sink + live env. The
+/// provenance auto-populate is identical to the pre-split `record()`.
+pub fn record_to(sink: &dyn FlowSink, record: FlowRecord) -> Result<()> {
     let mut rec = record;
     if rec.machine_id.is_none() {
         rec.machine_id = resolve_machine_id();
@@ -1205,7 +1236,7 @@ pub fn record(record: FlowRecord) -> Result<()> {
     if rec.machine_tier.is_none() {
         rec.machine_tier = resolve_machine_tier();
     }
-    default_sink().write(&rec)
+    sink.write(&rec)
 }
 
 /// Resolve the machine identifier for new flow records.
@@ -2190,9 +2221,7 @@ mod tests {
 
         // Capture the day-key BEFORE calling record() so a midnight-UTC
         // crossing between record() and the assertion doesn't make the
-        // file appear at a different name than we check. (record() reads
-        // day_utc_now() once for the file path; we read it once too; both
-        // reads land in the same wall-clock window typically <1ms apart.)
+        // file appear at a different name than we check.
         let day_before = day_utc_now();
         super::record(rec).unwrap();
         let day_after = day_utc_now();
