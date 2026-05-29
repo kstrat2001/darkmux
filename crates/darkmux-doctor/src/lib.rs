@@ -17,13 +17,13 @@
 //! agent-runtime-specific checks (gateway port, openclaw config sanity) belong
 //! to the runtime, not to darkmux.
 
-use crate::agent_roles;
-use crate::eureka;
-use crate::hardware;
-use crate::heuristics;
-use crate::lms;
-use crate::profiles;
-use crate::types::ModelRole;
+use darkmux_agent_roles as agent_roles;
+use darkmux_eureka as eureka;
+use darkmux_hardware as hardware;
+use darkmux_heuristics as heuristics;
+use darkmux_profiles::lms;
+use darkmux_profiles::profiles;
+use darkmux_types::ModelRole;
 use anyhow::Result;
 use std::env;
 use std::io::{Read, Write};
@@ -231,7 +231,7 @@ fn check_legacy_compaction_extras() -> Check {
 /// fresh-Claude session can read it back and offer to execute. Doctor
 /// itself never mutates operator state.
 fn check_beat33_legacy_crew_dir() -> Check {
-    use crate::crew::loader::user_state_root;
+    use darkmux_crew::loader::user_state_root;
     let root = user_state_root();
     let legacy_dir = root.join("crew");
     if !legacy_dir.is_dir() {
@@ -335,7 +335,7 @@ fn check_beat33_legacy_crew_dir() -> Check {
 /// the operator tried to use the role. Doctor walks every role
 /// manifest proactively. (#340)
 fn check_role_tool_vocab_typos() -> Check {
-    let roles = match crate::crew::loader::load_roles() {
+    let roles = match darkmux_crew::loader::load_roles() {
         Ok(rs) => rs,
         Err(e) => {
             return Check {
@@ -352,7 +352,7 @@ fn check_role_tool_vocab_typos() -> Check {
     let mut findings: Vec<(String, Vec<String>)> = Vec::new();
     for role in &roles {
         let unknowns =
-            crate::crew::dispatch_internal::unknown_role_vocab_tokens(&role.tool_palette);
+            darkmux_crew::dispatch_internal::unknown_role_vocab_tokens(&role.tool_palette);
         if !unknowns.is_empty() {
             findings.push((role.id.clone(), unknowns));
         }
@@ -385,7 +385,7 @@ fn check_role_tool_vocab_typos() -> Check {
         ),
         hint: Some(format!(
             "Edit the offending role manifest(s) — likely typos. Known tokens: {}.",
-            crate::crew::dispatch_internal::known_role_vocab_csv()
+            darkmux_crew::dispatch_internal::known_role_vocab_csv()
         )),
     }
 }
@@ -396,7 +396,7 @@ fn check_role_tool_vocab_typos() -> Check {
 /// hand-edited openclaw.json). Recovery is one command: `darkmux crew
 /// sync`. (#160)
 fn check_role_model_pin_drift() -> Check {
-    let pins = match crate::crew::pins::load_pins() {
+    let pins = match darkmux_crew::pins::load_pins() {
         Ok(t) => t,
         Err(e) => {
             return Check {
@@ -415,7 +415,7 @@ fn check_role_model_pin_drift() -> Check {
     // reads the same path sync writes to — respects DARKMUX_OPENCLAW_CONFIG.
     // Without this, an operator using the env override sees doctor
     // pass-silently while sync is actually writing to a different file.
-    let openclaw_path = crate::crew::dispatch::default_openclaw_config();
+    let openclaw_path = darkmux_crew::dispatch::default_openclaw_config();
     if !openclaw_path.exists() {
         return Check {
             name: "role-model pin drift".into(),
@@ -539,7 +539,7 @@ fn check_role_model_pin_drift() -> Check {
 /// chain break is the audit substrate's tampering signal, not a
 /// recoverable warning. (#163)
 fn check_audit_integrity() -> Check {
-    let reports = match crate::flow::integrity_check_all() {
+    let reports = match darkmux_flow::integrity_check_all() {
         Ok(r) => r,
         Err(e) => {
             return Check {
@@ -555,7 +555,7 @@ fn check_audit_integrity() -> Check {
     };
 
     if reports.is_empty() {
-        let dir = crate::flow::audit_dir().display().to_string();
+        let dir = darkmux_flow::audit_dir().display().to_string();
         return Check {
             name: "audit integrity".into(),
             status: Status::Warn,
@@ -567,7 +567,7 @@ fn check_audit_integrity() -> Check {
         };
     }
 
-    let broken: Vec<&crate::flow::IntegrityReport> =
+    let broken: Vec<&darkmux_flow::IntegrityReport> =
         reports.iter().filter(|r| !r.chain_valid).collect();
     if broken.is_empty() {
         let total_records: u64 = reports.iter().map(|r| r.records_checked).sum();
@@ -615,7 +615,7 @@ fn check_audit_integrity() -> Check {
 /// recommended`, so the operator-defined profile is shadowed and
 /// unreachable via the `swap` verb. (#159)
 fn check_recommended_profile_name_not_shadowed() -> Check {
-    let loaded = match crate::profiles::load_registry(None) {
+    let loaded = match darkmux_profiles::profiles::load_registry(None) {
         Ok(l) => l,
         Err(_) => {
             // Registry load failures are surfaced by check_profile_registry;
@@ -628,7 +628,7 @@ fn check_recommended_profile_name_not_shadowed() -> Check {
             };
         }
     };
-    if crate::recommendations::operator_has_shadowed_recommended_profile(&loaded.registry) {
+    if darkmux_recommendations::operator_has_shadowed_recommended_profile(&loaded.registry) {
         Check {
             name: "recommended profile name not shadowed".into(),
             status: Status::Warn,
@@ -654,7 +654,7 @@ fn check_recommended_profile_name_not_shadowed() -> Check {
 /// may have swapped intentionally — doctor surfaces the drift; doesn't
 /// block dispatches. (#159)
 fn check_recommendation_drift() -> Check {
-    let rec = match crate::recommendations::for_active_hardware() {
+    let rec = match darkmux_recommendations::for_active_hardware() {
         Ok(r) => r,
         Err(e) => {
             return Check {
@@ -671,7 +671,7 @@ fn check_recommendation_drift() -> Check {
     // because the operator's tier has no opinion they can align with —
     // a passive "drift check inactive" would read as all-clear in
     // doctor's red/yellow/green summary glance, hiding the gap.
-    if rec.status != crate::recommendations::RecommendationStatus::Validated {
+    if rec.status != darkmux_recommendations::RecommendationStatus::Validated {
         return Check {
             name: "recommendation drift".into(),
             status: Status::Warn,
@@ -684,7 +684,7 @@ fn check_recommendation_drift() -> Check {
     }
 
     let required = rec.required_model_ids();
-    let loaded = match crate::lms::list_loaded() {
+    let loaded = match darkmux_profiles::lms::list_loaded() {
         Ok(l) => l,
         Err(_) => {
             return Check {
@@ -749,7 +749,7 @@ fn check_machine_id_resolution() -> Check {
     let env_set = std::env::var("DARKMUX_MACHINE_ID")
         .ok()
         .filter(|s| !s.trim().is_empty());
-    let resolved = crate::flow::resolve_machine_id();
+    let resolved = darkmux_flow::resolve_machine_id();
     match (env_set, resolved) {
         (Some(_), Some(id)) => Check {
             name: "machine_id".into(),
@@ -780,7 +780,7 @@ fn check_machine_id_resolution() -> Check {
 /// records. Warns when absent — the field is operator-explicit by design
 /// (#167 + #49) but the operator needs to know it exists.
 fn check_orchestrator_declared() -> Check {
-    match crate::flow::resolve_orchestrator() {
+    match darkmux_flow::resolve_orchestrator() {
         Some(name) => Check {
             name: "orchestrator".into(),
             status: Status::Pass,
@@ -805,7 +805,7 @@ fn check_orchestrator_declared() -> Check {
 /// dispatch routing will bail loud at use.
 fn check_machine_tier_declared() -> Check {
     const RECOGNIZED: &[&str] = &["inference", "hub", "client"];
-    match crate::flow::resolve_machine_tier() {
+    match darkmux_flow::resolve_machine_tier() {
         Some(tier) if RECOGNIZED.contains(&tier.as_str()) => Check {
             name: "machine-tier".into(),
             status: Status::Pass,
@@ -839,10 +839,10 @@ fn check_machine_tier_declared() -> Check {
 /// this check is the operator-glance signal that something needs a
 /// closer look. (#170)
 fn check_flow_sink_health() -> Check {
-    let status = crate::flow::collect_status();
+    let status = darkmux_flow::collect_status();
     let composition = status.sinks.composition.clone();
     match status.overall_state {
-        crate::flow::HealthState::Ok => Check {
+        darkmux_flow::HealthState::Ok => Check {
             name: "flow sink health".into(),
             status: Status::Pass,
             message: format!(
@@ -851,7 +851,7 @@ fn check_flow_sink_health() -> Check {
             ),
             hint: None,
         },
-        crate::flow::HealthState::Warn => {
+        darkmux_flow::HealthState::Warn => {
             let reasons = if status.warn_reasons.is_empty() {
                 "(no specific warn reasons captured)".to_string()
             } else {
@@ -870,7 +870,7 @@ fn check_flow_sink_health() -> Check {
                 ),
             }
         }
-        crate::flow::HealthState::Fail => {
+        darkmux_flow::HealthState::Fail => {
             let reasons = if status.fail_reasons.is_empty() {
                 "(no specific failure reasons captured)".to_string()
             } else {
@@ -901,7 +901,7 @@ fn check_flow_sink_health() -> Check {
 /// the manifest existed but the prompt didn't. See
 /// kstrat2001/darkmux#141 for context.
 fn check_crew_role_prompt_coverage() -> Check {
-    use crate::crew::loader::{builtin_role_prompt_ids, builtin_roles_ids};
+    use darkmux_crew::loader::{builtin_role_prompt_ids, builtin_roles_ids};
     let manifests = builtin_roles_ids();
     let prompts: std::collections::HashSet<&str> = builtin_role_prompt_ids().into_iter().collect();
     let missing: Vec<&str> = manifests
@@ -1297,7 +1297,7 @@ fn check_profile_loaded_match() -> Check {
 /// gets a silent skip — when they configure openclaw, doctor surfaces
 /// the binary/version checks automatically.
 fn openclaw_active() -> bool {
-    crate::crew::dispatch::default_openclaw_config().exists()
+    darkmux_crew::dispatch::default_openclaw_config().exists()
 }
 
 fn check_runtime_command() -> Check {
@@ -1311,7 +1311,7 @@ fn check_runtime_command() -> Check {
             status: Status::Pass,
             message: format!(
                 "(skipped — no {} on disk; openclaw not configured on this machine)",
-                crate::crew::dispatch::default_openclaw_config().display()
+                darkmux_crew::dispatch::default_openclaw_config().display()
             ),
             hint: None,
         };
@@ -1369,7 +1369,7 @@ fn check_runtime_version() -> Check {
             status: Status::Pass,
             message: format!(
                 "(skipped — no {} on disk; openclaw not configured on this machine)",
-                crate::crew::dispatch::default_openclaw_config().display()
+                darkmux_crew::dispatch::default_openclaw_config().display()
             ),
             hint: None,
         };
@@ -1700,11 +1700,11 @@ fn check_ram_headroom_load_projection() -> Check {
         return skip("no profile matches loaded state");
     };
 
-    let unloaded: Vec<&crate::types::ProfileModel> = profile
+    let unloaded: Vec<&darkmux_types::ProfileModel> = profile
         .models
         .iter()
         .filter(|pm| {
-            let ns = crate::swap::namespaced_identifier(pm);
+            let ns = darkmux_profiles::swap::namespaced_identifier(pm);
             !loaded
                 .iter()
                 .any(|l| l.identifier == pm.id || l.model == pm.id || l.identifier == ns)
@@ -1812,10 +1812,10 @@ fn classify_load_projection(
 /// in `check_profile_loaded_match` so the two checks agree on what
 /// "active" means.
 fn pick_active_profile<'a>(
-    registry: &'a crate::profiles::LoadedRegistry,
-    loaded: &[crate::types::LoadedModel],
-) -> Option<(&'a str, &'a crate::types::Profile)> {
-    let matches: Vec<(&str, &crate::types::Profile)> = registry
+    registry: &'a darkmux_profiles::profiles::LoadedRegistry,
+    loaded: &[darkmux_types::LoadedModel],
+) -> Option<(&'a str, &'a darkmux_types::Profile)> {
+    let matches: Vec<(&str, &darkmux_types::Profile)> = registry
         .registry
         .profiles
         .iter()
@@ -1824,7 +1824,7 @@ fn pick_active_profile<'a>(
                 .iter()
                 .filter(|m| matches!(m.role, ModelRole::Primary))
                 .any(|pm| {
-                    let ns = crate::swap::namespaced_identifier(pm);
+                    let ns = darkmux_profiles::swap::namespaced_identifier(pm);
                     loaded
                         .iter()
                         .any(|l| l.identifier == pm.id || l.model == pm.id || l.identifier == ns)
@@ -1860,7 +1860,7 @@ fn check_agent_role_definitions() -> Check {
     // check hardcoded `~/.openclaw/openclaw.json` and silently
     // probed the wrong file when the operator pointed the env var
     // somewhere else.
-    let openclaw_path = crate::crew::dispatch::default_openclaw_config();
+    let openclaw_path = darkmux_crew::dispatch::default_openclaw_config();
     if !openclaw_path.exists() {
         return Check {
             name: "agent role scaffolds".into(),
@@ -2019,8 +2019,8 @@ fn check_power_state() -> Check {
 /// but they're a signal that `darkmux mission migrate --apply` should be run
 /// to consolidate into the per-mission layout. (#148)
 fn check_legacy_mission_layout() -> Check {
-    let missions_dir = crate::crew::lifecycle::legacy_missions_dir();
-    let sprints_dir = crate::crew::lifecycle::legacy_sprints_dir();
+    let missions_dir = darkmux_crew::lifecycle::legacy_missions_dir();
+    let sprints_dir = darkmux_crew::lifecycle::legacy_sprints_dir();
 
     let mut legacy_count = 0u32;
 
@@ -2058,8 +2058,8 @@ fn check_legacy_mission_layout() -> Check {
         // Display the actual dirs the legacy files live under (resolved
         // through dual-read so the path shown is the one the operator
         // can cd into, regardless of canonical vs Beat-33-legacy layout).
-        let missions = crate::crew::loader::missions_dir();
-        let sprints = crate::crew::loader::sprints_dir();
+        let missions = darkmux_crew::loader::missions_dir();
+        let sprints = darkmux_crew::loader::sprints_dir();
         Check {
             name: "legacy mission layout".into(),
             status: Status::Warn,
@@ -2116,14 +2116,14 @@ fn is_executable(p: &std::path::Path) -> bool {
 /// (just the GB count, no doctor framing) so `serve` can read RAM
 /// headroom for /machine/specs without depending on the doctor's
 /// classify-into-status flow. (#275)
-pub(crate) fn reclaimable_gb_for_specs() -> Option<u64> {
+pub fn reclaimable_gb_for_specs() -> Option<u64> {
     read_reclaimable_gb()
 }
 
 /// Same shim shape for the safety-margin constant — exposes the
 /// doctor's per-machine reserve so callers compute the same
 /// real-headroom expression. (#275)
-pub(crate) const RAM_SAFETY_MARGIN_GB_FOR_SPECS: u64 = RAM_SAFETY_MARGIN_GB;
+pub const RAM_SAFETY_MARGIN_GB_FOR_SPECS: u64 = RAM_SAFETY_MARGIN_GB;
 
 fn read_reclaimable_gb() -> Option<u64> {
     let out = Command::new("vm_stat").output().ok()?;
@@ -2226,7 +2226,7 @@ pub fn try_fix(report: &DoctorReport) -> Result<Vec<FixOutcome>> {
 }
 
 fn fix_ctx_window_mismatch() -> Result<FixOutcome> {
-    let Some(path) = crate::runtime::resolve_openclaw_config_path(None) else {
+    let Some(path) = darkmux_profiles::runtime::resolve_openclaw_config_path(None) else {
         return Ok(FixOutcome {
             rule_id: "ctx-window-mismatch".into(),
             applied: false,
@@ -2249,7 +2249,7 @@ fn fix_ctx_window_mismatch() -> Result<FixOutcome> {
             });
         }
     };
-    let changes = crate::runtime::fix_ctx_window_to_loaded(&path, &loaded)?;
+    let changes = darkmux_profiles::runtime::fix_ctx_window_to_loaded(&path, &loaded)?;
     if changes.is_empty() {
         Ok(FixOutcome {
             rule_id: "ctx-window-mismatch".into(),
@@ -2528,7 +2528,7 @@ mod tests {
         // + legacy-compaction-extras [#380]) + one per active eureka rule.
         // Every check should appear regardless of environment — even if
         // the underlying probe couldn't read state.
-        let expected = 26 + crate::eureka::all_rules().len();
+        let expected = 26 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

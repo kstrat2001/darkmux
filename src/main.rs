@@ -13,7 +13,9 @@ pub use darkmux_agent_roles as agent_roles;
 // binary stub). Re-export keeps crate::crew::* resolving for the binary +
 // fleet.
 pub use darkmux_crew as crew;
-mod doctor;
+// #515 — doctor extracted (all deps now crates; resolves the plan's open
+// sub-decision). Re-export keeps crate::doctor::* resolving for serve.
+pub use darkmux_doctor as doctor;
 // #515 Tier B — eureka rules engine extracted. Re-export keeps crate::eureka::*
 // resolving for doctor/serve/lab.
 pub use darkmux_eureka as eureka;
