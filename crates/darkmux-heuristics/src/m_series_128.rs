@@ -9,8 +9,8 @@
 //! Hardware match: Apple Silicon AND RAM tier ≥ Large (i.e. 65 GB+).
 //! Below 65 GB the bigctx shapes won't fit; defer to `m_series_64`.
 
-use crate::hardware::{HardwareSpec, Platform, RamTier};
-use crate::heuristics::{
+use darkmux_hardware::{HardwareSpec, Platform, RamTier};
+use crate::{
     Architecture, CompactorChoice, HeuristicsProvider, RuleResult, SizeBucket, TaskClass,
     DEFAULT_COMPACTOR_ID,
 };

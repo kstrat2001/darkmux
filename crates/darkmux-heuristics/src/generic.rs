@@ -9,8 +9,8 @@
 //! The provider attaches a prominent warning note so the user knows the
 //! suggestion is unvalidated for their platform.
 
-use crate::hardware::HardwareSpec;
-use crate::heuristics::{
+use darkmux_hardware::HardwareSpec;
+use crate::{
     Architecture, HeuristicsProvider, RuleResult, SizeBucket, TaskClass,
 };
 
@@ -78,7 +78,7 @@ impl HeuristicsProvider for Provider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hardware::Platform;
+    use darkmux_hardware::Platform;
 
     fn hw(plat: Platform, ram: u32) -> HardwareSpec {
         HardwareSpec {

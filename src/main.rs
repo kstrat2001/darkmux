@@ -14,7 +14,9 @@ pub use darkmux_agent_roles as agent_roles;
 // fleet.
 pub use darkmux_crew as crew;
 mod doctor;
-mod eureka;
+// #515 Tier B — eureka rules engine extracted. Re-export keeps crate::eureka::*
+// resolving for doctor/serve/lab.
+pub use darkmux_eureka as eureka;
 mod external;
 mod fleet;
 // #463 workspace split — flow extracted to the darkmux-flow crate. The
@@ -24,7 +26,9 @@ mod flow_cli;
 // #515 — zero-edge leaf extracted to darkmux-hardware. Re-export keeps
 // crate::hardware::* resolving for heuristics/eureka/recommendations/doctor/etc.
 pub use darkmux_hardware as hardware;
-mod heuristics;
+// #515 Tier B — per-tier heuristics extracted. Re-export keeps
+// crate::heuristics::* resolving for recommendations/optimize/doctor.
+pub use darkmux_heuristics as heuristics;
 mod init;
 mod lab;
 mod migrate;

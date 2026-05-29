@@ -15,8 +15,8 @@
 //!
 //! Hardware match: Apple Silicon AND RAM tier == Small (0–32 GB).
 
-use crate::hardware::{HardwareSpec, Platform, RamTier};
-use crate::heuristics::{
+use darkmux_hardware::{HardwareSpec, Platform, RamTier};
+use crate::{
     Architecture, CompactorChoice, HeuristicsProvider, RuleResult, SizeBucket, TaskClass,
     DEFAULT_COMPACTOR_ID,
 };

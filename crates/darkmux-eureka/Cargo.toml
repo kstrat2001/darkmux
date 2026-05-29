@@ -1,0 +1,19 @@
+[package]
+name = "darkmux-eureka"
+version = "0.4.0"
+edition = "2021"
+description = "darkmux eureka rules engine — anomaly detection rule defs + instruments.jsonl emission"
+license = "MIT"
+homepage = "https://darkmux.com"
+repository = "https://github.com/kstrat2001/darkmux"
+authors = ["Kain Osterholt"]
+rust-version = "1.80"
+
+[dependencies]
+darkmux-types = { path = "../darkmux-types" }
+darkmux-hardware = { path = "../darkmux-hardware" }
+darkmux-profiles = { path = "../darkmux-profiles" }
+anyhow = "1.0"
+dirs = "5.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

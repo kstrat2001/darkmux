@@ -334,8 +334,10 @@ dependencies = [
  "clap",
  "darkmux-agent-roles",
  "darkmux-crew",
+ "darkmux-eureka",
  "darkmux-flow",
  "darkmux-hardware",
+ "darkmux-heuristics",
  "darkmux-profiles",
  "darkmux-types",
  "dirs",
@@ -381,6 +383,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "darkmux-eureka"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "darkmux-hardware",
+ "darkmux-profiles",
+ "darkmux-types",
+ "dirs",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "darkmux-flow"
 version = "0.4.0"
 dependencies = [
@@ -401,6 +416,16 @@ name = "darkmux-hardware"
 version = "0.4.0"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "darkmux-heuristics"
+version = "0.4.0"
+dependencies = [
+ "darkmux-hardware",
+ "darkmux-profiles",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

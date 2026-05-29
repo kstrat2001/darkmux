@@ -267,10 +267,10 @@ pub struct Context {
     /// with a "skipped" hint when this is `None`.
     pub openclaw_config: Option<serde_json::Value>,
     /// Loaded-model snapshot from `lms ps`.
-    pub loaded_models: Vec<crate::types::LoadedModel>,
+    pub loaded_models: Vec<darkmux_types::LoadedModel>,
     /// Downloaded-model catalog from `lms ls`, used for arch-max lookups.
     /// `None` if the call failed.
-    pub available_models: Option<Vec<crate::lms::ModelMeta>>,
+    pub available_models: Option<Vec<darkmux_profiles::lms::ModelMeta>>,
     /// System RAM in GB (unified memory total for Apple Silicon).
     pub total_ram_gb: u32,
 }
@@ -281,9 +281,9 @@ impl Context {
     /// rule pass can degrade gracefully.
     pub fn collect() -> Self {
         let openclaw_config = read_openclaw_config();
-        let loaded_models = crate::lms::list_loaded().unwrap_or_default();
-        let available_models = crate::lms::list_available().ok();
-        let total_ram_gb = crate::hardware::detect().total_ram_gb;
+        let loaded_models = darkmux_profiles::lms::list_loaded().unwrap_or_default();
+        let available_models = darkmux_profiles::lms::list_available().ok();
+        let total_ram_gb = darkmux_hardware::detect().total_ram_gb;
         Self {
             openclaw_config,
             loaded_models,
@@ -305,9 +305,9 @@ fn normalize_model_id(id: &str) -> &str {
 /// Match a model id from openclaw.json against the loaded set, accounting
 /// for provider-prefix differences (e.g. `lmstudio/foo` vs `foo`).
 fn loaded_match<'a>(
-    loaded: &'a [crate::types::LoadedModel],
+    loaded: &'a [darkmux_types::LoadedModel],
     want: &str,
-) -> Option<&'a crate::types::LoadedModel> {
+) -> Option<&'a darkmux_types::LoadedModel> {
     let want_norm = normalize_model_id(want);
     loaded.iter().find(|m| {
         normalize_model_id(&m.identifier) == want_norm
@@ -872,7 +872,7 @@ mod tests {
 
     #[test]
     fn ctx_window_mismatch_fires_when_configured_diverges_from_loaded() {
-        use crate::types::LoadedModel;
+        use darkmux_types::LoadedModel;
         let ctx = Context {
             openclaw_config: Some(serde_json::json!({
                 "models": {
