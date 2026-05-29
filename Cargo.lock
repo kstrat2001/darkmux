@@ -340,6 +340,7 @@ dependencies = [
  "darkmux-hardware",
  "darkmux-heuristics",
  "darkmux-profiles",
+ "darkmux-recommendations",
  "darkmux-types",
  "dirs",
  "futures",
@@ -456,6 +457,18 @@ dependencies = [
  "serde_json",
  "serial_test",
  "tempfile",
+]
+
+[[package]]
+name = "darkmux-recommendations"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "darkmux-hardware",
+ "darkmux-heuristics",
+ "darkmux-types",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

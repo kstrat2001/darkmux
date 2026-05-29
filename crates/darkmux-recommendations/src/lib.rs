@@ -115,13 +115,13 @@ impl Recommendation {
 // structs lazily on first lookup.
 
 const EMBEDDED_M_SERIES_128: &str =
-    include_str!("../templates/builtin/recommendations/m-series-128.json");
+    include_str!("../../../templates/builtin/recommendations/m-series-128.json");
 const EMBEDDED_M_SERIES_64: &str =
-    include_str!("../templates/builtin/recommendations/m-series-64.json");
+    include_str!("../../../templates/builtin/recommendations/m-series-64.json");
 const EMBEDDED_M_SERIES_32: &str =
-    include_str!("../templates/builtin/recommendations/m-series-32.json");
+    include_str!("../../../templates/builtin/recommendations/m-series-32.json");
 const EMBEDDED_GENERIC: &str =
-    include_str!("../templates/builtin/recommendations/generic.json");
+    include_str!("../../../templates/builtin/recommendations/generic.json");
 
 /// (tier_id, json_str) pairs. The tier_id duplication with the JSON's
 /// `tier` field is deliberate — the registry constructor validates that
@@ -182,8 +182,8 @@ pub fn for_tier(tier_id: &str) -> Result<&'static Recommendation> {
 /// Look up the recommendation for the actively-detected hardware tier.
 /// Convenience wrapper for the common case.
 pub fn for_active_hardware() -> Result<&'static Recommendation> {
-    let hw = crate::hardware::detect();
-    let tier_id = crate::heuristics::active_provider(&hw).id();
+    let hw = darkmux_hardware::detect();
+    let tier_id = darkmux_heuristics::active_provider(&hw).id();
     for_tier(tier_id)
         .with_context(|| format!("looking up recommendation for active tier `{tier_id}`"))
 }
@@ -194,7 +194,7 @@ pub fn for_active_hardware() -> Result<&'static Recommendation> {
 /// with the same name is shadowed (the literal profile is unreachable
 /// via `darkmux swap`). Doctor surfaces this once. (#159)
 pub fn operator_has_shadowed_recommended_profile(
-    registry: &crate::types::ProfileRegistry,
+    registry: &darkmux_types::ProfileRegistry,
 ) -> bool {
     registry.profiles.contains_key("recommended")
 }

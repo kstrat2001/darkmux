@@ -38,7 +38,9 @@ mod mission_propose;
 mod notebook;
 mod optimize;
 mod providers;
-mod recommendations;
+// #515 — recommendation registry extracted (deps hardware/heuristics/types,
+// all crates). Re-export keeps crate::recommendations::* resolving for doctor.
+pub use darkmux_recommendations as recommendations;
 mod role_cli;
 mod serve;
 mod skills;
