@@ -84,10 +84,22 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
             .unwrap_or(0);
         let run_id = format!("{}-{}-{}-{}", opts.workload_id, profile_name, stamp, i);
         let run_dir = paths.runs.join(&run_id);
-        // (#488) Phase 1 — the workload's *source* sandbox is what
-        // gets COW-cloned per run. Phase 3 will replace this resolver
-        // with a fixture-registry lookup.
-        let source_sandbox_dir = resolve_sandbox_dir(&opts.workload_id, &paths);
+        // (#488 Phase 1 / #490 Phase 3) The workload's *source* sandbox
+        // is what gets COW-cloned per run. Phase 3 resolution shape:
+        //   1. If workload declares `requires_fixture: <name@version>`,
+        //      consult the lab registry for a fixture satisfying that
+        //      requirement → use its path.
+        //   2. Else fall back to `{paths.sandboxes}/<workload-id>/`
+        //      (the convention for workloads with setupContent or no
+        //      external dependency).
+        // No env-var fallback per the no-compat-baggage-pre-1.0 doctrine.
+        let source_sandbox_dir =
+            resolve_source_sandbox(&loaded_workload, &paths).with_context(|| {
+                format!(
+                    "resolving source sandbox for workload `{}`",
+                    opts.workload_id
+                )
+            })?;
         // (#488) Phase 1 — the per-run sandbox lives UNDER the per-run
         // dir, isolated from every other run's edits. Each run starts
         // either as a COW clone of the source sandbox (if it exists)
@@ -308,26 +320,49 @@ fn enrich_manifest_with_fixture_info(
     Ok(())
 }
 
-/// Resolve the sandbox directory for a workload. By default, lives under
-/// `<paths.sandboxes>/<workload-id>/`. Override with the env var
-/// `DARKMUX_SANDBOX_<WORKLOAD-ID-UPPERCASED-WITH-DASHES-AS-UNDERSCORES>`,
-/// which is how a user points at an existing on-disk Node project (etc.)
-/// without having to ship the project as a sandbox seed in the workload.
+/// (#490) Phase 3 — resolve the source sandbox for a workload.
 ///
-/// Example: workload `long-agentic` looks at
-/// `DARKMUX_SANDBOX_LONG_AGENTIC`. If set and the path exists, that's the
-/// sandbox; otherwise the default path is used.
-pub fn resolve_sandbox_dir(workload_id: &str, paths: &paths::DarkmuxPaths) -> std::path::PathBuf {
-    let env_key = format!(
-        "DARKMUX_SANDBOX_{}",
-        workload_id.replace('-', "_").to_ascii_uppercase()
-    );
-    if let Ok(p) = std::env::var(&env_key) {
-        if !p.is_empty() {
-            return std::path::PathBuf::from(p);
+/// Resolution order:
+///   1. If `workload.requires_fixture` is set, look up a registered
+///      fixture satisfying it via the lab registry. If found, use that
+///      fixture's path as the source. If no fixture satisfies, return
+///      an operator-actionable error pointing at `dm lab register`.
+///   2. Otherwise fall back to `{paths.sandboxes}/<workload-id>/`
+///      (the default location for workloads with `setupContent` or
+///      no external dependency).
+///
+/// The pre-#490 `DARKMUX_SANDBOX_<WORKLOAD-ID>` env-var path has been
+/// removed cleanly per the `no-compat-baggage-pre-1.0` doctrine. The
+/// fixture registry (Phase 2 + 4) is the only persistent binding.
+pub fn resolve_source_sandbox(
+    loaded: &crate::workloads::types::LoadedWorkload,
+    paths: &paths::DarkmuxPaths,
+) -> Result<std::path::PathBuf> {
+    if let Some(requires) = &loaded.manifest.workload.requires_fixture {
+        let reg_path = crate::lab::registry::default_registry_path(paths);
+        let registry = crate::lab::registry::LabRegistry::load(&reg_path)
+            .with_context(|| format!("loading {}", reg_path.display()))?;
+        match registry.find_satisfying(requires) {
+            Some((_name, fixture)) => Ok(fixture.path.clone()),
+            None => Err(anyhow!(
+                "workload `{}` requires a fixture satisfying `{}` but no registered \
+                 fixture matches.\n\
+                 \n\
+                 Fix:\n\
+                   1. Register an existing fixture that satisfies this requirement:\n\
+                      darkmux lab register /path/to/your/fixture\n\
+                   2. Or inspect what's registered:\n\
+                      darkmux lab fixtures\n\
+                   3. Or update the fixture's `.fixture.json` to set:\n\
+                      \"satisfies\": \"{}\"",
+                loaded.manifest.workload.id,
+                requires,
+                requires,
+            )),
         }
+    } else {
+        Ok(paths.sandboxes.join(&loaded.manifest.workload.id))
     }
-    paths.sandboxes.join(workload_id)
 }
 
 #[cfg(test)]
@@ -414,6 +449,97 @@ mod tests {
             "baseline",
             "source sandbox got run 1's edit — COW invariant broken"
         );
+    }
+
+    /// (#490) Phase 3 — `resolve_source_sandbox` returns the
+    /// default-path location when the workload has no
+    /// `requires_fixture` field.
+    #[test]
+    fn resolver_falls_back_to_default_sandbox_when_no_requires_fixture() {
+        use crate::workloads::types::{LoadedWorkload, WorkloadManifest, WorkloadSource, WorkloadSpec};
+        use std::collections::BTreeMap;
+        let tmp = TempDir::new().unwrap();
+        let paths = paths::DarkmuxPaths {
+            root: tmp.path().to_path_buf(),
+            runs: tmp.path().join("runs"),
+            sandboxes: tmp.path().join("sandboxes"),
+            crew: tmp.path().join("crew"),
+            notebook: tmp.path().join("notebook"),
+            profiles: tmp.path().join("profiles.json"),
+            scope: paths::Scope::User,
+        };
+        let loaded = LoadedWorkload {
+            manifest: WorkloadManifest {
+                workload: WorkloadSpec {
+                    id: "demo".into(),
+                    provider: "prompt".into(),
+                    description: None,
+                    role: None,
+                    prompt: None,
+                    prompt_file: None,
+                    sandbox_seed: None,
+                    setup_content: BTreeMap::new(),
+                    requires_external_sandbox: false,
+                    requires_fixture: None,
+                    verify: None,
+                    expected: None,
+                    extras: BTreeMap::new(),
+                },
+            },
+            manifest_path: tmp.path().join("workloads/demo.json"),
+            base_dir: tmp.path().to_path_buf(),
+            source: WorkloadSource::Builtin,
+        };
+        let resolved = resolve_source_sandbox(&loaded, &paths).unwrap();
+        assert_eq!(resolved, paths.sandboxes.join("demo"));
+    }
+
+    /// (#490) Phase 3 — when `requires_fixture` is set, the resolver
+    /// consults the lab registry. Missing registry / unsatisfied
+    /// requirement → operator-actionable error pointing at the
+    /// registry CLI verbs.
+    #[test]
+    #[serial_test::serial]
+    fn resolver_errors_when_required_fixture_not_registered() {
+        use crate::workloads::types::{LoadedWorkload, WorkloadManifest, WorkloadSource, WorkloadSpec};
+        use std::collections::BTreeMap;
+        let tmp = TempDir::new().unwrap();
+        let paths = paths::DarkmuxPaths {
+            root: tmp.path().to_path_buf(),
+            runs: tmp.path().join("runs"),
+            sandboxes: tmp.path().join("sandboxes"),
+            crew: tmp.path().join("crew"),
+            notebook: tmp.path().join("notebook"),
+            profiles: tmp.path().join("profiles.json"),
+            scope: paths::Scope::User,
+        };
+        let loaded = LoadedWorkload {
+            manifest: WorkloadManifest {
+                workload: WorkloadSpec {
+                    id: "demo".into(),
+                    provider: "coding-task".into(),
+                    description: None,
+                    role: Some("coder".into()),
+                    prompt: Some("do the thing".into()),
+                    prompt_file: None,
+                    sandbox_seed: None,
+                    setup_content: BTreeMap::new(),
+                    requires_external_sandbox: true,
+                    requires_fixture: Some("never-registered@1.0".into()),
+                    verify: None,
+                    expected: None,
+                    extras: BTreeMap::new(),
+                },
+            },
+            manifest_path: tmp.path().join("workloads/demo.json"),
+            base_dir: tmp.path().to_path_buf(),
+            source: WorkloadSource::Builtin,
+        };
+        let err = resolve_source_sandbox(&loaded, &paths).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("never-registered@1.0"), "got: {msg}");
+        assert!(msg.contains("darkmux lab register"), "got: {msg}");
+        assert!(msg.contains("darkmux lab fixtures"), "got: {msg}");
     }
 
     /// (#489) Phase 2 — `enrich_manifest_with_fixture_info` adds the

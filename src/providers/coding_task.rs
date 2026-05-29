@@ -139,39 +139,44 @@ impl WorkloadProvider for CodingTaskProvider {
         //    applied. Without this check, the dispatch would proceed
         //    against an empty workspace and the agent would hallucinate
         //    files that don't exist — wasting wall-clock for unactionable
-        //    output. Operator-actionable hint names the env var.
+        //    output.
+        //
+        //    (#490) Pre-Phase-3 the operator-actionable hint pointed at
+        //    DARKMUX_SANDBOX_<WORKLOAD-ID>. That env-var path is gone.
+        //    The hint now points at the fixture-registry path:
+        //    `dm lab register` an existing dir, then add a
+        //    `requires_fixture` field to the workload manifest.
         if loaded.manifest.workload.requires_external_sandbox
             && loaded.manifest.workload.setup_content.is_empty()
             && sandbox_is_empty(sandbox_dir)
         {
-            let env_key = format!(
-                "DARKMUX_SANDBOX_{}",
-                loaded
-                    .manifest
-                    .workload
-                    .id
-                    .replace('-', "_")
-                    .to_ascii_uppercase()
-            );
+            let requires_hint = loaded
+                .manifest
+                .workload
+                .requires_fixture
+                .as_deref()
+                .unwrap_or("<satisfies-name>@<version>");
             bail!(
                 "workload `{}` requires an external sandbox but `{}` is empty.\n\
                  \n\
                  This workload expects a pre-existing project (e.g. a Node repo with the source\n\
-                 files the prompt references). Two ways forward:\n\
+                 files the prompt references). Fix:\n\
                  \n\
-                   1. Point at an existing project on disk:\n\
-                        export {}=<path-to-your-project>\n\
+                   1. Register your existing project as a fixture (first create\n\
+                      <path>/.fixture.json declaring `name` + `satisfies`):\n\
+                        darkmux lab register <path-to-your-project>\n\
                  \n\
-                   2. If you don't have a fitting project, see the workload manifest's `_comment`\n\
-                      field for the expected sandbox shape:\n\
-                        darkmux lab workloads | grep `{}`\n\
+                   2. Make sure the workload manifest declares what it needs:\n\
+                        \"requires_fixture\": \"{}\"\n\
+                 \n\
+                   3. Inspect what's registered:\n\
+                        darkmux lab fixtures\n\
                  \n\
                  For a coding-task workload that runs out of the box (no external setup), try:\n\
                    darkmux lab run quick-coding",
                 loaded.manifest.workload.id,
                 sandbox_dir.display(),
-                env_key,
-                loaded.manifest.workload.id,
+                requires_hint,
             );
         }
 
@@ -1284,6 +1289,7 @@ mod tests {
             sandbox_seed: None,
             setup_content: BTreeMap::new(),
             requires_external_sandbox: false,
+            requires_fixture: None,
             verify: None,
             expected: None,
             extras: BTreeMap::new(),
@@ -1621,9 +1627,16 @@ not-valid-json
             msg.contains("requires an external sandbox"),
             "expected actionable error; got: {msg}"
         );
+        // (#490) Phase 3 — pre-Phase-3 the hint pointed at the
+        // DARKMUX_SANDBOX_<W> env var. That path is removed; the
+        // hint now points at the fixture-registry CLI verbs.
         assert!(
-            msg.contains("DARKMUX_SANDBOX_LONG_AGENTIC_STYLE"),
-            "expected env-var hint with derived name; got: {msg}"
+            msg.contains("darkmux lab register"),
+            "expected register-verb hint; got: {msg}"
+        );
+        assert!(
+            msg.contains("requires_fixture"),
+            "expected requires_fixture mention; got: {msg}"
         );
         assert!(
             msg.contains("quick-coding"),
