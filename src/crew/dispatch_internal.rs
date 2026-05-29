@@ -1143,29 +1143,50 @@ fn resolve_dispatch_model_internal(role: &crate::crew::types::Role) -> Result<St
 
     match select_model(role, profile) {
         Ok(id) => {
-            // (#450 review note) Cross-check against actual LMStudio
-            // loaded models. `darkmux swap <name>` loads a profile's
-            // models in LMStudio but does NOT update `default_profile`
-            // in the registry — so after `swap fast` with default
-            // `balanced`, this path would happily select balanced's
-            // Primary while LMStudio is loaded with fast's models.
-            // The dispatch would then fail at the LMStudio call (or
-            // worse, silently route to a different model if the id
-            // collides). Surfacing the mismatch loudly here makes
-            // the misconfiguration operator-visible at dispatch time,
-            // not at LMStudio's cryptic "model not loaded" error.
+            // (#450 review note / #408) Cross-check against actual
+            // LMStudio loaded models. `darkmux swap <name>` loads a
+            // profile's models in LMStudio but does NOT update
+            // `default_profile` in the registry — so after `swap fast`
+            // with default `balanced`, this path would happily select
+            // balanced's Primary while LMStudio is loaded with fast's
+            // models. The dispatch would then fail at the LMStudio call
+            // (or worse, silently route to a different model if the id
+            // collides). Surfacing the mismatch here makes the
+            // misconfiguration operator-visible at dispatch time, not at
+            // LMStudio's cryptic "model not loaded" error.
             if let Ok(loaded_ids) = probe_loaded_model_list() {
                 if !loaded_ids.is_empty() && !loaded_ids.iter().any(|m| m == &id) {
+                    let loaded = loaded_ids.join(", ");
+                    if strict_selection_enabled() {
+                        // (#408) Strict mode: a selected-vs-loaded
+                        // mismatch is the dispatch-contamination case from
+                        // the `feedback_model_unload_load_authority` memory
+                        // note — proceeding risks measuring or attributing
+                        // the wrong model, inheriting class-wide errors
+                        // into every downstream claim. In a methodology /
+                        // CI run the operator opts into hard-fail rather
+                        // than a silent route to whatever LMStudio has
+                        // loaded.
+                        bail!(
+                            "darkmux crew dispatch: profile `{active_name}` selects \
+                             `{id}`, but LMStudio has loaded [{loaded}] and \
+                             DARKMUX_STRICT_SELECTION is set — refusing to dispatch \
+                             against an unselected model. Fix: `darkmux swap \
+                             {active_name}` to load the selected model, update \
+                             `default_profile` to match what's loaded, or unset \
+                             DARKMUX_STRICT_SELECTION to proceed anyway. (#408)"
+                        );
+                    }
                     eprintln!(
                         "darkmux crew dispatch: WARNING — profile `{active_name}` \
-                         Primary is `{id}`, but LMStudio has loaded [{}]. \
+                         Primary is `{id}`, but LMStudio has loaded [{loaded}]. \
                          `darkmux swap` does not update `default_profile` in the \
                          registry; if you swapped recently, your loaded model \
                          won't match the selection. To fix: either `darkmux swap \
                          {active_name}` to align LMStudio with the registry's \
                          default, or update `default_profile` to match what's \
-                         loaded. (#450 review note)",
-                        loaded_ids.join(", ")
+                         loaded. Set DARKMUX_STRICT_SELECTION=1 to make this \
+                         mismatch fatal instead of a warning. (#450 review note, #408)"
                     );
                 }
             }
@@ -1180,17 +1201,31 @@ fn resolve_dispatch_model_internal(role: &crate::crew::types::Role) -> Result<St
                  to probe_loaded_model() — deprecated. Add a Primary-role \
                  model to profile `{active_name}` to migrate. (#450 refactor 1b)"
             );
-            // TODO(#450 phase-1c): when phase-1c lands the two-instances-
-            // per-purpose policy + operator-tunable strict-selection
-            // setting (e.g., `DARKMUX_STRICT_SELECTION=1`), flip this
-            // fallback from warn-and-probe to hard-error per the
-            // `feedback_model_unload_load_authority` memory-note intent.
-            // Phase-1b keeps the fallback for back-compat with operators
-            // on the pre-refactor-1b config shape; warnings make the
-            // misconfiguration loud.
+            // TODO(#450 phase-1c): the selected-vs-loaded MISMATCH case
+            // now honors `DARKMUX_STRICT_SELECTION` (see the Ok branch
+            // above). This Err branch — no Primary configured at all —
+            // still warn-and-probes for back-compat with pre-refactor-1b
+            // configs. When phase-1c lands the two-instances-per-purpose
+            // policy, fold this fallback under strict mode too.
             probe_loaded_model()
         }
     }
+}
+
+/// (#408) Whether a selected-vs-loaded model mismatch should be fatal.
+///
+/// Opt-in via `DARKMUX_STRICT_SELECTION` (truthy: `1` / `true` / `yes` /
+/// `on`, case-insensitive). Default off keeps back-compat: a mismatch
+/// warns but proceeds, since LMStudio may JIT-load the selected model and
+/// the operator owns loaded state (operator-sovereignty). Strict mode is
+/// the methodology-grade setting — in lab / CI runs where dispatching
+/// against the wrong model contaminates downstream measurement claims
+/// (#408), the mismatch should hard-fail rather than silently route.
+fn strict_selection_enabled() -> bool {
+    std::env::var("DARKMUX_STRICT_SELECTION")
+        .ok()
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
 }
 
 /// (#450 review note) Return the list of currently-LOADED LMStudio
@@ -1393,6 +1428,31 @@ mod tests {
         cmd.get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
+    }
+
+    // ─── #408: strict-selection opt-in parsing ───────────────────────
+
+    #[serial]
+    #[test]
+    fn strict_selection_enabled_reads_env_truthy_values() {
+        let prev = std::env::var("DARKMUX_STRICT_SELECTION").ok();
+
+        unsafe { std::env::remove_var("DARKMUX_STRICT_SELECTION"); }
+        assert!(!strict_selection_enabled(), "unset ⇒ off (back-compat default)");
+
+        for truthy in ["1", "true", "TRUE", "Yes", " on "] {
+            unsafe { std::env::set_var("DARKMUX_STRICT_SELECTION", truthy); }
+            assert!(strict_selection_enabled(), "`{truthy}` should enable strict mode");
+        }
+        for falsy in ["0", "false", "no", "off", ""] {
+            unsafe { std::env::set_var("DARKMUX_STRICT_SELECTION", falsy); }
+            assert!(!strict_selection_enabled(), "`{falsy}` should NOT enable strict mode");
+        }
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("DARKMUX_STRICT_SELECTION", v) },
+            None => unsafe { std::env::remove_var("DARKMUX_STRICT_SELECTION") },
+        }
     }
 
     #[test]
