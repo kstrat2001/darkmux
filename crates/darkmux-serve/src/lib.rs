@@ -177,7 +177,7 @@ pub(crate) fn normalize_cors_origin(s: &str) -> String {
 // nudge without depending on `serve`). Re-exported here so existing
 // `crate::serve::{DEFAULT_DAEMON_ADDR, nudge_if_daemon_unreachable, ...}`
 // paths keep resolving unchanged.
-pub use crate::flow::daemon_probe::{nudge_if_daemon_unreachable, DEFAULT_DAEMON_ADDR};
+pub use darkmux_flow::daemon_probe::{nudge_if_daemon_unreachable, DEFAULT_DAEMON_ADDR};
 
 /// Grace period (seconds) between receiving a shutdown signal and
 /// force-exiting the process. SSE streams hold connections open
@@ -202,7 +202,7 @@ const _: () = assert!(
 /// assert content without spawning the daemon.
 ///
 /// `mission_count` and `sprint_count` are loaded via
-/// `crate::crew::loader::load_missions`/`load_sprints` in production;
+/// `darkmux_crew::loader::load_missions`/`load_sprints` in production;
 /// tests pass synthetic counts.
 #[allow(clippy::too_many_arguments)]
 fn build_startup_banner(
@@ -218,7 +218,7 @@ fn build_startup_banner(
 ) -> Vec<String> {
     let mut lines = Vec::new();
     let version = env!("CARGO_PKG_VERSION");
-    let flow_schema = crate::flow::FLOW_SCHEMA_VERSION;
+    let flow_schema = darkmux_flow::FLOW_SCHEMA_VERSION;
 
     lines.push(format!("darkmux serve · v{version}"));
     lines.push(format!("  bind:           http://{addr}"));
@@ -295,14 +295,14 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf) -> Result<()> {
         // Banner: print after bind succeeds so we don't claim "listening"
         // before we actually are.
         let flows_dir_exists = flows_dir.exists();
-        let missions_dir = crate::crew::loader::missions_dir();
+        let missions_dir = darkmux_crew::loader::missions_dir();
         let missions_dir_exists = missions_dir.exists();
-        let sprints_dir = crate::crew::loader::sprints_dir();
+        let sprints_dir = darkmux_crew::loader::sprints_dir();
         let sprints_dir_exists = sprints_dir.exists();
-        let mission_count = crate::crew::loader::load_missions()
+        let mission_count = darkmux_crew::loader::load_missions()
             .map(|v| v.len())
             .unwrap_or(0);
-        let sprint_count = crate::crew::loader::load_sprints()
+        let sprint_count = darkmux_crew::loader::load_sprints()
             .map(|v| v.len())
             .unwrap_or(0);
         for line in build_startup_banner(
@@ -327,7 +327,7 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf) -> Result<()> {
         // declared — single-machine fleets continue to work unchanged.
         // The thread runs for the daemon's lifetime; the process
         // force-exit in the SHUTDOWN_GRACE_SECS path kills it cleanly.
-        let _worker_handle = crate::fleet::spawn_worker_thread();
+        let _worker_handle = darkmux_fleet::spawn_worker_thread();
 
         // Shutdown plumbing: multiplex one signal to two consumers
         // (axum's graceful shutdown future and the force-exit timer).
@@ -370,7 +370,7 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf) -> Result<()> {
 async fn health() -> axum::Json<serde_json::Value> {
     axum::Json(serde_json::json!({
         "darkmux_version": env!("CARGO_PKG_VERSION"),
-        "flow_schema_version": crate::flow::FLOW_SCHEMA_VERSION,
+        "flow_schema_version": darkmux_flow::FLOW_SCHEMA_VERSION,
     }))
 }
 
@@ -392,7 +392,7 @@ async fn health() -> axum::Json<serde_json::Value> {
 /// durations and the sprint-progress widget. Empty array on no missions
 /// or unreachable crew root; never errors.
 async fn missions_handler() -> axum::Json<serde_json::Value> {
-    let result = tokio::task::spawn_blocking(crate::crew::loader::load_missions).await;
+    let result = tokio::task::spawn_blocking(darkmux_crew::loader::load_missions).await;
     let missions = match result {
         Ok(Ok(m)) => m,
         _ => Vec::new(),
@@ -409,7 +409,7 @@ async fn missions_handler() -> axum::Json<serde_json::Value> {
 /// graphic can render Running sprints' live elapsed time + Complete
 /// sprints' frozen durations. Empty array on no sprints; never errors.
 async fn sprints_handler() -> axum::Json<serde_json::Value> {
-    let result = tokio::task::spawn_blocking(crate::crew::loader::load_sprints).await;
+    let result = tokio::task::spawn_blocking(darkmux_crew::loader::load_sprints).await;
     let sprints = match result {
         Ok(Ok(s)) => s,
         _ => Vec::new(),
@@ -435,7 +435,7 @@ fn current_millis() -> u64 {
 /// configured, so runs on the blocking pool to keep the axum executor
 /// free.
 async fn flow_status_handler() -> axum::Json<serde_json::Value> {
-    let result = tokio::task::spawn_blocking(crate::flow::collect_status).await;
+    let result = tokio::task::spawn_blocking(darkmux_flow::collect_status).await;
     match result {
         Ok(status) => axum::Json(
             serde_json::to_value(status)
@@ -449,7 +449,7 @@ async fn flow_status_handler() -> axum::Json<serde_json::Value> {
 }
 
 async fn model_status_handler() -> axum::Json<serde_json::Value> {
-    let result = tokio::task::spawn_blocking(crate::lms::list_loaded).await;
+    let result = tokio::task::spawn_blocking(darkmux_profiles::lms::list_loaded).await;
     let (models, unreachable) = match result {
         Ok(Ok(m)) => (m, false),
         _ => (Vec::new(), true),
@@ -481,7 +481,7 @@ async fn machine_specs_handler() -> axum::Json<serde_json::Value> {
     // Shell-out probes run in spawn_blocking so the async runtime stays
     // responsive. Each result is independent — one failure doesn't
     // cascade.
-    let lms_result = tokio::task::spawn_blocking(crate::lms::list_loaded).await;
+    let lms_result = tokio::task::spawn_blocking(darkmux_profiles::lms::list_loaded).await;
     let (loaded_models, lms_unreachable) = match lms_result {
         Ok(Ok(m)) => (m, false),
         _ => (Vec::new(), true),
@@ -499,12 +499,12 @@ async fn machine_specs_handler() -> axum::Json<serde_json::Value> {
         .ok()
         .flatten();
 
-    let machine_id = crate::flow::resolve_machine_id();
-    let machine_tier = crate::flow::resolve_machine_tier();
+    let machine_id = darkmux_flow::resolve_machine_id();
+    let machine_tier = darkmux_flow::resolve_machine_tier();
     let redis_url_redacted = std::env::var("DARKMUX_REDIS_URL")
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .map(|raw| crate::flow::redact_url_creds(&raw));
+        .map(|raw| darkmux_flow::redact_url_creds(&raw));
 
     let generated_at_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -513,7 +513,7 @@ async fn machine_specs_handler() -> axum::Json<serde_json::Value> {
 
     axum::Json(serde_json::json!({
         "darkmux_version": env!("CARGO_PKG_VERSION"),
-        "flow_schema_version": crate::flow::FLOW_SCHEMA_VERSION,
+        "flow_schema_version": darkmux_flow::FLOW_SCHEMA_VERSION,
         "machine_id": machine_id,
         "machine_tier": machine_tier,
         "os": format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
@@ -571,17 +571,17 @@ fn read_ram_total_bytes() -> Option<u64> {
 /// computation. Returns `None` on non-macOS (today's doctor is
 /// macOS-shaped).
 fn read_ram_free_for_ai_bytes() -> Option<u64> {
-    let gb = crate::doctor::reclaimable_gb_for_specs()?;
-    let resident_gb = crate::lms::list_loaded()
+    let gb = darkmux_doctor::reclaimable_gb_for_specs()?;
+    let resident_gb = darkmux_profiles::lms::list_loaded()
         .ok()
         .map(|models| {
             models
                 .iter()
-                .filter_map(|m| crate::eureka::parse_size_gb(&m.size))
+                .filter_map(|m| darkmux_eureka::parse_size_gb(&m.size))
                 .sum::<f64>()
         })
         .unwrap_or(0.0);
-    let safety_gb = crate::doctor::RAM_SAFETY_MARGIN_GB_FOR_SPECS as f64;
+    let safety_gb = darkmux_doctor::RAM_SAFETY_MARGIN_GB_FOR_SPECS as f64;
     let real_gb = (gb as f64) + resident_gb - safety_gb;
     if real_gb < 0.0 {
         return Some(0);
@@ -653,7 +653,7 @@ async fn flow_stream_handler(
             redis::Client::open(probe_url.as_str())
                 .ok()
                 .and_then(|c| {
-                    c.get_connection_with_timeout(crate::flow::REDIS_CONNECT_TIMEOUT)
+                    c.get_connection_with_timeout(darkmux_flow::REDIS_CONNECT_TIMEOUT)
                         .ok()
                 })
                 .is_some()
@@ -793,7 +793,7 @@ fn read_flow_records_from_redis(
     // Bounded by REDIS_CONNECT_TIMEOUT (#278) — Studio-offline scenarios
     // must not wedge the HTTP handler thread for the OS default 75s.
     let mut conn = client
-        .get_connection_with_timeout(crate::flow::REDIS_CONNECT_TIMEOUT)
+        .get_connection_with_timeout(darkmux_flow::REDIS_CONNECT_TIMEOUT)
         .with_context(|| format!("connecting to Redis for /flow aggregation: {url}"))?;
     let stream = std::env::var("DARKMUX_REDIS_STREAM")
         .ok()
@@ -1215,7 +1215,7 @@ fn synthetic_stream_error_record(stream_name: &str, attempts: u32, reason: &str)
     // `stage: scope` records as edges — separate follow-up to add
     // a stream-error pill / toast in the viewer surface.
     serde_json::json!({
-        "ts": crate::flow::ts_utc_now(),
+        "ts": darkmux_flow::ts_utc_now(),
         "level": "warn",
         "category": "audit",
         "tier": "local",
@@ -1242,7 +1242,7 @@ fn resolve_current_last_id(
         .with_context(|| format!("opening Redis for XINFO on {stream_name}"))?;
     // Bounded by REDIS_CONNECT_TIMEOUT (#278).
     let mut conn = client
-        .get_connection_with_timeout(crate::flow::REDIS_CONNECT_TIMEOUT)
+        .get_connection_with_timeout(darkmux_flow::REDIS_CONNECT_TIMEOUT)
         .with_context(|| format!("connecting to Redis for XINFO on {stream_name}"))?;
     let raw: redis::RedisResult<redis::Value> = redis::cmd("XINFO")
         .arg("STREAM")
@@ -1288,7 +1288,7 @@ fn xread_block_once(
     // XREAD BLOCK timeout below (500ms) is separate — that's the
     // long-poll budget, not the connect budget.
     let mut conn = client
-        .get_connection_with_timeout(crate::flow::REDIS_CONNECT_TIMEOUT)
+        .get_connection_with_timeout(darkmux_flow::REDIS_CONNECT_TIMEOUT)
         .with_context(|| format!("connecting to Redis for XREAD on {stream_name}"))?;
     let raw: redis::Value = redis::cmd("XREAD")
         .arg("BLOCK")
@@ -2225,7 +2225,7 @@ mod tests {
         assert!(joined.contains("bind:"), "bind line present");
         assert!(joined.contains("http://127.0.0.1:8765"), "bind shows the addr");
         assert!(joined.contains("flow schema:"), "schema line present");
-        assert!(joined.contains(crate::flow::FLOW_SCHEMA_VERSION), "schema version shown");
+        assert!(joined.contains(darkmux_flow::FLOW_SCHEMA_VERSION), "schema version shown");
         assert!(joined.contains("/tmp/darkmux-flows-banner-test"), "flows dir shown");
         assert!(joined.contains("missions:       3 loaded"), "mission count rendered");
         assert!(joined.contains("sprints:        9 loaded"), "sprint count rendered");
@@ -2404,7 +2404,7 @@ mod tests {
         }
 
         fn today_utc_date() -> String {
-            crate::flow::day_utc_now()
+            darkmux_flow::day_utc_now()
         }
 
         async fn body_as_array(

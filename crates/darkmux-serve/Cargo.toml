@@ -1,0 +1,32 @@
+[package]
+name = "darkmux-serve"
+version = "0.4.0"
+edition = "2021"
+description = "darkmux serve — the flow-observability HTTP/SSE daemon"
+license = "MIT"
+homepage = "https://darkmux.com"
+repository = "https://github.com/kstrat2001/darkmux"
+authors = ["Kain Osterholt"]
+rust-version = "1.80"
+
+[dependencies]
+darkmux-types = { path = "../darkmux-types" }
+darkmux-flow = { path = "../darkmux-flow" }
+darkmux-profiles = { path = "../darkmux-profiles" }
+darkmux-crew = { path = "../darkmux-crew" }
+darkmux-eureka = { path = "../darkmux-eureka" }
+darkmux-fleet = { path = "../darkmux-fleet" }
+darkmux-doctor = { path = "../darkmux-doctor" }
+anyhow = "1.0"
+axum = "0.7"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "fs", "io-util"] }
+tokio-stream = "0.1"
+futures = "0.3"
+tower-http = { version = "0.5", features = ["cors"] }
+serde_json = "1.0"
+redis = { version = "0.27", default-features = false, features = ["streams"] }
+
+[dev-dependencies]
+tempfile = "3.10"
+serial_test = "3.1"
+tower = "0.5"
