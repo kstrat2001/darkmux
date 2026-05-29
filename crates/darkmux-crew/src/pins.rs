@@ -104,7 +104,7 @@ pub fn load_pins() -> Result<&'static PinTable> {
 /// Production never calls this — the cache lifetime is the process
 /// lifetime by intent. Test-only by `#[cfg(test)]` gate.
 #[cfg(test)]
-pub fn clear_cache_for_tests() {
+pub(crate) fn clear_cache_for_tests() {
     let mut guard = PIN_CACHE.lock().expect("pin cache poisoned");
     // The previously-leaked PinTable stays leaked (we don't have a
     // safe way to reclaim it; the leak was the price of the &'static

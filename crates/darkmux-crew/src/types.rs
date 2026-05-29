@@ -63,7 +63,7 @@ pub enum Capability {
 /// stable ordering. Map size is small (4-10 entries today, capped by
 /// the `Capability` enum's variant count); cost vs `HashMap` is
 /// negligible.
-pub type CapabilityProfile = BTreeMap<Capability, f32>;
+pub(crate) type CapabilityProfile = BTreeMap<Capability, f32>;
 
 /// A named skill with keyword-based relevance scoring + an intrinsic
 /// capability profile. A role declares which skills it has; the

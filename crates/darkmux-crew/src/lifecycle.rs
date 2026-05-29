@@ -97,7 +97,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 // `#[serial_test::serial]` since env var mutation isn't thread-safe.
 
 /// Directory holding the mission's JSON and its sprints/ subdir.
-pub fn mission_dir(mission_id: &str) -> PathBuf {
+pub(crate) fn mission_dir(mission_id: &str) -> PathBuf {
     crate::loader::missions_dir().join(mission_id)
 }
 
@@ -124,7 +124,7 @@ pub fn sprint_path(mission_id: &str, sprint_id: &str) -> PathBuf {
 /// target paths via `mission_path(id)` and walks `legacy_missions_dir()`,
 /// so this per-id resolver isn't currently called.
 #[allow(dead_code)]
-pub fn legacy_mission_path(mission_id: &str) -> PathBuf {
+pub(crate) fn legacy_mission_path(mission_id: &str) -> PathBuf {
     crate::loader::missions_dir().join(format!("{mission_id}.json"))
 }
 
@@ -132,7 +132,7 @@ pub fn legacy_mission_path(mission_id: &str) -> PathBuf {
 /// public API for symmetry with the dir helpers; see
 /// `legacy_mission_path` for why.
 #[allow(dead_code)]
-pub fn legacy_sprint_path(sprint_id: &str) -> PathBuf {
+pub(crate) fn legacy_sprint_path(sprint_id: &str) -> PathBuf {
     crate::loader::sprints_dir().join(format!("{sprint_id}.json"))
 }
 
@@ -244,7 +244,7 @@ fn fsync_dir(dir: &std::path::Path) -> Result<()> {
 /// JSON itself). Kept as the primary public surface for code that *does*
 /// have both ids in scope (e.g., crew dispatch when `--mission` lands).
 #[allow(dead_code)]
-pub fn load_sprint(mission_id: &str, sprint_id: &str) -> Result<Sprint> {
+pub(crate) fn load_sprint(mission_id: &str, sprint_id: &str) -> Result<Sprint> {
     let path = sprint_path(mission_id, sprint_id);
     if !path.is_file() {
         anyhow::bail!(
@@ -267,7 +267,7 @@ pub fn load_sprint(mission_id: &str, sprint_id: &str) -> Result<Sprint> {
 /// during a partial #148 migration since post-migration the uniqueness
 /// is per-mission), the first match in `(mission_id, sprint_id)` sort
 /// order wins and a flow record is emitted.
-pub fn load_sprint_by_id(sprint_id: &str) -> Result<Sprint> {
+pub(crate) fn load_sprint_by_id(sprint_id: &str) -> Result<Sprint> {
     let all = load_sprints()?;
     let mut matches: Vec<&Sprint> = all.iter().filter(|s| s.id == sprint_id).collect();
     match matches.as_slice() {
@@ -529,7 +529,7 @@ pub fn mission_start_with_reasoning(id: &str, reasoning: Option<&str>) -> Result
 
 /// `mission close <id>` — Active/Paused → Closed (terminal).
 #[allow(dead_code)]
-pub fn mission_close(id: &str) -> Result<Mission> {
+pub(crate) fn mission_close(id: &str) -> Result<Mission> {
     mission_close_with_reasoning(id, None)
 }
 
@@ -549,7 +549,7 @@ pub fn mission_close_with_reasoning(id: &str, reasoning: Option<&str>) -> Result
 /// `mission pause <id>` — Active → Paused. Updates `paused_ts` to now even
 /// if a prior pause was recorded (operator gets the most-recent pause time).
 #[allow(dead_code)]
-pub fn mission_pause(id: &str) -> Result<Mission> {
+pub(crate) fn mission_pause(id: &str) -> Result<Mission> {
     mission_pause_with_reasoning(id, None)
 }
 
@@ -570,7 +570,7 @@ pub fn mission_pause_with_reasoning(id: &str, reasoning: Option<&str>) -> Result
 /// `mission resume <id>` — Paused → Active. Does NOT clear `paused_ts` —
 /// the operator may want to see how long the mission was paused.
 #[allow(dead_code)]
-pub fn mission_resume(id: &str) -> Result<Mission> {
+pub(crate) fn mission_resume(id: &str) -> Result<Mission> {
     mission_resume_with_reasoning(id, None)
 }
 
@@ -623,7 +623,7 @@ pub fn mission_resume_with_reasoning(id: &str, reasoning: Option<&str>) -> Resul
 ///     explicitly edit; either way, don't paper over the conflict).
 ///   - Any `depends_on` id doesn't resolve to an existing sprint.
 #[allow(dead_code)]
-pub fn add_sprint_to_mission(
+pub(crate) fn add_sprint_to_mission(
     mission_id: &str,
     sprint_id: &str,
     description: &str,

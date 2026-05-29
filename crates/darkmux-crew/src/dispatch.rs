@@ -534,7 +534,7 @@ pub fn fresh_session_id(role_id: &str) -> String {
 ///
 /// Cap: 200 files per `root`. The dispatcher's job is to surface the
 /// signal, not to dump entire repos.
-pub fn snapshot_watched_path(root: &Path) -> WatchedPathState {
+pub(crate) fn snapshot_watched_path(root: &Path) -> WatchedPathState {
     const MAX_FILES_PER_ROOT: usize = 200;
 
     if !root.exists() {
@@ -675,7 +675,7 @@ fn load_operator_identity() -> Option<String> {
 /// systemPromptOverride written to openclaw.json reflects the
 /// augmented form) AND preflight time (so drift detection compares
 /// like-for-like).
-pub fn augment_prompt_with_identity(role_prompt: &str) -> String {
+pub(crate) fn augment_prompt_with_identity(role_prompt: &str) -> String {
     match load_operator_identity() {
         Some(identity) => format!(
             "{role_prompt}\n\n---\n\n## About the operator\n\n{}\n",
@@ -1461,7 +1461,7 @@ pub fn build_dispatch_record_with_payload(
 /// and is the right place for that signal. The flow record's absent
 /// `model` field is operator-visible enough on its own — it shows as
 /// missing in the viewer, which is the same signal in the right place.
-pub fn resolve_dispatch_model(agent_id: &str) -> Option<String> {
+pub(crate) fn resolve_dispatch_model(agent_id: &str) -> Option<String> {
     let path = default_openclaw_config();
     let raw = fs::read_to_string(&path).ok()?;
     let config: Value = serde_json::from_str(&raw).ok()?;
