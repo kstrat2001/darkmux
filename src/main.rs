@@ -11,27 +11,34 @@ mod doctor;
 mod eureka;
 mod external;
 mod fleet;
-pub mod flow;
+// #463 workspace split — flow extracted to the darkmux-flow crate. The
+// re-export keeps all existing `crate::flow::*` paths resolving unchanged.
+pub use darkmux_flow as flow;
 mod flow_cli;
 mod hardware;
 mod heuristics;
 mod init;
 mod lab;
-mod lms;
 mod migrate;
 mod mission_propose;
 mod notebook;
 mod optimize;
-mod profiles;
 mod providers;
 mod recommendations;
 mod role_cli;
-mod runtime;
 mod serve;
 mod skills;
 mod sprint_cli;
-mod swap;
-mod types;
+// #463 workspace split (PR2) — profiles/swap/lms/runtime extracted to the
+// darkmux-profiles crate. These re-exports keep every existing
+// crate::{profiles,swap,lms,runtime}::* path resolving unchanged.
+pub use darkmux_profiles::lms;
+pub use darkmux_profiles::profiles;
+pub use darkmux_profiles::runtime;
+pub use darkmux_profiles::swap;
+// #463 workspace split — types extracted to the darkmux-types crate. The
+// re-export keeps all existing `crate::types::*` paths resolving unchanged.
+pub use darkmux_types as types;
 mod workdir;
 mod workloads;
 

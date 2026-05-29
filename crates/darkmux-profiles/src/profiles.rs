@@ -1,4 +1,4 @@
-use crate::types::{Profile, ProfileRegistry};
+use darkmux_types::{Profile, ProfileRegistry};
 use anyhow::{Context, Result, anyhow, bail};
 use std::env;
 use std::fs;
@@ -94,7 +94,7 @@ fn validate_profile(name: &str, profile: &Profile, path: &Path) -> Result<()> {
     let primaries = profile
         .models
         .iter()
-        .filter(|m| matches!(m.role, crate::types::ModelRole::Primary))
+        .filter(|m| matches!(m.role, darkmux_types::ModelRole::Primary))
         .count();
     if primaries != 1 {
         bail!(
@@ -126,7 +126,7 @@ pub fn get_profile<'a>(reg: &'a ProfileRegistry, name: &str) -> Result<&'a Profi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ModelRole;
+    use darkmux_types::ModelRole;
     use std::io::Write;
     use tempfile::TempDir;
 

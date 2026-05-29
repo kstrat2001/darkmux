@@ -1,6 +1,6 @@
 use crate::lms;
 use crate::runtime::apply_runtime;
-use crate::types::{Profile, ProfileHookCommand, ProfileModel, ProfileRegistry};
+use darkmux_types::{Profile, ProfileHookCommand, ProfileModel, ProfileRegistry};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::process::Command;
@@ -92,7 +92,7 @@ pub fn swap(profile: &Profile, registry: &ProfileRegistry, opts: SwapOpts) -> Re
 
     // Pass 2 — load anything the profile wants that isn't already correctly
     // loaded under our namespace.
-    let loaded_after_unload: HashMap<&str, &crate::types::LoadedModel> = loaded
+    let loaded_after_unload: HashMap<&str, &darkmux_types::LoadedModel> = loaded
         .iter()
         .filter(|lm| !result.unloaded.iter().any(|u| u == &lm.identifier))
         .map(|lm| (lm.identifier.as_str(), lm))
@@ -159,7 +159,7 @@ fn run_hooks(hooks: &[ProfileHookCommand], profile: &Profile, opts: &SwapOpts) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ModelRole, Profile, ProfileModel, ProfileRuntime};
+    use darkmux_types::{ModelRole, Profile, ProfileModel, ProfileRuntime};
 
     fn opts() -> SwapOpts {
         SwapOpts { quiet: true, dry_run: true }

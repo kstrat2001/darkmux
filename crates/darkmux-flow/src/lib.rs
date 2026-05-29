@@ -209,7 +209,7 @@ pub struct FlowRecord {
 /// Resolve the flows directory from env override (`DARKMUX_FLOWS_DIR`) or
 /// default (`~/.darkmux/flows/`). Falls back to `/tmp/darkmux/flows/` if
 /// neither is resolvable (CI / sandboxed environments without HOME).
-pub(crate) fn flows_dir() -> PathBuf {
+pub fn flows_dir() -> PathBuf {
     std::env::var("DARKMUX_FLOWS_DIR")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -220,7 +220,7 @@ pub(crate) fn flows_dir() -> PathBuf {
 
 /// ISO 8601 UTC date string from current time — `YYYY-MM-DD`. Used for
 /// per-day file naming (one JSONL file per UTC day), NOT for record `ts`.
-pub(crate) fn day_utc_now() -> String {
+pub fn day_utc_now() -> String {
     let secs = current_epoch_secs();
     let (y, m, d) = epoch_to_yyyymmdd(secs);
     format!("{:04}-{:02}-{:02}", y, m, d)
@@ -229,7 +229,7 @@ pub(crate) fn day_utc_now() -> String {
 /// ISO 8601 UTC datetime string from current time — `YYYY-MM-DDTHH:MM:SSZ`.
 /// Used for `FlowRecord.ts`. Seconds precision is sufficient for the
 /// dispatch / sprint timing surfaces; finer precision is a future bump.
-pub(crate) fn ts_utc_now() -> String {
+pub fn ts_utc_now() -> String {
     let secs = current_epoch_secs();
     let (y, mo, d) = epoch_to_yyyymmdd(secs);
     let (h, mi, s) = epoch_to_hhmmss(secs);
@@ -395,7 +395,7 @@ impl FlowSink for LocalFileSink {
 /// Resolve the audit directory from env override (`DARKMUX_AUDIT_DIR`)
 /// or default (`~/.darkmux/audit/`). Symmetric with `flows_dir()` but
 /// deliberately separate so audit and casual records never share a path.
-pub(crate) fn audit_dir() -> PathBuf {
+pub fn audit_dir() -> PathBuf {
     std::env::var("DARKMUX_AUDIT_DIR")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -760,16 +760,16 @@ pub struct IntegrityReport {
 /// `Display` implementation below — all other paths reach the redacted
 /// form through `format!("{raw_url}")` or `.to_string()`.
 #[derive(Clone, Debug)]
-pub(crate) struct RawRedisUrl(String);
+pub struct RawRedisUrl(String);
 
 impl RawRedisUrl {
-    pub(crate) fn new(url: String) -> Self {
+    pub fn new(url: String) -> Self {
         Self(url)
     }
 
     /// Return the raw (unredacted) URL for `redis::Client::open` calls.
     /// The verbose name makes accidental use visible in review.
-    pub(crate) fn expose_for_probe(&self) -> &str {
+    pub fn expose_for_probe(&self) -> &str {
         &self.0
     }
 }
@@ -819,7 +819,7 @@ pub struct RedisSink {
 /// running Redis behind a slow VPN where 500ms isn't enough will see
 /// flow-record writes fail; if that surfaces in practice we'll need
 /// to make the cap operator-configurable.
-pub(crate) const REDIS_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+pub const REDIS_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Test-only env scrubber (#278). Tests in `flow::tests` write flow
 /// records via the default sink path which respects the
@@ -831,8 +831,14 @@ pub(crate) const REDIS_CONNECT_TIMEOUT: std::time::Duration = std::time::Duratio
 /// via the default sink path; idempotent and safe to call multiple
 /// times. Uses `OnceLock` so the scrub fires exactly once per
 /// test-binary invocation.
-#[cfg(test)]
-pub(crate) fn isolate_test_env_once() {
+// Gated on `any(test, feature = "test-support")` rather than `test` alone:
+// since #463 split flow into its own crate, a plain `#[cfg(test)]` would only
+// compile this for flow's *own* test build, leaving it invisible to downstream
+// crates' tests (e.g. `flow_cli` tests in the binary). The `test-support`
+// feature lets the binary opt in via a dev-dependency without compiling the
+// helper into release builds.
+#[cfg(any(test, feature = "test-support"))]
+pub fn isolate_test_env_once() {
     static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     INIT.get_or_init(|| {
         unsafe {
@@ -1282,7 +1288,7 @@ pub fn resolve_machine_tier() -> Option<String> {
 ///
 /// `sync_all()` is called after both write paths so audit-log durability
 /// survives power loss / crash between record emission and consumer read.
-pub(crate) fn record_at(record: &FlowRecord, path: &Path) -> Result<()> {
+pub fn record_at(record: &FlowRecord, path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)
@@ -1582,7 +1588,7 @@ fn find_redis_cfg(info: &SinkInfo) -> Option<RedisCfg> {
 /// `@` is treated as `<userinfo>@`; the password portion (after the first
 /// `:` in userinfo) is replaced with `***`. URLs without an `@` are
 /// returned unchanged.
-pub(crate) fn redact_url_creds(url: &str) -> String {
+pub fn redact_url_creds(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else {
         return url.to_string();
     };

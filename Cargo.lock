@@ -332,6 +332,9 @@ dependencies = [
  "axum",
  "blake3",
  "clap",
+ "darkmux-flow",
+ "darkmux-profiles",
+ "darkmux-types",
  "dirs",
  "futures",
  "libc",
@@ -347,6 +350,46 @@ dependencies = [
  "tower",
  "tower-http",
  "ureq",
+]
+
+[[package]]
+name = "darkmux-flow"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "clap",
+ "dirs",
+ "libc",
+ "redis",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "tempfile",
+]
+
+[[package]]
+name = "darkmux-profiles"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "darkmux-types",
+ "dirs",
+ "serde_json",
+ "serial_test",
+ "tempfile",
+]
+
+[[package]]
+name = "darkmux-types"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "tempfile",
 ]
 
 [[package]]
