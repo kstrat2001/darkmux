@@ -3,7 +3,7 @@
 //! Phase 1 stub: trivially returns the active profile's Primary-role
 //! model. Phase 2+ extends this into capability-scored selection over
 //! all `models[]` candidates, with the role's
-//! [`crate::crew::types::Role::capabilities`] vector as the input.
+//! [`crate::types::Role::capabilities`] vector as the input.
 //!
 //! ## Why a function (not a method on Profile)
 //!
@@ -33,8 +33,8 @@
 //! via select_model" from day one, not "phase 1 hack to refactor
 //! away later."
 
-use crate::crew::types::Role;
-use crate::types::Profile;
+use crate::types::Role;
+use darkmux_types::Profile;
 use anyhow::{anyhow, Result};
 
 /// Pick which model the dispatch should target for `role` given the
@@ -76,8 +76,8 @@ pub fn select_model(role: &Role, profile: &Profile) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crew::types::{EscalationContract, Role, ToolPalette};
-    use crate::types::{ModelRole, Profile, ProfileModel};
+    use crate::types::{EscalationContract, Role, ToolPalette};
+    use darkmux_types::{ModelRole, Profile, ProfileModel};
 
     fn make_role(id: &str, skill_ids: &[&str]) -> Role {
         Role {

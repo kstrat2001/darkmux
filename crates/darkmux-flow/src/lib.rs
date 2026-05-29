@@ -6,6 +6,8 @@
 //! `~/.darkmux/flows/` (overridable via `DARKMUX_FLOWS_DIR`). The first write
 //! atomically prepends a schema header so partial-file recovery is possible.
 
+pub mod daemon_probe;
+
 use anyhow::{Context, Result};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
@@ -822,15 +824,14 @@ pub struct RedisSink {
 pub const REDIS_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Test-only env scrubber (#278). Tests in `flow::tests` write flow
-/// records via the default sink path which respects the
-/// `DARKMUX_REDIS_URL` and `DARKMUX_AUDIT_DIR` env vars. An operator
-/// running tests from their daily shell with these env vars pointing
-/// at an unreachable peer (the Studio-offline scenario from
-/// 2026-05-21) saw the test bin wall-clock balloon by 75s/record.
-/// This helper scrubs the env in any flow test that writes records
-/// via the default sink path; idempotent and safe to call multiple
-/// times. Uses `OnceLock` so the scrub fires exactly once per
-/// test-binary invocation.
+/// records via the default sink path which respects `DARKMUX_REDIS_URL`.
+/// An operator running tests from their daily shell with that var pointing
+/// at an unreachable peer (the Studio-offline scenario from 2026-05-21)
+/// saw the test bin wall-clock balloon by 75s/record. This helper scrubs
+/// it in any flow test that writes records via the default sink path;
+/// idempotent and safe to call multiple times. Uses `OnceLock` so the
+/// scrub fires exactly once per test-binary invocation. (Deliberately does
+/// NOT touch `DARKMUX_AUDIT_DIR` — see the note in the body.)
 // Gated on `any(test, feature = "test-support")` rather than `test` alone:
 // since #463 split flow into its own crate, a plain `#[cfg(test)]` would only
 // compile this for flow's *own* test build, leaving it invisible to downstream
@@ -843,7 +844,17 @@ pub fn isolate_test_env_once() {
     INIT.get_or_init(|| {
         unsafe {
             std::env::remove_var("DARKMUX_REDIS_URL");
-            std::env::remove_var("DARKMUX_AUDIT_DIR");
+            // NOTE: we intentionally do NOT scrub DARKMUX_AUDIT_DIR here.
+            // This OnceLock fires lazily on the first default-sink dispatch,
+            // which can land mid-flight while a `#[serial]` audit test has
+            // legitimately set DARKMUX_AUDIT_DIR to its own tmp dir — wiping
+            // it and routing that test's later records elsewhere (the
+            // intermittent `records_checked == 1` failure on
+            // audit_file_sink_recovers_chain_across_process_boundaries).
+            // REDIS_URL is the load-bearing scrub: an unreachable peer costs
+            // 75s/record (the 2026-05-21 Studio-offline scenario). AUDIT_DIR
+            // is a local file path — it never causes that timeout, so leaving
+            // it untouched costs nothing and removes the race. (#463)
         }
     });
 }
@@ -2502,6 +2513,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn record_default_path_uses_local_file_sink() {
         // The public `record()` should dispatch through the default sink
         // and produce on-disk output (behavior-equivalent to pre-#162).
@@ -3380,6 +3392,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn audit_dir_respects_env_override() {
         let prev = std::env::var("DARKMUX_AUDIT_DIR").ok();
         unsafe { std::env::set_var("DARKMUX_AUDIT_DIR", "/tmp/dm-audit-test"); }

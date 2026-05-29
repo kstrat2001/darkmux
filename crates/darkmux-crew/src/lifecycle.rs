@@ -62,9 +62,10 @@
 //! transition, not "this mission exists." That's why creation alone
 //! leaves `started_ts: None`.
 
-use crate::crew::loader::load_sprints;
-use crate::crew::types::{Mission, MissionStatus, Sprint, SprintStatus};
-use crate::flow::{self, Category, FlowRecord, Level, Stage, Tier};
+use crate::loader::load_sprints;
+use crate::types::{Mission, MissionStatus, Sprint, SprintStatus};
+use darkmux_flow as flow;
+use darkmux_flow::{Category, FlowRecord, Level, Stage, Tier};
 use anyhow::{bail, Context, Result};
 use std::fs;
 use std::path::PathBuf;
@@ -97,7 +98,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Directory holding the mission's JSON and its sprints/ subdir.
 pub fn mission_dir(mission_id: &str) -> PathBuf {
-    crate::crew::loader::missions_dir().join(mission_id)
+    crate::loader::missions_dir().join(mission_id)
 }
 
 /// The mission JSON path under the per-mission directory.
@@ -124,7 +125,7 @@ pub fn sprint_path(mission_id: &str, sprint_id: &str) -> PathBuf {
 /// so this per-id resolver isn't currently called.
 #[allow(dead_code)]
 pub fn legacy_mission_path(mission_id: &str) -> PathBuf {
-    crate::crew::loader::missions_dir().join(format!("{mission_id}.json"))
+    crate::loader::missions_dir().join(format!("{mission_id}.json"))
 }
 
 /// Pre-#148 flat sprint path: `<sprints_dir>/<id>.json`. Held as
@@ -132,18 +133,18 @@ pub fn legacy_mission_path(mission_id: &str) -> PathBuf {
 /// `legacy_mission_path` for why.
 #[allow(dead_code)]
 pub fn legacy_sprint_path(sprint_id: &str) -> PathBuf {
-    crate::crew::loader::sprints_dir().join(format!("{sprint_id}.json"))
+    crate::loader::sprints_dir().join(format!("{sprint_id}.json"))
 }
 
 /// Pre-#148 flat missions dir: `<missions_dir>/` (containing flat
 /// `<id>.json` files at the top level).
 pub fn legacy_missions_dir() -> PathBuf {
-    crate::crew::loader::missions_dir()
+    crate::loader::missions_dir()
 }
 
 /// Pre-#148 flat sprints dir: `<sprints_dir>/`.
 pub fn legacy_sprints_dir() -> PathBuf {
-    crate::crew::loader::sprints_dir()
+    crate::loader::sprints_dir()
 }
 
 // ─── Time ───────────────────────────────────────────────────────────────
@@ -272,7 +273,7 @@ pub fn load_sprint_by_id(sprint_id: &str) -> Result<Sprint> {
     match matches.as_slice() {
         [] => anyhow::bail!(
             "no sprint with id `{sprint_id}` found in any mission under {}",
-            crate::crew::loader::missions_dir().display()
+            crate::loader::missions_dir().display()
         ),
         [_one] => Ok(matches.remove(0).clone()),
         _ => {
@@ -761,7 +762,7 @@ fn resolve_insert_position(sprint_ids: &[String], after: Option<&str>) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crew::types::{Mission, MissionStatus, Sprint, SprintStatus};
+    use crate::types::{Mission, MissionStatus, Sprint, SprintStatus};
     use std::env;
     use tempfile::TempDir;
 
@@ -1267,7 +1268,7 @@ mod tests {
 
         // Read the day's flow file from the temp DARKMUX_FLOWS_DIR.
         let flows_dir = env::var("DARKMUX_FLOWS_DIR").unwrap();
-        let day = crate::flow::day_utc_now();
+        let day = darkmux_flow::day_utc_now();
         let path = std::path::PathBuf::from(flows_dir).join(format!("{day}.jsonl"));
         let raw = std::fs::read_to_string(&path).expect("flow file should have been created");
         let found = raw.lines().any(|line| {

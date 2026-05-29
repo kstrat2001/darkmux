@@ -6,6 +6,7 @@
 //! without pulling in the lab crate.
 
 pub mod paths;
+pub mod workdir;
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

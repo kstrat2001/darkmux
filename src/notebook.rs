@@ -201,7 +201,7 @@ fn dispatch_draft_via_internal(role: &str, prompt: &str, session_id: &str) -> Re
         // defaults are fine.
         compaction: crate::crew::dispatch::CompactionDispatchArgs::default(),
     };
-    let result = crate::crew::dispatch::dispatch(opts)
+    let result = crate::fleet::dispatch_routed(opts)
         .context("internal-runtime dispatch for notebook draft")?;
     if result.exit_code != 0 {
         bail!(

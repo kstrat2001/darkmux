@@ -332,6 +332,7 @@ dependencies = [
  "axum",
  "blake3",
  "clap",
+ "darkmux-crew",
  "darkmux-flow",
  "darkmux-profiles",
  "darkmux-types",
@@ -350,6 +351,22 @@ dependencies = [
  "tower",
  "tower-http",
  "ureq",
+]
+
+[[package]]
+name = "darkmux-crew"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "darkmux-flow",
+ "darkmux-profiles",
+ "darkmux-types",
+ "dirs",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "tempfile",
 ]
 
 [[package]]

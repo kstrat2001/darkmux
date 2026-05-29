@@ -15,8 +15,8 @@
 //! `agents.list[]` reflect the manifests on disk — writes/updates the
 //! `darkmux/<role>` entries to match what the manifests + `.md` prompts say.
 
-use crate::crew::loader::{load_role_prompt, load_roles, load_sprints};
-use crate::crew::types::Role;
+use crate::loader::{load_role_prompt, load_roles, load_sprints};
+use crate::types::Role;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Map, Value};
 use std::fs;
@@ -41,7 +41,7 @@ const LICENSED_ADJACENT_ROLES: &[&str] = &["health-research", "legal-research", 
 /// Default openclaw config path. `DARKMUX_OPENCLAW_CONFIG` env var overrides
 /// (e.g., for tests). Visible to other crates so the doctor pin-drift
 /// check (#160) reads from the same path sync writes to.
-pub(crate) fn default_openclaw_config() -> PathBuf {
+pub fn default_openclaw_config() -> PathBuf {
     if let Ok(p) = std::env::var("DARKMUX_OPENCLAW_CONFIG") {
         let trimmed = p.trim();
         if !trimmed.is_empty() {
@@ -364,7 +364,7 @@ pub struct CompactionDispatchArgs {
     /// `profile.runtime.compaction.strategy` (#372 T2-A). When
     /// `None`, runtime uses default Narrative. Setting
     /// `Some(StructuredSlot)` opts the dispatch into tier-2.
-    pub strategy: Option<crate::types::CompactionStrategy>,
+    pub strategy: Option<darkmux_types::CompactionStrategy>,
     /// (#377) Escalation bound — after this many compactions, the
     /// runtime emits `TerminalReason::EscalationTriggered` and exits
     /// instead of continuing the agent loop. Set from
@@ -386,8 +386,8 @@ impl CompactionDispatchArgs {
     /// supplied openclaw-shape passthroughs (`maxHistoryShare`,
     /// `model`) from the `extras` map. Picks the primary model's
     /// `n_ctx` as the context_window (needed for formula trigger).
-    pub fn from_profile(profile: &crate::types::Profile) -> Self {
-        use crate::types::ModelRole;
+    pub fn from_profile(profile: &darkmux_types::Profile) -> Self {
+        use darkmux_types::ModelRole;
         let comp = profile.runtime.as_ref().and_then(|r| r.compaction.as_ref());
         let threshold_tokens = comp
             .and_then(|c| c.threshold_tokens)
@@ -457,7 +457,7 @@ impl CompactionDispatchArgs {
     /// The role's `escalation_posture` field is parsed here too but
     /// is currently informational only — the host/skill layer in
     /// chunk 5 will branch on it when frontier handoff lands.
-    pub fn apply_role_override(&mut self, role: &crate::crew::types::Role) {
+    pub fn apply_role_override(&mut self, role: &crate::types::Role) {
         if let Some(role_bail) = role.bail_after_compactions {
             self.bail_after_compactions = Some(role_bail);
         }
@@ -514,7 +514,7 @@ static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// faster than microsecond resolution allows). Together they guarantee no
 /// two `fresh_session_id` calls return the same string, closing the
 /// per-agent session reuse this helper is meant to prevent (#88).
-pub(crate) fn fresh_session_id(role_id: &str) -> String {
+pub fn fresh_session_id(role_id: &str) -> String {
     let micros = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_micros())
@@ -534,7 +534,7 @@ pub(crate) fn fresh_session_id(role_id: &str) -> String {
 ///
 /// Cap: 200 files per `root`. The dispatcher's job is to surface the
 /// signal, not to dump entire repos.
-pub(crate) fn snapshot_watched_path(root: &Path) -> WatchedPathState {
+pub fn snapshot_watched_path(root: &Path) -> WatchedPathState {
     const MAX_FILES_PER_ROOT: usize = 200;
 
     if !root.exists() {
@@ -675,7 +675,7 @@ fn load_operator_identity() -> Option<String> {
 /// systemPromptOverride written to openclaw.json reflects the
 /// augmented form) AND preflight time (so drift detection compares
 /// like-for-like).
-pub(crate) fn augment_prompt_with_identity(role_prompt: &str) -> String {
+pub fn augment_prompt_with_identity(role_prompt: &str) -> String {
     match load_operator_identity() {
         Some(identity) => format!(
             "{role_prompt}\n\n---\n\n## About the operator\n\n{}\n",
@@ -702,7 +702,7 @@ pub(crate) fn augment_prompt_with_identity(role_prompt: &str) -> String {
 /// New layout (#148): `<crew_root>/missions/<mission_id>/sprints/<sprint_id>-output.txt`
 /// co-located with the sprint manifest under the per-mission directory.
 fn sprint_output_path(mission_id: &str, sprint_id: &str) -> PathBuf {
-    crate::crew::lifecycle::sprints_dir(mission_id).join(format!("{sprint_id}-output.txt"))
+    crate::lifecycle::sprints_dir(mission_id).join(format!("{sprint_id}-output.txt"))
 }
 
 /// Resolve the dispatch message: when `sprint_id` is `Some(id)`, look
@@ -840,7 +840,7 @@ fn persist_sprint_output(sprint_id: Option<&str>, reply_text: &str) -> Option<Pa
     }
     // Resolve mission_id via lifecycle so the output file lands in the
     // per-mission directory next to the sprint manifest (#148).
-    let mission_id = match crate::crew::lifecycle::load_sprint_by_id(sprint_id) {
+    let mission_id = match crate::lifecycle::load_sprint_by_id(sprint_id) {
         Ok(s) => s.mission_id,
         Err(_) => {
             eprintln!(
@@ -912,7 +912,7 @@ fn apply_workdir_override(workdir: Option<&Path>, role_workspace: &Path) -> Resu
     // the canonical (symlink-free) path — operations below use the
     // operator-supplied `target` for messages but the canonical path
     // for filesystem ops is captured at the link-create site below.
-    let _resolved = crate::workdir::validate_workdir(target)?;
+    let _resolved = darkmux_types::workdir::validate_workdir(target)?;
 
     fs::create_dir_all(role_workspace)
         .with_context(|| format!("creating role workspace {}", role_workspace.display()))?;
@@ -979,120 +979,26 @@ fn is_openclaw_noise(path: &Path) -> bool {
 }
 
 /// Run a single dispatch end-to-end.
+/// Local dispatch entry point. Runs the role through the in-house
+/// container-bounded runtime (`--runtime internal`) or the openclaw
+/// shell-out path on THIS machine. Never routes across the fleet — the
+/// local-vs-remote routing decision lives in `fleet::dispatch_routed`
+/// (#463 cycle-break: moved up so `crew` doesn't depend on `fleet`).
+/// User-facing callers go through `fleet::dispatch_routed`; the fleet
+/// worker (already on the chosen machine) calls this directly.
 pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
-    // PR-C.3 tier-routing branch (#246): when --machine is set AND it's
-    // not the local machine, publish to the work queue and (if --wait)
-    // block on the worker's dispatch.complete flow record. Local
-    // dispatches (no --machine, OR --machine == local) fall through to
-    // the existing local path unchanged.
-    if let Some(target) = opts.machine.clone() {
-        let local = crate::flow::resolve_machine_id();
-        match routing_decision(Some(target.as_str()), local.as_deref()) {
-            RoutingDecision::Local {
-                matches_was_explicit: true,
-            } => {
-                eprintln!(
-                    "darkmux crew dispatch: --machine={target} matches local machine_id; \
-                     routing locally."
-                );
-            }
-            RoutingDecision::Remote {
-                target,
-                local_unknown: true,
-            } => {
-                // PR-C.3 review MEDIUM (Wave-E.7): local machine_id is
-                // unresolvable (no DARKMUX_MACHINE_ID, hostname failed).
-                // Routing via queue is the only option — surface the
-                // ambiguity loudly so the operator sees what happened.
-                eprintln!(
-                    "darkmux crew dispatch: WARNING — local DARKMUX_MACHINE_ID is unresolvable. \
-                     --machine={target} routes via the queue regardless. \
-                     If you intended a local dispatch, set DARKMUX_MACHINE_ID to make \
-                     tier-routing decisions deterministic."
-                );
-                // #290 — emit the pinned route record so the audit
-                // trail + topology UI see the operator-pinned routing
-                // decision (parity with the auto-route path's record).
-                // Validation runs BEFORE the emit so a role-load
-                // failure OR an invalid tier doesn't leave a misleading
-                // "pinned" record in the audit chain.
-                let role_tier = resolve_role_tier_for_record(&opts)?;
-                let session_id =
-                    emit_route_record_and_resolve_session(&opts, &role_tier, Some(&target));
-                let mut opts = opts;
-                opts.session_id = Some(session_id);
-                return dispatch_via_queue(opts, Some(&target));
-            }
-            RoutingDecision::Remote {
-                target,
-                local_unknown: false,
-            } => {
-                // #290 — emit the pinned route record so the audit
-                // trail + topology UI see the operator-pinned routing
-                // decision (parity with the auto-route path's record).
-                // Validation runs BEFORE the emit so a role-load
-                // failure OR an invalid tier doesn't leave a misleading
-                // "pinned" record in the audit chain.
-                let role_tier = resolve_role_tier_for_record(&opts)?;
-                let session_id =
-                    emit_route_record_and_resolve_session(&opts, &role_tier, Some(&target));
-                let mut opts = opts;
-                opts.session_id = Some(session_id);
-                return dispatch_via_queue(opts, Some(&target));
-            }
-            RoutingDecision::Local {
-                matches_was_explicit: false,
-            } => {
-                // Unreachable in this branch (we matched Some(target) above)
-                // — but the enum's total shape covers it.
-            }
-        }
-    } else {
-        // #247 PR-B — auto-route by tier when no explicit --machine.
-        // If the role's tier doesn't match the local machine's tier
-        // AND the fleet has a peer in the role's tier, publish to
-        // the tier-stream and let the consumer group claim. The
-        // worker that picks it up does its own preflight — we skip
-        // the local one (same shape as the explicit --machine path
-        // above).
-        if let Some(auto_target_tier) = auto_route_target_tier(&opts)? {
-            let local_tier = crate::flow::resolve_machine_tier();
-            eprintln!(
-                "darkmux crew dispatch: auto-routing role=`{}` via tier=`{}` \
-                 (local tier=`{}`, no --machine — consumer group claims).",
-                opts.role_id,
-                auto_target_tier,
-                local_tier.as_deref().unwrap_or("<unknown>"),
-            );
-            // Emit the dispatch-route flow record so the topology UI
-            // and the audit trail can render WHY the work went to the
-            // tier-stream rather than running locally. (#247 PR-C)
-            // Session id resolved + re-attached so dispatch_via_queue
-            // uses the same one — the worker's start/complete records
-            // pair with this route record by session_id.
-            let session_id = emit_route_record_and_resolve_session(
-                &opts,
-                &auto_target_tier,
-                None, // auto-route — consumer group claims
-            );
-            let mut opts = opts;
-            opts.session_id = Some(session_id);
-            return dispatch_via_queue(opts, None);
-        }
-    }
-
     // Route to the in-house container-bounded runtime when the operator
     // explicitly opts in via `--runtime internal`. Default stays the
     // openclaw path (everything below this branch).
     if opts.runtime == Runtime::Internal {
-        return crate::crew::dispatch_internal::dispatch(opts);
+        return crate::dispatch_internal::dispatch(opts);
     }
 
     // 0. Pre-flight: nudge the operator if the daemon isn't up. The
     //    dispatch will still write flow records to disk, but they
     //    won't be observable in the viewer until the daemon comes up.
     //    Non-blocking; the dispatch proceeds either way (#104 S3).
-    crate::serve::nudge_if_daemon_unreachable("crew dispatch");
+    darkmux_flow::daemon_probe::nudge_if_daemon_unreachable("crew dispatch");
 
     // 1. Load the role + its .md prompt
     let role = load_role_or_bail(&opts.role_id)?;
@@ -1199,8 +1105,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         "prompt_chars": augmented_message.chars().count(),
         "agent_id": agent_id,
     });
-    let _ = crate::flow::record(build_dispatch_record_with_payload(
-        crate::flow::Level::Info,
+    let _ = darkmux_flow::record(build_dispatch_record_with_payload(
+        darkmux_flow::Level::Info,
         "dispatch start",
         &opts.role_id,
         &resolved_session_id,
@@ -1233,8 +1139,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // returning Ok — emission must reflect both success and failure paths
     // so the viewer never sees a dangling start with no terminal event.
     let (action, level) = match &output_result {
-        Ok(o) if o.status.success() => ("dispatch complete", crate::flow::Level::Info),
-        _ => ("dispatch error", crate::flow::Level::Error),
+        Ok(o) if o.status.success() => ("dispatch complete", darkmux_flow::Level::Info),
+        _ => ("dispatch error", darkmux_flow::Level::Error),
     };
     let (stdout_chars, stderr_chars, exit_code) = match &output_result {
         Ok(o) => (o.stdout.len(), o.stderr.len(), o.status.code()),
@@ -1252,7 +1158,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             "error"
         },
     });
-    let _ = crate::flow::record(build_dispatch_record_with_payload(
+    let _ = darkmux_flow::record(build_dispatch_record_with_payload(
         level,
         action,
         &opts.role_id,
@@ -1341,163 +1247,7 @@ fn extract_payload_text(stdout: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Publish a dispatch to the fleet work queue instead of running it
-/// locally (#246 PR-C.3). Called from `dispatch` when `opts.machine`
-/// is set to a non-local id. If `opts.wait` is true (the default for
-/// `crew dispatch`), blocks on the worker's `dispatch.complete` flow
-/// record before returning; otherwise returns immediately with a
-/// fire-and-forget synthetic result.
-/// `target_machine: Some(id)` stamps the WorkJob's hint field so the
-/// audit trail and topology view see the operator-pinned target.
-/// `None` is the auto-route case (#247 PR-B) — the role's tier
-/// alone drives the work-stream choice; consumer-group claim picks
-/// whichever matching-tier worker is free first.
-fn dispatch_via_queue(opts: DispatchOpts, target_machine: Option<&str>) -> Result<DispatchResult> {
-    use crate::fleet;
 
-    // Determine the role's tier requirement (drives the work stream
-    // selection). Roles MUST declare a concrete tier for cross-machine
-    // dispatch — workers register on `darkmux:work:<inference|hub|client>`
-    // streams; a role with `tier: None` would publish to
-    // `darkmux:work:any` which has no consumer and the wait loop would
-    // time out without explanation. Bail loud with operator-actionable
-    // hints. (PR-C.3 review HIGH-1)
-    let role = load_role_or_bail(&opts.role_id)?;
-    let role_tier = match role.tier.clone() {
-        Some(t) if !t.trim().is_empty() && t != "any" => t,
-        Some(t) => {
-            bail!(
-                "role `{}` has tier={:?} which has no fleet consumer (workers \
-                 register on inference/hub/client streams). Either: (a) edit \
-                 the role manifest to declare a concrete tier, or (b) omit \
-                 --machine to dispatch locally.",
-                opts.role_id,
-                t
-            );
-        }
-        None => {
-            bail!(
-                "role `{}` has no tier declaration in its manifest. \
-                 Cross-machine dispatch requires the role to declare which \
-                 machine class it runs on. Either: (a) add \"tier\": \
-                 \"inference\" (or \"hub\") to the role's JSON manifest, or \
-                 (b) omit --machine to dispatch locally.",
-                opts.role_id
-            );
-        }
-    };
-
-    // The Redis URL is required for cross-machine dispatch. If it's
-    // unset, the operator hasn't configured the fleet substrate — bail
-    // loud with the fix-it pointer.
-    let redis_url = std::env::var("DARKMUX_REDIS_URL")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            let context = match target_machine {
-                Some(m) => format!("--machine={m}"),
-                None => format!("cross-tier auto-route (local tier != role tier=`{role_tier}`)"),
-            };
-            anyhow!(
-                "{context} requires DARKMUX_REDIS_URL to be set \
-                 (the fleet work queue lives on Redis). \
-                 Single-machine fleets shouldn't dispatch cross-tier."
-            )
-        })?;
-
-    // Resolve session_id up front — the worker needs it to stamp on
-    // the dispatch.complete record, and --wait needs it as the join key.
-    let session_id = opts
-        .session_id
-        .clone()
-        .unwrap_or_else(|| fresh_session_id(&opts.role_id));
-
-    // Build the WorkJob from DispatchOpts. The shape mirrors what the
-    // worker side reconstructs via `WorkJob::into_dispatch_opts` —
-    // round-trip parity matters for cross-machine dispatch.
-    let job = fleet::build_work_job(
-        role_tier,
-        target_machine.map(|s| s.to_string()),
-        opts.role_id.clone(),
-        opts.message.clone(),
-        session_id.clone(),
-        opts.deliver.clone(),
-        opts.workdir.as_ref().map(|p| p.display().to_string()),
-        opts.sprint_id.clone(),
-        opts.runtime,
-        opts.timeout_seconds,
-        crate::flow::resolve_machine_id(),
-        crate::flow::resolve_orchestrator(),
-    );
-
-    // Open the Redis client lazily here (not at darkmux startup) so the
-    // local-dispatch path doesn't pay any connection cost. The same
-    // `raw_url` is reused by `wait_for_completion` below.
-    let raw_url = crate::flow::RawRedisUrl::new(redis_url);
-    let client = redis::Client::open(raw_url.expose_for_probe())
-        .with_context(|| format!("opening Redis client {raw_url} for --machine dispatch"))?;
-
-    // Publish — `publish_job` runs validate() before XADD, so a
-    // malformed job bails before crossing the network.
-    let work_id = fleet::publish_job(&client, &job).context("publishing WorkJob to fleet queue")?;
-
-    eprintln!(
-        "darkmux crew dispatch: published work_id={work_id} tier={} \
-         target_machine={} session={session_id}",
-        job.target_tier,
-        target_machine.unwrap_or("<auto-route>"),
-    );
-
-    if !opts.wait {
-        // Fire-and-forget. Return a synthetic success result; the
-        // operator polls via `darkmux flow tail --session <id>`.
-        return Ok(DispatchResult {
-            exit_code: 0,
-            stdout: format!("published; not waiting (session_id={session_id})\n"),
-            stderr: String::new(),
-            session_id,
-            watched_state: Vec::new(),
-        });
-    }
-
-    // Block on the worker's dispatch.complete. Timeout = the job's own
-    // timeout + a small slack (the worker's clock starts at claim, so
-    // the dispatching client's wait must outlast the worker's budget).
-    let wait_timeout =
-        std::time::Duration::from_secs((opts.timeout_seconds as u64).saturating_add(30));
-    eprintln!(
-        "darkmux crew dispatch: waiting for dispatch.complete (session={session_id}, \
-         timeout={}s)…",
-        wait_timeout.as_secs()
-    );
-    let completion = fleet::wait_for_completion(&raw_url, &session_id, wait_timeout)
-        .context("waiting for remote dispatch completion")?;
-
-    eprintln!(
-        "darkmux crew dispatch: completed session={} result={} wall_ms={:?}",
-        completion.session_id, completion.result_class, completion.wall_ms
-    );
-
-    // Translate completion → DispatchResult. We don't have stdout from
-    // the worker side (it lives in the worker's flow records, not the
-    // dispatching CLI's stdout); surface the result_class + wall_ms in
-    // the synthetic stdout so the operator sees something useful.
-    Ok(completion_to_dispatch_result(completion))
-}
-
-/// Translate a queue completion (from `fleet::wait_for_completion`)
-/// into the `DispatchResult` shape the CLI returns. Pulls the actual
-/// `exit_code` out of the dispatch.complete payload when present;
-/// falls back to a binary 0/1 derived from `result_class` only when
-/// the payload lacks an explicit exit_code.
-///
-/// Closes the PR-C.3 review MEDIUM: the prior code unconditionally
-/// squashed to `exit_code = if result_class == "ok" { 0 } else { 1 }`,
-/// discarding the worker's actual exit code (which dispatchers reading
-/// the flow record DO see). Operators relying on specific exit codes
-/// for CI gating or shell scripting lost that signal in the cross-
-/// machine path. (#255 Wave-E.6)
 /// Outcome of the `dispatch()` routing-decision branch. Extracted as a
 /// pure shape so the (Some(machine), local_machine_id) matrix is
 /// unit-testable without filesystem / env-var setup. (Wave-E.7 #255)
@@ -1526,7 +1276,7 @@ pub enum RoutingDecision {
 /// Bailing BEFORE the record emit keeps the audit substrate honest:
 /// every persisted `dispatch route` record corresponds to a routing
 /// decision the substrate actually accepted.
-fn resolve_role_tier_for_record(opts: &DispatchOpts) -> Result<String> {
+pub fn resolve_role_tier_for_record(opts: &DispatchOpts) -> Result<String> {
     let role = load_role_or_bail(&opts.role_id)?;
     match role.tier.as_deref().map(str::trim) {
         Some(t) if !t.is_empty() && t != "any" => Ok(t.to_string()),
@@ -1561,19 +1311,19 @@ fn resolve_role_tier_for_record(opts: &DispatchOpts) -> Result<String> {
 /// the gap where #285 PR-C only emitted on the auto-route arm,
 /// leaving operator-pinned routing decisions unrecorded in the audit
 /// trail.
-fn emit_route_record_and_resolve_session(
+pub fn emit_route_record_and_resolve_session(
     opts: &DispatchOpts,
     role_tier: &str,
     target_machine: Option<&str>,
 ) -> String {
-    let local_tier = crate::flow::resolve_machine_tier();
+    let local_tier = darkmux_flow::resolve_machine_tier();
     let session_id = opts
         .session_id
         .clone()
         .unwrap_or_else(|| fresh_session_id(&opts.role_id));
     let payload = build_route_payload(role_tier, local_tier.as_deref(), target_machine);
-    let _ = crate::flow::record(build_dispatch_record_with_payload(
-        crate::flow::Level::Info,
+    let _ = darkmux_flow::record(build_dispatch_record_with_payload(
+        darkmux_flow::Level::Info,
         "dispatch route",
         &opts.role_id,
         &session_id,
@@ -1603,87 +1353,6 @@ fn build_route_payload(
     })
 }
 
-/// Decide whether the dispatch should auto-route via the work queue
-/// because the role's declared tier doesn't match the local machine's
-/// tier. Returns:
-/// - `Ok(None)` — dispatch locally (role.tier ∈ {None, "any"}, OR
-///   role.tier == local tier, OR roster is empty so there's no fleet
-///   to route across, OR auto-route would be pointless)
-/// - `Ok(Some(role_tier))` — fleet has a peer in `role_tier`; publish
-///   via queue. Caller (dispatch entry) emits the banner and calls
-///   `dispatch_via_queue(opts, None)`.
-/// - `Err(_)` — operator HAS a fleet with peers in other tiers but
-///   none in `role_tier`; bail loud since the operator's existing
-///   fleet is deliberately partitioned but missing this tier.
-///   (#247 PR-B; graceful-degradation refinement per LAB_NOTEBOOK
-///   Beat 35.)
-///
-/// **Graceful-degradation principle (Beat 35):** hardware constraints
-/// should never be a refusal condition for single-machine operators.
-/// If no fleet is declared at all (empty roster), the tier hint is
-/// treated as advisory — dispatch locally with a one-line nudge. The
-/// hard bail only fires when the operator HAS configured a fleet but
-/// it's missing the required tier (an actionable misconfiguration).
-fn auto_route_target_tier(opts: &DispatchOpts) -> Result<Option<String>> {
-    let role = load_role_or_bail(&opts.role_id)?;
-    let role_tier = match role.tier.as_deref().map(str::trim) {
-        Some("") | Some("any") | None => return Ok(None), // local
-        Some(t) => t.to_string(),
-    };
-    let local_tier = crate::flow::resolve_machine_tier();
-    if local_tier.as_deref() == Some(role_tier.as_str()) {
-        // Local matches role's tier — dispatch locally; no queue cost.
-        return Ok(None);
-    }
-    // Tier mismatch — consult the fleet roster. `load_roster()`
-    // already returns `Ok(FleetRoster::default())` for the missing-
-    // file case (single-machine operator legitimately has no
-    // fleet.json), so we only need to propagate genuine parse
-    // failures here. Silently swallowing parse errors would route
-    // local without surfacing that the operator's hand-edited
-    // roster.json is broken — exactly the silent-divergence-from-
-    // intent the operator-sovereignty doctrine forbids.
-    let roster = crate::fleet::load_roster().with_context(|| {
-        format!(
-            "role `{}` requires tier=`{role_tier}` and the fleet roster failed to load. \
-             Run `darkmux fleet status` to inspect.",
-            opts.role_id
-        )
-    })?;
-    let candidates = crate::fleet::candidates_for_tier(&roster, &role_tier);
-    if candidates.is_empty() {
-        if roster.machines.is_empty() {
-            // Single-machine operator — no fleet declared at all. Tier
-            // constraints don't apply when there's nothing to route
-            // across. Run locally with a teaching nudge so multi-
-            // machine ops can wire it up later. Operator-sovereignty
-            // applied per Beat 35.
-            eprintln!(
-                "darkmux crew dispatch: role `{}` declares tier=`{role_tier}` but no \
-                 fleet peers are declared — running locally. To enable multi-machine \
-                 routing later: `darkmux fleet add <id> --tier <tier> --address <addr>`.",
-                opts.role_id
-            );
-            return Ok(None);
-        }
-        // Roster has peers, but none in this tier — operator HAS a
-        // fleet that's deliberately partitioned, just missing the
-        // required tier. This is an actionable misconfiguration the
-        // operator wants to know about.
-        let peer_count = roster.machines.len();
-        let peer_word = if peer_count == 1 { "peer" } else { "peers" };
-        bail!(
-            "role `{}` requires tier=`{role_tier}` but no fleet peer is in that \
-             tier (local tier=`{}`, {peer_count} other {peer_word} declared). Either: \
-             (a) add a peer with `darkmux fleet add <id> --tier {role_tier} --address <addr>`, \
-             or (b) edit the role manifest to declare `tier: \"any\"` if this work \
-             belongs on whatever's available.",
-            opts.role_id,
-            local_tier.as_deref().unwrap_or("<unset>"),
-        );
-    }
-    Ok(Some(role_tier))
-}
 
 /// Pure-function routing decision. `machine` is the operator's
 /// `--machine` flag (None when omitted); `local_machine_id` is what
@@ -1714,28 +1383,6 @@ pub fn routing_decision(machine: Option<&str>, local_machine_id: Option<&str>) -
     }
 }
 
-fn completion_to_dispatch_result(c: crate::fleet::CompletionResult) -> DispatchResult {
-    let payload_exit_code = c
-        .payload
-        .as_ref()
-        .and_then(|p| p.get("exit_code"))
-        .and_then(|v| v.as_i64())
-        .map(|n| n as i32);
-    let exit_code = payload_exit_code.unwrap_or(if c.result_class == "ok" { 0 } else { 1 });
-    let stdout = format!(
-        "remote dispatch complete; result_class={} exit_code={exit_code} wall_ms={:?} session={}\n\
-         (full output in worker's flow records — \
-          tail `~/.darkmux/flows/<date>.jsonl` for session={})\n",
-        c.result_class, c.wall_ms, c.session_id, c.session_id,
-    );
-    DispatchResult {
-        exit_code,
-        stdout,
-        stderr: String::new(),
-        session_id: c.session_id,
-        watched_state: Vec::new(),
-    }
-}
 
 /// Build a flow record for a dispatch lifecycle event (`dispatch start`,
 /// `dispatch complete`, `dispatch error`). All three share the same
@@ -1750,13 +1397,13 @@ fn completion_to_dispatch_result(c: crate::fleet::CompletionResult) -> DispatchR
 /// through `_with_payload` directly to carry runtime metadata; this
 /// wrapper survives for tests + future callers that don't need payload.
 #[allow(dead_code)]
-pub(crate) fn build_dispatch_record(
-    level: crate::flow::Level,
+pub fn build_dispatch_record(
+    level: darkmux_flow::Level,
     action: &str,
     role_id: &str,
     session_id: &str,
     model: Option<&str>,
-) -> crate::flow::FlowRecord {
+) -> darkmux_flow::FlowRecord {
     build_dispatch_record_with_payload(level, action, role_id, session_id, model, None)
 }
 
@@ -1764,20 +1411,20 @@ pub(crate) fn build_dispatch_record(
 /// event-specific fields (#204). The richer dispatch events (turn,
 /// tool, compaction, reasoning) use this directly; the bare
 /// `build_dispatch_record` wrapper preserves the legacy call shape.
-pub(crate) fn build_dispatch_record_with_payload(
-    level: crate::flow::Level,
+pub fn build_dispatch_record_with_payload(
+    level: darkmux_flow::Level,
     action: &str,
     role_id: &str,
     session_id: &str,
     model: Option<&str>,
     payload: Option<serde_json::Value>,
-) -> crate::flow::FlowRecord {
-    crate::flow::FlowRecord {
-        ts: crate::flow::ts_utc_now(),
+) -> darkmux_flow::FlowRecord {
+    darkmux_flow::FlowRecord {
+        ts: darkmux_flow::ts_utc_now(),
         level,
-        category: crate::flow::Category::Work,
-        tier: crate::flow::Tier::Local,
-        stage: crate::flow::Stage::Dispatch,
+        category: darkmux_flow::Category::Work,
+        tier: darkmux_flow::Tier::Local,
+        stage: darkmux_flow::Stage::Dispatch,
         action: action.to_string(),
         handle: role_id.to_string(),
         sprint_id: None,
@@ -1814,7 +1461,7 @@ pub(crate) fn build_dispatch_record_with_payload(
 /// and is the right place for that signal. The flow record's absent
 /// `model` field is operator-visible enough on its own — it shows as
 /// missing in the viewer, which is the same signal in the right place.
-pub(crate) fn resolve_dispatch_model(agent_id: &str) -> Option<String> {
+pub fn resolve_dispatch_model(agent_id: &str) -> Option<String> {
     let path = default_openclaw_config();
     let raw = fs::read_to_string(&path).ok()?;
     let config: Value = serde_json::from_str(&raw).ok()?;
@@ -1845,7 +1492,7 @@ pub(crate) fn resolve_dispatch_model(agent_id: &str) -> Option<String> {
         .map(String::from)
 }
 
-fn load_role_or_bail(role_id: &str) -> Result<Role> {
+pub fn load_role_or_bail(role_id: &str) -> Result<Role> {
     let roles = load_roles().context("loading crew role manifests")?;
     roles
         .into_iter()
@@ -1979,7 +1626,7 @@ fn preflight_check(
     // Pin-table load failures bail with the underlying error so the
     // operator sees what went wrong with their pin file; we don't
     // swallow that into a generic warning. Dispatch hot path = strict.
-    let pin_table = crate::crew::pins::load_pins()
+    let pin_table = crate::pins::load_pins()
         .context("loading pin table for dispatch-time preflight (#182)")?;
     let expected_model = pin_table.pin_for(&role.id);
     let actual_model = entry.get("model").and_then(|m| m.as_str());
@@ -2147,7 +1794,7 @@ fn build_agent_entry(role: &Role, prompt: &str, agent_dir: &Path, workspace: &Pa
     // what's ambient-loaded. Pin-table read failures degrade to NO
     // model field — agent loses pin protection but the sync itself
     // doesn't fail; doctor's pin-drift check surfaces the gap.
-    let pinned_model = crate::crew::pins::load_pins()
+    let pinned_model = crate::pins::load_pins()
         .ok()
         .map(|t| t.pin_for(&role.id).to_string());
 
@@ -2171,7 +1818,7 @@ fn build_agent_entry(role: &Role, prompt: &str, agent_dir: &Path, workspace: &Pa
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crew::types::{EscalationContract, Role, ToolPalette};
+    use crate::types::{EscalationContract, Role, ToolPalette};
     use tempfile::TempDir;
 
     // ─── #247 PR-C build_route_payload ────────────────────────────────
@@ -2212,92 +1859,6 @@ mod tests {
         assert_eq!(p["decision"], "auto-route");
     }
 
-    // ─── completion_to_dispatch_result (Wave-E.6 #255) ────────────────
-
-    fn completion(
-        result_class: &str,
-        payload: Option<serde_json::Value>,
-    ) -> crate::fleet::CompletionResult {
-        crate::fleet::CompletionResult {
-            session_id: "test-sess".to_string(),
-            result_class: result_class.to_string(),
-            wall_ms: Some(1234),
-            payload,
-        }
-    }
-
-    #[test]
-    fn completion_extracts_explicit_exit_code_from_payload() {
-        // Worker emitted exit_code=42 (e.g. a build script's exit
-        // code). Translation must surface it verbatim, NOT squash
-        // to 1 via result_class.
-        let c = completion(
-            "error",
-            Some(serde_json::json!({"result_class": "error", "exit_code": 42})),
-        );
-        let r = completion_to_dispatch_result(c);
-        assert_eq!(
-            r.exit_code, 42,
-            "operator-facing exit code must match worker's"
-        );
-        assert!(
-            r.stdout.contains("exit_code=42"),
-            "stdout includes exit code"
-        );
-    }
-
-    #[test]
-    fn completion_extracts_zero_exit_code_even_on_ok() {
-        let c = completion(
-            "ok",
-            Some(serde_json::json!({"result_class": "ok", "exit_code": 0})),
-        );
-        let r = completion_to_dispatch_result(c);
-        assert_eq!(r.exit_code, 0);
-    }
-
-    #[test]
-    fn completion_falls_back_to_zero_on_ok_without_exit_code() {
-        // Payload present but no exit_code field; result_class=ok →
-        // fallback 0.
-        let c = completion("ok", Some(serde_json::json!({"result_class": "ok"})));
-        let r = completion_to_dispatch_result(c);
-        assert_eq!(r.exit_code, 0);
-    }
-
-    #[test]
-    fn completion_falls_back_to_one_on_error_without_exit_code() {
-        let c = completion("error", Some(serde_json::json!({"result_class": "error"})));
-        let r = completion_to_dispatch_result(c);
-        assert_eq!(r.exit_code, 1);
-    }
-
-    #[test]
-    fn completion_falls_back_when_payload_absent() {
-        let c = completion("error", None);
-        let r = completion_to_dispatch_result(c);
-        assert_eq!(r.exit_code, 1);
-    }
-
-    #[test]
-    fn completion_passes_session_id_through() {
-        let mut c = completion("ok", None);
-        c.session_id = "mission-foo-sprint-bar-12345-0".to_string();
-        let r = completion_to_dispatch_result(c);
-        assert_eq!(r.session_id, "mission-foo-sprint-bar-12345-0");
-        assert!(r.stdout.contains("mission-foo-sprint-bar-12345-0"));
-    }
-
-    #[test]
-    fn completion_handles_negative_exit_code() {
-        // SIGKILL-style exit codes can be negative (per std::process::ExitStatus).
-        let c = completion(
-            "error",
-            Some(serde_json::json!({"result_class": "error", "exit_code": -9})),
-        );
-        let r = completion_to_dispatch_result(c);
-        assert_eq!(r.exit_code, -9);
-    }
 
     // ─── routing_decision (Wave-E.7 #255) ─────────────────────────────
 
@@ -3215,7 +2776,7 @@ mod tests {
     #[test]
     fn dispatch_record_carries_role_id_session_and_local_tier() {
         let rec = build_dispatch_record(
-            crate::flow::Level::Info,
+            darkmux_flow::Level::Info,
             "dispatch start",
             "coder",
             "crew-dispatch-coder-12345-1",
@@ -3229,9 +2790,9 @@ mod tests {
         );
         assert_eq!(rec.source.as_deref(), Some("crew_dispatch"));
         assert_eq!(rec.model.as_deref(), Some("darkmux:qwen3.6-35b-a3b"));
-        assert!(matches!(rec.tier, crate::flow::Tier::Local));
-        assert!(matches!(rec.stage, crate::flow::Stage::Dispatch));
-        assert!(matches!(rec.category, crate::flow::Category::Work));
+        assert!(matches!(rec.tier, darkmux_flow::Tier::Local));
+        assert!(matches!(rec.stage, darkmux_flow::Stage::Dispatch));
+        assert!(matches!(rec.category, darkmux_flow::Category::Work));
         // sprint_id is None for dispatch records — crew dispatch is a
         // lower-level concept than sprint, so the dispatcher doesn't
         // assume a sprint context. The viewer joins via session_id.
@@ -3248,7 +2809,7 @@ mod tests {
         // tolerate the absent field; new viewers render "model: unknown"
         // or similar.
         let rec = build_dispatch_record(
-            crate::flow::Level::Info,
+            darkmux_flow::Level::Info,
             "dispatch start",
             "coder",
             "session-no-model",
@@ -3268,314 +2829,25 @@ mod tests {
         // not green). Lock the error level on dispatch_error so the
         // failure path is visually distinct from completion.
         let ok = build_dispatch_record(
-            crate::flow::Level::Info,
+            darkmux_flow::Level::Info,
             "dispatch complete",
             "coder",
             "session-abc",
             Some("darkmux:foo"),
         );
         let err = build_dispatch_record(
-            crate::flow::Level::Error,
+            darkmux_flow::Level::Error,
             "dispatch error",
             "coder",
             "session-abc",
             Some("darkmux:foo"),
         );
-        assert!(matches!(ok.level, crate::flow::Level::Info));
-        assert!(matches!(err.level, crate::flow::Level::Error));
+        assert!(matches!(ok.level, darkmux_flow::Level::Info));
+        assert!(matches!(err.level, darkmux_flow::Level::Error));
         // Same session_id so the viewer pairs them — this is the contract
         // that makes computeDispatchDurations() work for the failure path
         // too (an erroring dispatch still has a wall-clock arc).
         assert_eq!(ok.session_id, err.session_id);
     }
 
-    // ─── L1 / Beat 35: tier-routing graceful degradation ─────────────
-    //
-    // Pre-fix: a single-machine operator who ran
-    // `darkmux crew dispatch coder` (where coder has tier=inference and
-    // local has no DARKMUX_MACHINE_TIER set) hit a bail before the first
-    // dispatch ever produced a record. The bail message instructed them
-    // to either add a fleet peer OR edit the role manifest — both ask
-    // the operator to learn the multi-machine model at first dispatch.
-    //
-    // Post-fix: when the roster is empty (no fleet declared at all),
-    // tier mismatch falls back to local with a one-line nudge. The
-    // hard bail only fires when the operator HAS configured a fleet
-    // but it's missing the required tier (actionable misconfiguration).
-    //
-    // Tests run serially because they mutate DARKMUX_CREW_DIR,
-    // DARKMUX_FLEET_FILE, and DARKMUX_MACHINE_TIER — process-global.
-
-    /// RAII: scrub the three env vars + restore on drop.
-    struct TierRouteEnvGuard {
-        prev_crew: Option<String>,
-        prev_fleet: Option<String>,
-        prev_tier: Option<String>,
-        _tmp: TempDir,
-    }
-
-    impl TierRouteEnvGuard {
-        fn new() -> Self {
-            let tmp = TempDir::new().unwrap();
-            let prev_crew = std::env::var("DARKMUX_CREW_DIR").ok();
-            let prev_fleet = std::env::var("DARKMUX_FLEET_FILE").ok();
-            let prev_tier = std::env::var("DARKMUX_MACHINE_TIER").ok();
-            // SAFETY: serialized via #[serial_test::serial] on every caller.
-            unsafe {
-                std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
-                std::env::remove_var("DARKMUX_FLEET_FILE");
-                std::env::remove_var("DARKMUX_MACHINE_TIER");
-            }
-            Self {
-                prev_crew,
-                prev_fleet,
-                prev_tier,
-                _tmp: tmp,
-            }
-        }
-
-        fn path(&self) -> &std::path::Path {
-            self._tmp.path()
-        }
-
-        fn set_fleet_file(&self, path: &std::path::Path) {
-            // SAFETY: serialized via #[serial].
-            unsafe {
-                std::env::set_var("DARKMUX_FLEET_FILE", path);
-            }
-        }
-
-        fn set_local_tier(&self, tier: &str) {
-            // SAFETY: serialized via #[serial].
-            unsafe {
-                std::env::set_var("DARKMUX_MACHINE_TIER", tier);
-            }
-        }
-    }
-
-    impl Drop for TierRouteEnvGuard {
-        fn drop(&mut self) {
-            // SAFETY: serialized via #[serial].
-            unsafe {
-                match &self.prev_crew {
-                    Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                    None => std::env::remove_var("DARKMUX_CREW_DIR"),
-                }
-                match &self.prev_fleet {
-                    Some(v) => std::env::set_var("DARKMUX_FLEET_FILE", v),
-                    None => std::env::remove_var("DARKMUX_FLEET_FILE"),
-                }
-                match &self.prev_tier {
-                    Some(v) => std::env::set_var("DARKMUX_MACHINE_TIER", v),
-                    None => std::env::remove_var("DARKMUX_MACHINE_TIER"),
-                }
-            }
-        }
-    }
-
-    /// Seed an operator-override role with a specific tier value.
-    /// `auto_route_target_tier` only needs the role manifest (it reads
-    /// `role.tier`), not the system-prompt `.md` — that's consumed
-    /// later in the dispatch pipeline via `role_prompt_or_bail`, which
-    /// these routing tests don't reach.
-    fn seed_role_with_tier(crew_root: &std::path::Path, role_id: &str, tier: &str) {
-        let roles_dir = crew_root.join("roles");
-        std::fs::create_dir_all(&roles_dir).unwrap();
-        let json = format!(
-            r#"{{
-              "id": "{role_id}",
-              "description": "L1 test role",
-              "skills": [],
-              "tool_palette": {{"allow": ["read"], "deny": []}},
-              "escalation_contract": "bail-with-explanation",
-              "tier": "{tier}"
-            }}"#
-        );
-        std::fs::write(roles_dir.join(format!("{role_id}.json")), json).unwrap();
-    }
-
-    fn opts_for_role(role_id: &str) -> DispatchOpts {
-        DispatchOpts {
-            role_id: role_id.to_string(),
-            message: "test".to_string(),
-            deliver: None,
-            session_id: None,
-            timeout_seconds: 30,
-            skip_preflight: true,
-            json: false,
-            watch_paths: Vec::new(),
-            workdir: None,
-            sprint_id: None,
-            runtime: Runtime::Internal,
-            runtime_cmd: "openclaw".to_string(),
-            machine: None,
-            wait: true,
-            compaction: CompactionDispatchArgs::default(),
-        }
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn auto_route_falls_back_to_local_when_roster_empty() {
-        // The Beat-35 graceful-degradation path. Single-machine operator
-        // with no fleet declared, no local tier, role declares
-        // tier=inference. Should dispatch locally (Ok(None)) rather
-        // than bail.
-        let guard = TierRouteEnvGuard::new();
-        seed_role_with_tier(guard.path(), "l1-test-coder", "inference");
-        // Point fleet file at a nonexistent path — load_roster returns
-        // FleetRoster::default() (empty machines).
-        guard.set_fleet_file(&guard.path().join("nonexistent-fleet.json"));
-
-        let result = auto_route_target_tier(&opts_for_role("l1-test-coder"));
-        assert!(
-            matches!(result, Ok(None)),
-            "expected Ok(None) for empty-roster fallback; got: {:?}",
-            result
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn auto_route_falls_back_to_local_even_with_local_tier_unset() {
-        // Variant: explicitly unset DARKMUX_MACHINE_TIER (the smoke-test
-        // scenario that surfaced Beat 35). The fix must not depend on
-        // the operator having declared a tier.
-        let guard = TierRouteEnvGuard::new();
-        seed_role_with_tier(guard.path(), "l1-test-coder-2", "inference");
-        // DARKMUX_MACHINE_TIER stays unset (guard scrubs it on new).
-
-        let result = auto_route_target_tier(&opts_for_role("l1-test-coder-2"));
-        assert!(
-            matches!(result, Ok(None)),
-            "expected Ok(None); got: {:?}",
-            result
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn auto_route_bails_when_fleet_has_peers_but_missing_required_tier() {
-        // The "operator HAS a fleet but deliberately partitioned, just
-        // missing this tier" case. Preserves the existing actionable-
-        // misconfiguration bail. This is the case that should STILL
-        // fail loudly even post-Beat-35 — the operator has expressed
-        // intent (the fleet roster exists with peers) but the
-        // configuration is incomplete.
-        let guard = TierRouteEnvGuard::new();
-        seed_role_with_tier(guard.path(), "l1-test-coder-3", "inference");
-        let fleet_path = guard.path().join("fleet.json");
-        // Roster with one peer in `hub` tier — none in `inference`.
-        std::fs::write(
-            &fleet_path,
-            r#"{
-              "version": "1",
-              "machines": {
-                "studio": {
-                  "id": "studio",
-                  "tier": "hub",
-                  "address": "100.74.208.36",
-                  "added_unix_ms": 1700000000000
-                }
-              }
-            }"#,
-        )
-        .unwrap();
-        guard.set_fleet_file(&fleet_path);
-        guard.set_local_tier("client");
-
-        let result = auto_route_target_tier(&opts_for_role("l1-test-coder-3"));
-        let err = result.expect_err("expected bail for fleet-missing-tier case");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("inference"),
-            "error should mention the required tier; got: {msg}"
-        );
-        assert!(
-            msg.contains("1 other peer"),
-            "error should count the declared peers; got: {msg}"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn auto_route_routes_to_queue_when_fleet_has_matching_tier() {
-        // Sanity check: pre-existing multi-machine routing still works.
-        // Roster has a peer in the role's required tier — auto_route
-        // returns Ok(Some(role_tier)) so the caller publishes via the
-        // work queue.
-        let guard = TierRouteEnvGuard::new();
-        seed_role_with_tier(guard.path(), "l1-test-coder-4", "inference");
-        let fleet_path = guard.path().join("fleet.json");
-        std::fs::write(
-            &fleet_path,
-            r#"{
-              "version": "1",
-              "machines": {
-                "laptop": {
-                  "id": "laptop",
-                  "tier": "inference",
-                  "address": "100.74.208.99",
-                  "added_unix_ms": 1700000000000
-                }
-              }
-            }"#,
-        )
-        .unwrap();
-        guard.set_fleet_file(&fleet_path);
-        guard.set_local_tier("hub");
-
-        let result = auto_route_target_tier(&opts_for_role("l1-test-coder-4"));
-        match result {
-            Ok(Some(tier)) => assert_eq!(tier, "inference"),
-            other => panic!("expected Ok(Some(\"inference\")); got: {:?}", other),
-        }
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn auto_route_dispatches_locally_when_role_tier_matches_local() {
-        // Sanity: the existing local-tier-matches-role-tier early-exit
-        // still works (operator on inference peer, role wants
-        // inference, no queue indirection needed).
-        let guard = TierRouteEnvGuard::new();
-        seed_role_with_tier(guard.path(), "l1-test-coder-5", "inference");
-        guard.set_local_tier("inference");
-
-        let result = auto_route_target_tier(&opts_for_role("l1-test-coder-5"));
-        assert!(
-            matches!(result, Ok(None)),
-            "expected Ok(None) for local-matches-role; got: {:?}",
-            result
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn auto_route_bails_when_roster_file_exists_but_is_corrupted() {
-        // Reviewer B-1: a hand-edited roster with a JSON typo must not
-        // silently degrade to local — the operator believes they have
-        // a fleet, and silent divergence from intent is exactly the
-        // failure mode operator-sovereignty forbids. Missing file is
-        // still graceful (load_roster returns Ok(default) upstream);
-        // parse failure stays loud here.
-        let guard = TierRouteEnvGuard::new();
-        seed_role_with_tier(guard.path(), "l1-test-coder-6", "inference");
-        let fleet_path = guard.path().join("fleet.json");
-        // Trailing garbage after the JSON object — operator typo or
-        // editor corruption. serde_json rejects.
-        std::fs::write(
-            &fleet_path,
-            r#"{ "version": "1", "machines": {} this is broken"#,
-        )
-        .unwrap();
-        guard.set_fleet_file(&fleet_path);
-
-        let err = auto_route_target_tier(&opts_for_role("l1-test-coder-6"))
-            .expect_err("corrupted roster must surface as Err, not silently degrade");
-        let msg = format!("{err:#}");
-        // Top-level context names the dispatch surface; underlying error
-        // is the parse failure from load_roster. Both should be visible.
-        assert!(msg.contains("fleet roster failed to load"), "got: {msg}");
-    }
 }
