@@ -68,22 +68,68 @@ pub(crate) fn hash_sandbox_dir_with_excludes(sandbox_dir: &Path, excludes: &[&st
     files.sort();
 
     let mut hasher = blake3::Hasher::new();
-    for rel_path in &files {
+    for (rel_path, kind) in &files {
         // Length-prefixed path to avoid collision between
-        // (foo, "bar") and (foob, "ar").
-        let path_str = rel_path.to_string_lossy();
-        let path_bytes = path_str.as_bytes();
+        // (foo, "bar") and (foob, "ar"). (#494) Path bytes come from the
+        // raw OsStr on Unix, not `to_string_lossy`, so a non-UTF8
+        // filename hashes deterministically instead of collapsing to
+        // U+FFFD (which two machines could disagree on).
+        let path_bytes = os_path_bytes(rel_path);
         hasher.update(&(path_bytes.len() as u64).to_le_bytes());
-        hasher.update(path_bytes);
+        hasher.update(&path_bytes);
 
         let abs = sandbox_dir.join(rel_path);
-        let content = std::fs::read(&abs)
-            .with_context(|| format!("reading {}", abs.display()))?;
-        hasher.update(&(content.len() as u64).to_le_bytes());
-        hasher.update(&content);
+        match kind {
+            EntryKind::File => {
+                // Unchanged from Phase 1: (content_len, content). A
+                // file-only sandbox with UTF-8 paths hashes byte-for-byte
+                // identically to before this change.
+                let content = std::fs::read(&abs)
+                    .with_context(|| format!("reading {}", abs.display()))?;
+                hasher.update(&(content.len() as u64).to_le_bytes());
+                hasher.update(&content);
+            }
+            EntryKind::Symlink => {
+                // (#494) Symlinks were silently skipped, so two sandboxes
+                // differing only in a symlink hashed identically. Hash the
+                // link TARGET (length-prefixed) under a distinguishing
+                // marker; never follow it, so there's no loop risk.
+                let target = std::fs::read_link(&abs)
+                    .with_context(|| format!("read_link {}", abs.display()))?;
+                hasher.update(SYMLINK_MARKER);
+                let target_bytes = os_path_bytes(&target);
+                hasher.update(&(target_bytes.len() as u64).to_le_bytes());
+                hasher.update(&target_bytes);
+            }
+        }
     }
 
     Ok(format!("blake3:{}", hasher.finalize().to_hex()))
+}
+
+/// Marker mixed into the hash for a symlink entry so its (target) block
+/// can't be confused with a regular file's content block. (#494)
+const SYMLINK_MARKER: &[u8] = b"\0darkmux-symlink\0";
+
+/// Raw path bytes for hashing. On Unix this is the exact `OsStr` byte
+/// content (no lossy UTF-8 substitution); elsewhere it falls back to a
+/// lossy UTF-8 view (Windows paths are UTF-16 and rarely non-representable
+/// in practice, and the lab runs on POSIX). (#494)
+#[cfg(unix)]
+fn os_path_bytes(p: &Path) -> std::borrow::Cow<'_, [u8]> {
+    use std::os::unix::ffi::OsStrExt;
+    std::borrow::Cow::Borrowed(p.as_os_str().as_bytes())
+}
+#[cfg(not(unix))]
+fn os_path_bytes(p: &Path) -> std::borrow::Cow<'_, [u8]> {
+    std::borrow::Cow::Owned(p.to_string_lossy().into_owned().into_bytes())
+}
+
+/// What kind of filesystem entry contributes to the hash. (#494)
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum EntryKind {
+    File,
+    Symlink,
 }
 
 /// Recursively collect file paths relative to `root`, skipping any
@@ -92,7 +138,7 @@ fn collect_files(
     dir: &Path,
     root: &Path,
     excludes: &[&str],
-    out: &mut Vec<PathBuf>,
+    out: &mut Vec<(PathBuf, EntryKind)>,
 ) -> Result<()> {
     for entry in std::fs::read_dir(dir)
         .with_context(|| format!("read_dir {}", dir.display()))?
@@ -104,20 +150,24 @@ fn collect_files(
         if excludes.iter().any(|e| name_str.as_ref() == *e) {
             continue;
         }
+        // `file_type()` from read_dir does NOT follow symlinks, so a
+        // symlink reports `is_symlink()` (not is_dir/is_file) — we never
+        // traverse INTO it, avoiding loops.
         let file_type = entry.file_type()?;
+        let rel = || {
+            path.strip_prefix(root)
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|_| path.clone())
+        };
         if file_type.is_dir() {
             collect_files(&path, root, excludes, out)?;
         } else if file_type.is_file() {
-            // Store relative path so the hash is stable across moves.
-            let rel = path
-                .strip_prefix(root)
-                .map(|p| p.to_path_buf())
-                .unwrap_or(path);
-            out.push(rel);
+            out.push((rel(), EntryKind::File));
+        } else if file_type.is_symlink() {
+            // (#494) Record the symlink itself; the hash uses its target,
+            // not the (unfollowed) referent's contents.
+            out.push((rel(), EntryKind::Symlink));
         }
-        // Symlinks: skip silently for now — sandboxes shouldn't rely on
-        // them, and following could cause loops. Phase 2 can add a
-        // manifest opt-in if needed.
     }
     Ok(())
 }
@@ -248,6 +298,160 @@ mod tests {
         assert_ne!(
             hash_sandbox_dir(&a).unwrap(),
             hash_sandbox_dir(&b).unwrap()
+        );
+    }
+
+    // ─── (#494) symlinks + non-UTF8 path determinism (Unix) ──────────
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_presence_affects_hash() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        for dir in [&a, &b] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("real.txt"), "content").unwrap();
+        }
+        // `b` additionally has a symlink. Pre-#494 these hashed equal
+        // (symlink silently skipped); now the symlink contributes.
+        symlink("real.txt", b.join("link.txt")).unwrap();
+        assert_ne!(
+            hash_sandbox_dir(&a).unwrap(),
+            hash_sandbox_dir(&b).unwrap(),
+            "a sandbox with a symlink must hash differently from one without"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_target_change_affects_hash() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        for dir in [&a, &b] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("x.txt"), "content").unwrap();
+            std::fs::write(dir.join("y.txt"), "content").unwrap();
+        }
+        // Same content everywhere; only the symlink TARGET differs.
+        symlink("x.txt", a.join("link")).unwrap();
+        symlink("y.txt", b.join("link")).unwrap();
+        assert_ne!(
+            hash_sandbox_dir(&a).unwrap(),
+            hash_sandbox_dir(&b).unwrap(),
+            "retargeting a symlink must change the hash"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identical_symlinks_hash_equal() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        for dir in [&a, &b] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("t.txt"), "c").unwrap();
+            symlink("t.txt", dir.join("link")).unwrap();
+        }
+        assert_eq!(
+            hash_sandbox_dir(&a).unwrap(),
+            hash_sandbox_dir(&b).unwrap(),
+            "identical content + identical symlinks must hash equal"
+        );
+    }
+
+    #[test]
+    fn golden_hash_locks_file_only_algorithm_against_regression() {
+        // Frozen known-answer test: a fixed file-only UTF-8 sandbox must
+        // always hash to this exact value. This is what makes the
+        // "#494 doesn't change file-only hashes" claim enforceable — any
+        // future change to the File-branch hashing (path/content framing,
+        // sort order, exclude defaults) breaks this loudly. If you change
+        // the algorithm intentionally, update the constant AND note the
+        // baseline-hash compatibility impact in the commit.
+        let tmp = TempDir::new().unwrap();
+        let s = tmp.path().join("s");
+        std::fs::create_dir_all(s.join("sub")).unwrap();
+        std::fs::write(s.join("a.txt"), "hello\n").unwrap();
+        std::fs::write(s.join("sub/b.txt"), "world").unwrap();
+        assert_eq!(
+            hash_sandbox_dir(&s).unwrap(),
+            "blake3:ce6f703d8a29636e4b95beea2773af4bc4176e239842d69a446b2ce2727e9cb9",
+            "file-only hash changed — if intentional, update the golden + check baseline-hash impact"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_is_hashed_not_an_error() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let s = tmp.path().join("s");
+        std::fs::create_dir_all(&s).unwrap();
+        // Target doesn't exist — read_link returns the target path
+        // without stat'ing, so this must hash cleanly (no error) and the
+        // dangling link still contributes.
+        symlink("nonexistent-target", s.join("dangling")).unwrap();
+        let with = hash_sandbox_dir(&s).unwrap();
+        let empty = tmp.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_ne!(with, hash_sandbox_dir(&empty).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_directory_is_recorded_not_traversed() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let s = tmp.path().join("s");
+        std::fs::create_dir_all(s.join("realdir")).unwrap();
+        std::fs::write(s.join("realdir/inner.txt"), "x").unwrap();
+        // A symlink pointing at the directory is recorded as a symlink
+        // (its target), NOT followed/traversed into.
+        symlink("realdir", s.join("dirlink")).unwrap();
+        let with_link = hash_sandbox_dir(&s).unwrap();
+
+        let without = tmp.path().join("without");
+        std::fs::create_dir_all(without.join("realdir")).unwrap();
+        std::fs::write(without.join("realdir/inner.txt"), "x").unwrap();
+        assert_ne!(
+            with_link,
+            hash_sandbox_dir(&without).unwrap(),
+            "a dir-symlink must contribute (as a symlink target), not be skipped"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_filename_hashes_deterministically_and_distinctly() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = TempDir::new().unwrap();
+        let s = tmp.path().join("s");
+        std::fs::create_dir_all(&s).unwrap();
+        // 0xFF 0xFE is not valid UTF-8 — `to_string_lossy` would map both
+        // this and a different invalid sequence to U+FFFD, colliding.
+        let name1 = OsStr::from_bytes(b"bad\xff\xfe.txt");
+        std::fs::write(s.join(name1), "data").unwrap();
+        // Stable across repeated hashing (no panic, no lossy nondeterminism).
+        let h1 = hash_sandbox_dir(&s).unwrap();
+        assert_eq!(h1, hash_sandbox_dir(&s).unwrap());
+
+        // A different non-UTF8 name with the same content must NOT collide
+        // (it would under to_string_lossy → both U+FFFD).
+        let s2 = tmp.path().join("s2");
+        std::fs::create_dir_all(&s2).unwrap();
+        let name2 = OsStr::from_bytes(b"bad\xfe\xff.txt");
+        std::fs::write(s2.join(name2), "data").unwrap();
+        assert_ne!(
+            h1,
+            hash_sandbox_dir(&s2).unwrap(),
+            "distinct non-UTF8 filenames must hash distinctly (no lossy collision)"
         );
     }
 
