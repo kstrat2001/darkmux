@@ -23,15 +23,12 @@ pub fn cmd_register(
 
     let mut registry = LabRegistry::load(&reg_path)
         .with_context(|| format!("loading {}", reg_path.display()))?;
-    let entry = registry
-        .register(path, name_override, force)?
-        .clone();
-    let registered_name = registry
-        .fixtures
-        .iter()
-        .find(|(_, f)| f.content_hash == entry.content_hash && f.path == entry.path)
-        .map(|(n, _)| n.clone())
-        .unwrap_or_else(|| "<unknown>".to_string());
+    // `register` returns the resolved registry key + the inserted
+    // entry; we use both directly rather than re-scan the BTreeMap
+    // (the post-review #498 fix — scan was fragile when multiple
+    // entries shared content but had different keys).
+    let (registered_name, entry) = registry.register(path, name_override, force)?;
+    let entry = entry.clone();
     registry.save(&reg_path)?;
 
     Ok(format!(

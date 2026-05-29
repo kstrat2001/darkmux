@@ -37,7 +37,7 @@ pub fn lab_doctor() -> Result<DoctorReport> {
 
     if !reg_path.exists() {
         report.warnings.push(format!(
-            "no registry found at {}\n  Options:\n    (a) Run the built-in example installer: `scripts/lab-init.sh`\n    (b) Register your own fixture:           `dm lab register /path/to/your/fixture/`\n    (c) Hand-write the registry:             see docs/lab-registry.md\n  Until then, `dm lab run` can't resolve any fixture by name.",
+            "no registry found at {}\n  Options:\n    (a) Register your own fixture:  `dm lab register /path/to/your/fixture/`\n    (b) Hand-write the registry:    see docs/lab-registry.md (when published)\n  Phase 5 (#492) will ship `scripts/lab-init.sh` for a one-command bootstrap of built-in synthetic fixtures.\n  Until then, `dm lab run` can't resolve any fixture by name.",
             reg_path.display()
         ));
         return Ok(report);

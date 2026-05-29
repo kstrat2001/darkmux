@@ -2929,11 +2929,14 @@ fn cmd_lab(sub: LabCmd) -> Result<i32> {
         }
         LabCmd::Doctor => {
             let report = lab::doctor::lab_doctor()?;
-            for p in &report.passes {
-                println!("[ok]  {p}");
-            }
+            // Warnings first so actionable items don't get buried
+            // behind a long list of passes when many fixtures are
+            // registered. Reviewer suggestion (#498 QA).
             for w in &report.warnings {
                 println!("[warn] {w}");
+            }
+            for p in &report.passes {
+                println!("[ok]  {p}");
             }
             println!();
             println!(
