@@ -5,7 +5,9 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-mod agent_roles;
+// #515 — zero-edge leaf extracted to darkmux-agent-roles. Re-export keeps
+// crate::agent_roles::* resolving unchanged.
+pub use darkmux_agent_roles as agent_roles;
 // #463 workspace split — crew extracted to its own crate (the velocity-debt
 // target: touching dispatch_internal.rs now rebuilds only darkmux-crew + the
 // binary stub). Re-export keeps crate::crew::* resolving for the binary +
@@ -19,7 +21,9 @@ mod fleet;
 // re-export keeps all existing `crate::flow::*` paths resolving unchanged.
 pub use darkmux_flow as flow;
 mod flow_cli;
-mod hardware;
+// #515 — zero-edge leaf extracted to darkmux-hardware. Re-export keeps
+// crate::hardware::* resolving for heuristics/eureka/recommendations/doctor/etc.
+pub use darkmux_hardware as hardware;
 mod heuristics;
 mod init;
 mod lab;

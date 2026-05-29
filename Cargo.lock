@@ -332,8 +332,10 @@ dependencies = [
  "axum",
  "blake3",
  "clap",
+ "darkmux-agent-roles",
  "darkmux-crew",
  "darkmux-flow",
+ "darkmux-hardware",
  "darkmux-profiles",
  "darkmux-types",
  "dirs",
@@ -351,6 +353,15 @@ dependencies = [
  "tower",
  "tower-http",
  "ureq",
+]
+
+[[package]]
+name = "darkmux-agent-roles"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -383,6 +394,13 @@ dependencies = [
  "serde_json",
  "serial_test",
  "tempfile",
+]
+
+[[package]]
+name = "darkmux-hardware"
+version = "0.4.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
