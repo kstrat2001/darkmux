@@ -30,7 +30,7 @@ use std::fs;
 use std::sync::Mutex;
 
 const EMBEDDED_PINS_JSON: &str =
-    include_str!("../../../templates/builtin/role-model-pins.json");
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/role-model-pins.json"));
 
 /// The deserialized pin table. `BTreeMap` for `per_role` so doctor
 /// output / diagnostic dumps come out in a stable alphabetical order

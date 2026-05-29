@@ -115,13 +115,13 @@ impl Recommendation {
 // structs lazily on first lookup.
 
 const EMBEDDED_M_SERIES_128: &str =
-    include_str!("../../../templates/builtin/recommendations/m-series-128.json");
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/recommendations/m-series-128.json"));
 const EMBEDDED_M_SERIES_64: &str =
-    include_str!("../../../templates/builtin/recommendations/m-series-64.json");
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/recommendations/m-series-64.json"));
 const EMBEDDED_M_SERIES_32: &str =
-    include_str!("../../../templates/builtin/recommendations/m-series-32.json");
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/recommendations/m-series-32.json"));
 const EMBEDDED_GENERIC: &str =
-    include_str!("../../../templates/builtin/recommendations/generic.json");
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/recommendations/generic.json"));
 
 /// (tier_id, json_str) pairs. The tier_id duplication with the JSON's
 /// `tier` field is deliberate — the registry constructor validates that

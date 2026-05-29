@@ -15,19 +15,19 @@ use std::path::{Path, PathBuf};
 const EMBEDDED_WORKLOADS: &[(&str, &str)] = &[
     (
         "quick-q",
-        include_str!("../../../../templates/builtin/workloads/quick-q.json"),
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/workloads/quick-q.json")),
     ),
     (
         "long-agentic",
-        include_str!("../../../../templates/builtin/workloads/long-agentic.json"),
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/workloads/long-agentic.json")),
     ),
     (
         "quick-coding",
-        include_str!("../../../../templates/builtin/workloads/quick-coding.json"),
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/workloads/quick-coding.json")),
     ),
     (
         "medium-coding",
-        include_str!("../../../../templates/builtin/workloads/medium-coding.json"),
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/workloads/medium-coding.json")),
     ),
 ];
 
