@@ -466,8 +466,25 @@ fn parse_xml_tool_calls(
         let scan_end = payload_start
             .saturating_add(max_payload_bytes)
             .min(text.len());
-        let close_idx = text[payload_start..scan_end].find(XML_TOOL_CALL_CLOSE)?;
-        let payload_end = payload_start + close_idx;
+        // (#409) The structural `</tool_call>` is, by grammar, the first
+        // one that appears AFTER this block's `</function>`. Anchoring on
+        // `</function>` makes a literal `</tool_call>` inside a parameter
+        // value safe — it lives before `</function>`, so it is never
+        // mistaken for the block close. We additionally bound the search at
+        // the next `<tool_call>` opener so multi-block input still splits
+        // correctly. (A literal `<tool_call>` opener inside a value is the
+        // residual edge this can't disambiguate without a real tokenizer;
+        // models effectively never emit one.)
+        let next_open = text[payload_start..scan_end]
+            .find(XML_TOOL_CALL_OPEN)
+            .map(|rel| payload_start + rel)
+            .unwrap_or(scan_end);
+        let region = &text[payload_start..next_open];
+        let close_rel = match region.rfind(XML_FUNCTION_CLOSE) {
+            Some(fn_close) => region[fn_close..].find(XML_TOOL_CALL_CLOSE).map(|rel| fn_close + rel),
+            None => region.find(XML_TOOL_CALL_CLOSE),
+        }?;
+        let payload_end = payload_start + close_rel;
         let payload = &text[payload_start..payload_end];
         let block = parse_xml_block(payload, allowed_tool_names)?;
         let mut block = block;
@@ -506,7 +523,10 @@ fn parse_xml_block(
     }
 
     let params_start = name_start + name_end + 1;
-    let fn_close_idx = payload[params_start..].find(XML_FUNCTION_CLOSE);
+    // (#409) rfind, not find: there is exactly one structural `</function>`
+    // per block, so the LAST occurrence is the real one even when a
+    // parameter value contains the literal `</function>` substring.
+    let fn_close_idx = payload[params_start..].rfind(XML_FUNCTION_CLOSE);
     let params_end = match fn_close_idx {
         Some(idx) => params_start + idx,
         None => payload.len(),
@@ -515,13 +535,23 @@ fn parse_xml_block(
 
     let mut arguments = serde_json::Map::new();
     let mut p_cursor = 0;
-    while let Some(p_open_idx) = params_section[p_cursor..].find(XML_PARAMETER_OPEN) {
-        let key_start = p_cursor + p_open_idx + XML_PARAMETER_OPEN.len();
+    while let Some(p_open_rel) = params_section[p_cursor..].find(XML_PARAMETER_OPEN) {
+        let key_start = p_cursor + p_open_rel + XML_PARAMETER_OPEN.len();
         let key_end_rel = params_section[key_start..].find('>')?;
         let key = params_section[key_start..key_start + key_end_rel].trim().to_string();
         let value_start = key_start + key_end_rel + 1;
-        let value_end_rel = params_section[value_start..].find(XML_PARAMETER_CLOSE)?;
-        let value_text = &params_section[value_start..value_start + value_end_rel];
+        // (#409) The value's closing `</parameter>` is the LAST one before
+        // the next `<parameter=` opener (or before the end of the params
+        // section, for the final parameter). Region-anchored rfind makes a
+        // literal `</parameter>` inside the value safe: any embedded close
+        // tag is an earlier occurrence than the structural one.
+        let region_end = params_section[value_start..]
+            .find(XML_PARAMETER_OPEN)
+            .map(|rel| value_start + rel)
+            .unwrap_or(params_section.len());
+        let value_region = &params_section[value_start..region_end];
+        let value_end_rel = value_region.rfind(XML_PARAMETER_CLOSE)?;
+        let value_text = &value_region[..value_end_rel];
         let value = parse_xml_parameter_value(value_text);
         arguments.insert(key, value);
         p_cursor = value_start + value_end_rel + XML_PARAMETER_CLOSE.len();
@@ -795,6 +825,51 @@ mod tests {
         assert!(cmd.contains("refreshTokenService.test.ts"));
         let timeout = blocks[0].arguments.get("timeout").unwrap();
         assert_eq!(timeout.as_i64().unwrap_or(-1), 60);
+    }
+
+    #[test]
+    fn xml_format_value_contains_parameter_close_tag() {
+        // Regression for #409: a parameter value containing the literal
+        // "</parameter>" substring (e.g. grepping for it) must not truncate
+        // the value or fail the parse. This was the silent-bail edge the
+        // first-match `.find()` produced.
+        let text = "<tool_call><function=bash><parameter=command>grep \"</parameter>\" file.txt</parameter><parameter=timeout>60</parameter></function></tool_call>";
+        let blocks = blocks_only(parse_plain_text_tool_call_blocks(text, &allowed(&["bash"]), DEFAULT_MAX_PAYLOAD_BYTES)).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].name, "bash");
+        assert_eq!(
+            blocks[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "grep \"</parameter>\" file.txt"
+        );
+        assert_eq!(blocks[0].arguments.get("timeout").unwrap().as_i64().unwrap(), 60);
+    }
+
+    #[test]
+    fn xml_format_value_contains_function_and_tool_call_close_tags() {
+        // Regression for #409: literal "</function>" and "</tool_call>"
+        // inside a value must not truncate the params section or the block.
+        // Both are resolved by anchoring on the LAST </function> and the
+        // first </tool_call> after it.
+        let text = "<tool_call><function=bash><parameter=command>echo \"</function></tool_call>\"</parameter></function></tool_call>";
+        let blocks = blocks_only(parse_plain_text_tool_call_blocks(text, &allowed(&["bash"]), DEFAULT_MAX_PAYLOAD_BYTES)).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].name, "bash");
+        assert_eq!(
+            blocks[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "echo \"</function></tool_call>\""
+        );
+    }
+
+    #[test]
+    fn xml_format_close_tag_in_value_preserves_multiblock_split() {
+        // Region-anchoring must not collapse two independent blocks even
+        // when the first block's value contains a "</parameter>" substring.
+        let text = "<tool_call><function=bash><parameter=command>grep \"</parameter>\"</parameter></function></tool_call>\nthinking\n<tool_call><function=read><parameter=path>/a</parameter></function></tool_call>";
+        let blocks = blocks_only(parse_plain_text_tool_call_blocks(text, &allowed(&["bash", "read"]), DEFAULT_MAX_PAYLOAD_BYTES)).unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].name, "bash");
+        assert_eq!(blocks[1].name, "read");
+        assert_eq!(blocks[1].arguments.get("path").unwrap().as_str().unwrap(), "/a");
     }
 
     // ─── Format detection (the trajectory observability split) ─────────
