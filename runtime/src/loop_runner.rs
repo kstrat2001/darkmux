@@ -710,22 +710,34 @@ pub fn run(
                         );
                     }
                     let result = dispatch(&call.function.name, &call.function.arguments);
+                    // (#469) Classify success/failure with the same
+                    // predicate the failure-rate detector uses, and record
+                    // it on the trajectory event so the host watchdog can
+                    // gate its deadline reset.
+                    let tool_ok = !crate::failure_rate::is_failure_result(
+                        &call.function.name,
+                        &result,
+                    );
                     trajectory.append_tool_completed(
                         turns,
                         tool_seq as u32,
                         &call.function.name,
                         call.function.arguments.len(),
                         result.len(),
+                        tool_ok,
                     );
-                    // (#466) Proof-of-work signal for the inactivity-
-                    // approach detector. Mirrors the host-side #468
-                    // reset trigger so the runtime-side soft warning
-                    // and the host-side hard kill share the same
-                    // deadline semantics. Fires on success AND failure
-                    // (same gap as #469); the cycle + failure-rate
-                    // detectors guard the fast-fail seam.
-                    last_proof_of_work = std::time::Instant::now();
-                    inactivity_soft_warning_fired_in_window = false;
+                    // (#466/#469) Proof-of-work signal for the inactivity-
+                    // approach detector. Mirrors the host-side reset
+                    // trigger so the runtime-side soft warning and the
+                    // host-side hard kill share the same deadline
+                    // semantics. Only a SUCCESSFUL tool call counts as
+                    // proof-of-work (#469): a stream of failures must not
+                    // keep the deadline alive — that's the fast-fail seam
+                    // the cycle + failure-rate detectors also guard.
+                    if tool_ok {
+                        last_proof_of_work = std::time::Instant::now();
+                        inactivity_soft_warning_fired_in_window = false;
+                    }
                     // (#465) Track test-cadence drift via same-file
                     // repetition. See state-machine doc above the
                     // declaration of `last_edited_path` for full

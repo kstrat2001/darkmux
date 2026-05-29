@@ -379,7 +379,13 @@ impl Trajectory {
         tool_name: &str,
         args_chars: usize,
         result_chars: usize,
+        ok: bool,
     ) {
+        // `ok` discriminates success from failure (#469). Additive,
+        // backward-compatible field: consumers predating it treat a
+        // missing `ok` as success. The host-side watchdog reads it so a
+        // model fast-failing with varying tool calls can't keep the
+        // inactivity deadline alive with a stream of failed calls.
         self.write_event(&serde_json::json!({
             "type": "tool.completed",
             "seq": seq,
@@ -387,6 +393,7 @@ impl Trajectory {
             "tool_name": tool_name,
             "args_chars": args_chars,
             "result_chars": result_chars,
+            "ok": ok,
             "ts": unix_ms(),
         }));
     }
@@ -583,6 +590,31 @@ mod tests {
             assert!(parsed["type"].is_string());
             assert!(parsed["ts"].is_number());
         }
+    }
+
+    #[test]
+    fn tool_completed_emits_ok_discriminator() {
+        // (#469) tool.completed carries `ok` so the host watchdog can
+        // distinguish a successful tool call (proof-of-work, resets the
+        // deadline) from a failed one (does not).
+        let ws = TempDir::new("traj-test-ok").unwrap();
+        let mut t = Trajectory::open(ws.path());
+        t.append_tool_completed(1, 0, "bash", 40, 1000, true);
+        t.append_tool_completed(2, 1, "bash", 40, 80, false);
+        drop(t);
+
+        let body = fs::read_to_string(
+            ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE),
+        )
+        .unwrap();
+        let lines: Vec<serde_json::Value> = body
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["type"], "tool.completed");
+        assert_eq!(lines[0]["ok"], serde_json::json!(true));
+        assert_eq!(lines[1]["ok"], serde_json::json!(false));
     }
 
     #[test]

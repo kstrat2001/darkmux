@@ -127,8 +127,15 @@ Carries FULL reasoning text — can be 5-10× the response size on hard problems
 ### `tool.completed` (1 per tool invocation)
 
 ```
-{ "type": "tool.completed", "seq": <turn>, "tool_seq": <int>, "tool_name": <str>, "args_chars": <int>, "result_chars": <int>, "ts": <unix_ms> }
+{ "type": "tool.completed", "seq": <turn>, "tool_seq": <int>, "tool_name": <str>, "args_chars": <int>, "result_chars": <int>, "ok": <bool>, "ts": <unix_ms> }
 ```
+
+`ok` (added #469) discriminates success from failure: `true` when the tool
+call succeeded (read/edit/write without IO error, `bash` exit 0), `false`
+otherwise. Only a successful tool call counts as proof-of-work for the
+inactivity deadline — a stream of failures no longer keeps a stuck dispatch
+alive. Trajectories predating the field omit it; treat a missing `ok` as
+`true` (success) for backward compatibility.
 
 ### `compaction` (1 per compaction trigger that fires)
 
