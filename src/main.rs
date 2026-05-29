@@ -910,6 +910,37 @@ enum LabCmd {
         #[arg(long, short = 'c')]
         config: Option<String>,
     },
+    /// Register a fixture directory in the lab registry by name (#491).
+    /// Reads `.fixture.json` from `<path>`, computes a BLAKE3 content
+    /// hash, records the pointer in `~/.darkmux/lab-registry.json`.
+    /// The dir itself stays where it is — registry is just a lookup
+    /// table.
+    Register {
+        /// Path to the fixture directory (must contain `.fixture.json`).
+        path: std::path::PathBuf,
+        /// Override the manifest's name field (registry key).
+        #[arg(long)]
+        name: Option<String>,
+        /// Replace an existing registry entry with the same name.
+        /// Without this, duplicate names error out.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Remove a fixture from the lab registry by name (#491).
+    /// NEVER touches the underlying directory — operator-sovereignty
+    /// preserved.
+    Unregister {
+        /// Registry key (name from `.fixture.json` or `--name` at
+        /// register time).
+        name: String,
+    },
+    /// List registered fixtures + their paths + hashes (#491).
+    Fixtures,
+    /// Lint the lab registry — schema check, path existence, content
+    /// hash recompute, required-files presence (#491). Cheap + offline:
+    /// no dispatches, no network. Doctor is the discoverability layer
+    /// for the lab subsystem.
+    Doctor,
 }
 
 fn main() -> Result<()> {
@@ -2880,6 +2911,42 @@ fn cmd_lab(sub: LabCmd) -> Result<i32> {
             } else {
                 1
             })
+        }
+        LabCmd::Register { path, name, force } => {
+            let msg = lab::fixture_cli::cmd_register(&path, name, force)?;
+            println!("{msg}");
+            Ok(0)
+        }
+        LabCmd::Unregister { name } => {
+            let msg = lab::fixture_cli::cmd_unregister(&name)?;
+            println!("{msg}");
+            Ok(0)
+        }
+        LabCmd::Fixtures => {
+            let msg = lab::fixture_cli::cmd_list()?;
+            println!("{msg}");
+            Ok(0)
+        }
+        LabCmd::Doctor => {
+            let report = lab::doctor::lab_doctor()?;
+            // Warnings first so actionable items don't get buried
+            // behind a long list of passes when many fixtures are
+            // registered. Reviewer suggestion (#498 QA).
+            for w in &report.warnings {
+                println!("[warn] {w}");
+            }
+            for p in &report.passes {
+                println!("[ok]  {p}");
+            }
+            println!();
+            println!(
+                "{} pass, {} warn ({} fixture{} checked)",
+                report.passes.len(),
+                report.warnings.len(),
+                report.fixture_count,
+                if report.fixture_count == 1 { "" } else { "s" }
+            );
+            Ok(if report.has_warnings() { 1 } else { 0 })
         }
     }
 }

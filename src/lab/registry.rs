@@ -15,11 +15,20 @@
 //! pointer + an integrity-check hash.
 
 use crate::lab::fixture::FixtureManifest;
+use crate::lab::paths::DarkmuxPaths;
 use crate::lab::sandbox_hash::hash_sandbox_dir;
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+/// Canonical location of the lab registry file inside a resolved
+/// darkmux home. Phase 4 CLI verbs read/write this path. Operators
+/// who want a custom location can hand-edit + move; the resolver
+/// always honors the canonical name under `{root}`.
+pub fn default_registry_path(paths: &DarkmuxPaths) -> PathBuf {
+    paths.root.join("lab-registry.json")
+}
 
 /// One registered fixture's entry. Fields are public-API surface for
 /// Phase 3 (resolver) + Phase 4 (CLI verbs) — they're populated now
@@ -105,6 +114,11 @@ impl LabRegistry {
     /// `force` — if `true`, replace any existing entry with the same
     /// name. If `false` and an entry exists, return an error.
     ///
+    /// Returns the **resolved registry key** (post-name-override)
+    /// alongside the entry, so callers don't have to recover it via
+    /// scan-the-map (which is fragile when multiple entries share
+    /// the same content).
+    ///
     /// **In-memory only.** Caller MUST call [`Self::save`] to persist
     /// the change to disk. Phase 4 CLI verbs are responsible for the
     /// save step.
@@ -113,7 +127,7 @@ impl LabRegistry {
         fixture_dir: &Path,
         name_override: Option<String>,
         force: bool,
-    ) -> Result<&RegisteredFixture> {
+    ) -> Result<(String, &RegisteredFixture)> {
         let manifest = FixtureManifest::load_from_dir(fixture_dir)
             .with_context(|| format!("loading manifest from {}", fixture_dir.display()))?;
         let name = name_override.unwrap_or_else(|| manifest.name.clone());
@@ -140,7 +154,10 @@ impl LabRegistry {
             satisfies: manifest.satisfies,
         };
         self.fixtures.insert(name.clone(), entry);
-        Ok(self.fixtures.get(&name).expect("just inserted"))
+        Ok((
+            name.clone(),
+            self.fixtures.get(&name).expect("just inserted"),
+        ))
     }
 
     /// Remove a fixture from the registry. Does NOT delete the
@@ -280,9 +297,24 @@ mod tests {
         write_fixture(&fixture_dir, "demo", None);
 
         let mut reg = LabRegistry::default();
-        let entry = reg.register(&fixture_dir, None, false).unwrap();
+        let (name, entry) = reg.register(&fixture_dir, None, false).unwrap();
+        assert_eq!(name, "demo");
         assert!(entry.content_hash.starts_with("blake3:"));
         assert!(!entry.hashed_at.is_empty());
+    }
+
+    /// Returned (name, entry) reflects the override when supplied.
+    #[test]
+    fn register_returns_resolved_name_with_override() {
+        let tmp = TempDir::new().unwrap();
+        let fixture_dir = tmp.path().join("fx");
+        std::fs::create_dir_all(&fixture_dir).unwrap();
+        write_fixture(&fixture_dir, "from-manifest", None);
+        let mut reg = LabRegistry::default();
+        let (name, _) = reg
+            .register(&fixture_dir, Some("override-name".to_string()), false)
+            .unwrap();
+        assert_eq!(name, "override-name");
     }
 
     #[test]
