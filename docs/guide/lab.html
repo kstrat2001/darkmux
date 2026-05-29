@@ -135,6 +135,59 @@ darkmux lab runs --limit 50</code></pre>
 
 <section>
   <div class="wrap">
+    <h2>Reproducible sandboxes: fixtures</h2>
+    <p>A single number isn't a measurement — a number you can <em>reproduce</em> is. The fixture system (landed across <a href="https://github.com/kstrat2001/darkmux/issues/487">#487</a>, phases 1–5) makes every <code>coding-task</code> run start from a known state and end with a verifiable one, so "this profile is faster" becomes a claim you can re-run on demand.</p>
+
+    <h3>Per-run copy-on-write isolation</h3>
+    <p>Every <code>darkmux lab run</code> works in its own sandbox — a copy-on-write clone of the source, not the source itself. The source fixture directory is <strong>never touched</strong>; cross-run contamination is eliminated by construction. The clone is near-instant where the filesystem supports it (<code>clonefile</code> on APFS, <code>--reflink</code> on btrfs/xfs/zfs) and falls back to a deep copy everywhere else.</p>
+    <pre><code>~/.darkmux/runs/&lt;run-id&gt;/
+<span class="comment">  sandbox/          # this run's isolated COW clone — the model works here
+  manifest.json     # now carries baseline_hash + final_hash (schemaVersion 4)
+  trajectory.jsonl  # per-turn detail
+  instruments.jsonl # only with --instrument</span></code></pre>
+    <p>The manifest gained two content hashes (BLAKE3, formatted <code>blake3:&lt;hex&gt;</code>):</p>
+    <ul>
+      <li><strong><code>fixture.baseline_hash</code></strong> — the source state <em>before</em> the run, captured at clone time. Proves two runs started from the same place.</li>
+      <li><strong><code>final_hash</code></strong> — the sandbox state <em>after</em> dispatch, excluding derived dirs (<code>.git</code>, <code>node_modules</code>, <code>target</code>, <code>__pycache__</code>, <code>.coverage</code>, <code>.darkmux-runtime</code>). Two runs with the same <code>final_hash</code> left bitwise-identical output — the strongest reproducibility signal the lab emits.</li>
+    </ul>
+
+    <h3>The fixture manifest</h3>
+    <p>A fixture is a self-contained directory with a <code>.fixture.json</code> manifest at its root. Only <code>name</code> is required:</p>
+    <pre><code>{
+  <span class="comment">"name"</span>: "demo-tiny-py",          <span class="comment">// registry key — no path separators</span>
+  <span class="comment">"version"</span>: "1.0",
+  <span class="comment">"satisfies"</span>: "tiny-python-suite@1.0", <span class="comment">// what abstract requirement this fills</span>
+  <span class="comment">"language"</span>: "python",
+  <span class="comment">"verify_command"</span>: "python3 -m unittest discover -s tests",
+  <span class="comment">"baseline"</span>: { "test_count": 5 },   <span class="comment">// free-form expectations, surfaced by doctor</span>
+  <span class="comment">"required_files"</span>: ["src/parser.py", "tests/test_parser.py"],
+  <span class="comment">"hash_exclude"</span>: ["__pycache__", ".pytest_cache"]
+}</code></pre>
+    <p><code>hash_include</code> / <code>hash_exclude</code> layer on top of the defaults if you need to pull in out-of-tree files or ignore derived ones.</p>
+
+    <h3>Register once, resolve by requirement</h3>
+    <p>The fixture <em>directory</em> stays wherever it lives; the registry (<code>~/.darkmux/lab-registry.json</code>, or <code>.darkmux/lab-registry.json</code> project-scoped) is just a name → path lookup with integrity metadata. Registering computes and records the content hash so later drift is detectable.</p>
+    <pre><code>darkmux lab register ./my-fixture            <span class="comment"># add by path (reads .fixture.json)</span>
+darkmux lab register ./my-fixture --force    <span class="comment"># replace an existing entry</span>
+darkmux lab fixtures                         <span class="comment"># list registered fixtures</span>
+darkmux lab unregister demo-tiny-py          <span class="comment"># drop the entry (never deletes the dir)</span>
+darkmux lab doctor                           <span class="comment"># offline integrity check (see below)</span></code></pre>
+    <p>A workload opts into a fixture by declaring <code>requires_fixture</code> in its manifest — a <code>&lt;name&gt;@&lt;version&gt;</code> string. At run time the resolver finds a registered fixture whose <code>satisfies</code> matches and uses it as the source; with no <code>requires_fixture</code> set, the run falls back to <code>{sandboxes}/&lt;workload-id&gt;/</code> as before. (This replaces the old <code>DARKMUX_SANDBOX_&lt;ID&gt;</code> env-var binding — the registry is now the only persistent fixture binding.)</p>
+
+    <h3><code>darkmux lab doctor</code></h3>
+    <p>A cheap, offline check that catches a broken fixture <em>before</em> you waste a dispatch on it. For every registered fixture it verifies the path still exists, the manifest still loads, the <code>required_files</code> are present, and the content hash + manifest version haven't drifted since registration. If there's no registry at all, it points you at <code>scripts/lab-init.sh</code>.</p>
+
+    <h3>Bootstrap the built-ins</h3>
+    <p>A built-in <code>demo-tiny-py</code> fixture (a trivial Python module + a 5-test suite) ships in the repo under <code>templates/builtin/lab-fixtures/</code>. Populate your registry with it — and any future built-ins — via the standalone init script (idempotent; safe to re-run after a <code>git pull</code>):</p>
+    <pre><code>scripts/lab-init.sh          <span class="comment"># register all built-ins</span>
+scripts/lab-init.sh --dry    <span class="comment"># print what would be registered; no writes</span>
+scripts/lab-init.sh --force  <span class="comment"># re-register, accepting upstream drift</span></code></pre>
+    <p>It's a plain script, not a CLI verb — run it once, fork it, or skip it entirely. The discoverability path lives in <code>darkmux lab doctor</code>'s "no registry" hint.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
     <h2>Adding a workload</h2>
     <p>Built-in workloads live in <code>templates/builtin/workloads/*.json</code> and are embedded into the binary at compile time via <code>include_str!</code> — they work from any directory without the source tree.</p>
     <p>To add your own:</p>

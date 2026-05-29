@@ -70,26 +70,50 @@ src/
   init.rs / skills.rs        `darkmux init` + skill installer
   notebook.rs                Notebook draft generator
   lab/
-    paths.rs                 Workspace dir resolution (project vs user)
-    run.rs                   Workload dispatch
+    paths.rs                 Workspace dir resolution (project vs user) + default_registry_path
+    run.rs                   Workload dispatch + source-sandbox resolution + manifest fixture-enrichment
     inspect.rs               Single-run analysis
     compare.rs               Run-vs-run diff
     list.rs                  Recent runs table
+    cow_clone.rs             Per-run copy-on-write sandbox clone (#487 phase 1)
+    sandbox_hash.rs          BLAKE3 content hashing (baseline_hash / final_hash)
+    fixture.rs               .fixture.json manifest type + validation (#487 phase 2)
+    registry.rs              Fixture registry load/save/find_satisfying (lab-registry.json)
+    fixture_cli.rs           lab register/unregister/fixtures verbs (#487 phase 4)
+    doctor.rs                lab doctor — offline fixture integrity check
   workloads/
-    types.rs                 WorkloadProvider trait + manifest types
+    types.rs                 WorkloadProvider trait + manifest types (incl. requires_fixture)
     load.rs                  Manifest loading (user → on-disk → embedded)
     registry.rs              Provider registry
   providers/
     prompt.rs                Trivial single-prompt provider
-    coding_task.rs           Sandbox + verify-command provider
+    coding_task.rs           Sandbox + verify-command provider (writes final_hash)
+  crew/
+    types.rs                 Role + Skill + Capability schema; capabilities() derivation; is_specialist()
+    select.rs                select_model(role, profile) — dispatch model selection (phase-1 stub, E14)
+    dispatch_internal.rs     Internal-runtime dispatch path (typed-config consumer)
+    dispatch.rs              OC shell-out dispatch path
+runtime/                      Internal-runtime crate (built into darkmux-runtime Docker image)
+  src/loop_runner.rs          Agent loop; budget caps; inactivity deadline; detector + recovery wiring
+  src/compaction.rs           Narrative + structured-slot compaction; JSON repair; escalation
+  src/feedback.rs             Feedback-injection channel + default per-signal templates
+  src/cycle_detector.rs       Repeated-tool-call detection (#418)
+  src/reasoning_loop.rs       Repeated-reasoning detection (#461)
+  src/failure_rate.rs         Consecutive-tool-failure detection (#419)
+  src/plain_text_tool_calls.rs  Plain-text → structured tool-call promoter (#406)
+  src/json_repair.rs          Truncated-JSON repair for compactor output (#401)
+  src/trajectory.rs           Trajectory JSONL event writers (the analyze-run skill documents the shapes)
 templates/builtin/
   roles/                      Crew role library (manifest + .md) embedded at compile time
   skills/                     Skill library embedded at compile time (work-shape descriptors with keyword routing; renamed from `capabilities/` in refactor 0 — see #448)
   workloads/                  Workload manifests embedded at compile time
+  lab-fixtures/               Built-in lab fixtures (e.g. demo-tiny-py) registered via scripts/lab-init.sh
   recommendations/            Tier-aware recommendation registry
+  AUTONOMOUS_DISPATCH_PREAMBLE.md  Injected ahead of specialist-role dispatches (#427)
   role-model-pins.json        Default per-role model pins
 integrations/openclaw/
   agent-scaffolds/            Openclaw-integration export scaffolds (NOT engine-internal)
+scripts/lab-init.sh           Standalone fixture-registry bootstrapper (NOT a CLI verb; #487 phase 5)
 skills/darkmux-<name>/        Agent-invokable skill wrappers
 tests/cli.rs                  Integration tests (spawn the binary)
 ```
@@ -127,6 +151,8 @@ If a user asks you to:
 |---|---|
 | "add a new workload" | Drop a JSON manifest at `templates/builtin/workloads/<id>.json`. If it's a `prompt` workload, register it in `EMBEDDED_WORKLOADS` in `src/workloads/load.rs`. coding-task workloads need a sandbox seed dir and CAN'T be embedded. |
 | "add a new provider" | Implement `WorkloadProvider` in `src/providers/<name>.rs`, register it in `src/workloads/registry.rs::register_builtins()`. |
+| "add a lab fixture" | Create a dir with a `.fixture.json` manifest (`name` required; `satisfies`, `verify_command`, `required_files` optional), then `darkmux lab register <path>`. A workload binds to it via `requires_fixture: "<name>@<version>"`. Built-ins live under `templates/builtin/lab-fixtures/` and register via `scripts/lab-init.sh`. |
+| "check fixtures are healthy" | `darkmux lab doctor` — offline check that registered paths exist, manifests load, required files are present, and content hashes haven't drifted. |
 | "run the smoke test" | `cargo install --path . && darkmux lab run quick-q`. Should complete in ~6-10s if a model is loaded. |
 | "list notebook entries" | `darkmux notebook list` (optionally `--machine <id>` to filter). Enumerates `.md` files, parses headers. |
 | "draft a notebook entry" | `darkmux notebook draft <run-id>` (optionally `--machine <id>` to override). |
