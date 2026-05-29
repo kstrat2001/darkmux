@@ -333,6 +333,7 @@ dependencies = [
  "blake3",
  "clap",
  "darkmux-flow",
+ "darkmux-profiles",
  "darkmux-types",
  "dirs",
  "futures",
@@ -362,6 +363,18 @@ dependencies = [
  "libc",
  "redis",
  "serde",
+ "serde_json",
+ "serial_test",
+ "tempfile",
+]
+
+[[package]]
+name = "darkmux-profiles"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "darkmux-types",
+ "dirs",
  "serde_json",
  "serial_test",
  "tempfile",

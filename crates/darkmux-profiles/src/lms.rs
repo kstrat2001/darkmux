@@ -1,4 +1,4 @@
-use crate::types::LoadedModel;
+use darkmux_types::LoadedModel;
 use anyhow::{Context, Result, bail};
 use std::env;
 use std::process::Command;

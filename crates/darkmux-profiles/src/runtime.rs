@@ -1,5 +1,5 @@
 use crate::swap::namespaced_identifier;
-use crate::types::{ModelRole, Profile, ProfileModel};
+use darkmux_types::{ModelRole, Profile, ProfileModel};
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::env;
@@ -305,7 +305,7 @@ pub struct CtxWindowChange {
 /// already matches loaded state (the idempotent case).
 pub fn fix_ctx_window_to_loaded(
     config_path: &Path,
-    loaded: &[crate::types::LoadedModel],
+    loaded: &[darkmux_types::LoadedModel],
 ) -> Result<Vec<CtxWindowChange>> {
     if !config_path.exists() {
         bail!(
@@ -585,7 +585,7 @@ fn should_rewrite_lmstudio_pin(current: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ModelRole, Profile, ProfileModel, ProfileRuntime, RuntimeCompactionConfig};
+    use darkmux_types::{ModelRole, Profile, ProfileModel, ProfileRuntime, RuntimeCompactionConfig};
     use serde_json::Value as JsonValue;
     use tempfile::TempDir;
 
@@ -1245,7 +1245,7 @@ mod tests {
     // vars (DARKMUX_OPENCLAW_CONFIG) — running them in parallel races against
     // any other test that touches those vars.
 
-    use crate::types::LoadedModel;
+    use darkmux_types::LoadedModel;
     use serial_test::serial;
 
     fn profile_without_runtime(models: Vec<ProfileModel>) -> Profile {
