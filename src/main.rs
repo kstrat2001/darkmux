@@ -16,7 +16,9 @@ pub use darkmux_crew as crew;
 mod doctor;
 mod eureka;
 mod external;
-mod fleet;
+// #515 — fleet extracted (deps crew/flow/types all crates now). Re-export
+// keeps crate::fleet::* resolving for serve/sprint_cli/notebook/mission_propose.
+pub use darkmux_fleet as fleet;
 // #463 workspace split — flow extracted to the darkmux-flow crate. The
 // re-export keeps all existing `crate::flow::*` paths resolving unchanged.
 pub use darkmux_flow as flow;

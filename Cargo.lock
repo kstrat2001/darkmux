@@ -334,6 +334,7 @@ dependencies = [
  "clap",
  "darkmux-agent-roles",
  "darkmux-crew",
+ "darkmux-fleet",
  "darkmux-flow",
  "darkmux-hardware",
  "darkmux-profiles",
@@ -374,6 +375,23 @@ dependencies = [
  "darkmux-types",
  "dirs",
  "rusqlite",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "tempfile",
+]
+
+[[package]]
+name = "darkmux-fleet"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "darkmux-crew",
+ "darkmux-flow",
+ "darkmux-types",
+ "dirs",
+ "libc",
+ "redis",
  "serde",
  "serde_json",
  "serial_test",

@@ -617,7 +617,7 @@ pub struct WorkJob {
     /// time by serde rather than at `validate()`, eliminating a class
     /// of "publisher snuck through validate, worker crashed" bugs.
     #[serde(default)]
-    pub runtime: crate::crew::dispatch::Runtime,
+    pub runtime: darkmux_crew::dispatch::Runtime,
 
     /// Per-turn timeout (seconds) — passes through to the runtime's
     /// turn timeout.
@@ -739,7 +739,7 @@ impl WorkJob {
 /// parameter lets callers name the offending field as the operator
 /// thinks of it (`"mission_id"`, `"WorkJob.target_tier"`, etc.) so
 /// errors are operator-actionable rather than internal-shape-leaky.
-pub(crate) fn validate_identifier(label: &str, value: &str) -> Result<()> {
+pub fn validate_identifier(label: &str, value: &str) -> Result<()> {
     if value.is_empty() {
         return Err(anyhow!("{label} must be non-empty"));
     }
@@ -1065,7 +1065,7 @@ fn worker_main() {
         return;
     };
 
-    let Some(tier) = crate::flow::resolve_machine_tier() else {
+    let Some(tier) = darkmux_flow::resolve_machine_tier() else {
         eprintln!(
             "darkmux-worker: DARKMUX_MACHINE_TIER not set — fleet work queue disabled. \
              Set DARKMUX_MACHINE_TIER=<inference|hub|client> to enable."
@@ -1073,9 +1073,9 @@ fn worker_main() {
         return;
     };
 
-    let machine_id = crate::flow::resolve_machine_id().unwrap_or_else(|| "unknown".to_string());
+    let machine_id = darkmux_flow::resolve_machine_id().unwrap_or_else(|| "unknown".to_string());
 
-    let url = crate::flow::RawRedisUrl::new(redis_url);
+    let url = darkmux_flow::RawRedisUrl::new(redis_url);
     let client = match redis::Client::open(url.expose_for_probe()) {
         Ok(c) => c,
         Err(e) => {
@@ -1162,7 +1162,7 @@ fn handle_claimed_job(client: &redis::Client, tier: &str, claimed: ClaimedJob) {
     // not buried deep in the internal/openclaw dispatch path.
     if let Some(workdir_str) = &job.workdir {
         let path = std::path::Path::new(workdir_str);
-        if let Err(e) = crate::workdir::validate_workdir(path) {
+        if let Err(e) = darkmux_types::workdir::validate_workdir(path) {
             eprintln!(
                 "darkmux-worker: REJECTED claimed job {work_id}: workdir validation failed: {e:#}. \
                  Acking to release queue lease; dispatch NOT invoked."
@@ -1177,7 +1177,7 @@ fn handle_claimed_job(client: &redis::Client, tier: &str, claimed: ClaimedJob) {
     // doesn't match the local machine_id, log a warning but proceed —
     // the queue already gave us the claim, refusing would orphan the
     // job (PR-E will handle this properly via lease re-publish).
-    let local_machine = crate::flow::resolve_machine_id();
+    let local_machine = darkmux_flow::resolve_machine_id();
     if let Some(target) = &job.target_machine {
         if local_machine.as_deref() != Some(target.as_str()) {
             eprintln!(
@@ -1191,7 +1191,7 @@ fn handle_claimed_job(client: &redis::Client, tier: &str, claimed: ClaimedJob) {
     // Convert + dispatch. The dispatch function is synchronous and may
     // block several minutes for long-agentic dispatches.
     let opts = job.into_dispatch_opts();
-    let dispatch_result = crate::crew::dispatch::dispatch(opts);
+    let dispatch_result = darkmux_crew::dispatch::dispatch(opts);
 
     match dispatch_result {
         Ok(outcome) => {
@@ -1222,8 +1222,8 @@ impl WorkJob {
     /// `crew::dispatch::dispatch` entry point consumes. Centralizes the
     /// queue → in-process boundary so PR-C.3's client path can be checked
     /// against this shape for round-trip parity.
-    pub fn into_dispatch_opts(self) -> crate::crew::dispatch::DispatchOpts {
-        use crate::crew::dispatch::DispatchOpts;
+    pub fn into_dispatch_opts(self) -> darkmux_crew::dispatch::DispatchOpts {
+        use darkmux_crew::dispatch::DispatchOpts;
         DispatchOpts {
             role_id: self.role_id,
             message: self.message,
@@ -1260,7 +1260,7 @@ impl WorkJob {
             // runtime defaults. Future iteration could propagate via
             // the job payload if cross-machine compaction tuning
             // becomes a real requirement.
-            compaction: crate::crew::dispatch::CompactionDispatchArgs::default(),
+            compaction: darkmux_crew::dispatch::CompactionDispatchArgs::default(),
         }
     }
 }
@@ -1330,7 +1330,7 @@ pub struct CompletionResult {
 /// `darkmux:flow` stream via the TeeSink → RedisSink composition).
 /// (CRITICAL fix from PR-C.3 review)
 pub fn wait_for_completion(
-    redis_url: &crate::flow::RawRedisUrl,
+    redis_url: &darkmux_flow::RawRedisUrl,
     session_id: &str,
     timeout: Duration,
 ) -> Result<CompletionResult> {
@@ -1466,7 +1466,7 @@ pub fn build_work_job(
     deliver: Option<String>,
     workdir: Option<String>,
     sprint_id: Option<String>,
-    runtime: crate::crew::dispatch::Runtime,
+    runtime: darkmux_crew::dispatch::Runtime,
     timeout_seconds: u32,
     published_by_machine: Option<String>,
     published_by_orchestrator: Option<String>,
@@ -1505,7 +1505,7 @@ pub fn build_work_job(
 // the chosen machine, so it must run locally and never re-route.
 // ─────────────────────────────────────────────────────────────────────────
 
-use crate::crew::dispatch::{self, DispatchOpts, DispatchResult, RoutingDecision};
+use darkmux_crew::dispatch::{self, DispatchOpts, DispatchResult, RoutingDecision};
 
 /// Route a dispatch local-vs-remote, then run it. When `--machine` is set
 /// (and isn't the local machine) OR the role's tier auto-routes across the
@@ -1515,7 +1515,7 @@ use crate::crew::dispatch::{self, DispatchOpts, DispatchResult, RoutingDecision}
 /// relocated from `crew::dispatch::dispatch` in #463.)
 pub fn dispatch_routed(opts: DispatchOpts) -> Result<DispatchResult> {
     if let Some(target) = opts.machine.clone() {
-        let local = crate::flow::resolve_machine_id();
+        let local = darkmux_flow::resolve_machine_id();
         match dispatch::routing_decision(Some(target.as_str()), local.as_deref()) {
             RoutingDecision::Local {
                 matches_was_explicit: true,
@@ -1574,7 +1574,7 @@ pub fn dispatch_routed(opts: DispatchOpts) -> Result<DispatchResult> {
         // role's tier doesn't match the local machine's tier (and the fleet
         // has a peer in the role's tier). The worker that claims it runs its
         // own preflight — we skip the local one.
-        let local_tier = crate::flow::resolve_machine_tier();
+        let local_tier = darkmux_flow::resolve_machine_tier();
         eprintln!(
             "darkmux crew dispatch: auto-routing role=`{}` via tier=`{}` \
              (local tier=`{}`, no --machine — consumer group claims).",
@@ -1675,14 +1675,14 @@ fn dispatch_via_queue(opts: DispatchOpts, target_machine: Option<&str>) -> Resul
         opts.sprint_id.clone(),
         opts.runtime,
         opts.timeout_seconds,
-        crate::flow::resolve_machine_id(),
-        crate::flow::resolve_orchestrator(),
+        darkmux_flow::resolve_machine_id(),
+        darkmux_flow::resolve_orchestrator(),
     );
 
     // Open the Redis client lazily here (not at darkmux startup) so the
     // local-dispatch path doesn't pay any connection cost. The same
     // `raw_url` is reused by `wait_for_completion` below.
-    let raw_url = crate::flow::RawRedisUrl::new(redis_url);
+    let raw_url = darkmux_flow::RawRedisUrl::new(redis_url);
     let client = redis::Client::open(raw_url.expose_for_probe())
         .with_context(|| format!("opening Redis client {raw_url} for --machine dispatch"))?;
 
@@ -1752,7 +1752,7 @@ fn auto_route_target_tier(opts: &DispatchOpts) -> Result<Option<String>> {
         Some("") | Some("any") | None => return Ok(None), // local
         Some(t) => t.to_string(),
     };
-    let local_tier = crate::flow::resolve_machine_tier();
+    let local_tier = darkmux_flow::resolve_machine_tier();
     if local_tier.as_deref() == Some(role_tier.as_str()) {
         // Local matches role's tier — dispatch locally; no queue cost.
         return Ok(None);
@@ -1836,7 +1836,7 @@ mod tests {
 
     // #463 — routing tests moved here with their subjects
     // (completion_to_dispatch_result + auto_route_target_tier).
-    use crate::crew::dispatch::{CompactionDispatchArgs, Runtime};
+    use darkmux_crew::dispatch::{CompactionDispatchArgs, Runtime};
 
     // ─── completion_to_dispatch_result (Wave-E.6 #255) ────────────────
 
@@ -2500,7 +2500,7 @@ mod tests {
             None,
             Some("/tmp/workspace".to_string()),
             None,
-            crate::crew::dispatch::Runtime::Openclaw,
+            darkmux_crew::dispatch::Runtime::Openclaw,
             600,
             Some("studio".to_string()),
             Some("claude-opus-4-7".to_string()),
@@ -2526,7 +2526,7 @@ mod tests {
             None, // deliver None
             None, // workdir None
             None, // sprint_id None
-            crate::crew::dispatch::Runtime::Openclaw,
+            darkmux_crew::dispatch::Runtime::Openclaw,
             300,
             None, // published_by_machine None
             None, // published_by_orchestrator None
@@ -2575,7 +2575,7 @@ mod tests {
             "attempt": 1
         }"#;
         let parsed: WorkJob = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed.runtime, crate::crew::dispatch::Runtime::Internal);
+        assert_eq!(parsed.runtime, darkmux_crew::dispatch::Runtime::Internal);
     }
 
     /// Wave-E.14: lifting `runtime` from String to enum moves the
@@ -2611,7 +2611,7 @@ mod tests {
     /// JSON-on-disk records keep loading.
     #[test]
     fn runtime_enum_serdes_as_lowercase_string() {
-        use crate::crew::dispatch::Runtime;
+        use darkmux_crew::dispatch::Runtime;
         let oc = serde_json::to_string(&Runtime::Openclaw).unwrap();
         assert_eq!(oc, "\"openclaw\"");
         let ic = serde_json::to_string(&Runtime::Internal).unwrap();
@@ -2650,7 +2650,7 @@ mod tests {
             None,
             None,
             None,
-            crate::crew::dispatch::Runtime::Openclaw,
+            darkmux_crew::dispatch::Runtime::Openclaw,
             600,
             None,
             None,
@@ -2735,7 +2735,7 @@ mod tests {
             None,
             None,
             None,
-            crate::crew::dispatch::Runtime::Openclaw,
+            darkmux_crew::dispatch::Runtime::Openclaw,
             600,
             None,
             None,
