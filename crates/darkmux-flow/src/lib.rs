@@ -6,6 +6,8 @@
 //! `~/.darkmux/flows/` (overridable via `DARKMUX_FLOWS_DIR`). The first write
 //! atomically prepends a schema header so partial-file recovery is possible.
 
+pub mod daemon_probe;
+
 use anyhow::{Context, Result};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};

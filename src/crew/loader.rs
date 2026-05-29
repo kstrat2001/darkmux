@@ -5,7 +5,7 @@
 #![allow(dead_code)]
 
 use crate::crew::types::*;
-use crate::lab::paths::{resolve, ResolveScope};
+use crate::types::paths::{resolve, ResolveScope};
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 #[cfg(test)]
@@ -496,7 +496,7 @@ pub fn load_skills() -> Result<Vec<Skill>> {
 #[allow(dead_code)]
 pub fn resolve_role_prompt_path(
     role: &Role,
-    paths: &crate::lab::paths::DarkmuxPaths,
+    paths: &crate::types::paths::DarkmuxPaths,
 ) -> Option<PathBuf> {
     if let Some(p) = &role.prompt_path {
         return Some(p.clone());

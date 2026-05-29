@@ -891,7 +891,7 @@ pub(crate) fn sprint_review_at(
         sprint_id,
     ));
 
-    let dispatch_result = match crate::crew::dispatch::dispatch(dispatch_opts) {
+    let dispatch_result = match crate::fleet::dispatch_routed(dispatch_opts) {
         Ok(r) => r,
         Err(e) => {
             let _ = crate::flow::record(build_review_record(

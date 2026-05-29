@@ -60,7 +60,7 @@
 
 use crate::crew::loader;
 use crate::crew::types::*;
-use crate::lab::paths::{resolve, ResolveScope};
+use crate::types::paths::{resolve, ResolveScope};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::fs;

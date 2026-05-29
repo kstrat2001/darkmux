@@ -214,7 +214,7 @@ fn dispatch_compiler(input: &str, hint: Option<&str>) -> Result<String> {
         // large per-turn context.
         compaction: crate::crew::dispatch::CompactionDispatchArgs::default(),
     };
-    let dispatch_result = crate::crew::dispatch::dispatch(opts);
+    let dispatch_result = crate::fleet::dispatch_routed(opts);
 
     let wall_ms = compile_start_instant.elapsed().as_millis() as u64;
     let (success, output_chars) = match &dispatch_result {

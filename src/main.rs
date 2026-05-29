@@ -2188,7 +2188,7 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
                 // defaults. Lab + sprint paths derive from profile.
                 compaction: crew::dispatch::CompactionDispatchArgs::default(),
             };
-            let result = crew::dispatch::dispatch(opts)?;
+            let result = fleet::dispatch_routed(opts)?;
             // Announce the resolved session id on stderr so operators see
             // which session openclaw was pointed at — without polluting
             // the --json envelope on stdout that orchestrators parse.
