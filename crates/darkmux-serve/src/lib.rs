@@ -41,7 +41,7 @@ fn is_valid_date(date: &str) -> Option<&str> {
 }
 
 /// Build the HTTP router with a configurable flows directory.
-pub fn build_router(flows_dir: PathBuf) -> Router {
+pub(crate) fn build_router(flows_dir: PathBuf) -> Router {
     let state = AppState { flows_dir };
     Router::new()
         .route("/health", get(health))
@@ -183,7 +183,7 @@ pub use darkmux_flow::daemon_probe::{nudge_if_daemon_unreachable, DEFAULT_DAEMON
 /// force-exiting the process. SSE streams hold connections open
 /// indefinitely; axum's graceful shutdown would otherwise block forever
 /// waiting for them to drain.
-pub const SHUTDOWN_GRACE_SECS: u64 = 3;
+pub(crate) const SHUTDOWN_GRACE_SECS: u64 = 3;
 
 // Compile-time bounds: drift outside this range is the painful state
 // #121 fixed (operator hammering Ctrl-C / killing PID by hand at the
