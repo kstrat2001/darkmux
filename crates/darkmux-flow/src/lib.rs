@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 
 // ─── FlowSink abstraction (#162 Phase 1) ─────────────────────────────────
@@ -280,7 +281,23 @@ pub struct RedisSink {
     /// Optional MAXLEN ~ N retention cap. None = unbounded (don't use
     /// in production; the stream grows without bound).
     max_len: Option<usize>,
+    /// (#388) Consecutive write-failure counter. Reset to 0 on any
+    /// successful write. When it reaches `REDIS_DISABLE_THRESHOLD` the
+    /// sink disables itself for the rest of the process.
+    consecutive_failures: AtomicU32,
+    /// (#388) Once the failure counter trips the threshold, the sink is
+    /// disabled: subsequent writes skip silently (no connection attempt,
+    /// no per-write log spam). Spares single-machine operators who set
+    /// `DARKMUX_REDIS_URL` "just in case" from a 500ms-timeout-plus-log
+    /// on every `darkmux` invocation when the peer is offline.
+    disabled: AtomicBool,
 }
+
+/// (#388) Consecutive write failures before a `RedisSink` disables
+/// itself for the process. 3 strikes balances "tolerate a one-off blip"
+/// against "stop spamming a 500ms timeout + log line per write when the
+/// peer is genuinely offline."
+const REDIS_DISABLE_THRESHOLD: u32 = 3;
 
 /// Hard cap on the wall-clock spent connecting + handshaking to Redis
 /// from any `RedisSink` or sink-diagnostic probe (#278). The OS default
@@ -403,7 +420,44 @@ impl RedisSink {
             url,
             stream: stream.to_string(),
             max_len,
+            consecutive_failures: AtomicU32::new(0),
+            disabled: AtomicBool::new(false),
         })
+    }
+
+    /// (#388) Whether the sink has disabled itself after repeated
+    /// failures. Disabled writes skip silently.
+    pub fn is_disabled(&self) -> bool {
+        self.disabled.load(Ordering::Acquire)
+    }
+
+    /// (#388) Account one write failure. Disables the sink (and logs a
+    /// single one-time warning) when the consecutive-failure counter
+    /// first reaches `REDIS_DISABLE_THRESHOLD`. Returns true iff this
+    /// call is the one that flipped the sink to disabled.
+    fn note_failure(&self, err: &anyhow::Error) -> bool {
+        let n = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
+        if n >= REDIS_DISABLE_THRESHOLD && !self.disabled.swap(true, Ordering::AcqRel) {
+            eprintln!(
+                "flow::RedisSink: {} unreachable after {n} consecutive write failures \
+                 ({err:#}); disabling Redis flow sink for this process. \
+                 LocalFileSink is unaffected; re-run after the peer is reachable to re-enable.",
+                self.url
+            );
+            true
+        } else {
+            false
+        }
+    }
+
+    /// (#388) Account one successful write — clears the failure streak so
+    /// a transient blip never counts toward the disable threshold.
+    fn note_success(&self) {
+        // Relaxed-store is fine: a stale 0 only delays a disable by one
+        // write, never causes a spurious one.
+        if self.consecutive_failures.load(Ordering::Acquire) != 0 {
+            self.consecutive_failures.store(0, Ordering::Release);
+        }
     }
 
     /// Connect + return a usable connection. Exposed for diagnostics
@@ -423,6 +477,39 @@ impl RedisSink {
 
 impl FlowSink for RedisSink {
     fn write(&self, record: &FlowRecord) -> Result<()> {
+        // (#388) Once disabled, skip silently — no connection attempt
+        // (so no 500ms timeout) and no log. Returning Ok keeps this
+        // best-effort coordination sink from masking the durable
+        // LocalFileSink's own result in the TeeSink.
+        if self.is_disabled() {
+            return Ok(());
+        }
+        match self.try_write(record) {
+            Ok(()) => {
+                self.note_success();
+                Ok(())
+            }
+            Err(e) => {
+                // Swallow: log a single one-time warning at the disable
+                // threshold (note_failure), but never propagate to the
+                // TeeSink — that's what produced the per-write spam this
+                // fixes. Redis is the coordination substrate, not the
+                // durable record.
+                self.note_failure(&e);
+                Ok(())
+            }
+        }
+    }
+
+    fn info(&self) -> SinkInfo {
+        self.sink_info()
+    }
+}
+
+impl RedisSink {
+    /// The actual XADD write — fallible. `write` (the trait method) wraps
+    /// this with the #388 disable accounting.
+    fn try_write(&self, record: &FlowRecord) -> Result<()> {
         let mut conn = open_redis_connection_bounded(&self.client, REDIS_CONNECT_TIMEOUT)
             .context("getting Redis connection")?;
         let payload = serde_json::to_string(record)
@@ -452,7 +539,8 @@ impl FlowSink for RedisSink {
         Ok(())
     }
 
-    fn info(&self) -> SinkInfo {
+    /// `SinkInfo` for diagnostics — called by the `FlowSink::info` impl.
+    fn sink_info(&self) -> SinkInfo {
         let mut config = std::collections::BTreeMap::new();
         // The displayed URL is redacted — `config` rides through to JSON
         // output (`darkmux flow status --json` + the daemon's HTTP
@@ -770,6 +858,90 @@ mod tests {
     // post-#508 submodule split (they are pub(crate), not part of the
     // crate's public re-export surface).
     use crate::schema::{epoch_to_hhmmss, epoch_to_yyyymmdd};
+
+    // ─── (#388) RedisSink graceful-disable-on-unreachable ────────────
+
+    fn minimal_record() -> FlowRecord {
+        FlowRecord {
+            ts: "2025-01-15T12:34:56Z".to_string(),
+            level: Level::Info,
+            category: Category::Work,
+            tier: Tier::Operator,
+            stage: Stage::Dispatch,
+            action: "test".to_string(),
+            handle: "t".to_string(),
+            sprint_id: None,
+            session_id: None,
+            source: None,
+            model: None,
+            reasoning: None,
+            mission_id: None,
+            machine_id: None,
+            orchestrator: None,
+            prev_hash: None,
+            hash: None,
+            payload: None,
+            machine_tier: None,
+            work_id: None,
+            attempt: None,
+        }
+    }
+
+    // Lazy client — never connects until a write, so we can exercise the
+    // failure-accounting directly without a live Redis.
+    fn unreachable_sink() -> RedisSink {
+        RedisSink::new("redis://127.0.0.1:6390", "darkmux:test", None).unwrap()
+    }
+
+    #[test]
+    fn redis_sink_disables_after_threshold_consecutive_failures() {
+        let sink = unreachable_sink();
+        let e = anyhow::anyhow!("synthetic connect failure");
+        // Below threshold: accumulates, stays enabled.
+        assert!(!sink.note_failure(&e));
+        assert!(!sink.is_disabled());
+        assert!(!sink.note_failure(&e));
+        assert!(!sink.is_disabled());
+        // Threshold (3rd) flips it — note_failure returns true exactly once.
+        assert!(sink.note_failure(&e), "3rd failure should flip to disabled");
+        assert!(sink.is_disabled());
+        // Already disabled: further failures don't re-flip (no repeat log).
+        assert!(!sink.note_failure(&e));
+    }
+
+    #[test]
+    fn redis_sink_success_resets_failure_streak() {
+        let sink = unreachable_sink();
+        let e = anyhow::anyhow!("x");
+        sink.note_failure(&e);
+        sink.note_failure(&e);
+        sink.note_success(); // a single success clears the streak
+        sink.note_failure(&e);
+        sink.note_failure(&e);
+        assert!(!sink.is_disabled(), "2 failures after a reset must not disable");
+        assert!(sink.note_failure(&e), "3 consecutive post-reset failures disable");
+        assert!(sink.is_disabled());
+    }
+
+    #[test]
+    fn redis_sink_disabled_write_is_a_fast_noop() {
+        let sink = unreachable_sink();
+        let e = anyhow::anyhow!("x");
+        // Trip the threshold.
+        sink.note_failure(&e);
+        sink.note_failure(&e);
+        sink.note_failure(&e);
+        assert!(sink.is_disabled());
+        // A write while disabled returns Ok WITHOUT attempting a
+        // connection — proven by the absence of the ~500ms connect
+        // timeout the unreachable URL would otherwise incur.
+        let start = std::time::Instant::now();
+        assert!(sink.write(&minimal_record()).is_ok());
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(200),
+            "disabled write must skip the connection attempt, not pay the timeout"
+        );
+    }
 
     #[serial_test::serial]
     #[test]
@@ -2487,11 +2659,21 @@ mod tests {
         let result = sink.write(&rec);
         let elapsed = start.elapsed();
 
-        // Write MUST fail (no Redis handshake possible); the value
-        // we're asserting is the bounded wall-clock.
+        // (#388) write() is now best-effort: it swallows the underlying
+        // failure (returns Ok) and accounts it toward the disable
+        // threshold rather than propagating to the TeeSink (which is what
+        // produced the per-write log spam). The value this test guards is
+        // the bounded WALL-CLOCK of the underlying connect attempt — a
+        // single failing write must still return within the connect-
+        // timeout budget, not hang. The sink hasn't hit the disable
+        // threshold after one failure, so the connection WAS attempted.
         assert!(
-            result.is_err(),
-            "expected failure writing to unresponsive listener; got Ok"
+            result.is_ok(),
+            "write is best-effort and swallows the failure (#388); got {result:?}"
+        );
+        assert!(
+            !sink.is_disabled(),
+            "one failure must not yet disable the sink (threshold is 3)"
         );
         // Bound is `REDIS_CONNECT_TIMEOUT * 2` (1000ms from the
         // wall-clock wrapper) + small slack for thread spawn +
