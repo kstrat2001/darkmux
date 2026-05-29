@@ -281,9 +281,11 @@ pub fn run(
     // 100% is the safety net for that case. Soft is best-effort
     // between-turn telemetry; hard is the unconditional kill.
     //
-    // - `INACTIVITY_SOFT_THRESHOLD_RATIO` (0.75): fires at 75% of
-    //   the inactivity budget. Operator-visible via the runtime
-    //   stderr; queued into the feedback injector for the model.
+    // - soft threshold: `inactivity_soft_threshold_secs(budget)` — a
+    //   linear 75% of the inactivity budget, floored so it's never zero
+    //   and capped to leave headroom before the hard kill on small
+    //   budgets (#474). Operator-visible via the runtime stderr; queued
+    //   into the feedback injector for the model.
     // - `inactivity_budget_secs`: read once from
     //   `DARKMUX_INACTIVITY_TIMEOUT_SECONDS` (matches the host's
     //   default of 600s). The host-side watchdog also reads this;
@@ -295,7 +297,6 @@ pub fn run(
     // - `inactivity_soft_warning_fired_in_window`: edge-trigger
     //   flag so the warning fires once per stuck window, not on
     //   every loop iteration.
-    const INACTIVITY_SOFT_THRESHOLD_RATIO: f64 = 0.75;
     let inactivity_budget_secs: u64 = std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -310,7 +311,12 @@ pub fn run(
     // recently edited path + a same-file repetition counter.
     //
     // - Edit/write to a NEW path → reset counter to 1, remember path
+    //   (path is normalized lexically first, #471, so `./src/x` and
+    //   `src/x` aren't seen as different files)
     // - Edit/write to the SAME path as last edit → increment counter
+    // - Edit/write with unparseable/path-less args → HOLD state (#472):
+    //   no increment, no reset — a transient malformed edit must not
+    //   erase an in-progress thrash run
     // - Bash → reset both (verification cleared the slate)
     // - Counter hits THRESHOLD → fire signal, edge-trigger reset
     //
@@ -332,7 +338,7 @@ pub fn run(
         {
             let elapsed_secs = last_proof_of_work.elapsed().as_secs();
             let soft_threshold_secs =
-                ((inactivity_budget_secs as f64) * INACTIVITY_SOFT_THRESHOLD_RATIO) as u64;
+                inactivity_soft_threshold_secs(inactivity_budget_secs);
             if !inactivity_soft_warning_fired_in_window
                 && elapsed_secs >= soft_threshold_secs
             {
@@ -740,11 +746,15 @@ pub fn run(
                                     consecutive_same_file_edits = 1;
                                 }
                                 (None, _) => {
-                                    // Malformed args (or path-less write
-                                    // shape we don't recognize) — degrade
-                                    // safely; don't count toward drift.
-                                    last_edited_path = None;
-                                    consecutive_same_file_edits = 0;
+                                    // (#472) Malformed args (or a path-less
+                                    // write shape we don't recognize) — treat
+                                    // as a no-op for the detector: hold state,
+                                    // neither increment nor reset. Resetting
+                                    // here would let a degraded coder thrashing
+                                    // on one file dodge the detector by
+                                    // occasionally emitting malformed tool args.
+                                    // A real bash verification (below) is what
+                                    // clears the slate, not a parse failure.
                                 }
                             }
                             if consecutive_same_file_edits >= TEST_CADENCE_DRIFT_THRESHOLD {
@@ -1179,6 +1189,64 @@ fn extract_edit_target_path(raw_args: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(raw_args)
         .ok()
         .and_then(|v| v.get("path").and_then(|p| p.as_str()).map(String::from))
+        .map(|p| {
+            // (#471) Lexically normalize so `./src/lib.rs`, `src/lib.rs/`,
+            // and `src/../src/lib.rs` all compare equal in the same-file
+            // drift check. Purely lexical — no filesystem access (the
+            // sandbox path may not exist on the host, and canonicalize
+            // would add a syscall per edit).
+            let n = normalize_path_lexical(&p);
+            if n.is_empty() {
+                p
+            } else {
+                n
+            }
+        })
+}
+
+/// Inactivity soft-warning threshold (seconds) for a given budget (#466,
+/// hardened in #474). Base is a linear 75% of the budget, but guarded for
+/// small operator-tuned budgets: never zero (so it can't fire on loop
+/// iteration 1), and at least `MIN_HEADROOM` before the host's hard kill
+/// when the budget can afford it — the model needs a real window to wrap
+/// up, not 1-2s. For budgets too small for full headroom it degrades to
+/// "at most one tick before the kill" rather than firing immediately.
+fn inactivity_soft_threshold_secs(budget_secs: u64) -> u64 {
+    const RATIO: f64 = 0.75;
+    const MIN_HEADROOM_SECS: u64 = 30;
+    let linear = ((budget_secs as f64) * RATIO) as u64;
+    let floored = linear.max(1);
+    let headroom_cap = budget_secs.saturating_sub(MIN_HEADROOM_SECS);
+    if headroom_cap >= 1 {
+        floored.min(headroom_cap)
+    } else {
+        floored.min(budget_secs.saturating_sub(1)).max(1)
+    }
+}
+
+/// Lexically clean a path: drop `.` components, fold `..` against the
+/// preceding normal component, and drop trailing separators — without
+/// touching the filesystem (unlike `Path::canonicalize`). Leading `..`
+/// (no preceding component to pop) is preserved. (#471)
+fn normalize_path_lexical(p: &str) -> String {
+    use std::path::{Component, Path, PathBuf};
+    let mut out = PathBuf::new();
+    for comp in Path::new(p).components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else {
+                    out.push("..");
+                }
+            }
+            Component::RootDir => out.push(std::path::MAIN_SEPARATOR.to_string()),
+            Component::Prefix(pre) => out.push(pre.as_os_str()),
+            Component::Normal(seg) => out.push(seg),
+        }
+    }
+    out.to_string_lossy().into_owned()
 }
 
 fn measure_request_context(messages: &[Message]) -> (usize, usize) {
@@ -3317,11 +3385,71 @@ mod tests {
 
     #[test]
     fn extract_edit_target_path_returns_none_on_malformed_json() {
-        // Malformed JSON degrades safely — the state machine treats
-        // None as "unknown target" and resets the counter, which is
-        // the correct conservative behavior for a signal that should
-        // not fire on uncertain inputs.
+        // Malformed JSON degrades safely to None. The state machine (#472)
+        // treats a None target as a no-op — it HOLDS the in-progress
+        // same-file counter rather than resetting it, so a transient
+        // malformed-args edit can't erase an in-progress drift run. Only a
+        // real bash verification clears the slate.
         assert_eq!(extract_edit_target_path("{not valid json"), None);
+    }
+
+    // ─── (#471) path normalization in the same-file detector ─────────
+
+    #[test]
+    fn extract_edit_target_path_normalizes_current_dir_prefix() {
+        let with = extract_edit_target_path(r#"{"path":"./src/lib.rs"}"#);
+        let without = extract_edit_target_path(r#"{"path":"src/lib.rs"}"#);
+        assert_eq!(with, without, "./src/lib.rs must equal src/lib.rs (#471)");
+    }
+
+    #[test]
+    fn extract_edit_target_path_normalizes_trailing_slash() {
+        let with = extract_edit_target_path(r#"{"path":"src/lib.rs/"}"#);
+        let without = extract_edit_target_path(r#"{"path":"src/lib.rs"}"#);
+        assert_eq!(with, without, "trailing slash must not distinguish (#471)");
+    }
+
+    #[test]
+    fn extract_edit_target_path_normalizes_parent_dir_traversal() {
+        let with = extract_edit_target_path(r#"{"path":"src/../src/lib.rs"}"#);
+        let without = extract_edit_target_path(r#"{"path":"src/lib.rs"}"#);
+        assert_eq!(with, without, "src/../src/lib.rs must equal src/lib.rs (#471)");
+    }
+
+    #[test]
+    fn normalize_path_lexical_preserves_leading_parent_dir() {
+        // No preceding component to fold against — keep the `..`.
+        assert_eq!(normalize_path_lexical("../foo.rs"), "../foo.rs");
+    }
+
+    // ─── (#474) inactivity soft-threshold floor + headroom ───────────
+
+    #[test]
+    fn soft_threshold_default_budget_is_linear_75pct() {
+        assert_eq!(inactivity_soft_threshold_secs(600), 450);
+    }
+
+    #[test]
+    fn soft_threshold_never_zero_for_tiny_budget() {
+        assert!(inactivity_soft_threshold_secs(1) >= 1, "must never fire on iteration 1");
+    }
+
+    #[test]
+    fn soft_threshold_small_budgets_keep_some_headroom() {
+        // Below the headroom floor, soft must still be < budget so a
+        // warning precedes the hard kill.
+        assert_eq!(inactivity_soft_threshold_secs(10), 7);
+        assert_eq!(inactivity_soft_threshold_secs(30), 22);
+        for b in [2u64, 5, 10, 30] {
+            assert!(inactivity_soft_threshold_secs(b) < b, "budget {b}: soft must be < budget");
+        }
+    }
+
+    #[test]
+    fn soft_threshold_enforces_min_headroom_above_floor() {
+        // budget=100: linear would be 75 (25s headroom); capped to leave
+        // the 30s minimum headroom → 70.
+        assert_eq!(inactivity_soft_threshold_secs(100), 70);
     }
 
     #[test]
