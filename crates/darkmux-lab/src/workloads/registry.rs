@@ -70,7 +70,7 @@ fn list_inner(map: &HashMap<String, Box<dyn WorkloadProvider>>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Profile;
+    use darkmux_types::Profile;
     use crate::workloads::types::{InspectionReport, LoadedWorkload, RunResult, VerifyOutcome};
     use std::path::Path;
 
@@ -94,7 +94,7 @@ mod tests {
             _: &Path,
             _: &Profile,
             _: &str,
-            _: crate::crew::dispatch::Runtime,
+            _: darkmux_crew::dispatch::Runtime,
             _: &str,
         ) -> Result<RunResult> {
             Ok(RunResult {

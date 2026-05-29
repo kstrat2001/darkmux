@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/darkmux-types", "crates/darkmux-flow", "crates/darkmux-profiles", "crates/darkmux-crew", "crates/darkmux-hardware", "crates/darkmux-agent-roles", "crates/darkmux-heuristics", "crates/darkmux-eureka", "crates/darkmux-fleet", "crates/darkmux-recommendations"]
+members = [".", "crates/darkmux-types", "crates/darkmux-flow", "crates/darkmux-profiles", "crates/darkmux-crew", "crates/darkmux-hardware", "crates/darkmux-agent-roles", "crates/darkmux-heuristics", "crates/darkmux-eureka", "crates/darkmux-fleet", "crates/darkmux-recommendations", "crates/darkmux-lab"]
 # runtime/ is a separate crate with its own Cargo.lock; it stays out of the
 # workspace per #463 ("stays as-is").
 exclude = ["runtime"]
@@ -31,6 +31,7 @@ darkmux-heuristics = { path = "crates/darkmux-heuristics" }
 darkmux-eureka = { path = "crates/darkmux-eureka" }
 darkmux-fleet = { path = "crates/darkmux-fleet" }
 darkmux-recommendations = { path = "crates/darkmux-recommendations" }
+darkmux-lab = { path = "crates/darkmux-lab" }
 anyhow = "1.0"
 axum = "0.7"
 clap = { version = "4.5", features = ["derive"] }

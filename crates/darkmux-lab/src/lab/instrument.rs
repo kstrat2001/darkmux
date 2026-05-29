@@ -87,7 +87,7 @@ impl InstrumentSidecar {
         // Splice rules_schema_version + rules into the meta payload. If
         // the serialization fails (shouldn't), we ship the run without
         // them rather than aborting the dispatch.
-        if let Ok(rules_fields) = crate::eureka::RulesPayload::current().as_meta_fields() {
+        if let Ok(rules_fields) = darkmux_eureka::RulesPayload::current().as_meta_fields() {
             if let Some(obj) = payload.as_object_mut() {
                 for (k, v) in rules_fields {
                     obj.insert(k, v);

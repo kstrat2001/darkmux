@@ -339,6 +339,7 @@ dependencies = [
  "darkmux-flow",
  "darkmux-hardware",
  "darkmux-heuristics",
+ "darkmux-lab",
  "darkmux-profiles",
  "darkmux-recommendations",
  "darkmux-types",
@@ -445,6 +446,23 @@ dependencies = [
  "darkmux-profiles",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "darkmux-lab"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "darkmux-crew",
+ "darkmux-eureka",
+ "darkmux-profiles",
+ "darkmux-types",
+ "dirs",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "tempfile",
 ]
 
 [[package]]
