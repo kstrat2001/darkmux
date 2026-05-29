@@ -334,6 +334,7 @@ dependencies = [
  "clap",
  "darkmux-agent-roles",
  "darkmux-crew",
+ "darkmux-doctor",
  "darkmux-eureka",
  "darkmux-fleet",
  "darkmux-flow",
@@ -380,6 +381,26 @@ dependencies = [
  "dirs",
  "rusqlite",
  "serde",
+ "serde_json",
+ "serial_test",
+ "tempfile",
+]
+
+[[package]]
+name = "darkmux-doctor"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "darkmux-agent-roles",
+ "darkmux-crew",
+ "darkmux-eureka",
+ "darkmux-flow",
+ "darkmux-hardware",
+ "darkmux-heuristics",
+ "darkmux-profiles",
+ "darkmux-recommendations",
+ "darkmux-types",
+ "dirs",
  "serde_json",
  "serial_test",
  "tempfile",
