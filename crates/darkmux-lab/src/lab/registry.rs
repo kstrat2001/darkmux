@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 /// darkmux home. Phase 4 CLI verbs read/write this path. Operators
 /// who want a custom location can hand-edit + move; the resolver
 /// always honors the canonical name under `{root}`.
-pub fn default_registry_path(paths: &DarkmuxPaths) -> PathBuf {
+pub(crate) fn default_registry_path(paths: &DarkmuxPaths) -> PathBuf {
     paths.root.join("lab-registry.json")
 }
 
@@ -36,7 +36,7 @@ pub fn default_registry_path(paths: &DarkmuxPaths) -> PathBuf {
 /// dead-code lint.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RegisteredFixture {
+pub(crate) struct RegisteredFixture {
     /// Absolute path to the fixture directory.
     pub path: PathBuf,
     /// Content hash recorded at register time. Use this to detect
@@ -62,7 +62,7 @@ pub struct RegisteredFixture {
 /// them.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct LabRegistry {
+pub(crate) struct LabRegistry {
     #[serde(default)]
     pub fixtures: BTreeMap<String, RegisteredFixture>,
 }
@@ -71,7 +71,7 @@ pub struct LabRegistry {
 impl LabRegistry {
     /// Load the registry from `path`. Returns an empty registry if
     /// the file doesn't exist (first-time-operator-friendly).
-    pub fn load(path: &Path) -> Result<Self> {
+    pub(crate) fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
         }
@@ -89,7 +89,7 @@ impl LabRegistry {
     /// **No file locking.** Concurrent writers (e.g. two `dm lab
     /// register` invocations against the same registry) are
     /// last-write-wins. Tracked as a Phase 4 follow-up (#496).
-    pub fn save(&self, path: &Path) -> Result<()> {
+    pub(crate) fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             if !parent.exists() {
                 std::fs::create_dir_all(parent)
@@ -122,7 +122,7 @@ impl LabRegistry {
     /// **In-memory only.** Caller MUST call [`Self::save`] to persist
     /// the change to disk. Phase 4 CLI verbs are responsible for the
     /// save step.
-    pub fn register(
+    pub(crate) fn register(
         &mut self,
         fixture_dir: &Path,
         name_override: Option<String>,
@@ -166,7 +166,7 @@ impl LabRegistry {
     ///
     /// **In-memory only.** Caller MUST call [`Self::save`] to persist
     /// the change to disk.
-    pub fn unregister(&mut self, name: &str) -> Result<RegisteredFixture> {
+    pub(crate) fn unregister(&mut self, name: &str) -> Result<RegisteredFixture> {
         self.fixtures
             .remove(name)
             .ok_or_else(|| anyhow!("fixture `{}` not registered", name))
@@ -186,7 +186,7 @@ impl LabRegistry {
     ///
     /// Returns `(name, fixture)` of the first match in sorted-by-name
     /// order. Phase 3 may add disambiguation if multiple match.
-    pub fn find_satisfying(&self, requirement: &str) -> Option<(&String, &RegisteredFixture)> {
+    pub(crate) fn find_satisfying(&self, requirement: &str) -> Option<(&String, &RegisteredFixture)> {
         self.fixtures
             .iter()
             .find(|(_, f)| f.satisfies.as_deref() == Some(requirement))

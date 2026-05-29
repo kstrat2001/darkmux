@@ -40,7 +40,7 @@ use std::path::Path;
 /// until then.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FixtureManifest {
+pub(crate) struct FixtureManifest {
     /// Logical name of the fixture. Used as the registry key. Operator
     /// can override at register-time via `--name <name>`.
     pub name: String,
@@ -98,7 +98,7 @@ fn default_version() -> String {
 #[allow(dead_code)]
 impl FixtureManifest {
     /// Read + parse `.fixture.json` from inside a fixture dir.
-    pub fn load_from_dir(dir: &Path) -> Result<Self> {
+    pub(crate) fn load_from_dir(dir: &Path) -> Result<Self> {
         let manifest_path = dir.join(".fixture.json");
         if !manifest_path.exists() {
             return Err(anyhow!(
@@ -139,7 +139,7 @@ impl FixtureManifest {
 
     /// Returns (definition_name, version) split from `satisfies`.
     /// Returns `None` when `satisfies` is unset.
-    pub fn satisfies_parts(&self) -> Option<(&str, &str)> {
+    pub(crate) fn satisfies_parts(&self) -> Option<(&str, &str)> {
         self.satisfies
             .as_deref()
             .and_then(|s| s.split_once('@'))
@@ -147,7 +147,7 @@ impl FixtureManifest {
 
     /// Check whether on-disk fixture dir has all `required_files`
     /// present. Returns the list of missing paths (empty = all present).
-    pub fn missing_required_files(&self, fixture_dir: &Path) -> Vec<String> {
+    pub(crate) fn missing_required_files(&self, fixture_dir: &Path) -> Vec<String> {
         self.required_files
             .iter()
             .filter(|rel| !fixture_dir.join(rel).exists())

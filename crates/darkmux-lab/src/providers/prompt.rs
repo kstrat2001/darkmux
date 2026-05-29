@@ -14,7 +14,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub struct PromptProvider;
+pub(crate) struct PromptProvider;
 
 impl WorkloadProvider for PromptProvider {
     fn id(&self) -> &'static str {

@@ -80,7 +80,7 @@ pub fn tune(opts: &TuneOpts) -> Result<TuneReport> {
 /// 200s/700s split without needing k-means or stats deps. Edge case: if all
 /// runs are within 1.5× of each other, treat as a single cluster (no
 /// meaningful bimodal signal).
-pub fn compute_stats(outcomes: &[RunOutcome]) -> DistributionStats {
+pub(crate) fn compute_stats(outcomes: &[RunOutcome]) -> DistributionStats {
     let secs: Vec<u128> = outcomes.iter().map(|o| o.duration_ms / 1000).collect();
     let n = secs.len();
     if n == 0 {

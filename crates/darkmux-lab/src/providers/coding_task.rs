@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub struct CodingTaskProvider;
+pub(crate) struct CodingTaskProvider;
 
 impl WorkloadProvider for CodingTaskProvider {
     fn id(&self) -> &'static str {
@@ -819,7 +819,7 @@ fn guess_trajectory_path(session_id: &str) -> Option<PathBuf> {
 /// substantive, downstream automation takes the agent's claim as
 /// canonical, the verify-output.txt failure goes uninspected).
 #[derive(Debug, Clone, PartialEq)]
-pub struct ClaimVerifyMismatch {
+pub(crate) struct ClaimVerifyMismatch {
     /// The phrase from final_assistant that triggered the claim
     /// detector (truncated for compactness in qa-reply.json).
     pub claim_excerpt: String,
@@ -845,7 +845,7 @@ pub struct ClaimVerifyMismatch {
 /// as mismatches) erode trust faster than missing real disagreements.
 /// The patterns start narrow; operators can broaden empirically as
 /// more failure traces accumulate.
-pub fn detect_claim_verify_mismatch(
+pub(crate) fn detect_claim_verify_mismatch(
     final_assistant: &str,
     verify: Option<&crate::workloads::types::VerifyOutcome>,
 ) -> Option<ClaimVerifyMismatch> {

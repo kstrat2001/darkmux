@@ -54,7 +54,7 @@ fn builtin_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-pub fn load(id: &str, user_dir: Option<&Path>) -> Result<LoadedWorkload> {
+pub(crate) fn load(id: &str, user_dir: Option<&Path>) -> Result<LoadedWorkload> {
     if let Some(udir) = user_dir {
         let user_workloads = udir.join("workloads");
         if let Some(p) = find_in_dir(&user_workloads, id) {

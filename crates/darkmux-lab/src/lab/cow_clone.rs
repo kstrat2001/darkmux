@@ -34,7 +34,7 @@ use std::process::Command;
 /// --reflink=auto -r` first; falls back to `cp -R` if the reflink
 /// option isn't available on that `cp`. Returns the path to `dst`
 /// on success.
-pub fn cow_clone_dir(src: &Path, dst: &Path) -> Result<()> {
+pub(crate) fn cow_clone_dir(src: &Path, dst: &Path) -> Result<()> {
     if !src.exists() {
         return Err(anyhow!("source dir does not exist: {}", src.display()));
     }

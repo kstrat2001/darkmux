@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct VerifySpec {
+pub(crate) struct VerifySpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub must_contain: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -24,7 +24,7 @@ pub struct VerifySpec {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ExpectedSpec {
+pub(crate) struct ExpectedSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fast_cluster_seconds: Option<(u64, u64)>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -36,7 +36,7 @@ pub struct ExpectedSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkloadSpec {
+pub(crate) struct WorkloadSpec {
     pub id: String,
     pub provider: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -136,7 +136,7 @@ pub struct WorkloadSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkloadManifest {
+pub(crate) struct WorkloadManifest {
     pub workload: WorkloadSpec,
 }
 
@@ -149,7 +149,7 @@ pub struct WorkloadManifest {
 /// no current callers.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
-pub struct LoadedWorkload {
+pub(crate) struct LoadedWorkload {
     pub manifest: WorkloadManifest,
     pub manifest_path: std::path::PathBuf,
     pub base_dir: std::path::PathBuf,
@@ -157,13 +157,13 @@ pub struct LoadedWorkload {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WorkloadSource {
+pub(crate) enum WorkloadSource {
     Builtin,
     User,
 }
 
 #[derive(Debug, Default, Clone)]
-pub struct VerifyOutcome {
+pub(crate) struct VerifyOutcome {
     pub passed: bool,
     pub details: String,
 }
@@ -173,7 +173,7 @@ pub struct VerifyOutcome {
 /// summary doesn't, hence the dead-code lint.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
-pub struct RunResult {
+pub(crate) struct RunResult {
     pub ok: bool,
     pub duration_ms: u128,
     pub payload_text: Option<String>,
@@ -217,7 +217,7 @@ pub enum RunMode {
 /// trait shape stable for the `lab providers` subcommand + future
 /// per-workload cleanup needs.
 #[allow(dead_code)]
-pub trait WorkloadProvider: Send + Sync {
+pub(crate) trait WorkloadProvider: Send + Sync {
     fn id(&self) -> &'static str;
     fn description(&self) -> &'static str;
     fn setup(&self, loaded: &LoadedWorkload, run_dir: &Path, sandbox_dir: &Path) -> Result<()>;
