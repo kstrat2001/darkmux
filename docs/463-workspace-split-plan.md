@@ -1,6 +1,9 @@
 # #463 Workspace split — execution plan (resume anchor)
 
-Status: **ready to execute**. Dependency graph analyzed (clean DAG, no cycles).
+Status: **PR1 + PR2 (partial) landed; crew/lab/serve blocked on dep cycles.**
+See "Execution status" at the bottom for what's done and the cycle-breaking
+design needed to resume.
+
 Beat 54 milestone confirmed tested → timing caveat in #463 cleared.
 
 Decisions locked with the operator:
@@ -116,3 +119,66 @@ flips in `flow.rs` actually change.
 - [ ] `cargo install --path .` still produces the `darkmux` binary.
 - [ ] CI updated to `cargo test --workspace` if needed.
 - [ ] Touching `crew/dispatch_internal.rs` rebuilds in < 30s (verify in PR2).
+
+---
+
+## Execution status (2026-05-29)
+
+### Landed (green: build/clippy `--workspace`, new-crate tests pass)
+
+- **PR1** — `darkmux-types` (types.rs whole + lab/paths.rs lifted in) and
+  `darkmux-flow` (flow.rs; 11 `pub(crate)`→`pub`). Re-export shims in place.
+  One wrinkle vs the plan's watch-out #10: `isolate_test_env_once` was
+  `#[cfg(test)]`-gated, so once flow became its own crate it was invisible to
+  the binary's test build (`flow_cli` tests). Fixed by gating it on
+  `any(test, feature = "test-support")` and enabling that feature from the
+  binary's dev-dependency on `darkmux-flow`.
+- **PR2 (partial)** — `darkmux-profiles` (profiles/swap/lms/runtime). Clean
+  leaf above types; `crate::types`→`darkmux_types`, internal
+  `crate::{lms,swap,runtime}` unchanged. No `pub(crate)` flips needed.
+
+Known pre-existing failure (NOT introduced here, also fails on `main`):
+`sprint_cli::tests::flow_record_failure_does_not_crash_review` — sets a dir
+read-only to force a write failure, but CI/dev runs as root and root bypasses
+the permission, so a record gets written. Orthogonal to #463; track separately.
+
+### Blocked — the plan's DAG missed two cycles
+
+`crew`/`lab`/`serve` cannot be split along the plan's lines. Rust crates may
+not contain dependency cycles, and the real call graph has two:
+
+- **crew ↔ fleet**: `crew/dispatch.rs` uses `fleet::{load_roster,
+  candidates_for_tier, CompletionResult}`; `fleet.rs` uses
+  `crew::dispatch::{Runtime, dispatch, DispatchOpts, CompactionDispatchArgs}`
+  (10+ sites). Tightly coupled both ways.
+- **crew ↔ serve**: `crew/dispatch.rs` calls
+  `serve::nudge_if_daemon_unreachable` (1 site); `serve.rs` calls
+  `crew::loader::{load_missions, load_sprints, missions_dir, sprints_dir}`.
+
+(`crew → lab::paths` is trivially fixable — paths is now in `darkmux-types`;
+rewrite the 3 sites in `crew/{loader,index}.rs` to `darkmux_types::paths`.
+`lab → crew` is one-directional and fine once crew is a crate.)
+
+### Proposed cycle-breaking design (for the resume PR)
+
+1. **Break crew↔fleet** in two moves:
+   - Extract the shared *dispatch vocabulary* (`Runtime`, `DispatchOpts`,
+     `CompactionDispatchArgs`, `CompletionResult`, `DispatchResult`) into a
+     low crate both can depend on (either `darkmux-types` or a new
+     `darkmux-dispatch-types`). Removes the *type* coupling.
+   - Invert the *behavior* edge: today crew reaches up into
+     `fleet::{load_roster, candidates_for_tier}`. Either move roster loading
+     down to a lower crate, or have the caller pass the resolved roster/
+     candidates *into* crew dispatch as parameters. Goal: leave only
+     `fleet → crew` (fleet calls `crew::dispatch::dispatch`).
+2. **Break crew↔serve**: `nudge_if_daemon_unreachable` is a tiny
+   daemon-reachability helper — lift it into a low crate (or inject it as a
+   callback) so the only remaining edge is `serve → crew` (loader fns).
+3. After the cycles are gone: `darkmux-crew` (deps types, flow, dispatch-
+   types), `darkmux-lab` (deps types, profiles, crew), `darkmux-serve` (deps
+   flow, crew, types). `fleet` stays binary-resident (per PR3) or becomes its
+   own crate depending on crew. Doctor stays in the binary (the PR3 open
+   sub-decision still stands).
+
+This is design work, not the mechanical refactor the plan scoped — hence
+deferred to a dedicated follow-up rather than bolted onto this branch.
