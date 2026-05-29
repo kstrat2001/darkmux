@@ -453,8 +453,13 @@ impl RedisSink {
     /// (#388) Account one successful write — clears the failure streak so
     /// a transient blip never counts toward the disable threshold.
     fn note_success(&self) {
-        // Relaxed-store is fine: a stale 0 only delays a disable by one
-        // write, never causes a spurious one.
+        // A single success clears the streak. The load-then-store isn't
+        // one atomic op, but that's benign: a racing failure between the
+        // load and the store at worst delays a disable by one write — it
+        // can never cause a spurious disable, and a disabled sink never
+        // reaches here (write() returns early when disabled). The
+        // Acquire/Release pair orders the reset against note_failure's
+        // fetch_add so the cleared counter is visible to the next writer.
         if self.consecutive_failures.load(Ordering::Acquire) != 0 {
             self.consecutive_failures.store(0, Ordering::Release);
         }
@@ -920,6 +925,25 @@ mod tests {
         sink.note_failure(&e);
         assert!(!sink.is_disabled(), "2 failures after a reset must not disable");
         assert!(sink.note_failure(&e), "3 consecutive post-reset failures disable");
+        assert!(sink.is_disabled());
+    }
+
+    #[test]
+    fn redis_sink_disable_is_permanent_for_process() {
+        // Disable is a one-way latch for the process: once tripped, a
+        // later success does NOT re-enable the sink (a disabled sink
+        // never even reaches note_success via write(), but assert the
+        // contract directly), and further failures neither re-flip nor
+        // re-log (note_failure returns false).
+        let sink = unreachable_sink();
+        let e = anyhow::anyhow!("x");
+        sink.note_failure(&e);
+        sink.note_failure(&e);
+        assert!(sink.note_failure(&e));
+        assert!(sink.is_disabled());
+        sink.note_success();
+        assert!(sink.is_disabled(), "success must not re-enable a disabled sink");
+        assert!(!sink.note_failure(&e), "no re-flip / re-log after disable");
         assert!(sink.is_disabled());
     }
 
