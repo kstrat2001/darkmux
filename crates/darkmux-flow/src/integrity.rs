@@ -17,7 +17,7 @@ use crate::schema::{FlowRecord, FLOW_SCHEMA_VERSION};
 /// None` before serializing) so the chain doesn't self-reference. The
 /// `prev_hash` field IS included — that's what binds each record to the
 /// chain.
-pub fn audit_hash_of(record: &FlowRecord) -> Result<String> {
+pub(crate) fn audit_hash_of(record: &FlowRecord) -> Result<String> {
     let mut to_hash = record.clone();
     to_hash.hash = None;
     let bytes = serde_json::to_vec(&to_hash).context("serializing record for hash")?;

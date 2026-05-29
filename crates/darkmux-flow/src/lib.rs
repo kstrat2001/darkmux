@@ -482,7 +482,7 @@ impl FlowSink for RedisSink {
 // is degraded. Per the operator-sovereignty contract: surface failures
 // loudly via stderr; don't silently lose the audit record.
 
-pub struct TeeSink {
+pub(crate) struct TeeSink {
     sinks: Vec<Arc<dyn FlowSink>>,
 }
 
@@ -643,7 +643,7 @@ fn default_sink() -> Arc<dyn FlowSink> {
 /// Introspect the process-wide default sink for diagnostics. Stable
 /// pointer to the same singleton `record()` writes through, so the
 /// reported sink graph cannot drift from the actually-active one.
-pub fn default_sink_info() -> SinkInfo {
+pub(crate) fn default_sink_info() -> SinkInfo {
     default_sink().info()
 }
 
@@ -681,7 +681,7 @@ pub fn record(record: FlowRecord) -> Result<()> {
 /// tests — can target a sink built against an explicit dir instead of
 /// depending on the process-global default sink + live env. The
 /// provenance auto-populate is identical to the pre-split `record()`.
-pub fn record_to(sink: &dyn FlowSink, record: FlowRecord) -> Result<()> {
+pub(crate) fn record_to(sink: &dyn FlowSink, record: FlowRecord) -> Result<()> {
     let mut rec = record;
     if rec.machine_id.is_none() {
         rec.machine_id = resolve_machine_id();
@@ -716,7 +716,7 @@ pub fn record_to(sink: &dyn FlowSink, record: FlowRecord) -> Result<()> {
 ///
 /// `sync_all()` is called after both write paths so audit-log durability
 /// survives power loss / crash between record emission and consumer read.
-pub fn record_at(record: &FlowRecord, path: &Path) -> Result<()> {
+pub(crate) fn record_at(record: &FlowRecord, path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)
