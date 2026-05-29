@@ -1,10 +1,12 @@
 pub mod characterize;
 pub mod compare;
 pub mod cow_clone;
+pub mod fixture;
 pub mod inspect;
 pub mod instrument;
 pub mod list;
 pub mod paths;
+pub mod registry;
 pub mod run;
 pub mod sandbox_hash;
 pub mod tune;
