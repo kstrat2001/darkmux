@@ -76,6 +76,10 @@ impl LabRegistry {
     /// Save the registry to `path`. Creates parent dir if needed.
     /// Writes pretty-printed JSON for operator-readability (the
     /// registry is small enough that pretty cost is negligible).
+    ///
+    /// **No file locking.** Concurrent writers (e.g. two `dm lab
+    /// register` invocations against the same registry) are
+    /// last-write-wins. Tracked as a Phase 4 follow-up (#496).
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             if !parent.exists() {
@@ -100,6 +104,10 @@ impl LabRegistry {
     ///
     /// `force` — if `true`, replace any existing entry with the same
     /// name. If `false` and an entry exists, return an error.
+    ///
+    /// **In-memory only.** Caller MUST call [`Self::save`] to persist
+    /// the change to disk. Phase 4 CLI verbs are responsible for the
+    /// save step.
     pub fn register(
         &mut self,
         fixture_dir: &Path,
@@ -138,6 +146,9 @@ impl LabRegistry {
     /// Remove a fixture from the registry. Does NOT delete the
     /// underlying dir (operator-sovereignty: register is a pointer,
     /// unregister forgets the pointer, the dir stays untouched).
+    ///
+    /// **In-memory only.** Caller MUST call [`Self::save`] to persist
+    /// the change to disk.
     pub fn unregister(&mut self, name: &str) -> Result<RegisteredFixture> {
         self.fixtures
             .remove(name)
@@ -186,11 +197,14 @@ fn chrono_like_utc_now() -> String {
 
 /// Decompose epoch seconds into (year, month, day, hour, minute, second).
 /// Self-contained; no dep. Standard Gregorian calendar, UTC.
+/// `total_days` is `u64` so this stays correct past year 2106 (where
+/// `u32 days` overflows). Pre-1.0 we wouldn't care, but a silent
+/// wrong-result at year-2106 is harder to debug than the trivial fix.
 fn epoch_to_utc_components(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
     let s = (secs % 60) as u32;
     let m = ((secs / 60) % 60) as u32;
     let h = ((secs / 3600) % 24) as u32;
-    let total_days = (secs / 86400) as u32;
+    let total_days: u64 = secs / 86400;
 
     // Days since 1970-01-01.
     let (year, month, day) = days_to_civil_date(total_days);
@@ -199,7 +213,7 @@ fn epoch_to_utc_components(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
 
 /// Howard Hinnant's days_from_civil inverse — convert days since
 /// 1970-01-01 to (year, month, day). Public domain algorithm.
-fn days_to_civil_date(days: u32) -> (u32, u32, u32) {
+fn days_to_civil_date(days: u64) -> (u32, u32, u32) {
     let z = days as i64 + 719468;
     let era = if z >= 0 { z / 146097 } else { (z - 146096) / 146097 };
     let doe = (z - era * 146097) as u64; // [0, 146096]
