@@ -1,7 +1,9 @@
 pub mod characterize;
 pub mod compare;
 pub mod cow_clone;
+pub mod doctor;
 pub mod fixture;
+pub mod fixture_cli;
 pub mod inspect;
 pub mod instrument;
 pub mod list;

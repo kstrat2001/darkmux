@@ -799,3 +799,182 @@ fn notebook_draft_runtime_cmd_without_openclaw_bails_loud() {
         "expected stderr to point operator at `--runtime openclaw`; got: {stderr}"
     );
 }
+
+// ─── (#491) Phase 4 lab CLI verbs: register / unregister / fixtures / doctor ──
+
+/// Operator runs `dm lab register <path>` against a fixture dir with
+/// a valid `.fixture.json`. Registry file is created at
+/// `{paths.root}/lab-registry.json` with one entry.
+#[test]
+fn lab_register_creates_registry_entry() {
+    let tmp = TempDir::new().unwrap();
+    // Create the fixture dir + manifest.
+    let fixture_dir = tmp.path().join("my-fixture");
+    fs::create_dir_all(&fixture_dir).unwrap();
+    fs::write(
+        fixture_dir.join(".fixture.json"),
+        r#"{"name": "demo", "satisfies": "tiny@1.0"}"#,
+    )
+    .unwrap();
+    fs::write(fixture_dir.join("a.txt"), "alpha").unwrap();
+
+    // Force project-scope so registry lands in tmp.
+    fs::create_dir_all(tmp.path().join(".darkmux")).unwrap();
+
+    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    cmd.current_dir(tmp.path());
+    cmd.args(["lab", "register", fixture_dir.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Registered fixture `demo`"));
+
+    let reg_path = tmp.path().join(".darkmux/lab-registry.json");
+    assert!(reg_path.exists(), "registry should exist at {}", reg_path.display());
+    let raw = fs::read_to_string(&reg_path).unwrap();
+    assert!(raw.contains("\"demo\""));
+    assert!(raw.contains("\"tiny@1.0\""));
+    assert!(raw.contains("\"content_hash\""));
+}
+
+/// `dm lab fixtures` shows the registered entry after a register.
+#[test]
+fn lab_fixtures_shows_registered_entries() {
+    let tmp = TempDir::new().unwrap();
+    let fixture_dir = tmp.path().join("my-fixture");
+    fs::create_dir_all(&fixture_dir).unwrap();
+    fs::write(fixture_dir.join(".fixture.json"), r#"{"name": "demo"}"#).unwrap();
+    fs::write(fixture_dir.join("a.txt"), "x").unwrap();
+    fs::create_dir_all(tmp.path().join(".darkmux")).unwrap();
+
+    // Register first.
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .current_dir(tmp.path())
+        .args(["lab", "register", fixture_dir.to_str().unwrap()])
+        .assert()
+        .success();
+
+    // Now list.
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .current_dir(tmp.path())
+        .args(["lab", "fixtures"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("demo"))
+        .stdout(predicate::str::contains("1 fixture"));
+}
+
+/// `dm lab unregister` removes the entry without touching the dir.
+#[test]
+fn lab_unregister_removes_entry_but_not_dir() {
+    let tmp = TempDir::new().unwrap();
+    let fixture_dir = tmp.path().join("my-fixture");
+    fs::create_dir_all(&fixture_dir).unwrap();
+    fs::write(fixture_dir.join(".fixture.json"), r#"{"name": "demo"}"#).unwrap();
+    fs::write(fixture_dir.join("a.txt"), "x").unwrap();
+    fs::create_dir_all(tmp.path().join(".darkmux")).unwrap();
+
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .current_dir(tmp.path())
+        .args(["lab", "register", fixture_dir.to_str().unwrap()])
+        .assert()
+        .success();
+
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .current_dir(tmp.path())
+        .args(["lab", "unregister", "demo"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Unregistered"));
+
+    // Dir still on disk (operator-sovereignty).
+    assert!(fixture_dir.join(".fixture.json").exists());
+    // Registry no longer has the entry.
+    let raw = fs::read_to_string(tmp.path().join(".darkmux/lab-registry.json")).unwrap();
+    assert!(!raw.contains("\"demo\""));
+}
+
+/// `dm lab doctor` with no registry exits non-zero + emits a warning
+/// with the three options for the operator.
+#[test]
+fn lab_doctor_warns_when_no_registry() {
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir_all(tmp.path().join(".darkmux")).unwrap();
+
+    let output = Command::cargo_bin("darkmux")
+        .unwrap()
+        .current_dir(tmp.path())
+        .args(["lab", "doctor"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "doctor should exit non-zero on warnings");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("no registry found"), "got: {stdout}");
+    assert!(stdout.contains("lab-init.sh") || stdout.contains("dm lab register"), "got: {stdout}");
+}
+
+/// `dm lab doctor` passes when a registered fixture is unchanged.
+#[test]
+fn lab_doctor_passes_for_clean_fixture() {
+    let tmp = TempDir::new().unwrap();
+    let fixture_dir = tmp.path().join("my-fixture");
+    fs::create_dir_all(&fixture_dir).unwrap();
+    fs::write(fixture_dir.join(".fixture.json"), r#"{"name": "demo"}"#).unwrap();
+    fs::write(fixture_dir.join("source.txt"), "baseline").unwrap();
+    fs::create_dir_all(tmp.path().join(".darkmux")).unwrap();
+
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .current_dir(tmp.path())
+        .args(["lab", "register", fixture_dir.to_str().unwrap()])
+        .assert()
+        .success();
+
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .current_dir(tmp.path())
+        .args(["lab", "doctor"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[ok]"))
+        .stdout(predicate::str::contains("demo"));
+}
+
+/// `dm lab doctor` warns + exits non-zero when a registered fixture's
+/// content has drifted (hash mismatch).
+#[test]
+fn lab_doctor_warns_on_hash_drift() {
+    let tmp = TempDir::new().unwrap();
+    let fixture_dir = tmp.path().join("my-fixture");
+    fs::create_dir_all(&fixture_dir).unwrap();
+    fs::write(fixture_dir.join(".fixture.json"), r#"{"name": "demo"}"#).unwrap();
+    fs::write(fixture_dir.join("source.txt"), "baseline").unwrap();
+    fs::create_dir_all(tmp.path().join(".darkmux")).unwrap();
+
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .current_dir(tmp.path())
+        .args(["lab", "register", fixture_dir.to_str().unwrap()])
+        .assert()
+        .success();
+
+    // Mutate the fixture → drift.
+    fs::write(fixture_dir.join("source.txt"), "MUTATED").unwrap();
+
+    let output = Command::cargo_bin("darkmux")
+        .unwrap()
+        .current_dir(tmp.path())
+        .args(["lab", "doctor"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "drift should exit non-zero");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("content drift"), "got: {stdout}");
+    assert!(
+        stdout.contains("dm lab register --force"),
+        "expected recovery hint: {stdout}"
+    );
+}

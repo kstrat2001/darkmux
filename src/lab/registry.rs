@@ -15,11 +15,20 @@
 //! pointer + an integrity-check hash.
 
 use crate::lab::fixture::FixtureManifest;
+use crate::lab::paths::DarkmuxPaths;
 use crate::lab::sandbox_hash::hash_sandbox_dir;
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+/// Canonical location of the lab registry file inside a resolved
+/// darkmux home. Phase 4 CLI verbs read/write this path. Operators
+/// who want a custom location can hand-edit + move; the resolver
+/// always honors the canonical name under `{root}`.
+pub fn default_registry_path(paths: &DarkmuxPaths) -> PathBuf {
+    paths.root.join("lab-registry.json")
+}
 
 /// One registered fixture's entry. Fields are public-API surface for
 /// Phase 3 (resolver) + Phase 4 (CLI verbs) — they're populated now
