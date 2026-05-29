@@ -58,9 +58,9 @@
 
 #![allow(dead_code)]
 
-use crate::crew::loader;
-use crate::crew::types::*;
-use crate::types::paths::{resolve, ResolveScope};
+use crate::loader;
+use crate::types::*;
+use darkmux_types::paths::{resolve, ResolveScope};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::fs;
@@ -240,7 +240,7 @@ const REBUILD_TABLES: &[&str] = &[
 /// changing this silently invalidates every operator's existing index.
 /// Tests use the `_at(&path)` variants (`rebuild_at`, `role_list_at`,
 /// `crew_list_at`, etc.) rather than overriding this path.
-pub(crate) fn default_index_path() -> PathBuf {
+pub fn default_index_path() -> PathBuf {
     resolve(ResolveScope::Auto).root.join("index.db")
 }
 
@@ -312,7 +312,7 @@ fn sprint_status_str(s: SprintStatus) -> &'static str {
     }
 }
 
-pub(crate) fn open_index(path: &Path) -> Result<Connection> {
+pub fn open_index(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)
@@ -565,7 +565,7 @@ fn read_meta(conn: &Connection, key: &str) -> Result<Option<String>> {
 }
 
 /// Internal entry point for tests + the public `rebuild()` wrapper.
-pub(crate) fn rebuild_at(path: &Path) -> Result<()> {
+pub fn rebuild_at(path: &Path) -> Result<()> {
     let mut conn = open_index(path)?;
     init_schema(&conn)?;
     populate(&mut conn)?;

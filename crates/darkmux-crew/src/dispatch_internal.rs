@@ -20,9 +20,9 @@
 //!
 //! See `runtime/` for the container image this dispatches to.
 
-use crate::crew::dispatch::DispatchResult;
-use crate::crew::dispatch::DispatchOpts;
-use crate::crew::loader::{load_autonomous_dispatch_preamble, load_role_prompt, load_roles};
+use crate::dispatch::DispatchResult;
+use crate::dispatch::DispatchOpts;
+use crate::loader::{load_autonomous_dispatch_preamble, load_role_prompt, load_roles};
 use anyhow::{anyhow, bail, Context, Result};
 use std::fs;
 use std::path::PathBuf;
@@ -45,7 +45,7 @@ const RUNTIME_IMAGE: &str = "darkmux-runtime:latest";
 /// without spawning a container.
 fn apply_compaction_flags(
     cmd: &mut Command,
-    compaction: &crate::crew::dispatch::CompactionDispatchArgs,
+    compaction: &crate::dispatch::CompactionDispatchArgs,
 ) {
     if let Some(n) = compaction.threshold_tokens {
         cmd.arg("--compact-threshold-tokens").arg(n.to_string());
@@ -63,7 +63,7 @@ fn apply_compaction_flags(
     // parses it back to its local enum; None ⇒ flag omitted ⇒
     // runtime uses Narrative default.
     if let Some(strategy) = compaction.strategy {
-        use crate::types::CompactionStrategy;
+        use darkmux_types::CompactionStrategy;
         let kebab = match strategy {
             CompactionStrategy::Narrative => "narrative",
             CompactionStrategy::StructuredSlot => "structured-slot",
@@ -292,7 +292,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             // Symlink-escape guard via the shared validator (#255 Wave-E.2).
             // Same scope as #227 + #232 — symlink-only; `..`-traversal
             // is operator-explicit and intentionally out of scope.
-            crate::workdir::validate_workdir(custom)?
+            darkmux_types::workdir::validate_workdir(custom)?
         }
         None => {
             let auto = std::env::temp_dir().join(format!(
@@ -324,8 +324,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         "system_chars": system_prompt.chars().count(),
         "workspace": workspace.display().to_string(),
     });
-    let _ = crate::flow::record(crate::crew::dispatch::build_dispatch_record_with_payload(
-        crate::flow::Level::Info,
+    let _ = darkmux_flow::record(crate::dispatch::build_dispatch_record_with_payload(
+        darkmux_flow::Level::Info,
         "dispatch start",
         &opts.role_id,
         &session_id,
@@ -601,11 +601,11 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         "total_compactions": trajectory_summary.compactions,
     });
     let (action, level) = if exit_code == 0 {
-        ("dispatch complete", crate::flow::Level::Info)
+        ("dispatch complete", darkmux_flow::Level::Info)
     } else {
-        ("dispatch error", crate::flow::Level::Error)
+        ("dispatch error", darkmux_flow::Level::Error)
     };
-    let _ = crate::flow::record(crate::crew::dispatch::build_dispatch_record_with_payload(
+    let _ = darkmux_flow::record(crate::dispatch::build_dispatch_record_with_payload(
         level,
         action,
         &opts.role_id,
@@ -861,7 +861,7 @@ impl TailerState {
                     "tool_calls_count": event.get("tool_calls").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0),
                     "usage": event.get("usage"),
                 });
-                self.emit("dispatch.turn", crate::flow::Level::Info, payload);
+                self.emit("dispatch.turn", darkmux_flow::Level::Info, payload);
             }
             "tool.completed" => {
                 self.summary.tool_calls += 1;
@@ -894,7 +894,7 @@ impl TailerState {
                     "args_chars": event.get("args_chars"),
                     "result_chars": event.get("result_chars"),
                 });
-                self.emit("dispatch.tool", crate::flow::Level::Info, payload);
+                self.emit("dispatch.tool", darkmux_flow::Level::Info, payload);
             }
             "compaction" => {
                 self.summary.compactions += 1;
@@ -918,7 +918,7 @@ impl TailerState {
                     "after_messages": event.get("after_messages"),
                     "summary_chars": event.get("summary_chars"),
                 });
-                self.emit("dispatch.compaction", crate::flow::Level::Info, payload);
+                self.emit("dispatch.compaction", darkmux_flow::Level::Info, payload);
             }
             "model.reasoning" => {
                 // The runtime emits these when it parses <think>...</think>
@@ -934,7 +934,7 @@ impl TailerState {
                     "reasoning_text": reasoning_text,
                     "reasoning_format": event.get("reasoning_format").unwrap_or(&serde_json::Value::String("inline-think-tags".into())),
                 });
-                self.emit("dispatch.reasoning", crate::flow::Level::Info, payload);
+                self.emit("dispatch.reasoning", darkmux_flow::Level::Info, payload);
             }
             "dispatch.feedback.injected" => {
                 // (#454 feedback-injection scaffold) Forward the new
@@ -952,7 +952,7 @@ impl TailerState {
                     "message_count": event.get("message_count"),
                     "signal_kinds": event.get("signal_kinds"),
                 });
-                self.emit("dispatch.feedback.injected", crate::flow::Level::Info, payload);
+                self.emit("dispatch.feedback.injected", darkmux_flow::Level::Info, payload);
             }
             "model.partial" => {
                 // Per-SSE-chunk events coalesced into a coarser heartbeat
@@ -973,7 +973,7 @@ impl TailerState {
                         "partial_index": event.get("partial_index"),
                         "cumulative_chars": event.get("cumulative_chars"),
                     });
-                    self.emit("dispatch.turn.heartbeat", crate::flow::Level::Info, payload);
+                    self.emit("dispatch.turn.heartbeat", darkmux_flow::Level::Info, payload);
                 }
             }
             _ => {
@@ -986,8 +986,8 @@ impl TailerState {
         }
     }
 
-    fn emit(&self, action: &str, level: crate::flow::Level, payload: serde_json::Value) {
-        let _ = crate::flow::record(crate::crew::dispatch::build_dispatch_record_with_payload(
+    fn emit(&self, action: &str, level: darkmux_flow::Level, payload: serde_json::Value) {
+        let _ = darkmux_flow::record(crate::dispatch::build_dispatch_record_with_payload(
             level,
             action,
             &self.role_id,
@@ -1101,9 +1101,9 @@ fn check_docker_preflight() -> Result<()> {
 /// LMStudio happens to have loaded" is the contaminating-dispatch
 /// anti-pattern. The deprecation warning makes the misconfiguration
 /// operator-visible while keeping pre-refactor-1b setups working.
-fn resolve_dispatch_model_internal(role: &crate::crew::types::Role) -> Result<String> {
-    use crate::crew::select::select_model;
-    use crate::profiles::{get_profile, load_registry};
+fn resolve_dispatch_model_internal(role: &crate::types::Role) -> Result<String> {
+    use crate::select::select_model;
+    use darkmux_profiles::profiles::{get_profile, load_registry};
 
     let loaded = match load_registry(None) {
         Ok(loaded) => loaded,
@@ -1299,7 +1299,7 @@ fn probe_loaded_model() -> Result<String> {
 }
 
 // `first_user_symlink_in` and `is_macos_firmlink` moved to
-// `crate::workdir` as part of Wave-E.2 (#255). Workers + both runtime
+// `darkmux_types::workdir` as part of Wave-E.2 (#255). Workers + both runtime
 // paths now share one implementation via `workdir::validate_workdir`.
 
 /// Map a role's tool_palette (allow/deny in role-vocab) to the list of
@@ -1364,7 +1364,7 @@ fn role_to_runtime(role_name: &str) -> &'static [&'static str] {
 /// operator with the unknown tokens + the list of known ones so
 /// they can correct the manifest. Doctor uses the same helper to
 /// surface unknowns across all role manifests proactively (#340).
-pub(crate) fn unknown_role_vocab_tokens(palette: &crate::crew::types::ToolPalette) -> Vec<String> {
+pub fn unknown_role_vocab_tokens(palette: &crate::types::ToolPalette) -> Vec<String> {
     let mut unknowns: Vec<String> = palette
         .allow
         .iter()
@@ -1377,7 +1377,7 @@ pub(crate) fn unknown_role_vocab_tokens(palette: &crate::crew::types::ToolPalett
     unknowns
 }
 
-fn compute_runtime_allowed_tools(palette: &crate::crew::types::ToolPalette) -> Option<Vec<String>> {
+fn compute_runtime_allowed_tools(palette: &crate::types::ToolPalette) -> Option<Vec<String>> {
     // Empty palette: caller decides; today we return None so the
     // runtime exposes its full catalog (back-compat).
     if palette.allow.is_empty() && palette.deny.is_empty() {
@@ -1411,7 +1411,7 @@ fn compute_runtime_allowed_tools(palette: &crate::crew::types::ToolPalette) -> O
 /// Comma-separated list of all known role-vocab tokens, for use in
 /// operator-facing warning messages (#340). Wrapped in a helper so
 /// the formatting stays consistent across dispatch + doctor surfaces.
-pub(crate) fn known_role_vocab_csv() -> String {
+pub fn known_role_vocab_csv() -> String {
     KNOWN_ROLE_VOCAB.join(", ")
 }
 
@@ -1458,7 +1458,7 @@ mod tests {
     #[test]
     fn apply_compaction_flags_omits_when_all_none() {
         let mut cmd = Command::new("docker");
-        let compaction = crate::crew::dispatch::CompactionDispatchArgs::default();
+        let compaction = crate::dispatch::CompactionDispatchArgs::default();
         apply_compaction_flags(&mut cmd, &compaction);
         let args = args_of(&cmd);
         assert!(
@@ -1470,7 +1470,7 @@ mod tests {
     #[test]
     fn apply_compaction_flags_emits_threshold_when_set() {
         let mut cmd = Command::new("docker");
-        let compaction = crate::crew::dispatch::CompactionDispatchArgs {
+        let compaction = crate::dispatch::CompactionDispatchArgs {
             threshold_tokens: Some(35_000),
             ..Default::default()
         };
@@ -1486,12 +1486,12 @@ mod tests {
     #[test]
     fn apply_compaction_flags_emits_all_when_set() {
         let mut cmd = Command::new("docker");
-        let compaction = crate::crew::dispatch::CompactionDispatchArgs {
+        let compaction = crate::dispatch::CompactionDispatchArgs {
             threshold_tokens: Some(45_000),
             compactor_model: Some("custom-compactor".to_string()),
             threshold_ratio: Some(0.35),
             context_window: Some(101_000),
-            strategy: Some(crate::types::CompactionStrategy::StructuredSlot),
+            strategy: Some(darkmux_types::CompactionStrategy::StructuredSlot),
             bail_after_compactions: None,
             custom_instructions: None,
         };
@@ -1514,7 +1514,7 @@ mod tests {
     #[test]
     fn apply_compaction_flags_emits_bail_when_set() {
         let mut cmd = Command::new("docker");
-        let compaction = crate::crew::dispatch::CompactionDispatchArgs {
+        let compaction = crate::dispatch::CompactionDispatchArgs {
             bail_after_compactions: Some(3),
             custom_instructions: None,
             ..Default::default()
@@ -1531,7 +1531,7 @@ mod tests {
     #[test]
     fn apply_compaction_flags_omits_bail_when_none() {
         let mut cmd = Command::new("docker");
-        let compaction = crate::crew::dispatch::CompactionDispatchArgs::default();
+        let compaction = crate::dispatch::CompactionDispatchArgs::default();
         apply_compaction_flags(&mut cmd, &compaction);
         let args = args_of(&cmd);
         assert!(
@@ -1549,7 +1549,7 @@ mod tests {
     #[test]
     fn apply_compaction_flags_emits_custom_instructions_when_set() {
         let mut cmd = Command::new("docker");
-        let compaction = crate::crew::dispatch::CompactionDispatchArgs {
+        let compaction = crate::dispatch::CompactionDispatchArgs {
             custom_instructions: Some(
                 "Preserve verbatim X / list active files with what was learned".into(),
             ),
@@ -1567,7 +1567,7 @@ mod tests {
     #[test]
     fn apply_compaction_flags_omits_custom_instructions_when_none() {
         let mut cmd = Command::new("docker");
-        let compaction = crate::crew::dispatch::CompactionDispatchArgs::default();
+        let compaction = crate::dispatch::CompactionDispatchArgs::default();
         apply_compaction_flags(&mut cmd, &compaction);
         let args = args_of(&cmd);
         assert!(
@@ -1583,8 +1583,8 @@ mod tests {
     #[test]
     fn apply_compaction_flags_strategy_only_emits_just_strategy_flag() {
         let mut cmd = Command::new("docker");
-        let compaction = crate::crew::dispatch::CompactionDispatchArgs {
-            strategy: Some(crate::types::CompactionStrategy::StructuredSlot),
+        let compaction = crate::dispatch::CompactionDispatchArgs {
+            strategy: Some(darkmux_types::CompactionStrategy::StructuredSlot),
             ..Default::default()
         };
         apply_compaction_flags(&mut cmd, &compaction);
@@ -1597,7 +1597,7 @@ mod tests {
 
     #[test]
     fn from_profile_reads_typed_strategy_field() {
-        use crate::types::{
+        use darkmux_types::{
             CompactionStrategy, ModelRole, Profile, ProfileModel, ProfileRuntime,
             RuntimeCompactionConfig,
         };
@@ -1625,7 +1625,7 @@ mod tests {
             }),
             use_when: None,
         };
-        let args = crate::crew::dispatch::CompactionDispatchArgs::from_profile(&profile);
+        let args = crate::dispatch::CompactionDispatchArgs::from_profile(&profile);
         assert_eq!(args.strategy, Some(CompactionStrategy::StructuredSlot));
     }
 
@@ -1636,7 +1636,7 @@ mod tests {
     /// level only at this chunk; per-role override comes in chunk 4.
     #[test]
     fn from_profile_derives_bail_after_compactions_from_reserve() {
-        use crate::types::{
+        use darkmux_types::{
             ModelRole, Profile, ProfileModel, ProfileRuntime, ReserveConfig,
             RuntimeCompactionConfig,
         };
@@ -1667,7 +1667,7 @@ mod tests {
             }),
             use_when: None,
         };
-        let args = crate::crew::dispatch::CompactionDispatchArgs::from_profile(&profile);
+        let args = crate::dispatch::CompactionDispatchArgs::from_profile(&profile);
         assert_eq!(args.bail_after_compactions, Some(3));
     }
 
@@ -1677,8 +1677,8 @@ mod tests {
     /// profile's 5.
     #[test]
     fn apply_role_override_overlays_role_bail_on_top_of_profile() {
-        use crate::crew::dispatch::CompactionDispatchArgs;
-        use crate::crew::types::{EscalationContract, Role, ToolPalette};
+        use crate::dispatch::CompactionDispatchArgs;
+        use crate::types::{EscalationContract, Role, ToolPalette};
         let mut args = CompactionDispatchArgs {
             bail_after_compactions: Some(5), // profile default
             ..Default::default()
@@ -1707,8 +1707,8 @@ mod tests {
     /// into per-role escalation pinning).
     #[test]
     fn apply_role_override_preserves_profile_default_when_role_unset() {
-        use crate::crew::dispatch::CompactionDispatchArgs;
-        use crate::crew::types::{EscalationContract, Role, ToolPalette};
+        use crate::dispatch::CompactionDispatchArgs;
+        use crate::types::{EscalationContract, Role, ToolPalette};
         let mut args = CompactionDispatchArgs {
             bail_after_compactions: Some(5), // profile default
             ..Default::default()
@@ -1736,7 +1736,7 @@ mod tests {
 
     #[test]
     fn from_profile_bail_after_compactions_is_none_when_reserve_absent() {
-        use crate::types::{
+        use darkmux_types::{
             ModelRole, Profile, ProfileModel, ProfileRuntime, RuntimeCompactionConfig,
         };
         let profile = Profile {
@@ -1763,13 +1763,13 @@ mod tests {
             }),
             use_when: None,
         };
-        let args = crate::crew::dispatch::CompactionDispatchArgs::from_profile(&profile);
+        let args = crate::dispatch::CompactionDispatchArgs::from_profile(&profile);
         assert_eq!(args.bail_after_compactions, None);
     }
 
     #[test]
     fn from_profile_derives_typed_threshold() {
-        use crate::types::{
+        use darkmux_types::{
             ModelRole, Profile, ProfileModel, ProfileRuntime, RuntimeCompactionConfig,
         };
         let profile = Profile {
@@ -1796,7 +1796,7 @@ mod tests {
             }),
             use_when: None,
         };
-        let args = crate::crew::dispatch::CompactionDispatchArgs::from_profile(&profile);
+        let args = crate::dispatch::CompactionDispatchArgs::from_profile(&profile);
         assert_eq!(args.threshold_tokens, Some(40_000));
         assert_eq!(args.context_window, Some(100_000), "primary n_ctx");
     }
@@ -1809,7 +1809,7 @@ mod tests {
         // `lmstudio/<id>` format was passed to LMStudio's direct API
         // which only knows the bare/namespaced form). Until a typed
         // `compaction.compactor_model` lands, runtime uses default.
-        use crate::types::{
+        use darkmux_types::{
             ModelRole, Profile, ProfileModel, ProfileRuntime, RuntimeCompactionConfig,
         };
         let mut extras = serde_json::Map::new();
@@ -1842,7 +1842,7 @@ mod tests {
             }),
             use_when: None,
         };
-        let args = crate::crew::dispatch::CompactionDispatchArgs::from_profile(&profile);
+        let args = crate::dispatch::CompactionDispatchArgs::from_profile(&profile);
         assert_eq!(args.threshold_ratio, Some(0.35));
         assert!(
             args.compactor_model.is_none(),
@@ -1860,7 +1860,7 @@ mod tests {
     /// never actually expressed X in the darkmux-side surface.
     #[test]
     fn from_profile_ignores_openclaw_maxhistoryshare_extras() {
-        use crate::types::{
+        use darkmux_types::{
             ModelRole, Profile, ProfileModel, ProfileRuntime, RuntimeCompactionConfig,
         };
         let mut extras = serde_json::Map::new();
@@ -1892,7 +1892,7 @@ mod tests {
             }),
             use_when: None,
         };
-        let args = crate::crew::dispatch::CompactionDispatchArgs::from_profile(&profile);
+        let args = crate::dispatch::CompactionDispatchArgs::from_profile(&profile);
         assert!(
             args.threshold_ratio.is_none(),
             "clean break: openclaw extras must NOT auto-populate threshold_ratio"
@@ -1904,7 +1904,7 @@ mod tests {
     /// source the internal runtime sees.
     #[test]
     fn from_profile_reads_typed_custom_instructions() {
-        use crate::types::{
+        use darkmux_types::{
             ModelRole, Profile, ProfileModel, ProfileRuntime, RuntimeCompactionConfig,
         };
         let profile = Profile {
@@ -1933,7 +1933,7 @@ mod tests {
             }),
             use_when: None,
         };
-        let args = crate::crew::dispatch::CompactionDispatchArgs::from_profile(&profile);
+        let args = crate::dispatch::CompactionDispatchArgs::from_profile(&profile);
         assert_eq!(
             args.custom_instructions.as_deref(),
             Some("Preserve verbatim X / list active files")
@@ -1948,7 +1948,7 @@ mod tests {
     /// doctor warning.
     #[test]
     fn from_profile_ignores_openclaw_custom_instructions_extras() {
-        use crate::types::{
+        use darkmux_types::{
             ModelRole, Profile, ProfileModel, ProfileRuntime, RuntimeCompactionConfig,
         };
         let mut extras = serde_json::Map::new();
@@ -1984,7 +1984,7 @@ mod tests {
             }),
             use_when: None,
         };
-        let args = crate::crew::dispatch::CompactionDispatchArgs::from_profile(&profile);
+        let args = crate::dispatch::CompactionDispatchArgs::from_profile(&profile);
         assert!(
             args.custom_instructions.is_none(),
             "schema isolation: openclaw extras[customInstructions] must NOT auto-populate typed custom_instructions"
@@ -1993,7 +1993,7 @@ mod tests {
 
     #[test]
     fn from_profile_handles_missing_compaction_block() {
-        use crate::types::{ModelRole, Profile, ProfileModel};
+        use darkmux_types::{ModelRole, Profile, ProfileModel};
         let profile = Profile {
             description: None,
             models: vec![ProfileModel {
@@ -2005,7 +2005,7 @@ mod tests {
             runtime: None,
             use_when: None,
         };
-        let args = crate::crew::dispatch::CompactionDispatchArgs::from_profile(&profile);
+        let args = crate::dispatch::CompactionDispatchArgs::from_profile(&profile);
         assert!(args.threshold_tokens.is_none());
         assert!(args.compactor_model.is_none());
         assert!(args.threshold_ratio.is_none());
@@ -2304,8 +2304,8 @@ mod tests {
 
     // ─── role tool_palette → runtime allowed-tools mapping ────────────
 
-    fn palette(allow: &[&str], deny: &[&str]) -> crate::crew::types::ToolPalette {
-        crate::crew::types::ToolPalette {
+    fn palette(allow: &[&str], deny: &[&str]) -> crate::types::ToolPalette {
+        crate::types::ToolPalette {
             allow: allow.iter().map(|s| s.to_string()).collect(),
             deny: deny.iter().map(|s| s.to_string()).collect(),
         }
@@ -2747,5 +2747,5 @@ mod tests {
 
 
     // first_user_symlink_in / is_macos_firmlink tests moved to
-    // `crate::workdir::tests` as part of Wave-E.2 (#255).
+    // `darkmux_types::workdir::tests` as part of Wave-E.2 (#255).
 }

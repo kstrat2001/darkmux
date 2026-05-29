@@ -1,4 +1,4 @@
-use crate::crew::index::{default_index_path, open_index};
+use crate::index::{default_index_path, open_index};
 use anyhow::{Result, bail};
 use rusqlite::{params, OptionalExtension};
 use std::path::Path;
@@ -15,7 +15,7 @@ pub fn crew_show(crew_id: &str) -> Result<i32> {
 
 /// Internal entry for `crew list` taking an explicit index path. Tests use
 /// this to avoid querying the live `~/.darkmux/index.db`.
-pub(crate) fn crew_list_at(path: &Path) -> Result<i32> {
+pub fn crew_list_at(path: &Path) -> Result<i32> {
     if !path.exists() {
         bail!(
             "no index at {} — run `darkmux crew index rebuild` first",
@@ -73,7 +73,7 @@ pub(crate) fn crew_list_at(path: &Path) -> Result<i32> {
 }
 
 /// Internal entry for `crew show` taking an explicit index path.
-pub(crate) fn crew_show_at(path: &Path, crew_id: &str) -> Result<i32> {
+pub fn crew_show_at(path: &Path, crew_id: &str) -> Result<i32> {
     if !path.exists() {
         bail!(
             "no index at {} — run `darkmux crew index rebuild` first",
@@ -138,7 +138,7 @@ pub(crate) fn crew_show_at(path: &Path, crew_id: &str) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crew::index::rebuild_at;
+    use crate::index::rebuild_at;
     use std::path::PathBuf;
 
     /// RAII guard: point DARKMUX_CREW_DIR at a TempDir for the test's

@@ -15,8 +15,8 @@
 //! `agents.list[]` reflect the manifests on disk — writes/updates the
 //! `darkmux/<role>` entries to match what the manifests + `.md` prompts say.
 
-use crate::crew::loader::{load_role_prompt, load_roles, load_sprints};
-use crate::crew::types::Role;
+use crate::loader::{load_role_prompt, load_roles, load_sprints};
+use crate::types::Role;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Map, Value};
 use std::fs;
@@ -41,7 +41,7 @@ const LICENSED_ADJACENT_ROLES: &[&str] = &["health-research", "legal-research", 
 /// Default openclaw config path. `DARKMUX_OPENCLAW_CONFIG` env var overrides
 /// (e.g., for tests). Visible to other crates so the doctor pin-drift
 /// check (#160) reads from the same path sync writes to.
-pub(crate) fn default_openclaw_config() -> PathBuf {
+pub fn default_openclaw_config() -> PathBuf {
     if let Ok(p) = std::env::var("DARKMUX_OPENCLAW_CONFIG") {
         let trimmed = p.trim();
         if !trimmed.is_empty() {
@@ -364,7 +364,7 @@ pub struct CompactionDispatchArgs {
     /// `profile.runtime.compaction.strategy` (#372 T2-A). When
     /// `None`, runtime uses default Narrative. Setting
     /// `Some(StructuredSlot)` opts the dispatch into tier-2.
-    pub strategy: Option<crate::types::CompactionStrategy>,
+    pub strategy: Option<darkmux_types::CompactionStrategy>,
     /// (#377) Escalation bound — after this many compactions, the
     /// runtime emits `TerminalReason::EscalationTriggered` and exits
     /// instead of continuing the agent loop. Set from
@@ -386,8 +386,8 @@ impl CompactionDispatchArgs {
     /// supplied openclaw-shape passthroughs (`maxHistoryShare`,
     /// `model`) from the `extras` map. Picks the primary model's
     /// `n_ctx` as the context_window (needed for formula trigger).
-    pub fn from_profile(profile: &crate::types::Profile) -> Self {
-        use crate::types::ModelRole;
+    pub fn from_profile(profile: &darkmux_types::Profile) -> Self {
+        use darkmux_types::ModelRole;
         let comp = profile.runtime.as_ref().and_then(|r| r.compaction.as_ref());
         let threshold_tokens = comp
             .and_then(|c| c.threshold_tokens)
@@ -457,7 +457,7 @@ impl CompactionDispatchArgs {
     /// The role's `escalation_posture` field is parsed here too but
     /// is currently informational only — the host/skill layer in
     /// chunk 5 will branch on it when frontier handoff lands.
-    pub fn apply_role_override(&mut self, role: &crate::crew::types::Role) {
+    pub fn apply_role_override(&mut self, role: &crate::types::Role) {
         if let Some(role_bail) = role.bail_after_compactions {
             self.bail_after_compactions = Some(role_bail);
         }
@@ -534,7 +534,7 @@ pub fn fresh_session_id(role_id: &str) -> String {
 ///
 /// Cap: 200 files per `root`. The dispatcher's job is to surface the
 /// signal, not to dump entire repos.
-pub(crate) fn snapshot_watched_path(root: &Path) -> WatchedPathState {
+pub fn snapshot_watched_path(root: &Path) -> WatchedPathState {
     const MAX_FILES_PER_ROOT: usize = 200;
 
     if !root.exists() {
@@ -675,7 +675,7 @@ fn load_operator_identity() -> Option<String> {
 /// systemPromptOverride written to openclaw.json reflects the
 /// augmented form) AND preflight time (so drift detection compares
 /// like-for-like).
-pub(crate) fn augment_prompt_with_identity(role_prompt: &str) -> String {
+pub fn augment_prompt_with_identity(role_prompt: &str) -> String {
     match load_operator_identity() {
         Some(identity) => format!(
             "{role_prompt}\n\n---\n\n## About the operator\n\n{}\n",
@@ -702,7 +702,7 @@ pub(crate) fn augment_prompt_with_identity(role_prompt: &str) -> String {
 /// New layout (#148): `<crew_root>/missions/<mission_id>/sprints/<sprint_id>-output.txt`
 /// co-located with the sprint manifest under the per-mission directory.
 fn sprint_output_path(mission_id: &str, sprint_id: &str) -> PathBuf {
-    crate::crew::lifecycle::sprints_dir(mission_id).join(format!("{sprint_id}-output.txt"))
+    crate::lifecycle::sprints_dir(mission_id).join(format!("{sprint_id}-output.txt"))
 }
 
 /// Resolve the dispatch message: when `sprint_id` is `Some(id)`, look
@@ -840,7 +840,7 @@ fn persist_sprint_output(sprint_id: Option<&str>, reply_text: &str) -> Option<Pa
     }
     // Resolve mission_id via lifecycle so the output file lands in the
     // per-mission directory next to the sprint manifest (#148).
-    let mission_id = match crate::crew::lifecycle::load_sprint_by_id(sprint_id) {
+    let mission_id = match crate::lifecycle::load_sprint_by_id(sprint_id) {
         Ok(s) => s.mission_id,
         Err(_) => {
             eprintln!(
@@ -912,7 +912,7 @@ fn apply_workdir_override(workdir: Option<&Path>, role_workspace: &Path) -> Resu
     // the canonical (symlink-free) path — operations below use the
     // operator-supplied `target` for messages but the canonical path
     // for filesystem ops is captured at the link-create site below.
-    let _resolved = crate::workdir::validate_workdir(target)?;
+    let _resolved = darkmux_types::workdir::validate_workdir(target)?;
 
     fs::create_dir_all(role_workspace)
         .with_context(|| format!("creating role workspace {}", role_workspace.display()))?;
@@ -991,14 +991,14 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // explicitly opts in via `--runtime internal`. Default stays the
     // openclaw path (everything below this branch).
     if opts.runtime == Runtime::Internal {
-        return crate::crew::dispatch_internal::dispatch(opts);
+        return crate::dispatch_internal::dispatch(opts);
     }
 
     // 0. Pre-flight: nudge the operator if the daemon isn't up. The
     //    dispatch will still write flow records to disk, but they
     //    won't be observable in the viewer until the daemon comes up.
     //    Non-blocking; the dispatch proceeds either way (#104 S3).
-    crate::flow::daemon_probe::nudge_if_daemon_unreachable("crew dispatch");
+    darkmux_flow::daemon_probe::nudge_if_daemon_unreachable("crew dispatch");
 
     // 1. Load the role + its .md prompt
     let role = load_role_or_bail(&opts.role_id)?;
@@ -1105,8 +1105,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         "prompt_chars": augmented_message.chars().count(),
         "agent_id": agent_id,
     });
-    let _ = crate::flow::record(build_dispatch_record_with_payload(
-        crate::flow::Level::Info,
+    let _ = darkmux_flow::record(build_dispatch_record_with_payload(
+        darkmux_flow::Level::Info,
         "dispatch start",
         &opts.role_id,
         &resolved_session_id,
@@ -1139,8 +1139,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // returning Ok — emission must reflect both success and failure paths
     // so the viewer never sees a dangling start with no terminal event.
     let (action, level) = match &output_result {
-        Ok(o) if o.status.success() => ("dispatch complete", crate::flow::Level::Info),
-        _ => ("dispatch error", crate::flow::Level::Error),
+        Ok(o) if o.status.success() => ("dispatch complete", darkmux_flow::Level::Info),
+        _ => ("dispatch error", darkmux_flow::Level::Error),
     };
     let (stdout_chars, stderr_chars, exit_code) = match &output_result {
         Ok(o) => (o.stdout.len(), o.stderr.len(), o.status.code()),
@@ -1158,7 +1158,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             "error"
         },
     });
-    let _ = crate::flow::record(build_dispatch_record_with_payload(
+    let _ = darkmux_flow::record(build_dispatch_record_with_payload(
         level,
         action,
         &opts.role_id,
@@ -1316,14 +1316,14 @@ pub fn emit_route_record_and_resolve_session(
     role_tier: &str,
     target_machine: Option<&str>,
 ) -> String {
-    let local_tier = crate::flow::resolve_machine_tier();
+    let local_tier = darkmux_flow::resolve_machine_tier();
     let session_id = opts
         .session_id
         .clone()
         .unwrap_or_else(|| fresh_session_id(&opts.role_id));
     let payload = build_route_payload(role_tier, local_tier.as_deref(), target_machine);
-    let _ = crate::flow::record(build_dispatch_record_with_payload(
-        crate::flow::Level::Info,
+    let _ = darkmux_flow::record(build_dispatch_record_with_payload(
+        darkmux_flow::Level::Info,
         "dispatch route",
         &opts.role_id,
         &session_id,
@@ -1397,13 +1397,13 @@ pub fn routing_decision(machine: Option<&str>, local_machine_id: Option<&str>) -
 /// through `_with_payload` directly to carry runtime metadata; this
 /// wrapper survives for tests + future callers that don't need payload.
 #[allow(dead_code)]
-pub(crate) fn build_dispatch_record(
-    level: crate::flow::Level,
+pub fn build_dispatch_record(
+    level: darkmux_flow::Level,
     action: &str,
     role_id: &str,
     session_id: &str,
     model: Option<&str>,
-) -> crate::flow::FlowRecord {
+) -> darkmux_flow::FlowRecord {
     build_dispatch_record_with_payload(level, action, role_id, session_id, model, None)
 }
 
@@ -1411,20 +1411,20 @@ pub(crate) fn build_dispatch_record(
 /// event-specific fields (#204). The richer dispatch events (turn,
 /// tool, compaction, reasoning) use this directly; the bare
 /// `build_dispatch_record` wrapper preserves the legacy call shape.
-pub(crate) fn build_dispatch_record_with_payload(
-    level: crate::flow::Level,
+pub fn build_dispatch_record_with_payload(
+    level: darkmux_flow::Level,
     action: &str,
     role_id: &str,
     session_id: &str,
     model: Option<&str>,
     payload: Option<serde_json::Value>,
-) -> crate::flow::FlowRecord {
-    crate::flow::FlowRecord {
-        ts: crate::flow::ts_utc_now(),
+) -> darkmux_flow::FlowRecord {
+    darkmux_flow::FlowRecord {
+        ts: darkmux_flow::ts_utc_now(),
         level,
-        category: crate::flow::Category::Work,
-        tier: crate::flow::Tier::Local,
-        stage: crate::flow::Stage::Dispatch,
+        category: darkmux_flow::Category::Work,
+        tier: darkmux_flow::Tier::Local,
+        stage: darkmux_flow::Stage::Dispatch,
         action: action.to_string(),
         handle: role_id.to_string(),
         sprint_id: None,
@@ -1461,7 +1461,7 @@ pub(crate) fn build_dispatch_record_with_payload(
 /// and is the right place for that signal. The flow record's absent
 /// `model` field is operator-visible enough on its own — it shows as
 /// missing in the viewer, which is the same signal in the right place.
-pub(crate) fn resolve_dispatch_model(agent_id: &str) -> Option<String> {
+pub fn resolve_dispatch_model(agent_id: &str) -> Option<String> {
     let path = default_openclaw_config();
     let raw = fs::read_to_string(&path).ok()?;
     let config: Value = serde_json::from_str(&raw).ok()?;
@@ -1626,7 +1626,7 @@ fn preflight_check(
     // Pin-table load failures bail with the underlying error so the
     // operator sees what went wrong with their pin file; we don't
     // swallow that into a generic warning. Dispatch hot path = strict.
-    let pin_table = crate::crew::pins::load_pins()
+    let pin_table = crate::pins::load_pins()
         .context("loading pin table for dispatch-time preflight (#182)")?;
     let expected_model = pin_table.pin_for(&role.id);
     let actual_model = entry.get("model").and_then(|m| m.as_str());
@@ -1794,7 +1794,7 @@ fn build_agent_entry(role: &Role, prompt: &str, agent_dir: &Path, workspace: &Pa
     // what's ambient-loaded. Pin-table read failures degrade to NO
     // model field — agent loses pin protection but the sync itself
     // doesn't fail; doctor's pin-drift check surfaces the gap.
-    let pinned_model = crate::crew::pins::load_pins()
+    let pinned_model = crate::pins::load_pins()
         .ok()
         .map(|t| t.pin_for(&role.id).to_string());
 
@@ -1818,7 +1818,7 @@ fn build_agent_entry(role: &Role, prompt: &str, agent_dir: &Path, workspace: &Pa
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crew::types::{EscalationContract, Role, ToolPalette};
+    use crate::types::{EscalationContract, Role, ToolPalette};
     use tempfile::TempDir;
 
     // ─── #247 PR-C build_route_payload ────────────────────────────────
@@ -2776,7 +2776,7 @@ mod tests {
     #[test]
     fn dispatch_record_carries_role_id_session_and_local_tier() {
         let rec = build_dispatch_record(
-            crate::flow::Level::Info,
+            darkmux_flow::Level::Info,
             "dispatch start",
             "coder",
             "crew-dispatch-coder-12345-1",
@@ -2790,9 +2790,9 @@ mod tests {
         );
         assert_eq!(rec.source.as_deref(), Some("crew_dispatch"));
         assert_eq!(rec.model.as_deref(), Some("darkmux:qwen3.6-35b-a3b"));
-        assert!(matches!(rec.tier, crate::flow::Tier::Local));
-        assert!(matches!(rec.stage, crate::flow::Stage::Dispatch));
-        assert!(matches!(rec.category, crate::flow::Category::Work));
+        assert!(matches!(rec.tier, darkmux_flow::Tier::Local));
+        assert!(matches!(rec.stage, darkmux_flow::Stage::Dispatch));
+        assert!(matches!(rec.category, darkmux_flow::Category::Work));
         // sprint_id is None for dispatch records — crew dispatch is a
         // lower-level concept than sprint, so the dispatcher doesn't
         // assume a sprint context. The viewer joins via session_id.
@@ -2809,7 +2809,7 @@ mod tests {
         // tolerate the absent field; new viewers render "model: unknown"
         // or similar.
         let rec = build_dispatch_record(
-            crate::flow::Level::Info,
+            darkmux_flow::Level::Info,
             "dispatch start",
             "coder",
             "session-no-model",
@@ -2829,21 +2829,21 @@ mod tests {
         // not green). Lock the error level on dispatch_error so the
         // failure path is visually distinct from completion.
         let ok = build_dispatch_record(
-            crate::flow::Level::Info,
+            darkmux_flow::Level::Info,
             "dispatch complete",
             "coder",
             "session-abc",
             Some("darkmux:foo"),
         );
         let err = build_dispatch_record(
-            crate::flow::Level::Error,
+            darkmux_flow::Level::Error,
             "dispatch error",
             "coder",
             "session-abc",
             Some("darkmux:foo"),
         );
-        assert!(matches!(ok.level, crate::flow::Level::Info));
-        assert!(matches!(err.level, crate::flow::Level::Error));
+        assert!(matches!(ok.level, darkmux_flow::Level::Info));
+        assert!(matches!(err.level, darkmux_flow::Level::Error));
         // Same session_id so the viewer pairs them — this is the contract
         // that makes computeDispatchDurations() work for the failure path
         // too (an erroring dispatch still has a wall-clock arc).

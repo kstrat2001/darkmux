@@ -6,7 +6,11 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 mod agent_roles;
-mod crew;
+// #463 workspace split — crew extracted to its own crate (the velocity-debt
+// target: touching dispatch_internal.rs now rebuilds only darkmux-crew + the
+// binary stub). Re-export keeps crate::crew::* resolving for the binary +
+// fleet.
+pub use darkmux_crew as crew;
 mod doctor;
 mod eureka;
 mod external;
@@ -39,7 +43,10 @@ pub use darkmux_profiles::swap;
 // #463 workspace split — types extracted to the darkmux-types crate. The
 // re-export keeps all existing `crate::types::*` paths resolving unchanged.
 pub use darkmux_types as types;
-mod workdir;
+// #463 — workdir lifted into darkmux-types (leaf util shared by crew + fleet,
+// so crew can use it without a binary-resident edge). Re-export keeps
+// crate::workdir::* resolving for fleet + other binary modules.
+pub use darkmux_types::workdir;
 mod workloads;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");

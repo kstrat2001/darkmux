@@ -4,8 +4,8 @@
 
 #![allow(dead_code)]
 
-use crate::crew::types::*;
-use crate::types::paths::{resolve, ResolveScope};
+use crate::types::*;
+use darkmux_types::paths::{resolve, ResolveScope};
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 #[cfg(test)]
@@ -15,61 +15,61 @@ use std::path::PathBuf;
 
 /// Roles compiled into the binary at build time. Filename = `<id>.json`.
 const BUILTIN_ROLES: &[(&str, &str)] = &[
-    ("coder", include_str!("../../templates/builtin/roles/coder.json")),
-    ("scribe", include_str!("../../templates/builtin/roles/scribe.json")),
-    ("code-reviewer", include_str!("../../templates/builtin/roles/code-reviewer.json")),
-    ("analyst", include_str!("../../templates/builtin/roles/analyst.json")),
-    ("voice-editor", include_str!("../../templates/builtin/roles/voice-editor.json")),
-    ("design-reviewer", include_str!("../../templates/builtin/roles/design-reviewer.json")),
-    ("test-designer", include_str!("../../templates/builtin/roles/test-designer.json")),
-    ("lab-runner", include_str!("../../templates/builtin/roles/lab-runner.json")),
-    ("mission-compiler", include_str!("../../templates/builtin/roles/mission-compiler.json")),
+    ("coder", include_str!("../../../templates/builtin/roles/coder.json")),
+    ("scribe", include_str!("../../../templates/builtin/roles/scribe.json")),
+    ("code-reviewer", include_str!("../../../templates/builtin/roles/code-reviewer.json")),
+    ("analyst", include_str!("../../../templates/builtin/roles/analyst.json")),
+    ("voice-editor", include_str!("../../../templates/builtin/roles/voice-editor.json")),
+    ("design-reviewer", include_str!("../../../templates/builtin/roles/design-reviewer.json")),
+    ("test-designer", include_str!("../../../templates/builtin/roles/test-designer.json")),
+    ("lab-runner", include_str!("../../../templates/builtin/roles/lab-runner.json")),
+    ("mission-compiler", include_str!("../../../templates/builtin/roles/mission-compiler.json")),
     // Non-SWE engagement roles (#141): trip planning, health, athletics, legal.
     // Each is bounded — research/organize/structure only; no exec, no execution
     // of bookings or commitments. Each prompt's opening lines name what the role
     // is NOT, to keep cross-bounds questions from leaking into licensed-
     // professional territory.
-    ("trip-researcher", include_str!("../../templates/builtin/roles/trip-researcher.json")),
-    ("logistics-coordinator", include_str!("../../templates/builtin/roles/logistics-coordinator.json")),
-    ("health-research", include_str!("../../templates/builtin/roles/health-research.json")),
-    ("fitness-coach", include_str!("../../templates/builtin/roles/fitness-coach.json")),
-    ("legal-research", include_str!("../../templates/builtin/roles/legal-research.json")),
+    ("trip-researcher", include_str!("../../../templates/builtin/roles/trip-researcher.json")),
+    ("logistics-coordinator", include_str!("../../../templates/builtin/roles/logistics-coordinator.json")),
+    ("health-research", include_str!("../../../templates/builtin/roles/health-research.json")),
+    ("fitness-coach", include_str!("../../../templates/builtin/roles/fitness-coach.json")),
+    ("legal-research", include_str!("../../../templates/builtin/roles/legal-research.json")),
 ];
 
 /// Skills compiled into the binary at build time. Filename = `<id>.json`.
 const BUILTIN_SKILLS: &[(&str, &str)] = &[
-    ("coding", include_str!("../../templates/builtin/skills/coding.json")),
-    ("documenting", include_str!("../../templates/builtin/skills/documenting.json")),
-    ("test-designing", include_str!("../../templates/builtin/skills/test-designing.json")),
-    ("code-reviewing", include_str!("../../templates/builtin/skills/code-reviewing.json")),
-    ("analyzing", include_str!("../../templates/builtin/skills/analyzing.json")),
-    ("writing", include_str!("../../templates/builtin/skills/writing.json")),
-    ("voice-editing", include_str!("../../templates/builtin/skills/voice-editing.json")),
-    ("lab-running", include_str!("../../templates/builtin/skills/lab-running.json")),
-    ("design-reviewing", include_str!("../../templates/builtin/skills/design-reviewing.json")),
-    ("mission-compiling", include_str!("../../templates/builtin/skills/mission-compiling.json")),
+    ("coding", include_str!("../../../templates/builtin/skills/coding.json")),
+    ("documenting", include_str!("../../../templates/builtin/skills/documenting.json")),
+    ("test-designing", include_str!("../../../templates/builtin/skills/test-designing.json")),
+    ("code-reviewing", include_str!("../../../templates/builtin/skills/code-reviewing.json")),
+    ("analyzing", include_str!("../../../templates/builtin/skills/analyzing.json")),
+    ("writing", include_str!("../../../templates/builtin/skills/writing.json")),
+    ("voice-editing", include_str!("../../../templates/builtin/skills/voice-editing.json")),
+    ("lab-running", include_str!("../../../templates/builtin/skills/lab-running.json")),
+    ("design-reviewing", include_str!("../../../templates/builtin/skills/design-reviewing.json")),
+    ("mission-compiling", include_str!("../../../templates/builtin/skills/mission-compiling.json")),
 ];
 
 /// Role system prompts (`.md`) compiled into the binary. Used as the
 /// fallback source when no user-side `<crew_root>/roles/<id>.md` exists.
 /// One entry per role advertised in `BUILTIN_ROLES`; the
 /// `crew_role_prompt_coverage` doctor check verifies this invariant.
-pub(crate) const BUILTIN_ROLE_PROMPTS: &[(&str, &str)] = &[
-    ("coder", include_str!("../../templates/builtin/roles/coder.md")),
-    ("scribe", include_str!("../../templates/builtin/roles/scribe.md")),
-    ("code-reviewer", include_str!("../../templates/builtin/roles/code-reviewer.md")),
-    ("mission-compiler", include_str!("../../templates/builtin/roles/mission-compiler.md")),
-    ("analyst", include_str!("../../templates/builtin/roles/analyst.md")),
-    ("design-reviewer", include_str!("../../templates/builtin/roles/design-reviewer.md")),
-    ("lab-runner", include_str!("../../templates/builtin/roles/lab-runner.md")),
-    ("test-designer", include_str!("../../templates/builtin/roles/test-designer.md")),
-    ("voice-editor", include_str!("../../templates/builtin/roles/voice-editor.md")),
+pub const BUILTIN_ROLE_PROMPTS: &[(&str, &str)] = &[
+    ("coder", include_str!("../../../templates/builtin/roles/coder.md")),
+    ("scribe", include_str!("../../../templates/builtin/roles/scribe.md")),
+    ("code-reviewer", include_str!("../../../templates/builtin/roles/code-reviewer.md")),
+    ("mission-compiler", include_str!("../../../templates/builtin/roles/mission-compiler.md")),
+    ("analyst", include_str!("../../../templates/builtin/roles/analyst.md")),
+    ("design-reviewer", include_str!("../../../templates/builtin/roles/design-reviewer.md")),
+    ("lab-runner", include_str!("../../../templates/builtin/roles/lab-runner.md")),
+    ("test-designer", include_str!("../../../templates/builtin/roles/test-designer.md")),
+    ("voice-editor", include_str!("../../../templates/builtin/roles/voice-editor.md")),
     // Non-SWE engagement roles (#141). Order mirrors BUILTIN_ROLES.
-    ("trip-researcher", include_str!("../../templates/builtin/roles/trip-researcher.md")),
-    ("logistics-coordinator", include_str!("../../templates/builtin/roles/logistics-coordinator.md")),
-    ("health-research", include_str!("../../templates/builtin/roles/health-research.md")),
-    ("fitness-coach", include_str!("../../templates/builtin/roles/fitness-coach.md")),
-    ("legal-research", include_str!("../../templates/builtin/roles/legal-research.md")),
+    ("trip-researcher", include_str!("../../../templates/builtin/roles/trip-researcher.md")),
+    ("logistics-coordinator", include_str!("../../../templates/builtin/roles/logistics-coordinator.md")),
+    ("health-research", include_str!("../../../templates/builtin/roles/health-research.md")),
+    ("fitness-coach", include_str!("../../../templates/builtin/roles/fitness-coach.md")),
+    ("legal-research", include_str!("../../../templates/builtin/roles/legal-research.md")),
 ];
 
 /// (#425) Autonomous-dispatch preamble — prepended to specialist
@@ -79,7 +79,7 @@ pub(crate) const BUILTIN_ROLE_PROMPTS: &[(&str, &str)] = &[
 /// like mission-compiler) skip the preamble since they don't run
 /// agent loops.
 const AUTONOMOUS_DISPATCH_PREAMBLE: &str =
-    include_str!("../../templates/builtin/AUTONOMOUS_DISPATCH_PREAMBLE.md");
+    include_str!("../../../templates/builtin/AUTONOMOUS_DISPATCH_PREAMBLE.md");
 
 /// (#425) Resolve the autonomous-dispatch preamble — operator-side
 /// override at `<crew_root>/AUTONOMOUS_DISPATCH_PREAMBLE.md` wins
@@ -102,13 +102,13 @@ pub fn load_autonomous_dispatch_preamble() -> String {
 /// Expose the embedded role-id list for callers that need to verify
 /// prompt coverage against `BUILTIN_ROLES` (e.g., doctor checks). Kept
 /// thin so the visibility surface stays minimal.
-pub(crate) fn builtin_roles_ids() -> Vec<&'static str> {
+pub fn builtin_roles_ids() -> Vec<&'static str> {
     BUILTIN_ROLES.iter().map(|(id, _)| *id).collect()
 }
 
 /// Same shape for embedded role-prompt ids. Used by doctor's
 /// `crew_role_prompt_coverage` check.
-pub(crate) fn builtin_role_prompt_ids() -> Vec<&'static str> {
+pub fn builtin_role_prompt_ids() -> Vec<&'static str> {
     BUILTIN_ROLE_PROMPTS.iter().map(|(id, _)| *id).collect()
 }
 
@@ -140,7 +140,7 @@ pub fn crew_root() -> PathBuf {
 /// `DARKMUX_CREW_DIR` if set (operator override; unchanged semantics —
 /// the env var points at the directory CONTAINING the subdirs, with no
 /// `crew/` nesting), otherwise `<paths.root>` (e.g., `~/.darkmux/`).
-pub(crate) fn user_state_root() -> PathBuf {
+pub fn user_state_root() -> PathBuf {
     std::env::var("DARKMUX_CREW_DIR")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -357,7 +357,7 @@ pub fn load_crews() -> Result<Vec<Crew>> {
 ///
 /// Built-in missions (currently empty) are merged last, same as other loaders.
 pub fn load_missions() -> Result<Vec<Mission>> {
-    use crate::crew::lifecycle;
+    use crate::lifecycle;
     let missions_root = missions_dir();
     if !missions_root.is_dir() {
         return Ok(Vec::new());
@@ -409,7 +409,7 @@ pub fn load_missions() -> Result<Vec<Mission>> {
 /// name is needed.  Legacy flat sprint files under `<crew_root>/sprints/`
 /// are silently ignored — the migration verb is the bridge.
 pub fn load_sprints() -> Result<Vec<Sprint>> {
-    use crate::crew::lifecycle;
+    use crate::lifecycle;
     let missions_root = missions_dir();
     if !missions_root.is_dir() {
         return Ok(Vec::new());
@@ -496,7 +496,7 @@ pub fn load_skills() -> Result<Vec<Skill>> {
 #[allow(dead_code)]
 pub fn resolve_role_prompt_path(
     role: &Role,
-    paths: &crate::types::paths::DarkmuxPaths,
+    paths: &darkmux_types::paths::DarkmuxPaths,
 ) -> Option<PathBuf> {
     if let Some(p) = &role.prompt_path {
         return Some(p.clone());
