@@ -28,14 +28,26 @@ BUILTINS_DIR="$REPO_ROOT/templates/builtin/lab-fixtures"
 
 FORCE=false
 DRY=false
+print_help() {
+    # Hand-written help block — earlier draft parsed the script's own
+    # `# ` comments via sed, which bled body comments into the output.
+    cat <<'EOH'
+scripts/lab-init.sh — register the built-in lab fixtures shipped with
+this darkmux repo into ~/.darkmux/lab-registry.json.
+
+Usage:
+  scripts/lab-init.sh             # register all built-ins (idempotent)
+  scripts/lab-init.sh --force     # re-register, accepting any drift
+  scripts/lab-init.sh --dry       # print what would be registered; no writes
+  scripts/lab-init.sh -h, --help  # this help
+EOH
+}
+
 for arg in "$@"; do
     case "$arg" in
         --force) FORCE=true ;;
         --dry|--dry-run) DRY=true ;;
-        -h|--help)
-            sed -n 's/^# //p' "$0" | sed -n '/^Usage:/,/^$/p'
-            exit 0
-            ;;
+        -h|--help) print_help; exit 0 ;;
         *)
             echo "lab-init: unknown arg: $arg" >&2
             echo "Try: $0 --help" >&2
@@ -53,7 +65,7 @@ lab-init: \`darkmux\` not found on PATH.
     cargo install --path "$REPO_ROOT"
 
   Or use a debug binary directly (\`cargo build\` first):
-    PATH="$REPO_ROOT/target/debug:\$PATH" $0 $@
+    PATH="$REPO_ROOT/target/debug:\$PATH" $0
 EOF
     exit 1
 fi
@@ -84,13 +96,21 @@ if [ "$FORCE" = true ]; then
     register_args+=("--force")
 fi
 
+# Render the optional register-args portion for dry-run output. Using
+# `${#array[@]}` rather than `${array:+...}` (which tests the scalar
+# form = first element only — fragile if more flags are added).
+register_args_str=""
+if [ ${#register_args[@]} -gt 0 ]; then
+    register_args_str=" ${register_args[*]}"
+fi
+
 ok=0
 fail=0
 for fixture in "${fixtures_found[@]}"; do
     # Strip trailing slash for clean output.
     fixture_clean="${fixture%/}"
     if [ "$DRY" = true ]; then
-        echo "  [dry-run] darkmux lab register${register_args:+ ${register_args[*]}} $fixture_clean"
+        echo "  [dry-run] darkmux lab register$register_args_str $fixture_clean"
         ok=$((ok + 1))
         continue
     fi
