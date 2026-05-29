@@ -248,9 +248,11 @@ fn lab_run_quick_q_from_clean_cwd_uses_embedded_workload() {
     assert_eq!(manifest["profile"].as_str(), Some("deep"));
     assert_eq!(manifest["runId"].as_str(), Some(run_id.as_str()));
     assert_eq!(manifest["ok"].as_bool(), Some(true));
-    // Phase 2 fixture section: baseline_hash is null for self-contained
-    // workloads (quick-q has no source sandbox); source_path is recorded
-    // either way (canonicalize-fallback per #496).
+    // Phase 2 fixture section: for a self-contained workload (quick-q
+    // has no source sandbox) BOTH baseline_hash and source_path are
+    // null — the #496 resolution records an explicit "no source" signal
+    // rather than a non-canonical raw-path fallback that would
+    // spuriously mismatch a canonicalized run under `dm lab compare`.
     assert!(
         manifest["fixture"].is_object(),
         "expected fixture section, got: {}",
@@ -262,8 +264,8 @@ fn lab_run_quick_q_from_clean_cwd_uses_embedded_workload() {
         manifest["fixture"]["baseline_hash"]
     );
     assert!(
-        manifest["fixture"]["source_path"].is_string(),
-        "expected string source_path, got: {}",
+        manifest["fixture"]["source_path"].is_null(),
+        "expected null source_path for self-contained workload, got: {}",
         manifest["fixture"]["source_path"]
     );
 }

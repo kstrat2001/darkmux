@@ -481,6 +481,7 @@ dependencies = [
  "darkmux-profiles",
  "darkmux-types",
  "dirs",
+ "libc",
  "serde",
  "serde_json",
  "serial_test",

@@ -30,6 +30,16 @@ pub(crate) fn default_registry_path(paths: &DarkmuxPaths) -> PathBuf {
     paths.root.join("lab-registry.json")
 }
 
+/// Sidecar lock-file path for a registry at `path` (`<path>.lock`).
+/// `LabRegistry::with_locked` `flock(2)`s this rather than the registry
+/// itself so the load step never confuses an empty lock-created file
+/// with an absent registry (#496).
+fn registry_lock_path(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".lock");
+    PathBuf::from(s)
+}
+
 /// One registered fixture's entry. Fields are public-API surface for
 /// Phase 3 (resolver) + Phase 4 (CLI verbs) — they're populated now
 /// even though no consumer reads them in Phase 2 (#489), hence the
@@ -82,13 +92,92 @@ impl LabRegistry {
         Ok(reg)
     }
 
+    /// Run a read-modify-write transaction against the registry at
+    /// `path` under an exclusive cross-process `flock(2)` (#496).
+    ///
+    /// Loads the current registry, runs `f`, and persists the result —
+    /// all while holding the lock — so two concurrent `dm lab register`
+    /// invocations serialize through the lock instead of clobbering each
+    /// other last-write-wins. Mirrors `darkmux-flow`'s `AuditFileSink`
+    /// flock pattern.
+    ///
+    /// The lock is taken on a sidecar `<path>.lock` file (see
+    /// [`registry_lock_path`]) rather than the registry itself, so the
+    /// [`Self::load`] step never has to tell an empty lock-created file
+    /// apart from an absent registry (load treats absent as
+    /// empty-default).
+    ///
+    /// `f`'s result is returned untouched on success; if `f` returns
+    /// `Err` the registry is NOT saved (a rejected register leaves the
+    /// on-disk registry unchanged). POSIX-only — on non-unix the lock
+    /// degrades to a plain load → mutate → save (single-operator
+    /// assumption; cross-process safety is a unix-only guarantee).
+    #[cfg(unix)]
+    pub(crate) fn with_locked<F, T>(path: &Path, f: F) -> Result<T>
+    where
+        F: FnOnce(&mut LabRegistry) -> Result<T>,
+    {
+        use std::os::unix::io::AsRawFd;
+
+        let lock_path = registry_lock_path(path);
+        if let Some(parent) = lock_path.parent() {
+            if !parent.exists() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+        }
+        let lock_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| format!("opening registry lock {}", lock_path.display()))?;
+
+        // Acquire exclusive cross-process lock; released on guard drop.
+        let fd = lock_file.as_raw_fd();
+        if unsafe { libc::flock(fd, libc::LOCK_EX) } != 0 {
+            return Err(anyhow!(
+                "flock(LOCK_EX) failed on registry lock {}: {}",
+                lock_path.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        struct FlockGuard(std::os::unix::io::RawFd);
+        impl Drop for FlockGuard {
+            fn drop(&mut self) {
+                unsafe { libc::flock(self.0, libc::LOCK_UN) };
+            }
+        }
+        let _guard = FlockGuard(fd);
+
+        let mut registry = Self::load(path)?;
+        let out = f(&mut registry)?;
+        registry.save(path)?;
+        Ok(out)
+    }
+
+    /// Non-unix fallback for [`Self::with_locked`] — plain
+    /// load → mutate → save with no cross-process lock.
+    #[cfg(not(unix))]
+    pub(crate) fn with_locked<F, T>(path: &Path, f: F) -> Result<T>
+    where
+        F: FnOnce(&mut LabRegistry) -> Result<T>,
+    {
+        let mut registry = Self::load(path)?;
+        let out = f(&mut registry)?;
+        registry.save(path)?;
+        Ok(out)
+    }
+
     /// Save the registry to `path`. Creates parent dir if needed.
     /// Writes pretty-printed JSON for operator-readability (the
     /// registry is small enough that pretty cost is negligible).
     ///
-    /// **No file locking.** Concurrent writers (e.g. two `dm lab
-    /// register` invocations against the same registry) are
-    /// last-write-wins. Tracked as a Phase 4 follow-up (#496).
+    /// Direct callers do NOT get cross-process safety — concurrent
+    /// writers race last-write-wins. Mutating verbs go through
+    /// [`Self::with_locked`] instead, which serializes the whole
+    /// load → mutate → save cycle under `flock(2)` (#496).
     pub(crate) fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             if !parent.exists() {
@@ -436,5 +525,97 @@ mod tests {
         let reg = LabRegistry::default();
         reg.save(&reg_path).unwrap();
         assert!(reg_path.exists());
+    }
+
+    /// (#496) `with_locked` persists a successful mutation and creates
+    /// the registry file (and its sidecar lock) on first use.
+    #[test]
+    fn with_locked_persists_mutation() {
+        let tmp = TempDir::new().unwrap();
+        let fixture_dir = tmp.path().join("fx");
+        std::fs::create_dir_all(&fixture_dir).unwrap();
+        write_fixture(&fixture_dir, "demo", None);
+        let reg_path = tmp.path().join("registry.json");
+
+        let name = LabRegistry::with_locked(&reg_path, |reg| {
+            let (name, _) = reg.register(&fixture_dir, None, false)?;
+            Ok(name)
+        })
+        .unwrap();
+        assert_eq!(name, "demo");
+
+        let loaded = LabRegistry::load(&reg_path).unwrap();
+        assert!(loaded.fixtures.contains_key("demo"));
+        assert!(registry_lock_path(&reg_path).exists());
+    }
+
+    /// (#496) A closure that returns `Err` leaves the on-disk registry
+    /// unchanged — a rejected register doesn't clobber prior state.
+    #[test]
+    fn with_locked_does_not_save_on_closure_error() {
+        let tmp = TempDir::new().unwrap();
+        let fixture_dir = tmp.path().join("fx");
+        std::fs::create_dir_all(&fixture_dir).unwrap();
+        write_fixture(&fixture_dir, "demo", None);
+        let reg_path = tmp.path().join("registry.json");
+
+        // First register succeeds.
+        LabRegistry::with_locked(&reg_path, |reg| {
+            reg.register(&fixture_dir, None, false).map(|_| ())
+        })
+        .unwrap();
+        // Second (duplicate, no force) fails inside the closure.
+        let err = LabRegistry::with_locked(&reg_path, |reg| {
+            reg.register(&fixture_dir, None, false).map(|_| ())
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("already registered"), "got: {err}");
+
+        // Registry still has exactly the one entry from the first call.
+        let loaded = LabRegistry::load(&reg_path).unwrap();
+        assert_eq!(loaded.fixtures.len(), 1);
+    }
+
+    /// (#496) Concurrent `with_locked` transactions from multiple
+    /// threads must not lose entries to a last-write-wins race — each
+    /// thread opens its own fd on the sidecar lock, so `flock(LOCK_EX)`
+    /// serializes the load→modify→save cycles. Mirrors the process-level
+    /// `tests/lab_concurrent_register_no_lost_writes.rs`.
+    #[cfg(unix)]
+    #[test]
+    fn with_locked_concurrent_register_keeps_every_entry() {
+        const N: usize = 12;
+        let tmp = TempDir::new().unwrap();
+        let fixture_dir = tmp.path().join("fx");
+        std::fs::create_dir_all(&fixture_dir).unwrap();
+        write_fixture(&fixture_dir, "shared", None);
+        let reg_path = tmp.path().join("registry.json");
+
+        let mut handles = Vec::with_capacity(N);
+        for i in 0..N {
+            let reg_path = reg_path.clone();
+            let fixture_dir = fixture_dir.clone();
+            handles.push(std::thread::spawn(move || {
+                LabRegistry::with_locked(&reg_path, |reg| {
+                    reg.register(&fixture_dir, Some(format!("fix-{i:02}")), false)
+                        .map(|_| ())
+                })
+                .expect("locked register");
+            }));
+        }
+        for h in handles {
+            h.join().expect("join register thread");
+        }
+
+        let loaded = LabRegistry::load(&reg_path).unwrap();
+        let missing: Vec<String> = (0..N)
+            .map(|i| format!("fix-{i:02}"))
+            .filter(|k| !loaded.fixtures.contains_key(k))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "concurrent register lost entries: {missing:?}; have {} of {N}",
+            loaded.fixtures.len()
+        );
     }
 }
