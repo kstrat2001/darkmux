@@ -26,7 +26,6 @@ darkmux-flow = { path = "crates/darkmux-flow" }
 darkmux-profiles = { path = "crates/darkmux-profiles" }
 darkmux-crew = { path = "crates/darkmux-crew" }
 darkmux-hardware = { path = "crates/darkmux-hardware" }
-darkmux-agent-roles = { path = "crates/darkmux-agent-roles" }
 darkmux-heuristics = { path = "crates/darkmux-heuristics" }
 darkmux-eureka = { path = "crates/darkmux-eureka" }
 darkmux-fleet = { path = "crates/darkmux-fleet" }

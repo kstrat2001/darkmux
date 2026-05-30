@@ -5,9 +5,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-// #515 — zero-edge leaf extracted to darkmux-agent-roles. Re-export keeps
-// crate::agent_roles::* resolving unchanged.
-pub use darkmux_agent_roles as agent_roles;
 // #463 workspace split — crew extracted to its own crate (the velocity-debt
 // target: touching dispatch_internal.rs now rebuilds only darkmux-crew + the
 // binary stub). Re-export keeps crate::crew::* resolving for the binary +
@@ -198,14 +195,6 @@ enum Cmd {
         #[command(subcommand)]
         sub: MissionCmd,
     },
-    /// Agent-role template subcommands. Browse + emit validated
-    /// `systemPromptOverride` scaffolds for common roles (qa, scribe,
-    /// engineer). Output is print-only — paste into your runtime config
-    /// (`agents.list[]` in openclaw.json) yourself.
-    Agent {
-        #[command(subcommand)]
-        sub: AgentCmd,
-    },
     /// Per-hardware-tier recommendations — primary + compactor model
     /// picks validated via the project's bake-off methodology. Read-only;
     /// surfaces the registry's pick for the active or a specified tier.
@@ -283,18 +272,6 @@ enum ExternalCmd {
         /// for `pbpaste | darkmux external pull --stdin | ...`.
         #[arg(long, group = "source")]
         stdin: bool,
-    },
-}
-
-#[derive(Subcommand)]
-enum AgentCmd {
-    /// List the role-template ids darkmux ships scaffolds for.
-    ListTemplates,
-    /// Emit a JSON snippet for `agents.list[]` for the given role.
-    /// Print-only — paste into your runtime config yourself.
-    Template {
-        /// Role id (qa | scribe | engineer). Run `agent list-templates` to see what's available.
-        role: String,
     },
 }
 
@@ -1011,7 +988,6 @@ fn run(cmd: Cmd) -> Result<i32> {
         Cmd::Role { sub } => cmd_role(sub),
         Cmd::Sprint { sub } => cmd_sprint(sub),
         Cmd::Mission { sub } => cmd_mission(sub),
-        Cmd::Agent { sub } => cmd_agent(sub),
         Cmd::Recommendations { sub } => cmd_recommendations(sub),
         Cmd::Flow { sub } => {
             flow_cli::run(sub)?;
@@ -1818,48 +1794,6 @@ pub fn speedup_verdict(
         // silent even if the math says speedup >= threshold (which can
         // only happen via clock skew or wall_ms misreporting).
         SpeedupVerdict::Inconclusive
-    }
-}
-
-fn cmd_agent(sub: AgentCmd) -> Result<i32> {
-    match sub {
-        AgentCmd::ListTemplates => {
-            let ids = agent_roles::list_role_ids();
-            println!("darkmux ships {} role template(s):", ids.len());
-            println!();
-            for id in &ids {
-                let t = agent_roles::load_role(id)?;
-                println!("• {} ({})", t.role, t.runtime);
-                println!("    {}", t.description);
-                println!(
-                    "    pairs with profile: {}, tools: {}",
-                    t.recommended_profile,
-                    t.recommended_tools.join(", ")
-                );
-                println!();
-            }
-            println!("Generate a template:  `darkmux agent template <role>`");
-            Ok(0)
-        }
-        AgentCmd::Template { role } => {
-            let template = agent_roles::load_role(&role)?;
-            let snippet = agent_roles::snippet_for_agents_list(&template);
-            println!("{}", serde_json::to_string_pretty(&snippet)?);
-            eprintln!();
-            eprintln!(
-                "// Paste the above object into the `agents.list` array of your runtime config"
-            );
-            eprintln!(
-                "// (e.g. ~/.openclaw/openclaw.json). Recommended profile: `{}`. Adjust",
-                template.recommended_profile
-            );
-            eprintln!(
-                "// `tools` to taste; the override text is the validated scaffold — tune the"
-            );
-            eprintln!("// task-specific framing for your codebase, but keep the structural blocks");
-            eprintln!("// (Tool Call Style, Execution Bias) — they're the load-bearing parts.");
-            Ok(0)
-        }
     }
 }
 

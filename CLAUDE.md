@@ -113,6 +113,7 @@ templates/builtin/
   role-model-pins.json        Default per-role model pins
 integrations/openclaw/
   agent-scaffolds/            Openclaw-integration export scaffolds (NOT engine-internal)
+  oc-scaffold.sh              Standalone agents.list[] snippet emitter (NOT a CLI verb; replaced `darkmux agent template`, #538)
 scripts/lab-init.sh           Standalone fixture-registry bootstrapper (NOT a CLI verb; #487 phase 5)
 skills/darkmux-<name>/        Agent-invokable skill wrappers
 tests/cli.rs                  Integration tests (spawn the binary)
@@ -153,6 +154,7 @@ If a user asks you to:
 | "add a new provider" | Implement `WorkloadProvider` in `src/providers/<name>.rs`, register it in `src/workloads/registry.rs::register_builtins()`. |
 | "add a lab fixture" | Create a dir with a `.fixture.json` manifest (`name` required; `satisfies`, `verify_command`, `required_files` optional), then `darkmux lab register <path>`. A workload binds to it via `requires_fixture: "<name>@<version>"`. Built-ins live under `templates/builtin/lab-fixtures/` and register via `scripts/lab-init.sh`. |
 | "check fixtures are healthy" | `darkmux lab doctor` — offline check that registered paths exist, manifests load, required files are present, and content hashes haven't drifted. |
+| "emit an OpenClaw agent scaffold" | `integrations/openclaw/oc-scaffold.sh list` / `... template <role>` — standalone script (needs `jq`, NOT a CLI verb; #538). Emits a paste-ready `agents.list[]` snippet from `integrations/openclaw/agent-scaffolds/*.json`. Add a new scaffold by dropping a JSON there (and appending to `EMBEDDED_ROLES` in `crates/darkmux-agent-roles` so `darkmux doctor` recognizes it). |
 | "run the smoke test" | `cargo install --path . && darkmux lab run quick-q`. Should complete in ~6-10s if a model is loaded. |
 | "list notebook entries" | `darkmux notebook list` (optionally `--machine <id>` to filter). Enumerates `.md` files, parses headers. |
 | "draft a notebook entry" | `darkmux notebook draft <run-id>` (optionally `--machine <id>` to override). |
