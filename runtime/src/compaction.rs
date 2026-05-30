@@ -43,13 +43,15 @@ use anyhow::{anyhow, Result};
 
 use crate::lmstudio::{ChatRequest, LmStudioClient, Message};
 
-/// Default threshold: when an incoming prompt's `prompt_tokens`
-/// crosses this, compact before the next chat() call. 60K leaves
-/// substantial headroom for the model's response generation when
-/// loaded at 101K (the `balanced` profile context). Override via
-/// `profile.runtime.compaction.threshold_tokens` (typed v0.1 field
-/// landed in #357) → host passes as `--compact-threshold-tokens N`.
-pub const DEFAULT_THRESHOLD_TOKENS: u32 = 60_000;
+/// Default ratio applied to a known `context_window` when the
+/// operator hasn't set an explicit `threshold_tokens` or
+/// `threshold_ratio`. Picks 50% so response headroom remains
+/// substantial across the full range of windows the runtime sees in
+/// practice (32K → 1M+). Replaces the pre-#482 behavior where the
+/// absolute 60K fallback fired at a wildly different utilization
+/// percentage depending on the window — broken at 32K, pathological
+/// at 1M.
+pub const DEFAULT_THRESHOLD_RATIO: f32 = 0.5;
 
 /// Default compactor model — the bake-off-hired admin agent
 /// (Beat 21: "the dependable admin agent"). Same model openclaw uses
@@ -163,9 +165,13 @@ pub struct CompactionConfig {
 impl CompactionConfig {
     /// Resolve a CompactionConfig from optional explicit overrides.
     /// `None` for any field uses the corresponding default (or
-    /// disables the optional trigger). This is the host's choice
-    /// point — it reads the operator's profile and passes `Some(v)`
-    /// when set, `None` when not.
+    /// disables the optional trigger). Production callers
+    /// (`runtime/src/main.rs`) construct via
+    /// `from_overrides_with_bail_and_custom` directly so they can
+    /// thread the (#377) bail bound and (#383) custom instructions;
+    /// this shorter form is kept for test ergonomics where those
+    /// extra fields aren't relevant.
+    #[cfg(test)]
     pub fn from_overrides(
         threshold_tokens: Option<u32>,
         compactor_model: Option<String>,
@@ -173,37 +179,37 @@ impl CompactionConfig {
         context_window: Option<u32>,
         strategy: Option<CompactionStrategy>,
     ) -> Self {
-        Self::from_overrides_with_bail(
-            threshold_tokens,
-            compactor_model,
-            threshold_ratio,
-            context_window,
-            strategy,
-            None,
-        )
-    }
-
-    /// Same as `from_overrides` plus the (#377) escalation bound.
-    /// New call sites that thread the operator's
-    /// `bail_after_compactions` setting use this; existing tests
-    /// keep the 5-arg signature via the back-compat delegate above.
-    pub fn from_overrides_with_bail(
-        threshold_tokens: Option<u32>,
-        compactor_model: Option<String>,
-        threshold_ratio: Option<f32>,
-        context_window: Option<u32>,
-        strategy: Option<CompactionStrategy>,
-        bail_after_compactions: Option<u32>,
-    ) -> Self {
         Self::from_overrides_with_bail_and_custom(
             threshold_tokens,
             compactor_model,
             threshold_ratio,
             context_window,
             strategy,
-            bail_after_compactions,
+            None,
             None,
         )
+    }
+
+    /// Construct a config that disables compaction by configuration —
+    /// `threshold_tokens: u32::MAX`, no formula trigger, no
+    /// `context_window`. `needs_compaction` always returns false.
+    /// Test-scoped today: replaces the pre-#482 `Default::default()`
+    /// for tests that want "any config; compaction isn't the point of
+    /// this test." Lift the `#[cfg(test)]` gate if a production
+    /// caller ever needs to disable compaction by explicit
+    /// declaration; until then, keeping it test-scoped avoids a
+    /// public API for a "we picked u32::MAX" semantic.
+    #[cfg(test)]
+    pub fn never_compact() -> Self {
+        Self {
+            threshold_tokens: u32::MAX,
+            compactor_model: DEFAULT_COMPACTOR_MODEL.to_string(),
+            threshold_ratio: None,
+            context_window: None,
+            strategy: CompactionStrategy::Narrative,
+            bail_after_compactions: None,
+            custom_instructions: None,
+        }
     }
 
     /// Full override constructor with custom_instructions. All fields
@@ -218,10 +224,42 @@ impl CompactionConfig {
         bail_after_compactions: Option<u32>,
         custom_instructions: Option<String>,
     ) -> Self {
+        // (#482) Resolve the absolute threshold. Precedence:
+        //   1. Explicit `threshold_tokens` from the operator — sovereign.
+        //   2. Explicit `threshold_ratio` + known `context_window` →
+        //      formula value (keeps absolute in sync with formula so
+        //      `needs_compaction`'s "either fires first" semantic
+        //      is unchanged).
+        //   3. Window known but neither explicit threshold set → apply
+        //      `DEFAULT_THRESHOLD_RATIO` against the window — the
+        //      standard host path post-#482; scales with the loaded
+        //      model instead of hardcoding a value regardless of
+        //      envelope.
+        //   4. Nothing known → panic. There is no principled default
+        //      for "compact at N tokens" when N is uncorrelated with
+        //      the model's actual envelope. The CLI-level
+        //      `validate_compaction_cli_inputs` is the public contract
+        //      that rejects this combination at startup; the panic
+        //      here is defense-in-depth for direct callers that
+        //      bypass the validator.
+        let resolved_threshold_tokens = match (threshold_tokens, threshold_ratio, context_window) {
+            (Some(t), _, _) => t,
+            (None, Some(r), Some(w)) => ((w as f32) * r).floor() as u32,
+            (None, None, Some(w)) => ((w as f32) * DEFAULT_THRESHOLD_RATIO).floor() as u32,
+            // `context_window` is None AND no explicit absolute — covers both
+            // (None, None, None) and (None, Some(_), None). The latter is also
+            // a misuse: ratio with no window can't fire the formula trigger
+            // either, so the runtime is left with no path to compact.
+            (None, _, None) => panic!(
+                "CompactionConfig::from_overrides_with_bail_and_custom: no principled default \
+                 — context_window is None AND no explicit threshold_tokens was supplied. \
+                 Call `validate_compaction_cli_inputs` first, or supply an explicit threshold \
+                 or context_window (#482)."
+            ),
+        };
         Self {
-            threshold_tokens: threshold_tokens.unwrap_or(DEFAULT_THRESHOLD_TOKENS),
-            compactor_model: compactor_model
-                .unwrap_or_else(|| DEFAULT_COMPACTOR_MODEL.to_string()),
+            threshold_tokens: resolved_threshold_tokens,
+            compactor_model: compactor_model.unwrap_or_else(|| DEFAULT_COMPACTOR_MODEL.to_string()),
             threshold_ratio,
             context_window,
             strategy: strategy.unwrap_or_default(),
@@ -246,10 +284,78 @@ impl CompactionConfig {
     }
 }
 
-impl Default for CompactionConfig {
-    fn default() -> Self {
-        Self::from_overrides(None, None, None, None, None)
+/// (#482) CLI-input validation called from the runtime's `run`
+/// entrypoint before constructing a `CompactionConfig`. The contract:
+/// the runtime needs ONE of
+///   - `--context-window N` (loaded model's `n_ctx`; the host derives
+///     this from the active profile's primary model), or
+///   - `--compact-threshold-tokens N` (operator's explicit absolute
+///     trigger).
+///
+/// Without at least one, there's no principled basis for a default —
+/// pre-#482 the runtime silently fell through to a hardcoded 60K,
+/// which broke on small models (never fires under a 32K window) and
+/// was pathological on large ones (fires at 6% of a 1M window).
+/// Loud-fail here surfaces the misconfiguration at startup rather than
+/// silently mistuning every compaction decision downstream.
+///
+/// On the standard host path (`darkmux crew dispatch`,
+/// `darkmux lab run`) the host always supplies `--context-window` from
+/// the primary model's `n_ctx`, so this check never fires. It catches
+/// the runtime being invoked without the host (direct `docker run`,
+/// non-darkmux harness) or against a profile that's missing a Primary
+/// model.
+///
+/// Additionally rejects `--compact-threshold-ratio` without
+/// `--context-window`: the formula trigger requires both, and the
+/// operator-supplied ratio is meaningless on its own. Catching it
+/// here gives a targeted operator-actionable message; the constructor
+/// would otherwise panic on the same combination with a less helpful
+/// stack-traced abort.
+///
+/// Returns `Err(msg)` with an operator-actionable message when the
+/// contract is violated; `Ok(())` otherwise.
+pub fn validate_compaction_cli_inputs(
+    threshold_tokens: Option<u32>,
+    threshold_ratio: Option<f32>,
+    context_window: Option<u32>,
+) -> std::result::Result<(), String> {
+    // Ratio supplied without a window — the formula trigger needs both,
+    // and there's no principled fallback for "ratio-of-unknown".
+    // Checked first because the (None, Some(_), None) case would
+    // otherwise also fail the broader check below with a less
+    // targeted message.
+    if threshold_tokens.is_none() && threshold_ratio.is_some() && context_window.is_none() {
+        return Err(
+            "--compact-threshold-ratio was supplied without --context-window. The \
+             formula trigger needs both (ratio * window = the prompt-token level \
+             at which compaction fires). Either:\n  \
+             - add --context-window N (loaded model's n_ctx), or\n  \
+             - drop the ratio and use --compact-threshold-tokens N for an \
+             absolute trigger.\n\n\
+             If you reached this via `darkmux crew dispatch` or `darkmux lab \
+             run`, the host should be supplying --context-window — check that \
+             the active profile has a Primary model with `n_ctx` set. See #482."
+                .to_string(),
+        );
     }
+    if threshold_tokens.is_none() && context_window.is_none() {
+        return Err(
+            "cannot determine compaction threshold — neither --context-window \
+             nor --compact-threshold-tokens was supplied. The runtime requires \
+             one of:\n  \
+             - --context-window N (loaded model's n_ctx; the standard host \
+             path derives this from the active profile's primary model)\n  \
+             - --compact-threshold-tokens N (operator's explicit absolute \
+             trigger)\n\n\
+             If you reached this via `darkmux crew dispatch` or `darkmux lab \
+             run`, the host should be supplying --context-window — check that \
+             the active profile has a Primary model with `n_ctx` set. See \
+             #482."
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Decide whether the conversation needs compaction before the next
@@ -412,7 +518,8 @@ pub fn structured_compact(
     let middle_messages: Vec<Message> = messages[middle_start..middle_end].to_vec();
     let middle_rendered = render_messages_as_excerpt(&middle_messages);
 
-    let request = build_structured_compaction_request(cfg, generation, middle_count, &middle_rendered);
+    let request =
+        build_structured_compaction_request(cfg, generation, middle_count, &middle_rendered);
 
     eprintln!(
         "darkmux-runtime: tier-2 compaction #{generation} — \
@@ -520,8 +627,11 @@ fn build_structured_compaction_request(
     let compactor_system = Message::system(structured_compactor_system_prompt_with_custom(
         cfg.custom_instructions.as_deref(),
     ));
-    let compactor_user =
-        Message::user(build_compactor_user_message(generation, middle_count, middle_rendered));
+    let compactor_user = Message::user(build_compactor_user_message(
+        generation,
+        middle_count,
+        middle_rendered,
+    ));
 
     ChatRequest {
         model: cfg.compactor_model.clone(),
@@ -631,9 +741,7 @@ fn structured_compactor_system_prompt() -> &'static str {
 /// instructions appended. When `custom_instructions` is `Some`,
 /// appends the operator's text after a section header. When `None`,
 /// returns the base prompt unchanged (V0 baseline).
-pub fn structured_compactor_system_prompt_with_custom(
-    custom_instructions: Option<&str>,
-) -> String {
+pub fn structured_compactor_system_prompt_with_custom(custom_instructions: Option<&str>) -> String {
     let mut prompt = structured_compactor_system_prompt().to_string();
     if let Some(custom) = custom_instructions {
         prompt.push_str("\n\nOperator guidance for slot population:\n");
@@ -679,8 +787,8 @@ fn call_and_parse(
     let content = extract_compactor_content(message)?;
 
     // Layer 1: lexical repair via the generic json_repair module.
-    let (value, repaired) =
-        crate::json_repair::parse_with_repair::<serde_json::Value>(&content).map_err(|e| {
+    let (value, repaired) = crate::json_repair::parse_with_repair::<serde_json::Value>(&content)
+        .map_err(|e| {
             anyhow!("parsing compactor JSON failed (even after repair): {e} — content: {content}")
         })?;
     if repaired {
@@ -739,9 +847,7 @@ fn call_and_parse(
 /// generic helper to request-side context. The `truncation_patched`
 /// flag is the load-bearing signal for downstream consumers anyway;
 /// the spurious `generation: 0` on the rare path is acceptable noise.
-fn patch_missing_required_fields(
-    mut value: serde_json::Value,
-) -> (serde_json::Value, bool) {
+fn patch_missing_required_fields(mut value: serde_json::Value) -> (serde_json::Value, bool) {
     let mut was_patched = false;
 
     let Some(obj) = value.as_object_mut() else {
@@ -761,10 +867,7 @@ fn patch_missing_required_fields(
     }
 
     if !obj.contains_key("current_truth") {
-        obj.insert(
-            "current_truth".to_string(),
-            serde_json::json!({}),
-        );
+        obj.insert("current_truth".to_string(), serde_json::json!({}));
         was_patched = true;
     }
 
@@ -782,8 +885,14 @@ fn patch_missing_required_fields(
 
     // Flag the metadata so downstream consumers see the marker.
     if was_patched {
-        if let Some(meta) = obj.get_mut("compaction_metadata").and_then(|v| v.as_object_mut()) {
-            meta.insert("truncation_patched".to_string(), serde_json::Value::Bool(true));
+        if let Some(meta) = obj
+            .get_mut("compaction_metadata")
+            .and_then(|v| v.as_object_mut())
+        {
+            meta.insert(
+                "truncation_patched".to_string(),
+                serde_json::Value::Bool(true),
+            );
         }
     }
 
@@ -1193,7 +1302,7 @@ mod tests {
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
         let mut messages = dummy_messages_long_enough_to_compact();
         let original_len = messages.len();
-        let cfg = CompactionConfig::default();
+        let cfg = CompactionConfig::never_compact();
 
         let out = structured_compact(&client, &mut messages, 7, &cfg, None)
             .expect("happy path returns parsed output");
@@ -1212,7 +1321,10 @@ mod tests {
         // The synthetic message is at PRESERVE_HEAD position and is
         // SYSTEM-role (per #354 Q3 attention-bias rationale).
         assert_eq!(messages[PRESERVE_HEAD].role, "system");
-        let content = messages[PRESERVE_HEAD].content.as_ref().expect("content set");
+        let content = messages[PRESERVE_HEAD]
+            .content
+            .as_ref()
+            .expect("content set");
         assert!(content.contains("Working memory state"));
         assert!(content.contains("audit refresh-token"));
     }
@@ -1247,7 +1359,7 @@ mod tests {
 
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
         let mut messages = dummy_messages_long_enough_to_compact();
-        let cfg = CompactionConfig::default();
+        let cfg = CompactionConfig::never_compact();
 
         let result = structured_compact(&client, &mut messages, 1, &cfg, None);
         assert!(result.is_err(), "both attempts return malformed → bail");
@@ -1261,15 +1373,14 @@ mod tests {
         let server = MockServer::start();
         let _mock = server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions");
-            then.status(200).json_body(chat_response_with_json_content(
-                "not even close to JSON",
-            ));
+            then.status(200)
+                .json_body(chat_response_with_json_content("not even close to JSON"));
         });
 
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
         let mut messages = dummy_messages_long_enough_to_compact();
         let original_len = messages.len();
-        let cfg = CompactionConfig::default();
+        let cfg = CompactionConfig::never_compact();
 
         let result = structured_compact(&client, &mut messages, 1, &cfg, None);
         assert!(result.is_err());
@@ -1290,7 +1401,11 @@ mod tests {
         m
     }
 
-    fn output_for_cap_tests(objective: &str, active_files: Option<&str>, decisions: Option<&str>) -> StructuredCompactionOutput {
+    fn output_for_cap_tests(
+        objective: &str,
+        active_files: Option<&str>,
+        decisions: Option<&str>,
+    ) -> StructuredCompactionOutput {
         StructuredCompactionOutput {
             objective: objective.to_string(),
             current_truth: CurrentTruth {
@@ -1302,12 +1417,12 @@ mod tests {
                 schema_version: "0.1".into(),
                 generation: 1,
                 source_message_count: 5,
-            truncation_patched: None,
-            turns_used: None,
-            max_turns: None,
-            cumulative_completion_tokens_used: None,
-            max_cumulative_completion_tokens: None,
-            max_tokens_per_call: None,
+                truncation_patched: None,
+                turns_used: None,
+                max_turns: None,
+                cumulative_completion_tokens_used: None,
+                max_cumulative_completion_tokens: None,
+                max_tokens_per_call: None,
             },
             completed_decisions: decisions.map(str::to_string),
             errors_to_preserve: None,
@@ -1333,7 +1448,10 @@ mod tests {
     fn apply_caps_leaves_under_cap_strings_alone() {
         let mut out = output_for_cap_tests("short", None, None);
         apply_slot_caps(&mut out, &test_caps());
-        assert_eq!(out.objective, "short", "under-cap content must not be modified");
+        assert_eq!(
+            out.objective, "short",
+            "under-cap content must not be modified"
+        );
     }
 
     #[test]
@@ -1369,7 +1487,10 @@ mod tests {
             None,
         );
         apply_slot_caps(&mut out, &caps);
-        assert_eq!(out.objective, "long-objective-no-cap-defined", "no cap → no truncate");
+        assert_eq!(
+            out.objective, "long-objective-no-cap-defined",
+            "no cap → no truncate"
+        );
         assert_eq!(out.current_truth.active_files.as_ref().unwrap().len(), 5);
     }
 
@@ -1389,8 +1510,14 @@ mod tests {
     fn render_markdown_emits_objective_section() {
         let out = output_for_cap_tests("fix the bug in foo.py", None, None);
         let md = render_structured_output_as_markdown(&out, 5);
-        assert!(md.contains("**Objective:**"), "objective section header missing");
-        assert!(md.contains("fix the bug in foo.py"), "objective body missing");
+        assert!(
+            md.contains("**Objective:**"),
+            "objective section header missing"
+        );
+        assert!(
+            md.contains("fix the bug in foo.py"),
+            "objective body missing"
+        );
     }
 
     #[test]
@@ -1406,12 +1533,12 @@ mod tests {
                 schema_version: "0.1".into(),
                 generation: 1,
                 source_message_count: 5,
-            truncation_patched: None,
-            turns_used: None,
-            max_turns: None,
-            cumulative_completion_tokens_used: None,
-            max_cumulative_completion_tokens: None,
-            max_tokens_per_call: None,
+                truncation_patched: None,
+                turns_used: None,
+                max_turns: None,
+                cumulative_completion_tokens_used: None,
+                max_cumulative_completion_tokens: None,
+                max_tokens_per_call: None,
             },
             completed_decisions: None,
             errors_to_preserve: None,
@@ -1420,7 +1547,10 @@ mod tests {
             sprint_id: None,
         };
         let md = render_structured_output_as_markdown(&out, 5);
-        assert!(md.contains("Current truth — active files"), "active_files subsection missing");
+        assert!(
+            md.contains("Current truth — active files"),
+            "active_files subsection missing"
+        );
         assert!(md.contains("file.py:32"), "active_files content missing");
         assert!(md.contains("Current truth — test outcomes"));
         assert!(md.contains("3 of 5 failed"));
@@ -1434,7 +1564,10 @@ mod tests {
     fn render_markdown_skips_unset_optional_top_level_sections() {
         let out = output_for_cap_tests("obj only", None, None);
         let md = render_structured_output_as_markdown(&out, 1);
-        assert!(!md.contains("Completed decisions"), "unset section must be omitted");
+        assert!(
+            !md.contains("Completed decisions"),
+            "unset section must be omitted"
+        );
         assert!(!md.contains("Errors to preserve"));
         assert!(!md.contains("Next concrete actions"));
         assert!(!md.contains("Verify criteria"));
@@ -1449,12 +1582,12 @@ mod tests {
                 schema_version: "0.1".into(),
                 generation: 1,
                 source_message_count: 5,
-            truncation_patched: None,
-            turns_used: None,
-            max_turns: None,
-            cumulative_completion_tokens_used: None,
-            max_cumulative_completion_tokens: None,
-            max_tokens_per_call: None,
+                truncation_patched: None,
+                turns_used: None,
+                max_turns: None,
+                cumulative_completion_tokens_used: None,
+                max_cumulative_completion_tokens: None,
+                max_tokens_per_call: None,
             },
             completed_decisions: Some("decided X".into()),
             errors_to_preserve: Some("don't retry Y".into()),
@@ -1520,7 +1653,10 @@ mod tests {
             out.current_truth.active_files.as_deref(),
             Some("refreshTokenService.test.ts — 5 failures")
         );
-        assert_eq!(out.completed_decisions.as_deref(), Some("Decided to fix mock isolation"));
+        assert_eq!(
+            out.completed_decisions.as_deref(),
+            Some("Decided to fix mock isolation")
+        );
         assert_eq!(out.sprint_id.as_deref(), Some("sprint-42"));
     }
 
@@ -1545,7 +1681,10 @@ mod tests {
             "current_truth": {}
         }"#;
         let result: Result<StructuredCompactionOutput, _> = serde_json::from_str(json);
-        assert!(result.is_err(), "missing required `compaction_metadata` must error");
+        assert!(
+            result.is_err(),
+            "missing required `compaction_metadata` must error"
+        );
     }
 
     #[test]
@@ -1583,12 +1722,12 @@ mod tests {
                 schema_version: "0.1".into(),
                 generation: 1,
                 source_message_count: 10,
-            truncation_patched: None,
-            turns_used: None,
-            max_turns: None,
-            cumulative_completion_tokens_used: None,
-            max_cumulative_completion_tokens: None,
-            max_tokens_per_call: None,
+                truncation_patched: None,
+                turns_used: None,
+                max_turns: None,
+                cumulative_completion_tokens_used: None,
+                max_cumulative_completion_tokens: None,
+                max_tokens_per_call: None,
             },
             completed_decisions: None,
             errors_to_preserve: None,
@@ -1599,21 +1738,17 @@ mod tests {
         let json = serde_json::to_string(&original).unwrap();
         let back: StructuredCompactionOutput = serde_json::from_str(&json).unwrap();
         assert_eq!(back.objective, original.objective);
-        assert_eq!(back.current_truth.active_files, original.current_truth.active_files);
-        assert_eq!(back.compaction_metadata.generation, original.compaction_metadata.generation);
+        assert_eq!(
+            back.current_truth.active_files,
+            original.current_truth.active_files
+        );
+        assert_eq!(
+            back.compaction_metadata.generation,
+            original.compaction_metadata.generation
+        );
     }
 
-    // ─── #368: explicit-param CompactionConfig (no env-var reads) ─
-
-    /// Defaults preserve pre-#368 behavior: 60K threshold + canonical
-    /// 4B compactor. Operator overrides arrive via host's profile
-    /// JSON → CLI flags, not env vars.
-    #[test]
-    fn default_cfg_matches_pre_368_defaults() {
-        let cfg = CompactionConfig::default();
-        assert_eq!(cfg.threshold_tokens, DEFAULT_THRESHOLD_TOKENS);
-        assert_eq!(cfg.compactor_model, DEFAULT_COMPACTOR_MODEL);
-    }
+    // ─── #482: explicit-param CompactionConfig (post-#482 contract) ─
 
     #[test]
     fn from_overrides_threshold_only_uses_default_model() {
@@ -1624,17 +1759,21 @@ mod tests {
         assert!(cfg.context_window.is_none());
     }
 
+    /// (#482) Replaces the pre-#482 silent-fallback test. With no
+    /// threshold and no window the constructor panics — there is no
+    /// principled default. `validate_compaction_cli_inputs` rejects
+    /// the same combination at CLI parse time; this guards the
+    /// constructor itself for any caller that bypasses the validator.
     #[test]
-    fn from_overrides_model_only_uses_default_threshold() {
-        let cfg = CompactionConfig::from_overrides(
+    #[should_panic(expected = "no principled default")]
+    fn from_overrides_panics_when_no_threshold_and_no_window() {
+        let _ = CompactionConfig::from_overrides(
             None,
             Some("custom-compactor".to_string()),
             None,
             None,
             None,
         );
-        assert_eq!(cfg.threshold_tokens, DEFAULT_THRESHOLD_TOKENS);
-        assert_eq!(cfg.compactor_model, "custom-compactor");
     }
 
     #[test]
@@ -1654,7 +1793,9 @@ mod tests {
 
     #[test]
     fn needs_compaction_requires_both_size_and_length() {
-        let cfg = CompactionConfig::default();
+        // Test threshold picked to make the boundary intent obvious;
+        // not a system default.
+        let cfg = CompactionConfig::from_overrides(Some(60_000), None, None, None, None);
         // Tokens below threshold → no compaction even with many messages
         assert!(!needs_compaction(1000, 100, &cfg));
         // Tokens above threshold but conversation too short
@@ -1665,14 +1806,15 @@ mod tests {
 
     #[test]
     fn needs_compaction_boundary() {
-        let cfg = CompactionConfig::default();
+        const TEST_THRESHOLD: u32 = 60_000;
+        let cfg = CompactionConfig::from_overrides(Some(TEST_THRESHOLD), None, None, None, None);
         // Exactly at threshold + minimum length
         let min_len = PRESERVE_HEAD + 1 + PRESERVE_TAIL;
-        assert!(needs_compaction(DEFAULT_THRESHOLD_TOKENS, min_len, &cfg));
+        assert!(needs_compaction(TEST_THRESHOLD, min_len, &cfg));
         // One below threshold
-        assert!(!needs_compaction(DEFAULT_THRESHOLD_TOKENS - 1, min_len, &cfg));
+        assert!(!needs_compaction(TEST_THRESHOLD - 1, min_len, &cfg));
         // Length-1 below
-        assert!(!needs_compaction(DEFAULT_THRESHOLD_TOKENS, min_len - 1, &cfg));
+        assert!(!needs_compaction(TEST_THRESHOLD, min_len - 1, &cfg));
     }
 
     #[test]
@@ -1705,7 +1847,11 @@ mod tests {
 
     #[test]
     fn formula_trigger_disabled_when_either_input_missing() {
-        let cfg = CompactionConfig::from_overrides(None, None, Some(0.35), None, None);
+        // Supply an explicit threshold_tokens so the constructor
+        // doesn't trip the no-window panic; the test's intent is to
+        // verify formula_trigger_tokens()'s gating, independent of
+        // the absolute trigger.
+        let cfg = CompactionConfig::from_overrides(Some(60_000), None, Some(0.35), None, None);
         assert!(cfg.formula_trigger_tokens().is_none(), "missing window");
 
         let cfg = CompactionConfig::from_overrides(None, None, None, Some(101_000), None);
@@ -1737,6 +1883,130 @@ mod tests {
         assert!(needs_compaction(36_000, min_len, &cfg));
         // 34K below formula trigger AND below absolute → does NOT fire.
         assert!(!needs_compaction(34_000, min_len, &cfg));
+    }
+
+    // ─── #482: ratio-of-context default when only the window is known ─
+
+    /// When the host passes only `context_window` (the common case —
+    /// `darkmux swap` always derives `n_ctx` from the profile's primary
+    /// model) and the operator hasn't set an explicit
+    /// `threshold_tokens` or `threshold_ratio`, the runtime should pick
+    /// a default in proportion to the loaded window — not the
+    /// pre-#482 hardcoded 60K. 50% leaves comparable response
+    /// headroom across 32K / 64K / 101K / 262K / 1M windows.
+    #[test]
+    fn threshold_defaults_to_ratio_of_context_when_only_window_supplied() {
+        // 32K window → 50% = 16K (60K would never fire — broken).
+        let cfg = CompactionConfig::from_overrides(None, None, None, Some(32_000), None);
+        assert_eq!(cfg.threshold_tokens, 16_000);
+        // 101K window (current bake-off hire) → 50% = 50_500.
+        let cfg = CompactionConfig::from_overrides(None, None, None, Some(101_000), None);
+        assert_eq!(cfg.threshold_tokens, 50_500);
+        // 262144 window (deep profile primary) → 50% = 131_072.
+        let cfg = CompactionConfig::from_overrides(None, None, None, Some(262_144), None);
+        assert_eq!(cfg.threshold_tokens, 131_072);
+    }
+
+    /// Explicit `threshold_tokens` still wins — operator's absolute
+    /// override is sovereign and shouldn't be ratio-substituted just
+    /// because the window happens to be known.
+    #[test]
+    fn explicit_threshold_tokens_overrides_ratio_default() {
+        let cfg = CompactionConfig::from_overrides(Some(45_000), None, None, Some(262_144), None);
+        assert_eq!(cfg.threshold_tokens, 45_000);
+    }
+
+    /// When `threshold_ratio` IS supplied (with window), the resolved
+    /// absolute matches the formula — they never disagree by default.
+    /// The "either trigger fires first" semantic is preserved because
+    /// both triggers compute to the same value.
+    #[test]
+    fn explicit_ratio_resolves_absolute_to_match() {
+        let cfg = CompactionConfig::from_overrides(None, None, Some(0.35), Some(100_000), None);
+        // 100_000 * 0.35 = 35_000 — same value used by formula_trigger_tokens().
+        assert_eq!(cfg.threshold_tokens, 35_000);
+        assert_eq!(cfg.formula_trigger_tokens(), Some(35_000));
+    }
+
+    /// (#482) The all-None construction path panics — there's no
+    /// principled default for "compact at N tokens" when N is
+    /// uncorrelated with any loaded model. CLI-level
+    /// `validate_compaction_cli_inputs` rejects this combination
+    /// before construction; the panic catches direct callers that
+    /// bypass the validator. Replaces the pre-#482 silent fallback.
+    #[test]
+    #[should_panic(expected = "no principled default")]
+    fn no_window_no_overrides_panics() {
+        let _ = CompactionConfig::from_overrides(None, None, None, None, None);
+    }
+
+    // ─── #482: CLI-input validation (loud-fail when no window known) ─
+
+    #[test]
+    fn validate_rejects_when_both_inputs_missing() {
+        let err = validate_compaction_cli_inputs(None, None, None).unwrap_err();
+        // Operator-actionable: names both flags + suggests the host fix.
+        assert!(
+            err.contains("--context-window"),
+            "msg names the flag: {err}"
+        );
+        assert!(
+            err.contains("--compact-threshold-tokens"),
+            "msg names the other flag: {err}"
+        );
+        assert!(err.contains("#482"), "msg references the issue: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_ratio_without_window() {
+        // Operator passed --compact-threshold-ratio but forgot
+        // --context-window — the formula trigger needs both. The
+        // validator catches it CLI-side with a targeted message
+        // rather than letting it slide to the constructor panic
+        // (which would produce a less helpful stack-traced abort).
+        let err = validate_compaction_cli_inputs(None, Some(0.35), None).unwrap_err();
+        assert!(
+            err.contains("--compact-threshold-ratio"),
+            "msg names the offending flag: {err}"
+        );
+        assert!(
+            err.contains("--context-window"),
+            "msg names the missing flag: {err}"
+        );
+        assert!(
+            err.contains("formula trigger"),
+            "msg explains the contract: {err}"
+        );
+        assert!(err.contains("#482"), "msg references the issue: {err}");
+    }
+
+    #[test]
+    fn validate_accepts_when_only_context_window_supplied() {
+        // Standard host path: profile's primary n_ctx becomes
+        // --context-window N; the runtime derives the threshold via
+        // the ratio default. This is the post-#482 production path.
+        assert!(validate_compaction_cli_inputs(None, None, Some(101_000)).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_when_only_threshold_tokens_supplied() {
+        // Operator-explicit absolute: window is irrelevant — the
+        // explicit absolute is sovereign.
+        assert!(validate_compaction_cli_inputs(Some(60_000), None, None).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_when_both_inputs_supplied() {
+        // Either alone is enough; both together is also fine.
+        assert!(validate_compaction_cli_inputs(Some(60_000), None, Some(101_000)).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_ratio_with_window() {
+        // The valid formula-trigger configuration: ratio + window both
+        // supplied. The constructor will derive the absolute threshold
+        // from ratio*window.
+        assert!(validate_compaction_cli_inputs(None, Some(0.35), Some(101_000)).is_ok());
     }
 
     #[test]
@@ -1777,10 +2047,7 @@ mod tests {
 
     #[test]
     fn render_excerpt_preserves_role_and_content() {
-        let msgs = vec![
-            Message::user("hello"),
-            Message::system("system-text"),
-        ];
+        let msgs = vec![Message::user("hello"), Message::system("system-text")];
         let out = render_messages_as_excerpt(&msgs);
         assert!(out.contains("[user]: hello"));
         assert!(out.contains("[system]: system-text"));
@@ -1968,8 +2235,7 @@ mod tests {
     #[test]
     fn response_format_schema_v0_matches_fixture() {
         let actual = structured_output_response_format_schema();
-        let expected_str =
-            include_str!("../tests/fixtures/compactor_response_format_v0.json");
+        let expected_str = include_str!("../tests/fixtures/compactor_response_format_v0.json");
         let expected: serde_json::Value =
             serde_json::from_str(expected_str).expect("fixture parses as JSON");
         assert_eq!(
@@ -1990,7 +2256,7 @@ mod tests {
     #[test]
     fn request_hyperparameters_v0_pinned() {
         let cfg = CompactionConfig {
-            threshold_tokens: DEFAULT_THRESHOLD_TOKENS,
+            threshold_tokens: 60_000,
             compactor_model: DEFAULT_COMPACTOR_MODEL.to_string(),
             threshold_ratio: None,
             context_window: None,
@@ -2009,11 +2275,27 @@ mod tests {
         assert_eq!(req.temperature, 0.1, "temperature");
         assert_eq!(req.max_tokens, Some(4096), "max_tokens");
         assert!(req.tools.is_empty(), "compactor must not advertise tools");
-        assert!(req.tool_choice.is_none(), "compactor must not constrain tool_choice");
-        assert!(req.response_format.is_some(), "compactor must enforce json_schema response_format");
-        assert_eq!(req.messages.len(), 2, "compactor request must be system + user only");
-        assert_eq!(req.messages[0].role, "system", "first message is system prompt");
-        assert_eq!(req.messages[1].role, "user", "second message is user (excerpt)");
+        assert!(
+            req.tool_choice.is_none(),
+            "compactor must not constrain tool_choice"
+        );
+        assert!(
+            req.response_format.is_some(),
+            "compactor must enforce json_schema response_format"
+        );
+        assert_eq!(
+            req.messages.len(),
+            2,
+            "compactor request must be system + user only"
+        );
+        assert_eq!(
+            req.messages[0].role, "system",
+            "first message is system prompt"
+        );
+        assert_eq!(
+            req.messages[1].role, "user",
+            "second message is user (excerpt)"
+        );
     }
 
     /// (#383) When `custom_instructions` is None, the augmented
@@ -2036,7 +2318,8 @@ mod tests {
     /// `dump_snapshot_fixtures` helper as the V0 baseline.
     #[test]
     fn system_prompt_with_custom_v0_matches_fixture() {
-        let actual = structured_compactor_system_prompt_with_custom(Some(FIXTURE_CUSTOM_INSTRUCTIONS));
+        let actual =
+            structured_compactor_system_prompt_with_custom(Some(FIXTURE_CUSTOM_INSTRUCTIONS));
         let expected = include_str!("../tests/fixtures/compactor_system_with_custom_v0.txt");
         assert_eq!(
             actual, expected,
@@ -2077,7 +2360,7 @@ mod tests {
         let mut messages = dummy_messages_long_enough_to_compact();
         let cfg = CompactionConfig {
             custom_instructions: Some("operator-test-guidance-string-7c4a".to_string()),
-            ..CompactionConfig::default()
+            ..CompactionConfig::never_compact()
         };
 
         let _out = structured_compact(&client, &mut messages, 9, &cfg, None)
@@ -2100,7 +2383,10 @@ mod tests {
             }
         });
         let (out, was_patched) = patch_missing_required_fields(complete.clone());
-        assert!(!was_patched, "complete payload must not be flagged as patched");
+        assert!(
+            !was_patched,
+            "complete payload must not be flagged as patched"
+        );
         assert_eq!(out, complete);
     }
 
@@ -2120,7 +2406,10 @@ mod tests {
         assert!(was_patched);
         let obj = out.as_object().unwrap();
         let objective = obj.get("objective").unwrap().as_str().unwrap();
-        assert!(objective.contains("truncated"), "sentinel must name the truncation");
+        assert!(
+            objective.contains("truncated"),
+            "sentinel must name the truncation"
+        );
         // Patched flag landed on metadata
         let meta = obj.get("compaction_metadata").unwrap();
         assert_eq!(meta["truncation_patched"], true);
@@ -2180,9 +2469,12 @@ mod tests {
         assert!(!obj.contains_key("completed_decisions"));
         assert!(!obj.contains_key("errors_to_preserve"));
         assert!(!obj.contains_key("next_concrete_actions"));
-        assert!(obj.get("compaction_metadata")
-            .and_then(|m| m.get("truncation_patched")).is_none(),
-            "unpatched compaction must not carry the truncation_patched flag");
+        assert!(
+            obj.get("compaction_metadata")
+                .and_then(|m| m.get("truncation_patched"))
+                .is_none(),
+            "unpatched compaction must not carry the truncation_patched flag"
+        );
     }
 
     #[test]
@@ -2213,7 +2505,10 @@ mod tests {
         let out: StructuredCompactionOutput = serde_json::from_value(patched)
             .expect("patched payload must deserialize into StructuredCompactionOutput");
         assert!(out.objective.contains("truncated"));
-        assert_eq!(out.current_truth.active_files.as_deref(), Some("/x.ts:\n\nrefresh-token rotation"));
+        assert_eq!(
+            out.current_truth.active_files.as_deref(),
+            Some("/x.ts:\n\nrefresh-token rotation")
+        );
         assert_eq!(out.compaction_metadata.generation, 2);
         assert_eq!(out.compaction_metadata.truncation_patched, Some(true));
     }
@@ -2229,15 +2524,17 @@ mod tests {
             generation: 1,
             source_message_count: 6,
             truncation_patched: None,
-        turns_used: None,
-        max_turns: None,
-        cumulative_completion_tokens_used: None,
-        max_cumulative_completion_tokens: None,
-        max_tokens_per_call: None,
+            turns_used: None,
+            max_turns: None,
+            cumulative_completion_tokens_used: None,
+            max_cumulative_completion_tokens: None,
+            max_tokens_per_call: None,
         };
         let serialized = serde_json::to_value(&meta).unwrap();
-        assert!(serialized.get("truncation_patched").is_none(),
-            "clean metadata must not serialize the truncation_patched field");
+        assert!(
+            serialized.get("truncation_patched").is_none(),
+            "clean metadata must not serialize the truncation_patched field"
+        );
     }
 
     #[test]
@@ -2247,11 +2544,11 @@ mod tests {
             generation: 1,
             source_message_count: 6,
             truncation_patched: Some(true),
-        turns_used: None,
-        max_turns: None,
-        cumulative_completion_tokens_used: None,
-        max_cumulative_completion_tokens: None,
-        max_tokens_per_call: None,
+            turns_used: None,
+            max_turns: None,
+            cumulative_completion_tokens_used: None,
+            max_cumulative_completion_tokens: None,
+            max_tokens_per_call: None,
         };
         let serialized = serde_json::to_value(&meta).unwrap();
         assert_eq!(serialized["truncation_patched"], true);
@@ -2278,9 +2575,8 @@ mod tests {
             "../tests/fixtures/compactor-malformed/beat48-truncated-missing-objective.json"
         );
         // Layer 1: lexical repair (succeeds — JSON is balanceable).
-        let (value, _repaired) =
-            crate::json_repair::parse_with_repair::<serde_json::Value>(raw)
-                .expect("fixture must parse-with-repair into a Value");
+        let (value, _repaired) = crate::json_repair::parse_with_repair::<serde_json::Value>(raw)
+            .expect("fixture must parse-with-repair into a Value");
         // Raw value lacks `objective` — direct deserialize FAILS.
         assert!(
             serde_json::from_value::<StructuredCompactionOutput>(value.clone()).is_err(),
@@ -2289,8 +2585,8 @@ mod tests {
         // Layer 2: schema patch (inserts sentinel objective + flag).
         let (patched, was_patched) = patch_missing_required_fields(value);
         assert!(was_patched, "fixture must trip the patcher");
-        let out: StructuredCompactionOutput = serde_json::from_value(patched)
-            .expect("post-patch fixture must deserialize");
+        let out: StructuredCompactionOutput =
+            serde_json::from_value(patched).expect("post-patch fixture must deserialize");
         assert!(out.objective.contains("truncated"));
         assert_eq!(out.compaction_metadata.truncation_patched, Some(true));
     }
@@ -2340,7 +2636,9 @@ mod tests {
         let md = render_structured_output_as_markdown(&out, 6);
         assert!(md.contains("**Dispatch budget**"), "budget header present");
         assert!(md.contains("Turns: 35 of 100 used (65 remaining)"));
-        assert!(md.contains("Cumulative completion tokens: 16830 of 250000 used (233170 remaining)"));
+        assert!(
+            md.contains("Cumulative completion tokens: 16830 of 250000 used (233170 remaining)")
+        );
         assert!(md.contains("Per-call token cap: 10000"));
         assert!(md.contains("BLOCKED:"), "escalation hint surfaced");
     }
@@ -2381,8 +2679,14 @@ mod tests {
             max_tokens_per_call: None,
         });
         let md = render_structured_output_as_markdown(&out, 6);
-        assert!(!md.contains("**Dispatch budget**"), "no budget header when metadata is None");
-        assert!(md.contains("**Objective:** test objective"), "objective still renders");
+        assert!(
+            !md.contains("**Dispatch budget**"),
+            "no budget header when metadata is None"
+        );
+        assert!(
+            md.contains("**Objective:** test objective"),
+            "objective still renders"
+        );
     }
 
     #[test]
@@ -2417,7 +2721,10 @@ mod tests {
             "max_cumulative_completion_tokens",
             "max_tokens_per_call",
         ] {
-            assert!(s.get(field).is_none(), "field `{field}` must not serialize when None");
+            assert!(
+                s.get(field).is_none(),
+                "field `{field}` must not serialize when None"
+            );
         }
     }
 
