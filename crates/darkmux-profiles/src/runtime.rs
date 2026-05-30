@@ -15,11 +15,12 @@ use std::path::{Path, PathBuf};
 ///      installs (also makes the path injectable from tests)
 ///   3. Default `~/.openclaw/openclaw.json`
 ///
-/// Sprint-G will scope this to "only when openclaw is active in the
-/// operator's profile"; for now (Sprint-E) the env var indirection is
-/// removed but the fallback still resolves the canonical openclaw path.
-/// `apply_runtime` quiet-skips when the file doesn't exist, so machines
-/// without openclaw installed see no behavior change.
+/// The gate on whether to patch at all is openclaw-config-on-disk:
+/// `apply_runtime` quiet-skips when the resolved file doesn't exist, so
+/// machines without openclaw installed see no behavior change. There is no
+/// per-profile "runtime kind" to gate on — runtime is chosen per-dispatch
+/// via `--runtime`, so file presence is the signal, matching doctor's
+/// `openclaw_active()` check.
 ///
 /// Exposed for `doctor --fix`, which has no profile context but still
 /// needs to find the openclaw config to apply ctx-window fixes.
@@ -63,8 +64,9 @@ pub fn resolve_openclaw_config_path(explicit_path: Option<&str>) -> Option<PathB
 /// Path resolution falls back to `~/.openclaw/openclaw.json` when the
 /// profile has no `runtime.config_path`. When the resolved file is
 /// absent (no openclaw installed), `apply_runtime` returns `Ok(false)`
-/// quietly. Sprint-G will tighten the gate to "only when openclaw is
-/// the active runtime in the profile."
+/// quietly — openclaw-config-on-disk is the gate (matching doctor's
+/// `openclaw_active()`). There is no per-profile runtime kind to gate on;
+/// runtime is a per-dispatch choice (`--runtime`).
 ///
 /// Returns true if the file was modified.
 pub fn apply_runtime(profile: &Profile) -> Result<bool> {
