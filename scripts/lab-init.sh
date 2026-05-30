@@ -122,7 +122,13 @@ for fixture in "${fixtures_found[@]}"; do
     # `git pull` is idempotent — already-present built-ins are left
     # untouched (use --force to refresh them). `if cmd; then` also keeps
     # `set -e` from aborting on the non-zero rejection exit.
-    if out="$(darkmux lab register "${register_args[@]}" "$fixture_clean" 2>&1)"; then
+    #
+    # `${register_args[@]+"${register_args[@]}"}` is the bash-3.2-safe
+    # empty-array expansion: macOS ships bash 3.2, where a bare
+    # `"${arr[@]}"` on an EMPTY array trips `set -u`'s nounset (a bug
+    # fixed in bash 4.4). The `+`-guard expands to nothing when the
+    # array is unset/empty, so the no-`--force` path is portable.
+    if out="$(darkmux lab register ${register_args[@]+"${register_args[@]}"} "$fixture_clean" 2>&1)"; then
         printf '%s\n' "$out"
         ok=$((ok + 1))
     elif printf '%s' "$out" | grep -qi "already registered"; then
