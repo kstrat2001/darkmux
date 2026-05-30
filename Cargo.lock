@@ -332,7 +332,6 @@ dependencies = [
  "axum",
  "blake3",
  "clap",
- "darkmux-agent-roles",
  "darkmux-crew",
  "darkmux-doctor",
  "darkmux-eureka",

@@ -1935,7 +1935,7 @@ fn check_agent_role_definitions() -> Check {
     } else {
         let suggestions = missing_overrides
             .iter()
-            .map(|id| format!("`darkmux agent template {id}`"))
+            .map(|id| format!("`integrations/openclaw/oc-scaffold.sh template {id}`"))
             .collect::<Vec<_>>()
             .join(", ");
         Check {

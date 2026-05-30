@@ -7,13 +7,19 @@
 //! in PERFORMANCE.md and the article-2 lab notebook.
 //!
 //! The user owns their agent definitions. darkmux just ships opinionated
-//! starting points via `darkmux agent template <role>`. Output is a JSON
-//! snippet ready to paste into `agents.list[]` in openclaw.json.
+//! starting points. Operator-facing emission of the paste-ready
+//! `agents.list[]` snippet lives in the standalone script
+//! `integrations/openclaw/oc-scaffold.sh` (NOT a CLI verb — #538), so the
+//! engine doesn't compile openclaw-schema knowledge into its verb surface.
+//! This crate remains as the engine-side consumer: `darkmux doctor` uses
+//! `list_role_ids()` to flag openclaw agents that match a known scaffold
+//! role but lack a `systemPromptOverride`, and the tests below guard that
+//! the scaffold JSONs stay well-formed.
 //!
 //! Source-of-truth files live under `integrations/openclaw/agent-scaffolds/`
 //! (NOT `templates/builtin/`) to keep openclaw-integration scope visibly
 //! separate from the darkmux engine's own role/skill/workload
-//! libraries.
+//! libraries. The `oc-scaffold.sh` script reads that same directory.
 //!
 //! ## Why three roles only
 //!
@@ -27,8 +33,10 @@
 //! ## Adding a new scaffold
 //!
 //! 1. Add a JSON file under `integrations/openclaw/agent-scaffolds/<role>.json`
-//!    matching the `RoleTemplate` schema below.
-//! 2. Append it to `EMBEDDED_ROLES`.
+//!    matching the `RoleTemplate` schema below. `oc-scaffold.sh` picks it
+//!    up automatically (it globs that directory).
+//! 2. Append it to `EMBEDDED_ROLES` so `darkmux doctor`'s role-gap check
+//!    recognizes it too.
 //! 3. Tests + doctor check pick it up automatically.
 
 use anyhow::{Context, Result, bail};
@@ -92,20 +100,11 @@ pub fn load_role(id: &str) -> Result<RoleTemplate> {
     Ok(template)
 }
 
-/// Emit a JSON snippet for `agents.list[]` in the target runtime config.
-/// User pastes this into their openclaw.json (or equivalent) themselves —
-/// stdout-only, no auto-edit.
-pub fn snippet_for_agents_list(template: &RoleTemplate) -> serde_json::Value {
-    serde_json::json!({
-        "_notes": [
-            format!("Auto-drafted by `darkmux agent template {}` (runtime={}).", template.role, template.runtime),
-            format!("Pair with the `{}` profile for best fit. Adjust tools/skills to taste.", template.recommended_profile),
-        ],
-        "id": template.role,
-        "systemPromptOverride": template.override_text,
-        "tools": { "allow": template.recommended_tools },
-    })
-}
+// NOTE: the operator-facing `agents.list[]` snippet emitter moved to the
+// standalone `integrations/openclaw/oc-scaffold.sh` (#538). The snippet
+// shape (`id` / `systemPromptOverride` / `tools.allow` + `_notes`) is now
+// owned by that script's `jq` template so the engine carries no
+// openclaw-schema knowledge in its compiled surface.
 
 #[cfg(test)]
 mod tests {
@@ -141,22 +140,6 @@ mod tests {
         assert!(msg.contains("qa"));
         assert!(msg.contains("scribe"));
         assert!(msg.contains("engineer"));
-    }
-
-    #[test]
-    fn snippet_includes_id_override_and_tools() {
-        let t = load_role("qa").unwrap();
-        let snip = snippet_for_agents_list(&t);
-        let obj = snip.as_object().unwrap();
-        assert_eq!(obj.get("id").and_then(|v| v.as_str()), Some("qa"));
-        assert!(obj.get("systemPromptOverride").is_some());
-        // OpenClaw 2026.5+ schema: tools is an object whose `allow` field
-        // holds the recommended tool ids, not a bare array.
-        let tools = obj.get("tools").and_then(|v| v.as_object()).expect("tools must be an object");
-        let allow = tools.get("allow").and_then(|v| v.as_array()).expect("tools.allow must be an array");
-        assert!(!allow.is_empty(), "tools.allow must be non-empty");
-        // _notes is included for self-documentation
-        assert!(obj.get("_notes").is_some());
     }
 
     #[test]
