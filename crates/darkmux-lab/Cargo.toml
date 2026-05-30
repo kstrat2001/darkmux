@@ -20,6 +20,9 @@ serde_json = "1.0"
 dirs = "5.0"
 # BLAKE3 — content hashing for sandbox baseline/final hashes (#487).
 blake3 = "1.5"
+# libc: flock(2) for the cross-process registry read-modify-write lock
+# (#496), mirroring darkmux-flow's AuditFileSink pattern.
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3.10"

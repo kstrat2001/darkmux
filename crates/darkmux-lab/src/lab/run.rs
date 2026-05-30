@@ -123,30 +123,18 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
         // load-bearing isolation: subsequent runs get fresh sandboxes
         // and never observe prior runs' edits.
         //
-        // (#489) Phase 2 — compute baseline_hash of the source fixture
-        // BEFORE the COW clone (so the hash reflects exactly what the
-        // model started from, not any pre-run mutations a future hook
-        // might inject). Best-effort: skip silently for self-contained
-        // workloads (no source yet) — Phase 2's resolver-based path
-        // (Phase 3) always has a source.
+        // (#489) Phase 2 — compute baseline_hash, then (#496) hash the
+        // per-run sandbox AFTER the COW clone rather than the source
+        // before it. The COW copy is byte-identical, so the recorded
+        // value is unchanged — but hashing the clone closes the race
+        // window where a concurrent writer could mutate the source
+        // between the hash and the clone, leaving baseline_hash not
+        // matching what the clone actually copied. The per-run sandbox
+        // is private to this run, so nothing else touches it between the
+        // clone and the hash. Best-effort: skip silently for
+        // self-contained workloads (no source yet) — the provider's
+        // setup() populates the empty dir; baseline_hash stays None.
         let baseline_hash: Option<String> = if source_sandbox_dir.exists() {
-            match hash_sandbox_dir(&source_sandbox_dir) {
-                Ok(h) => Some(h),
-                Err(e) => {
-                    if !opts.quiet {
-                        eprintln!(
-                            "[lab] warn: baseline_hash for {} skipped: {e}",
-                            source_sandbox_dir.display()
-                        );
-                    }
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        if source_sandbox_dir.exists() {
             cow_clone_dir(&source_sandbox_dir, &per_run_sandbox_dir).with_context(|| {
                 format!(
                     "cow-cloning source sandbox {} → {}",
@@ -154,11 +142,24 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
                     per_run_sandbox_dir.display()
                 )
             })?;
+            match hash_sandbox_dir(&per_run_sandbox_dir) {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    if !opts.quiet {
+                        eprintln!(
+                            "[lab] warn: baseline_hash for {} skipped: {e}",
+                            per_run_sandbox_dir.display()
+                        );
+                    }
+                    None
+                }
+            }
         } else {
             fs::create_dir_all(&per_run_sandbox_dir).with_context(|| {
                 format!("creating empty per-run sandbox {}", per_run_sandbox_dir.display())
             })?;
-        }
+            None
+        };
 
         // Optional cross-layer telemetry. The sidecar runs on a background
         // thread until we explicitly stop it after the dispatch completes.
@@ -298,13 +299,26 @@ fn enrich_manifest_with_fixture_info(
     // The fixture object names what the model started from. Phase 3
     // will add `name` + `satisfies` + `manifest_version` once the
     // registry resolver is wired in.
-    let source_path_str = source_sandbox_dir
-        .canonicalize()
-        .unwrap_or_else(|_| source_sandbox_dir.to_path_buf())
-        .display()
-        .to_string();
+    //
+    // (#496) source_path semantics for `dm lab compare`'s cross-run
+    // string-equality:
+    //   - source exists → canonicalized absolute path (stable across
+    //     runs; the rare canonicalize failure on an existing dir, e.g.
+    //     a permissions quirk, falls back to the raw path).
+    //   - source does NOT exist (self-contained workload populated by
+    //     the provider's setup()) → JSON `null`, an explicit "no
+    //     source" signal rather than a non-canonical raw path that
+    //     would spuriously mismatch a canonicalized run.
+    let source_path = if source_sandbox_dir.exists() {
+        let p = source_sandbox_dir
+            .canonicalize()
+            .unwrap_or_else(|_| source_sandbox_dir.to_path_buf());
+        serde_json::Value::String(p.display().to_string())
+    } else {
+        serde_json::Value::Null
+    };
     let fixture = serde_json::json!({
-        "source_path": source_path_str,
+        "source_path": source_path,
         "baseline_hash": baseline_hash,
     });
 
@@ -721,13 +735,16 @@ mod tests {
     }
 
     /// `baseline_hash: None` is recorded as JSON null (operator-visible
-    /// "this run had no baseline" — distinct from missing key).
+    /// "this run had no baseline" — distinct from missing key). Source
+    /// dir exists here, so the concern under test is purely the
+    /// baseline, not the source_path.
     #[test]
     fn enrich_records_null_when_baseline_hash_missing() {
         let tmp = TempDir::new().unwrap();
         let run_dir = tmp.path().join("run-1");
         std::fs::create_dir_all(&run_dir).unwrap();
         let source_sandbox = tmp.path().join("source-sandbox");
+        std::fs::create_dir_all(&source_sandbox).unwrap();
         std::fs::write(
             run_dir.join("manifest.json"),
             r#"{"schemaVersion": 3, "runId": "r1"}"#,
@@ -740,6 +757,38 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(run_dir.join("manifest.json")).unwrap())
                 .unwrap();
         assert!(parsed["fixture"]["baseline_hash"].is_null());
+        // Source exists → canonical string path, not null.
+        assert!(parsed["fixture"]["source_path"].is_string());
+    }
+
+    /// (#496) When the source sandbox doesn't exist (self-contained
+    /// workload populated by the provider's setup()), `source_path` is
+    /// recorded as JSON `null` — an explicit "no source" signal rather
+    /// than a non-canonical raw path that would spuriously mismatch a
+    /// canonicalized run under `dm lab compare`.
+    #[test]
+    fn enrich_records_null_source_path_when_source_missing() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run-1");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        // Deliberately NOT created — self-contained workload.
+        let source_sandbox = tmp.path().join("does-not-exist");
+        std::fs::write(
+            run_dir.join("manifest.json"),
+            r#"{"schemaVersion": 3, "runId": "r1"}"#,
+        )
+        .unwrap();
+
+        enrich_manifest_with_fixture_info(&run_dir, Some("blake3:x"), &source_sandbox).unwrap();
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(run_dir.join("manifest.json")).unwrap())
+                .unwrap();
+        assert!(
+            parsed["fixture"]["source_path"].is_null(),
+            "source_path should be null when source is missing, got: {}",
+            parsed["fixture"]["source_path"]
+        );
     }
 
     #[test]

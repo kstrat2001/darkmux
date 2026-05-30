@@ -21,15 +21,19 @@ pub fn cmd_register(
     paths::ensure(&paths)?;
     let reg_path = default_registry_path(&paths);
 
-    let mut registry = LabRegistry::load(&reg_path)
-        .with_context(|| format!("loading {}", reg_path.display()))?;
-    // `register` returns the resolved registry key + the inserted
-    // entry; we use both directly rather than re-scan the BTreeMap
-    // (the post-review #498 fix — scan was fragile when multiple
-    // entries shared content but had different keys).
-    let (registered_name, entry) = registry.register(path, name_override, force)?;
-    let entry = entry.clone();
-    registry.save(&reg_path)?;
+    // The whole load → register → save cycle runs under an exclusive
+    // `flock(2)` on the registry (#496) so concurrent `dm lab register`
+    // invocations serialize instead of clobbering last-write-wins.
+    //
+    // `register` returns the resolved registry key + the inserted entry;
+    // we clone the entry out of the locked closure (the post-review #498
+    // fix — re-scanning the BTreeMap was fragile when multiple entries
+    // shared content but had different keys).
+    let (registered_name, entry) = LabRegistry::with_locked(&reg_path, |registry| {
+        let (name, entry) = registry.register(path, name_override, force)?;
+        Ok((name, entry.clone()))
+    })
+    .with_context(|| format!("registering into {}", reg_path.display()))?;
 
     Ok(format!(
         "Registered fixture `{}`\n  path:   {}\n  hash:   {}\n  hashed: {}\n  version: {}{}",
@@ -53,9 +57,8 @@ pub fn cmd_unregister(name: &str) -> Result<String> {
     paths::ensure(&paths)?;
     let reg_path = default_registry_path(&paths);
 
-    let mut registry = LabRegistry::load(&reg_path)?;
-    let removed = registry.unregister(name)?;
-    registry.save(&reg_path)?;
+    // load → unregister → save under the registry flock (#496).
+    let removed = LabRegistry::with_locked(&reg_path, |registry| registry.unregister(name))?;
 
     Ok(format!(
         "Unregistered `{name}` (was → {})\n  Note: the directory itself was NOT touched.",

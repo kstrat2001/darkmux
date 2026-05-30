@@ -16,8 +16,10 @@
 #   scripts/lab-init.sh --force # re-register, accepting any drift
 #   scripts/lab-init.sh --dry   # print what would be registered; no writes
 #
-# Exits non-zero on any registration failure. Successful registrations
-# print a one-line summary.
+# Idempotent: an already-registered built-in is reported as "skipped"
+# (NOT a failure), so a clean re-run exits 0. Exits non-zero only on a
+# real registration failure. Successful registrations print a one-line
+# summary.
 
 set -euo pipefail
 
@@ -105,6 +107,7 @@ if [ ${#register_args[@]} -gt 0 ]; then
 fi
 
 ok=0
+skipped=0
 fail=0
 for fixture in "${fixtures_found[@]}"; do
     # Strip trailing slash for clean output.
@@ -114,16 +117,32 @@ for fixture in "${fixtures_found[@]}"; do
         ok=$((ok + 1))
         continue
     fi
-    if darkmux lab register "${register_args[@]}" "$fixture_clean" 2>&1; then
+    # Capture output so an "already registered" rejection can be
+    # demoted from failure → skip (#501): re-running the script after a
+    # `git pull` is idempotent — already-present built-ins are left
+    # untouched (use --force to refresh them). `if cmd; then` also keeps
+    # `set -e` from aborting on the non-zero rejection exit.
+    #
+    # `${register_args[@]+"${register_args[@]}"}` is the bash-3.2-safe
+    # empty-array expansion: macOS ships bash 3.2, where a bare
+    # `"${arr[@]}"` on an EMPTY array trips `set -u`'s nounset (a bug
+    # fixed in bash 4.4). The `+`-guard expands to nothing when the
+    # array is unset/empty, so the no-`--force` path is portable.
+    if out="$(darkmux lab register ${register_args[@]+"${register_args[@]}"} "$fixture_clean" 2>&1)"; then
+        printf '%s\n' "$out"
         ok=$((ok + 1))
+    elif printf '%s' "$out" | grep -qi "already registered"; then
+        echo "  [skip] already registered: $fixture_clean (use --force to refresh)"
+        skipped=$((skipped + 1))
     else
+        printf '%s\n' "$out" >&2
         echo "lab-init: registration failed for $fixture_clean" >&2
         fail=$((fail + 1))
     fi
 done
 
 echo ""
-echo "lab-init: $ok registered, $fail failed"
+echo "lab-init: $ok registered, $skipped skipped, $fail failed"
 
 if [ $fail -gt 0 ]; then
     exit 1
