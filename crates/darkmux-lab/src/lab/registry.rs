@@ -87,8 +87,15 @@ impl LabRegistry {
         }
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("reading {}", path.display()))?;
-        let reg: LabRegistry = serde_json::from_str(&raw)
-            .with_context(|| format!("parsing {} as lab registry", path.display()))?;
+        let reg: LabRegistry = serde_json::from_str(&raw).with_context(|| {
+            format!(
+                "parsing {} as lab registry — the file appears corrupt. \
+                 New writes are atomic (#543), so this is most likely a legacy \
+                 torn write or a bad hand-edit. Back it up and remove it to rebuild \
+                 from `scripts/lab-init.sh` (+ re-`darkmux lab register` any custom fixtures).",
+                path.display()
+            )
+        })?;
         Ok(reg)
     }
 
@@ -187,8 +194,27 @@ impl LabRegistry {
         }
         let json = serde_json::to_string_pretty(self)
             .context("serializing lab registry")?;
-        std::fs::write(path, json)
-            .with_context(|| format!("writing {}", path.display()))?;
+
+        // Write to a sibling temp file, then atomic rename onto `path`
+        // (#543). `flock(2)` (#496) serializes writers, but a bare
+        // `fs::write` truncates-in-place: a crash mid-write leaves a torn
+        // registry, and an unlocked reader (`lab run`/`fixtures`/`doctor`
+        // all `load()` without the lock) can observe the half-written
+        // file. temp-write + rename closes both: a crash leaves only an
+        // orphan temp, and `rename(2)` is atomic on POSIX so a reader
+        // always sees the complete old or complete new file — no reader
+        // lock required. The temp is process-unique so a stale temp from
+        // a previously-crashed writer is never reused mid-flight.
+        let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+        std::fs::write(&tmp, json)
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        std::fs::rename(&tmp, path).with_context(|| {
+            // Best-effort cleanup so a failed rename doesn't leave the
+            // temp behind; ignore the cleanup error and surface the
+            // original rename failure.
+            let _ = std::fs::remove_file(&tmp);
+            format!("atomically replacing {}", path.display())
+        })?;
         Ok(())
     }
 
@@ -525,6 +551,45 @@ mod tests {
         let reg = LabRegistry::default();
         reg.save(&reg_path).unwrap();
         assert!(reg_path.exists());
+    }
+
+    /// #543: `save()` writes via a sibling temp + atomic rename. Assert
+    /// (a) overwriting an existing registry leaves it fully parseable
+    /// (never torn) and (b) no `*.json.tmp.*` sibling is left behind.
+    #[test]
+    fn save_atomic_overwrite_leaves_registry_intact_and_no_temp() {
+        let tmp = TempDir::new().unwrap();
+        let reg_path = tmp.path().join("lab-registry.json");
+
+        // First save (creates the file), then overwrite with a second
+        // save — the overwrite path is where a bare truncating write
+        // could tear the file.
+        LabRegistry::default().save(&reg_path).unwrap();
+        let fixture_dir = tmp.path().join("fix");
+        std::fs::create_dir_all(&fixture_dir).unwrap();
+        write_fixture(&fixture_dir, "f1", None);
+        let mut reg = LabRegistry::load(&reg_path).unwrap();
+        reg.register(&fixture_dir, None, false).unwrap();
+        reg.save(&reg_path).unwrap();
+
+        // (a) The on-disk file is always a complete, parseable registry.
+        let reloaded = LabRegistry::load(&reg_path).unwrap();
+        assert!(reloaded.get("f1").is_some(), "registry survived overwrite");
+
+        // (b) No temp file leaked into the directory.
+        let leftover: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains("json.tmp.")
+            })
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "save() left a temp file behind: {leftover:?}"
+        );
     }
 
     /// (#496) `with_locked` persists a successful mutation and creates
