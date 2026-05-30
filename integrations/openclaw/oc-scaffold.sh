@@ -59,19 +59,29 @@ for f in "$SCAFFOLDS_DIR"/*.json; do
     role_ids+=("$(basename "$f" .json)")
 done
 
-available_csv() { local out; out="$(printf '%s, ' "${role_ids[@]}")"; echo "${out%, }"; }
+# `${role_ids[@]+"${role_ids[@]}"}` is the bash-3.2-safe empty-array
+# expansion: macOS ships bash 3.2, where a bare `"${arr[@]}"` on an EMPTY
+# array trips `set -u` (fixed in bash 4.4). role_ids is empty when the
+# scaffolds dir has no *.json, and this helper runs from the not-found
+# error path — so without the guard the error handler itself would crash.
+available_csv() { local out; out="$(printf '%s, ' ${role_ids[@]+"${role_ids[@]}"})"; echo "${out%, }"; }
 
 cmd_list() {
     echo "darkmux ships ${#role_ids[@]} openclaw role scaffold(s):"
     echo
     for f in "$SCAFFOLDS_DIR"/*.json; do
         [ -e "$f" ] || continue
-        jq -r '
+        # `if !` keeps `set -e` from aborting the whole listing when one
+        # scaffold is malformed (invalid JSON or a missing field) — the
+        # remaining good roles still print, and the bad one is flagged.
+        if ! jq -r '
             "• \(.role) (\(.runtime))",
             "    \(.description)",
             "    pairs with profile: \(.recommended_profile), tools: \(.recommended_tools | join(", "))",
             ""
-        ' "$f"
+        ' "$f" 2>/dev/null; then
+            echo "  (skipped $(basename "$f") — invalid JSON or missing field)" >&2
+        fi
     done
     echo "Generate a snippet:  $SELF template <role>"
 }
@@ -86,6 +96,30 @@ cmd_template() {
     if [ ! -f "$file" ]; then
         echo "oc-scaffold: agent role '$role' not found. Available: $(available_csv)" >&2
         exit 2
+    fi
+
+    # Validate required fields before emitting. Raw `jq` would otherwise
+    # silently emit `null` for a missing field (e.g. a hand-edited or
+    # partially-migrated scaffold) and exit 0 — the operator would paste a
+    # null-systemPromptOverride agent into openclaw.json. The Rust
+    # `RoleTemplate` deserialize this replaced failed loudly on this; match
+    # that. (`-e` makes jq exit non-zero so `set -e` would abort, hence the
+    # `if !` guard.)
+    local missing
+    if ! missing="$(jq -er '
+        [ if (.role|type) != "string"              then "role"               else empty end,
+          if (.runtime|type) != "string"           then "runtime"            else empty end,
+          if (.override_text|type) != "string"     then "override_text"      else empty end,
+          if (.recommended_profile|type) != "string" then "recommended_profile" else empty end,
+          if (.recommended_tools|type) != "array"  then "recommended_tools"  else empty end ]
+        | join(", ")
+    ' "$file" 2>/dev/null)"; then
+        echo "oc-scaffold: scaffold '$role' ($file) is not valid JSON." >&2
+        exit 1
+    fi
+    if [ -n "$missing" ]; then
+        echo "oc-scaffold: scaffold '$role' is missing or has invalid field(s): $missing" >&2
+        exit 1
     fi
 
     # Mirror the agents.list[] shape the old `darkmux agent template`
