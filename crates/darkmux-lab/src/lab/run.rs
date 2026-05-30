@@ -74,6 +74,21 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
         .ok_or_else(|| anyhow!("no profile specified and no default_profile in registry"))?;
     let profile = get_profile(&registry_loaded.registry, &profile_name)?;
 
+    // (#365) Best-effort provenance guard: if the operator swapped a
+    // different profile before this dispatch (or the default_profile
+    // doesn't match what's loaded), the manifest's `profile=` tag would
+    // silently misattribute the runtime envelope. Compare the requested
+    // profile's declared models against `lms ps` and warn (never block —
+    // operator-sovereignty: the operator may have swapped deliberately).
+    // Skipped silently when `lms` is unavailable or nothing is loaded.
+    if !opts.quiet {
+        if let Ok(loaded) = darkmux_profiles::lms::list_loaded() {
+            for w in crate::lab::profile_check::envelope_warnings(profile, &profile_name, &loaded) {
+                eprintln!("[lab] warn: {w}");
+            }
+        }
+    }
+
     let runs = opts.runs.max(1);
     let mut outcomes: Vec<RunOutcome> = Vec::new();
 
