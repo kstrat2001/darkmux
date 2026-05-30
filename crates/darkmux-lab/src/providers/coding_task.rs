@@ -523,14 +523,27 @@ impl WorkloadProvider for CodingTaskProvider {
         // Prefer runtime metrics when present (internal-runtime path);
         // fall back to trajectory-derived counts (openclaw shell-out
         // path or any other dispatch source).
-        let turns = runtime_metrics
-            .as_ref()
-            .and_then(|m| m.turns)
-            .unwrap_or(trajectory_turns);
-        let compactions = runtime_metrics
-            .as_ref()
-            .and_then(|m| m.compactions)
-            .unwrap_or(tokens_before.len() as u32);
+        // (#371) Reconcile runtime metrics with trajectory-derived
+        // counts via `max`. The trajectory is append-only ground truth,
+        // so a `metrics.json` that under-reports — absent, partial, or
+        // not-yet-finalized when the runtime hard-errors mid-dispatch
+        // (SSE timeout / kill / panic) — must never drag the count BELOW
+        // what the trajectory actually recorded. Pre-fix, a stale/partial
+        // `turns: 0` won over an 84-turn trajectory (Beat 40).
+        //
+        // Trajectory turns: the openclaw path emits `prompt.submitted`;
+        // the internal runtime emits one `model.completed` per turn (and
+        // never `prompt.submitted`), so take the max of both shapes.
+        // Compactions: `compactionSummary` dedup (openclaw) vs
+        // `compaction` events (internal runtime).
+        let trajectory_turns = trajectory_turns.max(count_event_type(&events, "model.completed"));
+        let trajectory_compactions =
+            (tokens_before.len() as u32).max(count_event_type(&events, "compaction"));
+        let turns = reconcile_count(runtime_metrics.as_ref().and_then(|m| m.turns), trajectory_turns);
+        let compactions = reconcile_count(
+            runtime_metrics.as_ref().and_then(|m| m.compactions),
+            trajectory_compactions,
+        );
         let mut notes = vec![
             format!("turns={}", turns),
             format!("compactions={}", compactions),
@@ -1215,6 +1228,25 @@ fn profile_loaded_mismatch_message(
 /// Caller-chooses the path so the preference chain (per-run copy
 /// first, sandbox-live fallback) lives at the consumer, not split
 /// across multiple helpers.
+/// Count trajectory events of a given `"type"`. (#371)
+fn count_event_type(events: &[serde_json::Value], ty: &str) -> u32 {
+    events
+        .iter()
+        .filter(|e| e.get("type").and_then(|t| t.as_str()) == Some(ty))
+        .count() as u32
+}
+
+/// (#371) Reconcile a runtime-reported count with the trajectory-derived
+/// count. The trajectory is append-only ground truth, so the metric can
+/// never legitimately be LOWER than what the trajectory recorded — a
+/// missing (`None`) or stale/partial metric (e.g. `turns: 0` written
+/// before a hard-error exit) is corrected upward to the trajectory
+/// count. When the metric is complete it wins (and ties are a no-op);
+/// when the trajectory itself is truncated, the higher metric is kept.
+fn reconcile_count(metric: Option<u32>, trajectory: u32) -> u32 {
+    metric.unwrap_or(0).max(trajectory)
+}
+
 fn read_metrics_json(path: &Path) -> Option<InternalRuntimeMetrics> {
     let raw = fs::read_to_string(path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
@@ -1273,6 +1305,49 @@ mod tests {
     };
     use std::collections::BTreeMap;
     use tempfile::TempDir;
+
+    // ── (#371) metrics ↔ trajectory reconciliation ──────────────────
+
+    #[test]
+    fn reconcile_count_corrects_stale_metric_upward() {
+        // The Beat-40 case: a stale/partial metrics.json says turns=0
+        // but the trajectory recorded 84 model.completed events.
+        assert_eq!(reconcile_count(Some(0), 84), 84);
+    }
+
+    #[test]
+    fn reconcile_count_falls_back_to_trajectory_when_metric_absent() {
+        // Hard error before metrics.json was written at all.
+        assert_eq!(reconcile_count(None, 84), 84);
+    }
+
+    #[test]
+    fn reconcile_count_keeps_complete_metric() {
+        // Metrics complete and at least the trajectory count: metric wins
+        // (covers a truncated trajectory where the metric is higher).
+        assert_eq!(reconcile_count(Some(90), 84), 90);
+        assert_eq!(reconcile_count(Some(84), 84), 84);
+    }
+
+    #[test]
+    fn reconcile_count_zero_when_neither_has_data() {
+        assert_eq!(reconcile_count(None, 0), 0);
+    }
+
+    #[test]
+    fn count_event_type_counts_internal_runtime_turns() {
+        let events: Vec<serde_json::Value> = vec![
+            serde_json::json!({"type": "dispatch.start"}),
+            serde_json::json!({"type": "model.completed"}),
+            serde_json::json!({"type": "tool.completed"}),
+            serde_json::json!({"type": "model.completed"}),
+            serde_json::json!({"type": "compaction"}),
+            serde_json::json!({"type": "model.completed"}),
+        ];
+        assert_eq!(count_event_type(&events, "model.completed"), 3);
+        assert_eq!(count_event_type(&events, "compaction"), 1);
+        assert_eq!(count_event_type(&events, "nonexistent"), 0);
+    }
 
     fn make_loaded(spec: WorkloadSpec, base_dir: PathBuf) -> LoadedWorkload {
         LoadedWorkload {
