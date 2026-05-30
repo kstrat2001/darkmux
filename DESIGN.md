@@ -37,7 +37,7 @@ darkmux swap <profile>
 
 ## Implementation sketch (Rust)
 
-- Single static binary built with `cargo build --release` (no runtime needed beyond LMStudio + an agent runtime like OpenClaw)
+- Single static binary built with `cargo build --release`. `swap` / `status` / `profiles` need only LMStudio; `crew dispatch` / `lab run` default to the in-house internal runtime (a per-dispatch `darkmux-runtime` Docker container) and can opt into an external agent runtime like OpenClaw / Aider / Cline via `--runtime`. No external agent runtime is required to get started.
 - Profile / workload registries: `serde_json` over plain JSON files
 - `lms` CLI invocation: `std::process::Command`
 - Built-in workloads embedded into the binary via `include_str!` so `cargo install --path .` works from any directory without the source tree present
