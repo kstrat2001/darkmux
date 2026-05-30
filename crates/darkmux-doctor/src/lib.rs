@@ -1935,7 +1935,7 @@ fn check_agent_role_definitions() -> Check {
     } else {
         let suggestions = missing_overrides
             .iter()
-            .map(|id| format!("`integrations/openclaw/oc-scaffold.sh template {id}`"))
+            .map(|id| format!("`oc-scaffold.sh template {id}`"))
             .collect::<Vec<_>>()
             .join(", ");
         Check {
@@ -1950,7 +1950,9 @@ fn check_agent_role_definitions() -> Check {
                     .join(", ")
             ),
             hint: Some(format!(
-                "darkmux ships validated scaffolds for these roles. Try: {suggestions}"
+                "darkmux ships validated scaffolds for these roles. From your darkmux \
+                 source checkout, run `integrations/openclaw/oc-scaffold.sh template <role>` \
+                 (e.g. {suggestions}) and paste the snippet into openclaw.json."
             )),
         }
     }
