@@ -1,7 +1,9 @@
 //! Trivial workload provider: "just answer this prompt."
 //! No sandbox; optional must_contain / must_not_contain keyword checks.
 //!
-//! Dispatches via the active runtime's CLI (default: `openclaw agent`).
+//! Dispatches via the active runtime: the in-house internal runtime by
+//! default, or the `openclaw agent` shell-out when `--runtime openclaw`
+//! is opted into.
 
 use darkmux_types::Profile;
 use crate::workloads::types::{

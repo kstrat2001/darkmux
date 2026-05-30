@@ -2113,9 +2113,10 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
             } else {
                 watch
             };
-            // Parse --runtime <openclaw|internal>; default openclaw.
+            // Parse --runtime <openclaw|internal>; default internal.
             // `internal` routes to the in-house container-bounded
-            // runtime (see `runtime/`).
+            // runtime (see `runtime/`); `openclaw` is the opt-in
+            // shell-out path.
             let runtime_flag = crew::dispatch::Runtime::parse(&runtime)?;
             // Sprint-E QA: bail loud when --runtime-cmd is set without
             // --runtime openclaw. The flag is only consulted by the
