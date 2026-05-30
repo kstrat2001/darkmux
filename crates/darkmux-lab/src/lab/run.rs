@@ -74,20 +74,18 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
         .ok_or_else(|| anyhow!("no profile specified and no default_profile in registry"))?;
     let profile = get_profile(&registry_loaded.registry, &profile_name)?;
 
-    // (#365) Best-effort provenance guard: if the operator swapped a
+    // (#365/#544) Best-effort provenance guard: if the operator swapped a
     // different profile before this dispatch (or the default_profile
     // doesn't match what's loaded), the manifest's `profile=` tag would
     // silently misattribute the runtime envelope. Compare the requested
     // profile's declared models against `lms ps` and warn (never block —
     // operator-sovereignty: the operator may have swapped deliberately).
-    // Skipped silently when `lms` is unavailable or nothing is loaded.
-    if !opts.quiet {
-        if let Ok(loaded) = darkmux_profiles::lms::list_loaded() {
-            for w in crate::lab::profile_check::envelope_warnings(profile, &profile_name, &loaded) {
-                eprintln!("[lab] warn: {w}");
-            }
-        }
-    }
+    // The check runs per-run inside the loop below: with `--runs N` the
+    // loaded model can drift between runs (LMStudio eviction under memory
+    // pressure), and each run is independently stamped `profile=<name>`.
+    // `prev_envelope_warns` dedups a stable picture so a persistent
+    // mismatch warns once, not once-per-run.
+    let mut prev_envelope_warns: Option<Vec<String>> = None;
 
     let runs = opts.runs.max(1);
     let mut outcomes: Vec<RunOutcome> = Vec::new();
@@ -127,6 +125,26 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
                 "[lab] run {i}/{runs} — workload={} profile={} → {}",
                 opts.workload_id, profile_name, run_id
             );
+
+            // (#365/#544) Per-run envelope check. An `lms ps` failure is
+            // surfaced distinctly (verification didn't run) rather than
+            // silently skipped — methodology citations depend on knowing
+            // the verification status.
+            let warns = match darkmux_profiles::lms::list_loaded() {
+                Ok(loaded) => {
+                    crate::lab::profile_check::envelope_warnings(profile, &profile_name, &loaded)
+                }
+                Err(e) => vec![format!(
+                    "could not verify profile-load match — `lms ps` failed ({e}); \
+                     this run's `profile={profile_name}` tag is unverified. (#365)"
+                )],
+            };
+            if prev_envelope_warns.as_ref() != Some(&warns) {
+                for w in &warns {
+                    eprintln!("[lab] warn: {w}");
+                }
+                prev_envelope_warns = Some(warns);
+            }
         }
 
         fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;

@@ -198,14 +198,10 @@ impl WorkloadProvider for CodingTaskProvider {
         runtime: darkmux_crew::dispatch::Runtime,
         runtime_cmd: &str,
     ) -> Result<RunResult> {
-        // (#365) Warn when the requested profile's primary model doesn't
-        // match what's currently loaded in LMStudio. The dispatch will
-        // still go through (operator-sovereignty: we don't auto-swap),
-        // but the operator sees the divergence — methodology data later
-        // citing "this run used profile X" will be wrong otherwise.
-        // Best-effort: lms query failures (LMStudio offline, parse
-        // errors) silently skip the check rather than block dispatch.
-        warn_on_profile_loaded_mismatch(profile, profile_name);
+        // (#365/#544) The profile↔loaded envelope check now lives once at
+        // the lab-run level (`lab::run` → `profile_check::envelope_warnings`,
+        // a superset of the old primary-only check here), so it isn't
+        // repeated per provider — a coding-task run warns once, not twice.
 
         // Per-runtime sandbox-path substitution:
         //   - Openclaw runs on host → agent sees the host sandbox path.
@@ -1136,88 +1132,6 @@ struct InternalRuntimeMetrics {
     compactions: Option<u32>,
 }
 
-/// (#365) Emit a warning to stderr when the loaded model state doesn't
-/// match the profile the dispatch claims to be using. Compares the
-/// primary model: the profile declares an id + n_ctx; LMStudio reports
-/// the actually-loaded identifier + context. Differences mean future
-/// methodology citations of "this run used profile <name>" will be
-/// wrong.
-///
-/// Silent skip when:
-///   - LMStudio query fails (offline, lms binary missing, etc.) —
-///     dispatch will fail with a clearer error downstream.
-///   - Profile declares no primary model — nothing to compare against.
-///   - The primary model isn't found in `lms ps` under either bare or
-///     namespaced identifier — could be openclaw passthrough or a
-///     pre-load race; defer to runtime to surface the dispatch
-///     failure if any.
-///
-/// Operator-sovereignty: warn-only. Doesn't auto-swap, doesn't bail.
-/// Phase B dogfood (Beat 39, 2026-05-25) surfaced this gap when a
-/// `darkmux swap recommended` loaded `balanced` but `darkmux lab run`
-/// tagged manifests with `default_profile=deep`.
-fn warn_on_profile_loaded_mismatch(profile: &Profile, profile_name: &str) {
-    let loaded = match darkmux_profiles::lms::list_loaded() {
-        Ok(v) => v,
-        Err(e) => {
-            // Surface the failure mode distinctly from "match silent" —
-            // a silent return would leave the operator believing the
-            // check passed when in fact it never ran. Methodology
-            // citations depend on knowing the verification status.
-            eprintln!(
-                "darkmux lab dispatch: warn — could not verify profile-load match: \
-                 `lms ps` failed ({e}). Methodology citations of `profile={profile_name}` \
-                 are unverified. (#365)"
-            );
-            return;
-        }
-    };
-    if let Some(msg) = profile_loaded_mismatch_message(profile, profile_name, &loaded) {
-        eprintln!("{msg}");
-    }
-}
-
-/// Pure comparison: returns the warning message to print, or `None`
-/// when the loaded primary matches the profile's declared primary.
-/// Extracted from `warn_on_profile_loaded_mismatch` so the comparison
-/// logic is unit-testable without `lms ps`.
-fn profile_loaded_mismatch_message(
-    profile: &Profile,
-    profile_name: &str,
-    loaded: &[darkmux_types::LoadedModel],
-) -> Option<String> {
-    use darkmux_types::ModelRole;
-    let declared_primary = profile
-        .models
-        .iter()
-        .find(|m| matches!(m.role, ModelRole::Primary))?;
-    // Match by either bare id or `darkmux:<id>` namespace.
-    let namespaced = format!("darkmux:{}", declared_primary.id);
-    let found = loaded.iter().find(|m| {
-        m.identifier == declared_primary.id
-            || m.identifier == namespaced
-            || m.model == declared_primary.id
-    });
-    let Some(loaded_primary) = found else {
-        return Some(format!(
-            "darkmux lab dispatch: warn — profile `{profile_name}` declares primary `{}` \
-             but it is NOT in `lms ps`. Manifest will be stamped `profile={profile_name}` \
-             — methodology citations may not match the actually-dispatched model. (#365)",
-            declared_primary.id
-        ));
-    };
-    if loaded_primary.context != declared_primary.n_ctx as u64 {
-        return Some(format!(
-            "darkmux lab dispatch: warn — profile `{profile_name}` declares primary `{}` \
-             at ctx={} but `lms ps` reports it loaded at ctx={}. Manifest will be stamped \
-             `profile={profile_name}` — methodology citations may not match the actual \
-             context envelope. (#365)",
-            declared_primary.id, declared_primary.n_ctx, loaded_primary.context
-        ));
-    }
-    None
-}
-
 /// Read a runtime-emitted `metrics.json` from a specific path.
 /// Returns `None` if the file doesn't exist (openclaw shell-out
 /// dispatches won't have one; some run dirs don't yet have the
@@ -1988,91 +1902,6 @@ not-valid-json
         // Per-run copy wins.
         assert_eq!(report.turns, 7);
         assert_eq!(report.compactions, 1);
-    }
-
-    // ─── #365: profile-loaded mismatch detection ──────────────────
-
-    fn loaded(identifier: &str, model: &str, ctx: u64) -> darkmux_types::LoadedModel {
-        darkmux_types::LoadedModel {
-            identifier: identifier.to_string(),
-            model: model.to_string(),
-            status: "idle".to_string(),
-            size: "1G".to_string(),
-            context: ctx,
-        }
-    }
-
-    fn profile_with_primary(model_id: &str, ctx: u32) -> Profile {
-        Profile {
-            description: None,
-            models: vec![darkmux_types::ProfileModel {
-                id: model_id.to_string(),
-                n_ctx: ctx,
-                role: darkmux_types::ModelRole::Primary,
-                identifier: None,
-            }],
-            runtime: None,
-            use_when: None,
-        }
-    }
-
-    #[test]
-    fn mismatch_none_when_primary_loaded_with_matching_ctx() {
-        let p = profile_with_primary("qwen3.6", 101_000);
-        // Loaded under the darkmux: namespace at matching ctx → match.
-        let lms = vec![loaded("darkmux:qwen3.6", "qwen3.6", 101_000)];
-        assert!(profile_loaded_mismatch_message(&p, "balanced", &lms).is_none());
-    }
-
-    #[test]
-    fn mismatch_none_when_loaded_by_bare_identifier() {
-        let p = profile_with_primary("qwen3.6", 101_000);
-        // Some setups load with the bare model id as identifier.
-        let lms = vec![loaded("qwen3.6", "qwen3.6", 101_000)];
-        assert!(profile_loaded_mismatch_message(&p, "balanced", &lms).is_none());
-    }
-
-    #[test]
-    fn mismatch_when_ctx_differs() {
-        let p = profile_with_primary("qwen3.6", 101_000);
-        // Loaded but at a different context window — Beat 39's
-        // `deep`-tag-but-`balanced`-loaded scenario.
-        let lms = vec![loaded("darkmux:qwen3.6", "qwen3.6", 262_144)];
-        let msg = profile_loaded_mismatch_message(&p, "deep", &lms)
-            .expect("ctx mismatch should warn");
-        assert!(msg.contains("ctx=101000"));
-        assert!(msg.contains("loaded at ctx=262144"));
-        assert!(msg.contains("(#365)"));
-    }
-
-    #[test]
-    fn mismatch_when_primary_not_loaded_at_all() {
-        let p = profile_with_primary("qwen3.6", 101_000);
-        // LMStudio has something completely different loaded.
-        let lms = vec![loaded("darkmux:gpt-oss-120b", "gpt-oss-120b", 50_000)];
-        let msg = profile_loaded_mismatch_message(&p, "balanced", &lms)
-            .expect("not-loaded primary should warn");
-        assert!(msg.contains("`qwen3.6`"));
-        assert!(msg.contains("NOT in `lms ps`"));
-    }
-
-    #[test]
-    fn mismatch_silent_when_profile_has_no_primary() {
-        // Profile with only auxiliary / compactor — no primary to check.
-        // Returning None (not warning) is the right call; the consumer
-        // can decide whether to surface a different message.
-        let p = Profile {
-            description: None,
-            models: vec![darkmux_types::ProfileModel {
-                id: "compactor-only".into(),
-                n_ctx: 32_000,
-                role: darkmux_types::ModelRole::Compactor,
-                identifier: None,
-            }],
-            runtime: None,
-            use_when: None,
-        };
-        assert!(profile_loaded_mismatch_message(&p, "x", &[]).is_none());
     }
 
     /// (#359 QA follow-up) When `.darkmux-runtime/metrics.json` exists

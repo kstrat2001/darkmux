@@ -1252,10 +1252,14 @@ fn check_profile_loaded_match() -> Check {
             .models
             .iter()
             .filter(|m| matches!(m.role, ModelRole::Primary));
+        // (#544) Use the shared matcher so doctor agrees with the lab
+        // surfaces — crucially, this also matches a `darkmux:`-namespaced
+        // load, which the old inline check (`identifier == id || model ==
+        // id`) silently missed.
         let primary_match = primaries.clone().any(|p| {
             loaded
                 .iter()
-                .any(|l| l.identifier == p.id || l.model == p.id)
+                .any(|l| darkmux_profiles::envelope::loaded_matches(l, p))
         });
         if primary_match {
             matching.push(name);

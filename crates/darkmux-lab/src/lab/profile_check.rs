@@ -20,39 +20,8 @@
 //! dispatch proceeds either way (the operator may have swapped
 //! deliberately — A/B, defensive escalation, candidate eval).
 
-use darkmux_types::{LoadedModel, ModelRole, Profile, ProfileModel};
-
-/// Does this loaded model correspond to the profile's declared model?
-///
-/// Matches on the bare model key first — the canonical dispatch
-/// resolution per the darkmux namespace convention (`identifier =
-/// darkmux:foo`, `modelKey = foo`; dispatchers call with the bare `foo`
-/// and resolve via `modelKey`). Also accepts the namespaced identifier
-/// and any explicit `identifier` the operator set in the profile.
-fn matches(lm: &LoadedModel, pm: &ProfileModel) -> bool {
-    let namespaced = format!("darkmux:{}", pm.id);
-    lm.model == pm.id
-        || lm.identifier == pm.id
-        || lm.identifier == namespaced
-        || pm
-            .identifier
-            .as_deref()
-            .is_some_and(|id| id == lm.identifier || id == lm.model)
-}
-
-/// Declared vs loaded context windows differ enough to flag?
-///
-/// A 5% tolerance absorbs benign rounding (a profile declaring `262000`
-/// against a `262144` power-of-two load) while still catching a real
-/// envelope swap (the Beat-39 case: `262000` declared vs `101000`
-/// loaded). A loaded context of `0` means `lms ps` didn't report one —
-/// we can't tell, so we don't flag.
-fn ctx_diverges(declared: u64, loaded: u64) -> bool {
-    if loaded == 0 {
-        return false;
-    }
-    declared.abs_diff(loaded) * 20 > declared
-}
+use darkmux_profiles::envelope::{ctx_diverges, loaded_matches};
+use darkmux_types::{LoadedModel, ModelRole, Profile};
 
 /// Compare the requested profile's declared model envelope against what
 /// LMStudio actually has loaded, returning operator-facing warning lines
@@ -79,7 +48,7 @@ pub(crate) fn envelope_warnings(
         return out;
     }
     for pm in &profile.models {
-        match loaded.iter().find(|lm| matches(lm, pm)) {
+        match loaded.iter().find(|lm| loaded_matches(lm, pm)) {
             None => {
                 // Only the Primary model is load-bearing for the
                 // measurement envelope; a missing compactor/auxiliary is
@@ -112,6 +81,7 @@ pub(crate) fn envelope_warnings(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use darkmux_types::ProfileModel;
 
     fn pm(id: &str, n_ctx: u32, role: ModelRole) -> ProfileModel {
         ProfileModel {
@@ -141,24 +111,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn matches_on_bare_model_key() {
-        // namespaced load: identifier=darkmux:foo, modelKey=foo
-        let loaded = lm("darkmux:qwen-35b", "qwen-35b", 262000);
-        assert!(matches(
-            &loaded,
-            &pm("qwen-35b", 262000, ModelRole::Primary)
-        ));
-    }
-
-    #[test]
-    fn matches_on_namespaced_identifier() {
-        let loaded = lm("darkmux:qwen-35b", "different-key", 262000);
-        assert!(matches(
-            &loaded,
-            &pm("qwen-35b", 262000, ModelRole::Primary)
-        ));
-    }
+    // matches_on_* unit tests moved to darkmux-profiles::envelope (the
+    // matcher's new home, #544). The envelope_warnings tests below
+    // exercise the shared matcher transitively.
 
     #[test]
     fn no_warning_when_envelope_aligns() {
