@@ -9,7 +9,7 @@ A pre-1.0 Rust CLI that does two things for users running local LLMs (LMStudio +
 1. **Profile multiplexer** — `darkmux swap <name>` switches the loaded model + context length + (optional) compaction settings to a named profile defined in `~/.darkmux/profiles.json`.
 2. **Lab harness** — `darkmux lab run <workload>` dispatches a workload against an agent runtime (default: `openclaw`) and records timing + trajectory + verify outcome under `.darkmux/runs/<run-id>/`.
 
-The CLI is the *engine*; the empirical findings in the article series at <https://substack.com/@DarklyEnergized> are what it backs. The reproducibility story is the product story — users should be able to rerun a workload and get numbers comparable to the published claims.
+The CLI is the *engine*; the empirical findings in the Genesis series on Darkly Energized (<https://darklyenergized.substack.com>) are what it backs. The reproducibility story is the product story — users should be able to rerun a workload and get numbers comparable to the published claims.
 
 ## darkmux's grand vision (agent-facing)
 

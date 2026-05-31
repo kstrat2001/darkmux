@@ -21,13 +21,15 @@ Built for operators who need to see what their AI fleet did, when, and why.
 
 Local AI is good at things frontier models aren't — fast iteration, repeatability across hardware, an offline foundation. darkmux exists to make frontier models *better* by giving them complementary teammates running locally. **Diversity-as-synergy, not replacement.**
 
-**The bet.** Faster and better LLM results require solving the *harness* problem, and go hand-in-hand with the *modeling* problem. Articles 1 and 2 of [the series](https://darklyenergized.substack.com) measured this — the same model on the same machine ranged from 25 minutes to 5 minutes depending on which compaction settings the operator chose. darkmux is the engine that captures that knowledge.
+**The bet.** Faster and better LLM results require solving the *harness* problem, and go hand-in-hand with the *modeling* problem. The [Genesis series](https://darklyenergized.substack.com) on Darkly Energized — three Substack posts — walked from casual comparison through controlled experimentation to the architectural reveal that produced this tool. The same model on the same machine ranged from 25 minutes to 5 minutes depending on which compaction settings the operator chose. darkmux is the engine that captures what the series found.
 
-**The arc.**
+**The Genesis series.**
 
-- **[Part 1](https://darklyenergized.substack.com/p/can-a-35b-local-model-write-your)** — sweep many models on the same workload, pick a few that work locally.
-- **[Part 2](https://darklyenergized.substack.com/p/part-2-charting-the-wake)** — tune the knobs scientifically; get the most out of the right model.
-- **Part 3** *(in progress)* — does the methodology produce better real work? darkmux as the tool that runs the loop on *your* hardware, not just the author's.
+- **[Part 1](https://darklyenergized.substack.com/p/can-a-35b-local-model-write-your)** — *Can a 35B local model write your code?* Sweep many models on the same workload, pick a few that work locally.
+- **[Part 2](https://darklyenergized.substack.com/p/part-2-charting-the-wake)** — *Charting the Wake.* Tune the knobs scientifically; get the most out of the right model. Empirical finding: configuration drift around the model matters more than the model.
+- **[Part 3](https://darklyenergized.substack.com/p/PUBLISH_URL_TBD)** — *Hybrid by Design.* The architectural reveal — what the operator-orchestrator-darkmux-local-stack continuum actually looks like once the protocol survives the orchestrator deciding where work goes. Closes the Genesis arc.
+
+Posts after Part 3 will appear on the same Substack but stand alone — the Genesis series is the *why this exists* story; subsequent work is the *what's next*.
 
 **The long view.** Once a local stack is optimized, the next step is collaboration — frontier, local, and specialized models on the same task. The optimizing agent (Claude, by default) is part of the team being optimized; it maintains the team's integrity as new models arrive and hardware changes. Optimization is not the destination — it's how the team stays sharp.
 
@@ -153,6 +155,8 @@ cargo install --path . --force
 The `--force` flag tells cargo to replace the existing binary even when the source path or version metadata hasn't changed. Without it, cargo can silently skip the reinstall and leave you running an older binary while reporting the same `darkmux --version`. If a new feature (like `--instrument`) is missing despite a fresh `git pull`, that's the most likely cause — re-run with `--force`.
 
 ## Why this exists
+
+The long-form answer is the [Genesis series](https://darklyenergized.substack.com) on Darkly Energized — three Substack posts that walk the genesis story end-to-end. The README is the short version.
 
 **AI-first because today you'd be crazy not to.** Pre-AI, integrating a new source or structuring an unstructured intent meant writing a bespoke parser; tools for local-AI orchestration meant operators hand-authoring JSON for missions, sprints, and profiles. With AI in the loop — specifically a small, fast, dependable *utility agent* loaded locally — that authoring tax mostly evaporates. darkmux dispatches utility agents internally for compaction, sprint estimation, and (per [#113](https://github.com/kstrat2001/darkmux/issues/113)) mission proposal, so the operator gets structured output from vague intent without leaving the local tier. The frontier orchestrator stays on strategy; the utility agent absorbs the routine.
 
