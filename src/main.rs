@@ -935,6 +935,12 @@ enum LabCmd {
         /// Without this, duplicate names error out.
         #[arg(long)]
         force: bool,
+        /// Idempotent register: if the fixture is already registered,
+        /// skip with a no-op success instead of erroring. Lets scripts
+        /// (e.g. scripts/lab-init.sh) re-run cleanly without parsing
+        /// error text. Ignored when `--force` is also passed.
+        #[arg(long = "if-absent")]
+        if_absent: bool,
     },
     /// Remove a fixture from the lab registry by name (#491).
     /// NEVER touches the underlying directory — operator-sovereignty
@@ -2880,8 +2886,13 @@ fn cmd_lab(sub: LabCmd) -> Result<i32> {
                 1
             })
         }
-        LabCmd::Register { path, name, force } => {
-            let msg = lab::fixture_cli::cmd_register(&path, name, force)?;
+        LabCmd::Register {
+            path,
+            name,
+            force,
+            if_absent,
+        } => {
+            let msg = lab::fixture_cli::cmd_register(&path, name, force, if_absent)?;
             println!("{msg}");
             Ok(0)
         }

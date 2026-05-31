@@ -5,6 +5,7 @@
 //! the registry file as a unit. Verbs return operator-formatted
 //! result strings; main.rs prints them.
 
+use crate::lab::fixture::FixtureManifest;
 use crate::lab::paths::{self, ResolveScope};
 use crate::lab::registry::{default_registry_path, LabRegistry};
 use anyhow::{Context, Result};
@@ -12,28 +13,53 @@ use std::path::Path;
 
 /// `dm lab register <path>` — read `.fixture.json` from `path`,
 /// compute its content hash, add to registry, persist.
+///
+/// `if_absent` makes register **idempotent**: if the fixture is already
+/// registered, skip with a no-op success (exit 0) instead of erroring.
+/// This gives callers like `scripts/lab-init.sh` a clean machine-readable
+/// signal — they no longer have to grep the "already registered" error
+/// text to tell "re-run on a clean tree" apart from a real failure (#544
+/// review). `--force` (replace) takes precedence when both are set.
 pub fn cmd_register(
     path: &Path,
     name_override: Option<String>,
     force: bool,
+    if_absent: bool,
 ) -> Result<String> {
     let paths = paths::resolve(ResolveScope::Auto);
     paths::ensure(&paths)?;
     let reg_path = default_registry_path(&paths);
 
-    // The whole load → register → save cycle runs under an exclusive
-    // `flock(2)` on the registry (#496) so concurrent `dm lab register`
-    // invocations serialize instead of clobbering last-write-wins.
+    // The whole load → (check) → register → save cycle runs under an
+    // exclusive `flock(2)` on the registry (#496) so concurrent `dm lab
+    // register` invocations serialize instead of clobbering last-write-wins
+    // — and so the `if_absent` existence check and the insert are atomic.
     //
     // `register` returns the resolved registry key + the inserted entry;
     // we clone the entry out of the locked closure (the post-review #498
     // fix — re-scanning the BTreeMap was fragile when multiple entries
-    // shared content but had different keys).
-    let (registered_name, entry) = LabRegistry::with_locked(&reg_path, |registry| {
+    // shared content but had different keys). `None` = skipped (#544).
+    let outcome = LabRegistry::with_locked(&reg_path, |registry| {
+        if if_absent && !force {
+            // Resolve the registry key the same way `register` does
+            // (manifest name, overridable) and skip if already present.
+            let manifest = FixtureManifest::load_from_dir(path)
+                .with_context(|| format!("loading manifest from {}", path.display()))?;
+            let name = name_override
+                .clone()
+                .unwrap_or_else(|| manifest.name.clone());
+            if registry.get(&name).is_some() {
+                return Ok(None);
+            }
+        }
         let (name, entry) = registry.register(path, name_override, force)?;
-        Ok((name, entry.clone()))
+        Ok(Some((name, entry.clone())))
     })
     .with_context(|| format!("registering into {}", reg_path.display()))?;
+
+    let Some((registered_name, entry)) = outcome else {
+        return Ok("Fixture already registered — skipped (--if-absent).".to_string());
+    };
 
     Ok(format!(
         "Registered fixture `{}`\n  path:   {}\n  hash:   {}\n  hashed: {}\n  version: {}{}",

@@ -92,10 +92,16 @@ fi
 
 echo "lab-init: found ${#fixtures_found[@]} built-in fixture(s) under $BUILTINS_DIR"
 
-# Register each. --force flag passes through to `dm lab register`.
+# Register each. With --force we replace existing entries; otherwise
+# --if-absent makes `dm lab register` idempotent (#544): it exits 0
+# whether it registered or skipped an already-present fixture, so a
+# re-run after `git pull` is clean WITHOUT parsing error text. (force
+# and if-absent are mutually exclusive; force wins.)
 register_args=()
 if [ "$FORCE" = true ]; then
     register_args+=("--force")
+else
+    register_args+=("--if-absent")
 fi
 
 # Render the optional register-args portion for dry-run output. Using
@@ -117,23 +123,27 @@ for fixture in "${fixtures_found[@]}"; do
         ok=$((ok + 1))
         continue
     fi
-    # Capture output so an "already registered" rejection can be
-    # demoted from failure → skip (#501): re-running the script after a
-    # `git pull` is idempotent — already-present built-ins are left
-    # untouched (use --force to refresh them). `if cmd; then` also keeps
-    # `set -e` from aborting on the non-zero rejection exit.
+    # With --if-absent / --force, register exits 0 on success (registered
+    # OR skipped), so a NON-ZERO exit is now an unambiguous real failure —
+    # no error-text grep gates the skip path, so the #501 non-idempotent
+    # regression can't be silently reintroduced by rewording a Rust error.
+    # `if cmd; then` keeps `set -e` from aborting on a genuine failure.
     #
     # `${register_args[@]+"${register_args[@]}"}` is the bash-3.2-safe
-    # empty-array expansion: macOS ships bash 3.2, where a bare
-    # `"${arr[@]}"` on an EMPTY array trips `set -u`'s nounset (a bug
-    # fixed in bash 4.4). The `+`-guard expands to nothing when the
-    # array is unset/empty, so the no-`--force` path is portable.
+    # empty-array expansion (macOS bash 3.2 trips `set -u` on a bare
+    # `"${arr[@]}"` over an empty array; the `+`-guard expands to nothing).
     if out="$(darkmux lab register ${register_args[@]+"${register_args[@]}"} "$fixture_clean" 2>&1)"; then
-        printf '%s\n' "$out"
-        ok=$((ok + 1))
-    elif printf '%s' "$out" | grep -qi "already registered"; then
-        echo "  [skip] already registered: $fixture_clean (use --force to refresh)"
-        skipped=$((skipped + 1))
+        # COSMETIC ONLY: a skip prints "skipped (--if-absent)"; matching it
+        # just splits the summary counts. A miss mis-labels (counts as
+        # registered) but never fails the run, so this grep is no longer
+        # load-bearing.
+        if printf '%s' "$out" | grep -qi "skipped"; then
+            echo "  [skip] already registered: $fixture_clean (use --force to refresh)"
+            skipped=$((skipped + 1))
+        else
+            printf '%s\n' "$out"
+            ok=$((ok + 1))
+        fi
     else
         printf '%s\n' "$out" >&2
         echo "lab-init: registration failed for $fixture_clean" >&2
