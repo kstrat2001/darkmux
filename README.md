@@ -25,11 +25,11 @@ Local AI is good at things frontier models aren't — fast iteration, repeatabil
 
 **The Genesis series.**
 
-- **[Part 1](https://darklyenergized.substack.com/p/can-a-35b-local-model-write-your)** — *Can a 35B local model write your code?* Sweep many models on the same workload, pick a few that work locally.
-- **[Part 2](https://darklyenergized.substack.com/p/part-2-charting-the-wake)** — *Charting the Wake.* Tune the knobs scientifically; get the most out of the right model. Empirical finding: configuration drift around the model matters more than the model.
-- **[Part 3](https://darklyenergized.substack.com/p/PUBLISH_URL_TBD)** — *Hybrid by Design.* The architectural reveal — what the operator-orchestrator-darkmux-local-stack continuum actually looks like once the protocol survives the orchestrator deciding where work goes. Closes the Genesis arc.
+- **[Darkmux Genesis I](https://darklyenergized.substack.com/p/can-a-35b-local-model-write-your)** — *Can a 35B Local Model Write Your Unit Tests?* Sweep many models on the same workload, pick a few that work locally.
+- **[Darkmux Genesis II](https://darklyenergized.substack.com/p/part-2-charting-the-wake)** — *Charting the Wake.* Tune the knobs scientifically; get the most out of the right model. Empirical finding: configuration drift around the model matters more than the model.
+- **[Darkmux Genesis III](https://darklyenergized.substack.com/p/PUBLISH_URL_TBD)** — *Hybrid by Design.* The architectural reveal — what the operator-orchestrator-darkmux-local-stack continuum actually looks like once the protocol survives the orchestrator deciding where work goes. Closes the Genesis arc.
 
-Posts after Part 3 will appear on the same Substack but stand alone — the Genesis series is the *why this exists* story; subsequent work is the *what's next*.
+Posts after the Genesis series will appear on the same Substack but stand alone — the trilogy is the *why this exists* story; subsequent work is the *what's next*.
 
 **The long view.** Once a local stack is optimized, the next step is collaboration — frontier, local, and specialized models on the same task. The optimizing agent (Claude, by default) is part of the team being optimized; it maintains the team's integrity as new models arrive and hardware changes. Optimization is not the destination — it's how the team stays sharp.
 
