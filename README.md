@@ -12,7 +12,7 @@ Built for operators who need to see what their AI fleet did, when, and why.
 - 🔧 **Operator sovereignty by design** — defaults are overridable, writes are auditable, suggestions are explainable.
 - 📊 **Reproducible benchmarks** — `darkmux lab run <workload>` captures timing + trajectory + verify outcome, so empirical claims in the article series can be re-run by anyone with the binary.
 
-**AI-first local-AI orchestrator** — darkmux uses local-AI internally to manage your local-AI workflows. Task-class-aware profile multiplexing, admin-agent dispatch verbs (like `mission propose`), and a mission/sprint lifecycle, on top of LMStudio. Developed on Apple Silicon. **Assumes a frontier orchestrator** (Claude Code) — the engagement work happens in the frontier session.
+**AI-first local-AI orchestrator** — darkmux uses local-AI internally to manage your local-AI workflows. Task-class-aware profile multiplexing, utility-agent dispatch verbs (like `mission propose`), and a mission/sprint lifecycle, on top of LMStudio. Developed on Apple Silicon. **Assumes a frontier orchestrator** (Claude Code) — the engagement work happens in the frontier session.
 
 > **Heads up — read before running.**
 > darkmux orchestrates AI tools that execute on your machine. It modifies your local config files (`~/.openclaw/openclaw.json`), sends commands to your local LMStudio server, and — in lab mode — runs AI-generated code in a working directory that is **not a security sandbox**. AI agents can behave unexpectedly. Use it on a machine where that is acceptable. Performance numbers in this README and in the accompanying articles are measured on the author's hardware (M5 Max, 128 GB) and will differ on yours. See [DISCLAIMER.md](./DISCLAIMER.md) for details. MIT licensed, no warranty, use at your own risk.
@@ -154,7 +154,7 @@ The `--force` flag tells cargo to replace the existing binary even when the sour
 
 ## Why this exists
 
-**AI-first because today you'd be crazy not to.** Pre-AI, integrating a new source or structuring an unstructured intent meant writing a bespoke parser; tools for local-AI orchestration meant operators hand-authoring JSON for missions, sprints, and profiles. With AI in the loop — specifically a small, fast, dependable *admin agent* loaded locally — that authoring tax mostly evaporates. darkmux dispatches admin agents internally for compaction, sprint estimation, and (per [#113](https://github.com/kstrat2001/darkmux/issues/113)) mission proposal, so the operator gets structured output from vague intent without leaving the local tier. The frontier orchestrator stays on strategy; the admin agent absorbs the routine.
+**AI-first because today you'd be crazy not to.** Pre-AI, integrating a new source or structuring an unstructured intent meant writing a bespoke parser; tools for local-AI orchestration meant operators hand-authoring JSON for missions, sprints, and profiles. With AI in the loop — specifically a small, fast, dependable *utility agent* loaded locally — that authoring tax mostly evaporates. darkmux dispatches utility agents internally for compaction, sprint estimation, and (per [#113](https://github.com/kstrat2001/darkmux/issues/113)) mission proposal, so the operator gets structured output from vague intent without leaving the local tier. The frontier orchestrator stays on strategy; the utility agent absorbs the routine.
 
 The other half of the answer is the original one: local-AI users hit a real workload-tax problem when they go agentic. A single static configuration can't be optimal across:
 
@@ -177,7 +177,7 @@ darkmux is a CLI binary, not an HTTP proxy. Your frontier session (Claude Code) 
 
 1. **Profile multiplexing.** `darkmux swap <profile>` unloads + loads models in LMStudio according to a named profile in `~/.darkmux/profiles.json`. `darkmux swap recommended` resolves the active hardware tier to the bake-off-validated profile + pre-flight-checks the required models are downloaded. `~10s` wall to swap.
 
-2. **Crew + mission + sprint lifecycle.** `darkmux crew dispatch <role>` invokes a per-role-pinned agent (coder, code-reviewer, scribe, …) via the in-house container-bounded runtime by default (or openclaw via `--runtime openclaw`). `darkmux mission propose` + `darkmux sprint estimate` are admin-AI verbs that turn vague intent into structured Mission + Sprint JSONs without the operator authoring them by hand. Each dispatch emits a flow record carrying provenance: `machine_id`, `orchestrator`, role, model, mission, sprint.
+2. **Crew + mission + sprint lifecycle.** `darkmux crew dispatch <role>` invokes a per-role-pinned agent (coder, code-reviewer, scribe, …) via the in-house container-bounded runtime by default (or openclaw via `--runtime openclaw`). `darkmux mission propose` + `darkmux sprint estimate` are utility-AI verbs that turn vague intent into structured Mission + Sprint JSONs without the operator authoring them by hand. Each dispatch emits a flow record carrying provenance: `machine_id`, `orchestrator`, role, model, mission, sprint.
 
 3. **Flow substrate.** Every dispatch, decision, and review is recorded as a structured JSONL event. `LocalFileSink` (always-on) writes to `~/.darkmux/flows/`. `AuditFileSink` (opt-in via `DARKMUX_AUDIT_DIR`) adds a BLAKE3 hash chain for tamper-evidence. `RedisSink` (opt-in via `DARKMUX_REDIS_URL`) adds a cross-machine coordination stream. `darkmux flow status` introspects the substrate; `darkmux flow integrity-check` walks the audit chain.
 
@@ -192,7 +192,7 @@ Both `crew dispatch` and `lab run` use the internal Docker-bounded runtime by de
 
 OSS-published under personal GitHub: `github.com/kstrat2001/darkmux`. Darkly Energized is the brand context but darkmux is intentionally independent (no commercial coupling).
 
-The name comes from the multiplexer core — task-class-aware routing of LMStudio loadouts. The project has since grown into an AI-first local-AI orchestrator: small CLI primitives for the routing, plus AI-built-in verbs (`mission propose`, `sprint estimate`, `notebook draft`) that compose those primitives with admin-agent dispatch so the operator gets structured output without writing JSON by hand. Earlier framings of darkmux as *"infrastructure, not an agent framework"* were honest at the time, but the binary today embeds AI dispatch logic internally — calling it AI-first out loud is the honest move.
+The name comes from the multiplexer core — task-class-aware routing of LMStudio loadouts. The project has since grown into an AI-first local-AI orchestrator: small CLI primitives for the routing, plus AI-built-in verbs (`mission propose`, `sprint estimate`, `notebook draft`) that compose those primitives with utility-agent dispatch so the operator gets structured output without writing JSON by hand. Earlier framings of darkmux as *"infrastructure, not an agent framework"* were honest at the time, but the binary today embeds AI dispatch logic internally — calling it AI-first out loud is the honest move.
 
 ## Design principles
 
@@ -335,7 +335,7 @@ The case for darkmux: **once you accept that static configs leave performance on
 - ✅ Lab reproducibility (#487): per-run copy-on-write sandbox isolation (source never mutated), `baseline_hash` + `final_hash` content hashing in the run manifest, a fixture registry with `lab register`/`unregister`/`fixtures`/`doctor` verbs, workload `requires_fixture` resolution, and `scripts/lab-init.sh` + the built-in `demo-tiny-py` fixture
 - ✅ Notebook (`notebook draft`/`list`) — cross-machine via `DARKMUX_NOTEBOOK_DIR`
 - ✅ Agent-invocable skills bundle (12 skills including `/darkmux-bootstrap`)
-- ✅ Crew + Role + Mission + Sprint schema with SQLite-backed index; `mission propose` + `sprint estimate` admin-AI verbs
+- ✅ Crew + Role + Mission + Sprint schema with SQLite-backed index; `mission propose` + `sprint estimate` utility-AI verbs
 - ✅ Per-role `agent.model` pinning (#160) with bake-off-derived defaults; doctor surfaces drift
 - ✅ Recommendation registry per hardware tier (#159) with `swap recommended` + `model pull-recommended`; doctor surfaces drift
 - ✅ Flow substrate: `LocalFileSink` (always) + `AuditFileSink` (BLAKE3 hash chain, verifiable via `flow integrity-check`; opt-in) + `RedisSink` (coordination; opt-in), composed via `TeeSink`

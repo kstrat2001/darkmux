@@ -75,7 +75,7 @@ pub(crate) const BUILTIN_ROLE_PROMPTS: &[(&str, &str)] = &[
 /// (#425) Autonomous-dispatch preamble — prepended to specialist
 /// role prompts at dispatch-time so the model knows upfront it
 /// can't ask questions, can't pause, and should escalate
-/// explicitly if blocked. Admin roles (bounded-I/O transformers
+/// explicitly if blocked. Utility roles (bounded-I/O transformers
 /// like mission-compiler) skip the preamble since they don't run
 /// agent loops.
 const AUTONOMOUS_DISPATCH_PREAMBLE: &str =
@@ -317,13 +317,21 @@ pub fn load_roles() -> Result<Vec<Role>> {
     // Load user-defined roles first.
     let mut map: BTreeMap<String, Role> = BTreeMap::new();
     for (_id, role) in read_all_roles(&roles_dir)? {
+        validate_role_family(&role, RoleSource::User)?;
         map.insert(role.id.clone(), role);
     }
 
     // Built-in roles fill in any ids not covered by user files.
     for (id, json) in BUILTIN_ROLES {
         match serde_json::from_str::<Role>(json) {
-            Ok(role) => { map.entry(id.to_string()).or_insert(role); }
+            Ok(role) => {
+                // Defense-in-depth: builtin manifests get the same
+                // validation as user-authored ones. A future builtin
+                // drift back to `admin` would bail loudly here rather
+                // than silently shipping the wrong family.
+                validate_role_family(&role, RoleSource::Builtin)?;
+                map.entry(id.to_string()).or_insert(role);
+            }
             Err(e) => eprintln!("warning: failed to parse builtin role \"{id}\": {e}"),
         }
     }
@@ -340,6 +348,57 @@ pub fn load_roles() -> Result<Vec<Role>> {
         }
         role
     }).collect())
+}
+
+/// Where a Role came from. Drives the error message in
+/// `validate_role_family` — user-authored manifests get an actionable
+/// file path; builtin manifests can't be operator-edited and get a
+/// "please file an issue" message instead.
+#[derive(Debug, Clone, Copy)]
+enum RoleSource {
+    /// Operator-authored manifest under `roles_dir()`.
+    User,
+    /// Embedded manifest from `templates/builtin/roles/` — operator
+    /// cannot edit it, so the actionable repair is "file an issue."
+    Builtin,
+}
+
+/// Validate a role's `role_family` field against the post-rename
+/// vocabulary. The legacy `"admin"` value was renamed to `"utility"`
+/// in the codebase-wide nomenclature transition; pre-1.0 there's no
+/// compat alias. Loud-fail at the loader boundary with an
+/// operator-actionable error message that names the offending role,
+/// the legacy value, the new value, and a repair path appropriate
+/// to where the manifest came from.
+///
+/// Other unknown values (including `None` and `"specialist"`) are
+/// accepted — the matcher (`Role::is_specialist`) handles them
+/// silently with the preventive-specialist default. This validator's
+/// scope is strictly the migration from the legacy value.
+fn validate_role_family(role: &Role, source: RoleSource) -> Result<()> {
+    if matches!(role.role_family.as_deref(), Some("admin")) {
+        return Err(match source {
+            RoleSource::User => anyhow::anyhow!(
+                "role `{}` has `role_family: \"admin\"`, which was renamed to \"utility\" \
+                 in the codebase-wide nomenclature transition. Pre-1.0 there's no \
+                 compat alias — update your role manifest at `{}/{}.json` to set \
+                 `\"role_family\": \"utility\"` (the canonical bounded-I/O family).",
+                role.id,
+                roles_dir().display(),
+                role.id
+            ),
+            RoleSource::Builtin => anyhow::anyhow!(
+                "internal regression: builtin role `{}` declares the legacy \
+                 `role_family: \"admin\"` value, which was renamed to \"utility\" \
+                 in the codebase-wide nomenclature transition. This is not an \
+                 operator-actionable error — please file an issue at \
+                 https://github.com/kstrat2001/darkmux/issues with the role id \
+                 (`{}`) and your darkmux version (`darkmux --version`).",
+                role.id, role.id
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Load all crews.
@@ -1103,7 +1162,31 @@ mod load_per_mission_tests {
     }
 
     #[test]
-    fn role_family_admin_opts_out_of_specialist() {
+    fn role_family_utility_opts_out_of_specialist() {
+        let role = Role {
+            id: "test-role".into(),
+            description: "A test role".into(),
+            skills: vec![],
+            tool_palette: ToolPalette { allow: vec!["read".into()], deny: vec![] },
+            escalation_contract: EscalationContract::BailWithExplanation,
+            prompt_path: None,
+            tier: None,
+            bail_after_compactions: None,
+            escalation_posture: None,
+            role_family: Some("utility".into()),
+            feedback_templates: None,
+        };
+        assert!(!role.is_specialist());
+    }
+
+    /// Legacy `"admin"` value (renamed to `"utility"` in the
+    /// admin→utility nomenclature transition) is treated as
+    /// specialist by `is_specialist()` itself — silent fallthrough
+    /// at the matcher layer. The loud-fail lives at the loader
+    /// boundary (`validate_role_family`) so the matcher stays
+    /// branch-free. See `validate_rejects_legacy_admin_role_family`.
+    #[test]
+    fn legacy_admin_value_is_silently_specialist_at_matcher_layer() {
         let role = Role {
             id: "test-role".into(),
             description: "A test role".into(),
@@ -1117,7 +1200,11 @@ mod load_per_mission_tests {
             role_family: Some("admin".into()),
             feedback_templates: None,
         };
-        assert!(!role.is_specialist());
+        // Matcher only recognizes "utility" — legacy "admin" falls
+        // through to specialist (preventive default). Production paths
+        // rely on the loader's validator catching this before the
+        // matcher ever sees it.
+        assert!(role.is_specialist());
     }
 
     #[test]
@@ -1140,8 +1227,8 @@ mod load_per_mission_tests {
 
     #[serial]
     #[test]
-    fn mission_compiler_manifest_declares_role_family_admin() {
-        // The one canonical admin role today. Pins the manifest's
+    fn mission_compiler_manifest_declares_role_family_utility() {
+        // The one canonical utility role today. Pins the manifest's
         // role_family value so a future edit that accidentally
         // removed it would fail loudly + force a conscious decision.
         let _guard = TestCrewRoot::new();
@@ -1149,8 +1236,8 @@ mod load_per_mission_tests {
         let mc = roles.iter()
             .find(|r| r.id == "mission-compiler")
             .expect("mission-compiler must be in the embedded role registry");
-        assert_eq!(mc.role_family.as_deref(), Some("admin"),
-            "mission-compiler must be tagged role_family: admin — it's the canonical bounded-I/O role; \
+        assert_eq!(mc.role_family.as_deref(), Some("utility"),
+            "mission-compiler must be tagged role_family: utility — it's the canonical bounded-I/O role; \
              retagging requires explicit operator decision since it changes preamble behavior");
         assert!(!mc.is_specialist());
     }
@@ -1169,8 +1256,89 @@ mod load_per_mission_tests {
                 continue;
             }
             assert!(r.is_specialist(),
-                "role `{}` must be specialist (default or explicit) — only mission-compiler is admin today",
+                "role `{}` must be specialist (default or explicit) — only mission-compiler is utility today",
                 r.id);
         }
+    }
+
+    /// Loader rejects the legacy `"admin"` role_family value from a
+    /// user-authored manifest with an operator-actionable error
+    /// message that names the rename, points at the offending file
+    /// path, and tells the operator what to change. Pre-1.0 no-compat
+    /// doctrine — no silent rewrite, no env-var alias.
+    #[test]
+    fn validate_rejects_legacy_admin_role_family_user_source() {
+        let legacy_role = Role {
+            id: "legacy-role".into(),
+            description: "A role using the pre-rename admin value".into(),
+            skills: vec![],
+            tool_palette: ToolPalette { allow: vec!["read".into()], deny: vec![] },
+            escalation_contract: EscalationContract::BailWithExplanation,
+            prompt_path: None,
+            tier: None,
+            bail_after_compactions: None,
+            escalation_posture: None,
+            role_family: Some("admin".into()),
+            feedback_templates: None,
+        };
+        let err = super::validate_role_family(&legacy_role, super::RoleSource::User).expect_err(
+            "validator must reject the legacy `admin` value on user-authored roles"
+        );
+        let msg = format!("{err}");
+        assert!(msg.contains("legacy-role"), "msg names the offending role: {msg}");
+        assert!(msg.contains("\"admin\""), "msg names the legacy value: {msg}");
+        assert!(msg.contains("\"utility\""), "msg names the new value: {msg}");
+        // User-source message points at the editable file path.
+        assert!(msg.contains("legacy-role.json"), "msg points at the file to edit: {msg}");
+    }
+
+    /// Builtin-source rejection produces a different message — operator
+    /// can't edit embedded manifests, so the actionable repair is
+    /// "please file an issue" rather than "edit your manifest."
+    #[test]
+    fn validate_rejects_legacy_admin_role_family_builtin_source() {
+        let legacy_role = Role {
+            id: "broken-builtin".into(),
+            description: "Simulates a builtin manifest that drifted back to admin".into(),
+            skills: vec![],
+            tool_palette: ToolPalette { allow: vec!["read".into()], deny: vec![] },
+            escalation_contract: EscalationContract::BailWithExplanation,
+            prompt_path: None,
+            tier: None,
+            bail_after_compactions: None,
+            escalation_posture: None,
+            role_family: Some("admin".into()),
+            feedback_templates: None,
+        };
+        let err = super::validate_role_family(&legacy_role, super::RoleSource::Builtin)
+            .expect_err("validator must reject the legacy `admin` value on builtin roles");
+        let msg = format!("{err}");
+        assert!(msg.contains("broken-builtin"), "msg names the offending role: {msg}");
+        assert!(msg.contains("internal regression"), "msg flags this is not operator-actionable: {msg}");
+        assert!(msg.contains("file an issue"), "msg points to the right repair path: {msg}");
+    }
+
+    #[test]
+    fn validate_accepts_utility_specialist_and_none() {
+        let mut r = Role {
+            id: "test-role".into(),
+            description: "A test role".into(),
+            skills: vec![],
+            tool_palette: ToolPalette { allow: vec!["read".into()], deny: vec![] },
+            escalation_contract: EscalationContract::BailWithExplanation,
+            prompt_path: None,
+            tier: None,
+            bail_after_compactions: None,
+            escalation_posture: None,
+            role_family: None,
+            feedback_templates: None,
+        };
+        // Source doesn't matter for the accept path — assert both.
+        assert!(super::validate_role_family(&r, super::RoleSource::User).is_ok(), "None+User must pass");
+        assert!(super::validate_role_family(&r, super::RoleSource::Builtin).is_ok(), "None+Builtin must pass");
+        r.role_family = Some("utility".into());
+        assert!(super::validate_role_family(&r, super::RoleSource::User).is_ok(), "utility+User must pass");
+        r.role_family = Some("specialist".into());
+        assert!(super::validate_role_family(&r, super::RoleSource::User).is_ok(), "specialist+User must pass");
     }
 }

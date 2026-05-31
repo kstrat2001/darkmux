@@ -67,7 +67,7 @@ The three tiers darkmux understands (#246, doctor's `check_machine_tier_declared
 | Tier | What it's for | Typical hardware |
 |---|---|---|
 | `inference` | Heavy reasoning peers. 35B+ specialist work; the actual model compute. | M-series with 64+ GB unified memory; deep GPU headroom |
-| `hub` | Always-on infrastructure: Redis, daemon HTTP, audit log writer. Can run 4B admin agents (compactor, scribe, mission-compiler). | Lower-memory always-on box; sometimes the coordinator |
+| `hub` | Always-on infrastructure: Redis, daemon HTTP, audit log writer. Can run 4B utility agents (compactor, scribe, mission-compiler). | Lower-memory always-on box; sometimes the coordinator |
 | `client` | UI-only; no local LLM. Future mobile / consumer / older laptop. | Tier C; not common today |
 
 Ask the operator: *"What's this machine for?"* Based on the answer, propose a tier. Examples:

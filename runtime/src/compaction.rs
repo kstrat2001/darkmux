@@ -53,8 +53,8 @@ use crate::lmstudio::{ChatRequest, LmStudioClient, Message};
 /// at 1M.
 pub const DEFAULT_THRESHOLD_RATIO: f32 = 0.5;
 
-/// Default compactor model — the bake-off-hired admin agent
-/// (Beat 21: "the dependable admin agent"). Same model openclaw uses
+/// Default compactor model — the bake-off-hired utility agent
+/// (Beat 21: "the dependable utility agent"). Same model openclaw uses
 /// by convention. Override via `profile.runtime.compaction.extras.model`
 /// (openclaw-shape passthrough that survived the #357 typed schema)
 /// → host passes as `--compactor-model <id>`.
@@ -902,7 +902,7 @@ fn patch_missing_required_fields(mut value: serde_json::Value) -> (serde_json::V
 /// (#376) Pull the structured-output JSON string out of a chat-
 /// completion message, with a fallback to `reasoning_content` for
 /// thinking-mode models. Qwen 3.x line, deepseek-r1, and other
-/// thinking-mode admin candidates route their `<think>...</think>`
+/// thinking-mode utility candidates route their `<think>...</think>`
 /// output into `reasoning_content` rather than `content`. When asked
 /// for JSON-mode output via `response_format: json_schema`, those
 /// models put the JSON THERE, leaving `content` empty (or `None`).

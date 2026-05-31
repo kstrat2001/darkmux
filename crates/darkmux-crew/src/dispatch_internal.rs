@@ -196,7 +196,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         )
     })?;
     // (#425) Prepend the autonomous-dispatch preamble for specialist
-    // roles. Admin roles (bounded-I/O transformers like mission-
+    // roles. Utility roles (bounded-I/O transformers like mission-
     // compiler) skip it — they don't run agent loops and structurally
     // can't enter the asking-mode failure shape the preamble guards
     // against. Default (role_family unset) = specialist (preventive

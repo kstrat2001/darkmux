@@ -32,7 +32,7 @@ pub fn characterize(opts: &CharacterizeOpts) -> Result<CharacterizeReport> {
         runs: 1,
         config_path: opts.config.clone(),
         quiet: true,
-        // characterize() is an internal admin operation — uses default
+        // characterize() is an internal utility operation — uses default
         // runtime (internal, post-Sprint-D).
         runtime: darkmux_crew::dispatch::Runtime::Internal,
         // runtime_cmd is unused by the internal path; "openclaw" for

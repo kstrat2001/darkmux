@@ -819,7 +819,7 @@ fn check_machine_tier_declared() -> Check {
                 "`{other}` — not one of inference/hub/client; tier-aware routing may not match"
             ),
             hint: Some(
-                "Set DARKMUX_MACHINE_TIER to one of: inference (heavy-model peer), hub (always-on infra + 4B admin agents), client (UI only).".into(),
+                "Set DARKMUX_MACHINE_TIER to one of: inference (heavy-model peer), hub (always-on infra + 4B utility agents), client (UI only).".into(),
             ),
         },
         None => Check {

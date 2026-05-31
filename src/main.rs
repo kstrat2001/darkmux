@@ -540,7 +540,7 @@ enum MissionCmd {
         reasoning: Option<String>,
     },
     /// Propose a Mission + Sprints from unstructured input (#113 Sprint 3).
-    /// Dispatches the `mission-compiler` admin agent against the input,
+    /// Dispatches the `mission-compiler` utility agent against the input,
     /// renders the proposal to the operator for approve/edit/reject/regen,
     /// and writes the JSONs only after approval. The operator approval
     /// gate is non-negotiable per operator-sovereignty (#44).
@@ -700,7 +700,7 @@ enum FleetCmd {
         /// Example: `studio`, `laptop`, `mini-1`.
         id: String,
         /// Hardware tier: `inference` (heavy-model peer), `hub`
-        /// (always-on infra + admin agents), `client` (UI-only).
+        /// (always-on infra + utility agents), `client` (UI-only).
         #[arg(long)]
         tier: String,
         /// Tailnet address or DNS name to reach the daemon on. Example:
