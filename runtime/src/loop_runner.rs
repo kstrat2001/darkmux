@@ -1687,7 +1687,7 @@ mod tests {
         let initial = vec![Message::system("test"), Message::user("burn budget")];
         let tools = [Tool::Read];
 
-        let cfg = compaction::CompactionConfig::default();
+        let cfg = compaction::CompactionConfig::never_compact();
         // (#457) Test specifically exercises the cumulative-tokens cap.
         // After the cap became operator-opt-in (default None = unlimited),
         // we have to pass an explicit Some() here or the loop runs
@@ -1742,7 +1742,7 @@ mod tests {
         let initial = vec![Message::system("test"), Message::user("hi")];
         let tools = [Tool::Read];
 
-        let cfg = compaction::CompactionConfig::default();
+        let cfg = compaction::CompactionConfig::never_compact();
         // (#457) Counter-test to the cap-fire path. Set Some(250_000)
         // for parity with the cap-fire test; the mock returns a stop
         // turn quickly so we never approach it.
@@ -1789,7 +1789,7 @@ mod tests {
         let initial = vec![Message::system("test"), Message::user("loop forever")];
         let tools = [Tool::Read];
 
-        let cfg = compaction::CompactionConfig::default();
+        let cfg = compaction::CompactionConfig::never_compact();
         // (#457) Test exercises the MaxTurns terminal — needs Some(N)
         // for the cap to fire. 100 matches the prior hardcoded default.
         let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new())
@@ -1847,7 +1847,7 @@ mod tests {
         let initial = vec![Message::system("test"), Message::user("loop fail")];
         let tools = [Tool::Bash];
 
-        let cfg = compaction::CompactionConfig::default();
+        let cfg = compaction::CompactionConfig::never_compact();
         // (#457) Test relies on MaxTurns to terminate the loop — needs
         // Some(100) explicitly now that the cap is operator-opt-in.
         let _outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new())
@@ -1913,7 +1913,7 @@ mod tests {
         let initial = vec![Message::system("test"), Message::user("loop")];
         let tools = [Tool::Read];
 
-        let cfg = compaction::CompactionConfig::default();
+        let cfg = compaction::CompactionConfig::never_compact();
         // Let the loop run to MAX_TURNS — the cycle should fire well
         // before. (#457) Cap is operator-opt-in now; pass Some(100)
         // explicitly so the loop terminates at the same point this
@@ -1988,7 +1988,7 @@ mod tests {
         let initial = vec![Message::system("test"), Message::user("loop")];
         let tools = [Tool::Read];
 
-        let cfg = compaction::CompactionConfig::default();
+        let cfg = compaction::CompactionConfig::never_compact();
         // (#457) Same MaxTurns-relying pattern as the cycle/cascade
         // tests above; needs Some(100) now that the cap is opt-in.
         let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new())
@@ -2100,7 +2100,7 @@ mod tests {
         let initial = vec![Message::system("test"), Message::user("read x.txt")];
         let tools = [Tool::Read];
 
-        let cfg = compaction::CompactionConfig::default();
+        let cfg = compaction::CompactionConfig::never_compact();
         let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new())
             .expect("promoted XML tool call should drive the loop, not error");
 
@@ -2214,7 +2214,7 @@ mod tests {
         let initial = vec![Message::system("test"), Message::user("read x.txt")];
         let tools = [Tool::Read];
 
-        let cfg = compaction::CompactionConfig::default();
+        let cfg = compaction::CompactionConfig::never_compact();
         // Cap turns at 3 so the loop terminates if salvage works (it'll
         // run turn 1 → salvage dispatch → turn 2 → ... → MAX_TURNS).
         let outcome = run(
@@ -2285,7 +2285,7 @@ mod tests {
         let initial = vec![Message::system("test"), Message::user("read x.txt")];
         let tools = [Tool::Read];
 
-        let cfg = compaction::CompactionConfig::default();
+        let cfg = compaction::CompactionConfig::never_compact();
         let outcome = run(
             &client,
             "test-model",
@@ -2355,7 +2355,7 @@ mod tests {
         let initial = vec![Message::system("test"), Message::user("read x.txt")];
         let tools = [Tool::Read];
 
-        let cfg = compaction::CompactionConfig::default();
+        let cfg = compaction::CompactionConfig::never_compact();
         let outcome = run(
             &client,
             "test-model",
@@ -2421,7 +2421,7 @@ mod tests {
         let initial = vec![Message::system("test"), Message::user("read x.txt")];
         let tools = [Tool::Read];
 
-        let cfg = compaction::CompactionConfig::default();
+        let cfg = compaction::CompactionConfig::never_compact();
         let result = run(
             &client,
             "test-model",
@@ -2475,7 +2475,7 @@ mod tests {
         let initial = vec![Message::system("test"), Message::user("read x.txt")];
         let tools = [Tool::Read];
 
-        let cfg = compaction::CompactionConfig::default();
+        let cfg = compaction::CompactionConfig::never_compact();
         let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new())
             .expect("recovered call from length-truncated response should drive the loop");
 
@@ -2530,7 +2530,7 @@ mod tests {
         let initial = vec![Message::system("test"), Message::user("read x.txt")];
         let tools = [Tool::Read];
 
-        let cfg = compaction::CompactionConfig::default();
+        let cfg = compaction::CompactionConfig::never_compact();
         let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new())
             .expect("promoted XML tool call from reasoning_content should drive the loop");
 
@@ -2613,7 +2613,7 @@ mod tests {
         let initial = vec![Message::system("test"), Message::user("read x.txt")];
         let tools = [Tool::Read];
 
-        let cfg = compaction::CompactionConfig::default();
+        let cfg = compaction::CompactionConfig::never_compact();
         let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new())
             .expect("clean two-turn dispatch");
 
@@ -2676,7 +2676,7 @@ mod tests {
         let initial = vec![Message::system("test"), Message::user("hi")];
         let tools = [Tool::Read];
 
-        let cfg = compaction::CompactionConfig::default();
+        let cfg = compaction::CompactionConfig::never_compact();
         let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new())
             .expect("clean single-turn dispatch");
 
@@ -2715,7 +2715,7 @@ mod tests {
         ];
         let tools = [Tool::Read, Tool::Edit, Tool::Bash];
 
-        let cfg = compaction::CompactionConfig::default();
+        let cfg = compaction::CompactionConfig::never_compact();
         let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new())
             .expect("loop should terminate cleanly on first-turn stop");
 
@@ -3097,7 +3097,7 @@ mod tests {
         let initial = vec![Message::system("test"), Message::user("answer the question")];
         let tools = [Tool::Read];
 
-        let cfg = compaction::CompactionConfig::default();
+        let cfg = compaction::CompactionConfig::never_compact();
         let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new())
             .expect("stall recovery should drive the loop to Stop, not Err");
 
@@ -3164,7 +3164,7 @@ mod tests {
         let initial = vec![Message::system("test"), Message::user("verbose answer")];
         let tools = [Tool::Read];
 
-        let cfg = compaction::CompactionConfig::default();
+        let cfg = compaction::CompactionConfig::never_compact();
         let result = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new());
 
         assert!(
@@ -3201,7 +3201,7 @@ mod tests {
         let initial = vec![Message::system("test"), Message::user("ask")];
         let tools = [Tool::Read];
 
-        let cfg = compaction::CompactionConfig::default();
+        let cfg = compaction::CompactionConfig::never_compact();
         let result = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new());
 
         assert!(
@@ -3252,7 +3252,7 @@ mod tests {
         let initial = vec![Message::system("test"), Message::user("ask")];
         let tools = [Tool::Read];
 
-        let cfg = compaction::CompactionConfig::default();
+        let cfg = compaction::CompactionConfig::never_compact();
         let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new())
             .expect("recovery should drive the loop to Stop");
 
@@ -3289,7 +3289,7 @@ mod tests {
         let initial = vec![Message::system("test"), Message::user("ask")];
         let tools = [Tool::Read];
 
-        let cfg = compaction::CompactionConfig::default();
+        let cfg = compaction::CompactionConfig::never_compact();
         let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new())
             .expect("budget exhaustion returns Ok(EscalationTriggered)");
 
@@ -3354,7 +3354,7 @@ mod tests {
         let initial = vec![Message::system("test"), Message::user("ask")];
         let tools = [Tool::Read];
 
-        let cfg = compaction::CompactionConfig::default();
+        let cfg = compaction::CompactionConfig::never_compact();
         let _outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new())
             .expect("recovery succeeds");
 

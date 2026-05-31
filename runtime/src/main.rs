@@ -155,10 +155,13 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // in the system prompt and call `edit` anyway because the tool
     // existed in the catalog.
     let mut allowed_tools: Option<Vec<String>> = None;
-    // (#368) Compaction config flags — explicit values from the host
-    // (which derives them from `profile.runtime.compaction.*` in the
-    // typed schema landed in #357). When absent, the runtime uses
-    // CompactionConfig::default(). Env vars are NOT consulted.
+    // (#368 / #482) Compaction config flags — explicit values from the
+    // host (which derives them from `profile.runtime.compaction.*` in
+    // the typed schema landed in #357). The runtime requires at least
+    // one of `--context-window` or `--compact-threshold-tokens` per
+    // #482's `validate_compaction_cli_inputs`; the absolute fallback
+    // const that pre-#482 covered the all-None case is gone. Env vars
+    // are NOT consulted.
     let mut compact_threshold_tokens: Option<u32> = None;
     let mut compactor_model: Option<String> = None;
     // (#368) Formula-based trigger: max_history_share fraction +
@@ -503,6 +506,29 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     } else {
         println!("dispatching to model: {model}");
         println!();
+    }
+
+    // (#482) Fail loud if neither the loaded model's context window nor
+    // an explicit absolute threshold is known — pre-#482 the runtime
+    // silently fell through to a hardcoded const, which made every
+    // compaction decision downstream uncorrelated with the actual
+    // model envelope. The standard host path (`darkmux crew dispatch`,
+    // `darkmux lab run`) always supplies `--context-window` from the
+    // primary model's `n_ctx`; this check catches direct callers that
+    // bypass the host (or profiles missing a Primary model).
+    //
+    // Pre-flight ordering: validator runs BEFORE `Trajectory::open` so
+    // a contract failure doesn't leave a dangling `dispatch_start`
+    // record under `/workspace/.darkmux-runtime/trajectory.jsonl`
+    // ("dispatch started → no further records" reads like a crash to
+    // log scrapers).
+    if let Err(msg) = compaction::validate_compaction_cli_inputs(
+        compact_threshold_tokens,
+        compact_threshold_ratio,
+        context_window,
+    ) {
+        eprintln!("error: {msg}");
+        return ExitCode::from(2);
     }
 
     // Open trajectory + metrics recorder against the mounted
