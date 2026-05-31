@@ -130,7 +130,7 @@ pub struct Role {
     /// Hardware-tier requirement for the work this role does. One of
     /// `"inference"` (heavy-model peer; needs GPU + memory headroom for
     /// 35B+ specialists), `"hub"` (always-on infrastructure tier; suited
-    /// to 4B admin agents), or `"any"` (no preference; routes to whatever
+    /// to 4B utility agents), or `"any"` (no preference; routes to whatever
     /// machine is available). Absent in older manifests; the loader
     /// treats absence as `"any"`. Consumed by tier-aware dispatch
     /// routing (#246 / #247). Schema-compatible with existing role
@@ -160,13 +160,16 @@ pub struct Role {
     pub escalation_posture: Option<String>,
     /// (#425) Role family — distinguishes specialist roles (multi-
     /// turn agent-loop driven; need the autonomous-dispatch preamble
-    /// prepended to their system prompt) from admin roles (bounded-
+    /// prepended to their system prompt) from utility roles (bounded-
     /// I/O transformers; no agent loop, can't enter asking-mode
     /// failure shape, no preamble needed). One of `"specialist"` or
-    /// `"admin"`. Absent ⇒ treat as `"specialist"` (preventive
+    /// `"utility"`. Absent ⇒ treat as `"specialist"` (preventive
     /// safety: better to prepend an unneeded preamble than to miss
     /// prepending a needed one). The mission-compiler is the
-    /// canonical admin role today; all others default to specialist.
+    /// canonical utility role today; all others default to specialist.
+    /// The legacy `"admin"` value (pre-rename) is rejected by
+    /// `validate_role_family` in `loader.rs` with an operator-
+    /// actionable migration message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role_family: Option<String>,
     /// (#457 Step 2) Per-role overrides for the runtime's feedback-
@@ -202,9 +205,13 @@ impl Role {
     /// (#425) True when this role drives a multi-turn agent loop and
     /// therefore needs the autonomous-dispatch preamble prepended to
     /// its system prompt. Default (field absent) = specialist =
-    /// needs preamble. Explicit `"admin"` opts out.
+    /// needs preamble. Explicit `"utility"` opts out. The legacy
+    /// `"admin"` value was renamed to `"utility"` to match the
+    /// codebase's broader utility/specialist nomenclature; pre-1.0,
+    /// no compat alias — `validate_role_family` in `loader.rs` rejects
+    /// the legacy value with a clear migration message.
     pub fn is_specialist(&self) -> bool {
-        !matches!(self.role_family.as_deref(), Some("admin"))
+        !matches!(self.role_family.as_deref(), Some("utility"))
     }
 
     /// (#450, E14) Derive this role's effective capability profile from

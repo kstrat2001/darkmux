@@ -175,7 +175,7 @@ pub struct FlowRecord {
     pub payload: Option<serde_json::Value>,
     /// Hardware tier of the machine that emitted this record — one of
     /// `"inference"` (heavy-model peer), `"hub"` (always-on infrastructure
-    /// for admin agents), `"client"` (UI-only). Auto-populated at record
+    /// for utility agents), `"client"` (UI-only). Auto-populated at record
     /// write time from `DARKMUX_MACHINE_TIER` env, same pattern as
     /// `machine_id`. None when the operator hasn't declared a tier — the
     /// fleet topology still works for single-machine setups but tier-aware

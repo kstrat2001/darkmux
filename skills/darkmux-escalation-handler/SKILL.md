@@ -7,7 +7,7 @@ allowed-tools: "Bash(darkmux:*),Bash(cat:*),Bash(jq:*),Bash(ls:*),Bash(grep:*),B
 
 # Darkmux escalation handler
 
-This skill picks up where a local-tier dispatch left off when it hit an operator-configured escalation bound. The dispatch didn't fail — it **escalated** by design. The local tier (4B admin agents + 35B specialists running in the per-dispatch container) did what it could; past a known wall-clock or compaction-count bound, the contract says hand off to the frontier-tier orchestrator (this session) with the salvageable state.
+This skill picks up where a local-tier dispatch left off when it hit an operator-configured escalation bound. The dispatch didn't fail — it **escalated** by design. The local tier (4B utility agents + 35B specialists running in the per-dispatch container) did what it could; past a known wall-clock or compaction-count bound, the contract says hand off to the frontier-tier orchestrator (this session) with the salvageable state.
 
 ## When to invoke
 
@@ -92,7 +92,7 @@ Frontier-tier means: you (this session) become the agent. You have your own tool
 
 Some operator-facing principles:
 
-- **You're not slower than local tier; you're slower-and-smarter.** Operator escalated specifically so a more capable layer takes over. Don't try to act like a 4B admin; act like the frontier-tier orchestrator you are.
+- **You're not slower than local tier; you're slower-and-smarter.** Operator escalated specifically so a more capable layer takes over. Don't try to act like a 4B utility agent; act like the frontier-tier orchestrator you are.
 - **Verify before declaring done.** Whatever the operator's `verify_criteria` was on the workload, run it (or have the operator run it) before reporting success.
 - **Preserve the escalation trail.** When the work is done, mention in your reply where the run-dir is and how the work post-escalation differed from what local-tier had done — this is the lab signal that future tuning depends on.
 

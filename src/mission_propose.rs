@@ -1,6 +1,6 @@
 //! `darkmux mission propose` — AI-built-in verb that takes unstructured
 //! operator intent and emits a structured Mission + Sprint proposal
-//! JSON via internal dispatch to the `mission-compiler` admin role
+//! JSON via internal dispatch to the `mission-compiler` utility role
 //! (#113 Sprint 1). Operator approval gate is mandatory; the proposal
 //! is only persisted to disk after the operator accepts (operator-
 //! sovereignty per #44).
@@ -10,7 +10,7 @@
 //! section for doctrine. The frontier orchestrator carries engagement
 //! nuance natively into the input text it crafts; quantizing it into a
 //! CLI arg would (a) compress a dreamscape into a token, (b) push the
-//! interpretation tier onto a 4B admin agent that doesn't have the
+//! interpretation layer onto a 4B utility agent that doesn't have the
 //! shape for it, (c) violate the #49 rule that engagement lives in the
 //! operator-judgment layer above the system.
 //!
@@ -198,11 +198,11 @@ fn dispatch_compiler(input: &str, hint: Option<&str>) -> Result<String> {
         // mission-compiler runs BEFORE any mission/sprints exist on disk —
         // there's nothing to bind to and no parent context to inject.
         sprint_id: None,
-        // Mission propose is a system-level admin dispatch; runs
+        // Mission propose is a system-level utility dispatch; runs
         // through the internal Docker-bounded runtime — same default
         // as `darkmux crew dispatch` (#309). Beat 36 directional
         // principle: openclaw is a downstream translation target, not
-        // a hardcoded admin-dispatch dependency.
+        // a hardcoded utility-dispatch dependency.
         runtime: crate::crew::dispatch::Runtime::Internal,
         // mission-compiler pins Runtime::Internal; runtime_cmd is unused
         // by the internal path. Default "openclaw" for codebase parity.
@@ -210,7 +210,7 @@ fn dispatch_compiler(input: &str, hint: Option<&str>) -> Result<String> {
         machine: None,
         wait: true,
         // Mission-compile dispatch uses runtime-default compaction;
-        // mission-compiler role is admin-tier and doesn't accumulate
+        // mission-compiler role is utility-family and doesn't accumulate
         // large per-turn context.
         compaction: crate::crew::dispatch::CompactionDispatchArgs::default(),
     };
@@ -269,7 +269,7 @@ fn build_compiler_message(input: &str, hint: Option<&str>) -> String {
 }
 
 /// Extract the JSON object from a ```json fenced block in the
-/// response. The admin agent's role prompt requires exactly one such
+/// response. The utility agent's role prompt requires exactly one such
 /// block; we strip everything outside it and parse the inner.
 ///
 /// First unwraps the openclaw envelope (if response is wrapped); the
@@ -283,7 +283,7 @@ fn parse_proposal(response: &str) -> Result<Proposal> {
 }
 
 /// Validate cross-references inside a Proposal so a hallucinated /
-/// drifted admin-agent output can't land on disk as a broken
+/// drifted utility-agent output can't land on disk as a broken
 /// mission+sprints set. `add_sprint_to_mission` already enforces these
 /// invariants for the mid-flight add-sprint path; `propose` should hold
 /// the same bar at first-write time. Three checks:
