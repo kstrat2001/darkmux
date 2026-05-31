@@ -192,7 +192,7 @@
     <div class="btns">
       <a class="btn btn-primary" href="guide/">User guide →</a>
       <a class="btn btn-ghost" href="https://github.com/kstrat2001/darkmux">GitHub</a>
-      <a class="btn btn-ghost" href="flow/">Flow viewer</a>
+      <a class="btn btn-ghost" href="topology/">Observability demo</a>
       <a class="btn btn-ghost" href="https://substack.com/@DarklyEnergized">Read the work</a>
     </div>
   </div>
@@ -216,11 +216,11 @@
   <div class="wrap">
     <h2>Watch it work</h2>
     <h3>A daemon + viewer for live observability of dispatches, sprints, and verdicts.</h3>
-    <p><code>darkmux serve</code> runs a small HTTP daemon (default <code>127.0.0.1:8765</code>) that exposes flow records written by every dispatch and mission/sprint transition. The <a href="flow/">flow viewer</a> tails those records and renders them as an annotated timeline — cyan for operator actions, violet for orchestrator narrative, green for local-AI work. Wall-clock arcs on dispatch records; <code>model</code> field tells you which LMStudio model ran the work.</p>
+    <p><code>darkmux serve</code> runs a small HTTP daemon (default <code>127.0.0.1:8765</code>) that exposes flow records written by every dispatch and mission/sprint transition. The <a href="topology/">observability viewer</a> renders those records as one drillable view of your fleet — drill fleet → machine → subsystem, with the event stream as a log lens at any level. A <a href="topology/">live demo with sample data</a> runs on this site. Wall-clock arcs on dispatch records; <code>model</code> field tells you which LMStudio model ran the work.</p>
     <ul class="plain">
       <li><code>darkmux serve</code> — start the daemon in a separate terminal tab</li>
       <li><code>darkmux doctor</code> — pre-flight checks including <code>daemon: reachable</code></li>
-      <li><a href="flow/">darkmux.com/flow/</a> — viewer; click <strong>Connect</strong> to fetch + tail today's records</li>
+      <li><a href="topology/">darkmux.com/topology/</a> — interactive demo, sample fleet data (no install required)</li>
       <li><code>darkmux crew dispatch</code> / <code>sprint review</code> — emit flow records as they run</li>
     </ul>
     <p class="muted" style="margin-top: 24px;">Full walkthrough in the <a href="guide/observability.html">observability section of the user guide</a>.</p>
