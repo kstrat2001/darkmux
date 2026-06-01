@@ -11,6 +11,42 @@ pub mod workdir;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// AI-industry-conventional model capabilities — orthogonal optimization
+/// dimensions that map to how Anthropic, OpenAI, HuggingFace, Google,
+/// Cohere, Mistral, and Meta describe their models. A *role* requests
+/// capabilities (via the skills it declares); a *model* offers them
+/// (via its profile entry). Lives in the foundation crate so both sides
+/// — the crew/role layer and the profile/model layer — speak one
+/// vocabulary (E14 / #450).
+///
+/// Serialized form: `snake_case` (e.g. `"code"`, `"agentic_tool_use"`).
+/// Unknown variant names fail to deserialize with a clear error — no
+/// silent typo-induced zero-weight bugs. Pre-1.0 schema growth is fine;
+/// removing a variant is breaking, so seed conservatively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Capability {
+    /// Code generation + understanding. Benchmarks: HumanEval, MBPP,
+    /// BigCodeBench.
+    Code,
+    /// Multi-step reasoning + judgment. Benchmarks: MMLU, GPQA,
+    /// ARC-Challenge, MMLU-Pro.
+    Reasoning,
+    /// Adherence to structured prompts. Benchmarks: IFEval, ChatRAG.
+    InstructionFollowing,
+    /// Tool-call quality + agent loops. Benchmarks: SWE-Bench,
+    /// AgentBench, Berkeley Function Calling Leaderboard.
+    AgenticToolUse,
+}
+
+/// A weighted capability profile — maps each capability to a non-negative
+/// weight. **Sparse-as-zero**: an absent key means weight 0. **Relative
+/// weights**: magnitudes are advisory; ratios drive scoring (normalized
+/// at scoring time). `BTreeMap` for deterministic iteration (display /
+/// flow-record stamping benefit from stable ordering; the map is small,
+/// capped by the `Capability` variant count).
+pub type CapabilityProfile = BTreeMap<Capability, f32>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelRole {
@@ -26,6 +62,17 @@ pub struct ProfileModel {
     pub role: ModelRole,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identifier: Option<String>,
+    /// Capability vector — what kinds of work this model is good at, and
+    /// at what relative weights (code / reasoning / instruction_following
+    /// / agentic_tool_use). The operator populates it from lab results
+    /// (which models run well on their machine, at what context). Empty
+    /// by default. `select_model` (phase 2, #450) WILL match a role's
+    /// requested capabilities against this — treating a wholly-unvectored
+    /// model as a 0.5-everywhere generalist — with no machine tier in the
+    /// decision, only capability + lab-vetted fit (#322). Additive today:
+    /// nothing scores against it until that slice lands.
+    #[serde(default)]
+    pub capabilities: CapabilityProfile,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -366,6 +413,7 @@ mod tests {
             id: "x".to_string(),
             n_ctx: 32_000,
             role: ModelRole::Primary,
+            capabilities: Default::default(),
             identifier: Some("alias".to_string()),
         };
         let json = serde_json::to_string(&m).unwrap();
@@ -382,10 +430,34 @@ mod tests {
             id: "x".to_string(),
             n_ctx: 1024,
             role: ModelRole::Auxiliary,
+            capabilities: Default::default(),
             identifier: None,
         };
         let json = serde_json::to_string(&m).unwrap();
         assert!(!json.contains("identifier"));
+    }
+
+    #[test]
+    fn profile_model_parses_capability_vector() {
+        // A model carries an inline capability vector; absent keys are
+        // sparse-as-zero. select_model (phase 2) matches a role's needs
+        // against this — no machine tier in the decision (#450/#322).
+        let json =
+            r#"{"id":"m","n_ctx":32000,"role":"primary","capabilities":{"code":0.9,"reasoning":0.4}}"#;
+        let m: ProfileModel = serde_json::from_str(json).unwrap();
+        assert_eq!(m.capabilities.get(&Capability::Code), Some(&0.9));
+        assert_eq!(m.capabilities.get(&Capability::Reasoning), Some(&0.4));
+        assert_eq!(m.capabilities.get(&Capability::AgenticToolUse), None); // sparse-as-zero
+        let back: ProfileModel =
+            serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(back.capabilities, m.capabilities);
+    }
+
+    #[test]
+    fn capability_rejects_unknown_variant() {
+        // A typo'd capability fails loud rather than silently scoring zero.
+        let r: Result<Capability, _> = serde_json::from_str("\"coding\"");
+        assert!(r.is_err());
     }
 
     #[test]

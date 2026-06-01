@@ -101,6 +101,7 @@ mod tests {
                 id: model_id.into(),
                 n_ctx: 100_000,
                 role: ModelRole::Primary,
+                capabilities: Default::default(),
                 identifier: None,
             }],
             ..Default::default()
@@ -151,6 +152,7 @@ mod tests {
                 id: "compactor-only".into(),
                 n_ctx: 32_000,
                 role: ModelRole::Compactor,
+                capabilities: Default::default(),
                 identifier: None,
             }],
             ..Default::default()

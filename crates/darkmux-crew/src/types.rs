@@ -9,61 +9,14 @@
 #![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-/// AI-industry-conventional model capabilities — orthogonal optimization
-/// dimensions that map directly to how Anthropic, OpenAI, HuggingFace,
-/// Google, Cohere, Mistral, and Meta describe their models.
-///
-/// Each variant represents a *kind* of work optimization. Models score
-/// independently across variants (a model can be code-strong but
-/// reasoning-weak, or vision-only); roles declare which variants they
-/// need (via the skills they declare); machines bind one model per
-/// variant via the profile's `[models]` section.
-///
-/// Phase 1 ships the four variants existing roles actually need; future
-/// variants (`Vision`, `Math`, `LongContext`, future `MultimodalAudio`,
-/// future `AgenticCodeUse` split from `Code`) land as the industry's
-/// vocabulary evolves. Pre-1.0 schema growth is fine; removing a
-/// variant is breaking, so seed conservatively.
-///
-/// Serialized form: `snake_case` (e.g., `"code"`, `"agentic_tool_use"`).
-/// Parse-time validation: unknown variant names fail to deserialize
-/// with a clear error — no silent typo-induced zero-weight bugs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Capability {
-    /// Code generation + understanding. Benchmarks: HumanEval, MBPP,
-    /// BigCodeBench. Phase-1 variant — most worker roles need this.
-    Code,
-    /// Multi-step reasoning + judgment. Benchmarks: MMLU, GPQA,
-    /// ARC-Challenge, MMLU-Pro. Phase-1 variant — analyst,
-    /// design-reviewer, mission-compiler, etc.
-    Reasoning,
-    /// Adherence to structured prompts. Benchmarks: IFEval, ChatRAG.
-    /// Phase-1 variant — scribe, voice-editor, structured-output
-    /// generation in general.
-    InstructionFollowing,
-    /// Tool-call quality + agent loops. Benchmarks: SWE-Bench,
-    /// AgentBench, Berkeley Function Calling Leaderboard. Phase-1
-    /// variant — any role driving multi-turn tool dispatches.
-    AgenticToolUse,
-}
-
-/// A weighted capability profile. Maps each capability dimension to a
-/// non-negative weight. **Sparse-as-zero semantics**: an absent
-/// capability key means weight=0 for that dimension. **Relative
-/// weights**: magnitudes are advisory; ratios drive scoring. Operators
-/// can author weights on any non-negative scale (0..1, 0..100,
-/// arbitrary); normalization happens at scoring time.
-///
-/// **`BTreeMap` for deterministic iteration** — phase-1b dispatch /
-/// `darkmux doctor` display / flow-record stamping all benefit from
-/// stable ordering. Map size is small (4-10 entries today, capped by
-/// the `Capability` enum's variant count); cost vs `HashMap` is
-/// negligible.
-pub(crate) type CapabilityProfile = BTreeMap<Capability, f32>;
+// `Capability` + `CapabilityProfile` moved to the foundation crate
+// (darkmux-types) so the profile/model layer can carry them too — a role
+// requests capabilities, a model offers them, both speak one vocabulary
+// (E14 / #450). Re-exported here so existing `crate::types::Capability`
+// references resolve unchanged.
+pub use darkmux_types::{Capability, CapabilityProfile};
 
 /// A named skill with keyword-based relevance scoring + an intrinsic
 /// capability profile. A role declares which skills it has; the
