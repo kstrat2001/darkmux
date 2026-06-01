@@ -48,9 +48,9 @@ second file format.
 |---|---|
 | **2026-05-10** | `lab run --instrument` + `instruments.jsonl` — the instrument/telemetry capability and its viewer. |
 | **2026-05-13** | the flow stream + flow viewer — built without lab in mind. |
-| later | flow's extensible event model (`fields` payload map, [#204](https://github.com/kstrat2001/darkmux/issues/204), schema 1.6). |
+| later | flow's extensible event model (the `payload` JSON map, [#204](https://github.com/kstrat2001/darkmux/issues/204), schema 1.6). |
 
-Instruments predate the flow stream by three days, **and** predate the `fields` mechanism that
+Instruments predate the flow stream by three days, **and** predate the `payload` mechanism that
 would have absorbed them. The split is historical, not architectural — and the `FlowRecord` schema
 proves it (below). The `lab` viewer file looks newer than `flow` only because it was renamed from
 `/viewer/` to `/lab/` on 2026-05-17 ([#171](https://github.com/kstrat2001/darkmux/issues/171)).
@@ -63,12 +63,12 @@ Fold per-run telemetry into the flow stream as `FlowRecord`s. The schema is alre
 
 ```
 FlowRecord { ts, level, category, tier, stage, action, handle,
-             session_id?, source?, model?, mission_id?, machine_id?, orchestrator?,
-             prev_hash?, hash?, fields? }
+             sprint_id?, session_id?, source?, model?, mission_id?, machine_id?,
+             orchestrator?, prev_hash?, hash?, payload?, machine_tier?, work_id?, attempt? }
 ```
 
 - `source` is the *same* field instrument samples already use (`lms`/`process`/`meta`).
-- `fields` is a map added in schema 1.6 ([#204](https://github.com/kstrat2001/darkmux/issues/204))
+- `payload` is a JSON map added in schema 1.6 ([#204](https://github.com/kstrat2001/darkmux/issues/204))
   whose documented purpose is *"give new event types a place to carry their event-specific fields
   without growing the struct"* — i.e., exactly an instrument sample.
 

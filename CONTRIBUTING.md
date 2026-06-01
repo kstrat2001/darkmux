@@ -65,6 +65,8 @@ darkmux is a Cargo **workspace** — most code lives in focused crates under `cr
 
 The **authoritative, kept-current** map of where each module lives is the **"Where things live"** section of [`CLAUDE.md`](CLAUDE.md) — refer to it rather than a parallel list here. A duplicated map is exactly what drifts: this section previously described a pre-workspace `src/` monolith that no longer exists.
 
+For the **conceptual model** the code implements — role families, the mission/sprint lifecycle, the internal runtime + compaction, telemetry, and the flow record, each with a `path:line` citation and a shipped-vs-planned line — see [`docs/architecture/CONCEPTS.md`](docs/architecture/CONCEPTS.md). It's the source of truth a new contributor (or agent) should read before changing any of those surfaces.
+
 ## Releases
 
 darkmux is pre-1.0. Versioning is informal until v1.0. The maintainer cuts releases manually:
