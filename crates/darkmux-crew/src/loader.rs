@@ -363,21 +363,27 @@ enum RoleSource {
     Builtin,
 }
 
-/// Validate a role's `role_family` field against the post-rename
-/// vocabulary. The legacy `"admin"` value was renamed to `"utility"`
-/// in the codebase-wide nomenclature transition; pre-1.0 there's no
-/// compat alias. Loud-fail at the loader boundary with an
-/// operator-actionable error message that names the offending role,
-/// the legacy value, the new value, and a repair path appropriate
-/// to where the manifest came from.
+/// Validate a role's `role_family` field. The family is a validated
+/// **two-value axis** (#590): `"specialist"` (works the mission/sprints)
+/// or `"utility"` (supports the runtime outside mission scope), or absent
+/// (defaults to specialist). Anything else loud-fails at the loader
+/// boundary:
 ///
-/// Other unknown values (including `None` and `"specialist"`) are
-/// accepted — the matcher (`Role::is_specialist`) handles them
-/// silently with the preventive-specialist default. This validator's
-/// scope is strictly the migration from the legacy value.
+/// - The legacy `"admin"` value (renamed to `"utility"` in the
+///   codebase-wide nomenclature transition; no pre-1.0 compat alias) gets
+///   a targeted migration message.
+/// - Any other unknown value (a typo like `"utilty"`) is rejected rather
+///   than silently treated as specialist — a silent misclassification is
+///   exactly the bug a validated axis prevents.
+///
+/// Each error names the offending role, the value, and a repair path
+/// appropriate to where the manifest came from.
 fn validate_role_family(role: &Role, source: RoleSource) -> Result<()> {
-    if matches!(role.role_family.as_deref(), Some("admin")) {
-        return Err(match source {
+    match role.role_family.as_deref() {
+        // The two recognized families, or absent (defaults to specialist).
+        None | Some("specialist") | Some("utility") => Ok(()),
+        // Legacy value renamed to "utility" — keep the targeted migration message.
+        Some("admin") => Err(match source {
             RoleSource::User => anyhow::anyhow!(
                 "role `{}` has `role_family: \"admin\"`, which was renamed to \"utility\" \
                  in the codebase-wide nomenclature transition. Pre-1.0 there's no \
@@ -396,9 +402,28 @@ fn validate_role_family(role: &Role, source: RoleSource) -> Result<()> {
                  (`{}`) and your darkmux version (`darkmux --version`).",
                 role.id, role.id
             ),
-        });
+        }),
+        // Any other value is a typo / unknown family — fail loud.
+        Some(other) => Err(match source {
+            RoleSource::User => anyhow::anyhow!(
+                "role `{}` has `role_family: \"{}\"`, which is not a recognized family. \
+                 Valid values are \"specialist\" (works the mission/sprints) or \"utility\" \
+                 (supports the runtime outside mission scope); omit the field to default to \
+                 \"specialist\". Update your role manifest at `{}/{}.json`.",
+                role.id,
+                other,
+                roles_dir().display(),
+                role.id
+            ),
+            RoleSource::Builtin => anyhow::anyhow!(
+                "internal regression: builtin role `{}` declares an unrecognized \
+                 `role_family: \"{}\"` (valid: \"specialist\" / \"utility\"). Please file an \
+                 issue at https://github.com/kstrat2001/darkmux/issues with the role id \
+                 (`{}`) and your darkmux version (`darkmux --version`).",
+                role.id, other, role.id
+            ),
+        }),
     }
-    Ok(())
 }
 
 /// Load all crews.
@@ -1228,9 +1253,9 @@ mod load_per_mission_tests {
     #[serial]
     #[test]
     fn mission_compiler_manifest_declares_role_family_utility() {
-        // The one canonical utility role today. Pins the manifest's
-        // role_family value so a future edit that accidentally
-        // removed it would fail loudly + force a conscious decision.
+        // A canonical utility role (#590 also tags scribe, and will add
+        // the compactor). Pins the manifest's role_family value so a
+        // future edit that accidentally removed it would fail loudly.
         let _guard = TestCrewRoot::new();
         let roles = load_roles().expect("load_roles must succeed against embedded defaults");
         let mc = roles.iter()
@@ -1244,20 +1269,39 @@ mod load_per_mission_tests {
 
     #[serial]
     #[test]
-    fn other_embedded_roles_default_to_specialist() {
-        // Every embedded role OTHER than mission-compiler should
-        // default to specialist (either via absent field or explicit
-        // "specialist"). The preamble-prepend logic depends on this
-        // invariant being stable.
+    fn embedded_roles_declare_expected_families() {
+        // Pin the specialist/utility split across the built-in roster (#590):
+        // utility = supports the runtime outside mission scope; specialist =
+        // works the mission/sprints. Every built-in declares the family
+        // EXPLICITLY (no implicit default), and a retag must be a conscious
+        // edit here. The preamble-prepend logic depends on this split.
         let _guard = TestCrewRoot::new();
         let roles = load_roles().expect("load_roles must succeed against embedded defaults");
+        let utility: std::collections::BTreeSet<&str> =
+            ["mission-compiler", "scribe"].into_iter().collect();
         for r in &roles {
-            if r.id == "mission-compiler" {
-                continue;
+            assert!(
+                r.role_family.is_some(),
+                "built-in role `{}` must declare role_family explicitly (#590)",
+                r.id
+            );
+            if utility.contains(r.id.as_str()) {
+                assert_eq!(
+                    r.role_family.as_deref(),
+                    Some("utility"),
+                    "role `{}` must be utility (supports the runtime outside mission scope)",
+                    r.id
+                );
+                assert!(!r.is_specialist());
+            } else {
+                assert_eq!(
+                    r.role_family.as_deref(),
+                    Some("specialist"),
+                    "role `{}` must be specialist (works the mission/sprints)",
+                    r.id
+                );
+                assert!(r.is_specialist());
             }
-            assert!(r.is_specialist(),
-                "role `{}` must be specialist (default or explicit) — only mission-compiler is utility today",
-                r.id);
         }
     }
 
@@ -1340,5 +1384,37 @@ mod load_per_mission_tests {
         assert!(super::validate_role_family(&r, super::RoleSource::User).is_ok(), "utility+User must pass");
         r.role_family = Some("specialist".into());
         assert!(super::validate_role_family(&r, super::RoleSource::User).is_ok(), "specialist+User must pass");
+    }
+
+    /// Unknown role_family values (a typo like `"worker"`) are now rejected
+    /// rather than silently treated as specialist (#590: validated two-value
+    /// axis). User source → actionable; builtin source → regression framing.
+    #[test]
+    fn validate_rejects_unknown_role_family() {
+        let r = Role {
+            id: "test-role".into(),
+            description: "A role with a typo'd family".into(),
+            skills: vec![],
+            tool_palette: ToolPalette { allow: vec!["read".into()], deny: vec![] },
+            escalation_contract: EscalationContract::BailWithExplanation,
+            prompt_path: None,
+            tier: None,
+            bail_after_compactions: None,
+            escalation_posture: None,
+            role_family: Some("worker".into()),
+            feedback_templates: None,
+        };
+        let err = super::validate_role_family(&r, super::RoleSource::User)
+            .expect_err("unknown role_family must be rejected on user roles");
+        let msg = format!("{err}");
+        assert!(msg.contains("\"worker\""), "names the bad value: {msg}");
+        assert!(msg.contains("not a recognized family"), "explains the problem: {msg}");
+        assert!(msg.contains("test-role.json"), "points at the file to edit: {msg}");
+
+        let err_b = super::validate_role_family(&r, super::RoleSource::Builtin)
+            .expect_err("unknown role_family must be rejected on builtin roles");
+        let msg_b = format!("{err_b}");
+        assert!(msg_b.contains("internal regression"), "flags not operator-actionable: {msg_b}");
+        assert!(msg_b.contains("file an issue"), "points to the repair path: {msg_b}");
     }
 }

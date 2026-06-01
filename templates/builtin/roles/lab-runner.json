@@ -1,5 +1,6 @@
 {
   "id": "lab-runner",
+  "role_family": "specialist",
   "description": "Runs darkmux lab dispatches, captures run outputs, and summarizes results for the user.",
   "skills": [
     "lab-running",

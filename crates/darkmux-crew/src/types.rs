@@ -111,18 +111,18 @@ pub struct Role {
     /// branch on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub escalation_posture: Option<String>,
-    /// (#425) Role family — distinguishes specialist roles (multi-
-    /// turn agent-loop driven; need the autonomous-dispatch preamble
-    /// prepended to their system prompt) from utility roles (bounded-
-    /// I/O transformers; no agent loop, can't enter asking-mode
-    /// failure shape, no preamble needed). One of `"specialist"` or
-    /// `"utility"`. Absent ⇒ treat as `"specialist"` (preventive
-    /// safety: better to prepend an unneeded preamble than to miss
-    /// prepending a needed one). The mission-compiler is the
-    /// canonical utility role today; all others default to specialist.
-    /// The legacy `"admin"` value (pre-rename) is rejected by
-    /// `validate_role_family` in `loader.rs` with an operator-
-    /// actionable migration message.
+    /// (#425) Role family — a **scope** distinction (#590): `"specialist"`
+    /// roles work the mission/sprints (the deliverable); `"utility"` roles
+    /// support the runtime outside mission scope (mission-compiler, scribe,
+    /// and — once #590 lands it — the compactor). The split also drives
+    /// dispatch shape: specialists run the multi-turn agent loop and get the
+    /// autonomous-dispatch preamble prepended; utility roles are bounded-I/O
+    /// transformers with no agent loop, no asking-mode failure shape, and no
+    /// preamble. Absent ⇒ treat as `"specialist"` (preventive safety: better
+    /// an unneeded preamble than a missing one). Built-in roles all declare
+    /// it explicitly. `validate_role_family` in `loader.rs` enforces the
+    /// two-value axis — the legacy `"admin"` value and any unknown value are
+    /// rejected with an operator-actionable message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role_family: Option<String>,
     /// (#457 Step 2) Per-role overrides for the runtime's feedback-

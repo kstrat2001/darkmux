@@ -1,5 +1,6 @@
 {
   "id": "design-reviewer",
+  "role_family": "specialist",
   "description": "A senior reviewer who evaluates design proposals (UX, architecture, API shapes). Reads design docs; provides structured critique.",
   "skills": [
     "design-reviewing",
