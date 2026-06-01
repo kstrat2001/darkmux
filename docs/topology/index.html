@@ -29,7 +29,10 @@
   .wrap{display:flex;height:calc(100vh - 46px - 40px - 64px)}
   .stage{flex:1;position:relative;overflow:auto;padding:24px}
   .log{width:380px;border-left:1px solid var(--line);background:var(--bg2);display:flex;flex-direction:column}
-  .detail{border-bottom:1px solid var(--line);padding:12px 14px;background:#20180e}
+  .detail{display:flex;flex-direction:column;padding:12px 14px 0;background:#20180e}
+  #detailbody{flex:1;overflow:auto;min-height:0;padding-bottom:12px}
+  .split{height:7px;flex:none;background:var(--line);cursor:row-resize}
+  .split:hover{background:var(--amber-dim)}
   .dh{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
   .dt{font:600 11px 'JetBrains Mono',monospace;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
   .follow{font:600 10px 'JetBrains Mono',monospace;letter-spacing:.06em;padding:4px 9px;border-radius:11px;cursor:pointer;border:1px solid var(--amber-dim);color:var(--amber);background:none}
@@ -110,9 +113,10 @@
 <div class="wrap">
   <div class="stage" id="stage"></div>
   <div class="log">
-    <div class="detail"><div class="dh"><span class="dt">selected event</span>
+    <div class="detail" id="detail"><div class="dh"><span class="dt">selected event</span>
       <button class="follow on" id="follow">⤓ follow latest</button></div>
       <div id="detailbody"></div></div>
+    <div class="split" id="split" title="drag to resize"></div>
     <div class="loglist">
       <h3><span>event log · <span id="logscope">fleet</span></span>
           <button class="fbtn" id="fbtn" onclick="openFilters()">⚙ filters</button></h3>
@@ -291,6 +295,11 @@ window.closeFilters=()=>{$("modalbg").style.display="none";};
 window.clearFilters=()=>{state.filters={cat:new Set(FCATS),tier:new Set(FTIERS),src:new Set(FSRC),q:""};$("fsearch").value="";renderFilters();render();};
 $("fsearch").oninput=e=>{state.filters.q=e.target.value;render();};
 $("modalbg").onclick=e=>{if(e.target===$("modalbg"))closeFilters();};
+// resizable detail/log split — fixed default height stops the jumpiness; drag the divider to grow it
+(function(){const DEF=200,MIN=110,MAX=520;$("detail").style.height=DEF+"px";let drag=false,sy=0,sh=0;
+  $("split").addEventListener("mousedown",e=>{drag=true;sy=e.clientY;sh=$("detail").offsetHeight;document.body.style.userSelect="none";e.preventDefault();});
+  window.addEventListener("mousemove",e=>{if(!drag)return;$("detail").style.height=Math.max(MIN,Math.min(MAX,sh+(e.clientY-sy)))+"px";});
+  window.addEventListener("mouseup",()=>{drag=false;document.body.style.userSelect="";});})();
 render();
 </script>
 </body>
