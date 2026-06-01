@@ -84,7 +84,7 @@ pub fn resolve(scope: ResolveScope) -> DarkmuxPaths {
         sandboxes: chosen.join("sandboxes"),
         crew: chosen.join("crew"),
         notebook,
-        profiles: chosen.join("profiles.yaml"),
+        profiles: chosen.join("profiles.json"),
         scope: chosen_scope,
         root: chosen,
     }
@@ -256,7 +256,7 @@ mod tests {
             sandboxes: tmp.path().join(".darkmux/sandboxes"),
             crew: tmp.path().join(".darkmux/crew"),
             notebook: tmp.path().join(".darkmux/notebook"),
-            profiles: tmp.path().join(".darkmux/profiles.yaml"),
+            profiles: tmp.path().join(".darkmux/profiles.json"),
             scope: Scope::Project,
         };
         ensure(&paths).unwrap();
@@ -276,7 +276,7 @@ mod tests {
             sandboxes: tmp.path().join(".darkmux/sandboxes"),
             crew: tmp.path().join(".darkmux/crew"),
             notebook: tmp.path().join(".darkmux/notebook"),
-            profiles: tmp.path().join(".darkmux/profiles.yaml"),
+            profiles: tmp.path().join(".darkmux/profiles.json"),
             scope: Scope::Project,
         };
         ensure(&paths).unwrap();
