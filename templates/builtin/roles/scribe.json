@@ -1,6 +1,6 @@
 {
   "id": "scribe",
-  "description": "Drafts lab notebook entries and prose from run data + operator findings. EE-lab-notebook aesthetic; date stamps; tables OK; methodology over polish.",
+  "description": "Drafts lab notebook entries and prose from run data + user findings. EE-lab-notebook aesthetic; date stamps; tables OK; methodology over polish.",
   "skills": [
     "documenting"
   ],
