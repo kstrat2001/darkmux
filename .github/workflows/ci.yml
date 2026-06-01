@@ -103,7 +103,7 @@ jobs:
           # 'admin' role family was renamed to 'utility' with NO compat alias —
           # crates/darkmux-crew validate_role_family REJECTS 'admin' at load time.
           PAT='admin[- ]agent|admin</code>'
-          if bad=$(grep -rniE "$PAT" README.md CONTRIBUTING.md DESIGN.md docs/index.html docs/guide/ 2>/dev/null); then
+          if bad=$(grep -rniE "$PAT" README.md CONTRIBUTING.md DESIGN.md docs/index.html docs/guide/ docs/architecture/ 2>/dev/null); then
             echo "::error::Retired term in user-facing docs — use 'utility', not 'admin' (the role_family loader rejects 'admin'):"
             echo "$bad"
             exit 1
