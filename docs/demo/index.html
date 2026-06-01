@@ -203,6 +203,11 @@ const DATA = [
  {ts:"2026-05-19T01:02:25Z",category:"telemetry",source:"context",machine_id:"mini-1",session_id:"S3",fields:{used:5000,max:24000}},
  {ts:"2026-05-19T01:02:50Z",category:"telemetry",source:"context",machine_id:"mini-1",session_id:"S3",fields:{used:14000,max:24000}},
  {ts:"2026-05-19T01:03:20Z",category:"telemetry",source:"context",machine_id:"mini-1",session_id:"S3",fields:{used:21000,max:24000}},
+ {ts:"2026-05-19T01:02:25Z",category:"work",tier:"local",stage:"dispatch",action:"dispatch.start",handle:"darkmux/coder",machine_id:"studio",mission_id:"redis-tailnet",session_id:"S4",model:"qwen3-coder-next"},
+ {ts:"2026-05-19T01:02:45Z",category:"telemetry",source:"process",machine_id:"studio",session_id:"S4",fields:{cpu:44}},
+ {ts:"2026-05-19T01:03:15Z",category:"telemetry",source:"process",machine_id:"studio",session_id:"S4",fields:{cpu:29}},
+ {ts:"2026-05-19T01:03:28Z",category:"telemetry",source:"runtime",machine_id:"studio",session_id:"S4",fields:{turns:3}},
+ {ts:"2026-05-19T01:03:30Z",category:"work",tier:"local",stage:"dispatch",action:"dispatch.complete",handle:"darkmux/coder",machine_id:"studio",mission_id:"redis-tailnet",session_id:"S4",model:"qwen3-coder-next"},
  {ts:"2026-05-19T01:00:55Z",category:"work",tier:"local",stage:"dispatch",action:"dispatch.start",handle:"darkmux/reviewer",machine_id:"laptop",mission_id:"redis-tailnet",session_id:"S2",model:"qwen3.5-122b"},
  {ts:"2026-05-19T01:01:00Z",category:"telemetry",source:"lms",machine_id:"laptop",session_id:"S2",fields:{event:"load",model:"qwen3.5-122b",gb:74}},
  {ts:"2026-05-19T01:01:30Z",category:"telemetry",source:"process",machine_id:"laptop",session_id:"S2",fields:{cpu:55}},
@@ -226,7 +231,7 @@ const MISSION={id:"redis-tailnet",goal:"Wire the fleet's flow stream through Red
   {id:"s1",title:"Redis stream sink + XADD MAXLEN retention",est:"M",who:"darkmux/coder",on:"studio",sid:"S1"},
   {id:"s2",title:"Cross-machine aggregation in /flow/<date>",est:"S",who:"darkmux/reviewer",on:"laptop",sid:"S2"},
   {id:"s3",title:"Tailnet hub topology + failover routing",est:"L",who:"darkmux/analyst",on:"mini-1",sid:"S3"},
-  {id:"s4",title:"Audit-sink tee + integrity-check cron",est:"M",who:"—",on:"—",sid:null}]};
+  {id:"s4",title:"Audit-sink tee + integrity-check cron",est:"M",who:"darkmux/coder",on:"studio",sid:"S4"}]};
 const T=s=>Date.parse(s);
 const tMin=Math.min(...DATA.map(r=>T(r.ts))), tMax=Math.max(...DATA.map(r=>T(r.ts)));
 const iso=t=>new Date(t).toISOString();
