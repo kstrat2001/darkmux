@@ -94,6 +94,16 @@
   .finding .fk{display:block;font:600 12px 'JetBrains Mono',monospace;color:var(--warn)}.finding.ok .fk{color:var(--good)}
   .finding .fm{display:block;font-size:12px;color:var(--text);margin-top:3px}
   .finding .ff{display:block;font-size:11px;color:var(--muted);margin-top:5px}
+  .misslink{cursor:pointer;color:var(--amber);text-decoration:none}.misslink:hover{text-decoration:underline}
+  .mgoal{font-size:13px;color:var(--text);margin:8px 0 16px;max-width:680px;line-height:1.5}
+  .burn{margin-bottom:18px}.burnbar{height:6px;background:var(--line);border-radius:3px;overflow:hidden;max-width:420px}.burnbar span{display:block;height:100%;background:var(--good)}
+  .burnlbl{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin-top:6px}
+  .sprow{display:flex;align-items:center;gap:14px;padding:10px 12px;border:1px solid var(--line);border-radius:5px;margin-bottom:7px;background:var(--panel)}
+  .sps{font:600 10px 'JetBrains Mono',monospace;text-transform:uppercase;padding:3px 8px;border-radius:10px;min-width:74px;text-align:center}
+  .sps.complete{background:#1c1c22;color:var(--muted)}.sps.active{background:#16261d;color:var(--good)}.sps.backlog{background:var(--bg2);color:var(--amber-dim);border:1px solid var(--line)}
+  .spt{flex:1;font:12px 'JetBrains Mono',monospace;color:var(--text)}
+  .spe{font:11px 'JetBrains Mono',monospace;color:var(--muted)}
+  .spa{font:11px 'JetBrains Mono',monospace;color:var(--amber-dim);min-width:190px;text-align:right}
   .eureka{margin-top:16px;border:1px solid var(--warn);background:#1c1c22;border-radius:6px;padding:12px 14px}
   .eureka .k{color:var(--warn);font:600 12px 'JetBrains Mono',monospace}.eureka .m{color:var(--text);font-size:12px;margin-top:4px}.eureka .f{color:var(--muted);font-size:11px;margin-top:6px}
   /* filter modal */
@@ -191,6 +201,11 @@ const ICON={
   mini:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="9" width="18" height="7" rx="2"/><circle cx="7" cy="12.5" r="1"/></svg>'};
 // demo: machines are known; the real tool derives form-factor from machine metadata
 const MACH_ICON={studio:"desktop",laptop:"laptop",["mini-1"]:"mini"};
+const MISSION={id:"redis-tailnet",goal:"Wire the fleet's flow stream through Redis over the tailnet so every machine's dispatches aggregate into one shared, auditable stream.",sprints:[
+  {id:"s1",title:"Redis stream sink + XADD MAXLEN retention",status:"complete",est:"M",who:"darkmux/coder",on:"studio"},
+  {id:"s2",title:"Cross-machine aggregation in /flow/<date>",status:"complete",est:"S",who:"darkmux/reviewer",on:"laptop"},
+  {id:"s3",title:"Tailnet hub topology + failover routing",status:"active",est:"L",who:"darkmux/analyst",on:"mini-1"},
+  {id:"s4",title:"Audit-sink tee + integrity-check cron",status:"backlog",est:"M",who:"—",on:"—"}]};
 const T=s=>Date.parse(s);
 const tMin=Math.min(...DATA.map(r=>T(r.ts))), tMax=Math.max(...DATA.map(r=>T(r.ts)));
 const iso=t=>new Date(t).toISOString();
@@ -219,7 +234,7 @@ const sessionsOn=m=>[...new Set(DATA.filter(r=>r.machine_id===m&&r.session_id).m
 const dispatch=(sid,act)=>DATA.find(r=>r.session_id===sid&&r.action==="dispatch."+act);
 
 function renderMeta(){
-  $("meta").innerHTML=`<b>${missions.join(', ')}</b> · recorded ${iso(tMin).slice(0,10)} `+
+  $("meta").innerHTML=`<a class="misslink" onclick="goMission()">◆ ${missions.join(', ')}</a> · recorded ${iso(tMin).slice(0,10)} `+
     `${iso(tMin).slice(11,19)}–${iso(tMax).slice(11,19)}Z<br>${DATA.length} records · ${machines().length} machines · flow schema 1.7`;
 }
 function machActive(m){
@@ -309,10 +324,13 @@ function renderLog(){
   }).join(""):`<div class="empty">no events match the current filters</div>`;
 }
 function renderCrumb(){
-  let c=`<a onclick="goFleet()">fleet</a>`;
-  if(state.level!=="fleet") c+=`<span class="sep">›</span><a onclick="drillMachine('${state.machine}')">${state.machine}</a>`;
-  if(state.level==="subsystem") c+=`<span class="sep">›</span>${state.session}`;
-  $("crumb").innerHTML=c; $("back").disabled=(state.level==="fleet");
+  let c=`<a class="misslink" onclick="goMission()">◆ ${MISSION.id}</a>`;
+  if(state.level!=="mission"){
+    c+=`<span class="sep">›</span><a onclick="goFleet()">fleet</a>`;
+    if(state.level==="machine"||state.level==="subsystem") c+=`<span class="sep">›</span><a onclick="drillMachine('${state.machine}')">${state.machine}</a>`;
+    if(state.level==="subsystem") c+=`<span class="sep">›</span>${state.session}`;
+  }
+  $("crumb").innerHTML=c; $("back").disabled=(state.level==="mission");
 }
 function filtersActive(){return state.filters.cat.size<FCATS.length||state.filters.tier.size<FTIERS.length||state.filters.src.size<FSRC.length||!!state.filters.q;}
 function updateFbtn(){const a=filtersActive();$("fbtn").className="fbtn"+(a?" on":"");$("fbtn").textContent=a?"⚙ filters •":"⚙ filters";}
@@ -321,7 +339,7 @@ function syncTransport(){
   $("clock").textContent=fmt(state.t-tMin)+" / "+fmt(tMax-tMin)+"  ·  "+visible().length+"/"+DATA.length+" rec";
 }
 function render(){
-  if(state.level==="fleet")renderFleet(); else if(state.level==="machine")renderMachine(); else renderSubsystem();
+  if(state.level==="mission")renderMission(); else if(state.level==="fleet")renderFleet(); else if(state.level==="machine")renderMachine(); else renderSubsystem();
   if(state.follow){ const n=newest(scopedFiltered()); state.selected=n?n._id:null; }
   renderDetail();renderLog();renderCrumb();renderMeta();updateFbtn();
   syncTransport();
@@ -329,9 +347,19 @@ function render(){
 window.drillMachine=m=>{state.level="machine";state.machine=m;state.session=null;state.follow=true;render();};
 window.drillSession=s=>{state.level="subsystem";state.session=s;state.follow=true;render();};
 window.goFleet=()=>{state.level="fleet";state.machine=null;state.session=null;state.follow=true;render();};
+window.goMission=()=>{state.level="mission";state.machine=null;state.session=null;state.follow=true;render();};
+function renderMission(){
+  state.stageScope=r=>r.mission_id===MISSION.id; $("logscope").textContent="mission";
+  const done=MISSION.sprints.filter(s=>s.status==="complete").length, active=MISSION.sprints.filter(s=>s.status==="active").length, backlog=MISSION.sprints.filter(s=>s.status==="backlog").length, total=MISSION.sprints.length, pct=Math.round(done/total*100);
+  const rows=MISSION.sprints.map(s=>`<div class="sprow"><span class="sps ${s.status}">${s.status}</span><span class="spt">${s.title}</span><span class="spe">est ${s.est}</span><span class="spa">${s.who}${s.on!=="—"?' · '+s.on:''}</span></div>`).join("");
+  $("stage").innerHTML=`<div class="sub"><h2>mission · ${MISSION.id}</h2>
+    <div class="mgoal">${MISSION.goal}</div>
+    <div class="burn"><div class="burnbar"><span style="width:${pct}%"></span></div><div class="burnlbl">${done}/${total} sprints complete · ${pct}% burned down · ${active} active · ${backlog} backlog</div></div>
+    <div class="track"><div class="lbl">sprints</div>${rows}</div></div>`;
+}
 window.selectRec=id=>{state.selected=id;state.follow=false;render();};
 $("follow").onclick=()=>{state.follow=!state.follow;render();};
-$("back").onclick=()=>{ if(state.level==="subsystem")drillMachine(state.machine); else if(state.level==="machine")goFleet(); };
+$("back").onclick=()=>{ if(state.level==="subsystem")drillMachine(state.machine); else if(state.level==="machine")goFleet(); else if(state.level==="fleet")goMission(); };
 $("range").oninput=e=>{state.t=tMin+(tMax-tMin)*e.target.value/100;render();};
 $("rewind").onclick=()=>{state.t=tMin;state.follow=true;render();};
 $("speed").onclick=()=>{const s=[0.5,1,2,4];state.speed=s[(s.indexOf(state.speed)+1)%s.length];$("speed").textContent=state.speed+"×";};
