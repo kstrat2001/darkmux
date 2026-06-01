@@ -1438,7 +1438,6 @@ pub fn build_dispatch_record_with_payload(
         prev_hash: None,
         hash: None,
         payload,
-        machine_tier: None,
         work_id: None,
         attempt: None,
     }

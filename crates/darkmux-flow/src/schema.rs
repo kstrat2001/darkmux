@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.8.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.9.0";
 // Version history:
 //   1.2.0 — added optional `model` (#106)
 //   1.3.0 — added optional `reasoning` + `mission_id`; new Stage::TierDecision (#136)
@@ -37,6 +37,15 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.8.0";
 //           dispatch path when the work flowed through the queue; absent on direct
 //           local dispatches. Backward-compatible — older readers ignore the new
 //           fields. (#246 PR-A tier substrate)
+//   1.9.0 — REMOVED `machine_tier` (the {inference/hub/client} machine-capacity
+//           label). It conflated the orchestration `tier` enum with a hardware
+//           label that no routing consumed; the capacity concept moves to
+//           capability-based model selection driven by the lab-vetted
+//           recommendation registry (#321/#322). New records omit the field.
+//           Casual LocalFileSink readers are unaffected (unknown keys ignored).
+//           Pre-1.9.0 AuditFileSink hash-chains cannot be re-verified after this
+//           canonical-form change — rotate to a fresh chain (no-compat-baggage;
+//           small known audience). `work_id`/`attempt` are unchanged.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -173,20 +182,6 @@ pub struct FlowRecord {
     /// FlowRecord fields, just not the event-specific extras.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payload: Option<serde_json::Value>,
-    /// Hardware tier of the machine that emitted this record — one of
-    /// `"inference"` (heavy-model peer), `"hub"` (always-on infrastructure
-    /// for utility agents), `"client"` (UI-only). Auto-populated at record
-    /// write time from `DARKMUX_MACHINE_TIER` env, same pattern as
-    /// `machine_id`. None when the operator hasn't declared a tier — the
-    /// fleet topology still works for single-machine setups but tier-aware
-    /// routing will bail loud. Schema 1.8 addition (#246).
-    ///
-    /// Distinct from the existing `tier: Tier` enum at the top of this
-    /// struct: that field classifies the *record* (local-vs-frontier-vs-
-    /// audit), while `machine_tier` classifies the *machine* (capacity
-    /// class). Both can be set independently on the same record.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub machine_tier: Option<String>,
     /// Work-queue claim id when this record was produced by a job that
     /// flowed through `darkmux:work:<tier>`. Absent on direct local
     /// dispatches (the operator ran `darkmux crew dispatch <role>` on the
