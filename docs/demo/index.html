@@ -125,7 +125,7 @@
 <body>
 <div class="top">
   <span class="brand"><a href="../"><b>darkmux</b></a> · observability</span>
-  <span class="badge">Demo — sample data</span>
+  <span class="badge" id="srcbadge">Demo — sample data</span>
   <span class="pb">▣ playback</span>
   <nav class="topnav">
     <a href="../">home</a>
@@ -169,7 +169,10 @@
 </div>
 
 <script>
-const DATA = [
+// SAMPLE is the bundled fixture. On darkmux.com (no daemon) the viewer falls
+// back to it; served by `darkmux serve` at GET / it instead fetches the
+// daemon's real /flow/:date records (same-origin). See boot() at the bottom.
+const SAMPLE = [
  {ts:"2026-05-19T01:00:00Z",category:"work",tier:"operator",stage:"scope",action:"note",handle:"mission scoped",machine_id:"studio",mission_id:"redis-tailnet"},
  {ts:"2026-05-19T01:00:30Z",category:"work",tier:"local",stage:"dispatch",action:"dispatch.start",handle:"darkmux/coder",machine_id:"studio",mission_id:"redis-tailnet",session_id:"S1",model:"qwen3.6-35b"},
  {ts:"2026-05-19T01:00:35Z",category:"telemetry",source:"lms",machine_id:"studio",session_id:"S1",fields:{event:"load",model:"qwen3.6-35b",gb:21}},
@@ -218,7 +221,8 @@ const DATA = [
  {ts:"2026-05-19T01:02:55Z",category:"telemetry",source:"process",machine_id:"mini-1",session_id:"S3",fields:{cpu:33}},
  {ts:"2026-05-19T01:03:40Z",category:"work",tier:"local",stage:"dispatch",action:"dispatch.complete",handle:"darkmux/analyst",machine_id:"mini-1",mission_id:"redis-tailnet",session_id:"S3",model:"qwen3.6-35b"},
 ];
-DATA.forEach((r,i)=>r._id=i);
+let DATA = SAMPLE;            // boot() may replace with real /flow/:date records
+let DATA_SOURCE = "sample data";
 const MACH_SPEC={studio:"M1 Max · 32 GB · hub",laptop:"M5 Max · 128 GB · inference",["mini-1"]:"M4 · 16 GB"};
 // Mac-form-factor glyphs (inline SVG, Lucide stroke style — license-free, no external load)
 const ICON={
@@ -233,13 +237,21 @@ const MISSION={id:"redis-tailnet",goal:"Wire the fleet's flow stream through Red
   {id:"s3",title:"Tailnet hub topology + failover routing",est:"L",who:"darkmux/analyst",on:"mini-1",sid:"S3"},
   {id:"s4",title:"Audit-sink tee + integrity-check cron",est:"M",who:"darkmux/coder",on:"studio",sid:"S4"}]};
 const T=s=>Date.parse(s);
-const tMin=Math.min(...DATA.map(r=>T(r.ts))), tMax=Math.max(...DATA.map(r=>T(r.ts)));
 const iso=t=>new Date(t).toISOString();
 const fmt=ms=>{ms=Math.max(0,ms);return Math.floor(ms/60000)+":"+String(Math.floor(ms/1000)%60).padStart(2,"0");};
-const missions=[...new Set(DATA.filter(r=>r.mission_id).map(r=>r.mission_id))];
-const FCATS=[...new Set(DATA.map(r=>r.category))];
-const FTIERS=[...new Set(DATA.map(r=>r.tier).filter(Boolean))];
-const FSRC=[...new Set(DATA.map(r=>r.source).filter(Boolean))];
+// Derived from DATA; recomputed whenever the data source changes (sample <-> real).
+let tMin, tMax, missions, FCATS, FTIERS, FSRC;
+function recompute(){
+  DATA.forEach((r,i)=>r._id=i);
+  const ts=DATA.map(r=>T(r.ts)).filter(n=>!isNaN(n));
+  tMin = ts.length?Math.min(...ts):Date.now();
+  tMax = ts.length?Math.max(...ts):Date.now();
+  missions=[...new Set(DATA.filter(r=>r.mission_id).map(r=>r.mission_id))];
+  FCATS=[...new Set(DATA.map(r=>r.category))];
+  FTIERS=[...new Set(DATA.map(r=>r.tier).filter(Boolean))];
+  FSRC=[...new Set(DATA.map(r=>r.source).filter(Boolean))];
+}
+recompute();
 let state={level:"fleet",machine:null,session:null,t:tMax,playing:false,timer:null,selected:null,follow:true,speed:1,
   filters:{cat:new Set(FCATS),tier:new Set(FTIERS),src:new Set(FSRC),q:""}};
 
@@ -255,13 +267,13 @@ function passesFilter(r){
 }
 const scopedFiltered=()=>scoped().filter(passesFilter);
 const newest=arr=>arr.length?arr.reduce((a,b)=>T(b.ts)>=T(a.ts)?b:a):null;
-const machines=()=>[...new Set(DATA.map(r=>r.machine_id))];
+const machines=()=>[...new Set(DATA.map(r=>r.machine_id).filter(Boolean))];
 const sessionsOn=m=>[...new Set(DATA.filter(r=>r.machine_id===m&&r.session_id).map(r=>r.session_id))];
 const dispatch=(sid,act)=>DATA.find(r=>r.session_id===sid&&r.action==="dispatch."+act);
 
 function renderMeta(){
-  $("meta").innerHTML=`<a class="misslink" onclick="goMission()">◆ ${missions.join(', ')}</a> · recorded ${iso(tMin).slice(0,10)} `+
-    `${iso(tMin).slice(11,19)}–${iso(tMax).slice(11,19)}Z<br>${DATA.length} records · ${machines().length} machines · flow schema 1.7`;
+  $("meta").innerHTML=`<a class="misslink" onclick="goMission()">◆ ${missions.join(', ')||'—'}</a> · <b>${DATA_SOURCE}</b> · ${iso(tMin).slice(0,10)} `+
+    `${iso(tMin).slice(11,19)}–${iso(tMax).slice(11,19)}Z<br>${DATA.length} records · ${machines().length} machines`;
 }
 function machActive(m){
   const v=visible();
@@ -362,9 +374,13 @@ function renderLog(){
   }).join(""):`<div class="empty">no events match the current filters</div>`;
 }
 function renderCrumb(){
-  let c=`<a class="misslink" onclick="goMission()">◆ ${MISSION.id}</a>`;
+  // Mission crumb only when the loaded data actually has a mission. Lab/dispatch
+  // playback (no mission_id) starts at fleet. (Live mission/sprint detail is a
+  // follow-up seam — /missions + /sprints; MISSION stays the sample fixture.)
+  const hasMission=missions.length>0;
+  let c=hasMission?`<a class="misslink" onclick="goMission()">◆ ${missions[0]}</a>`:``;
   if(state.level!=="mission"){
-    c+=`<span class="sep">›</span><a onclick="goFleet()">fleet</a>`;
+    c+=(hasMission?`<span class="sep">›</span>`:``)+`<a onclick="goFleet()">fleet</a>`;
     if(state.level==="machine"||state.level==="subsystem") c+=`<span class="sep">›</span><a onclick="drillMachine('${state.machine}')">${state.machine}</a>`;
     if(state.level==="subsystem") c+=`<span class="sep">›</span>${state.session}`;
   }
@@ -385,7 +401,7 @@ function render(){
 window.drillMachine=m=>{state.level="machine";state.machine=m;state.session=null;state.follow=true;render();};
 window.drillSession=s=>{state.level="subsystem";state.session=s;state.follow=true;render();};
 window.goFleet=()=>{state.level="fleet";state.machine=null;state.session=null;state.follow=true;render();};
-window.goMission=()=>{state.level="mission";state.machine=null;state.session=null;state.follow=true;render();};
+window.goMission=()=>{ if(!missions.length)return goFleet(); state.level="mission";state.machine=null;state.session=null;state.follow=true;render();};
 function renderMission(){
   state.stageScope=r=>r.mission_id===MISSION.id; $("logscope").textContent="mission";
   // Sprint status is derived from its dispatch session at the current playhead, so the
@@ -443,7 +459,79 @@ $("modalbg").onclick=e=>{if(e.target===$("modalbg"))closeFilters();};
   $("split").addEventListener("mousedown",e=>{drag=true;sy=e.clientY;sh=$("detail").offsetHeight;document.body.style.userSelect="none";e.preventDefault();});
   window.addEventListener("mousemove",e=>{if(!drag)return;$("detail").style.height=Math.max(MIN,Math.min(MAX,sh+(e.clientY-sy)))+"px";});
   window.addEventListener("mouseup",()=>{drag=false;document.body.style.userSelect="";});})();
-render();
+
+// ── Data source: real flow records (daemon) with sample fallback (website) ──
+// Normalize real FlowRecords into the viewer's record shape. The flow schema
+// is already close: it carries ts/category/tier/stage/action/handle/
+// machine_id/mission_id/session_id/model. Differences handled here:
+//  - "dispatch start"/"dispatch complete" (space) → dotted form the UI matches
+//  - tier may be capitalized ("Local") → lowercased to match the filter set
+//  - event-specific data lives under `payload` (schema 1.6+) → exposed as `fields`
+//  - category defaults to telemetry when a `source` is present, else work
+function flowToRenderModel(records){
+  const out=records.map(r=>{
+    const o={...r};
+    if(o.action==="dispatch start")o.action="dispatch.start";
+    if(o.action==="dispatch complete")o.action="dispatch.complete";
+    if(o.tier)o.tier=String(o.tier).toLowerCase();
+    if(o.payload&&!o.fields)o.fields=o.payload;
+    // dispatch.compaction → a compaction telemetry record (the subsystem's
+    // compaction count). from/to are message counts here, not the byte
+    // sawtooth the sample draws (per-turn context bytes need #557).
+    if(o.action==="dispatch.compaction"){
+      const p=o.payload||{};
+      o.category="telemetry"; o.source="compaction";
+      o.fields={from:p.before_messages||0,to:p.after_messages||0};
+    }
+    if(!o.category)o.category=o.source?"telemetry":"work";
+    return o;
+  });
+  // Per-session turn count (max turn_seq) → one runtime telemetry record, which
+  // is where the subsystem view reads the TURNS metric.
+  const perS={};
+  for(const r of records){
+    if(r.action==="dispatch.turn"&&r.session_id){
+      const seq=(r.payload&&r.payload.turn_seq)||0;
+      const e=perS[r.session_id]||(perS[r.session_id]={turns:0,ts:r.ts,machine_id:r.machine_id});
+      e.turns=Math.max(e.turns,seq); e.ts=r.ts; if(r.machine_id)e.machine_id=r.machine_id;
+    }
+  }
+  for(const s in perS){
+    out.push({ts:perS[s].ts,category:"telemetry",source:"runtime",machine_id:perS[s].machine_id,session_id:s,fields:{turns:perS[s].turns}});
+  }
+  return out;
+}
+
+// Pick the day to play back: URL hash (#2026-06-01) or ?date=, default today (UTC).
+function targetDate(){
+  const h=(location.hash||"").replace(/^#/,"").trim();
+  if(/^\d{4}-\d{2}-\d{2}$/.test(h))return h;
+  const q=new URLSearchParams(location.search).get("date");
+  if(q&&/^\d{4}-\d{2}-\d{2}$/.test(q))return q;
+  return new Date().toISOString().slice(0,10);
+}
+
+async function boot(){
+  const date=targetDate();
+  let mode="sample";
+  try{
+    const res=await fetch("/flow/"+date,{headers:{accept:"application/json"}});
+    if(res.ok){
+      const body=await res.json();
+      const recs=Array.isArray(body)?body:(body.records||body.flow||[]);
+      DATA=flowToRenderModel(recs);
+      mode=recs.length?"live":"empty";
+    }else{ DATA=SAMPLE; mode="sample"; }
+  }catch(e){ DATA=SAMPLE; mode="sample"; }   // no daemon reachable (website) → fixture
+  DATA_SOURCE = mode==="live" ? ("flow · "+date) : mode==="empty" ? ("no records · "+date) : "sample data";
+  const sb=$("srcbadge");
+  if(sb) sb.textContent = mode==="live" ? ("Live · "+date) : mode==="empty" ? ("No records · "+date) : "Demo — sample data";
+  recompute();
+  state.t=tMax;
+  state.filters={cat:new Set(FCATS),tier:new Set(FTIERS),src:new Set(FSRC),q:""};
+  render();
+}
+boot();
 </script>
 </body>
 </html>

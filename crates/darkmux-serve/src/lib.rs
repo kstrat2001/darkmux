@@ -40,10 +40,29 @@ fn is_valid_date(date: &str) -> Option<&str> {
     }
 }
 
+/// Serve the observability viewer at the daemon's own origin (#554).
+///
+/// Because the daemon and the viewer share an origin, the viewer's
+/// same-origin `fetch('/flow/:date')` calls are CORS- and
+/// mixed-content-free **by construction** — that's the structural fix
+/// behind #554, not a CORS allowlist. The HTML is the same drill viewer
+/// published as the darkmux.com demo, embedded via `include_str!` so the
+/// daemon binary is self-contained (no asset dir to ship). On the website
+/// the viewer falls back to its bundled sample fixture; served here it
+/// fetches the daemon's real flow records.
+async fn root_html() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [("content-type", "text/html; charset=utf-8")],
+        include_str!("../../../docs/demo/index.html"),
+    )
+}
+
 /// Build the HTTP router with a configurable flows directory.
 pub(crate) fn build_router(flows_dir: PathBuf) -> Router {
     let state = AppState { flows_dir };
     Router::new()
+        .route("/", get(root_html))
         .route("/health", get(health))
         .route("/flow/:date", get(flow_handler))
         .route("/flow/:date/stream", get(flow_stream_handler))
@@ -1432,6 +1451,49 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(!json["darkmux_version"].as_str().unwrap().is_empty());
         assert!(!json["flow_schema_version"].as_str().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn root_serves_viewer_html() {
+        // #554: GET / serves the observability viewer (same-origin host
+        // for the viewer's /flow/:date fetches).
+        let app = build_router(PathBuf::new());
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 200);
+        let ct = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(ct.starts_with("text/html"), "content-type was `{ct}`");
+
+        let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        let lower = body.to_lowercase();
+        assert!(
+            lower.contains("<!doctype") || lower.contains("<html"),
+            "GET / body is not HTML"
+        );
+    }
+
+    #[tokio::test]
+    async fn root_route_does_not_shadow_api_routes() {
+        // Adding GET / must not collide with the noun-prefixed API routes.
+        // `/health` has no external deps, so a clean 200 here proves the
+        // router still dispatches the API surface after `/` was added.
+        let app = build_router(PathBuf::new());
+        let response = app
+            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "/health regressed after adding GET /");
     }
 
     #[tokio::test]
