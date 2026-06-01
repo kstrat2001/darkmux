@@ -414,6 +414,24 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // loaded at the top of this function.
     let mut compaction = opts.compaction.clone();
     compaction.apply_role_override(role);
+    // (#590) Overlay the machine-level utility model (`internal.utility`) as
+    // the compactor, unless already pinned. The util model is darkmux's
+    // standing support model for this machine — one global model for
+    // compaction, decoupled from the worker profile. Best-effort: no binding
+    // ⇒ untouched ⇒ runtime keeps its built-in default compactor.
+    let utility_model = resolve_utility_model_internal();
+    compaction.apply_utility_model(utility_model.as_deref());
+    // (#590) Pre-flight loaded-check: compaction summons the util model
+    // mid-dispatch, so if it's registered but not resident the compactor call
+    // fails. Warn loudly here (the doctor check is the at-rest sibling).
+    // Best-effort — skipped when lms is unreachable.
+    if let Some(util_id) = compaction.compactor_model.as_deref() {
+        if let Ok(loaded) = darkmux_profiles::lms::list_loaded() {
+            if let Some(warning) = utility_preflight_warning(util_id, &loaded) {
+                eprintln!("{warning}");
+            }
+        }
+    }
     apply_compaction_flags(&mut cmd, &compaction);
 
     // (#457 Changes 2+3) Operator-opt-in per-dispatch caps on turn
@@ -1238,6 +1256,41 @@ fn resolve_dispatch_model_internal(role: &crate::types::Role) -> Result<String> 
             // policy, fold this fallback under strict mode too.
             probe_loaded_model()
         }
+    }
+}
+
+/// (#590) Best-effort: the machine's registered utility model
+/// (`internal.utility`), for overlaying onto the compactor. `None` if the
+/// registry isn't loadable or no utility model is registered — the runtime
+/// then keeps its built-in default compactor. Mirrors the loud-but-soft
+/// posture of `resolve_dispatch_model_internal`: a missing binding is not an
+/// error, just an absent overlay.
+fn resolve_utility_model_internal() -> Option<String> {
+    darkmux_profiles::profiles::load_registry(None)
+        .ok()
+        .and_then(|l| l.registry.utility_model_id().map(str::to_string))
+}
+
+/// (#590) Returns a loud warning when the registered utility model isn't in
+/// the loaded set — compaction summons it mid-dispatch and a missing one
+/// fails at the LMStudio call. `None` ⇒ it's loaded (matched by either the
+/// `modelKey` or the namespaced `identifier`). Pure, for testing.
+fn utility_preflight_warning(
+    util_id: &str,
+    loaded: &[darkmux_types::LoadedModel],
+) -> Option<String> {
+    let is_loaded = loaded
+        .iter()
+        .any(|m| m.model == util_id || m.identifier == util_id);
+    if is_loaded {
+        None
+    } else {
+        Some(format!(
+            "darkmux crew dispatch: WARNING — utility model `{util_id}` \
+             (internal.utility) is NOT loaded; compaction summons it mid-dispatch \
+             and will fail if it isn't resident. Load it now (`lms load {util_id}`, \
+             or include it in the profile you `darkmux swap` to). (#590)"
+        ))
     }
 }
 
@@ -2866,4 +2919,33 @@ mod tests {
 
     // first_user_symlink_in / is_macos_firmlink tests moved to
     // `darkmux_types::workdir::tests` as part of Wave-E.2 (#255).
+
+    // ─── #590 utility_preflight_warning ───────────────────────────────
+    fn lm(identifier: &str, model: &str) -> darkmux_types::LoadedModel {
+        darkmux_types::LoadedModel {
+            identifier: identifier.into(),
+            model: model.into(),
+            status: "loaded".into(),
+            size: "3 GB".into(),
+            context: 4096,
+        }
+    }
+
+    #[test]
+    fn utility_preflight_no_warning_when_loaded() {
+        let loaded = vec![lm("darkmux:util-4b", "util-4b"), lm("worker", "worker-35b")];
+        // Matched by modelKey...
+        assert!(super::utility_preflight_warning("util-4b", &loaded).is_none());
+        // ...or by the namespaced identifier.
+        assert!(super::utility_preflight_warning("darkmux:util-4b", &loaded).is_none());
+    }
+
+    #[test]
+    fn utility_preflight_warns_loudly_when_not_loaded() {
+        let loaded = vec![lm("worker", "worker-35b")];
+        let w = super::utility_preflight_warning("util-4b", &loaded)
+            .expect("a registered-but-unloaded util model must warn");
+        assert!(w.contains("util-4b"), "names the model: {w}");
+        assert!(w.contains("NOT loaded"), "states the problem: {w}");
+    }
 }
