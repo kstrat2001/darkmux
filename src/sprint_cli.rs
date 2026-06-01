@@ -74,7 +74,6 @@ pub(crate) fn build_review_record(
         prev_hash: None,
         hash: None,
         payload: None,
-        machine_tier: None,
         work_id: None,
         attempt: None,
     }

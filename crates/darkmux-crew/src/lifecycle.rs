@@ -304,7 +304,6 @@ pub(crate) fn load_sprint_by_id(sprint_id: &str) -> Result<Sprint> {
                 prev_hash: None,
                 hash: None,
                 payload: None,
-                machine_tier: None,
                 work_id: None,
                 attempt: None,
             });
@@ -352,7 +351,6 @@ fn emit_sprint_transition_record(sprint_id: &str, mission_id: &str, action: &str
         prev_hash: None,
         hash: None,
         payload: None,
-        machine_tier: None,
         work_id: None,
         attempt: None,
     });
@@ -393,7 +391,6 @@ fn emit_mission_transition_record_with_reasoning(
         prev_hash: None,
         hash: None,
         payload: None,
-        machine_tier: None,
         work_id: None,
         attempt: None,
     });
@@ -436,7 +433,6 @@ fn emit_sprint_added_record_with_reasoning(
         prev_hash: None,
         hash: None,
         payload: None,
-        machine_tier: None,
         work_id: None,
         attempt: None,
     });

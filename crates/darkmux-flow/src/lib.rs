@@ -768,7 +768,7 @@ pub fn record(record: FlowRecord) -> Result<()> {
     record_to(default_sink().as_ref(), record)
 }
 
-/// Stamp provenance (machine_id / orchestrator / machine_tier when the
+/// Stamp provenance (machine_id / orchestrator when the
 /// caller left them `None`) and write to an explicit sink. `record()` is
 /// `record_to(default_sink(), …)`. Split out (#507) so callers — and
 /// tests — can target a sink built against an explicit dir instead of
@@ -781,9 +781,6 @@ pub(crate) fn record_to(sink: &dyn FlowSink, record: FlowRecord) -> Result<()> {
     }
     if rec.orchestrator.is_none() {
         rec.orchestrator = resolve_orchestrator();
-    }
-    if rec.machine_tier.is_none() {
-        rec.machine_tier = resolve_machine_tier();
     }
     sink.write(&rec)
 }
@@ -886,7 +883,6 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            machine_tier: None,
             work_id: None,
             attempt: None,
         }
@@ -992,7 +988,6 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            machine_tier: None,
             work_id: None,
             attempt: None,
         };
@@ -1035,7 +1030,6 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            machine_tier: None,
             work_id: None,
             attempt: None,
         };
@@ -1086,7 +1080,6 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            machine_tier: None,
             work_id: None,
             attempt: None,
         };
@@ -1154,7 +1147,6 @@ mod tests {
                 prev_hash: None,
                 hash: None,
                 payload: None,
-                machine_tier: None,
                 work_id: None,
                 attempt: None,
             },
@@ -1201,7 +1193,6 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            machine_tier: None,
             work_id: None,
             attempt: None,
         };
@@ -1257,7 +1248,6 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            machine_tier: None,
             work_id: None,
             attempt: None,
         };
@@ -1402,7 +1392,6 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            machine_tier: None,
             work_id: None,
             attempt: None,
         };
@@ -1475,7 +1464,6 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            machine_tier: None,
             work_id: None,
             attempt: None,
         };
@@ -1517,7 +1505,6 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            machine_tier: None,
             work_id: None,
             attempt: None,
         };
@@ -1573,7 +1560,6 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            machine_tier: None,
             work_id: None,
             attempt: None,
         };
@@ -1617,7 +1603,6 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            machine_tier: None,
             work_id: None,
             attempt: None,
         };
@@ -1638,7 +1623,7 @@ mod tests {
     }
 
     #[test]
-    fn flow_schema_version_is_1_5_0() {
+    fn flow_schema_version_is_1_9_0() {
         // Pin the schema version so an accidental rename can't ship silently;
         // any bump beyond this should be a deliberate code change paired with
         // an update to this assertion (and corresponding viewer EXPECTED_*
@@ -1669,7 +1654,13 @@ mod tests {
         //           `work_id` + `attempt` populated by the dispatch path
         //           when work flowed through the queue. Minor bump — older
         //           readers safely ignore the new fields.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.8.0");
+        //   1.9.0 — REMOVED `machine_tier` (the {inference/hub/client} machine-
+        //           capacity label that no routing consumed; it conflated the
+        //           `tier` enum with a hardware label. Capacity moves to
+        //           capability-based model selection — #321/#322). Minor bump:
+        //           old readers tolerate the now-unknown key. Pre-1.9.0
+        //           AuditFileSink chains need rotation (canonical-form change).
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.9.0");
     }
 
     #[test]
@@ -1720,7 +1711,6 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            machine_tier: None,
             work_id: None,
             attempt: None,
         };
@@ -1756,7 +1746,6 @@ mod tests {
                 prev_hash: None,
                 hash: None,
                 payload: None,
-                machine_tier: None,
                 work_id: None,
                 attempt: None,
             },
@@ -1938,7 +1927,6 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            machine_tier: None,
             work_id: None,
             attempt: None,
         };
@@ -1968,7 +1956,6 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            machine_tier: None,
             work_id: None,
             attempt: None,
         };
@@ -2015,7 +2002,6 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            machine_tier: None,
             work_id: None,
             attempt: None,
         };
@@ -2072,7 +2058,6 @@ mod tests {
             prev_hash: Some("seed".to_string()),
             hash: None,
             payload: None,
-            machine_tier: None,
             work_id: None,
             attempt: None,
         };
@@ -2106,7 +2091,6 @@ mod tests {
             prev_hash: Some("seed".to_string()),
             hash: None,
             payload: None,
-            machine_tier: None,
             work_id: None,
             attempt: None,
         };
@@ -2125,14 +2109,6 @@ mod tests {
         // for `skip` (which omits the field from serialization entirely)
         // can't silently weaken the tamper-evidence invariant. (#246
         // PR-A review M1)
-        let mut diff_machine_tier = base.clone();
-        diff_machine_tier.machine_tier = Some("inference".to_string());
-        assert_ne!(
-            audit_hash_of(&diff_machine_tier).unwrap(),
-            h1,
-            "machine_tier must contribute to audit hash"
-        );
-
         let mut diff_work_id = base.clone();
         diff_work_id.work_id = Some("1716192000000-0".to_string());
         assert_ne!(
@@ -2151,7 +2127,7 @@ mod tests {
     }
 
     /// Cross-version audit-chain walk: records that lack the schema-1.8
-    /// fields (machine_tier / work_id / attempt) must still validate
+    /// fields (work_id / attempt) must still validate
     /// under 1.8 reader code. The invariant rides on
     /// `skip_serializing_if = "Option::is_none"` — re-serialization of
     /// a None-valued field produces the same bytes a pre-1.8 writer
@@ -2188,7 +2164,6 @@ mod tests {
                 prev_hash: None,
                 hash: None,
                 payload: None,
-                machine_tier: None,
                 work_id: None,
                 attempt: None,
             };
@@ -2200,11 +2175,6 @@ mod tests {
         let day = day_utc_now();
         let path = tmp.path().join(format!("{day}.jsonl"));
         let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            !raw.contains("machine_tier"),
-            "None-valued machine_tier must be omitted from serialized form (skip_serializing_if). \
-             Otherwise pre-1.8 audit chains break under 1.8 reader. Raw:\n{raw}"
-        );
         assert!(
             !raw.contains("\"work_id\""),
             "None-valued work_id must be omitted"
@@ -2259,7 +2229,6 @@ mod tests {
                 prev_hash: None, // sink stamps this
                 hash: None,      // sink stamps this
                 payload: None,
-                machine_tier: None,
                 work_id: None,
                 attempt: None,
             };
@@ -2309,7 +2278,6 @@ mod tests {
                 prev_hash: None,
                 hash: None,
                 payload: None,
-                machine_tier: None,
                 work_id: None,
                 attempt: None,
             };
@@ -2374,7 +2342,6 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            machine_tier: None,
             work_id: None,
             attempt: None,
         };
@@ -2440,7 +2407,6 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            machine_tier: None,
             work_id: None,
             attempt: None,
         };
@@ -2674,7 +2640,6 @@ mod tests {
             prev_hash: None,
             hash: None,
             payload: None,
-            machine_tier: None,
             work_id: None,
             attempt: None,
         };
