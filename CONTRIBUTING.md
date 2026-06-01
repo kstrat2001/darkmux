@@ -61,36 +61,9 @@ When filing a bug, please include:
 
 ## Project structure
 
-```
-src/
-  main.rs                  CLI dispatch (clap)
-  types.rs                 Profile / ProfileRegistry / ProfileModel
-  profiles.rs              Registry loading + lookup
-  swap.rs / lms.rs         Stack swap orchestration + lms CLI wrapper
-  runtime.rs               Runtime config patcher (e.g. openclaw.json)
-  init.rs / skills.rs      `darkmux init` + skill installer
-  notebook.rs              Notebook draft generator
-  lab/
-    paths.rs               Workspace dir resolution (project vs user)
-    run.rs                 Workload dispatch (the lab loop)
-    inspect.rs             Single-run analysis dispatch
-    compare.rs             Run-vs-run diff
-    list.rs                Recent runs table
-  workloads/
-    types.rs               WorkloadProvider trait + manifest types
-    load.rs                Manifest loading (user → on-disk → embedded)
-    registry.rs            Provider registry (Box<dyn WorkloadProvider>)
-  providers/
-    prompt.rs              Trivial single-prompt provider
-    coding_task.rs         Sandbox + verify-command provider
-templates/
-  builtin/
-    workloads/<id>.json    Embedded workload manifests (compile-time)
-skills/
-  darkmux-<name>/SKILL.md  Agent-invokable skill wrappers
-tests/
-  cli.rs                   Integration tests (spawn the binary)
-```
+darkmux is a Cargo **workspace** — most code lives in focused crates under `crates/` (`darkmux-types`, `darkmux-profiles`, `darkmux-crew`, `darkmux-flow`, `darkmux-lab`, `darkmux-serve`, `darkmux-eureka`, `darkmux-doctor`, `darkmux-fleet`, …), with the agent runtime as its own excluded crate at `runtime/`. The thin binary entrypoint and the CLI verb modules (`flow_cli.rs`, `mission_propose.rs`, `role_cli.rs`, `sprint_cli.rs`, …) live in `src/`. Embedded assets (workload / role / skill manifests + prompts) live under `templates/builtin/`; integration tests are several `*.rs` files under `tests/` that spawn the compiled binary via `assert_cmd`.
+
+The **authoritative, kept-current** map of where each module lives is the **"Where things live"** section of [`CLAUDE.md`](CLAUDE.md) — refer to it rather than a parallel list here. A duplicated map is exactly what drifts: this section previously described a pre-workspace `src/` monolith that no longer exists.
 
 ## Releases
 

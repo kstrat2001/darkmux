@@ -85,3 +85,27 @@ jobs:
       - name: No Rust-relevant changes — pipeline skipped
         if: steps.filter.outputs.rust != 'true'
         run: echo "No Rust / Cargo / template / workflow changes detected; build+test+lint skipped (reports green)."
+
+  docs-drift:
+    name: docs drift guard (retired terms)
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      # Turns "the docs silently drifted" into a blocked PR — CLAUDE.md's principle
+      # that "doc drift is a bug, not a footnote." Grow this guard as the
+      # observability-unification guide rewrites land (#556): add 'instruments.jsonl'
+      # / '--instrument' once #557 ships, and 'click Connect' / live
+      # darkmux.com/{flow,topology,lab} once the daemon-hosted viewer (#554/#558) ships.
+      - name: No retired terms in user-facing docs
+        run: |
+          # 'admin' role family was renamed to 'utility' with NO compat alias —
+          # crates/darkmux-crew validate_role_family REJECTS 'admin' at load time.
+          PAT='admin[- ]agent|admin</code>'
+          if bad=$(grep -rniE "$PAT" README.md CONTRIBUTING.md DESIGN.md docs/index.html docs/guide/ 2>/dev/null); then
+            echo "::error::Retired term in user-facing docs — use 'utility', not 'admin' (the role_family loader rejects 'admin'):"
+            echo "$bad"
+            exit 1
+          fi
+          echo "docs drift guard passed: no retired terms"

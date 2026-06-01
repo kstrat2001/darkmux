@@ -54,7 +54,7 @@
       <li><code>id</code>, <code>description</code>, <code>skills</code> — the <code>skills</code> list names work-shape descriptors the role is good at (renamed from <code>capabilities</code> in <a href="https://github.com/kstrat2001/darkmux/issues/448">#448</a>; existing manifests must use the new key). Each skill in turn declares an intrinsic capability profile (<code>code</code>, <code>reasoning</code>, <code>instruction_following</code>, <code>agentic_tool_use</code>) that role-to-model selection will score against.</li>
       <li><code>tool_palette</code> — <code>allow</code> and <code>deny</code> lists of tools (read, exec, edit, etc.)</li>
       <li><code>escalation_contract</code> — what the role does when it can't solve the task (bail, retry-with-hint, hand-off-to)</li>
-      <li><code>role_family</code> (optional) — <code>specialist</code> (default) or <code>admin</code>; specialist roles get the autonomous-dispatch preamble injected ahead of their prompt (they can't ask questions mid-dispatch, so they escalate with a <code>BLOCKED:</code> line instead).</li>
+      <li><code>role_family</code> (optional) — <code>specialist</code> (default) or <code>utility</code>; specialist roles get the autonomous-dispatch preamble injected ahead of their prompt (they can't ask questions mid-dispatch, so they escalate with a <code>BLOCKED:</code> line instead).</li>
       <li><code>feedback_templates</code> (optional) — per-signal overrides for the runtime's model-facing nudges (cycle/loop/cascade/etc.); falls back to the built-in wording when unset.</li>
     </ul>
 
@@ -97,7 +97,7 @@ darkmux crew sync --dry-run      <span class="comment"># preview without writing
     <p class="muted"><em>Note for operators with existing state:</em> earlier versions of darkmux nested everything under <code>~/.darkmux/crew/</code> (<code>roles/</code>, <code>missions/</code>, <code>sprints/</code>). The loader transparently falls back to that layout, so existing state keeps working. Run <code>darkmux doctor</code> for a copy-pasteable <code>mv</code> script to flatten when you're ready.</p>
 
     <h3>Authoring a mission (recommended)</h3>
-    <p>The preferred path: use <code>darkmux mission propose</code>, which takes unstructured input (pasted text, a Jira ticket via <code>acli</code>, a GitHub issue via <code>gh</code>) and dispatches the mission-compiler admin agent to emit a structured proposal you approve before any file lands.</p>
+    <p>The preferred path: use <code>darkmux mission propose</code>, which takes unstructured input (pasted text, a Jira ticket via <code>acli</code>, a GitHub issue via <code>gh</code>) and dispatches the mission-compiler utility agent to emit a structured proposal you approve before any file lands.</p>
 
     <h4>Worked example: proposing a mission from stdin</h4>
     <pre><code><span class="comment"># Pipe operator intent into the compiler</span>

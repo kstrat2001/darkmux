@@ -80,12 +80,12 @@
   <div class="wrap">
     <h2>How darkmux is meant to be used</h2>
     <h3>A complement to your frontier orchestrator — not a replacement.</h3>
-    <p>darkmux is an AI-first local-AI orchestrator: a CLI that manages local LLM stacks on your machine and dispatches admin-agent models internally for bounded structuring tasks (compaction, sprint estimation, mission proposal — see <a href="https://github.com/kstrat2001/darkmux/issues/115">#115</a>). The strategic reasoning loop lives in your <em>frontier orchestrator</em> — Claude Code today, with other frontiers (Gemini, Codex, Copilot) tracked in <a href="https://github.com/kstrat2001/darkmux/issues/179">#179</a>. The admin agent absorbs the routine bounded work; the orchestrator stays on strategy.</p>
+    <p>darkmux is an AI-first local-AI orchestrator: a CLI that manages local LLM stacks on your machine and dispatches utility-agent models internally for bounded structuring tasks (compaction, sprint estimation, mission proposal — see <a href="https://github.com/kstrat2001/darkmux/issues/115">#115</a>). The strategic reasoning loop lives in your <em>frontier orchestrator</em> — Claude Code today, with other frontiers (Gemini, Codex, Copilot) tracked in <a href="https://github.com/kstrat2001/darkmux/issues/179">#179</a>. The utility agent absorbs the routine bounded work; the orchestrator stays on strategy.</p>
     <p>The intended division of labor:</p>
     <ul>
       <li><strong>Frontier orchestrator</strong> — design decisions, complex reasoning, code review, multi-step debugging, narrative for what's being built.</li>
       <li><strong>Local specialist models (driven by darkmux)</strong> — routine implementation, scaffolding, bounded refactors, parallel work that doesn't need full session context.</li>
-      <li><strong>Local admin agent (dispatched internally by darkmux)</strong> — compaction, structured-output tasks (sprint estimates, mission proposals, notebook drafts). Small, fast, dependable on bounded reasoning. You rarely interact with it directly; darkmux dispatches it when a verb needs that capability.</li>
+      <li><strong>Local utility agent (dispatched internally by darkmux)</strong> — compaction, structured-output tasks (sprint estimates, mission proposals, notebook drafts). Small, fast, dependable on bounded reasoning. You rarely interact with it directly; darkmux dispatches it when a verb needs that capability.</li>
       <li><strong>You</strong> — the operator: pick the tier per task, name your intent, override defaults when you have specific judgment.</li>
     </ul>
     <p>This guide assumes you have an orchestrator and want to use darkmux as the local-tier resource it dispatches to. If you're running darkmux purely as a CLI (no orchestrator), most of the guide still applies — just skip the agentic sections (crew dispatch, sprint review).</p>
