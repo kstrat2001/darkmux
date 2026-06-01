@@ -35,6 +35,6 @@ Surface the list to the user, then offer the natural next steps:
 
 ## Notes
 
-- "(no workloads found ...)" means neither the built-in templates nor any user-defined workloads were located. Check the darkmux installation, or set `DARKMUX_TEMPLATES_DIR` to point at the templates source.
+- The exact message is `(no workloads found — check templates/builtin/workloads/ or .darkmux/workloads/)` — neither the built-in templates nor any user-defined workloads were located. Check the darkmux installation. (Advanced: `DARKMUX_TEMPLATES_DIR` overrides where the built-in templates are read from, though the error itself doesn't name it.)
 - User-defined workloads under `.darkmux/workloads/<id>.json` (or `.darkmux/workloads/<id>/workload.json`) shadow built-ins of the same name.
 - Workload manifests follow the schema documented in the darkmux repo's `templates/builtin/workloads/` examples.
