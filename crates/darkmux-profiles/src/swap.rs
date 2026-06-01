@@ -172,6 +172,7 @@ mod tests {
                 id: "m".into(),
                 n_ctx: 1000,
                 role: ModelRole::Primary,
+                capabilities: Default::default(),
                 identifier: None,
             }],
             runtime,
@@ -185,6 +186,7 @@ mod tests {
             id: "qwen3.6-35b-a3b".into(),
             n_ctx: 100_000,
             role: ModelRole::Primary,
+            capabilities: Default::default(),
             identifier: None,
         };
         assert_eq!(namespaced_identifier(&m), "darkmux:qwen3.6-35b-a3b");
@@ -196,6 +198,7 @@ mod tests {
             id: "qwen3.6-35b-a3b".into(),
             n_ctx: 100_000,
             role: ModelRole::Primary,
+            capabilities: Default::default(),
             identifier: Some("my-custom-alias".into()),
         };
         // Explicit override wins — operator opted out of the auto-namespace.

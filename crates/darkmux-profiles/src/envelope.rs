@@ -57,6 +57,7 @@ mod tests {
             id: id.to_string(),
             n_ctx: 262000,
             role: ModelRole::Primary,
+            capabilities: Default::default(),
             identifier: ident.map(|s| s.to_string()),
         }
     }

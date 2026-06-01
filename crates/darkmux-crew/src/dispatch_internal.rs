@@ -1636,6 +1636,7 @@ mod tests {
                 id: "primary".into(),
                 n_ctx: 100_000,
                 role: ModelRole::Primary,
+                capabilities: Default::default(),
                 identifier: None,
             }],
             runtime: Some(ProfileRuntime {
@@ -1675,6 +1676,7 @@ mod tests {
                 id: "primary-x".into(),
                 n_ctx: 100_000,
                 role: ModelRole::Primary,
+                capabilities: Default::default(),
                 identifier: None,
             }],
             runtime: Some(ProfileRuntime {
@@ -1774,6 +1776,7 @@ mod tests {
                 id: "primary-x".into(),
                 n_ctx: 100_000,
                 role: ModelRole::Primary,
+                capabilities: Default::default(),
                 identifier: None,
             }],
             runtime: Some(ProfileRuntime {
@@ -1807,6 +1810,7 @@ mod tests {
                 id: "primary-x".into(),
                 n_ctx: 100_000,
                 role: ModelRole::Primary,
+                capabilities: Default::default(),
                 identifier: None,
             }],
             runtime: Some(ProfileRuntime {
@@ -1853,6 +1857,7 @@ mod tests {
                 id: "primary-x".into(),
                 n_ctx: 101_000,
                 role: ModelRole::Primary,
+                capabilities: Default::default(),
                 identifier: None,
             }],
             runtime: Some(ProfileRuntime {
@@ -1903,6 +1908,7 @@ mod tests {
                 id: "primary-x".into(),
                 n_ctx: 100_000,
                 role: ModelRole::Primary,
+                capabilities: Default::default(),
                 identifier: None,
             }],
             runtime: Some(ProfileRuntime {
@@ -1942,6 +1948,7 @@ mod tests {
                 id: "primary-x".into(),
                 n_ctx: 100_000,
                 role: ModelRole::Primary,
+                capabilities: Default::default(),
                 identifier: None,
             }],
             runtime: Some(ProfileRuntime {
@@ -1995,6 +2002,7 @@ mod tests {
                 id: "primary-x".into(),
                 n_ctx: 100_000,
                 role: ModelRole::Primary,
+                capabilities: Default::default(),
                 identifier: None,
             }],
             runtime: Some(ProfileRuntime {
@@ -2029,6 +2037,7 @@ mod tests {
                 id: "primary-x".into(),
                 n_ctx: 50_000,
                 role: ModelRole::Primary,
+                capabilities: Default::default(),
                 identifier: None,
             }],
             runtime: None,

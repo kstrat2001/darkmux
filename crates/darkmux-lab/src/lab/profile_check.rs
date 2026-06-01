@@ -88,6 +88,7 @@ mod tests {
             id: id.to_string(),
             n_ctx,
             role,
+            capabilities: Default::default(),
             identifier: None,
         }
     }

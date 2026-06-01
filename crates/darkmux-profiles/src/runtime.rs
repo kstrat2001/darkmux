@@ -740,12 +740,14 @@ mod tests {
                     id: "primary-id".into(),
                     n_ctx: 262144,
                     role: ModelRole::Primary,
+                    capabilities: Default::default(),
                     identifier: None,
                 },
                 ProfileModel {
                     id: "compactor-id".into(),
                     n_ctx: 120000,
                     role: ModelRole::Compactor,
+                    capabilities: Default::default(),
                     identifier: None,
                 },
             ],
@@ -781,6 +783,7 @@ mod tests {
                 id: "any".into(),
                 n_ctx: 1000,
                 role: ModelRole::Primary,
+                capabilities: Default::default(),
                 identifier: None,
             }],
         );
@@ -823,6 +826,7 @@ mod tests {
                 id: "qwen3.6-35b-a3b".into(),
                 n_ctx: 100000,
                 role: ModelRole::Primary,
+                capabilities: Default::default(),
                 identifier: None,
             }],
         );
@@ -860,6 +864,7 @@ mod tests {
                 id: "qwen3-4b-instruct-2507".into(),
                 n_ctx: 120000,
                 role: ModelRole::Compactor,
+                capabilities: Default::default(),
                 identifier: None,
             }],
         );
@@ -895,6 +900,7 @@ mod tests {
                 id: "foo".into(),
                 n_ctx: 1000,
                 role: ModelRole::Primary,
+                capabilities: Default::default(),
                 identifier: Some("my-explicit-alias".into()),
             }],
         );
@@ -923,6 +929,7 @@ mod tests {
                 id: "foo".into(),
                 n_ctx: 1000,
                 role: ModelRole::Primary,
+                capabilities: Default::default(),
                 identifier: None,
             }],
         );
@@ -952,6 +959,7 @@ mod tests {
                 id: "foo".into(),
                 n_ctx: 1000,
                 role: ModelRole::Primary,
+                capabilities: Default::default(),
                 identifier: None,
             }],
         );
@@ -1004,6 +1012,7 @@ mod tests {
                 id: "qwen3.6-35b-a3b".into(),
                 n_ctx: 101000,
                 role: ModelRole::Primary,
+                capabilities: Default::default(),
                 identifier: None,
             }],
         );
@@ -1052,6 +1061,7 @@ mod tests {
                 id: "unknown-model-id".into(),
                 n_ctx: 64000,
                 role: ModelRole::Primary,
+                capabilities: Default::default(),
                 identifier: None,
             }],
         );
@@ -1096,6 +1106,7 @@ mod tests {
                 id: "foo".into(),
                 n_ctx: 50000,
                 role: ModelRole::Primary,
+                capabilities: Default::default(),
                 identifier: None,
             }],
         );
@@ -1153,6 +1164,7 @@ mod tests {
                 id: "foo".into(),
                 n_ctx: 80000,
                 role: ModelRole::Primary,
+                capabilities: Default::default(),
                 identifier: None,
             }],
         );
@@ -1196,6 +1208,7 @@ mod tests {
                 id: "foo".into(),
                 n_ctx: 50000,
                 role: ModelRole::Primary,
+                capabilities: Default::default(),
                 identifier: Some("my-alias".into()),
             }],
         );
@@ -1228,6 +1241,7 @@ mod tests {
                 id: "google/gemini-2.5".into(),
                 n_ctx: 1000,
                 role: ModelRole::Primary,
+                capabilities: Default::default(),
                 identifier: None,
             }],
         );
@@ -1286,6 +1300,7 @@ mod tests {
             id: "openai/gpt-oss-20b".into(),
             n_ctx: 100000,
             role: ModelRole::Primary,
+            capabilities: Default::default(),
             identifier: None,
         }]);
 
@@ -1338,6 +1353,7 @@ mod tests {
             id: "new-model".into(),
             n_ctx: 100000,
             role: ModelRole::Primary,
+            capabilities: Default::default(),
             identifier: None,
         }]);
 
@@ -1376,12 +1392,14 @@ mod tests {
                 id: "new-primary".into(),
                 n_ctx: 100000,
                 role: ModelRole::Primary,
+                capabilities: Default::default(),
                 identifier: None,
             },
             ProfileModel {
                 id: "new-compactor".into(),
                 n_ctx: 32000,
                 role: ModelRole::Compactor,
+                capabilities: Default::default(),
                 identifier: None,
             },
         ]);
@@ -1425,6 +1443,7 @@ mod tests {
             id: "primary-only".into(),
             n_ctx: 100000,
             role: ModelRole::Primary,
+            capabilities: Default::default(),
             identifier: None,
         }]);
 
@@ -1458,6 +1477,7 @@ mod tests {
             id: "the-model".into(),
             n_ctx: 100000,
             role: ModelRole::Primary,
+            capabilities: Default::default(),
             identifier: None,
         }]);
 
@@ -1484,6 +1504,7 @@ mod tests {
             id: "the-model".into(),
             n_ctx: 100000,
             role: ModelRole::Primary,
+            capabilities: Default::default(),
             identifier: Some("my-custom-alias".into()),
         }];
         let modified = sync_default_model_pins(&mut config, &models);
@@ -1505,6 +1526,7 @@ mod tests {
             id: "the-model".into(),
             n_ctx: 100000,
             role: ModelRole::Primary,
+            capabilities: Default::default(),
             identifier: None,
         }];
         assert!(sync_default_model_pins(&mut config, &models));
@@ -1526,6 +1548,7 @@ mod tests {
             id: "new-model".into(),
             n_ctx: 100000,
             role: ModelRole::Primary,
+            capabilities: Default::default(),
             identifier: None,
         }];
         assert!(sync_default_model_pins(&mut config, &models));
@@ -1554,6 +1577,7 @@ mod tests {
                 id: "lmstudio-side-model".into(),
                 n_ctx: 100000,
                 role: ModelRole::Primary,
+                capabilities: Default::default(),
                 identifier: None,
             }];
             let modified = sync_default_model_pins(&mut config, &models);
@@ -1579,6 +1603,7 @@ mod tests {
             id: "aux".into(),
             n_ctx: 8192,
             role: ModelRole::Auxiliary,
+            capabilities: Default::default(),
             identifier: None,
         }];
         assert!(!sync_default_model_pins(&mut config, &models));
