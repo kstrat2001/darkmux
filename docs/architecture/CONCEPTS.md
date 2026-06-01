@@ -49,13 +49,18 @@ division of labor concrete.
 
 ## 2. Role families — specialist vs utility
 
-darkmux defines exactly **two** crew role families, and the distinction governs
-how a role is dispatched.
+darkmux defines exactly **two** crew role families. The defining axis is
+**scope**: a *specialist* works the **mission/sprints** (the deliverable); a
+*utility* role supports the **runtime**, *outside* mission scope (compaction,
+mission-compiling, estimation). The family also governs **how a role is
+dispatched** (the table below). Bias toward utility for as much outside-mission
+work as possible, so the runtime isn't loading extra worker models for support
+tasks.
 
 | Family | What it is | Dispatch shape |
 |---|---|---|
-| **specialist** | Judgment-dependent, multi-turn agent-loop roles (coder, code-reviewer, analyst). Free-form output. | Runs the full agent loop; the autonomous-dispatch preamble (`templates/builtin/AUTONOMOUS_DISPATCH_PREAMBLE.md`) is prepended to the system prompt. |
-| **utility** | Bounded-I/O transformers (mission-compiler, and future scribe/estimator helpers). Structured output, no agent loop. | A single bounded transform; no preamble. |
+| **specialist** | Works the mission/sprints — judgment-dependent, multi-turn agent-loop roles (coder, code-reviewer, analyst). Free-form output. | Runs the full agent loop; the autonomous-dispatch preamble (`templates/builtin/AUTONOMOUS_DISPATCH_PREAMBLE.md`) is prepended to the system prompt. |
+| **utility** | Supports the runtime, outside mission scope — `mission-compiler` today; `compactor`/`estimator`/`scribe` joining (#590). Bounded I/O, structured output, no agent loop. | A single bounded transform; no preamble. |
 
 - The family is carried by the optional `role_family` field on a role manifest
   (`crates/darkmux-crew/src/types.rs:161-174`).
@@ -68,25 +73,36 @@ how a role is dispatched.
   (`templates/builtin/roles/mission-compiler.json`;
   `crates/darkmux-crew/src/loader.rs:1230-1242`).
 
-### "utility" is a role *type*, not "the compaction role"
+### "utility" is a role *family*, not "the compaction role"
 
-A utility role is defined by its **work shape** — bounded inputs, structured
-outputs, low per-call failure cost — not by any single task. The mission-compiler
-turns unstructured intent into a structured Mission + Sprint proposal; the same
-family is where future bounded helpers (estimation, scribe) land. Don't read
-"utility" as "compaction."
+A utility role is defined by its **scope** — supporting the runtime *outside*
+mission work — and typically carries a bounded work shape (structured I/O, low
+per-call failure cost). The mission-compiler turns unstructured intent into a
+structured Mission + Sprint proposal; the same family is home to estimation,
+scribe, and (in transition, #590) compaction. The util tier is a baked-in
+runtime **affordance** — the runtime can always summon a util model for these
+built-in tasks; *which* model is config, *whether* it's resident is
+resource-dependent. Compaction is one of N such tasks, not the definition of
+"utility."
 
-### There is no `compactor` crew role
+### The compactor: runtime function today, utility role in transition (#590)
 
-Compaction is a **runtime function**, not a dispatchable crew role (see §5). The
-fourteen built-in crew roles are: `coder`, `scribe`, `code-reviewer`, `analyst`,
-`voice-editor`, `design-reviewer`, `test-designer`, `lab-runner`,
-`mission-compiler`, `trip-researcher`, `logistics-coordinator`, `health-research`,
-`fitness-coach`, `legal-research` — none named `compactor`
-(`crates/darkmux-crew/src/loader.rs:17-37`). The separate `ModelRole::Compactor`
-enum (`crates/darkmux-types/src/lib.rs:16-18`) is a *model-selection* role in the
-profile schema — which loaded model performs compaction — and is orthogonal to
-crew roles.
+Compaction runs *inside* the agent loop (§5), and **today** there is no
+`compactor` crew role — the fourteen built-in roles (`coder`, `scribe`,
+`code-reviewer`, `analyst`, `voice-editor`, `design-reviewer`, `test-designer`,
+`lab-runner`, `mission-compiler`, `trip-researcher`, `logistics-coordinator`,
+`health-research`, `fitness-coach`, `legal-research`) include none named
+`compactor` (`crates/darkmux-crew/src/loader.rs`), and the compactor model is
+selected via the `ModelRole::Compactor` slot in the profile
+(`crates/darkmux-types/src/lib.rs`).
+
+> **Direction (#590):** that coupling is being undone. The compactor becomes a
+> standalone **utility role** (alongside `mission-compiler`/`scribe`); its model
+> is registered via the `[internal] utility` binding (#450) instead of a
+> `ModelRole::Compactor` profile slot; and `ModelRole` is removed — so a
+> **profile becomes a wrapper for the worker models' capabilities**, not a
+> `Primary`+`Compactor` stack. The runtime keeps a built-in *affordance* to
+> summon the util model for compaction (and estimation, planning, …).
 
 ### Legacy `admin` is rejected, with no compat alias
 
@@ -216,6 +232,10 @@ Supporting mechanisms, all shipped:
   `--compactor-model`, `--compactor-custom-instructions`) sourced from
   `profile.runtime.compaction.*` — **not** env vars
   (`runtime/src/compaction.rs:28-30, 165-269`).
+  *Direction (#590): the compactor model moves out of the `ModelRole::Compactor`
+  profile slot into the `[internal] utility` binding (#450); compaction becomes
+  one of several built-in runtime util affordances that summon the
+  config-registered util model.*
 - **Two trigger modes** (whichever fires first): an absolute token threshold, and
   a ratio trigger (`latest_prompt_tokens >= context_window * threshold_ratio`)
   (`runtime/src/compaction.rs:367-381`).
