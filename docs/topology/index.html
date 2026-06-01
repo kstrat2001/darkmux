@@ -58,7 +58,9 @@
   .fleet{display:flex;gap:36px;flex-wrap:wrap;align-items:flex-start}
   .mach{width:230px;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px;cursor:pointer;transition:border-color .15s}
   .mach:hover{border-color:var(--amber-dim)}.mach.active{border-color:var(--amber);box-shadow:0 0 0 1px var(--amber-dim)}
-  .mach .name{font:600 15px 'JetBrains Mono',monospace;color:var(--text)}
+  .mach .name{font:600 15px 'JetBrains Mono',monospace;color:var(--text);display:flex;align-items:center;gap:8px}
+  .mico{display:inline-flex;color:var(--amber-dim)}.mico svg{width:19px;height:19px;display:block}
+  .mach.active .mico{color:var(--amber)}
   .mach .spec{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin-top:3px}
   .mach .stat{margin-top:12px;font:12px 'JetBrains Mono',monospace}
   .mach .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--amber-dim);margin-right:7px;vertical-align:middle}
@@ -162,6 +164,13 @@ const DATA = [
 ];
 DATA.forEach((r,i)=>r._id=i);
 const MACH_SPEC={studio:"M1 Max · 32 GB · hub",laptop:"M5 Max · 128 GB · inference",["mini-1"]:"M4 · 16 GB"};
+// Mac-form-factor glyphs (inline SVG, Lucide stroke style — license-free, no external load)
+const ICON={
+  laptop:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="5" width="16" height="11" rx="1.5"/><path d="M2 19h20l-1.2-3H3.2z"/></svg>',
+  desktop:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="6" width="16" height="12" rx="2"/><circle cx="8" cy="12" r="1.1"/></svg>',
+  mini:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="9" width="18" height="7" rx="2"/><circle cx="7" cy="12.5" r="1"/></svg>'};
+// demo: machines are known; the real tool derives form-factor from machine metadata
+const MACH_ICON={studio:"desktop",laptop:"laptop",["mini-1"]:"mini"};
 const T=s=>Date.parse(s);
 const tMin=Math.min(...DATA.map(r=>T(r.ts))), tMax=Math.max(...DATA.map(r=>T(r.ts)));
 const iso=t=>new Date(t).toISOString();
@@ -203,7 +212,7 @@ function renderFleet(){
   $("logscope").textContent="fleet"; state.stageScope=()=>true;
   $("stage").innerHTML=`<div class="fleet">`+machines().map(m=>{
     const act=machActive(m), runs=sessionsOn(m).length;
-    return `<div class="mach ${act?'active':''}" onclick="drillMachine('${m}')"><div class="name">${m}</div>
+    return `<div class="mach ${act?'active':''}" onclick="drillMachine('${m}')"><div class="name"><span class="mico">${ICON[MACH_ICON[m]]||""}</span>${m}</div>
       <div class="spec">${MACH_SPEC[m]||''}</div><div class="stat"><span class="dot"></span>${act?'dispatch in flight':'idle'} · ${runs} run(s)</div>
       <div class="hint">click to drill in →</div></div>`;}).join("")+`</div>`;
 }
