@@ -680,7 +680,7 @@ mod tests {
         // No user files written — loader should fall through to builtin coder.
         let roles = load_roles().unwrap();
         let coder = roles.iter().find(|r| r.id == "coder").expect("builtin coder should load");
-        assert_eq!(coder.description, "Implements features described by the operator. Reads existing code first; follows patterns; runs tests before reporting done.");
+        assert_eq!(coder.description, "Implements features described by the user. Reads existing code first; follows patterns; runs tests before reporting done.");
     }
 
     #[serial_test::serial]
