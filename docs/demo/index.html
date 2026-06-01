@@ -269,12 +269,15 @@ function renderCrumb(){
 }
 function filtersActive(){return state.filters.cat.size<FCATS.length||state.filters.tier.size<FTIERS.length||state.filters.src.size<FSRC.length||!!state.filters.q;}
 function updateFbtn(){const a=filtersActive();$("fbtn").className="fbtn"+(a?" on":"");$("fbtn").textContent=a?"⚙ filters •":"⚙ filters";}
+function syncTransport(){
+  $("range").value=Math.round((state.t-tMin)/(tMax-tMin)*100);
+  $("clock").textContent=fmt(state.t-tMin)+" / "+fmt(tMax-tMin)+"  ·  "+visible().length+"/"+DATA.length+" rec";
+}
 function render(){
   if(state.level==="fleet")renderFleet(); else if(state.level==="machine")renderMachine(); else renderSubsystem();
   if(state.follow){ const n=newest(scopedFiltered()); state.selected=n?n._id:null; }
   renderDetail();renderLog();renderCrumb();renderMeta();updateFbtn();
-  $("range").value=Math.round((state.t-tMin)/(tMax-tMin)*100);
-  $("clock").textContent=fmt(state.t-tMin)+" / "+fmt(tMax-tMin)+"  ·  "+visible().length+"/"+DATA.length+" rec";
+  syncTransport();
 }
 window.drillMachine=m=>{state.level="machine";state.machine=m;state.session=null;state.follow=true;render();};
 window.drillSession=s=>{state.level="subsystem";state.session=s;state.follow=true;render();};
@@ -288,10 +291,16 @@ $("speed").onclick=()=>{const s=[0.5,1,2,4];state.speed=s[(s.indexOf(state.speed
 $("play").onclick=()=>{
   if(state.playing){clearInterval(state.timer);state.playing=false;$("play").textContent="▶ play";return;}
   if(state.t>=tMax)state.t=tMin;
-  state.follow=true; state.playing=true;$("play").textContent="⏸ pause";
+  state.follow=true; state.playing=true;$("play").textContent="⏸ pause"; render();
+  let lastCount=visible().length;
   state.timer=setInterval(()=>{ state.t+=(tMax-tMin)/120*state.speed;
-    if(state.t>=tMax){state.t=tMax;clearInterval(state.timer);state.playing=false;$("play").textContent="▶ play";}
-    render(); },100);
+    let cap=false;
+    if(state.t>=tMax){state.t=tMax;clearInterval(state.timer);state.playing=false;$("play").textContent="▶ play";cap=true;}
+    const c=visible().length;
+    // Only full-render when a record crosses the playhead; between crossings just advance the
+    // readouts, so the cards aren't destroyed mid-click (the bug — same fix the live tool needs).
+    if(c!==lastCount||cap){lastCount=c;render();} else syncTransport();
+  },100);
 };
 // filter modal
 function renderFilters(){
