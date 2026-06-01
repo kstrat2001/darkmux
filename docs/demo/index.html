@@ -72,7 +72,9 @@
   .node:hover{border-color:var(--amber-dim)}.node .h{font:600 13px 'JetBrains Mono',monospace}
   .node .s{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin-top:4px}
   .pill{display:inline-block;font:600 10px 'JetBrains Mono',monospace;padding:2px 7px;border-radius:10px;margin-top:8px}
-  .pill.run{background:#16261d;color:var(--good)}.pill.done{background:#1c1c22;color:var(--muted)}
+  .pill.run{background:#16261d;color:var(--good)}.pill.done{background:#1c1c22;color:var(--muted)}.pill.util{background:var(--bg2);color:var(--amber-dim);border:1px solid var(--line)}
+  .node.util{cursor:default;border-left:3px solid var(--amber-dim)}.node.util:hover{border-color:var(--line)}
+  .rglbl{font:11px 'JetBrains Mono',monospace;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:12px}
   .sub h2{font:600 13px 'JetBrains Mono',monospace;letter-spacing:.1em;text-transform:uppercase;color:var(--amber);margin:0 0 4px}
   .sub h2 a{color:var(--amber);text-decoration:underline;cursor:pointer}
   .track{margin:18px 0}.track .lbl{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin-bottom:6px}
@@ -231,18 +233,26 @@ function renderFleet(){
   $("stage").innerHTML=`<div class="fleet">`+machines().map(m=>{
     const act=machActive(m), runs=sessionsOn(m).length;
     return `<div class="mach ${act?'active':''}" onclick="drillMachine('${m}')"><div class="name"><span class="mico">${ICON[MACH_ICON[m]]||""}</span>${m}</div>
-      <div class="spec">${MACH_SPEC[m]||''}</div><div class="stat"><span class="dot"></span>${act?'dispatch in flight':'idle'} · ${runs} run(s)</div>
+      <div class="spec">${MACH_SPEC[m]||''}</div><div class="stat"><span class="dot"></span>${act?'dispatch in flight':'idle'} · ${runs} specialist${runs===1?'':'s'} + utility</div>
       <div class="hint">click to drill in →</div></div>`;}).join("")+`</div>`;
 }
 function renderMachine(){
   const m=state.machine; $("logscope").textContent=m; state.stageScope=r=>r.machine_id===m;
-  const nodes=sessionsOn(m).filter(sid=>visible().some(r=>r.session_id===sid)).map(sid=>{
+  // Always-loaded utility role — resident on every machine, runs alongside the specialists
+  // to handle compaction + other utility-tier tasks (not a per-mission dispatch).
+  const util=`<div class="node util"><div class="h">darkmux/compactor</div>
+    <div class="s">utility role · always-loaded</div>
+    <div class="s">compaction · scribe · estimator</div>
+    <span class="pill util">resident</span></div>`;
+  // Specialist roles dispatched on this machine for the active mission
+  const specs=sessionsOn(m).filter(sid=>visible().some(r=>r.session_id===sid)).map(sid=>{
     const s=dispatch(sid,"start"), done=dispatch(sid,"complete")&&T(dispatch(sid,"complete").ts)<=state.t;
     return `<div class="node" onclick="drillSession('${sid}')"><div class="h">${s.handle}</div>
-      <div class="s">session ${sid} · ${s.model||'?'}</div><div class="s">mission ${s.mission_id}</div>
-      <span class="pill ${done?'done':'run'}">${done?'complete':'running'}</span></div>`;}).join("")
-    || `<div class="hint">no runs yet at this point in the timeline</div>`;
-  $("stage").innerHTML=`<div><div class="stagehdr"><a onclick="goFleet()">fleet</a> › machine · ${m} — ${MACH_SPEC[m]||''}</div>${nodes}</div>`;
+      <div class="s">specialist role · ${s.model||'?'}</div>
+      <div class="s">session ${sid} · mission ${s.mission_id}</div>
+      <span class="pill ${done?'done':'run'}">${done?'complete':'running'}</span></div>`;}).join("");
+  $("stage").innerHTML=`<div><div class="stagehdr"><a onclick="goFleet()">fleet</a> › machine · ${m} — ${MACH_SPEC[m]||''}</div>
+    <div class="rglbl">crew on ${m}</div>${util}${specs||'<span class="hint">no specialist runs yet at this point in the timeline</span>'}</div>`;
 }
 function renderSubsystem(){
   const sid=state.session, m=state.machine; $("logscope").textContent=sid; state.stageScope=r=>r.session_id===sid;
