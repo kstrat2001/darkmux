@@ -19,6 +19,8 @@
   .topnav a:hover{color:var(--amber)}
   .badge{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.12em;text-transform:uppercase;color:#0a0a0b;background:var(--amber);padding:5px 9px;border-radius:3px}
   .pb{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.12em;text-transform:uppercase;color:var(--amber);border:1px solid var(--amber-dim);padding:4px 9px;border-radius:3px}
+  @keyframes lpulse{0%,100%{opacity:1}50%{opacity:.5}}
+  .pb.live{color:#4ade80;border-color:#4ade80;animation:lpulse 1.6s ease-in-out infinite}
   .crumbbar{height:40px;display:flex;align-items:center;gap:12px;padding:0 16px;border-bottom:1px solid var(--line);background:#131316}
   .backbtn{background:var(--bg);border:1px solid var(--line);color:var(--text);padding:5px 11px;border-radius:4px;cursor:pointer;font:600 12px 'JetBrains Mono',monospace}
   .backbtn[disabled]{opacity:.35;cursor:default}
@@ -56,6 +58,16 @@
   input[type=range]{flex:1;accent-color:var(--amber)}
   .clock{font:12px 'JetBrains Mono',monospace;color:var(--muted);min-width:160px;text-align:right}
   .fleet{display:flex;gap:36px;flex-wrap:wrap;align-items:flex-start}
+  .fleettl{margin-top:30px;border-top:1px solid var(--line);padding-top:18px}
+  .tlhdr{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin-bottom:14px}
+  .lane{display:flex;align-items:center;gap:12px;margin-bottom:7px}
+  .lname{width:150px;flex:none;font:12px 'JetBrains Mono',monospace;color:var(--text);text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .track{position:relative;flex:1;height:28px;background:var(--panel);border:1px solid var(--line);border-radius:4px;overflow:hidden}
+  .sbar{position:absolute;top:5px;height:18px;background:var(--amber-dim);border-radius:3px;min-width:2px}
+  .sbar.a{background:var(--amber);box-shadow:0 0 6px var(--amber)}
+  .track .ph{position:absolute;top:0;bottom:0;width:2px;background:var(--text);opacity:.32}
+  .tlaxis{margin-left:162px;display:flex;justify-content:space-between;font:9px 'JetBrains Mono',monospace;color:var(--muted);margin-top:7px}
+  .tlempty{font:11px 'JetBrains Mono',monospace;color:var(--muted)}
   .mach{width:230px;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px;cursor:pointer;transition:border-color .15s}
   .mach:hover{border-color:var(--amber-dim)}.mach.active{border-color:var(--amber);box-shadow:0 0 0 1px var(--amber-dim)}
   .mach .name{font:600 15px 'JetBrains Mono',monospace;color:var(--text);display:flex;align-items:center;gap:8px}
@@ -126,7 +138,7 @@
 <div class="top">
   <span class="brand"><a href="../"><b>darkmux</b></a> · observability</span>
   <span class="badge" id="srcbadge">Demo — sample data</span>
-  <span class="pb">▣ playback</span>
+  <span class="pb" id="modebadge">▣ playback</span>
   <nav class="topnav">
     <a href="../">home</a>
     <a href="../guide/">guide</a>
@@ -283,11 +295,32 @@ function machActive(m){
 }
 function renderFleet(){
   $("logscope").textContent="fleet"; state.stageScope=()=>true;
-  $("stage").innerHTML=`<div class="fleet">`+machines().map(m=>{
+  const ms=machines();
+  const cards=ms.map(m=>{
     const act=machActive(m), runs=sessionsOn(m).length;
     return `<div class="mach ${act?'active':''}" onclick="drillMachine('${m}')"><div class="name"><span class="mico">${ICON[MACH_ICON[m]]||""}</span>${m}</div>
       <div class="spec">${MACH_SPEC[m]||''}</div><div class="stat"><span class="dot"></span>${act?'dispatch in flight':'idle'} · ${runs} specialist${runs===1?'':'s'} + utility</div>
-      <div class="hint">click to drill in →</div></div>`;}).join("")+`</div>`;
+      <div class="hint">click to drill in →</div></div>`;}).join("");
+  // Activity timeline — one lane per machine; each dispatch session is a bar
+  // positioned across the recorded window, revealed up to the playhead (an
+  // in-flight session grows to the playhead). Fills the fleet view with a
+  // "what ran when, where" overview instead of empty canvas.
+  const span=Math.max(1,tMax-tMin), pct=t=>(t-tMin)/span*100;
+  const lanes=ms.map(m=>{
+    const bars=sessionsOn(m).map(sid=>{
+      const s=dispatch(sid,"start"); if(!s||T(s.ts)>state.t)return"";
+      const c=dispatch(sid,"complete"), done=c&&T(c.ts)<=state.t;
+      const end=done?T(c.ts):state.t, L=pct(T(s.ts)), W=Math.max(0.6,pct(end)-L);
+      const role=(s.handle||"").replace(/^darkmux\//,"");
+      return `<div class="sbar ${done?'':'a'}" style="left:${L}%;width:${W}%" title="${role} · ${sid}${done?'':' · in flight'}"></div>`;
+    }).join("");
+    return `<div class="lane"><div class="lname" title="${m}">${m}</div><div class="track">${bars}<div class="ph" style="left:${pct(state.t)}%"></div></div></div>`;
+  }).join("");
+  const ax=`<div class="tlaxis"><span>${iso(tMin).slice(11,16)}</span><span>${iso(tMin+span/2).slice(11,16)}</span><span>${iso(tMax).slice(11,16)}Z</span></div>`;
+  const tl = ms.length
+    ? `<div class="fleettl"><div class="tlhdr">activity · ${iso(tMin).slice(11,19)}–${iso(tMax).slice(11,19)}Z</div>${lanes}${ax}</div>`
+    : `<div class="fleettl"><div class="tlempty">waiting for the first flow record…</div></div>`;
+  $("stage").innerHTML=`<div class="fleet">${cards}</div>`+tl;
 }
 function renderMachine(){
   const m=state.machine; $("logscope").textContent=m; state.stageScope=r=>r.machine_id===m;
@@ -425,7 +458,7 @@ function renderMission(){
 window.selectRec=id=>{state.selected=id;state.follow=false;render();};
 $("follow").onclick=()=>{state.follow=!state.follow;render();};
 $("back").onclick=()=>{ if(state.level==="subsystem")drillMachine(state.machine); else if(state.level==="machine")goFleet(); else if(state.level==="mission")goFleet(); };
-$("range").oninput=e=>{state.t=tMin+(tMax-tMin)*e.target.value/100;render();};
+$("range").oninput=e=>{state.follow=false;state.t=tMin+(tMax-tMin)*e.target.value/100;render();};
 $("rewind").onclick=()=>{state.t=tMin;state.follow=true;render();};
 $("speed").onclick=()=>{const s=[0.5,1,2,4];state.speed=s[(s.indexOf(state.speed)+1)%s.length];$("speed").textContent=state.speed+"×";};
 $("play").onclick=()=>{
@@ -511,6 +544,69 @@ function targetDate(){
   return new Date().toISOString().slice(0,10);
 }
 
+function todayUTC(){return new Date().toISOString().slice(0,10);}
+
+let RAW=[];            // raw FlowRecords (pre-adapt); the live tail appends here
+let LIVE_ES=null;      // EventSource handle when tailing the live stream
+let lastStageSig=null; // skip stage re-renders that would destroy clickable cards
+const SEEN={cat:new Set(),tier:new Set(),src:new Set()};  // filter values ever observed
+
+// When live records introduce a category/tier/source not seen before, include it
+// in the active filter set (new = visible by default). Values the operator
+// explicitly deselected are already in SEEN, so they stay deselected.
+function absorbNewFilterValues(){
+  const add=(vals,seen,fset)=>{for(const v of vals){if(!seen.has(v)){seen.add(v);fset.add(v);}}};
+  add(FCATS,SEEN.cat,state.filters.cat);
+  add(FTIERS,SEEN.tier,state.filters.tier);
+  add(FSRC,SEEN.src,state.filters.src);
+}
+
+function setBadges(mode,date){
+  const dl = date===todayUTC() ? "today" : date;
+  DATA_SOURCE = mode==="live" ? ("live · "+dl) : mode==="play" ? ("flow · "+date) : mode==="empty" ? ("no records · "+date) : "sample data";
+  const sb=$("srcbadge");
+  if(sb) sb.textContent = mode==="live" ? ("Live · "+dl) : mode==="play" ? ("Flow · "+date) : mode==="empty" ? ("No records · "+date) : "Demo — sample data";
+  const mb=$("modebadge");
+  if(mb){ const live=mode==="live"; mb.textContent=live?"● live":"▣ playback"; mb.classList.toggle("live",live); }
+}
+
+// Structural signature of the current level's stage. In live mode the cards are
+// re-rendered only when this changes — a burst of telemetry records must not
+// destroy a card the operator is about to click (same hazard the playback timer
+// guards against). Subsystem is a metrics view with no cards → always full-render.
+function stageSig(){
+  const v=visible(), dis=v.filter(r=>r.action==="dispatch.start"||r.action==="dispatch.complete").length;
+  if(state.level==="fleet")return "f|"+machines().join(",")+"|"+dis;
+  if(state.level==="machine")return "m|"+state.machine+"|"+sessionsOn(state.machine).join(",")+"|"+dis;
+  if(state.level==="subsystem")return null;
+  return "mission";
+}
+function applyLive(){
+  DATA=flowToRenderModel(RAW);
+  recompute();
+  absorbNewFilterValues();
+  if(state.follow)state.t=tMax;
+  const sig=stageSig();
+  if(sig===null||sig!==lastStageSig){ lastStageSig=sig; render(); return; }
+  // Cards unchanged — refresh only the live readouts (selected event, log, meta, transport).
+  if(state.follow){ const n=newest(scopedFiltered()); state.selected=n?n._id:null; }
+  renderDetail();renderLog();renderMeta();syncTransport();
+}
+function startLiveTail(date){
+  if(typeof EventSource==="undefined")return;
+  if(LIVE_ES)LIVE_ES.close();
+  LIVE_ES=new EventSource("/flow/"+date+"/stream");
+  let pending=false;
+  LIVE_ES.onmessage=ev=>{
+    let rec; try{rec=JSON.parse(ev.data);}catch(_){return;}
+    if(!rec||typeof rec!=="object"||Array.isArray(rec))return;
+    RAW.push(rec);
+    if(!pending){pending=true;requestAnimationFrame(()=>{pending=false;applyLive();});}
+  };
+  LIVE_ES.onerror=()=>{const mb=$("modebadge");if(mb)mb.classList.remove("live");}; // reconnecting — drop the pulse
+  window.addEventListener("beforeunload",()=>{if(LIVE_ES)LIVE_ES.close();});
+}
+
 async function boot(){
   const date=targetDate();
   let mode="sample";
@@ -518,18 +614,18 @@ async function boot(){
     const res=await fetch("/flow/"+date,{headers:{accept:"application/json"}});
     if(res.ok){
       const body=await res.json();
-      const recs=Array.isArray(body)?body:(body.records||body.flow||[]);
-      DATA=flowToRenderModel(recs);
-      mode=recs.length?"live":"empty";
-    }else{ DATA=SAMPLE; mode="sample"; }
-  }catch(e){ DATA=SAMPLE; mode="sample"; }   // no daemon reachable (website) → fixture
-  DATA_SOURCE = mode==="live" ? ("flow · "+date) : mode==="empty" ? ("no records · "+date) : "sample data";
-  const sb=$("srcbadge");
-  if(sb) sb.textContent = mode==="live" ? ("Live · "+date) : mode==="empty" ? ("No records · "+date) : "Demo — sample data";
+      RAW=Array.isArray(body)?body:(body.records||body.flow||[]);
+      DATA=flowToRenderModel(RAW);
+      mode = date===todayUTC() ? "live" : (RAW.length?"play":"empty");  // today tails; a past date replays
+    }else{ DATA=SAMPLE; RAW=[]; mode="sample"; }
+  }catch(e){ DATA=SAMPLE; RAW=[]; mode="sample"; }   // no daemon (website) → bundled fixture
+  setBadges(mode,date);
   recompute();
   state.t=tMax;
   state.filters={cat:new Set(FCATS),tier:new Set(FTIERS),src:new Set(FSRC),q:""};
+  absorbNewFilterValues();
   render();
+  if(mode==="live") startLiveTail(date);
 }
 boot();
 </script>
