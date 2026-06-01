@@ -368,7 +368,7 @@ function renderCrumb(){
     if(state.level==="machine"||state.level==="subsystem") c+=`<span class="sep">›</span><a onclick="drillMachine('${state.machine}')">${state.machine}</a>`;
     if(state.level==="subsystem") c+=`<span class="sep">›</span>${state.session}`;
   }
-  $("crumb").innerHTML=c; $("back").disabled=(state.level==="mission");
+  $("crumb").innerHTML=c; $("back").disabled=(state.level==="fleet");
 }
 function filtersActive(){return state.filters.cat.size<FCATS.length||state.filters.tier.size<FTIERS.length||state.filters.src.size<FSRC.length||!!state.filters.q;}
 function updateFbtn(){const a=filtersActive();$("fbtn").className="fbtn"+(a?" on":"");$("fbtn").textContent=a?"⚙ filters •":"⚙ filters";}
@@ -408,7 +408,7 @@ function renderMission(){
 }
 window.selectRec=id=>{state.selected=id;state.follow=false;render();};
 $("follow").onclick=()=>{state.follow=!state.follow;render();};
-$("back").onclick=()=>{ if(state.level==="subsystem")drillMachine(state.machine); else if(state.level==="machine")goFleet(); else if(state.level==="fleet")goMission(); };
+$("back").onclick=()=>{ if(state.level==="subsystem")drillMachine(state.machine); else if(state.level==="machine")goFleet(); else if(state.level==="mission")goFleet(); };
 $("range").oninput=e=>{state.t=tMin+(tMax-tMin)*e.target.value/100;render();};
 $("rewind").onclick=()=>{state.t=tMin;state.follow=true;render();};
 $("speed").onclick=()=>{const s=[0.5,1,2,4];state.speed=s[(s.indexOf(state.speed)+1)%s.length];$("speed").textContent=state.speed+"×";};
