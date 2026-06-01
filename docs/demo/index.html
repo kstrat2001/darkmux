@@ -104,6 +104,7 @@
   .spt{flex:1;font:12px 'JetBrains Mono',monospace;color:var(--text)}
   .spe{font:11px 'JetBrains Mono',monospace;color:var(--muted)}
   .spa{font:11px 'JetBrains Mono',monospace;color:var(--amber-dim);min-width:190px;text-align:right}
+  .mscope{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin:-8px 0 16px}
   .eureka{margin-top:16px;border:1px solid var(--warn);background:#1c1c22;border-radius:6px;padding:12px 14px}
   .eureka .k{color:var(--warn);font:600 12px 'JetBrains Mono',monospace}.eureka .m{color:var(--text);font-size:12px;margin-top:4px}.eureka .f{color:var(--muted);font-size:11px;margin-top:6px}
   /* filter modal */
@@ -201,11 +202,11 @@ const ICON={
   mini:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="9" width="18" height="7" rx="2"/><circle cx="7" cy="12.5" r="1"/></svg>'};
 // demo: machines are known; the real tool derives form-factor from machine metadata
 const MACH_ICON={studio:"desktop",laptop:"laptop",["mini-1"]:"mini"};
-const MISSION={id:"redis-tailnet",goal:"Wire the fleet's flow stream through Redis over the tailnet so every machine's dispatches aggregate into one shared, auditable stream.",sprints:[
-  {id:"s1",title:"Redis stream sink + XADD MAXLEN retention",status:"complete",est:"M",who:"darkmux/coder",on:"studio"},
-  {id:"s2",title:"Cross-machine aggregation in /flow/<date>",status:"complete",est:"S",who:"darkmux/reviewer",on:"laptop"},
-  {id:"s3",title:"Tailnet hub topology + failover routing",status:"active",est:"L",who:"darkmux/analyst",on:"mini-1"},
-  {id:"s4",title:"Audit-sink tee + integrity-check cron",status:"backlog",est:"M",who:"—",on:"—"}]};
+const MISSION={id:"redis-tailnet",goal:"Wire the fleet's flow stream through Redis over the tailnet so every machine's dispatches aggregate into one shared, auditable stream.",scope:"fleet · studio + laptop + mini-1",sprints:[
+  {id:"s1",title:"Redis stream sink + XADD MAXLEN retention",est:"M",who:"darkmux/coder",on:"studio",sid:"S1"},
+  {id:"s2",title:"Cross-machine aggregation in /flow/<date>",est:"S",who:"darkmux/reviewer",on:"laptop",sid:"S2"},
+  {id:"s3",title:"Tailnet hub topology + failover routing",est:"L",who:"darkmux/analyst",on:"mini-1",sid:"S3"},
+  {id:"s4",title:"Audit-sink tee + integrity-check cron",est:"M",who:"—",on:"—",sid:null}]};
 const T=s=>Date.parse(s);
 const tMin=Math.min(...DATA.map(r=>T(r.ts))), tMax=Math.max(...DATA.map(r=>T(r.ts)));
 const iso=t=>new Date(t).toISOString();
@@ -255,9 +256,9 @@ function renderMachine(){
   const m=state.machine; $("logscope").textContent=m; state.stageScope=r=>r.machine_id===m;
   // Always-loaded utility role — resident on every machine, runs alongside the specialists
   // to handle compaction + other utility-tier tasks (not a per-mission dispatch).
-  const util=`<div class="node util"><div class="h">darkmux/compactor</div>
-    <div class="s">utility role · always-loaded</div>
-    <div class="s">compaction · scribe · estimator</div>
+  const util=`<div class="node util"><div class="h">darkmux/utility</div>
+    <div class="s">utility tier · always-loaded</div>
+    <div class="s">compaction · mission-compile · estimate · scribe</div>
     <span class="pill util">resident</span></div>`;
   // Specialist roles dispatched on this machine for the active mission
   const specs=sessionsOn(m).filter(sid=>visible().some(r=>r.session_id===sid)).map(sid=>{
@@ -350,10 +351,21 @@ window.goFleet=()=>{state.level="fleet";state.machine=null;state.session=null;st
 window.goMission=()=>{state.level="mission";state.machine=null;state.session=null;state.follow=true;render();};
 function renderMission(){
   state.stageScope=r=>r.mission_id===MISSION.id; $("logscope").textContent="mission";
-  const done=MISSION.sprints.filter(s=>s.status==="complete").length, active=MISSION.sprints.filter(s=>s.status==="active").length, backlog=MISSION.sprints.filter(s=>s.status==="backlog").length, total=MISSION.sprints.length, pct=Math.round(done/total*100);
-  const rows=MISSION.sprints.map(s=>`<div class="sprow"><span class="sps ${s.status}">${s.status}</span><span class="spt">${s.title}</span><span class="spe">est ${s.est}</span><span class="spa">${s.who}${s.on!=="—"?' · '+s.on:''}</span></div>`).join("");
+  // Sprint status is derived from its dispatch session at the current playhead, so the
+  // burn-down actually advances during playback (backlog → active → complete).
+  const statusOf=s=>{
+    if(!s.sid) return "backlog";
+    const st=dispatch(s.sid,"start"), cp=dispatch(s.sid,"complete");
+    if(!st||T(st.ts)>state.t) return "backlog";
+    if(cp&&T(cp.ts)<=state.t) return "complete";
+    return "active";
+  };
+  const sp=MISSION.sprints.map(s=>({...s,status:statusOf(s)}));
+  const done=sp.filter(s=>s.status==="complete").length, active=sp.filter(s=>s.status==="active").length, backlog=sp.filter(s=>s.status==="backlog").length, total=sp.length, pct=Math.round(done/total*100);
+  const rows=sp.map(s=>`<div class="sprow"><span class="sps ${s.status}">${s.status}</span><span class="spt">${s.title}</span><span class="spe">est ${s.est}</span><span class="spa">${s.who}${s.on!=="—"?' · '+s.on:''}</span></div>`).join("");
   $("stage").innerHTML=`<div class="sub"><h2>mission · ${MISSION.id}</h2>
     <div class="mgoal">${MISSION.goal}</div>
+    <div class="mscope">scope · ${MISSION.scope}</div>
     <div class="burn"><div class="burnbar"><span style="width:${pct}%"></span></div><div class="burnlbl">${done}/${total} sprints complete · ${pct}% burned down · ${active} active · ${backlog} backlog</div></div>
     <div class="track"><div class="lbl">sprints</div>${rows}</div></div>`;
 }
