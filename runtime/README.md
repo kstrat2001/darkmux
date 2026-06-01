@@ -69,10 +69,22 @@ For routine use, the wrapper is `darkmux crew dispatch <role-id> -m "<message>"`
 
 ## Environment variables
 
+The runtime reads only two env vars directly. Everything else — model, context
+window, compaction tuning, turn/token bounds — arrives as explicit **CLI flags**
+from the host dispatcher.
+
 | Variable | Default | Effect |
 |---|---|---|
-| `DARKMUX_RUNTIME_COMPACT_THRESHOLD_TOKENS` | 60000 | Prompt-token threshold above which compaction fires |
-| `DARKMUX_RUNTIME_COMPACTOR_MODEL` | `darkmux:qwen3-4b-instruct-2507` | Companion model used for compaction summaries |
+| `DARKMUX_INACTIVITY_TIMEOUT_SECONDS` | 600 | Per-dispatch inactivity budget. The runtime-side detector soft-warns at 75%; the host watchdog hard-kills the container at 100%. Both reset on any proof-of-work signal. |
+| `DARKMUX_FEEDBACK_INJECTION` | on | Toggles the struggle-detector feedback-injection channel (cycle / tool-failure / reasoning-loop nudges). Set to `0`/`off`/`false`/`no` to disable. |
+
+**Compaction config is NOT read from the environment** (since #368/#482). The host
+derives it from `profile.runtime.compaction.*` and passes it as CLI flags —
+`--compact-threshold-tokens`, `--compactor-model`, `--compact-threshold-ratio`,
+`--context-window`, `--compact-strategy` (the runtime requires at least one of
+`--context-window` / `--compact-threshold-tokens`; there is no env fallback). Turn
+and cumulative-token bounds arrive the same way via `--max-turns` / `--max-tokens`.
+The operator's tuning surface is the profile JSON, not shell env.
 
 ## Tests
 

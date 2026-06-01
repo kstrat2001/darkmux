@@ -1,50 +1,28 @@
-# /topology — fleet observability diagram
+# /topology — moved to /demo
 
-Renders the darkmux fleet's shape from `FlowRecord` streams. Live or replay; same render pipeline either way.
+The standalone `/topology` fleet-diagram page has been folded into the unified
+observability **demo** at [`/demo`](../demo/). Opening `darkmux.com/topology/`
+now redirects there.
 
-## Modes
+## What `/demo` is today
 
-- **Fleet** (default) — orchestrators on the left, machines (with crew role count) in the middle, missions on the right.
-- **Focus** — one machine deep-dive: crew roles and recent stages expanded to their own nodes.
-- **Mission** — cross-cutting filter by mission_id; non-mission nodes dim, mission edges highlighted.
+A **static, badged playback** of a curated sample fleet — one inlined flow-record
+fixture rendered through a drill-down viewer (mission → fleet → machine →
+subsystem). It is explicitly a *demo of sample data*, not a live tool:
 
-Switch modes via the pill row at the top.
+- **No live source.** It does not subscribe to `darkmux serve`; it ships an inline
+  fixture and makes no daemon fetch — which is what makes it safe to host on an
+  HTTPS page (no CORS / mixed-content).
+- **No `?fixture=`, drag-drop, or `?test=1`.** Those were capabilities of the
+  pre-redirect topology viewer; the demo loads one fixed dataset.
 
-## Data sources
+## Where the live tool is headed
 
-| Source | How to load |
-|---|---|
-| Live | Default. Subscribes to `darkmux serve` on `http://127.0.0.1:8765/flow/<today>/stream`. Source pill reads `source: live`. |
-| Fixture | `?fixture=fleet-3-machines` or `?fixture=single-machine-dispatch` — loads from `fixtures/<name>.jsonl`. |
-| Drag-drop | Drop any `.jsonl` of flow records onto the canvas. |
-
-## Replay scrubber
-
-Only visible in replay mode (when a fixture is loaded). At the bottom of the canvas:
-
-- ▸| — step to next record.
-- Speed selector — pause / 1× / 4× / 16×.
-- Range slider — drag to scrub through the fixture's ts range.
-- Readout — current wall-clock + visible/total record count.
-
-## Live cues
-
-- **Edge motion** — dashed-stroke animation on edges whose most recent record is within the last 5 seconds.
-- **Node pulse** — 2-second halo on nodes that just received a record.
-- **Wall-clock arc** — SVG ring around a crew role node when a `dispatch start` has been seen but `dispatch complete` has not yet; shows elapsed seconds.
-
-## Tests
-
-Inline harness — open `?test=1` for the unit-test panel. Tests cover the pure transforms (`aggregateMachines`, `aggregateOrchestrators`, `aggregateMissions`, `aggregateRoles`, `deriveEdges`). Visual surfaces (modes, cues, scrubber) are verified manually + via Playwright snapshots during development.
-
-## Composes with
-
-- [#162](https://github.com/kstrat2001/darkmux/issues/162) — fleet-aware-darkmux epic; this is UI Step 3 / Phase 4.
-- [#168](https://github.com/kstrat2001/darkmux/issues/168) — UI Step 1 plumbing (shared shell + tab nav).
-- [#169](https://github.com/kstrat2001/darkmux/issues/169) — design spec.
-- [#211](https://github.com/kstrat2001/darkmux/issues/211) — flow schema 1.6.0 (event types this renders).
-
-## Known gaps
-
-- Live SSE is single-machine (the daemon reads its local file sink, not Redis). True fleet-aggregated live mode lands when daemon gains a Redis-aware endpoint.
-- Mobile responsive: usable below 720px but the diagram is densest at desktop widths.
+A daemon-hosted, drillable viewer over the live flow stream — with fixture loading
+and a distinct live-vs-playback mode — is the observability-unification work:
+[#556](https://github.com/kstrat2001/darkmux/issues/556) (epic),
+[#558](https://github.com/kstrat2001/darkmux/issues/558) (unified viewer),
+[#554](https://github.com/kstrat2001/darkmux/issues/554) (daemon hosts it at its
+own origin). The design lives in `docs/architecture/observability-unification-plan.md`;
+the concepts it renders (flow records, schema 1.8.0, the drill levels) are in
+`docs/architecture/CONCEPTS.md`.
