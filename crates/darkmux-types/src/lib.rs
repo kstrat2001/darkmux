@@ -270,6 +270,23 @@ pub struct RegistryHooks {
     pub post_swap: Vec<ProfileHookCommand>,
 }
 
+/// Machine-level internal bindings — darkmux's own standing infrastructure
+/// for this machine, a sibling to the operator's `profiles`. Decoupled from
+/// any single profile so swapping a worker profile never changes the
+/// compaction model. (#590)
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegistryInternal {
+    /// The machine's **utility model** — the standing support model the
+    /// runtime summons for built-in utility tasks (compaction today;
+    /// estimation / mission-compile later). The operator registers it from
+    /// lab work; it is **not** capability-scored (a score could re-pick a
+    /// large worker for compaction and reintroduce the per-beat tax). One
+    /// global util model serves all utility hooks. Absent ⇒ the runtime
+    /// falls back to its built-in default compactor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub utility: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Profile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -325,6 +342,20 @@ pub struct ProfileRegistry {
     pub hooks: Option<RegistryHooks>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_profile: Option<String>,
+    /// Machine-level internal bindings (the utility model, …) — sibling to
+    /// `profiles`, so swapping a worker profile never disturbs darkmux's own
+    /// standing infrastructure. (#590)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internal: Option<RegistryInternal>,
+}
+
+impl ProfileRegistry {
+    /// The machine's registered utility model id (`internal.utility`), if any.
+    /// `None` ⇒ no machine utility model registered; consumers fall back to
+    /// their built-in default. (#590)
+    pub fn utility_model_id(&self) -> Option<&str> {
+        self.internal.as_ref().and_then(|i| i.utility.as_deref())
+    }
 }
 
 // `Serialize` so `darkmux serve`'s `/model/status` endpoint (#87) can
@@ -477,6 +508,39 @@ mod tests {
         let p = reg.profiles.get("fast").unwrap();
         assert_eq!(p.models[0].n_ctx, 32_000);
         assert!(matches!(p.models[0].role, ModelRole::Primary));
+        // No `internal` block ⇒ no machine utility model registered.
+        assert_eq!(reg.utility_model_id(), None);
+    }
+
+    #[test]
+    fn registry_parses_machine_internal_utility_binding() {
+        // The machine-level `internal.utility` binding (#590) — sibling to
+        // `profiles`, carries the standing utility model id.
+        let json = r#"{
+            "profiles": {
+                "fast": { "models": [ {"id": "worker-a", "n_ctx": 32000, "role": "primary"} ] }
+            },
+            "internal": { "utility": "darkmux:qwen3-4b-instruct-2507" }
+        }"#;
+        let reg: ProfileRegistry = serde_json::from_str(json).unwrap();
+        assert_eq!(reg.utility_model_id(), Some("darkmux:qwen3-4b-instruct-2507"));
+        // Round-trips back to the same shape.
+        let back: ProfileRegistry =
+            serde_json::from_str(&serde_json::to_string(&reg).unwrap()).unwrap();
+        assert_eq!(back.utility_model_id(), Some("darkmux:qwen3-4b-instruct-2507"));
+    }
+
+    #[test]
+    fn registry_internal_present_but_utility_absent_is_none() {
+        // An `internal` block with no `utility` key ⇒ no util model.
+        let json = r#"{ "profiles": {}, "internal": {} }"#;
+        let reg: ProfileRegistry = serde_json::from_str(json).unwrap();
+        assert!(reg.internal.is_some());
+        assert_eq!(reg.utility_model_id(), None);
+        // The inner `utility` key skips when None, so `internal` reserializes
+        // as an empty object — `{"internal":{}}` — and never carries a
+        // `utility` key. (The empty `internal` block itself is NOT dropped.)
+        assert!(!serde_json::to_string(&reg).unwrap().contains("utility"));
     }
 
     // ─── RuntimeCompactionConfig (v0.1 schema extension, #357) ──────────

@@ -103,6 +103,7 @@ pub fn run(include_openclaw: bool) -> DoctorReport {
         check_audit_integrity(),
         check_recommendation_drift(),
         check_recommended_profile_name_not_shadowed(),
+        check_utility_model_binding(),
         check_role_tool_vocab_typos(),
         check_beat33_legacy_crew_dir(),
         check_legacy_mission_layout(),
@@ -649,6 +650,77 @@ fn check_recommended_profile_name_not_shadowed() -> Check {
             message: "no shadowing — `recommended` is free to route to the recommendation registry"
                 .into(),
             hint: None,
+        }
+    }
+}
+
+/// `utility model`: surfaces the machine-level `internal.utility` binding
+/// (#590) — the standing support model the runtime summons for compaction
+/// (and future estimation / mission-compile). When it's registered the model
+/// must be LOADED, because compaction fires mid-dispatch and a missing
+/// utility model makes the compactor call fail. This is the operator-facing
+/// half of the silent-eviction guard (the dispatch-time check lands with the
+/// wiring); doctor flags "registered but not loaded" before you dispatch.
+fn check_utility_model_binding() -> Check {
+    let registry_util = darkmux_profiles::profiles::load_registry(None)
+        .ok()
+        .and_then(|l| l.registry.utility_model_id().map(str::to_string));
+    // Only query LMStudio when there's a binding to check.
+    let loaded = if registry_util.is_some() {
+        darkmux_profiles::lms::list_loaded().ok()
+    } else {
+        None
+    };
+    utility_binding_status(registry_util.as_deref(), loaded.as_deref())
+}
+
+/// Pure decision for `check_utility_model_binding`, split out so every arm is
+/// unit-testable without a live LMStudio. `loaded` is `None` when the binding
+/// is set but `lms ps` couldn't be queried.
+fn utility_binding_status(
+    registry_util: Option<&str>,
+    loaded: Option<&[darkmux_types::LoadedModel]>,
+) -> Check {
+    let name = "utility model".to_string();
+    let Some(id) = registry_util else {
+        return Check {
+            name,
+            status: Status::Pass,
+            message: "no machine utility model registered; compaction uses the runtime default"
+                .into(),
+            hint: Some(
+                "Optional: register a small fast model as this machine's utility model in ~/.darkmux/profiles.json — `\"internal\": { \"utility\": \"<model-id>\" }`. It serves compaction (and future estimation/mission-compile) for every role, decoupled from your worker profiles. (#590)".into(),
+            ),
+        };
+    };
+    match loaded {
+        None => Check {
+            name,
+            status: Status::Warn,
+            message: format!(
+                "utility model `{id}` registered; couldn't query LMStudio to confirm it's loaded"
+            ),
+            hint: Some("Start LMStudio and ensure `lms ps` returns successfully.".into()),
+        },
+        Some(models) => {
+            let is_loaded = models.iter().any(|m| m.model == id || m.identifier == id);
+            if is_loaded {
+                Check {
+                    name,
+                    status: Status::Pass,
+                    message: format!("utility model `{id}` registered and loaded"),
+                    hint: None,
+                }
+            } else {
+                Check {
+                    name,
+                    status: Status::Warn,
+                    message: format!("utility model `{id}` registered but NOT loaded"),
+                    hint: Some(
+                        "Load it before dispatching — compaction summons the utility model mid-dispatch; if it isn't resident the compactor call fails. Run `lms load <id>`, or include it in the profile you `darkmux swap` to. (#590)".into(),
+                    ),
+                }
+            }
         }
     }
 }
@@ -2528,14 +2600,61 @@ mod tests {
         // machine_id + orchestrator [#167] + machine-tier-env (retired,
         // [#321/#322]) +
         // audit-integrity [#163] + recommendation-drift +
-        // recommended-profile-not-shadowed [#159] + role-model-pin-drift
-        // [#160] + legacy-mission-layout [#148] + beat-33-crew-dir
-        // [Beat 33 directory flatten] + role-tool-vocab [#340]
-        // + legacy-compaction-extras [#380]) + one per active eureka rule.
-        // Every check should appear regardless of environment — even if
+        // recommended-profile-not-shadowed [#159] + utility-model-binding
+        // [#590] + role-model-pin-drift [#160] + legacy-mission-layout [#148]
+        // + beat-33-crew-dir [Beat 33 directory flatten] + role-tool-vocab
+        // [#340] + legacy-compaction-extras [#380]) + one per active eureka
+        // rule. Every check should appear regardless of environment — even if
         // the underlying probe couldn't read state.
-        let expected = 26 + darkmux_eureka::all_rules().len();
+        let expected = 27 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
+    }
+
+    // ─── check_utility_model_binding (#590) ───────────────────────────
+    fn lm(identifier: &str, model: &str) -> darkmux_types::LoadedModel {
+        darkmux_types::LoadedModel {
+            identifier: identifier.into(),
+            model: model.into(),
+            status: "loaded".into(),
+            size: "3 GB".into(),
+            context: 4096,
+        }
+    }
+
+    #[test]
+    fn utility_binding_unregistered_passes_with_setup_hint() {
+        let c = super::utility_binding_status(None, None);
+        assert_eq!(c.status, Status::Pass);
+        assert!(c.message.contains("no machine utility model"));
+        assert!(c.hint.unwrap().contains("internal"));
+    }
+
+    #[test]
+    fn utility_binding_registered_but_lms_unreachable_warns() {
+        let c = super::utility_binding_status(Some("darkmux:util-4b"), None);
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.message.contains("couldn't query LMStudio"));
+    }
+
+    #[test]
+    fn utility_binding_registered_and_loaded_passes() {
+        // Match by modelKey...
+        let loaded = vec![lm("darkmux:util-4b", "util-4b"), lm("worker", "worker-35b")];
+        let c = super::utility_binding_status(Some("util-4b"), Some(&loaded));
+        assert_eq!(c.status, Status::Pass);
+        assert!(c.message.contains("registered and loaded"));
+        // ...or by the namespaced identifier.
+        let c2 = super::utility_binding_status(Some("darkmux:util-4b"), Some(&loaded));
+        assert_eq!(c2.status, Status::Pass);
+    }
+
+    #[test]
+    fn utility_binding_registered_but_not_loaded_warns() {
+        let loaded = vec![lm("worker", "worker-35b")];
+        let c = super::utility_binding_status(Some("util-4b"), Some(&loaded));
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.message.contains("registered but NOT loaded"));
+        assert!(c.hint.unwrap().contains("Load it before dispatching"));
     }
 
     // ─── parse_semver / classify_version_vs_latest (issue #13) ───────────

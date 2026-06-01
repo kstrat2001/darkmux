@@ -1043,6 +1043,7 @@ mod tests {
             profiles,
             hooks: None,
             default_profile: None,
+            internal: None,
         }
     }
 
