@@ -76,9 +76,22 @@
   .sub h2{font:600 13px 'JetBrains Mono',monospace;letter-spacing:.1em;text-transform:uppercase;color:var(--amber);margin:0 0 4px}
   .sub h2 a{color:var(--amber);text-decoration:underline;cursor:pointer}
   .track{margin:18px 0}.track .lbl{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin-bottom:6px}
-  .seg{display:inline-block;height:30px;line-height:30px;padding:0 12px;margin-right:2px;font:11px 'JetBrains Mono',monospace;border-radius:3px;color:#0a0a0b;background:var(--amber)}
+  .seg{display:inline-flex;align-items:center;height:30px;padding:0 12px;margin-right:2px;font:11px 'JetBrains Mono',monospace;border-radius:3px;color:#0a0a0b;background:var(--amber)}
   .seg.b{background:var(--warn)}
-  .bars{display:flex;align-items:flex-end;gap:4px;height:80px}.bar{width:26px;background:var(--amber-dim);border-radius:2px 2px 0 0}
+  .metrics{display:flex;gap:12px;margin:14px 0 4px;flex-wrap:wrap}
+  .met{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:9px 14px;min-width:118px}
+  .met .mv{font:600 17px 'JetBrains Mono',monospace;color:var(--text)}
+  .met .ml{font:10px 'JetBrains Mono',monospace;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-top:3px}
+  .tokbar{height:4px;background:var(--line);border-radius:2px;margin-top:7px;overflow:hidden}.tokbar span{display:block;height:100%;background:var(--amber)}
+  .cpuchart{display:flex;gap:8px;align-items:flex-end}
+  .yax{display:flex;flex-direction:column;justify-content:space-between;height:80px;font:9px 'JetBrains Mono',monospace;color:var(--muted);text-align:right}
+  .bars{display:flex;align-items:flex-end;gap:6px;height:80px;border-bottom:1px solid var(--line)}.bar{width:24px;background:var(--amber-dim);border-radius:2px 2px 0 0}
+  .xvals{display:flex;gap:6px;margin-top:4px}.xvals span{width:24px;text-align:center;font:9px 'JetBrains Mono',monospace;color:var(--muted)}
+  .finding{border:1px solid var(--line);border-left:3px solid var(--line);border-radius:5px;padding:9px 12px;margin-bottom:7px;background:var(--panel)}
+  .finding.warn{border-left-color:var(--warn)}.finding.ok{border-left-color:var(--good)}
+  .finding .fk{display:block;font:600 12px 'JetBrains Mono',monospace;color:var(--warn)}.finding.ok .fk{color:var(--good)}
+  .finding .fm{display:block;font-size:12px;color:var(--text);margin-top:3px}
+  .finding .ff{display:block;font-size:11px;color:var(--muted);margin-top:5px}
   .eureka{margin-top:16px;border:1px solid var(--warn);background:#1c1c22;border-radius:6px;padding:12px 14px}
   .eureka .k{color:var(--warn);font:600 12px 'JetBrains Mono',monospace}.eureka .m{color:var(--text);font-size:12px;margin-top:4px}.eureka .f{color:var(--muted);font-size:11px;margin-top:6px}
   /* filter modal */
@@ -152,6 +165,11 @@ const DATA = [
  {ts:"2026-05-19T01:01:35Z",category:"telemetry",source:"process",machine_id:"studio",session_id:"S1",fields:{cpu:71}},
  {ts:"2026-05-19T01:01:55Z",category:"telemetry",source:"process",machine_id:"studio",session_id:"S1",fields:{cpu:24}},
  {ts:"2026-05-19T01:02:10Z",category:"work",tier:"local",stage:"dispatch",action:"dispatch.complete",handle:"darkmux/coder",machine_id:"studio",mission_id:"redis-tailnet",session_id:"S1",model:"qwen3-coder-next"},
+ {ts:"2026-05-19T01:01:10Z",category:"telemetry",source:"detector",machine_id:"studio",session_id:"S1",fields:{kind:"tool-failure",severity:"warn",detail:"2 consecutive tool failures (file_not_found) before recovery (#419)"}},
+ {ts:"2026-05-19T01:02:08Z",category:"telemetry",source:"runtime",machine_id:"studio",session_id:"S1",fields:{turns:7,tokens:48200,budget:100000}},
+ {ts:"2026-05-19T01:02:00Z",category:"telemetry",source:"detector",machine_id:"laptop",session_id:"S2",fields:{kind:"cycle",severity:"warn",detail:"same file read 3x in a row — repeated-tool-call cycle (#418)"}},
+ {ts:"2026-05-19T01:03:08Z",category:"telemetry",source:"runtime",machine_id:"laptop",session_id:"S2",fields:{turns:4,tokens:72500,budget:100000}},
+ {ts:"2026-05-19T01:03:38Z",category:"telemetry",source:"runtime",machine_id:"mini-1",session_id:"S3",fields:{turns:5,tokens:31000,budget:100000}},
  {ts:"2026-05-19T01:00:55Z",category:"work",tier:"local",stage:"dispatch",action:"dispatch.start",handle:"darkmux/reviewer",machine_id:"laptop",mission_id:"redis-tailnet",session_id:"S2",model:"qwen3.5-122b"},
  {ts:"2026-05-19T01:01:00Z",category:"telemetry",source:"lms",machine_id:"laptop",session_id:"S2",fields:{event:"load",model:"qwen3.5-122b",gb:74}},
  {ts:"2026-05-19T01:01:30Z",category:"telemetry",source:"process",machine_id:"laptop",session_id:"S2",fields:{cpu:55}},
@@ -230,17 +248,36 @@ function renderSubsystem(){
   const sid=state.session, m=state.machine; $("logscope").textContent=sid; state.stageScope=r=>r.session_id===sid;
   const tel=visible().filter(r=>r.session_id===sid&&r.category==="telemetry");
   const lms=tel.filter(r=>r.source==="lms"), procs=tel.filter(r=>r.source==="process");
+  const rt=tel.filter(r=>r.source==="runtime").slice(-1)[0];
+  const dets=tel.filter(r=>r.source==="detector");
   const loads=lms.filter(r=>r.fields.event==="load");
-  const segs=loads.map((r,i)=>`<span class="seg ${i>0?'b':''}">${r.fields.model} · ${r.fields.gb||'?'}GB</span>`).join("");
-  const bars=procs.map(r=>`<div class="bar" style="height:${Math.max(6,r.fields.cpu*0.8)}px" title="cpu ${r.fields.cpu}%"></div>`).join("");
   const distinct=[...new Set(loads.map(r=>r.fields.model))];
-  const eureka=distinct.length>1?`<div class="eureka"><div class="k">⚠ eureka · jit-model-swap</div>
-     <div class="m">${distinct.length} models loaded in one run (${distinct.join(' → ')}) — mid-run swap stalls the dispatch while the new model loads.</div>
-     <div class="f">fix: pin one model for the run, or pre-warm the swap target.</div></div>`:"";
-  const d=dispatch(sid,"start");
+  const d=dispatch(sid,"start"), c=dispatch(sid,"complete"), done=c&&T(c.ts)<=state.t;
+  const turns=rt?rt.fields.turns:"—";
+  const tok=rt?rt.fields.tokens:0, bud=rt?rt.fields.budget:0, tokPct=bud?Math.round(tok/bud*100):0;
+  const wall=done?fmt(T(c.ts)-T(d.ts)):fmt(state.t-T(d.ts))+" so far";
+  const met=`<div class="metrics">
+    <div class="met"><div class="mv">${turns}</div><div class="ml">turns</div></div>
+    <div class="met"><div class="mv">${tok?(tok/1000).toFixed(1)+"k":"—"}</div><div class="ml">tokens / ${bud?(bud/1000)+"k budget":"—"}</div><div class="tokbar"><span style="width:${tokPct}%"></span></div></div>
+    <div class="met"><div class="mv">${distinct.length}</div><div class="ml">model(s) loaded</div></div>
+    <div class="met"><div class="mv">${wall}</div><div class="ml">wall clock</div></div></div>`;
+  const segs=loads.map((r,i)=>`<span class="seg ${i>0?'b':''}">${r.fields.model} · ${r.fields.gb||'?'}GB</span>`).join("");
+  const bars=procs.map(r=>`<div class="bar" style="height:${Math.max(3,r.fields.cpu/100*78)}px" title="cpu ${r.fields.cpu}%"></div>`).join("");
+  const xvals=procs.map(r=>`<span>${r.fields.cpu}</span>`).join("");
+  const cpu=procs.length?`<div class="track"><div class="lbl">process cpu — % busy</div>
+    <div class="cpuchart"><div class="yax"><span>100</span><span>50</span><span>0</span></div>
+      <div><div class="bars">${bars}</div><div class="xvals">${xvals}</div></div></div></div>`:"";
+  const finds=[];
+  if(distinct.length>1)finds.push({s:"warn",k:"jit-model-swap",d:`${distinct.length} models loaded in one run (${distinct.join(" → ")}) — mid-run swap stalls the dispatch while the new model loads.`,f:"pin one model for the run, or pre-warm the swap target."});
+  dets.forEach(r=>finds.push({s:r.fields.severity||"warn",k:r.fields.kind,d:r.fields.detail}));
+  const detections=finds.length
+    ? `<div class="track"><div class="lbl">detections (${finds.length})</div>`+finds.map(f=>`<div class="finding ${f.s}"><span class="fk">⚠ ${f.k}</span><span class="fm">${f.d}</span>${f.f?`<span class="ff">fix: ${f.f}</span>`:""}</div>`).join("")+`</div>`
+    : `<div class="track"><div class="lbl">detections</div><div class="finding ok"><span class="fk">✓ clean</span><span class="fm">no behavioral flags (cycle, tool-failure, reasoning-loop, edit-drift)</span></div></div>`;
   $("stage").innerHTML=`<div class="sub"><h2>subsystem · ${d.handle} <span style="color:var(--muted);text-transform:none;font-weight:400">(${sid} on <a onclick="drillMachine('${m}')">${m}</a>)</span></h2>
+    ${met}
     <div class="track"><div class="lbl">model (lms)</div>${segs||'<span class="hint">no telemetry yet</span>'}</div>
-    <div class="track"><div class="lbl">process cpu — ${procs.length} sample(s)</div><div class="bars">${bars}</div></div>${eureka}</div>`;
+    ${cpu}
+    ${detections}</div>`;
 }
 function pretty(r){
   const o={};Object.keys(r).filter(k=>k!=="_id").forEach(k=>o[k]=r[k]);
@@ -256,7 +293,7 @@ function renderLog(){
   const recs=scopedFiltered().slice(-50).reverse();
   $("logbody").innerHTML=recs.length?recs.map(r=>{
     const tt=iso(T(r.ts)).slice(11,19);
-    const tag=r.category==="telemetry"?`${r.source}:${r.fields.event||('cpu '+r.fields.cpu+'%')}`:(r.action||r.stage);
+    const tag=r.category==="telemetry"?(r.source==="lms"?`lms:${r.fields.event}`:r.source==="process"?`cpu ${r.fields.cpu}%`:r.source==="detector"?`detect:${r.fields.kind}`:r.source==="runtime"?`run:${r.fields.turns}t·${(r.fields.tokens/1000).toFixed(0)}k`:r.source):(r.action||r.stage);
     return `<div class="rec ${r.category} ${r._id===state.selected?'sel':''}" onclick="selectRec(${r._id})">
       <span class="t">${tt}</span> <span class="tag">${tag}</span> ${r.machine_id||''}${r.session_id?(' · '+r.session_id):''}</div>`;
   }).join(""):`<div class="empty">no events match the current filters</div>`;
