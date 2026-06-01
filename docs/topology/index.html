@@ -13,7 +13,10 @@
   *{box-sizing:border-box}
   html,body{margin:0;height:100vh;background:var(--bg);color:var(--text);font:14px/1.4 'Inter',-apple-system,system-ui,sans-serif;overflow:hidden}
   .top{height:46px;display:flex;align-items:center;gap:14px;padding:0 16px;border-bottom:1px solid var(--line);background:var(--bg2)}
-  .brand{font-weight:700;letter-spacing:.04em}.brand b{color:var(--amber)}
+  .brand{font-weight:700;letter-spacing:.04em}.brand b{color:var(--amber)}.brand a{color:inherit;text-decoration:none}.brand a:hover b{text-decoration:underline}
+  .topnav{margin-left:auto;display:flex;gap:18px;align-items:center}
+  .topnav a{color:var(--muted);text-decoration:none;font:600 12px 'JetBrains Mono',monospace;letter-spacing:.04em}
+  .topnav a:hover{color:var(--amber)}
   .badge{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.12em;text-transform:uppercase;color:#1b1610;background:var(--amber);padding:5px 9px;border-radius:3px}
   .pb{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.12em;text-transform:uppercase;color:var(--amber);border:1px solid var(--amber-dim);padding:4px 9px;border-radius:3px}
   .crumbbar{height:40px;display:flex;align-items:center;gap:12px;padding:0 16px;border-bottom:1px solid var(--line);background:#20180e}
@@ -89,9 +92,15 @@
 </head>
 <body>
 <div class="top">
-  <span class="brand"><b>darkmux</b> · observability</span>
+  <span class="brand"><a href="../"><b>darkmux</b></a> · observability</span>
   <span class="badge">Demo — sample data</span>
   <span class="pb">▣ playback</span>
+  <nav class="topnav">
+    <a href="../">home</a>
+    <a href="../guide/">guide</a>
+    <a href="https://darklyenergized.substack.com" target="_blank" rel="noopener">articles</a>
+    <a href="https://github.com/kstrat2001/darkmux" target="_blank" rel="noopener">github</a>
+  </nav>
 </div>
 <div class="crumbbar">
   <button class="backbtn" id="back">‹ back</button>
