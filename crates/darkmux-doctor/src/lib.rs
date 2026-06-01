@@ -17,6 +17,7 @@
 //! agent-runtime-specific checks (gateway port, openclaw config sanity) belong
 //! to the runtime, not to darkmux.
 
+use anyhow::Result;
 use darkmux_agent_roles as agent_roles;
 use darkmux_eureka as eureka;
 use darkmux_hardware as hardware;
@@ -24,7 +25,6 @@ use darkmux_heuristics as heuristics;
 use darkmux_profiles::lms;
 use darkmux_profiles::profiles;
 use darkmux_types::ModelRole;
-use anyhow::Result;
 use std::env;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -99,7 +99,7 @@ pub fn run(include_openclaw: bool) -> DoctorReport {
         check_flow_sink_health(),
         check_machine_id_resolution(),
         check_orchestrator_declared(),
-        check_machine_tier_declared(),
+        check_legacy_machine_tier_env(),
         check_audit_integrity(),
         check_recommendation_drift(),
         check_recommended_profile_name_not_shadowed(),
@@ -136,7 +136,9 @@ fn check_legacy_compaction_extras() -> Check {
             return Check {
                 name: "legacy compaction extras".into(),
                 status: Status::Warn,
-                message: format!("can't check compaction extras (profile registry load failed: {e})"),
+                message: format!(
+                    "can't check compaction extras (profile registry load failed: {e})"
+                ),
                 hint: None,
             };
         }
@@ -185,7 +187,9 @@ fn check_legacy_compaction_extras() -> Check {
             .iter()
             .map(|(name, keys)| {
                 let key_list = keys.join(", ");
-                format!("profile `{name}` has fields not consumed by the internal runtime: {key_list}")
+                format!(
+                    "profile `{name}` has fields not consumed by the internal runtime: {key_list}"
+                )
             })
             .collect::<Vec<_>>()
             .join("; ");
@@ -798,37 +802,35 @@ fn check_orchestrator_declared() -> Check {
     }
 }
 
-/// `machine-tier`: pass when DARKMUX_MACHINE_TIER is set to a recognized
-/// tier value (`inference` / `hub` / `client`). Warns when absent or set
-/// to an unrecognized value — fleet routing depends on this declaration
-/// (#246). Single-machine fleets work without it; multi-machine
-/// dispatch routing will bail loud at use.
-fn check_machine_tier_declared() -> Check {
-    const RECOGNIZED: &[&str] = &["inference", "hub", "client"];
-    match darkmux_flow::resolve_machine_tier() {
-        Some(tier) if RECOGNIZED.contains(&tier.as_str()) => Check {
-            name: "machine-tier".into(),
-            status: Status::Pass,
-            message: format!("`{tier}` (from DARKMUX_MACHINE_TIER env)"),
-            hint: None,
-        },
-        Some(other) => Check {
-            name: "machine-tier".into(),
+/// `machine-tier env`: `DARKMUX_MACHINE_TIER` was the old way to hand-declare
+/// a machine's tier (`inference` / `hub` / `client`). That classification is
+/// **retired** (#321/#322): a machine's capability now comes from hardware
+/// *detection* (see the `platform / heuristics` check) feeding the lab-vetted
+/// recommendation registry, and model selection is by capability, not tier.
+/// This check NEVER asks the operator to set the var — it only nudges to
+/// remove a leftover export. Absent (the new normal) → pass.
+fn check_legacy_machine_tier_env() -> Check {
+    let name = "machine-tier env".to_string();
+    match std::env::var("DARKMUX_MACHINE_TIER")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
+        Some(val) => Check {
+            name,
             status: Status::Warn,
             message: format!(
-                "`{other}` — not one of inference/hub/client; tier-aware routing may not match"
+                "DARKMUX_MACHINE_TIER=`{val}` is set — the inference/hub/client tier declaration is retired (#321/#322)"
             ),
             hint: Some(
-                "Set DARKMUX_MACHINE_TIER to one of: inference (heavy-model peer), hub (always-on infra + 4B utility agents), client (UI only).".into(),
+                "Machine capability is auto-detected from hardware (see the `platform / heuristics` check) and model selection is by capability, not tier. Remove the DARKMUX_MACHINE_TIER export from this machine's shell rc — it's being phased out and should no longer drive anything.".into(),
             ),
         },
         None => Check {
-            name: "machine-tier".into(),
-            status: Status::Warn,
-            message: "not declared — fleet routing will treat this machine as `any` tier only".into(),
-            hint: Some(
-                "Export DARKMUX_MACHINE_TIER=<tier> in this machine's shell. `inference` for heavy-model peers (M-series w/ 64GB+); `hub` for always-on infrastructure machines; `client` for UI-only devices. Operator-explicit by design (#246).".into(),
-            ),
+            name,
+            status: Status::Pass,
+            message: "no DARKMUX_MACHINE_TIER export — machine capability is auto-detected (#321)"
+                .into(),
+            hint: None,
         },
     }
 }
@@ -1869,10 +1871,7 @@ fn check_agent_role_definitions() -> Check {
         return Check {
             name: "agent role scaffolds".into(),
             status: Status::Pass,
-            message: format!(
-                "(no {} on disk — skipping)",
-                openclaw_path.display()
-            ),
+            message: format!("(no {} on disk — skipping)", openclaw_path.display()),
             hint: None,
         };
     }
@@ -2526,7 +2525,8 @@ mod tests {
         // 23 baseline checks (incl. runtime version + load projection +
         // daemon reachable + darkmux-version-vs-latest-release [#13] +
         // crew-role-prompt-coverage [#141] + flow-sink-health [#170] +
-        // machine_id + orchestrator [#167] + machine_tier [#246] +
+        // machine_id + orchestrator [#167] + machine-tier-env (retired,
+        // [#321/#322]) +
         // audit-integrity [#163] + recommendation-drift +
         // recommended-profile-not-shadowed [#159] + role-model-pin-drift
         // [#160] + legacy-mission-layout [#148] + beat-33-crew-dir
@@ -2959,7 +2959,10 @@ mod tests {
         assert!(check.message.contains("test-profile"));
         assert!(check.message.contains("customInstructions"));
         let hint = check.hint.as_deref().unwrap_or("");
-        assert!(hint.contains("custom_instructions"), "hint must mention typed custom_instructions field");
+        assert!(
+            hint.contains("custom_instructions"),
+            "hint must mention typed custom_instructions field"
+        );
     }
 
     #[serial_test::serial]
@@ -3199,8 +3202,7 @@ mod tests {
             .filter(|c| {
                 c.message.to_lowercase().contains("openclaw")
                     || c.name.to_lowercase().contains("openclaw")
-                    || c
-                        .hint
+                    || c.hint
                         .as_deref()
                         .map(|h| h.to_lowercase().contains("openclaw"))
                         .unwrap_or(false)
@@ -3242,5 +3244,66 @@ mod tests {
             oc_names.len(),
             oc_names
         );
+    }
+
+    // ─── check_legacy_machine_tier_env ────────────────────────────────
+    //
+    // DARKMUX_MACHINE_TIER is retired (#321/#322); the check no longer
+    // asks the operator to SET it — absent is the pass case, a leftover
+    // export earns a remove-it warning. Tests mutate the process-global
+    // env var, so they run serially.
+
+    /// RAII: force DARKMUX_MACHINE_TIER to a known state for the test.
+    struct MachineTierEnvGuard {
+        prev: Option<String>,
+    }
+
+    impl MachineTierEnvGuard {
+        fn set(value: Option<&str>) -> Self {
+            let prev = std::env::var("DARKMUX_MACHINE_TIER").ok();
+            // SAFETY: tests using this guard MUST be #[serial].
+            unsafe {
+                match value {
+                    Some(v) => std::env::set_var("DARKMUX_MACHINE_TIER", v),
+                    None => std::env::remove_var("DARKMUX_MACHINE_TIER"),
+                }
+            }
+            Self { prev }
+        }
+    }
+
+    impl Drop for MachineTierEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: tests using this guard MUST be #[serial].
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("DARKMUX_MACHINE_TIER", v),
+                    None => std::env::remove_var("DARKMUX_MACHINE_TIER"),
+                }
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn legacy_machine_tier_env_passes_when_absent() {
+        let _guard = MachineTierEnvGuard::set(None);
+        let check = check_legacy_machine_tier_env();
+        assert_eq!(check.status, Status::Pass);
+        assert!(check.message.contains("auto-detected"));
+        assert!(check.hint.is_none());
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn legacy_machine_tier_env_warns_to_remove_when_set() {
+        let _guard = MachineTierEnvGuard::set(Some("inference"));
+        let check = check_legacy_machine_tier_env();
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.message.contains("retired"));
+        // Nudges to REMOVE, never to set.
+        let hint = check.hint.unwrap();
+        assert!(hint.contains("Remove"));
+        assert!(!hint.contains("Set DARKMUX_MACHINE_TIER"));
     }
 }
