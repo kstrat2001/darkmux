@@ -58,6 +58,16 @@
   input[type=range]{flex:1;accent-color:var(--amber)}
   .clock{font:12px 'JetBrains Mono',monospace;color:var(--muted);min-width:160px;text-align:right}
   .fleet{display:flex;gap:36px;flex-wrap:wrap;align-items:flex-start}
+  .fleettl{margin-top:30px;border-top:1px solid var(--line);padding-top:18px}
+  .tlhdr{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin-bottom:14px}
+  .lane{display:flex;align-items:center;gap:12px;margin-bottom:7px}
+  .lname{width:150px;flex:none;font:12px 'JetBrains Mono',monospace;color:var(--text);text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .track{position:relative;flex:1;height:28px;background:var(--panel);border:1px solid var(--line);border-radius:4px;overflow:hidden}
+  .sbar{position:absolute;top:5px;height:18px;background:var(--amber-dim);border-radius:3px;min-width:2px}
+  .sbar.a{background:var(--amber);box-shadow:0 0 6px var(--amber)}
+  .track .ph{position:absolute;top:0;bottom:0;width:2px;background:var(--text);opacity:.32}
+  .tlaxis{margin-left:162px;display:flex;justify-content:space-between;font:9px 'JetBrains Mono',monospace;color:var(--muted);margin-top:7px}
+  .tlempty{font:11px 'JetBrains Mono',monospace;color:var(--muted)}
   .mach{width:230px;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px;cursor:pointer;transition:border-color .15s}
   .mach:hover{border-color:var(--amber-dim)}.mach.active{border-color:var(--amber);box-shadow:0 0 0 1px var(--amber-dim)}
   .mach .name{font:600 15px 'JetBrains Mono',monospace;color:var(--text);display:flex;align-items:center;gap:8px}
@@ -285,11 +295,32 @@ function machActive(m){
 }
 function renderFleet(){
   $("logscope").textContent="fleet"; state.stageScope=()=>true;
-  $("stage").innerHTML=`<div class="fleet">`+machines().map(m=>{
+  const ms=machines();
+  const cards=ms.map(m=>{
     const act=machActive(m), runs=sessionsOn(m).length;
     return `<div class="mach ${act?'active':''}" onclick="drillMachine('${m}')"><div class="name"><span class="mico">${ICON[MACH_ICON[m]]||""}</span>${m}</div>
       <div class="spec">${MACH_SPEC[m]||''}</div><div class="stat"><span class="dot"></span>${act?'dispatch in flight':'idle'} · ${runs} specialist${runs===1?'':'s'} + utility</div>
-      <div class="hint">click to drill in →</div></div>`;}).join("")+`</div>`;
+      <div class="hint">click to drill in →</div></div>`;}).join("");
+  // Activity timeline — one lane per machine; each dispatch session is a bar
+  // positioned across the recorded window, revealed up to the playhead (an
+  // in-flight session grows to the playhead). Fills the fleet view with a
+  // "what ran when, where" overview instead of empty canvas.
+  const span=Math.max(1,tMax-tMin), pct=t=>(t-tMin)/span*100;
+  const lanes=ms.map(m=>{
+    const bars=sessionsOn(m).map(sid=>{
+      const s=dispatch(sid,"start"); if(!s||T(s.ts)>state.t)return"";
+      const c=dispatch(sid,"complete"), done=c&&T(c.ts)<=state.t;
+      const end=done?T(c.ts):state.t, L=pct(T(s.ts)), W=Math.max(0.6,pct(end)-L);
+      const role=(s.handle||"").replace(/^darkmux\//,"");
+      return `<div class="sbar ${done?'':'a'}" style="left:${L}%;width:${W}%" title="${role} · ${sid}${done?'':' · in flight'}"></div>`;
+    }).join("");
+    return `<div class="lane"><div class="lname" title="${m}">${m}</div><div class="track">${bars}<div class="ph" style="left:${pct(state.t)}%"></div></div></div>`;
+  }).join("");
+  const ax=`<div class="tlaxis"><span>${iso(tMin).slice(11,16)}</span><span>${iso(tMin+span/2).slice(11,16)}</span><span>${iso(tMax).slice(11,16)}Z</span></div>`;
+  const tl = ms.length
+    ? `<div class="fleettl"><div class="tlhdr">activity · ${iso(tMin).slice(11,19)}–${iso(tMax).slice(11,19)}Z</div>${lanes}${ax}</div>`
+    : `<div class="fleettl"><div class="tlempty">waiting for the first flow record…</div></div>`;
+  $("stage").innerHTML=`<div class="fleet">${cards}</div>`+tl;
 }
 function renderMachine(){
   const m=state.machine; $("logscope").textContent=m; state.stageScope=r=>r.machine_id===m;
