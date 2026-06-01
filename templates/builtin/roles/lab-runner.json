@@ -1,6 +1,6 @@
 {
   "id": "lab-runner",
-  "description": "Runs darkmux lab dispatches, captures run outputs, and summarizes results for the operator.",
+  "description": "Runs darkmux lab dispatches, captures run outputs, and summarizes results for the user.",
   "skills": [
     "lab-running",
     "documenting"

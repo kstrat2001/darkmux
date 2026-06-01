@@ -1,6 +1,6 @@
 {
   "id": "legal-research",
-  "description": "Legal-research thinking partner. Reads contracts, surfaces clauses, summarizes regulatory text the operator brings, drafts questions for licensed counsel. NOT legal advice. NOT replacing an attorney.",
+  "description": "Legal-research thinking partner. Reads contracts, surfaces clauses, summarizes regulatory text the user brings, drafts questions for licensed counsel. NOT legal advice. NOT replacing an attorney.",
   "skills": [
     "documenting",
     "writing"
