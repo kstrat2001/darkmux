@@ -42,14 +42,14 @@ darkmux profile draft <name> --model <model-id> --task-class <fast|mid|long>
 This emits a profile JSON to stdout with:
 - Inline `_notes` explaining the heuristic choices made
 - Sensible n_ctx capped at the model's claimed maxContextLength
-- Compaction knobs (only when a compactor is paired): `maxHistoryShare 0.35`, `recentTurnsPreserve 5`, `customInstructions` preserve-verbatim string
+- Compaction knobs (only when a compactor is paired): a `custom_instructions` field (snake_case) carrying a default summary-preservation prompt the user can tune, plus the `runtime.compaction` threshold/strategy fields. (Pre-#385 drafts emitted openclaw-shaped `maxHistoryShare`/`recentTurnsPreserve`/`customInstructions` camelCase fields — those are no longer generated.)
 
 ## Step 4 — Show + offer to install
 
 Display the JSON output to the user. Then:
 
 - Tell them where it goes: the `profiles` block of `~/.darkmux/profiles.json`
-- Mention they can tune any field (especially `description` and `customInstructions`) before saving
+- Mention they can tune any field (especially `description` and `custom_instructions`) before saving
 - After they've added it, suggest `darkmux doctor` to verify the registry parses
 
 **Do NOT auto-edit `~/.darkmux/profiles.json`** — that's user state. Always print and let them paste.

@@ -130,8 +130,7 @@ Look for these lines in the output (now `✓` after step 5):
 
 - `machine-tier` — should report the tier you picked, sourced from `DARKMUX_MACHINE_TIER`
 - `machine_id` — should report your id, sourced from `DARKMUX_MACHINE_ID`
-- `flow sink health` — Redis sink should now be `✓` (the test connect to the coordinator succeeded)
-- `redis reachability` — `✓` means the coordinator is reachable from this machine
+- `flow sink health` — Redis sink should now be `✓` (the test connect to the coordinator succeeded; this is the check that covers Redis reachability)
 
 If `flow sink health` is `⚠` — re-check the Redis URL. The most common errors: wrong password, wrong host, tailnet not routing.
 
@@ -180,10 +179,12 @@ darkmux flow note --text "hello from $(echo $DARKMUX_MACHINE_ID)"
 Then on the operator's coordinator (or any other fleet member):
 
 ```bash
-darkmux flow tail | head -5
+# That machine's daemon Redis-aggregates the whole fleet, so the new
+# machine's records show up here (needs `darkmux serve` running there):
+curl -s "http://127.0.0.1:8765/flow/$(date +%F)"
 ```
 
-The new machine's `machine_id` should appear in the recent flow records. If yes — the new machine is joined.
+The new machine's `machine_id` should appear in the recent flow records. If yes — the new machine is joined. (There is no `darkmux flow tail` verb; query the daemon as above, or read `~/.darkmux/flows/$(date +%F).jsonl` directly on the machine itself.)
 
 ## Step 10 — Optional: start the daemon as a service
 

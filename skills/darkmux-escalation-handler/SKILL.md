@@ -49,8 +49,9 @@ What you're looking for in the manifest:
 Three durable signals:
 
 ```bash
-# Final assistant turn (what the model was saying when the bound fired):
-grep '"type":"model.completed"' $RUN_DIR/trajectory.jsonl | tail -1 | jq '.content_preview // .text_preview // .'
+# Final model turn — finish_reason tells you WHY the bound fired
+# ("length" = truncation), with token usage and any tool calls:
+grep '"type":"model.completed"' $RUN_DIR/trajectory.jsonl | tail -1 | jq '{finish_reason, usage, tool_calls}'
 
 # Turn count + compaction count (gauges what the local tier got through):
 grep -c '"type":"model.completed"' $RUN_DIR/trajectory.jsonl
