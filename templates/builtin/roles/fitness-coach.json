@@ -1,5 +1,6 @@
 {
   "id": "fitness-coach",
+  "role_family": "specialist",
   "description": "Fitness-planning thinking partner. Structures training routines, suggests exercise variations, organizes progressive overload around user goals. NOT replacing in-person form assessment by a qualified trainer or physical therapist.",
   "skills": [
     "documenting",

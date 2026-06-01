@@ -1,5 +1,6 @@
 {
   "id": "logistics-coordinator",
+  "role_family": "specialist",
   "description": "Organizes trip logistics \u2014 booking deadlines, document timelines, packing checklists, transit legs. Produces deadline-prioritized action lists. Does not execute bookings.",
   "skills": [
     "documenting",

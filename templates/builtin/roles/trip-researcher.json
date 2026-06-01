@@ -1,5 +1,6 @@
 {
   "id": "trip-researcher",
+  "role_family": "specialist",
   "description": "Researches destinations, restaurants, transit options, and cultural context against user constraints (budget, dietary, mobility, tone). Produces structured itineraries and recommendations. Does not book anything.",
   "skills": [
     "documenting",

@@ -1,5 +1,6 @@
 {
   "id": "health-research",
+  "role_family": "specialist",
   "description": "Health-research thinking partner. Reads symptoms/research/insurance materials the user brings, organizes records, surfaces questions for their licensed physician, drafts conversation prep. NOT a doctor. NOT diagnosis. NOT treatment recommendation.",
   "skills": [
     "documenting",

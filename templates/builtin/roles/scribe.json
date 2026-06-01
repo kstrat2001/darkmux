@@ -1,5 +1,6 @@
 {
   "id": "scribe",
+  "role_family": "utility",
   "description": "Drafts lab notebook entries and prose from run data + user findings. EE-lab-notebook aesthetic; date stamps; tables OK; methodology over polish.",
   "skills": [
     "documenting"

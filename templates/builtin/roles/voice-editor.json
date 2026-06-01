@@ -1,5 +1,6 @@
 {
   "id": "voice-editor",
+  "role_family": "specialist",
   "description": "A senior editor who reads existing drafts and suggests revisions for voice and clarity. Reads prose; provides structured feedback.",
   "skills": [
     "voice-editing",
