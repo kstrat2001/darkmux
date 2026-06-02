@@ -153,14 +153,14 @@ darkmux swap recommended              <span class="comment"># load them for real
 <section>
   <div class="wrap">
     <h2>Your first swap</h2>
-    <p><code>darkmux swap &lt;profile&gt;</code> atomically transitions LMStudio's loaded model set to match the named profile. It unloads anything that doesn't belong, loads what does, and patches your agent runtime's config so the agent requests the right model identifier on its next dispatch.</p>
+    <p><code>darkmux swap &lt;profile&gt;</code> atomically transitions LMStudio's loaded model set to match the named profile: it unloads anything that doesn't belong and loads what does. By default it writes nothing outside LMStudio — the internal runtime reads the loaded model directly. If you dispatch through openclaw, add <code>--runtime openclaw</code> and swap will also patch <code>~/.openclaw/openclaw.json</code> to reference the now-loaded identifier; without that flag, no config file is touched.</p>
     <pre><code>darkmux status                    <span class="comment"># what's loaded right now; which profile (if any) matches</span>
 darkmux swap fast                 <span class="comment"># load the "fast" profile</span>
 darkmux status                    <span class="comment"># confirm — should show "fast" as the active profile</span></code></pre>
 
     <div class="callout good">
       <strong>What just happened.</strong>
-      <p style="margin: 6px 0 0;">darkmux issued <code>lms load</code> for your profile's primary model with a <code>darkmux:</code> namespace prefix (so darkmux can recognize its own loads later), set the context length, updated <code>~/.openclaw/openclaw.json</code> (or your runtime's config) to reference the now-loaded identifier, and reported success. Your orchestrator's next dispatch will route to this model.</p>
+      <p style="margin: 6px 0 0;">darkmux issued <code>lms load</code> for your profile's primary model with a <code>darkmux:</code> namespace prefix (so darkmux can recognize its own loads later), set the context length, and reported success. Nothing outside LMStudio was modified — the internal runtime resolves the loaded model directly. (Had you run <code>darkmux swap fast --runtime openclaw</code>, swap would additionally patch <code>~/.openclaw/openclaw.json</code> so an openclaw dispatch routes to the loaded identifier.)</p>
     </div>
 
     <p>If swap reports a warning about RAM headroom or a model not found in <code>lms ls</code>, that's doctor-style feedback at swap time — usually fixable by either trimming context length or downloading the model first via the LMStudio UI.</p>
@@ -168,7 +168,7 @@ darkmux status                    <span class="comment"># confirm — should sho
     <h3>The smoke test</h3>
     <pre><code>darkmux lab run quick-q           <span class="comment"># single-turn smoke prompt against the active profile</span>
 darkmux lab inspect &lt;run-id&gt;      <span class="comment"># quick look at what happened</span></code></pre>
-    <p>This requires an agent runtime (OpenClaw or override). If you don't have one configured, skip this step — you can come back to it after reading the <a href="lab.html">lab</a> section.</p>
+    <p>This runs through darkmux's default internal Docker-bounded runtime — build the <code>darkmux-runtime</code> image once (see the <a href="lab.html">lab</a> section) and it works with no external runtime. To dispatch through openclaw instead, pass <code>--runtime openclaw</code>. If you have neither Docker nor openclaw set up yet, skip this step and come back after reading the lab section.</p>
   </div>
 </section>
 

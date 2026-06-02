@@ -8,7 +8,7 @@ The smallest useful thing. CLI that:
 2. Looks up the named profile
 3. Calls `lms unload --all` (or selectively unloads only mismatched models)
 4. Calls `lms load <model> --context-length <N> --identifier <id>` for each model in profile
-5. (Optional) Patches caller's runtime config (e.g., openclaw.json fields under `runtime:`)
+5. Patches the caller's runtime config (e.g., openclaw.json fields under `runtime:`) **only under `darkmux swap <profile> --runtime openclaw`** — the default flagless swap touches LMStudio only and writes nothing to openclaw config
 6. (Optional) Runs `post_swap` hooks (e.g., gateway restart)
 
 That's it. No proxy, no classifier, no daemon. ~200 lines of code.
@@ -41,7 +41,7 @@ darkmux swap <profile>
 - Profile / workload registries: `serde_json` over plain JSON files
 - `lms` CLI invocation: `std::process::Command`
 - Built-in workloads embedded into the binary via `include_str!` so `cargo install --path .` works from any directory without the source tree present
-- Config patching for runtime configs (e.g. `openclaw.json`): targeted edits via `serde_json::Value` to preserve user-modified fields rather than full deserialize / reserialize round-trips
+- Config patching for runtime configs (e.g. `openclaw.json`), invoked only on the opt-in `swap --runtime openclaw` path (the default flagless swap performs no config patching): targeted edits via `serde_json::Value` to preserve user-modified fields rather than full deserialize / reserialize round-trips
 - Dep surface kept deliberately small (see `Cargo.toml`) — `anyhow`, `clap`, `serde`, `serde_json`, `dirs`. A 10-line inline module beats a crate for small one-off needs.
 
 ## v0.2 — `darkmux serve` (proxy mode)
@@ -139,7 +139,7 @@ The codebase distinguishes three code-path categories with distinct rules for wh
 
 **2. OC dispatch path** (`--runtime openclaw`, `src/crew/dispatch.rs`): shells out to `openclaw agent darkmux/<role-id>`. Openclaw reads its own `~/.openclaw/openclaw.json`. darkmux does not forward profile fields into openclaw's config, and openclaw never sees the darkmux profile. Operators using openclaw configure it through openclaw's own surfaces (`openclaw.json` editing, `openclaw agent` CLI flags, openclaw's own documentation). No schema bridging in either direction.
 
-**3. OC helper tooling** (`darkmux crew sync`, OC config patcher in `src/runtime.rs`, eureka OC config diagnostics): legitimate openclaw-aware code that operates ON `~/.openclaw/openclaw.json` directly. Knows the openclaw schema because that's its job — these are *helper verbs for openclaw users*, not part of the internal-runtime path. The doctrine permits these freely; they're clearly labeled as OC tooling rather than embedded in dispatch config plumbing. Openclaw-schema *emission* that the engine doesn't itself consume — the `agents.list[]` scaffold snippets — lives one step further out, as the standalone `integrations/openclaw/oc-scaffold.sh` script (NOT a CLI verb; #538), so the binary carries no openclaw-schema knowledge it doesn't use. The `darkmux-agent-roles` crate remains only for `darkmux doctor`'s role-gap awareness.
+**3. OC helper tooling** (`darkmux crew sync`, OC config patcher in `src/runtime.rs`, eureka OC config diagnostics): legitimate openclaw-aware code that operates ON `~/.openclaw/openclaw.json` directly. Knows the openclaw schema because that's its job — these are *helper verbs for openclaw users*, not part of the internal-runtime path. The `src/runtime.rs` patcher is reached only on the opt-in path (`darkmux swap <profile> --runtime openclaw`, and `crew dispatch` / `lab run` under `--runtime openclaw`); a default flagless `darkmux swap` never invokes it and writes zero bytes to `~/.openclaw/openclaw.json`. The doctrine permits these freely; they're clearly labeled as OC tooling rather than embedded in dispatch config plumbing. Openclaw-schema *emission* that the engine doesn't itself consume — the `agents.list[]` scaffold snippets — lives one step further out, as the standalone `integrations/openclaw/oc-scaffold.sh` script (NOT a CLI verb; #538), so the binary carries no openclaw-schema knowledge it doesn't use. The `darkmux-agent-roles` crate remains only for `darkmux doctor`'s role-gap awareness.
 
 **Profile generation discipline.** Heuristics in `src/heuristics.rs` write only darkmux-typed fields. Existing operator profiles with openclaw-shape `extras` keys (legacy `mode`, `maxHistoryShare`, `recentTurnsPreserve`, `customInstructions`) continue to load via back-compat parse, but `darkmux doctor` flags them as inactive with a migration hint to the typed equivalent (where one exists) or a removal suggestion (where it doesn't).
 
