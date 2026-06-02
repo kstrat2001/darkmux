@@ -43,29 +43,37 @@ const MAX_FILE_COUNT: usize = 50_000;
 
 /// Directory names always skipped during the walk. Path-segment match
 /// (not glob; we don't want to lint each entry against globs for cost
-/// reasons). Add new entries here when new "never workspace content"
-/// directories surface.
-const SKIPPED_DIR_NAMES: &[&str] = &[
-    ".git",
-    "node_modules",
-    "target",
-    "dist",
-    "build",
-    "__pycache__",
-    ".darkmux-runtime",
-    ".venv",
-    ".mypy_cache",
-    ".pytest_cache",
-    ".next",
-    // Empirical addition (2026-05-27): the first real-world post-#421
-    // dispatch (Beat 47 follow-up validation) surfaced 159 entries
-    // in `coverage/` (Jest/Vitest/c8/nyc HTML output from the verify
-    // command). These are build artifacts, not operator-meaningful
-    // changes — workspace_delta operators want signal about what the
-    // AGENT changed, not what the post-dispatch verify command
-    // generated as a side effect.
-    "coverage",
-];
+/// reasons).
+///
+/// The run-artifact names (`.git`, `node_modules`, `target`,
+/// `__pycache__`, `coverage`, `.darkmux-runtime`, `.darkmux-agent`,
+/// `.coverage`) are drawn from the single canonical source in
+/// `crate::lab::artifact_dirs` so the workspace-delta view, the COW
+/// clone, and the content hash can never drift (the drift across the
+/// hand-rolled copies was the recurring root cause of lab-run
+/// contamination). On top of that canonical set, workspace_delta adds
+/// the build-output dirs below that are legitimately "never operator-
+/// meaningful workspace content" but aren't run-artifacts the clone/hash
+/// care about.
+///
+/// `coverage` history: the first real-world post-#421 dispatch (Beat 47
+/// follow-up validation) surfaced 159 entries in `coverage/` (Jest/
+/// Vitest/c8/nyc HTML output from the verify command); it now lives in
+/// the canonical `RUN_ARTIFACT_DIRS`.
+static SKIPPED_DIR_NAMES: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
+    use crate::lab::artifact_dirs::{HASH_ONLY_EXCLUDES, RUN_ARTIFACT_DIRS};
+    // Build-output dirs workspace_delta wants skipped that are NOT
+    // run-artifacts (so they don't belong in the canonical clone/hash
+    // slices).
+    const BUILD_OUTPUT_EXTRAS: &[&str] =
+        &["dist", "build", ".venv", ".next", ".mypy_cache", ".pytest_cache"];
+    RUN_ARTIFACT_DIRS
+        .iter()
+        .chain(HASH_ONLY_EXCLUDES.iter())
+        .chain(BUILD_OUTPUT_EXTRAS.iter())
+        .copied()
+        .collect()
+});
 
 /// Per-file snapshot entry. `hash` is `None` when the file exceeded
 /// the per-file size cap (we still track its existence + size, but
