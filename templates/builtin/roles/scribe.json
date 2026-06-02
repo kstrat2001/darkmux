@@ -14,6 +14,5 @@
       "exec"
     ]
   },
-  "escalation_contract": "bail-with-explanation",
-  "tier": "any"
+  "escalation_contract": "bail-with-explanation"
 }

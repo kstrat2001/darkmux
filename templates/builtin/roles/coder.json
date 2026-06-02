@@ -16,6 +16,5 @@
     ],
     "deny": []
   },
-  "escalation_contract": "bail-with-explanation",
-  "tier": "inference"
+  "escalation_contract": "bail-with-explanation"
 }
