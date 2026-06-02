@@ -18,9 +18,7 @@
 //!   "baseline": { "test_count": 77 },
 //!   "required_files": [
 //!     "src/services/refreshTokenService.ts"
-//!   ],
-//!   "hash_include": [],
-//!   "hash_exclude": ["node_modules", ".git", "target", "__pycache__"]
+//!   ]
 //! }
 //! ```
 //!
@@ -77,18 +75,6 @@ pub(crate) struct FixtureManifest {
     /// fails the fixture if any required_file is missing.
     #[serde(default)]
     pub required_files: Vec<String>,
-
-    /// Extra paths to include in the content hash beyond what's
-    /// auto-discovered. Useful when a fixture has out-of-tree files
-    /// that should affect the hash (e.g., a shared lockfile under
-    /// the fixture root).
-    #[serde(default)]
-    pub hash_include: Vec<String>,
-
-    /// Paths to exclude from the content hash. Layered on top of the
-    /// sandbox_hash module's default exclusion list.
-    #[serde(default)]
-    pub hash_exclude: Vec<String>,
 }
 
 fn default_version() -> String {
@@ -187,8 +173,7 @@ mod tests {
                 "language": "nodejs",
                 "verify_command": "npm test -- {test_files}",
                 "baseline": {"test_count": 77},
-                "required_files": ["src/services/refreshTokenService.ts"],
-                "hash_exclude": ["node_modules", ".git"]
+                "required_files": ["src/services/refreshTokenService.ts"]
             }"#,
         );
         let m = FixtureManifest::load_from_dir(tmp.path()).unwrap();
@@ -196,7 +181,6 @@ mod tests {
         assert_eq!(m.satisfies.as_deref(), Some("node-refresh-token-rotation@1.0"));
         assert_eq!(m.language.as_deref(), Some("nodejs"));
         assert_eq!(m.required_files.len(), 1);
-        assert_eq!(m.hash_exclude.len(), 2);
         assert_eq!(m.baseline["test_count"], 77);
     }
 
