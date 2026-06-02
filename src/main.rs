@@ -2146,6 +2146,10 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
                 // context; runtime falls back to its hardcoded
                 // defaults. Lab + sprint paths derive from profile.
                 compaction: crew::dispatch::CompactionDispatchArgs::default(),
+                // (#549) Bare `crew dispatch` has no `--profile` override;
+                // model selection falls back to the registry's
+                // `default_profile`. The lab path passes the resolved name.
+                profile_name: None,
             };
             let result = fleet::dispatch_routed(opts)?;
             // Announce the resolved session id on stderr so operators see

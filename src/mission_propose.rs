@@ -213,6 +213,8 @@ fn dispatch_compiler(input: &str, hint: Option<&str>) -> Result<String> {
         // mission-compiler role is utility-family and doesn't accumulate
         // large per-turn context.
         compaction: crate::crew::dispatch::CompactionDispatchArgs::default(),
+        // (#549) No `--profile` override; fall back to `default_profile`.
+        profile_name: None,
     };
     let dispatch_result = crate::fleet::dispatch_routed(opts);
 

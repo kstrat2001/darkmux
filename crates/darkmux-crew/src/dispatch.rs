@@ -330,6 +330,12 @@ pub struct DispatchOpts {
     /// Ignored when `runtime == Runtime::Openclaw` (openclaw's
     /// compaction config lives in its own `openclaw.json`).
     pub compaction: CompactionDispatchArgs,
+    /// (#549) The resolved profile name the dispatch should use for
+    /// model selection — the CLI `--profile` override when set, else
+    /// `None` to fall back to the registry's `default_profile`. Set by
+    /// the lab provider (which knows the resolved profile); `None`
+    /// everywhere else preserves the default-profile behavior.
+    pub profile_name: Option<String>,
 }
 
 /// Host-side compaction config passthrough to the internal runtime

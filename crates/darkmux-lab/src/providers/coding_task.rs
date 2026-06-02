@@ -266,6 +266,7 @@ impl WorkloadProvider for CodingTaskProvider {
                     &session_id,
                     Some(sandbox_dir.to_path_buf()),
                     compaction,
+                    profile_name,
                 )?
             }
             darkmux_crew::dispatch::Runtime::Openclaw => {
@@ -740,6 +741,7 @@ fn dispatch_via_internal(
     session_id: &str,
     workdir: Option<PathBuf>,
     compaction: darkmux_crew::dispatch::CompactionDispatchArgs,
+    profile_name: &str,
 ) -> Result<(String, String, bool)> {
     use darkmux_crew::dispatch::{dispatch, DispatchOpts, Runtime};
     let opts = DispatchOpts {
@@ -758,6 +760,10 @@ fn dispatch_via_internal(
         machine: None,
         wait: true,
         compaction,
+        // (#549) Lab runs resolve + log against the run's resolved
+        // profile (the CLI `--profile` override when set), not the
+        // registry default.
+        profile_name: Some(profile_name.to_string()),
     };
     let result = dispatch(opts).context("internal-runtime dispatch via lab harness")?;
     Ok((result.stdout, result.stderr, result.exit_code == 0))
