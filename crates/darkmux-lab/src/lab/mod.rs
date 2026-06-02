@@ -1,3 +1,4 @@
+pub mod artifact_dirs;
 pub mod characterize;
 pub mod compare;
 pub mod cow_clone;

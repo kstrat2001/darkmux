@@ -6,13 +6,14 @@
 //! `dm lab compare` can mechanically verify two runs were controlled
 //! experiments against the same fixture state.
 //!
-//! ## What's in the hash (Phase 1, simple defaults)
+//! ## What's in the hash
 //!
-//! - Every regular file under the sandbox, EXCLUDING:
-//!   - `.darkmux-runtime/` (the runtime's own bookkeeping — not the model's
-//!     contribution to the sandbox state)
-//!   - `node_modules/`, `target/`, `__pycache__/`, `.git/` (derived /
-//!     irrelevant; including them makes hash unstable across machines)
+//! - Every regular file under the sandbox, EXCLUDING the canonical
+//!   run-artifact directories. The exclusion set is the single source of
+//!   truth in `artifact_dirs.rs` (`RUN_ARTIFACT_DIRS` ∪
+//!   `HASH_ONLY_EXCLUDES`) — see `default_excludes()` below. These are
+//!   the runtime's own bookkeeping plus derived/irrelevant build output
+//!   (including them makes the hash unstable across machines).
 //!
 //! Phase 2 layers fixture-manifest-driven include/exclude rules on top.
 //!
@@ -27,24 +28,31 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-/// Default exclusion set for Phase 1. These are the "definitely
-/// shouldn't be in the hash" entries for any reasonable sandbox.
-/// Phase 2 lets fixture manifests declare additional excludes.
-const DEFAULT_EXCLUDES: &[&str] = &[
-    ".darkmux-runtime",
-    "node_modules",
-    "target",
-    "__pycache__",
-    ".git",
-    ".coverage",
-];
+/// Default exclusion set for the content hash. Drawn from the single
+/// canonical source in `artifact_dirs.rs` so the hash, the COW clone,
+/// and the workspace-delta view can never drift (the drift across the
+/// hand-rolled copies was the recurring root cause of lab-run
+/// contamination). The set is `RUN_ARTIFACT_DIRS` (run/build droppings)
+/// ∪ `HASH_ONLY_EXCLUDES` (heavy-but-needed deps the clone keeps but the
+/// hash must drop). Built as an owned `Vec` per call — the two source
+/// slices are `const` and can't be concatenated in a `const` context;
+/// the per-call alloc is trivial. Phase 2 lets fixture manifests declare
+/// additional excludes on top.
+fn default_excludes() -> Vec<&'static str> {
+    use crate::lab::artifact_dirs::{HASH_ONLY_EXCLUDES, RUN_ARTIFACT_DIRS};
+    RUN_ARTIFACT_DIRS
+        .iter()
+        .chain(HASH_ONLY_EXCLUDES.iter())
+        .copied()
+        .collect()
+}
 
 /// Compute a content hash of `sandbox_dir`, applying default
 /// exclusions. Output is the BLAKE3 hash prefixed with `blake3:`.
 ///
 /// Returns an error if `sandbox_dir` doesn't exist or can't be walked.
 pub(crate) fn hash_sandbox_dir(sandbox_dir: &Path) -> Result<String> {
-    hash_sandbox_dir_with_excludes(sandbox_dir, DEFAULT_EXCLUDES)
+    hash_sandbox_dir_with_excludes(sandbox_dir, &default_excludes())
 }
 
 /// Same as `hash_sandbox_dir` but with a caller-supplied exclusion
@@ -468,5 +476,30 @@ mod tests {
         for _ in 0..5 {
             assert_eq!(hash_sandbox_dir(&s).unwrap(), first);
         }
+    }
+
+    #[test]
+    fn coverage_and_darkmux_agent_dirs_dont_affect_hash() {
+        // Contamination-fix regression guard: `coverage` (jest/vitest
+        // no-dot dir) and `.darkmux-agent` (foreign-runtime dropping)
+        // were MISSING from the hash excludes before the canonical-list
+        // unification. A sandbox with these dirs must hash IDENTICALLY to
+        // the same sandbox without them.
+        let tmp = TempDir::new().unwrap();
+        let with = tmp.path().join("with");
+        let without = tmp.path().join("without");
+        for dir in [&with, &without] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("real.txt"), "real content").unwrap();
+        }
+        std::fs::create_dir_all(with.join("coverage/lcov-report")).unwrap();
+        std::fs::write(with.join("coverage/lcov-report/index.html"), "<html/>").unwrap();
+        std::fs::create_dir_all(with.join(".darkmux-agent")).unwrap();
+        std::fs::write(with.join(".darkmux-agent/state.json"), "{}").unwrap();
+        assert_eq!(
+            hash_sandbox_dir(&with).unwrap(),
+            hash_sandbox_dir(&without).unwrap(),
+            "coverage/ and .darkmux-agent/ must be excluded from the hash"
+        );
     }
 }

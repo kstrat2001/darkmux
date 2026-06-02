@@ -1,6 +1,7 @@
 //! `darkmux lab run <workload> [opts]` — execute a workload and capture output.
 
-use crate::lab::cow_clone::cow_clone_dir;
+use crate::lab::artifact_dirs;
+use crate::lab::cow_clone::cow_clone_dir_excluding;
 use crate::lab::instrument::InstrumentSidecar;
 use crate::lab::paths::{self, ResolveScope};
 use crate::lab::sandbox_hash::hash_sandbox_dir;
@@ -168,7 +169,19 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
         // self-contained workloads (no source yet) — the provider's
         // setup() populates the empty dir; baseline_hash stays None.
         let baseline_hash: Option<String> = if source_sandbox_dir.exists() {
-            cow_clone_dir(&source_sandbox_dir, &per_run_sandbox_dir).with_context(|| {
+            // Prune run-artifact dirs (.darkmux-runtime, coverage, .git,
+            // …) from the clone so a stale dropping in a fixture source
+            // can't contaminate this run. node_modules is deliberately
+            // NOT in RUN_ARTIFACT_DIRS — the in-sandbox tests need it; the
+            // hash drops it separately via HASH_ONLY_EXCLUDES. Because the
+            // baseline_hash below runs on this now-pruned clone, the
+            // run-path baseline is clean for free. (lab-contamination fix)
+            cow_clone_dir_excluding(
+                &source_sandbox_dir,
+                &per_run_sandbox_dir,
+                artifact_dirs::RUN_ARTIFACT_DIRS,
+            )
+            .with_context(|| {
                 format!(
                     "cow-cloning source sandbox {} → {}",
                     source_sandbox_dir.display(),

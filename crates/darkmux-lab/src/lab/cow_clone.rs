@@ -105,6 +105,33 @@ pub(crate) fn cow_clone_dir(src: &Path, dst: &Path) -> Result<()> {
     .context("cow_clone_dir")
 }
 
+/// COW-clone `src` to `dst`, then PRUNE the named artifact dirs from the
+/// destination. Same preconditions + clonefile/reflink speed as
+/// `cow_clone_dir`; the only addition is a post-clone unlink of each
+/// `exclude_dir_names` entry that landed in `dst`.
+///
+/// We clone verbatim THEN prune (rather than filtering during the copy)
+/// to keep the single fast `clonefile(2)`/reflink path — pruning a COW
+/// clone is near-instant (it unlinks COW refs and never touches the
+/// source). This is the canonical entry point for materializing a
+/// per-run sandbox so stale run-artifact dirs from a fixture source can
+/// never contaminate a fresh run.
+pub(crate) fn cow_clone_dir_excluding(
+    src: &Path,
+    dst: &Path,
+    exclude_dir_names: &[&str],
+) -> Result<()> {
+    cow_clone_dir(src, dst)?; // existing clonefile/reflink copy (verbatim, fast)
+    for name in exclude_dir_names {
+        let p = dst.join(name);
+        if p.exists() {
+            std::fs::remove_dir_all(&p)
+                .with_context(|| format!("pruning artifact dir from clone: {}", p.display()))?;
+        }
+    }
+    Ok(())
+}
+
 /// Per-platform argv attempts in preference order. First success wins;
 /// remaining attempts are skipped.
 fn cow_attempts() -> Vec<Vec<&'static str>> {
@@ -229,5 +256,38 @@ mod tests {
             !src.join("new-file.txt").exists(),
             "source got the clone's new file — COW invariant broken"
         );
+    }
+
+    #[test]
+    fn excluding_clone_prunes_artifact_dirs_but_keeps_node_modules() {
+        // Contamination-fix regression guard: the excluding clone must
+        // drop run-artifact dirs (.darkmux-runtime, coverage) while
+        // KEEPING node_modules, which the in-sandbox `npm test` needs.
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(src.join(".darkmux-runtime")).unwrap();
+        std::fs::write(src.join(".darkmux-runtime/x"), "runtime droppings").unwrap();
+        std::fs::create_dir_all(src.join("coverage")).unwrap();
+        std::fs::write(src.join("coverage/y"), "jest html").unwrap();
+        std::fs::create_dir_all(src.join("node_modules")).unwrap();
+        std::fs::write(src.join("node_modules/z"), "dep").unwrap();
+        std::fs::write(src.join("keep.txt"), "real content").unwrap();
+        let dst = tmp.path().join("dst");
+
+        cow_clone_dir_excluding(&src, &dst, &[".darkmux-runtime", "coverage"]).unwrap();
+
+        assert!(
+            !dst.join(".darkmux-runtime").exists(),
+            ".darkmux-runtime must be pruned from the clone"
+        );
+        assert!(
+            !dst.join("coverage").exists(),
+            "coverage must be pruned from the clone"
+        );
+        assert!(
+            dst.join("node_modules/z").exists(),
+            "node_modules must survive the clone (in-sandbox tests need deps)"
+        );
+        assert!(dst.join("keep.txt").exists(), "real content must survive");
     }
 }
