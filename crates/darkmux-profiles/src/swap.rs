@@ -52,6 +52,18 @@ pub struct SwapOpts {
     pub dry_run: bool,
 }
 
+/// (#590) Does a model already loaded at `loaded_ctx` satisfy a profile that
+/// wants `wanted_n_ctx`? A profile's `n_ctx` is a **minimum**, not an exact
+/// size: a model loaded with *at least* the wanted context satisfies the
+/// profile, so swap keeps it rather than reloading it smaller. A larger
+/// context is strictly more capable, and reloading down would discard a good
+/// load just to shrink it — the operator who loaded it bigger has the RAM for
+/// it (operator sovereignty over loaded state). Only an *insufficient* load
+/// (smaller than the minimum) triggers a reload.
+fn ctx_sufficient(loaded_ctx: u32, wanted_n_ctx: u32) -> bool {
+    loaded_ctx >= wanted_n_ctx
+}
+
 pub fn swap(profile: &Profile, registry: &ProfileRegistry, opts: SwapOpts) -> Result<SwapResult> {
     let t0 = Instant::now();
     let mut result = SwapResult::default();
@@ -68,18 +80,19 @@ pub fn swap(profile: &Profile, registry: &ProfileRegistry, opts: SwapOpts) -> Re
 
     let loaded = lms::list_loaded()?;
 
-    // Pass 1 — unload anything in the darkmux namespace that doesn't match
-    // the new profile (wrong ctx, or absent from profile entirely). Never
-    // touch entries outside the namespace; those are user state.
+    // Pass 1 — unload anything in the darkmux namespace the new profile
+    // doesn't want, or that's loaded with LESS than its n_ctx minimum. A
+    // model loaded with at least the wanted context is kept (n_ctx is a min,
+    // not an exact size — see `ctx_sufficient`). Never touch entries outside
+    // the namespace; those are user state.
     for cur in &loaded {
         if !is_darkmux_owned(&cur.identifier) {
             result.user_state_respected.push(cur.identifier.clone());
             continue;
         }
         let desired_ctx = want.get(&cur.identifier).copied();
-        let same_ctx = desired_ctx == Some(cur.context as u32);
-        if same_ctx {
-            continue; // already correctly loaded
+        if desired_ctx.is_some_and(|d| ctx_sufficient(cur.context as u32, d)) {
+            continue; // already loaded with enough context
         }
         if !opts.quiet {
             println!("unload {} (was ctx={})", cur.identifier, cur.context);
@@ -100,8 +113,8 @@ pub fn swap(profile: &Profile, registry: &ProfileRegistry, opts: SwapOpts) -> Re
     for m in &profile.models {
         let ident = namespaced_identifier(m);
         if let Some(c) = loaded_after_unload.get(ident.as_str()) {
-            if c.context as u32 == m.n_ctx {
-                continue; // already correctly loaded under our namespace
+            if ctx_sufficient(c.context as u32, m.n_ctx) {
+                continue; // already loaded with enough context (n_ctx is a min)
             }
         }
         if !opts.quiet {
@@ -216,6 +229,17 @@ mod tests {
         // Partial match isn't enough.
         assert!(!is_darkmux_owned("dark:foo"));
         assert!(!is_darkmux_owned("predarkmux:foo"));
+    }
+
+    #[test]
+    fn ctx_sufficient_treats_n_ctx_as_a_minimum() {
+        // The motivating case: a model loaded LARGER than the profile wants is
+        // kept — no reload-down. (qwen @ 200k satisfies a 64k profile.)
+        assert!(ctx_sufficient(200_000, 64_000));
+        // Exactly enough is fine.
+        assert!(ctx_sufficient(64_000, 64_000));
+        // Only an insufficient load triggers a reload.
+        assert!(!ctx_sufficient(64_000, 200_000));
     }
 
     #[test]
