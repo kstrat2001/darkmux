@@ -298,12 +298,15 @@ impl WorkloadProvider for CodingTaskProvider {
         let mut trajectory_path: Option<PathBuf> = None;
         match runtime {
             darkmux_crew::dispatch::Runtime::Internal => {
-                // Read from the dispatch's out-dir when present (post
-                // image-rebuild). Fall back to the legacy
-                // `<sandbox>/.darkmux-runtime/` when `out_dir` is `None`
-                // (pre-rebuild runtimes still write into the workspace) —
-                // this fallback makes the change safe BEFORE the operator
-                // rebuilds the darkmux-runtime image.
+                // Read from the dispatch's out-dir. For the internal path
+                // `out_dir` is ALWAYS `Some` (the host allocates + mounts it),
+                // so the `unwrap_or(sandbox_dir)` fallback only catches the
+                // openclaw/remote cases that legitimately have no out-dir.
+                // There is NO safe pre-rebuild gap for the internal path: an
+                // un-rebuilt image still writes the trajectory into /workspace,
+                // which the new tailer never reads, so the #457 watchdog would
+                // hard-kill productive dispatches. The host-code change and the
+                // darkmux-runtime image rebuild must land atomically.
                 let runtime_dir = dispatch_out_dir
                     .as_deref()
                     .unwrap_or(sandbox_dir)
@@ -486,7 +489,9 @@ impl WorkloadProvider for CodingTaskProvider {
         //      sandbox source.
         //   2. `<sandbox>/.darkmux-runtime/metrics.json` — live source.
         //      Backward-compat for runs predating #364 that don't have
-        //      the per-run copy yet.
+        //      the per-run copy yet. Old-run-only once the runtime writes
+        //      out-of-band (#611): new runs no longer leave metrics in the
+        //      sandbox, so tier 1 is always authoritative for them.
         let runtime_metrics = read_metrics_json(&run_dir.join("metrics.json")).or_else(|| {
             meta.get("sandbox")
                 .and_then(|v| v.as_str())
