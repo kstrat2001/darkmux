@@ -250,10 +250,10 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         None => None,
     };
 
-    // 2. Resolve the model. (#450, E14 refactor 1b) Phase-1 selection
-    //    consults the active profile's Primary-role model via
-    //    `select_model(role, profile)`. Phase 2+ extends this into
-    //    capability-scored selection. If no profile is configured (or
+    // 2. Resolve the model. (#450 / #590) `select_model(role, profile,
+    //    skill_lookup)` capability-scores the role's requested vector against
+    //    the profile's candidate models; with no offer vectors it falls back
+    //    to the Primary-role model. If no profile is configured (or
     //    has no Primary), falls back to `probe_loaded_model()` with a
     //    deprecation warning — back-compat for operators on the
     //    pre-refactor-1b config shape; the warning surfaces the gap
@@ -1136,8 +1136,9 @@ fn check_docker_preflight() -> Result<()> {
 ///    set the default; if they want a different profile, they swap
 ///    the default). Phase 2+ adds `--profile <name>` plumbing through
 ///    `DispatchOpts` for per-dispatch override.
-/// 2. Look up the profile + call `select_model(role, profile)`. Phase 1
-///    trivially returns the profile's Primary-role model id.
+/// 2. Look up the profile + call `select_model(role, profile, skill_lookup)`,
+///    which capability-scores the role against the profile's models (phase 2),
+///    falling back to the Primary-role model when no vectors are populated.
 /// 3. On any failure (no registry, no default, no profile, no Primary),
 ///    log a deprecation warning + fall back to `probe_loaded_model()`.
 ///    Back-compat for pre-refactor-1b configurations; the warning
@@ -1188,7 +1189,17 @@ fn resolve_dispatch_model_internal(role: &crate::types::Role) -> Result<String> 
         }
     };
 
-    match select_model(role, profile) {
+    // (#590 phase 2) Build a skill lookup so select_model can compose the
+    // role's requested capability vector (role → skills → CapabilityProfile).
+    // Skills unavailable ⇒ empty lookup ⇒ select_model takes its Primary
+    // fallback (safe + behavior-preserving).
+    let skill_index: std::collections::HashMap<String, crate::types::Skill> =
+        crate::loader::load_skills()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| (s.id.clone(), s))
+            .collect();
+    match select_model(role, profile, |id| skill_index.get(id)) {
         Ok(id) => {
             // (#450 review note / #408) Cross-check against actual
             // LMStudio loaded models. `darkmux swap <name>` loads a
