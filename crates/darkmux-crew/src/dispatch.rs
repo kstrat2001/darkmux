@@ -462,6 +462,19 @@ impl CompactionDispatchArgs {
             self.bail_after_compactions = Some(role_bail);
         }
     }
+
+    /// (#590) Overlay the machine-level utility model (`internal.utility`) as
+    /// the compactor, UNLESS the caller already pinned one. Call after
+    /// `from_profile` / `apply_role_override` from any dispatcher that has the
+    /// registry. The utility model is the machine's standing support model —
+    /// one global model for compaction (and future estimation / mission-
+    /// compile), decoupled from the worker profile. `None` (no binding) ⇒
+    /// untouched, so the runtime keeps its built-in default compactor.
+    pub fn apply_utility_model(&mut self, utility_model_id: Option<&str>) {
+        if self.compactor_model.is_none() {
+            self.compactor_model = utility_model_id.map(str::to_string);
+        }
+    }
 }
 
 /// One file's state for the watched-paths summary (#89).
@@ -1819,6 +1832,33 @@ mod tests {
     use super::*;
     use crate::types::{EscalationContract, Role, ToolPalette};
     use tempfile::TempDir;
+
+    // ─── #590 apply_utility_model overlay ─────────────────────────────
+
+    #[test]
+    fn apply_utility_model_sets_compactor_when_unset() {
+        let mut c = CompactionDispatchArgs::default();
+        assert!(c.compactor_model.is_none());
+        c.apply_utility_model(Some("darkmux:util-4b"));
+        assert_eq!(c.compactor_model.as_deref(), Some("darkmux:util-4b"));
+    }
+
+    #[test]
+    fn apply_utility_model_does_not_override_a_pinned_compactor() {
+        let mut c = CompactionDispatchArgs {
+            compactor_model: Some("operator-pinned".into()),
+            ..Default::default()
+        };
+        c.apply_utility_model(Some("darkmux:util-4b"));
+        assert_eq!(c.compactor_model.as_deref(), Some("operator-pinned"));
+    }
+
+    #[test]
+    fn apply_utility_model_none_leaves_compactor_unset() {
+        let mut c = CompactionDispatchArgs::default();
+        c.apply_utility_model(None);
+        assert!(c.compactor_model.is_none());
+    }
 
     // ─── #247 PR-C build_route_payload ────────────────────────────────
 
