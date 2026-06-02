@@ -271,18 +271,20 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // 2. Resolve the model. (#450 / #590) `select_model(role, profile,
     //    skill_lookup)` capability-scores the role's requested vector against
     //    the profile's candidate models; with no offer vectors it falls back
-    //    to the Primary-role model. If no profile is configured (or
-    //    has no Primary), falls back to `probe_loaded_model()` with a
-    //    deprecation warning — back-compat for operators on the
-    //    pre-refactor-1b config shape; the warning surfaces the gap
-    //    so they migrate.
+    //    to the profile's default worker model (ModelRole removed in #601).
+    //    The profile is the `--profile` override when set (#549), else the
+    //    registry's `default_profile`. If no profile is configured (or has
+    //    no worker), falls back to `probe_loaded_model()` with a deprecation
+    //    warning — back-compat for operators on the pre-refactor-1b config
+    //    shape; the warning surfaces the gap so they migrate.
     //
     //    NOT the long-form probe-then-pin path documented in #408 —
     //    that's phase 2+ scope when the recommendation registry
     //    activates per-hardware tuple selection.
-    let model = resolve_dispatch_model_internal(role).context(
+    let model = resolve_dispatch_model_internal(role, opts.profile_name.as_deref()).context(
         "model selection failed. Ensure `~/.darkmux/profiles.json` has \
-         a profile with a model `role: \"primary\"`, or load a model in \
+         a profile with at least one model (the default worker is \
+         `default_model` or the first model in `models`), or load a model in \
          LMStudio (darkmux swap <profile>) as the deprecated fallback."
     )?;
     eprintln!("darkmux crew dispatch: model={model}");
@@ -1182,14 +1184,14 @@ fn check_docker_preflight() -> Result<()> {
 ///
 /// Selection chain:
 /// 1. Load the profile registry. Get the active profile name from
-///    `registry.default_profile` (phase-1 simplification — operators
-///    set the default; if they want a different profile, they swap
-///    the default). Phase 2+ adds `--profile <name>` plumbing through
-///    `DispatchOpts` for per-dispatch override.
+///    `profile_override` (the CLI `--profile` override, #549) when set,
+///    else `registry.default_profile`. When neither is present, fall
+///    back to `probe_loaded_model()`.
 /// 2. Look up the profile + call `select_model(role, profile, skill_lookup)`,
-///    which capability-scores the role against the profile's models (phase 2),
-///    falling back to the Primary-role model when no vectors are populated.
-/// 3. On any failure (no registry, no default, no profile, no Primary),
+///    which capability-scores the role against the profile's models (#590),
+///    falling back to the profile's default worker model when no vectors
+///    are populated (ModelRole removed in #601).
+/// 3. On any failure (no registry, no default, no profile, no worker),
 ///    log a deprecation warning + fall back to `probe_loaded_model()`.
 ///    Back-compat for pre-refactor-1b configurations; the warning
 ///    points the operator at the migration.
@@ -1199,7 +1201,10 @@ fn check_docker_preflight() -> Result<()> {
 /// LMStudio happens to have loaded" is the contaminating-dispatch
 /// anti-pattern. The deprecation warning makes the misconfiguration
 /// operator-visible while keeping pre-refactor-1b setups working.
-fn resolve_dispatch_model_internal(role: &crate::types::Role) -> Result<String> {
+fn resolve_dispatch_model_internal(
+    role: &crate::types::Role,
+    profile_override: Option<&str>,
+) -> Result<String> {
     use crate::select::select_model;
     use darkmux_profiles::profiles::{get_profile, load_registry};
 
@@ -1215,7 +1220,11 @@ fn resolve_dispatch_model_internal(role: &crate::types::Role) -> Result<String> 
         }
     };
 
-    let active_name = match loaded.registry.default_profile.as_deref() {
+    // (#549) Resolve the active profile name: the CLI `--profile` override
+    // takes precedence; otherwise fall back to the registry's
+    // `default_profile`. When BOTH are absent, fall back to
+    // `probe_loaded_model()`.
+    let active_name = match profile_override.or(loaded.registry.default_profile.as_deref()) {
         Some(name) => name,
         None => {
             eprintln!(
@@ -1241,8 +1250,8 @@ fn resolve_dispatch_model_internal(role: &crate::types::Role) -> Result<String> 
 
     // (#590 phase 2) Build a skill lookup so select_model can compose the
     // role's requested capability vector (role → skills → CapabilityProfile).
-    // Skills unavailable ⇒ empty lookup ⇒ select_model takes its Primary
-    // fallback (safe + behavior-preserving).
+    // Skills unavailable ⇒ empty lookup ⇒ select_model takes its
+    // default-worker-model fallback (safe + behavior-preserving; #601).
     let skill_index: std::collections::HashMap<String, crate::types::Skill> =
         crate::loader::load_skills()
             .unwrap_or_default()
@@ -1256,8 +1265,9 @@ fn resolve_dispatch_model_internal(role: &crate::types::Role) -> Result<String> 
             // profile's models in LMStudio but does NOT update
             // `default_profile` in the registry — so after `swap fast`
             // with default `balanced`, this path would happily select
-            // balanced's Primary while LMStudio is loaded with fast's
-            // models. The dispatch would then fail at the LMStudio call
+            // balanced's default worker model while LMStudio is loaded
+            // with fast's models. The dispatch would then fail at the
+            // LMStudio call
             // (or worse, silently route to a different model if the id
             // collides). Surfacing the mismatch here makes the
             // misconfiguration operator-visible at dispatch time, not at
@@ -1287,7 +1297,7 @@ fn resolve_dispatch_model_internal(role: &crate::types::Role) -> Result<String> 
                     }
                     eprintln!(
                         "darkmux crew dispatch: WARNING — profile `{active_name}` \
-                         Primary is `{id}`, but LMStudio has loaded [{loaded}]. \
+                         selects `{id}`, but LMStudio has loaded [{loaded}]. \
                          `darkmux swap` does not update `default_profile` in the \
                          registry; if you swapped recently, your loaded model \
                          won't match the selection. To fix: either `darkmux swap \
@@ -1299,19 +1309,19 @@ fn resolve_dispatch_model_internal(role: &crate::types::Role) -> Result<String> 
                 }
             }
             eprintln!(
-                "darkmux crew dispatch: model selected via profile `{active_name}` Primary"
+                "darkmux crew dispatch: selected model `{id}` via profile `{active_name}`"
             );
             Ok(id)
         }
         Err(e) => {
             eprintln!(
                 "darkmux crew dispatch: select_model error ({e}); falling back \
-                 to probe_loaded_model() — deprecated. Add a Primary-role \
+                 to probe_loaded_model() — deprecated. Add a default worker \
                  model to profile `{active_name}` to migrate. (#450 refactor 1b)"
             );
             // TODO(#450 phase-1c): the selected-vs-loaded MISMATCH case
             // now honors `DARKMUX_STRICT_SELECTION` (see the Ok branch
-            // above). This Err branch — no Primary configured at all —
+            // above). This Err branch — no worker model configured at all —
             // still warn-and-probes for back-compat with pre-refactor-1b
             // configs. When phase-1c lands the two-instances-per-purpose
             // policy, fold this fallback under strict mode too.

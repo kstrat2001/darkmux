@@ -245,6 +245,12 @@ impl WorkJob {
             // the job payload if cross-machine compaction tuning
             // becomes a real requirement.
             compaction: darkmux_crew::dispatch::CompactionDispatchArgs::default(),
+            // (#549) Fleet-deserialized jobs don't carry a `--profile`
+            // override (pre-#549 wire shape) — the worker resolves against
+            // its local `default_profile`. Future iteration could propagate
+            // via the job payload if cross-machine profile selection becomes
+            // a requirement.
+            profile_name: None,
         }
     }
 }

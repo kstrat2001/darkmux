@@ -200,6 +200,8 @@ fn dispatch_draft_via_internal(role: &str, prompt: &str, session_id: &str) -> Re
         // Notebook draft is single-shot prompt-style; compaction
         // defaults are fine.
         compaction: crate::crew::dispatch::CompactionDispatchArgs::default(),
+        // (#549) No `--profile` override; fall back to `default_profile`.
+        profile_name: None,
     };
     let result = crate::fleet::dispatch_routed(opts)
         .context("internal-runtime dispatch for notebook draft")?;
