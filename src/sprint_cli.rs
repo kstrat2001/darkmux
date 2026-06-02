@@ -874,6 +874,8 @@ pub(crate) fn sprint_review_at(
         // Sprint dispatch defaults to runtime's built-in compaction;
         // sprint context isn't tied to a profile in this entry path.
         compaction: crate::crew::dispatch::CompactionDispatchArgs::default(),
+        // (#549) No `--profile` override; fall back to `default_profile`.
+        profile_name: None,
     };
 
     // Emit dispatch flow record.
