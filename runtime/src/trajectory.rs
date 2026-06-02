@@ -24,13 +24,29 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::lmstudio::{ToolCall, Usage};
 
-/// Path inside `/workspace` where trajectory + metrics land. The
+/// Container mount point for darkmux's OWN bookkeeping — SEPARATE from
+/// /workspace so the runtime never writes its logs into the tree it's
+/// operating on. dispatch_internal mounts a host tempdir here. An
+/// unmounted manual `docker run` writes to the container-ephemeral path
+/// (lost on --rm) but /workspace stays clean either way.
+/// MUST match the mount point in darkmux-crew's dispatch_internal.rs.
+pub const RUNTIME_OUT_BASE: &str = "/darkmux-out";
+
+/// Subdir (under the out-base) where trajectory + metrics land. The
 /// dot-prefix is a soft signal that this is runtime metadata rather
 /// than agent content; agents that respect "don't muck with dotfiles"
 /// conventions will leave it alone.
 const TRAJECTORY_SUBDIR: &str = ".darkmux-runtime";
 const TRAJECTORY_FILE: &str = "trajectory.jsonl";
 const METRICS_FILE: &str = "metrics.json";
+
+/// The runtime's bookkeeping directory: `<RUNTIME_OUT_BASE>/<TRAJECTORY_SUBDIR>`.
+/// Both runtime write sites (trajectory/metrics in `main.rs`, structured
+/// compaction output in `loop_runner.rs`) consume this so the two can't
+/// drift to different paths.
+pub fn runtime_dir() -> std::path::PathBuf {
+    std::path::Path::new(RUNTIME_OUT_BASE).join(TRAJECTORY_SUBDIR)
+}
 
 /// Trajectory + metrics recorder. Open at dispatch start; methods
 /// append events as they occur; `save_metrics()` writes the final

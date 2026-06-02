@@ -531,10 +531,12 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     }
 
-    // Open trajectory + metrics recorder against the mounted
-    // workspace. Phase 7: gives post-dispatch visibility because the
-    // container is --rm and otherwise everything except stderr is lost.
-    let mut traj = trajectory::Trajectory::open(Path::new("/workspace"));
+    // Open trajectory + metrics recorder against the mounted out-dir
+    // (SEPARATE from /workspace so the runtime never writes its own
+    // bookkeeping into the tree it's operating on). Phase 7: gives
+    // post-dispatch visibility because the container is --rm and
+    // otherwise everything except stderr is lost.
+    let mut traj = trajectory::Trajectory::open(Path::new(trajectory::RUNTIME_OUT_BASE));
     let started_at_unix_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -742,7 +744,15 @@ fn build_json_envelope(
             "completion_tokens": completion_tokens,
             "total_messages": total_messages,
         },
-        "trajectory_path": "/workspace/.darkmux-runtime/trajectory.jsonl",
+        // Container-internal path where the runtime's own bookkeeping
+        // landed — now the out-dir (SEPARATE from /workspace) per the
+        // out-of-band bookkeeping change. Built from the shared
+        // trajectory module constants so it can't drift from the actual
+        // write site.
+        "trajectory_path": trajectory::runtime_dir()
+            .join("trajectory.jsonl")
+            .display()
+            .to_string(),
     })
 }
 
@@ -852,7 +862,7 @@ mod tests {
         // Top-level contract — qa-review + lab adapter parse these.
         assert_eq!(env["result"], "stop");
         assert_eq!(env["final_assistant"], "hello world");
-        assert_eq!(env["trajectory_path"], "/workspace/.darkmux-runtime/trajectory.jsonl");
+        assert_eq!(env["trajectory_path"], "/darkmux-out/.darkmux-runtime/trajectory.jsonl");
         // Metrics block — mirrors trajectory::Metrics field names so the
         // two surfaces stay aligned.
         assert_eq!(env["metrics"]["runtime"], "darkmux-runtime");
