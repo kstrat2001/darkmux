@@ -50,6 +50,23 @@ pub struct SwapResult {
 pub struct SwapOpts {
     pub quiet: bool,
     pub dry_run: bool,
+    /// (#590) Patch the openclaw runtime config (`~/.openclaw/openclaw.json`)
+    /// to match this profile. `false` (the default — internal runtime) means
+    /// swap touches ONLY LMStudio and never writes openclaw config. `true` is
+    /// set only when the operator explicitly opts into openclaw via
+    /// `--runtime openclaw` — openclaw config is touched on explicit intent,
+    /// never via passive file-presence (openclaw independence).
+    pub patch_openclaw: bool,
+}
+
+/// (#590) Whether this swap should patch the openclaw runtime config. True
+/// ONLY when the operator explicitly opted into openclaw (`--runtime openclaw`
+/// → `patch_openclaw`) AND this isn't a dry run. The gate is explicit operator
+/// intent — never passive `openclaw.json` file-presence — so an operator
+/// running the internal runtime (the default) never has `darkmux swap` mutate
+/// `~/.openclaw/openclaw.json`.
+fn should_patch_openclaw(opts: &SwapOpts) -> bool {
+    opts.patch_openclaw && !opts.dry_run
 }
 
 /// (#590) Does a model already loaded at `loaded_ctx` satisfy a profile that
@@ -139,6 +156,10 @@ pub fn swap(profile: &Profile, registry: &ProfileRegistry, opts: SwapOpts) -> Re
     let t0 = Instant::now();
     let mut result = SwapResult::default();
 
+    // Pre/post-swap hooks run on EVERY swap, independent of `--runtime`: they
+    // are operator-authored shell commands (RegistryHooks), not darkmux-owned
+    // openclaw writes, so the openclaw-independence gate (#590) intentionally
+    // does NOT suppress them (operator sovereignty over their own hooks).
     let pre = registry.hooks.as_ref().map(|h| h.pre_swap.as_slice()).unwrap_or(&[]);
     result.hooks_ran += run_hooks(pre, profile, &opts);
 
@@ -199,10 +220,13 @@ pub fn swap(profile: &Profile, registry: &ProfileRegistry, opts: SwapOpts) -> Re
         result.loaded.push(d.identifier.clone());
     }
 
-    if !opts.dry_run {
+    // (#590) Openclaw config is patched ONLY when the operator explicitly
+    // opted into openclaw (`--runtime openclaw`); the default internal-runtime
+    // swap never touches `~/.openclaw/openclaw.json` (openclaw independence).
+    if should_patch_openclaw(&opts) {
         result.runtime_modified = apply_runtime(profile)?;
         if result.runtime_modified && !opts.quiet {
-            println!("runtime config patched");
+            println!("openclaw config patched");
         }
     }
 
@@ -248,7 +272,33 @@ mod tests {
     use darkmux_types::{Profile, ProfileModel, ProfileRegistry, ProfileRuntime, RegistryInternal};
 
     fn opts() -> SwapOpts {
-        SwapOpts { quiet: true, dry_run: true }
+        SwapOpts { quiet: true, dry_run: true, patch_openclaw: false }
+    }
+
+    #[test]
+    fn does_not_patch_openclaw_without_explicit_opt_in() {
+        // The default (internal runtime) — swap never touches openclaw.json.
+        assert!(!should_patch_openclaw(&SwapOpts {
+            quiet: true,
+            dry_run: false,
+            patch_openclaw: false,
+        }));
+    }
+
+    #[test]
+    fn patches_openclaw_only_on_explicit_opt_in_and_real_run() {
+        // `--runtime openclaw` opts in; a real (non-dry) run patches.
+        assert!(should_patch_openclaw(&SwapOpts {
+            quiet: true,
+            dry_run: false,
+            patch_openclaw: true,
+        }));
+        // A dry run never patches, even when opted in.
+        assert!(!should_patch_openclaw(&SwapOpts {
+            quiet: true,
+            dry_run: true,
+            patch_openclaw: true,
+        }));
     }
 
     /// A registry whose `internal.utility` is `util` (or no `internal` block

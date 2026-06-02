@@ -76,7 +76,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Swap LMStudio + runtime config to a profile.
+    /// Swap the LMStudio stack to a profile. With `--runtime openclaw`, ALSO
+    /// patches openclaw's config to match; the default leaves
+    /// `~/.openclaw/openclaw.json` untouched.
     Swap {
         profile: String,
         #[arg(long, short = 'c')]
@@ -85,6 +87,14 @@ enum Cmd {
         dry_run: bool,
         #[arg(long, short = 'q')]
         quiet: bool,
+        /// Dispatch runtime this profile targets. `internal` (default) — swap
+        /// loads LMStudio and touches NOTHING else. `openclaw` — ALSO patch
+        /// `~/.openclaw/openclaw.json` to match the profile (model pins,
+        /// contextWindow sync, namespaced registry entries). Openclaw config
+        /// is patched on explicit opt-in only, never via passive file-presence
+        /// — mirrors `crew dispatch` / `lab run` (#590 openclaw independence).
+        #[arg(long, default_value = "internal")]
+        runtime: String,
     },
     /// Show what's loaded and which profile (if any) it matches.
     Status {
@@ -976,7 +986,8 @@ fn run(cmd: Cmd) -> Result<i32> {
             config,
             dry_run,
             quiet,
-        } => cmd_swap(&profile, config.as_deref(), dry_run, quiet),
+            runtime,
+        } => cmd_swap(&profile, config.as_deref(), dry_run, quiet, &runtime),
         Cmd::Status { config } => cmd_status(config.as_deref()),
         Cmd::Profiles { config } => cmd_profiles(config.as_deref()),
         Cmd::Lab { sub } => cmd_lab(sub),
@@ -2346,7 +2357,12 @@ fn cmd_model_pull_recommended() -> Result<i32> {
 /// recommendation status isn't `Validated`, or when the prescribed
 /// models aren't downloaded (with a one-command-fix pointer to
 /// `darkmux model pull-recommended`). (#159)
-fn cmd_swap_recommended(config: Option<&str>, dry_run: bool, quiet: bool) -> Result<i32> {
+fn cmd_swap_recommended(
+    config: Option<&str>,
+    dry_run: bool,
+    quiet: bool,
+    runtime: &str,
+) -> Result<i32> {
     let rec = recommendations::for_active_hardware()?;
     if !quiet {
         println!(
@@ -2398,7 +2414,7 @@ fn cmd_swap_recommended(config: Option<&str>, dry_run: bool, quiet: bool) -> Res
             rec.bake_off_url.as_deref().unwrap_or("no url"),
         );
     }
-    cmd_swap(profile_name, config, dry_run, quiet)
+    cmd_swap(profile_name, config, dry_run, quiet, runtime)
 }
 
 fn cmd_profile(sub: ProfileCmd) -> Result<i32> {
@@ -2543,13 +2559,19 @@ fn cmd_init(
     Ok(0)
 }
 
-fn cmd_swap(profile_name: &str, config: Option<&str>, dry_run: bool, quiet: bool) -> Result<i32> {
+fn cmd_swap(
+    profile_name: &str,
+    config: Option<&str>,
+    dry_run: bool,
+    quiet: bool,
+    runtime: &str,
+) -> Result<i32> {
     // `swap recommended` is reserved — short-circuit to the recommendation-
     // registry-driven dispatcher rather than looking up a profile literally
     // named "recommended". Per #159: the prescriptive verb resolves the
     // active hardware tier to the bake-off-validated profile.
     if profile_name == "recommended" {
-        return cmd_swap_recommended(config, dry_run, quiet);
+        return cmd_swap_recommended(config, dry_run, quiet, runtime);
     }
     let loaded = profiles::load_registry(config)?;
     let profile = profiles::get_profile(&loaded.registry, profile_name)?;
@@ -2559,7 +2581,20 @@ fn cmd_swap(profile_name: &str, config: Option<&str>, dry_run: bool, quiet: bool
             loaded.path.display()
         );
     }
-    let result = swap::swap(profile, &loaded.registry, swap::SwapOpts { quiet, dry_run })?;
+    // (#590) Openclaw config is patched only when the operator explicitly
+    // names openclaw (`--runtime openclaw`). The default (`internal`) leaves
+    // ~/.openclaw/openclaw.json untouched — file-presence is not opt-in.
+    let patch_openclaw =
+        crew::dispatch::Runtime::parse(runtime)? == crew::dispatch::Runtime::Openclaw;
+    let result = swap::swap(
+        profile,
+        &loaded.registry,
+        swap::SwapOpts {
+            quiet,
+            dry_run,
+            patch_openclaw,
+        },
+    )?;
     if !quiet {
         let mut bits = vec![
             format!("done in {}ms", result.walltime_ms),
