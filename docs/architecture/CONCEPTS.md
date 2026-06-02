@@ -54,7 +54,7 @@ darkmux defines exactly **two** crew role families. The defining axis is
 *utility* role supports the **runtime**, *outside* mission scope (compaction,
 mission-compiling, estimation). The family also governs **how a role is
 dispatched** (the table below). Bias toward utility for as much outside-mission
-work as possible, so the runtime isn't loading extra worker models for support
+work as possible, so the runtime isn't loading extra models for support
 tasks.
 
 | Family | What it is | Dispatch shape |
@@ -100,7 +100,7 @@ selected via the `ModelRole::Compactor` slot in the profile
 > standalone **utility role** (alongside `mission-compiler`/`scribe`); its model
 > is registered via the `[internal] utility` binding (#450) instead of a
 > `ModelRole::Compactor` profile slot; and `ModelRole` is removed — so a
-> **profile becomes a wrapper for the worker models' capabilities**, not a
+> **profile becomes a wrapper for its models' capabilities**, not a
 > `Primary`+`Compactor` stack. The runtime keeps a built-in *affordance* to
 > summon the util model for compaction (and estimation, planning, …).
 
