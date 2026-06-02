@@ -21,7 +21,7 @@
 //! deliberately — A/B, defensive escalation, candidate eval).
 
 use darkmux_profiles::envelope::{ctx_diverges, loaded_matches};
-use darkmux_types::{LoadedModel, ModelRole, Profile};
+use darkmux_types::{LoadedModel, Profile};
 
 /// Compare the requested profile's declared model envelope against what
 /// LMStudio actually has loaded, returning operator-facing warning lines
@@ -31,8 +31,8 @@ use darkmux_types::{LoadedModel, ModelRole, Profile};
 ///
 /// Two findings, both pointing at the same risk — the manifest's
 /// `profile=` tag may not reflect the real runtime envelope:
-///   1. The profile's **Primary** model isn't in the loaded set at all,
-///      so the dispatch will use whatever LMStudio has loaded.
+///   1. The profile's **default worker** model isn't in the loaded set at
+///      all, so the dispatch will use whatever LMStudio has loaded.
 ///   2. A declared model **is** loaded but at a materially different
 ///      context window than the profile declares.
 pub(crate) fn envelope_warnings(
@@ -47,15 +47,16 @@ pub(crate) fn envelope_warnings(
     if loaded.is_empty() {
         return out;
     }
+    // (#590) Only the default worker (default_model, or first model) is
+    // load-bearing for the measurement envelope.
+    let default_id = profile.default_model_id();
     for pm in &profile.models {
         match loaded.iter().find(|lm| loaded_matches(lm, pm)) {
             None => {
-                // Only the Primary model is load-bearing for the
-                // measurement envelope; a missing compactor/auxiliary is
-                // common and not worth the noise.
-                if matches!(pm.role, ModelRole::Primary) {
+                // A missing non-default model is common and not worth the noise.
+                if Some(pm.id.as_str()) == default_id {
                     out.push(format!(
-                        "requested profile `{profile_name}` declares primary model `{}` (ctx {}) \
+                        "requested profile `{profile_name}` declares default-worker model `{}` (ctx {}) \
                          but it is not among the currently loaded models — the dispatch will use \
                          whatever LMStudio has loaded, so this run's `profile={profile_name}` tag \
                          may not reflect the real runtime envelope. Run `darkmux swap {profile_name}` \
@@ -83,11 +84,10 @@ mod tests {
     use super::*;
     use darkmux_types::ProfileModel;
 
-    fn pm(id: &str, n_ctx: u32, role: ModelRole) -> ProfileModel {
+    fn pm(id: &str, n_ctx: u32) -> ProfileModel {
         ProfileModel {
             id: id.to_string(),
             n_ctx,
-            role,
             capabilities: Default::default(),
             identifier: None,
         }
@@ -106,6 +106,7 @@ mod tests {
     fn profile(models: Vec<ProfileModel>) -> Profile {
         Profile {
             description: None,
+            default_model: None,
             models,
             runtime: None,
             use_when: None,
@@ -118,7 +119,7 @@ mod tests {
 
     #[test]
     fn no_warning_when_envelope_aligns() {
-        let p = profile(vec![pm("qwen-35b", 262000, ModelRole::Primary)]);
+        let p = profile(vec![pm("qwen-35b", 262000)]);
         let loaded = vec![lm("darkmux:qwen-35b", "qwen-35b", 262000)];
         assert!(envelope_warnings(&p, "deep", &loaded).is_empty());
     }
@@ -126,7 +127,7 @@ mod tests {
     #[test]
     fn warns_on_context_envelope_mismatch() {
         // The Beat-39 case: profile=deep declares 262K, balanced is loaded @101K.
-        let p = profile(vec![pm("qwen-35b", 262000, ModelRole::Primary)]);
+        let p = profile(vec![pm("qwen-35b", 262000)]);
         let loaded = vec![lm("darkmux:qwen-35b", "qwen-35b", 101000)];
         let w = envelope_warnings(&p, "deep", &loaded);
         assert_eq!(w.len(), 1, "expected one mismatch warning, got: {w:?}");
@@ -136,7 +137,7 @@ mod tests {
 
     #[test]
     fn warns_when_primary_not_loaded() {
-        let p = profile(vec![pm("qwen-35b", 262000, ModelRole::Primary)]);
+        let p = profile(vec![pm("qwen-35b", 262000)]);
         // A wholly different model is loaded.
         let loaded = vec![lm("darkmux:other-model", "other-model", 32000)];
         let w = envelope_warnings(&p, "deep", &loaded);
@@ -145,12 +146,13 @@ mod tests {
     }
 
     #[test]
-    fn missing_compactor_does_not_warn() {
-        // Only the primary is loaded; a missing compactor is common and quiet.
-        let p = profile(vec![
-            pm("qwen-35b", 262000, ModelRole::Primary),
-            pm("qwen-4b", 68000, ModelRole::Compactor),
-        ]);
+    fn missing_non_default_model_does_not_warn() {
+        // (#590) Only the default worker (first model) is load-bearing for the
+        // envelope. The first model is loaded; a missing SECOND (non-default)
+        // worker is common and quiet. (Replaces the old primary+compactor case —
+        // the compactor moved to the registry's internal.utility binding and can
+        // no longer live in `models[]`.)
+        let p = profile(vec![pm("qwen-35b", 262000), pm("qwen-4b", 68000)]);
         let loaded = vec![lm("darkmux:qwen-35b", "qwen-35b", 262000)];
         assert!(envelope_warnings(&p, "deep", &loaded).is_empty());
     }
@@ -158,7 +160,7 @@ mod tests {
     #[test]
     fn tolerates_rounding_within_5_percent() {
         // 262000 declared vs 262144 loaded (power-of-two) — benign.
-        let p = profile(vec![pm("qwen-35b", 262000, ModelRole::Primary)]);
+        let p = profile(vec![pm("qwen-35b", 262000)]);
         let loaded = vec![lm("darkmux:qwen-35b", "qwen-35b", 262144)];
         assert!(envelope_warnings(&p, "deep", &loaded).is_empty());
     }
@@ -166,14 +168,14 @@ mod tests {
     #[test]
     fn unknown_loaded_context_does_not_warn() {
         // lms ps didn't report a context (0) — can't tell, stay quiet.
-        let p = profile(vec![pm("qwen-35b", 262000, ModelRole::Primary)]);
+        let p = profile(vec![pm("qwen-35b", 262000)]);
         let loaded = vec![lm("darkmux:qwen-35b", "qwen-35b", 0)];
         assert!(envelope_warnings(&p, "deep", &loaded).is_empty());
     }
 
     #[test]
     fn empty_loaded_set_yields_no_warnings() {
-        let p = profile(vec![pm("qwen-35b", 262000, ModelRole::Primary)]);
+        let p = profile(vec![pm("qwen-35b", 262000)]);
         assert!(envelope_warnings(&p, "deep", &[]).is_empty());
     }
 }

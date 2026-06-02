@@ -172,7 +172,7 @@ fn run_hooks(hooks: &[ProfileHookCommand], profile: &Profile, opts: &SwapOpts) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use darkmux_types::{ModelRole, Profile, ProfileModel, ProfileRuntime};
+    use darkmux_types::{Profile, ProfileModel, ProfileRuntime};
 
     fn opts() -> SwapOpts {
         SwapOpts { quiet: true, dry_run: true }
@@ -184,10 +184,10 @@ mod tests {
             models: vec![ProfileModel {
                 id: "m".into(),
                 n_ctx: 1000,
-                role: ModelRole::Primary,
                 capabilities: Default::default(),
                 identifier: None,
             }],
+            default_model: None,
             runtime,
             use_when: None,
         }
@@ -198,7 +198,6 @@ mod tests {
         let m = ProfileModel {
             id: "qwen3.6-35b-a3b".into(),
             n_ctx: 100_000,
-            role: ModelRole::Primary,
             capabilities: Default::default(),
             identifier: None,
         };
@@ -210,7 +209,6 @@ mod tests {
         let m = ProfileModel {
             id: "qwen3.6-35b-a3b".into(),
             n_ctx: 100_000,
-            role: ModelRole::Primary,
             capabilities: Default::default(),
             identifier: Some("my-custom-alias".into()),
         };

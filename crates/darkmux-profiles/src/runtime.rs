@@ -1,5 +1,5 @@
 use crate::swap::namespaced_identifier;
-use darkmux_types::{ModelRole, Profile, ProfileModel};
+use darkmux_types::{Profile, ProfileModel};
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::env;
@@ -48,12 +48,13 @@ pub fn resolve_openclaw_config_path(explicit_path: Option<&str>) -> Option<PathB
 ///   - **Inherent to namespaced loading** (always runs whenever there's an
 ///     openclaw config to update — these aren't customizations, they're
 ///     consequences of `darkmux swap` issuing namespaced `lms load`s):
-///     - `agents.defaults.model.primary` / `agents.defaults.compaction.model`
-///       rewritten to the profile's `role: Primary` / `role: Compactor`
-///       namespaced identifier — replaces any prior pin, not just bare→
-///       namespaced (see #90; without this the operator can swap to a new
-///       profile and have dispatch keep requesting the prior profile's
-///       primary)
+///     - `agents.defaults.model.primary` rewritten to the profile's default
+///       worker (`default_model`, or the first model) namespaced identifier —
+///       replaces any prior pin, not just bare→namespaced (see #90; without
+///       this the operator can swap to a new profile and have dispatch keep
+///       requesting the prior profile's primary). The compactor pin is no
+///       longer written here — the compactor model is the registry's
+///       `internal.utility` binding now, not a `models[]` entry (#590).
 ///     - Legacy bare→namespaced rewrite still runs for any other
 ///       darkmux-managed model references that may exist (extension point
 ///       for future fields)
@@ -161,7 +162,7 @@ pub fn apply_runtime(profile: &Profile) -> Result<bool> {
     // These aren't operator customizations — they're consequences of issuing
     // namespaced `lms load`s in swap.rs. Without them, openclaw's view of the
     // model registry drifts from `lms ps` every swap (issue #72).
-    if sync_default_model_pins(&mut config, &profile.models) {
+    if sync_default_model_pins(&mut config, profile) {
         modified = true;
     }
     if rewrite_namespaced_model_refs(&mut config, &profile.models) {
@@ -491,53 +492,33 @@ fn rewrite_namespaced_model_refs(config: &mut Value, models: &[ProfileModel]) ->
 ///   - Creates any missing nesting in `agents.defaults.{model,compaction}`
 ///     (matches the existing posture in `apply_runtime`'s
 ///     context-tokens write).
-fn sync_default_model_pins(config: &mut Value, models: &[ProfileModel]) -> bool {
-    let primary_ref = models
-        .iter()
-        .find(|m| matches!(m.role, ModelRole::Primary))
-        .map(|m| format!("lmstudio/{}", namespaced_identifier(m)));
-    let compactor_ref = models
-        .iter()
-        .find(|m| matches!(m.role, ModelRole::Compactor))
+fn sync_default_model_pins(config: &mut Value, profile: &Profile) -> bool {
+    // (#590) The default-worker pin = the profile's `default_model` (or its
+    // first model when unset). The compactor pin is gone — the compactor model
+    // lives in the registry's `internal.utility` binding now, not in a
+    // profile's `models[]`.
+    let primary_ref = profile
+        .default_model_id()
+        .and_then(|id| profile.models.iter().find(|m| m.id == id))
         .map(|m| format!("lmstudio/{}", namespaced_identifier(m)));
 
-    if primary_ref.is_none() && compactor_ref.is_none() {
+    let Some(want) = primary_ref else {
         return false;
+    };
+
+    let cur = config
+        .get("agents")
+        .and_then(|a| a.get("defaults"))
+        .and_then(|d| d.get("model"))
+        .and_then(|m| m.get("primary"))
+        .and_then(|p| p.as_str())
+        .map(String::from);
+    if should_rewrite_lmstudio_pin(cur.as_deref()) && cur.as_deref() != Some(want.as_str()) {
+        ensure_object_at_path(config, &["agents", "defaults", "model"])
+            .insert("primary".to_string(), Value::String(want));
+        return true;
     }
-
-    let mut modified = false;
-
-    if let Some(want) = primary_ref {
-        let cur = config
-            .get("agents")
-            .and_then(|a| a.get("defaults"))
-            .and_then(|d| d.get("model"))
-            .and_then(|m| m.get("primary"))
-            .and_then(|p| p.as_str())
-            .map(String::from);
-        if should_rewrite_lmstudio_pin(cur.as_deref()) && cur.as_deref() != Some(want.as_str()) {
-            ensure_object_at_path(config, &["agents", "defaults", "model"])
-                .insert("primary".to_string(), Value::String(want));
-            modified = true;
-        }
-    }
-
-    if let Some(want) = compactor_ref {
-        let cur = config
-            .get("agents")
-            .and_then(|a| a.get("defaults"))
-            .and_then(|d| d.get("compaction"))
-            .and_then(|c| c.get("model"))
-            .and_then(|m| m.as_str())
-            .map(String::from);
-        if should_rewrite_lmstudio_pin(cur.as_deref()) && cur.as_deref() != Some(want.as_str()) {
-            ensure_object_at_path(config, &["agents", "defaults", "compaction"])
-                .insert("model".to_string(), Value::String(want));
-            modified = true;
-        }
-    }
-
-    modified
+    false
 }
 
 /// Walk `config` along `path`, creating missing intermediate objects.
@@ -587,7 +568,7 @@ fn should_rewrite_lmstudio_pin(current: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use darkmux_types::{ModelRole, Profile, ProfileModel, ProfileRuntime, RuntimeCompactionConfig};
+    use darkmux_types::{Profile, ProfileModel, ProfileRuntime, RuntimeCompactionConfig};
     use serde_json::Value as JsonValue;
     use tempfile::TempDir;
 
@@ -625,6 +606,7 @@ mod tests {
         Profile {
             description: None,
             models,
+            default_model: None,
             runtime: Some(ProfileRuntime {
                 config_path: Some(config_path.to_string()),
                 context_tokens,
@@ -639,6 +621,7 @@ mod tests {
         let profile = Profile {
             description: None,
             models: vec![],
+            default_model: None,
             runtime: None,
             use_when: None,
         };
@@ -650,6 +633,7 @@ mod tests {
         let profile = Profile {
             description: None,
             models: vec![],
+            default_model: None,
             runtime: Some(ProfileRuntime::default()),
             use_when: None,
         };
@@ -739,14 +723,12 @@ mod tests {
                 ProfileModel {
                     id: "primary-id".into(),
                     n_ctx: 262144,
-                    role: ModelRole::Primary,
                     capabilities: Default::default(),
                     identifier: None,
                 },
                 ProfileModel {
                     id: "compactor-id".into(),
                     n_ctx: 120000,
-                    role: ModelRole::Compactor,
                     capabilities: Default::default(),
                     identifier: None,
                 },
@@ -782,7 +764,6 @@ mod tests {
             vec![ProfileModel {
                 id: "any".into(),
                 n_ctx: 1000,
-                role: ModelRole::Primary,
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -825,7 +806,6 @@ mod tests {
             vec![ProfileModel {
                 id: "qwen3.6-35b-a3b".into(),
                 n_ctx: 100000,
-                role: ModelRole::Primary,
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -863,7 +843,6 @@ mod tests {
             vec![ProfileModel {
                 id: "qwen3-4b-instruct-2507".into(),
                 n_ctx: 120000,
-                role: ModelRole::Compactor,
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -899,7 +878,6 @@ mod tests {
             vec![ProfileModel {
                 id: "foo".into(),
                 n_ctx: 1000,
-                role: ModelRole::Primary,
                 capabilities: Default::default(),
                 identifier: Some("my-explicit-alias".into()),
             }],
@@ -928,7 +906,6 @@ mod tests {
             vec![ProfileModel {
                 id: "foo".into(),
                 n_ctx: 1000,
-                role: ModelRole::Primary,
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -958,7 +935,6 @@ mod tests {
             vec![ProfileModel {
                 id: "foo".into(),
                 n_ctx: 1000,
-                role: ModelRole::Primary,
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -1011,7 +987,6 @@ mod tests {
             vec![ProfileModel {
                 id: "qwen3.6-35b-a3b".into(),
                 n_ctx: 101000,
-                role: ModelRole::Primary,
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -1060,7 +1035,6 @@ mod tests {
             vec![ProfileModel {
                 id: "unknown-model-id".into(),
                 n_ctx: 64000,
-                role: ModelRole::Primary,
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -1105,7 +1079,6 @@ mod tests {
             vec![ProfileModel {
                 id: "foo".into(),
                 n_ctx: 50000,
-                role: ModelRole::Primary,
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -1163,7 +1136,6 @@ mod tests {
             vec![ProfileModel {
                 id: "foo".into(),
                 n_ctx: 80000,
-                role: ModelRole::Primary,
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -1207,7 +1179,6 @@ mod tests {
             vec![ProfileModel {
                 id: "foo".into(),
                 n_ctx: 50000,
-                role: ModelRole::Primary,
                 capabilities: Default::default(),
                 identifier: Some("my-alias".into()),
             }],
@@ -1240,7 +1211,6 @@ mod tests {
             vec![ProfileModel {
                 id: "google/gemini-2.5".into(),
                 n_ctx: 1000,
-                role: ModelRole::Primary,
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -1268,6 +1238,7 @@ mod tests {
         Profile {
             description: None,
             models,
+            default_model: None,
             runtime: None,
             use_when: None,
         }
@@ -1299,7 +1270,6 @@ mod tests {
         let profile = profile_without_runtime(vec![ProfileModel {
             id: "openai/gpt-oss-20b".into(),
             n_ctx: 100000,
-            role: ModelRole::Primary,
             capabilities: Default::default(),
             identifier: None,
         }]);
@@ -1352,7 +1322,6 @@ mod tests {
         let profile = profile_without_runtime(vec![ProfileModel {
             id: "new-model".into(),
             n_ctx: 100000,
-            role: ModelRole::Primary,
             capabilities: Default::default(),
             identifier: None,
         }]);
@@ -1370,12 +1339,15 @@ mod tests {
         );
     }
 
-    /// Same shape for the compaction pin: profile names a Compactor; the
-    /// existing pin (or its absence) gets replaced with the profile's
-    /// namespaced compactor id.
+    /// (#590) The compactor pin is no longer derived from `models[]` — the
+    /// compactor model moved to the registry's `internal.utility` binding,
+    /// so `apply_runtime` (via `sync_default_model_pins`) writes ONLY the
+    /// default-worker primary pin. An existing `compaction.model` pin must
+    /// be left untouched by a swap; only the primary pin gets rewritten to
+    /// the profile's default worker (first model when `default_model` unset).
     #[test]
     #[serial]
-    fn swap_rewrites_compactor_pin_when_profile_has_role_compactor() {
+    fn swap_rewrites_primary_pin_but_leaves_compactor_pin_untouched() {
         let tmp = TempDir::new().unwrap();
         let p = write_config(
             &tmp,
@@ -1391,14 +1363,12 @@ mod tests {
             ProfileModel {
                 id: "new-primary".into(),
                 n_ctx: 100000,
-                role: ModelRole::Primary,
                 capabilities: Default::default(),
                 identifier: None,
             },
             ProfileModel {
-                id: "new-compactor".into(),
+                id: "second-worker".into(),
                 n_ctx: 32000,
-                role: ModelRole::Compactor,
                 capabilities: Default::default(),
                 identifier: None,
             },
@@ -1411,56 +1381,58 @@ mod tests {
         assert!(modified);
         let after: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+        // Compactor pin is no longer profile-derived → left exactly as found.
         assert_eq!(
             after["agents"]["defaults"]["compaction"]["model"],
-            "lmstudio/darkmux:new-compactor"
+            "lmstudio/darkmux:old-compactor",
+            "compactor pin is not derived from models[] → must be left untouched"
         );
+        // Primary pin rewritten to the default worker (first model).
         assert_eq!(
             after["agents"]["defaults"]["model"]["primary"],
             "lmstudio/darkmux:new-primary"
         );
     }
 
-    /// Defensive: if the new profile has no Compactor, we don't clear the
-    /// existing `compaction.model` pin. Stronger contract than the issue
-    /// asks for and could silently disable an operator's manual setup.
+    /// (#590) `default_model` selects which worker becomes the primary pin —
+    /// not the first-declared model when it's set. Locks the tie-break/default
+    /// designation moving from the old Primary-role to the new `default_model`
+    /// field.
     #[test]
     #[serial]
-    fn swap_leaves_compactor_pin_untouched_when_profile_has_no_compactor() {
+    fn swap_uses_default_model_for_primary_pin_when_set() {
         let tmp = TempDir::new().unwrap();
         let p = write_config(
             &tmp,
-            r#"{
-                "agents": {
-                    "defaults": {
-                        "compaction": { "model": "lmstudio/darkmux:manual-compactor" }
-                    }
-                }
-            }"#,
+            r#"{ "agents": { "defaults": { "model": { "primary": "lmstudio/darkmux:stale" } } } }"#,
         );
-        // Primary-only profile (no Compactor role).
-        let profile = profile_without_runtime(vec![ProfileModel {
-            id: "primary-only".into(),
-            n_ctx: 100000,
-            role: ModelRole::Primary,
-            capabilities: Default::default(),
-            identifier: None,
-        }]);
+        let mut profile = profile_without_runtime(vec![
+            ProfileModel {
+                id: "first".into(),
+                n_ctx: 100000,
+                capabilities: Default::default(),
+                identifier: None,
+            },
+            ProfileModel {
+                id: "the-default".into(),
+                n_ctx: 100000,
+                capabilities: Default::default(),
+                identifier: None,
+            },
+        ]);
+        profile.default_model = Some("the-default".into());
 
         unsafe { env::set_var("DARKMUX_OPENCLAW_CONFIG", p.to_str().unwrap()) };
-        let _ = apply_runtime(&profile).unwrap();
+        let modified = apply_runtime(&profile).unwrap();
         unsafe { env::remove_var("DARKMUX_OPENCLAW_CONFIG") };
 
+        assert!(modified);
         let after: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
         assert_eq!(
-            after["agents"]["defaults"]["compaction"]["model"], "lmstudio/darkmux:manual-compactor",
-            "compactor pin should be left alone when profile has no Compactor role"
-        );
-        // Primary was still rewritten — that role IS in the profile.
-        assert_eq!(
             after["agents"]["defaults"]["model"]["primary"],
-            "lmstudio/darkmux:primary-only"
+            "lmstudio/darkmux:the-default",
+            "explicit default_model, not the first model, drives the primary pin"
         );
     }
 
@@ -1476,7 +1448,6 @@ mod tests {
         let profile = profile_without_runtime(vec![ProfileModel {
             id: "the-model".into(),
             n_ctx: 100000,
-            role: ModelRole::Primary,
             capabilities: Default::default(),
             identifier: None,
         }]);
@@ -1500,14 +1471,13 @@ mod tests {
     #[test]
     fn sync_default_model_pins_uses_explicit_identifier_when_profile_opts_out() {
         let mut config = serde_json::json!({});
-        let models = vec![ProfileModel {
+        let profile = profile_without_runtime(vec![ProfileModel {
             id: "the-model".into(),
             n_ctx: 100000,
-            role: ModelRole::Primary,
             capabilities: Default::default(),
             identifier: Some("my-custom-alias".into()),
-        }];
-        let modified = sync_default_model_pins(&mut config, &models);
+        }]);
+        let modified = sync_default_model_pins(&mut config, &profile);
         assert!(modified);
         assert_eq!(
             config["agents"]["defaults"]["model"]["primary"],
@@ -1522,15 +1492,14 @@ mod tests {
     #[test]
     fn sync_default_model_pins_is_idempotent() {
         let mut config = serde_json::json!({});
-        let models = vec![ProfileModel {
+        let profile = profile_without_runtime(vec![ProfileModel {
             id: "the-model".into(),
             n_ctx: 100000,
-            role: ModelRole::Primary,
             capabilities: Default::default(),
             identifier: None,
-        }];
-        assert!(sync_default_model_pins(&mut config, &models));
-        assert!(!sync_default_model_pins(&mut config, &models));
+        }]);
+        assert!(sync_default_model_pins(&mut config, &profile));
+        assert!(!sync_default_model_pins(&mut config, &profile));
     }
 
     /// Review M1: an unprefixed (bare) pin is still darkmux's to rewrite
@@ -1544,14 +1513,13 @@ mod tests {
         let mut config = serde_json::json!({
             "agents": { "defaults": { "model": { "primary": "stale-bare-id" } } }
         });
-        let models = vec![ProfileModel {
+        let profile = profile_without_runtime(vec![ProfileModel {
             id: "new-model".into(),
             n_ctx: 100000,
-            role: ModelRole::Primary,
             capabilities: Default::default(),
             identifier: None,
-        }];
-        assert!(sync_default_model_pins(&mut config, &models));
+        }]);
+        assert!(sync_default_model_pins(&mut config, &profile));
         assert_eq!(
             config["agents"]["defaults"]["model"]["primary"],
             "lmstudio/darkmux:new-model"
@@ -1573,14 +1541,13 @@ mod tests {
             let mut config = serde_json::json!({
                 "agents": { "defaults": { "model": { "primary": stale_pin } } }
             });
-            let models = vec![ProfileModel {
+            let profile = profile_without_runtime(vec![ProfileModel {
                 id: "lmstudio-side-model".into(),
                 n_ctx: 100000,
-                role: ModelRole::Primary,
                 capabilities: Default::default(),
                 identifier: None,
-            }];
-            let modified = sync_default_model_pins(&mut config, &models);
+            }]);
+            let modified = sync_default_model_pins(&mut config, &profile);
             assert!(
                 !modified,
                 "non-LMStudio pin `{stale_pin}` should be left alone"
@@ -1592,24 +1559,21 @@ mod tests {
         }
     }
 
-    /// A profile with no managed roles (e.g. all Auxiliary) must not
-    /// touch any pin — there's nothing meaningful to write.
+    /// (#590) A profile with no models has no default worker to pin, so
+    /// `sync_default_model_pins` must be a no-op and leave any existing
+    /// pin untouched. (Replaces the old "all-Auxiliary, no managed roles"
+    /// case — every model is now an unroled worker, so the only no-write
+    /// path left is an empty `models[]`.)
     #[test]
-    fn sync_default_model_pins_no_op_when_profile_has_no_primary_or_compactor() {
+    fn sync_default_model_pins_no_op_when_profile_has_no_models() {
         let mut config = serde_json::json!({
             "agents": { "defaults": { "model": { "primary": "lmstudio/whatever" } } }
         });
-        let models = vec![ProfileModel {
-            id: "aux".into(),
-            n_ctx: 8192,
-            role: ModelRole::Auxiliary,
-            capabilities: Default::default(),
-            identifier: None,
-        }];
-        assert!(!sync_default_model_pins(&mut config, &models));
+        let profile = profile_without_runtime(vec![]);
+        assert!(!sync_default_model_pins(&mut config, &profile));
         assert_eq!(
             config["agents"]["defaults"]["model"]["primary"], "lmstudio/whatever",
-            "no managed roles → pin left alone"
+            "no models → no default worker → pin left alone"
         );
     }
 

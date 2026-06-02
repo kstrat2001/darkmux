@@ -2652,9 +2652,16 @@ fn cmd_profiles(config: Option<&str>) -> Result<i32> {
         if let Some(desc) = profile.description.as_deref() {
             println!("  {desc}");
         }
+        // (#590) Models no longer carry a role; mark the default worker
+        // (default_model, or first model) instead.
+        let default_id = profile.default_model_id();
         for m in &profile.models {
-            let role = format!("{:?}", m.role).to_lowercase();
-            println!("  - {:<10} {} @ ctx {}", role, m.id, m.n_ctx);
+            let marker = if Some(m.id.as_str()) == default_id {
+                "default"
+            } else {
+                ""
+            };
+            println!("  - {:<10} {} @ ctx {}", marker, m.id, m.n_ctx);
         }
     }
     Ok(0)
