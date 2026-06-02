@@ -299,18 +299,40 @@ with a soft model-facing warning at 75% (see `CLAUDE.md` → environment variabl
 
 ## 7. Flow records + the serve daemon
 
+### Machine (≡ node)
+
+A **machine** is one operator-named host in your fleet (e.g. `studio`, `laptop`):
+a single unified compute pool, reached at one Tailnet address, serving one local
+LMStudio endpoint. On Apple Silicon that mapping is exact — one machine = one
+integrated GPU + one shared-memory RAM budget + one inference endpoint
+(`crates/darkmux-hardware/src/lib.rs` models one `total_ram_gb` +
+`has_unified_memory`, no per-GPU fields). Scaling means *adding machines*, not
+splitting GPUs within one.
+
+**"node" is a synonym for "machine."** darkmux has no separate node concept — the
+only fleet unit is `MachineEntry` (a logical `id` + a Tailnet `address` + a
+tier). If "node" shows up in discussion, read it as "machine." The distinction
+that *would* earn its own word is a single machine hosting **more than one
+inference endpoint** (a CUDA eGPU tier, or several LMStudio instances on
+different ports) — out of scope today; darkmux models a machine as one endpoint,
+the LMStudio default. That multi-endpoint case is tracked in #597, where the
+right noun is **`endpoint`** (not `node`): #590's capability layer already
+handles the *routing* (a model offers `vision`, a role requests it), so only
+per-model endpoint *addressing* is deferred.
+
 ### The flow stream
 
 Every dispatch, decision, and review is recorded as a `FlowRecord` — the audit
-and coordination substrate. The schema version is **`1.8.0`**
+and coordination substrate. The schema version is **`1.9.0`**
 (`crates/darkmux-flow/src/schema.rs:14`). The fields group as:
 
 - **Core (always present):** `ts`, `level`, `category`, `tier`, `stage`,
   `action`, `handle`.
 - **Correlation:** `sprint_id`, `session_id`, `mission_id`, `source`.
 - **Provenance (env-stamped at write time):** `model`, `machine_id` (from
-  `DARKMUX_MACHINE_ID`), `orchestrator` (from `DARKMUX_ORCHESTRATOR`),
-  `machine_tier` (from `DARKMUX_MACHINE_TIER`).
+  `DARKMUX_MACHINE_ID`), `orchestrator` (from `DARKMUX_ORCHESTRATOR`). *(The
+  `machine_tier` provenance field was removed in schema 1.9.0, #587 — the
+  {inference/hub/client} machine-capacity tier is retired; see #590.)*
 - **Audit chain (`AuditFileSink` only):** `prev_hash`, `hash` — a BLAKE3
   chain-of-custody verified by `darkmux flow integrity-check` (#163).
 - **Parallel-dispatch (#246, schema 1.8):** `work_id`, `attempt`.
