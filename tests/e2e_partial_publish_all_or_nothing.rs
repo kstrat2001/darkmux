@@ -9,7 +9,7 @@
 //! never leaves orphan jobs on Redis.
 //!
 //! Test asserts the invariant directly: query Redis `XLEN
-//! darkmux:work:<tier>` after a known-failing dispatch and confirm
+//! darkmux:work` after a known-failing dispatch and confirm
 //! it's still 0. A future refactor that switched to a "publish-then-
 //! validate-each" pattern would silently leak orphan jobs; this test
 //! catches that regression.
@@ -104,7 +104,7 @@ fn oversize_sprint_aborts_publish_with_no_orphans() {
         return;
     }
 
-    let harness = FleetHarness::boot(vec![NodeSpec::inference("node-a")])
+    let harness = FleetHarness::boot(vec![NodeSpec::new("node-a")])
         .expect("FleetHarness::boot");
     let node = harness.node("node-a").unwrap();
 
@@ -134,7 +134,7 @@ fn oversize_sprint_aborts_publish_with_no_orphans() {
     );
 
     // Sanity: stream is empty before dispatch.
-    let pre_xlen = xlen(harness.redis_url(), "darkmux:work:inference");
+    let pre_xlen = xlen(harness.redis_url(), "darkmux:work");
 
     let out = node
         .cmd()
@@ -162,11 +162,11 @@ fn oversize_sprint_aborts_publish_with_no_orphans() {
     // invariant means even the well-formed `sprint-normal` did not
     // land on Redis. Net XADD count for our stream after the failed
     // dispatch must equal the pre-dispatch count (typically 0).
-    let post_xlen = xlen(harness.redis_url(), "darkmux:work:inference");
+    let post_xlen = xlen(harness.redis_url(), "darkmux:work");
     assert_eq!(
         post_xlen, pre_xlen,
         "all-or-nothing pre-publish invariant violated: \
-         XLEN(darkmux:work:inference) went from {pre_xlen} to {post_xlen}. \
+         XLEN(darkmux:work) went from {pre_xlen} to {post_xlen}. \
          A future refactor must NOT publish ANY sprint when ANY sprint trips validation."
     );
 

@@ -1,8 +1,8 @@
-//! Fleet dispatch routing — auto-route target selection, queue dispatch, and completion waiting.
+//! Fleet dispatch routing — local-vs-`--machine` selection, queue dispatch, and completion waiting.
 
 use crate::queue::extract_field;
-use crate::{candidates_for_tier, load_roster, publish_job, WorkJob};
-use anyhow::{anyhow, bail, Context, Result};
+use crate::{publish_job, WorkJob};
+use anyhow::{anyhow, Context, Result};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // ─── Client-side --wait wrapper (PR-C.3) ──────────────────────────────
@@ -198,7 +198,6 @@ pub(crate) fn match_completion(line: &str, target_session_id: &str) -> Option<Co
 /// duplicate the shape.
 #[allow(clippy::too_many_arguments)]
 pub fn build_work_job(
-    target_tier: String,
     target_machine: Option<String>,
     role_id: String,
     message: String,
@@ -216,7 +215,6 @@ pub fn build_work_job(
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     WorkJob {
-        target_tier,
         target_machine,
         role_id,
         message,
@@ -248,11 +246,14 @@ pub fn build_work_job(
 use darkmux_crew::dispatch::{self, DispatchOpts, DispatchResult, RoutingDecision};
 
 /// Route a dispatch local-vs-remote, then run it. When `--machine` is set
-/// (and isn't the local machine) OR the role's tier auto-routes across the
-/// fleet, publish to the work queue and (if `--wait`) block on the worker's
-/// `dispatch.complete` flow record. Otherwise fall through to the local
-/// dispatch path (`crew::dispatch::dispatch`). (#246 PR-C.3 / #247 PR-B;
-/// relocated from `crew::dispatch::dispatch` in #463.)
+/// (and isn't the local machine), publish to the single global work queue
+/// and (if `--wait`) block on the worker's `dispatch.complete` flow
+/// record. Otherwise fall through to the local dispatch path
+/// (`crew::dispatch::dispatch`). After #590 there is no tier auto-route:
+/// the only fleet-queue path is explicit `--machine`, and it's advisory
+/// (any worker may claim; a non-target worker logs a soft warning and
+/// proceeds). (#246 PR-C.3; relocated from `crew::dispatch::dispatch` in
+/// #463; tier auto-route retired in #590.)
 pub fn dispatch_routed(opts: DispatchOpts) -> Result<DispatchResult> {
     if let Some(target) = opts.machine.clone() {
         let local = darkmux_flow::resolve_machine_id();
@@ -282,11 +283,10 @@ pub fn dispatch_routed(opts: DispatchOpts) -> Result<DispatchResult> {
                 // #290 — emit the pinned route record so the audit
                 // trail + topology UI see the operator-pinned routing
                 // decision. Validation runs BEFORE the emit so a
-                // role-load failure OR an invalid tier doesn't leave a
-                // misleading "pinned" record in the audit chain.
-                let role_tier = dispatch::resolve_role_tier_for_record(&opts)?;
+                // role-load failure doesn't leave a misleading "pinned"
+                // record in the audit chain.
                 let session_id =
-                    dispatch::emit_route_record_and_resolve_session(&opts, &role_tier, Some(&target));
+                    dispatch::emit_route_record_and_resolve_session(&opts, Some(&target));
                 let mut opts = opts;
                 opts.session_id = Some(session_id);
                 return dispatch_via_queue(opts, Some(&target));
@@ -295,9 +295,8 @@ pub fn dispatch_routed(opts: DispatchOpts) -> Result<DispatchResult> {
                 target,
                 local_unknown: false,
             } => {
-                let role_tier = dispatch::resolve_role_tier_for_record(&opts)?;
                 let session_id =
-                    dispatch::emit_route_record_and_resolve_session(&opts, &role_tier, Some(&target));
+                    dispatch::emit_route_record_and_resolve_session(&opts, Some(&target));
                 let mut opts = opts;
                 opts.session_id = Some(session_id);
                 return dispatch_via_queue(opts, Some(&target));
@@ -309,72 +308,24 @@ pub fn dispatch_routed(opts: DispatchOpts) -> Result<DispatchResult> {
                 // — but the enum's total shape covers it.
             }
         }
-    } else if let Some(auto_target_tier) = auto_route_target_tier(&opts)? {
-        // #247 PR-B — auto-route by tier when no explicit --machine and the
-        // role's tier doesn't match the local machine's tier (and the fleet
-        // has a peer in the role's tier). The worker that claims it runs its
-        // own preflight — we skip the local one.
-        let local_tier = darkmux_flow::resolve_machine_tier();
-        eprintln!(
-            "darkmux crew dispatch: auto-routing role=`{}` via tier=`{}` \
-             (local tier=`{}`, no --machine — consumer group claims).",
-            opts.role_id,
-            auto_target_tier,
-            local_tier.as_deref().unwrap_or("<unknown>"),
-        );
-        let session_id =
-            dispatch::emit_route_record_and_resolve_session(&opts, &auto_target_tier, None);
-        let mut opts = opts;
-        opts.session_id = Some(session_id);
-        return dispatch_via_queue(opts, None);
     }
 
-    // Local fall-through — run the dispatch on this machine.
+    // Local fall-through — no `--machine` means run on this machine
+    // (#590: the tier auto-route arm was removed; there's no tier to
+    // trigger auto-routing).
     dispatch::dispatch(opts)
 }
 
-/// Publish a dispatch to the fleet work queue instead of running it
-/// locally (#246 PR-C.3). Called from `dispatch_routed` when `opts.machine`
-/// is set to a non-local id, or when tier auto-routing fires. If `opts.wait`
-/// is true (the default for `crew dispatch`), blocks on the worker's
+/// Publish a dispatch to the single global fleet work queue instead of
+/// running it locally (#246 PR-C.3). Called from `dispatch_routed` when
+/// `opts.machine` is set to a non-local id. If `opts.wait` is true (the
+/// default for `crew dispatch`), blocks on the worker's
 /// `dispatch.complete` flow record before returning; otherwise returns
 /// immediately with a fire-and-forget synthetic result.
-/// `target_machine: Some(id)` stamps the WorkJob's hint field so the
-/// audit trail and topology view see the operator-pinned target.
-/// `None` is the auto-route case (#247 PR-B).
+/// `target_machine: Some(id)` stamps the WorkJob's advisory hint field so
+/// the audit trail and topology view see the operator-pinned target (#590:
+/// advisory only — any worker may claim).
 fn dispatch_via_queue(opts: DispatchOpts, target_machine: Option<&str>) -> Result<DispatchResult> {
-    // Determine the role's tier requirement (drives the work stream
-    // selection). Roles MUST declare a concrete tier for cross-machine
-    // dispatch — workers register on `darkmux:work:<inference|hub|client>`
-    // streams; a role with `tier: None` would publish to
-    // `darkmux:work:any` which has no consumer and the wait loop would
-    // time out without explanation. Bail loud with operator-actionable
-    // hints. (PR-C.3 review HIGH-1)
-    let role = dispatch::load_role_or_bail(&opts.role_id)?;
-    let role_tier = match role.tier.clone() {
-        Some(t) if !t.trim().is_empty() && t != "any" => t,
-        Some(t) => {
-            bail!(
-                "role `{}` has tier={:?} which has no fleet consumer (workers \
-                 register on inference/hub/client streams). Either: (a) edit \
-                 the role manifest to declare a concrete tier, or (b) omit \
-                 --machine to dispatch locally.",
-                opts.role_id,
-                t
-            );
-        }
-        None => {
-            bail!(
-                "role `{}` has no tier declaration in its manifest. \
-                 Cross-machine dispatch requires the role to declare which \
-                 machine class it runs on. Either: (a) add \"tier\": \
-                 \"inference\" (or \"hub\") to the role's JSON manifest, or \
-                 (b) omit --machine to dispatch locally.",
-                opts.role_id
-            );
-        }
-    };
-
     // The Redis URL is required for cross-machine dispatch. If it's
     // unset, the operator hasn't configured the fleet substrate — bail
     // loud with the fix-it pointer.
@@ -385,12 +336,12 @@ fn dispatch_via_queue(opts: DispatchOpts, target_machine: Option<&str>) -> Resul
         .ok_or_else(|| {
             let context = match target_machine {
                 Some(m) => format!("--machine={m}"),
-                None => format!("cross-tier auto-route (local tier != role tier=`{role_tier}`)"),
+                None => "fleet-queue dispatch".to_string(),
             };
             anyhow!(
                 "{context} requires DARKMUX_REDIS_URL to be set \
                  (the fleet work queue lives on Redis). \
-                 Single-machine fleets shouldn't dispatch cross-tier."
+                 Single-machine fleets shouldn't dispatch to the queue."
             )
         })?;
 
@@ -405,7 +356,6 @@ fn dispatch_via_queue(opts: DispatchOpts, target_machine: Option<&str>) -> Resul
     // worker side reconstructs via `WorkJob::into_dispatch_opts` —
     // round-trip parity matters for cross-machine dispatch.
     let job = build_work_job(
-        role_tier,
         target_machine.map(|s| s.to_string()),
         opts.role_id.clone(),
         opts.message.clone(),
@@ -431,10 +381,9 @@ fn dispatch_via_queue(opts: DispatchOpts, target_machine: Option<&str>) -> Resul
     let work_id = publish_job(&client, &job).context("publishing WorkJob to fleet queue")?;
 
     eprintln!(
-        "darkmux crew dispatch: published work_id={work_id} tier={} \
+        "darkmux crew dispatch: published work_id={work_id} \
          target_machine={} session={session_id}",
-        job.target_tier,
-        target_machine.unwrap_or("<auto-route>"),
+        target_machine.unwrap_or("<any>"),
     );
 
     if !opts.wait {
@@ -472,73 +421,6 @@ fn dispatch_via_queue(opts: DispatchOpts, target_machine: Option<&str>) -> Resul
     // dispatching CLI's stdout); surface the result_class + wall_ms in
     // the synthetic stdout so the operator sees something useful.
     Ok(completion_to_dispatch_result(completion))
-}
-
-/// Decide whether the dispatch should auto-route via the work queue
-/// because the role's declared tier doesn't match the local machine's
-/// tier. Returns:
-/// - `Ok(None)` — dispatch locally (role.tier ∈ {None, "any"}, OR
-///   role.tier == local tier, OR roster is empty so there's no fleet
-///   to route across)
-/// - `Ok(Some(role_tier))` — fleet has a peer in `role_tier`; publish
-///   via queue.
-/// - `Err(_)` — operator HAS a fleet with peers in other tiers but
-///   none in `role_tier`; bail loud (actionable misconfiguration).
-///   (#247 PR-B; graceful-degradation refinement per LAB_NOTEBOOK
-///   Beat 35.)
-pub(crate) fn auto_route_target_tier(opts: &DispatchOpts) -> Result<Option<String>> {
-    let role = dispatch::load_role_or_bail(&opts.role_id)?;
-    let role_tier = match role.tier.as_deref().map(str::trim) {
-        Some("") | Some("any") | None => return Ok(None), // local
-        Some(t) => t.to_string(),
-    };
-    let local_tier = darkmux_flow::resolve_machine_tier();
-    if local_tier.as_deref() == Some(role_tier.as_str()) {
-        // Local matches role's tier — dispatch locally; no queue cost.
-        return Ok(None);
-    }
-    // Tier mismatch — consult the fleet roster. `load_roster()` already
-    // returns `Ok(FleetRoster::default())` for the missing-file case
-    // (single-machine operator legitimately has no fleet.json), so we
-    // only need to propagate genuine parse failures here.
-    let roster = load_roster().with_context(|| {
-        format!(
-            "role `{}` requires tier=`{role_tier}` and the fleet roster failed to load. \
-             Run `darkmux fleet status` to inspect.",
-            opts.role_id
-        )
-    })?;
-    let candidates = candidates_for_tier(&roster, &role_tier);
-    if candidates.is_empty() {
-        if roster.machines.is_empty() {
-            // Single-machine operator — no fleet declared at all. Tier
-            // constraints don't apply when there's nothing to route
-            // across. Run locally with a teaching nudge. Operator-
-            // sovereignty applied per Beat 35.
-            eprintln!(
-                "darkmux crew dispatch: role `{}` declares tier=`{role_tier}` but no \
-                 fleet peers are declared — running locally. To enable multi-machine \
-                 routing later: `darkmux fleet add <id> --tier <tier> --address <addr>`.",
-                opts.role_id
-            );
-            return Ok(None);
-        }
-        // Roster has peers, but none in this tier — operator HAS a
-        // fleet that's deliberately partitioned, just missing the
-        // required tier. Actionable misconfiguration.
-        let peer_count = roster.machines.len();
-        let peer_word = if peer_count == 1 { "peer" } else { "peers" };
-        bail!(
-            "role `{}` requires tier=`{role_tier}` but no fleet peer is in that \
-             tier (local tier=`{}`, {peer_count} other {peer_word} declared). Either: \
-             (a) add a peer with `darkmux fleet add <id> --tier {role_tier} --address <addr>`, \
-             or (b) edit the role manifest to declare `tier: \"any\"` if this work \
-             belongs on whatever's available.",
-            opts.role_id,
-            local_tier.as_deref().unwrap_or("<unset>"),
-        );
-    }
-    Ok(Some(role_tier))
 }
 
 /// Translate a queue completion (from `wait_for_completion`) into the

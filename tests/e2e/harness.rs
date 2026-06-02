@@ -8,8 +8,8 @@
 //!
 //! Spawns `redis-server` on a random port, an in-process mock LMStudio,
 //! and N `darkmux serve` daemons with distinct
-//! `DARKMUX_MACHINE_ID` / `DARKMUX_MACHINE_TIER` / `DARKMUX_REDIS_URL`
-//! env vars. Provides helpers to:
+//! `DARKMUX_MACHINE_ID` / `DARKMUX_REDIS_URL` env vars. Provides helpers
+//! to:
 //!
 //! - dispatch CLI commands "from" any node (sets the right env vars on
 //!   the child process)
@@ -79,7 +79,6 @@ fn build_darkmux_release() -> Result<(), String> {
 /// pre-configured for the node's identity.
 pub struct FleetNode {
     pub machine_id: String,
-    pub tier: String,
     pub daemon_port: u16,
     pub flows_dir: PathBuf,
     pub fleet_file: PathBuf,
@@ -98,7 +97,6 @@ impl FleetNode {
         let binary = darkmux_release_binary();
         let mut cmd = Command::new(binary);
         cmd.env("DARKMUX_MACHINE_ID", &self.machine_id)
-            .env("DARKMUX_MACHINE_TIER", &self.tier)
             .env("DARKMUX_REDIS_URL", &self.redis_url)
             .env("DARKMUX_FLOWS_DIR", &self.flows_dir)
             .env("DARKMUX_FLEET_FILE", &self.fleet_file)
@@ -136,19 +134,19 @@ pub struct FleetHarness {
     _tempdir: tempfile::TempDir,
 }
 
-/// Configuration for one node in `FleetHarness::boot`.
+/// Configuration for one node in `FleetHarness::boot`. After #590 a node
+/// is identified solely by its `machine_id` — machine-capacity tier no
+/// longer routes work.
 #[derive(Debug, Clone)]
 pub struct NodeSpec {
     pub machine_id: String,
-    pub tier: String,
 }
 
 impl NodeSpec {
-    pub fn inference(id: &str) -> Self {
-        Self { machine_id: id.to_string(), tier: "inference".to_string() }
-    }
-    pub fn hub(id: &str) -> Self {
-        Self { machine_id: id.to_string(), tier: "hub".to_string() }
+    pub fn new(id: &str) -> Self {
+        Self {
+            machine_id: id.to_string(),
+        }
     }
 }
 
@@ -309,7 +307,6 @@ fn spawn_daemon(
     let daemon = Command::new(&binary)
         .args(["serve", "--bind", "127.0.0.1", "--port", &port.to_string()])
         .env("DARKMUX_MACHINE_ID", &spec.machine_id)
-        .env("DARKMUX_MACHINE_TIER", &spec.tier)
         .env("DARKMUX_REDIS_URL", redis_url)
         .env("DARKMUX_FLOWS_DIR", &flows_dir)
         .env("DARKMUX_FLEET_FILE", &fleet_file)
@@ -326,7 +323,6 @@ fn spawn_daemon(
 
     Ok(FleetNode {
         machine_id: spec.machine_id.clone(),
-        tier: spec.tier.clone(),
         daemon_port: port,
         flows_dir,
         fleet_file,

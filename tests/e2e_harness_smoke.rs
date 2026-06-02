@@ -36,8 +36,8 @@ fn dual_node_harness_boots_cleanly() {
     }
 
     let harness = FleetHarness::boot(vec![
-        NodeSpec::inference("node-a"),
-        NodeSpec::hub("node-b"),
+        NodeSpec::new("node-a"),
+        NodeSpec::new("node-b"),
     ])
     .expect("FleetHarness::boot");
 
@@ -59,21 +59,17 @@ fn dual_node_harness_boots_cleanly() {
     assert!(node_b.daemon_port != 0);
     assert_ne!(node_a.daemon_port, node_b.daemon_port);
 
-    // Per-node tier env propagated.
-    assert_eq!(node_a.tier, "inference");
-    assert_eq!(node_b.tier, "hub");
+    // Per-node machine_id propagated (#590: machine-capacity tier no
+    // longer routes work, so a node is identified solely by machine_id).
+    assert_eq!(node_a.machine_id, "node-a");
+    assert_eq!(node_b.machine_id, "node-b");
 
-    // Sanity: `darkmux doctor` from inside node-a's env should echo the
-    // propagated DARKMUX_MACHINE_TIER value (verifies the daemon's env
-    // vars wired through to the doctor subprocess). The tier *declaration*
-    // is retired (#321/#322) — doctor now reports it as a remove-me
-    // leftover, not a live setting — but the env value still round-trips,
-    // which is what this harness check asserts. We match the backtick-
-    // wrapped echo (`` `inference` ``) so the assertion discriminates the
-    // node from the retired-list literal ("inference/hub/client") every
-    // set-case message carries. Doctor may exit non-zero in the isolated
-    // test env (missing real LMStudio models, etc.); the assertion is on
-    // the echoed value, not the exit code.
+    // Sanity: `darkmux doctor` from inside each node's env should run and
+    // echo that node's propagated DARKMUX_MACHINE_ID — verifying the
+    // daemon's env vars wired through to the doctor subprocess. Doctor may
+    // exit non-zero in the isolated test env (missing real LMStudio
+    // models, etc.); the assertion is on the echoed value, not the exit
+    // code.
     let mut cmd = node_a.cmd();
     let output = cmd
         .arg("doctor")
@@ -81,10 +77,8 @@ fn dual_node_harness_boots_cleanly() {
         .expect("running darkmux doctor on node-a");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("machine-tier")
-            && stdout.contains("`inference`")
-            && !stdout.contains("`hub`"),
-        "node-a doctor should echo the propagated DARKMUX_MACHINE_TIER=inference (and not node-b's); got:\n{stdout}"
+        stdout.contains("node-a"),
+        "node-a doctor should echo the propagated DARKMUX_MACHINE_ID=node-a; got:\n{stdout}"
     );
     let output_b = node_b
         .cmd()
@@ -93,9 +87,7 @@ fn dual_node_harness_boots_cleanly() {
         .expect("running darkmux doctor on node-b");
     let stdout_b = String::from_utf8_lossy(&output_b.stdout);
     assert!(
-        stdout_b.contains("machine-tier")
-            && stdout_b.contains("`hub`")
-            && !stdout_b.contains("`inference`"),
-        "node-b doctor should echo the propagated DARKMUX_MACHINE_TIER=hub (and not node-a's); got:\n{stdout_b}"
+        stdout_b.contains("node-b"),
+        "node-b doctor should echo the propagated DARKMUX_MACHINE_ID=node-b; got:\n{stdout_b}"
     );
 }

@@ -3,13 +3,11 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
-pub(crate) const WORK_STREAM_PREFIX: &str = "darkmux:work:";
-
-/// Compose the per-tier work stream name. Used by both publisher and
-/// claimer so the convention lives in one place.
-pub(crate) fn work_stream_name(tier: &str) -> String {
-    format!("{WORK_STREAM_PREFIX}{tier}")
-}
+/// The single global work stream. After #590 the fleet routes all work
+/// onto one stream; the first available worker claims any job. The former
+/// per-tier streams (`darkmux:work:<tier>`) are retired — machine-capacity
+/// tier is no longer the work-routing key.
+pub(crate) const WORK_STREAM: &str = "darkmux:work";
 
 /// MAXLEN cap for the work streams (approximate; passes `MAXLEN ~ N`
 /// to XADD). 1000 in-flight + recently-acked jobs is generous — at
@@ -38,18 +36,12 @@ pub(crate) const WORK_STREAM_MAXLEN: usize = 1000;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkJob {
-    /// Target hardware tier — used to pick which work stream to publish
-    /// onto. The worker on a matching-tier machine claims via that
-    /// stream's consumer group. Examples: `"inference"`, `"hub"`,
-    /// `"any"` (acceptable to any machine).
-    pub target_tier: String,
-
-    /// Optional pre-claim hint — when set, the dispatching orchestrator
-    /// asserts this specific machine should handle the job. PR-C.1 just
-    /// carries the field; routing enforcement lands in PR-C.2 (the
-    /// claim path validates `target_machine` matches the local
-    /// `DARKMUX_MACHINE_ID`). When `None`, the first matching-tier
-    /// worker claims it (pull semantics).
+    /// Optional advisory machine hint — when set, the dispatching
+    /// orchestrator suggests this specific machine should handle the job.
+    /// Advisory only (#590): any worker may claim the job off the single
+    /// `WORK_STREAM`; a non-target worker logs a soft warning and
+    /// proceeds. There is NO NACK/requeue enforcement. When `None`, the
+    /// first available worker claims it (pull semantics).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_machine: Option<String>,
 
@@ -124,10 +116,10 @@ pub(crate) const MAX_WORK_MESSAGE_BYTES: usize = 256 * 1024;
 /// path string. (#246 PR-C.2)
 pub(crate) const MAX_WORK_WORKDIR_BYTES: usize = 4 * 1024;
 
-/// Max length for identifier fields (`target_tier`, `target_machine`,
-/// `role_id`). 64 chars is plenty for any realistic operator-named
-/// machine or role id and forecloses identifier-as-payload attacks
-/// (e.g. an `role_id` of 100MB). (#246 PR-C.2)
+/// Max length for identifier fields (`target_machine`, `role_id`). 64
+/// chars is plenty for any realistic operator-named machine or role id
+/// and forecloses identifier-as-payload attacks (e.g. an `role_id` of
+/// 100MB). (#246 PR-C.2)
 pub(crate) const MAX_WORK_IDENTIFIER_LEN: usize = 64;
 
 /// Max allowed `timeout_seconds` on a queued `WorkJob`. 1 hour bounds
@@ -145,10 +137,10 @@ impl WorkJob {
     /// downstream dispatch path from a hostile or buggy publisher.
     ///
     /// Validated:
-    /// - Identifier fields (`target_tier`, optional `target_machine`,
-    ///   `role_id`) match `[a-z0-9_-]{1,MAX_WORK_IDENTIFIER_LEN}`. Rejects
-    ///   path-traversal (`../`), null bytes, command-injection chars,
-    ///   and over-long values.
+    /// - Identifier fields (optional `target_machine`, `role_id`) match
+    ///   `[a-z0-9_-]{1,MAX_WORK_IDENTIFIER_LEN}`. Rejects path-traversal
+    ///   (`../`), null bytes, command-injection chars, and over-long
+    ///   values.
     /// - `message` ≤ `MAX_WORK_MESSAGE_BYTES`. Prevents memory
     ///   exhaustion at deserialize time.
     /// - Optional `workdir` ≤ `MAX_WORK_WORKDIR_BYTES`. The
@@ -160,7 +152,6 @@ impl WorkJob {
     /// (Wave-E.14 #255). A new runtime requires a deliberate variant
     /// add to `Runtime`.
     pub fn validate(&self) -> Result<()> {
-        validate_work_identifier("target_tier", &self.target_tier)?;
         if let Some(m) = &self.target_machine {
             validate_work_identifier("target_machine", m)?;
         }
@@ -205,7 +196,7 @@ impl WorkJob {
 /// Allowlist: `[a-z0-9_-]` (ASCII lowercase + digits + underscore +
 /// hyphen), length 1..=MAX_WORK_IDENTIFIER_LEN. The full `label`
 /// parameter lets callers name the offending field as the operator
-/// thinks of it (`"mission_id"`, `"WorkJob.target_tier"`, etc.) so
+/// thinks of it (`"mission_id"`, `"WorkJob.target_machine"`, etc.) so
 /// errors are operator-actionable rather than internal-shape-leaky.
 pub fn validate_identifier(label: &str, value: &str) -> Result<()> {
     if value.is_empty() {
@@ -246,11 +237,11 @@ pub(crate) struct ClaimedJob {
     pub job: WorkJob,
 }
 
-/// Publish a job onto the per-tier Redis Stream. Returns the
-/// auto-assigned entry ID (the canonical `work_id`).
+/// Publish a job onto the single global Redis Stream (`WORK_STREAM`).
+/// Returns the auto-assigned entry ID (the canonical `work_id`).
 ///
 /// XADD fields:
-/// - `schema`: `WORK_JOB_SCHEMA_VERSION` ("1") — wire-version tag so
+/// - `schema`: `WORK_JOB_SCHEMA_VERSION` ("2") — wire-version tag so
 ///   future schema bumps can be detected by older workers
 /// - `record`: the JSON-serialized WorkJob
 ///
@@ -267,10 +258,9 @@ pub fn publish_job(client: &redis::Client, job: &WorkJob) -> Result<String> {
     let mut conn = client
         .get_connection()
         .context("opening Redis connection to publish work job")?;
-    let stream = work_stream_name(&job.target_tier);
     let payload = serde_json::to_string(job).context("serializing WorkJob")?;
     let mut cmd = redis::cmd("XADD");
-    cmd.arg(&stream)
+    cmd.arg(WORK_STREAM)
         .arg("MAXLEN")
         .arg("~")
         .arg(WORK_STREAM_MAXLEN)
@@ -281,29 +271,33 @@ pub fn publish_job(client: &redis::Client, job: &WorkJob) -> Result<String> {
         .arg(&payload);
     let id: String = cmd
         .query(&mut conn)
-        .with_context(|| format!("XADD to {stream}"))?;
+        .with_context(|| format!("XADD to {WORK_STREAM}"))?;
     Ok(id)
 }
 
 /// Wire-schema version tag carried alongside each job. Bumped when
 /// `WorkJob` shape changes in a way old workers can't safely parse.
+/// Bumped "1" → "2" in #590 (single-stream collapse: `target_tier`
+/// removed from `WorkJob`). `deny_unknown_fields` means a "1"-era worker
+/// and a "2"-era worker are non-interop by design — a clean pre-1.0
+/// wire break.
 #[allow(dead_code)] // PR-C.1 substrate; consumed by PR-C.2 (worker loop) + PR-C.3 (client push)
-pub(crate) const WORK_JOB_SCHEMA_VERSION: &str = "1";
+pub(crate) const WORK_JOB_SCHEMA_VERSION: &str = "2";
 
-/// Ensure the consumer group exists on the per-tier stream. Idempotent —
-/// returns `Ok(())` whether the group was just created OR already
-/// existed. The `MKSTREAM` flag creates the stream itself if missing
-/// (XGROUP CREATE on a non-existent stream would otherwise error).
+/// Ensure the consumer group exists on the single global stream.
+/// Idempotent — returns `Ok(())` whether the group was just created OR
+/// already existed. The `MKSTREAM` flag creates the stream itself if
+/// missing (XGROUP CREATE on a non-existent stream would otherwise
+/// error).
 ///
-/// Call once per daemon-startup per tier. Safe to call repeatedly.
-pub(crate) fn init_consumer_group(client: &redis::Client, tier: &str, group: &str) -> Result<()> {
+/// Call once per daemon-startup. Safe to call repeatedly.
+pub(crate) fn init_consumer_group(client: &redis::Client, group: &str) -> Result<()> {
     let mut conn = client
         .get_connection()
         .context("opening Redis connection to init consumer group")?;
-    let stream = work_stream_name(tier);
     let result: redis::RedisResult<String> = redis::cmd("XGROUP")
         .arg("CREATE")
-        .arg(&stream)
+        .arg(WORK_STREAM)
         .arg(group)
         .arg("$")
         .arg("MKSTREAM")
@@ -318,13 +312,13 @@ pub(crate) fn init_consumer_group(client: &redis::Client, tier: &str, group: &st
             if matches!(e.code(), Some("BUSYGROUP")) {
                 Ok(())
             } else {
-                Err(anyhow!("XGROUP CREATE on {stream}: {e}"))
+                Err(anyhow!("XGROUP CREATE on {WORK_STREAM}: {e}"))
             }
         }
     }
 }
 
-/// Claim the next job from the per-tier stream's consumer group via
+/// Claim the next job from the single global stream's consumer group via
 /// XREADGROUP. Blocks for up to `block_ms` waiting for a new entry;
 /// returns `Ok(None)` on timeout (no work available).
 ///
@@ -337,7 +331,6 @@ pub(crate) fn init_consumer_group(client: &redis::Client, tier: &str, group: &st
 /// (PR-E will consume these).
 pub(crate) fn claim_job(
     client: &redis::Client,
-    tier: &str,
     group: &str,
     consumer: &str,
     block_ms: u64,
@@ -345,7 +338,6 @@ pub(crate) fn claim_job(
     let mut conn = client
         .get_connection()
         .context("opening Redis connection to claim work job")?;
-    let stream = work_stream_name(tier);
 
     // XREADGROUP returns nested arrays: [[stream, [[id, [k, v, k, v]]]]].
     // We parse via `redis::Value` (the dynamic type) rather than a typed
@@ -359,10 +351,10 @@ pub(crate) fn claim_job(
         .arg("BLOCK")
         .arg(block_ms)
         .arg("STREAMS")
-        .arg(&stream)
+        .arg(WORK_STREAM)
         .arg(">")
         .query(&mut conn)
-        .with_context(|| format!("XREADGROUP from {stream}"))?;
+        .with_context(|| format!("XREADGROUP from {WORK_STREAM}"))?;
 
     let Some(value) = raw else { return Ok(None) };
     let claimed = parse_xreadgroup_response(&value)?;
@@ -458,16 +450,15 @@ pub(crate) fn extract_field(fields: &[redis::Value], key: &str) -> Option<String
 /// Worker MUST call this after the dispatch completes, regardless of
 /// dispatch success — the `dispatch.complete` flow record carries the
 /// success/error signal; the ack just releases the queue lease.
-pub(crate) fn ack_job(client: &redis::Client, tier: &str, group: &str, work_id: &str) -> Result<()> {
+pub(crate) fn ack_job(client: &redis::Client, group: &str, work_id: &str) -> Result<()> {
     let mut conn = client
         .get_connection()
         .context("opening Redis connection to ack work job")?;
-    let stream = work_stream_name(tier);
     let _: i64 = redis::cmd("XACK")
-        .arg(&stream)
+        .arg(WORK_STREAM)
         .arg(group)
         .arg(work_id)
         .query(&mut conn)
-        .with_context(|| format!("XACK on {stream}"))?;
+        .with_context(|| format!("XACK on {WORK_STREAM}"))?;
     Ok(())
 }

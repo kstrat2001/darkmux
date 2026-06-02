@@ -392,14 +392,15 @@ enum CrewCmd {
         /// openclaw`** — the internal runtime ignores this flag.
         #[arg(long = "runtime-cmd", value_name = "PATH", default_value = "openclaw")]
         runtime_cmd: String,
-        /// Target machine for the dispatch (#246 PR-C.3). When set to
-        /// an id that's NOT the local `DARKMUX_MACHINE_ID`, the
-        /// dispatch is published to the fleet work queue
-        /// (`darkmux:work:<role-tier>`) and a worker on the named
-        /// machine picks it up. When omitted (today's default), the
-        /// dispatch runs locally. Requires `DARKMUX_REDIS_URL` to be
-        /// set on the dispatching machine + `darkmux serve` running
-        /// with `DARKMUX_MACHINE_TIER` declared on the target.
+        /// Advisory target machine for the dispatch (#246 PR-C.3). When
+        /// set to an id that's NOT the local `DARKMUX_MACHINE_ID`, the
+        /// dispatch is published to the single global fleet work queue
+        /// (`darkmux:work`) and the first available worker picks it up.
+        /// The id is an advisory hint (#590): any worker may claim it;
+        /// a non-target worker logs a soft warning and proceeds. When
+        /// omitted, the dispatch runs locally. Requires
+        /// `DARKMUX_REDIS_URL` set on the dispatching machine +
+        /// `darkmux serve` running on the worker.
         #[arg(long, value_name = "ID")]
         machine: Option<String>,
         /// Return immediately after publishing to the queue instead of
@@ -631,11 +632,11 @@ enum MissionCmd {
     /// CLAUDE.md doctrine that mission planning is judgment-bearing
     /// work the operator owns.
     ///
-    /// Each sprint becomes a WorkJob published to `darkmux:work:<role-tier>`;
-    /// workers on matching-tier machines claim and run them. Default
-    /// `--wait` blocks until all sprints emit `dispatch.complete` (or
-    /// timeout). `--no-wait` returns immediately with the session_ids
-    /// for later polling.
+    /// Each sprint becomes a WorkJob published to the single global
+    /// `darkmux:work` stream (#590); the first available worker claims
+    /// and runs each one. Default `--wait` blocks until all sprints emit
+    /// `dispatch.complete` (or timeout). `--no-wait` returns immediately
+    /// with the session_ids for later polling.
     ///
     /// This is the keystone for Article 4's "operator hands off a
     /// mission and the fleet runs it" narrative.
@@ -643,13 +644,13 @@ enum MissionCmd {
         /// Mission id to dispatch.
         mission_id: String,
         /// Role to dispatch each sprint under (e.g. `coder`,
-        /// `code-reviewer`). The role's manifest tier drives which
-        /// per-tier work stream the jobs publish to.
+        /// `code-reviewer`). One role applies to every dispatched sprint.
         #[arg(long)]
         role: String,
-        /// Optional target machine for every sprint. When omitted, jobs
-        /// publish to the tier stream with no `target_machine` hint —
-        /// any matching-tier worker claims (pull semantics).
+        /// Optional advisory target machine for every sprint. When
+        /// omitted, jobs publish with no `target_machine` hint — the
+        /// first available worker claims each (pull semantics). The hint
+        /// is advisory (#590): any worker may claim regardless.
         #[arg(long, value_name = "ID")]
         machine: Option<String>,
         /// Per-sprint dispatch timeout (seconds). Default 600.
@@ -699,10 +700,6 @@ enum FleetCmd {
         /// Logical machine id (what flow records carry as `machine_id`).
         /// Example: `studio`, `laptop`, `mini-1`.
         id: String,
-        /// Hardware tier: `inference` (heavy-model peer), `hub`
-        /// (always-on infra + utility agents), `client` (UI-only).
-        #[arg(long)]
-        tier: String,
         /// Tailnet address or DNS name to reach the daemon on. Example:
         /// `100.74.208.36`, `100.74.208.36:8765`, `studio.tailnet`. If
         /// no `:port` suffix, port 8765 is assumed.
@@ -1489,21 +1486,14 @@ fn cmd_mission_dispatch(
         );
     }
 
-    // 2. Resolve role tier — same validation as crew dispatch --machine.
+    // 2. Confirm the role exists before fanning out sprints. After #590
+    //    there is no tier requirement — sprints fan onto the single
+    //    global `darkmux:work` stream and the first available worker
+    //    claims each one.
     let roles = load_roles()?;
-    let role = roles
-        .iter()
-        .find(|r| r.id == role_id)
-        .ok_or_else(|| anyhow::anyhow!("role `{role_id}` not found"))?;
-    let role_tier = match role.tier.clone() {
-        Some(t) if !t.trim().is_empty() && t != "any" => t,
-        _ => anyhow::bail!(
-            "role `{role_id}` has no concrete tier declaration. Cross-machine dispatch \
-             requires a tier (\"inference\" or \"hub\"). Add `\"tier\": \"inference\"` \
-             to the role's JSON manifest, or use `darkmux crew dispatch` (single-shot, \
-             local) instead."
-        ),
-    };
+    if !roles.iter().any(|r| r.id == role_id) {
+        anyhow::bail!("role `{role_id}` not found");
+    }
 
     // 3. Filter sprints: this mission + depends_on=[] + status=Planned.
     //    `Running` is NOT included — PR-D.1 filter-level guard. Wave-E.3
@@ -1583,7 +1573,6 @@ fn cmd_mission_dispatch(
             mission_id, sprint.id, dispatch_micros, idx
         );
         let job = fleet::build_work_job(
-            role_tier.clone(),
             machine.map(String::from),
             role_id.to_string(),
             sprint.description.clone(),
@@ -1613,7 +1602,7 @@ fn cmd_mission_dispatch(
     //    list of already-published (sprint_id, session_id, work_id)
     //    triples on stderr so they can dedup / clean up via flow tail.
     eprintln!(
-        "darkmux mission dispatch: mission={mission_id} role={role_id} tier={role_tier} \
+        "darkmux mission dispatch: mission={mission_id} role={role_id} \
          sprints={} target_machine={}",
         jobs.len(),
         machine.unwrap_or("<any>")
@@ -1857,23 +1846,22 @@ fn cmd_fleet(sub: FleetCmd) -> Result<i32> {
     match sub {
         FleetCmd::Add {
             id,
-            tier,
             address,
             description,
-        } => cmd_fleet_add(&id, &tier, &address, description.as_deref()),
+        } => cmd_fleet_add(&id, &address, description.as_deref()),
         FleetCmd::Remove { id } => cmd_fleet_remove(&id),
         FleetCmd::Status { json, deep } => cmd_fleet_status(json, deep),
     }
 }
 
-fn cmd_fleet_add(id: &str, tier: &str, address: &str, description: Option<&str>) -> Result<i32> {
+fn cmd_fleet_add(id: &str, address: &str, description: Option<&str>) -> Result<i32> {
     let was_present = fleet::mutate_roster(|roster| {
         let was_present = roster.machines.contains_key(id);
-        fleet::add_machine(roster, id, tier, address, description)?;
+        fleet::add_machine(roster, id, address, description)?;
         Ok(was_present)
     })?;
     let verb = if was_present { "updated" } else { "added" };
-    println!("fleet: {verb} {id} (tier={tier}, address={address})");
+    println!("fleet: {verb} {id} (address={address})");
     if let Some(d) = description {
         println!("  description: {d}");
     }
@@ -1885,7 +1873,7 @@ fn cmd_fleet_remove(id: &str) -> Result<i32> {
     let removed = fleet::mutate_roster(|roster| Ok(fleet::remove_machine(roster, id)))?;
     match removed {
         Some(entry) => {
-            println!("fleet: removed {id} (tier was {})", entry.tier);
+            println!("fleet: removed {id} (address was {})", entry.address);
             println!("  roster: {}", fleet::roster_path().display());
             Ok(0)
         }
@@ -1932,18 +1920,15 @@ fn cmd_fleet_status(emit_json: bool, deep: bool) -> Result<i32> {
     };
 
     if emit_json {
-        let local_tier = flow::resolve_machine_tier();
         let local_id = flow::resolve_machine_id();
         let payload = serde_json::json!({
             "roster_path": fleet::roster_path().display().to_string(),
             "roster_version": roster.version,
             "local_machine_id": local_id,
-            "local_machine_tier": local_tier,
             "machines": probes
                 .iter()
                 .map(|(m, p)| serde_json::json!({
                     "id": m.id,
-                    "tier": m.tier,
                     "address": m.address,
                     "description": m.description,
                     "added_unix_ms": m.added_unix_ms,
@@ -1968,26 +1953,22 @@ fn cmd_fleet_status(emit_json: bool, deep: bool) -> Result<i32> {
         "  local machine_id: {}",
         flow::resolve_machine_id().unwrap_or_else(|| "<unknown>".into())
     );
-    println!(
-        "  local tier:       {}",
-        flow::resolve_machine_tier().unwrap_or_else(|| "<not declared>".into())
-    );
     println!();
     if probes.is_empty() {
         println!("(no peers in roster — single-machine fleet)");
         println!();
-        println!("Add a peer: darkmux fleet add <id> --tier <inference|hub|client> --address <tailnet-addr>");
+        println!("Add a peer: darkmux fleet add <id> --address <tailnet-addr>");
         return Ok(0);
     }
     if deep {
         println!(
-            "{:<14} {:<10} {:<22} {:<10} {:<11} {:<10} VERSION  MODELS",
-            "MACHINE", "TIER", "ADDRESS", "PROBE", "RAM-FREE", "OS"
+            "{:<14} {:<22} {:<10} {:<11} {:<10} VERSION  MODELS",
+            "MACHINE", "ADDRESS", "PROBE", "RAM-FREE", "OS"
         );
     } else {
         println!(
-            "{:<14} {:<10} {:<26} {:<10} DESCRIPTION",
-            "MACHINE", "TIER", "ADDRESS", "PROBE"
+            "{:<14} {:<26} {:<10} DESCRIPTION",
+            "MACHINE", "ADDRESS", "PROBE"
         );
     }
     for (m, p) in &probes {
@@ -2039,14 +2020,14 @@ fn cmd_fleet_status(emit_json: bool, deep: bool) -> Result<i32> {
                 None => ("specs?".into(), "—".into(), "—".into(), "—".into()),
             };
             println!(
-                "{:<14} {:<10} {:<22} {:<10} {:<11} {:<10} {:<8} {}",
-                m.id, m.tier, m.address, status, ram_free, os_str, version, models_summary
+                "{:<14} {:<22} {:<10} {:<11} {:<10} {:<8} {}",
+                m.id, m.address, status, ram_free, os_str, version, models_summary
             );
         } else {
             let desc = m.description.as_deref().unwrap_or("");
             println!(
-                "{:<14} {:<10} {:<26} {:<10} {}",
-                m.id, m.tier, m.address, status, desc
+                "{:<14} {:<26} {:<10} {}",
+                m.id, m.address, status, desc
             );
         }
         if let Some(err) = &p.error {

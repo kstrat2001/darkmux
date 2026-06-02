@@ -1,26 +1,26 @@
-//! Fleet worker loop — claims jobs off the tier work-stream and dispatches them.
+//! Fleet worker loop — claims jobs off the global work-stream and dispatches them.
 
-use crate::{ack_job, claim_job, init_consumer_group, work_stream_name, ClaimedJob, WorkJob};
+use crate::{ack_job, claim_job, init_consumer_group, ClaimedJob, WorkJob, WORK_STREAM};
 use std::path::PathBuf;
 use std::time::Duration;
 
 // ─── Daemon worker loop (PR-C.2) ──────────────────────────────────────
 //
 // Runs on a dedicated `std::thread` (not a tokio task) inside the
-// `darkmux serve` daemon. Polls `darkmux:work:<own-tier>` via XREADGROUP
-// with a short BLOCK budget; on claim, invokes the existing synchronous
-// `crew::dispatch::dispatch(opts)` and acks on completion. The dispatch
-// path is unchanged — whether work arrives via local CLI invocation OR
-// queue claim, it lands at the same entry point.
+// `darkmux serve` daemon. Polls the single global `darkmux:work` stream
+// (#590) via XREADGROUP with a short BLOCK budget; on claim, invokes the
+// existing synchronous `crew::dispatch::dispatch(opts)` and acks on
+// completion. The dispatch path is unchanged — whether work arrives via
+// local CLI invocation OR queue claim, it lands at the same entry point.
 //
 // **Why a dedicated thread, not a tokio task:** the redis crate (sync)
 // + `crew::dispatch::dispatch` (shells out to docker / openclaw, blocks
 // 5+ minutes) would saturate the tokio executor. The thread runs
 // independently of the axum server's runtime.
 
-/// Consumer group name used by all darkmux workers. Per-tier; combined
-/// with the stream name, every worker for a given tier shares the
-/// group → exactly-one-consumer-per-job delivery.
+/// Consumer group name used by all darkmux workers. Combined with the
+/// single global stream name, every worker shares the group →
+/// exactly-one-consumer-per-job delivery.
 pub(crate) const WORKER_CONSUMER_GROUP: &str = "darkmux-workers";
 
 /// XREADGROUP BLOCK budget per poll. 2 seconds is short enough that
@@ -33,9 +33,9 @@ const WORKER_BLOCK_MS: u64 = 2_000;
 /// can monitor (typically the daemon never joins — the worker runs
 /// for the daemon's lifetime and dies when the process exits).
 ///
-/// Reads three env vars at spawn time:
+/// Reads two env vars at spawn time:
 /// - `DARKMUX_REDIS_URL` — required; absent → worker doesn't start
-/// - `DARKMUX_MACHINE_TIER` — required; absent → worker doesn't start
+///   (Redis presence is the participation gate, #590)
 /// - `DARKMUX_MACHINE_ID` — used as consumer name (per-machine identity)
 ///
 /// When prerequisites are missing, logs to stderr and returns a thread
@@ -65,14 +65,6 @@ fn worker_main() {
         return;
     };
 
-    let Some(tier) = darkmux_flow::resolve_machine_tier() else {
-        eprintln!(
-            "darkmux-worker: DARKMUX_MACHINE_TIER not set — fleet work queue disabled. \
-             Set DARKMUX_MACHINE_TIER=<inference|hub|client> to enable."
-        );
-        return;
-    };
-
     let machine_id = darkmux_flow::resolve_machine_id().unwrap_or_else(|| "unknown".to_string());
 
     let url = darkmux_flow::RawRedisUrl::new(redis_url);
@@ -91,35 +83,27 @@ fn worker_main() {
         }
     };
 
-    if let Err(e) = init_consumer_group(&client, &tier, WORKER_CONSUMER_GROUP) {
+    if let Err(e) = init_consumer_group(&client, WORKER_CONSUMER_GROUP) {
         eprintln!(
-            "darkmux-worker: init_consumer_group on darkmux:work:{tier} failed: {e:#}. \
+            "darkmux-worker: init_consumer_group on {WORK_STREAM} failed: {e:#}. \
              Queue worker disabled."
         );
         return;
     }
 
     eprintln!(
-        "darkmux-worker: started — tier={tier} consumer={machine_id} \
-         stream={} group={}",
-        work_stream_name(&tier),
-        WORKER_CONSUMER_GROUP
+        "darkmux-worker: started — consumer={machine_id} \
+         stream={WORK_STREAM} group={WORKER_CONSUMER_GROUP}"
     );
 
     loop {
-        match claim_job(
-            &client,
-            &tier,
-            WORKER_CONSUMER_GROUP,
-            &machine_id,
-            WORKER_BLOCK_MS,
-        ) {
+        match claim_job(&client, WORKER_CONSUMER_GROUP, &machine_id, WORKER_BLOCK_MS) {
             Ok(None) => {
                 // BLOCK timeout — no work. Loop and re-block.
                 continue;
             }
             Ok(Some(claimed)) => {
-                handle_claimed_job(&client, &tier, claimed);
+                handle_claimed_job(&client, claimed);
             }
             Err(e) => {
                 eprintln!("darkmux-worker: claim_job failed ({e}); backing off 1s");
@@ -133,7 +117,7 @@ fn worker_main() {
 /// the job is acked anyway — the `dispatch.complete` flow record (or
 /// its absence) is the operator-visible signal; the ack just releases
 /// the queue lease.
-fn handle_claimed_job(client: &redis::Client, tier: &str, claimed: ClaimedJob) {
+fn handle_claimed_job(client: &redis::Client, claimed: ClaimedJob) {
     let ClaimedJob { work_id, job } = claimed;
     let session_id = job.session_id.clone();
     let role_id = job.role_id.clone();
@@ -151,7 +135,7 @@ fn handle_claimed_job(client: &redis::Client, tier: &str, claimed: ClaimedJob) {
             "darkmux-worker: REJECTED claimed job {work_id}: {e:#}. \
              Acking to release queue lease; dispatch NOT invoked."
         );
-        let _ = ack_job(client, tier, WORKER_CONSUMER_GROUP, &work_id);
+        let _ = ack_job(client, WORKER_CONSUMER_GROUP, &work_id);
         return;
     }
 
@@ -167,7 +151,7 @@ fn handle_claimed_job(client: &redis::Client, tier: &str, claimed: ClaimedJob) {
                 "darkmux-worker: REJECTED claimed job {work_id}: workdir validation failed: {e:#}. \
                  Acking to release queue lease; dispatch NOT invoked."
             );
-            let _ = ack_job(client, tier, WORKER_CONSUMER_GROUP, &work_id);
+            let _ = ack_job(client, WORKER_CONSUMER_GROUP, &work_id);
             return;
         }
     }
@@ -212,7 +196,7 @@ fn handle_claimed_job(client: &redis::Client, tier: &str, claimed: ClaimedJob) {
         }
     }
 
-    if let Err(e) = ack_job(client, tier, WORKER_CONSUMER_GROUP, &work_id) {
+    if let Err(e) = ack_job(client, WORKER_CONSUMER_GROUP, &work_id) {
         eprintln!("darkmux-worker: XACK failed for {work_id}: {e:#}");
     }
 }

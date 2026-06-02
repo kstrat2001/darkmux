@@ -34,11 +34,6 @@ pub struct MachineEntry {
     /// `"mini-1"`). Unique within a roster.
     pub id: String,
 
-    /// Hardware tier this machine plays: `"inference"` (heavy-model
-    /// peer), `"hub"` (always-on infra), `"client"` (UI-only). Future
-    /// tier names pass through unchanged.
-    pub tier: String,
-
     /// Tailnet address or DNS name to reach the daemon on. Examples:
     /// `"100.74.208.36"`, `"studio.tailnet"`, `"127.0.0.1:8765"`. If no
     /// `:port` suffix is given, `DEFAULT_DAEMON_PORT` (8765) is assumed.
@@ -64,8 +59,18 @@ pub struct MachineEntry {
 /// fleets.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FleetRoster {
-    /// Schema-version tag. `"1"` for now. Bumped if the roster format
-    /// ever changes shape.
+    /// Schema-version tag. `"2"` after #590 dropped `MachineEntry.tier`.
+    /// Bumped if the roster format ever changes shape.
+    ///
+    /// **Advisory, not code-gated.** `load_roster` neither reads nor validates
+    /// this tag, and the roster is operator-owned hand-edited JSON without
+    /// `deny_unknown_fields` — so a legacy `"1"` roster still carrying the
+    /// dropped `tier` field loads cleanly, the stale field is silently
+    /// absorbed, and it's gone on the next `save_roster`. The tag is a
+    /// human-facing format marker, not an enforced compat boundary. (Contrast
+    /// `WorkJob`'s `WORK_JOB_SCHEMA_VERSION`, which IS a hard wire break via
+    /// `deny_unknown_fields` because it's an on-the-wire message from a
+    /// possibly-buggy publisher; the roster is local operator state.) (#590)
     #[serde(default = "default_roster_version")]
     pub version: String,
 
@@ -79,7 +84,7 @@ impl Default for FleetRoster {
     fn default() -> Self {
         // Hand-written so the in-memory default agrees with what a
         // freshly-deserialized `{}` would produce via serde — both
-        // paths see version = "1".
+        // paths see version = "2".
         Self {
             version: default_roster_version(),
             machines: BTreeMap::new(),
@@ -88,7 +93,7 @@ impl Default for FleetRoster {
 }
 
 fn default_roster_version() -> String {
-    "1".to_string()
+    "2".to_string()
 }
 
 /// Resolve the roster file path: `DARKMUX_FLEET_FILE` env override, or
@@ -296,15 +301,11 @@ fn fsync_dir(dir: &std::path::Path) -> Result<()> {
 pub fn add_machine(
     roster: &mut FleetRoster,
     id: &str,
-    tier: &str,
     address: &str,
     description: Option<&str>,
 ) -> Result<()> {
     if id.trim().is_empty() {
         return Err(anyhow!("machine id must be non-empty"));
-    }
-    if tier.trim().is_empty() {
-        return Err(anyhow!("machine tier must be non-empty"));
     }
     if address.trim().is_empty() {
         return Err(anyhow!("machine address must be non-empty"));
@@ -316,7 +317,6 @@ pub fn add_machine(
     let existing_added_at = roster.machines.get(id).map(|m| m.added_unix_ms);
     let entry = MachineEntry {
         id: id.to_string(),
-        tier: tier.to_string(),
         address: address.to_string(),
         description: description.map(String::from),
         added_unix_ms: existing_added_at.unwrap_or(now),
@@ -329,34 +329,6 @@ pub fn add_machine(
 /// caller can confirm what was dropped) or `None` if not present.
 pub fn remove_machine(roster: &mut FleetRoster, id: &str) -> Option<MachineEntry> {
     roster.machines.remove(id)
-}
-
-/// Return the roster entries whose `tier` matches `tier`. Used by the
-/// dispatch routing path (#247) to answer "is the role's tier supported
-/// by the current fleet?" before publishing a WorkJob — without a
-/// matching-tier machine in the fleet the publish would XADD to a
-/// stream no worker is reading.
-#[allow(dead_code)] // consumed by #247 PR-B (dispatch auto-route)
-///
-/// Comparison is exact-match. `"any"` returns every machine (no
-/// filter), matching the WorkJob-validation contract that treats `any`
-/// as the catch-all tier. Empty input returns an empty Vec; never
-/// allocates more than `roster.machines.len()` entries.
-///
-/// The returned `Vec<&MachineEntry>` preserves the roster's iteration
-/// order (BTreeMap-by-id ordering, which is operator-deterministic via
-/// `darkmux fleet add` order of insertion + the alphabetic id sort).
-/// Callers picking "the" machine for a tier use whichever element they
-/// want — for dispatch, today's pattern is publish-to-stream and let
-/// the consumer group claim, so the picker really just needs *some*
-/// match.
-pub(crate) fn candidates_for_tier<'a>(roster: &'a FleetRoster, tier: &str) -> Vec<&'a MachineEntry> {
-    let any_match = tier == "any";
-    roster
-        .machines
-        .values()
-        .filter(|m| any_match || m.tier == tier)
-        .collect()
 }
 
 /// Reachability check via TCP connect to the daemon port. Same

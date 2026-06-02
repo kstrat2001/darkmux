@@ -2,8 +2,8 @@
 //!
 //! The `FlowRecord` shape, its enum fields (`Level`, `Category`, `Tier`,
 //! `Stage`), the per-day file/timestamp helpers, and the env-driven
-//! provenance resolvers (`resolve_machine_id` / `resolve_orchestrator` /
-//! `resolve_machine_tier`). Split out of the crate's sink/record core (#508).
+//! provenance resolvers (`resolve_machine_id` / `resolve_orchestrator`).
+//! Split out of the crate's sink/record core (#508).
 
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
@@ -46,6 +46,11 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.9.0";
 //           Pre-1.9.0 AuditFileSink hash-chains cannot be re-verified after this
 //           canonical-form change — rotate to a fresh chain (no-compat-baggage;
 //           small known audience). `work_id`/`attempt` are unchanged.
+//   (code-internal, no FLOW_SCHEMA_VERSION bump) — removed the orphaned
+//           `resolve_machine_tier()` resolver. The `machine_tier` FlowRecord
+//           field was already removed in 1.9.0; the resolver lingered with no
+//           consumers after the fleet single-stream collapse retired tier
+//           routing (#590). No on-the-wire shape change. (#590)
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -183,10 +188,10 @@ pub struct FlowRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payload: Option<serde_json::Value>,
     /// Work-queue claim id when this record was produced by a job that
-    /// flowed through `darkmux:work:<tier>`. Absent on direct local
-    /// dispatches (the operator ran `darkmux crew dispatch <role>` on the
-    /// local machine and tier matched). Populated by the dispatch path
-    /// when it claims work from the queue. Schema 1.8 addition (#246).
+    /// flowed through the global `darkmux:work` stream. Absent on direct
+    /// local dispatches (the operator ran `darkmux crew dispatch <role>`
+    /// with no `--machine`). Populated by the dispatch path when it claims
+    /// work from the queue. Schema 1.8 addition (#246).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub work_id: Option<String>,
     /// Retry counter for queued work — 1 on first attempt, 2+ on retries
@@ -305,26 +310,6 @@ pub fn resolve_machine_id() -> Option<String> {
 /// surfaces a warn so the operator knows the field exists.
 pub fn resolve_orchestrator() -> Option<String> {
     std::env::var("DARKMUX_ORCHESTRATOR")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
-/// Resolve the machine's hardware-tier declaration for new flow records.
-///
-/// **Operator-explicit by design** — same posture as `DARKMUX_ORCHESTRATOR`:
-/// there's no reliable way to auto-detect whether a machine should serve
-/// as an inference peer, hub, or client from inside darkmux. The operator
-/// declares it via `DARKMUX_MACHINE_TIER`; absent declaration, records
-/// carry no `machine_tier` field and tier-aware routing bails loud at the
-/// dispatch path rather than silently substituting. (#246)
-///
-/// Valid values are `"inference"`, `"hub"`, `"client"`. Other values are
-/// passed through unchanged (forward-compat with future tier names); the
-/// dispatch path validates membership at the moment a routing decision
-/// would consume the value.
-pub fn resolve_machine_tier() -> Option<String> {
-    std::env::var("DARKMUX_MACHINE_TIER")
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())

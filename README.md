@@ -56,16 +56,16 @@ See [DESIGN.md → "Relationship to openclaw"](DESIGN.md#relationship-to-opencla
 
 ## Many machines become one
 
-If you have more than one Mac, darkmux makes them work as a single development environment. Operator names a role; darkmux figures out which machine runs it. Open the topology viewer from any node — you see the whole fleet. Open the fleet status from any node — you see specs, RAM, loaded models per machine.
+If you have more than one Mac, darkmux makes them work as a single development environment. Operator hands off a role; the first available worker runs it. Open the topology viewer from any node — you see the whole fleet. Open the fleet status from any node — you see specs, RAM, loaded models per machine.
 
 Concretely, the capabilities the multi-machine substrate ships today:
 
-- **Tier-aware dispatch routing.** Declare each machine's tier (`inference` / `hub` / `client`) once in `DARKMUX_MACHINE_TIER`. Tag each role's manifest with the tier it belongs on. `darkmux crew dispatch coder` from a hub-tier machine auto-routes to an inference-tier peer; consumer-group claim decides which one (#247).
+- **Single-stream fleet dispatch.** Every dispatch routes onto one global work stream (`darkmux:work`); the first available worker claims any job — no tier configuration to maintain. `darkmux crew dispatch coder --machine <id>` is an *advisory* hint when you want a specific machine; any worker may still claim it. Capability-based auto-routing (match work to the machine best suited to run it) is the planned successor, building on the [#590](https://github.com/kstrat2001/darkmux/issues/590) capability layer.
 - **Fleet status with specs.** `darkmux fleet status --deep` fans out across every reachable peer's `/machine/specs` endpoint — RAM-free, loaded models, OS, darkmux version, redacted Redis URL — in one table (#275).
 - **Decentralized flow UI.** The topology viewer at `docs/topology/index.html` aggregates events from every machine writing to the shared `darkmux:flow` Redis stream. Open it on any peer running the daemon and see the fleet, not just the host machine (#270).
 - **`/darkmux-add-machine` skill.** Walkthrough for joining a new Mac to an existing fleet — env vars, roster setup, smoke test. Run `darkmux init` to install all skills locally (#176).
 
-Deployment shape that this assumes: a couple of Macs on a tailnet you control (Tailscale, ZeroTier, WireGuard — your call), with Redis running on the always-on member (typically `hub` tier). Redis is optional; without it, single-machine usage works fine and `LocalFileSink` captures provenance on disk per-machine.
+Deployment shape that this assumes: a couple of Macs on a tailnet you control (Tailscale, ZeroTier, WireGuard — your call), with Redis running on the always-on member. Redis is optional; without it, single-machine usage works fine and `LocalFileSink` captures provenance on disk per-machine.
 
 If your hub machine drops off the network, the substrate degrades gracefully — flow writes fall back to `LocalFileSink`, dispatch bails loud with operator-actionable hints, `darkmux doctor` surfaces the degraded state, and the SSE Redis tail exits cleanly after a bounded number of failures rather than leaking spawned tasks. The verification discipline that matters here is "make sure your hub is hardened for the absences you plan" — `pmset` config + Tailscale "Run at login" + auto-login user. macOS defaults assume "laptop closed = sleep"; they're wrong for a 24/7 hub.
 
@@ -350,7 +350,7 @@ The case for darkmux: **once you accept that static configs leave performance on
 **On the roadmap (active):**
 
 - 🚧 Topology view in the web viewer (live + replay diagram of fleet activity; #169)
-- 🚧 Fleet primitives (`darkmux fleet add/status/route`) and cross-machine coordination (Phase 5 of #162)
+- 🚧 Fleet primitives (`darkmux fleet add/status`) and cross-machine coordination (Phase 5 of #162)
 - 🚧 Event-sourced mission state (Phase 8 of #162)
 - 🚧 Sibling bootstrap skills: `/darkmux-add-machine` (#176), `/darkmux-enable-audit` (#177), `/darkmux-enable-redis` (#178)
 - 🚧 Audit log management: `flow export`, `flow archive`, OS-level append-only flags for audit files

@@ -74,11 +74,12 @@ fn second_mission_dispatch_finds_nothing_to_fan_out() {
         return;
     }
 
-    // Roles need a concrete tier for mission dispatch to publish.
-    // The harness's openclaw config stub has no roles; we need one role
-    // with tier="inference" so the test reaches the publish + sprint_start
-    // path (vs. bailing at role-not-found).
-    let harness = FleetHarness::boot(vec![NodeSpec::inference("node-a")])
+    // The harness's openclaw config stub has no roles. Post-#590, mission
+    // dispatch only checks the role EXISTS before fanning sprints onto the
+    // single `darkmux:work` stream (no tier requirement), so we register one
+    // role to reach the publish + sprint_start path (vs. bailing at
+    // role-not-found).
+    let harness = FleetHarness::boot(vec![NodeSpec::new("node-a")])
         .expect("FleetHarness::boot");
     let node = harness.node("node-a").unwrap();
 

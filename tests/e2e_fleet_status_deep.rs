@@ -34,7 +34,6 @@ fn populate_roster_via_cli(viewer: &e2e::harness::FleetNode, peers: &[&e2e::harn
             .cmd()
             .args([
                 "fleet", "add", &peer.machine_id,
-                "--tier", &peer.tier,
                 "--address", &format!("127.0.0.1:{}", peer.daemon_port),
             ])
             .output()
@@ -57,8 +56,8 @@ fn fleet_status_deep_aggregates_specs_from_reachable_peers() {
     }
 
     let harness = FleetHarness::boot(vec![
-        NodeSpec::inference("node-a"),
-        NodeSpec::hub("node-b"),
+        NodeSpec::new("node-a"),
+        NodeSpec::new("node-b"),
     ])
     .expect("FleetHarness::boot");
 
@@ -111,7 +110,7 @@ fn fleet_status_deep_degrades_gracefully_for_unreachable_peers() {
         return;
     }
 
-    let harness = FleetHarness::boot(vec![NodeSpec::inference("node-a")])
+    let harness = FleetHarness::boot(vec![NodeSpec::new("node-a")])
         .expect("FleetHarness::boot");
     let node_a = harness.node("node-a").expect("node-a");
 
@@ -122,7 +121,6 @@ fn fleet_status_deep_degrades_gracefully_for_unreachable_peers() {
         .cmd()
         .args([
             "fleet", "add", "ghost-machine",
-            "--tier", "inference",
             "--address", "127.0.0.1:1",
         ])
         .output()
@@ -164,7 +162,7 @@ fn fleet_status_default_unchanged_without_deep_flag() {
         return;
     }
 
-    let harness = FleetHarness::boot(vec![NodeSpec::inference("node-a")])
+    let harness = FleetHarness::boot(vec![NodeSpec::new("node-a")])
         .expect("FleetHarness::boot");
     let node_a = harness.node("node-a").expect("node-a");
     populate_roster_via_cli(node_a, &[node_a]);

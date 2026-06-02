@@ -36,8 +36,8 @@
     <h2>The big picture</h2>
     <p>darkmux's multi-machine substrate has three layers:</p>
     <ul>
-      <li><strong>Identity</strong> — each machine declares its <em>tier</em> (<code>inference</code>, <code>hub</code>, or <code>client</code>) and a logical fleet name (<code>DARKMUX_MACHINE_ID</code>). Per-tier separation matters: dispatch routing uses it to send work to the right hardware class.</li>
-      <li><strong>Coordination</strong> — a Redis instance running on the always-on member (typically the <code>hub</code>-tier machine). Two stream classes: <code>darkmux:work:&lt;tier&gt;</code> for the work queue (publishers <code>XADD</code>; workers claim via consumer groups) and <code>darkmux:flow</code> for the fleet-wide event log (every machine writes; any daemon's <code>/flow</code> endpoint reads).</li>
+      <li><strong>Identity</strong> — each machine declares a logical fleet name (<code>DARKMUX_MACHINE_ID</code>). That name is what flow records carry as <code>machine_id</code> and what <code>--machine</code> hints reference.</li>
+      <li><strong>Coordination</strong> — a Redis instance running on the always-on member. Two stream classes: <code>darkmux:work</code> — one global work queue (publishers <code>XADD</code>; the first available worker claims via a shared consumer group) — and <code>darkmux:flow</code> for the fleet-wide event log (every machine writes; any daemon's <code>/flow</code> endpoint reads).</li>
       <li><strong>Observability</strong> — the topology viewer at <a href="../topology/">darkmux.com/topology/</a> aggregates events from every machine writing to the shared stream. The <code>darkmux fleet status --deep</code> CLI does the same for per-machine specs (RAM-free, loaded models, version).</li>
     </ul>
     <p>Redis is <strong>optional</strong>. Without it, single-machine usage works exactly as before; flow records still land on disk per-machine via <code>LocalFileSink</code>. With it, the fleet members start seeing each other.</p>
@@ -78,17 +78,15 @@ pmset -g
 brew services start redis</code></pre>
     <p>Decide on a Redis URL — typically <code>redis://default:&lt;password&gt;@&lt;tailnet-addr&gt;:6379</code> where <code>&lt;tailnet-addr&gt;</code> is the hub's Tailscale IP or Magic DNS name. Set a password (<code>requirepass</code> in <code>redis.conf</code>) even on a trusted tailnet — defense-in-depth is cheap.</p>
     <p>Then in the hub's shell rc (<code>~/.zshrc</code>):</p>
-    <pre><code><span class="comment"># darkmux fleet membership — hub tier</span>
+    <pre><code><span class="comment"># darkmux fleet membership — always-on hub member</span>
 export DARKMUX_MACHINE_ID=studio        <span class="comment"># operator-named, not hostname</span>
-export DARKMUX_MACHINE_TIER=hub
 export DARKMUX_REDIS_URL=redis://default:&lt;password&gt;@&lt;hub-tailnet-addr&gt;:6379
 export DARKMUX_ORCHESTRATOR=claude-opus-4-7   <span class="comment"># or whichever frontier you use</span></code></pre>
-    <p>Reload your shell and verify with <code>darkmux doctor</code> — <code>machine-tier</code>, <code>machine_id</code>, and <code>flow sink health</code> should all read <code>✓</code>.</p>
+    <p>Reload your shell and verify with <code>darkmux doctor</code> — <code>machine_id</code> and <code>flow sink health</code> should both read <code>✓</code>.</p>
 
-    <h3>On each inference / client peer</h3>
-    <p>Same shape, different tier + id:</p>
+    <h3>On each peer</h3>
+    <p>Same shape, different id:</p>
     <pre><code>export DARKMUX_MACHINE_ID=laptop
-export DARKMUX_MACHINE_TIER=inference
 export DARKMUX_REDIS_URL=redis://default:&lt;password&gt;@&lt;hub-tailnet-addr&gt;:6379
 export DARKMUX_ORCHESTRATOR=claude-opus-4-7</code></pre>
     <p>Same Redis URL on every peer — that's how they coordinate. Same orchestrator string per session (lets you trace which frontier drove which dispatch in flow records).</p>
@@ -97,11 +95,11 @@ export DARKMUX_ORCHESTRATOR=claude-opus-4-7</code></pre>
     <h3>Add peers to each machine's roster</h3>
     <p>Each machine has its own <code>~/.darkmux/fleet.json</code> roster — the list of machines IT knows about. Today this is per-machine hand-maintained (cross-machine state replication tracked in <a href="https://github.com/kstrat2001/darkmux/issues/280">#280</a>).</p>
     <p>From the hub, register every peer:</p>
-    <pre><code>darkmux fleet add laptop --tier inference --address &lt;laptop-tailnet-addr&gt;:8765
-darkmux fleet add ipad-pi --tier client    --address &lt;ipad-tailnet-addr&gt;:8765</code></pre>
+    <pre><code>darkmux fleet add laptop --address &lt;laptop-tailnet-addr&gt;:8765
+darkmux fleet add ipad-pi --address &lt;ipad-tailnet-addr&gt;:8765</code></pre>
     <p>From each peer, register the hub + any peers it should know about:</p>
-    <pre><code>darkmux fleet add studio --tier hub      --address &lt;hub-tailnet-addr&gt;:8765
-darkmux fleet add laptop --tier inference --address 127.0.0.1:8765   <span class="comment"># self</span></code></pre>
+    <pre><code>darkmux fleet add studio --address &lt;hub-tailnet-addr&gt;:8765
+darkmux fleet add laptop --address 127.0.0.1:8765   <span class="comment"># self</span></code></pre>
     <p>Verify with <code>darkmux fleet status</code> on each machine — reachability probes confirm the addresses resolve and the daemon ports are open.</p>
   </div>
 </section>
@@ -112,7 +110,7 @@ darkmux fleet add laptop --tier inference --address 127.0.0.1:8765   <span class
     <p>Once the initial fleet is up, joining the next Mac is a 10-step walkthrough that lives in the <code>/darkmux-add-machine</code> Claude Code skill:</p>
     <pre><code><span class="comment"># From your frontier orchestrator (Claude Code, etc.):</span>
 /darkmux-add-machine</code></pre>
-    <p>The skill reads your existing fleet state, asks the operator a handful of questions (which tier, what id, which Redis URL), and proposes the configuration. It then waits for you to apply each step and verifies the outcome before continuing. Read+propose throughout — every state-mutating command runs at your hand, not the skill's.</p>
+    <p>The skill reads your existing fleet state, asks the operator a handful of questions (what id, which Redis URL), and proposes the configuration. It then waits for you to apply each step and verifies the outcome before continuing. Read+propose throughout — every state-mutating command runs at your hand, not the skill's.</p>
     <p>If you don't use a Claude Code orchestrator: the steps are mechanical and the same as the "Set up the fleet" section above. The skill is a convenience, not a requirement.</p>
   </div>
 </section>
@@ -121,34 +119,20 @@ darkmux fleet add laptop --tier inference --address 127.0.0.1:8765   <span class
   <div class="wrap">
     <h2>Use the fleet</h2>
 
-    <h3>Dispatch a role and let darkmux pick the machine</h3>
-    <p>This is the big payoff. Each role's manifest declares its tier:</p>
-    <pre><code><span class="comment"># ~/.darkmux/roles/coder.json</span>
-{
-  "id": "coder",
-  "tier": "inference",
-  "description": "...",
-  "tool_palette": { ... }
-}</code></pre>
+    <h3>Dispatch a role across the fleet</h3>
     <p>From any machine in the fleet:</p>
     <pre><code>darkmux crew dispatch coder --message "implement the X feature"</code></pre>
-    <p>If you're on a machine whose tier matches the role's tier, dispatch runs locally. If not, darkmux auto-routes to a fleet peer in the matching tier — publishes the work to <code>darkmux:work:&lt;role.tier&gt;</code> and lets a peer's consumer group claim it. The banner makes the decision visible:</p>
-    <pre><code>darkmux crew dispatch: auto-routing role=`coder` via tier=`inference`
- (local tier=`hub`, no --machine — consumer group claims).</code></pre>
-    <p>If no fleet peer matches the role's tier, the command bails with an operator-actionable hint:</p>
-    <pre><code>Error: role `coder` requires tier=`inference` but no fleet peer is in
-that tier (local tier=`hub`). Either: (a) add a peer with
-`darkmux fleet add &lt;id&gt; --tier inference --address &lt;addr&gt;`, or (b)
-edit the role manifest to declare `tier: "hub"` if this work belongs
-on the local machine.</code></pre>
-    <p>Override with <code>--machine &lt;id&gt;</code> when you want to pin a specific peer (operator-sovereignty: the default is the suggestion; you can always override).</p>
+    <p>With no <code>--machine</code>, the dispatch runs locally. To hand the work to the fleet queue instead, name a target machine:</p>
+    <pre><code>darkmux crew dispatch coder --machine laptop --message "implement the X feature"</code></pre>
+    <p>This publishes the work to the single global <code>darkmux:work</code> stream; the first available worker claims it. The <code>--machine</code> id is an <strong>advisory hint</strong> (<a href="https://github.com/kstrat2001/darkmux/issues/590">#590</a>): any worker may claim the job, and a non-target worker logs a soft warning and proceeds (no requeue). Requires <code>DARKMUX_REDIS_URL</code> set on the dispatching machine and <code>darkmux serve</code> running on the worker.</p>
+    <p>Capability-based auto-routing — match work to the machine best suited to run it, without naming a target — is the planned successor (<a href="https://github.com/kstrat2001/darkmux/issues/590">#590</a>).</p>
 
     <h3>See what's on every machine — <code>fleet status --deep</code></h3>
     <pre><code>darkmux fleet status --deep</code></pre>
     <p>Fans out across every reachable peer's <code>/machine/specs</code> endpoint and renders a table:</p>
-    <pre><code>MACHINE        TIER       ADDRESS                PROBE      RAM-FREE    OS              VERSION  MODELS
-laptop         inference  100.64.1.5:8765        ✓ 23ms     78 GB       macos aarch64   0.4.0    darkmux:qwen3.6-35b-a3b-mlx
-studio         hub        100.64.2.1:8765        ✓ 45ms     12 GB       macos aarch64   0.4.0    darkmux:qwen3-4b-instruct</code></pre>
+    <pre><code>MACHINE        ADDRESS                PROBE      RAM-FREE    OS              VERSION  MODELS
+laptop         100.64.1.5:8765        ✓ 23ms     78 GB       macos aarch64   0.4.0    darkmux:qwen3.6-35b-a3b-mlx
+studio         100.64.2.1:8765        ✓ 45ms     12 GB       macos aarch64   0.4.0    darkmux:qwen3-4b-instruct</code></pre>
     <p>Bounded at 1s per peer; degraded peers render with <code>specs?</code> in the RAM-FREE column rather than failing the whole command. This is the "what's actually going on right now?" view across your fleet — the answer to "is the laptop's RAM full?" or "did the studio reboot and lose the model I had loaded?"</p>
 
     <h3>Watch fleet activity from any machine — topology viewer</h3>
@@ -177,7 +161,7 @@ studio         hub        100.64.2.1:8765        ✓ 45ms     12 GB       macos 
     <p>The SSE channel between the daemon's Redis-tail task and the SSE stream is bounded at <code>SSE_MPSC_CAPACITY</code> (256 records, ~256 KB worst-case per stream). When the consumer falls behind, the daemon drops the newest records and logs the drop with a running total. Operator-visible: viewer might miss a few recent events; reconnect or refresh to recover.</p>
 
     <h3>"Why didn't my dispatch land where I expected?"</h3>
-    <p>Every routing decision emits a <code>dispatch route</code> flow record. Tail the flow stream or open the topology viewer; filter for <code>action: dispatch route</code>. The record's payload shows <code>role_tier</code>, <code>local_tier</code>, <code>target_machine</code>, and <code>decision</code> (<code>auto-route</code> or <code>pinned</code>) — the substrate's reasoning is in the audit chain, not hidden.</p>
+    <p>A <code>--machine</code> dispatch emits a <code>dispatch route</code> flow record. Tail the flow stream or open the topology viewer; filter for <code>action: dispatch route</code>. The record's payload shows <code>target_machine</code> and <code>decision</code> (<code>pinned</code> for <code>--machine</code>, or <code>local</code> for a local fall-through) — the substrate's reasoning is in the audit chain, not hidden.</p>
 
     <h3>Two operators on the same machine</h3>
     <p>Out of scope. <code>DARKMUX_MACHINE_ID</code> is per-machine, not per-user. If you ever need per-user provenance on a shared Mac, darkmux has outgrown its target — fork it.</p>

@@ -39,7 +39,7 @@ fn crew_dispatch_rejects_symlink_workdir() {
         return;
     }
 
-    let harness = FleetHarness::boot(vec![NodeSpec::inference("node-a")])
+    let harness = FleetHarness::boot(vec![NodeSpec::new("node-a")])
         .expect("FleetHarness::boot");
 
     // Build a fixture: a real directory + a symlink pointing at it.

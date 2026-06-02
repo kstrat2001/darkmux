@@ -147,8 +147,9 @@ indexed and queryable.
 
 **Crews are not dynamically composed per mission today.** A mission has no
 `crew_id` field; `darkmux mission dispatch` takes an explicit `role` and fans the
-mission's ready sprints out under that role's tier (`src/main.rs:1443-1450`). The
-operator names the role per dispatch; dynamic per-mission crew assembly is
+mission's ready sprints out onto the single global work stream, where the first
+available worker claims each one (#590). The operator names the role per
+dispatch; dynamic per-mission crew assembly is
 [planned](#8-planned--not-yet-shipped), not shipped.
 
 ### Sprint
@@ -192,7 +193,7 @@ All of the following are **shipped**:
 | `darkmux mission propose` | Reads unstructured intent → dispatches the **mission-compiler** utility role → renders a Mission + Sprints proposal → **mandatory operator approve/edit/reject/regenerate gate** → persists only on approval (atomic rollback on partial write). | `src/mission_propose.rs`; `src/main.rs:542-577` |
 | `darkmux sprint estimate` | Reads a `WorkloadSpec` → deterministic per-turn token math → recommends the smallest adequate profile → optional 4B narration. | `src/sprint_cli.rs:233-310, 500-514`; `src/main.rs:459-471` |
 | `darkmux sprint review` | Auto-detects base branch → computes the git diff → dispatches the **code-reviewer** role → parses the `QA-REVIEW-SIGNOFF` block (`BLOCK`/`FLAG`/`NIT`) → emits a verdict (`clean` / `flags-only` / `blockers`, or `indeterminate` when the reviewer output doesn't match the expected format). | `src/sprint_cli.rs:683-970`; `src/main.rs:472-485` |
-| `darkmux mission dispatch` | Loads a mission, validates status, resolves the role tier, fans out its ready sprints (`depends_on == []`) as work jobs onto the fleet work queue (`darkmux:work:<tier>`); waits or returns session ids. | `src/main.rs:642-662`, `1453-1721` |
+| `darkmux mission dispatch` | Loads a mission, validates status, confirms the role exists, fans out its ready sprints (`depends_on == []`) as work jobs onto the single global fleet work queue (`darkmux:work`); waits or returns session ids. | `src/main.rs:642-662`, `1453-1721` |
 | `darkmux crew dispatch <role>` | Single-turn dispatch to a named role through the internal runtime (default) or `--runtime openclaw`. | see `CLAUDE.md` → operator-facing commands |
 
 The **operator-approval gate on `mission propose`** is the sovereignty contract
@@ -310,8 +311,9 @@ integrated GPU + one shared-memory RAM budget + one inference endpoint
 splitting GPUs within one.
 
 **"node" is a synonym for "machine."** darkmux has no separate node concept — the
-only fleet unit is `MachineEntry` (a logical `id` + a Tailnet `address` + a
-tier). If "node" shows up in discussion, read it as "machine." The distinction
+only fleet unit is `MachineEntry` (a logical `id` + a Tailnet `address`; the
+machine-capacity tier field was dropped in #590). If "node" shows up in
+discussion, read it as "machine." The distinction
 that *would* earn its own word is a single machine hosting **more than one
 inference endpoint** (a CUDA eGPU tier, or several LMStudio instances on
 different ports) — out of scope today; darkmux models a machine as one endpoint,
