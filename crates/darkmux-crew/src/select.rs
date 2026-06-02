@@ -150,7 +150,6 @@ mod tests {
             tool_palette: ToolPalette::default(),
             escalation_contract: EscalationContract::BailWithExplanation,
             prompt_path: None,
-            tier: None,
             bail_after_compactions: None,
             escalation_posture: None,
             role_family: None,

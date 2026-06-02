@@ -80,17 +80,6 @@ pub struct Role {
     /// does NOT read the prompt content — just stores the resolvable path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_path: Option<PathBuf>,
-    /// Hardware-tier requirement for the work this role does. One of
-    /// `"inference"` (heavy-model peer; needs GPU + memory headroom for
-    /// 35B+ specialists), `"hub"` (always-on infrastructure tier; suited
-    /// to 4B utility agents), or `"any"` (no preference; routes to whatever
-    /// machine is available). Absent in older manifests; the loader
-    /// treats absence as `"any"`. Consumed by tier-aware dispatch
-    /// routing (#246 / #247). Schema-compatible with existing role
-    /// manifests — operator-edited roles without `tier` continue to work
-    /// against single-machine fleets unchanged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tier: Option<String>,
     /// (#377) Per-role escalation bound — overrides
     /// `profile.runtime.compaction.reserve.bail_after_compactions`
     /// when set. Sprint-shaped roles (coder, reviewer) typically pin
@@ -339,7 +328,6 @@ mod tests {
             tool_palette: ToolPalette::default(),
             escalation_contract: EscalationContract::BailWithExplanation,
             prompt_path: None,
-            tier: None,
             bail_after_compactions: None,
             escalation_posture: None,
             role_family: None,

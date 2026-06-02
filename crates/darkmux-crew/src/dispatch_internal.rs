@@ -1785,7 +1785,6 @@ mod tests {
             tool_palette: ToolPalette::default(),
             escalation_contract: EscalationContract::BailWithExplanation,
             prompt_path: None,
-            tier: None,
             bail_after_compactions: Some(2), // role pin
             escalation_posture: None,
             role_family: None,
@@ -1815,7 +1814,6 @@ mod tests {
             tool_palette: ToolPalette::default(),
             escalation_contract: EscalationContract::BailWithExplanation,
             prompt_path: None,
-            tier: None,
             bail_after_compactions: None, // role didn't pin
             escalation_posture: None,
             role_family: None,
