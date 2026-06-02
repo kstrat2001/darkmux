@@ -34,7 +34,7 @@ fn mission_dispatch_rejects_path_traversal_mission_id() {
         return;
     }
 
-    let harness = FleetHarness::boot(vec![NodeSpec::inference("node-a")])
+    let harness = FleetHarness::boot(vec![NodeSpec::new("node-a")])
         .expect("FleetHarness::boot");
     let node = harness.node("node-a").unwrap();
 
@@ -70,7 +70,7 @@ fn mission_dispatch_rejects_special_chars_in_mission_id() {
         return;
     }
 
-    let harness = FleetHarness::boot(vec![NodeSpec::inference("node-a")])
+    let harness = FleetHarness::boot(vec![NodeSpec::new("node-a")])
         .expect("FleetHarness::boot");
     let node = harness.node("node-a").unwrap();
 

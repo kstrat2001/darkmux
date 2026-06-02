@@ -47,7 +47,6 @@ fn parallel_fleet_adds_keep_every_entry() {
             std::process::Command::new(&bin)
                 .args([
                     "fleet", "add", &id,
-                    "--tier", "inference",
                     "--address", &format!("127.0.0.1:{}", 10000 + i),
                 ])
                 .env("HOME", &home)

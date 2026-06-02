@@ -298,15 +298,14 @@ pub struct DispatchOpts {
     pub runtime_cmd: String,
     /// Target machine for the dispatch (#246 PR-C.3). When `Some(<id>)`
     /// and `<id>` differs from the local `DARKMUX_MACHINE_ID`, the
-    /// dispatch is published to `darkmux:work:<role-tier>` via
-    /// `fleet::publish_job` instead of running locally; a worker on
-    /// the target machine picks it up. When `None`, the dispatch runs
-    /// locally (today's behavior; preserved for backward compat).
-    ///
-    /// PR-D will add implicit tier-aware routing (no `--machine` flag
-    /// required); this field is the operator-explicit override that
-    /// will continue to win over implicit routing per
-    /// operator-sovereignty doctrine.
+    /// dispatch is published to the single global `darkmux:work` stream
+    /// via `fleet::publish_job` instead of running locally; the first
+    /// available worker picks it up. The id is an **advisory hint**
+    /// (#590): any worker may claim the job; a non-target worker logs a
+    /// soft warning and proceeds (no NACK/requeue). When `None`, the
+    /// dispatch runs locally — there is no implicit tier auto-route
+    /// (retired in #590; capability-based auto-routing is the #590
+    /// successor work).
     pub machine: Option<String>,
     /// Whether to block on completion when the dispatch routes to a
     /// remote machine (#246 PR-C.3). `true` — the default for
@@ -1276,41 +1275,6 @@ pub enum RoutingDecision {
     Remote { target: String, local_unknown: bool },
 }
 
-/// Look up the role's tier for stamping into a `dispatch route`
-/// record's payload + validating it's acceptable for cross-machine
-/// dispatch (#290). Returns the concrete tier on success. Returns
-/// `Err` on:
-/// - role manifest not found / unreadable / unparseable (B1)
-/// - role.tier is `None`, empty, or `"any"` — cross-machine
-///   dispatch needs a concrete tier; bailing here means the
-///   record never lands in the audit chain claiming a "pinned"
-///   decision for a role the substrate would then reject (B2)
-///
-/// Bailing BEFORE the record emit keeps the audit substrate honest:
-/// every persisted `dispatch route` record corresponds to a routing
-/// decision the substrate actually accepted.
-pub fn resolve_role_tier_for_record(opts: &DispatchOpts) -> Result<String> {
-    let role = load_role_or_bail(&opts.role_id)?;
-    match role.tier.as_deref().map(str::trim) {
-        Some(t) if !t.is_empty() && t != "any" => Ok(t.to_string()),
-        Some(t) => bail!(
-            "role `{}` has tier={t:?} which is invalid for cross-machine \
-             dispatch (workers register on inference/hub/client streams). \
-             Either edit the role manifest to declare a concrete tier, or \
-             omit --machine to dispatch locally.",
-            opts.role_id,
-        ),
-        None => bail!(
-            "role `{}` has no tier declaration in its manifest. \
-             Cross-machine dispatch requires the role to declare which \
-             machine class it runs on. Either add \"tier\": \"inference\" \
-             (or \"hub\") to the role's JSON manifest, or omit --machine \
-             to dispatch locally.",
-            opts.role_id,
-        ),
-    }
-}
-
 /// Emit a `dispatch route` flow record at the moment the routing
 /// decision is made and return the resolved session_id so the caller
 /// can re-attach it to `opts.session_id`. This ensures the route
@@ -1318,23 +1282,18 @@ pub fn resolve_role_tier_for_record(opts: &DispatchOpts) -> Result<String> {
 /// start` / `dispatch complete` records — the topology UI's pair-
 /// rendering depends on session_id continuity.
 ///
-/// Called from BOTH the auto-route path (`target_machine: None`,
-/// `decision: "auto-route"`) AND the explicit-`--machine` path
-/// (`target_machine: Some(id)`, `decision: "pinned"`) — #290 closed
-/// the gap where #285 PR-C only emitted on the auto-route arm,
-/// leaving operator-pinned routing decisions unrecorded in the audit
-/// trail.
+/// After #590 the only routed path is explicit `--machine`
+/// (`target_machine: Some(id)`, `decision: "pinned"`); the tier
+/// auto-route arm was retired, so `decision: "auto"` no longer occurs.
 pub fn emit_route_record_and_resolve_session(
     opts: &DispatchOpts,
-    role_tier: &str,
     target_machine: Option<&str>,
 ) -> String {
-    let local_tier = darkmux_flow::resolve_machine_tier();
     let session_id = opts
         .session_id
         .clone()
         .unwrap_or_else(|| fresh_session_id(&opts.role_id));
-    let payload = build_route_payload(role_tier, local_tier.as_deref(), target_machine);
+    let payload = build_route_payload(target_machine);
     let _ = darkmux_flow::record(build_dispatch_record_with_payload(
         darkmux_flow::Level::Info,
         "dispatch route",
@@ -1347,25 +1306,24 @@ pub fn emit_route_record_and_resolve_session(
 }
 
 /// Construct the payload for a `dispatch route` flow record (#247
-/// PR-C). Pure; testable in isolation. `target_machine: Some(id)`
-/// signals an operator-pinned explicit-machine dispatch; `None` is
-/// the auto-route case (consumer group claims).
-fn build_route_payload(
-    role_tier: &str,
-    local_tier: Option<&str>,
-    target_machine: Option<&str>,
-) -> serde_json::Value {
+/// PR-C). Pure; testable in isolation. After #590 the payload carries
+/// the advisory `target_machine` hint + the `decision` verdict only —
+/// the former `role_tier` / `local_tier` fields are gone with tier
+/// routing. `target_machine: Some(id)` signals an operator-pinned
+/// explicit-machine dispatch; `None` is the local-fallthrough case (so
+/// `decision` reduces to {`pinned`, `local`}). The #556 topology UI
+/// previously colored edges by `role_tier`/`local_tier`; keeping
+/// `target_machine` + `decision` is the agreed minimum the route record
+/// must still carry.
+fn build_route_payload(target_machine: Option<&str>) -> serde_json::Value {
     serde_json::json!({
-        "role_tier": role_tier,
-        "local_tier": local_tier,
         "target_machine": target_machine,
         // `decision` makes the operator-visible verdict explicit in
         // the audit trail without re-deriving it from the other
         // fields (the topology UI uses this to color routing edges).
-        "decision": if target_machine.is_some() { "pinned" } else { "auto-route" },
+        "decision": if target_machine.is_some() { "pinned" } else { "local" },
     })
 }
-
 
 /// Pure-function routing decision. `machine` is the operator's
 /// `--machine` flag (None when omitted); `local_machine_id` is what
@@ -1860,42 +1818,48 @@ mod tests {
         assert!(c.compactor_model.is_none());
     }
 
-    // ─── #247 PR-C build_route_payload ────────────────────────────────
+    // ─── #247 PR-C build_route_payload (post-#590 single-stream shape) ─
 
-    /// Auto-route payload — no target_machine; decision="auto-route".
-    /// Topology UI uses these fields to render WHY the dispatch edge
-    /// went to the tier-stream instead of running locally.
+    /// Local-fallthrough payload — no target_machine; decision="local".
+    /// After #590 the tier auto-route arm is gone, so the no-target case
+    /// is the local-dispatch verdict (not "auto-route"). The payload no
+    /// longer carries role_tier / local_tier.
     #[test]
-    fn build_route_payload_auto_route_has_no_target_and_auto_decision() {
-        let p = build_route_payload("inference", Some("hub"), None);
-        assert_eq!(p["role_tier"], "inference");
-        assert_eq!(p["local_tier"], "hub");
+    fn build_route_payload_no_target_has_local_decision() {
+        let p = build_route_payload(None);
         assert_eq!(p["target_machine"], serde_json::Value::Null);
-        assert_eq!(p["decision"], "auto-route");
+        assert_eq!(p["decision"], "local");
+        assert!(
+            p.get("role_tier").is_none(),
+            "role_tier dropped with tier routing (#590)"
+        );
+        assert!(
+            p.get("local_tier").is_none(),
+            "local_tier dropped with tier routing (#590)"
+        );
     }
 
-    /// Pinned payload — operator-supplied target_machine;
+    /// Pinned payload — operator-supplied advisory target_machine;
     /// decision="pinned". The explicit-machine path still emits a
-    /// dispatch route record so the audit trail captures that the
-    /// operator made the decision (not the substrate).
+    /// dispatch route record so the audit trail (and the #556 topology
+    /// UI) capture that the operator made the decision (not the
+    /// substrate).
     #[test]
     fn build_route_payload_pinned_has_target_and_pinned_decision() {
-        let p = build_route_payload("inference", Some("hub"), Some("laptop"));
-        assert_eq!(p["role_tier"], "inference");
-        assert_eq!(p["local_tier"], "hub");
+        let p = build_route_payload(Some("laptop"));
         assert_eq!(p["target_machine"], "laptop");
         assert_eq!(p["decision"], "pinned");
     }
 
-    /// Local-tier-unknown variant — `DARKMUX_MACHINE_TIER` unset.
-    /// Still emits a sensible payload (local_tier: null); operator
-    /// can correlate with the doctor warning.
+    /// Minimum #556-coordination shape: every route record carries
+    /// exactly `target_machine` + `decision` and nothing tier-shaped.
     #[test]
-    fn build_route_payload_handles_unknown_local_tier() {
-        let p = build_route_payload("inference", None, None);
-        assert_eq!(p["role_tier"], "inference");
-        assert_eq!(p["local_tier"], serde_json::Value::Null);
-        assert_eq!(p["decision"], "auto-route");
+    fn build_route_payload_minimum_shape_is_target_and_decision() {
+        let p = build_route_payload(Some("studio"));
+        let obj = p.as_object().expect("route payload is a JSON object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["decision", "target_machine"]);
     }
 
 

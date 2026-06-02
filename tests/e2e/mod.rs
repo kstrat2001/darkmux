@@ -2,9 +2,9 @@
 //!
 //! Boots an in-process mock LMStudio + an external `redis-server` +
 //! N `darkmux serve` daemons with distinct `DARKMUX_MACHINE_ID` /
-//! `DARKMUX_MACHINE_TIER` / `DARKMUX_REDIS_URL` env vars. Provides
-//! helpers to dispatch CLI commands "from" any of the nodes (sets
-//! the env vars on the child process) and assert against flow records.
+//! `DARKMUX_REDIS_URL` env vars. Provides helpers to dispatch CLI
+//! commands "from" any of the nodes (sets the env vars on the child
+//! process) and assert against flow records.
 //!
 //! Purpose (#255): give every deferred-bug item a TDD home + permanent
 //! regression coverage for cross-machine semantics. The harness itself

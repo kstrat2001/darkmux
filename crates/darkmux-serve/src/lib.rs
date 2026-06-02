@@ -341,9 +341,10 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf) -> Result<()> {
         // Spawn the fleet work-queue worker thread (#246 PR-C.2). Runs
         // on a dedicated std::thread (not a tokio task) so the sync
         // redis client + sync crew::dispatch::dispatch don't saturate
-        // the tokio executor. Worker self-disables when its
-        // prerequisites (DARKMUX_REDIS_URL + DARKMUX_MACHINE_TIER) aren't
-        // declared — single-machine fleets continue to work unchanged.
+        // the tokio executor. Worker self-disables when its prerequisite
+        // (DARKMUX_REDIS_URL) isn't declared — single-machine fleets
+        // continue to work unchanged (#590: Redis presence is the
+        // participation gate; tier declaration is no longer required).
         // The thread runs for the daemon's lifetime; the process
         // force-exit in the SHUTDOWN_GRACE_SECS path kills it cleanly.
         let _worker_handle = darkmux_fleet::spawn_worker_thread();
@@ -486,7 +487,7 @@ async fn model_status_handler() -> axum::Json<serde_json::Value> {
 
 /// GET /machine/specs — local-machine spec sheet for `darkmux fleet
 /// status --deep` aggregation. Composes:
-/// - identity (machine_id, machine_tier from env)
+/// - identity (machine_id from env)
 /// - hardware (ram_total_bytes, ram_free_for_ai_bytes, cpu_brand, os)
 /// - software (darkmux_version, flow_schema_version)
 /// - state (loaded_models from lms ps; redacted Redis URL from env)
@@ -519,7 +520,6 @@ async fn machine_specs_handler() -> axum::Json<serde_json::Value> {
         .flatten();
 
     let machine_id = darkmux_flow::resolve_machine_id();
-    let machine_tier = darkmux_flow::resolve_machine_tier();
     let redis_url_redacted = std::env::var("DARKMUX_REDIS_URL")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -534,7 +534,6 @@ async fn machine_specs_handler() -> axum::Json<serde_json::Value> {
         "darkmux_version": env!("CARGO_PKG_VERSION"),
         "flow_schema_version": darkmux_flow::FLOW_SCHEMA_VERSION,
         "machine_id": machine_id,
-        "machine_tier": machine_tier,
         "os": format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
         "ram_total_bytes": ram_total,
         "ram_free_for_ai_bytes": ram_free,
@@ -1539,7 +1538,7 @@ mod tests {
     // ─── #275 PR-A: /machine/specs endpoint ──────────────────────────
 
     /// GET /machine/specs returns a JSON object with the local machine's
-    /// versioned spec sheet — version + machine_id/tier + RAM + CPU + OS
+    /// versioned spec sheet — version + machine_id + RAM + CPU + OS
     /// + loaded models + redacted Redis URL. Tested at the contract level
     /// rather than the value level so the test doesn't depend on the
     /// machine actually running it.
@@ -1550,7 +1549,6 @@ mod tests {
         unsafe {
             std::env::remove_var("DARKMUX_REDIS_URL");
             std::env::remove_var("DARKMUX_MACHINE_ID");
-            std::env::remove_var("DARKMUX_MACHINE_TIER");
         }
         let app = build_router(PathBuf::new());
         let response = app
@@ -1572,7 +1570,6 @@ mod tests {
             "darkmux_version",
             "flow_schema_version",
             "machine_id",
-            "machine_tier",
             "os",
             "ram_total_bytes",
             "ram_free_for_ai_bytes",
@@ -1638,15 +1635,14 @@ mod tests {
     }
 
     /// /machine/specs reports operator-stamped provenance — `machine_id`
-    /// from `DARKMUX_MACHINE_ID` (default: hostname) and `machine_tier`
-    /// from `DARKMUX_MACHINE_TIER` (no default — surfaces `null` when
-    /// unset, which is the contract `flow::resolve_machine_tier` uses).
+    /// from `DARKMUX_MACHINE_ID` (default: hostname). The former
+    /// `machine_tier` field was dropped in #590 (machine-capacity tier
+    /// no longer routes work).
     #[tokio::test]
     #[serial_test::serial]
-    async fn machine_specs_endpoint_reports_machine_id_and_tier_from_env() {
+    async fn machine_specs_endpoint_reports_machine_id_from_env() {
         unsafe {
             std::env::set_var("DARKMUX_MACHINE_ID", "test-laptop");
-            std::env::set_var("DARKMUX_MACHINE_TIER", "inference");
         }
         let app = build_router(PathBuf::new());
         let response = app
@@ -1660,7 +1656,6 @@ mod tests {
             .unwrap();
         unsafe {
             std::env::remove_var("DARKMUX_MACHINE_ID");
-            std::env::remove_var("DARKMUX_MACHINE_TIER");
         }
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
@@ -1670,10 +1665,9 @@ mod tests {
             Some("test-laptop"),
             "machine_id env not surfaced: {json}"
         );
-        assert_eq!(
-            json["machine_tier"].as_str(),
-            Some("inference"),
-            "machine_tier env not surfaced: {json}"
+        assert!(
+            json.get("machine_tier").is_none(),
+            "machine_tier must be absent post-#590: {json}"
         );
     }
 

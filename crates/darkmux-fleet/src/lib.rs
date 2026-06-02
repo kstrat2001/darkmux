@@ -24,13 +24,8 @@ mod tests {
     use crate::queue::{extract_field, parse_xreadgroup_response};
     use crate::roster::parse_address;
     use crate::routing::{
-        auto_route_target_tier, completion_to_dispatch_result, match_completion,
-        scan_flow_entries_for_completion,
+        completion_to_dispatch_result, match_completion, scan_flow_entries_for_completion,
     };
-
-    // #463 — routing tests moved here with their subjects
-    // (completion_to_dispatch_result + auto_route_target_tier).
-    use darkmux_crew::dispatch::{CompactionDispatchArgs, DispatchOpts, Runtime};
 
     // ─── completion_to_dispatch_result (Wave-E.6 #255) ────────────────
 
@@ -119,273 +114,6 @@ mod tests {
         assert_eq!(r.exit_code, -9);
     }
 
-    // ─── L1 / Beat 35: tier-routing graceful degradation ─────────────
-    //
-    // Tests run serially because they mutate DARKMUX_CREW_DIR,
-    // DARKMUX_FLEET_FILE, and DARKMUX_MACHINE_TIER — process-global.
-
-    /// RAII: scrub the three env vars + restore on drop.
-    struct TierRouteEnvGuard {
-        prev_crew: Option<String>,
-        prev_fleet: Option<String>,
-        prev_tier: Option<String>,
-        _tmp: TempDir,
-    }
-
-    impl TierRouteEnvGuard {
-        fn new() -> Self {
-            let tmp = TempDir::new().unwrap();
-            let prev_crew = std::env::var("DARKMUX_CREW_DIR").ok();
-            let prev_fleet = std::env::var("DARKMUX_FLEET_FILE").ok();
-            let prev_tier = std::env::var("DARKMUX_MACHINE_TIER").ok();
-            // SAFETY: serialized via #[serial_test::serial] on every caller.
-            unsafe {
-                std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
-                std::env::remove_var("DARKMUX_FLEET_FILE");
-                std::env::remove_var("DARKMUX_MACHINE_TIER");
-            }
-            Self {
-                prev_crew,
-                prev_fleet,
-                prev_tier,
-                _tmp: tmp,
-            }
-        }
-
-        fn path(&self) -> &std::path::Path {
-            self._tmp.path()
-        }
-
-        fn set_fleet_file(&self, path: &std::path::Path) {
-            // SAFETY: serialized via #[serial].
-            unsafe {
-                std::env::set_var("DARKMUX_FLEET_FILE", path);
-            }
-        }
-
-        fn set_local_tier(&self, tier: &str) {
-            // SAFETY: serialized via #[serial].
-            unsafe {
-                std::env::set_var("DARKMUX_MACHINE_TIER", tier);
-            }
-        }
-    }
-
-    impl Drop for TierRouteEnvGuard {
-        fn drop(&mut self) {
-            // SAFETY: serialized via #[serial].
-            unsafe {
-                match &self.prev_crew {
-                    Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                    None => std::env::remove_var("DARKMUX_CREW_DIR"),
-                }
-                match &self.prev_fleet {
-                    Some(v) => std::env::set_var("DARKMUX_FLEET_FILE", v),
-                    None => std::env::remove_var("DARKMUX_FLEET_FILE"),
-                }
-                match &self.prev_tier {
-                    Some(v) => std::env::set_var("DARKMUX_MACHINE_TIER", v),
-                    None => std::env::remove_var("DARKMUX_MACHINE_TIER"),
-                }
-            }
-        }
-    }
-
-    /// Seed an operator-override role with a specific tier value.
-    /// `auto_route_target_tier` only needs the role manifest (it reads
-    /// `role.tier`), not the system-prompt `.md`.
-    fn seed_role_with_tier(crew_root: &std::path::Path, role_id: &str, tier: &str) {
-        let roles_dir = crew_root.join("roles");
-        std::fs::create_dir_all(&roles_dir).unwrap();
-        let json = format!(
-            r#"{{
-              "id": "{role_id}",
-              "description": "L1 test role",
-              "skills": [],
-              "tool_palette": {{"allow": ["read"], "deny": []}},
-              "escalation_contract": "bail-with-explanation",
-              "tier": "{tier}"
-            }}"#
-        );
-        std::fs::write(roles_dir.join(format!("{role_id}.json")), json).unwrap();
-    }
-
-    fn opts_for_role(role_id: &str) -> DispatchOpts {
-        DispatchOpts {
-            role_id: role_id.to_string(),
-            message: "test".to_string(),
-            deliver: None,
-            session_id: None,
-            timeout_seconds: 30,
-            skip_preflight: true,
-            json: false,
-            watch_paths: Vec::new(),
-            workdir: None,
-            sprint_id: None,
-            runtime: Runtime::Internal,
-            runtime_cmd: "openclaw".to_string(),
-            machine: None,
-            wait: true,
-            compaction: CompactionDispatchArgs::default(),
-        }
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn auto_route_falls_back_to_local_when_roster_empty() {
-        // The Beat-35 graceful-degradation path. Single-machine operator
-        // with no fleet declared, no local tier, role declares
-        // tier=inference. Should dispatch locally (Ok(None)) rather
-        // than bail.
-        let guard = TierRouteEnvGuard::new();
-        seed_role_with_tier(guard.path(), "l1-test-coder", "inference");
-        // Point fleet file at a nonexistent path — load_roster returns
-        // FleetRoster::default() (empty machines).
-        guard.set_fleet_file(&guard.path().join("nonexistent-fleet.json"));
-
-        let result = auto_route_target_tier(&opts_for_role("l1-test-coder"));
-        assert!(
-            matches!(result, Ok(None)),
-            "expected Ok(None) for empty-roster fallback; got: {:?}",
-            result
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn auto_route_falls_back_to_local_even_with_local_tier_unset() {
-        // Variant: explicitly unset DARKMUX_MACHINE_TIER (the smoke-test
-        // scenario that surfaced Beat 35). The fix must not depend on
-        // the operator having declared a tier.
-        let guard = TierRouteEnvGuard::new();
-        seed_role_with_tier(guard.path(), "l1-test-coder-2", "inference");
-        // DARKMUX_MACHINE_TIER stays unset (guard scrubs it on new).
-
-        let result = auto_route_target_tier(&opts_for_role("l1-test-coder-2"));
-        assert!(
-            matches!(result, Ok(None)),
-            "expected Ok(None); got: {:?}",
-            result
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn auto_route_bails_when_fleet_has_peers_but_missing_required_tier() {
-        // The "operator HAS a fleet but deliberately partitioned, just
-        // missing this tier" case. Preserves the existing actionable-
-        // misconfiguration bail.
-        let guard = TierRouteEnvGuard::new();
-        seed_role_with_tier(guard.path(), "l1-test-coder-3", "inference");
-        let fleet_path = guard.path().join("fleet.json");
-        // Roster with one peer in `hub` tier — none in `inference`.
-        std::fs::write(
-            &fleet_path,
-            r#"{
-              "version": "1",
-              "machines": {
-                "studio": {
-                  "id": "studio",
-                  "tier": "hub",
-                  "address": "100.74.208.36",
-                  "added_unix_ms": 1700000000000
-                }
-              }
-            }"#,
-        )
-        .unwrap();
-        guard.set_fleet_file(&fleet_path);
-        guard.set_local_tier("client");
-
-        let result = auto_route_target_tier(&opts_for_role("l1-test-coder-3"));
-        let err = result.expect_err("expected bail for fleet-missing-tier case");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("inference"),
-            "error should mention the required tier; got: {msg}"
-        );
-        assert!(
-            msg.contains("1 other peer"),
-            "error should count the declared peers; got: {msg}"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn auto_route_routes_to_queue_when_fleet_has_matching_tier() {
-        // Sanity check: pre-existing multi-machine routing still works.
-        // Roster has a peer in the role's required tier — auto_route
-        // returns Ok(Some(role_tier)) so the caller publishes via the
-        // work queue.
-        let guard = TierRouteEnvGuard::new();
-        seed_role_with_tier(guard.path(), "l1-test-coder-4", "inference");
-        let fleet_path = guard.path().join("fleet.json");
-        std::fs::write(
-            &fleet_path,
-            r#"{
-              "version": "1",
-              "machines": {
-                "laptop": {
-                  "id": "laptop",
-                  "tier": "inference",
-                  "address": "100.74.208.99",
-                  "added_unix_ms": 1700000000000
-                }
-              }
-            }"#,
-        )
-        .unwrap();
-        guard.set_fleet_file(&fleet_path);
-        guard.set_local_tier("hub");
-
-        let result = auto_route_target_tier(&opts_for_role("l1-test-coder-4"));
-        match result {
-            Ok(Some(tier)) => assert_eq!(tier, "inference"),
-            other => panic!("expected Ok(Some(\"inference\")); got: {:?}", other),
-        }
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn auto_route_dispatches_locally_when_role_tier_matches_local() {
-        // Sanity: the existing local-tier-matches-role-tier early-exit
-        // still works (operator on inference peer, role wants
-        // inference, no queue indirection needed).
-        let guard = TierRouteEnvGuard::new();
-        seed_role_with_tier(guard.path(), "l1-test-coder-5", "inference");
-        guard.set_local_tier("inference");
-
-        let result = auto_route_target_tier(&opts_for_role("l1-test-coder-5"));
-        assert!(
-            matches!(result, Ok(None)),
-            "expected Ok(None) for local-matches-role; got: {:?}",
-            result
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn auto_route_bails_when_roster_file_exists_but_is_corrupted() {
-        // Reviewer B-1: a hand-edited roster with a JSON typo must not
-        // silently degrade to local — silent divergence from intent is
-        // exactly the failure mode operator-sovereignty forbids.
-        let guard = TierRouteEnvGuard::new();
-        seed_role_with_tier(guard.path(), "l1-test-coder-6", "inference");
-        let fleet_path = guard.path().join("fleet.json");
-        // Trailing garbage after the JSON object — operator typo or
-        // editor corruption. serde_json rejects.
-        std::fs::write(
-            &fleet_path,
-            r#"{ "version": "1", "machines": {} this is broken"#,
-        )
-        .unwrap();
-        guard.set_fleet_file(&fleet_path);
-
-        let err = auto_route_target_tier(&opts_for_role("l1-test-coder-6"))
-            .expect_err("corrupted roster must surface as Err, not silently degrade");
-        let msg = format!("{err:#}");
-        assert!(msg.contains("fleet roster failed to load"), "got: {msg}");
-    }
     use tempfile::TempDir;
 
     fn with_roster_env<F: FnOnce(&PathBuf)>(f: F) {
@@ -415,7 +143,7 @@ mod tests {
         with_roster_env(|_| {
             let r = load_roster().unwrap();
             assert!(r.machines.is_empty());
-            assert_eq!(r.version, "1");
+            assert_eq!(r.version, "2");
         });
     }
 
@@ -424,20 +152,12 @@ mod tests {
     fn add_then_load_round_trips() {
         with_roster_env(|_| {
             let mut r = FleetRoster::default();
-            add_machine(
-                &mut r,
-                "studio",
-                "hub",
-                "100.74.208.36",
-                Some("always-on m1 max"),
-            )
-            .unwrap();
+            add_machine(&mut r, "studio", "100.74.208.36", Some("always-on m1 max")).unwrap();
             save_roster(&r).unwrap();
 
             let loaded = load_roster().unwrap();
             assert_eq!(loaded.machines.len(), 1);
             let entry = loaded.machines.get("studio").unwrap();
-            assert_eq!(entry.tier, "hub");
             assert_eq!(entry.address, "100.74.208.36");
             assert_eq!(entry.description.as_deref(), Some("always-on m1 max"));
             assert!(entry.added_unix_ms > 0);
@@ -452,10 +172,10 @@ mod tests {
         // signal stays honest.
         with_roster_env(|_| {
             let mut r = FleetRoster::default();
-            add_machine(&mut r, "studio", "hub", "addr-1", None).unwrap();
+            add_machine(&mut r, "studio", "addr-1", None).unwrap();
             let first_added = r.machines.get("studio").unwrap().added_unix_ms;
             std::thread::sleep(std::time::Duration::from_millis(2));
-            add_machine(&mut r, "studio", "hub", "addr-2", Some("updated desc")).unwrap();
+            add_machine(&mut r, "studio", "addr-2", Some("updated desc")).unwrap();
             let entry = r.machines.get("studio").unwrap();
             assert_eq!(
                 entry.added_unix_ms, first_added,
@@ -469,91 +189,21 @@ mod tests {
     #[test]
     fn add_rejects_empty_id() {
         let mut r = FleetRoster::default();
-        let err = add_machine(&mut r, "", "hub", "addr", None).unwrap_err();
+        let err = add_machine(&mut r, "", "addr", None).unwrap_err();
         assert!(err.to_string().contains("id must be non-empty"));
-    }
-
-    #[test]
-    fn add_rejects_empty_tier() {
-        let mut r = FleetRoster::default();
-        let err = add_machine(&mut r, "studio", "", "addr", None).unwrap_err();
-        assert!(err.to_string().contains("tier must be non-empty"));
     }
 
     #[test]
     fn add_rejects_empty_address() {
         let mut r = FleetRoster::default();
-        let err = add_machine(&mut r, "studio", "hub", "", None).unwrap_err();
+        let err = add_machine(&mut r, "studio", "", None).unwrap_err();
         assert!(err.to_string().contains("address must be non-empty"));
-    }
-
-    // ─── #247 PR-A: candidates_for_tier ──────────────────────────────
-
-    /// Exact-match: only inference-tier machines come back when the
-    /// query is "inference".
-    #[test]
-    fn candidates_for_tier_returns_only_exact_matches() {
-        let mut r = FleetRoster::default();
-        add_machine(&mut r, "laptop", "inference", "100.64.1.5:8765", None).unwrap();
-        add_machine(&mut r, "studio", "hub", "100.64.2.1:8765", None).unwrap();
-        add_machine(&mut r, "laptop-2", "inference", "100.64.1.6:8765", None).unwrap();
-        let inf = candidates_for_tier(&r, "inference");
-        assert_eq!(inf.len(), 2, "expected two inference matches");
-        let ids: Vec<&str> = inf.iter().map(|m| m.id.as_str()).collect();
-        assert!(ids.contains(&"laptop"));
-        assert!(ids.contains(&"laptop-2"));
-        assert!(!ids.contains(&"studio"));
-    }
-
-    /// Empty roster → empty result; no allocation panic.
-    #[test]
-    fn candidates_for_tier_empty_roster_returns_empty() {
-        let r = FleetRoster::default();
-        assert!(candidates_for_tier(&r, "inference").is_empty());
-        assert!(candidates_for_tier(&r, "any").is_empty());
-    }
-
-    /// `"any"` returns every machine in the roster regardless of tier.
-    /// Matches the WorkJob-validation contract that treats `any` as
-    /// the catch-all.
-    #[test]
-    fn candidates_for_tier_any_returns_all_machines() {
-        let mut r = FleetRoster::default();
-        add_machine(&mut r, "laptop", "inference", "100.64.1.5:8765", None).unwrap();
-        add_machine(&mut r, "studio", "hub", "100.64.2.1:8765", None).unwrap();
-        add_machine(&mut r, "mobile", "client", "100.64.3.1:8765", None).unwrap();
-        let all = candidates_for_tier(&r, "any");
-        assert_eq!(all.len(), 3);
-    }
-
-    /// No machine in the queried tier → empty result. This is the
-    /// signal the dispatch routing path will use to bail loud: if the
-    /// role's tier has zero candidates in the fleet, the WorkJob
-    /// would XADD to a stream with no consumers.
-    #[test]
-    fn candidates_for_tier_no_match_returns_empty() {
-        let mut r = FleetRoster::default();
-        add_machine(&mut r, "laptop", "inference", "100.64.1.5:8765", None).unwrap();
-        add_machine(&mut r, "studio", "hub", "100.64.2.1:8765", None).unwrap();
-        let none = candidates_for_tier(&r, "client");
-        assert!(none.is_empty());
-    }
-
-    /// Unknown / mistyped tier (e.g. typo "infernce") returns empty —
-    /// the exact-match doctrine. Callers translate this to "no fleet
-    /// machine in the tier, bail with the operator-actionable hint."
-    #[test]
-    fn candidates_for_tier_unknown_tier_returns_empty() {
-        let mut r = FleetRoster::default();
-        add_machine(&mut r, "laptop", "inference", "100.64.1.5:8765", None).unwrap();
-        let none = candidates_for_tier(&r, "infernce"); // typo
-        assert!(none.is_empty());
     }
 
     #[test]
     fn remove_returns_entry_when_present() {
         let mut r = FleetRoster::default();
-        add_machine(&mut r, "studio", "hub", "addr", None).unwrap();
+        add_machine(&mut r, "studio", "addr", None).unwrap();
         let removed = remove_machine(&mut r, "studio").expect("entry present");
         assert_eq!(removed.id, "studio");
         assert!(r.machines.is_empty());
@@ -665,7 +315,7 @@ mod tests {
     fn save_roundtrip_preserves_pretty_json() {
         with_roster_env(|path| {
             let mut r = FleetRoster::default();
-            add_machine(&mut r, "studio", "hub", "100.74.208.36:8765", None).unwrap();
+            add_machine(&mut r, "studio", "100.74.208.36:8765", None).unwrap();
             save_roster(&r).unwrap();
             let raw = std::fs::read_to_string(path).unwrap();
             // Pretty-print means newlines + indent — at least one newline.
@@ -677,16 +327,15 @@ mod tests {
     // ─── Work queue (PR-C.1) ──────────────────────────────────────────
 
     #[test]
-    fn work_stream_name_composes_tier() {
-        assert_eq!(work_stream_name("inference"), "darkmux:work:inference");
-        assert_eq!(work_stream_name("hub"), "darkmux:work:hub");
-        assert_eq!(work_stream_name("any"), "darkmux:work:any");
+    fn work_stream_is_single_global_stream() {
+        // #590 — the per-tier stream prefix is gone; all fleet work
+        // routes onto one stream.
+        assert_eq!(crate::queue::WORK_STREAM, "darkmux:work");
     }
 
     #[test]
     fn work_job_serde_round_trips() {
         let job = build_work_job(
-            "inference".to_string(),
             Some("laptop".to_string()),
             "coder".to_string(),
             "implement the feature".to_string(),
@@ -712,7 +361,6 @@ mod tests {
         // so older workers (future-proof case) don't trip on
         // unexpected null values.
         let job = build_work_job(
-            "any".to_string(),
             None, // target_machine None
             "scribe".to_string(),
             "draft a note".to_string(),
@@ -760,7 +408,6 @@ mod tests {
     #[test]
     fn work_job_default_runtime_is_internal() {
         let json = r#"{
-            "target_tier": "any",
             "role_id": "scribe",
             "message": "hi",
             "session_id": "s-1",
@@ -781,7 +428,6 @@ mod tests {
     #[test]
     fn work_job_unknown_runtime_rejected_at_deserialize() {
         let json = r#"{
-            "target_tier": "any",
             "role_id": "scribe",
             "message": "hi",
             "session_id": "s-1",
@@ -836,7 +482,6 @@ mod tests {
         // [[stream_name, [[id, [k, v, k, v]]]]]
         use redis::Value as V;
         let job = build_work_job(
-            "inference".to_string(),
             None,
             "coder".to_string(),
             "do the thing".to_string(),
@@ -852,7 +497,7 @@ mod tests {
         let job_json = serde_json::to_string(&job).unwrap();
         let entry_id = "1716192000000-0";
         let response = V::Array(vec![V::Array(vec![
-            V::BulkString(b"darkmux:work:inference".to_vec()),
+            V::BulkString(b"darkmux:work".to_vec()),
             V::Array(vec![V::Array(vec![
                 V::BulkString(entry_id.as_bytes().to_vec()),
                 V::Array(vec![
@@ -874,12 +519,12 @@ mod tests {
         use redis::Value as V;
         // Entry has fields but no `record` key — caller can't dispatch.
         let response = V::Array(vec![V::Array(vec![
-            V::BulkString(b"darkmux:work:inference".to_vec()),
+            V::BulkString(b"darkmux:work".to_vec()),
             V::Array(vec![V::Array(vec![
                 V::BulkString(b"1716192000000-0".to_vec()),
                 V::Array(vec![
                     V::BulkString(b"schema".to_vec()),
-                    V::BulkString(b"1".to_vec()),
+                    V::BulkString(b"2".to_vec()),
                     // record field absent
                 ]),
             ])]),
@@ -921,7 +566,6 @@ mod tests {
 
     fn good_job() -> WorkJob {
         build_work_job(
-            "inference".to_string(),
             None,
             "coder".to_string(),
             "do a thing".to_string(),
@@ -1176,7 +820,6 @@ mod tests {
         // A future-PR field smuggled by a malicious publisher must fail
         // to deserialize, not silently roundtrip.
         let json = r#"{
-            "target_tier": "inference",
             "role_id": "coder",
             "message": "hi",
             "session_id": "s-1",
@@ -1203,7 +846,6 @@ mod tests {
     fn workjob_deserialize_accepts_known_fields_only() {
         // Sanity: the strict shape still accepts a valid job.
         let json = r#"{
-            "target_tier": "inference",
             "role_id": "coder",
             "message": "hi",
             "session_id": "s-1",
@@ -1213,6 +855,33 @@ mod tests {
             "attempt": 1
         }"#;
         let parsed: WorkJob = serde_json::from_str(json).expect("valid job parses");
-        assert_eq!(parsed.target_tier, "inference");
+        assert_eq!(parsed.role_id, "coder");
+        assert!(
+            parsed.target_machine.is_none(),
+            "advisory target_machine defaults to None when omitted"
+        );
+    }
+
+    #[test]
+    fn workjob_deserialize_rejects_legacy_target_tier_field() {
+        // #590 wire break — the former `target_tier` routing key is gone.
+        // A "1"-era publisher's job (carrying target_tier) must fail to
+        // deserialize against the "2"-era shape rather than silently drop
+        // the field. deny_unknown_fields enforces the non-interop.
+        let json = r#"{
+            "target_tier": "inference",
+            "role_id": "coder",
+            "message": "hi",
+            "session_id": "s-1",
+            "runtime": "openclaw",
+            "timeout_seconds": 300,
+            "published_at_unix_ms": 0,
+            "attempt": 1
+        }"#;
+        let result: Result<WorkJob, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "legacy target_tier field must be rejected post-#590; got: {result:?}"
+        );
     }
 }
