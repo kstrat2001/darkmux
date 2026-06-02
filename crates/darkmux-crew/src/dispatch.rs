@@ -387,7 +387,6 @@ impl CompactionDispatchArgs {
     /// `model`) from the `extras` map. Picks the primary model's
     /// `n_ctx` as the context_window (needed for formula trigger).
     pub fn from_profile(profile: &darkmux_types::Profile) -> Self {
-        use darkmux_types::ModelRole;
         let comp = profile.runtime.as_ref().and_then(|r| r.compaction.as_ref());
         let threshold_tokens = comp
             .and_then(|c| c.threshold_tokens)
@@ -414,10 +413,11 @@ impl CompactionDispatchArgs {
         // a pre-compaction trigger) and would be confusing to silently
         // map across the semantic boundary.
         let threshold_ratio = comp.and_then(|c| c.threshold_ratio).map(|f| f as f32);
+        // (#590) Context window for the compaction trigger comes from the
+        // profile's default worker model (default_model, or first model).
         let context_window = profile
-            .models
-            .iter()
-            .find(|m| matches!(m.role, ModelRole::Primary))
+            .default_model_id()
+            .and_then(|id| profile.models.iter().find(|m| m.id == id))
             .map(|m| m.n_ctx);
         // (#372 T2-A/T2-C) Strategy is a typed field on the schema;
         // read directly. When operator hasn't set it, runtime falls

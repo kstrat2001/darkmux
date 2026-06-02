@@ -91,18 +91,19 @@ fn validate_profile(name: &str, profile: &Profile, path: &Path) -> Result<()> {
             name
         );
     }
-    let primaries = profile
-        .models
-        .iter()
-        .filter(|m| matches!(m.role, darkmux_types::ModelRole::Primary))
-        .count();
-    if primaries != 1 {
-        bail!(
-            "{}: profile \"{}\" must have exactly one primary model (found {})",
-            path.display(),
-            name,
-            primaries
-        );
+    // (#590) The old "exactly one primary" rule is gone with `ModelRole`. The
+    // default worker is `default_model` (or the first model when unset). The
+    // only new failure mode worth catching: a `default_model` that names a
+    // model not present in `models[]` — an operator typo, surfaced loudly.
+    if let Some(default_id) = profile.default_model.as_deref() {
+        if !profile.models.iter().any(|m| m.id == default_id) {
+            bail!(
+                "{}: profile \"{}\" sets default_model \"{}\", which is not one of its models[]",
+                path.display(),
+                name,
+                default_id
+            );
+        }
     }
     Ok(())
 }
@@ -126,7 +127,6 @@ pub fn get_profile<'a>(reg: &'a ProfileRegistry, name: &str) -> Result<&'a Profi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use darkmux_types::ModelRole;
     use std::io::Write;
     use tempfile::TempDir;
 
@@ -141,7 +141,7 @@ mod tests {
                 "fast": {
                     "description": "tiny",
                     "models": [
-                        {"id": "model-a", "n_ctx": 32000, "role": "primary"}
+                        {"id": "model-a", "n_ctx": 32000}
                     ]
                 }
             },
@@ -232,32 +232,40 @@ mod tests {
     }
 
     #[test]
-    fn validates_two_primaries() {
+    fn validates_multiple_models_no_role_constraint() {
+        // (#590) The old "exactly one primary" rule is gone with `ModelRole`.
+        // A profile may now declare any number of (unroled) worker models; the
+        // default worker is the first one when `default_model` is unset.
         let tmp = TempDir::new().unwrap();
         let p = tmp.path().join("profiles.json");
         write(
             &p,
-            r#"{"profiles":{"bad":{"models":[
-                {"id":"a","n_ctx":1,"role":"primary"},
-                {"id":"b","n_ctx":2,"role":"primary"}
+            r#"{"profiles":{"ok":{"models":[
+                {"id":"a","n_ctx":1},
+                {"id":"b","n_ctx":2}
             ]}}}"#,
         );
-        let err = load_registry(Some(p.to_str().unwrap())).unwrap_err();
-        assert!(err.to_string().contains("exactly one primary"));
+        let reg = load_registry(Some(p.to_str().unwrap())).unwrap().registry;
+        let prof = reg.profiles.get("ok").unwrap();
+        assert_eq!(prof.models.len(), 2);
+        // First model is the implicit default worker.
+        assert_eq!(prof.default_model_id(), Some("a"));
     }
 
     #[test]
-    fn validates_zero_primaries() {
+    fn validates_default_model_must_name_a_real_model() {
+        // (#590) The one new failure mode: `default_model` naming an id that
+        // isn't in `models[]` (an operator typo) fails loud at load time.
         let tmp = TempDir::new().unwrap();
         let p = tmp.path().join("profiles.json");
         write(
             &p,
-            r#"{"profiles":{"bad":{"models":[
-                {"id":"a","n_ctx":1,"role":"compactor"}
+            r#"{"profiles":{"bad":{"default_model":"ghost","models":[
+                {"id":"a","n_ctx":1}
             ]}}}"#,
         );
         let err = load_registry(Some(p.to_str().unwrap())).unwrap_err();
-        assert!(err.to_string().contains("exactly one primary"));
+        assert!(err.to_string().contains("not one of its models"));
     }
 
     #[test]
@@ -283,7 +291,9 @@ mod tests {
         let reg: ProfileRegistry = serde_json::from_str(minimal_json()).unwrap();
         let p = get_profile(&reg, "fast").unwrap();
         assert_eq!(p.models.len(), 1);
-        assert!(matches!(p.models[0].role, ModelRole::Primary));
+        // (#590) The default worker is the first model when `default_model` is
+        // unset (replaces the old Primary-role designation).
+        assert_eq!(p.default_model_id(), Some("model-a"));
     }
 
     #[test]

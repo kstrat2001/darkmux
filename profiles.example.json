@@ -1,42 +1,39 @@
 {
-  "_comment": "darkmux profile registry — example. Four reference profiles in increasing capacity order: fast → balanced → deep → gpt-oss. Replace the model ids with what you have downloaded in LMStudio (run `lms ls` to see).",
+  "_comment": "darkmux profile registry — example. Four reference profiles in increasing capacity order: fast → balanced → deep → gpt-oss. A profile's `models[]` are WORKER models (no `role` field — #590); the machine's standing utility/compactor model lives once in the top-level `internal.utility` binding, not per-profile. `default_model` (optional) names a profile's default worker when it lists more than one; with a single model it's implicit. Replace the model ids with what you have downloaded in LMStudio (run `lms ls`).",
 
   "profiles": {
     "fast": {
-      "description": "Single-turn tasks. Slim primary, no compactor — fastest dispatch, lowest RAM.",
+      "description": "Single-turn tasks. Slim worker — fastest dispatch, lowest RAM.",
       "models": [
-        {
-          "id": "<your-primary-model-id>",
-          "n_ctx": 32000,
-          "role": "primary"
-        }
+        { "id": "<your-worker-model-id>", "n_ctx": 32000 }
       ]
     },
 
     "balanced": {
-      "description": "Mid-range tasks. Tuned compaction with a small companion compactor — predictable behavior across mixed workloads.",
+      "description": "Mid-range tasks. Predictable behavior across mixed workloads; compaction runs on the machine's internal.utility model.",
       "models": [
-        { "id": "<your-primary-model-id>", "n_ctx": 100000, "role": "primary" },
-        { "id": "<your-compactor-model-id>", "n_ctx": 68000, "role": "compactor" }
+        { "id": "<your-worker-model-id>", "n_ctx": 100000 }
       ]
     },
 
     "deep": {
-      "description": "Long agentic tasks. Maximum primary context for fewer compactions; companion compactor as safety net.",
+      "description": "Long agentic tasks. Maximum worker context for fewer compactions.",
       "models": [
-        { "id": "<your-primary-model-id>", "n_ctx": 200000, "role": "primary" },
-        { "id": "<your-compactor-model-id>", "n_ctx": 120000, "role": "compactor" }
+        { "id": "<your-worker-model-id>", "n_ctx": 200000 }
       ]
     },
 
     "gpt-oss": {
-      "description": "OpenAI gpt-oss-120b (MXFP4 quantization) for Apple Silicon — primary at 100K with a 4B compactor at 68K, per Article 2's small-companion-compactor pattern. Requires OpenClaw >= v2026.5.9-beta.1 (harmony format / tool-payload fix).",
+      "description": "OpenAI gpt-oss-120b (MXFP4 quantization) for Apple Silicon — worker at 100K. Requires OpenClaw >= v2026.5.9-beta.1 (harmony format / tool-payload fix).",
       "models": [
-        { "id": "mlx-community/gpt-oss-120b-MXFP4-Q8", "n_ctx": 100000, "role": "primary" },
-        { "id": "qwen/qwen3-4b-instruct-2507", "n_ctx": 68000, "role": "compactor" }
+        { "id": "mlx-community/gpt-oss-120b-MXFP4-Q8", "n_ctx": 100000 }
       ]
     }
   },
 
-  "default_profile": "balanced"
+  "default_profile": "balanced",
+
+  "internal": {
+    "utility": "qwen/qwen3-4b-instruct-2507"
+  }
 }

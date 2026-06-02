@@ -24,7 +24,6 @@ use darkmux_hardware as hardware;
 use darkmux_heuristics as heuristics;
 use darkmux_profiles::lms;
 use darkmux_profiles::profiles;
-use darkmux_types::ModelRole;
 use std::env;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -1322,10 +1321,13 @@ fn check_profile_loaded_match() -> Check {
 
     let mut matching: Vec<&str> = Vec::new();
     for (name, profile) in &registry.registry.profiles {
+        // (#590) The profile's default worker (default_model, or first model)
+        // is the load-bearing match — the old Primary-role check.
+        let default_id = profile.default_model_id();
         let primaries = profile
             .models
             .iter()
-            .filter(|m| matches!(m.role, ModelRole::Primary));
+            .filter(|m| Some(m.id.as_str()) == default_id);
         // (#544) Use the shared matcher so doctor agrees with the lab
         // surfaces — crucially, this also matches a `darkmux:`-namespaced
         // load, which the old inline check (`identifier == id || model ==
@@ -1898,9 +1900,10 @@ fn pick_active_profile<'a>(
         .profiles
         .iter()
         .filter(|(_, p)| {
+            let default_id = p.default_model_id();
             p.models
                 .iter()
-                .filter(|m| matches!(m.role, ModelRole::Primary))
+                .filter(|m| Some(m.id.as_str()) == default_id)
                 .any(|pm| {
                     let ns = darkmux_profiles::swap::namespaced_identifier(pm);
                     loaded

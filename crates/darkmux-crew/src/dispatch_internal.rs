@@ -1691,15 +1691,15 @@ mod tests {
     #[test]
     fn from_profile_reads_typed_strategy_field() {
         use darkmux_types::{
-            CompactionStrategy, ModelRole, Profile, ProfileModel, ProfileRuntime,
+            CompactionStrategy, Profile, ProfileModel, ProfileRuntime,
             RuntimeCompactionConfig,
         };
         let profile = Profile {
             description: None,
+            default_model: None,
             models: vec![ProfileModel {
                 id: "primary".into(),
                 n_ctx: 100_000,
-                role: ModelRole::Primary,
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -1731,15 +1731,15 @@ mod tests {
     #[test]
     fn from_profile_derives_bail_after_compactions_from_reserve() {
         use darkmux_types::{
-            ModelRole, Profile, ProfileModel, ProfileRuntime, ReserveConfig,
+            Profile, ProfileModel, ProfileRuntime, ReserveConfig,
             RuntimeCompactionConfig,
         };
         let profile = Profile {
             description: None,
+            default_model: None,
             models: vec![ProfileModel {
                 id: "primary-x".into(),
                 n_ctx: 100_000,
-                role: ModelRole::Primary,
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -1832,14 +1832,14 @@ mod tests {
     #[test]
     fn from_profile_bail_after_compactions_is_none_when_reserve_absent() {
         use darkmux_types::{
-            ModelRole, Profile, ProfileModel, ProfileRuntime, RuntimeCompactionConfig,
+            Profile, ProfileModel, ProfileRuntime, RuntimeCompactionConfig,
         };
         let profile = Profile {
             description: None,
+            default_model: None,
             models: vec![ProfileModel {
                 id: "primary-x".into(),
                 n_ctx: 100_000,
-                role: ModelRole::Primary,
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -1866,14 +1866,14 @@ mod tests {
     #[test]
     fn from_profile_derives_typed_threshold() {
         use darkmux_types::{
-            ModelRole, Profile, ProfileModel, ProfileRuntime, RuntimeCompactionConfig,
+            Profile, ProfileModel, ProfileRuntime, RuntimeCompactionConfig,
         };
         let profile = Profile {
             description: None,
+            default_model: None,
             models: vec![ProfileModel {
                 id: "primary-x".into(),
                 n_ctx: 100_000,
-                role: ModelRole::Primary,
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -1907,7 +1907,7 @@ mod tests {
         // which only knows the bare/namespaced form). Until a typed
         // `compaction.compactor_model` lands, runtime uses default.
         use darkmux_types::{
-            ModelRole, Profile, ProfileModel, ProfileRuntime, RuntimeCompactionConfig,
+            Profile, ProfileModel, ProfileRuntime, RuntimeCompactionConfig,
         };
         let mut extras = serde_json::Map::new();
         // This openclaw-flavored value must NOT influence the dispatch.
@@ -1917,10 +1917,10 @@ mod tests {
         );
         let profile = Profile {
             description: None,
+            default_model: None,
             models: vec![ProfileModel {
                 id: "primary-x".into(),
                 n_ctx: 101_000,
-                role: ModelRole::Primary,
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -1959,7 +1959,7 @@ mod tests {
     #[test]
     fn from_profile_ignores_openclaw_maxhistoryshare_extras() {
         use darkmux_types::{
-            ModelRole, Profile, ProfileModel, ProfileRuntime, RuntimeCompactionConfig,
+            Profile, ProfileModel, ProfileRuntime, RuntimeCompactionConfig,
         };
         let mut extras = serde_json::Map::new();
         // Operator carries openclaw's historical config — this should
@@ -1968,10 +1968,10 @@ mod tests {
         extras.insert("maxHistoryShare".into(), serde_json::json!(0.35));
         let profile = Profile {
             description: None,
+            default_model: None,
             models: vec![ProfileModel {
                 id: "primary-x".into(),
                 n_ctx: 100_000,
-                role: ModelRole::Primary,
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -2004,14 +2004,14 @@ mod tests {
     #[test]
     fn from_profile_reads_typed_custom_instructions() {
         use darkmux_types::{
-            ModelRole, Profile, ProfileModel, ProfileRuntime, RuntimeCompactionConfig,
+            Profile, ProfileModel, ProfileRuntime, RuntimeCompactionConfig,
         };
         let profile = Profile {
             description: None,
+            default_model: None,
             models: vec![ProfileModel {
                 id: "primary-x".into(),
                 n_ctx: 100_000,
-                role: ModelRole::Primary,
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -2049,7 +2049,7 @@ mod tests {
     #[test]
     fn from_profile_ignores_openclaw_custom_instructions_extras() {
         use darkmux_types::{
-            ModelRole, Profile, ProfileModel, ProfileRuntime, RuntimeCompactionConfig,
+            Profile, ProfileModel, ProfileRuntime, RuntimeCompactionConfig,
         };
         let mut extras = serde_json::Map::new();
         // Operator carries an openclaw-era `customInstructions` string
@@ -2062,10 +2062,10 @@ mod tests {
         );
         let profile = Profile {
             description: None,
+            default_model: None,
             models: vec![ProfileModel {
                 id: "primary-x".into(),
                 n_ctx: 100_000,
-                role: ModelRole::Primary,
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -2094,13 +2094,13 @@ mod tests {
 
     #[test]
     fn from_profile_handles_missing_compaction_block() {
-        use darkmux_types::{ModelRole, Profile, ProfileModel};
+        use darkmux_types::{Profile, ProfileModel};
         let profile = Profile {
             description: None,
+            default_model: None,
             models: vec![ProfileModel {
                 id: "primary-x".into(),
                 n_ctx: 50_000,
-                role: ModelRole::Primary,
                 capabilities: Default::default(),
                 identifier: None,
             }],

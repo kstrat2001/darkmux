@@ -50,13 +50,11 @@ pub fn ctx_diverges(declared: u64, loaded: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use darkmux_types::ModelRole;
 
     fn pm(id: &str, ident: Option<&str>) -> ProfileModel {
         ProfileModel {
             id: id.to_string(),
             n_ctx: 262000,
-            role: ModelRole::Primary,
             capabilities: Default::default(),
             identifier: ident.map(|s| s.to_string()),
         }

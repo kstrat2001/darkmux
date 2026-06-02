@@ -47,19 +47,10 @@ pub enum Capability {
 /// capped by the `Capability` variant count).
 pub type CapabilityProfile = BTreeMap<Capability, f32>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ModelRole {
-    Primary,
-    Compactor,
-    Auxiliary,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileModel {
     pub id: String,
     pub n_ctx: u32,
-    pub role: ModelRole,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identifier: Option<String>,
     /// Capability vector — what kinds of work this model is good at, and
@@ -292,6 +283,14 @@ pub struct Profile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub models: Vec<ProfileModel>,
+    /// The canonical default worker model id (#590) — the deterministic
+    /// fallback `select_model` returns when capability scoring can't
+    /// differentiate (no offers, or a tie). Replaces the old `Primary`-role
+    /// designation. When `None`, the first model in `models[]` is the implicit
+    /// default (mirrors the old Primary-is-first convention). Must name a real
+    /// `models[]` id when set (checked by `validate_profile`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<ProfileRuntime>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -299,39 +298,19 @@ pub struct Profile {
 }
 
 impl Profile {
-    /// (#450, E14 refactor 1b) Returns the id of this profile's
-    /// Primary-role model — the worker model dispatch routes to by
-    /// default. Profile schema enforces "exactly one primary" at load
-    /// time (see `profiles::validate_profile`), so this is the model
-    /// every worker-class role uses under phase-1 trivial selection.
-    /// Phase-2 scoring layers on top: candidate set comes from ALL
-    /// `models[]` entries, scoring picks per-role, primary is the
-    /// fallback when no candidate scores above threshold.
-    pub fn primary_model_id(&self) -> Option<&str> {
-        self.models
-            .iter()
-            .find(|m| matches!(m.role, ModelRole::Primary))
-            .map(|m| m.id.as_str())
-    }
-
-    /// (#450, E14 refactor 1b) Returns the id of this profile's
-    /// Compactor-role model — the utility model darkmux uses for its
-    /// internal AI-first functions (compaction today; future
-    /// mission-planner-auto, scribe-helper, etc.). Lives in a
-    /// separate `[internal]`-style layer from worker-tier roles;
-    /// always-loaded for the runtime session per Beat 50 doctrine.
-    ///
-    /// Unused in refactor 1b's dispatch wiring (compactor selection
-    /// today flows through `RuntimeCompactionConfig.compactor_model`
-    /// directly). Phase-1c will wire this when the utility-loading
-    /// orchestration lands; the helper exists now as the public API
-    /// surface phase-1c will consume.
-    #[allow(dead_code)]
-    pub fn compactor_model_id(&self) -> Option<&str> {
-        self.models
-            .iter()
-            .find(|m| matches!(m.role, ModelRole::Compactor))
-            .map(|m| m.id.as_str())
+    /// (#590) The profile's canonical default worker model id: the explicit
+    /// `default_model` if set, else the first declared model (mirroring the
+    /// old Primary-is-first convention). `None` only when `models[]` is empty.
+    /// This is the deterministic fallback `select_model` returns when
+    /// capability scoring can't differentiate, and the model that swap /
+    /// compaction-context resolution treat as the profile's primary worker.
+    /// (Replaces the removed `primary_model_id()`; the compactor moved to the
+    /// registry's `internal.utility` binding, so `compactor_model_id()` is
+    /// gone.)
+    pub fn default_model_id(&self) -> Option<&str> {
+        self.default_model
+            .as_deref()
+            .or_else(|| self.models.first().map(|m| m.id.as_str()))
     }
 }
 
@@ -431,19 +410,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn model_role_serializes_lowercase() {
-        let role = ModelRole::Primary;
-        assert_eq!(serde_json::to_string(&role).unwrap(), "\"primary\"");
-        let parsed: ModelRole = serde_json::from_str("\"compactor\"").unwrap();
-        assert_eq!(parsed, ModelRole::Compactor);
-    }
-
-    #[test]
     fn profile_model_round_trips() {
         let m = ProfileModel {
             id: "x".to_string(),
             n_ctx: 32_000,
-            role: ModelRole::Primary,
             capabilities: Default::default(),
             identifier: Some("alias".to_string()),
         };
@@ -451,7 +421,6 @@ mod tests {
         let back: ProfileModel = serde_json::from_str(&json).unwrap();
         assert_eq!(back.id, "x");
         assert_eq!(back.n_ctx, 32_000);
-        assert_eq!(back.role, ModelRole::Primary);
         assert_eq!(back.identifier.as_deref(), Some("alias"));
     }
 
@@ -460,7 +429,6 @@ mod tests {
         let m = ProfileModel {
             id: "x".to_string(),
             n_ctx: 1024,
-            role: ModelRole::Auxiliary,
             capabilities: Default::default(),
             identifier: None,
         };
@@ -474,7 +442,7 @@ mod tests {
         // sparse-as-zero. select_model (phase 2) matches a role's needs
         // against this — no machine tier in the decision (#450/#322).
         let json =
-            r#"{"id":"m","n_ctx":32000,"role":"primary","capabilities":{"code":0.9,"reasoning":0.4}}"#;
+            r#"{"id":"m","n_ctx":32000,"capabilities":{"code":0.9,"reasoning":0.4}}"#;
         let m: ProfileModel = serde_json::from_str(json).unwrap();
         assert_eq!(m.capabilities.get(&Capability::Code), Some(&0.9));
         assert_eq!(m.capabilities.get(&Capability::Reasoning), Some(&0.4));
@@ -498,7 +466,7 @@ mod tests {
                 "fast": {
                     "description": "tiny",
                     "models": [
-                        {"id": "model-a", "n_ctx": 32000, "role": "primary"}
+                        {"id": "model-a", "n_ctx": 32000}
                     ]
                 }
             }
@@ -507,7 +475,7 @@ mod tests {
         assert_eq!(reg.profiles.len(), 1);
         let p = reg.profiles.get("fast").unwrap();
         assert_eq!(p.models[0].n_ctx, 32_000);
-        assert!(matches!(p.models[0].role, ModelRole::Primary));
+        assert_eq!(p.default_model_id(), Some("model-a"));
         // No `internal` block ⇒ no machine utility model registered.
         assert_eq!(reg.utility_model_id(), None);
     }
@@ -518,7 +486,7 @@ mod tests {
         // `profiles`, carries the standing utility model id.
         let json = r#"{
             "profiles": {
-                "fast": { "models": [ {"id": "worker-a", "n_ctx": 32000, "role": "primary"} ] }
+                "fast": { "models": [ {"id": "worker-a", "n_ctx": 32000} ] }
             },
             "internal": { "utility": "darkmux:qwen3-4b-instruct-2507" }
         }"#;
@@ -722,7 +690,7 @@ mod tests {
         let json = r#"{
             "profiles": {
                 "balanced": {
-                    "models": [{"id": "primary", "n_ctx": 60000, "role": "primary"}],
+                    "models": [{"id": "primary", "n_ctx": 60000}],
                     "runtime": {
                         "compaction": {
                             "strategy": "structured-slot",

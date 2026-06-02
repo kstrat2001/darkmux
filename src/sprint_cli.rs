@@ -182,25 +182,23 @@ struct ProfileCapacity {
     compaction_max_history_share: f64,
 }
 
-/// Reads the profile registry and returns each profile's primary model
-/// context + compaction params. Profiles with no `primary`-role model are
-/// skipped (can't recommend a load with no inference target).
+/// Reads the profile registry and returns each profile's default-worker model
+/// context + compaction params. Empty profiles (no models) are skipped (can't
+/// recommend a load with no inference target).
 fn collect_profile_capacities(
     reg: &crate::types::ProfileRegistry,
 ) -> Vec<(String, ProfileCapacity)> {
-    use crate::types::ModelRole;
     let mut out: Vec<(String, ProfileCapacity)> = reg
         .profiles
         .iter()
         .filter_map(|(name, profile)| {
+            // (#590) The default worker (default_model, or first model).
             let primary = profile
-                .models
-                .iter()
-                .find(|m| matches!(m.role, ModelRole::Primary))?;
-            let has_compactor = profile
-                .models
-                .iter()
-                .any(|m| matches!(m.role, ModelRole::Compactor));
+                .default_model_id()
+                .and_then(|id| profile.models.iter().find(|m| m.id == id))?;
+            // (#590) The compactor signal is the machine-level internal.utility
+            // binding now, not a role in the profile's models[].
+            let has_compactor = reg.utility_model_id().is_some();
             // Resolve the compaction ratio for sprint budget projections.
             // Precedence: typed `threshold_ratio` (#368 clean-break
             // primary surface) → 0.35 default.
@@ -971,7 +969,7 @@ pub fn sprint_review(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ModelRole, Profile, ProfileModel, ProfileRegistry};
+    use crate::types::{Profile, ProfileModel, ProfileRegistry};
     use std::collections::BTreeMap;
 
     fn fixture_registry() -> ProfileRegistry {
@@ -980,10 +978,10 @@ mod tests {
             "fast".to_string(),
             Profile {
                 description: None,
+                default_model: None,
                 models: vec![ProfileModel {
                     id: "primary".into(),
                     n_ctx: 32000,
-                    role: ModelRole::Primary,
                     capabilities: Default::default(),
                     identifier: None,
                 }],
@@ -995,18 +993,17 @@ mod tests {
             "balanced".to_string(),
             Profile {
                 description: None,
+                default_model: None,
                 models: vec![
                     ProfileModel {
                         id: "primary".into(),
                         n_ctx: 101000,
-                        role: ModelRole::Primary,
                         capabilities: Default::default(),
                         identifier: None,
                     },
                     ProfileModel {
                         id: "compactor".into(),
                         n_ctx: 68000,
-                        role: ModelRole::Compactor,
                         capabilities: Default::default(),
                         identifier: None,
                     },
@@ -1019,18 +1016,17 @@ mod tests {
             "deep".to_string(),
             Profile {
                 description: None,
+                default_model: None,
                 models: vec![
                     ProfileModel {
                         id: "primary".into(),
                         n_ctx: 262144,
-                        role: ModelRole::Primary,
                         capabilities: Default::default(),
                         identifier: None,
                     },
                     ProfileModel {
                         id: "compactor".into(),
                         n_ctx: 120000,
-                        role: ModelRole::Compactor,
                         capabilities: Default::default(),
                         identifier: None,
                     },
