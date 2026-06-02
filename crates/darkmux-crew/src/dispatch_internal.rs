@@ -25,7 +25,7 @@ use crate::dispatch::DispatchOpts;
 use crate::loader::{load_autonomous_dispatch_preamble, load_role_prompt, load_roles};
 use anyhow::{anyhow, bail, Context, Result};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -36,6 +36,24 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// `runtime/Dockerfile`. Will become configurable when production
 /// hardening lands.
 const RUNTIME_IMAGE: &str = "darkmux-runtime:latest";
+
+/// Add the two host→container bind mounts to the docker run command:
+/// the agent's `/workspace` and the runtime's out-of-band bookkeeping
+/// dir at `/darkmux-out`. Both mount-point literals are duplicated here
+/// (not shared from the runtime crate) by necessity — the runtime is
+/// built INTO the Docker image, not linked against this crate, so the
+/// `/darkmux-out` literal MUST be kept in sync with
+/// `runtime::trajectory::RUNTIME_OUT_BASE` by hand.
+///
+/// Extracted from the docker-spawn site so the mount-translation rule is
+/// unit-testable without spawning a container (same rationale as
+/// `apply_compaction_flags`).
+fn apply_volume_mounts(cmd: &mut Command, workspace: &Path, host_out: &Path) {
+    cmd.arg("-v")
+        .arg(format!("{}:/workspace", workspace.display()))
+        .arg("-v")
+        .arg(format!("{}:/darkmux-out", host_out.display()));
+}
 
 /// (#368) Translate the host-side `CompactionDispatchArgs` into
 /// runtime CLI flags. Each `Some(v)` becomes a `--flag v` pair on
@@ -329,6 +347,25 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         workspace_source
     );
 
+    // 4b. Out-of-band bookkeeping dir. The runtime writes its OWN
+    //     `.darkmux-runtime/{trajectory.jsonl, metrics.json,
+    //     compaction-<gen>.json}` here — SEPARATE from /workspace so a
+    //     `--workdir` repo never gets a `.darkmux-runtime` dropping in
+    //     the tree it's operating on. Mounted at `/darkmux-out` inside
+    //     the container (see the `-v` arg below).
+    //
+    //     Derived from the container_name's unique micros component so
+    //     two concurrent dispatches never collide. Like the workspace,
+    //     this is NOT auto-cleaned — the operator inspects
+    //     trajectory.jsonl + metrics.json after the container exits.
+    let host_out = std::env::temp_dir().join(format!("darkmux-out-{}-{unix_micros}", opts.role_id));
+    fs::create_dir_all(&host_out)
+        .with_context(|| format!("creating dispatch out-dir: {}", host_out.display()))?;
+    eprintln!(
+        "darkmux crew dispatch: out-dir={} (runtime bookkeeping → /darkmux-out)",
+        host_out.display()
+    );
+
     // 5. Emit dispatch.start flow record with runtime metadata in payload
     //    (#204). Pairs with dispatch.complete below via session_id, same
     //    as the openclaw path does.
@@ -375,10 +412,12 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     cmd.arg("run")
         .arg("--rm")
         .arg("--name")
-        .arg(&container_name)
-        .arg("-v")
-        .arg(format!("{}:/workspace", workspace.display()))
-        .arg(RUNTIME_IMAGE)
+        .arg(&container_name);
+    // `/workspace` (the agent's tree) + `/darkmux-out` (the runtime's
+    // out-of-band bookkeeping). `/darkmux-out` MUST match
+    // `runtime::trajectory::RUNTIME_OUT_BASE` — see `apply_volume_mounts`.
+    apply_volume_mounts(&mut cmd, &workspace, &host_out);
+    cmd.arg(RUNTIME_IMAGE)
         .arg("run")
         .arg("--model")
         .arg(&model)
@@ -472,7 +511,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     let child = cmd.spawn().context("spawning darkmux-runtime container")?;
 
     // 7. Live trajectory tailer (#231). Background thread polls
-    //    `<workspace>/.darkmux-runtime/trajectory.jsonl` every 250ms while
+    //    `<host_out>/.darkmux-runtime/trajectory.jsonl` every 250ms while
     //    the container runs; emits flow records in real time:
     //
     //      - `model.completed`  → `dispatch.turn`
@@ -504,14 +543,16 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     let stop_flag = Arc::new(AtomicBool::new(false));
     let tailer_handle = {
         let stop = Arc::clone(&stop_flag);
-        let workspace = workspace.clone();
+        // (#out-of-band) The trajectory now lands in the out-dir, not the
+        // workspace. The tailer reads from there.
+        let out_dir = host_out.clone();
         let session_id = session_id.clone();
         let role_id = opts.role_id.clone();
         let model = model.clone();
         let inactivity_deadline = Arc::clone(&inactivity_deadline);
         thread::spawn(move || {
             run_tailer(
-                workspace,
+                out_dir,
                 session_id,
                 role_id,
                 model,
@@ -652,6 +693,11 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         stderr,
         session_id,
         watched_state: Vec::new(),
+        // Host path where the runtime's `.darkmux-runtime/` bookkeeping
+        // landed (mounted at `/darkmux-out` in the container). Threaded
+        // to coding_task so it reads the trajectory from here rather than
+        // from the sandbox.
+        out_dir: Some(host_out),
     })
 }
 
@@ -696,7 +742,11 @@ const MAX_REASONING_TEXT_BYTES: usize = 256 * 1024;
 /// trajectory event lands. `inactivity_secs` is the timeout window
 /// used to compute the new deadline (`now + inactivity_secs`).
 fn run_tailer(
-    workspace: PathBuf,
+    // Host path mounted into the container at `/darkmux-out` — where the
+    // runtime writes its `.darkmux-runtime/trajectory.jsonl`. SEPARATE
+    // from the workspace so the tailer reads the runtime's own
+    // bookkeeping, not the tree the agent is editing.
+    out_dir: PathBuf,
     session_id: String,
     role_id: String,
     model: String,
@@ -704,7 +754,7 @@ fn run_tailer(
     inactivity_deadline: Arc<Mutex<Instant>>,
     inactivity_secs: u64,
 ) -> TrajectorySummary {
-    let trajectory_path = workspace
+    let trajectory_path = out_dir
         .join(".darkmux-runtime")
         .join("trajectory.jsonl");
     let mut state = TailerState::new(
@@ -1531,6 +1581,41 @@ mod tests {
         cmd.get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
+    }
+
+    // ─── out-of-band bookkeeping: volume mounts ──────────────────────
+
+    #[test]
+    fn apply_volume_mounts_emits_workspace_and_out_dir() {
+        // The runtime's OWN bookkeeping goes to `/darkmux-out`, SEPARATE
+        // from the agent's `/workspace`. This literal MUST stay in sync
+        // with `runtime::trajectory::RUNTIME_OUT_BASE` (the two crates
+        // can't share the const — the runtime is built into the image).
+        let mut cmd = Command::new("docker");
+        apply_volume_mounts(
+            &mut cmd,
+            Path::new("/host/workspace"),
+            Path::new("/host/out"),
+        );
+        let args = args_of(&cmd);
+        assert_eq!(
+            args,
+            vec![
+                "-v",
+                "/host/workspace:/workspace",
+                "-v",
+                "/host/out:/darkmux-out",
+            ],
+            "both binds present; out-dir mounts at /darkmux-out"
+        );
+        // Defensive: the runtime must NOT be told to write its
+        // bookkeeping into the workspace tree.
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.ends_with(":/workspace") && a.contains("/host/out")),
+            "out-dir must not be mounted at /workspace"
+        );
     }
 
     // ─── #408: strict-selection opt-in parsing ───────────────────────

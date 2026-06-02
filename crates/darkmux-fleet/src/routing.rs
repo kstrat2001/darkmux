@@ -395,6 +395,9 @@ fn dispatch_via_queue(opts: DispatchOpts, target_machine: Option<&str>) -> Resul
             stderr: String::new(),
             session_id,
             watched_state: Vec::new(),
+            // Remote/queue path: the runtime's bookkeeping lands on the
+            // worker, not on this dispatching host.
+            out_dir: None,
         });
     }
 
@@ -448,6 +451,9 @@ pub(crate) fn completion_to_dispatch_result(c: CompletionResult) -> DispatchResu
         stderr: String::new(),
         session_id: c.session_id,
         watched_state: Vec::new(),
+        // Remote/queue path: the runtime's bookkeeping lands on the
+        // worker, not on this dispatching host.
+        out_dir: None,
     }
 }
 

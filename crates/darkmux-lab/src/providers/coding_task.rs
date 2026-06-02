@@ -245,6 +245,11 @@ impl WorkloadProvider for CodingTaskProvider {
         };
 
         let started = std::time::Instant::now();
+        // `dispatch_out_dir` is the host path where the internal runtime
+        // wrote its `.darkmux-runtime/` bookkeeping. `None` for the
+        // openclaw path (and pre-image-rebuild internal dispatches) ⇒ the
+        // copy site falls back to the legacy sandbox_dir location.
+        let mut dispatch_out_dir: Option<PathBuf> = None;
         let (stdout, stderr, ok) = match runtime {
             darkmux_crew::dispatch::Runtime::Internal => {
                 // (#368) Derive compaction config from the active
@@ -260,14 +265,16 @@ impl WorkloadProvider for CodingTaskProvider {
                 // Pass sandbox_dir as --workdir so the runtime mounts
                 // it at /workspace, matching the placeholder
                 // substitution above (#337 fix).
-                dispatch_via_internal(
+                let (stdout, stderr, ok, out_dir) = dispatch_via_internal(
                     &role,
                     &prompt,
                     &session_id,
                     Some(sandbox_dir.to_path_buf()),
                     compaction,
                     profile_name,
-                )?
+                )?;
+                dispatch_out_dir = out_dir;
+                (stdout, stderr, ok)
             }
             darkmux_crew::dispatch::Runtime::Openclaw => {
                 dispatch_via_openclaw(runtime_cmd, &role, &prompt, &session_id)?
@@ -281,10 +288,10 @@ impl WorkloadProvider for CodingTaskProvider {
         }
 
         // (#364) Per-run preservation of the runtime's trajectory +
-        // metrics.json. The runtime writes both into
-        // `<sandbox>/.darkmux-runtime/` — but the sandbox is shared
-        // across all dispatches of the same workload, so the NEXT
-        // dispatch overwrites these files. Copy them into run_dir
+        // metrics.json. The runtime writes both into the out-of-band
+        // bookkeeping dir (`<out_dir>/.darkmux-runtime/`) — but that dir
+        // is reused across all dispatches of the same workload, so the
+        // NEXT dispatch overwrites these files. Copy them into run_dir
         // before that can happen. Phase B dogfood (Beat 39, 2026-05-25)
         // surfaced the methodology gap: per-run aggregator-side
         // analysis was reading the latest dispatch's data for every
@@ -292,7 +299,19 @@ impl WorkloadProvider for CodingTaskProvider {
         let mut trajectory_path: Option<PathBuf> = None;
         match runtime {
             darkmux_crew::dispatch::Runtime::Internal => {
-                let runtime_dir = sandbox_dir.join(".darkmux-runtime");
+                // Read from the dispatch's out-dir. For the internal path
+                // `out_dir` is ALWAYS `Some` (the host allocates + mounts it),
+                // so the `unwrap_or(sandbox_dir)` fallback only catches the
+                // openclaw/remote cases that legitimately have no out-dir.
+                // There is NO safe pre-rebuild gap for the internal path: an
+                // un-rebuilt image still writes the trajectory into /workspace,
+                // which the new tailer never reads, so the #457 watchdog would
+                // hard-kill productive dispatches. The host-code change and the
+                // darkmux-runtime image rebuild must land atomically.
+                let runtime_dir = dispatch_out_dir
+                    .as_deref()
+                    .unwrap_or(sandbox_dir)
+                    .join(".darkmux-runtime");
                 // `src.exists()` gate is intentional: a #363-timeout
                 // dispatch may have written partial trajectory but no
                 // metrics.json. Copying what's there preserves forensic
@@ -471,7 +490,9 @@ impl WorkloadProvider for CodingTaskProvider {
         //      sandbox source.
         //   2. `<sandbox>/.darkmux-runtime/metrics.json` — live source.
         //      Backward-compat for runs predating #364 that don't have
-        //      the per-run copy yet.
+        //      the per-run copy yet. Old-run-only once the runtime writes
+        //      out-of-band (#611): new runs no longer leave metrics in the
+        //      sandbox, so tier 1 is always authoritative for them.
         let runtime_metrics = read_metrics_json(&run_dir.join("metrics.json")).or_else(|| {
             meta.get("sandbox")
                 .and_then(|v| v.as_str())
@@ -742,7 +763,7 @@ fn dispatch_via_internal(
     workdir: Option<PathBuf>,
     compaction: darkmux_crew::dispatch::CompactionDispatchArgs,
     profile_name: &str,
-) -> Result<(String, String, bool)> {
+) -> Result<(String, String, bool, Option<PathBuf>)> {
     use darkmux_crew::dispatch::{dispatch, DispatchOpts, Runtime};
     let opts = DispatchOpts {
         role_id: role_id.to_string(),
@@ -766,7 +787,16 @@ fn dispatch_via_internal(
         profile_name: Some(profile_name.to_string()),
     };
     let result = dispatch(opts).context("internal-runtime dispatch via lab harness")?;
-    Ok((result.stdout, result.stderr, result.exit_code == 0))
+    // `out_dir` is the host path where the runtime wrote its
+    // `.darkmux-runtime/` bookkeeping (trajectory + metrics). Threaded
+    // back to the copy-into-run_dir site. `None` pre-image-rebuild ⇒
+    // caller falls back to the legacy sandbox_dir location.
+    Ok((
+        result.stdout,
+        result.stderr,
+        result.exit_code == 0,
+        result.out_dir,
+    ))
 }
 
 /// Dispatch via the legacy openclaw shell-out path. Shells out with the

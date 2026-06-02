@@ -515,6 +515,11 @@ pub struct DispatchResult {
     /// order. Surfaces the actual filesystem so the operator can compare
     /// against the SIGNOFF block's "files written" claims (#89).
     pub watched_state: Vec<WatchedPathState>,
+    /// Host path where the internal runtime's `.darkmux-runtime/`
+    /// bookkeeping landed (the dir mounted into the container at
+    /// `/darkmux-out`). `None` for the openclaw runtime, which writes no
+    /// such out-of-band bookkeeping.
+    pub out_dir: Option<PathBuf>,
 }
 
 /// Process-local monotonic counter — guarantees uniqueness for rapid
@@ -1240,6 +1245,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         stderr: stderr_text,
         session_id: resolved_session_id,
         watched_state,
+        // openclaw writes no out-of-band runtime bookkeeping dir.
+        out_dir: None,
     })
 }
 

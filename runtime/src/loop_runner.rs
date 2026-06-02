@@ -835,7 +835,7 @@ pub fn run(
                     // USER message). StructuredSlot is tier-2 (typed
                     // schema + JSON mode + SYSTEM message); on
                     // success the parsed output is persisted to
-                    // `/workspace/.darkmux-runtime/compaction-<gen>.json`
+                    // `<RUNTIME_OUT_BASE>/.darkmux-runtime/compaction-<gen>.json`
                     // per #352 Step 5 "persistence falls out for free."
                     match compaction_cfg.strategy {
                         compaction::CompactionStrategy::Narrative => {
@@ -877,7 +877,7 @@ pub fn run(
                             // NOT fail the dispatch — observability,
                             // not correctness.
                             persist_structured_compaction_output(
-                                std::path::Path::new("/workspace/.darkmux-runtime"),
+                                &crate::trajectory::runtime_dir(),
                                 compactions,
                                 &parsed,
                             );
