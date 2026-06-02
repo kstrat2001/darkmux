@@ -64,6 +64,77 @@ fn ctx_sufficient(loaded_ctx: u32, wanted_n_ctx: u32) -> bool {
     loaded_ctx >= wanted_n_ctx
 }
 
+/// (#590) The context window at which swap loads the machine's standing
+/// **utility model**, when `internal.utility` is registered. The utility binding
+/// (`RegistryInternal`) carries only a model id — no `n_ctx` — so swap needs a
+/// default. 68K is the empirically-grounded small-utility context darkmux has
+/// shipped as the compactor default (see `darkmux-heuristics` `m_series_*`
+/// compactor sizing and `DEFAULT_COMPACTOR_ID`); a utility model summoned for
+/// compaction / estimation rarely needs more. This is a *minimum*, not a
+/// prescription (the #600 `ctx_sufficient` semantics): an operator who has
+/// already loaded the utility model larger keeps that load. Tuning the utility
+/// context via a `utility_n_ctx` config knob is a deliberate follow-up, not
+/// shipped here (KISS).
+const DEFAULT_UTILITY_N_CTX: u32 = 68_000;
+
+/// One model swap intends to have resident: the LMStudio model key to load,
+/// the darkmux-namespaced identifier to load it under, and the minimum context.
+struct DesiredLoad {
+    /// Bare LMStudio model key passed to `lms load` (the catalog id).
+    model_key: String,
+    /// Namespaced identifier the load is tagged with (`darkmux:<…>`), so the
+    /// unload-filter and `model eject` recognize it as darkmux-owned.
+    identifier: String,
+    /// Minimum context window (n_ctx-as-minimum, #600).
+    n_ctx: u32,
+}
+
+/// (#590) Resolve the `(model_key, namespaced_identifier)` pair to load for the
+/// machine's configured utility model id. The operator may store **either** the
+/// bare LMStudio model key (`qwen3-4b-instruct-2507`) or the darkmux-namespaced
+/// identifier (`darkmux:qwen3-4b-instruct-2507`) — both are accepted, matching
+/// the same dual-form tolerance the doctor + dispatch preflight use when
+/// checking loaded state. Either way the model loads UNDER the darkmux
+/// namespace so swap's unload-filter and `model eject` recognize it as
+/// darkmux-owned (never double-prefixed).
+fn utility_load_target(util_id: &str) -> (String, String) {
+    match util_id.strip_prefix(DARKMUX_LMS_NAMESPACE) {
+        // Already namespaced — load the bare key under the stored identifier.
+        Some(bare) => (bare.to_string(), util_id.to_string()),
+        // Bare key — wrap it under the namespace.
+        None => (util_id.to_string(), format!("{DARKMUX_LMS_NAMESPACE}{util_id}")),
+    }
+}
+
+/// (#590) Everything a swap to `profile` wants resident: the profile's worker
+/// models, plus the machine's standing utility model (`internal.utility`) when
+/// registered. The utility model is loaded *alongside* the workers so
+/// compaction finds it resident mid-dispatch — and because it lives in the
+/// machine-level `internal` binding (not any profile's `models[]`), it survives
+/// every worker-profile swap. A utility model that happens to duplicate a
+/// declared worker is loaded once (the worker entry wins, keeping its declared
+/// context). Pure: the caller owns the `lms ps` / load I/O.
+fn desired_loads(profile: &Profile, registry: &ProfileRegistry) -> Vec<DesiredLoad> {
+    let mut loads: Vec<DesiredLoad> = profile
+        .models
+        .iter()
+        .map(|m| DesiredLoad {
+            model_key: m.id.clone(),
+            identifier: namespaced_identifier(m),
+            n_ctx: m.n_ctx,
+        })
+        .collect();
+    if let Some(util_id) = registry.utility_model_id() {
+        let (model_key, identifier) = utility_load_target(util_id);
+        // Don't load twice if the utility model is also a declared worker —
+        // the worker entry already covers it (and keeps its declared context).
+        if !loads.iter().any(|l| l.identifier == identifier) {
+            loads.push(DesiredLoad { model_key, identifier, n_ctx: DEFAULT_UTILITY_N_CTX });
+        }
+    }
+    loads
+}
+
 pub fn swap(profile: &Profile, registry: &ProfileRegistry, opts: SwapOpts) -> Result<SwapResult> {
     let t0 = Instant::now();
     let mut result = SwapResult::default();
@@ -71,11 +142,14 @@ pub fn swap(profile: &Profile, registry: &ProfileRegistry, opts: SwapOpts) -> Re
     let pre = registry.hooks.as_ref().map(|h| h.pre_swap.as_slice()).unwrap_or(&[]);
     result.hooks_ran += run_hooks(pre, profile, &opts);
 
-    // Map of namespaced identifier → desired context length for everything
-    // the new profile wants loaded.
+    // Everything this swap wants resident: the profile's worker models plus the
+    // machine's standing utility model (#590). Map of namespaced identifier →
+    // desired (minimum) context length, used to drive the Pass-1 unload
+    // decision below.
+    let desired = desired_loads(profile, registry);
     let mut want: HashMap<String, u32> = HashMap::new();
-    for m in &profile.models {
-        want.insert(namespaced_identifier(m), m.n_ctx);
+    for d in &desired {
+        want.insert(d.identifier.clone(), d.n_ctx);
     }
 
     let loaded = lms::list_loaded()?;
@@ -110,20 +184,19 @@ pub fn swap(profile: &Profile, registry: &ProfileRegistry, opts: SwapOpts) -> Re
         .filter(|lm| !result.unloaded.iter().any(|u| u == &lm.identifier))
         .map(|lm| (lm.identifier.as_str(), lm))
         .collect();
-    for m in &profile.models {
-        let ident = namespaced_identifier(m);
-        if let Some(c) = loaded_after_unload.get(ident.as_str()) {
-            if ctx_sufficient(c.context as u32, m.n_ctx) {
+    for d in &desired {
+        if let Some(c) = loaded_after_unload.get(d.identifier.as_str()) {
+            if ctx_sufficient(c.context as u32, d.n_ctx) {
                 continue; // already loaded with enough context (n_ctx is a min)
             }
         }
         if !opts.quiet {
-            println!("load {ident} @ ctx={}", m.n_ctx);
+            println!("load {} @ ctx={}", d.identifier, d.n_ctx);
         }
         if !opts.dry_run {
-            lms::load_with_identifier(&m.id, m.n_ctx, &ident, opts.quiet)?;
+            lms::load_with_identifier(&d.model_key, d.n_ctx, &d.identifier, opts.quiet)?;
         }
-        result.loaded.push(ident);
+        result.loaded.push(d.identifier.clone());
     }
 
     if !opts.dry_run {
@@ -172,10 +245,19 @@ fn run_hooks(hooks: &[ProfileHookCommand], profile: &Profile, opts: &SwapOpts) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use darkmux_types::{Profile, ProfileModel, ProfileRuntime};
+    use darkmux_types::{Profile, ProfileModel, ProfileRegistry, ProfileRuntime, RegistryInternal};
 
     fn opts() -> SwapOpts {
         SwapOpts { quiet: true, dry_run: true }
+    }
+
+    /// A registry whose `internal.utility` is `util` (or no `internal` block
+    /// when `None`). Profiles are irrelevant to the utility-load helpers.
+    fn registry_with_utility(util: Option<&str>) -> ProfileRegistry {
+        ProfileRegistry {
+            internal: util.map(|u| RegistryInternal { utility: Some(u.to_string()) }),
+            ..Default::default()
+        }
     }
 
     fn profile_with(desc: &str, runtime: Option<ProfileRuntime>) -> Profile {
@@ -238,6 +320,84 @@ mod tests {
         assert!(ctx_sufficient(64_000, 64_000));
         // Only an insufficient load triggers a reload.
         assert!(!ctx_sufficient(64_000, 200_000));
+    }
+
+    #[test]
+    fn utility_load_target_wraps_a_bare_model_key() {
+        // The profiles.example.json form: a bare LMStudio catalog id. Loaded
+        // under the darkmux namespace; the bare key drives the actual load.
+        let (key, ident) = utility_load_target("qwen3-4b-instruct-2507");
+        assert_eq!(key, "qwen3-4b-instruct-2507");
+        assert_eq!(ident, "darkmux:qwen3-4b-instruct-2507");
+    }
+
+    #[test]
+    fn utility_load_target_accepts_a_namespaced_id_without_double_prefixing() {
+        // The DEFAULT_COMPACTOR_MODEL / doctor-test form: already namespaced.
+        // The bare key is recovered for the load; the identifier is kept as-is.
+        let (key, ident) = utility_load_target("darkmux:qwen3-4b-instruct-2507");
+        assert_eq!(key, "qwen3-4b-instruct-2507");
+        assert_eq!(ident, "darkmux:qwen3-4b-instruct-2507");
+    }
+
+    #[test]
+    fn desired_loads_appends_the_registered_utility_model() {
+        // Worker "m" (ctx 1000) + a registered utility model "util-4b".
+        let profile = profile_with("p", None);
+        let registry = registry_with_utility(Some("util-4b"));
+        let loads = desired_loads(&profile, &registry);
+        assert_eq!(loads.len(), 2);
+        assert!(loads.iter().any(|l| l.identifier == "darkmux:m" && l.n_ctx == 1000));
+        let util = loads.iter().find(|l| l.identifier == "darkmux:util-4b").unwrap();
+        assert_eq!(util.model_key, "util-4b");
+        // The utility model loads at the empirical default context.
+        assert_eq!(util.n_ctx, DEFAULT_UTILITY_N_CTX);
+    }
+
+    #[test]
+    fn desired_loads_without_a_utility_binding_is_workers_only() {
+        let profile = profile_with("p", None);
+        let loads = desired_loads(&profile, &registry_with_utility(None));
+        assert_eq!(loads.len(), 1);
+        assert_eq!(loads[0].identifier, "darkmux:m");
+    }
+
+    #[test]
+    fn desired_loads_does_not_double_load_a_utility_that_is_also_a_worker() {
+        // The operator declared the same model as both a worker and the
+        // utility model — load it once, keeping the worker's declared context
+        // (not the utility default).
+        let profile = profile_with("p", None); // worker id "m" @ ctx 1000
+        let loads = desired_loads(&profile, &registry_with_utility(Some("m")));
+        assert_eq!(loads.len(), 1, "duplicate utility/worker isn't loaded twice");
+        assert_eq!(loads[0].n_ctx, 1000, "worker's declared context wins over the utility default");
+    }
+
+    #[test]
+    fn desired_loads_dedups_when_worker_identifier_collides_with_util_identifier() {
+        // (#590 NIT) A worker whose explicit `identifier` happens to equal the
+        // util model's namespaced identifier dedups to ONE load (by identifier),
+        // and the worker entry wins — so the `darkmux:util-4b` slot loads the
+        // worker's model key, not the util's. This is operator misconfiguration
+        // (the doctor/preflight will WARN "util not loaded" because the stored
+        // `util-4b` matches neither the loaded `.model` nor `.identifier`), but
+        // it must never produce two competing loads of the same identifier.
+        let profile = Profile {
+            description: None,
+            models: vec![ProfileModel {
+                id: "worker-35b".into(),
+                n_ctx: 100_000,
+                capabilities: Default::default(),
+                identifier: Some("darkmux:util-4b".into()),
+            }],
+            default_model: None,
+            runtime: None,
+            use_when: None,
+        };
+        let loads = desired_loads(&profile, &registry_with_utility(Some("util-4b")));
+        assert_eq!(loads.len(), 1, "collision must dedup to a single load");
+        assert_eq!(loads[0].identifier, "darkmux:util-4b");
+        assert_eq!(loads[0].model_key, "worker-35b", "the worker entry wins the identifier slot");
     }
 
     #[test]
