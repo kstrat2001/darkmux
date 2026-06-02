@@ -15,12 +15,12 @@ use std::path::{Path, PathBuf};
 ///      installs (also makes the path injectable from tests)
 ///   3. Default `~/.openclaw/openclaw.json`
 ///
-/// The gate on whether to patch at all is openclaw-config-on-disk:
-/// `apply_runtime` quiet-skips when the resolved file doesn't exist, so
-/// machines without openclaw installed see no behavior change. There is no
-/// per-profile "runtime kind" to gate on — runtime is chosen per-dispatch
-/// via `--runtime`, so file presence is the signal, matching doctor's
-/// `openclaw_active()` check.
+/// (#590) The patch is gated on EXPLICIT operator opt-in: `darkmux swap`
+/// invokes `apply_runtime` only under `--runtime openclaw`; the default
+/// internal-runtime swap never reaches it (`doctor --fix` is the other opt-in
+/// caller). The file-presence quiet-skip in `apply_runtime` is now
+/// defense-in-depth, NOT the primary gate — file-presence is not operator
+/// intent (an operator who tried openclaw once still has the file on disk).
 ///
 /// Exposed for `doctor --fix`, which has no profile context but still
 /// needs to find the openclaw config to apply ctx-window fixes.
@@ -45,9 +45,9 @@ pub fn resolve_openclaw_config_path(explicit_path: Option<&str>) -> Option<PathB
 ///   - **Genuinely runtime-customization** (gated on `profile.runtime`):
 ///     - `agents.defaults.contextTokens` (from `runtime.contextTokens`)
 ///     - `agents.defaults.compaction` (merged with `runtime.compaction`)
-///   - **Inherent to namespaced loading** (always runs whenever there's an
-///     openclaw config to update — these aren't customizations, they're
-///     consequences of `darkmux swap` issuing namespaced `lms load`s):
+///   - **Inherent to namespaced loading** (runs whenever `apply_runtime` is
+///     invoked — these aren't customizations, they're consequences of an
+///     openclaw-targeted swap issuing namespaced `lms load`s):
 ///     - `agents.defaults.model.primary` rewritten to the profile's default
 ///       worker (`default_model`, or the first model) namespaced identifier —
 ///       replaces any prior pin, not just bare→namespaced (see #90; without
@@ -62,12 +62,12 @@ pub fn resolve_openclaw_config_path(explicit_path: Option<&str>) -> Option<PathB
 ///       for any matching bare-or-namespaced id
 ///     - Namespaced registry entries added when missing (see #61)
 ///
-/// Path resolution falls back to `~/.openclaw/openclaw.json` when the
-/// profile has no `runtime.config_path`. When the resolved file is
-/// absent (no openclaw installed), `apply_runtime` returns `Ok(false)`
-/// quietly — openclaw-config-on-disk is the gate (matching doctor's
-/// `openclaw_active()`). There is no per-profile runtime kind to gate on;
-/// runtime is a per-dispatch choice (`--runtime`).
+/// Path resolution falls back to `~/.openclaw/openclaw.json` when the profile
+/// has no `runtime.config_path`. When the resolved file is absent,
+/// `apply_runtime` returns `Ok(false)` quietly (defense-in-depth). (#590) The
+/// PRIMARY gate is the caller's explicit opt-in — `darkmux swap` reaches here
+/// only under `--runtime openclaw`; the default internal-runtime swap never
+/// invokes it, so it never patches openclaw config.
 ///
 /// Returns true if the file was modified.
 pub fn apply_runtime(profile: &Profile) -> Result<bool> {
@@ -158,10 +158,12 @@ pub fn apply_runtime(profile: &Profile) -> Result<bool> {
         }
     }
 
-    // ─── Namespaced-load sync (always runs when there's a config to update) ──
+    // ─── Namespaced-load sync (runs whenever apply_runtime is invoked) ──
     // These aren't operator customizations — they're consequences of issuing
-    // namespaced `lms load`s in swap.rs. Without them, openclaw's view of the
-    // model registry drifts from `lms ps` every swap (issue #72).
+    // namespaced `lms load`s. Without them, openclaw's view of the model
+    // registry drifts from `lms ps`. apply_runtime is reached ONLY on an
+    // openclaw-opted-in swap (`--runtime openclaw`); the default internal swap
+    // never gets here (#590, issue #72).
     if sync_default_model_pins(&mut config, profile) {
         modified = true;
     }
