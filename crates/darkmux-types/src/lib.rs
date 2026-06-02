@@ -332,8 +332,19 @@ impl ProfileRegistry {
     /// The machine's registered utility model id (`internal.utility`), if any.
     /// `None` ⇒ no machine utility model registered; consumers fall back to
     /// their built-in default. (#590)
+    ///
+    /// Surrounding whitespace is trimmed and a blank value (`""` / whitespace)
+    /// is treated as **unset** — an empty binding is meaningless, and since
+    /// `swap` now *loads* this model (not just displays it), a blank value
+    /// would otherwise attempt to load the bare `darkmux:` identifier. Trimming
+    /// also keeps the value matchable against the un-padded loaded-model fields
+    /// the doctor + dispatch preflight compare against.
     pub fn utility_model_id(&self) -> Option<&str> {
-        self.internal.as_ref().and_then(|i| i.utility.as_deref())
+        self.internal
+            .as_ref()
+            .and_then(|i| i.utility.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
     }
 }
 
@@ -509,6 +520,22 @@ mod tests {
         // as an empty object — `{"internal":{}}` — and never carries a
         // `utility` key. (The empty `internal` block itself is NOT dropped.)
         assert!(!serde_json::to_string(&reg).unwrap().contains("utility"));
+    }
+
+    #[test]
+    fn registry_blank_utility_is_treated_as_unset() {
+        // A blank or whitespace-only `utility` value is meaningless and reads
+        // as "no util model" — guards swap (#590) against trying to load the
+        // bare `darkmux:` identifier. Surrounding whitespace is also trimmed.
+        for blank in ["\"\"", "\"   \"", "\"\\t\\n\""] {
+            let json = format!(r#"{{ "profiles": {{}}, "internal": {{ "utility": {blank} }} }}"#);
+            let reg: ProfileRegistry = serde_json::from_str(&json).unwrap();
+            assert_eq!(reg.utility_model_id(), None, "blank {blank} should be unset");
+        }
+        // A padded real id trims to the bare id (so it still matches loaded state).
+        let json = r#"{ "profiles": {}, "internal": { "utility": "  darkmux:util-4b  " } }"#;
+        let reg: ProfileRegistry = serde_json::from_str(json).unwrap();
+        assert_eq!(reg.utility_model_id(), Some("darkmux:util-4b"));
     }
 
     // ─── RuntimeCompactionConfig (v0.1 schema extension, #357) ──────────
