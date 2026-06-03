@@ -1,9 +1,5 @@
 //! `darkmux serve` — minimal HTTP daemon for flow record retrieval.
 
-mod aliases;
-
-pub use aliases::IdentityAliases;
-
 use anyhow::Result;
 use axum::{
     extract::{Path, State},
@@ -15,35 +11,12 @@ use axum::{
 use futures::stream::{self, Stream};
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 /// Application state shared across handlers.
 #[derive(Clone)]
 struct AppState {
     flows_dir: PathBuf,
-    /// View-time `machine_id` → canonical-name table (#629). Empty when no
-    /// `~/.darkmux/identity-aliases.json` (or override) is present;
-    /// rewrite passes are cheap no-ops in that case.
-    aliases: Arc<IdentityAliases>,
-}
-
-/// Resolve the path to the identity-aliases file (#629). Honors
-/// `DARKMUX_IDENTITY_ALIASES_FILE` for testing/overrides; otherwise looks
-/// at `~/.darkmux/identity-aliases.json`. Returns a path even when nothing
-/// exists at that location — `IdentityAliases::load_or_default` handles
-/// the missing-file case gracefully.
-fn identity_aliases_path() -> PathBuf {
-    if let Ok(override_path) = std::env::var("DARKMUX_IDENTITY_ALIASES_FILE") {
-        if !override_path.trim().is_empty() {
-            return PathBuf::from(override_path);
-        }
-    }
-    std::env::var("HOME")
-        .ok()
-        .filter(|h| !h.trim().is_empty())
-        .map(|h| PathBuf::from(h).join(".darkmux").join("identity-aliases.json"))
-        .unwrap_or_else(|| PathBuf::from(".darkmux/identity-aliases.json"))
 }
 
 /// Validate a path segment as `YYYY-MM-DD.jsonl` format.
@@ -141,25 +114,10 @@ async fn play_html(Path(date): Path<String>) -> impl IntoResponse {
     }
 }
 
-/// Build the HTTP router with a configurable flows directory and empty
-/// alias table. Test-only convenience — production callers go through
-/// `build_router_with_aliases` to load `~/.darkmux/identity-aliases.json`.
-#[cfg(test)]
+/// Build the HTTP router with a configurable flows directory. The daemon's
+/// `run` entry point and the integration tests both go through here.
 pub(crate) fn build_router(flows_dir: PathBuf) -> Router {
-    build_router_with_aliases(flows_dir, IdentityAliases::empty())
-}
-
-/// Build the HTTP router with an explicit alias table. The daemon's `run`
-/// entry point uses this after loading the on-disk alias file; tests can
-/// inject a synthetic table directly.
-pub(crate) fn build_router_with_aliases(
-    flows_dir: PathBuf,
-    aliases: IdentityAliases,
-) -> Router {
-    let state = AppState {
-        flows_dir,
-        aliases: Arc::new(aliases),
-    };
+    let state = AppState { flows_dir };
     Router::new()
         .route("/", get(root_html))
         .route("/play/:date", get(play_html))
@@ -171,17 +129,8 @@ pub(crate) fn build_router_with_aliases(
         .route("/machine/specs", get(machine_specs_handler))
         .route("/missions", get(missions_handler))
         .route("/sprints", get(sprints_handler))
-        .route("/fleet/aliases", get(fleet_aliases_handler))
         .layer(local_only_cors())
         .with_state(state)
-}
-
-/// GET /fleet/aliases — return the daemon's loaded identity-alias table
-/// (#629). Empty `aliases: []` when none configured. Operators inspect
-/// this to verify their `~/.darkmux/identity-aliases.json` parsed as
-/// expected before changes hit the viewer.
-async fn fleet_aliases_handler(State(state): State<AppState>) -> impl IntoResponse {
-    axum::Json(state.aliases.as_json())
 }
 
 /// CORS layer for the daemon's browser-facing endpoints. **Default**:
@@ -416,26 +365,9 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf) -> Result<()> {
         .build()?;
 
     rt.block_on(async move {
-        // Load identity aliases from ~/.darkmux/identity-aliases.json (#629).
-        // Missing file → empty table; malformed JSON → empty table + stderr
-        // warning. Daemon stays serving either way.
-        let aliases_path = identity_aliases_path();
-        let aliases = IdentityAliases::load_or_default(&aliases_path);
-        let alias_count = aliases.as_json()["aliases"]
-            .as_array()
-            .map(|a| a.len())
-            .unwrap_or(0);
-
-        let app = build_router_with_aliases(flows_dir.clone(), aliases);
+        let app = build_router(flows_dir.clone());
         let addr: std::net::SocketAddr = format!("{bind}:{port}").parse()?;
         let listener = tokio::net::TcpListener::bind(addr).await?;
-
-        if alias_count > 0 {
-            println!(
-                "  identity aliases: {alias_count} canonical(s) loaded from {}",
-                aliases_path.display()
-            );
-        }
 
         // Banner: print after bind succeeds so we don't claim "listening"
         // before we actually are.
@@ -880,12 +812,7 @@ async fn flow_handler(
     let Some(date) = is_valid_date(&segment) else {
         return (StatusCode::BAD_REQUEST, "bad date format").into_response();
     };
-    let mut records = aggregate_flow_records_for_date(date, &state.flows_dir).await;
-    // #629: rewrite `machine_id` per the identity-alias table so the viewer
-    // sees one card per physical machine instead of one per stamped id.
-    // No-op when the alias table is empty (the common case). Records on
-    // disk + in Redis are NOT mutated — this is a view-time transform.
-    state.aliases.rewrite_records(&mut records);
+    let records = aggregate_flow_records_for_date(date, &state.flows_dir).await;
     axum::Json(records).into_response()
 }
 
@@ -1566,7 +1493,7 @@ mod tests {
     use axum::http::Request;
     use std::{fs, path::PathBuf};
     use tower::util::ServiceExt;
-    use tempfile::{NamedTempFile, TempDir};
+    use tempfile::TempDir;
 
     #[tokio::test]
     async fn health_returns_200_with_versions() {
@@ -1706,166 +1633,6 @@ mod tests {
         let play = inject_mode_meta(html, "play", Some("2026-06-03"));
         assert!(play.contains(r#"<meta name="darkmux-mode" content="play">"#));
         assert!(play.contains(r#"<meta name="darkmux-date" content="2026-06-03">"#));
-    }
-
-    // ---- Identity-aliases integration tests (#629) ------------------------
-    //
-    // These exercise the full request-cycle: build_router_with_aliases →
-    // GET /flow/<date> → JSON body. The flow handler's Redis path is
-    // gated on DARKMUX_REDIS_URL being set, so these tests intentionally
-    // do NOT set it — they exercise the file-fallback path. The flows
-    // directory is populated with a synthetic JSONL fixture per test.
-
-    fn write_flow_fixture(dir: &TempDir, date: &str, lines: &[serde_json::Value]) -> PathBuf {
-        let path = dir.path().join(format!("{date}.jsonl"));
-        let body: String = lines
-            .iter()
-            .map(|v| serde_json::to_string(v).unwrap())
-            .collect::<Vec<_>>()
-            .join("\n");
-        std::fs::write(&path, body).unwrap();
-        path
-    }
-
-    fn aliases_for_test(canonical: &str, aliases: &[&str]) -> IdentityAliases {
-        // Construct an in-memory table by serializing → loading; keeps the
-        // test independent of the file-loading internals.
-        let json = serde_json::json!({
-            "aliases": [{
-                "canonical": canonical,
-                "aliases": aliases,
-            }]
-        })
-        .to_string();
-        let tmp = NamedTempFile::new().unwrap();
-        std::fs::write(tmp.path(), json).unwrap();
-        IdentityAliases::from_file(tmp.path()).unwrap()
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn flow_endpoint_rewrites_machine_id_via_aliases() {
-        // Setup: no Redis, local JSONL fixture has two records — one
-        // stamped under a hostname-default id, one already canonical.
-        unsafe {
-            std::env::remove_var("DARKMUX_REDIS_URL");
-        }
-        let tmp = TempDir::new().unwrap();
-        write_flow_fixture(
-            &tmp,
-            "2026-06-03",
-            &[
-                serde_json::json!({"machine_id": "MacBook-Pro.local", "action": "test-host-default", "ts": "2026-06-03T01:00:00Z"}),
-                serde_json::json!({"machine_id": "laptop", "action": "test-canonical", "ts": "2026-06-03T01:01:00Z"}),
-                serde_json::json!({"machine_id": "untouched-machine", "action": "test-unknown", "ts": "2026-06-03T01:02:00Z"}),
-            ],
-        );
-        let aliases = aliases_for_test("laptop", &["MacBook-Pro.local"]);
-        let app = build_router_with_aliases(tmp.path().to_path_buf(), aliases);
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/flow/2026-06-03")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), 200);
-        let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024)
-            .await
-            .unwrap();
-        let body: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
-
-        // MacBook-Pro.local → laptop (aliased)
-        // laptop → laptop (canonical, unchanged)
-        // untouched-machine → untouched-machine (not in alias table)
-        let machine_ids: Vec<&str> = body
-            .iter()
-            .map(|r| r.get("machine_id").and_then(|v| v.as_str()).unwrap())
-            .collect();
-        assert_eq!(
-            machine_ids,
-            vec!["laptop", "laptop", "untouched-machine"],
-            "expected hostname-default to canonicalize, others to pass through"
-        );
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn flow_endpoint_no_op_with_empty_alias_table() {
-        // Sanity: when no aliases are configured the response is
-        // unchanged. Regression guard against the rewrite pass leaking
-        // surprises into the no-aliases path.
-        unsafe {
-            std::env::remove_var("DARKMUX_REDIS_URL");
-        }
-        let tmp = TempDir::new().unwrap();
-        write_flow_fixture(
-            &tmp,
-            "2026-06-03",
-            &[serde_json::json!({"machine_id": "MacBook-Pro.local", "action": "test"})],
-        );
-        let app = build_router(tmp.path().to_path_buf());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/flow/2026-06-03")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024)
-            .await
-            .unwrap();
-        let body: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body[0]["machine_id"], "MacBook-Pro.local");
-    }
-
-    #[tokio::test]
-    async fn fleet_aliases_endpoint_returns_loaded_table() {
-        let aliases = aliases_for_test("laptop", &["MacBook-Pro.local", "kain-mbp"]);
-        let app = build_router_with_aliases(PathBuf::new(), aliases);
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/fleet/aliases")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), 200);
-        let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        let arr = body["aliases"].as_array().unwrap();
-        assert_eq!(arr.len(), 1);
-        assert_eq!(arr[0]["canonical"], "laptop");
-        let aliases_list = arr[0]["aliases"].as_array().unwrap();
-        // Sorted alphabetically: MacBook-Pro.local comes before kain-mbp
-        // (uppercase M sorts before lowercase k in ASCII)
-        assert_eq!(aliases_list[0], "MacBook-Pro.local");
-        assert_eq!(aliases_list[1], "kain-mbp");
-    }
-
-    #[tokio::test]
-    async fn fleet_aliases_endpoint_returns_empty_when_no_aliases() {
-        let app = build_router(PathBuf::new());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/fleet/aliases")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), 200);
-        let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(body["aliases"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]
