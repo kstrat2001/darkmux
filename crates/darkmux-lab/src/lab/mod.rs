@@ -6,7 +6,6 @@ pub mod doctor;
 pub mod fixture;
 pub mod fixture_cli;
 pub mod inspect;
-pub mod instrument;
 pub mod list;
 pub mod profile_check;
 // #463 workspace split — paths lifted into the darkmux-types foundation crate

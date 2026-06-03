@@ -38,7 +38,6 @@ pub fn characterize(opts: &CharacterizeOpts) -> Result<CharacterizeReport> {
         // runtime_cmd is unused by the internal path; "openclaw" for
         // codebase parity (Sprint-E).
         runtime_cmd: "openclaw".to_string(),
-        instrument: false,
     };
     let outcomes = lab_run(run_opts)?;
     Ok(CharacterizeReport {

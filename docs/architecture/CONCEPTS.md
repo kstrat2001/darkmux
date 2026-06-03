@@ -371,13 +371,12 @@ optional fields are minor bumps that older viewers safely ignore (the
 
 ### Lab telemetry transport (today)
 
-The lab's per-run instrument samples are written to a standalone
-**`instruments.jsonl`** in the run directory, **only when `--instrument` is passed
-to `darkmux lab run`**. It carries periodic `lms ps` / `ps` samples plus a meta
-payload (darkmux version, cadence, rules schema version)
-(`src/main.rs:866-872`; `crates/darkmux-lab/src/lab/instrument.rs:57-71`). This is
-a *separate file from the flow stream today* — folding the two together is the
-core of the [observability-unification](#8-planned--not-yet-shipped) work (#557).
+Cross-layer telemetry is always-on (#557) — the internal runtime and crew dispatch
+emit it as `category=telemetry` flow records on the flow stream (sources: `lms`,
+`process`, `detector`, `runtime`, `context`, `compaction`). There is no sidecar
+file and no flag: the standalone `instruments.jsonl` sidecar and the `--instrument`
+flag on `darkmux lab run` were retired as part of the
+[observability-unification](#8-planned--not-yet-shipped) work (#557).
 
 ---
 
@@ -392,7 +391,7 @@ behavior. The observability items are the
 
 | Planned | Status | Tracking |
 |---|---|---|
-| **Stream unification** — fold lab telemetry into the flow stream as an event family; make instrumentation always-on; retire `instruments.jsonl` + `--instrument`. | not started | [#557](https://github.com/kstrat2001/darkmux/issues/557) |
+| **Stream unification** — fold lab telemetry into the flow stream as an event family; make instrumentation always-on; retire `instruments.jsonl` + `--instrument`. | in progress | [#557](https://github.com/kstrat2001/darkmux/issues/557) |
 | **Unified drill-down viewer** — one app (fleet → machine → subsystem), replacing the `topology`/`flow`/`lab` pages. | website demo only | [#558](https://github.com/kstrat2001/darkmux/issues/558) |
 | **Daemon hosts the viewer** at its own origin (`GET /`), making CORS/mixed-content impossible by construction. | not started | [#554](https://github.com/kstrat2001/darkmux/issues/554) |
 | **darkmux.com demo** as an explicit badged playback fixture (live at `darkmux.com/demo`). | live on the website | [#559](https://github.com/kstrat2001/darkmux/issues/559) |

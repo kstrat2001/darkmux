@@ -128,7 +128,7 @@ tests/cli.rs                  Integration tests (spawn the binary)
 
 ## Versioning — rules schema
 
-The `eureka` rules engine emits its definitions into `instruments.jsonl` so the viewer can render findings without duplicating rule data in JS. The viewer enforces compatibility on file drop. The contract is plain semver, applied to the rules **data shape** (not to darkmux itself):
+The `eureka` rules engine emits its definitions so the viewer can render findings without duplicating rule data in JS. The standalone `instruments.jsonl` sidecar and its file-drop delivery were retired (#557); the RuleDefs' transport is migrating to the flow telemetry stream as part of that work. The contract is plain semver, applied to the rules **data shape** (not to darkmux itself):
 
 | Bump | Meaning | UI behavior |
 |---|---|---|
@@ -142,7 +142,7 @@ Rule of thumb when changing the schema:
 - Renaming or retyping a field on `RuleDef`? **Major bump.**
 - Fixing a typo in `fix_hint`? **Patch bump.**
 
-`RULES_SCHEMA_VERSION` lives in `src/eureka.rs` as a single constant. The viewer's `EXPECTED_RULES_SCHEMA_MAJOR` lives in `docs/viewer/index.html` near the top of the script block. **When you bump major, you bump both in the same PR** — the viewer-release-PR is the contract.
+`RULES_SCHEMA_VERSION` lives in `crates/darkmux-eureka/src/lib.rs` as a single constant. The viewer's `EXPECTED_RULES_SCHEMA_MAJOR` lives in `docs/viewer/index.html` near the top of the script block. **When you bump major, you bump both in the same PR** — the viewer-release-PR is the contract.
 
 ## Common tasks for an agent
 

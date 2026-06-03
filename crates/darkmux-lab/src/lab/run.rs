@@ -2,7 +2,6 @@
 
 use crate::lab::artifact_dirs;
 use crate::lab::cow_clone::cow_clone_dir_excluding;
-use crate::lab::instrument::InstrumentSidecar;
 use crate::lab::paths::{self, ResolveScope};
 use crate::lab::sandbox_hash::hash_sandbox_dir;
 use darkmux_profiles::profiles::{get_profile, load_registry};
@@ -11,7 +10,7 @@ use crate::workloads::registry::with_provider;
 use anyhow::{anyhow, Context, Result};
 use std::fs;
 use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct RunOpts {
     pub workload_id: String,
@@ -31,10 +30,6 @@ pub struct RunOpts {
     /// `<cmd> agent --message` calling convention. Ignored when
     /// `runtime == Runtime::Internal`.
     pub runtime_cmd: String,
-    /// Enable cross-layer telemetry capture during the dispatch. When true,
-    /// each run dir gets an `instruments.jsonl` with periodic samples of
-    /// LMStudio state, gateway-process residency, and timing meta.
-    pub instrument: bool,
 }
 
 /// `run_dir` is the canonical path to the run's output directory.
@@ -207,24 +202,6 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
             None
         };
 
-        // Optional cross-layer telemetry. The sidecar runs on a background
-        // thread until we explicitly stop it after the dispatch completes.
-        // Failure to start the sidecar should not abort the dispatch — it's
-        // additive instrumentation, not load-bearing.
-        let sidecar = if opts.instrument {
-            match InstrumentSidecar::start(&run_dir, Duration::from_millis(2000)) {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    if !opts.quiet {
-                        eprintln!("[lab] warning: failed to start instrument sidecar: {e}");
-                    }
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
         let provider_id = loaded_workload.manifest.workload.provider.clone();
         let runtime = opts.runtime;
         let runtime_cmd = opts.runtime_cmd.as_str();
@@ -259,24 +236,6 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
                 eprintln!(
                     "[lab] warn: enriching manifest with fixture info skipped: {e}"
                 );
-            }
-        }
-
-        // Stop the sidecar before recording outcome notes — that way any
-        // last-second samples land on disk and the meta:end event is
-        // present for the inspector.
-        if let Some(s) = sidecar {
-            match s.stop() {
-                Ok(path) => {
-                    if !opts.quiet {
-                        println!("  instruments → {}", path.display());
-                    }
-                }
-                Err(e) => {
-                    if !opts.quiet {
-                        eprintln!("[lab] warning: instrument sidecar stop errored: {e}");
-                    }
-                }
             }
         }
 
@@ -903,7 +862,6 @@ mod tests {
             quiet: true,
             runtime: darkmux_crew::dispatch::Runtime::Internal,
             runtime_cmd: "openclaw".to_string(),
-            instrument: false,
         })
         .unwrap_err();
         std::env::set_current_dir(prev).unwrap();

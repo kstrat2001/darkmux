@@ -15,13 +15,12 @@
 //!   CPU%, via `docker stats <name> --no-stream`. Wire payload:
 //!   `{cpu:<N>}` (integer percent).
 //!
-//! ALWAYS-ON (not `--instrument`-gated). This REPLACES the OpenClaw-
-//! gateway CPU sampler (`lab::instrument::sample_gateway_proc`) for the
-//! crew-side dispatch path: that vestige returns `None` on internal-
-//! runtime dispatches (there's no gateway process), so the operator's
-//! decision was to keep the `source:process` CPU signal but source it
-//! from the per-dispatch container instead. (`instrument.rs` stays
-//! `--instrument`-gated for lab runs — out of scope here.)
+//! ALWAYS-ON: cross-layer telemetry is captured automatically, never
+//! behind a flag. The `source:process` CPU signal is sourced from the
+//! per-dispatch container. (It originally replaced an OpenClaw-gateway CPU
+//! sampler that returned `None` on internal-runtime dispatches; the
+//! lab-side `instrument.rs` sidecar and the `--instrument` flag it lived
+//! behind were retired in #557.)
 //!
 //! This module holds the two PURE, unit-testable helpers (`lms_diff`,
 //! `parse_cpu_percent`). The live sampler thread (which calls

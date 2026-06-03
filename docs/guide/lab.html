@@ -73,10 +73,9 @@
       <li><strong><code>verify.json</code></strong> — verify-command outcome (for workloads that have one). For <code>quick-q</code>, just "did the response come back."</li>
     </ul>
 
-    <h3>Capture cross-layer telemetry with <code>--instrument</code></h3>
-    <p>Add the <code>--instrument</code> flag to a run to capture a sidecar JSONL stream of cross-layer events alongside the trajectory — LMStudio's loaded-model snapshot, gateway-process residency, samples missing — useful for diagnosing where wall-clock latency is concentrated.</p>
-    <pre><code>darkmux lab run long-agentic --instrument</code></pre>
-    <p>Output lands at <code>~/.darkmux/runs/&lt;run-id&gt;/instruments.jsonl</code>. Drag it onto <a href="../lab/">darkmux.com/lab/</a> to replay the run as a four-block topology with anomaly detection. (The <code>/lab</code> page was previously named <code>/viewer</code>; the old URL still redirects.)</p>
+    <h3>Cross-layer telemetry (always-on)</h3>
+    <p>Cross-layer telemetry is captured automatically (#557) — no flag, no sidecar file. The internal runtime and crew dispatch emit it as <code>category=telemetry</code> flow records on the flow stream (sources: <code>lms</code>, <code>process</code>, <code>detector</code>, <code>runtime</code>, <code>context</code>, <code>compaction</code>), so you can see what LMStudio had loaded, where the runtime process sat across the run, detector signals, and compaction events — useful for diagnosing where wall-clock latency is concentrated.</p>
+    <p>View it in the daemon's observability viewer: run <code>darkmux serve</code> and open <code>http://localhost:8765/</code>. The viewer reads live flow records straight from the daemon. A demo instance lives at <a href="../../demo/">darkmux.com/demo</a>.</p>
   </div>
 </section>
 
@@ -143,8 +142,7 @@ darkmux lab runs --limit 50</code></pre>
     <pre><code>~/.darkmux/runs/&lt;run-id&gt;/
 <span class="comment">  sandbox/          # this run's isolated COW clone — the model works here
   manifest.json     # now carries baseline_hash + final_hash (schemaVersion 4)
-  trajectory.jsonl  # per-turn detail
-  instruments.jsonl # only with --instrument</span></code></pre>
+  trajectory.jsonl  # per-turn detail</span></code></pre>
     <p>The manifest gained two content hashes (BLAKE3, formatted <code>blake3:&lt;hex&gt;</code>):</p>
     <ul>
       <li><strong><code>fixture.baseline_hash</code></strong> — the source state <em>before</em> the run, captured at clone time. Proves two runs started from the same place.</li>
