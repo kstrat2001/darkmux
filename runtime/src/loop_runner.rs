@@ -520,6 +520,21 @@ pub fn run(
             total_completion_tokens =
                 total_completion_tokens.saturating_add(usage.completion_tokens);
             latest_prompt_tokens = usage.prompt_tokens;
+            // (#557 Slice-3) Per-turn context-window occupancy sawtooth.
+            // Emitted ONCE per turn, only when a real `usage` was seen
+            // (so a no-usage turn doesn't write a stale/zero context).
+            // `used` is the EXACT prompt-token count; `max` is the
+            // configured n_ctx (None when unconfigured). Uses `turns`
+            // as the seq — the same post-increment turn counter the
+            // sibling trajectory events at this point use
+            // (append_model_completed, append_tool_call_promoted). NO
+            // rate-limiting: per-turn IS the correct sawtooth
+            // granularity (unlike model.partial's per-SSE-chunk cadence).
+            trajectory.append_context_window(
+                turns,
+                latest_prompt_tokens,
+                compaction_cfg.context_window,
+            );
         }
 
         // Record model.completed for trajectory. We grab the first
@@ -892,11 +907,25 @@ pub fn run(
                         .and_then(|m| m.content.as_ref())
                         .map(|c| c.len())
                         .unwrap_or(0);
+                    // (#557 Slice-3) Token occupancy across the compaction
+                    // drop. `tokens_before` is the EXACT prompt-token count
+                    // that triggered this compaction (the prior turn's
+                    // usage.prompt_tokens). `tokens_after` is a chars/4
+                    // ESTIMATE of the now-compacted `messages` buffer — the
+                    // runtime has no tokenizer, so we measure chars via the
+                    // same helper the dispatch.start event uses and divide
+                    // by 4. The EXACT post-compaction count lands on the
+                    // next turn's `dispatch.context` `used`.
+                    let tokens_before = latest_prompt_tokens;
+                    let (sys_chars, prompt_chars) = measure_request_context(&messages);
+                    let tokens_after = ((sys_chars + prompt_chars) / 4) as u32;
                     trajectory.append_compaction(
                         compactions,
                         before_count,
                         after_count,
                         summary_chars,
+                        tokens_before,
+                        tokens_after,
                     );
 
                     // (#457 Step 3) Post-compaction feedback nudge.

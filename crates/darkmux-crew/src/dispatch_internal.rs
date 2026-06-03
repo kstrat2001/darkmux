@@ -1033,6 +1033,17 @@ impl TailerState {
                     "summary_chars": event.get("summary_chars"),
                 });
                 self.emit("dispatch.compaction", darkmux_flow::Level::Info, payload);
+                // (#557 slice 3) Compaction token telemetry — the drop in
+                // the context-occupancy sawtooth. The runtime now carries
+                // `tokens_before` (EXACT prompt-token count that triggered
+                // compaction) + `tokens_after` (chars/4 estimate of the
+                // compacted buffer) on the compaction event; forward them
+                // as a `source=compaction` telemetry record the viewer
+                // reads as `{from, to}`.
+                self.emit_telemetry("compaction", "telemetry.compaction", serde_json::json!({
+                    "from": event.get("tokens_before"),
+                    "to": event.get("tokens_after"),
+                }));
             }
             "model.reasoning" => {
                 // The runtime emits these when it parses <think>...</think>
@@ -1107,6 +1118,18 @@ impl TailerState {
                 if let Some(payload) = detector_telemetry_payload(event_type, &event) {
                     self.emit_telemetry("detector", "telemetry.detector", payload);
                 }
+            }
+            // (#557 slice 3) Per-turn context-window occupancy sawtooth.
+            // The runtime emits one `dispatch.context` trajectory event per
+            // turn carrying the EXACT prompt-token count (`used`) + the
+            // configured n_ctx (`max`, null when unconfigured). Forward it
+            // into the one flow stream as a `source=context` telemetry
+            // record the observability viewer reads as `{used, max}`.
+            "dispatch.context" => {
+                self.emit_telemetry("context", "telemetry.context", serde_json::json!({
+                    "used": event.get("used"),
+                    "max": event.get("max"),
+                }));
             }
             _ => {
                 // Other event types (dispatch.start/complete from the
@@ -2852,6 +2875,162 @@ mod tests {
                 .unwrap_or(false),
             "detail must be present and non-empty"
         );
+    }
+
+    /// (#557 slice 3) A `dispatch.context` trajectory line → a
+    /// `category=telemetry, source=context` flow record carrying
+    /// `{used, max}`. Same capture mechanism + env-scrub as the cycle
+    /// test above (tempdir DARKMUX_FLOWS_DIR + DARKMUX_REDIS_URL scrub +
+    /// `#[serial]`).
+    #[test]
+    #[serial]
+    fn handle_event_context_emits_telemetry_record() {
+        let tmp = TempDir::new().unwrap();
+        // SAFETY: serialized via `#[serial]`; no concurrent env reader.
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let mut state = TailerState::new_for_test(
+            traj_path,
+            "sess-context".into(),
+            "coder".into(),
+            "darkmux:qwen3.6".into(),
+        );
+        state.handle_event(
+            r#"{"type":"dispatch.context","seq":3,"used":42000,"max":101000}"#,
+        );
+
+        // Restore env BEFORE assertions so a failing assert can't leak it.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+
+        let day_file = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                p.extension().and_then(|x| x.to_str()) == Some("jsonl")
+                    && p.file_name().and_then(|n| n.to_str()) != Some("trajectory.jsonl")
+            })
+            .expect("a flow day-file should have been written");
+
+        let contents = std::fs::read_to_string(&day_file).unwrap();
+        // Scope to THIS test's session_id — the process-global
+        // `DARKMUX_FLOWS_DIR` is shared with concurrent non-serial tailing
+        // tests that also write telemetry records here.
+        let telemetry = contents
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| {
+                v["category"] == "telemetry"
+                    && v["source"] == "context"
+                    && v["session_id"] == "sess-context"
+            })
+            .expect("a telemetry record should have been emitted");
+
+        assert_eq!(telemetry["category"], "telemetry");
+        assert_eq!(telemetry["source"], "context");
+        assert_eq!(telemetry["action"], "telemetry.context");
+        assert_eq!(telemetry["payload"]["used"], 42000);
+        assert_eq!(telemetry["payload"]["max"], 101000);
+    }
+
+    /// (#557 slice 3) A `compaction` trajectory line carrying
+    /// `tokens_before`/`tokens_after` → BOTH the existing
+    /// `dispatch.compaction` Work record (category=work) AND a new
+    /// `source=compaction` telemetry record reading `{from, to}`.
+    #[test]
+    #[serial]
+    fn handle_event_compaction_emits_work_and_telemetry_records() {
+        let tmp = TempDir::new().unwrap();
+        // SAFETY: serialized via `#[serial]`; no concurrent env reader.
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let mut state = TailerState::new_for_test(
+            traj_path,
+            "sess-compaction".into(),
+            "coder".into(),
+            "darkmux:qwen3.6".into(),
+        );
+        state.handle_event(
+            r#"{"type":"compaction","generation":1,"before_messages":30,"after_messages":6,"summary_chars":1500,"tokens_before":48000,"tokens_after":9000}"#,
+        );
+
+        // Restore env BEFORE assertions so a failing assert can't leak it.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+
+        let day_file = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                p.extension().and_then(|x| x.to_str()) == Some("jsonl")
+                    && p.file_name().and_then(|n| n.to_str()) != Some("trajectory.jsonl")
+            })
+            .expect("a flow day-file should have been written");
+
+        let contents = std::fs::read_to_string(&day_file).unwrap();
+        let records: Vec<serde_json::Value> = contents
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .collect();
+
+        // The existing dispatch.compaction Work record must still fire.
+        let work = records
+            .iter()
+            .find(|v| {
+                v["action"] == "dispatch.compaction"
+                    && v["session_id"] == "sess-compaction"
+            })
+            .expect("the dispatch.compaction work record should still be emitted");
+        assert_eq!(work["payload"]["generation"], 1);
+        assert_eq!(work["payload"]["before_messages"], 30);
+        assert_eq!(work["payload"]["after_messages"], 6);
+
+        // The new compaction telemetry record carries {from, to}.
+        // Scope to THIS test's session_id: the process-global
+        // `DARKMUX_FLOWS_DIR` (set above) is also the write target for any
+        // non-serial live-tailing test that runs concurrently and emits
+        // `test-role`/`test-session` records — including compaction lines
+        // without tokens_before/after. Match on our unique session so the
+        // assertion can't latch onto a foreign record.
+        let telemetry = records
+            .iter()
+            .find(|v| {
+                v["category"] == "telemetry"
+                    && v["source"] == "compaction"
+                    && v["session_id"] == "sess-compaction"
+            })
+            .expect("a source=compaction telemetry record should have been emitted");
+        assert_eq!(telemetry["action"], "telemetry.compaction");
+        assert_eq!(telemetry["payload"]["from"], 48000);
+        assert_eq!(telemetry["payload"]["to"], 9000);
     }
 
     // ─── role tool_palette → runtime allowed-tools mapping ────────────
