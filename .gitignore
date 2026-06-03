@@ -12,6 +12,16 @@ qa-reply.json
 qa-reply.err
 cpu-samples.txt
 
+# Run-artifact dirs — keep them out of committed fixtures (a committed one
+# trips `lab doctor`'s cleanliness check + the workspace test). Mirrors the
+# canonical RUN_ARTIFACT_DIRS the lab clone prunes + the hash excludes.
+__pycache__/
+*.pyc
+coverage/
+.coverage
+.darkmux-runtime/
+.darkmux-agent/
+
 # dotenv files (local secrets)
 .env
 .env.local

@@ -70,17 +70,29 @@ jobs:
       # lints. Tracked as a follow-up (`cargo fmt --all` once, then
       # re-enable here).
 
-      - name: Build release (no warnings allowed)
+      - name: Build release (whole workspace, no warnings allowed)
         if: steps.filter.outputs.rust == 'true'
-        run: cargo build --release --all-targets
+        run: cargo build --workspace --release --all-targets
 
-      - name: Test release
+      - name: Test release (whole workspace)
         if: steps.filter.outputs.rust == 'true'
-        run: cargo test --release
+        run: cargo test --workspace --release
 
-      - name: Clippy (all targets, no warnings allowed)
+      - name: Clippy (whole workspace, all targets, no warnings allowed)
         if: steps.filter.outputs.rust == 'true'
-        run: cargo clippy --release --all-targets -- -D warnings
+        run: cargo clippy --workspace --release --all-targets -- -D warnings
+
+      # The runtime crate is EXCLUDED from the cargo workspace (#463 — it builds
+      # against musl in the darkmux-runtime Docker image), so `--workspace` above
+      # does NOT cover it. Build + test + lint it explicitly so its suite + lints
+      # gate CI too. (Image build itself needs a Docker daemon — deferred to a
+      # follow-up Linux job; macOS runners don't ship a working Docker.)
+      - name: Runtime crate — build + test + lint
+        if: steps.filter.outputs.rust == 'true'
+        run: |
+          cargo build --manifest-path runtime/Cargo.toml --release --all-targets
+          cargo test --manifest-path runtime/Cargo.toml --release
+          cargo clippy --manifest-path runtime/Cargo.toml --release --all-targets -- -D warnings
 
       - name: No Rust-relevant changes — pipeline skipped
         if: steps.filter.outputs.rust != 'true'

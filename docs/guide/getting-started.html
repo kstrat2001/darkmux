@@ -54,12 +54,13 @@
     </table>
     <p class="muted">darkmux is developed and tested on Apple Silicon. Linux should work; Intel Mac is untested.</p>
 
-    <h3>Optional (but unlocks a lot)</h3>
+    <h3>For the dispatch + lab path</h3>
+    <p class="muted">The <code>swap</code> / <code>status</code> / <code>profiles</code> core needs only LMStudio. Docker is required for <code>crew dispatch</code> / <code>lab run</code> (the default internal runtime); an external agent runtime is an optional alternative to it.</p>
     <table>
       <tr><th>Tool</th><th>When you need it</th></tr>
       <tr>
         <td><a href="https://www.docker.com/products/docker-desktop">Docker</a></td>
-        <td>For <code>darkmux crew dispatch</code>'s default internal runtime. The dispatch runs in a per-invocation <code>darkmux-runtime</code> container; build the image once with <code>docker build -t darkmux-runtime:latest runtime/</code>. Skip this if you opt out via <code>--runtime openclaw</code>.</td>
+        <td><strong>Required for <code>darkmux crew dispatch</code> / <code>lab run</code></strong> — the default internal runtime. The dispatch runs in a per-invocation <code>darkmux-runtime</code> container; build the image once with <code>docker build -t darkmux-runtime:latest runtime/</code>. Skip only if you opt out via <code>--runtime openclaw</code>.</td>
       </tr>
       <tr>
         <td>An agent runtime (e.g. <a href="https://github.com/openclaw/openclaw">OpenClaw</a>, Aider, Cline)</td>
