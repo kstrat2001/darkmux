@@ -132,6 +132,35 @@
   .mft{display:flex;gap:10px;margin-top:8px}
   .mft input{flex:1;background:var(--bg);border:1px solid var(--line);color:var(--text);border-radius:4px;padding:8px 10px;font:12px 'JetBrains Mono',monospace}
   .clr{background:var(--bg);border:1px solid var(--amber-dim);color:var(--text);border-radius:4px;padding:8px 12px;cursor:pointer;font:600 12px 'JetBrains Mono',monospace}
+
+  /* ---- Mobile phase 1 — survival #634 (mirrors viewer.html) ----------
+     darkmux.com/demo is the public-facing version of this viewer and
+     mobile visitors land here first. Phase 1 keeps the layout
+     SCROLLABLE + STACKED on phones (~390px); doesn't redesign. Touch
+     gestures, drawer-based log, swipe drill-in are phase 2+. Keep this
+     block in sync with the matching block in
+     crates/darkmux-serve/assets/viewer.html (the live + playback viewer
+     served by the daemon). Both files share most CSS; future refactor
+     to extract shared styles is tracked under #624. */
+  @media (max-width: 768px) {
+    html, body { height: auto; overflow: auto; min-height: 100vh; }
+    .wrap { display: block; height: auto; }
+    .stage { padding: 16px; min-height: 50vh; overflow: visible; }
+    .log { width: auto; border-left: none; border-top: 1px solid var(--line); max-height: 60vh; }
+    .detail { padding: 12px 14px 0; }
+    .split { display: none; } /* row-resize handle isn't useful when stacked */
+    .fleet { gap: 16px; }
+    .mach { width: 100%; }
+    .fleettl { margin-top: 18px; }
+    .lname { width: 96px; font-size: 10px; }
+    .scrub { flex-wrap: wrap; height: auto; padding: 12px; gap: 10px; }
+    .scrub button { padding: 10px 14px; font-size: 13px; min-height: 40px; }
+    .clock { text-align: left; min-width: 0; flex: 1 0 100%; }
+    .top { padding: 0 12px; gap: 10px; }
+    .topnav { gap: 12px; flex-wrap: wrap; }
+    .crumbbar { padding: 0 12px; gap: 8px; overflow-x: auto; white-space: nowrap; }
+    .meta { font-size: 10px; }
+  }
 </style>
 </head>
 <body>
