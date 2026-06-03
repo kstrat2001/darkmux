@@ -40,7 +40,27 @@ fn is_valid_date(date: &str) -> Option<&str> {
     }
 }
 
-/// Serve the observability viewer at the daemon's own origin (#554).
+/// Embedded HTML for the observability viewer. Shared between the live
+/// route (`GET /`) and the playback route (`GET /play/:date`); each handler
+/// injects a `<meta name="darkmux-mode">` tag the viewer's boot() reads to
+/// decide whether to start the SSE tail (live) or skip it (playback).
+const VIEWER_HTML: &str = include_str!("../../../docs/viewer/index.html");
+
+/// Inject a `<meta name="darkmux-mode">` tag right after `<head>` so the
+/// viewer's `boot()` can read it before any data-fetching logic runs.
+/// Optionally injects a `<meta name="darkmux-date">` to pin playback to a
+/// specific UTC date independent of the browser's URL.
+fn inject_mode_meta(html: &str, mode: &str, date: Option<&str>) -> String {
+    let mut meta = format!(r#"<meta name="darkmux-mode" content="{}">"#, mode);
+    if let Some(d) = date {
+        meta.push_str(&format!(r#"
+<meta name="darkmux-date" content="{}">"#, d));
+    }
+    // <head> appears exactly once; the replacement is unambiguous.
+    html.replacen("<head>", &format!("<head>\n{}", meta), 1)
+}
+
+/// Serve the LIVE observability viewer at `GET /` (#554, #624 follow-up).
 ///
 /// Because the daemon and the viewer share an origin, the viewer's
 /// same-origin `fetch('/flow/:date')` calls are CORS- and
@@ -49,16 +69,43 @@ fn is_valid_date(date: &str) -> Option<&str> {
 /// `include_str!` so the daemon binary is self-contained (no asset dir to
 /// ship).
 ///
-/// The daemon serves the LIVE viewer (`docs/viewer/index.html`) — no
-/// embedded sample fixture, never falls back to demo content. Per #624,
-/// the demo with bundled sample data and recorded playback scenario lives
-/// at `docs/demo/index.html` and is served by `darkmux.com/demo`.
+/// Live mode tails today's records via SSE on `/flow/:date/stream`. For
+/// scrubbing through a past day without live records bleeding in, use the
+/// playback route `GET /play/:date` instead.
+///
+/// Per #624, the demo with bundled sample data and recorded scenario lives
+/// at `docs/demo/index.html` and is served by `darkmux.com/demo` — separate
+/// from this live viewer.
 async fn root_html() -> impl IntoResponse {
     (
         StatusCode::OK,
         [("content-type", "text/html; charset=utf-8")],
-        include_str!("../../../docs/viewer/index.html"),
+        inject_mode_meta(VIEWER_HTML, "live", None),
     )
+}
+
+/// Serve the PLAYBACK observability viewer at `GET /play/:date`. Same HTML
+/// as the live route, but the injected mode meta tells the viewer's boot()
+/// to skip `startLiveTail()` and stay in scrubber-replay mode for the
+/// captured day. Operators inspecting a past day get a deterministic
+/// playback view that isn't disrupted by today's incoming records.
+///
+/// Returns 404 for malformed dates. The viewer expects UTC `YYYY-MM-DD`.
+async fn play_html(Path(date): Path<String>) -> impl IntoResponse {
+    match is_valid_date(&date) {
+        Some(valid) => (
+            StatusCode::OK,
+            [("content-type", "text/html; charset=utf-8")],
+            inject_mode_meta(VIEWER_HTML, "play", Some(valid)),
+        )
+            .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            [("content-type", "text/plain; charset=utf-8")],
+            "darkmux serve: expected /play/YYYY-MM-DD\n",
+        )
+            .into_response(),
+    }
 }
 
 /// Build the HTTP router with a configurable flows directory.
@@ -66,6 +113,7 @@ pub(crate) fn build_router(flows_dir: PathBuf) -> Router {
     let state = AppState { flows_dir };
     Router::new()
         .route("/", get(root_html))
+        .route("/play/:date", get(play_html))
         .route("/health", get(health))
         .route("/flow/:date", get(flow_handler))
         .route("/flow/:date/stream", get(flow_stream_handler))
@@ -1483,6 +1531,92 @@ mod tests {
             lower.contains("<!doctype") || lower.contains("<html"),
             "GET / body is not HTML"
         );
+        // #624 follow-up: GET / injects darkmux-mode=live so the viewer's
+        // boot() knows to start the SSE tail. No darkmux-date meta on the
+        // live route — the viewer falls back to URL-driven targetDate().
+        assert!(
+            body.contains(r#"<meta name="darkmux-mode" content="live">"#),
+            "live meta absent from GET / body"
+        );
+        assert!(
+            !body.contains(r#"<meta name="darkmux-date""#),
+            "live route should not inject a date meta"
+        );
+    }
+
+    #[tokio::test]
+    async fn play_serves_viewer_html_with_playback_meta() {
+        // #624 follow-up: GET /play/<date> serves the same viewer HTML with
+        // darkmux-mode=play + darkmux-date=<date> so boot() skips the SSE
+        // tail and stays in scrubber-replay mode for the captured day.
+        let app = build_router(PathBuf::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/play/2026-06-03")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains(r#"<meta name="darkmux-mode" content="play">"#),
+            "play meta absent from GET /play/<date> body"
+        );
+        assert!(
+            body.contains(r#"<meta name="darkmux-date" content="2026-06-03">"#),
+            "date meta absent from GET /play/<date> body"
+        );
+    }
+
+    #[tokio::test]
+    async fn play_rejects_malformed_date_with_404() {
+        // The handler delegates date validation to `is_valid_date`, which
+        // checks SHAPE (10 chars, dashes at positions 4 and 7, digits
+        // elsewhere) but not calendar values. "2026-13-99" passes the shape
+        // check; the daemon returns 200 + empty viewer for it because the
+        // resulting /flow/<date> lookup returns no records — that's
+        // acceptable. We test only shape-rejection cases here.
+        let app = build_router(PathBuf::new());
+        for bad in ["garbage", "26-6-3", "2026/06/03", "2026-06-3", "2026-6-03"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/play/{bad}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "expected 404 for /play/{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn inject_mode_meta_inserts_after_head_open_tag() {
+        let html = "<!doctype html><html><head>\n<title>x</title></head><body></body></html>";
+        let live = inject_mode_meta(html, "live", None);
+        assert!(live.contains(r#"<meta name="darkmux-mode" content="live">"#));
+        assert!(!live.contains(r#"<meta name="darkmux-date""#));
+        // Order matters: meta must come AFTER <head> open tag, BEFORE <title>
+        let head_pos = live.find("<head>").unwrap();
+        let meta_pos = live.find(r#"<meta name="darkmux-mode""#).unwrap();
+        let title_pos = live.find("<title>").unwrap();
+        assert!(head_pos < meta_pos && meta_pos < title_pos);
+
+        let play = inject_mode_meta(html, "play", Some("2026-06-03"));
+        assert!(play.contains(r#"<meta name="darkmux-mode" content="play">"#));
+        assert!(play.contains(r#"<meta name="darkmux-date" content="2026-06-03">"#));
     }
 
     #[tokio::test]

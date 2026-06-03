@@ -639,8 +639,23 @@ function startLiveTail(date){
   window.addEventListener("beforeunload",()=>{if(LIVE_ES)LIVE_ES.close();});
 }
 
+// Read injected mode + date from the daemon. The live route (GET /) injects
+// content="live"; the playback route (GET /play/<date>) injects
+// content="play" and a darkmux-date meta with the captured day. When loaded
+// statically (no daemon — e.g., darkmux.com/viewer), no meta is present and
+// the viewer falls back to URL-driven targetDate() behavior.
+function injectedMeta(name){
+  const el=document.querySelector('meta[name="'+name+'"]');
+  return el ? el.getAttribute('content') : null;
+}
 async function boot(){
-  const date=targetDate();
+  const injectedMode=injectedMeta("darkmux-mode");
+  const injectedDate=injectedMeta("darkmux-date");
+  const date=injectedDate||targetDate();
+  // Playback mode is daemon-controlled: it forces "play" regardless of
+  // whether the date happens to be today, and SSE is never started. Live
+  // mode follows the original today=tail / past=replay logic.
+  const wantsPlayback = injectedMode==="play";
   let mode="empty";
   try{
     const res=await fetch("/flow/"+date,{headers:{accept:"application/json"}});
@@ -648,9 +663,13 @@ async function boot(){
       const body=await res.json();
       RAW=Array.isArray(body)?body:(body.records||body.flow||[]);
       DATA=flowToRenderModel(RAW);
-      mode = date===todayUTC() ? "live" : (RAW.length?"play":"empty");  // today tails; a past date replays
+      mode = wantsPlayback ? (RAW.length?"play":"empty")
+                           : (date===todayUTC() ? "live" : (RAW.length?"play":"empty"));
     }else{ DATA=[]; RAW=[]; mode="empty"; }
   }catch(e){ DATA=[]; RAW=[]; mode="no-daemon"; }   // daemon not reachable — show honest empty state, never demo
+  // Tag the body with the daemon-injected mode so CSS and dev tools can
+  // distinguish live-route vs playback-route loads at a glance.
+  document.body.classList.add("daemon-mode-"+(injectedMode||"unset"));
   setBadges(mode,date);
   recompute();
   state.t=tMax;
