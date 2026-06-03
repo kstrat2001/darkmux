@@ -1,16 +1,29 @@
 # Disclaimer
 
-darkmux is a personal project released under the MIT license. The license text already says "no warranty, use at your own risk" in legal language. This file says the same thing in plain English, with specifics, because darkmux does things that warrant a clear-eyed warning.
+darkmux is a personal, pre-1.0 project (currently v0.4.0) released under the MIT license. The license text already says "no warranty, use at your own risk" in legal language. This file says the same thing in plain English, with specifics, because darkmux does things that warrant a clear-eyed warning.
+
+It's pre-1.0 with a small known audience. Breaking changes — renames, removals, default changes — ship cleanly, without env-var aliases or deprecation periods, until 1.0. If you need stability, pin a version.
 
 ## What darkmux does to your machine
 
-- **Reads and writes config files.** darkmux modifies `~/.openclaw/openclaw.json` when you swap stacks. If darkmux has a bug, if your config has an unusual shape, or if a swap is interrupted, your OpenClaw agent runtime can end up in a broken state. You are ultimately responsible for backing up anything you cannot afford to lose.
-- **Talks to your local LMStudio server.** darkmux sends HTTP requests to `http://localhost:1234/v1` to load and unload models. It does not talk to any remote service on your behalf. (No telemetry, no analytics, no update checks.)
-- **Runs AI-orchestrated workloads.** In lab mode, darkmux dispatches prompts to a local agent (OpenClaw) and can execute shell commands the agent produces — for example, `npm test` against AI-generated code. The lab working directory is **not a security boundary.** It is a regular directory on your filesystem. An AI that decides to run `rm -rf ~` is not stopped by darkmux. Treat lab mode the way you would treat running any untrusted script: only on a machine where that risk is acceptable, ideally on a separate user account or VM.
+- **Reads and writes config files.** A default `darkmux swap` only transitions the LMStudio loadout and touches no agent-runtime config. darkmux writes `~/.openclaw/openclaw.json` *only* on the opt-in OpenClaw path — `darkmux swap --runtime openclaw`, `darkmux crew dispatch / lab run --runtime openclaw`, `darkmux crew sync`, or `darkmux doctor --fix` on that path. If darkmux has a bug, if your config has an unusual shape, or if a write is interrupted, your OpenClaw agent runtime can end up in a broken state. You are ultimately responsible for backing up anything you cannot afford to lose.
+- **Talks to your local LMStudio server.** darkmux sends HTTP requests to `http://localhost:1234/v1` to load and unload models. It does not talk to any remote service on your behalf. (No telemetry, no analytics, no update checks.) Your data stays on your disk.
+- **Uses Docker for the default dispatch + lab path.** `darkmux crew dispatch` and `darkmux lab run` default to darkmux's internal Rust runtime, which runs inside a per-invocation `darkmux-runtime` Docker container (image built from `runtime/`). Docker is therefore a runtime dependency for that path. darkmux builds and runs that image on your behalf.
+- **Runs AI-orchestrated workloads.** In lab mode and on crew dispatch, darkmux runs an agent loop and can execute shell commands the agent produces — for example, `npm test` against AI-generated code. On the **default internal runtime**, each dispatch runs in a per-invocation container with kernel-enforced workspace isolation — better than a bare directory, but still not a hardened sandbox (Docker on macOS is a VM boundary, not a security guarantee against a determined adversary). On the **opt-in `--runtime openclaw`** path (or any `--runtime-cmd` tool), there is no container: the working directory is **not a security boundary** — it is a regular directory on your filesystem, and an AI that decides to run `rm -rf ~` is not stopped by darkmux. Treat that path the way you would treat running any untrusted script: only on a machine where that risk is acceptable, ideally on a separate user account or VM.
 
 ## About AI behaviour
 
 AI models — local or hosted — can produce unexpected, incorrect, or unsafe output. They can hallucinate file paths, generate destructive shell commands, edit files in ways you did not intend, and confidently explain why the wrong thing was the right thing to do. darkmux is an orchestration layer; it does not police what the model does. If a model misbehaves, darkmux will faithfully execute the misbehaviour. Review agent output before letting it touch anything you care about.
+
+## Results vary by your frontier configuration
+
+darkmux assumes a frontier orchestrator (Claude Code, Cursor, or similar) driving it. Its value depends on how *you* configure that frontier — the frontier models you use as the orchestrator need proper guidance to make the most of darkmux. Contradictory statements between your project's `CLAUDE.md`, the user guide, and other frontier configs will cause more harm than good. Configure to your own strategy and goals. darkmux cannot warrant outcomes that depend on your frontier configuration, which it neither controls nor sees. See [issue #112](https://github.com/kstrat2001/darkmux/issues/112) for the architectural reasoning.
+
+## Flow records and the audit sink
+
+darkmux writes a structured flow record for each dispatch, decision, and review. The always-on `LocalFileSink` writes these to `~/.darkmux/flows/` on your disk — casual provenance, no integrity guarantee.
+
+An opt-in audit sink (enabled by setting `DARKMUX_AUDIT_DIR`, POSIX-only — Linux/macOS) additionally writes those records into a BLAKE3 hash chain. `darkmux flow integrity-check` walks that chain and exits non-zero if it is broken, so a post-hoc edit to an audited record is **detectable**. This is a detection property, not a prevention one: the chain surfaces tampering after the fact; it does not make records impossible to alter, and running it does not make you compliant with anything. It is a substrate that can support a compliance posture — see "Two layers of liability" below for where your obligations begin.
 
 ## Licensed-adjacent role prompts
 
@@ -35,7 +48,8 @@ Benchmarks, throughput claims, and "X tokens/sec" figures in this repository and
 darkmux is not affiliated with, endorsed by, or supported by:
 
 - **LMStudio** — a separate product with its own license and terms of service. You are responsible for complying with them, including any commercial-use restrictions.
-- **OpenClaw** — a separate open-source project. darkmux integrates with it but is not maintained by the OpenClaw authors.
+- **OpenClaw** — a separate open-source project. darkmux can integrate with it on the opt-in `--runtime openclaw` path but is not maintained by the OpenClaw authors.
+- **Docker** — a separate product with its own license and terms. The default dispatch path depends on a working Docker installation, which you provide and maintain.
 - **Apple, Inc.** — "Apple Silicon" and "M5 Max" are Apple trademarks used here descriptively. No endorsement is implied.
 
 darkmux is tested against specific versions of LMStudio and OpenClaw. Future versions of either may break compatibility. When that happens, file an issue — but understand fixes ship on the author's schedule.
@@ -54,7 +68,7 @@ darkmux involves two distinct legal personas, and the MIT license addresses only
 
 **The distributor** (the author of darkmux, Darkly Energized LLC) ships the binary and the prompts under MIT with no warranty. If darkmux corrupts a config, returns a wrong benchmark number, or produces an unexpected output, the author owes you nothing beyond the source you already have. The MIT "AS IS" clause is the contract.
 
-**The operator** (anyone running darkmux on their own machine) is subject to the law of their own jurisdiction independently of the MIT grant. The license does NOT insulate the operator from: unauthorized practice of law or medicine if they re-publish licensed-adjacent role outputs as a service to third parties; HIPAA if they are a covered entity processing PHI through a local LLM; their professional ethics rules if they are a licensed attorney, physician, RD, PT, or trainer using the tool on client/patient work; data-protection rules (GDPR, PDPA, CCPA) if they process personal data of others. These are operator-side obligations. darkmux makes no representation that running it satisfies any of them.
+**The operator** (anyone running darkmux on their own machine) is subject to the law of their own jurisdiction independently of the MIT grant. The license does NOT insulate the operator from: unauthorized practice of law or medicine if they re-publish licensed-adjacent role outputs as a service to third parties; HIPAA if they are a covered entity processing PHI through a local LLM; their professional ethics rules if they are a licensed attorney, physician, RD, PT, or trainer using the tool on client/patient work; data-protection rules (GDPR, PDPA, CCPA) if they process personal data of others. These are operator-side obligations. The audit sink can support such a posture by making tampering detectable, but it does not satisfy any of these obligations on its own — darkmux makes no representation that running it makes you compliant with anything.
 
 ## The MIT bit, in human words
 
