@@ -2135,9 +2135,12 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
                 runtime_cmd,
                 machine,
                 wait: !no_wait,
-                // Bare `crew dispatch` doesn't carry a profile in
-                // context; runtime falls back to its hardcoded
-                // defaults. Lab + sprint paths derive from profile.
+                // Bare `crew dispatch` carries no profile-derived compaction
+                // config here; the internal dispatch fills the runtime-
+                // required context window from the resolved `default_profile`
+                // (#632 — the runtime has no built-in context-window default),
+                // so a `default()` is safe. Lab + sprint paths derive the
+                // full compaction config from the profile up front.
                 compaction: crew::dispatch::CompactionDispatchArgs::default(),
                 // (#549) Bare `crew dispatch` has no `--profile` override;
                 // model selection falls back to the registry's
