@@ -526,6 +526,7 @@ dependencies = [
  "darkmux-types",
  "futures",
  "redis",
+ "serde",
  "serde_json",
  "serial_test",
  "tempfile",

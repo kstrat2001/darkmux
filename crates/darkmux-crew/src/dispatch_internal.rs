@@ -462,6 +462,17 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // ⇒ untouched ⇒ runtime keeps its built-in default compactor.
     let utility_model = resolve_utility_model_internal();
     compaction.apply_utility_model(utility_model.as_deref());
+    // (#632) The runtime has no built-in context-window default — it
+    // REQUIRES one to derive its compaction threshold. Bare `crew dispatch`
+    // and the lab `prompt` provider hand us a `default()` with
+    // `context_window: None`; fill it from the resolved default-worker
+    // profile so no dispatch path can leave the runtime without one. (The
+    // coding-task provider already sets it via `from_profile` — the guard
+    // leaves any already-set window untouched.)
+    ensure_context_window(
+        &mut compaction,
+        resolve_context_window_internal(opts.profile_name.as_deref()),
+    );
     // (#590) Pre-flight loaded-check: compaction summons the util model
     // mid-dispatch, so if it's registered but not resident the compactor call
     // fails. Warn loudly here (the doctor check is the at-rest sibling).
@@ -1679,6 +1690,38 @@ fn resolve_utility_model_internal() -> Option<String> {
         .and_then(|l| l.registry.utility_model_id().map(str::to_string))
 }
 
+/// (#632) Resolve the context window the runtime needs to compute its
+/// compaction threshold, from the active profile's default-worker model.
+/// Mirrors the profile resolution in `resolve_dispatch_model_internal` (CLI
+/// `--profile` override > registry `default_profile`) and delegates the
+/// derivation to `CompactionDispatchArgs::from_profile` so the
+/// default-worker → `n_ctx` rule has a single source of truth. Returns
+/// `None` only when the registry/profile can't be resolved — the same edge
+/// cases that send model selection to `probe_loaded_model()`.
+fn resolve_context_window_internal(profile_override: Option<&str>) -> Option<u32> {
+    let loaded = darkmux_profiles::profiles::load_registry(None).ok()?;
+    let active_name = profile_override.or(loaded.registry.default_profile.as_deref())?;
+    let profile = darkmux_profiles::profiles::get_profile(&loaded.registry, active_name).ok()?;
+    crate::dispatch::CompactionDispatchArgs::from_profile(profile).context_window
+}
+
+/// (#632) Guard that the runtime always receives a context window. Some
+/// dispatch paths (bare `crew dispatch`, the lab `prompt` provider) build a
+/// `default()` `CompactionDispatchArgs` with `context_window: None`, but the
+/// runtime has no built-in default and hard-errors without one. Fill it from
+/// the profile-derived `fallback`; a path that already set a window (e.g. the
+/// coding-task provider via `from_profile`) is left untouched. Pure so the
+/// guard rule is unit-testable without resolving a registry or spawning a
+/// container.
+fn ensure_context_window(
+    compaction: &mut crate::dispatch::CompactionDispatchArgs,
+    fallback: Option<u32>,
+) {
+    if compaction.context_window.is_none() {
+        compaction.context_window = fallback;
+    }
+}
+
 /// (#590) Returns a loud warning when the registered utility model isn't in
 /// the loaded set — compaction summons it mid-dispatch and a missing one
 /// fails at the LMStudio call. `None` ⇒ it's loaded (matched by either the
@@ -2005,6 +2048,53 @@ mod tests {
             args.windows(2)
                 .any(|w| w[0] == "--compact-threshold-tokens" && w[1] == "35000"),
             "expected --compact-threshold-tokens 35000; got {args:?}"
+        );
+    }
+
+    #[test]
+    fn ensure_context_window_fills_when_none() {
+        let mut c = crate::dispatch::CompactionDispatchArgs::default();
+        assert_eq!(c.context_window, None);
+        ensure_context_window(&mut c, Some(101_000));
+        assert_eq!(c.context_window, Some(101_000));
+    }
+
+    #[test]
+    fn ensure_context_window_preserves_existing() {
+        let mut c = crate::dispatch::CompactionDispatchArgs {
+            context_window: Some(50_000),
+            ..Default::default()
+        };
+        ensure_context_window(&mut c, Some(101_000));
+        assert_eq!(
+            c.context_window,
+            Some(50_000),
+            "an already-set window must win over the fallback"
+        );
+    }
+
+    #[test]
+    fn ensure_context_window_stays_none_without_fallback() {
+        let mut c = crate::dispatch::CompactionDispatchArgs::default();
+        ensure_context_window(&mut c, None);
+        assert_eq!(c.context_window, None);
+    }
+
+    // (#632 regression) A `default()` compaction — what bare `crew dispatch`
+    // and the lab `prompt` provider build — must emit `--context-window`
+    // once the guard fills it, so the runtime can derive its compaction
+    // threshold instead of hard-erroring.
+    #[test]
+    fn ensure_context_window_then_apply_emits_flag() {
+        let mut cmd = Command::new("docker");
+        let mut compaction = crate::dispatch::CompactionDispatchArgs::default();
+        ensure_context_window(&mut compaction, Some(262_144));
+        apply_compaction_flags(&mut cmd, &compaction);
+        let args = args_of(&cmd);
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--context-window" && w[1] == "262144"),
+            "expected --context-window 262144 after the guard; got {args:?}"
         );
     }
 
