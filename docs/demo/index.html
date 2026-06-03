@@ -62,10 +62,10 @@
   .tlhdr{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin-bottom:14px}
   .lane{display:flex;align-items:center;gap:12px;margin-bottom:7px}
   .lname{width:150px;flex:none;font:12px 'JetBrains Mono',monospace;color:var(--text);text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .track{position:relative;flex:1;height:28px;background:var(--panel);border:1px solid var(--line);border-radius:4px;overflow:hidden}
+  .tltrack{position:relative;flex:1;height:28px;background:var(--panel);border:1px solid var(--line);border-radius:4px;overflow:hidden}
   .sbar{position:absolute;top:5px;height:18px;background:var(--amber-dim);border-radius:3px;min-width:2px}
   .sbar.a{background:var(--amber);box-shadow:0 0 6px var(--amber)}
-  .track .ph{position:absolute;top:0;bottom:0;width:2px;background:var(--text);opacity:.32}
+  .tltrack .ph{position:absolute;top:0;bottom:0;width:2px;background:var(--text);opacity:.32}
   .tlaxis{margin-left:162px;display:flex;justify-content:space-between;font:9px 'JetBrains Mono',monospace;color:var(--muted);margin-top:7px}
   .tlempty{font:11px 'JetBrains Mono',monospace;color:var(--muted)}
   .mach{width:230px;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px;cursor:pointer;transition:border-color .15s}
@@ -314,7 +314,7 @@ function renderFleet(){
       const role=(s.handle||"").replace(/^darkmux\//,"");
       return `<div class="sbar ${done?'':'a'}" style="left:${L}%;width:${W}%" title="${role} · ${sid}${done?'':' · in flight'}"></div>`;
     }).join("");
-    return `<div class="lane"><div class="lname" title="${m}">${m}</div><div class="track">${bars}<div class="ph" style="left:${pct(state.t)}%"></div></div></div>`;
+    return `<div class="lane"><div class="lname" title="${m}">${m}</div><div class="tltrack">${bars}<div class="ph" style="left:${pct(state.t)}%"></div></div></div>`;
   }).join("");
   const ax=`<div class="tlaxis"><span>${iso(tMin).slice(11,16)}</span><span>${iso(tMin+span/2).slice(11,16)}</span><span>${iso(tMax).slice(11,16)}Z</span></div>`;
   const tl = ms.length
