@@ -436,6 +436,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "APFS rejects non-UTF8 filenames (EILSEQ); this validates POSIX byte-path hashing APFS can't represent — runs on Linux CI"
+    )]
     fn non_utf8_filename_hashes_deterministically_and_distinctly() {
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;

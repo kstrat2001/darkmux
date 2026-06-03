@@ -79,7 +79,7 @@ If your hub machine drops off the network, the substrate degrades gracefully —
 |---|---|---|
 | **[LMStudio](https://lmstudio.ai/)** | Loads/unloads models. darkmux drives it via the `lms` CLI. | macOS / Windows / Linux installer |
 | **At least one model in LMStudio** | Nothing to swap to without one. | Download via the LMStudio UI; verify with `lms ls`. |
-| **[Docker](https://www.docker.com/products/docker-desktop)** | Hosts darkmux's internal Rust runtime — the default for `darkmux crew dispatch` and `darkmux lab run`. Each dispatch runs in a per-invocation `darkmux-runtime` container with kernel-enforced workspace isolation. Build the image once: `docker build -t darkmux-runtime:latest runtime/`. | Docker Desktop or equivalent daemon |
+| **[Docker](https://www.docker.com/products/docker-desktop)** | Hosts darkmux's internal Rust runtime — the default for `darkmux crew dispatch` and `darkmux lab run`. Each dispatch runs in a per-invocation `darkmux-runtime` container with kernel-enforced workspace isolation. Build the image once: `docker build -t darkmux-runtime:latest runtime/`. **Required only for that dispatch + lab path** — the `swap` / `status` / `profiles` core needs just LMStudio + a model. | Docker Desktop or equivalent daemon |
 | **Rust toolchain** | To build darkmux itself. | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh` |
 
 | Optional | When you'd want it |
