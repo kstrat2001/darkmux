@@ -187,7 +187,7 @@
   <div class="wrap">
     <div class="brand">darkly energized<span class="dot">·</span>open source</div>
     <h1>darkmux<span class="cursor">_</span></h1>
-    <p class="tag">AI-first orchestrator for local LLM workflows on <span class="accent">Apple Silicon</span>.</p>
+    <p class="tag"><strong>Own your AI workforce.</strong> The capable local models your <span class="accent">Apple Silicon</span> already runs — directed by your frontier, off the meter, on your hardware.</p>
     <pre class="install"><span class="prompt">$ </span><span class="cmd">cargo install --git https://github.com/kstrat2001/darkmux</span></pre>
     <div class="btns">
       <a class="btn btn-primary" href="guide/">User guide →</a>
@@ -200,13 +200,23 @@
 
 <section>
   <div class="wrap">
-    <h2>What it does</h2>
-    <h3>Pick the right loaded model + context length + compaction profile for each task — automatically.</h3>
+    <h2>Why darkmux exists</h2>
+    <h3>You don't have to rent every token — the AI workforce is already sitting in your Mac.</h3>
+    <p>darkmux didn't start as a tool — it started as a lab notebook for a series on faster local AI on Apple Silicon. The belief that came out of it: <strong>a frontier model is a brilliant strategist you rent by the token — and burning those tokens on compaction, scaffolding, test runs, and structuring is paying rent for busy work, plus handing your data to someone else's cloud to do it.</strong> The Apple Silicon you already bought runs capable open-source models locally — no cloud account, no per-token meter, nothing leaving your disk. Many Mac owners don't make full use of the hardware they paid for; darkmux gives you the tools to fully utilize that silicon.</p>
+    <p>It gives your frontier a crew it directs: 4B-class utility agents for the bounded, high-volume work; 35B-class specialists for the judgment calls. The frontier holds the context; the local fleet does the offloadable labor. <strong>The point is to make your frontier <em>better</em>, not to replace it.</strong> Local-by-default by construction — darkmux talks only to your localhost LMStudio, with no telemetry, no analytics, no update checks. MIT-licensed and open source, because a tool you trust with your work is a tool you can read.</p>
+    <p class="muted">The findings drove the design — compaction-mode defaults, bimodal wall-clock variance, the bigctx pivot, the compactor n_ctx cut. The repo is the evidence locker; the <a href="https://substack.com/@DarklyEnergized">article series</a> is the narrative.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Swap the loadout</h2>
+    <h3>The right loaded model, context length, and compaction profile for each task — named, not remembered.</h3>
     <p>You shouldn't have to remember whether your fast bounded-task stack is loaded right now, or whether the deep-agentic profile got swapped out an hour ago when you ran a different test. darkmux makes the loadout an explicit, named thing.</p>
     <ul class="plain">
       <li><code>darkmux profiles</code> — list named stacks (combinations of LMStudio models at specified context lengths)</li>
       <li><code>darkmux status</code> — show what's loaded and which profile (if any) it matches</li>
-      <li><code>darkmux swap deep</code> — atomically transition the LMStudio loadout (also patches the agent runtime config when you dispatch via <code>--runtime openclaw</code>)</li>
+      <li><code>darkmux swap deep</code> — atomically transition the LMStudio loadout to a named profile</li>
       <li><code>darkmux scan</code> — discover models in your LMStudio catalog not yet covered by any profile</li>
     </ul>
   </div>
@@ -260,15 +270,6 @@
 
 <section>
   <div class="wrap">
-    <h2>Read the work</h2>
-    <h3>The article series this came from.</h3>
-    <p>darkmux didn't start as a tool — it started as a lab notebook for a series on faster local AI on Apple Silicon. The findings (compaction-mode defaults, bimodal wall-clock variance, the bigctx pivot, the compactor n_ctx cut) drove the design choices. The series lives at <a href="https://substack.com/@DarklyEnergized">substack.com/@DarklyEnergized</a>.</p>
-    <p class="muted">The repo is the evidence locker. The articles are the narrative.</p>
-  </div>
-</section>
-
-<section>
-  <div class="wrap">
     <h2>Get going</h2>
     <pre class="install"><span class="prompt">$ </span><span class="cmd">cargo install --git https://github.com/kstrat2001/darkmux</span>
 <span class="prompt">$ </span><span class="cmd">darkmux init</span>
@@ -276,7 +277,7 @@
     <p class="muted">Then edit <code>~/.darkmux/profiles.json</code> to point at your downloaded LMStudio models. The <a href="guide/getting-started.html">getting-started page of the user guide</a> walks through this end-to-end, including verifying with doctor and running your first swap.</p>
 
     <div class="warn">
-      <strong>Results will vary based on your frontier configuration.</strong> The frontier models you use as the orchestrator (Claude Code, Cursor, OpenClaw, etc.) need proper guidance to make the most out of darkmux. The user guide is a starting reference, not doctrine to enforce. Contradictory statements between this guide, your project's <code>CLAUDE.md</code>, and other frontier configs will cause more harm than good. Configure to your own strategy and goals. See <a href="https://github.com/kstrat2001/darkmux/issues/112">issue #112</a> for the architectural reasoning.
+      <strong>Results will vary based on your frontier configuration.</strong> The frontier models you use as the orchestrator (Claude Code, Cursor, etc.) need proper guidance to make the most out of darkmux. The user guide is a starting reference, not doctrine to enforce. Contradictory statements between this guide, your project's <code>CLAUDE.md</code>, and other frontier configs will cause more harm than good. Configure to your own strategy and goals. See <a href="https://github.com/kstrat2001/darkmux/issues/112">issue #112</a> for the architectural reasoning.
     </div>
 
     <div class="warn">
