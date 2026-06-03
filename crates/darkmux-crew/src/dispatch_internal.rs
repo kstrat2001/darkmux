@@ -619,6 +619,32 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         })
     };
 
+    // (#557 slice 4) Always-on lms + container-CPU telemetry sampler.
+    // Mirrors the tailer/watchdog lifecycle: a background thread that
+    // loops until `sampler_stop` is set (after `wait_with_output()`
+    // returns) + a best-effort `.join()`. Per `TELEMETRY_SAMPLE_INTERVAL`
+    // it samples two host-side surfaces and forwards each into the one
+    // flow stream as a `category=telemetry` record:
+    //   - `source=lms`     → load/unload deltas of the LMStudio loaded set
+    //   - `source=process` → the per-dispatch container's CPU%
+    // ALWAYS-ON (not `--instrument`-gated). Replaces the OC-gateway CPU
+    // sampler vestige for the crew path — CPU is sourced from `docker
+    // stats <container>`, never from a gateway process / OPENCLAW_GATEWAY_PORT.
+    // Best-effort throughout: a failed `list_loaded` / `docker stats` /
+    // record never panics or aborts the dispatch — it's additive
+    // observability, so starting/stopping it is non-load-bearing.
+    let sampler_stop = Arc::new(AtomicBool::new(false));
+    let sampler_handle = {
+        let sampler_stop = Arc::clone(&sampler_stop);
+        let role_id = opts.role_id.clone();
+        let session_id = session_id.clone();
+        let model = model.clone();
+        let container_name = container_name.clone();
+        thread::spawn(move || {
+            run_telemetry_sampler(sampler_stop, role_id, session_id, model, container_name)
+        })
+    };
+
     let output = child
         .wait_with_output()
         .context("waiting for darkmux-runtime container")?;
@@ -628,6 +654,15 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // panic-resilience isn't load-bearing).
     watchdog_done.store(true, Ordering::SeqCst);
     let _ = watchdog_handle.join();
+
+    // (#557 slice 4) Stop the telemetry sampler now the container has
+    // exited — the container's gone, so `docker stats` would just churn
+    // and the loaded-model set is whatever it settled on. Mirrors the
+    // tailer's stop-then-join; best-effort (observability path, so a
+    // panicked sampler thread degrades to "no more samples", not a
+    // failed dispatch).
+    sampler_stop.store(true, Ordering::SeqCst);
+    let _ = sampler_handle.join();
 
     let wall_ms = dispatch_start_instant.elapsed().as_millis() as u64;
     let exit_code = output.status.code().unwrap_or(-1);
@@ -732,6 +767,22 @@ struct TrajectorySummary {
 /// to keep CPU+IO cost negligible for an idle dispatch.
 const TAILER_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+/// (#557 slice 4) Cadence for the always-on lms + container-CPU
+/// telemetry sampler. 2000ms is coarser than the 250ms trajectory tailer
+/// on purpose: lms load/unload + container CPU are slow-moving fleet
+/// signals (the demo viewer renders CPU as a sparse bar chart, not a live
+/// trace), and each tick shells out to `docker stats --no-stream` (a
+/// ~1s blocking call) — a tighter cadence would just stack docker calls
+/// without adding resolution.
+const TELEMETRY_SAMPLE_INTERVAL: Duration = Duration::from_millis(2000);
+
+/// Granularity at which the sampler re-checks its stop flag while waiting
+/// out a `TELEMETRY_SAMPLE_INTERVAL`. Mirrors the watchdog's 500ms poll:
+/// after `wait_with_output()` sets `sampler_stop`, the thread exits within
+/// one poll (≤500ms) instead of blocking for a full 2s sample interval, so
+/// the dispatch's `.join()` teardown stays snappy.
+const SAMPLER_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
 /// Minimum interval between consecutive `dispatch.turn.heartbeat` flow
 /// records. The runtime emits one `model.partial` trajectory event per
 /// SSE chunk (potentially hundreds per second on a streaming turn);
@@ -793,6 +844,124 @@ fn run_tailer(
     }
 
     state.summary
+}
+
+/// (#557 slice 4) Run the always-on lms + container-CPU telemetry
+/// sampler to completion. Loops until `stop_flag` is set (the main thread
+/// sets it after `wait_with_output()` returns), sampling two host-side
+/// surfaces each `TELEMETRY_SAMPLE_INTERVAL` and forwarding each
+/// observation into the one flow stream as a `category=telemetry` record.
+///
+/// **lms (`source=lms`)**: `darkmux_profiles::lms::list_loaded()` is the
+/// lms-ps source. Each tick diffs the current loaded set against the
+/// previous tick's via `telemetry_sampler::lms_diff`; only CHANGES emit
+/// (`{event:"load"|"unload", model, gb?}`).
+///
+/// **`prev` seeding choice**: `prev` is seeded with the FIRST sample
+/// (`prev = Vec::new()` initially, but the first iteration computes a diff
+/// against an empty `prev` ONLY when we want the initial set as loads).
+/// We chose to **seed `prev` on the first iteration and emit nothing** —
+/// the models already resident when the dispatch starts are pre-existing
+/// state, not a load this dispatch caused, so emitting them as "load"
+/// events would be spurious. Only loads/unloads that happen DURING the
+/// dispatch surface. Implemented via the `seeded` flag: first tick sets
+/// `prev = cur` and skips the diff; subsequent ticks diff normally.
+///
+/// **process (`source=process`)**: `docker stats <container> --no-stream
+/// --format "{{.CPUPerc}}"` → `parse_cpu_percent` → `{cpu:<N>}`. This is
+/// the OC-gateway-sampler replacement: CPU comes from the per-dispatch
+/// container, never from a gateway process.
+///
+/// Best-effort throughout — a failed `list_loaded`, a failed `docker
+/// stats`, or a failed record never panics or aborts; the worst case is
+/// a missing sample. A failed `list_loaded` probe is SKIPPED (the diff
+/// runs only against a SUCCESSFUL probe), leaving `prev` untouched for
+/// the next tick — so a transient lms hiccup can't emit a flurry of
+/// spurious "unload" events.
+fn run_telemetry_sampler(
+    stop_flag: Arc<AtomicBool>,
+    role_id: String,
+    session_id: String,
+    model: String,
+    container_name: String,
+) {
+    let emit = |source: &str, action: &str, payload: serde_json::Value| {
+        let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
+            darkmux_flow::Level::Info,
+            action,
+            source,
+            &role_id,
+            &session_id,
+            Some(&model),
+            payload,
+        ));
+    };
+
+    let mut prev: Vec<darkmux_types::LoadedModel> = Vec::new();
+    let mut seeded = false;
+
+    loop {
+        if stop_flag.load(Ordering::SeqCst) {
+            break;
+        }
+
+        // lms load/unload deltas. Only diff against a SUCCESSFUL probe —
+        // a failed `list_loaded` is skipped (leaves `prev` intact) so a
+        // transient lms hiccup doesn't emit a flurry of spurious unloads.
+        if let Ok(cur) = darkmux_profiles::lms::list_loaded() {
+            if !seeded {
+                // First successful sample: seed `prev`, emit nothing. The
+                // already-resident models are pre-existing state, not a
+                // load this dispatch caused.
+                prev = cur;
+                seeded = true;
+            } else {
+                for payload in crate::telemetry_sampler::lms_diff(&prev, &cur) {
+                    emit("lms", "telemetry.lms", payload);
+                }
+                prev = cur;
+            }
+        }
+
+        // Container CPU%. `docker stats --no-stream` is a single-shot
+        // sample of THIS dispatch's container. Best-effort: any failure
+        // (docker gone, container already exited, unparseable output) just
+        // skips the CPU sample for this tick.
+        if let Ok(out) = Command::new("docker")
+            .args([
+                "stats",
+                &container_name,
+                "--no-stream",
+                "--format",
+                "{{.CPUPerc}}",
+            ])
+            .output()
+        {
+            if out.status.success() {
+                let raw = String::from_utf8_lossy(&out.stdout);
+                if let Some(cpu) = crate::telemetry_sampler::parse_cpu_percent(&raw) {
+                    emit(
+                        "process",
+                        "telemetry.process",
+                        serde_json::json!({ "cpu": cpu }),
+                    );
+                }
+            }
+        }
+
+        // Wait out the sample interval, but poll the stop flag every
+        // `SAMPLER_POLL_INTERVAL` so teardown after `wait_with_output()`
+        // is prompt (≤500ms) rather than blocking for a full 2s tick.
+        let mut slept = Duration::ZERO;
+        while slept < TELEMETRY_SAMPLE_INTERVAL {
+            if stop_flag.load(Ordering::SeqCst) {
+                return;
+            }
+            let nap = SAMPLER_POLL_INTERVAL.min(TELEMETRY_SAMPLE_INTERVAL - slept);
+            thread::sleep(nap);
+            slept += nap;
+        }
+    }
 }
 
 /// State machine for tailing `trajectory.jsonl`. Tracks the file offset,
