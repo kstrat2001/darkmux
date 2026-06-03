@@ -1427,6 +1427,45 @@ pub fn build_dispatch_record_with_payload(
     }
 }
 
+/// Build a telemetry flow record (#557 slice 2). Same shape as
+/// `build_dispatch_record_with_payload` but `category = Telemetry` and
+/// the `source` is caller-supplied (`"detector"`, `"runtime"`, …) so the
+/// observability viewer can discriminate telemetry sub-streams. The
+/// `payload` carries the instrument-specific fields (the viewer aliases
+/// the wire `payload` to `fields` client-side).
+pub fn build_telemetry_record(
+    level: darkmux_flow::Level,
+    action: &str,
+    source: &str,
+    role_id: &str,
+    session_id: &str,
+    model: Option<&str>,
+    payload: serde_json::Value,
+) -> darkmux_flow::FlowRecord {
+    darkmux_flow::FlowRecord {
+        ts: darkmux_flow::ts_utc_now(),
+        level,
+        category: darkmux_flow::Category::Telemetry,
+        tier: darkmux_flow::Tier::Local,
+        stage: darkmux_flow::Stage::Dispatch,
+        action: action.to_string(),
+        handle: role_id.to_string(),
+        sprint_id: None,
+        session_id: Some(session_id.to_string()),
+        source: Some(source.to_string()),
+        model: model.map(String::from),
+        reasoning: None,
+        mission_id: None,
+        machine_id: None,
+        orchestrator: None,
+        prev_hash: None,
+        hash: None,
+        payload: Some(payload),
+        work_id: None,
+        attempt: None,
+    }
+}
+
 /// Best-effort resolve the LMStudio model id openclaw will route this
 /// agent's dispatches to. Tries `agents.list[<agent-id>].model` first,
 /// falls back to `agents.defaults.model.primary`. Returns `None` when:
@@ -1829,6 +1868,64 @@ mod tests {
         let mut c = CompactionDispatchArgs::default();
         c.apply_utility_model(None);
         assert!(c.compactor_model.is_none());
+    }
+
+    // ─── #557 slice 2 build_telemetry_record ──────────────────────────
+
+    /// `build_telemetry_record` differs from the work-category dispatch
+    /// builder in exactly two fields: `category = Telemetry` and a
+    /// caller-supplied `source`. Everything else (tier=Local,
+    /// stage=Dispatch, handle=role_id, session_id, model, payload) is
+    /// copied verbatim. This asserts the discriminating fields plus the
+    /// payload round-trip.
+    #[test]
+    fn build_telemetry_record_has_telemetry_category_and_caller_source() {
+        let payload = serde_json::json!({
+            "kind": "cycle",
+            "severity": "warn",
+            "detail": "`read` called 3× in the last 10 tool calls",
+        });
+        let rec = build_telemetry_record(
+            darkmux_flow::Level::Info,
+            "telemetry.detector",
+            "detector",
+            "coder",
+            "sess-1",
+            Some("darkmux:qwen3.6"),
+            payload.clone(),
+        );
+
+        assert!(matches!(rec.category, darkmux_flow::Category::Telemetry));
+        assert_eq!(rec.source.as_deref(), Some("detector"));
+        assert!(matches!(rec.tier, darkmux_flow::Tier::Local));
+        assert!(matches!(rec.stage, darkmux_flow::Stage::Dispatch));
+        assert_eq!(rec.handle, "coder");
+        assert_eq!(rec.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(rec.model.as_deref(), Some("darkmux:qwen3.6"));
+        assert_eq!(rec.payload, Some(payload));
+    }
+
+    /// The observability viewer discriminates telemetry sub-streams on
+    /// the *serialized* `category` + `source` strings. Confirm a
+    /// telemetry record serializes to `"category":"telemetry"` and
+    /// `"source":"detector"` (the wire-level contract the demo viewer
+    /// keys on; it then aliases `payload` → `fields` client-side).
+    #[test]
+    fn telemetry_record_serializes_with_telemetry_category_and_detector_source() {
+        let rec = build_telemetry_record(
+            darkmux_flow::Level::Info,
+            "telemetry.detector",
+            "detector",
+            "coder",
+            "sess-1",
+            None,
+            serde_json::json!({ "kind": "cycle", "severity": "warn", "detail": "x" }),
+        );
+        let v = serde_json::to_value(&rec).unwrap();
+        assert_eq!(v["category"], "telemetry");
+        assert_eq!(v["source"], "detector");
+        // payload (aliased to `fields` viewer-side) round-trips on the wire.
+        assert_eq!(v["payload"]["kind"], "cycle");
     }
 
     // ─── #247 PR-C build_route_payload (post-#590 single-stream shape) ─
