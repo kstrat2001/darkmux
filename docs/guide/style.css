@@ -322,8 +322,10 @@ footer a:hover { color: var(--accent); }
   .toc a .title { font-size: 16px; }
 
   /* Tables scroll horizontally as a unit rather than overflow the
-     viewport. The env-var tables in the hub guide are the worst case
-     here (4 columns of varying-width content). */
+     viewport. The real <table> elements live in getting-started,
+     missions, and observability (2-3 columns); always-on-hub's env-var
+     content is <pre><code>, already handled by the desktop
+     pre{overflow-x:auto} rule. */
   table {
     display: block;
     overflow-x: auto;
