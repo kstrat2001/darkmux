@@ -687,6 +687,21 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         Some(dispatch_complete_payload),
     ));
 
+    // (#557 slice 2) Per-dispatch runtime-turns telemetry. A telemetry
+    // sibling of the dispatch.complete record above carrying just the
+    // turn count under `category=telemetry, source=runtime` so the
+    // observability viewer can render runtime-turns without parsing the
+    // Work-category complete payload.
+    let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
+        darkmux_flow::Level::Info,
+        "telemetry.runtime",
+        "runtime",
+        &opts.role_id,
+        &session_id,
+        Some(&model),
+        serde_json::json!({ "turns": trajectory_summary.turns }),
+    ));
+
     Ok(DispatchResult {
         exit_code,
         stdout,
@@ -1075,6 +1090,24 @@ impl TailerState {
                     self.emit("dispatch.turn.heartbeat", darkmux_flow::Level::Info, payload);
                 }
             }
+            // (#557 slice 2) Detector trajectory events → telemetry flow
+            // records. Each detector firing becomes one `category=telemetry,
+            // source=detector` record carrying a {kind, severity, detail}
+            // payload the observability viewer renders. The runtime already
+            // records these in its own trajectory; forwarding them into the
+            // one flow stream is what makes detector firings visible in the
+            // unified viewer (the keystone of #557). The kind/severity/detail
+            // mapping lives in the pure `detector_telemetry_payload` helper
+            // so it can be unit-tested without the process-global flow sink.
+            "dispatch.cycle.suspected"
+            | "dispatch.reasoning_loop.suspected"
+            | "dispatch.tool.repeated_failure"
+            | "dispatch.intra_turn_stall.recovered"
+            | "dispatch.per_turn_cap.salvaged" => {
+                if let Some(payload) = detector_telemetry_payload(event_type, &event) {
+                    self.emit_telemetry("detector", "telemetry.detector", payload);
+                }
+            }
             _ => {
                 // Other event types (dispatch.start/complete from the
                 // runtime side; model.streaming.start/end) are ignored —
@@ -1095,6 +1128,118 @@ impl TailerState {
             Some(payload),
         ));
     }
+
+    /// (#557 slice 2) Emit a telemetry flow record. Same plumbing as
+    /// `emit` but routes through `build_telemetry_record` so the record
+    /// lands under `category=telemetry` with a caller-supplied `source`
+    /// (`"detector"`, `"runtime"`, …) the observability viewer keys on.
+    fn emit_telemetry(&self, source: &str, action: &str, payload: serde_json::Value) {
+        let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
+            darkmux_flow::Level::Info,
+            action,
+            source,
+            &self.role_id,
+            &self.session_id,
+            Some(&self.model),
+            payload,
+        ));
+    }
+}
+
+/// (#557 slice 2) Map a detector trajectory event to its telemetry
+/// payload — the `{kind, severity, detail}` object the observability
+/// viewer renders. Pure (no IO, no global sink) so the mapping is
+/// unit-testable in isolation from `handle_event`'s flow-record emission.
+///
+/// `event_type` is the already-extracted `event["type"]` string; `event`
+/// is the parsed trajectory line. Returns `None` for event types this
+/// helper doesn't map (the caller only invokes it for the five detector
+/// types, so `None` is defensive — it never fires on the happy path).
+///
+/// Field accessors are all safe (`unwrap_or` defaults) so a malformed or
+/// partial detector event still produces a renderable record rather than
+/// dropping the firing. `completion_tokens` on the intra-turn-stall event
+/// may be JSON null (upstream omitted `usage`); that renders as "unknown"
+/// rather than a misleading "0".
+fn detector_telemetry_payload(
+    event_type: &str,
+    event: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let str_field = |k: &str| event.get(k).and_then(|v| v.as_str()).unwrap_or("?");
+    let u64_field = |k: &str| event.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+
+    let (kind, severity, detail) = match event_type {
+        "dispatch.cycle.suspected" => {
+            let tool_name = str_field("tool_name");
+            let count = u64_field("count");
+            let window_size = u64_field("window_size");
+            (
+                "cycle",
+                "warn",
+                format!(
+                    "`{tool_name}` called {count}× in the last {window_size} tool calls — repeated-tool-call cycle (#418)"
+                ),
+            )
+        }
+        "dispatch.reasoning_loop.suspected" => {
+            let count = u64_field("count");
+            let window_size = u64_field("window_size");
+            (
+                "reasoning-loop",
+                "warn",
+                format!(
+                    "same reasoning repeated {count}× in {window_size} turns — reasoning loop (#461)"
+                ),
+            )
+        }
+        "dispatch.tool.repeated_failure" => {
+            let tool_name = str_field("tool_name");
+            let consecutive_failures = u64_field("consecutive_failures");
+            (
+                "tool-failure",
+                "warn",
+                format!("{consecutive_failures} consecutive failures of `{tool_name}` (#419)"),
+            )
+        }
+        "dispatch.intra_turn_stall.recovered" => {
+            // completion_tokens may be JSON null (upstream omitted `usage`);
+            // render "unknown" rather than a misleading 0 that reads
+            // identical to a real small count.
+            let completion_tokens = event
+                .get("completion_tokens")
+                .and_then(|v| v.as_u64())
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            let recoveries_used = u64_field("recoveries_used");
+            let recoveries_budget = u64_field("recoveries_budget");
+            (
+                "intra-turn-stall",
+                "info",
+                format!(
+                    "runaway-reasoning turn dropped + recovered (budget {recoveries_used}/{recoveries_budget}, {completion_tokens} tokens) (#414)"
+                ),
+            )
+        }
+        "dispatch.per_turn_cap.salvaged" => {
+            let completion_tokens = u64_field("completion_tokens");
+            let cap = u64_field("cap");
+            let salvaged_tool_calls = u64_field("salvaged_tool_calls");
+            (
+                "per-turn-cap",
+                "info",
+                format!(
+                    "{salvaged_tool_calls} tool call(s) salvaged at the per-call cap ({completion_tokens}/{cap} tokens) (#479)"
+                ),
+            )
+        }
+        _ => return None,
+    };
+
+    Some(serde_json::json!({
+        "kind": kind,
+        "severity": severity,
+        "detail": detail,
+    }))
 }
 
 /// Cap a JSON string value at `MAX_REASONING_TEXT_BYTES`, appending a
@@ -2574,6 +2719,138 @@ mod tests {
         assert!(
             new_deadline >= expected_min,
             "deadline must reflect the latest reset, not stale to an earlier event"
+        );
+    }
+
+    // ─── #557 slice 2 detector telemetry ──────────────────────────────
+
+    /// The pure mapping helper: a `dispatch.cycle.suspected` event →
+    /// `{kind:"cycle", severity:"warn", detail:<non-empty>}`. Pure (no
+    /// flow sink, no IO) so the kind/severity/detail contract is asserted
+    /// deterministically. All five detector kinds route through this fn.
+    #[test]
+    fn detector_telemetry_payload_maps_cycle_event() {
+        let event = serde_json::json!({
+            "type": "dispatch.cycle.suspected",
+            "seq": 7,
+            "tool_name": "read",
+            "count": 3,
+            "window_size": 10,
+        });
+        let payload =
+            detector_telemetry_payload("dispatch.cycle.suspected", &event).expect("maps cycle");
+        assert_eq!(payload["kind"], "cycle");
+        assert_eq!(payload["severity"], "warn");
+        let detail = payload["detail"].as_str().expect("detail is a string");
+        assert!(!detail.is_empty(), "detail must be non-empty");
+        assert!(
+            detail.contains("read") && detail.contains('3') && detail.contains("10"),
+            "detail must weave in the event fields; got {detail:?}"
+        );
+    }
+
+    /// `intra_turn_stall.recovered` with a null `completion_tokens`
+    /// (upstream omitted `usage`) renders "unknown", not a misleading 0.
+    #[test]
+    fn detector_telemetry_payload_renders_unknown_for_null_completion_tokens() {
+        let event = serde_json::json!({
+            "type": "dispatch.intra_turn_stall.recovered",
+            "seq": 4,
+            "completion_tokens": serde_json::Value::Null,
+            "recoveries_used": 1,
+            "recoveries_budget": 3,
+        });
+        let payload = detector_telemetry_payload("dispatch.intra_turn_stall.recovered", &event)
+            .expect("maps intra-turn-stall");
+        assert_eq!(payload["kind"], "intra-turn-stall");
+        assert_eq!(payload["severity"], "info");
+        let detail = payload["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("unknown tokens"),
+            "null completion_tokens must render as 'unknown'; got {detail:?}"
+        );
+    }
+
+    /// Integration shape: feed a `dispatch.cycle.suspected` trajectory
+    /// line through `handle_event` and assert the emitted FlowRecord is a
+    /// telemetry record (`category:"telemetry"`, `source:"detector"`)
+    /// with a `kind:"cycle"`/`severity:"warn"`/non-empty `detail` payload.
+    ///
+    /// Capture mechanism: `LocalFileSink` resolves `DARKMUX_FLOWS_DIR`
+    /// per write (see the #507 note on the sink), so pointing it at a
+    /// tempdir and reading the day-file back observes exactly the record
+    /// `handle_event` → `emit_telemetry` → `darkmux_flow::record` wrote.
+    /// `#[serial]` guards the shared env var (other flow tests mutate it).
+    #[test]
+    #[serial]
+    fn handle_event_cycle_emits_telemetry_record() {
+        let tmp = TempDir::new().unwrap();
+        // SAFETY: serialized via `#[serial]`; no concurrent env reader.
+        // Scrub DARKMUX_REDIS_URL so a stray operator-shell value can't
+        // make the default-sink write block on an unreachable peer
+        // (the 75s/record timeout the flow crate's isolate helper guards
+        // against; we inline the scrub since that helper is test-support
+        // gated and not visible here).
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let mut state = TailerState::new_for_test(
+            traj_path,
+            "sess-cycle".into(),
+            "coder".into(),
+            "darkmux:qwen3.6".into(),
+        );
+        state.handle_event(
+            r#"{"type":"dispatch.cycle.suspected","seq":9,"tool_name":"read","canonical_args":"{}","count":3,"window_size":10}"#,
+        );
+
+        // Restore env BEFORE assertions so a failing assert can't leak it.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+
+        // Find the day-file the sink wrote (YYYY-MM-DD.jsonl) without
+        // needing the crate-private day helper — glob the tempdir.
+        let day_file = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                p.extension().and_then(|x| x.to_str()) == Some("jsonl")
+                    && p.file_name().and_then(|n| n.to_str()) != Some("trajectory.jsonl")
+            })
+            .expect("a flow day-file should have been written");
+
+        let contents = std::fs::read_to_string(&day_file).unwrap();
+        let telemetry = contents
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["category"] == "telemetry")
+            .expect("a telemetry record should have been emitted");
+
+        assert_eq!(telemetry["category"], "telemetry");
+        assert_eq!(telemetry["source"], "detector");
+        assert_eq!(telemetry["action"], "telemetry.detector");
+        assert_eq!(telemetry["handle"], "coder");
+        assert_eq!(telemetry["payload"]["kind"], "cycle");
+        assert_eq!(telemetry["payload"]["severity"], "warn");
+        assert!(
+            telemetry["payload"]["detail"]
+                .as_str()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false),
+            "detail must be present and non-empty"
         );
     }
 
