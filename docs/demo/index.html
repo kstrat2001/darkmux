@@ -215,53 +215,53 @@
 // back to it; served by `darkmux serve` at GET / it instead fetches the
 // daemon's real /flow/:date records (same-origin). See boot() at the bottom.
 const SAMPLE = [
- {ts:"2026-05-19T01:00:00Z",category:"work",tier:"operator",stage:"scope",action:"note",handle:"mission scoped",machine_id:"studio",mission_id:"redis-tailnet"},
- {ts:"2026-05-19T01:00:30Z",category:"work",tier:"local",stage:"dispatch",action:"dispatch.start",handle:"darkmux/coder",machine_id:"studio",mission_id:"redis-tailnet",session_id:"S1",model:"qwen3.6-35b"},
- {ts:"2026-05-19T01:00:35Z",category:"telemetry",source:"lms",machine_id:"studio",session_id:"S1",fields:{event:"load",model:"qwen3.6-35b",gb:21}},
- {ts:"2026-05-19T01:00:50Z",category:"telemetry",source:"process",machine_id:"studio",session_id:"S1",fields:{cpu:38}},
- {ts:"2026-05-19T01:01:20Z",category:"telemetry",source:"lms",machine_id:"studio",session_id:"S1",fields:{event:"unload",model:"qwen3.6-35b"}},
- {ts:"2026-05-19T01:01:22Z",category:"telemetry",source:"lms",machine_id:"studio",session_id:"S1",fields:{event:"load",model:"qwen3-coder-next",gb:19}},
- {ts:"2026-05-19T01:01:35Z",category:"telemetry",source:"process",machine_id:"studio",session_id:"S1",fields:{cpu:71}},
- {ts:"2026-05-19T01:01:55Z",category:"telemetry",source:"process",machine_id:"studio",session_id:"S1",fields:{cpu:24}},
- {ts:"2026-05-19T01:02:10Z",category:"work",tier:"local",stage:"dispatch",action:"dispatch.complete",handle:"darkmux/coder",machine_id:"studio",mission_id:"redis-tailnet",session_id:"S1",model:"qwen3-coder-next"},
- {ts:"2026-05-19T01:01:10Z",category:"telemetry",source:"detector",machine_id:"studio",session_id:"S1",fields:{kind:"tool-failure",severity:"warn",detail:"2 consecutive tool failures (file_not_found) before recovery (#419)"}},
- {ts:"2026-05-19T01:02:08Z",category:"telemetry",source:"runtime",machine_id:"studio",session_id:"S1",fields:{turns:7}},
- {ts:"2026-05-19T01:02:00Z",category:"telemetry",source:"detector",machine_id:"laptop",session_id:"S2",fields:{kind:"cycle",severity:"warn",detail:"same file read 3x in a row — repeated-tool-call cycle (#418)"}},
- {ts:"2026-05-19T01:03:08Z",category:"telemetry",source:"runtime",machine_id:"laptop",session_id:"S2",fields:{turns:4}},
- {ts:"2026-05-19T01:03:38Z",category:"telemetry",source:"runtime",machine_id:"mini-1",session_id:"S3",fields:{turns:5}},
- {ts:"2026-05-19T01:00:35Z",category:"telemetry",source:"context",machine_id:"studio",session_id:"S1",fields:{used:6000,max:40000}},
- {ts:"2026-05-19T01:00:55Z",category:"telemetry",source:"context",machine_id:"studio",session_id:"S1",fields:{used:22000,max:40000}},
- {ts:"2026-05-19T01:01:15Z",category:"telemetry",source:"context",machine_id:"studio",session_id:"S1",fields:{used:36000,max:40000}},
- {ts:"2026-05-19T01:01:20Z",category:"telemetry",source:"compaction",machine_id:"studio",session_id:"S1",fields:{from:36000,to:12000}},
- {ts:"2026-05-19T01:01:21Z",category:"telemetry",source:"context",machine_id:"studio",session_id:"S1",fields:{used:12000,max:40000}},
- {ts:"2026-05-19T01:01:45Z",category:"telemetry",source:"context",machine_id:"studio",session_id:"S1",fields:{used:30000,max:40000}},
- {ts:"2026-05-19T01:01:58Z",category:"telemetry",source:"context",machine_id:"studio",session_id:"S1",fields:{used:35000,max:40000}},
- {ts:"2026-05-19T01:02:02Z",category:"telemetry",source:"compaction",machine_id:"studio",session_id:"S1",fields:{from:35000,to:11000}},
- {ts:"2026-05-19T01:02:03Z",category:"telemetry",source:"context",machine_id:"studio",session_id:"S1",fields:{used:11000,max:40000}},
- {ts:"2026-05-19T01:02:08Z",category:"telemetry",source:"context",machine_id:"studio",session_id:"S1",fields:{used:17000,max:40000}},
- {ts:"2026-05-19T01:01:00Z",category:"telemetry",source:"context",machine_id:"laptop",session_id:"S2",fields:{used:14000,max:100000}},
- {ts:"2026-05-19T01:01:40Z",category:"telemetry",source:"context",machine_id:"laptop",session_id:"S2",fields:{used:48000,max:100000}},
- {ts:"2026-05-19T01:02:30Z",category:"telemetry",source:"context",machine_id:"laptop",session_id:"S2",fields:{used:79000,max:100000}},
- {ts:"2026-05-19T01:02:32Z",category:"telemetry",source:"compaction",machine_id:"laptop",session_id:"S2",fields:{from:79000,to:22000}},
- {ts:"2026-05-19T01:02:34Z",category:"telemetry",source:"context",machine_id:"laptop",session_id:"S2",fields:{used:22000,max:100000}},
- {ts:"2026-05-19T01:03:00Z",category:"telemetry",source:"context",machine_id:"laptop",session_id:"S2",fields:{used:41000,max:100000}},
- {ts:"2026-05-19T01:02:25Z",category:"telemetry",source:"context",machine_id:"mini-1",session_id:"S3",fields:{used:5000,max:24000}},
- {ts:"2026-05-19T01:02:50Z",category:"telemetry",source:"context",machine_id:"mini-1",session_id:"S3",fields:{used:14000,max:24000}},
- {ts:"2026-05-19T01:03:20Z",category:"telemetry",source:"context",machine_id:"mini-1",session_id:"S3",fields:{used:21000,max:24000}},
- {ts:"2026-05-19T01:02:25Z",category:"work",tier:"local",stage:"dispatch",action:"dispatch.start",handle:"darkmux/coder",machine_id:"studio",mission_id:"redis-tailnet",session_id:"S4",model:"qwen3-coder-next"},
- {ts:"2026-05-19T01:02:45Z",category:"telemetry",source:"process",machine_id:"studio",session_id:"S4",fields:{cpu:44}},
- {ts:"2026-05-19T01:03:15Z",category:"telemetry",source:"process",machine_id:"studio",session_id:"S4",fields:{cpu:29}},
- {ts:"2026-05-19T01:03:28Z",category:"telemetry",source:"runtime",machine_id:"studio",session_id:"S4",fields:{turns:3}},
- {ts:"2026-05-19T01:03:30Z",category:"work",tier:"local",stage:"dispatch",action:"dispatch.complete",handle:"darkmux/coder",machine_id:"studio",mission_id:"redis-tailnet",session_id:"S4",model:"qwen3-coder-next"},
- {ts:"2026-05-19T01:00:55Z",category:"work",tier:"local",stage:"dispatch",action:"dispatch.start",handle:"darkmux/reviewer",machine_id:"laptop",mission_id:"redis-tailnet",session_id:"S2",model:"qwen3.5-122b"},
- {ts:"2026-05-19T01:01:00Z",category:"telemetry",source:"lms",machine_id:"laptop",session_id:"S2",fields:{event:"load",model:"qwen3.5-122b",gb:74}},
- {ts:"2026-05-19T01:01:30Z",category:"telemetry",source:"process",machine_id:"laptop",session_id:"S2",fields:{cpu:55}},
- {ts:"2026-05-19T01:02:40Z",category:"telemetry",source:"process",machine_id:"laptop",session_id:"S2",fields:{cpu:48}},
- {ts:"2026-05-19T01:03:10Z",category:"work",tier:"local",stage:"dispatch",action:"dispatch.complete",handle:"darkmux/reviewer",machine_id:"laptop",mission_id:"redis-tailnet",session_id:"S2",model:"qwen3.5-122b"},
- {ts:"2026-05-19T01:02:20Z",category:"work",tier:"local",stage:"dispatch",action:"dispatch.start",handle:"darkmux/analyst",machine_id:"mini-1",mission_id:"redis-tailnet",session_id:"S3",model:"qwen3.6-35b"},
- {ts:"2026-05-19T01:02:25Z",category:"telemetry",source:"lms",machine_id:"mini-1",session_id:"S3",fields:{event:"load",model:"qwen3.6-35b",gb:21}},
- {ts:"2026-05-19T01:02:55Z",category:"telemetry",source:"process",machine_id:"mini-1",session_id:"S3",fields:{cpu:33}},
- {ts:"2026-05-19T01:03:40Z",category:"work",tier:"local",stage:"dispatch",action:"dispatch.complete",handle:"darkmux/analyst",machine_id:"mini-1",mission_id:"redis-tailnet",session_id:"S3",model:"qwen3.6-35b"},
+ {ts:"2026-05-19T01:00:00Z",category:"work",tier:"operator",stage:"scope",action:"note",handle:"mission scoped",machine_id:"studio",machine_uid:"demo-studio",mission_id:"redis-tailnet"},
+ {ts:"2026-05-19T01:00:30Z",category:"work",tier:"local",stage:"dispatch",action:"dispatch.start",handle:"darkmux/coder",machine_id:"studio",machine_uid:"demo-studio",mission_id:"redis-tailnet",session_id:"S1",model:"qwen3.6-35b"},
+ {ts:"2026-05-19T01:00:35Z",category:"telemetry",source:"lms",machine_id:"studio",machine_uid:"demo-studio",session_id:"S1",fields:{event:"load",model:"qwen3.6-35b",gb:21}},
+ {ts:"2026-05-19T01:00:50Z",category:"telemetry",source:"process",machine_id:"studio",machine_uid:"demo-studio",session_id:"S1",fields:{cpu:38}},
+ {ts:"2026-05-19T01:01:20Z",category:"telemetry",source:"lms",machine_id:"studio",machine_uid:"demo-studio",session_id:"S1",fields:{event:"unload",model:"qwen3.6-35b"}},
+ {ts:"2026-05-19T01:01:22Z",category:"telemetry",source:"lms",machine_id:"studio",machine_uid:"demo-studio",session_id:"S1",fields:{event:"load",model:"qwen3-coder-next",gb:19}},
+ {ts:"2026-05-19T01:01:35Z",category:"telemetry",source:"process",machine_id:"studio",machine_uid:"demo-studio",session_id:"S1",fields:{cpu:71}},
+ {ts:"2026-05-19T01:01:55Z",category:"telemetry",source:"process",machine_id:"studio",machine_uid:"demo-studio",session_id:"S1",fields:{cpu:24}},
+ {ts:"2026-05-19T01:02:10Z",category:"work",tier:"local",stage:"dispatch",action:"dispatch.complete",handle:"darkmux/coder",machine_id:"studio",machine_uid:"demo-studio",mission_id:"redis-tailnet",session_id:"S1",model:"qwen3-coder-next"},
+ {ts:"2026-05-19T01:01:10Z",category:"telemetry",source:"detector",machine_id:"studio",machine_uid:"demo-studio",session_id:"S1",fields:{kind:"tool-failure",severity:"warn",detail:"2 consecutive tool failures (file_not_found) before recovery (#419)"}},
+ {ts:"2026-05-19T01:02:08Z",category:"telemetry",source:"runtime",machine_id:"studio",machine_uid:"demo-studio",session_id:"S1",fields:{turns:7}},
+ {ts:"2026-05-19T01:02:00Z",category:"telemetry",source:"detector",machine_id:"laptop",machine_uid:"demo-laptop",session_id:"S2",fields:{kind:"cycle",severity:"warn",detail:"same file read 3x in a row — repeated-tool-call cycle (#418)"}},
+ {ts:"2026-05-19T01:03:08Z",category:"telemetry",source:"runtime",machine_id:"laptop",machine_uid:"demo-laptop",session_id:"S2",fields:{turns:4}},
+ {ts:"2026-05-19T01:03:38Z",category:"telemetry",source:"runtime",machine_id:"mini-1",machine_uid:"demo-mini",session_id:"S3",fields:{turns:5}},
+ {ts:"2026-05-19T01:00:35Z",category:"telemetry",source:"context",machine_id:"studio",machine_uid:"demo-studio",session_id:"S1",fields:{used:6000,max:40000}},
+ {ts:"2026-05-19T01:00:55Z",category:"telemetry",source:"context",machine_id:"studio",machine_uid:"demo-studio",session_id:"S1",fields:{used:22000,max:40000}},
+ {ts:"2026-05-19T01:01:15Z",category:"telemetry",source:"context",machine_id:"studio",machine_uid:"demo-studio",session_id:"S1",fields:{used:36000,max:40000}},
+ {ts:"2026-05-19T01:01:20Z",category:"telemetry",source:"compaction",machine_id:"studio",machine_uid:"demo-studio",session_id:"S1",fields:{from:36000,to:12000}},
+ {ts:"2026-05-19T01:01:21Z",category:"telemetry",source:"context",machine_id:"studio",machine_uid:"demo-studio",session_id:"S1",fields:{used:12000,max:40000}},
+ {ts:"2026-05-19T01:01:45Z",category:"telemetry",source:"context",machine_id:"studio",machine_uid:"demo-studio",session_id:"S1",fields:{used:30000,max:40000}},
+ {ts:"2026-05-19T01:01:58Z",category:"telemetry",source:"context",machine_id:"studio",machine_uid:"demo-studio",session_id:"S1",fields:{used:35000,max:40000}},
+ {ts:"2026-05-19T01:02:02Z",category:"telemetry",source:"compaction",machine_id:"studio",machine_uid:"demo-studio",session_id:"S1",fields:{from:35000,to:11000}},
+ {ts:"2026-05-19T01:02:03Z",category:"telemetry",source:"context",machine_id:"studio",machine_uid:"demo-studio",session_id:"S1",fields:{used:11000,max:40000}},
+ {ts:"2026-05-19T01:02:08Z",category:"telemetry",source:"context",machine_id:"studio",machine_uid:"demo-studio",session_id:"S1",fields:{used:17000,max:40000}},
+ {ts:"2026-05-19T01:01:00Z",category:"telemetry",source:"context",machine_id:"laptop",machine_uid:"demo-laptop",session_id:"S2",fields:{used:14000,max:100000}},
+ {ts:"2026-05-19T01:01:40Z",category:"telemetry",source:"context",machine_id:"laptop",machine_uid:"demo-laptop",session_id:"S2",fields:{used:48000,max:100000}},
+ {ts:"2026-05-19T01:02:30Z",category:"telemetry",source:"context",machine_id:"laptop",machine_uid:"demo-laptop",session_id:"S2",fields:{used:79000,max:100000}},
+ {ts:"2026-05-19T01:02:32Z",category:"telemetry",source:"compaction",machine_id:"laptop",machine_uid:"demo-laptop",session_id:"S2",fields:{from:79000,to:22000}},
+ {ts:"2026-05-19T01:02:34Z",category:"telemetry",source:"context",machine_id:"laptop",machine_uid:"demo-laptop",session_id:"S2",fields:{used:22000,max:100000}},
+ {ts:"2026-05-19T01:03:00Z",category:"telemetry",source:"context",machine_id:"laptop",machine_uid:"demo-laptop",session_id:"S2",fields:{used:41000,max:100000}},
+ {ts:"2026-05-19T01:02:25Z",category:"telemetry",source:"context",machine_id:"mini-1",machine_uid:"demo-mini",session_id:"S3",fields:{used:5000,max:24000}},
+ {ts:"2026-05-19T01:02:50Z",category:"telemetry",source:"context",machine_id:"mini-1",machine_uid:"demo-mini",session_id:"S3",fields:{used:14000,max:24000}},
+ {ts:"2026-05-19T01:03:20Z",category:"telemetry",source:"context",machine_id:"mini-1",machine_uid:"demo-mini",session_id:"S3",fields:{used:21000,max:24000}},
+ {ts:"2026-05-19T01:02:25Z",category:"work",tier:"local",stage:"dispatch",action:"dispatch.start",handle:"darkmux/coder",machine_id:"studio",machine_uid:"demo-studio",mission_id:"redis-tailnet",session_id:"S4",model:"qwen3-coder-next"},
+ {ts:"2026-05-19T01:02:45Z",category:"telemetry",source:"process",machine_id:"studio",machine_uid:"demo-studio",session_id:"S4",fields:{cpu:44}},
+ {ts:"2026-05-19T01:03:15Z",category:"telemetry",source:"process",machine_id:"studio",machine_uid:"demo-studio",session_id:"S4",fields:{cpu:29}},
+ {ts:"2026-05-19T01:03:28Z",category:"telemetry",source:"runtime",machine_id:"studio",machine_uid:"demo-studio",session_id:"S4",fields:{turns:3}},
+ {ts:"2026-05-19T01:03:30Z",category:"work",tier:"local",stage:"dispatch",action:"dispatch.complete",handle:"darkmux/coder",machine_id:"studio",machine_uid:"demo-studio",mission_id:"redis-tailnet",session_id:"S4",model:"qwen3-coder-next"},
+ {ts:"2026-05-19T01:00:55Z",category:"work",tier:"local",stage:"dispatch",action:"dispatch.start",handle:"darkmux/reviewer",machine_id:"laptop",machine_uid:"demo-laptop",mission_id:"redis-tailnet",session_id:"S2",model:"qwen3.5-122b"},
+ {ts:"2026-05-19T01:01:00Z",category:"telemetry",source:"lms",machine_id:"laptop",machine_uid:"demo-laptop",session_id:"S2",fields:{event:"load",model:"qwen3.5-122b",gb:74}},
+ {ts:"2026-05-19T01:01:30Z",category:"telemetry",source:"process",machine_id:"laptop",machine_uid:"demo-laptop",session_id:"S2",fields:{cpu:55}},
+ {ts:"2026-05-19T01:02:40Z",category:"telemetry",source:"process",machine_id:"laptop",machine_uid:"demo-laptop",session_id:"S2",fields:{cpu:48}},
+ {ts:"2026-05-19T01:03:10Z",category:"work",tier:"local",stage:"dispatch",action:"dispatch.complete",handle:"darkmux/reviewer",machine_id:"laptop",machine_uid:"demo-laptop",mission_id:"redis-tailnet",session_id:"S2",model:"qwen3.5-122b"},
+ {ts:"2026-05-19T01:02:20Z",category:"work",tier:"local",stage:"dispatch",action:"dispatch.start",handle:"darkmux/analyst",machine_id:"mini-1",machine_uid:"demo-mini",mission_id:"redis-tailnet",session_id:"S3",model:"qwen3.6-35b"},
+ {ts:"2026-05-19T01:02:25Z",category:"telemetry",source:"lms",machine_id:"mini-1",machine_uid:"demo-mini",session_id:"S3",fields:{event:"load",model:"qwen3.6-35b",gb:21}},
+ {ts:"2026-05-19T01:02:55Z",category:"telemetry",source:"process",machine_id:"mini-1",machine_uid:"demo-mini",session_id:"S3",fields:{cpu:33}},
+ {ts:"2026-05-19T01:03:40Z",category:"work",tier:"local",stage:"dispatch",action:"dispatch.complete",handle:"darkmux/analyst",machine_id:"mini-1",machine_uid:"demo-mini",mission_id:"redis-tailnet",session_id:"S3",model:"qwen3.6-35b"},
 ];
 let DATA = SAMPLE;            // boot() may replace with real /flow/:date records
 let DATA_SOURCE = "sample data";
@@ -309,8 +309,17 @@ function passesFilter(r){
 }
 const scopedFiltered=()=>scoped().filter(passesFilter);
 const newest=arr=>arr.length?arr.reduce((a,b)=>T(b.ts)>=T(a.ts)?b:a):null;
-const machines=()=>[...new Set(DATA.map(r=>r.machine_id).filter(Boolean))];
-const sessionsOn=m=>[...new Set(DATA.filter(r=>r.machine_id===m&&r.session_id).map(r=>r.session_id))];
+// (#640) Identity is the STABLE HARDWARE UID, not the operator-set name.
+// Records without a uid have UNKNOWN identity — they all bucket under ONE
+// "unknown" machine (we never trust the name as identity). `nameOf` is the
+// mutable DISPLAY label (the record's machine_id); `specOf` surfaces the
+// claimed-but-unverified names on the unknown card. Machines group + filter
+// by uid; cards render the name.
+const uidOf=r=>r.machine_uid||"unknown";
+const nameOf=m=>{ if(m==="unknown")return"unknown"; const r=DATA.find(x=>uidOf(x)===m&&x.machine_id); return r?r.machine_id:m; };
+const specOf=m=>{ if(m==="unknown"){ const ns=[...new Set(DATA.filter(r=>uidOf(r)==="unknown"&&r.machine_id).map(r=>r.machine_id))]; return ns.length?"unverified · claimed: "+ns.join(", "):"unidentified (no hardware uid)"; } return MACH_SPEC[nameOf(m)]||''; };
+const machines=()=>[...new Set(DATA.map(uidOf))];
+const sessionsOn=m=>[...new Set(DATA.filter(r=>uidOf(r)===m&&r.session_id).map(r=>r.session_id))];
 const dispatch=(sid,act)=>DATA.find(r=>r.session_id===sid&&r.action==="dispatch."+act);
 
 function renderMeta(){
@@ -319,8 +328,8 @@ function renderMeta(){
 }
 function machActive(m){
   const v=visible();
-  const starts=v.filter(r=>r.machine_id===m&&r.action==="dispatch.start").map(r=>r.session_id);
-  const dones=v.filter(r=>r.machine_id===m&&r.action==="dispatch.complete").map(r=>r.session_id);
+  const starts=v.filter(r=>uidOf(r)===m&&r.action==="dispatch.start").map(r=>r.session_id);
+  const dones=v.filter(r=>uidOf(r)===m&&r.action==="dispatch.complete").map(r=>r.session_id);
   return starts.some(s=>!dones.includes(s));
 }
 function renderFleet(){
@@ -328,8 +337,8 @@ function renderFleet(){
   const ms=machines();
   const cards=ms.map(m=>{
     const act=machActive(m), runs=sessionsOn(m).length;
-    return `<div class="mach ${act?'active':''}" onclick="drillMachine('${m}')"><div class="name"><span class="mico">${ICON[MACH_ICON[m]]||""}</span>${m}</div>
-      <div class="spec">${MACH_SPEC[m]||''}</div><div class="stat"><span class="dot"></span>${act?'dispatch in flight':'idle'} · ${runs} specialist${runs===1?'':'s'} + utility</div>
+    return `<div class="mach ${act?'active':''}" onclick="drillMachine('${m}')"><div class="name"><span class="mico">${ICON[MACH_ICON[nameOf(m)]]||""}</span>${nameOf(m)}</div>
+      <div class="spec">${specOf(m)}</div><div class="stat"><span class="dot"></span>${act?'dispatch in flight':'idle'} · ${runs} specialist${runs===1?'':'s'} + utility</div>
       <div class="hint">click to drill in →</div></div>`;}).join("");
   // Activity timeline — one lane per machine; each dispatch session is a bar
   // positioned across the recorded window, revealed up to the playhead (an
@@ -344,7 +353,7 @@ function renderFleet(){
       const role=(s.handle||"").replace(/^darkmux\//,"");
       return `<div class="sbar ${done?'':'a'}" style="left:${L}%;width:${W}%" title="${role} · ${sid}${done?'':' · in flight'}"></div>`;
     }).join("");
-    return `<div class="lane"><div class="lname" title="${m}">${m}</div><div class="tltrack">${bars}<div class="ph" style="left:${pct(state.t)}%"></div></div></div>`;
+    return `<div class="lane"><div class="lname" title="${nameOf(m)}">${nameOf(m)}</div><div class="tltrack">${bars}<div class="ph" style="left:${pct(state.t)}%"></div></div></div>`;
   }).join("");
   const ax=`<div class="tlaxis"><span>${iso(tMin).slice(11,16)}</span><span>${iso(tMin+span/2).slice(11,16)}</span><span>${iso(tMax).slice(11,16)}Z</span></div>`;
   const tl = ms.length
@@ -353,7 +362,7 @@ function renderFleet(){
   $("stage").innerHTML=`<div class="fleet">${cards}</div>`+tl;
 }
 function renderMachine(){
-  const m=state.machine; $("logscope").textContent=m; state.stageScope=r=>r.machine_id===m;
+  const m=state.machine; $("logscope").textContent=nameOf(m); state.stageScope=r=>uidOf(r)===m;
   // Always-loaded utility role — resident on every machine, runs alongside the specialists
   // to handle compaction + other utility-tier tasks (not a per-mission dispatch).
   const util=`<div class="node util"><div class="h">darkmux/utility</div>
@@ -367,8 +376,8 @@ function renderMachine(){
       <div class="s">specialist role · ${s.model||'?'}</div>
       <div class="s">session ${sid} · mission ${s.mission_id}</div>
       <span class="pill ${done?'done':'run'}">${done?'complete':'running'}</span></div>`;}).join("");
-  $("stage").innerHTML=`<div><div class="stagehdr"><a onclick="goFleet()">fleet</a> › machine · ${m} — ${MACH_SPEC[m]||''}</div>
-    <div class="rglbl">crew on ${m}</div>${util}${specs||'<span class="hint">no specialist runs yet at this point in the timeline</span>'}</div>`;
+  $("stage").innerHTML=`<div><div class="stagehdr"><a onclick="goFleet()">fleet</a> › machine · ${nameOf(m)}${specOf(m)?' — '+specOf(m):''}</div>
+    <div class="rglbl">crew on ${nameOf(m)}</div>${util}${specs||'<span class="hint">no specialist runs yet at this point in the timeline</span>'}</div>`;
 }
 function renderSubsystem(){
   const sid=state.session, m=state.machine; $("logscope").textContent=sid; state.stageScope=r=>r.session_id===sid;
@@ -410,7 +419,7 @@ function renderSubsystem(){
   const detections=finds.length
     ? `<div class="track"><div class="lbl">detections (${finds.length})</div>`+finds.map(f=>`<div class="finding ${f.s}"><span class="fk">⚠ ${f.k}</span><span class="fm">${f.d}</span>${f.f?`<span class="ff">fix: ${f.f}</span>`:""}</div>`).join("")+`</div>`
     : `<div class="track"><div class="lbl">detections</div><div class="finding ok"><span class="fk">✓ clean</span><span class="fm">no behavioral flags (cycle, tool-failure, reasoning-loop, edit-drift)</span></div></div>`;
-  $("stage").innerHTML=`<div class="sub"><h2>subsystem · ${d.handle} <span style="color:var(--muted);text-transform:none;font-weight:400">(${sid} on <a onclick="drillMachine('${m}')">${m}</a>)</span></h2>
+  $("stage").innerHTML=`<div class="sub"><h2>subsystem · ${d.handle} <span style="color:var(--muted);text-transform:none;font-weight:400">(${sid} on <a onclick="drillMachine('${m}')">${nameOf(m)}</a>)</span></h2>
     ${met}
     <div class="track"><div class="lbl">model (lms)</div>${segs||'<span class="hint">no telemetry yet</span>'}</div>
     ${cpu}
@@ -555,12 +564,12 @@ function flowToRenderModel(records){
   for(const r of records){
     if(r.action==="dispatch.turn"&&r.session_id){
       const seq=(r.payload&&r.payload.turn_seq)||0;
-      const e=perS[r.session_id]||(perS[r.session_id]={turns:0,ts:r.ts,machine_id:r.machine_id});
-      e.turns=Math.max(e.turns,seq); e.ts=r.ts; if(r.machine_id)e.machine_id=r.machine_id;
+      const e=perS[r.session_id]||(perS[r.session_id]={turns:0,ts:r.ts,machine_id:r.machine_id,machine_uid:r.machine_uid});
+      e.turns=Math.max(e.turns,seq); e.ts=r.ts; if(r.machine_id)e.machine_id=r.machine_id; if(r.machine_uid)e.machine_uid=r.machine_uid;
     }
   }
   for(const s in perS){
-    out.push({ts:perS[s].ts,category:"telemetry",source:"runtime",machine_id:perS[s].machine_id,session_id:s,fields:{turns:perS[s].turns}});
+    out.push({ts:perS[s].ts,category:"telemetry",source:"runtime",machine_id:perS[s].machine_id,machine_uid:perS[s].machine_uid,session_id:s,fields:{turns:perS[s].turns}});
   }
   return out;
 }
