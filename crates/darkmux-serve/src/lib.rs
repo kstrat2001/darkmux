@@ -475,6 +475,15 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf) -> Result<()> {
         // force-exit in the SHUTDOWN_GRACE_SECS path kills it cleanly.
         let _worker_handle = darkmux_fleet::spawn_worker_thread();
 
+        // (#638) Spawn the fleet-presence heartbeat emitter. Same dedicated-
+        // std::thread shape + DARKMUX_REDIS_URL self-disable as the worker
+        // above (plus a stable-machine-uid gate, #640): while this daemon
+        // runs, it refreshes a short-TTL `darkmux:presence:<uid>` key so the
+        // live-only fleet view, the live-version skew check, and the roster
+        // can key on "who's actually here now" instead of "who ever wrote a
+        // record".
+        let _presence_handle = darkmux_flow::presence::spawn_emitter_thread();
+
         // Shutdown plumbing: multiplex one signal to two consumers
         // (axum's graceful shutdown future and the force-exit timer).
         // `watch::channel` is the right shape — both consumers wait_for

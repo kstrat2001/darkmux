@@ -443,6 +443,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "clap",
+ "darkmux-hardware",
  "dirs",
  "libc",
  "redis",
