@@ -1623,7 +1623,7 @@ mod tests {
     }
 
     #[test]
-    fn flow_schema_version_is_1_9_0() {
+    fn flow_schema_version_is_1_10_0() {
         // Pin the schema version so an accidental rename can't ship silently;
         // any bump beyond this should be a deliberate code change paired with
         // an update to this assertion (and corresponding viewer EXPECTED_*
@@ -1660,7 +1660,21 @@ mod tests {
         //           capability-based model selection — #321/#322). Minor bump:
         //           old readers tolerate the now-unknown key. Pre-1.9.0
         //           AuditFileSink chains need rotation (canonical-form change).
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.9.0");
+        //   1.10.0 — added `Category::Telemetry` (#557): telemetry folds into the
+        //           one flow stream as a first-class family, retiring
+        //           instruments.jsonl. Minor + additive — new records only, so
+        //           prior AuditFileSink chains survive without rotation.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.10.0");
+    }
+
+    #[test]
+    fn telemetry_category_serializes_to_lowercase_word() {
+        // The served viewer keys on `category: "telemetry"` (docs/demo/index.html
+        // flowToRenderModel). The `#[serde(rename_all = "lowercase")]` on Category
+        // must produce exactly that string — pin it so a variant rename can't
+        // silently desync the wire from the viewer.
+        let v = serde_json::to_value(crate::schema::Category::Telemetry).unwrap();
+        assert_eq!(v, serde_json::json!("telemetry"));
     }
 
     #[test]

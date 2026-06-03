@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.9.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.10.0";
 // Version history:
 //   1.2.0 — added optional `model` (#106)
 //   1.3.0 — added optional `reasoning` + `mission_id`; new Stage::TierDecision (#136)
@@ -51,6 +51,13 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.9.0";
 //           field was already removed in 1.9.0; the resolver lingered with no
 //           consumers after the fleet single-stream collapse retired tier
 //           routing (#590). No on-the-wire shape change. (#590)
+//   1.10.0 — added the `Category::Telemetry` variant (#557 slice 1; the
+//           observability-unification keystone). Telemetry folds into the one
+//           flow stream as a first-class event family (sources: lms / process /
+//           detector / runtime / context / compaction), retiring the separate
+//           instruments.jsonl sidecar. Minor + additive: older readers ignore
+//           the unknown category; new records only, so prior AuditFileSink
+//           chains survive without rotation (unlike the 1.9.0 field removal).
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -69,6 +76,11 @@ pub enum Category {
     Machinery,
     Audit,
     Review,
+    /// Telemetry as a first-class flow-event family (#557): per-dispatch
+    /// instrument samples — context-fill, detector firings, compaction, lms
+    /// load/unload, container CPU — emitted into the one stream, always-on.
+    /// Replaces the retired instruments.jsonl sidecar.
+    Telemetry,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
