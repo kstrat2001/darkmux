@@ -1,0 +1,74 @@
+#!/bin/zsh
+# darkmux-serve-wrapped — keychain-aware wrapper for `darkmux serve`
+#
+# Installed by the Homebrew formula at #{libexec}/darkmux-serve-wrapped and
+# invoked by the brew-generated launchd plist for `brew services start
+# darkmux`. Solves the constraint that brew's `service do … end` block bakes
+# env vars at plist-generation time but DARKMUX_REDIS_URL needs to be
+# resolved live (from macOS Keychain) at process-start.
+#
+# Behavior:
+#   1. If the Keychain item `darkmux-redis` exists for $USER, read the
+#      password and construct DARKMUX_REDIS_URL pointing at localhost. The
+#      hub posture binds Redis on 0.0.0.0 with requirepass + protected-mode;
+#      the wrapper points the daemon at 127.0.0.1 for the local connection
+#      (peers point at the hub's tailnet address in THEIR rc files, not
+#      through this wrapper).
+#   2. If the Keychain item does NOT exist, skip the URL — the daemon falls
+#      back to LocalFile-only sink composition (single-machine mode).
+#   3. exec darkmux serve with localhost bind (CORS posture stays
+#      localhost-only by default; cross-network viewer access is an opt-in
+#      env var per the always-on hub guide).
+#
+# Operator env vars passed through from the launchd plist environment:
+#   DARKMUX_MACHINE_ID     — operator-named fleet identity
+#   DARKMUX_ORCHESTRATOR   — frontier AI driving sessions
+#   DARKMUX_AUDIT_DIR      — opt-in audit substrate; see /darkmux-enable-audit
+#   DARKMUX_FLOWS_DIR      — override default ~/.darkmux/flows
+#   DARKMUX_REDIS_STREAM   — override default darkmux:flow
+#   DARKMUX_REDIS_MAXLEN   — override default 10000
+#   DARKMUX_DAEMON_CORS_ORIGINS — opt-in cross-tailnet viewer access
+#
+# Operator overrides for the bind:
+#   DARKMUX_SERVE_BIND  — default 127.0.0.1, set to 0.0.0.0 for the
+#                         substrate+viewer posture
+#   DARKMUX_SERVE_PORT  — default 8765
+#
+# Password constraints:
+#   The Redis password stored in the `darkmux-redis` Keychain item MUST be
+#   URL-safe: alphanumeric + `.~_-` only. No `@`, `:`, `/`, `#`, `?`, `&`,
+#   or other URL-reserved characters. The recommended generator that always
+#   produces a safe password:
+#     openssl rand -base64 36 | tr -d '/+=' | head -c 48
+#   This wrapper does NOT percent-encode; non-URL-safe passwords will break
+#   the Redis URL parser and the daemon will fail to connect.
+
+set -e
+
+# Locate the darkmux binary. brew-installed path first, fallback to PATH.
+if [[ -x /opt/homebrew/bin/darkmux ]]; then
+  DARKMUX_BIN=/opt/homebrew/bin/darkmux
+elif [[ -x /usr/local/bin/darkmux ]]; then
+  DARKMUX_BIN=/usr/local/bin/darkmux
+elif command -v darkmux > /dev/null 2>&1; then
+  DARKMUX_BIN=$(command -v darkmux)
+else
+  echo "darkmux-serve-wrapped: darkmux binary not found on PATH" >&2
+  exit 127
+fi
+
+# Read Redis password from Keychain if the item exists. Suppress stderr to
+# avoid noise when running in single-machine mode (no Keychain item set up).
+DARKMUX_REDIS_PASS=$(security find-generic-password -a "$USER" -s darkmux-redis -w 2>/dev/null || true)
+
+if [[ -n "$DARKMUX_REDIS_PASS" ]]; then
+  export DARKMUX_REDIS_URL="redis://:${DARKMUX_REDIS_PASS}@127.0.0.1:6379"
+  unset DARKMUX_REDIS_PASS
+fi
+
+# Bind defaults — localhost-only matches CORS-localhost-only default
+BIND="${DARKMUX_SERVE_BIND:-127.0.0.1}"
+PORT="${DARKMUX_SERVE_PORT:-8765}"
+
+# Hand off to darkmux serve.
+exec "$DARKMUX_BIN" serve --bind "$BIND" --port "$PORT"
