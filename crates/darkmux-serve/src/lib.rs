@@ -44,7 +44,13 @@ fn is_valid_date(date: &str) -> Option<&str> {
 /// route (`GET /`) and the playback route (`GET /play/:date`); each handler
 /// injects a `<meta name="darkmux-mode">` tag the viewer's boot() reads to
 /// decide whether to start the SSE tail (live) or skip it (playback).
-const VIEWER_HTML: &str = include_str!("../../../docs/viewer/index.html");
+///
+/// Lives at `crates/darkmux-serve/assets/viewer.html` (not under `docs/`)
+/// specifically so GitHub Pages doesn't also serve it at `darkmux.com/viewer/`.
+/// `darkmux.com` is reserved for the demo (`/demo`) + marketing surface; the
+/// live and playback viewers only exist where there's a daemon to talk to
+/// (operator's localhost or tailnet). See #624.
+const VIEWER_HTML: &str = include_str!("../assets/viewer.html");
 
 /// Inject a `<meta name="darkmux-mode">` tag right after `<head>` so the
 /// viewer's `boot()` can read it before any data-fetching logic runs.
