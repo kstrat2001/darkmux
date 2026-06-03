@@ -44,7 +44,6 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -190,10 +189,6 @@ impl IdentityAliases {
         serde_json::json!({ "aliases": entries })
     }
 }
-
-/// Shared handle the HTTP handlers carry around in `AppState`. `Arc` is
-/// cheap to clone and the table is read-only after load.
-pub type SharedAliases = Arc<IdentityAliases>;
 
 #[derive(Deserialize)]
 struct AliasesFile {

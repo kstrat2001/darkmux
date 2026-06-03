@@ -142,8 +142,9 @@ async fn play_html(Path(date): Path<String>) -> impl IntoResponse {
 }
 
 /// Build the HTTP router with a configurable flows directory and empty
-/// alias table. Tests use this. Production callers go through
+/// alias table. Test-only convenience — production callers go through
 /// `build_router_with_aliases` to load `~/.darkmux/identity-aliases.json`.
+#[cfg(test)]
 pub(crate) fn build_router(flows_dir: PathBuf) -> Router {
     build_router_with_aliases(flows_dir, IdentityAliases::empty())
 }
