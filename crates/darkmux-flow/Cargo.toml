@@ -27,6 +27,8 @@ blake3 = "1.5"
 libc = "0.2"
 # #162 Phase 3 — Redis client for the live-coordination flow sink.
 redis = { version = "0.27", default-features = false, features = ["streams"] }
+# #640 — stable machine identity (IOPlatformUUID) for presence beats.
+darkmux-hardware = { path = "../darkmux-hardware" }
 
 [dev-dependencies]
 tempfile = "3.10"

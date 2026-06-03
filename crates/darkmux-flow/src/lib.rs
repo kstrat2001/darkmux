@@ -7,6 +7,7 @@
 //! atomically prepends a schema header so partial-file recovery is possible.
 
 pub mod daemon_probe;
+pub mod presence;
 
 mod integrity;
 mod schema;
@@ -369,7 +370,7 @@ pub fn isolate_test_env_once() {
 /// the same `Duration` for the TCP connect; doubling gives the
 /// handshake the same budget so a healthy peer with a 400ms RTT
 /// completes inside the bound.
-fn open_redis_connection_bounded(
+pub(crate) fn open_redis_connection_bounded(
     client: &redis::Client,
     timeout: std::time::Duration,
 ) -> Result<redis::Connection> {
