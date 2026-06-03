@@ -414,15 +414,40 @@ impl Trajectory {
         }));
     }
 
+    /// dispatch.context — per-turn context-window occupancy. `used` is the EXACT
+    /// prompt-token count from the LMStudio API response (usage.prompt_tokens);
+    /// `max` is the configured context window (n_ctx), None when unconfigured.
+    /// The #557 Slice-3 sawtooth: occupancy climbs each turn, drops at compaction.
+    pub fn append_context_window(&mut self, seq: u32, used: u32, max: Option<u32>) {
+        self.write_event(&serde_json::json!({
+            "type": "dispatch.context",
+            "seq": seq,
+            "ts": unix_ms(),
+            "used": used,
+            "max": max,   // serde_json renders None as null; the viewer treats null max as "unknown window"
+        }));
+    }
+
     /// compaction — fires when middle-replace compaction runs. Records
     /// the size delta so the operator can verify compaction is actually
     /// shrinking the conversation.
+    ///
+    /// `tokens_before` / `tokens_after` (#557 Slice-3) carry the token
+    /// occupancy across the compaction drop so the sawtooth's fall is
+    /// quantified in tokens (not just message counts). `tokens_before`
+    /// is the EXACT prompt-token count that triggered the compaction
+    /// (`usage.prompt_tokens` from the prior turn); `tokens_after` is a
+    /// chars/4 ESTIMATE of the compacted buffer (the runtime has no
+    /// tokenizer) — the EXACT post-compaction count lands on the next
+    /// turn's `dispatch.context` `used`.
     pub fn append_compaction(
         &mut self,
         generation: u32,
         before_message_count: usize,
         after_message_count: usize,
         summary_chars: usize,
+        tokens_before: u32,
+        tokens_after: u32,
     ) {
         self.write_event(&serde_json::json!({
             "type": "compaction",
@@ -431,6 +456,8 @@ impl Trajectory {
             "before_messages": before_message_count,
             "after_messages": after_message_count,
             "summary_chars": summary_chars,
+            "tokens_before": tokens_before,
+            "tokens_after": tokens_after,
         }));
     }
 
@@ -631,6 +658,48 @@ mod tests {
         assert_eq!(lines[0]["type"], "tool.completed");
         assert_eq!(lines[0]["ok"], serde_json::json!(true));
         assert_eq!(lines[1]["ok"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn append_context_window_writes_used_and_max() {
+        // (#557 Slice-3) The per-turn sawtooth event carries the EXACT
+        // prompt-token count (`used`) + the configured n_ctx (`max`).
+        let ws = TempDir::new("traj-test-ctx").unwrap();
+        let mut t = Trajectory::open(ws.path());
+        t.append_context_window(3, 42000, Some(101000));
+        drop(t);
+
+        let body = fs::read_to_string(
+            ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE),
+        )
+        .unwrap();
+        let line: serde_json::Value =
+            serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        assert_eq!(line["type"], "dispatch.context");
+        assert_eq!(line["seq"], 3);
+        assert_eq!(line["used"], 42000);
+        assert_eq!(line["max"], 101000);
+        assert!(line["ts"].is_number());
+    }
+
+    #[test]
+    fn append_context_window_renders_none_max_as_json_null() {
+        // (#557 Slice-3) An unconfigured context window (None) must
+        // render as JSON null — the viewer treats null max as "unknown
+        // window", distinct from a real numeric cap.
+        let ws = TempDir::new("traj-test-ctx-null").unwrap();
+        let mut t = Trajectory::open(ws.path());
+        t.append_context_window(1, 5000, None);
+        drop(t);
+
+        let body = fs::read_to_string(
+            ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE),
+        )
+        .unwrap();
+        let line: serde_json::Value =
+            serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        assert_eq!(line["used"], 5000);
+        assert!(line["max"].is_null(), "None max must serialize as JSON null");
     }
 
     #[test]
