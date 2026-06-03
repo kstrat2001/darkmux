@@ -3,12 +3,617 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>darkmux · observability · demo</title>
-<meta http-equiv="refresh" content="0; url=../demo/">
-<link rel="canonical" href="../demo/">
+<title>darkmux · observability viewer</title>
+<!--
+  This is the LIVE observability viewer. It's served by `darkmux serve` at
+  `GET /` and at `darkmux.com/viewer`. It fetches real flow records from the
+  daemon's `/flow/<date>` endpoint and tails new ones via SSE.
+
+  The demo / showcase version (with bundled sample data and the recorded
+  playback scenario) lives at `docs/demo/index.html` and serves
+  `darkmux.com/demo`. The two files started as near-copies; live-only
+  improvements go here, demo-narrative improvements go in `demo/`.
+
+  Reference: GitHub issue #624 (split demo + live to stop conflation).
+-->
+
+<style>
+  :root{
+    --bg:#0a0a0b; --bg2:#131316; --panel:#1c1c22; --line:#1f1f24;
+    --text:#e8e6e3; --muted:#8a8a92; --amber:#6df1ff; --amber-dim:#2a8a96;
+    --good:#5af0a3; --warn:#ffb86b; --bad:#ff6b85;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100vh;background:var(--bg);color:var(--text);font:14px/1.4 'Inter',-apple-system,system-ui,sans-serif;overflow:hidden}
+  .top{height:46px;display:flex;align-items:center;gap:14px;padding:0 16px;border-bottom:1px solid var(--line);background:var(--bg2)}
+  .brand{font-weight:700;letter-spacing:.04em}.brand b{color:var(--amber)}.brand a{color:inherit;text-decoration:none}.brand a:hover b{text-decoration:underline}
+  .topnav{margin-left:auto;display:flex;gap:18px;align-items:center}
+  .topnav a{color:var(--muted);text-decoration:none;font:600 12px 'JetBrains Mono',monospace;letter-spacing:.04em}
+  .topnav a:hover{color:var(--amber)}
+  .badge{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.12em;text-transform:uppercase;color:#0a0a0b;background:var(--amber);padding:5px 9px;border-radius:3px}
+  .pb{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.12em;text-transform:uppercase;color:var(--amber);border:1px solid var(--amber-dim);padding:4px 9px;border-radius:3px}
+  @keyframes lpulse{0%,100%{opacity:1}50%{opacity:.5}}
+  .pb.live{color:#4ade80;border-color:#4ade80;animation:lpulse 1.6s ease-in-out infinite}
+  .crumbbar{height:40px;display:flex;align-items:center;gap:12px;padding:0 16px;border-bottom:1px solid var(--line);background:#131316}
+  .backbtn{background:var(--bg);border:1px solid var(--line);color:var(--text);padding:5px 11px;border-radius:4px;cursor:pointer;font:600 12px 'JetBrains Mono',monospace}
+  .backbtn[disabled]{opacity:.35;cursor:default}
+  .crumb{font:600 13px 'JetBrains Mono',monospace;color:var(--muted)}
+  .crumb a{color:var(--amber);cursor:pointer;text-decoration:none}.crumb a:hover{text-decoration:underline}
+  .crumb .sep{color:var(--amber-dim);margin:0 6px}
+  .meta{margin-left:auto;font:11px/1.4 'JetBrains Mono',monospace;color:var(--muted);text-align:right}.meta b{color:var(--text)}
+  .wrap{display:flex;height:calc(100vh - 46px - 40px - 64px)}
+  .stage{flex:1;position:relative;overflow:auto;padding:24px}
+  .log{width:380px;border-left:1px solid var(--line);background:var(--bg2);display:flex;flex-direction:column}
+  .detail{display:flex;flex-direction:column;padding:12px 14px 0;background:#131316}
+  #detailbody{flex:1;overflow:auto;min-height:0;padding-bottom:12px}
+  .split{height:7px;flex:none;background:var(--line);cursor:row-resize}
+  .split:hover{background:var(--amber-dim)}
+  .dh{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+  .dt{font:600 11px 'JetBrains Mono',monospace;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
+  .follow{font:600 10px 'JetBrains Mono',monospace;letter-spacing:.06em;padding:4px 9px;border-radius:11px;cursor:pointer;border:1px solid var(--line);color:var(--muted);background:none}
+  .follow.on{background:var(--amber);color:#0a0a0b;border-color:var(--amber)}
+  .detail pre{margin:0;padding:10px 12px;background:var(--bg);border:1px solid var(--line);border-radius:5px;color:var(--text);white-space:pre-wrap;font:11px/1.55 'JetBrains Mono',monospace}
+  .detail pre .k{color:var(--muted)}
+  .detail .none{color:var(--muted);font:11px 'JetBrains Mono',monospace;padding:10px 0}
+  .loglist{flex:1;overflow:auto;padding:10px 14px}
+  .loglist h3{margin:0 0 8px;font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);display:flex;justify-content:space-between;align-items:center}
+  .fbtn{background:none;border:1px solid var(--line);color:var(--muted);font:600 10px 'JetBrains Mono',monospace;letter-spacing:.06em;padding:4px 9px;border-radius:11px;cursor:pointer;text-transform:none}
+  .fbtn:hover{border-color:var(--amber-dim);color:var(--amber)}
+  .fbtn.on{border-color:var(--amber);color:var(--amber)}
+  .rec{font:11px/1.5 'JetBrains Mono',monospace;color:var(--muted);padding:5px 6px;border-bottom:1px solid var(--line);cursor:pointer;border-left:2px solid transparent}
+  .rec:hover{background:#1c1c22}
+  .rec.sel{background:#23232b;border-left:2px solid var(--amber);color:var(--text)}
+  .rec .t{color:var(--amber)}.rec .tag{color:var(--text)}.rec.telemetry .tag{color:var(--warn)}
+  .empty{color:var(--muted);font:11px 'JetBrains Mono',monospace;padding:10px 2px}
+  .scrub{height:64px;border-top:1px solid var(--line);background:var(--bg2);display:flex;align-items:center;gap:14px;padding:0 18px}
+  .scrub button{background:var(--bg);border:1px solid var(--amber-dim);color:var(--text);padding:7px 14px;border-radius:4px;cursor:pointer;font:600 12px 'JetBrains Mono',monospace}
+  .scrub button.primary{background:var(--amber);color:#0a0a0b;border-color:var(--amber)}
+  input[type=range]{flex:1;accent-color:var(--amber)}
+  .clock{font:12px 'JetBrains Mono',monospace;color:var(--muted);min-width:160px;text-align:right}
+  .fleet{display:flex;gap:36px;flex-wrap:wrap;align-items:flex-start}
+  .fleettl{margin-top:30px;border-top:1px solid var(--line);padding-top:18px}
+  .tlhdr{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin-bottom:14px}
+  .lane{display:flex;align-items:center;gap:12px;margin-bottom:7px}
+  .lname{width:150px;flex:none;font:12px 'JetBrains Mono',monospace;color:var(--text);text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .tltrack{position:relative;flex:1;height:28px;background:var(--panel);border:1px solid var(--line);border-radius:4px;overflow:hidden}
+  .sbar{position:absolute;top:5px;height:18px;background:var(--amber-dim);border-radius:3px;min-width:2px}
+  .sbar.a{background:var(--amber);box-shadow:0 0 6px var(--amber)}
+  .tltrack .ph{position:absolute;top:0;bottom:0;width:2px;background:var(--text);opacity:.32}
+  .tlaxis{margin-left:162px;display:flex;justify-content:space-between;font:9px 'JetBrains Mono',monospace;color:var(--muted);margin-top:7px}
+  .tlempty{font:11px 'JetBrains Mono',monospace;color:var(--muted)}
+  .mach{width:230px;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px;cursor:pointer;transition:border-color .15s}
+  .mach:hover{border-color:var(--amber-dim)}.mach.active{border-color:var(--amber);box-shadow:0 0 0 1px var(--amber-dim)}
+  .mach .name{font:600 15px 'JetBrains Mono',monospace;color:var(--text);display:flex;align-items:center;gap:8px}
+  .mico{display:inline-flex;color:var(--amber-dim)}.mico svg{width:19px;height:19px;display:block}
+  .mach.active .mico{color:var(--amber)}
+  .mach .spec{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin-top:3px}
+  .mach .stat{margin-top:12px;font:12px 'JetBrains Mono',monospace}
+  .mach .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--amber-dim);margin-right:7px;vertical-align:middle}
+  .mach.active .dot{background:var(--amber);box-shadow:0 0 8px var(--amber)}
+  .hint{color:var(--muted);font:11px 'JetBrains Mono',monospace;margin-top:10px}
+  .stagehdr{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin-bottom:14px}
+  .stagehdr a{color:var(--amber);cursor:pointer;text-decoration:none}.stagehdr a:hover{text-decoration:underline}
+  .node{display:inline-block;width:260px;vertical-align:top;margin:0 24px 24px 0;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px;cursor:pointer}
+  .node:hover{border-color:var(--amber-dim)}.node .h{font:600 13px 'JetBrains Mono',monospace}
+  .node .s{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin-top:4px}
+  .pill{display:inline-block;font:600 10px 'JetBrains Mono',monospace;padding:2px 7px;border-radius:10px;margin-top:8px}
+  .pill.run{background:#16261d;color:var(--good)}.pill.done{background:#1c1c22;color:var(--muted)}.pill.util{background:var(--bg2);color:var(--amber-dim);border:1px solid var(--line)}
+  .node.util{cursor:default;border-left:3px solid var(--amber-dim)}.node.util:hover{border-color:var(--line)}
+  .rglbl{font:11px 'JetBrains Mono',monospace;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:12px}
+  .sub h2{font:600 13px 'JetBrains Mono',monospace;letter-spacing:.1em;text-transform:uppercase;color:var(--amber);margin:0 0 4px}
+  .sub h2 a{color:var(--amber);text-decoration:underline;cursor:pointer}
+  .track{margin:18px 0}.track .lbl{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin-bottom:6px}
+  .seg{display:inline-flex;align-items:center;height:30px;padding:0 12px;margin-right:2px;font:11px 'JetBrains Mono',monospace;border-radius:3px;color:#0a0a0b;background:var(--amber)}
+  .seg.b{background:var(--warn)}
+  .metrics{display:flex;gap:12px;margin:14px 0 4px;flex-wrap:wrap}
+  .met{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:9px 14px;min-width:118px}
+  .met .mv{font:600 17px 'JetBrains Mono',monospace;color:var(--text)}
+  .met .ml{font:10px 'JetBrains Mono',monospace;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-top:3px}
+  .tokbar{height:4px;background:var(--line);border-radius:2px;margin-top:7px;overflow:hidden}.tokbar span{display:block;height:100%;background:var(--amber)}
+  .cpuchart{display:flex;gap:8px;align-items:flex-end}
+  .yax{display:flex;flex-direction:column;justify-content:space-between;height:80px;font:9px 'JetBrains Mono',monospace;color:var(--muted);text-align:right}
+  .bars{display:flex;align-items:flex-end;gap:6px;height:80px;border-bottom:1px solid var(--line)}.bar{width:24px;background:var(--amber-dim);border-radius:2px 2px 0 0}
+  .xvals{display:flex;gap:6px;margin-top:4px}.xvals span{width:24px;text-align:center;font:9px 'JetBrains Mono',monospace;color:var(--muted)}
+  .ctxchart{width:440px;height:74px;display:block;border-bottom:1px solid var(--line)}
+  .finding{border:1px solid var(--line);border-left:3px solid var(--line);border-radius:5px;padding:9px 12px;margin-bottom:7px;background:var(--panel)}
+  .finding.warn{border-left-color:var(--warn)}.finding.ok{border-left-color:var(--good)}
+  .finding .fk{display:block;font:600 12px 'JetBrains Mono',monospace;color:var(--warn)}.finding.ok .fk{color:var(--good)}
+  .finding .fm{display:block;font-size:12px;color:var(--text);margin-top:3px}
+  .finding .ff{display:block;font-size:11px;color:var(--muted);margin-top:5px}
+  .misslink{cursor:pointer;color:var(--amber);text-decoration:none}.misslink:hover{text-decoration:underline}
+  .mgoal{font-size:13px;color:var(--text);margin:8px 0 16px;max-width:680px;line-height:1.5}
+  .burn{margin-bottom:18px}.burnbar{height:6px;background:var(--line);border-radius:3px;overflow:hidden;max-width:420px}.burnbar span{display:block;height:100%;background:var(--good)}
+  .burnlbl{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin-top:6px}
+  .sprow{display:flex;align-items:center;gap:14px;padding:10px 12px;border:1px solid var(--line);border-radius:5px;margin-bottom:7px;background:var(--panel)}
+  .sps{font:600 10px 'JetBrains Mono',monospace;text-transform:uppercase;padding:3px 8px;border-radius:10px;min-width:74px;text-align:center}
+  .sps.complete{background:#1c1c22;color:var(--muted)}.sps.active{background:#16261d;color:var(--good)}.sps.backlog{background:var(--bg2);color:var(--amber-dim);border:1px solid var(--line)}
+  .spt{flex:1;font:12px 'JetBrains Mono',monospace;color:var(--text)}
+  .spe{font:11px 'JetBrains Mono',monospace;color:var(--muted)}
+  .spa{font:11px 'JetBrains Mono',monospace;color:var(--amber-dim);min-width:190px;text-align:right}
+  .mscope{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin:-8px 0 16px}
+  .eureka{margin-top:16px;border:1px solid var(--warn);background:#1c1c22;border-radius:6px;padding:12px 14px}
+  .eureka .k{color:var(--warn);font:600 12px 'JetBrains Mono',monospace}.eureka .m{color:var(--text);font-size:12px;margin-top:4px}.eureka .f{color:var(--muted);font-size:11px;margin-top:6px}
+  /* filter modal */
+  .modalbg{position:fixed;inset:0;background:rgba(0,0,0,0.65);z-index:100;display:none;align-items:center;justify-content:center}
+  .modal{width:380px;background:var(--bg2);border:1px solid var(--amber-dim);border-radius:8px;padding:18px 20px}
+  .mhd{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;font:600 13px 'JetBrains Mono',monospace;letter-spacing:.08em;text-transform:uppercase;color:var(--amber)}
+  .mx{background:none;border:none;color:var(--muted);font-size:16px;cursor:pointer}
+  .fgroup{margin-bottom:14px}
+  .fgroup h4{margin:0 0 8px;font:600 10px 'JetBrains Mono',monospace;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
+  .fgroup label{display:inline-flex;align-items:center;gap:6px;margin:0 14px 7px 0;font:12px 'JetBrains Mono',monospace;color:var(--text);cursor:pointer}
+  .fgroup input{accent-color:var(--amber);cursor:pointer}
+  .mft{display:flex;gap:10px;margin-top:8px}
+  .mft input{flex:1;background:var(--bg);border:1px solid var(--line);color:var(--text);border-radius:4px;padding:8px 10px;font:12px 'JetBrains Mono',monospace}
+  .clr{background:var(--bg);border:1px solid var(--amber-dim);color:var(--text);border-radius:4px;padding:8px 12px;cursor:pointer;font:600 12px 'JetBrains Mono',monospace}
+</style>
 </head>
 <body>
-<p>The flow, topology, and lab views are now one drillable observability viewer. Redirecting to the <a href="../demo/">demo</a>…</p>
-<script>location.replace('../demo/');</script>
+<div class="top">
+  <span class="brand"><a href="../"><b>darkmux</b></a> · observability</span>
+  <span class="badge" id="srcbadge">Loading…</span>
+  <span class="pb" id="modebadge">▣ playback</span>
+  <nav class="topnav">
+    <a href="../">home</a>
+    <a href="../guide/">guide</a>
+    <a href="https://darklyenergized.substack.com" target="_blank" rel="noopener">articles</a>
+    <a href="https://github.com/kstrat2001/darkmux" target="_blank" rel="noopener">github</a>
+  </nav>
+</div>
+<div class="crumbbar">
+  <button class="backbtn" id="back">‹ back</button>
+  <span class="crumb" id="crumb"></span>
+  <span class="meta" id="meta"></span>
+</div>
+<div class="wrap">
+  <div class="stage" id="stage"></div>
+  <div class="log">
+    <div class="detail" id="detail"><div class="dh"><span class="dt">selected event</span>
+      <button class="follow on" id="follow">☑ following</button></div>
+      <div id="detailbody"></div></div>
+    <div class="split" id="split" title="drag to resize"></div>
+    <div class="loglist">
+      <h3><span>event log · <span id="logscope">fleet</span></span>
+          <button class="fbtn" id="fbtn" onclick="openFilters()">⚙ filters</button></h3>
+      <div id="logbody"></div>
+    </div>
+  </div>
+</div>
+<div class="scrub">
+  <button id="rewind" title="jump to start">⏮</button>
+  <button id="play" class="primary">▶ play</button>
+  <input type="range" id="range" min="0" max="100" value="100">
+  <button id="speed" title="playback speed">1×</button>
+  <span class="clock" id="clock"></span>
+</div>
+<div class="modalbg" id="modalbg">
+  <div class="modal">
+    <div class="mhd"><span>filter events</span><button class="mx" onclick="closeFilters()">✕</button></div>
+    <div id="filterbody"></div>
+    <div class="mft"><input id="fsearch" placeholder="search text…"><button class="clr" onclick="clearFilters()">clear all</button></div>
+  </div>
+</div>
+
+<script>
+// Live viewer — no embedded sample data.
+//
+// DATA is populated from the daemon's /flow/<date> endpoint in boot(); new
+// records stream in via SSE on /flow/<date>/stream. If the daemon isn't
+// reachable (e.g., this file loaded statically from darkmux.com/viewer with
+// no daemon running), DATA stays empty and the viewer renders the "no records"
+// state instead of falling back to demo content.
+//
+// The demo/showcase version with bundled SAMPLE data lives at docs/demo/
+// (served at darkmux.com/demo). See issue #624 for the split rationale.
+//
+// SAMPLE kept as an empty const for shape compatibility with the demo file —
+// future common-code edits should land in both files; demo-narrative-only and
+// daemon-only edits land in one.
+const SAMPLE = [];
+let DATA = SAMPLE;
+let DATA_SOURCE = "no records yet";
+
+// MACH_SPEC was a hardcoded lookup for the demo's three machines (studio,
+// laptop, mini-1). Removed for the live viewer — real machine specs come
+// from /machine/specs/<id> (TODO: wire dynamic lookup, follow-up to #624).
+// For now the spec field renders empty for real machines, which is honest:
+// better than fake specs for unknown machines.
+const MACH_SPEC={};
+// Mac-form-factor glyphs (inline SVG, Lucide stroke style — license-free, no external load)
+const ICON={
+  laptop:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="5" width="16" height="11" rx="1.5"/><path d="M2 19h20l-1.2-3H3.2z"/></svg>',
+  desktop:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="6" width="16" height="12" rx="2"/><circle cx="8" cy="12" r="1.1"/></svg>',
+  mini:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="9" width="18" height="7" rx="2"/><circle cx="7" cy="12.5" r="1"/></svg>'};
+// Live viewer — machine form-factor lookup empty; real machines render with no icon
+// until /machine/specs/<id> wiring lands (follow-up to #624).
+const MACH_ICON={};
+// MISSION was a hardcoded demo mission ("redis-tailnet") with 4 sprints. The live
+// viewer's mission panel renders empty until /missions + /sprints endpoint
+// integration lands (already a TODO "follow-up seam" in the original viewer code).
+// Shape kept so existing access paths (MISSION.id, MISSION.goal, etc.) don't throw.
+const MISSION={id:null,goal:"",scope:"",sprints:[]};
+const T=s=>Date.parse(s);
+const iso=t=>new Date(t).toISOString();
+const fmt=ms=>{ms=Math.max(0,ms);return Math.floor(ms/60000)+":"+String(Math.floor(ms/1000)%60).padStart(2,"0");};
+// Derived from DATA; recomputed whenever the data source changes (sample <-> real).
+let tMin, tMax, missions, FCATS, FTIERS, FSRC;
+function recompute(){
+  DATA.forEach((r,i)=>r._id=i);
+  const ts=DATA.map(r=>T(r.ts)).filter(n=>!isNaN(n));
+  tMin = ts.length?Math.min(...ts):Date.now();
+  tMax = ts.length?Math.max(...ts):Date.now();
+  missions=[...new Set(DATA.filter(r=>r.mission_id).map(r=>r.mission_id))];
+  FCATS=[...new Set(DATA.map(r=>r.category))];
+  FTIERS=[...new Set(DATA.map(r=>r.tier).filter(Boolean))];
+  FSRC=[...new Set(DATA.map(r=>r.source).filter(Boolean))];
+}
+recompute();
+let state={level:"fleet",machine:null,session:null,t:tMax,playing:false,timer:null,selected:null,follow:true,speed:1,
+  filters:{cat:new Set(FCATS),tier:new Set(FTIERS),src:new Set(FSRC),q:""}};
+
+const $=id=>document.getElementById(id);
+const visible=()=>DATA.filter(r=>T(r.ts)<=state.t);
+const scoped=()=>visible().filter(state.stageScope||(()=>true));
+function passesFilter(r){
+  if(!state.filters.cat.has(r.category))return false;
+  if(r.tier&&!state.filters.tier.has(r.tier))return false;
+  if(r.source&&!state.filters.src.has(r.source))return false;
+  if(state.filters.q&&!JSON.stringify(r).toLowerCase().includes(state.filters.q.toLowerCase()))return false;
+  return true;
+}
+const scopedFiltered=()=>scoped().filter(passesFilter);
+const newest=arr=>arr.length?arr.reduce((a,b)=>T(b.ts)>=T(a.ts)?b:a):null;
+const machines=()=>[...new Set(DATA.map(r=>r.machine_id).filter(Boolean))];
+const sessionsOn=m=>[...new Set(DATA.filter(r=>r.machine_id===m&&r.session_id).map(r=>r.session_id))];
+const dispatch=(sid,act)=>DATA.find(r=>r.session_id===sid&&r.action==="dispatch."+act);
+
+function renderMeta(){
+  $("meta").innerHTML=`<a class="misslink" onclick="goMission()">◆ ${missions.join(', ')||'—'}</a> · <b>${DATA_SOURCE}</b> · ${iso(tMin).slice(0,10)} `+
+    `${iso(tMin).slice(11,19)}–${iso(tMax).slice(11,19)}Z<br>${DATA.length} records · ${machines().length} machines`;
+}
+function machActive(m){
+  const v=visible();
+  const starts=v.filter(r=>r.machine_id===m&&r.action==="dispatch.start").map(r=>r.session_id);
+  const dones=v.filter(r=>r.machine_id===m&&r.action==="dispatch.complete").map(r=>r.session_id);
+  return starts.some(s=>!dones.includes(s));
+}
+function renderFleet(){
+  $("logscope").textContent="fleet"; state.stageScope=()=>true;
+  const ms=machines();
+  const cards=ms.map(m=>{
+    const act=machActive(m), runs=sessionsOn(m).length;
+    return `<div class="mach ${act?'active':''}" onclick="drillMachine('${m}')"><div class="name"><span class="mico">${ICON[MACH_ICON[m]]||""}</span>${m}</div>
+      <div class="spec">${MACH_SPEC[m]||''}</div><div class="stat"><span class="dot"></span>${act?'dispatch in flight':'idle'} · ${runs} specialist${runs===1?'':'s'} + utility</div>
+      <div class="hint">click to drill in →</div></div>`;}).join("");
+  // Activity timeline — one lane per machine; each dispatch session is a bar
+  // positioned across the recorded window, revealed up to the playhead (an
+  // in-flight session grows to the playhead). Fills the fleet view with a
+  // "what ran when, where" overview instead of empty canvas.
+  const span=Math.max(1,tMax-tMin), pct=t=>(t-tMin)/span*100;
+  const lanes=ms.map(m=>{
+    const bars=sessionsOn(m).map(sid=>{
+      const s=dispatch(sid,"start"); if(!s||T(s.ts)>state.t)return"";
+      const c=dispatch(sid,"complete"), done=c&&T(c.ts)<=state.t;
+      const end=done?T(c.ts):state.t, L=pct(T(s.ts)), W=Math.max(0.6,pct(end)-L);
+      const role=(s.handle||"").replace(/^darkmux\//,"");
+      return `<div class="sbar ${done?'':'a'}" style="left:${L}%;width:${W}%" title="${role} · ${sid}${done?'':' · in flight'}"></div>`;
+    }).join("");
+    return `<div class="lane"><div class="lname" title="${m}">${m}</div><div class="tltrack">${bars}<div class="ph" style="left:${pct(state.t)}%"></div></div></div>`;
+  }).join("");
+  const ax=`<div class="tlaxis"><span>${iso(tMin).slice(11,16)}</span><span>${iso(tMin+span/2).slice(11,16)}</span><span>${iso(tMax).slice(11,16)}Z</span></div>`;
+  const tl = ms.length
+    ? `<div class="fleettl"><div class="tlhdr">activity · ${iso(tMin).slice(11,19)}–${iso(tMax).slice(11,19)}Z</div>${lanes}${ax}</div>`
+    : `<div class="fleettl"><div class="tlempty">waiting for the first flow record…</div></div>`;
+  $("stage").innerHTML=`<div class="fleet">${cards}</div>`+tl;
+}
+function renderMachine(){
+  const m=state.machine; $("logscope").textContent=m; state.stageScope=r=>r.machine_id===m;
+  // Always-loaded utility role — resident on every machine, runs alongside the specialists
+  // to handle compaction + other utility-tier tasks (not a per-mission dispatch).
+  const util=`<div class="node util"><div class="h">darkmux/utility</div>
+    <div class="s">utility tier · always-loaded</div>
+    <div class="s">compaction · mission-compile · estimate · scribe</div>
+    <span class="pill util">resident</span></div>`;
+  // Specialist roles dispatched on this machine for the active mission
+  const specs=sessionsOn(m).filter(sid=>visible().some(r=>r.session_id===sid)).map(sid=>{
+    const s=dispatch(sid,"start"), done=dispatch(sid,"complete")&&T(dispatch(sid,"complete").ts)<=state.t;
+    return `<div class="node" onclick="drillSession('${sid}')"><div class="h">${s.handle}</div>
+      <div class="s">specialist role · ${s.model||'?'}</div>
+      <div class="s">session ${sid} · mission ${s.mission_id}</div>
+      <span class="pill ${done?'done':'run'}">${done?'complete':'running'}</span></div>`;}).join("");
+  $("stage").innerHTML=`<div><div class="stagehdr"><a onclick="goFleet()">fleet</a> › machine · ${m} — ${MACH_SPEC[m]||''}</div>
+    <div class="rglbl">crew on ${m}</div>${util}${specs||'<span class="hint">no specialist runs yet at this point in the timeline</span>'}</div>`;
+}
+function renderSubsystem(){
+  const sid=state.session, m=state.machine; $("logscope").textContent=sid; state.stageScope=r=>r.session_id===sid;
+  const tel=visible().filter(r=>r.session_id===sid&&r.category==="telemetry");
+  const lms=tel.filter(r=>r.source==="lms"), procs=tel.filter(r=>r.source==="process");
+  const rt=tel.filter(r=>r.source==="runtime").slice(-1)[0];
+  const dets=tel.filter(r=>r.source==="detector");
+  const loads=lms.filter(r=>r.fields.event==="load");
+  const distinct=[...new Set(loads.map(r=>r.fields.model))];
+  const d=dispatch(sid,"start"), c=dispatch(sid,"complete"), done=c&&T(c.ts)<=state.t;
+  const turns=rt?rt.fields.turns:"—";
+  const cx=tel.filter(r=>r.source==="context").slice().sort((a,b)=>T(a.ts)-T(b.ts));
+  const comps=tel.filter(r=>r.source==="compaction");
+  const nctx=cx.length?cx[0].fields.max:0, ctxPeak=cx.length?Math.max(...cx.map(r=>r.fields.used)):0;
+  const wall=done?fmt(T(c.ts)-T(d.ts)):fmt(state.t-T(d.ts))+" so far";
+  const met=`<div class="metrics">
+    <div class="met"><div class="mv">${turns}</div><div class="ml">turns</div></div>
+    <div class="met"><div class="mv">${nctx?(ctxPeak/1000).toFixed(0)+"k":"—"}</div><div class="ml">peak ctx / ${nctx?(nctx/1000)+"k window":"—"}</div><div class="tokbar"><span style="width:${nctx?Math.round(ctxPeak/nctx*100):0}%"></span></div></div>
+    <div class="met"><div class="mv">${comps.length}</div><div class="ml">compactions</div></div>
+    <div class="met"><div class="mv">${wall}</div><div class="ml">wall clock</div></div></div>`;
+  const segs=loads.map((r,i)=>`<span class="seg ${i>0?'b':''}">${r.fields.model} · ${r.fields.gb||'?'}GB</span>`).join("");
+  const bars=procs.map(r=>`<div class="bar" style="height:${Math.max(3,r.fields.cpu/100*78)}px" title="cpu ${r.fields.cpu}%"></div>`).join("");
+  const xvals=procs.map(r=>`<span>${r.fields.cpu}</span>`).join("");
+  const cpu=procs.length?`<div class="track"><div class="lbl">process cpu — % busy</div>
+    <div class="cpuchart"><div class="yax"><span>100</span><span>50</span><span>0</span></div>
+      <div><div class="bars">${bars}</div><div class="xvals">${xvals}</div></div></div></div>`:"";
+  let ctxChart="";
+  if(cx.length){
+    const W=440,H=72,t0=T(d.ts),t1=done?T(c.ts):state.t,span=Math.max(1,t1-t0);
+    const xy=cx.map(r=>[Math.max(0,Math.min(W,(T(r.ts)-t0)/span*W)),H-(r.fields.used/nctx)*H]);
+    const line=xy.map(p=>p[0].toFixed(0)+","+p[1].toFixed(0)).join(" ");
+    const area="M"+xy[0][0].toFixed(0)+","+H+" "+xy.map(p=>"L"+p[0].toFixed(0)+","+p[1].toFixed(0)).join(" ")+" L"+xy[xy.length-1][0].toFixed(0)+","+H+" Z";
+    const marks=comps.map(r=>{const x=Math.max(0,Math.min(W,(T(r.ts)-t0)/span*W)).toFixed(0);return `<line x1="${x}" y1="0" x2="${x}" y2="${H}" stroke="var(--warn)" stroke-width="1" stroke-dasharray="2 3"/><text x="${x}" y="9" fill="var(--warn)" font-size="9" text-anchor="middle">⚡</text>`;}).join("");
+    ctxChart=`<div class="track"><div class="lbl">context window — ${(nctx/1000)}K · ⚡ = compaction (${comps.length})</div><svg class="ctxchart" viewBox="0 0 ${W} ${H+2}" preserveAspectRatio="none"><path d="${area}" fill="var(--amber-dim)" opacity="0.22"/><polyline points="${line}" fill="none" stroke="var(--amber)" stroke-width="1.5"/>${marks}</svg></div>`;
+  }
+  const finds=[];
+  if(distinct.length>1)finds.push({s:"warn",k:"jit-model-swap",d:`${distinct.length} models loaded in one run (${distinct.join(" → ")}) — mid-run swap stalls the dispatch while the new model loads.`,f:"pin one model for the run, or pre-warm the swap target."});
+  dets.forEach(r=>finds.push({s:r.fields.severity||"warn",k:r.fields.kind,d:r.fields.detail}));
+  const detections=finds.length
+    ? `<div class="track"><div class="lbl">detections (${finds.length})</div>`+finds.map(f=>`<div class="finding ${f.s}"><span class="fk">⚠ ${f.k}</span><span class="fm">${f.d}</span>${f.f?`<span class="ff">fix: ${f.f}</span>`:""}</div>`).join("")+`</div>`
+    : `<div class="track"><div class="lbl">detections</div><div class="finding ok"><span class="fk">✓ clean</span><span class="fm">no behavioral flags (cycle, tool-failure, reasoning-loop, edit-drift)</span></div></div>`;
+  $("stage").innerHTML=`<div class="sub"><h2>subsystem · ${d.handle} <span style="color:var(--muted);text-transform:none;font-weight:400">(${sid} on <a onclick="drillMachine('${m}')">${m}</a>)</span></h2>
+    ${met}
+    <div class="track"><div class="lbl">model (lms)</div>${segs||'<span class="hint">no telemetry yet</span>'}</div>
+    ${cpu}
+    ${ctxChart}
+    ${detections}</div>`;
+}
+function pretty(r){
+  const o={};Object.keys(r).filter(k=>k!=="_id").forEach(k=>o[k]=r[k]);
+  return JSON.stringify(o,null,1).replace(/"(\w+)":/g,'<span class="k">$1</span>:');
+}
+function renderDetail(){
+  const r=DATA.find(x=>x._id===state.selected);
+  $("follow").className="follow"+(state.follow?" on":"");
+  $("follow").innerHTML=state.follow?"☑ following":"☐ follow latest";
+  $("detailbody").innerHTML=r?`<pre>${pretty(r)}</pre>`:`<div class="none">no event at this point in the timeline</div>`;
+}
+function renderLog(){
+  const recs=scopedFiltered().slice(-50).reverse();
+  $("logbody").innerHTML=recs.length?recs.map(r=>{
+    const tt=iso(T(r.ts)).slice(11,19);
+    const tag=r.category==="telemetry"?(r.source==="lms"?`lms:${r.fields.event}`:r.source==="process"?`cpu ${r.fields.cpu}%`:r.source==="detector"?`detect:${r.fields.kind}`:r.source==="runtime"?`run:${r.fields.turns}t`:r.source):(r.action||r.stage);
+    return `<div class="rec ${r.category} ${r._id===state.selected?'sel':''}" onclick="selectRec(${r._id})">
+      <span class="t">${tt}</span> <span class="tag">${tag}</span> ${r.machine_id||''}${r.session_id?(' · '+r.session_id):''}</div>`;
+  }).join(""):`<div class="empty">no events match the current filters</div>`;
+}
+function renderCrumb(){
+  // Mission crumb only when the loaded data actually has a mission. Lab/dispatch
+  // playback (no mission_id) starts at fleet. (Live mission/sprint detail is a
+  // follow-up seam — /missions + /sprints; MISSION stays the sample fixture.)
+  const hasMission=missions.length>0;
+  let c=hasMission?`<a class="misslink" onclick="goMission()">◆ ${missions[0]}</a>`:``;
+  if(state.level!=="mission"){
+    c+=(hasMission?`<span class="sep">›</span>`:``)+`<a onclick="goFleet()">fleet</a>`;
+    if(state.level==="machine"||state.level==="subsystem") c+=`<span class="sep">›</span><a onclick="drillMachine('${state.machine}')">${state.machine}</a>`;
+    if(state.level==="subsystem") c+=`<span class="sep">›</span>${state.session}`;
+  }
+  $("crumb").innerHTML=c; $("back").disabled=(state.level==="fleet");
+}
+function filtersActive(){return state.filters.cat.size<FCATS.length||state.filters.tier.size<FTIERS.length||state.filters.src.size<FSRC.length||!!state.filters.q;}
+function updateFbtn(){const a=filtersActive();$("fbtn").className="fbtn"+(a?" on":"");$("fbtn").textContent=a?"⚙ filters •":"⚙ filters";}
+function syncTransport(){
+  $("range").value=Math.round((state.t-tMin)/(tMax-tMin)*100);
+  $("clock").textContent=fmt(state.t-tMin)+" / "+fmt(tMax-tMin)+"  ·  "+visible().length+"/"+DATA.length+" rec";
+}
+function render(){
+  if(state.level==="mission")renderMission(); else if(state.level==="fleet")renderFleet(); else if(state.level==="machine")renderMachine(); else renderSubsystem();
+  if(state.follow){ const n=newest(scopedFiltered()); state.selected=n?n._id:null; }
+  renderDetail();renderLog();renderCrumb();renderMeta();updateFbtn();
+  syncTransport();
+}
+window.drillMachine=m=>{state.level="machine";state.machine=m;state.session=null;state.follow=true;render();};
+window.drillSession=s=>{state.level="subsystem";state.session=s;state.follow=true;render();};
+window.goFleet=()=>{state.level="fleet";state.machine=null;state.session=null;state.follow=true;render();};
+window.goMission=()=>{ if(!missions.length)return goFleet(); state.level="mission";state.machine=null;state.session=null;state.follow=true;render();};
+function renderMission(){
+  state.stageScope=r=>r.mission_id===MISSION.id; $("logscope").textContent="mission";
+  // Sprint status is derived from its dispatch session at the current playhead, so the
+  // burn-down actually advances during playback (backlog → active → complete).
+  const statusOf=s=>{
+    if(!s.sid) return "backlog";
+    const st=dispatch(s.sid,"start"), cp=dispatch(s.sid,"complete");
+    if(!st||T(st.ts)>state.t) return "backlog";
+    if(cp&&T(cp.ts)<=state.t) return "complete";
+    return "active";
+  };
+  const sp=MISSION.sprints.map(s=>({...s,status:statusOf(s)}));
+  const done=sp.filter(s=>s.status==="complete").length, active=sp.filter(s=>s.status==="active").length, backlog=sp.filter(s=>s.status==="backlog").length, total=sp.length, pct=Math.round(done/total*100);
+  const rows=sp.map(s=>`<div class="sprow"><span class="sps ${s.status}">${s.status}</span><span class="spt">${s.title}</span><span class="spe">est ${s.est}</span><span class="spa">${s.who}${s.on!=="—"?' · '+s.on:''}</span></div>`).join("");
+  $("stage").innerHTML=`<div class="sub"><h2>mission · ${MISSION.id}</h2>
+    <div class="mgoal">${MISSION.goal}</div>
+    <div class="mscope">scope · ${MISSION.scope}</div>
+    <div class="burn"><div class="burnbar"><span style="width:${pct}%"></span></div><div class="burnlbl">${done}/${total} sprints complete · ${pct}% burned down · ${active} active · ${backlog} backlog</div></div>
+    <div class="track"><div class="lbl">sprints</div>${rows}</div></div>`;
+}
+window.selectRec=id=>{state.selected=id;state.follow=false;render();};
+$("follow").onclick=()=>{state.follow=!state.follow;render();};
+$("back").onclick=()=>{ if(state.level==="subsystem")drillMachine(state.machine); else if(state.level==="machine")goFleet(); else if(state.level==="mission")goFleet(); };
+$("range").oninput=e=>{state.follow=false;state.t=tMin+(tMax-tMin)*e.target.value/100;render();};
+$("rewind").onclick=()=>{state.t=tMin;state.follow=true;render();};
+$("speed").onclick=()=>{const s=[0.5,1,2,4];state.speed=s[(s.indexOf(state.speed)+1)%s.length];$("speed").textContent=state.speed+"×";};
+$("play").onclick=()=>{
+  if(state.playing){clearInterval(state.timer);state.playing=false;$("play").textContent="▶ play";return;}
+  if(state.t>=tMax)state.t=tMin;
+  state.follow=true; state.playing=true;$("play").textContent="⏸ pause"; render();
+  let lastCount=visible().length;
+  state.timer=setInterval(()=>{ state.t+=(tMax-tMin)/120*state.speed;
+    let cap=false;
+    if(state.t>=tMax){state.t=tMax;clearInterval(state.timer);state.playing=false;$("play").textContent="▶ play";cap=true;}
+    const c=visible().length;
+    // Only full-render when a record crosses the playhead; between crossings just advance the
+    // readouts, so the cards aren't destroyed mid-click (the bug — same fix the live tool needs).
+    if(c!==lastCount||cap){lastCount=c;render();} else syncTransport();
+  },100);
+};
+// filter modal
+function renderFilters(){
+  const grp=(title,vals,k)=>`<div class="fgroup"><h4>${title}</h4>`+vals.map(v=>
+    `<label><input type="checkbox" ${state.filters[k].has(v)?'checked':''} onclick="toggleFilter('${k}','${v}')"> ${v}</label>`).join("")+`</div>`;
+  $("filterbody").innerHTML=grp('category',FCATS,'cat')+grp('tier',FTIERS,'tier')+grp('telemetry source',FSRC,'src');
+}
+window.toggleFilter=(k,v)=>{const s=state.filters[k];s.has(v)?s.delete(v):s.add(v);render();};
+window.openFilters=()=>{renderFilters();$("fsearch").value=state.filters.q;$("modalbg").style.display="flex";};
+window.closeFilters=()=>{$("modalbg").style.display="none";};
+window.clearFilters=()=>{state.filters={cat:new Set(FCATS),tier:new Set(FTIERS),src:new Set(FSRC),q:""};$("fsearch").value="";renderFilters();render();};
+$("fsearch").oninput=e=>{state.filters.q=e.target.value;render();};
+$("modalbg").onclick=e=>{if(e.target===$("modalbg"))closeFilters();};
+// resizable detail/log split — fixed default height stops the jumpiness; drag the divider to grow it
+(function(){const DEF=200,MIN=110,MAX=520;$("detail").style.height=DEF+"px";let drag=false,sy=0,sh=0;
+  $("split").addEventListener("mousedown",e=>{drag=true;sy=e.clientY;sh=$("detail").offsetHeight;document.body.style.userSelect="none";e.preventDefault();});
+  window.addEventListener("mousemove",e=>{if(!drag)return;$("detail").style.height=Math.max(MIN,Math.min(MAX,sh+(e.clientY-sy)))+"px";});
+  window.addEventListener("mouseup",()=>{drag=false;document.body.style.userSelect="";});})();
+
+// ── Data source: real flow records (daemon) with sample fallback (website) ──
+// Normalize real FlowRecords into the viewer's record shape. The flow schema
+// is already close: it carries ts/category/tier/stage/action/handle/
+// machine_id/mission_id/session_id/model. Differences handled here:
+//  - "dispatch start"/"dispatch complete" (space) → dotted form the UI matches
+//  - tier may be capitalized ("Local") → lowercased to match the filter set
+//  - event-specific data lives under `payload` (schema 1.6+) → exposed as `fields`
+//  - category defaults to telemetry when a `source` is present, else work
+function flowToRenderModel(records){
+  const out=records.map(r=>{
+    const o={...r};
+    if(o.action==="dispatch start")o.action="dispatch.start";
+    if(o.action==="dispatch complete")o.action="dispatch.complete";
+    if(o.tier)o.tier=String(o.tier).toLowerCase();
+    if(o.payload&&!o.fields)o.fields=o.payload;
+    // dispatch.compaction → a compaction telemetry record (the subsystem's
+    // compaction count). from/to are message counts here, not the byte
+    // sawtooth the sample draws (per-turn context bytes need #557).
+    if(o.action==="dispatch.compaction"){
+      const p=o.payload||{};
+      o.category="telemetry"; o.source="compaction";
+      o.fields={from:p.before_messages||0,to:p.after_messages||0};
+    }
+    if(!o.category)o.category=o.source?"telemetry":"work";
+    return o;
+  });
+  // Per-session turn count (max turn_seq) → one runtime telemetry record, which
+  // is where the subsystem view reads the TURNS metric.
+  const perS={};
+  for(const r of records){
+    if(r.action==="dispatch.turn"&&r.session_id){
+      const seq=(r.payload&&r.payload.turn_seq)||0;
+      const e=perS[r.session_id]||(perS[r.session_id]={turns:0,ts:r.ts,machine_id:r.machine_id});
+      e.turns=Math.max(e.turns,seq); e.ts=r.ts; if(r.machine_id)e.machine_id=r.machine_id;
+    }
+  }
+  for(const s in perS){
+    out.push({ts:perS[s].ts,category:"telemetry",source:"runtime",machine_id:perS[s].machine_id,session_id:s,fields:{turns:perS[s].turns}});
+  }
+  return out;
+}
+
+// Pick the day to play back: URL hash (#2026-06-01) or ?date=, default today (UTC).
+function targetDate(){
+  const h=(location.hash||"").replace(/^#/,"").trim();
+  if(/^\d{4}-\d{2}-\d{2}$/.test(h))return h;
+  const q=new URLSearchParams(location.search).get("date");
+  if(q&&/^\d{4}-\d{2}-\d{2}$/.test(q))return q;
+  return new Date().toISOString().slice(0,10);
+}
+
+function todayUTC(){return new Date().toISOString().slice(0,10);}
+
+let RAW=[];            // raw FlowRecords (pre-adapt); the live tail appends here
+let LIVE_ES=null;      // EventSource handle when tailing the live stream
+let lastStageSig=null; // skip stage re-renders that would destroy clickable cards
+const SEEN={cat:new Set(),tier:new Set(),src:new Set()};  // filter values ever observed
+
+// When live records introduce a category/tier/source not seen before, include it
+// in the active filter set (new = visible by default). Values the operator
+// explicitly deselected are already in SEEN, so they stay deselected.
+function absorbNewFilterValues(){
+  const add=(vals,seen,fset)=>{for(const v of vals){if(!seen.has(v)){seen.add(v);fset.add(v);}}};
+  add(FCATS,SEEN.cat,state.filters.cat);
+  add(FTIERS,SEEN.tier,state.filters.tier);
+  add(FSRC,SEEN.src,state.filters.src);
+}
+
+function setBadges(mode,date){
+  const dl = date===todayUTC() ? "today" : date;
+  // Live viewer never enters "sample" mode — the fallback is "no daemon" or
+  // "no records yet", both honest empty states. (Demo "sample data" badge is
+  // gone — that mode belongs to docs/demo/ only.)
+  DATA_SOURCE = mode==="live" ? ("live · "+dl) : mode==="play" ? ("flow · "+date) : mode==="empty" ? ("no records · "+date) : mode==="no-daemon" ? "daemon not reachable" : "no records yet";
+  const sb=$("srcbadge");
+  if(sb) sb.textContent = mode==="live" ? ("Live · "+dl) : mode==="play" ? ("Flow · "+date) : mode==="empty" ? ("No records · "+date) : mode==="no-daemon" ? "No daemon" : "No records yet";
+  const mb=$("modebadge");
+  if(mb){ const live=mode==="live"; mb.textContent=live?"● live":"▣ playback"; mb.classList.toggle("live",live); }
+}
+
+// Structural signature of the current level's stage. In live mode the cards are
+// re-rendered only when this changes — a burst of telemetry records must not
+// destroy a card the operator is about to click (same hazard the playback timer
+// guards against). Subsystem is a metrics view with no cards → always full-render.
+function stageSig(){
+  const v=visible(), dis=v.filter(r=>r.action==="dispatch.start"||r.action==="dispatch.complete").length;
+  if(state.level==="fleet")return "f|"+machines().join(",")+"|"+dis;
+  if(state.level==="machine")return "m|"+state.machine+"|"+sessionsOn(state.machine).join(",")+"|"+dis;
+  if(state.level==="subsystem")return null;
+  return "mission";
+}
+function applyLive(){
+  DATA=flowToRenderModel(RAW);
+  recompute();
+  absorbNewFilterValues();
+  if(state.follow)state.t=tMax;
+  const sig=stageSig();
+  if(sig===null||sig!==lastStageSig){ lastStageSig=sig; render(); return; }
+  // Cards unchanged — refresh only the live readouts (selected event, log, meta, transport).
+  if(state.follow){ const n=newest(scopedFiltered()); state.selected=n?n._id:null; }
+  renderDetail();renderLog();renderMeta();syncTransport();
+}
+function startLiveTail(date){
+  if(typeof EventSource==="undefined")return;
+  if(LIVE_ES)LIVE_ES.close();
+  LIVE_ES=new EventSource("/flow/"+date+"/stream");
+  let pending=false;
+  LIVE_ES.onmessage=ev=>{
+    let rec; try{rec=JSON.parse(ev.data);}catch(_){return;}
+    if(!rec||typeof rec!=="object"||Array.isArray(rec))return;
+    RAW.push(rec);
+    if(!pending){pending=true;requestAnimationFrame(()=>{pending=false;applyLive();});}
+  };
+  LIVE_ES.onerror=()=>{const mb=$("modebadge");if(mb)mb.classList.remove("live");}; // reconnecting — drop the pulse
+  window.addEventListener("beforeunload",()=>{if(LIVE_ES)LIVE_ES.close();});
+}
+
+async function boot(){
+  const date=targetDate();
+  let mode="empty";
+  try{
+    const res=await fetch("/flow/"+date,{headers:{accept:"application/json"}});
+    if(res.ok){
+      const body=await res.json();
+      RAW=Array.isArray(body)?body:(body.records||body.flow||[]);
+      DATA=flowToRenderModel(RAW);
+      mode = date===todayUTC() ? "live" : (RAW.length?"play":"empty");  // today tails; a past date replays
+    }else{ DATA=[]; RAW=[]; mode="empty"; }
+  }catch(e){ DATA=[]; RAW=[]; mode="no-daemon"; }   // daemon not reachable — show honest empty state, never demo
+  setBadges(mode,date);
+  recompute();
+  state.t=tMax;
+  state.filters={cat:new Set(FCATS),tier:new Set(FTIERS),src:new Set(FSRC),q:""};
+  absorbNewFilterValues();
+  render();
+  if(mode==="live") startLiveTail(date);
+}
+boot();
+</script>
 </body>
 </html>
