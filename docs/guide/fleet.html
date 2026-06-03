@@ -51,8 +51,11 @@
 
 <section>
   <div class="wrap">
-    <h2>Before you start — harden your hub</h2>
+    <h2 id="harden">Before you start — harden your hub</h2>
     <p>The most painful failure mode in a multi-machine darkmux deployment is the operator-default-macOS one: hub machine sleeps overnight, drops Tailscale, your other Macs' dispatch starts timing out, and you don't notice until you try to use it. That happened in the maintainer's own setup; the lesson is in the field notebook.</p>
+    <div class="callout">
+      <strong>Going deeper:</strong> the checklist below is the minimum (sleep, autostart). For a production-grade hub — Redis with AOF persistence, <code>darkmux serve</code> under launchd KeepAlive, the audit substrate enabled, log rotation, daily integrity checks — see <a href="always-on-hub.html">always-on hub operations</a>. The two pages compose: this page tells you how to wire up the fleet; that page tells you how to make the hub at the center of it survive crashes, reboots, and weeks of operator absence.
+    </div>
     <p>Before joining a Mac as your hub, walk through this checklist on it once:</p>
     <pre><code><span class="comment"># Stop sleeping. Mac defaults assume "laptop closed = sleep"; that's wrong for a 24/7 hub.</span>
 sudo pmset -a sleep 0 disksleep 0 autorestart 1
