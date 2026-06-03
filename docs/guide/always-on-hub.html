@@ -37,6 +37,9 @@
     <h2>Who this page is for</h2>
     <p>You've already done <a href="getting-started.html">getting started</a> on at least one machine, and read <a href="fleet.html">fleet</a> well enough to know you want a multi-machine setup. You have one always-on machine — a Mac mini, a Mac Studio, a Linux box in a closet — that's going to be the coordinator. This page is the deep operational walkthrough for hardening THAT machine specifically: the one other machines depend on.</p>
     <p>If you only have one machine and you're staying single-machine, you don't need this page. The casual <code>darkmux serve</code> + <code>brew services start redis</code> path from the fleet page is enough.</p>
+    <div class="callout">
+      <strong>Shorter path coming:</strong> <a href="https://github.com/kstrat2001/darkmux/issues/618">#618</a> tracks Homebrew packaging — once <code>brew install darkmux</code> + <code>brew services start darkmux</code> ship, Phase 2 of this guide collapses to two commands. The deep walkthrough below stays as the "what brew is doing for you" reference. Until then, hand-roll the launchd plist (it's worth understanding what's under it anyway).
+    </div>
   </div>
 </section>
 
@@ -84,43 +87,375 @@
 <section id="phase-1">
   <div class="wrap">
     <h2>Phase 1 — Harden Redis</h2>
-    <p><em>[Section to be filled in during execution — Plan steps 5-7. Will cover: AOF persistence (<code>appendonly yes</code>, <code>appendfsync everysec</code>), memory cap (<code>maxmemory 4gb</code>, <code>noeviction</code>), bind decision (keep <code>0.0.0.0</code> + <code>protected-mode yes</code> + <code>requirepass</code>; not dual-bind), password storage in macOS Keychain (<code>security add-generic-password</code>), cross-Tailnet smoke from a peer with <code>nc</code> + <code>redis-cli PING</code>, Tailscale ACL guidance for when a third device joins. Per-phase rollback: restore <code>redis.conf</code> backup + <code>CONFIG SET appendonly no</code> + <code>brew services restart redis</code>.]</em></p>
+    <p>Install Redis if you haven't:</p>
+    <pre><code>brew install redis
+brew services start redis</code></pre>
+    <p>Then set <code>requirepass</code> (defense-in-depth — the tailnet is your perimeter; the password is your authentication). Store the password in macOS Keychain rather than the rc file:</p>
+    <pre><code><span class="comment"># Generate a strong password (or pick your own); store in keychain.</span>
+PASS=$(openssl rand -base64 36 | tr -d '/+=' | head -c 48)
+security add-generic-password -a "$USER" -s darkmux-redis -w "$PASS"
+unset PASS
+
+<span class="comment"># Read it back and set requirepass on the running instance.</span>
+DARKMUX_REDIS_PASS=$(security find-generic-password -a "$USER" -s darkmux-redis -w)
+echo "requirepass \"$DARKMUX_REDIS_PASS\"" | sudo tee -a /opt/homebrew/etc/redis.conf > /dev/null
+brew services restart redis</code></pre>
+    <p>(If you already had Redis with a password, skip the above — just confirm the password is in keychain under service <code>darkmux-redis</code>.)</p>
+
+    <h3>AOF persistence</h3>
+    <p>The default Redis install does periodic RDB snapshots. A crash between snapshots loses minutes of flow records. AOF (append-only file) with <code>appendfsync everysec</code> caps loss at ≤1 second on crash at negligible throughput cost for hub-class write volume.</p>
+    <p>Back up <code>redis.conf</code> first (always):</p>
+    <pre><code>cp /opt/homebrew/etc/redis.conf \
+   /opt/homebrew/etc/redis.conf.bak-pre-hub-$(date +%Y%m%d-%H%M%S)</code></pre>
+    <p>Then apply at runtime + persist back to <code>redis.conf</code>:</p>
+    <pre><code>DARKMUX_REDIS_PASS=$(security find-generic-password -a "$USER" -s darkmux-redis -w)
+
+redis-cli -a "$DARKMUX_REDIS_PASS" --no-auth-warning CONFIG SET appendonly yes
+redis-cli -a "$DARKMUX_REDIS_PASS" --no-auth-warning CONFIG SET appendfsync everysec
+redis-cli -a "$DARKMUX_REDIS_PASS" --no-auth-warning CONFIG SET maxmemory 4gb
+redis-cli -a "$DARKMUX_REDIS_PASS" --no-auth-warning CONFIG SET maxmemory-policy noeviction
+redis-cli -a "$DARKMUX_REDIS_PASS" --no-auth-warning CONFIG REWRITE
+redis-cli -a "$DARKMUX_REDIS_PASS" --no-auth-warning BGREWRITEAOF</code></pre>
+    <p>The <code>maxmemory 4gb</code> + <code>noeviction</code> pair is deliberate: the flow stream is already <code>XADD MAXLEN</code>-bounded by darkmux (default 10,000 entries via <code>DARKMUX_REDIS_MAXLEN</code>), so Redis doesn't need to evict — and you do NOT want it to, because eviction policies that touch streams can lose records silently. <code>noeviction</code> means "if you'd hit the cap, reject the write and surface an error" — the right posture for a record-keeping substrate.</p>
+    <p>Verify:</p>
+    <pre><code>redis-cli -a "$DARKMUX_REDIS_PASS" --no-auth-warning CONFIG GET appendonly      <span class="comment"># "yes"</span>
+redis-cli -a "$DARKMUX_REDIS_PASS" --no-auth-warning CONFIG GET appendfsync     <span class="comment"># "everysec"</span>
+ls /opt/homebrew/var/db/redis/appendonlydir/                                    <span class="comment"># appendonly.aof.* files appear</span></code></pre>
+
+    <h3>Bind decision — keep <code>0.0.0.0</code></h3>
+    <p>The temptation is to dual-bind <code>127.0.0.1</code> + the hub's tailnet IP (e.g. <code>100.x.y.z</code>) for "least exposure." Don't. Two reasons:</p>
+    <ul>
+      <li><strong>Tailscale documents IPs as stable-but-not-contractual.</strong> If the tailnet IP ever rotates (machine reset, account migration, tag change), Redis fails to bind and the hub silently goes offline.</li>
+      <li><strong><code>protected-mode yes</code> + <code>requirepass</code> already reject unauthenticated non-localhost connections at the Redis layer.</strong> The bind is just "which interfaces does the listener attach to" — security is enforced separately.</li>
+    </ul>
+    <p>Confirm the existing safe defaults:</p>
+    <pre><code>redis-cli -a "$DARKMUX_REDIS_PASS" --no-auth-warning CONFIG GET protected-mode  <span class="comment"># "yes"</span>
+redis-cli -a "$DARKMUX_REDIS_PASS" --no-auth-warning CONFIG GET bind            <span class="comment"># "0.0.0.0 ::1"</span></code></pre>
+    <p>Then verify cross-network reachability — from a peer machine on the same tailnet:</p>
+    <pre><code><span class="comment"># On the peer:</span>
+nc -zvw1 &lt;hub-tailnet-addr&gt; 6379                                <span class="comment"># expect "succeeded"</span>
+redis-cli -h &lt;hub-tailnet-addr&gt; -a "&lt;password&gt;" --no-auth-warning PING    <span class="comment"># expect PONG</span>
+redis-cli -h &lt;hub-tailnet-addr&gt; -a "&lt;password&gt;" --no-auth-warning XLEN darkmux:flow</code></pre>
+
+    <h3>Tailscale ACL — when a third device joins</h3>
+    <p>With one operator and two devices, the trivial-ACL "allow everything within the tailnet" is fine. The moment you add a third device (a CI runner, a friend's laptop, a tagged ephemeral), tighten with a tag:</p>
+    <pre><code>{
+  "tagOwners": {
+    "tag:darkmux-fleet": ["your-email@example.com"]
+  },
+  "acls": [{
+    "action": "accept",
+    "src":    ["tag:darkmux-fleet"],
+    "dst":    ["tag:darkmux-fleet:6379", "tag:darkmux-fleet:8765"]
+  }]
+}</code></pre>
+    <p>Tag each device that's part of the fleet in the Tailscale admin console; untagged devices can't reach the hub's Redis or darkmux daemon port.</p>
+
+    <h3>Phase 1 rollback</h3>
+    <pre><code><span class="comment"># Restore the backup; turn AOF off; restart.</span>
+cp /opt/homebrew/etc/redis.conf.bak-pre-hub-YYYYMMDD-HHMMSS /opt/homebrew/etc/redis.conf
+DARKMUX_REDIS_PASS=$(security find-generic-password -a "$USER" -s darkmux-redis -w)
+redis-cli -a "$DARKMUX_REDIS_PASS" --no-auth-warning CONFIG SET appendonly no
+brew services restart redis</code></pre>
+    <p><strong>Linux substitution:</strong> swap <code>brew install redis</code> → <code>apt install redis-server</code> or <code>dnf install redis</code>; swap macOS Keychain (<code>security</code>) → distro secret store (libsecret <code>secret-tool</code>, GNOME Keyring, or pass) or <code>~/.darkmux/redis-pass</code> chmod 600; <code>/opt/homebrew/etc/redis.conf</code> → <code>/etc/redis/redis.conf</code>.</p>
   </div>
 </section>
 
 <section id="phase-2">
   <div class="wrap">
     <h2>Phase 2 — Run darkmux serve as a launchd service</h2>
-    <p><em>[Section to be filled in during execution — Plan steps 8-10. Will cover: path decisions (<code>~/Library/Logs/darkmux/</code> for logs, <code>com.darkmux.serve</code> label), the Keychain pre-grant gotcha (run <code>security find-generic-password</code> interactively once and click "Always Allow" BEFORE loading the plist or KeepAlive loops on hidden GUI prompt), the full plist with <code>/bin/zsh -lc</code> wrapper that reads Redis password from Keychain at process-start so the URL never lives in the plist file, env vars the daemon must inherit (<code>DARKMUX_MACHINE_ID</code>, <code>DARKMUX_ORCHESTRATOR</code>, <code>DARKMUX_AUDIT_DIR</code>, <code>DARKMUX_FLOWS_DIR</code>, <code>DARKMUX_REDIS_STREAM</code>, <code>DARKMUX_REDIS_MAXLEN</code>), KeepAlive smoke (kill TERM → expect new PID), fleet roster registration via <code>darkmux fleet add &lt;machine-id&gt; --address 127.0.0.1:8765</code>. Per-phase rollback: <code>launchctl unload</code> + <code>rm</code> plist.]</em></p>
+    <p><code>darkmux serve</code> is the local HTTP daemon — flow records, mission/sprint state, model status, the bundled topology viewer. Running it as a foreground process is fine for casual use; for a 24/7 hub you want it under launchd so it auto-starts at boot and KeepAlive-respawns on crash.</p>
+
+    <h3>Paths</h3>
+    <ul>
+      <li><strong>Binary:</strong> <code>~/.cargo/bin/darkmux</code> (where <code>cargo install --path .</code> puts it; <code>which darkmux</code> confirms)</li>
+      <li><strong>Logs:</strong> <code>~/Library/Logs/darkmux/serve.{out,err}</code> — macOS convention; visible in Console.app and rotates cleanly via newsyslog (Phase 4)</li>
+      <li><strong>launchd label:</strong> <code>com.darkmux.serve</code> (reverse-DNS, namespaces cleanly alongside Homebrew's <code>homebrew.mxcl.*</code>)</li>
+    </ul>
+    <pre><code>mkdir -p ~/Library/Logs/darkmux
+
+<span class="comment"># If you've been running darkmux serve manually, move any legacy log out of the way.</span>
+mv ~/.darkmux/serve.log ~/Library/Logs/darkmux/serve.legacy.log 2>/dev/null || true</code></pre>
+
+    <h3>Keychain pre-grant (do this BEFORE loading the plist)</h3>
+    <div class="callout warn">
+      <strong>The hidden-prompt gotcha.</strong> The launchd plist will exec <code>security find-generic-password</code> at process-start to read the Redis password from Keychain. The FIRST time a launchd-spawned process accesses a keychain item, macOS may show a GUI prompt asking whether to allow it. A launchd-spawned process has no controlling TTY, so the prompt has no UI to display in — the daemon then sits silently failing under KeepAlive in a loop until you notice. Pre-grant by running the access interactively once:
+    </div>
+    <pre><code><span class="comment"># Run in a fresh terminal. If a GUI prompt appears, click "Always Allow".</span>
+<span class="comment"># If it just prints the password and exits, your ACL is already permissive.</span>
+security find-generic-password -a "$USER" -s darkmux-redis -w</code></pre>
+
+    <h3>The plist</h3>
+    <p>File: <code>~/Library/LaunchAgents/com.darkmux.serve.plist</code></p>
+    <pre><code>&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+&lt;!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"&gt;
+&lt;plist version="1.0"&gt;
+&lt;dict&gt;
+  &lt;key&gt;Label&lt;/key&gt;&lt;string&gt;com.darkmux.serve&lt;/string&gt;
+
+  &lt;key&gt;ProgramArguments&lt;/key&gt;
+  &lt;array&gt;
+    &lt;string&gt;/bin/zsh&lt;/string&gt;
+    &lt;string&gt;-lc&lt;/string&gt;
+    &lt;string&gt;export DARKMUX_REDIS_URL="redis://:$(security find-generic-password -a $USER -s darkmux-redis -w)@127.0.0.1:6379"; exec /Users/&lt;your-user&gt;/.cargo/bin/darkmux serve --bind 127.0.0.1 --port 8765&lt;/string&gt;
+  &lt;/array&gt;
+
+  &lt;key&gt;EnvironmentVariables&lt;/key&gt;
+  &lt;dict&gt;
+    &lt;key&gt;HOME&lt;/key&gt;&lt;string&gt;/Users/&lt;your-user&gt;&lt;/string&gt;
+    &lt;key&gt;PATH&lt;/key&gt;&lt;string&gt;/Users/&lt;your-user&gt;/.cargo/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/bin:/usr/sbin:/sbin&lt;/string&gt;
+    &lt;key&gt;DARKMUX_MACHINE_ID&lt;/key&gt;&lt;string&gt;&lt;your-machine-id&gt;&lt;/string&gt;
+    &lt;key&gt;DARKMUX_ORCHESTRATOR&lt;/key&gt;&lt;string&gt;claude-opus-4-7&lt;/string&gt;
+    &lt;key&gt;DARKMUX_AUDIT_DIR&lt;/key&gt;&lt;string&gt;/Users/&lt;your-user&gt;/.darkmux/audit&lt;/string&gt;
+    &lt;key&gt;DARKMUX_FLOWS_DIR&lt;/key&gt;&lt;string&gt;/Users/&lt;your-user&gt;/.darkmux/flows&lt;/string&gt;
+    &lt;key&gt;DARKMUX_REDIS_STREAM&lt;/key&gt;&lt;string&gt;darkmux:flow&lt;/string&gt;
+    &lt;key&gt;DARKMUX_REDIS_MAXLEN&lt;/key&gt;&lt;string&gt;10000&lt;/string&gt;
+  &lt;/dict&gt;
+
+  &lt;key&gt;RunAtLoad&lt;/key&gt;&lt;true/&gt;
+  &lt;key&gt;KeepAlive&lt;/key&gt;&lt;true/&gt;
+  &lt;key&gt;ThrottleInterval&lt;/key&gt;&lt;integer&gt;10&lt;/integer&gt;
+
+  &lt;key&gt;StandardOutPath&lt;/key&gt;&lt;string&gt;/Users/&lt;your-user&gt;/Library/Logs/darkmux/serve.out&lt;/string&gt;
+  &lt;key&gt;StandardErrorPath&lt;/key&gt;&lt;string&gt;/Users/&lt;your-user&gt;/Library/Logs/darkmux/serve.err&lt;/string&gt;
+
+  &lt;key&gt;WorkingDirectory&lt;/key&gt;&lt;string&gt;/Users/&lt;your-user&gt;&lt;/string&gt;
+  &lt;key&gt;ProcessType&lt;/key&gt;&lt;string&gt;Background&lt;/string&gt;
+&lt;/dict&gt;
+&lt;/plist&gt;</code></pre>
+    <p>Replace <code>&lt;your-user&gt;</code> and <code>&lt;your-machine-id&gt;</code>. The <code>/bin/zsh -lc</code> wrapper is the load-bearing part: it reads the Redis password from Keychain at process-start and exports it before exec-ing darkmux. The password never lives in the plist file (which is plaintext on disk) and never appears in <code>ps aux</code> — only the resolved URL goes into the child process's environment, not the command line.</p>
+
+    <h3>Load + verify</h3>
+    <pre><code>plutil -lint ~/Library/LaunchAgents/com.darkmux.serve.plist
+launchctl load -w ~/Library/LaunchAgents/com.darkmux.serve.plist
+sleep 3
+launchctl list | grep com.darkmux.serve                <span class="comment"># expect: &lt;pid&gt; 0 com.darkmux.serve</span>
+curl -s http://127.0.0.1:8765/health                    <span class="comment"># expect: {"darkmux_version":"…","flow_schema_version":"…"}</span>
+darkmux doctor 2>&amp;1 | grep -i "daemon reachable"        <span class="comment"># expect: ✓</span>
+tail -20 ~/Library/Logs/darkmux/serve.err</code></pre>
+
+    <h3>KeepAlive smoke test</h3>
+    <p>Prove auto-recovery actually works by killing the daemon:</p>
+    <pre><code>PID=$(launchctl list | awk '/com.darkmux.serve/ {print $1}')
+kill -TERM "$PID"
+sleep 14    <span class="comment"># ThrottleInterval=10s + 4s margin</span>
+launchctl list | grep com.darkmux.serve                <span class="comment"># expect: a NEW PID (different from before)</span></code></pre>
+
+    <h3>Register the hub in its own fleet roster</h3>
+    <pre><code>darkmux fleet add &lt;your-machine-id&gt; --address 127.0.0.1:8765
+darkmux fleet status</code></pre>
+
+    <h3>Phase 2 rollback</h3>
+    <pre><code>launchctl unload -w ~/Library/LaunchAgents/com.darkmux.serve.plist
+rm ~/Library/LaunchAgents/com.darkmux.serve.plist</code></pre>
+    <p><strong>Linux substitution:</strong> swap the plist for a systemd user unit at <code>~/.config/systemd/user/darkmux-serve.service</code> (<code>Restart=always</code>, <code>RestartSec=10</code>, env vars in <code>[Service]</code>), enable with <code>systemctl --user enable --now darkmux-serve</code>; swap <code>launchctl list</code> → <code>systemctl --user status</code>; swap Console.app → <code>journalctl --user -u darkmux-serve -f</code>.</p>
   </div>
 </section>
 
 <section id="phase-3">
   <div class="wrap">
     <h2>Phase 3 — Enable the audit substrate</h2>
-    <p><em>[Section to be filled in during execution — Plan step 11. Will defer to the <code>/darkmux-enable-audit</code> skill as the authoritative walkthrough (don't duplicate). Will surface the hub-specific decisions: pick <code>~/.darkmux/audit/</code> as the audit dir, put <code>DARKMUX_AUDIT_DIR</code> in BOTH the launchd plist (so the daemon writes audit records) AND <code>~/.zshrc</code> (so interactive <code>darkmux flow note</code> writes them too), reload <code>com.darkmux.serve</code> after enabling so a daemon started before the env var lands picks it up. Per-phase rollback: unset env var + reload daemon; on-disk JSONLs are operator's call to keep or delete.]</em></p>
+    <p>The <strong>casual</strong> per-day JSONL under <code>~/.darkmux/flows/</code> is enough for personal record-keeping. The <strong>audit</strong> sink adds BLAKE3 hash-chained append-only records that surface tampering on a daily <code>darkmux flow integrity-check</code> (Phase 4) — the right substrate for any compliance posture (ISO 27001, AI Act, HIPAA-as-covered-entity) and a useful tripwire even for personal use.</p>
+    <div class="callout">
+      <strong>Use the skill, don't re-implement.</strong> The authoritative walkthrough for enabling the audit substrate is the <code>/darkmux-enable-audit</code> Claude Code skill (shipped with darkmux). Invoke it in a Claude Code session on the hub; it'll walk you through the use-case framing, the dir choice, the env-var setup, the first-write verification, and the doctor check. This section captures only the HUB-specific decisions that overlay the skill's defaults.
+    </div>
+
+    <h3>Hub-specific decisions</h3>
+    <ul>
+      <li><strong>Audit dir:</strong> <code>~/.darkmux/audit/</code>. Same FS as <code>~/.darkmux/flows/</code> — simplest backup posture, lives or dies together with the casual sink. If you want the audit chain on a different volume (Time Machine excluded, separate backup, etc.), put it there instead.</li>
+      <li><strong>Env var goes in TWO places:</strong>
+        <ul>
+          <li>The <code>com.darkmux.serve</code> launchd plist's <code>EnvironmentVariables</code> dict (so the daemon writes audit records for its own activity — heartbeats, fleet probes, internal record-keeping).</li>
+          <li>Your <code>~/.zshrc</code> (so interactive <code>darkmux flow note</code>, <code>darkmux crew dispatch</code>, etc. from the hub's shell also write to the audit chain).</li>
+        </ul>
+        Missing either one means a partial audit chain.
+      </li>
+      <li><strong>Reload <code>com.darkmux.serve</code> after the plist edit.</strong> launchd reads env vars at process-start; the running daemon was launched before the audit env var was set. Without a reload the daemon keeps writing only to <code>Tee([LocalFile, Redis])</code> and you've got a silent two-tier sink that looks right in <code>darkmux flow status</code> from your shell but isn't actually capturing the daemon's writes.</li>
+    </ul>
+
+    <h3>Skill walkthrough in one block (for reference; run via Claude Code session)</h3>
+    <pre><code><span class="comment"># Add to ~/.zshrc:</span>
+export DARKMUX_AUDIT_DIR="$HOME/.darkmux/audit"
+
+<span class="comment"># Trigger first write — auto-creates the dir + emits the first hash-chained record.</span>
+source ~/.zshrc
+darkmux flow note --text "audit substrate enable smoke"
+
+<span class="comment"># Verify chain integrity.</span>
+darkmux flow integrity-check                        <span class="comment"># expect: ✓ valid …</span>
+echo "exit=$?"                                       <span class="comment"># expect: exit=0</span>
+
+<span class="comment"># Confirm doctor agrees — and that the sink composition includes AuditFile.</span>
+DARKMUX_AUDIT_DIR="$HOME/.darkmux/audit" darkmux doctor 2>&amp;1 | grep -iE "audit integrity|flow sink"
+<span class="comment"># expect: ✓ audit integrity</span>
+<span class="comment">#         ⚠ or ✓ flow sink health   Tee([AuditFile, LocalFile, Redis])</span>
+
+<span class="comment"># Reload the daemon so it picks up DARKMUX_AUDIT_DIR from the plist.</span>
+launchctl unload -w ~/Library/LaunchAgents/com.darkmux.serve.plist
+launchctl load   -w ~/Library/LaunchAgents/com.darkmux.serve.plist</code></pre>
+
+    <h3>Phase 3 rollback</h3>
+    <pre><code><span class="comment"># Disable audit at the daemon: remove DARKMUX_AUDIT_DIR from plist + reload.</span>
+<span class="comment"># Disable audit interactively: remove DARKMUX_AUDIT_DIR line from ~/.zshrc.</span>
+<span class="comment"># On-disk audit JSONLs under ~/.darkmux/audit/ are your call to keep or delete —</span>
+<span class="comment"># disabling the sink stops new writes but doesn't touch existing files.</span>
+launchctl unload -w ~/Library/LaunchAgents/com.darkmux.serve.plist
+<span class="comment"># edit plist to remove DARKMUX_AUDIT_DIR key</span>
+launchctl load   -w ~/Library/LaunchAgents/com.darkmux.serve.plist</code></pre>
+    <p><strong>Linux substitution:</strong> the audit substrate is POSIX-only by design — uses <code>flock(2)</code> for cross-process safety. Same env var, same skill, same integrity check, same exit codes. Only the path conventions differ (use <code>~/.local/share/darkmux/audit/</code> or wherever your XDG layout puts it).</p>
   </div>
 </section>
 
 <section id="phase-4">
   <div class="wrap">
     <h2>Phase 4 — Survive at scale</h2>
-    <p><em>[Section to be filled in during execution — Plan steps 12-13. Will cover: log rotation via <code>/etc/newsyslog.d/darkmux.conf</code> rotating <code>serve.out</code> + <code>serve.err</code> weekly Sat 00:00, keep 8, compress; the <strong>Redis-log-can't-share-rotation caveat</strong> (redis-server doesn't reopen fd on SIGHUP — newsyslog rotation orphans the fd silently; manual <code>brew services restart redis</code> a couple times per year is the workaround); daily integrity-check via launchd plist at 04:15 with exit-2 → <code>osascript</code> desktop notification (NOT cron — launchd is the macOS-native pattern); the <strong>flow + audit JSONL grow unbounded</strong> caveat — retention is operator policy, audit retention is part of your compliance posture if any. Per-phase rollback: <code>sudo rm /etc/newsyslog.d/darkmux.conf</code> + <code>launchctl unload</code> the integrity-check plist.]</em></p>
+    <p>Two operational habits the hub needs that the daemon itself doesn't ship: <strong>log rotation</strong> so <code>serve.err</code> doesn't grow forever, and <strong>a daily integrity check</strong> that fires a notification if the audit chain ever breaks.</p>
+
+    <h3>Log rotation via newsyslog</h3>
+    <p>macOS's native rotation system is <code>newsyslog</code>, invoked daily by <code>/System/Library/LaunchDaemons/com.apple.newsyslog.plist</code>. Drop-in configs live under <code>/etc/newsyslog.d/</code>.</p>
+    <p>File: <code>/etc/newsyslog.d/darkmux.conf</code></p>
+    <pre><code><span class="comment"># darkmux serve daemon logs — rotate weekly Saturday 00:00, keep 8, compress</span>
+<span class="comment"># fields: logfilename                              owner:group  mode count size  when    flags</span>
+/Users/&lt;your-user&gt;/Library/Logs/darkmux/serve.out        kain:staff   644  8     *     $W6D0   ZN
+/Users/&lt;your-user&gt;/Library/Logs/darkmux/serve.err        kain:staff   644  8     *     $W6D0   ZN
+/Users/&lt;your-user&gt;/Library/Logs/darkmux/integrity.log    kain:staff   644  8     *     $W6D0   ZN</code></pre>
+    <p>Apply:</p>
+    <pre><code>sudo install -m 644 -o root -g wheel /tmp/darkmux-newsyslog.conf /etc/newsyslog.d/darkmux.conf
+sudo newsyslog -nv | grep -i darkmux
+<span class="comment"># expect three lines, each "will trim at Sat &lt;next-saturday&gt; 00:00:00"</span></code></pre>
+    <div class="callout warn">
+      <strong>Redis log can't share this rotation.</strong> Tempting to add <code>/opt/homebrew/var/log/redis.log</code> to the same file — don't. <code>redis-server</code> doesn't reopen its log fd on SIGHUP; rotating its file mid-process silently orphans the fd and you stop seeing Redis logs without any error. Hub-scale Redis log volume is small (banner + occasional notices); manual <code>brew services restart redis</code> a couple times per year is the practical workaround.
+    </div>
+
+    <h3>Daily integrity-check via launchd</h3>
+    <p>cron works on macOS but launchd is the native choice — it survives reboots, integrates with <code>launchctl</code>, and respects <code>StandardOutPath</code>/<code>StandardErrorPath</code> so the audit findings naturally flow into your log directory.</p>
+    <p>File: <code>~/Library/LaunchAgents/com.darkmux.flow-integrity-check.plist</code></p>
+    <pre><code>&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+&lt;!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"&gt;
+&lt;plist version="1.0"&gt;
+&lt;dict&gt;
+  &lt;key&gt;Label&lt;/key&gt;&lt;string&gt;com.darkmux.flow-integrity-check&lt;/string&gt;
+  &lt;key&gt;ProgramArguments&lt;/key&gt;
+  &lt;array&gt;
+    &lt;string&gt;/bin/zsh&lt;/string&gt;
+    &lt;string&gt;-lc&lt;/string&gt;
+    &lt;string&gt;export DARKMUX_AUDIT_DIR="$HOME/.darkmux/audit"; /Users/&lt;your-user&gt;/.cargo/bin/darkmux flow integrity-check; ec=$?; if [ $ec -eq 2 ]; then /usr/bin/osascript -e 'display notification "darkmux audit chain BROKEN — see ~/Library/Logs/darkmux/integrity.log" with title "darkmux integrity-check"'; fi; exit $ec&lt;/string&gt;
+  &lt;/array&gt;
+  &lt;key&gt;EnvironmentVariables&lt;/key&gt;
+  &lt;dict&gt;
+    &lt;key&gt;HOME&lt;/key&gt;&lt;string&gt;/Users/&lt;your-user&gt;&lt;/string&gt;
+    &lt;key&gt;PATH&lt;/key&gt;&lt;string&gt;/Users/&lt;your-user&gt;/.cargo/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/bin:/usr/sbin:/sbin&lt;/string&gt;
+  &lt;/dict&gt;
+  &lt;key&gt;StartCalendarInterval&lt;/key&gt;
+  &lt;dict&gt;&lt;key&gt;Hour&lt;/key&gt;&lt;integer&gt;4&lt;/integer&gt;&lt;key&gt;Minute&lt;/key&gt;&lt;integer&gt;15&lt;/integer&gt;&lt;/dict&gt;
+  &lt;key&gt;StandardOutPath&lt;/key&gt;&lt;string&gt;/Users/&lt;your-user&gt;/Library/Logs/darkmux/integrity.log&lt;/string&gt;
+  &lt;key&gt;StandardErrorPath&lt;/key&gt;&lt;string&gt;/Users/&lt;your-user&gt;/Library/Logs/darkmux/integrity.log&lt;/string&gt;
+  &lt;key&gt;RunAtLoad&lt;/key&gt;&lt;false/&gt;
+&lt;/dict&gt;
+&lt;/plist&gt;</code></pre>
+    <p>The wrapped shell does the load-bearing exit-2 handling: <code>darkmux flow integrity-check</code> exits 2 only on chain break; that case fires a desktop notification you can't miss. Exit 0 (the happy path) just appends a <code>✓ valid</code> line to <code>integrity.log</code> silently.</p>
+    <p>Load and smoke-test (don't wait until 04:15):</p>
+    <pre><code>plutil -lint ~/Library/LaunchAgents/com.darkmux.flow-integrity-check.plist
+launchctl load -w ~/Library/LaunchAgents/com.darkmux.flow-integrity-check.plist
+launchctl start com.darkmux.flow-integrity-check
+sleep 3
+cat ~/Library/Logs/darkmux/integrity.log    <span class="comment"># expect: ✓ valid …</span></code></pre>
+
+    <h3>Phase 4 rollback</h3>
+    <pre><code>sudo rm /etc/newsyslog.d/darkmux.conf
+launchctl unload -w ~/Library/LaunchAgents/com.darkmux.flow-integrity-check.plist
+rm ~/Library/LaunchAgents/com.darkmux.flow-integrity-check.plist</code></pre>
+    <p><strong>Linux substitution:</strong> swap newsyslog for <code>/etc/logrotate.d/darkmux</code> (same fields, different syntax: <code>weekly rotate 8 compress missingok notifempty</code>); swap the integrity-check launchd plist for a systemd timer (<code>darkmux-integrity.timer</code> + <code>.service</code>, <code>OnCalendar=*-*-* 04:15:00</code>); swap <code>osascript</code> notification for your distro's notify-send (libnotify) or a desktop bus call.</p>
   </div>
 </section>
 
 <section id="phase-5">
   <div class="wrap">
     <h2>Phase 5 — Join satellite machines</h2>
-    <p><em>[Section to be filled in during execution — Plan step 14. Will defer to the <code>/darkmux-add-machine</code> skill as the authoritative walkthrough. Will surface: the keychain-on-each-machine pattern (each satellite stores the Redis password locally; the rc files end up identical except for the hostname); the cross-Tailnet smoke from satellite (<code>darkmux flow note</code> on satellite → verify <code>XLEN</code> incremented on hub + <code>machine_id</code> appears in <code>/flow/&lt;date&gt;</code>); the manual fleet-roster fanout caveat — see <a href="https://github.com/kstrat2001/darkmux/issues/280">#280</a> until cross-roster replication ships, you run <code>darkmux fleet add</code> on EACH machine.]</em></p>
+    <p>The hub is operational and the first peer is the second machine you wire up. This phase is delegated to the <code>/darkmux-add-machine</code> Claude Code skill (also see <a href="fleet.html">fleet → Add a new machine to an existing fleet</a> for the fleet-roster context). Per the operator-sovereignty principle, the skill is read-and-propose — it surfaces decisions and you run the commands.</p>
+
+    <h3>Hub-specific overlays on the skill walkthrough</h3>
+    <ul>
+      <li><strong>Each satellite stores the Redis password in its own keychain.</strong> Same service name (<code>darkmux-redis</code>), same password, different machine — the rc files end up identical across machines except for which hostname the URL points at.
+        <pre><code><span class="comment"># On the satellite, once:</span>
+security add-generic-password -a "$USER" -s darkmux-redis -w
+<span class="comment"># prompts for the password — paste the same one as the hub</span></code></pre>
+      </li>
+      <li><strong>The satellite's <code>~/.zshrc</code> mirrors the hub's pattern, but the Redis URL points at the hub's tailnet address:</strong>
+        <pre><code>export DARKMUX_MACHINE_ID=&lt;satellite-id&gt;
+DARKMUX_REDIS_PASS="$(security find-generic-password -a "$USER" -s darkmux-redis -w 2>/dev/null)"
+export DARKMUX_REDIS_URL="redis://:${DARKMUX_REDIS_PASS}@&lt;hub-tailnet-addr&gt;:6379"
+unset DARKMUX_REDIS_PASS
+export DARKMUX_ORCHESTRATOR=claude-opus-4-7
+<span class="comment"># Optional: enable audit on the satellite too if you want full-chain coverage:</span>
+export DARKMUX_AUDIT_DIR="$HOME/.darkmux/audit"</code></pre>
+      </li>
+      <li><strong>Cross-network smoke from the satellite proves end-to-end:</strong>
+        <pre><code><span class="comment"># On the satellite:</span>
+source ~/.zshrc
+darkmux doctor 2>&amp;1 | grep -E "machine_id|flow sink health"
+darkmux flow note --text "hello from &lt;satellite-id&gt;"
+
+<span class="comment"># On the hub — verify Redis XLEN incremented and the satellite's id appears:</span>
+DARKMUX_REDIS_PASS=$(security find-generic-password -a "$USER" -s darkmux-redis -w)
+redis-cli -h 127.0.0.1 -a "$DARKMUX_REDIS_PASS" --no-auth-warning XLEN darkmux:flow
+curl -s http://127.0.0.1:8765/flow/$(date +%F) | grep machine_id | head</code></pre>
+      </li>
+      <li><strong>Fleet roster fanout is manual until <a href="https://github.com/kstrat2001/darkmux/issues/280">#280</a> ships.</strong> Today, each machine's <code>~/.darkmux/fleet.json</code> is local — adding a satellite means updating BOTH machines' rosters:
+        <pre><code><span class="comment"># On the hub:</span>
+darkmux fleet add &lt;satellite-id&gt; --address &lt;satellite-tailnet-addr&gt;:8765
+
+<span class="comment"># On the satellite:</span>
+darkmux fleet add &lt;hub-id&gt; --address &lt;hub-tailnet-addr&gt;:8765
+darkmux fleet status</code></pre>
+      </li>
+      <li><strong>Should the satellite also run <code>darkmux serve</code> under launchd?</strong> Operator's call. If yes, repeat Phase 2 on the satellite (the plist is identical except for the machine_id). If you just want the satellite to write flow records cross-tailnet without exposing its own daemon, you can run <code>darkmux serve</code> only when you actively need its viewer endpoint.</li>
+    </ul>
   </div>
 </section>
 
 <section>
   <div class="wrap">
     <h2>End-to-end verification</h2>
-    <p>After all five phases, the load-bearing test is <strong>reboot the hub and confirm everything comes back unaided</strong>.</p>
-    <p><em>[Verification commands to be filled in during execution — Plan's seven-check final block: <code>launchctl list | grep -E 'redis|darkmux'</code>, <code>darkmux doctor</code>, satellite-side <code>darkmux flow note</code> + <code>curl</code> hit on hub, KeepAlive smoke (kill <code>darkmux serve</code> → expect new PID after ThrottleInterval), integrity.log timestamped today.]</em></p>
+    <p>After all five phases, the load-bearing test is <strong>reboot the hub and confirm everything comes back unaided</strong>. Don't skip this — KeepAlive and "starts on boot" are two different guarantees, and only a real reboot exercises both.</p>
+    <pre><code>sudo shutdown -r now
+<span class="comment"># Log back in once the machine reboots, then:</span>
+
+<span class="comment"># 1) Confirm both services came up at boot via launchd</span>
+launchctl list | grep -E 'redis|darkmux'
+<span class="comment"># expect: homebrew.mxcl.redis, com.darkmux.serve, com.darkmux.flow-integrity-check</span>
+
+<span class="comment"># 2) Doctor green on the load-bearing checks</span>
+darkmux doctor
+<span class="comment"># expect ✓ on: daemon reachable, machine_id, orchestrator, audit integrity</span>
+<span class="comment"># expect ⚠ on: anything you've left out-of-scope (models loaded if you haven't</span>
+<span class="comment">#   swapped a profile yet, recommendation drift if your hardware tier is unbaked, etc.)</span>
+
+<span class="comment"># 3) Cross-network write from a satellite</span>
+<span class="comment"># (on a peer:)</span>
+darkmux flow note --text "post-reboot satellite smoke $(date +%s)"
+
+<span class="comment"># 4) Cross-network read from the satellite via the hub's daemon</span>
+<span class="comment"># (still on the peer:)</span>
+curl -s http://&lt;hub-tailnet-addr&gt;:8765/flow/$(date +%F) | grep "satellite smoke"
+<span class="comment"># expect: a hit on the line you just wrote</span>
+
+<span class="comment"># 5) KeepAlive smoke — kill serve, expect a new PID after ThrottleInterval</span>
+PID=$(launchctl list | awk '/com.darkmux.serve/ {print $1}')
+kill -TERM "$PID"
+sleep 14
+launchctl list | grep com.darkmux.serve
+<span class="comment"># expect: a NEW pid (proves auto-recovery happened)</span>
+
+<span class="comment"># 6) Integrity-check fired since boot (or fire it manually to verify the path)</span>
+ls -la ~/Library/Logs/darkmux/integrity.log
+<span class="comment"># expect: timestamped today; tail shows ✓ valid</span>
+
+<span class="comment"># 7) Redis XLEN includes the new satellite-smoke records</span>
+DARKMUX_REDIS_PASS=$(security find-generic-password -a "$USER" -s darkmux-redis -w)
+redis-cli -h 127.0.0.1 -a "$DARKMUX_REDIS_PASS" --no-auth-warning XLEN darkmux:flow
+<span class="comment"># expect: a number higher than your pre-reboot baseline</span></code></pre>
+    <p>All seven pass → the hub is operational. Document the rollback paths somewhere you can find them (a personal runbook, a sticky note, the rollback sections of this page) in case you need to undo any phase later.</p>
   </div>
 </section>
 
