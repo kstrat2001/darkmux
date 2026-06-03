@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Always-on hub operations · darkmux user guide</title>
+<meta name="description" content="Turn one machine into a stable, secure 24/7 darkmux hub: Redis persistence, daemon under launchd, audit substrate, log rotation, daily integrity checks.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <div class="wrap">
+    <a href="../" class="brand">darkmux</a>
+    <span class="crumbs"><span>/</span> guide <span>/</span> always-on hub</span>
+    <div class="links">
+      <a href="index.html">Guide</a>
+      <a href="fleet.html">Fleet</a>
+      <a href="https://github.com/kstrat2001/darkmux">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<header class="page-head">
+  <div class="wrap">
+    <div class="label">user guide <span class="dot">·</span> 06 · operations</div>
+    <h1>Always-on hub operations</h1>
+    <p class="lede">A walkthrough for turning one machine into the stable, secure 24/7 hub other machines on your tailnet rely on. Sibling to <a href="fleet.html">fleet</a> — that page tells you what a fleet looks like; this page tells you how to make the hub at the center of it survive crashes, reboots, and weeks of operator absence.</p>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <h2>Who this page is for</h2>
+    <p>You've already done <a href="getting-started.html">getting started</a> on at least one machine, and read <a href="fleet.html">fleet</a> well enough to know you want a multi-machine setup. You have one always-on machine — a Mac mini, a Mac Studio, a Linux box in a closet — that's going to be the coordinator. This page is the deep operational walkthrough for hardening THAT machine specifically: the one other machines depend on.</p>
+    <p>If you only have one machine and you're staying single-machine, you don't need this page. The casual <code>darkmux serve</code> + <code>brew services start redis</code> path from the fleet page is enough.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>What you'll have at the end</h2>
+    <ul>
+      <li>Redis bound to the hub, password-protected, AOF-persistent, auto-starting at boot</li>
+      <li><code>darkmux serve</code> running as an OS-managed service with auto-restart on crash</li>
+      <li>The audit substrate enabled with daily integrity checks and a desktop notification on chain break</li>
+      <li>Logs that rotate weekly</li>
+      <li>A clear rollback path for every phase, in case something later turns out to be wrong</li>
+    </ul>
+    <p>The hub itself is one machine, but the discipline matters because other machines will start depending on it. A flaky hub means flaky fleet, no matter how stable the satellites are.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Before you start</h2>
+    <ul>
+      <li>An always-on machine (the hub) with the OS basics already hardened — sleep disabled, auto-login enabled, mesh-VPN (Tailscale recommended) set to "Run at login". Cover this from <a href="fleet.html#harden">fleet → Harden your hub</a> first if you haven't.</li>
+      <li>A private network reaching the hub from your other machines. Tailscale is what this guide assumes; WireGuard, ZeroTier, plain LAN all work the same.</li>
+      <li>Homebrew (macOS) or apt/dnf (Linux) for installing Redis.</li>
+      <li>darkmux installed, on a version that ships <code>darkmux fleet</code> (run <code>darkmux fleet --help</code> to confirm — if it errors, upgrade with <code>cargo install --path . --force</code>).</li>
+    </ul>
+    <div class="callout">
+      <strong>macOS vs Linux:</strong> this guide uses launchd and newsyslog, which are macOS-native. Linux operators substitute systemd units for launchd plists, logrotate for newsyslog, and your distro's secret store (keyring, libsecret) for the macOS Keychain. The decisions and the verification steps are the same; only the file formats change.
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>One decision before you start: should the hub also serve viewers cross-network?</h2>
+    <p>Two postures:</p>
+    <ul>
+      <li><strong>Substrate-only</strong> (this guide's default) — the daemon binds <code>127.0.0.1:8765</code>. Redis carries the cross-machine data; viewers load on the hub itself, or on satellites via their own local daemon. Simplest, safest. <strong>Recommended starting posture.</strong></li>
+      <li><strong>Substrate + viewer</strong> — daemon binds the private-network address; you add a CORS allowlist for the viewer origin. Slightly more attack surface, but you can open the bundled topology viewer at <code>http://&lt;hub-tailnet-addr&gt;:8765/</code> from a browser on any peer.</li>
+    </ul>
+    <p>You can start substrate-only and upgrade later — see the <a href="#upgrade-viewer">upgrade-to-viewer section</a> at the bottom of this page.</p>
+  </div>
+</section>
+
+<section id="phase-1">
+  <div class="wrap">
+    <h2>Phase 1 — Harden Redis</h2>
+    <p><em>[Section to be filled in during execution — Plan steps 5-7. Will cover: AOF persistence (<code>appendonly yes</code>, <code>appendfsync everysec</code>), memory cap (<code>maxmemory 4gb</code>, <code>noeviction</code>), bind decision (keep <code>0.0.0.0</code> + <code>protected-mode yes</code> + <code>requirepass</code>; not dual-bind), password storage in macOS Keychain (<code>security add-generic-password</code>), cross-Tailnet smoke from a peer with <code>nc</code> + <code>redis-cli PING</code>, Tailscale ACL guidance for when a third device joins. Per-phase rollback: restore <code>redis.conf</code> backup + <code>CONFIG SET appendonly no</code> + <code>brew services restart redis</code>.]</em></p>
+  </div>
+</section>
+
+<section id="phase-2">
+  <div class="wrap">
+    <h2>Phase 2 — Run darkmux serve as a launchd service</h2>
+    <p><em>[Section to be filled in during execution — Plan steps 8-10. Will cover: path decisions (<code>~/Library/Logs/darkmux/</code> for logs, <code>com.darkmux.serve</code> label), the Keychain pre-grant gotcha (run <code>security find-generic-password</code> interactively once and click "Always Allow" BEFORE loading the plist or KeepAlive loops on hidden GUI prompt), the full plist with <code>/bin/zsh -lc</code> wrapper that reads Redis password from Keychain at process-start so the URL never lives in the plist file, env vars the daemon must inherit (<code>DARKMUX_MACHINE_ID</code>, <code>DARKMUX_ORCHESTRATOR</code>, <code>DARKMUX_AUDIT_DIR</code>, <code>DARKMUX_FLOWS_DIR</code>, <code>DARKMUX_REDIS_STREAM</code>, <code>DARKMUX_REDIS_MAXLEN</code>), KeepAlive smoke (kill TERM → expect new PID), fleet roster registration via <code>darkmux fleet add &lt;machine-id&gt; --address 127.0.0.1:8765</code>. Per-phase rollback: <code>launchctl unload</code> + <code>rm</code> plist.]</em></p>
+  </div>
+</section>
+
+<section id="phase-3">
+  <div class="wrap">
+    <h2>Phase 3 — Enable the audit substrate</h2>
+    <p><em>[Section to be filled in during execution — Plan step 11. Will defer to the <code>/darkmux-enable-audit</code> skill as the authoritative walkthrough (don't duplicate). Will surface the hub-specific decisions: pick <code>~/.darkmux/audit/</code> as the audit dir, put <code>DARKMUX_AUDIT_DIR</code> in BOTH the launchd plist (so the daemon writes audit records) AND <code>~/.zshrc</code> (so interactive <code>darkmux flow note</code> writes them too), reload <code>com.darkmux.serve</code> after enabling so a daemon started before the env var lands picks it up. Per-phase rollback: unset env var + reload daemon; on-disk JSONLs are operator's call to keep or delete.]</em></p>
+  </div>
+</section>
+
+<section id="phase-4">
+  <div class="wrap">
+    <h2>Phase 4 — Survive at scale</h2>
+    <p><em>[Section to be filled in during execution — Plan steps 12-13. Will cover: log rotation via <code>/etc/newsyslog.d/darkmux.conf</code> rotating <code>serve.out</code> + <code>serve.err</code> weekly Sat 00:00, keep 8, compress; the <strong>Redis-log-can't-share-rotation caveat</strong> (redis-server doesn't reopen fd on SIGHUP — newsyslog rotation orphans the fd silently; manual <code>brew services restart redis</code> a couple times per year is the workaround); daily integrity-check via launchd plist at 04:15 with exit-2 → <code>osascript</code> desktop notification (NOT cron — launchd is the macOS-native pattern); the <strong>flow + audit JSONL grow unbounded</strong> caveat — retention is operator policy, audit retention is part of your compliance posture if any. Per-phase rollback: <code>sudo rm /etc/newsyslog.d/darkmux.conf</code> + <code>launchctl unload</code> the integrity-check plist.]</em></p>
+  </div>
+</section>
+
+<section id="phase-5">
+  <div class="wrap">
+    <h2>Phase 5 — Join satellite machines</h2>
+    <p><em>[Section to be filled in during execution — Plan step 14. Will defer to the <code>/darkmux-add-machine</code> skill as the authoritative walkthrough. Will surface: the keychain-on-each-machine pattern (each satellite stores the Redis password locally; the rc files end up identical except for the hostname); the cross-Tailnet smoke from satellite (<code>darkmux flow note</code> on satellite → verify <code>XLEN</code> incremented on hub + <code>machine_id</code> appears in <code>/flow/&lt;date&gt;</code>); the manual fleet-roster fanout caveat — see <a href="https://github.com/kstrat2001/darkmux/issues/280">#280</a> until cross-roster replication ships, you run <code>darkmux fleet add</code> on EACH machine.]</em></p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>End-to-end verification</h2>
+    <p>After all five phases, the load-bearing test is <strong>reboot the hub and confirm everything comes back unaided</strong>.</p>
+    <p><em>[Verification commands to be filled in during execution — Plan's seven-check final block: <code>launchctl list | grep -E 'redis|darkmux'</code>, <code>darkmux doctor</code>, satellite-side <code>darkmux flow note</code> + <code>curl</code> hit on hub, KeepAlive smoke (kill <code>darkmux serve</code> → expect new PID after ThrottleInterval), integrity.log timestamped today.]</em></p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>What this guide does NOT solve for you</h2>
+    <ul>
+      <li><strong>Flow + audit JSONL retention.</strong> Files grow per-day, indefinitely. Casual retention is operator policy (a quarterly find-and-delete is fine for most setups); audit retention is part of your compliance posture if you have one.</li>
+      <li><strong>Hub hardware fault tolerance.</strong> One physical machine. If the disk dies, the AOF is gone — but the satellites' local <code>~/.darkmux/flows/</code> sinks survive independently, so per-machine history is preserved on every satellite. The hub is the coordination point, not the source of truth.</li>
+      <li><strong>Cross-roster replication.</strong> <a href="https://github.com/kstrat2001/darkmux/issues/280">#280</a> is the issue. Today, each machine's <code>~/.darkmux/fleet.json</code> is hand-maintained; adding the Nth machine means N <code>fleet add</code> commands.</li>
+      <li><strong><code>/darkmux-enable-redis</code> skill.</strong> <a href="https://github.com/kstrat2001/darkmux/issues/178">#178</a>. Once it ships, the Phase 1 manual Redis-hardening steps in this guide are replaced by a guided read-and-propose walkthrough.</li>
+      <li><strong>Fleet primitives expansion.</strong> <a href="https://github.com/kstrat2001/darkmux/issues/162">#162</a> Phase 5 — more <code>darkmux fleet</code> verbs for routing, tier-aware dispatch, etc.</li>
+    </ul>
+  </div>
+</section>
+
+<section id="upgrade-viewer">
+  <div class="wrap">
+    <h2>Upgrading to substrate + viewer later</h2>
+    <p>If you decided substrate-only at the start and now want the bundled topology viewer reachable from any peer's browser pointed at the hub, it's a two-line change to the <code>com.darkmux.serve</code> plist:</p>
+    <ol>
+      <li>Change <code>--bind 127.0.0.1</code> to <code>--bind 0.0.0.0</code> in the <code>ProgramArguments</code> exec line.</li>
+      <li>Add <code>DARKMUX_DAEMON_CORS_ORIGINS=http://&lt;hub-tailnet-addr&gt;:8765</code> to the <code>EnvironmentVariables</code> dict.</li>
+    </ol>
+    <p>Then <code>launchctl unload</code> + <code>launchctl load</code> the plist. The daemon now serves to the tailnet with CORS for that origin only; Redis stays at <code>requirepass</code>, the audit substrate stays on, everything else is unchanged.</p>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <p class="muted">Next: <a href="fleet.html">fleet — many machines become one</a> for the multi-machine model and the <code>/darkmux-add-machine</code> walkthrough.</p>
+    <p class="muted" style="margin-top: 6px;">Source of truth for what's modeled and what's roadmap: <a href="https://github.com/kstrat2001/darkmux/blob/main/docs/architecture/CONCEPTS.md">concepts reference</a>.</p>
+  </div>
+</footer>
+
+</body>
+</html>
