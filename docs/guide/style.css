@@ -284,3 +284,64 @@ footer {
 footer .wrap { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 16px; }
 footer a { color: var(--muted); }
 footer a:hover { color: var(--accent); }
+
+/* ---- Mobile responsive — #635 phase 1 -----------------------------
+   The guide CSS is already partially responsive (TOC uses
+   `grid-template-columns: repeat(auto-fill, minmax(280px, 1fr))`; topnav
+   `.wrap` has `flex-wrap: wrap`; `pre` has `overflow-x: auto`; `h1`
+   uses `clamp()`). What's left are density/spacing concerns: section
+   vertical padding is generous, the prev/next page-nav goes side-by-
+   side on narrow viewports, lede font size is fixed at 19px regardless
+   of width.
+
+   This block targets phone-class viewports (~640px and below) and
+   tightens spacing, stacks the page-nav vertically, and makes tables
+   horizontally scrollable inside their container so wide env-var
+   tables in the always-on-hub guide don't overflow the viewport. */
+@media (max-width: 640px) {
+  .wrap { padding: 0 18px; }
+
+  /* Header tightens vertically but keeps the clamped h1 shape */
+  .page-head { padding: 36px 0 24px; }
+  .page-head .lede { font-size: 17px; }
+
+  /* Body density */
+  body { font-size: 15px; }
+  section { padding: 32px 0; }
+  h3 { font-size: 19px; margin: 24px 0 10px; }
+  h4 { font-size: 16px; margin: 20px 0 8px; }
+
+  /* Code block padding shrinks; line still scrolls horizontally for
+     long commands via the desktop overflow-x rule */
+  pre { padding: 12px 14px; font-size: 13px; }
+
+  /* TOC cards already grid-auto-fill at 280px; tighten gap so they
+     don't feel airy when stacked single-column */
+  .toc { gap: 12px; }
+  .toc a { padding: 14px 16px; }
+  .toc a .title { font-size: 16px; }
+
+  /* Tables scroll horizontally as a unit rather than overflow the
+     viewport. The real <table> elements live in getting-started,
+     missions, and observability (2-3 columns); always-on-hub's env-var
+     content is <pre><code>, already handled by the desktop
+     pre{overflow-x:auto} rule. */
+  table {
+    display: block;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    font-size: 14px;
+  }
+
+  /* Prev/next page-nav stacks; otherwise both cards squeeze to ~140px
+     and the titles wrap awkwardly */
+  .page-nav { flex-direction: column; gap: 12px; padding: 24px 0 48px; }
+  .page-nav a { max-width: none; }
+  .page-nav .next { text-align: left; margin-left: 0; }
+
+  /* Topnav already wraps; tighten visual weight */
+  .topnav { padding: 14px 0; }
+  .topnav .links { gap: 12px; font-size: 13px; }
+
+  footer { padding: 24px 0 36px; }
+}

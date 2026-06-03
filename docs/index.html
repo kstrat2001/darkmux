@@ -179,6 +179,24 @@
   }
   footer a { color: var(--muted); }
   footer a:hover { color: var(--accent); }
+
+  /* ---- Mobile responsive — #635 phase 1 ---------------------------
+     The landing page is already partially responsive (h1 uses clamp(),
+     .btns + footer .row both flex-wrap, .install has overflow-x).
+     Remaining gaps are density: hero vertical padding is 96px+64px on
+     desktop and feels enormous on a phone, section padding is 64px on
+     both sides, tag font is fixed at 20px regardless of width. */
+  @media (max-width: 640px) {
+    .wrap { padding: 0 18px; }
+    header { padding: 56px 0 40px; }
+    .tag { font-size: 17px; }
+    section { padding: 36px 0; }
+    h3 { font-size: 20px; }
+    .install { padding: 12px 14px; font-size: 13px; }
+    .btn { padding: 10px 14px; }
+    ul.plain li { padding: 12px 0; }
+    footer { padding: 24px 0 36px; }
+  }
 </style>
 </head>
 <body>
