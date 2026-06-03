@@ -10,8 +10,10 @@
 //!
 //! # Schema versioning
 //!
-//! `RULES_SCHEMA_VERSION` is semver and ships in the `meta` row of
-//! `instruments.jsonl` so the viewer can detect compatibility on file drop.
+//! `RULES_SCHEMA_VERSION` is semver and ships in the rules `meta` payload
+//! the viewer consumes, so it can detect compatibility. (The standalone
+//! `instruments.jsonl` sidecar that used to carry it was retired in #557;
+//! the payload's transport is migrating to the flow telemetry stream.)
 //! Bump rules:
 //!
 //! - **patch** — bug fix, message tweak, threshold adjustment that doesn't
@@ -27,14 +29,14 @@
 //! # DRY architecture
 //!
 //! Rule **metadata** (id, name, kind, message_template, fix_hint) lives
-//! here as the single source of truth. The CLI emits the metadata into
-//! `instruments.jsonl`; the viewer renders findings using the metadata it
-//! reads from the file, not from a duplicated JS copy.
+//! here as the single source of truth. The CLI emits the metadata in the
+//! rules `meta` payload; the viewer renders findings using that metadata,
+//! not a duplicated JS copy.
 //!
 //! Rule **evaluation** is per-side: Rust evaluators here read config files
 //! and `lms ps`; the viewer's JS evaluates the live-applicable subset
-//! against streaming samples in `instruments.jsonl`. Different input data
-//! shapes — same logical rules.
+//! against the telemetry it reads from the flow stream. Different input
+//! data shapes — same logical rules.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -104,9 +106,9 @@ pub enum Severity {
     Fail,
 }
 
-/// Definition of a single rule. Cloned into the meta row of
-/// `instruments.jsonl` so the viewer renders findings with the same
-/// labels/messages without duplicating string literals.
+/// Definition of a single rule. Cloned into the rules `meta` payload the
+/// viewer consumes, so it renders findings with the same labels/messages
+/// without duplicating string literals.
 ///
 /// String fields are owned (`String`) rather than `&'static str` so the
 /// type round-trips cleanly through serde (the viewer never deserializes
@@ -335,8 +337,8 @@ pub enum Verdict {
     /// payload is the JIT-load hint. See issue #101.
     ///
     /// Rust-internal today. When issue #11 lands and verdicts start
-    /// shipping to `instruments.jsonl`, this variant becomes part of the
-    /// wire format and the `RULES_SCHEMA_VERSION` contract gates that bump.
+    /// shipping on the flow telemetry stream, this variant becomes part of
+    /// the wire format and the `RULES_SCHEMA_VERSION` contract gates that bump.
     PassWith(String),
     /// Rule fired. Message describes the specific finding; severity comes
     /// from the rule def by default but may be downgraded at runtime.
@@ -774,9 +776,9 @@ pub fn parse_size_gb(s: &str) -> Option<f64> {
     }
 }
 
-/// JSON-serializable view of the active rule set, embedded in the meta
-/// row of `instruments.jsonl`. The viewer reads this on file drop to
-/// drive its Anomalies panel rendering.
+/// JSON-serializable view of the active rule set, carried in the rules
+/// `meta` payload the viewer consumes to drive its Anomalies panel
+/// rendering. (Transport migrating to the flow telemetry stream, #557.)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RulesPayload {
     pub schema_version: String,
@@ -792,7 +794,7 @@ impl RulesPayload {
     }
 
     /// Wrap into the canonical `{rules_schema_version, rules: [...]}` JSON
-    /// shape for embedding in instruments.jsonl meta payload.
+    /// shape for embedding in the rules `meta` payload.
     pub fn as_meta_fields(&self) -> Result<serde_json::Map<String, serde_json::Value>> {
         let mut out = serde_json::Map::new();
         out.insert(

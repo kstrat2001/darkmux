@@ -179,7 +179,7 @@ git pull
 cargo install --path . --force
 ```
 
-The `--force` flag tells cargo to replace the existing binary even when the source path or version metadata hasn't changed. Without it, cargo can silently skip the reinstall and leave you running an older binary while reporting the same `darkmux --version`. If a new feature (like `--instrument`) is missing despite a fresh `git pull`, that's the most likely cause — re-run with `--force`.
+The `--force` flag tells cargo to replace the existing binary even when the source path or version metadata hasn't changed. Without it, cargo can silently skip the reinstall and leave you running an older binary while reporting the same `darkmux --version`. If a new feature (like `lab register`) is missing despite a fresh `git pull`, that's the most likely cause — re-run with `--force`.
 
 ## Why this exists
 
@@ -311,38 +311,11 @@ darkmux notebook list --machine m5-home  # only this machine's entries
 
 ## Instrumentation
 
-`lab run --instrument` captures cross-layer telemetry alongside each dispatch — what LMStudio actually had loaded, where the gateway process sat across the run, and any anomalies (PID changes during active dispatch, loaded-model-set shifts, missing samplers). No root required.
+Cross-layer telemetry is always-on (#557) — no flag, no sidecar file. The internal runtime and crew dispatch emit it as `category=telemetry` flow records on the flow stream (sources: `lms`, `process`, `detector`, `runtime`, `context`, `compaction`), capturing what LMStudio actually had loaded, where the runtime process sat across the run, detector signals, and compaction events.
 
-```bash
-darkmux lab run long-agentic --instrument
-```
-
-The flag adds a sidecar sampler that writes one JSON record per line to `~/.darkmux/runs/<run-id>/instruments.jsonl`. Each line has the shape:
-
-```json
-{"t": 1778466601846, "elapsed_ms": 0, "source": "meta", "payload": {...}}
-```
-
-Three sources:
-
-- **`meta`** — sampler lifecycle events (start, cadence, version)
-- **`lms`** — LMStudio's loaded-model snapshot from `lms ps --json` (identifier, context, status per model)
-- **`process`** — gateway-process residency from `ps -p`: PID, port, CPU%, RSS
-
-### Viewer
-
-The companion viewer at [darkmux.com/viewer](https://darkmux.com/viewer/) replays a captured run as a four-block topology you can scrub through.
+View it in the observability viewer the daemon serves: run `darkmux serve` and open `http://localhost:8765/`. The viewer reads live flow records straight from the daemon — there's nothing to drag and drop. A demo instance lives at [darkmux.com/demo](https://darkmux.com/demo).
 
 ![darkmux viewer mid-replay — qwen3.6-35b primary processing a prompt, qwen3-4b compactor idle. Claude → OpenClaw Gateway → LMStudio backbone runs left-to-right; model nodes branch off the right edge.](docs/media/viewer-active-model.png)
-
-Drag your `instruments.jsonl` file onto the window. The topology renders:
-
-- **Agent client** → **OpenClaw Gateway** → **LMStudio** runs left-to-right
-- Loaded models branch off the right edge as separate nodes
-- Edges fire as request/response samples come in — active model gets cyan-dashed edges, idle models stay grey
-- The Anomalies panel surfaces inconsistencies (gateway PID changed during active dispatch, loaded-model set shifted mid-run, samples missing) — usually leading indicators of a misconfiguration worth investigating
-
-The viewer is a static page served from this repo's `docs/` folder. **Nothing is uploaded.** Your `instruments.jsonl` is parsed entirely in the browser. No backend, no telemetry on the telemetry.
 
 ## Why this exists — empirical motivation
 
@@ -362,7 +335,7 @@ The case for darkmux: **once you accept that static configs leave performance on
 **Shipped:**
 
 - ✅ Profile registry + `swap`/`status`/`profiles`/`scan` CLI
-- ✅ Lab subcommands (`run`/`inspect`/`compare`/`characterize`/`tune`/`runs`), `WorkloadProvider` trait, embedded smoke workloads, `--instrument` sidecar sampler
+- ✅ Lab subcommands (`run`/`inspect`/`compare`/`characterize`/`tune`/`runs`), `WorkloadProvider` trait, embedded smoke workloads, always-on cross-layer flow telemetry (#557)
 - ✅ Lab reproducibility (#487): per-run copy-on-write sandbox isolation (source never mutated), `baseline_hash` + `final_hash` content hashing in the run manifest, a fixture registry with `lab register`/`unregister`/`fixtures`/`doctor` verbs, workload `requires_fixture` resolution, and `scripts/lab-init.sh` + the built-in `demo-tiny-py` fixture
 - ✅ Notebook (`notebook draft`/`list`) — cross-machine via `DARKMUX_NOTEBOOK_DIR`
 - ✅ Agent-invocable skills bundle (12 skills including `/darkmux-bootstrap`)
