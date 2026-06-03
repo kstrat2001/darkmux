@@ -45,16 +45,19 @@ fn is_valid_date(date: &str) -> Option<&str> {
 /// Because the daemon and the viewer share an origin, the viewer's
 /// same-origin `fetch('/flow/:date')` calls are CORS- and
 /// mixed-content-free **by construction** — that's the structural fix
-/// behind #554, not a CORS allowlist. The HTML is the same drill viewer
-/// published as the darkmux.com demo, embedded via `include_str!` so the
-/// daemon binary is self-contained (no asset dir to ship). On the website
-/// the viewer falls back to its bundled sample fixture; served here it
-/// fetches the daemon's real flow records.
+/// behind #554, not a CORS allowlist. The HTML is embedded via
+/// `include_str!` so the daemon binary is self-contained (no asset dir to
+/// ship).
+///
+/// The daemon serves the LIVE viewer (`docs/viewer/index.html`) — no
+/// embedded sample fixture, never falls back to demo content. Per #624,
+/// the demo with bundled sample data and recorded playback scenario lives
+/// at `docs/demo/index.html` and is served by `darkmux.com/demo`.
 async fn root_html() -> impl IntoResponse {
     (
         StatusCode::OK,
         [("content-type", "text/html; charset=utf-8")],
-        include_str!("../../../docs/demo/index.html"),
+        include_str!("../../../docs/viewer/index.html"),
     )
 }
 
