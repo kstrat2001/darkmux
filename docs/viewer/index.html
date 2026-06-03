@@ -309,19 +309,65 @@ function renderMachine(){
   const m=state.machine; $("logscope").textContent=m; state.stageScope=r=>r.machine_id===m;
   // Always-loaded utility role — resident on every machine, runs alongside the specialists
   // to handle compaction + other utility-tier tasks (not a per-mission dispatch).
+  // TODO(#624): should read /model/status to surface the actual utility model resident,
+  // not a generic placeholder. Until then, mark it as static UI rather than implying it
+  // reflects live state.
   const util=`<div class="node util"><div class="h">darkmux/utility</div>
     <div class="s">utility tier · always-loaded</div>
     <div class="s">compaction · mission-compile · estimate · scribe</div>
     <span class="pill util">resident</span></div>`;
-  // Specialist roles dispatched on this machine for the active mission
+  // Specialist roles dispatched on this machine. Defensive against missing
+  // dispatch.start records: real flow streams contain telemetry-only sessions,
+  // test-fixture sessions emitting dispatch.tool/turn without a proper
+  // start record, and isolated records that don't fit the dispatch lifecycle.
+  // For each session we render whatever metadata we can recover from the first
+  // visible record on that session, rather than throwing if dispatch.start is
+  // missing (which silently broke the entire machine-detail panel).
   const specs=sessionsOn(m).filter(sid=>visible().some(r=>r.session_id===sid)).map(sid=>{
-    const s=dispatch(sid,"start"), done=dispatch(sid,"complete")&&T(dispatch(sid,"complete").ts)<=state.t;
-    return `<div class="node" onclick="drillSession('${sid}')"><div class="h">${s.handle}</div>
-      <div class="s">specialist role · ${s.model||'?'}</div>
-      <div class="s">session ${sid} · mission ${s.mission_id}</div>
-      <span class="pill ${done?'done':'run'}">${done?'complete':'running'}</span></div>`;}).join("");
-  $("stage").innerHTML=`<div><div class="stagehdr"><a onclick="goFleet()">fleet</a> › machine · ${m} — ${MACH_SPEC[m]||''}</div>
-    <div class="rglbl">crew on ${m}</div>${util}${specs||'<span class="hint">no specialist runs yet at this point in the timeline</span>'}</div>`;
+    const s=dispatch(sid,"start");
+    const c=dispatch(sid,"complete"), done=c&&T(c.ts)<=state.t;
+    if(s){
+      return `<div class="node" onclick="drillSession('${sid}')"><div class="h">${s.handle}</div>
+        <div class="s">specialist role · ${s.model||'?'}</div>
+        <div class="s">session ${sid} · mission ${s.mission_id}</div>
+        <span class="pill ${done?'done':'run'}">${done?'complete':'running'}</span></div>`;
+    }
+    // Fallback: no dispatch.start — pull handle/model/mission from the first
+    // record we have for this session, surface honestly that the lifecycle
+    // wasn't captured here.
+    const first=visible().find(r=>r.session_id===sid)||{};
+    const handle=first.handle||`session ${sid}`;
+    const model=first.model||'?';
+    const mission=first.mission_id?`mission ${first.mission_id}`:'no mission scope';
+    return `<div class="node" onclick="drillSession('${sid}')"><div class="h">${handle}</div>
+      <div class="s">role · ${model}</div>
+      <div class="s">session ${sid} · ${mission}</div>
+      <span class="pill warn">no dispatch.start</span></div>`;
+  }).join("");
+  // Loose records — records on this machine that don't have a session_id and
+  // therefore don't show up in any session card above (flow notes, free-floating
+  // telemetry, anything written outside a dispatch). Surface them as a count
+  // with a click-through so the operator can still inspect them.
+  const loose=visible().filter(r=>r.machine_id===m&&!r.session_id);
+  const looseCard=loose.length
+    ? `<div class="node" onclick="drillLoose('${m}')"><div class="h">unscoped records</div>
+        <div class="s">${loose.length} record${loose.length===1?'':'s'} without a session</div>
+        <div class="s">flow notes, ambient telemetry, etc.</div>
+        <span class="pill">loose</span></div>`
+    : '';
+  $("stage").innerHTML=`<div><div class="stagehdr"><a onclick="goFleet()">fleet</a> › machine · ${m}${MACH_SPEC[m]?' — '+MACH_SPEC[m]:''}</div>
+    <div class="rglbl">crew on ${m}</div>${util}${specs}${looseCard||(specs?'':'<span class="hint">no specialist runs at this point in the timeline</span>')}</div>`;
+}
+// Drill into the loose-records panel (records on a machine that don't have a
+// session_id — e.g. flow notes, ambient telemetry). Scopes the log to those
+// records so the operator can still inspect them.
+function drillLoose(m){
+  state.level="loose"; state.machine=m; state.session=null; state.selected=null;
+  state.stageScope=r=>r.machine_id===m&&!r.session_id;
+  $("logscope").textContent=m+" · loose";
+  $("stage").innerHTML=`<div><div class="stagehdr"><a onclick="goFleet()">fleet</a> › <a onclick="drillMachine('${m}')">${m}</a> › unscoped records</div>
+    <div class="rglbl">${visible().filter(r=>r.machine_id===m&&!r.session_id).length} record(s) without a session — inspect via the log on the right</div></div>`;
+  renderLog();renderMeta();syncTransport();
 }
 function renderSubsystem(){
   const sid=state.session, m=state.machine; $("logscope").textContent=sid; state.stageScope=r=>r.session_id===sid;
