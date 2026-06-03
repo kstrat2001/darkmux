@@ -37,11 +37,13 @@
 # Password constraints:
 #   The Redis password stored in the `darkmux-redis` Keychain item MUST be
 #   URL-safe: alphanumeric + `.~_-` only. No `@`, `:`, `/`, `#`, `?`, `&`,
-#   or other URL-reserved characters. The recommended generator that always
-#   produces a safe password:
+#   whitespace, or other URL-reserved characters. The wrapper validates the
+#   password before constructing the URL and EXITS with status 78
+#   (EX_CONFIG) + an actionable message if it's unsafe — better than the
+#   alternative of emitting a malformed URL that silently fails to connect
+#   under launchd KeepAlive. The recommended generator that always produces
+#   a safe password:
 #     openssl rand -base64 36 | tr -d '/+=' | head -c 48
-#   This wrapper does NOT percent-encode; non-URL-safe passwords will break
-#   the Redis URL parser and the daemon will fail to connect.
 
 set -e
 
@@ -62,6 +64,29 @@ fi
 DARKMUX_REDIS_PASS=$(security find-generic-password -a "$USER" -s darkmux-redis -w 2>/dev/null || true)
 
 if [[ -n "$DARKMUX_REDIS_PASS" ]]; then
+  # Fail loud if the password contains URL-reserved characters that would
+  # silently break the URL parser when embedded in DARKMUX_REDIS_URL. The
+  # wrapper does NOT percent-encode (the redis URL parser handles raw values
+  # for the safe character set inline); for non-safe passwords the operator
+  # must either regenerate (recommended: `openssl rand -base64 36 | tr -d
+  # '/+=' | head -c 48`) or wire in their own URL-encoded form. Better to
+  # fail with a clear message than emit a malformed URL the daemon will
+  # silently fail to connect with.
+  if [[ "$DARKMUX_REDIS_PASS" == *[@:/\#?\&\ ]* ]]; then
+    echo "darkmux-serve-wrapped: Redis password in Keychain item 'darkmux-redis'" >&2
+    echo "  contains URL-reserved characters (one of @ : / # ? & or whitespace)." >&2
+    echo "  These break the redis://: URL parser when embedded raw." >&2
+    echo "  Regenerate a URL-safe password (recommended form below) and update" >&2
+    echo "  the keychain item + Redis requirepass to match, then restart this" >&2
+    echo "  service:" >&2
+    echo "" >&2
+    echo "    PASS=\$(openssl rand -base64 36 | tr -d '/+=' | head -c 48)" >&2
+    echo "    security delete-generic-password -a \"\$USER\" -s darkmux-redis" >&2
+    echo "    security add-generic-password   -a \"\$USER\" -s darkmux-redis -w \"\$PASS\"" >&2
+    echo "    # update redis.conf requirepass with the new value + brew services restart redis" >&2
+    unset DARKMUX_REDIS_PASS
+    exit 78  # EX_CONFIG (sysexits.h) — configuration error
+  fi
   export DARKMUX_REDIS_URL="redis://:${DARKMUX_REDIS_PASS}@127.0.0.1:6379"
   unset DARKMUX_REDIS_PASS
 fi

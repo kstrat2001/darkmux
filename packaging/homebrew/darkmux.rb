@@ -74,6 +74,16 @@ class Darkmux < Formula
     <<~EOS
       darkmux is installed but the `serve` daemon is NOT started by default.
 
+      Scope: this formula ships the `darkmux` CLI + `serve` daemon + the
+      keychain wrapper + bundled skills. It does NOT ship the
+      `darkmux-runtime` Docker image — `darkmux crew dispatch` and
+      `darkmux lab run` need that image, which requires a source checkout +
+      `docker build -t darkmux-runtime:latest runtime/` (a published image
+      is tracked in #618). brew = complete install for `swap` / `status` /
+      `profiles` / `fleet` / `flow` / `serve` / `doctor` and for the hub
+      coordinator role. For local dispatches, supplement with a runtime
+      image from a source checkout.
+
       For a single-machine CLI install (no daemon needed):
         # Already done. Run `darkmux --help` to explore.
 
@@ -104,8 +114,9 @@ class Darkmux < Formula
         4. brew services start darkmux
 
       For the production-grade hub posture — Redis AOF persistence, audit
-      substrate (BLAKE3 hash-chained tamper-evident JSONL), log rotation, and
-      daily integrity checks — see the guide:
+      substrate (BLAKE3 hash-chained JSONL; any post-hoc edit is surfaced by
+      `darkmux flow integrity-check`), log rotation, and daily integrity
+      checks — see the guide:
 
         https://darkmux.com/guide/always-on-hub.html
 

@@ -6,7 +6,7 @@ darkmux is the substrate layer — profiles per role, missions per engagement, a
 
 Built for operators who need to see what their AI fleet did, when, and why.
 
-- 🔒 **Tamper-evident audit trail** — every dispatch, decision, and review captured in a hash-chained per-machine log. Any post-hoc edit to the chain is detectable via `darkmux flow integrity-check`.
+- 🔒 **Hash-chained audit trail with edit detection** — every dispatch, decision, and review captured in a BLAKE3 hash-chained per-machine log; any post-hoc edit to the chain is surfaced by `darkmux flow integrity-check` (exits 2 on chain break, suitable for cron / CI gating).
 - 🤝 **Engagement-aware coordination** — sessions running on different machines share a flow stream, so two Claude Code sessions on two laptops compose into one fleet view rather than two siloed runs.
 - 🎯 **Methodology-driven role specialization** — per-role models selected through documented bake-off methodology; evaluation criteria recorded before the comparison runs.
 - 🔧 **Operator sovereignty by design** — defaults are overridable, writes are auditable, suggestions are explainable.
@@ -106,6 +106,8 @@ brew services start darkmux
 ```
 
 The brew formula installs both the `darkmux` binary AND a keychain-aware wrapper script (`libexec/darkmux-serve-wrapped`) that resolves `DARKMUX_REDIS_URL` from macOS Keychain at process-start, so the Redis password never lives in the launchd plist. See [the always-on hub guide](docs/guide/always-on-hub.html) for the production-grade setup.
+
+**Scope of the brew install.** What you get: the `darkmux` CLI (swap, profiles, status, doctor, fleet, flow, init), the `serve` daemon, the keychain wrapper, and the bundled skills. What you DON'T get: the `darkmux-runtime` Docker image that `darkmux crew dispatch` / `darkmux lab run` need — that requires a `runtime/` source checkout and `docker build` (Option B below), or a published image once one exists ([tracked in #618](https://github.com/kstrat2001/darkmux/issues/618)). The brew path is a complete install for the **hub posture** (coordinator running Redis + serve, no local dispatches) and for the `darkmux swap` / `darkmux status` / `darkmux profiles` flows. For dispatches on this machine, use Option B or supplement the brew install with a runtime image.
 
 **Option B — from source via cargo** (the current working path; also for dev work and contributors):
 
