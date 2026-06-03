@@ -780,6 +780,11 @@ pub(crate) fn record_to(sink: &dyn FlowSink, record: FlowRecord) -> Result<()> {
     if rec.machine_id.is_none() {
         rec.machine_id = resolve_machine_id();
     }
+    if rec.machine_uid.is_none() {
+        // (#640) Stamp the stable hardware identity at write time, like the
+        // machine_id label above. Cached, so the ioreg shell-out runs once.
+        rec.machine_uid = darkmux_hardware::machine_uid().map(str::to_string);
+    }
     if rec.orchestrator.is_none() {
         rec.orchestrator = resolve_orchestrator();
     }
@@ -880,6 +885,7 @@ mod tests {
             reasoning: None,
             mission_id: None,
             machine_id: None,
+            machine_uid: None,
             orchestrator: None,
             prev_hash: None,
             hash: None,
@@ -985,6 +991,7 @@ mod tests {
             reasoning: None,
             mission_id: None,
             machine_id: None,
+            machine_uid: None,
             orchestrator: None,
             prev_hash: None,
             hash: None,
@@ -1027,6 +1034,7 @@ mod tests {
             reasoning: None,
             mission_id: None,
             machine_id: None,
+            machine_uid: None,
             orchestrator: None,
             prev_hash: None,
             hash: None,
@@ -1077,6 +1085,7 @@ mod tests {
             reasoning: None,
             mission_id: None,
             machine_id: None,
+            machine_uid: None,
             orchestrator: None,
             prev_hash: None,
             hash: None,
@@ -1144,6 +1153,7 @@ mod tests {
                 reasoning: None,
                 mission_id: None,
                 machine_id: None,
+                machine_uid: None,
                 orchestrator: None,
                 prev_hash: None,
                 hash: None,
@@ -1190,6 +1200,7 @@ mod tests {
             reasoning: None,
             mission_id: None,
             machine_id: None,
+            machine_uid: None,
             orchestrator: None,
             prev_hash: None,
             hash: None,
@@ -1245,6 +1256,7 @@ mod tests {
             reasoning: None,
             mission_id: None,
             machine_id: None,
+            machine_uid: None,
             orchestrator: None,
             prev_hash: None,
             hash: None,
@@ -1389,6 +1401,7 @@ mod tests {
             reasoning: None,
             mission_id: None,
             machine_id: None,
+            machine_uid: None,
             orchestrator: None,
             prev_hash: None,
             hash: None,
@@ -1461,6 +1474,7 @@ mod tests {
             reasoning: None,
             mission_id: None,
             machine_id: None,
+            machine_uid: None,
             orchestrator: None,
             prev_hash: None,
             hash: None,
@@ -1502,6 +1516,7 @@ mod tests {
             reasoning: None,
             mission_id: None,
             machine_id: None,
+            machine_uid: None,
             orchestrator: None,
             prev_hash: None,
             hash: None,
@@ -1557,6 +1572,7 @@ mod tests {
             reasoning: None,
             mission_id: None,
             machine_id: None,
+            machine_uid: None,
             orchestrator: None,
             prev_hash: None,
             hash: None,
@@ -1600,6 +1616,7 @@ mod tests {
             reasoning: None,
             mission_id: None,
             machine_id: None,
+            machine_uid: None,
             orchestrator: None,
             prev_hash: None,
             hash: None,
@@ -1624,7 +1641,7 @@ mod tests {
     }
 
     #[test]
-    fn flow_schema_version_is_1_10_0() {
+    fn flow_schema_version_is_1_11_0() {
         // Pin the schema version so an accidental rename can't ship silently;
         // any bump beyond this should be a deliberate code change paired with
         // an update to this assertion (and corresponding viewer EXPECTED_*
@@ -1665,7 +1682,9 @@ mod tests {
         //           one flow stream as a first-class family, retiring
         //           instruments.jsonl. Minor + additive — new records only, so
         //           prior AuditFileSink chains survive without rotation.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.10.0");
+        //   1.11.0 — added optional `machine_uid` (#640): the stable hardware
+        //           identity. Minor + additive — new records only, chains survive.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.11.0");
     }
 
     #[test]
@@ -1722,6 +1741,7 @@ mod tests {
             reasoning: None,
             mission_id: None,
             machine_id: None,
+            machine_uid: None,
             orchestrator: None,
             prev_hash: None,
             hash: None,
@@ -1757,6 +1777,7 @@ mod tests {
                 reasoning: None,
                 mission_id: None,
                 machine_id: None,
+                machine_uid: None,
                 orchestrator: None,
                 prev_hash: None,
                 hash: None,
@@ -1938,6 +1959,7 @@ mod tests {
             reasoning: None,
             mission_id: None,
             machine_id: None,
+            machine_uid: None,
             orchestrator: None,
             prev_hash: None,
             hash: None,
@@ -1967,6 +1989,7 @@ mod tests {
             reasoning: None,
             mission_id: None,
             machine_id: Some("studio".to_string()),
+            machine_uid: None,
             orchestrator: Some("claude-opus-4-7".to_string()),
             prev_hash: None,
             hash: None,
@@ -2013,6 +2036,7 @@ mod tests {
             reasoning: None,
             mission_id: None,
             machine_id: None,
+            machine_uid: None,
             orchestrator: None,
             prev_hash: None,
             hash: None,
@@ -2069,6 +2093,7 @@ mod tests {
             reasoning: None,
             mission_id: None,
             machine_id: None,
+            machine_uid: None,
             orchestrator: None,
             prev_hash: Some("seed".to_string()),
             hash: None,
@@ -2102,6 +2127,7 @@ mod tests {
             reasoning: None,
             mission_id: None,
             machine_id: None,
+            machine_uid: None,
             orchestrator: None,
             prev_hash: Some("seed".to_string()),
             hash: None,
@@ -2175,6 +2201,7 @@ mod tests {
                 reasoning: None,
                 mission_id: None,
                 machine_id: None,
+                machine_uid: None,
                 orchestrator: None,
                 prev_hash: None,
                 hash: None,
@@ -2240,6 +2267,7 @@ mod tests {
                 reasoning: None,
                 mission_id: None,
                 machine_id: None,
+                machine_uid: None,
                 orchestrator: None,
                 prev_hash: None, // sink stamps this
                 hash: None,      // sink stamps this
@@ -2289,6 +2317,7 @@ mod tests {
                 reasoning: None,
                 mission_id: None,
                 machine_id: None,
+                machine_uid: None,
                 orchestrator: None,
                 prev_hash: None,
                 hash: None,
@@ -2353,6 +2382,7 @@ mod tests {
             reasoning: None,
             mission_id: None,
             machine_id: None,
+            machine_uid: None,
             orchestrator: None,
             prev_hash: None,
             hash: None,
@@ -2418,6 +2448,7 @@ mod tests {
             reasoning: None,
             mission_id: None,
             machine_id: None,
+            machine_uid: None,
             orchestrator: None,
             prev_hash: None,
             hash: None,
@@ -2651,6 +2682,7 @@ mod tests {
             reasoning: None,
             mission_id: None,
             machine_id: None,
+            machine_uid: None,
             orchestrator: None,
             prev_hash: None,
             hash: None,

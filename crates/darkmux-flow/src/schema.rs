@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.10.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.11.0";
 // Version history:
 //   1.2.0 — added optional `model` (#106)
 //   1.3.0 — added optional `reasoning` + `mission_id`; new Stage::TierDecision (#136)
@@ -58,6 +58,12 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.10.0";
 //           instruments.jsonl sidecar. Minor + additive: older readers ignore
 //           the unknown category; new records only, so prior AuditFileSink
 //           chains survive without rotation (unlike the 1.9.0 field removal).
+//   1.11.0 — added optional `machine_uid` (#640): the stable hardware
+//           identity (IOPlatformUUID), auto-populated at write time. The
+//           canonical machine identity, distinct from the mutable `machine_id`
+//           label. Older records lack it; the viewer treats absence as
+//           *unknown identity* (NOT a fallback to the name). Minor + additive
+//           — new records only, prior AuditFileSink chains survive.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -156,6 +162,15 @@ pub struct FlowRecord {
     /// (#167; substrate for fleet UI).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub machine_id: Option<String>,
+    /// Stable hardware identity of the machine that emitted this record
+    /// (`IOPlatformUUID`, #640) — the canonical machine identity, distinct
+    /// from the mutable `machine_id` label above. Auto-populated at write time
+    /// from `darkmux_hardware::machine_uid()`. `None` off macOS, or on records
+    /// written before 1.11.0; the viewer treats absence as *unknown identity*
+    /// and groups such records under one "unknown" machine — never falling
+    /// back to the (unprovable) name. Schema 1.11 addition.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine_uid: Option<String>,
     /// Frontier orchestrator driving this record's session — e.g.,
     /// `"claude-opus-4-7"`, `"cursor-anthropic"`. Auto-populated from
     /// `DARKMUX_ORCHESTRATOR` env at write time. Operator-explicit by
