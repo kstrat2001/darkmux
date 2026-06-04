@@ -8,6 +8,7 @@
 
 pub mod daemon_probe;
 pub mod presence;
+pub mod presence_reconciler;
 pub mod session_presence;
 
 mod integrity;
