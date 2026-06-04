@@ -330,9 +330,14 @@ const newest=arr=>arr.length?arr.reduce((a,b)=>T(b.ts)>=T(a.ts)?b:a):null;
 // claimed-but-unverified names on the unknown card. Machines group + filter
 // by uid; cards render the name.
 const uidOf=r=>r.machine_uid||"unknown";
-const nameOf=m=>{ if(m==="unknown")return"unknown"; const r=DATA.find(x=>uidOf(x)===m&&x.machine_id); return r?r.machine_id:m; };
-const specOf=m=>{ if(m==="unknown"){ const ns=[...new Set(DATA.filter(r=>uidOf(r)==="unknown"&&r.machine_id).map(r=>r.machine_id))]; return ns.length?"unverified · claimed: "+ns.join(", "):"unidentified (no hardware uid)"; } return MACH_SPEC[nameOf(m)]||''; };
-const machines=()=>[...new Set(DATA.map(uidOf))];
+// (#638) Mirrors the live viewer. LIVE_MACHINES stays EMPTY in this static
+// showcase (no daemon to poll), so nameOf/specOf/machines resolve purely from
+// SAMPLE records here — identical to the prior behavior — while the live viewer
+// drives them off presence heartbeats.
+const LIVE_MACHINES=new Map();
+const nameOf=m=>{ if(m==="unknown")return"unknown"; const r=DATA.find(x=>uidOf(x)===m&&x.machine_id); if(r)return r.machine_id; const b=LIVE_MACHINES.get(m); return b&&b.display_name?b.display_name:m; };
+const specOf=m=>{ if(m==="unknown"){ const ns=[...new Set(DATA.filter(r=>uidOf(r)==="unknown"&&r.machine_id).map(r=>r.machine_id))]; return ns.length?"unverified · claimed: "+ns.join(", "):"unidentified (no hardware uid)"; } const rs=MACH_SPEC[nameOf(m)]; if(rs)return rs; const b=LIVE_MACHINES.get(m); return (b&&b.specs)||''; };
+const machines=()=>[...new Set([...DATA.map(uidOf),...LIVE_MACHINES.keys()])];
 const sessionsOn=m=>[...new Set(DATA.filter(r=>uidOf(r)===m&&r.session_id).map(r=>r.session_id))];
 const dispatch=(sid,act)=>DATA.find(r=>r.session_id===sid&&r.action==="dispatch."+act);
 // (#647) The reconciler-emitted `session.end` close-edge for an abandoned

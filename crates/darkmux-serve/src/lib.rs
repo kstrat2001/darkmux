@@ -130,8 +130,40 @@ pub(crate) fn build_router(flows_dir: PathBuf) -> Router {
         .route("/missions", get(missions_handler))
         .route("/sprints", get(sprints_handler))
         .route("/fleet/sessions/live", get(fleet_sessions_live_handler))
+        .route("/fleet/machines/live", get(fleet_machines_live_handler))
         .layer(local_only_cors())
         .with_state(state)
+}
+
+/// GET /fleet/machines/live — the machines present in the fleet RIGHT NOW
+/// (#638): every unexpired `darkmux:presence:<uid>` beat, fleet-wide across
+/// the shared Redis. **Presence is the source of truth for "who's in the
+/// fleet" — independent of whether a machine has ever emitted a flow
+/// record.** A freshly-synced, idle machine broadcasting its heartbeat shows
+/// here with zero dispatch activity; the live viewer unions this with the
+/// record-derived machines so a present machine appears (and a machine that
+/// stops beating drops off) regardless of work.
+///
+/// Returns `[]` when `DARKMUX_REDIS_URL` is unset or unreachable — a
+/// single-machine, file-only fleet has no shared presence substrate, so the
+/// viewer falls back to record-derived machines. Never 500s on a Redis blip.
+async fn fleet_machines_live_handler() -> impl IntoResponse {
+    let redis_url = std::env::var("DARKMUX_REDIS_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let beats: Vec<darkmux_flow::presence::PresenceBeat> = match redis_url {
+        Some(url) => tokio::task::spawn_blocking(move || {
+            redis::Client::open(url.as_str())
+                .ok()
+                .and_then(|c| darkmux_flow::presence::read_live(&c).ok())
+                .unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    axum::Json(beats)
 }
 
 /// GET /fleet/sessions/live — the sessions with a live heartbeat right now
@@ -1711,6 +1743,29 @@ mod tests {
         let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(body.is_array(), "live-sessions response must be a JSON array");
+    }
+
+    #[tokio::test]
+    async fn fleet_machines_live_returns_json_array() {
+        // GET /fleet/machines/live (#638) — the same robust contract as the
+        // sessions endpoint: always 200 + JSON array (`[]` when Redis is
+        // unset/unreachable, the presence beats when it is). The live viewer
+        // unions this into machines(), so a Redis blip must degrade to "no
+        // live machines", never a 500.
+        let app = build_router(PathBuf::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/fleet/machines/live")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(body.is_array(), "live-machines response must be a JSON array");
     }
 
     #[tokio::test]
