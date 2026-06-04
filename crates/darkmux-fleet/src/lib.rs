@@ -1,16 +1,16 @@
-//! darkmux-fleet — fleet topology, the Redis work queue, the worker loop,
+//! darkmux-fleet — fleet topology, the Redis work queue, the runner loop,
 //! and dispatch routing. Split by concern into the `roster`, `queue`,
-//! `worker`, and `routing` submodules (#508); this file is the crate facade.
+//! `runner`, and `routing` submodules (#508); this file is the crate facade.
 
 mod queue;
 mod roster;
 mod routing;
-mod worker;
+mod runner;
 
 pub use queue::*;
 pub use roster::*;
 pub use routing::*;
-pub use worker::*;
+pub use runner::*;
 
 #[cfg(test)]
 mod tests {
@@ -43,7 +43,7 @@ mod tests {
 
     #[test]
     fn completion_extracts_explicit_exit_code_from_payload() {
-        // Worker emitted exit_code=42 (e.g. a build script's exit
+        // Runner emitted exit_code=42 (e.g. a build script's exit
         // code). Translation must surface it verbatim, NOT squash
         // to 1 via result_class.
         let c = completion(
@@ -53,7 +53,7 @@ mod tests {
         let r = completion_to_dispatch_result(c);
         assert_eq!(
             r.exit_code, 42,
-            "operator-facing exit code must match worker's"
+            "operator-facing exit code must match runner's"
         );
         assert!(
             r.stdout.contains("exit_code=42"),
@@ -358,7 +358,7 @@ mod tests {
     #[test]
     fn work_job_omits_none_fields_from_serialized() {
         // None-valued optional fields must be omitted from the wire form
-        // so older workers (future-proof case) don't trip on
+        // so older runners (future-proof case) don't trip on
         // unexpected null values.
         let job = build_work_job(
             None, // target_machine None
@@ -422,7 +422,7 @@ mod tests {
     /// Wave-E.14: lifting `runtime` from String to enum moves the
     /// "unknown runtime" check from `validate()` to JSON-parse time. A
     /// publisher that XADD's a job with `"runtime": "nuclear"` is
-    /// rejected before the job ever enters the worker's WorkJob in-memory
+    /// rejected before the job ever enters the runner's WorkJob in-memory
     /// shape — the consumer's `serde_json::from_str` fails loud rather
     /// than going through validate.
     #[test]

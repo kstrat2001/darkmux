@@ -300,8 +300,8 @@ pub struct DispatchOpts {
     /// and `<id>` differs from the local `DARKMUX_MACHINE_ID`, the
     /// dispatch is published to the single global `darkmux:work` stream
     /// via `fleet::publish_job` instead of running locally; the first
-    /// available worker picks it up. The id is an **advisory hint**
-    /// (#590): any worker may claim the job; a non-target worker logs a
+    /// available runner picks it up. The id is an **advisory hint**
+    /// (#590): any runner may claim the job; a non-target runner logs a
     /// soft warning and proceeds (no NACK/requeue). When `None`, the
     /// dispatch runs locally — there is no implicit tier auto-route
     /// (retired in #590; capability-based auto-routing is the #590
@@ -419,7 +419,7 @@ impl CompactionDispatchArgs {
         // map across the semantic boundary.
         let threshold_ratio = comp.and_then(|c| c.threshold_ratio).map(|f| f as f32);
         // (#590) Context window for the compaction trigger comes from the
-        // profile's default worker model (default_model, or first model).
+        // profile's default model (default_model, or first model).
         let context_window = profile
             .default_model_id()
             .and_then(|id| profile.models.iter().find(|m| m.id == id))
@@ -473,7 +473,7 @@ impl CompactionDispatchArgs {
     /// `from_profile` / `apply_role_override` from any dispatcher that has the
     /// registry. The utility model is the machine's standing support model —
     /// one global model for compaction (and future estimation / mission-
-    /// compile), decoupled from the worker profile. `None` (no binding) ⇒
+    /// compile), decoupled from the profile. `None` (no binding) ⇒
     /// untouched, so the runtime keeps its built-in default compactor.
     pub fn apply_utility_model(&mut self, utility_model_id: Option<&str>) {
         if self.compactor_model.is_none() {
@@ -1008,7 +1008,7 @@ fn is_openclaw_noise(path: &Path) -> bool {
 /// local-vs-remote routing decision lives in `fleet::dispatch_routed`
 /// (#463 cycle-break: moved up so `crew` doesn't depend on `fleet`).
 /// User-facing callers go through `fleet::dispatch_routed`; the fleet
-/// worker (already on the chosen machine) calls this directly.
+/// runner (already on the chosen machine) calls this directly.
 pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // Route to the in-house container-bounded runtime when the operator
     // explicitly opts in via `--runtime internal`. Default stays the
@@ -1291,7 +1291,7 @@ pub enum RoutingDecision {
 /// Emit a `dispatch route` flow record at the moment the routing
 /// decision is made and return the resolved session_id so the caller
 /// can re-attach it to `opts.session_id`. This ensures the route
-/// record's session_id matches the worker's subsequent `dispatch
+/// record's session_id matches the runner's subsequent `dispatch
 /// start` / `dispatch complete` records — the topology UI's pair-
 /// rendering depends on session_id continuity.
 ///

@@ -10,7 +10,7 @@
 //!
 //! Post-fix (this PR): shared `crate::workdir::validate_workdir`
 //! enforces the symlink check + canonicalize + is_dir uniformly
-//! across BOTH runtime paths AND the worker's `WorkJob.workdir`
+//! across BOTH runtime paths AND the runner's `WorkJob.workdir`
 //! validation in `handle_claimed_job`.
 //!
 //! Test shape: spawn a single-node fleet (no Redis needed since we're

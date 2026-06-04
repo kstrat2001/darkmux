@@ -1,10 +1,10 @@
-//! Fleet worker loop — claims jobs off the global work-stream and dispatches them.
+//! Fleet runner loop — claims jobs off the global work-stream and dispatches them.
 
 use crate::{ack_job, claim_job, init_consumer_group, ClaimedJob, WorkJob, WORK_STREAM};
 use std::path::PathBuf;
 use std::time::Duration;
 
-// ─── Daemon worker loop (PR-C.2) ──────────────────────────────────────
+// ─── Daemon runner loop (PR-C.2) ──────────────────────────────────────
 //
 // Runs on a dedicated `std::thread` (not a tokio task) inside the
 // `darkmux serve` daemon. Polls the single global `darkmux:work` stream
@@ -18,23 +18,23 @@ use std::time::Duration;
 // 5+ minutes) would saturate the tokio executor. The thread runs
 // independently of the axum server's runtime.
 
-/// Consumer group name used by all darkmux workers. Combined with the
-/// single global stream name, every worker shares the group →
+/// Consumer group name used by all darkmux runners. Combined with the
+/// single global stream name, every runner shares the group →
 /// exactly-one-consumer-per-job delivery.
-pub(crate) const WORKER_CONSUMER_GROUP: &str = "darkmux-workers";
+pub(crate) const RUNNER_CONSUMER_GROUP: &str = "darkmux-runners";
 
 /// XREADGROUP BLOCK budget per poll. 2 seconds is short enough that
-/// shutdown latency is bounded (the worker rechecks the shutdown flag
+/// shutdown latency is bounded (the runner rechecks the shutdown flag
 /// every BLOCK round) and long enough that a quiet queue doesn't
 /// hot-spin Redis. (#246 PR-C.2)
-const WORKER_BLOCK_MS: u64 = 2_000;
+const RUNNER_BLOCK_MS: u64 = 2_000;
 
-/// Spawn the daemon worker thread. Returns the JoinHandle so callers
-/// can monitor (typically the daemon never joins — the worker runs
+/// Spawn the daemon runner thread. Returns the JoinHandle so callers
+/// can monitor (typically the daemon never joins — the runner runs
 /// for the daemon's lifetime and dies when the process exits).
 ///
 /// Reads two env vars at spawn time:
-/// - `DARKMUX_REDIS_URL` — required; absent → worker doesn't start
+/// - `DARKMUX_REDIS_URL` — required; absent → runner doesn't start
 ///   (Redis presence is the participation gate, #590)
 /// - `DARKMUX_MACHINE_ID` — used as consumer name (per-machine identity)
 ///
@@ -43,23 +43,23 @@ const WORKER_BLOCK_MS: u64 = 2_000;
 /// the daemon usable as an observability node even without queue
 /// participation — same posture as the existing single-machine-fleet
 /// default in `fleet status`.
-pub fn spawn_worker_thread() -> std::thread::JoinHandle<()> {
+pub fn spawn_runner_thread() -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
-        .name("darkmux-worker".to_string())
-        .spawn(worker_main)
-        .expect("spawn darkmux-worker thread")
+        .name("darkmux-runner".to_string())
+        .spawn(runner_main)
+        .expect("spawn darkmux-runner thread")
 }
 
-/// Entry point for the worker thread. Reads env config, opens Redis,
+/// Entry point for the runner thread. Reads env config, opens Redis,
 /// initializes the consumer group, then loops on claim/dispatch/ack.
-fn worker_main() {
+fn runner_main() {
     let Some(redis_url) = std::env::var("DARKMUX_REDIS_URL")
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
     else {
         eprintln!(
-            "darkmux-worker: DARKMUX_REDIS_URL not set — fleet work queue disabled. \
+            "darkmux-runner: DARKMUX_REDIS_URL not set — fleet work queue disabled. \
              Daemon continues as observability/serve node only."
         );
         return;
@@ -76,28 +76,28 @@ fn worker_main() {
             // our `.with_context` wrapper. Operator needs the full
             // chain to diagnose. (PR-C.2 review carry-over)
             eprintln!(
-                "darkmux-worker: failed to open Redis client ({url}): {e:#}. \
-                 Queue worker disabled."
+                "darkmux-runner: failed to open Redis client ({url}): {e:#}. \
+                 Queue runner disabled."
             );
             return;
         }
     };
 
-    if let Err(e) = init_consumer_group(&client, WORKER_CONSUMER_GROUP) {
+    if let Err(e) = init_consumer_group(&client, RUNNER_CONSUMER_GROUP) {
         eprintln!(
-            "darkmux-worker: init_consumer_group on {WORK_STREAM} failed: {e:#}. \
-             Queue worker disabled."
+            "darkmux-runner: init_consumer_group on {WORK_STREAM} failed: {e:#}. \
+             Queue runner disabled."
         );
         return;
     }
 
     eprintln!(
-        "darkmux-worker: started — consumer={machine_id} \
-         stream={WORK_STREAM} group={WORKER_CONSUMER_GROUP}"
+        "darkmux-runner: started — consumer={machine_id} \
+         stream={WORK_STREAM} group={RUNNER_CONSUMER_GROUP}"
     );
 
     loop {
-        match claim_job(&client, WORKER_CONSUMER_GROUP, &machine_id, WORKER_BLOCK_MS) {
+        match claim_job(&client, RUNNER_CONSUMER_GROUP, &machine_id, RUNNER_BLOCK_MS) {
             Ok(None) => {
                 // BLOCK timeout — no work. Loop and re-block.
                 continue;
@@ -106,7 +106,7 @@ fn worker_main() {
                 handle_claimed_job(&client, claimed);
             }
             Err(e) => {
-                eprintln!("darkmux-worker: claim_job failed ({e}); backing off 1s");
+                eprintln!("darkmux-runner: claim_job failed ({e}); backing off 1s");
                 std::thread::sleep(Duration::from_secs(1));
             }
         }
@@ -122,7 +122,7 @@ fn handle_claimed_job(client: &redis::Client, claimed: ClaimedJob) {
     let session_id = job.session_id.clone();
     let role_id = job.role_id.clone();
     eprintln!(
-        "darkmux-worker: claimed work_id={work_id} role={role_id} \
+        "darkmux-runner: claimed work_id={work_id} role={role_id} \
          session={session_id} target_machine={:?} attempt={}",
         job.target_machine, job.attempt
     );
@@ -132,26 +132,26 @@ fn handle_claimed_job(client: &redis::Client, claimed: ClaimedJob) {
     // hostile publisher who bypassed our publish path.
     if let Err(e) = job.validate() {
         eprintln!(
-            "darkmux-worker: REJECTED claimed job {work_id}: {e:#}. \
+            "darkmux-runner: REJECTED claimed job {work_id}: {e:#}. \
              Acking to release queue lease; dispatch NOT invoked."
         );
-        let _ = ack_job(client, WORKER_CONSUMER_GROUP, &work_id);
+        let _ = ack_job(client, RUNNER_CONSUMER_GROUP, &work_id);
         return;
     }
 
     // Workdir symlink-escape guard via the shared validator (Wave-E.2 /
     // #255). The dispatch path itself ALSO validates, but doing it
     // here is the canonical "queue boundary" check — operator sees
-    // the rejection in the worker's flow records via dispatch.error,
+    // the rejection in the runner's flow records via dispatch.error,
     // not buried deep in the internal/openclaw dispatch path.
     if let Some(workdir_str) = &job.workdir {
         let path = std::path::Path::new(workdir_str);
         if let Err(e) = darkmux_types::workdir::validate_workdir(path) {
             eprintln!(
-                "darkmux-worker: REJECTED claimed job {work_id}: workdir validation failed: {e:#}. \
+                "darkmux-runner: REJECTED claimed job {work_id}: workdir validation failed: {e:#}. \
                  Acking to release queue lease; dispatch NOT invoked."
             );
-            let _ = ack_job(client, WORKER_CONSUMER_GROUP, &work_id);
+            let _ = ack_job(client, RUNNER_CONSUMER_GROUP, &work_id);
             return;
         }
     }
@@ -165,7 +165,7 @@ fn handle_claimed_job(client: &redis::Client, claimed: ClaimedJob) {
     if let Some(target) = &job.target_machine {
         if local_machine.as_deref() != Some(target.as_str()) {
             eprintln!(
-                "darkmux-worker: target_machine={target:?} doesn't match \
+                "darkmux-runner: target_machine={target:?} doesn't match \
                  local machine_id={local_machine:?}; proceeding (queue \
                  already claimed; PR-E will add lease re-publish)."
             );
@@ -180,7 +180,7 @@ fn handle_claimed_job(client: &redis::Client, claimed: ClaimedJob) {
     match dispatch_result {
         Ok(outcome) => {
             eprintln!(
-                "darkmux-worker: dispatched work_id={work_id} → exit_code={} \
+                "darkmux-runner: dispatched work_id={work_id} → exit_code={} \
                  stdout_bytes={} stderr_bytes={}",
                 outcome.exit_code,
                 outcome.stdout.len(),
@@ -189,15 +189,15 @@ fn handle_claimed_job(client: &redis::Client, claimed: ClaimedJob) {
         }
         Err(e) => {
             eprintln!(
-                "darkmux-worker: dispatch ERROR work_id={work_id}: {e:#}. \
+                "darkmux-runner: dispatch ERROR work_id={work_id}: {e:#}. \
                  Acking to release queue lease; dispatch.complete flow \
                  record carries the failure detail."
             );
         }
     }
 
-    if let Err(e) = ack_job(client, WORKER_CONSUMER_GROUP, &work_id) {
-        eprintln!("darkmux-worker: XACK failed for {work_id}: {e:#}");
+    if let Err(e) = ack_job(client, RUNNER_CONSUMER_GROUP, &work_id) {
+        eprintln!("darkmux-runner: XACK failed for {work_id}: {e:#}");
     }
 }
 
@@ -215,7 +215,7 @@ impl WorkJob {
             session_id: Some(self.session_id),
             timeout_seconds: self.timeout_seconds,
             skip_preflight: false,
-            // Worker-side dispatches preserve today's human-readable
+            // Runner-side dispatches preserve today's human-readable
             // stdout shape — JSON-envelope mode is operator-explicit
             // and only fires when the originating CLI used --json.
             // (When cross-machine plumbing eventually carries the flag
@@ -225,17 +225,17 @@ impl WorkJob {
             workdir: self.workdir.map(PathBuf::from),
             sprint_id: self.sprint_id,
             runtime: self.runtime,
-            // Worker-side runtime_cmd hardcoded to "openclaw" —
+            // Runner-side runtime_cmd hardcoded to "openclaw" —
             // intentionally NOT threaded from the publisher's WorkJob.
             // A publisher-local binary path (`/opt/aider/aider` on the
-            // dispatcher) doesn't translate to a remote worker's
+            // dispatcher) doesn't translate to a remote runner's
             // filesystem; when cross-machine openclaw becomes a
-            // first-class use case the field belongs to the WORKER's
+            // first-class use case the field belongs to the RUNNER's
             // local config (read at claim-time), not to the WorkJob
             // serialized off the publisher. Internal-runtime jobs
             // ignore the field entirely.
             runtime_cmd: "openclaw".to_string(),
-            // Worker-side opts: never recurse into the queue (would
+            // Runner-side opts: never recurse into the queue (would
             // ping-pong jobs back to redis); always run local synchronous.
             machine: None,
             wait: true,
@@ -246,7 +246,7 @@ impl WorkJob {
             // becomes a real requirement.
             compaction: darkmux_crew::dispatch::CompactionDispatchArgs::default(),
             // (#549) Fleet-deserialized jobs don't carry a `--profile`
-            // override (pre-#549 wire shape) — the worker resolves against
+            // override (pre-#549 wire shape) — the runner resolves against
             // its local `default_profile`. Future iteration could propagate
             // via the job payload if cross-machine profile selection becomes
             // a requirement.

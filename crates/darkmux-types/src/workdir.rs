@@ -2,7 +2,7 @@
 //! resolution. Hoisted from `crew/dispatch_internal.rs` so the openclaw
 //! path (`crew/dispatch.rs::apply_workdir_override`) and the internal
 //! runtime path (`crew/dispatch_internal.rs`) share one implementation,
-//! and the worker side (`fleet.rs::handle_claimed_job`) can validate
+//! and the runner side (`fleet.rs::handle_claimed_job`) can validate
 //! queued `WorkJob.workdir` values before invoking dispatch.
 //!
 //! Flagged in PR-C.1, PR-C.2, AND PR-C.3 security reviews — without
@@ -70,7 +70,7 @@ pub fn is_macos_firmlink(p: &Path) -> bool {
 ///    that isn't an allowed macOS firmlink. Closes the original #227
 ///    threat (operator surprised by indirection) AND prevents a remote
 ///    publisher from using the work queue to target a weaker
-///    symlink-following path on a worker machine.
+///    symlink-following path on a runner machine.
 /// 2. Canonicalize — surfaces "doesn't exist" as the canonical error.
 /// 3. Confirm it's a directory.
 ///
@@ -83,7 +83,7 @@ pub fn is_macos_firmlink(p: &Path) -> bool {
 /// Call sites:
 /// - `crew::dispatch::apply_workdir_override` (openclaw path)
 /// - `crew::dispatch_internal::dispatch` (internal runtime path)
-/// - `fleet::handle_claimed_job` (worker side; validates `WorkJob.workdir`
+/// - `fleet::handle_claimed_job` (runner side; validates `WorkJob.workdir`
 ///   before invoking the dispatch path that consumes it)
 pub fn validate_workdir(path: &Path) -> Result<PathBuf> {
     if let Some(offending) = first_user_symlink_in(path)

@@ -92,7 +92,7 @@ fn validate_profile(name: &str, profile: &Profile, path: &Path) -> Result<()> {
         );
     }
     // (#590) The old "exactly one primary" rule is gone with `ModelRole`. The
-    // default worker is `default_model` (or the first model when unset). The
+    // default model is `default_model` (or the first model when unset). The
     // only new failure mode worth catching: a `default_model` that names a
     // model not present in `models[]` — an operator typo, surfaced loudly.
     if let Some(default_id) = profile.default_model.as_deref() {
@@ -234,8 +234,8 @@ mod tests {
     #[test]
     fn validates_multiple_models_no_role_constraint() {
         // (#590) The old "exactly one primary" rule is gone with `ModelRole`.
-        // A profile may now declare any number of (unroled) worker models; the
-        // default worker is the first one when `default_model` is unset.
+        // A profile may now declare any number of (unroled) models; the
+        // default model is the first one when `default_model` is unset.
         let tmp = TempDir::new().unwrap();
         let p = tmp.path().join("profiles.json");
         write(
@@ -248,7 +248,7 @@ mod tests {
         let reg = load_registry(Some(p.to_str().unwrap())).unwrap().registry;
         let prof = reg.profiles.get("ok").unwrap();
         assert_eq!(prof.models.len(), 2);
-        // First model is the implicit default worker.
+        // First model is the implicit default model.
         assert_eq!(prof.default_model_id(), Some("a"));
     }
 
@@ -291,7 +291,7 @@ mod tests {
         let reg: ProfileRegistry = serde_json::from_str(minimal_json()).unwrap();
         let p = get_profile(&reg, "fast").unwrap();
         assert_eq!(p.models.len(), 1);
-        // (#590) The default worker is the first model when `default_model` is
+        // (#590) The default model is the first model when `default_model` is
         // unset (replaces the old Primary-role designation).
         assert_eq!(p.default_model_id(), Some("model-a"));
     }

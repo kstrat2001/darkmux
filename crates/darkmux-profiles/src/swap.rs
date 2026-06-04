@@ -123,13 +123,13 @@ fn utility_load_target(util_id: &str) -> (String, String) {
     }
 }
 
-/// (#590) Everything a swap to `profile` wants resident: the profile's worker
+/// (#590) Everything a swap to `profile` wants resident: the profile's
 /// models, plus the machine's standing utility model (`internal.utility`) when
-/// registered. The utility model is loaded *alongside* the workers so
+/// registered. The utility model is loaded *alongside* the profile's models so
 /// compaction finds it resident mid-dispatch — and because it lives in the
 /// machine-level `internal` binding (not any profile's `models[]`), it survives
-/// every worker-profile swap. A utility model that happens to duplicate a
-/// declared worker is loaded once (the worker entry wins, keeping its declared
+/// every profile swap. A utility model that happens to duplicate a
+/// declared model is loaded once (the declared entry wins, keeping its declared
 /// context). Pure: the caller owns the `lms ps` / load I/O.
 fn desired_loads(profile: &Profile, registry: &ProfileRegistry) -> Vec<DesiredLoad> {
     let mut loads: Vec<DesiredLoad> = profile
@@ -143,8 +143,8 @@ fn desired_loads(profile: &Profile, registry: &ProfileRegistry) -> Vec<DesiredLo
         .collect();
     if let Some(util_id) = registry.utility_model_id() {
         let (model_key, identifier) = utility_load_target(util_id);
-        // Don't load twice if the utility model is also a declared worker —
-        // the worker entry already covers it (and keeps its declared context).
+        // Don't load twice if the utility model is also a declared model —
+        // the declared entry already covers it (and keeps its declared context).
         if !loads.iter().any(|l| l.identifier == identifier) {
             loads.push(DesiredLoad { model_key, identifier, n_ctx: DEFAULT_UTILITY_N_CTX });
         }
@@ -163,7 +163,7 @@ pub fn swap(profile: &Profile, registry: &ProfileRegistry, opts: SwapOpts) -> Re
     let pre = registry.hooks.as_ref().map(|h| h.pre_swap.as_slice()).unwrap_or(&[]);
     result.hooks_ran += run_hooks(pre, profile, &opts);
 
-    // Everything this swap wants resident: the profile's worker models plus the
+    // Everything this swap wants resident: the profile's models plus the
     // machine's standing utility model (#590). Map of namespaced identifier →
     // desired (minimum) context length, used to drive the Pass-1 unload
     // decision below.
@@ -392,7 +392,7 @@ mod tests {
 
     #[test]
     fn desired_loads_appends_the_registered_utility_model() {
-        // Worker "m" (ctx 1000) + a registered utility model "util-4b".
+        // Model "m" (ctx 1000) + a registered utility model "util-4b".
         let profile = profile_with("p", None);
         let registry = registry_with_utility(Some("util-4b"));
         let loads = desired_loads(&profile, &registry);
@@ -414,21 +414,21 @@ mod tests {
 
     #[test]
     fn desired_loads_does_not_double_load_a_utility_that_is_also_a_worker() {
-        // The operator declared the same model as both a worker and the
-        // utility model — load it once, keeping the worker's declared context
+        // The operator declared the same model as both a profile model and the
+        // utility model — load it once, keeping the model's declared context
         // (not the utility default).
-        let profile = profile_with("p", None); // worker id "m" @ ctx 1000
+        let profile = profile_with("p", None); // model id "m" @ ctx 1000
         let loads = desired_loads(&profile, &registry_with_utility(Some("m")));
-        assert_eq!(loads.len(), 1, "duplicate utility/worker isn't loaded twice");
-        assert_eq!(loads[0].n_ctx, 1000, "worker's declared context wins over the utility default");
+        assert_eq!(loads.len(), 1, "duplicate utility/model isn't loaded twice");
+        assert_eq!(loads[0].n_ctx, 1000, "the model's declared context wins over the utility default");
     }
 
     #[test]
     fn desired_loads_dedups_when_worker_identifier_collides_with_util_identifier() {
-        // (#590 NIT) A worker whose explicit `identifier` happens to equal the
+        // (#590 NIT) A model whose explicit `identifier` happens to equal the
         // util model's namespaced identifier dedups to ONE load (by identifier),
-        // and the worker entry wins — so the `darkmux:util-4b` slot loads the
-        // worker's model key, not the util's. This is operator misconfiguration
+        // and the model entry wins — so the `darkmux:util-4b` slot loads the
+        // declared model's key, not the util's. This is operator misconfiguration
         // (the doctor/preflight will WARN "util not loaded" because the stored
         // `util-4b` matches neither the loaded `.model` nor `.identifier`), but
         // it must never produce two competing loads of the same identifier.
@@ -447,7 +447,7 @@ mod tests {
         let loads = desired_loads(&profile, &registry_with_utility(Some("util-4b")));
         assert_eq!(loads.len(), 1, "collision must dedup to a single load");
         assert_eq!(loads[0].identifier, "darkmux:util-4b");
-        assert_eq!(loads[0].model_key, "worker-35b", "the worker entry wins the identifier slot");
+        assert_eq!(loads[0].model_key, "worker-35b", "the model entry wins the identifier slot");
     }
 
     #[test]

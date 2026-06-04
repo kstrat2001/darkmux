@@ -263,7 +263,7 @@ pub struct RegistryHooks {
 
 /// Machine-level internal bindings — darkmux's own standing infrastructure
 /// for this machine, a sibling to the operator's `profiles`. Decoupled from
-/// any single profile so swapping a worker profile never changes the
+/// any single profile so swapping a profile never changes the
 /// compaction model. (#590)
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegistryInternal {
@@ -271,7 +271,7 @@ pub struct RegistryInternal {
     /// runtime summons for built-in utility tasks (compaction today;
     /// estimation / mission-compile later). The operator registers it from
     /// lab work; it is **not** capability-scored (a score could re-pick a
-    /// large worker for compaction and reintroduce the per-beat tax). One
+    /// large model for compaction and reintroduce the per-beat tax). One
     /// global util model serves all utility hooks. Absent ⇒ the runtime
     /// falls back to its built-in default compactor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -283,7 +283,7 @@ pub struct Profile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub models: Vec<ProfileModel>,
-    /// The canonical default worker model id (#590) — the deterministic
+    /// The canonical default model id (#590) — the deterministic
     /// fallback `select_model` returns when capability scoring can't
     /// differentiate (no offers, or a tie). Replaces the old `Primary`-role
     /// designation. When `None`, the first model in `models[]` is the implicit
@@ -298,12 +298,12 @@ pub struct Profile {
 }
 
 impl Profile {
-    /// (#590) The profile's canonical default worker model id: the explicit
+    /// (#590) The profile's canonical default model id: the explicit
     /// `default_model` if set, else the first declared model (mirroring the
     /// old Primary-is-first convention). `None` only when `models[]` is empty.
     /// This is the deterministic fallback `select_model` returns when
     /// capability scoring can't differentiate, and the model that swap /
-    /// compaction-context resolution treat as the profile's primary worker.
+    /// compaction-context resolution treat as the profile's primary model.
     /// (Replaces the removed `primary_model_id()`; the compactor moved to the
     /// registry's `internal.utility` binding, so `compactor_model_id()` is
     /// gone.)
@@ -322,7 +322,7 @@ pub struct ProfileRegistry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_profile: Option<String>,
     /// Machine-level internal bindings (the utility model, …) — sibling to
-    /// `profiles`, so swapping a worker profile never disturbs darkmux's own
+    /// `profiles`, so swapping a profile never disturbs darkmux's own
     /// standing infrastructure. (#590)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub internal: Option<RegistryInternal>,

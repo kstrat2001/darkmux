@@ -49,7 +49,7 @@ pub fn resolve_openclaw_config_path(explicit_path: Option<&str>) -> Option<PathB
 ///     invoked — these aren't customizations, they're consequences of an
 ///     openclaw-targeted swap issuing namespaced `lms load`s):
 ///     - `agents.defaults.model.primary` rewritten to the profile's default
-///       worker (`default_model`, or the first model) namespaced identifier —
+///       model (`default_model`, or the first model) namespaced identifier —
 ///       replaces any prior pin, not just bare→namespaced (see #90; without
 ///       this the operator can swap to a new profile and have dispatch keep
 ///       requesting the prior profile's primary). The compactor pin is no
@@ -495,7 +495,7 @@ fn rewrite_namespaced_model_refs(config: &mut Value, models: &[ProfileModel]) ->
 ///     (matches the existing posture in `apply_runtime`'s
 ///     context-tokens write).
 fn sync_default_model_pins(config: &mut Value, profile: &Profile) -> bool {
-    // (#590) The default-worker pin = the profile's `default_model` (or its
+    // (#590) The default-model pin = the profile's `default_model` (or its
     // first model when unset). The compactor pin is gone — the compactor model
     // lives in the registry's `internal.utility` binding now, not in a
     // profile's `models[]`.
@@ -1344,9 +1344,9 @@ mod tests {
     /// (#590) The compactor pin is no longer derived from `models[]` — the
     /// compactor model moved to the registry's `internal.utility` binding,
     /// so `apply_runtime` (via `sync_default_model_pins`) writes ONLY the
-    /// default-worker primary pin. An existing `compaction.model` pin must
+    /// default-model primary pin. An existing `compaction.model` pin must
     /// be left untouched by a swap; only the primary pin gets rewritten to
-    /// the profile's default worker (first model when `default_model` unset).
+    /// the profile's default model (first model when `default_model` unset).
     #[test]
     #[serial]
     fn swap_rewrites_primary_pin_but_leaves_compactor_pin_untouched() {
@@ -1389,14 +1389,14 @@ mod tests {
             "lmstudio/darkmux:old-compactor",
             "compactor pin is not derived from models[] → must be left untouched"
         );
-        // Primary pin rewritten to the default worker (first model).
+        // Primary pin rewritten to the default model (first model).
         assert_eq!(
             after["agents"]["defaults"]["model"]["primary"],
             "lmstudio/darkmux:new-primary"
         );
     }
 
-    /// (#590) `default_model` selects which worker becomes the primary pin —
+    /// (#590) `default_model` selects which model becomes the primary pin —
     /// not the first-declared model when it's set. Locks the tie-break/default
     /// designation moving from the old Primary-role to the new `default_model`
     /// field.
@@ -1561,10 +1561,10 @@ mod tests {
         }
     }
 
-    /// (#590) A profile with no models has no default worker to pin, so
+    /// (#590) A profile with no models has no default model to pin, so
     /// `sync_default_model_pins` must be a no-op and leave any existing
     /// pin untouched. (Replaces the old "all-Auxiliary, no managed roles"
-    /// case — every model is now an unroled worker, so the only no-write
+    /// case — every model is now an unroled model, so the only no-write
     /// path left is an empty `models[]`.)
     #[test]
     fn sync_default_model_pins_no_op_when_profile_has_no_models() {
@@ -1575,7 +1575,7 @@ mod tests {
         assert!(!sync_default_model_pins(&mut config, &profile));
         assert_eq!(
             config["agents"]["defaults"]["model"]["primary"], "lmstudio/whatever",
-            "no models → no default worker → pin left alone"
+            "no models → no default model → pin left alone"
         );
     }
 

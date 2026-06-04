@@ -460,19 +460,19 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf) -> Result<()> {
             println!("{line}");
         }
 
-        // Spawn the fleet work-queue worker thread (#246 PR-C.2). Runs
-        // on a dedicated std::thread (not a tokio task) so the sync
+        // Spawn the fleet work-queue runner thread (#246 PR-C.2, renamed #595).
+        // Runs on a dedicated std::thread (not a tokio task) so the sync
         // redis client + sync crew::dispatch::dispatch don't saturate
-        // the tokio executor. Worker self-disables when its prerequisite
+        // the tokio executor. The runner self-disables when its prerequisite
         // (DARKMUX_REDIS_URL) isn't declared — single-machine fleets
         // continue to work unchanged (#590: Redis presence is the
         // participation gate; tier declaration is no longer required).
         // The thread runs for the daemon's lifetime; the process
         // force-exit in the SHUTDOWN_GRACE_SECS path kills it cleanly.
-        let _worker_handle = darkmux_fleet::spawn_worker_thread();
+        let _runner_handle = darkmux_fleet::spawn_runner_thread();
 
         // (#638) Spawn the fleet-presence heartbeat emitter. Same dedicated-
-        // std::thread shape + DARKMUX_REDIS_URL self-disable as the worker
+        // std::thread shape + DARKMUX_REDIS_URL self-disable as the runner
         // above (plus a stable-machine-uid gate, #640): while this daemon
         // runs, it refreshes a short-TTL `darkmux:presence:<uid>` key so the
         // live-only fleet view, the live-version skew check, and the roster
