@@ -475,12 +475,43 @@ redis-cli -h 127.0.0.1 -a "$DARKMUX_REDIS_PASS" --no-auth-warning XLEN darkmux:f
 <section id="upgrade-viewer">
   <div class="wrap">
     <h2>Upgrading to substrate + viewer later</h2>
-    <p>If you decided substrate-only at the start and now want the bundled topology viewer reachable from any peer's browser pointed at the hub, it's a two-line change to the <code>com.darkmux.serve</code> plist:</p>
+    <p>If you decided substrate-only at the start and now want the daemon-hosted viewer reachable from any peer's browser pointed at the hub, you have two options. Both leave the substrate (Redis + audit + log rotation + integrity check) unchanged.</p>
+
+    <h3>Option A — Tailscale Serve (recommended)</h3>
+    <p>Tailscale Serve terminates TLS at the local Tailscale node and proxies inbound HTTPS connections to <code>127.0.0.1:8765</code> without ever exposing the daemon directly to the tailnet interface. The daemon stays bound to localhost; Tailscale handles the cross-tailnet hop. End result is a stable <code>https://&lt;hub&gt;.&lt;your-tailnet&gt;.ts.net/</code> URL that any peer on your tailnet can load in a browser, with proper HTTPS (no mixed-content errors, no CORS gymnastics):</p>
+    <pre><code><span class="comment"># On the hub, expose the daemon at the tailnet HTTPS port (443).</span>
+<span class="comment"># Background flag persists across reboots via tailscaled.</span>
+tailscale serve --bg --https=443 http://127.0.0.1:8765
+
+<span class="comment"># Confirm the URL Tailscale assigned and the proxy mapping.</span>
+tailscale serve status</code></pre>
+    <p>Now <code>https://&lt;hub-magic-dns-name&gt;.ts.net/</code> resolves on any peer in your tailnet and loads the live viewer. To also allow the bundled viewer to be loaded from THAT origin (browsers send the page's origin in the Origin header on fetch/EventSource calls; the daemon's CORS check has to pass it), add the corresponding entry to the launchd plist:</p>
+    <pre><code><span class="comment"># Add to the EnvironmentVariables dict in</span>
+<span class="comment"># ~/Library/LaunchAgents/com.darkmux.serve.plist:</span>
+<span class="comment">#   &lt;key&gt;DARKMUX_DAEMON_CORS_ORIGINS&lt;/key&gt;</span>
+<span class="comment">#   &lt;string&gt;https://&lt;hub-magic-dns-name&gt;.ts.net&lt;/string&gt;</span>
+
+launchctl unload -w ~/Library/LaunchAgents/com.darkmux.serve.plist
+launchctl load   -w ~/Library/LaunchAgents/com.darkmux.serve.plist</code></pre>
+    <p>The daemon stays bound to <code>127.0.0.1</code> — Tailscale Serve handles the cross-tailnet hop. Trust boundary stays at the tailnet ACL; HTTPS is real (not self-signed); peers don't need a local daemon to view the hub's fleet view.</p>
+
+    <h3>Option B — Direct tailnet bind</h3>
+    <p>The lower-overhead path: change the daemon to bind on the tailnet IP directly. Two-line plist edit:</p>
     <ol>
       <li>Change <code>--bind 127.0.0.1</code> to <code>--bind 0.0.0.0</code> in the <code>ProgramArguments</code> exec line.</li>
       <li>Add <code>DARKMUX_DAEMON_CORS_ORIGINS=http://&lt;hub-tailnet-addr&gt;:8765</code> to the <code>EnvironmentVariables</code> dict.</li>
     </ol>
-    <p>Then <code>launchctl unload</code> + <code>launchctl load</code> the plist. The daemon now serves to the tailnet with CORS for that origin only; Redis stays at <code>requirepass</code>, the audit substrate stays on, everything else is unchanged.</p>
+    <p>Then <code>launchctl unload</code> + <code>launchctl load</code> the plist. The daemon now listens on the tailnet interface with CORS for that origin only; Redis stays at <code>requirepass</code>, the audit substrate stays on, everything else is unchanged.</p>
+
+    <div class="callout warn">
+      <strong>Tradeoff:</strong> Option B serves HTTP only (no TLS), so peers loading <code>http://&lt;hub-tailnet-addr&gt;:8765/</code> get a plain HTTP origin. Modern browsers don't flag this as insecure for tailnet hostnames specifically (they're not public), but mixed-content interactions (loading <code>http://</code> resources from an <code>https://</code> page) can bite if you ever proxy through a different layer later. Option A's HTTPS termination at the Tailscale node future-proofs against that.
+    </div>
+
+    <h3>How to pick</h3>
+    <ul>
+      <li><strong>Tailscale Serve (A)</strong> if you have Tailscale (which the always-on hub guide assumes), want HTTPS, and don't want to think about the daemon's network exposure. Lowest-friction long-term posture.</li>
+      <li><strong>Direct bind (B)</strong> if you're not on Tailscale (e.g. WireGuard or LAN), prefer one fewer moving part, and accept the HTTP-only tradeoff.</li>
+    </ul>
   </div>
 </section>
 

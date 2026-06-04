@@ -38,7 +38,7 @@
     <ul>
       <li><strong>Identity</strong> — each machine declares a logical fleet name (<code>DARKMUX_MACHINE_ID</code>). That name is what flow records carry as <code>machine_id</code> and what <code>--machine</code> hints reference.</li>
       <li><strong>Coordination</strong> — a Redis instance running on the always-on member. Two stream classes: <code>darkmux:work</code> — one global work queue (publishers <code>XADD</code>; the first available worker claims via a shared consumer group) — and <code>darkmux:flow</code> for the fleet-wide event log (every machine writes; any daemon's <code>/flow</code> endpoint reads).</li>
-      <li><strong>Observability</strong> — the topology viewer at <a href="../topology/">darkmux.com/topology/</a> aggregates events from every machine writing to the shared stream. The <code>darkmux fleet status --deep</code> CLI does the same for per-machine specs (RAM-free, loaded models, version).</li>
+      <li><strong>Observability</strong> — the daemon hosts the live viewer at <code>http://localhost:8765/</code>; the <a href="../demo/">demo at darkmux.com/demo</a> shows the bundled showcase scenario. The viewer aggregates events from every machine writing to the shared stream. For fleet-wide access from any peer's browser, see <a href="always-on-hub.html#upgrade-viewer">always-on hub → upgrading to substrate + viewer</a> (Tailscale Serve recommended). The <code>darkmux fleet status --deep</code> CLI does the same per-machine specs view (RAM-free, loaded models, version) from the terminal.</li>
     </ul>
     <p>Redis is <strong>optional</strong>. Without it, single-machine usage works exactly as before; flow records still land on disk per-machine via <code>LocalFileSink</code>. With it, the fleet members start seeing each other.</p>
 
@@ -138,8 +138,9 @@ laptop         100.64.1.5:8765        ✓ 23ms     78 GB       macos aarch64   0
 studio         100.64.2.1:8765        ✓ 45ms     12 GB       macos aarch64   0.4.0    darkmux:qwen3-4b-instruct</code></pre>
     <p>Bounded at 1s per peer; degraded peers render with <code>specs?</code> in the RAM-FREE column rather than failing the whole command. This is the "what's actually going on right now?" view across your fleet — the answer to "is the laptop's RAM full?" or "did the studio reboot and lose the model I had loaded?"</p>
 
-    <h3>Watch fleet activity from any machine — topology viewer</h3>
-    <p>Open <a href="../topology/">darkmux.com/topology/</a> (or the local-disk equivalent if you've installed the docs) and point its <code>daemon-base</code> at any machine running <code>darkmux serve</code>. When <code>DARKMUX_REDIS_URL</code> is set on that daemon, the viewer's <code>/flow/&lt;date&gt;</code> + <code>/flow/&lt;date&gt;/stream</code> endpoints aggregate events from every machine writing to the shared <code>darkmux:flow</code> stream — fleet-wide events, not just the host's local file.</p>
+    <h3>Watch fleet activity from any machine — the live viewer</h3>
+    <p>The daemon serves the live viewer at its own origin: open <code>http://localhost:8765/</code> in any browser on a machine running <code>darkmux serve</code>. When <code>DARKMUX_REDIS_URL</code> is set on that daemon, the viewer's <code>/flow/&lt;date&gt;</code> + <code>/flow/&lt;date&gt;/stream</code> endpoints aggregate events from every machine writing to the shared <code>darkmux:flow</code> stream — fleet-wide events, not just the host's local file.</p>
+    <p>For loading the hub's viewer from a peer's browser (without each peer running its own daemon), see <a href="always-on-hub.html#upgrade-viewer">always-on hub → upgrading to substrate + viewer</a>. Tailscale Serve is the recommended path — proxies HTTPS to the hub's daemon without exposing the daemon to the tailnet interface.</p>
     <p>Source-pill on the toolbar tells you the truth about the data path:</p>
     <ul>
       <li><strong>source: live</strong> — Redis aggregation is working; you're seeing the whole fleet</li>

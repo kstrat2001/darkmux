@@ -62,12 +62,24 @@ Concretely, the capabilities the multi-machine substrate ships today:
 
 - **Single-stream fleet dispatch.** Every dispatch routes onto one global work stream (`darkmux:work`); the first available worker claims any job — no tier configuration to maintain. `darkmux crew dispatch coder --machine <id>` is an *advisory* hint when you want a specific machine; any worker may still claim it. Capability-based auto-routing (match work to the machine best suited to run it) is the planned successor, building on the [#590](https://github.com/kstrat2001/darkmux/issues/590) capability layer.
 - **Fleet status with specs.** `darkmux fleet status --deep` fans out across every reachable peer's `/machine/specs` endpoint — RAM-free, loaded models, OS, darkmux version, redacted Redis URL — in one table (#275).
-- **Decentralized flow UI.** The topology viewer at `docs/topology/index.html` aggregates events from every machine writing to the shared `darkmux:flow` Redis stream. Open it on any peer running the daemon and see the fleet, not just the host machine (#270).
+- **Decentralized flow UI.** The daemon hosts the observability viewer at its own origin — `http://localhost:8765/` on every machine running `darkmux serve`. The viewer pulls from the daemon's `/flow/<date>` endpoint which aggregates events from every machine writing to the shared `darkmux:flow` Redis stream — so you see the fleet, not just the host (#270 + #554).
 - **`/darkmux-add-machine` skill.** Walkthrough for joining a new Mac to an existing fleet — env vars, roster setup, smoke test. Run `darkmux init` to install all skills locally (#176).
 
 Deployment shape that this assumes: a couple of Macs on a tailnet you control (Tailscale, ZeroTier, WireGuard — your call), with Redis running on the always-on member. Redis is optional; without it, single-machine usage works fine and `LocalFileSink` captures provenance on disk per-machine.
 
 If your hub machine drops off the network, the substrate degrades gracefully — flow writes fall back to `LocalFileSink`, dispatch bails loud with operator-actionable hints, `darkmux doctor` surfaces the degraded state, and the SSE Redis tail exits cleanly after a bounded number of failures rather than leaking spawned tasks. The verification discipline that matters here is "make sure your hub is hardened for the absences you plan" — `pmset` config + Tailscale "Run at login" + auto-login user. macOS defaults assume "laptop closed = sleep"; they're wrong for a 24/7 hub.
+
+### Seeing your fleet
+
+The observability viewer is hosted by `darkmux serve` itself, not by the public site. Three URL patterns depending on what you're looking at:
+
+| URL | Role | When to use |
+|---|---|---|
+| [`darkmux.com/demo`](https://darkmux.com/demo) | Demo with bundled sample scenario | First impression — see what the viewer does before installing anything |
+| `http://localhost:8765/` | Your own daemon, live | Single-machine fleet, or local-only ops view on a multi-machine fleet |
+| `https://<hub>.<your-tailnet>.ts.net/` | Hub's daemon via Tailscale Serve | Multi-machine fleet — load the hub's fleet view from any peer on your tailnet |
+
+The third one is opt-in (the daemon binds localhost by default for safety). To expose it across your tailnet, see the [always-on hub guide → upgrading to substrate + viewer](https://darkmux.com/guide/always-on-hub.html#upgrade-viewer) — Tailscale Serve is the recommended path (HTTPS termination at the tailnet node, daemon stays bound to localhost). Raw `--bind 0.0.0.0` on the tailnet IP is the lower-overhead alternative if you don't have Tailscale.
 
 ## Quick start
 
