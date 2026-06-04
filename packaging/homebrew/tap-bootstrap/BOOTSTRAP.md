@@ -1,27 +1,33 @@
 # Tap repo bootstrap
 
-This directory holds the files needed to create the
-`kstrat2001/homebrew-darkmux` GitHub repo. The repo doesn't exist yet
-(tracked in [#618](https://github.com/kstrat2001/darkmux/issues/618)) —
-when it's created, copy these files in, plus a `Formula/` directory
-containing the formula from `../darkmux.rb`.
+This directory holds the source-of-truth files for the
+[`kstrat2001/homebrew-darkmux`](https://github.com/kstrat2001/homebrew-darkmux)
+GitHub repo, plus the maintainer-facing docs for keeping it in sync.
 
-## One-time creation steps
+**Status: tap repo created and seeded 2026-06-04** (commit `610d05b`).
+Anyone can now run:
 
 ```bash
-# 1. Create the repo on GitHub (public, MIT license, minimal README)
+brew tap kstrat2001/darkmux
+brew install --HEAD darkmux
+```
+
+## How this was initially bootstrapped (for posterity)
+
+```bash
+# 1. Create the repo on GitHub (public, MIT license)
 gh repo create kstrat2001/homebrew-darkmux \
     --public \
     --license MIT \
-    --description "Homebrew tap for darkmux (Rust CLI for local LLM stacks)"
+    --description "Homebrew tap for darkmux (Rust CLI for managing local LLM stacks)" \
+    --homepage "https://darkmux.com"
 
 # 2. Clone it locally
-cd /tmp
-git clone git@github.com:kstrat2001/homebrew-darkmux
-cd homebrew-darkmux
+gh repo clone kstrat2001/homebrew-darkmux /tmp/homebrew-darkmux
+cd /tmp/homebrew-darkmux
 
-# 3. Copy the bootstrap files (LICENSE comes from `gh repo create --license MIT`
-#    but you can overwrite with the darkmux one for consistency)
+# 3. Copy the bootstrap files (LICENSE overwrites the gh-generated one for
+#    byte-identical match with darkmux's LICENSE)
 DARKMUX_PUB=/path/to/darkmux-public
 cp "$DARKMUX_PUB/packaging/homebrew/tap-bootstrap/LICENSE" LICENSE
 cp "$DARKMUX_PUB/packaging/homebrew/tap-bootstrap/README.md" README.md
@@ -32,15 +38,8 @@ cp "$DARKMUX_PUB/packaging/homebrew/darkmux.rb" Formula/darkmux.rb
 
 # 5. Commit + push
 git add LICENSE README.md Formula/darkmux.rb
-git commit -m "feat: initial formula + tap docs (refs darkmux#618)"
+git commit -m "feat: initial tap content — formula + LICENSE + README (refs kstrat2001/darkmux#618)"
 git push
-```
-
-After step 5 the tap is live. Anyone can run:
-
-```bash
-brew tap kstrat2001/darkmux
-brew install --HEAD darkmux
 ```
 
 ## Ongoing maintenance — formula sync
