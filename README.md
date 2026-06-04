@@ -91,7 +91,7 @@ darkmux is developed and tested on Apple Silicon. Linux should work; Intel Mac i
 
 ### Install + bootstrap
 
-**Option A — via Homebrew tap** (recommended once the tap ships per [#618](https://github.com/kstrat2001/darkmux/issues/618)):
+**Option A — via Homebrew tap** (recommended; tap lives at [`kstrat2001/homebrew-darkmux`](https://github.com/kstrat2001/homebrew-darkmux)):
 
 ```bash
 brew tap kstrat2001/darkmux
@@ -109,7 +109,7 @@ The brew formula installs both the `darkmux` binary AND a keychain-aware wrapper
 
 **Scope of the brew install.** What you get: the `darkmux` CLI (swap, profiles, status, doctor, fleet, flow, init), the `serve` daemon, the keychain wrapper, and the bundled skills. What you DON'T get: the `darkmux-runtime` Docker image that `darkmux crew dispatch` / `darkmux lab run` need — that requires a `runtime/` source checkout and `docker build` (Option B below), or a published image once one exists ([tracked in #618](https://github.com/kstrat2001/darkmux/issues/618)). The brew path is a complete install for the **hub posture** (coordinator running Redis + serve, no local dispatches) and for the `darkmux swap` / `darkmux status` / `darkmux profiles` flows. For dispatches on this machine, use Option B or supplement the brew install with a runtime image.
 
-**Option B — from source via cargo** (the current working path; also for dev work and contributors):
+**Option B — from source via cargo** (for dev work, contributors, or if you need the `darkmux-runtime` Docker image alongside the binary):
 
 ```bash
 # 1. Install Rust toolchain (skip if `cargo --version` already works)
