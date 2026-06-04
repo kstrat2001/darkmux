@@ -156,6 +156,23 @@ impl SessionEmitter {
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
+        // (#647) This is the CLEAN-stop path — the dispatch is about to emit its
+        // `dispatch.complete`, which is this session's authoritative close-edge.
+        // Pre-claim `session-end:<sid>` BEFORE removing the key so the presence
+        // reconciler, when it observes the key gone, LOSES the claim and skips
+        // its `session.end` edge (which would be redundant with the complete).
+        // An abandoned dispatch (host process killed) never reaches here, so it
+        // never pre-claims — and the reconciler then wins + records the close,
+        // which is exactly the interval bracket playback would otherwise lack.
+        // (Benign edge: a Redis outage spanning longer than the claim's TTL can
+        // let the pre-claim expire before the reconciler recovers, so a clean
+        // session may get a redundant session.end alongside its complete. The
+        // viewer's `closeTs=min(...)` + cleanClose still render it "complete".)
+        let _ = crate::presence_reconciler::claim_edge(
+            &self.client,
+            "session-end",
+            &self.session_id,
+        );
         if let Ok(mut conn) = open_redis_connection_bounded(&self.client, REDIS_CONNECT_TIMEOUT) {
             let _: std::result::Result<redis::Value, _> = redis::cmd("DEL")
                 .arg(session_key(&self.session_id))

@@ -335,6 +335,9 @@ const specOf=m=>{ if(m==="unknown"){ const ns=[...new Set(DATA.filter(r=>uidOf(r
 const machines=()=>[...new Set(DATA.map(uidOf))];
 const sessionsOn=m=>[...new Set(DATA.filter(r=>uidOf(r)===m&&r.session_id).map(r=>r.session_id))];
 const dispatch=(sid,act)=>DATA.find(r=>r.session_id===sid&&r.action==="dispatch."+act);
+// (#647) The reconciler-emitted `session.end` close-edge for an abandoned
+// session (no clean dispatch.complete) — lets playback bracket the interval.
+const sessEnd=sid=>DATA.find(r=>r.session_id===sid&&r.action==="session.end");
 
 function renderMeta(){
   $("meta").innerHTML=`<a class="misslink" onclick="goMission()">◆ ${missions.join(', ')||'—'}</a> · <b>${DATA_SOURCE}</b> · ${iso(tMin).slice(0,10)} `+
@@ -385,13 +388,25 @@ function renderMachine(){
     <span class="pill util">resident</span></div>`;
   // Specialist roles dispatched on this machine for the active mission
   const specs=sessionsOn(m).filter(sid=>visible().some(r=>r.session_id===sid)).map(sid=>{
-    const s=dispatch(sid,"start"), done=dispatch(sid,"complete")&&T(dispatch(sid,"complete").ts)<=state.t;
-    // "running" is a positive liveness signal (#638): a session shows running
-    // only while it's in LIVE_SESSIONS (the live viewer polls this; the demo
-    // seeds it from SAMPLE). With a complete → "complete"; no complete and not
-    // live → "ended", never a phantom "running".
+    const s=dispatch(sid,"start");
+    // (#638/#647) Session status at the scrubber time from the edge pair —
+    // close-edge = earliest of dispatch.complete (clean) / session.end
+    // (abandoned). closed by state.t → complete/ended; else live heartbeat or
+    // a future close-edge → running; else (no close evidence, not live) →
+    // ended. Never "no complete = running". (Demo SAMPLE carries no session.end
+    // edges, so demo sessions bracket on their dispatch.complete + LIVE_SESSIONS
+    // seed; the live viewer gets real session.end edges from the daemon.)
+    const c=dispatch(sid,"complete"), e=sessEnd(sid);
+    const closeCands=[c&&T(c.ts), e&&T(e.ts)].filter(x=>x);
+    const closeTs=closeCands.length?Math.min(...closeCands):null;
+    const closedBy=closeTs!=null&&closeTs<=state.t;
+    const cleanClose=c&&T(c.ts)===closeTs;
     const liveNow=LIVE_SESSIONS.has(sid);
-    const cls=done?'done':(liveNow?'run':'ended'), lbl=done?'complete':(liveNow?'running':'ended');
+    let cls,lbl;
+    if(closedBy){ cls=cleanClose?'done':'ended'; lbl=cleanClose?'complete':'ended'; }
+    else if(liveNow){ cls='run'; lbl='running'; }
+    else if(closeTs!=null){ cls='run'; lbl='running'; }
+    else { cls='ended'; lbl='ended'; }
     return `<div class="node" onclick="drillSession('${sid}')"><div class="h">${s.handle}</div>
       <div class="s">specialist role · ${s.model||'?'}</div>
       <div class="s">session ${sid} · mission ${s.mission_id}</div>
@@ -634,7 +649,7 @@ function setBadges(mode,date){
 // destroy a card the operator is about to click (same hazard the playback timer
 // guards against). Subsystem is a metrics view with no cards → always full-render.
 function stageSig(){
-  const v=visible(), dis=v.filter(r=>r.action==="dispatch.start"||r.action==="dispatch.complete").length;
+  const v=visible(), dis=v.filter(r=>r.action==="dispatch.start"||r.action==="dispatch.complete"||r.action==="session.end").length;
   // Fold the live-session set in so a liveness flip re-renders the cards (the
   // "running"↔"ended" pill), same as a dispatch lifecycle change (#638). The
   // demo's set is static, so this is a no-op there — kept to align the forks.
