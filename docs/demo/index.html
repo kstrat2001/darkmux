@@ -85,6 +85,7 @@
   .node .s{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin-top:4px}
   .pill{display:inline-block;font:600 10px 'JetBrains Mono',monospace;padding:2px 7px;border-radius:10px;margin-top:8px}
   .pill.run{background:#16261d;color:var(--good)}.pill.done{background:#1c1c22;color:var(--muted)}.pill.util{background:var(--bg2);color:var(--amber-dim);border:1px solid var(--line)}
+  .pill.ended{background:#241a12;color:var(--amber-dim)}
   .node.util{cursor:default;border-left:3px solid var(--amber-dim)}.node.util:hover{border-color:var(--line)}
   .rglbl{font:11px 'JetBrains Mono',monospace;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:12px}
   .sub h2{font:600 13px 'JetBrains Mono',monospace;letter-spacing:.1em;text-transform:uppercase;color:var(--amber);margin:0 0 4px}
@@ -265,6 +266,19 @@ const SAMPLE = [
 ];
 let DATA = SAMPLE;            // boot() may replace with real /flow/:date records
 let DATA_SOURCE = "sample data";
+// (#638) The showcase has no live daemon to poll, so seed the live-session
+// set from SAMPLE: every dispatched session is treated as "live", and the
+// done-precedence in renderMachine means only the ones WITHOUT a
+// dispatch.complete actually read "running" (preserving the showcase's
+// running/complete mix). In the daemon-served viewer this set is polled from
+// /fleet/sessions/live instead. NOTE: this seed is SAMPLE-scoped by design —
+// the demo is a static showcase; if it's ever served by a real daemon (boot()
+// swaps in real /flow records), a real in-flight session falls through to
+// "ended" (the safe direction — never a false "running").
+const LIVE_SESSIONS=new Set(
+  SAMPLE.filter(r=>(r.action==="dispatch.start"||r.action==="dispatch start")&&r.session_id).map(r=>r.session_id)
+);
+const liveSig=()=>[...LIVE_SESSIONS].sort().join(",");
 const MACH_SPEC={studio:"M1 Max · 32 GB · hub",laptop:"M5 Max · 128 GB · inference",["mini-1"]:"M4 · 16 GB"};
 // Mac-form-factor glyphs (inline SVG, Lucide stroke style — license-free, no external load)
 const ICON={
@@ -372,10 +386,16 @@ function renderMachine(){
   // Specialist roles dispatched on this machine for the active mission
   const specs=sessionsOn(m).filter(sid=>visible().some(r=>r.session_id===sid)).map(sid=>{
     const s=dispatch(sid,"start"), done=dispatch(sid,"complete")&&T(dispatch(sid,"complete").ts)<=state.t;
+    // "running" is a positive liveness signal (#638): a session shows running
+    // only while it's in LIVE_SESSIONS (the live viewer polls this; the demo
+    // seeds it from SAMPLE). With a complete → "complete"; no complete and not
+    // live → "ended", never a phantom "running".
+    const liveNow=LIVE_SESSIONS.has(sid);
+    const cls=done?'done':(liveNow?'run':'ended'), lbl=done?'complete':(liveNow?'running':'ended');
     return `<div class="node" onclick="drillSession('${sid}')"><div class="h">${s.handle}</div>
       <div class="s">specialist role · ${s.model||'?'}</div>
       <div class="s">session ${sid} · mission ${s.mission_id}</div>
-      <span class="pill ${done?'done':'run'}">${done?'complete':'running'}</span></div>`;}).join("");
+      <span class="pill ${cls}">${lbl}</span></div>`;}).join("");
   $("stage").innerHTML=`<div><div class="stagehdr"><a onclick="goFleet()">fleet</a> › machine · ${nameOf(m)}${specOf(m)?' — '+specOf(m):''}</div>
     <div class="rglbl">crew on ${nameOf(m)}</div>${util}${specs||'<span class="hint">no specialist runs yet at this point in the timeline</span>'}</div>`;
 }
@@ -615,8 +635,12 @@ function setBadges(mode,date){
 // guards against). Subsystem is a metrics view with no cards → always full-render.
 function stageSig(){
   const v=visible(), dis=v.filter(r=>r.action==="dispatch.start"||r.action==="dispatch.complete").length;
-  if(state.level==="fleet")return "f|"+machines().join(",")+"|"+dis;
-  if(state.level==="machine")return "m|"+state.machine+"|"+sessionsOn(state.machine).join(",")+"|"+dis;
+  // Fold the live-session set in so a liveness flip re-renders the cards (the
+  // "running"↔"ended" pill), same as a dispatch lifecycle change (#638). The
+  // demo's set is static, so this is a no-op there — kept to align the forks.
+  const ls=liveSig();
+  if(state.level==="fleet")return "f|"+machines().join(",")+"|"+dis+"|"+ls;
+  if(state.level==="machine")return "m|"+state.machine+"|"+sessionsOn(state.machine).join(",")+"|"+dis+"|"+ls;
   if(state.level==="subsystem")return null;
   return "mission";
 }

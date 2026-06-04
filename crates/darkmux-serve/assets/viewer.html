@@ -98,6 +98,7 @@
   .node .s{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin-top:4px}
   .pill{display:inline-block;font:600 10px 'JetBrains Mono',monospace;padding:2px 7px;border-radius:10px;margin-top:8px}
   .pill.run{background:#16261d;color:var(--good)}.pill.done{background:#1c1c22;color:var(--muted)}.pill.util{background:var(--bg2);color:var(--amber-dim);border:1px solid var(--line)}
+  .pill.ended{background:#241a12;color:var(--amber-dim)}
   .node.util{cursor:default;border-left:3px solid var(--amber-dim)}.node.util:hover{border-color:var(--line)}
   .rglbl{font:11px 'JetBrains Mono',monospace;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:12px}
   .sub h2{font:600 13px 'JetBrains Mono',monospace;letter-spacing:.1em;text-transform:uppercase;color:var(--amber);margin:0 0 4px}
@@ -368,11 +369,19 @@ function renderMachine(){
   const specs=sessionsOn(m).filter(sid=>visible().some(r=>r.session_id===sid)).map(sid=>{
     const s=dispatch(sid,"start");
     const c=dispatch(sid,"complete"), done=c&&T(c.ts)<=state.t;
+    // "running" is a POSITIVE liveness signal (a live session heartbeat,
+    // #638) — NOT "no dispatch.complete record". A session shows running
+    // only while its `darkmux:session-presence:<sid>` key is live (polled
+    // into LIVE_SESSIONS in live mode). With a complete → "complete"; no
+    // complete and not live (crashed / killed / past-date playback, where
+    // LIVE_SESSIONS is empty) → "ended", never a phantom "running".
+    const liveNow=LIVE_SESSIONS.has(sid);
+    const cls=done?'done':(liveNow?'run':'ended'), lbl=done?'complete':(liveNow?'running':'ended');
     if(s){
       return `<div class="node" onclick="drillSession('${sid}')"><div class="h">${s.handle}</div>
         <div class="s">specialist role · ${s.model||'?'}</div>
         <div class="s">session ${sid} · mission ${s.mission_id}</div>
-        <span class="pill ${done?'done':'run'}">${done?'complete':'running'}</span></div>`;
+        <span class="pill ${cls}">${lbl}</span></div>`;
     }
     // Fallback: no dispatch.start — pull handle/model/mission from the first
     // record we have for this session, surface honestly that the lifecycle
@@ -619,6 +628,12 @@ function todayUTC(){return new Date().toISOString().slice(0,10);}
 
 let RAW=[];            // raw FlowRecords (pre-adapt); the live tail appends here
 let LIVE_ES=null;      // EventSource handle when tailing the live stream
+// (#638) Sessions with a live heartbeat right now — polled from the daemon's
+// /fleet/sessions/live in live mode (stays EMPTY in playback). The machine
+// drill keys "running" on membership here, so a dispatch that died without a
+// dispatch.complete ages out instead of showing "running" forever.
+const LIVE_SESSIONS=new Set();
+const liveSig=()=>[...LIVE_SESSIONS].sort().join(",");
 let lastStageSig=null; // skip stage re-renders that would destroy clickable cards
 const SEEN={cat:new Set(),tier:new Set(),src:new Set()};  // filter values ever observed
 
@@ -650,8 +665,12 @@ function setBadges(mode,date){
 // guards against). Subsystem is a metrics view with no cards → always full-render.
 function stageSig(){
   const v=visible(), dis=v.filter(r=>r.action==="dispatch.start"||r.action==="dispatch.complete").length;
-  if(state.level==="fleet")return "f|"+machines().join(",")+"|"+dis;
-  if(state.level==="machine")return "m|"+state.machine+"|"+sessionsOn(state.machine).join(",")+"|"+dis;
+  // Fold the live-session set in: a session going live / ageing out is a
+  // lifecycle change that must re-render the cards (so the "running"↔"ended"
+  // pill flips), same as a dispatch.start/complete arriving (#638).
+  const ls=liveSig();
+  if(state.level==="fleet")return "f|"+machines().join(",")+"|"+dis+"|"+ls;
+  if(state.level==="machine")return "m|"+state.machine+"|"+sessionsOn(state.machine).join(",")+"|"+dis+"|"+ls;
   if(state.level==="subsystem")return null;
   return "mission";
 }
@@ -679,6 +698,27 @@ function startLiveTail(date){
   };
   LIVE_ES.onerror=()=>{const mb=$("modebadge");if(mb)mb.classList.remove("live");}; // reconnecting — drop the pulse
   window.addEventListener("beforeunload",()=>{if(LIVE_ES)LIVE_ES.close();});
+}
+// (#638) Poll the live-session set on the heartbeat cadence (~5s, matching
+// the emitter's refresh + 15s TTL). Best-effort: a fetch error just leaves
+// the set unchanged rather than flapping sessions offline. Only started in
+// live mode; playback keeps LIVE_SESSIONS empty so nothing reads "running".
+let LIVE_SESS_TIMER=null;
+async function pollLiveSessions(){
+  try{
+    const r=await fetch("/fleet/sessions/live",{headers:{accept:"application/json"}});
+    if(!r.ok)return;
+    const arr=await r.json();
+    const next=(Array.isArray(arr)?arr:[]).map(b=>b&&b.session_id).filter(Boolean);
+    LIVE_SESSIONS.clear(); next.forEach(s=>LIVE_SESSIONS.add(s));
+    applyLive();   // re-renders only if the live set changed the stage signature
+  }catch(_){/* best-effort — keep the last known live set */}
+}
+function startLiveSessionPoll(){
+  if(LIVE_SESS_TIMER)return;
+  pollLiveSessions();
+  LIVE_SESS_TIMER=setInterval(pollLiveSessions,5000);
+  window.addEventListener("beforeunload",()=>{if(LIVE_SESS_TIMER)clearInterval(LIVE_SESS_TIMER);});
 }
 
 // Read injected mode + date from the daemon. The live route (GET /) injects
@@ -718,7 +758,7 @@ async function boot(){
   state.filters={cat:new Set(FCATS),tier:new Set(FTIERS),src:new Set(FSRC),q:""};
   absorbNewFilterValues();
   render();
-  if(mode==="live") startLiveTail(date);
+  if(mode==="live"){ startLiveTail(date); startLiveSessionPoll(); }
 }
 boot();
 </script>

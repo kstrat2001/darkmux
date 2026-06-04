@@ -385,6 +385,21 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     ));
     let dispatch_start_instant = std::time::Instant::now();
 
+    // (#638) Session liveness heartbeat. While THIS dispatch process lives,
+    // refresh a short-TTL `darkmux:session-presence:<sid>` Redis key so the
+    // live fleet view keys "running" on the key's existence — a crashed /
+    // killed / watchdog-timed-out dispatch (which never emits a clean
+    // dispatch.complete) ages out of the live set instead of showing
+    // "running" forever. Self-disables when DARKMUX_REDIS_URL is unset. The
+    // TTL is the crash backstop; `stop()` after the container exits DELetes
+    // the key for an instant drop on the clean path. Held to end-of-fn; an
+    // early `?`-return drops it, halting the thread (key then TTLs out).
+    let session_emitter = darkmux_flow::session_presence::spawn_session_emitter(
+        session_id.clone(),
+        Some(opts.role_id.clone()),
+        Some(model.clone()),
+    );
+
     // 6. Spawn the docker container. Async via `spawn()` (vs the older
     //    `output()`) so the live trajectory tailer (step 7) can run in
     //    parallel and emit flow records mid-dispatch — without that,
@@ -674,6 +689,15 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // failed dispatch).
     sampler_stop.store(true, Ordering::SeqCst);
     let _ = sampler_handle.join();
+
+    // (#638) The container has exited — the session is no longer running.
+    // Stop the liveness heartbeat and DELete its key so the live view drops
+    // the session immediately, before the dispatch.complete record below
+    // (which then renders it terminal). A crash that bypassed this path
+    // leaves the key to age out via TTL instead.
+    if let Some(em) = session_emitter {
+        em.stop();
+    }
 
     let wall_ms = dispatch_start_instant.elapsed().as_millis() as u64;
     let exit_code = output.status.code().unwrap_or(-1);
