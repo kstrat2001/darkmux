@@ -90,7 +90,7 @@ resource-dependent. Compaction is one of N such tasks, not the definition of
 Compaction runs *inside* the agent loop (§5), and **today** there is no
 `compactor` crew role — the fourteen built-in roles (`coder`, `scribe`,
 `code-reviewer`, `analyst`, `voice-editor`, `design-reviewer`, `test-designer`,
-`lab-runner`, `mission-compiler`, `trip-researcher`, `logistics-coordinator`,
+`lab-manager`, `mission-compiler`, `trip-researcher`, `logistics-coordinator`,
 `health-research`, `fitness-coach`, `legal-research`) include none named
 `compactor` (`crates/darkmux-crew/src/loader.rs`), and the compactor model is
 selected via the `ModelRole::Compactor` slot in the profile
