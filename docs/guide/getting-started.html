@@ -77,8 +77,20 @@
 <section>
   <div class="wrap">
     <h2>Install + bootstrap</h2>
-    <h3>One copy-pasteable block</h3>
-    <p>Works from a fresh machine that has LMStudio installed:</p>
+
+    <h3>Recommended path — via Homebrew tap</h3>
+    <p>Works from a fresh macOS machine that has LMStudio installed:</p>
+    <pre><code><span class="comment"># 1. Tap + install</span>
+brew tap kstrat2001/darkmux
+brew install --HEAD darkmux         <span class="comment"># head-only until v0.5.0 ships</span>
+
+<span class="comment"># 2. Bootstrap config + agent skills</span>
+darkmux init</code></pre>
+    <p>The tap is at <a href="https://github.com/kstrat2001/homebrew-darkmux">kstrat2001/homebrew-darkmux</a>. The formula installs the <code>darkmux</code> CLI + <code>serve</code> daemon + the keychain-aware wrapper script. For the production-grade always-on hub setup (Redis hardening, audit substrate, log rotation, daily integrity checks), see the <a href="always-on-hub.html">always-on hub guide</a>.</p>
+    <p><strong>Updating</strong> later is then <code>brew upgrade --HEAD darkmux</code> (+ <code>brew services restart darkmux</code> if you have the daemon running).</p>
+
+    <h3>From-source path — for contributors or if you need the runtime image</h3>
+    <p>The <code>darkmux-runtime</code> Docker image (needed for <code>darkmux crew dispatch</code> and <code>darkmux lab run</code>) is not in the brew install — those flows need a source checkout. Use this path if you're contributing to darkmux or running dispatches on this machine:</p>
     <pre><code><span class="comment"># 1. Install Rust toolchain (skip if `cargo --version` already works)</span>
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source "$HOME/.cargo/env"
@@ -88,7 +100,10 @@ git clone https://github.com/kstrat2001/darkmux
 cd darkmux
 cargo install --path .
 
-<span class="comment"># 3. Bootstrap config + agent skills</span>
+<span class="comment"># 3. Build the runtime image (optional, needed for dispatches)</span>
+docker build -t darkmux-runtime:latest runtime/
+
+<span class="comment"># 4. Bootstrap config + agent skills</span>
 darkmux init</code></pre>
     <div class="callout">
       <strong>Heads up.</strong>
