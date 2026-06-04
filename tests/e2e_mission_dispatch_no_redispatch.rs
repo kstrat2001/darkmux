@@ -6,7 +6,7 @@
 //! BUT mission dispatch doesn't call `lifecycle::sprint_start` so the
 //! sprints stay `Planned` in their JSON after the first dispatch. A
 //! second invocation of `mission dispatch` finds the same Planned
-//! sprints and re-publishes them — two workers race on the same work.
+//! sprints and re-publishes them — two runners race on the same work.
 //!
 //! Post-fix (this PR): `cmd_mission_dispatch` calls
 //! `lifecycle::sprint_start` on each filtered sprint BEFORE publishing.

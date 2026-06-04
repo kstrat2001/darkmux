@@ -363,7 +363,7 @@ pub fn isolate_test_env_once() {
 /// but never completes the handshake (e.g. a half-functional Redis,
 /// a TCP listener that does nothing, certain VPN-flap states) can
 /// wedge the caller indefinitely. This wrapper runs the full
-/// connect-and-handshake in a worker thread and bails at
+/// connect-and-handshake in a background thread and bails at
 /// `timeout * 2` wall-clock regardless of which phase is stuck —
 /// same shape as the DNS-resolution wrapper in `fleet::parse_address`
 /// (#265 Wave-E.10).
@@ -383,14 +383,14 @@ pub(crate) fn open_redis_connection_bounded(
         .spawn(move || {
             let result = client_clone.get_connection_with_timeout(timeout);
             // Ignore send errors — receiver may have given up on
-            // timeout. The worker thread keeps running until the
+            // timeout. The background thread keeps running until the
             // underlying socket gives up (post-connect handshake
             // hangs are bounded by the OS TCP keepalive + the redis-
             // crate's handshake, which can be minutes on a peer that
             // accepts but never responds). The leak is per-wedge, not
             // unbounded growth — but operators with a long-running
             // daemon hitting a half-functional peer may accumulate
-            // worker threads over time. Acceptable for the personal-
+            // background threads over time. Acceptable for the personal-
             // scope target; revisit if it bites.
             let _ = tx.send(result);
         })
@@ -404,7 +404,7 @@ pub(crate) fn open_redis_connection_bounded(
             (timeout * 2).as_millis()
         )),
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(anyhow::anyhow!(
-            "redis-connect worker thread panicked or exited without sending result"
+            "redis-connect background thread panicked or exited without sending result"
         )),
     }
 }

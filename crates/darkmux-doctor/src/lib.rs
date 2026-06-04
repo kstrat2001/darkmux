@@ -687,7 +687,7 @@ fn utility_binding_status(
             message: "no machine utility model registered; compaction uses the runtime default"
                 .into(),
             hint: Some(
-                "Optional: register a small fast model as this machine's utility model in ~/.darkmux/profiles.json — `\"internal\": { \"utility\": \"<model-id>\" }`. It serves compaction (and future estimation/mission-compile) for every role, decoupled from your worker profiles. (#590)".into(),
+                "Optional: register a small fast model as this machine's utility model in ~/.darkmux/profiles.json — `\"internal\": { \"utility\": \"<model-id>\" }`. It serves compaction (and future estimation/mission-compile) for every role, decoupled from your profiles. (#590)".into(),
             ),
         };
     };
@@ -1287,7 +1287,7 @@ fn check_profile_loaded_match() -> Check {
 
     let mut matching: Vec<&str> = Vec::new();
     for (name, profile) in &registry.registry.profiles {
-        // (#590) The profile's default worker (default_model, or first model)
+        // (#590) The profile's default model (default_model, or first model)
         // is the load-bearing match — the old Primary-role check.
         let default_id = profile.default_model_id();
         let primaries = profile

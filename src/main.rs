@@ -405,16 +405,16 @@ enum CrewCmd {
         /// Advisory target machine for the dispatch (#246 PR-C.3). When
         /// set to an id that's NOT the local `DARKMUX_MACHINE_ID`, the
         /// dispatch is published to the single global fleet work queue
-        /// (`darkmux:work`) and the first available worker picks it up.
-        /// The id is an advisory hint (#590): any worker may claim it;
-        /// a non-target worker logs a soft warning and proceeds. When
+        /// (`darkmux:work`) and the first available runner picks it up.
+        /// The id is an advisory hint (#590): any runner may claim it;
+        /// a non-target runner logs a soft warning and proceeds. When
         /// omitted, the dispatch runs locally. Requires
         /// `DARKMUX_REDIS_URL` set on the dispatching machine +
-        /// `darkmux serve` running on the worker.
+        /// `darkmux serve` running on the runner.
         #[arg(long, value_name = "ID")]
         machine: Option<String>,
         /// Return immediately after publishing to the queue instead of
-        /// blocking on the worker's `dispatch.complete` (#246 PR-C.3).
+        /// blocking on the runner's `dispatch.complete` (#246 PR-C.3).
         /// Default is `--wait` (block) so today's "spawn, see result"
         /// ergonomics are preserved. With `--no-wait`, the CLI prints
         /// the `session_id` and exits 0; the operator polls completion
@@ -643,7 +643,7 @@ enum MissionCmd {
     /// work the operator owns.
     ///
     /// Each sprint becomes a WorkJob published to the single global
-    /// `darkmux:work` stream (#590); the first available worker claims
+    /// `darkmux:work` stream (#590); the first available runner claims
     /// and runs each one. Default `--wait` blocks until all sprints emit
     /// `dispatch.complete` (or timeout). `--no-wait` returns immediately
     /// with the session_ids for later polling.
@@ -659,8 +659,8 @@ enum MissionCmd {
         role: String,
         /// Optional advisory target machine for every sprint. When
         /// omitted, jobs publish with no `target_machine` hint — the
-        /// first available worker claims each (pull semantics). The hint
-        /// is advisory (#590): any worker may claim regardless.
+        /// first available runner claims each (pull semantics). The hint
+        /// is advisory (#590): any runner may claim regardless.
         #[arg(long, value_name = "ID")]
         machine: Option<String>,
         /// Per-sprint dispatch timeout (seconds). Default 600.
@@ -1492,7 +1492,7 @@ fn cmd_mission_dispatch(
 
     // 2. Confirm the role exists before fanning out sprints. After #590
     //    there is no tier requirement — sprints fan onto the single
-    //    global `darkmux:work` stream and the first available worker
+    //    global `darkmux:work` stream and the first available runner
     //    claims each one.
     let roles = load_roles()?;
     if !roles.iter().any(|r| r.id == role_id) {
@@ -1584,7 +1584,7 @@ fn cmd_mission_dispatch(
             None,
             None,
             Some(sprint.id.clone()),
-            // Mission dispatch publishes work jobs to peers; the worker
+            // Mission dispatch publishes work jobs to peers; the runner
             // on the receiving machine runs the role through the
             // internal Docker-bounded runtime (same default as local
             // dispatch — Beat 36 directional principle, openclaw
@@ -1621,7 +1621,7 @@ fn cmd_mission_dispatch(
             Err(e) => {
                 eprintln!(
                     "\ndarkmux mission dispatch: ERROR — publish failed for sprint `{sprint_id}` \
-                     after {} successful publishes. Already-published jobs are in flight on workers:",
+                     after {} successful publishes. Already-published jobs are in flight on runners:",
                     sessions.len()
                 );
                 for (sid, sess, wid) in &sessions {
@@ -1697,11 +1697,11 @@ fn cmd_mission_dispatch(
     match speedup_verdict(sum_sprint_wall_ms, mission_wall_ms, sessions.len()) {
         SpeedupVerdict::ParallelConfirmed { speedup } => println!(
             "  → wall-clock indicates parallel execution: {speedup:.2}× speedup vs the \
-             sum of per-sprint wall_ms (worker self-reported; not authenticated)."
+             sum of per-sprint wall_ms (runner self-reported; not authenticated)."
         ),
         SpeedupVerdict::SeriallySuspect { speedup } => println!(
             "  ⚠ wall_ms ≈ sum of sprint wall_ms ({speedup:.2}×) — sprints may have run \
-             serially. Check fleet roster + worker reachability."
+             serially. Check fleet roster + runner reachability."
         ),
         SpeedupVerdict::Inconclusive => {}
     }
@@ -1757,7 +1757,7 @@ pub enum SpeedupVerdict {
     /// Wall-clock ≈ sum-of-sprints (`speedup < threshold`) with multiple
     /// sprints — sprints may have run serially under the hood. Caller
     /// renders the operator-warning line pointing at fleet roster +
-    /// worker reachability.
+    /// runner reachability.
     SeriallySuspect { speedup: f64 },
     /// Insufficient data to assert parallel vs serial: either zero
     /// sprints completed (`sum_sprint_wall_ms == 0`) OR exactly one
@@ -1769,7 +1769,7 @@ pub enum SpeedupVerdict {
 /// summaries collected during `mission dispatch --wait`:
 ///
 /// - `sum_sprint_wall_ms` — sum of `wall_ms` from each
-///   `dispatch.complete` flow record. Worker self-reported.
+///   `dispatch.complete` flow record. Runner self-reported.
 /// - `mission_wall_ms` — wall time from `mission dispatch` invocation
 ///   to the last completion seen, measured by the publisher.
 /// - `n_sprints` — number of sprints dispatched (sessions.len()).
@@ -2668,7 +2668,7 @@ fn cmd_profiles(config: Option<&str>) -> Result<i32> {
         if let Some(desc) = profile.description.as_deref() {
             println!("  {desc}");
         }
-        // (#590) Models no longer carry a role; mark the default worker
+        // (#590) Models no longer carry a role; mark the default model
         // (default_model, or first model) instead.
         let default_id = profile.default_model_id();
         for m in &profile.models {

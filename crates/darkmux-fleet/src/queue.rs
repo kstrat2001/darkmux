@@ -4,7 +4,7 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
 /// The single global work stream. After #590 the fleet routes all work
-/// onto one stream; the first available worker claims any job. The former
+/// onto one stream; the first available runner claims any job. The former
 /// per-tier streams (`darkmux:work:<tier>`) are retired — machine-capacity
 /// tier is no longer the work-routing key.
 pub(crate) const WORK_STREAM: &str = "darkmux:work";
@@ -13,19 +13,19 @@ pub(crate) const WORK_STREAM: &str = "darkmux:work";
 /// to XADD). 1000 in-flight + recently-acked jobs is generous — at
 /// 2-machine fleet scale, the steady-state depth is bounded by
 /// in-flight count (typically 1-2). The cap exists to prevent a stuck
-/// or crashed worker from growing the stream unboundedly.
-#[allow(dead_code)] // PR-C.1 substrate; consumed by PR-C.2 (worker loop) + PR-C.3 (client push)
+/// or crashed runner from growing the stream unboundedly.
+#[allow(dead_code)] // PR-C.1 substrate; consumed by PR-C.2 (runner loop) + PR-C.3 (client push)
 pub(crate) const WORK_STREAM_MAXLEN: usize = 1000;
 
 /// One unit of dispatch work flowing through the queue. The producing
-/// orchestrator constructs and publishes; the consuming worker reads,
+/// orchestrator constructs and publishes; the consuming runner reads,
 /// dispatches, and acks. Serialized as the `record` field on a Redis
 /// stream entry; the stream entry's auto-assigned ID becomes the
 /// canonical `work_id` after claim.
 ///
 /// Backward-compat shape: all fields are explicit (no `#[serde(default)]`
 /// trickery) so any change to this struct is a deliberate schema bump.
-/// Older worker code seeing a newer-shaped job will fail to deserialize
+/// Older runner code seeing a newer-shaped job will fail to deserialize
 /// loudly rather than dispatching with missing context.
 ///
 /// `#[serde(deny_unknown_fields)]` (PR-C.2) — a publisher cannot inject
@@ -38,15 +38,15 @@ pub(crate) const WORK_STREAM_MAXLEN: usize = 1000;
 pub struct WorkJob {
     /// Optional advisory machine hint — when set, the dispatching
     /// orchestrator suggests this specific machine should handle the job.
-    /// Advisory only (#590): any worker may claim the job off the single
-    /// `WORK_STREAM`; a non-target worker logs a soft warning and
+    /// Advisory only (#590): any runner may claim the job off the single
+    /// `WORK_STREAM`; a non-target runner logs a soft warning and
     /// proceeds. There is NO NACK/requeue enforcement. When `None`, the
-    /// first available worker claims it (pull semantics).
+    /// first available runner claims it (pull semantics).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_machine: Option<String>,
 
     /// Role to dispatch against — `darkmux/<role-id>` resolves to the
-    /// openclaw agent on the worker side.
+    /// openclaw agent on the runner side.
     pub role_id: String,
 
     /// The operator's dispatch message — handed verbatim to the runtime.
@@ -63,7 +63,7 @@ pub struct WorkJob {
     pub deliver: Option<String>,
 
     /// Optional `--workdir` override (resolved to a string for transport;
-    /// re-parsed to PathBuf on the worker side).
+    /// re-parsed to PathBuf on the runner side).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workdir: Option<String>,
 
@@ -71,11 +71,11 @@ pub struct WorkJob {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sprint_id: Option<String>,
 
-    /// Which runtime the worker should use — `Openclaw` (default) or
+    /// Which runtime the runner should use — `Openclaw` (default) or
     /// `Internal`. Wave-E.14 lifted this from `String` to the
     /// `Runtime` enum: a mistyped runtime is rejected at JSON-parse
     /// time by serde rather than at `validate()`, eliminating a class
-    /// of "publisher snuck through validate, worker crashed" bugs.
+    /// of "publisher snuck through validate, runner crashed" bugs.
     #[serde(default)]
     pub runtime: darkmux_crew::dispatch::Runtime,
 
@@ -105,7 +105,7 @@ pub struct WorkJob {
 
 /// Max byte size of a `WorkJob.message` accepted by the queue. A
 /// publisher cannot XADD a multi-megabyte prompt that would force every
-/// worker to allocate it on deserialize. 256 KiB matches the
+/// runner to allocate it on deserialize. 256 KiB matches the
 /// reasoning-text cap in `dispatch_internal.rs` (#231 / S6) — same
 /// rationale, same number. (#246 PR-C.2 boundary defense)
 pub(crate) const MAX_WORK_MESSAGE_BYTES: usize = 256 * 1024;
@@ -123,7 +123,7 @@ pub(crate) const MAX_WORK_WORKDIR_BYTES: usize = 4 * 1024;
 pub(crate) const MAX_WORK_IDENTIFIER_LEN: usize = 64;
 
 /// Max allowed `timeout_seconds` on a queued `WorkJob`. 1 hour bounds
-/// the worst-case "publisher pins this machine's single worker" surface.
+/// the worst-case "publisher pins this machine's single runner" surface.
 /// Legitimate dispatches measured in this codebase top out around 15
 /// minutes (long-agentic-shape workloads at large context); 1 hour is
 /// 4× that headroom. A publisher specifying `u32::MAX` (136 years) is
@@ -145,7 +145,7 @@ impl WorkJob {
     ///   exhaustion at deserialize time.
     /// - Optional `workdir` ≤ `MAX_WORK_WORKDIR_BYTES`. The
     ///   symlink-escape check on the resolved path is done by the
-    ///   worker (PR-C.2b / follow-up).
+    ///   runner (PR-C.2b / follow-up).
     ///
     /// `runtime` is not checked here — the field is the `Runtime` enum,
     /// so an unknown variant is rejected at JSON deserialization
@@ -227,7 +227,7 @@ fn validate_work_identifier(field: &str, value: &str) -> Result<()> {
     validate_identifier(&format!("WorkJob.{field}"), value)
 }
 
-/// Result of a successful `claim_job` — the worker now owns the job.
+/// Result of a successful `claim_job` — the runner now owns the job.
 /// `work_id` is the Redis stream entry ID assigned at publish time
 /// (canonical form: `<ms>-<seq>`); `ack_job` uses it to acknowledge
 /// completion.
@@ -242,16 +242,16 @@ pub(crate) struct ClaimedJob {
 ///
 /// XADD fields:
 /// - `schema`: `WORK_JOB_SCHEMA_VERSION` ("2") — wire-version tag so
-///   future schema bumps can be detected by older workers
+///   future schema bumps can be detected by older runners
 /// - `record`: the JSON-serialized WorkJob
 ///
-/// Capped at `WORK_STREAM_MAXLEN` via `MAXLEN ~ N` so a stuck worker
+/// Capped at `WORK_STREAM_MAXLEN` via `MAXLEN ~ N` so a stuck runner
 /// can't grow the stream unboundedly.
-#[allow(dead_code)] // PR-C.1 substrate; consumed by PR-C.2 (worker loop) + PR-C.3 (client push)
+#[allow(dead_code)] // PR-C.1 substrate; consumed by PR-C.2 (runner loop) + PR-C.3 (client push)
 pub fn publish_job(client: &redis::Client, job: &WorkJob) -> Result<String> {
     // Fail-fast at the queue boundary — better to reject a malformed
     // job at publish than to ship it across the network and trip the
-    // consumer-side validator after one or more workers waste their
+    // consumer-side validator after one or more runners waste their
     // claim budget on it. (#246 PR-C.2)
     job.validate()
         .context("validating WorkJob before publish")?;
@@ -276,12 +276,12 @@ pub fn publish_job(client: &redis::Client, job: &WorkJob) -> Result<String> {
 }
 
 /// Wire-schema version tag carried alongside each job. Bumped when
-/// `WorkJob` shape changes in a way old workers can't safely parse.
+/// `WorkJob` shape changes in a way old runners can't safely parse.
 /// Bumped "1" → "2" in #590 (single-stream collapse: `target_tier`
-/// removed from `WorkJob`). `deny_unknown_fields` means a "1"-era worker
-/// and a "2"-era worker are non-interop by design — a clean pre-1.0
+/// removed from `WorkJob`). `deny_unknown_fields` means a "1"-era runner
+/// and a "2"-era runner are non-interop by design — a clean pre-1.0
 /// wire break.
-#[allow(dead_code)] // PR-C.1 substrate; consumed by PR-C.2 (worker loop) + PR-C.3 (client push)
+#[allow(dead_code)] // PR-C.1 substrate; consumed by PR-C.2 (runner loop) + PR-C.3 (client push)
 pub(crate) const WORK_JOB_SCHEMA_VERSION: &str = "2";
 
 /// Ensure the consumer group exists on the single global stream.
@@ -326,7 +326,7 @@ pub(crate) fn init_consumer_group(client: &redis::Client, group: &str) -> Result
 /// `WorkJob`. Malformed entries (deserialize failure) are surfaced as
 /// errors so the caller can decide whether to ack-and-skip or bail.
 ///
-/// `consumer` is the per-worker identity (typically `DARKMUX_MACHINE_ID`)
+/// `consumer` is the per-runner identity (typically `DARKMUX_MACHINE_ID`)
 /// — Redis tracks per-consumer pending-entries lists for lease semantics
 /// (PR-E will consume these).
 pub(crate) fn claim_job(
@@ -447,7 +447,7 @@ pub(crate) fn extract_field(fields: &[redis::Value], key: &str) -> Option<String
 /// pending-entries list (PEL). After ack, the job is fully delivered
 /// from the queue's perspective.
 ///
-/// Worker MUST call this after the dispatch completes, regardless of
+/// Runner MUST call this after the dispatch completes, regardless of
 /// dispatch success — the `dispatch.complete` flow record carries the
 /// success/error signal; the ack just releases the queue lease.
 pub(crate) fn ack_job(client: &redis::Client, group: &str, work_id: &str) -> Result<()> {

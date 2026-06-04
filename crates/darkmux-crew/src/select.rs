@@ -3,7 +3,7 @@
 //! Capability-scored selection over the profile's `models[]`: matches the
 //! role's requested capability vector ([`crate::types::Role::capabilities`])
 //! against each model's offered vector. Falls back to the profile's default
-//! worker ([`darkmux_types::Profile::default_model_id`]) when there's no basis
+//! model ([`darkmux_types::Profile::default_model_id`]) when there's no basis
 //! to differentiate (no requested capabilities, or no model carries an offer
 //! vector) — the reality until operators populate `capabilities`.
 //!
@@ -34,7 +34,7 @@ use darkmux_types::{CapabilityProfile, Profile, ProfileModel};
 /// **Behavior-preserving until vectors are populated.** When the role requests
 /// no capabilities OR no model in the profile carries an offer vector — the
 /// reality for every shipped profile today — there's no basis to
-/// differentiate, so selection falls back to the profile's default worker
+/// differentiate, so selection falls back to the profile's default model
 /// (`default_model_id()`: the explicit `default_model`, or the first model).
 /// Real scoring only activates once an operator characterizes models with
 /// `capabilities` from lab results.
@@ -42,13 +42,13 @@ use darkmux_types::{CapabilityProfile, Profile, ProfileModel};
 /// **Scoring** is a weighted dot product of the role's requested vector
 /// against each model's offered vector; a model with no declared vector scores
 /// as a 0.5-everywhere generalist (#450) — neutral, not penalized. Highest
-/// score wins; a flat tie breaks toward the default worker model
+/// score wins; a flat tie breaks toward the default model
 /// (`default_model_id()`), then first-declared.
 ///
 /// `skill_lookup` resolves a skill id → [`Skill`] so the role's requested
 /// vector composes via [`crate::types::Role::capabilities`]. A lookup that
 /// returns `None` (skills unavailable) yields an empty request → the
-/// default-worker fallback, which is safe.
+/// default-model fallback, which is safe.
 ///
 /// **Precedence note:** operator-pin precedence sits ABOVE this in the
 /// dispatch path (a later slice of #590).
@@ -62,20 +62,20 @@ where
     F: Fn(&str) -> Option<&'a Skill>,
 {
     let request = role.capabilities(skill_lookup);
-    // (#590) The profile's `models[]` are worker-only — the compactor moved to
-    // the registry's `internal.utility` binding, so there's no util model to
+    // (#590) The profile's `models[]` are all work models — the compactor moved
+    // to the registry's `internal.utility` binding, so there's no util model to
     // exclude from the candidate set.
     let any_offers = profile.models.iter().any(|m| !m.capabilities.is_empty());
 
     // Nothing to differentiate on (no requested capabilities, or no model
-    // offers a vector) → the deterministic default worker. This is the path
+    // offers a vector) → the deterministic default model. This is the path
     // every shipped profile takes until operators populate `capabilities`.
     if request.is_empty() || !any_offers {
         return default_or_error(profile);
     }
 
     // Capability scoring: highest weighted-dot-product wins; a flat tie breaks
-    // toward the default worker model, then first-declared.
+    // toward the default model, then first-declared.
     let default_id = profile.default_model_id();
     let mut best: Option<(&ProfileModel, f32)> = None;
     for m in &profile.models {
@@ -132,7 +132,7 @@ fn no_default_error() -> anyhow::Error {
     anyhow!(
         "active profile has no models configured. Add at least one model to the \
          profile's `models[]` (and optionally set `default_model` to pick the \
-         default worker). (#590)"
+         default model). (#590)"
     )
 }
 
@@ -247,7 +247,7 @@ mod tests {
     }
 
     /// Phase-2 scoring: once models carry capability vectors, the best-fit
-    /// model wins on score — even over the default-worker model.
+    /// model wins on score — even over the default model.
     #[test]
     fn select_scores_best_capability_fit_over_default() {
         let coding = skill_with("coding", &[(Capability::Code, 0.9), (Capability::Reasoning, 0.3)]);
@@ -255,7 +255,7 @@ mod tests {
         let role = make_role("coder", &["coding"]);
         let profile = Profile {
             models: vec![
-                // Default worker (first), weak on code: 0.9*0.2 + 0.3*0.9 = 0.45
+                // Default model (first), weak on code: 0.9*0.2 + 0.3*0.9 = 0.45
                 model_with("reasoner",
                     &[(Capability::Code, 0.2), (Capability::Reasoning, 0.9)]),
                 // Strong on code: 0.9*0.9 + 0.3*0.4 = 0.93

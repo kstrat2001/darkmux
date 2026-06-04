@@ -9,11 +9,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 //
 // After `publish_job` returns, the dispatching client can either return
 // immediately (fire-and-forget; the operator polls flow stream from
-// elsewhere) OR block until the worker's `dispatch.complete` flow
+// elsewhere) OR block until the runner's `dispatch.complete` flow
 // record lands for the matching `session_id`. The `--wait` wrapper
 // implements the blocking form by **polling the Redis flow stream**
 // (`darkmux:flow`) — NOT the local file, because in a cross-machine
-// dispatch the completion record lands on the WORKER's local file,
+// dispatch the completion record lands on the RUNNER's local file,
 // not the publisher's. The Redis stream is the only substrate both
 // machines write to (via the shared TeeSink → RedisSink composition).
 //
@@ -51,7 +51,7 @@ pub struct CompletionResult {
 /// Block until a `dispatch.complete` flow record for `session_id` lands
 /// in the Redis flow stream, or `timeout` elapses. Returns the
 /// completion result on success; bails when the timeout fires (the job
-/// may still be running on the remote worker — the operator can re-tail
+/// may still be running on the remote runner — the operator can re-tail
 /// via `darkmux flow tail --session <id>` to keep watching).
 ///
 /// Polls the Redis stream (default `darkmux:flow`; override via
@@ -64,7 +64,7 @@ pub struct CompletionResult {
 /// model is fine; PR-E may add last-id tracking for efficiency.
 ///
 /// **Why poll Redis, not the local file:** in a cross-machine dispatch
-/// the worker writes the `dispatch.complete` record to its OWN local
+/// the runner writes the `dispatch.complete` record to its OWN local
 /// `~/.darkmux/flows/<day>.jsonl`, not the publisher's. The Redis
 /// stream is the only substrate both machines write to (the shared
 /// `darkmux:flow` stream via the TeeSink → RedisSink composition).
@@ -91,7 +91,7 @@ pub fn wait_for_completion(
             return Err(anyhow!(
                 "wait_for_completion: no dispatch.complete for session_id={session_id} \
                  within {}s in Redis stream {stream}. The job may still be running on the \
-                 worker — tail `darkmux flow tail --session {session_id}` to keep watching.",
+                 runner — tail `darkmux flow tail --session {session_id}` to keep watching.",
                 timeout.as_secs()
             ));
         }
@@ -239,7 +239,7 @@ pub fn build_work_job(
 // edge that made `crew` un-extractable as a crate). `crew::dispatch::dispatch`
 // is now purely local; `dispatch_routed` is the front door for user-facing
 // dispatch callers (main / sprint_cli / mission_propose / notebook). The
-// fleet worker calls `crew::dispatch::dispatch` directly — it's already on
+// fleet runner calls `crew::dispatch::dispatch` directly — it's already on
 // the chosen machine, so it must run locally and never re-route.
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -247,11 +247,11 @@ use darkmux_crew::dispatch::{self, DispatchOpts, DispatchResult, RoutingDecision
 
 /// Route a dispatch local-vs-remote, then run it. When `--machine` is set
 /// (and isn't the local machine), publish to the single global work queue
-/// and (if `--wait`) block on the worker's `dispatch.complete` flow
+/// and (if `--wait`) block on the runner's `dispatch.complete` flow
 /// record. Otherwise fall through to the local dispatch path
 /// (`crew::dispatch::dispatch`). After #590 there is no tier auto-route:
 /// the only fleet-queue path is explicit `--machine`, and it's advisory
-/// (any worker may claim; a non-target worker logs a soft warning and
+/// (any runner may claim; a non-target runner logs a soft warning and
 /// proceeds). (#246 PR-C.3; relocated from `crew::dispatch::dispatch` in
 /// #463; tier auto-route retired in #590.)
 pub fn dispatch_routed(opts: DispatchOpts) -> Result<DispatchResult> {
@@ -319,12 +319,12 @@ pub fn dispatch_routed(opts: DispatchOpts) -> Result<DispatchResult> {
 /// Publish a dispatch to the single global fleet work queue instead of
 /// running it locally (#246 PR-C.3). Called from `dispatch_routed` when
 /// `opts.machine` is set to a non-local id. If `opts.wait` is true (the
-/// default for `crew dispatch`), blocks on the worker's
+/// default for `crew dispatch`), blocks on the runner's
 /// `dispatch.complete` flow record before returning; otherwise returns
 /// immediately with a fire-and-forget synthetic result.
 /// `target_machine: Some(id)` stamps the WorkJob's advisory hint field so
 /// the audit trail and topology view see the operator-pinned target (#590:
-/// advisory only — any worker may claim).
+/// advisory only — any runner may claim).
 fn dispatch_via_queue(opts: DispatchOpts, target_machine: Option<&str>) -> Result<DispatchResult> {
     // The Redis URL is required for cross-machine dispatch. If it's
     // unset, the operator hasn't configured the fleet substrate — bail
@@ -345,7 +345,7 @@ fn dispatch_via_queue(opts: DispatchOpts, target_machine: Option<&str>) -> Resul
             )
         })?;
 
-    // Resolve session_id up front — the worker needs it to stamp on
+    // Resolve session_id up front — the runner needs it to stamp on
     // the dispatch.complete record, and --wait needs it as the join key.
     let session_id = opts
         .session_id
@@ -353,7 +353,7 @@ fn dispatch_via_queue(opts: DispatchOpts, target_machine: Option<&str>) -> Resul
         .unwrap_or_else(|| dispatch::fresh_session_id(&opts.role_id));
 
     // Build the WorkJob from DispatchOpts. The shape mirrors what the
-    // worker side reconstructs via `WorkJob::into_dispatch_opts` —
+    // runner side reconstructs via `WorkJob::into_dispatch_opts` —
     // round-trip parity matters for cross-machine dispatch.
     let job = build_work_job(
         target_machine.map(|s| s.to_string()),
@@ -396,14 +396,14 @@ fn dispatch_via_queue(opts: DispatchOpts, target_machine: Option<&str>) -> Resul
             session_id,
             watched_state: Vec::new(),
             // Remote/queue path: the runtime's bookkeeping lands on the
-            // worker, not on this dispatching host.
+            // runner, not on this dispatching host.
             out_dir: None,
         });
     }
 
-    // Block on the worker's dispatch.complete. Timeout = the job's own
-    // timeout + a small slack (the worker's clock starts at claim, so
-    // the dispatching client's wait must outlast the worker's budget).
+    // Block on the runner's dispatch.complete. Timeout = the job's own
+    // timeout + a small slack (the runner's clock starts at claim, so
+    // the dispatching client's wait must outlast the runner's budget).
     let wait_timeout =
         std::time::Duration::from_secs((opts.timeout_seconds as u64).saturating_add(30));
     eprintln!(
@@ -420,7 +420,7 @@ fn dispatch_via_queue(opts: DispatchOpts, target_machine: Option<&str>) -> Resul
     );
 
     // Translate completion → DispatchResult. We don't have stdout from
-    // the worker side (it lives in the worker's flow records, not the
+    // the runner side (it lives in the runner's flow records, not the
     // dispatching CLI's stdout); surface the result_class + wall_ms in
     // the synthetic stdout so the operator sees something useful.
     Ok(completion_to_dispatch_result(completion))
@@ -441,7 +441,7 @@ pub(crate) fn completion_to_dispatch_result(c: CompletionResult) -> DispatchResu
     let exit_code = payload_exit_code.unwrap_or(if c.result_class == "ok" { 0 } else { 1 });
     let stdout = format!(
         "remote dispatch complete; result_class={} exit_code={exit_code} wall_ms={:?} session={}\n\
-         (full output in worker's flow records — \
+         (full output in runner's flow records — \
           tail `~/.darkmux/flows/<date>.jsonl` for session={})\n",
         c.result_class, c.wall_ms, c.session_id, c.session_id,
     );
@@ -452,7 +452,7 @@ pub(crate) fn completion_to_dispatch_result(c: CompletionResult) -> DispatchResu
         session_id: c.session_id,
         watched_state: Vec::new(),
         // Remote/queue path: the runtime's bookkeeping lands on the
-        // worker, not on this dispatching host.
+        // runner, not on this dispatching host.
         out_dir: None,
     }
 }

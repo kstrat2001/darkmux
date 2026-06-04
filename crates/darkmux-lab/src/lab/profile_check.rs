@@ -31,7 +31,7 @@ use darkmux_types::{LoadedModel, Profile};
 ///
 /// Two findings, both pointing at the same risk — the manifest's
 /// `profile=` tag may not reflect the real runtime envelope:
-///   1. The profile's **default worker** model isn't in the loaded set at
+///   1. The profile's **default** model isn't in the loaded set at
 ///      all, so the dispatch will use whatever LMStudio has loaded.
 ///   2. A declared model **is** loaded but at a materially different
 ///      context window than the profile declares.
@@ -47,7 +47,7 @@ pub(crate) fn envelope_warnings(
     if loaded.is_empty() {
         return out;
     }
-    // (#590) Only the default worker (default_model, or first model) is
+    // (#590) Only the default model (default_model, or first model) is
     // load-bearing for the measurement envelope.
     let default_id = profile.default_model_id();
     for pm in &profile.models {
@@ -56,7 +56,7 @@ pub(crate) fn envelope_warnings(
                 // A missing non-default model is common and not worth the noise.
                 if Some(pm.id.as_str()) == default_id {
                     out.push(format!(
-                        "requested profile `{profile_name}` declares default-worker model `{}` (ctx {}) \
+                        "requested profile `{profile_name}` declares default model `{}` (ctx {}) \
                          but it is not among the currently loaded models — the dispatch will use \
                          whatever LMStudio has loaded, so this run's `profile={profile_name}` tag \
                          may not reflect the real runtime envelope. Run `darkmux swap {profile_name}` \
@@ -147,9 +147,9 @@ mod tests {
 
     #[test]
     fn missing_non_default_model_does_not_warn() {
-        // (#590) Only the default worker (first model) is load-bearing for the
+        // (#590) Only the default model (first model) is load-bearing for the
         // envelope. The first model is loaded; a missing SECOND (non-default)
-        // worker is common and quiet. (Replaces the old primary+compactor case —
+        // model is common and quiet. (Replaces the old primary+compactor case —
         // the compactor moved to the registry's internal.utility binding and can
         // no longer live in `models[]`.)
         let p = profile(vec![pm("qwen-35b", 262000), pm("qwen-4b", 68000)]);

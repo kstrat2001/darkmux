@@ -271,10 +271,10 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // 2. Resolve the model. (#450 / #590) `select_model(role, profile,
     //    skill_lookup)` capability-scores the role's requested vector against
     //    the profile's candidate models; with no offer vectors it falls back
-    //    to the profile's default worker model (ModelRole removed in #601).
+    //    to the profile's default model (ModelRole removed in #601).
     //    The profile is the `--profile` override when set (#549), else the
     //    registry's `default_profile`. If no profile is configured (or has
-    //    no worker), falls back to `probe_loaded_model()` with a deprecation
+    //    no model), falls back to `probe_loaded_model()` with a deprecation
     //    warning — back-compat for operators on the pre-refactor-1b config
     //    shape; the warning surfaces the gap so they migrate.
     //
@@ -283,7 +283,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     //    activates per-hardware tuple selection.
     let model = resolve_dispatch_model_internal(role, opts.profile_name.as_deref()).context(
         "model selection failed. Ensure `~/.darkmux/profiles.json` has \
-         a profile with at least one model (the default worker is \
+         a profile with at least one model (the default model is \
          `default_model` or the first model in `models`), or load a model in \
          LMStudio (darkmux swap <profile>) as the deprecated fallback."
     )?;
@@ -473,14 +473,14 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // (#590) Overlay the machine-level utility model (`internal.utility`) as
     // the compactor, unless already pinned. The util model is darkmux's
     // standing support model for this machine — one global model for
-    // compaction, decoupled from the worker profile. Best-effort: no binding
+    // compaction, decoupled from the profile. Best-effort: no binding
     // ⇒ untouched ⇒ runtime keeps its built-in default compactor.
     let utility_model = resolve_utility_model_internal();
     compaction.apply_utility_model(utility_model.as_deref());
     // (#632) The runtime has no built-in context-window default — it
     // REQUIRES one to derive its compaction threshold. Bare `crew dispatch`
     // and the lab `prompt` provider hand us a `default()` with
-    // `context_window: None`; fill it from the resolved default-worker
+    // `context_window: None`; fill it from the resolved default-model
     // profile so no dispatch path can leave the runtime without one. (The
     // coding-task provider already sets it via `from_profile` — the guard
     // leaves any already-set window untouched.)
@@ -1561,9 +1561,9 @@ fn check_docker_preflight() -> Result<()> {
 ///    back to `probe_loaded_model()`.
 /// 2. Look up the profile + call `select_model(role, profile, skill_lookup)`,
 ///    which capability-scores the role against the profile's models (#590),
-///    falling back to the profile's default worker model when no vectors
+///    falling back to the profile's default model when no vectors
 ///    are populated (ModelRole removed in #601).
-/// 3. On any failure (no registry, no default, no profile, no worker),
+/// 3. On any failure (no registry, no default, no profile, no model),
 ///    log a deprecation warning + fall back to `probe_loaded_model()`.
 ///    Back-compat for pre-refactor-1b configurations; the warning
 ///    points the operator at the migration.
@@ -1623,7 +1623,7 @@ fn resolve_dispatch_model_internal(
     // (#590 phase 2) Build a skill lookup so select_model can compose the
     // role's requested capability vector (role → skills → CapabilityProfile).
     // Skills unavailable ⇒ empty lookup ⇒ select_model takes its
-    // default-worker-model fallback (safe + behavior-preserving; #601).
+    // default-model fallback (safe + behavior-preserving; #601).
     let skill_index: std::collections::HashMap<String, crate::types::Skill> =
         crate::loader::load_skills()
             .unwrap_or_default()
@@ -1637,7 +1637,7 @@ fn resolve_dispatch_model_internal(
             // profile's models in LMStudio but does NOT update
             // `default_profile` in the registry — so after `swap fast`
             // with default `balanced`, this path would happily select
-            // balanced's default worker model while LMStudio is loaded
+            // balanced's default model while LMStudio is loaded
             // with fast's models. The dispatch would then fail at the
             // LMStudio call
             // (or worse, silently route to a different model if the id
@@ -1688,12 +1688,12 @@ fn resolve_dispatch_model_internal(
         Err(e) => {
             eprintln!(
                 "darkmux crew dispatch: select_model error ({e}); falling back \
-                 to probe_loaded_model() — deprecated. Add a default worker \
+                 to probe_loaded_model() — deprecated. Add a default \
                  model to profile `{active_name}` to migrate. (#450 refactor 1b)"
             );
             // TODO(#450 phase-1c): the selected-vs-loaded MISMATCH case
             // now honors `DARKMUX_STRICT_SELECTION` (see the Ok branch
-            // above). This Err branch — no worker model configured at all —
+            // above). This Err branch — no model configured at all —
             // still warn-and-probes for back-compat with pre-refactor-1b
             // configs. When phase-1c lands the two-instances-per-purpose
             // policy, fold this fallback under strict mode too.
@@ -1715,11 +1715,11 @@ fn resolve_utility_model_internal() -> Option<String> {
 }
 
 /// (#632) Resolve the context window the runtime needs to compute its
-/// compaction threshold, from the active profile's default-worker model.
+/// compaction threshold, from the active profile's default model.
 /// Mirrors the profile resolution in `resolve_dispatch_model_internal` (CLI
 /// `--profile` override > registry `default_profile`) and delegates the
 /// derivation to `CompactionDispatchArgs::from_profile` so the
-/// default-worker → `n_ctx` rule has a single source of truth. Returns
+/// default-model → `n_ctx` rule has a single source of truth. Returns
 /// `None` only when the registry/profile can't be resolved — the same edge
 /// cases that send model selection to `probe_loaded_model()`.
 fn resolve_context_window_internal(profile_override: Option<&str>) -> Option<u32> {
@@ -1856,7 +1856,7 @@ fn probe_loaded_model() -> Result<String> {
 }
 
 // `first_user_symlink_in` and `is_macos_firmlink` moved to
-// `darkmux_types::workdir` as part of Wave-E.2 (#255). Workers + both runtime
+// `darkmux_types::workdir` as part of Wave-E.2 (#255). Runners + both runtime
 // paths now share one implementation via `workdir::validate_workdir`.
 
 /// Map a role's tool_palette (allow/deny in role-vocab) to the list of

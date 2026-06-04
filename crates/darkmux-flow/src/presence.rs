@@ -143,7 +143,7 @@ pub fn now_ms() -> u64 {
 
 /// Spawn the presence-emitter loop on a dedicated OS thread (the sync redis
 /// client blocks; a `std::thread` keeps it off the tokio executor — same
-/// shape as `darkmux_fleet::spawn_worker_thread`). **Self-disables** (returns
+/// shape as `darkmux_fleet::spawn_runner_thread`). **Self-disables** (returns
 /// `None`) when either gate is unmet:
 ///
 /// - `DARKMUX_REDIS_URL` unset → no shared substrate to be present in.

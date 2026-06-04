@@ -183,7 +183,7 @@ struct ProfileCapacity {
     compaction_max_history_share: f64,
 }
 
-/// Reads the profile registry and returns each profile's default-worker model
+/// Reads the profile registry and returns each profile's default model
 /// context + compaction params. Empty profiles (no models) are skipped (can't
 /// recommend a load with no inference target).
 fn collect_profile_capacities(
@@ -193,7 +193,7 @@ fn collect_profile_capacities(
         .profiles
         .iter()
         .filter_map(|(name, profile)| {
-            // (#590) The default worker (default_model, or first model).
+            // (#590) The default model (default_model, or first model).
             let primary = profile
                 .default_model_id()
                 .and_then(|id| profile.models.iter().find(|m| m.id == id))?;
