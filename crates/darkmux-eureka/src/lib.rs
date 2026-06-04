@@ -11,9 +11,11 @@
 //! # Schema versioning
 //!
 //! `RULES_SCHEMA_VERSION` is semver and ships in the rules `meta` payload
-//! the viewer consumes, so it can detect compatibility. (The standalone
-//! `instruments.jsonl` sidecar that used to carry it was retired in #557;
-//! the payload's transport is migrating to the flow telemetry stream.)
+//! the viewer would consume to detect compatibility. (The standalone
+//! `instruments.jsonl` sidecar that used to carry the RuleDefs to the viewer
+//! was retired in #557; emitting them onto the flow telemetry stream + the
+//! viewer Anomalies panel that reads them is tracked separately as #657 — not
+//! yet built. `darkmux doctor` is the live surface for these rules today.)
 //! Bump rules:
 //!
 //! - **patch** — bug fix, message tweak, threshold adjustment that doesn't
@@ -29,13 +31,15 @@
 //! # DRY architecture
 //!
 //! Rule **metadata** (id, name, kind, message_template, fix_hint) lives
-//! here as the single source of truth. The CLI emits the metadata in the
-//! rules `meta` payload; the viewer renders findings using that metadata,
-//! not a duplicated JS copy.
+//! here as the single source of truth. The intended split (#657): the CLI
+//! emits the metadata in the rules `meta` payload; the viewer renders
+//! findings using that metadata, not a duplicated JS copy. (The viewer side
+//! isn't built yet — see #657.)
 //!
 //! Rule **evaluation** is per-side: Rust evaluators here read config files
-//! and `lms ps`; the viewer's JS evaluates the live-applicable subset
-//! against the telemetry it reads from the flow stream. Different input
+//! and `lms ps` (the live path, via `darkmux doctor`); the viewer's JS would
+//! evaluate the live-applicable subset against the telemetry it reads from
+//! the flow stream (#657). Different input
 //! data shapes — same logical rules.
 
 use anyhow::Result;
@@ -336,9 +340,9 @@ pub enum Verdict {
     /// the first dispatch will JIT-load it. The verdict is Pass; the
     /// payload is the JIT-load hint. See issue #101.
     ///
-    /// Rust-internal today. When issue #11 lands and verdicts start
-    /// shipping on the flow telemetry stream, this variant becomes part of
-    /// the wire format and the `RULES_SCHEMA_VERSION` contract gates that bump.
+    /// Rust-internal today. When verdicts start shipping on the flow
+    /// telemetry stream (#657), this variant becomes part of the wire format
+    /// and the `RULES_SCHEMA_VERSION` contract gates that bump.
     PassWith(String),
     /// Rule fired. Message describes the specific finding; severity comes
     /// from the rule def by default but may be downgraded at runtime.
@@ -776,9 +780,11 @@ pub fn parse_size_gb(s: &str) -> Option<f64> {
     }
 }
 
-/// JSON-serializable view of the active rule set, carried in the rules
-/// `meta` payload the viewer consumes to drive its Anomalies panel
-/// rendering. (Transport migrating to the flow telemetry stream, #557.)
+/// JSON-serializable view of the active rule set, built to ride the rules
+/// `meta` payload a viewer would consume to drive an Anomalies panel.
+/// **Not emitted yet** — the stream transport + viewer panel are #657
+/// (the `instruments.jsonl` sidecar that used to carry this was retired in
+/// #557).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RulesPayload {
     pub schema_version: String,
