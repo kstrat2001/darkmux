@@ -18,7 +18,10 @@ Tracking: [#618](https://github.com/kstrat2001/darkmux/issues/618).
   plist. Falls back to single-machine mode (no Redis URL) if the keychain
   item doesn't exist.
 
-## Operator install path (once the tap repo exists)
+## Operator install path
+
+The tap exists at [kstrat2001/homebrew-darkmux](https://github.com/kstrat2001/homebrew-darkmux)
+(created 2026-06-04):
 
 ```bash
 brew tap kstrat2001/darkmux
@@ -30,51 +33,55 @@ See the [always-on hub guide](../../docs/guide/always-on-hub.html) for the
 full hub-posture setup (Redis hardening, audit substrate, log rotation,
 daily integrity check) that composes on top of the brew-managed service.
 
-## Setting up the tap repo (one-time, when ready to ship)
-
-The tap is a standalone GitHub repo named `homebrew-<name>` under the user's
-namespace. For darkmux: `kstrat2001/homebrew-darkmux`.
-
-Steps:
-
-1. **Create the tap repo on GitHub** as a public repo named
-   `kstrat2001/homebrew-darkmux`. Minimal README + MIT license.
-2. **Clone it locally and seed the formula directory:**
-   ```bash
-   git clone git@github.com:kstrat2001/homebrew-darkmux
-   cd homebrew-darkmux
-   mkdir -p Formula
-   cp /path/to/darkmux-public/packaging/homebrew/darkmux.rb Formula/
-   git add Formula/darkmux.rb
-   git commit -m "feat: initial formula (head-only, refs #618)"
-   git push
-   ```
-3. **Test from another machine:**
-   ```bash
-   brew tap kstrat2001/darkmux
-   brew install --HEAD darkmux
-   ```
-4. **Set up CI for bottling per release** — a GitHub Actions workflow that
-   builds bottles for `arm64_monterey`, `ventura`, `sonoma`, `sequoia` and
-   uploads them to the tap's releases. See
-   [Homebrew's bottle-building guide](https://docs.brew.sh/Bottles) for the
-   actions setup; the `Homebrew/actions/setup-homebrew` action is the
-   standard starting point.
+The tap-side README, LICENSE, and BOOTSTRAP docs (source-of-truth for what
+gets pushed into the tap repo) live at `tap-bootstrap/` in this directory.
 
 ## Keeping the tap in sync with the main repo
 
-Two approaches:
+The source-of-truth formula is here at `packaging/homebrew/darkmux.rb`; the
+tap is downstream. Two paths:
 
-**A. Manual copy on each release** (simplest, fine for early days):
-After a tagged release in `kstrat2001/darkmux`, copy
-`packaging/homebrew/darkmux.rb` from the main repo into the tap's
-`Formula/darkmux.rb`, update the `url` and `sha256` lines for the new tag,
-and push.
+**A. Automated sync via `.github/workflows/sync-homebrew-tap.yml`**
+(default; runs on every push to main that touches the formula):
+The workflow opens a PR in the tap repo with the updated formula. Requires
+a repository secret named `HOMEBREW_TAP_TOKEN`:
 
-**B. Automated sync via GitHub Actions** (when manual gets old): a workflow
-in the main repo that, on a new tag, computes the new tarball SHA256 and
-opens a PR in the tap repo with the updated formula. Track this as a
-follow-up to #618 once the manual process feels heavy.
+1. Create a fine-grained personal access token at
+   https://github.com/settings/personal-access-tokens — Resource owner:
+   your user; Repository access: `kstrat2001/homebrew-darkmux` only;
+   Permissions: `Contents: Read and write` + `Pull requests: Read and write`.
+2. Add it to this repo's secrets at
+   `Settings → Secrets and variables → Actions → New repository secret`
+   with name `HOMEBREW_TAP_TOKEN`.
+3. The workflow checks the secret on every run; if missing it logs a notice
+   and skips the sync. This means the workflow lands safely before the
+   secret is configured.
+
+Once configured, every change to `packaging/homebrew/darkmux.rb` on main
+auto-opens a PR in the tap repo. Review + merge there; operators pick up
+the new formula on their next `brew upgrade --HEAD darkmux`.
+
+**B. Manual fallback** (when CI is down or the workflow is being edited):
+```bash
+cd /path/to/homebrew-darkmux           # or wherever you've cloned the tap
+cp /path/to/darkmux-public/packaging/homebrew/darkmux.rb Formula/darkmux.rb
+git diff Formula/darkmux.rb            # sanity check
+git add Formula/darkmux.rb
+git commit -m "sync: formula pulled from darkmux@<sha>"
+git push
+```
+
+## Future: bottling per release
+
+Track in [#618](https://github.com/kstrat2001/darkmux/issues/618) item 3.
+The bottling workflow lives IN THE TAP REPO (not here) per Homebrew
+convention — once Cargo.toml ships a real semver tag and the tap gains a
+release-tag workflow that builds bottles for `arm64_monterey`, `ventura`,
+`sonoma`, `sequoia` and uploads to the tap's GitHub releases, operators
+can drop `--HEAD` and install pre-compiled binaries in ~5 seconds. See
+[Homebrew's bottle-building guide](https://docs.brew.sh/Bottles) for the
+template; the `Homebrew/actions/setup-homebrew` action is the starting
+point.
 
 ## Updating the formula
 
