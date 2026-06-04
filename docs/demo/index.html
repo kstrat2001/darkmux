@@ -77,6 +77,7 @@
   .mach .stat{margin-top:12px;font:12px 'JetBrains Mono',monospace}
   .mach .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--amber-dim);margin-right:7px;vertical-align:middle}
   .mach.active .dot{background:var(--amber);box-shadow:0 0 8px var(--amber)}
+  .mach.absent{opacity:.45}.mach.absent .dot{background:var(--muted);box-shadow:none}
   .hint{color:var(--muted);font:11px 'JetBrains Mono',monospace;margin-top:10px}
   .stagehdr{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin-bottom:14px}
   .stagehdr a{color:var(--amber);cursor:pointer;text-decoration:none}.stagehdr a:hover{text-decoration:underline}
@@ -354,13 +355,26 @@ function machActive(m){
   const dones=v.filter(r=>uidOf(r)===m&&r.action==="dispatch.complete").map(r=>r.session_id);
   return starts.some(s=>!dones.includes(s));
 }
+// (#638 Slice 3) Present at the scrubber? Mirrors the live viewer. The demo's
+// SAMPLE carries no machine.online/offline edges and LIVE_MACHINES is empty, so
+// this returns null (unknown) for every demo machine → no "absent" state, demo
+// renders exactly as before.
+function machPresent(m){
+  if(LIVE_MACHINES.has(m))return true;
+  const edges=DATA.filter(r=>uidOf(r)===m&&(r.action==="machine.online"||r.action==="machine.offline")&&T(r.ts)<=state.t)
+                  .sort((a,b)=>T(a.ts)-T(b.ts));
+  if(!edges.length)return null;
+  return edges[edges.length-1].action==="machine.online";
+}
 function renderFleet(){
   $("logscope").textContent="fleet"; state.stageScope=()=>true;
   const ms=machines();
   const cards=ms.map(m=>{
     const act=machActive(m), runs=sessionsOn(m).length;
-    return `<div class="mach ${act?'active':''}" onclick="drillMachine('${m}')"><div class="name"><span class="mico">${ICON[MACH_ICON[nameOf(m)]]||""}</span>${nameOf(m)}</div>
-      <div class="spec">${specOf(m)}</div><div class="stat"><span class="dot"></span>${act?'dispatch in flight':'idle'} · ${runs} specialist${runs===1?'':'s'} + utility</div>
+    const absent=machPresent(m)===false;
+    const stat=absent?'offline':(act?'dispatch in flight':'idle');
+    return `<div class="mach ${act&&!absent?'active':''} ${absent?'absent':''}" onclick="drillMachine('${m}')"><div class="name"><span class="mico">${ICON[MACH_ICON[nameOf(m)]]||""}</span>${nameOf(m)}</div>
+      <div class="spec">${specOf(m)}</div><div class="stat"><span class="dot"></span>${stat} · ${runs} specialist${runs===1?'':'s'} + utility</div>
       <div class="hint">click to drill in →</div></div>`;}).join("");
   // Activity timeline — one lane per machine; each dispatch session is a bar
   // positioned across the recorded window, revealed up to the playhead (an
@@ -392,6 +406,9 @@ function renderMachine(){
     <div class="s">compaction · mission-compile · estimate · scribe</div>
     <span class="pill util">resident</span></div>`;
   // Specialist roles dispatched on this machine for the active mission
+  // (#638 Slice 3) A role can't be "running" on an absent machine (null in the
+  // demo — no machine edges — so this never caps anything here).
+  const machAbsent=machPresent(m)===false;
   const specs=sessionsOn(m).filter(sid=>visible().some(r=>r.session_id===sid)).map(sid=>{
     const s=dispatch(sid,"start");
     // (#638/#647) Session status at the scrubber time from the edge pair —
@@ -409,8 +426,8 @@ function renderMachine(){
     const liveNow=LIVE_SESSIONS.has(sid);
     let cls,lbl;
     if(closedBy){ cls=cleanClose?'done':'ended'; lbl=cleanClose?'complete':'ended'; }
-    else if(liveNow){ cls='run'; lbl='running'; }
-    else if(closeTs!=null){ cls='run'; lbl='running'; }
+    else if(!machAbsent&&liveNow){ cls='run'; lbl='running'; }
+    else if(!machAbsent&&closeTs!=null){ cls='run'; lbl='running'; }
     else { cls='ended'; lbl='ended'; }
     return `<div class="node" onclick="drillSession('${sid}')"><div class="h">${s.handle}</div>
       <div class="s">specialist role · ${s.model||'?'}</div>
@@ -659,8 +676,12 @@ function stageSig(){
   // "running"↔"ended" pill), same as a dispatch lifecycle change (#638). The
   // demo's set is static, so this is a no-op there — kept to align the forks.
   const ls=liveSig();
-  if(state.level==="fleet")return "f|"+machines().join(",")+"|"+dis+"|"+ls;
-  if(state.level==="machine")return "m|"+state.machine+"|"+sessionsOn(state.machine).join(",")+"|"+dis+"|"+ls;
+  // (#638 Slice 3) Presence signature — a machine flipping present↔absent must
+  // re-render its card. Empty/static in the demo (no daemon poll) — kept to
+  // align the forks.
+  const ps=[...LIVE_MACHINES.keys()].sort().join(",");
+  if(state.level==="fleet")return "f|"+machines().join(",")+"|"+dis+"|"+ls+"|"+ps;
+  if(state.level==="machine")return "m|"+state.machine+"|"+sessionsOn(state.machine).join(",")+"|"+dis+"|"+ls+"|"+ps;
   if(state.level==="subsystem")return null;
   return "mission";
 }

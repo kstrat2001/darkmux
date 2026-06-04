@@ -90,6 +90,7 @@
   .mach .stat{margin-top:12px;font:12px 'JetBrains Mono',monospace}
   .mach .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--amber-dim);margin-right:7px;vertical-align:middle}
   .mach.active .dot{background:var(--amber);box-shadow:0 0 8px var(--amber)}
+  .mach.absent{opacity:.45}.mach.absent .dot{background:var(--muted);box-shadow:none}
   .hint{color:var(--muted);font:11px 'JetBrains Mono',monospace;margin-top:10px}
   .stagehdr{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin-bottom:14px}
   .stagehdr a{color:var(--amber);cursor:pointer;text-decoration:none}.stagehdr a:hover{text-decoration:underline}
@@ -331,13 +332,30 @@ function machActive(m){
   const dones=v.filter(r=>uidOf(r)===m&&r.action==="dispatch.complete").map(r=>r.session_id);
   return starts.some(s=>!dones.includes(s));
 }
+// (#638 Slice 3) Is machine `m` PRESENT at the scrubber time `state.t`?
+//   true  = present · false = absent (offline) · null = unknown (no evidence)
+// Live: it's broadcasting a heartbeat now (LIVE_MACHINES). Playback: walk its
+// machine.online/offline lifecycle edges up to state.t — the most recent one
+// wins. No edges → null (render neutral, don't assert absence we can't prove).
+function machPresent(m){
+  if(LIVE_MACHINES.has(m))return true;
+  const edges=DATA.filter(r=>uidOf(r)===m&&(r.action==="machine.online"||r.action==="machine.offline")&&T(r.ts)<=state.t)
+                  .sort((a,b)=>T(a.ts)-T(b.ts));
+  if(!edges.length)return null;
+  return edges[edges.length-1].action==="machine.online";
+}
 function renderFleet(){
   $("logscope").textContent="fleet"; state.stageScope=()=>true;
   const ms=machines();
   const cards=ms.map(m=>{
     const act=machActive(m), runs=sessionsOn(m).length;
-    return `<div class="mach ${act?'active':''}" onclick="drillMachine('${m}')"><div class="name"><span class="mico">${ICON[MACH_ICON[nameOf(m)]]||""}</span>${nameOf(m)}</div>
-      <div class="spec">${specOf(m)}</div><div class="stat"><span class="dot"></span>${act?'dispatch in flight':'idle'} · ${runs} specialist${runs===1?'':'s'} + utility</div>
+    // (#638 Slice 3) Presence at the scrubber: an absent machine dims + reads
+    // "offline" and can't be "dispatch in flight" (it's gone). present/unknown
+    // keep the prior idle/active behavior.
+    const absent=machPresent(m)===false;
+    const stat=absent?'offline':(act?'dispatch in flight':'idle');
+    return `<div class="mach ${act&&!absent?'active':''} ${absent?'absent':''}" onclick="drillMachine('${m}')"><div class="name"><span class="mico">${ICON[MACH_ICON[nameOf(m)]]||""}</span>${nameOf(m)}</div>
+      <div class="spec">${specOf(m)}</div><div class="stat"><span class="dot"></span>${stat} · ${runs} specialist${runs===1?'':'s'} + utility</div>
       <div class="hint">click to drill in →</div></div>`;}).join("");
   // Activity timeline — one lane per machine; each dispatch session is a bar
   // positioned across the recorded window, revealed up to the playhead (an
@@ -378,6 +396,11 @@ function renderMachine(){
   // For each session we render whatever metadata we can recover from the first
   // visible record on that session, rather than throwing if dispatch.start is
   // missing (which silently broke the entire machine-detail panel).
+  // (#638 Slice 3) A role can't be "running" on a machine that's absent at the
+  // scrubber — when the machine went offline, its dispatches went with it. So
+  // an absent machine caps its roles to terminal status (consistency guard;
+  // the session.end edges usually already bookend them at the same instant).
+  const machAbsent=machPresent(m)===false;
   const specs=sessionsOn(m).filter(sid=>visible().some(r=>r.session_id===sid)).map(sid=>{
     const s=dispatch(sid,"start");
     // (#638/#647) Session status at the scrubber time `state.t`, from the
@@ -400,8 +423,8 @@ function renderMachine(){
     const liveNow=LIVE_SESSIONS.has(sid);
     let cls,lbl;
     if(closedBy){ cls=cleanClose?'done':'ended'; lbl=cleanClose?'complete':'ended'; }
-    else if(liveNow){ cls='run'; lbl='running'; }
-    else if(closeTs!=null){ cls='run'; lbl='running'; }
+    else if(!machAbsent&&liveNow){ cls='run'; lbl='running'; }
+    else if(!machAbsent&&closeTs!=null){ cls='run'; lbl='running'; }
     else { cls='ended'; lbl='ended'; }
     if(s){
       return `<div class="node" onclick="drillSession('${sid}')"><div class="h">${s.handle}</div>
@@ -702,8 +725,14 @@ function stageSig(){
   // pill flips), same as a dispatch.start/complete / session.end edge arriving
   // (#638/#647).
   const ls=liveSig();
-  if(state.level==="fleet")return "f|"+machines().join(",")+"|"+dis+"|"+ls;
-  if(state.level==="machine")return "m|"+state.machine+"|"+sessionsOn(state.machine).join(",")+"|"+dis+"|"+ls;
+  // (#638 Slice 3) Live presence set — when a machine stops beating it drops
+  // from LIVE_MACHINES (membership stays via its records, so machines() doesn't
+  // change), but its card must re-render present→absent. Fold the presence
+  // signature in so that flip triggers a render. (Playback re-renders on each
+  // scrub, so machPresent re-evaluates against state.t there without help.)
+  const ps=[...LIVE_MACHINES.keys()].sort().join(",");
+  if(state.level==="fleet")return "f|"+machines().join(",")+"|"+dis+"|"+ls+"|"+ps;
+  if(state.level==="machine")return "m|"+state.machine+"|"+sessionsOn(state.machine).join(",")+"|"+dis+"|"+ls+"|"+ps;
   if(state.level==="subsystem")return null;
   return "mission";
 }
