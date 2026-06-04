@@ -303,9 +303,17 @@ const newest=arr=>arr.length?arr.reduce((a,b)=>T(b.ts)>=T(a.ts)?b:a):null;
 // claimed-but-unverified names on the unknown card. Machines group + filter
 // by uid; cards render the name.
 const uidOf=r=>r.machine_uid||"unknown";
-const nameOf=m=>{ if(m==="unknown")return"unknown"; const r=DATA.find(x=>uidOf(x)===m&&x.machine_id); return r?r.machine_id:m; };
-const specOf=m=>{ if(m==="unknown"){ const ns=[...new Set(DATA.filter(r=>uidOf(r)==="unknown"&&r.machine_id).map(r=>r.machine_id))]; return ns.length?"unverified · claimed: "+ns.join(", "):"unidentified (no hardware uid)"; } return MACH_SPEC[nameOf(m)]||''; };
-const machines=()=>[...new Set(DATA.map(uidOf))];
+// (#638) A machine's label/spec resolve from its records first, then fall back
+// to its live presence beat (LIVE_MACHINES) — so a present-but-recordless
+// machine (freshly synced, no dispatches yet) still renders with its real
+// name + specs from the heartbeat, not a bare uid.
+const nameOf=m=>{ if(m==="unknown")return"unknown"; const r=DATA.find(x=>uidOf(x)===m&&x.machine_id); if(r)return r.machine_id; const b=LIVE_MACHINES.get(m); return b&&b.display_name?b.display_name:m; };
+const specOf=m=>{ if(m==="unknown"){ const ns=[...new Set(DATA.filter(r=>uidOf(r)==="unknown"&&r.machine_id).map(r=>r.machine_id))]; return ns.length?"unverified · claimed: "+ns.join(", "):"unidentified (no hardware uid)"; } const rs=MACH_SPEC[nameOf(m)]; if(rs)return rs; const b=LIVE_MACHINES.get(m); return (b&&b.specs)||''; };
+// (#638) Presence is the source of truth for "who's in the fleet" — a machine
+// shows if it's broadcasting a heartbeat (LIVE_MACHINES), whether or not it has
+// emitted any flow records. Union with the record-derived uids so historical/
+// playback machines (which have records but no live beat) still appear too.
+const machines=()=>[...new Set([...DATA.map(uidOf), ...LIVE_MACHINES.keys()])];
 const sessionsOn=m=>[...new Set(DATA.filter(r=>uidOf(r)===m&&r.session_id).map(r=>r.session_id))];
 const dispatch=(sid,act)=>DATA.find(r=>r.session_id===sid&&r.action==="dispatch."+act);
 // (#647) The reconciler-emitted `session.end` close-edge for an ABANDONED
@@ -652,6 +660,12 @@ let LIVE_ES=null;      // EventSource handle when tailing the live stream
 // dispatch.complete ages out instead of showing "running" forever.
 const LIVE_SESSIONS=new Set();
 const liveSig=()=>[...LIVE_SESSIONS].sort().join(",");
+// (#638) Machines broadcasting a presence heartbeat right now — uid → beat,
+// polled from /fleet/machines/live in live mode (EMPTY in playback). Presence
+// is the source of truth for the live fleet: a machine appears here whether or
+// not it has any flow records, so machines() unions it, and nameOf/specOf fall
+// back to the beat's display_name/specs for a recordless present machine.
+const LIVE_MACHINES=new Map();
 let lastStageSig=null; // skip stage re-renders that would destroy clickable cards
 const SEEN={cat:new Set(),tier:new Set(),src:new Set()};  // filter values ever observed
 
@@ -733,10 +747,24 @@ async function pollLiveSessions(){
     applyLive();   // re-renders only if the live set changed the stage signature
   }catch(_){/* best-effort — keep the last known live set */}
 }
-function startLiveSessionPoll(){
+// (#638) Poll the live-machine set (presence beats) on the same cadence. A
+// machine shows in the fleet view because it's BROADCASTING PRESENCE, not
+// because it emitted a flow record — so a freshly-synced, idle machine appears
+// here and drops off when it stops beating. Best-effort like the session poll.
+async function pollLiveMachines(){
+  try{
+    const r=await fetch("/fleet/machines/live",{headers:{accept:"application/json"}});
+    if(!r.ok)return;
+    const arr=await r.json();
+    LIVE_MACHINES.clear();
+    (Array.isArray(arr)?arr:[]).forEach(b=>{ if(b&&b.machine_uid)LIVE_MACHINES.set(b.machine_uid,b); });
+    applyLive();   // machines() unions LIVE_MACHINES → a new present machine re-renders
+  }catch(_){/* best-effort — keep the last known live machines */}
+}
+function startLivePoll(){
   if(LIVE_SESS_TIMER)return;
-  pollLiveSessions();
-  LIVE_SESS_TIMER=setInterval(pollLiveSessions,5000);
+  pollLiveSessions(); pollLiveMachines();
+  LIVE_SESS_TIMER=setInterval(()=>{pollLiveSessions();pollLiveMachines();},5000);
   window.addEventListener("beforeunload",()=>{if(LIVE_SESS_TIMER)clearInterval(LIVE_SESS_TIMER);});
 }
 
@@ -777,7 +805,7 @@ async function boot(){
   state.filters={cat:new Set(FCATS),tier:new Set(FTIERS),src:new Set(FSRC),q:""};
   absorbNewFilterValues();
   render();
-  if(mode==="live"){ startLiveTail(date); startLiveSessionPoll(); }
+  if(mode==="live"){ startLiveTail(date); startLivePoll(); }
 }
 boot();
 </script>
