@@ -25,6 +25,7 @@
 //! Slice 1 covers machine edges only; sessions follow.
 
 use crate::presence::{read_live, PresenceBeat};
+use crate::session_presence::{read_live_sessions, SessionBeat};
 use crate::{open_redis_connection_bounded, FlowRecord, REDIS_CONNECT_TIMEOUT};
 use std::collections::{HashMap, HashSet};
 
@@ -122,6 +123,56 @@ fn build_machine_edge_record(action: &str, machine_uid: &str, display_name: &str
     }
 }
 
+/// Pure: the session beats present in `last` whose id is absent from
+/// `now_sids` — the sessions that disappeared since the previous tick.
+/// Unit-testable without Redis (sibling of [`disappeared_machines`]).
+fn disappeared_sessions<'a>(
+    last: &'a HashMap<String, SessionBeat>,
+    now_sids: &HashSet<String>,
+) -> Vec<&'a SessionBeat> {
+    last.iter()
+        .filter(|(sid, _)| !now_sids.contains(*sid))
+        .map(|(_, beat)| beat)
+        .collect()
+}
+
+/// Build a `session.end` close-edge from a disappeared session's last beat.
+/// `session_id` is the subject; `machine_uid`/`machine_id` are set explicitly
+/// from the beat (the session's machine, not the local observer) to suppress
+/// the write-time auto-stamp. `handle` carries the role for the viewer.
+///
+/// A `session.end` is the close-edge for the **abandoned** case (host process
+/// killed mid-run — no clean `dispatch.complete`). A cleanly-completed session
+/// pre-claims `session-end:<sid>` in `SessionEmitter::stop` to SUPPRESS this
+/// edge, keeping its `dispatch.complete` as the sole close. So in practice
+/// `session.end` marks the crash/kill/timeout interval-close that playback
+/// would otherwise have no bracket for.
+fn build_session_end_record(beat: &SessionBeat) -> FlowRecord {
+    FlowRecord {
+        ts: crate::ts_utc_now(),
+        level: crate::Level::Info,
+        category: crate::Category::Machinery,
+        tier: crate::Tier::Local,
+        stage: crate::Stage::Dispatch,
+        action: "session.end".to_string(),
+        handle: beat.role.clone().unwrap_or_else(|| beat.session_id.clone()),
+        sprint_id: None,
+        session_id: Some(beat.session_id.clone()),
+        source: Some(EDGE_SOURCE.to_string()),
+        model: beat.model.clone(),
+        reasoning: None,
+        mission_id: None,
+        machine_id: Some(beat.display_name.clone()),
+        machine_uid: beat.machine_uid.clone(),
+        orchestrator: None,
+        prev_hash: None,
+        hash: None,
+        payload: None,
+        work_id: None,
+        attempt: None,
+    }
+}
+
 /// Self-emit this machine's `machine.online` open-edge — call once at daemon
 /// startup, after the presence emitter is up. Gated on a stable hardware uid
 /// (no uid → the machine can't be identified, so it must not bookend under an
@@ -138,12 +189,16 @@ pub fn emit_machine_online_edge() {
 /// same shape as the presence emitter). **Self-disables** (returns `None`)
 /// when `DARKMUX_REDIS_URL` is unset — no shared substrate to reconcile.
 ///
-/// Slice 1 (#647): machine close-edges only. Each tick reads the live machine
-/// set; the FIRST tick just establishes a baseline (machines already present
-/// when this daemon started are not "appearances" — and their `machine.online`
-/// was self-emitted by their own daemon, so we never emit it here). From the
-/// next tick on, any machine that vanished is a `machine.offline` close-edge,
-/// recorded once across the fleet via [`claim_edge`].
+/// (#647): close-edges for both machines (`machine.offline`) and sessions
+/// (`session.end`). Each tick reads the live machine + session sets; the FIRST
+/// tick just establishes a baseline (entities already present when this daemon
+/// started are not "appearances" — machine `online` is self-emitted by the
+/// machine's own daemon, and a session's open-edge is its `dispatch.start`, so
+/// we never emit appearances here). From the next tick on, any id that vanished
+/// is a close-edge, recorded once across the fleet via [`claim_edge`]. A
+/// cleanly-completed session pre-claims its `session-end` in
+/// `SessionEmitter::stop`, so only abandoned (crash/kill/timeout) sessions —
+/// the ones playback has no close bracket for otherwise — get a `session.end`.
 pub fn spawn_reconciler_thread() -> Option<std::thread::JoinHandle<()>> {
     let url = std::env::var("DARKMUX_REDIS_URL")
         .ok()
@@ -162,12 +217,13 @@ pub fn spawn_reconciler_thread() -> Option<std::thread::JoinHandle<()>> {
                 }
             };
             eprintln!(
-                "presence-reconciler: started — recording machine lifecycle edges \
-                 (every {RECONCILE_INTERVAL_SECS}s)"
+                "presence-reconciler: started — recording machine + session \
+                 lifecycle edges (every {RECONCILE_INTERVAL_SECS}s)"
             );
-            // Last-seen live machines, uid → beat (the beat carries the display
-            // label needed to build a faithful offline edge once it's gone).
-            let mut last: HashMap<String, PresenceBeat> = HashMap::new();
+            // Last-seen live machines + sessions, id → beat (the beat carries
+            // the label/role needed to build a faithful close-edge once gone).
+            let mut last_machines: HashMap<String, PresenceBeat> = HashMap::new();
+            let mut last_sessions: HashMap<String, SessionBeat> = HashMap::new();
             let mut first_tick = true;
             // Edge-triggered health latch — mirrors the presence emitter
             // (presence.rs). If `read_live` starts failing, close-edges quietly
@@ -175,7 +231,9 @@ pub fn spawn_reconciler_thread() -> Option<std::thread::JoinHandle<()>> {
             // the operator must SEE that, so log once on each fail↔recover
             // transition (never per-tick — a persistently-down Redis must not
             // spam the daemon log). Assume-healthy at start so a normal first
-            // tick stays quiet.
+            // tick stays quiet. The machine read drives the latch; the session
+            // read is a best-effort secondary (a session-read blip just keeps
+            // the last session baseline, never fires a false `session.end`).
             let mut healthy = true;
             loop {
                 match read_live(&client) {
@@ -184,13 +242,16 @@ pub fn spawn_reconciler_thread() -> Option<std::thread::JoinHandle<()>> {
                             eprintln!("presence-reconciler: read_live recovered — recording edges again");
                             healthy = true;
                         }
-                        let now: HashMap<String, PresenceBeat> = beats
+                        let now_machines: HashMap<String, PresenceBeat> = beats
                             .into_iter()
                             .map(|b| (b.machine_uid.clone(), b))
                             .collect();
+                        let session_read = read_live_sessions(&client);
                         if !first_tick {
-                            let now_uids: HashSet<String> = now.keys().cloned().collect();
-                            for gone in disappeared_machines(&last, &now_uids) {
+                            // Machine offline edges.
+                            let now_uids: HashSet<String> =
+                                now_machines.keys().cloned().collect();
+                            for gone in disappeared_machines(&last_machines, &now_uids) {
                                 // Dedup across the fleet: only the claim winner
                                 // records the edge.
                                 if claim_edge(&client, "machine-offline", &gone.machine_uid) {
@@ -201,8 +262,42 @@ pub fn spawn_reconciler_thread() -> Option<std::thread::JoinHandle<()>> {
                                     ));
                                 }
                             }
+                            // Session end edges (only when the session read
+                            // succeeded — a blip must not read as a disappearance).
+                            if let Ok(ref sbeats) = session_read {
+                                let now_sids: HashSet<String> =
+                                    sbeats.iter().map(|b| b.session_id.clone()).collect();
+                                for gone in disappeared_sessions(&last_sessions, &now_sids) {
+                                    // (#640 honesty) Skip a session whose machine
+                                    // can't be proven (no hardware uid — e.g. off
+                                    // Mac): emitting here would let the write-time
+                                    // auto-stamp attribute the close-edge to THIS
+                                    // observer's machine, not the session's. Better
+                                    // no bracket (it shows "ended" in playback) than
+                                    // one under an unprovable machine.
+                                    if gone.machine_uid.is_none() {
+                                        continue;
+                                    }
+                                    // A cleanly-completed session pre-claimed this
+                                    // in SessionEmitter::stop, so the claim loses
+                                    // here and no redundant edge is recorded; an
+                                    // abandoned (crash/kill) session has no
+                                    // pre-claim, so this wins and records the close.
+                                    if claim_edge(&client, "session-end", &gone.session_id) {
+                                        let _ = crate::record(build_session_end_record(gone));
+                                    }
+                                }
+                            }
                         }
-                        last = now;
+                        last_machines = now_machines;
+                        // Keep the last session baseline on a session-read error
+                        // (no false disappearances); refresh it on success.
+                        if let Ok(sbeats) = session_read {
+                            last_sessions = sbeats
+                                .into_iter()
+                                .map(|b| (b.session_id.clone(), b))
+                                .collect();
+                        }
                         first_tick = false;
                     }
                     Err(e) => {
@@ -277,6 +372,44 @@ mod tests {
         let last = HashMap::new();
         let now: HashSet<String> = ["NEW".to_string()].into_iter().collect();
         assert!(disappeared_machines(&last, &now).is_empty());
+    }
+
+    fn sbeat(sid: &str, role: &str) -> SessionBeat {
+        SessionBeat {
+            session_id: sid.to_string(),
+            machine_uid: Some("UID-1".to_string()),
+            display_name: "laptop".to_string(),
+            role: Some(role.to_string()),
+            model: Some("qwen3.6-35b".to_string()),
+            beat_ts_ms: 1,
+        }
+    }
+
+    #[test]
+    fn disappeared_sessions_is_last_minus_now() {
+        let mut last = HashMap::new();
+        last.insert("S1".to_string(), sbeat("S1", "coder"));
+        last.insert("S2".to_string(), sbeat("S2", "reviewer"));
+        let now: HashSet<String> = ["S1".to_string()].into_iter().collect();
+        let gone: Vec<String> = disappeared_sessions(&last, &now)
+            .iter()
+            .map(|b| b.session_id.clone())
+            .collect();
+        assert_eq!(gone, vec!["S2".to_string()]);
+    }
+
+    #[test]
+    fn session_end_edge_carries_subject_session_and_machine() {
+        // The close-edge must be attributed to the session's own machine
+        // (explicit machine_uid/machine_id suppress the observer auto-stamp),
+        // and carry the session id + role for the viewer to bracket it.
+        let rec = build_session_end_record(&sbeat("crew-dispatch-coder-1-internal", "coder"));
+        assert_eq!(rec.action, "session.end");
+        assert_eq!(rec.session_id.as_deref(), Some("crew-dispatch-coder-1-internal"));
+        assert_eq!(rec.machine_uid.as_deref(), Some("UID-1"));
+        assert_eq!(rec.machine_id.as_deref(), Some("laptop"));
+        assert_eq!(rec.handle, "coder");
+        assert_eq!(rec.source.as_deref(), Some(EDGE_SOURCE));
     }
 
     #[test]
