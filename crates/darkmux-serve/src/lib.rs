@@ -448,6 +448,16 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf) -> Result<()> {
         // record".
         let _presence_handle = darkmux_flow::presence::spawn_emitter_thread();
 
+        // (#647) Presence edge-recording for playback. Self-emit this machine's
+        // `machine.online` open-edge now (it's online), and spawn the reconciler
+        // that records `machine.offline` close-edges when a peer's presence key
+        // disappears (deduped fleet-wide via an atomic claim). Heartbeats stay
+        // ephemeral; only these ~2-per-episode edges hit the durable stream, so
+        // playback can replay machine present/absent intervals without the
+        // heartbeat noise. Same DARKMUX_REDIS_URL self-disable as presence.
+        darkmux_flow::presence_reconciler::emit_machine_online_edge();
+        let _reconciler_handle = darkmux_flow::presence_reconciler::spawn_reconciler_thread();
+
         // Shutdown plumbing: multiplex one signal to two consumers
         // (axum's graceful shutdown future and the force-exit timer).
         // `watch::channel` is the right shape — both consumers wait_for
