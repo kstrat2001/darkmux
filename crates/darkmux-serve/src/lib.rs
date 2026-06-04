@@ -129,8 +129,40 @@ pub(crate) fn build_router(flows_dir: PathBuf) -> Router {
         .route("/machine/specs", get(machine_specs_handler))
         .route("/missions", get(missions_handler))
         .route("/sprints", get(sprints_handler))
+        .route("/fleet/sessions/live", get(fleet_sessions_live_handler))
         .layer(local_only_cors())
         .with_state(state)
+}
+
+/// GET /fleet/sessions/live — the sessions with a live heartbeat right now
+/// (#638). Each running dispatch refreshes a short-TTL
+/// `darkmux:session-presence:<sid>` Redis key; this returns every unexpired
+/// one (fleet-wide, across machines on the shared Redis). The live viewer
+/// keys "running" on membership here, so a crashed / killed / timed-out
+/// dispatch ages out of the live set instead of showing "running" forever
+/// for want of a `dispatch.complete` record.
+///
+/// Returns `[]` when `DARKMUX_REDIS_URL` is unset or unreachable —
+/// single-machine, file-only fleets have no live-session substrate, so the
+/// viewer shows terminal status only. Never 500s on a Redis blip (the live
+/// signal is best-effort; degraded == "nothing live", not an error).
+async fn fleet_sessions_live_handler() -> impl IntoResponse {
+    let redis_url = std::env::var("DARKMUX_REDIS_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let beats: Vec<darkmux_flow::session_presence::SessionBeat> = match redis_url {
+        Some(url) => tokio::task::spawn_blocking(move || {
+            redis::Client::open(url.as_str())
+                .ok()
+                .and_then(|c| darkmux_flow::session_presence::read_live_sessions(&c).ok())
+                .unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    axum::Json(beats)
 }
 
 /// CORS layer for the daemon's browser-facing endpoints. **Default**:
@@ -1646,6 +1678,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), 200, "/health regressed after adding GET /");
+    }
+
+    #[tokio::test]
+    async fn fleet_sessions_live_returns_json_array() {
+        // GET /fleet/sessions/live (#638) must always answer 200 with a JSON
+        // array — `[]` when Redis is unset/unreachable (CI), the live-session
+        // beats when it is. The live viewer keys "running" on this, so it must
+        // never 500 on a Redis blip. Asserting "200 + is_array" is robust in
+        // both environments (content depends on whether a dispatch is live).
+        let app = build_router(PathBuf::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/fleet/sessions/live")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(body.is_array(), "live-sessions response must be a JSON array");
     }
 
     #[tokio::test]
