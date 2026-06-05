@@ -229,16 +229,13 @@ pub struct FlowRecord {
     pub attempt: Option<u32>,
 }
 
-/// Resolve the flows directory from env override (`DARKMUX_FLOWS_DIR`) or
-/// default (`~/.darkmux/flows/`). Falls back to `/tmp/darkmux/flows/` if
-/// neither is resolvable (CI / sandboxed environments without HOME).
+/// Resolve the flows directory. Precedence (#661 Slice 3):
+/// `env(DARKMUX_FLOWS_DIR) > config.dirs.flows > ~/.darkmux/flows`, with a
+/// `/tmp/darkmux/flows` HOME-less (CI / sandbox) fallback. Delegates to the
+/// single resolver in `darkmux_types::config_access` so the precedence — now
+/// including the config tier — lives in exactly one place.
 pub fn flows_dir() -> PathBuf {
-    std::env::var("DARKMUX_FLOWS_DIR")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".darkmux").join("flows")))
-        .unwrap_or_else(|| PathBuf::from("/tmp/darkmux/flows"))
+    darkmux_types::config_access::flows_dir()
 }
 
 /// ISO 8601 UTC date string from current time — `YYYY-MM-DD`. Used for
