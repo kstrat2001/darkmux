@@ -248,6 +248,44 @@ pub fn runtime_agents_dir_override() -> Option<std::path::PathBuf> {
     )
 }
 
+/// The operator-override candidates for a **search-path** dir (templates,
+/// skills) — `env` first, then the config tier, each highest-priority entries a
+/// search caller prepends to its built-in candidate list (cwd, ~/.darkmux/…,
+/// /usr/local/…). Unlike the single-value override accessors, BOTH tiers are
+/// returned (in precedence order) since a search path layers candidates rather
+/// than picking one. Empty when neither is set. Env is raw (shell-expanded);
+/// config is tilde-expanded; empty/whitespace values fall through.
+fn override_dirs(env_value: Option<String>, cfg: Option<&str>) -> Vec<std::path::PathBuf> {
+    let mut v = Vec::new();
+    if let Some(s) = env_value {
+        v.push(std::path::PathBuf::from(s));
+    }
+    if let Some(s) = cfg.filter(|s| !s.trim().is_empty()) {
+        v.push(crate::paths::expand_tilde(s));
+    }
+    v
+}
+
+/// Workload-templates override candidates (`env(DARKMUX_TEMPLATES_DIR)` then
+/// `config.dirs.templates`). The caller (`lab::workloads::load::builtin_dirs`)
+/// joins `workloads/` and prepends these ahead of cwd/home/system candidates.
+pub fn templates_override_dirs() -> Vec<std::path::PathBuf> {
+    override_dirs(
+        env_str("DARKMUX_TEMPLATES_DIR"),
+        config().dirs.as_ref().and_then(|d| d.templates.as_deref()),
+    )
+}
+
+/// Skills-source override candidates (`env(DARKMUX_SKILLS_DIR)` then
+/// `config.dirs.skills`). The caller (`skills::locate_on_disk_skills_source`)
+/// prepends these ahead of cwd/home/system candidates.
+pub fn skills_override_dirs() -> Vec<std::path::PathBuf> {
+    override_dirs(
+        env_str("DARKMUX_SKILLS_DIR"),
+        config().dirs.as_ref().and_then(|d| d.skills.as_deref()),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,6 +457,46 @@ mod tests {
             // handling differs per dir, which is why these are override-only).
             unsafe { std::env::remove_var(key); }
             assert_eq!(accessor(), None, "{key} unset → None");
+            unsafe {
+                match prev {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    // ── override_dirs: [env (raw), config (tilde-expanded)] in precedence order ──
+    #[test]
+    fn override_dirs_orders_env_before_config_and_tilde_expands() {
+        use std::path::PathBuf;
+        let home = dirs::home_dir().expect("home dir");
+        // both → env first (raw), then config (tilde-expanded)
+        assert_eq!(
+            override_dirs(Some("/env".to_string()), Some("~/cfg")),
+            vec![PathBuf::from("/env"), home.join("cfg")]
+        );
+        // config only
+        assert_eq!(override_dirs(None, Some("~/cfg")), vec![home.join("cfg")]);
+        // empty/whitespace config falls through
+        assert_eq!(override_dirs(None, Some("  ")), Vec::<PathBuf>::new());
+        // neither set → no override candidates (caller uses its built-ins)
+        assert_eq!(override_dirs(None, None), Vec::<PathBuf>::new());
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn search_path_override_dirs_env_then_empty() {
+        type Acc = fn() -> Vec<std::path::PathBuf>;
+        for (key, accessor) in [
+            ("DARKMUX_TEMPLATES_DIR", templates_override_dirs as Acc),
+            ("DARKMUX_SKILLS_DIR", skills_override_dirs),
+        ] {
+            let prev = std::env::var(key).ok();
+            unsafe { std::env::set_var(key, "/custom/x"); }
+            assert_eq!(accessor(), vec![std::path::PathBuf::from("/custom/x")], "{key} env candidate");
+            unsafe { std::env::remove_var(key); }
+            assert!(accessor().is_empty(), "{key} unset → no override candidates");
             unsafe {
                 match prev {
                     Some(v) => std::env::set_var(key, v),

@@ -38,12 +38,13 @@ fn find_embedded(id: &str) -> Option<&'static str> {
         .map(|(_, json)| *json)
 }
 
-/// Built-in template directories, in priority order. Override with
-/// `DARKMUX_TEMPLATES_DIR`.
+/// Built-in template directories, in priority order. Override candidates come
+/// from `env(DARKMUX_TEMPLATES_DIR)` then `config.dirs.templates` (#661 Slice 3),
+/// prepended ahead of cwd/home/system.
 fn builtin_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Ok(p) = env::var("DARKMUX_TEMPLATES_DIR") {
-        dirs.push(Path::new(&p).join("workloads"));
+    for base in darkmux_types::config_access::templates_override_dirs() {
+        dirs.push(base.join("workloads"));
     }
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     dirs.push(cwd.join("templates").join("builtin").join("workloads"));
