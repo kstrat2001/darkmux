@@ -145,11 +145,14 @@ pub fn draft_entry(opts: &DraftOptions) -> Result<DraftReport> {
             shortid(&opts.run_id)
         ))
     });
-    let entry_path = paths.notebook.join(format!("{date}-{slug}.md"));
+    // Notebook dir resolves env > config.dirs.notebook > <root>/notebook (#661
+    // Slice 3) — config can point it at an iCloud-synced path, like the env var.
+    let notebook_dir = darkmux_types::config_access::notebook_dir();
+    let entry_path = notebook_dir.join(format!("{date}-{slug}.md"));
 
     if !opts.dry_run {
-        if !paths.notebook.exists() {
-            fs::create_dir_all(&paths.notebook)?;
+        if !notebook_dir.exists() {
+            fs::create_dir_all(&notebook_dir)?;
         }
         // Include a machine-id tag so the same notebook directory (e.g.
         // when pointed at an iCloud-synced path via DARKMUX_NOTEBOOK_DIR)

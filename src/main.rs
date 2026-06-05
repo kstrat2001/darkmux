@@ -1020,7 +1020,6 @@ fn run(cmd: Cmd) -> Result<i32> {
 }
 
 fn cmd_notebook(sub: NotebookCmd) -> Result<i32> {
-    use crate::lab::paths;
     match sub {
         NotebookCmd::Draft {
             run_id,
@@ -1060,12 +1059,13 @@ fn cmd_notebook(sub: NotebookCmd) -> Result<i32> {
             Ok(0)
         }
         NotebookCmd::List { machine } => {
-            let paths = paths::resolve(paths::ResolveScope::Auto);
-            if !paths.notebook.exists() {
-                println!("no notebook directory found: {}", paths.notebook.display());
+            // env > config.dirs.notebook > <root>/notebook (#661 Slice 3).
+            let notebook_dir = darkmux_types::config_access::notebook_dir();
+            if !notebook_dir.exists() {
+                println!("no notebook directory found: {}", notebook_dir.display());
                 return Ok(1);
             }
-            let entries = notebook::list_entries(&paths.notebook, machine.as_deref())?;
+            let entries = notebook::list_entries(&notebook_dir, machine.as_deref())?;
             if entries.is_empty() {
                 println!("no notebook entries found");
                 return Ok(0);
