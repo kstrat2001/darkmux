@@ -3030,7 +3030,7 @@ mod tests {
 
     // ─── #380: check_legacy_compaction_extras tests ─────────────
 
-    /// Helper that points `DARKMUX_CONFIG` at a tempdir for the test's
+    /// Helper that points `DARKMUX_PROFILES` at a tempdir for the test's
     /// duration so `load_registry()` reads from a controlled path.
     struct ConfigPathGuard {
         prev: Option<String>,
@@ -3043,10 +3043,10 @@ mod tests {
             let path = tmp.path().join(filename);
             // Ensure parent dir exists
             std::fs::create_dir_all(tmp.path()).unwrap();
-            let prev = std::env::var("DARKMUX_CONFIG").ok();
+            let prev = std::env::var("DARKMUX_PROFILES").ok();
             // SAFETY: tests using this guard MUST be #[serial].
             unsafe {
-                std::env::set_var("DARKMUX_CONFIG", &path);
+                std::env::set_var("DARKMUX_PROFILES", &path);
             }
             (Self { prev, _tmp: tmp }, path)
         }
@@ -3057,8 +3057,8 @@ mod tests {
             // SAFETY: tests using this guard MUST be #[serial].
             unsafe {
                 match &self.prev {
-                    Some(v) => std::env::set_var("DARKMUX_CONFIG", v),
-                    None => std::env::remove_var("DARKMUX_CONFIG"),
+                    Some(v) => std::env::set_var("DARKMUX_PROFILES", v),
+                    None => std::env::remove_var("DARKMUX_PROFILES"),
                 }
             }
         }

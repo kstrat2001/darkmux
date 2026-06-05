@@ -10,8 +10,8 @@ pub struct LoadedRegistry {
     pub path: PathBuf,
 }
 
-/// Default search locations when neither `--config` nor `DARKMUX_CONFIG` is
-/// set. `DARKMUX_CONFIG`, if set, short-circuits this list — see `load_registry`.
+/// Default search locations when neither `--profiles` nor `DARKMUX_PROFILES` is
+/// set. `DARKMUX_PROFILES`, if set, short-circuits this list — see `load_registry`.
 pub fn default_locations() -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -25,15 +25,15 @@ pub fn default_locations() -> Vec<PathBuf> {
 }
 
 pub fn load_registry(explicit: Option<&str>) -> Result<LoadedRegistry> {
-    // Precedence: explicit --config flag > DARKMUX_CONFIG env var > default
+    // Precedence: explicit --profiles flag > DARKMUX_PROFILES env var > default
     // search locations. The two override paths fail-fast on missing files
     // so that a typo'd path doesn't silently pick up an unrelated registry.
     if let Some(p) = explicit {
-        return load_from(PathBuf::from(p), "--config flag");
+        return load_from(PathBuf::from(p), "--profiles flag");
     }
-    if let Ok(p) = env::var("DARKMUX_CONFIG") {
+    if let Ok(p) = env::var("DARKMUX_PROFILES") {
         if !p.is_empty() {
-            return load_from(PathBuf::from(p), "DARKMUX_CONFIG env var");
+            return load_from(PathBuf::from(p), "DARKMUX_PROFILES env var");
         }
     }
     let candidates = default_locations();
@@ -168,24 +168,24 @@ mod tests {
             msg.contains("registry not found") || msg.contains("no profile registry"),
             "unexpected error: {msg}"
         );
-        assert!(msg.contains("--config flag"), "should attribute the source: {msg}");
+        assert!(msg.contains("--profiles flag"), "should attribute the source: {msg}");
     }
 
-    /// `DARKMUX_CONFIG` must take precedence over the default search chain
+    /// `DARKMUX_PROFILES` must take precedence over the default search chain
     /// AND fail-fast when set to a non-existent path. Falling through to
     /// `~/.darkmux/profiles.json` would silently mask a typo.
     #[serial_test::serial]
     #[test]
     fn darkmux_config_env_var_fails_fast_on_missing() {
-        unsafe { env::set_var("DARKMUX_CONFIG", "/tmp/darkmux-no-such-file.json") };
+        unsafe { env::set_var("DARKMUX_PROFILES", "/tmp/darkmux-no-such-file.json") };
         let err = load_registry(None).unwrap_err();
-        unsafe { env::remove_var("DARKMUX_CONFIG") };
+        unsafe { env::remove_var("DARKMUX_PROFILES") };
         let msg = err.to_string();
         assert!(msg.contains("registry not found"), "got: {msg}");
-        assert!(msg.contains("DARKMUX_CONFIG"), "should attribute the source: {msg}");
+        assert!(msg.contains("DARKMUX_PROFILES"), "should attribute the source: {msg}");
     }
 
-    /// `DARKMUX_CONFIG` pointing at a real file should be honored — taking
+    /// `DARKMUX_PROFILES` pointing at a real file should be honored — taking
     /// precedence over default search locations.
     #[serial_test::serial]
     #[test]
@@ -193,14 +193,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let p = tmp.path().join("env-profiles.json");
         write(&p, minimal_json());
-        unsafe { env::set_var("DARKMUX_CONFIG", p.to_str().unwrap()) };
+        unsafe { env::set_var("DARKMUX_PROFILES", p.to_str().unwrap()) };
         let result = load_registry(None);
-        unsafe { env::remove_var("DARKMUX_CONFIG") };
+        unsafe { env::remove_var("DARKMUX_PROFILES") };
         let loaded = result.unwrap();
         assert_eq!(loaded.path, p);
     }
 
-    /// An empty `DARKMUX_CONFIG` value (e.g. `DARKMUX_CONFIG=`) should be
+    /// An empty `DARKMUX_PROFILES` value (e.g. `DARKMUX_PROFILES=`) should be
     /// treated as unset, falling through to the default search chain rather
     /// than failing with an empty-path error.
     #[serial_test::serial]
@@ -211,9 +211,9 @@ mod tests {
         write(&p, minimal_json());
         let prev = env::current_dir().unwrap();
         env::set_current_dir(tmp.path()).unwrap();
-        unsafe { env::set_var("DARKMUX_CONFIG", "") };
+        unsafe { env::set_var("DARKMUX_PROFILES", "") };
         let result = load_registry(None);
-        unsafe { env::remove_var("DARKMUX_CONFIG") };
+        unsafe { env::remove_var("DARKMUX_PROFILES") };
         env::set_current_dir(prev).unwrap();
         let loaded = result.unwrap();
         assert!(loaded.path.ends_with(".darkmux.json"));
@@ -313,21 +313,21 @@ mod tests {
     }
 
     #[test]
-    /// `default_locations()` is the *fallback* chain only — DARKMUX_CONFIG
+    /// `default_locations()` is the *fallback* chain only — DARKMUX_PROFILES
     /// short-circuits in `load_registry`, not here. The default chain itself
     /// should not include the env var path.
     #[serial_test::serial]
     fn default_locations_does_not_include_env() {
         unsafe {
-            std::env::set_var("DARKMUX_CONFIG", "/tmp/test-darkmux.json");
+            std::env::set_var("DARKMUX_PROFILES", "/tmp/test-darkmux.json");
         }
         let locs = default_locations();
         unsafe {
-            std::env::remove_var("DARKMUX_CONFIG");
+            std::env::remove_var("DARKMUX_PROFILES");
         }
         assert!(
             !locs.iter().any(|p| p.to_str().unwrap().contains("test-darkmux.json")),
-            "default_locations leaked DARKMUX_CONFIG into the fallback chain: {:?}",
+            "default_locations leaked DARKMUX_PROFILES into the fallback chain: {:?}",
             locs
         );
     }

@@ -81,8 +81,10 @@ enum Cmd {
     /// `~/.openclaw/openclaw.json` untouched.
     Swap {
         profile: String,
-        #[arg(long, short = 'c')]
-        config: Option<String>,
+        /// Profiles-registry path (profiles.json). Overrides DARKMUX_PROFILES
+        /// and the default search locations. (renamed from --config, #661)
+        #[arg(long)]
+        profiles: Option<String>,
         #[arg(long, short = 'n')]
         dry_run: bool,
         #[arg(long, short = 'q')]
@@ -98,13 +100,17 @@ enum Cmd {
     },
     /// Show what's loaded and which profile (if any) it matches.
     Status {
-        #[arg(long, short = 'c')]
-        config: Option<String>,
+        /// Profiles-registry path (profiles.json). Overrides DARKMUX_PROFILES
+        /// and the default search locations. (renamed from --config, #661)
+        #[arg(long)]
+        profiles: Option<String>,
     },
     /// List profiles in the registry.
     Profiles {
-        #[arg(long, short = 'c')]
-        config: Option<String>,
+        /// Profiles-registry path (profiles.json). Overrides DARKMUX_PROFILES
+        /// and the default search locations. (renamed from --config, #661)
+        #[arg(long)]
+        profiles: Option<String>,
     },
     /// Lab subcommands.
     Lab {
@@ -152,8 +158,10 @@ enum Cmd {
     /// and rough memory impact. Run after downloading a new model in LMStudio
     /// to see whether you'd want to define a profile for it.
     Scan {
-        #[arg(long, short = 'c')]
-        config: Option<String>,
+        /// Profiles-registry path (profiles.json). Overrides DARKMUX_PROFILES
+        /// and the default search locations. (renamed from --config, #661)
+        #[arg(long)]
+        profiles: Option<String>,
     },
     /// Profile management subcommands.
     Profile {
@@ -851,8 +859,10 @@ enum LabCmd {
         profile: Option<String>,
         #[arg(long, short = 'n', default_value = "1")]
         runs: u32,
-        #[arg(long, short = 'c')]
-        config: Option<String>,
+        /// Profiles-registry path (profiles.json). Overrides DARKMUX_PROFILES
+        /// and the default search locations. (renamed from --config, #661)
+        #[arg(long)]
+        profiles: Option<String>,
         #[arg(long, short = 'q')]
         quiet: bool,
         /// Which agent runtime to dispatch through. Default `internal`
@@ -902,8 +912,10 @@ enum LabCmd {
         workload: String,
         #[arg(long, short = 'p')]
         profile: Option<String>,
-        #[arg(long, short = 'c')]
-        config: Option<String>,
+        /// Profiles-registry path (profiles.json). Overrides DARKMUX_PROFILES
+        /// and the default search locations. (renamed from --config, #661)
+        #[arg(long)]
+        profiles: Option<String>,
     },
     /// Multi-run distribution characterization with bimodal cluster detection.
     /// Run a workload N times on a profile, then report fast cluster / slow
@@ -917,8 +929,10 @@ enum LabCmd {
         /// signal without burning hours on Apple Silicon).
         #[arg(long, short = 'n', default_value = "6")]
         runs: u32,
-        #[arg(long, short = 'c')]
-        config: Option<String>,
+        /// Profiles-registry path (profiles.json). Overrides DARKMUX_PROFILES
+        /// and the default search locations. (renamed from --config, #661)
+        #[arg(long)]
+        profiles: Option<String>,
     },
     /// Register a fixture directory in the lab registry by name (#491).
     /// Reads `.fixture.json` from `<path>`, computes a BLAKE3 content
@@ -976,18 +990,18 @@ fn run(cmd: Cmd) -> Result<i32> {
         },
         Cmd::Swap {
             profile,
-            config,
+            profiles,
             dry_run,
             quiet,
             runtime,
-        } => cmd_swap(&profile, config.as_deref(), dry_run, quiet, &runtime),
-        Cmd::Status { config } => cmd_status(config.as_deref()),
-        Cmd::Profiles { config } => cmd_profiles(config.as_deref()),
+        } => cmd_swap(&profile, profiles.as_deref(), dry_run, quiet, &runtime),
+        Cmd::Status { profiles } => cmd_status(profiles.as_deref()),
+        Cmd::Profiles { profiles } => cmd_profiles(profiles.as_deref()),
         Cmd::Lab { sub } => cmd_lab(sub),
         Cmd::Skills { sub } => cmd_skills(sub),
         Cmd::Notebook { sub } => cmd_notebook(sub),
         Cmd::Doctor { fix, include_openclaw } => cmd_doctor(fix, include_openclaw),
-        Cmd::Scan { config } => cmd_scan(config.as_deref()),
+        Cmd::Scan { profiles } => cmd_scan(profiles.as_deref()),
         Cmd::Profile { sub } => cmd_profile(sub),
         Cmd::Model { sub } => cmd_model(sub),
         Cmd::Fleet { sub } => cmd_fleet(sub),
@@ -2760,7 +2774,7 @@ fn cmd_lab(sub: LabCmd) -> Result<i32> {
             workload,
             profile,
             runs,
-            config,
+            profiles,
             quiet,
             runtime,
             runtime_cmd,
@@ -2780,7 +2794,7 @@ fn cmd_lab(sub: LabCmd) -> Result<i32> {
                 workload_id: workload,
                 profile_name: profile,
                 runs,
-                config_path: config,
+                config_path: profiles,
                 quiet,
                 runtime: runtime_flag,
                 runtime_cmd,
@@ -2858,12 +2872,12 @@ fn cmd_lab(sub: LabCmd) -> Result<i32> {
         LabCmd::Characterize {
             workload,
             profile,
-            config,
+            profiles,
         } => {
             let report = lab::characterize::characterize(&lab::characterize::CharacterizeOpts {
                 workload,
                 profile,
-                config,
+                config: profiles,
             })?;
             lab::characterize::print_report(&report);
             Ok(if report.outcomes.iter().all(|o| o.ok) {
@@ -2876,13 +2890,13 @@ fn cmd_lab(sub: LabCmd) -> Result<i32> {
             workload,
             profile,
             runs,
-            config,
+            profiles,
         } => {
             let report = lab::tune::tune(&lab::tune::TuneOpts {
                 workload,
                 profile,
                 runs,
-                config,
+                config: profiles,
             })?;
             lab::tune::print_report(&report);
             Ok(if report.outcomes.iter().all(|o| o.ok) {

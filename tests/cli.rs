@@ -58,7 +58,7 @@ fn profiles_lists_from_explicit_config() {
     let p = tmp.path().join("profiles.json");
     fs::write(&p, fixture_json()).unwrap();
     let mut cmd = Command::cargo_bin("darkmux").unwrap();
-    cmd.args(["profiles", "--config", p.to_str().unwrap()])
+    cmd.args(["profiles", "--profiles", p.to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicate::str::contains("fast"))
@@ -69,7 +69,7 @@ fn profiles_lists_from_explicit_config() {
 #[test]
 fn profiles_errors_when_config_missing() {
     let mut cmd = Command::cargo_bin("darkmux").unwrap();
-    cmd.args(["profiles", "--config", "/no/such/path.json"])
+    cmd.args(["profiles", "--profiles", "/no/such/path.json"])
         .assert()
         .failure()
         .stderr(
@@ -91,7 +91,7 @@ fn swap_dry_run_succeeds_without_real_lms() {
     cmd.args([
         "swap",
         "fast",
-        "--config",
+        "--profiles",
         p.to_str().unwrap(),
         "--dry-run",
         "--quiet",
@@ -110,7 +110,7 @@ fn swap_unknown_profile_errors() {
     cmd.args([
         "swap",
         "nonexistent-profile",
-        "--config",
+        "--profiles",
         p.to_str().unwrap(),
         "--dry-run",
         "--quiet",
@@ -121,13 +121,13 @@ fn swap_unknown_profile_errors() {
 }
 
 #[test]
-fn status_runs_with_explicit_config() {
+fn status_runs_with_explicit_profiles() {
     let tmp = TempDir::new().unwrap();
     let p = tmp.path().join("profiles.json");
     fs::write(&p, fixture_json()).unwrap();
     let mut cmd = Command::cargo_bin("darkmux").unwrap();
     cmd.env("DARKMUX_LMS_BIN", "/usr/bin/true");
-    cmd.args(["status", "--config", p.to_str().unwrap()])
+    cmd.args(["status", "--profiles", p.to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicate::str::contains("registry:"));
@@ -207,7 +207,7 @@ fn lab_run_quick_q_from_clean_cwd_uses_embedded_workload() {
         "openclaw",
         "--runtime-cmd",
         "/usr/bin/true",
-        "--config",
+        "--profiles",
         cfg.to_str().unwrap(),
         "--quiet",
     ])
@@ -318,7 +318,7 @@ fn lab_run_runtime_cmd_flag_overrides_openclaw_binary() {
             "openclaw",
             "--runtime-cmd",
             bogus_path,
-            "--config",
+            "--profiles",
             cfg.to_str().unwrap(),
             "--quiet",
         ])
@@ -391,7 +391,7 @@ fn lab_run_runtime_cmd_without_openclaw_bails_loud() {
             "internal",
             "--runtime-cmd",
             "/opt/aider/aider",
-            "--config",
+            "--profiles",
             cfg.to_str().unwrap(),
             "--quiet",
         ])
