@@ -219,8 +219,10 @@ fn local_only_cors() -> tower_http::cors::CorsLayer {
     use axum::http::{HeaderValue, Method};
     use tower_http::cors::AllowOrigin;
 
+    // env(DARKMUX_DAEMON_CORS_ORIGINS) > config.runtime.daemon_cors_origins >
+    // "" (#661 Slice 4).
     let extra_origins = parse_cors_origins(
-        &std::env::var("DARKMUX_DAEMON_CORS_ORIGINS").unwrap_or_default(),
+        &darkmux_types::config_access::daemon_cors_origins().unwrap_or_default(),
     );
 
     tower_http::cors::CorsLayer::new()

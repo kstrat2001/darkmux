@@ -1,10 +1,10 @@
 use darkmux_types::LoadedModel;
 use anyhow::{Context, Result, bail};
-use std::env;
 use std::process::Command;
 
 fn lms_bin() -> String {
-    env::var("DARKMUX_LMS_BIN").unwrap_or_else(|_| "lms".to_string())
+    // env(DARKMUX_LMS_BIN) > config.lms_bin > "lms" (#661 Slice 4).
+    darkmux_types::config_access::lms_bin()
 }
 
 pub fn list_loaded() -> Result<Vec<LoadedModel>> {
