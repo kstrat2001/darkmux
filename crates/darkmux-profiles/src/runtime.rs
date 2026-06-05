@@ -2,6 +2,7 @@ use crate::swap::namespaced_identifier;
 use darkmux_types::{Profile, ProfileModel};
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
+#[cfg(test)]
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -25,16 +26,13 @@ use std::path::{Path, PathBuf};
 /// Exposed for `doctor --fix`, which has no profile context but still
 /// needs to find the openclaw config to apply ctx-window fixes.
 pub fn resolve_openclaw_config_path(explicit_path: Option<&str>) -> Option<PathBuf> {
+    // explicit pin > env(DARKMUX_OPENCLAW_CONFIG) > config.dirs.openclaw_config >
+    // ~/.openclaw/openclaw.json (None if no HOME and no override) (#661 Slice 3).
     if let Some(p) = explicit_path {
         return Some(PathBuf::from(p));
     }
-    if let Ok(p) = env::var("DARKMUX_OPENCLAW_CONFIG") {
-        let trimmed = p.trim();
-        if !trimmed.is_empty() {
-            return Some(PathBuf::from(trimmed));
-        }
-    }
-    dirs::home_dir().map(|home| home.join(".openclaw/openclaw.json"))
+    darkmux_types::config_access::openclaw_config_override()
+        .or_else(|| dirs::home_dir().map(|home| home.join(".openclaw/openclaw.json")))
 }
 
 /// Apply a profile's `runtime:` block to the configured runtime config file

@@ -24,9 +24,16 @@ fn config() -> &'static DarkmuxConfig {
     CONFIG.get_or_init(DarkmuxConfig::load_resolved)
 }
 
-/// Read a non-empty, trimmed env var. The existing idiom (`paths.rs:76`).
+/// Read an env var, **trimmed**, returning `None` when unset or
+/// empty/whitespace-only. Trimming (not just empty-filtering) matches the
+/// prior per-call-site behavior several resolvers had (`PathBuf::from(p.trim())`)
+/// and is strictly forgiving everywhere this feeds — paths, ids, and numeric
+/// parses all want surrounding whitespace gone. The single env-read idiom.
 pub(crate) fn env_str(key: &str) -> Option<String> {
-    std::env::var(key).ok().filter(|s| !s.trim().is_empty())
+    std::env::var(key)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Precedence for a string setting: `env > config.json field > built-in
@@ -197,6 +204,50 @@ pub fn fleet_file() -> std::path::PathBuf {
     )
 }
 
+// The next four are **override-only** (`env > config.dirs.X`, else `None`):
+// each caller keeps its own no-HOME default/error handling (some return
+// `Option`, some `Result`, some `~/.darkmux/...` vs `~/.openclaw/...`), so the
+// accessor yields just the override and the caller applies its default.
+
+/// openclaw config-file override (`env(DARKMUX_OPENCLAW_CONFIG) >
+/// config.dirs.openclaw_config`). Callers default to `~/.openclaw/openclaw.json`
+/// (the swap patcher → `None` on no HOME; the dispatch path → `./.openclaw/...`).
+pub fn openclaw_config_override() -> Option<std::path::PathBuf> {
+    pick_dir_override(
+        env_str("DARKMUX_OPENCLAW_CONFIG"),
+        config().dirs.as_ref().and_then(|d| d.openclaw_config.as_deref()),
+    )
+}
+
+/// Operator-identity file override (`env(DARKMUX_IDENTITY_PATH) >
+/// config.dirs.identity`). Caller defaults to `~/.darkmux/identity.md`.
+pub fn identity_path_override() -> Option<std::path::PathBuf> {
+    pick_dir_override(
+        env_str("DARKMUX_IDENTITY_PATH"),
+        config().dirs.as_ref().and_then(|d| d.identity.as_deref()),
+    )
+}
+
+/// Acknowledgment-files dir override (`env(DARKMUX_ACK_DIR) > config.dirs.ack`).
+/// Caller defaults to `~/.darkmux/acks`.
+pub fn ack_dir_override() -> Option<std::path::PathBuf> {
+    pick_dir_override(
+        env_str("DARKMUX_ACK_DIR"),
+        config().dirs.as_ref().and_then(|d| d.ack.as_deref()),
+    )
+}
+
+/// Agent-runtime trajectories dir override (`env(DARKMUX_RUNTIME_AGENTS_DIR) >
+/// config.dirs.runtime_agents`). Caller defaults to `~/.openclaw/agents`. NOTE:
+/// the prior env read was not empty-filtered; routing through `env_str` makes
+/// an empty value fall through (a strict improvement — an empty path is bogus).
+pub fn runtime_agents_dir_override() -> Option<std::path::PathBuf> {
+    pick_dir_override(
+        env_str("DARKMUX_RUNTIME_AGENTS_DIR"),
+        config().dirs.as_ref().and_then(|d| d.runtime_agents.as_deref()),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,6 +256,17 @@ mod tests {
     fn env_str_skips_empty_and_unset() {
         // unset
         assert!(env_str("DARKMUX_DEFINITELY_UNSET_XYZ").is_none());
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn env_str_trims_value() {
+        let k = "DARKMUX_TEST_ENV_TRIM";
+        unsafe { std::env::set_var(k, "  /padded/path  "); }
+        assert_eq!(env_str(k).as_deref(), Some("/padded/path"), "surrounding whitespace trimmed");
+        unsafe { std::env::set_var(k, "   "); }
+        assert_eq!(env_str(k), None, "whitespace-only → None");
+        unsafe { std::env::remove_var(k); }
     }
 
     // ── pick_string: env > cfg > default ──
@@ -338,5 +400,31 @@ mod tests {
         unsafe { std::env::remove_var("DARKMUX_FLEET_FILE"); }
         assert!(fleet_file().ends_with("fleet.json"), "default ends in fleet.json");
         if let Some(v) = prev { unsafe { std::env::set_var("DARKMUX_FLEET_FILE", v); } }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn override_only_dir_accessors_env_then_none() {
+        type Acc = fn() -> Option<std::path::PathBuf>;
+        for (key, accessor) in [
+            ("DARKMUX_OPENCLAW_CONFIG", openclaw_config_override as Acc),
+            ("DARKMUX_IDENTITY_PATH", identity_path_override),
+            ("DARKMUX_ACK_DIR", ack_dir_override),
+            ("DARKMUX_RUNTIME_AGENTS_DIR", runtime_agents_dir_override),
+        ] {
+            let prev = std::env::var(key).ok();
+            unsafe { std::env::set_var(key, "/custom/x"); }
+            assert_eq!(accessor(), Some(std::path::PathBuf::from("/custom/x")), "{key} env override");
+            // unset → None; each caller then applies its own default (the no-HOME
+            // handling differs per dir, which is why these are override-only).
+            unsafe { std::env::remove_var(key); }
+            assert_eq!(accessor(), None, "{key} unset → None");
+            unsafe {
+                match prev {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
     }
 }
