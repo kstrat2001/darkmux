@@ -151,6 +151,27 @@ pub fn daemon_cors_origins() -> Option<String> {
     let cfg = config().runtime.as_ref().and_then(|r| r.daemon_cors_origins.as_deref());
     pick_string("DARKMUX_DAEMON_CORS_ORIGINS", cfg, None)
 }
+/// Strict model-selection (hard-fail on profile-vs-loaded mismatch).
+/// `env(DARKMUX_STRICT_SELECTION)` truthy (`1`/`true`/`yes`/`on`, case-
+/// insensitive) > `config.runtime.strict_selection` > `false`. The env layer is
+/// a *string* parsed per this var's truthy set (config is already a typed bool).
+pub fn strict_selection() -> bool {
+    if let Some(s) = env_str("DARKMUX_STRICT_SELECTION") {
+        return matches!(s.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+    }
+    config().runtime.as_ref().and_then(|r| r.strict_selection).unwrap_or(false)
+}
+/// Whether `darkmux doctor` checks for a newer release. An **opt-out**:
+/// `env(DARKMUX_CHECK_UPDATES)` falsy (`0`/`false`/`no`) disables >
+/// `config.runtime.check_updates` > `true` (default on). Env match is
+/// case-sensitive (preserving the prior behavior); `env_str` trims surrounding
+/// whitespace.
+pub fn check_updates() -> bool {
+    if let Some(s) = env_str("DARKMUX_CHECK_UPDATES") {
+        return !matches!(s.as_str(), "0" | "false" | "no");
+    }
+    config().runtime.as_ref().and_then(|r| r.check_updates).unwrap_or(true)
+}
 
 // ── Directories (#661 Slice 3) ──
 // Dir accessors layer `env(DARKMUX_*_DIR) > config.dirs.X > built-in default`.
@@ -541,5 +562,45 @@ mod tests {
         // No env/config → the `<root>/notebook` derived default.
         assert!(notebook_dir().ends_with("notebook"));
         if let Some(v) = prev { unsafe { std::env::set_var("DARKMUX_NOTEBOOK_DIR", v); } }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn strict_selection_env_truthy_then_default_false() {
+        let prev = std::env::var("DARKMUX_STRICT_SELECTION").ok();
+        for truthy in ["1", "true", "YES", "On"] {
+            unsafe { std::env::set_var("DARKMUX_STRICT_SELECTION", truthy); }
+            assert!(strict_selection(), "{truthy} → true (case-insensitive)");
+        }
+        unsafe { std::env::set_var("DARKMUX_STRICT_SELECTION", "nope"); }
+        assert!(!strict_selection(), "non-truthy → false");
+        unsafe { std::env::remove_var("DARKMUX_STRICT_SELECTION"); }
+        assert!(!strict_selection(), "unset → false default");
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_STRICT_SELECTION", v),
+                None => std::env::remove_var("DARKMUX_STRICT_SELECTION"),
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_updates_env_optout_then_default_on() {
+        let prev = std::env::var("DARKMUX_CHECK_UPDATES").ok();
+        for off in ["0", "false", "no"] {
+            unsafe { std::env::set_var("DARKMUX_CHECK_UPDATES", off); }
+            assert!(!check_updates(), "{off} → disabled");
+        }
+        unsafe { std::env::set_var("DARKMUX_CHECK_UPDATES", "1"); }
+        assert!(check_updates(), "non-falsy value → on");
+        unsafe { std::env::remove_var("DARKMUX_CHECK_UPDATES"); }
+        assert!(check_updates(), "unset → on (default)");
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_CHECK_UPDATES", v),
+                None => std::env::remove_var("DARKMUX_CHECK_UPDATES"),
+            }
+        }
     }
 }

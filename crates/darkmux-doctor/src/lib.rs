@@ -1508,10 +1508,11 @@ fn check_darkmux_version_vs_latest_release() -> Check {
     };
     let installed = env!("CARGO_PKG_VERSION");
 
-    // Operator-respect: explicit opt-out beats the network call.
-    match env::var("DARKMUX_CHECK_UPDATES").as_deref() {
-        Ok("0") | Ok("false") | Ok("no") => return skip("DARKMUX_CHECK_UPDATES=0"),
-        _ => {}
+    // Operator-respect: explicit opt-out beats the network call. Resolves
+    // env(DARKMUX_CHECK_UPDATES, opt-out) > config.runtime.check_updates > true
+    // (#661 Slice 4).
+    if !darkmux_types::config_access::check_updates() {
+        return skip("update check disabled (DARKMUX_CHECK_UPDATES / config)");
     }
 
     match fetch_latest_release_tag() {

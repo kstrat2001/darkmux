@@ -10,6 +10,7 @@ use crate::workloads::types::{
     InspectionReport, LoadedWorkload, RunResult, VerifyOutcome, WorkloadProvider,
 };
 use anyhow::{anyhow, bail, Context, Result};
+#[cfg(test)]
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -253,7 +254,9 @@ fn pick_role(loaded: &LoadedWorkload) -> String {
     if let Some(r) = loaded.manifest.workload.role.as_deref() {
         return r.to_string();
     }
-    env::var("DARKMUX_DEFAULT_ROLE").unwrap_or_else(|_| "code-reviewer".to_string())
+    // env(DARKMUX_DEFAULT_ROLE) > config.runtime.default_role > "code-reviewer"
+    // (#661 Slice 4).
+    darkmux_types::config_access::default_role().unwrap_or_else(|| "code-reviewer".to_string())
 }
 
 pub(crate) fn extract_reply_text(stdout: &str) -> String {

@@ -1779,10 +1779,9 @@ fn utility_preflight_warning(
 /// against the wrong model contaminates downstream measurement claims
 /// (#408), the mismatch should hard-fail rather than silently route.
 fn strict_selection_enabled() -> bool {
-    std::env::var("DARKMUX_STRICT_SELECTION")
-        .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
+    // env(DARKMUX_STRICT_SELECTION) truthy > config.runtime.strict_selection >
+    // false (#661 Slice 4).
+    darkmux_types::config_access::strict_selection()
 }
 
 /// (#450 review note) Return the list of currently-LOADED LMStudio
