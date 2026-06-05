@@ -200,14 +200,14 @@ pub fn emit_machine_online_edge() {
 /// `SessionEmitter::stop`, so only abandoned (crash/kill/timeout) sessions —
 /// the ones playback has no close bracket for otherwise — get a `session.end`.
 pub fn spawn_reconciler_thread() -> Option<std::thread::JoinHandle<()>> {
-    let url = std::env::var("DARKMUX_REDIS_URL")
-        .ok()
-        .filter(|s| !s.trim().is_empty())?;
+    // env(DARKMUX_REDIS_URL) > config-assembled (#661 Slice 5). `RawRedisUrl`
+    // moves into the thread; `expose_for_probe()` at the client open below.
+    let url = crate::redis_url()?;
 
     let spawned = std::thread::Builder::new()
         .name("darkmux-presence-reconciler".to_string())
         .spawn(move || {
-            let client = match redis::Client::open(url.as_str()) {
+            let client = match redis::Client::open(url.expose_for_probe()) {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!(

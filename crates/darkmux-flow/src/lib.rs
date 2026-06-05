@@ -387,6 +387,14 @@ pub fn redis_url() -> Option<RawRedisUrl> {
     None
 }
 
+/// Whether a (non-empty) Redis password is present in the macOS Keychain (item
+/// `darkmux-redis`). Boolean ONLY — never the password itself. Lets `darkmux
+/// doctor` surface a config Redis that would otherwise connect password-less.
+/// `false` on non-macOS. (#661 Slice 5)
+pub fn redis_keychain_password_present() -> bool {
+    keychain_redis_password().is_some()
+}
+
 /// Redis Streams-backed flow sink. Each `write` XADDs the record's
 /// JSON-serialized fields to a single stream. Multiple consumers can
 /// `XREAD BLOCK` for live updates; consumer groups handle multi-reader

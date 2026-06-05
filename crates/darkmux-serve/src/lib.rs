@@ -148,13 +148,11 @@ pub(crate) fn build_router(flows_dir: PathBuf) -> Router {
 /// single-machine, file-only fleet has no shared presence substrate, so the
 /// viewer falls back to record-derived machines. Never 500s on a Redis blip.
 async fn fleet_machines_live_handler() -> impl IntoResponse {
-    let redis_url = std::env::var("DARKMUX_REDIS_URL")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    // env(DARKMUX_REDIS_URL) > config-assembled (#661 Slice 5).
+    let redis_url = darkmux_flow::redis_url();
     let beats: Vec<darkmux_flow::presence::PresenceBeat> = match redis_url {
         Some(url) => tokio::task::spawn_blocking(move || {
-            redis::Client::open(url.as_str())
+            redis::Client::open(url.expose_for_probe())
                 .ok()
                 .and_then(|c| darkmux_flow::presence::read_live(&c).ok())
                 .unwrap_or_default()
@@ -179,13 +177,11 @@ async fn fleet_machines_live_handler() -> impl IntoResponse {
 /// viewer shows terminal status only. Never 500s on a Redis blip (the live
 /// signal is best-effort; degraded == "nothing live", not an error).
 async fn fleet_sessions_live_handler() -> impl IntoResponse {
-    let redis_url = std::env::var("DARKMUX_REDIS_URL")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    // env(DARKMUX_REDIS_URL) > config-assembled (#661 Slice 5).
+    let redis_url = darkmux_flow::redis_url();
     let beats: Vec<darkmux_flow::session_presence::SessionBeat> = match redis_url {
         Some(url) => tokio::task::spawn_blocking(move || {
-            redis::Client::open(url.as_str())
+            redis::Client::open(url.expose_for_probe())
                 .ok()
                 .and_then(|c| darkmux_flow::session_presence::read_live_sessions(&c).ok())
                 .unwrap_or_default()
@@ -663,10 +659,9 @@ async fn machine_specs_handler() -> axum::Json<serde_json::Value> {
         .flatten();
 
     let machine_id = darkmux_flow::resolve_machine_id();
-    let redis_url_redacted = std::env::var("DARKMUX_REDIS_URL")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(|raw| darkmux_flow::redact_url_creds(&raw));
+    // env(DARKMUX_REDIS_URL) > config-assembled (#661 Slice 5); `Display` on
+    // `RawRedisUrl` is the redacted form, so this stays password-safe.
+    let redis_url_redacted = darkmux_flow::redis_url().map(|u| u.to_string());
 
     let generated_at_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -802,16 +797,14 @@ async fn flow_stream_handler(
     // the file-tail. Probe is cheap (~ms) and bounds the failure mode
     // to "operator misconfigured DARKMUX_REDIS_URL → degraded but
     // serving" rather than 500.
-    let redis_url = std::env::var("DARKMUX_REDIS_URL")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    // env(DARKMUX_REDIS_URL) > config-assembled (#661 Slice 5).
+    let redis_url = darkmux_flow::redis_url();
     let redis_reachable = if let Some(url) = &redis_url {
         let probe_url = url.clone();
         tokio::task::spawn_blocking(move || {
             // Bounded by REDIS_CONNECT_TIMEOUT (#278) — Studio-offline
             // scenarios must not wedge the SSE-handler probe.
-            redis::Client::open(probe_url.as_str())
+            redis::Client::open(probe_url.expose_for_probe())
                 .ok()
                 .and_then(|c| {
                     c.get_connection_with_timeout(darkmux_flow::REDIS_CONNECT_TIMEOUT)
@@ -834,7 +827,11 @@ async fn flow_stream_handler(
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| "darkmux:flow".to_string());
             Box::pin(
-                redis_tail_lines(url, stream_name, date_owned)
+                // expose_for_probe(): redis_tail_lines + resolve_current_last_id
+                // use the URL only for Client::open and never log it (they
+                // pre-date the RawRedisUrl wrapper and handle the raw string
+                // safely), so the secret stays unlogged. (#661 Slice 5)
+                redis_tail_lines(url.expose_for_probe().to_string(), stream_name, date_owned)
                     .map(|line| Ok(Event::default().data(line))),
             )
         } else {
@@ -909,16 +906,14 @@ async fn aggregate_flow_records_for_date(
     date: &str,
     flows_dir: &std::path::Path,
 ) -> Vec<serde_json::Value> {
-    let redis_url = std::env::var("DARKMUX_REDIS_URL")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    // env(DARKMUX_REDIS_URL) > config-assembled (#661 Slice 5).
+    let redis_url = darkmux_flow::redis_url();
 
     if let Some(url) = redis_url {
         let date_owned = date.to_string();
         let url_owned = url.clone();
         let redis_result = tokio::task::spawn_blocking(move || {
-            read_flow_records_from_redis(&url_owned, &date_owned)
+            read_flow_records_from_redis(url_owned.expose_for_probe(), &date_owned)
         })
         .await;
         match redis_result {
@@ -949,13 +944,16 @@ fn read_flow_records_from_redis(
     date: &str,
 ) -> Result<Vec<serde_json::Value>, anyhow::Error> {
     use anyhow::Context;
+    // NOTE: never interpolate `url` into a log/error — it may carry an inline
+    // password (the env-URL tier). Use the non-secret `{date}` for context.
+    // (#661 Slice 5 — sealing a pre-existing raw-URL log the audit flagged.)
     let client = redis::Client::open(url)
-        .with_context(|| format!("opening Redis client for /flow aggregation: {url}"))?;
+        .with_context(|| format!("opening Redis client for /flow aggregation (date {date})"))?;
     // Bounded by REDIS_CONNECT_TIMEOUT (#278) — Studio-offline scenarios
     // must not wedge the HTTP handler thread for the OS default 75s.
     let mut conn = client
         .get_connection_with_timeout(darkmux_flow::REDIS_CONNECT_TIMEOUT)
-        .with_context(|| format!("connecting to Redis for /flow aggregation: {url}"))?;
+        .with_context(|| format!("connecting to Redis for /flow aggregation (date {date})"))?;
     let stream = std::env::var("DARKMUX_REDIS_STREAM")
         .ok()
         .filter(|s| !s.trim().is_empty())

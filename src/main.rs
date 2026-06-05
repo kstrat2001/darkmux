@@ -1546,15 +1546,11 @@ fn cmd_mission_dispatch(
         return Ok(2);
     }
 
-    // 4. Redis URL required for cross-machine fan-out.
-    let redis_url = std::env::var("DARKMUX_REDIS_URL")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow::anyhow!(
-            "mission dispatch requires DARKMUX_REDIS_URL to be set (the fleet work queue lives on Redis)."
-        ))?;
-    let raw_url = flow::RawRedisUrl::new(redis_url);
+    // 4. Redis required for cross-machine fan-out. env(DARKMUX_REDIS_URL) >
+    //    config-assembled (#661 Slice 5).
+    let raw_url = flow::redis_url().ok_or_else(|| anyhow::anyhow!(
+        "mission dispatch requires Redis (DARKMUX_REDIS_URL or config.redis.enabled) — the fleet work queue lives on Redis."
+    ))?;
     let client = redis::Client::open(raw_url.expose_for_probe())
         .with_context(|| format!("opening Redis client {raw_url} for mission dispatch"))?;
 
