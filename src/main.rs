@@ -2505,6 +2505,16 @@ fn cmd_init(
             );
         }
     }
+    if let Some(p) = report.config_path.as_ref() {
+        if report.config_already_present {
+            println!("config: already present at {}", p.display());
+        } else if report.config_created {
+            println!(
+                "config: created at {} (machine_id seeded — edit to set Redis, dirs, runtime knobs)",
+                p.display()
+            );
+        }
+    }
     println!("skills target: {}", report.skills_target.display());
     if !report.skills_installed.is_empty() {
         println!(

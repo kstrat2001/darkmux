@@ -56,6 +56,8 @@ pub struct DarkmuxConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redis: Option<RedisConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit: Option<AuditConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<RuntimeBehaviorConfig>,
 
     /// Forward-compat overflow — unknown top-level keys land here and
@@ -83,17 +85,42 @@ pub struct DirsConfig {
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
-/// Non-secret Redis connection bits. The **password is NEVER here** — it
-/// lives in the macOS Keychain (item `darkmux-redis`), assembled at runtime
-/// (#661 Slice 5). `DARKMUX_REDIS_URL` (full URL, password inline) still
-/// wins as the env override.
+/// The Redis flow-coordination sink — a **feature block gated by `enabled`**,
+/// not by field-presence. `darkmux init` writes the whole block with
+/// `enabled: false` and every connection knob populated to its sensible
+/// default, so the operator sees the full surface and turns it on by flipping
+/// one field (the knobs are already there to tweak). The on/off *gating* wires
+/// in #661 Slice 5; this is the visible schema + the written defaults.
+///
+/// The **password is NEVER here** — it lives in the macOS Keychain (item
+/// `darkmux-redis`), assembled at runtime (Slice 5). `DARKMUX_REDIS_URL` (full
+/// URL, password inline) still wins as the env override regardless of `enabled`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RedisConfig {
+    /// The gate: `true` → assemble + connect; `false`/absent → off (unless the
+    /// `DARKMUX_REDIS_URL` env override is set). Declared first so it reads at
+    /// the top of the block.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub host: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub db: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub stream: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub maxlen: Option<usize>,
+    #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
+/// The hash-chained audit sink (#163) — a **feature block gated by `enabled`**,
+/// same pattern as `RedisConfig`. `darkmux init` writes it with `enabled:
+/// false` + the default `dir`. Today's env equivalent (`DARKMUX_AUDIT_DIR`
+/// presence) still wins as the override; the config gating wires in #661.
+/// POSIX-only sink (the env var is recognized but skipped on Windows).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AuditConfig {
+    /// The gate: `true` → the AuditFileSink writes a hash-chained (BLAKE3)
+    /// per-day JSONL that `darkmux flow integrity-check` walks to detect chain
+    /// breaks; `false`/absent → off. Declared first.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub dir: Option<String>,
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -112,6 +139,64 @@ pub struct RuntimeBehaviorConfig {
 }
 
 impl DarkmuxConfig {
+    /// The full, self-documenting default config that `darkmux init` writes —
+    /// every common knob present and visible, so the operator tunes the *file*,
+    /// not the code, and can *see* the surface without digging. Scalar defaults
+    /// are written explicitly; the integration features (`redis`, `audit`) are
+    /// written as complete blocks with `enabled: false`, so their whole surface
+    /// is discoverable and one flip from on.
+    ///
+    /// Deliberately omitted — NOT hidden defaults, but fields where a written
+    /// literal would be *wrong*:
+    /// - `dirs` — defaults are derived from the root (`<root>/flows`); there is
+    ///   no fixed literal to write without freezing the derivation. The
+    ///   discovery surface is `darkmux doctor` (resolved path, overridable).
+    /// - caps (`max_turns`/`max_tokens`), `default_role`, `daemon_cors_origins`
+    ///   — absent is a real behavior (uncapped / none), not a value to default.
+    /// - `orchestrator` is written as `""` (visible but unset; empty config
+    ///   strings are treated as unset, so the per-session env override drives).
+    ///
+    /// Single source of truth for the written defaults: `init` writes this and
+    /// `config.example.json` is asserted equal to its pretty form (a drift
+    /// guard), so the docs reference and the code can't diverge. `machine_id`
+    /// is a placeholder here — `init` overrides it with the machine's name.
+    pub fn with_defaults() -> Self {
+        DarkmuxConfig {
+            schema_version: Some(CONFIG_SCHEMA_VERSION.to_string()),
+            machine_id: Some("my-machine".to_string()),
+            orchestrator: Some(String::new()),
+            lms_bin: Some("lms".to_string()),
+            lmstudio_url: Some("http://localhost:1234".to_string()),
+            dirs: None,
+            redis: Some(RedisConfig {
+                enabled: Some(false),
+                host: Some("127.0.0.1".to_string()),
+                port: Some(6379),
+                db: None,
+                stream: Some("darkmux:flow".to_string()),
+                maxlen: Some(10_000),
+                extras: Default::default(),
+            }),
+            audit: Some(AuditConfig {
+                enabled: Some(false),
+                dir: Some("~/.darkmux/audit".to_string()),
+                extras: Default::default(),
+            }),
+            runtime: Some(RuntimeBehaviorConfig {
+                inactivity_timeout_seconds: Some(600),
+                max_turns: None,
+                max_tokens: None,
+                strict_selection: Some(false),
+                feedback_injection: Some(true),
+                default_role: None,
+                check_updates: Some(true),
+                daemon_cors_origins: None,
+                extras: Default::default(),
+            }),
+            extras: Default::default(),
+        }
+    }
+
     /// Load the config.json at the resolved location (`<root>/config.json`
     /// via `paths::resolve`). Missing or malformed → default-empty (loud
     /// validation belongs to `darkmux doctor`, not the hot load path; a bad
@@ -135,6 +220,38 @@ impl DarkmuxConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `with_defaults()` is the full, self-documenting config `init` writes:
+    /// feature blocks present + gated off, scalar defaults explicit, derived/
+    /// advanced fields absent, and `enabled` serialized first in each block.
+    #[test]
+    fn with_defaults_is_full_visible_and_round_trips() {
+        let cfg = DarkmuxConfig::with_defaults();
+        // Integration features: present as `enabled: false` blocks (visible
+        // surface, off) — not absent, so the operator can see + flip them.
+        let redis = cfg.redis.as_ref().unwrap();
+        assert_eq!(redis.enabled, Some(false));
+        assert_eq!(redis.host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(redis.maxlen, Some(10_000));
+        assert_eq!(cfg.audit.as_ref().unwrap().enabled, Some(false));
+        // Scalar defaults written explicitly (not hidden in code).
+        assert_eq!(cfg.lms_bin.as_deref(), Some("lms"));
+        assert_eq!(cfg.runtime.as_ref().unwrap().feedback_injection, Some(true));
+        assert_eq!(cfg.orchestrator.as_deref(), Some(""), "visible but unset");
+        // Fields where a written literal would be wrong stay absent.
+        assert!(cfg.dirs.is_none(), "dirs are derived → surfaced by doctor, not frozen");
+        assert!(cfg.runtime.as_ref().unwrap().max_turns.is_none(), "uncapped, not defaulted");
+        // `enabled` reads at the TOP of each feature block.
+        let json = serde_json::to_string_pretty(&cfg).unwrap();
+        assert!(
+            json.find("\"enabled\"").unwrap() < json.find("\"host\"").unwrap(),
+            "enabled must precede the connection knobs"
+        );
+        // Lossless round-trip.
+        let back: DarkmuxConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.redis.as_ref().unwrap().enabled, Some(false));
+        assert_eq!(back.audit.as_ref().unwrap().dir.as_deref(), Some("~/.darkmux/audit"));
+    }
 
     /// Default serializes to `{}` and round-trips empty — the forward-compat
     /// guarantee (mirrors `runtime_compaction_config_default_round_trips_empty`).

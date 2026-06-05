@@ -32,10 +32,13 @@ pub(crate) fn env_str(key: &str) -> Option<String> {
 /// Precedence for a string setting: `env > config.json field > built-in
 /// default`. Pure + testable (the `cfg`/`default` are passed in, not read
 /// from the global) so precedence is unit-tested without the load-once
-/// `CONFIG`.
+/// `CONFIG`. An **empty/whitespace config string is treated as unset** (falls
+/// through), mirroring `env_str` — so a visible-but-blank field like
+/// `"orchestrator": ""` the operator hasn't filled in defers to the env/
+/// built-in tier rather than stamping an empty value.
 fn pick_string(env_key: &str, cfg: Option<&str>, default: Option<&str>) -> Option<String> {
     env_str(env_key)
-        .or_else(|| cfg.map(str::to_string))
+        .or_else(|| cfg.filter(|s| !s.trim().is_empty()).map(str::to_string))
         .or_else(|| default.map(str::to_string))
 }
 
@@ -142,6 +145,10 @@ mod tests {
         unsafe { std::env::set_var(k, "   "); }
         assert_eq!(pick_string(k, Some("c"), Some("d")), Some("c".to_string()));
         unsafe { std::env::remove_var(k); }
+        // empty/whitespace cfg is treated as unset (falls through) — the
+        // "visible but blank" field (`"orchestrator": ""`) defers to default.
+        assert_eq!(pick_string(k, Some("   "), Some("d")), Some("d".to_string()));
+        assert_eq!(pick_string(k, Some(""), None), None);
         // nothing set anywhere
         assert_eq!(pick_string(k, None, None), None);
     }
