@@ -222,9 +222,9 @@ const SENTINEL: &str = ".darkmux-skills";
 /// fall back to the binary-embedded `EMBEDDED_SKILLS` const.
 fn locate_on_disk_skills_source() -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(p) = env::var("DARKMUX_SKILLS_DIR") {
-        candidates.push(PathBuf::from(p));
-    }
+    // Override candidates: env(DARKMUX_SKILLS_DIR) then config.dirs.skills
+    // (#661 Slice 3), ahead of cwd/home/system.
+    candidates.extend(darkmux_types::config_access::skills_override_dirs());
     if let Ok(cwd) = env::current_dir() {
         candidates.push(cwd.join("skills"));
     }
