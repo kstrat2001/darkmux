@@ -98,6 +98,7 @@ pub fn run(include_openclaw: bool) -> DoctorReport {
         check_flow_sink_health(),
         check_machine_id_resolution(),
         check_orchestrator_declared(),
+        check_redis_config(),
         check_audit_integrity(),
         check_recommendation_drift(),
         check_recommended_profile_name_not_shadowed(),
@@ -868,6 +869,47 @@ fn check_orchestrator_declared() -> Check {
             hint: Some(
                 "Export DARKMUX_ORCHESTRATOR=<frontier-model-name> in the shell driving darkmux (e.g. `claude-opus-4-7`, `cursor-anthropic`). Operator-explicit by design (#49 cultivation discipline).".into(),
             ),
+        },
+    }
+}
+
+/// Surface a config-assembled Redis that would connect WITHOUT a password —
+/// `config.redis.enabled` is set but neither the Keychain item `darkmux-redis`
+/// nor `DARKMUX_REDIS_URL` supplies credentials. Password-less is fine for a
+/// local/Tailnet-trusted Redis but fails against an auth-required one, so this
+/// warns (never fails). The env-URL path (password inline) is self-contained,
+/// and a disabled config Redis is a no-op — both Pass. (#661 Slice 5)
+fn check_redis_config() -> Check {
+    let name = "redis config";
+    let env_url = std::env::var("DARKMUX_REDIS_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .is_some();
+    if env_url {
+        return Check { name: name.into(), status: Status::Pass, message: "Redis via DARKMUX_REDIS_URL".into(), hint: None };
+    }
+    if !darkmux_types::config_access::redis_enabled() {
+        return Check { name: name.into(), status: Status::Pass, message: "config Redis disabled".into(), hint: None };
+    }
+    // enabled + no env URL → the config-assembled (tier-2) path is active.
+    match darkmux_types::config_access::redis_host() {
+        None => Check {
+            name: name.into(),
+            status: Status::Warn,
+            message: "config.redis.enabled=true but no config.redis.host — Redis can't be assembled".into(),
+            hint: Some("Set `config.redis.host` (and `port`) in ~/.darkmux/config.json, or set DARKMUX_REDIS_URL.".into()),
+        },
+        Some(host) if darkmux_flow::redis_keychain_password_present() => Check {
+            name: name.into(),
+            status: Status::Pass,
+            message: format!("config Redis enabled → {host} (password from Keychain)"),
+            hint: None,
+        },
+        Some(host) => Check {
+            name: name.into(),
+            status: Status::Warn,
+            message: format!("config Redis enabled → {host}, but no password (Keychain item `darkmux-redis` absent, no DARKMUX_REDIS_URL) — connecting password-less"),
+            hint: Some("If your Redis requires auth, store the password: `security add-generic-password -a $USER -s darkmux-redis -w` (URL-safe). Password-less is fine for a local/Tailnet-trusted Redis.".into()),
         },
     }
 }
@@ -2572,10 +2614,10 @@ mod tests {
         // recommended-profile-not-shadowed [#159] + utility-model-binding
         // [#590] + role-model-pin-drift [#160] + legacy-mission-layout [#148]
         // + beat-33-crew-dir [Beat 33 directory flatten] + role-tool-vocab
-        // [#340] + legacy-compaction-extras [#380]) + one per active eureka
-        // rule. Every check should appear regardless of environment — even if
-        // the underlying probe couldn't read state.
-        let expected = 26 + darkmux_eureka::all_rules().len();
+        // [#340] + legacy-compaction-extras [#380] + redis-config [#661]) + one
+        // per active eureka rule. Every check should appear regardless of
+        // environment — even if the underlying probe couldn't read state.
+        let expected = 27 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

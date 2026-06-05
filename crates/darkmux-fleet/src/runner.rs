@@ -53,13 +53,11 @@ pub fn spawn_runner_thread() -> std::thread::JoinHandle<()> {
 /// Entry point for the runner thread. Reads env config, opens Redis,
 /// initializes the consumer group, then loops on claim/dispatch/ack.
 fn runner_main() {
-    let Some(redis_url) = std::env::var("DARKMUX_REDIS_URL")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    else {
+    // env(DARKMUX_REDIS_URL) > config-assembled (#661 Slice 5).
+    let Some(url) = darkmux_flow::redis_url() else {
         eprintln!(
-            "darkmux-runner: DARKMUX_REDIS_URL not set — fleet work queue disabled. \
+            "darkmux-runner: Redis not configured (DARKMUX_REDIS_URL or \
+             config.redis.enabled) — fleet work queue disabled. \
              Daemon continues as observability/serve node only."
         );
         return;
@@ -67,7 +65,6 @@ fn runner_main() {
 
     let machine_id = darkmux_flow::resolve_machine_id().unwrap_or_else(|| "unknown".to_string());
 
-    let url = darkmux_flow::RawRedisUrl::new(redis_url);
     let client = match redis::Client::open(url.expose_for_probe()) {
         Ok(c) => c,
         Err(e) => {

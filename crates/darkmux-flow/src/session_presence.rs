@@ -209,10 +209,9 @@ pub fn spawn_session_emitter(
     role: Option<String>,
     model: Option<String>,
 ) -> Option<SessionEmitter> {
-    let url = std::env::var("DARKMUX_REDIS_URL")
-        .ok()
-        .filter(|s| !s.trim().is_empty())?;
-    let client = redis::Client::open(url.as_str()).ok()?;
+    // env(DARKMUX_REDIS_URL) > config-assembled (#661 Slice 5).
+    let url = crate::redis_url()?;
+    let client = redis::Client::open(url.expose_for_probe()).ok()?;
 
     let machine_uid = darkmux_hardware::machine_uid().map(str::to_string);
     let display_name = crate::resolve_machine_id().unwrap_or_else(|| "unknown".to_string());

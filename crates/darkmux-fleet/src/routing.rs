@@ -329,21 +329,18 @@ fn dispatch_via_queue(opts: DispatchOpts, target_machine: Option<&str>) -> Resul
     // The Redis URL is required for cross-machine dispatch. If it's
     // unset, the operator hasn't configured the fleet substrate — bail
     // loud with the fix-it pointer.
-    let redis_url = std::env::var("DARKMUX_REDIS_URL")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            let context = match target_machine {
-                Some(m) => format!("--machine={m}"),
-                None => "fleet-queue dispatch".to_string(),
-            };
-            anyhow!(
-                "{context} requires DARKMUX_REDIS_URL to be set \
-                 (the fleet work queue lives on Redis). \
-                 Single-machine fleets shouldn't dispatch to the queue."
-            )
-        })?;
+    // env(DARKMUX_REDIS_URL) > config-assembled (#661 Slice 5).
+    let raw_url = darkmux_flow::redis_url().ok_or_else(|| {
+        let context = match target_machine {
+            Some(m) => format!("--machine={m}"),
+            None => "fleet-queue dispatch".to_string(),
+        };
+        anyhow!(
+            "{context} requires Redis (DARKMUX_REDIS_URL or config.redis.enabled) \
+             — the fleet work queue lives on Redis. \
+             Single-machine fleets shouldn't dispatch to the queue."
+        )
+    })?;
 
     // Resolve session_id up front — the runner needs it to stamp on
     // the dispatch.complete record, and --wait needs it as the join key.
@@ -371,8 +368,7 @@ fn dispatch_via_queue(opts: DispatchOpts, target_machine: Option<&str>) -> Resul
 
     // Open the Redis client lazily here (not at darkmux startup) so the
     // local-dispatch path doesn't pay any connection cost. The same
-    // `raw_url` is reused by `wait_for_completion` below.
-    let raw_url = darkmux_flow::RawRedisUrl::new(redis_url);
+    // `raw_url` (already resolved above) is reused by `wait_for_completion` below.
     let client = redis::Client::open(raw_url.expose_for_probe())
         .with_context(|| format!("opening Redis client {raw_url} for --machine dispatch"))?;
 

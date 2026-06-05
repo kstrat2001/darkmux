@@ -153,9 +153,9 @@ pub fn now_ms() -> u64 {
 /// The thread runs for the process lifetime; a Redis blip is logged
 /// once-per-transition and retried — it never crashes the daemon.
 pub fn spawn_emitter_thread() -> Option<std::thread::JoinHandle<()>> {
-    let url = std::env::var("DARKMUX_REDIS_URL")
-        .ok()
-        .filter(|s| !s.trim().is_empty())?;
+    // env(DARKMUX_REDIS_URL) > config-assembled (#661 Slice 5). `RawRedisUrl`
+    // moves into the thread; `expose_for_probe()` at the client open below.
+    let url = crate::redis_url()?;
     let machine_uid = match darkmux_hardware::machine_uid() {
         Some(uid) => uid.to_string(),
         None => {
@@ -175,7 +175,7 @@ pub fn spawn_emitter_thread() -> Option<std::thread::JoinHandle<()>> {
     let spawned = std::thread::Builder::new()
         .name("darkmux-presence".to_string())
         .spawn(move || {
-            let client = match redis::Client::open(url.as_str()) {
+            let client = match redis::Client::open(url.expose_for_probe()) {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("presence: could not open Redis client ({e}); presence disabled");
