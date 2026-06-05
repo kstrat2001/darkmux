@@ -132,6 +132,34 @@ pub fn redis_maxlen() -> usize {
     pick_parsed("DARKMUX_REDIS_MAXLEN", cfg, Some(10_000)).unwrap()
 }
 
+// The non-secret connection bits for the config-assembled Redis URL (#661
+// Slice 5). CONFIG-ONLY — there is no per-field env var; the env path to
+// configure Redis is the full `DARKMUX_REDIS_URL` (tier-1 of `flow::redis_url`).
+// The password is NEVER here — it comes from the macOS Keychain.
+
+/// The Redis feature gate (`config.redis.enabled`). `false`/absent → no
+/// config-assembled Redis (the env `DARKMUX_REDIS_URL` can still enable it).
+pub fn redis_enabled() -> bool {
+    config().redis.as_ref().and_then(|r| r.enabled).unwrap_or(false)
+}
+/// Redis host (`config.redis.host`). `None` → nothing to assemble.
+pub fn redis_host() -> Option<String> {
+    config()
+        .redis
+        .as_ref()
+        .and_then(|r| r.host.as_deref())
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string)
+}
+/// Redis port (`config.redis.port`), default `6379`.
+pub fn redis_port() -> u16 {
+    config().redis.as_ref().and_then(|r| r.port).unwrap_or(6379)
+}
+/// Redis logical DB index (`config.redis.db`). `None` → omit the `/<db>` suffix.
+pub fn redis_db() -> Option<u8> {
+    config().redis.as_ref().and_then(|r| r.db)
+}
+
 // ── Runtime behavior ──
 pub fn inactivity_timeout_seconds() -> u64 {
     let cfg = config().runtime.as_ref().and_then(|r| r.inactivity_timeout_seconds);
