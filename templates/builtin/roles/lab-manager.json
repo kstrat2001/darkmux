@@ -1,7 +1,7 @@
 {
-  "id": "lab-runner",
+  "id": "lab-manager",
   "role_family": "specialist",
-  "description": "Runs darkmux lab dispatches, captures run outputs, and summarizes results for the user.",
+  "description": "Manages darkmux lab dispatches end-to-end: runs them, captures outputs, and summarizes results for the user.",
   "skills": [
     "lab-running",
     "documenting"
