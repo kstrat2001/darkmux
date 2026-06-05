@@ -444,6 +444,7 @@ dependencies = [
  "blake3",
  "clap",
  "darkmux-hardware",
+ "darkmux-types",
  "dirs",
  "libc",
  "redis",

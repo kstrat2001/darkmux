@@ -29,6 +29,9 @@ libc = "0.2"
 redis = { version = "0.27", default-features = false, features = ["streams"] }
 # #640 — stable machine identity (IOPlatformUUID) for presence beats.
 darkmux-hardware = { path = "../darkmux-hardware" }
+# #661 — config accessors (env > config.json > default). The one new edge in
+# the dep graph; darkmux-types is the leaf (no darkmux-* deps), so no cycle.
+darkmux-types = { path = "../darkmux-types" }
 
 [dev-dependencies]
 tempfile = "3.10"
