@@ -2569,11 +2569,19 @@ fn cmd_init(
         if report.profile_registry_created {
             println!("  1. Edit ~/.darkmux/profiles.json to point at your downloaded models");
             println!("     (run `lms ls` to see what's available)");
+            println!(
+                "  2. Build the internal-runtime image (one-time, ~50 MB, from the darkmux repo root):"
+            );
+            println!("       docker build -t darkmux-runtime:latest runtime/");
+            println!("  3. Run `darkmux doctor` to verify your setup");
+            println!("  4. Run `darkmux lab characterize` to smoke-test your machine");
+        } else {
+            println!(
+                "  1. Build the internal-runtime image if you haven't (one-time, ~50 MB, from the darkmux repo root):"
+            );
+            println!("       docker build -t darkmux-runtime:latest runtime/");
             println!("  2. Run `darkmux doctor` to verify your setup");
             println!("  3. Run `darkmux lab characterize` to smoke-test your machine");
-        } else {
-            println!("  1. Run `darkmux doctor` to verify your setup");
-            println!("  2. Run `darkmux lab characterize` to smoke-test your machine");
         }
     }
     Ok(0)
