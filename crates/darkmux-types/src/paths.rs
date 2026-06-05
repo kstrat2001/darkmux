@@ -117,7 +117,9 @@ fn paths_from_root(chosen: PathBuf, chosen_scope: Scope) -> DarkmuxPaths {
 /// Expand a leading `~` to the user's home directory. Pass-through for
 /// any other shape. Returns the original path unchanged if no home is
 /// available (which is unusual; would mean a misconfigured environment).
-fn expand_tilde(s: &str) -> PathBuf {
+/// `pub(crate)` so `config_access` can expand `~` in `config.dirs.*` values
+/// (#661 Slice 3).
+pub(crate) fn expand_tilde(s: &str) -> PathBuf {
     if let Some(stripped) = s.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
             return home.join(stripped);

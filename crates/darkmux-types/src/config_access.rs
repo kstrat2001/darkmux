@@ -51,6 +51,26 @@ fn pick_parsed<T: FromStr + Copy>(env_key: &str, cfg: Option<T>, default: Option
         .or(default)
 }
 
+/// Precedence for a **directory** setting: `env > config tier > built-in
+/// default`. Pure + testable (env/cfg passed in, default a closure since some
+/// dirs derive it lazily from HOME/root). `env` is the already-empty-filtered
+/// `env_str` output, used raw (the shell expands `~`); the config tier is
+/// tilde-expanded (operators hand-write `~/...`) and an empty/whitespace value
+/// falls through. The reusable spine of every dir accessor (#661 Slice 3).
+fn pick_dir(
+    env: Option<String>,
+    cfg: Option<&str>,
+    default: impl FnOnce() -> std::path::PathBuf,
+) -> std::path::PathBuf {
+    if let Some(s) = env {
+        return std::path::PathBuf::from(s);
+    }
+    if let Some(s) = cfg.filter(|s| !s.trim().is_empty()) {
+        return crate::paths::expand_tilde(s);
+    }
+    default()
+}
+
 // ── Identity / provenance ──
 /// `DARKMUX_MACHINE_ID > config.machine_id`. The hostname fallback stays in
 /// `resolve_machine_id` (the write-time caller), so this returns `None` when
@@ -116,6 +136,29 @@ pub fn default_role() -> Option<String> {
 pub fn daemon_cors_origins() -> Option<String> {
     let cfg = config().runtime.as_ref().and_then(|r| r.daemon_cors_origins.as_deref());
     pick_string("DARKMUX_DAEMON_CORS_ORIGINS", cfg, None)
+}
+
+// ── Directories (#661 Slice 3) ──
+// Dir accessors layer `env(DARKMUX_*_DIR) > config.dirs.X > built-in default`.
+// The env tier preserves today's exact behavior; the config tier (tilde-
+// expanded — operators hand-write `~/...`) is the new override. Each accessor
+// owns its dir's full precedence so the resolution lives in ONE place.
+
+/// The flows directory (the always-on LocalFileSink target):
+/// `env(DARKMUX_FLOWS_DIR) > config.dirs.flows > ~/.darkmux/flows >
+/// /tmp/darkmux/flows`. The last is the HOME-less CI/sandbox fallback (parity
+/// with the prior `flow::schema::flows_dir`, which this now backs).
+pub fn flows_dir() -> std::path::PathBuf {
+    use std::path::PathBuf;
+    pick_dir(
+        env_str("DARKMUX_FLOWS_DIR"),
+        config().dirs.as_ref().and_then(|d| d.flows.as_deref()),
+        || {
+            dirs::home_dir()
+                .map(|h| h.join(".darkmux").join("flows"))
+                .unwrap_or_else(|| PathBuf::from("/tmp/darkmux/flows"))
+        },
+    )
 }
 
 #[cfg(test)]
@@ -192,5 +235,48 @@ mod tests {
         // With no env and (in CI) no config.json, the built-in default holds.
         assert_eq!(redis_stream(), "darkmux:flow");
         if let Some(v) = prev { unsafe { std::env::set_var("DARKMUX_REDIS_STREAM", v); } }
+    }
+
+    // ── pick_dir: env > cfg (tilde-expanded) > default — the dir spine ──
+    #[test]
+    fn pick_dir_precedence_and_tilde() {
+        use std::path::PathBuf;
+        let home = dirs::home_dir().expect("home dir");
+        // default fires when nothing is set
+        assert_eq!(pick_dir(None, None, || PathBuf::from("/d")), PathBuf::from("/d"));
+        // cfg beats default + is tilde-expanded
+        assert_eq!(pick_dir(None, Some("~/cfg"), || PathBuf::from("/d")), home.join("cfg"));
+        // empty/whitespace cfg falls through to default
+        assert_eq!(pick_dir(None, Some("   "), || PathBuf::from("/d")), PathBuf::from("/d"));
+        // env beats cfg and is used RAW (the shell already expanded ~)
+        assert_eq!(
+            pick_dir(Some("/env".to_string()), Some("~/cfg"), || PathBuf::from("/d")),
+            PathBuf::from("/env")
+        );
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn flows_dir_env_override_wins() {
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", "/custom/flows"); }
+        assert_eq!(flows_dir(), std::path::PathBuf::from("/custom/flows"));
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn flows_dir_default_when_unset() {
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe { std::env::remove_var("DARKMUX_FLOWS_DIR"); }
+        // No env, and (in CI) no config.json → ends in a `flows` dir (the
+        // ~/.darkmux/flows default, or the /tmp fallback if HOME is absent).
+        assert!(flows_dir().ends_with("flows"), "resolves to a flows dir");
+        if let Some(v) = prev { unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", v); } }
     }
 }
