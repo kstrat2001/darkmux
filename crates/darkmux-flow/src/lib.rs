@@ -116,8 +116,11 @@ impl FlowSink for LocalFileSink {
     // default sink's "honor a live DARKMUX_FLOWS_DIR" behavior that ~9
     // tests across the binary + crew rely on — converting those to
     // explicit sinks is its own scoped task, tracked as a #507 follow-up.
-    // FLOWS_DIR (unlike AUDIT_DIR) is not concurrently scrubbed by the
-    // test-isolation helper, so this path is not a demonstrated race.
+    // The per-record append is a single `write_all` under `O_APPEND` (see
+    // `record_at`): O_APPEND's atomic EOF-positioning plus per-inode write
+    // serialization on Linux/macOS keep concurrent writers to a shared day-file
+    // from tearing each other's lines — the best-effort, lock-free counterpart
+    // to AuditFileSink's tear-proof `flock`.
     fn write(&self, record: &FlowRecord) -> Result<()> {
         let dir = flows_dir();
         let day = day_utc_now();
@@ -847,7 +850,21 @@ pub(crate) fn record_at(record: &FlowRecord, path: &Path) -> Result<()> {
                 .append(true)
                 .open(path)
                 .with_context(|| format!("opening flow log for append {}", path.display()))?;
-            writeln!(file, "{record_line}")
+            // ONE `write_all` of the whole `line\n` — not `writeln!`, which
+            // forwards the record text and the newline as SEPARATE `write()`s
+            // that two concurrent appenders interleave mid-line, fusing two JSON
+            // objects onto one line. Two real guarantees make the single-write
+            // form tear-free for these small records on the targeted POSIX
+            // platforms (Linux/macOS): `O_APPEND` atomically re-seeks each
+            // `write()` to EOF — the actual POSIX promise, NOT PIPE_BUF (which
+            // only governs pipes/FIFOs) — so no appender clobbers another; and
+            // per-inode write serialization keeps one `write()` contiguous
+            // against a concurrent one. `write_all` is a single `write()` in
+            // practice for a sub-KB regular file (it loops only on a partial
+            // return — effectively never here outside ENOSPC). Tear-proof BY
+            // CONSTRUCTION is the audit sink's `flock` path; the casual sink
+            // stays lock-free + best-effort.
+            file.write_all(format!("{record_line}\n").as_bytes())
                 .with_context(|| format!("appending to flow log {}", path.display()))?;
             file.sync_all()
                 .with_context(|| format!("syncing flow log {}", path.display()))?;
@@ -1064,6 +1081,59 @@ mod tests {
                 line.get("_type").is_none(),
                 "record line should not contain _type"
             );
+        }
+    }
+
+    /// Concurrent appenders to a shared day-file must never tear each other's
+    /// lines. Regression for the flow-test flake: the append path used
+    /// `writeln!` (record text + `\n` as SEPARATE writes), so two threads could
+    /// interleave mid-line into invalid JSON. The fix is one atomic `write_all`
+    /// of `line\n` (atomic under `O_APPEND` for sub-`PIPE_BUF` records). Not
+    /// `#[serial]` — it deliberately drives concurrency against ONE file it owns.
+    #[test]
+    fn concurrent_appends_never_tear_lines() {
+        use std::collections::HashSet;
+        use std::thread;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("2025-01-15.jsonl");
+        let threads = 8;
+        let per_thread = 40;
+
+        // Pre-create the file so every thread takes the append path — isolates
+        // this to the append-tearing concern, not the create-race.
+        record_at(&minimal_record(), &path).unwrap();
+
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let path = path.clone();
+                thread::spawn(move || {
+                    for i in 0..per_thread {
+                        let mut rec = minimal_record();
+                        rec.action = format!("thr{t}-rec{i}");
+                        record_at(&rec, &path).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Every line must parse (no torn/interleaved JSON) ...
+        let contents = fs::read_to_string(&path).unwrap();
+        let mut markers = HashSet::new();
+        for (n, line) in contents.lines().enumerate() {
+            let v: Value = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("torn line {n}: {e}: {line:?}"));
+            if let Some(a) = v["action"].as_str() {
+                markers.insert(a.to_string());
+            }
+        }
+        // ... and every record must be present (none lost to a clobbering write).
+        for t in 0..threads {
+            for i in 0..per_thread {
+                assert!(markers.contains(&format!("thr{t}-rec{i}")), "missing thr{t}-rec{i}");
+            }
         }
     }
 
