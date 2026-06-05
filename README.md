@@ -137,10 +137,10 @@ cargo install --path .      # builds the self-contained binary, drops it on $PAT
 docker build -t darkmux-runtime:latest runtime/
 
 # 4. Bootstrap config + agent skills
-darkmux init                # creates ~/.darkmux/profiles.json + installs agent skills
-                            # (skills include /darkmux-bootstrap — a guided
-                            # first-time setup workflow you run in your
-                            # Claude Code session after install)
+darkmux init                # writes ~/.darkmux/config.json + ~/.darkmux/profiles.json,
+                            # installs agent skills (incl. /darkmux-bootstrap — a guided
+                            # first-time setup workflow you run in your Claude Code
+                            # session after install). Never overwrites existing files.
 ```
 
 If `cargo` is already on your PATH, skip Step 1. The `source "$HOME/.cargo/env"` line is the one most often missed by first-time-Rust users — without it, a fresh `cargo install` fails with `command not found: cargo` in the same shell that just ran the rustup installer.
@@ -155,6 +155,26 @@ darkmux doctor          # pre-flight checks: registry, LMStudio, models, runtime
 Doctor returns exit 0 if everything's wired up, 1 if a fail-level check needs fixing. Fail/warn lines include actionable hints.
 
 Once doctor is green, edit `~/.darkmux/profiles.json` and replace each `<your-primary-model-id>` placeholder with an actual id from `lms ls`. (Doctor will warn if profiles don't match your loaded models — that's the moment to fix them.)
+
+### Configuration
+
+`darkmux init` also writes **`~/.darkmux/config.json`** — your one place to configure darkmux. It's self-documenting: every common setting is written with its default visible, so you tune the file rather than hunt through docs.
+
+```json
+{
+  "machine_id": "studio",
+  "lmstudio_url": "http://localhost:1234",
+  "redis":   { "enabled": false, "host": "127.0.0.1", "port": 6379 },
+  "audit":   { "enabled": false, "dir": "~/.darkmux/audit" },
+  "runtime": { "inactivity_timeout_seconds": 600, "check_updates": true }
+}
+```
+
+Optional integrations (Redis coordination, the audit log) are blocks you turn on by flipping `"enabled": true` — the connection knobs are already there to edit. Every setting also accepts a `DARKMUX_*` environment-variable override (handy for CI or a one-off shell); the precedence is **env var > `config.json` > built-in default**, and `darkmux doctor` shows where each value resolved.
+
+**Secrets stay out of the file.** A Redis password is never written to `config.json` — it lives in the macOS Keychain (store it once: `security add-generic-password -a "$USER" -s darkmux-redis -w`), read at runtime and never logged. On non-macOS, pass a full `DARKMUX_REDIS_URL` instead.
+
+> `config.json` (darkmux's settings) is a separate file from `profiles.json` (your swap profiles). Point at a non-default profiles registry with `--profiles <path>` or `DARKMUX_PROFILES`.
 
 ### First useful commands
 
