@@ -245,8 +245,19 @@ impl FlowSink for AuditFileSink {
 /// The only call site for `redact_url_creds` in production code is the
 /// `Display` implementation below — all other paths reach the redacted
 /// form through `format!("{raw_url}")` or `.to_string()`.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct RawRedisUrl(String);
+
+// Debug is hand-written (NOT derived) so `{:?}` can't leak the password — the
+// derived tuple-struct Debug would print the raw inner string verbatim, making
+// the type safe for `Display` but a footgun for `{:?}` (a future log line, an
+// anyhow context, an `.expect`). Delegating to the redacting form makes the
+// "compile-time, not convention" promise actually hold for both. (#661, audit)
+impl std::fmt::Debug for RawRedisUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RawRedisUrl({})", redact_url_creds(&self.0))
+    }
+}
 
 impl RawRedisUrl {
     pub fn new(url: String) -> Self {
@@ -264,6 +275,116 @@ impl std::fmt::Display for RawRedisUrl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&redact_url_creds(&self.0))
     }
+}
+
+/// Read the Redis password from the macOS Keychain — the SAME `darkmux-redis`
+/// item the Homebrew wrapper already populates (`security add-generic-password
+/// -a $USER -s darkmux-redis -w`). Shells out to `security` (no crate dep,
+/// matching the dep discipline + the wrapper), `OnceLock`-cached (the password
+/// doesn't change mid-process). `-w` writes ONLY the password to stdout (never
+/// stderr), so capturing stdout can't leak it into a log; the value flows into
+/// `assemble_redis_url` and from there only into a `RawRedisUrl` (redacted
+/// `Display`). Non-macOS → `None` — portable operators use the full-URL env
+/// path (tier-1). (#661 Slice 5)
+#[cfg(target_os = "macos")]
+fn keychain_redis_password() -> Option<String> {
+    static PW: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    PW.get_or_init(|| {
+        let user = std::env::var("USER").ok()?;
+        let out = std::process::Command::new("security")
+            .args(["find-generic-password", "-a", &user, "-s", "darkmux-redis", "-w"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None; // item absent → password-less assemble (don't hard-fail)
+        }
+        let pw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if pw.is_empty() { None } else { Some(pw) }
+    })
+    .clone()
+}
+#[cfg(not(target_os = "macos"))]
+fn keychain_redis_password() -> Option<String> {
+    None
+}
+
+/// Percent-encode the URL-structural characters (`@ : / # ? &` — the exact set
+/// the Homebrew wrapper documents as forbidden) in a Redis password. Two
+/// reasons, one security + one functional:
+/// - **Security:** `redact_url_creds` masks only the userinfo before the FIRST
+///   `@`, so an `@` *inside* the password would push its tail into the
+///   (unredacted) host portion and leak on `Display`. Encoding `@`→`%40` keeps
+///   the whole secret in the masked userinfo.
+/// - **Functional:** the other structural chars would otherwise split the URL.
+///
+/// A contract-compliant password contains none of these → **no-op**. The `redis`
+/// crate percent-decodes userinfo, so an encoded edge-case password still
+/// authenticates. `%` is intentionally NOT encoded (it's not in the forbidden
+/// set and isn't a leak vector — leaving it avoids changing today's handling of
+/// a literal `%`). Inline, no dep — per the project's dep discipline.
+fn encode_redis_password(pw: &str) -> String {
+    let mut out = String::with_capacity(pw.len());
+    for c in pw.chars() {
+        match c {
+            '@' => out.push_str("%40"),
+            ':' => out.push_str("%3A"),
+            '/' => out.push_str("%2F"),
+            '#' => out.push_str("%23"),
+            '?' => out.push_str("%3F"),
+            '&' => out.push_str("%26"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Assemble a Redis URL from the non-secret bits + an optional password. Pure +
+/// testable. The password is `encode_redis_password`'d, then placed as `:<pw>@`
+/// (empty user), which `redact_url_creds` masks to `:***@`.
+fn assemble_redis_url(host: &str, port: u16, db: Option<u8>, password: Option<&str>) -> String {
+    let auth = match password {
+        Some(pw) => format!(":{}@", encode_redis_password(pw)),
+        None => String::new(),
+    };
+    let db_suffix = db.map(|d| format!("/{d}")).unwrap_or_default();
+    format!("redis://{auth}{host}:{port}{db_suffix}")
+}
+
+/// Resolve the Redis connection URL, 3-tier (#661 Slice 5):
+///   1. `DARKMUX_REDIS_URL` env set → **verbatim** (full URL, password inline)
+///      — the backward-compat path; existing setups + the brew wrapper stay
+///      byte-for-byte unchanged.
+///   2. else `config.redis.enabled` + a host → **assemble** from the
+///      non-secret config bits + the Keychain password (password-less if the
+///      Keychain item is absent — local/Tailnet-trusted Redis is common; don't
+///      hard-fail).
+///   3. else `None` (Redis off — today's default).
+///
+/// Always returns `RawRedisUrl`, so the password can only reach a log through
+/// the redacting `Display`; `expose_for_probe()` (deliberately verbose, visible
+/// in review) is the sole raw-bytes path, for `redis::Client::open`.
+pub fn redis_url() -> Option<RawRedisUrl> {
+    // Tier 1 — env URL verbatim (password inline; redacted on Display).
+    if let Some(url) = std::env::var("DARKMUX_REDIS_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
+        return Some(RawRedisUrl::new(url));
+    }
+    // Tier 2 — config-assembled (enabled + host), password from the Keychain.
+    if darkmux_types::config_access::redis_enabled() {
+        if let Some(host) = darkmux_types::config_access::redis_host() {
+            let url = assemble_redis_url(
+                &host,
+                darkmux_types::config_access::redis_port(),
+                darkmux_types::config_access::redis_db(),
+                keychain_redis_password().as_deref(),
+            );
+            return Some(RawRedisUrl::new(url));
+        }
+    }
+    // Tier 3 — off.
+    None
 }
 
 /// Redis Streams-backed flow sink. Each `write` XADDs the record's
@@ -677,11 +798,10 @@ fn build_default_sink() -> Arc<dyn FlowSink> {
     // LocalFile is always present.
     sinks.push(Arc::new(LocalFileSink::new()));
 
-    let redis_url = std::env::var("DARKMUX_REDIS_URL")
-        .ok()
-        .filter(|s| !s.trim().is_empty());
-
-    if let Some(url) = redis_url {
+    // (#661 Slice 5) Resolve via the 3-tier resolver: env DARKMUX_REDIS_URL
+    // verbatim, else config-assembled (enabled + host + Keychain password),
+    // else None.
+    if let Some(raw_url) = redis_url() {
         let stream = std::env::var("DARKMUX_REDIS_STREAM")
             .ok()
             .filter(|s| !s.trim().is_empty())
@@ -696,7 +816,6 @@ fn build_default_sink() -> Arc<dyn FlowSink> {
             Err(_) => Some(10000),
         };
 
-        let raw_url = RawRedisUrl::new(url);
         match RedisSink::new(raw_url.expose_for_probe(), &stream, max_len) {
             Ok(redis_sink) => {
                 eprintln!(
@@ -2557,6 +2676,56 @@ mod tests {
             match prev {
                 Some(v) => std::env::set_var("DARKMUX_AUDIT_DIR", v),
                 None => std::env::remove_var("DARKMUX_AUDIT_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    fn assemble_redis_url_places_password_and_db() {
+        // password-less, no db
+        assert_eq!(assemble_redis_url("h", 6379, None, None), "redis://h:6379");
+        // password as `:<pw>@` (empty user) — and redact masks it to `:***@`
+        let pw = assemble_redis_url("h", 6379, None, Some("secret"));
+        assert_eq!(pw, "redis://:secret@h:6379");
+        assert_eq!(redact_url_creds(&pw), "redis://:***@h:6379");
+        // db suffix
+        assert_eq!(assemble_redis_url("h", 6380, Some(2), None), "redis://h:6380/2");
+        assert_eq!(assemble_redis_url("h", 6380, Some(2), Some("p")), "redis://:p@h:6380/2");
+        // A non-URL-safe password (`@`/`/`/`&` in it) is percent-encoded so it
+        // can't split the URL or escape redaction — the whole secret stays in
+        // the masked userinfo (audit LOW).
+        let at = assemble_redis_url("h", 6379, None, Some("p@ss/w&rd"));
+        assert_eq!(at, "redis://:p%40ss%2Fw%26rd@h:6379");
+        assert!(!at.contains("p@ss"), "raw `@` must not appear in the assembled URL");
+        assert_eq!(redact_url_creds(&at), "redis://:***@h:6379", "no tail leaks past redaction");
+    }
+
+    #[test]
+    fn raw_redis_url_debug_is_redacted() {
+        // The `Debug` impl must NOT expose the raw password (audit MEDIUM) —
+        // `{:?}` is as safe as `{}`.
+        let u = RawRedisUrl::new("redis://:supersecret@h:6379".to_string());
+        let dbg = format!("{u:?}");
+        assert!(!dbg.contains("supersecret"), "Debug leaked the password: {dbg}");
+        assert!(dbg.contains("***"), "Debug should show the redacted form: {dbg}");
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn redis_url_env_tier_verbatim_then_off() {
+        let prev = std::env::var("DARKMUX_REDIS_URL").ok();
+        // Tier 1: env verbatim — raw via expose_for_probe, redacted on Display.
+        unsafe { std::env::set_var("DARKMUX_REDIS_URL", "redis://:hunter2@h:6379/0"); }
+        let u = redis_url().expect("env tier → Some");
+        assert_eq!(u.expose_for_probe(), "redis://:hunter2@h:6379/0");
+        assert_eq!(u.to_string(), "redis://:***@h:6379/0", "Display redacts");
+        // Tier 3: unset env + (in CI) no config.redis → None (off).
+        unsafe { std::env::remove_var("DARKMUX_REDIS_URL"); }
+        assert!(redis_url().is_none(), "no env + no config → Redis off");
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
             }
         }
     }
