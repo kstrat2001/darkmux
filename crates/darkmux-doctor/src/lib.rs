@@ -1420,9 +1420,8 @@ fn docker_status_to_check(status: darkmux_crew::dispatch_internal::DockerRuntime
             message: "`docker` not on PATH — darkmux's default internal runtime can't dispatch"
                 .into(),
             hint: Some(
-                "Install Docker Desktop (https://www.docker.com/products/docker-desktop) to use the \
-                 default container-bounded runtime, or pass `--runtime openclaw` per dispatch if you \
-                 have openclaw."
+                "Install Docker Desktop (https://www.docker.com/products/docker-desktop) to use \
+                 darkmux's default container-bounded runtime."
                     .into(),
             ),
         },
@@ -1433,11 +1432,7 @@ fn docker_status_to_check(status: darkmux_crew::dispatch_internal::DockerRuntime
                 "Docker is installed but the daemon isn't reachable — the default internal runtime \
                  can't dispatch"
                     .into(),
-            hint: Some(
-                "Start Docker Desktop, then re-run `darkmux doctor`. (Or pass `--runtime openclaw` \
-                 per dispatch.)"
-                    .into(),
-            ),
+            hint: Some("Start Docker Desktop, then re-run `darkmux doctor`.".into()),
         },
         S::ImageMissing => Check {
             name,
@@ -2536,6 +2531,33 @@ mod tests {
         assert_eq!(c.status, Status::Warn);
         assert!(c.message.contains("boom"), "{}", c.message);
         assert!(c.hint.is_none());
+    }
+
+    #[test]
+    fn docker_checks_never_mention_openclaw() {
+        // #393 schema-isolation: doctor's default-mode checks must not surface
+        // openclaw (enforced by `doctor_default_skips_openclaw_checks`). The
+        // docker-runtime check runs in default mode, so NONE of its outputs —
+        // across every probe result — may mention openclaw in name/message/hint.
+        // This guards it directly, without needing a Docker-absent host.
+        use darkmux_crew::dispatch_internal::DockerRuntimeStatus as S;
+        for status in [
+            S::Ready,
+            S::BinaryMissing,
+            S::DaemonUnreachable("x".into()),
+            S::ImageMissing,
+            S::ProbeError("x".into()),
+        ] {
+            let c = docker_status_to_check(status);
+            let blob = format!(
+                "{} {} {}",
+                c.name,
+                c.message,
+                c.hint.unwrap_or_default()
+            )
+            .to_lowercase();
+            assert!(!blob.contains("openclaw"), "docker check leaked openclaw: {blob}");
+        }
     }
 
     // ─── classify_ram_headroom ─────────────────────────────────────────
