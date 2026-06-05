@@ -205,3 +205,17 @@ Designed to live BELOW agent frameworks and ABOVE inference engines:
 ```
 
 Drop in via OpenAI-compatible endpoint. No changes to agent framework. No changes to inference engine. Just a smarter routing layer between them.
+
+## Configuration: visible defaults, gated features, secret carve-outs
+
+darkmux's settings live in one file — `~/.darkmux/config.json` — resolved with a single precedence everywhere: **env var > `config.json` > built-in default**. The env layer survives as a live override (CI, tests, a one-off shell); `config.json` is the durable surface; the built-in default is the floor. The whole precedence lives in one module so a reader never has to wonder where a value came from — the same *operator sovereignty* principle the rest of darkmux is built on: every default overridable, every value's source explainable.
+
+Three choices shape it:
+
+**Visible defaults, not hidden code-defaults.** `darkmux init` writes the common knobs *into the file* with their default values, rather than leaving them implicit in the binary. The cost is that a default written today doesn't silently change on upgrade — but that's the point: the operator can *see* what's configurable without reading source, and *change* a default with a file edit instead of a recompile. A config meant to replace env-var sprawl has to be discoverable, or it isn't a config at all.
+
+**Off-by-default features are `enabled`-gated blocks, not presence-gated.** Redis coordination and the audit log are written as complete blocks with `"enabled": false` and every connection knob populated. The block's *presence* doesn't turn the feature on — the `enabled` flag does. So the whole surface is discoverable (you see exactly what Redis would need) and one edit from on, without darkmux guessing intent from whether a `host` happens to be set.
+
+**Secrets are carved out — never plaintext config.** A `config.json` is a file an operator writes, edits, and might share or commit. So the one thing it never holds is a password: the Redis password lives in the macOS Keychain, read at runtime and wrapped so it can only ever reach a log redacted. `config.redis` holds the non-secret connection bits; the Keychain holds the secret. (One other carve-out, for a different reason: `DARKMUX_HOME` — the pointer that *locates* the config root — stays an env var, because it can't live inside the file it's there to find.)
+
+The schema is lenient on read (every field optional, unknown keys preserved), so a newer config never bricks an older binary and a hand-edited file never panics the CLI — loud validation is `darkmux doctor`'s job, not the hot load path. Additive schema changes are a minor version bump; the operator's file keeps working across them.
