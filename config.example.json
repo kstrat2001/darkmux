@@ -1,0 +1,24 @@
+{
+  "schema_version": "1.0",
+  "machine_id": "my-machine",
+  "orchestrator": "",
+  "lms_bin": "lms",
+  "lmstudio_url": "http://localhost:1234",
+  "redis": {
+    "enabled": false,
+    "host": "127.0.0.1",
+    "port": 6379,
+    "stream": "darkmux:flow",
+    "maxlen": 10000
+  },
+  "audit": {
+    "enabled": false,
+    "dir": "~/.darkmux/audit"
+  },
+  "runtime": {
+    "inactivity_timeout_seconds": 600,
+    "strict_selection": false,
+    "feedback_injection": true,
+    "check_updates": true
+  }
+}
