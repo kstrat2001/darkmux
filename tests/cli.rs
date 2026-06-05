@@ -470,8 +470,12 @@ fn notebook_list_machine_filter() {
         .arg("m5-home")
         .assert()
         .success()
-        .stdout(predicate::str::contains("r1"))
-        .stdout(predicate::str::contains("r2").not());
+        // Assert on the machine name, NOT the 2-char run id: `notebook list`
+        // prints each entry's full file path (under a random TempDir), so a
+        // `contains("r2")` predicate spuriously fails whenever the tmp path
+        // happens to contain "r2". Machine names don't collide with paths.
+        .stdout(predicate::str::contains("m5-home"))
+        .stdout(predicate::str::contains("m3-laptop").not());
 
     // Filter to nonexistent machine → no output.
     let mut cmd2 = Command::cargo_bin("darkmux").unwrap();
