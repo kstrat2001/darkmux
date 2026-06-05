@@ -118,31 +118,33 @@ fn apply_compaction_flags(
 /// stderr warning rather than aborting the dispatch — keeps the
 /// dispatch alive on operator-typo'd values, surfaces the issue.
 fn apply_runtime_limit_flags(cmd: &mut Command) {
-    if let Ok(raw) = std::env::var("DARKMUX_RUNTIME_MAX_TURNS") {
-        match raw.parse::<u32>() {
-            Ok(n) => {
-                cmd.arg("--max-turns").arg(n.to_string());
-            }
-            Err(_) => {
-                eprintln!(
-                    "darkmux crew dispatch: DARKMUX_RUNTIME_MAX_TURNS=`{raw}` is not a \
-                     positive integer; ignoring (runtime defaults to unlimited turns). (#457)"
-                );
-            }
-        }
+    // Resolve env(DARKMUX_RUNTIME_MAX_*) > config.runtime.max_* > None (#661
+    // Slice 4) and emit the container flag only when a cap is set. A set-but-
+    // unparseable env still warns (operator-typo help) before `config_access`
+    // falls it through to the config / unset tier.
+    warn_if_unparseable_u32("DARKMUX_RUNTIME_MAX_TURNS");
+    warn_if_unparseable_u32("DARKMUX_RUNTIME_MAX_TOKENS");
+    if let Some(n) = darkmux_types::config_access::max_turns() {
+        cmd.arg("--max-turns").arg(n.to_string());
     }
-    if let Ok(raw) = std::env::var("DARKMUX_RUNTIME_MAX_TOKENS") {
-        match raw.parse::<u32>() {
-            Ok(n) => {
-                cmd.arg("--max-tokens").arg(n.to_string());
-            }
-            Err(_) => {
-                eprintln!(
-                    "darkmux crew dispatch: DARKMUX_RUNTIME_MAX_TOKENS=`{raw}` is not a \
-                     positive integer; ignoring (runtime defaults to unlimited cumulative \
-                     completion tokens). (#457)"
-                );
-            }
+    if let Some(n) = darkmux_types::config_access::max_tokens() {
+        cmd.arg("--max-tokens").arg(n.to_string());
+    }
+}
+
+/// Warn (don't abort) if a runtime-limit env var is set to a non-`u32` —
+/// keeps the dispatch alive on operator typos while surfacing the issue.
+/// The resolved value comes from `config_access` (which falls an unparseable
+/// env through to the config / unset tier), so this is purely the typo nudge.
+/// (#457 / #661 Slice 4)
+fn warn_if_unparseable_u32(var: &str) {
+    if let Ok(raw) = std::env::var(var) {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() && trimmed.parse::<u32>().is_err() {
+            eprintln!(
+                "darkmux crew dispatch: {var}=`{raw}` is not a positive integer; \
+                 ignoring it (falling through to config / runtime default). (#457)"
+            );
         }
     }
 }
@@ -154,14 +156,15 @@ fn apply_runtime_limit_flags(cmd: &mut Command) {
 /// pathologically hung (compactor model ran, primary accepted new
 /// state, turns continued).
 ///
-/// **600s** is the same value the prior absolute deadline used.
-/// Under inactivity-reset semantics it bounds the time between
-/// progress signals rather than total dispatch wall-clock —
+/// **600s** (the `config_access` default) is the same value the prior
+/// absolute deadline used. Under inactivity-reset semantics it bounds the
+/// time between progress signals rather than total dispatch wall-clock —
 /// dispatches making compactions every ~5-10 min stay alive
 /// indefinitely up to the runtime's other bounds (per-call token
 /// cap, cumulative-tokens cap, MAX_TURNS).
 ///
-/// Override per dispatch via `DARKMUX_INACTIVITY_TIMEOUT_SECONDS`.
+/// Resolution (#661 Slice 4): `env(DARKMUX_INACTIVITY_TIMEOUT_SECONDS) >
+/// config.runtime.inactivity_timeout_seconds > 600`.
 ///
 /// (#457) Renamed from `DEFAULT_DISPATCH_DEADLINE_SECS` /
 /// `DARKMUX_RUNTIME_DEADLINE_SECONDS`. The prior absolute-deadline
@@ -169,13 +172,8 @@ fn apply_runtime_limit_flags(cmd: &mut Command) {
 /// 88 passing tests, killed at 600s with the model still iterating).
 /// Progress-signal-based limits trust empirical evidence; absolute
 /// caps embed a guess about how long good work should take.
-const DEFAULT_INACTIVITY_TIMEOUT_SECS: u64 = 600;
-
 fn inactivity_timeout_seconds() -> u64 {
-    std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_INACTIVITY_TIMEOUT_SECS)
+    darkmux_types::config_access::inactivity_timeout_seconds()
 }
 
 /// LMStudio /v1/models URL used to probe the currently-loaded model
@@ -2666,7 +2664,7 @@ mod tests {
         // Saved + restored — tests share process env, so be polite.
         let prev = std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS").ok();
         unsafe { std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS") };
-        assert_eq!(inactivity_timeout_seconds(), DEFAULT_INACTIVITY_TIMEOUT_SECS);
+        assert_eq!(inactivity_timeout_seconds(), 600); // the config_access default
         if let Some(v) = prev {
             unsafe { std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", v) };
         }
@@ -2689,7 +2687,7 @@ mod tests {
     fn inactivity_timeout_falls_back_on_garbage_env() {
         let prev = std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS").ok();
         unsafe { std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", "not-a-number") };
-        assert_eq!(inactivity_timeout_seconds(), DEFAULT_INACTIVITY_TIMEOUT_SECS);
+        assert_eq!(inactivity_timeout_seconds(), 600); // the config_access default
         unsafe { std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS") };
         if let Some(v) = prev {
             unsafe { std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", v) };
