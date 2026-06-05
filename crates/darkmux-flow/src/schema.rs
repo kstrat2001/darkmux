@@ -305,11 +305,12 @@ pub(crate) fn epoch_to_hhmmss(epochs: i64) -> (u8, u8, u8) {
 ///    hazard for tests that mutate env without `#[serial_test::serial]`.
 /// 3. `None` — extremely rare (CI in a sandbox without `hostname`).
 pub fn resolve_machine_id() -> Option<String> {
-    if let Ok(s) = std::env::var("DARKMUX_MACHINE_ID") {
-        let trimmed = s.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
-        }
+    // env(DARKMUX_MACHINE_ID) > config.machine_id (#661 Slice 4). config_access
+    // reads the env LIVE per-call, so a `set_var` in tests / operator shells
+    // still takes effect without a process restart — the property this hot path
+    // (and the serial tests) rely on. The hostname fallback below is unchanged.
+    if let Some(id) = darkmux_types::config_access::machine_id() {
+        return Some(id);
     }
     static HOSTNAME: OnceLock<Option<String>> = OnceLock::new();
     HOSTNAME
@@ -333,8 +334,6 @@ pub fn resolve_machine_id() -> Option<String> {
 /// declaration, records carry no orchestrator field and the doctor
 /// surfaces a warn so the operator knows the field exists.
 pub fn resolve_orchestrator() -> Option<String> {
-    std::env::var("DARKMUX_ORCHESTRATOR")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    // env(DARKMUX_ORCHESTRATOR) > config.orchestrator (#661 Slice 4), read live.
+    darkmux_types::config_access::orchestrator()
 }
