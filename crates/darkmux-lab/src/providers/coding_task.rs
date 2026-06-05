@@ -836,10 +836,11 @@ fn dispatch_via_openclaw(
 /// `DARKMUX_RUNTIME_AGENTS_DIR` for any other runtime that stores per-agent
 /// session files in a parallel layout: `<dir>/<agent>/sessions/<session-id>.trajectory.jsonl`.
 fn guess_trajectory_path(session_id: &str) -> Option<PathBuf> {
-    let agents_dir = if let Ok(custom) = env::var("DARKMUX_RUNTIME_AGENTS_DIR") {
-        PathBuf::from(custom)
-    } else {
-        dirs::home_dir()?.join(".openclaw").join("agents")
+    // env(DARKMUX_RUNTIME_AGENTS_DIR) > config.dirs.runtime_agents >
+    // ~/.openclaw/agents (None if no HOME and no override) (#661 Slice 3).
+    let agents_dir = match darkmux_types::config_access::runtime_agents_dir_override() {
+        Some(p) => p,
+        None => dirs::home_dir()?.join(".openclaw").join("agents"),
     };
     if !agents_dir.exists() {
         return None;

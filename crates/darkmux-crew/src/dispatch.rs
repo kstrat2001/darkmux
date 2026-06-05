@@ -42,14 +42,13 @@ const LICENSED_ADJACENT_ROLES: &[&str] = &["health-research", "legal-research", 
 /// (e.g., for tests). Visible to other crates so the doctor pin-drift
 /// check (#160) reads from the same path sync writes to.
 pub fn default_openclaw_config() -> PathBuf {
-    if let Ok(p) = std::env::var("DARKMUX_OPENCLAW_CONFIG") {
-        let trimmed = p.trim();
-        if !trimmed.is_empty() {
-            return PathBuf::from(trimmed);
-        }
-    }
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    home.join(".openclaw/openclaw.json")
+    // env(DARKMUX_OPENCLAW_CONFIG) > config.dirs.openclaw_config >
+    // ~/.openclaw/openclaw.json (with a `./.openclaw/...` no-HOME fallback) (#661).
+    darkmux_types::config_access::openclaw_config_override().unwrap_or_else(|| {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".openclaw/openclaw.json")
+    })
 }
 
 /// The openclaw agent id darkmux uses for a given role. Per the
@@ -85,11 +84,9 @@ fn agent_dirs_for(role_id: &str, openclaw_root: &Path) -> (PathBuf, PathBuf) {
 /// overrides — used by tests, also available for operators who want to
 /// keep the acks in a different location.
 fn ack_dir() -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("DARKMUX_ACK_DIR") {
-        let trimmed = p.trim();
-        if !trimmed.is_empty() {
-            return Ok(PathBuf::from(trimmed));
-        }
+    // env(DARKMUX_ACK_DIR) > config.dirs.ack > ~/.darkmux/acks (#661 Slice 3).
+    if let Some(p) = darkmux_types::config_access::ack_dir_override() {
+        return Ok(p);
     }
     let home = dirs::home_dir().ok_or_else(|| anyhow!("no home directory found"))?;
     Ok(home.join(".darkmux").join("acks"))
@@ -652,13 +649,10 @@ fn walk_one_level(dir: &Path, out: &mut Vec<WatchedFile>, cap: usize) {
 /// env var overrides — used by tests, also available for operators
 /// with multi-user / multi-identity setups.
 fn identity_path() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("DARKMUX_IDENTITY_PATH") {
-        let trimmed = p.trim();
-        if !trimmed.is_empty() {
-            return Some(PathBuf::from(trimmed));
-        }
-    }
-    dirs::home_dir().map(|h| h.join(".darkmux").join("identity.md"))
+    // env(DARKMUX_IDENTITY_PATH) > config.dirs.identity > ~/.darkmux/identity.md
+    // (None if no HOME and no override) (#661 Slice 3).
+    darkmux_types::config_access::identity_path_override()
+        .or_else(|| dirs::home_dir().map(|h| h.join(".darkmux").join("identity.md")))
 }
 
 /// Load the operator-identity content from `~/.darkmux/identity.md` if
