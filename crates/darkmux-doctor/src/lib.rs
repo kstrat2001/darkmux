@@ -86,6 +86,7 @@ pub fn run(include_openclaw: bool) -> DoctorReport {
     let mut checks = vec![
         check_profile_registry(),
         check_lms_binary(),
+        check_docker_runtime(),
         check_models_loaded(),
         check_profile_loaded_match(),
         check_darkmux_version_vs_latest_release(),
@@ -1388,6 +1389,69 @@ fn openclaw_active() -> bool {
     darkmux_crew::dispatch::default_openclaw_config().exists()
 }
 
+/// (#680) The internal Docker-bounded runtime is the DEFAULT for `crew
+/// dispatch` and `lab run`, but nothing else in doctor surfaces it — a fresh
+/// operator otherwise gets an all-green doctor and only learns the Docker
+/// requirement when their first dispatch bails at the dispatch-time preflight.
+/// Reuses that preflight's probe (`dispatch_internal::docker_runtime_status`)
+/// so the image tag + probe logic have one home. Warn (not Fail):
+/// `--runtime openclaw` users legitimately need no Docker, so this is a
+/// heads-up, not a hard error.
+fn check_docker_runtime() -> Check {
+    docker_status_to_check(darkmux_crew::dispatch_internal::docker_runtime_status())
+}
+
+/// Pure status → Check mapping (unit-testable without Docker on the host).
+fn docker_status_to_check(status: darkmux_crew::dispatch_internal::DockerRuntimeStatus) -> Check {
+    use darkmux_crew::dispatch_internal::{DockerRuntimeStatus as S, RUNTIME_IMAGE};
+    let name = "docker runtime".to_string();
+    match status {
+        S::Ready => Check {
+            name,
+            status: Status::Pass,
+            message: format!(
+                "Docker daemon up · `{RUNTIME_IMAGE}` image present — internal runtime ready"
+            ),
+            hint: None,
+        },
+        S::BinaryMissing => Check {
+            name,
+            status: Status::Warn,
+            message: "`docker` not on PATH — darkmux's default internal runtime can't dispatch"
+                .into(),
+            hint: Some(
+                "Install Docker Desktop (https://www.docker.com/products/docker-desktop) to use \
+                 darkmux's default container-bounded runtime."
+                    .into(),
+            ),
+        },
+        S::DaemonUnreachable(_) => Check {
+            name,
+            status: Status::Warn,
+            message:
+                "Docker is installed but the daemon isn't reachable — the default internal runtime \
+                 can't dispatch"
+                    .into(),
+            hint: Some("Start Docker Desktop, then re-run `darkmux doctor`.".into()),
+        },
+        S::ImageMissing => Check {
+            name,
+            status: Status::Warn,
+            message: format!("Docker is up, but the `{RUNTIME_IMAGE}` image isn't built yet"),
+            hint: Some(format!(
+                "Build it once (≈50 MB) from the darkmux repo root:\n  \
+                 docker build -t {RUNTIME_IMAGE} runtime/"
+            )),
+        },
+        S::ProbeError(e) => Check {
+            name,
+            status: Status::Warn,
+            message: format!("couldn't probe the Docker runtime image: {e}"),
+            hint: None,
+        },
+    }
+}
+
 fn check_runtime_command() -> Check {
     // Sprint-G: skip when no openclaw config on disk. The internal
     // runtime is the default and needs no external binary; checking
@@ -2420,6 +2484,82 @@ mod tests {
         }
     }
 
+    // ─── #680: docker runtime status → Check mapping ───────────────────
+
+    #[test]
+    fn docker_status_ready_passes_no_hint() {
+        use darkmux_crew::dispatch_internal::DockerRuntimeStatus;
+        let c = docker_status_to_check(DockerRuntimeStatus::Ready);
+        assert_eq!(c.status, Status::Pass);
+        assert!(c.message.contains("internal runtime ready"), "{}", c.message);
+        assert!(c.hint.is_none());
+    }
+
+    #[test]
+    fn docker_status_binary_missing_warns_not_fails() {
+        // Warn, never Fail — openclaw-only operators legitimately have no Docker.
+        use darkmux_crew::dispatch_internal::DockerRuntimeStatus;
+        let c = docker_status_to_check(DockerRuntimeStatus::BinaryMissing);
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.hint.unwrap().contains("Install Docker Desktop"));
+    }
+
+    #[test]
+    fn docker_status_image_missing_warns_with_build_cmd() {
+        use darkmux_crew::dispatch_internal::DockerRuntimeStatus;
+        let c = docker_status_to_check(DockerRuntimeStatus::ImageMissing);
+        assert_eq!(c.status, Status::Warn);
+        assert!(
+            c.hint
+                .unwrap()
+                .contains("docker build -t darkmux-runtime:latest runtime/")
+        );
+    }
+
+    #[test]
+    fn docker_status_daemon_unreachable_warns() {
+        use darkmux_crew::dispatch_internal::DockerRuntimeStatus;
+        let c = docker_status_to_check(DockerRuntimeStatus::DaemonUnreachable("x".into()));
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.hint.unwrap().contains("Start Docker Desktop"));
+    }
+
+    #[test]
+    fn docker_status_probe_error_warns_no_hint() {
+        use darkmux_crew::dispatch_internal::DockerRuntimeStatus;
+        let c = docker_status_to_check(DockerRuntimeStatus::ProbeError("boom".into()));
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.message.contains("boom"), "{}", c.message);
+        assert!(c.hint.is_none());
+    }
+
+    #[test]
+    fn docker_checks_never_mention_openclaw() {
+        // #393 schema-isolation: doctor's default-mode checks must not surface
+        // openclaw (enforced by `doctor_default_skips_openclaw_checks`). The
+        // docker-runtime check runs in default mode, so NONE of its outputs —
+        // across every probe result — may mention openclaw in name/message/hint.
+        // This guards it directly, without needing a Docker-absent host.
+        use darkmux_crew::dispatch_internal::DockerRuntimeStatus as S;
+        for status in [
+            S::Ready,
+            S::BinaryMissing,
+            S::DaemonUnreachable("x".into()),
+            S::ImageMissing,
+            S::ProbeError("x".into()),
+        ] {
+            let c = docker_status_to_check(status);
+            let blob = format!(
+                "{} {} {}",
+                c.name,
+                c.message,
+                c.hint.unwrap_or_default()
+            )
+            .to_lowercase();
+            assert!(!blob.contains("openclaw"), "docker check leaked openclaw: {blob}");
+        }
+    }
+
     // ─── classify_ram_headroom ─────────────────────────────────────────
     // Verdicts must follow `real_headroom = reclaimable + resident − safety`,
     // not raw reclaimable. Calibrated against the issue #67 table.
@@ -2606,7 +2746,7 @@ mod tests {
     #[test]
     fn run_returns_static_plus_eureka_checks() {
         let r = run(true);
-        // 23 baseline checks (incl. runtime version + load projection +
+        // 28 static checks (incl. docker-runtime [#680] + runtime version + load projection +
         // daemon reachable + darkmux-version-vs-latest-release [#13] +
         // crew-role-prompt-coverage [#141] + flow-sink-health [#170] +
         // machine_id + orchestrator [#167] +
@@ -2614,10 +2754,11 @@ mod tests {
         // recommended-profile-not-shadowed [#159] + utility-model-binding
         // [#590] + role-model-pin-drift [#160] + legacy-mission-layout [#148]
         // + beat-33-crew-dir [Beat 33 directory flatten] + role-tool-vocab
-        // [#340] + legacy-compaction-extras [#380] + redis-config [#661]) + one
-        // per active eureka rule. Every check should appear regardless of
-        // environment — even if the underlying probe couldn't read state.
-        let expected = 27 + darkmux_eureka::all_rules().len();
+        // [#340] + legacy-compaction-extras [#380] + redis-config [#661] +
+        // docker-runtime [#680]) + one per active eureka rule. Every check
+        // should appear regardless of environment — even if the underlying
+        // probe couldn't read state.
+        let expected = 28 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

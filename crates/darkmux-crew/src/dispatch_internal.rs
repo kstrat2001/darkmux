@@ -35,7 +35,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// Docker image tag for the internal runtime. Built locally from
 /// `runtime/Dockerfile`. Will become configurable when production
 /// hardening lands.
-const RUNTIME_IMAGE: &str = "darkmux-runtime:latest";
+pub const RUNTIME_IMAGE: &str = "darkmux-runtime:latest";
 
 /// Add the two host→container bind mounts to the docker run command:
 /// the agent's `/workspace` and the runtime's out-of-band bookkeeping
@@ -1488,7 +1488,62 @@ fn cap_reasoning_text(value: Option<&serde_json::Value>) -> serde_json::Value {
     ))
 }
 
-/// Shell out to curl to fetch `/v1/models` from the host's LMStudio and
+/// Result of probing the host for the internal Docker runtime's two
+/// prerequisites (daemon reachable + `darkmux-runtime:latest` built).
+///
+/// Single source of truth shared by two consumers with different
+/// presentation: the dispatch-time `check_docker_preflight()` maps these
+/// to a hard bail (a stuck dispatch is worse than a refused one), while
+/// `darkmux doctor`'s `check_docker_runtime` maps them to a non-fatal Warn
+/// so a fresh operator learns the requirement at setup time rather than
+/// only when their first dispatch fails (#680).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DockerRuntimeStatus {
+    /// Docker daemon reachable AND the `RUNTIME_IMAGE` is built — ready.
+    Ready,
+    /// The `docker` binary isn't on PATH.
+    BinaryMissing,
+    /// `docker` is present but `docker version` failed (daemon not running).
+    /// Carries the trimmed stderr for diagnostics.
+    DaemonUnreachable(String),
+    /// Docker is up but `RUNTIME_IMAGE` isn't built locally.
+    ImageMissing,
+    /// Couldn't run the image probe even though the daemon answered (rare —
+    /// same binary as the version probe). Carries the error string.
+    ProbeError(String),
+}
+
+/// Probe the host for Docker availability + the runtime image. Pure of any
+/// presentation decision — callers map the returned status to a bail
+/// (dispatch) or a Warn (doctor).
+pub fn docker_runtime_status() -> DockerRuntimeStatus {
+    // Step 1: docker binary exists + daemon is reachable.
+    match Command::new("docker")
+        .args(["version", "--format", "{{.Server.Version}}"])
+        .output()
+    {
+        Ok(out) if out.status.success() => {} // Docker daemon up — fall through
+        Ok(out) => {
+            return DockerRuntimeStatus::DaemonUnreachable(
+                String::from_utf8_lossy(&out.stderr).trim().to_string(),
+            );
+        }
+        Err(_) => return DockerRuntimeStatus::BinaryMissing,
+    }
+
+    // Step 2: runtime image exists locally. `docker images -q <tag>` exits 0
+    // even when the image is missing; the load-bearing signal is empty stdout
+    // (no image id printed). Daemon-unreachable cases were caught in Step 1.
+    match Command::new("docker")
+        .args(["images", "-q", RUNTIME_IMAGE])
+        .output()
+    {
+        Ok(out) if out.stdout.is_empty() => DockerRuntimeStatus::ImageMissing,
+        Ok(_) => DockerRuntimeStatus::Ready,
+        Err(e) => DockerRuntimeStatus::ProbeError(e.to_string()),
+    }
+}
+
 /// Verify Docker is reachable + the runtime image exists. Called by
 /// `dispatch()` BEFORE the role-load / model-probe / workspace setup
 /// so a new user without Docker (or with Docker but no runtime image)
@@ -1496,51 +1551,39 @@ fn cap_reasoning_text(value: Option<&serde_json::Value>) -> serde_json::Value {
 /// opaque `Command::new("docker")` "No such file or directory" or
 /// a runtime-time "Unable to find image" failure mid-dispatch.
 fn check_docker_preflight() -> Result<()> {
-    // Step 1: docker binary exists + daemon is reachable.
-    let docker_check = Command::new("docker")
-        .args(["version", "--format", "{{.Server.Version}}"])
-        .output();
-    match docker_check {
-        Ok(out) if out.status.success() => {} // Docker daemon up
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            bail!(
-                "darkmux's default runtime (`--runtime internal`) requires Docker, \
-                 but `docker version` failed:\n  {}\n\
-                 Options:\n  \
-                 - Start Docker Desktop, OR\n  \
-                 - Re-run with `--runtime openclaw` if you have openclaw installed",
-                stderr.trim()
-            );
-        }
-        Err(_) => {
-            bail!(
-                "darkmux's default runtime (`--runtime internal`) requires Docker, \
-                 but the `docker` binary isn't on PATH.\n\
-                 Options:\n  \
-                 - Install Docker Desktop (https://www.docker.com/products/docker-desktop), OR\n  \
-                 - Re-run with `--runtime openclaw` if you have openclaw installed"
-            );
-        }
-    }
+    preflight_result_for(docker_runtime_status())
+}
 
-    // Step 2: runtime image exists locally. `docker images -q <tag>`
-    // exits 0 even when the image is missing; the load-bearing signal
-    // is empty stdout (no image id printed). Daemon-unreachable cases
-    // were already caught in Step 1.
-    let image_check = Command::new("docker")
-        .args(["images", "-q", RUNTIME_IMAGE])
-        .output()
-        .context("running `docker images` to check for runtime image")?;
-    if image_check.stdout.is_empty() {
-        bail!(
+/// Map a probe result to the dispatch-time bail (pure — unit-testable
+/// without Docker on the host).
+fn preflight_result_for(status: DockerRuntimeStatus) -> Result<()> {
+    match status {
+        DockerRuntimeStatus::Ready => Ok(()),
+        DockerRuntimeStatus::DaemonUnreachable(stderr) => bail!(
+            "darkmux's default runtime (`--runtime internal`) requires Docker, \
+             but `docker version` failed:\n  {}\n\
+             Options:\n  \
+             - Start Docker Desktop, OR\n  \
+             - Re-run with `--runtime openclaw` if you have openclaw installed",
+            stderr
+        ),
+        DockerRuntimeStatus::BinaryMissing => bail!(
+            "darkmux's default runtime (`--runtime internal`) requires Docker, \
+             but the `docker` binary isn't on PATH.\n\
+             Options:\n  \
+             - Install Docker Desktop (https://www.docker.com/products/docker-desktop), OR\n  \
+             - Re-run with `--runtime openclaw` if you have openclaw installed"
+        ),
+        DockerRuntimeStatus::ImageMissing => bail!(
             "darkmux runtime image `{RUNTIME_IMAGE}` not found locally.\n\
              Build it once from the darkmux repo root:\n  \
              docker build -t {RUNTIME_IMAGE} runtime/\n\
              (Or use `--runtime openclaw` if you have openclaw installed.)"
-        );
+        ),
+        DockerRuntimeStatus::ProbeError(e) => {
+            Err(anyhow!("running `docker images` to check for runtime image: {e}"))
+        }
     }
-    Ok(())
 }
 
 /// (#450, E14 refactor 1b) Resolve the model id this internal-runtime
@@ -1968,6 +2011,56 @@ mod tests {
     use serial_test::serial;
     use std::io::Write;
     use tempfile::TempDir;
+
+    // ─── #680: Docker-runtime preflight status → bail mapping ─────────
+
+    #[test]
+    fn preflight_ready_is_ok() {
+        assert!(preflight_result_for(DockerRuntimeStatus::Ready).is_ok());
+    }
+
+    #[test]
+    fn preflight_binary_missing_bails_with_install_hint() {
+        let msg = preflight_result_for(DockerRuntimeStatus::BinaryMissing)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("isn't on PATH"), "{msg}");
+        assert!(msg.contains("Install Docker Desktop"), "{msg}");
+    }
+
+    #[test]
+    fn preflight_daemon_unreachable_surfaces_stderr_and_start_hint() {
+        let msg = preflight_result_for(DockerRuntimeStatus::DaemonUnreachable(
+            "Cannot connect to the Docker daemon".to_string(),
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(msg.contains("`docker version` failed"), "{msg}");
+        assert!(msg.contains("Start Docker Desktop"), "{msg}");
+        assert!(msg.contains("Cannot connect to the Docker daemon"), "{msg}");
+    }
+
+    #[test]
+    fn preflight_image_missing_bails_with_build_command() {
+        let msg = preflight_result_for(DockerRuntimeStatus::ImageMissing)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("not found locally"), "{msg}");
+        assert!(
+            msg.contains("docker build -t darkmux-runtime:latest runtime/"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn preflight_probe_error_bails_with_underlying_error() {
+        // The one arm whose behavior changed (old `.context(...)?` → `anyhow!`).
+        let msg = preflight_result_for(DockerRuntimeStatus::ProbeError("boom".to_string()))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("running `docker images`"), "{msg}");
+        assert!(msg.contains("boom"), "{msg}");
+    }
 
     // ─── #368: compaction-flag passthrough to runtime CLI ────────────
 
