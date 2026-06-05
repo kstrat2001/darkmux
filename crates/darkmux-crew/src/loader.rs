@@ -129,10 +129,8 @@ const BUILTIN_SPRINTS: &[(&str, &str)] = &[];
 /// `crew_root()` is retained for callers that need the parent directory
 /// itself (e.g., daemon banner messages).
 pub(crate) fn crew_root() -> PathBuf {
-    std::env::var("DARKMUX_CREW_DIR")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(PathBuf::from)
+    // env(DARKMUX_CREW_DIR) > config.dirs.crew > <root>/crew (#661 Slice 3).
+    darkmux_types::config_access::crew_dir_override()
         .unwrap_or_else(|| resolve(ResolveScope::Auto).crew)
 }
 
@@ -141,10 +139,9 @@ pub(crate) fn crew_root() -> PathBuf {
 /// the env var points at the directory CONTAINING the subdirs, with no
 /// `crew/` nesting), otherwise `<paths.root>` (e.g., `~/.darkmux/`).
 pub fn user_state_root() -> PathBuf {
-    std::env::var("DARKMUX_CREW_DIR")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(PathBuf::from)
+    // Same override as crew_root, but the no-override default is the bare root
+    // (no `crew/` nesting). env(DARKMUX_CREW_DIR) > config.dirs.crew > <root>.
+    darkmux_types::config_access::crew_dir_override()
         .unwrap_or_else(|| resolve(ResolveScope::Auto).root)
 }
 

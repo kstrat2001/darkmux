@@ -96,17 +96,12 @@ fn default_roster_version() -> String {
     "2".to_string()
 }
 
-/// Resolve the roster file path: `DARKMUX_FLEET_FILE` env override, or
-/// `~/.darkmux/fleet.json` default. Tests bypass via the env override.
+/// Resolve the roster file path. Precedence (#661 Slice 3):
+/// `env(DARKMUX_FLEET_FILE) > config.dirs.fleet_file > ~/.darkmux/fleet.json`
+/// (with a `.darkmux/fleet.json` HOME-less fallback). Delegates to the single
+/// resolver in `darkmux_types::config_access`. Tests bypass via the env override.
 pub fn roster_path() -> PathBuf {
-    if let Ok(p) = std::env::var("DARKMUX_FLEET_FILE") {
-        if !p.trim().is_empty() {
-            return PathBuf::from(p);
-        }
-    }
-    dirs::home_dir()
-        .map(|h| h.join(".darkmux").join("fleet.json"))
-        .unwrap_or_else(|| PathBuf::from(".darkmux/fleet.json"))
+    darkmux_types::config_access::fleet_file()
 }
 
 /// Load the roster from disk, returning an empty roster when the file

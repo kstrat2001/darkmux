@@ -51,24 +51,31 @@ fn pick_parsed<T: FromStr + Copy>(env_key: &str, cfg: Option<T>, default: Option
         .or(default)
 }
 
-/// Precedence for a **directory** setting: `env > config tier > built-in
-/// default`. Pure + testable (env/cfg passed in, default a closure since some
-/// dirs derive it lazily from HOME/root). `env` is the already-empty-filtered
-/// `env_str` output, used raw (the shell expands `~`); the config tier is
-/// tilde-expanded (operators hand-write `~/...`) and an empty/whitespace value
-/// falls through. The reusable spine of every dir accessor (#661 Slice 3).
+/// The **override tier** for a directory setting: `env > config tier
+/// (tilde-expanded)`, or `None` when neither is set. The caller then supplies
+/// its own default — used where one env var overrides two *different* derived
+/// defaults (e.g. `DARKMUX_CREW_DIR` overrides both the crew root and the
+/// user-state root). `env` is the already-empty-filtered `env_str` output, used
+/// raw (the shell expands `~`); the config tier is tilde-expanded (operators
+/// hand-write `~/...`) and an empty/whitespace value falls through. Pure +
+/// testable — the reusable spine of every dir accessor (#661 Slice 3).
+fn pick_dir_override(env: Option<String>, cfg: Option<&str>) -> Option<std::path::PathBuf> {
+    if let Some(s) = env {
+        return Some(std::path::PathBuf::from(s));
+    }
+    cfg.filter(|s| !s.trim().is_empty())
+        .map(crate::paths::expand_tilde)
+}
+
+/// Precedence for a **directory** setting: `env > config tier (tilde-expanded) > built-in default`.
+/// `pick_dir_override` plus a lazy default closure (some dirs derive their
+/// default from HOME/root). Pure + testable.
 fn pick_dir(
     env: Option<String>,
     cfg: Option<&str>,
     default: impl FnOnce() -> std::path::PathBuf,
 ) -> std::path::PathBuf {
-    if let Some(s) = env {
-        return std::path::PathBuf::from(s);
-    }
-    if let Some(s) = cfg.filter(|s| !s.trim().is_empty()) {
-        return crate::paths::expand_tilde(s);
-    }
-    default()
+    pick_dir_override(env, cfg).unwrap_or_else(default)
 }
 
 // ── Identity / provenance ──
@@ -157,6 +164,35 @@ pub fn flows_dir() -> std::path::PathBuf {
             dirs::home_dir()
                 .map(|h| h.join(".darkmux").join("flows"))
                 .unwrap_or_else(|| PathBuf::from("/tmp/darkmux/flows"))
+        },
+    )
+}
+
+/// The crew-state directory **override** (`env(DARKMUX_CREW_DIR) >
+/// config.dirs.crew`), or `None` when neither is set. Returns the override only
+/// — the env var points at the directory *containing* the crew subdirs, and it
+/// overrides two distinct derived defaults (the crew root `<root>/crew` and the
+/// user-state root `<root>`), so each caller in `darkmux-crew` applies its own
+/// (`crew_root` / `user_state_root`).
+pub fn crew_dir_override() -> Option<std::path::PathBuf> {
+    pick_dir_override(
+        env_str("DARKMUX_CREW_DIR"),
+        config().dirs.as_ref().and_then(|d| d.crew.as_deref()),
+    )
+}
+
+/// The fleet roster file: `env(DARKMUX_FLEET_FILE) > config.dirs.fleet_file >
+/// ~/.darkmux/fleet.json` (with a `.darkmux/fleet.json` HOME-less fallback).
+/// Backs `fleet::roster::roster_path`.
+pub fn fleet_file() -> std::path::PathBuf {
+    use std::path::PathBuf;
+    pick_dir(
+        env_str("DARKMUX_FLEET_FILE"),
+        config().dirs.as_ref().and_then(|d| d.fleet_file.as_deref()),
+        || {
+            dirs::home_dir()
+                .map(|h| h.join(".darkmux").join("fleet.json"))
+                .unwrap_or_else(|| PathBuf::from(".darkmux/fleet.json"))
         },
     )
 }
@@ -278,5 +314,29 @@ mod tests {
         // ~/.darkmux/flows default, or the /tmp fallback if HOME is absent).
         assert!(flows_dir().ends_with("flows"), "resolves to a flows dir");
         if let Some(v) = prev { unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", v); } }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn crew_dir_override_env_then_none() {
+        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+        unsafe { std::env::set_var("DARKMUX_CREW_DIR", "/custom/crew"); }
+        assert_eq!(crew_dir_override(), Some(std::path::PathBuf::from("/custom/crew")));
+        // No env, and (in CI) no config → no override; the caller supplies its
+        // own default (crew root vs user-state root).
+        unsafe { std::env::remove_var("DARKMUX_CREW_DIR"); }
+        assert_eq!(crew_dir_override(), None);
+        if let Some(v) = prev { unsafe { std::env::set_var("DARKMUX_CREW_DIR", v); } }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn fleet_file_env_override_and_default() {
+        let prev = std::env::var("DARKMUX_FLEET_FILE").ok();
+        unsafe { std::env::set_var("DARKMUX_FLEET_FILE", "/custom/fleet.json"); }
+        assert_eq!(fleet_file(), std::path::PathBuf::from("/custom/fleet.json"));
+        unsafe { std::env::remove_var("DARKMUX_FLEET_FILE"); }
+        assert!(fleet_file().ends_with("fleet.json"), "default ends in fleet.json");
+        if let Some(v) = prev { unsafe { std::env::set_var("DARKMUX_FLEET_FILE", v); } }
     }
 }

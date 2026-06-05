@@ -427,7 +427,6 @@ dependencies = [
  "darkmux-crew",
  "darkmux-flow",
  "darkmux-types",
- "dirs",
  "libc",
  "redis",
  "serde",
