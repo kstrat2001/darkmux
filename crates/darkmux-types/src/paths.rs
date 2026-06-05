@@ -31,6 +31,9 @@ pub struct DarkmuxPaths {
     pub crew: PathBuf,
     pub notebook: PathBuf,
     pub profiles: PathBuf,
+    /// (#661) The config.json location (`<root>/config.json`). The config
+    /// subsystem reads + `darkmux init` writes here.
+    pub config: PathBuf,
     pub scope: Scope,
 }
 
@@ -48,6 +51,19 @@ pub enum ResolveScope {
 }
 
 pub fn resolve(scope: ResolveScope) -> DarkmuxPaths {
+    // (#661) DARKMUX_HOME is the bootstrap pointer — it overrides the darkmux
+    // root directory entirely (a relocated install, or test isolation), and
+    // wins over the project/user auto-resolve below. The pointer can't live
+    // inside the config it locates, so it stays a direct env read. Tilde-
+    // expanded for ergonomics.
+    if let Some(root) = env::var("DARKMUX_HOME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| expand_tilde(&s))
+    {
+        return paths_from_root(root, Scope::User);
+    }
+
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let project_root = cwd.join(".darkmux");
     let user_root = dirs::home_dir()
@@ -66,6 +82,13 @@ pub fn resolve(scope: ResolveScope) -> DarkmuxPaths {
         }
     };
 
+    paths_from_root(chosen, chosen_scope)
+}
+
+/// Build the full `DarkmuxPaths` from a chosen root, applying the per-dir
+/// env overrides. Shared by the `DARKMUX_HOME` override path and the normal
+/// project/user resolution so both stay in sync.
+fn paths_from_root(chosen: PathBuf, chosen_scope: Scope) -> DarkmuxPaths {
     // The notebook dir can be overridden via DARKMUX_NOTEBOOK_DIR — useful
     // for pointing notebook entries at an iCloud-synced (or otherwise
     // shared) path so multiple machines write to the same notebook. When
@@ -85,6 +108,7 @@ pub fn resolve(scope: ResolveScope) -> DarkmuxPaths {
         crew: chosen.join("crew"),
         notebook,
         profiles: chosen.join("profiles.json"),
+        config: chosen.join("config.json"),
         scope: chosen_scope,
         root: chosen,
     }
@@ -234,6 +258,30 @@ mod tests {
         }
     }
 
+    #[serial_test::serial]
+    #[test]
+    fn resolve_honors_darkmux_home_override() {
+        let tmp = TempDir::new().unwrap();
+        let custom_root = tmp.path().join("relocated-darkmux");
+        let prev = env::var("DARKMUX_HOME").ok();
+        unsafe { env::set_var("DARKMUX_HOME", &custom_root); }
+
+        // DARKMUX_HOME (#661) wins over the project/user auto-resolve and IS
+        // the root directly — config + profiles hang off it.
+        let paths = resolve(ResolveScope::Auto);
+        assert_eq!(paths.root, custom_root, "DARKMUX_HOME overrides the root");
+        assert_eq!(paths.config, custom_root.join("config.json"));
+        assert_eq!(paths.profiles, custom_root.join("profiles.json"));
+        assert_eq!(paths.scope, Scope::User);
+
+        unsafe {
+            match prev {
+                Some(v) => env::set_var("DARKMUX_HOME", v),
+                None => env::remove_var("DARKMUX_HOME"),
+            }
+        }
+    }
+
     #[test]
     fn expand_tilde_handles_home_prefix() {
         if let Some(home) = dirs::home_dir() {
@@ -257,6 +305,7 @@ mod tests {
             crew: tmp.path().join(".darkmux/crew"),
             notebook: tmp.path().join(".darkmux/notebook"),
             profiles: tmp.path().join(".darkmux/profiles.json"),
+            config: tmp.path().join(".darkmux/config.json"),
             scope: Scope::Project,
         };
         ensure(&paths).unwrap();
@@ -277,6 +326,7 @@ mod tests {
             crew: tmp.path().join(".darkmux/crew"),
             notebook: tmp.path().join(".darkmux/notebook"),
             profiles: tmp.path().join(".darkmux/profiles.json"),
+            config: tmp.path().join(".darkmux/config.json"),
             scope: Scope::Project,
         };
         ensure(&paths).unwrap();

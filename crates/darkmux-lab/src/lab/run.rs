@@ -485,6 +485,7 @@ mod tests {
             crew: tmp.path().join("crew"),
             notebook: tmp.path().join("notebook"),
             profiles: tmp.path().join("profiles.json"),
+            config: tmp.path().join("config.json"),
             scope: paths::Scope::User,
         };
         let loaded = LoadedWorkload {
@@ -534,6 +535,7 @@ mod tests {
             crew: tmp.path().join("crew"),
             notebook: tmp.path().join("notebook"),
             profiles: tmp.path().join("profiles.json"),
+            config: tmp.path().join("config.json"),
             scope: paths::Scope::User,
         };
         // Create fixture dir with .fixture.json declaring satisfies.
@@ -602,6 +604,7 @@ mod tests {
             crew: tmp.path().join("crew"),
             notebook: tmp.path().join("notebook"),
             profiles: tmp.path().join("profiles.json"),
+            config: tmp.path().join("config.json"),
             scope: paths::Scope::User,
         };
         let fixture_dir = tmp.path().join("my-fx");
@@ -666,6 +669,7 @@ mod tests {
             crew: tmp.path().join("crew"),
             notebook: tmp.path().join("notebook"),
             profiles: tmp.path().join("profiles.json"),
+            config: tmp.path().join("config.json"),
             scope: paths::Scope::User,
         };
         let loaded = LoadedWorkload {
