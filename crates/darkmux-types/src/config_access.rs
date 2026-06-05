@@ -101,20 +101,22 @@ pub fn orchestrator() -> Option<String> {
 pub fn lms_bin() -> String {
     pick_string("DARKMUX_LMS_BIN", config().lms_bin.as_deref(), Some("lms")).unwrap()
 }
-/// The LMStudio **base** URL (`scheme://host:port`), default
-/// `http://localhost:1234`. Callers append their endpoint path
-/// (`/v1/models` for the runtime probe, `/v1/chat/completions` for sprint
-/// narration).
+/// The LMStudio **base** URL (`scheme://host:port`), resolving
+/// `env(DARKMUX_LMSTUDIO_URL) > config.lmstudio_url > http://localhost:1234`.
+/// Callers append their endpoint path: `/v1/chat/completions`
+/// (`sprint_cli::lmstudio_chat_url`) and `/v1/models` (the `dispatch_internal`
+/// model probe).
 ///
-/// **Slice-4 migration contract:** today `DARKMUX_LMSTUDIO_URL` is consumed
-/// as the *full* chat-completions URL (`sprint_cli::lmstudio_chat_url`,
-/// default `…/v1/chat/completions`). Moving to this base-URL accessor is a
-/// clean pre-1.0 semantic break — the migrating caller MUST append its path
-/// suffix (else it double-appends or 404s), and the runtime probe
-/// (`dispatch_internal`, currently hardcoded `localhost:1234`) routes through
-/// here too. Document the env var's new "base URL" meaning when it migrates.
+/// (#661 Slice 4) `DARKMUX_LMSTUDIO_URL` is the **base** URL — a clean pre-1.0
+/// break from its prior "full chat-completions URL" meaning, so the chat
+/// narrator + the probe share one config value, each appending its own path.
 pub fn lmstudio_url() -> String {
-    pick_string("DARKMUX_LMSTUDIO_URL", config().lmstudio_url.as_deref(), Some("http://localhost:1234")).unwrap()
+    // Trim a trailing `/` so a caller's `/v1/...` suffix can't double up — an
+    // operator base of `http://host:1234/` is a common slip.
+    pick_string("DARKMUX_LMSTUDIO_URL", config().lmstudio_url.as_deref(), Some("http://localhost:1234"))
+        .unwrap()
+        .trim_end_matches('/')
+        .to_string()
 }
 
 // ── Redis (non-secret bits; password + URL assembly land in Slice 5) ──
@@ -600,6 +602,24 @@ mod tests {
             match prev {
                 Some(v) => std::env::set_var("DARKMUX_CHECK_UPDATES", v),
                 None => std::env::remove_var("DARKMUX_CHECK_UPDATES"),
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn lmstudio_url_is_base_and_trims_trailing_slash() {
+        let prev = std::env::var("DARKMUX_LMSTUDIO_URL").ok();
+        // A trailing-slash base is trimmed so callers' `/v1/...` can't double up.
+        unsafe { std::env::set_var("DARKMUX_LMSTUDIO_URL", "http://host:1234/"); }
+        assert_eq!(lmstudio_url(), "http://host:1234");
+        // Default (no env/config) is the bare base, no trailing slash.
+        unsafe { std::env::remove_var("DARKMUX_LMSTUDIO_URL"); }
+        assert_eq!(lmstudio_url(), "http://localhost:1234");
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_LMSTUDIO_URL", v),
+                None => std::env::remove_var("DARKMUX_LMSTUDIO_URL"),
             }
         }
     }

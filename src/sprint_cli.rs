@@ -80,9 +80,6 @@ pub(crate) fn build_review_record(
     }
 }
 
-/// LMStudio endpoint for the optional `--narrate` flag.
-const LMSTUDIO_CHAT_URL: &str = "http://localhost:1234/v1/chat/completions";
-
 /// Namespaced 4B compactor — same model used for compaction, now extended
 /// as the small-task specialist for narrative wraps. See fixture-06's
 /// concurrent probe for the operational justification.
@@ -378,13 +375,16 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-/// LMStudio endpoint (env-overridable for tests). Defaults to the public
-/// `LMSTUDIO_CHAT_URL` constant.
+/// LMStudio chat-completions endpoint. The **base** URL resolves
+/// `env(DARKMUX_LMSTUDIO_URL) > config.lmstudio_url > http://localhost:1234`
+/// via `config_access`; this appends the `/v1/chat/completions` path.
+///
+/// (#661 Slice 4) `DARKMUX_LMSTUDIO_URL` is now the **base** URL
+/// (`scheme://host:port`), not the full chat-completions URL it used to be — a
+/// clean pre-1.0 break so the chat narrator + the model probe share one config
+/// value, each appending its own endpoint path.
 fn lmstudio_chat_url() -> String {
-    std::env::var("DARKMUX_LMSTUDIO_URL")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| LMSTUDIO_CHAT_URL.to_string())
+    format!("{}/v1/chat/completions", darkmux_types::config_access::lmstudio_url())
 }
 
 /// Call the 4B compactor at LMStudio for the operator-facing narrative
@@ -1321,15 +1321,14 @@ mod tests {
         };
         let reg = fixture_registry();
 
-        // Save the existing env var (if any), override with unreachable URL.
+        // Save the existing env var (if any), override with an unreachable
+        // BASE url (#661 Slice 4: the env var is now the base; lmstudio_chat_url
+        // appends /v1/chat/completions → http://127.0.0.1:1/v1/chat/completions).
         let prev = std::env::var("DARKMUX_LMSTUDIO_URL").ok();
         // SAFETY: tests use serial_test::serial when needed; this test
         // doesn't share state with others that rely on this env var.
         unsafe {
-            std::env::set_var(
-                "DARKMUX_LMSTUDIO_URL",
-                "http://127.0.0.1:1/v1/chat/completions",
-            );
+            std::env::set_var("DARKMUX_LMSTUDIO_URL", "http://127.0.0.1:1");
         }
 
         let result = run_estimate(&spec, &reg, true);

@@ -176,12 +176,6 @@ fn inactivity_timeout_seconds() -> u64 {
     darkmux_types::config_access::inactivity_timeout_seconds()
 }
 
-/// LMStudio /v1/models URL used to probe the currently-loaded model
-/// when no explicit model is provided. Currently the internal runtime
-/// uses "whatever's loaded"; future iteration will resolve via the
-/// role pin table.
-const LMSTUDIO_MODELS_URL: &str = "http://localhost:1234/v1/models";
-
 pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     eprintln!(
         "darkmux crew dispatch: runtime=internal — image: {RUNTIME_IMAGE}"
@@ -1827,13 +1821,12 @@ fn probe_loaded_model_list() -> Result<Vec<String>> {
 /// return the first model id. Uses curl so we don't drag a Rust HTTP
 /// client dep into darkmux's main crate for one probe call.
 fn probe_loaded_model() -> Result<String> {
+    // env(DARKMUX_LMSTUDIO_URL) > config.lmstudio_url > http://localhost:1234,
+    // + the /v1/models path (#661 Slice 4 — the probe is now config-aware and
+    // shares the base URL with the sprint chat narrator).
+    let url = format!("{}/v1/models", darkmux_types::config_access::lmstudio_url());
     let output = Command::new("curl")
-        .args([
-            "-sf",
-            "-m",
-            "5",
-            LMSTUDIO_MODELS_URL,
-        ])
+        .args(["-sf", "-m", "5", &url])
         .output()
         .context("running curl to probe LMStudio")?;
 
