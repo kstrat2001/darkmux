@@ -1,9 +1,27 @@
 <!doctype html>
 <html lang="en">
 <head>
+<!-- GENERATED from crates/darkmux-serve/assets/viewer.html by scripts/build-demo.sh — edit the viewer, not this file. -->
+<meta name="darkmux-mode" content="play">
+<meta name="darkmux-flow-src" content="./demo-flow.jsonl">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>darkmux · observability · demo</title>
+<title>darkmux · observability viewer</title>
+<!--
+  The canonical darkmux observability viewer. ONE file, served three ways:
+
+   - `darkmux serve` at `GET /` (and darkmux.com/viewer) — LIVE: fetches real
+     flow records from the daemon's `/flow/<date>` and tails new ones via SSE.
+   - `GET /play/<date>` — PLAYBACK of a recorded day from the daemon.
+   - darkmux.com/demo — PLAYBACK of a committed flow file
+     (docs/demo/demo-flow.jsonl), generated from THIS file by
+     scripts/build-demo.sh which injects `mode=play` + `darkmux-flow-src`.
+
+  The demo is this viewer in playback mode loading a real flow file, so it's
+  identical to a local `/play` — there is no demo fork. Edit this file; for the
+  demo, also run `scripts/build-demo.sh` (CI fails on drift).
+-->
+
 <style>
   :root{
     --bg:#0a0a0b; --bg2:#131316; --panel:#1c1c22; --line:#1f1f24;
@@ -42,8 +60,27 @@
   .detail pre{margin:0;padding:10px 12px;background:var(--bg);border:1px solid var(--line);border-radius:5px;color:var(--text);white-space:pre-wrap;font:11px/1.55 'JetBrains Mono',monospace}
   .detail pre .k{color:var(--muted)}
   .detail .none{color:var(--muted);font:11px 'JetBrains Mono',monospace;padding:10px 0}
-  .loglist{flex:1;overflow:auto;padding:10px 14px}
-  .loglist h3{margin:0 0 8px;font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);display:flex;justify-content:space-between;align-items:center}
+  .loglist{flex:1;display:flex;flex-direction:column;min-height:0;overflow:hidden}
+  .loghead{flex:none;padding:10px 14px 8px;border-bottom:1px solid var(--line)}
+  .loglist h3{margin:0;font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);display:flex;justify-content:space-between;align-items:center}
+  .logsearch{display:flex;align-items:center;gap:10px;margin-top:8px}
+  .searchbox{position:relative;flex:1;min-width:0;display:flex;align-items:center}
+  .searchbox .sicon{position:absolute;left:9px;font-size:14px;line-height:1;color:var(--muted);pointer-events:none;transition:color .15s}
+  .searchbox input{flex:1;min-width:0;background:var(--bg);border:1px solid var(--line);color:var(--text);border-radius:6px;padding:7px 28px;font:12px 'JetBrains Mono',monospace;transition:border-color .15s,box-shadow .15s}
+  .searchbox input::-webkit-search-cancel-button{-webkit-appearance:none;appearance:none}
+  .searchbox input:focus{outline:none;border-color:var(--amber);box-shadow:0 0 0 3px rgba(109,241,255,.12)}
+  .searchbox input:focus-visible{outline:none}
+  .searchbox.has-q .sicon{color:var(--amber-dim)}
+  .searchbox:focus-within .sicon{color:var(--amber)}
+  .searchbox input::placeholder{color:var(--muted);font-style:italic}
+  .sclear{position:absolute;right:5px;display:flex;align-items:center;justify-content:center;width:18px;height:18px;padding:0;border:none;border-radius:50%;background:none;color:var(--muted);font-size:11px;line-height:1;cursor:pointer;transition:color .12s,background .12s}
+  .sclear:hover{color:var(--text);background:var(--panel)}
+  .sclear:focus-visible{outline:none;color:var(--amber);box-shadow:0 0 0 2px var(--amber-dim)}
+  .sclear[hidden]{display:none}
+  .qcount{flex:none;font:600 10px/1 'JetBrains Mono',monospace;letter-spacing:.04em;color:var(--amber-dim);white-space:nowrap;padding:3px 7px;border:1px solid var(--line);border-radius:10px;opacity:0;transition:opacity .15s}
+  .qcount.show{opacity:1}
+  .qcount.zero{color:var(--bad);border-color:rgba(255,107,133,.35)}
+  #logbody{flex:1;overflow:auto;padding:8px 14px 10px}
   .fbtn{background:none;border:1px solid var(--line);color:var(--muted);font:600 10px 'JetBrains Mono',monospace;letter-spacing:.06em;padding:4px 9px;border-radius:11px;cursor:pointer;text-transform:none}
   .fbtn:hover{border-color:var(--amber-dim);color:var(--amber)}
   .fbtn.on{border-color:var(--amber);color:var(--amber)}
@@ -55,6 +92,10 @@
   .scrub{height:64px;border-top:1px solid var(--line);background:var(--bg2);display:flex;align-items:center;gap:14px;padding:0 18px}
   .scrub button{background:var(--bg);border:1px solid var(--amber-dim);color:var(--text);padding:7px 14px;border-radius:4px;cursor:pointer;font:600 12px 'JetBrains Mono',monospace}
   .scrub button.primary{background:var(--amber);color:#0a0a0b;border-color:var(--amber)}
+  /* Live mode follows the tail — historical replay lives at /play/<date>. Hide
+     the playback transport and reclaim its reserved 64px back into .wrap. */
+  body.live-mode .scrub{display:none}
+  body.live-mode .wrap{height:calc(100vh - 46px - 40px)}
   input[type=range]{flex:1;accent-color:var(--amber)}
   .clock{font:12px 'JetBrains Mono',monospace;color:var(--muted);min-width:160px;text-align:right}
   .fleet{display:flex;gap:36px;flex-wrap:wrap;align-items:flex-start}
@@ -135,22 +176,26 @@
   .mft input{flex:1;background:var(--bg);border:1px solid var(--line);color:var(--text);border-radius:4px;padding:8px 10px;font:12px 'JetBrains Mono',monospace}
   .clr{background:var(--bg);border:1px solid var(--amber-dim);color:var(--text);border-radius:4px;padding:8px 12px;cursor:pointer;font:600 12px 'JetBrains Mono',monospace}
 
-  /* ---- Mobile phase 1 — survival #634 (mirrors viewer.html) ----------
-     darkmux.com/demo is the public-facing version of this viewer and
-     mobile visitors land here first. Phase 1 keeps the layout
-     SCROLLABLE + STACKED on phones (~390px); doesn't redesign. Touch
-     gestures, drawer-based log, swipe drill-in are phase 2+. Keep this
-     block in sync with the matching block in
-     crates/darkmux-serve/assets/viewer.html (the live + playback viewer
-     served by the daemon). Both files share most CSS; future refactor
-     to extract shared styles is tracked under #624. */
+  /* ---- Mobile phase 1 — survival #634 -------------------------------
+     Desktop locks viewport to 100vh + overflow:hidden + horizontal flex
+     of stage|log. On phones (~390px) that produces an unusable layout
+     where the 380px log panel covers the screen or the canvas is off
+     to the side. Phase 1 makes the viewer SCROLLABLE + STACKED on
+     mobile without trying to redesign:
+       - body + html scroll (not viewport-locked)
+       - .wrap stacks stage above log
+       - fleet machine cards go full-width one-per-row
+       - scrubber controls wrap onto multiple rows + larger tap targets
+       - crumbbar + topnav allow horizontal scroll rather than overlap
+     Touch gestures, drawer-based log, swipe drill-in are phase 2+. */
   @media (max-width: 768px) {
     html, body { height: auto; overflow: auto; min-height: 100vh; }
     .wrap { display: block; height: auto; }
+    body.live-mode .wrap { height: auto; } /* override the desktop live-mode calc on mobile */
     .stage { padding: 16px; min-height: 50vh; overflow: visible; }
     .log { width: auto; border-left: none; border-top: 1px solid var(--line); max-height: 60vh; }
     .detail { padding: 12px 14px 0; }
-    .split { display: none; } /* row-resize handle isn't useful when stacked */
+    .split { display: none; } /* the row-resize handle isn't useful when stacked */
     .fleet { gap: 16px; }
     .mach { width: 100%; }
     .fleettl { margin-top: 18px; }
@@ -159,21 +204,37 @@
     .scrub { flex-wrap: wrap; height: auto; padding: 12px; gap: 10px; }
     .scrub button { padding: 10px 14px; font-size: 13px; min-height: 40px; }
     .clock { text-align: left; min-width: 0; flex: 1 0 100%; }
-    .top { padding: 0 12px; gap: 10px; }
-    .topnav { gap: 12px; flex-wrap: wrap; }
-    .crumbbar { padding: 0 12px; gap: 8px; overflow-x: auto; white-space: nowrap; }
-    .meta { font-size: 10px; }
+
+    /* Top bar reflows to two rows on phones: row 1 = brand + status badges,
+       row 2 = the nav. Auto-height instead of the desktop 46px so nothing
+       collides; the brand stops wrapping mid-word and the badges sit beside
+       it. The .wrap height calcs below subtract the desktop bar heights, but
+       on mobile .wrap is already height:auto (set above), so the taller bars
+       don't need a calc adjustment. */
+    .top { height: auto; flex-wrap: wrap; padding: 9px 12px; gap: 8px 10px; row-gap: 8px; }
+    .brand { flex: 1 1 100%; font-size: 13px; }
+    #srcbadge, #modebadge { order: 2; }
+    .badge, .pb { padding: 4px 8px; font-size: 10px; }
+    .topnav { order: 3; margin-left: 0; flex: 1 1 100%; gap: 16px; justify-content: flex-start; padding-top: 2px; border-top: 1px solid var(--line); }
+    .topnav a { font-size: 11px; }
+
+    /* Crumbbar: keep the back button + crumb on one scrollable row, but let
+       the meta block (records/machines/time) drop below instead of being
+       shoved off-screen. */
+    .crumbbar { height: auto; flex-wrap: wrap; padding: 8px 12px; gap: 6px 8px; }
+    .crumb { flex: 1 1 auto; min-width: 0; overflow-x: auto; white-space: nowrap; -webkit-overflow-scrolling: touch; }
+    .meta { flex: 1 1 100%; margin-left: 0; text-align: left; font-size: 10px; }
   }
 </style>
 </head>
 <body>
 <div class="top">
-  <span class="brand"><a href="../"><b>darkmux</b></a> · observability</span>
-  <span class="badge" id="srcbadge">Demo — sample data</span>
+  <span class="brand"><a href="https://darkmux.com/" target="_blank" rel="noopener"><b>darkmux</b></a> · observability</span>
+  <span class="badge" id="srcbadge">Loading…</span>
   <span class="pb" id="modebadge">▣ playback</span>
   <nav class="topnav">
-    <a href="../">home</a>
-    <a href="../guide/">guide</a>
+    <a href="https://darkmux.com/" target="_blank" rel="noopener">home</a>
+    <a href="https://darkmux.com/guide/" target="_blank" rel="noopener">guide</a>
     <a href="https://darklyenergized.substack.com" target="_blank" rel="noopener">articles</a>
     <a href="https://github.com/kstrat2001/darkmux" target="_blank" rel="noopener">github</a>
   </nav>
@@ -191,8 +252,18 @@
       <div id="detailbody"></div></div>
     <div class="split" id="split" title="drag to resize"></div>
     <div class="loglist">
-      <h3><span>event log · <span id="logscope">fleet</span></span>
-          <button class="fbtn" id="fbtn" onclick="openFilters()">⚙ filters</button></h3>
+      <div class="loghead">
+        <h3><span>event log · <span id="logscope">fleet</span></span>
+            <button class="fbtn" id="fbtn" onclick="openFilters()">⚙ filters</button></h3>
+        <div class="logsearch">
+          <div class="searchbox">
+            <span class="sicon" aria-hidden="true">⌕</span>
+            <input id="logq" type="search" placeholder="filter the stream…" autocomplete="off" spellcheck="false" aria-label="search events">
+            <button class="sclear" id="sclear" type="button" aria-label="clear search" title="clear search" hidden>✕</button>
+          </div>
+          <span class="qcount" id="qcount" aria-live="polite"></span>
+        </div>
+      </div>
       <div id="logbody"></div>
     </div>
   </div>
@@ -213,86 +284,40 @@
 </div>
 
 <script>
-// SAMPLE is the bundled fixture. On darkmux.com (no daemon) the viewer falls
-// back to it; served by `darkmux serve` at GET / it instead fetches the
-// daemon's real /flow/:date records (same-origin). See boot() at the bottom.
-const SAMPLE = [
- {ts:"2026-05-19T01:00:00Z",category:"work",tier:"operator",stage:"scope",action:"note",handle:"mission scoped",machine_id:"studio",machine_uid:"demo-studio",mission_id:"redis-tailnet"},
- {ts:"2026-05-19T01:00:30Z",category:"work",tier:"local",stage:"dispatch",action:"dispatch.start",handle:"darkmux/coder",machine_id:"studio",machine_uid:"demo-studio",mission_id:"redis-tailnet",session_id:"S1",model:"qwen3.6-35b"},
- {ts:"2026-05-19T01:00:35Z",category:"telemetry",source:"lms",machine_id:"studio",machine_uid:"demo-studio",session_id:"S1",fields:{event:"load",model:"qwen3.6-35b",gb:21}},
- {ts:"2026-05-19T01:00:50Z",category:"telemetry",source:"process",machine_id:"studio",machine_uid:"demo-studio",session_id:"S1",fields:{cpu:38}},
- {ts:"2026-05-19T01:01:20Z",category:"telemetry",source:"lms",machine_id:"studio",machine_uid:"demo-studio",session_id:"S1",fields:{event:"unload",model:"qwen3.6-35b"}},
- {ts:"2026-05-19T01:01:22Z",category:"telemetry",source:"lms",machine_id:"studio",machine_uid:"demo-studio",session_id:"S1",fields:{event:"load",model:"qwen3-coder-next",gb:19}},
- {ts:"2026-05-19T01:01:35Z",category:"telemetry",source:"process",machine_id:"studio",machine_uid:"demo-studio",session_id:"S1",fields:{cpu:71}},
- {ts:"2026-05-19T01:01:55Z",category:"telemetry",source:"process",machine_id:"studio",machine_uid:"demo-studio",session_id:"S1",fields:{cpu:24}},
- {ts:"2026-05-19T01:02:10Z",category:"work",tier:"local",stage:"dispatch",action:"dispatch.complete",handle:"darkmux/coder",machine_id:"studio",machine_uid:"demo-studio",mission_id:"redis-tailnet",session_id:"S1",model:"qwen3-coder-next"},
- {ts:"2026-05-19T01:01:10Z",category:"telemetry",source:"detector",machine_id:"studio",machine_uid:"demo-studio",session_id:"S1",fields:{kind:"tool-failure",severity:"warn",detail:"2 consecutive tool failures (file_not_found) before recovery (#419)"}},
- {ts:"2026-05-19T01:02:08Z",category:"telemetry",source:"runtime",machine_id:"studio",machine_uid:"demo-studio",session_id:"S1",fields:{turns:7}},
- {ts:"2026-05-19T01:02:00Z",category:"telemetry",source:"detector",machine_id:"laptop",machine_uid:"demo-laptop",session_id:"S2",fields:{kind:"cycle",severity:"warn",detail:"same file read 3x in a row — repeated-tool-call cycle (#418)"}},
- {ts:"2026-05-19T01:03:08Z",category:"telemetry",source:"runtime",machine_id:"laptop",machine_uid:"demo-laptop",session_id:"S2",fields:{turns:4}},
- {ts:"2026-05-19T01:03:38Z",category:"telemetry",source:"runtime",machine_id:"mini-1",machine_uid:"demo-mini",session_id:"S3",fields:{turns:5}},
- {ts:"2026-05-19T01:00:35Z",category:"telemetry",source:"context",machine_id:"studio",machine_uid:"demo-studio",session_id:"S1",fields:{used:6000,max:40000}},
- {ts:"2026-05-19T01:00:55Z",category:"telemetry",source:"context",machine_id:"studio",machine_uid:"demo-studio",session_id:"S1",fields:{used:22000,max:40000}},
- {ts:"2026-05-19T01:01:15Z",category:"telemetry",source:"context",machine_id:"studio",machine_uid:"demo-studio",session_id:"S1",fields:{used:36000,max:40000}},
- {ts:"2026-05-19T01:01:20Z",category:"telemetry",source:"compaction",machine_id:"studio",machine_uid:"demo-studio",session_id:"S1",fields:{from:36000,to:12000}},
- {ts:"2026-05-19T01:01:21Z",category:"telemetry",source:"context",machine_id:"studio",machine_uid:"demo-studio",session_id:"S1",fields:{used:12000,max:40000}},
- {ts:"2026-05-19T01:01:45Z",category:"telemetry",source:"context",machine_id:"studio",machine_uid:"demo-studio",session_id:"S1",fields:{used:30000,max:40000}},
- {ts:"2026-05-19T01:01:58Z",category:"telemetry",source:"context",machine_id:"studio",machine_uid:"demo-studio",session_id:"S1",fields:{used:35000,max:40000}},
- {ts:"2026-05-19T01:02:02Z",category:"telemetry",source:"compaction",machine_id:"studio",machine_uid:"demo-studio",session_id:"S1",fields:{from:35000,to:11000}},
- {ts:"2026-05-19T01:02:03Z",category:"telemetry",source:"context",machine_id:"studio",machine_uid:"demo-studio",session_id:"S1",fields:{used:11000,max:40000}},
- {ts:"2026-05-19T01:02:08Z",category:"telemetry",source:"context",machine_id:"studio",machine_uid:"demo-studio",session_id:"S1",fields:{used:17000,max:40000}},
- {ts:"2026-05-19T01:01:00Z",category:"telemetry",source:"context",machine_id:"laptop",machine_uid:"demo-laptop",session_id:"S2",fields:{used:14000,max:100000}},
- {ts:"2026-05-19T01:01:40Z",category:"telemetry",source:"context",machine_id:"laptop",machine_uid:"demo-laptop",session_id:"S2",fields:{used:48000,max:100000}},
- {ts:"2026-05-19T01:02:30Z",category:"telemetry",source:"context",machine_id:"laptop",machine_uid:"demo-laptop",session_id:"S2",fields:{used:79000,max:100000}},
- {ts:"2026-05-19T01:02:32Z",category:"telemetry",source:"compaction",machine_id:"laptop",machine_uid:"demo-laptop",session_id:"S2",fields:{from:79000,to:22000}},
- {ts:"2026-05-19T01:02:34Z",category:"telemetry",source:"context",machine_id:"laptop",machine_uid:"demo-laptop",session_id:"S2",fields:{used:22000,max:100000}},
- {ts:"2026-05-19T01:03:00Z",category:"telemetry",source:"context",machine_id:"laptop",machine_uid:"demo-laptop",session_id:"S2",fields:{used:41000,max:100000}},
- {ts:"2026-05-19T01:02:25Z",category:"telemetry",source:"context",machine_id:"mini-1",machine_uid:"demo-mini",session_id:"S3",fields:{used:5000,max:24000}},
- {ts:"2026-05-19T01:02:50Z",category:"telemetry",source:"context",machine_id:"mini-1",machine_uid:"demo-mini",session_id:"S3",fields:{used:14000,max:24000}},
- {ts:"2026-05-19T01:03:20Z",category:"telemetry",source:"context",machine_id:"mini-1",machine_uid:"demo-mini",session_id:"S3",fields:{used:21000,max:24000}},
- {ts:"2026-05-19T01:02:25Z",category:"work",tier:"local",stage:"dispatch",action:"dispatch.start",handle:"darkmux/coder",machine_id:"studio",machine_uid:"demo-studio",mission_id:"redis-tailnet",session_id:"S4",model:"qwen3-coder-next"},
- {ts:"2026-05-19T01:02:45Z",category:"telemetry",source:"process",machine_id:"studio",machine_uid:"demo-studio",session_id:"S4",fields:{cpu:44}},
- {ts:"2026-05-19T01:03:15Z",category:"telemetry",source:"process",machine_id:"studio",machine_uid:"demo-studio",session_id:"S4",fields:{cpu:29}},
- {ts:"2026-05-19T01:03:28Z",category:"telemetry",source:"runtime",machine_id:"studio",machine_uid:"demo-studio",session_id:"S4",fields:{turns:3}},
- {ts:"2026-05-19T01:03:30Z",category:"work",tier:"local",stage:"dispatch",action:"dispatch.complete",handle:"darkmux/coder",machine_id:"studio",machine_uid:"demo-studio",mission_id:"redis-tailnet",session_id:"S4",model:"qwen3-coder-next"},
- {ts:"2026-05-19T01:00:55Z",category:"work",tier:"local",stage:"dispatch",action:"dispatch.start",handle:"darkmux/reviewer",machine_id:"laptop",machine_uid:"demo-laptop",mission_id:"redis-tailnet",session_id:"S2",model:"qwen3.5-122b"},
- {ts:"2026-05-19T01:01:00Z",category:"telemetry",source:"lms",machine_id:"laptop",machine_uid:"demo-laptop",session_id:"S2",fields:{event:"load",model:"qwen3.5-122b",gb:74}},
- {ts:"2026-05-19T01:01:30Z",category:"telemetry",source:"process",machine_id:"laptop",machine_uid:"demo-laptop",session_id:"S2",fields:{cpu:55}},
- {ts:"2026-05-19T01:02:40Z",category:"telemetry",source:"process",machine_id:"laptop",machine_uid:"demo-laptop",session_id:"S2",fields:{cpu:48}},
- {ts:"2026-05-19T01:03:10Z",category:"work",tier:"local",stage:"dispatch",action:"dispatch.complete",handle:"darkmux/reviewer",machine_id:"laptop",machine_uid:"demo-laptop",mission_id:"redis-tailnet",session_id:"S2",model:"qwen3.5-122b"},
- {ts:"2026-05-19T01:02:20Z",category:"work",tier:"local",stage:"dispatch",action:"dispatch.start",handle:"darkmux/analyst",machine_id:"mini-1",machine_uid:"demo-mini",mission_id:"redis-tailnet",session_id:"S3",model:"qwen3.6-35b"},
- {ts:"2026-05-19T01:02:25Z",category:"telemetry",source:"lms",machine_id:"mini-1",machine_uid:"demo-mini",session_id:"S3",fields:{event:"load",model:"qwen3.6-35b",gb:21}},
- {ts:"2026-05-19T01:02:55Z",category:"telemetry",source:"process",machine_id:"mini-1",machine_uid:"demo-mini",session_id:"S3",fields:{cpu:33}},
- {ts:"2026-05-19T01:03:40Z",category:"work",tier:"local",stage:"dispatch",action:"dispatch.complete",handle:"darkmux/analyst",machine_id:"mini-1",machine_uid:"demo-mini",mission_id:"redis-tailnet",session_id:"S3",model:"qwen3.6-35b"},
-];
-let DATA = SAMPLE;            // boot() may replace with real /flow/:date records
-let DATA_SOURCE = "sample data";
-// (#638) The showcase has no live daemon to poll, so seed the live-session
-// set from SAMPLE: every dispatched session is treated as "live", and the
-// done-precedence in renderMachine means only the ones WITHOUT a
-// dispatch.complete actually read "running" (preserving the showcase's
-// running/complete mix). In the daemon-served viewer this set is polled from
-// /fleet/sessions/live instead. NOTE: this seed is SAMPLE-scoped by design —
-// the demo is a static showcase; if it's ever served by a real daemon (boot()
-// swaps in real /flow records), a real in-flight session falls through to
-// "ended" (the safe direction — never a false "running").
-const LIVE_SESSIONS=new Set(
-  SAMPLE.filter(r=>(r.action==="dispatch.start"||r.action==="dispatch start")&&r.session_id).map(r=>r.session_id)
-);
-const liveSig=()=>[...LIVE_SESSIONS].sort().join(",");
-const MACH_SPEC={studio:"M1 Max · 32 GB · hub",laptop:"M5 Max · 128 GB · inference",["mini-1"]:"M4 · 16 GB"};
+// Live viewer — no embedded sample data.
+//
+// DATA is populated from the daemon's /flow/<date> endpoint in boot(); new
+// records stream in via SSE on /flow/<date>/stream. If the daemon isn't
+// reachable (e.g., this file loaded statically from darkmux.com/viewer with
+// no daemon running), DATA stays empty and the viewer renders the "no records"
+// state instead of falling back to demo content.
+//
+// darkmux.com/demo IS this viewer in playback mode (mode=play +
+// darkmux-flow-src), generated from this file by scripts/build-demo.sh and fed
+// docs/demo/demo-flow.jsonl — so the demo is identical to a local `/play`.
+// There is no demo fork; edit this viewer, then regenerate.
+let DATA = [];
+let DATA_SOURCE = "no records yet";
+
+// MACH_SPEC was a hardcoded lookup for the demo's three machines (studio,
+// laptop, mini-1). Removed for the live viewer — real machine specs come
+// from /machine/specs/<id> (TODO: wire dynamic lookup, follow-up to #624).
+// For now the spec field renders empty for real machines, which is honest:
+// better than fake specs for unknown machines.
+const MACH_SPEC={};
 // Mac-form-factor glyphs (inline SVG, Lucide stroke style — license-free, no external load)
 const ICON={
   laptop:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="5" width="16" height="11" rx="1.5"/><path d="M2 19h20l-1.2-3H3.2z"/></svg>',
   desktop:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="6" width="16" height="12" rx="2"/><circle cx="8" cy="12" r="1.1"/></svg>',
   mini:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="9" width="18" height="7" rx="2"/><circle cx="7" cy="12.5" r="1"/></svg>'};
-// demo: machines are known; the real tool derives form-factor from machine metadata
-const MACH_ICON={studio:"desktop",laptop:"laptop",["mini-1"]:"mini"};
-const MISSION={id:"redis-tailnet",goal:"Wire the fleet's flow stream through Redis over the tailnet so every machine's dispatches aggregate into one shared, auditable stream.",scope:"fleet · studio + laptop + mini-1",sprints:[
-  {id:"s1",title:"Redis stream sink + XADD MAXLEN retention",est:"M",who:"darkmux/coder",on:"studio",sid:"S1"},
-  {id:"s2",title:"Cross-machine aggregation in /flow/<date>",est:"S",who:"darkmux/reviewer",on:"laptop",sid:"S2"},
-  {id:"s3",title:"Tailnet hub topology + failover routing",est:"L",who:"darkmux/analyst",on:"mini-1",sid:"S3"},
-  {id:"s4",title:"Audit-sink tee + integrity-check cron",est:"M",who:"darkmux/coder",on:"studio",sid:"S4"}]};
+// Live viewer — machine form-factor lookup empty; real machines render with no icon
+// until /machine/specs/<id> wiring lands (follow-up to #624).
+const MACH_ICON={};
+// MISSION was a hardcoded demo mission ("redis-tailnet") with 4 sprints. The live
+// viewer's mission panel renders empty until /missions + /sprints endpoint
+// integration lands (already a TODO "follow-up seam" in the original viewer code).
+// Shape kept so existing access paths (MISSION.id, MISSION.goal, etc.) don't throw.
+const MISSION={id:null,goal:"",scope:"",sprints:[]};
 const T=s=>Date.parse(s);
 const iso=t=>new Date(t).toISOString();
 const fmt=ms=>{ms=Math.max(0,ms);return Math.floor(ms/60000)+":"+String(Math.floor(ms/1000)%60).padStart(2,"0");};
@@ -331,18 +356,22 @@ const newest=arr=>arr.length?arr.reduce((a,b)=>T(b.ts)>=T(a.ts)?b:a):null;
 // claimed-but-unverified names on the unknown card. Machines group + filter
 // by uid; cards render the name.
 const uidOf=r=>r.machine_uid||"unknown";
-// (#638) Mirrors the live viewer. LIVE_MACHINES stays EMPTY in this static
-// showcase (no daemon to poll), so nameOf/specOf/machines resolve purely from
-// SAMPLE records here — identical to the prior behavior — while the live viewer
-// drives them off presence heartbeats.
-const LIVE_MACHINES=new Map();
+// (#638) A machine's label/spec resolve from its records first, then fall back
+// to its live presence beat (LIVE_MACHINES) — so a present-but-recordless
+// machine (freshly synced, no dispatches yet) still renders with its real
+// name + specs from the heartbeat, not a bare uid.
 const nameOf=m=>{ if(m==="unknown")return"unknown"; const r=DATA.find(x=>uidOf(x)===m&&x.machine_id); if(r)return r.machine_id; const b=LIVE_MACHINES.get(m); return b&&b.display_name?b.display_name:m; };
 const specOf=m=>{ if(m==="unknown"){ const ns=[...new Set(DATA.filter(r=>uidOf(r)==="unknown"&&r.machine_id).map(r=>r.machine_id))]; return ns.length?"unverified · claimed: "+ns.join(", "):"unidentified (no hardware uid)"; } const rs=MACH_SPEC[nameOf(m)]; if(rs)return rs; const b=LIVE_MACHINES.get(m); return (b&&b.specs)||''; };
-const machines=()=>[...new Set([...DATA.map(uidOf),...LIVE_MACHINES.keys()])];
+// (#638) Presence is the source of truth for "who's in the fleet" — a machine
+// shows if it's broadcasting a heartbeat (LIVE_MACHINES), whether or not it has
+// emitted any flow records. Union with the record-derived uids so historical/
+// playback machines (which have records but no live beat) still appear too.
+const machines=()=>[...new Set([...DATA.map(uidOf), ...LIVE_MACHINES.keys()])];
 const sessionsOn=m=>[...new Set(DATA.filter(r=>uidOf(r)===m&&r.session_id).map(r=>r.session_id))];
 const dispatch=(sid,act)=>DATA.find(r=>r.session_id===sid&&r.action==="dispatch."+act);
-// (#647) The reconciler-emitted `session.end` close-edge for an abandoned
-// session (no clean dispatch.complete) — lets playback bracket the interval.
+// (#647) The reconciler-emitted `session.end` close-edge for an ABANDONED
+// session (crash/kill/timeout — no clean dispatch.complete). Lets playback
+// bracket the running interval where there's no complete to close it.
 const sessEnd=sid=>DATA.find(r=>r.session_id===sid&&r.action==="session.end");
 
 function renderMeta(){
@@ -355,10 +384,11 @@ function machActive(m){
   const dones=v.filter(r=>uidOf(r)===m&&r.action==="dispatch.complete").map(r=>r.session_id);
   return starts.some(s=>!dones.includes(s));
 }
-// (#638 Slice 3) Present at the scrubber? Mirrors the live viewer. The demo's
-// SAMPLE carries no machine.online/offline edges and LIVE_MACHINES is empty, so
-// this returns null (unknown) for every demo machine → no "absent" state, demo
-// renders exactly as before.
+// (#638 Slice 3) Is machine `m` PRESENT at the scrubber time `state.t`?
+//   true  = present · false = absent (offline) · null = unknown (no evidence)
+// Live: it's broadcasting a heartbeat now (LIVE_MACHINES). Playback: walk its
+// machine.online/offline lifecycle edges up to state.t — the most recent one
+// wins. No edges → null (render neutral, don't assert absence we can't prove).
 function machPresent(m){
   if(LIVE_MACHINES.has(m))return true;
   const edges=DATA.filter(r=>uidOf(r)===m&&(r.action==="machine.online"||r.action==="machine.offline")&&T(r.ts)<=state.t)
@@ -371,6 +401,9 @@ function renderFleet(){
   const ms=machines();
   const cards=ms.map(m=>{
     const act=machActive(m), runs=sessionsOn(m).length;
+    // (#638 Slice 3) Presence at the scrubber: an absent machine dims + reads
+    // "offline" and can't be "dispatch in flight" (it's gone). present/unknown
+    // keep the prior idle/active behavior.
     const absent=machPresent(m)===false;
     const stat=absent?'offline':(act?'dispatch in flight':'idle');
     return `<div class="mach ${act&&!absent?'active':''} ${absent?'absent':''}" onclick="drillMachine('${m}')"><div class="name"><span class="mico">${ICON[MACH_ICON[nameOf(m)]]||""}</span>${nameOf(m)}</div>
@@ -401,40 +434,92 @@ function renderMachine(){
   const m=state.machine; $("logscope").textContent=nameOf(m); state.stageScope=r=>uidOf(r)===m;
   // Always-loaded utility role — resident on every machine, runs alongside the specialists
   // to handle compaction + other utility-tier tasks (not a per-mission dispatch).
+  // TODO(#624): should read /model/status to surface the actual utility model resident,
+  // not a generic placeholder. Until then, mark it as static UI rather than implying it
+  // reflects live state.
   const util=`<div class="node util"><div class="h">darkmux/utility</div>
     <div class="s">utility tier · always-loaded</div>
     <div class="s">compaction · mission-compile · estimate · scribe</div>
     <span class="pill util">resident</span></div>`;
-  // Specialist roles dispatched on this machine for the active mission
-  // (#638 Slice 3) A role can't be "running" on an absent machine (null in the
-  // demo — no machine edges — so this never caps anything here).
+  // Specialist roles dispatched on this machine. Defensive against missing
+  // dispatch.start records: real flow streams contain telemetry-only sessions,
+  // test-fixture sessions emitting dispatch.tool/turn without a proper
+  // start record, and isolated records that don't fit the dispatch lifecycle.
+  // For each session we render whatever metadata we can recover from the first
+  // visible record on that session, rather than throwing if dispatch.start is
+  // missing (which silently broke the entire machine-detail panel).
+  // (#638 Slice 3) A role can't be "running" on a machine that's absent at the
+  // scrubber — when the machine went offline, its dispatches went with it. So
+  // an absent machine caps its roles to terminal status (consistency guard;
+  // the session.end edges usually already bookend them at the same instant).
   const machAbsent=machPresent(m)===false;
   const specs=sessionsOn(m).filter(sid=>visible().some(r=>r.session_id===sid)).map(sid=>{
     const s=dispatch(sid,"start");
-    // (#638/#647) Session status at the scrubber time from the edge pair —
-    // close-edge = earliest of dispatch.complete (clean) / session.end
-    // (abandoned). closed by state.t → complete/ended; else live heartbeat or
-    // a future close-edge → running; else (no close evidence, not live) →
-    // ended. Never "no complete = running". (Demo SAMPLE carries no session.end
-    // edges, so demo sessions bracket on their dispatch.complete + LIVE_SESSIONS
-    // seed; the live viewer gets real session.end edges from the daemon.)
+    // (#638/#647) Session status at the scrubber time `state.t`, from the
+    // edge pair — NOT "no dispatch.complete = running" (the old false-running
+    // bug). Close-edge = the earliest of dispatch.complete (clean) or the
+    // reconciler's session.end (abandoned). Priority:
+    //   closed by state.t → "complete" (clean) / "ended" (abandoned)
+    //   else live heartbeat now (live mode)            → "running"
+    //   else a close-edge exists but is AFTER state.t  → "running"
+    //        (playback: the session was running at the scrubber, its bracket
+    //         just hasn't been reached yet)
+    //   else started, no close evidence, not live      → "ended"
+    //        (crashed before the reconciler shipped, or capture truncated —
+    //         honest default; never a phantom "running")
     const c=dispatch(sid,"complete"), e=sessEnd(sid);
     const closeCands=[c&&T(c.ts), e&&T(e.ts)].filter(x=>x);
     const closeTs=closeCands.length?Math.min(...closeCands):null;
     const closedBy=closeTs!=null&&closeTs<=state.t;
-    const cleanClose=c&&T(c.ts)===closeTs;
+    const cleanClose=c&&T(c.ts)===closeTs;            // complete is the (or tied) earliest close
     const liveNow=LIVE_SESSIONS.has(sid);
     let cls,lbl;
     if(closedBy){ cls=cleanClose?'done':'ended'; lbl=cleanClose?'complete':'ended'; }
     else if(!machAbsent&&liveNow){ cls='run'; lbl='running'; }
     else if(!machAbsent&&closeTs!=null){ cls='run'; lbl='running'; }
     else { cls='ended'; lbl='ended'; }
-    return `<div class="node" onclick="drillSession('${sid}')"><div class="h">${s.handle}</div>
-      <div class="s">specialist role · ${s.model||'?'}</div>
-      <div class="s">session ${sid} · mission ${s.mission_id}</div>
-      <span class="pill ${cls}">${lbl}</span></div>`;}).join("");
+    if(s){
+      return `<div class="node" onclick="drillSession('${sid}')"><div class="h">${s.handle}</div>
+        <div class="s">specialist role · ${s.model||'?'}</div>
+        <div class="s">session ${sid} · mission ${s.mission_id}</div>
+        <span class="pill ${cls}">${lbl}</span></div>`;
+    }
+    // Fallback: no dispatch.start — pull handle/model/mission from the first
+    // record we have for this session, surface honestly that the lifecycle
+    // wasn't captured here.
+    const first=visible().find(r=>r.session_id===sid)||{};
+    const handle=first.handle||`session ${sid}`;
+    const model=first.model||'?';
+    const mission=first.mission_id?`mission ${first.mission_id}`:'no mission scope';
+    return `<div class="node" onclick="drillSession('${sid}')"><div class="h">${handle}</div>
+      <div class="s">role · ${model}</div>
+      <div class="s">session ${sid} · ${mission}</div>
+      <span class="pill warn">no dispatch.start</span></div>`;
+  }).join("");
+  // Loose records — records on this machine that don't have a session_id and
+  // therefore don't show up in any session card above (flow notes, free-floating
+  // telemetry, anything written outside a dispatch). Surface them as a count
+  // with a click-through so the operator can still inspect them.
+  const loose=visible().filter(r=>uidOf(r)===m&&!r.session_id);
+  const looseCard=loose.length
+    ? `<div class="node" onclick="drillLoose('${m}')"><div class="h">unscoped records</div>
+        <div class="s">${loose.length} record${loose.length===1?'':'s'} without a session</div>
+        <div class="s">flow notes, ambient telemetry, etc.</div>
+        <span class="pill">loose</span></div>`
+    : '';
   $("stage").innerHTML=`<div><div class="stagehdr"><a onclick="goFleet()">fleet</a> › machine · ${nameOf(m)}${specOf(m)?' — '+specOf(m):''}</div>
-    <div class="rglbl">crew on ${nameOf(m)}</div>${util}${specs||'<span class="hint">no specialist runs yet at this point in the timeline</span>'}</div>`;
+    <div class="rglbl">crew on ${nameOf(m)}</div>${util}${specs}${looseCard||(specs?'':'<span class="hint">no specialist runs at this point in the timeline</span>')}</div>`;
+}
+// Drill into the loose-records panel (records on a machine that don't have a
+// session_id — e.g. flow notes, ambient telemetry). Scopes the log to those
+// records so the operator can still inspect them.
+function drillLoose(m){
+  state.level="loose"; state.machine=m; state.session=null; state.selected=null;
+  state.stageScope=r=>uidOf(r)===m&&!r.session_id;
+  $("logscope").textContent=nameOf(m)+" · loose";
+  $("stage").innerHTML=`<div><div class="stagehdr"><a onclick="goFleet()">fleet</a> › <a onclick="drillMachine('${m}')">${nameOf(m)}</a> › unscoped records</div>
+    <div class="rglbl">${visible().filter(r=>uidOf(r)===m&&!r.session_id).length} record(s) without a session — inspect via the log on the right</div></div>`;
+  renderLog();renderMeta();syncTransport();
 }
 function renderSubsystem(){
   const sid=state.session, m=state.machine; $("logscope").textContent=sid; state.stageScope=r=>r.session_id===sid;
@@ -494,13 +579,21 @@ function renderDetail(){
   $("detailbody").innerHTML=r?`<pre>${pretty(r)}</pre>`:`<div class="none">no event at this point in the timeline</div>`;
 }
 function renderLog(){
-  const recs=scopedFiltered().slice(-50).reverse();
+  const all=scopedFiltered();
+  const recs=all.slice(-50).reverse();
+  const qc=$("qcount");
+  if(qc){
+    const q=!!state.filters.q;
+    qc.textContent=q?(all.length?`${all.length} match${all.length===1?'':'es'}${all.length>50?' · newest 50':''}`:"no match"):"";
+    qc.classList.toggle("show",q);
+    qc.classList.toggle("zero",q&&all.length===0);
+  }
   $("logbody").innerHTML=recs.length?recs.map(r=>{
     const tt=iso(T(r.ts)).slice(11,19);
     const tag=r.category==="telemetry"?(r.source==="lms"?`lms:${r.fields.event}`:r.source==="process"?`cpu ${r.fields.cpu}%`:r.source==="detector"?`detect:${r.fields.kind}`:r.source==="runtime"?`run:${r.fields.turns}t`:r.source):(r.action||r.stage);
     return `<div class="rec ${r.category} ${r._id===state.selected?'sel':''}" onclick="selectRec(${r._id})">
       <span class="t">${tt}</span> <span class="tag">${tag}</span> ${r.machine_id||''}${r.session_id?(' · '+r.session_id):''}</div>`;
-  }).join(""):`<div class="empty">no events match the current filters</div>`;
+  }).join(""):`<div class="empty">${state.filters.q?'no events match your search':'no events match the current filters'}</div>`;
 }
 function renderCrumb(){
   // Mission crumb only when the loaded data actually has a mission. Lab/dispatch
@@ -580,8 +673,24 @@ function renderFilters(){
 window.toggleFilter=(k,v)=>{const s=state.filters[k];s.has(v)?s.delete(v):s.add(v);render();};
 window.openFilters=()=>{renderFilters();$("fsearch").value=state.filters.q;$("modalbg").style.display="flex";};
 window.closeFilters=()=>{$("modalbg").style.display="none";};
-window.clearFilters=()=>{state.filters={cat:new Set(FCATS),tier:new Set(FTIERS),src:new Set(FSRC),q:""};$("fsearch").value="";renderFilters();render();};
-$("fsearch").oninput=e=>{state.filters.q=e.target.value;render();};
+window.clearFilters=()=>{state.filters={cat:new Set(FCATS),tier:new Set(FTIERS),src:new Set(FSRC),q:""};setQuery("");renderFilters();};
+// One query, two inputs: the first-class pane search (#logq) and the modal
+// search (#fsearch) stay in sync through setQuery so either entry point filters
+// the same `state.filters.q` (full-text over each record — model, action, id…).
+function setQuery(v){
+  state.filters.q=v;
+  const lq=$("logq"), fs=$("fsearch"), sb=lq&&lq.closest(".searchbox"), sc=$("sclear");
+  if(lq&&lq.value!==v)lq.value=v;
+  if(fs&&fs.value!==v)fs.value=v;
+  if(sb)sb.classList.toggle("has-q",!!v);
+  if(sc)sc.hidden=!v;
+  render();
+}
+$("fsearch").oninput=e=>setQuery(e.target.value);
+$("logq").oninput=e=>setQuery(e.target.value);
+// Clear affordance in the pane search — wipes the shared query and re-focuses
+// the input so the operator can keep typing a fresh filter.
+$("sclear").onclick=()=>{setQuery("");const lq=$("logq");if(lq)lq.focus();};
 $("modalbg").onclick=e=>{if(e.target===$("modalbg"))closeFilters();};
 // resizable detail/log split — fixed default height stops the jumpiness; drag the divider to grow it
 (function(){const DEF=200,MIN=110,MAX=520;$("detail").style.height=DEF+"px";let drag=false,sy=0,sh=0;
@@ -644,6 +753,18 @@ function todayUTC(){return new Date().toISOString().slice(0,10);}
 
 let RAW=[];            // raw FlowRecords (pre-adapt); the live tail appends here
 let LIVE_ES=null;      // EventSource handle when tailing the live stream
+// (#638) Sessions with a live heartbeat right now — polled from the daemon's
+// /fleet/sessions/live in live mode (stays EMPTY in playback). The machine
+// drill keys "running" on membership here, so a dispatch that died without a
+// dispatch.complete ages out instead of showing "running" forever.
+const LIVE_SESSIONS=new Set();
+const liveSig=()=>[...LIVE_SESSIONS].sort().join(",");
+// (#638) Machines broadcasting a presence heartbeat right now — uid → beat,
+// polled from /fleet/machines/live in live mode (EMPTY in playback). Presence
+// is the source of truth for the live fleet: a machine appears here whether or
+// not it has any flow records, so machines() unions it, and nameOf/specOf fall
+// back to the beat's display_name/specs for a recordless present machine.
+const LIVE_MACHINES=new Map();
 let lastStageSig=null; // skip stage re-renders that would destroy clickable cards
 const SEEN={cat:new Set(),tier:new Set(),src:new Set()};  // filter values ever observed
 
@@ -659,11 +780,16 @@ function absorbNewFilterValues(){
 
 function setBadges(mode,date){
   const dl = date===todayUTC() ? "today" : date;
-  DATA_SOURCE = mode==="live" ? ("live · "+dl) : mode==="play" ? ("flow · "+date) : mode==="empty" ? ("no records · "+date) : "sample data";
+  // Live viewer never enters "sample" mode — the fallback is "no daemon" or
+  // "no records yet", both honest empty states. (Demo "sample data" badge is
+  // gone — that mode belongs to docs/demo/ only.)
+  DATA_SOURCE = mode==="live" ? ("live · "+dl) : mode==="play" ? ("flow · "+date) : mode==="empty" ? ("no records · "+date) : mode==="no-daemon" ? "daemon not reachable" : "no records yet";
   const sb=$("srcbadge");
-  if(sb) sb.textContent = mode==="live" ? ("Live · "+dl) : mode==="play" ? ("Flow · "+date) : mode==="empty" ? ("No records · "+date) : "Demo — sample data";
+  if(sb) sb.textContent = mode==="live" ? ("Live · "+dl) : mode==="play" ? ("Flow · "+date) : mode==="empty" ? ("No records · "+date) : mode==="no-daemon" ? "No daemon" : "No records yet";
   const mb=$("modebadge");
   if(mb){ const live=mode==="live"; mb.textContent=live?"● live":"▣ playback"; mb.classList.toggle("live",live); }
+  // Live mode hides the playback scrub bar (CSS keys off this class) — replay is /play/<date>.
+  document.body.classList.toggle("live-mode", mode==="live");
 }
 
 // Structural signature of the current level's stage. In live mode the cards are
@@ -672,13 +798,16 @@ function setBadges(mode,date){
 // guards against). Subsystem is a metrics view with no cards → always full-render.
 function stageSig(){
   const v=visible(), dis=v.filter(r=>r.action==="dispatch.start"||r.action==="dispatch.complete"||r.action==="session.end").length;
-  // Fold the live-session set in so a liveness flip re-renders the cards (the
-  // "running"↔"ended" pill), same as a dispatch lifecycle change (#638). The
-  // demo's set is static, so this is a no-op there — kept to align the forks.
+  // Fold the live-session set in: a session going live / ageing out is a
+  // lifecycle change that must re-render the cards (so the "running"↔"ended"
+  // pill flips), same as a dispatch.start/complete / session.end edge arriving
+  // (#638/#647).
   const ls=liveSig();
-  // (#638 Slice 3) Presence signature — a machine flipping present↔absent must
-  // re-render its card. Empty/static in the demo (no daemon poll) — kept to
-  // align the forks.
+  // (#638 Slice 3) Live presence set — when a machine stops beating it drops
+  // from LIVE_MACHINES (membership stays via its records, so machines() doesn't
+  // change), but its card must re-render present→absent. Fold the presence
+  // signature in so that flip triggers a render. (Playback re-renders on each
+  // scrub, so machPresent re-evaluates against state.t there without help.)
   const ps=[...LIVE_MACHINES.keys()].sort().join(",");
   if(state.level==="fleet")return "f|"+machines().join(",")+"|"+dis+"|"+ls+"|"+ps;
   if(state.level==="machine")return "m|"+state.machine+"|"+sessionsOn(state.machine).join(",")+"|"+dis+"|"+ls+"|"+ps;
@@ -710,26 +839,97 @@ function startLiveTail(date){
   LIVE_ES.onerror=()=>{const mb=$("modebadge");if(mb)mb.classList.remove("live");}; // reconnecting — drop the pulse
   window.addEventListener("beforeunload",()=>{if(LIVE_ES)LIVE_ES.close();});
 }
-
-async function boot(){
-  const date=targetDate();
-  let mode="sample";
+// (#638) Poll the live-session set on the heartbeat cadence (~5s, matching
+// the emitter's refresh + 15s TTL). Best-effort: a fetch error just leaves
+// the set unchanged rather than flapping sessions offline. Only started in
+// live mode; playback keeps LIVE_SESSIONS empty so nothing reads "running".
+let LIVE_SESS_TIMER=null;
+async function pollLiveSessions(){
   try{
-    const res=await fetch("/flow/"+date,{headers:{accept:"application/json"}});
-    if(res.ok){
-      const body=await res.json();
-      RAW=Array.isArray(body)?body:(body.records||body.flow||[]);
-      DATA=flowToRenderModel(RAW);
-      mode = date===todayUTC() ? "live" : (RAW.length?"play":"empty");  // today tails; a past date replays
-    }else{ DATA=SAMPLE; RAW=[]; mode="sample"; }
-  }catch(e){ DATA=SAMPLE; RAW=[]; mode="sample"; }   // no daemon (website) → bundled fixture
+    const r=await fetch("/fleet/sessions/live",{headers:{accept:"application/json"}});
+    if(!r.ok)return;
+    const arr=await r.json();
+    const next=(Array.isArray(arr)?arr:[]).map(b=>b&&b.session_id).filter(Boolean);
+    LIVE_SESSIONS.clear(); next.forEach(s=>LIVE_SESSIONS.add(s));
+    applyLive();   // re-renders only if the live set changed the stage signature
+  }catch(_){/* best-effort — keep the last known live set */}
+}
+// (#638) Poll the live-machine set (presence beats) on the same cadence. A
+// machine shows in the fleet view because it's BROADCASTING PRESENCE, not
+// because it emitted a flow record — so a freshly-synced, idle machine appears
+// here and drops off when it stops beating. Best-effort like the session poll.
+async function pollLiveMachines(){
+  try{
+    const r=await fetch("/fleet/machines/live",{headers:{accept:"application/json"}});
+    if(!r.ok)return;
+    const arr=await r.json();
+    LIVE_MACHINES.clear();
+    (Array.isArray(arr)?arr:[]).forEach(b=>{ if(b&&b.machine_uid)LIVE_MACHINES.set(b.machine_uid,b); });
+    applyLive();   // machines() unions LIVE_MACHINES → a new present machine re-renders
+  }catch(_){/* best-effort — keep the last known live machines */}
+}
+function startLivePoll(){
+  if(LIVE_SESS_TIMER)return;
+  pollLiveSessions(); pollLiveMachines();
+  LIVE_SESS_TIMER=setInterval(()=>{pollLiveSessions();pollLiveMachines();},5000);
+  window.addEventListener("beforeunload",()=>{if(LIVE_SESS_TIMER)clearInterval(LIVE_SESS_TIMER);});
+}
+
+// Read injected mode + date from the daemon. The live route (GET /) injects
+// content="live"; the playback route (GET /play/<date>) injects
+// content="play" and a darkmux-date meta with the captured day. When loaded
+// statically (no daemon — e.g., darkmux.com/viewer), no meta is present and
+// the viewer falls back to URL-driven targetDate() behavior.
+function injectedMeta(name){
+  const el=document.querySelector('meta[name="'+name+'"]');
+  return el ? el.getAttribute('content') : null;
+}
+async function boot(){
+  const injectedMode=injectedMeta("darkmux-mode");
+  const injectedDate=injectedMeta("darkmux-date");
+  // Static-playback source (darkmux.com/demo): a committed .jsonl loaded
+  // directly — exactly the on-disk flow file the daemon would read for
+  // /flow/<date>. No daemon, identical render path. Forces playback.
+  const flowSrc=injectedMeta("darkmux-flow-src");
+  let date=injectedDate||targetDate();
+  // Playback mode is daemon-controlled (or static-flow-src driven): it forces
+  // "play" regardless of whether the date happens to be today, and SSE is
+  // never started. Live mode follows the original today=tail / past=replay.
+  const wantsPlayback = injectedMode==="play" || !!flowSrc;
+  let mode="empty";
+  if(flowSrc){
+    // Parse the flow file line-by-line, the way the daemon parses the on-disk
+    // .jsonl — then it's the standard playback render path, nothing demo-specific.
+    try{
+      const text=await fetch(flowSrc).then(r=>r.text());
+      RAW=text.split(/\r?\n/).map(l=>l.trim()).filter(Boolean)
+              .map(l=>{try{return JSON.parse(l);}catch(_){return null;}}).filter(Boolean);
+    }catch(e){ RAW=[]; }
+    DATA=flowToRenderModel(RAW);
+    if(!injectedDate&&RAW.length)date=String(RAW[0].ts||"").slice(0,10)||date;
+    mode = RAW.length?"play":"empty";
+  } else {
+    try{
+      const res=await fetch("/flow/"+date,{headers:{accept:"application/json"}});
+      if(res.ok){
+        const body=await res.json();
+        RAW=Array.isArray(body)?body:(body.records||body.flow||[]);
+        DATA=flowToRenderModel(RAW);
+        mode = wantsPlayback ? (RAW.length?"play":"empty")
+                             : (date===todayUTC() ? "live" : (RAW.length?"play":"empty"));
+      }else{ DATA=[]; RAW=[]; mode="empty"; }
+    }catch(e){ DATA=[]; RAW=[]; mode="no-daemon"; }   // daemon not reachable — show honest empty state, never demo
+  }
+  // Tag the body with the daemon-injected mode so CSS and dev tools can
+  // distinguish live-route vs playback-route loads at a glance.
+  document.body.classList.add("daemon-mode-"+(injectedMode||(flowSrc?"play":"unset")));
   setBadges(mode,date);
   recompute();
   state.t=tMax;
   state.filters={cat:new Set(FCATS),tier:new Set(FTIERS),src:new Set(FSRC),q:""};
   absorbNewFilterValues();
   render();
-  if(mode==="live") startLiveTail(date);
+  if(mode==="live"){ startLiveTail(date); startLivePoll(); }
 }
 boot();
 </script>
