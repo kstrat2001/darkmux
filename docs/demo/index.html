@@ -757,7 +757,12 @@ function flowToRenderModel(records){
   for(const s in perS){
     out.push({ts:perS[s].ts,category:"telemetry",source:"runtime",machine_id:perS[s].machine_id,machine_uid:perS[s].machine_uid,session_id:s,fields:{turns:perS[s].turns}});
   }
-  return out;
+  // Sort by ts: the per-session runtime aggregates above are APPENDED out of
+  // chronological order, and the event log + the follow-latest selection both
+  // assume DATA is temporal (log reverses it; "following" = max-ts = topmost
+  // row). One sort here keeps the whole pipeline in time order. recompute()
+  // assigns `_id` by index AFTER this, so ids track the sorted order.
+  return out.sort((a,b)=>T(a.ts)-T(b.ts));
 }
 
 // Pick the day to play back: URL hash (#2026-06-01) or ?date=, default today (UTC).
