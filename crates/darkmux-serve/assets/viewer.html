@@ -55,8 +55,27 @@
   .detail pre{margin:0;padding:10px 12px;background:var(--bg);border:1px solid var(--line);border-radius:5px;color:var(--text);white-space:pre-wrap;font:11px/1.55 'JetBrains Mono',monospace}
   .detail pre .k{color:var(--muted)}
   .detail .none{color:var(--muted);font:11px 'JetBrains Mono',monospace;padding:10px 0}
-  .loglist{flex:1;overflow:auto;padding:10px 14px}
-  .loglist h3{margin:0 0 8px;font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);display:flex;justify-content:space-between;align-items:center}
+  .loglist{flex:1;display:flex;flex-direction:column;min-height:0;overflow:hidden}
+  .loghead{flex:none;padding:10px 14px 8px;border-bottom:1px solid var(--line)}
+  .loglist h3{margin:0;font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);display:flex;justify-content:space-between;align-items:center}
+  .logsearch{display:flex;align-items:center;gap:10px;margin-top:8px}
+  .searchbox{position:relative;flex:1;min-width:0;display:flex;align-items:center}
+  .searchbox .sicon{position:absolute;left:9px;font-size:14px;line-height:1;color:var(--muted);pointer-events:none;transition:color .15s}
+  .searchbox input{flex:1;min-width:0;background:var(--bg);border:1px solid var(--line);color:var(--text);border-radius:6px;padding:7px 28px;font:12px 'JetBrains Mono',monospace;transition:border-color .15s,box-shadow .15s}
+  .searchbox input::-webkit-search-cancel-button{-webkit-appearance:none;appearance:none}
+  .searchbox input:focus{outline:none;border-color:var(--amber);box-shadow:0 0 0 3px rgba(109,241,255,.12)}
+  .searchbox input:focus-visible{outline:none}
+  .searchbox.has-q .sicon{color:var(--amber-dim)}
+  .searchbox:focus-within .sicon{color:var(--amber)}
+  .searchbox input::placeholder{color:var(--muted);font-style:italic}
+  .sclear{position:absolute;right:5px;display:flex;align-items:center;justify-content:center;width:18px;height:18px;padding:0;border:none;border-radius:50%;background:none;color:var(--muted);font-size:11px;line-height:1;cursor:pointer;transition:color .12s,background .12s}
+  .sclear:hover{color:var(--text);background:var(--panel)}
+  .sclear:focus-visible{outline:none;color:var(--amber);box-shadow:0 0 0 2px var(--amber-dim)}
+  .sclear[hidden]{display:none}
+  .qcount{flex:none;font:600 10px/1 'JetBrains Mono',monospace;letter-spacing:.04em;color:var(--amber-dim);white-space:nowrap;padding:3px 7px;border:1px solid var(--line);border-radius:10px;opacity:0;transition:opacity .15s}
+  .qcount.show{opacity:1}
+  .qcount.zero{color:var(--bad);border-color:rgba(255,107,133,.35)}
+  #logbody{flex:1;overflow:auto;padding:8px 14px 10px}
   .fbtn{background:none;border:1px solid var(--line);color:var(--muted);font:600 10px 'JetBrains Mono',monospace;letter-spacing:.06em;padding:4px 9px;border-radius:11px;cursor:pointer;text-transform:none}
   .fbtn:hover{border-color:var(--amber-dim);color:var(--amber)}
   .fbtn.on{border-color:var(--amber);color:var(--amber)}
@@ -68,6 +87,10 @@
   .scrub{height:64px;border-top:1px solid var(--line);background:var(--bg2);display:flex;align-items:center;gap:14px;padding:0 18px}
   .scrub button{background:var(--bg);border:1px solid var(--amber-dim);color:var(--text);padding:7px 14px;border-radius:4px;cursor:pointer;font:600 12px 'JetBrains Mono',monospace}
   .scrub button.primary{background:var(--amber);color:#0a0a0b;border-color:var(--amber)}
+  /* Live mode follows the tail — historical replay lives at /play/<date>. Hide
+     the playback transport and reclaim its reserved 64px back into .wrap. */
+  body.live-mode .scrub{display:none}
+  body.live-mode .wrap{height:calc(100vh - 46px - 40px)}
   input[type=range]{flex:1;accent-color:var(--amber)}
   .clock{font:12px 'JetBrains Mono',monospace;color:var(--muted);min-width:160px;text-align:right}
   .fleet{display:flex;gap:36px;flex-wrap:wrap;align-items:flex-start}
@@ -163,6 +186,7 @@
   @media (max-width: 768px) {
     html, body { height: auto; overflow: auto; min-height: 100vh; }
     .wrap { display: block; height: auto; }
+    body.live-mode .wrap { height: auto; } /* override the desktop live-mode calc on mobile */
     .stage { padding: 16px; min-height: 50vh; overflow: visible; }
     .log { width: auto; border-left: none; border-top: 1px solid var(--line); max-height: 60vh; }
     .detail { padding: 12px 14px 0; }
@@ -175,21 +199,37 @@
     .scrub { flex-wrap: wrap; height: auto; padding: 12px; gap: 10px; }
     .scrub button { padding: 10px 14px; font-size: 13px; min-height: 40px; }
     .clock { text-align: left; min-width: 0; flex: 1 0 100%; }
-    .top { padding: 0 12px; gap: 10px; }
-    .topnav { gap: 12px; flex-wrap: wrap; }
-    .crumbbar { padding: 0 12px; gap: 8px; overflow-x: auto; white-space: nowrap; }
-    .meta { font-size: 10px; }
+
+    /* Top bar reflows to two rows on phones: row 1 = brand + status badges,
+       row 2 = the nav. Auto-height instead of the desktop 46px so nothing
+       collides; the brand stops wrapping mid-word and the badges sit beside
+       it. The .wrap height calcs below subtract the desktop bar heights, but
+       on mobile .wrap is already height:auto (set above), so the taller bars
+       don't need a calc adjustment. */
+    .top { height: auto; flex-wrap: wrap; padding: 9px 12px; gap: 8px 10px; row-gap: 8px; }
+    .brand { flex: 1 1 100%; font-size: 13px; }
+    #srcbadge, #modebadge { order: 2; }
+    .badge, .pb { padding: 4px 8px; font-size: 10px; }
+    .topnav { order: 3; margin-left: 0; flex: 1 1 100%; gap: 16px; justify-content: flex-start; padding-top: 2px; border-top: 1px solid var(--line); }
+    .topnav a { font-size: 11px; }
+
+    /* Crumbbar: keep the back button + crumb on one scrollable row, but let
+       the meta block (records/machines/time) drop below instead of being
+       shoved off-screen. */
+    .crumbbar { height: auto; flex-wrap: wrap; padding: 8px 12px; gap: 6px 8px; }
+    .crumb { flex: 1 1 auto; min-width: 0; overflow-x: auto; white-space: nowrap; -webkit-overflow-scrolling: touch; }
+    .meta { flex: 1 1 100%; margin-left: 0; text-align: left; font-size: 10px; }
   }
 </style>
 </head>
 <body>
 <div class="top">
-  <span class="brand"><a href="../"><b>darkmux</b></a> · observability</span>
+  <span class="brand"><a href="https://darkmux.com/" target="_blank" rel="noopener"><b>darkmux</b></a> · observability</span>
   <span class="badge" id="srcbadge">Loading…</span>
   <span class="pb" id="modebadge">▣ playback</span>
   <nav class="topnav">
-    <a href="../">home</a>
-    <a href="../guide/">guide</a>
+    <a href="https://darkmux.com/" target="_blank" rel="noopener">home</a>
+    <a href="https://darkmux.com/guide/" target="_blank" rel="noopener">guide</a>
     <a href="https://darklyenergized.substack.com" target="_blank" rel="noopener">articles</a>
     <a href="https://github.com/kstrat2001/darkmux" target="_blank" rel="noopener">github</a>
   </nav>
@@ -207,8 +247,18 @@
       <div id="detailbody"></div></div>
     <div class="split" id="split" title="drag to resize"></div>
     <div class="loglist">
-      <h3><span>event log · <span id="logscope">fleet</span></span>
-          <button class="fbtn" id="fbtn" onclick="openFilters()">⚙ filters</button></h3>
+      <div class="loghead">
+        <h3><span>event log · <span id="logscope">fleet</span></span>
+            <button class="fbtn" id="fbtn" onclick="openFilters()">⚙ filters</button></h3>
+        <div class="logsearch">
+          <div class="searchbox">
+            <span class="sicon" aria-hidden="true">⌕</span>
+            <input id="logq" type="search" placeholder="filter the stream…" autocomplete="off" spellcheck="false" aria-label="search events">
+            <button class="sclear" id="sclear" type="button" aria-label="clear search" title="clear search" hidden>✕</button>
+          </div>
+          <span class="qcount" id="qcount" aria-live="polite"></span>
+        </div>
+      </div>
       <div id="logbody"></div>
     </div>
   </div>
@@ -527,13 +577,21 @@ function renderDetail(){
   $("detailbody").innerHTML=r?`<pre>${pretty(r)}</pre>`:`<div class="none">no event at this point in the timeline</div>`;
 }
 function renderLog(){
-  const recs=scopedFiltered().slice(-50).reverse();
+  const all=scopedFiltered();
+  const recs=all.slice(-50).reverse();
+  const qc=$("qcount");
+  if(qc){
+    const q=!!state.filters.q;
+    qc.textContent=q?(all.length?`${all.length} match${all.length===1?'':'es'}${all.length>50?' · newest 50':''}`:"no match"):"";
+    qc.classList.toggle("show",q);
+    qc.classList.toggle("zero",q&&all.length===0);
+  }
   $("logbody").innerHTML=recs.length?recs.map(r=>{
     const tt=iso(T(r.ts)).slice(11,19);
     const tag=r.category==="telemetry"?(r.source==="lms"?`lms:${r.fields.event}`:r.source==="process"?`cpu ${r.fields.cpu}%`:r.source==="detector"?`detect:${r.fields.kind}`:r.source==="runtime"?`run:${r.fields.turns}t`:r.source):(r.action||r.stage);
     return `<div class="rec ${r.category} ${r._id===state.selected?'sel':''}" onclick="selectRec(${r._id})">
       <span class="t">${tt}</span> <span class="tag">${tag}</span> ${r.machine_id||''}${r.session_id?(' · '+r.session_id):''}</div>`;
-  }).join(""):`<div class="empty">no events match the current filters</div>`;
+  }).join(""):`<div class="empty">${state.filters.q?'no events match your search':'no events match the current filters'}</div>`;
 }
 function renderCrumb(){
   // Mission crumb only when the loaded data actually has a mission. Lab/dispatch
@@ -613,8 +671,24 @@ function renderFilters(){
 window.toggleFilter=(k,v)=>{const s=state.filters[k];s.has(v)?s.delete(v):s.add(v);render();};
 window.openFilters=()=>{renderFilters();$("fsearch").value=state.filters.q;$("modalbg").style.display="flex";};
 window.closeFilters=()=>{$("modalbg").style.display="none";};
-window.clearFilters=()=>{state.filters={cat:new Set(FCATS),tier:new Set(FTIERS),src:new Set(FSRC),q:""};$("fsearch").value="";renderFilters();render();};
-$("fsearch").oninput=e=>{state.filters.q=e.target.value;render();};
+window.clearFilters=()=>{state.filters={cat:new Set(FCATS),tier:new Set(FTIERS),src:new Set(FSRC),q:""};setQuery("");renderFilters();};
+// One query, two inputs: the first-class pane search (#logq) and the modal
+// search (#fsearch) stay in sync through setQuery so either entry point filters
+// the same `state.filters.q` (full-text over each record — model, action, id…).
+function setQuery(v){
+  state.filters.q=v;
+  const lq=$("logq"), fs=$("fsearch"), sb=lq&&lq.closest(".searchbox"), sc=$("sclear");
+  if(lq&&lq.value!==v)lq.value=v;
+  if(fs&&fs.value!==v)fs.value=v;
+  if(sb)sb.classList.toggle("has-q",!!v);
+  if(sc)sc.hidden=!v;
+  render();
+}
+$("fsearch").oninput=e=>setQuery(e.target.value);
+$("logq").oninput=e=>setQuery(e.target.value);
+// Clear affordance in the pane search — wipes the shared query and re-focuses
+// the input so the operator can keep typing a fresh filter.
+$("sclear").onclick=()=>{setQuery("");const lq=$("logq");if(lq)lq.focus();};
 $("modalbg").onclick=e=>{if(e.target===$("modalbg"))closeFilters();};
 // resizable detail/log split — fixed default height stops the jumpiness; drag the divider to grow it
 (function(){const DEF=200,MIN=110,MAX=520;$("detail").style.height=DEF+"px";let drag=false,sy=0,sh=0;
@@ -712,6 +786,8 @@ function setBadges(mode,date){
   if(sb) sb.textContent = mode==="live" ? ("Live · "+dl) : mode==="play" ? ("Flow · "+date) : mode==="empty" ? ("No records · "+date) : mode==="no-daemon" ? "No daemon" : "No records yet";
   const mb=$("modebadge");
   if(mb){ const live=mode==="live"; mb.textContent=live?"● live":"▣ playback"; mb.classList.toggle("live",live); }
+  // Live mode hides the playback scrub bar (CSS keys off this class) — replay is /play/<date>.
+  document.body.classList.toggle("live-mode", mode==="live");
 }
 
 // Structural signature of the current level's stage. In live mode the cards are
