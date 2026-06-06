@@ -56,11 +56,11 @@ See [DESIGN.md → "Relationship to openclaw"](DESIGN.md#relationship-to-opencla
 
 ## Many machines become one
 
-If you have more than one Mac, darkmux makes them work as a single development environment. Operator hands off a role; the first available worker runs it. Open the topology viewer from any node — you see the whole fleet. Open the fleet status from any node — you see specs, RAM, loaded models per machine.
+If you have more than one Mac, darkmux makes them work as a single development environment. Operator hands off a role; the first available runner runs it. Open the topology viewer from any node — you see the whole fleet. Open the fleet status from any node — you see specs, RAM, loaded models per machine.
 
 Concretely, the capabilities the multi-machine substrate ships today:
 
-- **Single-stream fleet dispatch.** Every dispatch routes onto one global work stream (`darkmux:work`); the first available worker claims any job — no tier configuration to maintain. `darkmux crew dispatch coder --machine <id>` is an *advisory* hint when you want a specific machine; any worker may still claim it. Capability-based auto-routing (match work to the machine best suited to run it) is the planned successor, building on the [#590](https://github.com/kstrat2001/darkmux/issues/590) capability layer.
+- **Single-stream fleet dispatch.** Every dispatch routes onto one global work stream (`darkmux:work`); the first available runner claims any job — no tier configuration to maintain. `darkmux crew dispatch coder --machine <id>` is an *advisory* hint when you want a specific machine; any runner may still claim it. Capability-based auto-routing (match work to the machine best suited to run it) is the planned successor, building on the [#590](https://github.com/kstrat2001/darkmux/issues/590) capability layer.
 - **Fleet status with specs.** `darkmux fleet status --deep` fans out across every reachable peer's `/machine/specs` endpoint — RAM-free, loaded models, OS, darkmux version, redacted Redis URL — in one table (#275).
 - **Decentralized flow UI.** The daemon hosts the observability viewer at its own origin — `http://localhost:8765/` on every machine running `darkmux serve`. The viewer pulls from the daemon's `/flow/<date>` endpoint which aggregates events from every machine writing to the shared `darkmux:flow` Redis stream — so you see the fleet, not just the host (#270 + #554).
 - **`/darkmux-add-machine` skill.** Walkthrough for joining a new Mac to an existing fleet — env vars, roster setup, smoke test. Run `darkmux init` to install all skills locally (#176).

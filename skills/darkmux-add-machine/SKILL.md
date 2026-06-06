@@ -21,7 +21,7 @@ Before walking through join, confirm the operator's mental model lines up with w
 
 - **Per-machine roster.** Each machine has its OWN `~/.darkmux/fleet.json`. Adding this new machine to the fleet means: (a) configure this machine's env vars + roster to know about its peers, AND (b) run `darkmux fleet add <this-machine-id>` on EACH of the operator's other existing machines so they see it too. Cross-machine roster replication is filed as [#280](https://github.com/kstrat2001/darkmux/issues/280) but not yet shipped — for now, the per-machine roster is the operator's hand-managed reality.
 - **Tailnet trust boundary.** darkmux assumes everyone reachable on the same `DARKMUX_REDIS_URL` is the same operator. No per-machine auth beyond the mesh VPN (Tailscale, etc.). See [README — "Who darkmux is for"](https://github.com/kstrat2001/darkmux#who-darkmux-is-for).
-- **Single global work stream (#590).** All fleet work routes onto one stream (`darkmux:work`); the first available worker claims any job. There's no machine-capacity tier to declare — a `--machine <id>` hint is advisory only.
+- **Single global work stream (#590).** All fleet work routes onto one stream (`darkmux:work`); the first available runner claims any job. There's no machine-capacity tier to declare — a `--machine <id>` hint is advisory only.
 
 Tell the operator these points up-front, then continue.
 
