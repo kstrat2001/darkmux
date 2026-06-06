@@ -80,7 +80,13 @@ enum Cmd {
     /// patches openclaw's config to match; the default leaves
     /// `~/.openclaw/openclaw.json` untouched.
     Swap {
-        profile: String,
+        /// Name of the profile to swap to (from profiles.json).
+        #[arg(required = false)]
+        profile: Option<String>,
+        /// Swap to the tier-recommended profile for this machine instead of
+        /// a named profile.
+        #[arg(long)]
+        recommended: bool,
         /// Profiles-registry path (profiles.json). Overrides DARKMUX_PROFILES
         /// and the default search locations. (renamed from --config, #661)
         #[arg(long)]
@@ -698,7 +704,7 @@ enum ModelCmd {
     },
     /// Download the bake-off-validated models for the active hardware
     /// tier (per `templates/builtin/recommendations/<tier>.json`).
-    /// Composes with `darkmux swap recommended` — the swap verb errors
+    /// Composes with `darkmux swap --recommended` — the swap verb errors
     /// loudly when the prescribed models aren't on disk; this verb is
     /// the fix-it.
     ///
@@ -994,7 +1000,8 @@ fn run(cmd: Cmd) -> Result<i32> {
             dry_run,
             quiet,
             runtime,
-        } => cmd_swap(&profile, profiles.as_deref(), dry_run, quiet, &runtime),
+            recommended,
+        } => cmd_swap(profile.as_deref(), profiles.as_deref(), dry_run, quiet, &runtime, recommended),
         Cmd::Status { profiles } => cmd_status(profiles.as_deref()),
         Cmd::Profiles { profiles } => cmd_profiles(profiles.as_deref()),
         Cmd::Lab { sub } => cmd_lab(sub),
@@ -2362,7 +2369,7 @@ fn cmd_model_pull_recommended() -> Result<i32> {
     Ok(0)
 }
 
-/// `darkmux swap recommended` — resolve the active hardware tier to its
+/// `darkmux swap --recommended` — resolve the active hardware tier to its
 /// bake-off-validated profile and swap to it. Errors loudly when the
 /// recommendation status isn't `Validated`, or when the prescribed
 /// models aren't downloaded (with a one-command-fix pointer to
@@ -2424,7 +2431,7 @@ fn cmd_swap_recommended(
             rec.bake_off_url.as_deref().unwrap_or("no url"),
         );
     }
-    cmd_swap(profile_name, config, dry_run, quiet, runtime)
+    cmd_swap(Some(profile_name), config, dry_run, quiet, runtime, false)
 }
 
 fn cmd_profile(sub: ProfileCmd) -> Result<i32> {
@@ -2588,19 +2595,22 @@ fn cmd_init(
 }
 
 fn cmd_swap(
-    profile_name: &str,
+    profile_name: Option<&str>,
     config: Option<&str>,
     dry_run: bool,
     quiet: bool,
     runtime: &str,
+    recommended: bool,
 ) -> Result<i32> {
-    // `swap recommended` is reserved — short-circuit to the recommendation-
-    // registry-driven dispatcher rather than looking up a profile literally
-    // named "recommended". Per #159: the prescriptive verb resolves the
-    // active hardware tier to the bake-off-validated profile.
-    if profile_name == "recommended" {
+    // `swap --recommended` — short-circuit to the recommendation-
+    // registry-driven dispatcher rather than looking up a profile.
+    if recommended {
         return cmd_swap_recommended(config, dry_run, quiet, runtime);
     }
+    let Some(profile_name) = profile_name else {
+        eprintln!("darkmux: specify a profile name to swap to, or pass --recommended");
+        return Ok(2);
+    };
     let loaded = profiles::load_registry(config)?;
     let profile = profiles::get_profile(&loaded.registry, profile_name)?;
     if !quiet {
