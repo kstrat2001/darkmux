@@ -148,7 +148,7 @@ indexed and queryable.
 **Crews are not dynamically composed per mission today.** A mission has no
 `crew_id` field; `darkmux mission dispatch` takes an explicit `role` and fans the
 mission's ready sprints out onto the single global work stream, where the first
-available worker claims each one (#590). The operator names the role per
+available runner claims each one (#590). The operator names the role per
 dispatch; dynamic per-mission crew assembly is
 [planned](#8-planned--not-yet-shipped), not shipped.
 
