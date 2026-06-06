@@ -5,16 +5,18 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>darkmux · observability viewer</title>
 <!--
-  This is the LIVE observability viewer. It's served by `darkmux serve` at
-  `GET /` and at `darkmux.com/viewer`. It fetches real flow records from the
-  daemon's `/flow/<date>` endpoint and tails new ones via SSE.
+  The canonical darkmux observability viewer. ONE file, served three ways:
 
-  The demo / showcase version (with bundled sample data and the recorded
-  playback scenario) lives at `docs/demo/index.html` and serves
-  `darkmux.com/demo`. The two files started as near-copies; live-only
-  improvements go here, demo-narrative improvements go in `demo/`.
+   - `darkmux serve` at `GET /` (and darkmux.com/viewer) — LIVE: fetches real
+     flow records from the daemon's `/flow/<date>` and tails new ones via SSE.
+   - `GET /play/<date>` — PLAYBACK of a recorded day from the daemon.
+   - darkmux.com/demo — PLAYBACK of a committed flow file
+     (docs/demo/demo-flow.jsonl), generated from THIS file by
+     scripts/build-demo.sh which injects `mode=play` + `darkmux-flow-src`.
 
-  Reference: GitHub issue #624 (split demo + live to stop conflation).
+  The demo is this viewer in playback mode loading a real flow file, so it's
+  identical to a local `/play` — there is no demo fork. Edit this file; for the
+  demo, also run `scripts/build-demo.sh` (CI fails on drift).
 -->
 
 <style>
@@ -287,14 +289,11 @@
 // no daemon running), DATA stays empty and the viewer renders the "no records"
 // state instead of falling back to demo content.
 //
-// The demo/showcase version with bundled SAMPLE data lives at docs/demo/
-// (served at darkmux.com/demo). See issue #624 for the split rationale.
-//
-// SAMPLE kept as an empty const for shape compatibility with the demo file —
-// future common-code edits should land in both files; demo-narrative-only and
-// daemon-only edits land in one.
-const SAMPLE = [];
-let DATA = SAMPLE;
+// darkmux.com/demo IS this viewer in playback mode (mode=play +
+// darkmux-flow-src), generated from this file by scripts/build-demo.sh and fed
+// docs/demo/demo-flow.jsonl — so the demo is identical to a local `/play`.
+// There is no demo fork; edit this viewer, then regenerate.
+let DATA = [];
 let DATA_SOURCE = "no records yet";
 
 // MACH_SPEC was a hardcoded lookup for the demo's three machines (studio,
@@ -885,25 +884,42 @@ function injectedMeta(name){
 async function boot(){
   const injectedMode=injectedMeta("darkmux-mode");
   const injectedDate=injectedMeta("darkmux-date");
-  const date=injectedDate||targetDate();
-  // Playback mode is daemon-controlled: it forces "play" regardless of
-  // whether the date happens to be today, and SSE is never started. Live
-  // mode follows the original today=tail / past=replay logic.
-  const wantsPlayback = injectedMode==="play";
+  // Static-playback source (darkmux.com/demo): a committed .jsonl loaded
+  // directly — exactly the on-disk flow file the daemon would read for
+  // /flow/<date>. No daemon, identical render path. Forces playback.
+  const flowSrc=injectedMeta("darkmux-flow-src");
+  let date=injectedDate||targetDate();
+  // Playback mode is daemon-controlled (or static-flow-src driven): it forces
+  // "play" regardless of whether the date happens to be today, and SSE is
+  // never started. Live mode follows the original today=tail / past=replay.
+  const wantsPlayback = injectedMode==="play" || !!flowSrc;
   let mode="empty";
-  try{
-    const res=await fetch("/flow/"+date,{headers:{accept:"application/json"}});
-    if(res.ok){
-      const body=await res.json();
-      RAW=Array.isArray(body)?body:(body.records||body.flow||[]);
-      DATA=flowToRenderModel(RAW);
-      mode = wantsPlayback ? (RAW.length?"play":"empty")
-                           : (date===todayUTC() ? "live" : (RAW.length?"play":"empty"));
-    }else{ DATA=[]; RAW=[]; mode="empty"; }
-  }catch(e){ DATA=[]; RAW=[]; mode="no-daemon"; }   // daemon not reachable — show honest empty state, never demo
+  if(flowSrc){
+    // Parse the flow file line-by-line, the way the daemon parses the on-disk
+    // .jsonl — then it's the standard playback render path, nothing demo-specific.
+    try{
+      const text=await fetch(flowSrc).then(r=>r.text());
+      RAW=text.split(/\r?\n/).map(l=>l.trim()).filter(Boolean)
+              .map(l=>{try{return JSON.parse(l);}catch(_){return null;}}).filter(Boolean);
+    }catch(e){ RAW=[]; }
+    DATA=flowToRenderModel(RAW);
+    if(!injectedDate&&RAW.length)date=String(RAW[0].ts||"").slice(0,10)||date;
+    mode = RAW.length?"play":"empty";
+  } else {
+    try{
+      const res=await fetch("/flow/"+date,{headers:{accept:"application/json"}});
+      if(res.ok){
+        const body=await res.json();
+        RAW=Array.isArray(body)?body:(body.records||body.flow||[]);
+        DATA=flowToRenderModel(RAW);
+        mode = wantsPlayback ? (RAW.length?"play":"empty")
+                             : (date===todayUTC() ? "live" : (RAW.length?"play":"empty"));
+      }else{ DATA=[]; RAW=[]; mode="empty"; }
+    }catch(e){ DATA=[]; RAW=[]; mode="no-daemon"; }   // daemon not reachable — show honest empty state, never demo
+  }
   // Tag the body with the daemon-injected mode so CSS and dev tools can
   // distinguish live-route vs playback-route loads at a glance.
-  document.body.classList.add("daemon-mode-"+(injectedMode||"unset"));
+  document.body.classList.add("daemon-mode-"+(injectedMode||(flowSrc?"play":"unset")));
   setBadges(mode,date);
   recompute();
   state.t=tMax;

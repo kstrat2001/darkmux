@@ -79,9 +79,10 @@ fn inject_mode_meta(html: &str, mode: &str, date: Option<&str>) -> String {
 /// scrubbing through a past day without live records bleeding in, use the
 /// playback route `GET /play/:date` instead.
 ///
-/// Per #624, the demo with bundled sample data and recorded scenario lives
-/// at `docs/demo/index.html` and is served by `darkmux.com/demo` — separate
-/// from this live viewer.
+/// darkmux.com/demo is THIS viewer in playback mode, generated from
+/// `assets/viewer.html` by `scripts/build-demo.sh` and fed a committed flow
+/// file (`docs/demo/demo-flow.jsonl`) — identical to a local `/play`, not a
+/// separate fork.
 async fn root_html() -> impl IntoResponse {
     (
         StatusCode::OK,
@@ -1568,6 +1569,46 @@ mod tests {
     use std::{fs, path::PathBuf};
     use tower::util::ServiceExt;
     use tempfile::TempDir;
+
+    /// The darkmux.com/demo dataset is a *real* FLOW_SCHEMA flow file: the demo
+    /// page is the canonical viewer in playback mode loading this `.jsonl`,
+    /// identical to a local `/play`. Guard that it stays an exact `FlowRecord`
+    /// set — if a line drifts off-schema the demo would render wrong (or the
+    /// playback path would choke), so it must deserialize line-for-line.
+    #[test]
+    fn demo_flow_dataset_is_schema_valid() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/demo/demo-flow.jsonl");
+        let raw = fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {path}: {e}"));
+        let mut recs = Vec::new();
+        for (i, line) in raw.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let r: darkmux_flow::FlowRecord = serde_json::from_str(line).unwrap_or_else(|e| {
+                panic!("demo-flow.jsonl line {} is not a valid FlowRecord: {e}\n  {line}", i + 1)
+            });
+            recs.push(r);
+        }
+        assert!(!recs.is_empty(), "demo dataset is empty");
+        // The demo flare is data-driven: the mission is named `demo`, so the
+        // viewer's crumb reads `◆ demo` with zero viewer special-casing.
+        assert!(
+            recs.iter().any(|r| r.mission_id.as_deref() == Some("demo")),
+            "demo dataset must carry mission_id=demo (the data-driven demo flare)"
+        );
+        assert!(
+            recs.iter()
+                .all(|r| r.mission_id.as_deref().map_or(true, |m| m == "demo")),
+            "every mission-scoped demo record must be mission=demo"
+        );
+        let machines: std::collections::BTreeSet<_> =
+            recs.iter().filter_map(|r| r.machine_id.as_deref()).collect();
+        assert!(
+            machines.len() >= 3,
+            "demo should showcase a multi-machine fleet, got {machines:?}"
+        );
+    }
 
     #[tokio::test]
     async fn health_returns_200_with_versions() {
