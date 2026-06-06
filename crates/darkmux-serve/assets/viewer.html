@@ -99,12 +99,12 @@
   .fleettl{margin-top:30px;border-top:1px solid var(--line);padding-top:18px}
   .tlhdr{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin-bottom:14px}
   .lane{display:flex;align-items:center;gap:12px;margin-bottom:7px}
-  .lname{width:150px;flex:none;font:12px 'JetBrains Mono',monospace;color:var(--text);text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .lname{width:var(--lname-w,150px);flex:none;font:12px 'JetBrains Mono',monospace;color:var(--text);text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .tltrack{position:relative;flex:1;height:28px;background:var(--panel);border:1px solid var(--line);border-radius:4px;overflow:hidden}
   .sbar{position:absolute;top:5px;height:18px;background:var(--amber-dim);border-radius:3px;min-width:2px}
   .sbar.a{background:var(--amber);box-shadow:0 0 6px var(--amber)}
   .tltrack .ph{position:absolute;top:0;bottom:0;width:2px;background:var(--text);opacity:.32}
-  .tlaxis{margin-left:162px;display:flex;justify-content:space-between;font:9px 'JetBrains Mono',monospace;color:var(--muted);margin-top:7px}
+  .tlaxis{margin-left:calc(var(--lname-w,150px) + 12px);display:flex;justify-content:space-between;font:9px 'JetBrains Mono',monospace;color:var(--muted);margin-top:7px}
   .tlempty{font:11px 'JetBrains Mono',monospace;color:var(--muted)}
   .mach{width:230px;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px;cursor:pointer;transition:border-color .15s}
   .mach:hover{border-color:var(--amber-dim)}.mach.active{border-color:var(--amber);box-shadow:0 0 0 1px var(--amber-dim)}
@@ -428,8 +428,13 @@ function renderFleet(){
     return `<div class="lane"><div class="lname" title="${nameOf(m)}">${nameOf(m)}</div><div class="tltrack">${bars}<div class="ph" style="left:${pct(state.t)}%"></div></div></div>`;
   }).join("");
   const ax=`<div class="tlaxis"><span>${iso(tMin).slice(11,16)}</span><span>${iso(tMin+span/2).slice(11,16)}</span><span>${iso(tMax).slice(11,16)}Z</span></div>`;
+  // Size the lane-label column to the actual machine names so short names
+  // ("studio") don't leave a fixed-150px gap before the bars. CSS var consumed
+  // on desktop; mobile stacks the lanes (.lname width:auto) and ignores it.
+  const maxLen=ms.length?Math.max(...ms.map(m=>nameOf(m).length)):8;
+  const labelW=Math.round(Math.min(170,Math.max(54,maxLen*7.4+10)));
   const tl = ms.length
-    ? `<div class="fleettl"><div class="tlhdr">activity · ${iso(tMin).slice(11,19)}–${iso(tMax).slice(11,19)}Z</div>${lanes}${ax}</div>`
+    ? `<div class="fleettl" style="--lname-w:${labelW}px"><div class="tlhdr">activity · ${iso(tMin).slice(11,19)}–${iso(tMax).slice(11,19)}Z</div>${lanes}${ax}</div>`
     : `<div class="fleettl"><div class="tlempty">waiting for the first flow record…</div></div>`;
   $("stage").innerHTML=`<div class="fleet">${cards}</div>`+tl;
 }
