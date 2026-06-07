@@ -289,8 +289,11 @@ pub fn publish_job(client: &redis::Client, job: &WorkJob) -> Result<String> {
 /// removed from `WorkJob`). Bumped "2" → "3" in #703 Slice 4 (added the
 /// optional `image` field so cross-machine dispatch carries `--image`).
 /// `deny_unknown_fields` means a job carrying `image` from a "3"-era
-/// publisher is rejected by a "2"-era runner — a clean pre-1.0 wire break;
-/// restart all fleet daemons together after upgrading.
+/// publisher is rejected by a "2"-era runner — a clean pre-1.0 wire break.
+/// The break is **asymmetric**: `image` is `skip_serializing_if = None`, so a
+/// "3" job with no image serializes byte-identical to a "2" job and old
+/// runners still parse it; only image-bearing jobs require all runners on "3".
+/// Safe rule of thumb: restart all fleet daemons together after upgrading.
 #[allow(dead_code)] // PR-C.1 substrate; consumed by PR-C.2 (runner loop) + PR-C.3 (client push)
 pub(crate) const WORK_JOB_SCHEMA_VERSION: &str = "3";
 
