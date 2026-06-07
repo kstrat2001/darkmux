@@ -380,8 +380,35 @@ const dispatch=(sid,act)=>DATA.find(r=>r.session_id===sid&&r.action==="dispatch.
 // bracket the running interval where there's no complete to close it.
 const sessEnd=sid=>DATA.find(r=>r.session_id===sid&&r.action==="session.end");
 
+// (#691) The mission label for the meta bar. Joining EVERY mission_id in the
+// window produced an ever-growing title (`◆ japan-trip, test-mission-e11, m1,
+// m2, …`) — the live view was showing the whole day's history, not what's live
+// now. Live = present-now: prefer missions that have a currently-live session
+// (∈ LIVE_SESSIONS); if none are running, fall back to the most recent (DATA is
+// ts-sorted, so the last distinct mission_id is newest). Cap the rest behind a
+// "+N" so the title never sprawls. Playback isn't presence-scoped (LIVE_SESSIONS
+// is empty there) — it shows the window's missions, also capped.
+// (#691) Live-scoped missions — present-now, not the whole window. In live
+// mode, prefer missions with a currently-live session (∈ LIVE_SESSIONS); if
+// none are running, the most recent (DATA is ts-sorted → last is newest). In
+// playback, the window's missions (LIVE_SESSIONS is empty there).
+function liveScopedMissions(){
+  if(!missions.length) return [];
+  if(document.body.classList.contains('live-mode')){
+    const live = missions.filter(mid => DATA.some(r => r.mission_id===mid && LIVE_SESSIONS.has(r.session_id)));
+    return live.length ? live : [missions[missions.length-1]];
+  }
+  return missions;
+}
+// The single mission the crumb + mission panel focus on.
+function primaryMission(){ const ms=liveScopedMissions(); return ms.length?ms[0]:null; }
+function missionLabel(){
+  const ms=liveScopedMissions();
+  if(!ms.length) return '—';
+  return ms.length>2 ? `${ms.slice(0,2).join(', ')} +${ms.length-2} more` : ms.join(', ');
+}
 function renderMeta(){
-  $("meta").innerHTML=`<a class="misslink" onclick="goMission()">◆ ${missions.join(', ')||'—'}</a> · <b>${DATA_SOURCE}</b> · ${iso(tMin).slice(0,10)} `+
+  $("meta").innerHTML=`<a class="misslink" onclick="goMission()">◆ ${missionLabel()}</a> · <b>${DATA_SOURCE}</b> · ${iso(tMin).slice(0,10)} `+
     `${iso(tMin).slice(11,19)}–${iso(tMax).slice(11,19)}Z<br>${DATA.length} records · ${machines().length} machines`;
 }
 function machActive(m){
@@ -611,7 +638,7 @@ function renderCrumb(){
   // playback (no mission_id) starts at fleet. (Live mission/sprint detail is a
   // follow-up seam — /missions + /sprints; MISSION stays the sample fixture.)
   const hasMission=missions.length>0;
-  let c=hasMission?`<a class="misslink" onclick="goMission()">◆ ${missions[0]}</a>`:``;
+  let c=hasMission?`<a class="misslink" onclick="goMission()">◆ ${primaryMission()}</a>`:``;
   if(state.level!=="mission"){
     c+=(hasMission?`<span class="sep">›</span>`:``)+`<a onclick="goFleet()">fleet</a>`;
     if(state.level==="machine"||state.level==="subsystem") c+=`<span class="sep">›</span><a onclick="drillMachine('${state.machine}')">${state.machine}</a>`;
@@ -642,7 +669,7 @@ function renderMission(){
   // exactly as live data would. (Sprint/burn-down detail is a separate
   // feature — it needs sprint lifecycle records, which dispatch flows don't
   // carry yet.)
-  const mid=missions[0]||"—";
+  const mid=primaryMission()||"—";
   state.stageScope=r=>r.mission_id===mid; $("logscope").textContent="mission";
   const starts={};
   DATA.filter(r=>r.mission_id===mid&&typeof r.action==="string"&&r.action.indexOf("dispatch")===0&&r.action.indexOf("start")>-1)
