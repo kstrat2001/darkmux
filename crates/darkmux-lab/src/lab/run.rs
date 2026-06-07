@@ -280,7 +280,7 @@ pub fn lab_workloads() -> Vec<String> {
 
 /// (#489) Phase 2 — read the provider-written `<run_dir>/manifest.json`,
 /// merge in a `fixture` section carrying baseline_hash + source path,
-/// bump schemaVersion to 4, write it back. Provider stays unaware of
+/// bump schema_version to 4, write it back. Provider stays unaware of
 /// fixture provenance; lab is the orchestration layer that knows what
 /// source fed the COW clone.
 ///
@@ -329,7 +329,7 @@ fn enrich_manifest_with_fixture_info(
 
     if let Some(obj) = manifest.as_object_mut() {
         obj.insert("fixture".to_string(), fixture);
-        obj.insert("schemaVersion".to_string(), serde_json::json!(4));
+        obj.insert("schema_version".to_string(), serde_json::json!(4));
     } else {
         return Err(anyhow!("manifest is not a JSON object"));
     }
@@ -707,7 +707,7 @@ mod tests {
 
     /// (#489) Phase 2 — `enrich_manifest_with_fixture_info` adds the
     /// `fixture` section to a provider-written manifest.json, bumps
-    /// schemaVersion to 4, preserves all existing fields.
+    /// schema_version to 4, preserves all existing fields.
     #[test]
     fn enrich_adds_fixture_section_to_existing_manifest() {
         let tmp = TempDir::new().unwrap();
@@ -720,8 +720,8 @@ mod tests {
         std::fs::write(
             run_dir.join("manifest.json"),
             r#"{
-                "schemaVersion": 3,
-                "runId": "test-run-1",
+            "schema_version": 3,
+                "run_id": "test-run-1",
                 "workload": "demo",
                 "final_hash": "blake3:abc"
             }"#,
@@ -738,9 +738,9 @@ mod tests {
         let raw = std::fs::read_to_string(run_dir.join("manifest.json")).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
         // Schema bumped to v4.
-        assert_eq!(parsed["schemaVersion"], 4);
+        assert_eq!(parsed["schema_version"], 4);
         // Existing fields preserved.
-        assert_eq!(parsed["runId"], "test-run-1");
+        assert_eq!(parsed["run_id"], "test-run-1");
         assert_eq!(parsed["final_hash"], "blake3:abc");
         // New fixture section.
         assert_eq!(parsed["fixture"]["baseline_hash"], "blake3:source-hash");
@@ -760,7 +760,7 @@ mod tests {
         std::fs::create_dir_all(&source_sandbox).unwrap();
         std::fs::write(
             run_dir.join("manifest.json"),
-            r#"{"schemaVersion": 3, "runId": "r1"}"#,
+            r#"{"schema_version": 3, "run_id": "r1"}"#,
         )
         .unwrap();
 
@@ -788,7 +788,7 @@ mod tests {
         let source_sandbox = tmp.path().join("does-not-exist");
         std::fs::write(
             run_dir.join("manifest.json"),
-            r#"{"schemaVersion": 3, "runId": "r1"}"#,
+            r#"{"schema_version": 3, "run_id": "r1"}"#,
         )
         .unwrap();
 

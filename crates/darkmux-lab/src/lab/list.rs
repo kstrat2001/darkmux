@@ -53,11 +53,11 @@ pub fn list_runs(limit: Option<usize>) -> Result<Vec<RunSummary>> {
             Ok(v) => v,
             Err(_) => continue,
         };
-        // Prefer the v2 `runId` field; fall back to the run-dir basename so
+        // Prefer the v2 `run_id` field; fall back to the run-dir basename so
         // pre-v2 runs still list. The dir basename is the canonical id that
         // the user passes back to `lab inspect` / `lab compare`.
         let run_id = parsed
-            .get("runId")
+            .get("run_id")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .unwrap_or_else(|| {
@@ -77,7 +77,7 @@ pub fn list_runs(limit: Option<usize>) -> Result<Vec<RunSummary>> {
             .unwrap_or("?")
             .to_string();
         let duration_ms = parsed
-            .get("durationMs")
+            .get("duration_ms")
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as u128;
         let ok = parsed.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -141,11 +141,11 @@ mod tests {
         let dir = runs_dir.join(run_id);
         fs::create_dir_all(&dir).unwrap();
         let manifest = serde_json::json!({
-            "schemaVersion": 1,
-            "sessionId": run_id,
+            "schema_version": 1,
+            "session_id": run_id,
             "workload": workload,
             "profile": "test-profile",
-            "durationMs": dur,
+            "duration_ms": dur,
             "ok": ok,
         });
         fs::write(dir.join("manifest.json"), manifest.to_string()).unwrap();

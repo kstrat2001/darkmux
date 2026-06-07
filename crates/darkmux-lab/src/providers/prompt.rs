@@ -86,17 +86,17 @@ impl WorkloadProvider for PromptProvider {
             .unwrap_or("")
             .to_string();
         let manifest_json = serde_json::json!({
-            // v2 added: runId, profile (now the profile NAME), profileDescription.
-            // v1 had: sessionId, profile (was the description text), workload, provider, durationMs, ok.
-            "schemaVersion": 2,
-            "runId": run_id,
+            // v2 added: run_id, profile (now the profile NAME), profile_description.
+            // v1 had: session_id, profile (was the description text), workload, provider, duration_ms, ok.
+            "schema_version": 2,
+            "run_id": run_id,
             "workload": loaded.manifest.workload.id,
             "provider": self.id(),
             "profile": profile_name,
-            "profileDescription": profile.description.clone().unwrap_or_default(),
-            "durationMs": duration_ms,
+            "profile_description": profile.description.clone().unwrap_or_default(),
+            "duration_ms": duration_ms,
             "ok": ok,
-            "sessionId": session_id,
+            "session_id": session_id,
         });
         fs::write(
             run_dir.join("manifest.json"),
@@ -132,7 +132,7 @@ impl WorkloadProvider for PromptProvider {
         };
         let verify_outcome = run_verify(loaded, &reply);
         let run_id = meta
-            .get("runId")
+            .get("run_id")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .or_else(|| {
@@ -145,7 +145,7 @@ impl WorkloadProvider for PromptProvider {
         Ok(InspectionReport {
             run_id,
             workload_id: loaded.manifest.workload.id.clone(),
-            walltime_ms: meta.get("durationMs").and_then(|v| v.as_u64()).unwrap_or(0) as u128,
+            walltime_ms: meta.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0) as u128,
             turns: 1,
             compactions: 0,
             tokens_before: vec![],
@@ -596,7 +596,7 @@ mod tests {
         assert_eq!(report.compactions, 0);
     }
 
-    /// Forward-compat: when the manifest carries a `runId`, inspect returns
+    /// Forward-compat: when the manifest carries a `run_id`, inspect returns
     /// that value rather than the dir basename. Locks the new schema (v2).
     #[test]
     fn inspect_uses_run_id_from_manifest() {
@@ -605,7 +605,7 @@ mod tests {
         fs::create_dir_all(&run_dir).unwrap();
         fs::write(
             run_dir.join("manifest.json"),
-            r#"{"schemaVersion":2,"runId":"the-canonical-id","workload":"t","provider":"prompt","profile":"deep","durationMs":42,"ok":true,"sessionId":"darkmux-prompt-t-1"}"#,
+            r#"{"schema_version":2,"run_id":"the-canonical-id","workload":"t","provider":"prompt","profile":"deep","duration_ms":42,"ok":true,"session_id":"darkmux-prompt-t-1"}"#,
         )
         .unwrap();
         let loaded = make_loaded(spec_with_prompt("x"), tmp.path().to_path_buf());

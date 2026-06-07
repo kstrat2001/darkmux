@@ -419,17 +419,17 @@ impl WorkloadProvider for CodingTaskProvider {
             }
         };
         let manifest_json = serde_json::json!({
-            // v2 added: runId, profile (now the profile NAME), profileDescription.
+            // v2 added: run_id, profile (now the profile NAME), profile_description.
             // v3 (#488) added: final_hash (Phase 1). baseline_hash added in Phase 2.
-            "schemaVersion": 3,
-            "runId": run_id,
+            "schema_version": 3,
+            "run_id": run_id,
             "workload": loaded.manifest.workload.id,
             "provider": self.id(),
             "profile": profile_name,
-            "profileDescription": profile.description.clone().unwrap_or_default(),
-            "durationMs": duration_ms,
+            "profile_description": profile.description.clone().unwrap_or_default(),
+            "duration_ms": duration_ms,
             "ok": ok,
-            "sessionId": session_id,
+            "session_id": session_id,
             // Always store the sandbox path as absolute in the
             // manifest. Prior to #359 (QA finding), this stored a
             // relative path when sandbox_dir was under cwd — making
@@ -536,7 +536,7 @@ impl WorkloadProvider for CodingTaskProvider {
             }
         }
 
-        let walltime_ms = meta.get("durationMs").and_then(|v| v.as_u64()).unwrap_or(0) as u128;
+        let walltime_ms = meta.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0) as u128;
         let mode = classify_mode(walltime_ms, loaded);
 
         // Prefer runtime metrics when present (internal-runtime path);
@@ -589,7 +589,7 @@ impl WorkloadProvider for CodingTaskProvider {
         ));
 
         let run_id = meta
-            .get("runId")
+            .get("run_id")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .or_else(|| {
@@ -1801,19 +1801,19 @@ not-valid-json
         // Provide minimal manifest.json
         fs::write(
             run_dir.join("manifest.json"),
-            r#"{"sessionId":"abc","durationMs":12345}"#,
+            r#"{"session_id":"abc","duration_ms":12345}"#,
         )
         .unwrap();
         let loaded = make_loaded(basic_spec(), tmp.path().to_path_buf());
         let report = CodingTaskProvider.inspect(&loaded, &run_dir).unwrap();
-        // Manifest pre-dates `runId`, so inspect falls back to the dir basename.
+        // Manifest pre-dates `run_id`, so inspect falls back to the dir basename.
         assert_eq!(report.run_id, "run");
         assert_eq!(report.walltime_ms, 12345);
         assert_eq!(report.turns, 0);
         assert_eq!(report.compactions, 0);
     }
 
-    /// Forward-compat: a v2-shaped manifest with `runId` should be returned
+    /// Forward-compat: a v2-shaped manifest with `run_id` should be returned
     /// as-is, not the dir basename.
     #[test]
     fn inspect_uses_run_id_from_manifest() {
@@ -1822,7 +1822,7 @@ not-valid-json
         fs::create_dir_all(&run_dir).unwrap();
         fs::write(
             run_dir.join("manifest.json"),
-            r#"{"schemaVersion":2,"runId":"the-canonical-id","sessionId":"sess-1","durationMs":7000}"#,
+            r#"{"schema_version":2,"run_id":"the-canonical-id","session_id":"sess-1","duration_ms":7000}"#,
         )
         .unwrap();
         let loaded = make_loaded(basic_spec(), tmp.path().to_path_buf());
@@ -1838,7 +1838,7 @@ not-valid-json
         fs::create_dir_all(&run_dir).unwrap();
         fs::write(
             run_dir.join("manifest.json"),
-            r#"{"sessionId":"sess","durationMs":300000}"#,
+            r#"{"session_id":"sess","duration_ms":300000}"#,
         )
         .unwrap();
         // Three prompt.submitted events; two of them carry a unique compactionSummary.
@@ -1873,7 +1873,7 @@ not-valid-json
         fs::write(
             run_dir.join("manifest.json"),
             format!(
-                r#"{{"sessionId":"sess","durationMs":60000,"sandbox":"{}"}}"#,
+                r#"{{"session_id":"sess","duration_ms":60000,"sandbox":"{}"}}"#,
                 sandbox.display()
             ),
         )
@@ -1922,7 +1922,7 @@ not-valid-json
         fs::write(
             run_dir.join("manifest.json"),
             format!(
-                r#"{{"sessionId":"sess","durationMs":60000,"sandbox":"{}"}}"#,
+                r#"{{"session_id":"sess","duration_ms":60000,"sandbox":"{}"}}"#,
                 sandbox.display()
             ),
         )
@@ -1966,7 +1966,7 @@ not-valid-json
         fs::write(
             run_dir.join("manifest.json"),
             format!(
-                r#"{{"sessionId":"sess","durationMs":60000,"sandbox":"{}"}}"#,
+                r#"{{"session_id":"sess","duration_ms":60000,"sandbox":"{}"}}"#,
                 sandbox.display()
             ),
         )
@@ -2006,7 +2006,7 @@ not-valid-json
         fs::write(
             run_dir.join("manifest.json"),
             format!(
-                r#"{{"sessionId":"sess","durationMs":60000,"sandbox":"{}"}}"#,
+                r#"{{"session_id":"sess","duration_ms":60000,"sandbox":"{}"}}"#,
                 sandbox.display()
             ),
         )
@@ -2028,7 +2028,7 @@ not-valid-json
         fs::create_dir_all(&run_dir).unwrap();
         fs::write(
             run_dir.join("manifest.json"),
-            r#"{"sessionId":"x","durationMs":220000}"#,
+            r#"{"session_id":"x","duration_ms":220000}"#,
         )
         .unwrap();
         let mut spec = basic_spec();
