@@ -135,6 +135,21 @@
      they read as history one click away, not current crew. */
   .rglbl.rgdim{margin-top:8px;color:var(--amber-dim)}
   .recentruns{opacity:.55}.recentruns:hover{opacity:1}
+  /* (#691) recent runs as an expandable list — richer + scannable vs cards */
+  .rrlist{border-top:1px solid var(--line);margin-top:2px;max-width:920px}
+  .rr{border-bottom:1px solid var(--line)}
+  .rr>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:12px;padding:8px 6px;font:11px 'JetBrains Mono',monospace}
+  .rr>summary::-webkit-details-marker{display:none}
+  .rr>summary:hover,.rr[open]>summary{background:var(--bg2)}
+  .rr .rrmain{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--text)}
+  .rr .rrmeta{flex-shrink:0;color:var(--muted)}
+  .rr .rrtime{flex-shrink:0;color:var(--amber-dim)}
+  .rr>summary .pill{margin-top:0;flex-shrink:0;min-width:62px;text-align:center}
+  .rrdetail{padding:4px 10px 12px 22px;font:11px 'JetBrains Mono',monospace;color:var(--muted)}
+  .rrdetail .kv{display:flex;gap:10px;margin-top:4px}
+  .rrdetail .kv b{color:var(--text);font-weight:600;min-width:92px;flex-shrink:0}
+  .rrdetail .kv span{min-width:0;word-break:break-all}
+  .rrdetail a{color:var(--amber);cursor:pointer}.rrdetail a:hover{text-decoration:underline}
   .sub h2{font:600 13px 'JetBrains Mono',monospace;letter-spacing:.1em;text-transform:uppercase;color:var(--amber);margin:0 0 4px}
   .sub h2 a{color:var(--amber);text-decoration:underline;cursor:pointer}
   .track{margin:18px 0}.track .lbl{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin-bottom:6px}
@@ -501,6 +516,41 @@ function renderFleet(){
     : `<div class="fleettl"><div class="tlempty">waiting for the first flow record…</div></div>`;
   $("stage").innerHTML=`<div class="fleet">${cards}</div>`+tl;
 }
+// (#691) One expandable row in the recent-runs LIST. Collapsed: status · role ·
+// model · mission · completed-time/duration · turns/tools — scannable, so the
+// operator can tell runs apart. Expanded (<details>, no JS state, survives
+// re-render): the full dispatch info — the start "brief" (runtime/image/prompt/
+// workspace), the terminal result (loud on kill/error), counts, timing, and a
+// drill link. Built from the rich fields the nodeObjs map attached.
+function recentRow(n){
+  const dur=(n.closeTs!=null&&n.startTs!=null)?fmt(n.closeTs-n.startTs):null;
+  const dp=n.donePayload||{}, sp=n.startPayload||{};
+  const turns=dp.total_turns, tools=dp.total_tools, comps=dp.total_compactions;
+  const metaBits=[turns!=null?turns+'t':null,tools!=null?tools+'⚙':null].filter(Boolean).join(' ');
+  const rel=n.closeTs!=null?relAgo(n.closeTs):'';
+  const when=n.closeTs!=null?`${clk(n.closeTs)}${rel?' · '+rel:''}`:'';
+  const miss=n.mission?` · ${n.mission}`:'';
+  const kv=(k,v)=>v!=null&&v!==''?`<div class="kv"><b>${k}</b><span>${v}</span></div>`:'';
+  const exit=dp.exit_code;
+  const result=n.killed?'killed (watchdog timeout)':n.errored?`errored${exit!=null?' (exit '+exit+')':''}`:(dp.result_class||(n.hasStart?'—':'lifecycle not captured'));
+  const about=[sp.runtime?'runtime '+sp.runtime:null,sp.image?'image '+sp.image:null,sp.prompt_chars!=null?sp.prompt_chars+' prompt chars':null].filter(Boolean).join(' · ');
+  const counts=[turns!=null?turns+' turns':null,tools!=null?tools+' tools':null,comps!=null?comps+' compactions':null].filter(Boolean).join(' · ');
+  const timing=n.startTs!=null?`${clk(n.startTs)}${n.closeTs!=null?' → '+clk(n.closeTs)+(dur?' ('+dur+')':''):''}`:'';
+  const detail=[
+    kv('session',`${n.sid} &nbsp;<a onclick="drillSession('${n.sid}')">open →</a>`),
+    n.mission?kv('mission',n.mission+(n.sprint?` · sprint ${n.sprint}`:'')):'',
+    kv('about',about),
+    kv('workspace',sp.workspace),
+    kv('result',`<span class="${n.errored?'wallerr':''}">${result}</span>`),
+    kv('counts',counts),
+    kv('timing',timing),
+  ].filter(Boolean).join("");
+  return `<details class="rr"><summary><span class="pill ${n.pill}">${n.lbl}</span>`
+    +`<span class="rrmain">${n.handle} · ${n.model}${miss}</span>`
+    +`${metaBits?`<span class="rrmeta">${metaBits}</span>`:''}`
+    +`<span class="rrtime">${when}${dur?' · '+dur:''}</span></summary>`
+    +`<div class="rrdetail">${detail}</div></details>`;
+}
 function renderMachine(){
   const m=state.machine; $("logscope").textContent=nameOf(m); state.stageScope=r=>uidOf(r)===m;
   // Always-loaded utility role — resident on every machine, runs alongside the specialists
@@ -569,8 +619,15 @@ function renderMachine(){
       : startTs!=null
         ? `<div class="s tsline">${stamp('started',startTs)}</div>`
         : '';
+    // (#691) Rich fields so the recent-runs LIST can render an expandable row
+    // (collapsed summary + full dispatch info) instead of a shallow card.
+    const donePayload=c?c.payload:null;
+    const errored=!!(c&&dispatchErrored(c)), killed=!!(c&&dispatchKilled(c));
     if(s){
-      return {cls, closeTs, startTs, html:`<div class="node" onclick="drillSession('${sid}')"><div class="h">${s.handle}</div>
+      return {cls, lbl, pill:cls, closeTs, startTs, sid, handle:s.handle, model:s.model||'?',
+        mission:s.mission_id||null, sprint:s.sprint_id||null,
+        startPayload:s.payload||null, donePayload, errored, killed, hasStart:true,
+        html:`<div class="node" onclick="drillSession('${sid}')"><div class="h">${s.handle}</div>
         <div class="s">specialist role · ${s.model||'?'}</div>
         <div class="s">session ${sid} · mission ${s.mission_id}</div>
         ${tsLine}<span class="pill ${cls}">${lbl}</span></div>`};
@@ -584,7 +641,10 @@ function renderMachine(){
     const mission=first.mission_id?`mission ${first.mission_id}`:'no mission scope';
     const fbTs=closeTs??(first.ts?T(first.ts):null);
     const fbLine=fbTs!=null?`<div class="s tsline">${stamp(closeTs!=null?'completed':'seen',fbTs)}</div>`:'';
-    return {cls:'ended', closeTs, startTs:first.ts?T(first.ts):null, html:`<div class="node" onclick="drillSession('${sid}')"><div class="h">${handle}</div>
+    return {cls:'ended', lbl:'no start', pill:'warn', closeTs, startTs:first.ts?T(first.ts):null,
+      sid, handle, model, mission:first.mission_id||null, sprint:null,
+      startPayload:null, donePayload, errored, killed, hasStart:false,
+      html:`<div class="node" onclick="drillSession('${sid}')"><div class="h">${handle}</div>
       <div class="s">role · ${model}</div>
       <div class="s">session ${sid} · ${mission}</div>
       ${fbLine}<span class="pill warn">no dispatch.start</span></div>`};
@@ -600,12 +660,17 @@ function renderMachine(){
   const byRecent=(a,b)=>((b.closeTs??b.startTs??0)-(a.closeTs??a.startTs??0));
   let specs;
   if(liveMode){
+    // Running stay as prominent cards; completed collapse into an expandable
+    // LIST (#691) — each row carries far more than a card (role · model ·
+    // mission · completed-time · duration · turns/tools) and expands to the
+    // full dispatch info so the operator can tell what a run was about and pick
+    // the right one. Newest-first.
     const running=nodeObjs.filter(n=>n.cls==='run').map(n=>n.html).join("");
     const recentObjs=nodeObjs.filter(n=>n.cls!=='run').sort(byRecent);
-    const recent=recentObjs.map(n=>n.html).join("");
+    const recent=recentObjs.map(recentRow).join("");
     const recentCount=recentObjs.length;
     specs=(running||'<span class="hint">no dispatches running right now</span>')
-      +(recentCount?`<div class="rglbl rgdim">recent runs · ${recentCount} today</div><div class="recentruns">${recent}</div>`:'');
+      +(recentCount?`<div class="rglbl rgdim">recent runs · ${recentCount} today</div><div class="rrlist">${recent}</div>`:'');
   } else {
     specs=nodeObjs.slice().sort(byRecent).map(n=>n.html).join("");
   }
