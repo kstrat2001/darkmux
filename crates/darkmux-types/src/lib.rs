@@ -70,9 +70,9 @@ pub struct ProfileModel {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProfileRuntime {
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "configPath")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_path: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "contextTokens")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction: Option<RuntimeCompactionConfig>,
