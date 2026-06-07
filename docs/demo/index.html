@@ -696,20 +696,26 @@ function renderMachine(){
   $("stage").innerHTML=`<div><div class="stagehdr"><a onclick="goFleet()">fleet</a> › machine · ${nameOf(m)}${specOf(m)?' — '+specOf(m):''}</div>
     <div class="rglbl">crew on ${nameOf(m)}</div>${util}${specs||(looseSection?'':'<span class="hint">no specialist runs at this point in the timeline</span>')}${looseSection}</div>`;
 }
-// Drill into the loose-records panel (records on a machine that don't have a
-// session_id — e.g. flow notes, ambient telemetry). Scopes the log to those
-// records so the operator can still inspect them.
+// (#691) Render the loose-records panel — records on a machine that don't have
+// a session_id (flow notes, ambient telemetry). A FIRST-CLASS render path (not
+// just a one-shot in drillLoose) so the live-refresh `render()` re-renders it
+// with the SAME scope predicate: previously `render()` had no `loose` branch
+// and fell through to `renderSubsystem()`, which clobbered `state.stageScope`
+// to `session_id===null` (matches nothing) → the log emptied while the header
+// count still read N. One source (DATA), one scope — now they can't diverge.
+function renderLoose(){
+  const m=state.machine;
+  state.stageScope=r=>uidOf(r)===m&&!r.session_id;
+  $("logscope").textContent=nameOf(m)+" · loose";
+  const n=scoped().length;
+  $("stage").innerHTML=`<div><div class="stagehdr"><a onclick="goFleet()">fleet</a> › <a onclick="drillMachine('${m}')">${nameOf(m)}</a> › unscoped records</div>
+    <div class="rglbl">${n} record(s) without a session — inspect via the log on the right</div></div>`;
+}
+// Drill into the loose-records panel. Sets state then routes through the shared
+// `render()` so landing and every live tick take the identical path.
 function drillLoose(m){
   state.level="loose"; state.machine=m; state.session=null;
-  state.stageScope=r=>uidOf(r)===m&&!r.session_id;
-  // (#691) Auto-select the newest unscoped record so the detail panel shows
-  // something on landing — otherwise the header ("N records — inspect via the
-  // log") contradicts an empty "no event" detail until the next follow-tick.
-  const n=newest(scopedFiltered()); state.selected=n?n._id:null;
-  $("logscope").textContent=nameOf(m)+" · loose";
-  $("stage").innerHTML=`<div><div class="stagehdr"><a onclick="goFleet()">fleet</a> › <a onclick="drillMachine('${m}')">${nameOf(m)}</a> › unscoped records</div>
-    <div class="rglbl">${visible().filter(r=>uidOf(r)===m&&!r.session_id).length} record(s) without a session — inspect via the log on the right</div></div>`;
-  renderLog();renderMeta();syncTransport();
+  render();
 }
 function renderSubsystem(){
   const sid=state.session, m=state.machine; $("logscope").textContent=sid; state.stageScope=r=>r.session_id===sid;
@@ -820,7 +826,7 @@ function syncTransport(){
   $("clock").textContent=fmt(state.t-tMin)+" / "+fmt(tMax-tMin)+"  ·  "+visible().length+"/"+DATA.length+" rec";
 }
 function render(){
-  if(state.level==="mission")renderMission(); else if(state.level==="fleet")renderFleet(); else if(state.level==="machine")renderMachine(); else renderSubsystem();
+  if(state.level==="mission")renderMission(); else if(state.level==="fleet")renderFleet(); else if(state.level==="machine")renderMachine(); else if(state.level==="loose")renderLoose(); else renderSubsystem();
   if(state.follow){ const n=newest(scopedFiltered()); state.selected=n?n._id:null; }
   renderDetail();renderLog();renderCrumb();renderMeta();updateFbtn();
   syncTransport();
@@ -1052,7 +1058,7 @@ function stageSig(){
   const ps=[...LIVE_MACHINES.keys()].sort().join(",");
   if(state.level==="fleet")return "f|"+machines().join(",")+"|"+dis+"|"+ls+"|"+ps;
   if(state.level==="machine")return "m|"+state.machine+"|"+sessionsOn(state.machine).join(",")+"|"+dis+"|"+ls+"|"+ps;
-  if(state.level==="subsystem")return null;
+  if(state.level==="subsystem"||state.level==="loose")return null;  // (#691) live log/metrics views: full-render each tick
   return "mission";
 }
 function applyLive(){
