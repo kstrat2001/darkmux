@@ -147,6 +147,8 @@
   .rr .rrmain{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--text)}
   .rr .rrmeta{flex-shrink:0;color:var(--muted)}
   .rr .rrtime{flex-shrink:0;color:var(--amber-dim)}
+  .rrmore{max-width:920px;text-align:center;padding:8px;cursor:pointer;font:11px 'JetBrains Mono',monospace;color:var(--amber);border-bottom:1px solid var(--line)}
+  .rrmore:hover{background:var(--bg2)}
   .rr>summary .pill{margin-top:0;flex-shrink:0;min-width:62px;text-align:center}
   .rrdetail{padding:4px 10px 12px 22px;font:11px 'JetBrains Mono',monospace;color:var(--muted)}
   .rrdetail .kv{display:flex;gap:10px;margin-top:4px}
@@ -385,7 +387,10 @@ function recompute(){
   FSRC=[...new Set(DATA.map(r=>r.source).filter(Boolean))];
 }
 recompute();
-let state={level:"fleet",machine:null,session:null,t:tMax,playing:false,timer:null,selected:null,follow:true,speed:1,
+// (#691) Default cap on the recent-runs list (newest-first); show-all toggle
+// via state.recentAll. Keeps a busy machine's panel from scrolling unbounded.
+const RECENT_CAP=20;
+let state={level:"fleet",machine:null,session:null,t:tMax,playing:false,timer:null,selected:null,follow:true,speed:1,recentAll:false,
   filters:{cat:new Set(FCATS),tier:new Set(FTIERS),src:new Set(FSRC),q:""}};
 
 const $=id=>document.getElementById(id);
@@ -681,10 +686,18 @@ function renderMachine(){
     // the right one. Newest-first.
     const running=nodeObjs.filter(n=>n.cls==='run').map(n=>n.html).join("");
     const recentObjs=nodeObjs.filter(n=>n.cls!=='run').sort(byRecent);
-    const recent=recentObjs.map(recentRow).join("");
     const recentCount=recentObjs.length;
+    // (#691) Cap the list — a busy machine accumulates unbounded completed runs,
+    // so show the newest RECENT_CAP by default with a show-all/fewer toggle
+    // rather than an ever-growing scroll. state.recentAll persists across live
+    // re-renders; reset on machine entry (drillMachine).
+    const shown=state.recentAll?recentObjs:recentObjs.slice(0,RECENT_CAP);
+    const recent=shown.map(recentRow).join("");
+    const more=recentCount>RECENT_CAP
+      ? `<div class="rrmore" onclick="toggleRecentAll()">${state.recentAll?'show fewer':`show all ${recentCount} →`}</div>`
+      : '';
     specs=(running||'<span class="hint">no dispatches running right now</span>')
-      +(recentCount?`<div class="rglbl rgdim">recent runs · ${recentCount} today</div><div class="rrlist">${recent}</div>`:'');
+      +(recentCount?`<div class="rglbl rgdim">recent runs · ${recentCount} today${state.recentAll||recentCount<=RECENT_CAP?'':` · newest ${RECENT_CAP}`}</div><div class="rrlist">${recent}</div>${more}`:'');
   } else {
     specs=nodeObjs.slice().sort(byRecent).map(n=>n.html).join("");
   }
@@ -859,7 +872,9 @@ function render(){
   renderDetail();renderLog();renderCrumb();renderMeta();updateFbtn();
   syncTransport();
 }
-window.drillMachine=m=>{state.level="machine";state.machine=m;state.session=null;state.follow=true;render();};
+window.drillMachine=m=>{state.level="machine";state.machine=m;state.session=null;state.follow=true;state.recentAll=false;render();};
+// (#691) Expand/collapse the recent-runs list past RECENT_CAP.
+window.toggleRecentAll=()=>{state.recentAll=!state.recentAll;render();};
 window.drillSession=s=>{state.level="subsystem";state.session=s;state.follow=true;render();};
 window.goFleet=()=>{state.level="fleet";state.machine=null;state.session=null;state.follow=true;render();};
 window.goMission=()=>{ if(!missions.length)return goFleet(); state.level="mission";state.machine=null;state.session=null;state.follow=true;render();};
