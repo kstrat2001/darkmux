@@ -877,6 +877,8 @@ pub(crate) fn sprint_review_at(
         compaction: crate::crew::dispatch::CompactionDispatchArgs::default(),
         // (#549) No `--profile` override; fall back to `default_profile`.
         profile_name: None,
+        // (#703) default image.
+        image: None,
     };
 
     // Emit dispatch flow record.

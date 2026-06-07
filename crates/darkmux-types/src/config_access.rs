@@ -226,6 +226,18 @@ pub fn flows_dir() -> std::path::PathBuf {
     )
 }
 
+/// (#703) Host cache dir for the extracted static `darkmux-runtime` binary,
+/// bind-mounted into operator-named images (`crew dispatch --image <tag>`)
+/// so darkmux can inject its agent into ANY Linux image rather than ship a
+/// per-language image catalog. `~/.darkmux/runtime` (HOME-less fallback
+/// `/tmp/darkmux/runtime`). Internal cache — no env/config override tier.
+pub fn runtime_cache_dir() -> std::path::PathBuf {
+    use std::path::PathBuf;
+    dirs::home_dir()
+        .map(|h| h.join(".darkmux").join("runtime"))
+        .unwrap_or_else(|| PathBuf::from("/tmp/darkmux/runtime"))
+}
+
 /// The crew-state directory **override** (`env(DARKMUX_CREW_DIR) >
 /// config.dirs.crew`), or `None` when neither is set. Returns the override only
 /// — the env var points at the directory *containing* the crew subdirs, and it

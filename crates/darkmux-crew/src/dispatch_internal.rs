@@ -55,6 +55,111 @@ fn apply_volume_mounts(cmd: &mut Command, workspace: &Path, host_out: &Path) {
         .arg(format!("{}:/darkmux-out", host_out.display()));
 }
 
+/// (#703) Inject the host-cached static runtime binary into an operator
+/// image: bind-mount it read-only at `/darkmux-runtime` and override the
+/// container entrypoint to it. Used when dispatching into an image OTHER
+/// than the default (which has the binary baked in). MUST be applied after
+/// the volume mounts and before the image arg — `-v` / `--entrypoint` are
+/// docker-run OPTIONS that precede the IMAGE. Unit-testable without docker.
+fn apply_runtime_injection(cmd: &mut Command, binary: &Path) {
+    cmd.arg("-v")
+        .arg(format!("{}:/darkmux-runtime:ro", binary.display()))
+        .arg("--entrypoint")
+        .arg("/darkmux-runtime");
+}
+
+/// (#703) Ensure the static `darkmux-runtime` binary is extracted to the
+/// host cache (`~/.darkmux/runtime/darkmux-runtime`) so it can be
+/// bind-mounted into an arbitrary operator image. On a cache miss, extract
+/// it from the default `RUNTIME_IMAGE` via `docker create` + `docker cp`.
+/// The binary is musl-static, so it runs in any Linux image (verified
+/// against alpine + debian). Returns the cached path.
+///
+/// Staleness: the cache is NOT auto-invalidated — after rebuilding the
+/// runtime image, `rm ~/.darkmux/runtime/darkmux-runtime` to refresh.
+fn ensure_runtime_binary_cached() -> Result<PathBuf> {
+    let dir = darkmux_types::config_access::runtime_cache_dir();
+    let dest = dir.join("darkmux-runtime");
+    if dest.exists() {
+        return Ok(dest);
+    }
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("creating runtime-binary cache dir {}", dir.display()))?;
+
+    // A throwaway container is the standard `docker cp` source; clean it up
+    // unconditionally afterward.
+    let created = Command::new("docker")
+        .args(["create", RUNTIME_IMAGE])
+        .output()
+        .context("docker create (to extract the runtime binary for --image injection)")?;
+    if !created.status.success() {
+        bail!(
+            "docker create {RUNTIME_IMAGE} failed while extracting the runtime binary: {}",
+            String::from_utf8_lossy(&created.stderr).trim()
+        );
+    }
+    let cid = String::from_utf8_lossy(&created.stdout).trim().to_string();
+
+    // Extract to a temp path then atomically rename into place. `docker cp`
+    // is NOT atomic — a partial write must never be left at `dest`, or the
+    // cache-hit check above would hand out a truncated binary on every later
+    // dispatch. The temp is cleaned up on any failure.
+    let tmp = dir.join("darkmux-runtime.partial");
+    let _ = fs::remove_file(&tmp);
+    let tmp_str = tmp.to_str().ok_or_else(|| {
+        anyhow!(
+            "runtime-binary cache temp path is not valid UTF-8: {}",
+            tmp.display()
+        )
+    })?;
+    let cp = Command::new("docker")
+        .args([
+            "cp",
+            &format!("{cid}:/usr/local/bin/darkmux-runtime"),
+            tmp_str,
+        ])
+        .output();
+    // Best-effort cleanup of the throwaway container regardless of cp result.
+    let _ = Command::new("docker").args(["rm", "-f", &cid]).output();
+    let cp = cp.context("docker cp (extracting the runtime binary)")?;
+    if !cp.status.success() {
+        let _ = fs::remove_file(&tmp);
+        bail!(
+            "docker cp of the runtime binary failed: {}",
+            String::from_utf8_lossy(&cp.stderr).trim()
+        );
+    }
+
+    // Ensure it's executable for the bind-mount; clean up the temp on failure
+    // so a non-executable partial is never promoted.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let chmod = (|| -> Result<()> {
+            let mut perms = fs::metadata(&tmp)?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&tmp, perms)?;
+            Ok(())
+        })();
+        if let Err(e) = chmod {
+            let _ = fs::remove_file(&tmp);
+            return Err(e).with_context(|| {
+                format!("chmod extracted runtime binary {}", tmp.display())
+            });
+        }
+    }
+
+    // Atomic publish — only a complete, executable binary ever appears at dest.
+    fs::rename(&tmp, &dest)
+        .with_context(|| format!("publishing runtime binary to {}", dest.display()))?;
+
+    eprintln!(
+        "darkmux crew dispatch: cached runtime binary → {} (from {RUNTIME_IMAGE}, for --image injection)",
+        dest.display()
+    );
+    Ok(dest)
+}
+
 /// (#368) Translate the host-side `CompactionDispatchArgs` into
 /// runtime CLI flags. Each `Some(v)` becomes a `--flag v` pair on
 /// the docker run command; `None` is omitted so the runtime falls
@@ -177,15 +282,32 @@ fn inactivity_timeout_seconds() -> u64 {
 }
 
 pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
+    // (#703) Resolve the dispatch image. Default → the baked slim image
+    // (binary inside). Any other image → INJECT darkmux's static runtime
+    // binary into it (bind-mount + entrypoint override) so the coder runs
+    // in the operator's environment and can compile/test in-sandbox. The
+    // default image is always the binary SOURCE, so pre-flight still
+    // requires it either way.
+    let image = opts
+        .image
+        .clone()
+        .unwrap_or_else(|| RUNTIME_IMAGE.to_string());
+    let inject = image != RUNTIME_IMAGE;
     eprintln!(
-        "darkmux crew dispatch: runtime=internal — image: {RUNTIME_IMAGE}"
+        "darkmux crew dispatch: runtime=internal — image: {image}{}",
+        if inject {
+            " (darkmux-runtime binary injected)"
+        } else {
+            ""
+        }
     );
 
-    // Pre-flight: Docker reachable + runtime image present. The
-    // internal runtime is the default as of the runtime-default flip;
-    // these are the prereqs a new user might not have set up yet. Bail
-    // loud + operator-actionable BEFORE we run the role-load / model-
-    // probe / workspace-setup work below.
+    // Pre-flight: Docker reachable + the default runtime image present (it's
+    // run directly on the default path, and is the binary SOURCE on the
+    // inject path). The internal runtime is the default as of the
+    // runtime-default flip; these are the prereqs a new user might not have
+    // set up yet. Bail loud + operator-actionable BEFORE we run the
+    // role-load / model-probe / workspace-setup work below.
     if !opts.skip_preflight {
         check_docker_preflight()?;
     }
@@ -424,7 +546,15 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // out-of-band bookkeeping). `/darkmux-out` MUST match
     // `runtime::trajectory::RUNTIME_OUT_BASE` — see `apply_volume_mounts`.
     apply_volume_mounts(&mut cmd, &workspace, &host_out);
-    cmd.arg(RUNTIME_IMAGE)
+    // (#703) For a non-default image, inject the host-cached static runtime
+    // binary (bind-mount + entrypoint override) — these are docker-run
+    // OPTIONS and MUST precede the image arg. The default image has the
+    // binary baked in and needs neither.
+    if inject {
+        let binary = ensure_runtime_binary_cached()?;
+        apply_runtime_injection(&mut cmd, &binary);
+    }
+    cmd.arg(&image)
         .arg("run")
         .arg("--model")
         .arg(&model)
@@ -2102,6 +2232,26 @@ mod tests {
                 .iter()
                 .any(|a| a.ends_with(":/workspace") && a.contains("/host/out")),
             "out-dir must not be mounted at /workspace"
+        );
+    }
+
+    #[test]
+    fn apply_runtime_injection_mounts_binary_and_overrides_entrypoint() {
+        // (#703) Injecting into a non-default image: bind the static binary
+        // read-only at /darkmux-runtime and force the entrypoint to it. These
+        // are docker-run OPTIONS (must precede the image arg).
+        let mut cmd = Command::new("docker");
+        apply_runtime_injection(&mut cmd, Path::new("/home/op/.darkmux/runtime/darkmux-runtime"));
+        let args = args_of(&cmd);
+        assert_eq!(
+            args,
+            vec![
+                "-v",
+                "/home/op/.darkmux/runtime/darkmux-runtime:/darkmux-runtime:ro",
+                "--entrypoint",
+                "/darkmux-runtime",
+            ],
+            "binary bound read-only at /darkmux-runtime; entrypoint overridden to it"
         );
     }
 

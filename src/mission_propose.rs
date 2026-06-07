@@ -215,6 +215,8 @@ fn dispatch_compiler(input: &str, hint: Option<&str>) -> Result<String> {
         compaction: crate::crew::dispatch::CompactionDispatchArgs::default(),
         // (#549) No `--profile` override; fall back to `default_profile`.
         profile_name: None,
+        // (#703) default image.
+        image: None,
     };
     let dispatch_result = crate::fleet::dispatch_routed(opts);
 

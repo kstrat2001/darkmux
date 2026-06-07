@@ -333,6 +333,16 @@ pub struct DispatchOpts {
     /// the lab provider (which knows the resolved profile); `None`
     /// everywhere else preserves the default-profile behavior.
     pub profile_name: Option<String>,
+    /// (#703) Override the Docker image the internal runtime dispatches
+    /// into. `None` → the default `darkmux-runtime:latest` (slim base, the
+    /// binary baked in). Set to ANY Linux image (e.g. `rust:slim`, the
+    /// operator's own CI image) and darkmux **injects** its static runtime
+    /// binary into it (bind-mount + entrypoint override) so the coder runs
+    /// in that environment and can compile/test in-sandbox — the inner
+    /// verify loop. No per-language darkmux images. The image needs `bash`
+    /// and coreutils `timeout` (debian/ubuntu-family ship them; bare-alpine
+    /// images need them added — Slice 2). Ignored on the openclaw runtime.
+    pub image: Option<String>,
 }
 
 /// Host-side compaction config passthrough to the internal runtime
@@ -1009,6 +1019,17 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // openclaw path (everything below this branch).
     if opts.runtime == Runtime::Internal {
         return crate::dispatch_internal::dispatch(opts);
+    }
+
+    // (#703) `--image` only applies to the internal runtime (it names the
+    // container darkmux injects into). Warn loud rather than silently ignore
+    // it on the openclaw path — symmetric with the cross-machine warning, and
+    // matches the loud-beats-quiet operator-sovereignty bar.
+    if opts.image.is_some() {
+        eprintln!(
+            "darkmux: warning — `--image` is ignored on `--runtime openclaw`; \
+             it only selects the container for the internal runtime."
+        );
     }
 
     // 0. Pre-flight: nudge the operator if the daemon isn't up. The
