@@ -785,6 +785,9 @@ fn dispatch_via_internal(
         // profile (the CLI `--profile` override when set), not the
         // registry default.
         profile_name: Some(profile_name.to_string()),
+        // (#703) lab dispatches use the default image for now; per-workload
+        // toolchain selection (manifest `toolchain` field) is the follow-on.
+        image: None,
     };
     let result = dispatch(opts).context("internal-runtime dispatch via lab harness")?;
     // `out_dir` is the host path where the runtime wrote its

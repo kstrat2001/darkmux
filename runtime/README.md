@@ -67,6 +67,36 @@ docker run --rm -v "$(pwd):/workspace" darkmux-runtime run \
 
 For routine use, the wrapper is `darkmux crew dispatch <role-id> -m "<message>"` (default runtime — handles role loading, workspace allocation, model probe, and Docker pre-flight).
 
+## Image variants (#703)
+
+The runtime ships in two flavors, selected per dispatch:
+
+| Image | Base | Carries | When |
+|---|---|---|---|
+| `darkmux-runtime:latest` | `alpine:3.20` | Unix toolkit + **python + node** | default; coders edit + verify Python/JS in-sandbox |
+| `darkmux-runtime-rust:latest` | `rust:alpine` | the above **+ the Rust toolchain** (`cargo`/`rustc`) | so a dispatched coder can `cargo check`/`test` its edits **in-sandbox** — the inner verify loop |
+
+Build both at once:
+
+```
+./build-images.sh        # from runtime/ (or ./runtime/build-images.sh from the repo root)
+```
+
+or build a single variant:
+
+```
+docker build -t darkmux-runtime:latest .
+docker build --build-arg RUNTIME_BASE=rust:alpine -t darkmux-runtime-rust:latest .
+```
+
+Select the toolchain variant on a dispatch with `--image`:
+
+```
+darkmux crew dispatch coder --workdir <repo> --image darkmux-runtime-rust:latest -m "..."
+```
+
+The default slim base keeps non-Rust dispatches small; the Rust variant is opt-in because it's a much larger image (~full toolchain). Per-workload image selection via a manifest `toolchain` field is the follow-on.
+
 ## Environment variables
 
 The runtime reads only two env vars directly. Everything else — model, context
@@ -98,7 +128,7 @@ cargo test --release
 
 - Multi-agent parallelism inside one container (single agent loop per invocation today; nothing precludes extending to multiple `--agent` flags + parallel loops sharing the workspace)
 - Audit-chain wiring at the volume-mount boundary
-- Distribution: the image is built locally from this Dockerfile, not pushed to a registry — `docker build -t darkmux-runtime:latest runtime/` from the darkmux repo root is the install step
+- Distribution: images are built locally from this Dockerfile, not pushed to a registry — `./runtime/build-images.sh` from the darkmux repo root builds both the slim base and the Rust variant (or `docker build -t darkmux-runtime:latest runtime/` for just the base)
 
 ## Known gaps post-flip (v0.4)
 

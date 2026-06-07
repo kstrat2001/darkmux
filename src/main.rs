@@ -437,6 +437,16 @@ enum CrewCmd {
         /// dispatches (those are always synchronous).
         #[arg(long)]
         no_wait: bool,
+        /// (#703) Override the Docker image for the internal runtime.
+        /// Default: `darkmux-runtime:latest` (slim — python + node, no
+        /// compiled-language toolchain). Pass a toolchain-bearing variant
+        /// (e.g. `darkmux-runtime-rust:latest`, built via
+        /// `./runtime/build-images.sh`) so the coder can `cargo check`/`test`
+        /// in-sandbox — the inner verify loop. Local dispatch only today:
+        /// ignored on `--runtime openclaw`, and on cross-machine `--machine`
+        /// dispatch (the remote runner uses its own default image — follow-on).
+        #[arg(long, value_name = "TAG")]
+        image: Option<String>,
     },
     /// Reconcile openclaw's `agents.list[]` with the crew role manifests.
     /// For every role with both a JSON manifest and a `.md` prompt, ensures
@@ -2112,6 +2122,7 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
             runtime_cmd,
             machine,
             no_wait,
+            image,
         } => {
             // CLI default: if the operator didn't supply --watch, watch the
             // role's openclaw workspace dir. Library callers (e.g.
@@ -2163,6 +2174,9 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
                 // model selection falls back to the registry's
                 // `default_profile`. The lab path passes the resolved name.
                 profile_name: None,
+                // (#703) operator-selected runtime image (e.g. the rust
+                // toolchain variant) so the coder can verify in-sandbox.
+                image,
             };
             let result = fleet::dispatch_routed(opts)?;
             // Announce the resolved session id on stderr so operators see

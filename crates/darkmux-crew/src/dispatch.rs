@@ -333,6 +333,15 @@ pub struct DispatchOpts {
     /// the lab provider (which knows the resolved profile); `None`
     /// everywhere else preserves the default-profile behavior.
     pub profile_name: Option<String>,
+    /// (#703) Override the Docker image the internal runtime dispatches
+    /// to. `None` → the default `darkmux-runtime:latest` (slim base:
+    /// python + node, NO compiled-language toolchain). Set to a
+    /// toolchain-bearing variant (e.g. `darkmux-runtime-rust:latest`,
+    /// built with `--build-arg RUNTIME_BASE=rust:alpine`) so a dispatched
+    /// coder can `cargo check`/`test` its edits **in-sandbox** — the inner
+    /// verify loop. CLI: `crew dispatch --image <tag>`. Ignored on the
+    /// openclaw runtime path (which doesn't use the container).
+    pub image: Option<String>,
 }
 
 /// Host-side compaction config passthrough to the internal runtime

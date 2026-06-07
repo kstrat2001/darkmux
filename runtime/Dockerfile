@@ -10,6 +10,12 @@
 # workspace boundary — workspace mounts at /workspace, and the binary's
 # path validators reject anything that resolves outside it.
 
+# RUNTIME_BASE — GLOBAL build arg (#703). Declared before the first FROM so
+# it's usable in the runtime stage's `FROM ${RUNTIME_BASE}` below — a
+# stage-local ARG would not reach that FROM. Default = slim alpine; pass
+# `--build-arg RUNTIME_BASE=rust:alpine` for the toolchain-bearing variant.
+ARG RUNTIME_BASE=alpine:3.20
+
 # ─── builder ──────────────────────────────────────────────────────────────
 # rust:alpine pulls the latest stable Rust on Alpine. Pinning to a
 # specific 1.NN-alpine tag caused MSRV-bump issues with transitive deps
@@ -38,7 +44,18 @@ COPY src ./src
 RUN cargo build --release --locked || cargo build --release
 
 # ─── runtime ──────────────────────────────────────────────────────────────
-FROM alpine:3.20
+# RUNTIME_BASE selects the final image base (#703):
+#   alpine:3.20  (default) → slim base; python + node, NO compiled-language
+#                 toolchain. Coders edit + verify Python/JS in-sandbox.
+#   rust:alpine  → adds the Rust toolchain (cargo/rustc) so a dispatched coder
+#                 can `cargo check`/`test` its edits in-sandbox — the inner
+#                 verify loop. Build the variant with:
+#                   docker build --build-arg RUNTIME_BASE=rust:alpine \
+#                     -t darkmux-runtime-rust:latest runtime/
+# Bigger image (~full Rust toolchain) — opt-in per dispatch via `--image`.
+# rust:alpine floats on latest-stable, matching the builder stage above.
+# (RUNTIME_BASE is the global ARG declared at the top of this file.)
+FROM ${RUNTIME_BASE}
 
 # The Unix toolkit agents reach for. Stays small.
 #
@@ -79,6 +96,14 @@ RUN apk add --no-cache \
 # Non-root user. UID 1000 is the convention; matches what a typical
 # host-side macOS user maps to inside Docker for Mac when sharing volumes.
 RUN adduser -D -u 1000 -h /home/darkmux -s /bin/bash darkmux
+
+# (#703) When RUNTIME_BASE=rust:alpine, cargo needs a writable CARGO_HOME for
+# the non-root dispatch user to compile/test in-sandbox. Harmless on the
+# default alpine base (no cargo there). The toolchain binaries stay on PATH
+# (rust:alpine puts /usr/local/cargo/bin on PATH); this only redirects the
+# registry/build cache to a uid-1000-writable dir.
+ENV CARGO_HOME=/home/darkmux/.cargo
+RUN mkdir -p /home/darkmux/.cargo && chown -R darkmux:darkmux /home/darkmux
 
 # Copy the runtime binary from the builder stage.
 COPY --from=builder /build/target/release/darkmux-runtime /usr/local/bin/darkmux-runtime

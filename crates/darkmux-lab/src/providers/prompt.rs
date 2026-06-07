@@ -192,6 +192,8 @@ fn dispatch_via_internal(
         // (#549) No `--profile` override threaded here — fall back to the
         // registry's `default_profile` for model selection.
         profile_name: None,
+        // (#703) default image for now.
+        image: None,
     };
     let result = dispatch(opts).context("internal-runtime dispatch via lab harness")?;
     Ok((result.stdout, result.stderr, result.exit_code == 0))

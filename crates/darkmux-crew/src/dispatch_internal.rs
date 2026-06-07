@@ -177,9 +177,14 @@ fn inactivity_timeout_seconds() -> u64 {
 }
 
 pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
-    eprintln!(
-        "darkmux crew dispatch: runtime=internal — image: {RUNTIME_IMAGE}"
-    );
+    // (#703) Resolve the dispatch image: the default slim base, or an
+    // operator-selected toolchain-bearing variant (`--image`) so the coder
+    // can compile/test in-sandbox (the inner verify loop).
+    let image = opts
+        .image
+        .clone()
+        .unwrap_or_else(|| RUNTIME_IMAGE.to_string());
+    eprintln!("darkmux crew dispatch: runtime=internal — image: {image}");
 
     // Pre-flight: Docker reachable + runtime image present. The
     // internal runtime is the default as of the runtime-default flip;
@@ -187,7 +192,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // loud + operator-actionable BEFORE we run the role-load / model-
     // probe / workspace-setup work below.
     if !opts.skip_preflight {
-        check_docker_preflight()?;
+        check_docker_preflight(&image)?;
     }
 
     // 1. Load the role manifest + .md prompt. The internal runtime uses
@@ -424,7 +429,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // out-of-band bookkeeping). `/darkmux-out` MUST match
     // `runtime::trajectory::RUNTIME_OUT_BASE` — see `apply_volume_mounts`.
     apply_volume_mounts(&mut cmd, &workspace, &host_out);
-    cmd.arg(RUNTIME_IMAGE)
+    cmd.arg(&image)
         .arg("run")
         .arg("--model")
         .arg(&model)
@@ -1517,6 +1522,15 @@ pub enum DockerRuntimeStatus {
 /// presentation decision — callers map the returned status to a bail
 /// (dispatch) or a Warn (doctor).
 pub fn docker_runtime_status() -> DockerRuntimeStatus {
+    docker_runtime_status_for(RUNTIME_IMAGE)
+}
+
+/// Image-aware probe (#703): Docker availability + that the GIVEN image is
+/// built locally. `docker_runtime_status()` is the back-compat wrapper for
+/// the default image (used by `darkmux doctor`); `dispatch()` passes the
+/// resolved `--image` so a missing toolchain variant is caught at pre-flight
+/// rather than mid-dispatch.
+pub fn docker_runtime_status_for(image: &str) -> DockerRuntimeStatus {
     // Step 1: docker binary exists + daemon is reachable.
     match Command::new("docker")
         .args(["version", "--format", "{{.Server.Version}}"])
@@ -1531,11 +1545,11 @@ pub fn docker_runtime_status() -> DockerRuntimeStatus {
         Err(_) => return DockerRuntimeStatus::BinaryMissing,
     }
 
-    // Step 2: runtime image exists locally. `docker images -q <tag>` exits 0
-    // even when the image is missing; the load-bearing signal is empty stdout
+    // Step 2: the selected image exists locally. `docker images -q <tag>` exits
+    // 0 even when the image is missing; the load-bearing signal is empty stdout
     // (no image id printed). Daemon-unreachable cases were caught in Step 1.
     match Command::new("docker")
-        .args(["images", "-q", RUNTIME_IMAGE])
+        .args(["images", "-q", image])
         .output()
     {
         Ok(out) if out.stdout.is_empty() => DockerRuntimeStatus::ImageMissing,
@@ -1550,13 +1564,14 @@ pub fn docker_runtime_status() -> DockerRuntimeStatus {
 /// gets a clean, operator-actionable bail message instead of an
 /// opaque `Command::new("docker")` "No such file or directory" or
 /// a runtime-time "Unable to find image" failure mid-dispatch.
-fn check_docker_preflight() -> Result<()> {
-    preflight_result_for(docker_runtime_status())
+fn check_docker_preflight(image: &str) -> Result<()> {
+    preflight_result_for(docker_runtime_status_for(image), image)
 }
 
 /// Map a probe result to the dispatch-time bail (pure — unit-testable
-/// without Docker on the host).
-fn preflight_result_for(status: DockerRuntimeStatus) -> Result<()> {
+/// without Docker on the host). `image` is named in the ImageMissing
+/// message so a missing toolchain variant points at the right build (#703).
+fn preflight_result_for(status: DockerRuntimeStatus, image: &str) -> Result<()> {
     match status {
         DockerRuntimeStatus::Ready => Ok(()),
         DockerRuntimeStatus::DaemonUnreachable(stderr) => bail!(
@@ -1575,9 +1590,11 @@ fn preflight_result_for(status: DockerRuntimeStatus) -> Result<()> {
              - Re-run with `--runtime openclaw` if you have openclaw installed"
         ),
         DockerRuntimeStatus::ImageMissing => bail!(
-            "darkmux runtime image `{RUNTIME_IMAGE}` not found locally.\n\
-             Build it once from the darkmux repo root:\n  \
-             docker build -t {RUNTIME_IMAGE} runtime/\n\
+            "darkmux runtime image `{image}` not found locally.\n\
+             Build the runtime image(s) once from the darkmux repo root:\n  \
+             ./runtime/build-images.sh          # base + the rust-capable variant\n\
+             or build just this one:\n  \
+             docker build -t {image} runtime/   # add `--build-arg RUNTIME_BASE=rust:alpine` for the rust variant\n\
              (Or use `--runtime openclaw` if you have openclaw installed.)"
         ),
         DockerRuntimeStatus::ProbeError(e) => {
@@ -2016,12 +2033,12 @@ mod tests {
 
     #[test]
     fn preflight_ready_is_ok() {
-        assert!(preflight_result_for(DockerRuntimeStatus::Ready).is_ok());
+        assert!(preflight_result_for(DockerRuntimeStatus::Ready, RUNTIME_IMAGE).is_ok());
     }
 
     #[test]
     fn preflight_binary_missing_bails_with_install_hint() {
-        let msg = preflight_result_for(DockerRuntimeStatus::BinaryMissing)
+        let msg = preflight_result_for(DockerRuntimeStatus::BinaryMissing, RUNTIME_IMAGE)
             .unwrap_err()
             .to_string();
         assert!(msg.contains("isn't on PATH"), "{msg}");
@@ -2030,9 +2047,12 @@ mod tests {
 
     #[test]
     fn preflight_daemon_unreachable_surfaces_stderr_and_start_hint() {
-        let msg = preflight_result_for(DockerRuntimeStatus::DaemonUnreachable(
-            "Cannot connect to the Docker daemon".to_string(),
-        ))
+        let msg = preflight_result_for(
+            DockerRuntimeStatus::DaemonUnreachable(
+                "Cannot connect to the Docker daemon".to_string(),
+            ),
+            RUNTIME_IMAGE,
+        )
         .unwrap_err()
         .to_string();
         assert!(msg.contains("`docker version` failed"), "{msg}");
@@ -2042,7 +2062,7 @@ mod tests {
 
     #[test]
     fn preflight_image_missing_bails_with_build_command() {
-        let msg = preflight_result_for(DockerRuntimeStatus::ImageMissing)
+        let msg = preflight_result_for(DockerRuntimeStatus::ImageMissing, RUNTIME_IMAGE)
             .unwrap_err()
             .to_string();
         assert!(msg.contains("not found locally"), "{msg}");
@@ -2053,9 +2073,22 @@ mod tests {
     }
 
     #[test]
+    fn preflight_image_missing_names_the_selected_image() {
+        // (#703) A missing toolchain variant points at THAT image, not the default.
+        let msg = preflight_result_for(
+            DockerRuntimeStatus::ImageMissing,
+            "darkmux-runtime-rust:latest",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(msg.contains("darkmux-runtime-rust:latest"), "{msg}");
+        assert!(msg.contains("build-images.sh"), "{msg}");
+    }
+
+    #[test]
     fn preflight_probe_error_bails_with_underlying_error() {
         // The one arm whose behavior changed (old `.context(...)?` → `anyhow!`).
-        let msg = preflight_result_for(DockerRuntimeStatus::ProbeError("boom".to_string()))
+        let msg = preflight_result_for(DockerRuntimeStatus::ProbeError("boom".to_string()), RUNTIME_IMAGE)
             .unwrap_err()
             .to_string();
         assert!(msg.contains("running `docker images`"), "{msg}");

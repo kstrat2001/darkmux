@@ -326,6 +326,18 @@ pub fn dispatch_routed(opts: DispatchOpts) -> Result<DispatchResult> {
 /// the audit trail and topology view see the operator-pinned target (#590:
 /// advisory only — any runner may claim).
 fn dispatch_via_queue(opts: DispatchOpts, target_machine: Option<&str>) -> Result<DispatchResult> {
+    // (#703) `--image` is a host-side dispatch override; `WorkJob` carries no
+    // image field yet, so a queued job runs on the *runner's* default image.
+    // Warn loud rather than silently ignore the flag — operator sovereignty
+    // (loud beats quiet). Per-job image selection is the cross-machine
+    // follow-on (a WorkJob wire-shape change).
+    if opts.image.is_some() {
+        eprintln!(
+            "darkmux: warning — `--image` is ignored for cross-machine (`--machine`) \
+             dispatch; the remote runner uses its own default runtime image. \
+             (Per-job image selection over the fleet queue is a follow-on — #703.)"
+        );
+    }
     // The Redis URL is required for cross-machine dispatch. If it's
     // unset, the operator hasn't configured the fleet substrate — bail
     // loud with the fix-it pointer.
