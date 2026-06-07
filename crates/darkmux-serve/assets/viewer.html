@@ -122,6 +122,7 @@
   .node{display:inline-block;width:260px;vertical-align:top;margin:0 24px 24px 0;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px;cursor:pointer}
   .node:hover{border-color:var(--amber-dim)}.node .h{font:600 13px 'JetBrains Mono',monospace}
   .node .s{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin-top:4px}
+  .node .s.tsline{color:var(--amber-dim);margin-top:6px}
   .pill{display:inline-block;font:600 10px 'JetBrains Mono',monospace;padding:2px 7px;border-radius:10px;margin-top:8px}
   .pill.run{background:#16261d;color:var(--good)}.pill.done{background:#1c1c22;color:var(--muted)}.pill.util{background:var(--bg2);color:var(--amber-dim);border:1px solid var(--line)}
   .pill.ended{background:#241a12;color:var(--amber-dim)}
@@ -328,6 +329,13 @@ const MACH_ICON={};
 const T=s=>Date.parse(s);
 const iso=t=>new Date(t).toISOString();
 const fmt=ms=>{ms=Math.max(0,ms);return Math.floor(ms/60000)+":"+String(Math.floor(ms/1000)%60).padStart(2,"0");};
+// (#691) Wall-clock HH:MM:SS (UTC) for a card timestamp line.
+const clk=t=>iso(t).slice(11,19)+"Z";
+// (#691) Coarse relative-time vs the scrubber `state.t` so recent-run cards read
+// "12m ago" without a live ticking clock. Past only (recent runs are completed).
+const relAgo=t=>{const d=state.t-t;if(d<0)return"";const s=Math.floor(d/1000);
+  if(s<60)return"just now";const m=Math.floor(s/60);if(m<60)return m+"m ago";
+  const h=Math.floor(m/60);if(h<24)return h+"h ago";return Math.floor(h/24)+"d ago";};
 // Derived from DATA; recomputed whenever the data source changes (sample <-> real).
 let tMin, tMax, missions, FCATS, FTIERS, FSRC;
 function recompute(){
@@ -523,11 +531,19 @@ function renderMachine(){
     else if(!machAbsent&&liveNow){ cls='run'; lbl='running'; }
     else if(!machAbsent&&closeTs!=null){ cls='run'; lbl='running'; }
     else { cls='ended'; lbl='ended'; }
+    // (#691) Card timestamp line so recent runs are dated + identifiable at a
+    // glance: completed cards show the close time, running cards show start time.
+    const startTs=s?T(s.ts):null;
+    const tsLine=closeTs!=null
+      ? `<div class="s tsline">completed ${clk(closeTs)} · ${relAgo(closeTs)}</div>`
+      : startTs!=null
+        ? `<div class="s tsline">started ${clk(startTs)} · ${relAgo(startTs)}</div>`
+        : '';
     if(s){
-      return {cls, html:`<div class="node" onclick="drillSession('${sid}')"><div class="h">${s.handle}</div>
+      return {cls, closeTs, startTs, html:`<div class="node" onclick="drillSession('${sid}')"><div class="h">${s.handle}</div>
         <div class="s">specialist role · ${s.model||'?'}</div>
         <div class="s">session ${sid} · mission ${s.mission_id}</div>
-        <span class="pill ${cls}">${lbl}</span></div>`};
+        ${tsLine}<span class="pill ${cls}">${lbl}</span></div>`};
     }
     // Fallback: no dispatch.start — pull handle/model/mission from the first
     // record we have for this session, surface honestly that the lifecycle
@@ -536,25 +552,32 @@ function renderMachine(){
     const handle=first.handle||`session ${sid}`;
     const model=first.model||'?';
     const mission=first.mission_id?`mission ${first.mission_id}`:'no mission scope';
-    return {cls:'ended', html:`<div class="node" onclick="drillSession('${sid}')"><div class="h">${handle}</div>
+    const fbTs=closeTs??(first.ts?T(first.ts):null);
+    const fbLine=fbTs!=null?`<div class="s tsline">${closeTs!=null?'completed':'seen'} ${clk(fbTs)} · ${relAgo(fbTs)}</div>`:'';
+    return {cls:'ended', closeTs, startTs:first.ts?T(first.ts):null, html:`<div class="node" onclick="drillSession('${sid}')"><div class="h">${handle}</div>
       <div class="s">role · ${model}</div>
       <div class="s">session ${sid} · ${mission}</div>
-      <span class="pill warn">no dispatch.start</span></div>`};
+      ${fbLine}<span class="pill warn">no dispatch.start</span></div>`};
   });
   // (#691 Slice 2) In live mode, separate RUNNING-now from completed: completed
   // dispatches from earlier today shouldn't sit in the live crew looking
   // current. Running stay prominent; the rest collapse into a dimmed "recent
   // runs" section (still one click to drill / playback). Playback shows all.
   const liveMode=document.body.classList.contains('live-mode');
+  // (#691) Most-recent-first: order completed cards by close time (falling back
+  // to start time) descending, so the operator scans newest → oldest and clicks
+  // the right run without hunting.
+  const byRecent=(a,b)=>((b.closeTs??b.startTs??0)-(a.closeTs??a.startTs??0));
   let specs;
   if(liveMode){
     const running=nodeObjs.filter(n=>n.cls==='run').map(n=>n.html).join("");
-    const recent=nodeObjs.filter(n=>n.cls!=='run').map(n=>n.html).join("");
-    const recentCount=nodeObjs.filter(n=>n.cls!=='run').length;
+    const recentObjs=nodeObjs.filter(n=>n.cls!=='run').sort(byRecent);
+    const recent=recentObjs.map(n=>n.html).join("");
+    const recentCount=recentObjs.length;
     specs=(running||'<span class="hint">no dispatches running right now</span>')
       +(recentCount?`<div class="rglbl rgdim">recent runs · ${recentCount} today</div><div class="recentruns">${recent}</div>`:'');
   } else {
-    specs=nodeObjs.map(n=>n.html).join("");
+    specs=nodeObjs.slice().sort(byRecent).map(n=>n.html).join("");
   }
   // Loose records — records on this machine that don't have a session_id and
   // therefore don't show up in any session card above (flow notes, free-floating
