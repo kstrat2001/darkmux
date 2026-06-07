@@ -160,6 +160,7 @@ mod tests {
     fn profile_with_primary(model_id: &str) -> Profile {
         Profile {
             models: vec![ProfileModel {
+                extras: Default::default(),
                 id: model_id.into(),
                 n_ctx: 100_000,
                 capabilities: Default::default(),
@@ -186,6 +187,7 @@ mod tests {
 
     fn model_with(id: &str, caps: &[(Capability, f32)]) -> ProfileModel {
         ProfileModel {
+            extras: Default::default(),
             id: id.into(),
             n_ctx: 100_000,
             capabilities: caps.iter().cloned().collect(),

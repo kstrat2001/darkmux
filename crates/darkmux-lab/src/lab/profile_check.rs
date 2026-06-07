@@ -86,6 +86,7 @@ mod tests {
 
     fn pm(id: &str, n_ctx: u32) -> ProfileModel {
         ProfileModel {
+            extras: Default::default(),
             id: id.to_string(),
             n_ctx,
             capabilities: Default::default(),
@@ -105,6 +106,7 @@ mod tests {
 
     fn profile(models: Vec<ProfileModel>) -> Profile {
         Profile {
+            extras: Default::default(),
             description: None,
             default_model: None,
             models,

@@ -982,9 +982,11 @@ mod tests {
         profiles.insert(
             "fast".to_string(),
             Profile {
+                extras: Default::default(),
                 description: None,
                 default_model: None,
                 models: vec![ProfileModel {
+                    extras: Default::default(),
                     id: "primary".into(),
                     n_ctx: 32000,
                     capabilities: Default::default(),
@@ -997,16 +999,19 @@ mod tests {
         profiles.insert(
             "balanced".to_string(),
             Profile {
+                extras: Default::default(),
                 description: None,
                 default_model: None,
                 models: vec![
                     ProfileModel {
+                        extras: Default::default(),
                         id: "primary".into(),
                         n_ctx: 101000,
                         capabilities: Default::default(),
                         identifier: None,
                     },
                     ProfileModel {
+                        extras: Default::default(),
                         id: "compactor".into(),
                         n_ctx: 68000,
                         capabilities: Default::default(),
@@ -1020,16 +1025,19 @@ mod tests {
         profiles.insert(
             "deep".to_string(),
             Profile {
+                extras: Default::default(),
                 description: None,
                 default_model: None,
                 models: vec![
                     ProfileModel {
+                        extras: Default::default(),
                         id: "primary".into(),
                         n_ctx: 262144,
                         capabilities: Default::default(),
                         identifier: None,
                     },
                     ProfileModel {
+                        extras: Default::default(),
                         id: "compactor".into(),
                         n_ctx: 120000,
                         capabilities: Default::default(),
@@ -1041,6 +1049,8 @@ mod tests {
             },
         );
         ProfileRegistry {
+            schema_version: None,
+            extras: Default::default(),
             profiles,
             hooks: None,
             default_profile: None,
