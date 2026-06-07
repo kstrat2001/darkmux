@@ -238,6 +238,19 @@ pub fn runtime_cache_dir() -> std::path::PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp/darkmux/runtime"))
 }
 
+/// (#703 Slice 3) Host dir for the shared toolchain build/download cache,
+/// bind-mounted into every dispatch at `/darkmux-cache` so the inner verify
+/// loop doesn't re-download deps each run (cargo registry, npm, pip). The
+/// registry/download caches are concurrency-safe; per-dispatch `target/` stays
+/// in the workspace (so concurrent dispatches don't contend). `~/.darkmux/cache`
+/// (HOME-less fallback `/tmp/darkmux/cache`). Internal cache — no override tier.
+pub fn cache_dir() -> std::path::PathBuf {
+    use std::path::PathBuf;
+    dirs::home_dir()
+        .map(|h| h.join(".darkmux").join("cache"))
+        .unwrap_or_else(|| PathBuf::from("/tmp/darkmux/cache"))
+}
+
 /// The crew-state directory **override** (`env(DARKMUX_CREW_DIR) >
 /// config.dirs.crew`), or `None` when neither is set. Returns the override only
 /// — the env var points at the directory *containing* the crew subdirs, and it

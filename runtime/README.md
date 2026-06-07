@@ -77,7 +77,9 @@ darkmux crew dispatch coder --workdir <repo> --image rust:slim -m "..."
 
 darkmux does **not** ship a catalog of per-language images. Instead it **injects** its agent into the image you name: the static `darkmux-runtime` binary (musl, runs in any Linux image) is extracted once to `~/.darkmux/runtime/` and bind-mounted into your image with the entrypoint overridden. So `--image` accepts *anything* — `rust:slim`, `node:20-bookworm`, **your project's own CI image**, or whatever your `Dockerfile` builds. The model of it: darkmux brings the agent; you bring the environment (the CI-runner / devcontainer pattern).
 
-**Image requirement:** the agent's `bash` tool runs `bash -c` + coreutils `timeout`, so the image needs `bash` + coreutils. Debian/Ubuntu-family images (`*:slim`, `*-bookworm`, most CI images) ship them and work as-is. Bare-alpine images (`rust:alpine`) ship only `sh` — add `bash coreutils` (a portability floor that removes this requirement is a follow-on). After rebuilding the default image, `rm ~/.darkmux/runtime/darkmux-runtime` to refresh the cached binary.
+**Image requirement:** minimal. The agent's `bash` tool prefers `bash` but falls back to `sh` when bash isn't installed, so bare-alpine / busybox images (`rust:alpine`, `*:alpine`) work too — only a POSIX `sh` is required, which every Linux image has. (Truly shell-less distroless images aren't supported.) After rebuilding the default image, `rm ~/.darkmux/runtime/darkmux-runtime` to refresh the cached binary.
+
+**Build cache:** `~/.darkmux/cache` is bind-mounted into every dispatch at `/darkmux-cache`, with `CARGO_HOME` / `npm_config_cache` / `PIP_CACHE_DIR` redirected into it — so the inner verify loop reuses downloaded deps across dispatches. The registry/download caches are concurrency-safe; each dispatch's `target/` stays in its own workspace, so concurrent dispatches don't contend on build artifacts.
 
 `--image` is local-dispatch only today — ignored on `--runtime openclaw` and on cross-machine `--machine` dispatch (the remote runner uses its own image; carrying the image through the fleet queue is a follow-on).
 

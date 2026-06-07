@@ -438,22 +438,23 @@ fn execute_bash(raw_args: &str, workspace_root: &Path) -> Result<String> {
     //
     // If `timeout` fires, exit code is 124 — we surface that marker
     // explicitly in the returned text.
+    let shell = shell_for_commands();
     let output = if has_timeout_command() {
         Command::new("timeout")
             .arg(format!("{timeout_secs}"))
-            .arg("bash")
+            .arg(shell)
             .arg("-c")
             .arg(&args.command)
             .current_dir(workspace_root)
             .output()
     } else {
-        Command::new("bash")
+        Command::new(shell)
             .arg("-c")
             .arg(&args.command)
             .current_dir(workspace_root)
             .output()
     }
-    .with_context(|| format!("spawning bash for: {}", args.command))?;
+    .with_context(|| format!("spawning {shell} for: {}", args.command))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -481,6 +482,30 @@ fn has_timeout_command() -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// (#703 Slice 2) The shell to run agent `bash`-tool commands under. Prefer
+/// `bash` (the default image ships it and most commands assume it), but fall
+/// back to `sh` when bash isn't installed — so darkmux can inject into
+/// bare-alpine / minimal operator images that ship only busybox `sh`. Probed
+/// once via `sh` (which every Linux image has). The agent's tool is named
+/// `bash` regardless; this is just which interpreter actually runs the string.
+fn shell_for_commands() -> &'static str {
+    use std::sync::OnceLock;
+    static SHELL: OnceLock<&'static str> = OnceLock::new();
+    SHELL.get_or_init(|| {
+        let has_bash = Command::new("sh")
+            .arg("-c")
+            .arg("command -v bash >/dev/null 2>&1")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if has_bash {
+            "bash"
+        } else {
+            "sh"
+        }
+    })
 }
 
 // ─── read ─────────────────────────────────────────────────────────────────
