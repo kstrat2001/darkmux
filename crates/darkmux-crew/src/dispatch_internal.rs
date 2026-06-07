@@ -3619,6 +3619,56 @@ mod tests {
 
     #[test]
     #[serial]
+    fn bookend_guard_fires_on_panic_unwind() {
+        // The RAII headline: a panic between start and disarm still bookends
+        // the start. Rust runs Drop on unwind, so the guard emits its
+        // dispatch.error even when the dispatch panics mid-flight (#717).
+        let tmp = TempDir::new().unwrap();
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+
+        // Silence the expected panic backtrace so test output stays clean.
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(|| {
+            let _guard = DispatchBookendGuard {
+                armed: true,
+                role_id: "coder".into(),
+                session_id: "sess-panic".into(),
+                model: "darkmux:qwen3.6".into(),
+                mission_id: Some("pre-1.0-compat-sweep".into()),
+                sprint_id: None,
+            };
+            panic!("simulated mid-dispatch panic");
+        });
+        std::panic::set_hook(prev_hook);
+        assert!(result.is_err(), "the closure should have panicked");
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+
+        let rec = drain_flow_records(tmp.path())
+            .into_iter()
+            .find(|v| v["action"] == "dispatch error")
+            .expect("guard should emit a dispatch.error terminal on panic unwind");
+        assert_eq!(rec["session_id"], "sess-panic");
+        assert_eq!(rec["mission_id"], "pre-1.0-compat-sweep");
+    }
+
+    #[test]
+    #[serial]
     fn handle_event_cycle_emits_telemetry_record() {
         let tmp = TempDir::new().unwrap();
         // SAFETY: serialized via `#[serial]`; no concurrent env reader.
