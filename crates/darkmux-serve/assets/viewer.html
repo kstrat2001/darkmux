@@ -541,7 +541,7 @@ function recentRow(n){
     n.mission?kv('mission',n.mission+(n.sprint?` · sprint ${n.sprint}`:'')):'',
     kv('about',about),
     kv('workspace',sp.workspace),
-    kv('result',`<span class="${n.errored?'wallerr':''}">${result}</span>`),
+    kv('result',`<span class="${(n.errored||n.killed)?'wallerr':''}">${result}</span>`),
     kv('counts',counts),
     kv('timing',timing),
   ].filter(Boolean).join("");
