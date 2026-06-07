@@ -344,6 +344,7 @@ mod tests {
             Some("/tmp/workspace".to_string()),
             None,
             darkmux_crew::dispatch::Runtime::Openclaw,
+            None, // image (#703 Slice 4)
             600,
             Some("studio".to_string()),
             Some("claude-opus-4-7".to_string()),
@@ -369,6 +370,7 @@ mod tests {
             None, // workdir None
             None, // sprint_id None
             darkmux_crew::dispatch::Runtime::Openclaw,
+            None, // image (#703 Slice 4)
             300,
             None, // published_by_machine None
             None, // published_by_orchestrator None
@@ -490,6 +492,7 @@ mod tests {
             None,
             None,
             darkmux_crew::dispatch::Runtime::Openclaw,
+            None, // image (#703 Slice 4)
             600,
             None,
             None,
@@ -574,6 +577,7 @@ mod tests {
             None,
             None,
             darkmux_crew::dispatch::Runtime::Openclaw,
+            None, // image (#703 Slice 4)
             600,
             None,
             None,

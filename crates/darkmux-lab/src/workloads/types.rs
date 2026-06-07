@@ -130,6 +130,12 @@ pub(crate) struct WorkloadSpec {
     pub verify: Option<VerifySpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected: Option<ExpectedSpec>,
+    /// (#703 Slice 4) Docker image this workload should dispatch into. When
+    /// set, darkmux injects its runtime binary into this image so the agent
+    /// can compile/test the workload in-sandbox (e.g. `"rust:slim"` for a
+    /// Rust fixture). `None` → the default slim runtime image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
     /// Provider-specific overflow.
     #[serde(flatten)]
     pub extras: BTreeMap<String, serde_json::Value>,

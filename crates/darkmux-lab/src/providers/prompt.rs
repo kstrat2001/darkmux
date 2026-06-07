@@ -59,7 +59,12 @@ impl WorkloadProvider for PromptProvider {
         let started = std::time::Instant::now();
         let (stdout, stderr, ok) = match runtime {
             darkmux_crew::dispatch::Runtime::Internal => {
-                dispatch_via_internal(&role, &prompt, &session_id)?
+                dispatch_via_internal(
+                    &role,
+                    &prompt,
+                    &session_id,
+                    loaded.manifest.workload.image.as_deref(),
+                )?
             }
             darkmux_crew::dispatch::Runtime::Openclaw => {
                 dispatch_via_openclaw(runtime_cmd, &role, &prompt, &session_id)?
@@ -167,6 +172,7 @@ fn dispatch_via_internal(
     role_id: &str,
     prompt: &str,
     session_id: &str,
+    image: Option<&str>,
 ) -> Result<(String, String, bool)> {
     use darkmux_crew::dispatch::{dispatch, DispatchOpts, Runtime};
     let opts = DispatchOpts {
@@ -192,8 +198,8 @@ fn dispatch_via_internal(
         // (#549) No `--profile` override threaded here — fall back to the
         // registry's `default_profile` for model selection.
         profile_name: None,
-        // (#703) default image.
-        image: None,
+        // (#703 Slice 4) the workload's declared image, if any.
+        image: image.map(str::to_string),
     };
     let result = dispatch(opts).context("internal-runtime dispatch via lab harness")?;
     Ok((result.stdout, result.stderr, result.exit_code == 0))
