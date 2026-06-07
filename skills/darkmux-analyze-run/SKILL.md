@@ -62,7 +62,7 @@ There are four distinct files with overlapping but **non-identical** schemas. Mi
 
 | File | Path template | Authoritative for | NOT authoritative for |
 |---|---|---|---|
-| **Run manifest** | `~/.darkmux/runs/<run-id>/manifest.json` | host's view of the run: `runId`, `workload`, `profile`, `provider`, `sandbox`, `ok`, `durationMs`, `sessionId`, `schemaVersion`. **schemaVersion 3+** adds `final_hash` (post-dispatch sandbox content hash, `blake3:<hex>`); **schemaVersion 4+** adds a `fixture` block (`source_path`, `baseline_hash`) for fixture-backed coding-task runs | per-turn metrics; final assistant text; tool calls |
+| **Run manifest** | `~/.darkmux/runs/<run-id>/manifest.json` | host's view of the run: `run_id`, `workload`, `profile`, `provider`, `sandbox`, `ok`, `duration_ms`, `session_id`, `schema_version`. **schema_version 3+** adds `final_hash` (post-dispatch sandbox content hash, `blake3:<hex>`); **schema_version 4+** adds a `fixture` block (`source_path`, `baseline_hash`) for fixture-backed coding-task runs | per-turn metrics; final assistant text; tool calls |
 | **QA reply** | `~/.darkmux/runs/<run-id>/qa-reply.json` | runtime's JSON envelope: `final_assistant` (string), `metrics.{turns, prompt_tokens, completion_tokens, compactions, wall_ms, total_messages}`, `result` ("stop"/"max_turns"/"escalation_*"/"error"), `trajectory_path` | per-turn breakdown; tool calls; reasoning |
 | **Runtime metrics** | `<sandbox>/.darkmux-runtime/metrics.json` (sandbox path is in manifest.json's `.sandbox`) | aggregate totals using `total_prompt_tokens` / `total_completion_tokens` naming (DIFFERENT from qa-reply's nested `metrics.prompt_tokens`) | history; stale on watchdog-killed dispatches |
 | **Trajectory** | `<sandbox>/.darkmux-runtime/trajectory.jsonl` | event-by-event ground truth. JSONL — one event per line. Source for all derived analyses. | aggregates (derive them yourself) |
@@ -190,7 +190,7 @@ These are the specific names where the schema has evolved or where similar conce
 | `total_prompt_tokens` (at qa-reply top level) | `metrics.prompt_tokens` (nested) | qa-reply.json envelope |
 | `metrics.prompt_tokens` (in runtime metrics.json) | `total_prompt_tokens` (top level) | runtime's `<sandbox>/.darkmux-runtime/metrics.json` — note this is the OPPOSITE nesting from qa-reply.json |
 | `tokens` (anywhere) | `prompt_tokens` + `completion_tokens` + `total_tokens` | always the three-way split; never a single "tokens" field |
-| `wall_ms` (in manifest.json) | `durationMs` (in manifest.json) | manifest uses camelCase; runtime metrics + qa-reply use snake_case |
+| `wall_ms` (in manifest.json) | `duration_ms` (in manifest.json) | manifest uses snake_case; runtime metrics + qa-reply use snake_case |
 | `model.completed.usage.tokens` | `model.completed.usage.{prompt,completion,total}_tokens` | usage is always the three-field object |
 
 If a query returns `null` for a field you expect populated:
@@ -302,7 +302,7 @@ For runs whose workload declared `requires_fixture`, the manifest carries conten
 
 ```bash
 for r in <run-a> <run-b>; do
-  jq -c '{run: .runId, baseline: .fixture.baseline_hash, final: .final_hash}' \
+  jq -c '{run: .run_id, baseline: .fixture.baseline_hash, final: .final_hash}' \
     ~/.darkmux/runs/$r/manifest.json
 done
 ```

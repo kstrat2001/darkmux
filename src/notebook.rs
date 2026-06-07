@@ -268,11 +268,11 @@ fn build_run_data_summary(run_dir: &Path, manifest: &Value) -> Result<String> {
         .and_then(|v| v.as_str())
         .unwrap_or("?");
     let session_id = manifest
-        .get("sessionId")
+        .get("session_id")
         .and_then(|v| v.as_str())
         .unwrap_or("?");
     let duration_ms = manifest
-        .get("durationMs")
+        .get("duration_ms")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
     let ok = manifest
@@ -690,12 +690,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let run_dir = tmp.path();
         let manifest_json = serde_json::json!({
-            "schemaVersion": 1,
+            "schema_version": 1,
             "workload": "quick-q",
             "provider": "prompt",
             "profile": "scribe",
-            "sessionId": "abc-123",
-            "durationMs": 12_000,
+            "session_id": "abc-123",
+            "duration_ms": 12_000,
             "ok": true
         });
         let summary = build_run_data_summary(run_dir, &manifest_json).unwrap();
@@ -717,8 +717,8 @@ mod tests {
             "workload": "quick-q",
             "provider": "prompt",
             "profile": "deep",
-            "sessionId": "s",
-            "durationMs": 8000,
+            "session_id": "s",
+            "duration_ms": 8000,
             "ok": true
         });
         let summary = build_run_data_summary(run_dir, &manifest_json).unwrap();
@@ -739,8 +739,8 @@ mod tests {
             "workload": "quick-q",
             "provider": "prompt",
             "profile": "deep",
-            "sessionId": "s",
-            "durationMs": 1000,
+            "session_id": "s",
+            "duration_ms": 1000,
             "ok": false
         });
         let summary = build_run_data_summary(run_dir, &manifest_json).unwrap();
@@ -759,8 +759,8 @@ mod tests {
             "workload": "long-task",
             "provider": "coding-task",
             "profile": "deep",
-            "sessionId": "x",
-            "durationMs": 200000,
+            "session_id": "x",
+            "duration_ms": 200000,
             "ok": true
         });
         let summary = build_run_data_summary(run_dir, &manifest_json).unwrap();
@@ -783,7 +783,7 @@ mod tests {
         fs::create_dir_all(&runs_dir).unwrap();
         fs::write(
             runs_dir.join("manifest.json"),
-            r#"{"workload":"quick-q","provider":"prompt","profile":"scribe","sessionId":"s","durationMs":5000,"ok":true}"#,
+            r#"{"workload":"quick-q","provider":"prompt","profile":"scribe","session_id":"s","duration_ms":5000,"ok":true}"#,
         )
         .unwrap();
 

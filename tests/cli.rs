@@ -215,7 +215,7 @@ fn lab_run_quick_q_from_clean_cwd_uses_embedded_workload() {
     .success();
 
     // The run dir should exist under .darkmux/runs/<id>/ in the tempdir,
-    // and contain a v2 manifest with the right runId.
+    // and contain a v2 manifest with the right run_id.
     let runs_dir = tmp.path().join(".darkmux").join("runs");
     assert!(
         runs_dir.is_dir(),
@@ -239,14 +239,14 @@ fn lab_run_quick_q_from_clean_cwd_uses_embedded_workload() {
     let manifest: serde_json::Value = serde_json::from_str(&manifest_raw).unwrap();
     // (#487, #489) Phase 2 of the lab cluster: lab/run.rs's
     // enrich_manifest_with_fixture_info adds the `fixture` section
-    // post-provider and bumps schemaVersion to 4. Pre-Phase-1 was v2;
+    // post-provider and bumps schema_version to 4. Pre-Phase-1 was v2;
     // Phase 1 (coding-task only) was v3; Phase 2 brings v4 to ALL
     // providers via the enrich step.
-    assert_eq!(manifest["schemaVersion"].as_u64(), Some(4));
+    assert_eq!(manifest["schema_version"].as_u64(), Some(4));
     assert_eq!(manifest["workload"].as_str(), Some("quick-q"));
     assert_eq!(manifest["provider"].as_str(), Some("prompt"));
     assert_eq!(manifest["profile"].as_str(), Some("deep"));
-    assert_eq!(manifest["runId"].as_str(), Some(run_id.as_str()));
+    assert_eq!(manifest["run_id"].as_str(), Some(run_id.as_str()));
     assert_eq!(manifest["ok"].as_bool(), Some(true));
     // Phase 2 fixture section: for a self-contained workload (quick-q
     // has no source sandbox) BOTH baseline_hash and source_path are
@@ -744,7 +744,7 @@ fn notebook_draft_accepts_role_flag_under_dry_run() {
     fs::create_dir_all(&runs_dir).unwrap();
     fs::write(
         runs_dir.join("manifest.json"),
-        r#"{"workload":"quick-q","provider":"prompt","profile":"scribe","sessionId":"s","durationMs":5000,"ok":true}"#,
+        r#"{"workload":"quick-q","provider":"prompt","profile":"scribe","session_id":"s","duration_ms":5000,"ok":true}"#,
     )
     .unwrap();
 
@@ -776,7 +776,7 @@ fn notebook_draft_runtime_cmd_without_openclaw_bails_loud() {
     fs::create_dir_all(&runs_dir).unwrap();
     fs::write(
         runs_dir.join("manifest.json"),
-        r#"{"workload":"quick-q","provider":"prompt","profile":"scribe","sessionId":"s","durationMs":5000,"ok":true}"#,
+        r#"{"workload":"quick-q","provider":"prompt","profile":"scribe","session_id":"s","duration_ms":5000,"ok":true}"#,
     )
     .unwrap();
 
