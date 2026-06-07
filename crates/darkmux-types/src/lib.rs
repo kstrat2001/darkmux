@@ -49,7 +49,7 @@ pub enum Capability {
 /// capped by the `Capability` variant count).
 pub type CapabilityProfile = BTreeMap<Capability, f32>;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProfileModel {
     pub id: String,
     pub n_ctx: u32,
@@ -66,6 +66,10 @@ pub struct ProfileModel {
     /// nothing scores against it until that slice lands.
     #[serde(default)]
     pub capabilities: CapabilityProfile,
+    /// Forward-compat overflow — unknown keys land here and
+    /// re-serialize flat (a newer config read by an older binary).
+    #[serde(flatten)]
+    pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -297,6 +301,10 @@ pub struct Profile {
     pub runtime: Option<ProfileRuntime>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub use_when: Option<serde_json::Value>,
+    /// Forward-compat overflow — unknown keys land here and
+    /// re-serialize flat (a newer config read by an older binary).
+    #[serde(flatten)]
+    pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
 impl Profile {
@@ -319,6 +327,11 @@ impl Profile {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProfileRegistry {
     pub profiles: BTreeMap<String, Profile>,
+    /// Schema version — additive field/section adds are a minor bump
+    /// (older binaries safely ignore unknown keys via `extras`);
+    /// renaming/retyping a field is major.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hooks: Option<RegistryHooks>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -328,6 +341,10 @@ pub struct ProfileRegistry {
     /// standing infrastructure. (#590)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub internal: Option<RegistryInternal>,
+    /// Forward-compat overflow — unknown top-level keys land here and
+    /// re-serialize flat (a newer config read by an older binary).
+    #[serde(flatten)]
+    pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
 impl ProfileRegistry {
@@ -429,6 +446,7 @@ mod tests {
             n_ctx: 32_000,
             capabilities: Default::default(),
             identifier: Some("alias".to_string()),
+            extras: Default::default(),
         };
         let json = serde_json::to_string(&m).unwrap();
         let back: ProfileModel = serde_json::from_str(&json).unwrap();
@@ -444,6 +462,7 @@ mod tests {
             n_ctx: 1024,
             capabilities: Default::default(),
             identifier: None,
+            extras: Default::default(),
         };
         let json = serde_json::to_string(&m).unwrap();
         assert!(!json.contains("identifier"));
@@ -787,5 +806,66 @@ mod tests {
         assert!(cfg2.custom_instructions.is_none());
         let out2: serde_json::Value = serde_json::to_value(&cfg2).unwrap();
         assert!(!out2.as_object().unwrap().contains_key("custom_instructions"));
+    }
+
+    // ─── ProfileRegistry forward-compat overflow, #694 ──────────────
+
+    /// A default ProfileRegistry serializes to `{"profiles":{}}` and
+    /// round-trips empty — the forward-compat guarantee (mirrors
+    /// `default_round_trips_empty`).
+    #[test]
+    fn registry_default_serializes_empty() {
+        let reg = ProfileRegistry::default();
+        let json = serde_json::to_string(&reg).unwrap();
+        assert_eq!(json, r#"{"profiles":{}}"#);
+        let back: ProfileRegistry = serde_json::from_str(&json).unwrap();
+        assert!(back.profiles.is_empty());
+        assert!(back.schema_version.is_none());
+        assert!(back.hooks.is_none());
+        assert!(back.default_profile.is_none());
+        assert!(back.internal.is_none());
+        assert!(back.extras.is_empty());
+    }
+
+    /// Unknown top-level keys land in `extras` and re-serialize flat —
+    /// a newer config read by an older binary preserves them.
+    #[test]
+    fn registry_unknown_keys_land_in_extras_and_reserialize_flat() {
+        let json = r#"{"profiles":{},"future_knob":7,"nested_future":{"a":1}}"#;
+        let reg: ProfileRegistry = serde_json::from_str(json).unwrap();
+        assert_eq!(reg.profiles.len(), 0);
+        assert_eq!(reg.extras.get("future_knob").and_then(|v| v.as_u64()), Some(7));
+        let out: serde_json::Value = serde_json::to_value(&reg).unwrap();
+        let obj = out.as_object().unwrap();
+        assert!(!obj.contains_key("extras"), "extras must flatten, not nest");
+        assert!(obj.contains_key("future_knob"), "unknown key re-serializes flat");
+    }
+
+    /// Full round-trip preserves typed fields through serialize→parse cycle.
+    #[test]
+    fn registry_full_shape_round_trips() {
+        let json = r#"{"schema_version":"2.0","profiles":{"fast":{"description":"tiny profile","models":[{"id":"model-a","n_ctx":32000}],"default_model":"model-a"}},"hooks":{"pre_swap":[{"command":"echo swap-start","condition":"always"}],"post_swap":[{"command":"echo swap-end"}]},"default_profile":"fast","internal":{"utility":"darkmux:util-4b"},"future_field":true}"#;
+        let reg: ProfileRegistry = serde_json::from_str(json).unwrap();
+        assert_eq!(reg.schema_version.as_deref(), Some("2.0"));
+        assert_eq!(reg.profiles.len(), 1);
+        let p = reg.profiles.get("fast").unwrap();
+        assert_eq!(p.description.as_deref(), Some("tiny profile"));
+        assert_eq!(p.default_model_id(), Some("model-a"));
+        assert_eq!(reg.hooks.as_ref().unwrap().pre_swap.len(), 1);
+        assert_eq!(reg.default_profile.as_deref(), Some("fast"));
+        assert!(reg.internal.is_some());
+        assert_eq!(reg.utility_model_id(), Some("darkmux:util-4b"));
+        assert!(reg.extras.contains_key("future_field"));
+
+        // Re-serialize → parse back — typed fields survive.
+        let round = serde_json::to_string(&reg).unwrap();
+        let back: ProfileRegistry = serde_json::from_str(&round).unwrap();
+        assert_eq!(back.schema_version, reg.schema_version);
+        assert_eq!(back.profiles.len(), 1);
+        let p2 = back.profiles.get("fast").unwrap();
+        assert_eq!(p2.description, p.description);
+        assert_eq!(back.default_profile, reg.default_profile);
+        assert_eq!(back.internal.as_ref().unwrap().utility, reg.internal.as_ref().unwrap().utility);
+        assert!(back.extras.contains_key("future_field"));
     }
 }
