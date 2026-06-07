@@ -106,6 +106,7 @@
   .tltrack{position:relative;flex:1;height:28px;background:var(--panel);border:1px solid var(--line);border-radius:4px;overflow:hidden}
   .sbar{position:absolute;top:5px;height:18px;background:var(--amber-dim);border-radius:3px;min-width:2px}
   .sbar.a{background:var(--amber);box-shadow:0 0 6px var(--amber)}
+  .sbar.err{background:var(--bad)}
   .tltrack .ph{position:absolute;top:0;bottom:0;width:2px;background:var(--text);opacity:.32}
   .tlaxis{margin-left:calc(var(--lname-w,150px) + 12px);display:flex;justify-content:space-between;font:9px 'JetBrains Mono',monospace;color:var(--muted);margin-top:7px}
   .tlempty{font:11px 'JetBrains Mono',monospace;color:var(--muted)}
@@ -129,6 +130,8 @@
   .pill{display:inline-block;font:600 10px 'JetBrains Mono',monospace;padding:2px 7px;border-radius:10px;margin-top:8px}
   .pill.run{background:#16261d;color:var(--good)}.pill.done{background:#1c1c22;color:var(--muted)}.pill.util{background:var(--bg2);color:var(--amber-dim);border:1px solid var(--line)}
   .pill.ended{background:#241a12;color:var(--amber-dim)}
+  .pill.err{background:#2a1416;color:var(--bad)}
+  .wallerr{color:var(--bad);font-weight:600}
   .node.util{cursor:default;border-left:3px solid var(--amber-dim)}.node.util:hover{border-color:var(--line)}
   .rglbl{font:11px 'JetBrains Mono',monospace;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:12px}
   /* (#691 Slice 2) "recent runs" — completed dispatches in live mode, dimmed so
@@ -162,6 +165,7 @@
   .sprow{display:flex;align-items:center;gap:14px;padding:10px 12px;border:1px solid var(--line);border-radius:5px;margin-bottom:7px;background:var(--panel)}
   .sps{font:600 10px 'JetBrains Mono',monospace;text-transform:uppercase;padding:3px 8px;border-radius:10px;min-width:74px;text-align:center}
   .sps.complete{background:#1c1c22;color:var(--muted)}.sps.active{background:#16261d;color:var(--good)}.sps.backlog{background:var(--bg2);color:var(--amber-dim);border:1px solid var(--line)}
+  .sps.errored{background:#2a1416;color:var(--bad)}
   .spt{flex:1;font:12px 'JetBrains Mono',monospace;color:var(--text)}
   .spe{font:11px 'JetBrains Mono',monospace;color:var(--muted)}
   .spa{font:11px 'JetBrains Mono',monospace;color:var(--amber-dim);min-width:190px;text-align:right}
@@ -390,6 +394,14 @@ const specOf=m=>{ if(m==="unknown"){ const ns=[...new Set(DATA.filter(r=>uidOf(r
 const machines=()=>[...new Set([...DATA.map(uidOf), ...LIVE_MACHINES.keys()])];
 const sessionsOn=m=>[...new Set(DATA.filter(r=>uidOf(r)===m&&r.session_id).map(r=>r.session_id))];
 const dispatch=(sid,act)=>DATA.find(r=>r.session_id===sid&&r.action==="dispatch."+act);
+// (#720) A dispatch ends with EITHER a clean `dispatch.complete` or a failed
+// `dispatch.error` (watchdog kill = exit 137, or any non-zero exit). Both are
+// terminal close-edges — the lifecycle pairing must recognize both or a failed
+// run shows "so far" forever and reads as a silent "complete". Returns the
+// terminal record (whichever was emitted); `dispatchErrored` says which.
+const dispatchEnd=sid=>dispatch(sid,"complete")||dispatch(sid,"error");
+const dispatchErrored=rec=>!!rec&&rec.action==="dispatch.error";
+const dispatchKilled=rec=>dispatchErrored(rec)&&((rec.payload&&rec.payload.exit_code)===137);
 // (#647) The reconciler-emitted `session.end` close-edge for an ABANDONED
 // session (crash/kill/timeout — no clean dispatch.complete). Lets playback
 // bracket the running interval where there's no complete to close it.
@@ -430,7 +442,9 @@ function renderMeta(){
 function machActive(m){
   const v=visible();
   const starts=v.filter(r=>uidOf(r)===m&&r.action==="dispatch.start").map(r=>r.session_id);
-  const dones=v.filter(r=>uidOf(r)===m&&r.action==="dispatch.complete").map(r=>r.session_id);
+  // (#720) A run is done when it reached EITHER terminal — without counting
+  // `dispatch.error`, a killed run keeps its machine "active" forever.
+  const dones=v.filter(r=>uidOf(r)===m&&(r.action==="dispatch.complete"||r.action==="dispatch.error")).map(r=>r.session_id);
   return starts.some(s=>!dones.includes(s));
 }
 // (#638 Slice 3) Is machine `m` PRESENT at the scrubber time `state.t`?
@@ -471,10 +485,11 @@ function renderFleet(){
   const lanes=ms.map(m=>{
     const bars=sessionsOn(m).map(sid=>{
       const s=dispatch(sid,"start"); if(!s||T(s.ts)>state.t)return"";
-      const c=dispatch(sid,"complete"), done=c&&T(c.ts)<=state.t;
+      const c=dispatchEnd(sid), done=c&&T(c.ts)<=state.t;
+      const err=done&&dispatchErrored(c);
       const end=done?T(c.ts):state.t, L=pct(T(s.ts)), W=Math.max(0.6,pct(end)-L);
       const role=(s.handle||"").replace(/^darkmux\//,"");
-      return `<div class="sbar ${done?'':'a'}" style="left:${L}%;width:${W}%" title="${role} · ${sid}${done?'':' · in flight'}"></div>`;
+      return `<div class="sbar ${done?(err?'err':''):'a'}" style="left:${L}%;width:${W}%" title="${role} · ${sid}${done?(err?(dispatchKilled(c)?' · killed (timeout)':' · errored'):''):' · in flight'}"></div>`;
     }).join("");
     return `<div class="lane"><div class="lname" title="${nameOf(m)}">${nameOf(m)}</div><div class="tltrack">${bars}<div class="ph" style="left:${pct(state.t)}%"></div></div></div>`;
   }).join("");
@@ -526,14 +541,26 @@ function renderMachine(){
     //   else started, no close evidence, not live      → "ended"
     //        (crashed before the reconciler shipped, or capture truncated —
     //         honest default; never a phantom "running")
-    const c=dispatch(sid,"complete"), e=sessEnd(sid);
+    // (#720) `dispatchEnd` finds EITHER terminal (clean complete or
+    // error/killed); without the error edge a failed run never closes here.
+    const c=dispatchEnd(sid), e=sessEnd(sid);
     const closeCands=[c&&T(c.ts), e&&T(e.ts)].filter(x=>x);
     const closeTs=closeCands.length?Math.min(...closeCands):null;
     const closedBy=closeTs!=null&&closeTs<=state.t;
-    const cleanClose=c&&T(c.ts)===closeTs;            // complete is the (or tied) earliest close
+    const cleanClose=c&&T(c.ts)===closeTs&&!dispatchErrored(c);  // clean complete is the (or tied) earliest close
+    const errClose=c&&T(c.ts)===closeTs&&dispatchErrored(c);     // failed/killed terminal closed it
+    // (#720) Caveat: closeTs = min(terminal, session.end). If a redundant
+    // session.end lands EARLIER than the error terminal, both cleanClose and
+    // errClose are false → renders 'ended', masking 'killed'. Same min()-masking
+    // the clean path already has; suppressed in practice because the session
+    // emitter's stop() pre-claims session-end on the normal return path
+    // regardless of exit code. Only leaks on a Redis-outage-spans-TTL window.
     const liveNow=LIVE_SESSIONS.has(sid);
     let cls,lbl;
-    if(closedBy){ cls=cleanClose?'done':'ended'; lbl=cleanClose?'complete':'ended'; }
+    if(closedBy){
+      if(errClose){ cls='err'; lbl=dispatchKilled(c)?'killed':'errored'; }
+      else { cls=cleanClose?'done':'ended'; lbl=cleanClose?'complete':'ended'; }
+    }
     else if(!machAbsent&&liveNow){ cls='run'; lbl='running'; }
     else if(!machAbsent&&closeTs!=null){ cls='run'; lbl='running'; }
     else { cls='ended'; lbl='ended'; }
@@ -618,12 +645,19 @@ function renderSubsystem(){
   const dets=tel.filter(r=>r.source==="detector");
   const loads=lms.filter(r=>r.fields.event==="load");
   const distinct=[...new Set(loads.map(r=>r.fields.model))];
-  const d=dispatch(sid,"start"), c=dispatch(sid,"complete"), done=c&&T(c.ts)<=state.t;
+  const d=dispatch(sid,"start"), c=dispatchEnd(sid), done=c&&T(c.ts)<=state.t;
   const turns=rt?rt.fields.turns:"—";
   const cx=tel.filter(r=>r.source==="context").slice().sort((a,b)=>T(a.ts)-T(b.ts));
   const comps=tel.filter(r=>r.source==="compaction");
   const nctx=cx.length?cx[0].fields.max:0, ctxPeak=cx.length?Math.max(...cx.map(r=>r.fields.used)):0;
-  const wall=done?fmt(T(c.ts)-T(d.ts)):fmt(state.t-T(d.ts))+" so far";
+  // (#720) Surface a failed/killed terminal LOUDLY — a watchdog kill or
+  // non-zero exit must read as such, never a silent "complete" or eternal
+  // "so far". `wallLoud` is the red qualifier appended to the wall time.
+  const wallBase=done?fmt(T(c.ts)-T(d.ts)):fmt(state.t-T(d.ts))+" so far";
+  const wallLoud=done&&dispatchErrored(c)
+    ? `<span class="wallerr"> · ${dispatchKilled(c)?'killed (timeout)':'errored'+((c.payload&&c.payload.exit_code!=null)?' (exit '+c.payload.exit_code+')':'')}</span>`
+    : '';
+  const wall=wallBase+wallLoud;
   const met=`<div class="metrics">
     <div class="met"><div class="mv">${turns}</div><div class="ml">turns</div></div>
     <div class="met"><div class="mv">${nctx?(ctxPeak/1000).toFixed(0)+"k":"—"}</div><div class="ml">peak ctx / ${nctx?(nctx/1000)+"k window":"—"}</div><div class="tokbar"><span style="width:${nctx?Math.round(ctxPeak/nctx*100):0}%"></span></div></div>
@@ -730,18 +764,25 @@ function renderMission(){
   DATA.filter(r=>r.mission_id===mid&&typeof r.action==="string"&&r.action.indexOf("dispatch")===0&&r.action.indexOf("start")>-1)
       .forEach(r=>{ if(r.session_id&&!starts[r.session_id])starts[r.session_id]=r; });
   const sessions=Object.keys(starts).map(sid=>{
-    const st=starts[sid], cp=dispatch(sid,"complete");
-    const started=T(st.ts)<=state.t, complete=cp&&T(cp.ts)<=state.t;
+    const st=starts[sid], cp=dispatchEnd(sid);
+    const started=T(st.ts)<=state.t, ended=cp&&T(cp.ts)<=state.t;
+    // (#720) A failed/killed terminal is still an ENDED dispatch — surface it as
+    // `errored`, not stuck in `active` (which read as "so far" before).
+    const status=!started?"backlog":(ended?(dispatchErrored(cp)?"errored":"complete"):"active");
     return {role:(st.handle||"").replace(/^darkmux\//,""), machine:nameOf(uidOf(st)),
-            model:st.model||"?", status:!started?"backlog":(complete?"complete":"active"), ts:T(st.ts)};
+            model:st.model||"?", status, ts:T(st.ts)};
   }).sort((a,b)=>a.ts-b.ts);
   const total=sessions.length, done=sessions.filter(s=>s.status==="complete").length, active=sessions.filter(s=>s.status==="active").length;
+  // (#720) Surface failed/killed dispatches in the rollup too — per-row is
+  // already loud (red `errored` chip); without this the burndown summary
+  // silently drops them from the narrative.
+  const errored=sessions.filter(s=>s.status==="errored").length;
   const pct=total?Math.round(done/total*100):0;
   const machs=[...new Set(sessions.map(s=>s.machine))];
   const rows=sessions.map(s=>`<div class="sprow"><span class="sps ${s.status}">${s.status}</span><span class="spt">${s.role} · ${s.machine}</span><span class="spa">${s.model}</span></div>`).join("")||`<div class="none">no dispatches at this point in the timeline</div>`;
   $("stage").innerHTML=`<div class="sub"><h2>mission · ${mid}</h2>
     <div class="mgoal">${total} dispatch${total===1?'':'es'} across ${machs.length} machine${machs.length===1?'':'s'}${machs.length?' · '+machs.join(', '):''}</div>
-    <div class="burn"><div class="burnbar"><span style="width:${pct}%"></span></div><div class="burnlbl">${done}/${total} dispatches complete · ${pct}%${active?' · '+active+' in flight':''}</div></div>
+    <div class="burn"><div class="burnbar"><span style="width:${pct}%"></span></div><div class="burnlbl">${done}/${total} dispatches complete · ${pct}%${active?' · '+active+' in flight':''}${errored?` · <span class="wallerr">${errored} errored</span>`:''}</div></div>
     <div class="track"><div class="lbl">dispatches</div>${rows}</div></div>`;
 }
 // Re-engage auto-tracking AND snap the playhead to the live tail. Used by the
@@ -823,6 +864,11 @@ function flowToRenderModel(records){
     const o={...r};
     if(o.action==="dispatch start")o.action="dispatch.start";
     if(o.action==="dispatch complete")o.action="dispatch.complete";
+    // (#720) The third terminal: a failed/watchdog-killed dispatch emits
+    // "dispatch error" (exit!=0; watchdog kill = exit 137). Normalize it to a
+    // DISTINCT dotted form (not collapsed into complete) so the lifecycle
+    // closes the run AND the failure stays loud downstream.
+    if(o.action==="dispatch error")o.action="dispatch.error";
     if(o.tier)o.tier=String(o.tier).toLowerCase();
     if(o.payload&&!o.fields)o.fields=o.payload;
     // dispatch.compaction → a compaction telemetry record (the subsystem's
@@ -914,7 +960,7 @@ function setBadges(mode,date){
 // destroy a card the operator is about to click (same hazard the playback timer
 // guards against). Subsystem is a metrics view with no cards → always full-render.
 function stageSig(){
-  const v=visible(), dis=v.filter(r=>r.action==="dispatch.start"||r.action==="dispatch.complete"||r.action==="session.end").length;
+  const v=visible(), dis=v.filter(r=>r.action==="dispatch.start"||r.action==="dispatch.complete"||r.action==="dispatch.error"||r.action==="session.end").length;
   // Fold the live-session set in: a session going live / ageing out is a
   // lifecycle change that must re-render the cards (so the "running"↔"ended"
   // pill flips), same as a dispatch.start/complete / session.end edge arriving
