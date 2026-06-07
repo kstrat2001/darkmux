@@ -68,6 +68,23 @@ fn apply_runtime_injection(cmd: &mut Command, binary: &Path) {
         .arg("/darkmux-runtime");
 }
 
+/// (#703 Slice 3) Mount the shared toolchain cache at `/darkmux-cache` and
+/// point the language package managers at it, so the inner verify loop doesn't
+/// re-download deps on every dispatch. The registry/download caches are
+/// concurrency-safe; per-dispatch `target/` stays in the workspace, so
+/// concurrent dispatches don't contend on build artifacts. Docker-run OPTIONS
+/// (must precede the image arg). Unit-testable without docker.
+fn apply_cache_mount(cmd: &mut Command, cache: &Path) {
+    cmd.arg("-v")
+        .arg(format!("{}:/darkmux-cache", cache.display()))
+        .arg("-e")
+        .arg("CARGO_HOME=/darkmux-cache/cargo")
+        .arg("-e")
+        .arg("npm_config_cache=/darkmux-cache/npm")
+        .arg("-e")
+        .arg("PIP_CACHE_DIR=/darkmux-cache/pip");
+}
+
 /// (#703) Ensure the static `darkmux-runtime` binary is extracted to the
 /// host cache (`~/.darkmux/runtime/darkmux-runtime`) so it can be
 /// bind-mounted into an arbitrary operator image. On a cache miss, extract
@@ -546,6 +563,12 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // out-of-band bookkeeping). `/darkmux-out` MUST match
     // `runtime::trajectory::RUNTIME_OUT_BASE` — see `apply_volume_mounts`.
     apply_volume_mounts(&mut cmd, &workspace, &host_out);
+    // (#703 Slice 3) Mount the shared toolchain cache so the inner verify loop
+    // doesn't re-download deps each run. Best-effort dir create; if it fails
+    // the mount still works (docker creates the source) — just uncached.
+    let cache = darkmux_types::config_access::cache_dir();
+    let _ = fs::create_dir_all(&cache);
+    apply_cache_mount(&mut cmd, &cache);
     // (#703) For a non-default image, inject the host-cached static runtime
     // binary (bind-mount + entrypoint override) — these are docker-run
     // OPTIONS and MUST precede the image arg. The default image has the
@@ -2252,6 +2275,30 @@ mod tests {
                 "/darkmux-runtime",
             ],
             "binary bound read-only at /darkmux-runtime; entrypoint overridden to it"
+        );
+    }
+
+    #[test]
+    fn apply_cache_mount_binds_cache_and_points_package_managers_at_it() {
+        // (#703 Slice 3) Shared toolchain cache mounted at /darkmux-cache with
+        // CARGO_HOME / npm / pip env redirected so the inner loop reuses
+        // downloads across dispatches.
+        let mut cmd = Command::new("docker");
+        apply_cache_mount(&mut cmd, Path::new("/home/op/.darkmux/cache"));
+        let args = args_of(&cmd);
+        assert_eq!(
+            args,
+            vec![
+                "-v",
+                "/home/op/.darkmux/cache:/darkmux-cache",
+                "-e",
+                "CARGO_HOME=/darkmux-cache/cargo",
+                "-e",
+                "npm_config_cache=/darkmux-cache/npm",
+                "-e",
+                "PIP_CACHE_DIR=/darkmux-cache/pip",
+            ],
+            "cache bound at /darkmux-cache; cargo/npm/pip caches redirected into it"
         );
     }
 
