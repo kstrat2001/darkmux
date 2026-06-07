@@ -390,14 +390,15 @@ const sessEnd=sid=>DATA.find(r=>r.session_id===sid&&r.action==="session.end");
 // "+N" so the title never sprawls. Playback isn't presence-scoped (LIVE_SESSIONS
 // is empty there) — it shows the window's missions, also capped.
 // (#691) Live-scoped missions — present-now, not the whole window. In live
-// mode, prefer missions with a currently-live session (∈ LIVE_SESSIONS); if
-// none are running, the most recent (DATA is ts-sorted → last is newest). In
+// mode, ONLY missions with a currently-live session (∈ LIVE_SESSIONS). When
+// nothing is running, return empty → the title reads "—" and the crumb drops
+// the mission link, rather than surfacing a stale old mission with no current
+// activity (the "◆ m6 → empty mission detail" bug from the first cut). In
 // playback, the window's missions (LIVE_SESSIONS is empty there).
 function liveScopedMissions(){
   if(!missions.length) return [];
   if(document.body.classList.contains('live-mode')){
-    const live = missions.filter(mid => DATA.some(r => r.mission_id===mid && LIVE_SESSIONS.has(r.session_id)));
-    return live.length ? live : [missions[missions.length-1]];
+    return missions.filter(mid => DATA.some(r => r.mission_id===mid && LIVE_SESSIONS.has(r.session_id)));
   }
   return missions;
 }
@@ -658,8 +659,12 @@ function renderCrumb(){
   // Mission crumb only when the loaded data actually has a mission. Lab/dispatch
   // playback (no mission_id) starts at fleet. (Live mission/sprint detail is a
   // follow-up seam — /missions + /sprints; MISSION stays the sample fixture.)
-  const hasMission=missions.length>0;
-  let c=hasMission?`<a class="misslink" onclick="goMission()">◆ ${primaryMission()}</a>`:``;
+  // (#691) Gate on the live-SCOPED mission, not the global count — in live mode
+  // with nothing running, primaryMission() is null and the crumb drops the
+  // mission link (no stale "◆ m6"). Playback: primaryMission()=missions[0].
+  const pm=primaryMission();
+  const hasMission=pm!=null;
+  let c=hasMission?`<a class="misslink" onclick="goMission()">◆ ${pm}</a>`:``;
   if(state.level!=="mission"){
     c+=(hasMission?`<span class="sep">›</span>`:``)+`<a onclick="goFleet()">fleet</a>`;
     if(state.level==="machine"||state.level==="subsystem") c+=`<span class="sep">›</span><a onclick="drillMachine('${state.machine}')">${state.machine}</a>`;
