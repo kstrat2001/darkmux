@@ -178,6 +178,8 @@ fn dispatch_compiler(input: &str, hint: Option<&str>) -> Result<String> {
         "mission-compiler",
         &synth_session_id,
         None,
+        None,
+        None,
         Some(compile_start_payload),
     ));
     let compile_start_instant = std::time::Instant::now();
@@ -241,6 +243,8 @@ fn dispatch_compiler(input: &str, hint: Option<&str>) -> Result<String> {
         action,
         "mission-compiler",
         &synth_session_id,
+        None,
+        None,
         None,
         Some(compile_complete_payload),
     ));

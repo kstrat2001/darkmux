@@ -434,6 +434,15 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         )
     });
 
+    // (#714) Resolve the sprint → mission once so every flow record this
+    // dispatch emits (start / turn / tool / compaction / complete / telemetry)
+    // carries `mission_id`/`sprint_id` and groups under its mission in the
+    // observability view. Best-effort: None when this isn't a sprint-bound
+    // dispatch. The router (dispatch.rs) returns here before its own sprint
+    // wiring, so the internal path resolves it directly from `opts`.
+    let mission_id = crate::dispatch::resolve_mission_for_sprint(opts.sprint_id.as_deref());
+    let sprint_id = opts.sprint_id.clone();
+
     // 4. Workspace resolution. Two paths (#206):
     //
     //    a) `--workdir <path>` → mount operator's chosen path at
@@ -512,6 +521,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         &opts.role_id,
         &session_id,
         Some(&model),
+        mission_id.as_deref(),
+        sprint_id.as_deref(),
         Some(dispatch_start_payload),
     ));
     let dispatch_start_instant = std::time::Instant::now();
@@ -720,6 +731,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         let session_id = session_id.clone();
         let role_id = opts.role_id.clone();
         let model = model.clone();
+        let mission_id = mission_id.clone();
+        let sprint_id = sprint_id.clone();
         let inactivity_deadline = Arc::clone(&inactivity_deadline);
         thread::spawn(move || {
             run_tailer(
@@ -727,6 +740,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
                 session_id,
                 role_id,
                 model,
+                mission_id,
+                sprint_id,
                 stop,
                 inactivity_deadline,
                 inactivity_secs,
@@ -810,9 +825,19 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         let role_id = opts.role_id.clone();
         let session_id = session_id.clone();
         let model = model.clone();
+        let mission_id = mission_id.clone();
+        let sprint_id = sprint_id.clone();
         let container_name = container_name.clone();
         thread::spawn(move || {
-            run_telemetry_sampler(sampler_stop, role_id, session_id, model, container_name)
+            run_telemetry_sampler(
+                sampler_stop,
+                role_id,
+                session_id,
+                model,
+                mission_id,
+                sprint_id,
+                container_name,
+            )
         })
     };
 
@@ -899,6 +924,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         &opts.role_id,
         &session_id,
         Some(&model),
+        mission_id.as_deref(),
+        sprint_id.as_deref(),
         Some(dispatch_complete_payload),
     ));
 
@@ -914,6 +941,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         &opts.role_id,
         &session_id,
         Some(&model),
+        mission_id.as_deref(),
+        sprint_id.as_deref(),
         serde_json::json!({ "turns": trajectory_summary.turns }),
     ));
 
@@ -987,6 +1016,7 @@ const MAX_REASONING_TEXT_BYTES: usize = 256 * 1024;
 /// the tailer writes a new deadline to it each time a `compaction`
 /// trajectory event lands. `inactivity_secs` is the timeout window
 /// used to compute the new deadline (`now + inactivity_secs`).
+#[allow(clippy::too_many_arguments)]
 fn run_tailer(
     // Host path mounted into the container at `/darkmux-out` — where the
     // runtime writes its `.darkmux-runtime/trajectory.jsonl`. SEPARATE
@@ -996,6 +1026,8 @@ fn run_tailer(
     session_id: String,
     role_id: String,
     model: String,
+    mission_id: Option<String>,
+    sprint_id: Option<String>,
     stop_flag: Arc<AtomicBool>,
     inactivity_deadline: Arc<Mutex<Instant>>,
     inactivity_secs: u64,
@@ -1010,7 +1042,8 @@ fn run_tailer(
         model,
         inactivity_deadline,
         inactivity_secs,
-    );
+    )
+    .with_mission(mission_id, sprint_id);
 
     loop {
         state.poll_and_emit();
@@ -1063,6 +1096,8 @@ fn run_telemetry_sampler(
     role_id: String,
     session_id: String,
     model: String,
+    mission_id: Option<String>,
+    sprint_id: Option<String>,
     container_name: String,
 ) {
     let emit = |source: &str, action: &str, payload: serde_json::Value| {
@@ -1073,6 +1108,8 @@ fn run_telemetry_sampler(
             &role_id,
             &session_id,
             Some(&model),
+            mission_id.as_deref(),
+            sprint_id.as_deref(),
             payload,
         ));
     };
@@ -1191,6 +1228,11 @@ struct TailerState {
     session_id: String,
     role_id: String,
     model: String,
+    /// (#714) Mission/sprint this dispatch belongs to (when sprint-bound),
+    /// stamped onto every per-event flow record so they group under the
+    /// mission in the observability view. `None` for a one-off dispatch.
+    mission_id: Option<String>,
+    sprint_id: Option<String>,
     last_heartbeat_at: Option<Instant>,
     summary: TrajectorySummary,
     /// (#457) Shared with the watchdog thread. Tailer writes a new
@@ -1218,11 +1260,23 @@ impl TailerState {
             session_id,
             role_id,
             model,
+            mission_id: None,
+            sprint_id: None,
             last_heartbeat_at: None,
             summary: TrajectorySummary::default(),
             inactivity_deadline: Some(inactivity_deadline),
             inactivity_secs,
         }
+    }
+
+    /// (#714) Stamp the sprint → mission this dispatch belongs to so the
+    /// per-event flow records group under the mission. Builder-style so the
+    /// `new`/`new_for_test` call sites (incl. unit tests) stay unchanged;
+    /// only the production `run_tailer` opts in.
+    fn with_mission(mut self, mission_id: Option<String>, sprint_id: Option<String>) -> Self {
+        self.mission_id = mission_id;
+        self.sprint_id = sprint_id;
+        self
     }
 
     /// Test-only constructor — no inactivity-deadline plumbing. Used by
@@ -1242,6 +1296,8 @@ impl TailerState {
             session_id,
             role_id,
             model,
+            mission_id: None,
+            sprint_id: None,
             last_heartbeat_at: None,
             summary: TrajectorySummary::default(),
             inactivity_deadline: None,
@@ -1497,6 +1553,8 @@ impl TailerState {
             &self.role_id,
             &self.session_id,
             Some(&self.model),
+            self.mission_id.as_deref(),
+            self.sprint_id.as_deref(),
             Some(payload),
         ));
     }
@@ -1513,6 +1571,8 @@ impl TailerState {
             &self.role_id,
             &self.session_id,
             Some(&self.model),
+            self.mission_id.as_deref(),
+            self.sprint_id.as_deref(),
             payload,
         ));
     }
@@ -3849,6 +3909,24 @@ mod tests {
             "test-role".into(),
             "test-model".into(),
         )
+    }
+
+    #[test]
+    fn tailer_state_with_mission_stamps_fields() {
+        // (#714) The production tailer chains `.with_mission(...)` so every
+        // per-event flow record it emits carries the dispatch's mission/sprint
+        // and groups under the mission in the observability view. Default
+        // (test/one-off) is None.
+        let tmp = TempDir::new().unwrap();
+        let bare = fixture_state(tmp.path().join("t.jsonl"));
+        assert!(bare.mission_id.is_none() && bare.sprint_id.is_none());
+
+        let stamped = fixture_state(tmp.path().join("t.jsonl")).with_mission(
+            Some("pre-1.0-compat-sweep".into()),
+            Some("s694-profiles-schema".into()),
+        );
+        assert_eq!(stamped.mission_id.as_deref(), Some("pre-1.0-compat-sweep"));
+        assert_eq!(stamped.sprint_id.as_deref(), Some("s694-profiles-schema"));
     }
 
     #[test]

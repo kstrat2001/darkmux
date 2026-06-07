@@ -860,6 +860,24 @@ fn augment_message_with_sprint_context(
 /// Returns the path written when persistence happened, `None`
 /// otherwise. Errors are logged but don't fail the dispatch itself —
 /// best-effort for downstream sprints.
+/// (#714) Resolve a sprint's mission so every dispatch flow record can be
+/// stamped with `mission_id` and group under its mission in the observability
+/// view. `None` when there's no `--sprint-id` or the sprint manifest can't be
+/// loaded — best-effort metadata, never a reason to fail the dispatch.
+pub(crate) fn resolve_mission_for_sprint(sprint_id: Option<&str>) -> Option<String> {
+    let sprint_id = sprint_id?;
+    match crate::lifecycle::load_sprint_by_id(sprint_id) {
+        Ok(s) => Some(s.mission_id),
+        Err(_) => {
+            eprintln!(
+                "darkmux crew dispatch: sprint `{sprint_id}` not found; \
+                 flow records won't carry a mission_id."
+            );
+            None
+        }
+    }
+}
+
 fn persist_sprint_output(sprint_id: Option<&str>, reply_text: &str) -> Option<PathBuf> {
     let sprint_id = sprint_id?;
     if reply_text.trim().is_empty() {
@@ -1128,6 +1146,12 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // config is edited mid-dispatch. Non-fatal: None on failure.
     let resolved_model = resolve_dispatch_model(&agent_id);
 
+    // (#714) Resolve the sprint → mission once so every flow record this
+    // dispatch emits carries `mission_id`/`sprint_id` and groups under its
+    // mission in the observability view. Best-effort: None when not sprint-bound.
+    let dispatch_mission_id = resolve_mission_for_sprint(opts.sprint_id.as_deref());
+    let dispatch_sprint_id = opts.sprint_id.as_deref();
+
     // Flow emission: dispatch_start lands on disk before openclaw is
     // even invoked, so the viewer sees the local-tier event the instant
     // we begin. Pairs with the dispatch_complete / dispatch_error
@@ -1149,6 +1173,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         &opts.role_id,
         &resolved_session_id,
         resolved_model.as_deref(),
+        dispatch_mission_id.as_deref(),
+        dispatch_sprint_id,
         Some(dispatch_start_payload),
     ));
 
@@ -1202,6 +1228,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         &opts.role_id,
         &resolved_session_id,
         resolved_model.as_deref(),
+        dispatch_mission_id.as_deref(),
+        dispatch_sprint_id,
         Some(dispatch_complete_payload),
     ));
 
@@ -1322,12 +1350,15 @@ pub fn emit_route_record_and_resolve_session(
         .clone()
         .unwrap_or_else(|| fresh_session_id(&opts.role_id));
     let payload = build_route_payload(target_machine);
+    let mission_id = resolve_mission_for_sprint(opts.sprint_id.as_deref());
     let _ = darkmux_flow::record(build_dispatch_record_with_payload(
         darkmux_flow::Level::Info,
         "dispatch route",
         &opts.role_id,
         &session_id,
         None,
+        mission_id.as_deref(),
+        opts.sprint_id.as_deref(),
         Some(payload),
     ));
     session_id
@@ -1403,19 +1434,22 @@ pub fn build_dispatch_record(
     session_id: &str,
     model: Option<&str>,
 ) -> darkmux_flow::FlowRecord {
-    build_dispatch_record_with_payload(level, action, role_id, session_id, model, None)
+    build_dispatch_record_with_payload(level, action, role_id, session_id, model, None, None, None)
 }
 
 /// Same as `build_dispatch_record` but with an explicit `payload` for
 /// event-specific fields (#204). The richer dispatch events (turn,
 /// tool, compaction, reasoning) use this directly; the bare
 /// `build_dispatch_record` wrapper preserves the legacy call shape.
+#[allow(clippy::too_many_arguments)]
 pub fn build_dispatch_record_with_payload(
     level: darkmux_flow::Level,
     action: &str,
     role_id: &str,
     session_id: &str,
     model: Option<&str>,
+    mission_id: Option<&str>,
+    sprint_id: Option<&str>,
     payload: Option<serde_json::Value>,
 ) -> darkmux_flow::FlowRecord {
     darkmux_flow::FlowRecord {
@@ -1426,12 +1460,12 @@ pub fn build_dispatch_record_with_payload(
         stage: darkmux_flow::Stage::Dispatch,
         action: action.to_string(),
         handle: role_id.to_string(),
-        sprint_id: None,
+        sprint_id: sprint_id.map(String::from),
         session_id: Some(session_id.to_string()),
         source: Some("crew_dispatch".to_string()),
         model: model.map(String::from),
         reasoning: None,
-        mission_id: None,
+        mission_id: mission_id.map(String::from),
         machine_id: None,
         machine_uid: None,
         orchestrator: None,
@@ -1449,6 +1483,7 @@ pub fn build_dispatch_record_with_payload(
 /// observability viewer can discriminate telemetry sub-streams. The
 /// `payload` carries the instrument-specific fields (the viewer aliases
 /// the wire `payload` to `fields` client-side).
+#[allow(clippy::too_many_arguments)]
 pub fn build_telemetry_record(
     level: darkmux_flow::Level,
     action: &str,
@@ -1456,6 +1491,8 @@ pub fn build_telemetry_record(
     role_id: &str,
     session_id: &str,
     model: Option<&str>,
+    mission_id: Option<&str>,
+    sprint_id: Option<&str>,
     payload: serde_json::Value,
 ) -> darkmux_flow::FlowRecord {
     darkmux_flow::FlowRecord {
@@ -1466,12 +1503,12 @@ pub fn build_telemetry_record(
         stage: darkmux_flow::Stage::Dispatch,
         action: action.to_string(),
         handle: role_id.to_string(),
-        sprint_id: None,
+        sprint_id: sprint_id.map(String::from),
         session_id: Some(session_id.to_string()),
         source: Some(source.to_string()),
         model: model.map(String::from),
         reasoning: None,
-        mission_id: None,
+        mission_id: mission_id.map(String::from),
         machine_id: None,
         machine_uid: None,
         orchestrator: None,
@@ -1909,6 +1946,8 @@ mod tests {
             "coder",
             "sess-1",
             Some("darkmux:qwen3.6"),
+            None,
+            None,
             payload.clone(),
         );
 
@@ -1935,6 +1974,8 @@ mod tests {
             "detector",
             "coder",
             "sess-1",
+            None,
+            None,
             None,
             serde_json::json!({ "kind": "cycle", "severity": "warn", "detail": "x" }),
         );
@@ -2922,9 +2963,10 @@ mod tests {
         assert!(matches!(rec.tier, darkmux_flow::Tier::Local));
         assert!(matches!(rec.stage, darkmux_flow::Stage::Dispatch));
         assert!(matches!(rec.category, darkmux_flow::Category::Work));
-        // sprint_id is None for dispatch records — crew dispatch is a
-        // lower-level concept than sprint, so the dispatcher doesn't
-        // assume a sprint context. The viewer joins via session_id.
+        // The bare `build_dispatch_record` wrapper carries no mission/sprint
+        // (it's the legacy/test call shape). A real sprint-bound dispatch goes
+        // through `_with_payload` with the resolved mission/sprint (#714); the
+        // viewer joins via session_id either way.
         assert!(rec.sprint_id.is_none());
         // ts is set to a non-empty UTC datetime string.
         assert!(!rec.ts.is_empty());
@@ -2950,6 +2992,69 @@ mod tests {
             !json.contains("\"model\""),
             "absent field should serialize away: {json}"
         );
+    }
+
+    #[test]
+    fn dispatch_record_with_payload_stamps_mission_and_sprint() {
+        // (#714) A sprint-bound dispatch threads its mission/sprint onto
+        // every flow record so the observability view groups the dispatch
+        // under its mission. The viewer keys the mission crumb/panel on
+        // `mission_id`; without this the records were ungrouped.
+        let rec = build_dispatch_record_with_payload(
+            darkmux_flow::Level::Info,
+            "dispatch start",
+            "coder",
+            "crew-dispatch-coder-99-internal",
+            Some("darkmux:qwen3.6"),
+            Some("pre-1.0-compat-sweep"),
+            Some("s694-profiles-schema"),
+            None,
+        );
+        assert_eq!(rec.mission_id.as_deref(), Some("pre-1.0-compat-sweep"));
+        assert_eq!(rec.sprint_id.as_deref(), Some("s694-profiles-schema"));
+    }
+
+    #[test]
+    fn dispatch_record_with_payload_omits_mission_when_not_sprint_bound() {
+        // A one-off dispatch (no --sprint-id) carries neither field — they
+        // serialize away (skip_serializing_if), so old viewers and the
+        // ungrouped-session rendering are untouched.
+        let rec = build_dispatch_record_with_payload(
+            darkmux_flow::Level::Info,
+            "dispatch start",
+            "coder",
+            "crew-dispatch-coder-99-internal",
+            Some("darkmux:qwen3.6"),
+            None,
+            None,
+            None,
+        );
+        assert!(rec.mission_id.is_none());
+        assert!(rec.sprint_id.is_none());
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(
+            !json.contains("mission_id") && !json.contains("sprint_id"),
+            "absent mission/sprint should serialize away: {json}"
+        );
+    }
+
+    #[test]
+    fn telemetry_record_with_payload_stamps_mission_and_sprint() {
+        // Telemetry siblings (runtime turns, CPU samples, detector events)
+        // group under the mission too — same wire as the work records.
+        let rec = build_telemetry_record(
+            darkmux_flow::Level::Info,
+            "telemetry.runtime",
+            "runtime",
+            "coder",
+            "sess-1",
+            Some("darkmux:qwen3.6"),
+            Some("pre-1.0-compat-sweep"),
+            Some("s694-profiles-schema"),
+            serde_json::json!({ "turns": 9 }),
+        );
+        assert_eq!(rec.mission_id.as_deref(), Some("pre-1.0-compat-sweep"));
+        assert_eq!(rec.sprint_id.as_deref(), Some("s694-profiles-schema"));
     }
 
     #[test]
