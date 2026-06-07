@@ -339,6 +339,9 @@ const clk=t=>iso(t).slice(11,19)+"Z";
 const relAgo=t=>{const d=state.t-t;if(d<0)return"";const s=Math.floor(d/1000);
   if(s<60)return"just now";const m=Math.floor(s/60);if(m<60)return m+"m ago";
   const h=Math.floor(m/60);if(h<24)return h+"h ago";return Math.floor(h/24)+"d ago";};
+// (#691) "<clock> · <rel ago>", dropping the separator when rel is empty (a
+// running card scrubbed to before its start in playback yields no relative).
+const stamp=(verb,t)=>{const r=relAgo(t);return `${verb} ${clk(t)}${r?' · '+r:''}`;};
 // Derived from DATA; recomputed whenever the data source changes (sample <-> real).
 let tMin, tMax, missions, FCATS, FTIERS, FSRC;
 function recompute(){
@@ -538,9 +541,9 @@ function renderMachine(){
     // glance: completed cards show the close time, running cards show start time.
     const startTs=s?T(s.ts):null;
     const tsLine=closeTs!=null
-      ? `<div class="s tsline">completed ${clk(closeTs)} · ${relAgo(closeTs)}</div>`
+      ? `<div class="s tsline">${stamp('completed',closeTs)}</div>`
       : startTs!=null
-        ? `<div class="s tsline">started ${clk(startTs)} · ${relAgo(startTs)}</div>`
+        ? `<div class="s tsline">${stamp('started',startTs)}</div>`
         : '';
     if(s){
       return {cls, closeTs, startTs, html:`<div class="node" onclick="drillSession('${sid}')"><div class="h">${s.handle}</div>
@@ -556,7 +559,7 @@ function renderMachine(){
     const model=first.model||'?';
     const mission=first.mission_id?`mission ${first.mission_id}`:'no mission scope';
     const fbTs=closeTs??(first.ts?T(first.ts):null);
-    const fbLine=fbTs!=null?`<div class="s tsline">${closeTs!=null?'completed':'seen'} ${clk(fbTs)} · ${relAgo(fbTs)}</div>`:'';
+    const fbLine=fbTs!=null?`<div class="s tsline">${stamp(closeTs!=null?'completed':'seen',fbTs)}</div>`:'';
     return {cls:'ended', closeTs, startTs:first.ts?T(first.ts):null, html:`<div class="node" onclick="drillSession('${sid}')"><div class="h">${handle}</div>
       <div class="s">role · ${model}</div>
       <div class="s">session ${sid} · ${mission}</div>
