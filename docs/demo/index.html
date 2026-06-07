@@ -549,6 +549,12 @@ function renderMachine(){
     const closedBy=closeTs!=null&&closeTs<=state.t;
     const cleanClose=c&&T(c.ts)===closeTs&&!dispatchErrored(c);  // clean complete is the (or tied) earliest close
     const errClose=c&&T(c.ts)===closeTs&&dispatchErrored(c);     // failed/killed terminal closed it
+    // (#720) Caveat: closeTs = min(terminal, session.end). If a redundant
+    // session.end lands EARLIER than the error terminal, both cleanClose and
+    // errClose are false → renders 'ended', masking 'killed'. Same min()-masking
+    // the clean path already has; suppressed in practice because the session
+    // emitter's stop() pre-claims session-end on the normal return path
+    // regardless of exit code. Only leaks on a Redis-outage-spans-TTL window.
     const liveNow=LIVE_SESSIONS.has(sid);
     let cls,lbl;
     if(closedBy){
@@ -767,12 +773,16 @@ function renderMission(){
             model:st.model||"?", status, ts:T(st.ts)};
   }).sort((a,b)=>a.ts-b.ts);
   const total=sessions.length, done=sessions.filter(s=>s.status==="complete").length, active=sessions.filter(s=>s.status==="active").length;
+  // (#720) Surface failed/killed dispatches in the rollup too — per-row is
+  // already loud (red `errored` chip); without this the burndown summary
+  // silently drops them from the narrative.
+  const errored=sessions.filter(s=>s.status==="errored").length;
   const pct=total?Math.round(done/total*100):0;
   const machs=[...new Set(sessions.map(s=>s.machine))];
   const rows=sessions.map(s=>`<div class="sprow"><span class="sps ${s.status}">${s.status}</span><span class="spt">${s.role} · ${s.machine}</span><span class="spa">${s.model}</span></div>`).join("")||`<div class="none">no dispatches at this point in the timeline</div>`;
   $("stage").innerHTML=`<div class="sub"><h2>mission · ${mid}</h2>
     <div class="mgoal">${total} dispatch${total===1?'':'es'} across ${machs.length} machine${machs.length===1?'':'s'}${machs.length?' · '+machs.join(', '):''}</div>
-    <div class="burn"><div class="burnbar"><span style="width:${pct}%"></span></div><div class="burnlbl">${done}/${total} dispatches complete · ${pct}%${active?' · '+active+' in flight':''}</div></div>
+    <div class="burn"><div class="burnbar"><span style="width:${pct}%"></span></div><div class="burnlbl">${done}/${total} dispatches complete · ${pct}%${active?' · '+active+' in flight':''}${errored?` · <span class="wallerr">${errored} errored</span>`:''}</div></div>
     <div class="track"><div class="lbl">dispatches</div>${rows}</div></div>`;
 }
 // Re-engage auto-tracking AND snap the playhead to the live tail. Used by the
