@@ -679,14 +679,19 @@ function renderMachine(){
   // telemetry, anything written outside a dispatch). Surface them as a count
   // with a click-through so the operator can still inspect them.
   const loose=visible().filter(r=>uidOf(r)===m&&!r.session_id);
-  const looseCard=loose.length
-    ? `<div class="node" onclick="drillLoose('${m}')"><div class="h">unscoped records</div>
+  // (#691) Unscoped records get their OWN section with a header, not an extra
+  // card tacked onto the crew — they're a different KIND of thing (records
+  // without a dispatch session: flow notes, ambient telemetry), so they read
+  // better as a separate block than as a sibling of the role cards.
+  const looseSection=loose.length
+    ? `<div class="rglbl rgdim">unscoped records · ${loose.length} today</div>
+        <div class="node" onclick="drillLoose('${m}')"><div class="h">unscoped records</div>
         <div class="s">${loose.length} record${loose.length===1?'':'s'} without a session</div>
         <div class="s">flow notes, ambient telemetry, etc.</div>
         <span class="pill">loose</span></div>`
     : '';
   $("stage").innerHTML=`<div><div class="stagehdr"><a onclick="goFleet()">fleet</a> › machine · ${nameOf(m)}${specOf(m)?' — '+specOf(m):''}</div>
-    <div class="rglbl">crew on ${nameOf(m)}</div>${util}${specs}${looseCard||(specs?'':'<span class="hint">no specialist runs at this point in the timeline</span>')}</div>`;
+    <div class="rglbl">crew on ${nameOf(m)}</div>${util}${specs||(looseSection?'':'<span class="hint">no specialist runs at this point in the timeline</span>')}${looseSection}</div>`;
 }
 // Drill into the loose-records panel (records on a machine that don't have a
 // session_id — e.g. flow notes, ambient telemetry). Scopes the log to those
