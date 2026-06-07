@@ -298,6 +298,56 @@ fn inactivity_timeout_seconds() -> u64 {
     darkmux_types::config_access::inactivity_timeout_seconds()
 }
 
+/// (#717) Bookend guard for the internal dispatch lifecycle. Once
+/// `dispatch.start` is emitted, the dispatch can still `?`-return before the
+/// clean `dispatch.complete` (runtime-binary extraction, container spawn, or
+/// `wait_with_output` failing) — or panic. Without a terminal record that
+/// leaves an orphaned start; since #714 stamped `mission_id` on it, the
+/// orphan now groups under its mission and would render as perpetually
+/// in-flight. This guard fires a `dispatch.error` terminal record on `Drop`
+/// unless `disarm`ed, so every start has a matching terminal event. The clean
+/// path (and the container-ran-but-failed path, which already emits its own
+/// `dispatch.error`) calls `disarm()` after that emit, so the guard never
+/// double-counts a dispatch that reached its own terminal record.
+struct DispatchBookendGuard {
+    armed: bool,
+    role_id: String,
+    session_id: String,
+    model: String,
+    mission_id: Option<String>,
+    sprint_id: Option<String>,
+}
+
+impl DispatchBookendGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DispatchBookendGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Best-effort, same as every other emit on this path: a flow-sink
+        // write problem must not mask the original error propagating out.
+        let _ = darkmux_flow::record(crate::dispatch::build_dispatch_record_with_payload(
+            darkmux_flow::Level::Error,
+            "dispatch error",
+            &self.role_id,
+            &self.session_id,
+            Some(&self.model),
+            self.mission_id.as_deref(),
+            self.sprint_id.as_deref(),
+            Some(serde_json::json!({
+                "runtime": "internal",
+                "result_class": "error",
+                "error": "dispatch terminated before completion (early return or panic)",
+            })),
+        ));
+    }
+}
+
 pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // (#703) Resolve the dispatch image. Default → the baked slim image
     // (binary inside). Any other image → INJECT darkmux's static runtime
@@ -525,6 +575,17 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         sprint_id.as_deref(),
         Some(dispatch_start_payload),
     ));
+    // (#717) Arm the bookend guard: from here, any `?`-return or panic before
+    // the clean `dispatch.complete` below emits a `dispatch.error` terminal so
+    // the start is never left orphaned (and mission-grouped-but-in-flight).
+    let mut bookend = DispatchBookendGuard {
+        armed: true,
+        role_id: opts.role_id.clone(),
+        session_id: session_id.clone(),
+        model: model.clone(),
+        mission_id: mission_id.clone(),
+        sprint_id: sprint_id.clone(),
+    };
     let dispatch_start_instant = std::time::Instant::now();
 
     // (#638) Session liveness heartbeat. While THIS dispatch process lives,
@@ -928,6 +989,10 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         sprint_id.as_deref(),
         Some(dispatch_complete_payload),
     ));
+    // (#717) Terminal record emitted (clean complete, or the container-ran-
+    // but-failed `dispatch.error` above) — disarm so the guard doesn't emit a
+    // second terminal on the function's normal return.
+    bookend.disarm();
 
     // (#557 slice 2) Per-dispatch runtime-turns telemetry. A telemetry
     // sibling of the dispatch.complete record above carrying just the
@@ -3445,6 +3510,163 @@ mod tests {
     /// tempdir and reading the day-file back observes exactly the record
     /// `handle_event` → `emit_telemetry` → `darkmux_flow::record` wrote.
     /// `#[serial]` guards the shared env var (other flow tests mutate it).
+    /// (#717) Read every flow record the default sink wrote to a tempdir
+    /// day-file. Shared helper for the bookend-guard tests below.
+    fn drain_flow_records(dir: &std::path::Path) -> Vec<serde_json::Value> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.extension().and_then(|x| x.to_str()) == Some("jsonl")
+                    && p.file_name().and_then(|n| n.to_str()) != Some("trajectory.jsonl")
+            })
+            .flat_map(|p| std::fs::read_to_string(&p).unwrap_or_default().into_bytes())
+            .collect::<Vec<u8>>()
+            .split(|&b| b == b'\n')
+            .filter_map(|l| serde_json::from_slice::<serde_json::Value>(l).ok())
+            .collect()
+    }
+
+    #[test]
+    #[serial]
+    fn bookend_guard_armed_emits_dispatch_error_on_drop() {
+        // An armed guard dropped without disarming (the `?`-return / panic
+        // path) emits a `dispatch.error` terminal carrying the same mission
+        // so the orphaned start is bookended + stays grouped (#717/#714).
+        let tmp = TempDir::new().unwrap();
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+
+        {
+            let _guard = DispatchBookendGuard {
+                armed: true,
+                role_id: "coder".into(),
+                session_id: "sess-orphan".into(),
+                model: "darkmux:qwen3.6".into(),
+                mission_id: Some("pre-1.0-compat-sweep".into()),
+                sprint_id: Some("s694".into()),
+            };
+            // drop here (end of scope) — no disarm
+        }
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+
+        let rec = drain_flow_records(tmp.path())
+            .into_iter()
+            .find(|v| v["action"] == "dispatch error")
+            .expect("armed guard should emit a dispatch.error terminal on drop");
+        assert_eq!(rec["session_id"], "sess-orphan");
+        assert_eq!(rec["mission_id"], "pre-1.0-compat-sweep");
+        assert_eq!(rec["sprint_id"], "s694");
+        assert_eq!(rec["payload"]["result_class"], "error");
+    }
+
+    #[test]
+    #[serial]
+    fn bookend_guard_disarmed_emits_nothing_on_drop() {
+        // The happy path (and container-ran-but-failed path) disarm after
+        // their own terminal record — the guard must then stay silent so the
+        // dispatch isn't double-counted.
+        let tmp = TempDir::new().unwrap();
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+
+        {
+            let mut guard = DispatchBookendGuard {
+                armed: true,
+                role_id: "coder".into(),
+                session_id: "sess-clean".into(),
+                model: "darkmux:qwen3.6".into(),
+                mission_id: None,
+                sprint_id: None,
+            };
+            guard.disarm();
+        }
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+
+        let emitted = drain_flow_records(tmp.path())
+            .into_iter()
+            .any(|v| v["action"] == "dispatch error");
+        assert!(!emitted, "disarmed guard must not emit any terminal record");
+    }
+
+    #[test]
+    #[serial]
+    fn bookend_guard_fires_on_panic_unwind() {
+        // The RAII headline: a panic between start and disarm still bookends
+        // the start. Rust runs Drop on unwind, so the guard emits its
+        // dispatch.error even when the dispatch panics mid-flight (#717).
+        let tmp = TempDir::new().unwrap();
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+
+        // Silence the expected panic backtrace so test output stays clean.
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(|| {
+            let _guard = DispatchBookendGuard {
+                armed: true,
+                role_id: "coder".into(),
+                session_id: "sess-panic".into(),
+                model: "darkmux:qwen3.6".into(),
+                mission_id: Some("pre-1.0-compat-sweep".into()),
+                sprint_id: None,
+            };
+            panic!("simulated mid-dispatch panic");
+        });
+        std::panic::set_hook(prev_hook);
+        assert!(result.is_err(), "the closure should have panicked");
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+
+        let rec = drain_flow_records(tmp.path())
+            .into_iter()
+            .find(|v| v["action"] == "dispatch error")
+            .expect("guard should emit a dispatch.error terminal on panic unwind");
+        assert_eq!(rec["session_id"], "sess-panic");
+        assert_eq!(rec["mission_id"], "pre-1.0-compat-sweep");
+    }
+
     #[test]
     #[serial]
     fn handle_event_cycle_emits_telemetry_record() {
