@@ -1329,6 +1329,7 @@ mod tests {
             requires_fixture: None,
             verify: None,
             expected: None,
+            image: None,
             extras: BTreeMap::new(),
         }
     }
