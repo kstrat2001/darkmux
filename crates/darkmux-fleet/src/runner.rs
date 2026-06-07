@@ -248,6 +248,9 @@ impl WorkJob {
             // via the job payload if cross-machine profile selection becomes
             // a requirement.
             profile_name: None,
+            // (#703) Fleet jobs run on the runner's default image; carrying a
+            // requested image through WorkJob is a follow-on slice.
+            image: None,
         }
     }
 }
