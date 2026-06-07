@@ -2521,9 +2521,11 @@ mod tests {
             RuntimeCompactionConfig,
         };
         let profile = Profile {
+            extras: Default::default(),
             description: None,
             default_model: None,
             models: vec![ProfileModel {
+                extras: Default::default(),
                 id: "primary".into(),
                 n_ctx: 100_000,
                 capabilities: Default::default(),
@@ -2561,9 +2563,11 @@ mod tests {
             RuntimeCompactionConfig,
         };
         let profile = Profile {
+            extras: Default::default(),
             description: None,
             default_model: None,
             models: vec![ProfileModel {
+                extras: Default::default(),
                 id: "primary-x".into(),
                 n_ctx: 100_000,
                 capabilities: Default::default(),
@@ -2659,9 +2663,11 @@ mod tests {
             Profile, ProfileModel, ProfileRuntime, RuntimeCompactionConfig,
         };
         let profile = Profile {
+            extras: Default::default(),
             description: None,
             default_model: None,
             models: vec![ProfileModel {
+                extras: Default::default(),
                 id: "primary-x".into(),
                 n_ctx: 100_000,
                 capabilities: Default::default(),
@@ -2693,9 +2699,11 @@ mod tests {
             Profile, ProfileModel, ProfileRuntime, RuntimeCompactionConfig,
         };
         let profile = Profile {
+            extras: Default::default(),
             description: None,
             default_model: None,
             models: vec![ProfileModel {
+                extras: Default::default(),
                 id: "primary-x".into(),
                 n_ctx: 100_000,
                 capabilities: Default::default(),
@@ -2740,9 +2748,11 @@ mod tests {
             serde_json::json!("lmstudio/qwen3-4b-instruct-2507"),
         );
         let profile = Profile {
+            extras: Default::default(),
             description: None,
             default_model: None,
             models: vec![ProfileModel {
+                extras: Default::default(),
                 id: "primary-x".into(),
                 n_ctx: 101_000,
                 capabilities: Default::default(),
@@ -2791,9 +2801,11 @@ mod tests {
         // openclaw-aware consumer) but NOT influence darkmux's trigger.
         extras.insert("maxHistoryShare".into(), serde_json::json!(0.35));
         let profile = Profile {
+            extras: Default::default(),
             description: None,
             default_model: None,
             models: vec![ProfileModel {
+                extras: Default::default(),
                 id: "primary-x".into(),
                 n_ctx: 100_000,
                 capabilities: Default::default(),
@@ -2831,9 +2843,11 @@ mod tests {
             Profile, ProfileModel, ProfileRuntime, RuntimeCompactionConfig,
         };
         let profile = Profile {
+            extras: Default::default(),
             description: None,
             default_model: None,
             models: vec![ProfileModel {
+                extras: Default::default(),
                 id: "primary-x".into(),
                 n_ctx: 100_000,
                 capabilities: Default::default(),
@@ -2885,9 +2899,11 @@ mod tests {
             serde_json::json!("openclaw-shape passthrough — must be ignored by internal runtime"),
         );
         let profile = Profile {
+            extras: Default::default(),
             description: None,
             default_model: None,
             models: vec![ProfileModel {
+                extras: Default::default(),
                 id: "primary-x".into(),
                 n_ctx: 100_000,
                 capabilities: Default::default(),
@@ -2920,9 +2936,11 @@ mod tests {
     fn from_profile_handles_missing_compaction_block() {
         use darkmux_types::{Profile, ProfileModel};
         let profile = Profile {
+            extras: Default::default(),
             description: None,
             default_model: None,
             models: vec![ProfileModel {
+                extras: Default::default(),
                 id: "primary-x".into(),
                 n_ctx: 50_000,
                 capabilities: Default::default(),

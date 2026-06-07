@@ -312,8 +312,10 @@ mod tests {
 
     fn profile_with(desc: &str, runtime: Option<ProfileRuntime>) -> Profile {
         Profile {
+            extras: Default::default(),
             description: Some(desc.to_string()),
             models: vec![ProfileModel {
+                extras: Default::default(),
                 id: "m".into(),
                 n_ctx: 1000,
                 capabilities: Default::default(),
@@ -328,6 +330,7 @@ mod tests {
     #[test]
     fn namespaced_identifier_uses_prefix_when_no_override() {
         let m = ProfileModel {
+            extras: Default::default(),
             id: "qwen3.6-35b-a3b".into(),
             n_ctx: 100_000,
             capabilities: Default::default(),
@@ -339,6 +342,7 @@ mod tests {
     #[test]
     fn namespaced_identifier_passes_through_explicit_id() {
         let m = ProfileModel {
+            extras: Default::default(),
             id: "qwen3.6-35b-a3b".into(),
             n_ctx: 100_000,
             capabilities: Default::default(),
@@ -433,8 +437,10 @@ mod tests {
         // `util-4b` matches neither the loaded `.model` nor `.identifier`), but
         // it must never produce two competing loads of the same identifier.
         let profile = Profile {
+            extras: Default::default(),
             description: None,
             models: vec![ProfileModel {
+                extras: Default::default(),
                 id: "worker-35b".into(),
                 n_ctx: 100_000,
                 capabilities: Default::default(),
