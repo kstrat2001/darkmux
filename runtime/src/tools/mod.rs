@@ -493,7 +493,7 @@ fn has_timeout_command() -> bool {
 fn shell_for_commands() -> &'static str {
     use std::sync::OnceLock;
     static SHELL: OnceLock<&'static str> = OnceLock::new();
-    *SHELL.get_or_init(|| {
+    SHELL.get_or_init(|| {
         let has_bash = Command::new("sh")
             .arg("-c")
             .arg("command -v bash >/dev/null 2>&1")
