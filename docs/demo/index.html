@@ -130,6 +130,10 @@
   .pill.ended{background:#241a12;color:var(--amber-dim)}
   .node.util{cursor:default;border-left:3px solid var(--amber-dim)}.node.util:hover{border-color:var(--line)}
   .rglbl{font:11px 'JetBrains Mono',monospace;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:12px}
+  /* (#691 Slice 2) "recent runs" — completed dispatches in live mode, dimmed so
+     they read as history one click away, not current crew. */
+  .rglbl.rgdim{margin-top:8px;color:var(--amber-dim)}
+  .recentruns{opacity:.55}.recentruns:hover{opacity:1}
   .sub h2{font:600 13px 'JetBrains Mono',monospace;letter-spacing:.1em;text-transform:uppercase;color:var(--amber);margin:0 0 4px}
   .sub h2 a{color:var(--amber);text-decoration:underline;cursor:pointer}
   .track{margin:18px 0}.track .lbl{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin-bottom:6px}
@@ -432,15 +436,20 @@ function machPresent(m){
 function renderFleet(){
   $("logscope").textContent="fleet"; state.stageScope=()=>true;
   const ms=machines();
+  // (#691 Slice 2) In live mode the card counts only RUNNING sessions (∈
+  // LIVE_SESSIONS) — completed dispatches from earlier today shouldn't read as
+  // current crew ("coder ×7"). Playback counts all sessions in the window.
+  const liveMode=document.body.classList.contains('live-mode');
   const cards=ms.map(m=>{
-    const act=machActive(m), runs=sessionsOn(m).length;
+    const all=sessionsOn(m);
+    const act=machActive(m), runs=liveMode ? all.filter(sid=>LIVE_SESSIONS.has(sid)).length : all.length;
     // (#638 Slice 3) Presence at the scrubber: an absent machine dims + reads
     // "offline" and can't be "dispatch in flight" (it's gone). present/unknown
     // keep the prior idle/active behavior.
     const absent=machPresent(m)===false;
     const stat=absent?'offline':(act?'dispatch in flight':'idle');
     return `<div class="mach ${act&&!absent?'active':''} ${absent?'absent':''}" onclick="drillMachine('${m}')"><div class="name"><span class="mico">${ICON[MACH_ICON[nameOf(m)]]||""}</span>${nameOf(m)}</div>
-      <div class="spec">${specOf(m)}</div><div class="stat"><span class="dot"></span>${stat} · ${runs} specialist${runs===1?'':'s'} + utility</div>
+      <div class="spec">${specOf(m)}</div><div class="stat"><span class="dot"></span>${stat} · ${runs} ${liveMode?'running':'specialist'+(runs===1?'':'s')} + utility</div>
       <div class="hint">click to drill in →</div></div>`;}).join("");
   // Activity timeline — one lane per machine; each dispatch session is a bar
   // positioned across the recorded window, revealed up to the playhead (an
@@ -464,7 +473,7 @@ function renderFleet(){
   const maxLen=ms.length?Math.max(...ms.map(m=>nameOf(m).length)):8;
   const labelW=Math.round(Math.min(170,Math.max(54,maxLen*7.4+10)));
   const tl = ms.length
-    ? `<div class="fleettl" style="--lname-w:${labelW}px"><div class="tlhdr">activity · ${iso(tMin).slice(11,19)}–${iso(tMax).slice(11,19)}Z</div>${lanes}${ax}</div>`
+    ? `<div class="fleettl" style="--lname-w:${labelW}px"><div class="tlhdr">${liveMode?'recent activity':'activity'} · ${iso(tMin).slice(11,19)}–${iso(tMax).slice(11,19)}Z</div>${lanes}${ax}</div>`
     : `<div class="fleettl"><div class="tlempty">waiting for the first flow record…</div></div>`;
   $("stage").innerHTML=`<div class="fleet">${cards}</div>`+tl;
 }
@@ -491,7 +500,7 @@ function renderMachine(){
   // an absent machine caps its roles to terminal status (consistency guard;
   // the session.end edges usually already bookend them at the same instant).
   const machAbsent=machPresent(m)===false;
-  const specs=sessionsOn(m).filter(sid=>visible().some(r=>r.session_id===sid)).map(sid=>{
+  const nodeObjs=sessionsOn(m).filter(sid=>visible().some(r=>r.session_id===sid)).map(sid=>{
     const s=dispatch(sid,"start");
     // (#638/#647) Session status at the scrubber time `state.t`, from the
     // edge pair — NOT "no dispatch.complete = running" (the old false-running
@@ -517,10 +526,10 @@ function renderMachine(){
     else if(!machAbsent&&closeTs!=null){ cls='run'; lbl='running'; }
     else { cls='ended'; lbl='ended'; }
     if(s){
-      return `<div class="node" onclick="drillSession('${sid}')"><div class="h">${s.handle}</div>
+      return {cls, html:`<div class="node" onclick="drillSession('${sid}')"><div class="h">${s.handle}</div>
         <div class="s">specialist role · ${s.model||'?'}</div>
         <div class="s">session ${sid} · mission ${s.mission_id}</div>
-        <span class="pill ${cls}">${lbl}</span></div>`;
+        <span class="pill ${cls}">${lbl}</span></div>`};
     }
     // Fallback: no dispatch.start — pull handle/model/mission from the first
     // record we have for this session, surface honestly that the lifecycle
@@ -529,11 +538,26 @@ function renderMachine(){
     const handle=first.handle||`session ${sid}`;
     const model=first.model||'?';
     const mission=first.mission_id?`mission ${first.mission_id}`:'no mission scope';
-    return `<div class="node" onclick="drillSession('${sid}')"><div class="h">${handle}</div>
+    return {cls:'ended', html:`<div class="node" onclick="drillSession('${sid}')"><div class="h">${handle}</div>
       <div class="s">role · ${model}</div>
       <div class="s">session ${sid} · ${mission}</div>
-      <span class="pill warn">no dispatch.start</span></div>`;
-  }).join("");
+      <span class="pill warn">no dispatch.start</span></div>`};
+  });
+  // (#691 Slice 2) In live mode, separate RUNNING-now from completed: completed
+  // dispatches from earlier today shouldn't sit in the live crew looking
+  // current. Running stay prominent; the rest collapse into a dimmed "recent
+  // runs" section (still one click to drill / playback). Playback shows all.
+  const liveMode=document.body.classList.contains('live-mode');
+  let specs;
+  if(liveMode){
+    const running=nodeObjs.filter(n=>n.cls==='run').map(n=>n.html).join("");
+    const recent=nodeObjs.filter(n=>n.cls!=='run').map(n=>n.html).join("");
+    const recentCount=nodeObjs.filter(n=>n.cls!=='run').length;
+    specs=(running||'<span class="hint">no dispatches running right now</span>')
+      +(recentCount?`<div class="rglbl rgdim">recent runs · ${recentCount} today</div><div class="recentruns">${recent}</div>`:'');
+  } else {
+    specs=nodeObjs.map(n=>n.html).join("");
+  }
   // Loose records — records on this machine that don't have a session_id and
   // therefore don't show up in any session card above (flow notes, free-floating
   // telemetry, anything written outside a dispatch). Surface them as a count
