@@ -153,6 +153,17 @@
   .rrdetail .kv b{color:var(--text);font-weight:600;min-width:92px;flex-shrink:0}
   .rrdetail .kv span{min-width:0;word-break:break-all}
   .rrdetail a{color:var(--amber);cursor:pointer}.rrdetail a:hover{text-decoration:underline}
+  /* (#691) unscoped-records composition breakdown */
+  .lbreakdown{max-width:560px;margin-top:2px}
+  .lrow{display:flex;align-items:center;gap:12px;padding:6px 8px;border-radius:6px;font:11px 'JetBrains Mono',monospace}
+  .lrow[onclick]{cursor:pointer}.lrow[onclick]:hover{background:var(--bg2)}
+  .lrow.sel{background:var(--bg2);outline:1px solid var(--amber-dim)}
+  .lrlbl{flex:0 0 220px;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .lrbar{flex:1;height:10px;background:var(--bg2);border-radius:5px;overflow:hidden}
+  .lrbar>span{display:block;height:100%;background:var(--amber-dim)}
+  .lrcnt{flex:0 0 auto;color:var(--muted);min-width:34px;text-align:right}
+  .rghint{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin-top:14px}
+  .rghint a{color:var(--amber);cursor:pointer}.rghint a:hover{text-decoration:underline}
   .sub h2{font:600 13px 'JetBrains Mono',monospace;letter-spacing:.1em;text-transform:uppercase;color:var(--amber);margin:0 0 4px}
   .sub h2 a{color:var(--amber);text-decoration:underline;cursor:pointer}
   .track{margin:18px 0}.track .lbl{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin-bottom:6px}
@@ -707,9 +718,26 @@ function renderLoose(){
   const m=state.machine;
   state.stageScope=r=>uidOf(r)===m&&!r.session_id;
   $("logscope").textContent=nameOf(m)+" · loose";
-  const n=scoped().length;
+  const recs=scoped(), n=recs.length;
+  // (#691) Composition breakdown: group the unscoped records by action so the
+  // operator sees WHAT they are (mostly machine.online/offline lifecycle +
+  // ambient/malformed), not a blank stage. Clicking a type sets the log query
+  // so the right-hand event log narrows to that type. Counts are over the full
+  // scope (always the true composition); the log reflects the active filter.
+  const groups={};
+  recs.forEach(r=>{const a=(r.action&&String(r.action))||"(no action)";groups[a]=(groups[a]||0)+1;});
+  const rows=Object.entries(groups).sort((a,b)=>b[1]-a[1]);
+  const max=rows.length?rows[0][1]:1, q=state.filters.q;
+  const body=rows.map(([a,cnt])=>{
+    const clickable=a!=="(no action)", sel=clickable&&q===a, w=Math.round(cnt/max*100);
+    return `<div class="lrow${sel?' sel':''}"${clickable?` onclick="setQuery('${a}')"`:''}>`
+      +`<span class="lrlbl">${a}</span><span class="lrbar"><span style="width:${w}%"></span></span>`
+      +`<span class="lrcnt">${cnt}</span></div>`;
+  }).join("");
   $("stage").innerHTML=`<div><div class="stagehdr"><a onclick="goFleet()">fleet</a> › <a onclick="drillMachine('${m}')">${nameOf(m)}</a> › unscoped records</div>
-    <div class="rglbl">${n} record(s) without a session — inspect via the log on the right</div></div>`;
+    <div class="rglbl">${n} record(s) without a session · by type</div>
+    <div class="lbreakdown">${body||'<span class="hint">none at this point in the timeline</span>'}</div>
+    <div class="rghint">${q?`log filtered to <b>${q}</b> — <a onclick="setQuery('')">clear</a>`:'click a type to filter the event log →'}</div></div>`;
 }
 // Drill into the loose-records panel. Sets state then routes through the shared
 // `render()` so landing and every live tick take the identical path.
