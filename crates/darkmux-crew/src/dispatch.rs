@@ -2285,6 +2285,59 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn resolve_mission_for_sprint_returns_mission_for_known_sprint() {
+        // (#714) The resolution heart of the fix: a known sprint id maps to
+        // its mission so dispatch records can group under it.
+        let tmp = TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
+        }
+        let sprints_dir = tmp.path().join("missions").join("sweep").join("sprints");
+        fs::create_dir_all(&sprints_dir).unwrap();
+        fs::write(
+            sprints_dir.join("s694.json"),
+            r#"{"id":"s694","mission_id":"sweep","description":"d","status":"planned","depends_on":[],"created_ts":0}"#,
+        ).unwrap();
+
+        assert_eq!(
+            resolve_mission_for_sprint(Some("s694")).as_deref(),
+            Some("sweep")
+        );
+        // No sprint id → no mission (one-off dispatch).
+        assert!(resolve_mission_for_sprint(None).is_none());
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
+                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_mission_for_sprint_returns_none_for_unknown_sprint() {
+        // An unresolvable sprint warns (stderr) and degrades to None rather
+        // than failing the dispatch — flow records just go ungrouped.
+        let tmp = TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
+        }
+        // No manifests written under the crew dir.
+        assert!(resolve_mission_for_sprint(Some("does-not-exist")).is_none());
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
+                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn augment_message_injects_parent_output_when_recorded() {
         let tmp = TempDir::new().unwrap();
         let prev = std::env::var("DARKMUX_CREW_DIR").ok();
