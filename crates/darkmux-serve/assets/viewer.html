@@ -697,8 +697,12 @@ function renderMachine(){
 // session_id — e.g. flow notes, ambient telemetry). Scopes the log to those
 // records so the operator can still inspect them.
 function drillLoose(m){
-  state.level="loose"; state.machine=m; state.session=null; state.selected=null;
+  state.level="loose"; state.machine=m; state.session=null;
   state.stageScope=r=>uidOf(r)===m&&!r.session_id;
+  // (#691) Auto-select the newest unscoped record so the detail panel shows
+  // something on landing — otherwise the header ("N records — inspect via the
+  // log") contradicts an empty "no event" detail until the next follow-tick.
+  const n=newest(scopedFiltered()); state.selected=n?n._id:null;
   $("logscope").textContent=nameOf(m)+" · loose";
   $("stage").innerHTML=`<div><div class="stagehdr"><a onclick="goFleet()">fleet</a> › <a onclick="drillMachine('${m}')">${nameOf(m)}</a> › unscoped records</div>
     <div class="rglbl">${visible().filter(r=>uidOf(r)===m&&!r.session_id).length} record(s) without a session — inspect via the log on the right</div></div>`;
@@ -766,7 +770,11 @@ function renderDetail(){
   const r=DATA.find(x=>x._id===state.selected);
   $("follow").className="follow"+(state.follow?" on":"");
   $("follow").innerHTML=state.follow?"☑ following":"☐ follow latest";
-  $("detailbody").innerHTML=r?`<pre>${pretty(r)}</pre>`:`<div class="none">no event at this point in the timeline</div>`;
+  // (#691) Distinguish "nothing selected yet, but events exist" from "genuinely
+  // no events" — the latter wording contradicted a populated log/header.
+  $("detailbody").innerHTML=r?`<pre>${pretty(r)}</pre>`
+    :(scopedFiltered().length?`<div class="none">select an event from the log to inspect it</div>`
+      :`<div class="none">no event at this point in the timeline</div>`);
 }
 function renderLog(){
   const all=scopedFiltered();
