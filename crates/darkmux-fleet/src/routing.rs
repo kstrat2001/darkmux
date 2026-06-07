@@ -206,6 +206,7 @@ pub fn build_work_job(
     workdir: Option<String>,
     sprint_id: Option<String>,
     runtime: darkmux_crew::dispatch::Runtime,
+    image: Option<String>,
     timeout_seconds: u32,
     published_by_machine: Option<String>,
     published_by_orchestrator: Option<String>,
@@ -223,6 +224,7 @@ pub fn build_work_job(
         workdir,
         sprint_id,
         runtime,
+        image,
         timeout_seconds,
         published_at_unix_ms,
         published_by_machine,
@@ -326,18 +328,9 @@ pub fn dispatch_routed(opts: DispatchOpts) -> Result<DispatchResult> {
 /// the audit trail and topology view see the operator-pinned target (#590:
 /// advisory only — any runner may claim).
 fn dispatch_via_queue(opts: DispatchOpts, target_machine: Option<&str>) -> Result<DispatchResult> {
-    // (#703) `--image` is a host-side dispatch override; `WorkJob` carries no
-    // image field yet, so a queued job runs on the *runner's* default image.
-    // Warn loud rather than silently ignore the flag (operator sovereignty —
-    // loud beats quiet). Carrying the image through WorkJob is a follow-on
-    // slice.
-    if opts.image.is_some() {
-        eprintln!(
-            "darkmux: warning — `--image` is ignored for cross-machine (`--machine`) \
-             dispatch; the remote runner uses its own default runtime image. \
-             (Per-job image selection over the fleet queue is a follow-on — #703.)"
-        );
-    }
+    // (#703 Slice 4) `--image` now rides the WorkJob (`build_work_job` below)
+    // and the runner injects into it — cross-machine dispatch honors it, so no
+    // silent-drop warning here anymore.
     // The Redis URL is required for cross-machine dispatch. If it's
     // unset, the operator hasn't configured the fleet substrate — bail
     // loud with the fix-it pointer.
@@ -373,6 +366,7 @@ fn dispatch_via_queue(opts: DispatchOpts, target_machine: Option<&str>) -> Resul
         opts.workdir.as_ref().map(|p| p.display().to_string()),
         opts.sprint_id.clone(),
         opts.runtime,
+        opts.image.clone(),
         opts.timeout_seconds,
         darkmux_flow::resolve_machine_id(),
         darkmux_flow::resolve_orchestrator(),

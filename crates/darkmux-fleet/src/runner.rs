@@ -248,9 +248,10 @@ impl WorkJob {
             // via the job payload if cross-machine profile selection becomes
             // a requirement.
             profile_name: None,
-            // (#703) Fleet jobs run on the runner's default image; carrying a
-            // requested image through WorkJob is a follow-on slice.
-            image: None,
+            // (#703 Slice 4) Honor the image the publisher requested (carried
+            // on the WorkJob); the runner injects darkmux's binary into it.
+            // `None` → the runner's default slim image.
+            image: self.image,
         }
     }
 }

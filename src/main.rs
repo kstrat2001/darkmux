@@ -1618,6 +1618,7 @@ fn cmd_mission_dispatch(
             // dispatch — Beat 36 directional principle, openclaw
             // optional everywhere).
             crate::crew::dispatch::Runtime::Internal,
+            None, // image (#703 Slice 4) — mission dispatch uses the runner's default
             timeout_seconds,
             local_machine.clone(),
             local_orchestrator.clone(),

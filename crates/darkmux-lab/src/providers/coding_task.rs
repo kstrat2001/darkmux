@@ -272,6 +272,7 @@ impl WorkloadProvider for CodingTaskProvider {
                     Some(sandbox_dir.to_path_buf()),
                     compaction,
                     profile_name,
+                    loaded.manifest.workload.image.as_deref(),
                 )?;
                 dispatch_out_dir = out_dir;
                 (stdout, stderr, ok)
@@ -756,6 +757,7 @@ fn pick_role(loaded: &LoadedWorkload) -> String {
 /// `--workdir` so the runtime mounts the host path at `/workspace`
 /// inside the container, giving the agent access to the workload's
 /// sandbox files (#337 fix).
+#[allow(clippy::too_many_arguments)]
 fn dispatch_via_internal(
     role_id: &str,
     prompt: &str,
@@ -763,6 +765,7 @@ fn dispatch_via_internal(
     workdir: Option<PathBuf>,
     compaction: darkmux_crew::dispatch::CompactionDispatchArgs,
     profile_name: &str,
+    image: Option<&str>,
 ) -> Result<(String, String, bool, Option<PathBuf>)> {
     use darkmux_crew::dispatch::{dispatch, DispatchOpts, Runtime};
     let opts = DispatchOpts {
@@ -785,9 +788,9 @@ fn dispatch_via_internal(
         // profile (the CLI `--profile` override when set), not the
         // registry default.
         profile_name: Some(profile_name.to_string()),
-        // (#703) lab dispatches use the default image; per-workload toolchain
-        // selection (manifest field) is a follow-on slice.
-        image: None,
+        // (#703 Slice 4) the workload's declared image (manifest
+        // `workload.image`), injected so the agent can build/test in-sandbox.
+        image: image.map(str::to_string),
     };
     let result = dispatch(opts).context("internal-runtime dispatch via lab harness")?;
     // `out_dir` is the host path where the runtime wrote its
@@ -1326,6 +1329,7 @@ mod tests {
             requires_fixture: None,
             verify: None,
             expected: None,
+            image: None,
             extras: BTreeMap::new(),
         }
     }

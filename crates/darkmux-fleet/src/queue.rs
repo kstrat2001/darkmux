@@ -79,6 +79,14 @@ pub struct WorkJob {
     #[serde(default)]
     pub runtime: darkmux_crew::dispatch::Runtime,
 
+    /// (#703 Slice 4) Docker image the runner should dispatch into. When
+    /// set, the runner injects darkmux's runtime binary into this image so
+    /// the coder can compile/test the job in-sandbox. `None` → the runner's
+    /// default slim image. Carries `--image` (and a workload's declared
+    /// `image`) across the fleet queue so cross-machine dispatch honors it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+
     /// Per-turn timeout (seconds) — passes through to the runtime's
     /// turn timeout.
     pub timeout_seconds: u32,
@@ -241,7 +249,7 @@ pub(crate) struct ClaimedJob {
 /// Returns the auto-assigned entry ID (the canonical `work_id`).
 ///
 /// XADD fields:
-/// - `schema`: `WORK_JOB_SCHEMA_VERSION` ("2") — wire-version tag so
+/// - `schema`: `WORK_JOB_SCHEMA_VERSION` ("3") — wire-version tag so
 ///   future schema bumps can be detected by older runners
 /// - `record`: the JSON-serialized WorkJob
 ///
@@ -278,11 +286,16 @@ pub fn publish_job(client: &redis::Client, job: &WorkJob) -> Result<String> {
 /// Wire-schema version tag carried alongside each job. Bumped when
 /// `WorkJob` shape changes in a way old runners can't safely parse.
 /// Bumped "1" → "2" in #590 (single-stream collapse: `target_tier`
-/// removed from `WorkJob`). `deny_unknown_fields` means a "1"-era runner
-/// and a "2"-era runner are non-interop by design — a clean pre-1.0
-/// wire break.
+/// removed from `WorkJob`). Bumped "2" → "3" in #703 Slice 4 (added the
+/// optional `image` field so cross-machine dispatch carries `--image`).
+/// `deny_unknown_fields` means a job carrying `image` from a "3"-era
+/// publisher is rejected by a "2"-era runner — a clean pre-1.0 wire break.
+/// The break is **asymmetric**: `image` is `skip_serializing_if = None`, so a
+/// "3" job with no image serializes byte-identical to a "2" job and old
+/// runners still parse it; only image-bearing jobs require all runners on "3".
+/// Safe rule of thumb: restart all fleet daemons together after upgrading.
 #[allow(dead_code)] // PR-C.1 substrate; consumed by PR-C.2 (runner loop) + PR-C.3 (client push)
-pub(crate) const WORK_JOB_SCHEMA_VERSION: &str = "2";
+pub(crate) const WORK_JOB_SCHEMA_VERSION: &str = "3";
 
 /// Ensure the consumer group exists on the single global stream.
 /// Idempotent — returns `Ok(())` whether the group was just created OR
