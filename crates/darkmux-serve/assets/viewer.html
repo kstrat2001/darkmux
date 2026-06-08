@@ -1046,6 +1046,7 @@ function prevDateUTC(d){const dt=new Date(d+"T00:00:00Z");dt.setUTCDate(dt.getUT
 
 let RAW=[];            // raw FlowRecords (pre-adapt); the live tail appends here
 let LIVE_ES=null;      // EventSource handle when tailing the live stream
+let LIVE_ES_DATE=null; // UTC date string of the day the SSE stream was opened
 // (#638) Sessions with a live heartbeat right now — polled from the daemon's
 // /fleet/sessions/live in live mode (stays EMPTY in playback). The machine
 // drill keys "running" on membership here, so a dispatch that died without a
@@ -1107,6 +1108,20 @@ function stageSig(){
   if(state.level==="subsystem"||state.level==="loose")return null;  // (#691) live log/metrics views: full-render each tick
   return "mission";
 }
+// (#691) Fetch yesterday + today's flow records and keep only the last
+// LIVE_WINDOW_MS into RAW. Used by boot() for initial live load and by
+// the UTC date-rollover handler to reload the rolling window on a new day.
+async function loadLiveWindow(today){
+  const dates=[prevDateUTC(today),today];
+  let recs=[],anyOk=false;
+  for(const d of dates){
+    const res=await fetch("/flow/"+d,{headers:{accept:"application/json"}});
+    if(res.ok){anyOk=true;const body=await res.json();recs=recs.concat(Array.isArray(body)?body:(body.records||body.flow||[]));}
+  }
+  RAW=recs.filter(r=>T(r.ts)>=Date.now()-LIVE_WINDOW_MS);
+  return anyOk;
+}
+
 function applyLive(){
   // (#691) Keep RAW within the rolling live window so a long-running session
   // (and the SSE tail across midnight) ages old records out instead of growing
@@ -1125,6 +1140,7 @@ function applyLive(){
 }
 function startLiveTail(date){
   if(typeof EventSource==="undefined")return;
+  LIVE_ES_DATE=date; // record the day this stream was opened
   if(LIVE_ES)LIVE_ES.close();
   LIVE_ES=new EventSource("/flow/"+date+"/stream");
   let pending=false;
@@ -1169,7 +1185,20 @@ async function pollLiveMachines(){
 function startLivePoll(){
   if(LIVE_SESS_TIMER)return;
   pollLiveSessions(); pollLiveMachines();
-  LIVE_SESS_TIMER=setInterval(()=>{pollLiveSessions();pollLiveMachines();},5000);
+  LIVE_SESS_TIMER=setInterval(async()=>{
+    // UTC date-rollover detection: if we're in live mode and the day
+    // changed since the SSE stream was opened, close it, reload the
+    // rolling window for the new day, reopen the tail, and refresh.
+    const nd=todayUTC();
+    if(nd!==LIVE_ES_DATE){
+      LIVE_ES_DATE=nd;
+      if(LIVE_ES)LIVE_ES.close();
+      await loadLiveWindow(nd);
+      startLiveTail(nd);
+      recompute(); render();
+    }
+    pollLiveSessions();pollLiveMachines();
+  },5000);
   window.addEventListener("beforeunload",()=>{if(LIVE_SESS_TIMER)clearInterval(LIVE_SESS_TIMER);});
 }
 
@@ -1209,23 +1238,20 @@ async function boot(){
   } else {
     try{
       const live = !wantsPlayback && date===todayUTC();
-      // (#691) Live = rolling 24h window: fetch yesterday + today and keep the
-      // last LIVE_WINDOW_MS, so runs from before midnight stay in live after a
-      // refresh. Playback stays single-day. The SSE tail of `date` (today)
-      // feeds new records. A per-date 404 (no file that day) is skipped.
-      const dates = live ? [prevDateUTC(date), date] : [date];
-      let recs=[], anyOk=false;
-      for(const d of dates){
-        const res=await fetch("/flow/"+d,{headers:{accept:"application/json"}});
-        if(res.ok){ anyOk=true; const body=await res.json(); recs=recs.concat(Array.isArray(body)?body:(body.records||body.flow||[])); }
+      // (#691/#730) Live = rolling 24h window (yesterday+today, last LIVE_WINDOW_MS);
+      // mode is "live" whenever the daemon is reachable, even with zero records,
+      // so the SSE tail + rollover poll start and stream the day's first record.
+      let anyOk=false;
+      if(live){
+        anyOk = await loadLiveWindow(date);
+      } else {
+        const res=await fetch("/flow/"+date,{headers:{accept:"application/json"}});
+        if(res.ok){ anyOk=true; const body=await res.json(); RAW=Array.isArray(body)?body:(body.records||body.flow||[]); }
+        else RAW=[];
       }
-      if(live){ const cut=Date.now()-LIVE_WINDOW_MS; recs=recs.filter(r=>T(r.ts)>=cut); }
-      RAW=recs;
       DATA=flowToRenderModel(RAW);
-      mode = anyOk ? (wantsPlayback ? (RAW.length?"play":"empty")
-                                    : (live ? "live" : (RAW.length?"play":"empty")))
-                   : "empty";
-    }catch(e){ DATA=[]; RAW=[]; mode="no-daemon"; }   // daemon not reachable — show honest empty state, never demo
+      mode = anyOk ? (live ? "live" : (RAW.length?"play":"empty")) : "empty";
+    }catch(e){ DATA=[]; RAW=[]; mode="no-daemon"; }
   }
   // Tag the body with the daemon-injected mode so CSS and dev tools can
   // distinguish live-route vs playback-route loads at a glance.
