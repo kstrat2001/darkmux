@@ -84,14 +84,14 @@ brew services start redis</code></pre>
     <pre><code><span class="comment"># darkmux fleet membership — always-on hub member</span>
 export DARKMUX_MACHINE_ID=studio        <span class="comment"># operator-named, not hostname</span>
 export DARKMUX_REDIS_URL=redis://default:&lt;password&gt;@&lt;hub-tailnet-addr&gt;:6379
-export DARKMUX_ORCHESTRATOR=claude-opus-4-7   <span class="comment"># or whichever frontier you use</span></code></pre>
+export DARKMUX_ORCHESTRATOR=claude-code   <span class="comment"># or whichever frontier you use</span></code></pre>
     <p>Reload your shell and verify with <code>darkmux doctor</code> — <code>machine_id</code> and <code>flow sink health</code> should both read <code>✓</code>.</p>
 
     <h3>On each peer</h3>
     <p>Same shape, different id:</p>
     <pre><code>export DARKMUX_MACHINE_ID=laptop
 export DARKMUX_REDIS_URL=redis://default:&lt;password&gt;@&lt;hub-tailnet-addr&gt;:6379
-export DARKMUX_ORCHESTRATOR=claude-opus-4-7</code></pre>
+export DARKMUX_ORCHESTRATOR=claude-code</code></pre>
     <p>Same Redis URL on every peer — that's how they coordinate. Same orchestrator string per session (lets you trace which frontier drove which dispatch in flow records).</p>
     <p>Reload + <code>darkmux doctor</code> on each peer. All checks should green.</p>
 

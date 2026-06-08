@@ -273,7 +273,7 @@ mod tests {
         let json = r#"{
             "schema_version": "1.0",
             "machine_id": "studio",
-            "orchestrator": "claude-opus-4-8",
+            "orchestrator": "claude-code",
             "lms_bin": "/usr/local/bin/lms",
             "lmstudio_url": "http://localhost:1234",
             "dirs": { "flows": "~/dm/flows", "audit": "~/dm/audit" },
