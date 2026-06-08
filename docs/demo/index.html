@@ -1040,6 +1040,12 @@ function targetDate(){
 }
 
 function todayUTC(){return new Date().toISOString().slice(0,10);}
+// (#691) The live view is a rolling window, NOT just today's file — otherwise
+// crossing midnight (or refreshing after it) drops recent runs from live even
+// though they're hours old. Storage stays per-day files; the live VIEW queries
+// the last LIVE_WINDOW_MS across day files.
+const LIVE_WINDOW_MS=24*60*60*1000;
+function prevDateUTC(d){const dt=new Date(d+"T00:00:00Z");dt.setUTCDate(dt.getUTCDate()-1);return dt.toISOString().slice(0,10);}
 
 let RAW=[];            // raw FlowRecords (pre-adapt); the live tail appends here
 let LIVE_ES=null;      // EventSource handle when tailing the live stream
@@ -1105,6 +1111,11 @@ function stageSig(){
   return "mission";
 }
 function applyLive(){
+  // (#691) Keep RAW within the rolling live window so a long-running session
+  // (and the SSE tail across midnight) ages old records out instead of growing
+  // unbounded. RAW is ~chronological, so only filter when the oldest is stale.
+  const cut=Date.now()-LIVE_WINDOW_MS;
+  if(RAW.length&&T(RAW[0].ts)<cut)RAW=RAW.filter(r=>T(r.ts)>=cut);
   DATA=flowToRenderModel(RAW);
   recompute();
   absorbNewFilterValues();
@@ -1200,14 +1211,23 @@ async function boot(){
     mode = RAW.length?"play":"empty";
   } else {
     try{
-      const res=await fetch("/flow/"+date,{headers:{accept:"application/json"}});
-      if(res.ok){
-        const body=await res.json();
-        RAW=Array.isArray(body)?body:(body.records||body.flow||[]);
-        DATA=flowToRenderModel(RAW);
-        mode = wantsPlayback ? (RAW.length?"play":"empty")
-                             : (date===todayUTC() ? "live" : (RAW.length?"play":"empty"));
-      }else{ DATA=[]; RAW=[]; mode="empty"; }
+      const live = !wantsPlayback && date===todayUTC();
+      // (#691) Live = rolling 24h window: fetch yesterday + today and keep the
+      // last LIVE_WINDOW_MS, so runs from before midnight stay in live after a
+      // refresh. Playback stays single-day. The SSE tail of `date` (today)
+      // feeds new records. A per-date 404 (no file that day) is skipped.
+      const dates = live ? [prevDateUTC(date), date] : [date];
+      let recs=[], anyOk=false;
+      for(const d of dates){
+        const res=await fetch("/flow/"+d,{headers:{accept:"application/json"}});
+        if(res.ok){ anyOk=true; const body=await res.json(); recs=recs.concat(Array.isArray(body)?body:(body.records||body.flow||[])); }
+      }
+      if(live){ const cut=Date.now()-LIVE_WINDOW_MS; recs=recs.filter(r=>T(r.ts)>=cut); }
+      RAW=recs;
+      DATA=flowToRenderModel(RAW);
+      mode = anyOk ? (wantsPlayback ? (RAW.length?"play":"empty")
+                                    : (live ? "live" : (RAW.length?"play":"empty")))
+                   : "empty";
     }catch(e){ DATA=[]; RAW=[]; mode="no-daemon"; }   // daemon not reachable — show honest empty state, never demo
   }
   // Tag the body with the daemon-injected mode so CSS and dev tools can
