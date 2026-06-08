@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 pub struct InitOptions {
     pub with_hook: bool,
     pub with_claude_md: Option<PathBuf>,
+    pub with_agents_md: Option<PathBuf>,
     pub force: bool,
     pub dry_run: bool,
 }
@@ -25,7 +26,7 @@ pub struct InitReport {
     pub config_path: Option<PathBuf>,
     pub config_created: bool,
     pub config_already_present: bool,
-    pub skills_target: PathBuf,
+    pub skills_targets: Vec<PathBuf>,
     pub skills_installed: Vec<String>,
     pub skills_overwritten: Vec<String>,
     pub skills_skipped: Vec<String>,
@@ -34,6 +35,9 @@ pub struct InitReport {
     pub claude_md_path: Option<PathBuf>,
     pub claude_md_appended: bool,
     pub claude_md_already_present: bool,
+    pub agents_md_path: Option<PathBuf>,
+    pub agents_md_appended: bool,
+    pub agents_md_already_present: bool,
 }
 
 /// The example profile registry, embedded at compile time. Copied to
@@ -85,7 +89,7 @@ pub fn init(opts: &InitOptions) -> Result<InitReport> {
         force: opts.force,
         dry_run: opts.dry_run,
     })?;
-    report.skills_target = skills_report.target;
+    report.skills_targets = skills_report.targets;
     report.skills_installed = skills_report.installed;
     report.skills_overwritten = skills_report.overwritten;
     report.skills_skipped = skills_report.skipped;
@@ -104,6 +108,14 @@ pub fn init(opts: &InitOptions) -> Result<InitReport> {
         report.claude_md_path = Some(target.clone());
         report.claude_md_appended = appended;
         report.claude_md_already_present = !appended;
+    }
+
+    // 6) AGENTS.md merge (optional)
+    if let Some(target) = opts.with_agents_md.as_ref() {
+        let appended = ensure_agents_md_section(target, opts.dry_run)?;
+        report.agents_md_path = Some(target.clone());
+        report.agents_md_appended = appended;
+        report.agents_md_already_present = !appended;
     }
 
     Ok(report)
@@ -187,6 +199,8 @@ fn computer_name() -> Option<String> {
 const HOOK_MARKER: &str = "darkmux:session-start";
 const CLAUDE_MD_HEADER: &str = "<!-- darkmux:integration:start -->";
 const CLAUDE_MD_FOOTER: &str = "<!-- darkmux:integration:end -->";
+const AGENTS_MD_HEADER: &str = "<!-- darkmux:integration:agents:start -->";
+const AGENTS_MD_FOOTER: &str = "<!-- darkmux:integration:agents:end -->";
 
 fn claude_settings_path() -> Result<PathBuf> {
     let home = dirs::home_dir().ok_or_else(|| anyhow!("could not resolve home directory"))?;
@@ -316,6 +330,69 @@ Before starting a long agentic task that may grow context past ~30K tokens, cons
 "#,
         header = CLAUDE_MD_HEADER,
         footer = CLAUDE_MD_FOOTER,
+    )
+}
+
+/// Append (or replace, with --force) a darkmux integration section into an
+/// AGENTS.md file. Idempotent via the marker comments — running twice
+/// without --force is a no-op.
+fn ensure_agents_md_section(target: &Path, dry_run: bool) -> Result<bool> {
+    let existing = if target.exists() {
+        fs::read_to_string(target)?
+    } else {
+        String::new()
+    };
+
+    if existing.contains(AGENTS_MD_HEADER) {
+        return Ok(false);
+    }
+
+    let section = darkmux_agents_md_section();
+    let new_contents = if existing.is_empty() {
+        section
+    } else {
+        format!("{}\n\n{}", existing.trim_end(), section)
+    };
+
+    if !dry_run {
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(target, new_contents)?;
+    }
+    Ok(true)
+}
+
+fn darkmux_agents_md_section() -> String {
+    format!(
+        r#"{header}
+
+# darkmux
+
+This project uses [darkmux](https://github.com/kstrat2001/darkmux) to multiplex local LLM stacks. Three reference profiles are available: `fast`, `balanced`, and `deep`.
+
+## When to swap stacks
+
+- **`fast`** — single-turn tasks (audits, TODO fills, short Q&A). Slim primary, no compactor.
+- **`balanced`** — mid-range tasks. Tuned compaction with a small companion compactor.
+- **`deep`** — long agentic tasks (multi-file refactors, exploratory test authoring). Maximum primary context for fewer compactions.
+
+## Available skills
+
+- `/darkmux-status` — what's currently loaded
+- `/darkmux-list-stacks` — see all available profiles
+- `/darkmux-swap-stack <name>` — switch to a profile
+- `/darkmux-list-workloads` / `/darkmux-lab-run` — execute lab workloads
+- `/darkmux-list-runs` / `/darkmux-analyze-run` / `/darkmux-compare-runs` — inspect run history
+
+## Dispatch policy
+
+Before starting a long agentic task that may grow context past ~30K tokens, consider swapping to `deep`. Before doing a single-turn audit or short review, consider swapping to `fast` to skip the compactor's idle KV-cache cost. Use `/darkmux-status` to confirm before making the change — swapping is idempotent so a status-matched call is a no-op.
+
+{footer}
+"#,
+        header = AGENTS_MD_HEADER,
+        footer = AGENTS_MD_FOOTER,
     )
 }
 
@@ -452,6 +529,17 @@ mod tests {
         // Verify the section appears exactly once.
         let after = fs::read_to_string(&p).unwrap();
         assert_eq!(after.matches(CLAUDE_MD_HEADER).count(), 1);
+    }
+
+    #[test]
+    fn ensure_agents_md_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("AGENTS.md");
+        ensure_agents_md_section(&p, false).unwrap();
+        let second = ensure_agents_md_section(&p, false).unwrap();
+        assert!(!second);
+        let after = fs::read_to_string(&p).unwrap();
+        assert_eq!(after.matches(AGENTS_MD_HEADER).count(), 1);
     }
 
     #[test]

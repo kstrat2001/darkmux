@@ -258,6 +258,10 @@ enum Cmd {
         /// Use `~/.claude/CLAUDE.md` for global, or a project-relative path.
         #[arg(long)]
         with_claude_md: Option<std::path::PathBuf>,
+        /// Append a darkmux integration section to the given AGENTS.md.
+        /// Use `./AGENTS.md` for a project-relative path, or any custom path.
+        #[arg(long)]
+        with_agents_md: Option<std::path::PathBuf>,
         /// Overwrite existing skills / hook entries.
         #[arg(long, short = 'f')]
         force: bool,
@@ -1035,9 +1039,10 @@ fn run(cmd: Cmd) -> Result<i32> {
         Cmd::Init {
             with_hook,
             with_claude_md,
+            with_agents_md,
             force,
             dry_run,
-        } => cmd_init(with_hook, with_claude_md, force, dry_run),
+        } => cmd_init(with_hook, with_claude_md, with_agents_md, force, dry_run),
         Cmd::Serve {
             port,
             bind,
@@ -2519,12 +2524,14 @@ fn cmd_profile(sub: ProfileCmd) -> Result<i32> {
 fn cmd_init(
     with_hook: bool,
     with_claude_md: Option<std::path::PathBuf>,
+    with_agents_md: Option<std::path::PathBuf>,
     force: bool,
     dry_run: bool,
 ) -> Result<i32> {
     let report = init::init(&init::InitOptions {
         with_hook,
         with_claude_md,
+        with_agents_md,
         force,
         dry_run,
     })?;
@@ -2548,7 +2555,15 @@ fn cmd_init(
             );
         }
     }
-    println!("skills target: {}", report.skills_target.display());
+    println!(
+        "skills targets: {}",
+        report
+            .skills_targets
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     if !report.skills_installed.is_empty() {
         println!(
             "  installed ({}): {}",
@@ -2582,6 +2597,13 @@ fn cmd_init(
             println!("CLAUDE.md: already integrated at {}", p.display());
         } else if report.claude_md_appended {
             println!("CLAUDE.md: integration section appended to {}", p.display());
+        }
+    }
+    if let Some(p) = report.agents_md_path {
+        if report.agents_md_already_present {
+            println!("AGENTS.md: already integrated at {}", p.display());
+        } else if report.agents_md_appended {
+            println!("AGENTS.md: integration section appended to {}", p.display());
         }
     }
     if dry_run {
@@ -2750,7 +2772,15 @@ fn cmd_skills(sub: SkillsCmd) -> Result<i32> {
                 dry_run,
             })?;
             println!("source: {}", report.source.display());
-            println!("target: {}", report.target.display());
+            println!(
+                "targets: {}",
+                report
+                    .targets
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
             if !report.installed.is_empty() {
                 println!(
                     "installed ({}): {}",

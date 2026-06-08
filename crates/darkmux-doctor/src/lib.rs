@@ -868,7 +868,7 @@ fn check_orchestrator_declared() -> Check {
             status: Status::Warn,
             message: "not declared — flow records won't carry orchestrator provenance".into(),
             hint: Some(
-                "Export DARKMUX_ORCHESTRATOR=<frontier-model-name> in the shell driving darkmux (e.g. `claude-opus-4-7`, `cursor-anthropic`). Operator-explicit by design (#49 cultivation discipline).".into(),
+                "Export DARKMUX_ORCHESTRATOR=<frontier-model-name> in the shell driving darkmux (e.g. `claude-opus-4-7`, `antigravity-gemini-1-5-pro`, `cursor-anthropic`). Operator-explicit by design (#49 cultivation discipline).".into(),
             ),
         },
     }

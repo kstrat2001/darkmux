@@ -86,30 +86,57 @@ pub struct InstallOptions {
 #[derive(Debug, Default)]
 pub struct InstallReport {
     pub source: PathBuf,
-    pub target: PathBuf,
+    pub targets: Vec<PathBuf>,
     pub installed: Vec<String>,
     pub skipped: Vec<String>,
     pub overwritten: Vec<String>,
 }
 
 pub fn install_skills(opts: &InstallOptions) -> Result<InstallReport> {
-    let target = match &opts.target {
-        Some(p) => p.clone(),
-        None => default_skills_target()?,
+    let targets = match &opts.target {
+        Some(p) => vec![p.clone()],
+        None => default_skills_targets()?,
     };
 
-    if !opts.dry_run && !target.exists() {
-        fs::create_dir_all(&target)
-            .with_context(|| format!("creating {}", target.display()))?;
+    let mut report = InstallReport {
+        source: PathBuf::new(),
+        targets: targets.clone(),
+        ..Default::default()
+    };
+
+    let source = locate_on_disk_skills_source();
+    report.source = source.clone().unwrap_or_else(|| PathBuf::from("<embedded>"));
+
+    for target in &targets {
+        if !opts.dry_run && !target.exists() {
+            fs::create_dir_all(target)
+                .with_context(|| format!("creating {}", target.display()))?;
+        }
+
+        let sub_report = if let Some(src) = &source {
+            install_from_disk(src, target, opts)?
+        } else {
+            install_from_embedded(target, opts)?
+        };
+
+        for s in sub_report.installed {
+            if !report.installed.contains(&s) {
+                report.installed.push(s);
+            }
+        }
+        for s in sub_report.overwritten {
+            if !report.overwritten.contains(&s) {
+                report.overwritten.push(s);
+            }
+        }
+        for s in sub_report.skipped {
+            if !report.skipped.contains(&s) {
+                report.skipped.push(s);
+            }
+        }
     }
 
-    // Prefer on-disk skills if available (lets developers iterate without
-    // rebuilding); fall back to embedded skills (the typical end-user path).
-    if let Some(source) = locate_on_disk_skills_source() {
-        install_from_disk(&source, &target, opts)
-    } else {
-        install_from_embedded(&target, opts)
-    }
+    Ok(report)
 }
 
 fn install_from_disk(
@@ -119,7 +146,7 @@ fn install_from_disk(
 ) -> Result<InstallReport> {
     let mut report = InstallReport {
         source: source.to_path_buf(),
-        target: target.to_path_buf(),
+        targets: vec![target.to_path_buf()],
         ..Default::default()
     };
 
@@ -174,7 +201,7 @@ fn install_from_disk(
 fn install_from_embedded(target: &Path, opts: &InstallOptions) -> Result<InstallReport> {
     let mut report = InstallReport {
         source: PathBuf::from("<embedded>"),
-        target: target.to_path_buf(),
+        targets: vec![target.to_path_buf()],
         ..Default::default()
     };
 
@@ -254,35 +281,52 @@ fn locate_skills_source() -> Result<PathBuf> {
     })
 }
 
-/// Default install target: `~/.claude/skills/`.
-///
-/// Skills install flat (each as `~/.claude/skills/<skill-name>/SKILL.md`) so
-/// they're invokable as `/<skill-name>`. Skill names already carry the
-/// `darkmux-` prefix (e.g. `darkmux-swap-stack`) so they're discoverable as
-/// a group without nesting under a subdirectory.
-///
-/// Override with `--target` to install into another agent runtime's skill dir.
-fn default_skills_target() -> Result<PathBuf> {
+/// Default install targets. Automatically detects `~/.claude/` and `~/.gemini/`
+/// and returns both if present, defaulting to Claude as a fallback.
+fn default_skills_targets() -> Result<Vec<PathBuf>> {
     let home = dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("could not resolve home directory"))?;
-    Ok(home.join(".claude").join("skills"))
+    let mut targets = Vec::new();
+
+    let claude_dir = home.join(".claude");
+    if claude_dir.exists() {
+        targets.push(claude_dir.join("skills"));
+    }
+
+    let gemini_dir = home.join(".gemini");
+    if gemini_dir.exists() {
+        targets.push(gemini_dir.join("config").join("skills"));
+    }
+
+    if targets.is_empty() {
+        // Fallback to Claude target to preserve legacy default behavior
+        targets.push(claude_dir.join("skills"));
+    }
+
+    Ok(targets)
 }
 
 pub fn list_installed_skills(target: Option<&Path>) -> Result<Vec<String>> {
-    let dir = match target {
-        Some(p) => p.to_path_buf(),
-        None => default_skills_target()?,
+    let targets = match target {
+        Some(p) => vec![p.to_path_buf()],
+        None => default_skills_targets()?,
     };
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
+
     let mut out: Vec<String> = Vec::new();
-    for entry in fs::read_dir(&dir)? {
-        let entry = entry?;
-        let p = entry.path();
-        if p.is_dir() && p.join("SKILL.md").exists() {
-            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                out.push(name.to_string());
+    for dir in &targets {
+        if !dir.exists() {
+            continue;
+        }
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let p = entry.path();
+            if p.is_dir() && p.join("SKILL.md").exists() {
+                if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                    let name_str = name.to_string();
+                    if !out.contains(&name_str) {
+                        out.push(name_str);
+                    }
+                }
             }
         }
     }
