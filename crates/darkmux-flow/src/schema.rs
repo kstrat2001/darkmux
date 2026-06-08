@@ -172,7 +172,7 @@ pub struct FlowRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub machine_uid: Option<String>,
     /// Frontier orchestrator driving this record's session — e.g.,
-    /// `"claude-opus-4-7"`, `"antigravity-gemini-1-5-pro"`, `"cursor-anthropic"`. Auto-populated from
+    /// `"claude-code"`, `"antigravity"`, `"cursor"`. Auto-populated from
     /// `DARKMUX_ORCHESTRATOR` env at write time. Operator-explicit by
     /// design: there's no reliable way to auto-detect the frontier-tier
     /// AI from inside darkmux. None when the operator hasn't declared.
