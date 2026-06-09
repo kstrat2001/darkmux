@@ -312,7 +312,7 @@
     <div class="loglist">
       <div class="loghead">
         <h3><span>event log · <span id="logscope">fleet</span></span>
-            <button class="fbtn" id="fbtn" onclick="openFilters()">⚙ filters</button></h3>
+            <button class="fbtn" id="fbtn" data-act="filters">⚙ filters</button></h3>
         <div class="logsearch">
           <div class="searchbox">
             <span class="sicon" aria-hidden="true">⌕</span>
@@ -335,9 +335,9 @@
 </div>
 <div class="modalbg" id="modalbg">
   <div class="modal">
-    <div class="mhd"><span>filter events</span><button class="mx" onclick="closeFilters()">✕</button></div>
+    <div class="mhd"><span>filter events</span><button class="mx" data-act="closefilters">✕</button></div>
     <div id="filterbody"></div>
-    <div class="mft"><input id="fsearch" placeholder="search text…"><button class="clr" onclick="clearFilters()">clear all</button></div>
+    <div class="mft"><input id="fsearch" placeholder="search text…"><button class="clr" data-act="clearfilters">clear all</button></div>
   </div>
 </div>
 
@@ -401,8 +401,13 @@ const relAgo=t=>{const d=state.t-t;if(d<0)return"";const s=Math.floor(d/1000);
 // running card scrubbed to before its start in playback yields no relative).
 const stamp=(verb,t)=>{const r=relAgo(t);return `${verb} ${clk(t)}${r?' · '+r:''}`;};
 // Derived from DATA; recomputed whenever the data source changes (sample <-> real).
-const esc=s=>String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#x27;");
+const esc=s=>String(s??"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#x27;");
 const escBr=s=>esc(s).replace(/\n/g,"<br>");
+// Escape sugar for the single most-interpolated lookup. esc() is applied at
+// the TEMPLATE EDGE only — never inside nameOf/specOf themselves, whose raw
+// values also feed non-HTML logic (MACH_ICON key lookup, label-width math,
+// equality checks).
+const escN=m=>esc(nameOf(m));
 let tMin, tMax, missions, FCATS, FTIERS, FSRC;
 function recompute(){
   DATA.forEach(r=>r._id=r._uid);
@@ -496,7 +501,7 @@ function missionLabel(){
   return ms.length>2 ? `${ms.slice(0,2).join(', ')} +${ms.length-2} more` : ms.join(', ');
 }
 function renderMeta(){
-  $("meta").innerHTML=`<a class="misslink" onclick="goMission()">◆ ${missionLabel()}</a> · <b>${DATA_SOURCE}</b> · ${iso(tMin).slice(0,10)} `+
+  $("meta").innerHTML=`<a class="misslink" data-act="mission">◆ ${esc(missionLabel())}</a> · <b>${esc(DATA_SOURCE)}</b> · ${iso(tMin).slice(0,10)} `+
     `${iso(tMin).slice(11,19)}–${iso(tMax).slice(11,19)}Z<br>${DATA.length} records · ${machines().length} machines`;
 }
 function machActive(m){
@@ -534,8 +539,8 @@ function renderFleet(){
     // keep the prior idle/active behavior.
     const absent=machPresent(m)===false;
     const stat=absent?'offline':(act?'dispatch in flight':'idle');
-    return `<div class="mach ${act&&!absent?'active':''} ${absent?'absent':''}" onclick="drillMachine('${m}')"><div class="name"><span class="mico">${ICON[MACH_ICON[nameOf(m)]]||""}</span>${nameOf(m)}</div>
-      <div class="spec">${specOf(m)}</div><div class="stat"><span class="dot"></span>${stat} · ${runs} ${liveMode?'running':'specialist'+(runs===1?'':'s')} + utility</div>
+    return `<div class="mach ${act&&!absent?'active':''} ${absent?'absent':''}" data-act="machine" data-arg="${esc(m)}"><div class="name"><span class="mico">${ICON[MACH_ICON[nameOf(m)]]||""}</span>${escN(m)}</div>
+      <div class="spec">${esc(specOf(m))}</div><div class="stat"><span class="dot"></span>${stat} · ${runs} ${liveMode?'running':'specialist'+(runs===1?'':'s')} + utility</div>
       <div class="hint">click to drill in →</div></div>`;}).join("");
   // Activity timeline — one lane per machine; each dispatch session is a bar
   // positioned across the recorded window, revealed up to the playhead (an
@@ -549,9 +554,9 @@ function renderFleet(){
       const err=done&&dispatchErrored(c);
       const end=done?T(c.ts):state.t, L=pct(T(s.ts)), W=Math.max(0.6,pct(end)-L);
       const role=(s.handle||"").replace(/^darkmux\//,"");
-      return `<div class="sbar ${done?(err?'err':''):'a'}" style="left:${L}%;width:${W}%" title="${role} · ${sid}${done?(err?(dispatchKilled(c)?' · killed (timeout)':' · errored'):''):' · in flight'}"></div>`;
+      return `<div class="sbar ${done?(err?'err':''):'a'}" style="left:${L}%;width:${W}%" title="${esc(role)} · ${esc(sid)}${done?(err?(dispatchKilled(c)?' · killed (timeout)':' · errored'):''):' · in flight'}"></div>`;
     }).join("");
-    return `<div class="lane"><div class="lname" title="${nameOf(m)}">${nameOf(m)}</div><div class="tltrack">${bars}<div class="ph" style="left:${pct(state.t)}%"></div></div></div>`;
+    return `<div class="lane"><div class="lname" title="${escN(m)}">${escN(m)}</div><div class="tltrack">${bars}<div class="ph" style="left:${pct(state.t)}%"></div></div></div>`;
   }).join("");
   const ax=`<div class="tlaxis"><span>${iso(tMin).slice(11,16)}</span><span>${iso(tMin+span/2).slice(11,16)}</span><span>${iso(tMax).slice(11,16)}Z</span></div>`;
   // Size the lane-label column to the actual machine names so short names
@@ -574,27 +579,27 @@ function recentRow(n){
   const dur=(n.closeTs!=null&&n.startTs!=null)?fmt(n.closeTs-n.startTs):null;
   const dp=n.donePayload||{}, sp=n.startPayload||{};
   const turns=dp.total_turns, tools=dp.total_tools, comps=dp.total_compactions;
-  const metaBits=[turns!=null?turns+'t':null,tools!=null?tools+'⚙':null].filter(Boolean).join(' ');
+  const metaBits=[turns!=null?esc(turns)+'t':null,tools!=null?esc(tools)+'⚙':null].filter(Boolean).join(' ');
   const rel=n.closeTs!=null?relAgo(n.closeTs):'';
   const when=n.closeTs!=null?`${clk(n.closeTs)}${rel?' · '+rel:''}`:'';
-  const miss=n.mission?` · ${n.mission}`:'';
+  const miss=n.mission?` · ${esc(n.mission)}`:'';
   const kv=(k,v)=>v!=null&&v!==''?`<div class="kv"><b>${k}</b><span>${v}</span></div>`:'';
   const exit=dp.exit_code;
-  const result=n.killed?'killed (watchdog timeout)':n.errored?`errored${exit!=null?' (exit '+exit+')':''}`:(dp.result_class||(n.hasStart?'—':'lifecycle not captured'));
-  const about=[sp.runtime?'runtime '+sp.runtime:null,sp.image?'image '+sp.image:null,sp.prompt_chars!=null?sp.prompt_chars+' prompt chars':null].filter(Boolean).join(' · ');
-  const counts=[turns!=null?turns+' turns':null,tools!=null?tools+' tools':null,comps!=null?comps+' compactions':null].filter(Boolean).join(' · ');
+  const result=n.killed?'killed (watchdog timeout)':n.errored?`errored${exit!=null?' (exit '+esc(exit)+')':''}`:(esc(dp.result_class)||(n.hasStart?'—':'lifecycle not captured'));
+  const about=[sp.runtime?'runtime '+esc(sp.runtime):null,sp.image?'image '+esc(sp.image):null,sp.prompt_chars!=null?esc(sp.prompt_chars)+' prompt chars':null].filter(Boolean).join(' · ');
+  const counts=[turns!=null?esc(turns)+' turns':null,tools!=null?esc(tools)+' tools':null,comps!=null?esc(comps)+' compactions':null].filter(Boolean).join(' · ');
   const timing=n.startTs!=null?`${clk(n.startTs)}${n.closeTs!=null?' → '+clk(n.closeTs)+(dur?' ('+dur+')':''):''}`:'';
   const detail=[
-    kv('session',`${n.sid} &nbsp;<a onclick="drillSession('${n.sid}')">open →</a>`),
-    n.mission?kv('mission',n.mission+(n.sprint?` · sprint ${n.sprint}`:'')):'',
+    kv('session',`${esc(n.sid)} &nbsp;<a data-act="session" data-arg="${esc(n.sid)}">open →</a>`),
+    n.mission?kv('mission',esc(n.mission)+(n.sprint?` · sprint ${esc(n.sprint)}`:'')):'',
     kv('about',about),
-    kv('workspace',sp.workspace),
+    kv('workspace',esc(sp.workspace)),
     kv('result',`<span class="${(n.errored||n.killed)?'wallerr':''}">${result}</span>`),
     kv('counts',counts),
     kv('timing',timing),
   ].filter(Boolean).join("");
   return `<details class="rr"><summary><span class="pill ${n.pill}">${n.lbl}</span>`
-    +`<span class="rrmain">${n.handle} · ${n.model}${miss}</span>`
+    +`<span class="rrmain">${esc(n.handle)} · ${esc(n.model)}${miss}</span>`
     +`${metaBits?`<span class="rrmeta">${metaBits}</span>`:''}`
     +`<span class="rrtime">${when}${dur?' · '+dur:''}</span></summary>`
     +`<div class="rrdetail">${detail}</div></details>`;
@@ -675,16 +680,16 @@ function renderMachine(){
       return {cls, lbl, pill:cls, closeTs, startTs, sid, handle:s.handle, model:s.model||'?',
         mission:s.mission_id||null, sprint:s.sprint_id||null,
         startPayload:s.payload||null, donePayload, errored, killed, hasStart:true,
-        html:`<div class="node" onclick="drillSession('${sid}')"><div class="h">${s.handle}</div>
-        <div class="s">specialist role · ${s.model||'?'}</div>
-        <div class="s">session ${sid} · mission ${s.mission_id}</div>
+        html:`<div class="node" data-act="session" data-arg="${esc(sid)}"><div class="h">${esc(s.handle)}</div>
+        <div class="s">specialist role · ${esc(s.model||'?')}</div>
+        <div class="s">session ${esc(sid)} · mission ${esc(s.mission_id)}</div>
         ${tsLine}<span class="pill ${cls}">${lbl}</span></div>`};
     }
     // Fallback: no dispatch.start — pull handle/model/mission from the first
     // record we have for this session, surface honestly that the lifecycle
     // wasn't captured here.
     const first=visible().find(r=>r.session_id===sid)||{};
-    const handle=first.handle||`session ${sid}`;
+    const handle=first.handle||("session "+sid);
     const model=first.model||'?';
     const mission=first.mission_id?`mission ${first.mission_id}`:'no mission scope';
     const fbTs=closeTs??(first.ts?T(first.ts):null);
@@ -692,9 +697,9 @@ function renderMachine(){
     return {cls:'ended', lbl:'no start', pill:'warn', closeTs, startTs:first.ts?T(first.ts):null,
       sid, handle, model, mission:first.mission_id||null, sprint:null,
       startPayload:null, donePayload, errored, killed, hasStart:false,
-      html:`<div class="node" onclick="drillSession('${sid}')"><div class="h">${handle}</div>
-      <div class="s">role · ${model}</div>
-      <div class="s">session ${sid} · ${mission}</div>
+      html:`<div class="node" data-act="session" data-arg="${esc(sid)}"><div class="h">${esc(handle)}</div>
+      <div class="s">role · ${esc(model)}</div>
+      <div class="s">session ${esc(sid)} · ${esc(mission)}</div>
       ${fbLine}<span class="pill warn">no dispatch.start</span></div>`};
   });
   // (#691 Slice 2) In live mode, separate RUNNING-now from completed: completed
@@ -723,7 +728,7 @@ function renderMachine(){
     const shown=state.recentAll?recentObjs:recentObjs.slice(0,RECENT_CAP);
     const recent=shown.map(recentRow).join("");
     const more=recentCount>RECENT_CAP
-      ? `<div class="rrmore" onclick="toggleRecentAll()">${state.recentAll?'show fewer':`show all ${recentCount} →`}</div>`
+      ? `<div class="rrmore" data-act="recentall">${state.recentAll?'show fewer':`show all ${recentCount} →`}</div>`
       : '';
     specs=(running||'<span class="hint">no dispatches running right now</span>')
       +(recentCount?`<div class="rglbl rgdim">recent runs · ${recentCount} today${state.recentAll||recentCount<=RECENT_CAP?'':` · newest ${RECENT_CAP}`}</div><div class="rrlist">${recent}</div>${more}`:'');
@@ -741,13 +746,14 @@ function renderMachine(){
   // better as a separate block than as a sibling of the role cards.
   const looseSection=loose.length
     ? `<div class="rglbl rgdim">unscoped records · ${loose.length} today</div>
-        <div class="node" onclick="drillLoose('${m}')"><div class="h">unscoped records</div>
+        <div class="node" data-act="loose" data-arg="${esc(m)}"><div class="h">unscoped records</div>
         <div class="s">${loose.length} record${loose.length===1?'':'s'} without a session</div>
         <div class="s">flow notes, ambient telemetry, etc.</div>
         <span class="pill">loose</span></div>`
     : '';
-  $("stage").innerHTML=`<div><div class="stagehdr"><a onclick="goFleet()">fleet</a> › machine · ${nameOf(m)}${specOf(m)?' — '+specOf(m):''}</div>
-    <div class="rglbl">crew on ${nameOf(m)}</div>${util}${specs||(looseSection?'':'<span class="hint">no specialist runs at this point in the timeline</span>')}${looseSection}</div>`;
+  const spec=specOf(m);
+  $("stage").innerHTML=`<div><div class="stagehdr"><a data-act="fleet">fleet</a> › machine · ${escN(m)}${spec?' — '+esc(spec):''}</div>
+    <div class="rglbl">crew on ${escN(m)}</div>${util}${specs||(looseSection?'':'<span class="hint">no specialist runs at this point in the timeline</span>')}${looseSection}</div>`;
 }
 // (#691) Render the loose-records panel — records on a machine that don't have
 // a session_id (flow notes, ambient telemetry). A FIRST-CLASS render path (not
@@ -772,14 +778,14 @@ function renderLoose(){
   const max=rows.length?rows[0][1]:1, q=state.filters.q;
   const body=rows.map(([a,cnt])=>{
     const clickable=a!=="(no action)", sel=clickable&&q===a, w=Math.round(cnt/max*100);
-    return `<div class="lrow${sel?' sel':''}"${clickable?` onclick="setQuery('${a}')"`:''}>`
-      +`<span class="lrlbl">${a}</span><span class="lrbar"><span style="width:${w}%"></span></span>`
+    return `<div class="lrow${sel?' sel':''}"${clickable?` data-act="query" data-arg="${esc(a)}"`:''}>`
+      +`<span class="lrlbl">${esc(a)}</span><span class="lrbar"><span style="width:${w}%"></span></span>`
       +`<span class="lrcnt">${cnt}</span></div>`;
   }).join("");
-  $("stage").innerHTML=`<div><div class="stagehdr"><a onclick="goFleet()">fleet</a> › <a onclick="drillMachine('${m}')">${nameOf(m)}</a> › unscoped records</div>
+  $("stage").innerHTML=`<div><div class="stagehdr"><a data-act="fleet">fleet</a> › <a data-act="machine" data-arg="${esc(m)}">${escN(m)}</a> › unscoped records</div>
     <div class="rglbl">${n} record(s) without a session · by type</div>
     <div class="lbreakdown">${body||'<span class="hint">none at this point in the timeline</span>'}</div>
-    <div class="rghint">${q?`log filtered to <b>${q}</b> — <a onclick="setQuery('')">clear</a>`:'click a type to filter the event log →'}</div></div>`;
+    <div class="rghint">${q?`log filtered to <b>${esc(q)}</b> — <a data-act="query" data-arg="">clear</a>`:'click a type to filter the event log →'}</div></div>`;
 }
 // Drill into the loose-records panel. Sets state then routes through the shared
 // `render()` so landing and every live tick take the identical path.
@@ -808,17 +814,17 @@ function renderSubsystem(){
   // "so far". `wallLoud` is the red qualifier appended to the wall time.
   const wallBase=done?fmt(T(c.ts)-startTs):fmt(state.t-startTs)+" so far";
   const wallLoud=done&&dispatchErrored(c)
-    ? `<span class="wallerr"> · ${dispatchKilled(c)?'killed (timeout)':'errored'+((c.payload&&c.payload.exit_code!=null)?' (exit '+c.payload.exit_code+')':'')}</span>`
+    ? `<span class="wallerr"> · ${dispatchKilled(c)?'killed (timeout)':'errored'+((c.payload&&c.payload.exit_code!=null)?' (exit '+esc(c.payload.exit_code)+')':'')}</span>`
     : '';
   const wall=wallBase+wallLoud;
   const met=`<div class="metrics">
-    <div class="met"><div class="mv">${turns}</div><div class="ml">turns</div></div>
+    <div class="met"><div class="mv">${esc(turns)}</div><div class="ml">turns</div></div>
     <div class="met"><div class="mv">${nctx?(ctxPeak/1000).toFixed(0)+"k":"—"}</div><div class="ml">peak ctx / ${nctx?(nctx/1000)+"k window":"—"}</div><div class="tokbar"><span style="width:${nctx?Math.round(ctxPeak/nctx*100):0}%"></span></div></div>
     <div class="met"><div class="mv">${comps.length}</div><div class="ml">compactions</div></div>
     <div class="met"><div class="mv">${wall}</div><div class="ml">wall clock</div></div></div>`;
-  const segs=loads.map((r,i)=>`<span class="seg ${i>0?'b':''}">${r.fields.model} · ${r.fields.gb||'?'}GB</span>`).join("");
-  const bars=procs.map(r=>`<div class="bar" style="height:${Math.max(3,r.fields.cpu/100*78)}px" title="cpu ${r.fields.cpu}%"></div>`).join("");
-  const xvals=procs.map(r=>`<span>${r.fields.cpu}</span>`).join("");
+  const segs=loads.map((r,i)=>`<span class="seg ${i>0?'b':''}">${esc(r.fields.model)} · ${esc(r.fields.gb||'?')}GB</span>`).join("");
+  const bars=procs.map(r=>`<div class="bar" style="height:${Math.max(3,r.fields.cpu/100*78)}px" title="cpu ${esc(r.fields.cpu)}%"></div>`).join("");
+  const xvals=procs.map(r=>`<span>${esc(r.fields.cpu)}</span>`).join("");
   const cpu=procs.length?`<div class="track"><div class="lbl">process cpu — % busy</div>
     <div class="cpuchart"><div class="yax"><span>100</span><span>50</span><span>0</span></div>
       <div><div class="bars">${bars}</div><div class="xvals">${xvals}</div></div></div></div>`:"";
@@ -835,9 +841,9 @@ function renderSubsystem(){
   if(distinct.length>1)finds.push({s:"warn",k:"jit-model-swap",d:`${distinct.length} models loaded in one run (${distinct.join(" → ")}) — mid-run swap stalls the dispatch while the new model loads.`,f:"pin one model for the run, or pre-warm the swap target."});
   dets.forEach(r=>finds.push({s:r.fields.severity||"warn",k:r.fields.kind,d:r.fields.detail}));
   const detections=finds.length
-    ? `<div class="track"><div class="lbl">detections (${finds.length})</div>`+finds.map(f=>`<div class="finding ${f.s}"><span class="fk">⚠ ${f.k}</span><span class="fm">${f.d}</span>${f.f?`<span class="ff">fix: ${f.f}</span>`:""}</div>`).join("")+`</div>`
+    ? `<div class="track"><div class="lbl">detections (${finds.length})</div>`+finds.map(f=>`<div class="finding ${esc(f.s)}"><span class="fk">⚠ ${esc(f.k)}</span><span class="fm">${esc(f.d)}</span>${f.f?`<span class="ff">fix: ${esc(f.f)}</span>`:""}</div>`).join("")+`</div>`
     : `<div class="track"><div class="lbl">detections</div><div class="finding ok"><span class="fk">✓ clean</span><span class="fm">no behavioral flags (cycle, tool-failure, reasoning-loop, edit-drift)</span></div></div>`;
-  $("stage").innerHTML=`<div class="sub"><h2>subsystem · ${handle} <span style="color:var(--muted);text-transform:none;font-weight:400">(${sid} on <a onclick="drillMachine('${m}')">${nameOf(m)}</a>)</span></h2>
+  $("stage").innerHTML=`<div class="sub"><h2>subsystem · ${esc(handle)} <span style="color:var(--muted);text-transform:none;font-weight:400">(${esc(sid)} on <a data-act="machine" data-arg="${esc(m)}">${escN(m)}</a>)</span></h2>
     ${met}
     <div class="track"><div class="lbl">model (lms)</div>${segs||'<span class="hint">no telemetry yet</span>'}</div>
     ${cpu}
@@ -861,36 +867,36 @@ function renderDetail(){
   const f=r.fields||r.payload;
   if(r.action==="dispatch.reasoning"&&f&&f.reasoning_text){
     html=`<div class="detail-card reasoning">
-      <h3>model reasoning (turn ${f.turn_seq||0})</h3>
+      <h3>model reasoning (turn ${esc(f.turn_seq||0)})</h3>
       <div class="content">${escBr(f.reasoning_text)}</div>
     </div>`;
   }else if(r.action==="dispatch.tool"&&f){
     html=`<div class="detail-card tool ${f.ok===false?'fail':''}">
-      <h3>tool execution: ${esc(f.tool_name)} (seq ${f.tool_seq||0})</h3>
+      <h3>tool execution: ${esc(f.tool_name)} (seq ${esc(f.tool_seq||0)})</h3>
       <table class="detail-table">
         <tr><td>status</td><td>${f.ok!==false?'✓ success':'✗ failure'}</td></tr>
-        <tr><td>arguments size</td><td>${f.args_chars!=null?f.args_chars+' chars':'—'}</td></tr>
-        <tr><td>result size</td><td>${f.result_chars!=null?f.result_chars+' chars':'—'}</td></tr>
+        <tr><td>arguments size</td><td>${f.args_chars!=null?esc(f.args_chars)+' chars':'—'}</td></tr>
+        <tr><td>result size</td><td>${f.result_chars!=null?esc(f.result_chars)+' chars':'—'}</td></tr>
       </table>
     </div>`;
   }else if(r.action==="dispatch.turn"&&f){
     const u=f.usage||{};
     html=`<div class="detail-card">
-      <h3>turn completed (turn ${f.turn_seq||0})</h3>
+      <h3>turn completed (turn ${esc(f.turn_seq||0)})</h3>
       <table class="detail-table">
         <tr><td>finish reason</td><td>${esc(f.finish_reason)}</td></tr>
-        <tr><td>tools called</td><td>${f.tool_calls_count||0}</td></tr>
-        <tr><td>token usage</td><td>prompt: ${u.prompt_tokens||0} · completion: ${u.completion_tokens||0}</td></tr>
+        <tr><td>tools called</td><td>${esc(f.tool_calls_count||0)}</td></tr>
+        <tr><td>token usage</td><td>prompt: ${esc(u.prompt_tokens||0)} · completion: ${esc(u.completion_tokens||0)}</td></tr>
       </table>
     </div>`;
   }else if(r.action==="dispatch.compaction"&&f){
     html=`<div class="detail-card">
       <h3>compaction event</h3>
       <table class="detail-table">
-        <tr><td>generation</td><td>${f.generation||0}</td></tr>
-        <tr><td>messages before</td><td>${f.before_messages||0}</td></tr>
-        <tr><td>messages after</td><td>${f.after_messages||0}</td></tr>
-        <tr><td>summary size</td><td>${f.summary_chars!=null?f.summary_chars+' chars':'—'}</td></tr>
+        <tr><td>generation</td><td>${esc(f.generation||0)}</td></tr>
+        <tr><td>messages before</td><td>${esc(f.before_messages||0)}</td></tr>
+        <tr><td>messages after</td><td>${esc(f.after_messages||0)}</td></tr>
+        <tr><td>summary size</td><td>${f.summary_chars!=null?esc(f.summary_chars)+' chars':'—'}</td></tr>
       </table>
     </div>`;
   }else if(r.action==="tier-decision"&&r.reasoning){
@@ -900,7 +906,7 @@ function renderDetail(){
     </div>`;
   }
   if(html){
-    $("detailbody").innerHTML=html+`<details ${state.rawOpen ? 'open' : ''} ontoggle="state.rawOpen=this.open"><summary>raw event JSON</summary><pre>${pretty(r)}</pre></details>`;
+    $("detailbody").innerHTML=html+`<details ${state.rawOpen ? 'open' : ''} data-raw><summary>raw event JSON</summary><pre>${pretty(r)}</pre></details>`;
   }else{
     $("detailbody").innerHTML=`<pre>${pretty(r)}</pre>`;
   }
@@ -923,16 +929,16 @@ function renderLog(){
     if(r.action==="dispatch.reasoning"&&f&&f.reasoning_text){
       detail=` · <span class="preview-text">"${esc(f.reasoning_text.slice(0,60).replace(/\n/g," "))}..."</span>`;
     }else if(r.action==="dispatch.tool"&&f){
-      detail=` · <span class="preview-text">${esc(f.tool_name)} (${f.args_chars||0}ch → ${f.result_chars||0}ch)${f.ok!==false?'':' ❌'}</span>`;
+      detail=` · <span class="preview-text">${esc(f.tool_name)} (${esc(f.args_chars||0)}ch → ${esc(f.result_chars||0)}ch)${f.ok!==false?'':' ❌'}</span>`;
     }else if(r.action==="dispatch.turn"&&f){
-      detail=` · <span class="preview-text">turn ${f.turn_seq||0} (${esc(f.finish_reason)})</span>`;
+      detail=` · <span class="preview-text">turn ${esc(f.turn_seq||0)} (${esc(f.finish_reason)})</span>`;
     }else if(r.action==="tier-decision"&&r.reasoning){
       detail=` · <span class="preview-text">"${esc(r.reasoning.slice(0,60).replace(/\n/g," "))}..."</span>`;
     }else if(r.action==="dispatch.start"||r.action==="dispatch start"){
-      detail=` · <span class="preview-text">start (prompt: ${f?f.prompt_chars:0}ch)</span>`;
+      detail=` · <span class="preview-text">start (prompt: ${esc(f?f.prompt_chars:0)}ch)</span>`;
     }
-    return `<div class="rec ${r.category} ${r._id===state.selected?'sel':''}" onclick="selectRec(${r._id})">
-      <span class="t">${tt}</span> <span class="tag">${tag}</span> ${r.machine_id||''}${r.session_id?(' · '+r.session_id):''}${detail}</div>`;
+    return `<div class="rec ${esc(r.category)} ${r._id===state.selected?'sel':''}" data-act="rec" data-arg="${r._id}">
+      <span class="t">${tt}</span> <span class="tag">${esc(tag)}</span> ${esc(r.machine_id||'')}${r.session_id?(' · '+esc(r.session_id)):''}${detail}</div>`;
   }).join(""):`<div class="empty">${state.filters.q?'no events match your search':'no events match the current filters'}</div>`;
 }
 function renderCrumb(){
@@ -944,11 +950,11 @@ function renderCrumb(){
   // mission link (no stale "◆ m6"). Playback: primaryMission()=missions[0].
   const pm=primaryMission();
   const hasMission=pm!=null;
-  let c=hasMission?`<a class="misslink" onclick="goMission()">◆ ${pm}</a>`:``;
+  let c=hasMission?`<a class="misslink" data-act="mission">◆ ${esc(pm)}</a>`:``;
   if(state.level!=="mission"){
-    c+=(hasMission?`<span class="sep">›</span>`:``)+`<a onclick="goFleet()">fleet</a>`;
-    if(state.level==="machine"||state.level==="subsystem") c+=`<span class="sep">›</span><a onclick="drillMachine('${state.machine}')">${state.machine}</a>`;
-    if(state.level==="subsystem") c+=`<span class="sep">›</span>${state.session}`;
+    c+=(hasMission?`<span class="sep">›</span>`:``)+`<a data-act="fleet">fleet</a>`;
+    if(state.level==="machine"||state.level==="subsystem") c+=`<span class="sep">›</span><a data-act="machine" data-arg="${esc(state.machine)}">${esc(state.machine)}</a>`;
+    if(state.level==="subsystem") c+=`<span class="sep">›</span>${esc(state.session)}`;
   }
   $("crumb").innerHTML=c; $("back").disabled=(state.level==="fleet");
 }
@@ -998,9 +1004,9 @@ function renderMission(){
   const errored=sessions.filter(s=>s.status==="errored").length;
   const pct=total?Math.round(done/total*100):0;
   const machs=[...new Set(sessions.map(s=>s.machine))];
-  const rows=sessions.map(s=>`<div class="sprow"><span class="sps ${s.status}">${s.status}</span><span class="spt">${s.role} · ${s.machine}</span><span class="spa">${s.model}</span></div>`).join("")||`<div class="none">no dispatches at this point in the timeline</div>`;
-  $("stage").innerHTML=`<div class="sub"><h2>mission · ${mid}</h2>
-    <div class="mgoal">${total} dispatch${total===1?'':'es'} across ${machs.length} machine${machs.length===1?'':'s'}${machs.length?' · '+machs.join(', '):''}</div>
+  const rows=sessions.map(s=>`<div class="sprow"><span class="sps ${s.status}">${s.status}</span><span class="spt">${esc(s.role)} · ${esc(s.machine)}</span><span class="spa">${esc(s.model)}</span></div>`).join("")||`<div class="none">no dispatches at this point in the timeline</div>`;
+  $("stage").innerHTML=`<div class="sub"><h2>mission · ${esc(mid)}</h2>
+    <div class="mgoal">${total} dispatch${total===1?'':'es'} across ${machs.length} machine${machs.length===1?'':'s'}${machs.length?' · '+esc(machs.join(', ')):''}</div>
     <div class="burn"><div class="burnbar"><span style="width:${pct}%"></span></div><div class="burnlbl">${done}/${total} dispatches complete · ${pct}%${active?' · '+active+' in flight':''}${errored?` · <span class="wallerr">${errored} errored</span>`:''}</div></div>
     <div class="track"><div class="lbl">dispatches</div>${rows}</div></div>`;
 }
@@ -1039,7 +1045,7 @@ $("play").onclick=()=>{
 // filter modal
 function renderFilters(){
   const grp=(title,vals,k)=>`<div class="fgroup"><h4>${title}</h4>`+vals.map(v=>
-    `<label><input type="checkbox" ${state.filters[k].has(v)?'checked':''} onclick="toggleFilter('${k}','${v}')"> ${v}</label>`).join("")+`</div>`;
+    `<label><input type="checkbox" ${state.filters[k].has(v)?'checked':''} data-act="filter" data-k="${esc(k)}" data-arg="${esc(v)}"> ${esc(v)}</label>`).join("")+`</div>`;
   $("filterbody").innerHTML=grp('category',FCATS,'cat')+grp('tier',FTIERS,'tier')+grp('telemetry source',FSRC,'src');
 }
 window.toggleFilter=(k,v)=>{const s=state.filters[k];s.has(v)?s.delete(v):s.add(v);render();};
@@ -1064,6 +1070,39 @@ $("logq").oninput=e=>setQuery(e.target.value);
 // the input so the operator can keep typing a fresh filter.
 $("sclear").onclick=()=>{setQuery("");const lq=$("logq");if(lq)lq.focus();};
 $("modalbg").onclick=e=>{if(e.target===$("modalbg"))closeFilters();};
+// ── Delegated event handling (viewer output-encoding hardening) ────────────
+// Rendered templates carry NO inline event-handler attributes: record-derived
+// values ride in data-* attributes and come back as plain strings via
+// `dataset` — there is no JS-string context to break out of, so a malicious
+// identifier in a flow record can't execute. ONE delegated listener routes
+// every click. The companion invariant (zero inline handlers in this file) is
+// enforced by `viewer_has_no_inline_event_handlers` in the serve crate.
+const ACTIONS={
+  machine:a=>drillMachine(a),
+  session:a=>drillSession(a),
+  loose:a=>drillLoose(a),
+  query:a=>setQuery(a||""),
+  rec:a=>selectRec(Number(a)),
+  fleet:()=>goFleet(),
+  mission:()=>goMission(),
+  recentall:()=>toggleRecentAll(),
+  filters:()=>openFilters(),
+  closefilters:()=>closeFilters(),
+  clearfilters:()=>clearFilters(),
+};
+document.addEventListener("click",e=>{
+  const el=e.target.closest("[data-act]");
+  if(!el)return;
+  if(el.dataset.act==="filter"){toggleFilter(el.dataset.k,el.dataset.arg);return;}
+  const fn=ACTIONS[el.dataset.act];
+  if(fn)fn(el.dataset.arg);
+});
+// `toggle` doesn't bubble — a capture-phase listener stands in for the old
+// inline ontoggle on the raw-JSON <details> (tagged data-raw; the recent-runs
+// <details class="rr"> rows don't carry it and are untracked by design).
+document.addEventListener("toggle",e=>{
+  if(e.target&&e.target.matches&&e.target.matches("details[data-raw]"))state.rawOpen=e.target.open;
+},true);
 // resizable detail/log split — fixed default height stops the jumpiness; drag the divider to grow it
 (function(){const DEF=200,MIN=110,MAX=520;$("detail").style.height=DEF+"px";let drag=false,sy=0,sh=0;
   $("split").addEventListener("mousedown",e=>{drag=true;sy=e.clientY;sh=$("detail").offsetHeight;document.body.style.userSelect="none";e.preventDefault();});
