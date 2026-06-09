@@ -104,7 +104,7 @@ pub enum FlowCmd {
         /// already-dispatched session — e.g., recorded after the fact).
         #[arg(long = "session-id")]
         session_id: Option<String>,
-        /// Optional source label (e.g., `frontier-claude`, `operator-manual`).
+        /// Optional source label (e.g., `frontier`, `operator-manual`).
         #[arg(long)]
         source: Option<String>,
     },
@@ -583,7 +583,7 @@ mod tests {
             sprint_id: Some("113-s1".into()),
             mission_id: Some("113-mission-propose-pipeline".into()),
             session_id: None,
-            source: Some("frontier-claude".into()),
+            source: Some("frontier".into()),
         })
         .unwrap();
 
@@ -596,7 +596,7 @@ mod tests {
         assert_eq!(rec["handle"], "coder");
         assert_eq!(rec["sprint_id"], "113-s1");
         assert_eq!(rec["mission_id"], "113-mission-propose-pipeline");
-        assert_eq!(rec["source"], "frontier-claude");
+        assert_eq!(rec["source"], "frontier");
         // reasoning carries the decision prefix + the operator's prose.
         let reasoning = rec["reasoning"].as_str().unwrap();
         assert!(reasoning.starts_with("[dispatch] "), "got: {reasoning}");
