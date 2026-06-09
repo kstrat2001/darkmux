@@ -161,7 +161,7 @@ Then on the operator's coordinator (or any other fleet member):
 curl -s "http://127.0.0.1:8765/flow/$(date +%F)"
 ```
 
-The new machine's `machine_id` should appear in the recent flow records. If yes — the new machine is joined. (There is no `darkmux flow tail` verb; query the daemon as above, or read `~/.darkmux/flows/$(date +%F).jsonl` directly on the machine itself.)
+The new machine's `machine_id` should appear in the recent flow records. If yes — the new machine is joined. Run `darkmux flow tail --session <id>` to follow it live, or read `~/.darkmux/flows/$(date +%F).jsonl` directly.
 
 ## Step 9 — Optional: start the daemon as a service
 

@@ -1662,7 +1662,7 @@ fn cmd_mission_dispatch(
                     eprintln!("  ORPHAN sprint={sid} session={sess} work_id={wid}");
                 }
                 eprintln!(
-                    "Tail each via `darkmux flow tail --session <id>` (when implemented) OR \
+                    "Tail each via `darkmux flow tail --session <id>` OR \
                      XRANGE darkmux:flow against the published session_ids to track completion. \
                      Do NOT re-run mission dispatch without checking — re-publish would \
                      double-fire the orphans."
