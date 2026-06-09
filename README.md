@@ -174,7 +174,7 @@ Optional integrations (Redis coordination, the audit log) are blocks you turn on
 
 **Secrets stay out of the file.** A Redis password is never written to `config.json` — it lives in the macOS Keychain (store it once: `security add-generic-password -a "$USER" -s darkmux-redis -w`), read at runtime and never logged. On non-macOS, pass a full `DARKMUX_REDIS_URL` instead.
 
-> `config.json` (darkmux's settings) is a separate file from `profiles.json` (your swap profiles). Point at a non-default profiles registry with `--profiles <path>` or `DARKMUX_PROFILES`.
+> `config.json` (darkmux's settings) is a separate file from `profiles.json` (your swap profiles). Point at a non-default profiles registry with `--profiles-file <path>` or `DARKMUX_PROFILES`.
 
 ### First useful commands
 
