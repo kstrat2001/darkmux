@@ -137,6 +137,17 @@ pub enum FlowCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Tail flow records, optionally filtered to one session, following new
+    /// appends live (like `tail -f`). Ctrl-C to stop.
+    #[command(name = "tail")]
+    Tail {
+        /// Only show records for this session id.
+        #[arg(long = "session")]
+        session: Option<String>,
+        /// Emit raw JSON lines instead of a formatted one-line summary.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub fn run(cmd: FlowCmd) -> Result<()> {
@@ -145,6 +156,7 @@ pub fn run(cmd: FlowCmd) -> Result<()> {
     match cmd {
         FlowCmd::Status { json } => return print_status(json),
         FlowCmd::IntegrityCheck { path, json } => return print_integrity_check(path, json),
+        FlowCmd::Tail { session, json } => return run_tail(session.as_deref(), json),
         _ => {}
     }
     let record = build_record(cmd);
@@ -204,6 +216,88 @@ fn print_integrity_check(path: Option<std::path::PathBuf>, json: bool) -> Result
         std::process::exit(2);
     }
     Ok(())
+}
+
+/// Filter a single JSONL line for tail output.
+///
+/// Returns `Some(string)` when the line should be printed, `None` otherwise.
+/// When `session` is `Some(s)`, only records whose `session_id` equals `s`
+/// are returned. When `json` is true, the raw line is returned; otherwise
+/// a concise one-line summary is built from available fields.
+fn tail_match(line: &str, session: Option<&str>, json: bool) -> Option<String> {
+    let parsed = match serde_json::from_str::<serde_json::Value>(line) {
+        Ok(v) => v,
+        Err(_) => return None, // unparseable line — skip
+    };
+
+    if let Some(s) = session {
+        if parsed.get("session_id").and_then(|v| v.as_str()) != Some(s) {
+            return None;
+        }
+    }
+
+    if json {
+        Some(line.to_string())
+    } else {
+        let ts = parsed.get("ts").and_then(|v| v.as_str()).unwrap_or("");
+        let action = parsed.get("action").and_then(|v| v.as_str()).unwrap_or("-");
+        let handle = parsed.get("handle").and_then(|v| v.as_str()).unwrap_or("-");
+        let session_id = parsed
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-");
+        Some(format!("{ts} {action} {handle} {session_id}"))
+    }
+}
+
+/// Run `darkmux flow tail`: read today's JSONL file, then follow new appends
+/// until interrupted (Ctrl-C / SIGINT — default signal handler).
+pub fn run_tail(session: Option<&str>, json: bool) -> anyhow::Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::thread;
+    use std::time::Duration;
+
+    let flows_dir = flow::flows_dir();
+    // Track which day file we're tailing + our byte offset into it. The day is
+    // recomputed each tick so a tail running across UTC midnight follows the new
+    // day's `<date>.jsonl` instead of going silent (#695; same rollover the
+    // viewer handles per #730). First iteration: day == "" → reads from offset 0.
+    let mut day = String::new();
+    let mut offset: u64 = 0;
+
+    loop {
+        let today: String = flow::ts_utc_now().chars().take(10).collect();
+        if today != day {
+            day = today;
+            offset = 0; // new day file — start from the top
+        }
+        let today_file = flows_dir.join(format!("{day}.jsonl"));
+
+        if let Ok(mut f) = std::fs::File::open(&today_file) {
+            if let Ok(meta) = f.metadata() {
+                let current_len = meta.len();
+                if current_len > offset {
+                    let mut buf = Vec::new();
+                    if f.seek(SeekFrom::Start(offset)).is_ok() && f.read_to_end(&mut buf).is_ok() {
+                        offset = current_len;
+                        let content = String::from_utf8_lossy(&buf);
+                        for line in content.lines() {
+                            if let Some(s) = tail_match(line, session, json) {
+                                println!("{s}");
+                            }
+                        }
+                        let _ = std::io::stdout().flush();
+                    }
+                } else if current_len < offset {
+                    // File shrank/rotated under us — restart from the top.
+                    offset = 0;
+                }
+            }
+        }
+        // (If the file doesn't exist yet, just keep polling until it appears.)
+
+        thread::sleep(Duration::from_millis(500));
+    }
 }
 
 pub fn build_record(cmd: FlowCmd) -> FlowRecord {
@@ -335,6 +429,9 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
         ),
         FlowCmd::IntegrityCheck { .. } => unreachable!(
             "FlowCmd::IntegrityCheck is a read verb and must be handled by run() before build_record"
+        ),
+        FlowCmd::Tail { .. } => unreachable!(
+            "FlowCmd::Tail is a read verb and must be handled by run() before build_record"
         ),
     }
 }
@@ -626,5 +723,34 @@ mod tests {
         let reasoning = rec["reasoning"].as_str().unwrap();
         assert!(reasoning.starts_with("[direct] "), "got: {reasoning}");
         assert!(reasoning.contains("Multi-variable holding"), "got: {reasoning}");
+    }
+
+    #[test]
+    fn tail_match_session_filter_matches() {
+        let line = r#"{"ts":"2025-01-01T00:00:00Z","action":"note","handle":"hello","session_id":"abc"}"#;
+        assert!(tail_match(line, Some("abc"), false).is_some());
+    }
+
+    #[test]
+    fn tail_match_session_filter_no_match() {
+        let line = r#"{"ts":"2025-01-01T00:00:00Z","action":"note","handle":"hello","session_id":"abc"}"#;
+        assert!(tail_match(line, Some("xyz"), false).is_none());
+    }
+
+    #[test]
+    fn tail_match_no_session_filter_always_some() {
+        let line = r#"{"ts":"2025-01-01T00:00:00Z","action":"note","handle":"hello"}"#;
+        assert!(tail_match(line, None, false).is_some());
+    }
+
+    #[test]
+    fn tail_match_unparseable_line_returns_none() {
+        assert!(tail_match("not json at all", None, false).is_none());
+    }
+
+    #[test]
+    fn tail_match_json_mode_returns_raw_line() {
+        let line = r#"{"ts":"2025-01-01T00:00:00Z","action":"note"}"#;
+        assert_eq!(tail_match(line, None, true), Some(line.to_string()));
     }
 }
