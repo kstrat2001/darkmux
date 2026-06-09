@@ -2125,8 +2125,8 @@ mod tests {
         // No env → None. Operator-explicit by design (#49).
         assert_eq!(resolve_orchestrator(), None);
 
-        unsafe { env::set_var("DARKMUX_ORCHESTRATOR", "claude-opus-4-7"); }
-        assert_eq!(resolve_orchestrator().as_deref(), Some("claude-opus-4-7"));
+        unsafe { env::set_var("DARKMUX_ORCHESTRATOR", "claude-code"); }
+        assert_eq!(resolve_orchestrator().as_deref(), Some("claude-code"));
 
         unsafe { env::set_var("DARKMUX_ORCHESTRATOR", "   "); }
         assert_eq!(resolve_orchestrator(), None);
@@ -2189,7 +2189,7 @@ mod tests {
             mission_id: None,
             machine_id: Some("studio".to_string()),
             machine_uid: None,
-            orchestrator: Some("claude-opus-4-7".to_string()),
+            orchestrator: Some("claude-code".to_string()),
             prev_hash: None,
             hash: None,
             payload: None,
@@ -2199,7 +2199,7 @@ mod tests {
         let s = serde_json::to_string(&rec).unwrap();
         let parsed: FlowRecord = serde_json::from_str(&s).unwrap();
         assert_eq!(parsed.machine_id.as_deref(), Some("studio"));
-        assert_eq!(parsed.orchestrator.as_deref(), Some("claude-opus-4-7"));
+        assert_eq!(parsed.orchestrator.as_deref(), Some("claude-code"));
     }
 
     #[serial_test::serial]

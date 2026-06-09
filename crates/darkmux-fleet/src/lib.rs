@@ -347,7 +347,7 @@ mod tests {
             None, // image (#703 Slice 4)
             600,
             Some("studio".to_string()),
-            Some("claude-opus-4-7".to_string()),
+            Some("claude-code".to_string()),
         );
         let json = serde_json::to_string(&job).unwrap();
         let parsed: WorkJob = serde_json::from_str(&json).unwrap();

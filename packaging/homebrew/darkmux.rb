@@ -105,7 +105,7 @@ class Darkmux < Formula
 
         3. In your shell rc (~/.zshrc), set per-machine identity:
              export DARKMUX_MACHINE_ID=studio     # operator-named; not hostname
-             export DARKMUX_ORCHESTRATOR=claude-opus-4-7
+             export DARKMUX_ORCHESTRATOR=claude-code
 
            (The wrapper script picks up DARKMUX_MACHINE_ID from your env at
            launchd-load time. Re-run `brew services restart darkmux` after

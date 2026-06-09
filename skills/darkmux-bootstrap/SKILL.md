@@ -123,15 +123,15 @@ Three outcomes:
 
 ## Step 5 — Optional: declare the orchestrator
 
-Flow records carry an `orchestrator` field that names the frontier session driving the work (e.g., `claude-opus-4-7`). Declaring it gives provenance to every flow record. Propose:
+Flow records carry an `orchestrator` field that names the frontier session driving the work (e.g., `claude-code`, `antigravity`). Declaring it gives provenance to every flow record. Propose:
 
 > Want flow records to carry the orchestrator name? It's operator-explicit by design — no auto-detection. Export this in your shell rc:
 >
 > ```bash
-> export DARKMUX_ORCHESTRATOR=claude-opus-4-7
+> export DARKMUX_ORCHESTRATOR=claude-code
 > ```
 >
-> Replace `claude-opus-4-7` with the model driving this session. Doctor will surface a warning until it's declared.
+> Replace `claude-code` with the harness driving this session (e.g. `claude-code`, `antigravity`, `cursor`). Doctor will surface a warning until it's declared.
 
 ## Step 6 — Optional: enable the compliance substrates
 

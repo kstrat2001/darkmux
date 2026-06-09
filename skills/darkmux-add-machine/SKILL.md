@@ -85,7 +85,7 @@ Tell the operator to add these to `~/.zshrc` (or `~/.bashrc`):
 export DARKMUX_MACHINE_ID=<picked-in-step-3>
 export DARKMUX_REDIS_URL=redis://default:<password>@<coord-addr>:6379
 # Optional: name this frontier session in flow records
-export DARKMUX_ORCHESTRATOR=<claude-opus-4-7 / cursor / etc.>
+export DARKMUX_ORCHESTRATOR=<harness-name (e.g. claude-code / antigravity / cursor)>
 ```
 
 `DARKMUX_AUDIT_DIR` is intentionally NOT set here — audit substrate is the `/darkmux-enable-audit` skill's territory. Only run that if the operator wants the compliance posture.
