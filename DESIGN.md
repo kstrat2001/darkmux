@@ -4,7 +4,7 @@
 
 The smallest useful thing. CLI that:
 
-1. Reads `~/.darkmux/profiles.json` (or `--profiles <path>`)
+1. Reads `~/.darkmux/profiles.json` (or `--profiles-file <path>`)
 2. Looks up the named profile
 3. Calls `lms unload --all` (or selectively unloads only mismatched models)
 4. Calls `lms load <model> --context-length <N> --identifier <id>` for each model in profile

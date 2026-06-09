@@ -89,7 +89,7 @@ enum Cmd {
         recommended: bool,
         /// Profiles-registry path (profiles.json). Overrides DARKMUX_PROFILES
         /// and the default search locations. (renamed from --config, #661)
-        #[arg(long)]
+        #[arg(long = "profiles-file")]
         profiles: Option<String>,
         #[arg(long, short = 'n')]
         dry_run: bool,
@@ -108,14 +108,14 @@ enum Cmd {
     Status {
         /// Profiles-registry path (profiles.json). Overrides DARKMUX_PROFILES
         /// and the default search locations. (renamed from --config, #661)
-        #[arg(long)]
+        #[arg(long = "profiles-file")]
         profiles: Option<String>,
     },
     /// List profiles in the registry.
     Profiles {
         /// Profiles-registry path (profiles.json). Overrides DARKMUX_PROFILES
         /// and the default search locations. (renamed from --config, #661)
-        #[arg(long)]
+        #[arg(long = "profiles-file")]
         profiles: Option<String>,
     },
     /// Lab subcommands.
@@ -166,7 +166,7 @@ enum Cmd {
     Scan {
         /// Profiles-registry path (profiles.json). Overrides DARKMUX_PROFILES
         /// and the default search locations. (renamed from --config, #661)
-        #[arg(long)]
+        #[arg(long = "profiles-file")]
         profiles: Option<String>,
     },
     /// Profile management subcommands.
@@ -882,7 +882,7 @@ enum LabCmd {
         runs: u32,
         /// Profiles-registry path (profiles.json). Overrides DARKMUX_PROFILES
         /// and the default search locations. (renamed from --config, #661)
-        #[arg(long)]
+        #[arg(long = "profiles-file")]
         profiles: Option<String>,
         #[arg(long, short = 'q')]
         quiet: bool,
@@ -935,7 +935,7 @@ enum LabCmd {
         profile: Option<String>,
         /// Profiles-registry path (profiles.json). Overrides DARKMUX_PROFILES
         /// and the default search locations. (renamed from --config, #661)
-        #[arg(long)]
+        #[arg(long = "profiles-file")]
         profiles: Option<String>,
     },
     /// Multi-run distribution characterization with bimodal cluster detection.
@@ -952,7 +952,7 @@ enum LabCmd {
         runs: u32,
         /// Profiles-registry path (profiles.json). Overrides DARKMUX_PROFILES
         /// and the default search locations. (renamed from --config, #661)
-        #[arg(long)]
+        #[arg(long = "profiles-file")]
         profiles: Option<String>,
     },
     /// Register a fixture directory in the lab registry by name (#491).
