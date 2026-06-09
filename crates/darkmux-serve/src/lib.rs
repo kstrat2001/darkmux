@@ -1580,17 +1580,45 @@ mod tests {
     #[test]
     fn viewer_has_no_inline_event_handlers() {
         let html = include_str!("../assets/viewer.html");
-        for needle in [
-            "onclick=\"", "onclick='", "ontoggle=\"", "ontoggle='",
-            "onerror=\"", "onerror='", "onload=\"", "onload='",
-            "onmouseover=\"", "onmouseover='", "onchange=\"", "onchange='",
-        ] {
-            assert!(
-                !html.contains(needle),
-                "viewer.html contains inline event handler `{needle}…` — use \
-                 data-act/data-arg + the delegated listener instead (XSS hardening)"
-            );
+        // Scan the WHOLE inline-handler attribute class, not a fixed name list:
+        // an HTML `on<event>=` attribute is leading whitespace, `on`, lowercase
+        // letters, optional whitespace, `=`, then a quote. Matches onclick/
+        // ontoggle/oninput/onkeydown/onsubmit/… alike, so reintroducing ANY of
+        // them fails the build. (`$("x").onclick=` JS property assignment is NOT
+        // matched — it has no leading-whitespace `on…="` attribute shape.)
+        let bytes = html.as_bytes();
+        for (i, w) in bytes.windows(3).enumerate() {
+            if matches!(w[0], b' ' | b'\t' | b'\n') && w[1] == b'o' && w[2] == b'n' {
+                let mut j = i + 3;
+                while j < bytes.len() && bytes[j].is_ascii_lowercase() {
+                    j += 1;
+                }
+                let mut k = j;
+                while k < bytes.len() && matches!(bytes[k], b' ' | b'\t') {
+                    k += 1;
+                }
+                if j > i + 3 && bytes.get(k) == Some(&b'=') {
+                    let mut q = k + 1;
+                    while q < bytes.len() && matches!(bytes[q], b' ' | b'\t') {
+                        q += 1;
+                    }
+                    if matches!(bytes.get(q), Some(b'"') | Some(b'\'')) {
+                        let attr = String::from_utf8_lossy(&bytes[i + 1..j]);
+                        panic!(
+                            "viewer.html contains inline event handler `{attr}=…` \
+                             (byte {i}) — use data-act/data-arg + the delegated \
+                             listener instead (XSS hardening)"
+                        );
+                    }
+                }
+            }
         }
+        // No `javascript:` URL sinks either (an href/src carrying a
+        // record-derived scheme would dodge the attribute scan above).
+        assert!(
+            !html.to_lowercase().contains("javascript:"),
+            "viewer.html contains a javascript: URL — not allowed (XSS hardening)"
+        );
     }
 
     /// XSS guard, layer 2: tripwire for raw (unescaped) interpolation of
