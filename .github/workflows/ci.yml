@@ -149,6 +149,54 @@ jobs:
           cargo audit
           cargo audit --file runtime/Cargo.lock
 
+  viewer-e2e:
+    name: viewer e2e (headless XSS gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Only run when the viewer, its generated demo, the XSS fixture, or the e2e
+      # harness itself changes — a Rust-only or docs-only PR doesn't pay the
+      # browser-download cost.
+      - name: Detect viewer-relevant changes
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            viewer:
+              - 'crates/darkmux-serve/assets/viewer.html'
+              - 'docs/demo/**'
+              - 'tests/fixtures/xss-flow.jsonl'
+              - 'tests/e2e/**'
+              - '.github/workflows/ci.yml'
+
+      - name: Setup Node
+        if: steps.filter.outputs.viewer == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install e2e deps
+        if: steps.filter.outputs.viewer == 'true'
+        working-directory: tests/e2e
+        run: npm ci
+
+      - name: Install Chromium for Playwright
+        if: steps.filter.outputs.viewer == 'true'
+        working-directory: tests/e2e
+        run: npx playwright install --with-deps chromium
+
+      - name: Run viewer e2e (drives the real viewer over attacker-controlled records)
+        if: steps.filter.outputs.viewer == 'true'
+        working-directory: tests/e2e
+        run: npx playwright test
+
+      - name: No viewer-relevant changes — e2e skipped
+        if: steps.filter.outputs.viewer != 'true'
+        run: echo "No viewer / demo / fixture / e2e changes detected; viewer e2e skipped (reports green)."
+
   docs-drift:
     name: docs drift guard (retired terms)
     runs-on: ubuntu-latest

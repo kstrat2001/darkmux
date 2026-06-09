@@ -32,3 +32,9 @@ coverage/
 .idea/
 .vscode/
 .claude/
+
+# Viewer e2e (Playwright) — local artifacts
+tests/e2e/node_modules/
+tests/e2e/.served/
+tests/e2e/test-results/
+tests/e2e/playwright-report/

@@ -49,6 +49,19 @@ If you modify the embedded workload manifests under `templates/builtin/workloads
 
 Tests that depend on a real `lms` binary or a real LMStudio runtime should set `DARKMUX_LMS_BIN=/usr/bin/true` (or similar) so the test runs without those dependencies.
 
+### Viewer e2e (headless browser)
+
+The observability viewer (`crates/darkmux-serve/assets/viewer.html`) has a headless Playwright suite under `tests/e2e/` that drives the *real* viewer over a flow file of attacker-controlled records (`tests/fixtures/xss-flow.jsonl`) and asserts every render path stays inert (output-encoding / XSS gate). It replaces the old manual "open `/play/<date>` and check `window.__xss`" walkthrough.
+
+```bash
+cd tests/e2e
+npm ci
+npx playwright install chromium   # first run only
+npx playwright test
+```
+
+The config builds the harness the same way `scripts/build-demo.sh` builds the public demo (viewer + injected playback metas), so the test exercises the shipped render path, not a fork. CI runs it automatically when the viewer, demo, fixture, or harness changes. If you touch how records render, add an assertion here.
+
 ## Issue reports
 
 When filing a bug, please include:
