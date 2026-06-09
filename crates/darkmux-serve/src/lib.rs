@@ -1570,6 +1570,89 @@ mod tests {
     use tower::util::ServiceExt;
     use tempfile::TempDir;
 
+    /// XSS guard, layer 1: the viewer must contain ZERO inline event-handler
+    /// attributes. All clicks route through one delegated listener reading
+    /// `data-act`/`data-arg` (dataset values are plain strings — no JS-string
+    /// context for a malicious flow-record identifier to break out of). A new
+    /// `onclick="…"` carrying a record-derived value is exactly the injection
+    /// shape this PR removed; fail the build on any reintroduction. JS-side
+    /// property assignment (`$("play").onclick=…`) is fine and not matched.
+    #[test]
+    fn viewer_has_no_inline_event_handlers() {
+        let html = include_str!("../assets/viewer.html");
+        for needle in [
+            "onclick=\"", "onclick='", "ontoggle=\"", "ontoggle='",
+            "onerror=\"", "onerror='", "onload=\"", "onload='",
+            "onmouseover=\"", "onmouseover='", "onchange=\"", "onchange='",
+        ] {
+            assert!(
+                !html.contains(needle),
+                "viewer.html contains inline event handler `{needle}…` — use \
+                 data-act/data-arg + the delegated listener instead (XSS hardening)"
+            );
+        }
+    }
+
+    /// XSS guard, layer 2: tripwire for raw (unescaped) interpolation of
+    /// record-derived values into rendered templates. Curated needles — each
+    /// is an exact pattern this hardening pass replaced with an `esc()`-wrapped
+    /// form; matching one means an escape was dropped. NOT a proof of safety
+    /// (string construction that's escaped downstream is legitimate and
+    /// unmatched) — the proof is review + the malicious fixture walkthrough
+    /// (tests/fixtures/xss-flow.jsonl).
+    #[test]
+    fn viewer_has_no_raw_record_interpolations() {
+        let html = include_str!("../assets/viewer.html");
+        for needle in [
+            "${missionLabel()}", "${DATA_SOURCE}", "${nameOf(", "${specOf(",
+            "${m}", "${sid}", "${pm}", "${mid}", "${q}", "${a}",
+            "${role}", "${handle}", "${model}", "${mission}", "${tag}", "${turns}",
+            "${state.machine}", "${state.session}",
+            "${s.handle}", "${s.model}", "${s.mission_id}", "${s.role}", "${s.machine}",
+            "${n.sid}", "${n.handle}", "${n.model}", "${n.mission}",
+            "${r.category}", "${r.machine_id}", "${r.session_id}",
+            "${f.k}", "${f.d}", "${f.f}", "${f.s}",
+        ] {
+            assert!(
+                !html.contains(needle),
+                "viewer.html interpolates `{needle}` without esc() — wrap it \
+                 (record-derived values must be escaped at the template edge)"
+            );
+        }
+    }
+
+    /// The XSS regression fixture must stay a valid FLOW_SCHEMA day file —
+    /// the manual walkthrough (copy to ~/.darkmux/flows/2026-01-01.jsonl,
+    /// `darkmux serve`, open /play/2026-01-01, assert window.__xss is
+    /// undefined) only proves anything if the records take the real ingest
+    /// path rather than being skipped as malformed.
+    #[test]
+    fn xss_fixture_is_schema_valid() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/xss-flow.jsonl"
+        );
+        let raw = fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {path}: {e}"));
+        let mut n = 0;
+        for (i, line) in raw.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            serde_json::from_str::<darkmux_flow::FlowRecord>(line).unwrap_or_else(|e| {
+                panic!(
+                    "xss-flow.jsonl line {} is not a valid FlowRecord: {e}\n  {line}",
+                    i + 1
+                )
+            });
+            n += 1;
+        }
+        assert!(n >= 10, "xss fixture suspiciously small ({n} records)");
+        // The payloads themselves must be present, or the walkthrough is a no-op.
+        assert!(raw.contains("window.__xss"), "fixture lost its XSS payloads");
+        assert!(raw.contains("onerror="), "fixture lost its HTML-injection payloads");
+    }
+
     /// The darkmux.com/demo dataset is a *real* FLOW_SCHEMA flow file: the demo
     /// page is the canonical viewer in playback mode loading this `.jsonl`,
     /// identical to a local `/play`. Guard that it stays an exact `FlowRecord`
