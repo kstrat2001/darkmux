@@ -393,6 +393,13 @@ The case for darkmux: **once you accept that static configs leave performance on
 - 🚧 Plugin system for community-contributed providers, workloads, role manifests
 - 🚧 Per-role bake-offs for non-SWE roles (trip-researcher, health-research, legal-research, …)
 
+## Security
+
+darkmux is a single-operator, local-first tool — see [SECURITY.md](./SECURITY.md)
+for the threat model (what it does and doesn't defend) and how to report a
+vulnerability privately. Short version: keep `darkmux serve` on loopback, and
+treat AI-generated code the way you'd treat any untrusted script.
+
 ## License
 
 MIT
