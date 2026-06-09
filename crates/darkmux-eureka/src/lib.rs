@@ -23,8 +23,9 @@
 //! - **minor** — new rule kind or new optional field. Old viewers can
 //!   safely ignore unknown rules (additive change).
 //! - **major** — rename/retype a field, change `kind` enum, new required
-//!   field. Old viewers must NOT trust the data. The viewer's
-//!   `EXPECTED_RULES_SCHEMA_MAJOR` constant must move in the same PR.
+//!   field. A future consumer must NOT trust the data; when the viewer
+//!   consumer lands (#657 transport + #12 viewer validation) its version
+//!   gate moves in the same PR. There is no such viewer gate today.
 //!
 //! See `CLAUDE.md` for the full contract.
 //!
@@ -47,9 +48,10 @@ use serde::{Deserialize, Serialize};
 
 /// Semver of the rules schema. See module docs for bump rules.
 ///
-/// **When bumping major:** update `EXPECTED_RULES_SCHEMA_MAJOR` in
-/// `docs/viewer/index.html` in the same PR. The viewer-release-PR is the
-/// contract.
+/// Engine-internal + surfaced by `darkmux doctor` today; there is no
+/// viewer-side `EXPECTED_RULES_SCHEMA_MAJOR` gate yet (gated on #657 transport
+/// + #12 viewer validation). When the viewer consumer lands, its version gate
+/// moves in the same PR.
 pub const RULES_SCHEMA_VERSION: &str = "1.1.0";
 
 /// Stable rule-id string for `ctx-window-mismatch`. Single source of truth

@@ -176,13 +176,15 @@ tests/cli.rs                  Integration tests (spawn the binary)
 
 ## Versioning — rules schema
 
-The `eureka` rules engine emits its definitions so the viewer can render findings without duplicating rule data in JS. The standalone `instruments.jsonl` sidecar and its file-drop delivery were retired (#557); the RuleDefs' transport is migrating to the flow telemetry stream as part of that work. The contract is plain semver, applied to the rules **data shape** (not to darkmux itself):
+The `eureka` rules engine versions its emitted definitions (`RuleDef`s) with plain semver applied to the rules **data shape** (not to darkmux itself). `RULES_SCHEMA_VERSION` lives in `crates/darkmux-eureka/src/lib.rs` as a single constant.
 
-| Bump | Meaning | UI behavior |
-|---|---|---|
-| **Patch** (`1.0.0` → `1.0.1`) | Fully backward-compatible. Bug fix in a message, threshold tweak that doesn't change semantics, typo in a `fix_hint`. | Viewer parser ignores; works unchanged. |
-| **Minor** (`1.0` → `1.1`) | Additive. New rule `kind`, new optional field on `RuleDef`. Older viewers can't *evaluate* new rules but can SAFELY IGNORE them. | Viewer soft-warns; renders normally. New rules surface as "checked at pre-flight only" until the viewer gets a JS evaluator. |
-| **Major** (`1.x` → `2.0`) | Breaking. Rename/retype a field, change of `RuleKind` enum encoding, new required field. Older viewers cannot trust newer-major data. | Viewer **blocks** the Anomalies panel + shows an upgrade modal with the exact `cargo install --path . --force` command. User must update CLI or downgrade viewer. |
+**Scope today: engine-internal + `darkmux doctor`.** The RuleDefs are consumed in-process and surfaced by `darkmux doctor`. There is **no viewer consumer yet**: the `instruments.jsonl` sidecar was retired (#557), the flow-stream transport that would carry RuleDefs to the viewer is unbuilt (#657), and the viewer-side rules validation is unbuilt (#12). So there is currently **no viewer-blocking behavior and no `EXPECTED_RULES_SCHEMA_MAJOR` constant** (the old `docs/viewer/index.html` is a redirect stub — it does not hold viewer code). The semver discipline below governs the data shape for when that transport lands.
+
+| Bump | Meaning |
+|---|---|
+| **Patch** (`1.0.0` → `1.0.1`) | Fully backward-compatible — a message fix, a threshold tweak that doesn't change semantics, a typo in a `fix_hint`. |
+| **Minor** (`1.0` → `1.1`) | Additive — a new rule `kind`, a new optional field on `RuleDef`. A future consumer can SAFELY IGNORE what it can't yet evaluate. |
+| **Major** (`1.x` → `2.0`) | Breaking — rename/retype a field, change the `RuleKind` enum encoding, a new required field. |
 
 Rule of thumb when changing the schema:
 
@@ -190,7 +192,7 @@ Rule of thumb when changing the schema:
 - Renaming or retyping a field on `RuleDef`? **Major bump.**
 - Fixing a typo in `fix_hint`? **Patch bump.**
 
-`RULES_SCHEMA_VERSION` lives in `crates/darkmux-eureka/src/lib.rs` as a single constant. The viewer's `EXPECTED_RULES_SCHEMA_MAJOR` lives in `docs/viewer/index.html` near the top of the script block. **When you bump major, you bump both in the same PR** — the viewer-release-PR is the contract.
+When the viewer consumer lands (#657 transport + #12 viewer rules validation), this section is where the major-bump UI contract (block stale data, prompt to update) gets defined and the viewer-side version gate gets added in the same PR. Until then there is nothing on the viewer side to bump.
 
 ## Common tasks for an agent
 
