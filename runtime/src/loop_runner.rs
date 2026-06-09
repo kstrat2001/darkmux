@@ -1428,7 +1428,7 @@ mod tests {
 
     #[test]
     fn persist_writes_compaction_json_to_runtime_dir() {
-        let tmp = tempdir::TempDir::new("persist-compaction").unwrap();
+        let tmp = tempfile::Builder::new().prefix("persist-compaction").tempdir().unwrap();
         let runtime_dir = tmp.path().join(".darkmux-runtime");
         let out = dummy_structured_output(3);
         persist_structured_compaction_output(&runtime_dir, 3, &out);
@@ -1447,7 +1447,7 @@ mod tests {
 
     #[test]
     fn persist_creates_runtime_dir_if_missing() {
-        let tmp = tempdir::TempDir::new("persist-mkdir").unwrap();
+        let tmp = tempfile::Builder::new().prefix("persist-mkdir").tempdir().unwrap();
         // Subdir that doesn't exist yet — persist must create it.
         let runtime_dir = tmp.path().join("nested").join("not-yet").join(".darkmux-runtime");
         let out = dummy_structured_output(1);
@@ -1460,7 +1460,7 @@ mod tests {
         // Path under a regular file (can't be a dir) — write should
         // fail silently, NOT panic or propagate. Persistence is
         // observability, not correctness.
-        let tmp = tempdir::TempDir::new("persist-unwritable").unwrap();
+        let tmp = tempfile::Builder::new().prefix("persist-unwritable").tempdir().unwrap();
         let blocker = tmp.path().join("blocker");
         std::fs::write(&blocker, b"i am a file not a dir").unwrap();
         let runtime_dir = blocker.join("under-a-file");
@@ -1711,7 +1711,7 @@ mod tests {
         });
 
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
-        let tmp = tempdir::TempDir::new("cumtokens").unwrap();
+        let tmp = tempfile::Builder::new().prefix("cumtokens").tempdir().unwrap();
         let mut traj = Trajectory::open(tmp.path());
         let initial = vec![Message::system("test"), Message::user("burn budget")];
         let tools = [Tool::Read];
@@ -1766,7 +1766,7 @@ mod tests {
         });
 
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
-        let tmp = tempdir::TempDir::new("under-budget").unwrap();
+        let tmp = tempfile::Builder::new().prefix("under-budget").tempdir().unwrap();
         let mut traj = Trajectory::open(tmp.path());
         let initial = vec![Message::system("test"), Message::user("hi")];
         let tools = [Tool::Read];
@@ -1813,7 +1813,7 @@ mod tests {
         });
 
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
-        let tmp = tempdir::TempDir::new("maxturns").unwrap();
+        let tmp = tempfile::Builder::new().prefix("maxturns").tempdir().unwrap();
         let mut traj = Trajectory::open(tmp.path());
         let initial = vec![Message::system("test"), Message::user("loop forever")];
         let tools = [Tool::Read];
@@ -1871,7 +1871,7 @@ mod tests {
         });
 
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
-        let tmp = tempdir::TempDir::new("failure-rate").unwrap();
+        let tmp = tempfile::Builder::new().prefix("failure-rate").tempdir().unwrap();
         let mut traj = Trajectory::open(tmp.path());
         let initial = vec![Message::system("test"), Message::user("loop fail")];
         let tools = [Tool::Bash];
@@ -1937,7 +1937,7 @@ mod tests {
         });
 
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
-        let tmp = tempdir::TempDir::new("cycle-detect").unwrap();
+        let tmp = tempfile::Builder::new().prefix("cycle-detect").tempdir().unwrap();
         let mut traj = Trajectory::open(tmp.path());
         let initial = vec![Message::system("test"), Message::user("loop")];
         let tools = [Tool::Read];
@@ -2012,7 +2012,7 @@ mod tests {
         });
 
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
-        let tmp = tempdir::TempDir::new("feedback-injection").unwrap();
+        let tmp = tempfile::Builder::new().prefix("feedback-injection").tempdir().unwrap();
         let mut traj = Trajectory::open(tmp.path());
         let initial = vec![Message::system("test"), Message::user("loop")];
         let tools = [Tool::Read];
@@ -2124,7 +2124,7 @@ mod tests {
         });
 
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
-        let tmp = tempdir::TempDir::new("xml-promote").unwrap();
+        let tmp = tempfile::Builder::new().prefix("xml-promote").tempdir().unwrap();
         let mut traj = Trajectory::open(tmp.path());
         let initial = vec![Message::system("test"), Message::user("read x.txt")];
         let tools = [Tool::Read];
@@ -2238,7 +2238,7 @@ mod tests {
         });
 
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
-        let tmp = tempdir::TempDir::new("per-turn-cap-salvage").unwrap();
+        let tmp = tempfile::Builder::new().prefix("per-turn-cap-salvage").tempdir().unwrap();
         let mut traj = Trajectory::open(tmp.path());
         let initial = vec![Message::system("test"), Message::user("read x.txt")];
         let tools = [Tool::Read];
@@ -2309,7 +2309,7 @@ mod tests {
         });
 
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
-        let tmp = tempdir::TempDir::new("salvage-feedback-disabled").unwrap();
+        let tmp = tempfile::Builder::new().prefix("salvage-feedback-disabled").tempdir().unwrap();
         let mut traj = Trajectory::open(tmp.path());
         let initial = vec![Message::system("test"), Message::user("read x.txt")];
         let tools = [Tool::Read];
@@ -2379,7 +2379,7 @@ mod tests {
         });
 
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
-        let tmp = tempdir::TempDir::new("salvage-clear-content").unwrap();
+        let tmp = tempfile::Builder::new().prefix("salvage-clear-content").tempdir().unwrap();
         let mut traj = Trajectory::open(tmp.path());
         let initial = vec![Message::system("test"), Message::user("read x.txt")];
         let tools = [Tool::Read];
@@ -2445,7 +2445,7 @@ mod tests {
         });
 
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
-        let tmp = tempdir::TempDir::new("per-turn-cap-no-salvage").unwrap();
+        let tmp = tempfile::Builder::new().prefix("per-turn-cap-no-salvage").tempdir().unwrap();
         let mut traj = Trajectory::open(tmp.path());
         let initial = vec![Message::system("test"), Message::user("read x.txt")];
         let tools = [Tool::Read];
@@ -2499,7 +2499,7 @@ mod tests {
         });
 
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
-        let tmp = tempdir::TempDir::new("xml-promote-length").unwrap();
+        let tmp = tempfile::Builder::new().prefix("xml-promote-length").tempdir().unwrap();
         let mut traj = Trajectory::open(tmp.path());
         let initial = vec![Message::system("test"), Message::user("read x.txt")];
         let tools = [Tool::Read];
@@ -2554,7 +2554,7 @@ mod tests {
         });
 
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
-        let tmp = tempdir::TempDir::new("xml-promote-reason").unwrap();
+        let tmp = tempfile::Builder::new().prefix("xml-promote-reason").tempdir().unwrap();
         let mut traj = Trajectory::open(tmp.path());
         let initial = vec![Message::system("test"), Message::user("read x.txt")];
         let tools = [Tool::Read];
@@ -2637,7 +2637,7 @@ mod tests {
         });
 
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
-        let tmp = tempdir::TempDir::new("reasoning-invariant").unwrap();
+        let tmp = tempfile::Builder::new().prefix("reasoning-invariant").tempdir().unwrap();
         let mut traj = Trajectory::open(tmp.path());
         let initial = vec![Message::system("test"), Message::user("read x.txt")];
         let tools = [Tool::Read];
@@ -2700,7 +2700,7 @@ mod tests {
         });
 
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
-        let tmp = tempdir::TempDir::new("max-tokens-cap").unwrap();
+        let tmp = tempfile::Builder::new().prefix("max-tokens-cap").tempdir().unwrap();
         let mut traj = Trajectory::open(tmp.path());
         let initial = vec![Message::system("test"), Message::user("hi")];
         let tools = [Tool::Read];
@@ -2736,7 +2736,7 @@ mod tests {
         // server.base_url() is just the host:port. Compose the path
         // here so the mock's /v1/chat/completions matcher hits.
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
-        let tmp = tempdir::TempDir::new("compaction-smoke").unwrap();
+        let tmp = tempfile::Builder::new().prefix("compaction-smoke").tempdir().unwrap();
         let mut traj = Trajectory::open(tmp.path());
         let initial = vec![
             Message::system("you are a test assistant"),
@@ -2838,7 +2838,7 @@ mod tests {
         // server.base_url() is just the host:port. Compose the path
         // here so the mock's /v1/chat/completions matcher hits.
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
-        let tmp = tempdir::TempDir::new("compaction-fire").unwrap();
+        let tmp = tempfile::Builder::new().prefix("compaction-fire").tempdir().unwrap();
         // Pre-populate /workspace dir + the file the mock's tool_call
         // will try to read. Real dispatches mount /workspace as a
         // tempdir; here we just give read a target that resolves.
@@ -2962,7 +2962,7 @@ mod tests {
         });
 
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
-        let tmp = tempdir::TempDir::new("compaction-bail").unwrap();
+        let tmp = tempfile::Builder::new().prefix("compaction-bail").tempdir().unwrap();
         std::fs::create_dir_all(tmp.path()).unwrap();
         let mut traj = Trajectory::open(tmp.path());
         let mut initial = vec![Message::system("test system"), Message::user("seed")];
@@ -3048,7 +3048,7 @@ mod tests {
         });
 
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
-        let tmp = tempdir::TempDir::new("compaction-no-bail").unwrap();
+        let tmp = tempfile::Builder::new().prefix("compaction-no-bail").tempdir().unwrap();
         std::fs::create_dir_all(tmp.path()).unwrap();
         let mut traj = Trajectory::open(tmp.path());
         let mut initial = vec![Message::system("test system"), Message::user("seed")];
@@ -3121,7 +3121,7 @@ mod tests {
         });
 
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
-        let tmp = tempdir::TempDir::new("stall-recover").unwrap();
+        let tmp = tempfile::Builder::new().prefix("stall-recover").tempdir().unwrap();
         let mut traj = Trajectory::open(tmp.path());
         let initial = vec![Message::system("test"), Message::user("answer the question")];
         let tools = [Tool::Read];
@@ -3188,7 +3188,7 @@ mod tests {
         });
 
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
-        let tmp = tempdir::TempDir::new("length-truncated").unwrap();
+        let tmp = tempfile::Builder::new().prefix("length-truncated").tempdir().unwrap();
         let mut traj = Trajectory::open(tmp.path());
         let initial = vec![Message::system("test"), Message::user("verbose answer")];
         let tools = [Tool::Read];
@@ -3225,7 +3225,7 @@ mod tests {
         });
 
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
-        let tmp = tempdir::TempDir::new("length-empty-tc-array").unwrap();
+        let tmp = tempfile::Builder::new().prefix("length-empty-tc-array").tempdir().unwrap();
         let mut traj = Trajectory::open(tmp.path());
         let initial = vec![Message::system("test"), Message::user("ask")];
         let tools = [Tool::Read];
@@ -3276,7 +3276,7 @@ mod tests {
         });
 
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
-        let tmp = tempdir::TempDir::new("stall-recover-empty-array").unwrap();
+        let tmp = tempfile::Builder::new().prefix("stall-recover-empty-array").tempdir().unwrap();
         let mut traj = Trajectory::open(tmp.path());
         let initial = vec![Message::system("test"), Message::user("ask")];
         let tools = [Tool::Read];
@@ -3313,7 +3313,7 @@ mod tests {
         });
 
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
-        let tmp = tempdir::TempDir::new("stall-budget-exhaust").unwrap();
+        let tmp = tempfile::Builder::new().prefix("stall-budget-exhaust").tempdir().unwrap();
         let mut traj = Trajectory::open(tmp.path());
         let initial = vec![Message::system("test"), Message::user("ask")];
         let tools = [Tool::Read];
@@ -3378,7 +3378,7 @@ mod tests {
         });
 
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
-        let tmp = tempdir::TempDir::new("stall-traj").unwrap();
+        let tmp = tempfile::Builder::new().prefix("stall-traj").tempdir().unwrap();
         let mut traj = Trajectory::open(tmp.path());
         let initial = vec![Message::system("test"), Message::user("ask")];
         let tools = [Tool::Read];

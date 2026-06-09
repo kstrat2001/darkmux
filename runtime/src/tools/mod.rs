@@ -883,10 +883,9 @@ fn search_dir(dir: &Path, ws_root: &Path, pattern: &str, hits: &mut Vec<String>,
 mod tests {
     use super::*;
     use std::fs;
-    use tempdir::TempDir;
 
-    fn fresh_workspace() -> TempDir {
-        TempDir::new("darkmux-runtime-tools-test").expect("create tempdir")
+    fn fresh_workspace() -> tempfile::TempDir {
+        tempfile::Builder::new().prefix("darkmux-runtime-tools-test").tempdir().expect("create tempdir")
     }
 
     // ─── echo ─────────────────────────────────────────────────────────────

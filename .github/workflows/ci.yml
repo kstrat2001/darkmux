@@ -21,6 +21,10 @@ on:
     branches: [main]
   push:
     branches: [main]
+  # Daily advisory sweep: catches a newly-disclosed RUSTSEC advisory against an
+  # unchanged dependency without waiting for the next dep-touching PR.
+  schedule:
+    - cron: "17 6 * * *"
 
 env:
   CARGO_TERM_COLOR: always
@@ -97,6 +101,53 @@ jobs:
       - name: No Rust-relevant changes — pipeline skipped
         if: steps.filter.outputs.rust != 'true'
         run: echo "No Rust / Cargo / template / workflow changes detected; build+test+lint skipped (reports green)."
+
+  cargo-audit:
+    name: cargo audit (RUSTSEC advisories)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # On a PR, only do real work when the dependency set actually changes —
+      # an advisory regression can't ride in on a docs/viewer-only PR, and those
+      # PRs aren't blocked by this job. The daily `schedule` run and pushes to
+      # main always audit (they have no `before` filter / aren't gated here), so
+      # a freshly-disclosed advisory against an unchanged dep still surfaces.
+      - name: Detect dependency changes
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v3
+        id: deps
+        with:
+          filters: |
+            deps:
+              - '**/Cargo.toml'
+              - '**/Cargo.lock'
+              - '.github/workflows/ci.yml'
+
+      - name: Should this run audit?
+        id: gate
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ] || [ "${{ steps.deps.outputs.deps }}" == "true" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "No dependency changes on this PR; cargo audit skipped (reports green)."
+          fi
+
+      - name: Install cargo-audit
+        if: steps.gate.outputs.run == 'true'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      # The workspace excludes the runtime crate (#463), so audit both lockfiles.
+      - name: Audit workspace + runtime lockfiles
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          cargo audit
+          cargo audit --file runtime/Cargo.lock
 
   docs-drift:
     name: docs drift guard (retired terms)

@@ -36,8 +36,9 @@ ureq = { version = "2", default-features = false, features = ["json", "tls"] }
 
 [dev-dependencies]
 # Workspace-root path validation tests need real filesystem with
-# tempdir + symlink support. tempdir is the simpler crate.
-tempdir = "0.3"
+# tempfile: maintained successor to the deprecated `tempdir` crate
+# (RUSTSEC-2018-0017) — its remove_dir_all impl also avoids RUSTSEC-2023-0018.
+tempfile = "3"
 
 # In-process HTTP mock server. Used by the compaction-loop integration
 # test to stand in for LMStudio without needing a real model loaded —

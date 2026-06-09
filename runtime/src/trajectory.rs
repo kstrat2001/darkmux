@@ -598,11 +598,10 @@ fn unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempdir::TempDir;
 
     #[test]
     fn open_creates_dot_dir_and_file() {
-        let ws = TempDir::new("traj-test").unwrap();
+        let ws = tempfile::Builder::new().prefix("traj-test").tempdir().unwrap();
         let _t = Trajectory::open(ws.path());
         let traj_file = ws
             .path()
@@ -613,7 +612,7 @@ mod tests {
 
     #[test]
     fn append_events_writes_jsonl() {
-        let ws = TempDir::new("traj-test-2").unwrap();
+        let ws = tempfile::Builder::new().prefix("traj-test-2").tempdir().unwrap();
         let mut t = Trajectory::open(ws.path());
         t.append_dispatch_start("test-model", 100, 50);
         t.append_model_completed(1, "stop", None, None);
@@ -640,7 +639,7 @@ mod tests {
         // (#469) tool.completed carries `ok` so the host watchdog can
         // distinguish a successful tool call (proof-of-work, resets the
         // deadline) from a failed one (does not).
-        let ws = TempDir::new("traj-test-ok").unwrap();
+        let ws = tempfile::Builder::new().prefix("traj-test-ok").tempdir().unwrap();
         let mut t = Trajectory::open(ws.path());
         t.append_tool_completed(1, 0, "bash", 40, 1000, true);
         t.append_tool_completed(2, 1, "bash", 40, 80, false);
@@ -664,7 +663,7 @@ mod tests {
     fn append_context_window_writes_used_and_max() {
         // (#557 Slice-3) The per-turn sawtooth event carries the EXACT
         // prompt-token count (`used`) + the configured n_ctx (`max`).
-        let ws = TempDir::new("traj-test-ctx").unwrap();
+        let ws = tempfile::Builder::new().prefix("traj-test-ctx").tempdir().unwrap();
         let mut t = Trajectory::open(ws.path());
         t.append_context_window(3, 42000, Some(101000));
         drop(t);
@@ -687,7 +686,7 @@ mod tests {
         // (#557 Slice-3) An unconfigured context window (None) must
         // render as JSON null — the viewer treats null max as "unknown
         // window", distinct from a real numeric cap.
-        let ws = TempDir::new("traj-test-ctx-null").unwrap();
+        let ws = tempfile::Builder::new().prefix("traj-test-ctx-null").tempdir().unwrap();
         let mut t = Trajectory::open(ws.path());
         t.append_context_window(1, 5000, None);
         drop(t);
