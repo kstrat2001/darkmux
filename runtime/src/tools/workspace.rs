@@ -116,8 +116,8 @@ mod tests {
 
     /// Create a fresh tempdir to serve as the workspace root for one
     /// test. Returns the dir; drop = cleanup.
-    fn fresh_workspace() -> tempdir::TempDir {
-        tempdir::TempDir::new("darkmux-runtime-workspace-test")
+    fn fresh_workspace() -> tempfile::TempDir {
+        tempfile::Builder::new().prefix("darkmux-runtime-workspace-test").tempdir()
             .expect("create tempdir")
     }
 
@@ -213,7 +213,7 @@ mod tests {
         // the workspace dir's name as a substring. Path::starts_with
         // does component-wise matching, so the lookalike should fail
         // even though string-prefix would pass.
-        let tmp = tempdir::TempDir::new("darkmux-lookalike").unwrap();
+        let tmp = tempfile::Builder::new().prefix("darkmux-lookalike").tempdir().unwrap();
         let workspace = tmp.path().join("workspace");
         let workspace2 = tmp.path().join("workspace2");
         fs::create_dir(&workspace).unwrap();
