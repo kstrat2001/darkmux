@@ -50,8 +50,8 @@ use serde::{Deserialize, Serialize};
 ///
 /// Engine-internal + surfaced by `darkmux doctor` today; there is no
 /// viewer-side `EXPECTED_RULES_SCHEMA_MAJOR` gate yet (gated on #657 transport
-/// + #12 viewer validation). When the viewer consumer lands, its version gate
-/// moves in the same PR.
+/// and #12 viewer validation). When the viewer consumer lands, its version
+/// gate moves in the same PR.
 pub const RULES_SCHEMA_VERSION: &str = "1.1.0";
 
 /// Stable rule-id string for `ctx-window-mismatch`. Single source of truth
