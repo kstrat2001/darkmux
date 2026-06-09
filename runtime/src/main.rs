@@ -698,6 +698,12 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         return ExitCode::from(1);
     }
 
+    if let Some(o) = &outcome {
+        if matches!(o.terminal_reason, loop_runner::TerminalReason::EscalationTriggered(_)) {
+            return ExitCode::from(1);
+        }
+    }
+
     ExitCode::SUCCESS
 }
 
