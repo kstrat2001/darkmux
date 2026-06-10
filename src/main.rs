@@ -334,9 +334,11 @@ enum CrewCmd {
         id: String,
     },
     /// Dispatch a single turn to the named role. Loads the role manifest +
-    /// `.md` system prompt, verifies the corresponding `darkmux/<role-id>`
-    /// openclaw agent exists and matches the manifest, then invokes
-    /// `openclaw agent` with the assembled message.
+    /// `.md` system prompt and runs the role through the **internal runtime**
+    /// by default — a per-dispatch `darkmux-runtime` Docker container with the
+    /// assembled message. Pass `--runtime openclaw` to opt into the openclaw
+    /// shell-out path instead (which pre-flight-verifies the `darkmux/<role-id>`
+    /// openclaw agent matches the manifest, then invokes `openclaw agent`).
     Dispatch {
         /// Role id (e.g. `code-reviewer`). Must have a manifest at
         /// `templates/builtin/roles/<id>.json` (or under

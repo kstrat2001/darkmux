@@ -19,13 +19,7 @@ struct AppState {
     flows_dir: PathBuf,
 }
 
-/// Validate a path segment as `YYYY-MM-DD.jsonl` format.
-fn is_valid_date_jsonl(segment: &str) -> Option<&str> {
-    let date = segment.strip_suffix(".jsonl")?;
-    is_valid_date(date)
-}
-
-/// Validate a bare date string (`YYYY-MM-DD`) without `.jsonl` suffix.
+/// Validate a path segment as a bare date string (`YYYY-MM-DD`).
 fn is_valid_date(date: &str) -> Option<&str> {
     if date.len() == 10
         && date.as_bytes()[4] == b'-'
@@ -852,37 +846,22 @@ async fn flow_stream_handler(
 
 /// GET /flow/:date — returns flow records for a UTC day.
 ///
-/// Two response shapes, picked by URL suffix:
-/// - `<date>.jsonl` → newline-delimited JSON (`application/x-ndjson`),
-///   served from the local file. Used by the legacy `/flow` viewer
-///   page; behavior unchanged since pre-#270.
-/// - `<date>` (no extension) → JSON array (`application/json`). When
-///   `DARKMUX_REDIS_URL` is set + reachable, the array is aggregated
-///   from Redis (`darkmux:flow` stream, filtered by date) — the
-///   **fleet-wide** view across every machine writing to the same
-///   stream. When Redis is unconfigured OR unreachable, the array
-///   comes from the local `<date>.jsonl` file (#270). The topology
-///   viewer's backfill consumes this shape.
+/// `GET /flow/<date>` → JSON array (`application/json`) of the day's flow
+/// records. When `DARKMUX_REDIS_URL` is set + reachable, the array is
+/// aggregated from Redis (`darkmux:flow` stream, filtered by date) — the
+/// **fleet-wide** view across every machine writing to the same stream. When
+/// Redis is unconfigured OR unreachable, the array comes from the local
+/// `<date>.jsonl` file (#270). The viewer's playback + backfill consume this.
+///
+/// `<date>` must be a bare `YYYY-MM-DD` (no extension). A missing day is an
+/// empty array (200), not a 404 — "the flow records for date X" is an empty
+/// collection, not an absent resource. (The pre-#270 `<date>.jsonl` ndjson
+/// shape was retired in #701 — nothing fetched it once the `/flow` page
+/// became a redirect stub.)
 async fn flow_handler(
     State(state): State<AppState>,
     Path(segment): Path<String>,
 ) -> impl IntoResponse {
-    // Legacy ndjson path — preserve byte-for-byte for the /flow page.
-    if let Some(date) = is_valid_date_jsonl(&segment) {
-        let file = state.flows_dir.join(format!("{date}.jsonl"));
-        return match tokio::fs::read(&file).await {
-            Ok(bytes) => (
-                StatusCode::OK,
-                [("content-type", "application/x-ndjson")],
-                bytes,
-            )
-                .into_response(),
-            Err(_) => (StatusCode::NOT_FOUND, "not found").into_response(),
-        };
-    }
-
-    // JSON-array path — used by the topology viewer. Aggregates from
-    // Redis when available; falls back to the local file otherwise.
     let Some(date) = is_valid_date(&segment) else {
         return (StatusCode::BAD_REQUEST, "bad date format").into_response();
     };
@@ -2097,21 +2076,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flow_returns_404_for_missing_date() {
+    async fn flow_returns_empty_array_for_missing_date() {
+        // Post-#701: a missing day is an empty JSON array (200), not a 404 —
+        // "flow records for date X" is an empty collection, not an absent
+        // resource. (The old `.jsonl` route returned 404 here; it's retired.)
         let tmp = TempDir::new().unwrap();
         let app = build_router(tmp.path().to_path_buf());
 
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/flow/2999-01-01.jsonl")
+                    .uri("/flow/2999-01-01")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(bytes.as_ref(), b"[]");
     }
 
     #[tokio::test]
@@ -2119,12 +2103,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let app = build_router(tmp.path().to_path_buf());
 
-        // Truly malformed — no .jsonl suffix.
+        // Non-date shape → rejected by the format validator.
         let response = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/flow/not-a-date.jsonl")
+                    .uri("/flow/not-a-date")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2132,29 +2116,10 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
-        // Valid format but invalid date (month 13) — passes validation,
-        // so hits FS layer → 404.
+        // A trailing `.jsonl` is no longer a recognized shape (route retired
+        // in #701) — it fails the bare-date validator → 400.
         let response2 = app
             .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/flow/2026-13-99.jsonl")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response2.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn flow_returns_file_contents_when_present() {
-        let tmp = TempDir::new().unwrap();
-        let content = "{\"_type\":\"schema\",\"version\":\"1.0.0\"}\n{\"action\":\"x\",\"handle\":\"test\"}\n";
-        fs::write(tmp.path().join("2026-05-14.jsonl"), content).unwrap();
-
-        let app = build_router(tmp.path().to_path_buf());
-        let response = app
             .oneshot(
                 Request::builder()
                     .uri("/flow/2026-05-14.jsonl")
@@ -2163,17 +2128,47 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(response2.status(), StatusCode::BAD_REQUEST);
+    }
 
-        assert_eq!(response.status(), StatusCode::OK);
+    #[tokio::test]
+    async fn flow_returns_records_as_json_array_when_present() {
+        // The bare-date route reads the local `<date>.jsonl` file (Redis
+        // unset) and returns its records as a JSON array.
+        let tmp = TempDir::new().unwrap();
+        let content = "{\"_type\":\"schema\",\"version\":\"1.0.0\"}\n{\"action\":\"x\",\"handle\":\"test\"}\n";
+        fs::write(tmp.path().join("2026-05-14.jsonl"), content).unwrap();
 
-        // Verify content-type header.
-        let headers = response.headers();
-        assert!(headers.contains_key("content-type"));
-
-        let bytes = to_bytes(response.into_body(), 1024)
+        let app = build_router(tmp.path().to_path_buf());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/flow/2026-05-14")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
-        assert_eq!(bytes.as_ref(), content.as_bytes());
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let ct = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(ct.starts_with("application/json"), "content-type was `{ct}`");
+
+        let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+        let arr: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // Every non-empty JSON line is parsed (schema header + the record);
+        // the viewer's adapter ignores non-record entries downstream.
+        let items = arr.as_array().expect("expected a JSON array");
+        assert_eq!(items.len(), 2, "schema header line + one record");
+        assert!(
+            items.iter().any(|r| r["handle"] == "test"),
+            "the dispatch record should be present: {arr}"
+        );
     }
 
     /// Localhost-origin requests get CORS headers (topology viewer on any
