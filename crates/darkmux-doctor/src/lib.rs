@@ -99,6 +99,7 @@ pub fn run(include_openclaw: bool) -> DoctorReport {
         check_flow_sink_health(),
         check_machine_id_resolution(),
         check_orchestrator_declared(),
+        check_openai_base_url_conflict(),
         check_redis_config(),
         check_audit_integrity(),
         check_recommendation_drift(),
@@ -871,6 +872,53 @@ fn check_orchestrator_declared() -> Check {
                 "Export DARKMUX_ORCHESTRATOR=<harness-name> in the shell driving darkmux (e.g. `claude-code`, `antigravity`, `cursor`). Operator-explicit by design (#49 cultivation discipline).".into(),
             ),
         },
+    }
+}
+
+/// Normalize an OpenAI-style base URL for comparison: strip a trailing `/v1`
+/// (clients append it) and any trailing slash, so `http://h:1234/v1` and
+/// `http://h:1234` compare equal.
+fn normalize_openai_base(s: &str) -> String {
+    let s = s.trim().trim_end_matches('/');
+    let s = s.strip_suffix("/v1").unwrap_or(s);
+    s.trim_end_matches('/').to_string()
+}
+
+/// (#5) Decide the `OPENAI_BASE_URL` check outcome from the env value + the
+/// LMStudio base darkmux manages. Pure (no env / IO) so it's unit-testable.
+fn classify_openai_base_url(base: Option<&str>, lms_url: &str) -> (Status, String, Option<String>) {
+    match base {
+        None => (
+            Status::Pass,
+            "OPENAI_BASE_URL unset — downstream agents aren't pinned to a non-darkmux endpoint".into(),
+            None,
+        ),
+        Some(b) if normalize_openai_base(b) == normalize_openai_base(lms_url) => (
+            Status::Pass,
+            format!("OPENAI_BASE_URL points at darkmux's LMStudio ({lms_url}) — swaps reach downstream agents"),
+            None,
+        ),
+        Some(b) => (
+            Status::Warn,
+            format!("OPENAI_BASE_URL={b} does not point at darkmux's LMStudio ({lms_url})"),
+            Some(
+                "darkmux doesn't set or manage OPENAI_BASE_URL — `darkmux swap` loads models into the LMStudio at lmstudio_url. OpenAI-compatible agents reading this env var talk to the other endpoint, so a swap won't change the model they see. Point OPENAI_BASE_URL at darkmux's LMStudio (or unset it) if you want swaps to reach those agents. (If it's a reverse proxy fronting the SAME LMStudio, this warning is benign.) (#5)".into(),
+            ),
+        ),
+    }
+}
+
+/// (#5) Warn when a shell-exported `OPENAI_BASE_URL` would defeat `darkmux swap`
+/// for downstream OpenAI-compatible agents (they read the env var, not darkmux).
+fn check_openai_base_url_conflict() -> Check {
+    let base = std::env::var("OPENAI_BASE_URL").ok();
+    let lms = darkmux_types::config_access::lmstudio_url();
+    let (status, message, hint) = classify_openai_base_url(base.as_deref(), &lms);
+    Check {
+        name: "openai endpoint".into(),
+        status,
+        message,
+        hint,
     }
 }
 
@@ -2475,6 +2523,31 @@ pub fn print_report(r: &DoctorReport) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn openai_base_url_classify_covers_unset_match_and_divergence() {
+        let lms = "http://localhost:1234";
+        // Unset → Pass, no hint.
+        let (s, _, h) = classify_openai_base_url(None, lms);
+        assert_eq!(s, Status::Pass);
+        assert!(h.is_none());
+        // Set + points at darkmux's LMStudio (with the /v1 clients append) → Pass.
+        let (s, _, h) = classify_openai_base_url(Some("http://localhost:1234/v1"), lms);
+        assert_eq!(s, Status::Pass, "matching endpoint (modulo /v1) must pass");
+        assert!(h.is_none());
+        // Trailing slash also normalizes equal.
+        let (s, _, _) = classify_openai_base_url(Some("http://localhost:1234/"), lms);
+        assert_eq!(s, Status::Pass);
+        // A trailing slash AFTER /v1 must also normalize equal (exercises the
+        // second trim).
+        let (s, _, _) = classify_openai_base_url(Some("http://localhost:1234/v1/"), lms);
+        assert_eq!(s, Status::Pass);
+        // Set + diverges → Warn with an actionable hint naming the conflict.
+        let (s, msg, h) = classify_openai_base_url(Some("https://api.openai.com/v1"), lms);
+        assert_eq!(s, Status::Warn, "a non-darkmux endpoint must warn (#5)");
+        assert!(msg.contains("api.openai.com"));
+        assert!(h.unwrap().contains("OPENAI_BASE_URL"));
+    }
+
     fn check(name: &str, status: Status) -> Check {
         Check {
             name: name.into(),
@@ -2746,10 +2819,10 @@ mod tests {
     #[test]
     fn run_returns_static_plus_eureka_checks() {
         let r = run(true);
-        // 28 static checks (incl. docker-runtime [#680] + runtime version + load projection +
+        // 29 static checks (incl. docker-runtime [#680] + runtime version + load projection +
         // daemon reachable + darkmux-version-vs-latest-release [#13] +
         // crew-role-prompt-coverage [#141] + flow-sink-health [#170] +
-        // machine_id + orchestrator [#167] +
+        // machine_id + orchestrator [#167] + openai-base-url-conflict [#5] +
         // audit-integrity [#163] + recommendation-drift +
         // recommended-profile-not-shadowed [#159] + utility-model-binding
         // [#590] + role-model-pin-drift [#160] + legacy-mission-layout [#148]
@@ -2758,7 +2831,7 @@ mod tests {
         // docker-runtime [#680]) + one per active eureka rule. Every check
         // should appear regardless of environment — even if the underlying
         // probe couldn't read state.
-        let expected = 28 + darkmux_eureka::all_rules().len();
+        let expected = 29 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
