@@ -50,6 +50,20 @@
   .catempty{color:var(--muted);font:12px/1.4 Inter,sans-serif;padding:8px 9px}
   @keyframes lpulse{0%,100%{opacity:1}50%{opacity:.5}}
   .pb.live{color:#4ade80;border-color:#4ade80;animation:lpulse 1.6s ease-in-out infinite}
+  /* (#238) Respect prefers-reduced-motion: drop the infinite live-badge pulse
+     (and shorten transitions) for vestibular accessibility. Live state stays
+     distinguishable WITHOUT motion — the badge keeps its green color, the "●"
+     glyph, and the word "live" (vs "▣ playback"); recents stay dimmed + labeled.
+
+     The universal `*` reset is the canonical reduced-motion pattern, chosen
+     deliberately over a targeted selector: it's robust to future animations
+     (which SHOULD also be reduced — correctness must never depend on motion).
+     Safe here — this viewer's only animation is the decorative `lpulse`; the
+     rest are sub-150ms hover transitions (no spinners / progress / motion-gated
+     state). `.001ms` (not 0) keeps animationend/transitionend events firing. */
+  @media (prefers-reduced-motion: reduce){
+    *,*::before,*::after{animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.001ms!important}
+  }
   .crumbbar{height:40px;display:flex;align-items:center;gap:12px;padding:0 16px;border-bottom:1px solid var(--line);background:#131316}
   .backbtn{background:var(--bg);border:1px solid var(--line);color:var(--text);padding:5px 11px;border-radius:4px;cursor:pointer;font:600 12px 'JetBrains Mono',monospace}
   .backbtn[disabled]{opacity:.35;cursor:default}
