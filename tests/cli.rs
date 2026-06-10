@@ -1012,17 +1012,56 @@ fn lab_register_builtin_demo_tiny_py_succeeds() {
 }
 
 /// `darkmux lab doctor` passes against the freshly-registered
+/// Recursively copy `src` → `dst`, skipping run-artifact dirs (the
+/// `crates/darkmux-lab` `RUN_ARTIFACT_DIRS` set). (#613) A dev machine that has
+/// run a dispatch against the in-repo builtin fixture leaves `__pycache__/` /
+/// `coverage/` / `.darkmux-runtime/` under it; registering that raw source
+/// would trip `lab doctor`'s cleanliness check (warn → exit 1) and fail the
+/// test below locally, though CI (fresh checkout) stays green. Registering a
+/// pruned copy gives the test the same isolation the real lab flow gets from
+/// its COW clone (#609), so the result no longer depends on dev-machine cruft.
+fn copy_pruned(src: &std::path::Path, dst: &std::path::Path) {
+    const PRUNE: &[&str] = &[
+        ".darkmux-runtime",
+        ".darkmux-agent",
+        "coverage",
+        ".coverage",
+        "target",
+        "__pycache__",
+        ".git",
+    ];
+    fs::create_dir_all(dst).unwrap();
+    for entry in fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        if entry.file_type().unwrap().is_dir() {
+            if PRUNE.contains(&name.to_string_lossy().as_ref()) {
+                continue;
+            }
+            copy_pruned(&entry.path(), &dst.join(&name));
+        } else {
+            fs::copy(entry.path(), dst.join(&name)).unwrap();
+        }
+    }
+}
+
 /// `demo-tiny-py` built-in — schema check, required_files present,
-/// hash matches.
+/// hash matches. Registers a pruned copy (not the raw in-repo source) so
+/// dev-machine artifact cruft can't trip the cleanliness check (#613).
 #[test]
 fn lab_doctor_passes_for_builtin_demo_tiny_py() {
     let tmp = TempDir::new().unwrap();
     fs::create_dir_all(tmp.path().join(".darkmux")).unwrap();
     let repo_root = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    let fixture_path = format!(
+    let fixture_src = format!(
         "{}/templates/builtin/lab-fixtures/demo-tiny-py",
         repo_root
     );
+    // Copy to an isolated, artifact-pruned location and register THAT, so the
+    // test is hermetic regardless of cruft under the in-repo fixture (#613).
+    let fixture_dir = tmp.path().join("demo-tiny-py");
+    copy_pruned(std::path::Path::new(&fixture_src), &fixture_dir);
+    let fixture_path = fixture_dir.to_string_lossy().to_string();
     Command::cargo_bin("darkmux")
         .unwrap()
         .current_dir(tmp.path())
