@@ -1072,6 +1072,15 @@ const HEARTBEAT_MIN_INTERVAL: Duration = Duration::from_secs(2);
 /// original size so the operator knows it was capped. (#231 / S6)
 const MAX_REASONING_TEXT_BYTES: usize = 256 * 1024;
 
+/// Hard cap on the OTHER container-written trajectory string fields that flow
+/// into a payload — `tool_name`, `finish_reason`, and the assembled detector
+/// `detail`. These are short by nature (a tool name, a finish reason, a
+/// one-line detector message), so a tight 4 KiB bound is generous for the real
+/// thing while stopping an adversarial or buggy container from injecting a
+/// pathologically large string into the flow stream / audit chain / Redis /
+/// viewer. Defense-in-depth under the viewer's output encoding (#237).
+const MAX_TRAJ_FIELD_BYTES: usize = 4 * 1024;
+
 /// Run the live trajectory tailer to completion. Polls until `stop_flag`
 /// is set, then does one final flush pass to drain any straggler lines
 /// the container wrote between the last poll tick and exit. Returns the
@@ -1424,7 +1433,7 @@ impl TailerState {
                 self.summary.turns += 1;
                 let payload = serde_json::json!({
                     "turn_seq": event.get("seq"),
-                    "finish_reason": event.get("finish_reason"),
+                    "finish_reason": cap_json_str(event.get("finish_reason"), MAX_TRAJ_FIELD_BYTES),
                     "tool_calls_count": event.get("tool_calls").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0),
                     "usage": event.get("usage"),
                 });
@@ -1473,7 +1482,7 @@ impl TailerState {
                 }
                 let payload = serde_json::json!({
                     "tool_seq": event.get("tool_seq"),
-                    "tool_name": event.get("tool_name"),
+                    "tool_name": cap_json_str(event.get("tool_name"), MAX_TRAJ_FIELD_BYTES),
                     "args_chars": event.get("args_chars"),
                     "result_chars": event.get("result_chars"),
                     "ok": tool_ok,
@@ -1732,6 +1741,11 @@ fn detector_telemetry_payload(
         _ => return None,
     };
 
+    // (#237) The detail embeds a container-written `tool_name`; bound the
+    // assembled string so a pathologically large tool name can't bloat the
+    // telemetry record. kind/severity are fixed literals (not container-set).
+    let detail = cap_str(&detail, MAX_TRAJ_FIELD_BYTES);
+
     Some(serde_json::json!({
         "kind": kind,
         "severity": severity,
@@ -1739,31 +1753,49 @@ fn detector_telemetry_payload(
     }))
 }
 
-/// Cap a JSON string value at `MAX_REASONING_TEXT_BYTES`, appending a
-/// human-readable marker so downstream consumers know it was truncated.
-/// Truncates at a UTF-8 char boundary to avoid invalid encoding.
-/// Non-string values pass through unchanged. (#231 / S6)
-fn cap_reasoning_text(value: Option<&serde_json::Value>) -> serde_json::Value {
+/// Cap a string at `max` bytes, truncating at a UTF-8 char boundary (so the
+/// result stays valid) and appending a marker that records the original size.
+/// Short strings are returned unchanged. The single primitive behind both
+/// `cap_json_str` and the detector-`detail` bound (#237).
+fn cap_str(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut cut = max;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!(
+        "{}… [truncated; original {} chars / {} bytes]",
+        &s[..cut],
+        s.chars().count(),
+        s.len()
+    )
+}
+
+/// Cap a JSON string value at `max` bytes (see `cap_str`). Non-string values
+/// pass through unchanged; `None` becomes JSON null. Container-written
+/// trajectory fields flow into flow-record payloads (→ flow stream, audit
+/// chain, Redis, viewer); bounding them at ingest stops an adversarial or buggy
+/// container from injecting a pathologically large string (#237 defense-in-
+/// depth, layered under the viewer's output encoding).
+fn cap_json_str(value: Option<&serde_json::Value>, max: usize) -> serde_json::Value {
     let Some(v) = value else {
         return serde_json::Value::Null;
     };
     let Some(s) = v.as_str() else {
         return v.clone();
     };
-    if s.len() <= MAX_REASONING_TEXT_BYTES {
+    if s.len() <= max {
         return v.clone();
     }
-    // Truncate at a UTF-8 char boundary so the resulting string is valid.
-    let mut cut = MAX_REASONING_TEXT_BYTES;
-    while cut > 0 && !s.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    let original_bytes = s.len();
-    let original_chars = s.chars().count();
-    serde_json::Value::String(format!(
-        "{}… [truncated; original {original_chars} chars / {original_bytes} bytes]",
-        &s[..cut]
-    ))
+    serde_json::Value::String(cap_str(s, max))
+}
+
+/// `reasoning_text` cap — the large-text case (thinking-mode output). Delegates
+/// to the shared `cap_json_str` with the reasoning-specific bound. (#231 / S6)
+fn cap_reasoning_text(value: Option<&serde_json::Value>) -> serde_json::Value {
+    cap_json_str(value, MAX_REASONING_TEXT_BYTES)
 }
 
 /// Result of probing the host for the internal Docker runtime's two
@@ -4120,6 +4152,46 @@ mod tests {
         // because String::from_utf8_lossy isn't used — we sliced on a boundary.
         assert!(truncated.is_char_boundary(0));
         assert!(truncated.contains("[truncated"));
+    }
+
+    // ─── #237: bounding container-written trajectory fields at ingest ──
+    #[test]
+    fn cap_json_str_bounds_short_fields() {
+        // A container could write a pathologically large tool_name / finish_reason.
+        let huge = "z".repeat(MAX_TRAJ_FIELD_BYTES + 5000);
+        let v = serde_json::Value::String(huge.clone());
+        let out = cap_json_str(Some(&v), MAX_TRAJ_FIELD_BYTES);
+        let s = out.as_str().expect("string out");
+        assert!(s.len() <= MAX_TRAJ_FIELD_BYTES + 100, "bounded near the cap (+marker)");
+        assert!(s.contains("[truncated"), "carries the marker");
+        assert!(s.contains(&huge.len().to_string()), "marker names the original size");
+        // Short values are untouched.
+        let small = serde_json::json!("read");
+        assert_eq!(cap_json_str(Some(&small), MAX_TRAJ_FIELD_BYTES), small);
+        // Non-string + None pass through / null.
+        let n = serde_json::json!(42);
+        assert_eq!(cap_json_str(Some(&n), MAX_TRAJ_FIELD_BYTES), n);
+        assert_eq!(cap_json_str(None, MAX_TRAJ_FIELD_BYTES), serde_json::Value::Null);
+    }
+
+    #[test]
+    fn detector_detail_is_bounded_against_oversize_tool_name() {
+        // A container-injected cycle event with a giant tool_name must not
+        // produce an unbounded detector `detail` in the telemetry record.
+        let huge = "t".repeat(100_000);
+        let event = serde_json::json!({
+            "type": "dispatch.cycle.suspected",
+            "tool_name": huge,
+            "count": 3,
+            "window_size": 10,
+        });
+        let payload = detector_telemetry_payload("dispatch.cycle.suspected", &event)
+            .expect("cycle event yields a payload");
+        let detail = payload["detail"].as_str().expect("detail string");
+        assert!(detail.len() <= MAX_TRAJ_FIELD_BYTES + 100, "detail bounded near the cap");
+        assert!(detail.contains("[truncated"), "carries the marker");
+        assert_eq!(payload["kind"], "cycle");
+        assert_eq!(payload["severity"], "warn");
     }
 
     // ─── TailerState::poll_and_emit (live tailing) ────────────────────
