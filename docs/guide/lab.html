@@ -70,7 +70,7 @@
     <ul>
       <li><strong><code>manifest.json</code></strong> — workload id, profile, loaded model state, hardware fingerprint, start/end time.</li>
       <li><strong><code>trajectory.jsonl</code></strong> — per-turn detail: prompt, response, tool calls, timing, compaction events.</li>
-      <li><strong><code>verify.json</code></strong> — verify-command outcome (for workloads that have one). For <code>quick-q</code>, just "did the response come back."</li>
+      <li><strong><code>verify.json</code></strong> — verify-command outcome. Only <code>coding-task</code> workloads define a verify command; a <code>prompt</code> workload like <code>quick-q</code> has none, so its verify is just "a response came back" and reports <strong>pass</strong> without running any check. Don't read a prompt workload's "pass" as a test result — there's nothing to fail. The real pass/fail signal lives in <code>coding-task</code> verify commands.</li>
     </ul>
 
     <h3>Cross-layer telemetry (always-on)</h3>

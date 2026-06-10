@@ -140,8 +140,11 @@ cat ~/.darkmux/profiles.json      <span class="comment"># see the actual JSON</s
     <p>The bootstrap config ships with placeholder profiles (<code>fast</code>, <code>balanced</code>, <code>deep</code>, plus a <code>gpt-oss</code> preset for the 120B MXFP4 build on Apple Silicon). Each profile lists models with placeholder IDs like <code>&lt;your-primary-model-id&gt;</code>.</p>
 
     <h3>Swap a real model id in</h3>
-    <p>Run <code>lms ls</code> to see what's downloaded in LMStudio. Pick one (start with whatever you've been using day-to-day) and replace a placeholder in <code>profiles.json</code>:</p>
-    <pre><code><span class="comment"># See what's available</span>
+    <p>The quickest way: <code>darkmux scan</code> lists the models LMStudio has downloaded that aren't yet in any profile, with a suggestion for each — so you can see what's available to slot in without hand-matching ids.</p>
+    <pre><code><span class="comment"># Downloaded models not yet in a profile, with suggestions</span>
+darkmux scan</code></pre>
+    <p>Then replace a placeholder in <code>profiles.json</code> with a real id (<code>lms ls</code> shows the raw list if you prefer). Pick one to start — whatever you've been using day-to-day:</p>
+    <pre><code><span class="comment"># See what's available (raw)</span>
 lms ls
 
 <span class="comment"># Edit the file (use whatever editor)</span>
