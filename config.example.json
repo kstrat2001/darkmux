@@ -18,7 +18,6 @@
   "runtime": {
     "inactivity_timeout_seconds": 600,
     "strict_selection": false,
-    "feedback_injection": true,
     "check_updates": true
   }
 }

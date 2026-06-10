@@ -153,6 +153,11 @@ impl DarkmuxConfig {
     ///   discovery surface is `darkmux doctor` (resolved path, overridable).
     /// - caps (`max_turns`/`max_tokens`), `default_role`, `daemon_cors_origins`
     ///   — absent is a real behavior (uncapped / none), not a value to default.
+    /// - `feedback_injection` — read in-container directly from
+    ///   `DARKMUX_FEEDBACK_INJECTION` (the runtime crate can't depend on
+    ///   `config_access`), so it does NOT yet honor the `config.json` tier
+    ///   (#661). Writing it here would advertise a knob that silently no-ops;
+    ///   omitted until the flag is plumbed. Absent = the env default (on).
     /// - `orchestrator` is written as `""` (visible but unset; empty config
     ///   strings are treated as unset, so the per-session env override drives).
     ///
@@ -187,7 +192,7 @@ impl DarkmuxConfig {
                 max_turns: None,
                 max_tokens: None,
                 strict_selection: Some(false),
-                feedback_injection: Some(true),
+                feedback_injection: None,
                 default_role: None,
                 check_updates: Some(true),
                 daemon_cors_origins: None,
@@ -236,11 +241,14 @@ mod tests {
         assert_eq!(cfg.audit.as_ref().unwrap().enabled, Some(false));
         // Scalar defaults written explicitly (not hidden in code).
         assert_eq!(cfg.lms_bin.as_deref(), Some("lms"));
-        assert_eq!(cfg.runtime.as_ref().unwrap().feedback_injection, Some(true));
         assert_eq!(cfg.orchestrator.as_deref(), Some(""), "visible but unset");
         // Fields where a written literal would be wrong stay absent.
         assert!(cfg.dirs.is_none(), "dirs are derived → surfaced by doctor, not frozen");
         assert!(cfg.runtime.as_ref().unwrap().max_turns.is_none(), "uncapped, not defaulted");
+        assert!(
+            cfg.runtime.as_ref().unwrap().feedback_injection.is_none(),
+            "feedback_injection is env-only (not yet config_access-backed, #661) → omitted, not advertised"
+        );
         // `enabled` reads at the TOP of each feature block.
         let json = serde_json::to_string_pretty(&cfg).unwrap();
         assert!(

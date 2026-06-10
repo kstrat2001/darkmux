@@ -2770,11 +2770,11 @@ mod tests {
     /// from primary calls by inspecting the request's `model` field —
     /// they differ.
     ///
-    /// Pre-#368 this test set/unset
-    /// `DARKMUX_RUNTIME_COMPACT_THRESHOLD_TOKENS` env var with a 40-
-    /// line EnvGuard for restore-on-drop and required serial
+    /// Pre-#368 this test set/unset a compaction-threshold env var with
+    /// a 40-line EnvGuard for restore-on-drop and required serial
     /// execution. Post-#368 the runtime reads compaction config from
-    /// explicit params (no env), so this is just a struct literal.
+    /// explicit params (no env — that env knob no longer exists), so
+    /// this is just a struct literal.
     ///
     /// Asserts:
     ///   - outcome.compactions == 1
