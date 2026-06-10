@@ -25,6 +25,17 @@ const PORT = 47823;
   fs.mkdirSync(SERVED, { recursive: true });
   fs.writeFileSync(path.join(SERVED, 'index.html'), injected);
   fs.writeFileSync(path.join(SERVED, 'xss-flow.jsonl'), fixture);
+
+  // (#691) A daemon-mode harness: mode=play + a date, but NO flow-src — so the
+  // viewer takes the daemon-fetch path (the catalog spec route-mocks /flow and
+  // /flow-days). This is the only way the catalog button shows (it's gated off
+  // for static flow-src), so the catalog's record-derived rendering — mission
+  // names — gets the same XSS gate as the rest of the viewer.
+  const daemon = viewer.replace(
+    '<head>',
+    '<head>\n<meta name="darkmux-mode" content="play">\n<meta name="darkmux-date" content="2026-01-01">'
+  );
+  fs.writeFileSync(path.join(SERVED, 'index-daemon.html'), daemon);
 })();
 
 // Serve over HTTP (not file://) so the viewer's boot() fetch('./xss-flow.jsonl')

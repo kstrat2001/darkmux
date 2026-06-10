@@ -119,6 +119,7 @@ pub(crate) fn build_router(flows_dir: PathBuf) -> Router {
         .route("/health", get(health))
         .route("/flow/:date", get(flow_handler))
         .route("/flow/:date/stream", get(flow_stream_handler))
+        .route("/flow-days", get(flow_days_handler))
         .route("/flow-status", get(flow_status_handler))
         .route("/model/status", get(model_status_handler))
         .route("/machine/specs", get(machine_specs_handler))
@@ -867,6 +868,98 @@ async fn flow_handler(
     };
     let records = aggregate_flow_records_for_date(date, &state.flows_dir).await;
     axum::Json(records).into_response()
+}
+
+/// `GET /flow-days` → the playback **catalog**: every day with a flow file on
+/// disk, newest-first, each with a one-line summary (record count, the distinct
+/// missions seen, and how many dispatches ran). The viewer's day-picker consumes
+/// this so historical playback is *discoverable* — you pick a day from a list
+/// instead of having to know the date and type `/play/<date>` (#691).
+///
+/// Deliberately **disk-backed** (the durable per-day files), distinct from the
+/// live view's Redis-fed rolling window: the catalog is "everything, by day",
+/// the live view is "now-ish on present machines". Storage stays per-day append;
+/// this is the navigation layer over it. A `mission_id`/`session_id` cross-day
+/// index is the scale path (not built here) — scanning day files is fine at the
+/// per-operator scale this serves.
+async fn flow_days_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let dir = state.flows_dir.clone();
+    let days = tokio::task::spawn_blocking(move || scan_flow_days(&dir))
+        .await
+        .unwrap_or_default();
+    axum::Json(serde_json::json!({
+        "days": days,
+        "generated_at_ms": current_millis(),
+    }))
+}
+
+/// Scan `flows_dir` for `YYYY-MM-DD.jsonl` files and summarize each. Newest day
+/// first. Unreadable / malformed files are skipped (best-effort catalog, never
+/// an error that hides the days that DO parse). Schema-header lines (`_type ==
+/// "schema"`) don't count as records.
+fn scan_flow_days(flows_dir: &std::path::Path) -> Vec<serde_json::Value> {
+    use std::io::BufRead;
+    let mut days: Vec<serde_json::Value> = Vec::new();
+    let Ok(entries) = std::fs::read_dir(flows_dir) else {
+        return days;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        let Some(date) = name.strip_suffix(".jsonl") else {
+            continue;
+        };
+        if is_valid_date(date).is_none() {
+            continue;
+        }
+        // Stream the file line-by-line (the catalog needs only counts + ids, not
+        // the parsed content) so a large day file is never held whole in memory.
+        let Ok(file) = std::fs::File::open(entry.path()) else {
+            continue;
+        };
+        let reader = std::io::BufReader::new(file);
+        let mut records: u64 = 0;
+        let mut missions: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut dispatches: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for line in reader.lines() {
+            let Ok(line) = line else { break };
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if v.get("_type").and_then(|t| t.as_str()) == Some("schema") {
+                continue;
+            }
+            records += 1;
+            if let Some(m) = v.get("mission_id").and_then(|m| m.as_str()) {
+                missions.insert(m.to_string());
+            }
+            // A dispatch = a dispatch.start edge (tolerate the dotted + spaced
+            // action forms the flow stream carries).
+            let action = v.get("action").and_then(|a| a.as_str()).unwrap_or("");
+            if action == "dispatch.start" || action == "dispatch start" {
+                if let Some(s) = v.get("session_id").and_then(|s| s.as_str()) {
+                    dispatches.insert(s.to_string());
+                }
+            }
+        }
+        days.push(serde_json::json!({
+            "date": date,
+            "records": records,
+            "missions": missions.into_iter().collect::<Vec<_>>(),
+            "dispatches": dispatches.len(),
+        }));
+    }
+    days.sort_by(|a, b| {
+        b["date"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(a["date"].as_str().unwrap_or(""))
+    });
+    days
 }
 
 /// Aggregate the day's flow records — Redis-when-available, file-otherwise.
@@ -2096,6 +2189,75 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
         assert_eq!(bytes.as_ref(), b"[]");
+    }
+
+    #[tokio::test]
+    async fn flow_days_lists_days_newest_first_with_summaries() {
+        // #691: the catalog endpoint scans the flows dir and summarizes each
+        // day so the viewer's picker can offer historical playback by date.
+        let tmp = TempDir::new().unwrap();
+        // Two days; one with a mission + a dispatch, one bare. A schema header
+        // line must not count as a record. A non-date file is ignored.
+        fs::write(
+            tmp.path().join("2026-05-14.jsonl"),
+            "{\"_type\":\"schema\",\"version\":\"1.0.0\"}\n\
+             {\"action\":\"dispatch.start\",\"handle\":\"coder\",\"session_id\":\"S1\",\"mission_id\":\"demo\"}\n\
+             {\"action\":\"dispatch.turn\",\"handle\":\"coder\",\"session_id\":\"S1\",\"mission_id\":\"demo\"}\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("2026-05-12.jsonl"),
+            "{\"action\":\"note\",\"handle\":\"x\"}\n",
+        )
+        .unwrap();
+        fs::write(tmp.path().join("not-a-day.jsonl"), "garbage\n").unwrap();
+        fs::write(tmp.path().join("README.txt"), "ignore me\n").unwrap();
+
+        let app = build_router(tmp.path().to_path_buf());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/flow-days")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 8192).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let days = json["days"].as_array().expect("days array");
+
+        assert_eq!(days.len(), 2, "two valid date files (non-date files ignored)");
+        // Newest first.
+        assert_eq!(days[0]["date"], "2026-05-14");
+        assert_eq!(days[1]["date"], "2026-05-12");
+        // Summary: schema header excluded → 2 records; mission + 1 dispatch.
+        assert_eq!(days[0]["records"], 2);
+        assert_eq!(days[0]["dispatches"], 1);
+        assert_eq!(days[0]["missions"], serde_json::json!(["demo"]));
+        assert_eq!(days[1]["records"], 1);
+        assert_eq!(days[1]["dispatches"], 0);
+        assert_eq!(days[1]["missions"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn flow_days_empty_dir_is_empty_array() {
+        let tmp = TempDir::new().unwrap();
+        let app = build_router(tmp.path().to_path_buf());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/flow-days")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["days"], serde_json::json!([]));
     }
 
     #[tokio::test]
