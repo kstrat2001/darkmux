@@ -808,7 +808,14 @@ function renderSubsystem(){
   const turns=rt?rt.fields.turns:"—";
   const cx=tel.filter(r=>r.source==="context").slice().sort((a,b)=>T(a.ts)-T(b.ts));
   const comps=tel.filter(r=>r.source==="compaction");
-  const nctx=cx.length?cx[0].fields.max:0, ctxPeak=cx.length?Math.max(...cx.map(r=>r.fields.used)):0;
+  // (#622) Require a POSITIVE, finite window — a null/0/NaN `max` (unconfigured
+  // context window) must yield nctx=0 so the metric reads "—" and the chart is
+  // skipped entirely, never a -Infinity/NaN render.
+  const nctx=(cx.length && Number.isFinite(cx[0].fields.max) && cx[0].fields.max>0)?cx[0].fields.max:0;
+  const ctxPeak=cx.length?Math.max(...cx.map(r=>r.fields.used||0)):0;
+  // (#711) Current usage = the latest sample at/under the playhead (cx is
+  // ts-sorted ascending), so the readout tracks the scrubber in playback.
+  const ctxNow=cx.length?(cx[cx.length-1].fields.used||0):0;
   // (#720) Surface a failed/killed terminal LOUDLY — a watchdog kill or
   // non-zero exit must read as such, never a silent "complete" or eternal
   // "so far". `wallLoud` is the red qualifier appended to the wall time.
@@ -817,9 +824,13 @@ function renderSubsystem(){
     ? `<span class="wallerr"> · ${dispatchKilled(c)?'killed (timeout)':'errored'+((c.payload&&c.payload.exit_code!=null)?' (exit '+esc(c.payload.exit_code)+')':'')}</span>`
     : '';
   const wall=wallBase+wallLoud;
+  // (#711) The ctx metric leads with CURRENT usage (ctxNow) — headline number AND
+  // bar fill both track "now" so they read coherently; peak is carried in the
+  // label text. (Deliberate shift from the old peak-led bar; the high-water mark
+  // lives in the label + the chart's polyline, not the bar.)
   const met=`<div class="metrics">
     <div class="met"><div class="mv">${esc(turns)}</div><div class="ml">turns</div></div>
-    <div class="met"><div class="mv">${nctx?(ctxPeak/1000).toFixed(0)+"k":"—"}</div><div class="ml">peak ctx / ${nctx?(nctx/1000)+"k window":"—"}</div><div class="tokbar"><span style="width:${nctx?Math.round(ctxPeak/nctx*100):0}%"></span></div></div>
+    <div class="met"><div class="mv">${nctx?(ctxNow/1000).toFixed(0)+"k":"—"}</div><div class="ml">ctx now${nctx?` · peak ${(ctxPeak/1000).toFixed(0)}k / ${(nctx/1000)}k window`:""}</div><div class="tokbar"><span style="width:${nctx?Math.round(ctxNow/nctx*100):0}%"></span></div></div>
     <div class="met"><div class="mv">${comps.length}</div><div class="ml">compactions</div></div>
     <div class="met"><div class="mv">${wall}</div><div class="ml">wall clock</div></div></div>`;
   const segs=loads.map((r,i)=>`<span class="seg ${i>0?'b':''}">${esc(r.fields.model)} · ${esc(r.fields.gb||'?')}GB</span>`).join("");
@@ -829,13 +840,15 @@ function renderSubsystem(){
     <div class="cpuchart"><div class="yax"><span>100</span><span>50</span><span>0</span></div>
       <div><div class="bars">${bars}</div><div class="xvals">${xvals}</div></div></div></div>`:"";
   let ctxChart="";
-  if(cx.length){
+  if(cx.length && nctx){
     const W=440,H=72,t0=startTs,t1=done?T(c.ts):state.t,span=Math.max(1,t1-t0);
     const xy=cx.map(r=>[Math.max(0,Math.min(W,(T(r.ts)-t0)/span*W)),H-(nctx?(r.fields.used/nctx)*H:0)]);
     const line=xy.map(p=>p[0].toFixed(0)+","+p[1].toFixed(0)).join(" ");
     const area="M"+xy[0][0].toFixed(0)+","+H+" "+xy.map(p=>"L"+p[0].toFixed(0)+","+p[1].toFixed(0)).join(" ")+" L"+xy[xy.length-1][0].toFixed(0)+","+H+" Z";
     const marks=comps.map(r=>{const x=Math.max(0,Math.min(W,(T(r.ts)-t0)/span*W)).toFixed(0);return `<line x1="${x}" y1="0" x2="${x}" y2="${H}" stroke="var(--warn)" stroke-width="1" stroke-dasharray="2 3"/><text x="${x}" y="9" fill="var(--warn)" font-size="9" text-anchor="middle">⚡</text>`;}).join("");
-    ctxChart=`<div class="track"><div class="lbl">context window — ${(nctx/1000)}K · ⚡ = compaction (${comps.length})</div><svg class="ctxchart" viewBox="0 0 ${W} ${H+2}" preserveAspectRatio="none"><path d="${area}" fill="var(--amber-dim)" opacity="0.22"/><polyline points="${line}" fill="none" stroke="var(--amber)" stroke-width="1.5"/>${marks}</svg></div>`;
+    // (#711) Native hover tooltip on the chart — now / peak / window at a glance.
+    const tip=`now ${(ctxNow/1000).toFixed(0)}k · peak ${(ctxPeak/1000).toFixed(0)}k · window ${(nctx/1000)}k · ${comps.length} compaction${comps.length===1?'':'s'}`;
+    ctxChart=`<div class="track"><div class="lbl">context window — ${(nctx/1000)}K · ⚡ = compaction (${comps.length})</div><svg class="ctxchart" viewBox="0 0 ${W} ${H+2}" preserveAspectRatio="none"><title>${esc(tip)}</title><path d="${area}" fill="var(--amber-dim)" opacity="0.22"/><polyline points="${line}" fill="none" stroke="var(--amber)" stroke-width="1.5"/>${marks}</svg></div>`;
   }
   const finds=[];
   if(distinct.length>1)finds.push({s:"warn",k:"jit-model-swap",d:`${distinct.length} models loaded in one run (${distinct.join(" → ")}) — mid-run swap stalls the dispatch while the new model loads.`,f:"pin one model for the run, or pre-warm the swap target."});
@@ -953,7 +966,7 @@ function renderCrumb(){
   let c=hasMission?`<a class="misslink" data-act="mission">◆ ${esc(pm)}</a>`:``;
   if(state.level!=="mission"){
     c+=(hasMission?`<span class="sep">›</span>`:``)+`<a data-act="fleet">fleet</a>`;
-    if(state.level==="machine"||state.level==="subsystem") c+=`<span class="sep">›</span><a data-act="machine" data-arg="${esc(state.machine)}">${esc(state.machine)}</a>`;
+    if(state.level==="machine"||state.level==="subsystem") c+=`<span class="sep">›</span><a data-act="machine" data-arg="${esc(state.machine)}">${escN(state.machine)}</a>`;
     if(state.level==="subsystem") c+=`<span class="sep">›</span>${esc(state.session)}`;
   }
   $("crumb").innerHTML=c; $("back").disabled=(state.level==="fleet");
