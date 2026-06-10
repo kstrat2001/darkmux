@@ -101,9 +101,18 @@ These are accepted, documented gaps — not undisclosed vulnerabilities:
 
 - **Trajectory event injection ([#237](https://github.com/kstrat2001/darkmux/issues/237)).**
   Container tools can write to the dispatch trajectory file, which the host
-  tailer turns into flow records. The viewer is hardened against the downstream
-  XSS this enables (output encoding, above); identifier-field validation at the
-  ingest boundary is the defense-in-depth follow-up.
+  tailer turns into flow records. The identifier fields on those records
+  (`session_id`, `machine_id`, `handle`, `model`, `mission_id`) are **stamped by
+  the host** from the dispatch context, not read from the container — so a
+  container influences only the record *payload* (tool name, finish reason,
+  reasoning text, detector detail). That payload is (a) output-encoded at the
+  viewer, so it can't execute script, and (b) **size-bounded at ingest** so a
+  container can't inject a pathologically large field into the flow stream /
+  audit chain / Redis (`reasoning_text` ≤ 256 KiB; `tool_name` / `finish_reason`
+  / detector `detail` ≤ 4 KiB). The residual is that a container can still emit
+  *plausible* (well-formed, in-bounds) telemetry about its own run — a
+  self-affecting concern bounded by the operator's per-dispatch caps, not a
+  cross-trust-boundary one.
 - **CORS origin normalization ([#289](https://github.com/kstrat2001/darkmux/issues/289)).**
   The `DARKMUX_DAEMON_CORS_ORIGINS` allowlist matches origins by normalized
   string (lowercased scheme/host, trailing slash stripped) but does not collapse
