@@ -154,7 +154,13 @@ darkmux doctor          # pre-flight checks: registry, LMStudio, models, runtime
 
 Doctor returns exit 0 if everything's wired up, 1 if a fail-level check needs fixing. Fail/warn lines include actionable hints.
 
-Once doctor is green, edit `~/.darkmux/profiles.json` and replace each `<your-primary-model-id>` placeholder with an actual id from `lms ls`. (Doctor will warn if profiles don't match your loaded models — that's the moment to fix them.)
+Once doctor is green, point your profiles at real models. The fastest path is `darkmux scan` — it lists the models LMStudio has downloaded that aren't yet in any profile and suggests which are worth adding, so you don't have to hand-match ids:
+
+```bash
+darkmux scan                # see downloaded models not yet in a profile, with suggestions
+```
+
+Or edit `~/.darkmux/profiles.json` directly and replace each `<your-primary-model-id>` placeholder with an actual id from `lms ls`. Either way, doctor will warn if profiles don't match your loaded models — that's the moment to fix them.
 
 ### Configuration
 
