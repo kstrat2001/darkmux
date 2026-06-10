@@ -37,6 +37,17 @@
   .topnav a:hover{color:var(--amber)}
   .badge{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.12em;text-transform:uppercase;color:#0a0a0b;background:var(--amber);padding:5px 9px;border-radius:3px}
   .pb{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.12em;text-transform:uppercase;color:var(--amber);border:1px solid var(--amber-dim);padding:4px 9px;border-radius:3px}
+  /* (#691) playback catalog day-picker */
+  .catbtn{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.12em;text-transform:uppercase;color:var(--amber);border:1px solid var(--amber-dim);background:none;padding:4px 9px;border-radius:3px;cursor:pointer}
+  .catbtn:hover{background:var(--amber-dim)}
+  .catpanel{position:absolute;top:48px;left:16px;z-index:60;background:var(--bg2);border:1px solid var(--line);border-radius:6px;padding:5px;min-width:300px;max-width:min(420px,92vw);max-height:60vh;overflow:auto;box-shadow:0 10px 30px rgba(0,0,0,.55)}
+  .catpanel .cathdr{font:600 10px/1 'JetBrains Mono',monospace;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);padding:7px 8px 4px}
+  .catrow{display:block;width:100%;text-align:left;background:none;border:0;color:var(--text);padding:7px 9px;border-radius:4px;cursor:pointer}
+  .catrow:hover{background:var(--amber-dim)}
+  .catrow .cd{font:600 13px/1.2 Inter,sans-serif}
+  .catrow .cs{color:var(--muted);font:11px/1.3 Inter,sans-serif;margin-top:2px}
+  .catrow.live .cd{color:var(--amber)}
+  .catempty{color:var(--muted);font:12px/1.4 Inter,sans-serif;padding:8px 9px}
   @keyframes lpulse{0%,100%{opacity:1}50%{opacity:.5}}
   .pb.live{color:#4ade80;border-color:#4ade80;animation:lpulse 1.6s ease-in-out infinite}
   .crumbbar{height:40px;display:flex;align-items:center;gap:12px;padding:0 16px;border-bottom:1px solid var(--line);background:#131316}
@@ -293,6 +304,7 @@
   <span class="brand"><a href="https://darkmux.com/" target="_blank" rel="noopener"><b>darkmux</b></a> · observability</span>
   <span class="badge" id="srcbadge">Loading…</span>
   <span class="pb" id="modebadge">▣ playback</span>
+  <button class="catbtn" id="catbtn" data-act="catalog" hidden>▤ history</button>
   <nav class="topnav">
     <a href="https://darkmux.com/" target="_blank" rel="noopener">home</a>
     <a href="https://darkmux.com/guide/" target="_blank" rel="noopener">guide</a>
@@ -300,6 +312,7 @@
     <a href="https://github.com/kstrat2001/darkmux" target="_blank" rel="noopener">github</a>
   </nav>
 </div>
+<div class="catpanel" id="catpanel" hidden></div>
 <div class="crumbbar">
   <button class="backbtn" id="back">‹ back</button>
   <span class="crumb" id="crumb"></span>
@@ -1105,20 +1118,61 @@ const ACTIONS={
   filters:()=>openFilters(),
   closefilters:()=>closeFilters(),
   clearfilters:()=>clearFilters(),
+  catalog:()=>toggleCatalog(),
+  goday:d=>{ location.href="/play/"+encodeURIComponent(d); },
+  golive:()=>{ location.href="/"; },
 };
 document.addEventListener("click",e=>{
   const el=e.target.closest("[data-act]");
+  // (#691) Click outside the open catalog panel (and not on its toggle) closes it.
+  if(!el || (el.dataset.act!=="catalog")){
+    const panel=$("catpanel");
+    if(panel && !panel.hidden && !e.target.closest("#catpanel")) panel.hidden=true;
+  }
   if(!el)return;
   if(el.dataset.act==="filter"){toggleFilter(el.dataset.k,el.dataset.arg);return;}
   const fn=ACTIONS[el.dataset.act];
   if(fn)fn(el.dataset.arg);
 });
+document.addEventListener("keydown",e=>{ if(e.key==="Escape"){const p=$("catpanel"); if(p) p.hidden=true;} });
 // `toggle` doesn't bubble — a capture-phase listener stands in for the old
 // inline ontoggle on the raw-JSON <details> (tagged data-raw; the recent-runs
 // <details class="rr"> rows don't carry it and are untracked by design).
 document.addEventListener("toggle",e=>{
   if(e.target&&e.target.matches&&e.target.matches("details[data-raw]"))state.rawOpen=e.target.open;
 },true);
+// (#691) Playback catalog day-picker. Toggling fetches /flow-days (the
+// disk-backed catalog — every day with a flow file, summarized) and renders a
+// list: "live (today)" first, then each day newest-first with a one-line
+// summary. Selecting a day navigates to /play/<date>; "live" goes to /. Only
+// daemon-backed views get the button (the static demo has no /flow-days), so
+// this is gated in boot().
+async function toggleCatalog(){
+  const panel=$("catpanel");
+  if(!panel) return;
+  if(!panel.hidden){ panel.hidden=true; return; }
+  panel.innerHTML=`<div class="cathdr">loading…</div>`;
+  panel.hidden=false;
+  let days=[];
+  try{
+    const r=await fetch("/flow-days",{headers:{accept:"application/json"}});
+    if(r.ok){ const b=await r.json(); days=Array.isArray(b.days)?b.days:[]; }
+  }catch(_){ /* render the empty/error state below */ }
+  const today=todayUTC();
+  const liveRow=`<button class="catrow live" data-act="golive"><div class="cd">● live · today</div><div class="cs">now-ish on present machines</div></button>`;
+  const dayRows=days.map(d=>{
+    const date=esc(d.date);
+    const recs=Number(d.records)||0, disp=Number(d.dispatches)||0;
+    const ms=Array.isArray(d.missions)?d.missions:[];
+    const missTxt=ms.length?` · ${ms.length===1?'mission':'missions'} ${esc(ms.slice(0,3).join(', '))}${ms.length>3?` +${ms.length-3}`:''}`:'';
+    const isToday=d.date===today;
+    const summary=`${disp} dispatch${disp===1?'':'es'} · ${recs} record${recs===1?'':'s'}${missTxt}`;
+    return `<button class="catrow" data-act="goday" data-arg="${date}"><div class="cd">${date}${isToday?' · today':''}</div><div class="cs">${summary}</div></button>`;
+  }).join("");
+  panel.innerHTML=`<div class="cathdr">playback catalog</div>${liveRow}`
+    +(days.length?dayRows:`<div class="catempty">no recorded days yet — dispatches you run will appear here.</div>`);
+}
+
 // resizable detail/log split — fixed default height stops the jumpiness; drag the divider to grow it
 (function(){const DEF=200,MIN=110,MAX=520;$("detail").style.height=DEF+"px";let drag=false,sy=0,sh=0;
   $("split").addEventListener("mousedown",e=>{drag=true;sy=e.clientY;sh=$("detail").offsetHeight;document.body.style.userSelect="none";e.preventDefault();});
@@ -1413,6 +1467,10 @@ async function boot(){
   // Tag the body with the daemon-injected mode so CSS and dev tools can
   // distinguish live-route vs playback-route loads at a glance.
   document.body.classList.add("daemon-mode-"+(injectedMode||(flowSrc?"play":"unset")));
+  // (#691) The catalog day-picker needs the daemon's /flow-days endpoint, which
+  // the static demo (flowSrc, no daemon) and the no-daemon state don't have —
+  // show the button only when there's a daemon behind us.
+  if(!flowSrc && mode!=="no-daemon"){ const cb=$("catbtn"); if(cb) cb.hidden=false; }
   setBadges(mode,date);
   recompute();
   state.t=tMax;
