@@ -1943,7 +1943,10 @@ fn check_docker_preflight() -> Result<String> {
             ensure_darkmux_image_present()
         }
         // Docker missing / daemon unreachable / probe error → actionable bail
-        // (reuse the pure mapper, which returns Err for all of these).
+        // (reuse the pure mapper, which returns Err for all of these). The
+        // `.map` only adapts the Ok type so the `Result<String>` signature
+        // lines up — these variants never produce Ok, so the `String` is never
+        // built.
         other => preflight_result_for(other).map(|()| String::new()),
     }
 }
