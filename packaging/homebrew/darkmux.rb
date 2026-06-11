@@ -72,14 +72,15 @@ class Darkmux < Formula
       darkmux is installed but the `serve` daemon is NOT started by default.
 
       Scope: this formula ships the `darkmux` CLI + `serve` daemon + the
-      keychain wrapper + bundled skills. It does NOT ship the
-      `darkmux-runtime` Docker image — `darkmux crew dispatch` and
-      `darkmux lab run` need that image, which requires a source checkout +
-      `docker build -t darkmux-runtime:latest runtime/` (a published image
-      is tracked in #618). brew = complete install for `swap` / `status` /
-      `profiles` / `fleet` / `flow` / `serve` / `doctor` and for the hub
-      coordinator role. For local dispatches, supplement with a runtime
-      image from a source checkout.
+      keychain wrapper + bundled skills. The `darkmux-runtime` Docker image
+      that `darkmux crew dispatch` and `darkmux lab run` use is not bundled,
+      but you don't build it by hand: on the first dispatch with no local
+      image, darkmux pulls the version-pinned image from GHCR on demand
+      (ghcr.io/kstrat2001/darkmux-runtime:<version>, #759) — you just need
+      Docker running. (`docker build -t darkmux-runtime:latest runtime/` from
+      a source checkout is the offline/dev alternative.) So brew is a complete
+      install end to end: `swap` / `status` / `profiles` / `fleet` / `flow` /
+      `serve` / `doctor`, the hub coordinator role, AND local dispatches.
 
       For a single-machine CLI install (no daemon needed):
         # Already done. Run `darkmux --help` to explore.
