@@ -92,7 +92,8 @@ The third one is opt-in (the daemon binds localhost by default for safety). To e
 | **[LMStudio](https://lmstudio.ai/)** | Loads/unloads models. darkmux drives it via the `lms` CLI. | macOS / Windows / Linux installer |
 | **At least one model in LMStudio** | Nothing to swap to without one. | Download via the LMStudio UI; verify with `lms ls`. |
 | **[Docker](https://www.docker.com/products/docker-desktop)** | Hosts darkmux's internal Rust runtime — the default for `darkmux crew dispatch` and `darkmux lab run`. Each dispatch runs in a per-invocation `darkmux-runtime` container with kernel-enforced workspace isolation. darkmux pulls the image from GHCR on demand (or `docker build -t darkmux-runtime:latest runtime/` from a source checkout). **Required only for that dispatch + lab path** — the `swap` / `status` / `profiles` core needs just LMStudio + a model. | Docker Desktop or equivalent daemon |
-| **Rust toolchain** | To build darkmux itself. | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh` |
+
+> **`brew install` needs no toolchain** — Homebrew handles the build for you (and bottled binaries, once published, ship precompiled). The **Rust toolchain** is required only if you build from source (Option B below), which documents `rustup` at its first step.
 
 | Optional | When you'd want it |
 |---|---|
