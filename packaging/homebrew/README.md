@@ -9,7 +9,7 @@ Tracking: [#618](https://github.com/kstrat2001/darkmux/issues/618).
 
 ## Files
 
-- **`darkmux.rb`** — the formula. Currently head-only (no v0.5.0 tag yet
+- **`darkmux.rb`** — the formula. Currently head-only (no v0.9.0 tag yet
   per [#618](https://github.com/kstrat2001/darkmux/issues/618) item 4).
   Audit-clean (`brew audit --strict` against a local tap).
 - **`darkmux-serve-wrapped`** — keychain-aware wrapper for
@@ -25,7 +25,7 @@ The tap exists at [kstrat2001/homebrew-darkmux](https://github.com/kstrat2001/ho
 
 ```bash
 brew tap kstrat2001/darkmux
-brew install --HEAD darkmux           # head-only until v0.5.0
+brew install --HEAD darkmux           # head-only until v0.9.0
 brew services start darkmux           # optional — runs serve under launchd
 ```
 

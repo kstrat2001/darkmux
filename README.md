@@ -107,7 +107,7 @@ darkmux is developed and tested on Apple Silicon. Linux should work; Intel Mac i
 
 ```bash
 brew tap kstrat2001/darkmux
-brew install --HEAD darkmux           # head-only until v0.5.0 ships a stable tag
+brew install --HEAD darkmux           # head-only until v0.9.0 ships a stable tag
 
 # Optional: hub posture — Redis as the coordination substrate
 brew install redis
@@ -208,7 +208,7 @@ brew upgrade darkmux                  # picks up the latest tagged release
 brew services restart darkmux         # if you're running the daemon
 ```
 
-For `--HEAD` installs (pre-v0.5.0): `brew upgrade --HEAD darkmux` pulls the latest commit on main.
+For `--HEAD` installs (pre-v0.9.0): `brew upgrade --HEAD darkmux` pulls the latest commit on main.
 
 **If you installed from source via cargo:**
 
@@ -368,7 +368,7 @@ The case for darkmux: **once you accept that static configs leave performance on
 
 ## Status
 
-🚧 **Pre-1.0** — v0.4.0 on `main`; active development; APIs not yet frozen.
+🚧 **Pre-1.0** — v0.9.0 on `main`; active development; APIs not yet frozen.
 
 **Shipped:**
 
