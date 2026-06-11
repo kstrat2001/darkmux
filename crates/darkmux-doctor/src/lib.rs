@@ -2483,24 +2483,24 @@ fn fix_ctx_window_mismatch() -> Result<FixOutcome> {
 // ─── Result rendering ───────────────────────────────────────────────────
 
 pub fn print_report(r: &DoctorReport) -> Result<()> {
-    println!("darkmux doctor — {} checks", r.checks.len());
+    println!("{}", darkmux_types::style::header(&format!("darkmux doctor — {} checks", r.checks.len())));
     println!();
     for c in &r.checks {
         let marker = match c.status {
-            Status::Pass => "✓",
-            Status::Warn => "⚠",
-            Status::Fail => "✗",
+            Status::Pass => darkmux_types::style::success("✓"),
+            Status::Warn => darkmux_types::style::warn("⚠"),
+            Status::Fail => darkmux_types::style::error("✗"),
         };
         println!("  {} {:<22} {}", marker, c.name, c.message);
         if let Some(hint) = c.hint.as_ref() {
             for line in hint.lines() {
-                println!("        → {line}");
+                println!("        → {}", darkmux_types::style::dim(line));
             }
         }
     }
     println!();
     let summary = match r.worst_status() {
-        Status::Pass => format!(
+        Status::Pass => darkmux_types::style::success(&format!(
             "all {} checks passed{}",
             r.pass_count(),
             if r.warn_count() > 0 {
@@ -2508,18 +2508,18 @@ pub fn print_report(r: &DoctorReport) -> Result<()> {
             } else {
                 "".into()
             }
-        ),
-        Status::Warn => format!(
+        )),
+        Status::Warn => darkmux_types::style::warn(&format!(
             "{} pass, {} warn — workable but worth a look",
             r.pass_count(),
             r.warn_count()
-        ),
-        Status::Fail => format!(
+        )),
+        Status::Fail => darkmux_types::style::error(&format!(
             "{} pass, {} warn, {} fail — fix failures before running darkmux end-to-end",
             r.pass_count(),
             r.warn_count(),
             r.fail_count()
-        ),
+        )),
     };
     println!("{summary}");
     Ok(())
