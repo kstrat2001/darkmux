@@ -725,9 +725,11 @@ enum MissionCmd {
         #[arg(long, default_value = "coder")]
         role: String,
         /// Dispatch image. The default slim runtime image is used when
-        /// omitted; naming a language image (e.g. `rust:slim`) makes
+        /// omitted; naming a language image (e.g. `rust:latest`) makes
         /// darkmux inject its runtime binary so the coder can build/test
-        /// in-sandbox (#703).
+        /// in-sandbox (#703). For Rust in-sandbox lint, pick an image with
+        /// the clippy component (`rust:latest` has it; bare `rust:slim`
+        /// may not) — darkmux ships no per-language image.
         #[arg(long, value_name = "IMG")]
         image: Option<String>,
         /// Base ref the worktree branches off (and the QA diff compares
