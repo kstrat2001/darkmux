@@ -166,7 +166,7 @@ darkmux sprint complete &lt;your-sprint-id&gt;   <span class="comment"># cyan: s
   <div class="wrap">
     <h2>Stopping + restarting</h2>
     <p>Ctrl-C the daemon's terminal tab to stop. To restart after upgrading darkmux:</p>
-    <pre><code>cargo install --path . --force    <span class="comment"># rebuild + install</span>
+    <pre><code>brew upgrade darkmux              <span class="comment"># or `cargo install --path . --force` from source</span>
 <span class="comment"># Then in the daemon tab, Ctrl-C and re-run:</span>
 darkmux serve</code></pre>
     <p>The viewer auto-reconnects on the next interaction; no need to refresh.</p>
