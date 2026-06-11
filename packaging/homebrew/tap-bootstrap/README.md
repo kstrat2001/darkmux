@@ -12,11 +12,14 @@ for managing local LLM stacks (LMStudio, Ollama, llama.cpp) on Apple Silicon.
 
 ```bash
 brew tap kstrat2001/darkmux
-brew install --HEAD darkmux
+brew install darkmux              # stable release (v0.9.0)
+# brew install --HEAD darkmux    # or build from the latest commit on main
 ```
 
-`--HEAD` is required while darkmux is pre-v0.9.0. Once a tagged release exists,
-plain `brew install darkmux` will install a stable pinned version.
+`brew install darkmux` installs the stable pinned release; `--HEAD` builds from
+the latest commit on `main`. If brew refuses with an "untrusted tap" error,
+run `brew trust kstrat2001/darkmux` once (a newer-Homebrew security gate for
+third-party taps), then re-run the install.
 
 For a hub machine (Redis-backed multi-machine fleet coordinator):
 
@@ -33,7 +36,7 @@ integrity checks).
 ## Upgrade
 
 ```bash
-brew upgrade --HEAD darkmux
+brew upgrade darkmux                     # or `brew upgrade --HEAD darkmux` for main
 brew services restart darkmux           # if you're running the daemon
 ```
 
@@ -50,8 +53,8 @@ leave a dangling launchd plist until the next reboot.
 
 ## What's in this tap
 
-- `Formula/darkmux.rb` — the formula. Currently head-only (no v0.9.0 tag
-  yet — tracked in [darkmux#618](https://github.com/kstrat2001/darkmux/issues/618)).
+- `Formula/darkmux.rb` — the formula. Pinned to stable **v0.9.0** (url + sha256)
+  with a `head` block for `--HEAD` installs from main.
   Installs the `darkmux` CLI + the `serve` daemon + a keychain-aware
   wrapper script (`libexec/darkmux-serve-wrapped`) that resolves
   `DARKMUX_REDIS_URL` from macOS Keychain at process-start.
