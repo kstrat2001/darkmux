@@ -526,21 +526,10 @@ pub fn abort(mission_id: &str, sprint_id: Option<&str>) -> Result<i32> {
         bail!("mission `{mission_id}` not found");
     }
     let sprints = load_sprints()?;
-    // Sprint resolution differs by path: an explicit `--sprint` is looked up
-    // by id directly (no status filter — so a Running sprint, the common
-    // abort case after a `run` flipped it, resolves fine). The auto-path
-    // falls back to `select_sprint`, which only matches a Planned, ready
-    // sprint — so to abort a Running sprint, pass `--sprint` explicitly.
-    let sprint = match sprint_id {
-        Some(id) => sprints
-            .iter()
-            .find(|s| s.id == id && s.mission_id == mission_id)
-            .cloned()
-            .ok_or_else(|| {
-                anyhow::anyhow!("sprint `{id}` not found in mission `{mission_id}`")
-            })?,
-        None => select_sprint(&sprints, mission_id, None)?,
-    };
+    // Explicit `--sprint` resolves by id (any status — a Running sprint, the
+    // common abort case after a `run`, resolves); auto-path requires a ready
+    // Planned sprint. So to abort a Running sprint, pass `--sprint`.
+    let sprint = resolve_sprint(&sprints, mission_id, sprint_id)?;
 
     let root = repo_root()?;
     let wt_path = worktree_path(&root, &sprint.id);
@@ -615,6 +604,402 @@ pub fn abort(mission_id: &str, sprint_id: Option<&str>) -> Result<i32> {
         &sprint.id,
         &session_id,
         serde_json::json!({ "branch": branch, "worktree": wt_path.display().to_string() }),
+    );
+    Ok(0)
+}
+
+/// Resolve the sprint a post-run verb (`ship` / `abort`) targets. An explicit
+/// `--sprint` is looked up by id directly (no status filter — so a Running
+/// sprint, the common post-`run` case, resolves); otherwise fall back to
+/// `select_sprint`'s ready-Planned auto-pick.
+fn resolve_sprint(
+    sprints: &[crew::types::Sprint],
+    mission_id: &str,
+    explicit: Option<&str>,
+) -> Result<crew::types::Sprint> {
+    match explicit {
+        Some(id) => sprints
+            .iter()
+            .find(|s| s.id == id && s.mission_id == mission_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("sprint `{id}` not found in mission `{mission_id}`")),
+        None => select_sprint(sprints, mission_id, None),
+    }
+}
+
+/// Run a git subcommand in `dir`, returning its captured output. Thin wrapper
+/// so the ship/abort git calls read uniformly.
+fn git_in(dir: &Path, args: &[&str]) -> Result<std::process::Output> {
+    Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .with_context(|| format!("running `git {}`", args.join(" ")))
+}
+
+/// Commit subject for a shipped sprint: the sprint description's first line,
+/// trimmed to a conventional ~72-char subject.
+fn commit_subject(sprint: &crew::types::Sprint) -> String {
+    let first = sprint.description.lines().next().unwrap_or("").trim();
+    let s = if first.is_empty() {
+        format!("darkmux sprint {}", sprint.id)
+    } else {
+        first.to_string()
+    };
+    if s.chars().count() > 72 {
+        let truncated: String = s.chars().take(69).collect();
+        format!("{truncated}...")
+    } else {
+        s
+    }
+}
+
+/// PR title for a shipped sprint.
+fn pr_title(sprint: &crew::types::Sprint) -> String {
+    commit_subject(sprint)
+}
+
+/// PR body — sprint + mission provenance. Authored by the LOCAL coder via
+/// `mission run`; the body says so (no frontier/Claude co-author claim — this
+/// is local-AI work shipped through darkmux's loop).
+fn pr_body(mission: &crew::types::Mission, sprint: &crew::types::Sprint) -> String {
+    format!(
+        "## {sprint_desc}\n\n\
+         Shipped via `darkmux mission ship` — the local dispatch-to-PR loop.\n\n\
+         - **Mission:** `{mission_id}` — {mission_desc}\n\
+         - **Sprint:** `{sprint_id}`\n\n\
+         The implementation was produced by the local-AI coder under \
+         `darkmux mission run` and reviewed by the local `code-reviewer` before \
+         sign-off. The frontier/operator adjudicated the QA findings at the gate.",
+        sprint_desc = sprint.description.lines().next().unwrap_or("").trim(),
+        mission_id = mission.id,
+        mission_desc = mission.description.lines().next().unwrap_or("").trim(),
+        sprint_id = sprint.id,
+    )
+}
+
+/// `gh pr view <branch> --json url -q .url` — returns the existing PR URL for
+/// the branch, or `None` if there's no open PR (or `gh` reports none).
+fn existing_pr_url(dir: &Path, branch: &str) -> Option<String> {
+    let out = Command::new("gh")
+        .current_dir(dir)
+        .args(["pr", "view", branch, "--json", "url", "-q", ".url"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if url.is_empty() { None } else { Some(url) }
+}
+
+/// Verify the branch's CI is GREEN — every check `conclusion == SUCCESS`, not
+/// merely completed (per the merge-gate discipline). `--watch` blocks until
+/// checks finish; we then re-read the rollup and require all-SUCCESS.
+///
+/// Two deliberate behaviors: (1) `gh pr checks --watch` has no timeout — a
+/// hung check blocks `ship` until it resolves or the operator interrupts
+/// (Ctrl-C leaves the PR open, nothing merged). (2) an EMPTY rollup (no checks
+/// configured) is treated as NOT green — a merge gate shouldn't wave work
+/// through just because a repo has no CI. So `--merge` requires CI to be both
+/// configured AND passing.
+fn ci_is_green(dir: &Path, branch: &str) -> Result<bool> {
+    // Block until checks complete (ignore the exit code — a red check makes
+    // `gh pr checks --watch` exit non-zero; we judge from the rollup below).
+    let _ = Command::new("gh")
+        .current_dir(dir)
+        .args(["pr", "checks", branch, "--watch", "--interval", "30"])
+        .status();
+    let out = Command::new("gh")
+        .current_dir(dir)
+        .args([
+            "pr",
+            "view",
+            branch,
+            "--json",
+            "statusCheckRollup",
+            "-q",
+            ".statusCheckRollup[].conclusion",
+        ])
+        .output()
+        .context("reading CI rollup via gh")?;
+    if !out.status.success() {
+        bail!(
+            "could not read CI status: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let conclusions: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    // All checks must be SUCCESS. An empty list (no checks configured) is
+    // treated as NOT green — refuse to claim green when nothing ran.
+    Ok(!conclusions.is_empty() && conclusions.iter().all(|c| c == "SUCCESS"))
+}
+
+/// `darkmux mission ship` — the post-sign-off completion of the dispatch-to-PR
+/// loop. Commits the worktree's work, pushes the branch, opens (or reuses) the
+/// PR, and STOPS at the PR by default. `--wait-ci` blocks on CI; `--merge`
+/// (opt-in, green-gated) squash-merges, flips the sprint to Complete, and
+/// tears the worktree down. **Never auto-merges** — `--merge` is the operator/
+/// frontier's explicit sign-off act. Returns `0` on success, `1` on a refused
+/// merge (CI not green), `2` when the PR merged but the sprint couldn't be
+/// marked Complete (inconsistent state — needs manual reconcile).
+pub fn ship(
+    mission_id: &str,
+    sprint_id: Option<&str>,
+    base: &str,
+    wait_ci: bool,
+    merge: bool,
+) -> Result<i32> {
+    use crew::loader::{load_missions, load_sprints};
+
+    fleet::validate_identifier("mission_id", mission_id)?;
+    if let Some(s) = sprint_id {
+        fleet::validate_identifier("--sprint", s)?;
+    }
+
+    let missions = load_missions()?;
+    let mission = missions
+        .iter()
+        .find(|m| m.id == mission_id)
+        .ok_or_else(|| anyhow::anyhow!("mission `{mission_id}` not found"))?
+        .clone();
+    let sprints = load_sprints()?;
+    let sprint = resolve_sprint(&sprints, mission_id, sprint_id)?;
+
+    // A Complete sprint is terminal — a prior `--merge` already shipped it
+    // (and tore down its worktree). Re-shipping would duplicate-PR or churn;
+    // refuse rather than confuse.
+    if matches!(sprint.status, crew::types::SprintStatus::Complete) {
+        bail!(
+            "sprint `{}` is already Complete (terminal) — nothing to ship.",
+            sprint.id
+        );
+    }
+
+    let root = repo_root()?;
+    let wt_path = worktree_path(&root, &sprint.id);
+    let branch = branch_name(&sprint.id);
+    let session_id = format!("mission-run-{}-{}", mission_id, sprint.id);
+
+    if !wt_path.exists() {
+        bail!(
+            "no worktree at {} — run `darkmux mission run {mission_id} --sprint {}` first.",
+            wt_path.display(),
+            sprint.id
+        );
+    }
+
+    println!(
+        "{}",
+        style::header(&format!("▶ mission ship — {} · sprint {}", mission_id, sprint.id))
+    );
+
+    // 1. Commit the worktree's work (the coder's changes + any operator edits
+    //    made while resolving findings). Stage everything, commit only if
+    //    there's something staged; if nothing's staged but the branch is
+    //    already ahead of base, proceed to push the existing commits.
+    git_in(&wt_path, &["add", "-A"])?;
+    let nothing_staged = git_in(&wt_path, &["diff", "--cached", "--quiet"])?
+        .status
+        .success();
+    let ahead = git_in(&wt_path, &["rev-list", "--count", &format!("{base}..HEAD")])?;
+    let commits_ahead: u32 = String::from_utf8_lossy(&ahead.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0);
+    if nothing_staged && commits_ahead == 0 {
+        bail!(
+            "nothing to ship — worktree at {} has no changes vs `{base}` and no commits ahead.",
+            wt_path.display()
+        );
+    }
+    if !nothing_staged {
+        let subject = commit_subject(&sprint);
+        let msg = format!(
+            "{subject}\n\nAuthored via `darkmux mission run` (local-AI coder, sprint {}).",
+            sprint.id
+        );
+        let out = git_in(&wt_path, &["commit", "-m", &msg])?;
+        if !out.status.success() {
+            bail!("git commit failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        println!("{}", style::success(&format!("✓ committed: {subject}")));
+    } else {
+        println!(
+            "{}",
+            style::dim(&format!("{commits_ahead} commit(s) already ahead of {base} — nothing new to commit"))
+        );
+    }
+
+    // 2. Push the branch (sets upstream).
+    let out = git_in(&wt_path, &["push", "-u", "origin", &branch])?;
+    if !out.status.success() {
+        bail!(
+            "git push failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    println!("{}", style::success(&format!("✓ pushed {branch}")));
+
+    // 3. Open (or reuse) the PR.
+    let pr_url = match existing_pr_url(&wt_path, &branch) {
+        Some(url) => {
+            println!("{}", style::dim(&format!("PR already open: {url}")));
+            url
+        }
+        None => {
+            let title = pr_title(&sprint);
+            let body = pr_body(&mission, &sprint);
+            let out = Command::new("gh")
+                .current_dir(&wt_path)
+                .args([
+                    "pr", "create", "--base", base, "--head", &branch, "--title", &title,
+                    "--body", &body,
+                ])
+                .output()
+                .context("running `gh pr create` — is `gh` on PATH?")?;
+            if !out.status.success() {
+                bail!(
+                    "`gh pr create` failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+            let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            println!("{}", style::success(&format!("✓ opened PR: {url}")));
+            url
+        }
+    };
+
+    emit_run_record(
+        flow::Level::Info,
+        "mission.run.ship",
+        mission_id,
+        &sprint.id,
+        &session_id,
+        serde_json::json!({ "branch": branch, "pr_url": pr_url, "base": base }),
+    );
+
+    // 4. CI gate (for --wait-ci or --merge).
+    let mut green = false;
+    if wait_ci || merge {
+        println!("\n{}", style::header("▶ watching CI…"));
+        green = ci_is_green(&wt_path, &branch)?;
+        if green {
+            println!("{}", style::success("✓ CI green"));
+        } else {
+            eprintln!("{}", style::warn("⚠ CI is not green (or no checks ran)"));
+        }
+    }
+
+    // 5. Merge — opt-in, green-gated. NEVER automatic.
+    if merge {
+        if !green {
+            // `green` is false both when a check failed AND when no checks
+            // ran at all (ci_is_green treats empty as not-green — the safe
+            // default for a merge gate). Name both so the operator knows
+            // which it is.
+            eprintln!(
+                "{}",
+                style::error(&format!(
+                    "✗ refusing to merge {branch} — CI is not green (a check failed, or no \
+                     checks ran; `--merge` requires configured + passing CI). Resolve, re-push, \
+                     then re-run `darkmux mission ship {mission_id} --sprint {} --merge`.",
+                    sprint.id
+                ))
+            );
+            return Ok(1);
+        }
+        let out = Command::new("gh")
+            .current_dir(&wt_path)
+            .args(["pr", "merge", &branch, "--squash", "--delete-branch"])
+            .output()
+            .context("running `gh pr merge`")?;
+        if !out.status.success() {
+            bail!(
+                "`gh pr merge` failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        println!("{}", style::success(&format!("✓ merged {branch} (squash)")));
+
+        // Flip the sprint Complete + tear down the worktree. The merge is
+        // already irreversible, so a sprint_complete failure can't roll it
+        // back — but it leaves merged-PR-but-Running-sprint, so we must NOT
+        // claim a clean "loop closed". Track the outcome and exit non-zero
+        // with a reconcile pointer if completion didn't take.
+        let complete_ok = match crew::lifecycle::sprint_complete(&sprint.id) {
+            Ok(_) => {
+                println!("{}", style::success(&format!("✓ sprint {} → Complete", sprint.id)));
+                true
+            }
+            Err(e) => {
+                eprintln!(
+                    "{}",
+                    style::error(&format!("✗ sprint_complete({}) failed: {e:#}", sprint.id))
+                );
+                false
+            }
+        };
+        // The branch was deleted by --delete-branch; remove the now-orphaned
+        // worktree (force — its branch ref is gone). Warn on failure so
+        // orphaned files don't linger silently.
+        match git_in(&root, &["worktree", "remove", "--force", &wt_path.to_string_lossy()]) {
+            Ok(o) if o.status.success() => {
+                println!("{}", style::dim(&format!("worktree {} removed", wt_path.display())))
+            }
+            Ok(o) => eprintln!(
+                "{}",
+                style::warn(&format!(
+                    "worktree removal failed ({}) — run `git worktree prune` / remove {} manually.",
+                    String::from_utf8_lossy(&o.stderr).trim(),
+                    wt_path.display()
+                ))
+            ),
+            Err(e) => eprintln!(
+                "{}",
+                style::warn(&format!("worktree removal errored: {e:#} — remove {} manually.", wt_path.display()))
+            ),
+        }
+
+        emit_run_record(
+            flow::Level::Info,
+            "mission.run.ship.merged",
+            mission_id,
+            &sprint.id,
+            &session_id,
+            serde_json::json!({ "pr_url": pr_url, "sprint_completed": complete_ok }),
+        );
+        if !complete_ok {
+            eprintln!(
+                "{}",
+                style::error(&format!(
+                    "PR was MERGED but sprint `{}` could not be marked Complete — state is \
+                     inconsistent. Reconcile with `darkmux sprint complete {}`.",
+                    sprint.id, sprint.id
+                ))
+            );
+            return Ok(2);
+        }
+        println!("\n{}", style::success("✓ sprint shipped + merged. Loop closed."));
+        return Ok(0);
+    }
+
+    // Default: stop at the PR. Merge stays the operator/frontier's explicit act.
+    println!(
+        "\n{}",
+        style::success(&format!("✓ PR ready: {pr_url}"))
+    );
+    println!(
+        "  {}",
+        style::dim(&format!(
+            "review CI, then merge. To finish via darkmux after green: \
+             darkmux mission ship {mission_id} --sprint {} --merge",
+            sprint.id
+        ))
     );
     Ok(0)
 }
@@ -732,5 +1117,54 @@ mod tests {
         assert!(p.ends_with("darkmux-public/s1"), "{}", p.display());
         // Recomputable: same inputs → same path.
         assert_eq!(p, worktree_path(Path::new("/home/k/proj/darkmux-public"), "s1"));
+    }
+
+    fn mission(id: &str, desc: &str) -> crew::types::Mission {
+        crew::types::Mission {
+            id: id.to_string(),
+            description: desc.to_string(),
+            status: crew::types::MissionStatus::Active,
+            sprint_ids: vec![],
+            created_ts: 0,
+            started_ts: None,
+            closed_ts: None,
+            paused_ts: None,
+        }
+    }
+
+    #[test]
+    fn commit_subject_takes_first_line() {
+        let s = sprint("s1", "m1", &[], SprintStatus::Running);
+        // sprint() sets description = "desc s1"
+        assert_eq!(commit_subject(&s), "desc s1");
+    }
+
+    #[test]
+    fn commit_subject_truncates_long_and_takes_only_first_line() {
+        let mut s = sprint("s1", "m1", &[], SprintStatus::Running);
+        s.description = format!("{}\nsecond line ignored", "x".repeat(100));
+        let subj = commit_subject(&s);
+        assert!(subj.chars().count() <= 72, "len {}", subj.chars().count());
+        assert!(subj.ends_with("..."), "{subj}");
+        assert!(!subj.contains("second line"), "only first line: {subj}");
+    }
+
+    #[test]
+    fn commit_subject_falls_back_on_empty_description() {
+        let mut s = sprint("s1", "m1", &[], SprintStatus::Running);
+        s.description = String::new();
+        assert_eq!(commit_subject(&s), "darkmux sprint s1");
+    }
+
+    #[test]
+    fn pr_body_names_mission_and_sprint_no_currency() {
+        let m = mission("m1", "ship the thing");
+        let s = sprint("s1", "m1", &[], SprintStatus::Running);
+        let body = pr_body(&m, &s);
+        assert!(body.contains("`m1`"), "{body}");
+        assert!(body.contains("`s1`"), "{body}");
+        assert!(body.contains("mission ship"), "{body}");
+        // Tokens-only doctrine: no currency leaks into shipped PR copy.
+        assert!(!body.contains('$'), "no currency in PR body: {body}");
     }
 }
