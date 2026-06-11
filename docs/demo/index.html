@@ -217,7 +217,10 @@
   #meta .idle{color:var(--muted);cursor:default}
   #meta .metahint{color:var(--muted);font:11px 'JetBrains Mono',monospace}
   /* (#783) savings hero — tokens kept off the meter. The "bang-up" on the fleet view. */
-  .savings{margin:0 0 18px;padding:16px 20px;border:1px solid var(--line);border-radius:10px;background:linear-gradient(180deg,rgba(74,222,128,.06),rgba(74,222,128,.01))}
+  /* max-width so the hero reads as a deliberate stat card aligned with the
+     machine cards below, not a full-width bordered bar with a void to the
+     right on wide displays. */
+  .savings{margin:0 0 18px;padding:16px 20px;border:1px solid var(--line);border-radius:10px;background:linear-gradient(180deg,rgba(74,222,128,.06),rgba(74,222,128,.01));max-width:560px}
   .savnum{font:700 42px/1 'JetBrains Mono',monospace;color:#4ade80;letter-spacing:.01em}
   .savlbl{font:600 12px/1 'JetBrains Mono',monospace;color:var(--text);margin-top:7px;text-transform:uppercase;letter-spacing:.12em}
   .savbreak{font:12px Inter,sans-serif;color:var(--muted);margin-top:7px}
