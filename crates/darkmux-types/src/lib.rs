@@ -8,6 +8,7 @@
 pub mod config;
 pub mod config_access;
 pub mod paths;
+pub mod style;
 pub mod workdir;
 
 use serde::{Deserialize, Serialize};
