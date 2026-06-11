@@ -2299,21 +2299,21 @@ fn cmd_model_status() -> Result<i32> {
     let (managed, user): (Vec<_>, Vec<_>) = loaded
         .iter()
         .partition(|m| swap::is_darkmux_owned(&m.identifier));
-    println!("darkmux-managed ({}):", managed.len());
+    println!("{}", darkmux_types::style::header(&format!("darkmux-managed ({}):", managed.len())));
     if managed.is_empty() {
         println!("  (none — `darkmux swap <profile>` to load)");
     } else {
         for m in &managed {
-            println!("  {:<46} ctx={:<8} {}", m.identifier, m.context, m.size);
+            println!("  {} ctx={:<8} {}", darkmux_types::style::accent(&format!("{:<46}", m.identifier)), m.context, m.size);
         }
     }
     println!();
-    println!("user state ({}):", user.len());
+    println!("{}", darkmux_types::style::header(&format!("user state ({}):", user.len())));
     if user.is_empty() {
         println!("  (none — LMStudio is exclusively darkmux's right now)");
     } else {
         for m in &user {
-            println!("  {:<46} ctx={:<8} {}", m.identifier, m.context, m.size);
+            println!("  {} ctx={:<8} {}", darkmux_types::style::dim(&format!("{:<46}", m.identifier)), m.context, m.size);
         }
         println!();
         println!("note: darkmux will never unload entries under `user state` — they're");
@@ -2750,16 +2750,16 @@ fn profile_matches(profile: &types::Profile, loaded: &[types::LoadedModel]) -> b
 
 fn cmd_profiles(config: Option<&str>) -> Result<i32> {
     let loaded = profiles::load_registry(config)?;
-    println!("registry: {}", loaded.path.display());
+    println!("{}", darkmux_types::style::header(&format!("registry: {}", loaded.path.display())));
     for (name, profile) in &loaded.registry.profiles {
         let default_marker = if loaded.registry.default_profile.as_deref() == Some(name) {
-            " (default)"
+            &format!(" {}", darkmux_types::style::success("(default)"))
         } else {
             ""
         };
-        println!("\n{}{}", name, default_marker);
+        println!("\n{}{}", darkmux_types::style::accent(name), default_marker);
         if let Some(desc) = profile.description.as_deref() {
-            println!("  {desc}");
+            println!("  {}", darkmux_types::style::dim(desc));
         }
         // (#590) Models no longer carry a role; mark the default model
         // (default_model, or first model) instead.
@@ -2770,7 +2770,7 @@ fn cmd_profiles(config: Option<&str>) -> Result<i32> {
             } else {
                 ""
             };
-            println!("  - {:<10} {} @ ctx {}", marker, m.id, m.n_ctx);
+            println!("  - {} {} @ ctx {}", darkmux_types::style::dim(&format!("{:<10}", marker)), m.id, m.n_ctx);
         }
     }
     Ok(0)
