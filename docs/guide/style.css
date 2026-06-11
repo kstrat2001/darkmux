@@ -150,6 +150,33 @@ pre .prompt { color: var(--muted); user-select: none; }
 pre .cmd { color: var(--accent); }
 pre .comment { color: var(--muted); font-style: italic; }
 
+/* Copy-to-clipboard button on code blocks (injected by copy.js). The button
+   lives on a .code-wrap wrapper, not inside the scrolling <pre>, so it stays
+   pinned to the visible top-right even when the block scrolls horizontally. */
+.code-wrap { position: relative; }
+.code-wrap .copy-btn {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  cursor: pointer;
+  background: var(--border);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--muted);
+  font-family: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.4;
+  padding: 2px 9px;
+  opacity: 0.6;
+  user-select: none;
+  transition: opacity .12s, color .12s, border-color .12s, background .12s;
+}
+/* Resting opacity keeps it usable on touch (no hover); brightens on hover/focus. */
+.code-wrap:hover .copy-btn,
+.code-wrap .copy-btn:focus-visible { opacity: 1; }
+.code-wrap .copy-btn:hover { color: var(--text); border-color: var(--accent); background: var(--bg-elev); }
+.code-wrap .copy-btn.copied { color: var(--good); border-color: var(--good); opacity: 1; }
+
 /* Tables */
 table {
   border-collapse: collapse;
