@@ -6,7 +6,7 @@
 # Operator-facing install path once the tap exists:
 #   brew tap kstrat2001/darkmux
 #   brew install --HEAD darkmux         # while only head is available
-#   brew install darkmux                # once v0.5.0 is tagged and the formula
+#   brew install darkmux                # once v0.9.0 is tagged and the formula
 #                                       # has its stable url + sha256 block
 #
 # For local development / smoke testing:
@@ -20,12 +20,12 @@ class Darkmux < Formula
   homepage "https://darkmux.com"
   license "MIT"
 
-  # Pre-v0.5.0 posture: head-only. Once Cargo.toml ships a real semver tag
+  # Pre-v0.9.0 posture: head-only. Once Cargo.toml ships a real semver tag
   # (item 4 in #618), add a stable url + sha256 block here and homebrew users
   # can drop `--HEAD` from the install command.
   #
   # When that lands, replace this comment with:
-  #   url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v0.5.0.tar.gz"
+  #   url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v0.9.0.tar.gz"
   #   sha256 "<run `shasum -a 256` against the GitHub tarball>"
   head "https://github.com/kstrat2001/darkmux.git", branch: "main"
 

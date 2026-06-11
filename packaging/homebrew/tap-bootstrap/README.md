@@ -15,7 +15,7 @@ brew tap kstrat2001/darkmux
 brew install --HEAD darkmux
 ```
 
-`--HEAD` is required while darkmux is pre-v0.5.0. Once a tagged release exists,
+`--HEAD` is required while darkmux is pre-v0.9.0. Once a tagged release exists,
 plain `brew install darkmux` will install a stable pinned version.
 
 For a hub machine (Redis-backed multi-machine fleet coordinator):
@@ -50,7 +50,7 @@ leave a dangling launchd plist until the next reboot.
 
 ## What's in this tap
 
-- `Formula/darkmux.rb` — the formula. Currently head-only (no v0.5.0 tag
+- `Formula/darkmux.rb` — the formula. Currently head-only (no v0.9.0 tag
   yet — tracked in [darkmux#618](https://github.com/kstrat2001/darkmux/issues/618)).
   Installs the `darkmux` CLI + the `serve` daemon + a keychain-aware
   wrapper script (`libexec/darkmux-serve-wrapped`) that resolves
@@ -97,10 +97,10 @@ See:
   — plain-English version of the warranty disclaimer, with specifics
   about what darkmux does to your machine
 
-**Pre-1.0 reality:** darkmux is currently v0.4.0. Breaking changes ship
+**Pre-1.0 reality:** darkmux is currently v0.9.0. Breaking changes ship
 cleanly without deprecation periods until 1.0. `brew install --HEAD`
 pulls the latest `main` commit — operators get in-progress work
-including any breaking changes. Pin a tag once v0.5.0+ is released if
+including any breaking changes. Pin a tag once v0.9.0+ is released if
 you want a stable target.
 
 ## Formula updates
