@@ -1840,7 +1840,7 @@ mod tests {
     }
 
     #[test]
-    fn flow_schema_version_is_1_11_0() {
+    fn flow_schema_version_is_1_12_0() {
         // Pin the schema version so an accidental rename can't ship silently;
         // any bump beyond this should be a deliberate code change paired with
         // an update to this assertion (and corresponding viewer EXPECTED_*
@@ -1883,7 +1883,12 @@ mod tests {
         //           prior AuditFileSink chains survive without rotation.
         //   1.11.0 — added optional `machine_uid` (#640): the stable hardware
         //           identity. Minor + additive — new records only, chains survive.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.11.0");
+        //   1.12.0 — added the `telemetry.tokens` action + `source=tokens` (#782):
+        //           per-dispatch token totals (prompt/completion/total) in payload,
+        //           the spine the live "tokens off-meter" view aggregates. Minor +
+        //           additive — new action value, no struct change; older readers
+        //           ignore it. New records only, chains survive.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.12.0");
     }
 
     #[test]
