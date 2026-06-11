@@ -1,0 +1,83 @@
+name: Publish runtime image
+
+# Builds `runtime/` and pushes it to GHCR as
+# `ghcr.io/kstrat2001/darkmux-runtime:<darkmux-version>` (+ `:latest`) so a
+# `brew install` user can pull the runtime image on demand for `crew dispatch`
+# / `lab run` instead of needing a source checkout + local `docker build`.
+# See https://github.com/kstrat2001/darkmux/issues/759.
+#
+# The image tag tracks the DARKMUX version (root `Cargo.toml`), NOT the runtime
+# crate's independent `0.1.0` — pull-on-demand pins to the binary's version so a
+# `brew upgrade` fetches the matching image and never runs a skewed pair.
+#
+# Auth uses the built-in `GITHUB_TOKEN` (`packages: write`) — no PAT needed.
+# First push creates the package PRIVATE; make it public once in the package
+# settings so users can pull without authenticating.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "darkmux version to tag the image (e.g. 0.9.0). Blank = read from Cargo.toml."
+        required: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  # One publish at a time; never cancel a push mid-flight.
+  group: publish-runtime-image
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build + push runtime image (arm64)
+    # Native arm64 runner (free for public repos) — the audience is Apple
+    # Silicon, and building linux/arm64 natively avoids slow QEMU emulation of
+    # the cargo release build.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve darkmux version
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            V="${{ github.event.release.tag_name }}"
+          elif [ -n "${{ github.event.inputs.version }}" ]; then
+            V="${{ github.event.inputs.version }}"
+          else
+            V="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          fi
+          V="${V#v}"  # strip a leading v (v0.9.0 -> 0.9.0)
+          if [ -z "$V" ]; then
+            echo "::error::could not resolve a darkmux version to tag the image"
+            exit 1
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Resolved darkmux version: $V"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build + push runtime image
+        uses: docker/build-push-action@v6
+        with:
+          context: runtime
+          file: runtime/Dockerfile
+          platforms: linux/arm64
+          push: true
+          # Plain single-arch image (no attestation manifest) — simplest to pull.
+          provenance: false
+          tags: |
+            ghcr.io/kstrat2001/darkmux-runtime:${{ steps.ver.outputs.version }}
+            ghcr.io/kstrat2001/darkmux-runtime:latest
