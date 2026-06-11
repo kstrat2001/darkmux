@@ -200,8 +200,9 @@ fn add_worktree(repo_root: &Path, wt_path: &Path, branch: &str, base: &str) -> R
 }
 
 /// `darkmux mission run` entry. Returns the process exit code:
-/// `0` clean (coder ran, QA clean or flags-only), `1` dispatch error,
-/// `2` QA found blockers (operator must resolve before ship).
+/// `0` clean (coder ran, QA clean or flags-only), `1` coder dispatch error,
+/// `2` QA found blockers (operator must resolve before ship),
+/// `3` QA could not run (reviewer dispatch failed — manual review required).
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     mission_id: &str,
@@ -390,8 +391,46 @@ pub fn run(
         "\n{}",
         style::header("▶ local QA — dispatching `code-reviewer` against the worktree diff…")
     );
-    let review =
-        crate::sprint_cli::sprint_review_output_at(&wt_path, Some(base), Some(&sprint.id))?;
+    // A QA *dispatch* failure (reviewer image pull, timeout, etc.) is NOT a
+    // coder failure — don't propagate it as exit 1. The coder's work is in
+    // the worktree and the gate still matters; surface that QA couldn't run
+    // and let the operator/frontier review manually. Distinct exit 3.
+    let review = match crate::sprint_cli::sprint_review_output_at(
+        &wt_path,
+        Some(base),
+        Some(&sprint.id),
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "{}",
+                style::warn(&format!(
+                    "⚠ QA could not run ({e:#}). The coder's work is in the worktree — \
+                     review the diff manually before shipping."
+                ))
+            );
+            emit_run_record(
+                flow::Level::Warn,
+                "mission.run.qa-unavailable",
+                mission_id,
+                &sprint.id,
+                &session_id,
+                serde_json::json!({ "error": format!("{e:#}"), "total_tokens": tokens.total() }),
+            );
+            println!("\n{}", style::header("▶ gate — QA unavailable, manual review required"));
+            println!("  {} {}", style::dim("worktree:"), wt_path.display());
+            println!("  {} {}", style::dim("branch:  "), style::accent(&branch));
+            println!(
+                "\n{}",
+                style::warn(&format!(
+                    "review the diff manually, then:  darkmux mission ship {mission_id} --sprint {} \
+                     (or abort: darkmux mission abort {mission_id} --sprint {})",
+                    sprint.id, sprint.id
+                ))
+            );
+            return Ok(3);
+        }
+    };
 
     print_review_summary(&review);
 
@@ -487,10 +526,11 @@ pub fn abort(mission_id: &str, sprint_id: Option<&str>) -> Result<i32> {
         bail!("mission `{mission_id}` not found");
     }
     let sprints = load_sprints()?;
-    // Reuse the same selection logic, but for abort we also accept a Running
-    // sprint (the common case — a run flipped it to Running). select_sprint
-    // rejects Complete and requires Planned for the auto-path, so an explicit
-    // --sprint is the reliable way to abort a Running sprint.
+    // Sprint resolution differs by path: an explicit `--sprint` is looked up
+    // by id directly (no status filter — so a Running sprint, the common
+    // abort case after a `run` flipped it, resolves fine). The auto-path
+    // falls back to `select_sprint`, which only matches a Planned, ready
+    // sprint — so to abort a Running sprint, pass `--sprint` explicitly.
     let sprint = match sprint_id {
         Some(id) => sprints
             .iter()
