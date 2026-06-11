@@ -1451,15 +1451,16 @@ fn check_docker_runtime() -> Check {
 
 /// Pure status → Check mapping (unit-testable without Docker on the host).
 fn docker_status_to_check(status: darkmux_crew::dispatch_internal::DockerRuntimeStatus) -> Check {
-    use darkmux_crew::dispatch_internal::{DockerRuntimeStatus as S, RUNTIME_IMAGE};
+    use darkmux_crew::dispatch_internal::{
+        ghcr_runtime_image, DockerRuntimeStatus as S, RUNTIME_IMAGE,
+    };
     let name = "docker runtime".to_string();
     match status {
         S::Ready => Check {
             name,
             status: Status::Pass,
-            message: format!(
-                "Docker daemon up · `{RUNTIME_IMAGE}` image present — internal runtime ready"
-            ),
+            message: "Docker daemon up · darkmux runtime image present — internal runtime ready"
+                .to_string(),
             hint: None,
         },
         S::BinaryMissing => Check {
@@ -1485,10 +1486,15 @@ fn docker_status_to_check(status: darkmux_crew::dispatch_internal::DockerRuntime
         S::ImageMissing => Check {
             name,
             status: Status::Warn,
-            message: format!("Docker is up, but the `{RUNTIME_IMAGE}` image isn't built yet"),
+            message: "Docker is up; no local runtime image — darkmux will pull it on the first \
+                      dispatch"
+                .to_string(),
             hint: Some(format!(
-                "Build it once (≈50 MB) from the darkmux repo root:\n  \
-                 docker build -t {RUNTIME_IMAGE} runtime/"
+                "darkmux pulls `{}` from GHCR on demand (#759). Pre-pull now with \
+                 `docker pull {}`, or build locally from a source checkout: \
+                 `docker build -t {RUNTIME_IMAGE} runtime/`.",
+                ghcr_runtime_image(),
+                ghcr_runtime_image()
             )),
         },
         S::ProbeError(e) => Check {
