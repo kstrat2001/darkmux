@@ -91,6 +91,25 @@
   }
   .install .prompt { color: var(--muted); user-select: none; }
   .install .cmd { color: var(--accent); }
+  .cmd-line { display: flex; align-items: center; gap: 10px; }
+  .cmd-line + .cmd-line { margin-top: 6px; }
+  .cmd-line .cmd { flex: 1; white-space: pre; overflow-x: auto; }
+  .copy-btn {
+    flex: none;
+    cursor: pointer;
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    color: var(--muted);
+    font-family: inherit;
+    font-size: 11px;
+    line-height: 1.4;
+    padding: 2px 9px;
+    user-select: none;
+    transition: color .12s, border-color .12s;
+  }
+  .copy-btn:hover { color: var(--text); border-color: var(--accent); }
+  .copy-btn.copied { color: var(--accent); border-color: var(--accent); }
 
   /* buttons */
   .btns { display: flex; gap: 12px; flex-wrap: wrap; }
@@ -206,8 +225,10 @@
     <div class="brand">darkly energized<span class="dot">·</span>open source</div>
     <h1>darkmux<span class="cursor">_</span></h1>
     <p class="tag"><strong>Own your AI workforce.</strong> The capable local models your <span class="accent">Apple Silicon</span> already runs — directed by your frontier, off the meter, on your hardware.</p>
-    <pre class="install"><span class="prompt">$ </span><span class="cmd">brew tap kstrat2001/darkmux</span>
-<span class="prompt">$ </span><span class="cmd">brew install darkmux</span></pre>
+    <div class="install">
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">brew tap kstrat2001/darkmux</span><button class="copy-btn" data-copy="brew tap kstrat2001/darkmux" aria-label="Copy command">Copy</button></div>
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">brew install darkmux</span><button class="copy-btn" data-copy="brew install darkmux" aria-label="Copy command">Copy</button></div>
+    </div>
     <div class="btns">
       <a class="btn btn-primary" href="guide/">User guide →</a>
       <a class="btn btn-ghost" href="https://github.com/kstrat2001/darkmux">GitHub</a>
@@ -297,10 +318,12 @@
 <section>
   <div class="wrap">
     <h2>Get going</h2>
-    <pre class="install"><span class="prompt">$ </span><span class="cmd">brew tap kstrat2001/darkmux</span>
-<span class="prompt">$ </span><span class="cmd">brew install darkmux</span>
-<span class="prompt">$ </span><span class="cmd">darkmux init</span>
-<span class="prompt">$ </span><span class="cmd">darkmux doctor</span></pre>
+    <div class="install">
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">brew tap kstrat2001/darkmux</span><button class="copy-btn" data-copy="brew tap kstrat2001/darkmux" aria-label="Copy command">Copy</button></div>
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">brew install darkmux</span><button class="copy-btn" data-copy="brew install darkmux" aria-label="Copy command">Copy</button></div>
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux init</span><button class="copy-btn" data-copy="darkmux init" aria-label="Copy command">Copy</button></div>
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux doctor</span><button class="copy-btn" data-copy="darkmux doctor" aria-label="Copy command">Copy</button></div>
+    </div>
     <p class="muted">Prefer source? <code>cargo install --git https://github.com/kstrat2001/darkmux</code> works too. Then edit <code>~/.darkmux/profiles.json</code> to point at your downloaded LMStudio models. The <a href="guide/getting-started.html">getting-started page of the user guide</a> walks through this end-to-end, including verifying with doctor and running your first swap.</p>
 
     <div class="warn">
@@ -325,6 +348,33 @@
     </div>
   </div>
 </footer>
+
+<script>
+  // Copy-to-clipboard for install commands. One delegated listener (no inline
+  // handlers); each `.copy-btn` carries its exact command in `data-copy`. The
+  // commands are static page content, so there is no untrusted input here.
+  document.addEventListener("click", function (e) {
+    var btn = e.target.closest(".copy-btn");
+    if (!btn) return;
+    var cmd = btn.getAttribute("data-copy") || "";
+    var done = function (label, ok) {
+      btn.textContent = label;
+      btn.classList.toggle("copied", ok);
+      setTimeout(function () {
+        btn.textContent = "Copy";
+        btn.classList.remove("copied");
+      }, 1200);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(cmd).then(
+        function () { done("Copied", true); },
+        function () { done("Failed", false); }
+      );
+    } else {
+      done("Failed", false);
+    }
+  });
+</script>
 
 </body>
 </html>
