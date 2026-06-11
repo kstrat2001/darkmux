@@ -652,7 +652,10 @@ const fmtN=n=>Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g,',');
 function savingsHero(){
   const t=tokensOffMeter();
   if(!t.runs) return '';
-  const win=document.body.classList.contains('live-mode')?' · last 24h':'';
+  // Derive the window label from LIVE_WINDOW_MS so it can't drift from the
+  // actual live window (in live mode DATA is pre-windowed to it). Playback
+  // shows no window suffix (the meta bar already shows the dataset range).
+  const win=document.body.classList.contains('live-mode')?` · last ${Math.round(LIVE_WINDOW_MS/3600000)}h`:'';
   return `<div class="savings">
     <div class="savnum">${fmtN(t.total)}</div>
     <div class="savlbl">tokens off the meter${win}</div>
