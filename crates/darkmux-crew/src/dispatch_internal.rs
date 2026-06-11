@@ -1149,14 +1149,18 @@ struct TrajectorySummary {
 /// the observability viewer can aggregate "tokens off-meter" without
 /// re-parsing the runtime's stdout envelope (#782). `total` is derived
 /// (prompt + completion) at the read site so consumers don't have to.
+///
+/// `pub` so a second host-side consumer (`mission run`, #782b) reads the
+/// same canonical totals from a `DispatchResult.out_dir` rather than
+/// duplicating the metrics.json field names.
 #[derive(Default, Debug, Clone, Copy)]
-struct TokenTotals {
-    prompt: u32,
-    completion: u32,
+pub struct TokenTotals {
+    pub prompt: u32,
+    pub completion: u32,
 }
 
 impl TokenTotals {
-    fn total(&self) -> u32 {
+    pub fn total(&self) -> u32 {
         self.prompt.saturating_add(self.completion)
     }
 }
@@ -1168,7 +1172,7 @@ impl TokenTotals {
 /// `wait`ed. Best-effort: a missing/malformed file degrades to zero
 /// totals — this is an observability enrichment, never a dispatch
 /// failure. Same out-dir the trajectory tailer reads from.
-fn read_token_totals(out_dir: &Path) -> TokenTotals {
+pub fn read_token_totals(out_dir: &Path) -> TokenTotals {
     let metrics_path = out_dir.join(".darkmux-runtime").join("metrics.json");
     let Ok(raw) = fs::read_to_string(&metrics_path) else {
         return TokenTotals::default();

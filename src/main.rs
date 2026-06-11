@@ -36,6 +36,7 @@ mod init;
 pub use darkmux_lab::lab;
 mod migrate;
 mod mission_propose;
+mod mission_run;
 mod notebook;
 mod optimize;
 pub use darkmux_lab::providers;
@@ -701,6 +702,53 @@ enum MissionCmd {
         /// of blocking on each `dispatch.complete`. Default is `--wait`.
         #[arg(long)]
         no_wait: bool,
+    },
+    /// Run one sprint's dispatch-to-PR loop LOCALLY, up to the sign-off
+    /// gate. Unlike `dispatch` (which fans sprints onto the fleet work
+    /// queue), `run` is synchronous and single-sprint on this machine:
+    /// it creates an isolated git worktree, dispatches the coder into it,
+    /// runs the local `code-reviewer` QA against the diff, surfaces the
+    /// result + tokens-off-meter + findings, then STOPS — nothing is
+    /// committed, PR'd, or merged. Adjudicating findings and merging are
+    /// gate steps for the operator/frontier (never auto-merge). After
+    /// sign-off, `darkmux mission ship <id> --sprint <sprint-id>` finishes
+    /// the loop. (#782)
+    Run {
+        /// Mission id to run a sprint from.
+        mission_id: String,
+        /// Sprint to run. Optional — when omitted, the single ready sprint
+        /// (Planned, no unmet dependencies) is auto-selected; 0 or >1 ready
+        /// sprints is ambiguous and bails asking for an explicit `--sprint`.
+        #[arg(long, value_name = "ID")]
+        sprint: Option<String>,
+        /// Role to dispatch the sprint under. Default `coder`.
+        #[arg(long, default_value = "coder")]
+        role: String,
+        /// Dispatch image. The default slim runtime image is used when
+        /// omitted; naming a language image (e.g. `rust:slim`) makes
+        /// darkmux inject its runtime binary so the coder can build/test
+        /// in-sandbox (#703).
+        #[arg(long, value_name = "IMG")]
+        image: Option<String>,
+        /// Base ref the worktree branches off (and the QA diff compares
+        /// against). Default `main`.
+        #[arg(long, default_value = "main")]
+        base: String,
+        /// Coder dispatch timeout (seconds). Default 600.
+        #[arg(long, default_value = "600")]
+        timeout: u32,
+    },
+    /// Abort a `mission run` cleanly: remove the sprint's worktree + branch
+    /// and flip the sprint to Abandoned. The explicit teardown for a run
+    /// the operator/frontier decides to back out of (vs. leaving an orphan
+    /// worktree). (#782)
+    Abort {
+        /// Mission id.
+        mission_id: String,
+        /// Sprint to abort. Optional — when omitted, the single ready sprint
+        /// is selected (pass `--sprint` explicitly to abort a Running one).
+        #[arg(long, value_name = "ID")]
+        sprint: Option<String>,
     },
 }
 
@@ -1502,6 +1550,25 @@ fn cmd_mission(sub: MissionCmd) -> Result<i32> {
             timeout,
             no_wait,
         } => cmd_mission_dispatch(&mission_id, &role, machine.as_deref(), timeout, !no_wait),
+        MissionCmd::Run {
+            mission_id,
+            sprint,
+            role,
+            image,
+            base,
+            timeout,
+        } => mission_run::run(
+            &mission_id,
+            sprint.as_deref(),
+            &role,
+            image.as_deref(),
+            &base,
+            timeout,
+        ),
+        MissionCmd::Abort {
+            mission_id,
+            sprint,
+        } => mission_run::abort(&mission_id, sprint.as_deref()),
     }
 }
 
