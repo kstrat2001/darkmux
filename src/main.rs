@@ -750,6 +750,30 @@ enum MissionCmd {
         #[arg(long, value_name = "ID")]
         sprint: Option<String>,
     },
+    /// Ship a `mission run`'s work: commit the worktree, push the branch,
+    /// and open (or reuse) the PR. By DEFAULT stops at the PR — merging is
+    /// the operator/frontier's explicit act (never auto-merge). `--wait-ci`
+    /// blocks on CI; `--merge` (opt-in, green-gated) squash-merges, flips the
+    /// sprint to Complete, and tears down the worktree. (#782)
+    Ship {
+        /// Mission id.
+        mission_id: String,
+        /// Sprint to ship. Optional — when omitted the single ready sprint
+        /// is selected (pass `--sprint` explicitly for a Running sprint).
+        #[arg(long, value_name = "ID")]
+        sprint: Option<String>,
+        /// Base branch the PR targets. Default `main`.
+        #[arg(long, default_value = "main")]
+        base: String,
+        /// Block on CI checks until they finish, then report green/red.
+        #[arg(long)]
+        wait_ci: bool,
+        /// After CI is green, squash-merge the PR, mark the sprint Complete,
+        /// and remove the worktree. Opt-in — refuses to merge if CI isn't
+        /// green. Without this flag, ship stops at the PR.
+        #[arg(long)]
+        merge: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1569,6 +1593,13 @@ fn cmd_mission(sub: MissionCmd) -> Result<i32> {
             mission_id,
             sprint,
         } => mission_run::abort(&mission_id, sprint.as_deref()),
+        MissionCmd::Ship {
+            mission_id,
+            sprint,
+            base,
+            wait_ci,
+            merge,
+        } => mission_run::ship(&mission_id, sprint.as_deref(), &base, wait_ci, merge),
     }
 }
 
