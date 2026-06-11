@@ -3,11 +3,10 @@
 # into the tap as Formula/darkmux.rb. Editing it here keeps the formula
 # version-controlled alongside the source it formulates.
 #
-# Operator-facing install path once the tap exists:
+# Operator-facing install path:
 #   brew tap kstrat2001/darkmux
-#   brew install --HEAD darkmux         # while only head is available
-#   brew install darkmux                # once v0.9.0 is tagged and the formula
-#                                       # has its stable url + sha256 block
+#   brew install darkmux                # stable release (v0.9.0)
+#   brew install --HEAD darkmux         # build from main instead
 #
 # For local development / smoke testing:
 #   brew install --build-from-source ./packaging/homebrew/darkmux.rb
@@ -18,15 +17,13 @@
 class Darkmux < Formula
   desc "Profile multiplexer + lab for local LLM stacks (LMStudio, Ollama)"
   homepage "https://darkmux.com"
+  # Stable release: v0.9.0 (darkmux's first tagged release). `brew install
+  # darkmux` builds from this source tarball; `brew install --HEAD darkmux`
+  # builds from main instead. The sha256 is of the GitHub-generated source
+  # tarball for the tag (`shasum -a 256` of the archive download).
+  url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v0.9.0.tar.gz"
+  sha256 "b4145029288d225d10915a0bdf1f64754f6ef5f8eaaceb7952768397c8e8b3db"
   license "MIT"
-
-  # Pre-v0.9.0 posture: head-only. Once Cargo.toml ships a real semver tag
-  # (item 4 in #618), add a stable url + sha256 block here and homebrew users
-  # can drop `--HEAD` from the install command.
-  #
-  # When that lands, replace this comment with:
-  #   url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v0.9.0.tar.gz"
-  #   sha256 "<run `shasum -a 256` against the GitHub tarball>"
   head "https://github.com/kstrat2001/darkmux.git", branch: "main"
 
   depends_on "rust" => :build
