@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.11.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.12.0";
 // Version history:
 //   1.2.0 — added optional `model` (#106)
 //   1.3.0 — added optional `reasoning` + `mission_id`; new Stage::TierDecision (#136)
@@ -64,6 +64,17 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.11.0";
 //           label. Older records lack it; the viewer treats absence as
 //           *unknown identity* (NOT a fallback to the name). Minor + additive
 //           — new records only, prior AuditFileSink chains survive.
+//   1.12.0 — added the `telemetry.tokens` action + `source=tokens`
+//           (#782 token-emission spine): a per-dispatch telemetry record
+//           carrying `prompt_tokens` / `completion_tokens` / `total_tokens`
+//           in `payload`, read from the runtime's metrics.json at exit. The
+//           data the live "tokens off-meter" savings view (#783) aggregates
+//           over a window. The same totals also land on the existing
+//           `dispatch.complete` Work record's payload. Tokens-only — NO
+//           currency by design. Minor + additive: a new action value + new
+//           telemetry source, no struct/field change; older readers ignore
+//           the unknown action. New records only, prior AuditFileSink chains
+//           survive without rotation.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]

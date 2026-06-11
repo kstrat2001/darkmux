@@ -1,9 +1,11 @@
 //! Trajectory + metrics recording.
 //!
 //! Gives post-dispatch visibility. Writes a line-per-event JSONL trace
-//! to `/workspace/.darkmux-runtime/trajectory.jsonl` plus a top-line
-//! `metrics.json` at exit. Operators inspect these after the container
-//! is gone (the `--rm` mode otherwise loses everything except stderr).
+//! to `<RUNTIME_OUT_BASE>/.darkmux-runtime/trajectory.jsonl` (i.e.
+//! `/darkmux-out/.darkmux-runtime/` — the out-dir, SEPARATE from the
+//! agent's `/workspace`) plus a top-line `metrics.json` at exit.
+//! Operators inspect these after the container is gone (the `--rm`
+//! mode otherwise loses everything except stderr).
 //!
 //! The shape of each event mirrors openclaw's trajectory format
 //! closely enough that a side-by-side diff between the two runtimes
@@ -81,11 +83,13 @@ pub struct Metrics {
 }
 
 impl Trajectory {
-    /// Open a trajectory file at `<workspace>/.darkmux-runtime/`. If
-    /// the directory can't be created (permission, missing workspace,
-    /// etc.) returns a degraded no-op recorder rather than failing.
-    pub fn open(workspace: &Path) -> Self {
-        let dir = workspace.join(TRAJECTORY_SUBDIR);
+    /// Open a trajectory file at `<base_dir>/.darkmux-runtime/`. In
+    /// production `base_dir` is `RUNTIME_OUT_BASE` (`/darkmux-out`, the
+    /// out-dir — SEPARATE from the agent's `/workspace`); tests pass a
+    /// tempdir. If the directory can't be created (permission, missing
+    /// path, etc.) returns a degraded no-op recorder rather than failing.
+    pub fn open(base_dir: &Path) -> Self {
+        let dir = base_dir.join(TRAJECTORY_SUBDIR);
         let trajectory_path = dir.join(TRAJECTORY_FILE);
         let metrics_path = dir.join(METRICS_FILE);
 

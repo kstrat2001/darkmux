@@ -1038,6 +1038,11 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         .join()
         .unwrap_or_else(|_| TrajectorySummary::default());
 
+    // (#782) Read the runtime's token totals from metrics.json now the
+    // container has exited. Best-effort — zero totals on any read failure
+    // (this is observability enrichment, never a dispatch-failing path).
+    let tokens = read_token_totals(&host_out);
+
     // 8. Emit dispatch.complete flow record with summary metadata.
     let dispatch_complete_payload = serde_json::json!({
         "runtime": "internal",
@@ -1049,6 +1054,9 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         "total_turns": trajectory_summary.turns,
         "total_tools": trajectory_summary.tool_calls,
         "total_compactions": trajectory_summary.compactions,
+        "prompt_tokens": tokens.prompt,
+        "completion_tokens": tokens.completion,
+        "total_tokens": tokens.total(),
     });
     let (action, level) = if exit_code == 0 {
         ("dispatch complete", darkmux_flow::Level::Info)
@@ -1087,6 +1095,30 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         serde_json::json!({ "turns": trajectory_summary.turns }),
     ));
 
+    // (#782) Per-dispatch token telemetry — the spine the live "tokens
+    // off-meter" savings view aggregates. A telemetry sibling carrying the
+    // dispatch's prompt/completion/total token counts under
+    // `category=telemetry, source=tokens` so the viewer can sum tokens
+    // across a window without parsing the Work-category complete payload.
+    // Tokens-only by design (NO currency) — the operator multiplies by
+    // their own per-token rate. Emitted on success AND error paths (a
+    // failed dispatch still consumed tokens, which still ran off-meter).
+    let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
+        darkmux_flow::Level::Info,
+        "telemetry.tokens",
+        "tokens",
+        &opts.role_id,
+        &session_id,
+        Some(&model),
+        mission_id.as_deref(),
+        sprint_id.as_deref(),
+        serde_json::json!({
+            "prompt_tokens": tokens.prompt,
+            "completion_tokens": tokens.completion,
+            "total_tokens": tokens.total(),
+        }),
+    ));
+
     Ok(DispatchResult {
         exit_code,
         stdout,
@@ -1109,6 +1141,45 @@ struct TrajectorySummary {
     tool_calls: u32,
     compactions: u32,
     heartbeats: u32,
+}
+
+/// Token totals the runtime records in `metrics.json` at dispatch exit.
+/// Read host-side once the container has exited, then surfaced into the
+/// `dispatch.complete` payload AND a `telemetry.tokens` flow record so
+/// the observability viewer can aggregate "tokens off-meter" without
+/// re-parsing the runtime's stdout envelope (#782). `total` is derived
+/// (prompt + completion) at the read site so consumers don't have to.
+#[derive(Default, Debug, Clone, Copy)]
+struct TokenTotals {
+    prompt: u32,
+    completion: u32,
+}
+
+impl TokenTotals {
+    fn total(&self) -> u32 {
+        self.prompt.saturating_add(self.completion)
+    }
+}
+
+/// Read `total_prompt_tokens` / `total_completion_tokens` from the
+/// runtime's `metrics.json` under `<out_dir>/.darkmux-runtime/`. The
+/// runtime writes this file at exit on BOTH the success and error paths
+/// (`runtime/src/main.rs`), so it's present once the container has been
+/// `wait`ed. Best-effort: a missing/malformed file degrades to zero
+/// totals — this is an observability enrichment, never a dispatch
+/// failure. Same out-dir the trajectory tailer reads from.
+fn read_token_totals(out_dir: &Path) -> TokenTotals {
+    let metrics_path = out_dir.join(".darkmux-runtime").join("metrics.json");
+    let Ok(raw) = fs::read_to_string(&metrics_path) else {
+        return TokenTotals::default();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return TokenTotals::default();
+    };
+    TokenTotals {
+        prompt: v.get("total_prompt_tokens").and_then(|n| n.as_u64()).unwrap_or(0) as u32,
+        completion: v.get("total_completion_tokens").and_then(|n| n.as_u64()).unwrap_or(0) as u32,
+    }
 }
 
 /// How often the live tailer polls `trajectory.jsonl` while the container
@@ -2502,6 +2573,51 @@ mod tests {
     }
 
     // ─── out-of-band bookkeeping: volume mounts ──────────────────────
+
+    #[test]
+    fn read_token_totals_parses_metrics_json() {
+        // metrics.json lives under <out_dir>/.darkmux-runtime/ — the same
+        // out-dir the trajectory tailer reads. read_token_totals pulls the
+        // runtime's recorded prompt/completion totals; total() is derived.
+        let out = TempDir::new().unwrap();
+        let rt = out.path().join(".darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        fs::write(
+            rt.join("metrics.json"),
+            r#"{"total_prompt_tokens": 1200, "total_completion_tokens": 345, "turns": 4}"#,
+        )
+        .unwrap();
+        let t = read_token_totals(out.path());
+        assert_eq!(t.prompt, 1200);
+        assert_eq!(t.completion, 345);
+        assert_eq!(t.total(), 1545);
+    }
+
+    #[test]
+    fn read_token_totals_degrades_to_zero_on_missing_or_malformed() {
+        // Observability enrichment, never a dispatch-failing path: a missing
+        // file (container died before writing) or malformed JSON yields zero
+        // totals rather than erroring.
+        let missing = TempDir::new().unwrap();
+        let t = read_token_totals(missing.path());
+        assert_eq!(t.total(), 0, "missing metrics.json → zero totals");
+
+        let bad = TempDir::new().unwrap();
+        let rt = bad.path().join(".darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        fs::write(rt.join("metrics.json"), "{not valid json").unwrap();
+        let t = read_token_totals(bad.path());
+        assert_eq!(t.total(), 0, "malformed metrics.json → zero totals");
+    }
+
+    #[test]
+    fn token_totals_total_saturates() {
+        // Guard the derived sum against overflow on absurd inputs (the
+        // runtime caps real totals far below this, but the helper must not
+        // panic in a release build with overflow checks off — saturate).
+        let t = TokenTotals { prompt: u32::MAX, completion: 10 };
+        assert_eq!(t.total(), u32::MAX);
+    }
 
     #[test]
     fn apply_volume_mounts_emits_workspace_and_out_dir() {
