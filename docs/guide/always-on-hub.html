@@ -64,7 +64,7 @@
       <li>An always-on machine (the hub) with the OS basics already hardened — sleep disabled, auto-login enabled, mesh-VPN (Tailscale recommended) set to "Run at login". Cover this from <a href="fleet.html#harden">fleet → Harden your hub</a> first if you haven't.</li>
       <li>A private network reaching the hub from your other machines. Tailscale is what this guide assumes; WireGuard, ZeroTier, plain LAN all work the same.</li>
       <li>Homebrew (macOS) or apt/dnf (Linux) for installing Redis.</li>
-      <li>darkmux installed, on a version that ships <code>darkmux fleet</code> (run <code>darkmux fleet --help</code> to confirm — if it errors, upgrade with <code>cargo install --path . --force</code>).</li>
+      <li>darkmux installed, on a version that ships <code>darkmux fleet</code> (run <code>darkmux fleet --help</code> to confirm — if it errors, upgrade with <code>brew upgrade darkmux</code>, or <code>cargo install --path . --force</code> from source).</li>
     </ul>
     <div class="callout">
       <strong>macOS vs Linux:</strong> this guide uses launchd and newsyslog, which are macOS-native. Linux operators substitute systemd units for launchd plists, logrotate for newsyslog, and your distro's secret store (keyring, libsecret) for the macOS Keychain. The decisions and the verification steps are the same; only the file formats change.
@@ -168,7 +168,7 @@ brew services restart redis</code></pre>
 
     <h3>Paths</h3>
     <ul>
-      <li><strong>Binary:</strong> <code>~/.cargo/bin/darkmux</code> (where <code>cargo install --path .</code> puts it; <code>which darkmux</code> confirms)</li>
+      <li><strong>Binary:</strong> <code>/opt/homebrew/bin/darkmux</code> (Homebrew) or <code>~/.cargo/bin/darkmux</code> (from source); <code>which darkmux</code> confirms</li>
       <li><strong>Logs:</strong> <code>~/Library/Logs/darkmux/serve.{out,err}</code> — macOS convention; visible in Console.app and rotates cleanly via newsyslog (Phase 4)</li>
       <li><strong>launchd label:</strong> <code>com.darkmux.serve</code> (reverse-DNS, namespaces cleanly alongside Homebrew's <code>homebrew.mxcl.*</code>)</li>
     </ul>
