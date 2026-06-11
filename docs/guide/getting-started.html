@@ -82,12 +82,13 @@
     <p>Works from a fresh macOS machine that has LMStudio installed:</p>
     <pre><code><span class="comment"># 1. Tap + install</span>
 brew tap kstrat2001/darkmux
-brew install --HEAD darkmux         <span class="comment"># head-only until v0.9.0 ships</span>
+brew install darkmux                <span class="comment"># stable release (or --HEAD for latest main)</span>
 
 <span class="comment"># 2. Bootstrap config + agent skills</span>
 darkmux init</code></pre>
+    <div class="callout">If <code>brew install</code> refuses with an <strong>"untrusted tap"</strong> error, newer Homebrew gates third-party taps behind a one-time trust step: run <code>brew trust kstrat2001/darkmux</code>, then re-run the install. (Older Homebrew won't prompt for this.)</div>
     <p>The tap is at <a href="https://github.com/kstrat2001/homebrew-darkmux">kstrat2001/homebrew-darkmux</a>. The formula installs the <code>darkmux</code> CLI + <code>serve</code> daemon + the keychain-aware wrapper script. For the production-grade always-on hub setup (Redis hardening, audit substrate, log rotation, daily integrity checks), see the <a href="always-on-hub.html">always-on hub guide</a>.</p>
-    <p><strong>Updating</strong> later is then <code>brew upgrade --HEAD darkmux</code> (+ <code>brew services restart darkmux</code> if you have the daemon running).</p>
+    <p><strong>Updating</strong> later is then <code>brew upgrade darkmux</code> (+ <code>brew services restart darkmux</code> if you have the daemon running).</p>
 
     <h3>From-source path — for contributors or if you need the runtime image</h3>
     <p>The <code>darkmux-runtime</code> Docker image (needed for <code>darkmux crew dispatch</code> and <code>darkmux lab run</code>) is not in the brew install — those flows need a source checkout. Use this path if you're contributing to darkmux or running dispatches on this machine:</p>
