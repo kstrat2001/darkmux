@@ -722,12 +722,17 @@ fn count_files_changed(path: &Path, base: &str) -> usize {
 }
 
 /// Internal entry for `sprint review` taking an explicit repo path.
-pub(crate) fn sprint_review_at(
+/// Core of `sprint review`: run the reviewer dispatch against `path`'s diff
+/// vs `base` and return the structured [`SprintReviewOutput`] (verdict +
+/// findings). Does NOT print or map an exit code — callers decide how to
+/// surface it. `sprint_review_at` is the thin CLI wrapper (JSON + exit code);
+/// `mission run` (#782b) consumes the struct directly for a colorized
+/// at-the-gate summary.
+pub(crate) fn sprint_review_output_at(
     path: &Path,
     base: Option<&str>,
-    require_clean: bool,
     sprint_id: Option<&str>,
-) -> Result<i32> {
+) -> Result<SprintReviewOutput> {
     // Capture branch name.
     let branch = Command::new("git")
         .args(["branch", "--show-current"])
@@ -802,8 +807,7 @@ pub(crate) fn sprint_review_at(
             &session_id,
             sprint_id,
         ));
-        println!("{}", serde_json::to_string_pretty(&output)?);
-        return Ok(0);
+        return Ok(output);
     }
 
     // Count changed files from diff stat.
@@ -946,9 +950,21 @@ pub(crate) fn sprint_review_at(
         sprint_id,
     ));
 
-    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(output)
+}
 
-    Ok(if require_clean && signoff.block > 0 {
+/// Thin CLI wrapper over [`sprint_review_output_at`]: prints the JSON output
+/// and maps to an exit code (`1` when `require_clean` and blockers exist,
+/// else `0`). Preserves the original `sprint review` CLI contract.
+pub(crate) fn sprint_review_at(
+    path: &Path,
+    base: Option<&str>,
+    require_clean: bool,
+    sprint_id: Option<&str>,
+) -> Result<i32> {
+    let output = sprint_review_output_at(path, base, sprint_id)?;
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(if require_clean && output.by_severity.block > 0 {
         1
     } else {
         0
