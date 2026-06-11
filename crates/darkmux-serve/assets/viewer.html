@@ -209,6 +209,10 @@
   .finding .fm{display:block;font-size:12px;color:var(--text);margin-top:3px}
   .finding .ff{display:block;font-size:11px;color:var(--muted);margin-top:5px}
   .misslink{cursor:pointer;color:var(--amber);text-decoration:none}.misslink:hover{text-decoration:underline}
+  /* (#789) activity-driven headline: running = live-green subject; idle = muted status (not a link) */
+  #meta .run{color:#4ade80}
+  #meta .idle{color:var(--muted);cursor:default}
+  #meta .metahint{color:var(--muted);font:11px 'JetBrains Mono',monospace}
   .mgoal{font-size:13px;color:var(--text);margin:8px 0 16px;max-width:680px;line-height:1.5}
   .burn{margin-bottom:18px}.burnbar{height:6px;background:var(--line);border-radius:3px;overflow:hidden;max-width:420px}.burnbar span{display:block;height:100%;background:var(--good)}
   .burnlbl{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin-top:6px}
@@ -527,8 +531,61 @@ function missionLabel(){
   if(!ms.length) return '—';
   return ms.length>2 ? `${ms.slice(0,2).join(', ')} +${ms.length-2} more` : ms.join(', ');
 }
+// The live headline subject — what's RUNNING right now, tracked by live
+// SESSION (not just mission): an unscoped `crew dispatch` has a live session
+// but no mission_id and is still "running". Returns null when nothing is live
+// (→ idle status) or in playback (LIVE_SESSIONS empty). Prefers a mission-
+// scoped session as the primary subject; surfaces the rest behind "+N more".
+// (#789) This is deliberately SEPARATE from liveScopedMissions()/primaryMission()
+// — those stay mission-only for the crumb + mission panel; only the headline is
+// activity-driven. A completed/recent mission NEVER appears here: the moment a
+// session leaves LIVE_SESSIONS the headline flips to idle (no stale "◆ m6").
+function liveSubject(){
+  if(!document.body.classList.contains('live-mode')) return null;
+  const live=DATA.filter(r=>r.action==="dispatch.start"&&LIVE_SESSIONS.has(r.session_id));
+  if(!live.length) return null;
+  const byNew=live.slice().sort((a,b)=>T(b.ts)-T(a.ts));
+  const pick=byNew.find(r=>r.mission_id)||byNew[0]; // prefer a mission-scoped subject
+  const count=byNew.length-1;                       // other live sessions
+  if(pick.mission_id){
+    const sp=pick.sprint_id?` · sprint ${esc(pick.sprint_id)}`:'';
+    return {mission:true, label:`${esc(pick.mission_id)}${sp} on ${escN(uidOf(pick))}`, count};
+  }
+  const role=(pick.handle||'').replace(/^darkmux\//,'')||'dispatch';
+  return {mission:false, label:`${esc(role)} on ${escN(uidOf(pick))}`, count};
+}
+// Affirmative idle status for the live headline — "all good, ready", NOT an
+// empty "nothing" badge and NOT a blank (both read as broken to a new user).
+// Present-tense health anchor (fleet ready · N machines) + a recent-context
+// tail (last run Xm ago) when the window has a terminal record. No machines
+// beating → "waiting for fleet" (honest: daemon up, nothing has checked in).
+// (#789)
+function idleStatus(){
+  const n=LIVE_MACHINES.size;
+  if(!n) return '○ waiting for fleet';
+  const closes=DATA.filter(r=>r.action==="dispatch.complete"||r.action==="dispatch.error");
+  const last=closes.length?Math.max(...closes.map(r=>T(r.ts))):null;
+  const ago=last!=null?relAgo(last):'';
+  return `● fleet ready · ${n} machine${n===1?'':'s'}${ago?` · last run ${ago}`:''}`;
+}
 function renderMeta(){
-  $("meta").innerHTML=`<a class="misslink" data-act="mission">◆ ${esc(missionLabel())}</a> · <b>${esc(DATA_SOURCE)}</b> · ${iso(tMin).slice(0,10)} `+
+  // (#789) Activity-driven headline. Running → the live subject (mission-scoped
+  // subjects stay clickable into the mission panel; unscoped dispatches are
+  // plain text — no dead link). Idle (live) → an affirmative health status, not
+  // a dash. Playback → the window's mission label, unchanged.
+  let head;
+  const subj=liveSubject();
+  if(subj){
+    const more=subj.count>0?` <span class="metahint">+${subj.count} more</span>`:'';
+    head=subj.mission
+      ? `<a class="misslink run" data-act="mission">◆ ${subj.label}</a>${more}`
+      : `<span class="run">◆ ${subj.label}</span>${more}`;
+  } else if(document.body.classList.contains('live-mode')){
+    head=`<span class="idle">${esc(idleStatus())}</span>`; // status, NOT a link
+  } else {
+    head=`<a class="misslink" data-act="mission">◆ ${esc(missionLabel())}</a>`;
+  }
+  $("meta").innerHTML=`${head} · <b>${esc(DATA_SOURCE)}</b> · ${iso(tMin).slice(0,10)} `+
     `${iso(tMin).slice(11,19)}–${iso(tMax).slice(11,19)}Z<br>${DATA.length} records · ${machines().length} machines`;
 }
 function machActive(m){
