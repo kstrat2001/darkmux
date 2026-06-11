@@ -1210,9 +1210,12 @@ fn cmd_scan(config: Option<&str>) -> Result<i32> {
         .collect();
 
     println!(
-        "darkmux scan — {} model(s) in LMStudio, {} not yet in any profile",
-        llms.len(),
-        uncovered.len()
+        "{}",
+        darkmux_types::style::header(&format!(
+            "darkmux scan — {} model(s) in LMStudio, {} not yet in any profile",
+            llms.len(),
+            uncovered.len()
+        ))
     );
     if uncovered.is_empty() {
         if !llms.is_empty() {
@@ -1260,18 +1263,25 @@ fn cmd_scan(config: Option<&str>) -> Result<i32> {
             m.display_name.clone()
         };
 
-        println!("• {display}");
-        println!(
-            "    id={}  params={}  arch={:?}  size={:.1}GB  maxCtx={}",
-            m.model_key,
-            m.params_string.as_deref().unwrap_or("?"),
-            arch,
-            size_gb,
-            m.max_context_length.unwrap_or(0)
+        let icon = if m.trained_for_tool_use {
+            darkmux_types::style::success("✓")
+        } else {
+            darkmux_types::style::warn("⚠")
+        };
+        println!("{} {}", icon, darkmux_types::style::accent(&display));
+        println!("    {}",
+            darkmux_types::style::dim(&format!(
+                "id={}  params={}  arch={:?}  size={:.1}GB  maxCtx={}",
+                m.model_key,
+                m.params_string.as_deref().unwrap_or("?"),
+                arch,
+                size_gb,
+                m.max_context_length.unwrap_or(0)
+            ))
         );
         println!(
             "    suggested task class: `{}` (n_ctx={}, compactor={})",
-            suggested_class.as_str(),
+            darkmux_types::style::accent(suggested_class.as_str()),
             suggestion.primary_n_ctx,
             suggestion
                 .compactor
@@ -1280,13 +1290,18 @@ fn cmd_scan(config: Option<&str>) -> Result<i32> {
                 .unwrap_or_else(|| "none".into())
         );
         if !m.trained_for_tool_use {
-            println!("    ⚠ NOT marked trainedForToolUse — agentic dispatch may be unreliable");
+            println!("    {}", darkmux_types::style::warn(
+                "⚠ NOT marked trainedForToolUse — agentic dispatch may be unreliable"
+            ));
         }
         let safe_name = derive_profile_name(&m.model_key, suggested_class);
         if name_collisions.get(&safe_name).copied().unwrap_or(0) > 1 {
             println!(
-                "    ⚠ derived name `{safe_name}` collides with another uncovered model — \
-                 customize the name when drafting (publisher prefix gets stripped)"
+                "    {}",
+                darkmux_types::style::warn(&format!(
+                    "⚠ derived name `{safe_name}` collides with another uncovered model — \
+                     customize the name when drafting (publisher prefix gets stripped)"
+                ))
             );
         }
         println!(
