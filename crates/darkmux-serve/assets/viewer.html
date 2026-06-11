@@ -544,9 +544,14 @@ function liveSubject(){
   if(!document.body.classList.contains('live-mode')) return null;
   const live=DATA.filter(r=>r.action==="dispatch.start"&&LIVE_SESSIONS.has(r.session_id));
   if(!live.length) return null;
+  // Dedup by session_id (newest-first, keep the first seen) — a session that
+  // emitted dispatch.start more than once (reconnect/retry) must count ONCE,
+  // or "+N more" inflates with phantom sessions. The unit is the session.
   const byNew=live.slice().sort((a,b)=>T(b.ts)-T(a.ts));
-  const pick=byNew.find(r=>r.mission_id)||byNew[0]; // prefer a mission-scoped subject
-  const count=byNew.length-1;                       // other live sessions
+  const seen=new Set();
+  const uniq=byNew.filter(r=>!(seen.has(r.session_id)||seen.add(r.session_id)));
+  const pick=uniq.find(r=>r.mission_id)||uniq[0]; // prefer a mission-scoped subject
+  const count=uniq.length-1;                      // other live sessions
   if(pick.mission_id){
     const sp=pick.sprint_id?` · sprint ${esc(pick.sprint_id)}`:'';
     return {mission:true, label:`${esc(pick.mission_id)}${sp} on ${escN(uidOf(pick))}`, count};
@@ -560,12 +565,19 @@ function liveSubject(){
 // tail (last run Xm ago) when the window has a terminal record. No machines
 // beating → "waiting for fleet" (honest: daemon up, nothing has checked in).
 // (#789)
+// Only surface "last run Xm ago" when the last run is genuinely RECENT. The
+// live window spans LIVE_WINDOW_MS (24h), so an unguarded tail could read
+// "last run 18h ago" — honest but stale, and the opposite of the freshness
+// signal the tail is meant to give. Beyond this, drop the tail; "fleet ready ·
+// N machines" stands alone (still affirmatively healthy).
+const IDLE_LAST_RUN_RECENT_MS=60*60*1000; // 1h
 function idleStatus(){
   const n=LIVE_MACHINES.size;
   if(!n) return '○ waiting for fleet';
   const closes=DATA.filter(r=>r.action==="dispatch.complete"||r.action==="dispatch.error");
   const last=closes.length?Math.max(...closes.map(r=>T(r.ts))):null;
-  const ago=last!=null?relAgo(last):'';
+  const recent=last!=null&&(state.t-last)>=0&&(state.t-last)<=IDLE_LAST_RUN_RECENT_MS;
+  const ago=recent?relAgo(last):'';
   return `● fleet ready · ${n} machine${n===1?'':'s'}${ago?` · last run ${ago}`:''}`;
 }
 function renderMeta(){
