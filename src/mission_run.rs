@@ -696,6 +696,13 @@ fn existing_pr_url(dir: &Path, branch: &str) -> Option<String> {
 /// Verify the branch's CI is GREEN — every check `conclusion == SUCCESS`, not
 /// merely completed (per the merge-gate discipline). `--watch` blocks until
 /// checks finish; we then re-read the rollup and require all-SUCCESS.
+///
+/// Two deliberate behaviors: (1) `gh pr checks --watch` has no timeout — a
+/// hung check blocks `ship` until it resolves or the operator interrupts
+/// (Ctrl-C leaves the PR open, nothing merged). (2) an EMPTY rollup (no checks
+/// configured) is treated as NOT green — a merge gate shouldn't wave work
+/// through just because a repo has no CI. So `--merge` requires CI to be both
+/// configured AND passing.
 fn ci_is_green(dir: &Path, branch: &str) -> Result<bool> {
     // Block until checks complete (ignore the exit code — a red check makes
     // `gh pr checks --watch` exit non-zero; we judge from the rollup below).
@@ -738,7 +745,8 @@ fn ci_is_green(dir: &Path, branch: &str) -> Result<bool> {
 /// (opt-in, green-gated) squash-merges, flips the sprint to Complete, and
 /// tears the worktree down. **Never auto-merges** — `--merge` is the operator/
 /// frontier's explicit sign-off act. Returns `0` on success, `1` on a refused
-/// merge (CI not green).
+/// merge (CI not green), `2` when the PR merged but the sprint couldn't be
+/// marked Complete (inconsistent state — needs manual reconcile).
 pub fn ship(
     mission_id: &str,
     sprint_id: Option<&str>,
@@ -761,6 +769,16 @@ pub fn ship(
         .clone();
     let sprints = load_sprints()?;
     let sprint = resolve_sprint(&sprints, mission_id, sprint_id)?;
+
+    // A Complete sprint is terminal — a prior `--merge` already shipped it
+    // (and tore down its worktree). Re-shipping would duplicate-PR or churn;
+    // refuse rather than confuse.
+    if matches!(sprint.status, crew::types::SprintStatus::Complete) {
+        bail!(
+            "sprint `{}` is already Complete (terminal) — nothing to ship.",
+            sprint.id
+        );
+    }
 
     let root = repo_root()?;
     let wt_path = worktree_path(&root, &sprint.id);
@@ -880,11 +898,16 @@ pub fn ship(
     // 5. Merge — opt-in, green-gated. NEVER automatic.
     if merge {
         if !green {
+            // `green` is false both when a check failed AND when no checks
+            // ran at all (ci_is_green treats empty as not-green — the safe
+            // default for a merge gate). Name both so the operator knows
+            // which it is.
             eprintln!(
                 "{}",
                 style::error(&format!(
-                    "✗ refusing to merge {branch} — CI is not green. Resolve, re-push, then \
-                     re-run `darkmux mission ship {mission_id} --sprint {} --merge`.",
+                    "✗ refusing to merge {branch} — CI is not green (a check failed, or no \
+                     checks ran; `--merge` requires configured + passing CI). Resolve, re-push, \
+                     then re-run `darkmux mission ship {mission_id} --sprint {} --merge`.",
                     sprint.id
                 ))
             );
@@ -903,18 +926,44 @@ pub fn ship(
         }
         println!("{}", style::success(&format!("✓ merged {branch} (squash)")));
 
-        // Flip the sprint Complete + tear down the worktree.
-        match crew::lifecycle::sprint_complete(&sprint.id) {
-            Ok(_) => println!("{}", style::success(&format!("✓ sprint {} → Complete", sprint.id))),
+        // Flip the sprint Complete + tear down the worktree. The merge is
+        // already irreversible, so a sprint_complete failure can't roll it
+        // back — but it leaves merged-PR-but-Running-sprint, so we must NOT
+        // claim a clean "loop closed". Track the outcome and exit non-zero
+        // with a reconcile pointer if completion didn't take.
+        let complete_ok = match crew::lifecycle::sprint_complete(&sprint.id) {
+            Ok(_) => {
+                println!("{}", style::success(&format!("✓ sprint {} → Complete", sprint.id)));
+                true
+            }
+            Err(e) => {
+                eprintln!(
+                    "{}",
+                    style::error(&format!("✗ sprint_complete({}) failed: {e:#}", sprint.id))
+                );
+                false
+            }
+        };
+        // The branch was deleted by --delete-branch; remove the now-orphaned
+        // worktree (force — its branch ref is gone). Warn on failure so
+        // orphaned files don't linger silently.
+        match git_in(&root, &["worktree", "remove", "--force", &wt_path.to_string_lossy()]) {
+            Ok(o) if o.status.success() => {
+                println!("{}", style::dim(&format!("worktree {} removed", wt_path.display())))
+            }
+            Ok(o) => eprintln!(
+                "{}",
+                style::warn(&format!(
+                    "worktree removal failed ({}) — run `git worktree prune` / remove {} manually.",
+                    String::from_utf8_lossy(&o.stderr).trim(),
+                    wt_path.display()
+                ))
+            ),
             Err(e) => eprintln!(
                 "{}",
-                style::warn(&format!("sprint_complete({}) failed: {e:#}", sprint.id))
+                style::warn(&format!("worktree removal errored: {e:#} — remove {} manually.", wt_path.display()))
             ),
         }
-        // The branch was deleted by --delete-branch; remove the now-orphaned
-        // worktree (force — its branch ref is gone).
-        let _ = git_in(&root, &["worktree", "remove", "--force", &wt_path.to_string_lossy()]);
-        println!("{}", style::dim(&format!("worktree {} removed", wt_path.display())));
 
         emit_run_record(
             flow::Level::Info,
@@ -922,8 +971,19 @@ pub fn ship(
             mission_id,
             &sprint.id,
             &session_id,
-            serde_json::json!({ "pr_url": pr_url }),
+            serde_json::json!({ "pr_url": pr_url, "sprint_completed": complete_ok }),
         );
+        if !complete_ok {
+            eprintln!(
+                "{}",
+                style::error(&format!(
+                    "PR was MERGED but sprint `{}` could not be marked Complete — state is \
+                     inconsistent. Reconcile with `darkmux sprint complete {}`.",
+                    sprint.id, sprint.id
+                ))
+            );
+            return Ok(2);
+        }
         println!("\n{}", style::success("✓ sprint shipped + merged. Loop closed."));
         return Ok(0);
     }
