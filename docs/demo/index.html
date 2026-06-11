@@ -286,6 +286,14 @@
     .split { display: none; } /* the row-resize handle isn't useful when stacked */
     .fleet { gap: 16px; }
     .mach { width: 100%; }
+    /* (#783) compact the savings hero on phones — the 42px number + padding ate
+       too much vertical space and forced scrolling. Smaller number, tighter
+       box, full-width (the desktop 560px cap is irrelevant below it). */
+    .savings { max-width: none; padding: 13px 15px; margin-bottom: 14px; }
+    .savnum { font-size: 30px; }
+    .savlbl { margin-top: 5px; }
+    .savbreak { margin-top: 5px; }
+    .savhint { margin-top: 6px; }
     .fleettl { margin-top: 18px; }
     /* Activity lanes stack on phones: the machine name sits on its own line and
        the bar spans the full width below. A side label column would eat ~30% of
@@ -654,7 +662,11 @@ function tokensOffMeter(){
 const fmtN=n=>Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g,',');
 function savingsHero(){
   const t=tokensOffMeter();
-  if(!t.runs) return '';
+  // Always render — even at zero (playback start, or a fresh fleet with no
+  // dispatches yet). Showing "0" that then climbs reads as a live odometer;
+  // hiding it until the first record made it pop in late + look absent (#783
+  // mobile feedback). The fleet view is where it lives; the gate was the only
+  // thing keeping it invisible at t=start.
   // Derive the window label from LIVE_WINDOW_MS so it can't drift from the
   // actual live window (in live mode DATA is pre-windowed to it). Playback
   // shows no window suffix (the meta bar already shows the dataset range).
