@@ -216,6 +216,12 @@
   #meta .run{color:#4ade80}
   #meta .idle{color:var(--muted);cursor:default}
   #meta .metahint{color:var(--muted);font:11px 'JetBrains Mono',monospace}
+  /* (#783) savings hero — tokens kept off the meter. The "bang-up" on the fleet view. */
+  .savings{margin:0 0 18px;padding:16px 20px;border:1px solid var(--line);border-radius:10px;background:linear-gradient(180deg,rgba(74,222,128,.06),rgba(74,222,128,.01))}
+  .savnum{font:700 42px/1 'JetBrains Mono',monospace;color:#4ade80;letter-spacing:.01em}
+  .savlbl{font:600 12px/1 'JetBrains Mono',monospace;color:var(--text);margin-top:7px;text-transform:uppercase;letter-spacing:.12em}
+  .savbreak{font:12px Inter,sans-serif;color:var(--muted);margin-top:7px}
+  .savhint{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin-top:9px;opacity:.7}
   .mgoal{font-size:13px;color:var(--text);margin:8px 0 16px;max-width:680px;line-height:1.5}
   .burn{margin-bottom:18px}.burnbar{height:6px;background:var(--line);border-radius:3px;overflow:hidden;max-width:420px}.burnbar span{display:block;height:100%;background:var(--good)}
   .burnlbl{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin-top:6px}
@@ -623,6 +629,37 @@ function machPresent(m){
   if(!edges.length)return null;
   return edges[edges.length-1].action==="machine.online";
 }
+// (#783) Tokens kept off the (frontier) meter — the savings hero. Sums ONLY
+// `telemetry.tokens` records (category=telemetry, source=tokens), the canonical
+// per-dispatch token event from the local runtime (#785). dispatch.complete
+// ALSO carries the totals in its payload; summing both would double-count — so
+// we sum the telemetry family exclusively. Playhead-aware (ts<=state.t) so the
+// odometer accumulates as playback scrubs; in live follow state.t=tMax → the
+// whole window. TOKENS ONLY — never a currency figure (the operator multiplies
+// by their own per-token rate; darkmux supplies no rate and makes no $ claim).
+function tokensOffMeter(){
+  let total=0,prompt=0,completion=0,runs=0;
+  for(const r of DATA){
+    if(r.category==="telemetry"&&r.source==="tokens"&&T(r.ts)<=state.t){
+      const p=r.payload||{};
+      total+=p.total_tokens||0; prompt+=p.prompt_tokens||0; completion+=p.completion_tokens||0; runs++;
+    }
+  }
+  return {total,prompt,completion,runs};
+}
+// Thousands-separated integer (locale-free, deterministic for tests).
+const fmtN=n=>Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g,',');
+function savingsHero(){
+  const t=tokensOffMeter();
+  if(!t.runs) return '';
+  const win=document.body.classList.contains('live-mode')?' · last 24h':'';
+  return `<div class="savings">
+    <div class="savnum">${fmtN(t.total)}</div>
+    <div class="savlbl">tokens off the meter${win}</div>
+    <div class="savbreak">${fmtN(t.prompt)} prompt + ${fmtN(t.completion)} completion · ${t.runs} dispatch${t.runs===1?'':'es'} run locally</div>
+    <div class="savhint">× your per-token rate = your savings</div>
+  </div>`;
+}
 function renderFleet(){
   $("logscope").textContent="fleet"; state.stageScope=()=>true;
   const ms=machines();
@@ -666,7 +703,7 @@ function renderFleet(){
   const tl = ms.length
     ? `<div class="fleettl" style="--lname-w:${labelW}px"><div class="tlhdr">${liveMode?'recent activity':'activity'} · ${iso(tMin).slice(11,19)}–${iso(tMax).slice(11,19)}Z</div>${lanes}${ax}</div>`
     : `<div class="fleettl"><div class="tlempty">waiting for the first flow record…</div></div>`;
-  $("stage").innerHTML=`<div class="fleet">${cards}</div>`+tl;
+  $("stage").innerHTML=savingsHero()+`<div class="fleet">${cards}</div>`+tl;
 }
 // (#691) One expandable row in the recent-runs LIST. Collapsed: status · role ·
 // model · mission · completed-time/duration · turns/tools — scannable, so the
