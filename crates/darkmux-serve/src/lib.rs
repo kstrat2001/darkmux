@@ -10,6 +10,7 @@ use axum::{
 };
 use futures::stream::{self, Stream};
 use std::collections::VecDeque;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -356,11 +357,23 @@ fn build_startup_banner(
     let flow_schema = darkmux_flow::FLOW_SCHEMA_VERSION;
 
     lines.push(format!("darkmux serve · v{version}"));
-    lines.push(format!("  bind:           http://{addr}"));
-    lines.push(format!("  flow schema:    {flow_schema}"));
-    lines.push(format!("  flows dir:      {}", flows_dir.display()));
-    lines.push(format!("  missions:       {mission_count} loaded"));
-    lines.push(format!("  sprints:        {sprint_count} loaded"));
+    lines.push(format!(
+        "  viewer:   {}",
+        darkmux_types::style::accent(&format!("http://{addr}/"))
+    ));
+    lines.push(format!("  flow schema:    {}", darkmux_types::style::dim(flow_schema)));
+    lines.push(format!(
+        "  flows dir:      {}",
+        darkmux_types::style::dim(&flows_dir.display().to_string())
+    ));
+    lines.push(format!(
+        "  missions:       {} loaded",
+        darkmux_types::style::dim(&mission_count.to_string())
+    ));
+    lines.push(format!(
+        "  sprints:        {} loaded",
+        darkmux_types::style::dim(&sprint_count.to_string())
+    ));
 
     // CORS allowlist surface (#273) — operators with a localhost dev
     // server origin need to opt in via DARKMUX_DAEMON_CORS_ORIGINS;
@@ -383,32 +396,29 @@ fn build_startup_banner(
         // wonder why their typed env value looks different here.
         lines.push(format!(
             "  cors allowlist: null (file://) + {} (exact-match, normalized lowercase + no trailing slash)",
-            extra_list.join(", ")
+            darkmux_types::style::dim(&extra_list.join(", "))
         ));
     }
 
     if !flows_dir_exists {
-        lines.push(
-            "  ! flows dir doesn't exist yet — will be created on first record write".to_string(),
-        );
+        lines.push(darkmux_types::style::warn(
+            "  ! flows dir doesn't exist yet — will be created on first record write",
+        ));
     }
     if !missions_dir_exists {
-        // Per-endpoint message uses the loader's dual-read-resolved dir
-        // so the path printed is the one the operator can `ls` or
-        // `mkdir` (canonical post-Beat-33 if no legacy state exists).
-        lines.push(format!(
+        lines.push(darkmux_types::style::warn(&format!(
             "  ! missions dir not found at {} (/missions endpoint returns empty)",
             missions_dir.display()
-        ));
+        )));
     }
     if !sprints_dir_exists {
-        lines.push(format!(
+        lines.push(darkmux_types::style::warn(&format!(
             "  ! sprints dir not found at {} (/sprints endpoint returns empty)",
             sprints_dir.display()
-        ));
+        )));
     }
 
-    lines.push("  ready — Ctrl-C to stop".to_string());
+    lines.push(darkmux_types::style::success("  ready — Ctrl-C to stop"));
     lines
 }
 
@@ -432,6 +442,21 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf) -> Result<()> {
         let flows_dir_exists = flows_dir.exists();
         let missions_dir = darkmux_crew::loader::missions_dir();
         let missions_dir_exists = missions_dir.exists();
+        // Print the ASCII-art wordmark + tagline only when stdout is a real
+        // terminal (so piped / redirected logs stay clean).
+        if std::io::stdout().is_terminal() {
+            let art = r#"██████╗  █████╗ ██████╗ ██╗  ██╗███╗   ███╗██╗   ██╗██╗  ██╗
+██╔══██╗██╔══██╗██╔══██╗██║ ██╔╝████╗ ████║██║   ██║╚██╗██╔╝
+██║  ██║███████║██████╔╝█████╔╝ ██╔████╔██║██║   ██║ ╚███╔╝ 
+██║  ██║██╔══██║██╔══██╗██╔═██╗ ██║╚██╔╝██║██║   ██║ ██╔██╗ 
+██████╔╝██║  ██║██║  ██║██║  ██╗██║ ╚═╝ ██║╚██████╔╝██╔╝ ██╗
+╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝ ╚═════╝ ╚═╝  ╚═╝"#;
+            println!("{}", darkmux_types::style::accent(art));
+            println!("  🤖 Mission control for your AI fleet.");
+            println!();
+        }
+
+        // Print the startup panel (viewer URL, counts, warnings).
         let sprints_dir = darkmux_crew::loader::sprints_dir();
         let sprints_dir_exists = sprints_dir.exists();
         let mission_count = darkmux_crew::loader::load_missions()
@@ -2860,8 +2885,11 @@ mod tests {
         // Title carries the binary version that operators bump via cargo install.
         let joined = lines.join("\n");
         assert!(joined.contains("darkmux serve · v"), "title line present: {joined}");
-        assert!(joined.contains("bind:"), "bind line present");
-        assert!(joined.contains("http://127.0.0.1:8765"), "bind shows the addr");
+        assert!(joined.contains("viewer:"), "viewer line present");
+        assert!(
+            joined.contains("http://127.0.0.1:8765/"),
+            "viewer shows the addr with trailing slash"
+        );
         assert!(joined.contains("flow schema:"), "schema line present");
         assert!(joined.contains(darkmux_flow::FLOW_SCHEMA_VERSION), "schema version shown");
         assert!(joined.contains("/tmp/darkmux-flows-banner-test"), "flows dir shown");
