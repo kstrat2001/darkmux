@@ -216,6 +216,8 @@
   #meta .run{color:#4ade80}
   #meta .idle{color:var(--muted);cursor:default}
   #meta .metahint{color:var(--muted);font:11px 'JetBrains Mono',monospace}
+  /* (#803) hybrid note — the encouraging line inside the savings card */
+  .hybnote{margin-top:9px;padding-top:8px;border-top:1px solid var(--line);font:12px 'JetBrains Mono',monospace;color:var(--good)}
   /* (#756) live diff panel — watch the code form during a mission-run dispatch */
   .fchips{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 8px}
   .fchip{font:10px/1.7 'JetBrains Mono',monospace;background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:1px 7px;color:var(--text)}
@@ -663,19 +665,58 @@ function machPresent(m){
 // state.t=tMax → the whole window. TOKENS ONLY — never a currency figure (the
 // operator multiplies by their own per-token rate; darkmux supplies no rate
 // and makes no $ claim).
+// (#803) Token-CLASS decomposition — the educational layer. An agent loop
+// re-reads its whole context every turn and generates a little, so the raw
+// total hides the economics. Per session (turn_seq-ordered per-turn records,
+// #795): re-read = Σ min(promptᵢ, promptᵢ₋₁) — the overlap each turn re-sends
+// (exact for uncompacted runs, a close approximation across middle-replace
+// compactions); fresh = Σprompt − re-read (first-read context: a single-turn
+// dispatch is ALL fresh); generated = Σ completion (always exact). Aggregate-
+// era records (pre-#795, no turn_seq) can't decompose → `unclassified`,
+// shown only when nonzero and gone once old records age out of the window.
 function tokensOffMeter(){
-  let total=0,prompt=0,completion=0;const sess=new Set();
+  let total=0,prompt=0,completion=0;const sess=new Map();
   for(const r of DATA){
     if(r.category==="telemetry"&&r.source==="tokens"&&T(r.ts)<=state.t){
       const p=r.payload||{};
       total+=p.total_tokens||0; prompt+=p.prompt_tokens||0; completion+=p.completion_tokens||0;
-      sess.add(r.session_id||r.ts);
+      // Composite fallback key: two sessionless records sharing a ts must
+      // not merge into one pseudo-session (it would corrupt the turn_seq
+      // decomposition below). session_id is the norm; this is defensive.
+      const k=r.session_id||("ts:"+r.ts+":"+(r.handle||"")+":"+(r.machine_uid||""));
+      if(!sess.has(k))sess.set(k,[]);
+      sess.get(k).push(p);
     }
   }
-  return {total,prompt,completion,runs:sess.size};
+  let fresh=0,reread=0,uncls=0;
+  for(const recs of sess.values()){
+    const sp=recs.reduce((a,p)=>a+(p.prompt_tokens||0),0);
+    if(recs.every(p=>p.turn_seq!=null)){
+      const turns=recs.slice().sort((a,b)=>a.turn_seq-b.turn_seq);
+      let rr=0,prev=null;
+      for(const p of turns){const pi=p.prompt_tokens||0;if(prev!=null)rr+=Math.min(pi,prev);prev=pi;}
+      reread+=rr; fresh+=sp-rr;
+    }else uncls+=sp;
+  }
+  return {total,prompt,completion,fresh,reread,uncls,runs:sess.size};
 }
 // Thousands-separated integer (locale-free, deterministic for tests).
 const fmtN=n=>Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g,',');
+// Compact count for the breakdown line (7.6M / 312k) — the headline keeps fmtN.
+const fmtC=n=>n>=1e6?(n/1e6).toFixed(n>=1e7?0:1)+"M":n>=1000?Math.round(n/1000)+"k":fmtN(n);
+// (#803) The hybrid note — a short, data-driven encouraging line with the
+// hero. This dashboard is a hybrid work environment (the fleet lifts, the
+// frontier judges); the note names the latest local mission when there is
+// one, the day's off-meter work when there isn't, and an invitation at
+// zero. Deterministic templates only (no generation); record-derived text
+// passes esc() at the template edge.
+function hybridNote(t){
+  const mr=DATA.filter(r=>r.action&&r.action.indexOf("mission.run")===0&&r.mission_id&&T(r.ts)<=state.t)
+               .sort((a,b)=>T(a.ts)-T(b.ts)).pop();
+  if(mr)return `<div class="hybnote">◆ ${esc(mr.mission_id)} ran through the local loop — the fleet lifted, the frontier judged. that's hybrid. keep going.</div>`;
+  if(t.runs)return `<div class="hybnote">${t.runs} dispatch${t.runs===1?'':'es'} off the meter — the hybrid loop is humming. keep it up.</div>`;
+  return `<div class="hybnote">going hybrid takes nerve. the fleet is ready when you are.</div>`;
+}
 function savingsHero(){
   const t=tokensOffMeter();
   // Always render — even at zero (playback start, or a fresh fleet with no
@@ -686,12 +727,16 @@ function savingsHero(){
   // Derive the window label from LIVE_WINDOW_MS so it can't drift from the
   // actual live window (in live mode DATA is pre-windowed to it). Playback
   // shows no window suffix (the meta bar already shows the dataset range).
+  // TOKENS ONLY — the hint names the rate CLASSES (providers price output ≈
+  // 5× input and cached input ≈ 0.1× input) but supplies no rate and makes
+  // no $ claim; the operator prices each class themselves.
   const win=document.body.classList.contains('live-mode')?` · last ${Math.round(LIVE_WINDOW_MS/3600000)}h`:'';
   return `<div class="savings">
     <div class="savnum">${fmtN(t.total)}</div>
     <div class="savlbl">tokens off the meter${win}</div>
-    <div class="savbreak">${fmtN(t.prompt)} prompt + ${fmtN(t.completion)} completion · ${t.runs} dispatch${t.runs===1?'':'es'} run locally</div>
-    <div class="savhint">× your per-token rate = your savings</div>
+    <div class="savbreak">${fmtC(t.completion)} generated · ${fmtC(t.fresh)} fresh input · ${fmtC(t.reread)} re-read input${t.uncls?` · ${fmtC(t.uncls)} unclassified`:''} · ${t.runs} dispatch${t.runs===1?'':'es'} run locally</div>
+    ${hybridNote(t)}
+    <div class="savhint">price each class at your provider's rates (input / cached input / output) = your savings</div>
   </div>`;
 }
 function renderFleet(){

@@ -2133,6 +2133,49 @@ mod tests {
         );
     }
 
+    /// (#803) The savings hero's token-class breakdown + hybrid note. Locks:
+    /// (a) the educational class labels exist (generated / fresh / re-read —
+    /// the decomposition IS the feature), (b) the hint stays TOKENS-ONLY
+    /// (names rate classes, supplies no currency or rate figure), (c) the
+    /// hybrid note's record-derived mission id is esc()-wrapped.
+    #[test]
+    fn savings_hero_breakdown_is_classed_and_currency_free() {
+        let html = include_str!("../assets/viewer.html");
+        for needle in ["generated", "fresh input", "re-read input", "unclassified"] {
+            assert!(
+                html.contains(needle),
+                "savings hero lost the `{needle}` token-class label (#803)"
+            );
+        }
+        assert!(
+            html.contains("${esc(mr.mission_id)}"),
+            "hybridNote must esc() the mission id"
+        );
+        assert!(
+            !html.contains("${mr.mission_id}"),
+            "hybridNote interpolates mission_id without esc()"
+        );
+        // Tokens-only invariant: no currency or rate figure anywhere in the
+        // hero region (hybridNote through the end of savingsHero, bounded by
+        // the next top-level function) — the operator prices each class
+        // themselves. Region-based extraction so a template reshuffle can't
+        // silently shrink the scanned text (QA finding on the first cut).
+        let start = html
+            .find("function hybridNote(")
+            .expect("viewer.html lost hybridNote");
+        let end = html[start..]
+            .find("function renderFleet(")
+            .map(|i| start + i)
+            .expect("renderFleet no longer follows the hero region");
+        let hero = &html[start..end];
+        for sym in ["USD", "$0", "$1", "€", "£", "/M", "per million"] {
+            assert!(
+                !hero.contains(sym),
+                "savings hero must not carry a currency/rate figure (`{sym}`) — tokens only"
+            );
+        }
+    }
+
     /// (#756) The live-diff panel renders model-authored diff text — it must
     /// stay output-encoded at the template edge and must never fetch outside
     /// live mode (playback and the static demo have no daemon). Lock both
