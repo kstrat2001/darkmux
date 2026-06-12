@@ -1746,6 +1746,33 @@ mod tests {
         }
     }
 
+    /// (#794) The live SSE tail must be idempotent — a re-delivered record
+    /// (reconnect / snapshot-stream overlap; the stream is at-least-once) must
+    /// not be re-counted, or cumulative readouts (the savings hero) inflate
+    /// past the persisted truth and "reset" on refresh. Lock the dedup so it
+    /// can't be removed without this failing.
+    #[test]
+    fn live_tail_dedups_records() {
+        let html = include_str!("../assets/viewer.html");
+        assert!(
+            html.contains("const SEEN_KEYS=new Set();") && html.contains("const recKey="),
+            "viewer.html lost the live-tail dedup primitives (SEEN_KEYS / recKey)"
+        );
+        // The SSE onmessage handler must consult SEEN_KEYS before RAW.push so a
+        // re-delivered record is dropped rather than re-counted.
+        let onmsg = html
+            .split("LIVE_ES.onmessage")
+            .nth(1)
+            .expect("viewer.html has no LIVE_ES.onmessage handler");
+        let guard = onmsg.find("if(SEEN_KEYS.has(k))return;");
+        let push = onmsg.find("RAW.push(rec);");
+        assert!(
+            matches!((guard, push), (Some(g), Some(p)) if g < p),
+            "the live SSE onmessage must guard on SEEN_KEYS.has(k) BEFORE RAW.push(rec) \
+             (idempotent append — #794)"
+        );
+    }
+
     /// The XSS regression fixture must stay a valid FLOW_SCHEMA day file —
     /// the manual walkthrough (copy to ~/.darkmux/flows/2026-01-01.jsonl,
     /// `darkmux serve`, open /play/2026-01-01, assert window.__xss is

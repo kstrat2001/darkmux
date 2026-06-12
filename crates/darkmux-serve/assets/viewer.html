@@ -1387,6 +1387,16 @@ const LIVE_WINDOW_MS=24*60*60*1000;
 function prevDateUTC(d){const dt=new Date(d+"T00:00:00Z");dt.setUTCDate(dt.getUTCDate()-1);return dt.toISOString().slice(0,10);}
 
 let RAW=[];            // raw FlowRecords (pre-adapt); the live tail appends here
+// (#794) Record-identity dedup for the live tail. The SSE stream is
+// at-least-once: a reconnect or a snapshot/stream boundary can re-deliver a
+// record the client already holds. Appending blindly RE-COUNTED records, which
+// inflated cumulative readouts — the savings hero climbed past the persisted
+// truth and then "reset" to the real number on refresh (the live in-memory set
+// had diverged from the unique records in the window). SEEN_KEYS makes RAW
+// append idempotent: a record is added at most once, so live == refresh always.
+const SEEN_KEYS=new Set();
+const recKey=r=>[r.ts,r.machine_uid||'',r.session_id||'',r.action||'',r.source||'',r.handle||'',r.level||'',r.stage||'',r.payload!=null?JSON.stringify(r.payload):''].join('\x1f');
+function rebuildSeen(){ SEEN_KEYS.clear(); for(const r of RAW)SEEN_KEYS.add(recKey(r)); }
 let LIVE_ES=null;      // EventSource handle when tailing the live stream
 let LIVE_ES_DATE=null; // UTC date string of the day the SSE stream was opened
 // (#638) Sessions with a live heartbeat right now — polled from the daemon's
@@ -1461,7 +1471,13 @@ async function loadLiveWindow(today){
     if(res.ok){anyOk=true;const body=await res.json();recs=recs.concat(Array.isArray(body)?body:(body.records||body.flow||[]));}
   }
   RAW=recs.filter(r=>T(r.ts)>=Date.now()-LIVE_WINDOW_MS);
+  // (#794) Dedup the initial window — the two-day fetch (prevDate + today) can
+  // overlap, and we want RAW to start as a clean unique set so the tail's
+  // dedup has an accurate baseline. Seeds SEEN_KEYS via rebuildSeen().
+  const sk=new Set();
+  RAW=RAW.filter(r=>{const k=recKey(r); if(sk.has(k))return false; sk.add(k); return true;});
   assignUids(RAW);
+  rebuildSeen();
   return anyOk;
 }
 
@@ -1470,7 +1486,10 @@ function applyLive(){
   // (and the SSE tail across midnight) ages old records out instead of growing
   // unbounded. RAW is ~chronological, so only filter when the oldest is stale.
   const cut=Date.now()-LIVE_WINDOW_MS;
-  if(RAW.length&&T(RAW[0].ts)<cut)RAW=RAW.filter(r=>T(r.ts)>=cut);
+  // (#794) Rebuild SEEN_KEYS after an age-out so it tracks exactly what's in
+  // RAW — keeps the dedup set bounded and lets a record legitimately re-enter
+  // if it ever ages out and is re-sent.
+  if(RAW.length&&T(RAW[0].ts)<cut){RAW=RAW.filter(r=>T(r.ts)>=cut);rebuildSeen();}
   DATA=flowToRenderModel(RAW);
   recompute();
   absorbNewFilterValues();
@@ -1490,6 +1509,12 @@ function startLiveTail(date){
   LIVE_ES.onmessage=ev=>{
     let rec; try{rec=JSON.parse(ev.data);}catch(_){return;}
     if(!rec||typeof rec!=="object"||Array.isArray(rec))return;
+    // (#794) Idempotent append — drop a record already in the window. The SSE
+    // is at-least-once; without this, a re-delivered record re-counts and
+    // inflates cumulative readouts (the savings-hero divergence).
+    const k=recKey(rec);
+    if(SEEN_KEYS.has(k))return;
+    SEEN_KEYS.add(k);
     rec._uid = nextRecordUid++;
     RAW.push(rec);
     if(!pending){pending=true;requestAnimationFrame(()=>{pending=false;applyLive();});}
