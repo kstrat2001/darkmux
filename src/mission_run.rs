@@ -131,13 +131,13 @@ fn conventions_branch(
         Some(b) if crate::conventions::valid_branch(&b) => b,
         Some(b) => {
             eprintln!(
-                "darkmux: warning — conventions branch_template expanded to an invalid                  git ref ({b:?}); using `{default}`"
+                "darkmux: warning — conventions branch_template expanded to an invalid git ref ({b:?}); using `{default}`"
             );
             default
         }
         None => {
             eprintln!(
-                "darkmux: warning — conventions branch_template references {{ticket}} but                  mission `{}` has no ticket (set one: `mission propose --ticket <ID>`);                  using `{default}`",
+                "darkmux: warning — conventions branch_template references {{ticket}} but mission `{}` has no ticket (set one: `mission propose --ticket <ID>`); using `{default}`",
                 mission.id
             );
             default
@@ -804,6 +804,22 @@ fn pr_body(mission: &crew::types::Mission, sprint: &crew::types::Sprint) -> Stri
     )
 }
 
+/// (#816) The branch a worktree is actually on (`git rev-parse
+/// --abbrev-ref HEAD`). None when the worktree is missing/unreadable or
+/// detached — callers fall back to the conventions-computed name.
+fn worktree_branch(wt_path: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .current_dir(wt_path)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let b = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if b.is_empty() || b == "HEAD" { None } else { Some(b) }
+}
+
 /// (#816) Apply a conventions template to the default-computed subject.
 /// `what` names the item in the fallback warning. Falls back to the
 /// default subject when there's no template, the template needs a ticket
@@ -826,7 +842,7 @@ fn conventioned(
         Some(out) if !out.trim().is_empty() => out,
         _ => {
             eprintln!(
-                "darkmux: warning — conventions {what} template couldn't expand for                  mission `{}` (missing ticket or empty result); using the default",
+                "darkmux: warning — conventions {what} template couldn't expand for mission `{}` (missing ticket or empty result); using the default",
                 mission.id
             );
             default
@@ -854,7 +870,7 @@ fn conventioned_pr_body(
         Ok(tpl) => format!("{tpl}\n\n{summary}"),
         Err(e) => {
             eprintln!(
-                "darkmux: warning — conventions pr_body_template {} unreadable ({e});                  using the generated body",
+                "darkmux: warning — conventions pr_body_template {} unreadable ({e}); using the generated body",
                 path.display()
             );
             summary
@@ -967,7 +983,13 @@ pub fn ship(
     let root = repo_root()?;
     let wt_path = worktree_path(&root, &sprint.id);
     let conv = crate::conventions::load(&root);
-    let branch = conventions_branch(&sprint, &mission, conv.as_ref());
+    // (#816) Ship pushes the branch the worktree is ACTUALLY on — created at
+    // `mission run` time — not a recomputation. If conventions.json changed
+    // between run and ship, recomputing would target a branch that doesn't
+    // exist (QA drift finding). The computed name is only the fallback for
+    // a worktree whose HEAD can't be read.
+    let branch = worktree_branch(&wt_path)
+        .unwrap_or_else(|| conventions_branch(&sprint, &mission, conv.as_ref()));
     let session_id = format!("mission-run-{}-{}", mission_id, sprint.id);
 
     if !wt_path.exists() {
