@@ -35,6 +35,7 @@ mod init;
 // crate::{lab,workloads,providers}::* resolving for main + notebook.
 pub use darkmux_lab::lab;
 mod migrate;
+mod conventions;
 mod mission_propose;
 mod mission_run;
 mod notebook;
@@ -617,6 +618,12 @@ enum MissionCmd {
         /// files before starting can omit this flag.
         #[arg(long)]
         start: bool,
+        /// Work-item / ticket id this mission realizes (e.g. `SYS-2598`).
+        /// Stamped on the mission record; referenced as `{ticket}` by the
+        /// repo's `.darkmux/conventions.json` templates (#816) for branch
+        /// names, commit subjects, and PR titles.
+        #[arg(long, value_name = "ID")]
+        ticket: Option<String>,
     },
     /// Add a new Sprint to an existing Mission mid-flight (#107).
     /// Operator-sovereign scope growth — alternative to either hand-
@@ -1524,7 +1531,8 @@ fn cmd_mission(sub: MissionCmd) -> Result<i32> {
             from_file,
             yes,
             start,
-        } => mission_propose::propose(from_stdin, from_file.as_deref(), yes, start),
+            ticket,
+        } => mission_propose::propose(from_stdin, from_file.as_deref(), yes, start, ticket.as_deref()),
         MissionCmd::AddSprint {
             mission_id,
             sprint_id,

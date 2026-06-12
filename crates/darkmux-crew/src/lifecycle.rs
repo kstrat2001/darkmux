@@ -839,6 +839,7 @@ mod tests {
             closed_ts: None,
             paused_ts: None,
             source_input: None,
+            ticket: None,
         };
         save_json(&mission_path(id), &m).unwrap();
         m

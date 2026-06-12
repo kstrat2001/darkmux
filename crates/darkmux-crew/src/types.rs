@@ -273,6 +273,14 @@ pub struct Mission {
     /// hand-authored or pre-#815 missions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_input: Option<String>,
+    /// (#816) Work-item / ticket id this mission realizes (e.g.
+    /// `SYS-2598`), set via `mission propose --ticket`. Referenced as
+    /// `{ticket}` by the target repo's `.darkmux/conventions.json`
+    /// templates for branch names, commit subjects, and PR titles. None
+    /// on ticketless missions — templates referencing `{ticket}` then
+    /// fall back to darkmux defaults with a soft warning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket: Option<String>,
 }
 
 /// Status of a sprint.
