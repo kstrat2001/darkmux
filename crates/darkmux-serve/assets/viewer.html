@@ -304,6 +304,14 @@
     .savlbl { margin-top: 5px; }
     .savbreak { margin-top: 5px; }
     .savhint { margin-top: 6px; }
+    /* (#803) Recent-runs rows wrap to multiple lines on phones so the per-run
+       crits (turns · tools · tokens · compactions) stay visible instead of
+       being crushed by the single-line flex row. Line 1 = pill + role/model/
+       mission (ellipsized), line 2 = the stat bits, line 3 = when/duration. */
+    .rr>summary { flex-wrap: wrap; row-gap: 3px; padding: 9px 6px; }
+    .rr .rrmain { flex: 1 1 calc(100% - 80px); }
+    .rr .rrmeta { flex: 1 1 100%; padding-left: 2px; }
+    .rr .rrtime { flex: 1 1 100%; padding-left: 2px; }
     .fleettl { margin-top: 18px; }
     /* Activity lanes stack on phones: the machine name sits on its own line and
        the bar spans the full width below. A side label column would eat ~30% of
@@ -796,7 +804,14 @@ function recentRow(n){
   const dur=(n.closeTs!=null&&n.startTs!=null)?fmt(n.closeTs-n.startTs):null;
   const dp=n.donePayload||{}, sp=n.startPayload||{};
   const turns=dp.total_turns, tools=dp.total_tools, comps=dp.total_compactions;
-  const metaBits=[turns!=null?esc(turns)+'t':null,tools!=null?esc(tools)+'⚙':null].filter(Boolean).join(' ');
+  // (#803) Tokens + compactions on the collapsed row — the rail is where the
+  // per-run economics jump out (a 106-turn run reading 5.2M next to a 10-turn
+  // one reading 200k teaches the turn-count lever at a glance). ⚡ matches the
+  // context chart's compaction glyph. All from the dispatch.complete payload;
+  // pre-#785 records lack the fields and the bits simply omit.
+  const toks=dp.total_tokens;
+  const metaBits=[turns!=null?esc(turns)+'t':null,tools!=null?esc(tools)+'⚙':null,
+    toks!=null?fmtC(toks)+'tok':null,comps!=null?esc(comps)+'⚡':null].filter(Boolean).join(' ');
   const rel=n.closeTs!=null?relAgo(n.closeTs):'';
   const when=n.closeTs!=null?`${clk(n.closeTs)}${rel?' · '+rel:''}`:'';
   const miss=n.mission?` · ${esc(n.mission)}`:'';
@@ -813,6 +828,7 @@ function recentRow(n){
     kv('workspace',esc(sp.workspace)),
     kv('result',`<span class="${(n.errored||n.killed)?'wallerr':''}">${result}</span>`),
     kv('counts',counts),
+    toks!=null?kv('tokens',`${fmtN(toks)} total · ${fmtN(dp.prompt_tokens||0)} read · ${fmtN(dp.completion_tokens||0)} generated`):'',
     kv('timing',timing),
   ].filter(Boolean).join("");
   return `<details class="rr"><summary><span class="pill ${n.pill}">${n.lbl}</span>`
