@@ -242,7 +242,7 @@
   .savc.gen .scv{color:var(--good)}
   .savc.uncls .scv{color:var(--muted)}
   .savc .scl{font:10px/1.5 'JetBrains Mono',monospace;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin-top:3px}
-  .savhint{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin-top:9px;opacity:.7}
+  .hybnote .hybpre{color:var(--text);font-weight:700}
   .mgoal{font-size:13px;color:var(--text);margin:8px 0 16px;max-width:680px;line-height:1.5}
   .burn{margin-bottom:18px}.burnbar{height:6px;background:var(--line);border-radius:3px;overflow:hidden;max-width:420px}.burnbar span{display:block;height:100%;background:var(--good)}
   .burnlbl{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin-top:6px}
@@ -315,7 +315,6 @@
     .savrow { gap: 10px 18px; }
     .savclasses { gap: 8px 16px; }
     .savc .scv { font-size: 15px; }
-    .savhint { margin-top: 6px; }
     /* (#803) Recent-runs rows wrap to multiple lines on phones so the per-run
        crits (turns · tools · tokens · compactions) stay visible instead of
        being crushed by the single-line flex row. Line 1 = pill + role/model/
@@ -730,9 +729,12 @@ const fmtC=n=>n>=1e6?(n/1e6).toFixed(n>=1e7?0:1)+"M":n>=1000?Math.round(n/1000)+
 function hybridNote(t){
   const mr=DATA.filter(r=>r.action&&r.action.indexOf("mission.run")===0&&r.mission_id&&T(r.ts)<=state.t)
                .sort((a,b)=>T(a.ts)-T(b.ts)).pop();
-  if(mr)return `<div class="hybnote">◆ ${esc(mr.mission_id)} ran through the local loop — the fleet lifted, the frontier judged. that's hybrid. keep going.</div>`;
-  if(t.runs)return `<div class="hybnote">${t.runs} dispatch${t.runs===1?'':'es'} off the meter — the hybrid loop is humming. keep it up.</div>`;
-  return `<div class="hybnote">going hybrid takes nerve. the fleet is ready when you are.</div>`;
+  // "Orchestrator note:" prefix (operator-chosen wording) — the note is the
+  // card's CONCLUSION; nothing renders below it.
+  const pre=`<b class="hybpre">Orchestrator note:</b> `;
+  if(mr)return `<div class="hybnote">${pre}${esc(mr.mission_id)} ran through the local loop — the fleet lifted, the frontier judged. that's hybrid. keep going.</div>`;
+  if(t.runs)return `<div class="hybnote">${pre}${t.runs} dispatch${t.runs===1?'':'es'} off the meter — the hybrid loop is humming. keep it up.</div>`;
+  return `<div class="hybnote">${pre}going hybrid takes nerve. the fleet is ready when you are.</div>`;
 }
 function savingsHero(){
   const t=tokensOffMeter();
@@ -744,9 +746,9 @@ function savingsHero(){
   // Derive the window label from LIVE_WINDOW_MS so it can't drift from the
   // actual live window (in live mode DATA is pre-windowed to it). Playback
   // shows no window suffix (the meta bar already shows the dataset range).
-  // TOKENS ONLY — the hint names the rate CLASSES (providers price output ≈
-  // 5× input and cached input ≈ 0.1× input) but supplies no rate and makes
-  // no $ claim; the operator prices each class themselves.
+  // TOKENS ONLY — class labels, no rates, no currency, no savings formula
+  // (the numbers speak for themselves; the orchestrator note concludes the
+  // card). The operator prices each class at their own provider's rates.
   const win=document.body.classList.contains('live-mode')?` · last ${Math.round(LIVE_WINDOW_MS/3600000)}h`:'';
   const sc=(v,l,cls)=>`<div class="savc${cls?' '+cls:''}"><div class="scv">${v}</div><div class="scl">${l}</div></div>`;
   return `<div class="savings">
@@ -764,7 +766,6 @@ function savingsHero(){
       </div>
     </div>
     ${hybridNote(t)}
-    <div class="savhint">price each class at your provider's rates (input / cached input / output) = your savings</div>
   </div>`;
 }
 function renderFleet(){
