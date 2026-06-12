@@ -491,6 +491,16 @@ pub fn run(
             sprint.id
         ))
     );
+    // (#807) Cue the frontier orchestrator at the decision moment — tool
+    // output is the one hint channel every harness reads. The note follows
+    // the MERGE (the arc's conclusion), so the gate print sequences it.
+    println!(
+        "{}",
+        style::dim(
+            "  after the merge, conclude on the dashboard:  darkmux flow note \
+             --text \"<what ran · where the tokens stayed · your call>\" --source orchestrator",
+        )
+    );
     emit_run_record(
         flow::Level::Info,
         "mission.run.gate",
@@ -985,6 +995,16 @@ pub fn ship(
             return Ok(2);
         }
         println!("\n{}", style::success("✓ sprint shipped + merged. Loop closed."));
+        // (#807) The arc just concluded — cue the orchestrator note HERE,
+        // where the conclusion is freshest. Tool output is the hint channel
+        // every frontier harness reads at the moment of action.
+        println!(
+            "{}",
+            style::dim(
+                "  next: leave the orchestrator note →  darkmux flow note \
+                 --text \"<what ran · where the tokens stayed · your call>\" --source orchestrator",
+            )
+        );
         return Ok(0);
     }
 
