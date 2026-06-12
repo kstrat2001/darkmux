@@ -703,7 +703,12 @@ function renderFleet(){
       const s=dispatch(sid,"start"); if(!s||T(s.ts)>state.t)return"";
       const c=dispatchEnd(sid), done=c&&T(c.ts)<=state.t;
       const err=done&&dispatchErrored(c);
-      const end=done?T(c.ts):state.t, L=pct(T(s.ts)), W=Math.max(0.6,pct(end)-L);
+      const end=done?T(c.ts):state.t;
+      const W=Math.max(0.6,pct(end)-pct(T(s.ts)));
+      // Clamp so a bar at/near "now" (left≈100%) + its min-width can't spill
+      // past the track's right edge (the rightmost bar was clipping ~3px).
+      // Shift left so left+width never exceeds 100%.
+      const L=Math.max(0,Math.min(pct(T(s.ts)),100-W));
       const role=(s.handle||"").replace(/^darkmux\//,"");
       return `<div class="sbar ${done?(err?'err':''):'a'}" style="left:${L}%;width:${W}%" title="${esc(role)} · ${esc(sid)}${done?(err?(dispatchKilled(c)?' · killed (timeout)':' · errored'):''):' · in flight'}"></div>`;
     }).join("");
