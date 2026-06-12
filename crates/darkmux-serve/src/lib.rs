@@ -2133,6 +2133,45 @@ mod tests {
         );
     }
 
+    /// (#756) The live-diff panel renders model-authored diff text — it must
+    /// stay output-encoded at the template edge and must never fetch outside
+    /// live mode (playback and the static demo have no daemon). Lock both
+    /// invariants in source so a refactor can't quietly drop them.
+    #[test]
+    fn diff_panel_is_live_gated_and_escaped() {
+        let html = include_str!("../assets/viewer.html");
+        // The esc() implementation the assertions below depend on must itself
+        // exist — if a refactor drops it, every wrapped interpolation throws
+        // rather than escaping (QA finding, #756 viewer review).
+        assert!(
+            html.contains("const esc="),
+            "viewer.html lost the esc() helper the output-encoding invariant rests on"
+        );
+        let panel = html
+            .split("function diffPanel(")
+            .nth(1)
+            .expect("viewer.html lost the #756 diffPanel function");
+        assert!(
+            panel.contains("if(!document.body.classList.contains('live-mode'))return \"\";"),
+            "diffPanel must early-return outside live mode (static demo / playback never fetch)"
+        );
+        // Every record/daemon-derived string must pass through esc() — the
+        // diff body line, the file path chips, and the base ref label.
+        for needle in ["${esc(l)", "${esc(f.path)}", "${esc(d.base)}", "${esc(p)}"] {
+            assert!(
+                panel.contains(needle),
+                "diffPanel lost the esc() wrap on `{needle}` — diff content is \
+                 model-authored text and must be output-encoded"
+            );
+        }
+        for raw in ["${l}", "${f.path}", "${d.base}", "${d.diff}"] {
+            assert!(
+                !panel.contains(raw),
+                "diffPanel interpolates `{raw}` without esc()"
+            );
+        }
+    }
+
     /// The XSS regression fixture must stay a valid FLOW_SCHEMA day file —
     /// the manual walkthrough (copy to ~/.darkmux/flows/2026-01-01.jsonl,
     /// `darkmux serve`, open /play/2026-01-01, assert window.__xss is

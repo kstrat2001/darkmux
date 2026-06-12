@@ -216,6 +216,17 @@
   #meta .run{color:#4ade80}
   #meta .idle{color:var(--muted);cursor:default}
   #meta .metahint{color:var(--muted);font:11px 'JetBrains Mono',monospace}
+  /* (#756) live diff panel — watch the code form during a mission-run dispatch */
+  .fchips{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 8px}
+  .fchip{font:10px/1.7 'JetBrains Mono',monospace;background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:1px 7px;color:var(--text)}
+  .fchip .fa{color:var(--good)}.fchip .fd{color:var(--bad)}
+  .diffwrap{max-height:380px;overflow:auto;background:#0a0f17;border:1px solid var(--line);border-radius:6px;padding:8px 10px;font:11px/1.5 'JetBrains Mono',ui-monospace,monospace}
+  .dl{white-space:pre-wrap;word-break:break-all}
+  .dl.add{color:var(--good);background:rgba(90,240,163,.05)}
+  .dl.del{color:var(--bad);background:rgba(255,107,133,.05)}
+  .dl.hunk{color:var(--amber);margin-top:4px}
+  .dl.fhd{color:var(--text);font-weight:700;margin-top:10px}
+  .dl.mt{color:var(--muted)}
   /* (#783) savings hero — tokens kept off the meter. The "bang-up" on the fleet view. */
   /* max-width so the hero reads as a deliberate stat card aligned with the
      machine cards below, not a full-width bordered bar with a void to the
@@ -1025,7 +1036,38 @@ function renderSubsystem(){
     <div class="track"><div class="lbl">model (lms)</div>${segs||'<span class="hint">no telemetry yet</span>'}</div>
     ${cpu}
     ${ctxChart}
-    ${detections}</div>`;
+    ${detections}
+    ${diffPanel(sid)}</div>`;
+}
+// (#756) Live-diff panel for the session view — the agent's code changes
+// forming in real time. Renders only in live mode (the static demo and
+// playback have no daemon to ask) and only when the daemon reports the
+// session's worktree diff as available; everything record-derived passes
+// through esc() at the template edge (the viewer's output-encoding
+// invariant — diff content is model-authored text, treat it as hostile).
+function diffPanel(sid){
+  if(!document.body.classList.contains('live-mode'))return "";
+  ensureDiffPoll(sid);
+  const d=DIFF.sid===sid?DIFF.data:null;
+  if(!d||!d.available)return "";
+  const files=d.files||[], untracked=d.untracked||[];
+  if(!files.length&&!untracked.length)
+    return `<div class="track"><div class="lbl">live diff vs ${esc(d.base)}</div><div class="hint">no changes yet — the worktree matches ${esc(d.base)}</div></div>`;
+  const adds=files.reduce((a,f)=>a+(f.additions||0),0), dels=files.reduce((a,f)=>a+(f.deletions||0),0);
+  const chips=files.map(f=>`<span class="fchip">${esc(f.path)} <b class="fa">+${f.additions==null?'·':esc(f.additions)}</b> <b class="fd">−${f.deletions==null?'·':esc(f.deletions)}</b></span>`).join("")
+    +untracked.map(p=>`<span class="fchip">${esc(p)} <b class="fa">new</b></span>`).join("");
+  // Client-side line cap for DOM sanity on huge diffs; the server already
+  // byte-bounds the text and flags `truncated`.
+  const MAXL=4000, lines=(d.diff||"").split("\n");
+  const body=lines.slice(0,MAXL).map(l=>{
+    const c=l.startsWith("+++")||l.startsWith("---")?"mt":l.startsWith("diff --git")?"fhd":l.startsWith("@@")?"hunk":l.startsWith("+")?"add":l.startsWith("-")?"del":"";
+    return `<div class="dl ${c}">${esc(l)||" "}</div>`;
+  }).join("");
+  const more=lines.length>MAXL?`<div class="dl mt">… ${lines.length-MAXL} more lines (capped for display)</div>`:"";
+  const trunc=d.truncated?' · <span class="fd">truncated</span>':'';
+  return `<div class="track"><div class="lbl">live diff vs ${esc(d.base)} — ${files.length} file${files.length===1?'':'s'} · <span class="fa" style="color:var(--good)">+${adds}</span> <span class="fd" style="color:var(--bad)">−${dels}</span>${trunc}</div>
+    <div class="fchips">${chips}</div>
+    <div class="diffwrap">${body}${more}</div></div>`;
 }
 function pretty(r){
   const o={};Object.keys(r).filter(k=>!k.startsWith("_")).forEach(k=>o[k]=r[k]);
@@ -1538,6 +1580,40 @@ function startLiveTail(date){
 // (#638) Poll the live-session set on the heartbeat cadence (~5s, matching
 // the emitter's refresh + 15s TTL). Best-effort: a fetch error just leaves
 // the set unchanged rather than flapping sessions offline. Only started in
+// (#756) Live diff of a session's mission-run worktree. The daemon's
+// GET /diff/:session_id resolves the session's worktree from its
+// mission.run.start record and returns the running `git diff` vs the base
+// (read-only, size-bounded, path-contained server-side). Polled ONLY while
+// the operator is on that session's view in LIVE mode — playback and the
+// static demo never fetch (no daemon there; the catch keeps a 404 silent,
+// so this also degrades cleanly against a pre-#756 daemon). One timer max;
+// it self-stops when the view changes. Worktrees outlive dispatch complete
+// (until ship/abort), so the panel keeps working at the review gate —
+// where reading the diff matters most.
+const DIFF={sid:null,data:null,timer:null};
+function stopDiffPoll(){ if(DIFF.timer)clearInterval(DIFF.timer); DIFF.timer=null; DIFF.sid=null; DIFF.data=null; }
+async function pollDiff(){
+  const sid=DIFF.sid;
+  if(!sid)return;
+  try{
+    const r=await fetch("/diff/"+encodeURIComponent(sid),{headers:{accept:"application/json"}});
+    if(!r.ok)return;
+    const d=await r.json();
+    const changed=JSON.stringify(d)!==JSON.stringify(DIFF.data);
+    DIFF.data=d;
+    if(changed&&state.level==="subsystem"&&state.session===sid)render();
+  }catch(_){/* best-effort — no daemon / endpoint absent / transient */}
+}
+function ensureDiffPoll(sid){
+  if(DIFF.sid===sid&&DIFF.timer)return;
+  stopDiffPoll();
+  DIFF.sid=sid;
+  pollDiff();
+  DIFF.timer=setInterval(()=>{
+    if(state.level!=="subsystem"||state.session!==sid){stopDiffPoll();return;}
+    pollDiff();
+  },3000);
+}
 // live mode; playback keeps LIVE_SESSIONS empty so nothing reads "running".
 let LIVE_SESS_TIMER=null;
 async function pollLiveSessions(){
