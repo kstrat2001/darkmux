@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.12.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.13.0";
 // Version history:
 //   1.2.0 — added optional `model` (#106)
 //   1.3.0 — added optional `reasoning` + `mission_id`; new Stage::TierDecision (#136)
@@ -74,6 +74,14 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.12.0";
 //           currency by design. Minor + additive: a new action value + new
 //           telemetry source, no struct/field change; older readers ignore
 //           the unknown action. New records only, prior AuditFileSink chains
+//           survive without rotation.
+//   1.13.0 — `telemetry.tokens` is now emitted PER TURN by the dispatch
+//           tailer (#795) with a new optional `turn_seq` payload field; the
+//           per-dispatch at-complete aggregate (1.12.0 / #782) is retired so
+//           records sum to the dispatch total without double-counting.
+//           Minor + additive: same action + source, new payload field only;
+//           consumers that SUM the family are unaffected (old aggregates and
+//           new per-turn records sum identically). New records only, chains
 //           survive without rotation.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]

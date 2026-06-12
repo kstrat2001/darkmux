@@ -1840,7 +1840,7 @@ mod tests {
     }
 
     #[test]
-    fn flow_schema_version_is_1_12_0() {
+    fn flow_schema_version_is_1_13_0() {
         // Pin the schema version so an accidental rename can't ship silently;
         // any bump beyond this should be a deliberate code change paired with
         // an update to this assertion (and corresponding viewer EXPECTED_*
@@ -1888,7 +1888,12 @@ mod tests {
         //           the spine the live "tokens off-meter" view aggregates. Minor +
         //           additive — new action value, no struct change; older readers
         //           ignore it. New records only, chains survive.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.12.0");
+        //   1.13.0 — `telemetry.tokens` now emitted PER TURN by the dispatch
+        //           tailer (#795), new optional `turn_seq` payload field; the
+        //           at-complete aggregate retired so records sum to the
+        //           dispatch total without double-counting. Minor + additive —
+        //           consumers that SUM the family are unaffected.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.13.0");
     }
 
     #[test]
