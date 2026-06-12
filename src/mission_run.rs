@@ -492,16 +492,19 @@ pub fn run(
         ))
     );
     // (#807/#817) Cue the frontier orchestrator at the decision moment —
-    // tool output is the one hint channel every harness reads. The gate is
-    // where the adjudication happens (QA findings accepted/overridden, and
-    // why), so the scaffold is READY-TO-PASTE with the session id pre-filled
-    // (the fiddly part) so the reasoning lands in the run's own record
-    // trail instead of evaporating into the PR body.
+    // tool output is the one hint channel every harness reads, and the
+    // scaffold's placeholder IS the style direction (operator feedback:
+    // the first cut's "<verdict · what you overrode · why>" produced wordy
+    // technical notes on the dashboard card). Two channels, routed by tag:
+    //   source=adjudication → the audit trail (technical reasoning, never
+    //                          rendered on the hero card)
+    //   source=orchestrator → the dashboard card (positive, digestible)
     println!(
         "{}",
         style::dim(&format!(
-            "  record your adjudication:  darkmux flow note --session-id {session_id} \
-             --text \"<verdict · what you overrode · why>\" --source orchestrator",
+            "  record your adjudication (audit trail):  darkmux flow note \
+             --session-id {session_id} \
+             --text \"<verdict · what you overrode · why>\" --source adjudication",
         ))
     );
     emit_run_record(
@@ -652,10 +655,12 @@ fn git_in(dir: &Path, args: &[&str]) -> Result<std::process::Output> {
 
 /// Commit subject for a shipped sprint: the sprint description's first line,
 /// trimmed to a conventional ~72-char subject.
-/// (#817) Does the run's flow trail carry an orchestrator adjudication note?
-/// Scans the TWO lexicographically-newest day files (UTC-rollover safe, same
-/// pattern as the /diff endpoint's resolution) for `action=note`,
-/// `source=orchestrator`, matching session id. Best-effort: any IO/parse
+/// (#817) Does the run's flow trail carry an adjudication note? Scans the
+/// TWO lexicographically-newest day files (UTC-rollover safe, same pattern
+/// as the /diff endpoint's resolution) for `action=note` matching the
+/// session id, with source `adjudication` (the audit-trail channel) OR
+/// `orchestrator` (the dashboard channel — accepted so a session-scoped
+/// dashboard note also satisfies the nudge). Best-effort: any IO/parse
 /// problem reads as "no note" — this only feeds a soft nudge, never a gate.
 fn session_has_orchestrator_note(session_id: &str) -> bool {
     let flows_dir = darkmux_types::config_access::flows_dir();
@@ -671,8 +676,9 @@ fn session_has_orchestrator_note(session_id: &str) -> bool {
         let Ok(raw) = std::fs::read_to_string(day) else { continue };
         for line in raw.lines() {
             let Ok(r) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            let src = r.get("source").and_then(|v| v.as_str());
             if r.get("action").and_then(|v| v.as_str()) == Some("note")
-                && r.get("source").and_then(|v| v.as_str()) == Some("orchestrator")
+                && (src == Some("adjudication") || src == Some("orchestrator"))
                 && r.get("session_id").and_then(|v| v.as_str()) == Some(session_id)
             {
                 return true;
@@ -696,7 +702,7 @@ fn nudge_missing_adjudication_note(session_id: &str) {
         style::dim(&format!(
             "  no adjudication note in this run's trail — capture it:  darkmux flow note \
              --session-id {session_id} --text \"<verdict · what you overrode · why>\" \
-             --source orchestrator",
+             --source adjudication",
         ))
     );
 }
@@ -1048,10 +1054,20 @@ pub fn ship(
         }
         println!("\n{}", style::success("✓ sprint shipped + merged. Loop closed."));
         // (#807/#817) The arc just concluded — soft-nudge if the run's trail
-        // has no adjudication note (session-id pre-filled scaffold). Tool
-        // output is the hint channel every frontier harness reads at the
-        // moment of action. Prints, never blocks.
+        // has no adjudication note (session-id pre-filled scaffold), then cue
+        // the DASHBOARD note: the operator-facing card line. The placeholder
+        // is the style brief — positive, plain-language, easy to digest
+        // (operator-specified voice; this is encouragement infrastructure,
+        // not a changelog).
         nudge_missing_adjudication_note(&session_id);
+        println!(
+            "{}",
+            style::dim(
+                "  then a line for the operator's dashboard:  darkmux flow note \
+                 --text \"<1-2 upbeat plain-language lines: what the crew got done + \
+                 keep-going energy. no jargon, no file paths>\" --source orchestrator",
+            )
+        );
         return Ok(0);
     }
 
@@ -1131,6 +1147,7 @@ mod tests {
             concat!(
                 r#"{"ts":"2026-06-12T10:00:00Z","action":"note","source":"orchestrator","session_id":"mission-run-m1-s1","handle":"adjudicated"}"#, "\n",
                 r#"{"ts":"2026-06-12T10:01:00Z","action":"note","source":"operator","session_id":"mission-run-m1-s2","handle":"not orchestrator"}"#, "\n",
+                r#"{"ts":"2026-06-12T10:02:00Z","action":"note","source":"adjudication","session_id":"mission-run-m1-s3","handle":"audit-trail channel"}"#, "\n",
             ),
         )
         .unwrap();
@@ -1141,6 +1158,7 @@ mod tests {
         let hit = session_has_orchestrator_note("mission-run-m1-s1");
         let wrong_session = session_has_orchestrator_note("mission-run-m1-sX");
         let wrong_source = session_has_orchestrator_note("mission-run-m1-s2");
+        let adjudication_tag = session_has_orchestrator_note("mission-run-m1-s3");
 
         unsafe {
             match prev {
@@ -1150,7 +1168,8 @@ mod tests {
         }
         assert!(hit, "session-scoped orchestrator note must be found");
         assert!(!wrong_session, "other sessions' notes must not match");
-        assert!(!wrong_source, "non-orchestrator notes must not match");
+        assert!(!wrong_source, "non-adjudication/orchestrator notes must not match");
+        assert!(adjudication_tag, "the adjudication audit-trail tag must satisfy the scan");
     }
 
     fn sprint(id: &str, mission: &str, deps: &[&str], status: SprintStatus) -> Sprint {
