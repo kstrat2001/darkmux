@@ -96,16 +96,21 @@ pub fn wait_for_completion(
             ));
         }
 
-        // XRANGE darkmux:flow - + COUNT 10000 — full-scan each poll. The
-        // stream is bounded (MAXLEN ~ 10000) so the scan is bounded too.
-        let raw: redis::Value = redis::cmd("XRANGE")
+        // (#809) XREVRANGE (newest-first) — the completion record we're
+        // waiting for is by definition RECENT. The old oldest-first XRANGE
+        // dropped the newest entries once the stream rode at its `MAXLEN ~`
+        // cap (XLEN floats above the cap; trimming is lazy), so a saturated
+        // stream made this wait MISS the completion entirely and time out.
+        // Scan order doesn't matter for a find; newest-first also returns
+        // the match in the first entries scanned.
+        let raw: redis::Value = redis::cmd("XREVRANGE")
             .arg(&stream)
-            .arg("-")
             .arg("+")
+            .arg("-")
             .arg("COUNT")
             .arg(WAIT_XRANGE_COUNT)
             .query(&mut conn)
-            .with_context(|| format!("XRANGE on flow stream {stream}"))?;
+            .with_context(|| format!("XREVRANGE on flow stream {stream}"))?;
 
         if let Some(result) = scan_flow_entries_for_completion(&raw, session_id)? {
             return Ok(result);

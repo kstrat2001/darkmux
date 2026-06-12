@@ -1350,8 +1350,10 @@ fn scan_flow_days(flows_dir: &std::path::Path) -> Vec<serde_json::Value> {
 /// Aggregate the day's flow records — Redis-when-available, file-otherwise.
 ///
 /// Resolution order:
-/// 1. `DARKMUX_REDIS_URL` set + reachable → `XRANGE darkmux:flow - + COUNT N`,
-///    parse each entry's `record` field, filter by `record.ts.starts_with(date)`.
+/// 1. `DARKMUX_REDIS_URL` set + reachable → `XREVRANGE darkmux:flow + - COUNT N`
+///    (newest-first — #809: cap-saturation must cut the oldest entries, never
+///    the newest), parse each entry's `record` field, filter by
+///    `record.ts.starts_with(date)`, reverse back to chronological.
 ///    `darkmux:flow` stream override honored via `DARKMUX_REDIS_STREAM`.
 /// 2. Redis configured but unreachable → log the fallback once and read
 ///    the local file. Daemon stays serving rather than 500-ing.
@@ -1416,16 +1418,23 @@ fn read_flow_records_from_redis(
         .ok()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "darkmux:flow".to_string());
-    // Bounded by DARKMUX_REDIS_MAXLEN at write time (default 10k) — same
-    // count as wait_for_completion's XRANGE in fleet.rs:1332.
-    let raw: redis::Value = redis::cmd("XRANGE")
+    // (#809) NEWEST-first read. The stream rides at its `MAXLEN ~` cap once
+    // the fleet has been busy long enough (XLEN floats a little above the
+    // cap — trimming is lazy), and an oldest-first `XRANGE - + COUNT N`
+    // then silently DROPS the newest entries — the live view loses exactly
+    // the most recent records at exactly the busiest moment (found live:
+    // the operator's orchestrator note "not showing"). XREVRANGE makes
+    // cap-saturation cut the OLDEST entries instead, which the date filter
+    // below mostly discards anyway. Entries are reversed after parsing so
+    // callers still see chronological order.
+    let raw: redis::Value = redis::cmd("XREVRANGE")
         .arg(&stream)
-        .arg("-")
         .arg("+")
+        .arg("-")
         .arg("COUNT")
         .arg(10000)
         .query(&mut conn)
-        .with_context(|| format!("XRANGE on {stream}"))?;
+        .with_context(|| format!("XREVRANGE on {stream}"))?;
     let entries = match raw {
         redis::Value::Array(v) => v,
         other => {
@@ -1454,6 +1463,9 @@ fn read_flow_records_from_redis(
         };
         records.push(parsed);
     }
+    // XREVRANGE yields newest-first; restore chronological order so the
+    // response matches the local-file path's ordering (#809).
+    records.reverse();
     Ok(records)
 }
 
