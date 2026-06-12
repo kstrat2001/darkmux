@@ -106,6 +106,45 @@ fn branch_name(sprint_id: &str) -> String {
     format!("darkmux/{sprint_id}")
 }
 
+/// (#816) Conventions-aware branch name: the repo's `branch_template`
+/// (expanded + validated as a safe git ref) when present, else the
+/// darkmux default. ALL THREE verbs (run / abort / ship) must resolve the
+/// branch through this one fn so they always agree on the name. A
+/// template that can't expand (ticketless mission) or expands to an
+/// invalid ref falls back loudly-but-softly to the default.
+fn conventions_branch(
+    sprint: &crew::types::Sprint,
+    mission: &crew::types::Mission,
+    conv: Option<&crate::conventions::Conventions>,
+) -> String {
+    let default = branch_name(&sprint.id);
+    let Some(template) = conv.and_then(|c| c.branch_template.as_deref()) else {
+        return default;
+    };
+    let vars = crate::conventions::Vars {
+        ticket: mission.ticket.as_deref(),
+        sprint: &sprint.id,
+        mission: &mission.id,
+        subject: "",
+    };
+    match crate::conventions::expand(template, &vars) {
+        Some(b) if crate::conventions::valid_branch(&b) => b,
+        Some(b) => {
+            eprintln!(
+                "darkmux: warning — conventions branch_template expanded to an invalid                  git ref ({b:?}); using `{default}`"
+            );
+            default
+        }
+        None => {
+            eprintln!(
+                "darkmux: warning — conventions branch_template references {{ticket}} but                  mission `{}` has no ticket (set one: `mission propose --ticket <ID>`);                  using `{default}`",
+                mission.id
+            );
+            default
+        }
+    }
+}
+
 /// Choose which sprint to run. Explicit `--sprint` wins (validated to belong
 /// to the mission and not be terminal). Otherwise auto-select the single
 /// ready sprint (`depends_on` empty + `Planned`); 0 or >1 is ambiguous and
@@ -259,7 +298,8 @@ pub fn run(
     // 3. Set up the isolated worktree.
     let root = repo_root()?;
     let wt_path = worktree_path(&root, &sprint.id);
-    let branch = branch_name(&sprint.id);
+    let conv = crate::conventions::load(&root);
+    let branch = conventions_branch(&sprint, mission, conv.as_ref());
 
     println!(
         "{}",
@@ -538,9 +578,10 @@ pub fn abort(mission_id: &str, sprint_id: Option<&str>) -> Result<i32> {
     }
 
     let missions = load_missions()?;
-    if !missions.iter().any(|m| m.id == mission_id) {
-        bail!("mission `{mission_id}` not found");
-    }
+    let mission = missions
+        .iter()
+        .find(|m| m.id == mission_id)
+        .ok_or_else(|| anyhow::anyhow!("mission `{mission_id}` not found"))?;
     let sprints = load_sprints()?;
     // Explicit `--sprint` resolves by id (any status — a Running sprint, the
     // common abort case after a `run`, resolves); auto-path requires a ready
@@ -549,7 +590,8 @@ pub fn abort(mission_id: &str, sprint_id: Option<&str>) -> Result<i32> {
 
     let root = repo_root()?;
     let wt_path = worktree_path(&root, &sprint.id);
-    let branch = branch_name(&sprint.id);
+    let conv = crate::conventions::load(&root);
+    let branch = conventions_branch(&sprint, mission, conv.as_ref());
 
     println!(
         "{}",
@@ -743,11 +785,6 @@ fn commit_subject(sprint: &crew::types::Sprint) -> String {
     }
 }
 
-/// PR title for a shipped sprint.
-fn pr_title(sprint: &crew::types::Sprint) -> String {
-    commit_subject(sprint)
-}
-
 /// PR body — sprint + mission provenance. Authored by the LOCAL coder via
 /// `mission run`; the body says so (no frontier/Claude co-author claim — this
 /// is local-AI work shipped through darkmux's loop).
@@ -765,6 +802,64 @@ fn pr_body(mission: &crew::types::Mission, sprint: &crew::types::Sprint) -> Stri
         mission_desc = mission.description.lines().next().unwrap_or("").trim(),
         sprint_id = sprint.id,
     )
+}
+
+/// (#816) Apply a conventions template to the default-computed subject.
+/// `what` names the item in the fallback warning. Falls back to the
+/// default subject when there's no template, the template needs a ticket
+/// the mission doesn't have, or it expands empty.
+fn conventioned(
+    template: Option<&str>,
+    sprint: &crew::types::Sprint,
+    mission: &crew::types::Mission,
+    what: &str,
+) -> String {
+    let default = commit_subject(sprint);
+    let Some(t) = template else { return default };
+    let vars = crate::conventions::Vars {
+        ticket: mission.ticket.as_deref(),
+        sprint: &sprint.id,
+        mission: &mission.id,
+        subject: &default,
+    };
+    match crate::conventions::expand(t, &vars) {
+        Some(out) if !out.trim().is_empty() => out,
+        _ => {
+            eprintln!(
+                "darkmux: warning — conventions {what} template couldn't expand for                  mission `{}` (missing ticket or empty result); using the default",
+                mission.id
+            );
+            default
+        }
+    }
+}
+
+/// (#816) PR body honoring the repo's `pr_body_template` (repo-relative
+/// path): the file's content with `{summary}` replaced by the generated
+/// darkmux summary, or the summary appended when the placeholder is
+/// absent. Missing/unreadable template file warns + falls back.
+fn conventioned_pr_body(
+    mission: &crew::types::Mission,
+    sprint: &crew::types::Sprint,
+    conv: Option<&crate::conventions::Conventions>,
+    repo_root: &Path,
+) -> String {
+    let summary = pr_body(mission, sprint);
+    let Some(rel) = conv.and_then(|c| c.pr_body_template.as_deref()) else {
+        return summary;
+    };
+    let path = repo_root.join(rel);
+    match std::fs::read_to_string(&path) {
+        Ok(tpl) if tpl.contains("{summary}") => tpl.replace("{summary}", &summary),
+        Ok(tpl) => format!("{tpl}\n\n{summary}"),
+        Err(e) => {
+            eprintln!(
+                "darkmux: warning — conventions pr_body_template {} unreadable ({e});                  using the generated body",
+                path.display()
+            );
+            summary
+        }
+    }
 }
 
 /// `gh pr view <branch> --json url -q .url` — returns the existing PR URL for
@@ -871,7 +966,8 @@ pub fn ship(
 
     let root = repo_root()?;
     let wt_path = worktree_path(&root, &sprint.id);
-    let branch = branch_name(&sprint.id);
+    let conv = crate::conventions::load(&root);
+    let branch = conventions_branch(&sprint, &mission, conv.as_ref());
     let session_id = format!("mission-run-{}-{}", mission_id, sprint.id);
 
     if !wt_path.exists() {
@@ -907,7 +1003,10 @@ pub fn ship(
         );
     }
     if !nothing_staged {
-        let subject = commit_subject(&sprint);
+        let subject = conventioned(
+        conv.as_ref().and_then(|c| c.commit_subject_template.as_deref()),
+        &sprint, &mission, "commit subject",
+    );
         let msg = format!(
             "{subject}\n\nAuthored via `darkmux mission run` (local-AI coder, sprint {}).",
             sprint.id
@@ -941,14 +1040,28 @@ pub fn ship(
             url
         }
         None => {
-            let title = pr_title(&sprint);
-            let body = pr_body(&mission, &sprint);
+            let title = conventioned(
+                conv.as_ref().and_then(|c| c.pr_title_template.as_deref()),
+                &sprint, &mission, "PR title",
+            );
+            let body = conventioned_pr_body(&mission, &sprint, conv.as_ref(), &root);
+            let mut args: Vec<&str> = vec![
+                "pr", "create", "--base", base, "--head", &branch, "--title", &title,
+                "--body", &body,
+            ];
+            // (#816) Repo-declared labels — each must exist in the repo
+            // (gh errors otherwise; surfaced verbatim below).
+            let labels: Vec<&str> = conv
+                .as_ref()
+                .map(|c| c.pr_labels.iter().map(String::as_str).collect())
+                .unwrap_or_default();
+            for l in &labels {
+                args.push("--label");
+                args.push(l);
+            }
             let out = Command::new("gh")
                 .current_dir(&wt_path)
-                .args([
-                    "pr", "create", "--base", base, "--head", &branch, "--title", &title,
-                    "--body", &body,
-                ])
+                .args(&args)
                 .output()
                 .context("running `gh pr create` — is `gh` on PATH?")?;
             if !out.status.success() {
@@ -1155,6 +1268,28 @@ mod tests {
     use super::*;
     use crew::types::{Sprint, SprintStatus};
 
+    /// (#816) conventions_branch: template + ticket → conventioned ref;
+    /// ticketless mission or invalid expansion → darkmux default (soft
+    /// fallback, never an error).
+    #[test]
+    fn conventions_branch_expands_and_falls_back() {
+        let s = sprint("s1-fix", "m1", &[], SprintStatus::Planned);
+        let mut m = mission("m1", "desc");
+        let conv: crate::conventions::Conventions =
+            serde_json::from_str(r#"{"branch_template":"{ticket}/{sprint}"}"#).unwrap();
+        // ticketless → default
+        assert_eq!(conventions_branch(&s, &m, Some(&conv)), "darkmux/s1-fix");
+        // ticketed → conventioned
+        m.ticket = Some("SYS-2598".into());
+        assert_eq!(conventions_branch(&s, &m, Some(&conv)), "SYS-2598/s1-fix");
+        // no conventions at all → default
+        assert_eq!(conventions_branch(&s, &m, None), "darkmux/s1-fix");
+        // template expanding to an invalid ref → default
+        let bad: crate::conventions::Conventions =
+            serde_json::from_str(r#"{"branch_template":"-{sprint}"}"#).unwrap();
+        assert_eq!(conventions_branch(&s, &m, Some(&bad)), "darkmux/s1-fix");
+    }
+
     /// (#815) With a mission-level source_input, the coder brief carries the
     /// compiled description AND the verbatim operator prose under the
     /// provenance-tagged block; without one (hand-authored / pre-#815
@@ -1310,6 +1445,7 @@ mod tests {
             closed_ts: None,
             paused_ts: None,
             source_input: None,
+            ticket: None,
         }
     }
 
