@@ -215,6 +215,14 @@
   #meta .metahint{color:var(--muted);font:11px 'JetBrains Mono',monospace}
   /* (#803) hybrid note — the encouraging line inside the savings card */
   .hybnote{margin-top:9px;padding-top:8px;border-top:1px solid var(--line);font:12px 'JetBrains Mono',monospace;color:var(--good)}
+  /* (#807) real orchestrator notes: timestamp + history link on the note line,
+     and the notes-history modal (wider than filters; notes are prose). */
+  .hybts{color:var(--muted);font-size:10px}
+  .hyblink{color:var(--amber);cursor:pointer;font-size:11px;margin-left:4px}.hyblink:hover{text-decoration:underline}
+  .nmodal{width:540px;max-width:92vw;max-height:72vh;overflow:auto}
+  .nrow{border-bottom:1px solid var(--line);padding:9px 0}.nrow:last-child{border-bottom:none}
+  .nts{font:10px 'JetBrains Mono',monospace;color:var(--amber-dim)}
+  .ntext{font:12px/1.5 'JetBrains Mono',monospace;color:var(--text);margin-top:3px;white-space:pre-wrap}
   /* (#756) live diff panel — watch the code form during a mission-run dispatch */
   .fchips{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 8px}
   .fchip{font:10px/1.7 'JetBrains Mono',monospace;background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:1px 7px;color:var(--text)}
@@ -418,6 +426,12 @@
     <div class="mhd"><span>filter events</span><button class="mx" data-act="closefilters">✕</button></div>
     <div id="filterbody"></div>
     <div class="mft"><input id="fsearch" placeholder="search text…"><button class="clr" data-act="clearfilters">clear all</button></div>
+  </div>
+</div>
+<div class="modalbg" id="nmodalbg">
+  <div class="modal nmodal">
+    <div class="mhd"><span>orchestrator notes</span><button class="mx" data-act="closenotes">✕</button></div>
+    <div id="notesbody"></div>
   </div>
 </div>
 
@@ -726,16 +740,37 @@ const fmtC=n=>n>=1e6?(n/1e6).toFixed(n>=1e7?0:1)+"M":n>=1000?Math.round(n/1000)+
 // one, the day's off-meter work when there isn't, and an invitation at
 // zero. Deterministic templates only (no generation); record-derived text
 // passes esc() at the template edge.
+// (#807) The REAL orchestrator-note channel: a frontier session concludes a
+// run by emitting `darkmux flow note --text "..." --source orchestrator` —
+// no dedicated verb, just the existing note action with the source tag. The
+// latest tagged note at/under the playhead OVERRIDES the procedural template
+// below; the templates remain the fallback for windows with no note. Note
+// text is operator/orchestrator-authored free text → esc() at the edge.
+const orchNotes=()=>DATA.filter(r=>r.action==="note"&&r.source==="orchestrator"&&T(r.ts)<=state.t)
+                        .sort((a,b)=>T(a.ts)-T(b.ts));
 function hybridNote(t){
-  const mr=DATA.filter(r=>r.action&&r.action.indexOf("mission.run")===0&&r.mission_id&&T(r.ts)<=state.t)
-               .sort((a,b)=>T(a.ts)-T(b.ts)).pop();
+  const notes=orchNotes();
+  const hist=notes.length?` <a class="hyblink" data-act="notes">history →</a>`:'';
   // "Orchestrator note:" prefix (operator-chosen wording) — the note is the
   // card's CONCLUSION; nothing renders below it.
   const pre=`<b class="hybpre">Orchestrator note:</b> `;
-  if(mr)return `<div class="hybnote">${pre}${esc(mr.mission_id)} ran through the local loop — the fleet lifted, the frontier judged. that's hybrid. keep going.</div>`;
-  if(t.runs)return `<div class="hybnote">${pre}${t.runs} dispatch${t.runs===1?'':'es'} off the meter — the hybrid loop is humming. keep it up.</div>`;
-  return `<div class="hybnote">${pre}going hybrid takes nerve. the fleet is ready when you are.</div>`;
+  const last=notes[notes.length-1];
+  if(last)return `<div class="hybnote">${pre}${esc(last.handle)} <span class="hybts">· ${clk(T(last.ts))}</span>${hist}</div>`;
+  const mr=DATA.filter(r=>r.action&&r.action.indexOf("mission.run")===0&&r.mission_id&&T(r.ts)<=state.t)
+               .sort((a,b)=>T(a.ts)-T(b.ts)).pop();
+  if(mr)return `<div class="hybnote">${pre}${esc(mr.mission_id)} ran through the local loop — the fleet lifted, the frontier judged. that's hybrid. keep going.${hist}</div>`;
+  if(t.runs)return `<div class="hybnote">${pre}${t.runs} dispatch${t.runs===1?'':'es'} off the meter — the hybrid loop is humming. keep it up.${hist}</div>`;
+  return `<div class="hybnote">${pre}going hybrid takes nerve. the fleet is ready when you are.${hist}</div>`;
 }
+// (#807) Notes-history modal — every orchestrator note in the current window
+// (live: the rolling window; playback: the dataset), newest first.
+function openNotes(){
+  const rows=orchNotes().slice().reverse().map(n=>
+    `<div class="nrow"><div class="nts">${clk(T(n.ts))} · ${relAgo(T(n.ts))}</div><div class="ntext">${esc(n.handle)}</div></div>`
+  ).join("")||'<div class="none">no orchestrator notes in this window</div>';
+  $("notesbody").innerHTML=rows;$("nmodalbg").style.display="flex";
+}
+function closeNotes(){$("nmodalbg").style.display="none";}
 function savingsHero(){
   const t=tokensOffMeter();
   // Always render — even at zero (playback start, or a fresh fleet with no
@@ -1371,6 +1406,7 @@ $("logq").oninput=e=>setQuery(e.target.value);
 // the input so the operator can keep typing a fresh filter.
 $("sclear").onclick=()=>{setQuery("");const lq=$("logq");if(lq)lq.focus();};
 $("modalbg").onclick=e=>{if(e.target===$("modalbg"))closeFilters();};
+$("nmodalbg").onclick=e=>{if(e.target===$("nmodalbg"))closeNotes();};
 // ── Delegated event handling (viewer output-encoding hardening) ────────────
 // Rendered templates carry NO inline event-handler attributes: record-derived
 // values ride in data-* attributes and come back as plain strings via
@@ -1390,6 +1426,8 @@ const ACTIONS={
   filters:()=>openFilters(),
   closefilters:()=>closeFilters(),
   clearfilters:()=>clearFilters(),
+  notes:()=>openNotes(),
+  closenotes:()=>closeNotes(),
   catalog:()=>toggleCatalog(),
   goday:d=>{ location.href="/play/"+encodeURIComponent(d); },
   golive:()=>{ location.href="/"; },
