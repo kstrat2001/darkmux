@@ -227,13 +227,21 @@
   .dl.fhd{color:var(--text);font-weight:700;margin-top:10px}
   .dl.mt{color:var(--muted)}
   /* (#783) savings hero — tokens kept off the meter. The "bang-up" on the fleet view. */
-  /* max-width so the hero reads as a deliberate stat card aligned with the
-     machine cards below, not a full-width bordered bar with a void to the
-     right on wide displays. */
-  .savings{margin:0 0 18px;padding:16px 20px;border:1px solid var(--line);border-radius:10px;background:linear-gradient(180deg,rgba(74,222,128,.06),rgba(74,222,128,.01));max-width:560px}
-  .savnum{font:700 42px/1 'JetBrains Mono',monospace;color:#4ade80;letter-spacing:.01em}
+  /* (#803 layout) Horizontal hero: the big number leads on the left, the
+     token-class stat blocks fill the width to its right (the breakdown now
+     earns the space the old 560px cap was guarding), the hybrid note + hint
+     span below. Wraps gracefully as the viewport narrows; ~980px cap keeps
+     it a deliberate card on ultra-wide rather than a stretched bar. */
+  .savings{margin:0 0 18px;padding:16px 22px;border:1px solid var(--line);border-radius:10px;background:linear-gradient(180deg,rgba(74,222,128,.06),rgba(74,222,128,.01));max-width:980px}
+  .savrow{display:flex;align-items:center;gap:14px 40px;flex-wrap:wrap}
+  .savlead{flex:0 0 auto}
+  .savnum{font:700 48px/1 'JetBrains Mono',monospace;color:#4ade80;letter-spacing:.01em}
   .savlbl{font:600 12px/1 'JetBrains Mono',monospace;color:var(--text);margin-top:7px;text-transform:uppercase;letter-spacing:.12em}
-  .savbreak{font:12px Inter,sans-serif;color:var(--muted);margin-top:7px}
+  .savclasses{display:flex;gap:10px 30px;flex-wrap:wrap;align-items:center;flex:1 1 auto}
+  .savc .scv{font:600 23px/1.1 'JetBrains Mono',monospace;color:var(--text)}
+  .savc.gen .scv{color:var(--good)}
+  .savc.uncls .scv{color:var(--muted)}
+  .savc .scl{font:10px/1.5 'JetBrains Mono',monospace;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin-top:3px}
   .savhint{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin-top:9px;opacity:.7}
   .mgoal{font-size:13px;color:var(--text);margin:8px 0 16px;max-width:680px;line-height:1.5}
   .burn{margin-bottom:18px}.burnbar{height:6px;background:var(--line);border-radius:3px;overflow:hidden;max-width:420px}.burnbar span{display:block;height:100%;background:var(--good)}
@@ -302,7 +310,11 @@
     .savings { max-width: none; padding: 13px 15px; margin-bottom: 14px; }
     .savnum { font-size: 30px; }
     .savlbl { margin-top: 5px; }
-    .savbreak { margin-top: 5px; }
+    /* (#803 layout) Stat blocks compress on phones: smaller values, tighter
+       gaps; the flex wrap stacks them under the headline number naturally. */
+    .savrow { gap: 10px 18px; }
+    .savclasses { gap: 8px 16px; }
+    .savc .scv { font-size: 15px; }
     .savhint { margin-top: 6px; }
     /* (#803) Recent-runs rows wrap to multiple lines on phones so the per-run
        crits (turns · tools · tokens · compactions) stay visible instead of
@@ -736,10 +748,21 @@ function savingsHero(){
   // 5× input and cached input ≈ 0.1× input) but supplies no rate and makes
   // no $ claim; the operator prices each class themselves.
   const win=document.body.classList.contains('live-mode')?` · last ${Math.round(LIVE_WINDOW_MS/3600000)}h`:'';
+  const sc=(v,l,cls)=>`<div class="savc${cls?' '+cls:''}"><div class="scv">${v}</div><div class="scl">${l}</div></div>`;
   return `<div class="savings">
-    <div class="savnum">${fmtN(t.total)}</div>
-    <div class="savlbl">tokens off the meter${win}</div>
-    <div class="savbreak">${fmtC(t.completion)} generated · ${fmtC(t.fresh)} fresh input · ${fmtC(t.reread)} re-read input${t.uncls?` · ${fmtC(t.uncls)} unclassified`:''} · ${t.runs} dispatch${t.runs===1?'':'es'} run locally</div>
+    <div class="savrow">
+      <div class="savlead">
+        <div class="savnum">${fmtN(t.total)}</div>
+        <div class="savlbl">tokens off the meter${win}</div>
+      </div>
+      <div class="savclasses">
+        ${sc(fmtC(t.completion),'generated','gen')}
+        ${sc(fmtC(t.fresh),'fresh input','')}
+        ${sc(fmtC(t.reread),'re-read input','')}
+        ${t.uncls?sc(fmtC(t.uncls),'unclassified','uncls'):''}
+        ${sc(t.runs,`dispatch${t.runs===1?'':'es'} run locally`,'')}
+      </div>
+    </div>
     ${hybridNote(t)}
     <div class="savhint">price each class at your provider's rates (input / cached input / output) = your savings</div>
   </div>`;
