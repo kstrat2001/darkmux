@@ -491,15 +491,18 @@ pub fn run(
             sprint.id
         ))
     );
-    // (#807) Cue the frontier orchestrator at the decision moment — tool
-    // output is the one hint channel every harness reads. The note follows
-    // the MERGE (the arc's conclusion), so the gate print sequences it.
+    // (#807/#817) Cue the frontier orchestrator at the decision moment —
+    // tool output is the one hint channel every harness reads. The gate is
+    // where the adjudication happens (QA findings accepted/overridden, and
+    // why), so the scaffold is READY-TO-PASTE with the session id pre-filled
+    // (the fiddly part) so the reasoning lands in the run's own record
+    // trail instead of evaporating into the PR body.
     println!(
         "{}",
-        style::dim(
-            "  after the merge, conclude on the dashboard:  darkmux flow note \
-             --text \"<what ran · where the tokens stayed · your call>\" --source orchestrator",
-        )
+        style::dim(&format!(
+            "  record your adjudication:  darkmux flow note --session-id {session_id} \
+             --text \"<verdict · what you overrode · why>\" --source orchestrator",
+        ))
     );
     emit_run_record(
         flow::Level::Info,
@@ -649,6 +652,55 @@ fn git_in(dir: &Path, args: &[&str]) -> Result<std::process::Output> {
 
 /// Commit subject for a shipped sprint: the sprint description's first line,
 /// trimmed to a conventional ~72-char subject.
+/// (#817) Does the run's flow trail carry an orchestrator adjudication note?
+/// Scans the TWO lexicographically-newest day files (UTC-rollover safe, same
+/// pattern as the /diff endpoint's resolution) for `action=note`,
+/// `source=orchestrator`, matching session id. Best-effort: any IO/parse
+/// problem reads as "no note" — this only feeds a soft nudge, never a gate.
+fn session_has_orchestrator_note(session_id: &str) -> bool {
+    let flows_dir = darkmux_types::config_access::flows_dir();
+    let Ok(entries) = std::fs::read_dir(&flows_dir) else {
+        return false;
+    };
+    let mut days: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
+        .collect();
+    days.sort();
+    for day in days.iter().rev().take(2) {
+        let Ok(raw) = std::fs::read_to_string(day) else { continue };
+        for line in raw.lines() {
+            let Ok(r) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            if r.get("action").and_then(|v| v.as_str()) == Some("note")
+                && r.get("source").and_then(|v| v.as_str()) == Some("orchestrator")
+                && r.get("session_id").and_then(|v| v.as_str()) == Some(session_id)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// (#817) Soft nudge printed at ship time when a gated sprint is shipping
+/// with zero adjudication notes in its trail — the gate is where judgment
+/// calls happen, and without a note darkmux's own record of the mission has
+/// a hole where the reasoning should be. Prints, never blocks (nudges, not
+/// gates — operator sovereignty).
+fn nudge_missing_adjudication_note(session_id: &str) {
+    if session_has_orchestrator_note(session_id) {
+        return;
+    }
+    println!(
+        "{}",
+        style::dim(&format!(
+            "  no adjudication note in this run's trail — capture it:  darkmux flow note \
+             --session-id {session_id} --text \"<verdict · what you overrode · why>\" \
+             --source orchestrator",
+        ))
+    );
+}
+
 fn commit_subject(sprint: &crew::types::Sprint) -> String {
     let first = sprint.description.lines().next().unwrap_or("").trim();
     let s = if first.is_empty() {
@@ -995,16 +1047,11 @@ pub fn ship(
             return Ok(2);
         }
         println!("\n{}", style::success("✓ sprint shipped + merged. Loop closed."));
-        // (#807) The arc just concluded — cue the orchestrator note HERE,
-        // where the conclusion is freshest. Tool output is the hint channel
-        // every frontier harness reads at the moment of action.
-        println!(
-            "{}",
-            style::dim(
-                "  next: leave the orchestrator note →  darkmux flow note \
-                 --text \"<what ran · where the tokens stayed · your call>\" --source orchestrator",
-            )
-        );
+        // (#807/#817) The arc just concluded — soft-nudge if the run's trail
+        // has no adjudication note (session-id pre-filled scaffold). Tool
+        // output is the hint channel every frontier harness reads at the
+        // moment of action. Prints, never blocks.
+        nudge_missing_adjudication_note(&session_id);
         return Ok(0);
     }
 
@@ -1021,6 +1068,9 @@ pub fn ship(
             sprint.id
         ))
     );
+    // (#817) Stop-at-PR exit gets the same soft nudge as the merge exit —
+    // the adjudication happened at the gate either way.
+    nudge_missing_adjudication_note(&session_id);
     Ok(0)
 }
 
@@ -1067,6 +1117,41 @@ fn print_review_summary(review: &crate::sprint_cli::SprintReviewOutput) {
 mod tests {
     use super::*;
     use crew::types::{Sprint, SprintStatus};
+
+    /// (#817) The note-trail scan finds a session-scoped orchestrator note in
+    /// the newest day files, and reads "no note" for other sessions, other
+    /// sources, and a missing dir. `#[serial_test::serial]` — mutates the
+    /// shared DARKMUX_FLOWS_DIR env (config_access reads it live per-access).
+    #[test]
+    #[serial_test::serial]
+    fn session_note_scan_matches_session_and_source() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("2026-06-12.jsonl"),
+            concat!(
+                r#"{"ts":"2026-06-12T10:00:00Z","action":"note","source":"orchestrator","session_id":"mission-run-m1-s1","handle":"adjudicated"}"#, "\n",
+                r#"{"ts":"2026-06-12T10:01:00Z","action":"note","source":"operator","session_id":"mission-run-m1-s2","handle":"not orchestrator"}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        // SAFETY: serialized via #[serial]; restored below.
+        unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path()) };
+
+        let hit = session_has_orchestrator_note("mission-run-m1-s1");
+        let wrong_session = session_has_orchestrator_note("mission-run-m1-sX");
+        let wrong_source = session_has_orchestrator_note("mission-run-m1-s2");
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+        assert!(hit, "session-scoped orchestrator note must be found");
+        assert!(!wrong_session, "other sessions' notes must not match");
+        assert!(!wrong_source, "non-orchestrator notes must not match");
+    }
 
     fn sprint(id: &str, mission: &str, deps: &[&str], status: SprintStatus) -> Sprint {
         Sprint {
