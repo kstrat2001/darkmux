@@ -641,22 +641,27 @@ function machPresent(m){
   return edges[edges.length-1].action==="machine.online";
 }
 // (#783) Tokens kept off the (frontier) meter — the savings hero. Sums ONLY
-// `telemetry.tokens` records (category=telemetry, source=tokens), the canonical
-// per-dispatch token event from the local runtime (#785). dispatch.complete
-// ALSO carries the totals in its payload; summing both would double-count — so
-// we sum the telemetry family exclusively. Playhead-aware (ts<=state.t) so the
-// odometer accumulates as playback scrubs; in live follow state.t=tMax → the
-// whole window. TOKENS ONLY — never a currency figure (the operator multiplies
-// by their own per-token rate; darkmux supplies no rate and makes no $ claim).
+// `telemetry.tokens` records (category=telemetry, source=tokens). Since #795
+// the runtime tailer emits one record PER TURN (so the odometer climbs DURING
+// a dispatch); pre-#795 records were one per-dispatch aggregate — both shapes
+// sum identically, so mixed-era data stays correct. dispatch.complete ALSO
+// carries the totals in its payload; summing both would double-count — so we
+// sum the telemetry family exclusively. `runs` counts DISTINCT sessions (not
+// records — per-turn emission means many records per dispatch). Playhead-aware
+// (ts<=state.t) so the odometer accumulates as playback scrubs; in live follow
+// state.t=tMax → the whole window. TOKENS ONLY — never a currency figure (the
+// operator multiplies by their own per-token rate; darkmux supplies no rate
+// and makes no $ claim).
 function tokensOffMeter(){
-  let total=0,prompt=0,completion=0,runs=0;
+  let total=0,prompt=0,completion=0;const sess=new Set();
   for(const r of DATA){
     if(r.category==="telemetry"&&r.source==="tokens"&&T(r.ts)<=state.t){
       const p=r.payload||{};
-      total+=p.total_tokens||0; prompt+=p.prompt_tokens||0; completion+=p.completion_tokens||0; runs++;
+      total+=p.total_tokens||0; prompt+=p.prompt_tokens||0; completion+=p.completion_tokens||0;
+      sess.add(r.session_id||r.ts);
     }
   }
-  return {total,prompt,completion,runs};
+  return {total,prompt,completion,runs:sess.size};
 }
 // Thousands-separated integer (locale-free, deterministic for tests).
 const fmtN=n=>Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g,',');

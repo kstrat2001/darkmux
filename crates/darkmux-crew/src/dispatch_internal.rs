@@ -1095,29 +1095,13 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         serde_json::json!({ "turns": trajectory_summary.turns }),
     ));
 
-    // (#782) Per-dispatch token telemetry — the spine the live "tokens
-    // off-meter" savings view aggregates. A telemetry sibling carrying the
-    // dispatch's prompt/completion/total token counts under
-    // `category=telemetry, source=tokens` so the viewer can sum tokens
-    // across a window without parsing the Work-category complete payload.
-    // Tokens-only by design (NO currency) — the operator multiplies by
-    // their own per-token rate. Emitted on success AND error paths (a
-    // failed dispatch still consumed tokens, which still ran off-meter).
-    let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
-        darkmux_flow::Level::Info,
-        "telemetry.tokens",
-        "tokens",
-        &opts.role_id,
-        &session_id,
-        Some(&model),
-        mission_id.as_deref(),
-        sprint_id.as_deref(),
-        serde_json::json!({
-            "prompt_tokens": tokens.prompt,
-            "completion_tokens": tokens.completion,
-            "total_tokens": tokens.total(),
-        }),
-    ));
+    // (#795) NO at-complete `telemetry.tokens` aggregate here. The tailer
+    // emits one `telemetry.tokens` record PER TURN as `model.completed`
+    // events land (see `handle_event`), and the savings view SUMS records
+    // — re-emitting the dispatch totals at exit would double-count every
+    // token. The per-dispatch totals still live on the dispatch.complete
+    // payload above for drill-down (the viewer deliberately does not sum
+    // that family). #782 originally emitted the aggregate here.
 
     Ok(DispatchResult {
         exit_code,
@@ -1145,10 +1129,12 @@ struct TrajectorySummary {
 
 /// Token totals the runtime records in `metrics.json` at dispatch exit.
 /// Read host-side once the container has exited, then surfaced into the
-/// `dispatch.complete` payload AND a `telemetry.tokens` flow record so
-/// the observability viewer can aggregate "tokens off-meter" without
-/// re-parsing the runtime's stdout envelope (#782). `total` is derived
-/// (prompt + completion) at the read site so consumers don't have to.
+/// `dispatch.complete` payload so the per-dispatch drill-down shows
+/// totals without re-parsing the runtime's stdout envelope (#782). The
+/// live "tokens off-meter" aggregation no longer reads from here — it
+/// sums the PER-TURN `telemetry.tokens` records the tailer emits (#795).
+/// `total` is derived (prompt + completion) at the read site so
+/// consumers don't have to.
 ///
 /// `pub` so a second host-side consumer (`mission run`, #782b) reads the
 /// same canonical totals from a `DispatchResult.out_dir` rather than
@@ -1589,6 +1575,19 @@ impl TailerState {
                     "usage": event.get("usage"),
                 });
                 self.emit("dispatch.turn", darkmux_flow::Level::Info, payload);
+                // (#795) Per-turn token telemetry — the live "tokens
+                // off-meter" odometer climbs DURING the dispatch, not just
+                // at complete. Each turn's billed usage is its own
+                // `telemetry.tokens` record; the viewer SUMS records, and
+                // per-turn billed prompt tokens genuinely sum to the
+                // runtime's metrics totals (each turn re-sends context —
+                // same accumulator the runtime uses). The former
+                // at-complete aggregate is gone so nothing double-counts.
+                // Skipped when the event carries no `usage` (such turns
+                // also don't accumulate in metrics.json — symmetric).
+                if let Some(tokens_payload) = turn_tokens_payload(&event) {
+                    self.emit_telemetry("tokens", "telemetry.tokens", tokens_payload);
+                }
             }
             "tool.completed" => {
                 self.summary.tool_calls += 1;
@@ -1801,6 +1800,32 @@ impl TailerState {
             payload,
         ));
     }
+}
+
+/// (#795) Map a `model.completed` trajectory event to the per-turn
+/// `telemetry.tokens` payload — `{turn_seq, prompt_tokens,
+/// completion_tokens, total_tokens}`. Pure (no IO, no global sink) so the
+/// mapping is unit-testable in isolation from `handle_event`'s
+/// flow-record emission, same pattern as `detector_telemetry_payload`.
+///
+/// Returns `None` when the event carries no `usage` object (upstream
+/// omitted it — rare). Such turns also don't accumulate into the
+/// runtime's metrics.json totals (`loop_runner.rs` only adds when
+/// `response.usage` is `Some`), so skipping the record preserves the
+/// invariant that per-turn `telemetry.tokens` records SUM to the
+/// dispatch's metrics totals exactly. Absent token counts inside a
+/// present `usage` object degrade to 0 (defensive; the runtime always
+/// writes both fields).
+fn turn_tokens_payload(event: &serde_json::Value) -> Option<serde_json::Value> {
+    let usage = event.get("usage").filter(|u| u.is_object())?;
+    let prompt = usage.get("prompt_tokens").and_then(|n| n.as_u64()).unwrap_or(0);
+    let completion = usage.get("completion_tokens").and_then(|n| n.as_u64()).unwrap_or(0);
+    Some(serde_json::json!({
+        "turn_seq": event.get("seq"),
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": prompt.saturating_add(completion),
+    }))
 }
 
 /// (#557 slice 2) Map a detector trajectory event to its telemetry
@@ -3773,6 +3798,54 @@ mod tests {
         );
     }
 
+    /// (#795) A `model.completed` event with a full `usage` object maps
+    /// to the per-turn `telemetry.tokens` payload: turn_seq carried
+    /// through, total derived as prompt + completion.
+    #[test]
+    fn turn_tokens_payload_maps_usage_to_per_turn_payload() {
+        let event = serde_json::json!({
+            "type": "model.completed",
+            "seq": 12,
+            "finish_reason": "tool_calls",
+            "usage": { "prompt_tokens": 24000, "completion_tokens": 850 },
+        });
+        let payload = turn_tokens_payload(&event).expect("maps usage");
+        assert_eq!(payload["turn_seq"], 12);
+        assert_eq!(payload["prompt_tokens"], 24000);
+        assert_eq!(payload["completion_tokens"], 850);
+        assert_eq!(payload["total_tokens"], 24850);
+    }
+
+    /// (#795) No `usage` (or JSON-null usage — upstream omitted it) emits
+    /// NOTHING. Such turns also don't accumulate into the runtime's
+    /// metrics totals, so skipping preserves the records-sum-to-total
+    /// invariant rather than injecting a zero-noise record.
+    #[test]
+    fn turn_tokens_payload_skips_absent_or_null_usage() {
+        let absent = serde_json::json!({ "type": "model.completed", "seq": 3 });
+        assert!(turn_tokens_payload(&absent).is_none(), "absent usage → no record");
+        let null = serde_json::json!({
+            "type": "model.completed", "seq": 3, "usage": serde_json::Value::Null,
+        });
+        assert!(turn_tokens_payload(&null).is_none(), "null usage → no record");
+    }
+
+    /// (#795) Defensive: a `usage` object missing a count degrades that
+    /// count to 0 (the runtime always writes both fields; this guards
+    /// hand-rolled or cross-runtime trajectories).
+    #[test]
+    fn turn_tokens_payload_defaults_missing_counts_to_zero() {
+        let event = serde_json::json!({
+            "type": "model.completed",
+            "seq": 1,
+            "usage": { "completion_tokens": 500 },
+        });
+        let payload = turn_tokens_payload(&event).expect("partial usage still maps");
+        assert_eq!(payload["prompt_tokens"], 0);
+        assert_eq!(payload["completion_tokens"], 500);
+        assert_eq!(payload["total_tokens"], 500);
+    }
+
     /// Integration shape: feed a `dispatch.cycle.suspected` trajectory
     /// line through `handle_event` and assert the emitted FlowRecord is a
     /// telemetry record (`category:"telemetry"`, `source:"detector"`)
@@ -4011,6 +4084,69 @@ mod tests {
                 .unwrap_or(false),
             "detail must be present and non-empty"
         );
+    }
+
+    /// (#795) A `model.completed` trajectory line with usage → BOTH a
+    /// `dispatch.turn` Work record AND a per-turn `category=telemetry,
+    /// source=tokens` record carrying that turn's billed usage + turn_seq.
+    /// Same capture mechanism + env-scrub as the cycle test above.
+    #[test]
+    #[serial]
+    fn handle_event_model_completed_emits_per_turn_tokens_telemetry() {
+        let tmp = TempDir::new().unwrap();
+        // SAFETY: serialized via `#[serial]`; no concurrent env reader.
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let mut state = TailerState::new_for_test(
+            traj_path,
+            "sess-tokens".into(),
+            "coder".into(),
+            "darkmux:qwen3.6".into(),
+        );
+        state.handle_event(
+            r#"{"type":"model.completed","seq":5,"finish_reason":"tool_calls","usage":{"prompt_tokens":31000,"completion_tokens":1200}}"#,
+        );
+        // A no-usage turn must emit dispatch.turn but NO tokens record.
+        state.handle_event(r#"{"type":"model.completed","seq":6,"finish_reason":"stop"}"#);
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+
+        let records = drain_flow_records(tmp.path());
+        let tokens: Vec<&serde_json::Value> = records
+            .iter()
+            .filter(|v| v["category"] == "telemetry" && v["source"] == "tokens")
+            .collect();
+        assert_eq!(
+            tokens.len(),
+            1,
+            "exactly one tokens record (the no-usage turn must not emit one); got {tokens:?}"
+        );
+        let rec = tokens[0];
+        assert_eq!(rec["action"], "telemetry.tokens");
+        assert_eq!(rec["handle"], "coder");
+        assert_eq!(rec["session_id"], "sess-tokens");
+        assert_eq!(rec["payload"]["turn_seq"], 5);
+        assert_eq!(rec["payload"]["prompt_tokens"], 31000);
+        assert_eq!(rec["payload"]["completion_tokens"], 1200);
+        assert_eq!(rec["payload"]["total_tokens"], 32200);
+        // Both turns still produced their dispatch.turn Work records.
+        let turns = records.iter().filter(|v| v["action"] == "dispatch.turn").count();
+        assert_eq!(turns, 2, "dispatch.turn unaffected by the telemetry emission");
     }
 
     /// (#557 slice 3) A `dispatch.context` trajectory line → a
