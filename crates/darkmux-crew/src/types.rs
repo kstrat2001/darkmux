@@ -264,6 +264,15 @@ pub struct Mission {
     /// the operator may want to see when the most recent pause occurred.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paused_ts: Option<u64>,
+    /// (#815) The operator's VERBATIM `mission propose` input — the
+    /// unabridged prose the mission-compiler summarized into the
+    /// description + sprint descriptions. `mission run` dispatches this
+    /// alongside each sprint's compiled description so exact strings and
+    /// constraints survive the compiler's compression (the lost-in-
+    /// translation seam from the 2026-06-12 dogfood). None on
+    /// hand-authored or pre-#815 missions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_input: Option<String>,
 }
 
 /// Status of a sprint.
