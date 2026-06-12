@@ -2155,6 +2155,30 @@ mod tests {
             !html.contains("${mr.mission_id}"),
             "hybridNote interpolates mission_id without esc()"
         );
+        // (#807) The real orchestrator-note channel: the tagged-note lookup
+        // must exist, and note text (orchestrator-authored free text) must be
+        // esc()-wrapped both on the hero line and in the history modal.
+        assert!(
+            html.contains("r.source===\"orchestrator\""),
+            "viewer lost the orchestrator-note source filter (#807)"
+        );
+        for (escaped, raw) in [
+            ("${esc(last.handle)}", "${last.handle}"),
+            ("${esc(n.handle)}", "${n.handle}"),
+        ] {
+            assert!(
+                html.contains(escaped),
+                "orchestrator note text lost its esc() wrap (`{escaped}`)"
+            );
+            assert!(
+                !html.contains(raw),
+                "orchestrator note text interpolated raw (`{raw}`)"
+            );
+        }
+        assert!(
+            html.contains("id=\"nmodalbg\"") && html.contains("data-act=\"notes\""),
+            "notes-history modal or its dispatcher hook is missing (#807)"
+        );
         // Tokens-only invariant: no currency or rate figure anywhere in the
         // hero region (hybridNote through the end of savingsHero, bounded by
         // the next top-level function) — the operator prices each class

@@ -211,6 +211,7 @@ If a user asks you to:
 | "make the build self-contained" | Already is — `include_str!` for embedded workloads, no external assets needed at runtime. |
 | "review the diff before commit" | Run the suite (`cargo test`), eyeball `git diff`, propose a commit message — but **do not commit unless explicitly asked**. |
 | "run the optimize wizard" | `darkmux optimize` — Phase 1 scaffold prints six steps (all "todo"). For the full plan, see #35. Do NOT attempt full implementation of all six steps in one PR; land one phase at a time.
+| "leave an orchestrator note on the dashboard" | `darkmux flow note --text "<conclusion>" --source orchestrator` (#807) — the savings hero renders the latest tagged note verbatim as its "Orchestrator note:" conclusion (procedural template is the fallback), and `history →` lists the window's notes. Emit one after adjudicating a mission-run gate or wrapping a work arc: name what ran, where the tokens stayed, and the judgment call. TOKENS-ONLY discipline applies (no currency). |
 
 ## Things to ASK before doing
 
