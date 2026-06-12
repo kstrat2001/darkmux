@@ -666,7 +666,10 @@ fn git_in(dir: &Path, args: &[&str]) -> Result<std::process::Output> {
 fn coder_brief(sprint: &crew::types::Sprint, mission: &crew::types::Mission) -> String {
     match mission.source_input.as_deref().map(str::trim) {
         Some(src) if !src.is_empty() => format!(
-            "{desc}\n\n<operator-source-input>\nThe user's original, unabridged request              that produced this sprint. The summary above is derived from it; where this              text adds constraints, exact strings, or scope limits beyond the summary,              THIS text is authoritative.\n\n{src}\n</operator-source-input>",
+            "{desc}\n\n<operator-source-input>\nThe user's original, unabridged request that \
+             produced this sprint. The summary above is derived from it; where this text \
+             adds constraints, exact strings, or scope limits beyond the summary, THIS \
+             text is authoritative.\n\n{src}\n</operator-source-input>",
             desc = sprint.description,
         ),
         _ => sprint.description.clone(),
@@ -1166,6 +1169,14 @@ mod tests {
         assert!(brief.contains("<operator-source-input>"), "provenance tag present");
         assert!(brief.contains("Do NOT rename fields."), "verbatim constraint survives");
         assert!(brief.contains("THIS text is authoritative"), "authority statement present");
+        // The preamble must read as clean prose — no literal space-runs from
+        // string-continuation mistakes (QA caught exactly this on the first
+        // cut; the model-facing text is the product here).
+        assert!(
+            !brief.contains("  "),
+            "brief preamble contains a literal space-run: {brief:?}"
+        );
+        assert!(brief.contains("unabridged request that produced this sprint"));
     }
 
     #[test]
