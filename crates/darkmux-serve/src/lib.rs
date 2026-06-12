@@ -10,14 +10,16 @@ use axum::{
 };
 use futures::stream::{self, Stream};
 use std::collections::VecDeque;
-use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::io::{BufRead, IsTerminal};
+use std::path::{Path as StdPath, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
 /// Application state shared across handlers.
 #[derive(Clone)]
-struct AppState {
+pub(crate) struct AppState {
     flows_dir: PathBuf,
+    worktrees_base: PathBuf,
 }
 
 /// Validate a path segment as a bare date string (`YYYY-MM-DD`).
@@ -113,7 +115,10 @@ async fn play_html(Path(date): Path<String>) -> impl IntoResponse {
 /// Build the HTTP router with a configurable flows directory. The daemon's
 /// `run` entry point and the integration tests both go through here.
 pub(crate) fn build_router(flows_dir: PathBuf) -> Router {
-    let state = AppState { flows_dir };
+    let state = AppState {
+        flows_dir,
+        worktrees_base: worktrees_base_dir(),
+    };
     Router::new()
         .route("/", get(root_html))
         .route("/play/:date", get(play_html))
@@ -128,6 +133,33 @@ pub(crate) fn build_router(flows_dir: PathBuf) -> Router {
         .route("/sprints", get(sprints_handler))
         .route("/fleet/sessions/live", get(fleet_sessions_live_handler))
         .route("/fleet/machines/live", get(fleet_machines_live_handler))
+        .route("/diff/:session_id", get(diff_handler))
+        .layer(local_only_cors())
+        .with_state(state)
+}
+
+/// Like `build_router` but accepts a custom worktrees base directory.
+#[allow(dead_code)]
+pub(crate) fn build_router_with_worktrees_base(
+    flows_dir: PathBuf,
+    worktrees_base: PathBuf,
+) -> Router {
+    let state = AppState { flows_dir, worktrees_base };
+    Router::new()
+        .route("/", get(root_html))
+        .route("/play/:date", get(play_html))
+        .route("/health", get(health))
+        .route("/flow/:date", get(flow_handler))
+        .route("/flow/:date/stream", get(flow_stream_handler))
+        .route("/flow-days", get(flow_days_handler))
+        .route("/flow-status", get(flow_status_handler))
+        .route("/model/status", get(model_status_handler))
+        .route("/machine/specs", get(machine_specs_handler))
+        .route("/missions", get(missions_handler))
+        .route("/sprints", get(sprints_handler))
+        .route("/fleet/sessions/live", get(fleet_sessions_live_handler))
+        .route("/fleet/machines/live", get(fleet_machines_live_handler))
+        .route("/diff/:session_id", get(diff_handler))
         .layer(local_only_cors())
         .with_state(state)
 }
@@ -552,6 +584,334 @@ async fn health() -> axum::Json<serde_json::Value> {
         "darkmux_version": env!("CARGO_PKG_VERSION"),
         "flow_schema_version": darkmux_flow::FLOW_SCHEMA_VERSION,
     }))
+}
+
+/// Resolve the base directory holding per-sprint worktrees:
+/// `~/.darkmux/worktrees` (HOME-less fallback `/tmp/darkmux/worktrees`).
+fn worktrees_base_dir() -> PathBuf {
+    std::env::var("HOME")
+        .ok()
+        .map(|h| PathBuf::from(h).join(".darkmux").join("worktrees"))
+        .unwrap_or_else(|| PathBuf::from("/tmp/darkmux/worktrees"))
+}
+
+/// Validate a base ref string: must match `^[A-Za-z0-9][A-Za-z0-9_/.-]*$`.
+/// No leading dash (prevents git argument injection). Plain char iteration,
+/// no regex crate.
+pub fn validate_base_ref(base: &str) -> bool {
+    if base.is_empty() {
+        return false;
+    }
+    let mut chars = base.chars();
+    // First char: must be alphanumeric (no leading dash).
+    if !chars.clone().next().unwrap_or_default().is_ascii_alphanumeric() {
+        return false;
+    }
+    // Rest: alphanumeric, underscore, slash, dot, hyphen.
+    chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '/' | '.' | '-'))
+}
+
+/// Validate that `worktree_path` is contained within `base_dir`.
+/// Both paths are canonicalized first; missing paths return false.
+pub fn worktree_contained(
+    worktree_path: &StdPath,
+    base_dir: &StdPath,
+) -> bool {
+    let canon_base = match std::fs::canonicalize(base_dir) {
+        Ok(p) => p,
+        Err(_) => return false, // base doesn't exist
+    };
+    let canon_wt = match std::fs::canonicalize(worktree_path) {
+        Ok(p) => p,
+        Err(_) => return false, // worktree doesn't exist
+    };
+    canon_wt.starts_with(&canon_base)
+}
+
+/// Resolve a session_id from flow records: find the LAST `mission.run.start`
+/// record matching that session across the two lexicographically last
+/// `.jsonl` day files, and extract payload.worktree/base/branch.
+pub fn resolve_session(
+    session_id: &str,
+    flows_dir: &StdPath,
+) -> Option<(String, String, String)> {
+    // Read all .jsonl day files from flows_dir.
+    let entries: Vec<PathBuf> = std::fs::read_dir(flows_dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .map(|ext| ext == "jsonl")
+                .unwrap_or(false)
+        })
+        .collect();
+
+    // Take the two lexicographically last day files (covers midnight rollover).
+    let mut last_two: Vec<PathBuf> = entries
+        .iter()
+        .filter_map(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .filter(|name| is_valid_date(name).is_some())
+                .map(|_| p.clone())
+        })
+        .collect();
+    last_two.sort_by(|a, b| {
+        let a_name = a.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let b_name = b.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        a_name.cmp(b_name)
+    });
+
+    let candidates: Vec<&StdPath> = last_two.iter().rev().take(2).map(|p| p.as_path()).collect();
+
+    // Scan all lines from those files, find the LAST matching record.
+    let mut best: Option<(String, String, String)> = None;
+
+    for day_file in &candidates {
+        let Ok(file) = std::fs::File::open(day_file) else {
+            continue;
+        };
+        let reader = std::io::BufReader::new(file);
+        for line in reader.lines() {
+            let Ok(line) = line else { continue };
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let action = record.get("action").and_then(|a| a.as_str()).unwrap_or("");
+            if action != "mission.run.start" {
+                continue;
+            }
+            let sid = record
+                .get("session_id")
+                .and_then(|s| s.as_str())
+                .unwrap_or("");
+            if sid != session_id {
+                continue;
+            }
+            let payload = record.get("payload");
+            if let Some(p) = payload {
+                let wt = p.get("worktree").and_then(|w| w.as_str()).unwrap_or("");
+                let base = p.get("base").and_then(|b| b.as_str()).unwrap_or("");
+                let branch = p.get("branch").and_then(|b| b.as_str()).unwrap_or("");
+                if !wt.is_empty() && !base.is_empty() {
+                    best = Some((wt.to_string(), base.to_string(), branch.to_string()));
+                }
+            }
+        }
+    }
+
+    best
+}
+
+/// Compute the git diff for a worktree against its base ref.
+pub fn compute_git_diff(
+    worktree: &StdPath,
+    base: &str,
+) -> Result<(String, Vec<DiffFile>, Vec<String>, bool), String> {
+    // 1) unified diff text
+    let diff_out = Command::new("git")
+        .current_dir(worktree)
+        .args(["diff", "--no-color", base])
+        .output()
+        .map_err(|_| "git error".to_string())?;
+    let diff_text = String::from_utf8_lossy(&diff_out.stdout).to_string();
+
+    // 2) numstat (additions/deletions per file)
+    let numstat_out = Command::new("git")
+        .current_dir(worktree)
+        .args(["diff", "--numstat", base])
+        .output()
+        .map_err(|_| "git error".to_string())?;
+    let numstat_text = String::from_utf8_lossy(&numstat_out.stdout);
+
+    // 3) untracked files
+    let ls_out = Command::new("git")
+        .current_dir(worktree)
+        .args(["ls-files", "--others", "--exclude-standard"])
+        .output()
+        .map_err(|_| "git error".to_string())?;
+    let untracked: Vec<String> = String::from_utf8_lossy(&ls_out.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .take(200)
+        .map(|s| s.to_string())
+        .collect();
+
+    // Parse numstat lines.
+    let mut files: Vec<DiffFile> = Vec::new();
+    for line in numstat_text.lines() {
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        let additions = parse_numstat_count(parts[0]);
+        let deletions = parse_numstat_count(parts[1]);
+        let path = parts[2].to_string();
+        files.push(DiffFile {
+            path,
+            additions,
+            deletions,
+        });
+    }
+
+    // Cap diff text at 262144 bytes (char boundary).
+    let mut truncated = false;
+    let diff_text = if diff_text.len() > 262144 {
+        // Truncate at a char boundary.
+        let mut end = 262144;
+        while end > 0 && !diff_text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == 0 {
+            truncated = true;
+            diff_text.clone()
+        } else {
+            truncated = true;
+            diff_text[..end].to_string()
+        }
+    } else {
+        diff_text
+    };
+
+    Ok((diff_text, files, untracked, truncated))
+}
+
+/// Parse a numstat count field: "-" means binary (null), otherwise parse as u64.
+fn parse_numstat_count(s: &str) -> Option<u64> {
+    if s == "-" {
+        None
+    } else {
+        s.parse::<u64>().ok()
+    }
+}
+
+/// Diff response struct.
+#[derive(serde::Serialize)]
+pub struct DiffResponse {
+    pub available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files: Option<Vec<DiffFile>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub untracked: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Per-file diff stats.
+#[derive(serde::Serialize)]
+pub struct DiffFile {
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub additions: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deletions: Option<u64>,
+}
+
+/// GET /diff/:session_id — returns the running git diff of a mission-run worktree.
+pub(crate) async fn diff_handler(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    // 1. Resolve session from flow records.
+    let flows_dir = state.flows_dir.clone();
+    let worktrees_base = state.worktrees_base.clone();
+    let (worktree, base, branch) = match resolve_session(&session_id, &flows_dir) {
+        Some((wt, b, br)) => (wt, b, br),
+        None => {
+            return axum::Json(DiffResponse {
+                available: false,
+                session_id: None,
+                base: None,
+                branch: None,
+                files: None,
+                untracked: None,
+                diff: None,
+                truncated: None,
+                reason: Some("no mission-run record for session".to_string()),
+            })
+            .into_response();
+        }
+    };
+
+    // 2. Security: containment check.
+    if !worktree_contained(StdPath::new(&worktree), &worktrees_base) {
+        return axum::Json(DiffResponse {
+            available: false,
+            session_id: None,
+            base: None,
+            branch: None,
+            files: None,
+            untracked: None,
+            diff: None,
+            truncated: None,
+            reason: Some("worktree outside managed base".to_string()),
+        })
+        .into_response();
+    }
+
+    // 3. Security: base ref validation.
+    if !validate_base_ref(&base) {
+        return axum::Json(DiffResponse {
+            available: false,
+            session_id: None,
+            base: None,
+            branch: None,
+            files: None,
+            untracked: None,
+            diff: None,
+            truncated: None,
+            reason: Some("invalid base ref".to_string()),
+        })
+        .into_response();
+    }
+
+    // 4. Compute diff.
+    let (diff_text, files, untracked, truncated) = match compute_git_diff(StdPath::new(&worktree), &base) {
+        Ok(r) => r,
+        Err(reason) => {
+            return axum::Json(DiffResponse {
+                available: false,
+                session_id: None,
+                base: None,
+                branch: None,
+                files: None,
+                untracked: None,
+                diff: None,
+                truncated: None,
+                reason: Some(reason),
+            })
+            .into_response();
+        }
+    };
+
+    axum::Json(DiffResponse {
+        available: true,
+        session_id: Some(session_id),
+        base: Some(base),
+        branch: Some(branch),
+        files: Some(files),
+        untracked: Some(untracked),
+        diff: Some(diff_text),
+        truncated: Some(truncated),
+        reason: None,
+    })
+    .into_response()
 }
 
 /// GET /model/status — returns currently-loaded models (per `lms ps --json`)
@@ -3476,5 +3836,242 @@ mod tests {
                 "expected XADD'd record to surface as SSE event; got: {got:?}"
             );
         }
+    }
+
+    // ─── #756: diff endpoint tests ─────────────────────────────────────
+
+    #[test]
+    fn validate_base_ref_accepts_valid_refs() {
+        assert!(validate_base_ref("main"));
+        assert!(validate_base_ref("origin/main"));
+        assert!(validate_base_ref("abc123"));
+        assert!(validate_base_ref("v1.0.0"));
+        assert!(validate_base_ref("feature/my-branch"));
+        assert!(validate_base_ref("a_b.c-d"));
+    }
+
+    #[test]
+    fn validate_base_ref_rejects_invalid_refs() {
+        assert!(!validate_base_ref(""));
+        assert!(!validate_base_ref("-rev"));
+        assert!(!validate_base_ref("$(x)"));
+        assert!(!validate_base_ref("a b")); // space
+    }
+
+    #[test]
+    fn worktree_contained_accepts_path_under_base() {
+        let tmp = TempDir::new().unwrap();
+        // Create a real directory structure.
+        std::fs::create_dir_all(tmp.path().join("sub")).unwrap();
+        assert!(worktree_contained(
+            &tmp.path().join("sub"),
+            tmp.path(),
+        ));
+    }
+
+    #[test]
+    fn worktree_contained_rejects_path_outside_base() {
+        let tmp = TempDir::new().unwrap();
+        // A path outside the base dir.
+        assert!(
+            !worktree_contained(
+                StdPath::new("/tmp"),
+                tmp.path(),
+            )
+        );
+    }
+
+    #[test]
+    fn worktree_contained_rejects_missing_worktree() {
+        let tmp = TempDir::new().unwrap();
+        // Non-existent worktree path.
+        assert!(
+            !worktree_contained(
+                &tmp.path().join("does_not_exist"),
+                tmp.path(),
+            )
+        );
+    }
+
+    #[test]
+    fn resolve_session_finds_matching_record() {
+        let tmp = TempDir::new().unwrap();
+        let record = serde_json::json!({
+            "action": "mission.run.start",
+            "session_id": "abc123",
+            "payload": {
+                "worktree": "/tmp/wt",
+                "base": "main",
+                "branch": "darkmux/abc123"
+            }
+        });
+        fs::write(
+            tmp.path().join("2026-01-15.jsonl"),
+            format!("{}\n", record),
+        )
+        .unwrap();
+
+        let result = resolve_session("abc123", tmp.path());
+        assert!(result.is_some(), "expected session to resolve");
+        let (wt, base, branch) = result.unwrap();
+        assert_eq!(wt, "/tmp/wt");
+        assert_eq!(base, "main");
+        assert_eq!(branch, "darkmux/abc123");
+    }
+
+    #[test]
+    fn resolve_session_returns_none_for_unknown() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("2026-01-15.jsonl"),
+            r#"{"action":"mission.run.start","session_id":"other","payload":{"worktree":"/tmp/wt","base":"main","branch":"x"}}\n"#,
+        )
+        .unwrap();
+
+        let result = resolve_session("unknown", tmp.path());
+        assert!(result.is_none(), "expected no match for unknown session");
+    }
+
+    #[tokio::test]
+    async fn diff_handler_returns_available_true_with_git_diff() {
+        // Create a temp dir acting as the worktrees base containing a real git repo.
+        let wt_base = TempDir::new().unwrap();
+
+        // Create a real git repo inside the base.
+        let wt_dir = wt_base.path().join("myrepo").join("sprint1");
+        std::fs::create_dir_all(&wt_dir).unwrap();
+
+        // Initialize git repo.
+        Command::new("git")
+            .current_dir(&wt_dir)
+            .args(["init"])
+            .output()
+            .expect("git init");
+
+        // Configure git user for commits.
+        Command::new("git")
+            .current_dir(&wt_dir)
+            .args(["config", "user.email", "test@test.com"])
+            .output()
+            .expect("git config");
+        Command::new("git")
+            .current_dir(&wt_dir)
+            .args(["config", "user.name", "Test"])
+            .output()
+            .expect("git config");
+
+        // Create and commit a file as base.
+        let test_file = wt_dir.join("hello.txt");
+        fs::write(&test_file, "original content\n").unwrap();
+
+        Command::new("git")
+            .current_dir(&wt_dir)
+            .args(["add", "."])
+            .output()
+            .expect("git add");
+        let _commit_out = Command::new("git")
+            .current_dir(&wt_dir)
+            .args(["commit", "-m", "initial"])
+            .output()
+            .expect("git commit");
+        // Use git rev-parse to get just the hash.
+        let base_ref = Command::new("git")
+            .current_dir(&wt_dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("git rev-parse")
+            .stdout;
+        let base_ref = String::from_utf8(base_ref).unwrap().trim().to_string();
+
+        // Modify the file and add an untracked one.
+        fs::write(&test_file, "modified content\n").unwrap();
+        Command::new("git")
+            .current_dir(&wt_dir)
+            .args(["add", "."])
+            .output()
+            .expect("git add");
+        fs::write(wt_dir.join("new.txt"), "untracked\n").unwrap();
+
+        // Create a flows dir with a day file pointing at this worktree.
+        let flows_dir = TempDir::new().unwrap();
+        let record = serde_json::json!({
+            "action": "mission.run.start",
+            "session_id": "test-session-1",
+            "payload": {
+                "worktree": wt_dir.to_str().unwrap(),
+                "base": &base_ref,
+                "branch": "darkmux/test"
+            }
+        });
+        fs::write(
+            flows_dir.path().join("2026-01-15.jsonl"),
+            format!("{}\n", record),
+        )
+        .unwrap();
+
+        let app = build_router_with_worktrees_base(
+            flows_dir.path().to_path_buf(),
+            wt_base.path().to_path_buf(),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/diff/test-session-1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON body");
+
+        assert!(json["available"].as_bool().unwrap_or(false), "expected available:true");
+        assert_eq!(json["session_id"].as_str(), Some("test-session-1"));
+        assert!(!json["base"].as_str().unwrap_or("").is_empty());
+        assert!(!json["branch"].as_str().unwrap_or("").is_empty());
+
+        // files[] should contain "hello.txt" with additions/deletions.
+        let files = json["files"].as_array().expect("expected files array");
+        assert!(!files.is_empty(), "expected at least one file in files[]");
+        let hello = files.iter().find(|f| f["path"] == "hello.txt");
+        assert!(hello.is_some(), "expected hello.txt in files[]");
+
+        // untracked should contain "new.txt".
+        let untracked = json["untracked"].as_array().expect("expected untracked array");
+        assert!(
+            untracked.iter().any(|u| u == "new.txt"),
+            "expected new.txt in untracked: {untracked:?}"
+        );
+
+        // diff text should contain the change.
+        let diff = json["diff"].as_str().unwrap_or("");
+        assert!(
+            diff.contains("original content") || diff.contains("modified content"),
+            "expected diff text to contain file content; got: {diff}"
+        );
+    }
+
+    #[tokio::test]
+    async fn diff_handler_returns_available_false_for_unknown_session() {
+        let flows_dir = TempDir::new().unwrap();
+        // No records at all.
+
+        let app = build_router(flows_dir.path().to_path_buf());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/diff/nonexistent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON body");
+        assert!(!json["available"].as_bool().unwrap_or(false));
     }
 }
