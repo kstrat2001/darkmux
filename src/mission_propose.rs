@@ -45,6 +45,11 @@ struct ProposedMission {
     sprint_ids: Vec<String>,
     #[serde(default)]
     created_ts: u64,
+    /// (#815) The operator's verbatim propose input, stamped at persist
+    /// time (never round-tripped through the compiler — the whole point
+    /// is that this text survives unsummarized).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_input: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,10 +120,10 @@ pub fn propose(
         // 5. Operator decision
         if yes {
             eprintln!("mission propose: --yes flag set, applying without prompt");
-            return persist_and_maybe_start(&proposal, start);
+            return persist_and_maybe_start(&proposal, start, &input);
         }
         match prompt_decision()? {
-            Decision::Approve => return persist_and_maybe_start(&proposal, start),
+            Decision::Approve => return persist_and_maybe_start(&proposal, start, &input),
             Decision::Reject => {
                 eprintln!("mission propose: rejected. No files written.");
                 return Ok(1);
@@ -476,7 +481,7 @@ fn prompt_decision() -> Result<Decision> {
     }
 }
 
-fn persist(p: &Proposal) -> Result<i32> {
+fn persist(p: &Proposal, source_input: &str) -> Result<i32> {
     use crate::crew::lifecycle;
 
     // Stamp created_ts on everything that has 0 (the schema convention
@@ -489,6 +494,13 @@ fn persist(p: &Proposal) -> Result<i32> {
     let mut mission = p.mission.clone();
     if mission.created_ts == 0 {
         mission.created_ts = now;
+    }
+    // (#815) Stamp the operator's verbatim input onto the mission record —
+    // the compiled descriptions are the STRUCTURE; this is the WORDS. A
+    // trimmed-empty input (shouldn't happen — propose rejects empty) stays
+    // None rather than persisting an empty block.
+    if !source_input.trim().is_empty() {
+        mission.source_input = Some(source_input.to_string());
     }
 
     // Ensure the per-mission dir + its sprints/ subdir exist before any
@@ -582,8 +594,8 @@ fn write_all(
 }
 
 /// Helper that persists a proposal and optionally starts the mission.
-fn persist_and_maybe_start(p: &Proposal, start: bool) -> Result<i32> {
-    let exit = persist(p)?;
+fn persist_and_maybe_start(p: &Proposal, start: bool, source_input: &str) -> Result<i32> {
+    let exit = persist(p, source_input)?;
     if exit != 0 {
         return Ok(exit);
     }
@@ -659,6 +671,7 @@ mod tests {
                 status: "active".to_string(),
                 sprint_ids: sprint_ids.iter().map(|s| s.to_string()).collect(),
                 created_ts: 0,
+                source_input: None,
             },
             sprints: sprint_ids
                 .iter()
@@ -768,7 +781,7 @@ some epilogue"#;
             .expect("writing existing mission");
 
         let proposal = sample_proposal("test-existing-mission", &[]);
-        let err = persist(&proposal).expect_err("persist should fail for existing mission");
+        let err = persist(&proposal, "test input").expect_err("persist should fail for existing mission");
         assert!(err.to_string().contains("already exists"));
     }
 
@@ -800,7 +813,7 @@ some epilogue"#;
         // `std::fs::write` returns ENOENT during the loop (rollback fires).
         let proposal = sample_proposal("test-rollback", &["test-s1", "deep/test-s2"]);
 
-        let err = persist(&proposal).expect_err("persist should fail mid-loop");
+        let err = persist(&proposal, "test input").expect_err("persist should fail mid-loop");
         assert!(
             err.to_string().contains("writing"),
             "expected a write error, got: {err}"

@@ -323,7 +323,7 @@ pub fn run(
     );
     let opts = crew::dispatch::DispatchOpts {
         role_id: role.to_string(),
-        message: sprint.description.clone(),
+        message: coder_brief(&sprint, mission),
         deliver: None,
         session_id: Some(session_id.clone()),
         timeout_seconds,
@@ -655,6 +655,27 @@ fn git_in(dir: &Path, args: &[&str]) -> Result<std::process::Output> {
 
 /// Commit subject for a shipped sprint: the sprint description's first line,
 /// trimmed to a conventional ~72-char subject.
+/// (#815) The coder's dispatch brief: the sprint's compiled description
+/// (the STRUCTURE) plus, when the mission carries it, the operator's
+/// verbatim `mission propose` input (the WORDS) under a provenance-tagged
+/// block. The 2026-06-12 dogfood showed the compiler compressing exact
+/// strings + constraints out of the description — and since the description
+/// IS the brief, the constraints never reached the coder. The tagged block
+/// follows the model-facing prompt doctrine: AI-convention framing, with
+/// the tag itself carrying the provenance a clean-context model needs.
+fn coder_brief(sprint: &crew::types::Sprint, mission: &crew::types::Mission) -> String {
+    match mission.source_input.as_deref().map(str::trim) {
+        Some(src) if !src.is_empty() => format!(
+            "{desc}\n\n<operator-source-input>\nThe user's original, unabridged request that \
+             produced this sprint. The summary above is derived from it; where this text \
+             adds constraints, exact strings, or scope limits beyond the summary, THIS \
+             text is authoritative.\n\n{src}\n</operator-source-input>",
+            desc = sprint.description,
+        ),
+        _ => sprint.description.clone(),
+    }
+}
+
 /// (#817) Does the run's flow trail carry an adjudication note? Scans the
 /// TWO lexicographically-newest day files (UTC-rollover safe, same pattern
 /// as the /diff endpoint's resolution) for `action=note` matching the
@@ -1134,6 +1155,41 @@ mod tests {
     use super::*;
     use crew::types::{Sprint, SprintStatus};
 
+    /// (#815) With a mission-level source_input, the coder brief carries the
+    /// compiled description AND the verbatim operator prose under the
+    /// provenance-tagged block; without one (hand-authored / pre-#815
+    /// missions) the brief is the bare description, unchanged.
+    #[test]
+    fn coder_brief_appends_verbatim_source_when_present() {
+        let s = sprint("s1", "m1", &[], SprintStatus::Planned);
+        let mut m = mission("m1", "compiled summary");
+        m.source_input = Some("EXACT placeholder: 'APIM Key Name'. Do NOT rename fields.".into());
+        let brief = coder_brief(&s, &m);
+        assert!(brief.starts_with("desc s1"), "compiled description leads");
+        assert!(brief.contains("<operator-source-input>"), "provenance tag present");
+        assert!(brief.contains("Do NOT rename fields."), "verbatim constraint survives");
+        assert!(brief.contains("THIS text is authoritative"), "authority statement present");
+        // The preamble must read as clean prose — no literal space-runs from
+        // string-continuation mistakes (QA caught exactly this on the first
+        // cut; the model-facing text is the product here).
+        assert!(
+            !brief.contains("  "),
+            "brief preamble contains a literal space-run: {brief:?}"
+        );
+        assert!(brief.contains("unabridged request that produced this sprint"));
+    }
+
+    #[test]
+    fn coder_brief_is_bare_description_without_source() {
+        let s = sprint("s1", "m1", &[], SprintStatus::Planned);
+        let m = mission("m1", "compiled summary");
+        assert_eq!(coder_brief(&s, &m), "desc s1");
+        // Whitespace-only source_input behaves as absent.
+        let mut m2 = mission("m1", "compiled summary");
+        m2.source_input = Some("   \n ".into());
+        assert_eq!(coder_brief(&s, &m2), "desc s1");
+    }
+
     /// (#817) The note-trail scan finds a session-scoped orchestrator note in
     /// the newest day files, and reads "no note" for other sessions, other
     /// sources, and a missing dir. `#[serial_test::serial]` — mutates the
@@ -1253,6 +1309,7 @@ mod tests {
             started_ts: None,
             closed_ts: None,
             paused_ts: None,
+            source_input: None,
         }
     }
 
