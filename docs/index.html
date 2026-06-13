@@ -37,6 +37,9 @@
   a { color: var(--accent); text-decoration: none; }
   a:hover { text-decoration: underline; text-underline-offset: 3px; }
   .wrap { max-width: 760px; margin: 0 auto; padding: 0 24px; }
+  .shot { margin: 28px 0 6px; }
+  .shot img { width: 100%; border: 1px solid #1d2a3a; border-radius: 10px; display: block; }
+  .shot figcaption { font-size: 13px; color: #8a8a92; margin-top: 10px; line-height: 1.5; }
 
   /* hero */
   header {
@@ -244,6 +247,10 @@
     <h3>You don't have to rent every token — the AI workforce is already sitting in your Mac.</h3>
     <p>darkmux started as a lab for testing faster local AI on Apple Silicon. The belief that came out of it: <strong>a frontier model is a brilliant strategist you rent by the token — and burning those tokens on compaction, scaffolding, test runs, and structuring is paying rent for busy work, plus handing your data to someone else's cloud to do it.</strong> The Apple Silicon you already bought runs capable open-source models locally — no cloud account, no per-token meter, nothing leaving your disk. Many Mac owners don't make full use of the hardware they paid for; darkmux gives you the tools to fully utilize that silicon.</p>
     <p class="muted">Every default in darkmux comes from a measured result, not a guess — the repo is the evidence locker; the <a href="https://substack.com/@DarklyEnergized">writing</a> is the narrative.</p>
+    <figure class="shot">
+      <img src="media/savings-hero-live.png" alt="darkmux live dashboard: 9,721,748 tokens off the meter in 24 hours — broken into 157k generated, 395k fresh input, 9.2M re-read input across 22 local dispatches on two machines, with an orchestrator note concluding the day's work" loading="lazy">
+      <figcaption>A real day on a two-Mac fleet: 9.7M tokens stayed home — and the breakdown teaches why agent loops devour them (94% was re-read context). Live dashboard, not a mockup.</figcaption>
+    </figure>
   </div>
 </section>
 
