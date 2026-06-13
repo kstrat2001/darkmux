@@ -749,7 +749,12 @@ const fmtC=n=>n>=1e6?(n/1e6).toFixed(n>=1e7?0:1)+"M":n>=1000?Math.round(n/1000)+
 // latest tagged note at/under the playhead OVERRIDES the procedural template
 // below; the templates remain the fallback for windows with no note. Note
 // text is operator/orchestrator-authored free text → esc() at the edge.
-const orchNotes=()=>DATA.filter(r=>r.action==="note"&&r.source==="orchestrator"&&T(r.ts)<=state.t)
+// Dashboard notes are MISSION-LEVEL by definition (#819's ship scaffold has
+// no --session-id); session-scoped notes are adjudication-shaped and belong
+// to their session's trail, so the card + history ignore them — which also
+// auto-hides mis-tagged technical adjudications (observed twice during the
+// channel-split transition).
+const orchNotes=()=>DATA.filter(r=>r.action==="note"&&r.source==="orchestrator"&&!r.session_id&&T(r.ts)<=state.t)
                         .sort((a,b)=>T(a.ts)-T(b.ts));
 function hybridNote(t){
   const notes=orchNotes();

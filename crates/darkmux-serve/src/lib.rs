@@ -2171,8 +2171,10 @@ mod tests {
         // must exist, and note text (orchestrator-authored free text) must be
         // esc()-wrapped both on the hero line and in the history modal.
         assert!(
-            html.contains("r.source===\"orchestrator\""),
-            "viewer lost the orchestrator-note source filter (#807)"
+            html.contains("r.source===\"orchestrator\"&&!r.session_id"),
+            "viewer lost the orchestrator-note source filter or its mission-level \
+             (no session_id) restriction — session-scoped notes are adjudication-\
+             shaped and never belong on the card (#807/#819)"
         );
         for (escaped, raw) in [
             ("${esc(last.handle)}", "${last.handle}"),
