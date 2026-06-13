@@ -1156,13 +1156,23 @@ function renderSubsystem(){
   const detections=finds.length
     ? `<div class="track"><div class="lbl">detections (${finds.length})</div>`+finds.map(f=>`<div class="finding ${esc(f.s)}"><span class="fk">⚠ ${esc(f.k)}</span><span class="fm">${esc(f.d)}</span>${f.f?`<span class="ff">fix: ${esc(f.f)}</span>`:""}</div>`).join("")+`</div>`
     : `<div class="track"><div class="lbl">detections</div><div class="finding ok"><span class="fk">✓ clean</span><span class="fm">no behavioral flags (cycle, tool-failure, reasoning-loop, edit-drift)</span></div></div>`;
+  // (#756 flicker fix) The diff lives in a stable mount painted independently
+  // of this full-stage rebuild. A live run re-renders the subsystem ~once per
+  // turn (metrics change), and inlining the diff here destroyed + recreated
+  // its DOM every time — the flash + scroll-reset the operator saw. Capture
+  // the current diff scroll before the wipe, mount an empty #difftrack, then
+  // repaint it from cache synchronously (pre-paint, so no flicker) with scroll
+  // restored. paintDiff is also the poll's repaint target, so a content change
+  // touches only the diff, never the whole stage.
+  const _dw=document.querySelector('.diffwrap'); if(_dw)DIFF._scroll=_dw.scrollTop;
   $("stage").innerHTML=`<div class="sub"><h2>subsystem · ${esc(handle)} <span style="color:var(--muted);text-transform:none;font-weight:400">(${esc(sid)} on <a data-act="machine" data-arg="${esc(m)}">${escN(m)}</a>)</span></h2>
     ${met}
     <div class="track"><div class="lbl">model (lms)</div>${segs||'<span class="hint">no telemetry yet</span>'}</div>
     ${cpu}
     ${ctxChart}
     ${detections}
-    ${diffPanel(sid)}</div>`;
+    <div id="difftrack"></div></div>`;
+  paintDiff(sid);
 }
 // (#756) Live-diff panel for the session view — the agent's code changes
 // forming in real time. Renders only in live mode (the static demo and
@@ -1172,7 +1182,6 @@ function renderSubsystem(){
 // invariant — diff content is model-authored text, treat it as hostile).
 function diffPanel(sid){
   if(!document.body.classList.contains('live-mode'))return "";
-  ensureDiffPoll(sid);
   const d=DIFF.sid===sid?DIFF.data:null;
   if(!d||!d.available)return "";
   const files=d.files||[], untracked=d.untracked||[];
@@ -1193,6 +1202,22 @@ function diffPanel(sid){
   return `<div class="track"><div class="lbl">live diff vs ${esc(d.base)} — ${files.length} file${files.length===1?'':'s'} · <span class="fa" style="color:var(--good)">+${adds}</span> <span class="fd" style="color:var(--bad)">−${dels}</span>${trunc}</div>
     <div class="fchips">${chips}</div>
     <div class="diffwrap">${body}${more}</div></div>`;
+}
+// (#756 flicker fix) Paint the diff into its stable #difftrack mount,
+// independent of the full-stage render. Repaints only when the content
+// changed OR the mount was just rebuilt empty by render() — and restores the
+// captured scroll, so a per-turn re-render neither flashes the diff nor jumps
+// it. Live-gated via diffPanel() (returns "" off-live), and starts the poll.
+function paintDiff(sid){
+  const mount=document.getElementById('difftrack');
+  if(!mount)return;
+  if(document.body.classList.contains('live-mode'))ensureDiffPoll(sid);
+  const html=diffPanel(sid);
+  if(html!==DIFF._painted||(html!==""&&mount.childElementCount===0)){
+    mount.innerHTML=html; DIFF._painted=html;
+  }
+  const w=mount.querySelector('.diffwrap');
+  if(w&&DIFF._scroll)w.scrollTop=DIFF._scroll;
 }
 function pretty(r){
   const o={};Object.keys(r).filter(k=>!k.startsWith("_")).forEach(k=>o[k]=r[k]);
@@ -1718,8 +1743,8 @@ function startLiveTail(date){
 // it self-stops when the view changes. Worktrees outlive dispatch complete
 // (until ship/abort), so the panel keeps working at the review gate —
 // where reading the diff matters most.
-const DIFF={sid:null,data:null,timer:null};
-function stopDiffPoll(){ if(DIFF.timer)clearInterval(DIFF.timer); DIFF.timer=null; DIFF.sid=null; DIFF.data=null; }
+const DIFF={sid:null,data:null,timer:null,_scroll:0,_painted:""};
+function stopDiffPoll(){ if(DIFF.timer)clearInterval(DIFF.timer); DIFF.timer=null; DIFF.sid=null; DIFF.data=null; DIFF._painted=""; DIFF._scroll=0; }
 async function pollDiff(){
   const sid=DIFF.sid;
   if(!sid)return;
@@ -1729,7 +1754,11 @@ async function pollDiff(){
     const d=await r.json();
     const changed=JSON.stringify(d)!==JSON.stringify(DIFF.data);
     DIFF.data=d;
-    if(changed&&state.level==="subsystem"&&state.session===sid)render();
+    // (#756 flicker fix) Repaint ONLY the diff mount on a content change —
+    // not a full render(). The rest of the subsystem updates on its own
+    // cadence via applyLive; the diff has no business triggering a stage
+    // rebuild (that was half the flicker).
+    if(changed&&state.level==="subsystem"&&state.session===sid)paintDiff(sid);
   }catch(_){/* best-effort — no daemon / endpoint absent / transient */}
 }
 function ensureDiffPoll(sid){
