@@ -1411,17 +1411,22 @@ function renderMissionsIndex(){
   MISSIONS.forEach(m=>{ if(m&&m.id)ids.add(m.id); });
   visible().forEach(r=>{ if(r.mission_id)ids.add(r.mission_id); });
   const byId={}; MISSIONS.forEach(m=>{ if(m&&m.id)byId[m.id]=m; });
+  // (#827 QA) One pass to bucket records by mission_id — avoids re-filtering
+  // the whole visible window per row (O(n×m) → O(n+m)) on every live render.
+  const recsBy={}, sprBy={};
+  visible().forEach(r=>{ if(r.mission_id){(recsBy[r.mission_id]||(recsBy[r.mission_id]=[])).push(r);} });
+  SPRINTS.forEach(s=>{ if(s&&s.mission_id){(sprBy[s.mission_id]||(sprBy[s.mission_id]=[])).push(s);} });
   const rows=[...ids].map(id=>{
     const m=byId[id]||null;
     const status=m?(m.status||"active"):"(from flow)";
     // Sprint progress from the durable plan when present.
     const sids=(m&&Array.isArray(m.sprint_ids))?m.sprint_ids:[];
-    const sprintObjs=SPRINTS.filter(s=>s&&s.mission_id===id);
+    const sprintObjs=sprBy[id]||[];
     const total=sids.length||sprintObjs.length;
     const done=sprintObjs.filter(s=>s.status==="complete").length;
     const pct=total?Math.round(done/total*100):0;
     // Cross-machine + token rollup from the flow.
-    const recs=visible().filter(r=>r.mission_id===id);
+    const recs=recsBy[id]||[];
     const machs=[...new Set(recs.map(r=>nameOf(uidOf(r))).filter(Boolean))];
     const toks=recs.filter(r=>r.category==="telemetry"&&r.source==="tokens")
                    .reduce((a,r)=>a+((r.payload&&r.payload.total_tokens)||0),0);
@@ -1434,7 +1439,7 @@ function renderMissionsIndex(){
     const tok=r.toks?` · ${fmtC(r.toks)} tok`:'';
     const mach=r.machs.length?` · ${esc(r.machs.length===1?r.machs[0]:r.machs.length+' machines')}`:'';
     return `<div class="mirow ${r.status==="closed"?'midimrow':''}" data-act="missiondrill" data-arg="${esc(r.id)}">
-      <span class="mistatus ${esc(r.status.replace(/[^a-z]/g,''))}">${esc(r.status)}</span>
+      <span class="mistatus ${esc(r.status.replace(/[^a-z]/gi,''))}">${esc(r.status)}</span>
       <span class="miname">◆ ${esc(r.id)}</span>
       ${prog}
       <span class="mimeta">${mach}${tok}</span></div>`;
