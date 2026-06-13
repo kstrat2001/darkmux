@@ -69,6 +69,27 @@
   .backbtn[disabled]{opacity:.35;cursor:default}
   .crumb{font:600 13px 'JetBrains Mono',monospace;color:var(--muted)}
   .crumb a{color:var(--amber);cursor:pointer;text-decoration:none}.crumb a:hover{text-decoration:underline}
+  /* (#827) missions index rows */
+  .milist{margin-top:6px}
+  .mirow{display:flex;align-items:center;gap:14px;padding:11px 12px;border:1px solid var(--line);border-radius:7px;margin-bottom:8px;cursor:pointer;background:var(--panel)}
+  .mirow:hover{border-color:var(--amber-dim)}
+  .midimrow{opacity:.55}
+  .mistatus{font:600 10px/1 'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.08em;padding:3px 7px;border-radius:3px;border:1px solid var(--line);color:var(--muted);flex:0 0 auto}
+  .mistatus.active{color:var(--good);border-color:var(--good)}
+  .mistatus.closed{color:var(--muted)}
+  .mistatus.paused{color:var(--warn);border-color:var(--warn)}
+  .miname{font:600 13px 'JetBrains Mono',monospace;color:var(--amber);flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .miprog{display:inline-flex;align-items:center;gap:7px;font:11px 'JetBrains Mono',monospace;color:var(--muted);flex:0 0 auto}
+  .mibar{display:inline-block;width:60px;height:6px;background:var(--line);border-radius:3px;overflow:hidden}
+  .mibar span{display:block;height:100%;background:var(--good)}
+  .mimeta{font:11px 'JetBrains Mono',monospace;color:var(--muted);flex:0 0 auto}
+  .midim{font:11px 'JetBrains Mono',monospace;color:var(--muted)}
+  /* (#827) fleet | missions lens toggle — two co-equal views of the fleet */
+  .lenstabs{display:inline-flex;border:1px solid var(--line);border-radius:5px;overflow:hidden}
+  .lens{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);padding:5px 11px;cursor:pointer;text-decoration:none;background:none}
+  .lens+.lens{border-left:1px solid var(--line)}
+  .lens:hover{color:var(--text)}
+  .lens.on{background:var(--amber-dim);color:#0a0f17}
   .crumb .sep{color:var(--amber-dim);margin:0 6px}
   .meta{margin-left:auto;font:11px/1.4 'JetBrains Mono',monospace;color:var(--muted);text-align:right}.meta b{color:var(--text)}
   .wrap{display:flex;height:calc(100vh - 46px - 40px - 64px)}
@@ -390,6 +411,7 @@
 <div class="catpanel" id="catpanel" hidden></div>
 <div class="crumbbar">
   <button class="backbtn" id="back">‹ back</button>
+  <span class="lenstabs"><a class="lens" id="lens-fleet" data-act="fleet">fleet</a><a class="lens" id="lens-missions" data-act="missions">missions</a></span>
   <span class="crumb" id="crumb"></span>
   <span class="meta" id="meta"></span>
 </div>
@@ -452,6 +474,13 @@
 // docs/demo/demo-flow.jsonl — so the demo is identical to a local `/play`.
 // There is no demo fork; edit this viewer, then regenerate.
 let DATA = [];
+// (#827 Slice A) Durable mission/sprint structure from /missions + /sprints —
+// the WORK plan, distinct from the flow-record run history. Fetched at boot
+// (best-effort; empty under the static demo / no daemon, where the missions
+// index falls back to mission_ids found in the flow). Joined in the missions
+// lens so a planned-but-not-yet-run sprint still shows.
+let MISSIONS = [];
+let SPRINTS = [];
 let DATA_SOURCE = "no records yet";
 let nextRecordUid = 1;
 const runtimeUids = new Map();
@@ -520,7 +549,7 @@ recompute();
 // (#691) Default cap on the recent-runs list (newest-first); show-all toggle
 // via state.recentAll. Keeps a busy machine's panel from scrolling unbounded.
 const RECENT_CAP=20;
-let state={level:"fleet",machine:null,session:null,t:tMax,playing:false,timer:null,selected:null,follow:true,speed:1,recentAll:false,
+let state={level:"fleet",machine:null,session:null,missionId:null,t:tMax,playing:false,timer:null,selected:null,follow:true,speed:1,recentAll:false,
   filters:{cat:new Set(FCATS),tier:new Set(FTIERS),src:new Set(FSRC),q:""},
   rawOpen:false};
 
@@ -1317,14 +1346,24 @@ function renderCrumb(){
   // (#691) Gate on the live-SCOPED mission, not the global count — in live mode
   // with nothing running, primaryMission() is null and the crumb drops the
   // mission link (no stale "◆ m6"). Playback: primaryMission()=missions[0].
+  // (#827) Light the active lens. The missions lens covers the index + a
+  // mission detail; everything else is the fleet lens.
+  const inMissions = state.level==="missions"||state.level==="mission";
+  const lf=$("lens-fleet"), lm=$("lens-missions");
+  if(lf)lf.className="lens"+(inMissions?"":" on");
+  if(lm)lm.className="lens"+(inMissions?" on":"");
+  // Missions-lens crumb: index → mission detail.
+  if(inMissions){
+    let mc=`<a data-act="missions">missions</a>`;
+    if(state.level==="mission") mc+=`<span class="sep">›</span>◆ ${esc(state.missionId||primaryMission()||"—")}`;
+    $("crumb").innerHTML=mc; $("back").disabled=false; return;
+  }
   const pm=primaryMission();
   const hasMission=pm!=null;
   let c=hasMission?`<a class="misslink" data-act="mission">◆ ${esc(pm)}</a>`:``;
-  if(state.level!=="mission"){
-    c+=(hasMission?`<span class="sep">›</span>`:``)+`<a data-act="fleet">fleet</a>`;
-    if(state.level==="machine"||state.level==="subsystem") c+=`<span class="sep">›</span><a data-act="machine" data-arg="${esc(state.machine)}">${escN(state.machine)}</a>`;
-    if(state.level==="subsystem") c+=`<span class="sep">›</span>${esc(state.session)}`;
-  }
+  c+=(hasMission?`<span class="sep">›</span>`:``)+`<a data-act="fleet">fleet</a>`;
+  if(state.level==="machine"||state.level==="subsystem") c+=`<span class="sep">›</span><a data-act="machine" data-arg="${esc(state.machine)}">${escN(state.machine)}</a>`;
+  if(state.level==="subsystem") c+=`<span class="sep">›</span>${esc(state.session)}`;
   $("crumb").innerHTML=c; $("back").disabled=(state.level==="fleet");
 }
 function filtersActive(){return state.filters.cat.size<FCATS.length||state.filters.tier.size<FTIERS.length||state.filters.src.size<FSRC.length||!!state.filters.q;}
@@ -1334,7 +1373,7 @@ function syncTransport(){
   $("clock").textContent=fmt(state.t-tMin)+" / "+fmt(tMax-tMin)+"  ·  "+visible().length+"/"+DATA.length+" rec";
 }
 function render(){
-  if(state.level==="mission")renderMission(); else if(state.level==="fleet")renderFleet(); else if(state.level==="machine")renderMachine(); else if(state.level==="loose")renderLoose(); else renderSubsystem();
+  if(state.level==="missions")renderMissionsIndex(); else if(state.level==="mission")renderMission(); else if(state.level==="fleet")renderFleet(); else if(state.level==="machine")renderMachine(); else if(state.level==="loose")renderLoose(); else renderSubsystem();
   if(state.follow){ const n=newest(scopedFiltered()); state.selected=n?n._id:null; }
   renderDetail();renderLog();renderCrumb();renderMeta();updateFbtn();
   syncTransport();
@@ -1344,7 +1383,65 @@ window.drillMachine=m=>{state.level="machine";state.machine=m;state.session=null
 window.toggleRecentAll=()=>{state.recentAll=!state.recentAll;render();};
 window.drillSession=s=>{state.level="subsystem";state.session=s;state.follow=true;render();};
 window.goFleet=()=>{state.level="fleet";state.machine=null;state.session=null;state.follow=true;render();};
-window.goMission=()=>{ if(!missions.length)return goFleet(); state.level="mission";state.machine=null;state.session=null;state.follow=true;render();};
+window.goMission=()=>{ if(!missions.length)return goFleet(); state.level="mission";state.machine=null;state.session=null;state.missionId=primaryMission();state.follow=true;render();};
+// (#827 Slice A) The missions lens: index (all missions) + drill to one mission.
+window.goMissions=()=>{ state.level="missions";state.machine=null;state.session=null;state.missionId=null;state.follow=true;render();};
+window.drillMission=id=>{ state.level="mission";state.machine=null;state.session=null;state.missionId=id;state.follow=true;render();};
+// (#827 Slice A) Fetch the durable mission + sprint structure. Best-effort:
+// any failure leaves the caches empty and the index falls back to flow-derived
+// mission_ids. Async, awaited once at boot (Slice A doesn't live-poll it).
+async function loadMissionsSprints(){
+  try{
+    const [m,s]=await Promise.all([
+      fetch("/missions",{headers:{accept:"application/json"}}).then(r=>r.ok?r.json():null).catch(()=>null),
+      fetch("/sprints",{headers:{accept:"application/json"}}).then(r=>r.ok?r.json():null).catch(()=>null),
+    ]);
+    MISSIONS=(m&&Array.isArray(m.missions))?m.missions:[];
+    SPRINTS=(s&&Array.isArray(s.sprints))?s.sprints:[];
+  }catch(_){ MISSIONS=[]; SPRINTS=[]; }
+}
+// (#827 Slice A) The missions index — every mission, durable plan joined with
+// flow-record history. Rows union /missions structs with mission_ids seen in
+// the flow (so it works under the demo without a /missions endpoint). Each row:
+// status, sprint progress (from the durable plan), machines touched + token
+// rollup (from the flow), last activity. Click → that mission's detail.
+function renderMissionsIndex(){
+  $("logscope").textContent="missions"; state.stageScope=()=>true;
+  const ids=new Set();
+  MISSIONS.forEach(m=>{ if(m&&m.id)ids.add(m.id); });
+  visible().forEach(r=>{ if(r.mission_id)ids.add(r.mission_id); });
+  const byId={}; MISSIONS.forEach(m=>{ if(m&&m.id)byId[m.id]=m; });
+  const rows=[...ids].map(id=>{
+    const m=byId[id]||null;
+    const status=m?(m.status||"active"):"(from flow)";
+    // Sprint progress from the durable plan when present.
+    const sids=(m&&Array.isArray(m.sprint_ids))?m.sprint_ids:[];
+    const sprintObjs=SPRINTS.filter(s=>s&&s.mission_id===id);
+    const total=sids.length||sprintObjs.length;
+    const done=sprintObjs.filter(s=>s.status==="complete").length;
+    const pct=total?Math.round(done/total*100):0;
+    // Cross-machine + token rollup from the flow.
+    const recs=visible().filter(r=>r.mission_id===id);
+    const machs=[...new Set(recs.map(r=>nameOf(uidOf(r))).filter(Boolean))];
+    const toks=recs.filter(r=>r.category==="telemetry"&&r.source==="tokens")
+                   .reduce((a,r)=>a+((r.payload&&r.payload.total_tokens)||0),0);
+    const last=recs.length?Math.max(...recs.map(r=>T(r.ts))):0;
+    return {id,status,total,done,pct,machs,toks,last,known:!!m};
+  }).sort((a,b)=> (a.status==="closed")-(b.status==="closed") || b.last-a.last );
+  const body=rows.length?rows.map(r=>{
+    const prog=r.total?`<span class="miprog"><span class="mibar"><span style="width:${r.pct}%"></span></span> ${r.done}/${r.total}</span>`
+                      :`<span class="midim">no sprints yet</span>`;
+    const tok=r.toks?` · ${fmtC(r.toks)} tok`:'';
+    const mach=r.machs.length?` · ${esc(r.machs.length===1?r.machs[0]:r.machs.length+' machines')}`:'';
+    return `<div class="mirow ${r.status==="closed"?'midimrow':''}" data-act="missiondrill" data-arg="${esc(r.id)}">
+      <span class="mistatus ${esc(r.status.replace(/[^a-z]/g,''))}">${esc(r.status)}</span>
+      <span class="miname">◆ ${esc(r.id)}</span>
+      ${prog}
+      <span class="mimeta">${mach}${tok}</span></div>`;
+  }).join(""):`<div class="none">no missions yet — propose one with <code>darkmux mission propose</code></div>`;
+  $("stage").innerHTML=`<div><div class="stagehdr">missions · ${rows.length} total</div>
+    <div class="milist">${body}</div></div>`;
+}
 function renderMission(){
   // Derived entirely from the flow records — no hardcoded sprint fixture. Each
   // dispatch session in the mission is a row whose status advances with the
@@ -1352,7 +1449,7 @@ function renderMission(){
   // exactly as live data would. (Sprint/burn-down detail is a separate
   // feature — it needs sprint lifecycle records, which dispatch flows don't
   // carry yet.)
-  const mid=primaryMission()||"—";
+  const mid=state.missionId||primaryMission()||"—";
   state.stageScope=r=>r.mission_id===mid; $("logscope").textContent="mission";
   const starts={};
   DATA.filter(r=>r.mission_id===mid&&typeof r.action==="string"&&r.action.indexOf("dispatch")===0&&r.action.indexOf("start")>-1)
@@ -1387,7 +1484,7 @@ function followLatest(){ state.follow=true; state.t=tMax; render(); }
 // selected (follow off) regardless of where the playhead sits.
 window.selectRec=id=>{state.selected=id;state.follow=false;render();};
 $("follow").onclick=()=>{ if(state.follow){state.follow=false;render();} else followLatest(); };
-$("back").onclick=()=>{ if(state.level==="subsystem")drillMachine(state.machine); else if(state.level==="machine")goFleet(); else if(state.level==="mission")goFleet(); };
+$("back").onclick=()=>{ if(state.level==="subsystem")drillMachine(state.machine); else if(state.level==="machine")goFleet(); else if(state.level==="mission")goMissions(); else if(state.level==="missions")goFleet(); };
 // Scrubbing moves the playhead and (RE-)ENGAGES following — render()'s follow
 // branch reselects the newest VISIBLE record at the new state.t, so the
 // selection tracks the playhead (never strands one record ahead of it) and the
@@ -1454,6 +1551,8 @@ const ACTIONS={
   query:a=>setQuery(a||""),
   rec:a=>selectRec(Number(a)),
   fleet:()=>goFleet(),
+  missions:()=>goMissions(),
+  missiondrill:a=>drillMission(a),
   mission:()=>goMission(),
   recentall:()=>toggleRecentAll(),
   filters:()=>openFilters(),
@@ -1877,6 +1976,10 @@ async function boot(){
   // the static demo (flowSrc, no daemon) and the no-daemon state don't have —
   // show the button only when there's a daemon behind us.
   if(!flowSrc && mode!=="no-daemon"){ const cb=$("catbtn"); if(cb) cb.hidden=false; }
+  // (#827 Slice A) Pull the durable mission/sprint plan (best-effort). Absent
+  // under the static demo / no daemon — the missions lens then derives rows
+  // from mission_ids in the flow instead.
+  if(!flowSrc && mode!=="no-daemon"){ await loadMissionsSprints(); }
   setBadges(mode,date);
   recompute();
   state.t=tMax;
