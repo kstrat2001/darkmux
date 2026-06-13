@@ -11,6 +11,71 @@ their own cadence (see `CLAUDE.md`). Semver stability begins at 1.0.
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-06-13
+
+darkmux 1.0 — semver stability begins. The release that closes the loop:
+darkmux now runs the full local dispatch-to-PR cycle, shows the work (and the
+savings) live, and was used to build itself — the observability features in
+this release were shipped through `mission run`, and the savings figure on
+darkmux.com is this release's own development telemetry.
+
+### Added
+- **`mission run` / `mission ship` / `mission abort` — the local dispatch-to-PR
+  loop (#782).** `run` creates an isolated git worktree, dispatches the coder
+  (sprint-bound, internal runtime), runs the local `code-reviewer` QA against
+  the diff, and STOPS at a sign-off gate; `ship` commits, pushes, opens the PR,
+  and (opt-in, green-gated) squash-merges — never auto-merge (#786, #787, #788).
+- **Verbatim spec fidelity (#815).** `mission propose --ticket <ID>` stamps the
+  operator's unabridged input onto the mission; every coder brief carries it
+  under an authority-stamped provenance block, so exact strings and constraints
+  survive the mission-compiler's summarization (#820).
+- **Repo-level shipping conventions (#816).** `<repo>/.darkmux/conventions.json`
+  — branch/commit-subject/PR-title templates with `{ticket}`/`{sprint}`/
+  `{mission}`/`{subject}` vars, a PR body template, and PR labels. Ship pushes
+  the worktree's actual branch, so mid-flight conventions edits can't drift
+  (#821).
+- **Per-turn token telemetry (#795).** The runtime tailer emits a
+  `telemetry.tokens` flow record per model turn (FLOW_SCHEMA 1.13) — the
+  dashboard's savings odometer climbs live DURING a dispatch (#800).
+- **The savings hero (#783, #803).** "Tokens off the meter" headline with a
+  token-class breakdown — generated / fresh input / re-read input — that
+  teaches the agent-loop economics (a typical day: ~90% of input is re-read
+  context). Tokens only, never currency (#791–#793, #804, #805).
+- **Orchestrator notes (#807, #817, #819).** A real channel for the frontier
+  orchestrator's voice: `darkmux flow note --source orchestrator` renders as
+  the card's conclusion with a history modal; gate/ship print ready-to-paste
+  scaffolds (session-id pre-filled) splitting upbeat dashboard notes from
+  session-scoped technical adjudications; ship soft-warns when a gated sprint
+  ships with a noteless trail (#808, #812, #818, #819, #822).
+- **Live diff (#756).** `GET /diff/:session_id` serves the running git diff of
+  a mission-run worktree (path-contained, ref-validated, size-bounded); the
+  session view renders it live — watch the agent's code form in real time. The
+  endpoint was built end-to-end by the local coder through `mission run`
+  (#801, #802).
+- **Activity-driven live headline (#789).** The viewer's headline tracks the
+  live session (mission-scoped → clickable) and reads an affirmative fleet
+  status when idle (#790).
+- **CLI styling pass (#772–#776).** Semantic color across doctor / scan /
+  model-status / profiles / dispatch telemetry, tty-gated (#777–#781).
+- **Runtime image on GHCR (#759).** The `darkmux-runtime` image publishes on
+  release and pulls on demand — `brew install darkmux` alone can dispatch
+  (#764, #765).
+- **darkmux.com refresh.** Homebrew-first install docs, copy-to-clipboard on
+  all snippets, and the live savings-hero screenshot under the why-headline —
+  real work, real telemetry, not a mockup (#763, #766–#770, #784/#823).
+
+### Fixed
+- **Saturated Redis streams no longer drop the live tail (#809).** Day reads
+  and fleet completion-waits now read newest-first (`XREVRANGE`); at the
+  `MAXLEN` cap the oldest records age out instead of the newest vanishing
+  (#810).
+- **Live-tail idempotency (#794).** SSE re-delivery is identity-deduped so
+  cumulative readouts can't inflate and "reset" on refresh (#796).
+- Activity-timeline rightmost bar no longer clips past the track (#797);
+  savings hero is always visible and compact on mobile (#792, #793).
+
+[1.0.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.0.0
+
 ## [0.9.0] - 2026-06-11
 
 First tagged release. 0.9.0 exercises the full Homebrew + release pipeline ahead

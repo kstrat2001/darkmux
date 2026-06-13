@@ -372,7 +372,7 @@ The case for darkmux: **once you accept that static configs leave performance on
 
 ## Status
 
-🚧 **Pre-1.0** — v0.9.0 on `main`; active development; APIs not yet frozen.
+✅ **v1.0.0** — semver stability begins; the dispatch-to-PR loop, live observability, and the Homebrew pipeline are the stable surface.
 
 **Shipped:**
 
