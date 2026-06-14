@@ -10,9 +10,9 @@ darkmux orchestrates **local** LLMs to do real work — a profile multiplexer + 
 
 ## Now — M4: Dispatch-to-PR loop depth
 
-The lead theme. Make the daily-driver loop rock-solid and formalize it as a first-class capability: the orchestration loop (coder → fresh-context review → fix → frontier sign-off → PR), its failure modes, and its termination discipline.
+The lead theme. Harden the daily-driver loop and formalize it as a first-class capability: the orchestration loop (coder → fresh-context review → fix → frontier sign-off → PR), its failure modes, and its termination discipline.
 
-This theme is **grounded in the loop-engineering literature** — the field crystallized into a named discipline over the last several months, and the research validates the architecture darkmux already ships (observability-driven detectors, cross-context verification). Key items carry the citations:
+This theme is **grounded in the loop-engineering literature**: the field crystallized into a named discipline over the past year, and the research supports the architecture darkmux already ships (observability-driven detectors, cross-context verification). Key items carry the citations:
 
 - [#799](https://github.com/kstrat2001/darkmux/issues/799) — terminate on a **verifiable check**, never agent self-assessment. Process-reward-model research shows step-wise verification catches *silent errors* (code runs, result wrong) that outcome-only checks miss ([arXiv 2604.24198](https://arxiv.org/abs/2604.24198)); self-verification in the same context is mostly confirmatory, not corrective ([arXiv 2602.03485](https://arxiv.org/abs/2602.03485)). **Lead item.**
 - [#849](https://github.com/kstrat2001/darkmux/issues/849) — persist corrections into the next brief (doom-loop fix) + recheck-vs-rethink escalation, with **quantified escalation budgets** ([Graph-Harness termination, arXiv 2604.11378](https://arxiv.org/abs/2604.11378))

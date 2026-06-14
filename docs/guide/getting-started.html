@@ -47,7 +47,7 @@
         <td>Download via the LMStudio UI; verify with <code>lms ls</code>.</td>
       </tr>
     </table>
-    <p class="muted"><code>brew install</code> needs no toolchain — Homebrew handles the build, and bottled binaries (once published) ship precompiled. The <strong>Rust toolchain</strong> is needed only for the from-source path below, which documents <code>rustup</code> at its first step.</p>
+    <p class="muted"><code>brew install</code> needs no toolchain. Homebrew handles the build, and bottled binaries (once published) ship precompiled. The <strong>Rust toolchain</strong> is needed only for the from-source path below, which documents <code>rustup</code> at its first step.</p>
     <p class="muted">darkmux is developed and tested on Apple Silicon. Linux should work; Intel Mac is untested.</p>
 
     <h3>For the dispatch + lab path</h3>
@@ -56,7 +56,7 @@
       <tr><th>Tool</th><th>When you need it</th></tr>
       <tr>
         <td><a href="https://www.docker.com/products/docker-desktop">Docker</a></td>
-        <td><strong>Required for <code>darkmux crew dispatch</code> / <code>lab run</code></strong> — the default internal runtime. The dispatch runs in a per-invocation <code>darkmux-runtime</code> container; build the image once with <code>docker build -t darkmux-runtime:latest runtime/</code>. Skip only if you opt out via <code>--runtime openclaw</code>.</td>
+        <td><strong>Required for <code>darkmux crew dispatch</code> / <code>lab run</code></strong> (the default internal runtime). The dispatch runs in a per-invocation <code>darkmux-runtime</code> container; build the image once with <code>docker build -t darkmux-runtime:latest runtime/</code>. Skip only if you opt out via <code>--runtime openclaw</code>.</td>
       </tr>
       <tr>
         <td>An agent runtime (e.g. <a href="https://github.com/openclaw/openclaw">OpenClaw</a>, Aider, Cline)</td>
@@ -64,7 +64,7 @@
       </tr>
       <tr>
         <td><a href="https://claude.com/claude-code">Claude Code</a> (or any frontier orchestrator)</td>
-        <td><strong>Recommended.</strong> darkmux is designed to be <em>driven</em> by a frontier orchestrator — <code>darkmux init</code> installs agent skills (including the <code>/darkmux-bootstrap</code> setup skill) and dispatches agentic work through one. The bare CLI works without it, but the orchestrator is the intended path — see <a href="#orchestrator">Recommended: let your orchestrator set it up</a> below.</td>
+        <td><strong>Recommended.</strong> darkmux is designed to be <em>driven</em> by a frontier orchestrator. <code>darkmux init</code> installs agent skills (including the <code>/darkmux-bootstrap</code> setup skill) and dispatches agentic work through one. The bare CLI works without it, but the orchestrator is the intended path; see <a href="#orchestrator">Recommended: let your orchestrator set it up</a> below.</td>
       </tr>
     </table>
   </div>
@@ -74,7 +74,7 @@
   <div class="wrap">
     <h2>Install + bootstrap</h2>
 
-    <h3>Recommended path — via Homebrew tap</h3>
+    <h3>Recommended path: via Homebrew tap</h3>
     <p>Works from a fresh macOS machine that has LMStudio installed:</p>
     <pre><code><span class="comment"># 1. Tap + install</span>
 brew tap kstrat2001/darkmux
@@ -86,8 +86,8 @@ darkmux init</code></pre>
     <p>The tap is at <a href="https://github.com/kstrat2001/homebrew-darkmux">kstrat2001/homebrew-darkmux</a>. The formula installs the <code>darkmux</code> CLI + <code>serve</code> daemon + the keychain-aware wrapper script. For the production-grade always-on hub setup (Redis hardening, audit substrate, log rotation, daily integrity checks), see the <a href="always-on-hub.html">always-on hub guide</a>.</p>
     <p><strong>Updating</strong> later is then <code>brew upgrade darkmux</code> (+ <code>brew services restart darkmux</code> if you have the daemon running).</p>
 
-    <h3>From-source path — for contributors</h3>
-    <p>You don't need this just to dispatch: the <code>darkmux-runtime</code> Docker image (used by <code>darkmux crew dispatch</code> and <code>darkmux lab run</code>) is pulled from GHCR on demand on the first dispatch (<a href="https://github.com/kstrat2001/darkmux/issues/759">#759</a>) — a brew install is complete. Use this path if you're contributing to darkmux, or want to build the runtime image offline instead of pulling it:</p>
+    <h3>From-source path: for contributors</h3>
+    <p>You don't need this to dispatch: the <code>darkmux-runtime</code> Docker image (used by <code>darkmux crew dispatch</code> and <code>darkmux lab run</code>) is pulled from GHCR on demand on the first dispatch (<a href="https://github.com/kstrat2001/darkmux/issues/759">#759</a>), so a brew install is complete. Use this path if you're contributing to darkmux, or want to build the runtime image offline instead of pulling it:</p>
     <pre><code><span class="comment"># 1. Install Rust toolchain (skip if `cargo --version` already works)</span>
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source "$HOME/.cargo/env"
@@ -104,7 +104,7 @@ docker build -t darkmux-runtime:latest runtime/
 darkmux init</code></pre>
     <div class="callout">
       <strong>Heads up.</strong>
-      <p style="margin: 6px 0 0;">The <code>source "$HOME/.cargo/env"</code> line is the one most often missed. Without it, a fresh <code>cargo install</code> fails with <code>command not found: cargo</code> in the same shell that just ran the rustup installer.</p>
+      <p style="margin: 6px 0 0;">The <code>source "$HOME/.cargo/env"</code> line is the one people miss most. Without it, a fresh <code>cargo install</code> fails with <code>command not found: cargo</code> in the same shell that just ran the rustup installer.</p>
     </div>
   </div>
 </section>
@@ -112,23 +112,23 @@ darkmux init</code></pre>
 <section id="orchestrator">
   <div class="wrap">
     <h2>Recommended: let your orchestrator set it up</h2>
-    <p>darkmux is built to be <em>driven</em> by a frontier orchestrator — a <a href="https://claude.com/claude-code">Claude Code</a>, Gemini, Antigravity, Cursor, Codex, or Copilot session that runs the loop, reads the project docs, and proposes the commands. <code>darkmux init</code> installs the agent skills + guidance for exactly this. <strong>The recommended way to finish setup — and to operate darkmux day to day — is from inside an orchestrator session, not by hand.</strong></p>
+    <p>darkmux is built to be <em>driven</em> by a frontier orchestrator: a <a href="https://claude.com/claude-code">Claude Code</a>, Gemini, Antigravity, Cursor, Codex, or Copilot session that runs the loop, reads the project docs, and proposes the commands. <code>darkmux init</code> installs the agent skills + guidance for exactly this. <strong>The recommended way to finish setup (and to operate darkmux day to day) is from inside an orchestrator session, not by hand.</strong></p>
 
     <p><strong>Whichever frontier model you prefer, the first move is the same: have it read the project docs.</strong> They're written for any agent and carry darkmux's operating doctrine:</p>
     <ul>
-      <li><a href="https://github.com/kstrat2001/darkmux/blob/main/README.md"><code>README.md</code></a> — what darkmux is for (the north-star) + the quick start.</li>
-      <li><a href="https://github.com/kstrat2001/darkmux/blob/main/CLAUDE.md"><code>CLAUDE.md</code></a> / <a href="https://github.com/kstrat2001/darkmux/blob/main/AGENTS.md"><code>AGENTS.md</code></a> — the agent-facing operating doctrine. Claude Code auto-loads <code>CLAUDE.md</code>; Antigravity / Gemini / Codex / Cursor auto-load <code>AGENTS.md</code> — same doctrine, both conventions shipped.</li>
-      <li><a href="https://github.com/kstrat2001/darkmux/blob/main/DESIGN.md"><code>DESIGN.md</code></a> — the implementation reasoning, when the agent needs the "why."</li>
-      <li>This guide — the operator-facing walkthrough the agent can follow step by step.</li>
+      <li><a href="https://github.com/kstrat2001/darkmux/blob/main/README.md"><code>README.md</code></a>: what darkmux is for (the north-star) + the quick start.</li>
+      <li><a href="https://github.com/kstrat2001/darkmux/blob/main/CLAUDE.md"><code>CLAUDE.md</code></a> / <a href="https://github.com/kstrat2001/darkmux/blob/main/AGENTS.md"><code>AGENTS.md</code></a>: the agent-facing operating doctrine. Claude Code auto-loads <code>CLAUDE.md</code>; Antigravity / Gemini / Codex / Cursor auto-load <code>AGENTS.md</code>. Same doctrine, both conventions shipped.</li>
+      <li><a href="https://github.com/kstrat2001/darkmux/blob/main/DESIGN.md"><code>DESIGN.md</code></a>: the implementation reasoning, for when the agent needs the "why."</li>
+      <li>This guide: the operator-facing walkthrough the agent can follow step by step.</li>
     </ul>
 
     <p><strong>Claude Code</strong> gets a head start: open a session in your working directory and run the guided setup skill (installed by <code>darkmux init</code>):</p>
     <pre><code>/darkmux-bootstrap</code></pre>
-    <p>It walks the whole setup interactively — detecting your hardware tier, downloading the recommended models, registering profiles, declaring the orchestrator for flow-record provenance, and validating the end state with <code>darkmux doctor</code>. The skill <strong>reads and proposes; you run the commands</strong>, so you stay in the loop with provenance on every step. On any other frontier, point the session at the docs above and ask it to do the same — the steps below are exactly what it follows. (First-class bootstrap skills for Gemini / Codex / Copilot are on the roadmap — <a href="https://github.com/kstrat2001/darkmux/issues/179">#179</a>.)</p>
+    <p>It walks the whole setup interactively: detecting your hardware tier, downloading the recommended models, registering profiles, declaring the orchestrator for flow-record provenance, and validating the end state with <code>darkmux doctor</code>. The skill <strong>reads and proposes; you run the commands</strong>, so you stay in the loop with provenance on every step. On any other frontier, point the session at the docs above and ask it to do the same; the steps below are exactly what it follows. (First-class bootstrap skills for Gemini / Codex / Copilot are on the roadmap: <a href="https://github.com/kstrat2001/darkmux/issues/179">#179</a>.)</p>
 
     <div class="callout good">
       <strong>Why orchestrator-first?</strong>
-      <p style="margin: 6px 0 0;">darkmux's reason for existing is local-AI orchestration — the frontier model is the strategist that drives your local models, and setup is the first place that shows up. Everything from here down documents the <em>same steps by hand</em>: read it to understand what the orchestrator does for you, or follow it directly if you're running darkmux as a bare CLI.</p>
+      <p style="margin: 6px 0 0;">darkmux's reason for existing is local-AI orchestration: the frontier model is the strategist that drives your local models, and setup is the first place that shows up. Everything from here down documents the <em>same steps by hand</em>: read it to understand what the orchestrator does for you, or follow it directly if you're running darkmux as a bare CLI.</p>
     </div>
   </div>
 </section>
@@ -140,32 +140,32 @@ darkmux init</code></pre>
     <pre><code>darkmux doctor</code></pre>
     <p>Each check returns Pass, Warn, or Fail. Fail-level lines include actionable hints; the exit code is 0 on all-pass-or-warn, 1 if anything Fails.</p>
 
-    <p>Output is one line per check, color-coded: <code>✓</code> for Pass, <code>!</code> for Warn, <code>✗</code> for Fail. Run it yourself on a fresh setup — that's the canonical reference for what it looks like.</p>
+    <p>Output is one line per check, color-coded: <code>✓</code> for Pass, <code>!</code> for Warn, <code>✗</code> for Fail. Run it yourself on a fresh setup. That's the canonical reference for what it looks like.</p>
 
     <p>Common first-run warnings:</p>
     <ul>
-      <li><strong><code>daemon: reachable</code> Warn</strong> — you haven't started <code>darkmux serve</code> yet. That's fine for now; you'll start it in the <a href="observability.html">Observability</a> section.</li>
-      <li><strong><code>profile match</code> Warn</strong> — your <code>~/.darkmux/profiles.json</code> doesn't yet reference what's loaded in LMStudio. That's also fine — we fix it next.</li>
-      <li><strong><code>runtime version</code> Warn</strong> — your installed agent runtime is older than darkmux's validated minimum. If you're not running an orchestrator, you can ignore this for now.</li>
+      <li><strong><code>daemon: reachable</code> Warn</strong>: you haven't started <code>darkmux serve</code> yet. That's fine for now; you start it in the <a href="observability.html">Observability</a> section.</li>
+      <li><strong><code>profile match</code> Warn</strong>: your <code>~/.darkmux/profiles.json</code> doesn't yet reference what's loaded in LMStudio. That's also fine, we fix it next.</li>
+      <li><strong><code>runtime version</code> Warn</strong>: your installed agent runtime is older than darkmux's validated minimum. If you're not running an orchestrator, you can ignore this for now.</li>
     </ul>
   </div>
 </section>
 
 <section>
   <div class="wrap">
-    <h2>Configure your first profile <span class="muted" style="font-weight:400">— or let <code>/darkmux-bootstrap</code> do it</span></h2>
+    <h2>Configure your first profile <span class="muted" style="font-weight:400">(or let <code>/darkmux-bootstrap</code> do it)</span></h2>
     <p class="muted">This is the manual version of what the <a href="#orchestrator"><code>/darkmux-bootstrap</code></a> skill does for you. Follow it to understand the moving parts, or if you're running darkmux without an orchestrator.</p>
-    <p>A profile is a named loadout — which model(s) to keep resident in LMStudio at which context length. Profiles live in <code>~/.darkmux/profiles.json</code> (created by <code>darkmux init</code>).</p>
+    <p>A profile is a named loadout: which model(s) to keep resident in LMStudio at which context length. Profiles live in <code>~/.darkmux/profiles.json</code> (created by <code>darkmux init</code>).</p>
     <h3>Inspect what's already there</h3>
     <pre><code>darkmux profiles                  <span class="comment"># list configured profiles</span>
 cat ~/.darkmux/profiles.json      <span class="comment"># see the actual JSON</span></code></pre>
-    <p>The bootstrap config ships with four reference profiles in increasing capacity — <code>fast</code> (32K), <code>balanced</code> (100K), <code>deep</code> (200K), and a <code>gpt-oss</code> preset (the 120B MXFP4 build for Apple Silicon, at 100K). <code>fast</code>/<code>balanced</code>/<code>deep</code> carry a placeholder worker id, <code>&lt;your-worker-model-id&gt;</code>, for you to fill in; <code>gpt-oss</code> ships a concrete id (<code>mlx-community/gpt-oss-120b-MXFP4-Q8</code>). The <strong>default profile is <code>balanced</code></strong> — not the 120B preset.</p>
+    <p>The bootstrap config ships with four reference profiles in increasing capacity: <code>fast</code> (32K), <code>balanced</code> (100K), <code>deep</code> (200K), and a <code>gpt-oss</code> preset (the 120B MXFP4 build for Apple Silicon, at 100K). <code>fast</code>/<code>balanced</code>/<code>deep</code> carry a placeholder worker id, <code>&lt;your-worker-model-id&gt;</code>, for you to fill in; <code>gpt-oss</code> ships a concrete id (<code>mlx-community/gpt-oss-120b-MXFP4-Q8</code>). The <strong>default profile is <code>balanced</code></strong>, not the 120B preset.</p>
 
     <h3>Swap a real model id in</h3>
-    <p>The quickest way: <code>darkmux scan</code> lists the models LMStudio has downloaded that aren't yet in any profile, with a suggestion for each — so you can see what's available to slot in without hand-matching ids.</p>
+    <p>The quickest way: <code>darkmux scan</code> lists the models LMStudio has downloaded that aren't yet in any profile, with a suggestion for each, so you can see what's available to slot in without hand-matching ids.</p>
     <pre><code><span class="comment"># Downloaded models not yet in a profile, with suggestions</span>
 darkmux scan</code></pre>
-    <p>Then replace a placeholder in <code>profiles.json</code> with a real id (<code>lms ls</code> shows the raw list if you prefer). Pick one to start — whatever you've been using day-to-day:</p>
+    <p>Then replace a placeholder in <code>profiles.json</code> with a real id (<code>lms ls</code> shows the raw list if you prefer). Pick one to start, whatever you've been using day-to-day:</p>
     <pre><code><span class="comment"># See what's available (raw)</span>
 lms ls
 
@@ -173,10 +173,10 @@ lms ls
 ${EDITOR:-vim} ~/.darkmux/profiles.json</code></pre>
     <p>Each profile model has two fields that matter:</p>
     <ul>
-      <li><code>id</code> — the LMStudio model id from <code>lms ls</code> output (e.g. <code>qwen3.6-35b-a3b</code>).</li>
-      <li><code>n_ctx</code> — context length to load at. Defaults are usually fine; <code>32768</code> is a safe starter for any model.</li>
+      <li><code>id</code>: the LMStudio model id from <code>lms ls</code> output (e.g. <code>qwen3.6-35b-a3b</code>).</li>
+      <li><code>n_ctx</code>: context length to load at. Defaults are usually fine; <code>32768</code> is a safe starter for any model.</li>
     </ul>
-    <p>Profile models are <strong>worker</strong> models — there's no per-model <code>role</code> field (it was removed in <a href="https://github.com/kstrat2001/darkmux/issues/590">#590</a>). The standing utility/compactor model is declared once for the machine in the top-level <code>internal.utility</code> binding, not per profile. If a profile lists more than one worker, an optional <code>default_model</code> names which one is the default.</p>
+    <p>Profile models are <strong>worker</strong> models. There's no per-model <code>role</code> field (it was removed in <a href="https://github.com/kstrat2001/darkmux/issues/590">#590</a>). The standing utility/compactor model is declared once for the machine in the top-level <code>internal.utility</code> binding, not per profile. If a profile lists more than one worker, an optional <code>default_model</code> names which one is the default.</p>
 
     <h3>Verify the edits</h3>
     <pre><code>darkmux profiles                  <span class="comment"># the profile should now list your model</span>
@@ -187,29 +187,29 @@ darkmux doctor                    <span class="comment"># confirm "profile match
     <pre><code>darkmux swap recommended --dry-run    <span class="comment"># resolves your tier → validated profile → pre-flight checks</span>
 darkmux model pull-recommended        <span class="comment"># downloads any missing models via `lms get`</span>
 darkmux swap recommended              <span class="comment"># load them for real</span></code></pre>
-    <p>On Apple Silicon 96+ GB (<code>m-series-128</code>), the validated recommendation pairs a 35B-A3B MoE primary with a 4B compactor (specific model ids in the registry). Other tiers carry a <code>pending-bake-off</code> status — the verb errors loudly with the rationale, surfacing the gap rather than silently picking. Doctor's <code>recommendation-drift</code> check warns when your loaded models don't match the registry's pick.</p>
+    <p>On Apple Silicon 96+ GB (<code>m-series-128</code>), the validated recommendation pairs a 35B-A3B MoE primary with a 4B compactor (specific model ids in the registry). Other tiers carry a <code>pending-bake-off</code> status: the verb errors loudly with the rationale, surfacing the gap rather than silently picking. Doctor's <code>recommendation-drift</code> check warns when your loaded models don't match the registry's pick.</p>
   </div>
 </section>
 
 <section>
   <div class="wrap">
     <h2>Your first swap</h2>
-    <p><code>darkmux swap &lt;profile&gt;</code> atomically transitions LMStudio's loaded model set to match the named profile: it unloads anything that doesn't belong and loads what does. By default it writes nothing outside LMStudio — the internal runtime reads the loaded model directly. If you dispatch through openclaw, add <code>--runtime openclaw</code> and swap will also patch <code>~/.openclaw/openclaw.json</code> to reference the now-loaded identifier; without that flag, no config file is touched.</p>
+    <p><code>darkmux swap &lt;profile&gt;</code> transitions LMStudio's loaded model set to match the named profile: it unloads anything that doesn't belong and loads what does. By default it writes nothing outside LMStudio. The internal runtime reads the loaded model directly. If you dispatch through openclaw, add <code>--runtime openclaw</code> and swap will also patch <code>~/.openclaw/openclaw.json</code> to reference the now-loaded identifier; without that flag, no config file is touched.</p>
     <pre><code>darkmux status                    <span class="comment"># what's loaded right now; which profile (if any) matches</span>
 darkmux swap fast                 <span class="comment"># load the "fast" profile</span>
-darkmux status                    <span class="comment"># confirm — should show "fast" as the active profile</span></code></pre>
+darkmux status                    <span class="comment"># confirm: should show "fast" as the active profile</span></code></pre>
 
     <div class="callout good">
       <strong>What just happened.</strong>
-      <p style="margin: 6px 0 0;">darkmux issued <code>lms load</code> for your profile's primary model with a <code>darkmux:</code> namespace prefix (so darkmux can recognize its own loads later), set the context length, and reported success. Nothing outside LMStudio was modified — the internal runtime resolves the loaded model directly. (Had you run <code>darkmux swap fast --runtime openclaw</code>, swap would additionally patch <code>~/.openclaw/openclaw.json</code> so an openclaw dispatch routes to the loaded identifier.)</p>
+      <p style="margin: 6px 0 0;">darkmux issued <code>lms load</code> for your profile's primary model with a <code>darkmux:</code> namespace prefix (so darkmux can recognize its own loads later), set the context length, and reported success. Nothing outside LMStudio was modified. The internal runtime resolves the loaded model directly. (Had you run <code>darkmux swap fast --runtime openclaw</code>, swap would additionally patch <code>~/.openclaw/openclaw.json</code> so an openclaw dispatch routes to the loaded identifier.)</p>
     </div>
 
-    <p>If swap reports a warning about RAM headroom or a model not found in <code>lms ls</code>, that's doctor-style feedback at swap time — usually fixable by either trimming context length or downloading the model first via the LMStudio UI.</p>
+    <p>If swap reports a warning about RAM headroom or a model not found in <code>lms ls</code>, that's doctor-style feedback at swap time, usually fixable by either trimming context length or downloading the model first via the LMStudio UI.</p>
 
     <h3>The smoke test</h3>
     <pre><code>darkmux lab run quick-q           <span class="comment"># single-turn smoke prompt against the active profile</span>
 darkmux lab inspect &lt;run-id&gt;      <span class="comment"># quick look at what happened</span></code></pre>
-    <p>This runs through darkmux's default internal Docker-bounded runtime — build the <code>darkmux-runtime</code> image once (see the <a href="lab.html">lab</a> section) and it works with no external runtime. To dispatch through openclaw instead, pass <code>--runtime openclaw</code>. If you have neither Docker nor openclaw set up yet, skip this step and come back after reading the lab section.</p>
+    <p>This runs through darkmux's default internal Docker-bounded runtime. Build the <code>darkmux-runtime</code> image once (see the <a href="lab.html">lab</a> section) and it works with no external runtime. To dispatch through openclaw instead, pass <code>--runtime openclaw</code>. If you have neither Docker nor openclaw set up yet, skip this step and come back after reading the lab section.</p>
   </div>
 </section>
 
@@ -218,7 +218,7 @@ darkmux lab inspect &lt;run-id&gt;      <span class="comment"># quick look at wh
     <h2>What's next</h2>
     <p>If you set up via <a href="#orchestrator"><code>/darkmux-bootstrap</code></a> (or had your orchestrator follow the steps above), your profiles, models, and orchestrator declaration are already in place. Pick a direction:</p>
     <ul>
-      <li>If you want to see darkmux operate visually as you work: <a href="observability.html">Observability — daemon + viewer</a>.</li>
+      <li>If you want to see darkmux operate visually as you work: <a href="observability.html">Observability: daemon + viewer</a>.</li>
       <li>If you want to benchmark / characterize your hardware against a workload: <a href="lab.html">The lab harness</a>.</li>
       <li>If you're integrating with an orchestrator for agentic work: <a href="missions.html">Missions, sprints, and crew dispatch</a>.</li>
     </ul>

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>darkmux — AI-first local-AI orchestrator for Apple Silicon</title>
-<meta name="description" content="AI-first local-AI orchestrator. Uses local-AI internally to manage your local-AI workflows — profile multiplexing, utility-agent verbs, live observability, mission/sprint lifecycle. Built on real benchmarks.">
+<meta name="description" content="AI-first local-AI orchestrator. Uses local-AI internally to manage your local-AI workflows: profile multiplexing, utility-agent verbs, live observability, mission/sprint lifecycle. Built on real benchmarks.">
 <meta property="og:title" content="darkmux">
 <meta property="og:description" content="AI-first local-AI orchestrator for Apple Silicon. Uses local-AI internally to manage your local-AI workflows.">
 <meta property="og:url" content="https://darkmux.com">
@@ -227,7 +227,7 @@
   <div class="wrap">
     <div class="brand">darkly energized<span class="dot">·</span>open source</div>
     <h1>darkmux<span class="cursor">_</span></h1>
-    <p class="tag"><strong>Own your AI workforce.</strong> The capable local models your <span class="accent">Apple Silicon</span> already runs — directed by your frontier, off the meter, on your hardware.</p>
+    <p class="tag"><strong>Own your AI workforce.</strong> The capable local models your <span class="accent">Apple Silicon</span> already runs, directed by your frontier, off the meter, on your hardware.</p>
     <div class="install">
       <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">brew tap kstrat2001/darkmux</span><button class="copy-btn" data-copy="brew tap kstrat2001/darkmux" aria-label="Copy command">Copy</button></div>
       <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">brew install darkmux</span><button class="copy-btn" data-copy="brew install darkmux" aria-label="Copy command">Copy</button></div>
@@ -245,11 +245,11 @@
   <div class="wrap">
     <h2>Why darkmux exists</h2>
     <h3>You don't have to rent every token — the AI workforce is already sitting in your Mac.</h3>
-    <p>darkmux started as a lab for testing faster local AI on Apple Silicon. The belief that came out of it: <strong>a frontier model is a brilliant strategist you rent by the token — and burning those tokens on compaction, scaffolding, test runs, and structuring is paying rent for busy work, plus handing your data to someone else's cloud to do it.</strong> The Apple Silicon you already bought runs capable open-source models locally — no cloud account, no per-token meter, nothing leaving your disk. Many Mac owners don't make full use of the hardware they paid for; darkmux gives you the tools to fully utilize that silicon.</p>
-    <p class="muted">Every default in darkmux comes from a measured result, not a guess — the repo is the evidence locker; the <a href="https://substack.com/@DarklyEnergized">writing</a> is the narrative.</p>
+    <p>darkmux started as a lab for testing faster local AI on Apple Silicon. The belief that came out of it: <strong>a frontier model is a brilliant strategist you rent by the token. Burning those tokens on compaction, scaffolding, test runs, and structuring is paying rent for busy work, plus handing your data to someone else's cloud to do it.</strong> The Apple Silicon you already bought runs capable open-source models locally — no cloud account, no per-token meter, nothing leaving your disk. Many Mac owners don't make full use of the hardware they paid for; darkmux gives you the tools to use that silicon.</p>
+    <p class="muted">Every default in darkmux comes from a measured result, not a guess. The repo is the evidence locker; the <a href="https://substack.com/@DarklyEnergized">writing</a> is the narrative.</p>
     <figure class="shot">
-      <img src="media/savings-hero-live.png" alt="darkmux live dashboard: 9,721,748 tokens off the meter in 24 hours — broken into 157k generated, 395k fresh input, 9.2M re-read input across 22 local dispatches on two machines, with an orchestrator note concluding the day's work" loading="lazy">
-      <figcaption>A real day on a two-Mac fleet: 9.7M tokens stayed home — and the breakdown teaches why agent loops devour them (94% was re-read context). Live dashboard, not a mockup.</figcaption>
+      <img src="media/savings-hero-live.png" alt="darkmux live dashboard: 9,721,748 tokens off the meter in 24 hours, broken into 157k generated, 395k fresh input, 9.2M re-read input across 22 local dispatches on two machines, with an orchestrator note concluding the day's work" loading="lazy">
+      <figcaption>A real day on a two-Mac fleet: 9.7M tokens stayed home, and the breakdown teaches why agent loops devour them (94% was re-read context). Live dashboard, not a mockup.</figcaption>
     </figure>
   </div>
 </section>
@@ -257,15 +257,15 @@
 <section>
   <div class="wrap">
     <h2>On-demand crews, not a pyramid</h2>
-    <h3>An AI workforce — not a bureaucracy of bots.</h3>
-    <p>The obvious way to build a multi-agent tool was to copy the company — a boss model delegating to manager models delegating to workers, a pyramid of cloud agents renting tokens just to talk to each other. But the org chart exists to route around <em>human</em> limits — span of control, careers, reporting lines — and none of those bind a model that spins up for one job and vanishes. So darkmux has no pyramid. One principal — <strong>you</strong> — leverages an orchestration harness (e.g. Claude Code) that assembles crews on demand for the mission and dissolves them when the work is done. The capable model shapes the work, the local crew does it, <strong>you decide what runs.</strong></p>
+    <h3>An AI workforce, not a bureaucracy of bots.</h3>
+    <p>The obvious way to build a multi-agent tool was to copy the company: a boss model delegating to manager models delegating to workers, a pyramid of cloud agents renting tokens to talk to each other. But the org chart exists to route around <em>human</em> limits (span of control, careers, reporting lines), and none of those bind a model that spins up for one job and vanishes. So darkmux has no pyramid. One principal, <strong>you</strong>, leverages an orchestration harness (e.g. Claude Code) that assembles crews on demand for the mission and dissolves them when the work is done. The capable model shapes the work, the local crew does it, <strong>you decide what runs.</strong></p>
   </div>
 </section>
 
 <section>
   <div class="wrap">
     <h2>Swap the loadout</h2>
-    <h3>The right loaded model, context length, and compaction profile for each task — named, not remembered.</h3>
+    <h3>The right loaded model, context length, and compaction profile for each task: named, not remembered.</h3>
     <p>You shouldn't have to remember whether your fast bounded-task stack is loaded right now, or whether the deep-agentic profile got swapped out an hour ago when you ran a different test. darkmux makes the loadout an explicit, named thing.</p>
     <ul class="plain">
       <li><code>darkmux profiles</code> — list named stacks (combinations of LMStudio models at specified context lengths)</li>
@@ -280,7 +280,7 @@
   <div class="wrap">
     <h2>Watch it work</h2>
     <h3>A daemon + viewer for live observability of dispatches, sprints, and verdicts.</h3>
-    <p><code>darkmux serve</code> runs a small HTTP daemon (default <code>127.0.0.1:8765</code>) that exposes flow records written by every dispatch and mission/sprint transition. The <a href="demo/">observability viewer</a> renders those records as one drillable view of your fleet — drill fleet → machine → subsystem, with the event stream as a log lens at any level. A <a href="demo/">live demo with sample data</a> runs on this site. Wall-clock arcs on dispatch records; <code>model</code> field tells you which LMStudio model ran the work.</p>
+    <p><code>darkmux serve</code> runs a small HTTP daemon (default <code>127.0.0.1:8765</code>) that exposes the flow records written by every dispatch and mission/sprint transition. The <a href="demo/">observability viewer</a> renders those records as one drillable view of your fleet: drill fleet → machine → subsystem, with the event stream as a log lens at any level. A <a href="demo/">live demo with sample data</a> runs on this site. Wall-clock arcs on dispatch records; <code>model</code> field tells you which LMStudio model ran the work.</p>
     <ul class="plain">
       <li><code>darkmux serve</code> — start the daemon in a separate terminal tab</li>
       <li><code>darkmux doctor</code> — pre-flight checks including <code>daemon: reachable</code></li>
@@ -295,7 +295,7 @@
   <div class="wrap">
     <h2>The lab</h2>
     <h3>A measurement harness, not a config tool dressed up as one.</h3>
-    <p>Every <code>darkmux lab run</code> writes a manifest, a trajectory, and per-turn timing under <code>.darkmux/runs/&lt;id&gt;/</code> — so wall-clock variance, compaction events, and per-profile behavior are inspectable after the fact. Not in your head. On disk.</p>
+    <p>Every <code>darkmux lab run</code> writes a manifest, a trajectory, and per-turn timing under <code>.darkmux/runs/&lt;id&gt;/</code>, so wall-clock variance, compaction events, and per-profile behavior are inspectable after the fact. Not in your head. On disk.</p>
     <ul class="plain">
       <li><code>lab run quick-q</code> — single-turn smoke prompt against the active profile</li>
       <li><code>lab run long-agentic</code> — the workload that exercises compaction</li>
@@ -303,14 +303,14 @@
       <li><code>lab tune long-agentic --runs 6</code> — bimodal cluster detection across N dispatches</li>
       <li><code>lab compare &lt;A&gt; &lt;B&gt;</code> — diff two runs for variance / regression</li>
     </ul>
-    <p class="muted" style="margin-top: 24px;">Workloads are pluggable via a <code>WorkloadProvider</code> trait. Two ship out of the box (<code>prompt</code>, <code>coding-task</code>); add your own without forking. Full walkthrough in the <a href="guide/lab.html">lab section of the user guide</a>.</p>
+    <p class="muted" style="margin-top: 24px;">Workloads are pluggable via a <code>WorkloadProvider</code> trait. Two ship out of the box (<code>prompt</code>, <code>coding-task</code>); add your own without forking the repo. Full walkthrough in the <a href="guide/lab.html">lab section of the user guide</a>.</p>
   </div>
 </section>
 
 <section>
   <div class="wrap">
     <h2>Advanced: missions, sprints, crew</h2>
-    <h3>Structured agentic work — for operators using darkmux as the local-AI tier of an orchestrator workflow.</h3>
+    <h3>Structured agentic work, for operators using darkmux as the local-AI tier of an orchestrator workflow.</h3>
     <p>Beyond the swap/lab CLI surface, darkmux ships a <em>crew</em> abstraction: named local-AI roles (coder, code-reviewer, scribe) with declared tool palettes and system prompts, plus a <em>mission/sprint</em> lifecycle that tracks multi-step plans as JSON files the operator owns. Optional — none of this is required to use darkmux as a CLI.</p>
     <ul class="plain">
       <li><code>darkmux crew dispatch coder --message "..."</code> — invoke a named role; emits flow records</li>
@@ -338,7 +338,7 @@
     </div>
 
     <div class="warn">
-      <strong>Safety note.</strong> darkmux orchestrates AI tools that execute on your machine. It modifies your local config files and — in lab mode — runs AI-generated code in a working directory that is not a security sandbox. Read the <a href="https://github.com/kstrat2001/darkmux/blob/main/DISCLAIMER.md">DISCLAIMER</a> before running.
+      <strong>Safety note.</strong> darkmux orchestrates AI tools that execute on your machine. It modifies your local config files and, in lab mode, runs AI-generated code in a working directory that is not a security sandbox. Read the <a href="https://github.com/kstrat2001/darkmux/blob/main/DISCLAIMER.md">DISCLAIMER</a> before running.
     </div>
   </div>
 </section>

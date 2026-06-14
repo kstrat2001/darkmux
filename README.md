@@ -2,50 +2,50 @@
 
 **[darkmux.com](https://darkmux.com) · Turn your frontier AI assistant into an engagement-aware orchestrator that distributes AI work across your machines.**
 
-darkmux is the substrate layer — profiles per role, missions per engagement, audit per record, coordination across the fleet. Your frontier holds the engagement context; darkmux gives it the local-AI fleet to operate on.
+darkmux is the substrate layer: profiles per role, missions per engagement, audit per record, coordination across the fleet. Your frontier holds the engagement context; darkmux gives it the local-AI fleet to operate on.
 
 Built for operators who need to see what their AI fleet did, when, and why.
 
-- 🔒 **Hash-chained audit trail with edit detection** — every dispatch, decision, and review captured in a BLAKE3 hash-chained per-machine log; any post-hoc edit to the chain is surfaced by `darkmux flow integrity-check` (exits 2 on chain break, suitable for cron / CI gating).
-- 🤝 **Engagement-aware coordination** — sessions running on different machines share a flow stream, so two Claude Code sessions on two laptops compose into one fleet view rather than two siloed runs.
-- 🎯 **Methodology-driven role specialization** — per-role models selected through documented bake-off methodology; evaluation criteria recorded before the comparison runs.
-- 🔧 **Operator sovereignty by design** — defaults are overridable, writes are auditable, suggestions are explainable.
-- 📊 **Reproducible benchmarks** — `darkmux lab run <workload>` captures timing + trajectory + verify outcome, so empirical claims in the article series can be re-run by anyone with the binary.
+- 🔒 **Hash-chained audit trail with edit detection.** Every dispatch, decision, and review is captured in a BLAKE3 hash-chained per-machine log; `darkmux flow integrity-check` surfaces any post-hoc edit to the chain (exits 2 on chain break, suitable for cron / CI gating).
+- 🤝 **Engagement-aware coordination.** Sessions running on different machines share a flow stream, so two Claude Code sessions on two laptops compose into one fleet view rather than two siloed runs.
+- 🎯 **Methodology-driven role specialization.** Per-role models selected through documented bake-off methodology; evaluation criteria recorded before the comparison runs.
+- 🔧 **Operator sovereignty by design.** Defaults are overridable, writes are auditable, suggestions are explainable.
+- 📊 **Reproducible benchmarks.** `darkmux lab run <workload>` captures timing + trajectory + verify outcome, so anyone with the binary can re-run the empirical claims from the article series.
 
-**AI-first local-AI orchestrator** — darkmux uses local-AI internally to manage your local-AI workflows. Task-class-aware profile multiplexing, utility-agent dispatch verbs (like `mission propose`), and a mission/sprint lifecycle, on top of LMStudio. Developed on Apple Silicon. **Assumes a frontier orchestrator** (Claude Code) — the engagement work happens in the frontier session.
+**AI-first local-AI orchestrator.** darkmux uses local-AI internally to manage your local-AI workflows. Task-class-aware profile multiplexing, utility-agent dispatch verbs (like `mission propose`), and a mission/sprint lifecycle, on top of LMStudio. Developed on Apple Silicon. **Assumes a frontier orchestrator** (Claude Code): the engagement work happens in the frontier session.
 
 > **Heads up — read before running.**
-> darkmux orchestrates AI tools that execute on your machine. It sends commands to your local LMStudio server, can modify your local config files (`~/.openclaw/openclaw.json` — only on the opt-in `--runtime openclaw` / `crew sync` path), and — in lab mode — runs AI-generated code in a working directory that is **not a security sandbox**. AI agents can behave unexpectedly. Use it on a machine where that is acceptable. Performance numbers in this README and in the accompanying articles are measured on the author's hardware (M5 Max, 128 GB) and will differ on yours. See [DISCLAIMER.md](./DISCLAIMER.md) for details. MIT licensed, no warranty, use at your own risk.
+> darkmux orchestrates AI tools that execute on your machine. It sends commands to your local LMStudio server, can modify your local config files (`~/.openclaw/openclaw.json`, only on the opt-in `--runtime openclaw` / `crew sync` path), and in lab mode runs AI-generated code in a working directory that is **not a security sandbox**. AI agents can behave unexpectedly. Use it on a machine where that is acceptable. Performance numbers in this README and the accompanying articles are measured on the author's hardware (M5 Max, 128 GB) and will differ on yours. See [DISCLAIMER.md](./DISCLAIMER.md) for details. MIT licensed, no warranty, use at your own risk.
 
 ## What darkmux is for
 
 Local AI is good at things frontier models aren't — fast iteration, repeatability across hardware, an offline foundation. darkmux exists to make frontier models *better* by giving them complementary teammates running locally. **Diversity-as-synergy, not replacement.**
 
-**The bet.** Faster and better LLM results require solving the *harness* problem, and go hand-in-hand with the *modeling* problem. The [Genesis series](https://darklyenergized.substack.com) on Darkly Energized — three Substack posts — walked from casual comparison through controlled experimentation to the architectural reveal that produced this tool. The same model on the same machine ranged from 25 minutes to 5 minutes depending on which compaction settings the operator chose. darkmux is the engine that captures what the series found.
+**The bet.** Faster and better LLM results require solving the *harness* problem, and go hand-in-hand with the *modeling* problem. The [Genesis series](https://darklyenergized.substack.com) on Darkly Energized — three Substack posts — walk from casual comparison through controlled experimentation to the architectural reveal that produced this tool. The same model on the same machine ranged from 25 minutes to 5 minutes depending on the compaction settings the operator chose. darkmux is the engine that captures what the series found.
 
 **The Genesis series.**
 
 - **[Darkmux Genesis I](https://darklyenergized.substack.com/p/can-a-35b-local-model-write-your)** — *Can a 35B Local Model Write Your Unit Tests?* Sweep many models on the same workload, pick a few that work locally.
-- **[Darkmux Genesis II](https://darklyenergized.substack.com/p/part-2-charting-the-wake)** — *Charting the Wake.* Tune the knobs scientifically; get the most out of the right model. Empirical finding: configuration drift around the model matters more than the model.
-- **[Darkmux Genesis III](https://darklyenergized.substack.com/p/darkmux-genesis-iii-hybrid-by-design)** — *Hybrid by Design.* The architectural reveal — what the operator-orchestrator-darkmux-local-stack continuum actually looks like once the protocol survives the orchestrator deciding where work goes. Closes the Genesis arc.
+- **[Darkmux Genesis II](https://darklyenergized.substack.com/p/part-2-charting-the-wake)** — *Charting the Wake.* Tune the knobs scientifically to get the most out of the right model. Empirical finding: configuration drift around the model matters more than the model.
+- **[Darkmux Genesis III](https://darklyenergized.substack.com/p/darkmux-genesis-iii-hybrid-by-design)** — *Hybrid by Design.* The architectural reveal: what the operator-orchestrator-darkmux-local-stack continuum actually looks like once the protocol survives the orchestrator deciding where work goes. Closes the Genesis arc.
 
-Posts after the Genesis series will appear on the same Substack but stand alone — the trilogy is the *why this exists* story; subsequent work is the *what's next*.
+Posts after the Genesis series will appear on the same Substack but stand alone. The trilogy is the *why this exists* story; subsequent work is the *what's next*.
 
-**The long view.** Once a local stack is optimized, the next step is collaboration — frontier, local, and specialized models on the same task. The optimizing agent (Claude, by default) is part of the team being optimized; it maintains the team's integrity as new models arrive and hardware changes. Optimization is not the destination — it's how the team stays sharp.
+**The long view.** Once a local stack is optimized, the next step is collaboration: frontier, local, and specialized models on the same task. The optimizing agent (Claude, by default) is part of the team being optimized; it maintains the team's integrity as new models arrive and hardware changes. Optimization is not the destination; it's how the team stays sharp.
 
-**Measurable goal.** A fresh frontier-model context, after a clean-slate `cargo install --path .`, should reach this same conclusion about darkmux's purpose without external prompting. If it doesn't, the docs (this README + `CLAUDE.md`) have drifted from the vision and that's the next thing to fix. See [#35](https://github.com/kstrat2001/darkmux/issues/35) for the maintainer's long-form answer.
+**Measurable goal.** A fresh frontier-model context, after a clean-slate `cargo install --path .`, should reach this same conclusion about darkmux's purpose without external prompting. If it doesn't, the docs (this README + `CLAUDE.md`) have drifted from the vision, and that's the next thing to fix. See [#35](https://github.com/kstrat2001/darkmux/issues/35) for the maintainer's long-form answer.
 
 > **Results will vary based on your frontier configuration.** The frontier models you use as the orchestrator need proper guidance to make the most out of darkmux. This README and the [user guide](https://darkmux.com/guide/) are a starting reference, not doctrine to enforce. Contradictory statements between this guide, your project's `CLAUDE.md`, and other frontier configs will cause more harm than good. Configure to your own strategy and goals; treat what's here as inspiration, not commandments. See [#112](https://github.com/kstrat2001/darkmux/issues/112) for the architectural reasoning.
 
 ## Who darkmux is for
 
-Hobbyists building local-AI workflows on their own Macs. Individual engineers who want a serious agent stack running across the machines they already own. A few Macs over a tailnet (Tailscale, ZeroTier, WireGuard — your call) is the natural deployment shape; one operator who trusts every machine in their own fleet.
+Hobbyists building local-AI workflows on their own Macs. Individual engineers who want a serious agent stack running across the machines they already own. A few Macs over a tailnet (Tailscale, ZeroTier, WireGuard, your call) is the natural deployment shape: one operator who trusts every machine in their own fleet.
 
-Not *designed* as team tooling or a multi-tenant platform. The technical surface (no auth on `DARKMUX_REDIS_URL` beyond what your mesh VPN already provides, operator-asserted provenance fields, cross-machine state on a shared substrate) assumes everyone reachable on the substrate is you. If team scope is interesting to you, the substrate is a reasonable starting point — fork it, layer in auth where you need it, and the project's design will likely benefit from the lessons. Bigger orgs have their own infrastructure for the multi-tenant problem and darkmux stays focused on the one-operator-many-Macs case; that's not a fence, it's a focus.
+Not *designed* as team tooling or a multi-tenant platform. The technical surface (no auth on `DARKMUX_REDIS_URL` beyond what your mesh VPN already provides, operator-asserted provenance fields, cross-machine state on a shared substrate) assumes everyone reachable on the substrate is you. If team scope is interesting to you, the substrate is a reasonable starting point — fork it, layer in auth where you need it, and the project's design will likely benefit from the lessons. Bigger orgs have their own infrastructure for the multi-tenant problem, and darkmux stays focused on the one-operator-many-Macs case; that's not a fence, it's a focus.
 
 ## Two ways to run darkmux
 
-Pick whichever matches your setup — switchable per dispatch, not a one-time install decision:
+Pick whichever matches your setup; it's switchable per dispatch, not a one-time install decision:
 
 - **Standalone** (default): with just Docker + LMStudio, darkmux dispatches through its built-in internal runtime. No external agent runtime to install or configure. The out-of-box path for `darkmux crew dispatch`, `darkmux lab run`, and the mission/sprint lifecycle.
 - **With your existing openclaw**: if openclaw is already in your stack, `darkmux crew dispatch --runtime openclaw` (or `darkmux lab run --runtime openclaw`) routes through it. Your existing sessions, channel routing, custom agents, and openclaw-specific tools (`update_plan`, `process`) keep working as-is. `darkmux crew sync` aligns openclaw's `agents.list[]` with darkmux's role manifests so the two stay in step.
@@ -56,18 +56,18 @@ See [DESIGN.md → "Relationship to openclaw"](DESIGN.md#relationship-to-opencla
 
 ## Many machines become one
 
-If you have more than one Mac, darkmux makes them work as a single development environment. Operator hands off a role; the first available runner runs it. Open the topology viewer from any node — you see the whole fleet. Open the fleet status from any node — you see specs, RAM, loaded models per machine.
+If you have more than one Mac, darkmux makes them work as a single development environment. Operator hands off a role; the first available runner runs it. Open the topology viewer from any node and you see the whole fleet. Open the fleet status from any node and you see specs, RAM, loaded models per machine.
 
 Concretely, the capabilities the multi-machine substrate ships today:
 
-- **Single-stream fleet dispatch.** Every dispatch routes onto one global work stream (`darkmux:work`); the first available runner claims any job — no tier configuration to maintain. `darkmux crew dispatch coder --machine <id>` is an *advisory* hint when you want a specific machine; any runner may still claim it. Capability-based auto-routing (match work to the machine best suited to run it) is the planned successor, building on the [#590](https://github.com/kstrat2001/darkmux/issues/590) capability layer.
+- **Single-stream fleet dispatch.** Every dispatch routes onto one global work stream (`darkmux:work`), and the first available runner claims any job, with no tier configuration to maintain. `darkmux crew dispatch coder --machine <id>` is an *advisory* hint when you want a specific machine; any runner may still claim it. Capability-based auto-routing (match work to the machine best suited to run it) is the planned successor, building on the [#590](https://github.com/kstrat2001/darkmux/issues/590) capability layer.
 - **Fleet status with specs.** `darkmux fleet status --deep` fans out across every reachable peer's `/machine/specs` endpoint — RAM-free, loaded models, OS, darkmux version, redacted Redis URL — in one table (#275).
-- **Decentralized flow UI.** The daemon hosts the observability viewer at its own origin — `http://localhost:8765/` on every machine running `darkmux serve`. The viewer pulls from the daemon's `/flow/<date>` endpoint which aggregates events from every machine writing to the shared `darkmux:flow` Redis stream — so you see the fleet, not just the host (#270 + #554).
-- **`/darkmux-add-machine` skill.** Walkthrough for joining a new Mac to an existing fleet — env vars, roster setup, smoke test. Run `darkmux init` to install all skills locally (#176).
+- **Decentralized flow UI.** The daemon hosts the observability viewer at its own origin — `http://localhost:8765/` on every machine running `darkmux serve`. The viewer pulls from the daemon's `/flow/<date>` endpoint which aggregates events from every machine writing to the shared `darkmux:flow` Redis stream, so you see the fleet, not just the host (#270 + #554).
+- **`/darkmux-add-machine` skill.** Walkthrough for joining a new Mac to an existing fleet: env vars, roster setup, smoke test. Run `darkmux init` to install all skills locally (#176).
 
 Deployment shape that this assumes: a couple of Macs on a tailnet you control (Tailscale, ZeroTier, WireGuard — your call), with Redis running on the always-on member. Redis is optional; without it, single-machine usage works fine and `LocalFileSink` captures provenance on disk per-machine.
 
-If your hub machine drops off the network, the substrate degrades gracefully — flow writes fall back to `LocalFileSink`, dispatch bails loud with operator-actionable hints, `darkmux doctor` surfaces the degraded state, and the SSE Redis tail exits cleanly after a bounded number of failures rather than leaking spawned tasks. The verification discipline that matters here is "make sure your hub is hardened for the absences you plan" — `pmset` config + Tailscale "Run at login" + auto-login user. macOS defaults assume "laptop closed = sleep"; they're wrong for a 24/7 hub.
+If your hub machine drops off the network, the substrate degrades gracefully: flow writes fall back to `LocalFileSink`, dispatch bails loud with operator-actionable hints, `darkmux doctor` surfaces the degraded state, and the SSE Redis tail exits cleanly after a bounded number of failures rather than leaking spawned tasks. The verification discipline that matters here is "make sure your hub is hardened for the absences you plan": `pmset` config + Tailscale "Run at login" + auto-login user. macOS defaults assume "laptop closed = sleep"; that's wrong for a 24/7 hub.
 
 ### Seeing your fleet
 
@@ -75,11 +75,11 @@ The observability viewer is hosted by `darkmux serve` itself, not by the public 
 
 | URL | Role | When to use |
 |---|---|---|
-| [`darkmux.com/demo`](https://darkmux.com/demo) | Demo with bundled sample scenario | First impression — see what the viewer does before installing anything |
+| [`darkmux.com/demo`](https://darkmux.com/demo) | Demo with bundled sample scenario | First impression: see what the viewer does before installing anything |
 | `http://localhost:8765/` | Your own daemon, live | Single-machine fleet, or local-only ops view on a multi-machine fleet |
-| `https://<hub>.<your-tailnet>.ts.net/` | Hub's daemon via Tailscale Serve | Multi-machine fleet — load the hub's fleet view from any peer on your tailnet |
+| `https://<hub>.<your-tailnet>.ts.net/` | Hub's daemon via Tailscale Serve | Multi-machine fleet: load the hub's fleet view from any peer on your tailnet |
 
-The third one is opt-in (the daemon binds localhost by default for safety). To expose it across your tailnet, see the [always-on hub guide → upgrading to substrate + viewer](https://darkmux.com/guide/always-on-hub.html#upgrade-viewer) — Tailscale Serve is the recommended path (HTTPS termination at the tailnet node, daemon stays bound to localhost). Raw `--bind 0.0.0.0` on the tailnet IP is the lower-overhead alternative if you don't have Tailscale.
+The third one is opt-in (the daemon binds localhost by default for safety). To expose it across your tailnet, see the [always-on hub guide → upgrading to substrate + viewer](https://darkmux.com/guide/always-on-hub.html#upgrade-viewer). Tailscale Serve is the recommended path (HTTPS termination at the tailnet node, daemon stays bound to localhost). Raw `--bind 0.0.0.0` on the tailnet IP is the lower-overhead alternative if you don't have Tailscale.
 
 ## Quick start
 
@@ -91,14 +91,14 @@ The third one is opt-in (the daemon binds localhost by default for safety). To e
 |---|---|---|
 | **[LMStudio](https://lmstudio.ai/)** | Loads/unloads models. darkmux drives it via the `lms` CLI. | macOS / Windows / Linux installer |
 | **At least one model in LMStudio** | Nothing to swap to without one. | Download via the LMStudio UI; verify with `lms ls`. |
-| **[Docker](https://www.docker.com/products/docker-desktop)** | Hosts darkmux's internal Rust runtime — the default for `darkmux crew dispatch` and `darkmux lab run`. Each dispatch runs in a per-invocation `darkmux-runtime` container with kernel-enforced workspace isolation. darkmux pulls the image from GHCR on demand (or `docker build -t darkmux-runtime:latest runtime/` from a source checkout). **Required only for that dispatch + lab path** — the `swap` / `status` / `profiles` core needs just LMStudio + a model. | Docker Desktop or equivalent daemon |
+| **[Docker](https://www.docker.com/products/docker-desktop)** | Hosts darkmux's internal Rust runtime, the default for `darkmux crew dispatch` and `darkmux lab run`. Each dispatch runs in a per-invocation `darkmux-runtime` container with kernel-enforced workspace isolation. darkmux pulls the image from GHCR on demand (or `docker build -t darkmux-runtime:latest runtime/` from a source checkout). **Required only for that dispatch + lab path:** the `swap` / `status` / `profiles` core needs only LMStudio + a model. | Docker Desktop or equivalent daemon |
 
-> **`brew install` needs no toolchain** — Homebrew handles the build for you (and bottled binaries, once published, ship precompiled). The **Rust toolchain** is required only if you build from source (Option B below), which documents `rustup` at its first step.
+> **`brew install` needs no toolchain.** Homebrew handles the build for you (and bottled binaries, once published, ship precompiled). The **Rust toolchain** is required only if you build from source (Option B below), which documents `rustup` at its first step.
 
 | Optional | When you'd want it |
 |---|---|
-| **[OpenClaw](https://github.com/openclaw/openclaw)** (or Aider / Cline) | If you're already running openclaw and want darkmux to dispatch through it instead of (or alongside) the internal runtime — pass `--runtime openclaw` per dispatch. `darkmux crew sync` aligns openclaw's agent registry with darkmux's role manifests. See [the dual-mode framing](#two-ways-to-run-darkmux) above. `swap`/`status`/`profiles` work without any external runtime. Override the openclaw binary path per dispatch with `--runtime-cmd <path>`.<br>**Version:** no hard OpenClaw version is required — darkmux only writes to `openclaw.json` on the opt-in OC path (`crew sync`, `--runtime openclaw`, or `swap --runtime openclaw`). darkmux is developed and tested against OpenClaw **2026.5.4**; much older OpenClaw (pre-`2026.3.x`) had a `systemPromptOverride` regression in the config darkmux writes there. `darkmux doctor --include-openclaw` warns (non-blocking) if yours predates the tested version — upgrade via your openclaw checkout (`git pull` + openclaw's own build steps) if it bites. |
-| **[Claude Code](https://claude.com/claude-code)** | The recommended way to drive darkmux. A frontier orchestrator (Claude Code, Cursor, Gemini, Antigravity, Codex, Copilot) operates the CLI verbs and the `/darkmux-*` skills; standalone CLI use is supported for scripting and cron, but orchestrator-driven dispatch is the design. |
+| **[OpenClaw](https://github.com/openclaw/openclaw)** (or Aider / Cline) | If you're already running openclaw and want darkmux to dispatch through it instead of (or alongside) the internal runtime — pass `--runtime openclaw` per dispatch. `darkmux crew sync` aligns openclaw's agent registry with darkmux's role manifests. See [the dual-mode framing](#two-ways-to-run-darkmux) above. `swap`/`status`/`profiles` work without any external runtime. Override the openclaw binary path per dispatch with `--runtime-cmd <path>`.<br>**Version:** no hard OpenClaw version is required, because darkmux only writes to `openclaw.json` on the opt-in OC path (`crew sync`, `--runtime openclaw`, or `swap --runtime openclaw`). darkmux is developed and tested against OpenClaw **2026.5.4**; much older OpenClaw (pre-`2026.3.x`) had a `systemPromptOverride` regression in the config darkmux writes there. `darkmux doctor --include-openclaw` warns (non-blocking) if yours predates the tested version; upgrade via your openclaw checkout (`git pull` + openclaw's own build steps) if it bites. |
+| **[Claude Code](https://claude.com/claude-code)** | The recommended way to drive darkmux. A frontier orchestrator (Claude Code, Cursor, Gemini, Antigravity, Codex, Copilot) operates the CLI verbs and the `/darkmux-*` skills; standalone CLI use works for scripting and cron, but orchestrator-driven dispatch is the design. |
 
 darkmux is developed and tested on Apple Silicon. Linux should work; Intel Mac is untested.
 
@@ -147,7 +147,7 @@ darkmux init                # writes ~/.darkmux/config.json + ~/.darkmux/profile
                             # session after install). Never overwrites existing files.
 ```
 
-If `cargo` is already on your PATH, skip Step 1. The `source "$HOME/.cargo/env"` line is the one most often missed by first-time-Rust users — without it, a fresh `cargo install` fails with `command not found: cargo` in the same shell that just ran the rustup installer.
+If `cargo` is already on your PATH, skip Step 1. The `source "$HOME/.cargo/env"` line is the one most often missed by first-time-Rust users. Without it, a fresh `cargo install` fails with `command not found: cargo` in the same shell that just ran the rustup installer.
 
 ### Verify your setup
 
@@ -156,7 +156,7 @@ darkmux doctor          # pre-flight checks: registry, LMStudio, models, runtime
                         # flow substrate, audit integrity, model-pin drift, recommendation drift, …
 ```
 
-Doctor returns exit 0 if everything's wired up, 1 if a fail-level check needs fixing. Fail/warn lines include actionable hints.
+Doctor returns exit 0 if everything's wired up, exit 1 if a fail-level check needs fixing. Fail/warn lines include actionable hints.
 
 Once doctor is green, point your profiles at real models. The fastest path is `darkmux scan` — it lists the models LMStudio has downloaded that aren't yet in any profile and suggests which are worth adding, so you don't have to hand-match ids:
 
@@ -164,11 +164,11 @@ Once doctor is green, point your profiles at real models. The fastest path is `d
 darkmux scan                # see downloaded models not yet in a profile, with suggestions
 ```
 
-Or edit `~/.darkmux/profiles.json` directly and replace each `<your-worker-model-id>` placeholder with an actual id from `lms ls`. Either way, doctor will warn if profiles don't match your loaded models — that's the moment to fix them.
+Or edit `~/.darkmux/profiles.json` directly and replace each `<your-worker-model-id>` placeholder with an actual id from `lms ls`. Either way, doctor will warn if profiles don't match your loaded models; that's the moment to fix them.
 
 ### Configuration
 
-`darkmux init` also writes **`~/.darkmux/config.json`** — your one place to configure darkmux. It's self-documenting: every common setting is written with its default visible, so you tune the file rather than hunt through docs.
+`darkmux init` also writes **`~/.darkmux/config.json`** — your one place to configure darkmux. It's self-documenting: every common setting is written with its default visible, so you tune the file instead of hunting through docs.
 
 ```json
 {
@@ -180,7 +180,7 @@ Or edit `~/.darkmux/profiles.json` directly and replace each `<your-worker-model
 }
 ```
 
-Optional integrations (Redis coordination, the audit log) are blocks you turn on by flipping `"enabled": true` — the connection knobs are already there to edit. Every setting also accepts a `DARKMUX_*` environment-variable override (handy for CI or a one-off shell); the precedence is **env var > `config.json` > built-in default**, and `darkmux doctor` shows where each value resolved.
+Optional integrations (Redis coordination, the audit log) are blocks you turn on by flipping `"enabled": true`; the connection knobs are already there to edit. Every setting also accepts a `DARKMUX_*` environment-variable override (handy for CI or a one-off shell); the precedence is **env var > `config.json` > built-in default**, and `darkmux doctor` shows where each value resolved.
 
 **Secrets stay out of the file.** A Redis password is never written to `config.json` — it lives in the macOS Keychain (store it once: `security add-generic-password -a "$USER" -s darkmux-redis -w`), read at runtime and never logged. On non-macOS, pass a full `DARKMUX_REDIS_URL` instead.
 
@@ -273,7 +273,7 @@ The name comes from the multiplexer core — task-class-aware routing of LMStudi
 2. **Profiles are config, not code.** Named profiles in a JSON file. Add a profile by editing config, not by writing a plugin.
 3. **Heuristic classification first, LLM classification later.** Free heuristics (prompt length, channel, agent role, file pattern) get most of the way without burning inference cycles.
 4. **OpenAI-compatible everywhere.** Frontend, backend, and config syntax all use the established OpenAI surface so existing agents drop in.
-5. **Honest about limits.** A router only beats static configs by routing correctly. We're explicit about what darkmux DOES NOT do (e.g., it doesn't make LMStudio faster; it makes the right LMStudio config available at the right time).
+5. **Honest about limits.** A router only beats static configs by routing correctly. We're explicit about what darkmux does NOT do (e.g., it doesn't make LMStudio faster; it makes the right LMStudio config available at the right time).
 
 ## Hardware profiles
 
@@ -285,11 +285,11 @@ darkmux ships with three Apple Silicon heuristics providers, tuned for different
 | `m-series-64` | 33–64 GB (M Pro) | ⚠️ Extrapolated from 128GB tier |
 | `m-series-32` | up to 32 GB (Mac Studio / MBP) | ⚠️ Extrapolated from 64GB tier |
 
-The `m-series-128` provider's rules are empirically validated against lab measurements. The 64 GB and 32 GB providers use conservative extrapolations — tune down `n_ctx` if you see swap pressure. Non-Apple-Silicon systems fall through to a generic fallback with unvalidated defaults.
+The `m-series-128` provider's rules are empirically validated against lab measurements. The 64 GB and 32 GB providers use conservative extrapolations; tune down `n_ctx` if you see swap pressure. Non-Apple-Silicon systems fall through to a generic fallback with unvalidated defaults.
 
 ## Runtime
 
-`darkmux crew dispatch` uses the **internal runtime** by default — an in-house Rust agent loop running inside a per-dispatch `darkmux-runtime` Docker container with a mounted workspace tempdir. Kernel-enforced workspace isolation, no cross-task context leak by construction. The image is small (~50 MB) and built once from `runtime/`:
+`darkmux crew dispatch` uses the **internal runtime** by default: an in-house Rust agent loop running inside a per-dispatch `darkmux-runtime` Docker container with a mounted workspace tempdir. Kernel-enforced workspace isolation, no cross-task context leak by construction. The image is small (~50 MB) and built once from `runtime/`:
 
 ```bash
 # build the image once from the darkmux repo root
@@ -310,21 +310,21 @@ On the explicit `--runtime openclaw` path (and via `darkmux crew sync`), `darkmu
 export DARKMUX_OPENCLAW_CONFIG="$HOME/work/openclaw-staging/openclaw.json"
 ```
 
-This means: **darkmux's profile-multiplexing is runtime-agnostic** today; `crew dispatch` ships with a self-contained internal runtime so new users don't need an openclaw install to get going; the lab harness is *runtime-pluggable* via the env var. The empirical findings in the article series happened to be measured against OpenClaw; the routing thesis itself is independent.
+This means: **darkmux's profile-multiplexing is runtime-agnostic** today; `crew dispatch` ships with a self-contained internal runtime so new users don't need an openclaw install to get going; the lab harness is *runtime-pluggable* via the env var. The empirical findings in the article series were measured against OpenClaw; the routing thesis itself is independent.
 
 ### Internal-runtime safety net + model-facing telemetry
 
-The internal runtime watches each dispatch for the failure modes that waste local-AI time, and surfaces what it sees both to the operator (in the trajectory) and to the model (as `[darkmux-runtime]` system-message nudges, the *feedback-injection* channel). All detectors are observability-first — they record and nudge before they ever bail.
+The internal runtime watches each dispatch for the failure modes that waste local-AI time, and surfaces what it sees both to the operator (in the trajectory) and to the model (as `[darkmux-runtime]` system-message nudges, the *feedback-injection* channel). All detectors are observability-first: they record and nudge before they ever bail.
 
-- **Struggle detectors** — repeated identical tool calls (*cycle detection*), the same idea re-reasoned in a loop (*reasoning-loop detection*), a tool failing several times in a row (*tool-failure cascade*), and editing one file repeatedly without ever verifying (*cadence drift*). Each writes a trajectory event and, by default, a model-facing nudge.
-- **Recovery paths** — well-formed tool calls are *salvaged* when a turn hits the per-call token cap mid-output; runaway "reasoning with no action" turns are dropped, nudged, and retried (*intra-turn stall recovery*); and tool calls the model emitted as plain text instead of structured JSON are *promoted* back to real tool calls.
-- **Budget + deadline** — a per-call cap bounds runaway emission; opt-in `--max-turns` / `--max-tokens` (env: `DARKMUX_RUNTIME_MAX_TURNS` / `DARKMUX_RUNTIME_MAX_TOKENS`) bound a whole dispatch; and an inactivity deadline (`DARKMUX_INACTIVITY_TIMEOUT_SECONDS`, default 600) fires a soft model-facing warning at 75% before the host hard-kills at 100%, resetting on any tool call or compaction.
+- **Struggle detectors.** Repeated identical tool calls (*cycle detection*), the same idea re-reasoned in a loop (*reasoning-loop detection*), a tool failing several times in a row (*tool-failure cascade*), and editing one file repeatedly without ever verifying (*cadence drift*). Each writes a trajectory event and, by default, a model-facing nudge.
+- **Recovery paths.** Well-formed tool calls are *salvaged* when a turn hits the per-call token cap mid-output; runaway "reasoning with no action" turns are dropped, nudged, and retried (*intra-turn stall recovery*); and tool calls the model emitted as plain text instead of structured JSON are *promoted* back to real tool calls.
+- **Budget + deadline.** A per-call cap bounds runaway emission; opt-in `--max-turns` / `--max-tokens` (env: `DARKMUX_RUNTIME_MAX_TURNS` / `DARKMUX_RUNTIME_MAX_TOKENS`) bound a whole dispatch; and an inactivity deadline (`DARKMUX_INACTIVITY_TIMEOUT_SECONDS`, default 600) fires a soft model-facing warning at 75% before the host hard-kills at 100%, resetting on any tool call or compaction.
 
 Roles can override the nudge wording per signal via a `feedback_templates` block on the role manifest; operators can disable injection entirely with `DARKMUX_FEEDBACK_INJECTION=0`. The trajectory event reference lives in the `darkmux-analyze-run` skill.
 
 ### Cross-machine notebook (multi-environment lab notes)
 
-If you run darkmux on more than one machine and want a single notebook that collates entries from all of them — for example, comparing wall-clock distributions across hardware tiers — point the notebook directory at an iCloud-synced (or otherwise shared) path:
+If you run darkmux on more than one machine and want a single notebook that collates entries from all of them (for example, comparing wall-clock distributions across hardware tiers), point the notebook directory at an iCloud-synced (or otherwise shared) path:
 
 ```bash
 export DARKMUX_NOTEBOOK_DIR="$HOME/Library/Mobile Documents/com~apple~CloudDocs/darkmux-notebook"
@@ -334,7 +334,7 @@ darkmux notebook draft <run-id>
 
 Set the same `DARKMUX_NOTEBOOK_DIR` on each machine; give each a distinct `DARKMUX_MACHINE_ID`. Entries get tagged with their machine of origin in the header comment, so cross-machine readouts are unambiguous.
 
-If `DARKMUX_MACHINE_ID` is unset, darkmux falls back to an auto-derived fingerprint (e.g. `apple-silicon-128gb`) — fine for casual use, but a named id is recommended when more than one machine of the same tier exists.
+If `DARKMUX_MACHINE_ID` is unset, darkmux falls back to an auto-derived fingerprint (e.g. `apple-silicon-128gb`); fine for casual use, but a named id is recommended when more than one machine of the same tier exists.
 
 You can also override the machine id for a single draft via `--machine`:
 
@@ -353,9 +353,9 @@ darkmux notebook list --machine m5-home  # only this machine's entries
 
 ## Instrumentation
 
-Cross-layer telemetry is always-on (#557) — no flag, no sidecar file. The internal runtime and crew dispatch emit it as `category=telemetry` flow records on the flow stream (sources: `lms`, `process`, `detector`, `runtime`, `context`, `compaction`), capturing what LMStudio actually had loaded, where the runtime process sat across the run, detector signals, and compaction events.
+Cross-layer telemetry is always-on (#557) — no flag, no sidecar file. The internal runtime and crew dispatch emit it as `category=telemetry` flow records on the flow stream (sources: `lms`, `process`, `detector`, `runtime`, `context`, `compaction`), capturing what LMStudio had loaded, where the runtime process sat across the run, detector signals, and compaction events.
 
-View it in the observability viewer the daemon serves: run `darkmux serve` and open `http://localhost:8765/`. The viewer reads live flow records straight from the daemon — there's nothing to drag and drop. A demo instance lives at [darkmux.com/demo](https://darkmux.com/demo).
+View it in the observability viewer the daemon serves: run `darkmux serve` and open `http://localhost:8765/`. The viewer reads live flow records straight from the daemon; there's nothing to drag and drop. A demo instance lives at [darkmux.com/demo](https://darkmux.com/demo).
 
 ![darkmux observability viewer: the live savings dashboard showing 9.7M tokens kept off the frontier meter over 24 hours (split into generated, fresh input, and re-read input) across 22 local dispatches on two machines, with the orchestrator's note concluding the day's work.](docs/media/savings-hero-live.png)
 
@@ -363,16 +363,16 @@ View it in the observability viewer the daemon serves: run `darkmux serve` and o
 
 Headline findings from the experimental work that produced darkmux's reference profiles:
 
-- **Static config tuning has a floor.** Compaction knobs (`maxHistoryShare`, `recentTurnsPreserve`, `customInstructions`, compactor n_ctx) are tightly coupled — pulling any one of them in isolation regresses the run. Tuning at the config layer eventually stops paying dividends.
+- **Static config tuning has a floor.** Compaction knobs (`maxHistoryShare`, `recentTurnsPreserve`, `customInstructions`, compactor n_ctx) are tightly coupled; pulling any one of them in isolation regresses the run. Tuning at the config layer eventually stops paying dividends.
 - **The "compactor loaded" tax is real.** Keeping a small compactor model warm for offload availability adds ~25s per dispatch on bounded workloads, even when compaction never fires. That cost is fixed and unrelated to compactor context size.
-- **Long-task wins are bimodal.** With maximum primary context, multiple dispatches of the *identical* prompt + config split into a fast cluster (single-turn, no compaction fired) and a slow cluster (multi-turn, compaction fired). 3× variance between modes is normal — driven by emergent control-flow decisions inside the model's tool-loop, not by config.
+- **Long-task wins are bimodal.** With maximum primary context, multiple dispatches of the *identical* prompt + config split into a fast cluster (single-turn, no compaction fired) and a slow cluster (multi-turn, compaction fired). 3× variance between modes is normal, driven by emergent control-flow decisions inside the model's tool-loop, not by config.
 - **Both modes still beat smaller-context baselines.** A router doesn't need to predict which mode a given dispatch will land in; it just needs to pick the right configuration for the *task class*.
 
-The case for darkmux: **once you accept that static configs leave performance on the table — and that the right configuration depends on the task class, not the model — the routing layer becomes the highest-leverage piece of infrastructure missing from the local-AI stack.**
+The case for darkmux: **once you accept that static configs leave performance on the table (and that the right configuration depends on the task class, not the model), the routing layer becomes one of the highest-leverage pieces of infrastructure missing from the local-AI stack.**
 
 ## Status
 
-✅ **v1.1.0** — semver-stable; the dispatch-to-PR loop, the missions lens + `mission status`, live observability, and the Homebrew pipeline are the stable surface.
+✅ **v1.1.0**, semver-stable. The dispatch-to-PR loop, the missions lens + `mission status`, live observability, and the Homebrew pipeline are the stable surface.
 
 **Shipped:**
 
@@ -405,7 +405,7 @@ The case for darkmux: **once you accept that static configs leave performance on
 
 ## Security
 
-darkmux is a single-operator, local-first tool — see [SECURITY.md](./SECURITY.md)
+darkmux is a single-operator, local-first tool. See [SECURITY.md](./SECURITY.md)
 for the threat model (what it does and doesn't defend) and how to report a
 vulnerability privately. Short version: keep `darkmux serve` on loopback, and
 treat AI-generated code the way you'd treat any untrusted script.
@@ -416,7 +416,7 @@ MIT
 
 ## Author
 
-Kain Osterholt — [@DarklyEnergized](https://x.com/DarklyEnergized) — Darkly Energized LLC
+Kain Osterholt · [@DarklyEnergized](https://x.com/DarklyEnergized) · Darkly Energized LLC
 
 ---
 
