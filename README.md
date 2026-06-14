@@ -357,7 +357,7 @@ Cross-layer telemetry is always-on (#557) — no flag, no sidecar file. The inte
 
 View it in the observability viewer the daemon serves: run `darkmux serve` and open `http://localhost:8765/`. The viewer reads live flow records straight from the daemon — there's nothing to drag and drop. A demo instance lives at [darkmux.com/demo](https://darkmux.com/demo).
 
-![darkmux viewer mid-replay — qwen3.6-35b primary processing a prompt, qwen3-4b compactor idle. Claude → OpenClaw Gateway → LMStudio backbone runs left-to-right; model nodes branch off the right edge.](docs/media/viewer-active-model.png)
+![darkmux observability viewer: the live savings dashboard showing 9.7M tokens kept off the frontier meter over 24 hours (split into generated, fresh input, and re-read input) across 22 local dispatches on two machines, with the orchestrator's note concluding the day's work.](docs/media/savings-hero-live.png)
 
 ## Why this exists — empirical motivation
 
