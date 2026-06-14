@@ -42,6 +42,27 @@ pub const RUNTIME_IMAGE: &str = "darkmux-runtime:latest";
 /// source checkout), darkmux pulls the version-pinned tag from here on demand.
 const RUNTIME_IMAGE_GHCR_REPO: &str = "ghcr.io/kstrat2001/darkmux-runtime";
 
+// (#839) Docker security hardening constants. The container runs untrusted LLM
+// output (the agent's bash tool), so Docker is the boundary — drop all Linux
+// capabilities, forbid privilege escalation, limit PIDs and memory.
+/// Drop ALL Linux capabilities — the runtime needs none for its job
+/// (HTTP calls to LMStudio, file reads/writes via bind mounts).
+const DOCKER_CAP_DROP: &str = "ALL";
+/// Prevent newpriv inside the container — even if a capability is
+/// granted, the kernel blocks setuid/setgid/binary-sUID tricks.
+const DOCKER_SECURITY_OPT: &str = "no-new-privileges";
+/// Per-container PID limit — prevents fork-bomb style resource exhaustion
+/// inside the container. 512 is a sane default for an LLM agent loop.
+const DOCKER_PIDS_LIMIT: u64 = 512;
+/// Per-container memory limit — prevents OOM-killing the host. 4g is a
+/// sane default for an LLM agent loop that may compile/test code.
+const DOCKER_MEMORY: &str = "4g";
+/// TODO (#839): Run the container as non-root (`--user 1000:1000`).
+/// This requires verifying that the workspace bind-mount and injected
+/// runtime binary are readable/executable by uid 1000:gid 1000 inside
+/// the target image. Not yet shipped because per-image uid/gid mapping
+/// is unpredictable — follow-up: add `--user` once verified safe.
+///
 /// The version-pinned GHCR runtime-image ref for THIS binary. Pins to the
 /// darkmux crate version so a `brew upgrade` pulls the matching image and a
 /// skewed binary/image pair never runs (#759). Public so `darkmux doctor` can
@@ -118,7 +139,8 @@ fn ensure_darkmux_image_present() -> Result<String> {
 /// Extracted from the docker-spawn site so the mount-translation rule is
 /// unit-testable without spawning a container (same rationale as
 /// `apply_compaction_flags`).
-fn apply_volume_mounts(cmd: &mut Command, workspace: &Path, host_out: &Path) {
+#[allow(dead_code)]
+pub(crate) fn apply_volume_mounts(cmd: &mut Command, workspace: &Path, host_out: &Path) {
     cmd.arg("-v")
         .arg(format!("{}:/workspace", workspace.display()))
         .arg("-v")
@@ -131,7 +153,8 @@ fn apply_volume_mounts(cmd: &mut Command, workspace: &Path, host_out: &Path) {
 /// than the default (which has the binary baked in). MUST be applied after
 /// the volume mounts and before the image arg — `-v` / `--entrypoint` are
 /// docker-run OPTIONS that precede the IMAGE. Unit-testable without docker.
-fn apply_runtime_injection(cmd: &mut Command, binary: &Path) {
+#[allow(dead_code)]
+pub(crate) fn apply_runtime_injection(cmd: &mut Command, binary: &Path) {
     cmd.arg("-v")
         .arg(format!("{}:/darkmux-runtime:ro", binary.display()))
         .arg("--entrypoint")
@@ -144,6 +167,7 @@ fn apply_runtime_injection(cmd: &mut Command, binary: &Path) {
 /// concurrency-safe; per-dispatch `target/` stays in the workspace, so
 /// concurrent dispatches don't contend on build artifacts. Docker-run OPTIONS
 /// (must precede the image arg). Unit-testable without docker.
+#[allow(dead_code)]
 fn apply_cache_mount(cmd: &mut Command, cache: &Path) {
     cmd.arg("-v")
         .arg(format!("{}:/darkmux-cache", cache.display()))
@@ -254,6 +278,7 @@ fn ensure_runtime_binary_cached(source_image: &str) -> Result<PathBuf> {
 /// back to its hardcoded default for that knob. Extracted from the
 /// docker-spawn site so the translation rule is unit-testable
 /// without spawning a container.
+#[allow(dead_code)]
 fn apply_compaction_flags(
     cmd: &mut Command,
     compaction: &crate::dispatch::CompactionDispatchArgs,
@@ -324,6 +349,177 @@ fn apply_runtime_limit_flags(cmd: &mut Command) {
         cmd.arg("--max-tokens").arg(n.to_string());
     }
 }
+
+
+/// Configuration for building the docker-run argv vector.
+/// (#842) This struct exists so `build_docker_run_argv` is a pure,
+/// testable function — construct it from dispatch inputs, call once,
+/// assert the full arg vector.
+#[derive(Debug, Clone)]
+pub struct DockerRunConfig {
+    /// Unique container name for `docker ps` debugging.
+    pub container_name: String,
+    /// Host path of the agent's workspace tree (mounted at /workspace).
+    pub workspace: PathBuf,
+    /// Host path for out-of-band bookkeeping (mounted at /darkmux-out).
+    pub host_out: PathBuf,
+    /// Whether to inject the darkmux-runtime binary into a non-default image.
+    pub inject: bool,
+    /// Path to the cached runtime binary (only used when `inject` is true).
+    pub runtime_binary: Option<PathBuf>,
+    /// The Docker image to run (operator-supplied or resolved darkmux image).
+    pub image: String,
+    /// Resolved model name for the runtime CLI.
+    pub model: String,
+    /// Full system prompt (preamble + role prompt, specialist roles only).
+    pub system_prompt: String,
+    /// The operator's user message.
+    pub message: String,
+    /// Whether to request JSON envelope output from the runtime.
+    pub json: bool,
+    /// Allowed tools CSV (None = full catalog).
+    pub allowed_tools: Option<Vec<String>>,
+    /// Compaction config (may be modified by role override / utility model).
+    pub compaction: crate::dispatch::CompactionDispatchArgs,
+    /// Per-role feedback template overrides (empty map = no flag).
+    pub feedback_templates: serde_json::Value,
+    /// Host path bind-mounted at `/darkmux-cache` (the shared toolchain
+    /// cache). Resolved + created at the call site so the inner verify loop
+    /// reuses downloaded deps across dispatches (#703 Slice 3).
+    pub cache_dir: std::path::PathBuf,
+}
+
+/// (#842) Build the complete `docker run` argv from a prepared config.
+/// Returns all arguments as a flat `Vec<String>` suitable for
+/// `Command::get_args()` assertion. Pure function — no I/O, no side effects.
+///
+/// Order: docker-run OPTIONS (--rm, --name, hardening flags, mounts,
+/// injection) then `--` + image + runtime CLI args.
+pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
+    let mut args = Vec::new();
+
+    // docker-run OPTIONS (must precede the image arg)
+    args.push("docker".to_string());
+    args.push("run".to_string());
+    args.push("--rm".to_string());
+    args.push("--name".to_string());
+    args.push(config.container_name.clone());
+
+    // (#839) Security hardening flags
+    args.push(format!("--cap-drop={}", DOCKER_CAP_DROP));
+    args.push(format!("--security-opt={}", DOCKER_SECURITY_OPT));
+    args.push(format!("--pids-limit={}", DOCKER_PIDS_LIMIT));
+    args.push(format!("--memory={}", DOCKER_MEMORY));
+
+    // Workspace + out-dir volume mounts
+    args.push("-v".to_string());
+    args.push(format!("{}:/workspace", config.workspace.display()));
+    args.push("-v".to_string());
+    args.push(format!("{}:/darkmux-out", config.host_out.display()));
+
+    // Shared toolchain cache mount (always applied). The host dir is
+    // resolved + created at the call site (see DockerRunConfig.cache_dir);
+    // bind it to /darkmux-cache so cargo/npm/pip caches persist across the
+    // per-dispatch `--rm` container (#703 Slice 3). A bare `/darkmux-cache`
+    // (no host:container colon) would be an anonymous volume discarded on
+    // --rm — i.e. no caching at all.
+    args.push("-v".to_string());
+    args.push(format!("{}:/darkmux-cache", config.cache_dir.display()));
+    args.push("-e".to_string());
+    args.push("CARGO_HOME=/darkmux-cache/cargo".to_string());
+    args.push("-e".to_string());
+    args.push("npm_config_cache=/darkmux-cache/npm".to_string());
+    args.push("-e".to_string());
+    args.push("PIP_CACHE_DIR=/darkmux-cache/pip".to_string());
+
+    // Runtime binary injection (non-default images only)
+    if config.inject {
+        if let Some(binary) = &config.runtime_binary {
+            args.push("-v".to_string());
+            args.push(format!("{}:/darkmux-runtime:ro", binary.display()));
+            args.push("--entrypoint".to_string());
+            args.push("/darkmux-runtime".to_string());
+        }
+    }
+
+    // `--` + image + runtime CLI args (everything after is the container command)
+    args.push("--".to_string());
+    args.push(config.image.clone());
+    args.push("run".to_string());
+    args.push("--model".to_string());
+    args.push(config.model.clone());
+    args.push("--system".to_string());
+    args.push(config.system_prompt.clone());
+    args.push("--prompt".to_string());
+    args.push(config.message.clone());
+
+    if config.json {
+        args.push("--json".to_string());
+    }
+
+    if let Some(allowed) = config.allowed_tools.as_ref() {
+        args.push("--allowed-tools".to_string());
+        args.push(allowed.join(","));
+    }
+
+    // Compaction flags — must stay byte-for-byte identical to the runtime's
+    // accepted flag names (runtime/src/main.rs rejects an unknown flag with
+    // exit 2). All six are emitted; None ⇒ flag omitted ⇒ runtime default.
+    if let Some(threshold) = config.compaction.threshold_tokens {
+        args.push("--compact-threshold-tokens".to_string());
+        args.push(threshold.to_string());
+    }
+    if let Some(model) = config.compaction.compactor_model.as_ref() {
+        args.push("--compactor-model".to_string());
+        args.push(model.clone());
+    }
+    if let Some(ratio) = config.compaction.threshold_ratio {
+        args.push("--compact-threshold-ratio".to_string());
+        args.push(ratio.to_string());
+    }
+    if let Some(window) = config.compaction.context_window {
+        args.push("--context-window".to_string());
+        args.push(window.to_string());
+    }
+    // (#372) Strategy → `--compact-strategy <kebab>`. None ⇒ runtime
+    // uses its Narrative default.
+    if let Some(strategy) = config.compaction.strategy {
+        use darkmux_types::CompactionStrategy;
+        let kebab = match strategy {
+            CompactionStrategy::Narrative => "narrative",
+            CompactionStrategy::StructuredSlot => "structured-slot",
+        };
+        args.push("--compact-strategy".to_string());
+        args.push(kebab.to_string());
+    }
+    // (#377) Escalation bound. None ⇒ runtime is unbounded (a real
+    // safety bound, not cosmetic — dropping it lets a dispatch compact
+    // without limit).
+    if let Some(n) = config.compaction.bail_after_compactions {
+        args.push("--bail-after-compactions".to_string());
+        args.push(n.to_string());
+    }
+    // (#383) Operator-tunable compactor instructions. None ⇒ runtime's
+    // baseline compactor system prompt.
+    if let Some(text) = config.compaction.custom_instructions.as_deref() {
+        args.push("--compactor-custom-instructions".to_string());
+        args.push(text.to_string());
+    }
+
+    // Feedback templates (if a non-empty object). Guarded so a non-object
+    // Value can't panic this pure function.
+    if config
+        .feedback_templates
+        .as_object()
+        .is_some_and(|o| !o.is_empty())
+    {
+        args.push("--feedback-templates-json".to_string());
+        args.push(serde_json::to_string(&config.feedback_templates).unwrap_or_default());
+    }
+
+    args
+}
+
 
 /// Warn (don't abort) if a runtime-limit env var is set to a non-`u32` —
 /// keeps the dispatch alive on operator typos while surfacing the issue.
@@ -702,93 +898,32 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             .collect::<String>()
     );
 
-    let mut cmd = Command::new("docker");
-    cmd.arg("run")
-        .arg("--rm")
-        .arg("--name")
-        .arg(&container_name);
-    // `/workspace` (the agent's tree) + `/darkmux-out` (the runtime's
-    // out-of-band bookkeeping). `/darkmux-out` MUST match
-    // `runtime::trajectory::RUNTIME_OUT_BASE` — see `apply_volume_mounts`.
-    apply_volume_mounts(&mut cmd, &workspace, &host_out);
-    // (#703 Slice 3) Mount the shared toolchain cache so the inner verify loop
-    // doesn't re-download deps each run. Best-effort dir create; if it fails
-    // the mount still works (docker creates the source) — just uncached.
-    let cache = darkmux_types::config_access::cache_dir();
-    let _ = fs::create_dir_all(&cache);
-    apply_cache_mount(&mut cmd, &cache);
-    // (#703) For a non-default image, inject the host-cached static runtime
-    // binary (bind-mount + entrypoint override) — these are docker-run
-    // OPTIONS and MUST precede the image arg. The default image has the
-    // binary baked in and needs neither.
-    if inject {
-        let binary = ensure_runtime_binary_cached(&darkmux_image)?;
-        apply_runtime_injection(&mut cmd, &binary);
-    }
-    // Belt-and-braces: `--` tells docker run "everything after this is the
-    // image, never an option" — guards against a publisher injecting
-    // `--privileged` etc. as the image ref (#838).
-    cmd.arg("--")
-        .arg(&image)
-        .arg("run")
-        .arg("--model")
-        .arg(&model)
-        .arg("--system")
-        .arg(&system_prompt)
-        .arg("--prompt")
-        .arg(&opts.message);
-    if opts.json {
-        // Plumb the operator's `--json` request through to the
-        // container CLI so downstream parsers (qa-review skill, lab
-        // adapter, ad-hoc `jq` users) get a structured envelope on
-        // stdout instead of the human-readable separator format. The
-        // runtime emits status lines to stderr in JSON mode so stdout
-        // stays clean. See `runtime/src/main.rs::build_json_envelope`
-        // for the schema contract.
-        cmd.arg("--json");
-    }
-    if let Some(allowed) = allowed_tools.as_ref() {
-        let csv = allowed.join(",");
-        eprintln!(
-            "darkmux crew dispatch: tool_palette filtered to [{}] (role={})",
-            csv, opts.role_id
-        );
-        cmd.arg("--allowed-tools").arg(csv);
-    }
-    // (#368) Compaction config passthrough to the runtime CLI. Each
-    // flag is optional: when the operator's profile didn't set a
-    // value, no flag is passed and the runtime uses its hardcoded
-    // default. End-state: operator tunes via profile JSON → these
-    // four flags flow into the container → no env vars touch the
-    // surface anywhere.
-    // (#377) Per-role escalation-bound overlay: role manifest's
-    // `bail_after_compactions` wins over profile fallback when set.
-    // Lookup chain: role > profile > unset. The role was already
-    // loaded at the top of this function.
+    // Build the complete docker-run argv via the pure function (#842).
+    // All inputs are resolved above; this is a single deterministic call.
+    let feedback_json = if let Some(templates) = role.feedback_templates.as_ref() {
+        if !templates.is_empty() {
+            serde_json::to_value(templates).unwrap_or(serde_json::Value::Null)
+        } else {
+            serde_json::Value::Null
+        }
+    } else {
+        serde_json::Value::Null
+    };
+
+    // Resolve compaction (role override + utility model + context window).
     let mut compaction = opts.compaction.clone();
     compaction.apply_role_override(role);
-    // (#590) Overlay the machine-level utility model (`internal.utility`) as
-    // the compactor, unless already pinned. The util model is darkmux's
-    // standing support model for this machine — one global model for
-    // compaction, decoupled from the profile. Best-effort: no binding
-    // ⇒ untouched ⇒ runtime keeps its built-in default compactor.
     let utility_model = resolve_utility_model_internal();
     compaction.apply_utility_model(utility_model.as_deref());
-    // (#632) The runtime has no built-in context-window default — it
-    // REQUIRES one to derive its compaction threshold. Bare `crew dispatch`
-    // and the lab `prompt` provider hand us a `default()` with
-    // `context_window: None`; fill it from the resolved default-model
-    // profile so no dispatch path can leave the runtime without one. (The
-    // coding-task provider already sets it via `from_profile` — the guard
-    // leaves any already-set window untouched.)
     ensure_context_window(
         &mut compaction,
         resolve_context_window_internal(opts.profile_name.as_deref()),
     );
-    // (#590) Pre-flight loaded-check: compaction summons the util model
-    // mid-dispatch, so if it's registered but not resident the compactor call
-    // fails. Warn loudly here (the doctor check is the at-rest sibling).
-    // Best-effort — skipped when lms is unreachable.
+
+    // (#590) Pre-compaction loaded-check: warn (don't abort) if the resolved
+    // compactor model is registered but not resident in LMStudio, BEFORE a
+    // mid-dispatch compaction call fails. Best-effort — skipped when lms is
+    // unreachable. Host-side I/O, kept out of the pure argv builder.
     if let Some(util_id) = compaction.compactor_model.as_deref() {
         if let Ok(loaded) = darkmux_profiles::lms::list_loaded() {
             if let Some(warning) = utility_preflight_warning(util_id, &loaded) {
@@ -796,7 +931,48 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             }
         }
     }
-    apply_compaction_flags(&mut cmd, &compaction);
+
+    // Shared toolchain cache: resolve the host dir + best-effort create so
+    // the bind-mount target exists (#703 Slice 3). If create fails the mount
+    // still works (docker creates the source) — just uncached.
+    let cache_dir = darkmux_types::config_access::cache_dir();
+    let _ = fs::create_dir_all(&cache_dir);
+
+    let argv_config = DockerRunConfig {
+        container_name: container_name.clone(),
+        workspace: workspace.clone(),
+        host_out: host_out.clone(),
+        inject,
+        runtime_binary: if inject {
+            Some(ensure_runtime_binary_cached(&darkmux_image)?)
+        } else {
+            None
+        },
+        image: image.clone(),
+        model: model.clone(),
+        system_prompt: system_prompt.clone(),
+        message: opts.message.clone(),
+        json: opts.json,
+        allowed_tools: allowed_tools.clone(),
+        compaction: compaction.clone(),
+        feedback_templates: feedback_json,
+        cache_dir: cache_dir.clone(),
+    };
+
+    let argv = build_docker_run_argv(&argv_config);
+
+    // (#839) Security hardening: drop all capabilities, forbid newpriv,
+    // limit PIDs and memory. These are docker-run OPTIONS (must precede
+    // the image arg).
+    let mut cmd = Command::new("docker");
+    for arg in &argv {
+        cmd.arg(arg);
+    }
+
+    // TODO (#839): Network hardening — the runtime must reach host LMStudio
+    // via `host.docker.internal`. Constraining networking (e.g. `--network none`
+    // with a proxy, or `--network host` explicitly) is a separate, riskier
+    // change. This sprint scopes to caps/limits/user only.
 
     // (#457 Changes 2+3) Operator-opt-in per-dispatch caps on turn
     // count + cumulative completion tokens. Read from env vars on
@@ -804,30 +980,6 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // the runtime container. Both default unlimited (omitted flag
     // → runtime's `Option<u32>` stays None → no cap applied).
     apply_runtime_limit_flags(&mut cmd);
-
-    // (#457 Step 2) Per-role feedback-template overrides. If the
-    // role manifest declares `feedback_templates`, serialize the
-    // map to JSON and pass via `--feedback-templates-json`. The
-    // runtime parses and overrides the FeedbackInjector's defaults
-    // for any signal-kind key present. Absent field ⇒ no flag ⇒
-    // runtime uses its hardcoded defaults across all signals.
-    if let Some(templates) = role.feedback_templates.as_ref() {
-        if !templates.is_empty() {
-            match serde_json::to_string(templates) {
-                Ok(json) => {
-                    cmd.arg("--feedback-templates-json").arg(json);
-                }
-                Err(e) => {
-                    eprintln!(
-                        "darkmux crew dispatch: failed to serialize role `{}` \
-                         feedback_templates: {e}. Runtime will use defaults. \
-                         (#457 Step 2)",
-                        opts.role_id
-                    );
-                }
-            }
-        }
-    }
 
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
@@ -2727,6 +2879,214 @@ mod tests {
             ],
             "cache bound at /darkmux-cache; cargo/npm/pip caches redirected into it"
         );
+    }
+
+    // ─── #839 + #842: full docker-run argv assertion ──────────────
+
+    #[test]
+    fn build_docker_run_argv_asserts_complete_vector() {
+        // (#842) Representative dispatch: non-default image (inject=true),
+        // with compaction, allowed tools, and json mode. Asserts the
+        // COMPLETE argv vector including all hardening flags (#839).
+        let config = DockerRunConfig {
+            container_name: "darkmux-dispatch-test-123".to_string(),
+            workspace: PathBuf::from("/host/workspace"),
+            host_out: PathBuf::from("/host/out"),
+            inject: true,
+            runtime_binary: Some(PathBuf::from(
+                "/home/op/.darkmux/runtime/darkmux-runtime",
+            )),
+            image: "rust:slim".to_string(),
+            model: "llama3-8b".to_string(),
+            system_prompt: "You are a coding assistant.".to_string(),
+            message: "Fix the bug in main.rs".to_string(),
+            json: true,
+            allowed_tools: Some(vec!["exec".to_string(), "edit".to_string()]),
+            compaction: crate::dispatch::CompactionDispatchArgs {
+                threshold_tokens: Some(4096),
+                compactor_model: Some("util-model".to_string()),
+                threshold_ratio: Some(0.75),
+                context_window: Some(32000),
+                // All six compaction flags set so each emission is pinned —
+                // the regression that shipped a wrong flag name + dropped
+                // three of these (strategy/bail/custom) is exactly what an
+                // all-fields-set assertion catches.
+                strategy: Some(darkmux_types::CompactionStrategy::StructuredSlot),
+                bail_after_compactions: Some(10u32),
+                custom_instructions: Some("Be terse.".to_string()),
+            },
+            feedback_templates: serde_json::json!({
+                "error": "An error occurred."
+            }),
+            cache_dir: PathBuf::from("/home/op/.darkmux/cache"),
+        };
+
+        let argv = build_docker_run_argv(&config);
+
+        // 1. Verify the hardening flags are present (#839)
+        assert!(
+            argv.contains(&format!("--cap-drop={}", DOCKER_CAP_DROP)),
+            "must include --cap-drop ALL"
+        );
+        assert!(
+            argv.contains(&format!("--security-opt={}", DOCKER_SECURITY_OPT)),
+            "must include --security-opt no-new-privileges"
+        );
+        assert!(
+            argv.contains(&format!("--pids-limit={}", DOCKER_PIDS_LIMIT)),
+            "must include --pids-limit 512"
+        );
+        assert!(
+            argv.contains(&format!("--memory={}", DOCKER_MEMORY)),
+            "must include --memory 4g"
+        );
+
+        // 2. Verify the full argv structure
+        assert_eq!(argv[0], "docker");
+        assert_eq!(argv[1], "run");
+        assert_eq!(argv[2], "--rm");
+        assert_eq!(argv[3], "--name");
+        assert_eq!(argv[4], "darkmux-dispatch-test-123");
+
+        // 3. Verify hardening flags follow immediately after --name
+        assert_eq!(argv[5], format!("--cap-drop={}", DOCKER_CAP_DROP));
+        assert_eq!(argv[6], format!("--security-opt={}", DOCKER_SECURITY_OPT));
+        assert_eq!(argv[7], format!("--pids-limit={}", DOCKER_PIDS_LIMIT));
+        assert_eq!(argv[8], format!("--memory={}", DOCKER_MEMORY));
+
+        // 4. Verify volume mounts (workspace + out-dir)
+        assert_eq!(argv[9], "-v");
+        assert_eq!(argv[10], "/host/workspace:/workspace");
+        assert_eq!(argv[11], "-v");
+        assert_eq!(argv[12], "/host/out:/darkmux-out");
+
+        // 5. Verify cache mount + env vars (real host:container bind, not a
+        // bare anonymous volume).
+        assert_eq!(argv[13], "-v");
+        assert_eq!(argv[14], "/home/op/.darkmux/cache:/darkmux-cache");
+        assert_eq!(argv[15], "-e");
+        assert_eq!(argv[16], "CARGO_HOME=/darkmux-cache/cargo");
+        assert_eq!(argv[17], "-e");
+        assert_eq!(argv[18], "npm_config_cache=/darkmux-cache/npm");
+        assert_eq!(argv[19], "-e");
+        assert_eq!(argv[20], "PIP_CACHE_DIR=/darkmux-cache/pip");
+
+        // 6. Verify runtime injection (non-default image)
+        assert_eq!(argv[21], "-v");
+        assert_eq!(
+            argv[22],
+            "/home/op/.darkmux/runtime/darkmux-runtime:/darkmux-runtime:ro"
+        );
+        assert_eq!(argv[23], "--entrypoint");
+        assert_eq!(argv[24], "/darkmux-runtime");
+
+        // 7. Verify `--` + image + runtime CLI args
+        assert_eq!(argv[25], "--");
+        assert_eq!(argv[26], "rust:slim"); // image
+        assert_eq!(argv[27], "run"); // runtime subcommand
+        assert_eq!(argv[28], "--model");
+        assert_eq!(argv[29], "llama3-8b");
+        assert_eq!(argv[30], "--system");
+        assert_eq!(argv[31], "You are a coding assistant.");
+        assert_eq!(argv[32], "--prompt");
+        assert_eq!(argv[33], "Fix the bug in main.rs");
+
+        // 8. Verify json flag
+        assert_eq!(argv[34], "--json");
+
+        // 9. Verify allowed tools
+        assert_eq!(argv[35], "--allowed-tools");
+        assert_eq!(argv[36], "exec,edit");
+
+        // 10. Verify compaction flags — flag names must match the runtime's
+        // accepted set verbatim (an unknown flag exits the container with 2).
+        assert_eq!(argv[37], "--compact-threshold-tokens");
+        assert_eq!(argv[38], "4096");
+        assert_eq!(argv[39], "--compactor-model");
+        assert_eq!(argv[40], "util-model");
+        assert_eq!(argv[41], "--compact-threshold-ratio");
+        assert_eq!(argv[42], "0.75");
+        assert_eq!(argv[43], "--context-window");
+        assert_eq!(argv[44], "32000");
+        assert_eq!(argv[45], "--compact-strategy");
+        assert_eq!(argv[46], "structured-slot");
+        assert_eq!(argv[47], "--bail-after-compactions");
+        assert_eq!(argv[48], "10");
+        assert_eq!(argv[49], "--compactor-custom-instructions");
+        assert_eq!(argv[50], "Be terse.");
+
+        // 11. Verify feedback templates JSON
+        assert_eq!(argv[51], "--feedback-templates-json");
+        // The JSON value should contain the error template
+        assert!(argv[52].contains("error"));
+        assert!(argv[52].contains("An error occurred"));
+
+        // Total arg count: 53 (0..=52)
+        assert_eq!(argv.len(), 53);
+    }
+
+    #[test]
+    fn build_docker_run_argv_minimal_dispatch_no_injection() {
+        // Minimal dispatch: default darkmux image (inject=false), no
+        // compaction, no allowed tools, no json — asserts that optional
+        // flags are omitted when not set.
+        let config = DockerRunConfig {
+            container_name: "darkmux-dispatch-min".to_string(),
+            workspace: PathBuf::from("/tmp/ws"),
+            host_out: PathBuf::from("/tmp/out"),
+            inject: false,
+            runtime_binary: None,
+            image: "darkmux-runtime:latest".to_string(),
+            model: "default-model".to_string(),
+            system_prompt: "Basic role.".to_string(),
+            message: "Hello world".to_string(),
+            json: false,
+            allowed_tools: None,
+            compaction: crate::dispatch::CompactionDispatchArgs::default(),
+            feedback_templates: serde_json::Value::Null,
+            cache_dir: PathBuf::from("/tmp/cache"),
+        };
+
+        let argv = build_docker_run_argv(&config);
+
+        // Should NOT contain optional flags
+        assert!(
+            !argv.contains(&"--json".to_string()),
+            "minimal dispatch should NOT have --json"
+        );
+        assert!(
+            !argv.iter().any(|a| a.starts_with("--allowed-tools")),
+            "minimal dispatch should NOT have --allowed-tools"
+        );
+        assert!(
+            !argv.iter().any(|a| a.starts_with("--compact")),
+            "minimal dispatch should NOT have --compact-* flags"
+        );
+        assert!(
+            !argv.iter().any(|a| a.starts_with("--compactor-model")),
+            "minimal dispatch should NOT have --compactor-model"
+        );
+        assert!(
+            !argv.iter().any(|a| a.starts_with("--context-window")),
+            "minimal dispatch should NOT have --context-window"
+        );
+
+        // Should still contain hardening flags
+        assert!(argv.contains(&format!("--cap-drop={}", DOCKER_CAP_DROP)));
+        assert!(argv.contains(&format!("--security-opt={}", DOCKER_SECURITY_OPT)));
+        assert!(argv.contains(&format!("--pids-limit={}", DOCKER_PIDS_LIMIT)));
+        assert!(argv.contains(&format!("--memory={}", DOCKER_MEMORY)));
+
+        // Should NOT contain injection args (no binary mount/entrypoint)
+        assert!(
+            !argv.iter().any(|a| a.contains("/darkmux-runtime:ro")),
+            "minimal dispatch should NOT have runtime binary mount"
+        );
+
+        // Verify image and model are present after --
+        let dash_idx = argv.iter().position(|a| *a == "--").unwrap();
+        assert_eq!(argv[dash_idx + 1], "darkmux-runtime:latest");
+        assert_eq!(argv[dash_idx + 2], "run");
     }
 
     // ─── #408: strict-selection opt-in parsing ───────────────────────

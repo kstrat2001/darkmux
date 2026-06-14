@@ -349,7 +349,10 @@ pub struct DispatchOpts {
 /// (#368). Each field maps 1:1 to a runtime CLI flag. The host
 /// constructs from a `Profile`; `crew::dispatch_internal::dispatch`
 /// translates to `--compact-threshold-tokens N`, `--compactor-model
-/// id`, `--compact-max-history-share f`, `--context-window N` flags.
+/// id`, `--compact-threshold-ratio f`, `--context-window N`,
+/// `--compact-strategy <kebab>`, `--bail-after-compactions N`, and
+/// `--compactor-custom-instructions <text>` flags. Flag names must match
+/// the runtime's parser verbatim — an unknown flag exits the container 2.
 ///
 /// All optional: `None` ⇒ don't pass the flag ⇒ runtime uses its
 /// hardcoded default for that knob.
