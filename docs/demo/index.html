@@ -85,7 +85,6 @@
   .mimeta{font:11px 'JetBrains Mono',monospace;color:var(--muted);flex:0 0 auto}
   .midim{font:11px 'JetBrains Mono',monospace;color:var(--muted)}
   .mitag{font:600 10px 'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.06em;padding:3px 7px;border-radius:3px;color:var(--muted);background:var(--bg2);border:1px dashed var(--line);flex:0 0 auto}
-  .mistatus.running{color:var(--good);border-color:var(--good)}.mistatus.planned{color:var(--amber-dim)}.mistatus.abandoned{color:var(--muted)}
   /* (#827) fleet | missions lens toggle — two co-equal views of the fleet */
   .lenstabs{display:inline-flex;border:1px solid var(--line);border-radius:5px;overflow:hidden}
   .lens{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);padding:5px 11px;cursor:pointer;text-decoration:none;background:none}
@@ -1480,6 +1479,15 @@ function renderMissionsIndex(){
 // Built by concatenation, NOT template interpolation, so the XSS source-guard's
 // raw-mission-id deny-rule doesn't false-positive on this non-HTML data key.
 const runSid=(mid,sp)=>"mission-run-"+mid+"-"+sp;
+// (#827 Slice B QA) Sanitize a record-derived value used as a CSS class token.
+// esc() makes it HTML-safe but a status with a space/dot would still split or
+// invalidate the class; strip to alpha (enum values are alpha today — this is
+// the defensive guard the index originally had, restored consistently).
+const clsSafe=s=>String(s).replace(/[^a-z]/gi,'');
+// Mission-status badge, or an "untracked" tag for a flow-only mission (no
+// /missions struct) — same provenance distinction the index makes.
+const missionBadge=ms=>ms?`<span class="mstat ${clsSafe(ms)}">${esc(ms)}</span>`
+                         :`<span class="mitag">untracked</span>`;
 function cycleStage(mid, sprintId){
   const sid=runSid(mid, sprintId);
   const recs=DATA.filter(r=>r.session_id===sid&&typeof r.action==="string"
@@ -1534,12 +1542,16 @@ function renderMission(){
     // durable sprint status (complete ⇒ the whole cycle ran).
     const impliedComplete=s.status==="complete";
     const c=cyc||{};
+    // "blocked" is a CURRENT-state signal — suppress it once the sprint
+    // shipped/completed, so a once-blocked-then-done sprint doesn't show all
+    // stages lit AND a red blocked tag (QA: contradictory dual signal).
+    const showBlocked=c.blocked&&!c.ship&&!c.merged&&!impliedComplete;
     const strip=c.aborted
       ? `<span class="cyc abort">aborted</span>`
       : pill(c.run||impliedComplete,"run")+pill(c.gate||impliedComplete,"qa")
         +pill(c.gate||impliedComplete,"gate")+pill(c.ship||c.merged||impliedComplete,"ship")
-        +(c.blocked?`<span class="cyc block">blocked</span>`:'');
-    return `<div class="sprow"><span class="sps ${esc(s.status)}">${esc(s.status)}</span>`
+        +(showBlocked?`<span class="cyc block">blocked</span>`:'');
+    return `<div class="sprow"><span class="sps ${clsSafe(s.status)}">${esc(s.status)}</span>`
       +`<span class="spt">${esc(s.id)}</span>`
       +`<span class="cycstrip">${strip}</span>`
       +`<span class="sprun">${runInfo}</span></div>`;
@@ -1547,7 +1559,7 @@ function renderMission(){
 
   const closedWarn = mstat==="closed" && sprints.some(s=>s.status!=="complete"&&s.status!=="abandoned")
     ? `<div class="burnlbl"><span class="wallerr">⚠ mission Closed but a sprint isn't terminal — see <code>darkmux mission status</code></span></div>` : '';
-  $("stage").innerHTML=`<div class="sub"><h2>mission · ${esc(mid)}${mstat?` <span class="mstat ${esc(mstat)}">${esc(mstat)}</span>`:''}</h2>
+  $("stage").innerHTML=`<div class="sub"><h2>mission · ${esc(mid)} ${missionBadge(mstat)}</h2>
     <div class="mgoal">${total} sprint${total===1?'':'s'} · ${done} complete</div>
     <div class="burn"><div class="burnbar"><span style="width:${pct}%"></span></div><div class="burnlbl">${done}/${total} sprints complete · ${pct}%</div>${closedWarn}</div>
     <div class="track"><div class="lbl">sprints · run › qa › gate › ship</div>${rows}</div></div>`;
@@ -1570,7 +1582,7 @@ function renderMissionFromFlow(mid, mstat){
   const pct=total?Math.round(done/total*100):0;
   const machs=[...new Set(sessions.map(s=>s.machine))];
   const rows=sessions.map(s=>`<div class="sprow" data-act="session" data-arg="${esc(s.sid)}"><span class="sps ${s.status}">${s.status}</span><span class="spt">${esc(s.role)} · ${esc(s.machine)}</span><span class="spa">${esc(s.model)}</span></div>`).join("")||`<div class="none">no dispatches at this point in the timeline</div>`;
-  $("stage").innerHTML=`<div class="sub"><h2>mission · ${esc(mid)}${mstat?` <span class="mstat ${esc(mstat)}">${esc(mstat)}</span>`:''}</h2>
+  $("stage").innerHTML=`<div class="sub"><h2>mission · ${esc(mid)} ${missionBadge(mstat)}</h2>
     <div class="mgoal">${total} dispatch${total===1?'':'es'} across ${machs.length} machine${machs.length===1?'':'s'}${machs.length?' · '+esc(machs.join(', ')):''}</div>
     <div class="burn"><div class="burnbar"><span style="width:${pct}%"></span></div><div class="burnlbl">${done}/${total} dispatches complete · ${pct}%${active?' · '+active+' in flight':''}${errored?` · <span class="wallerr">${errored} errored</span>`:''}</div></div>
     <div class="track"><div class="lbl">dispatches</div>${rows}</div></div>`;
