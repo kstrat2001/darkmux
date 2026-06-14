@@ -11,6 +11,39 @@ their own cadence (see `CLAUDE.md`). Semver stability begins at 1.0.
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-06-14
+
+The work-level observability release: missions become a first-class lens —
+across the fleet, in the CLI, and on the dashboard — so you can see how a
+mission progresses (sprints + the run→qa→gate→ship cycle), not just what each
+machine is doing.
+
+### Added
+- **Missions lens in the viewer (#827).** A `fleet | missions` toggle adds a
+  work-centric view alongside the machine-centric fleet view — "all machines as
+  one" at the work level. A missions index lists every mission with sprint
+  progress + cross-machine token rollup; the detail renders the durable sprint
+  plan with each sprint's status and a **run → qa → gate → ship cycle strip**,
+  click-through to the per-machine run (#828, #832, #833).
+- **`darkmux mission status` (#829).** The global mission-control read,
+  completing the `<noun> status` family (`flow status`, `model status`): every
+  mission grouped by status with sprint progress, the drift that needs
+  attention (a Closed mission with a non-terminal sprint; an open mission whose
+  sprints are all done), and copy-pasteable, state-accurate reconcile commands.
+  Read-only; `--json` for the orchestrator / CI (#830, #831).
+
+### Fixed
+- **Live-diff no longer flickers/reloads (#826).** The session-view diff panel
+  was rebuilt on every live record (~1/sec during a run), destroying its DOM
+  and scroll; it now paints into a stable mount, repainting only on real
+  changes with scroll preserved.
+
+### Internal
+- A bundled maintainer skill, `darkmux-point-release`, standardizes this release
+  ceremony (not shipped to brew installs).
+
+[1.1.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.1.0
+
 ## [1.0.0] - 2026-06-13
 
 darkmux 1.0 — semver stability begins. The release that closes the loop:

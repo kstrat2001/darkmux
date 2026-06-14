@@ -372,7 +372,7 @@ The case for darkmux: **once you accept that static configs leave performance on
 
 ## Status
 
-✅ **v1.0.0** — semver stability begins; the dispatch-to-PR loop, live observability, and the Homebrew pipeline are the stable surface.
+✅ **v1.1.0** — semver-stable; the dispatch-to-PR loop, the missions lens + `mission status`, live observability, and the Homebrew pipeline are the stable surface.
 
 **Shipped:**
 
