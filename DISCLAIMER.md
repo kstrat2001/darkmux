@@ -1,8 +1,8 @@
 # Disclaimer
 
-darkmux is a personal, pre-1.0 project (currently v0.4.0) released under the MIT license. The license text already says "no warranty, use at your own risk" in legal language. This file says the same thing in plain English, with specifics, because darkmux does things that warrant a clear-eyed warning.
+darkmux is a personal project, semver-stable as of v1.0.0, released under the MIT license. The license text already says "no warranty, use at your own risk" in legal language. This file says the same thing in plain English, with specifics, because darkmux does things that warrant a clear-eyed warning.
 
-It's pre-1.0 with a small known audience. Breaking changes — renames, removals, default changes — ship cleanly, without env-var aliases or deprecation periods, until 1.0. If you need stability, pin a version.
+It's a personal project with a small audience. As of v1.0.0 darkmux follows semver: breaking changes — renames, removals, default changes — ship in a major version bump, signaled rather than silent. If you need stability, pin a version.
 
 ## What darkmux does to your machine
 
@@ -11,9 +11,9 @@ It's pre-1.0 with a small known audience. Breaking changes — renames, removals
 - **Uses Docker for the default dispatch + lab path.** `darkmux crew dispatch` and `darkmux lab run` default to darkmux's internal Rust runtime, which runs inside a per-invocation `darkmux-runtime` Docker container (image built from `runtime/`). Docker is therefore a runtime dependency for that path. darkmux builds and runs that image on your behalf.
 - **Runs AI-orchestrated workloads.** In lab mode and on crew dispatch, darkmux runs an agent loop and can execute shell commands the agent produces — for example, `npm test` against AI-generated code. On the **default internal runtime**, each dispatch runs in a per-invocation container with kernel-enforced workspace isolation — better than a bare directory, but still not a hardened sandbox (Docker on macOS is a VM boundary, not a security guarantee against a determined adversary). On the **opt-in `--runtime openclaw`** path (or any `--runtime-cmd` tool), there is no container: the working directory is **not a security boundary** — it is a regular directory on your filesystem, and an AI that decides to run `rm -rf ~` is not stopped by darkmux. Treat that path the way you would treat running any untrusted script: only on a machine where that risk is acceptable, ideally on a separate user account or VM.
 
-## About AI behaviour
+## About AI behavior
 
-AI models — local or hosted — can produce unexpected, incorrect, or unsafe output. They can hallucinate file paths, generate destructive shell commands, edit files in ways you did not intend, and confidently explain why the wrong thing was the right thing to do. darkmux is an orchestration layer; it does not police what the model does. If a model misbehaves, darkmux will faithfully execute the misbehaviour. Review agent output before letting it touch anything you care about.
+AI models — local or hosted — can produce unexpected, incorrect, or unsafe output. They can hallucinate file paths, generate destructive shell commands, edit files in ways you did not intend, and confidently explain why the wrong thing was the right thing to do. darkmux is an orchestration layer; it does not police what the model does. If a model misbehaves, darkmux will faithfully execute the misbehavior. Review agent output before letting it touch anything you care about.
 
 ## Results vary by your frontier configuration
 

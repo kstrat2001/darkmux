@@ -35,7 +35,7 @@ If you modify the embedded workload manifests under `templates/builtin/workloads
 
 - Rust 2021 edition, MSRV 1.80
 - `cargo fmt` before every commit
-- `cargo clippy` clean (warnings tolerated for now in pre-1.0 dead-code paths; new warnings in changed files should be fixed)
+- `cargo clippy` clean (warnings tolerated in legacy dead-code paths; new warnings in changed files must be fixed)
 - Single-purpose PRs
 - Conventional commit messages (`feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore:`)
 - New external dependencies are scrutinized — darkmux deliberately keeps the dep surface small (see `Cargo.toml`). If a 10-line inline module avoids a crate, prefer that.
@@ -82,12 +82,15 @@ For the **conceptual model** the code implements — role families, the mission/
 
 ## Releases
 
-darkmux is pre-1.0. Versioning is informal until v1.0. The maintainer cuts releases manually:
+darkmux follows semver as of v1.0.0 (see ROADMAP.md and README.md). The manual release flow:
 
 ```bash
-# bump version in Cargo.toml
+# bump the version in every workspace Cargo.toml + refresh the lockfile
 cargo build --release
 cargo test
 git tag vX.Y.Z
 git push origin vX.Y.Z
+gh release create vX.Y.Z          # the release event publishes the GHCR runtime image
 ```
+
+Publishing the GitHub release (not just the tag push) is what triggers the GHCR runtime-image publish workflow. A formula `url`/`sha256` bump, once merged, syncs the Homebrew tap. The maintainer automates this whole ceremony with the maintainer-only `/darkmux-point-release` skill, which also handles the per-crate version bump, the lockfile, and the formula update.

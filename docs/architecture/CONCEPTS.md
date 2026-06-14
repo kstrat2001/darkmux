@@ -27,7 +27,7 @@ When in doubt, the code is the source of truth (per `CLAUDE.md`). This doc is th
 
 ## 1. What darkmux is
 
-darkmux is a pre-1.0 Rust CLI for operators running local LLMs on Apple Silicon.
+darkmux is a Rust CLI for operators running local LLMs on Apple Silicon.
 It does three things:
 
 1. **Profile multiplexer** — `darkmux swap <profile>` switches the loaded model
@@ -109,8 +109,9 @@ selected via the `ModelRole::Compactor` slot in the profile
 The role family was renamed from `admin` to `utility`. The loader **rejects**
 `role_family: "admin"` at load time via `validate_role_family()`, with distinct
 operator-actionable error messages for user-authored vs. built-in manifests
-(`crates/darkmux-crew/src/loader.rs:379-398`). There is no compatibility alias —
-consistent with the pre-1.0 no-compat-baggage posture.
+(`crates/darkmux-crew/src/loader.rs:379-398`). There is no compatibility alias:
+the rename shipped before 1.0.0 under the pre-1.0 ship-cleanly posture, and the
+loader's rejection of the retired name is retained for forward-compat.
 
 ---
 

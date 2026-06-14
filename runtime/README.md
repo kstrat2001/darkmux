@@ -2,7 +2,7 @@
 
 In-house container-bounded agent runtime for darkmux. Replaces the openclaw shell-out path for `darkmux crew dispatch` with a lean Alpine container that darkmux owns end-to-end.
 
-**Default for `darkmux crew dispatch` as of v0.4.** Operators with an existing openclaw setup can opt back into the legacy path via `darkmux crew dispatch --runtime openclaw <role>`.
+**The default for `darkmux crew dispatch`** (it has been the default across the 1.x line). Operators with an existing openclaw setup can opt back into the legacy path via `darkmux crew dispatch --runtime openclaw <role>`.
 
 ## Why this exists
 
@@ -116,7 +116,7 @@ cargo test --release
 - Audit-chain wiring at the volume-mount boundary
 - Distribution: the image is built locally from this Dockerfile, not pushed to a registry — `docker build -t darkmux-runtime:latest runtime/` from the darkmux repo root is the install step
 
-## Known gaps post-flip (v0.4)
+## Known gaps post-flip
 
 The internal runtime is the default for `darkmux crew dispatch` as of v0.4, but a few rough edges remain:
 

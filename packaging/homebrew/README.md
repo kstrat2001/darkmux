@@ -9,7 +9,7 @@ Tracking: [#618](https://github.com/kstrat2001/darkmux/issues/618).
 
 ## Files
 
-- **`darkmux.rb`** — the formula. Pinned to stable **v0.9.0** (url + sha256)
+- **`darkmux.rb`** — the formula. Pinned to the latest stable `1.x` release (url + sha256)
   with a `head` block for `--HEAD` installs from main. `brew style`-clean.
 - **`darkmux-serve-wrapped`** — keychain-aware wrapper for
   `brew services start darkmux`. Reads `DARKMUX_REDIS_URL` from macOS

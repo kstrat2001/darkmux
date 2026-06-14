@@ -1,7 +1,7 @@
 # Security Policy
 
-darkmux is a personal, pre-1.0 project released under the MIT license with no
-warranty (see [DISCLAIMER.md](./DISCLAIMER.md)). This file describes how to
+darkmux is a personal project, semver-stable as of v1.0.0, released under the
+MIT license with no warranty (see [DISCLAIMER.md](./DISCLAIMER.md)). This file describes how to
 report a vulnerability and what the project's threat model is — what darkmux
 does and does not defend against — so you can make an informed decision about
 where and how to run it.
@@ -23,15 +23,15 @@ schedule, but security reports are triaged first.
 
 ## Supported versions
 
-darkmux is pre-1.0. Only the latest release (and `main`) receives fixes. There
-are no backported security patches to older tags — pin a version only if you
-accept that it will not receive fixes. Once 1.0 ships, this table will name the
-supported `1.x` line.
+As of v1.0.0, darkmux follows semver. The current `1.x` line receives security
+fixes and maintenance. Older major versions (`0.x`) get no backports; upgrade to
+the `1.x` line to receive fixes. Pin a version for reproducibility, but track the
+`1.x` line for security updates.
 
 | Version | Supported |
 | ------- | --------- |
-| latest release / `main` | ✅ |
-| any older tag | ❌ — upgrade to get fixes |
+| `1.x` (current) + `main` | ✅ |
+| `0.x` and older | ❌ (upgrade to `1.x`) |
 
 ## Threat model
 

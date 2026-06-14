@@ -98,7 +98,7 @@ The third one is opt-in (the daemon binds localhost by default for safety). To e
 | Optional | When you'd want it |
 |---|---|
 | **[OpenClaw](https://github.com/openclaw/openclaw)** (or Aider / Cline) | If you're already running openclaw and want darkmux to dispatch through it instead of (or alongside) the internal runtime — pass `--runtime openclaw` per dispatch. `darkmux crew sync` aligns openclaw's agent registry with darkmux's role manifests. See [the dual-mode framing](#two-ways-to-run-darkmux) above. `swap`/`status`/`profiles` work without any external runtime. Override the openclaw binary path per dispatch with `--runtime-cmd <path>`.<br>**Version:** no hard OpenClaw version is required — darkmux only writes to `openclaw.json` on the opt-in OC path (`crew sync`, `--runtime openclaw`, or `swap --runtime openclaw`). darkmux is developed and tested against OpenClaw **2026.5.4**; much older OpenClaw (pre-`2026.3.x`) had a `systemPromptOverride` regression in the config darkmux writes there. `darkmux doctor --include-openclaw` warns (non-blocking) if yours predates the tested version — upgrade via your openclaw checkout (`git pull` + openclaw's own build steps) if it bites. |
-| **[Claude Code](https://claude.com/claude-code)** | Only for the agent-invokable skills (`/darkmux-status`, etc.). darkmux as a CLI works without it. |
+| **[Claude Code](https://claude.com/claude-code)** | The recommended way to drive darkmux. A frontier orchestrator (Claude Code, Cursor, Gemini, Antigravity, Codex, Copilot) operates the CLI verbs and the `/darkmux-*` skills; standalone CLI use is supported for scripting and cron, but orchestrator-driven dispatch is the design. |
 
 darkmux is developed and tested on Apple Silicon. Linux should work; Intel Mac is untested.
 
@@ -394,7 +394,7 @@ The case for darkmux: **once you accept that static configs leave performance on
 - 🚧 Topology view in the web viewer (live + replay diagram of fleet activity; #169)
 - 🚧 Fleet primitives (`darkmux fleet add/status`) and cross-machine coordination (Phase 5 of #162)
 - 🚧 Event-sourced mission state (Phase 8 of #162)
-- 🚧 Sibling bootstrap skills: `/darkmux-add-machine` (#176), `/darkmux-enable-audit` (#177), `/darkmux-enable-redis` (#178)
+- 🚧 Sibling bootstrap skill: `/darkmux-enable-redis` (#178). (`/darkmux-add-machine` and `/darkmux-enable-audit` shipped, in the skills bundle above.)
 - 🚧 Audit log management: `flow export`, `flow archive`, OS-level append-only flags for audit files
 - 🚧 Multi-frontier orchestrator support (Gemini / Codex / Copilot bootstrap paths; #179)
 

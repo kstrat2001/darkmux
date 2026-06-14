@@ -125,7 +125,7 @@ contexts ([#555](https://github.com/kstrat2001/darkmux/issues/555)).
 
 Drop the separate **format** (`instruments.jsonl`), the separate **viewer app**, and the separate
 data path. **Keep the capability** — the subsystem/run-internals view (model loads, process activity,
-and the eureka/anomaly detection that is the M2/v0.5 roadmap theme), now a drill-lens over telemetry
+and the eureka/anomaly detection, sequenced under the observability theme, #557), now a drill-lens over telemetry
 records in the one stream. Kill the debt, keep the analysis.
 
 ## Why this kills the whole bug class

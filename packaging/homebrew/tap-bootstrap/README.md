@@ -12,7 +12,7 @@ for managing local LLM stacks (LMStudio, Ollama, llama.cpp) on Apple Silicon.
 
 ```bash
 brew tap kstrat2001/darkmux
-brew install darkmux              # stable release (v0.9.0)
+brew install darkmux              # stable release (latest 1.x)
 # brew install --HEAD darkmux    # or build from the latest commit on main
 ```
 
@@ -53,7 +53,7 @@ leave a dangling launchd plist until the next reboot.
 
 ## What's in this tap
 
-- `Formula/darkmux.rb` — the formula. Pinned to stable **v0.9.0** (url + sha256)
+- `Formula/darkmux.rb` — the formula. Pinned to the latest stable `1.x` release (url + sha256)
   with a `head` block for `--HEAD` installs from main.
   Installs the `darkmux` CLI + the `serve` daemon + a keychain-aware
   wrapper script (`libexec/darkmux-serve-wrapped`) that resolves
@@ -100,11 +100,10 @@ See:
   — plain-English version of the warranty disclaimer, with specifics
   about what darkmux does to your machine
 
-**Pre-1.0 reality:** darkmux is currently v0.9.0. Breaking changes ship
-cleanly without deprecation periods until 1.0. `brew install --HEAD`
-pulls the latest `main` commit — operators get in-progress work
-including any breaking changes. Pin a tag once v0.9.0+ is released if
-you want a stable target.
+**Stability:** darkmux follows semver as of v1.0.0. Breaking changes ship
+only in a major version bump. `brew install --HEAD` pulls the latest
+`main` commit, so operators get in-progress work; for a stable target,
+install the tagged release and pin if you need reproducibility.
 
 ## Formula updates
 
