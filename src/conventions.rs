@@ -47,11 +47,57 @@ pub struct Conventions {
     /// exist in the repo — gh errors otherwise, surfaced verbatim).
     #[serde(default)]
     pub pr_labels: Vec<String>,
+    /// (#834) The git identity `mission ship` commits under for this repo.
+    /// Git resolves author/committer from local→global config, so a repo
+    /// without a local identity falls back to the operator's global name —
+    /// silently breaking bot-authorship / separation-of-duties. Declaring it
+    /// here makes `ship` commit as the bot explicitly (`-c user.name=… -c
+    /// user.email=…`, setting BOTH author and committer). Absent → ship
+    /// commits under the resolved git identity and prints which one (soft
+    /// guard), so a managed repo never silently ships under a person.
+    #[serde(default)]
+    pub commit_author: Option<CommitAuthor>,
+}
+
+/// (#834) A declared git commit identity (the bot). Both fields required to
+/// take effect; a blank either-side is treated as undeclared.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CommitAuthor {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub email: String,
+}
+
+impl CommitAuthor {
+    /// The `git -c …` config args that set author AND committer to this
+    /// identity for a single commit, or None when either field is blank.
+    pub fn config_args(&self) -> Option<[String; 4]> {
+        let (n, e) = (self.name.trim(), self.email.trim());
+        if n.is_empty() || e.is_empty() {
+            return None;
+        }
+        Some([
+            "-c".into(),
+            format!("user.name={n}"),
+            "-c".into(),
+            format!("user.email={e}"),
+        ])
+    }
 }
 
 /// Load `<repo_root>/.darkmux/conventions.json`. Absent file → None
 /// (darkmux defaults). Malformed file → soft warning + None, never an
 /// error: conventions polish output, they don't gate the loop.
+/// (#834) Whether the repo declares conventions at all — i.e. the file
+/// exists, regardless of whether it parses. The commit-identity soft guard
+/// keys on THIS (not on a successful `load`), so a managed repo whose
+/// conventions JSON has a typo still surfaces the identity its commit will
+/// land under, instead of silently degrading to the personal identity.
+pub fn file_present(repo_root: &Path) -> bool {
+    repo_root.join(".darkmux").join("conventions.json").is_file()
+}
+
 pub fn load(repo_root: &Path) -> Option<Conventions> {
     let path = repo_root.join(".darkmux").join("conventions.json");
     let raw = std::fs::read_to_string(&path).ok()?;
@@ -163,5 +209,43 @@ mod tests {
         let c = load(tmp.path()).expect("valid file loads");
         assert_eq!(c.branch_template.as_deref(), Some("{ticket}/{sprint}"));
         assert_eq!(c.pr_labels, vec!["agent-work"]);
+    }
+
+    #[test]
+    fn commit_author_config_args() {
+        // (#834) Both fields present → the -c args set author AND committer.
+        let a = CommitAuthor { name: "finhero-bot".into(), email: "bot@finhero.asia".into() };
+        let args=a.config_args().expect("declared identity yields args");
+        assert_eq!(args, ["-c","user.name=finhero-bot","-c","user.email=bot@finhero.asia"]);
+        // A blank either side → undeclared (no half-set identity).
+        assert!(CommitAuthor { name: "finhero-bot".into(), email: "  ".into() }.config_args().is_none());
+        assert!(CommitAuthor { name: "".into(), email: "bot@finhero.asia".into() }.config_args().is_none());
+    }
+
+    #[test]
+    fn file_present_is_true_even_when_parse_fails() {
+        // (#834 QA) The commit-identity guard keys on file_present, not load(),
+        // so a managed repo with a TYPO'd conventions file still surfaces the
+        // identity instead of silently committing under the personal one.
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(!file_present(tmp.path()), "absent → not present");
+        std::fs::create_dir_all(tmp.path().join(".darkmux")).unwrap();
+        std::fs::write(tmp.path().join(".darkmux/conventions.json"), "{not json").unwrap();
+        assert!(load(tmp.path()).is_none(), "malformed → load None");
+        assert!(file_present(tmp.path()), "malformed but present → guard still fires");
+    }
+
+    #[test]
+    fn load_parses_commit_author() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".darkmux")).unwrap();
+        std::fs::write(
+            tmp.path().join(".darkmux/conventions.json"),
+            r#"{"commit_author":{"name":"finhero-bot","email":"bot@finhero.asia"}}"#,
+        ).unwrap();
+        let c = load(tmp.path()).expect("loads");
+        let a = c.commit_author.expect("commit_author parsed");
+        assert_eq!(a.name, "finhero-bot");
+        assert!(a.config_args().is_some());
     }
 }

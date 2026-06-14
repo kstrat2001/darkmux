@@ -695,6 +695,53 @@ fn git_in(dir: &Path, args: &[&str]) -> Result<std::process::Output> {
         .with_context(|| format!("running `git {}`", args.join(" ")))
 }
 
+/// (#834) Commit under a declared bot identity, airtight against ambient env.
+/// Git resolves the author/committer from `GIT_*_NAME`/`GIT_*_EMAIL` env vars
+/// FIRST, then `-c user.name/email`, then config — so a shell that already
+/// exports `GIT_AUTHOR_*` would override a bare `-c`. Set BOTH the env vars
+/// (authoritative, both author + committer) AND the `-c` args (visible/belt),
+/// so the identity holds regardless of the inherited environment. Caller
+/// guarantees name/email are non-blank (via `config_args().is_some()`).
+fn commit_with_identity(
+    dir: &Path,
+    a: &crate::conventions::CommitAuthor,
+    msg: &str,
+) -> Result<std::process::Output> {
+    let (n, e) = (a.name.trim(), a.email.trim());
+    Command::new("git")
+        .current_dir(dir)
+        .args([
+            "-c",
+            &format!("user.name={n}"),
+            "-c",
+            &format!("user.email={e}"),
+            "commit",
+            "-m",
+            msg,
+        ])
+        .env("GIT_AUTHOR_NAME", n)
+        .env("GIT_AUTHOR_EMAIL", e)
+        .env("GIT_COMMITTER_NAME", n)
+        .env("GIT_COMMITTER_EMAIL", e)
+        .output()
+        .with_context(|| "running `git commit` under the declared commit_author".to_string())
+}
+
+/// (#834) The identity git would commit under in `dir` (local→global config),
+/// formatted `Name <email>` for the soft-guard message. Best-effort: missing
+/// pieces render as `(unset)` so the guard still reads sensibly.
+fn resolved_git_identity(dir: &Path) -> String {
+    let g = |k: &str| {
+        git_in(dir, &["config", k])
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "(unset)".to_string())
+    };
+    format!("{} <{}>", g("user.name"), g("user.email"))
+}
+
 /// Commit subject for a shipped sprint: the sprint description's first line,
 /// trimmed to a conventional ~72-char subject.
 /// (#815) The coder's dispatch brief: the sprint's compiled description
@@ -1033,11 +1080,37 @@ pub fn ship(
             "{subject}\n\nAuthored via `darkmux mission run` (local-AI coder, sprint {}).",
             sprint.id
         );
-        let out = git_in(&wt_path, &["commit", "-m", &msg])?;
+        // (#834) Commit under the declared bot identity when the repo's
+        // conventions name one (sets author AND committer). Without it, a repo
+        // lacking a local git identity commits under the operator's GLOBAL
+        // name — silently breaking bot-authorship/SoD. When the repo IS managed
+        // (a conventions FILE exists, parse or not) but no identity resolves,
+        // surface what the commit will land under + how to pin it. Surface,
+        // never block (operator-sovereignty).
+        let author = conv
+            .as_ref()
+            .and_then(|c| c.commit_author.as_ref())
+            .filter(|a| a.config_args().is_some());
+        let out = if let Some(a) = author {
+            commit_with_identity(&wt_path, a, &msg)?
+        } else {
+            if crate::conventions::file_present(&root) {
+                println!(
+                    "{}",
+                    style::dim(&format!(
+                        "  committing as {} — declare commit_author in .darkmux/conventions.json \
+                         if this repo needs a bot identity",
+                        resolved_git_identity(&wt_path)
+                    ))
+                );
+            }
+            git_in(&wt_path, &["commit", "-m", &msg])?
+        };
         if !out.status.success() {
             bail!("git commit failed: {}", String::from_utf8_lossy(&out.stderr).trim());
         }
-        println!("{}", style::success(&format!("✓ committed: {subject}")));
+        let as_who = author.map(|a| format!(" as {}", a.name.trim())).unwrap_or_default();
+        println!("{}", style::success(&format!("✓ committed{as_who}: {subject}")));
     } else {
         println!(
             "{}",
