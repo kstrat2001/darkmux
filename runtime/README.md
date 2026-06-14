@@ -114,11 +114,10 @@ cargo test --release
 
 - Multi-agent parallelism inside one container (single agent loop per invocation today; nothing precludes extending to multiple `--agent` flags + parallel loops sharing the workspace)
 - Audit-chain wiring at the volume-mount boundary
-- Distribution: the image is built locally from this Dockerfile, not pushed to a registry — `docker build -t darkmux-runtime:latest runtime/` from the darkmux repo root is the install step
 
 ## Known gaps post-flip
 
-The internal runtime is the default for `darkmux crew dispatch` as of v0.4, but a few rough edges remain:
+The internal runtime is the default for `darkmux crew dispatch`, but a few rough edges remain:
 
 - Variance vs openclaw across a larger sample set — current data: 5-sample distribution of converged config showed median 2-3× faster than openclaw, with 8.5× wall variance, so single-run rankings are noisy
 - Migration of crew role definitions (`templates/builtin/roles/*.md`) — several roles still reference openclaw's tool palette (`exec`, `update_plan`, `process`) which don't exist here; the internal runtime ignores them gracefully but the manifests would be cleaner without
