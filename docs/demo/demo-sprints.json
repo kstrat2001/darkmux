@@ -1,0 +1,8 @@
+{
+  "sprints": [
+    {"id": "demo-scaffold", "mission_id": "demo", "description": "Scaffold the read-only diff route + path containment.", "status": "complete", "depends_on": [], "created_ts": 1779497400, "completed_ts": 1779497500},
+    {"id": "demo-endpoint", "mission_id": "demo", "description": "Compute the running git diff + size-bound + JSON response.", "status": "running", "depends_on": ["demo-scaffold"], "created_ts": 1779497400, "started_ts": 1779497570},
+    {"id": "demo-tests", "mission_id": "demo", "description": "Integration tests + the malicious-fixture walkthrough.", "status": "planned", "depends_on": ["demo-endpoint"], "created_ts": 1779497400},
+    {"id": "demo-feature", "mission_id": "demo-shipped", "description": "Emit telemetry.tokens per turn; remove the at-complete aggregate.", "status": "complete", "depends_on": [], "created_ts": 1779410000, "completed_ts": 1779494000}
+  ]
+}

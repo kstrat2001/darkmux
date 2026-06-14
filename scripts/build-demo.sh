@@ -25,6 +25,8 @@ OUT="$ROOT/docs/demo/index.html"
 <!-- GENERATED from crates/darkmux-serve/assets/viewer.html by scripts/build-demo.sh — edit the viewer, not this file. -->
 <meta name="darkmux-mode" content="play">
 <meta name="darkmux-flow-src" content="./demo-flow.jsonl">
+<meta name="darkmux-missions-src" content="./demo-missions.json">
+<meta name="darkmux-sprints-src" content="./demo-sprints.json">
 EOF
   sed '1,/<head>/d' "$SRC"
 } > "$OUT"

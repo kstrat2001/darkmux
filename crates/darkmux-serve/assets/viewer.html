@@ -1401,11 +1401,15 @@ window.drillMission=id=>{ state.level="mission";state.machine=null;state.session
 // (#827 Slice A) Fetch the durable mission + sprint structure. Best-effort:
 // any failure leaves the caches empty and the index falls back to flow-derived
 // mission_ids. Async, awaited once at boot (Slice A doesn't live-poll it).
-async function loadMissionsSprints(){
+async function loadMissionsSprints(mUrl, sUrl){
+  // Daemon path defaults to the live endpoints; the static demo passes the
+  // committed fixture files (no daemon) — same join, different source, exactly
+  // like flow-src vs the /flow endpoint (#827 Slice C).
+  mUrl=mUrl||"/missions"; sUrl=sUrl||"/sprints";
   try{
     const [m,s]=await Promise.all([
-      fetch("/missions",{headers:{accept:"application/json"}}).then(r=>r.ok?r.json():null).catch(()=>null),
-      fetch("/sprints",{headers:{accept:"application/json"}}).then(r=>r.ok?r.json():null).catch(()=>null),
+      fetch(mUrl,{headers:{accept:"application/json"}}).then(r=>r.ok?r.json():null).catch(()=>null),
+      fetch(sUrl,{headers:{accept:"application/json"}}).then(r=>r.ok?r.json():null).catch(()=>null),
     ]);
     MISSIONS=(m&&Array.isArray(m.missions))?m.missions:[];
     SPRINTS=(s&&Array.isArray(s.sprints))?s.sprints:[];
@@ -2084,10 +2088,14 @@ async function boot(){
   // the static demo (flowSrc, no daemon) and the no-daemon state don't have —
   // show the button only when there's a daemon behind us.
   if(!flowSrc && mode!=="no-daemon"){ const cb=$("catbtn"); if(cb) cb.hidden=false; }
-  // (#827 Slice A) Pull the durable mission/sprint plan (best-effort). Absent
-  // under the static demo / no daemon — the missions lens then derives rows
-  // from mission_ids in the flow instead.
+  // (#827 Slice A/C) Pull the durable mission/sprint plan. Live: the daemon's
+  // /missions + /sprints endpoints. Static demo: the committed fixture files
+  // injected as metas (no daemon). Best-effort either way — absent → the
+  // missions lens derives rows from mission_ids in the flow instead.
+  const missionsSrc=injectedMeta("darkmux-missions-src");
+  const sprintsSrc=injectedMeta("darkmux-sprints-src");
   if(!flowSrc && mode!=="no-daemon"){ await loadMissionsSprints(); }
+  else if(missionsSrc||sprintsSrc){ await loadMissionsSprints(missionsSrc, sprintsSrc); }
   setBadges(mode,date);
   recompute();
   state.t=tMax;
