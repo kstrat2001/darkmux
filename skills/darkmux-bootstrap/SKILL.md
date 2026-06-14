@@ -140,12 +140,12 @@ Two opt-in environment variables enable the heavier substrates:
 - `DARKMUX_AUDIT_DIR` → enables AuditFileSink (hash-chained tamper-evident log; #163)
 - `DARKMUX_REDIS_URL` → enables RedisSink (coordination substrate for cross-machine work; #162 Phase 3)
 
-These are out of scope for first-time bootstrap. **Sibling skills are planned but not yet shipped:**
+These are out of scope for first-time bootstrap. **Sibling skills:**
 
-- `/darkmux-enable-audit` — walks through compliance posture (tracked in #177; not yet implemented)
-- `/darkmux-enable-redis` — walks through fleet coordination (tracked in #178; not yet implemented)
+- `/darkmux-enable-audit` (shipped, #177): walks through the compliance/audit posture. The operator can invoke it directly after bootstrap.
+- `/darkmux-enable-redis`: tracked in #178; not yet implemented.
 
-For now, point the operator at the README's environment-variables table and the issue links above; tell them to come back to this skill once those ship. Don't suggest invoking the sibling skills yet — they won't be found.
+After bootstrap, point the operator at `/darkmux-enable-audit` for the audit substrate, and at the README's environment-variables table plus #178 for Redis coordination. Don't suggest invoking `/darkmux-enable-redis` yet; it isn't installed and won't be found.
 
 ## Step 7 — Final validation
 

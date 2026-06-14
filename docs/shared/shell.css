@@ -37,7 +37,7 @@
 }
 
 /* Lab page — lighter "lab paper" surface; the React-Flow canvas reads
- * better against a slightly elevated grey. */
+ * better against a slightly elevated gray. */
 html[data-page="lab"] {
   --bg:       #181820;
   --bg-elev:  #0a0a0d;
