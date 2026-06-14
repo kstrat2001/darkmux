@@ -168,6 +168,8 @@ pub fn run(cmd: FlowCmd) -> Result<()> {
 fn print_status(json: bool) -> Result<()> {
     let status = flow::collect_status();
     if json {
+        // (#776) machine-readable: force color off (defense-in-depth).
+        darkmux_types::style::set_colorize_override(Some(false));
         let s = serde_json::to_string_pretty(&status)
             .context("serializing FlowStatus to JSON")?;
         println!("{s}");
@@ -188,25 +190,41 @@ fn print_integrity_check(path: Option<std::path::PathBuf>, json: bool) -> Result
         flow::integrity_check_all()?
     };
 
+    use darkmux_types::style;
     if json {
+        // (#776) machine-readable: force color off (defense-in-depth).
+        style::set_colorize_override(Some(false));
         let s = serde_json::to_string_pretty(&reports)
             .context("serializing integrity reports to JSON")?;
         println!("{s}");
     } else if reports.is_empty() {
         println!(
-            "darkmux flow integrity-check — no audit files under {}",
-            flow::audit_dir().display()
+            "{}",
+            style::dim(&format!(
+                "darkmux flow integrity-check — no audit files under {}",
+                flow::audit_dir().display()
+            ))
         );
     } else {
         for r in &reports {
-            let status = if r.chain_valid { "✓ valid" } else { "✗ BROKEN" };
-            println!("{status}  {}  ({} record(s))", r.path, r.records_checked);
+            // Status token isn't column-padded here, so coloring it directly
+            // is alignment-safe.
+            let status = if r.chain_valid {
+                style::success("✓ valid")
+            } else {
+                style::error("✗ BROKEN")
+            };
+            println!(
+                "{status}  {}  {}",
+                r.path,
+                style::dim(&format!("({} record(s))", r.records_checked))
+            );
             if !r.chain_valid {
                 if let Some(line) = r.break_at_line {
-                    println!("       chain break at line {line}");
+                    println!("{}", style::error(&format!("       chain break at line {line}")));
                 }
                 if let Some(reason) = r.break_reason.as_ref() {
-                    println!("       reason: {reason}");
+                    println!("{}", style::error(&format!("       reason: {reason}")));
                 }
             }
         }
@@ -239,6 +257,7 @@ fn tail_match(line: &str, session: Option<&str>, json: bool) -> Option<String> {
     if json {
         Some(line.to_string())
     } else {
+        use darkmux_types::style;
         let ts = parsed.get("ts").and_then(|v| v.as_str()).unwrap_or("");
         let action = parsed.get("action").and_then(|v| v.as_str()).unwrap_or("-");
         let handle = parsed.get("handle").and_then(|v| v.as_str()).unwrap_or("-");
@@ -246,7 +265,14 @@ fn tail_match(line: &str, session: Option<&str>, json: bool) -> Option<String> {
             .get("session_id")
             .and_then(|v| v.as_str())
             .unwrap_or("-");
-        Some(format!("{ts} {action} {handle} {session_id}"))
+        // Space-separated (not column-padded) → coloring is alignment-safe.
+        Some(format!(
+            "{} {} {} {}",
+            style::dim(ts),
+            style::accent(action),
+            handle,
+            style::dim(session_id)
+        ))
     }
 }
 
@@ -256,6 +282,13 @@ pub fn run_tail(session: Option<&str>, json: bool) -> anyhow::Result<()> {
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::thread;
     use std::time::Duration;
+
+    // (#776) When emitting raw JSON lines, force color off (defense-in-depth;
+    // tail_match returns the verbatim line under --json, but a future styled
+    // path must not leak ANSI into a piped consumer).
+    if json {
+        darkmux_types::style::set_colorize_override(Some(false));
+    }
 
     let flows_dir = flow::flows_dir();
     // Track which day file we're tailing + our byte offset into it. The day is
@@ -444,6 +477,44 @@ mod tests {
     use std::env;
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    /// (#776) The `--json` handlers must force colorize OFF so machine-readable
+    /// output can never carry ANSI — even when stdout is a TTY (e.g. `--json`
+    /// piped to a pager, or run interactively for debugging). We simulate the
+    /// TTY case by forcing colorize ON, then assert the `--json` path flips it
+    /// back off. `#[serial]` because the override is process-global.
+    #[serial_test::serial]
+    #[test]
+    fn flow_json_paths_force_colorize_off() {
+        use darkmux_types::style;
+        // Pretend stdout is a color-capable TTY.
+        style::set_colorize_override(Some(true));
+        assert!(style::colorize_enabled(), "precondition: forced on");
+        // The --json status path must disable color (defense-in-depth belt).
+        let _ = print_status(true);
+        assert!(
+            !style::colorize_enabled(),
+            "`flow status --json` must force colorize OFF so the envelope stays ANSI-free"
+        );
+        // And the rendered helpers must now produce plain text.
+        assert!(!style::accent("x").contains("\u{1b}["));
+
+        // `flow tail --json` returns each line verbatim — assert the json arm
+        // is ANSI-free even with color forced ON (covers the tail belt's
+        // intent without entering run_tail's infinite follow-loop). The
+        // fleet `emit_json` + integrity-check belts share this one-line
+        // pattern but can't be unit-called safely (network probe /
+        // `process::exit(2)` respectively) — they're covered by review.
+        style::set_colorize_override(Some(true));
+        let line = r#"{"ts":"t","action":"a","handle":"h","session_id":"s"}"#;
+        let out = tail_match(line, None, true).expect("json line passes the filter");
+        assert!(
+            !out.contains('\u{1b}'),
+            "`flow tail --json` lines must be ANSI-free, got: {out:?}"
+        );
+
+        style::set_colorize_override(None); // restore auto-detect
+    }
 
     /// Isolates the flow-write env vars so a test runs against a clean
     /// flows-dir AND doesn't inherit the operator's daily-shell
