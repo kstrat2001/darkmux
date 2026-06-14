@@ -115,7 +115,7 @@ fn runner_main() {
 /// its absence) is the operator-visible signal; the ack just releases
 /// the queue lease.
 fn handle_claimed_job(client: &redis::Client, claimed: ClaimedJob) {
-    let ClaimedJob { work_id, job } = claimed;
+    let ClaimedJob { work_id, mut job } = claimed;
     let session_id = job.session_id.clone();
     let role_id = job.role_id.clone();
     eprintln!(
@@ -137,19 +137,32 @@ fn handle_claimed_job(client: &redis::Client, claimed: ClaimedJob) {
     }
 
     // Workdir symlink-escape guard via the shared validator (Wave-E.2 /
-    // #255). The dispatch path itself ALSO validates, but doing it
-    // here is the canonical "queue boundary" check — operator sees
-    // the rejection in the runner's flow records via dispatch.error,
-    // not buried deep in the internal/openclaw dispatch path.
+    // #255) + base-containment check (#840). Queue-originated jobs
+    // must have workdir under the per-machine darkmux worktrees base;
+    // this prevents a tailnet publisher from bind-mounting an arbitrary
+    // runner directory as /workspace.
+    //
+    // On success we OVERWRITE job.workdir with the validated CANONICAL
+    // path so the dispatch path mounts exactly the inode we blessed —
+    // not a re-resolution of the original string. Re-resolving downstream
+    // would reopen a TOCTOU window (a base-internal component swapped
+    // between this check and mount time); pinning the canonical result
+    // here closes it and matches the validator's documented contract
+    // ("use the returned canonical path for any subsequent fs operation").
     if let Some(workdir_str) = &job.workdir {
         let path = std::path::Path::new(workdir_str);
-        if let Err(e) = darkmux_types::workdir::validate_workdir(path) {
-            eprintln!(
-                "darkmux-runner: REJECTED claimed job {work_id}: workdir validation failed: {e:#}. \
-                 Acking to release queue lease; dispatch NOT invoked."
-            );
-            let _ = ack_job(client, RUNNER_CONSUMER_GROUP, &work_id);
-            return;
+        match darkmux_types::workdir::validate_remote_workdir(path) {
+            Ok(canonical) => {
+                job.workdir = Some(canonical.to_string_lossy().into_owned());
+            }
+            Err(e) => {
+                eprintln!(
+                    "darkmux-runner: REJECTED claimed job {work_id}: workdir validation failed: {e:#}. \
+                     Acking to release queue lease; dispatch NOT invoked."
+                );
+                let _ = ack_job(client, RUNNER_CONSUMER_GROUP, &work_id);
+                return;
+            }
         }
     }
 
