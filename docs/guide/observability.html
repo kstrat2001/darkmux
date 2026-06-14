@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Observability — daemon + viewer — darkmux user guide</title>
+<title>Observability: daemon + viewer | darkmux user guide</title>
 <meta name="description" content="Start the darkmux daemon, point the /flow viewer at it, watch darkmux operate. Covers doctor's daemon check and the pre-dispatch nudge too.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -28,7 +28,7 @@
   <div class="wrap">
     <div class="label">02 <span class="dot">·</span> see it work</div>
     <h1>Observability: daemon + viewer</h1>
-    <p class="lede">darkmux emits flow records as it works — what was dispatched, when, to which model, with what verdict. The daemon serves those records over HTTP; the <code>/flow</code> viewer renders them as a live timeline you can watch while darkmux operates.</p>
+    <p class="lede">darkmux emits flow records as it works: what was dispatched, when, to which model, with what verdict. The daemon serves those records over HTTP; the <code>/flow</code> viewer renders them as a live timeline you can watch while darkmux operates.</p>
   </div>
 </header>
 
@@ -37,9 +37,9 @@
     <h2>The big picture</h2>
     <p>Three pieces work together:</p>
     <ul>
-      <li><strong>Flow records on disk</strong> — every dispatch, every sprint transition, every QA verdict appends a JSON line to <code>~/.darkmux/flows/&lt;date&gt;.jsonl</code> via the <code>LocalFileSink</code>. Each record carries provenance fields (<code>machine_id</code>, <code>orchestrator</code>) auto-populated at write time from <code>DARKMUX_MACHINE_ID</code> / <code>DARKMUX_ORCHESTRATOR</code> env vars. The CLI writes these; no daemon required. Two opt-in sinks compose alongside via <code>TeeSink</code>: <code>AuditFileSink</code> (BLAKE3 hash-chained append-only log; any post-write modification is detectable via <code>darkmux flow integrity-check</code>; enable via <code>DARKMUX_AUDIT_DIR</code>) and <code>RedisSink</code> (cross-machine coordination stream; enable via <code>DARKMUX_REDIS_URL</code>).</li>
-      <li><strong><code>darkmux serve</code> daemon</strong> — a small HTTP server (default <code>127.0.0.1:8765</code>) that reads those JSONL files and exposes them via REST endpoints + SSE tail, plus a <code>/flow-status</code> endpoint that introspects the sink composition + Redis health + schema drift.</li>
-      <li><strong>Web viewers</strong> — three pages share a chrome (<code>/flow</code> = live timeline + filters, <code>/lab</code> = redirects to the demo viewer, which renders live flow records from the daemon, <code>/topology</code> = upcoming fleet diagram per <a href="https://github.com/kstrat2001/darkmux/issues/169">#169</a>). All static — JS fetches from your local daemon, nothing uploaded.</li>
+      <li><strong>Flow records on disk</strong>: every dispatch, every sprint transition, every QA verdict appends a JSON line to <code>~/.darkmux/flows/&lt;date&gt;.jsonl</code> via the <code>LocalFileSink</code>. Each record carries provenance fields (<code>machine_id</code>, <code>orchestrator</code>) auto-populated at write time from <code>DARKMUX_MACHINE_ID</code> / <code>DARKMUX_ORCHESTRATOR</code> env vars. The CLI writes these; no daemon required. Two opt-in sinks compose alongside via <code>TeeSink</code>: <code>AuditFileSink</code> (BLAKE3 hash-chained append-only log; any post-write modification is detectable via <code>darkmux flow integrity-check</code>; enable via <code>DARKMUX_AUDIT_DIR</code>) and <code>RedisSink</code> (cross-machine coordination stream; enable via <code>DARKMUX_REDIS_URL</code>).</li>
+      <li><strong><code>darkmux serve</code> daemon</strong>: a small HTTP server (default <code>127.0.0.1:8765</code>) that reads those JSONL files and exposes them via REST endpoints + SSE tail, plus a <code>/flow-status</code> endpoint that introspects the sink composition + Redis health + schema drift.</li>
+      <li><strong>Web viewers</strong>: three pages share a chrome (<code>/flow</code> = live timeline + filters, <code>/lab</code> = redirects to the demo viewer, which renders live flow records from the daemon, <code>/topology</code> = upcoming fleet diagram per <a href="https://github.com/kstrat2001/darkmux/issues/169">#169</a>). All static: JS fetches from your local daemon, nothing uploaded.</li>
     </ul>
     <p>The daemon and viewer are decoupled: records keep landing on disk whether or not the daemon is running. The daemon being up is only required for <em>live viewing</em>.</p>
   </div>
@@ -48,7 +48,7 @@
 <section>
   <div class="wrap">
     <h2>Start the daemon</h2>
-    <p>Open a second terminal tab — the daemon is a foreground process that blocks until you Ctrl-C.</p>
+    <p>Open a second terminal tab: the daemon is a foreground process that blocks until you Ctrl-C.</p>
     <pre><code>darkmux serve</code></pre>
     <p>Default bind: <code>127.0.0.1:8765</code>. Override with <code>--port</code> or <code>--bind</code> if you need to:</p>
     <pre><code>darkmux serve --port 9000 --bind 127.0.0.1</code></pre>
@@ -60,27 +60,27 @@
     <h3>Verify it's up</h3>
     <pre><code>curl -s http://127.0.0.1:8765/health
 <span class="comment"># {"darkmux_version":"1.1.0","flow_schema_version":"1.5.0"}</span></code></pre>
-    <p>Or just run <code>darkmux doctor</code> — the <code>daemon: reachable</code> check will report Pass.</p>
+    <p>Or just run <code>darkmux doctor</code>: the <code>daemon: reachable</code> check will report Pass.</p>
   </div>
 </section>
 
 <section>
   <div class="wrap">
     <h2>Open the viewer</h2>
-    <p>The viewer lives at <a href="../flow/">darkmux.com/flow/</a>. It's a static page — no backend, just JS that fetches from your local daemon.</p>
+    <p>The viewer lives at <a href="../flow/">darkmux.com/flow/</a>. It's a static page: no backend, just JS that fetches from your local daemon.</p>
     <ol>
       <li>Open <a href="../flow/">darkmux.com/flow/</a> in your browser.</li>
       <li>The header shows a "daemon" pill. If the daemon is up, it's green. If not, it's gray with a "daemon offline" label.</li>
       <li>Click <strong>Connect</strong> to fetch today's records and start tailing for new ones.</li>
     </ol>
-    <p>Open <a href="../flow/" target="_blank" rel="noopener">the viewer in a new tab</a> while your daemon is running to see the live shape — the static screenshots in this guide deliberately don't exist, since the viewer is iterating fast in this phase.</p>
+    <p>Open <a href="../flow/" target="_blank" rel="noopener">the viewer in a new tab</a> while your daemon is running to see the live shape. This guide intentionally ships without static screenshots: the viewer is iterating fast in this phase.</p>
 
     <p>The viewer renders records as cards in a stepper. Each card shows:</p>
     <ul>
-      <li><strong>Tier stripe</strong> — colored bar on the left. Cyan = operator (manual mission/sprint actions), violet = frontier (orchestrator narrative), green = local (model work).</li>
-      <li><strong>Action + handle</strong> — what happened ("dispatch start", "sprint complete", "verdict: clean") and which entity it acted on (the role id, sprint id, or mission id).</li>
-      <li><strong>Meta pills</strong> — category, tier, stage, source, model (if known), sprint, session id. The <code>model</code> pill on dispatch cards shows which LMStudio model handled the work — your map from event-to-model.</li>
-      <li><strong>Wall-clock graphic</strong> — for dispatch records, an SVG ring shows the duration. Sweeping if the dispatch is mid-flight; frozen at the final duration if complete.</li>
+      <li><strong>Tier stripe</strong>: colored bar on the left. Cyan = operator (manual mission/sprint actions), violet = frontier (orchestrator narrative), green = local (model work).</li>
+      <li><strong>Action + handle</strong>: what happened ("dispatch start", "sprint complete", "verdict: clean") and which entity it acted on (the role id, sprint id, or mission id).</li>
+      <li><strong>Meta pills</strong>: category, tier, stage, source, model (if known), sprint, session id. The <code>model</code> pill on dispatch cards shows which LMStudio model handled the work: your map from event-to-model.</li>
+      <li><strong>Wall-clock graphic</strong>: for dispatch records, an SVG ring shows the duration. Sweeping if the dispatch is mid-flight; frozen at the final duration if complete.</li>
     </ul>
   </div>
 </section>
@@ -96,7 +96,7 @@ darkmux sprint complete &lt;your-sprint-id&gt;   <span class="comment"># cyan: s
 
     <p>If you keep <a href="../flow/" target="_blank" rel="noopener">the viewer</a> open as you run those commands, the records appear in order: two cyan operator-tier records bracketing a green local-tier dispatch pair (with the model pill visible on each green card), followed by the cyan sprint-complete with its duration arc.</p>
 
-    <p>The records pair via <code>session_id</code> — dispatch start and dispatch complete share the same session id, which is how the wall-clock graphic computes duration. The viewer joins them automatically.</p>
+    <p>The records pair via <code>session_id</code>: dispatch start and dispatch complete share the same session id, which is how the wall-clock graphic computes duration. The viewer joins them automatically.</p>
   </div>
 </section>
 
@@ -105,11 +105,11 @@ darkmux sprint complete &lt;your-sprint-id&gt;   <span class="comment"># cyan: s
     <h2>What the doctor's daemon check does</h2>
     <p><code>darkmux doctor</code> includes a <code>daemon: reachable</code> check that probes <code>127.0.0.1:8765/health</code> with a 500ms timeout. Three outcomes:</p>
     <ul>
-      <li><strong>Pass</strong> — daemon is up and returning 200 OK. Live viewing works.</li>
-      <li><strong>Warn (connection refused)</strong> — daemon isn't running. The hint reminds you to run <code>darkmux serve</code> in another tab. Non-fatal — you can still do work; you just won't see it live.</li>
-      <li><strong>Warn (port held)</strong> — something is on 8765 but isn't responding HTTP 200. Hint: check whether another process is using the port.</li>
+      <li><strong>Pass</strong>: daemon is up and returning 200 OK. Live viewing works.</li>
+      <li><strong>Warn (connection refused)</strong>: daemon isn't running. The hint reminds you to run <code>darkmux serve</code> in another tab. Non-fatal: you can still do work; you just won't see it live.</li>
+      <li><strong>Warn (port held)</strong>: something is on 8765 but isn't responding HTTP 200. Hint: check whether another process is using the port.</li>
     </ul>
-    <p>The check is <strong>Warn</strong>, not Fail — the daemon being off doesn't break anything end-to-end. It only disables live viewing.</p>
+    <p>The check is <strong>Warn</strong>, not Fail: the daemon being off doesn't break anything end-to-end. It only disables live viewing.</p>
   </div>
 </section>
 
@@ -120,7 +120,7 @@ darkmux sprint complete &lt;your-sprint-id&gt;   <span class="comment"># cyan: s
     <pre><code>[!] darkmux serve isn't reachable on 127.0.0.1:8765 — `crew dispatch` will
     write flow records to disk but you won't see them live. To enable live
     viewing, run `darkmux serve` in another tab.</code></pre>
-    <p>The dispatch proceeds either way — this is situational awareness, not consent-gating. You won't commit to a multi-minute dispatch only to realize the viewer would have been empty.</p>
+    <p>The dispatch proceeds either way: this is situational awareness, not consent-gating. You won't commit to a multi-minute dispatch only to realize the viewer would have been empty.</p>
     <p>If you started the daemon mid-dispatch, the records that landed before you started it are still visible. The viewer's <strong>Connect</strong> button fetches the whole day's file first, then opens an SSE stream for new records. No data lost.</p>
   </div>
 </section>
@@ -140,7 +140,7 @@ darkmux sprint complete &lt;your-sprint-id&gt;   <span class="comment"># cyan: s
       </tr>
       <tr>
         <td><code>GET /flow/&lt;YYYY-MM-DD&gt;/stream</code></td>
-        <td>Server-Sent Events stream — new records appended to that day's file, in real time.</td>
+        <td>Server-Sent Events stream: new records appended to that day's file, in real time.</td>
       </tr>
       <tr>
         <td><code>GET /model/status</code></td>
