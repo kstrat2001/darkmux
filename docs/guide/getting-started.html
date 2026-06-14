@@ -64,7 +64,7 @@
       </tr>
       <tr>
         <td><a href="https://claude.com/claude-code">Claude Code</a> (or any frontier orchestrator)</td>
-        <td>For agent-invokable skills and dispatching workflows. darkmux works as a CLI without it.</td>
+        <td><strong>Recommended.</strong> darkmux is designed to be <em>driven</em> by a frontier orchestrator — <code>darkmux init</code> installs agent skills (including the <code>/darkmux-bootstrap</code> setup skill) and dispatches agentic work through one. The bare CLI works without it, but the orchestrator is the intended path — see <a href="#orchestrator">Recommended: let your orchestrator set it up</a> below.</td>
       </tr>
     </table>
   </div>
@@ -109,6 +109,30 @@ darkmux init</code></pre>
   </div>
 </section>
 
+<section id="orchestrator">
+  <div class="wrap">
+    <h2>Recommended: let your orchestrator set it up</h2>
+    <p>darkmux is built to be <em>driven</em> by a frontier orchestrator — a <a href="https://claude.com/claude-code">Claude Code</a>, Gemini, Antigravity, Cursor, Codex, or Copilot session that runs the loop, reads the project docs, and proposes the commands. <code>darkmux init</code> installs the agent skills + guidance for exactly this. <strong>The recommended way to finish setup — and to operate darkmux day to day — is from inside an orchestrator session, not by hand.</strong></p>
+
+    <p><strong>Whichever frontier model you prefer, the first move is the same: have it read the project docs.</strong> They're written for any agent and carry darkmux's operating doctrine:</p>
+    <ul>
+      <li><a href="https://github.com/kstrat2001/darkmux/blob/main/README.md"><code>README.md</code></a> — what darkmux is for (the north-star) + the quick start.</li>
+      <li><a href="https://github.com/kstrat2001/darkmux/blob/main/CLAUDE.md"><code>CLAUDE.md</code></a> / <a href="https://github.com/kstrat2001/darkmux/blob/main/AGENTS.md"><code>AGENTS.md</code></a> — the agent-facing operating doctrine. Claude Code auto-loads <code>CLAUDE.md</code>; Antigravity / Gemini / Codex / Cursor auto-load <code>AGENTS.md</code> — same doctrine, both conventions shipped.</li>
+      <li><a href="https://github.com/kstrat2001/darkmux/blob/main/DESIGN.md"><code>DESIGN.md</code></a> — the implementation reasoning, when the agent needs the "why."</li>
+      <li>This guide — the operator-facing walkthrough the agent can follow step by step.</li>
+    </ul>
+
+    <p><strong>Claude Code</strong> gets a head start: open a session in your working directory and run the guided setup skill (installed by <code>darkmux init</code>):</p>
+    <pre><code>/darkmux-bootstrap</code></pre>
+    <p>It walks the whole setup interactively — detecting your hardware tier, downloading the recommended models, registering profiles, declaring the orchestrator for flow-record provenance, and validating the end state with <code>darkmux doctor</code>. The skill <strong>reads and proposes; you run the commands</strong>, so you stay in the loop with provenance on every step. On any other frontier, point the session at the docs above and ask it to do the same — the steps below are exactly what it follows. (First-class bootstrap skills for Gemini / Codex / Copilot are on the roadmap — <a href="https://github.com/kstrat2001/darkmux/issues/179">#179</a>.)</p>
+
+    <div class="callout good">
+      <strong>Why orchestrator-first?</strong>
+      <p style="margin: 6px 0 0;">darkmux's reason for existing is local-AI orchestration — the frontier model is the strategist that drives your local models, and setup is the first place that shows up. Everything from here down documents the <em>same steps by hand</em>: read it to understand what the orchestrator does for you, or follow it directly if you're running darkmux as a bare CLI.</p>
+    </div>
+  </div>
+</section>
+
 <section>
   <div class="wrap">
     <h2>Verify your setup</h2>
@@ -129,12 +153,13 @@ darkmux init</code></pre>
 
 <section>
   <div class="wrap">
-    <h2>Configure your first profile</h2>
+    <h2>Configure your first profile <span class="muted" style="font-weight:400">— or let <code>/darkmux-bootstrap</code> do it</span></h2>
+    <p class="muted">This is the manual version of what the <a href="#orchestrator"><code>/darkmux-bootstrap</code></a> skill does for you. Follow it to understand the moving parts, or if you're running darkmux without an orchestrator.</p>
     <p>A profile is a named loadout — which model(s) to keep resident in LMStudio at which context length. Profiles live in <code>~/.darkmux/profiles.json</code> (created by <code>darkmux init</code>).</p>
     <h3>Inspect what's already there</h3>
     <pre><code>darkmux profiles                  <span class="comment"># list configured profiles</span>
 cat ~/.darkmux/profiles.json      <span class="comment"># see the actual JSON</span></code></pre>
-    <p>The bootstrap config ships with placeholder profiles (<code>fast</code>, <code>balanced</code>, <code>deep</code>, plus a <code>gpt-oss</code> preset for the 120B MXFP4 build on Apple Silicon). Each profile lists models with placeholder IDs like <code>&lt;your-primary-model-id&gt;</code>.</p>
+    <p>The bootstrap config ships with four reference profiles in increasing capacity — <code>fast</code> (32K), <code>balanced</code> (100K), <code>deep</code> (200K), and a <code>gpt-oss</code> preset (the 120B MXFP4 build for Apple Silicon, at 100K). <code>fast</code>/<code>balanced</code>/<code>deep</code> carry a placeholder worker id, <code>&lt;your-worker-model-id&gt;</code>, for you to fill in; <code>gpt-oss</code> ships a concrete id (<code>mlx-community/gpt-oss-120b-MXFP4-Q8</code>). The <strong>default profile is <code>balanced</code></strong> — not the 120B preset.</p>
 
     <h3>Swap a real model id in</h3>
     <p>The quickest way: <code>darkmux scan</code> lists the models LMStudio has downloaded that aren't yet in any profile, with a suggestion for each — so you can see what's available to slot in without hand-matching ids.</p>
@@ -146,12 +171,12 @@ lms ls
 
 <span class="comment"># Edit the file (use whatever editor)</span>
 ${EDITOR:-vim} ~/.darkmux/profiles.json</code></pre>
-    <p>Each profile model has three fields that matter:</p>
+    <p>Each profile model has two fields that matter:</p>
     <ul>
       <li><code>id</code> — the LMStudio model id from <code>lms ls</code> output (e.g. <code>qwen3.6-35b-a3b</code>).</li>
       <li><code>n_ctx</code> — context length to load at. Defaults are usually fine; <code>32768</code> is a safe starter for any model.</li>
-      <li><code>role</code> — one of <code>primary</code>, <code>compactor</code>, <code>auxiliary</code>. Every profile needs exactly one <code>primary</code>; the rest are optional.</li>
     </ul>
+    <p>Profile models are <strong>worker</strong> models — there's no per-model <code>role</code> field (it was removed in <a href="https://github.com/kstrat2001/darkmux/issues/590">#590</a>). The standing utility/compactor model is declared once for the machine in the top-level <code>internal.utility</code> binding, not per profile. If a profile lists more than one worker, an optional <code>default_model</code> names which one is the default.</p>
 
     <h3>Verify the edits</h3>
     <pre><code>darkmux profiles                  <span class="comment"># the profile should now list your model</span>
@@ -191,7 +216,7 @@ darkmux lab inspect &lt;run-id&gt;      <span class="comment"># quick look at wh
 <section>
   <div class="wrap">
     <h2>What's next</h2>
-    <p><strong>If you have a Claude Code session running</strong>, the natural next step is to run <code>/darkmux-bootstrap</code> in it — a guided skill (installed by <code>darkmux init</code>) that walks through everything above interactively: detecting your hardware tier, downloading recommended models, registering profiles, declaring the orchestrator for flow-record provenance, and validating end state via <code>darkmux doctor</code>. The skill reads + proposes; you run the commands.</p>
+    <p>If you set up via <a href="#orchestrator"><code>/darkmux-bootstrap</code></a> (or had your orchestrator follow the steps above), your profiles, models, and orchestrator declaration are already in place. Pick a direction:</p>
     <ul>
       <li>If you want to see darkmux operate visually as you work: <a href="observability.html">Observability — daemon + viewer</a>.</li>
       <li>If you want to benchmark / characterize your hardware against a workload: <a href="lab.html">The lab harness</a>.</li>

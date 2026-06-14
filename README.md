@@ -164,7 +164,7 @@ Once doctor is green, point your profiles at real models. The fastest path is `d
 darkmux scan                # see downloaded models not yet in a profile, with suggestions
 ```
 
-Or edit `~/.darkmux/profiles.json` directly and replace each `<your-primary-model-id>` placeholder with an actual id from `lms ls`. Either way, doctor will warn if profiles don't match your loaded models — that's the moment to fix them.
+Or edit `~/.darkmux/profiles.json` directly and replace each `<your-worker-model-id>` placeholder with an actual id from `lms ls`. Either way, doctor will warn if profiles don't match your loaded models — that's the moment to fix them.
 
 ### Configuration
 
