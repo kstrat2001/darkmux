@@ -1,0 +1,23 @@
+{
+  "missions": [
+    {
+      "id": "demo",
+      "description": "Add the live-diff endpoint and wire it into the session view.",
+      "status": "active",
+      "sprint_ids": ["demo-scaffold", "demo-endpoint", "demo-tests"],
+      "created_ts": 1779497400,
+      "started_ts": 1779497400,
+      "ticket": null
+    },
+    {
+      "id": "demo-shipped",
+      "description": "Per-turn token telemetry — the savings odometer.",
+      "status": "closed",
+      "sprint_ids": ["demo-feature"],
+      "created_ts": 1779410000,
+      "started_ts": 1779410000,
+      "closed_ts": 1779495000
+    }
+  ],
+  "generated_at_ms": 1779497611000
+}
