@@ -37,6 +37,7 @@ pub use darkmux_lab::lab;
 mod migrate;
 mod conventions;
 mod mission_propose;
+mod mission_status;
 mod mission_run;
 mod notebook;
 mod optimize;
@@ -545,6 +546,18 @@ enum SprintCmd {
 
 #[derive(Subcommand)]
 enum MissionCmd {
+    /// Global mission-control read (#829): the whole board — every mission
+    /// grouped by status with sprint progress, the inconsistencies that need
+    /// attention (a Closed mission with a non-terminal sprint; an open mission
+    /// whose sprints are all done), and copy-pasteable reconcile commands.
+    /// READ-ONLY — surfaces and suggests, never mutates. The CLI twin of the
+    /// viewer's missions lens; run it as session-start housekeeping.
+    Status {
+        /// Emit the board as structured JSON (for the frontier orchestrator
+        /// or CI/cron) instead of the human-readable view.
+        #[arg(long)]
+        json: bool,
+    },
     /// Transition a mission to `Active`. Stamps `started_ts=now()` if not
     /// already set. Mission must be currently `Active` with no started_ts,
     /// OR — note: missions get created in `Active` status by convention,
@@ -1488,6 +1501,7 @@ fn cmd_sprint(sub: SprintCmd) -> Result<i32> {
 
 fn cmd_mission(sub: MissionCmd) -> Result<i32> {
     match sub {
+        MissionCmd::Status { json } => mission_status::run(json),
         MissionCmd::Start { id, reasoning } => {
             let m = crew::lifecycle::mission_start_with_reasoning(&id, reasoning.as_deref())?;
             println!(
