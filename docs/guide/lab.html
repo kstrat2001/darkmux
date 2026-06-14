@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>The lab harness — darkmux user guide</title>
+<title>The lab harness: darkmux user guide</title>
 <meta name="description" content="Run workloads, characterize models, tune knobs, compare results across runs. The measurement harness behind darkmux's claims.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -28,20 +28,20 @@
   <div class="wrap">
     <div class="label">03 <span class="dot">·</span> measure</div>
     <h1>The lab harness</h1>
-    <p class="lede">A measurement harness, not a config tool dressed up as one. Every <code>darkmux lab run</code> writes a manifest, a trajectory, and per-turn timing under <code>.darkmux/runs/&lt;id&gt;/</code> — so wall-clock variance, compaction events, and per-profile behavior are inspectable after the fact, not in your head.</p>
+    <p class="lede">A measurement harness, not a config tool dressed up as one. Every <code>darkmux lab run</code> writes a manifest, a trajectory, and per-turn timing under <code>.darkmux/runs/&lt;id&gt;/</code>, so wall-clock variance, compaction events, and per-profile behavior are inspectable after the fact, not in your head.</p>
   </div>
 </header>
 
 <section>
   <div class="wrap">
     <h2>The point of the lab</h2>
-    <p>Local AI claims are usually unfalsifiable. *"This profile is faster"* — measured how? On which workload? With which compaction settings? With which loaded state at start?</p>
+    <p>Local AI claims are usually unfalsifiable. <em>"This profile is faster"</em>. Measured how? On which workload? With which compaction settings? With which loaded state at start?</p>
     <p>The lab harness exists to make those questions answerable on your own hardware:</p>
     <ul>
-      <li><strong>Reproducible workloads</strong> — named JSON manifests under <code>templates/builtin/workloads/</code> (and your own under <code>~/.darkmux/workloads/</code>).</li>
-      <li><strong>On-disk artifacts</strong> — every run writes a manifest, trajectory, and verify outcome to <code>.darkmux/runs/&lt;id&gt;/</code>. No "I think I saw 30 seconds" hand-waving — the numbers are on disk, in JSON, comparable.</li>
-      <li><strong>Comparison primitives</strong> — <code>lab compare A B</code> diffs two runs by wall-clock, compaction events, and per-turn behavior.</li>
-      <li><strong>Trait-based extension</strong> — add your own workload kinds via the <code>WorkloadProvider</code> trait in <code>src/workloads/types.rs</code>.</li>
+      <li><strong>Reproducible workloads</strong>: named JSON manifests under <code>templates/builtin/workloads/</code> (and your own under <code>~/.darkmux/workloads/</code>).</li>
+      <li><strong>On-disk artifacts</strong>: every run writes a manifest, trajectory, and verify outcome to <code>.darkmux/runs/&lt;id&gt;/</code>. No "I think I saw 30 seconds" hand-waving. The numbers are on disk, in JSON, comparable.</li>
+      <li><strong>Comparison primitives</strong>: <code>lab compare A B</code> diffs two runs by wall-clock, compaction events, and per-turn behavior.</li>
+      <li><strong>Trait-based extension</strong>: add your own workload kinds via the <code>WorkloadProvider</code> trait in <code>src/workloads/types.rs</code>.</li>
     </ul>
   </div>
 </section>
@@ -49,16 +49,16 @@
 <section>
   <div class="wrap">
     <h2>Prerequisites for lab</h2>
-    <p>By default, <code>darkmux lab run</code> uses the same internal Docker-bounded runtime as <code>darkmux crew dispatch</code> — no openclaw install needed. Workloads dispatch through a per-invocation <code>darkmux-runtime</code> container; build the image once with <code>docker build -t darkmux-runtime:latest runtime/</code> from the darkmux repo root.</p>
+    <p>By default, <code>darkmux lab run</code> uses the same internal Docker-bounded runtime as <code>darkmux crew dispatch</code>. No openclaw install needed. Workloads dispatch through a per-invocation <code>darkmux-runtime</code> container; build the image once with <code>docker build -t darkmux-runtime:latest runtime/</code> from the darkmux repo root.</p>
     <p>Operators who already have openclaw installed (or who want the runtime the lab-series numbers were measured against) can opt in per-run with <code>darkmux lab run &lt;workload&gt; --runtime openclaw</code>. The openclaw shell-out binary defaults to <code>openclaw</code> on PATH; override with <code>--runtime-cmd &lt;path&gt;</code> to point at Aider, Cline, or anything else with a <code>&lt;cmd&gt; agent --message</code> surface. The flag is only consulted under <code>--runtime openclaw</code>; pure-internal operators never touch it.</p>
-    <p>If you have neither Docker nor an external runtime, the <code>swap</code> / <code>status</code> / <code>profiles</code> / <code>doctor</code> verbs still work — you just can't run lab dispatches.</p>
+    <p>If you have neither Docker nor an external runtime, the <code>swap</code> / <code>status</code> / <code>profiles</code> / <code>doctor</code> verbs still work. You just can't run lab dispatches.</p>
   </div>
 </section>
 
 <section>
   <div class="wrap">
     <h2>The smoke workload</h2>
-    <p><code>quick-q</code> is a single-turn smoke prompt against the active profile. It's the "is this thing wired up at all" test — should complete in ~6–10 seconds if a model is loaded.</p>
+    <p><code>quick-q</code> is a single-turn smoke prompt against the active profile. It's the "is this thing wired up at all" test: should complete in ~6–10 seconds if a model is loaded.</p>
     <pre><code>darkmux lab run quick-q
 <span class="comment"># …
 # Captured run quick-q-deep-1778302418-1 in .darkmux/runs/quick-q-deep-1778302418-1/</span></code></pre>
@@ -68,13 +68,13 @@
     <pre><code>ls .darkmux/runs/quick-q-deep-1778302418-1/
 <span class="comment"># manifest.json     trajectory.jsonl   verify.json</span></code></pre>
     <ul>
-      <li><strong><code>manifest.json</code></strong> — workload id, profile, loaded model state, hardware fingerprint, start/end time.</li>
-      <li><strong><code>trajectory.jsonl</code></strong> — per-turn detail: prompt, response, tool calls, timing, compaction events.</li>
-      <li><strong><code>verify.json</code></strong> — verify-command outcome. Only <code>coding-task</code> workloads define a verify command; a <code>prompt</code> workload like <code>quick-q</code> has none, so its verify is just "a response came back" and reports <strong>pass</strong> without running any check. Don't read a prompt workload's "pass" as a test result — there's nothing to fail. The real pass/fail signal lives in <code>coding-task</code> verify commands.</li>
+      <li><strong><code>manifest.json</code></strong>: workload id, profile, loaded model state, hardware fingerprint, start/end time.</li>
+      <li><strong><code>trajectory.jsonl</code></strong>: per-turn detail, including prompt, response, tool calls, timing, and compaction events.</li>
+      <li><strong><code>verify.json</code></strong>: verify-command outcome. Only <code>coding-task</code> workloads define a verify command; a <code>prompt</code> workload like <code>quick-q</code> has none, so its verify is just "a response came back" and reports <strong>pass</strong> without running any check. Don't read a prompt workload's "pass" as a test result: there's nothing to fail. The real pass/fail signal lives in <code>coding-task</code> verify commands.</li>
     </ul>
 
     <h3>Cross-layer telemetry (always-on)</h3>
-    <p>Cross-layer telemetry is captured automatically (#557) — no flag, no sidecar file. The internal runtime and crew dispatch emit it as <code>category=telemetry</code> flow records on the flow stream (sources: <code>lms</code>, <code>process</code>, <code>detector</code>, <code>runtime</code>, <code>context</code>, <code>compaction</code>), so you can see what LMStudio had loaded, where the runtime process sat across the run, detector signals, and compaction events — useful for diagnosing where wall-clock latency is concentrated.</p>
+    <p>Cross-layer telemetry is captured automatically (#557): no flag, no sidecar file. The internal runtime and crew dispatch emit it as <code>category=telemetry</code> flow records on the flow stream (sources: <code>lms</code>, <code>process</code>, <code>detector</code>, <code>runtime</code>, <code>context</code>, <code>compaction</code>), so you can see what LMStudio had loaded, where the runtime process sat across the run, detector signals, and compaction events. That's useful for diagnosing where wall-clock latency is concentrated.</p>
     <p>View it in the daemon's observability viewer: run <code>darkmux serve</code> and open <code>http://localhost:8765/</code>. The viewer reads live flow records straight from the daemon. A demo instance lives at <a href="../../demo/">darkmux.com/demo</a>.</p>
   </div>
 </section>
@@ -85,14 +85,14 @@
     <pre><code>darkmux lab inspect quick-q-deep-1778302418-1</code></pre>
     <p>Shows: total wall-clock, turn count, compaction events, mode (fast vs slow per the bimodal wall-clock distribution observed in empirical testing), notes from the trajectory.</p>
 
-    <p>The mode classification (fast/slow) reflects the bimodal wall-clock distribution observed in empirical testing — wall-clock per turn splits into two clusters based on whether the prompt happened to hit a state that triggers heavy compaction or not. Inspect tells you which cluster a given run landed in. The output is a small report — best seen by running it on your own machine after a <code>quick-q</code> or <code>long-agentic</code> run. The methodology behind this is documented in <a href="https://darklyenergized.substack.com/p/part-2-charting-the-wake">Part 2 of the lab series</a> if you want the full empirical grounding.</p>
+    <p>The mode classification (fast/slow) reflects the bimodal wall-clock distribution observed in empirical testing. Wall-clock per turn splits into two clusters based on whether the prompt happened to hit a state that triggers heavy compaction or not. Inspect tells you which cluster a given run landed in. The output is a small report, best seen by running it on your own machine after a <code>quick-q</code> or <code>long-agentic</code> run. The methodology behind this is documented in <a href="https://darklyenergized.substack.com/p/part-2-charting-the-wake">Part 2 of the lab series</a> if you want the full empirical grounding.</p>
   </div>
 </section>
 
 <section>
   <div class="wrap">
     <h2>Characterize your hardware</h2>
-    <p><code>darkmux lab characterize</code> is the one-command "QA my Mac" — dispatches a representative smoke workload, captures the run, and emits a verdict.</p>
+    <p><code>darkmux lab characterize</code> is the one-command "QA my Mac": it dispatches a representative smoke workload, captures the run, and emits a verdict.</p>
     <pre><code>darkmux lab characterize</code></pre>
     <p>Output is a structured JSON verdict plus a human-readable summary. Used to:</p>
     <ul>
@@ -106,7 +106,7 @@
 <section>
   <div class="wrap">
     <h2>Tune: detect bimodal variance</h2>
-    <p>Single runs lie about local-AI behavior. Wall-clock varies enough that one run isn't a reliable signal. <code>lab tune</code> dispatches N runs against the same workload and clusters the results — surfacing the bimodal "fast" vs "slow" mode shape if it's there.</p>
+    <p>Single runs lie about local-AI behavior. Wall-clock varies enough that one run isn't a reliable signal. <code>lab tune</code> dispatches N runs against the same workload and clusters the results, surfacing the bimodal "fast" vs "slow" mode shape if it's there.</p>
     <pre><code>darkmux lab tune long-agentic --runs 6</code></pre>
     <p>Output: a per-run table + a cluster verdict ("looks bimodal at fast=&lt;mean&gt;s, slow=&lt;mean&gt;s" or "single-mode").</p>
     <p>Use this after changing a profile setting (context length, compaction mode, compactor model) to see whether the change actually shifted the distribution rather than just luck on a single run.</p>
@@ -116,7 +116,7 @@
 <section>
   <div class="wrap">
     <h2>Compare runs</h2>
-    <p><code>darkmux lab compare A B</code> diffs two runs — typically a "before tuning" baseline vs "after" verification.</p>
+    <p><code>darkmux lab compare A B</code> diffs two runs, typically a "before tuning" baseline vs "after" verification.</p>
     <pre><code>darkmux lab compare quick-q-deep-1778302418-1 quick-q-deep-1778466601-1</code></pre>
     <p>Reports: wall-clock delta, compaction-event delta, mode classification per side, any structural differences in the trajectory.</p>
     <p>The discipline behind it: <strong>baseline → single-variable change → re-measure → compare → record in notebook</strong>. Each step has a darkmux primitive. Don't skip the baseline. Don't change two variables at once. Without this discipline, the comparison is uninterpretable.</p>
@@ -135,18 +135,18 @@ darkmux lab runs --limit 50</code></pre>
 <section>
   <div class="wrap">
     <h2>Reproducible sandboxes: fixtures</h2>
-    <p>A single number isn't a measurement — a number you can <em>reproduce</em> is. The fixture system (landed across <a href="https://github.com/kstrat2001/darkmux/issues/487">#487</a>, phases 1–5) makes every <code>coding-task</code> run start from a known state and end with a verifiable one, so "this profile is faster" becomes a claim you can re-run on demand.</p>
+    <p>A single number isn't a measurement; a number you can <em>reproduce</em> is. The fixture system (landed across <a href="https://github.com/kstrat2001/darkmux/issues/487">#487</a>, phases 1–5) makes every <code>coding-task</code> run start from a known state and end with a verifiable one, so "this profile is faster" becomes a claim you can re-run on demand.</p>
 
     <h3>Per-run copy-on-write isolation</h3>
-    <p>Every <code>darkmux lab run</code> works in its own sandbox — a copy-on-write clone of the source, not the source itself. The source fixture directory is <strong>never touched</strong>; cross-run contamination is eliminated by construction. The clone is near-instant where the filesystem supports it (<code>clonefile</code> on APFS, <code>--reflink</code> on btrfs/xfs/zfs) and falls back to a deep copy everywhere else.</p>
+    <p>Every <code>darkmux lab run</code> works in its own sandbox, a copy-on-write clone of the source, not the source itself. The source fixture directory is <strong>never touched</strong>; cross-run contamination is eliminated by construction. The clone is near-instant where the filesystem supports it (<code>clonefile</code> on APFS, <code>--reflink</code> on btrfs/xfs/zfs) and falls back to a deep copy everywhere else.</p>
     <pre><code>~/.darkmux/runs/&lt;run-id&gt;/
 <span class="comment">  sandbox/          # this run's isolated COW clone — the model works here
   manifest.json     # now carries baseline_hash + final_hash (schema_version 4)
   trajectory.jsonl  # per-turn detail</span></code></pre>
     <p>The manifest gained two content hashes (BLAKE3, formatted <code>blake3:&lt;hex&gt;</code>):</p>
     <ul>
-      <li><strong><code>fixture.baseline_hash</code></strong> — the source state <em>before</em> the run, captured at clone time. Proves two runs started from the same place.</li>
-      <li><strong><code>final_hash</code></strong> — the sandbox state <em>after</em> dispatch, excluding derived dirs (<code>.git</code>, <code>node_modules</code>, <code>target</code>, <code>__pycache__</code>, <code>.coverage</code>, <code>.darkmux-runtime</code>). Two runs with the same <code>final_hash</code> left bitwise-identical output — the strongest reproducibility signal the lab emits.</li>
+      <li><strong><code>fixture.baseline_hash</code></strong>: the source state <em>before</em> the run, captured at clone time. Proves two runs started from the same place.</li>
+      <li><strong><code>final_hash</code></strong>: the sandbox state <em>after</em> dispatch, excluding derived dirs (<code>.git</code>, <code>node_modules</code>, <code>target</code>, <code>__pycache__</code>, <code>.coverage</code>, <code>.darkmux-runtime</code>). Two runs with the same <code>final_hash</code> left bitwise-identical output, the strongest reproducibility signal the lab emits.</li>
     </ul>
 
     <h3>The fixture manifest</h3>
@@ -170,7 +170,7 @@ darkmux lab register ./my-fixture --force    <span class="comment"># replace an 
 darkmux lab fixtures                         <span class="comment"># list registered fixtures</span>
 darkmux lab unregister demo-tiny-py          <span class="comment"># drop the entry (never deletes the dir)</span>
 darkmux lab doctor                           <span class="comment"># offline integrity check (see below)</span></code></pre>
-    <p>A workload opts into a fixture by declaring <code>requires_fixture</code> in its manifest — a <code>&lt;name&gt;@&lt;version&gt;</code> string. At run time the resolver finds a registered fixture whose <code>satisfies</code> matches and uses it as the source; with no <code>requires_fixture</code> set, the run falls back to <code>{sandboxes}/&lt;workload-id&gt;/</code> as before. (This replaces the old <code>DARKMUX_SANDBOX_&lt;ID&gt;</code> env-var binding — the registry is now the only persistent fixture binding.)</p>
+    <p>A workload opts into a fixture by declaring <code>requires_fixture</code> in its manifest, a <code>&lt;name&gt;@&lt;version&gt;</code> string. At run time the resolver finds a registered fixture whose <code>satisfies</code> matches and uses it as the source; with no <code>requires_fixture</code> set, the run falls back to <code>{sandboxes}/&lt;workload-id&gt;/</code> as before. (This replaces the old <code>DARKMUX_SANDBOX_&lt;ID&gt;</code> env-var binding; the registry is now the only persistent fixture binding.)</p>
 
     <h3><code>darkmux lab doctor</code></h3>
     <p>A cheap, offline check that catches a broken fixture <em>before</em> you waste a dispatch on it. For every registered fixture it verifies the path still exists, the manifest still loads, the <code>required_files</code> are present, and the content hash + manifest version haven't drifted since registration. If there's no registry at all, it points you at <code>scripts/lab-init.sh</code>.</p>
@@ -180,17 +180,17 @@ darkmux lab doctor                           <span class="comment"># offline int
     <pre><code>scripts/lab-init.sh          <span class="comment"># register all built-ins</span>
 scripts/lab-init.sh --dry    <span class="comment"># print what would be registered; no writes</span>
 scripts/lab-init.sh --force  <span class="comment"># re-register, accepting upstream drift</span></code></pre>
-    <p>It's a plain script, not a CLI verb — run it once, fork it, or skip it entirely. The discoverability path lives in <code>darkmux lab doctor</code>'s "no registry" hint.</p>
+    <p>It's a plain script, not a CLI verb: run it once, fork it, or skip it entirely. The discoverability path lives in <code>darkmux lab doctor</code>'s "no registry" hint.</p>
   </div>
 </section>
 
 <section>
   <div class="wrap">
     <h2>Adding a workload</h2>
-    <p>Built-in workloads live in <code>templates/builtin/workloads/*.json</code> and are embedded into the binary at compile time via <code>include_str!</code> — they work from any directory without the source tree.</p>
+    <p>Built-in workloads live in <code>templates/builtin/workloads/*.json</code> and are embedded into the binary at compile time via <code>include_str!</code>. They work from any directory without the source tree.</p>
     <p>To add your own:</p>
     <ol>
-      <li>Drop a JSON manifest at <code>~/.darkmux/workloads/&lt;id&gt;.json</code> (user-local) — picked up automatically on next <code>lab run</code>.</li>
+      <li>Drop a JSON manifest at <code>~/.darkmux/workloads/&lt;id&gt;.json</code> (user-local), picked up automatically on next <code>lab run</code>.</li>
       <li>For deeper extension (new workload <em>kinds</em>, not just new prompts), implement the <code>WorkloadProvider</code> trait in <code>src/workloads/types.rs</code> and register it in <code>src/workloads/registry.rs::register_builtins()</code>. Requires a code change + reinstall.</li>
     </ol>
     <p>Two provider kinds ship out of the box: <code>prompt</code> (single prompt → response) and <code>coding-task</code> (sandbox + verify-command pattern).</p>
@@ -202,7 +202,7 @@ scripts/lab-init.sh --force  <span class="comment"># re-register, accepting upst
     <h2>Notebook entries from runs</h2>
     <p><code>darkmux notebook draft &lt;run-id&gt;</code> dispatches the active role to author a lab-style notebook entry from the run's manifest + trajectory.</p>
     <pre><code>darkmux notebook draft quick-q-deep-1778302418-1</code></pre>
-    <p>The output is markdown — Action/Why/Result/Next blocks suitable for pasting into your lab notebook. If you have <code>DARKMUX_NOTEBOOK_DIR</code> set (typically to an iCloud-synced path), <code>darkmux notebook list</code> enumerates entries across machines.</p>
+    <p>The output is markdown: Action/Why/Result/Next blocks suitable for pasting into your lab notebook. If you have <code>DARKMUX_NOTEBOOK_DIR</code> set (typically to an iCloud-synced path), <code>darkmux notebook list</code> enumerates entries across machines.</p>
   </div>
 </section>
 

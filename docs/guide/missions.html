@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Missions, sprints, and crew dispatch — darkmux user guide</title>
+<title>Missions, sprints, and crew dispatch: darkmux user guide</title>
 <meta name="description" content="Structured agentic work in darkmux: dispatch local-AI roles, track multi-step plans as missions and sprints, drive QA via sprint review.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -28,20 +28,20 @@
   <div class="wrap">
     <div class="label">04 <span class="dot">·</span> advanced</div>
     <h1>Missions, sprints, and crew dispatch</h1>
-    <p class="lede">The advanced agentic surface. Use darkmux's <em>crew</em> abstraction to dispatch local-AI roles (coder, code-reviewer, scribe), track multi-step work as <em>missions</em> made of <em>sprints</em>, and run structured QA via <code>sprint review</code>. Optional — everything in earlier sections works without these concepts.</p>
+    <p class="lede">The advanced agentic surface. Use darkmux's <em>crew</em> abstraction to dispatch local-AI roles (coder, code-reviewer, scribe), track multi-step work as <em>missions</em> made of <em>sprints</em>, and run structured QA via <code>sprint review</code>. Optional: everything in earlier sections works without these concepts.</p>
   </div>
 </header>
 
 <section>
   <div class="wrap">
     <h2>When you'd use this</h2>
-    <p>If you're driving darkmux as a CLI for personal model loadout management, you don't need this. The mission/sprint/crew layer is for operators using darkmux as the local-AI tier of an agentic workflow — where a frontier orchestrator (Claude, GPT, etc.) is delegating routine implementation work to local models.</p>
+    <p>If you're driving darkmux as a CLI for personal model loadout management, you don't need this. The mission/sprint/crew layer is for operators using darkmux as the local-AI tier of an agentic workflow, where a frontier orchestrator (Claude, GPT, etc.) is delegating routine implementation work to local models.</p>
     <p>Specifically, this section is useful if you want:</p>
     <ul>
       <li><strong>Named local-AI roles</strong> with specific tool palettes and system prompts (a "coder" that can edit files; a "code-reviewer" that can only read; a "scribe" that drafts prose).</li>
-      <li><strong>Multi-step plans with structure</strong> — missions that contain sprints, dependencies, lifecycle state (planned/running/complete/abandoned).</li>
-      <li><strong>QA-by-default discipline</strong> — every implementation sprint passes through <code>sprint review</code>, which dispatches a code-reviewer crew against the diff.</li>
-      <li><strong>Visible orchestration in the viewer</strong> — mission start, sprint transitions, dispatch start/complete, verdict, all rendered as a timeline in <code>/flow</code>.</li>
+      <li><strong>Multi-step plans with structure</strong>: missions that contain sprints, dependencies, lifecycle state (planned/running/complete/abandoned).</li>
+      <li><strong>QA-by-default discipline</strong>: every implementation sprint should pass through <code>sprint review</code>, which dispatches a code-reviewer crew against the diff.</li>
+      <li><strong>Visible orchestration in the viewer</strong>: mission start, sprint transitions, dispatch start/complete, verdict, all rendered as a timeline in <code>/flow</code>.</li>
     </ul>
   </div>
 </section>
@@ -49,13 +49,13 @@
 <section>
   <div class="wrap">
     <h2>Crew: roles + dispatch</h2>
-    <p>A <strong>role</strong> is a named local-AI capability — a manifest under <code>templates/builtin/roles/&lt;id&gt;.json</code> (or <code>~/.darkmux/roles/&lt;id&gt;.json</code> for operator overrides) paired with a system prompt at the same path with a <code>.md</code> extension. The manifest declares:</p>
+    <p>A <strong>role</strong> is a named local-AI capability: a manifest under <code>templates/builtin/roles/&lt;id&gt;.json</code> (or <code>~/.darkmux/roles/&lt;id&gt;.json</code> for operator overrides) paired with a system prompt at the same path with a <code>.md</code> extension. The manifest declares:</p>
     <ul>
-      <li><code>id</code>, <code>description</code>, <code>skills</code> — the <code>skills</code> list names work-shape descriptors the role is good at (renamed from <code>capabilities</code> in <a href="https://github.com/kstrat2001/darkmux/issues/448">#448</a>; existing manifests must use the new key). Each skill in turn declares an intrinsic capability profile (<code>code</code>, <code>reasoning</code>, <code>instruction_following</code>, <code>agentic_tool_use</code>) that role-to-model selection will score against.</li>
-      <li><code>tool_palette</code> — <code>allow</code> and <code>deny</code> lists of tools (read, exec, edit, etc.)</li>
-      <li><code>escalation_contract</code> — what the role does when it can't solve the task (bail, retry-with-hint, hand-off-to)</li>
-      <li><code>role_family</code> (optional) — <code>specialist</code> (default) or <code>utility</code>; specialist roles get the autonomous-dispatch preamble injected ahead of their prompt (they can't ask questions mid-dispatch, so they escalate with a <code>BLOCKED:</code> line instead).</li>
-      <li><code>feedback_templates</code> (optional) — per-signal overrides for the runtime's model-facing nudges (cycle/loop/cascade/etc.); falls back to the built-in wording when unset.</li>
+      <li><code>id</code>, <code>description</code>, <code>skills</code>: the <code>skills</code> list names work-shape descriptors the role is good at (renamed from <code>capabilities</code> in <a href="https://github.com/kstrat2001/darkmux/issues/448">#448</a>; existing manifests must use the new key). Each skill in turn declares an intrinsic capability profile (<code>code</code>, <code>reasoning</code>, <code>instruction_following</code>, <code>agentic_tool_use</code>) that role-to-model selection will score against.</li>
+      <li><code>tool_palette</code>: <code>allow</code> and <code>deny</code> lists of tools (read, exec, edit, etc.)</li>
+      <li><code>escalation_contract</code>: what the role does when it can't solve the task (bail, retry-with-hint, hand-off-to)</li>
+      <li><code>role_family</code> (optional): <code>specialist</code> (default) or <code>utility</code>; specialist roles get the autonomous-dispatch preamble injected ahead of their prompt (they can't ask questions mid-dispatch, so they escalate with a <code>BLOCKED:</code> line instead).</li>
+      <li><code>feedback_templates</code> (optional): per-signal overrides for the runtime's model-facing nudges (cycle/loop/cascade/etc.); falls back to the built-in wording when unset.</li>
     </ul>
 
     <h3>Inspect roles</h3>
@@ -64,17 +64,17 @@ darkmux role show coder          <span class="comment"># full details for one ro
 
     <h3>Dispatch a role</h3>
     <pre><code>darkmux crew dispatch coder --message "Add tests for the new helper in src/foo.rs"</code></pre>
-    <p>What happens (default runtime &mdash; internal):</p>
+    <p>What happens (default runtime, internal):</p>
     <ol>
       <li>darkmux loads the role manifest + the <code>.md</code> system prompt.</li>
       <li><strong>Pre-flight</strong>: verifies Docker is reachable and the <code>darkmux-runtime:latest</code> image is present locally. Bails loud with build instructions if either is missing.</li>
-      <li>Spins up a fresh <code>darkmux-runtime</code> container per dispatch with a mounted workspace tempdir &mdash; kernel-enforced isolation, no cross-task context leak by construction.</li>
+      <li>Spins up a fresh <code>darkmux-runtime</code> container per dispatch with a mounted workspace tempdir: kernel-enforced isolation, no cross-task context leak by construction.</li>
       <li>Streams the model's reasoning and tool calls via the in-house Rust loop; emits <code>dispatch.turn</code>, <code>dispatch.tool</code>, and <code>dispatch.reasoning</code> flow records as they happen.</li>
       <li>Emits a final <code>dispatch complete</code> or <code>dispatch error</code> record; optionally snapshots <code>--watch</code> paths to verify the role's SIGNOFF claims.</li>
     </ol>
     <div class="callout">
       <strong>Verification boundary.</strong>
-      <p style="margin: 8px 0 0;">The dispatch container is intentionally minimal — no project toolchains. The <code>coder</code>, <code>code-reviewer</code>, and <code>test-designer</code> roles are instructed (<a href="https://github.com/kstrat2001/darkmux/issues/398">#398</a>) <em>not</em> to install toolchains or run build/test/lint inside the container: their job ends at "the edit is in place + the tests are written," and they name the verification commands the frontier should run on the host afterward. So a role's report won't claim "tests passed" for commands it never ran — verification is the frontier orchestrator's step, by design.</p>
+      <p style="margin: 8px 0 0;">The dispatch container is intentionally minimal: no project toolchains. The <code>coder</code>, <code>code-reviewer</code>, and <code>test-designer</code> roles are instructed (<a href="https://github.com/kstrat2001/darkmux/issues/398">#398</a>) <em>not</em> to install toolchains or run build/test/lint inside the container: their job ends at "the edit is in place + the tests are written," and they name the verification commands the frontier should run on the host afterward. So a role's report won't claim "tests passed" for commands it never ran. Verification is the frontier orchestrator's step, by design.</p>
     </div>
 
     <h4>Opting into openclaw</h4>
@@ -83,7 +83,7 @@ darkmux role show coder          <span class="comment"># full details for one ro
     <p>The openclaw path uses <code>darkmux/&lt;role-id&gt;</code> agents in openclaw's config; run <code>darkmux crew sync</code> first if you've edited a role manifest since the last sync.</p>
 
     <h3>Sync the role registry (openclaw only)</h3>
-    <p>Only needed if you use <code>--runtime openclaw</code>. The internal runtime reads role manifests directly each dispatch &mdash; no registry to reconcile.</p>
+    <p>Only needed if you use <code>--runtime openclaw</code>. The internal runtime reads role manifests directly each dispatch: no registry to reconcile.</p>
     <pre><code>darkmux crew sync                <span class="comment"># reconcile openclaw agents.list[] with manifests</span>
 darkmux crew sync --dry-run      <span class="comment"># preview without writing</span></code></pre>
   </div>
@@ -92,7 +92,7 @@ darkmux crew sync --dry-run      <span class="comment"># preview without writing
 <section>
   <div class="wrap">
     <h2>Missions + sprints</h2>
-    <p>A <strong>mission</strong> is a named objective — a JSON file under <code>~/.darkmux/missions/&lt;id&gt;.json</code> with a description, a list of <code>sprint_ids</code>, and a status (active/closed/paused). A <strong>sprint</strong> is a time-boxed work unit inside a mission — its own JSON file under <code>~/.darkmux/sprints/&lt;id&gt;.json</code> with status (planned/running/complete/abandoned), depends_on, and timestamps.</p>
+    <p>A <strong>mission</strong> is a named objective: a JSON file under <code>~/.darkmux/missions/&lt;id&gt;.json</code> with a description, a list of <code>sprint_ids</code>, and a status (active/closed/paused). A <strong>sprint</strong> is a time-boxed work unit inside a mission: its own JSON file under <code>~/.darkmux/sprints/&lt;id&gt;.json</code> with status (planned/running/complete/abandoned), depends_on, and timestamps.</p>
 
     <p class="muted"><em>Note for operators with existing state:</em> earlier versions of darkmux nested everything under <code>~/.darkmux/crew/</code> (<code>roles/</code>, <code>missions/</code>, <code>sprints/</code>). The loader transparently falls back to that layout, so existing state keeps working. Run <code>darkmux doctor</code> for a copy-pasteable <code>mv</code> script to flatten when you're ready.</p>
 
@@ -126,7 +126,7 @@ next: <code>darkmux mission start draft-blog-post</code> to begin (or pass <code
 <span class="comment"># ... proposal approved, files written, mission → Active</span></code></pre>
 
     <h3>Authoring by hand (low-level alternative)</h3>
-    <p>If you prefer to skip the propose step or are building automation, you can write the JSON files directly. This is the escape hatch — recommended for operators who want full control or are scripting workflows.</p>
+    <p>If you prefer to skip the propose step or are building automation, you can write the JSON files directly. This is the escape hatch: recommended for operators who want full control or are scripting workflows.</p>
     <p>These are <strong>operator-edited JSON files</strong>. darkmux doesn't require a creation verb; you write the file directly, then use the CLI to transition status.</p>
 
     <h3>When to use missions vs. not</h3>
@@ -149,7 +149,7 @@ next: <code>darkmux mission start draft-blog-post</code> to begin (or pass <code
         <td>Multi-step work where the wall-clock arcs per sprint matter, dependencies between sprints matter, or you want the viewer's timeline as an explicit feedback surface.</td>
       </tr>
     </table>
-    <p>The practical heuristic: <strong>if you can't articulate what the viewer would show you at the end of the mission, you probably don't need a mission.</strong> If the answer is *"a 3-arc timeline with these durations and these dispatch records"*, missions earn their keep.</p>
+    <p>The practical heuristic: <strong>if you can't articulate what the viewer would show you at the end of the mission, you probably don't need a mission.</strong> If the answer is <em>"a 3-arc timeline with these durations and these dispatch records"</em>, missions earn their keep.</p>
 
     <h3>Mission JSON shape</h3>
     <pre><code>{
@@ -214,10 +214,10 @@ darkmux sprint start draft-blog-post-s1-outline
 darkmux sprint complete draft-blog-post-s1-outline
 darkmux mission close draft-blog-post
 <span class="comment"># mission `draft-blog-post` → Closed   duration=&lt;wall-clock seconds&gt;</span></code></pre>
-    <p>Every transition emits a flow record — open <a href="../flow/">darkmux.com/flow/</a>, click <strong>Connect</strong>, and you'll see the cyan operator-tier records as the lifecycle moves.</p>
+    <p>Every transition emits a flow record. Open <a href="../flow/">darkmux.com/flow/</a>, click <strong>Connect</strong>, and you'll see the cyan operator-tier records as the lifecycle moves.</p>
 
     <h3>Mission without sprints (duration container)</h3>
-    <p>You can omit sprints entirely. A mission with <code>sprint_ids: []</code> is valid — it's just a start/close timestamp container for an engagement-level chunk of work that isn't decomposable.</p>
+    <p>You can omit sprints entirely. A mission with <code>sprint_ids: []</code> is valid: it's just a start/close timestamp container for an engagement-level chunk of work that isn't decomposable.</p>
     <pre><code>{
   "id": "japan-trip-2026-05",
   "description": "10-day Japan trip, May 20-30.",
@@ -227,7 +227,7 @@ darkmux mission close draft-blog-post
 }</code></pre>
     <p>Then just <code>darkmux mission start japan-trip-2026-05</code> when the trip begins and <code>darkmux mission close japan-trip-2026-05</code> when it ends. The viewer will show the wall-clock duration.</p>
 
-    <p>You can also <a href="https://github.com/kstrat2001/darkmux/issues/107"><code>mission add-sprint</code></a> later if structure emerges mid-trip — the empty-sprint mission grows into a decomposed one as needed.</p>
+    <p>You can also <a href="https://github.com/kstrat2001/darkmux/issues/107"><code>mission add-sprint</code></a> later if structure emerges mid-trip. The empty-sprint mission grows into a decomposed one as needed.</p>
 
     <h3>Growing the plan: the multi-sprint shape</h3>
     <p>For mission-shaped work with clear decomposition — a campaign, a deploy, a multi-week research arc — the natural pattern is one mission JSON + one sprint JSON per planned step. Same shape as the minimum-viable example, just more sprint files.</p>
@@ -236,7 +236,7 @@ darkmux mission close draft-blog-post
 
     <div class="callout">
       <strong>Mission/sprint is a generic plan abstraction.</strong>
-      <p style="margin: 6px 0 0;">The examples here aren't all software engineering — blog drafts, marketing campaigns, travel planning all fit. Anywhere you want explicit state for <em>"this is what I'm working toward"</em> and <em>"this is the named piece I'm currently on,"</em> mission + sprint is the shape. The schema doesn't care what the work is.</p>
+      <p style="margin: 6px 0 0;">The examples here aren't all software engineering: blog drafts, marketing campaigns, travel planning all fit. Anywhere you want explicit state for <em>"this is what I'm working toward"</em> and <em>"this is the named piece I'm currently on,"</em> mission + sprint is the shape. The schema doesn't care what the work is.</p>
     </div>
 
     <h3>Drive the lifecycle</h3>
@@ -250,7 +250,7 @@ darkmux mission close &lt;id&gt;        <span class="comment"># → Closed (term
 darkmux sprint start &lt;id&gt;         <span class="comment"># Planned/Abandoned → Running</span>
 darkmux sprint complete &lt;id&gt;      <span class="comment"># Running → Complete (terminal)</span>
 darkmux sprint abandon &lt;id&gt;       <span class="comment"># Planned/Running → Abandoned</span></code></pre>
-    <p>Every transition emits a flow record. Open <a href="../flow/" target="_blank" rel="noopener">the viewer in a new tab</a> as you run these — the sprint-progress widget in the header shows N/M done across active missions, and the record stream below shows the cyan operator-tier transitions in order.</p>
+    <p>Every transition emits a flow record. Open <a href="../flow/" target="_blank" rel="noopener">the viewer in a new tab</a> as you run these. The sprint-progress widget in the header shows N/M done across active missions, and the record stream below shows the cyan operator-tier transitions in order.</p>
   </div>
 </section>
 
@@ -284,9 +284,9 @@ darkmux sprint review --require-clean          <span class="comment"># exit 1 if
 
     <p>Verdict bucket reflects the worst severity found:</p>
     <ul>
-      <li><strong>clean</strong> — zero findings.</li>
-      <li><strong>flags-only</strong> — no blockers; flags and/or nits present.</li>
-      <li><strong>blockers</strong> — at least one BLOCKER-severity finding.</li>
+      <li><strong>clean</strong>: zero findings.</li>
+      <li><strong>flags-only</strong>: no blockers; flags and/or nits present.</li>
+      <li><strong>blockers</strong>: at least one BLOCKER-severity finding.</li>
     </ul>
     <p>Output is structured JSON with the full findings list. Use <code>--require-clean</code> in CI or pre-commit scripts that need to gate on clean reviews.</p>
 
@@ -300,10 +300,10 @@ darkmux sprint review --require-clean          <span class="comment"># exit 1 if
     <ol>
       <li>Write a mission JSON describing what you're trying to do, with sprint ids planned.</li>
       <li>Write the first sprint JSON.</li>
-      <li><code>darkmux mission start &lt;m&gt;</code> + <code>darkmux sprint start &lt;s1&gt;</code> — operator/cyan records land in the viewer.</li>
-      <li>Dispatch the work: <code>darkmux crew dispatch coder --message "&lt;sprint task&gt;"</code> — local/green records (start + complete) with the model field stamped.</li>
-      <li><code>darkmux sprint complete &lt;s1&gt;</code> — duration arc visible in the wall-clock graphic.</li>
-      <li><code>darkmux sprint review --sprint-id &lt;s1&gt;</code> — QA pass; verdict emits to the viewer. Address findings.</li>
+      <li><code>darkmux mission start &lt;m&gt;</code> + <code>darkmux sprint start &lt;s1&gt;</code>: operator/cyan records land in the viewer.</li>
+      <li>Dispatch the work: <code>darkmux crew dispatch coder --message "&lt;sprint task&gt;"</code>: local/green records (start + complete) with the model field stamped.</li>
+      <li><code>darkmux sprint complete &lt;s1&gt;</code>: duration arc visible in the wall-clock graphic.</li>
+      <li><code>darkmux sprint review --sprint-id &lt;s1&gt;</code>: QA pass; verdict emits to the viewer. Address findings.</li>
       <li>Open a PR. If the verdict was clean (or flags-only with nothing material), merge.</li>
       <li>Repeat for subsequent sprints. Discover scope mid-flight? <code>darkmux mission add-sprint</code> rather than filing a separate mission.</li>
       <li><code>darkmux mission close &lt;m&gt;</code> when the plan is done.</li>
@@ -315,8 +315,8 @@ darkmux sprint review --require-clean          <span class="comment"># exit 1 if
 <section>
   <div class="wrap">
     <h2>Operator sovereignty (a note)</h2>
-    <p>darkmux's mission/sprint/crew model is intentionally <em>operator-owned</em>: missions and sprints are JSON files you write; the CLI manages state transitions but never auto-creates or auto-abandons. The orchestrator is expected to propose structure — *"this looks like 3 sprints; want me to scaffold them?"* — but you accept or modify before files land.</p>
-    <p>If a sprint sits in <code>Running</code> status for hours, that's not a bug in darkmux; it's the operator deciding to leave it open. The viewer's wall-clock graphic shows an unbounded sweep on stale running sprints — clearly-wrong-looking signal that the operator forgot to close one. By design.</p>
+    <p>darkmux's mission/sprint/crew model is intentionally <em>operator-owned</em>: missions and sprints are JSON files you write; the CLI manages state transitions but never auto-creates or auto-abandons. The orchestrator is expected to propose structure — <em>"this looks like 3 sprints; want me to scaffold them?"</em> — but you accept or modify before files land.</p>
+    <p>If a sprint sits in <code>Running</code> status for hours, that's not a bug in darkmux; it's the operator deciding to leave it open. The viewer's wall-clock graphic shows an unbounded sweep on stale running sprints: clearly-wrong-looking signal that the operator forgot to close one. By design.</p>
   </div>
 </section>
 
