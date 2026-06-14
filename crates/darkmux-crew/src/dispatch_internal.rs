@@ -725,7 +725,11 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         let binary = ensure_runtime_binary_cached(&darkmux_image)?;
         apply_runtime_injection(&mut cmd, &binary);
     }
-    cmd.arg(&image)
+    // Belt-and-braces: `--` tells docker run "everything after this is the
+    // image, never an option" — guards against a publisher injecting
+    // `--privileged` etc. as the image ref (#838).
+    cmd.arg("--")
+        .arg(&image)
         .arg("run")
         .arg("--model")
         .arg(&model)

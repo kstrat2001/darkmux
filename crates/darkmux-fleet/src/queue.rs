@@ -138,6 +138,12 @@ pub(crate) const MAX_WORK_IDENTIFIER_LEN: usize = 64;
 /// rejected at the queue boundary. (#246 PR-C.3 / PR-C.2 review carry-over)
 pub(crate) const MAX_WORK_TIMEOUT_SECONDS: u32 = 60 * 60;
 
+/// Max byte size of `WorkJob.image` (the operator's Docker image ref).
+/// 256 bytes is generous for any realistic image reference (e.g.
+/// `ghcr.io/org/repo:tag`) and prevents a publisher from filling memory
+/// with a multi-megabyte image string. (#838 PR-C.2)
+pub(crate) const MAX_WORK_IMAGE_BYTES: usize = 256;
+
 impl WorkJob {
     /// Validate a `WorkJob` at the queue boundary — called by both the
     /// publisher (in `publish_job`) and the consumer (after claim, before
@@ -154,6 +160,9 @@ impl WorkJob {
     /// - Optional `workdir` ≤ `MAX_WORK_WORKDIR_BYTES`. The
     ///   symlink-escape check on the resolved path is done by the
     ///   runner (PR-C.2b / follow-up).
+    /// - `image` (optional) — non-empty, ≤ `MAX_WORK_IMAGE_BYTES`, no
+    ///   leading `-` (prevents docker-flag injection, #838), and every
+    ///   char in the conservative image-ref charset.
     ///
     /// `runtime` is not checked here — the field is the `Runtime` enum,
     /// so an unknown variant is rejected at JSON deserialization
@@ -191,6 +200,9 @@ impl WorkJob {
                 MAX_WORK_TIMEOUT_SECONDS,
                 self.timeout_seconds
             ));
+        }
+        if let Some(img) = &self.image {
+            validate_work_image(img)?;
         }
         Ok(())
     }
@@ -233,6 +245,49 @@ pub fn validate_identifier(label: &str, value: &str) -> Result<()> {
 /// the existing internal call-sites read tightly.
 fn validate_work_identifier(field: &str, value: &str) -> Result<()> {
     validate_identifier(&format!("WorkJob.{field}"), value)
+}
+
+/// Validate a Docker image reference at the queue boundary.
+/// Rejects empty strings, values starting with `-` (docker-flag injection,
+/// #838), and any char outside the conservative image-ref charset
+/// `[A-Za-z0-9._/:@-]`. Also enforces a byte-size cap.
+///
+/// The allowlist covers the full Docker reference grammar:
+/// - registry host (`myregistry.io`)
+/// - slash-separated path segments (`org/repo`, `a/b/c`)
+/// - colon tag (`:latest`, `:v1.2.3`)
+/// - at digest (`@sha256:...`)
+/// - dots, underscores, hyphens in names
+pub fn validate_image_ref(value: &str) -> Result<()> {
+    if value.is_empty() {
+        return Err(anyhow!("image must be non-empty"));
+    }
+    if value.len() > MAX_WORK_IMAGE_BYTES {
+        return Err(anyhow!(
+            "image exceeds {}-byte cap (was {} bytes): {value:?}",
+            MAX_WORK_IMAGE_BYTES,
+            value.len()
+        ));
+    }
+    if value.starts_with('-') {
+        return Err(anyhow!(
+            "image must not start with '-' (prevents docker-flag injection, #838): {value:?}"
+        ));
+    }
+    let bad = value
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == '/' || *c == '-' || *c == ':' || *c == '@'));
+    if let Some(c) = bad {
+        return Err(anyhow!(
+            "image contains invalid char {c:?} (allowlist [A-Za-z0-9._/:@-]): {value:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// Wraps `validate_image_ref` with the `"WorkJob.image"` label prefix.
+fn validate_work_image(value: &str) -> Result<()> {
+    validate_image_ref(value)
 }
 
 /// Result of a successful `claim_job` — the runner now owns the job.
@@ -474,4 +529,180 @@ pub(crate) fn ack_job(client: &redis::Client, group: &str, work_id: &str) -> Res
         .query(&mut conn)
         .with_context(|| format!("XACK on {WORK_STREAM}"))?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal valid WorkJob with all optional fields None.
+    fn make_valid_job() -> WorkJob {
+        WorkJob {
+            target_machine: None,
+            role_id: "test-role".to_string(),
+            message: "hello".to_string(),
+            session_id: "sess-1".to_string(),
+            deliver: None,
+            workdir: None,
+            sprint_id: None,
+            runtime: darkmux_crew::dispatch::Runtime::Internal,
+            image: None,
+            timeout_seconds: 60,
+            published_at_unix_ms: 1_700_000_000_000,
+            published_by_machine: None,
+            published_by_orchestrator: None,
+            attempt: 1,
+        }
+    }
+
+    // ---- validate_identifier tests ----
+
+    #[test]
+    fn validate_identifier_positive() {
+        // lowercase + digits + underscore + hyphen
+        assert!(validate_identifier("field", "abc-123_xyz").is_ok());
+    }
+
+    #[test]
+    fn validate_identifier_empty() {
+        let err = validate_identifier("field", "").unwrap_err();
+        assert!(err.to_string().contains("must be non-empty"));
+    }
+
+    #[test]
+    fn validate_identifier_over_length() {
+        let long = "a".repeat(MAX_WORK_IDENTIFIER_LEN + 1);
+        let err = validate_identifier("field", &long).unwrap_err();
+        assert!(err.to_string().contains("exceeds"));
+    }
+
+    #[test]
+    fn validate_identifier_dot() {
+        let err = validate_identifier("field", "a.b").unwrap_err();
+        assert!(err.to_string().contains("invalid char"));
+    }
+
+    #[test]
+    fn validate_identifier_slash() {
+        let err = validate_identifier("field", "a/b").unwrap_err();
+        assert!(err.to_string().contains("invalid char"));
+    }
+
+    #[test]
+    fn validate_identifier_double_dot() {
+        let err = validate_identifier("field", "..").unwrap_err();
+        assert!(err.to_string().contains("invalid char"));
+    }
+
+    #[test]
+    fn validate_identifier_space() {
+        let err = validate_identifier("field", "a b").unwrap_err();
+        assert!(err.to_string().contains("invalid char"));
+    }
+
+    #[test]
+    fn validate_identifier_uppercase() {
+        let err = validate_identifier("field", "Abc").unwrap_err();
+        assert!(err.to_string().contains("invalid char"));
+    }
+
+    #[test]
+    fn validate_identifier_embedded_null() {
+        let err = validate_identifier("field", "a\0b").unwrap_err();
+        assert!(err.to_string().contains("invalid char"));
+    }
+
+    // ---- validate_image_ref tests ----
+
+    #[test]
+    fn validate_image_ref_valid() {
+        // A typical registry/path:tag reference
+        assert!(validate_image_ref("rust:slim").is_ok());
+        // (#838 regression guard) registry/org-path + digest refs — the charset
+        // originally omitted '/' and rejected every real ref.
+        assert!(validate_image_ref("ghcr.io/org/repo:tag").is_ok());
+        assert!(validate_image_ref("docker.io/library/rust@sha256:abc123").is_ok());
+        // image byte-cap boundary (was untested):
+        assert!(validate_image_ref(&"a".repeat(MAX_WORK_IMAGE_BYTES)).is_ok());
+        assert!(validate_image_ref(&"a".repeat(MAX_WORK_IMAGE_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn validate_image_ref_empty() {
+        let err = validate_image_ref("").unwrap_err();
+        assert!(err.to_string().contains("non-empty"));
+    }
+
+    #[test]
+    fn validate_image_ref_leading_dash() {
+        let err = validate_image_ref("--privileged").unwrap_err();
+        assert!(err.to_string().contains("must not start with '-'"));
+    }
+
+    #[test]
+    fn validate_image_ref_bad_char() {
+        let err = validate_image_ref("rust:slim\0").unwrap_err();
+        assert!(err.to_string().contains("invalid char"));
+    }
+
+    // ---- WorkJob::validate boundary tests ----
+
+    #[test]
+    fn validate_job_zero_timeout() {
+        let mut job = make_valid_job();
+        job.timeout_seconds = 0;
+        let err = job.validate().unwrap_err();
+        assert!(err.to_string().contains("non-zero"));
+    }
+
+    #[test]
+    fn validate_job_over_cap_message() {
+        let mut job = make_valid_job();
+        job.message = "x".repeat(MAX_WORK_MESSAGE_BYTES + 1);
+        let err = job.validate().unwrap_err();
+        assert!(err.to_string().contains("exceeds"));
+    }
+
+    #[test]
+    fn validate_job_over_cap_workdir() {
+        let mut job = make_valid_job();
+        job.workdir = Some("x".repeat(MAX_WORK_WORKDIR_BYTES + 1));
+        let err = job.validate().unwrap_err();
+        assert!(err.to_string().contains("exceeds"));
+    }
+
+    #[test]
+    fn validate_job_invalid_image_leading_dash() {
+        let mut job = make_valid_job();
+        job.image = Some("--privileged".to_string());
+        let err = job.validate().unwrap_err();
+        assert!(err.to_string().contains("must not start with '-'"));
+    }
+
+    #[test]
+    fn validate_job_invalid_image_empty() {
+        let mut job = make_valid_job();
+        job.image = Some("".to_string());
+        let err = job.validate().unwrap_err();
+        assert!(err.to_string().contains("non-empty"));
+    }
+
+    #[test]
+    fn validate_job_invalid_image_bad_char() {
+        let mut job = make_valid_job();
+        job.image = Some("rust:slim\0".to_string());
+        let err = job.validate().unwrap_err();
+        assert!(err.to_string().contains("invalid char"));
+    }
+
+    #[test]
+    fn validate_job_valid_image_accepted() {
+        let mut job = make_valid_job();
+        job.image = Some("rust:slim".to_string());
+        assert!(job.validate().is_ok());
+    }
 }
