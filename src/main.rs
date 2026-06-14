@@ -2097,6 +2097,9 @@ fn cmd_fleet_status(emit_json: bool, deep: bool) -> Result<i32> {
     };
 
     if emit_json {
+        // (#776) Machine-readable output stays byte-clean: force color off so
+        // any accidental downstream style call can't leak ANSI into the JSON.
+        darkmux_types::style::set_colorize_override(Some(false));
         let local_id = flow::resolve_machine_id();
         let payload = serde_json::json!({
             "roster_path": fleet::roster_path().display().to_string(),
@@ -2124,11 +2127,15 @@ fn cmd_fleet_status(emit_json: bool, deep: bool) -> Result<i32> {
     }
 
     // Human-readable table.
-    println!("darkmux fleet status");
-    println!("  roster:           {}", fleet::roster_path().display());
+    use darkmux_types::style;
+    println!("{}", style::header("darkmux fleet status"));
+    println!(
+        "  roster:           {}",
+        style::dim(&fleet::roster_path().display().to_string())
+    );
     println!(
         "  local machine_id: {}",
-        flow::resolve_machine_id().unwrap_or_else(|| "<unknown>".into())
+        style::dim(&flow::resolve_machine_id().unwrap_or_else(|| "<unknown>".into()))
     );
     println!();
     if probes.is_empty() {
@@ -2137,15 +2144,24 @@ fn cmd_fleet_status(emit_json: bool, deep: bool) -> Result<i32> {
         println!("Add a peer: darkmux fleet add <id> --address <tailnet-addr>");
         return Ok(0);
     }
+    // Column-header row dimmed as secondary structure. Styling wraps the
+    // WHOLE line (color codes at the line edges), so column alignment — which
+    // counts visible chars inside the format — is preserved.
     if deep {
         println!(
-            "{:<14} {:<22} {:<10} {:<11} {:<10} VERSION  MODELS",
-            "MACHINE", "ADDRESS", "PROBE", "RAM-FREE", "OS"
+            "{}",
+            style::dim(&format!(
+                "{:<14} {:<22} {:<10} {:<11} {:<10} VERSION  MODELS",
+                "MACHINE", "ADDRESS", "PROBE", "RAM-FREE", "OS"
+            ))
         );
     } else {
         println!(
-            "{:<14} {:<26} {:<10} DESCRIPTION",
-            "MACHINE", "ADDRESS", "PROBE"
+            "{}",
+            style::dim(&format!(
+                "{:<14} {:<26} {:<10} DESCRIPTION",
+                "MACHINE", "ADDRESS", "PROBE"
+            ))
         );
     }
     for (m, p) in &probes {
@@ -2196,19 +2212,22 @@ fn cmd_fleet_status(emit_json: bool, deep: bool) -> Result<i32> {
                 }
                 None => ("specs?".into(), "—".into(), "—".into(), "—".into()),
             };
-            println!(
+            let row = format!(
                 "{:<14} {:<22} {:<10} {:<11} {:<10} {:<8} {}",
                 m.id, m.address, status, ram_free, os_str, version, models_summary
             );
+            // Fade unreachable peers (whole-line dim — alignment-safe).
+            println!("{}", if p.reachable { row } else { style::dim(&row) });
         } else {
             let desc = m.description.as_deref().unwrap_or("");
-            println!(
+            let row = format!(
                 "{:<14} {:<26} {:<10} {}",
                 m.id, m.address, status, desc
             );
+            println!("{}", if p.reachable { row } else { style::dim(&row) });
         }
         if let Some(err) = &p.error {
-            println!("               error: {err}");
+            println!("{}", style::error(&format!("               error: {err}")));
         }
     }
     Ok(0)
