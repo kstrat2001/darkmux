@@ -47,6 +47,27 @@ fn is_terminal(s: SprintStatus) -> bool {
     matches!(s, SprintStatus::Complete | SprintStatus::Abandoned)
 }
 
+/// State-accurate reconcile commands for a non-terminal sprint. `complete`
+/// only transitions Running→Complete, so a PLANNED (never-started) sprint
+/// needs `sprint start` first — emitting a bare `sprint complete` for it
+/// (the original bug) prints a command that errors. `abandon` works from
+/// either state. Surfaced by the cold-session reconcile of the
+/// cli-styling-foundation sprints, which were planned, not running (#829).
+fn reconcile_cmds(s: &Sprint) -> Vec<String> {
+    let shipped = match s.status {
+        SprintStatus::Planned => format!(
+            "darkmux sprint start {id} && darkmux sprint complete {id}   # if its work shipped",
+            id = s.id
+        ),
+        // Running (or any other non-terminal): complete goes straight through.
+        _ => format!("darkmux sprint complete {}   # if its work shipped", s.id),
+    };
+    vec![
+        shipped,
+        format!("darkmux sprint abandon {}   # if it was dropped", s.id),
+    ]
+}
+
 /// Pure drift detection for one mission given its sprints. The two
 /// load-bearing inconsistencies (both observed live 2026-06-14):
 ///   - a CLOSED mission with a non-terminal (planned/running) sprint — the
@@ -63,14 +84,7 @@ fn detect_drift(m: &Mission, sprints: &[&Sprint]) -> Vec<Drift> {
     if m.status == MissionStatus::Closed && !open.is_empty() {
         let mut suggest = Vec::new();
         for s in &open {
-            suggest.push(format!(
-                "darkmux sprint complete {}   # if its work shipped",
-                s.id
-            ));
-            suggest.push(format!(
-                "darkmux sprint abandon  {}   # if it was dropped",
-                s.id
-            ));
+            suggest.extend(reconcile_cmds(s));
         }
         out.push(Drift {
             kind: "closed-with-open-sprint",
@@ -284,9 +298,25 @@ mod tests {
         let d = detect_drift(&m, &[&s]);
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].kind, "closed-with-open-sprint");
-        // Suggests BOTH reconcile paths for the open sprint.
-        assert!(d[0].suggest.iter().any(|c| c.contains("sprint complete s1")));
-        assert!(d[0].suggest.iter().any(|c| c.contains("sprint abandon  s1")));
+        // RUNNING → complete transitions straight through (no `start`).
+        assert!(d[0].suggest.iter().any(|c| c.contains("sprint complete s1")
+            && !c.contains("sprint start")));
+        assert!(d[0].suggest.iter().any(|c| c.contains("sprint abandon s1")));
+    }
+
+    #[test]
+    fn closed_mission_with_planned_sprint_suggests_start_then_complete() {
+        // (#829 follow-up) A PLANNED sprint can't go straight to complete —
+        // the cue must include `sprint start` first, or it prints a command
+        // that errors. Caught by the cold-session reconcile.
+        let m = mission("m1", MissionStatus::Closed);
+        let s = sprint("s1", "m1", SprintStatus::Planned);
+        let d = detect_drift(&m, &[&s]);
+        assert_eq!(d.len(), 1);
+        let shipped = d[0].suggest.iter().find(|c| c.contains("if its work shipped")).unwrap();
+        assert!(shipped.contains("sprint start s1") && shipped.contains("sprint complete s1"),
+            "planned-sprint cue must start then complete; got: {shipped}");
+        assert!(d[0].suggest.iter().any(|c| c.contains("sprint abandon s1")));
     }
 
     #[test]
