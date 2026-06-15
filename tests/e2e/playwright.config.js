@@ -36,6 +36,22 @@ const PORT = 47823;
     '<head>\n<meta name="darkmux-mode" content="play">\n<meta name="darkmux-date" content="2026-01-01">'
   );
   fs.writeFileSync(path.join(SERVED, 'index-daemon.html'), daemon);
+
+  // (#856/#857) A static-playback harness pointed at the lifecycle fixture — a
+  // session whose only terminal is the reconciler's `session.end`, plus a
+  // clean-complete and a genuinely-in-flight control. viewer-lifecycle.spec.js
+  // asserts the activity lane brackets the session.end-only session as ENDED,
+  // not in-flight to the playhead (the bug where an idle machine's bar spanned
+  // the whole window). Same render path as the demo; no viewer fork.
+  const lifecycle = viewer.replace(
+    '<head>',
+    '<head>\n<meta name="darkmux-mode" content="play">\n<meta name="darkmux-flow-src" content="./lifecycle-flow.jsonl">'
+  );
+  fs.writeFileSync(path.join(SERVED, 'index-lifecycle.html'), lifecycle);
+  fs.writeFileSync(
+    path.join(SERVED, 'lifecycle-flow.jsonl'),
+    fs.readFileSync(path.join(repo, 'tests', 'fixtures', 'lifecycle-flow.jsonl'), 'utf8')
+  );
 })();
 
 // Serve over HTTP (not file://) so the viewer's boot() fetch('./xss-flow.jsonl')

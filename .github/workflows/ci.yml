@@ -169,6 +169,7 @@ jobs:
               - 'crates/darkmux-serve/assets/viewer.html'
               - 'docs/demo/**'
               - 'tests/fixtures/xss-flow.jsonl'
+              - 'tests/fixtures/lifecycle-flow.jsonl'
               - 'tests/e2e/**'
               - '.github/workflows/ci.yml'
 
