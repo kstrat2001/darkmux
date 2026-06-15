@@ -11,6 +11,10 @@ use crate::workloads::types::{
     InspectionReport, LoadedWorkload, RunMode, RunResult, WorkloadProvider,
 };
 use anyhow::{anyhow, bail, Context, Result};
+// (#875) `env` is now only used in tests (the default_role read moved to
+// config_access); gate the import so the non-test build has no unused-import
+// warning under `-D warnings`.
+#[cfg(test)]
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -749,7 +753,8 @@ fn pick_role(loaded: &LoadedWorkload) -> String {
     if let Some(r) = loaded.manifest.workload.role.as_deref() {
         return r.to_string();
     }
-    env::var("DARKMUX_DEFAULT_ROLE").unwrap_or_else(|_| "coder".to_string())
+    // (#875) env > config.runtime.default_role > "coder", via config_access.
+    darkmux_types::config_access::default_role().unwrap_or_else(|| "coder".to_string())
 }
 
 /// Dispatch via darkmux's internal Docker-bounded runtime through the

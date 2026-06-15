@@ -414,8 +414,11 @@ fn build_startup_banner(
     // the same normalized form the predicate uses — operators who type
     // `http://Foo:5173/` see `http://foo:5173` in the banner and can
     // verify the normalization landed.
+    // (#875) Banner must reflect the SAME allowlist source the router uses —
+    // env > config.runtime.daemon_cors_origins via config_access, not raw env
+    // (else a config-only allowlist shows as "null" in the banner).
     let extra_list = parse_cors_origins(
-        &std::env::var("DARKMUX_DAEMON_CORS_ORIGINS").unwrap_or_default(),
+        &darkmux_types::config_access::daemon_cors_origins().unwrap_or_default(),
     );
     if extra_list.is_empty() {
         lines.push(
@@ -1203,10 +1206,7 @@ async fn flow_stream_handler(
     let event_stream: futures::stream::BoxStream<'static, Result<Event, std::convert::Infallible>> =
         if redis_reachable {
             let url = redis_url.expect("redis_reachable implies url");
-            let stream_name = std::env::var("DARKMUX_REDIS_STREAM")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| "darkmux:flow".to_string());
+            let stream_name = darkmux_types::config_access::redis_stream(); // (#875)
             Box::pin(
                 // expose_for_probe(): redis_tail_lines + resolve_current_last_id
                 // use the URL only for Client::open and never log it (they
@@ -1414,10 +1414,7 @@ fn read_flow_records_from_redis(
     let mut conn = client
         .get_connection_with_timeout(darkmux_flow::REDIS_CONNECT_TIMEOUT)
         .with_context(|| format!("connecting to Redis for /flow aggregation (date {date})"))?;
-    let stream = std::env::var("DARKMUX_REDIS_STREAM")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "darkmux:flow".to_string());
+    let stream = darkmux_types::config_access::redis_stream(); // (#875)
     // (#809) NEWEST-first read. The stream rides at its `MAXLEN ~` cap once
     // the fleet has been busy long enough (XLEN floats a little above the
     // cap — trimming is lazy), and an oldest-first `XRANGE - + COUNT N`
