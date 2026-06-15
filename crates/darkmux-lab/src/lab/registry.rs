@@ -295,9 +295,11 @@ impl LabRegistry {
 
     /// Find the first registered fixture that satisfies the given
     /// requirement (Phase 3's resolver entry point). Requirement
-    /// format: `<definition-name>@<version-req>` where version-req
-    /// is currently a literal match (Phase 3 may extend to >= / ^
-    /// semver).
+    /// format: `<definition-name>@<version>`, matched LITERALLY (exact
+    /// `satisfies` string equality). Semver range operators (`>=`/`^`/…)
+    /// are NOT supported here — the caller (`resolve_source_sandbox`)
+    /// rejects them loudly before this point; full semver is tracked in
+    /// #496.
     ///
     /// Returns `(name, fixture)` of the first match in sorted-by-name
     /// order. Phase 3 may add disambiguation if multiple match.

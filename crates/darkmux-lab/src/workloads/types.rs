@@ -111,11 +111,14 @@ pub(crate) struct WorkloadSpec {
     )]
     pub requires_external_sandbox: bool,
     /// (#490) Declares which abstract fixture definition this workload
-    /// needs at dispatch time. Format: `<name>@<version-req>` (e.g.
-    /// `"node-refresh-token-rotation@>=1.0"`). When set, the lab
-    /// resolver consults `~/.darkmux/lab-registry.json` for a fixture
-    /// whose `.fixture.json::satisfies` matches; COW-clones it as the
-    /// per-run sandbox source.
+    /// needs at dispatch time. Format: `<name>@<version>` matched
+    /// LITERALLY (e.g. `"node-refresh-token-rotation@1.0"`) — the version
+    /// is an exact string, NOT a semver range. `@>=1.0`-style operators
+    /// are not supported and the resolver rejects them loudly (semver
+    /// support tracked in #496). When set, the lab resolver consults
+    /// `~/.darkmux/lab-registry.json` for a fixture whose
+    /// `.fixture.json::satisfies` equals this string; COW-clones it as
+    /// the per-run sandbox source.
     ///
     /// When unset, falls back to the default sandbox path
     /// `{paths.sandboxes}/<workload-id>/` (the current convention for

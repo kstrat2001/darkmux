@@ -358,6 +358,23 @@ pub(crate) fn resolve_source_sandbox(
     paths: &paths::DarkmuxPaths,
 ) -> Result<std::path::PathBuf> {
     if let Some(requires) = &loaded.manifest.workload.requires_fixture {
+        // (#871) Fixture matching is LITERAL today — `find_satisfying` compares
+        // the `satisfies` string for exact equality. A semver range operator in
+        // the version part would therefore silently never match a registered
+        // fixture, surfacing as a confusing "no fixture matches" for one that IS
+        // registered. Reject the operator syntax loudly with a pointer instead
+        // (full semver tracked in #496).
+        if let Some((name, ver)) = requires.split_once('@') {
+            if ver.starts_with(['>', '<', '^', '~', '=']) {
+                return Err(anyhow!(
+                    "workload `{}` requires_fixture `{}` uses a semver range operator, but fixture \
+                     matching is LITERAL today (semver support tracked in #496). Use an exact \
+                     `<name>@<version>`, e.g. `{name}@1.0`.",
+                    loaded.manifest.workload.id,
+                    requires,
+                ));
+            }
+        }
         let reg_path = crate::lab::registry::default_registry_path(paths);
         let registry = crate::lab::registry::LabRegistry::load(&reg_path)
             .with_context(|| format!("loading {}", reg_path.display()))?;
@@ -513,6 +530,58 @@ mod tests {
         };
         let resolved = resolve_source_sandbox(&loaded, &paths).unwrap();
         assert_eq!(resolved, paths.sandboxes.join("demo"));
+    }
+
+    /// (#871) A semver range operator in `requires_fixture` is rejected LOUDLY
+    /// — matching is literal today (#496 tracks real semver), so a `>=`-style
+    /// requirement that would silently never match a registered fixture must
+    /// error with a clear pointer instead.
+    #[test]
+    fn resolver_rejects_semver_operator_in_requires_fixture() {
+        use crate::workloads::types::{LoadedWorkload, WorkloadManifest, WorkloadSource, WorkloadSpec};
+        use std::collections::BTreeMap;
+        let tmp = TempDir::new().unwrap();
+        let paths = paths::DarkmuxPaths {
+            root: tmp.path().to_path_buf(),
+            runs: tmp.path().join("runs"),
+            sandboxes: tmp.path().join("sandboxes"),
+            crew: tmp.path().join("crew"),
+            notebook: tmp.path().join("notebook"),
+            profiles: tmp.path().join("profiles.json"),
+            config: tmp.path().join("config.json"),
+            scope: paths::Scope::User,
+        };
+        let loaded = LoadedWorkload {
+            manifest: WorkloadManifest {
+                workload: WorkloadSpec {
+                    id: "demo".into(),
+                    provider: "prompt".into(),
+                    description: None,
+                    role: None,
+                    prompt: None,
+                    prompt_file: None,
+                    sandbox_seed: None,
+                    setup_content: BTreeMap::new(),
+                    requires_external_sandbox: false,
+                    requires_fixture: Some("demo-fixture@>=1.0".into()),
+                    verify: None,
+                    expected: None,
+                    image: None,
+                    extras: BTreeMap::new(),
+                },
+            },
+            manifest_path: tmp.path().join("workloads/demo.json"),
+            base_dir: tmp.path().to_path_buf(),
+            source: WorkloadSource::Builtin,
+        };
+        let err = resolve_source_sandbox(&loaded, &paths)
+            .expect_err("a semver range operator should be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("#496"), "error should point to #496: {msg}");
+        assert!(
+            msg.contains("range operator") || msg.contains("LITERAL"),
+            "error should explain literal-matching: {msg}"
+        );
     }
 
     /// (#490) Phase 3 — happy path: register a fixture whose
