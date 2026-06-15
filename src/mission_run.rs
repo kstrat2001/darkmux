@@ -67,25 +67,83 @@ fn worktrees_base() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp/darkmux/worktrees"))
 }
 
-/// The git repository root of the current directory (`git rev-parse
-/// --show-toplevel`). `mission run` operates on the repo the operator
-/// invoked it from — the worktree branches off this repo's `--base`.
+/// The MAIN working tree of the current repository, resolved identically
+/// whether invoked from the main checkout or from inside a linked worktree.
+///
+/// `mission run` creates the sprint worktree off this repo and `mission ship`
+/// recomputes that worktree's path from `(repo-name, sprint)` — both must
+/// agree on the repo name. `git rev-parse --show-toplevel` returns the
+/// *current* working tree, which inside a mission's linked worktree is the
+/// sprint dir (basename = sprint id, NOT the repo name); using it made
+/// `mission ship` from inside a worktree recompute a different (wrong) path
+/// than `mission run` created (#846). The first `worktree` entry of
+/// `git worktree list --porcelain` is always the main working tree, so it
+/// yields the stable repo name AND a valid dir to run worktree teardown from
+/// (git refuses to remove the worktree you are standing in).
 fn repo_root() -> Result<PathBuf> {
     let out = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
+        .args(["worktree", "list", "--porcelain"])
         .output()
-        .context("running `git rev-parse --show-toplevel`")?;
+        .context("running `git worktree list --porcelain`")?;
     if !out.status.success() {
         bail!(
-            "`darkmux mission run` must be invoked from inside a git repository \
-             (git rev-parse --show-toplevel failed). cd into the engagement's repo first."
+            "`darkmux mission` must be invoked from inside a git repository \
+             (git worktree list failed). cd into the engagement's repo first."
         );
     }
-    let root = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if root.is_empty() {
-        bail!("git reported an empty repository root");
+    parse_main_worktree(&String::from_utf8_lossy(&out.stdout))
+        .ok_or_else(|| anyhow::anyhow!("git worktree list reported no main working tree"))
+}
+
+/// Parse the main working tree path from `git worktree list --porcelain`
+/// output: the first `worktree <path>` line. Pure, for testability (#846).
+fn parse_main_worktree(porcelain: &str) -> Option<PathBuf> {
+    porcelain
+        .lines()
+        .find_map(|l| l.strip_prefix("worktree "))
+        // `.lines()` already strips the trailing `\r\n`; deliberately NOT
+        // `.trim()` — git emits the path raw + unquoted, so a worktree dir
+        // whose name legitimately ends in whitespace must round-trip intact.
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Authoritative answer to "did this PR merge?" vs. "couldn't tell". The
+/// `Unknown` arm is load-bearing: if the verifying `gh pr view` itself blips
+/// (5xx / expired token / network), collapsing that into "not merged" would
+/// let the caller assert a falsehood and re-create the exact #844 silent drift
+/// one step later. So the caller distinguishes the three.
+enum MergeState {
+    Merged,
+    NotMerged,
+    Unknown,
+}
+
+/// Whether the PR at `pr_url` merged on the remote. Distinguishes a real
+/// `gh pr merge` failure from gh's local post-merge sync failing under the
+/// mission worktree layout (#844): gh performs the squash-merge + remote-branch
+/// deletion via the API BEFORE its local git ops, so a non-zero exit can still
+/// mean "merged".
+///
+/// Takes the PR **URL** specifically (not a branch / number): `--delete-branch`
+/// removes the head branch, after which a branch selector is unresolvable and a
+/// bare number is sensitive to which repo `dir` points at — a URL pins the PR
+/// identity unambiguously. A gh error or empty state is reported as `Unknown`
+/// (could-not-reach), never silently as `NotMerged`.
+fn pr_merge_state(dir: &Path, pr_url: &str) -> MergeState {
+    let out = match Command::new("gh")
+        .current_dir(dir)
+        .args(["pr", "view", pr_url, "--json", "state", "-q", ".state"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return MergeState::Unknown,
+    };
+    match String::from_utf8_lossy(&out.stdout).trim() {
+        "MERGED" => MergeState::Merged,
+        "" => MergeState::Unknown,
+        _ => MergeState::NotMerged, // OPEN / CLOSED-unmerged
     }
-    Ok(PathBuf::from(root))
 }
 
 /// Deterministic worktree path for a sprint: `<base>/<repo-name>/<sprint-id>`.
@@ -925,12 +983,23 @@ fn conventioned_pr_body(
     }
 }
 
-/// `gh pr view <branch> --json url -q .url` — returns the existing PR URL for
-/// the branch, or `None` if there's no open PR (or `gh` reports none).
+/// The **OPEN** PR's URL for `branch`, or `None` when there's no open PR.
+///
+/// `gh pr view <branch>` falls back to the most-recent CLOSED/MERGED PR when no
+/// OPEN one exists. On a deterministic, reusable branch name
+/// (`darkmux/<sprint-id>`) that could hand back a STALE merged PR; the ship
+/// path would then skip `gh pr create` and later verify merge-state against
+/// that stale URL (#844), wrongly OK-ing a teardown of un-merged work. The
+/// `select(.state=="OPEN")` jq filter closes that seam: a recycled branch whose
+/// only PR is merged/closed yields `None`, so ship falls through to
+/// `gh pr create` and gets a FRESH PR identity to verify against.
 fn existing_pr_url(dir: &Path, branch: &str) -> Option<String> {
     let out = Command::new("gh")
         .current_dir(dir)
-        .args(["pr", "view", branch, "--json", "url", "-q", ".url"])
+        .args([
+            "pr", "view", branch, "--json", "url,state", "-q",
+            "select(.state==\"OPEN\") | .url",
+        ])
         .output()
         .ok()?;
     if !out.status.success() {
@@ -1216,10 +1285,49 @@ pub fn ship(
             .output()
             .context("running `gh pr merge`")?;
         if !out.status.success() {
-            bail!(
-                "`gh pr merge` failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
+            // gh performs the squash-merge + remote-branch deletion via the API
+            // FIRST, then runs local post-merge git ops (checkout base + delete
+            // the local branch). In a mission worktree the base (`main`) is
+            // checked out in the primary worktree, so gh's local `git checkout
+            // main` fatals — and gh exits non-zero even though the REMOTE merge
+            // already landed (#844). Treating that as a total failure used to
+            // skip sprint-complete + teardown → silent drift (merged PR, sprint
+            // stuck Running, orphaned worktree). So verify the PR's ACTUAL
+            // state: only bail if it truly didn't merge.
+            match pr_merge_state(&root, &pr_url) {
+                MergeState::Merged => {
+                    eprintln!(
+                        "{}",
+                        style::warn(&format!(
+                            "gh exited non-zero after merging, but the PR is merged on the remote — \
+                             gh's local post-merge sync conflicts with the worktree layout (harmless; \
+                             continuing teardown). gh stderr: {}",
+                            String::from_utf8_lossy(&out.stderr).trim()
+                        ))
+                    );
+                }
+                MergeState::NotMerged => {
+                    bail!(
+                        "`gh pr merge` failed and the PR is not merged: {}",
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    );
+                }
+                MergeState::Unknown => {
+                    // The merge MAY have landed (the worktree-layout local-sync
+                    // failure looks identical to this), but the verifying view
+                    // couldn't confirm it. Don't assert "not merged" — point the
+                    // operator at the PR and the one-command reconcile (#844).
+                    bail!(
+                        "`gh pr merge` exited non-zero and the PR's merge state could not be \
+                         confirmed — check {pr_url}. If it DID merge, reconcile with \
+                         `darkmux sprint complete {}` and `git worktree remove --force {}`. \
+                         gh stderr: {}",
+                        sprint.id,
+                        wt_path.display(),
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    );
+                }
+            }
         }
         println!("{}", style::success(&format!("✓ merged {branch} (squash)")));
 
@@ -1261,6 +1369,15 @@ pub fn ship(
                 style::warn(&format!("worktree removal errored: {e:#} — remove {} manually.", wt_path.display()))
             ),
         }
+        // gh's `--delete-branch` removed the REMOTE branch via API, but its
+        // local-branch deletion rode the same post-merge sync that fails under
+        // the worktree layout (#844). With the worktree (which pinned the
+        // branch) now gone, reap the local branch ourselves so shipped sprints
+        // don't accrete dead `darkmux/<sprint>` refs. Safe unconditionally:
+        // if gh already deleted it, `-D` exits 1 (swallowed); if the worktree
+        // removal above FAILED, the branch is still pinned and git `-D` refuses
+        // outright — so this never orphan-kills a branch holding live work.
+        let _ = git_in(&root, &["branch", "-D", &branch]);
 
         emit_run_record(
             flow::Level::Info,
@@ -1527,6 +1644,79 @@ mod tests {
         assert!(p.ends_with("darkmux-public/s1"), "{}", p.display());
         // Recomputable: same inputs → same path.
         assert_eq!(p, worktree_path(Path::new("/home/k/proj/darkmux-public"), "s1"));
+    }
+
+    #[test]
+    fn parse_main_worktree_picks_first_entry() {
+        // The first `worktree` line is the main working tree; a linked
+        // worktree follows. #846: ship from inside the linked one must still
+        // resolve the repo name from the FIRST entry, not the current tree.
+        let porcelain = "worktree /home/k/proj/darkmux-public\n\
+                         HEAD 1111111111111111111111111111111111111111\n\
+                         branch refs/heads/main\n\
+                         \n\
+                         worktree /home/k/.darkmux/worktrees/darkmux-public/s2-foo\n\
+                         HEAD 2222222222222222222222222222222222222222\n\
+                         branch refs/heads/darkmux/s2-foo\n";
+        assert_eq!(
+            parse_main_worktree(porcelain),
+            Some(PathBuf::from("/home/k/proj/darkmux-public"))
+        );
+        // The repo-name component derived from it is stable regardless of which
+        // tree `mission ship` was invoked from.
+        let root = parse_main_worktree(porcelain).unwrap();
+        assert!(worktree_path(&root, "s2-foo").ends_with("darkmux-public/s2-foo"));
+    }
+
+    #[test]
+    fn parse_main_worktree_handles_empty_and_blank() {
+        assert_eq!(parse_main_worktree(""), None);
+        assert_eq!(parse_main_worktree("worktree \nHEAD abc\n"), None);
+        assert_eq!(parse_main_worktree("HEAD abc\nbranch refs/heads/main\n"), None);
+    }
+
+    #[test]
+    fn git_lists_main_worktree_first_from_inside_a_linked_worktree() {
+        // Locks the load-bearing #846 contract against REAL git: invoked from
+        // INSIDE a linked worktree, `git worktree list --porcelain` still lists
+        // the MAIN working tree first — so repo_root() (= this command +
+        // parse_main_worktree) resolves the repo, not the sprint dir. A future
+        // git change or an output-ordering refactor that broke this is caught
+        // here. No process-cwd mutation: git is invoked with `current_dir`.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let main_repo = tmp.path().join("mainrepo");
+        let linked = tmp.path().join("linked-sprint");
+        std::fs::create_dir_all(&main_repo).unwrap();
+
+        let git = |dir: &Path, args: &[&str]| {
+            let o = Command::new("git").current_dir(dir).args(args).output().unwrap();
+            assert!(
+                o.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+        };
+        git(&main_repo, &["init", "-q"]);
+        git(&main_repo, &["config", "user.email", "t@example.com"]);
+        git(&main_repo, &["config", "user.name", "t"]);
+        git(&main_repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(&main_repo, &["worktree", "add", "-q", linked.to_str().unwrap(), "-b", "sprint-x"]);
+
+        // Invoked FROM the linked worktree — the exact #846 scenario.
+        let out = Command::new("git")
+            .current_dir(&linked)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git worktree list failed");
+        let parsed = parse_main_worktree(&String::from_utf8_lossy(&out.stdout))
+            .expect("parse a main worktree from porcelain");
+        assert_eq!(
+            parsed.canonicalize().unwrap(),
+            main_repo.canonicalize().unwrap(),
+            "expected the MAIN tree, got {}",
+            parsed.display()
+        );
     }
 
     fn mission(id: &str, desc: &str) -> crew::types::Mission {
