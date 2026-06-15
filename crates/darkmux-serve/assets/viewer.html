@@ -1178,7 +1178,11 @@ function renderSubsystem(){
   // (#720) Surface a failed/killed terminal LOUDLY — a watchdog kill or
   // non-zero exit must read as such, never a silent "complete" or eternal
   // "so far". `wallLoud` is the red qualifier appended to the wall time.
-  const wallBase=done?fmt(T(c.ts)-startTs):fmt(state.t-startTs)+" so far";
+  // (#856) Wall time brackets to the CLOSE edge (`close`, which includes
+  // session.end), not the bare dispatch terminal `c` — for a session.end-only
+  // session `c` is undefined while `done` is true, so `T(c.ts)` would throw.
+  // `c` stays for the null-safe errored/killed STYLING (wallLoud) only.
+  const wallBase=done?fmt(T(close.ts)-startTs):fmt(state.t-startTs)+" so far";
   const wallLoud=done&&dispatchErrored(c)
     ? `<span class="wallerr"> · ${dispatchKilled(c)?'killed (timeout)':'errored'+((c.payload&&c.payload.exit_code!=null)?' (exit '+esc(c.payload.exit_code)+')':'')}</span>`
     : '';
@@ -1200,7 +1204,7 @@ function renderSubsystem(){
       <div><div class="bars">${bars}</div><div class="xvals">${xvals}</div></div></div></div>`:"";
   let ctxChart="";
   if(cx.length && nctx){
-    const W=440,H=72,t0=startTs,t1=done?T(c.ts):state.t,span=Math.max(1,t1-t0);
+    const W=440,H=72,t0=startTs,t1=done?T(close.ts):state.t,span=Math.max(1,t1-t0);
     const xy=cx.map(r=>[Math.max(0,Math.min(W,(T(r.ts)-t0)/span*W)),H-(nctx?(r.fields.used/nctx)*H:0)]);
     const line=xy.map(p=>p[0].toFixed(0)+","+p[1].toFixed(0)).join(" ");
     const area="M"+xy[0][0].toFixed(0)+","+H+" "+xy.map(p=>"L"+p[0].toFixed(0)+","+p[1].toFixed(0)).join(" ")+" L"+xy[xy.length-1][0].toFixed(0)+","+H+" Z";

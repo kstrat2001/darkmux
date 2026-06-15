@@ -47,5 +47,15 @@ test('activity lane brackets a session.end-only session as ended, not in-flight'
     page.locator('.sbar.a[title*="sess-in-flight"]')
   ).toHaveCount(1);
 
+  // Drilling into the session.end-only session must NOT throw. The detail panel
+  // brackets wall-clock + the ctx chart to the close edge; a slip that left a
+  // bare `dispatchEnd().ts` read gated on the new `done` would TypeError here
+  // (undefined for a session.end-only session) and blank the view. Navigate
+  // fleet → machine → that session, then assert the subsystem rendered cleanly.
+  await page.locator('[data-act="machine"]').first().click();
+  await page.waitForSelector('.stagehdr');
+  await page.locator('[data-act="session"][data-arg="sess-ended-via-sessionend"]').first().click();
+  await page.waitForSelector('.sub', { timeout: 10_000 });
+
   expect(pageErrors, `viewer threw: ${pageErrors.join('; ')}`).toHaveLength(0);
 });
