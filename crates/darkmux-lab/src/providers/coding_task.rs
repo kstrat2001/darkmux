@@ -897,6 +897,20 @@ pub(crate) struct ClaimVerifyMismatch {
 /// as mismatches) erode trust faster than missing real disagreements.
 /// The patterns start narrow; operators can broaden empirically as
 /// more failure traces accumulate.
+/// Largest char boundary `<= i` in `s`. (#869) Keeps byte-window slicing
+/// panic-safe on non-ASCII without depending on the recently-stabilized
+/// `str::floor_char_boundary`.
+fn floor_char_boundary(s: &str, i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    let mut i = i;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 pub(crate) fn detect_claim_verify_mismatch(
     final_assistant: &str,
     verify: Option<&crate::workloads::types::VerifyOutcome>,
@@ -963,9 +977,16 @@ pub(crate) fn detect_claim_verify_mismatch(
     // visibility. ~80 chars on either side, clipped at message
     // boundaries.
     let idx = lowered.find(claim).expect("claim was just matched");
-    let start = idx.saturating_sub(80);
-    let end = (idx + claim.len() + 80).min(final_assistant.len());
-    let excerpt = final_assistant[start..end].trim().to_string();
+    // (#869) Window the excerpt in `lowered`'s OWN index space. `idx` is a byte
+    // offset into `lowered` (the to_lowercase() copy), which is NOT offset-
+    // compatible with `final_assistant` on non-ASCII text (e.g. `İ` → `i̇`
+    // changes byte length) — slicing the original with these indices could
+    // split a multibyte codepoint and panic. The excerpt is forensic context,
+    // so the lowercased copy is fine. The ±80 window can itself land mid-
+    // codepoint, so clamp both ends to char boundaries before slicing.
+    let start = floor_char_boundary(&lowered, idx.saturating_sub(80));
+    let end = floor_char_boundary(&lowered, (idx + claim.len() + 80).min(lowered.len()));
+    let excerpt = lowered[start..end].trim().to_string();
 
     Some(ClaimVerifyMismatch {
         claim_excerpt: excerpt,
@@ -2114,8 +2135,26 @@ not-valid-json
         let mm = detect_claim_verify_mismatch(final_msg, Some(&verify_failed()));
         assert!(mm.is_some(), "expected mismatch on positive claim + verify fail");
         let mm = mm.unwrap();
-        assert!(mm.claim_excerpt.contains("All tests pass"));
+        // (#869) The excerpt is now built from the lowercased copy (forensic).
+        assert!(mm.claim_excerpt.contains("all tests pass"));
         assert_eq!(mm.verify_details, "exit 1");
+    }
+
+    #[test]
+    fn mismatch_excerpt_handles_non_ascii_without_panic() {
+        // (#869) Regression: a multibyte window around the claim must not panic
+        // the excerpt byte-slice. `İ`/accents/`Ω`/emoji change byte length under
+        // to_lowercase(), so indices from `lowered` would split a codepoint in
+        // `final_assistant`. The prefix is >80 bytes of multibyte text so the
+        // ±80 window lands inside it (pre-#869 this panicked).
+        let pad = "café señor İstanbul Ωμέγα 🎉 ".repeat(5);
+        let final_msg = format!("{pad}all tests pass{pad}");
+        let mm = detect_claim_verify_mismatch(&final_msg, Some(&verify_failed()));
+        assert!(mm.is_some(), "should detect the claim despite non-ASCII context");
+        assert!(
+            mm.unwrap().claim_excerpt.contains("all tests pass"),
+            "excerpt should still contain the matched claim"
+        );
     }
 
     #[test]
@@ -2200,9 +2239,10 @@ not-valid-json
         let final_msg = "I refactored the auth module to use the new pepper config. \
                          All tests pass. The diff is ~200 lines.";
         let mm = detect_claim_verify_mismatch(final_msg, Some(&verify_failed())).unwrap();
-        assert!(mm.claim_excerpt.contains("All tests pass"));
+        // (#869) The excerpt is built from the lowercased copy now (forensic).
+        assert!(mm.claim_excerpt.contains("all tests pass"));
         // Excerpt should include surrounding context, not just the bare match.
-        assert!(mm.claim_excerpt.len() > "All tests pass".len());
+        assert!(mm.claim_excerpt.len() > "all tests pass".len());
     }
 
     #[test]
