@@ -9,6 +9,12 @@ repository = "https://github.com/kstrat2001/darkmux"
 authors = ["Kain Osterholt"]
 rust-version = "1.80"
 
+[features]
+# (#811) Exposes `config_access::force_empty_config_for_test()` to dependent
+# crates' TEST builds so a test can neutralize the config tier (never read the
+# operator's real ~/.darkmux/config.json). Off in normal builds.
+test-support = []
+
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

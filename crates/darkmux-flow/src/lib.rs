@@ -493,6 +493,13 @@ pub const REDIS_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from
 pub fn isolate_test_env_once() {
     static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     INIT.get_or_init(|| {
+        // (#811) Scrubbing the env tier alone is no longer enough: post-#661 the
+        // CONFIG tier (`redis.enabled: true` in the operator's real config.json)
+        // re-enables the Redis sink even with DARKMUX_REDIS_URL removed — so test
+        // records leaked to the real `darkmux:flow` stream and `redis_url()`'s
+        // "off" assertions flaked on a populated machine. Neutralize the config
+        // tier too: config() now returns a default-empty config process-wide.
+        darkmux_types::config_access::force_empty_config_for_test();
         unsafe {
             std::env::remove_var("DARKMUX_REDIS_URL");
             // NOTE: we intentionally do NOT scrub DARKMUX_AUDIT_DIR here.
@@ -2906,6 +2913,10 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn redis_url_env_tier_verbatim_then_off() {
+        // (#811) Neutralize the config tier so the "off" assertion holds on a
+        // machine whose real config.json has `redis.enabled: true` (it flaked
+        // there before — the config tier kept Redis on after the env scrub).
+        isolate_test_env_once();
         let prev = std::env::var("DARKMUX_REDIS_URL").ok();
         // Tier 1: env verbatim — raw via expose_for_probe, redacted on Display.
         unsafe { std::env::set_var("DARKMUX_REDIS_URL", "redis://:hunter2@h:6379/0"); }

@@ -19,8 +19,35 @@ use std::sync::OnceLock;
 
 static CONFIG: OnceLock<DarkmuxConfig> = OnceLock::new();
 
+// (#811) Test-isolation override. When `force_empty_config_for_test()` has been
+// called, `config()` returns a default-EMPTY config for the rest of the process
+// instead of the operator's real `~/.darkmux/config.json`. Gated to test /
+// test-support builds so it's absent from release. The flag is checked BEFORE
+// the `CONFIG` OnceLock, so it works regardless of whether the real config was
+// already loaded by an earlier access (it bypasses the cache).
+#[cfg(any(test, feature = "test-support"))]
+static FORCE_EMPTY_CONFIG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(any(test, feature = "test-support"))]
+static EMPTY_CONFIG: OnceLock<DarkmuxConfig> = OnceLock::new();
+
+/// (#811) Make `config()` return a default-EMPTY config for the rest of this
+/// process — test isolation so a test never reads the operator's real
+/// `~/.darkmux/config.json`. Without this, an env-scrubbed test still inherits
+/// the config tier: e.g. `redis.enabled: true` re-enables the Redis sink (test
+/// records XADD'd to the real `darkmux:flow` stream), and `redis_url()`'s "off"
+/// assertions flake on a machine with a populated config. Idempotent; called
+/// from `darkmux-flow`'s `isolate_test_env_once`.
+#[cfg(any(test, feature = "test-support"))]
+pub fn force_empty_config_for_test() {
+    FORCE_EMPTY_CONFIG.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// The loaded `config.json` (lazily, once). Malformed/missing → default-empty.
 fn config() -> &'static DarkmuxConfig {
+    #[cfg(any(test, feature = "test-support"))]
+    if FORCE_EMPTY_CONFIG.load(std::sync::atomic::Ordering::SeqCst) {
+        return EMPTY_CONFIG.get_or_init(DarkmuxConfig::default);
+    }
     CONFIG.get_or_init(DarkmuxConfig::load_resolved)
 }
 
