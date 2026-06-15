@@ -608,6 +608,21 @@ const dispatchKilled=rec=>dispatchErrored(rec)&&((rec.payload&&rec.payload.exit_
 // session (crash/kill/timeout — no clean dispatch.complete). Lets playback
 // bracket the running interval where there's no complete to close it.
 const sessEnd=sid=>DATA.find(r=>r.session_id===sid&&r.action==="session.end");
+// (#856/#857) The close-edge for BRACKETING a session's interval: the earliest
+// of the dispatch terminal (complete/error) and the reconciler's `session.end`.
+// EVERY "is this session done / where does its bar end" decision must go through
+// here, NOT bare `dispatchEnd` — a session whose ONLY terminal is `session.end`
+// (abandoned / hard-killed / shipped-without-a-clean-complete) must read as
+// ENDED, not in-flight to the playhead. `machActive` already counts session.end
+// (#856); the lane/detail/status paths used bare `dispatchEnd` and diverged,
+// which drew an idle machine's bar across the whole window. `dispatchEnd` stays
+// the *dispatch* terminal, used for errored/killed STYLING; this is only
+// "closed, and when". The durable unify-on-presence fix is #857.
+const sessionCloseEdge=sid=>{
+  const c=dispatchEnd(sid), e=sessEnd(sid);
+  if(c&&e)return T(c.ts)<=T(e.ts)?c:e;
+  return c||e;
+};
 
 // (#691) The mission label for the meta bar. Joining EVERY mission_id in the
 // window produced an ever-growing title (`◆ japan-trip, test-mission-e11, m1,
@@ -881,16 +896,16 @@ function renderFleet(){
   const lanes=ms.map(m=>{
     const bars=sessionsOn(m).map(sid=>{
       const s=dispatch(sid,"start"); if(!s||T(s.ts)>state.t)return"";
-      const c=dispatchEnd(sid), done=c&&T(c.ts)<=state.t;
-      const err=done&&dispatchErrored(c);
-      const end=done?T(c.ts):state.t;
+      const term=dispatchEnd(sid), close=sessionCloseEdge(sid), done=close&&T(close.ts)<=state.t;
+      const err=done&&dispatchErrored(term);
+      const end=done?T(close.ts):state.t;
       const W=Math.max(0.6,pct(end)-pct(T(s.ts)));
       // Clamp so a bar at/near "now" (left≈100%) + its min-width can't spill
       // past the track's right edge (the rightmost bar was clipping ~3px).
       // Shift left so left+width never exceeds 100%.
       const L=Math.max(0,Math.min(pct(T(s.ts)),100-W));
       const role=(s.handle||"").replace(/^darkmux\//,"");
-      return `<div class="sbar ${done?(err?'err':''):'a'}" style="left:${L}%;width:${W}%" title="${esc(role)} · ${esc(sid)}${done?(err?(dispatchKilled(c)?' · killed (timeout)':' · errored'):''):' · in flight'}"></div>`;
+      return `<div class="sbar ${done?(err?'err':''):'a'}" style="left:${L}%;width:${W}%" title="${esc(role)} · ${esc(sid)}${done?(err?(dispatchKilled(term)?' · killed (timeout)':' · errored'):''):' · in flight'}"></div>`;
     }).join("");
     return `<div class="lane"><div class="lname" title="${escN(m)}">${escN(m)}</div><div class="tltrack">${bars}<div class="ph" style="left:${pct(state.t)}%"></div></div></div>`;
   }).join("");
@@ -1145,7 +1160,7 @@ function renderSubsystem(){
   const dets=tel.filter(r=>r.source==="detector");
   const loads=lms.filter(r=>r.fields.event==="load");
   const distinct=[...new Set(loads.map(r=>r.fields.model))];
-  const d=dispatch(sid,"start"), c=dispatchEnd(sid), done=c&&T(c.ts)<=state.t;
+  const d=dispatch(sid,"start"), c=dispatchEnd(sid), close=sessionCloseEdge(sid), done=close&&T(close.ts)<=state.t;
   const firstSessRec = DATA.find(r => r.session_id === sid);
   const handle = d ? d.handle : (firstSessRec ? firstSessRec.handle : "unknown");
   const startTs = d ? T(d.ts) : (firstSessRec ? T(firstSessRec.ts) : tMin);
@@ -1163,7 +1178,11 @@ function renderSubsystem(){
   // (#720) Surface a failed/killed terminal LOUDLY — a watchdog kill or
   // non-zero exit must read as such, never a silent "complete" or eternal
   // "so far". `wallLoud` is the red qualifier appended to the wall time.
-  const wallBase=done?fmt(T(c.ts)-startTs):fmt(state.t-startTs)+" so far";
+  // (#856) Wall time brackets to the CLOSE edge (`close`, which includes
+  // session.end), not the bare dispatch terminal `c` — for a session.end-only
+  // session `c` is undefined while `done` is true, so `T(c.ts)` would throw.
+  // `c` stays for the null-safe errored/killed STYLING (wallLoud) only.
+  const wallBase=done?fmt(T(close.ts)-startTs):fmt(state.t-startTs)+" so far";
   const wallLoud=done&&dispatchErrored(c)
     ? `<span class="wallerr"> · ${dispatchKilled(c)?'killed (timeout)':'errored'+((c.payload&&c.payload.exit_code!=null)?' (exit '+esc(c.payload.exit_code)+')':'')}</span>`
     : '';
@@ -1185,7 +1204,7 @@ function renderSubsystem(){
       <div><div class="bars">${bars}</div><div class="xvals">${xvals}</div></div></div></div>`:"";
   let ctxChart="";
   if(cx.length && nctx){
-    const W=440,H=72,t0=startTs,t1=done?T(c.ts):state.t,span=Math.max(1,t1-t0);
+    const W=440,H=72,t0=startTs,t1=done?T(close.ts):state.t,span=Math.max(1,t1-t0);
     const xy=cx.map(r=>[Math.max(0,Math.min(W,(T(r.ts)-t0)/span*W)),H-(nctx?(r.fields.used/nctx)*H:0)]);
     const line=xy.map(p=>p[0].toFixed(0)+","+p[1].toFixed(0)).join(" ");
     const area="M"+xy[0][0].toFixed(0)+","+H+" "+xy.map(p=>"L"+p[0].toFixed(0)+","+p[1].toFixed(0)).join(" ")+" L"+xy[xy.length-1][0].toFixed(0)+","+H+" Z";
@@ -1576,8 +1595,8 @@ function renderMissionFromFlow(mid, mstat){
   DATA.filter(r=>r.mission_id===mid&&typeof r.action==="string"&&r.action.indexOf("dispatch")===0&&r.action.indexOf("start")>-1)
       .forEach(r=>{ if(r.session_id&&!starts[r.session_id])starts[r.session_id]=r; });
   const sessions=Object.keys(starts).map(sid=>{
-    const st=starts[sid], cp=dispatchEnd(sid);
-    const started=T(st.ts)<=state.t, ended=cp&&T(cp.ts)<=state.t;
+    const st=starts[sid], cp=dispatchEnd(sid), close=sessionCloseEdge(sid);
+    const started=T(st.ts)<=state.t, ended=close&&T(close.ts)<=state.t;
     const status=!started?"backlog":(ended?(dispatchErrored(cp)?"errored":"complete"):"active");
     return {sid,role:(st.handle||"").replace(/^darkmux\//,""), machine:nameOf(uidOf(st)),
             model:st.model||"?", status, ts:T(st.ts)};
