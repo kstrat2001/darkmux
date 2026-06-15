@@ -364,6 +364,34 @@ impl Trajectory {
         }));
     }
 
+    /// dispatch.context.stale_tokens — fires when the runtime detects the
+    /// endpoint's reported `usage.prompt_tokens` has been frozen at
+    /// `frozen_value` for `frozen_turns` consecutive turns while the message
+    /// thread kept growing (#854). A healthy conversation strictly increases
+    /// prompt_tokens turn-over-turn, so a frozen count is an endpoint misreport
+    /// that can't gate compaction — the runtime substitutes the local size
+    /// `estimate` for the compaction decision. Pure observability: surfaces WHY
+    /// a compaction can fire (or occupancy be read) without the reported count
+    /// crossing the threshold. eureka-detection.
+    pub fn append_stale_context_tokens(
+        &mut self,
+        seq: u32,
+        frozen_value: u32,
+        frozen_turns: u32,
+        estimate: u32,
+        message_count: usize,
+    ) {
+        self.write_event(&serde_json::json!({
+            "type": "dispatch.context.stale_tokens",
+            "seq": seq,
+            "ts": unix_ms(),
+            "frozen_value": frozen_value,
+            "frozen_turns": frozen_turns,
+            "estimate": estimate,
+            "message_count": message_count,
+        }));
+    }
+
     /// tool_call.promoted — recovery event when the runtime promoted
     /// plain-text tool-call markup back into structured tool_calls
     /// (#406). `source` is either `"content"` or `"reasoning"`
