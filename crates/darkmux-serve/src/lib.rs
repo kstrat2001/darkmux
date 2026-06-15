@@ -4392,6 +4392,10 @@ mod tests {
     }
 
     #[tokio::test]
+    // (#881) serial: the always-on /diff gate keys on DARKMUX_SERVE_TOKEN, which
+    // the serial auth tests set/scrub — without this, that token can leak into
+    // this test's build_router window and 401 the request (CI-only race).
+    #[serial_test::serial]
     async fn diff_handler_returns_available_true_with_git_diff() {
         // Create a temp dir acting as the worktrees base containing a real git repo.
         let wt_base = TempDir::new().unwrap();
@@ -4513,6 +4517,9 @@ mod tests {
     }
 
     #[tokio::test]
+    // (#881) serial — see diff_handler_returns_available_true_with_git_diff:
+    // the /diff gate keys on DARKMUX_SERVE_TOKEN set by the serial auth tests.
+    #[serial_test::serial]
     async fn diff_handler_returns_available_false_for_unknown_session() {
         let flows_dir = TempDir::new().unwrap();
         // No records at all.
