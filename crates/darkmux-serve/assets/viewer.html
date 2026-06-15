@@ -711,7 +711,11 @@ function machActive(m){
   const starts=v.filter(r=>uidOf(r)===m&&r.action==="dispatch.start").map(r=>r.session_id);
   // (#720) A run is done when it reached EITHER terminal — without counting
   // `dispatch.error`, a killed run keeps its machine "active" forever.
-  const dones=v.filter(r=>uidOf(r)===m&&(r.action==="dispatch.complete"||r.action==="dispatch.error")).map(r=>r.session_id);
+  // (#856) A SIGKILL is uncatchable, so the Drop-based bookend guard (#717)
+  // can't emit `dispatch.error` on a hard kill — the reconciler's `session.end`
+  // (#647) is the compensating close-edge. Count it too, else a hard-killed
+  // dispatch shows "in flight" forever even after the session is gone.
+  const dones=v.filter(r=>uidOf(r)===m&&(r.action==="dispatch.complete"||r.action==="dispatch.error"||r.action==="session.end")).map(r=>r.session_id);
   return starts.some(s=>!dones.includes(s));
 }
 // (#638 Slice 3) Is machine `m` PRESENT at the scrubber time `state.t`?
