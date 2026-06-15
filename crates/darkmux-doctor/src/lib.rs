@@ -102,6 +102,7 @@ pub fn run(include_openclaw: bool) -> DoctorReport {
         check_openai_base_url_conflict(),
         check_redis_config(),
         check_audit_integrity(),
+        check_audit_write_drops(),
         check_recommendation_drift(),
         check_recommended_profile_name_not_shadowed(),
         check_utility_model_binding(),
@@ -610,6 +611,39 @@ fn check_audit_integrity() -> Check {
             message: summary,
             hint: Some(
                 "Audit log has been edited or a write was interleaved. Run `darkmux flow integrity-check` for the full per-file breakdown. If tampering is suspected, the chain break locates the affected line; older records before that line are still trustworthy."
+                    .into(),
+            ),
+        }
+    }
+}
+
+/// (#877) Surface DROPPED audit writes. An `AuditFileSink` write failure leaves
+/// a durable `audit.write_failed` breadcrumb in the local flow sink — the hash
+/// chain itself still validates clean (the next record re-seeds `prev_hash`
+/// from the file tail), so `integrity-check` cannot see the gap. Counting
+/// today's breadcrumbs makes the dropped write DETECTABLE: the audit log is
+/// INCOMPLETE for those records even though the surviving chain passes.
+fn check_audit_write_drops() -> Check {
+    let n = darkmux_flow::count_audit_write_failures_today();
+    if n == 0 {
+        Check {
+            name: "audit write integrity".into(),
+            status: Status::Pass,
+            message: "no dropped audit writes recorded today".into(),
+            hint: None,
+        }
+    } else {
+        Check {
+            name: "audit write integrity".into(),
+            status: Status::Warn,
+            message: format!(
+                "{n} audit write(s) FAILED today — the hash chain is INCOMPLETE for those records (the surviving chain still passes integrity-check)"
+            ),
+            hint: Some(
+                "An AuditFileSink write failed (audit dir unwritable / ENOSPC / flock contention). \
+                 Confirm DARKMUX_AUDIT_DIR (or ~/.darkmux/audit) is writable; the dropped records are \
+                 in today's flow file as `action=audit.write_failed`. For compliance, treat a dropped \
+                 audit write as a record-keeping incident, not a silent event."
                     .into(),
             ),
         }
@@ -2834,10 +2868,10 @@ mod tests {
         // [#590] + role-model-pin-drift [#160] + legacy-mission-layout [#148]
         // + beat-33-crew-dir [Beat 33 directory flatten] + role-tool-vocab
         // [#340] + legacy-compaction-extras [#380] + redis-config [#661] +
-        // docker-runtime [#680]) + one per active eureka rule. Every check
-        // should appear regardless of environment — even if the underlying
-        // probe couldn't read state.
-        let expected = 29 + darkmux_eureka::all_rules().len();
+        // docker-runtime [#680] + audit-write-drops [#877]) + one per active
+        // eureka rule. Every check should appear regardless of environment —
+        // even if the underlying probe couldn't read state.
+        let expected = 30 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

@@ -173,6 +173,29 @@ pub fn audit_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp/darkmux/audit"))
 }
 
+/// (#877) Count `audit.write_failed` breadcrumbs in TODAY's local flow file.
+/// Each one is a record the AuditFileSink dropped: the hash chain is INCOMPLETE
+/// for it, even though `flow integrity-check` still validates the surviving
+/// chain as clean (the next record re-derives `prev_hash` from the file tail).
+/// `darkmux doctor` surfaces this count so a dropped audit write is DETECTABLE
+/// instead of vanishing into stderr. Best-effort: a missing/unreadable flow
+/// file → 0 (nothing to report).
+pub fn count_audit_write_failures_today() -> usize {
+    let path = flows_dir().join(format!("{}.jsonl", day_utc_now()));
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return 0;
+    };
+    content
+        .lines()
+        .filter(|l| {
+            serde_json::from_str::<serde_json::Value>(l)
+                .ok()
+                .and_then(|v| v.get("action").and_then(|a| a.as_str()).map(|s| s == "audit.write_failed"))
+                .unwrap_or(false)
+        })
+        .count()
+}
+
 /// Hash-chained tamper-evident sink. See module-level comment for the
 /// design rationale. POSIX-only.
 #[cfg(unix)]
@@ -709,6 +732,14 @@ impl RedisSink {
 // is degraded. Per the operator-sovereignty contract: surface failures
 // loudly via stderr; don't silently lose the audit record.
 
+/// `SinkInfo.kind` of the AuditFileSink — the compliance-strength child whose
+/// write failures must be made DETECTABLE rather than vanish into stderr (#877).
+pub(crate) const AUDIT_SINK_KIND: &str = "AuditFile";
+/// `SinkInfo.kind` of the LocalFileSink — the durable casual sink the
+/// audit-failure breadcrumb is written into (a DIFFERENT path than the failing
+/// audit dir, so it's likely still writable when the audit write failed).
+pub(crate) const LOCAL_SINK_KIND: &str = "LocalFile";
+
 pub(crate) struct TeeSink {
     sinks: Vec<Arc<dyn FlowSink>>,
 }
@@ -716,6 +747,40 @@ pub(crate) struct TeeSink {
 impl TeeSink {
     pub fn new(sinks: Vec<Arc<dyn FlowSink>>) -> Self {
         Self { sinks }
+    }
+
+    /// (#877) When the AUDIT child's write fails, the record never reaches the
+    /// hash-chained log — and because the next record re-derives `prev_hash`
+    /// from the file tail, the chain still validates CLEAN, so the gap is
+    /// invisible to `flow integrity-check`. Leave a durable breadcrumb in the
+    /// LocalFile sink (a clone of the dropped record, retagged
+    /// `audit.write_failed`) so `darkmux doctor` can surface that the audit log
+    /// is INCOMPLETE for that record. Detection, not block-at-the-moment —
+    /// matches the "detect, don't claim tamper-proof" framing. Best-effort:
+    /// written straight to the local child (never re-tee'd → no recursion).
+    fn emit_audit_failure_breadcrumb(&self, dropped: &FlowRecord, err_msg: &str) {
+        let Some(local) = self.sinks.iter().find(|s| s.info().kind == LOCAL_SINK_KIND) else {
+            // No local sink to record into — stderr already logged the failure.
+            return;
+        };
+        let mut bc = dropped.clone();
+        bc.level = crate::schema::Level::Error;
+        bc.category = crate::schema::Category::Audit;
+        bc.action = "audit.write_failed".to_string();
+        // Never carry chain fields on the casual-sink breadcrumb.
+        bc.prev_hash = None;
+        bc.hash = None;
+        bc.payload = Some(serde_json::json!({
+            "dropped_action": dropped.action,
+            "dropped_session_id": dropped.session_id,
+            "error": err_msg,
+        }));
+        if let Err(e) = local.write(&bc) {
+            eprintln!(
+                "flow::TeeSink: audit-failure breadcrumb ALSO failed to write to the \
+                 local sink: {e:#} (original audit-write failure is unrecorded durably)"
+            );
+        }
     }
 }
 
@@ -725,15 +790,26 @@ impl FlowSink for TeeSink {
         // sink. Return the first error (so callers can react if they
         // want); log the rest to stderr so the operator sees them.
         let mut first_err: Option<anyhow::Error> = None;
+        let mut audit_err: Option<String> = None;
         for (i, sink) in self.sinks.iter().enumerate() {
             if let Err(e) = sink.write(record) {
                 eprintln!(
                     "flow::TeeSink: sink #{i} write failed: {e:#}"
                 );
+                // (#877) An AUDIT-sink failure is a compliance gap — capture it
+                // for the durable breadcrumb below.
+                if sink.info().kind == AUDIT_SINK_KIND {
+                    audit_err = Some(format!("{e:#}"));
+                }
                 if first_err.is_none() {
                     first_err = Some(e);
                 }
             }
+        }
+        // (#877) Drop the durable breadcrumb AFTER attempting every sink, so the
+        // record still reached the other (non-audit) sinks first.
+        if let Some(err_msg) = audit_err {
+            self.emit_audit_failure_breadcrumb(record, &err_msg);
         }
         match first_err {
             Some(e) => Err(e),
@@ -1644,6 +1720,110 @@ mod tests {
         fn info(&self) -> SinkInfo {
             SinkInfo { kind: "InMemory".to_string(), config: Default::default(), children: vec![], raw_url: None }
         }
+    }
+
+    #[test]
+    fn teesink_audit_failure_drops_breadcrumb_into_local_sink() {
+        // (#877) When the AuditFile child write fails, TeeSink must leave a
+        // durable `audit.write_failed` breadcrumb in the LocalFile child so the
+        // dropped audit record is DETECTABLE (the hash chain itself can't show
+        // the gap). Two test sinks reporting the real `kind` strings the
+        // breadcrumb logic keys on.
+        struct KindedRecorder {
+            kind: &'static str,
+            captured: std::sync::Mutex<Vec<FlowRecord>>,
+        }
+        impl FlowSink for KindedRecorder {
+            fn write(&self, r: &FlowRecord) -> Result<()> {
+                self.captured.lock().unwrap().push(r.clone());
+                Ok(())
+            }
+            fn info(&self) -> SinkInfo {
+                SinkInfo { kind: self.kind.to_string(), config: Default::default(), children: vec![], raw_url: None }
+            }
+        }
+        struct FailingAudit;
+        impl FlowSink for FailingAudit {
+            fn write(&self, _r: &FlowRecord) -> Result<()> {
+                Err(anyhow::anyhow!("audit dir unwritable (test)"))
+            }
+            fn info(&self) -> SinkInfo {
+                SinkInfo { kind: AUDIT_SINK_KIND.to_string(), config: Default::default(), children: vec![], raw_url: None }
+            }
+        }
+
+        let local = Arc::new(KindedRecorder {
+            kind: LOCAL_SINK_KIND,
+            captured: std::sync::Mutex::new(Vec::new()),
+        });
+        let tee = TeeSink::new(vec![
+            local.clone() as Arc<dyn FlowSink>,
+            Arc::new(FailingAudit),
+        ]);
+
+        let mut rec = minimal_record();
+        rec.action = "dispatch.complete".to_string();
+        rec.session_id = Some("sess-1".to_string());
+
+        // TeeSink returns Err (the audit child failed), but the breadcrumb is
+        // the point.
+        assert!(tee.write(&rec).is_err(), "audit-child failure surfaces an Err");
+
+        let captured = local.captured.lock().unwrap();
+        assert_eq!(
+            captured.len(),
+            2,
+            "local sink should hold the original record + the audit-failure breadcrumb"
+        );
+        assert_eq!(captured[0].action, "dispatch.complete", "original first");
+        assert_eq!(captured[1].action, "audit.write_failed", "breadcrumb second");
+        assert!(matches!(captured[1].level, Level::Error));
+        assert!(matches!(captured[1].category, Category::Audit));
+        assert!(captured[1].prev_hash.is_none() && captured[1].hash.is_none());
+        let payload = captured[1].payload.as_ref().expect("breadcrumb carries payload");
+        assert_eq!(payload["dropped_action"], "dispatch.complete");
+        assert_eq!(payload["dropped_session_id"], "sess-1");
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn count_audit_write_failures_today_counts_only_breadcrumbs() {
+        // (#877) Locks the action-string contract END TO END: the breadcrumb
+        // emit literal (`emit_audit_failure_breadcrumb`) and the scanner literal
+        // (`count_audit_write_failures_today`) are independent strings — this
+        // catches them drifting apart. `DARKMUX_FLOWS_DIR` env wins `flows_dir()`.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path()) };
+        let path = tmp.path().join(format!("{}.jsonl", day_utc_now()));
+        let lines = [
+            r#"{"action":"audit.write_failed","category":"audit","level":"error"}"#,
+            r#"{"action":"dispatch.complete","category":"work","level":"info"}"#, // ignored
+            "not valid json",                                                     // ignored — no panic
+            r#"{"action":"audit.write_failed","category":"audit","level":"error"}"#,
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        assert_eq!(count_audit_write_failures_today(), 2);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    fn sink_kind_consts_match_real_sinks() {
+        // (#877) The breadcrumb path keys on these EXACT `info().kind` strings;
+        // a silent rename of either sink's kind would disable detection. Lock
+        // the consts to the real sinks so a rename fails at test time, not in
+        // production (where the breadcrumb would just quietly no-op).
+        assert_eq!(LocalFileSink::new().info().kind, LOCAL_SINK_KIND);
+        #[cfg(unix)]
+        assert_eq!(
+            AuditFileSink::with_dir(std::path::PathBuf::from("/tmp/dm-kind-check")).info().kind,
+            AUDIT_SINK_KIND
+        );
     }
 
     #[test]
