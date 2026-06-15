@@ -160,6 +160,27 @@ pub fn redis_db() -> Option<u8> {
     config().redis.as_ref().and_then(|r| r.db)
 }
 
+// ── Audit (hash-chained sink #163; feature block gated by `enabled`) ──
+/// Audit-dir OVERRIDE: `env(DARKMUX_AUDIT_DIR) > config.audit.dir`
+/// (tilde-expanded), or `None` when neither is set — the caller applies its
+/// `~/.darkmux/audit` default. Mirrors the other dir-override accessors so an
+/// operator who sets `audit.dir` in `config.json` is honored, not ignored.
+pub fn audit_dir_override() -> Option<std::path::PathBuf> {
+    pick_dir_override(
+        env_str("DARKMUX_AUDIT_DIR"),
+        config().audit.as_ref().and_then(|a| a.dir.as_deref()),
+    )
+}
+/// Whether the AuditFileSink is enabled, per the documented precedence
+/// `env(DARKMUX_AUDIT_DIR) > config.audit.enabled`: the historical
+/// enable-by-presence of `DARKMUX_AUDIT_DIR`, OR `config.audit.enabled`. There
+/// is deliberately no `DARKMUX_AUDIT_ENABLED` env var — the env path to enable
+/// audit is setting the dir (preserves the pre-config behavior).
+pub fn audit_enabled() -> bool {
+    env_str("DARKMUX_AUDIT_DIR").is_some()
+        || config().audit.as_ref().and_then(|a| a.enabled).unwrap_or(false)
+}
+
 // ── Runtime behavior ──
 pub fn inactivity_timeout_seconds() -> u64 {
     let cfg = config().runtime.as_ref().and_then(|r| r.inactivity_timeout_seconds);
@@ -393,6 +414,34 @@ mod tests {
     fn env_str_skips_empty_and_unset() {
         // unset
         assert!(env_str("DARKMUX_DEFINITELY_UNSET_XYZ").is_none());
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn audit_env_dir_forces_enabled_and_overrides() {
+        // (#875) Env-tier behavior of the new audit accessors. The config tier
+        // is exercised by `pick_dir_override`'s own tests; here we pin the
+        // robust env-forces directions (no `config()` dependence in the asserts).
+        let k = "DARKMUX_AUDIT_DIR";
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::set_var(k, "/tmp/dm-audit-test"); }
+        assert!(audit_enabled(), "env DARKMUX_AUDIT_DIR presence enables audit");
+        assert_eq!(
+            audit_dir_override(),
+            Some(std::path::PathBuf::from("/tmp/dm-audit-test")),
+            "env value wins the audit-dir override tier"
+        );
+        // A blank env value is treated as unset by env_str → never the dir.
+        unsafe { std::env::set_var(k, "   "); }
+        assert_ne!(
+            audit_dir_override(),
+            Some(std::path::PathBuf::from("   ")),
+            "blank env must not become the audit dir"
+        );
+        match prev {
+            Some(v) => unsafe { std::env::set_var(k, v) },
+            None => unsafe { std::env::remove_var(k) },
+        }
     }
 
     #[serial_test::serial]

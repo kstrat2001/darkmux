@@ -80,10 +80,8 @@ pub fn wait_for_completion(
         .get_connection()
         .with_context(|| format!("connecting to Redis to wait for completion of {session_id}"))?;
 
-    let stream = std::env::var("DARKMUX_REDIS_STREAM")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "darkmux:flow".to_string());
+    // (#875) env > config.redis.stream > default, via config_access.
+    let stream = darkmux_types::config_access::redis_stream();
 
     let start = std::time::Instant::now();
     loop {

@@ -166,10 +166,9 @@ impl FlowSink for LocalFileSink {
 /// or default (`~/.darkmux/audit/`). Symmetric with `flows_dir()` but
 /// deliberately separate so audit and casual records never share a path.
 pub fn audit_dir() -> PathBuf {
-    std::env::var("DARKMUX_AUDIT_DIR")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(PathBuf::from)
+    // (#875) `env(DARKMUX_AUDIT_DIR) > config.audit.dir` via config_access, then
+    // the built-in default — so a config-only operator's `audit.dir` is honored.
+    darkmux_types::config_access::audit_dir_override()
         .or_else(|| dirs::home_dir().map(|h| h.join(".darkmux").join("audit")))
         .unwrap_or_else(|| PathBuf::from("/tmp/darkmux/audit"))
 }
@@ -783,10 +782,10 @@ impl FlowSink for TeeSink {
 fn build_default_sink() -> Arc<dyn FlowSink> {
     let mut sinks: Vec<Arc<dyn FlowSink>> = Vec::new();
 
-    let audit_enabled = std::env::var("DARKMUX_AUDIT_DIR")
-        .ok()
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false);
+    // (#875) `env(DARKMUX_AUDIT_DIR) presence > config.audit.enabled` via
+    // config_access — so a config-only operator with `audit.enabled: true` gets
+    // the AuditFileSink instead of it silently staying off.
+    let audit_enabled = darkmux_types::config_access::audit_enabled();
     if audit_enabled {
         #[cfg(unix)]
         {
@@ -810,18 +809,14 @@ fn build_default_sink() -> Arc<dyn FlowSink> {
     // verbatim, else config-assembled (enabled + host + Keychain password),
     // else None.
     if let Some(raw_url) = redis_url() {
-        let stream = std::env::var("DARKMUX_REDIS_STREAM")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "darkmux:flow".to_string());
-
-        let max_len = match std::env::var("DARKMUX_REDIS_MAXLEN") {
-            Ok(s) => match s.parse::<usize>() {
-                Ok(0) => None,
-                Ok(n) => Some(n),
-                Err(_) => Some(10000),
-            },
-            Err(_) => Some(10000),
+        // (#875) Resolve stream + maxlen through config_access (env > config >
+        // default) so a config-only operator's `redis.stream`/`redis.maxlen`
+        // aren't silently dropped. The `0 → None` (unbounded) translation stays
+        // at this call site per the accessor's contract.
+        let stream = darkmux_types::config_access::redis_stream();
+        let max_len = match darkmux_types::config_access::redis_maxlen() {
+            0 => None,
+            n => Some(n),
         };
 
         match RedisSink::new(raw_url.expose_for_probe(), &stream, max_len) {
