@@ -103,6 +103,7 @@ pub fn run(include_openclaw: bool) -> DoctorReport {
         check_redis_config(),
         check_audit_integrity(),
         check_audit_write_drops(),
+        check_daemon_auth(),
         check_recommendation_drift(),
         check_recommended_profile_name_not_shadowed(),
         check_utility_model_binding(),
@@ -648,6 +649,41 @@ fn check_audit_write_drops() -> Check {
             ),
         }
     }
+}
+
+/// Pure decision for `check_daemon_auth` (#881) — split out so both arms are
+/// testable without touching the Keychain/env. Always informational (never a
+/// Warn): a loopback-only daemon with no token is the SAFE default, and the
+/// refuse-to-bind gate already blocks the unsafe non-loopback-without-token
+/// state at runtime, so there's nothing to cry wolf about here.
+fn daemon_auth_status(token_present: bool) -> (Status, String, Option<String>) {
+    if token_present {
+        (
+            Status::Pass,
+            "serve token configured — non-loopback bind allowed; remote reads + /diff require the bearer token".into(),
+            None,
+        )
+    } else {
+        (
+            Status::Pass,
+            "no serve token — the daemon is loopback-only (a non-loopback `--bind` is refused)".into(),
+            Some(
+                "Safe as-is for a single machine. To expose the daemon across your fleet \
+                 (e.g. `fleet status --deep`), set ONE shared bearer token on every machine: \
+                 `security add-generic-password -U -a \"$USER\" -s darkmux-serve-token -w` (macOS) + \
+                 `daemon_auth_enabled: true` in ~/.darkmux/config.json, or export DARKMUX_SERVE_TOKEN."
+                    .into(),
+            ),
+        )
+    }
+}
+
+/// `serve daemon auth`: surfaces the bearer-auth posture (#881). Informational
+/// — the bind gate enforces safety at runtime; this just reports whether a
+/// shared fleet token is set.
+fn check_daemon_auth() -> Check {
+    let (status, message, hint) = daemon_auth_status(darkmux_flow::serve_token_present());
+    Check { name: "serve daemon auth".into(), status, message, hint }
 }
 
 /// Warn when the operator's profile registry contains a profile literally
@@ -2868,11 +2904,30 @@ mod tests {
         // [#590] + role-model-pin-drift [#160] + legacy-mission-layout [#148]
         // + beat-33-crew-dir [Beat 33 directory flatten] + role-tool-vocab
         // [#340] + legacy-compaction-extras [#380] + redis-config [#661] +
-        // docker-runtime [#680] + audit-write-drops [#877]) + one per active
-        // eureka rule. Every check should appear regardless of environment —
-        // even if the underlying probe couldn't read state.
-        let expected = 30 + darkmux_eureka::all_rules().len();
+        // docker-runtime [#680] + audit-write-drops [#877] + serve-daemon-auth
+        // [#881]) + one per active eureka rule. Every check should appear
+        // regardless of environment — even if the underlying probe couldn't
+        // read state.
+        let expected = 31 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
+    }
+
+    // ─── check_daemon_auth (#881) ─────────────────────────────────────
+    #[test]
+    fn daemon_auth_status_arms() {
+        // Token set → Pass, no hint.
+        let (s, _msg, hint) = daemon_auth_status(true);
+        assert_eq!(s, Status::Pass);
+        assert!(hint.is_none());
+        // No token → still Pass (loopback-only is the SAFE default; the bind
+        // gate enforces safety), but with an actionable enabling hint.
+        let (s, _msg, hint) = daemon_auth_status(false);
+        assert_eq!(s, Status::Pass, "no-token is not a Warn — don't cry wolf on the safe default");
+        let h = hint.expect("the no-token arm gives an enabling hint");
+        assert!(
+            h.contains("darkmux-serve-token") || h.contains("DARKMUX_SERVE_TOKEN"),
+            "hint should name how to set the token: {h}"
+        );
     }
 
     // ─── check_utility_model_binding (#590) ───────────────────────────

@@ -2,15 +2,17 @@
 
 use anyhow::Result;
 use axum::{
-    extract::{Path, State},
+    extract::{ConnectInfo, Path, Request, State},
     http::StatusCode,
-    response::{IntoResponse, sse::{Event, KeepAlive, Sse}},
+    middleware::{from_fn, Next},
+    response::{IntoResponse, Response, sse::{Event, KeepAlive, Sse}},
     routing::get,
     Router,
 };
 use futures::stream::{self, Stream};
 use std::collections::VecDeque;
 use std::io::{BufRead, IsTerminal};
+use std::net::SocketAddr;
 use std::path::{Path as StdPath, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -115,37 +117,40 @@ async fn play_html(Path(date): Path<String>) -> impl IntoResponse {
 /// Build the HTTP router with a configurable flows directory. The daemon's
 /// `run` entry point and the integration tests both go through here.
 pub(crate) fn build_router(flows_dir: PathBuf) -> Router {
-    let state = AppState {
-        flows_dir,
-        worktrees_base: worktrees_base_dir(),
-    };
-    Router::new()
-        .route("/", get(root_html))
-        .route("/play/:date", get(play_html))
-        .route("/health", get(health))
-        .route("/flow/:date", get(flow_handler))
-        .route("/flow/:date/stream", get(flow_stream_handler))
-        .route("/flow-days", get(flow_days_handler))
-        .route("/flow-status", get(flow_status_handler))
-        .route("/model/status", get(model_status_handler))
-        .route("/machine/specs", get(machine_specs_handler))
-        .route("/missions", get(missions_handler))
-        .route("/sprints", get(sprints_handler))
-        .route("/fleet/sessions/live", get(fleet_sessions_live_handler))
-        .route("/fleet/machines/live", get(fleet_machines_live_handler))
-        .route("/diff/:session_id", get(diff_handler))
-        .layer(local_only_cors())
-        .with_state(state)
+    build_router_with_worktrees_base(flows_dir, worktrees_base_dir())
 }
 
-/// Like `build_router` but accepts a custom worktrees base directory.
-#[allow(dead_code)]
+/// Like `build_router` but accepts a custom worktrees base directory. This is
+/// the SINGLE place routes are registered (#881 collapsed the prior duplicate
+/// builder), so the auth layers below land in exactly one place.
+///
+/// **Auth wiring (#881):** when a bearer token is configured
+/// (`darkmux_flow::serve_token_present()`), two gates are added — otherwise the
+/// router is byte-for-byte today's behavior (zero friction for the loopback-only
+/// default install):
+///   - `/diff/:session_id` gets an **always-on** token gate (`route_layer`), so
+///     the most sensitive endpoint (live in-flight source) requires the token
+///     even on loopback.
+///   - a **remote-only** gate (`auth_mw`) wraps the whole router: loopback peers
+///     pass (the operator's own machine + the bundled viewer keep working),
+///     non-loopback peers must present the token. `/health` is always exempt
+///     (doctor's reachability probe). Layered INNER of CORS so preflight is
+///     handled by the CORS layer first.
 pub(crate) fn build_router_with_worktrees_base(
     flows_dir: PathBuf,
     worktrees_base: PathBuf,
 ) -> Router {
     let state = AppState { flows_dir, worktrees_base };
-    Router::new()
+    let auth_on = darkmux_flow::serve_token_present();
+
+    // /diff is gated unconditionally when a token exists (even on loopback).
+    let diff_route = if auth_on {
+        get(diff_handler).route_layer(from_fn(diff_auth_mw))
+    } else {
+        get(diff_handler)
+    };
+
+    let mut router = Router::new()
         .route("/", get(root_html))
         .route("/play/:date", get(play_html))
         .route("/health", get(health))
@@ -159,9 +164,113 @@ pub(crate) fn build_router_with_worktrees_base(
         .route("/sprints", get(sprints_handler))
         .route("/fleet/sessions/live", get(fleet_sessions_live_handler))
         .route("/fleet/machines/live", get(fleet_machines_live_handler))
-        .route("/diff/:session_id", get(diff_handler))
-        .layer(local_only_cors())
-        .with_state(state)
+        .route("/diff/:session_id", diff_route);
+
+    // Remote-only gate, added BEFORE the CORS layer so CORS ends up outermost
+    // (handles preflight + sets headers first); the gate runs just inside it.
+    if auth_on {
+        router = router.layer(from_fn(auth_mw));
+    }
+
+    router.layer(local_only_cors()).with_state(state)
+}
+
+/// (#881) Build a `401 Unauthorized` with a `WWW-Authenticate: Bearer` hint.
+fn unauthorized() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [(axum::http::header::WWW_AUTHENTICATE, "Bearer")],
+        "unauthorized: darkmux serve requires a bearer token (Authorization: Bearer <token>)\n",
+    )
+        .into_response()
+}
+
+/// (#881) Constant-time-ish equality (length-independent body) for comparing a
+/// presented token against the configured one — avoids a trivial early-return
+/// timing oracle. Hand-rolled to keep the dep set tiny (no `subtle`/`constant_time_eq`).
+fn tokens_match(presented: &[u8], expected: &[u8]) -> bool {
+    if presented.len() != expected.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in presented.iter().zip(expected.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
+/// (#881) Whether the request carries a valid `Authorization: Bearer <token>`
+/// matching the configured serve token. `false` when no token is configured
+/// (the caller only invokes this on the auth-on path, but failing closed is the
+/// safe default).
+fn request_token_ok(headers: &axum::http::HeaderMap) -> bool {
+    let Some(token) = darkmux_flow::serve_token() else {
+        return false;
+    };
+    let Some(presented) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+    else {
+        return false;
+    };
+    tokens_match(presented.trim().as_bytes(), token.expose_for_compare().as_bytes())
+}
+
+/// (#881) Always-on token gate for `/diff/:session_id` — the most sensitive
+/// endpoint (live in-flight agent-produced source), gated even on loopback.
+async fn diff_auth_mw(req: Request, next: Next) -> Response {
+    if request_token_ok(req.headers()) {
+        next.run(req).await
+    } else {
+        unauthorized()
+    }
+}
+
+/// (#881) Remote-only token gate for the rest of the surface. Loopback peers
+/// pass (the operator's own machine + the bundled same-origin viewer keep
+/// working with zero friction); non-loopback peers must present the token.
+/// `/health` is always exempt so doctor's reachability probe (and external
+/// liveness checks) keep working. A missing `ConnectInfo` (the `oneshot` test
+/// path, which has no connection) is treated as loopback.
+async fn auth_mw(req: Request, next: Next) -> Response {
+    if req.uri().path() == "/health" {
+        return next.run(req).await;
+    }
+    let is_remote = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| !ci.0.ip().is_loopback())
+        .unwrap_or(false);
+    if !is_remote || request_token_ok(req.headers()) {
+        next.run(req).await
+    } else {
+        unauthorized()
+    }
+}
+
+/// (#881) Refuse a non-loopback bind unless a token is configured. Pure +
+/// testable: parse `bind` to an `IpAddr`; a loopback address (127.0.0.0/8, ::1)
+/// is always allowed; any other parsed address (a LAN/Tailnet IP, or `0.0.0.0`)
+/// requires `token_present`. A bind string that doesn't parse as an IP is
+/// treated conservatively as non-loopback (so a typo can't sneak past the gate).
+fn bind_requires_token(bind: &str, token_present: bool) -> Result<(), String> {
+    let is_loopback = bind
+        .parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false);
+    if is_loopback || token_present {
+        Ok(())
+    } else {
+        Err(format!(
+            "refusing to bind the serve daemon to a non-loopback address ({bind}) without a token \
+configured — the daemon would expose flow records, machine specs, mission state, and the live \
+git diff of in-flight worktrees to any reachable peer, unauthenticated.\n\
+  Fix: set a token — `security add-generic-password -U -a \"$USER\" -s darkmux-serve-token -w` (macOS) \
+plus `daemon_auth_enabled: true` in ~/.darkmux/config.json, OR export DARKMUX_SERVE_TOKEN=… — then \
+re-run. Or bind to 127.0.0.1 (the default) for a loopback-only daemon."
+        ))
+    }
 }
 
 /// GET /fleet/machines/live — the machines present in the fleet RIGHT NOW
@@ -435,6 +544,28 @@ fn build_startup_banner(
         ));
     }
 
+    // (#881) Auth-state line — so the operator can see at a glance whether the
+    // bearer gate is active and (when bound non-loopback) that a token is set.
+    let token_present = darkmux_flow::serve_token_present();
+    let non_loopback = !addr.ip().is_loopback();
+    if token_present {
+        lines.push(format!(
+            "  auth:           {} (remote reads + /diff require a bearer token; loopback open)",
+            darkmux_types::style::success("token set")
+        ));
+    } else if non_loopback {
+        // Should be unreachable — `bind_requires_token` refuses this combination
+        // before bind — but surface it loudly if the bind path ever changes.
+        lines.push(darkmux_types::style::warn(
+            "  ! auth:         NO token set but bound non-loopback — the read surface is UNAUTHENTICATED",
+        ));
+    } else {
+        lines.push(
+            "  auth:           none (loopback-only; set DARKMUX_SERVE_TOKEN or daemon_auth_enabled + Keychain to bind non-loopback)"
+                .to_string(),
+        );
+    }
+
     if !flows_dir_exists {
         lines.push(darkmux_types::style::warn(
             "  ! flows dir doesn't exist yet — will be created on first record write",
@@ -470,6 +601,11 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf) -> Result<()> {
     rt.block_on(async move {
         let app = build_router(flows_dir.clone());
         let addr: std::net::SocketAddr = format!("{bind}:{port}").parse()?;
+        // (#881) Refuse a non-loopback bind without a configured token BEFORE we
+        // bind the socket — exposing the read surface unauthenticated is the
+        // vulnerability this gate closes.
+        bind_requires_token(&bind, darkmux_flow::serve_token_present())
+            .map_err(anyhow::Error::msg)?;
         let listener = tokio::net::TcpListener::bind(addr).await?;
 
         // Banner: print after bind succeeds so we don't claim "listening"
@@ -572,9 +708,14 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf) -> Result<()> {
             let _ = shutdown_rx_axum.wait_for(|&v| v).await;
         };
 
-        axum::serve(listener, app)
-            .with_graceful_shutdown(axum_shutdown)
-            .await?;
+        // (#881) into_make_service_with_connect_info so auth_mw can read the
+        // peer's address and exempt loopback callers.
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(axum_shutdown)
+        .await?;
 
         println!("darkmux serve: clean shutdown");
         Ok::<_, anyhow::Error>(())
@@ -2957,6 +3098,175 @@ mod tests {
             response.headers().contains_key("access-control-allow-origin"),
             "origin in DARKMUX_DAEMON_CORS_ORIGINS must receive CORS headers (#273)"
         );
+    }
+
+    // ─── (#881) serve daemon auth ─────────────────────────────────────
+    // Under test-support the config tier is empty (#811), so a serve token
+    // resolves ONLY from the DARKMUX_SERVE_TOKEN env var — set/scrub it,
+    // #[serial] to avoid racing other env-mutating tests.
+
+    const TEST_TOKEN: &str = "sek-test-12345";
+    fn remote_peer() -> ConnectInfo<SocketAddr> {
+        ConnectInfo("10.0.0.9:5555".parse::<SocketAddr>().unwrap())
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn diff_requires_token_when_configured() {
+        unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN); }
+        let app = build_router(PathBuf::new());
+        let resp = app
+            .oneshot(Request::builder().uri("/diff/some-session").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        unsafe { std::env::remove_var("DARKMUX_SERVE_TOKEN"); }
+        // /diff is gated even on loopback when a token is set.
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn diff_accepts_matching_bearer_token() {
+        unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN); }
+        let app = build_router(PathBuf::new());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/diff/some-session")
+                    .header("Authorization", format!("Bearer {TEST_TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        unsafe { std::env::remove_var("DARKMUX_SERVE_TOKEN"); }
+        // The matching token passes the gate (the handler then runs).
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn diff_rejects_wrong_bearer_token() {
+        unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN); }
+        let app = build_router(PathBuf::new());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/diff/some-session")
+                    .header("Authorization", "Bearer not-the-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        unsafe { std::env::remove_var("DARKMUX_SERVE_TOKEN"); }
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn diff_open_when_no_token_configured() {
+        // Default install: no token → /diff is NOT gated (the bundled viewer
+        // keeps working on loopback).
+        unsafe { std::env::remove_var("DARKMUX_SERVE_TOKEN"); }
+        let app = build_router(PathBuf::new());
+        let resp = app
+            .oneshot(Request::builder().uri("/diff/some-session").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn flow_open_on_loopback_even_with_token() {
+        // The router-wide gate exempts loopback peers; a oneshot request has no
+        // ConnectInfo and is treated as loopback.
+        unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN); }
+        let app = build_router(PathBuf::new());
+        let resp = app
+            .oneshot(Request::builder().uri("/flow-days").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        unsafe { std::env::remove_var("DARKMUX_SERVE_TOKEN"); }
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn flow_requires_token_from_remote_peer() {
+        unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN); }
+        let app = build_router(PathBuf::new());
+        let mut req = Request::builder().uri("/flow-days").body(Body::empty()).unwrap();
+        req.extensions_mut().insert(remote_peer());
+        let resp = app.oneshot(req).await.unwrap();
+        unsafe { std::env::remove_var("DARKMUX_SERVE_TOKEN"); }
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn flow_accepts_remote_peer_with_token() {
+        unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN); }
+        let app = build_router(PathBuf::new());
+        let mut req = Request::builder()
+            .uri("/flow-days")
+            .header("Authorization", format!("Bearer {TEST_TOKEN}"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(remote_peer());
+        let resp = app.oneshot(req).await.unwrap();
+        unsafe { std::env::remove_var("DARKMUX_SERVE_TOKEN"); }
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn health_exempt_from_remote_gate() {
+        unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN); }
+        let app = build_router(PathBuf::new());
+        let mut req = Request::builder().uri("/health").body(Body::empty()).unwrap();
+        req.extensions_mut().insert(remote_peer());
+        let resp = app.oneshot(req).await.unwrap();
+        unsafe { std::env::remove_var("DARKMUX_SERVE_TOKEN"); }
+        // /health must answer even an unauthenticated remote peer (doctor's
+        // reachability probe + external liveness checks).
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn bind_gate_allows_loopback_without_token() {
+        assert!(bind_requires_token("127.0.0.1", false).is_ok());
+        assert!(bind_requires_token("::1", false).is_ok());
+        assert!(bind_requires_token("127.0.0.5", false).is_ok());
+    }
+
+    #[test]
+    fn bind_gate_refuses_nonloopback_without_token() {
+        assert!(bind_requires_token("0.0.0.0", false).is_err());
+        assert!(bind_requires_token("100.64.0.5", false).is_err()); // a Tailnet IP
+        assert!(bind_requires_token("192.168.1.10", false).is_err());
+    }
+
+    #[test]
+    fn bind_gate_allows_nonloopback_with_token() {
+        assert!(bind_requires_token("0.0.0.0", true).is_ok());
+        assert!(bind_requires_token("100.64.0.5", true).is_ok());
+    }
+
+    #[test]
+    fn bind_gate_treats_unparseable_as_nonloopback() {
+        // A bind string that isn't an IP is conservatively non-loopback.
+        assert!(bind_requires_token("garbage", false).is_err());
+        assert!(bind_requires_token("garbage", true).is_ok());
+    }
+
+    #[test]
+    fn tokens_match_is_exact() {
+        assert!(tokens_match(b"abc", b"abc"));
+        assert!(!tokens_match(b"abc", b"abd"));
+        assert!(!tokens_match(b"abc", b"abcd")); // length differs
+        assert!(!tokens_match(b"", b"x"));
     }
 
     // ─── #294 try_send_or_drop_newest ─────────────────────────────────

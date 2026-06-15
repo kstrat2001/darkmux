@@ -135,6 +135,10 @@ pub struct RuntimeBehaviorConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub default_role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub check_updates: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub daemon_cors_origins: Option<String>,
+    // (#881) Gate for reading the `darkmux-serve-token` Keychain item (the env
+    // token `DARKMUX_SERVE_TOKEN` needs no gate). Visible `false` so the
+    // security toggle is discoverable; the token itself is NEVER a config field.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub daemon_auth_enabled: Option<bool>,
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -196,6 +200,7 @@ impl DarkmuxConfig {
                 default_role: None,
                 check_updates: Some(true),
                 daemon_cors_origins: None,
+                daemon_auth_enabled: Some(false),
                 extras: Default::default(),
             }),
             extras: Default::default(),

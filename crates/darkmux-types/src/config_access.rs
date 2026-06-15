@@ -229,6 +229,16 @@ pub fn daemon_cors_origins() -> Option<String> {
     let cfg = config().runtime.as_ref().and_then(|r| r.daemon_cors_origins.as_deref());
     pick_string("DARKMUX_DAEMON_CORS_ORIGINS", cfg, None)
 }
+/// (#881) Whether the serve daemon may read the `darkmux-serve-token` macOS
+/// Keychain item for bearer auth. Config-only gate (`config.runtime.
+/// daemon_auth_enabled`, default `false`) — the env token path
+/// `DARKMUX_SERVE_TOKEN` needs no gate (its presence is the opt-in). Consumed by
+/// `darkmux_flow::serve_token`'s tier-2; auth being *active* is decided by
+/// whether a token actually resolves (`serve_token_present`), never by this flag
+/// alone (a gate-on-but-no-token state must NOT 401 every request).
+pub fn serve_auth_config_enabled() -> bool {
+    config().runtime.as_ref().and_then(|r| r.daemon_auth_enabled).unwrap_or(false)
+}
 /// Strict model-selection (hard-fail on profile-vs-loaded mismatch).
 /// `env(DARKMUX_STRICT_SELECTION)` truthy (`1`/`true`/`yes`/`on`, case-
 /// insensitive) > `config.runtime.strict_selection` > `false`. The env layer is
