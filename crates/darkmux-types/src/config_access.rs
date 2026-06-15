@@ -17,10 +17,37 @@ use crate::config::DarkmuxConfig;
 use std::str::FromStr;
 use std::sync::OnceLock;
 
+// The loaded `config.json` (lazily, once) — production path only. Gated out of
+// test / test-support builds, where `config()` is empty by construction (below).
+#[cfg(not(any(test, feature = "test-support")))]
 static CONFIG: OnceLock<DarkmuxConfig> = OnceLock::new();
 
-/// The loaded `config.json` (lazily, once). Malformed/missing → default-empty.
+// (#811) Test-isolation: the default-EMPTY config returned under test /
+// test-support builds. Its own `OnceLock` so the `&'static` lifetime works
+// without touching the production `CONFIG`.
+#[cfg(any(test, feature = "test-support"))]
+static EMPTY_CONFIG: OnceLock<DarkmuxConfig> = OnceLock::new();
+
+/// The config tier of `env > config.json > default`.
+///
+/// **Production** (`cfg(not(test, test-support))`): the operator's real
+/// `~/.darkmux/config.json`, loaded lazily once. Malformed/missing → default.
+///
+/// **Test / test-support** (`cfg(any(test, feature = "test-support"))`):
+/// EMPTY by construction — `config()` never reads the operator's real
+/// `~/.darkmux/config.json`. This is clean-by-construction test isolation
+/// (#811): the config tier is a process-wide `OnceLock`, so a test could never
+/// reliably control its *value* anyway, and a populated real config silently
+/// flaked default-assertion tests (e.g. `redis.enabled: true` re-enabled the
+/// Redis sink → test records XADD'd to the real `darkmux:flow` stream; a set
+/// `dirs.notebook` beat the built-in default). Precedence is still fully tested
+/// — `pick_*()` take explicit cfg args, and accessor tests assert the env tier
+/// or the built-in default. A crate's whole test build opts in by enabling the
+/// `darkmux-types/test-support` feature (a dev-dependency); no per-test call.
 fn config() -> &'static DarkmuxConfig {
+    #[cfg(any(test, feature = "test-support"))]
+    return EMPTY_CONFIG.get_or_init(DarkmuxConfig::default);
+    #[cfg(not(any(test, feature = "test-support")))]
     CONFIG.get_or_init(DarkmuxConfig::load_resolved)
 }
 
@@ -516,7 +543,7 @@ mod tests {
     fn redis_stream_default_when_unset() {
         let prev = std::env::var("DARKMUX_REDIS_STREAM").ok();
         unsafe { std::env::remove_var("DARKMUX_REDIS_STREAM"); }
-        // With no env and (in CI) no config.json, the built-in default holds.
+        // With no env and the empty test config (#811), the built-in default holds.
         assert_eq!(redis_stream(), "darkmux:flow");
         if let Some(v) = prev { unsafe { std::env::set_var("DARKMUX_REDIS_STREAM", v); } }
     }
@@ -558,7 +585,7 @@ mod tests {
     fn flows_dir_default_when_unset() {
         let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
         unsafe { std::env::remove_var("DARKMUX_FLOWS_DIR"); }
-        // No env, and (in CI) no config.json → ends in a `flows` dir (the
+        // No env, and the empty test config (#811) → ends in a `flows` dir (the
         // ~/.darkmux/flows default, or the /tmp fallback if HOME is absent).
         assert!(flows_dir().ends_with("flows"), "resolves to a flows dir");
         if let Some(v) = prev { unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", v); } }
@@ -663,7 +690,7 @@ mod tests {
         unsafe { std::env::set_var("DARKMUX_NOTEBOOK_DIR", "~/nb"); }
         assert_eq!(notebook_dir(), dirs::home_dir().expect("home").join("nb"));
         unsafe { std::env::remove_var("DARKMUX_NOTEBOOK_DIR"); }
-        // No env/config → the `<root>/notebook` derived default.
+        // No env, empty config → the `<root>/notebook` derived default.
         assert!(notebook_dir().ends_with("notebook"));
         if let Some(v) = prev { unsafe { std::env::set_var("DARKMUX_NOTEBOOK_DIR", v); } }
     }
