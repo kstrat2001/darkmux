@@ -291,7 +291,7 @@ mod tests {
             "lmstudio_url": "http://localhost:1234",
             "dirs": { "flows": "~/dm/flows", "audit": "~/dm/audit" },
             "redis": { "host": "100.74.208.36", "port": 6379, "stream": "darkmux:flow", "maxlen": 10000 },
-            "runtime": { "inactivity_timeout_seconds": 600, "max_turns": 40, "strict_selection": true }
+            "runtime": { "inactivity_timeout_seconds": 600, "max_turns": 40, "strict_selection": true, "daemon_auth_enabled": true }
         }"#;
         let cfg: DarkmuxConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.machine_id.as_deref(), Some("studio"));
@@ -300,6 +300,8 @@ mod tests {
         assert_eq!(cfg.dirs.as_ref().unwrap().flows.as_deref(), Some("~/dm/flows"));
         assert_eq!(cfg.runtime.as_ref().unwrap().max_turns, Some(40));
         assert_eq!(cfg.runtime.as_ref().unwrap().strict_selection, Some(true));
+        // (#881) the daemon-auth gate deserializes from the config tier.
+        assert_eq!(cfg.runtime.as_ref().unwrap().daemon_auth_enabled, Some(true));
         // Re-serialize → parse → still equal on the load-bearing fields.
         let round = serde_json::to_string(&cfg).unwrap();
         let back: DarkmuxConfig = serde_json::from_str(&round).unwrap();

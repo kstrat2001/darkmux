@@ -2895,7 +2895,8 @@ mod tests {
     #[test]
     fn run_returns_static_plus_eureka_checks() {
         let r = run(true);
-        // 29 static checks (incl. docker-runtime [#680] + runtime version + load projection +
+        // 31 static checks via run(true) (27 always-on + 4 openclaw), incl.
+        // docker-runtime [#680] + runtime version + load projection +
         // daemon reachable + darkmux-version-vs-latest-release [#13] +
         // crew-role-prompt-coverage [#141] + flow-sink-health [#170] +
         // machine_id + orchestrator [#167] + openai-base-url-conflict [#5] +

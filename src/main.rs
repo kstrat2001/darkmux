@@ -2132,6 +2132,11 @@ fn cmd_fleet_status(emit_json: bool, deep: bool) -> Result<i32> {
                     // Only present when --deep was passed; null when
                     // --deep was passed but the fetch failed.
                     "specs": specs_by_id.get(&m.id).cloned().flatten().unwrap_or(serde_json::Value::Null),
+                    // (#881) Distinguish a null `specs` caused by a 401/403
+                    // (this machine isn't sending the shared fleet token) from a
+                    // timeout/other failure, so a consumer (viewer/script) gets
+                    // the same signal the text table's `auth?` column carries.
+                    "specs_auth_required": auth_required.contains(&m.id),
                 }))
                 .collect::<Vec<_>>(),
         });

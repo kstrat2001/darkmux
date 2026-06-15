@@ -207,13 +207,20 @@ fn request_token_ok(headers: &axum::http::HeaderMap) -> bool {
     let Some(token) = darkmux_flow::serve_token() else {
         return false;
     };
-    let Some(presented) = headers
+    let Some(value) = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
     else {
         return false;
     };
+    // RFC 6750: the auth scheme is case-insensitive (`Bearer`/`bearer`); split
+    // on the first whitespace so extra spacing before the token is tolerated.
+    let Some((scheme, presented)) = value.split_once(char::is_whitespace) else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return false;
+    }
     tokens_match(presented.trim().as_bytes(), token.expose_for_compare().as_bytes())
 }
 
@@ -233,6 +240,13 @@ async fn diff_auth_mw(req: Request, next: Next) -> Response {
 /// `/health` is always exempt so doctor's reachability probe (and external
 /// liveness checks) keep working. A missing `ConnectInfo` (the `oneshot` test
 /// path, which has no connection) is treated as loopback.
+///
+/// **Trust assumption:** "loopback is trusted" holds for darkmux's deployment —
+/// bound directly (no reverse proxy) over a Tailscale tailnet that preserves the
+/// real peer IP. Behind a connection-terminating reverse proxy every peer would
+/// appear loopback and this gate would be bypassed (`/diff` would still be
+/// gated — it ignores `ConnectInfo`). If darkmux ever grows a
+/// multi-tenant/shared-host or behind-proxy mode, revisit this exemption.
 async fn auth_mw(req: Request, next: Next) -> Response {
     if req.uri().path() == "/health" {
         return next.run(req).await;
@@ -708,8 +722,14 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf) -> Result<()> {
             let _ = shutdown_rx_axum.wait_for(|&v| v).await;
         };
 
-        // (#881) into_make_service_with_connect_info so auth_mw can read the
-        // peer's address and exempt loopback callers.
+        // (#881) SECURITY-LOAD-BEARING: `into_make_service_with_connect_info`
+        // populates each request's `ConnectInfo<SocketAddr>` from the real TCP
+        // peer — that's how `auth_mw` tells a remote peer (token required) from a
+        // loopback one (exempt). If this is ever downgraded to a plain
+        // `into_make_service()`, `auth_mw` sees no `ConnectInfo`, treats EVERY
+        // peer as loopback, and the remote gate becomes a silent no-op. Do not
+        // change without re-checking `auth_mw`. (`/diff` stays gated regardless,
+        // as its `route_layer` doesn't consult `ConnectInfo`.)
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -3246,6 +3266,8 @@ mod tests {
         assert!(bind_requires_token("0.0.0.0", false).is_err());
         assert!(bind_requires_token("100.64.0.5", false).is_err()); // a Tailnet IP
         assert!(bind_requires_token("192.168.1.10", false).is_err());
+        assert!(bind_requires_token("::", false).is_err()); // IPv6 unspecified
+        assert!(bind_requires_token("2001:db8::1", false).is_err()); // global IPv6
     }
 
     #[test]
