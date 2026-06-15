@@ -23,3 +23,8 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 [dev-dependencies]
 tempfile = "3.10"
 serial_test = "3.1"
+# (#811) Empty the config tier by construction in crew's TEST build so the
+# inactivity-timeout default-assertion tests assert the built-in 600, not the
+# operator's real runtime.inactivity_timeout_seconds. Dev-dep only; off in the
+# release binary.
+darkmux-types = { path = "../darkmux-types", features = ["test-support"] }

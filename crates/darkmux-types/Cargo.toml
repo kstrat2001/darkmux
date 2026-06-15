@@ -10,9 +10,12 @@ authors = ["Kain Osterholt"]
 rust-version = "1.80"
 
 [features]
-# (#811) Exposes `config_access::force_empty_config_for_test()` to dependent
-# crates' TEST builds so a test can neutralize the config tier (never read the
-# operator's real ~/.darkmux/config.json). Off in normal builds.
+# (#811) Clean-by-construction test isolation. When enabled (only ever via a
+# dependent crate's DEV-dependency), `config_access::config()` returns an EMPTY
+# config — a test build never reads the operator's real ~/.darkmux/config.json
+# (which silently flaked default-assertion tests and leaked test records to the
+# real Redis stream). No per-test call; a crate opts its whole test build in.
+# Off in normal/release builds, so the production config path is unchanged.
 test-support = []
 
 [dependencies]

@@ -32,7 +32,7 @@ tempfile = "3.10"
 serial_test = "3.1"
 tower = "0.5"
 # (#811) Enable darkmux-types' test-support in serve's TEST build only so the
-# flow-endpoint tests can call `force_empty_config_for_test()` and neutralize
-# the config tier (never aggregate from the operator's real config.json Redis).
-# Feature-unifies with the normal dep above; off in the release binary.
+# config tier is empty by construction — the flow-endpoint tests never
+# aggregate from the operator's real config.json Redis. Feature-unifies with
+# the normal dep above; off in the release binary (dev-dependency only).
 darkmux-types = { path = "../darkmux-types", features = ["test-support"] }

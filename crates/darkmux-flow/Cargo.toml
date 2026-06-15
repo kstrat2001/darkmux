@@ -13,8 +13,8 @@ rust-version = "1.80"
 # Exposes test-only helpers (e.g. `isolate_test_env_once`) to downstream
 # crates' test builds without compiling them into release binaries. Enabled
 # from the binary's dev-dependency on this crate. See #463.
-# (#811) Pulls in darkmux-types' test-support so `isolate_test_env_once` can
-# neutralize the config tier (force_empty_config_for_test) — propagated to the
+# (#811) Pulls in darkmux-types' test-support so the config tier is empty by
+# construction in flow's (and the binary's) test build — propagated to the
 # binary's test build via its dev-dep on this crate's test-support feature.
 test-support = ["darkmux-types/test-support"]
 
@@ -40,6 +40,6 @@ darkmux-types = { path = "../darkmux-types" }
 tempfile = "3.10"
 serial_test = "3.1"
 # (#811) flow's OWN tests need darkmux-types' test-support (the `test` cfg on
-# darkmux-types doesn't apply when it's a dep) so `force_empty_config_for_test`
-# resolves. Feature-unifies with the normal dep above in the test build only.
+# darkmux-types doesn't apply when it's a dep) so the config tier is empty by
+# construction. Feature-unifies with the normal dep above in the test build only.
 darkmux-types = { path = "../darkmux-types", features = ["test-support"] }

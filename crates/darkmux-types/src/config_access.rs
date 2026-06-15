@@ -17,37 +17,37 @@ use crate::config::DarkmuxConfig;
 use std::str::FromStr;
 use std::sync::OnceLock;
 
+// The loaded `config.json` (lazily, once) — production path only. Gated out of
+// test / test-support builds, where `config()` is empty by construction (below).
+#[cfg(not(any(test, feature = "test-support")))]
 static CONFIG: OnceLock<DarkmuxConfig> = OnceLock::new();
 
-// (#811) Test-isolation override. When `force_empty_config_for_test()` has been
-// called, `config()` returns a default-EMPTY config for the rest of the process
-// instead of the operator's real `~/.darkmux/config.json`. Gated to test /
-// test-support builds so it's absent from release. The flag is checked BEFORE
-// the `CONFIG` OnceLock, so it works regardless of whether the real config was
-// already loaded by an earlier access (it bypasses the cache).
-#[cfg(any(test, feature = "test-support"))]
-static FORCE_EMPTY_CONFIG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+// (#811) Test-isolation: the default-EMPTY config returned under test /
+// test-support builds. Its own `OnceLock` so the `&'static` lifetime works
+// without touching the production `CONFIG`.
 #[cfg(any(test, feature = "test-support"))]
 static EMPTY_CONFIG: OnceLock<DarkmuxConfig> = OnceLock::new();
 
-/// (#811) Make `config()` return a default-EMPTY config for the rest of this
-/// process — test isolation so a test never reads the operator's real
-/// `~/.darkmux/config.json`. Without this, an env-scrubbed test still inherits
-/// the config tier: e.g. `redis.enabled: true` re-enables the Redis sink (test
-/// records XADD'd to the real `darkmux:flow` stream), and `redis_url()`'s "off"
-/// assertions flake on a machine with a populated config. Idempotent; called
-/// from `darkmux-flow`'s `isolate_test_env_once`.
-#[cfg(any(test, feature = "test-support"))]
-pub fn force_empty_config_for_test() {
-    FORCE_EMPTY_CONFIG.store(true, std::sync::atomic::Ordering::SeqCst);
-}
-
-/// The loaded `config.json` (lazily, once). Malformed/missing → default-empty.
+/// The config tier of `env > config.json > default`.
+///
+/// **Production** (`cfg(not(test, test-support))`): the operator's real
+/// `~/.darkmux/config.json`, loaded lazily once. Malformed/missing → default.
+///
+/// **Test / test-support** (`cfg(any(test, feature = "test-support"))`):
+/// EMPTY by construction — `config()` never reads the operator's real
+/// `~/.darkmux/config.json`. This is clean-by-construction test isolation
+/// (#811): the config tier is a process-wide `OnceLock`, so a test could never
+/// reliably control its *value* anyway, and a populated real config silently
+/// flaked default-assertion tests (e.g. `redis.enabled: true` re-enabled the
+/// Redis sink → test records XADD'd to the real `darkmux:flow` stream; a set
+/// `dirs.notebook` beat the built-in default). Precedence is still fully tested
+/// — `pick_*()` take explicit cfg args, and accessor tests assert the env tier
+/// or the built-in default. A crate's whole test build opts in by enabling the
+/// `darkmux-types/test-support` feature (a dev-dependency); no per-test call.
 fn config() -> &'static DarkmuxConfig {
     #[cfg(any(test, feature = "test-support"))]
-    if FORCE_EMPTY_CONFIG.load(std::sync::atomic::Ordering::SeqCst) {
-        return EMPTY_CONFIG.get_or_init(DarkmuxConfig::default);
-    }
+    return EMPTY_CONFIG.get_or_init(DarkmuxConfig::default);
+    #[cfg(not(any(test, feature = "test-support")))]
     CONFIG.get_or_init(DarkmuxConfig::load_resolved)
 }
 
@@ -541,12 +541,9 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn redis_stream_default_when_unset() {
-        // (#811) Neutralize the config tier so the operator's real config.json
-        // (which may set redis.stream) can't beat the built-in default here.
-        force_empty_config_for_test();
         let prev = std::env::var("DARKMUX_REDIS_STREAM").ok();
         unsafe { std::env::remove_var("DARKMUX_REDIS_STREAM"); }
-        // With no env and an empty config, the built-in default holds.
+        // With no env and the empty test config (#811), the built-in default holds.
         assert_eq!(redis_stream(), "darkmux:flow");
         if let Some(v) = prev { unsafe { std::env::set_var("DARKMUX_REDIS_STREAM", v); } }
     }
@@ -586,12 +583,9 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn flows_dir_default_when_unset() {
-        // (#811) Neutralize the config tier (dirs.flows may be set on the
-        // operator's machine) so the built-in default is what's asserted.
-        force_empty_config_for_test();
         let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
         unsafe { std::env::remove_var("DARKMUX_FLOWS_DIR"); }
-        // No env, and an empty config → ends in a `flows` dir (the
+        // No env, and the empty test config (#811) → ends in a `flows` dir (the
         // ~/.darkmux/flows default, or the /tmp fallback if HOME is absent).
         assert!(flows_dir().ends_with("flows"), "resolves to a flows dir");
         if let Some(v) = prev { unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", v); } }
@@ -690,9 +684,6 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn notebook_dir_env_is_tilde_expanded_then_default() {
-        // (#811) Neutralize the config tier so the `<root>/notebook` default is
-        // asserted, not the operator's real dirs.notebook (e.g. an iCloud path).
-        force_empty_config_for_test();
         let prev = std::env::var("DARKMUX_NOTEBOOK_DIR").ok();
         // The notebook env value IS tilde-expanded (the documented iCloud-path
         // ergonomics) — unlike the other dir accessors, whose env is raw.

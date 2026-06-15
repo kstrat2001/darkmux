@@ -2827,14 +2827,12 @@ mod tests {
     async fn flow_returns_records_as_json_array_when_present() {
         // The bare-date route reads the local `<date>.jsonl` file (Redis
         // unset) and returns its records as a JSON array.
-        // (#811) Neutralize BOTH precedence tiers so the handler's redis_url()
-        // resolves to "off" and it reads the tmp local file: drop the env var
-        // (serial-guarded so it can't race the sibling tests that set it) and
-        // force an empty config (the operator's real config.json sets
-        // redis.enabled). Without this the handler aggregates from the
-        // operator's real Redis and returns 0 records.
+        // (#811) The config tier is empty by construction in this test build
+        // (the test-support dev-dep), so config.json can't supply a Redis URL.
+        // The ENV tier is separate: drop DARKMUX_REDIS_URL (serial-guarded so it
+        // can't race the sibling tests that set it) so redis_url() is "off" and
+        // the handler reads the tmp local file instead of the operator's Redis.
         unsafe { std::env::remove_var("DARKMUX_REDIS_URL"); }
-        darkmux_types::config_access::force_empty_config_for_test();
         let tmp = TempDir::new().unwrap();
         let content = "{\"_type\":\"schema\",\"version\":\"1.0.0\"}\n{\"action\":\"x\",\"handle\":\"test\"}\n";
         fs::write(tmp.path().join("2026-05-14.jsonl"), content).unwrap();
@@ -3692,9 +3690,9 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn flow_endpoint_reads_local_file_when_redis_url_unset() {
-            // (#811) Neutralize the config tier so an unset DARKMUX_REDIS_URL
-            // means Redis off — not the operator's config.json-assembled URL.
-            darkmux_types::config_access::force_empty_config_for_test();
+            // (#811) The config tier is empty by construction in this test build
+            // (the test-support dev-dep), so an unset DARKMUX_REDIS_URL means
+            // Redis off — not the operator's config.json-assembled URL.
             let today = today_utc_date();
             let tmp = TempDir::new().unwrap();
             let local_record = format!(
