@@ -2080,12 +2080,25 @@ fn cmd_fleet_status(emit_json: bool, deep: bool) -> Result<i32> {
     // HTTP GET per peer; ~1s budget each. Failures are surfaced per-row
     // (Some(None) in the resolved vector) — they MUST NOT fail the
     // whole command. (#275 PR-B)
+    // (#881) Resolve THIS machine's serve token once and send it to peers — a
+    // single shared fleet token. Track peers that answered 401/403 so a missing
+    // token surfaces a real "auth?" signal instead of looking like a timeout.
+    let token = darkmux_flow::serve_token();
+    let token_str = token.as_ref().map(|t| t.expose_for_compare());
+    let mut auth_required: Vec<String> = Vec::new();
     let specs_by_id: std::collections::BTreeMap<String, Option<serde_json::Value>> = if deep {
         probes
             .iter()
             .map(|(m, p)| {
                 let value = if p.reachable {
-                    fetch_machine_specs(&m.address)
+                    match fetch_machine_specs(&m.address, token_str) {
+                        SpecsProbe::Ok(v) => Some(v),
+                        SpecsProbe::AuthRequired => {
+                            auth_required.push(m.id.clone());
+                            None
+                        }
+                        SpecsProbe::Unavailable => None,
+                    }
                 } else {
                     None
                 };
@@ -2119,6 +2132,11 @@ fn cmd_fleet_status(emit_json: bool, deep: bool) -> Result<i32> {
                     // Only present when --deep was passed; null when
                     // --deep was passed but the fetch failed.
                     "specs": specs_by_id.get(&m.id).cloned().flatten().unwrap_or(serde_json::Value::Null),
+                    // (#881) Distinguish a null `specs` caused by a 401/403
+                    // (this machine isn't sending the shared fleet token) from a
+                    // timeout/other failure, so a consumer (viewer/script) gets
+                    // the same signal the text table's `auth?` column carries.
+                    "specs_auth_required": auth_required.contains(&m.id),
                 }))
                 .collect::<Vec<_>>(),
         });
@@ -2210,6 +2228,12 @@ fn cmd_fleet_status(emit_json: bool, deep: bool) -> Result<i32> {
                         },
                     )
                 }
+                // (#881) Distinguish a 401/403 (peer requires a token we didn't
+                // send) from a generic specs failure, so it doesn't read as a
+                // timeout.
+                None if auth_required.contains(&m.id) => {
+                    ("auth?".into(), "—".into(), "—".into(), "—".into())
+                }
                 None => ("specs?".into(), "—".into(), "—".into(), "—".into()),
             };
             let row = format!(
@@ -2230,15 +2254,36 @@ fn cmd_fleet_status(emit_json: bool, deep: bool) -> Result<i32> {
             println!("{}", style::error(&format!("               error: {err}")));
         }
     }
+    // (#881) If any peer returned 401/403, the local machine is missing the
+    // shared fleet token — surface the fix rather than leaving a silent "auth?".
+    if !auth_required.is_empty() {
+        println!(
+            "{}",
+            style::warn(&format!(
+                "  ! {} peer(s) require a bearer token this machine isn't sending ({}). \
+Set DARKMUX_SERVE_TOKEN (or the darkmux-serve-token Keychain item) to the shared fleet token.",
+                auth_required.len(),
+                auth_required.join(", ")
+            ))
+        );
+    }
     Ok(0)
 }
 
-/// Fetch `/machine/specs` from a peer's daemon at `address`. Returns
-/// `None` if the URL can't be parsed, the HTTP request fails (timeout,
-/// connection refused, non-200), or the body isn't valid JSON. Bounded
-/// at 1s total — the operator gets a row per peer even when one is
-/// slow or wedged. (#275 PR-B)
-fn fetch_machine_specs(address: &str) -> Option<serde_json::Value> {
+/// Outcome of probing a peer's `/machine/specs` (#881). `AuthRequired`
+/// (401/403) is distinguished from `Unavailable` (timeout, refused, other
+/// non-2xx, bad JSON) so a missing shared fleet token reads as `auth?`, not a
+/// silent `specs?`.
+enum SpecsProbe {
+    Ok(serde_json::Value),
+    AuthRequired,
+    Unavailable,
+}
+
+/// Fetch `/machine/specs` from a peer's daemon at `address`, sending the shared
+/// fleet bearer `token` if one is configured (#881). Bounded at 1s total — the
+/// operator gets a row per peer even when one is slow or wedged. (#275 PR-B)
+fn fetch_machine_specs(address: &str, token: Option<&str>) -> SpecsProbe {
     let normalized = if address.contains("://") {
         address.to_string()
     } else if address.contains(':') {
@@ -2256,8 +2301,23 @@ fn fetch_machine_specs(address: &str) -> Option<serde_json::Value> {
     let agent = ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_millis(1000))
         .build();
-    let body = agent.get(&url).call().ok()?.into_string().ok()?;
-    serde_json::from_str(&body).ok()
+    let mut req = agent.get(&url);
+    if let Some(tok) = token {
+        req = req.set("Authorization", &format!("Bearer {tok}"));
+    }
+    match req.call() {
+        Ok(resp) => match resp.into_string() {
+            Ok(body) => match serde_json::from_str(&body) {
+                Ok(v) => SpecsProbe::Ok(v),
+                Err(_) => SpecsProbe::Unavailable,
+            },
+            Err(_) => SpecsProbe::Unavailable,
+        },
+        Err(ureq::Error::Status(401, _)) | Err(ureq::Error::Status(403, _)) => {
+            SpecsProbe::AuthRequired
+        }
+        Err(_) => SpecsProbe::Unavailable,
+    }
 }
 
 /// Format a byte count as a human-friendly "N GB" string for the

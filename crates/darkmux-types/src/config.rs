@@ -135,6 +135,10 @@ pub struct RuntimeBehaviorConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub default_role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub check_updates: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub daemon_cors_origins: Option<String>,
+    // (#881) Gate for reading the `darkmux-serve-token` Keychain item (the env
+    // token `DARKMUX_SERVE_TOKEN` needs no gate). Visible `false` so the
+    // security toggle is discoverable; the token itself is NEVER a config field.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub daemon_auth_enabled: Option<bool>,
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -196,6 +200,7 @@ impl DarkmuxConfig {
                 default_role: None,
                 check_updates: Some(true),
                 daemon_cors_origins: None,
+                daemon_auth_enabled: Some(false),
                 extras: Default::default(),
             }),
             extras: Default::default(),
@@ -286,7 +291,7 @@ mod tests {
             "lmstudio_url": "http://localhost:1234",
             "dirs": { "flows": "~/dm/flows", "audit": "~/dm/audit" },
             "redis": { "host": "100.74.208.36", "port": 6379, "stream": "darkmux:flow", "maxlen": 10000 },
-            "runtime": { "inactivity_timeout_seconds": 600, "max_turns": 40, "strict_selection": true }
+            "runtime": { "inactivity_timeout_seconds": 600, "max_turns": 40, "strict_selection": true, "daemon_auth_enabled": true }
         }"#;
         let cfg: DarkmuxConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.machine_id.as_deref(), Some("studio"));
@@ -295,6 +300,8 @@ mod tests {
         assert_eq!(cfg.dirs.as_ref().unwrap().flows.as_deref(), Some("~/dm/flows"));
         assert_eq!(cfg.runtime.as_ref().unwrap().max_turns, Some(40));
         assert_eq!(cfg.runtime.as_ref().unwrap().strict_selection, Some(true));
+        // (#881) the daemon-auth gate deserializes from the config tier.
+        assert_eq!(cfg.runtime.as_ref().unwrap().daemon_auth_enabled, Some(true));
         // Re-serialize → parse → still equal on the load-bearing fields.
         let round = serde_json::to_string(&cfg).unwrap();
         let back: DarkmuxConfig = serde_json::from_str(&round).unwrap();

@@ -417,6 +417,108 @@ pub fn redis_keychain_password_present() -> bool {
     keychain_redis_password().is_some()
 }
 
+// ── (#881) serve-daemon auth token ───────────────────────────────────────────
+// The serve daemon's bearer token is a SECRET, so it follows the SAME doctrine
+// as the Redis password above: the `DARKMUX_SERVE_TOKEN` env override or the
+// macOS Keychain item `darkmux-serve-token`, NEVER plaintext config.json. It
+// lives in THIS crate (not darkmux-serve, which consumes it) to reuse the
+// redacting-wrapper + Keychain-shell-out + OnceLock scaffold rather than
+// duplicate ~60 lines of secret handling — a mild layering smell (a flow crate
+// owning a serve concern) accepted for KISS pre-1.0. (#881)
+
+/// Opaque wrapper for the serve-daemon bearer token. Like `RawRedisUrl`, the raw
+/// bytes are reachable only via the verbosely-named `expose_for_compare`;
+/// `Debug`/`Display` redact, so the token can't leak into a log line, an anyhow
+/// context, or serialized JSON — a compile-time property, not a convention.
+#[derive(Clone)]
+pub struct RawServeToken(String);
+
+impl std::fmt::Debug for RawServeToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RawServeToken(***)")
+    }
+}
+impl std::fmt::Display for RawServeToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("***")
+    }
+}
+impl RawServeToken {
+    pub fn new(token: String) -> Self {
+        Self(token)
+    }
+    /// The raw token bytes, for the constant-time-ish header comparison in the
+    /// serve auth middleware. Verbose name so accidental use is visible in
+    /// review (mirrors `RawRedisUrl::expose_for_probe`).
+    pub fn expose_for_compare(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Read the serve-daemon token from the macOS Keychain — item
+/// `darkmux-serve-token` (`security add-generic-password -a $USER -s
+/// darkmux-serve-token -w`). Same shell-out-to-`security`, `OnceLock`-cached,
+/// `-w`-writes-only-to-stdout discipline as `keychain_redis_password`. Non-macOS
+/// → `None` (portable operators use the `DARKMUX_SERVE_TOKEN` env path). (#881)
+#[cfg(target_os = "macos")]
+fn keychain_serve_token() -> Option<String> {
+    static TOK: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    TOK.get_or_init(|| {
+        let user = std::env::var("USER").ok()?;
+        let out = std::process::Command::new("security")
+            .args(["find-generic-password", "-a", &user, "-s", "darkmux-serve-token", "-w"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None; // item absent → no Keychain token (don't hard-fail)
+        }
+        let tok = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if tok.is_empty() { None } else { Some(tok) }
+    })
+    .clone()
+}
+#[cfg(not(target_os = "macos"))]
+fn keychain_serve_token() -> Option<String> {
+    None
+}
+
+/// Resolve the serve-daemon bearer token, mirroring `redis_url`'s tiering:
+///   1. `env(DARKMUX_SERVE_TOKEN)` verbatim (trimmed, empty-filtered) — the
+///      portable/non-macOS path, no config gate (its presence is the opt-in);
+///   2. else config gate on (`runtime.daemon_auth_enabled`) + Keychain item
+///      `darkmux-serve-token`;
+///   3. else `None` (auth off — today's default).
+///
+/// Always a `RawServeToken`, so the secret reaches a comparison only via
+/// `expose_for_compare`. **Auth is "active" iff this returns `Some`** — the
+/// config flag alone never activates auth (a gate-on-but-no-token state would
+/// otherwise 401 every request with no way to pass). (#881)
+pub fn serve_token() -> Option<RawServeToken> {
+    // Tier 1 — env token verbatim.
+    if let Some(tok) = std::env::var("DARKMUX_SERVE_TOKEN")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        return Some(RawServeToken::new(tok));
+    }
+    // Tier 2 — config gate on + Keychain item present.
+    if darkmux_types::config_access::serve_auth_config_enabled() {
+        if let Some(tok) = keychain_serve_token() {
+            return Some(RawServeToken::new(tok));
+        }
+    }
+    // Tier 3 — off.
+    None
+}
+
+/// Whether a serve-daemon bearer token is configured (env or gated-Keychain).
+/// Boolean ONLY — never the token. Drives the refuse-to-bind gate, the auth
+/// middleware toggle, the startup banner, and `darkmux doctor`. (#881)
+pub fn serve_token_present() -> bool {
+    serve_token().is_some()
+}
+
 /// Redis Streams-backed flow sink. Each `write` XADDs the record's
 /// JSON-serialized fields to a single stream. Multiple consumers can
 /// `XREAD BLOCK` for live updates; consumer groups handle multi-reader
@@ -2929,6 +3031,41 @@ mod tests {
             match prev {
                 Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
                 None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+    }
+
+    #[test]
+    fn raw_serve_token_redacts() {
+        // (#881) The token must NEVER appear in `{:?}` or `{}` — only via the
+        // explicit, verbosely-named `expose_for_compare`.
+        let t = RawServeToken::new("sk-super-secret".to_string());
+        assert!(!format!("{t:?}").contains("sk-super-secret"), "Debug leaked the token");
+        assert!(format!("{t:?}").contains("***"), "Debug should redact");
+        assert!(!format!("{t}").contains("sk-super-secret"), "Display leaked the token");
+        assert_eq!(t.expose_for_compare(), "sk-super-secret");
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn serve_token_env_tier_then_off() {
+        // (#811) Empty config tier under test, so the token resolves ONLY from
+        // the env var (tier 1); tier 2 (config gate + Keychain) is off.
+        isolate_test_env_once();
+        let prev = std::env::var("DARKMUX_SERVE_TOKEN").ok();
+        // Tier 1: env token, trimmed.
+        unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", "  tok-xyz  "); }
+        let t = serve_token().expect("env tier → Some");
+        assert_eq!(t.expose_for_compare(), "tok-xyz", "surrounding whitespace trimmed");
+        assert!(serve_token_present());
+        // Tier 3: unset env + empty config gate → None (auth off).
+        unsafe { std::env::remove_var("DARKMUX_SERVE_TOKEN"); }
+        assert!(serve_token().is_none(), "no env + gate off → token absent");
+        assert!(!serve_token_present());
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_SERVE_TOKEN", v),
+                None => std::env::remove_var("DARKMUX_SERVE_TOKEN"),
             }
         }
     }
