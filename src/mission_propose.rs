@@ -313,7 +313,27 @@ fn parse_proposal(response: &str) -> Result<Proposal> {
 /// Returns a readable error so the operator can hit `e` to regenerate
 /// with a hint instead of having to discover the problem post-persist
 /// in the viewer's sprint-progress widget.
+/// (#867 security) Reject any MODEL-supplied mission/sprint id that isn't a
+/// safe single path component, BEFORE it reaches `lifecycle::mission_path` /
+/// `sprint_path` (which build paths by raw `join`). A `../`- or `/`-bearing id
+/// would otherwise escape the crew dir — a controlled `.json`/`mission.json`
+/// write-primitive from untrusted local-model output. `validate_identifier`
+/// rejects anything outside `[a-z0-9_-]`, so `.`/`/` (hence `..`) can't pass;
+/// this mirrors the guard `mission_run.rs:316` / `main.rs:1645` already apply
+/// to operator-supplied ids. Shared by `validate_proposal_invariants` (early /
+/// UX rejection) and `persist` (the write boundary) so the two never drift.
+fn validate_proposal_ids(p: &Proposal) -> Result<()> {
+    crate::fleet::validate_identifier("mission_id", &p.mission.id)?;
+    for s in &p.sprints {
+        crate::fleet::validate_identifier("sprint_id", &s.id)?;
+    }
+    Ok(())
+}
+
 fn validate_proposal_invariants(p: &Proposal) -> Result<()> {
+    // Charset-validate the path-bearing ids before any cross-ref logic (#867).
+    validate_proposal_ids(p)?;
+
     let sprint_ids: std::collections::HashSet<&str> =
         p.sprints.iter().map(|s| s.id.as_str()).collect();
 
@@ -488,6 +508,13 @@ fn prompt_decision() -> Result<Decision> {
 
 fn persist(p: &Proposal, source_input: &str, ticket: Option<&str>) -> Result<i32> {
     use crate::crew::lifecycle;
+
+    // (#867 security boundary) Re-assert id safety at the path-construction
+    // site — persist builds `lifecycle::{mission,sprint}_path` via raw join, so
+    // a model-supplied `../`/`/`-id must never reach here even if a future
+    // caller skips `validate_proposal_invariants`. This function, not its
+    // callers, owns the path-write boundary.
+    validate_proposal_ids(p)?;
 
     // Stamp created_ts on everything that has 0 (the schema convention
     // the mission-compiler emits — see role .md).
@@ -800,33 +827,34 @@ some epilogue"#;
         assert!(err.to_string().contains("already exists"));
     }
 
+    #[cfg(unix)]
     #[serial_test::serial]
     #[test]
     fn persist_rolls_back_mission_when_sprint_write_fails() {
         // Atomicity regression: if a sprint write fails mid-loop, the
-        // mission file + any earlier sprint files must be cleaned up
-        // so the operator's retry sees a clean slate.
+        // mission file + any EARLIER successfully-written sprint files must be
+        // cleaned up so the operator's retry sees a clean slate.
         //
-        // To trigger the failure DURING the write loop (not in the
-        // pre-flight `.exists()` check), the second sprint's id
-        // contains a `/`, so its target path is
-        // `<sprints_dir>/deep/test-s2.json` whose parent directory
-        // (`deep/`) doesn't exist. `.exists()` returns false on the
-        // full path (pre-flight passes); `std::fs::write` returns
-        // ENOENT during the loop (rollback fires).
-        //
-        // The slashed-id smell is acknowledged — sprint ids with `/`
-        // should arguably be rejected by `validate_proposal_invariants`
-        // as a path-traversal vector. Future hardening; tests-only
-        // use of the form is fine.
+        // Triggering a WRITE-time (not exists-pre-flight) failure on the
+        // SECOND sprint with VALID ids — `/`-bearing ids are now rejected up
+        // front by validate_identifier (#867) — needs a path that PASSES the
+        // `.exists()` pre-flight yet FAILS the write. A symlink whose target's
+        // parent is missing does exactly that: `Path::exists()` follows it and
+        // sees the absent target (pre-flight passes), while `std::fs::write`
+        // follows it and ENOENTs on the missing parent (rollback fires). So
+        // mission + sprint-1 land, sprint-2 fails, and both are rolled back.
+        // (Previously this used a `deep/test-s2` slashed id, which #867 now
+        // correctly refuses.)
+        use std::os::unix::fs::symlink;
         let _guard = CrewDirGuard::new(TempDir::new().unwrap());
 
-        // The second sprint id contains a `/` so its target path is
-        // `<sprints_dir>/deep/test-s2.json` whose parent directory
-        // (`deep/`) doesn't exist inside the mission sprints dir.
-        // `.exists()` returns false on the full path (pre-flight passes);
-        // `std::fs::write` returns ENOENT during the loop (rollback fires).
-        let proposal = sample_proposal("test-rollback", &["test-s1", "deep/test-s2"]);
+        let proposal = sample_proposal("test-rollback", &["test-s1", "test-s2"]);
+        let sprints_dir = crate::crew::lifecycle::sprints_dir("test-rollback");
+        std::fs::create_dir_all(&sprints_dir).unwrap();
+        let s2_path = crate::crew::lifecycle::sprint_path("test-rollback", "test-s2");
+        // Symlink s2's .json at a target whose parent dir doesn't exist.
+        symlink(sprints_dir.join("missing-parent").join("target.json"), &s2_path)
+            .expect("pre-create the failing symlink at the s2 json path");
 
         let err = persist(&proposal, "test input", None).expect_err("persist should fail mid-loop");
         assert!(
@@ -871,6 +899,47 @@ some epilogue"#;
         p.sprints[0].depends_on = vec!["missing".to_string()];
         let err = validate_proposal_invariants(&p).expect_err("should reject dangling depends_on");
         assert!(err.to_string().contains("missing"));
+    }
+
+    #[test]
+    fn validate_proposal_rejects_path_traversal_mission_id() {
+        // (#867 security) A model-supplied mission id with `..`/`/` must be
+        // rejected BEFORE it reaches lifecycle::mission_path's raw join.
+        let p = sample_proposal("../../../tmp/evil", &["s1"]);
+        let err = validate_proposal_invariants(&p)
+            .expect_err("a traversal mission id must be rejected");
+        assert!(
+            err.to_string().contains("invalid char"),
+            "expected an identifier-charset rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_proposal_rejects_path_traversal_sprint_id() {
+        // (#867 security) Same guard for sprint ids → sprint_path raw join.
+        let p = sample_proposal("m1", &["../../etc/passwd"]);
+        let err = validate_proposal_invariants(&p)
+            .expect_err("a traversal sprint id must be rejected");
+        assert!(
+            err.to_string().contains("invalid char"),
+            "expected an identifier-charset rejection, got: {err}"
+        );
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn persist_rejects_path_traversal_id_before_any_write() {
+        // (#867 security boundary) persist self-defends even when reached
+        // without validate_proposal_invariants: a traversal id is refused
+        // before any path construction / write.
+        let _guard = CrewDirGuard::new(TempDir::new().unwrap());
+        let p = sample_proposal("../../../tmp/evil", &["s1"]);
+        let err = persist(&p, "test input", None)
+            .expect_err("persist must refuse a traversal mission id");
+        assert!(
+            err.to_string().contains("invalid char"),
+            "expected an identifier-charset rejection at the persist boundary, got: {err}"
+        );
     }
 
     #[test]
