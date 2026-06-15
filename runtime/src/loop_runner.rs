@@ -98,6 +98,41 @@ const MAX_TOKENS_PER_CALL: u32 = 10000;
 /// pathology signal — escalate rather than burn more turns trying.
 const MAX_STALL_RECOVERIES: u32 = 2;
 
+/// (#854) How many consecutive turns of an IDENTICAL `usage.prompt_tokens`
+/// (while the message thread keeps growing) flags the endpoint's reported
+/// context count as stale. A healthy, growing conversation strictly increases
+/// prompt_tokens every turn (each turn appends the assistant message + tool
+/// results to the next prompt), so a value frozen for several turns is an
+/// endpoint misreport — observed on a turboquant MLX build, where the count
+/// stuck at 48109 for 8+ turns and silently suppressed compaction into a
+/// degenerate cycle. Set conservatively (4 identical reports) so a single
+/// coincidental repeat never trips it.
+///
+/// Assumes the endpoint reports EXACT prompt-token counts (the local LMStudio /
+/// Ollama / llama.cpp path does). On an endpoint that ROUNDS/BUCKETS the count,
+/// a slowly-growing thread can sit at the same bucket for several turns and trip
+/// this — but the substitution below is `estimate.max(reported)`, so it can only
+/// ever make compaction fire EARLIER, never suppress one (it cannot reintroduce
+/// the #854 cycle); the worst case on such an endpoint is a marginally-early
+/// compaction. The substitute estimator inherits the runtime's chars/4
+/// (~4-chars-per-token) proxy, so on pathologically token-dense content
+/// (CJK / base64 / minified) it can under-fire — still strictly better than the
+/// status quo, where compaction never fired at all. A token-dense-aware divisor
+/// for this path specifically would be a separate refinement if under-firing
+/// surfaces on real workloads.
+const STALE_PROMPT_TOKENS_TURNS: u32 = 3;
+
+/// (#854) Update the consecutive-frozen-turns counter for the endpoint's
+/// reported prompt-token count. Incremented when `current` equals the previous
+/// turn's value (frozen); reset to 0 on any change — growth is healthy, and a
+/// drop is the legitimate post-compaction shrink. Pure, for testability.
+fn update_frozen_prompt_turns(prev: Option<u32>, current: u32, frozen: u32) -> u32 {
+    match prev {
+        Some(p) if current == p => frozen.saturating_add(1),
+        _ => 0,
+    }
+}
+
 /// (#414 PR A) Nudge text injected as a system message when the loop
 /// recovers from a length-finish stall. Names BOTH valid next moves
 /// (tool call OR final answer) so the model has explicit alternatives
@@ -234,6 +269,12 @@ pub fn run(
     let mut total_completion_tokens: u32 = 0;
     let mut compactions: u32 = 0;
     let mut latest_prompt_tokens: u32 = 0;
+    // (#854) Endpoint stale-token detection state. `prev_prompt_tokens` is the
+    // prior turn's reported count; `frozen_prompt_turns` counts consecutive
+    // turns it hasn't changed. When it sticks (the count can't gate compaction),
+    // the loop substitutes a local size estimate for the compaction decision.
+    let mut prev_prompt_tokens: Option<u32> = None;
+    let mut frozen_prompt_turns: u32 = 0;
     // (#414 PR A) Per-dispatch budget for intra-turn stall recoveries.
     // Each occurrence of `finish_reason=length` with empty content +
     // no tool_calls (the classic Beat 47 / Run 1 runaway-reasoning
@@ -519,6 +560,17 @@ pub fn run(
             total_prompt_tokens = total_prompt_tokens.saturating_add(usage.prompt_tokens);
             total_completion_tokens =
                 total_completion_tokens.saturating_add(usage.completion_tokens);
+            // (#854) Track endpoint staleness BEFORE overwriting the running
+            // value: a count identical to last turn (while the thread grew)
+            // means the endpoint froze it. Deliberately inside the `Some(usage)`
+            // arm: a usage-less turn (e.g. streaming without include_usage) is
+            // BRIDGED — it neither increments nor resets the counter, so it
+            // can't corrupt the run of identical reports. Don't "fix" this into
+            // an unconditional reset; that would zero the counter on every
+            // usage-less turn and defeat the detector.
+            frozen_prompt_turns =
+                update_frozen_prompt_turns(prev_prompt_tokens, usage.prompt_tokens, frozen_prompt_turns);
+            prev_prompt_tokens = Some(usage.prompt_tokens);
             latest_prompt_tokens = usage.prompt_tokens;
             // (#557 Slice-3) Per-turn context-window occupancy sawtooth.
             // Emitted ONCE per turn, only when a real `usage` was seen
@@ -833,13 +885,47 @@ pub fn run(
                     ));
                 }
 
+                // (#854) When the endpoint's reported count is stale (frozen
+                // across turns while the thread grew), it can't gate compaction
+                // — it silently suppressed it into a degenerate cycle. Substitute
+                // a local chars/4 size estimate as the EFFECTIVE occupancy and
+                // let the SAME threshold decide: this changes nothing in normal
+                // operation (frozen=0 → effective == reported), and even when
+                // stale it only compacts if real occupancy actually warrants it
+                // (no needless compaction if the conversation genuinely
+                // plateaued). The endpoint misreport is surfaced regardless.
+                let effective_prompt_tokens = if frozen_prompt_turns >= STALE_PROMPT_TOKENS_TURNS {
+                    let (sys_chars, prompt_chars) = measure_request_context(&messages);
+                    let estimate = ((sys_chars + prompt_chars) / 4) as u32;
+                    // Emit the eureka signal once, at the staleness crossing,
+                    // so a stuck-but-low count doesn't spam the trajectory.
+                    if frozen_prompt_turns == STALE_PROMPT_TOKENS_TURNS {
+                        eprintln!(
+                            "darkmux-runtime: the endpoint's context token count has been frozen \
+                             at {latest_prompt_tokens} for {frozen_prompt_turns} turns while the \
+                             message thread grew — substituting a local estimate ({estimate}) for \
+                             the compaction decision (the reported count can't gate it). (#854)"
+                        );
+                        trajectory.append_stale_context_tokens(
+                            turns,
+                            latest_prompt_tokens,
+                            frozen_prompt_turns,
+                            estimate,
+                            messages.len(),
+                        );
+                    }
+                    estimate.max(latest_prompt_tokens)
+                } else {
+                    latest_prompt_tokens
+                };
+
                 // Phase 6: check whether the most recent prompt's
                 // token count crossed the compaction threshold, AND
                 // whether the conversation is long enough to compact.
                 // If so, compact BEFORE the next chat() call so the
                 // next request sees a smaller message thread.
                 if compaction::needs_compaction(
-                    latest_prompt_tokens,
+                    effective_prompt_tokens,
                     messages.len(),
                     compaction_cfg,
                 ) {
@@ -916,7 +1002,14 @@ pub fn run(
                     // same helper the dispatch.start event uses and divide
                     // by 4. The EXACT post-compaction count lands on the
                     // next turn's `dispatch.context` `used`.
-                    let tokens_before = latest_prompt_tokens;
+                    // (#854) `effective_prompt_tokens` == reported in normal
+                    // operation, and the local estimate when the endpoint count
+                    // was stale — so the event's before-size reflects occupancy
+                    // rather than a frozen value. Note: in the stale case the
+                    // estimate is measured AFTER this turn's pushes, so it's the
+                    // NEXT prompt's occupancy (one turn ahead of what the frozen
+                    // reported metric described), not a restatement of it.
+                    let tokens_before = effective_prompt_tokens;
                     let (sys_chars, prompt_chars) = measure_request_context(&messages);
                     let tokens_after = ((sys_chars + prompt_chars) / 4) as u32;
                     trajectory.append_compaction(
@@ -927,6 +1020,11 @@ pub fn run(
                         tokens_before,
                         tokens_after,
                     );
+                    // (#854) The thread just shrank, so the next report should
+                    // move again — restart staleness tracking so a fresh freeze
+                    // is detected cleanly and this episode isn't re-flagged.
+                    frozen_prompt_turns = 0;
+                    prev_prompt_tokens = None;
 
                     // (#457 Step 3) Post-compaction feedback nudge.
                     // The model's working state was just compressed
@@ -1424,6 +1522,42 @@ mod tests {
             verify_criteria: None,
             sprint_id: None,
         }
+    }
+
+    // ─── #854: endpoint stale-token detection ──────────────────────
+
+    #[test]
+    fn frozen_prompt_turns_increments_only_on_identical_count() {
+        // First observation seeds the baseline — never "frozen".
+        assert_eq!(update_frozen_prompt_turns(None, 1000, 0), 0);
+        // Growth (healthy conversation) resets to 0.
+        assert_eq!(update_frozen_prompt_turns(Some(1000), 1200, 0), 0);
+        assert_eq!(update_frozen_prompt_turns(Some(1000), 1200, 5), 0);
+        // A drop (legitimate post-compaction shrink) resets to 0.
+        assert_eq!(update_frozen_prompt_turns(Some(1200), 600, 5), 0);
+        // Identical to last turn = frozen → increment.
+        assert_eq!(update_frozen_prompt_turns(Some(48109), 48109, 0), 1);
+        assert_eq!(update_frozen_prompt_turns(Some(48109), 48109, 2), 3);
+    }
+
+    #[test]
+    fn frozen_prompt_turns_crosses_stale_threshold_after_repeated_freeze() {
+        // Replays the #854 shape: a count stuck at the same value across turns.
+        // Threshold is reached once the counter hits STALE_PROMPT_TOKENS_TURNS.
+        let frozen = 48109u32;
+        let mut count = 0u32;
+        let mut prev = Some(frozen);
+        // Simulate consecutive turns reporting the identical frozen value.
+        for _ in 0..STALE_PROMPT_TOKENS_TURNS {
+            count = update_frozen_prompt_turns(prev, frozen, count);
+            prev = Some(frozen);
+        }
+        assert!(
+            count >= STALE_PROMPT_TOKENS_TURNS,
+            "expected staleness after {STALE_PROMPT_TOKENS_TURNS} identical reports, got {count}"
+        );
+        // A single fresh (growing) report clears it immediately.
+        assert_eq!(update_frozen_prompt_turns(prev, frozen + 1, count), 0);
     }
 
     #[test]
@@ -2899,6 +3033,113 @@ mod tests {
                 compactor_mock.hits()
             );
         }
+    }
+
+    /// (#854) Regression-lock for the load-bearing path: a `usage.prompt_tokens`
+    /// frozen BELOW the threshold (the endpoint-misreport signature) must still
+    /// drive a compaction via the local-estimate substitution, and surface
+    /// exactly one `dispatch.context.stale_tokens` event. WITHOUT the fix, the
+    /// reported count never crosses the threshold and compaction never fires —
+    /// the degenerate cycle. Mirrors `loop_triggers_compaction_when_threshold_
+    /// crossed`, but the reported count is STUCK under the threshold while the
+    /// seeded thread is large enough that the chars/4 estimate clears it.
+    #[test]
+    fn stale_frozen_prompt_tokens_forces_compaction_and_fires_event_once() {
+        let cfg = compaction::CompactionConfig {
+            threshold_tokens: 5000,
+            compactor_model: "test-compactor".to_string(),
+            threshold_ratio: None,
+            context_window: None,
+            strategy: compaction::CompactionStrategy::Narrative,
+            bail_after_compactions: None,
+            custom_instructions: None,
+        };
+
+        let server = MockServer::start();
+        // Primary: EVERY call reports prompt_tokens FROZEN at 4000 — below the
+        // 5000 threshold, so the reported count never trips needs_compaction
+        // (the #854 endpoint-misreport). Same read call each turn keeps the
+        // mock simple; the cycle detector may also fire — harmless here.
+        let _primary = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("\"model\":\"test-primary\"");
+            then.status(200).json_body(chat_response_json(
+                None,
+                Some(serde_json::json!([{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "arguments": "{\"path\":\"/workspace/x.txt\",\"offset\":1,\"limit\":0}",
+                    },
+                }])),
+                "tool_calls",
+                4000, // FROZEN, below the 5000 threshold
+                50,
+            ));
+        });
+        let compactor_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("\"model\":\"test-compactor\"");
+            then.status(200).json_body(chat_response_json(
+                Some("Summary: assistant read a file."),
+                None,
+                "stop",
+                500,
+                30,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("stale-compaction").tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path()).unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+
+        // Seed a LARGE middle so the chars/4 estimate exceeds the 5000-token
+        // threshold once the reported count is judged stale. The big padding
+        // sits between PRESERVE_HEAD (first 2) and PRESERVE_TAIL (last 4), in
+        // the compactable region. ~24K chars / 4 ≈ 6000 > 5000.
+        let big = "x".repeat(8000);
+        let mut initial = vec![Message::system("test system"), Message::user("seed")];
+        for i in 0..3 {
+            initial.push(Message::user(format!("padding {i} {big}")));
+            initial.push(Message::assistant(format!("ack {i}")));
+        }
+        let tools = [Tool::Read];
+
+        // max_turns=6 bounds it to a SINGLE stale episode: the frozen counter
+        // climbs 0→1→2→3 across turns 1-4, fires + compacts + resets at turn 4,
+        // and the two remaining turns can't reach 3 again.
+        let _outcome = run(&client, "test-primary", initial, &tools, &mut traj, false, &cfg, Some(6), None, std::collections::BTreeMap::new());
+
+        // (1) The fix fired a compaction even though the reported count never
+        // crossed the threshold — the #854 regression-lock.
+        assert!(
+            compactor_mock.hits() >= 1,
+            "frozen-below-threshold prompt_tokens did NOT drive a compaction \
+             (the #854 bug); compactor hits={}",
+            compactor_mock.hits()
+        );
+
+        // (2) Exactly one stale_tokens eureka event for the single episode.
+        let traj_file = tmp.path().join(".darkmux-runtime").join("trajectory.jsonl");
+        let raw = std::fs::read_to_string(&traj_file).expect("trajectory file must exist");
+        let stale_events: Vec<_> = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["type"] == "dispatch.context.stale_tokens")
+            .collect();
+        assert_eq!(
+            stale_events.len(),
+            1,
+            "expected exactly one dispatch.context.stale_tokens event for one \
+             stale episode, got {}",
+            stale_events.len()
+        );
+        assert_eq!(stale_events[0]["frozen_value"], 4000);
+        assert!(stale_events[0]["estimate"].as_u64().unwrap() >= 5000);
     }
 
     /// (#377) When `bail_after_compactions = N` is set and N
