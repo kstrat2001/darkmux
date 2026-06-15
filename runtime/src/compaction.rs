@@ -944,11 +944,12 @@ pub fn default_slot_caps_v0_1() -> std::collections::BTreeMap<String, u32> {
 /// path (`objective`, `current_truth.active_files`, etc.); the
 /// default set is provided by `default_slot_caps_v0_1`.
 ///
-/// Truncation is byte-prefix (not char-aware) for simplicity; #354
-/// commits soft-cap-in-chars semantics so we accept the rare
-/// truncate-mid-codepoint edge for v0.1 simplicity. Future iteration
-/// can use `char_indices()` if multi-byte slot content becomes a real
-/// problem.
+/// Truncation is a byte-prefix soft cap (full char-aware cap semantics are
+/// tracked in #354). The cap is measured in bytes, but truncation is clamped
+/// DOWN to the nearest char boundary: `String::truncate` PANICS if the cut
+/// index splits a multibyte codepoint (#873), and slot content is the
+/// compactor model's output — routinely multibyte (CJK / emoji / accents). So
+/// the effective cut is `<= max` bytes, never mid-codepoint.
 ///
 /// Slots without a defined cap are left untouched — operators who
 /// haven't tuned them get the compactor's full output.
@@ -959,7 +960,13 @@ pub fn apply_slot_caps(
 ) {
     fn cap(value: &mut String, max: usize) {
         if value.len() > max {
-            value.truncate(max);
+            // (#873) Clamp the byte cap down to a char boundary — truncating
+            // mid-codepoint panics, and slot content can be multibyte.
+            let mut b = max;
+            while b > 0 && !value.is_char_boundary(b) {
+                b -= 1;
+            }
+            value.truncate(b);
         }
     }
     fn cap_opt(value: &mut Option<String>, max: usize) {
@@ -1442,6 +1449,18 @@ mod tests {
         apply_slot_caps(&mut out, &test_caps());
         assert_eq!(out.objective.len(), 10);
         assert_eq!(out.objective, "This is a ");
+    }
+
+    #[test]
+    fn apply_caps_truncates_multibyte_objective_at_char_boundary_without_panic() {
+        // (#873) A 10-byte cap landing mid-codepoint must clamp DOWN to a char
+        // boundary, never panic. "🎉" is 4 bytes; "🎉🎉🎉" = 12 bytes, so a cap
+        // of 10 lands inside the 3rd emoji — pre-#873 `String::truncate(10)`
+        // panicked. Post-fix it floors to byte 8 (after the 2nd emoji).
+        let mut out = output_for_cap_tests("🎉🎉🎉 done", None, None);
+        apply_slot_caps(&mut out, &test_caps());
+        assert!(out.objective.len() <= 10, "must respect the byte cap");
+        assert_eq!(out.objective, "🎉🎉", "cut at the largest char boundary <= 10");
     }
 
     #[test]
