@@ -11,6 +11,65 @@ their own cadence (see `CLAUDE.md`). Semver stability begins at 1.0.
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-06-15
+
+The stability + security hardening release. A multi-agent code review swept the
+whole codebase; this release lands the remediation — closing a path-traversal
+write primitive, an audit-record loss gap, a config-precedence bypass, and two
+runtime panics — alongside dispatch-boundary hardening and richer CLI output.
+
+### Added
+- **Colorized dispatch/lab telemetry + tabular CLI verbs (#776).** Run and lab
+  telemetry render in color, and the tabular verbs align cleanly for at-a-glance
+  reading.
+- **`mission ship` is commit-identity-aware (#834).** It honors
+  `conventions.json` `commit_author` and enforces a separation-of-duties guard.
+- **Dispatch-boundary hardening.** Queue-originated `WorkJob.image` is validated
+  at the queue boundary (#838) and `WorkJob.workdir` is base-restricted under
+  `~/.darkmux/worktrees` (#840); the dispatch `docker run` invocation is hardened
+  (#839).
+
+### Fixed
+- **Path traversal from untrusted model output (#867).** Model-supplied
+  `mission.id` / `sprint.id` are validated with `fleet::validate_identifier`
+  before any path construction, closing a constrained arbitrary-`.json`-write
+  primitive in `mission propose`.
+- **Audit-record silent loss (#877).** A dropped `AuditFileSink` write now leaves
+  a durable breadcrumb in the local sink and `doctor` surfaces the dropped-write
+  count, instead of a record vanishing under the best-effort `TeeSink`.
+- **Config-precedence bypass (#875).** Production `DARKMUX_*` reads
+  (`redis.stream`/`maxlen`, `audit.dir`/`enabled`, `default_role`, CORS origins)
+  now route through `config_access`, so `config.json`-only operators get their
+  settings honored.
+- **Runtime panic on multibyte input (#873).** The compaction slot cap clamps to
+  a char boundary before truncating, so a non-ASCII objective no longer panics
+  `apply_slot_caps`.
+- **Lab harness panic on non-ASCII (#869).** `detect_claim_verify_mismatch`
+  builds its excerpt in a consistent index space, so a non-ASCII window around a
+  matched claim phrase no longer panics after the dispatch ran.
+- **`requires_fixture` honesty (#871).** The matcher is documented as literal
+  `name@version` and loudly rejects semver operators that would silently never
+  match.
+- **Stale `prompt_tokens` (#854).** A stale token count is detected and a local
+  estimate substituted for the compaction trigger, fixing a suppressed
+  compaction + phantom context drop.
+- **`mission ship` from inside a worktree (#844, #846).** Post-merge
+  sprint-complete + teardown no longer silently drift when run from the worktree
+  layout; the viewer counts `session.end` as a dispatch terminal (#856).
+- **Config tier no longer leaks into tests (#811).** Test builds neutralize the
+  config tier by construction, so test flow records never reach the operator's
+  real Redis stream and default-assertion tests don't flake on a populated
+  `config.json`.
+
+### Documentation
+- Research-grounded `ROADMAP.md` with themed post-1.0 milestones (M4 loop-depth
+  lead) and verified per-theme citations (#850, #853).
+- Orchestrator-first getting-started, post-1.0 framing, screenshot refresh, and
+  an em-dash cleanup pass across the public docs (#858, #859, #860, #861, #862,
+  #863).
+
+[1.2.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.2.0
+
 ## [1.1.0] - 2026-06-14
 
 The work-level observability release: missions become a first-class lens —
