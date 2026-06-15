@@ -2239,9 +2239,10 @@ not-valid-json
         let final_msg = "I refactored the auth module to use the new pepper config. \
                          All tests pass. The diff is ~200 lines.";
         let mm = detect_claim_verify_mismatch(final_msg, Some(&verify_failed())).unwrap();
-        assert!(mm.claim_excerpt.contains("All tests pass"));
+        // (#869) The excerpt is built from the lowercased copy now (forensic).
+        assert!(mm.claim_excerpt.contains("all tests pass"));
         // Excerpt should include surrounding context, not just the bare match.
-        assert!(mm.claim_excerpt.len() > "All tests pass".len());
+        assert!(mm.claim_excerpt.len() > "all tests pass".len());
     }
 
     #[test]
