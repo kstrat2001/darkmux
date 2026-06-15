@@ -541,9 +541,12 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn redis_stream_default_when_unset() {
+        // (#811) Neutralize the config tier so the operator's real config.json
+        // (which may set redis.stream) can't beat the built-in default here.
+        force_empty_config_for_test();
         let prev = std::env::var("DARKMUX_REDIS_STREAM").ok();
         unsafe { std::env::remove_var("DARKMUX_REDIS_STREAM"); }
-        // With no env and (in CI) no config.json, the built-in default holds.
+        // With no env and an empty config, the built-in default holds.
         assert_eq!(redis_stream(), "darkmux:flow");
         if let Some(v) = prev { unsafe { std::env::set_var("DARKMUX_REDIS_STREAM", v); } }
     }
@@ -583,9 +586,12 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn flows_dir_default_when_unset() {
+        // (#811) Neutralize the config tier (dirs.flows may be set on the
+        // operator's machine) so the built-in default is what's asserted.
+        force_empty_config_for_test();
         let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
         unsafe { std::env::remove_var("DARKMUX_FLOWS_DIR"); }
-        // No env, and (in CI) no config.json → ends in a `flows` dir (the
+        // No env, and an empty config → ends in a `flows` dir (the
         // ~/.darkmux/flows default, or the /tmp fallback if HOME is absent).
         assert!(flows_dir().ends_with("flows"), "resolves to a flows dir");
         if let Some(v) = prev { unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", v); } }
@@ -684,13 +690,16 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn notebook_dir_env_is_tilde_expanded_then_default() {
+        // (#811) Neutralize the config tier so the `<root>/notebook` default is
+        // asserted, not the operator's real dirs.notebook (e.g. an iCloud path).
+        force_empty_config_for_test();
         let prev = std::env::var("DARKMUX_NOTEBOOK_DIR").ok();
         // The notebook env value IS tilde-expanded (the documented iCloud-path
         // ergonomics) — unlike the other dir accessors, whose env is raw.
         unsafe { std::env::set_var("DARKMUX_NOTEBOOK_DIR", "~/nb"); }
         assert_eq!(notebook_dir(), dirs::home_dir().expect("home").join("nb"));
         unsafe { std::env::remove_var("DARKMUX_NOTEBOOK_DIR"); }
-        // No env/config → the `<root>/notebook` derived default.
+        // No env, empty config → the `<root>/notebook` derived default.
         assert!(notebook_dir().ends_with("notebook"));
         if let Some(v) = prev { unsafe { std::env::set_var("DARKMUX_NOTEBOOK_DIR", v); } }
     }
