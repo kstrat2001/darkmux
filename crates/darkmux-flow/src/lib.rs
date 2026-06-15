@@ -456,6 +456,36 @@ pub struct RedisSink {
 /// peer is genuinely offline."
 const REDIS_DISABLE_THRESHOLD: u32 = 3;
 
+/// (#798) Extra XADD attempts after the first, on a transient Redis write
+/// failure, BEFORE the record is swallowed. A momentary blip (the report's
+/// "blip to the Studio-hosted Redis") otherwise leaves the record in
+/// LocalFileSink but never in Redis — a permanent file/Redis divergence that
+/// makes the fleet-aggregated savings view silently undercount. One retry
+/// catches the common single-blip; a SUSTAINED outage still trips
+/// `REDIS_DISABLE_THRESHOLD` quickly (each `write` counts as one failure
+/// regardless of internal retries), so the added latency stays bounded.
+const REDIS_WRITE_RETRIES: usize = 1;
+/// Base backoff between Redis write retries (#798); escalates per attempt.
+const REDIS_WRITE_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// (#798) Run `op` up to `1 + retries` times, returning `Ok` on the first
+/// success or the last `Err`, with an escalating backoff between attempts.
+/// Pure + testable — the retry spine for `RedisSink::write`.
+fn retry_n(
+    retries: usize,
+    backoff_base: std::time::Duration,
+    mut op: impl FnMut() -> Result<()>,
+) -> Result<()> {
+    let mut last = op();
+    let mut attempt = 0usize;
+    while last.is_err() && attempt < retries {
+        std::thread::sleep(backoff_base * (attempt as u32 + 1));
+        attempt += 1;
+        last = op();
+    }
+    last
+}
+
 /// Hard cap on the wall-clock spent connecting + handshaking to Redis
 /// from any `RedisSink` or sink-diagnostic probe (#278). The OS default
 /// TCP-connect + handshake budget is platform-dependent and on macOS
@@ -646,7 +676,12 @@ impl FlowSink for RedisSink {
         if self.is_disabled() {
             return Ok(());
         }
-        match self.try_write(record) {
+        // (#798) Retry a transient write failure a bounded number of times
+        // before swallowing — a momentary blip otherwise drops the record from
+        // Redis while it persists in LocalFileSink (fleet views undercount).
+        // try_write opens a fresh connection each attempt, so a retry
+        // re-establishes after a connection reset.
+        match retry_n(REDIS_WRITE_RETRIES, REDIS_WRITE_RETRY_BACKOFF, || self.try_write(record)) {
             Ok(()) => {
                 self.note_success();
                 Ok(())
@@ -656,7 +691,8 @@ impl FlowSink for RedisSink {
                 // threshold (note_failure), but never propagate to the
                 // TeeSink — that's what produced the per-write spam this
                 // fixes. Redis is the coordination substrate, not the
-                // durable record.
+                // durable record. Counts as ONE failure regardless of the
+                // internal retries, so the disable threshold still trips fast.
                 self.note_failure(&e);
                 Ok(())
             }
@@ -2921,6 +2957,38 @@ mod tests {
                 None => std::env::remove_var("DARKMUX_REDIS_URL"),
             }
         }
+    }
+
+    #[test]
+    fn retry_n_recovers_on_a_transient_failure() {
+        // (#798) The single-blip case the retry exists for: fail once, succeed
+        // on the retry. Zero backoff so the test doesn't sleep.
+        use std::cell::Cell;
+        let attempts = Cell::new(0);
+        let r = retry_n(2, std::time::Duration::from_millis(0), || {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() < 2 {
+                Err(anyhow::anyhow!("transient blip"))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(r.is_ok(), "should recover on the 2nd attempt");
+        assert_eq!(attempts.get(), 2);
+    }
+
+    #[test]
+    fn retry_n_exhausts_then_returns_last_err() {
+        // A sustained failure exhausts `1 + retries` attempts and surfaces the
+        // last error (the caller then swallows + counts ONE failure).
+        use std::cell::Cell;
+        let attempts = Cell::new(0);
+        let r = retry_n(2, std::time::Duration::from_millis(0), || {
+            attempts.set(attempts.get() + 1);
+            Err::<(), _>(anyhow::anyhow!("down"))
+        });
+        assert!(r.is_err());
+        assert_eq!(attempts.get(), 3, "1 initial + 2 retries");
     }
 
     #[test]
