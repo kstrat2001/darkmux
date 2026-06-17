@@ -1638,25 +1638,47 @@ fn read_flow_records_from_redis(
     Ok(records)
 }
 
-/// Parse `<flows_dir>/<date>.jsonl` into a Vec of JSON values. Missing
-/// file = empty Vec (not an error).
+/// The most records `GET /flow/:date` returns from the local day-file —
+/// the newest `MAX_FLOW_FILE_RECORDS`, matching the Redis path's
+/// `XREVRANGE … COUNT 10000` cap (#900). The file path previously read the
+/// WHOLE file into memory + parsed every line into a `Vec`, so a large
+/// day-file under concurrent requests could OOM the daemon (the Redis path
+/// was already bounded; the snapshot path wasn't).
+const MAX_FLOW_FILE_RECORDS: usize = 10_000;
+
+/// Parse `<flows_dir>/<date>.jsonl` into a Vec of JSON values, keeping only
+/// the newest `MAX_FLOW_FILE_RECORDS` (chronological order preserved).
+/// Missing file = empty Vec (not an error).
+///
+/// (#900) Streams the file line-by-line and holds a bounded ring of parsed
+/// records, so transient memory is ~one line + the cap regardless of the
+/// day-file's size — instead of an unbounded `tokio::fs::read` + full-DOM
+/// parse. Mirrors the Redis path's newest-first `COUNT 10000` semantics.
 async fn read_flow_records_from_file(
     date: &str,
     flows_dir: &std::path::Path,
 ) -> Vec<serde_json::Value> {
+    use tokio::io::AsyncBufReadExt;
     let path = flows_dir.join(format!("{date}.jsonl"));
-    let bytes = match tokio::fs::read(&path).await {
-        Ok(b) => b,
-        Err(_) => return Vec::new(),
+    let file = match tokio::fs::File::open(&path).await {
+        Ok(f) => f,
+        Err(_) => return Vec::new(), // missing file = empty (not an error)
     };
-    let text = match std::str::from_utf8(&bytes) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    text.lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .collect()
+    let mut lines = tokio::io::BufReader::new(file).lines();
+    let mut ring: std::collections::VecDeque<serde_json::Value> =
+        std::collections::VecDeque::with_capacity(MAX_FLOW_FILE_RECORDS.min(1024));
+    while let Ok(Some(line)) = lines.next_line().await {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+            if ring.len() == MAX_FLOW_FILE_RECORDS {
+                ring.pop_front();
+            }
+            ring.push_back(v);
+        }
+    }
+    ring.into()
 }
 
 /// Tail a `.jsonl` file from `start_offset`, yielding each new complete
@@ -4081,6 +4103,31 @@ mod tests {
                 arr.iter().any(|r| r.get("action").and_then(|v| v.as_str()) == Some("local-only")),
                 "expected local-only record: {arr:?}"
             );
+        }
+
+        #[tokio::test]
+        async fn flow_file_read_caps_at_max_records_keeping_newest() {
+            // (#900) A day-file larger than the cap must yield only the newest
+            // MAX_FLOW_FILE_RECORDS (chronological), bounding the daemon's
+            // memory — pre-fix the whole file was read + every line parsed.
+            let today = today_utc_date();
+            let tmp = TempDir::new().unwrap();
+            let total = MAX_FLOW_FILE_RECORDS + 5;
+            let mut buf = String::with_capacity(total * 40);
+            for i in 0..total {
+                buf.push_str(&format!(r#"{{"ts":"{today}T00:00:00Z","n":{i}}}"#));
+                buf.push('\n');
+            }
+            fs::write(tmp.path().join(format!("{today}.jsonl")), buf).unwrap();
+
+            let records = read_flow_records_from_file(&today, tmp.path()).await;
+            assert_eq!(records.len(), MAX_FLOW_FILE_RECORDS, "must cap at the max");
+            // Oldest dropped, newest kept, chronological order preserved.
+            assert_eq!(
+                records.first().unwrap()["n"].as_u64().unwrap(),
+                (total - MAX_FLOW_FILE_RECORDS) as u64
+            );
+            assert_eq!(records.last().unwrap()["n"].as_u64().unwrap(), (total - 1) as u64);
         }
 
         // ─── #270 PR-B: redis_tail_lines (SSE Redis tail) ────────────────
