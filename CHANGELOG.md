@@ -3,13 +3,61 @@
 All notable user-facing changes to darkmux are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-darkmux is **pre-1.0**. Per the project's no-compat-baggage policy, breaking
-changes ship cleanly while the surface stabilizes (no deprecation shims). Roadmap
-**milestones** (`M1`/`M2`/`M3`…) are intentionally decoupled from these version
-numbers, and the `RULES_SCHEMA` / `FLOW_SCHEMA` data-shape contracts version on
-their own cadence (see `CLAUDE.md`). Semver stability begins at 1.0.
+darkmux follows semver, stable since **1.0.0**; breaking changes are called out
+explicitly in each entry (pre-1.0, the no-compat-baggage policy shipped breaks
+without deprecation shims). Roadmap **milestones** (`M1`/`M2`/`M3`…) are
+intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
+`FLOW_SCHEMA` data-shape contracts version on their own cadence (see `CLAUDE.md`).
 
 ## [Unreleased]
+
+## [1.3.0] - 2026-06-17
+
+Hardens the serve daemon and the crew index. The headline is **serve daemon
+authentication** (#881), which closes the last unauthenticated exposure when the
+daemon binds beyond loopback — alongside a fix for a daemon shutdown hang and a
+cluster of crew-index correctness repairs.
+
+### Added
+- **Serve daemon authentication (#881).** The flow daemon can require a bearer
+  token: remote reads and `/diff` are gated while loopback stays open (the local
+  viewer is unaffected), and `/health` is always exempt. The token lives in the
+  macOS Keychain (`darkmux-serve-token`) or `DARKMUX_SERVE_TOKEN` — never plaintext
+  config — and `fleet status --deep` forwards the shared token to peers. `darkmux
+  doctor` and the startup banner report the auth posture.
+- **Colorized daemon runtime output (#918).** The serve and fleet-runner runtime
+  error/warning lines now render red/yellow through the shared style module
+  (TTY- and `NO_COLOR`-gated), matching `doctor` and the startup banner.
+
+### Changed
+- **BREAKING (narrow): `darkmux serve` refuses a non-loopback `--bind` unless a
+  token is configured (#881).** The default install is unchanged — loopback bind,
+  no token, the viewer works as today. Only the previously-allowed "bind to a
+  non-loopback address with no authentication" setup is now refused (it exposed
+  flow records, machine specs, mission state, and live `git diff` to any reachable
+  peer). Set a serve token to bind beyond loopback. No action needed for default
+  or loopback users.
+
+### Fixed
+- **Serve daemon shutdown hang (#918).** The force-exit watchdog ran as a tokio
+  task that was cancelled when the runtime dropped, so a wedged background thread
+  (e.g. a Redis worker pointed at an unreachable endpoint) could hang the daemon
+  after "clean shutdown" printed. The watchdog now runs on a dedicated OS thread
+  and guarantees the process exits within the grace window.
+- **Crew index self-heals across schema changes (#914).** `darkmux role list`/`show`
+  and `crew list`/`show` rebuild the local index on demand, and a schema-drifted
+  index (e.g. the mission/sprint timestamp columns) no longer crashes the rebuild
+  or silently serves stale data. No operator action — the index auto-rebuilds.
+- **Crew index correctness cluster (#894, #891, #892).** `role show` no longer
+  errors when a hand-off target row is missing; drift detection catches content
+  edits that don't advance mtime; manifest ids strip exactly one `.json`, and
+  `load_skills` keys on the authoritative body id so a misnamed user skill
+  overrides the builtin.
+- **Activity lane brackets `session.end`-only sessions as ended (#856),** so an
+  idle machine's bar no longer stretches to the playhead; adds the first
+  viewer-lifecycle e2e regression gate.
+
+[1.3.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.3.0
 
 ## [1.2.0] - 2026-06-15
 
