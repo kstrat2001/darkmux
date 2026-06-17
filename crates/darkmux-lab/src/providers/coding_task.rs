@@ -1718,6 +1718,37 @@ not-valid-json
         );
     }
 
+    #[test]
+    fn setup_bails_when_seed_dir_is_a_symlink_outside() {
+        // (#897) A seed dir that passes the component check (plain `sandbox`)
+        // but is itself a symlink pointing OUTSIDE the workload dir must be
+        // refused by the canonicalize-and-assert-prefix guard — otherwise it
+        // pulls host content into the sandbox. Red pre-fix (no canonicalize
+        // assertion → the copy proceeded).
+        let tmp = TempDir::new().unwrap();
+        let outside = tmp.path().join("outside-seed");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), "host secret").unwrap();
+        let base = tmp.path().join("base");
+        fs::create_dir_all(&base).unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("sandbox")).unwrap();
+
+        let run_dir = tmp.path().join("run");
+        let sandbox_dir = tmp.path().join("sandbox-out");
+        let loaded = make_loaded(basic_spec(), base.clone());
+        let err = CodingTaskProvider
+            .setup(&loaded, &run_dir, &sandbox_dir)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("resolves outside the workload dir"),
+            "expected outside-workload bail, got: {err}"
+        );
+        assert!(
+            !sandbox_dir.join("secret.txt").exists(),
+            "host content must not leak into the sandbox"
+        );
+    }
+
     /// `setupContent` writes each (path → content) pair into the sandbox
     /// dir at setup() time. Lets embedded workloads ship a complete
     /// runnable scaffold without needing an external project.
