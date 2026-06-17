@@ -266,9 +266,24 @@ fn read_all_roles(dir: &std::path::Path) -> Result<Vec<(String, Role)>> {
             None => continue,
         };
         if !name.ends_with(".json") { continue; }
-        let id = name.trim_end_matches(".json").to_string();
+        // #892: strip_suffix removes exactly one ".json" — trim_end_matches
+        // would strip repeated trailing matches (`foo.json.json` -> `foo`).
+        let stem = name.strip_suffix(".json").unwrap_or(name);
         match read_json::<Role>(&path) {
-            Ok(role) => results.push((id, role)),
+            Ok(role) => {
+                // #892: the body `id` is authoritative; warn when the filename
+                // stem disagrees so a misnamed manifest doesn't surprise the
+                // operator (operator-sovereignty: surface, don't silently
+                // mishandle).
+                if role.id != stem {
+                    eprintln!(
+                        "warning: role manifest {path:?} is filed as '{stem}.json' but its id is \
+                         '{}' — the id field wins; rename the file to '{}.json' to avoid confusion",
+                        role.id, role.id
+                    );
+                }
+                results.push((role.id.clone(), role));
+            }
             Err(e) => eprintln!("warning: failed to load role {path:?}: {e}"),
         }
     }
@@ -293,7 +308,8 @@ fn read_all_json<T: serde::de::DeserializeOwned>(dir: &std::path::Path) -> Resul
             None => continue,
         };
         if !name.ends_with(".json") { continue; }
-        let id = name.trim_end_matches(".json").to_string();
+        // #892: strip exactly one ".json" suffix (see read_all_roles).
+        let id = name.strip_suffix(".json").unwrap_or(name).to_string();
         match read_json::<T>(&path) {
             Ok(val) => results.push((id, val)),
             Err(e) => eprintln!("warning: failed to load {path:?}: {e}"),
@@ -552,7 +568,20 @@ pub(crate) fn load_skills() -> Result<Vec<Skill>> {
     let user_dir = skills_dir();
     let mut map: BTreeMap<String, Skill> = read_all_json::<Skill>(&user_dir)?
         .into_iter()
-        .map(|(id, c)| (id.clone(), c))
+        .map(|(stem, skill)| {
+            // #892: key on the authoritative body id, not the filename stem,
+            // so a user skill filed under a mismatched name still overrides the
+            // builtin of the same id (keying on the stem left both lingering).
+            // Warn on the mismatch (operator-sovereignty: surface it).
+            if skill.id != stem {
+                eprintln!(
+                    "warning: skill manifest '{stem}.json' has id '{}' — the id field wins; \
+                     rename the file to '{}.json' to avoid confusion",
+                    skill.id, skill.id
+                );
+            }
+            (skill.id.clone(), skill)
+        })
         .collect();
 
     for (id, json) in BUILTIN_SKILLS {
@@ -1404,5 +1433,39 @@ mod load_per_mission_tests {
         let msg_b = format!("{err_b}");
         assert!(msg_b.contains("internal regression"), "flags not operator-actionable: {msg_b}");
         assert!(msg_b.contains("file an issue"), "points to the repair path: {msg_b}");
+    }
+
+    #[test]
+    #[serial]
+    fn load_skills_user_override_keys_on_body_id_not_filename() {
+        // #892: load_skills keyed the dedup map on the filename stem, so a user
+        // skill filed under a name != its body id failed to override the
+        // builtin of the same id (both lingered). Keying on the body id fixes
+        // the override. Goes red pre-fix (two 'coding' skills survive).
+        let guard = TestCrewRoot::new();
+        let skills_dir = guard.path().join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        // A user override for the builtin "coding" skill, filed under a
+        // mismatched filename.
+        std::fs::write(
+            skills_dir.join("wrong-name.json"),
+            r#"{"id":"coding","description":"USER OVERRIDE","keywords":[]}"#,
+        )
+        .unwrap();
+
+        let coding: Vec<_> = load_skills()
+            .unwrap()
+            .into_iter()
+            .filter(|s| s.id == "coding")
+            .collect();
+        assert_eq!(
+            coding.len(),
+            1,
+            "exactly one 'coding' skill — the user file must override the builtin by body id"
+        );
+        assert_eq!(
+            coding[0].description, "USER OVERRIDE",
+            "the user manifest must win the override"
+        );
     }
 }

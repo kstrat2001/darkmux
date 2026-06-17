@@ -409,7 +409,9 @@ fn enumerate_user_files(dir: &Path) -> Result<Vec<(PathBuf, String, Vec<u8>)>> {
         if !name.ends_with(".json") {
             continue;
         }
-        let id = name.trim_end_matches(".json").to_string();
+        // #892: strip exactly one ".json" suffix (trim_end_matches would strip
+        // repeated trailing matches).
+        let id = name.strip_suffix(".json").unwrap_or(name).to_string();
         let bytes = fs::read(&path)
             .with_context(|| format!("reading {}", path.display()))?;
         out.push((path, id, bytes));
@@ -720,13 +722,16 @@ fn status_at(path: &Path) -> Result<StatusReport> {
                 None => {
                     report.added.push(((*kind).to_string(), path_str));
                 }
-                Some((_recorded_kind, recorded_mtime, recorded_hash)) => {
-                    let cur_mtime = file_mtime(&path).unwrap_or(0);
-                    if cur_mtime != *recorded_mtime {
-                        let cur_hash = content_hash_hex(&bytes);
-                        if &cur_hash != recorded_hash {
-                            report.modified.push(((*kind).to_string(), path_str));
-                        }
+                Some((_recorded_kind, _recorded_mtime, recorded_hash)) => {
+                    // #891: compare the content hash UNCONDITIONALLY. An edit
+                    // that doesn't advance mtime (a same-second write, or an
+                    // mtime-preserving copy/restore) still changed the file,
+                    // and the hash — not mtime — is the source of truth for
+                    // "modified". Gating the hash check behind a mtime change
+                    // silently missed those edits.
+                    let cur_hash = content_hash_hex(&bytes);
+                    if &cur_hash != recorded_hash {
+                        report.modified.push(((*kind).to_string(), path_str));
                     }
                 }
             }
@@ -1584,5 +1589,40 @@ mod tests {
             .unwrap();
         assert_eq!(kw, fts, "FTS mirror must match skill_keywords 1:1 after repeated rebuilds");
         assert!(kw > 0, "builtin skills declare keywords — otherwise this guard is vacuous");
+    }
+
+    /// (#891) Drift detection must flag a content edit even when mtime did not
+    /// advance. We simulate "content changed, mtime unchanged" by staling only
+    /// the recorded `content_hash` (the recorded mtime still matches disk),
+    /// then assert `status_at` reports the role as modified.
+    #[serial_test::serial]
+    #[test]
+    fn drift_detects_content_edit_without_mtime_change() {
+        let guard = CrewDirGuard::new();
+        write_role(
+            guard.path(),
+            "drifter",
+            "v1 description",
+            &[],
+            "bail-with-explanation",
+            None,
+        );
+        let idx = guard.path().join("index.db");
+        rebuild_at(&idx).unwrap();
+
+        {
+            let conn = open_index(&idx).unwrap();
+            conn.execute(
+                "UPDATE source_files SET content_hash = 'stale-hash' WHERE kind = 'role'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let report = status_at(&idx).unwrap();
+        assert!(
+            report.modified.iter().any(|(kind, _)| kind == "role"),
+            "status must flag the role modified when the content hash differs, regardless of mtime"
+        );
     }
 }
