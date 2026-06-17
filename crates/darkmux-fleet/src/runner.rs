@@ -103,7 +103,12 @@ fn runner_main() {
                 handle_claimed_job(&client, claimed);
             }
             Err(e) => {
-                eprintln!("darkmux-runner: claim_job failed ({e}); backing off 1s");
+                eprintln!(
+                    "{}",
+                    darkmux_types::style::warn(&format!(
+                        "darkmux-runner: claim_job failed ({e}); backing off 1s"
+                    ))
+                );
                 std::thread::sleep(Duration::from_secs(1));
             }
         }

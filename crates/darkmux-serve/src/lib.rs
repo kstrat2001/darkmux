@@ -720,7 +720,10 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf) -> Result<()> {
             std::thread::spawn(|| {
                 std::thread::sleep(Duration::from_secs(SHUTDOWN_GRACE_SECS));
                 eprintln!(
-                    "darkmux serve: force exit (a background thread blocked clean teardown past the grace window)"
+                    "{}",
+                    darkmux_types::style::warn(
+                        "darkmux serve: force exit (a background thread blocked clean teardown past the grace window)"
+                    )
                 );
                 std::process::exit(0);
             });
@@ -1846,9 +1849,12 @@ fn redis_tail_lines(
                                 // matters more than log noise. Rate-limit
                                 // is a future hardening if it surfaces.
                                 eprintln!(
-                                    "darkmux serve: SSE channel full ({SSE_MPSC_CAPACITY}); \
-                                     dropping newest record on stream `{stream_name}` \
-                                     (total dropped: {dropped_records})"
+                                    "{}",
+                                    darkmux_types::style::warn(&format!(
+                                        "darkmux serve: SSE channel full ({SSE_MPSC_CAPACITY}); \
+                                         dropping newest record on stream `{stream_name}` \
+                                         (total dropped: {dropped_records})"
+                                    ))
                                 );
                             }
                             SendOutcome::Closed => {
@@ -1861,9 +1867,12 @@ fn redis_tail_lines(
                 Ok(Err(e)) => {
                     consecutive_failures += 1;
                     eprintln!(
-                        "darkmux serve: XREAD on {stream_name} failed ({e}); \
-                         backing off 500ms (attempt {consecutive_failures}/{MAX})",
-                        MAX = MAX_CONSECUTIVE_XREAD_FAILURES
+                        "{}",
+                        darkmux_types::style::warn(&format!(
+                            "darkmux serve: XREAD on {stream_name} failed ({e}); \
+                             backing off 500ms (attempt {consecutive_failures}/{MAX})",
+                            MAX = MAX_CONSECUTIVE_XREAD_FAILURES
+                        ))
                     );
                     if consecutive_failures >= MAX_CONSECUTIVE_XREAD_FAILURES {
                         let synthetic = synthetic_stream_error_record(
@@ -1880,9 +1889,12 @@ fn redis_tail_lines(
                         // surfaced via #294 review)
                         if let Err(e) = tx.try_send(synthetic) {
                             eprintln!(
-                                "darkmux serve: stream-error synthetic not delivered \
-                                 on stream `{stream_name}` ({e}); SSE consumer will see \
-                                 silent stream close instead of explicit terminal record"
+                                "{}",
+                                darkmux_types::style::error(&format!(
+                                    "darkmux serve: stream-error synthetic not delivered \
+                                     on stream `{stream_name}` ({e}); SSE consumer will see \
+                                     silent stream close instead of explicit terminal record"
+                                ))
                             );
                         }
                         return;
@@ -1892,9 +1904,12 @@ fn redis_tail_lines(
                 Err(e) => {
                     consecutive_failures += 1;
                     eprintln!(
-                        "darkmux serve: XREAD blocking task join error ({e}); \
-                         backing off 500ms (attempt {consecutive_failures}/{MAX})",
-                        MAX = MAX_CONSECUTIVE_XREAD_FAILURES
+                        "{}",
+                        darkmux_types::style::warn(&format!(
+                            "darkmux serve: XREAD blocking task join error ({e}); \
+                             backing off 500ms (attempt {consecutive_failures}/{MAX})",
+                            MAX = MAX_CONSECUTIVE_XREAD_FAILURES
+                        ))
                     );
                     if consecutive_failures >= MAX_CONSECUTIVE_XREAD_FAILURES {
                         let synthetic = synthetic_stream_error_record(
@@ -1911,9 +1926,12 @@ fn redis_tail_lines(
                         // surfaced via #294 review)
                         if let Err(e) = tx.try_send(synthetic) {
                             eprintln!(
-                                "darkmux serve: stream-error synthetic not delivered \
-                                 on stream `{stream_name}` ({e}); SSE consumer will see \
-                                 silent stream close instead of explicit terminal record"
+                                "{}",
+                                darkmux_types::style::error(&format!(
+                                    "darkmux serve: stream-error synthetic not delivered \
+                                     on stream `{stream_name}` ({e}); SSE consumer will see \
+                                     silent stream close instead of explicit terminal record"
+                                ))
                             );
                         }
                         return;
