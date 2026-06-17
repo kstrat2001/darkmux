@@ -1,4 +1,4 @@
-use crate::index::{default_index_path, open_index};
+use crate::index::{default_index_path, ensure_fresh_index, open_index};
 use anyhow::{Result, bail};
 use rusqlite::{params, OptionalExtension};
 use std::path::Path;
@@ -16,12 +16,8 @@ pub fn crew_show(crew_id: &str) -> Result<i32> {
 /// Internal entry for `crew list` taking an explicit index path. Tests use
 /// this to avoid querying the live `~/.darkmux/index.db`.
 pub(crate) fn crew_list_at(path: &Path) -> Result<i32> {
-    if !path.exists() {
-        bail!(
-            "no index at {} — run `darkmux crew index rebuild` first",
-            path.display()
-        );
-    }
+    // Derived index: build it on demand if missing or stale (#914).
+    ensure_fresh_index(path)?;
 
     let conn = open_index(path)?;
 
@@ -74,12 +70,8 @@ pub(crate) fn crew_list_at(path: &Path) -> Result<i32> {
 
 /// Internal entry for `crew show` taking an explicit index path.
 pub(crate) fn crew_show_at(path: &Path, crew_id: &str) -> Result<i32> {
-    if !path.exists() {
-        bail!(
-            "no index at {} — run `darkmux crew index rebuild` first",
-            path.display()
-        );
-    }
+    // Build the derived index on demand if missing or stale (#914).
+    ensure_fresh_index(path)?;
 
     let conn = open_index(path)?;
 
@@ -100,7 +92,8 @@ pub(crate) fn crew_show_at(path: &Path, crew_id: &str) -> Result<i32> {
         Some(r) => r,
         None => {
             bail!(
-                "crew '{}' not found in index — run `darkmux crew index rebuild` if it was added recently",
+                "crew '{}' not found — no manifest under the crew root defines it \
+                 (the index was just rebuilt from the manifests on disk)",
                 crew_id
             );
         }
@@ -343,12 +336,19 @@ mod tests {
         assert!(err.to_string().contains("not found"));
     }
 
+    #[serial_test::serial]
     #[test]
-    fn crew_show_errors_when_index_missing() {
-        let nonexistent = PathBuf::from("/tmp/darkmux-crew-cli-missing-index-test.db");
-        let _ = std::fs::remove_file(&nonexistent);
-        let result = crew_show_at(&nonexistent, "any");
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("no index at"));
+    fn crew_list_lazy_rebuilds_when_index_missing() {
+        // #914: the read-verb builds the derived index on demand rather than
+        // bailing with "run `crew index rebuild` first".
+        let guard = CrewDirGuard::new();
+        write_role(guard.path(), "r1", "role one", &[], "bail-with-explanation");
+        write_crew(guard.path(), "c1", "crew one", &[("r1", "lead")]);
+        let idx = index_path(guard.path());
+        assert!(!idx.exists(), "precondition: no index built yet");
+
+        let result = crew_list_at(&idx);
+        assert!(result.is_ok(), "crew_list_at should lazily rebuild: {:?}", result);
+        assert!(idx.exists(), "index must have been built on demand");
     }
 }

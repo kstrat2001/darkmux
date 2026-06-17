@@ -67,15 +67,20 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Bumped to 2 in refactor 0 (`capability` → `skill` rename, #448). The
-/// migration block at the top of [`init_schema`] drops the old
-/// `capabilities`, `role_capabilities`, `capability_keywords`,
-/// `capability_keywords_fts` artifacts when an existing user DB is at
-/// version < 2. `rebuild()` then repopulates from manifests under
-/// `templates/builtin/skills/` (and operator overrides under
-/// `<crew_root>/skills/`). No data is lost — skill definitions are
-/// derived from on-disk manifests, not stored canonical state.
-const SCHEMA_VERSION: i32 = 2;
+/// Bumped to 2 in refactor 0 (`capability` → `skill` rename, #448); to 3
+/// for the #95 mission/sprint transition-timestamp columns (#914). Two
+/// independent mechanisms in [`init_schema`] keep an on-disk DB current:
+/// (1) the `< 2` migration block drops the legacy `capabilities` /
+/// `role_capabilities` / `capability_keywords` / `capability_keywords_fts`
+/// artifacts; (2) every rebuild drops + recreates the derived
+/// `REBUILD_TABLES` so a column added to the DDL (e.g. the #95 timestamps)
+/// lands even on a pre-existing DB — a plain `CREATE TABLE IF NOT EXISTS`
+/// cannot evolve an existing table's columns. Bumping this constant also
+/// gives the read path a staleness signal (see [`ensure_fresh_index`]).
+/// Allocator tables + `meta_kv` are NOT derived and are preserved across
+/// rebuilds. No data is lost — every dropped table is rebuilt from the
+/// on-disk manifests.
+const SCHEMA_VERSION: i32 = 3;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS source_files (
@@ -348,6 +353,26 @@ fn init_schema(conn: &Connection) -> Result<()> {
         .context("dropping pre-rename legacy tables (refactor 0, #448)")?;
     }
 
+    // Self-heal derived-table schema drift (#914): drop + recreate every
+    // derived table on each rebuild so a column added to the DDL (e.g. the
+    // #95 mission/sprint timestamp columns) lands even on a pre-existing DB —
+    // the `CREATE TABLE IF NOT EXISTS` in SCHEMA_SQL below cannot add columns
+    // to a table that already exists. Dropping `skill_keywords` also drops
+    // its three FTS-sync triggers, which SCHEMA_SQL then recreates; the FTS
+    // mirror itself is cleared + refilled by `populate`. FKs are toggled off
+    // for the drop so order is immaterial (FK-cascading re-INSERT happens in
+    // `populate`). Allocator tables + `meta_kv` are NOT in REBUILD_TABLES and
+    // carry non-derived runtime state, so they are deliberately preserved.
+    let mut drop_sql = String::from("PRAGMA foreign_keys = OFF;\n");
+    for tbl in REBUILD_TABLES {
+        drop_sql.push_str("DROP TABLE IF EXISTS ");
+        drop_sql.push_str(tbl);
+        drop_sql.push_str(";\n");
+    }
+    drop_sql.push_str("PRAGMA foreign_keys = ON;\n");
+    conn.execute_batch(&drop_sql)
+        .context("dropping derived tables for a clean rebuild (#914)")?;
+
     conn.execute_batch(SCHEMA_SQL)
         .context("applying index schema")?;
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))
@@ -572,13 +597,51 @@ pub fn rebuild_at(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Rebuild the index from manifests on disk. DELETE+INSERT into all
-/// derived tables in a single transaction; idempotent.
+/// Rebuild the index from manifests on disk. `init_schema` drops + recreates
+/// the derived tables, then `populate` refills them — idempotent, and
+/// self-healing across schema drift (#914).
 pub fn rebuild() -> Result<()> {
     let path = default_index_path();
     rebuild_at(&path)?;
     println!("crew index rebuilt at {}", path.display());
     Ok(())
+}
+
+/// Ensure the derived index at `path` exists and matches the current
+/// `SCHEMA_VERSION`, rebuilding from manifests if it is missing, stale, or
+/// unreadable. The index is derived state (the JSON manifests under the crew
+/// root are the source of truth), so an on-demand rebuild is always safe and
+/// recoverable — this is what lets the `role` / `crew` read-verbs work
+/// without a manual `darkmux crew index rebuild`. (#914)
+pub fn ensure_fresh_index(path: &Path) -> Result<()> {
+    let fresh = path.exists() && populated_schema_version(path) == Some(SCHEMA_VERSION);
+    if !fresh {
+        rebuild_at(path)?;
+    }
+    Ok(())
+}
+
+/// Read the schema version recorded by the last *successful* `populate` — the
+/// `meta_kv.schema_version` row, which is written inside populate's
+/// transaction — or `None` if it's absent/unreadable. This is deliberately
+/// NOT `PRAGMA user_version`: `init_schema` bumps `user_version` *before*
+/// `populate` runs, so a rebuild whose populate failed (rolling back to empty
+/// derived tables) would still report the current `user_version` and the lazy
+/// read path would trust it as fresh — re-arming the silent-stale failure
+/// #914 exists to eliminate. `meta_kv.schema_version` only advances when the
+/// refill actually commits, so a failed populate correctly reads as stale and
+/// is rebuilt on the next access. `None` (absent table/row, unreadable DB) is
+/// treated as stale by callers. (#914)
+fn populated_schema_version(path: &Path) -> Option<i32> {
+    let conn = Connection::open(path).ok()?;
+    let raw: String = conn
+        .query_row(
+            "SELECT value FROM meta_kv WHERE key = 'schema_version'",
+            [],
+            |r| r.get(0),
+        )
+        .ok()?;
+    raw.parse::<i32>().ok()
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -1241,5 +1304,285 @@ mod tests {
             .unwrap()
             .is_some();
         assert!(skills_exists);
+    }
+
+    /// (#914) A pre-#95 index whose `missions` table predates the
+    /// `started_ts`/`closed_ts`/`paused_ts` columns. Pre-fix, the
+    /// `CREATE TABLE IF NOT EXISTS` in SCHEMA_SQL skipped the existing table
+    /// (so a `populate` INSERT with `started_ts` crashed, or rolled back to
+    /// stale data). The self-healing drop+recreate in `init_schema` must
+    /// rebuild the table with the current columns.
+    #[serial_test::serial]
+    #[test]
+    fn rebuild_heals_stale_table_missing_a_column() {
+        let tmp = TempDir::new().unwrap();
+        let idx = tmp.path().join("stale.db");
+        {
+            let conn = Connection::open(&idx).unwrap();
+            conn.execute_batch(
+                "PRAGMA user_version = 2;
+                 CREATE TABLE missions (
+                     id          TEXT PRIMARY KEY,
+                     description TEXT NOT NULL,
+                     status      TEXT NOT NULL,
+                     created_ts  INTEGER NOT NULL
+                 );
+                 INSERT INTO missions (id, description, status, created_ts)
+                   VALUES ('legacy', 'seed', 'active', 0);",
+            )
+            .unwrap();
+        }
+
+        // Pre-fix this errored with `table missions has no column named
+        // started_ts`; post-fix the table is dropped + recreated fresh.
+        rebuild_at(&idx).unwrap();
+
+        let conn = open_index(&idx).unwrap();
+        let has_started_ts: Option<()> = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('missions') WHERE name = 'started_ts'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()
+            .unwrap();
+        assert!(
+            has_started_ts.is_some(),
+            "rebuild must heal the stale missions table to include the #95 columns"
+        );
+    }
+
+    /// (#914, CONSIDER-1) A DB whose structural `user_version` is current but
+    /// whose `populate` never committed (no `meta_kv.schema_version` row) —
+    /// the state a rebuild leaves behind when `init_schema` succeeds but
+    /// `populate` rolls back. `ensure_fresh_index` must treat it as stale and
+    /// rebuild, NOT trust the header version and serve empty derived tables.
+    #[serial_test::serial]
+    #[test]
+    fn ensure_fresh_rebuilds_when_populate_signal_absent() {
+        let tmp = TempDir::new().unwrap();
+        let idx = tmp.path().join("half.db");
+        {
+            // Header stamped current; no committed populate → no meta_kv row.
+            let conn = Connection::open(&idx).unwrap();
+            conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))
+                .unwrap();
+        }
+
+        ensure_fresh_index(&idx).unwrap();
+
+        // Post-condition: populate committed → meta_kv records the version and
+        // the derived tables are filled from the builtin manifests.
+        let conn = open_index(&idx).unwrap();
+        let recorded: String = conn
+            .query_row(
+                "SELECT value FROM meta_kv WHERE key = 'schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(recorded, SCHEMA_VERSION.to_string());
+        let role_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM roles", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            role_count > 0,
+            "ensure_fresh_index must rebuild from builtin manifests, not trust the stale header"
+        );
+    }
+
+    fn write_mission_with_started_ts(crew_root: &std::path::Path, id: &str) {
+        let dir = crew_root.join("missions").join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mission = serde_json::json!({
+            "id": id,
+            "description": "mission carrying a started_ts",
+            "sprint_ids": [],
+            "created_ts": 1_700_000_000u64,
+            "started_ts": 1_700_000_100u64,
+        });
+        std::fs::write(
+            dir.join("mission.json"),
+            serde_json::to_string_pretty(&mission).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn column_names(conn: &Connection, table: &str) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT name FROM pragma_table_info('{table}') ORDER BY name"
+            ))
+            .unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .unwrap()
+    }
+
+    /// (#914, CONSIDER-2 — recurrence guard) Pins the column set of every
+    /// rebuild-managed table to the schema version. The #914 bug was a column
+    /// added to the DDL (#95 timestamps) without a `SCHEMA_VERSION` bump,
+    /// invisible until a rebuild crashed. If you change a derived table's
+    /// columns, update this snapshot AND bump `SCHEMA_VERSION` (and weigh the
+    /// heal/migration path). A pure "remember to bump" comment is the same
+    /// discipline-as-willpower that already failed once here.
+    #[serial_test::serial]
+    #[test]
+    fn derived_table_columns_match_versioned_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let idx = tmp.path().join("snap.db");
+        rebuild_at(&idx).unwrap();
+        let conn = open_index(&idx).unwrap();
+
+        let expected: &[(&str, &[&str])] = &[
+            ("source_files", &["content_hash", "kind", "mtime", "path"]),
+            (
+                "roles",
+                &[
+                    "description",
+                    "escalation_contract_tag",
+                    "id",
+                    "prompt_path",
+                    "tool_palette_json",
+                ],
+            ),
+            ("role_escalation_targets", &["role_id", "target_role_id"]),
+            ("skills", &["description", "id"]),
+            ("role_skills", &["role_id", "skill_id"]),
+            ("skill_keywords", &["keyword", "skill_id", "weight"]),
+            ("crews", &["description", "id"]),
+            ("crew_members", &["crew_id", "position", "role_id"]),
+            (
+                "missions",
+                &[
+                    "closed_ts",
+                    "created_ts",
+                    "description",
+                    "id",
+                    "paused_ts",
+                    "started_ts",
+                    "status",
+                ],
+            ),
+            (
+                "sprints",
+                &[
+                    "abandoned_ts",
+                    "completed_ts",
+                    "created_ts",
+                    "depends_on_json",
+                    "description",
+                    "id",
+                    "mission_id",
+                    "started_ts",
+                    "status",
+                ],
+            ),
+        ];
+
+        for (table, cols) in expected {
+            let actual = column_names(&conn, table);
+            let want: Vec<String> = cols.iter().map(|s| s.to_string()).collect();
+            assert_eq!(
+                actual, want,
+                "column-set drift in `{table}` — update this snapshot AND bump SCHEMA_VERSION (#914 CONSIDER-2)"
+            );
+        }
+    }
+
+    /// (#914) The literal crash path: a pre-#95 `missions` table plus a
+    /// mission manifest carrying `started_ts`. Pre-fix, `populate`'s INSERT
+    /// errored with `table missions has no column named started_ts`; post-fix
+    /// the table is dropped + recreated, so the INSERT lands.
+    #[serial_test::serial]
+    #[test]
+    fn rebuild_heals_stale_table_then_inserts_mission_timestamps() {
+        let guard = CrewDirGuard::new();
+        write_mission_with_started_ts(guard.path(), "m1");
+        let idx = guard.path().join("index.db");
+        {
+            let conn = Connection::open(&idx).unwrap();
+            conn.execute_batch(
+                "PRAGMA user_version = 2;
+                 CREATE TABLE missions (
+                     id          TEXT PRIMARY KEY,
+                     description TEXT NOT NULL,
+                     status      TEXT NOT NULL,
+                     created_ts  INTEGER NOT NULL
+                 );",
+            )
+            .unwrap();
+        }
+
+        rebuild_at(&idx).unwrap();
+
+        let conn = open_index(&idx).unwrap();
+        let started: Option<i64> = conn
+            .query_row(
+                "SELECT started_ts FROM missions WHERE id = 'm1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(started, Some(1_700_000_100));
+    }
+
+    /// (#914) Non-derived runtime tables (allocator + meta) are NOT in
+    /// `REBUILD_TABLES` and must survive a rebuild that wipes + refills the
+    /// derived tables. Guards against a future change folding them in.
+    #[serial_test::serial]
+    #[test]
+    fn rebuild_preserves_non_derived_runtime_state() {
+        let tmp = TempDir::new().unwrap();
+        let idx = tmp.path().join("preserve.db");
+        rebuild_at(&idx).unwrap();
+        {
+            let conn = open_index(&idx).unwrap();
+            conn.execute(
+                "INSERT INTO unmatched_terms (term, count, last_seen) VALUES ('keepme', 7, 123)",
+                [],
+            )
+            .unwrap();
+        }
+
+        // A second rebuild drops + recreates the derived tables.
+        rebuild_at(&idx).unwrap();
+
+        let conn = open_index(&idx).unwrap();
+        let surviving: i64 = conn
+            .query_row(
+                "SELECT count FROM unmatched_terms WHERE term = 'keepme'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(surviving, 7, "non-derived runtime state must survive a rebuild");
+        let role_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM roles", [], |r| r.get(0))
+            .unwrap();
+        assert!(role_count > 0, "derived tables should be refilled from manifests");
+    }
+
+    /// (#914) `skill_keywords` is dropped + recreated each rebuild but the FTS
+    /// virtual mirror `skill_keywords_fts` is not — `populate` clears + refills
+    /// it. After repeated rebuilds the mirror must hold exactly one row per
+    /// `skill_keywords` row (no stale survivors, no duplicates).
+    #[serial_test::serial]
+    #[test]
+    fn fts_mirror_stays_consistent_across_repeated_rebuilds() {
+        let tmp = TempDir::new().unwrap();
+        let idx = tmp.path().join("fts.db");
+        rebuild_at(&idx).unwrap();
+        rebuild_at(&idx).unwrap();
+        let conn = open_index(&idx).unwrap();
+        let kw: i64 = conn
+            .query_row("SELECT COUNT(*) FROM skill_keywords", [], |r| r.get(0))
+            .unwrap();
+        let fts: i64 = conn
+            .query_row("SELECT COUNT(*) FROM skill_keywords_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kw, fts, "FTS mirror must match skill_keywords 1:1 after repeated rebuilds");
+        assert!(kw > 0, "builtin skills declare keywords — otherwise this guard is vacuous");
     }
 }
