@@ -699,23 +699,31 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf) -> Result<()> {
         // `watch::channel` is the right shape — both consumers wait_for
         // the same latch flip.
         let (shutdown_tx, mut shutdown_rx_axum) = tokio::sync::watch::channel(false);
-        let mut shutdown_rx_force = shutdown_tx.subscribe();
 
         tokio::spawn(async move {
             shutdown_signal().await;
             let _ = shutdown_tx.send(true);
-        });
-
-        tokio::spawn(async move {
-            let _ = shutdown_rx_force.wait_for(|&v| v).await;
             eprintln!(
                 "\ndarkmux serve: shutdown signal received, {SHUTDOWN_GRACE_SECS}s grace for in-flight connections"
             );
-            tokio::time::sleep(Duration::from_secs(SHUTDOWN_GRACE_SECS)).await;
-            eprintln!(
-                "darkmux serve: force exit (open connections — typically SSE streams to the viewer — blocked graceful drain)"
-            );
-            std::process::exit(0);
+            // (#918) Force-exit watchdog on a real OS thread, NOT a tokio task.
+            // A tokio task is cancelled the instant the runtime is dropped — and
+            // the runtime is dropped as soon as graceful drain completes — so a
+            // task-based watchdog can't guarantee exit if runtime teardown then
+            // blocks on a wedged background thread (e.g. a Redis presence /
+            // stream worker pointed at an unreachable endpoint). A std::thread
+            // outlives the runtime and guarantees the process exits within the
+            // grace window regardless of which thread is stuck. On a genuinely
+            // clean shutdown the process exits first and this thread is reaped
+            // with it, so the grace window is only ever spent when something is
+            // actually wedged.
+            std::thread::spawn(|| {
+                std::thread::sleep(Duration::from_secs(SHUTDOWN_GRACE_SECS));
+                eprintln!(
+                    "darkmux serve: force exit (a background thread blocked clean teardown past the grace window)"
+                );
+                std::process::exit(0);
+            });
         });
 
         let axum_shutdown = async move {
