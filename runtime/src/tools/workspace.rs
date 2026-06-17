@@ -105,7 +105,25 @@ pub fn resolve_write(input: &str, workspace_root: &Path) -> Result<PathBuf> {
         ));
     }
 
-    Ok(canonical_parent.join(filename))
+    let target = canonical_parent.join(filename);
+
+    // (#883) The parent is canonicalized + prefix-checked above, but the
+    // final component is joined raw. If it already exists as a symlink, an
+    // `fs::write` would FOLLOW it and could land outside the workspace —
+    // e.g. an agent runs `ln -s /etc/passwd /workspace/x` via Bash, then
+    // `write x`. lstat the final component (`symlink_metadata` does NOT
+    // follow) and refuse to write through an existing symlink. `resolve_read`
+    // is unaffected — it canonicalizes the full path, so a symlink target is
+    // resolved before the prefix check.
+    if let Ok(meta) = std::fs::symlink_metadata(&target) {
+        if meta.file_type().is_symlink() {
+            return Err(anyhow!(
+                "refusing to write through a symlink: {input} → {target:?}"
+            ));
+        }
+    }
+
+    Ok(target)
 }
 
 #[cfg(test)]
@@ -275,6 +293,29 @@ mod tests {
         );
 
         let _ = fs::remove_dir(&outside_dir);
+    }
+
+    #[test]
+    fn write_rejects_symlink_at_final_component() {
+        // (#883) The FINAL write component is itself a symlink pointing
+        // outside the workspace. Unlike the parent-segment case above, the
+        // parent (`ws`) is inside the workspace and passes the prefix check —
+        // only an lstat on the final component catches it. Pre-fix this
+        // returned Ok and `fs::write` would have followed the link and
+        // clobbered the outside file.
+        let ws = fresh_workspace();
+        let outside = ws.path().parent().unwrap().join("final-link-target.txt");
+        fs::write(&outside, b"host secret").unwrap();
+        let link = ws.path().join("leak");
+        symlink(&outside, &link).unwrap();
+
+        let err = resolve_write("leak", ws.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected symlink refusal, got: {err}"
+        );
+
+        let _ = fs::remove_file(&outside);
     }
 
     #[test]
