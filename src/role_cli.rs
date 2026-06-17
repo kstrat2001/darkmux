@@ -1,4 +1,4 @@
-use crate::crew::index::{default_index_path, open_index};
+use crate::crew::index::{default_index_path, ensure_fresh_index, open_index};
 use anyhow::{Context, Result, bail};
 use rusqlite::{params, OptionalExtension};
 use std::path::Path;
@@ -16,12 +16,9 @@ pub fn role_show(role_id: &str) -> Result<i32> {
 /// Internal entry for `role list` taking an explicit index path. Tests use
 /// this to avoid querying the live `~/.darkmux/index.db`.
 pub(crate) fn role_list_at(path: &Path) -> Result<i32> {
-    if !path.exists() {
-        bail!(
-            "no index at {} — run `darkmux crew index rebuild` first",
-            path.display()
-        );
-    }
+    // Derived index: build it on demand if missing or stale (#914) so the
+    // verb just works — no manual `darkmux crew index rebuild`.
+    ensure_fresh_index(path)?;
 
     let conn = open_index(path)?;
 
@@ -83,12 +80,8 @@ pub(crate) fn role_list_at(path: &Path) -> Result<i32> {
 
 /// Internal entry for `role show` taking an explicit index path.
 pub(crate) fn role_show_at(path: &Path, role_id: &str) -> Result<i32> {
-    if !path.exists() {
-        bail!(
-            "no index at {} — run `darkmux crew index rebuild` first",
-            path.display()
-        );
-    }
+    // Build the derived index on demand if missing or stale (#914).
+    ensure_fresh_index(path)?;
 
     let conn = open_index(path)?;
 
@@ -111,7 +104,8 @@ pub(crate) fn role_show_at(path: &Path, role_id: &str) -> Result<i32> {
         Some(r) => r,
         None => {
             bail!(
-                "role '{}' not found in index — run `darkmux crew index rebuild` if it was added recently",
+                "role '{}' not found — no manifest under the crew root defines it \
+                 (the index was just rebuilt from the manifests on disk)",
                 role_id
             );
         }
@@ -192,7 +186,6 @@ mod tests {
     use super::*;
     use crate::crew::index::rebuild_at;
     use std::env;
-    use std::path::PathBuf;
     use tempfile::TempDir;
 
     struct CrewDirGuard {
@@ -326,21 +319,53 @@ mod tests {
         assert_eq!(stored, Some("coder".to_string()));
     }
 
+    #[serial_test::serial]
     #[test]
-    fn role_list_errors_when_index_missing() {
-        let nonexistent = PathBuf::from("/tmp/darkmux-role-cli-missing-index-test.db");
-        let _ = std::fs::remove_file(&nonexistent);
-        let result = role_list_at(&nonexistent);
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("no index at"));
+    fn role_list_lazy_rebuilds_when_index_missing() {
+        // #914: the read-verb must build the derived index on demand instead
+        // of bailing with "run `crew index rebuild` first".
+        let guard = CrewDirGuard::new();
+        write_role(guard.path(), "lazy", "a lazily-indexed role", &["coding"], "bail-with-explanation", None);
+        let idx = index_path(guard.path());
+        assert!(!idx.exists(), "precondition: no index built yet");
+
+        let result = role_list_at(&idx);
+        assert!(result.is_ok(), "role_list_at should lazily rebuild: {:?}", result);
+        assert!(idx.exists(), "index must have been built on demand");
     }
 
+    #[serial_test::serial]
     #[test]
-    fn role_show_errors_when_index_missing() {
-        let nonexistent = PathBuf::from("/tmp/darkmux-role-cli-missing-index-test2.db");
-        let _ = std::fs::remove_file(&nonexistent);
-        let result = role_show_at(&nonexistent, "any");
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("no index at"));
+    fn role_show_lazy_rebuilds_when_index_missing() {
+        let guard = CrewDirGuard::new();
+        write_role(guard.path(), "shown", "shown role", &["coding"], "retry-with-hint", None);
+        let idx = index_path(guard.path());
+        assert!(!idx.exists());
+
+        let result = role_show_at(&idx, "shown");
+        assert!(result.is_ok(), "role_show_at should lazily rebuild + find the role: {:?}", result);
+        assert!(idx.exists());
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn role_skills_are_populated_on_rebuild() {
+        // #914 regression: a partial/aborted rebuild left `role_skills` empty
+        // so every role rendered `skills: 0`. The prior tests only asserted
+        // `is_ok()`, never the skill *content* — this closes that gap.
+        let guard = CrewDirGuard::new();
+        write_role(guard.path(), "skilled", "has a declared skill", &["coding"], "bail-with-explanation", None);
+        let idx = index_path(guard.path());
+        rebuild_at(&idx).unwrap();
+
+        let conn = open_index(&idx).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM role_skills WHERE role_id = 'skilled'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "the role's declared skill must land in role_skills");
     }
 }

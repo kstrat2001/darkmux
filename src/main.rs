@@ -471,9 +471,9 @@ enum CrewCmd {
         dry_run: bool,
     },
     /// SQLite-backed derived index over crew manifests (Phase B of #45).
-    /// **Scaffold only** — `rebuild`/`status` return "not yet implemented".
-    /// See `src/crew/index.rs` for the synthesized schema design awaiting
-    /// implementation.
+    /// The index is derived state — JSON manifests under the crew root are
+    /// the source of truth — and the `role`/`crew` read-verbs rebuild it on
+    /// demand, so an explicit `rebuild` is rarely needed.
     Index {
         #[command(subcommand)]
         sub: CrewIndexCmd,
@@ -482,10 +482,11 @@ enum CrewCmd {
 
 #[derive(Subcommand)]
 enum CrewIndexCmd {
-    /// Rebuild the index from manifests on disk. (Not yet implemented.)
+    /// Rebuild the index from manifests on disk. Drops + recreates the
+    /// derived tables, then repopulates — idempotent and self-healing across
+    /// schema changes.
     Rebuild,
     /// Report index status: last-rebuild timestamp, source counts, drift.
-    /// (Not yet implemented.)
     Status,
 }
 
