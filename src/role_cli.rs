@@ -170,12 +170,20 @@ pub(crate) fn role_show_at(path: &Path, role_id: &str) -> Result<i32> {
 
     println!("escalation: {}", escalation_tag);
     if escalation_tag == "hand-off-to" {
-        let target: String = conn.query_row(
-            "SELECT target_role_id FROM role_escalation_targets WHERE role_id = ?1",
-            params![role_id],
-            |r| r.get(0),
-        )?;
-        println!("  target: {}", target);
+        // #894: a `hand-off-to` role should have a target row, but the index
+        // could be inconsistent. Use `.optional()` so a missing row surfaces
+        // as a clear note rather than a raw `QueryReturnedNoRows` error.
+        let target: Option<String> = conn
+            .query_row(
+                "SELECT target_role_id FROM role_escalation_targets WHERE role_id = ?1",
+                params![role_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match target {
+            Some(t) => println!("  target: {}", t),
+            None => println!("  target: (unresolved: no target recorded for this role)"),
+        }
     }
 
     Ok(0)
@@ -367,5 +375,39 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1, "the role's declared skill must land in role_skills");
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn role_show_handoff_without_target_row_does_not_crash() {
+        // #894: a hand-off-to role whose target row is absent (an inconsistent
+        // index) must not crash role_show with a raw QueryReturnedNoRows.
+        let guard = CrewDirGuard::new();
+        write_role(
+            guard.path(),
+            "supervisor",
+            "routes work",
+            &[],
+            "hand-off-to",
+            Some("coder"),
+        );
+        let idx = index_path(guard.path());
+        rebuild_at(&idx).unwrap();
+        // Simulate an inconsistent index: drop the recorded target row.
+        {
+            let conn = open_index(&idx).unwrap();
+            conn.execute(
+                "DELETE FROM role_escalation_targets WHERE role_id = 'supervisor'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let result = role_show_at(&idx, "supervisor");
+        assert!(
+            result.is_ok(),
+            "role_show must not crash when the target row is missing: {:?}",
+            result
+        );
     }
 }
