@@ -43,10 +43,29 @@ impl WorkloadProvider for CodingTaskProvider {
         //    via `sandboxSeed`). Embedded workloads can't use this
         //    because include_str! only handles individual files.
         if let Some(seed_rel) = manifest_seed_path(loaded) {
+            // (#897) The seed path comes from the (operator-installed,
+            // untrusted) manifest. Reject absolute / `..` / root components
+            // the same way setupContent keys are, then — after joining —
+            // canonicalize and assert the resolved path stays under base_dir,
+            // so a seed dir that is itself a symlink pointing outside can't
+            // pull host content into the agent-visible sandbox.
+            reject_escaping_relpath(&seed_rel, "sandboxSeed")?;
             let seed_path = loaded.base_dir.join(&seed_rel);
             if seed_path.exists() {
-                copy_dir_recursive(&seed_path, sandbox_dir)
-                    .with_context(|| format!("seeding sandbox from {}", seed_path.display()))?;
+                let base_canon = loaded.base_dir.canonicalize().with_context(|| {
+                    format!("resolving workload dir {}", loaded.base_dir.display())
+                })?;
+                let seed_canon = seed_path.canonicalize().with_context(|| {
+                    format!("resolving sandboxSeed path {}", seed_path.display())
+                })?;
+                if !seed_canon.starts_with(&base_canon) {
+                    bail!(
+                        "sandboxSeed `{seed_rel}` resolves outside the workload dir → {}",
+                        seed_canon.display()
+                    );
+                }
+                copy_dir_recursive(&seed_canon, sandbox_dir)
+                    .with_context(|| format!("seeding sandbox from {}", seed_canon.display()))?;
             }
         }
 
@@ -700,24 +719,33 @@ fn role_can_modify_files(palette: &darkmux_crew::types::ToolPalette) -> bool {
 /// the consumer rather than at install. The cost is tiny and the
 /// invariant is much stronger.
 fn validate_setup_content_key(key: &str) -> Result<()> {
-    if key.is_empty() {
-        bail!("setupContent key is empty");
+    reject_escaping_relpath(key, "setupContent key")
+}
+
+/// Reject a relative path that would escape the sandbox dir — absolute
+/// paths, `..` traversal, or a root/prefix component. Shared by
+/// `validate_setup_content_key` and the `sandboxSeed` check (#897) so the
+/// same trust boundary is enforced identically in both places — one place
+/// to audit the escape rule.
+fn reject_escaping_relpath(raw: &str, label: &str) -> Result<()> {
+    if raw.is_empty() {
+        bail!("{label} is empty");
     }
-    let path = Path::new(key);
+    let path = Path::new(raw);
     if path.is_absolute() {
         bail!(
-            "setupContent key `{key}` is an absolute path; only relative paths under the sandbox are allowed"
+            "{label} `{raw}` is an absolute path; only relative paths under the sandbox are allowed"
         );
     }
     for component in path.components() {
         use std::path::Component;
         match component {
             Component::Normal(_) | Component::CurDir => continue,
-            Component::ParentDir => bail!(
-                "setupContent key `{key}` contains `..` — would escape the sandbox"
-            ),
+            Component::ParentDir => {
+                bail!("{label} `{raw}` contains `..` — would escape the sandbox")
+            }
             Component::Prefix(_) | Component::RootDir => bail!(
-                "setupContent key `{key}` contains a root/prefix component — only relative paths under the sandbox are allowed"
+                "{label} `{raw}` contains a root/prefix component — only relative paths under the sandbox are allowed"
             ),
         }
     }
@@ -1259,9 +1287,18 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     }
     for entry in fs::read_dir(src)? {
         let entry = entry?;
+        // (#897) No-follow: `file_type()` comes from the directory entry
+        // (lstat-like), so a symlink reports `is_symlink()` rather than its
+        // target's type. SKIP symlinks — copying or recreating a seed symlink
+        // (→ /etc, ~/.ssh, …) would pull host content into the agent-visible
+        // sandbox. Only real files/dirs are seeded.
+        let ft = entry.file_type()?;
+        if ft.is_symlink() {
+            continue;
+        }
         let s = entry.path();
         let d = dst.join(entry.file_name());
-        if s.is_dir() {
+        if ft.is_dir() {
             copy_dir_recursive(&s, &d)?;
         } else {
             fs::copy(&s, &d)?;
@@ -1539,6 +1576,43 @@ mod tests {
     }
 
     #[test]
+    fn copy_dir_recursive_skips_symlinks() {
+        // (#897) A symlink in the seed tree must NOT be copied/followed —
+        // otherwise a seed symlink → host content (/etc, ~/.ssh) would land
+        // in the agent-visible sandbox. Pre-fix `fs::copy` followed the link
+        // and copied the host file's content as a regular file.
+        let tmp = TempDir::new().unwrap();
+        let outside = tmp.path().join("host-secret.txt");
+        fs::write(&outside, "host secret").unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("real.txt"), "real").unwrap();
+        std::os::unix::fs::symlink(&outside, src.join("leak.txt")).unwrap();
+
+        copy_dir_recursive(&src, &dst).unwrap();
+
+        assert_eq!(fs::read_to_string(dst.join("real.txt")).unwrap(), "real");
+        assert!(
+            !dst.join("leak.txt").exists(),
+            "symlink must be skipped, not copied/followed into the sandbox"
+        );
+    }
+
+    #[test]
+    fn reject_escaping_relpath_blocks_seed_traversal() {
+        // (#897) The sandboxSeed path runs through the same escape check as
+        // setupContent keys, with a seed-specific label.
+        assert!(reject_escaping_relpath("sandbox", "sandboxSeed").is_ok());
+        assert!(reject_escaping_relpath("sub/dir", "sandboxSeed").is_ok());
+        let dotdot = reject_escaping_relpath("../../etc", "sandboxSeed").unwrap_err();
+        assert!(dotdot.to_string().contains("escape the sandbox"), "got: {dotdot}");
+        assert!(dotdot.to_string().contains("sandboxSeed"), "label should appear: {dotdot}");
+        let abs = reject_escaping_relpath("/etc/passwd", "sandboxSeed").unwrap_err();
+        assert!(abs.to_string().contains("absolute"), "got: {abs}");
+    }
+
+    #[test]
     fn read_jsonl_skips_blanks_and_malformed() {
         let tmp = TempDir::new().unwrap();
         let p = tmp.path().join("trace.jsonl");
@@ -1641,6 +1715,37 @@ not-valid-json
         assert_eq!(
             fs::read_to_string(sandbox_dir.join("foo.txt")).unwrap(),
             "seeded"
+        );
+    }
+
+    #[test]
+    fn setup_bails_when_seed_dir_is_a_symlink_outside() {
+        // (#897) A seed dir that passes the component check (plain `sandbox`)
+        // but is itself a symlink pointing OUTSIDE the workload dir must be
+        // refused by the canonicalize-and-assert-prefix guard — otherwise it
+        // pulls host content into the sandbox. Red pre-fix (no canonicalize
+        // assertion → the copy proceeded).
+        let tmp = TempDir::new().unwrap();
+        let outside = tmp.path().join("outside-seed");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), "host secret").unwrap();
+        let base = tmp.path().join("base");
+        fs::create_dir_all(&base).unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("sandbox")).unwrap();
+
+        let run_dir = tmp.path().join("run");
+        let sandbox_dir = tmp.path().join("sandbox-out");
+        let loaded = make_loaded(basic_spec(), base.clone());
+        let err = CodingTaskProvider
+            .setup(&loaded, &run_dir, &sandbox_dir)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("resolves outside the workload dir"),
+            "expected outside-workload bail, got: {err}"
+        );
+        assert!(
+            !sandbox_dir.join("secret.txt").exists(),
+            "host content must not leak into the sandbox"
         );
     }
 
