@@ -280,10 +280,13 @@ pub fn dispatch_routed(opts: DispatchOpts) -> Result<DispatchResult> {
                 // Routing via queue is the only option — surface the
                 // ambiguity loudly so the operator sees what happened.
                 eprintln!(
-                    "darkmux crew dispatch: WARNING — local DARKMUX_MACHINE_ID is unresolvable. \
-                     --machine={target} routes via the queue regardless. \
-                     If you intended a local dispatch, set DARKMUX_MACHINE_ID to make \
-                     tier-routing decisions deterministic."
+                    "{}",
+                    darkmux_types::style::warn(&format!(
+                        "darkmux crew dispatch: WARNING — local DARKMUX_MACHINE_ID is unresolvable. \
+                         --machine={target} routes via the queue regardless. \
+                         If you intended a local dispatch, set DARKMUX_MACHINE_ID to make \
+                         tier-routing decisions deterministic."
+                    ))
                 );
                 // #290 — emit the pinned route record so the audit
                 // trail + topology UI see the operator-pinned routing

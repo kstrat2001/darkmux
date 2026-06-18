@@ -73,8 +73,11 @@ fn runner_main() {
             // our `.with_context` wrapper. Operator needs the full
             // chain to diagnose. (PR-C.2 review carry-over)
             eprintln!(
-                "darkmux-runner: failed to open Redis client ({url}): {e:#}. \
-                 Queue runner disabled."
+                "{}",
+                darkmux_types::style::warn(&format!(
+                    "darkmux-runner: failed to open Redis client ({url}): {e:#}. \
+                     Queue runner disabled."
+                ))
             );
             return;
         }
@@ -82,8 +85,11 @@ fn runner_main() {
 
     if let Err(e) = init_consumer_group(&client, RUNNER_CONSUMER_GROUP) {
         eprintln!(
-            "darkmux-runner: init_consumer_group on {WORK_STREAM} failed: {e:#}. \
-             Queue runner disabled."
+            "{}",
+            darkmux_types::style::warn(&format!(
+                "darkmux-runner: init_consumer_group on {WORK_STREAM} failed: {e:#}. \
+                 Queue runner disabled."
+            ))
         );
         return;
     }
@@ -134,8 +140,11 @@ fn handle_claimed_job(client: &redis::Client, claimed: ClaimedJob) {
     // hostile publisher who bypassed our publish path.
     if let Err(e) = job.validate() {
         eprintln!(
-            "darkmux-runner: REJECTED claimed job {work_id}: {e:#}. \
-             Acking to release queue lease; dispatch NOT invoked."
+            "{}",
+            darkmux_types::style::warn(&format!(
+                "darkmux-runner: REJECTED claimed job {work_id}: {e:#}. \
+                 Acking to release queue lease; dispatch NOT invoked."
+            ))
         );
         let _ = ack_job(client, RUNNER_CONSUMER_GROUP, &work_id);
         return;
@@ -162,8 +171,11 @@ fn handle_claimed_job(client: &redis::Client, claimed: ClaimedJob) {
             }
             Err(e) => {
                 eprintln!(
-                    "darkmux-runner: REJECTED claimed job {work_id}: workdir validation failed: {e:#}. \
-                     Acking to release queue lease; dispatch NOT invoked."
+                    "{}",
+                    darkmux_types::style::warn(&format!(
+                        "darkmux-runner: REJECTED claimed job {work_id}: workdir validation failed: {e:#}. \
+                         Acking to release queue lease; dispatch NOT invoked."
+                    ))
                 );
                 let _ = ack_job(client, RUNNER_CONSUMER_GROUP, &work_id);
                 return;
@@ -180,9 +192,12 @@ fn handle_claimed_job(client: &redis::Client, claimed: ClaimedJob) {
     if let Some(target) = &job.target_machine {
         if local_machine.as_deref() != Some(target.as_str()) {
             eprintln!(
-                "darkmux-runner: target_machine={target:?} doesn't match \
-                 local machine_id={local_machine:?}; proceeding (queue \
-                 already claimed; PR-E will add lease re-publish)."
+                "{}",
+                darkmux_types::style::warn(&format!(
+                    "darkmux-runner: target_machine={target:?} doesn't match \
+                     local machine_id={local_machine:?}; proceeding (queue \
+                     already claimed; PR-E will add lease re-publish)."
+                ))
             );
         }
     }
@@ -204,15 +219,18 @@ fn handle_claimed_job(client: &redis::Client, claimed: ClaimedJob) {
         }
         Err(e) => {
             eprintln!(
-                "darkmux-runner: dispatch ERROR work_id={work_id}: {e:#}. \
-                 Acking to release queue lease; dispatch.complete flow \
-                 record carries the failure detail."
+                "{}",
+                darkmux_types::style::error(&format!(
+                    "darkmux-runner: dispatch ERROR work_id={work_id}: {e:#}. \
+                     Acking to release queue lease; dispatch.complete flow \
+                     record carries the failure detail."
+                ))
             );
         }
     }
 
     if let Err(e) = ack_job(client, RUNNER_CONSUMER_GROUP, &work_id) {
-        eprintln!("darkmux-runner: XACK failed for {work_id}: {e:#}");
+        eprintln!("{}", darkmux_types::style::warn(&format!("darkmux-runner: XACK failed for {work_id}: {e:#}")));
     }
 }
 

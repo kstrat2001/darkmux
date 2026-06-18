@@ -160,9 +160,12 @@ pub fn spawn_emitter_thread() -> Option<std::thread::JoinHandle<()>> {
         Some(uid) => uid.to_string(),
         None => {
             eprintln!(
-                "presence: no stable machine UID (IOPlatformUUID unavailable); \
-                 presence disabled — this machine can't be identified, and it \
-                 won't masquerade under a name (#640)"
+                "{}",
+                darkmux_types::style::warn(
+                    "presence: no stable machine UID (IOPlatformUUID unavailable); \
+                     presence disabled — this machine can't be identified, and it \
+                     won't masquerade under a name (#640)"
+                )
             );
             return None;
         }
@@ -178,7 +181,7 @@ pub fn spawn_emitter_thread() -> Option<std::thread::JoinHandle<()>> {
             let client = match redis::Client::open(url.expose_for_probe()) {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("presence: could not open Redis client ({e}); presence disabled");
+                    eprintln!("{}", darkmux_types::style::warn(&format!("presence: could not open Redis client ({e}); presence disabled")));
                     return;
                 }
             };
@@ -213,8 +216,11 @@ pub fn spawn_emitter_thread() -> Option<std::thread::JoinHandle<()>> {
                     Err(e) => {
                         if healthy != Some(false) {
                             eprintln!(
-                                "presence: heartbeat write failing (retrying every \
-                                 {DEFAULT_BEAT_INTERVAL_SECS}s): {e}"
+                                "{}",
+                                darkmux_types::style::warn(&format!(
+                                    "presence: heartbeat write failing (retrying every \
+                                     {DEFAULT_BEAT_INTERVAL_SECS}s): {e}"
+                                ))
                             );
                             healthy = Some(false);
                         }
@@ -227,7 +233,7 @@ pub fn spawn_emitter_thread() -> Option<std::thread::JoinHandle<()>> {
     match spawned {
         Ok(handle) => Some(handle),
         Err(e) => {
-            eprintln!("presence: could not spawn emitter thread ({e}); presence disabled");
+            eprintln!("{}", darkmux_types::style::warn(&format!("presence: could not spawn emitter thread ({e}); presence disabled")));
             None
         }
     }
