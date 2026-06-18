@@ -211,7 +211,10 @@ pub fn spawn_reconciler_thread() -> Option<std::thread::JoinHandle<()>> {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!(
-                        "presence-reconciler: could not open Redis client ({e}); disabled"
+                        "{}",
+                        darkmux_types::style::warn(&format!(
+                            "presence-reconciler: could not open Redis client ({e}); disabled"
+                        ))
                     );
                     return;
                 }
@@ -239,7 +242,7 @@ pub fn spawn_reconciler_thread() -> Option<std::thread::JoinHandle<()>> {
                 match read_live(&client) {
                     Ok(beats) => {
                         if !healthy {
-                            eprintln!("presence-reconciler: read_live recovered — recording edges again");
+                            eprintln!("{}", darkmux_types::style::success("presence-reconciler: read_live recovered — recording edges again"));
                             healthy = true;
                         }
                         let now_machines: HashMap<String, PresenceBeat> = beats
@@ -306,8 +309,11 @@ pub fn spawn_reconciler_thread() -> Option<std::thread::JoinHandle<()>> {
                         // stall is operator-visible (it isn't otherwise).
                         if healthy {
                             eprintln!(
-                                "presence-reconciler: read_live failing (close-edges \
-                                 paused, retrying every {RECONCILE_INTERVAL_SECS}s): {e}"
+                                "{}",
+                                darkmux_types::style::warn(&format!(
+                                    "presence-reconciler: read_live failing (close-edges \
+                                     paused, retrying every {RECONCILE_INTERVAL_SECS}s): {e}"
+                                ))
                             );
                             healthy = false;
                         }
@@ -320,7 +326,7 @@ pub fn spawn_reconciler_thread() -> Option<std::thread::JoinHandle<()>> {
     match spawned {
         Ok(handle) => Some(handle),
         Err(e) => {
-            eprintln!("presence-reconciler: could not spawn thread ({e}); disabled");
+            eprintln!("{}", darkmux_types::style::warn(&format!("presence-reconciler: could not spawn thread ({e}); disabled")));
             None
         }
     }
