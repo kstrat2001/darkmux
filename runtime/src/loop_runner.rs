@@ -938,15 +938,13 @@ pub fn run(
                     // success the parsed output is persisted to
                     // `<RUNTIME_OUT_BASE>/.darkmux-runtime/compaction-<gen>.json`
                     // per #352 Step 5 "persistence falls out for free."
-                    match compaction_cfg.strategy {
-                        compaction::CompactionStrategy::Narrative => {
-                            compaction::compact(
-                                client,
-                                &mut messages,
-                                compactions,
-                                compaction_cfg,
-                            )?;
-                        }
+                    let summary_chars = match compaction_cfg.strategy {
+                        compaction::CompactionStrategy::Narrative => compaction::compact(
+                            client,
+                            &mut messages,
+                            compactions,
+                            compaction_cfg,
+                        )?,
                         compaction::CompactionStrategy::StructuredSlot => {
                             // (#439) Build budget snapshot so the
                             // compacted SYSTEM message can surface
@@ -964,7 +962,7 @@ pub fn run(
                                 max_cumulative_completion_tokens: max_cumulative_tokens,
                                 max_tokens_per_call: MAX_TOKENS_PER_CALL,
                             };
-                            let parsed = compaction::structured_compact(
+                            let (parsed, summary_chars) = compaction::structured_compact(
                                 client,
                                 &mut messages,
                                 compactions,
@@ -982,17 +980,13 @@ pub fn run(
                                 compactions,
                                 &parsed,
                             );
+                            summary_chars
                         }
-                    }
+                    };
                     let after_count = messages.len();
-                    // Approximate summary_chars from the inserted
-                    // synthetic message at PRESERVE_HEAD position
-                    // (works for both Narrative=user + StructuredSlot=system).
-                    let summary_chars = messages
-                        .get(2)
-                        .and_then(|m| m.content.as_ref())
-                        .map(|c| c.len())
-                        .unwrap_or(0);
+                    // (#885) summary_chars now comes directly from the
+                    // compaction fn — the inserted summary's true length —
+                    // rather than guessing it from a fixed `messages` index.
                     // (#557 Slice-3) Token occupancy across the compaction
                     // drop. `tokens_before` is the EXACT prompt-token count
                     // that triggered this compaction (the prior turn's
