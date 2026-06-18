@@ -2430,7 +2430,9 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
             // so it must not write without explicit confirmation. Default
             // (no flags) = preview the diff + bail with a re-run hint;
             // `--dry-run` = explicit preview (exit 0); `--yes` = apply.
-            // Mirrors `mission migrate`'s preview-then-confirm gate.
+            // Follows `mission migrate`'s preview-then-confirm pattern, with a
+            // non-zero exit when changes are pending so the unwritten state is
+            // unmissable in scripts.
             let write = yes && !dry_run;
             let opts = crew::dispatch::SyncOpts { dry_run: !write };
             let result = crew::dispatch::sync(opts)?;

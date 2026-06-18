@@ -1115,4 +1115,20 @@ fn crew_sync_refuses_to_write_without_yes() {
         fs::read_to_string(&oc).unwrap().contains("darkmux/"),
         "--yes should have written agents to openclaw.json"
     );
+
+    // `--dry-run` previews and exits 0 without writing (even with pending).
+    let oc2 = tmp.path().join("openclaw2.json");
+    fs::write(&oc2, r#"{"agents":{"list":[]}}"#).unwrap();
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_OPENCLAW_CONFIG", &oc2)
+        .env("DARKMUX_CREW_DIR", &crew_dir)
+        .args(["crew", "sync", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[DRY RUN]"));
+    assert!(
+        !fs::read_to_string(&oc2).unwrap().contains("darkmux/"),
+        "--dry-run must not write"
+    );
 }
