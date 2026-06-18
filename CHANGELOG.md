@@ -11,6 +11,44 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-06-18
+
+A security-hardening patch. Drains the milestone-1.0 security cluster — five
+fixes that close workspace-escape, traversal, and denial-of-service surfaces
+across the runtime, lab, serve daemon, and crew/flow subsystems — and finishes
+the daemon colorization started in 1.3.0. No schema or config-surface change;
+`brew upgrade darkmux` is a drop-in.
+
+### Fixed
+- **Runtime refuses writes through a final-component symlink (#883).** A coder
+  dispatch could previously be steered into writing through a symlink whose final
+  path component pointed outside the mounted workspace. `resolve_write` now
+  `lstat`s the final component and refuses a symlink target, closing the escape.
+- **Lab validates the sandbox-seed path and stops following symlinks (#897).**
+  `coding_task` now rejects seed-key paths that escape the sandbox base
+  (canonicalized + `starts_with` containment on both sides) and copies seed
+  directories with a no-follow walk, so a symlinked seed entry can't read or write
+  outside the run sandbox.
+- **Serve daemon bounds the per-day flow-file read (#900).** `/flow/:date` now
+  streams the file and keeps only the newest 10,000 records in a ring buffer
+  instead of loading an unbounded file into memory, removing a memory-exhaustion
+  vector. (Broader request-rate limiting is tracked in #925.)
+- **`crew sync` requires `--yes` to write `openclaw.json` (#893).** A bare
+  `crew sync` now previews the pending changes and bails with a re-run pointer
+  rather than silently mutating operator-owned `openclaw.json`; `--dry-run`
+  previews without the gate. Restores the preview-then-confirm sovereignty
+  contract.
+- **Audit re-seed requires a schema header (#899).** `flow integrity-check` only
+  re-seeds the hash chain from a single-line file when that line is the schema
+  header; a non-schema single line now bails instead of silently anchoring the
+  chain to arbitrary content. The "tamper-evident" phrasing across the code, docs,
+  and README is scoped to the detection property the `integrity-check` verb
+  actually provides.
+- **Colorized the remaining daemon runtime output (#922).** The presence,
+  reconciler, fleet-runner, and routing error/warning lines now render through the
+  shared style module (TTY- and `NO_COLOR`-gated), completing the daemon
+  colorization begun in 1.3.0 (#918).
+
 ## [1.3.0] - 2026-06-17
 
 Hardens the serve daemon and the crew index. The headline is **serve daemon
@@ -57,6 +95,7 @@ cluster of crew-index correctness repairs.
   idle machine's bar no longer stretches to the playhead; adds the first
   viewer-lifecycle e2e regression gate.
 
+[1.3.1]: https://github.com/kstrat2001/darkmux/releases/tag/v1.3.1
 [1.3.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.3.0
 
 ## [1.2.0] - 2026-06-15
