@@ -28,7 +28,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1076,7 +1076,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
                     return;
                 }
                 let now = Instant::now();
-                let deadline = *inactivity_deadline.lock().unwrap();
+                let deadline = *lock_deadline(&inactivity_deadline);
                 if now >= deadline {
                     break;
                 }
@@ -1373,6 +1373,20 @@ const MAX_REASONING_TEXT_BYTES: usize = 256 * 1024;
 /// pathologically large string into the flow stream / audit chain / Redis /
 /// viewer. Defense-in-depth under the viewer's output encoding (#237).
 const MAX_TRAJ_FIELD_BYTES: usize = 4 * 1024;
+
+/// Acquire the shared inactivity-deadline lock, recovering from a
+/// poisoned mutex instead of panicking. (#890) This deadline is read by
+/// the hard-kill watchdog thread every tick and written by the tailer on
+/// each proof-of-work event, so its consumers — the watchdog above all —
+/// must be the MOST panic-resilient, not the least. A bare
+/// `lock().unwrap()` meant that a panic in the tailer (which holds this
+/// lock) would poison the mutex, panic the watchdog on its next tick, and
+/// silently disable the hard-kill safety net. The guarded value is a
+/// plain `Instant`, always valid regardless of which thread panicked, so
+/// recovering the poison via `into_inner()` is sound.
+fn lock_deadline(deadline: &Mutex<Instant>) -> MutexGuard<'_, Instant> {
+    deadline.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Run the live trajectory tailer to completion. Polls until `stop_flag`
 /// is set, then does one final flush pass to drain any straggler lines
@@ -1781,9 +1795,7 @@ impl TailerState {
                     if let Some(deadline) = &self.inactivity_deadline {
                         let new_deadline =
                             Instant::now() + Duration::from_secs(self.inactivity_secs);
-                        if let Ok(mut guard) = deadline.lock() {
-                            *guard = new_deadline;
-                        }
+                        *lock_deadline(deadline) = new_deadline;
                     }
                 }
                 let payload = serde_json::json!({
@@ -1807,9 +1819,7 @@ impl TailerState {
                 if let Some(deadline) = &self.inactivity_deadline {
                     let new_deadline =
                         Instant::now() + Duration::from_secs(self.inactivity_secs);
-                    if let Ok(mut guard) = deadline.lock() {
-                        *guard = new_deadline;
-                    }
+                    *lock_deadline(deadline) = new_deadline;
                 }
                 let payload = serde_json::json!({
                     "generation": event.get("generation"),
@@ -3780,6 +3790,40 @@ mod tests {
         if let Some(v) = prev {
             unsafe { std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", v) };
         }
+    }
+
+    /// (#890) The inactivity-deadline mutex guards the hard-kill
+    /// watchdog. If a panic elsewhere (e.g. the tailer, which also holds
+    /// this lock) poisons it, the safety-net consumers must still read
+    /// and write the deadline rather than panic — otherwise the watchdog
+    /// thread dies on its next tick and the hard-kill is silently
+    /// disabled. `lock_deadline` recovers the poison; the old watchdog's
+    /// bare `.lock().unwrap()` would panic here.
+    #[test]
+    fn lock_deadline_survives_a_poisoned_mutex() {
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+
+        let deadline = Arc::new(Mutex::new(Instant::now()));
+
+        // Poison the mutex the way a tailer panic would: panic while
+        // holding the lock.
+        let poisoner = Arc::clone(&deadline);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison the deadline mutex");
+        })
+        .join();
+        assert!(
+            deadline.lock().is_err(),
+            "precondition: the mutex must be poisoned"
+        );
+
+        // The safety-net accessor must recover, not panic — both the
+        // tailer's write and the watchdog's read.
+        let want = Instant::now() + Duration::from_secs(60);
+        *super::lock_deadline(&deadline) = want;
+        assert_eq!(*super::lock_deadline(&deadline), want);
     }
 
     /// (#457) Compaction-reset: when the tailer processes a `compaction`
