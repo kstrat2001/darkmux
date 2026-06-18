@@ -116,21 +116,27 @@ pub(crate) fn audit_record_at(record: &FlowRecord, path: &Path) -> Result<()> {
             let last_hash = match parsed.get("hash").and_then(|h| h.as_str()) {
                 Some(h) => h.to_string(),
                 None => {
-                    // No `hash` field on the last line. Two cases:
-                    //   (a) File contains ONLY the schema header (process
-                    //       or OS crash between header write and first-
-                    //       record write — the within-process atomicity
-                    //       comment above only protects same-process
-                    //       interrupts). Recover by re-seeding from the
-                    //       existing header so we don't double-write it.
-                    //   (b) Audit log has been edited to remove hash
-                    //       fields, or a non-audit JSONL was placed here.
-                    //       Chain cannot continue — bail loudly.
-                    if non_empty.len() == 1 {
+                    // No `hash` field on the last line. Recover ONLY when the
+                    // sole surviving line is genuinely the schema header
+                    // (process/OS crash between header write and the first
+                    // record — the within-process atomicity comment above
+                    // protects only same-process interrupts).
+                    //
+                    // (#899) The recovery MUST require `_type == "schema"`.
+                    // Otherwise truncating a multi-record log down to one
+                    // fabricated non-header line would re-seed a fresh,
+                    // clean-validating chain on the next write — silently
+                    // laundering tampering. Any other shape (a single
+                    // non-header line, or multiple lines whose last lacks
+                    // `hash`) means the chain can't continue — bail loudly.
+                    let is_schema_header =
+                        parsed.get("_type").and_then(|t| t.as_str()) == Some("schema");
+                    if non_empty.len() == 1 && is_schema_header {
                         audit_seed_hash(last_line)
                     } else {
                         return Err(anyhow::anyhow!(
-                            "audit log {} last line lacks `hash` field — chain corrupted",
+                            "audit log {} last line lacks `hash` field and is not the schema \
+                             header — chain corrupted (refusing to re-seed)",
                             path.display()
                         ));
                     }
