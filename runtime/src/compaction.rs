@@ -392,13 +392,15 @@ fn conversation_long_enough_to_compact(message_count: usize) -> bool {
 /// Sends `messages[PRESERVE_HEAD .. n - PRESERVE_TAIL]` to the
 /// compactor model with a "summarize this excerpt" prompt, then
 /// replaces that slice with a single synthetic user message
-/// containing the summary tagged `[compacted:<generation>]`.
+/// containing the summary tagged `[compacted:<generation>]`. Returns the
+/// inserted summary message's char count (#885), so the caller reports the
+/// true length rather than guessing it from a fixed `messages` index.
 pub fn compact(
     client: &LmStudioClient,
     messages: &mut Vec<Message>,
     generation: u32,
     cfg: &CompactionConfig,
-) -> Result<()> {
+) -> Result<usize> {
     let n = messages.len();
     if !conversation_long_enough_to_compact(n) {
         return Err(anyhow!(
@@ -457,10 +459,16 @@ pub fn compact(
         summary.len()
     );
 
-    let replacement = Message::user(format!("[compacted:{generation}] {summary}"));
+    // (#885) Return the inserted summary message's char count directly so
+    // the caller's observability event reports its true length instead of
+    // guessing it from a fixed `messages` index (which silently misreports
+    // if PRESERVE_HEAD ever changes).
+    let replacement_content = format!("[compacted:{generation}] {summary}");
+    let summary_chars = replacement_content.len();
+    let replacement = Message::user(replacement_content);
     messages.splice(middle_start..middle_end, std::iter::once(replacement));
 
-    Ok(())
+    Ok(summary_chars)
 }
 
 /// (#372 T2-B) Tier-2 compaction: structured-slot fact extraction.
@@ -469,8 +477,10 @@ pub fn compact(
 /// runtime uses by default) — `messages` is mutated in place, with
 /// the middle slice REPLACED by a single synthetic SYSTEM-role
 /// message carrying a labeled-markdown rendering of the parsed
-/// structured output. The returned `StructuredCompactionOutput` is
-/// what T2-C persists to `<sandbox>/.darkmux-runtime/compaction-<gen>.json`.
+/// structured output. Returns `(StructuredCompactionOutput, summary_chars)`:
+/// the first is what T2-C persists to
+/// `<sandbox>/.darkmux-runtime/compaction-<gen>.json`, the second is the
+/// inserted summary's char count for the caller's observability event (#885).
 ///
 /// Strategy:
 /// 1. JSON-mode chat request to `cfg.compactor_model` with system
@@ -501,7 +511,7 @@ pub fn structured_compact(
     generation: u32,
     cfg: &CompactionConfig,
     budget: Option<BudgetSnapshot>,
-) -> Result<StructuredCompactionOutput> {
+) -> Result<(StructuredCompactionOutput, usize)> {
     let n = messages.len();
     if !conversation_long_enough_to_compact(n) {
         return Err(anyhow!(
@@ -582,6 +592,10 @@ pub fn structured_compact(
     // Build the synthetic SYSTEM-role replacement message. Per #354
     // Q3: system-message attention bias keeps the compacted state
     // load-bearing across subsequent turns.
+    // (#885) Capture the rendered summary's char count before `markdown`
+    // moves into the synthetic message, so the caller reports its true
+    // length rather than reading a fixed `messages` index.
+    let summary_chars = markdown.len();
     let replacement = Message {
         role: "system".to_string(),
         content: Some(markdown),
@@ -592,7 +606,7 @@ pub fn structured_compact(
     };
     messages.splice(middle_start..middle_end, std::iter::once(replacement));
 
-    Ok(capped)
+    Ok((capped, summary_chars))
 }
 
 /// (#381 Independence S1) Build the user message sent to the compactor
@@ -1311,7 +1325,7 @@ mod tests {
         let original_len = messages.len();
         let cfg = CompactionConfig::never_compact();
 
-        let out = structured_compact(&client, &mut messages, 7, &cfg, None)
+        let (out, summary_chars) = structured_compact(&client, &mut messages, 7, &cfg, None)
             .expect("happy path returns parsed output");
 
         // Confirms the mock actually matched — proving the wire body
@@ -1334,6 +1348,46 @@ mod tests {
             .expect("content set");
         assert!(content.contains("Working memory state"));
         assert!(content.contains("audit refresh-token"));
+        // (#885) The returned summary_chars is the inserted summary's
+        // ACTUAL length, not a guess at a fixed index — it must equal the
+        // spliced message's content length.
+        assert_eq!(summary_chars, content.len());
+    }
+
+    /// (#885) The narrative `compact` path is the DEFAULT strategy, so its
+    /// summary_chars contract gets its own regression guard: the returned
+    /// count must equal the inserted `[compacted:N] …` message's actual
+    /// length (prefix included), not a guess at a fixed index.
+    #[test]
+    #[serial_test::serial]
+    fn compact_returns_inserted_summary_char_count() {
+        let server = MockServer::start();
+        let summary = "Decided to refactor the auth module; ran cargo test (passed).";
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200)
+                .json_body(chat_response_with_json_content(summary));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let mut messages = dummy_messages_long_enough_to_compact();
+        let cfg = CompactionConfig::never_compact();
+
+        let summary_chars = compact(&client, &mut messages, 3, &cfg)
+            .expect("narrative compaction returns the summary char count");
+        mock.assert_hits(1);
+
+        // The returned count is the inserted message's ACTUAL length, not a
+        // fixed-index guess — it must equal the spliced message's content.
+        let inserted = messages[PRESERVE_HEAD]
+            .content
+            .as_ref()
+            .expect("inserted summary has content");
+        assert_eq!(summary_chars, inserted.len());
+        // And it includes the `[compacted:N] ` prefix (the full synthetic
+        // message, not the bare model summary).
+        assert!(inserted.starts_with("[compacted:3] "));
+        assert!(summary_chars > summary.len());
     }
 
     #[test]
