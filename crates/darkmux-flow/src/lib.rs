@@ -3365,4 +3365,19 @@ mod tests {
             "expected re-seed refusal, got: {err}"
         );
     }
+
+    #[test]
+    fn audit_reseed_recovers_from_header_only_file() {
+        // (#899) The legit crash-recovery case must STILL work: a file with
+        // only the schema header (crash between header write and the first
+        // record) re-seeds cleanly on the next write — the guard must not turn
+        // this into a bail.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("audit.jsonl");
+        let header = crate::integrity::schema_header_line().unwrap();
+        std::fs::write(&path, format!("{header}\n")).unwrap();
+        audit_record_at(&minimal_record(), &path).unwrap();
+        let report = crate::integrity::integrity_check_file(&path).unwrap();
+        assert!(report.chain_valid, "header-only recovery must produce a valid chain");
+    }
 }

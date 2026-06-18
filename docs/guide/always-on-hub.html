@@ -255,7 +255,7 @@ rm ~/Library/LaunchAgents/com.darkmux.serve.plist</code></pre>
 <section id="phase-3">
   <div class="wrap">
     <h2>Phase 3: Enable the audit substrate</h2>
-    <p>The <strong>casual</strong> per-day JSONL under <code>~/.darkmux/flows/</code> is enough for personal record-keeping. The <strong>audit</strong> sink adds BLAKE3 hash-chained append-only records that surface tampering on a daily <code>darkmux flow integrity-check</code> (Phase 4): the right substrate for any compliance posture (ISO 27001, AI Act, HIPAA-as-covered-entity) and a useful tripwire even for personal use.</p>
+    <p>The <strong>casual</strong> per-day JSONL under <code>~/.darkmux/flows/</code> is enough for personal record-keeping. The <strong>audit</strong> sink adds BLAKE3 hash-chained records whose edits a daily <code>darkmux flow integrity-check</code> surfaces (Phase 4) &mdash; absent a full re-chain, since the chain is un-anchored: a strong substrate to build a compliance posture on (ISO 27001, AI Act, HIPAA-as-covered-entity) and a useful tripwire even for personal use. (An external anchor &mdash; OS append-only flags or an off-box co-signature &mdash; is the unbuilt next step for tamper-<em>proof</em>, vs tamper-<em>detecting</em>, guarantees.)</p>
     <div class="callout">
       <strong>Use the skill, don't re-implement.</strong> The authoritative walkthrough for enabling the audit substrate is the <code>/darkmux-enable-audit</code> Claude Code skill (shipped with darkmux). Invoke it in a Claude Code session on the hub; it'll walk you through the use-case framing, the dir choice, the env-var setup, the first-write verification, and the doctor check. This section captures only the HUB-specific decisions that overlay the skill's defaults.
     </div>
