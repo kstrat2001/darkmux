@@ -1078,3 +1078,57 @@ fn lab_doctor_passes_for_builtin_demo_tiny_py() {
         .stdout(predicate::str::contains("demo-tiny-py"))
         .stdout(predicate::str::contains("1 pass"));
 }
+
+/// (#893) `crew sync` mutates operator-owned openclaw.json — a bare run
+/// (no `--yes`) must PREVIEW and bail without writing; `--yes` applies.
+#[test]
+fn crew_sync_refuses_to_write_without_yes() {
+    let tmp = TempDir::new().unwrap();
+    let oc = tmp.path().join("openclaw.json");
+    fs::write(&oc, r#"{"agents":{"list":[]}}"#).unwrap();
+    let crew_dir = tmp.path().join("crew"); // empty → builtin roles only
+    fs::create_dir_all(&crew_dir).unwrap();
+
+    // Bare `crew sync`: builtin roles are pending → bail + leave the file alone.
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_OPENCLAW_CONFIG", &oc)
+        .env("DARKMUX_CREW_DIR", &crew_dir)
+        .args(["crew", "sync"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("re-run").and(predicate::str::contains("--yes")));
+    assert!(
+        !fs::read_to_string(&oc).unwrap().contains("darkmux/"),
+        "no agent should be written without --yes"
+    );
+
+    // `--yes` applies.
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_OPENCLAW_CONFIG", &oc)
+        .env("DARKMUX_CREW_DIR", &crew_dir)
+        .args(["crew", "sync", "--yes"])
+        .assert()
+        .success();
+    assert!(
+        fs::read_to_string(&oc).unwrap().contains("darkmux/"),
+        "--yes should have written agents to openclaw.json"
+    );
+
+    // `--dry-run` previews and exits 0 without writing (even with pending).
+    let oc2 = tmp.path().join("openclaw2.json");
+    fs::write(&oc2, r#"{"agents":{"list":[]}}"#).unwrap();
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_OPENCLAW_CONFIG", &oc2)
+        .env("DARKMUX_CREW_DIR", &crew_dir)
+        .args(["crew", "sync", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[DRY RUN]"));
+    assert!(
+        !fs::read_to_string(&oc2).unwrap().contains("darkmux/"),
+        "--dry-run must not write"
+    );
+}

@@ -2425,19 +2425,32 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
             CrewIndexCmd::Rebuild => crew::index::rebuild().map(|_| 0),
             CrewIndexCmd::Status => crew::index::status().map(|_| 0),
         },
-        CrewCmd::Sync { yes: _, dry_run } => {
-            let opts = crew::dispatch::SyncOpts { dry_run };
+        CrewCmd::Sync { yes, dry_run } => {
+            // (#893) `crew sync` mutates operator-owned ~/.openclaw/openclaw.json,
+            // so it must not write without explicit confirmation. Default
+            // (no flags) = preview the diff + bail with a re-run hint;
+            // `--dry-run` = explicit preview (exit 0); `--yes` = apply.
+            // Follows `mission migrate`'s preview-then-confirm pattern, with a
+            // non-zero exit when changes are pending so the unwritten state is
+            // unmissable in scripts.
+            let write = yes && !dry_run;
+            let opts = crew::dispatch::SyncOpts { dry_run: !write };
             let result = crew::dispatch::sync(opts)?;
-            let verbs = if dry_run {
-                ("would add", "would update")
-            } else {
+            let pending = result.added.len() + result.updated.len();
+            let (add_v, upd_v) = if write {
                 ("added", "updated")
+            } else {
+                ("would add", "would update")
             };
-            let trail = if dry_run { " [DRY RUN]" } else { "" };
+            let trail = if write {
+                ""
+            } else if dry_run {
+                " [DRY RUN]"
+            } else {
+                " [PREVIEW]"
+            };
             println!(
                 "crew sync{trail}: {add_v} {a}, {upd_v} {u}, unchanged {un}, skipped (no .md prompt) {sn}",
-                add_v = verbs.0,
-                upd_v = verbs.1,
                 a = result.added.len(),
                 u = result.updated.len(),
                 un = result.unchanged.len(),
@@ -2451,6 +2464,15 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
             }
             for id in &result.skipped_no_prompt {
                 println!("  · {id} (no .md prompt)");
+            }
+            // Default (no --yes, no --dry-run) with pending changes: refuse to
+            // write, point at --yes. A bare `--dry-run` is an explicit preview
+            // and exits 0 even with pending changes.
+            if !write && !dry_run && pending > 0 {
+                anyhow::bail!(
+                    "crew sync: {pending} pending change(s) NOT applied to openclaw.json — \
+                     re-run `darkmux crew sync --yes` to write them (or `--dry-run` to just preview)"
+                );
             }
             Ok(0)
         }
