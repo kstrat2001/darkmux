@@ -26,33 +26,35 @@
 //!   (see `execute_bash` — exit 124 is timeout-failure too)
 //! - Otherwise: success
 //!
-//! ## Per-tool isolation
+//! ## Per-signature isolation
 //!
-//! Counters are per-tool, not global. A dispatch with bash failing 3×
-//! but `read` succeeding doesn't bail — the failure-cascade signal
-//! attributes to bash specifically. Mirrors how a human would say
-//! *"the gcc command isn't working"*, not *"the dispatch is broken."*
+//! Counters are keyed per `(tool, args)` signature (#484) — not global,
+//! not per-tool-name. A dispatch with `gcc x.c` failing 3× while `read`
+//! succeeds still flags: `read`'s success doesn't reset the `gcc`
+//! signature. Mirrors how a human would say *"the gcc command isn't
+//! working"*, not *"the dispatch is broken."*
 
 use std::collections::{HashMap, HashSet};
 
-/// Default threshold — consecutive failures of one tool before warning.
+/// Default threshold — failures of one `(tool, args)` signature before warning.
 pub const DEFAULT_WARN_THRESHOLD: u32 = 3;
 
-/// (#419) Signal emitted when one tool's consecutive-failure counter
-/// crosses the threshold. Observability-only in the MVP — no bail.
+/// (#419) Signal emitted when one `(tool, args)` signature's failure
+/// counter crosses the threshold. Observability-only in the MVP — no bail.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FailureCascadeSignal {
-    /// Edge-triggered when the per-tool counter first reaches the
-    /// threshold. Continuing failures of the same tool stay quiet
-    /// (re-arms on a single success or a tool switch).
+    /// Edge-triggered when a `(tool, args)` signature's failure counter
+    /// first reaches the threshold. Further failures of the same signature
+    /// stay quiet; the warn re-arms when that signature next succeeds.
     Suspected {
         tool_name: String,
-        consecutive_failures: u32,
+        failure_count: u32,
     },
 }
 
-/// (#419) Per-tool consecutive-failure counter. One instance per
-/// dispatch / agent loop.
+/// (#419) Per-signature failure counter — cumulative failures of a
+/// `(tool, args)` signature since it last succeeded, NOT consecutive
+/// across tools. One instance per dispatch / agent loop.
 #[derive(Debug)]
 pub struct FailureRateDetector {
     counters: HashMap<String, u32>,
@@ -103,7 +105,7 @@ impl FailureRateDetector {
                 self.warned.insert(sig);
                 return Some(FailureCascadeSignal::Suspected {
                     tool_name: tool_name.to_string(),
-                    consecutive_failures: count_now,
+                    failure_count: count_now,
                 });
             }
             None
@@ -280,11 +282,11 @@ mod tests {
         d.record("bash", &bash_args("gcc x.c"), &err_for("bash"));
         d.record("bash", &bash_args("gcc x.c"), &err_for("bash"));
         let signal = d.record("bash", &bash_args("gcc x.c"), &err_for("bash"));
-        let Some(FailureCascadeSignal::Suspected { tool_name, consecutive_failures }) = signal else {
+        let Some(FailureCascadeSignal::Suspected { tool_name, failure_count }) = signal else {
             panic!("expected Suspected, got {signal:?}");
         };
         assert_eq!(tool_name, "bash");
-        assert_eq!(consecutive_failures, 3);
+        assert_eq!(failure_count, 3);
     }
 
     #[test]

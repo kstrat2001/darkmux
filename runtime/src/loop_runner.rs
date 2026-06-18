@@ -287,8 +287,8 @@ pub fn run(
     // bail-on-cycle is a follow-up if warn alone proves insufficient.
     let mut cycle_detector = CycleDetector::new();
     // (#419) Per-dispatch tool-failure-rate detector — warns on
-    // consecutive failures of one tool (e.g., agent retrying gcc
-    // inside sandbox where it doesn't exist). Sibling to the cycle
+    // repeated failures of one `(tool, args)` signature (e.g., agent
+    // retrying gcc inside sandbox where it doesn't exist). Sibling to the cycle
     // detector; same MVP shape (warn-only).
     let mut failure_rate_detector = FailureRateDetector::new();
     // (#461) Per-dispatch reasoning-loop detector — warns when the
@@ -845,11 +845,12 @@ pub fn run(
                     }
                     // (#419) Record into the failure-rate detector
                     // AFTER dispatch so the result is available to
-                    // classify. Edge-triggered: counter resets on a
-                    // single success, warn fires once per cascade.
+                    // classify. Edge-triggered: a signature's counter
+                    // resets when that signature next succeeds, warn
+                    // fires once per cascade.
                     if let Some(FailureCascadeSignal::Suspected {
                         tool_name,
-                        consecutive_failures,
+                        failure_count,
                     }) = failure_rate_detector.record(
                         &call.function.name,
                         &call.function.arguments,
@@ -857,25 +858,25 @@ pub fn run(
                     )
                     {
                         eprintln!(
-                            "darkmux-runtime: ✕ tool-failure cascade — `{}` failed {} times in a \
-                             row. The tool or its environment may need operator attention. \
+                            "darkmux-runtime: ✕ tool-failure cascade — `{}` failed {} times \
+                             since it last succeeded. The tool or its environment may need operator attention. \
                              Operator-visible only; no behavior change.",
-                            tool_name, consecutive_failures
+                            tool_name, failure_count
                         );
                         trajectory.append_tool_repeated_failure(
                             turns,
                             &tool_name,
-                            consecutive_failures,
+                            failure_count,
                         );
                         // Step 1 of feedback injection — see cycle-
                         // suspected callsite above for the rationale.
-                        // `consecutive_failures` is `u32` at the
+                        // `failure_count` is `u32` at the
                         // signal layer; cast to `usize` to match the
                         // injector's API (which uses `usize` for
                         // counter fields uniformly).
                         feedback_injector.queue_tool_failure_cascade(
                             &tool_name,
-                            consecutive_failures as usize,
+                            failure_count as usize,
                         );
                     }
                     messages.push(Message::tool_result(
@@ -2024,7 +2025,7 @@ mod tests {
         );
         let first = &failure_events[0];
         assert_eq!(first["tool_name"], "bash");
-        assert_eq!(first["consecutive_failures"], 3);
+        assert_eq!(first["failure_count"], 3);
         // Edge-triggered: even though the loop runs 100 turns of
         // failures, we should see exactly one cascade event for the
         // single uninterrupted streak.
