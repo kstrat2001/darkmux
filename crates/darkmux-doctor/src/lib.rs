@@ -569,7 +569,7 @@ fn check_audit_integrity() -> Check {
             status: Status::Warn,
             message: format!("no audit files under {dir}"),
             hint: Some(
-                "AuditFileSink is opt-in: set DARKMUX_AUDIT_DIR to enable hash-chained tamper-evident audit alongside the casual LocalFile sink. For compliance deployments (ISO 27001, AI Act, etc.) this should be on."
+                "AuditFileSink is opt-in: set DARKMUX_AUDIT_DIR to enable a BLAKE3 hash-chained audit log whose edits `darkmux flow integrity-check` detects (absent a full re-chain — the chain is un-anchored), alongside the casual LocalFile sink. Useful for compliance deployments (ISO 27001, AI Act, etc.)."
                     .into(),
             ),
         };

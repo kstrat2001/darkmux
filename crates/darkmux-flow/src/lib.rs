@@ -196,8 +196,10 @@ pub fn count_audit_write_failures_today() -> usize {
         .count()
 }
 
-/// Hash-chained tamper-evident sink. See module-level comment for the
-/// design rationale. POSIX-only.
+/// BLAKE3 hash-chained audit sink — edits are detected by `darkmux flow
+/// integrity-check` walking the chain (which is un-anchored, so it detects
+/// edits *absent a full re-chain*, #899 — not an OS append-only guarantee).
+/// See module-level comment for the design rationale. POSIX-only.
 #[cfg(unix)]
 pub struct AuditFileSink {
     // #507 — captured once at construction (see LocalFileSink). Capturing
@@ -3342,5 +3344,40 @@ mod tests {
         assert!(text.contains("composition:"));
         assert!(text.contains("Disk"));
         assert!(text.contains("Schema"));
+    }
+
+    #[test]
+    fn audit_reseed_refuses_non_schema_single_line() {
+        // (#899) Truncating a multi-record audit log down to ONE fabricated
+        // non-header line must NOT re-seed a fresh clean-validating chain on
+        // the next write — the recovery requires the surviving line to be the
+        // schema header. Pre-fix this re-seeded silently, laundering tampering.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("audit.jsonl");
+        // Legit first write → header + record.
+        audit_record_at(&minimal_record(), &path).unwrap();
+        // Attacker truncates to a single fabricated non-header line.
+        std::fs::write(&path, "{\"ts\":\"2026-01-01T00:00:00Z\",\"action\":\"forged\"}\n").unwrap();
+        // Next write must bail rather than re-seed a clean chain.
+        let err = audit_record_at(&minimal_record(), &path).unwrap_err();
+        assert!(
+            err.to_string().contains("not the schema header"),
+            "expected re-seed refusal, got: {err}"
+        );
+    }
+
+    #[test]
+    fn audit_reseed_recovers_from_header_only_file() {
+        // (#899) The legit crash-recovery case must STILL work: a file with
+        // only the schema header (crash between header write and the first
+        // record) re-seeds cleanly on the next write — the guard must not turn
+        // this into a bail.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("audit.jsonl");
+        let header = crate::integrity::schema_header_line().unwrap();
+        std::fs::write(&path, format!("{header}\n")).unwrap();
+        audit_record_at(&minimal_record(), &path).unwrap();
+        let report = crate::integrity::integrity_check_file(&path).unwrap();
+        assert!(report.chain_valid, "header-only recovery must produce a valid chain");
     }
 }

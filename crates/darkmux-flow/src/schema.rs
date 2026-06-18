@@ -209,7 +209,7 @@ pub struct FlowRecord {
     pub prev_hash: Option<String>,
     /// BLAKE3 hash of THIS record's content (excluding the `hash` field
     /// itself — see `audit_hash_of()`). Populated only by AuditFileSink.
-    /// Together with `prev_hash` forms a tamper-evident chain. The
+    /// Together with `prev_hash` forms a hash chain. The
     /// `darkmux flow integrity-check` verb recomputes the chain and
     /// reports the first divergence. Schema 1.5 addition (#163).
     #[serde(skip_serializing_if = "Option::is_none")]
