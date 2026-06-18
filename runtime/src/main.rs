@@ -683,7 +683,12 @@ fn run_dispatch(args: &[String]) -> ExitCode {
             total_prompt_tokens: 0,
             total_completion_tokens: 0,
             total_messages: 0,
-            max_turns_reached: true,
+            // (#884) An error returned from the loop is an infrastructure
+            // failure, NOT a turn-cap termination. Hardcoding `true` here
+            // mislabeled every infra failure as max-turns and corrupted
+            // the #325 three-way result discrimination that downstream
+            // consumers branch on.
+            max_turns_reached: false,
             final_assistant_preview: String::new(),
         };
         let _ = traj.save_metrics(&metrics);
