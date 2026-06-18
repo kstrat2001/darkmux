@@ -2042,11 +2042,11 @@ fn detector_telemetry_payload(
         }
         "dispatch.tool.repeated_failure" => {
             let tool_name = str_field("tool_name");
-            let consecutive_failures = u64_field("consecutive_failures");
+            let failure_count = u64_field("failure_count");
             (
                 "tool-failure",
                 "warn",
-                format!("{consecutive_failures} consecutive failures of `{tool_name}` (#419)"),
+                format!("{failure_count} failures of `{tool_name}` since it last succeeded (#419)"),
             )
         }
         "dispatch.intra_turn_stall.recovered" => {

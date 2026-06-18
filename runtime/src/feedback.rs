@@ -286,8 +286,8 @@ impl FeedbackInjector {
     }
 
     /// Queue a tool-failure-cascade feedback message. Called when the
-    /// failure-rate detector fires (e.g., 3 consecutive failures of
-    /// the same tool).
+    /// failure-rate detector fires (e.g., 3 failures of the same
+    /// `(tool, args)` signature since it last succeeded).
     ///
     /// **Wording — directive and literal** (same doctrine as the
     /// cycle template). Imperative verbs ("re-read", "change",
@@ -298,7 +298,7 @@ impl FeedbackInjector {
     pub fn queue_tool_failure_cascade(
         &mut self,
         tool_name: &str,
-        consecutive_failures: usize,
+        failure_count: usize,
     ) {
         if !self.enabled {
             return;
@@ -306,7 +306,7 @@ impl FeedbackInjector {
         let template = self.template_for("tool_failure_cascade");
         let message = template
             .replace("{tool_name}", tool_name)
-            .replace("{count}", &consecutive_failures.to_string());
+            .replace("{count}", &failure_count.to_string());
         self.pending.push(message);
         self.pending_kinds.push("tool_failure_cascade");
     }

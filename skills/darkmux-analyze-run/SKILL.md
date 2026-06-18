@@ -154,8 +154,8 @@ These are emitted by the runtime's struggle-detectors and recovery paths (landed
 { "type": "dispatch.reasoning_loop.suspected", "seq": <turn>, "ts": <ms>, "count": <int>, "window_size": <int> }
   # same normalized reasoning text repeated `count` times in `window_size` (10) turns — sibling of cycle detector (#461)
 
-{ "type": "dispatch.tool.repeated_failure", "seq": <turn>, "ts": <ms>, "tool_name": <str>, "consecutive_failures": <int> }
-  # one tool failed `consecutive_failures` times in a row (resets on any success) (#419)
+{ "type": "dispatch.tool.repeated_failure", "seq": <turn>, "ts": <ms>, "tool_name": <str>, "failure_count": <int> }
+  # one (tool, args) signature failed `failure_count` times since it last succeeded (#419)
 
 { "type": "dispatch.per_turn_cap.salvaged", "seq": <turn>, "ts": <ms>, "completion_tokens": <int>, "cap": <int>, "salvaged_tool_calls": <int> }
   # turn hit MAX_TOKENS_PER_CALL (10000) on finish_reason=length but well-formed tool calls survived; truncated content discarded, calls dispatched anyway (#479)
