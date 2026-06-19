@@ -555,6 +555,12 @@ pub fn structured_compact(
             // Attempt 2 — same request. Per #354 Q2 commitment: one
             // retry handles transient sampling noise; two failures
             // means the model genuinely can't produce the schema.
+            // (#905) Acknowledged refinement: this retries on ANY attempt-1
+            // failure, so a deterministic truncation pays a doomed 2nd
+            // 4096-token call. Gating the retry on a transient-vs-deterministic
+            // error kind would need `call_and_parse` to return a typed error;
+            // deferred (the layer-1+2 repair above already salvages most
+            // truncations, so the wasted call is rare in practice).
             call_and_parse(client, &request).map_err(|e2| {
                 anyhow!("tier-2 compaction failed twice (attempt 1: {e1}; attempt 2: {e2})")
             })?
