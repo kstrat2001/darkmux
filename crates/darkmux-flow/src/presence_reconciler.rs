@@ -76,6 +76,19 @@ pub fn claim_edge(client: &redis::Client, kind: &str, id: &str) -> bool {
     matches!(res, Ok(Some(_)))
 }
 
+/// Release a previously-won edge claim (DEL the key). (#902) Used when the
+/// claim won but the subsequent `record()` write FAILED — without this, the
+/// claim is held for its full TTL with no edge recorded, suppressing any peer
+/// that could still record it (a lost lifecycle bracket). Best-effort: a Redis
+/// error here just leaves the claim to TTL-expire (the prior behavior), so it
+/// never makes things worse.
+pub fn release_edge_claim(client: &redis::Client, kind: &str, id: &str) {
+    let key = format!("{EDGE_CLAIM_PREFIX}{kind}:{id}");
+    if let Ok(mut conn) = open_redis_connection_bounded(client, REDIS_CONNECT_TIMEOUT) {
+        let _: redis::RedisResult<()> = redis::cmd("DEL").arg(&key).query(&mut conn);
+    }
+}
+
 /// Pure: the beats present in `last` whose uid is absent from `now_uids` —
 /// i.e. the machines that disappeared since the previous reconcile tick.
 /// Extracted from the loop so the diff is unit-testable without Redis.
@@ -134,6 +147,15 @@ fn disappeared_sessions<'a>(
         .filter(|(sid, _)| !now_sids.contains(*sid))
         .map(|(_, beat)| beat)
         .collect()
+}
+
+/// Pure: whether this reconcile tick should emit close-edges. Only a
+/// steady-state tick does — never the `first_tick` (no baseline yet) nor a
+/// recovery tick (#902: a stale baseline from a `read_live` outage would
+/// re-fire long-gone machines as fresh disappearances). Extracted so the
+/// gate is unit-testable without the Redis-coupled loop.
+fn should_emit_edges(first_tick: bool, recovered_this_tick: bool) -> bool {
+    !first_tick && !recovered_this_tick
 }
 
 /// Build a `session.end` close-edge from a disappeared session's last beat.
@@ -241,8 +263,16 @@ pub fn spawn_reconciler_thread() -> Option<std::thread::JoinHandle<()>> {
             loop {
                 match read_live(&client) {
                     Ok(beats) => {
-                        if !healthy {
-                            eprintln!("{}", darkmux_types::style::success("presence-reconciler: read_live recovered — recording edges again"));
+                        // (#902) A recovery tick (first success after a
+                        // read_live outage) has a STALE baseline: machines that
+                        // went away during the outage would look like fresh
+                        // disappearances and re-fire close-edges (the prior
+                        // claims have TTL-expired). Treat it like first_tick —
+                        // rebaseline below and emit nothing this tick; edges
+                        // resume next tick off the refreshed baseline.
+                        let recovered_this_tick = !healthy;
+                        if recovered_this_tick {
+                            eprintln!("{}", darkmux_types::style::success("presence-reconciler: read_live recovered — rebaselining, edges resume next tick"));
                             healthy = true;
                         }
                         let now_machines: HashMap<String, PresenceBeat> = beats
@@ -250,7 +280,7 @@ pub fn spawn_reconciler_thread() -> Option<std::thread::JoinHandle<()>> {
                             .map(|b| (b.machine_uid.clone(), b))
                             .collect();
                         let session_read = read_live_sessions(&client);
-                        if !first_tick {
+                        if should_emit_edges(first_tick, recovered_this_tick) {
                             // Machine offline edges.
                             let now_uids: HashSet<String> =
                                 now_machines.keys().cloned().collect();
@@ -258,11 +288,22 @@ pub fn spawn_reconciler_thread() -> Option<std::thread::JoinHandle<()>> {
                                 // Dedup across the fleet: only the claim winner
                                 // records the edge.
                                 if claim_edge(&client, "machine-offline", &gone.machine_uid) {
-                                    let _ = crate::record(build_machine_edge_record(
+                                    // (#902) Release the claim if the record
+                                    // write fails, so it doesn't hold the 60s
+                                    // claim with no edge recorded (lost bracket).
+                                    if crate::record(build_machine_edge_record(
                                         "machine.offline",
                                         &gone.machine_uid,
                                         &gone.display_name,
-                                    ));
+                                    ))
+                                    .is_err()
+                                    {
+                                        release_edge_claim(
+                                            &client,
+                                            "machine-offline",
+                                            &gone.machine_uid,
+                                        );
+                                    }
                                 }
                             }
                             // Session end edges (only when the session read
@@ -287,7 +328,17 @@ pub fn spawn_reconciler_thread() -> Option<std::thread::JoinHandle<()>> {
                                     // abandoned (crash/kill) session has no
                                     // pre-claim, so this wins and records the close.
                                     if claim_edge(&client, "session-end", &gone.session_id) {
-                                        let _ = crate::record(build_session_end_record(gone));
+                                        // (#902) Release the claim on a failed
+                                        // record write so it doesn't suppress a
+                                        // peer that could still record the close.
+                                        if crate::record(build_session_end_record(gone)).is_err()
+                                        {
+                                            release_edge_claim(
+                                                &client,
+                                                "session-end",
+                                                &gone.session_id,
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -345,6 +396,16 @@ mod tests {
             specs: None,
             loaded_models: Vec::new(),
         }
+    }
+
+    #[test]
+    fn should_emit_edges_truth_table() {
+        // (#902) Emit close-edges only on a steady-state tick — never the
+        // first tick (no baseline) nor a recovery tick (stale baseline).
+        assert!(should_emit_edges(false, false), "steady state → emit");
+        assert!(!should_emit_edges(true, false), "first tick → no emit");
+        assert!(!should_emit_edges(false, true), "recovery tick → no emit");
+        assert!(!should_emit_edges(true, true), "first+recovery → no emit");
     }
 
     #[test]

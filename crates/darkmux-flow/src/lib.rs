@@ -1756,6 +1756,9 @@ mod tests {
     // ─── #162 Phase 1: FlowSink trait ────────────────────────────────
 
     #[test]
+    #[serial_test::serial] // (#902) mutates the process-global DARKMUX_FLOWS_DIR — must
+                           // serialize with the other env-mutating tests (e.g. the audit
+                           // breadcrumb scanner), or it races them and flakes under -j.
     fn local_file_sink_writes_through_to_per_day_jsonl() {
         // LocalFileSink should produce the same on-disk result as the
         // historical `record_at` path — preserving behavior under the
