@@ -445,7 +445,10 @@ fn check_role_model_pin_drift() -> Check {
             return Check {
                 name: "role-model pin drift".into(),
                 status: Status::Pass,
-                message: format!("(no openclaw config at {} — skipping)", openclaw_path.display()),
+                message: format!(
+                    "(no openclaw config at {} — skipping; run `darkmux crew sync` once openclaw is configured)",
+                    openclaw_path.display()
+                ),
                 hint: None,
             };
         }
