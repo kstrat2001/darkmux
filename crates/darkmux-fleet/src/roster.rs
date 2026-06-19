@@ -308,7 +308,12 @@ pub fn add_machine(
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+        .unwrap_or_else(|_| {
+            // (#906) Pre-epoch / NTP-skewed clock: 0 doubles as a sentinel,
+            // so warn rather than silently stamping a bogus added-at time.
+            eprintln!("darkmux: system clock is before the Unix epoch — stamping added_unix_ms=0");
+            0
+        });
     let existing_added_at = roster.machines.get(id).map(|m| m.added_unix_ms);
     let entry = MachineEntry {
         id: id.to_string(),

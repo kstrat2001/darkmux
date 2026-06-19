@@ -462,6 +462,12 @@ impl WorkloadProvider for CodingTaskProvider {
             // metrics.json, falling back to the trajectory-derived
             // counts with turns=0 (the very bug #359 fixes). Always-
             // absolute makes the manifest cwd-independent.
+            // (#906 INFO) Best-effort canonicalization: if the sandbox dir
+            // can't be canonicalized (rare — e.g. a component vanished mid-run)
+            // we fall back to the non-canonical path so the manifest still
+            // records *a* path rather than aborting. Degraded provenance in
+            // that rare case is acceptable; the absolute-path goal above holds
+            // for the normal case.
             "sandbox": sandbox_dir.canonicalize().unwrap_or_else(|_| sandbox_dir.to_path_buf()).display().to_string(),
             "final_hash": final_hash,
         });
@@ -737,10 +743,16 @@ fn reject_escaping_relpath(raw: &str, label: &str) -> Result<()> {
             "{label} `{raw}` is an absolute path; only relative paths under the sandbox are allowed"
         );
     }
+    // (#906) Track whether the key names an actual file component. A key of
+    // `.` / `./` / `./.` normalizes to only `CurDir` components — it passes
+    // the escape check but points AT the sandbox dir, so the later `fs::write`
+    // fails opaquely with `IsADirectory`. Reject it here with a clear message.
+    let mut has_normal = false;
     for component in path.components() {
         use std::path::Component;
         match component {
-            Component::Normal(_) | Component::CurDir => continue,
+            Component::Normal(_) => has_normal = true,
+            Component::CurDir => continue,
             Component::ParentDir => {
                 bail!("{label} `{raw}` contains `..` — would escape the sandbox")
             }
@@ -748,6 +760,9 @@ fn reject_escaping_relpath(raw: &str, label: &str) -> Result<()> {
                 "{label} `{raw}` contains a root/prefix component — only relative paths under the sandbox are allowed"
             ),
         }
+    }
+    if !has_normal {
+        bail!("{label} `{raw}` names no file under the sandbox (resolves to the sandbox dir itself)");
     }
     Ok(())
 }
@@ -1157,6 +1172,14 @@ fn augment_qa_reply_with_workspace_delta(
     Ok(())
 }
 
+/// Run the workload's verify command and capture its outcome.
+///
+/// SECURITY (#906): the command runs on the HOST shell (`/bin/sh -c`) with
+/// the operator's privileges — NOT inside the dispatch container that bounds
+/// the agent. A workload/fixture from an untrusted source could carry a
+/// hostile `verify.command`. `darkmux lab register` warns at register time
+/// when a fixture declares one (the trust-establishment point); running
+/// verify inside the declared `--image` is a deferred hardening step.
 fn run_verify_command(
     loaded: &LoadedWorkload,
     run_dir: &Path,

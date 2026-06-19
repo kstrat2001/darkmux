@@ -8,8 +8,9 @@
 //! conservative starting points.
 //!
 //! Hardware match: Apple Silicon AND RAM tier == Medium (33–64 GB). The
-//! lower bound matters — at 32GB even 13B models are tight; users on that
-//! tier fall through to `generic`.
+//! lower bound matters — at 32GB even 13B models are tight; the Small tier
+//! (0–32 GB) is now owned by `m_series_32`, so 32GB-and-below machines are
+//! handled there rather than falling through to `generic` (#906 doc-drift).
 
 use darkmux_hardware::{HardwareSpec, Platform, RamTier};
 use crate::{

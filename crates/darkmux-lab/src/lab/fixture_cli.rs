@@ -61,7 +61,7 @@ pub fn cmd_register(
         return Ok("Fixture already registered — skipped (--if-absent).".to_string());
     };
 
-    Ok(format!(
+    let mut msg = format!(
         "Registered fixture `{}`\n  path:   {}\n  hash:   {}\n  hashed: {}\n  version: {}{}",
         registered_name,
         entry.path.display(),
@@ -73,7 +73,29 @@ pub fn cmd_register(
             .as_ref()
             .map(|s| format!("\n  satisfies: {s}"))
             .unwrap_or_default(),
-    ))
+    );
+
+    // (#906, P6 defense-in-depth) `verify_command` runs on the HOST shell
+    // (`/bin/sh -c`) with the operator's privileges, NOT inside the
+    // dispatch container. Surface this at register time so an operator
+    // adding a shared / third-party fixture knows its verify command will
+    // execute as them (a planted `rm -rf ~` would run unsandboxed).
+    if let Ok(manifest) = FixtureManifest::load_from_dir(path) {
+        if manifest
+            .verify_command
+            .as_deref()
+            .map(|c| !c.trim().is_empty())
+            .unwrap_or(false)
+        {
+            msg.push_str(
+                "\n\n  ⚠ This fixture declares a verify_command. It runs on the HOST shell\n    \
+                 with your privileges (not inside the dispatch container). Only register\n    \
+                 fixtures whose verify_command you trust.",
+            );
+        }
+    }
+
+    Ok(msg)
 }
 
 /// `dm lab unregister <name>` — remove pointer from registry.

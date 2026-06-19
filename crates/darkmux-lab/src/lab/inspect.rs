@@ -69,7 +69,10 @@ pub fn read_compaction_summaries(run_dir: &Path) -> Result<Vec<CompactionSummary
             out.push(CompactionSummary {
                 turn_index: turn_idx,
                 tokens_before: m.get("tokensBefore").and_then(|v| v.as_u64()).unwrap_or(0),
-                summary_chars: summary_text.len(),
+                // (#906) char count, not byte count — the field is named
+                // `summary_chars` and multi-byte summaries would otherwise
+                // over-report.
+                summary_chars: summary_text.chars().count(),
                 summary_text,
             });
         }
