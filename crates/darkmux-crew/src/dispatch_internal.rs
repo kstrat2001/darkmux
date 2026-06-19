@@ -615,6 +615,47 @@ impl Drop for DispatchBookendGuard {
     }
 }
 
+/// (#888) Reclaims the auto-allocated dispatch workspace on an error/panic
+/// exit, so repeated failed dispatches don't accumulate throwaway scratch
+/// trees in `/tmp` (a slow disk/inode DoS). ARMED only for the auto-tempdir
+/// case — an operator `--workdir` is NEVER touched (`workspace` is `None`).
+/// `disarm`ed once the container has run to its terminal record, so a
+/// completed dispatch's workspace is retained for inspection (status quo).
+/// On the #889 wait-error path the container is explicitly killed before
+/// this guard drops, so the reclaim is safe. On a PANIC mid-dispatch the
+/// container may still be live (a `Child` is not killed on drop; the watchdog
+/// reaps it independently via `--rm`), so the `remove_dir_all` is a
+/// best-effort race there — an accepted edge for a `/tmp` scratch tree on an
+/// abnormal path.
+/// host_out (trajectory/metrics) is deliberately NOT cleaned even on error:
+/// failed-dispatch forensics stay debuggable; only the potentially-large
+/// scratch tree is reclaimed.
+struct AutoWorkspaceCleanup {
+    /// `Some(path)` only for an auto-allocated tempdir workspace; `None` for
+    /// an operator `--workdir`, which is never cleaned.
+    workspace: Option<PathBuf>,
+    armed: bool,
+}
+
+impl AutoWorkspaceCleanup {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for AutoWorkspaceCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(path) = &self.workspace {
+            // Best-effort: a cleanup failure must not mask the original error
+            // propagating out (or a panic unwinding through here).
+            let _ = fs::remove_dir_all(path);
+        }
+    }
+}
+
 pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // (#703) `inject` is true only when the operator named a NON-darkmux image
     // (e.g. `rust:slim`) — then darkmux's static runtime binary is injected
@@ -808,6 +849,19 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         workspace.display(),
         workspace_source
     );
+
+    // (#888) Reclaim the auto-allocated scratch workspace if the dispatch
+    // `?`-returns or panics before the container runs to completion. Tracks
+    // the tempdir ONLY for the no-`--workdir` case; an operator `--workdir`
+    // is never cleaned. Disarmed at the terminal-record point below.
+    let mut workspace_cleanup = AutoWorkspaceCleanup {
+        workspace: if opts.workdir.is_some() {
+            None
+        } else {
+            Some(workspace.clone())
+        },
+        armed: true,
+    };
 
     // 4b. Out-of-band bookkeeping dir. The runtime writes its OWN
     //     `.darkmux-runtime/{trajectory.jsonl, metrics.json,
@@ -1252,6 +1306,10 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // but-failed `dispatch.error` above) — disarm so the guard doesn't emit a
     // second terminal on the function's normal return.
     bookend.disarm();
+    // (#888) The container ran to its terminal record — retain the auto
+    // workspace for inspection (status quo). Only error/panic exits BEFORE
+    // this point reclaim it.
+    workspace_cleanup.disarm();
 
     // (#557 slice 2) Per-dispatch runtime-turns telemetry. A telemetry
     // sibling of the dispatch.complete record above carrying just the
@@ -2695,6 +2753,58 @@ mod tests {
     use serial_test::serial;
     use std::io::Write;
     use tempfile::TempDir;
+
+    // ─── #888: auto-workspace cleanup guard ───────────────────────────
+
+    #[test]
+    fn auto_workspace_cleanup_removes_dir_when_armed_on_drop() {
+        // Simulates an error/panic exit before the dispatch completed: the
+        // armed guard reclaims the auto-allocated scratch workspace.
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("darkmux-dispatch-coder-123");
+        std::fs::create_dir_all(workspace.join("subdir")).unwrap();
+        std::fs::write(workspace.join("subdir/scratch.txt"), b"agent work").unwrap();
+        {
+            let _guard = AutoWorkspaceCleanup {
+                workspace: Some(workspace.clone()),
+                armed: true,
+            };
+        } // drop here
+        assert!(!workspace.exists(), "armed guard must reclaim the workspace on drop");
+    }
+
+    #[test]
+    fn auto_workspace_cleanup_retains_dir_when_disarmed() {
+        // Simulates a completed dispatch: disarmed → workspace retained for
+        // inspection (status quo).
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("darkmux-dispatch-coder-456");
+        std::fs::create_dir_all(&workspace).unwrap();
+        {
+            let mut guard = AutoWorkspaceCleanup {
+                workspace: Some(workspace.clone()),
+                armed: true,
+            };
+            guard.disarm();
+        } // drop here
+        assert!(workspace.exists(), "disarmed guard must retain the workspace");
+    }
+
+    #[test]
+    fn auto_workspace_cleanup_never_touches_operator_workdir() {
+        // The `--workdir` case stores `None`, so an armed drop is a no-op —
+        // an operator-provided path is never reclaimed by construction.
+        let tmp = TempDir::new().unwrap();
+        let operator_workdir = tmp.path().join("my-repo");
+        std::fs::create_dir_all(&operator_workdir).unwrap();
+        {
+            let _guard = AutoWorkspaceCleanup {
+                workspace: None,
+                armed: true,
+            };
+        } // drop here — must NOT touch anything
+        assert!(operator_workdir.exists(), "operator --workdir must never be cleaned");
+    }
 
     // ─── #680: Docker-runtime preflight status → bail mapping ─────────
 
