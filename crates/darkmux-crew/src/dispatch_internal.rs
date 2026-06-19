@@ -1134,9 +1134,28 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         })
     };
 
-    let output = child
-        .wait_with_output()
-        .context("waiting for darkmux-runtime container")?;
+    let output = match child.wait_with_output() {
+        Ok(o) => o,
+        Err(e) => {
+            // (#889) The wait itself failed — the container may still be
+            // running (orphaned). The bare `?` here used to return before
+            // signaling the watchdog or killing the container: the watchdog
+            // thread would linger to its inactivity deadline and fire a
+            // spurious kill, and a genuinely-orphaned container would run
+            // until that deadline (or forever, if hung). Do the same
+            // teardown the success path does — stop the watchdog + sampler
+            // threads — plus a best-effort `docker kill` by the
+            // deterministic container name, then surface the wait error.
+            watchdog_done.store(true, Ordering::SeqCst);
+            let _ = Command::new("docker")
+                .args(["kill", &container_name])
+                .output();
+            let _ = watchdog_handle.join();
+            sampler_stop.store(true, Ordering::SeqCst);
+            let _ = sampler_handle.join();
+            return Err(e).context("waiting for darkmux-runtime container");
+        }
+    };
 
     // Tell the watchdog we're done so it doesn't fire spuriously after
     // a natural exit. Best-effort join (it's a kill-only thread —
