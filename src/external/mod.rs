@@ -59,6 +59,15 @@ fn pull_gh(target: &str) -> Result<()> {
 /// URL responds with — HTML, JSON, markdown all valid. Downstream
 /// AI-structuring (Sprint 3 `mission propose`) handles the lowering.
 fn pull_url(target: &str) -> Result<()> {
+    // (#907) Restrict to http(s) — defense-in-depth. Today the operator
+    // types the URL by hand, but allowlisting the scheme blocks `file://`,
+    // `gopher://`, etc. (an SSRF/local-read shape) should this path ever be
+    // wired to less-trusted input.
+    if !(target.starts_with("http://") || target.starts_with("https://")) {
+        return Err(anyhow!(
+            "external pull URL must start with http:// or https:// (got: `{target}`)"
+        ));
+    }
     let output = Command::new("curl")
         .args(["-s", "-L", "--max-time", "30", target])
         .output()
