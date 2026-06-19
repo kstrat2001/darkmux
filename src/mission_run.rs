@@ -102,10 +102,72 @@ fn parse_main_worktree(porcelain: &str) -> Option<PathBuf> {
         .lines()
         .find_map(|l| l.strip_prefix("worktree "))
         // `.lines()` already strips the trailing `\r\n`; deliberately NOT
-        // `.trim()` — git emits the path raw + unquoted, so a worktree dir
+        // `.trim()` — for an UNQUOTED path git emits it raw, so a worktree dir
         // whose name legitimately ends in whitespace must round-trip intact.
         .filter(|p| !p.is_empty())
-        .map(PathBuf::from)
+        .map(decode_git_path)
+}
+
+/// Decode git's C-quoted porcelain path form (#907). When a path contains
+/// bytes git considers "unusual" (control chars, high/non-ASCII bytes, `"`,
+/// `\`) and `core.quotePath` is on (the default), git wraps the path in
+/// double-quotes with C-style escapes (`\t`, `\n`, `\r`, `\"`, `\\`, and octal
+/// `\NNN` for raw bytes). An unquoted path is returned verbatim, preserving
+/// any legitimate trailing whitespace. Without this, `mission run`/`ship`/
+/// `abort` would point at the literal quoted string for repos at non-ASCII or
+/// special-char paths (fails loudly, no corruption — but breaks the verb).
+fn decode_git_path(raw: &str) -> PathBuf {
+    if raw.len() < 2 || !raw.starts_with('"') || !raw.ends_with('"') {
+        return PathBuf::from(raw);
+    }
+    let bytes = &raw.as_bytes()[1..raw.len() - 1];
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            match bytes[i + 1] {
+                b'n' => { out.push(b'\n'); i += 2; }
+                b't' => { out.push(b'\t'); i += 2; }
+                b'r' => { out.push(b'\r'); i += 2; }
+                b'"' => { out.push(b'"'); i += 2; }
+                b'\\' => { out.push(b'\\'); i += 2; }
+                b'0'..=b'7' => {
+                    // Up to 3 octal digits → one raw byte.
+                    let mut val: u32 = 0;
+                    let mut n = 0;
+                    let mut j = i + 1;
+                    while n < 3 && j < bytes.len() && bytes[j].is_ascii_digit() && bytes[j] < b'8' {
+                        val = val * 8 + u32::from(bytes[j] - b'0');
+                        j += 1;
+                        n += 1;
+                    }
+                    out.push(val as u8);
+                    i = j;
+                }
+                // Unknown escape — keep the backslash literally.
+                _ => { out.push(bytes[i]); i += 1; }
+            }
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    // git octal-escapes raw UTF-8 bytes, so the reassembled bytes are UTF-8 in
+    // the common case; fall back to the OS-native byte path on unix otherwise.
+    match String::from_utf8(out) {
+        Ok(s) => PathBuf::from(s),
+        Err(e) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStringExt;
+                PathBuf::from(std::ffi::OsString::from_vec(e.into_bytes()))
+            }
+            #[cfg(not(unix))]
+            {
+                PathBuf::from(String::from_utf8_lossy(&e.into_bytes()).into_owned())
+            }
+        }
+    }
 }
 
 /// Authoritative answer to "did this PR merge?" vs. "couldn't tell". The
@@ -458,8 +520,9 @@ pub fn run(
         eprintln!(
             "{}",
             style::error(&format!(
-                "✗ coder dispatch exited {} — see stderr above. Worktree left at {} \
-                 for inspection (or `darkmux mission abort {mission_id} --sprint {}`).",
+                "✗ coder dispatch exited {} — see stderr above. The sprint stays Running and \
+                 the worktree is left at {} for inspection. Re-running `darkmux mission run` will \
+                 refuse until you tear it down: `darkmux mission abort {mission_id} --sprint {}`.",
                 result.exit_code,
                 wt_path.display(),
                 sprint.id,
@@ -1673,6 +1736,36 @@ mod tests {
         assert_eq!(parse_main_worktree(""), None);
         assert_eq!(parse_main_worktree("worktree \nHEAD abc\n"), None);
         assert_eq!(parse_main_worktree("HEAD abc\nbranch refs/heads/main\n"), None);
+    }
+
+    #[test]
+    fn parse_main_worktree_unquoted_path_roundtrips_verbatim() {
+        // No special chars → git emits the path unquoted; trailing space kept.
+        assert_eq!(
+            parse_main_worktree("worktree /home/me/repo \nHEAD abc\n"),
+            Some(PathBuf::from("/home/me/repo "))
+        );
+    }
+
+    #[test]
+    fn parse_main_worktree_decodes_c_quoted_path() {
+        // (#907) git C-quotes paths with special chars: a space-containing or
+        // non-ASCII path is wrapped in quotes with escapes. The leading `"`
+        // signals the quoted form.
+        assert_eq!(
+            parse_main_worktree("worktree \"/home/me/my repo\"\nHEAD abc\n"),
+            Some(PathBuf::from("/home/me/my repo"))
+        );
+        // Escaped tab + backslash + quote.
+        assert_eq!(
+            parse_main_worktree("worktree \"/tmp/a\\tb\\\\c\\\"d\"\n"),
+            Some(PathBuf::from("/tmp/a\tb\\c\"d"))
+        );
+        // Octal-escaped UTF-8 (é = 0xC3 0xA9 = \303\251).
+        assert_eq!(
+            parse_main_worktree("worktree \"/tmp/caf\\303\\251\"\n"),
+            Some(PathBuf::from("/tmp/café"))
+        );
     }
 
     #[test]

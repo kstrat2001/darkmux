@@ -189,6 +189,25 @@ fn apply_cache_mount(cmd: &mut Command, cache: &Path) {
 ///
 /// Staleness: the cache is NOT auto-invalidated — after rebuilding/pulling a
 /// new runtime image, `rm ~/.darkmux/runtime/darkmux-runtime` to refresh.
+/// (#907, P2 defense-in-depth) Reject image refs that could be smuggled as a
+/// docker flag or carry shell/control characters. An image ref is a positional
+/// arg to `docker create`/`docker run`; a leading `-`, embedded whitespace, or
+/// a newline has no place in a legitimate registry ref. The `--` fence on the
+/// docker invocations already prevents flag interpretation — this keeps the
+/// contract explicit rather than fence-dependent.
+fn validate_image_ref(image: &str) -> Result<()> {
+    if image.is_empty() {
+        bail!("image ref is empty");
+    }
+    if image.starts_with('-') {
+        bail!("image ref `{image}` starts with `-` — refusing (could be parsed as a docker flag)");
+    }
+    if image.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        bail!("image ref `{image}` contains whitespace or control characters — refusing");
+    }
+    Ok(())
+}
+
 fn ensure_runtime_binary_cached(source_image: &str) -> Result<PathBuf> {
     let dir = darkmux_types::config_access::runtime_cache_dir();
     let dest = dir.join("darkmux-runtime");
@@ -200,8 +219,12 @@ fn ensure_runtime_binary_cached(source_image: &str) -> Result<PathBuf> {
 
     // A throwaway container is the standard `docker cp` source; clean it up
     // unconditionally afterward.
+    // (#907) `--` fences the image ref as a positional arg (symmetry with the
+    // run path), and we validate it first so a ref starting with `-` / control
+    // chars can't be smuggled as a docker flag.
+    validate_image_ref(source_image)?;
     let created = Command::new("docker")
-        .args(["create", source_image])
+        .args(["create", "--", source_image])
         .output()
         .context("docker create (to extract the runtime binary for --image injection)")?;
     if !created.status.success() {
@@ -211,6 +234,12 @@ fn ensure_runtime_binary_cached(source_image: &str) -> Result<PathBuf> {
         );
     }
     let cid = String::from_utf8_lossy(&created.stdout).trim().to_string();
+    // (#907) `docker create` should echo the new container id; if stdout is
+    // empty we have no handle to `docker rm` it, so bail rather than proceed
+    // with an un-reapable throwaway container.
+    if cid.is_empty() {
+        bail!("docker create returned an empty container id while extracting the runtime binary");
+    }
 
     // Extract to a temp path then atomically rename into place. `docker cp`
     // is NOT atomic — a partial write must never be left at `dest`, or the
@@ -1013,6 +1042,11 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         cache_dir: cache_dir.clone(),
     };
 
+    // (#907) Validate the image ref before it reaches docker as a positional
+    // arg. The `--` fence in build_docker_run_argv already prevents flag
+    // interpretation; this rejects malformed refs (leading `-`, whitespace,
+    // control chars) so the contract is explicit, not just fence-dependent.
+    validate_image_ref(&argv_config.image)?;
     let argv = build_docker_run_argv(&argv_config);
 
     // (#839) Security hardening: drop all capabilities, forbid newpriv,

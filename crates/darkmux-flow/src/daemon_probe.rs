@@ -15,6 +15,11 @@
 /// rather than discovering the silence only when they open the viewer.
 pub const DEFAULT_DAEMON_ADDR: &str = "127.0.0.1:8765";
 
+/// (#907) The default daemon port as a typed value — single source for the
+/// `8765` literal so callers don't re-derive it by string-splitting
+/// `DEFAULT_DAEMON_ADDR` (which is wrong for IPv6 / port-less addresses).
+pub const DEFAULT_DAEMON_PORT: u16 = 8765;
+
 /// Probe-budget timeout for the every-dispatch reachability check.
 /// Shared between the production hardcoded probe and the test helpers
 /// so a future drift doesn't leave the budget assertions and the
@@ -133,5 +138,7 @@ mod tests {
         let parsed: std::net::SocketAddr = DEFAULT_DAEMON_ADDR.parse().expect("must parse");
         assert_eq!(parsed.port(), 8765);
         assert!(parsed.ip().is_loopback());
+        // (#907) the typed port const must stay in sync with the addr literal.
+        assert_eq!(parsed.port(), DEFAULT_DAEMON_PORT);
     }
 }

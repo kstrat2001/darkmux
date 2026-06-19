@@ -513,7 +513,9 @@ pub(crate) fn normalize_cors_origin(s: &str) -> String {
 // nudge without depending on `serve`). Re-exported here so existing
 // `crate::serve::{DEFAULT_DAEMON_ADDR, nudge_if_daemon_unreachable, ...}`
 // paths keep resolving unchanged.
-pub use darkmux_flow::daemon_probe::{nudge_if_daemon_unreachable, DEFAULT_DAEMON_ADDR};
+pub use darkmux_flow::daemon_probe::{
+    nudge_if_daemon_unreachable, DEFAULT_DAEMON_ADDR, DEFAULT_DAEMON_PORT,
+};
 
 /// Grace period (seconds) between receiving a shutdown signal and
 /// force-exiting the process. SSE streams hold connections open

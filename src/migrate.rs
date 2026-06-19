@@ -178,6 +178,15 @@ pub fn apply_migration(plan: &MigratePlan) -> Result<()> {
         if !src.is_file() {
             continue; // already moved (re-run case)
         }
+        // (#907) Re-check the destination at apply time, mirroring the
+        // plan-time guard — state can change between plan and apply, and
+        // `fs::rename` would silently CLOBBER an existing dst.
+        if dst.exists() {
+            anyhow::bail!(
+                "migration target {} already exists — refusing to overwrite (resolve the collision, then re-run)",
+                dst.display()
+            );
+        }
         if let Some(parent) = dst.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
@@ -188,6 +197,12 @@ pub fn apply_migration(plan: &MigratePlan) -> Result<()> {
     for (src, dst) in &plan.sprint_moves {
         if !src.is_file() {
             continue;
+        }
+        if dst.exists() {
+            anyhow::bail!(
+                "migration target {} already exists — refusing to overwrite (resolve the collision, then re-run)",
+                dst.display()
+            );
         }
         if let Some(parent) = dst.parent() {
             std::fs::create_dir_all(parent)

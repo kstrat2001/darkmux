@@ -2294,13 +2294,9 @@ fn fetch_machine_specs(address: &str, token: Option<&str>) -> SpecsProbe {
     } else if address.contains(':') {
         format!("http://{address}")
     } else {
-        format!(
-            "http://{address}:{}",
-            crate::serve::DEFAULT_DAEMON_ADDR
-                .split(':')
-                .nth(1)
-                .unwrap_or("8765")
-        )
+        // (#907) Use the typed port const — string-splitting the addr is
+        // wrong for IPv6 / port-less forms.
+        format!("http://{address}:{}", crate::serve::DEFAULT_DAEMON_PORT)
     };
     let url = format!("{normalized}/machine/specs");
     let agent = ureq::AgentBuilder::new()
