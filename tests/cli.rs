@@ -442,6 +442,22 @@ fn notebook_list_shows_entries() {
         .stdout(predicate::str::contains("abc123"));
 }
 
+/// (#895) `notebook list` exits 0 when the notebook dir is simply absent —
+/// a fresh user, or `notebook list && …` chaining, must not see a false error.
+#[serial_test::serial]
+#[test]
+fn notebook_list_absent_dir_succeeds() {
+    let tmp = TempDir::new().unwrap();
+    let absent = tmp.path().join("does-not-exist");
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_NOTEBOOK_DIR", absent.to_str().unwrap())
+        .arg("notebook")
+        .arg("list")
+        .assert()
+        .success();
+}
+
 /// `notebook list --machine` filters entries.
 #[serial_test::serial]
 #[test]

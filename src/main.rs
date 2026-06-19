@@ -1196,8 +1196,12 @@ fn cmd_notebook(sub: NotebookCmd) -> Result<i32> {
             // env > config.dirs.notebook > <root>/notebook (#661 Slice 3).
             let notebook_dir = darkmux_types::config_access::notebook_dir();
             if !notebook_dir.exists() {
-                println!("no notebook directory found: {}", notebook_dir.display());
-                return Ok(1);
+                // (#895) An absent notebook dir is "nothing to list", not an
+                // error — a fresh user, or `notebook list && …` chaining,
+                // must not see a false failure. Mirrors the empty-dir case
+                // below (also Ok(0)).
+                println!("no notebook directory yet: {}", notebook_dir.display());
+                return Ok(0);
             }
             let entries = notebook::list_entries(&notebook_dir, machine.as_deref())?;
             if entries.is_empty() {
