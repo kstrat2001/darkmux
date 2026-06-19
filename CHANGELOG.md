@@ -11,6 +11,38 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 
 ## [Unreleased]
 
+## [1.3.3] - 2026-06-19
+
+A crash-path-hygiene patch — the second cluster of the milestone-1.0
+safety-net drain. Four fixes that stop dispatches from corrupting operator
+config or leaking resources on crash/error paths. No schema or config-surface
+change; `brew upgrade darkmux` is a drop-in.
+
+### Fixed
+- **Atomic writes to `openclaw.json` (#901).** `apply_runtime` and the
+  `doctor --fix` path wrote the operator's runtime config with a bare
+  `fs::write` (truncate-then-stream); a crash / ENOSPC / power-loss mid-write
+  could leave the operator's whole hand-authored config (`agents.list[]`,
+  channel routing) empty or truncated. Both now write to a sibling temp and
+  `rename(2)` onto the file, so a crash leaves the old config intact.
+- **Lab-registry temp name is collision-free across threads (#898).** The
+  atomic-save temp was process-unique only (`json.tmp.{pid}`); since `save()`
+  is `pub(crate)`, two threads racing it could tear the temp before the rename.
+  It's now process- and call-unique (`json.tmp.{pid}.{counter}`).
+- **Dispatch tears down the watchdog and kills the container on a wait error
+  (#889).** If `wait_with_output` itself failed, the dispatch returned without
+  signaling the watchdog or killing the container — leaking a watchdog thread
+  (which then fired a spurious kill) and potentially orphaning a running
+  container until its deadline. The error path now stops the watchdog/sampler
+  and best-effort `docker kill`s by the deterministic container name.
+- **Auto dispatch workspaces are reclaimed on error/panic (#888).** A
+  no-`--workdir` dispatch allocates a throwaway scratch tree in `/tmp`; it was
+  never cleaned, so repeated failed dispatches accumulated trees (slow
+  disk/inode exhaustion). An RAII guard now reclaims the auto-workspace on an
+  error/panic exit before the container completes. An operator `--workdir` is
+  never touched, and the bookkeeping dir (trajectory/metrics) is always
+  retained so failed dispatches stay debuggable.
+
 ## [1.3.2] - 2026-06-19
 
 A robustness patch — the first cluster of the milestone-1.0 safety-net drain.
@@ -134,6 +166,7 @@ cluster of crew-index correctness repairs.
   idle machine's bar no longer stretches to the playhead; adds the first
   viewer-lifecycle e2e regression gate.
 
+[1.3.3]: https://github.com/kstrat2001/darkmux/releases/tag/v1.3.3
 [1.3.2]: https://github.com/kstrat2001/darkmux/releases/tag/v1.3.2
 [1.3.1]: https://github.com/kstrat2001/darkmux/releases/tag/v1.3.1
 [1.3.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.3.0
