@@ -113,6 +113,9 @@ enum Cmd {
         /// and the default search locations. (renamed from --config, #661)
         #[arg(long = "profiles-file")]
         profiles: Option<String>,
+        /// Emit machine-readable JSON instead of styled text (#907).
+        #[arg(long)]
+        json: bool,
     },
     /// List profiles in the registry.
     Profiles {
@@ -120,6 +123,9 @@ enum Cmd {
         /// and the default search locations. (renamed from --config, #661)
         #[arg(long = "profiles-file")]
         profiles: Option<String>,
+        /// Emit machine-readable JSON instead of styled text (#907).
+        #[arg(long)]
+        json: bool,
     },
     /// Lab subcommands.
     Lab {
@@ -317,6 +323,9 @@ enum RecommendationsCmd {
     Show {
         /// Optional tier id; defaults to the active hardware tier.
         tier: Option<String>,
+        /// Emit machine-readable JSON instead of styled text (#907).
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -493,11 +502,18 @@ enum CrewIndexCmd {
 #[derive(Subcommand)]
 enum RoleCmd {
     /// List every role in the index.
-    List,
+    List {
+        /// Emit machine-readable JSON instead of styled text (#907).
+        #[arg(long)]
+        json: bool,
+    },
     /// Show full details for a single role.
     Show {
         /// Role id to show.
         id: String,
+        /// Emit machine-readable JSON instead of styled text (#907).
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -804,7 +820,11 @@ enum ModelCmd {
     /// Show models currently loaded in LMStudio, grouped by ownership:
     /// darkmux-managed (under the `darkmux:` namespace) vs user state
     /// (everything else). Read-only.
-    Status,
+    Status {
+        /// Emit machine-readable JSON instead of styled text (#907).
+        #[arg(long)]
+        json: bool,
+    },
     /// Eject all darkmux-managed model loads (anything in the `darkmux:`
     /// namespace). User-loaded models are never touched. Use this when
     /// you want to release darkmux's RAM footprint without affecting
@@ -1114,8 +1134,8 @@ fn run(cmd: Cmd) -> Result<i32> {
             runtime,
             recommended,
         } => cmd_swap(profile.as_deref(), profiles.as_deref(), dry_run, quiet, &runtime, recommended),
-        Cmd::Status { profiles } => cmd_status(profiles.as_deref()),
-        Cmd::Profiles { profiles } => cmd_profiles(profiles.as_deref()),
+        Cmd::Status { profiles, json } => cmd_status(profiles.as_deref(), json),
+        Cmd::Profiles { profiles, json } => cmd_profiles(profiles.as_deref(), json),
         Cmd::Lab { sub } => cmd_lab(sub),
         Cmd::Skills { sub } => cmd_skills(sub),
         Cmd::Notebook { sub } => cmd_notebook(sub),
@@ -1456,8 +1476,8 @@ fn has_stripped_publisher(model_id: &str) -> bool {
 
 fn cmd_role(sub: RoleCmd) -> Result<i32> {
     match sub {
-        RoleCmd::List => role_cli::role_list(),
-        RoleCmd::Show { id } => role_cli::role_show(&id),
+        RoleCmd::List { json } => role_cli::role_list(json),
+        RoleCmd::Show { id, json } => role_cli::role_show(&id, json),
     }
 }
 
@@ -1980,11 +2000,17 @@ pub fn speedup_verdict(
 /// way to ask "what does darkmux recommend for my hardware?".
 fn cmd_recommendations(sub: RecommendationsCmd) -> Result<i32> {
     match sub {
-        RecommendationsCmd::Show { tier } => {
+        RecommendationsCmd::Show { tier, json } => {
             let rec = match tier.as_deref() {
                 Some(t) => recommendations::for_tier(t)?,
                 None => recommendations::for_active_hardware()?,
             };
+            if json {
+                // (#907) Serialize the Recommendation directly — the full
+                // entry (tier, status, primary/compactor, rationale, etc.).
+                println!("{}", serde_json::to_string_pretty(&rec)?);
+                return Ok(0);
+            }
             println!("Tier:     {}", rec.tier);
             println!("Status:   {:?}", rec.status);
             if let Some(name) = &rec.profile_name {
@@ -2512,17 +2538,26 @@ fn print_watched_state(states: &[crew::dispatch::WatchedPathState]) {
 
 fn cmd_model(sub: ModelCmd) -> Result<i32> {
     match sub {
-        ModelCmd::Status => cmd_model_status(),
+        ModelCmd::Status { json } => cmd_model_status(json),
         ModelCmd::Eject { dry_run } => cmd_model_eject(dry_run),
         ModelCmd::PullRecommended => cmd_model_pull_recommended(),
     }
 }
 
-fn cmd_model_status() -> Result<i32> {
+fn cmd_model_status(json: bool) -> Result<i32> {
     let loaded = lms::list_loaded()?;
     let (managed, user): (Vec<_>, Vec<_>) = loaded
         .iter()
         .partition(|m| swap::is_darkmux_owned(&m.identifier));
+    if json {
+        // (#907) machine-readable parity, grouped by ownership.
+        let out = serde_json::json!({
+            "managed": managed,
+            "user_state": user,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(0);
+    }
     println!("{}", darkmux_types::style::header(&format!("darkmux-managed ({}):", managed.len())));
     if managed.is_empty() {
         println!("  (none — `darkmux swap <profile>` to load)");
@@ -2932,14 +2967,9 @@ fn cmd_swap(
     Ok(0)
 }
 
-fn cmd_status(config: Option<&str>) -> Result<i32> {
+fn cmd_status(config: Option<&str>, json: bool) -> Result<i32> {
     let loaded = profiles::load_registry(config)?;
     let models = lms::list_loaded()?;
-    println!("registry: {}", loaded.path.display());
-    println!("loaded models ({}):", models.len());
-    for m in &models {
-        println!("  {:<40} ctx={:<8} {}", m.identifier, m.context, m.status);
-    }
     let matches: Vec<&String> = loaded
         .registry
         .profiles
@@ -2947,6 +2977,21 @@ fn cmd_status(config: Option<&str>) -> Result<i32> {
         .filter(|(_, p)| profile_matches(p, &models))
         .map(|(k, _)| k)
         .collect();
+    if json {
+        // (#907) machine-readable parity for the frontier orchestrator.
+        let out = serde_json::json!({
+            "registry": loaded.path.display().to_string(),
+            "loaded_models": models,
+            "matching_profiles": matches,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(0);
+    }
+    println!("registry: {}", loaded.path.display());
+    println!("loaded models ({}):", models.len());
+    for m in &models {
+        println!("  {:<40} ctx={:<8} {}", m.identifier, m.context, m.status);
+    }
     if matches.is_empty() {
         println!("matches no registered profile");
     } else {
@@ -2972,8 +3017,18 @@ fn profile_matches(profile: &types::Profile, loaded: &[types::LoadedModel]) -> b
     true
 }
 
-fn cmd_profiles(config: Option<&str>) -> Result<i32> {
+fn cmd_profiles(config: Option<&str>, json: bool) -> Result<i32> {
     let loaded = profiles::load_registry(config)?;
+    if json {
+        // (#907) Serialize the registry directly — `default_profile` + the
+        // full profile map, the lowest-surprise machine-readable shape.
+        let out = serde_json::json!({
+            "registry_path": loaded.path.display().to_string(),
+            "registry": loaded.registry,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(0);
+    }
     println!("{}", darkmux_types::style::header(&format!("registry: {}", loaded.path.display())));
     for (name, profile) in &loaded.registry.profiles {
         let default_marker = if loaded.registry.default_profile.as_deref() == Some(name) {
