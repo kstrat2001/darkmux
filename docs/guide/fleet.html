@@ -134,8 +134,8 @@ darkmux fleet add laptop --address 127.0.0.1:8765   <span class="comment"># self
     <pre><code>darkmux fleet status --deep</code></pre>
     <p>Fans out across every reachable peer's <code>/machine/specs</code> endpoint and renders a table:</p>
     <pre><code>MACHINE        ADDRESS                PROBE      RAM-FREE    OS              VERSION  MODELS
-laptop         100.64.1.5:8765        ✓ 23ms     78 GB       macos aarch64   1.3.3    darkmux:qwen3.6-35b-a3b-mlx
-studio         100.64.2.1:8765        ✓ 45ms     12 GB       macos aarch64   1.3.3    darkmux:qwen3-4b-instruct</code></pre>
+laptop         100.64.1.5:8765        ✓ 23ms     78 GB       macos aarch64   1.3.4    darkmux:qwen3.6-35b-a3b-mlx
+studio         100.64.2.1:8765        ✓ 45ms     12 GB       macos aarch64   1.3.4    darkmux:qwen3-4b-instruct</code></pre>
     <p>Bounded at 1s per peer; degraded peers render with <code>specs?</code> in the RAM-FREE column rather than failing the whole command. This is the "what's actually going on right now?" view across your fleet: the answer to "is the laptop's RAM full?" or "did the studio reboot and lose the model I had loaded?"</p>
 
     <h3>Watch fleet activity from any machine: the live viewer</h3>

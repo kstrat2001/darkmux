@@ -11,6 +11,40 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 
 ## [Unreleased]
 
+## [1.3.4] - 2026-06-19
+
+The third milestone-1.0 safety-net cluster — fleet-substrate + correctness
+fixes. No schema or config-surface change; `brew upgrade darkmux` is a drop-in.
+
+### Fixed
+- **Memory-headroom estimate tolerates more size formats (#904).** `eureka`'s
+  `parse_size_gb` dropped `"18.45 GiB"`, `"18.45GB"` (no space), and comma
+  sizes to `0`, undercounting the working set so the `MemoryHeadroomTight`
+  warning under-fired (a tight system read as fine). It now parses binary
+  (`GiB`/`MiB`/`TiB`) and no-space forms, and reports `Skipped` (naming the
+  model) when a size truly can't be parsed instead of silently undercounting.
+- **`notebook list` exits 0 when the dir is absent (#895).** A fresh user (or
+  `notebook list && …` chaining) no longer sees a false error exit for a
+  read-only "nothing to list".
+- **Malformed work entries are XACKed, not leaked into the PEL forever (#903).**
+  A claimed-but-unparseable fleet work entry (missing `record`, bad JSON, or a
+  non-array fields slot) is now dropped from the consumer's pending-entries
+  list via a new `Malformed` claim outcome, instead of being mistaken for a
+  connection error and left pending indefinitely.
+- **Presence reconciler closes two edge races (#902).** A failed close-edge
+  write now releases its dedup claim so a peer can still record it (no lost
+  `machine.offline`/`session.end` bracket), and the first tick after a
+  `read_live` outage rebaselines instead of re-firing long-gone machines as
+  fresh disappearances. (Also fixed a latent test-isolation flake surfaced
+  along the way.)
+
+### Changed
+- **Doc-only: the fleet work-queue `schema` tag is documented as provenance,
+  not a compat gate (#882).** Cross-version compatibility is enforced by serde
+  shape (`deny_unknown_fields` + required-field deser), as the canonical
+  `WORK_JOB_SCHEMA_VERSION` doc already states; the publish-side over-claim is
+  corrected to match. No behavior change.
+
 ## [1.3.3] - 2026-06-19
 
 A crash-path-hygiene patch — the second cluster of the milestone-1.0
@@ -166,6 +200,7 @@ cluster of crew-index correctness repairs.
   idle machine's bar no longer stretches to the playhead; adds the first
   viewer-lifecycle e2e regression gate.
 
+[1.3.4]: https://github.com/kstrat2001/darkmux/releases/tag/v1.3.4
 [1.3.3]: https://github.com/kstrat2001/darkmux/releases/tag/v1.3.3
 [1.3.2]: https://github.com/kstrat2001/darkmux/releases/tag/v1.3.2
 [1.3.1]: https://github.com/kstrat2001/darkmux/releases/tag/v1.3.1
