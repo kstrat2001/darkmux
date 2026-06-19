@@ -407,33 +407,48 @@ fn unwrap_openclaw_envelope(response: &str) -> Option<String> {
     Some(texts.join("\n\n"))
 }
 
-/// Find the first ```json … ``` fenced block (or just the first ``` …
-/// ``` if no language tag) and return its inner content. Forgiving
-/// about whitespace/case for the language tag.
+/// Find the JSON fenced block and return its inner content. Prefers a
+/// ```json-tagged opener over a bare ``` fence (#896), falling back to the
+/// first bare fence only when no tagged opener exists. Forgiving about
+/// whitespace/case for the language tag. On a truncated/unterminated block
+/// it returns a distinct "unterminated" error rather than "no block found".
 fn extract_json_block(response: &str) -> Result<String> {
-    // Scan line-by-line; track when we're inside a fenced block.
-    let mut lines = response.lines();
+    let lines: Vec<&str> = response.lines().collect();
+
+    // (#896) Prefer a ```json-tagged opener over a bare ``` fence. A bare
+    // fence wrapping some OTHER block before the real JSON would otherwise
+    // be picked as the opener and capture the wrong region. Fall back to
+    // the first bare fence only when no tagged opener exists anywhere.
+    let is_tagged = |t: &str| t.starts_with("```json") || t.starts_with("```JSON");
+    let opener = lines
+        .iter()
+        .position(|l| is_tagged(l.trim_start()))
+        .or_else(|| lines.iter().position(|l| l.trim_start() == "```"));
+    let Some(open_idx) = opener else {
+        return Err(anyhow!("no fenced ```json block found in response"));
+    };
+
+    // Capture from the line after the opener up to the next closing ```.
     let mut buf = String::new();
-    let mut inside = false;
-    for line in &mut lines {
-        let trimmed = line.trim_start();
-        if !inside
-            && (trimmed.starts_with("```json")
-                || trimmed.starts_with("```JSON")
-                || trimmed == "```")
-        {
-            inside = true;
-            continue;
-        }
-        if inside && trimmed.starts_with("```") {
+    for line in &lines[open_idx + 1..] {
+        if line.trim_start().starts_with("```") {
             return Ok(buf);
         }
-        if inside {
-            buf.push_str(line);
-            buf.push('\n');
-        }
+        buf.push_str(line);
+        buf.push('\n');
     }
-    Err(anyhow!("no fenced ```json block found in response"))
+
+    // (#896) Opener found but no closing fence: the response was almost
+    // certainly truncated mid-block (common with token-capped local
+    // models). Emit a DISTINCT error rather than the misleading "no block
+    // found" — there WAS a block, it just didn't finish. We deliberately do
+    // NOT brace-balance the partial: truncated JSON balanced into valid-but-
+    // incomplete JSON would parse into a wrong proposal, which is worse than
+    // a clear "retry with more tokens" signal.
+    Err(anyhow!(
+        "unterminated fenced ```json block (response likely truncated at {} captured chars)",
+        buf.len()
+    ))
 }
 
 fn render_proposal(p: &Proposal) {
@@ -742,6 +757,47 @@ mod tests {
         let resp = "no fenced block here, just prose";
         let err = extract_json_block(resp).expect_err("should error");
         assert!(err.to_string().contains("no fenced"));
+    }
+
+    #[test]
+    fn extract_json_block_prefers_tagged_over_bare_fence() {
+        // (#896) A bare fence wrapping some OTHER block precedes the real
+        // ```json block. The old scanner opened on the bare fence and
+        // captured the wrong region; we must prefer the tagged opener.
+        let resp = "```\nnot json — some shell snippet\n```\n```json\n{\"mission\": {}, \"sprints\": []}\n```";
+        let block = extract_json_block(resp).expect("should extract the tagged block");
+        assert!(block.contains("\"mission\""));
+        assert!(!block.contains("shell snippet"));
+    }
+
+    #[test]
+    fn extract_json_block_distinct_error_on_unterminated() {
+        // (#896) A ```json opener with no closing fence (token-truncated
+        // local model). Must be a DISTINCT "unterminated" error, not the
+        // misleading "no fenced block" — there was a block, it didn't finish.
+        let resp = "preamble\n```json\n{\"mission\": {}, \"sprints\": [";
+        let err = extract_json_block(resp).expect_err("should error on truncation");
+        let msg = err.to_string();
+        assert!(msg.contains("unterminated"), "got: {msg}");
+        assert!(!msg.contains("no fenced"), "should not be the missing-fence error: {msg}");
+    }
+
+    #[test]
+    fn extract_json_block_falls_back_to_bare_fence() {
+        // No language tag anywhere → fall back to the first bare fence.
+        let resp = "```\n{\"mission\": {}, \"sprints\": []}\n```";
+        let block = extract_json_block(resp).expect("should extract the bare-fenced block");
+        assert!(block.contains("\"mission\""));
+    }
+
+    #[test]
+    fn extract_json_block_opener_on_last_line_is_unterminated_not_panic() {
+        // (#896) Opener is the final line with nothing after it: the
+        // `[open_idx + 1..]` slice is empty (must not panic), and it's
+        // treated as truncated — a distinct unterminated error.
+        let resp = "preamble\n```json";
+        let err = extract_json_block(resp).expect_err("opener-only is unterminated");
+        assert!(err.to_string().contains("unterminated"));
     }
 
     #[test]
