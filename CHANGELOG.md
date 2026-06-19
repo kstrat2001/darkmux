@@ -11,6 +11,46 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-06-19
+
+Completes the milestone-1.0 hardening pass. The `--json` machine-readable
+output convention is now consistent across the read commands the frontier
+orchestrator parses (the additive feature that makes this a minor), plus three
+batches of correctness/safety polish from the swarm code review. No schema or
+config-surface change; `brew upgrade darkmux` is a drop-in.
+
+### Added
+- **`--json` parity across the read commands (#907).** `status`, `profiles`,
+  `model status`, `recommendations show`, and `role list`/`show` now accept
+  `--json`, emitting machine-readable output for the frontier orchestrator
+  instead of ANSI-styled text. Each serializes its existing domain shape;
+  `role list --json` carries the full (untruncated) description.
+
+### Fixed
+- **Serve-daemon request-rate hardening (#925).** A per-route request timeout,
+  a cap on concurrent SSE streams, and a bounded per-line read on the flow file,
+  so a slow or abusive client can't exhaust the daemon.
+- **Runtime nit-batch (#905).** XML tool-call promotion now fails soft per block
+  (one malformed `<tool_call>` no longer drops the whole turn's recovered calls);
+  the `TIMED OUT` marker only fires when the `timeout` wrapper actually ran (a
+  user command exiting 124 isn't mislabeled); a failed non-JSON dispatch prints
+  a summary instead of vanishing behind a bare exit code. Plus doc corrections
+  (first-close-wins think-block scan; Bash isn't workspace-validated).
+- **Lab / flow / profiles / hardware / crew nit-batch (#906).** Escalation
+  hand-off targets are validated before the index rebuild (a clear, role-named
+  error instead of an opaque deferred-FK abort that rolled back the whole
+  rebuild); loaded-context sufficiency compares in `u64` (no truncation); an
+  all-`.` `setupContent` key is rejected up front; `doctor` treats a TOCTOU
+  file deletion as Pass, not a spurious Warn; Linux `physical_cores` counts
+  physical cores (not logical); manifest reads have a 1 MiB cap; `lab register`
+  warns that a fixture's `verify_command` runs on the host shell.
+- **CLI / dispatch nit-batch (#907).** `mission migrate --apply` refuses to
+  clobber an existing destination; `mission run`/`ship`/`abort` work for repos
+  at non-ASCII / special-char paths (git C-quoted porcelain decode); docker
+  image refs are validated before reaching docker; `external pull --url`
+  allowlists `http(s)`; the default daemon port is single-sourced (correct for
+  IPv6 / port-less addresses).
+
 ## [1.3.4] - 2026-06-19
 
 The third milestone-1.0 safety-net cluster — fleet-substrate + correctness
@@ -200,6 +240,7 @@ cluster of crew-index correctness repairs.
   idle machine's bar no longer stretches to the playhead; adds the first
   viewer-lifecycle e2e regression gate.
 
+[1.4.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.4.0
 [1.3.4]: https://github.com/kstrat2001/darkmux/releases/tag/v1.3.4
 [1.3.3]: https://github.com/kstrat2001/darkmux/releases/tag/v1.3.3
 [1.3.2]: https://github.com/kstrat2001/darkmux/releases/tag/v1.3.2
