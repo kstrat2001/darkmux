@@ -77,8 +77,11 @@ fn should_patch_openclaw(opts: &SwapOpts) -> bool {
 /// load just to shrink it — the operator who loaded it bigger has the RAM for
 /// it (operator sovereignty over loaded state). Only an *insufficient* load
 /// (smaller than the minimum) triggers a reload.
-fn ctx_sufficient(loaded_ctx: u32, wanted_n_ctx: u32) -> bool {
-    loaded_ctx >= wanted_n_ctx
+fn ctx_sufficient(loaded_ctx: u64, wanted_n_ctx: u32) -> bool {
+    // (#906) Compare in u64 — `LoadedModel.context` is u64; truncating it to
+    // u32 before the check could (in principle) wrap a very large loaded
+    // context down below the wanted minimum and trigger a needless reload.
+    loaded_ctx >= u64::from(wanted_n_ctx)
 }
 
 /// (#590) The context window at which swap loads the machine's standing
@@ -186,7 +189,7 @@ pub fn swap(profile: &Profile, registry: &ProfileRegistry, opts: SwapOpts) -> Re
             continue;
         }
         let desired_ctx = want.get(&cur.identifier).copied();
-        if desired_ctx.is_some_and(|d| ctx_sufficient(cur.context as u32, d)) {
+        if desired_ctx.is_some_and(|d| ctx_sufficient(cur.context, d)) {
             continue; // already loaded with enough context
         }
         if !opts.quiet {
@@ -207,7 +210,7 @@ pub fn swap(profile: &Profile, registry: &ProfileRegistry, opts: SwapOpts) -> Re
         .collect();
     for d in &desired {
         if let Some(c) = loaded_after_unload.get(d.identifier.as_str()) {
-            if ctx_sufficient(c.context as u32, d.n_ctx) {
+            if ctx_sufficient(c.context, d.n_ctx) {
                 continue; // already loaded with enough context (n_ctx is a min)
             }
         }

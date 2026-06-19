@@ -307,8 +307,15 @@ pub fn integrity_check_all() -> Result<Vec<IntegrityReport>> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntegrityReport {
     pub path: String,
+    /// (#906) Number of RECORDS verified — the schema header on line 1 is
+    /// NOT counted, so this is a record count, not a file-line count.
     pub records_checked: u64,
     pub chain_valid: bool,
+    /// (#906) 1-indexed FILE LINE of the break (the header counts as line 1,
+    /// so the first record is line 2). Deliberately a file line, not a record
+    /// index, so an operator can jump straight to the offending line — but
+    /// note it does NOT equal `records_checked` (which excludes the header).
+    /// For a break on the first record: `records_checked == 1`, `break_at_line == 2`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub break_at_line: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]

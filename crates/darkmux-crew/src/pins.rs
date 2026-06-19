@@ -124,20 +124,25 @@ fn load_pins_uncached() -> Result<PinTable> {
         })?;
         return Ok(parsed);
     }
-    let parsed: PinTable = serde_json::from_str(EMBEDDED_PINS_JSON).unwrap_or_else(|e| {
-        panic!("BUG: embedded role-model-pins.json failed to parse: {e}")
-    });
+    // (#906) The embedded asset is a compile-time invariant, so these are
+    // genuine BUGs if they ever fire — but the function already returns
+    // `Result`, so surface them as errors rather than `panic!` (a library
+    // function aborting the process is worse than a propagated error the
+    // caller can report cleanly).
+    let parsed: PinTable = serde_json::from_str(EMBEDDED_PINS_JSON).map_err(|e| {
+        anyhow::anyhow!("BUG: embedded role-model-pins.json failed to parse: {e}")
+    })?;
     // Build-time recursion guard analogous to #159 — a default_pin or
     // per_role value that matches the "recommended" reserved profile
     // name would route through `darkmux swap recommended` infinitely
     // if anything ever evaluated the pin as a profile. Defensive:
     // empty pins fail loudly at startup.
     if parsed.default_pin.trim().is_empty() {
-        panic!("BUG: embedded pin table has empty `default_pin` — fix templates/builtin/role-model-pins.json");
+        anyhow::bail!("BUG: embedded pin table has empty `default_pin` — fix templates/builtin/role-model-pins.json");
     }
     for (role, pin) in &parsed.per_role {
         if pin.trim().is_empty() {
-            panic!(
+            anyhow::bail!(
                 "BUG: embedded pin table has empty pin for role `{role}` — fix templates/builtin/role-model-pins.json"
             );
         }

@@ -139,15 +139,42 @@ fn read_physical_cores(platform: Platform) -> Option<u32> {
         Platform::AppleSilicon | Platform::MacIntel => sysctl_u32("hw.physicalcpu")
             .or_else(|| sysctl_u32("hw.ncpu")),
         Platform::Linux => {
-            // /proc/cpuinfo lists every logical CPU; counting "processor"
-            // gives logical-core count which is good enough for our purposes.
-            std::fs::read_to_string("/proc/cpuinfo")
-                .ok()
-                .map(|t| {
-                    t.lines()
-                        .filter(|line| line.starts_with("processor"))
-                        .count() as u32
-                })
+            // (#906) /proc/cpuinfo lists every LOGICAL cpu. Physical cores are
+            // the unique (physical id, core id) pairs — count those so the
+            // `physical_cores` field is actually physical. Fall back to the
+            // logical "processor" count when those fields are absent (common
+            // on ARM / in containers), which is the best available there.
+            let text = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+            let mut physical = std::collections::HashSet::new();
+            let (mut phys_id, mut core_id): (Option<u32>, Option<u32>) = (None, None);
+            let mut logical = 0u32;
+            let parse_val = |line: &str| line.split(':').nth(1).and_then(|s| s.trim().parse::<u32>().ok());
+            for line in text.lines() {
+                if line.starts_with("processor") {
+                    logical += 1;
+                } else if line.starts_with("physical id") {
+                    phys_id = parse_val(line);
+                } else if line.starts_with("core id") {
+                    core_id = parse_val(line);
+                } else if line.trim().is_empty() {
+                    if let (Some(p), Some(c)) = (phys_id, core_id) {
+                        physical.insert((p, c));
+                    }
+                    phys_id = None;
+                    core_id = None;
+                }
+            }
+            // Trailing block with no terminating blank line.
+            if let (Some(p), Some(c)) = (phys_id, core_id) {
+                physical.insert((p, c));
+            }
+            if !physical.is_empty() {
+                Some(physical.len() as u32)
+            } else if logical > 0 {
+                Some(logical)
+            } else {
+                None
+            }
         }
         _ => None,
     }

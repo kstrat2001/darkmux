@@ -241,7 +241,24 @@ pub(crate) fn load_role_prompt(role_id: &str) -> Option<String> {
     None
 }
 
+/// (#906) Defense-in-depth cap on a single manifest file. Role / mission /
+/// sprint / crew manifests are small (a few KB); a multi-MB file is either
+/// corrupt or hostile, and an unbounded `read_to_string` + `from_str` is a
+/// needless memory-amplification surface. 1 MiB is far above any real
+/// manifest while still bounding the blast radius.
+const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+
 fn read_json<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Result<T> {
+    if let Ok(meta) = fs::metadata(path) {
+        if meta.len() > MAX_MANIFEST_BYTES {
+            anyhow::bail!(
+                "manifest at {} is {} bytes — exceeds the {MAX_MANIFEST_BYTES} byte cap; \
+                 refusing to parse (corrupt or hostile manifest?)",
+                path.display(),
+                meta.len()
+            );
+        }
+    }
     let raw = fs::read_to_string(path)
         .with_context(|| format!("reading manifest at {}", path.display()))?;
     serde_json::from_str(&raw)

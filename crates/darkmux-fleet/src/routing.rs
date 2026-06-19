@@ -217,7 +217,13 @@ pub fn build_work_job(
     let published_at_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+        .unwrap_or_else(|_| {
+            // (#906) A pre-epoch / badly-NTP-skewed clock makes 0 (also the
+            // "unset" sentinel) the stamp. Surface it rather than silently
+            // mislabeling the record's publish time.
+            eprintln!("darkmux: system clock is before the Unix epoch — stamping published_at_unix_ms=0");
+            0
+        });
     WorkJob {
         target_machine,
         role_id,

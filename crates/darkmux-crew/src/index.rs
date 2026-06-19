@@ -469,6 +469,27 @@ fn populate(conn: &mut Connection) -> Result<()> {
         }
     }
 
+    // (#906) Pre-validate escalation hand-off targets resolve to a known
+    // role BEFORE inserting, so a dangling `HandOffTo` target fails with a
+    // clear, role-named message instead of an opaque deferred-FK abort at
+    // COMMIT that rolls back the entire rebuild. Validates against the full
+    // role set so forward references (target defined later) are allowed.
+    let known_role_ids: std::collections::HashSet<&str> =
+        roles.iter().map(|r| r.id.as_str()).collect();
+    for role in &roles {
+        if let EscalationContract::HandOffTo(target) = &role.escalation_contract {
+            if !known_role_ids.contains(target.as_str()) {
+                anyhow::bail!(
+                    "role `{}` declares an escalation hand-off to `{}`, but no role with \
+                     that id exists — fix the `escalation_contract` hand-off target or add \
+                     the missing role",
+                    role.id,
+                    target
+                );
+            }
+        }
+    }
+
     // Roles.
     for role in &roles {
         let tool_palette_json = serde_json::to_string(&role.tool_palette)?;

@@ -437,11 +437,23 @@ fn check_role_model_pin_drift() -> Check {
     }
     let raw = match std::fs::read_to_string(&openclaw_path) {
         Ok(r) => r,
-        Err(_) => {
+        // (#906) TOCTOU: the file existed at the `exists()` check above but
+        // could be deleted before this read. A NotFound here is the same
+        // "no config" state as the early return — Pass, not a spurious Warn.
+        // Other IO errors (perms, etc.) are real problems → Warn.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Check {
+                name: "role-model pin drift".into(),
+                status: Status::Pass,
+                message: format!("(no openclaw config at {} — skipping)", openclaw_path.display()),
+                hint: None,
+            };
+        }
+        Err(e) => {
             return Check {
                 name: "role-model pin drift".into(),
                 status: Status::Warn,
-                message: format!("could not read {}", openclaw_path.display()),
+                message: format!("could not read {}: {e}", openclaw_path.display()),
                 hint: None,
             };
         }
@@ -2149,11 +2161,22 @@ fn check_agent_role_definitions() -> Check {
     }
     let raw = match std::fs::read_to_string(&openclaw_path) {
         Ok(r) => r,
-        Err(_) => {
+        // (#906) TOCTOU: deleted between `exists()` and this read → NotFound
+        // is the same "no config" state as the early return (Pass). Other IO
+        // errors are real problems → Warn.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Check {
+                name: "agent role scaffolds".into(),
+                status: Status::Pass,
+                message: format!("(no {} on disk — skipping)", openclaw_path.display()),
+                hint: None,
+            };
+        }
+        Err(e) => {
             return Check {
                 name: "agent role scaffolds".into(),
                 status: Status::Warn,
-                message: format!("could not read {}", openclaw_path.display()),
+                message: format!("could not read {}: {e}", openclaw_path.display()),
                 hint: None,
             };
         }
