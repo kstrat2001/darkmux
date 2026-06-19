@@ -372,7 +372,7 @@ The case for darkmux: **once you accept that static configs leave performance on
 
 ## Status
 
-✅ **v1.3.1**, semver-stable. The dispatch-to-PR loop, the missions lens + `mission status`, live observability, and the Homebrew pipeline are the stable surface; v1.3.0 added serve-daemon authentication (#881), and v1.3.1 is a security-hardening patch that closes workspace-escape, traversal, and denial-of-service surfaces across the runtime, lab, serve daemon, and crew/flow subsystems.
+✅ **v1.3.2**, semver-stable. The dispatch-to-PR loop, the missions lens + `mission status`, live observability, and the Homebrew pipeline are the stable surface; the v1.3.x line is the milestone-1.0 hardening drain — v1.3.1 closed a security cluster (workspace-escape, traversal, DoS), and v1.3.2 is the agent-loop/runtime robustness cluster (watchdog poison-resilience, compaction + detector correctness, malformed-output handling).
 
 **Shipped:**
 

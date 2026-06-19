@@ -322,6 +322,13 @@ pub fn run(
     // 100% is the safety net for that case. Soft is best-effort
     // between-turn telemetry; hard is the unconditional kill.
     //
+    // (#887) Verified: the host watchdog resets its deadline only on
+    // proof-of-work (tool.completed + compaction), NOT on `model.partial`
+    // SSE chunks — so a within-turn hang or a proof-of-work-silent turn is
+    // bounded by the hard kill at 100%. A mid-stream SOFT nudge isn't
+    // actionable (can't inject into an in-progress generation), so this
+    // stays host-only by design.
+    //
     // - soft threshold: `inactivity_soft_threshold_secs(budget)` — a
     //   linear 75% of the inactivity budget, floored so it's never zero
     //   and capped to leave headroom before the hard kill on small

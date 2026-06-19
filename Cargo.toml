@@ -6,7 +6,7 @@ exclude = ["runtime"]
 
 [package]
 name = "darkmux"
-version = "1.3.1"
+version = "1.3.2"
 edition = "2021"
 description = "Lab and multiplexer for local LLM configurations"
 license = "MIT"

@@ -11,6 +11,45 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 
 ## [Unreleased]
 
+## [1.3.2] - 2026-06-19
+
+A robustness patch — the first cluster of the milestone-1.0 safety-net drain.
+Five agent-loop / runtime correctness fixes, no schema or config-surface change;
+`brew upgrade darkmux` is a drop-in.
+
+### Fixed
+- **Hard-kill watchdog survives a poisoned deadline mutex (#890).** The inactivity
+  deadline is shared between the trajectory tailer and the host watchdog; a panic
+  in the tailer while holding the lock poisoned the mutex, and the watchdog's
+  `.lock().unwrap()` then panicked on its next tick — silently disabling the
+  hard kill so a stuck dispatch could hang forever. All deadline lock sites now
+  recover a poisoned lock, making the safety-net thread the most panic-resilient
+  consumer rather than the least.
+- **Error-path metrics no longer mislabel infra failures as turn-cap hits (#884).**
+  The loop-error branch hardcoded `max_turns_reached: true`, so every
+  infrastructure failure looked like a turn-cap termination, corrupting the
+  three-way result discrimination downstream consumers branch on. It now reports
+  `false`, matching the success path's derivation.
+- **Compaction reports the true summary size (#885).** `summary_chars` was read
+  from a fixed `messages` index (assuming the preserved head was exactly two
+  messages); the compaction functions now return the inserted summary's actual
+  char count, so the observability field can't silently report an unrelated
+  message's length.
+- **Failure-cascade detector framing corrected (#886).** The per-`(tool, args)`-
+  signature failure counter was named `consecutive_failures` and described as
+  "consecutive / in a row" across the runtime, the host flow message, and the
+  analyze-run skill doc — none accurate. Renamed to `failure_count` and reworded
+  to the real per-signature semantics. Behavior unchanged.
+- **`mission propose` JSON extraction handles malformed model output (#896).**
+  `extract_json_block` now prefers a ` ```json `-tagged opener over a bare fence
+  (so a bare code block before the real JSON can't capture the wrong region) and
+  emits a distinct "unterminated fenced block" error on truncated output instead
+  of a misleading "no block found".
+
+(Also: #887 — the inactivity soft-warning's inability to fire mid-stream — was
+confirmed working-as-intended and documented; the host hard kill covers
+within-turn hangs. No behavior change.)
+
 ## [1.3.1] - 2026-06-18
 
 A security-hardening patch. Drains the milestone-1.0 security cluster — five
@@ -95,6 +134,7 @@ cluster of crew-index correctness repairs.
   idle machine's bar no longer stretches to the playhead; adds the first
   viewer-lifecycle e2e regression gate.
 
+[1.3.2]: https://github.com/kstrat2001/darkmux/releases/tag/v1.3.2
 [1.3.1]: https://github.com/kstrat2001/darkmux/releases/tag/v1.3.1
 [1.3.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.3.0
 
