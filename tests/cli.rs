@@ -442,22 +442,6 @@ fn notebook_list_shows_entries() {
         .stdout(predicate::str::contains("abc123"));
 }
 
-/// (#895) `notebook list` exits 0 when the notebook dir is simply absent —
-/// a fresh user, or `notebook list && …` chaining, must not see a false error.
-#[serial_test::serial]
-#[test]
-fn notebook_list_absent_dir_succeeds() {
-    let tmp = TempDir::new().unwrap();
-    let absent = tmp.path().join("does-not-exist");
-    Command::cargo_bin("darkmux")
-        .unwrap()
-        .env("DARKMUX_NOTEBOOK_DIR", absent.to_str().unwrap())
-        .arg("notebook")
-        .arg("list")
-        .assert()
-        .success();
-}
-
 /// `notebook list --machine` filters entries.
 #[serial_test::serial]
 #[test]
@@ -505,7 +489,8 @@ fn notebook_list_machine_filter() {
         .stdout(predicate::str::contains("no notebook entries found"));
 }
 
-/// `notebook list` with no notebook dir returns error.
+/// (#895) `notebook list` with an absent notebook dir exits 0 — "nothing to
+/// list" is success (fresh user / `notebook list && …` chaining), not an error.
 #[test]
 fn notebook_list_no_dir() {
     let mut cmd = Command::cargo_bin("darkmux").unwrap();
@@ -513,8 +498,8 @@ fn notebook_list_no_dir() {
         .arg("list")
         .env("DARKMUX_NOTEBOOK_DIR", "/no/such/path/xyz")
         .assert()
-        .failure()
-        .stdout(predicate::str::contains("no notebook directory found"));
+        .success()
+        .stdout(predicate::str::contains("no notebook directory yet"));
 }
 
 /// `external pull --stdin` echoes stdin to stdout. The other two plugins
