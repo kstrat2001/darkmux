@@ -325,8 +325,13 @@ pub(crate) enum ClaimOutcome {
 /// Returns the auto-assigned entry ID (the canonical `work_id`).
 ///
 /// XADD fields:
-/// - `schema`: `WORK_JOB_SCHEMA_VERSION` ("3") — wire-version tag so
-///   future schema bumps can be detected by older runners
+/// - `schema`: `WORK_JOB_SCHEMA_VERSION` ("3") — a wire-version PROVENANCE
+///   tag, NOT a compat gate: the consumer never reads it (#882). Cross-version
+///   compatibility is enforced by serde SHAPE — `#[serde(deny_unknown_fields)]`
+///   plus required-field deserialization of `record` — per the
+///   `WORK_JOB_SCHEMA_VERSION` doc below. (A serde-compatible-but-semantically-
+///   different change would still need a real read-the-tag gate; deferred until
+///   a major bump actually requires it, rather than half-claimed here.)
 /// - `record`: the JSON-serialized WorkJob
 ///
 /// Capped at `WORK_STREAM_MAXLEN` via `MAXLEN ~ N` so a stuck runner
