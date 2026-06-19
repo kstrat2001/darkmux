@@ -203,9 +203,19 @@ impl LabRegistry {
         // file. temp-write + rename closes both: a crash leaves only an
         // orphan temp, and `rename(2)` is atomic on POSIX so a reader
         // always sees the complete old or complete new file — no reader
-        // lock required. The temp is process-unique so a stale temp from
-        // a previously-crashed writer is never reused mid-flight.
-        let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+        // lock required. The temp name is process- AND call-unique (#898):
+        // an atomic counter alongside the pid. `save()` is `pub(crate)`, so
+        // two threads racing it must not tear each other's temp before the
+        // rename — a `{pid}`-only name would. `flock(2)` covers today's call
+        // graph, but the unique temp name is the construction-level guarantee
+        // (and matches `darkmux-profiles`' `write_atomic_json`, #901).
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
+        let tmp = path.with_extension(format!(
+            "json.tmp.{}.{}",
+            std::process::id(),
+            SAVE_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
         std::fs::write(&tmp, json)
             .with_context(|| format!("writing {}", tmp.display()))?;
         std::fs::rename(&tmp, path).with_context(|| {
@@ -592,6 +602,37 @@ mod tests {
             leftover.is_empty(),
             "save() left a temp file behind: {leftover:?}"
         );
+    }
+
+    /// (#898) `save()` is `pub(crate)`; two threads racing it must not tear
+    /// each other's temp before the rename. The temp name is now process-
+    /// AND call-unique, so concurrent saves to the same path never collide.
+    /// Guards against a `{pid}`-only regression (which reliably collides
+    /// across these rounds).
+    #[test]
+    fn save_concurrent_writers_to_same_path_dont_collide() {
+        let dir = TempDir::new().unwrap();
+        let reg_path = std::sync::Arc::new(dir.path().join("lab-registry.json"));
+        for _ in 0..8 {
+            let handles: Vec<_> = (0..16)
+                .map(|_| {
+                    let p = std::sync::Arc::clone(&reg_path);
+                    std::thread::spawn(move || LabRegistry::default().save(&p))
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap().expect("each concurrent save succeeds");
+            }
+            // Always a complete, parseable registry — never torn.
+            LabRegistry::load(&reg_path).expect("registry parseable after concurrent saves");
+            // No temp leaked.
+            let leftover: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().contains("json.tmp."))
+                .collect();
+            assert!(leftover.is_empty(), "orphan temp after concurrent saves: {leftover:?}");
+        }
     }
 
     /// (#496) `with_locked` persists a successful mutation and creates
