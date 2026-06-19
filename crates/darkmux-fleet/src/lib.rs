@@ -468,14 +468,14 @@ mod tests {
     fn parse_xreadgroup_handles_nil() {
         // Timeout / no work case — Redis returns Nil.
         let result = parse_xreadgroup_response(&redis::Value::Nil).unwrap();
-        assert!(result.is_none());
+        assert!(matches!(result, ClaimOutcome::Empty));
     }
 
     #[test]
     fn parse_xreadgroup_handles_empty_bulk() {
         // Some redis-rs versions return Bulk(vec![]) for empty.
         let result = parse_xreadgroup_response(&redis::Value::Array(vec![])).unwrap();
-        assert!(result.is_none());
+        assert!(matches!(result, ClaimOutcome::Empty));
     }
 
     #[test]
@@ -512,15 +512,17 @@ mod tests {
             ])]),
         ])]);
 
-        let claimed = parse_xreadgroup_response(&response).unwrap().unwrap();
+        let ClaimOutcome::Job(claimed) = parse_xreadgroup_response(&response).unwrap() else {
+            panic!("expected ClaimOutcome::Job");
+        };
         assert_eq!(claimed.work_id, entry_id);
         assert_eq!(claimed.job, job);
     }
 
     #[test]
-    fn parse_xreadgroup_errors_on_missing_record_field() {
+    fn parse_xreadgroup_malformed_on_missing_record_field() {
         use redis::Value as V;
-        // Entry has fields but no `record` key — caller can't dispatch.
+        // Entry has fields but no `record` key — claimed but unparseable.
         let response = V::Array(vec![V::Array(vec![
             V::BulkString(b"darkmux:work".to_vec()),
             V::Array(vec![V::Array(vec![
@@ -532,8 +534,61 @@ mod tests {
                 ]),
             ])]),
         ])]);
-        let err = parse_xreadgroup_response(&response).unwrap_err();
-        assert!(err.to_string().contains("missing `record`"));
+        // (#903) Malformed, NOT Err — the work_id is surfaced so the runner
+        // can XACK it out of the PEL instead of leaving it pending forever.
+        let ClaimOutcome::Malformed { work_id, reason } =
+            parse_xreadgroup_response(&response).unwrap()
+        else {
+            panic!("expected ClaimOutcome::Malformed");
+        };
+        assert_eq!(work_id, "1716192000000-0");
+        assert!(reason.contains("missing `record`"));
+    }
+
+    #[test]
+    fn parse_xreadgroup_malformed_on_invalid_record_json() {
+        use redis::Value as V;
+        // (#903) The `record` field is present but isn't valid WorkJob JSON —
+        // the other poison trigger. Must be Malformed (work_id surfaced for
+        // XACK), not Err.
+        let response = V::Array(vec![V::Array(vec![
+            V::BulkString(b"darkmux:work".to_vec()),
+            V::Array(vec![V::Array(vec![
+                V::BulkString(b"1716192000000-7".to_vec()),
+                V::Array(vec![
+                    V::BulkString(b"record".to_vec()),
+                    V::BulkString(b"{ not valid json".to_vec()),
+                ]),
+            ])]),
+        ])]);
+        let ClaimOutcome::Malformed { work_id, reason } =
+            parse_xreadgroup_response(&response).unwrap()
+        else {
+            panic!("expected ClaimOutcome::Malformed");
+        };
+        assert_eq!(work_id, "1716192000000-7");
+        assert!(reason.contains("invalid WorkJob JSON"));
+    }
+
+    #[test]
+    fn parse_xreadgroup_malformed_on_non_array_fields() {
+        use redis::Value as V;
+        // (#903) A valid entry-id but a non-array fields slot — the work_id is
+        // already known, so it's Malformed (XACK-able poison), not Err.
+        let response = V::Array(vec![V::Array(vec![
+            V::BulkString(b"darkmux:work".to_vec()),
+            V::Array(vec![V::Array(vec![
+                V::BulkString(b"1716192000000-9".to_vec()),
+                V::BulkString(b"not-a-fields-array".to_vec()),
+            ])]),
+        ])]);
+        let ClaimOutcome::Malformed { work_id, reason } =
+            parse_xreadgroup_response(&response).unwrap()
+        else {
+            panic!("expected ClaimOutcome::Malformed");
+        };
+        assert_eq!(work_id, "1716192000000-9");
+        assert!(reason.contains("fields list is not an array"));
     }
 
     #[test]

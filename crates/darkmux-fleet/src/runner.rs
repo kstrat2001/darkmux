@@ -1,6 +1,6 @@
 //! Fleet runner loop — claims jobs off the global work-stream and dispatches them.
 
-use crate::{ack_job, claim_job, init_consumer_group, ClaimedJob, WorkJob, WORK_STREAM};
+use crate::{ack_job, claim_job, init_consumer_group, ClaimOutcome, ClaimedJob, WorkJob, WORK_STREAM};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -101,14 +101,30 @@ fn runner_main() {
 
     loop {
         match claim_job(&client, RUNNER_CONSUMER_GROUP, &machine_id, RUNNER_BLOCK_MS) {
-            Ok(None) => {
+            Ok(ClaimOutcome::Empty) => {
                 // BLOCK timeout — no work. Loop and re-block.
                 continue;
             }
-            Ok(Some(claimed)) => {
-                handle_claimed_job(&client, claimed);
+            Ok(ClaimOutcome::Job(claimed)) => {
+                handle_claimed_job(&client, *claimed);
+            }
+            Ok(ClaimOutcome::Malformed { work_id, reason }) => {
+                // (#903) A poison entry: claimed into this consumer's PEL but
+                // unparseable, so it can NEVER be dispatched. ACK it to drop it
+                // from the pending-entries list — otherwise it sits pending
+                // forever (the `>` cursor never redelivers it). Log loudly: a
+                // malformed entry means a buggy or hostile peer published it.
+                eprintln!(
+                    "{}",
+                    darkmux_types::style::warn(&format!(
+                        "darkmux-runner: dropping unparseable work entry {work_id} ({reason}); \
+                         XACK to clear it from the pending-entries list"
+                    ))
+                );
+                let _ = ack_job(&client, RUNNER_CONSUMER_GROUP, &work_id);
             }
             Err(e) => {
+                // Genuine connection/protocol error — back off and retry.
                 eprintln!(
                     "{}",
                     darkmux_types::style::warn(&format!(
