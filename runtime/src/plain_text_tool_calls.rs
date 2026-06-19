@@ -402,6 +402,11 @@ fn parse_optional_harmony_closing(text: &str, start: usize) -> usize {
     start
 }
 
+// (#905) `max_payload_bytes` is the SAME `DEFAULT_MAX_PAYLOAD_BYTES`
+// (256 KB) cap the XML-block path uses — both call sites pass the one
+// constant, so the JSON-object and `<tool_call>`-block scanners are
+// bounded identically. The cap is measured here against the running
+// object span (`i + 1 - cursor`), not the whole input.
 fn consume_json_object(
     text: &str,
     start: usize,
@@ -483,11 +488,16 @@ fn parse_xml_tool_calls(
         let close_rel = match region.rfind(XML_FUNCTION_CLOSE) {
             Some(fn_close) => region[fn_close..].find(XML_TOOL_CALL_CLOSE).map(|rel| fn_close + rel),
             None => region.find(XML_TOOL_CALL_CLOSE),
-        }?;
+        };
+        // (#905) Fail soft per block: if this block's close tag can't be
+        // located (the rare literal-`<tool_call>`-in-a-value edge) or its
+        // payload won't parse, STOP scanning but KEEP the blocks already
+        // found — a single bad block must not silently drop the whole turn's
+        // tool-call promotion (the old `?` returned None for everything).
+        let Some(close_rel) = close_rel else { break };
         let payload_end = payload_start + close_rel;
         let payload = &text[payload_start..payload_end];
-        let block = parse_xml_block(payload, allowed_tool_names)?;
-        let mut block = block;
+        let Some(mut block) = parse_xml_block(payload, allowed_tool_names) else { break };
         block.start = block_start;
         block.end = payload_end + XML_TOOL_CALL_CLOSE.len();
         blocks.push(block);

@@ -530,6 +530,12 @@ impl ChunkAccumulator {
     /// non-streaming today). If `finish_reason` was never set, defaults
     /// to "stop" — this happens with malformed streams; the caller's
     /// terminal-state handling will treat it as a normal completion.
+    /// (#905) This is a deliberate choice over flagging an abnormal
+    /// termination: LMStudio reliably emits `finish_reason` on the final
+    /// SSE chunk, so a never-set value means a dead/truncated connection
+    /// where the partial `content` accumulated so far is the best result
+    /// available — surfacing it as a clean stop beats a synthetic error
+    /// arm that the loop has no extra recovery for.
     pub fn into_response(self) -> ChatResponse {
         let assistant_message = Message {
             role: "assistant".to_string(),

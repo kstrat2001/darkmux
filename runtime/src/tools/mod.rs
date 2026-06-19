@@ -439,7 +439,11 @@ fn execute_bash(raw_args: &str, workspace_root: &Path) -> Result<String> {
     // If `timeout` fires, exit code is 124 — we surface that marker
     // explicitly in the returned text.
     let shell = shell_for_commands();
-    let output = if has_timeout_command() {
+    // (#905) Capture once: gates BOTH the wrapper choice and the TIMED-OUT
+    // marker below, so a user command that happens to exit 124 isn't
+    // mislabeled as a timeout when the wrapper was never used.
+    let used_timeout = has_timeout_command();
+    let output = if used_timeout {
         Command::new("timeout")
             .arg(format!("{timeout_secs}"))
             .arg(shell)
@@ -460,7 +464,7 @@ fn execute_bash(raw_args: &str, workspace_root: &Path) -> Result<String> {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let exit_code = output.status.code().unwrap_or(-1);
 
-    let timed_out_marker = if exit_code == 124 {
+    let timed_out_marker = if used_timeout && exit_code == 124 {
         format!(" (TIMED OUT after {timeout_secs}s)")
     } else {
         String::new()
@@ -476,12 +480,17 @@ fn execute_bash(raw_args: &str, workspace_root: &Path) -> Result<String> {
 /// Probe whether the `timeout` command is available. Alpine has it via
 /// coreutils-default-symlinks; stock macOS doesn't.
 fn has_timeout_command() -> bool {
-    Command::new("sh")
-        .arg("-c")
-        .arg("command -v timeout >/dev/null 2>&1")
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    // (#905) Cache the probe — `execute_bash` calls this on every command and
+    // the answer can't change within a dispatch; mirrors `shell_for_commands`.
+    static HAS_TIMEOUT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HAS_TIMEOUT.get_or_init(|| {
+        Command::new("sh")
+            .arg("-c")
+            .arg("command -v timeout >/dev/null 2>&1")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
 }
 
 /// (#703 Slice 2) The shell to run agent `bash`-tool commands under. Prefer

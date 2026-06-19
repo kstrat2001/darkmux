@@ -1473,9 +1473,12 @@ fn persist_structured_compaction_output(
 /// assistant message content wrapped in these tags; we extract for the
 /// flow stream + viewer but leave the original content untouched.
 ///
-/// Implementation is a tag-scan, not a regex — keeps the runtime free
-/// of regex deps and handles nested tags by treating the outermost
-/// pairs as the boundary. Malformed (unclosed) tags are ignored.
+/// Implementation is a tag-scan, not a regex — keeps the runtime free of
+/// regex deps. It is FIRST-CLOSE-WINS: each `<think>` pairs with the next
+/// `</think>`, so a (rare) nested `<think>` inside another would mis-segment
+/// rather than nest by outermost boundary. Acceptable — qwen 3.x
+/// thinking-mode doesn't emit nested think tags. Malformed (unclosed) tags
+/// are ignored. (#905: doc corrected to match the first-close-wins behavior.)
 fn extract_think_blocks(content: &str) -> Vec<String> {
     const OPEN: &str = "<think>";
     const CLOSE: &str = "</think>";

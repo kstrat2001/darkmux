@@ -1,9 +1,11 @@
 //! Workspace-root path enforcement.
 //!
-//! All Read / Write / Bash tool paths must resolve to somewhere inside
-//! the dispatch's workspace root (default: `/workspace` inside the
-//! container). This module is the security-critical piece — every
-//! tool that touches the filesystem routes through here first.
+//! All Read / Write tool paths must resolve to somewhere inside the
+//! dispatch's workspace root (default: `/workspace` inside the container).
+//! This module is the security-critical piece for those — they route through
+//! here first. The Bash tool does NOT use this validator: its commands run
+//! in the container and are bounded by the container sandbox itself, not by
+//! workspace-root path resolution (#905).
 //!
 //! Three attack vectors the validator defends against:
 //!

@@ -699,6 +699,14 @@ fn run_dispatch(args: &[String]) -> ExitCode {
                 0, 0, 0, 0, 0,
             );
             println!("{}", serde_json::to_string(&envelope).unwrap_or_else(|_| "{}".into()));
+        } else {
+            // (#905) Human mode was silent on failure while the success path
+            // is verbose — print a failure summary so a non-JSON dispatch
+            // doesn't just vanish with a bare exit code.
+            println!("--- dispatch failed ---");
+            println!("result: {result_str}");
+            println!("model:  {model}");
+            println!("wall:   {wall_ms}ms");
         }
         return ExitCode::from(1);
     }
