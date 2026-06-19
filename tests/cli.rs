@@ -489,7 +489,8 @@ fn notebook_list_machine_filter() {
         .stdout(predicate::str::contains("no notebook entries found"));
 }
 
-/// `notebook list` with no notebook dir returns error.
+/// (#895) `notebook list` with an absent notebook dir exits 0 — "nothing to
+/// list" is success (fresh user / `notebook list && …` chaining), not an error.
 #[test]
 fn notebook_list_no_dir() {
     let mut cmd = Command::cargo_bin("darkmux").unwrap();
@@ -497,8 +498,8 @@ fn notebook_list_no_dir() {
         .arg("list")
         .env("DARKMUX_NOTEBOOK_DIR", "/no/such/path/xyz")
         .assert()
-        .failure()
-        .stdout(predicate::str::contains("no notebook directory found"));
+        .success()
+        .stdout(predicate::str::contains("no notebook directory yet"));
 }
 
 /// `external pull --stdin` echoes stdin to stdout. The other two plugins
