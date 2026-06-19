@@ -372,7 +372,7 @@ The case for darkmux: **once you accept that static configs leave performance on
 
 ## Status
 
-✅ **v1.3.3**, semver-stable. The dispatch-to-PR loop, the missions lens + `mission status`, live observability, and the Homebrew pipeline are the stable surface; the v1.3.x line is the milestone-1.0 hardening drain — v1.3.1 closed a security cluster, v1.3.2 the agent-loop/runtime robustness cluster, and v1.3.3 the crash-path-hygiene cluster (atomic config writes, watchdog/container teardown on error, auto-workspace cleanup).
+✅ **v1.3.4**, semver-stable. The dispatch-to-PR loop, the missions lens + `mission status`, live observability, and the Homebrew pipeline are the stable surface; the v1.3.x line is the milestone-1.0 hardening drain — v1.3.1 (security), v1.3.2 (agent-loop/runtime robustness), v1.3.3 (crash-path hygiene), and v1.3.4 (fleet-substrate + correctness: PEL poison-handling, presence edge races, memory-headroom parsing).
 
 **Shipped:**
 
