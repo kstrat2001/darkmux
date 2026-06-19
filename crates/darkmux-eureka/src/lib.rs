@@ -598,10 +598,26 @@ fn eval_memory_headroom(ctx: &Context) -> Verdict {
     // (size_gb + 0.5 * ctx_k / 32) per loaded model and flag if the
     // total exceeds 80% of unified memory.
     let mut estimated_gb: f64 = 0.0;
+    let mut unparseable: Vec<String> = Vec::new();
     for m in &ctx.loaded_models {
-        let size_gb = parse_size_gb(&m.size).unwrap_or(0.0);
-        let kv_gb = 0.5 * (m.context as f64) / 32_768.0;
-        estimated_gb += size_gb + kv_gb;
+        match parse_size_gb(&m.size) {
+            Some(size_gb) => {
+                let kv_gb = 0.5 * (m.context as f64) / 32_768.0;
+                estimated_gb += size_gb + kv_gb;
+            }
+            // (#904) A model whose size we can't parse would silently
+            // contribute 0, undercounting the working set and making this
+            // warning under-fire in the dangerous direction (a tight system
+            // reads as fine). Surface it as Skipped instead of a wrong Pass.
+            None => unparseable.push(format!("{} ({})", m.identifier, m.size)),
+        }
+    }
+    if !unparseable.is_empty() {
+        return Verdict::Skipped(format!(
+            "couldn't parse loaded-model size(s): {} — headroom estimate would be \
+             wrong-low, so not firing",
+            unparseable.join(", ")
+        ));
     }
     let budget_gb = total_ram_gb as f64;
     let pct = (estimated_gb / budget_gb) * 100.0;
@@ -769,15 +785,24 @@ fn eval_agents_default_model_resolves(ctx: &Context) -> Verdict {
 }
 
 pub fn parse_size_gb(s: &str) -> Option<f64> {
-    // LMStudio reports sizes like "18.45 GB" or "2.15 GB" — best-effort
-    // parse, returns None on anything unexpected.
+    // LMStudio reports sizes like "18.45 GB", "2.15 GB", or "18.45 GiB".
+    // (#904) Tolerate the binary (`GiB`/`MiB`/`TiB`) suffixes and a missing
+    // space (`18.45GB`) — the old `split_once(' ')` + GB/MB/TB-only match
+    // dropped all of those to `None`, which the caller then summed as 0,
+    // undercounting the working set so the headroom warning under-fired. For
+    // a headroom *estimate* the binary-vs-decimal gap is within the noise, so
+    // the `i`-variants map to the same magnitude. Returns `None` on anything
+    // genuinely unparseable (a localized comma, no unit) — the caller now
+    // surfaces that as Skipped rather than a silent 0.
     let s = s.trim();
-    let (num, unit) = s.split_once(' ')?;
-    let num: f64 = num.parse().ok()?;
-    match unit.to_ascii_uppercase().as_str() {
-        "GB" => Some(num),
-        "MB" => Some(num / 1024.0),
-        "TB" => Some(num * 1024.0),
+    // Split the leading number from the trailing unit, with or without a space.
+    let split = s.find(|c: char| !(c.is_ascii_digit() || c == '.'))?;
+    let (num_str, unit_raw) = s.split_at(split);
+    let num: f64 = num_str.trim().parse().ok()?;
+    match unit_raw.trim().to_ascii_uppercase().as_str() {
+        "GB" | "GIB" => Some(num),
+        "MB" | "MIB" => Some(num / 1024.0),
+        "TB" | "TIB" => Some(num * 1024.0),
         _ => None,
     }
 }
@@ -912,6 +937,48 @@ mod tests {
                 assert!(message.contains("120000"));
             }
             other => panic!("expected Fail fire, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_size_gb_tolerates_gib_binary_and_missing_space() {
+        // (#904) The old parser dropped all of these to None → summed as 0.
+        assert_eq!(parse_size_gb("18.45 GB"), Some(18.45));
+        assert_eq!(parse_size_gb("18.45GB"), Some(18.45)); // no space
+        assert_eq!(parse_size_gb("18.45 GiB"), Some(18.45)); // binary suffix
+        assert_eq!(parse_size_gb("512 MB"), Some(0.5));
+        assert_eq!(parse_size_gb("512MiB"), Some(0.5));
+        assert_eq!(parse_size_gb("2 TB"), Some(2048.0));
+        assert_eq!(parse_size_gb("2TiB"), Some(2048.0));
+        // Genuinely unparseable → None (caller surfaces it as Skipped, not 0).
+        assert_eq!(parse_size_gb("18,45 GB"), None); // localized comma
+        assert_eq!(parse_size_gb("nonsense"), None);
+        assert_eq!(parse_size_gb("18.45"), None); // no unit
+    }
+
+    #[test]
+    fn memory_headroom_skips_when_a_model_size_is_unparseable() {
+        use darkmux_types::LoadedModel;
+        // (#904) An unparseable size must Skip (so the operator sees it),
+        // NOT silently contribute 0 and Pass on a system that might be tight.
+        let ctx = Context {
+            openclaw_config: None,
+            loaded_models: vec![LoadedModel {
+                identifier: "weird-model".into(),
+                model: "weird-model".into(),
+                status: "idle".into(),
+                size: "18,45 GB".into(), // localized comma → unparseable
+                context: 32_768,
+            }],
+            available_models: None,
+            total_ram_gb: 32,
+        };
+        match eval_memory_headroom(&ctx) {
+            Verdict::Skipped(msg) => {
+                assert!(msg.contains("weird-model"), "got: {msg}");
+                assert!(msg.contains("couldn't parse"), "got: {msg}");
+            }
+            other => panic!("expected Skipped on unparseable size, got {other:?}"),
         }
     }
 
