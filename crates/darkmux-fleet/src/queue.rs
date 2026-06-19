@@ -300,6 +300,27 @@ pub(crate) struct ClaimedJob {
     pub job: WorkJob,
 }
 
+/// (#903) Outcome of a single `claim_job` / `parse_xreadgroup_response`.
+/// Distinguishes a poison entry (claimed into this consumer's PEL but
+/// unparseable — the caller should `XACK` it so it doesn't sit pending
+/// forever) from an empty read and a genuine connection/protocol error
+/// (which stays `Err` and warrants a backoff, not an ACK).
+#[derive(Debug)]
+pub(crate) enum ClaimOutcome {
+    /// BLOCK timeout / no entries.
+    Empty,
+    /// A valid claimed job ready to dispatch. Boxed because `ClaimedJob`
+    /// carries a full `WorkJob` — far larger than the other variants, so an
+    /// unboxed `Job` would bloat every `ClaimOutcome` to that size.
+    Job(Box<ClaimedJob>),
+    /// An entry was claimed (it's in this consumer's PEL) but can't be parsed
+    /// into a `WorkJob` — missing `record` field or invalid JSON. It can
+    /// NEVER be processed, so the runner `XACK`s it to drop the poison from
+    /// the PEL. `work_id` is known because it's extracted before the
+    /// record/deser step.
+    Malformed { work_id: String, reason: String },
+}
+
 /// Publish a job onto the single global Redis Stream (`WORK_STREAM`).
 /// Returns the auto-assigned entry ID (the canonical `work_id`).
 ///
@@ -402,7 +423,7 @@ pub(crate) fn claim_job(
     group: &str,
     consumer: &str,
     block_ms: u64,
-) -> Result<Option<ClaimedJob>> {
+) -> Result<ClaimOutcome> {
     let mut conn = client
         .get_connection()
         .context("opening Redis connection to claim work job")?;
@@ -424,20 +445,21 @@ pub(crate) fn claim_job(
         .query(&mut conn)
         .with_context(|| format!("XREADGROUP from {WORK_STREAM}"))?;
 
-    let Some(value) = raw else { return Ok(None) };
-    let claimed = parse_xreadgroup_response(&value)?;
-    Ok(claimed)
+    let Some(value) = raw else { return Ok(ClaimOutcome::Empty) };
+    parse_xreadgroup_response(&value)
 }
 
-/// Parse XREADGROUP's nested-array response into an optional ClaimedJob.
-/// Returns `Ok(None)` when the response is empty (timeout / no work);
-/// extracted as a pure function so it's unit-testable without Redis.
-pub(crate) fn parse_xreadgroup_response(value: &redis::Value) -> Result<Option<ClaimedJob>> {
+/// Parse XREADGROUP's nested-array response into a [`ClaimOutcome`].
+/// `Empty` on an empty response (timeout / no work); `Malformed` when an
+/// entry was claimed but its `record` is missing or unparseable (the caller
+/// XACKs it, #903); `Err` only on an unexpected protocol shape. Extracted as
+/// a pure function so it's unit-testable without Redis.
+pub(crate) fn parse_xreadgroup_response(value: &redis::Value) -> Result<ClaimOutcome> {
     use redis::Value as V;
 
     // Bulk(nil) or Nil → timeout, no work.
     if matches!(value, V::Nil) {
-        return Ok(None);
+        return Ok(ClaimOutcome::Empty);
     }
 
     // Expected shape: Bulk([Bulk([stream_name, Bulk([Bulk([id, Bulk([k,v,k,v...])])])])])
@@ -446,21 +468,21 @@ pub(crate) fn parse_xreadgroup_response(value: &redis::Value) -> Result<Option<C
         _ => return Err(anyhow!("XREADGROUP: unexpected outer shape: {value:?}")),
     };
     if outer.is_empty() {
-        return Ok(None);
+        return Ok(ClaimOutcome::Empty);
     }
     let stream_block = match &outer[0] {
         V::Array(b) => b,
         _ => return Err(anyhow!("XREADGROUP: expected stream block")),
     };
     if stream_block.len() < 2 {
-        return Ok(None);
+        return Ok(ClaimOutcome::Empty);
     }
     let entries = match &stream_block[1] {
         V::Array(b) => b,
         _ => return Err(anyhow!("XREADGROUP: expected entries list")),
     };
     if entries.is_empty() {
-        return Ok(None);
+        return Ok(ClaimOutcome::Empty);
     }
     let entry = match &entries[0] {
         V::Array(b) => b,
@@ -476,13 +498,36 @@ pub(crate) fn parse_xreadgroup_response(value: &redis::Value) -> Result<Option<C
     };
     let fields = match &entry[1] {
         V::Array(b) => b,
-        _ => return Err(anyhow!("XREADGROUP: expected fields list")),
+        // (#903) work_id is known but the fields aren't a list — this entry
+        // is claimed-but-unparseable poison, same class as a missing record.
+        // Route to Malformed so the runner XACKs it, rather than Err (which
+        // would leave it stuck in the PEL forever).
+        _ => {
+            return Ok(ClaimOutcome::Malformed {
+                work_id,
+                reason: "fields list is not an array".to_string(),
+            })
+        }
     };
-    let record_json = extract_field(fields, "record")
-        .ok_or_else(|| anyhow!("XREADGROUP entry missing `record` field"))?;
-    let job: WorkJob = serde_json::from_str(&record_json)
-        .with_context(|| format!("deserializing WorkJob from entry {work_id}"))?;
-    Ok(Some(ClaimedJob { work_id, job }))
+    let Some(record_json) = extract_field(fields, "record") else {
+        // (#903) Claimed but no `record` field — poison. Hand the work_id
+        // back so the runner can XACK it out of the pending-entries list.
+        return Ok(ClaimOutcome::Malformed {
+            work_id,
+            reason: "missing `record` field".to_string(),
+        });
+    };
+    let job: WorkJob = match serde_json::from_str(&record_json) {
+        Ok(j) => j,
+        Err(e) => {
+            // (#903) Claimed but the record isn't a valid WorkJob — poison.
+            return Ok(ClaimOutcome::Malformed {
+                work_id,
+                reason: format!("invalid WorkJob JSON: {e}"),
+            });
+        }
+    };
+    Ok(ClaimOutcome::Job(Box::new(ClaimedJob { work_id, job })))
 }
 
 /// Pull a field's value out of a Redis field-list (`[k, v, k, v, ...]`).
