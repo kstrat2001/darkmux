@@ -372,7 +372,7 @@ The case for darkmux: **once you accept that static configs leave performance on
 
 ## Status
 
-✅ **v1.3.4**, semver-stable. The dispatch-to-PR loop, the missions lens + `mission status`, live observability, and the Homebrew pipeline are the stable surface; the v1.3.x line is the milestone-1.0 hardening drain — v1.3.1 (security), v1.3.2 (agent-loop/runtime robustness), v1.3.3 (crash-path hygiene), and v1.3.4 (fleet-substrate + correctness: PEL poison-handling, presence edge races, memory-headroom parsing).
+✅ **v1.4.0**, semver-stable. The dispatch-to-PR loop, the missions lens + `mission status`, live observability, and the Homebrew pipeline are the stable surface. The v1.3.x line was the milestone-1.0 hardening drain — v1.3.1 (security), v1.3.2 (agent-loop/runtime robustness), v1.3.3 (crash-path hygiene), v1.3.4 (fleet-substrate + correctness) — and **v1.4.0 closes that milestone**: the swarm-review cleanup batches plus `--json` parity across the read commands (`status`, `profiles`, `model status`, `recommendations show`, `role list`/`show`), so the frontier orchestrator gets machine-readable output everywhere.
 
 **Shipped:**
 
