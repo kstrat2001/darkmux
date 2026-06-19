@@ -15,13 +15,44 @@ use std::io::{BufRead, IsTerminal};
 use std::net::SocketAddr;
 use std::path::{Path as StdPath, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
+
+/// (#925) Per-route request timeout for the NON-streaming routes. Bounds a
+/// slow/hung request; the long-lived `/flow/:date/stream` SSE route is
+/// deliberately excluded.
+const REQUEST_TIMEOUT_SECS: u64 = 30;
+
+/// (#925) Max simultaneously-open SSE streams across the daemon, so a client
+/// can't exhaust connections. Generous for a personal fleet's viewers.
+const MAX_CONCURRENT_SSE: usize = 64;
+
+/// (#925) Per-line byte cap for the day-file reader. A single flow record is
+/// small; a line beyond this (a corrupt/adversarial flows-dir file with no
+/// newline) is skipped rather than ballooned into one allocation.
+const MAX_FLOW_LINE_BYTES: usize = 1 << 20; // 1 MiB
 
 /// Application state shared across handlers.
 #[derive(Clone)]
 pub(crate) struct AppState {
     flows_dir: PathBuf,
     worktrees_base: PathBuf,
+    /// (#925) Count of currently-open SSE streams; `flow_stream_handler`
+    /// gates new streams on `MAX_CONCURRENT_SSE` and an `SseSlot` guard
+    /// decrements this on disconnect.
+    sse_open: Arc<AtomicUsize>,
+}
+
+/// (#925) RAII slot for one open SSE stream: decrements `AppState::sse_open`
+/// when dropped (the stream ends or the client disconnects). Carried inside
+/// the SSE stream so its lifetime exactly tracks the connection's.
+struct SseSlot(Arc<AtomicUsize>);
+
+impl Drop for SseSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Validate a path segment as a bare date string (`YYYY-MM-DD`).
@@ -140,7 +171,11 @@ pub(crate) fn build_router_with_worktrees_base(
     flows_dir: PathBuf,
     worktrees_base: PathBuf,
 ) -> Router {
-    let state = AppState { flows_dir, worktrees_base };
+    let state = AppState {
+        flows_dir,
+        worktrees_base,
+        sse_open: Arc::new(AtomicUsize::new(0)),
+    };
     let auth_on = darkmux_flow::serve_token_present();
 
     // /diff is gated unconditionally when a token exists (even on loopback).
@@ -150,12 +185,17 @@ pub(crate) fn build_router_with_worktrees_base(
         get(diff_handler)
     };
 
-    let mut router = Router::new()
+    // (#925) Keep the long-lived SSE stream route SEPARATE so the per-route
+    // request timeout below never applies to it (it's meant to stay open).
+    let streaming = Router::new().route("/flow/:date/stream", get(flow_stream_handler));
+
+    // Every other (non-streaming) route gets a request timeout, bounding a
+    // slow/hung request.
+    let timed = Router::new()
         .route("/", get(root_html))
         .route("/play/:date", get(play_html))
         .route("/health", get(health))
         .route("/flow/:date", get(flow_handler))
-        .route("/flow/:date/stream", get(flow_stream_handler))
         .route("/flow-days", get(flow_days_handler))
         .route("/flow-status", get(flow_status_handler))
         .route("/model/status", get(model_status_handler))
@@ -164,7 +204,12 @@ pub(crate) fn build_router_with_worktrees_base(
         .route("/sprints", get(sprints_handler))
         .route("/fleet/sessions/live", get(fleet_sessions_live_handler))
         .route("/fleet/machines/live", get(fleet_machines_live_handler))
-        .route("/diff/:session_id", diff_route);
+        .route("/diff/:session_id", diff_route)
+        .layer(tower_http::timeout::TimeoutLayer::new(Duration::from_secs(
+            REQUEST_TIMEOUT_SECS,
+        )));
+
+    let mut router = timed.merge(streaming);
 
     // Remote-only gate, added BEFORE the CORS layer so CORS ends up outermost
     // (handles preflight + sets headers first); the gate runs just inside it.
@@ -1348,6 +1393,19 @@ async fn flow_stream_handler(
     };
     let date_owned = date.to_string();
 
+    // (#925) Bound concurrent SSE streams so a client can't exhaust
+    // connections. fetch_add-then-check; roll back + 503 if over the cap.
+    // The `SseSlot` (carried in the stream below) decrements on disconnect.
+    let prev = state.sse_open.fetch_add(1, Ordering::SeqCst);
+    if prev >= MAX_CONCURRENT_SSE {
+        state.sse_open.fetch_sub(1, Ordering::SeqCst);
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "too many concurrent streams",
+        ));
+    }
+    let slot = SseSlot(Arc::clone(&state.sse_open));
+
     // Probe Redis once at request time. If the URL is set AND we can
     // open a connection, use the XREAD path. Otherwise fall back to
     // the file-tail. Probe is cheap (~ms) and bounds the failure mode
@@ -1399,7 +1457,12 @@ async fn flow_stream_handler(
             Box::pin(build_tail_stream(path, start_offset))
         };
 
-    Ok(Sse::new(event_stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
+    // (#925) Carry the SSE slot inside the stream so the open-count decrement
+    // happens exactly when the connection ends or the client disconnects.
+    let guarded = stream::unfold((event_stream, slot), |(mut s, slot)| async move {
+        s.next().await.map(|item| (item, (s, slot)))
+    });
+    Ok(Sse::new(guarded.boxed()).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
 }
 
 /// GET /flow/:date — returns flow records for a UTC day.
@@ -1658,27 +1721,75 @@ async fn read_flow_records_from_file(
     date: &str,
     flows_dir: &std::path::Path,
 ) -> Vec<serde_json::Value> {
-    use tokio::io::AsyncBufReadExt;
+    use tokio::io::AsyncReadExt;
     let path = flows_dir.join(format!("{date}.jsonl"));
     let file = match tokio::fs::File::open(&path).await {
         Ok(f) => f,
         Err(_) => return Vec::new(), // missing file = empty (not an error)
     };
-    let mut lines = tokio::io::BufReader::new(file).lines();
+    let mut reader = tokio::io::BufReader::new(file);
     let mut ring: std::collections::VecDeque<serde_json::Value> =
         std::collections::VecDeque::with_capacity(MAX_FLOW_FILE_RECORDS.min(1024));
-    while let Ok(Some(line)) = lines.next_line().await {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-            if ring.len() == MAX_FLOW_FILE_RECORDS {
-                ring.pop_front();
+
+    // (#925) Bounded line read: accumulate bytes up to MAX_FLOW_LINE_BYTES; a
+    // line that exceeds the cap (a corrupt/adversarial no-newline flows file)
+    // is skipped — drained to its next newline — rather than read into one
+    // ballooning allocation. Chunked (not byte-at-a-time) for speed.
+    let mut chunk = [0u8; 8192];
+    let mut line: Vec<u8> = Vec::new();
+    let mut over_cap = false;
+    loop {
+        let n = match reader.read(&mut chunk).await {
+            Ok(0) => break, // EOF
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        for &b in &chunk[..n] {
+            if b == b'\n' {
+                if !over_cap {
+                    push_flow_line(&line, &mut ring);
+                }
+                line.clear();
+                over_cap = false;
+            } else if over_cap {
+                // Draining an over-long line — discard until its newline.
+            } else if line.len() >= MAX_FLOW_LINE_BYTES {
+                eprintln!(
+                    "darkmux serve: skipping a >{MAX_FLOW_LINE_BYTES}-byte line in {} \
+                     (corrupt/adversarial flows file)",
+                    path.display()
+                );
+                over_cap = true;
+                line.clear();
+            } else {
+                line.push(b);
             }
-            ring.push_back(v);
         }
     }
+    // A final line with no trailing newline.
+    if !over_cap && !line.is_empty() {
+        push_flow_line(&line, &mut ring);
+    }
     ring.into()
+}
+
+/// (#925) Parse one flow-record line and push it into the bounded ring
+/// (newest-`MAX_FLOW_FILE_RECORDS`). Non-UTF-8, empty, or non-JSON lines are
+/// dropped silently — the same tolerance the old `.lines()` loop had.
+fn push_flow_line(line: &[u8], ring: &mut std::collections::VecDeque<serde_json::Value>) {
+    let s = match std::str::from_utf8(line) {
+        Ok(s) => s.trim(),
+        Err(_) => return,
+    };
+    if s.is_empty() {
+        return;
+    }
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
+        if ring.len() == MAX_FLOW_FILE_RECORDS {
+            ring.pop_front();
+        }
+        ring.push_back(v);
+    }
 }
 
 /// Tail a `.jsonl` file from `start_offset`, yielding each new complete
@@ -4128,6 +4239,32 @@ mod tests {
                 (total - MAX_FLOW_FILE_RECORDS) as u64
             );
             assert_eq!(records.last().unwrap()["n"].as_u64().unwrap(), (total - 1) as u64);
+        }
+
+        #[tokio::test]
+        async fn flow_file_read_skips_a_pathological_oversize_line() {
+            // (#925) A single line larger than MAX_FLOW_LINE_BYTES (a corrupt
+            // or adversarial flows file with no newline) is skipped — drained
+            // to its next newline — not read into one ballooning allocation.
+            // The surrounding valid records are still returned, and empty /
+            // non-JSON lines are tolerated (push_flow_line drops them).
+            let today = today_utc_date();
+            let tmp = TempDir::new().unwrap();
+            let mut buf = String::new();
+            buf.push_str(&format!(r#"{{"ts":"{today}T00:00:00Z","n":1}}"#));
+            buf.push('\n');
+            buf.push('\n'); // empty line — skipped
+            buf.push_str("not valid json\n"); // non-JSON — skipped
+            buf.push_str(&"x".repeat(MAX_FLOW_LINE_BYTES + 100)); // over-cap — skipped
+            buf.push('\n');
+            buf.push_str(&format!(r#"{{"ts":"{today}T00:00:00Z","n":2}}"#));
+            buf.push('\n');
+            fs::write(tmp.path().join(format!("{today}.jsonl")), buf).unwrap();
+
+            let records = read_flow_records_from_file(&today, tmp.path()).await;
+            assert_eq!(records.len(), 2, "oversize/empty/non-JSON lines skipped, valid kept");
+            assert_eq!(records[0]["n"].as_u64().unwrap(), 1);
+            assert_eq!(records[1]["n"].as_u64().unwrap(), 2);
         }
 
         // ─── #270 PR-B: redis_tail_lines (SSE Redis tail) ────────────────
