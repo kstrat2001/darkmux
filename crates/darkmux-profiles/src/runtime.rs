@@ -7,6 +7,31 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Write `contents` to `path` atomically: stream to a sibling temp file,
+/// then `rename(2)` onto `path` (atomic on POSIX). A crash / ENOSPC /
+/// power-loss mid-write leaves `path` untouched — the operator's whole
+/// hand-authored config (`agents.list[]`, channel routing) can't be
+/// truncated to empty by a torn `fs::write` (#901). The temp name is
+/// process- AND call-unique (an atomic counter), so concurrent writers
+/// never tear each other's temp before the rename.
+fn write_atomic_json(path: &Path, contents: &str) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let tmp = path.with_extension(format!(
+        "json.tmp.{}.{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&tmp, contents).with_context(|| format!("writing {}", tmp.display()))?;
+    if let Err(e) = fs::rename(&tmp, path) {
+        // Best-effort cleanup so a failed rename doesn't orphan the temp;
+        // surface the original rename failure.
+        let _ = fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("atomically replacing {}", path.display()));
+    }
+    Ok(())
+}
+
 /// Resolve the openclaw config path for a given operation.
 ///
 /// Lookup order:
@@ -177,7 +202,7 @@ pub fn apply_runtime(profile: &Profile) -> Result<bool> {
 
     if modified {
         let pretty = serde_json::to_string_pretty(&config)?;
-        fs::write(&path, pretty + "\n").with_context(|| format!("writing {}", path.display()))?;
+        write_atomic_json(&path, &(pretty + "\n"))?;
     }
     Ok(modified)
 }
@@ -372,8 +397,7 @@ pub fn fix_ctx_window_to_loaded(
 
     if !changes.is_empty() {
         let pretty = serde_json::to_string_pretty(&config)?;
-        fs::write(config_path, pretty + "\n")
-            .with_context(|| format!("writing {}", config_path.display()))?;
+        write_atomic_json(config_path, &(pretty + "\n"))?;
     }
     Ok(changes)
 }
@@ -571,6 +595,53 @@ mod tests {
     use darkmux_types::{Profile, ProfileModel, ProfileRuntime, RuntimeCompactionConfig};
     use serde_json::Value as JsonValue;
     use tempfile::TempDir;
+
+    #[test]
+    fn write_atomic_json_writes_content_and_leaves_no_temp() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("openclaw.json");
+        write_atomic_json(&path, "{\"k\":1}\n").expect("atomic write");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"k\":1}\n");
+        // No orphaned sibling temp left behind on the success path.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "orphan temp left: {leftovers:?}");
+    }
+
+    #[test]
+    fn write_atomic_json_concurrent_writers_to_same_path_dont_collide() {
+        // (#901, pre-empts #898) The temp name is process- AND call-unique,
+        // so concurrent writers to the SAME path never tear each other's
+        // temp before the rename. Each rename consumes its own unique temp.
+        // Multiple rounds so a {pid}-only temp name (the #898 bug) reliably
+        // collides at least once rather than passing a single round by luck.
+        let dir = TempDir::new().unwrap();
+        let path = std::sync::Arc::new(dir.path().join("openclaw.json"));
+        let content = "{\"shared\":true}\n";
+        for _ in 0..8 {
+            let handles: Vec<_> = (0..16)
+                .map(|_| {
+                    let p = std::sync::Arc::clone(&path);
+                    std::thread::spawn(move || write_atomic_json(&p, content))
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap().expect("each concurrent atomic write succeeds");
+            }
+            // Final file is the complete content (never torn) ...
+            assert_eq!(std::fs::read_to_string(&*path).unwrap(), content);
+            // ... and no temp survived the race.
+            let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+                .collect();
+            assert!(leftovers.is_empty(), "orphan temp after concurrent writers: {leftovers:?}");
+        }
+    }
 
     /// Build a `RuntimeCompactionConfig` from a flat (key, value) list
     /// — every pair lands in `extras`. Lets these tests keep their
