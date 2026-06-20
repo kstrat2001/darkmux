@@ -13,6 +13,6 @@ A charter **links** to its milestone rather than copying the issue list — so t
 | **M5 — Runtime / agent-loop robustness** | [M5.md](./M5.md) | [milestone/6](https://github.com/kstrat2001/darkmux/milestone/6) | next |
 | **M6 — Fleet (many machines become one)** | [M6.md](./M6.md) | [milestone/7](https://github.com/kstrat2001/darkmux/milestone/7) | sequenced |
 | **M7 — Observability / viewer** | [M7.md](./M7.md) | [milestone/8](https://github.com/kstrat2001/darkmux/milestone/8) | sequenced |
-| **M8 — Capability routing** | _pending_ | [milestone/9](https://github.com/kstrat2001/darkmux/milestone/9) | sequenced |
+| **M8 — Capability routing** | [M8.md](./M8.md) | [milestone/9](https://github.com/kstrat2001/darkmux/milestone/9) | sequenced |
 
 Milestones are **themes, not release numbers** — long-lived and decoupled from cargo versions ([why](../../ROADMAP.md)). Each charter names its own target release.
