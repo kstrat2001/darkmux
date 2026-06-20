@@ -10,7 +10,7 @@ A charter **links** to its milestone rather than copying the issue list — so t
 | Theme | Charter | Milestone | Status |
 |---|---|---|---|
 | **M4 — Dispatch-to-PR loop depth** | [M4.md](./M4.md) | [milestone/5](https://github.com/kstrat2001/darkmux/milestone/5) | **active (Now)** |
-| **M5 — Runtime / agent-loop robustness** | _pending_ | [milestone/6](https://github.com/kstrat2001/darkmux/milestone/6) | next |
+| **M5 — Runtime / agent-loop robustness** | [M5.md](./M5.md) | [milestone/6](https://github.com/kstrat2001/darkmux/milestone/6) | next |
 | **M6 — Fleet (many machines become one)** | _pending_ | [milestone/7](https://github.com/kstrat2001/darkmux/milestone/7) | sequenced |
 | **M7 — Observability / viewer** | _pending_ | [milestone/8](https://github.com/kstrat2001/darkmux/milestone/8) | sequenced |
 | **M8 — Capability routing** | _pending_ | [milestone/9](https://github.com/kstrat2001/darkmux/milestone/9) | sequenced |
