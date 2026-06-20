@@ -4,6 +4,8 @@ darkmux is past its [1.0](https://github.com/kstrat2001/darkmux/releases) founda
 
 Milestones are **themes**, not release numbers — they're long-lived and decoupled from cargo versions (a release can ship parts of several). The themes are sequenced, but they overlap: foundational and cross-cutting work is pulled into whichever theme activates it.
 
+Per-milestone **charters** — the full goal, research grounding, scope, success criteria, and target release for each theme — live in [`docs/roadmap/`](docs/roadmap/). This file is the map; the charters are the depth.
+
 ## The north star
 
 darkmux orchestrates **local** LLMs to do real work — a profile multiplexer + a dispatch-to-PR loop + a unified observability stream, driven by a frontier orchestrator (Claude Code, Cursor, etc.) that "writes the loop." Optimization, not replacement; the harness before the model; the operator always in the loop with full provenance. See [`README.md`](README.md) and [`CLAUDE.md`](CLAUDE.md).
@@ -11,6 +13,8 @@ darkmux orchestrates **local** LLMs to do real work — a profile multiplexer + 
 ## Now — M4: Dispatch-to-PR loop depth
 
 The lead theme. Harden the daily-driver loop and formalize it as a first-class capability: the orchestration loop (coder → fresh-context review → fix → frontier sign-off → PR), its failure modes, and its termination discipline.
+
+📋 **Full charter:** [`docs/roadmap/M4.md`](docs/roadmap/M4.md) — goal, the synthesized research + dogfood grounding, scope clusters, sequence, success criteria, and target release.
 
 This theme is **grounded in the loop-engineering literature**: the field crystallized into a named discipline over the past year, and the research supports the architecture darkmux already ships (observability-driven detectors, cross-context verification). Key items carry the citations:
 
