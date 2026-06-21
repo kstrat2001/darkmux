@@ -1,8 +1,8 @@
 # darkmux roadmap
 
-darkmux is past its [1.0](https://github.com/kstrat2001/darkmux/releases) foundations release. This file is the human-readable map of where it's going; the live detail lives in [GitHub Milestones](https://github.com/kstrat2001/darkmux/milestones) and [Issues](https://github.com/kstrat2001/darkmux/issues).
+darkmux is past its [1.0](https://github.com/kstrat2001/darkmux/releases) foundations release. This file is the human-readable map of where it's going; the live detail lives in the [`theme:*` labels](https://github.com/kstrat2001/darkmux/labels?q=theme) and [Issues](https://github.com/kstrat2001/darkmux/issues), with milestones tracking [releases](https://github.com/kstrat2001/darkmux/releases).
 
-Milestones are **themes**, not release numbers — they're long-lived and decoupled from cargo versions (a release can ship parts of several). The themes are sequenced, but they overlap: foundational and cross-cutting work is pulled into whichever theme activates it.
+Themes are tracked as **`theme:*` labels** — concurrent lanes, many-per-issue — not milestones; **milestones mean releases**. The lanes are *prioritized* (one leads), not *sequenced*: work happens across several at once, a release bundles whatever's ready from any of them, and cross-cutting work is pulled into whichever lane activates it.
 
 Per-milestone **charters** — the full goal, research grounding, scope, success criteria, and target release for each theme — live in [`docs/roadmap/`](docs/roadmap/). This file is the map; the charters are the depth.
 
@@ -23,14 +23,16 @@ This theme is **grounded in the loop-engineering literature**: the field crystal
 - [#453](https://github.com/kstrat2001/darkmux/issues/453) — wrong-diagnosis-stuck escalation (concurrent with the #389 watchdog tuning)
 - [#48](https://github.com/kstrat2001/darkmux/issues/48) — formalize the loop as the standard dispatch-to-PR skill ([#63](https://github.com/kstrat2001/darkmux/issues/63) core stages = the control-flow backbone)
 
-## Next — the sequence
+## The other lanes
 
-| Theme | Milestone | What it covers | Research anchor (verified) |
+These run **concurrently** with M4 — open and worked-on as each is ripe, not queued behind it. M4 just leads. Each links its charter (the depth) and its live `theme:*` issues.
+
+| Theme | Live issues | What it covers | Research anchor (verified) |
 |---|---|---|---|
-| **Runtime / agent-loop robustness** | [M5](https://github.com/kstrat2001/darkmux/milestone/6) | the *inner* loop: error taxonomy first, recovery behaviors, compaction tuning, streaming, and the harness that [learns from its own failure record](https://github.com/kstrat2001/darkmux/issues/400) | self-healing = detect + taxonomy + replan ([arXiv 2605.06737](https://arxiv.org/abs/2605.06737)); failure-aware observability ([arXiv 2606.01365](https://arxiv.org/abs/2606.01365)) |
-| **Fleet — many machines become one** | [M6](https://github.com/kstrat2001/darkmux/milestone/7) | version-compat first, then event-sourced mission state, cross-machine workspace handoff, topology-driven liveness | event-sourcing as the distributed-agent backbone ([akka.io](https://akka.io/blog/event-sourcing-the-backbone-of-agentic-ai)); capability discovery ([arXiv 2511.19113](https://arxiv.org/abs/2511.19113)) |
-| **Observability / viewer** | [M7](https://github.com/kstrat2001/darkmux/milestone/8) | one drill-down viewer over the unified stream; crew roster, sprint burn-down, eureka anomalies; an OTel-GenAI alignment spike | OpenTelemetry [GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/) (emerging standard, still in development) |
-| **Capability routing** | [M8](https://github.com/kstrat2001/darkmux/milestone/9) | backend abstraction first, then capability vectors, then continuous routing (not hardware-tier labels) | RouteLLM ([arXiv 2406.18665](https://arxiv.org/abs/2406.18665)); Skill Profiles ([arXiv 2602.02386](https://arxiv.org/abs/2602.02386)) |
+| **[Runtime / agent-loop robustness](docs/roadmap/M5.md)** | [`theme:m5-runtime`](https://github.com/kstrat2001/darkmux/issues?q=is%3Aopen+label%3A%22theme%3Am5-runtime%22) | the *inner* loop: error taxonomy first, recovery behaviors, compaction tuning, streaming, and the harness that [learns from its own failure record](https://github.com/kstrat2001/darkmux/issues/400) | self-healing = detect + taxonomy + replan ([arXiv 2605.06737](https://arxiv.org/abs/2605.06737)); failure-aware observability ([arXiv 2606.01365](https://arxiv.org/abs/2606.01365)) |
+| **[Fleet — many machines become one](docs/roadmap/M6.md)** | [`theme:m6-fleet`](https://github.com/kstrat2001/darkmux/issues?q=is%3Aopen+label%3A%22theme%3Am6-fleet%22) | version-compat first, then event-sourced mission state, cross-machine workspace handoff, topology-driven liveness | event-sourcing as the distributed-agent backbone ([akka.io](https://akka.io/blog/event-sourcing-the-backbone-of-agentic-ai)); capability discovery ([arXiv 2511.19113](https://arxiv.org/abs/2511.19113)) |
+| **[Observability / viewer](docs/roadmap/M7.md)** | [`theme:m7-observability`](https://github.com/kstrat2001/darkmux/issues?q=is%3Aopen+label%3A%22theme%3Am7-observability%22) | one drill-down viewer over the unified stream; crew roster, sprint burn-down, eureka anomalies; an OTel-GenAI alignment spike | OpenTelemetry [GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/) (emerging standard, still in development) |
+| **[Capability routing](docs/roadmap/M8.md)** | [`theme:m8-routing`](https://github.com/kstrat2001/darkmux/issues?q=is%3Aopen+label%3A%22theme%3Am8-routing%22) | backend abstraction first, then capability vectors, then continuous routing (not hardware-tier labels) | RouteLLM ([arXiv 2406.18665](https://arxiv.org/abs/2406.18665)); Skill Profiles ([arXiv 2602.02386](https://arxiv.org/abs/2602.02386)) |
 
 **Cross-cutting / backlog** (architecture, foundations, onboarding, doctrine) isn't a milestone of its own — those issues get pulled into whichever theme activates them. Examples: typed flow payloads (#511), centralized config (#507), workspace crate split (#463), multi-frontier bootstrap (#179).
 
