@@ -955,6 +955,15 @@ fn coder_brief(
     // be re-derived by the next dispatch. Injected as CONTEXT with provenance,
     // never a silent rule (operator sovereignty #44); the operator sees the
     // count logged at dispatch time and the block itself here.
+    //
+    // (#453) Framed as findings-to-verify, not directives. The wrong-diagnosis-
+    // stuck failure mode (Beat 51) was a coder anchoring on a confident-but-wrong
+    // verdict and looping to a watchdog timeout; "Honor them — do not re-make
+    // these mistakes" was the anchoring framing. The reframe splits concrete
+    // FACTS (safe to apply after a quick check) from DIAGNOSES (reproduce before
+    // applying), so a wrong correction is re-checked against the live workspace
+    // rather than entrenched. The #849 carry-forward is unchanged — corrections
+    // are still injected, the count still logged; only the framing shifts.
     let corrections = prior_corrections
         .iter()
         // Defense-in-depth: a note must not break the XML fence around the
@@ -971,8 +980,17 @@ fn coder_brief(
         .join("\n");
     format!(
         "{base}\n\n<prior-adjudication-corrections>\nThe user's reviewer recorded these \
-         corrections on earlier dispatches in this mission. Honor them — do not re-make \
-         these mistakes:\n\n{corrections}\n</prior-adjudication-corrections>"
+         corrections while reviewing earlier dispatches in this mission. Treat each as a \
+         finding from an earlier context, not a fact about your current workspace. If a \
+         correction names a concrete change (a renamed field, a config key, a command, an \
+         exact string), check it against the code or by running the command it names, and \
+         apply it if it holds. If it names a diagnosis (a race condition, a broken \
+         invariant, a failing test), reproduce the specific claim before changing anything: \
+         run the test or trace the code path it names. If a correction does not hold against \
+         your current workspace, say so in your final message and re-diagnose; if \
+         re-diagnosis does not converge quickly, surface the blocker and stop rather than \
+         looping:\n\n\
+         {corrections}\n</prior-adjudication-corrections>"
     )
 }
 
@@ -1969,7 +1987,17 @@ mod tests {
         );
         assert!(brief.contains("- Do NOT rename the APIM key field."), "{brief:?}");
         assert!(brief.contains("- The verify command is `cargo test -p foo`"), "{brief:?}");
-        assert!(brief.contains("Honor them"), "provenance framing present: {brief:?}");
+        // (#453) Corrections are framed as findings-to-verify, not directives —
+        // the reframe of the prior "Honor them — do not re-make these mistakes"
+        // anchoring framing. Assert the verify-against-workspace framing is present.
+        assert!(
+            brief.contains("not a fact about your current workspace"),
+            "hypothesis-to-verify framing present: {brief:?}"
+        );
+        assert!(
+            !brief.contains("Honor them"),
+            "old anchoring framing must be gone: {brief:?}"
+        );
         // Injected preamble prose must read clean — no literal space-runs from
         // string-continuation slips (the source-input block has the same guard;
         // the test notes here are space-run-free, so this covers the framing).
