@@ -755,4 +755,136 @@ mod tests {
         job.image = Some("rust:slim".to_string());
         assert!(job.validate().is_ok());
     }
+
+    // (Timeout-cap boundary — over-cap reject + at-cap accept — is already
+    // covered in lib.rs by validate_rejects_oversize_timeout +
+    // validate_accepts_max_timeout, so not duplicated here.)
+
+    // ---- parse_xreadgroup_response: protocol-shape Err branches (#842) ----
+    //
+    // COMPLEMENTS the lib.rs tests, which cover the Empty (nil/empty-bulk),
+    // Job (happy round-trip), and Malformed (#903 poison: non-array-fields /
+    // missing-record / invalid-json) cases. Those are NOT re-tested here.
+    // What lib.rs leaves uncovered is the protocol-shape `Err` arm — when the
+    // nested response shape itself is wrong (vs an entry being poison). A
+    // regression there mis-buckets a malformed protocol response and sails
+    // through green CI. These build the nested `redis::Value` trees by hand and
+    // walk each remaining return branch.
+
+    use redis::Value as RV;
+
+    #[test]
+    fn parse_xreadgroup_response_non_array_outer_errs() {
+        let err = parse_xreadgroup_response(&RV::SimpleString("nope".into())).unwrap_err();
+        assert!(err.to_string().contains("unexpected outer shape"), "{err}");
+    }
+
+    #[test]
+    fn parse_xreadgroup_response_stream_block_not_array_errs() {
+        let v = RV::Array(vec![RV::SimpleString("x".into())]);
+        let err = parse_xreadgroup_response(&v).unwrap_err();
+        assert!(err.to_string().contains("expected stream block"), "{err}");
+    }
+
+    #[test]
+    fn parse_xreadgroup_response_stream_block_too_short_is_empty() {
+        // stream_block has only the name, no entries list (len < 2).
+        let v = RV::Array(vec![RV::Array(vec![RV::BulkString(b"darkmux:work".to_vec())])]);
+        assert!(matches!(
+            parse_xreadgroup_response(&v).unwrap(),
+            ClaimOutcome::Empty
+        ));
+    }
+
+    #[test]
+    fn parse_xreadgroup_response_entries_not_array_errs() {
+        let v = RV::Array(vec![RV::Array(vec![
+            RV::BulkString(b"darkmux:work".to_vec()),
+            RV::SimpleString("notalist".into()),
+        ])]);
+        let err = parse_xreadgroup_response(&v).unwrap_err();
+        assert!(err.to_string().contains("expected entries list"), "{err}");
+    }
+
+    #[test]
+    fn parse_xreadgroup_response_empty_entries_is_empty() {
+        let v = RV::Array(vec![RV::Array(vec![
+            RV::BulkString(b"darkmux:work".to_vec()),
+            RV::Array(vec![]),
+        ])]);
+        assert!(matches!(
+            parse_xreadgroup_response(&v).unwrap(),
+            ClaimOutcome::Empty
+        ));
+    }
+
+    #[test]
+    fn parse_xreadgroup_response_entry_not_array_errs() {
+        let v = RV::Array(vec![RV::Array(vec![
+            RV::BulkString(b"darkmux:work".to_vec()),
+            RV::Array(vec![RV::SimpleString("nottuple".into())]),
+        ])]);
+        let err = parse_xreadgroup_response(&v).unwrap_err();
+        assert!(err.to_string().contains("expected entry tuple"), "{err}");
+    }
+
+    #[test]
+    fn parse_xreadgroup_response_entry_too_short_errs() {
+        // entry has an id but no fields (len < 2).
+        let v = RV::Array(vec![RV::Array(vec![
+            RV::BulkString(b"darkmux:work".to_vec()),
+            RV::Array(vec![RV::Array(vec![RV::BulkString(b"1-0".to_vec())])]),
+        ])]);
+        let err = parse_xreadgroup_response(&v).unwrap_err();
+        assert!(err.to_string().contains("entry missing id or fields"), "{err}");
+    }
+
+    #[test]
+    fn parse_xreadgroup_response_bad_id_type_errs() {
+        // entry[0] is neither BulkString nor SimpleString → unrecoverable shape.
+        let fields = RV::Array(vec![
+            RV::BulkString(b"record".to_vec()),
+            RV::BulkString(b"{}".to_vec()),
+        ]);
+        let v = RV::Array(vec![RV::Array(vec![
+            RV::BulkString(b"darkmux:work".to_vec()),
+            RV::Array(vec![RV::Array(vec![RV::Int(42), fields])]),
+        ])]);
+        let err = parse_xreadgroup_response(&v).unwrap_err();
+        assert!(err.to_string().contains("expected entry id"), "{err}");
+    }
+
+    // ---- extract_field: edge cases (#842) ----
+    // lib.rs covers key-found (BulkString + SimpleString) and key-absent.
+    // These add the structural edge cases that lib.rs leaves uncovered.
+
+    #[test]
+    fn extract_field_odd_length_returns_none() {
+        // Incomplete trailing pair (k with no v) — the i+1<len guard.
+        let fields = vec![RV::BulkString(b"k".to_vec())];
+        assert_eq!(extract_field(&fields, "k"), None);
+    }
+
+    #[test]
+    fn extract_field_empty_returns_none() {
+        assert_eq!(extract_field(&[], "k"), None);
+    }
+
+    #[test]
+    fn extract_field_skips_non_string_keys() {
+        // A non-string key + its value is skipped (i += 2), the later string key found.
+        let fields = vec![
+            RV::Int(1),
+            RV::BulkString(b"ignored".to_vec()),
+            RV::BulkString(b"k".to_vec()),
+            RV::BulkString(b"v".to_vec()),
+        ];
+        assert_eq!(extract_field(&fields, "k").as_deref(), Some("v"));
+    }
+
+    #[test]
+    fn extract_field_non_string_value_returns_none() {
+        let fields = vec![RV::BulkString(b"k".to_vec()), RV::Int(42)];
+        assert_eq!(extract_field(&fields, "k"), None);
+    }
 }

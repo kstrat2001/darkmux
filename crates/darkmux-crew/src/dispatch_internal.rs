@@ -3271,6 +3271,104 @@ mod tests {
         assert_eq!(argv[dash_idx + 2], "run");
     }
 
+    // ─── #842 edge cases the complete-vector test doesn't exercise ──────
+    // The complete-vector test only ever runs StructuredSlot + a non-empty
+    // allowed-tools vec + a non-empty feedback object. These pin the three
+    // remaining branches: the Narrative→kebab mapping, the
+    // Some(empty)-vs-None allowed-tools fork (block-all vs allow-all), and
+    // the empty-feedback-object guard.
+
+    /// A minimal valid config: no optional flags set. Each test below flips
+    /// exactly one field so the assertion isolates that branch.
+    fn base_argv_config() -> DockerRunConfig {
+        DockerRunConfig {
+            container_name: "darkmux-edge".to_string(),
+            workspace: PathBuf::from("/tmp/ws"),
+            host_out: PathBuf::from("/tmp/out"),
+            inject: false,
+            runtime_binary: None,
+            image: "darkmux-runtime:latest".to_string(),
+            model: "m".to_string(),
+            system_prompt: "role".to_string(),
+            message: "msg".to_string(),
+            json: false,
+            allowed_tools: None,
+            compaction: crate::dispatch::CompactionDispatchArgs::default(),
+            feedback_templates: serde_json::Value::Null,
+            cache_dir: PathBuf::from("/tmp/cache"),
+        }
+    }
+
+    #[test]
+    fn build_docker_run_argv_compaction_strategy_narrative_is_kebab() {
+        // Only StructuredSlot is exercised by the complete-vector test; a typo
+        // in the Narrative arm (line ~333) would ship green. The runtime
+        // rejects an unknown flag value, so the kebab string must be exact.
+        let mut config = base_argv_config();
+        config.compaction.strategy = Some(darkmux_types::CompactionStrategy::Narrative);
+        let argv = build_docker_run_argv(&config);
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--compact-strategy" && w[1] == "narrative"),
+            "Narrative must map to the kebab `narrative`, got: {argv:?}"
+        );
+        // And NOT the Debug-derived PascalCase, which the runtime would reject.
+        assert!(
+            !argv.iter().any(|a| a == "Narrative"),
+            "must not emit the enum's Debug form: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn build_docker_run_argv_empty_allowed_tools_is_block_all_not_omitted() {
+        // Some(vec![]) and None are DIFFERENT contracts: Some(empty) emits
+        // `--allowed-tools ""` (block-all — a sandbox-bounding semantic), None
+        // omits the flag (full catalog). A bug collapsing them is sandbox-
+        // adjacent, so pin that the two configs produce different argv.
+        let mut empty = base_argv_config();
+        empty.allowed_tools = Some(vec![]);
+        let empty_argv = build_docker_run_argv(&empty);
+        let pos = empty_argv
+            .iter()
+            .position(|a| a == "--allowed-tools")
+            .expect("Some(empty) must still emit --allowed-tools");
+        assert_eq!(
+            empty_argv[pos + 1], "",
+            "block-all is the empty CSV, got: {:?}",
+            empty_argv[pos + 1]
+        );
+
+        let none_argv = build_docker_run_argv(&base_argv_config());
+        assert!(
+            !none_argv.iter().any(|a| a == "--allowed-tools"),
+            "None must omit the flag entirely (allow-all): {none_argv:?}"
+        );
+    }
+
+    #[test]
+    fn build_docker_run_argv_empty_feedback_object_omits_flag() {
+        // The guard is `as_object().is_some_and(|o| !o.is_empty())`. An empty
+        // object must NOT emit the flag (it would be a useless empty payload);
+        // a non-empty object must. Pin both sides of the guard.
+        let mut empty = base_argv_config();
+        empty.feedback_templates = serde_json::json!({});
+        assert!(
+            !build_docker_run_argv(&empty)
+                .iter()
+                .any(|a| a == "--feedback-templates-json"),
+            "empty feedback object must omit the flag"
+        );
+
+        let mut filled = base_argv_config();
+        filled.feedback_templates = serde_json::json!({ "cycle": "regroup" });
+        assert!(
+            build_docker_run_argv(&filled)
+                .iter()
+                .any(|a| a == "--feedback-templates-json"),
+            "non-empty feedback object must emit the flag"
+        );
+    }
+
     #[test]
     fn docker_command_from_argv_uses_argv0_as_program_not_an_arg() {
         // (#975) Regression: the consumer must build the Command as
