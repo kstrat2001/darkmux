@@ -39,6 +39,18 @@ cargo install --path .   # install to ~/.cargo/bin/darkmux
 
 The release binary is self-contained (~1.1 MB). Built-in workloads under `templates/builtin/workloads/*.json` are embedded at compile time via `include_str!` — `cargo install --path .` produces a binary that works from any directory without the source tree.
 
+## Releasing — dogfood the dispatch critical path first
+
+**Before cutting ANY release, run a real dogfood dispatch as a critical-path smoke test.** A trivial `darkmux crew dispatch <role> --message "<smoke>"` (or a `mission run`) on the build you're about to tag is the only check that proves the end-to-end dispatch path — model selection → container spawn → `docker run` → runtime loop → envelope — actually works. `cargo test` + `cargo clippy` are necessary but NOT sufficient: they exercise the *pieces*, not the live invocation.
+
+This is load-bearing, not ceremony. **v1.3.x–1.4.0 shipped a completely broken internal-runtime dispatch** (`docker docker run`, exit 125 — #975): every unit test asserted the docker *argv vector*, but nothing ever constructed and ran the real `Command`, so the break sailed through four releases of green CI. One dogfood dispatch before any of those cuts would have caught it on the first try; it was finally found only when a `crew dispatch` happened to run for an unrelated reason.
+
+The discipline:
+- **Dogfood the version you're tagging** — `cargo install --path .` from the release commit first, then dispatch.
+- **A trivial message is enough** — you're testing the *path*, not the output. Pass = the container ran and the loop executed (`result: "stop"`, or any non-125 / non-pull-miss outcome). Fail = exit 125, an image-pull miss, or an immediate error before the loop.
+- **Name the loaded model** (see Anti-patterns) — a runaway or garbage *response* is a model finding, not a dispatch-path failure; the path passed if the container ran and the loop executed.
+- Composes with the pre-PR dual-QA discipline: per-PR QA catches logic bugs; the pre-release dogfood catches integration / critical-path regressions only a real container run reveals. The `darkmux-point-release` skill's preconditions should include this smoke step.
+
 ## Configuration (`config.json`)
 
 darkmux's canonical config surface is **`~/.darkmux/config.json`** (#661), written by `darkmux init`. Every setting resolves with one precedence — **`env(DARKMUX_*) > config.json > built-in default`** — and that precedence lives in exactly ONE place: `darkmux_types::config_access` (the env tier is read **live per-access**, so a `set_var` in a test or a power-user export still wins). A reader never has to wonder where a setting came from; `darkmux doctor` surfaces the resolved value + source.
