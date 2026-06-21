@@ -139,12 +139,11 @@ fn ensure_darkmux_image_present() -> Result<String> {
 /// Extracted from the docker-spawn site so the mount-translation rule is
 /// unit-testable without spawning a container (same rationale as
 /// `apply_compaction_flags`).
-#[allow(dead_code)]
-pub(crate) fn apply_volume_mounts(cmd: &mut Command, workspace: &Path, host_out: &Path) {
-    cmd.arg("-v")
-        .arg(format!("{}:/workspace", workspace.display()))
-        .arg("-v")
-        .arg(format!("{}:/darkmux-out", host_out.display()));
+pub(crate) fn apply_volume_mounts(args: &mut Vec<String>, workspace: &Path, host_out: &Path) {
+    args.push("-v".to_string());
+    args.push(format!("{}:/workspace", workspace.display()));
+    args.push("-v".to_string());
+    args.push(format!("{}:/darkmux-out", host_out.display()));
 }
 
 /// (#703) Inject the host-cached static runtime binary into an operator
@@ -153,12 +152,11 @@ pub(crate) fn apply_volume_mounts(cmd: &mut Command, workspace: &Path, host_out:
 /// than the default (which has the binary baked in). MUST be applied after
 /// the volume mounts and before the image arg — `-v` / `--entrypoint` are
 /// docker-run OPTIONS that precede the IMAGE. Unit-testable without docker.
-#[allow(dead_code)]
-pub(crate) fn apply_runtime_injection(cmd: &mut Command, binary: &Path) {
-    cmd.arg("-v")
-        .arg(format!("{}:/darkmux-runtime:ro", binary.display()))
-        .arg("--entrypoint")
-        .arg("/darkmux-runtime");
+pub(crate) fn apply_runtime_injection(args: &mut Vec<String>, binary: &Path) {
+    args.push("-v".to_string());
+    args.push(format!("{}:/darkmux-runtime:ro", binary.display()));
+    args.push("--entrypoint".to_string());
+    args.push("/darkmux-runtime".to_string());
 }
 
 /// (#703 Slice 3) Mount the shared toolchain cache at `/darkmux-cache` and
@@ -167,16 +165,15 @@ pub(crate) fn apply_runtime_injection(cmd: &mut Command, binary: &Path) {
 /// concurrency-safe; per-dispatch `target/` stays in the workspace, so
 /// concurrent dispatches don't contend on build artifacts. Docker-run OPTIONS
 /// (must precede the image arg). Unit-testable without docker.
-#[allow(dead_code)]
-fn apply_cache_mount(cmd: &mut Command, cache: &Path) {
-    cmd.arg("-v")
-        .arg(format!("{}:/darkmux-cache", cache.display()))
-        .arg("-e")
-        .arg("CARGO_HOME=/darkmux-cache/cargo")
-        .arg("-e")
-        .arg("npm_config_cache=/darkmux-cache/npm")
-        .arg("-e")
-        .arg("PIP_CACHE_DIR=/darkmux-cache/pip");
+fn apply_cache_mount(args: &mut Vec<String>, cache: &Path) {
+    args.push("-v".to_string());
+    args.push(format!("{}:/darkmux-cache", cache.display()));
+    args.push("-e".to_string());
+    args.push("CARGO_HOME=/darkmux-cache/cargo".to_string());
+    args.push("-e".to_string());
+    args.push("npm_config_cache=/darkmux-cache/npm".to_string());
+    args.push("-e".to_string());
+    args.push("PIP_CACHE_DIR=/darkmux-cache/pip".to_string());
 }
 
 /// (#703) Ensure the static `darkmux-runtime` binary is extracted to the
@@ -307,22 +304,25 @@ fn ensure_runtime_binary_cached(source_image: &str) -> Result<PathBuf> {
 /// back to its hardcoded default for that knob. Extracted from the
 /// docker-spawn site so the translation rule is unit-testable
 /// without spawning a container.
-#[allow(dead_code)]
 fn apply_compaction_flags(
-    cmd: &mut Command,
+    args: &mut Vec<String>,
     compaction: &crate::dispatch::CompactionDispatchArgs,
 ) {
     if let Some(n) = compaction.threshold_tokens {
-        cmd.arg("--compact-threshold-tokens").arg(n.to_string());
+        args.push("--compact-threshold-tokens".to_string());
+        args.push(n.to_string());
     }
     if let Some(model) = &compaction.compactor_model {
-        cmd.arg("--compactor-model").arg(model);
+        args.push("--compactor-model".to_string());
+        args.push(model.clone());
     }
     if let Some(share) = compaction.threshold_ratio {
-        cmd.arg("--compact-threshold-ratio").arg(share.to_string());
+        args.push("--compact-threshold-ratio".to_string());
+        args.push(share.to_string());
     }
     if let Some(window) = compaction.context_window {
-        cmd.arg("--context-window").arg(window.to_string());
+        args.push("--context-window".to_string());
+        args.push(window.to_string());
     }
     // (#372 T2-C) Strategy → `--compact-strategy <kebab>`. Runtime
     // parses it back to its local enum; None ⇒ flag omitted ⇒
@@ -333,14 +333,16 @@ fn apply_compaction_flags(
             CompactionStrategy::Narrative => "narrative",
             CompactionStrategy::StructuredSlot => "structured-slot",
         };
-        cmd.arg("--compact-strategy").arg(kebab);
+        args.push("--compact-strategy".to_string());
+        args.push(kebab.to_string());
     }
     // (#377) Escalation bound → `--bail-after-compactions N`.
     // Runtime exits with EscalationTriggered when this many
     // compactions have occurred. None ⇒ flag omitted ⇒ runtime is
     // unbounded (back-compat with pre-#377 behavior).
     if let Some(n) = compaction.bail_after_compactions {
-        cmd.arg("--bail-after-compactions").arg(n.to_string());
+        args.push("--bail-after-compactions".to_string());
+        args.push(n.to_string());
     }
     // (#383) Operator-tunable custom instructions →
     // `--compactor-custom-instructions <text>`. Runtime appends to the
@@ -351,7 +353,8 @@ fn apply_compaction_flags(
     // from `extras["customInstructions"]` (the dead-letter openclaw
     // passthrough). See DESIGN.md "Schema isolation".
     if let Some(text) = compaction.custom_instructions.as_deref() {
-        cmd.arg("--compactor-custom-instructions").arg(text);
+        args.push("--compactor-custom-instructions".to_string());
+        args.push(text.to_string());
     }
 }
 
@@ -445,10 +448,7 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
     args.push(format!("--memory={}", DOCKER_MEMORY));
 
     // Workspace + out-dir volume mounts
-    args.push("-v".to_string());
-    args.push(format!("{}:/workspace", config.workspace.display()));
-    args.push("-v".to_string());
-    args.push(format!("{}:/darkmux-out", config.host_out.display()));
+    apply_volume_mounts(&mut args, &config.workspace, &config.host_out);
 
     // Shared toolchain cache mount (always applied). The host dir is
     // resolved + created at the call site (see DockerRunConfig.cache_dir);
@@ -456,22 +456,12 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
     // per-dispatch `--rm` container (#703 Slice 3). A bare `/darkmux-cache`
     // (no host:container colon) would be an anonymous volume discarded on
     // --rm — i.e. no caching at all.
-    args.push("-v".to_string());
-    args.push(format!("{}:/darkmux-cache", config.cache_dir.display()));
-    args.push("-e".to_string());
-    args.push("CARGO_HOME=/darkmux-cache/cargo".to_string());
-    args.push("-e".to_string());
-    args.push("npm_config_cache=/darkmux-cache/npm".to_string());
-    args.push("-e".to_string());
-    args.push("PIP_CACHE_DIR=/darkmux-cache/pip".to_string());
+    apply_cache_mount(&mut args, &config.cache_dir);
 
     // Runtime binary injection (non-default images only)
     if config.inject {
         if let Some(binary) = &config.runtime_binary {
-            args.push("-v".to_string());
-            args.push(format!("{}:/darkmux-runtime:ro", binary.display()));
-            args.push("--entrypoint".to_string());
-            args.push("/darkmux-runtime".to_string());
+            apply_runtime_injection(&mut args, binary);
         }
     }
 
@@ -495,49 +485,11 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
         args.push(allowed.join(","));
     }
 
-    // Compaction flags — must stay byte-for-byte identical to the runtime's
-    // accepted flag names (runtime/src/main.rs rejects an unknown flag with
-    // exit 2). All six are emitted; None ⇒ flag omitted ⇒ runtime default.
-    if let Some(threshold) = config.compaction.threshold_tokens {
-        args.push("--compact-threshold-tokens".to_string());
-        args.push(threshold.to_string());
-    }
-    if let Some(model) = config.compaction.compactor_model.as_ref() {
-        args.push("--compactor-model".to_string());
-        args.push(model.clone());
-    }
-    if let Some(ratio) = config.compaction.threshold_ratio {
-        args.push("--compact-threshold-ratio".to_string());
-        args.push(ratio.to_string());
-    }
-    if let Some(window) = config.compaction.context_window {
-        args.push("--context-window".to_string());
-        args.push(window.to_string());
-    }
-    // (#372) Strategy → `--compact-strategy <kebab>`. None ⇒ runtime
-    // uses its Narrative default.
-    if let Some(strategy) = config.compaction.strategy {
-        use darkmux_types::CompactionStrategy;
-        let kebab = match strategy {
-            CompactionStrategy::Narrative => "narrative",
-            CompactionStrategy::StructuredSlot => "structured-slot",
-        };
-        args.push("--compact-strategy".to_string());
-        args.push(kebab.to_string());
-    }
-    // (#377) Escalation bound. None ⇒ runtime is unbounded (a real
-    // safety bound, not cosmetic — dropping it lets a dispatch compact
-    // without limit).
-    if let Some(n) = config.compaction.bail_after_compactions {
-        args.push("--bail-after-compactions".to_string());
-        args.push(n.to_string());
-    }
-    // (#383) Operator-tunable compactor instructions. None ⇒ runtime's
-    // baseline compactor system prompt.
-    if let Some(text) = config.compaction.custom_instructions.as_deref() {
-        args.push("--compactor-custom-instructions".to_string());
-        args.push(text.to_string());
-    }
+    // Compaction flags (#368) — delegated to `apply_compaction_flags`, the
+    // single source of truth. Each must stay byte-for-byte identical to the
+    // runtime's accepted flag names (runtime/src/main.rs rejects an unknown
+    // flag with exit 2); None ⇒ flag omitted ⇒ runtime default.
+    apply_compaction_flags(&mut args, &config.compaction);
 
     // Feedback templates (if a non-empty object). Guarded so a non-object
     // Value can't panic this pure function.
@@ -2944,12 +2896,6 @@ mod tests {
 
     // ─── #368: compaction-flag passthrough to runtime CLI ────────────
 
-    fn args_of(cmd: &Command) -> Vec<String> {
-        cmd.get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect()
-    }
-
     // ─── out-of-band bookkeeping: volume mounts ──────────────────────
 
     #[test]
@@ -3003,13 +2949,12 @@ mod tests {
         // from the agent's `/workspace`. This literal MUST stay in sync
         // with `runtime::trajectory::RUNTIME_OUT_BASE` (the two crates
         // can't share the const — the runtime is built into the image).
-        let mut cmd = Command::new("docker");
+        let mut args: Vec<String> = Vec::new();
         apply_volume_mounts(
-            &mut cmd,
+            &mut args,
             Path::new("/host/workspace"),
             Path::new("/host/out"),
         );
-        let args = args_of(&cmd);
         assert_eq!(
             args,
             vec![
@@ -3035,9 +2980,8 @@ mod tests {
         // (#703) Injecting into a non-default image: bind the static binary
         // read-only at /darkmux-runtime and force the entrypoint to it. These
         // are docker-run OPTIONS (must precede the image arg).
-        let mut cmd = Command::new("docker");
-        apply_runtime_injection(&mut cmd, Path::new("/home/op/.darkmux/runtime/darkmux-runtime"));
-        let args = args_of(&cmd);
+        let mut args: Vec<String> = Vec::new();
+        apply_runtime_injection(&mut args, Path::new("/home/op/.darkmux/runtime/darkmux-runtime"));
         assert_eq!(
             args,
             vec![
@@ -3055,9 +2999,8 @@ mod tests {
         // (#703 Slice 3) Shared toolchain cache mounted at /darkmux-cache with
         // CARGO_HOME / npm / pip env redirected so the inner loop reuses
         // downloads across dispatches.
-        let mut cmd = Command::new("docker");
-        apply_cache_mount(&mut cmd, Path::new("/home/op/.darkmux/cache"));
-        let args = args_of(&cmd);
+        let mut args: Vec<String> = Vec::new();
+        apply_cache_mount(&mut args, Path::new("/home/op/.darkmux/cache"));
         assert_eq!(
             args,
             vec![
@@ -3356,10 +3299,9 @@ mod tests {
 
     #[test]
     fn apply_compaction_flags_omits_when_all_none() {
-        let mut cmd = Command::new("docker");
+        let mut args: Vec<String> = Vec::new();
         let compaction = crate::dispatch::CompactionDispatchArgs::default();
-        apply_compaction_flags(&mut cmd, &compaction);
-        let args = args_of(&cmd);
+        apply_compaction_flags(&mut args, &compaction);
         assert!(
             !args.iter().any(|a| a.starts_with("--compact") || a == "--context-window"),
             "default config should emit no compaction flags; got {args:?}"
@@ -3368,13 +3310,12 @@ mod tests {
 
     #[test]
     fn apply_compaction_flags_emits_threshold_when_set() {
-        let mut cmd = Command::new("docker");
+        let mut args: Vec<String> = Vec::new();
         let compaction = crate::dispatch::CompactionDispatchArgs {
             threshold_tokens: Some(35_000),
             ..Default::default()
         };
-        apply_compaction_flags(&mut cmd, &compaction);
-        let args = args_of(&cmd);
+        apply_compaction_flags(&mut args, &compaction);
         assert!(
             args.windows(2)
                 .any(|w| w[0] == "--compact-threshold-tokens" && w[1] == "35000"),
@@ -3417,11 +3358,10 @@ mod tests {
     // threshold instead of hard-erroring.
     #[test]
     fn ensure_context_window_then_apply_emits_flag() {
-        let mut cmd = Command::new("docker");
+        let mut args: Vec<String> = Vec::new();
         let mut compaction = crate::dispatch::CompactionDispatchArgs::default();
         ensure_context_window(&mut compaction, Some(262_144));
-        apply_compaction_flags(&mut cmd, &compaction);
-        let args = args_of(&cmd);
+        apply_compaction_flags(&mut args, &compaction);
         assert!(
             args.windows(2)
                 .any(|w| w[0] == "--context-window" && w[1] == "262144"),
@@ -3431,7 +3371,7 @@ mod tests {
 
     #[test]
     fn apply_compaction_flags_emits_all_when_set() {
-        let mut cmd = Command::new("docker");
+        let mut args: Vec<String> = Vec::new();
         let compaction = crate::dispatch::CompactionDispatchArgs {
             threshold_tokens: Some(45_000),
             compactor_model: Some("custom-compactor".to_string()),
@@ -3441,8 +3381,7 @@ mod tests {
             bail_after_compactions: None,
             custom_instructions: None,
         };
-        apply_compaction_flags(&mut cmd, &compaction);
-        let args = args_of(&cmd);
+        apply_compaction_flags(&mut args, &compaction);
         assert!(args.iter().any(|a| a == "--compact-threshold-tokens"));
         assert!(args.iter().any(|a| a == "45000"));
         assert!(args.iter().any(|a| a == "--compactor-model"));
@@ -3459,14 +3398,13 @@ mod tests {
     /// + back-compat with operators who haven't configured the bound).
     #[test]
     fn apply_compaction_flags_emits_bail_when_set() {
-        let mut cmd = Command::new("docker");
+        let mut args: Vec<String> = Vec::new();
         let compaction = crate::dispatch::CompactionDispatchArgs {
             bail_after_compactions: Some(3),
             custom_instructions: None,
             ..Default::default()
         };
-        apply_compaction_flags(&mut cmd, &compaction);
-        let args = args_of(&cmd);
+        apply_compaction_flags(&mut args, &compaction);
         assert!(
             args.windows(2)
                 .any(|w| w[0] == "--bail-after-compactions" && w[1] == "3"),
@@ -3476,10 +3414,9 @@ mod tests {
 
     #[test]
     fn apply_compaction_flags_omits_bail_when_none() {
-        let mut cmd = Command::new("docker");
+        let mut args: Vec<String> = Vec::new();
         let compaction = crate::dispatch::CompactionDispatchArgs::default();
-        apply_compaction_flags(&mut cmd, &compaction);
-        let args = args_of(&cmd);
+        apply_compaction_flags(&mut args, &compaction);
         assert!(
             !args.iter().any(|a| a == "--bail-after-compactions"),
             "no bail flag should appear when bail_after_compactions is None; got {args:?}"
@@ -3494,15 +3431,14 @@ mod tests {
     /// tests below).
     #[test]
     fn apply_compaction_flags_emits_custom_instructions_when_set() {
-        let mut cmd = Command::new("docker");
+        let mut args: Vec<String> = Vec::new();
         let compaction = crate::dispatch::CompactionDispatchArgs {
             custom_instructions: Some(
                 "Preserve verbatim X / list active files with what was learned".into(),
             ),
             ..Default::default()
         };
-        apply_compaction_flags(&mut cmd, &compaction);
-        let args = args_of(&cmd);
+        apply_compaction_flags(&mut args, &compaction);
         assert!(
             args.windows(2).any(|w| w[0] == "--compactor-custom-instructions"
                 && w[1] == "Preserve verbatim X / list active files with what was learned"),
@@ -3512,10 +3448,9 @@ mod tests {
 
     #[test]
     fn apply_compaction_flags_omits_custom_instructions_when_none() {
-        let mut cmd = Command::new("docker");
+        let mut args: Vec<String> = Vec::new();
         let compaction = crate::dispatch::CompactionDispatchArgs::default();
-        apply_compaction_flags(&mut cmd, &compaction);
-        let args = args_of(&cmd);
+        apply_compaction_flags(&mut args, &compaction);
         assert!(
             !args.iter().any(|a| a == "--compactor-custom-instructions"),
             "no custom-instructions flag should appear when None; got {args:?}"
@@ -3528,13 +3463,12 @@ mod tests {
     /// to also override threshold/model/etc.
     #[test]
     fn apply_compaction_flags_strategy_only_emits_just_strategy_flag() {
-        let mut cmd = Command::new("docker");
+        let mut args: Vec<String> = Vec::new();
         let compaction = crate::dispatch::CompactionDispatchArgs {
             strategy: Some(darkmux_types::CompactionStrategy::StructuredSlot),
             ..Default::default()
         };
-        apply_compaction_flags(&mut cmd, &compaction);
-        let args = args_of(&cmd);
+        apply_compaction_flags(&mut args, &compaction);
         assert!(args.windows(2).any(|w| w[0] == "--compact-strategy" && w[1] == "structured-slot"));
         // Only the strategy flag should be present.
         assert!(!args.iter().any(|a| a == "--compact-threshold-tokens"));
