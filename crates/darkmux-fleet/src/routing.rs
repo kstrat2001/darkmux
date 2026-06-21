@@ -471,3 +471,111 @@ pub(crate) fn completion_to_dispatch_result(c: CompletionResult) -> DispatchResu
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use darkmux_crew::dispatch::Runtime;
+
+    // (#842) `build_work_job` is the single constructor for every WorkJob that
+    // crosses the fleet wire, and had ZERO tests. A field-swap (workdir landing
+    // in deliver), or `attempt` defaulting to something other than 1 (which the
+    // re-publish logic relies on, PR-C.1), corrupts every cross-machine dispatch
+    // and passes green CI.
+
+    /// All distinct values so a field-swap (X landing where Y belongs) fails.
+    fn sample_job() -> WorkJob {
+        build_work_job(
+            Some("studio".to_string()),       // target_machine
+            "coder".to_string(),               // role_id
+            "do the thing".to_string(),        // message
+            "sess-42".to_string(),             // session_id
+            Some("discord:123".to_string()),   // deliver
+            Some("/work/repo".to_string()),    // workdir
+            Some("sprint-7".to_string()),      // sprint_id
+            Runtime::Internal,                  // runtime
+            Some("rust:slim".to_string()),     // image
+            900,                                // timeout_seconds
+            Some("laptop".to_string()),        // published_by_machine
+            Some("claude-code".to_string()),   // published_by_orchestrator
+        )
+    }
+
+    #[test]
+    fn build_work_job_sets_attempt_one() {
+        // PR-C.1 invariant: a freshly-built job is attempt 1 (re-publish bumps
+        // to 2+). A non-1 default would break re-dispatch accounting.
+        assert_eq!(sample_job().attempt, 1);
+    }
+
+    #[test]
+    fn build_work_job_passes_fields_through_without_swap() {
+        let j = sample_job();
+        assert_eq!(j.target_machine.as_deref(), Some("studio"));
+        assert_eq!(j.role_id, "coder");
+        assert_eq!(j.message, "do the thing");
+        assert_eq!(j.session_id, "sess-42");
+        assert_eq!(j.deliver.as_deref(), Some("discord:123"));
+        assert_eq!(j.workdir.as_deref(), Some("/work/repo"));
+        assert_eq!(j.sprint_id.as_deref(), Some("sprint-7"));
+        assert_eq!(j.runtime, Runtime::Internal);
+        assert_eq!(j.image.as_deref(), Some("rust:slim"));
+        assert_eq!(j.timeout_seconds, 900);
+        assert_eq!(j.published_by_machine.as_deref(), Some("laptop"));
+        assert_eq!(j.published_by_orchestrator.as_deref(), Some("claude-code"));
+    }
+
+    #[test]
+    fn build_work_job_preserves_none_optionals() {
+        // The all-None shape must round-trip too — no field gets a spurious
+        // default substituted for an absent optional.
+        let j = build_work_job(
+            None,
+            "reviewer".to_string(),
+            "m".to_string(),
+            "s".to_string(),
+            None,
+            None,
+            None,
+            Runtime::Internal,
+            None,
+            60,
+            None,
+            None,
+        );
+        assert!(j.target_machine.is_none());
+        assert!(j.deliver.is_none());
+        assert!(j.workdir.is_none());
+        assert!(j.sprint_id.is_none());
+        assert!(j.image.is_none());
+        assert!(j.published_by_machine.is_none());
+        assert!(j.published_by_orchestrator.is_none());
+        assert_eq!(j.attempt, 1);
+    }
+
+    #[test]
+    fn build_work_job_stamps_published_at() {
+        // The #906 clock stamp: non-zero (0 is the pre-epoch sentinel) and
+        // stamped DURING the build. Bracket the call between two clock reads so
+        // the assertion can't flake on an NTP step or a suspended-VM resume —
+        // the stamp must land in [before, after], which holds by construction.
+        let now = || {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0)
+        };
+        let before = now();
+        let stamped = sample_job().published_at_unix_ms;
+        let after = now();
+        assert!(stamped > 0, "published_at should be stamped, not the 0 sentinel");
+        assert!(
+            stamped >= before && stamped <= after,
+            "stamp {stamped} must fall within the call window [{before}, {after}]"
+        );
+    }
+}
+
