@@ -643,7 +643,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         let _ = traj.save_metrics(&metrics);
 
         if json_mode {
-            let envelope = build_json_envelope(
+            let mut envelope = build_json_envelope(
                 result_str,
                 Some(&final_assistant),
                 &model,
@@ -655,6 +655,16 @@ fn run_dispatch(args: &[String]) -> ExitCode {
                 o.total_completion_tokens,
                 o.messages.len(),
             );
+            // (#799) Stamp the verifier-fabrication backstop: the bash commands
+            // that FAILED TO RUN this dispatch. The gate cross-checks a SIGNOFF's
+            // verification claims against this; empty on an honest run.
+            if let Some(obj) = envelope.as_object_mut() {
+                obj.insert(
+                    "failed_tool_invocations".into(),
+                    serde_json::to_value(&o.failed_to_run)
+                        .unwrap_or_else(|_| serde_json::json!([])),
+                );
+            }
             println!("{}", serde_json::to_string(&envelope).unwrap_or_else(|_| "{}".into()));
         } else {
             println!("--- final assistant message ---");
