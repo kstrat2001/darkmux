@@ -47,6 +47,7 @@ This is load-bearing, not ceremony. **v1.3.x–1.4.0 shipped a completely broken
 
 The discipline:
 - **Dogfood the version you're tagging** — `cargo install --path .` from the release commit first, then dispatch.
+- **Make a runtime image available first.** The versioned GHCR image (`darkmux-runtime:<version>`) only publishes *at* release, so a pre-release dogfood can't pull it. If `runtime/` changed in this release, `docker build -t darkmux-runtime:latest runtime/` from the release commit (darkmux prefers a local `:latest` over a pull). If `runtime/` is unchanged, the prior release's image is byte-identical — `docker tag <prev-runtime-image> darkmux-runtime:latest` and remove the tag after.
 - **A trivial message is enough** — you're testing the *path*, not the output. Pass = the container ran and the loop executed (`result: "stop"`, or any non-125 / non-pull-miss outcome). Fail = exit 125, an image-pull miss, or an immediate error before the loop.
 - **Name the loaded model** (see Anti-patterns) — a runaway or garbage *response* is a model finding, not a dispatch-path failure; the path passed if the container ran and the loop executed.
 - Composes with the pre-PR dual-QA discipline: per-PR QA catches logic bugs; the pre-release dogfood catches integration / critical-path regressions only a real container run reveals. The `darkmux-point-release` skill's preconditions should include this smoke step.
