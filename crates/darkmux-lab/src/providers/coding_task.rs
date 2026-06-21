@@ -221,6 +221,7 @@ impl WorkloadProvider for CodingTaskProvider {
         runtime: darkmux_crew::dispatch::Runtime,
         runtime_cmd: &str,
         config_path: Option<&str>,
+        loop_override: Option<&crate::lab::loop_report::LoopCompactionOverride>,
     ) -> Result<RunResult> {
         // (#365/#544) The profile↔loaded envelope check now lives once at
         // the lab-run level (`lab::run` → `profile_check::envelope_warnings`,
@@ -284,8 +285,14 @@ impl WorkloadProvider for CodingTaskProvider {
                 // (#377) Per-role override applied inside
                 // dispatch_via_internal where the role manifest is
                 // already loaded — single lookup point.
-                let compaction =
+                let mut compaction =
                     darkmux_crew::dispatch::CompactionDispatchArgs::from_profile(profile);
+                // (#986) Loop lab: overlay the per-run compaction overrides on
+                // top of the profile-derived args. `lab run` passes `None`
+                // here, so its behavior is byte-identical to before.
+                if let Some(ov) = loop_override {
+                    ov.apply(&mut compaction);
+                }
                 // Pass sandbox_dir as --workdir so the runtime mounts
                 // it at /workspace, matching the placeholder
                 // substitution above (#337 fix).

@@ -45,6 +45,10 @@ impl WorkloadProvider for PromptProvider {
         runtime: darkmux_crew::dispatch::Runtime,
         runtime_cmd: &str,
         config_path: Option<&str>,
+        // (#986) The prompt provider runs trivial single-prompt workloads with
+        // no compaction config to override — the loop lab targets coding-task
+        // workloads. Accepted to satisfy the trait; intentionally unused.
+        _loop_override: Option<&crate::lab::loop_report::LoopCompactionOverride>,
     ) -> Result<RunResult> {
         let prompt = resolve_prompt(loaded)?;
         let role = pick_role(loaded);

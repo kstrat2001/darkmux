@@ -259,6 +259,11 @@ pub(crate) trait WorkloadProvider: Send + Sync {
         // resolution must load from, so a lab `--profiles-file` actually
         // reaches the dispatch (not just lab run's own profile lookup).
         config_path: Option<&str>,
+        // (#986) Per-run compaction overrides for the loop lab. When
+        // `Some`, the fields override what `CompactionDispatchArgs::
+        // from_profile` derived (the loop-variation axis); `None` (the
+        // `lab run` path) leaves the profile's compaction config intact.
+        loop_override: Option<&crate::lab::loop_report::LoopCompactionOverride>,
     ) -> Result<RunResult>;
     fn inspect(&self, loaded: &LoadedWorkload, run_dir: &Path) -> Result<InspectionReport>;
     fn teardown(&self, _run_dir: &Path, _sandbox_dir: &Path) -> Result<()> {

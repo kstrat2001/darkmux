@@ -63,6 +63,8 @@ pub fn tune(opts: &TuneOpts) -> Result<TuneReport> {
         // runtime_cmd is unused by the internal path; "openclaw" for
         // codebase parity (Sprint-E).
         runtime_cmd: "openclaw".to_string(),
+        // tune() varies model behavior across N runs, not loop config (#986).
+        loop_override: None,
     })?;
     let stats = compute_stats(&outcomes);
     Ok(TuneReport {

@@ -30,6 +30,11 @@ pub struct RunOpts {
     /// `<cmd> agent --message` calling convention. Ignored when
     /// `runtime == Runtime::Internal`.
     pub runtime_cmd: String,
+    /// (#986) Loop lab: per-run compaction overrides applied on top of the
+    /// resolved profile's compaction config. `None` (the `lab run` /
+    /// `characterize` / `tune` paths) leaves the profile intact, so those
+    /// paths behave byte-identically to before.
+    pub loop_override: Option<crate::lab::loop_report::LoopCompactionOverride>,
 }
 
 /// `run_dir` is the canonical path to the run's output directory.
@@ -219,6 +224,7 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
                 runtime,
                 runtime_cmd,
                 opts.config_path.as_deref(),
+                opts.loop_override.as_ref(),
             )
         })??;
 
@@ -940,6 +946,7 @@ mod tests {
             quiet: true,
             runtime: darkmux_crew::dispatch::Runtime::Internal,
             runtime_cmd: "openclaw".to_string(),
+            loop_override: None,
         })
         .unwrap_err();
         std::env::set_current_dir(prev).unwrap();

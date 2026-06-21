@@ -97,6 +97,7 @@ mod tests {
             _: darkmux_crew::dispatch::Runtime,
             _: &str,
             _: Option<&str>,
+            _: Option<&crate::lab::loop_report::LoopCompactionOverride>,
         ) -> Result<RunResult> {
             Ok(RunResult {
                 ok: true,
