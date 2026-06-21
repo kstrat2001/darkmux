@@ -372,7 +372,7 @@ The case for darkmux: **once you accept that static configs leave performance on
 
 ## Status
 
-✅ **v1.5.0**, semver-stable. v1.5.0 hardens the dispatch-to-PR loop with the verifier-fabrication backstop: when a coder's verifier command (e.g. `cargo test`) failed to *run*, `mission ship --merge` holds the auto-merge for human review instead of trusting a SIGNOFF that may rest on a command that never executed (#799), plus a single-source-of-truth cleanup of the `docker run` argv assembly (#847). v1.4.1 was a hotfix restoring the internal-runtime dispatch (1.3.x–1.4.0 invoked `docker docker run`); v1.4.0 closed the milestone-1.0 hardening drain with `--json` parity across the read commands. The dispatch-to-PR loop, the missions lens + `mission status`, live observability, and the Homebrew pipeline are the stable surface.
+✅ **v1.6.0**, semver-stable. v1.6.0 hardens the dispatch-to-PR loop and makes the lab fit for profile development: adjudication corrections now persist into the next coder brief, so a fix the reviewer makes once is carried forward instead of re-derived (the doom-loop fix, #849); and `lab run --profiles-file` now actually reaches the dispatch's model resolution (#984), so you can A/B a new model against a fixture. v1.5.0 added the verifier-fabrication gate (#799); v1.4.1 restored the internal-runtime dispatch; v1.4.0 closed the milestone-1.0 hardening drain. The dispatch-to-PR loop, the missions lens + `mission status`, live observability, and the Homebrew pipeline are the stable surface.
 
 **Shipped:**
 

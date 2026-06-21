@@ -11,6 +11,27 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-06-21
+
+Dispatch-to-PR loop correctness, and the lab made fit for profile development.
+
+### Added
+- **Corrections persist into the next coder brief (#849).** A correction the
+  reviewer records at the gate (`flow note --source adjudication`) is now
+  injected into the next dispatch's brief for the same mission — a correction
+  made once is carried forward, not re-derived (the doom-loop fix). Injected as
+  provenance-framed context (the count + each correction surfaced at dispatch
+  time), never a silent rule. Plus a codified recheck-vs-rethink escalation
+  policy in the agent docs.
+
+### Fixed
+- **`lab run --profiles-file` now reaches the dispatch's model resolution
+  (#984).** The flag resolved the profile for lab run's own bookkeeping, but the
+  dispatch re-resolved its model from `env > default` — silently using the wrong
+  model, which blocked profile development. `config_path` is now threaded end to
+  end; `lab tune` / `lab characterize` inherit the fix. No behavior change off
+  the lab path.
+
 ## [1.5.0] - 2026-06-21
 
 Dispatch-to-PR loop robustness. The headline is the verifier-fabrication
@@ -285,6 +306,7 @@ cluster of crew-index correctness repairs.
   idle machine's bar no longer stretches to the playhead; adds the first
   viewer-lifecycle e2e regression gate.
 
+[1.6.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.6.0
 [1.5.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.5.0
 [1.4.1]: https://github.com/kstrat2001/darkmux/releases/tag/v1.4.1
 [1.4.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.4.0
