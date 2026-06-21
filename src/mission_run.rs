@@ -482,18 +482,30 @@ pub fn run(
         style::header(&format!("▶ dispatching `{role}` into the worktree…"))
     );
     // (#849 half 1) Carry forward corrections the reviewer recorded on earlier
-    // dispatches in this mission (the doom-loop fix). Surface the count so the
-    // operator sees what's injected — provenance, not a silent rule (#44).
-    let prior_corrections = mission_adjudication_notes(mission_id);
+    // dispatches in this mission (the doom-loop fix). Scope to the mission's
+    // EXACT dispatch session ids (built from its sprints) — a `mission-run-<id>-`
+    // prefix match would bleed a sibling mission whose id is a hyphen-extension.
+    // Surface the texts so the operator sees what's injected — provenance, not
+    // a silent rule (#44).
+    let mission_session_ids: std::collections::HashSet<String> = sprints
+        .iter()
+        .filter(|s| s.mission_id.as_str() == mission_id)
+        .map(|s| format!("mission-run-{}-{}", mission_id, s.id))
+        .collect();
+    let prior_corrections = mission_adjudication_notes(&mission_session_ids);
     if !prior_corrections.is_empty() {
         println!(
             "{}",
             style::dim(&format!(
                 "  carrying {} prior adjudication correction(s) into the brief \
-                 (recorded by the reviewer on earlier dispatches)",
+                 (recorded by the reviewer on earlier dispatches in this mission):",
                 prior_corrections.len()
             ))
         );
+        for c in &prior_corrections {
+            let first = c.lines().next().unwrap_or("").trim();
+            println!("{}", style::dim(&format!("    • {first}")));
+        }
     }
     let opts = crew::dispatch::DispatchOpts {
         role_id: role.to_string(),
@@ -943,7 +955,16 @@ fn coder_brief(
     // count logged at dispatch time and the block itself here.
     let corrections = prior_corrections
         .iter()
-        .map(|c| format!("- {}", c.trim()))
+        // Defense-in-depth: a note must not break the XML fence around the
+        // block. The adjudication channel is operator-only (no role/runtime
+        // path emits `--source adjudication`), so this is a self-inflicted-only
+        // vector — but neutralizing a literal closing tag is cheap.
+        .map(|c| {
+            format!(
+                "- {}",
+                c.trim().replace("</prior-adjudication-corrections>", "")
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n");
     format!(
@@ -955,18 +976,24 @@ fn coder_brief(
 
 /// (#849 half 1) The adjudication corrections recorded across this mission's
 /// dispatches, for injection into the next coder brief. Scans the flow trail
-/// for `action=note` + `source=adjudication` whose `session_id` is in this
-/// mission's family (`mission-run-<mission>-*`, so a correction on one sprint
-/// carries to the next), newest-last. Mission-scoped, not sprint-scoped, by
-/// design — a correction like "don't rename that field" applies mission-wide.
-/// Best-effort: any IO/parse problem reads as "no corrections" (the loop just
-/// doesn't get the carry-forward, never errors). Bounded: the most-recent
-/// `ADJUDICATION_LOOKBACK_DAYS` day-files, capped at `MAX_INJECTED_CORRECTIONS`
-/// most-recent notes so the brief stays focused and the scan cost stays flat
-/// as the flow dir grows. Mirrors `session_has_orchestrator_note`.
-fn mission_adjudication_notes(mission_id: &str) -> Vec<String> {
+/// for `action=note` + `source=adjudication` whose `session_id` is one of the
+/// mission's EXACT dispatch session ids (`mission_session_ids`, built from the
+/// mission's sprints as `mission-run-<mission>-<sprint>`). Exact-set match, NOT
+/// a `mission-run-<mission>-` prefix — a prefix bleeds a sibling mission whose
+/// id is a hyphen-extension (`auth` would swallow `auth-v2`'s notes, since
+/// `mission-run-auth-v2-s1` starts with `mission-run-auth-`). Mission-scoped,
+/// not sprint-scoped, by design — a correction like "don't rename that field"
+/// applies mission-wide. Best-effort: any IO/parse problem reads as "no
+/// corrections" (the loop just doesn't get the carry-forward, never errors).
+/// Bounded: the most-recent `ADJUDICATION_LOOKBACK_DAYS` day-files, capped at
+/// `MAX_INJECTED_CORRECTIONS` most-recent unique notes so the brief stays
+/// focused and the scan cost stays flat. Mirrors `session_has_orchestrator_note`.
+fn mission_adjudication_notes(mission_session_ids: &std::collections::HashSet<String>) -> Vec<String> {
     const ADJUDICATION_LOOKBACK_DAYS: usize = 7;
     const MAX_INJECTED_CORRECTIONS: usize = 10;
+    if mission_session_ids.is_empty() {
+        return Vec::new();
+    }
     let flows_dir = darkmux_types::config_access::flows_dir();
     let Ok(entries) = std::fs::read_dir(&flows_dir) else {
         return Vec::new();
@@ -985,7 +1012,6 @@ fn mission_adjudication_notes(mission_id: &str) -> Vec<String> {
         .rev()
         .cloned()
         .collect();
-    let prefix = format!("mission-run-{mission_id}-");
     let mut notes: Vec<String> = Vec::new();
     for day in &recent {
         let Ok(raw) = std::fs::read_to_string(day) else {
@@ -999,7 +1025,7 @@ fn mission_adjudication_notes(mission_id: &str) -> Vec<String> {
                 && r.get("source").and_then(|v| v.as_str()) == Some("adjudication")
                 && r.get("session_id")
                     .and_then(|v| v.as_str())
-                    .is_some_and(|s| s.starts_with(&prefix))
+                    .is_some_and(|s| mission_session_ids.contains(s))
             {
                 if let Some(text) = r.get("handle").and_then(|v| v.as_str()) {
                     let t = text.trim();
@@ -1942,14 +1968,21 @@ mod tests {
         assert!(brief.contains("- Do NOT rename the APIM key field."), "{brief:?}");
         assert!(brief.contains("- The verify command is `cargo test -p foo`"), "{brief:?}");
         assert!(brief.contains("Honor them"), "provenance framing present: {brief:?}");
+        // Injected preamble prose must read clean — no literal space-runs from
+        // string-continuation slips (the source-input block has the same guard;
+        // the test notes here are space-run-free, so this covers the framing).
+        assert!(!brief.contains("  "), "injected block has a space-run: {brief:?}");
         // Empty corrections leave the brief unchanged — the no-op the dispatch
         // hits on an honest first run with no prior adjudication.
         assert_eq!(coder_brief(&s, &m, &[]), "desc s1");
     }
 
     /// (#849 half 1) The brief-injection reader: collects adjudication notes
-    /// across a mission's sprint family, skips other sources + other missions,
-    /// and dedups. `#[serial]` — mutates the shared DARKMUX_FLOWS_DIR.
+    /// for a mission's EXACT dispatch session ids, dedups, and excludes other
+    /// sources + sibling missions. The load-bearing case is the sibling-mission
+    /// regression QA caught: `auth-v2`'s notes must NOT bleed into `auth` (a
+    /// prefix match would, since `mission-run-auth-v2-s1` starts with
+    /// `mission-run-auth-`). `#[serial]` — mutates the shared DARKMUX_FLOWS_DIR.
     #[test]
     #[serial_test::serial]
     fn mission_adjudication_notes_reads_family_and_filters() {
@@ -1957,16 +1990,18 @@ mod tests {
         std::fs::write(
             tmp.path().join("2026-06-21.jsonl"),
             concat!(
-                // mission mA, sprint s1 — an adjudication correction
-                r#"{"ts":"2026-06-21T10:00:00Z","action":"note","source":"adjudication","session_id":"mission-run-mA-s1","handle":"Do not rename the field."}"#, "\n",
-                // mA, a LATER sprint — same family, must be carried forward
-                r#"{"ts":"2026-06-21T11:00:00Z","action":"note","source":"adjudication","session_id":"mission-run-mA-s2","handle":"Use cargo test -p foo."}"#, "\n",
+                // mission `auth`, sprint s1 — an adjudication correction
+                r#"{"ts":"2026-06-21T10:00:00Z","action":"note","source":"adjudication","session_id":"mission-run-auth-s1","handle":"Do not rename the field."}"#, "\n",
+                // `auth`, a LATER sprint — same family, must be carried forward
+                r#"{"ts":"2026-06-21T11:00:00Z","action":"note","source":"adjudication","session_id":"mission-run-auth-s2","handle":"Use cargo test -p foo."}"#, "\n",
                 // exact duplicate of the first — must not repeat
-                r#"{"ts":"2026-06-21T11:30:00Z","action":"note","source":"adjudication","session_id":"mission-run-mA-s1","handle":"Do not rename the field."}"#, "\n",
-                // an ORCHESTRATOR (dashboard) note for mA — wrong source, skip
-                r#"{"ts":"2026-06-21T12:00:00Z","action":"note","source":"orchestrator","session_id":"mission-run-mA-s1","handle":"crew shipped it!"}"#, "\n",
-                // a DIFFERENT mission's adjudication note — must not bleed in
-                r#"{"ts":"2026-06-21T12:30:00Z","action":"note","source":"adjudication","session_id":"mission-run-mB-s1","handle":"Other mission only."}"#, "\n",
+                r#"{"ts":"2026-06-21T11:30:00Z","action":"note","source":"adjudication","session_id":"mission-run-auth-s1","handle":"Do not rename the field."}"#, "\n",
+                // SIBLING mission `auth-v2` (id is a hyphen-extension of `auth`)
+                // — a prefix match would bleed this in; the exact-set match must
+                // NOT (the #849 QA regression).
+                r#"{"ts":"2026-06-21T11:45:00Z","action":"note","source":"adjudication","session_id":"mission-run-auth-v2-s1","handle":"Belongs to auth-v2 ONLY."}"#, "\n",
+                // an ORCHESTRATOR (dashboard) note for `auth` — wrong source, skip
+                r#"{"ts":"2026-06-21T12:00:00Z","action":"note","source":"orchestrator","session_id":"mission-run-auth-s1","handle":"crew shipped it!"}"#, "\n",
             ),
         )
         .unwrap();
@@ -1974,8 +2009,15 @@ mod tests {
         // SAFETY: serialized via #[serial]; restored below.
         unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path()) };
 
-        let notes = mission_adjudication_notes("mA");
-        let unknown = mission_adjudication_notes("mZ");
+        // `auth`'s EXACT dispatch session ids — as run() builds them from the
+        // mission's sprints. Note `auth-v2`'s session id is deliberately absent.
+        let auth_ids: std::collections::HashSet<String> =
+            ["mission-run-auth-s1", "mission-run-auth-s2"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        let notes = mission_adjudication_notes(&auth_ids);
+        let unknown = mission_adjudication_notes(&std::collections::HashSet::new());
 
         unsafe {
             match prev {
@@ -1983,12 +2025,15 @@ mod tests {
                 None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
             }
         }
-        assert_eq!(notes.len(), 2, "two unique adjudication notes across the mA family: {notes:?}");
+        assert_eq!(notes.len(), 2, "two unique adjudication notes across the auth family: {notes:?}");
         assert!(notes.contains(&"Do not rename the field.".to_string()), "{notes:?}");
         assert!(notes.contains(&"Use cargo test -p foo.".to_string()), "{notes:?}");
+        assert!(
+            !notes.iter().any(|n| n.contains("auth-v2")),
+            "sibling mission auth-v2 must NOT bleed into auth (the #849 prefix-bleed regression): {notes:?}"
+        );
         assert!(!notes.iter().any(|n| n.contains("crew shipped")), "orchestrator note excluded: {notes:?}");
-        assert!(!notes.iter().any(|n| n.contains("Other mission")), "other mission excluded: {notes:?}");
-        assert!(unknown.is_empty(), "a mission with no notes reads as none");
+        assert!(unknown.is_empty(), "an empty session-id set reads as none");
     }
 
     /// (#817) The note-trail scan finds a session-scoped orchestrator note in
