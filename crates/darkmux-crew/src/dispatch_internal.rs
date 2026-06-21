@@ -777,7 +777,12 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     //    NOT the long-form probe-then-pin path documented in #408 —
     //    that's phase 2+ scope when the recommendation registry
     //    activates per-hardware tuple selection.
-    let model = resolve_dispatch_model_internal(role, opts.profile_name.as_deref()).context(
+    let model = resolve_dispatch_model_internal(
+        role,
+        opts.profile_name.as_deref(),
+        opts.config_path.as_deref(),
+    )
+    .context(
         "model selection failed. Ensure `~/.darkmux/profiles.json` has \
          a profile with at least one model (the default model is \
          `default_model` or the first model in `models`), or load a model in \
@@ -969,11 +974,11 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // Resolve compaction (role override + utility model + context window).
     let mut compaction = opts.compaction.clone();
     compaction.apply_role_override(role);
-    let utility_model = resolve_utility_model_internal();
+    let utility_model = resolve_utility_model_internal(opts.config_path.as_deref());
     compaction.apply_utility_model(utility_model.as_deref());
     ensure_context_window(
         &mut compaction,
-        resolve_context_window_internal(opts.profile_name.as_deref()),
+        resolve_context_window_internal(opts.profile_name.as_deref(), opts.config_path.as_deref()),
     );
 
     // (#590) Pre-compaction loaded-check: warn (don't abort) if the resolved
@@ -2359,11 +2364,12 @@ fn preflight_result_for(status: DockerRuntimeStatus) -> Result<()> {
 fn resolve_dispatch_model_internal(
     role: &crate::types::Role,
     profile_override: Option<&str>,
+    config_path: Option<&str>,
 ) -> Result<String> {
     use crate::select::select_model;
     use darkmux_profiles::profiles::{get_profile, load_registry};
 
-    let loaded = match load_registry(None) {
+    let loaded = match load_registry(config_path) {
         Ok(loaded) => loaded,
         Err(e) => {
             eprintln!(
@@ -2491,8 +2497,8 @@ fn resolve_dispatch_model_internal(
 /// then keeps its built-in default compactor. Mirrors the loud-but-soft
 /// posture of `resolve_dispatch_model_internal`: a missing binding is not an
 /// error, just an absent overlay.
-fn resolve_utility_model_internal() -> Option<String> {
-    darkmux_profiles::profiles::load_registry(None)
+fn resolve_utility_model_internal(config_path: Option<&str>) -> Option<String> {
+    darkmux_profiles::profiles::load_registry(config_path)
         .ok()
         .and_then(|l| l.registry.utility_model_id().map(str::to_string))
 }
@@ -2505,8 +2511,11 @@ fn resolve_utility_model_internal() -> Option<String> {
 /// default-model → `n_ctx` rule has a single source of truth. Returns
 /// `None` only when the registry/profile can't be resolved — the same edge
 /// cases that send model selection to `probe_loaded_model()`.
-fn resolve_context_window_internal(profile_override: Option<&str>) -> Option<u32> {
-    let loaded = darkmux_profiles::profiles::load_registry(None).ok()?;
+fn resolve_context_window_internal(
+    profile_override: Option<&str>,
+    config_path: Option<&str>,
+) -> Option<u32> {
+    let loaded = darkmux_profiles::profiles::load_registry(config_path).ok()?;
     let active_name = profile_override.or(loaded.registry.default_profile.as_deref())?;
     let profile = darkmux_profiles::profiles::get_profile(&loaded.registry, active_name).ok()?;
     crate::dispatch::CompactionDispatchArgs::from_profile(profile).context_window
@@ -2941,6 +2950,43 @@ mod tests {
         // panic in a release build with overflow checks off — saturate).
         let t = TokenTotals { prompt: u32::MAX, completion: 10 };
         assert_eq!(t.total(), u32::MAX);
+    }
+
+    #[test]
+    #[serial]
+    fn config_path_reaches_dispatch_resolvers_not_just_env() {
+        // (#984) Regression: the dispatch's resolvers called `load_registry(None)`,
+        // so a lab `--profiles-file` silently used the default registry's model —
+        // the flag reached lab run's own lookup but never the dispatch. With
+        // `config_path` threaded, a resolver loads from the passed file even with
+        // NO `DARKMUX_PROFILES` env. `resolve_context_window_internal` is the
+        // simplest of the three resolvers to exercise; the model + utility
+        // resolvers thread `config_path` identically. Fails on the old
+        // `load_registry(None)`; passes on `load_registry(config_path)`.
+        let tmp = TempDir::new().unwrap();
+        let pf = tmp.path().join("profiles.json");
+        std::fs::write(
+            &pf,
+            r#"{"profiles":{"probe":{"models":[{"id":"probe-model","n_ctx":12345,"role":"primary"}],"runtime":{"compaction":{"mode":"default"}}}},"default_profile":"probe"}"#,
+        )
+        .unwrap();
+        // Clear the env so this proves the FLAG (config_path), not the env workaround.
+        let prev = std::env::var("DARKMUX_PROFILES").ok();
+        // SAFETY: serialized via #[serial]; restored below.
+        unsafe { std::env::remove_var("DARKMUX_PROFILES") };
+        let from_flag = resolve_context_window_internal(None, pf.to_str());
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_PROFILES", v),
+                None => std::env::remove_var("DARKMUX_PROFILES"),
+            }
+        }
+        assert_eq!(
+            from_flag,
+            Some(12345),
+            "config_path (lab --profiles-file) must reach the dispatch resolver, \
+             not fall through to env/default (#984)"
+        );
     }
 
     #[test]

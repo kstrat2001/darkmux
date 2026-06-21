@@ -255,6 +255,10 @@ pub(crate) trait WorkloadProvider: Send + Sync {
         profile_name: &str,
         runtime: darkmux_crew::dispatch::Runtime,
         runtime_cmd: &str,
+        // (#984) The `--profiles-file` the dispatch's model + context-window
+        // resolution must load from, so a lab `--profiles-file` actually
+        // reaches the dispatch (not just lab run's own profile lookup).
+        config_path: Option<&str>,
     ) -> Result<RunResult>;
     fn inspect(&self, loaded: &LoadedWorkload, run_dir: &Path) -> Result<InspectionReport>;
     fn teardown(&self, _run_dir: &Path, _sandbox_dir: &Path) -> Result<()> {

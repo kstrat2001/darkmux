@@ -881,6 +881,8 @@ pub(crate) fn sprint_review_output_at(
         compaction: crate::crew::dispatch::CompactionDispatchArgs::default(),
         // (#549) No `--profile` override; fall back to `default_profile`.
         profile_name: None,
+        // (#984) No --profiles-file here; dispatch resolves from env > default.
+        config_path: None,
         // (#703) default image.
         image: None,
     };

@@ -526,6 +526,8 @@ pub fn run(
         wait: true,
         compaction: crew::dispatch::CompactionDispatchArgs::default(),
         profile_name: None,
+        // (#984) mission run uses the default registry — no --profiles-file.
+        config_path: None,
         image: image.map(String::from),
     };
     let result = fleet::dispatch_routed(opts)?;

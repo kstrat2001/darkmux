@@ -96,6 +96,7 @@ mod tests {
             _: &str,
             _: darkmux_crew::dispatch::Runtime,
             _: &str,
+            _: Option<&str>,
         ) -> Result<RunResult> {
             Ok(RunResult {
                 ok: true,
