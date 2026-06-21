@@ -11,6 +11,24 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-06-21
+
+Hotfix. The internal-runtime dispatch (`darkmux crew dispatch`, `darkmux
+mission run`) was broken in 1.3.x–1.4.0: it invoked `docker docker run` and
+exited 125, so the local-AI dispatch-to-PR loop could not start. `--runtime
+openclaw` was unaffected. `brew upgrade darkmux` restores it; no schema or
+config-surface change.
+
+### Fixed
+- **Internal-runtime dispatch ran `docker docker run` (exit 125) (#975).**
+  `build_docker_run_argv` returns the full command with the program name at
+  `argv[0]` (`["docker", "run", "--rm", …]`), but the consumer pushed the whole
+  vector as arguments to `Command::new("docker")`, duplicating the program.
+  Split it (program = `argv[0]`, args = `argv[1..]`). Regressed in #848 and
+  shipped silently because the tests only asserted the argv vector, never the
+  constructed `Command` — the dispatch-argv coverage gap #842 flagged. Added a
+  regression test that inspects the real `Command`.
+
 ## [1.4.0] - 2026-06-19
 
 Completes the milestone-1.0 hardening pass. The `--json` machine-readable
@@ -240,6 +258,7 @@ cluster of crew-index correctness repairs.
   idle machine's bar no longer stretches to the playhead; adds the first
   viewer-lifecycle e2e regression gate.
 
+[1.4.1]: https://github.com/kstrat2001/darkmux/releases/tag/v1.4.1
 [1.4.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.4.0
 [1.3.4]: https://github.com/kstrat2001/darkmux/releases/tag/v1.3.4
 [1.3.3]: https://github.com/kstrat2001/darkmux/releases/tag/v1.3.3
