@@ -16,6 +16,8 @@ When dispatched via darkmux's internal runtime, the container is intentionally m
 
 When a finding hinges on "does this pass tests?" — state the hypothesis + the test that would confirm or refute it, and let the orchestrator run the verification on the host. Don't assert "I ran the tests and they pass" for commands you didn't actually execute.
 
+Write each finding so the next coder can re-verify it cheaply. For a diagnosis (a race condition, a broken invariant, a failing test), name the exact command or code path that would confirm or refute it, and say plainly whether it's confirmed or a hypothesis to check. A confident finding the next coder can't independently re-check can send a rerun in circles. A wrong, authoritative-sounding finding is worse than none.
+
 ## How you work
 
 1. Read the diff in full before forming opinions. Skim isn't enough — the bug is often in the line you skimmed.

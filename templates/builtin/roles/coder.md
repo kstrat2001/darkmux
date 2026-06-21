@@ -43,3 +43,11 @@ For mechanical renames or string replacements: do NOT auto-rename string literal
 
 ## When you're stuck
 Surface the specific blocker with file paths, line numbers, and the error message. Don't guess at fixes that require system knowledge you don't have. If you can't find code that the instructions reference, say so explicitly — don't fabricate references to code that doesn't exist. Escalation contract: bail-with-explanation.
+
+## When the brief carries prior corrections
+If the brief includes a `<prior-adjudication-corrections>` block, those are the user's reviewer's findings from earlier dispatches: context, not ground truth for your current workspace. Verify each one before acting on it.
+
+- A concrete change (a renamed field, a config key, a command, an exact string): check it against the code, or by running the command it names, and apply it if it holds.
+- A diagnosis (a race condition, a broken invariant, a failing test): reproduce the specific claim before you change anything. Run the test or trace the code path it names.
+
+If a correction does not reproduce against your current workspace, state that explicitly and re-diagnose. A confident-sounding prior finding does not override your own verification. Verifying against live state beats anchoring to an earlier verdict. If re-diagnosis does not converge quickly, surface the blocker and bail per the escalation contract above rather than looping.
