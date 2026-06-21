@@ -545,6 +545,35 @@ pub fn run(
     println!("{}", style::success("✓ coder dispatch complete"));
     print_token_line(&tokens);
 
+    // (#799 part 2) Verifier-fabrication backstop: the runtime stamped any bash
+    // verifier commands that FAILED TO RUN (never executed) onto the dispatch
+    // envelope. Emit a per-run `mission.run.verification` record UNCONDITIONALLY
+    // (empty `failed` on an honest run) keyed by this run's deterministic
+    // session id, so `mission ship --merge` reads the LATEST run's status and
+    // HOLDs only when that run had failures. Emitting on EVERY run is what lets
+    // a clean re-run CLEAR a prior dirty run's record (the reader is latest-wins
+    // by overwrite); a conditional emit would leave a stale dirty record that
+    // the documented fix-and-retry could never clear. The gate banner reads the
+    // in-memory parse below, so an empty record adds no operator-facing noise.
+    // Soft everywhere: `run` still returns 0 at a clean gate; the operator
+    // decides (operator sovereignty #44).
+    let failed_verifiers = parse_failed_verifiers(&result.stdout);
+    emit_run_record(
+        if failed_verifiers.is_empty() {
+            flow::Level::Info
+        } else {
+            flow::Level::Warn
+        },
+        "mission.run.verification",
+        mission_id,
+        &sprint.id,
+        &session_id,
+        serde_json::json!({
+            "failed": failed_verifiers,
+            "count": failed_verifiers.len(),
+        }),
+    );
+
     // 6. Local QA — reuse `sprint review` against the worktree diff vs base.
     //    require_clean=false: the worktree has uncommitted changes by design
     //    (the whole point is reviewing pre-commit work).
@@ -579,6 +608,7 @@ pub fn run(
                 serde_json::json!({ "error": format!("{e:#}"), "total_tokens": tokens.total() }),
             );
             println!("\n{}", style::header("▶ gate — QA unavailable, manual review required"));
+            print_unverified_banner(&failed_verifiers);
             println!("  {} {}", style::dim("worktree:"), wt_path.display());
             println!("  {} {}", style::dim("branch:  "), style::accent(&branch));
             println!(
@@ -607,6 +637,7 @@ pub fn run(
         style::dim("branch:  "),
         style::accent(&branch)
     );
+    print_unverified_banner(&failed_verifiers);
 
     let blockers = review.by_severity.block > 0;
     if blockers {
@@ -938,6 +969,140 @@ fn nudge_missing_adjudication_note(session_id: &str) {
     );
 }
 
+/// (#799) A bash verifier command the runtime classified as FAILED TO RUN —
+/// the binary was missing (exit 127), not executable (exit 126), or its
+/// toolchain failed to load — so it never actually verified anything. Parsed
+/// from the dispatch envelope's `failed_tool_invocations` (stamped by the
+/// runtime in #799 part 1). A non-empty list means a coder SIGNOFF claiming
+/// "tests pass" may rest on a command that never ran. SOFT signal end to end:
+/// surfaced for the adjudicator, never an auto-fail (operator sovereignty #44).
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+struct FailedVerifier {
+    #[serde(default)]
+    command: String,
+    #[serde(default)]
+    reason: String,
+}
+
+/// Best-effort parse of `failed_tool_invocations` from the internal runtime's
+/// `--json` envelope (the dispatch's stdout). In `--json` mode the runtime
+/// prints a single-line JSON envelope to stdout (status goes to stderr), so the
+/// whole buffer is the envelope; the last-non-empty-line fallback is pure
+/// defense against an unexpected leading line. Returns EMPTY on any parse miss
+/// or absent field — a soft signal must never fire a FALSE alarm, so "couldn't
+/// tell" reads as "nothing failed."
+fn parse_failed_verifiers(envelope_stdout: &str) -> Vec<FailedVerifier> {
+    let as_json = |s: &str| serde_json::from_str::<serde_json::Value>(s.trim()).ok();
+    let Some(v) = as_json(envelope_stdout).or_else(|| {
+        envelope_stdout
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .and_then(as_json)
+    }) else {
+        return Vec::new();
+    };
+    v.get("failed_tool_invocations")
+        .and_then(|a| a.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| serde_json::from_value::<FailedVerifier>(e.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// (#799) Prominent gate banner naming the verifier commands that FAILED TO
+/// RUN. No-op on an honest run (empty list). Soft — it informs the adjudicator
+/// at the gate; it never blocks `mission run` (operator sovereignty #44). The
+/// list is what lets the operator cross-check the coder's SIGNOFF: a "tests
+/// pass" claim sitting next to "the test command never ran" is the
+/// contradiction this exists to surface.
+fn print_unverified_banner(failed: &[FailedVerifier]) {
+    if failed.is_empty() {
+        return;
+    }
+    println!(
+        "\n{}",
+        style::warn(&format!(
+            "⚠ verification unproven — {} verifier command(s) FAILED TO RUN (never executed, so \
+             they verified nothing). A SIGNOFF claiming these passed is contradicted by the \
+             runtime's own record:",
+            failed.len()
+        ))
+    );
+    for f in failed {
+        println!(
+            "    {} {}",
+            style::accent(&f.command),
+            style::dim(&format!("— {}", f.reason))
+        );
+    }
+    println!(
+        "  {}",
+        style::dim(
+            "confirm verification independently before shipping — re-run once the toolchain is \
+             fixed, or verify by hand. `mission ship --merge` will HOLD on this until you do."
+        )
+    );
+}
+
+/// (#799) The verifier commands the LATEST run's coder FAILED TO RUN, read back
+/// from the flow trail by the run's deterministic session id
+/// (`mission-run-<mission>-<sprint>`). `mission run` emits a
+/// `mission.run.verification` record (payload `{ failed: [{command, reason}] }`)
+/// on EVERY run — empty `failed` on an honest run — so `ship` reads the latest
+/// run's status and HOLDs an auto-merge only when that run had failures. The
+/// run is a separate process, so the flow trail is the durable handoff (the
+/// runtime's out-dir is an ephemeral per-dispatch tempdir ship can't
+/// reconstruct). Scans the last 2 days oldest→newest and OVERWRITES `latest` on
+/// each match, so a clean re-run's empty record correctly clears a prior dirty
+/// run's (latest-wins on a resumed sprint). Best effort: any IO/parse problem,
+/// or no record in the recent window, reads as "none" — this soft backstop
+/// fails OPEN (the run-time banner is the primary surface). Mirrors
+/// `session_has_orchestrator_note`.
+fn session_failed_verifiers(session_id: &str) -> Vec<FailedVerifier> {
+    let flows_dir = darkmux_types::config_access::flows_dir();
+    let Ok(entries) = std::fs::read_dir(&flows_dir) else {
+        return Vec::new();
+    };
+    let mut days: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
+        .collect();
+    days.sort();
+    // Last 2 days, iterated oldest→newest, so a later record overwrites an
+    // earlier one and the most recent `mission.run.unverified` for this
+    // session wins.
+    let recent: Vec<PathBuf> = days.iter().rev().take(2).rev().cloned().collect();
+    let mut latest: Vec<FailedVerifier> = Vec::new();
+    for day in &recent {
+        let Ok(raw) = std::fs::read_to_string(day) else {
+            continue;
+        };
+        for line in raw.lines() {
+            let Ok(r) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if r.get("action").and_then(|v| v.as_str()) == Some("mission.run.verification")
+                && r.get("session_id").and_then(|v| v.as_str()) == Some(session_id)
+            {
+                if let Some(arr) = r
+                    .get("payload")
+                    .and_then(|p| p.get("failed"))
+                    .and_then(|f| f.as_array())
+                {
+                    latest = arr
+                        .iter()
+                        .filter_map(|e| serde_json::from_value::<FailedVerifier>(e.clone()).ok())
+                        .collect();
+                }
+            }
+        }
+    }
+    latest
+}
+
 fn commit_subject(sprint: &crew::types::Sprint) -> String {
     let first = sprint.description.lines().next().unwrap_or("").trim();
     let s = if first.is_empty() {
@@ -1125,7 +1290,9 @@ fn ci_is_green(dir: &Path, branch: &str) -> Result<bool> {
 /// tears the worktree down. **Never auto-merges** — `--merge` is the operator/
 /// frontier's explicit sign-off act. Returns `0` on success, `1` on a refused
 /// merge (CI not green), `2` when the PR merged but the sprint couldn't be
-/// marked Complete (inconsistent state — needs manual reconcile).
+/// marked Complete (inconsistent state — needs manual reconcile), `3` when
+/// `--merge` is HELD because the run had verifier commands that failed to run
+/// (#799 — review the SIGNOFF, then merge manually or re-run after fixing).
 pub fn ship(
     mission_id: &str,
     sprint_id: Option<&str>,
@@ -1311,6 +1478,63 @@ pub fn ship(
         &session_id,
         serde_json::json!({ "branch": branch, "pr_url": pr_url, "base": base }),
     );
+
+    // (#799 part 2) Verifier-fabrication backstop — checked BEFORE the CI gate
+    // so a held merge doesn't first sit through `ci_is_green`'s blocking watch.
+    // If the run's coder had bash verifier commands that FAILED TO RUN, a
+    // SIGNOFF's "tests pass" claim may rest on a command that never executed.
+    // HOLD the auto-merge for human review: don't merge, don't tear down, never
+    // auto-fail (operator sovereignty #44). The PR is already open and the
+    // worktree intact — nothing is discarded; the operator reviews + merges
+    // manually after confirming verification, or re-runs once the toolchain is
+    // fixed. Soft by design: `--merge` is the ONLY path this gates (a default
+    // stop-at-PR `ship` is untouched), and the run-time banner surfaced it once
+    // already.
+    if merge {
+        let unverified = session_failed_verifiers(&session_id);
+        if !unverified.is_empty() {
+            eprintln!(
+                "{}",
+                style::error(&format!(
+                    "✗ holding the auto-merge of {branch} — {} verifier command(s) FAILED TO RUN \
+                     during the run, so the coder's SIGNOFF may claim verification that never \
+                     happened:",
+                    unverified.len()
+                ))
+            );
+            for f in &unverified {
+                eprintln!(
+                    "    {} {}",
+                    style::accent(&f.command),
+                    style::dim(&format!("— {}", f.reason))
+                );
+            }
+            eprintln!(
+                "{}",
+                style::warn(&format!(
+                    "  the PR is open ({pr_url}) and the worktree is intact — nothing was \
+                     discarded. Review the diff + SIGNOFF; if verification really is sound, merge \
+                     manually (`gh pr merge {branch} --squash`). If the toolchain was broken, fix \
+                     it and re-run `darkmux mission run {mission_id} --sprint {}`.",
+                    sprint.id
+                ))
+            );
+            emit_run_record(
+                flow::Level::Warn,
+                "mission.run.ship.held",
+                mission_id,
+                &sprint.id,
+                &session_id,
+                serde_json::json!({
+                    "reason": "verification-unproven",
+                    "failed": unverified,
+                    "count": unverified.len(),
+                    "pr_url": pr_url,
+                }),
+            );
+            return Ok(3);
+        }
+    }
 
     // 4. CI gate (for --wait-ci or --merge).
     let mut green = false;
@@ -1861,5 +2085,104 @@ mod tests {
         assert!(body.contains("mission ship"), "{body}");
         // Tokens-only doctrine: no currency leaks into shipped PR copy.
         assert!(!body.contains('$'), "no currency in PR body: {body}");
+    }
+
+    // (#799 part 2) parse_failed_verifiers — the verifier-fabrication backstop's
+    // consumer-side parse. The governing discipline is FALSE-ALARM avoidance:
+    // anything unparseable or absent must read as "nothing failed", never as a
+    // failure — a soft signal that cries wolf is worse than one that stays quiet.
+    fn envelope_with(failed: &str) -> String {
+        format!(
+            r#"{{"result":"stop","final_assistant":"done","metrics":{{}},"trajectory_path":"/x","failed_tool_invocations":{failed}}}"#
+        )
+    }
+
+    #[test]
+    fn parse_failed_verifiers_extracts_entries() {
+        let env = envelope_with(
+            r#"[{"command":"cargo test","reason":"command not found (exit 127) — the verifier never ran"}]"#,
+        );
+        let got = parse_failed_verifiers(&env);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].command, "cargo test");
+        assert!(got[0].reason.contains("exit 127"), "{:?}", got[0].reason);
+    }
+
+    #[test]
+    fn parse_failed_verifiers_empty_array_is_empty() {
+        // An honest run stamps an empty array — the no-op case.
+        assert!(parse_failed_verifiers(&envelope_with("[]")).is_empty());
+    }
+
+    #[test]
+    fn parse_failed_verifiers_missing_field_is_empty() {
+        // A pre-#799 runtime (or a non-success envelope) omits the field
+        // entirely — must NOT be read as a failure.
+        let env = r#"{"result":"stop","final_assistant":"done","metrics":{}}"#;
+        assert!(parse_failed_verifiers(env).is_empty());
+    }
+
+    #[test]
+    fn parse_failed_verifiers_malformed_json_is_empty() {
+        // Garbage on stdout must fail OPEN to "nothing failed" — never a false
+        // alarm that would hold a clean run's merge.
+        assert!(parse_failed_verifiers("not json at all").is_empty());
+        assert!(parse_failed_verifiers("").is_empty());
+    }
+
+    #[test]
+    fn parse_failed_verifiers_last_line_fallback() {
+        // Defense: if an unexpected leading line precedes the envelope, the
+        // last-non-empty-line fallback still recovers the stamp.
+        let env = envelope_with(r#"[{"command":"pytest","reason":"toolchain failed to load"}]"#);
+        let stdout = format!("some stray log line\n{env}\n");
+        let got = parse_failed_verifiers(&stdout);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].command, "pytest");
+    }
+
+    /// (#799 part 2) The ship-side reader round-trip — the run→ship handoff. The
+    /// load-bearing case is RESUMED-SPRINT latest-wins: a clean re-run's empty
+    /// `mission.run.verification` record must OVERWRITE a prior dirty run's for
+    /// the same session, so the documented fix-and-retry actually clears the
+    /// hold. Also: a dirty-only session stays held, and other sessions don't
+    /// bleed in. `#[serial]` — mutates the shared DARKMUX_FLOWS_DIR (read live
+    /// per-access by config_access).
+    #[test]
+    #[serial_test::serial]
+    fn session_failed_verifiers_latest_run_wins() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("2026-06-21.jsonl"),
+            concat!(
+                // session A: dirty run #1, then a clean re-run #2 (later line wins).
+                r#"{"ts":"2026-06-21T10:00:00Z","action":"mission.run.verification","session_id":"mission-run-mA-s1","payload":{"failed":[{"command":"cargo test","reason":"command not found (exit 127) — the verifier never ran"}],"count":1}}"#, "\n",
+                r#"{"ts":"2026-06-21T10:30:00Z","action":"mission.run.verification","session_id":"mission-run-mA-s1","payload":{"failed":[],"count":0}}"#, "\n",
+                // session B: a single dirty run — stays held.
+                r#"{"ts":"2026-06-21T11:00:00Z","action":"mission.run.verification","session_id":"mission-run-mB-s1","payload":{"failed":[{"command":"pytest","reason":"toolchain failed to load"}],"count":1}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        // SAFETY: serialized via #[serial]; restored below.
+        unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path()) };
+
+        let session_a = session_failed_verifiers("mission-run-mA-s1");
+        let session_b = session_failed_verifiers("mission-run-mB-s1");
+        let unknown = session_failed_verifiers("mission-run-mZ-s9");
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+        assert!(
+            session_a.is_empty(),
+            "a clean re-run must clear a prior dirty record (latest-wins): {session_a:?}"
+        );
+        assert_eq!(session_b.len(), 1, "a dirty-only session stays held: {session_b:?}");
+        assert_eq!(session_b[0].command, "pytest");
+        assert!(unknown.is_empty(), "an unknown session reads as none");
     }
 }
