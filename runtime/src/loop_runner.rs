@@ -203,6 +203,18 @@ pub enum EscalationReason {
     IntraTurnStallExhausted,
 }
 
+/// (#799) A bash tool invocation that **failed to run** — never executed —
+/// rather than running and returning a non-zero exit. Stamped onto the
+/// dispatch envelope so a SIGNOFF claiming a verifier passed can be
+/// mechanically contradicted (the gate cross-checks the claim against this).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FailedExec {
+    /// The command the model asked to run (from the bash tool args).
+    pub command: String,
+    /// Why it's classified as failed-to-run (e.g. "command not found (exit 127)").
+    pub reason: String,
+}
+
 /// Outcome of a completed loop run.
 #[derive(Debug)]
 pub struct LoopOutcome {
@@ -226,6 +238,10 @@ pub struct LoopOutcome {
     /// Number of compaction events that fired during the loop.
     /// Phase 6: middle-replace via the companion compactor model.
     pub compactions: u32,
+
+    /// (#799) Bash invocations that FAILED TO RUN (never executed) during the
+    /// dispatch — the verifier-fabrication backstop. Empty on an honest run.
+    pub failed_to_run: Vec<FailedExec>,
 }
 
 /// Run the tool-call loop to completion.
@@ -291,6 +307,9 @@ pub fn run(
     // retrying gcc inside sandbox where it doesn't exist). Sibling to the cycle
     // detector; same MVP shape (warn-only).
     let mut failure_rate_detector = FailureRateDetector::new();
+    // (#799) Accumulate bash invocations that FAILED TO RUN (never executed) —
+    // stamped onto the outcome/envelope as the verifier-fabrication backstop.
+    let mut failed_to_run: Vec<FailedExec> = Vec::new();
     // (#461) Per-dispatch reasoning-loop detector — warns when the
     // model's reasoning stream repeats across turns. Catches the
     // Beat 54 Run 5 case where every tool call looks unique but
@@ -449,6 +468,7 @@ pub fn run(
                     total_prompt_tokens,
                     total_completion_tokens,
                     compactions,
+                    failed_to_run: failed_to_run.clone(),
                 });
             }
         }
@@ -475,6 +495,7 @@ pub fn run(
                     total_prompt_tokens,
                     total_completion_tokens,
                     compactions,
+                    failed_to_run: failed_to_run.clone(),
                 });
             }
         }
@@ -727,6 +748,7 @@ pub fn run(
                     total_prompt_tokens,
                     total_completion_tokens,
                     compactions,
+                    failed_to_run: failed_to_run.clone(),
                 });
             }
             "tool_calls" => {
@@ -792,6 +814,23 @@ pub fn run(
                         &call.function.name,
                         &result,
                     );
+                    // (#799) A verifier that never RAN (vs ran-and-failed) is the
+                    // trust-critical class — stamp it so a SIGNOFF claiming it
+                    // passed can be mechanically contradicted at the gate.
+                    if let Some(reason) =
+                        crate::failure_rate::classify_failed_to_run(&call.function.name, &result)
+                    {
+                        let command = serde_json::from_str::<serde_json::Value>(
+                            &call.function.arguments,
+                        )
+                        .ok()
+                        .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(str::to_string))
+                        .unwrap_or_else(|| call.function.arguments.clone());
+                        failed_to_run.push(FailedExec {
+                            command,
+                            reason: reason.to_string(),
+                        });
+                    }
                     trajectory.append_tool_completed(
                         turns,
                         tool_seq as u32,
@@ -1072,6 +1111,7 @@ pub fn run(
                                 total_prompt_tokens,
                                 total_completion_tokens,
                                 compactions,
+                                failed_to_run: failed_to_run.clone(),
                             });
                         }
                     }
@@ -1141,6 +1181,7 @@ pub fn run(
                         total_prompt_tokens,
                         total_completion_tokens,
                         compactions,
+                        failed_to_run: failed_to_run.clone(),
                     });
                 }
 

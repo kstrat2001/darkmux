@@ -179,6 +179,50 @@ pub fn is_failure_result(tool_name: &str, result: &str) -> bool {
     false
 }
 
+/// (#799) Classify whether a bash result means the command **failed to run**
+/// — it never actually executed — as distinct from running and returning a
+/// non-zero exit (a real code/test failure). This is the trust-critical class:
+/// a verifier that never ran means any SIGNOFF claiming its result is
+/// fabricated. Returns a short reason when failed-to-run, else `None`.
+///
+/// Deliberately a SOFT, heuristic signal: the caller surfaces it for human
+/// review and never auto-acts on it (#799), so a rare false positive only
+/// costs a glance. Two high-confidence signal classes:
+///   1. **Exit 127 / 126** — the shell could not find / could not execute the
+///      command at all (`tsc` not installed, etc.). Unambiguous.
+///   2. **Toolchain-load failures in stderr** — the command started but its
+///      runtime could not load (e.g. swc's "Failed to load native binding",
+///      the exact #799 dogfood case), which an exit code alone can't tell
+///      apart from a real code failure. A small curated list of env/load
+///      markers, NOT ambiguous app-level errors.
+pub fn classify_failed_to_run(tool_name: &str, result: &str) -> Option<&'static str> {
+    if tool_name != "bash" {
+        return None;
+    }
+    let rest = result.strip_prefix("exit: ")?;
+    let code = rest.split_whitespace().next().unwrap_or("");
+    if code == "127" {
+        return Some("command not found (exit 127) — the verifier never ran");
+    }
+    if code == "126" {
+        return Some("command not executable (exit 126) — the verifier never ran");
+    }
+    // Scan ONLY the stderr section for curated tool-couldn't-load signatures.
+    let stderr = result.split("--- stderr ---").nth(1).unwrap_or("");
+    const LOAD_FAILURE_MARKERS: &[&str] = &[
+        "command not found",
+        "Failed to load native binding",
+        "Cannot find native binding",
+        "error while loading shared libraries",
+    ];
+    for m in LOAD_FAILURE_MARKERS {
+        if stderr.contains(m) {
+            return Some("toolchain failed to load — the verifier could not run");
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,6 +233,62 @@ mod tests {
     fn failure_when_generic_dispatch_error() {
         let r = "tool 'read' returned error: path traversal rejected";
         assert!(is_failure_result("read", r));
+    }
+
+    // (#799) classify_failed_to_run — the verifier-fabrication backstop.
+    fn bash(exit: &str, stderr: &str) -> String {
+        format!("exit: {exit}\n--- stdout ---\n\n--- stderr ---\n{stderr}")
+    }
+
+    #[test]
+    fn failed_to_run_on_command_not_found() {
+        assert!(classify_failed_to_run("bash", &bash("127", "tsc: not found")).is_some());
+    }
+
+    #[test]
+    fn failed_to_run_on_not_executable() {
+        assert!(classify_failed_to_run("bash", &bash("126", "")).is_some());
+    }
+
+    #[test]
+    fn ran_and_failed_is_not_failed_to_run() {
+        // The critical distinction: exit 1 means the verifier RAN and found a
+        // real failure — that's honest, not fabrication-class. Must be None.
+        assert!(classify_failed_to_run("bash", &bash("1", "3 type errors")).is_none());
+        assert!(classify_failed_to_run("bash", &bash("2", "test failures")).is_none());
+    }
+
+    #[test]
+    fn passing_run_is_not_failed_to_run() {
+        assert!(classify_failed_to_run("bash", &bash("0", "")).is_none());
+    }
+
+    #[test]
+    fn failed_to_run_on_native_binding_load_failure() {
+        // The exact #799 dogfood case: tsc started but its toolchain (swc's
+        // native binding) couldn't load — a non-zero exit indistinguishable
+        // from a code failure by exit code alone, caught via the stderr marker.
+        let r = bash("1", "Error: Failed to load native binding\n  at Object..");
+        assert!(classify_failed_to_run("bash", &r).is_some());
+    }
+
+    #[test]
+    fn failed_to_run_on_shared_library_load_failure() {
+        let r = bash("127", "error while loading shared libraries: libfoo.so");
+        assert!(classify_failed_to_run("bash", &r).is_some());
+    }
+
+    #[test]
+    fn ambiguous_app_error_not_overflagged() {
+        // A plain non-zero with an app-level message NOT in the curated load-
+        // failure list must not be flagged — soft signal, keep precision high.
+        let r = bash("1", "AssertionError: expected 5 got 4");
+        assert!(classify_failed_to_run("bash", &r).is_none());
+    }
+
+    #[test]
+    fn non_bash_tool_never_failed_to_run() {
+        assert!(classify_failed_to_run("read", "exit: 127\n").is_none());
     }
 
     #[test]
