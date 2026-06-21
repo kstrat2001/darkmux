@@ -11,6 +11,33 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-06-21
+
+Dispatch-to-PR loop robustness. The headline is the verifier-fabrication
+backstop: when a coder's verifier command (e.g. `cargo test`) *failed to run* —
+never executed — `mission ship --merge` now holds the auto-merge for human
+review instead of trusting a SIGNOFF that may rest on a command that never ran.
+
+### Added
+- **Verifier-fabrication gate (#799).** `mission run` parses the dispatch
+  envelope's `failed_tool_invocations` (stamped by the runtime in 1.4.x), emits
+  a per-run `mission.run.verification` flow record, and prints a gate banner
+  naming any verifier that failed to run. `mission ship --merge` reads the
+  latest run's record back and **holds** the auto-merge (new exit code `3` — PR
+  stays open, worktree intact, never torn down) when the latest run had
+  failures. Soft everywhere: never auto-fails, never auto-ships, only holds for
+  human review. New flow action `mission.run.verification`; `FLOW_SCHEMA` is
+  unchanged (additive action, not a shape change).
+
+### Changed
+- **Single source of truth for the `docker run` argv (#847).** The four
+  arg-builder helpers (volume mounts, runtime injection, cache mount, compaction
+  flags) are no longer duplicated between dead helpers and an inline copy in
+  `build_docker_run_argv` — the helpers are the one impl and `build_docker_run_argv`
+  delegates to them. Eliminates the divergence trap behind earlier dispatch
+  regressions (same bug-class as the 1.4.1 hotfix). No behavior change — the
+  emitted argv is byte-identical.
+
 ## [1.4.1] - 2026-06-21
 
 Hotfix. The internal-runtime dispatch (`darkmux crew dispatch`, `darkmux
@@ -258,6 +285,7 @@ cluster of crew-index correctness repairs.
   idle machine's bar no longer stretches to the playhead; adds the first
   viewer-lifecycle e2e regression gate.
 
+[1.5.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.5.0
 [1.4.1]: https://github.com/kstrat2001/darkmux/releases/tag/v1.4.1
 [1.4.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.4.0
 [1.3.4]: https://github.com/kstrat2001/darkmux/releases/tag/v1.3.4
