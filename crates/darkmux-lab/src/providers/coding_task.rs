@@ -220,6 +220,7 @@ impl WorkloadProvider for CodingTaskProvider {
         profile_name: &str,
         runtime: darkmux_crew::dispatch::Runtime,
         runtime_cmd: &str,
+        config_path: Option<&str>,
     ) -> Result<RunResult> {
         // (#365/#544) The profile↔loaded envelope check now lives once at
         // the lab-run level (`lab::run` → `profile_check::envelope_warnings`,
@@ -296,6 +297,7 @@ impl WorkloadProvider for CodingTaskProvider {
                     compaction,
                     profile_name,
                     loaded.manifest.workload.image.as_deref(),
+                    config_path,
                 )?;
                 dispatch_out_dir = out_dir;
                 (stdout, stderr, ok)
@@ -814,6 +816,7 @@ fn dispatch_via_internal(
     compaction: darkmux_crew::dispatch::CompactionDispatchArgs,
     profile_name: &str,
     image: Option<&str>,
+    config_path: Option<&str>,
 ) -> Result<(String, String, bool, Option<PathBuf>)> {
     use darkmux_crew::dispatch::{dispatch, DispatchOpts, Runtime};
     let opts = DispatchOpts {
@@ -836,6 +839,9 @@ fn dispatch_via_internal(
         // profile (the CLI `--profile` override when set), not the
         // registry default.
         profile_name: Some(profile_name.to_string()),
+        // (#984) Propagate the lab `--profiles-file` so the dispatch's model
+        // resolution loads from it (not just lab run's own profile lookup).
+        config_path: config_path.map(str::to_string),
         // (#703 Slice 4) the workload's declared image (manifest
         // `workload.image`), injected so the agent can build/test in-sandbox.
         image: image.map(str::to_string),

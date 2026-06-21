@@ -218,6 +218,7 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
                 &profile_name,
                 runtime,
                 runtime_cmd,
+                opts.config_path.as_deref(),
             )
         })??;
 

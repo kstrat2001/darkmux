@@ -300,6 +300,9 @@ impl WorkJob {
             // via the job payload if cross-machine profile selection becomes
             // a requirement.
             profile_name: None,
+            // (#984) Fleet-deserialized jobs don't carry a profiles-file
+            // either — the runner resolves against its local registry.
+            config_path: None,
             // (#703 Slice 4) Honor the image the publisher requested (carried
             // on the WorkJob); the runner injects darkmux's binary into it.
             // `None` → the runner's default slim image.

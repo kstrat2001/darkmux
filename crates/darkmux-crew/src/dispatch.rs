@@ -333,6 +333,14 @@ pub struct DispatchOpts {
     /// the lab provider (which knows the resolved profile); `None`
     /// everywhere else preserves the default-profile behavior.
     pub profile_name: Option<String>,
+    /// (#984) The profiles-registry path (`lab run --profiles-file`) the
+    /// dispatch's model + context-window + utility-model resolution must load
+    /// from. Without this, those resolvers call `load_registry(None)` —
+    /// `env(DARKMUX_PROFILES) > default` — so a `--profiles-file` reached lab
+    /// run's own lookup but NOT the dispatch, silently selecting the default
+    /// registry's model. Set by the lab providers; `None` everywhere else
+    /// preserves today's behavior (`env > default`).
+    pub config_path: Option<String>,
     /// (#703) Override the Docker image the internal runtime dispatches
     /// into. `None` → the default `darkmux-runtime:latest` (slim base, the
     /// binary baked in). Set to ANY Linux image (e.g. `rust:slim`, the

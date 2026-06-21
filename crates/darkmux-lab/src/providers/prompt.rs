@@ -44,6 +44,7 @@ impl WorkloadProvider for PromptProvider {
         profile_name: &str,
         runtime: darkmux_crew::dispatch::Runtime,
         runtime_cmd: &str,
+        config_path: Option<&str>,
     ) -> Result<RunResult> {
         let prompt = resolve_prompt(loaded)?;
         let role = pick_role(loaded);
@@ -64,6 +65,7 @@ impl WorkloadProvider for PromptProvider {
                     &prompt,
                     &session_id,
                     loaded.manifest.workload.image.as_deref(),
+                    config_path,
                 )?
             }
             darkmux_crew::dispatch::Runtime::Openclaw => {
@@ -173,6 +175,7 @@ fn dispatch_via_internal(
     prompt: &str,
     session_id: &str,
     image: Option<&str>,
+    config_path: Option<&str>,
 ) -> Result<(String, String, bool)> {
     use darkmux_crew::dispatch::{dispatch, DispatchOpts, Runtime};
     let opts = DispatchOpts {
@@ -198,6 +201,9 @@ fn dispatch_via_internal(
         // (#549) No `--profile` override threaded here — fall back to the
         // registry's `default_profile` for model selection.
         profile_name: None,
+        // (#984) Propagate the lab `--profiles-file` so the dispatch's
+        // default-profile model resolution loads from it.
+        config_path: config_path.map(str::to_string),
         // (#703 Slice 4) the workload's declared image, if any.
         image: image.map(str::to_string),
     };

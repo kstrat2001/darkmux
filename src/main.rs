@@ -2426,6 +2426,8 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
                 // model selection falls back to the registry's
                 // `default_profile`. The lab path passes the resolved name.
                 profile_name: None,
+                // (#984) No --profiles-file here; dispatch resolves env > default.
+                config_path: None,
                 // (#703) operator-selected dispatch image; darkmux injects
                 // its runtime binary into it when it's not the default.
                 image,
