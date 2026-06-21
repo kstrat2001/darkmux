@@ -418,12 +418,16 @@ pub struct DockerRunConfig {
     pub cache_dir: std::path::PathBuf,
 }
 
-/// (#842) Build the complete `docker run` argv from a prepared config.
-/// Returns all arguments as a flat `Vec<String>` suitable for
-/// `Command::get_args()` assertion. Pure function — no I/O, no side effects.
+/// (#842) Build the complete `docker` command from a prepared config: the
+/// program name (`docker`) at `[0]`, then the `run` subcommand + options, then
+/// `--` + image + runtime CLI args. Pure function — no I/O, no side effects.
 ///
-/// Order: docker-run OPTIONS (--rm, --name, hardening flags, mounts,
-/// injection) then `--` + image + runtime CLI args.
+/// Turn this into the executable `Command` via [`docker_command_from_argv`]
+/// (program = `[0]`, args = `[1..]`). Do NOT push the whole vector as arguments
+/// — that runs `docker docker run …` and docker exits 125 (the #975 regression).
+///
+/// Order: program, `run`, OPTIONS (--rm, --name, hardening flags, mounts,
+/// injection), then `--` + image + runtime CLI args.
 pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
     let mut args = Vec::new();
 
@@ -547,6 +551,23 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
     }
 
     args
+}
+
+/// Construct the dispatch `Command` from [`build_docker_run_argv`]'s output.
+/// That vector is a FULL command — the program (`docker`) at `[0]` followed by
+/// its arguments — so the program comes from `argv[0]` and the arguments from
+/// `argv[1..]`. Passing the whole vector as arguments was the #975 regression:
+/// it ran `docker docker run …`, which docker rejects with exit 125, killing
+/// every internal-runtime dispatch. `build_docker_run_argv` always emits at
+/// least `["docker", "run", "--rm", …]`, so `argv[0]` is guaranteed present.
+fn docker_command_from_argv(argv: &[String]) -> Command {
+    debug_assert!(
+        !argv.is_empty(),
+        "build_docker_run_argv must emit at least the program name"
+    );
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..]);
+    cmd
 }
 
 
@@ -1049,13 +1070,12 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     validate_image_ref(&argv_config.image)?;
     let argv = build_docker_run_argv(&argv_config);
 
-    // (#839) Security hardening: drop all capabilities, forbid newpriv,
-    // limit PIDs and memory. These are docker-run OPTIONS (must precede
-    // the image arg).
-    let mut cmd = Command::new("docker");
-    for arg in &argv {
-        cmd.arg(arg);
-    }
+    // `build_docker_run_argv` returns a FULL command — the program (`docker`)
+    // at [0], then `run` + the #839 hardening OPTIONS + the `--` image fence +
+    // runtime args. Split it: program from [0], args from [1..]. Pushing the
+    // whole vector (incl. [0]) ran `docker docker run …` → docker exit 125, the
+    // #975 regression. (Caps/limits/newpriv all live inside build_docker_run_argv.)
+    let mut cmd = docker_command_from_argv(&argv);
 
     // TODO (#839): Network hardening — the runtime must reach host LMStudio
     // via `host.docker.internal`. Constraining networking (e.g. `--network none`
@@ -3260,6 +3280,53 @@ mod tests {
         let dash_idx = argv.iter().position(|a| *a == "--").unwrap();
         assert_eq!(argv[dash_idx + 1], "darkmux-runtime:latest");
         assert_eq!(argv[dash_idx + 2], "run");
+    }
+
+    #[test]
+    fn docker_command_from_argv_uses_argv0_as_program_not_an_arg() {
+        // (#975) Regression: the consumer must build the Command as
+        // program=argv[0] + args=argv[1..], NOT push the whole vector. Pushing
+        // argv[0] ("docker") as an argument ran `docker docker run …`, which
+        // docker rejected with exit 125 — the core internal-runtime dispatch was
+        // dead in 1.3.x + 1.4.0. This is the missing test layer #842 named: it
+        // inspects the REAL Command the dispatch executes, not just
+        // build_docker_run_argv's output vector (which the other tests cover).
+        let config = DockerRunConfig {
+            container_name: "darkmux-dispatch-reg".to_string(),
+            workspace: PathBuf::from("/tmp/ws"),
+            host_out: PathBuf::from("/tmp/out"),
+            inject: false,
+            runtime_binary: None,
+            image: "darkmux-runtime:latest".to_string(),
+            model: "default-model".to_string(),
+            system_prompt: "Basic role.".to_string(),
+            message: "Hello world".to_string(),
+            json: false,
+            allowed_tools: None,
+            compaction: crate::dispatch::CompactionDispatchArgs::default(),
+            feedback_templates: serde_json::Value::Null,
+            cache_dir: PathBuf::from("/tmp/cache"),
+        };
+        let argv = build_docker_run_argv(&config);
+        let cmd = docker_command_from_argv(&argv);
+
+        // Program is `docker`, and the arguments start at `run` — never a
+        // spurious leading `docker`.
+        assert_eq!(cmd.get_program().to_str().unwrap(), "docker");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args.first().map(String::as_str),
+            Some("run"),
+            "args must start at `run`, not a second `docker`: {args:?}"
+        );
+        assert_eq!(args.get(1).map(String::as_str), Some("--rm"));
+        assert!(
+            !args.contains(&"docker".to_string()),
+            "no spurious `docker` in the arguments (the #975 `docker docker run` bug): {args:?}"
+        );
     }
 
     // ─── #408: strict-selection opt-in parsing ───────────────────────
