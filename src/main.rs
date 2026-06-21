@@ -1019,6 +1019,60 @@ enum LabCmd {
         #[arg(long = "runtime-cmd", value_name = "PATH", default_value = "openclaw")]
         runtime_cmd: String,
     },
+    /// Loop lab (#986) — run ONE dispatch under a chosen harness config and
+    /// classify how the loop behaved: productive / struggled / inert-false-pass
+    /// / failed. The loop-engineering bench — vary the HARNESS (turn/token
+    /// caps + compaction knobs) against a fixed model + fixture and see which
+    /// loop config catches or survives the struggle. The model axis comes from
+    /// the profile (`--profile` / `--profiles-file`); the loop axis from the
+    /// override flags below.
+    Loop {
+        /// Workload to dispatch (a coding-task / fixture-backed workload —
+        /// that's where loop behavior is interesting).
+        workload: String,
+        /// Profile (the model axis) — defaults to the registry's default_profile.
+        #[arg(long, short = 'p')]
+        profile: Option<String>,
+        /// Profiles-registry path (profiles.json). Overrides DARKMUX_PROFILES
+        /// and the default search locations (#984 makes this reach the
+        /// dispatch's model resolution).
+        #[arg(long = "profiles-file")]
+        profiles: Option<String>,
+        // ── loop-variation axis 1: caps ──────────────────────────────
+        // Applied via the documented live env-override tier
+        // (`DARKMUX_RUNTIME_MAX_TURNS` / `_MAX_TOKENS` /
+        // `DARKMUX_INACTIVITY_TIMEOUT_SECONDS`) for this dispatch only.
+        /// Cap the agent loop at N turns (overrides profile/config).
+        #[arg(long = "max-turns")]
+        max_turns: Option<u32>,
+        /// Cap cumulative completion tokens at N (overrides profile/config).
+        #[arg(long = "max-tokens")]
+        max_tokens: Option<u32>,
+        /// Inactivity-watchdog window in seconds (the per-dispatch
+        /// no-proof-of-work timeout).
+        #[arg(long = "timeout")]
+        timeout: Option<u64>,
+        // ── loop-variation axis 2: compaction ────────────────────────
+        // Overlaid on the resolved profile's compaction config for this run.
+        /// Compaction absolute trigger (tokens).
+        #[arg(long = "compact-threshold-tokens")]
+        compact_threshold_tokens: Option<u32>,
+        /// Compaction adaptive trigger fraction (0.1–0.9).
+        #[arg(long = "compact-threshold-ratio")]
+        compact_threshold_ratio: Option<f32>,
+        /// Compaction strategy: `narrative` or `structured-slot`.
+        #[arg(long = "compact-strategy")]
+        compact_strategy: Option<String>,
+        /// Escalate + exit after this many compactions.
+        #[arg(long = "bail-after-compactions")]
+        bail_after_compactions: Option<u32>,
+        /// Context window (tokens) the compaction formula trigger uses.
+        #[arg(long = "context-window")]
+        context_window: Option<u32>,
+        /// Emit the loop report as JSON instead of the human table.
+        #[arg(long)]
+        json: bool,
+    },
     /// List recent runs (most recent first).
     Runs {
         /// Show at most N runs (default: 5).
@@ -3160,6 +3214,7 @@ fn cmd_lab(sub: LabCmd) -> Result<i32> {
                 quiet,
                 runtime: runtime_flag,
                 runtime_cmd,
+                loop_override: None,
             })?;
             if !quiet {
                 println!("\n{} run(s) complete:", outcomes.len());
@@ -3169,6 +3224,33 @@ fn cmd_lab(sub: LabCmd) -> Result<i32> {
             }
             Ok(if outcomes.iter().all(|o| o.ok) { 0 } else { 1 })
         }
+        LabCmd::Loop {
+            workload,
+            profile,
+            profiles,
+            max_turns,
+            max_tokens,
+            timeout,
+            compact_threshold_tokens,
+            compact_threshold_ratio,
+            compact_strategy,
+            bail_after_compactions,
+            context_window,
+            json,
+        } => cmd_lab_loop(LabLoopArgs {
+            workload,
+            profile,
+            profiles,
+            max_turns,
+            max_tokens,
+            timeout,
+            compact_threshold_tokens,
+            compact_threshold_ratio,
+            compact_strategy,
+            bail_after_compactions,
+            context_window,
+            json,
+        }),
         LabCmd::Runs { limit, all } => {
             let lim = if all { None } else { Some(limit) };
             let summaries = lab::list::list_runs(lim)?;
@@ -3309,6 +3391,173 @@ fn cmd_lab(sub: LabCmd) -> Result<i32> {
             Ok(if report.has_warnings() { 1 } else { 0 })
         }
     }
+}
+
+/// Flattened args for `darkmux lab loop` (#986). Kept as a struct so the
+/// handler signature stays one parameter rather than a dozen.
+struct LabLoopArgs {
+    workload: String,
+    profile: Option<String>,
+    profiles: Option<String>,
+    max_turns: Option<u32>,
+    max_tokens: Option<u32>,
+    timeout: Option<u64>,
+    compact_threshold_tokens: Option<u32>,
+    compact_threshold_ratio: Option<f32>,
+    compact_strategy: Option<String>,
+    bail_after_compactions: Option<u32>,
+    context_window: Option<u32>,
+    json: bool,
+}
+
+/// Parse the `--compact-strategy` flag into the typed enum. Accepts the two
+/// strategies the runtime supports, kebab- or snake-cased.
+fn parse_compact_strategy(raw: &str) -> Result<darkmux_types::CompactionStrategy> {
+    match raw.trim().to_lowercase().replace('_', "-").as_str() {
+        "narrative" => Ok(darkmux_types::CompactionStrategy::Narrative),
+        "structured-slot" => Ok(darkmux_types::CompactionStrategy::StructuredSlot),
+        other => anyhow::bail!(
+            "unknown --compact-strategy `{other}` (expected `narrative` or `structured-slot`)"
+        ),
+    }
+}
+
+/// `darkmux lab loop` (#986) — single-run loop-engineering bench. Runs ONE
+/// dispatch under the chosen harness config, then classifies how the loop
+/// behaved via `lab::loop_report`.
+///
+/// Two loop-variation axes:
+///   - **Caps** (`--max-turns` / `--max-tokens` / `--timeout`) resolve through
+///     `config_access`'s live env tier, so we set the documented env override
+///     for this dispatch. This process is single-shot (it exits right after),
+///     so a process-wide `set_var` is the simplest honest mechanism — it's the
+///     same tier an operator would `export` for one run.
+///   - **Compaction** (`--compact-*` / `--bail-after-compactions` /
+///     `--context-window`) overlays onto the profile-derived
+///     `CompactionDispatchArgs` via the provider (`loop_override`).
+fn cmd_lab_loop(args: LabLoopArgs) -> Result<i32> {
+    use darkmux_lab::lab::loop_report::{analyze_run, LoopCompactionOverride};
+
+    // ── build the compaction overlay (axis 2) ───────────────────────
+    let strategy = match args.compact_strategy.as_deref() {
+        Some(s) => Some(parse_compact_strategy(s)?),
+        None => None,
+    };
+    // Validate the adaptive-trigger ratio upfront (parity with
+    // --compact-strategy) — this is a trust-the-bench surface, so reject an
+    // out-of-range value loudly rather than letting it flow into the runtime.
+    if let Some(r) = args.compact_threshold_ratio {
+        if !(0.1..=0.9).contains(&r) {
+            anyhow::bail!(
+                "--compact-threshold-ratio {r} is out of range (expected 0.1–0.9)"
+            );
+        }
+    }
+    let loop_override = LoopCompactionOverride {
+        threshold_tokens: args.compact_threshold_tokens,
+        threshold_ratio: args.compact_threshold_ratio,
+        context_window: args.context_window,
+        strategy,
+        bail_after_compactions: args.bail_after_compactions,
+    };
+
+    // ── self-describing loop-config summary for the report ───────────
+    let mut loop_config: Vec<String> = Vec::new();
+    if let Some(p) = args.profile.as_deref() {
+        loop_config.push(format!("profile={p}"));
+    }
+    if let Some(p) = args.profiles.as_deref() {
+        loop_config.push(format!("profiles-file={p}"));
+    }
+    if let Some(n) = args.max_turns {
+        loop_config.push(format!("max-turns={n}"));
+    }
+    if let Some(n) = args.max_tokens {
+        loop_config.push(format!("max-tokens={n}"));
+    }
+    if let Some(n) = args.timeout {
+        loop_config.push(format!("timeout={n}s"));
+    }
+    if let Some(n) = args.compact_threshold_tokens {
+        loop_config.push(format!("compact-threshold-tokens={n}"));
+    }
+    if let Some(r) = args.compact_threshold_ratio {
+        loop_config.push(format!("compact-threshold-ratio={r}"));
+    }
+    if let Some(s) = args.compact_strategy.as_deref() {
+        loop_config.push(format!("compact-strategy={s}"));
+    }
+    if let Some(n) = args.bail_after_compactions {
+        loop_config.push(format!("bail-after-compactions={n}"));
+    }
+    if let Some(n) = args.context_window {
+        loop_config.push(format!("context-window={n}"));
+    }
+    if loop_config.is_empty() {
+        loop_config.push("profile defaults (no overrides)".to_string());
+    }
+
+    // ── apply caps via the live env-override tier (axis 1) ───────────
+    if let Some(n) = args.max_turns {
+        std::env::set_var("DARKMUX_RUNTIME_MAX_TURNS", n.to_string());
+    }
+    if let Some(n) = args.max_tokens {
+        std::env::set_var("DARKMUX_RUNTIME_MAX_TOKENS", n.to_string());
+    }
+    if let Some(n) = args.timeout {
+        std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", n.to_string());
+    }
+
+    // ── run the single dispatch ──────────────────────────────────────
+    // quiet in --json mode so stdout stays pure JSON; otherwise show the
+    // dispatch progress before the verdict.
+    let outcomes = darkmux_lab::lab::run::lab_run(darkmux_lab::lab::run::RunOpts {
+        workload_id: args.workload,
+        profile_name: args.profile,
+        runs: 1,
+        config_path: args.profiles,
+        quiet: args.json,
+        runtime: crew::dispatch::Runtime::Internal,
+        runtime_cmd: "openclaw".to_string(),
+        // When no compaction flag was set, pass `None` so the dispatch takes
+        // the exact `lab run` compaction path (caps still apply via env). The
+        // overlay only engages when there's something to override.
+        loop_override: if loop_override.is_empty() {
+            None
+        } else {
+            Some(loop_override)
+        },
+    })?;
+
+    let outcome = outcomes
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("loop lab produced no run outcome"))?;
+
+    // ── classify ─────────────────────────────────────────────────────
+    let report = analyze_run(
+        &outcome.run_dir,
+        &outcome.run_id,
+        outcome.ok,
+        outcome.verify_passed,
+        outcome.duration_ms,
+        loop_config,
+    )?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        darkmux_lab::lab::loop_report::print_report(&report);
+    }
+
+    // Exit 0 when the loop achieved the task (productive or struggled-through);
+    // non-zero when it failed or — critically — falsely passed while inert, so
+    // a scripted bench surfaces those.
+    use darkmux_lab::lab::loop_report::Verdict;
+    Ok(match report.verdict {
+        Verdict::Productive | Verdict::Struggled => 0,
+        Verdict::InertFalsePass | Verdict::Failed => 1,
+    })
 }
 
 #[cfg(test)]

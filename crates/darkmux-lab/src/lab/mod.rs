@@ -7,6 +7,7 @@ pub mod fixture;
 pub mod fixture_cli;
 pub mod inspect;
 pub mod list;
+pub mod loop_report;
 pub mod profile_check;
 // #463 workspace split — paths lifted into the darkmux-types foundation crate
 // so crew can depend on path resolution without depending on lab. The
