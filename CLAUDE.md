@@ -52,6 +52,15 @@ The discipline:
 - **Name the loaded model** (see Anti-patterns) — a runaway or garbage *response* is a model finding, not a dispatch-path failure; the path passed if the container ran and the loop executed.
 - Composes with the pre-PR dual-QA discipline: per-PR QA catches logic bugs; the pre-release dogfood catches integration / critical-path regressions only a real container run reveals. The `darkmux-point-release` skill's preconditions should include this smoke step.
 
+## Loop policy — recheck vs rethink (escalate, don't re-ask)
+
+When a dispatch's output needs verification, **re-asking the same agent to re-check its own work in its own context is near-worthless.** The Self-Verification Dilemma (arXiv 2602.03485) measured that the vast majority of an agent's self-rechecks are *confirmatory*, not corrective — the agent re-derives and entrenches its original answer. Correction value comes from cross-context **re-thinking** by a *different*, ideally higher-tier reviewer.
+
+Codified policy (not orchestrator discretion):
+- **Invariant-bearing or security-bearing diffs → escalate to a fresh-context / higher-tier (frontier) review.** Never sign off on the dispatching agent's own self-recheck for these. Lived at the s3 gate: a coder's 271/271 tests + clippy were all confirmatory of its own broken work; only the fresh-context frontier review caught the four regressions (same shape as #975).
+- The escalation **raises the review tier; it never lowers the gate** (operator sovereignty #44). Hygiene-only diffs may stay at the local tier.
+- Pairs with #799 (terminate on a verifiable mechanical check, never self-assessment) and the persisted-corrections brief injection (#849 half 1 — a correction made once is carried into the next brief, not re-derived).
+
 ## Configuration (`config.json`)
 
 darkmux's canonical config surface is **`~/.darkmux/config.json`** (#661), written by `darkmux init`. Every setting resolves with one precedence — **`env(DARKMUX_*) > config.json > built-in default`** — and that precedence lives in exactly ONE place: `darkmux_types::config_access` (the env tier is read **live per-access**, so a `set_var` in a test or a power-user export still wins). A reader never has to wonder where a setting came from; `darkmux doctor` surfaces the resolved value + source.
