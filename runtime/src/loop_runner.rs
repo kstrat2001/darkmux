@@ -820,6 +820,10 @@ pub fn run(
                     if let Some(reason) =
                         crate::failure_rate::classify_failed_to_run(&call.function.name, &result)
                     {
+                        // Best-effort display text: the parsed `command` field,
+                        // falling back to the raw args. The gate treats it as
+                        // advisory (what the model asked to run), not a
+                        // re-parseable command.
                         let command = serde_json::from_str::<serde_json::Value>(
                             &call.function.arguments,
                         )

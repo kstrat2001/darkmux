@@ -201,16 +201,28 @@ pub fn classify_failed_to_run(tool_name: &str, result: &str) -> Option<&'static 
     }
     let rest = result.strip_prefix("exit: ")?;
     let code = rest.split_whitespace().next().unwrap_or("");
+    // (#974 QA) A command that exited 0 RAN, by definition — no fabrication is
+    // possible, so the stderr scan below is moot. Short-circuit, else an honest
+    // passing run whose stderr merely mentions a load-failure phrase (e.g. a
+    // build script logging "optional tool: command not found, skipping") would
+    // be falsely flagged — the exact trust-eroding false positive to avoid.
+    if code == "0" {
+        return None;
+    }
     if code == "127" {
         return Some("command not found (exit 127) — the verifier never ran");
     }
     if code == "126" {
         return Some("command not executable (exit 126) — the verifier never ran");
     }
-    // Scan ONLY the stderr section for curated tool-couldn't-load signatures.
-    let stderr = result.split("--- stderr ---").nth(1).unwrap_or("");
+    // The command exited non-zero: distinguish "started but its toolchain
+    // couldn't load" (failed-to-run) from "ran and found real errors" (honest).
+    // Scan ONLY the real stderr section — always the LAST split segment, so a
+    // stdout that happens to contain the separator literal can't mis-scope it.
+    // Bare "command not found" is deliberately NOT a marker: exit 127 already
+    // catches the shell-level case, and the bare phrase is app-reachable.
+    let stderr = result.rsplit("--- stderr ---").next().unwrap_or("");
     const LOAD_FAILURE_MARKERS: &[&str] = &[
-        "command not found",
         "Failed to load native binding",
         "Cannot find native binding",
         "error while loading shared libraries",
@@ -261,6 +273,14 @@ mod tests {
     #[test]
     fn passing_run_is_not_failed_to_run() {
         assert!(classify_failed_to_run("bash", &bash("0", "")).is_none());
+    }
+
+    #[test]
+    fn passing_run_with_load_phrase_in_stderr_is_none() {
+        // (#974 QA) exit 0 = the command ran; a stderr mention of a load-failure
+        // phrase must NOT flag it (honest build-script logging is common).
+        let r = bash("0", "optional tool foo: command not found, skipping");
+        assert!(classify_failed_to_run("bash", &r).is_none());
     }
 
     #[test]
