@@ -278,12 +278,18 @@ const REBUILD_TABLES: &[&str] = &[
 ];
 
 /// Default index path: `<paths.root>/index.db`. Resolved through the same
-/// project-vs-user precedence as `lab::paths`. Stable across releases —
-/// changing this silently invalidates every operator's existing index.
-/// Tests use the `_at(&path)` variants (`rebuild_at`, `role_list_at`,
-/// `crew_list_at`, etc.) rather than overriding this path.
+/// Stable across releases — changing this silently invalidates every operator's
+/// existing index. Tests use the `_at(&path)` variants (`rebuild_at`,
+/// `role_list_at`, `crew_list_at`, etc.) rather than overriding this path.
+/// (#1012) ForceUser, NOT Auto: the index is DERIVED from the user-scope crew /
+/// missions / sprints (now resolved via `user_state_root` = ForceUser), so it
+/// must be user-scoped to match its content — a project-scoped index of
+/// user-scoped data is incoherent, and a bare `<cwd>/.darkmux/` must not relocate
+/// it. In the common no-project-`.darkmux` case `Auto` already resolved to user,
+/// so the path is unchanged; only a repo with a stray `.darkmux/` is corrected
+/// (one rebuild). DARKMUX_HOME still wins.
 pub fn default_index_path() -> PathBuf {
-    resolve(ResolveScope::Auto).root.join("index.db")
+    resolve(ResolveScope::ForceUser).root.join("index.db")
 }
 
 fn now_unix() -> i64 {
