@@ -507,9 +507,28 @@ pub fn run(
             println!("{}", style::dim(&format!("    • {first}")));
         }
     }
+    // (#994 retrieve+inject) Carry forward the loop pathologies darkmux's
+    // detectors flagged on earlier dispatches in this mission (the auto-derived
+    // doom-loop signal — sibling to the operator-authored corrections above).
+    // Same provenance discipline: surface what's injected (#44).
+    let detected_cautions = mission_cautions(&mission_session_ids);
+    if !detected_cautions.is_empty() {
+        println!(
+            "{}",
+            style::dim(&format!(
+                "  carrying {} detected loop caution(s) into the brief \
+                 (darkmux's detectors flagged these on earlier dispatches in this mission):",
+                detected_cautions.len()
+            ))
+        );
+        for c in &detected_cautions {
+            let first = c.lines().next().unwrap_or("").trim();
+            println!("{}", style::dim(&format!("    • {first}")));
+        }
+    }
     let opts = crew::dispatch::DispatchOpts {
         role_id: role.to_string(),
-        message: coder_brief(&sprint, mission, &prior_corrections),
+        message: coder_brief(&sprint, mission, &prior_corrections, &detected_cautions),
         deliver: None,
         session_id: Some(session_id.clone()),
         timeout_seconds,
@@ -936,6 +955,7 @@ fn coder_brief(
     sprint: &crew::types::Sprint,
     mission: &crew::types::Mission,
     prior_corrections: &[String],
+    cautions: &[String],
 ) -> String {
     let base = match mission.source_input.as_deref().map(str::trim) {
         Some(src) if !src.is_empty() => format!(
@@ -947,51 +967,82 @@ fn coder_brief(
         ),
         _ => sprint.description.clone(),
     };
-    if prior_corrections.is_empty() {
-        return base;
+    let mut out = base;
+
+    if !prior_corrections.is_empty() {
+        // (#849 half 1) Persist adjudication corrections into the brief — the
+        // doom-loop fix: a correction the reviewer made once should never have to
+        // be re-derived by the next dispatch. Injected as CONTEXT with provenance,
+        // never a silent rule (operator sovereignty #44); the operator sees the
+        // count logged at dispatch time and the block itself here.
+        //
+        // (#453) Framed as findings-to-verify, not directives. The wrong-diagnosis-
+        // stuck failure mode (Beat 51) was a coder anchoring on a confident-but-wrong
+        // verdict and looping to a watchdog timeout; "Honor them — do not re-make
+        // these mistakes" was the anchoring framing. The reframe splits concrete
+        // FACTS (safe to apply after a quick check) from DIAGNOSES (reproduce before
+        // applying), so a wrong correction is re-checked against the live workspace
+        // rather than entrenched. The #849 carry-forward is unchanged — corrections
+        // are still injected, the count still logged; only the framing shifts.
+        let corrections = prior_corrections
+            .iter()
+            // Defense-in-depth: a note must not break the XML fence around the
+            // block. The adjudication channel is operator-only (no role/runtime
+            // path emits `--source adjudication`), so this is a self-inflicted-only
+            // vector — but neutralizing a literal closing tag is cheap.
+            .map(|c| {
+                format!(
+                    "- {}",
+                    c.trim().replace("</prior-adjudication-corrections>", "")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        out = format!(
+            "{out}\n\n<prior-adjudication-corrections>\nThe user's reviewer recorded these \
+             corrections while reviewing earlier dispatches in this mission. Treat each as a \
+             finding from an earlier context, not a fact about your current workspace. If a \
+             correction names a concrete change (a renamed field, a config key, a command, an \
+             exact string), check it against the code or by running the command it names, and \
+             apply it if it holds. If it names a diagnosis (a race condition, a broken \
+             invariant, a failing test), reproduce the specific claim before changing anything: \
+             run the test or trace the code path it names. If a correction does not hold against \
+             your current workspace, say so in your final message and re-diagnose; if \
+             re-diagnosis does not converge quickly, surface the blocker and stop rather than \
+             looping:\n\n\
+             {corrections}\n</prior-adjudication-corrections>"
+        );
     }
-    // (#849 half 1) Persist adjudication corrections into the brief — the
-    // doom-loop fix: a correction the reviewer made once should never have to
-    // be re-derived by the next dispatch. Injected as CONTEXT with provenance,
-    // never a silent rule (operator sovereignty #44); the operator sees the
-    // count logged at dispatch time and the block itself here.
-    //
-    // (#453) Framed as findings-to-verify, not directives. The wrong-diagnosis-
-    // stuck failure mode (Beat 51) was a coder anchoring on a confident-but-wrong
-    // verdict and looping to a watchdog timeout; "Honor them — do not re-make
-    // these mistakes" was the anchoring framing. The reframe splits concrete
-    // FACTS (safe to apply after a quick check) from DIAGNOSES (reproduce before
-    // applying), so a wrong correction is re-checked against the live workspace
-    // rather than entrenched. The #849 carry-forward is unchanged — corrections
-    // are still injected, the count still logged; only the framing shifts.
-    let corrections = prior_corrections
-        .iter()
-        // Defense-in-depth: a note must not break the XML fence around the
-        // block. The adjudication channel is operator-only (no role/runtime
-        // path emits `--source adjudication`), so this is a self-inflicted-only
-        // vector — but neutralizing a literal closing tag is cheap.
-        .map(|c| {
-            format!(
-                "- {}",
-                c.trim().replace("</prior-adjudication-corrections>", "")
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!(
-        "{base}\n\n<prior-adjudication-corrections>\nThe user's reviewer recorded these \
-         corrections while reviewing earlier dispatches in this mission. Treat each as a \
-         finding from an earlier context, not a fact about your current workspace. If a \
-         correction names a concrete change (a renamed field, a config key, a command, an \
-         exact string), check it against the code or by running the command it names, and \
-         apply it if it holds. If it names a diagnosis (a race condition, a broken \
-         invariant, a failing test), reproduce the specific claim before changing anything: \
-         run the test or trace the code path it names. If a correction does not hold against \
-         your current workspace, say so in your final message and re-diagnose; if \
-         re-diagnosis does not converge quickly, surface the blocker and stop rather than \
-         looping:\n\n\
-         {corrections}\n</prior-adjudication-corrections>"
-    )
+
+    // (#994 retrieve+inject) The auto-derived sibling of the corrections block:
+    // loop pathologies darkmux's detectors flagged in earlier dispatches of this
+    // mission (cycles, reasoning loops, tool-failure cascades), keyed where known
+    // to the file they happened in (the #994 capture slice). Framed as findings-
+    // to-verify (#453), not directives — a caution from an earlier context may be
+    // irrelevant now; the value is "don't walk back into a known dead end," never
+    // a required action. Independent of the corrections block (either, both, or
+    // neither may be present).
+    if !cautions.is_empty() {
+        let listed = cautions
+            .iter()
+            // Same XML-fence defense-in-depth as the corrections block — `detail`
+            // is container-written (a tool name flows into the cycle detail), so
+            // neutralize a literal closing tag.
+            .map(|c| c.replace("</detected-cautions>", ""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        out = format!(
+            "{out}\n\n<detected-cautions>\ndarkmux's loop detectors flagged these patterns in \
+             earlier dispatches in this mission — repeated tool calls, looping reasoning, \
+             tool-failure cascades. They are signals from earlier contexts, not facts about \
+             your current workspace: a pattern that fired earlier may be irrelevant now. Use \
+             them to avoid walking back into a known dead end — if you notice yourself about to \
+             repeat one, stop and change your approach. None of these is a required action:\n\n\
+             {listed}\n</detected-cautions>"
+        );
+    }
+
+    out
 }
 
 /// (#849 half 1) The adjudication corrections recorded across this mission's
@@ -1062,6 +1113,118 @@ fn mission_adjudication_notes(mission_session_ids: &std::collections::HashSet<St
         notes = notes.split_off(notes.len() - MAX_INJECTED_CORRECTIONS);
     }
     notes
+}
+
+/// (#994 retrieve+inject) The loop pathologies darkmux's detectors flagged
+/// across this mission's earlier dispatches, for injection into the next coder
+/// brief — the doom-loop fix's AUTO-DERIVED half (sibling to the operator-
+/// authored corrections from [`mission_adjudication_notes`]). A *caution* is a
+/// detector telemetry flow record (`category=telemetry`, `source=detector`,
+/// emitted by `crew::dispatch_internal`'s detector tailer): a repeated-tool-
+/// call cycle, a reasoning loop, a tool-failure cascade. Each carries a human-
+/// readable `detail` and, when the firing targeted a file (#994 capture slice),
+/// a `payload.area.files[0]` the bullet names as the "where".
+///
+/// Reads the flow stream DIRECTLY — always fresh, no dependency on the SQLite
+/// index's derive-on-rebuild freshness (the index serves the query/recall +
+/// status surface; this hot per-dispatch path mirrors the corrections
+/// collector). Scoped to the mission's EXACT dispatch session ids (exact-set,
+/// not a `mission-run-<id>-` prefix — same sibling-bleed guard as #849). Ranked
+/// severity-then-recency, deduped, capped at `MAX_INJECTED_CAUTIONS` over the
+/// most-recent `CAUTION_LOOKBACK_DAYS` day-files — the same focus + flat-scan-
+/// cost discipline as the corrections, but ranked SEVERITY-first where the
+/// corrections collector is recency-only (a high-severity older cycle should
+/// outrank a low-severity recent stall — deliberate divergence, don't "fix" it
+/// to match the sibling). Best-effort: any IO/parse problem reads as "no
+/// cautions" (the loop just doesn't get the carry-forward, never errors).
+fn mission_cautions(mission_session_ids: &std::collections::HashSet<String>) -> Vec<String> {
+    const CAUTION_LOOKBACK_DAYS: usize = 7;
+    const MAX_INJECTED_CAUTIONS: usize = 10;
+    if mission_session_ids.is_empty() {
+        return Vec::new();
+    }
+    let flows_dir = darkmux_types::config_access::flows_dir();
+    let Ok(entries) = std::fs::read_dir(&flows_dir) else {
+        return Vec::new();
+    };
+    let mut days: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
+        .collect();
+    days.sort();
+    let recent: Vec<PathBuf> = days
+        .iter()
+        .rev()
+        .take(CAUTION_LOOKBACK_DAYS)
+        .rev()
+        .cloned()
+        .collect();
+
+    // (severity_rank, ts, bullet) — sorted severity-then-recency below, then
+    // deduped (a pathology that recurred verbatim shouldn't repeat) and capped.
+    let mut found: Vec<(u8, String, String)> = Vec::new();
+    for day in &recent {
+        let Ok(raw) = std::fs::read_to_string(day) else {
+            continue;
+        };
+        for line in raw.lines() {
+            let Ok(r) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            // A caution = a detector telemetry record scoped to this mission.
+            if r.get("category").and_then(|v| v.as_str()) != Some("telemetry") {
+                continue;
+            }
+            if r.get("source").and_then(|v| v.as_str()) != Some("detector") {
+                continue;
+            }
+            let in_mission = r
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| mission_session_ids.contains(s));
+            if !in_mission {
+                continue;
+            }
+            let payload = r.get("payload");
+            let pstr = |k: &str| payload.and_then(|p| p.get(k)).and_then(|v| v.as_str());
+            let detail = pstr("detail").unwrap_or("");
+            if detail.is_empty() {
+                continue;
+            }
+            let kind = pstr("kind").unwrap_or("caution");
+            let severity = pstr("severity").unwrap_or("warn");
+            let file = payload
+                .and_then(|p| p.get("area"))
+                .and_then(|a| a.get("files"))
+                .and_then(|f| f.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|v| v.as_str());
+            let ts = r.get("ts").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let bullet = match file {
+                Some(f) => format!("- [{kind}] {detail} (in `{f}`)"),
+                None => format!("- [{kind}] {detail}"),
+            };
+            // `warn` outranks `info`; any other value (incl. a future severity
+            // above `warn`) floors to 0 — today only `warn`/`info` are emitted,
+            // so revisit this line if a higher severity is ever introduced.
+            let rank = if severity == "warn" { 1u8 } else { 0u8 };
+            found.push((rank, ts, bullet));
+        }
+    }
+    // Highest severity first, then most recent (ts is RFC3339 — lexicographic
+    // == chronological).
+    found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for (_, _, bullet) in found {
+        if seen.insert(bullet.clone()) {
+            out.push(bullet);
+            if out.len() >= MAX_INJECTED_CAUTIONS {
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// (#817) Does the run's flow trail carry an adjudication note? Scans the
@@ -1945,7 +2108,7 @@ mod tests {
         let s = sprint("s1", "m1", &[], SprintStatus::Planned);
         let mut m = mission("m1", "compiled summary");
         m.source_input = Some("EXACT placeholder: 'APIM Key Name'. Do NOT rename fields.".into());
-        let brief = coder_brief(&s, &m, &[]);
+        let brief = coder_brief(&s, &m, &[], &[]);
         assert!(brief.starts_with("desc s1"), "compiled description leads");
         assert!(brief.contains("<operator-source-input>"), "provenance tag present");
         assert!(brief.contains("Do NOT rename fields."), "verbatim constraint survives");
@@ -1964,11 +2127,11 @@ mod tests {
     fn coder_brief_is_bare_description_without_source() {
         let s = sprint("s1", "m1", &[], SprintStatus::Planned);
         let m = mission("m1", "compiled summary");
-        assert_eq!(coder_brief(&s, &m, &[]), "desc s1");
+        assert_eq!(coder_brief(&s, &m, &[], &[]), "desc s1");
         // Whitespace-only source_input behaves as absent.
         let mut m2 = mission("m1", "compiled summary");
         m2.source_input = Some("   \n ".into());
-        assert_eq!(coder_brief(&s, &m2, &[]), "desc s1");
+        assert_eq!(coder_brief(&s, &m2, &[], &[]), "desc s1");
     }
 
     #[test]
@@ -1979,7 +2142,7 @@ mod tests {
             "Do NOT rename the APIM key field.".to_string(),
             "The verify command is `cargo test -p foo`, not the workspace default.".to_string(),
         ];
-        let brief = coder_brief(&s, &m, &corrections);
+        let brief = coder_brief(&s, &m, &corrections, &[]);
         assert!(brief.starts_with("desc s1"), "base description leads: {brief:?}");
         assert!(
             brief.contains("<prior-adjudication-corrections>"),
@@ -2004,7 +2167,117 @@ mod tests {
         assert!(!brief.contains("  "), "injected block has a space-run: {brief:?}");
         // Empty corrections leave the brief unchanged — the no-op the dispatch
         // hits on an honest first run with no prior adjudication.
-        assert_eq!(coder_brief(&s, &m, &[]), "desc s1");
+        assert_eq!(coder_brief(&s, &m, &[], &[]), "desc s1");
+    }
+
+    /// (#994 retrieve+inject) The detected-cautions block injects independently
+    /// of the corrections block (either / both / neither), names the firing's
+    /// file as the "where", carries the findings-to-verify framing (#453), and
+    /// orders authored corrections before auto-detected cautions.
+    #[test]
+    fn coder_brief_injects_detected_cautions() {
+        let s = sprint("s1", "m1", &[], SprintStatus::Planned);
+        let m = mission("m1", "compiled summary");
+        let cautions = vec![
+            "- [cycle] `edit` called 3× in the last 10 tool calls (in `src/x.rs`)".to_string(),
+            "- [reasoning-loop] same reasoning repeated 3× in 6 turns".to_string(),
+        ];
+
+        // Cautions alone (no corrections).
+        let brief = coder_brief(&s, &m, &[], &cautions);
+        assert!(brief.starts_with("desc s1"), "base description leads: {brief:?}");
+        assert!(brief.contains("<detected-cautions>"), "cautions block present: {brief:?}");
+        assert!(brief.contains("- [cycle] `edit` called 3×"), "{brief:?}");
+        assert!(brief.contains("(in `src/x.rs`)"), "the file 'where' survives: {brief:?}");
+        assert!(
+            brief.contains("not facts about your current workspace"),
+            "findings-to-verify framing present: {brief:?}"
+        );
+        assert!(
+            !brief.contains("<prior-adjudication-corrections>"),
+            "no corrections block when corrections are empty: {brief:?}"
+        );
+        // Model-facing prose must read clean — no string-continuation space-runs.
+        assert!(!brief.contains("  "), "cautions block has a space-run: {brief:?}");
+
+        // Both blocks coexist; authored corrections precede auto-detected cautions.
+        let corrections = vec!["Do not rename the field.".to_string()];
+        let both = coder_brief(&s, &m, &corrections, &cautions);
+        let corr_at = both.find("<prior-adjudication-corrections>").unwrap();
+        let caut_at = both.find("<detected-cautions>").unwrap();
+        assert!(corr_at < caut_at, "corrections (authored) precede detected cautions: {both:?}");
+
+        // Neither → bare description.
+        assert_eq!(coder_brief(&s, &m, &[], &[]), "desc s1");
+    }
+
+    /// (#994 retrieve+inject) The caution reader: collects detector telemetry
+    /// firings for a mission's EXACT dispatch session ids, deduped + ranked
+    /// severity-then-recency, naming the firing's file. Excludes non-detector
+    /// telemetry, non-telemetry categories, and sibling missions (same
+    /// exact-set scope + sibling-bleed guard as the adjudication notes).
+    /// `#[serial]` — mutates the shared DARKMUX_FLOWS_DIR.
+    #[test]
+    #[serial_test::serial]
+    fn mission_cautions_filters_scopes_and_ranks() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("2026-06-22.jsonl"),
+            concat!(
+                // mission `auth`, s1 — a file-keyed cycle (warn)
+                r#"{"ts":"2026-06-22T10:00:00Z","category":"telemetry","source":"detector","session_id":"mission-run-auth-s1","handle":"coder","payload":{"kind":"cycle","severity":"warn","detail":"`edit` called 3×","area":{"files":["src/x.rs"]}}}"#, "\n",
+                // `auth`, s2 — an info-severity firing (must rank below warn)
+                r#"{"ts":"2026-06-22T11:00:00Z","category":"telemetry","source":"detector","session_id":"mission-run-auth-s2","handle":"coder","payload":{"kind":"intra-turn-stall","severity":"info","detail":"runaway turn recovered"}}"#, "\n",
+                // exact duplicate of the cycle — must not repeat
+                r#"{"ts":"2026-06-22T11:30:00Z","category":"telemetry","source":"detector","session_id":"mission-run-auth-s1","handle":"coder","payload":{"kind":"cycle","severity":"warn","detail":"`edit` called 3×","area":{"files":["src/x.rs"]}}}"#, "\n",
+                // SIBLING mission `auth-v2` — exact-set scope must NOT bleed it
+                r#"{"ts":"2026-06-22T11:45:00Z","category":"telemetry","source":"detector","session_id":"mission-run-auth-v2-s1","handle":"coder","payload":{"kind":"cycle","severity":"warn","detail":"belongs to auth-v2"}}"#, "\n",
+                // non-detector telemetry (source=runtime) — skip
+                r#"{"ts":"2026-06-22T12:00:00Z","category":"telemetry","source":"runtime","session_id":"mission-run-auth-s1","handle":"coder","payload":{"kind":"context","detail":"context fill 40%"}}"#, "\n",
+                // non-telemetry category, even with source=detector — skip
+                r#"{"ts":"2026-06-22T12:05:00Z","category":"work","source":"detector","session_id":"mission-run-auth-s1","handle":"coder","payload":{"kind":"cycle","severity":"warn","detail":"wrong category"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        // SAFETY: serialized via #[serial]; restored below.
+        unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path()) };
+
+        let auth_ids: std::collections::HashSet<String> =
+            ["mission-run-auth-s1", "mission-run-auth-s2"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        let cautions = mission_cautions(&auth_ids);
+        let unknown = mission_cautions(&std::collections::HashSet::new());
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+
+        assert_eq!(cautions.len(), 2, "two unique in-mission cautions: {cautions:?}");
+        assert!(cautions[0].contains("[cycle]"), "warn outranks info: {cautions:?}");
+        assert!(
+            cautions[0].contains("(in `src/x.rs`)"),
+            "the firing's file is named as the 'where': {cautions:?}"
+        );
+        assert!(cautions[1].contains("[intra-turn-stall]"), "info ranks last: {cautions:?}");
+        assert!(
+            !cautions.iter().any(|c| c.contains("auth-v2")),
+            "sibling mission auth-v2 must not bleed: {cautions:?}"
+        );
+        assert!(
+            !cautions.iter().any(|c| c.contains("context fill")),
+            "non-detector telemetry excluded: {cautions:?}"
+        );
+        assert!(
+            !cautions.iter().any(|c| c.contains("wrong category")),
+            "non-telemetry category excluded: {cautions:?}"
+        );
+        assert!(unknown.is_empty(), "an empty session-id set reads as none");
     }
 
     /// (#849 half 1) The brief-injection reader: collects adjudication notes
