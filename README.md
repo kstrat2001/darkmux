@@ -372,7 +372,7 @@ The case for darkmux: **once you accept that static configs leave performance on
 
 ## Status
 
-✅ **v1.6.0**, semver-stable. v1.6.0 hardens the dispatch-to-PR loop and makes the lab fit for profile development: adjudication corrections now persist into the next coder brief, so a fix the reviewer makes once is carried forward instead of re-derived (the doom-loop fix, #849); and `lab run --profiles-file` now actually reaches the dispatch's model resolution (#984), so you can A/B a new model against a fixture. v1.5.0 added the verifier-fabrication gate (#799); v1.4.1 restored the internal-runtime dispatch; v1.4.0 closed the milestone-1.0 hardening drain. The dispatch-to-PR loop, the missions lens + `mission status`, live observability, and the Homebrew pipeline are the stable surface.
+✅ **v1.7.0**, semver-stable. v1.7.0 adds loop-engineering tooling and correctness: the loop lab (`darkmux lab loop`, #986) runs one dispatch under a chosen harness config and classifies how the loop behaved — productive, struggled, inert-false-pass, or failed — so you can A/B turn/token caps and compaction settings against a fixed model; and prior reviewer corrections now read as findings-to-verify rather than directives (#453), so a confident-but-wrong diagnosis no longer anchors the next coder into a no-progress loop. v1.6.0 made adjudication corrections persist into the next coder brief (#849) and fixed `lab run --profiles-file` (#984); v1.5.0 added the verifier-fabrication gate (#799); v1.4.1 restored the internal-runtime dispatch. The dispatch-to-PR loop, the missions lens + `mission status`, live observability, and the Homebrew pipeline are the stable surface.
 
 **Shipped:**
 

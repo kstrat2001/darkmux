@@ -11,6 +11,43 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-06-22
+
+Loop-engineering tooling and correctness: a bench for measuring how a dispatch
+loop behaves, and a fix for the wrong-diagnosis-stuck failure mode.
+
+### Added
+- **Loop lab — `darkmux lab loop <workload>` (#986).** A single-run
+  loop-engineering bench. Run one dispatch under a chosen harness config and get
+  back a verdict for how the loop behaved: `productive`, `struggled` (a loop
+  detector fired and the harness bounded it), `inert-false-pass` (the model made
+  no tool calls yet verify reports pass because the baseline passes regardless),
+  or `failed`. Two loop-variation axes: caps (`--max-turns` / `--max-tokens` /
+  `--timeout`) and compaction (`--compact-threshold-tokens` /
+  `--compact-threshold-ratio` / `--compact-strategy` / `--bail-after-compactions`
+  / `--context-window`); the model axis comes from `--profile` /
+  `--profiles-file`. `--json` for programmatic use. The report reads the run's
+  trajectory, metrics, and sandbox hashes; no new infrastructure.
+
+### Changed
+- **Prior reviewer corrections read as findings-to-verify, not directives
+  (#453).** In the dispatch-to-PR loop a confident-but-wrong reviewer diagnosis
+  could anchor the next coder into a no-progress loop. Corrections injected into
+  a follow-up coder brief, and the code-reviewer and coder role prompts, now
+  frame a prior finding as something to verify against the live workspace before
+  applying: a concrete change (a renamed field, a command) gets a quick check; a
+  diagnosis (a race condition, a failing test) gets reproduced first. A
+  correction that does not hold is re-diagnosed, bounded by the existing
+  escalation contract. The #849 carry-forward is unchanged.
+
+### Tests
+- **Coverage pass (#842).** Closed the genuine remaining gaps in the fleet
+  queue-claim decode path (`parse_xreadgroup_response` protocol-shape errors,
+  `extract_field` edge cases), the docker-run argv builder (compaction-strategy
+  mapping, allowed-tools block-all vs allow-all, the feedback-templates guard),
+  and `build_work_job` (the cross-machine WorkJob constructor, previously
+  untested). Test-only; no behavior change.
+
 ## [1.6.0] - 2026-06-21
 
 Dispatch-to-PR loop correctness, and the lab made fit for profile development.
@@ -306,6 +343,7 @@ cluster of crew-index correctness repairs.
   idle machine's bar no longer stretches to the playhead; adds the first
   viewer-lifecycle e2e regression gate.
 
+[1.7.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.7.0
 [1.6.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.6.0
 [1.5.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.5.0
 [1.4.1]: https://github.com/kstrat2001/darkmux/releases/tag/v1.4.1
