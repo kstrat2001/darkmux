@@ -646,7 +646,8 @@ const sessionCloseEdge=sid=>{
 function liveScopedMissions(){
   if(!missions.length) return [];
   if(document.body.classList.contains('live-mode')){
-    return missions.filter(mid => DATA.some(r => r.mission_id===mid && LIVE_SESSIONS.has(r.session_id)));
+    const ls=liveSessionSet();
+    return missions.filter(mid => DATA.some(r => r.mission_id===mid && ls.has(r.session_id)));
   }
   return missions;
 }
@@ -668,14 +669,19 @@ function missionLabel(){
 // session leaves LIVE_SESSIONS the headline flips to idle (no stale "◆ m6").
 function liveSubject(){
   if(!document.body.classList.contains('live-mode')) return null;
-  const live=DATA.filter(r=>r.action==="dispatch.start"&&LIVE_SESSIONS.has(r.session_id));
+  const ls=liveSessionSet();
+  const live=DATA.filter(r=>r.action==="dispatch.start"&&ls.has(r.session_id));
   if(!live.length) return null;
   // Dedup by session_id (newest-first, keep the first seen) — a session that
   // emitted dispatch.start more than once (reconnect/retry) must count ONCE,
   // or "+N more" inflates with phantom sessions. The unit is the session.
   const byNew=live.slice().sort((a,b)=>T(b.ts)-T(a.ts));
   const seen=new Set();
-  const uniq=byNew.filter(r=>!(seen.has(r.session_id)||seen.add(r.session_id)));
+  // Keep the first (newest) record per session_id. NOTE: `Set.add` RETURNS the
+  // set (truthy), so the old `!(seen.has(x)||seen.add(x))` excluded EVERY record
+  // (uniq always empty -> pick undefined -> throw). Latent until #1007 made
+  // `live` non-empty without Redis; fixed to the explicit keep-first form.
+  const uniq=byNew.filter(r=>{ if(seen.has(r.session_id))return false; seen.add(r.session_id); return true; });
   const pick=uniq.find(r=>r.mission_id)||uniq[0]; // prefer a mission-scoped subject
   const count=uniq.length-1;                      // other live sessions
   if(pick.mission_id){
@@ -750,6 +756,41 @@ function machPresent(m){
   if(!edges.length)return null;
   return edges[edges.length-1].action==="machine.online";
 }
+// (#1007) Flow-derived liveness fallback. When Redis session-presence is
+// unavailable (single-machine, or the fleet hub is down/auth-failing),
+// `LIVE_SESSIONS` is empty even while a dispatch is actively running — so the
+// fleet card read "0 running" and role cards read "ended" while the SAME stream
+// carried fresh `dispatch.turn.heartbeat` records. A heartbeat seconds old IS
+// proof of life, and the local daemon already serves these flow records. So when
+// LIVE_SESSIONS is empty, derive the live set from the flow stream: a session
+// with a `dispatch.start`, NO close-edge, and a record within FLOW_LIVE_TTL_MS
+// of now. Redis stays authoritative whenever it has ANY beat — we only fall back
+// on a fully empty set. Live mode only; playback is presence-agnostic (returns
+// empty). Recency is vs wall-clock `Date.now()`, NOT `state.t`: in live follow
+// `state.t` tracks the newest record, so a stale orphaned session (no reconciler
+// to close it when Redis is down) could pin `state.t` to its own last record and
+// read as live forever — `Date.now()` correctly ages it out.
+const FLOW_LIVE_TTL_MS=300*1000; // below the 600s inactivity-kill; absorbs quiet stretches between turns
+function flowLiveSessions(){
+  if(!document.body.classList.contains('live-mode')) return new Set();
+  const now=Date.now(), lastBySid=new Map(), started=new Set();
+  for(const r of DATA){
+    if(!r.session_id) continue;
+    const t=T(r.ts), p=lastBySid.get(r.session_id);
+    if(p===undefined||t>p) lastBySid.set(r.session_id,t);
+    if(r.action==="dispatch.start") started.add(r.session_id);
+  }
+  const out=new Set();
+  for(const sid of started){
+    if(sessionCloseEdge(sid)) continue;                 // terminal/abandoned → not running
+    if(now-(lastBySid.get(sid)||0)<=FLOW_LIVE_TTL_MS) out.add(sid); // recent activity = alive
+  }
+  return out;
+}
+// The effective live-session set: Redis presence when it has ANY beat
+// (authoritative, short-TTL), else the flow-derived fallback above. Every
+// "is this session running NOW" decision routes through here.
+function liveSessionSet(){ return LIVE_SESSIONS.size ? LIVE_SESSIONS : flowLiveSessions(); }
 // (#783) Tokens kept off the (frontier) meter — the savings hero. Sums ONLY
 // `telemetry.tokens` records (category=telemetry, source=tokens). Since #795
 // the runtime tailer emits one record PER TURN (so the odometer climbs DURING
@@ -882,9 +923,10 @@ function renderFleet(){
   // LIVE_SESSIONS) — completed dispatches from earlier today shouldn't read as
   // current crew ("coder ×7"). Playback counts all sessions in the window.
   const liveMode=document.body.classList.contains('live-mode');
+  const liveSet=liveSessionSet(); // (#1007) Redis presence, or flow-derived when Redis is down
   const cards=ms.map(m=>{
     const all=sessionsOn(m);
-    const act=machActive(m), runs=liveMode ? all.filter(sid=>LIVE_SESSIONS.has(sid)).length : all.length;
+    const act=machActive(m), runs=liveMode ? all.filter(sid=>liveSet.has(sid)).length : all.length;
     // (#638 Slice 3) Presence at the scrubber: an absent machine dims + reads
     // "offline" and can't be "dispatch in flight" (it's gone). present/unknown
     // keep the prior idle/active behavior.
@@ -991,6 +1033,7 @@ function renderMachine(){
   // an absent machine caps its roles to terminal status (consistency guard;
   // the session.end edges usually already bookend them at the same instant).
   const machAbsent=machPresent(m)===false;
+  const liveSet=liveSessionSet(); // (#1007) Redis presence, or flow-derived when Redis is down
   const nodeObjs=sessionsOn(m).filter(sid=>visible().some(r=>r.session_id===sid)).map(sid=>{
     const s=dispatch(sid,"start");
     // (#638/#647) Session status at the scrubber time `state.t`, from the
@@ -1019,7 +1062,7 @@ function renderMachine(){
     // the clean path already has; suppressed in practice because the session
     // emitter's stop() pre-claims session-end on the normal return path
     // regardless of exit code. Only leaks on a Redis-outage-spans-TTL window.
-    const liveNow=LIVE_SESSIONS.has(sid);
+    const liveNow=liveSet.has(sid);
     let cls,lbl;
     if(closedBy){
       if(errClose){ cls='err'; lbl=dispatchKilled(c)?'killed':'errored'; }
@@ -1894,8 +1937,12 @@ function stageSig(){
   // Fold the live-session set in: a session going live / ageing out is a
   // lifecycle change that must re-render the cards (so the "running"↔"ended"
   // pill flips), same as a dispatch.start/complete / session.end edge arriving
-  // (#638/#647).
-  const ls=liveSig();
+  // (#638/#647). (#1007) When Redis presence is empty, fold the FLOW-DERIVED
+  // live set in instead — otherwise a silently-crashed orphan ageing out past
+  // FLOW_LIVE_TTL_MS changes nothing in the signature (no new record arrives)
+  // and the card stays "running" until an unrelated event re-renders. With the
+  // flow-derived set folded in, the next poll past the TTL boundary flips it.
+  const ls=LIVE_SESSIONS.size?liveSig():[...flowLiveSessions()].sort().join(",");
   // (#638 Slice 3) Live presence set — when a machine stops beating it drops
   // from LIVE_MACHINES (membership stays via its records, so machines() doesn't
   // change), but its card must re-render present→absent. Fold the presence
