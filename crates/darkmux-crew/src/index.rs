@@ -69,20 +69,21 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Bumped to 2 in refactor 0 (`capability` → `skill` rename, #448); to 3
 /// for the #95 mission/sprint transition-timestamp columns (#914); to 4 for
-/// the #994 engagement-context tables — `cautions` (derived from the flow
-/// stream) + `knowledge` (preserved, operator-authored). Two
-/// independent mechanisms in [`init_schema`] keep an on-disk DB current:
-/// (1) the `< 2` migration block drops the legacy `capabilities` /
-/// `role_capabilities` / `capability_keywords` / `capability_keywords_fts`
-/// artifacts; (2) every rebuild drops + recreates the derived
+/// the #994 engagement-context `cautions` table (derived from the flow stream);
+/// to 5 (#999) when the scaffolded `knowledge` table was dropped — authored
+/// lessons live in their own durable `lessons.db` store now (`darkmux lessons`),
+/// not in this derived crew index. Two independent mechanisms in [`init_schema`]
+/// keep an on-disk DB current: (1) version-gated migration blocks drop legacy
+/// artifacts (the `< 2` capability-rename tables; the `< 5` vestigial
+/// `knowledge` table); (2) every rebuild drops + recreates the derived
 /// `REBUILD_TABLES` so a column added to the DDL (e.g. the #95 timestamps)
 /// lands even on a pre-existing DB — a plain `CREATE TABLE IF NOT EXISTS`
 /// cannot evolve an existing table's columns. Bumping this constant also
 /// gives the read path a staleness signal (see [`ensure_fresh_index`]).
-/// Allocator tables, `knowledge`, + `meta_kv` are NOT derived and are
-/// preserved across rebuilds. No data is lost — every dropped table is
-/// rebuilt from the on-disk manifests + the flow stream.
-const SCHEMA_VERSION: i32 = 4;
+/// Allocator tables + `meta_kv` are NOT derived and are preserved across
+/// rebuilds. No data is lost — every dropped table is rebuilt from the on-disk
+/// manifests + the flow stream.
+const SCHEMA_VERSION: i32 = 5;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS source_files (
@@ -249,29 +250,19 @@ CREATE TABLE IF NOT EXISTS cautions (
 );
 CREATE INDEX IF NOT EXISTS idx_cautions_file ON cautions(file);
 
--- (#994) knowledge — operator-AUTHORED engagement context: conventions,
--- constraints, decisions, + the reasoning behind them ("include the why").
--- The operator-sovereign source of truth — NOT in REBUILD_TABLES, so it is
--- preserved across rebuilds (like `meta_kv` and the allocator tables). Empty
--- until the authoring slice (capture verb / bootstrap skill / hand-edit)
--- populates it; scaffolded here so the schema bump covers it. `file` is an
--- OPTIONAL area scope (NULL = engagement-level).
-CREATE TABLE IF NOT EXISTS knowledge (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    file        TEXT,
-    title       TEXT NOT NULL,
-    body        TEXT NOT NULL,
-    source      TEXT,
-    created_ts  INTEGER NOT NULL,
-    updated_ts  INTEGER NOT NULL
-);
+-- (#999) The operator-authored engagement context (conventions, constraints,
+-- decisions + the "why") lives in its own durable `lessons.db` store now
+-- (`darkmux lessons`), NOT in this derived crew index. The scaffolded
+-- `knowledge` table that briefly lived here (#998) is dropped by the `< 5`
+-- migration in `init_schema`.
 "#;
 
 /// Tables (and only tables) that `rebuild()` clears + repopulates. Most are
 /// derived from manifests; `cautions` is derived from the flow stream (#994).
-/// Allocator tables (allocations / outcomes / unmatched_terms), the
-/// operator-authored `knowledge` table (#994), and `meta_kv` are preserved
-/// across rebuilds — those carry runtime / authored state, not derived data.
+/// Allocator tables (allocations / outcomes / unmatched_terms) and `meta_kv`
+/// are preserved across rebuilds — those carry runtime state, not derived data.
+/// (Operator-authored lessons live in a separate `lessons.db` store, not in
+/// this index at all — #999.)
 const REBUILD_TABLES: &[&str] = &[
     "source_files",
     "role_escalation_targets",
@@ -397,6 +388,15 @@ fn init_schema(conn: &Connection) -> Result<()> {
              DROP TABLE IF EXISTS capabilities;",
         )
         .context("dropping pre-rename legacy tables (refactor 0, #448)")?;
+    }
+
+    // Migration (#999): the scaffolded `knowledge` table (#998) is superseded
+    // by the durable `lessons.db` store — authored lessons live there now, not
+    // in this derived crew index. Drop the vestigial table. Idempotent + a
+    // no-op on DBs that never had it (DROP IF EXISTS).
+    if current_version < 5 {
+        conn.execute_batch("DROP TABLE IF EXISTS knowledge;")
+            .context("dropping the vestigial index.db knowledge table (#999)")?;
     }
 
     // Self-heal derived-table schema drift (#914): drop + recreate every
@@ -867,10 +867,9 @@ fn status_at(path: &Path) -> Result<StatusReport> {
         report.per_kind_counts.push(row?);
     }
 
-    // (#994) Derived caution count. (Authored *knowledge* lives in its own
-    // durable `knowledge.db` store now — surfaced by `darkmux knowledge list`,
-    // not the crew index; the scaffolded index.db `knowledge` table is
-    // superseded and vestigial, full removal tracked as a follow-up.)
+    // (#994) Derived caution count. (Authored *lessons* live in their own
+    // durable `lessons.db` store — surfaced by `darkmux lessons list`, not the
+    // crew index; the scaffolded index.db `knowledge` table was dropped in #999.)
     report.caution_count = conn
         .query_row("SELECT COUNT(*) FROM cautions", [], |r| r.get(0))
         .unwrap_or(0);
@@ -973,8 +972,8 @@ pub fn status() -> Result<()> {
         }
     }
     println!();
-    // (#994) Derived cautions in the index. Authored knowledge is a separate
-    // durable store (`darkmux knowledge list`), not part of the crew index.
+    // (#994) Derived cautions in the index. Authored lessons are a separate
+    // durable store (`darkmux lessons list`), not part of the crew index.
     println!("engagement context:");
     println!("  {:12} {} (derived from the flow stream)", "cautions", report.caution_count);
     println!();
@@ -1147,60 +1146,11 @@ mod tests {
         assert_eq!(engagement_level, None, "engagement-level firing → NULL file");
     }
 
-    #[serial_test::serial]
-    #[test]
-    fn knowledge_preserved_but_cautions_rederived_across_rebuild() {
-        let crew = CrewDirGuard::new();
-        crew.write_flow_day(
-            "2026-06-22.jsonl",
-            &[detector_line(
-                "detector",
-                serde_json::json!({
-                    "kind": "cycle", "severity": "warn", "detail": "x",
-                    "area": { "files": ["a.rs"] }
-                }),
-            )],
-        );
-        let idx = index_path(crew.path());
-        rebuild_at(&idx).unwrap();
-
-        // Author a knowledge row (the authoring slice will do this via a verb).
-        {
-            let conn = open_index(&idx).unwrap();
-            conn.execute(
-                "INSERT INTO knowledge (file, title, body, source, created_ts, updated_ts)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    "a.rs",
-                    "bound the retries",
-                    "we cap retries because the loop entrenches its first answer",
-                    "operator",
-                    1_700_000_000_i64,
-                    1_700_000_000_i64
-                ],
-            )
-            .unwrap();
-        }
-
-        // Rebuild again: cautions are dropped + re-derived; knowledge survives.
-        rebuild_at(&idx).unwrap();
-        let conn = open_index(&idx).unwrap();
-        let knowledge: i64 = conn
-            .query_row("SELECT COUNT(*) FROM knowledge", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(
-            knowledge, 1,
-            "authored knowledge is preserved across rebuild (not in REBUILD_TABLES)"
-        );
-        let title: String = conn
-            .query_row("SELECT title FROM knowledge", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(title, "bound the retries");
-        let cautions: i64 = conn
-            .query_row("SELECT COUNT(*) FROM cautions", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(cautions, 1, "cautions re-derived from the flow stream on rebuild");
-    }
+    // (#999) The former `knowledge_preserved_but_cautions_rederived_across_rebuild`
+    // test was dropped with the vestigial index.db `knowledge` table: its
+    // preserved-across-rebuild property is covered by
+    // `rebuild_preserves_non_derived_runtime_state`, and its caution-rederive
+    // property by `rebuild_derives_cautions_from_flow_stream`.
 
     #[test]
     fn caution_fields_extracts_area_and_defaults() {
@@ -1801,6 +1751,55 @@ mod tests {
             has_started_ts.is_some(),
             "rebuild must heal the stale missions table to include the #95 columns"
         );
+    }
+
+    /// (#999) A pre-#999 index (version 4) carrying the scaffolded `knowledge`
+    /// table must, on rebuild, drop that table (authored lessons live in
+    /// `lessons.db` now) and advance to version 5. The `< 5` migration block in
+    /// `init_schema` does this; assert the table is gone afterward.
+    #[serial_test::serial]
+    #[test]
+    fn rebuild_drops_vestigial_knowledge_table() {
+        let tmp = TempDir::new().unwrap();
+        let idx = tmp.path().join("vestigial.db");
+        {
+            let conn = Connection::open(&idx).unwrap();
+            conn.execute_batch(
+                "PRAGMA user_version = 4;
+                 CREATE TABLE knowledge (
+                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                     file        TEXT,
+                     title       TEXT NOT NULL,
+                     body        TEXT NOT NULL,
+                     source      TEXT,
+                     created_ts  INTEGER NOT NULL,
+                     updated_ts  INTEGER NOT NULL
+                 );
+                 INSERT INTO knowledge (title, body, created_ts, updated_ts)
+                   VALUES ('legacy', 'seed', 0, 0);",
+            )
+            .unwrap();
+        }
+
+        rebuild_at(&idx).unwrap();
+
+        let conn = open_index(&idx).unwrap();
+        let knowledge_exists: Option<()> = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'knowledge'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()
+            .unwrap();
+        assert!(
+            knowledge_exists.is_none(),
+            "the vestigial index.db knowledge table must be dropped on migration (#999)"
+        );
+        let version: i32 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION, "user_version advanced to current");
     }
 
     /// (#914, CONSIDER-1) A DB whose structural `user_version` is current but

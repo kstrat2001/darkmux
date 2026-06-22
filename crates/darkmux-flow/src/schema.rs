@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.13.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.14.0";
 // Version history:
 //   1.2.0 — added optional `model` (#106)
 //   1.3.0 — added optional `reasoning` + `mission_id`; new Stage::TierDecision (#136)
@@ -83,6 +83,16 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.13.0";
 //           consumers that SUM the family are unaffected (old aggregates and
 //           new per-turn records sum identically). New records only, chains
 //           survive without rotation.
+//   1.14.0 — renamed the `Stage::Retrospect` variant → `Stage::Debrief`
+//           (serde value `"retrospect"` → `"debrief"`), the NASA-vocabulary
+//           rename for the post-mission review stage (#999). The variant was
+//           an unemitted placeholder — NO record ever carried the old value —
+//           so this changes only the enum's value-set, not any persisted data;
+//           AuditFileSink chains survive without rotation (no records change),
+//           and the variant stays unemitted until the debrief ceremony (#1000)
+//           writes it. Treated as minor since nothing on-the-wire carried the
+//           old value; the bump signals the value-set change for that future
+//           consumer.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -124,7 +134,12 @@ pub enum Stage {
     Dispatch,
     Review,
     Ship,
-    Retrospect,
+    /// Post-mission review stage (#999, NASA vocabulary — Mission · Crew ·
+    /// Debrief · Lessons). The mission debrief ceremony (#1000) distills the
+    /// mission's cautions + corrections into durable lessons; records of that
+    /// review carry this stage. Serialized as `"debrief"`. Renamed from the
+    /// unemitted `Retrospect` placeholder in FLOW_SCHEMA 1.14.0.
+    Debrief,
     /// Tier-decision record (#136): the frontier orchestrator's reasoning
     /// for routing this piece of work to local vs. holding in frontier.
     /// Emitted via `darkmux flow tier-decision`. Category typically
@@ -166,7 +181,7 @@ pub struct FlowRecord {
     ///
     /// Non-tier-decision records typically leave this `None`. When set
     /// on any record, it's free-form prose intended for human review
-    /// (compliance audit, post-mortem, retrospective).
+    /// (debrief, compliance audit, post-mortem).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
     /// Parent mission id. Optional because some flow records aren't
