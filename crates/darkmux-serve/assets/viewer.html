@@ -1261,7 +1261,7 @@ function renderSubsystem(){
   const segs=loads.map((r,i)=>`<span class="seg ${i>0?'b':''}">${esc(r.fields.model)} · ${esc(r.fields.gb||'?')}GB</span>`).join("");
   const bars=procs.map(r=>`<div class="bar" style="height:${Math.max(3,r.fields.cpu/100*78)}px" title="cpu ${esc(r.fields.cpu)}%"></div>`).join("");
   const xvals=procs.map(r=>`<span>${esc(r.fields.cpu)}</span>`).join("");
-  const cpu=procs.length?`<div class="track"><div class="lbl">process cpu — % busy</div>
+  const cpu=procs.length?`<div class="track"><div class="lbl">container cpu — % busy <span style="color:var(--muted);text-transform:none;font-weight:400">(tool work — inference runs in LMStudio, off-container)</span></div>
     <div class="cpuchart"><div class="yax"><span>100</span><span>50</span><span>0</span></div>
       <div><div class="bars">${bars}</div><div class="xvals">${xvals}</div></div></div></div>`:"";
   let ctxChart="";
