@@ -592,7 +592,7 @@ const specOf=m=>{ if(m==="unknown"){ const ns=[...new Set(DATA.filter(r=>uidOf(r
   // (#1008) THIS machine: prefer the live /machine/specs probe (cpu + RAM) over
   // the empty static MACH_SPEC. Remote machines fall through to their presence
   // beat's specs. Returns a RAW string; the call site escapes it.
-  if(MACHINE_SPECS && nameOf(m)===MACHINE_SPECS.machine_id && MACHINE_SPECS.cpu_brand){ const gb=MACHINE_SPECS.ram_total_bytes?` · ${Math.round(MACHINE_SPECS.ram_total_bytes/1e9)} GB`:''; return MACHINE_SPECS.cpu_brand+gb; }
+  if(MACHINE_SPECS && nameOf(m)===MACHINE_SPECS.machine_id && MACHINE_SPECS.cpu_brand){ const gb=MACHINE_SPECS.ram_total_bytes?` · ${Math.round(MACHINE_SPECS.ram_total_bytes/1073741824)} GB`:''; return MACHINE_SPECS.cpu_brand+gb; } // GiB (1024^3) — matches the "128 GB" the hardware/OS reports, not decimal 137
   const rs=MACH_SPEC[nameOf(m)]; if(rs)return rs; const b=LIVE_MACHINES.get(m); return (b&&b.specs)||''; };
 // (#638) Presence is the source of truth for "who's in the fleet" — a machine
 // shows if it's broadcasting a heartbeat (LIVE_MACHINES), whether or not it has
