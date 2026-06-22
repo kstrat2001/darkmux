@@ -102,6 +102,41 @@ pub enum RuleKind {
     AgentsDefaultModelResolves,
 }
 
+/// Which agent runtime a rule diagnoses (#1010). The doctor uses this to decide
+/// relevance: OC-path rules (their evaluators read `ctx.openclaw_config`) are
+/// suppressed from default `doctor` output unless `--include-openclaw`, since
+/// darkmux's default is the internal runtime and OpenClaw is optional. A rule
+/// DECLARES its runtime here rather than the doctor inferring it by substring-
+/// matching the human-facing message — that was fragile and already broken: a
+/// rule naming the config by field path (`agents.defaults.compaction.model`)
+/// never contained the literal word "openclaw", so it leaked into default output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleRuntime {
+    /// Diagnoses the OpenClaw shell-out path (reads `openclaw.json`).
+    OpenClaw,
+    /// Runtime-agnostic — applies regardless of dispatch runtime (e.g. RAM).
+    Agnostic,
+}
+
+impl RuleKind {
+    /// The runtime this rule diagnoses, classified by whether its evaluator
+    /// reads `ctx.openclaw_config` (OC-path) or only general system state.
+    pub fn runtime(&self) -> RuleRuntime {
+        use RuleKind::*;
+        match self {
+            ContextWindowMismatch
+            | SafeguardCompactionMode
+            | NCtxExceedsModelMax
+            | CompactorNotLoaded
+            | PrimaryConfigDrift
+            | AgentsDefaultModelResolves => RuleRuntime::OpenClaw,
+            // RAM headroom is runtime-agnostic; AggressiveSampler is reserved
+            // (always Skipped) and harmless to surface.
+            MemoryHeadroomTight | AggressiveSampler => RuleRuntime::Agnostic,
+        }
+    }
+}
+
 /// Severity of a rule firing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -842,6 +877,34 @@ impl RulesPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (#1010) Pin the runtime classification at the source. The `match` in
+    /// `RuleKind::runtime` is exhaustive, so the compiler forces a NEW variant to
+    /// pick *a* runtime — but not the CORRECT one. This locks the contract:
+    /// a rule whose evaluator reads `ctx.openclaw_config` MUST be `OpenClaw`
+    /// (so doctor suppresses it by default), and a runtime-agnostic rule must be
+    /// `Agnostic` (so it always surfaces). If you add/retag a rule, update here.
+    #[test]
+    fn rule_runtime_classification_is_pinned() {
+        use RuleKind::*;
+        for k in [
+            ContextWindowMismatch,
+            SafeguardCompactionMode,
+            NCtxExceedsModelMax,
+            CompactorNotLoaded,
+            PrimaryConfigDrift,
+            AgentsDefaultModelResolves,
+        ] {
+            assert_eq!(
+                k.runtime(),
+                RuleRuntime::OpenClaw,
+                "{k:?} reads openclaw_config — must be OpenClaw so doctor suppresses it by default"
+            );
+        }
+        for k in [MemoryHeadroomTight, AggressiveSampler] {
+            assert_eq!(k.runtime(), RuleRuntime::Agnostic, "{k:?} is runtime-agnostic");
+        }
+    }
 
     #[test]
     fn schema_version_is_semver_shaped() {

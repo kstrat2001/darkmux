@@ -1171,6 +1171,16 @@ fn eureka_checks(include_openclaw: bool) -> Vec<Check> {
     let ctx = eureka::Context::collect();
     eureka::evaluate_all(&ctx)
         .into_iter()
+        // (#1010) Suppress OC-path eureka rules from default output unless
+        // `--include-openclaw`, keyed on each rule's DECLARED runtime
+        // (RuleKind::runtime), not by substring-matching "openclaw" in the
+        // human-facing message. The old substring filter leaked any OC rule that
+        // named the config by field path (e.g. `agents.defaults.compaction.model`)
+        // without the literal word "openclaw" — compactor-not-loaded,
+        // agents-default-model-resolves, n-ctx-exceeds-model-max all slipped
+        // through. Filtering here (before the Check map) keys on the rule, not its
+        // wording, per the schema-isolation doctrine.
+        .filter(|(def, _)| include_openclaw || def.kind.runtime() != eureka::RuleRuntime::OpenClaw)
         .map(|(def, verdict)| match verdict {
             eureka::Verdict::Pass => Check {
                 name: format!("eureka: {}", def.id),
@@ -1205,31 +1215,6 @@ fn eureka_checks(include_openclaw: bool) -> Vec<Check> {
                 message: format!("(skipped: {reason})"),
                 hint: None,
             },
-        })
-        // (#393) Suppress all openclaw-mentioning eureka checks from
-        // default doctor output per the schema-isolation doctrine
-        // (DESIGN.md "Schema isolation: each runtime owns its own
-        // config"). The OC-coupled eureka rules (ctx-window-mismatch,
-        // safeguard-compaction-mode, n-ctx-exceeds-model-max,
-        // compactor-not-loaded, primary-config-drift,
-        // agents-default-model-resolves) still execute but their
-        // resulting Check is filtered out when its message OR hint
-        // mentions openclaw — covers Skipped("no ~/.openclaw/...")
-        // verdicts, Fire verdicts whose remediation hints point at
-        // openclaw.json, and any other OC-leaking surface. With
-        // `--include-openclaw` set, the operator opts in and these
-        // surface normally.
-        .filter(|check| {
-            if include_openclaw {
-                return true;
-            }
-            let mentions_oc = check.message.to_lowercase().contains("openclaw")
-                || check
-                    .hint
-                    .as_deref()
-                    .map(|h| h.to_lowercase().contains("openclaw"))
-                    .unwrap_or(false);
-            !mentions_oc
         })
         .collect()
 }
