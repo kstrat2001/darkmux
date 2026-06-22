@@ -1196,17 +1196,36 @@ function drillLoose(m){
   render();
 }
 function renderSubsystem(){
-  const sid=state.session, m=state.machine; $("logscope").textContent=sid; state.stageScope=r=>r.session_id===sid;
-  const tel=visible().filter(r=>r.session_id===sid&&r.category==="telemetry");
+  const sid=state.session, m=state.machine; $("logscope").textContent=sid;
+  // (#1013) A sprint re-run REUSES the deterministic session id
+  // (mission-run-<mission>-<sprint>), so DATA for `sid` can hold MULTIPLE
+  // dispatch attempts. Scope this drill-down to the attempt active at the
+  // scrubber — records from the most-recent dispatch.start AT/BEFORE state.t
+  // onward — so wall clock, detections, and metrics describe ONE dispatch, not a
+  // conflated sum spanning both runs + the gap between them (the 94-minute wall
+  // clock + merged detections #1013 was filed for). A single-attempt session is
+  // unchanged (one start = its own boundary). In live follow state.t=tMax, so
+  // this is the genuinely-latest attempt; in playback `visible()` (state.t-capped)
+  // already bounds the upper edge to the active attempt.
+  const sidStarts=DATA.filter(r=>r.session_id===sid&&r.action==="dispatch.start"&&T(r.ts)<=state.t).sort((a,b)=>T(a.ts)-T(b.ts));
+  const d=sidStarts.length?sidStarts[sidStarts.length-1]:null;
+  const firstSessRec=DATA.find(r=>r.session_id===sid);
+  const startTs=d?T(d.ts):(firstSessRec?T(firstSessRec.ts):tMin);
+  const inAttempt=r=>r.session_id===sid&&T(r.ts)>=startTs;
+  state.stageScope=inAttempt;
+  // This attempt's close-edge: earliest terminal at/after its start. `c` is the
+  // dispatch terminal (complete/error — errored/killed STYLING); `close` also
+  // counts session.end (brackets the wall clock for an abandoned/killed run).
+  const attemptCloses=DATA.filter(r=>inAttempt(r)&&(r.action==="dispatch.complete"||r.action==="dispatch.error"||r.action==="session.end")).sort((a,b)=>T(a.ts)-T(b.ts));
+  const close=attemptCloses[0]||null, c=attemptCloses.find(r=>r.action!=="session.end")||null;
+  const done=close&&T(close.ts)<=state.t;
+  const tel=visible().filter(r=>inAttempt(r)&&r.category==="telemetry");
   const lms=tel.filter(r=>r.source==="lms"), procs=tel.filter(r=>r.source==="process");
   const rt=tel.filter(r=>r.source==="runtime").slice(-1)[0];
   const dets=tel.filter(r=>r.source==="detector");
   const loads=lms.filter(r=>r.fields.event==="load");
   const distinct=[...new Set(loads.map(r=>r.fields.model))];
-  const d=dispatch(sid,"start"), c=dispatchEnd(sid), close=sessionCloseEdge(sid), done=close&&T(close.ts)<=state.t;
-  const firstSessRec = DATA.find(r => r.session_id === sid);
-  const handle = d ? d.handle : (firstSessRec ? firstSessRec.handle : "unknown");
-  const startTs = d ? T(d.ts) : (firstSessRec ? T(firstSessRec.ts) : tMin);
+  const handle=d?d.handle:(firstSessRec?firstSessRec.handle:"unknown");
   const turns=rt?rt.fields.turns:"—";
   const cx=tel.filter(r=>r.source==="context").slice().sort((a,b)=>T(a.ts)-T(b.ts));
   const comps=tel.filter(r=>r.source==="compaction");
