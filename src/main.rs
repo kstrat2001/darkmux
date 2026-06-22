@@ -585,6 +585,22 @@ enum MissionCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Debrief a mission (#1000) — the post-mission review ceremony's raw
+    /// material in one place: the loop pathologies darkmux's detectors flagged
+    /// across the mission's runs (cautions), the corrections the reviewer
+    /// recorded (#849), and the mission's sprints + how each ended. READ-ONLY.
+    /// Run it (or let the close nudge prompt it) at mission completion; the
+    /// `darkmux-mission-debrief` skill consumes `--json` to distill durable
+    /// `lessons` (with the why) for the next crew. NASA vocabulary:
+    /// Mission · Crew · Debrief · Lessons.
+    Debrief {
+        /// Mission id (filename stem under ~/.darkmux/missions/).
+        id: String,
+        /// Emit the debrief material as structured JSON (for the
+        /// `darkmux-mission-debrief` skill) instead of the human-readable view.
+        #[arg(long)]
+        json: bool,
+    },
     /// Transition a mission to `Active`. Stamps `started_ts=now()` if not
     /// already set. Mission must be currently `Active` with no started_ts,
     /// OR — note: missions get created in `Active` status by convention,
@@ -1700,6 +1716,7 @@ fn cmd_sprint(sub: SprintCmd) -> Result<i32> {
 fn cmd_mission(sub: MissionCmd) -> Result<i32> {
     match sub {
         MissionCmd::Status { json } => mission_status::run(json),
+        MissionCmd::Debrief { id, json } => mission_run::debrief(&id, json),
         MissionCmd::Start { id, reasoning } => {
             let m = crew::lifecycle::mission_start_with_reasoning(&id, reasoning.as_deref())?;
             println!(
@@ -1718,6 +1735,10 @@ fn cmd_mission(sub: MissionCmd) -> Result<i32> {
                 "mission `{}` → Closed  duration={}s  closed_ts={}",
                 m.id, dur, closed
             );
+            // (#1000) The mission's done — prompt the debrief ceremony so its
+            // transient signal (cautions + corrections) becomes durable lessons
+            // for the next crew. Emits Stage::Debrief; never blocks the close.
+            mission_run::nudge_mission_debrief(&m.id);
             Ok(0)
         }
         MissionCmd::Pause { id, reasoning } => {

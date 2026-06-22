@@ -1305,6 +1305,238 @@ fn engagement_lessons() -> Vec<String> {
         .collect()
 }
 
+fn sprint_status_label(s: crew::types::SprintStatus) -> &'static str {
+    use crew::types::SprintStatus::*;
+    match s {
+        Planned => "planned",
+        Running => "running",
+        Complete => "complete",
+        Abandoned => "abandoned",
+    }
+}
+
+fn mission_status_label(s: crew::types::MissionStatus) -> &'static str {
+    use crew::types::MissionStatus::*;
+    match s {
+        Active => "active",
+        Closed => "closed",
+        Paused => "paused",
+    }
+}
+
+/// Print a bullet list, or a dim "(none)" when empty — the debrief's
+/// section renderer. The collected strings are already bullet-formatted
+/// (`- …`) by the caution / correction collectors.
+fn print_bullets_or_none(items: &[String]) {
+    if items.is_empty() {
+        println!("  {}", style::dim("(none)"));
+        return;
+    }
+    for it in items {
+        for (i, line) in it.lines().enumerate() {
+            // First line carries the collector's own `- ` bullet; indent it
+            // two spaces. Continuation lines indent under the bullet.
+            if i == 0 {
+                println!("  {line}");
+            } else {
+                println!("    {line}");
+            }
+        }
+    }
+}
+
+/// (#1000) The debrief ceremony's gathered raw material for one mission. Owned
+/// (not borrowed from the loaded mission/sprint Vecs) so the gather + render are
+/// cleanly separable and the gather is unit-testable without stdout capture.
+struct DebriefReport {
+    mission_id: String,
+    mission_description: String,
+    mission_status: &'static str,
+    /// (sprint_id, first-line description, status label) per sprint.
+    sprints: Vec<(String, String, &'static str)>,
+    /// Already bullet-formatted by [`mission_cautions`].
+    cautions: Vec<String>,
+    /// The reviewer's adjudication notes (#849), as recorded.
+    corrections: Vec<String>,
+}
+
+/// (#1000) Gather the debrief raw material for `mission_id`: the loop
+/// pathologies darkmux's detectors flagged across the mission's runs (cautions),
+/// the corrections the reviewer recorded (#849), and the mission's sprints + how
+/// each ended. READ-ONLY.
+///
+/// The flow stream IS the mission's durable history (the #557 single-stream
+/// doctrine); this reads it scoped to the mission's EXACT dispatch session ids
+/// (same `mission-run-<id>-<sprint>` construction as the run path, so a sibling
+/// mission whose id is a hyphen-extension never bleeds in). It does NOT assume a
+/// coding mission — no git diffs are reconstructed here: for a coding mission
+/// the `darkmux-mission-debrief` skill pulls the actual patch with `git show`,
+/// and a non-coding mission simply has no coding activity.
+fn gather_debrief(mission_id: &str) -> Result<DebriefReport> {
+    use crew::loader::{load_missions, load_sprints};
+    fleet::validate_identifier("mission_id", mission_id)?;
+
+    let missions = load_missions()?;
+    let mission = missions
+        .iter()
+        .find(|m| m.id == mission_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!("mission `{mission_id}` not found (check `darkmux mission status`)")
+        })?;
+
+    let sprints = load_sprints()?;
+    let mission_sprints: Vec<&crew::types::Sprint> = sprints
+        .iter()
+        .filter(|s| s.mission_id.as_str() == mission_id)
+        .collect();
+
+    // The mission's exact dispatch session ids — same construction as `run`,
+    // so the collectors scope to THIS mission's sessions (no sibling bleed).
+    let mission_session_ids: std::collections::HashSet<String> = mission_sprints
+        .iter()
+        .map(|s| format!("mission-run-{}-{}", mission_id, s.id))
+        .collect();
+
+    Ok(DebriefReport {
+        mission_id: mission.id.clone(),
+        mission_description: mission.description.clone(),
+        mission_status: mission_status_label(mission.status),
+        sprints: mission_sprints
+            .iter()
+            .map(|s| {
+                (
+                    s.id.clone(),
+                    s.description.lines().next().unwrap_or("").trim().to_string(),
+                    sprint_status_label(s.status),
+                )
+            })
+            .collect(),
+        cautions: mission_cautions(&mission_session_ids),
+        corrections: mission_adjudication_notes(&mission_session_ids),
+    })
+}
+
+/// (#1000) `darkmux mission debrief <id>` — surface a completed mission's
+/// debrief material (cautions + corrections + sprints) for the post-mission
+/// review ceremony. `--json` feeds the `darkmux-mission-debrief` skill, which
+/// distills durable `lessons` (with the why) for the next crew. The ceremony
+/// that turns transient signal into durable lessons — NASA Lessons Learned,
+/// applied locally.
+pub fn debrief(mission_id: &str, json: bool) -> Result<i32> {
+    let report = gather_debrief(mission_id)?;
+
+    if json {
+        let sprints_json: Vec<serde_json::Value> = report
+            .sprints
+            .iter()
+            .map(|(id, desc, status)| {
+                serde_json::json!({ "id": id, "description": desc, "status": status })
+            })
+            .collect();
+        let out = serde_json::json!({
+            "mission": {
+                "id": report.mission_id,
+                "description": report.mission_description,
+                "status": report.mission_status,
+            },
+            "sprints": sprints_json,
+            "cautions": report.cautions,
+            "corrections": report.corrections,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(0);
+    }
+
+    println!(
+        "{}",
+        style::header(&format!("debrief — mission `{}`", report.mission_id))
+    );
+    let desc = report.mission_description.lines().next().unwrap_or("").trim();
+    if !desc.is_empty() {
+        println!("  {desc}");
+    }
+    println!();
+
+    println!("{}", style::header("sprints"));
+    if report.sprints.is_empty() {
+        println!("  {}", style::dim("(none)"));
+    } else {
+        for (id, desc, status) in &report.sprints {
+            println!(
+                "  {} [{}] {}",
+                style::accent(id),
+                status,
+                style::dim(desc)
+            );
+        }
+    }
+    println!();
+
+    println!(
+        "{}",
+        style::header("detected cautions — the loop pathologies the runs got flagged doing")
+    );
+    print_bullets_or_none(&report.cautions);
+    println!();
+
+    println!(
+        "{}",
+        style::header("adjudication corrections — what the reviewer recorded")
+    );
+    print_bullets_or_none(&report.corrections);
+    println!();
+
+    println!(
+        "{}",
+        style::dim(
+            "distill these into durable lessons (with the why) for the next crew:\n  \
+             run the `darkmux-mission-debrief` skill, or:  darkmux lessons add --title <t> --body <b>"
+        )
+    );
+    Ok(0)
+}
+
+/// (#1000) Soft nudge printed when a mission is closed — the natural reflection
+/// point. Prompts the debrief ceremony so the mission's transient signal
+/// (cautions + corrections, which evaporate once the work moves on) becomes
+/// durable `lessons` for the next crew. Emits a `Stage::Debrief` flow record
+/// marking the prompt in the mission's history. Prints, never blocks (a nudge,
+/// not a gate — operator sovereignty #44). The within-mission learning already
+/// happened live (corrections + cautions carried sprint→sprint at run time);
+/// this is the cross-MISSION lesson-banking step.
+pub fn nudge_mission_debrief(mission_id: &str) {
+    let _ = flow::record(flow::FlowRecord {
+        ts: flow::ts_utc_now(),
+        level: flow::Level::Info,
+        category: flow::Category::Review,
+        tier: flow::Tier::Operator,
+        stage: flow::Stage::Debrief,
+        action: "mission.debrief.prompt".to_string(),
+        handle: mission_id.to_string(),
+        sprint_id: None,
+        session_id: Some(format!("mission:{mission_id}")),
+        source: Some("mission_debrief".to_string()),
+        model: None,
+        reasoning: None,
+        mission_id: Some(mission_id.to_string()),
+        machine_id: None,
+        machine_uid: None,
+        orchestrator: None,
+        prev_hash: None,
+        hash: None,
+        payload: None,
+        work_id: None,
+        attempt: None,
+    });
+    println!(
+        "{}",
+        style::dim(&format!(
+            "  mission closed — bank its lessons before the next crew:  \
+             darkmux mission debrief {mission_id}"
+        ))
+    );
+}
+
 /// (#817) Does the run's flow trail carry an adjudication note? Scans the
 /// TWO lexicographically-newest day files (UTC-rollover safe, same pattern
 /// as the /diff endpoint's resolution) for `action=note` matching the
@@ -2497,6 +2729,134 @@ mod tests {
         );
         assert!(!notes.iter().any(|n| n.contains("crew shipped")), "orchestrator note excluded: {notes:?}");
         assert!(unknown.is_empty(), "an empty session-id set reads as none");
+    }
+
+    /// (#1000) The debrief gather assembles a mission's review material from
+    /// on-disk mission/sprint state + the flow stream: the mission identity, its
+    /// sprints + how each ended, the detector cautions, and the reviewer's
+    /// corrections — all scoped to THIS mission's exact dispatch sessions.
+    /// `#[serial]` — mutates DARKMUX_HOME (mission/sprint loaders) + the
+    /// DARKMUX_FLOWS_DIR (the collectors read it live per-access).
+    #[test]
+    #[serial_test::serial]
+    fn gather_debrief_assembles_mission_material() {
+        let home = tempfile::TempDir::new().unwrap();
+        let flows = tempfile::TempDir::new().unwrap();
+        let mid = "m-debrief";
+        let sprints_dir = home.path().join("missions").join(mid).join("sprints");
+        std::fs::create_dir_all(&sprints_dir).unwrap();
+        std::fs::write(
+            home.path().join("missions").join(mid).join("mission.json"),
+            format!(
+                r#"{{"id":"{mid}","description":"close the doom loop","status":"closed","sprint_ids":["s1","s2"],"created_ts":1700000000}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            sprints_dir.join("s1.json"),
+            format!(
+                r#"{{"id":"s1","mission_id":"{mid}","description":"capture slice","status":"complete","depends_on":[],"created_ts":1700000200}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            sprints_dir.join("s2.json"),
+            format!(
+                r#"{{"id":"s2","mission_id":"{mid}","description":"index slice","status":"abandoned","depends_on":[],"created_ts":1700000300}}"#
+            ),
+        )
+        .unwrap();
+        // A detector caution + an adjudication correction, scoped to s1's session.
+        std::fs::write(
+            flows.path().join("2026-06-22.jsonl"),
+            concat!(
+                r#"{"ts":"2026-06-22T10:00:00Z","category":"telemetry","source":"detector","session_id":"mission-run-m-debrief-s1","handle":"coder","payload":{"kind":"cycle","severity":"warn","detail":"edit called 3x","area":{"files":["src/index.rs"]}}}"#, "\n",
+                r#"{"ts":"2026-06-22T10:30:00Z","action":"note","source":"adjudication","session_id":"mission-run-m-debrief-s1","handle":"overrode SIGNOFF — verify never ran"}"#, "\n",
+                // SIBLING mission session must NOT bleed in.
+                r#"{"ts":"2026-06-22T10:45:00Z","category":"telemetry","source":"detector","session_id":"mission-run-m-debrief-v2-s1","handle":"coder","payload":{"kind":"cycle","severity":"warn","detail":"belongs to a sibling"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        // SAFETY: serialized via #[serial]; restored below.
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", home.path());
+            std::env::set_var("DARKMUX_FLOWS_DIR", flows.path());
+        }
+
+        let report = gather_debrief(mid);
+        let missing = gather_debrief("does-not-exist");
+
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+            match prev_flows {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+
+        let report = report.expect("mission found");
+        assert_eq!(report.mission_id, mid);
+        assert_eq!(report.mission_status, "closed");
+        assert_eq!(report.sprints.len(), 2, "both sprints surfaced: {:?}", report.sprints);
+        assert!(
+            report.sprints.iter().any(|(id, _, st)| id == "s1" && *st == "complete"),
+            "{:?}",
+            report.sprints
+        );
+        assert!(
+            report.sprints.iter().any(|(id, _, st)| id == "s2" && *st == "abandoned"),
+            "{:?}",
+            report.sprints
+        );
+        assert_eq!(report.cautions.len(), 1, "one in-mission caution (sibling excluded): {:?}", report.cautions);
+        assert!(report.cautions[0].contains("src/index.rs"), "{:?}", report.cautions);
+        assert_eq!(report.corrections, vec!["overrode SIGNOFF — verify never ran".to_string()]);
+        assert!(missing.is_err(), "an unknown mission errors");
+    }
+
+    /// (#1000) Closing a mission nudges the debrief — and that nudge emits a
+    /// `Stage::Debrief` flow record (the variant's first real emission; #999
+    /// added it unemitted). `#[serial]` — mutates DARKMUX_FLOWS_DIR.
+    #[test]
+    #[serial_test::serial]
+    fn nudge_mission_debrief_emits_debrief_stage_record() {
+        let flows = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        // SAFETY: serialized via #[serial]; restored below.
+        unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", flows.path()) };
+
+        nudge_mission_debrief("m-x");
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+
+        let mut found = false;
+        for entry in std::fs::read_dir(flows.path()).unwrap() {
+            let p = entry.unwrap().path();
+            if p.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+                continue;
+            }
+            for line in std::fs::read_to_string(&p).unwrap().lines() {
+                let r: serde_json::Value = serde_json::from_str(line).unwrap();
+                if r.get("stage").and_then(|v| v.as_str()) == Some("debrief")
+                    && r.get("action").and_then(|v| v.as_str()) == Some("mission.debrief.prompt")
+                    && r.get("mission_id").and_then(|v| v.as_str()) == Some("m-x")
+                {
+                    found = true;
+                }
+            }
+        }
+        assert!(found, "the close nudge must emit a stage=debrief mission.debrief.prompt record");
     }
 
     /// (#817) The note-trail scan finds a session-scoped orchestrator note in
