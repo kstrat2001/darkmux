@@ -130,8 +130,13 @@ const BUILTIN_SPRINTS: &[(&str, &str)] = &[];
 /// itself (e.g., daemon banner messages).
 pub(crate) fn crew_root() -> PathBuf {
     // env(DARKMUX_CREW_DIR) > config.dirs.crew > <root>/crew (#661 Slice 3).
+    // (#1012) ForceUser, NOT Auto: crew manifests are operator/fleet-level state.
+    // Auto flipped to PROJECT scope the moment a bare `<cwd>/.darkmux/` existed
+    // (e.g. created by repo-tier `lessons add` or lab runs), silently shadowing
+    // the operator's user-scope crew/missions. DARKMUX_HOME + the explicit
+    // override above still win; only the default no longer hijacks on a stray dir.
     darkmux_types::config_access::crew_dir_override()
-        .unwrap_or_else(|| resolve(ResolveScope::Auto).crew)
+        .unwrap_or_else(|| resolve(ResolveScope::ForceUser).crew)
 }
 
 /// User-state root for the post-Beat-33 flattened layout. Returns
@@ -141,8 +146,13 @@ pub(crate) fn crew_root() -> PathBuf {
 pub fn user_state_root() -> PathBuf {
     // Same override as crew_root, but the no-override default is the bare root
     // (no `crew/` nesting). env(DARKMUX_CREW_DIR) > config.dirs.crew > <root>.
+    // (#1012) ForceUser, NOT Auto — missions/sprints are operator-level work
+    // tracking (the operator's board lives in ~/.darkmux), never a project's
+    // stray `.darkmux/`. Auto made them VANISH from the CLI + viewer the moment
+    // a repo got a bare `.darkmux/` (from `lessons add` / lab runs). DARKMUX_HOME
+    // and the explicit override still win.
     darkmux_types::config_access::crew_dir_override()
-        .unwrap_or_else(|| resolve(ResolveScope::Auto).root)
+        .unwrap_or_else(|| resolve(ResolveScope::ForceUser).root)
 }
 
 /// Resolve a user-state subdirectory with backward-compat fallback.
