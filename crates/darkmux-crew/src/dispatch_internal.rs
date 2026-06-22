@@ -2176,11 +2176,86 @@ fn detector_telemetry_payload(
     // telemetry record. kind/severity are fixed literals (not container-set).
     let detail = cap_str(&detail, MAX_TRAJ_FIELD_BYTES);
 
-    Some(serde_json::json!({
+    let mut payload = serde_json::json!({
         "kind": kind,
         "severity": severity,
         "detail": detail,
-    }))
+    });
+
+    // (#994 engagement-context capture, slice 1) Key the firing to the file it
+    // happened in, so this *caution* can later be retrieved for the same file
+    // and fed into the next dispatch's brief. Host-side we can derive
+    // `area.files` from the detector's own args; today only
+    // `dispatch.cycle.suspected` carries them (`canonical_args`). `code_hash` +
+    // `symbols` + tool-repeated-failure coverage need firing-time file access
+    // inside the container and are a runtime-side follow-up (slice 2).
+    if let Some(area) = detector_area(event_type, event) {
+        payload["area"] = area;
+    }
+
+    Some(payload)
+}
+
+/// (#994 engagement-context capture, slice 1) Derive the `area` of the
+/// engagement a detector firing touched — the file the cycled tool call
+/// targeted — for stamping into the telemetry record's payload (`area.files`).
+///
+/// Today only `dispatch.cycle.suspected` carries the tool-call args
+/// (`canonical_args`, already a normalized JSON object for known tools — see
+/// `runtime/src/cycle_detector.rs::canonical_args`), so it is the only detector
+/// with a host-derivable file here, and only for the genuinely file-editing
+/// tools: `read`/`edit`/`write` carry a target-file `path`. A `search` cycle's
+/// `path` is the search *root directory* (not a target file) and a `bash`
+/// cycle carries a `command`, so neither keys a file — those, like the
+/// turn-level detectors (reasoning-loop / intra-turn-stall / per-turn-cap) and
+/// `dispatch.tool.repeated_failure` (no args today), return `None` → the caller
+/// omits `area` rather than recording a fileless or directory-as-file caution
+/// (those become a runtime-side slice 2).
+///
+/// Returns `None` when no file path is derivable.
+fn detector_area(event_type: &str, event: &serde_json::Value) -> Option<serde_json::Value> {
+    let path = match event_type {
+        "dispatch.cycle.suspected" => {
+            // Allowlist the file-editing tools: their canonical `path` is a
+            // target file. `search`'s `path` is a directory and `bash` carries
+            // a `command`, so a cycle in either is engagement-level, not
+            // file-scoped. Unknown tools (raw, unfiltered canonical args) fall
+            // through too. Clean-by-construction beats storing a directory in a
+            // field named `files`.
+            let tool = event.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
+            if !matches!(tool, "read" | "edit" | "write") {
+                return None;
+            }
+            let raw = event.get("canonical_args").and_then(|v| v.as_str())?;
+            extract_tool_target_path(raw)?
+        }
+        _ => return None,
+    };
+    // The path is container-written (the model chose it), so bound it the same
+    // way the detector `detail` is bounded (#237) — a pathologically long path
+    // can't bloat the telemetry record.
+    let path = cap_str(&path, MAX_TRAJ_FIELD_BYTES);
+    Some(serde_json::json!({ "files": [path] }))
+}
+
+/// (#994) Parse the target file path from a tool call's canonicalized JSON
+/// args — the `path` field the runtime's `read`/`edit`/`write` tools carry.
+/// This mirrors only the *parse* step of the runtime-side
+/// `extract_edit_target_path` (`runtime/src/loop_runner.rs`); the runtime crate
+/// is out-of-workspace, so the tiny parser is replicated here per the repo's
+/// "inline-over-crate for small needs" convention rather than shared across the
+/// boundary. It deliberately does NOT replicate that function's lexical path
+/// normalization (#471): the #994 retrieve slice normalizes both the stored
+/// keys and the current files *together* at match time, so capturing the path
+/// verbatim here is sufficient (and keeps the raw record faithful to what the
+/// model passed). The normalizer lands once, in the retrieve slice where it is
+/// actually used, rather than speculatively here.
+///
+/// Returns `None` when the args don't parse as JSON or carry no string `path`.
+fn extract_tool_target_path(raw_args: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(raw_args)
+        .ok()
+        .and_then(|v| v.get("path").and_then(|p| p.as_str()).map(String::from))
 }
 
 /// Cap a string at `max` bytes, truncating at a UTF-8 char boundary (so the
@@ -5285,6 +5360,147 @@ mod tests {
         assert!(detail.contains("[truncated"), "carries the marker");
         assert_eq!(payload["kind"], "cycle");
         assert_eq!(payload["severity"], "warn");
+    }
+
+    // ─── #994 engagement-context capture (slice 1): area.files ────────
+
+    /// A cycle on a file-bearing tool (edit/write/read/search) stamps
+    /// `area.files` with the path the runtime canonicalized into the event,
+    /// keying the caution to the file it happened in.
+    #[test]
+    fn detector_telemetry_payload_stamps_area_files_for_file_cycle() {
+        let event = serde_json::json!({
+            "type": "dispatch.cycle.suspected",
+            "seq": 9,
+            "tool_name": "edit",
+            "canonical_args": r#"{"path":"src/lib.rs"}"#,
+            "count": 3,
+            "window_size": 10,
+        });
+        let payload =
+            detector_telemetry_payload("dispatch.cycle.suspected", &event).expect("maps cycle");
+        assert_eq!(
+            payload["area"]["files"],
+            serde_json::json!(["src/lib.rs"]),
+            "a file-bearing cycle keys the caution to the edited path"
+        );
+    }
+
+    /// A `bash` cycle carries `{command: …}` — no file — so no `area` is
+    /// stamped (a fileless area would be noise; the firing stays
+    /// engagement-level, not pinned to a file that doesn't exist).
+    #[test]
+    fn detector_telemetry_payload_omits_area_for_fileless_cycle() {
+        let event = serde_json::json!({
+            "type": "dispatch.cycle.suspected",
+            "tool_name": "bash",
+            "canonical_args": r#"{"command":"ls -la"}"#,
+            "count": 3,
+            "window_size": 10,
+        });
+        let payload =
+            detector_telemetry_payload("dispatch.cycle.suspected", &event).expect("maps cycle");
+        assert!(payload.get("area").is_none(), "bash cycle has no file area");
+    }
+
+    /// A `search` cycle DOES carry a `path` in its canonical args — but it's
+    /// the search *root directory*, not a target file. The tool allowlist must
+    /// exclude it so a directory is never stamped into `area.files` (the
+    /// category error CONSIDER-1 in the #994-capture QA caught).
+    #[test]
+    fn detector_telemetry_payload_omits_area_for_search_cycle_directory_path() {
+        let event = serde_json::json!({
+            "type": "dispatch.cycle.suspected",
+            "tool_name": "search",
+            "canonical_args": r#"{"pattern":"TODO","path":"src/"}"#,
+            "count": 3,
+            "window_size": 10,
+        });
+        let payload =
+            detector_telemetry_payload("dispatch.cycle.suspected", &event).expect("maps cycle");
+        assert!(
+            payload.get("area").is_none(),
+            "search's path is a directory, not a file — must not be stamped as area.files"
+        );
+    }
+
+    /// Malformed `canonical_args` degrade to no `area` rather than dropping the
+    /// firing or panicking — the detail/kind/severity still render.
+    #[test]
+    fn detector_telemetry_payload_omits_area_on_malformed_canonical_args() {
+        let event = serde_json::json!({
+            "type": "dispatch.cycle.suspected",
+            "tool_name": "edit",
+            "canonical_args": "not json{{",
+            "count": 3,
+            "window_size": 10,
+        });
+        let payload = detector_telemetry_payload("dispatch.cycle.suspected", &event)
+            .expect("maps cycle even with bad args");
+        assert!(payload.get("area").is_none());
+        assert_eq!(payload["kind"], "cycle");
+    }
+
+    /// A cycle event with no `canonical_args` at all (the pre-#994 event shape
+    /// the other detector tests use) stamps no `area` — guards those existing
+    /// assertions against this slice.
+    #[test]
+    fn detector_telemetry_payload_omits_area_when_canonical_args_absent() {
+        let event = serde_json::json!({
+            "type": "dispatch.cycle.suspected",
+            "tool_name": "read",
+            "count": 3,
+            "window_size": 10,
+        });
+        let payload =
+            detector_telemetry_payload("dispatch.cycle.suspected", &event).expect("maps cycle");
+        assert!(payload.get("area").is_none());
+    }
+
+    /// Turn-level detectors fire with no single target file, so they never
+    /// stamp `area` (engagement-level cautions in #994 terms).
+    #[test]
+    fn detector_telemetry_payload_omits_area_for_turn_level_detector() {
+        let event = serde_json::json!({
+            "type": "dispatch.reasoning_loop.suspected",
+            "count": 4,
+            "window_size": 6,
+        });
+        let payload = detector_telemetry_payload("dispatch.reasoning_loop.suspected", &event)
+            .expect("maps reasoning-loop");
+        assert!(payload.get("area").is_none());
+    }
+
+    /// A pathologically long container-written path is bounded the same way the
+    /// detector `detail` is (#237) — it can't bloat the telemetry record.
+    #[test]
+    fn detector_area_path_is_bounded() {
+        let huge = "p".repeat(100_000);
+        let event = serde_json::json!({
+            "type": "dispatch.cycle.suspected",
+            "tool_name": "edit",
+            "canonical_args": serde_json::json!({ "path": huge }).to_string(),
+            "count": 3,
+            "window_size": 10,
+        });
+        let payload =
+            detector_telemetry_payload("dispatch.cycle.suspected", &event).expect("maps cycle");
+        let file = payload["area"]["files"][0].as_str().expect("file string");
+        assert!(file.len() <= MAX_TRAJ_FIELD_BYTES + 100, "path bounded near the cap");
+        assert!(file.contains("[truncated"), "carries the marker");
+    }
+
+    /// `extract_tool_target_path` mirrors the runtime parser: pulls a string
+    /// `path`; `None` on missing / non-string / malformed.
+    #[test]
+    fn extract_tool_target_path_pulls_path_and_degrades() {
+        assert_eq!(
+            extract_tool_target_path(r#"{"path":"a/b.rs","offset":1}"#).as_deref(),
+            Some("a/b.rs")
+        );
+        assert!(extract_tool_target_path(r#"{"command":"ls"}"#).is_none());
+        assert!(extract_tool_target_path(r#"{"path":42}"#).is_none());
+        assert!(extract_tool_target_path("not json").is_none());
     }
 
     // ─── TailerState::poll_and_emit (live tailing) ────────────────────
