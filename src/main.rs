@@ -207,6 +207,16 @@ enum Cmd {
         #[command(subcommand)]
         sub: CrewCmd,
     },
+    /// Engagement-context knowledge — operator-authored conventions,
+    /// constraints, and decisions (with the reasoning behind them) that surface
+    /// to coder dispatches as a `<conventions>` block. Stored in a durable,
+    /// concurrent-safe SQLite `knowledge.db`. Per-repo by default
+    /// (`<repo>/.darkmux/knowledge.db`, engagement-scoped); `--global` targets
+    /// the cross-engagement `~/.darkmux/knowledge.db`. (#994)
+    Knowledge {
+        #[command(subcommand)]
+        sub: KnowledgeCmd,
+    },
     /// Role management — list and show role details from the SQLite index.
     Role {
         #[command(subcommand)]
@@ -966,6 +976,38 @@ enum NotebookCmd {
 }
 
 #[derive(Subcommand)]
+enum KnowledgeCmd {
+    /// Record an engagement-context entry — a convention, constraint, or
+    /// decision, WITH the reasoning behind it (explain the why, not just the
+    /// rule). Appended to the durable `knowledge.db`; surfaced to coder
+    /// dispatches as a `<conventions>` block.
+    Add {
+        /// Short statement of the rule / decision.
+        #[arg(long)]
+        title: String,
+        /// The detail — explain the WHY, not just the rule.
+        #[arg(long)]
+        body: String,
+        /// Optional file scope (default: engagement-level — applies everywhere
+        /// in this repo).
+        #[arg(long)]
+        file: Option<String>,
+        /// Record into the cross-engagement user-global store
+        /// (`~/.darkmux/knowledge.db`) instead of this repo's. For conventions
+        /// that apply to ALL your work (house style, language).
+        #[arg(long)]
+        global: bool,
+    },
+    /// List recorded knowledge entries (this repo's + the user-global store,
+    /// labeled by tier).
+    List {
+        /// Emit machine-readable JSON instead of styled text.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum SkillsCmd {
     /// Copy bundled skills into a Claude Code (or compatible) skills dir.
     Install {
@@ -1199,6 +1241,7 @@ fn run(cmd: Cmd) -> Result<i32> {
         Cmd::Model { sub } => cmd_model(sub),
         Cmd::Fleet { sub } => cmd_fleet(sub),
         Cmd::Crew { sub } => cmd_crew(sub),
+        Cmd::Knowledge { sub } => cmd_knowledge(sub),
         Cmd::Role { sub } => cmd_role(sub),
         Cmd::Sprint { sub } => cmd_sprint(sub),
         Cmd::Mission { sub } => cmd_mission(sub),
@@ -1224,6 +1267,82 @@ fn run(cmd: Cmd) -> Result<i32> {
             Ok(0)
         }
         Cmd::Optimize => optimize::run(),
+    }
+}
+
+fn cmd_knowledge(sub: KnowledgeCmd) -> Result<i32> {
+    use darkmux_crew::knowledge;
+    match sub {
+        KnowledgeCmd::Add {
+            title,
+            body,
+            file,
+            global,
+        } => {
+            let (path, tier) = if global {
+                (knowledge::global_db_path(), "global")
+            } else {
+                (knowledge::repo_db_path(), "repo")
+            };
+            let conn = knowledge::open_at(&path)?;
+            knowledge::add(&conn, &title, &body, file.as_deref(), None)?;
+            println!(
+                "{}",
+                darkmux_types::style::success(&format!("recorded knowledge ({tier}): {title}"))
+            );
+            println!("{}", darkmux_types::style::dim(&format!("  {}", path.display())));
+            Ok(0)
+        }
+        KnowledgeCmd::List { json } => {
+            let repo_path = knowledge::repo_db_path();
+            let global_path = knowledge::global_db_path();
+            let repo = knowledge::load_entries_best_effort(&repo_path);
+            // When `$DARKMUX_HOME` collapses both tiers to one root the paths are
+            // identical — read once, don't double-display the same entries.
+            let global = if global_path == repo_path {
+                Vec::new()
+            } else {
+                knowledge::load_entries_best_effort(&global_path)
+            };
+
+            if json {
+                let out = serde_json::json!({ "repo": repo, "global": global });
+                println!("{}", serde_json::to_string_pretty(&out)?);
+                return Ok(0);
+            }
+            if repo.is_empty() && global.is_empty() {
+                println!(
+                    "{}",
+                    darkmux_types::style::dim(
+                        "no knowledge recorded yet — darkmux knowledge add --title <t> --body <b>"
+                    )
+                );
+                return Ok(0);
+            }
+            print_knowledge_tier("repo (this engagement)", &repo);
+            print_knowledge_tier("global (all engagements)", &global);
+            Ok(0)
+        }
+    }
+}
+
+fn print_knowledge_tier(label: &str, entries: &[darkmux_crew::knowledge::KnowledgeEntry]) {
+    if entries.is_empty() {
+        return;
+    }
+    println!("{}", darkmux_types::style::header(label));
+    for e in entries {
+        let scope = e
+            .file
+            .as_deref()
+            .map(|f| format!(" [{f}]"))
+            .unwrap_or_default();
+        println!(
+            "  {}{}",
+            darkmux_types::style::accent(&e.title),
+            darkmux_types::style::dim(&scope)
+        );
+        println!("    {}", e.body);
     }
 }
 

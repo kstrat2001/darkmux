@@ -830,8 +830,7 @@ struct StatusReport {
     stored_darkmux_version: Option<String>,
     stored_schema_version: Option<i32>,
     per_kind_counts: Vec<(String, i64)>,
-    caution_count: i64,   // (#994) derived detector firings in the index
-    knowledge_count: i64, // (#994) operator-authored engagement-context entries
+    caution_count: i64, // (#994) derived detector firings in the index
     added: Vec<(String, String)>,    // (kind, path)
     modified: Vec<(String, String)>, // (kind, path)
     deleted: Vec<(String, String)>,  // (kind, path)
@@ -868,12 +867,12 @@ fn status_at(path: &Path) -> Result<StatusReport> {
         report.per_kind_counts.push(row?);
     }
 
-    // (#994) engagement-context counts — derived cautions + authored knowledge.
+    // (#994) Derived caution count. (Authored *knowledge* lives in its own
+    // durable `knowledge.db` store now — surfaced by `darkmux knowledge list`,
+    // not the crew index; the scaffolded index.db `knowledge` table is
+    // superseded and vestigial, full removal tracked as a follow-up.)
     report.caution_count = conn
         .query_row("SELECT COUNT(*) FROM cautions", [], |r| r.get(0))
-        .unwrap_or(0);
-    report.knowledge_count = conn
-        .query_row("SELECT COUNT(*) FROM knowledge", [], |r| r.get(0))
         .unwrap_or(0);
 
     // Drift detection: compare on-disk state to source_files. Each kind's
@@ -974,10 +973,10 @@ pub fn status() -> Result<()> {
         }
     }
     println!();
-    // (#994) engagement context: derived cautions + operator-authored knowledge.
+    // (#994) Derived cautions in the index. Authored knowledge is a separate
+    // durable store (`darkmux knowledge list`), not part of the crew index.
     println!("engagement context:");
     println!("  {:12} {} (derived from the flow stream)", "cautions", report.caution_count);
-    println!("  {:12} {} (operator-authored)", "knowledge", report.knowledge_count);
     println!();
     let drift = report.added.len() + report.modified.len() + report.deleted.len();
     if drift == 0 {

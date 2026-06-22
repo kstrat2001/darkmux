@@ -16,6 +16,7 @@ pub mod cli;
 pub mod dispatch;
 pub mod dispatch_internal;
 pub mod index;
+pub mod knowledge;
 pub mod lifecycle;
 pub mod loader;
 pub mod pins;
