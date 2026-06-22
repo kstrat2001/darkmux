@@ -526,9 +526,26 @@ pub fn run(
             println!("{}", style::dim(&format!("    • {first}")));
         }
     }
+    // (#994) Carry forward the operator-authored conventions for this engagement
+    // — knowledge, the authored + FOLLOW-framed sibling of the detected cautions.
+    // Surface what's injected (provenance, #44).
+    let conventions = engagement_conventions();
+    if !conventions.is_empty() {
+        println!(
+            "{}",
+            style::dim(&format!(
+                "  carrying {} engagement convention(s) into the brief:",
+                conventions.len()
+            ))
+        );
+        for c in &conventions {
+            let first = c.lines().next().unwrap_or("").trim();
+            println!("{}", style::dim(&format!("    • {first}")));
+        }
+    }
     let opts = crew::dispatch::DispatchOpts {
         role_id: role.to_string(),
-        message: coder_brief(&sprint, mission, &prior_corrections, &detected_cautions),
+        message: coder_brief(&sprint, mission, &conventions, &prior_corrections, &detected_cautions),
         deliver: None,
         session_id: Some(session_id.clone()),
         timeout_seconds,
@@ -954,6 +971,7 @@ fn resolved_git_identity(dir: &Path) -> String {
 fn coder_brief(
     sprint: &crew::types::Sprint,
     mission: &crew::types::Mission,
+    conventions: &[String],
     prior_corrections: &[String],
     cautions: &[String],
 ) -> String {
@@ -968,6 +986,29 @@ fn coder_brief(
         _ => sprint.description.clone(),
     };
     let mut out = base;
+
+    // (#994) Operator-AUTHORED engagement conventions — knowledge's read side,
+    // the authored sibling of the auto-detected cautions below. FOLLOW framing,
+    // not verify: these are the rules the team actually follows + the why,
+    // authoritative unless clearly stale. Placed first after the task so they're
+    // salient. Independent of the other blocks (any / all / none may appear).
+    if !conventions.is_empty() {
+        let listed = conventions
+            .iter()
+            // Same XML-fence defense as the other blocks — a convention body can
+            // carry operator-written text; neutralize a literal closing tag.
+            .map(|c| c.replace("</conventions>", ""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        out = format!(
+            "{out}\n\n<conventions>\nThe user recorded these conventions and decisions for this \
+             codebase — the rules the team actually follows and the reasoning behind them. Treat \
+             them as authoritative: follow them, and prefer them over a generic default when they \
+             conflict. If one is clearly stale against the current code, say so in your final \
+             message rather than silently ignoring it:\n\n\
+             {listed}\n</conventions>"
+        );
+    }
 
     if !prior_corrections.is_empty() {
         // (#849 half 1) Persist adjudication corrections into the brief — the
@@ -1225,6 +1266,43 @@ fn mission_cautions(mission_session_ids: &std::collections::HashSet<String>) -> 
         }
     }
     out
+}
+
+/// (#994) The operator-authored conventions for this engagement, for the coder
+/// brief — knowledge's READ side (the authored sibling of the auto-derived
+/// [`mission_cautions`]). Reads BOTH knowledge tiers directly from their SQLite
+/// stores (always fresh — the db IS the source, no rebuild): the repo's
+/// `<repo>/.darkmux/knowledge.db` + the user-global `~/.darkmux/knowledge.db`.
+/// A dispatch in repo X sees only X's conventions + global; repo Y's never.
+///
+/// The store is detection-driven (the distiller turns recurring detections into
+/// durable knowledge), so reads must tolerate concurrent writes — SQLite +
+/// best-effort does: a missing/locked/unreadable store reads as "no
+/// conventions" and never errors the dispatch (mirrors the cautions +
+/// corrections collectors). Capped; formatted as bullets (the "why" rides in
+/// the body).
+fn engagement_conventions() -> Vec<String> {
+    use crew::knowledge;
+    const MAX_INJECTED_CONVENTIONS: usize = 12;
+    let repo_path = knowledge::repo_db_path();
+    let global_path = knowledge::global_db_path();
+    let mut entries = knowledge::load_entries_best_effort(&repo_path);
+    // `$DARKMUX_HOME` collapses both tiers to one path — don't inject twice.
+    if global_path != repo_path {
+        entries.extend(knowledge::load_entries_best_effort(&global_path));
+    }
+    entries
+        .into_iter()
+        .take(MAX_INJECTED_CONVENTIONS)
+        .map(|e| {
+            let scope = e
+                .file
+                .as_deref()
+                .map(|f| format!(" (in `{f}`)"))
+                .unwrap_or_default();
+            format!("- {}: {}{}", e.title, e.body, scope)
+        })
+        .collect()
 }
 
 /// (#817) Does the run's flow trail carry an adjudication note? Scans the
@@ -2108,7 +2186,7 @@ mod tests {
         let s = sprint("s1", "m1", &[], SprintStatus::Planned);
         let mut m = mission("m1", "compiled summary");
         m.source_input = Some("EXACT placeholder: 'APIM Key Name'. Do NOT rename fields.".into());
-        let brief = coder_brief(&s, &m, &[], &[]);
+        let brief = coder_brief(&s, &m, &[], &[], &[]);
         assert!(brief.starts_with("desc s1"), "compiled description leads");
         assert!(brief.contains("<operator-source-input>"), "provenance tag present");
         assert!(brief.contains("Do NOT rename fields."), "verbatim constraint survives");
@@ -2127,11 +2205,11 @@ mod tests {
     fn coder_brief_is_bare_description_without_source() {
         let s = sprint("s1", "m1", &[], SprintStatus::Planned);
         let m = mission("m1", "compiled summary");
-        assert_eq!(coder_brief(&s, &m, &[], &[]), "desc s1");
+        assert_eq!(coder_brief(&s, &m, &[], &[], &[]), "desc s1");
         // Whitespace-only source_input behaves as absent.
         let mut m2 = mission("m1", "compiled summary");
         m2.source_input = Some("   \n ".into());
-        assert_eq!(coder_brief(&s, &m2, &[], &[]), "desc s1");
+        assert_eq!(coder_brief(&s, &m2, &[], &[], &[]), "desc s1");
     }
 
     #[test]
@@ -2142,7 +2220,7 @@ mod tests {
             "Do NOT rename the APIM key field.".to_string(),
             "The verify command is `cargo test -p foo`, not the workspace default.".to_string(),
         ];
-        let brief = coder_brief(&s, &m, &corrections, &[]);
+        let brief = coder_brief(&s, &m, &[], &corrections, &[]);
         assert!(brief.starts_with("desc s1"), "base description leads: {brief:?}");
         assert!(
             brief.contains("<prior-adjudication-corrections>"),
@@ -2167,7 +2245,7 @@ mod tests {
         assert!(!brief.contains("  "), "injected block has a space-run: {brief:?}");
         // Empty corrections leave the brief unchanged — the no-op the dispatch
         // hits on an honest first run with no prior adjudication.
-        assert_eq!(coder_brief(&s, &m, &[], &[]), "desc s1");
+        assert_eq!(coder_brief(&s, &m, &[], &[], &[]), "desc s1");
     }
 
     /// (#994 retrieve+inject) The detected-cautions block injects independently
@@ -2184,7 +2262,7 @@ mod tests {
         ];
 
         // Cautions alone (no corrections).
-        let brief = coder_brief(&s, &m, &[], &cautions);
+        let brief = coder_brief(&s, &m, &[], &[], &cautions);
         assert!(brief.starts_with("desc s1"), "base description leads: {brief:?}");
         assert!(brief.contains("<detected-cautions>"), "cautions block present: {brief:?}");
         assert!(brief.contains("- [cycle] `edit` called 3×"), "{brief:?}");
@@ -2202,13 +2280,95 @@ mod tests {
 
         // Both blocks coexist; authored corrections precede auto-detected cautions.
         let corrections = vec!["Do not rename the field.".to_string()];
-        let both = coder_brief(&s, &m, &corrections, &cautions);
+        let both = coder_brief(&s, &m, &[], &corrections, &cautions);
         let corr_at = both.find("<prior-adjudication-corrections>").unwrap();
         let caut_at = both.find("<detected-cautions>").unwrap();
         assert!(corr_at < caut_at, "corrections (authored) precede detected cautions: {both:?}");
 
         // Neither → bare description.
-        assert_eq!(coder_brief(&s, &m, &[], &[]), "desc s1");
+        assert_eq!(coder_brief(&s, &m, &[], &[], &[]), "desc s1");
+    }
+
+    /// (#994) The conventions block injects independently, carries the FOLLOW
+    /// framing (authoritative, not verify — distinct from cautions), and orders
+    /// base → conventions → corrections → cautions.
+    #[test]
+    fn coder_brief_injects_conventions_authoritative_and_first() {
+        let s = sprint("s1", "m1", &[], SprintStatus::Planned);
+        let m = mission("m1", "compiled summary");
+        let conventions =
+            vec!["- American English: house style across all work, no British spellings.".to_string()];
+        let corrections = vec!["Do not rename the field.".to_string()];
+        let cautions = vec!["- [cycle] looped on src/x.rs".to_string()];
+
+        // Conventions alone.
+        let brief = coder_brief(&s, &m, &conventions, &[], &[]);
+        assert!(brief.starts_with("desc s1"), "task leads: {brief:?}");
+        assert!(brief.contains("<conventions>"), "conventions block present: {brief:?}");
+        assert!(brief.contains("American English"), "{brief:?}");
+        assert!(
+            brief.contains("Treat them as authoritative"),
+            "FOLLOW framing present (distinct from cautions' verify framing): {brief:?}"
+        );
+        assert!(!brief.contains("  "), "conventions block has a space-run: {brief:?}");
+
+        // All three present: base → conventions → corrections → cautions.
+        let all = coder_brief(&s, &m, &conventions, &corrections, &cautions);
+        let conv_at = all.find("<conventions>").unwrap();
+        let corr_at = all.find("<prior-adjudication-corrections>").unwrap();
+        let caut_at = all.find("<detected-cautions>").unwrap();
+        assert!(
+            conv_at < corr_at && corr_at < caut_at,
+            "authored conventions lead, then corrections, then auto-detected cautions: {all:?}"
+        );
+
+        // Empty conventions → no block.
+        assert!(!coder_brief(&s, &m, &[], &corrections, &cautions).contains("<conventions>"));
+    }
+
+    /// (#994) `engagement_conventions` reads the knowledge.db store and formats
+    /// entries as bullets — the file scope rendered as the "where", the why in
+    /// the body. `#[serial]` — mutates DARKMUX_HOME (which collapses both
+    /// knowledge tiers to one db, so the read is exercised single-store).
+    #[test]
+    #[serial_test::serial]
+    fn engagement_conventions_reads_knowledge_db() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        // SAFETY: serialized via #[serial]; restored below.
+        unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
+
+        {
+            let conn = crew::knowledge::open_at(&crew::knowledge::repo_db_path()).unwrap();
+            crew::knowledge::add(&conn, "American English", "house style across all work", None, None)
+                .unwrap();
+            crew::knowledge::add(
+                &conn,
+                "Bound retries",
+                "the loop entrenches its first answer",
+                Some("loop.rs"),
+                None,
+            )
+            .unwrap();
+        }
+        let conv = engagement_conventions();
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+
+        assert_eq!(conv.len(), 2, "both entries injected (tiers collapse under DARKMUX_HOME): {conv:?}");
+        assert!(
+            conv.iter().any(|c| c.contains("American English") && c.contains("house style")),
+            "{conv:?}"
+        );
+        assert!(
+            conv.iter().any(|c| c.contains("Bound retries") && c.contains("(in `loop.rs`)")),
+            "file scope rendered as the 'where': {conv:?}"
+        );
     }
 
     /// (#994 retrieve+inject) The caution reader: collects detector telemetry
