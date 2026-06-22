@@ -1266,6 +1266,27 @@ async fn machine_specs_handler() -> axum::Json<serde_json::Value> {
     // `RawRedisUrl` is the redacted form, so this stays password-safe.
     let redis_url_redacted = darkmux_flow::redis_url().map(|u| u.to_string());
 
+    // (#1008) The configured machine utility model (`internal.utility`) + whether
+    // it's resident, so the viewer's utility card shows OBSERVED state instead of
+    // a hardcoded "resident". `null` when no utility model is registered. The id
+    // matches a loaded model by its namespaced identifier OR its bare model key
+    // (utility_model_id may be stored either way). Best-effort — a profiles read
+    // failure just yields `None`.
+    let utility_model = tokio::task::spawn_blocking(|| {
+        darkmux_profiles::profiles::load_registry(None)
+            .ok()
+            .and_then(|lr| lr.registry.utility_model_id().map(str::to_string))
+    })
+    .await
+    .ok()
+    .flatten()
+    .map(|id| {
+        let loaded = loaded_models
+            .iter()
+            .any(|m| m.identifier == id || m.model == id);
+        serde_json::json!({ "id": id, "loaded": loaded })
+    });
+
     let generated_at_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -1281,6 +1302,7 @@ async fn machine_specs_handler() -> axum::Json<serde_json::Value> {
         "cpu_brand": cpu_brand,
         "loaded_models": loaded_models,
         "lms_unreachable": lms_unreachable,
+        "utility_model": utility_model,
         "redis_url_redacted": redis_url_redacted,
         "generated_at_ms": generated_at_ms,
     }))
