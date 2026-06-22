@@ -593,7 +593,12 @@ const uidOf=r=>r.machine_uid||"unknown";
 // machine (freshly synced, no dispatches yet) still renders with its real
 // name + specs from the heartbeat, not a bare uid.
 const nameOf=m=>{ if(m==="unknown")return"unknown"; const r=DATA.find(x=>uidOf(x)===m&&x.machine_id); if(r)return r.machine_id; const b=LIVE_MACHINES.get(m); return b&&b.display_name?b.display_name:m; };
-const specOf=m=>{ if(m==="unknown"){ const ns=[...new Set(DATA.filter(r=>uidOf(r)==="unknown"&&r.machine_id).map(r=>r.machine_id))]; return ns.length?"unverified · claimed: "+ns.join(", "):"unidentified (no hardware uid)"; } const rs=MACH_SPEC[nameOf(m)]; if(rs)return rs; const b=LIVE_MACHINES.get(m); return (b&&b.specs)||''; };
+const specOf=m=>{ if(m==="unknown"){ const ns=[...new Set(DATA.filter(r=>uidOf(r)==="unknown"&&r.machine_id).map(r=>r.machine_id))]; return ns.length?"unverified · claimed: "+ns.join(", "):"unidentified (no hardware uid)"; }
+  // (#1008) THIS machine: prefer the live /machine/specs probe (cpu + RAM) over
+  // the empty static MACH_SPEC. Remote machines fall through to their presence
+  // beat's specs. Returns a RAW string; the call site escapes it.
+  if(MACHINE_SPECS && nameOf(m)===MACHINE_SPECS.machine_id && MACHINE_SPECS.cpu_brand){ const gb=MACHINE_SPECS.ram_total_bytes?` · ${Math.round(MACHINE_SPECS.ram_total_bytes/1e9)} GB`:''; return MACHINE_SPECS.cpu_brand+gb; }
+  const rs=MACH_SPEC[nameOf(m)]; if(rs)return rs; const b=LIVE_MACHINES.get(m); return (b&&b.specs)||''; };
 // (#638) Presence is the source of truth for "who's in the fleet" — a machine
 // shows if it's broadcasting a heartbeat (LIVE_MACHINES), whether or not it has
 // emitted any flow records. Union with the record-derived uids so historical/
@@ -1012,15 +1017,23 @@ function recentRow(n){
 }
 function renderMachine(){
   const m=state.machine; $("logscope").textContent=nameOf(m); state.stageScope=r=>uidOf(r)===m;
-  // Always-loaded utility role — resident on every machine, runs alongside the specialists
-  // to handle compaction + other utility-tier tasks (not a per-mission dispatch).
-  // TODO(#624): should read /model/status to surface the actual utility model resident,
-  // not a generic placeholder. Until then, mark it as static UI rather than implying it
-  // reflects live state.
+  // (#1008) The utility role — compaction + utility-tier tasks. Renders OBSERVED
+  // state from the local daemon's /machine/specs (MACHINE_SPECS.utility_model)
+  // instead of a hardcoded "resident": for THIS machine the pill shows whether
+  // the configured `internal.utility` model is resident / registered-not-loaded /
+  // not-configured; for a remote machine (no specs probe — presence beats don't
+  // carry the binding) it reads "not reported" rather than implying residency.
+  const isLocalMach = MACHINE_SPECS && nameOf(m)===MACHINE_SPECS.machine_id;
+  const um = isLocalMach ? MACHINE_SPECS.utility_model : undefined; // {id,loaded} | null | undefined
+  let utilState, utilPill;
+  if(um===undefined){ utilState='utility tier'; utilPill='<span class="pill done">not reported</span>'; }
+  else if(um===null){ utilState='utility tier · not configured'; utilPill='<span class="pill done">not configured</span>'; }
+  else if(um.loaded){ utilState=`utility tier · ${esc(um.id)}`; utilPill='<span class="pill run">resident</span>'; }
+  else { utilState=`utility tier · ${esc(um.id)}`; utilPill='<span class="pill ended">registered · not loaded</span>'; }
   const util=`<div class="node util"><div class="h">darkmux/utility</div>
-    <div class="s">utility tier · always-loaded</div>
+    <div class="s">${utilState}</div>
     <div class="s">compaction · mission-compile · estimate · scribe</div>
-    <span class="pill util">resident</span></div>`;
+    ${utilPill}</div>`;
   // Specialist roles dispatched on this machine. Defensive against missing
   // dispatch.start records: real flow streams contain telemetry-only sessions,
   // test-fixture sessions emitting dispatch.tool/turn without a proper
@@ -1920,6 +1933,11 @@ const liveSig=()=>[...LIVE_SESSIONS].sort().join(",");
 // not it has any flow records, so machines() unions it, and nameOf/specOf fall
 // back to the beat's display_name/specs for a recordless present machine.
 const LIVE_MACHINES=new Map();
+// (#1008) The local daemon's /machine/specs snapshot (machine_id, cpu_brand,
+// ram, loaded_models, utility_model{id,loaded}). Polled in live mode so the
+// utility card + spec line render OBSERVED state for THIS machine instead of a
+// hardcoded "resident". null until first fetched / in playback.
+let MACHINE_SPECS=null;
 let lastStageSig=null; // skip stage re-renders that would destroy clickable cards
 const SEEN={cat:new Set(),tier:new Set(),src:new Set()};  // filter values ever observed
 
@@ -1968,8 +1986,16 @@ function stageSig(){
   // signature in so that flip triggers a render. (Playback re-renders on each
   // scrub, so machPresent re-evaluates against state.t there without help.)
   const ps=[...LIVE_MACHINES.keys()].sort().join(",");
-  if(state.level==="fleet")return "f|"+machines().join(",")+"|"+dis+"|"+ls+"|"+ps;
-  if(state.level==="machine")return "m|"+state.machine+"|"+sessionsOn(state.machine).join(",")+"|"+dis+"|"+ls+"|"+ps;
+  // (#1008) Fold the local /machine/specs snapshot in: the utility card's
+  // resident/registered/not-configured pill + the spec line read from
+  // MACHINE_SPECS, which arrives (and changes — a swap loads the utility model)
+  // on its own 5s poll WITHOUT any flow/presence edge. Without this, the card
+  // paints once before the first specs fetch and never repaints (the #1007
+  // re-render-gap class). Encode utility loaded-state + id + specs-present.
+  const um=MACHINE_SPECS&&MACHINE_SPECS.utility_model;
+  const ms=MACHINE_SPECS?((um?(um.loaded?'1':'0')+':'+um.id:'null'))+'|'+(MACHINE_SPECS.cpu_brand?'s':''):'na';
+  if(state.level==="fleet")return "f|"+machines().join(",")+"|"+dis+"|"+ls+"|"+ps+"|"+ms;
+  if(state.level==="machine")return "m|"+state.machine+"|"+sessionsOn(state.machine).join(",")+"|"+dis+"|"+ls+"|"+ps+"|"+ms;
   if(state.level==="subsystem"||state.level==="loose")return null;  // (#691) live log/metrics views: full-render each tick
   return "mission";
 }
@@ -2102,9 +2128,20 @@ async function pollLiveMachines(){
     applyLive();   // machines() unions LIVE_MACHINES → a new present machine re-renders
   }catch(_){/* best-effort — keep the last known live machines */}
 }
+// (#1008) Fetch the local machine's specs + utility-model state. Polled so the
+// utility card's "resident / registered-not-loaded / not-configured" tracks a
+// swap loading the utility model. Best-effort; failure keeps the last snapshot.
+async function pollMachineSpecs(){
+  try{
+    const r=await fetch("/machine/specs",{headers:{accept:"application/json"}});
+    if(!r.ok)return;
+    MACHINE_SPECS=await r.json();
+    applyLive();
+  }catch(_){/* best-effort */}
+}
 function startLivePoll(){
   if(LIVE_SESS_TIMER)return;
-  pollLiveSessions(); pollLiveMachines();
+  pollLiveSessions(); pollLiveMachines(); pollMachineSpecs();
   LIVE_SESS_TIMER=setInterval(async()=>{
     // UTC date-rollover detection: if we're in live mode and the day
     // changed since the SSE stream was opened, close it, reload the
@@ -2117,7 +2154,7 @@ function startLivePoll(){
       startLiveTail(nd);
       recompute(); render();
     }
-    pollLiveSessions();pollLiveMachines();
+    pollLiveSessions();pollLiveMachines();pollMachineSpecs();
   },5000);
   window.addEventListener("beforeunload",()=>{if(LIVE_SESS_TIMER)clearInterval(LIVE_SESS_TIMER);});
 }
