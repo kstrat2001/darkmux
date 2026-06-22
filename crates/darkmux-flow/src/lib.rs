@@ -2181,7 +2181,12 @@ mod tests {
         //           at-complete aggregate retired so records sum to the
         //           dispatch total without double-counting. Minor + additive —
         //           consumers that SUM the family are unaffected.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.13.0");
+        //   1.14.0 — renamed Stage::Retrospect → Stage::Debrief (serde value
+        //           "retrospect" → "debrief"), the NASA-vocabulary rename (#999).
+        //           The variant was an unemitted placeholder — no record carried
+        //           the old value — so only the enum's value-set changes; chains
+        //           survive without rotation. Unemitted until #1000.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.14.0");
     }
 
     #[test]
@@ -2206,7 +2211,7 @@ mod tests {
             (Stage::Dispatch, "dispatch"),
             (Stage::Review, "review"),
             (Stage::Ship, "ship"),
-            (Stage::Retrospect, "retrospect"),
+            (Stage::Debrief, "debrief"),
             (Stage::TierDecision, "tier-decision"),
         ] {
             let serialized = serde_json::to_string(&variant).unwrap();

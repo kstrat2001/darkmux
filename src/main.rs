@@ -207,15 +207,15 @@ enum Cmd {
         #[command(subcommand)]
         sub: CrewCmd,
     },
-    /// Engagement-context knowledge — operator-authored conventions,
+    /// Engagement-context lessons — operator-authored conventions,
     /// constraints, and decisions (with the reasoning behind them) that surface
-    /// to coder dispatches as a `<conventions>` block. Stored in a durable,
-    /// concurrent-safe SQLite `knowledge.db`. Per-repo by default
-    /// (`<repo>/.darkmux/knowledge.db`, engagement-scoped); `--global` targets
-    /// the cross-engagement `~/.darkmux/knowledge.db`. (#994)
-    Knowledge {
+    /// to coder dispatches as a `<lessons>` block. Stored in a durable,
+    /// concurrent-safe SQLite `lessons.db`. Per-repo by default
+    /// (`<repo>/.darkmux/lessons.db`, engagement-scoped); `--global` targets
+    /// the cross-engagement `~/.darkmux/lessons.db`. (#994)
+    Lessons {
         #[command(subcommand)]
-        sub: KnowledgeCmd,
+        sub: LessonsCmd,
     },
     /// Role management — list and show role details from the SQLite index.
     Role {
@@ -976,11 +976,11 @@ enum NotebookCmd {
 }
 
 #[derive(Subcommand)]
-enum KnowledgeCmd {
-    /// Record an engagement-context entry — a convention, constraint, or
+enum LessonsCmd {
+    /// Record an engagement-context lesson — a convention, constraint, or
     /// decision, WITH the reasoning behind it (explain the why, not just the
-    /// rule). Appended to the durable `knowledge.db`; surfaced to coder
-    /// dispatches as a `<conventions>` block.
+    /// rule). Appended to the durable `lessons.db`; surfaced to coder
+    /// dispatches as a `<lessons>` block.
     Add {
         /// Short statement of the rule / decision.
         #[arg(long)]
@@ -993,12 +993,12 @@ enum KnowledgeCmd {
         #[arg(long)]
         file: Option<String>,
         /// Record into the cross-engagement user-global store
-        /// (`~/.darkmux/knowledge.db`) instead of this repo's. For conventions
+        /// (`~/.darkmux/lessons.db`) instead of this repo's. For conventions
         /// that apply to ALL your work (house style, language).
         #[arg(long)]
         global: bool,
     },
-    /// List recorded knowledge entries (this repo's + the user-global store,
+    /// List recorded lessons (this repo's + the user-global store,
     /// labeled by tier).
     List {
         /// Emit machine-readable JSON instead of styled text.
@@ -1241,7 +1241,7 @@ fn run(cmd: Cmd) -> Result<i32> {
         Cmd::Model { sub } => cmd_model(sub),
         Cmd::Fleet { sub } => cmd_fleet(sub),
         Cmd::Crew { sub } => cmd_crew(sub),
-        Cmd::Knowledge { sub } => cmd_knowledge(sub),
+        Cmd::Lessons { sub } => cmd_lessons(sub),
         Cmd::Role { sub } => cmd_role(sub),
         Cmd::Sprint { sub } => cmd_sprint(sub),
         Cmd::Mission { sub } => cmd_mission(sub),
@@ -1270,39 +1270,39 @@ fn run(cmd: Cmd) -> Result<i32> {
     }
 }
 
-fn cmd_knowledge(sub: KnowledgeCmd) -> Result<i32> {
-    use darkmux_crew::knowledge;
+fn cmd_lessons(sub: LessonsCmd) -> Result<i32> {
+    use darkmux_crew::lessons;
     match sub {
-        KnowledgeCmd::Add {
+        LessonsCmd::Add {
             title,
             body,
             file,
             global,
         } => {
             let (path, tier) = if global {
-                (knowledge::global_db_path(), "global")
+                (lessons::global_db_path(), "global")
             } else {
-                (knowledge::repo_db_path(), "repo")
+                (lessons::repo_db_path(), "repo")
             };
-            let conn = knowledge::open_at(&path)?;
-            knowledge::add(&conn, &title, &body, file.as_deref(), None)?;
+            let conn = lessons::open_at(&path)?;
+            lessons::add(&conn, &title, &body, file.as_deref(), None)?;
             println!(
                 "{}",
-                darkmux_types::style::success(&format!("recorded knowledge ({tier}): {title}"))
+                darkmux_types::style::success(&format!("recorded lesson ({tier}): {title}"))
             );
             println!("{}", darkmux_types::style::dim(&format!("  {}", path.display())));
             Ok(0)
         }
-        KnowledgeCmd::List { json } => {
-            let repo_path = knowledge::repo_db_path();
-            let global_path = knowledge::global_db_path();
-            let repo = knowledge::load_entries_best_effort(&repo_path);
+        LessonsCmd::List { json } => {
+            let repo_path = lessons::repo_db_path();
+            let global_path = lessons::global_db_path();
+            let repo = lessons::load_entries_best_effort(&repo_path);
             // When `$DARKMUX_HOME` collapses both tiers to one root the paths are
             // identical — read once, don't double-display the same entries.
             let global = if global_path == repo_path {
                 Vec::new()
             } else {
-                knowledge::load_entries_best_effort(&global_path)
+                lessons::load_entries_best_effort(&global_path)
             };
 
             if json {
@@ -1314,19 +1314,19 @@ fn cmd_knowledge(sub: KnowledgeCmd) -> Result<i32> {
                 println!(
                     "{}",
                     darkmux_types::style::dim(
-                        "no knowledge recorded yet — darkmux knowledge add --title <t> --body <b>"
+                        "no lessons recorded yet — darkmux lessons add --title <t> --body <b>"
                     )
                 );
                 return Ok(0);
             }
-            print_knowledge_tier("repo (this engagement)", &repo);
-            print_knowledge_tier("global (all engagements)", &global);
+            print_lessons_tier("repo (this engagement)", &repo);
+            print_lessons_tier("global (all engagements)", &global);
             Ok(0)
         }
     }
 }
 
-fn print_knowledge_tier(label: &str, entries: &[darkmux_crew::knowledge::KnowledgeEntry]) {
+fn print_lessons_tier(label: &str, entries: &[darkmux_crew::lessons::Lesson]) {
     if entries.is_empty() {
         return;
     }

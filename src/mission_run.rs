@@ -526,26 +526,26 @@ pub fn run(
             println!("{}", style::dim(&format!("    • {first}")));
         }
     }
-    // (#994) Carry forward the operator-authored conventions for this engagement
-    // — knowledge, the authored + FOLLOW-framed sibling of the detected cautions.
+    // (#994) Carry forward the operator-authored lessons for this engagement
+    // — the authored + FOLLOW-framed sibling of the detected cautions.
     // Surface what's injected (provenance, #44).
-    let conventions = engagement_conventions();
-    if !conventions.is_empty() {
+    let lessons = engagement_lessons();
+    if !lessons.is_empty() {
         println!(
             "{}",
             style::dim(&format!(
-                "  carrying {} engagement convention(s) into the brief:",
-                conventions.len()
+                "  carrying {} engagement lesson(s) into the brief:",
+                lessons.len()
             ))
         );
-        for c in &conventions {
+        for c in &lessons {
             let first = c.lines().next().unwrap_or("").trim();
             println!("{}", style::dim(&format!("    • {first}")));
         }
     }
     let opts = crew::dispatch::DispatchOpts {
         role_id: role.to_string(),
-        message: coder_brief(&sprint, mission, &conventions, &prior_corrections, &detected_cautions),
+        message: coder_brief(&sprint, mission, &lessons, &prior_corrections, &detected_cautions),
         deliver: None,
         session_id: Some(session_id.clone()),
         timeout_seconds,
@@ -971,7 +971,7 @@ fn resolved_git_identity(dir: &Path) -> String {
 fn coder_brief(
     sprint: &crew::types::Sprint,
     mission: &crew::types::Mission,
-    conventions: &[String],
+    lessons: &[String],
     prior_corrections: &[String],
     cautions: &[String],
 ) -> String {
@@ -987,26 +987,26 @@ fn coder_brief(
     };
     let mut out = base;
 
-    // (#994) Operator-AUTHORED engagement conventions — knowledge's read side,
-    // the authored sibling of the auto-detected cautions below. FOLLOW framing,
-    // not verify: these are the rules the team actually follows + the why,
-    // authoritative unless clearly stale. Placed first after the task so they're
-    // salient. Independent of the other blocks (any / all / none may appear).
-    if !conventions.is_empty() {
-        let listed = conventions
+    // (#994) Operator-AUTHORED engagement lessons — the lessons store's read
+    // side, the authored sibling of the auto-detected cautions below. FOLLOW
+    // framing, not verify: these are the rules the team actually follows + the
+    // why, authoritative unless clearly stale. Placed first after the task so
+    // they're salient. Independent of the other blocks (any / all / none appear).
+    if !lessons.is_empty() {
+        let listed = lessons
             .iter()
-            // Same XML-fence defense as the other blocks — a convention body can
+            // Same XML-fence defense as the other blocks — a lesson body can
             // carry operator-written text; neutralize a literal closing tag.
-            .map(|c| c.replace("</conventions>", ""))
+            .map(|c| c.replace("</lessons>", ""))
             .collect::<Vec<_>>()
             .join("\n");
         out = format!(
-            "{out}\n\n<conventions>\nThe user recorded these conventions and decisions for this \
+            "{out}\n\n<lessons>\nThe user recorded these conventions and decisions for this \
              codebase — the rules the team actually follows and the reasoning behind them. Treat \
              them as authoritative: follow them, and prefer them over a generic default when they \
              conflict. If one is clearly stale against the current code, say so in your final \
              message rather than silently ignoring it:\n\n\
-             {listed}\n</conventions>"
+             {listed}\n</lessons>"
         );
     }
 
@@ -1268,32 +1268,32 @@ fn mission_cautions(mission_session_ids: &std::collections::HashSet<String>) -> 
     out
 }
 
-/// (#994) The operator-authored conventions for this engagement, for the coder
-/// brief — knowledge's READ side (the authored sibling of the auto-derived
-/// [`mission_cautions`]). Reads BOTH knowledge tiers directly from their SQLite
-/// stores (always fresh — the db IS the source, no rebuild): the repo's
-/// `<repo>/.darkmux/knowledge.db` + the user-global `~/.darkmux/knowledge.db`.
-/// A dispatch in repo X sees only X's conventions + global; repo Y's never.
+/// (#994) The operator-authored lessons for this engagement, for the coder
+/// brief — the lessons store's READ side (the authored sibling of the
+/// auto-derived [`mission_cautions`]). Reads BOTH lessons tiers directly from
+/// their SQLite stores (always fresh — the db IS the source, no rebuild): the
+/// repo's `<repo>/.darkmux/lessons.db` + the user-global `~/.darkmux/lessons.db`.
+/// A dispatch in repo X sees only X's lessons + global; repo Y's never.
 ///
 /// The store is detection-driven (the distiller turns recurring detections into
-/// durable knowledge), so reads must tolerate concurrent writes — SQLite +
+/// durable lessons), so reads must tolerate concurrent writes — SQLite +
 /// best-effort does: a missing/locked/unreadable store reads as "no
-/// conventions" and never errors the dispatch (mirrors the cautions +
+/// lessons" and never errors the dispatch (mirrors the cautions +
 /// corrections collectors). Capped; formatted as bullets (the "why" rides in
 /// the body).
-fn engagement_conventions() -> Vec<String> {
-    use crew::knowledge;
-    const MAX_INJECTED_CONVENTIONS: usize = 12;
-    let repo_path = knowledge::repo_db_path();
-    let global_path = knowledge::global_db_path();
-    let mut entries = knowledge::load_entries_best_effort(&repo_path);
+fn engagement_lessons() -> Vec<String> {
+    use crew::lessons;
+    const MAX_INJECTED_LESSONS: usize = 12;
+    let repo_path = lessons::repo_db_path();
+    let global_path = lessons::global_db_path();
+    let mut entries = lessons::load_entries_best_effort(&repo_path);
     // `$DARKMUX_HOME` collapses both tiers to one path — don't inject twice.
     if global_path != repo_path {
-        entries.extend(knowledge::load_entries_best_effort(&global_path));
+        entries.extend(lessons::load_entries_best_effort(&global_path));
     }
     entries
         .into_iter()
-        .take(MAX_INJECTED_CONVENTIONS)
+        .take(MAX_INJECTED_LESSONS)
         .map(|e| {
             let scope = e
                 .file
@@ -2289,60 +2289,60 @@ mod tests {
         assert_eq!(coder_brief(&s, &m, &[], &[], &[]), "desc s1");
     }
 
-    /// (#994) The conventions block injects independently, carries the FOLLOW
+    /// (#994) The lessons block injects independently, carries the FOLLOW
     /// framing (authoritative, not verify — distinct from cautions), and orders
-    /// base → conventions → corrections → cautions.
+    /// base → lessons → corrections → cautions.
     #[test]
-    fn coder_brief_injects_conventions_authoritative_and_first() {
+    fn coder_brief_injects_lessons_authoritative_and_first() {
         let s = sprint("s1", "m1", &[], SprintStatus::Planned);
         let m = mission("m1", "compiled summary");
-        let conventions =
+        let lessons =
             vec!["- American English: house style across all work, no British spellings.".to_string()];
         let corrections = vec!["Do not rename the field.".to_string()];
         let cautions = vec!["- [cycle] looped on src/x.rs".to_string()];
 
-        // Conventions alone.
-        let brief = coder_brief(&s, &m, &conventions, &[], &[]);
+        // Lessons alone.
+        let brief = coder_brief(&s, &m, &lessons, &[], &[]);
         assert!(brief.starts_with("desc s1"), "task leads: {brief:?}");
-        assert!(brief.contains("<conventions>"), "conventions block present: {brief:?}");
+        assert!(brief.contains("<lessons>"), "lessons block present: {brief:?}");
         assert!(brief.contains("American English"), "{brief:?}");
         assert!(
             brief.contains("Treat them as authoritative"),
             "FOLLOW framing present (distinct from cautions' verify framing): {brief:?}"
         );
-        assert!(!brief.contains("  "), "conventions block has a space-run: {brief:?}");
+        assert!(!brief.contains("  "), "lessons block has a space-run: {brief:?}");
 
-        // All three present: base → conventions → corrections → cautions.
-        let all = coder_brief(&s, &m, &conventions, &corrections, &cautions);
-        let conv_at = all.find("<conventions>").unwrap();
+        // All three present: base → lessons → corrections → cautions.
+        let all = coder_brief(&s, &m, &lessons, &corrections, &cautions);
+        let less_at = all.find("<lessons>").unwrap();
         let corr_at = all.find("<prior-adjudication-corrections>").unwrap();
         let caut_at = all.find("<detected-cautions>").unwrap();
         assert!(
-            conv_at < corr_at && corr_at < caut_at,
-            "authored conventions lead, then corrections, then auto-detected cautions: {all:?}"
+            less_at < corr_at && corr_at < caut_at,
+            "authored lessons lead, then corrections, then auto-detected cautions: {all:?}"
         );
 
-        // Empty conventions → no block.
-        assert!(!coder_brief(&s, &m, &[], &corrections, &cautions).contains("<conventions>"));
+        // Empty lessons → no block.
+        assert!(!coder_brief(&s, &m, &[], &corrections, &cautions).contains("<lessons>"));
     }
 
-    /// (#994) `engagement_conventions` reads the knowledge.db store and formats
+    /// (#994) `engagement_lessons` reads the lessons.db store and formats
     /// entries as bullets — the file scope rendered as the "where", the why in
     /// the body. `#[serial]` — mutates DARKMUX_HOME (which collapses both
-    /// knowledge tiers to one db, so the read is exercised single-store).
+    /// lessons tiers to one db, so the read is exercised single-store).
     #[test]
     #[serial_test::serial]
-    fn engagement_conventions_reads_knowledge_db() {
+    fn engagement_lessons_reads_lessons_db() {
         let tmp = tempfile::TempDir::new().unwrap();
         let prev = std::env::var("DARKMUX_HOME").ok();
         // SAFETY: serialized via #[serial]; restored below.
         unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
 
         {
-            let conn = crew::knowledge::open_at(&crew::knowledge::repo_db_path()).unwrap();
-            crew::knowledge::add(&conn, "American English", "house style across all work", None, None)
+            let conn = crew::lessons::open_at(&crew::lessons::repo_db_path()).unwrap();
+            crew::lessons::add(&conn, "American English", "house style across all work", None, None)
                 .unwrap();
-            crew::knowledge::add(
+            crew::lessons::add(
                 &conn,
                 "Bound retries",
                 "the loop entrenches its first answer",
@@ -2351,7 +2351,7 @@ mod tests {
             )
             .unwrap();
         }
-        let conv = engagement_conventions();
+        let conv = engagement_lessons();
 
         unsafe {
             match prev {
