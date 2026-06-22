@@ -272,16 +272,36 @@ pub fn check_updates() -> bool {
 /// /tmp/darkmux/flows`. The last is the HOME-less CI/sandbox fallback (parity
 /// with the prior `flow::schema::flows_dir`, which this now backs).
 pub fn flows_dir() -> std::path::PathBuf {
-    use std::path::PathBuf;
     pick_dir(
         env_str("DARKMUX_FLOWS_DIR"),
         config().dirs.as_ref().and_then(|d| d.flows.as_deref()),
-        || {
-            dirs::home_dir()
-                .map(|h| h.join(".darkmux").join("flows"))
-                .unwrap_or_else(|| PathBuf::from("/tmp/darkmux/flows"))
-        },
+        flows_dir_default,
     )
+}
+
+/// The built-in flows-dir default (third precedence tier), split out so it can
+/// be isolated in test builds.
+///
+/// (#994) In test / `test-support` builds the default must NOT be the
+/// operator's real `~/.darkmux/flows`. Derived consumers now READ the flow
+/// stream during a rebuild — the crew index's `cautions` derive scans
+/// `flows_dir()` — so any test that doesn't explicitly set `DARKMUX_FLOWS_DIR`
+/// would ingest live operator flow data (machine-dependent, and a ~50 MB scan
+/// on CI). Isolating the default to a throwaway path makes an un-set flows dir
+/// empty by construction; tests that need real content set `DARKMUX_FLOWS_DIR`
+/// (the env tier, which wins). Production is unaffected — `cfg`-gated, and the
+/// path still ends in `flows`. Same #811-style "empty operator state by
+/// construction in test builds" move the empty `config()` tier already makes.
+#[cfg(not(any(test, feature = "test-support")))]
+fn flows_dir_default() -> std::path::PathBuf {
+    dirs::home_dir()
+        .map(|h| h.join(".darkmux").join("flows"))
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/darkmux/flows"))
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn flows_dir_default() -> std::path::PathBuf {
+    std::path::PathBuf::from("/tmp/darkmux-test-isolated/flows")
 }
 
 /// (#703) Host cache dir for the extracted static `darkmux-runtime` binary,

@@ -68,7 +68,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Bumped to 2 in refactor 0 (`capability` → `skill` rename, #448); to 3
-/// for the #95 mission/sprint transition-timestamp columns (#914). Two
+/// for the #95 mission/sprint transition-timestamp columns (#914); to 4 for
+/// the #994 engagement-context tables — `cautions` (derived from the flow
+/// stream) + `knowledge` (preserved, operator-authored). Two
 /// independent mechanisms in [`init_schema`] keep an on-disk DB current:
 /// (1) the `< 2` migration block drops the legacy `capabilities` /
 /// `role_capabilities` / `capability_keywords` / `capability_keywords_fts`
@@ -77,10 +79,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// lands even on a pre-existing DB — a plain `CREATE TABLE IF NOT EXISTS`
 /// cannot evolve an existing table's columns. Bumping this constant also
 /// gives the read path a staleness signal (see [`ensure_fresh_index`]).
-/// Allocator tables + `meta_kv` are NOT derived and are preserved across
-/// rebuilds. No data is lost — every dropped table is rebuilt from the
-/// on-disk manifests.
-const SCHEMA_VERSION: i32 = 3;
+/// Allocator tables, `knowledge`, + `meta_kv` are NOT derived and are
+/// preserved across rebuilds. No data is lost — every dropped table is
+/// rebuilt from the on-disk manifests + the flow stream.
+const SCHEMA_VERSION: i32 = 4;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS source_files (
@@ -222,11 +224,54 @@ CREATE TABLE IF NOT EXISTS meta_kv (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- (#994) cautions — DERIVED from the flow stream (a row per detector firing).
+-- The mistakes the local crew has already made, keyed (when known) to the file
+-- they happened in, so the retrieve slice can feed the relevant ones into the
+-- next dispatch's brief. In REBUILD_TABLES → dropped + re-derived every rebuild
+-- (the flow JSONL is the source of truth; this is a queryable index of it).
+-- `file` is NULL for engagement-level firings (turn-level detectors, or a
+-- cycle on a non-file tool). `code_hash` is the firing-time file hash for
+-- staleness ranking — NULL until the runtime-side capture slice 2 emits it.
+CREATE TABLE IF NOT EXISTS cautions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    file        TEXT,
+    kind        TEXT NOT NULL,
+    severity    TEXT NOT NULL,
+    detail      TEXT NOT NULL,
+    code_hash   TEXT,
+    mission_id  TEXT,
+    sprint_id   TEXT,
+    session_id  TEXT,
+    role        TEXT,
+    model       TEXT,
+    ts          TEXT NOT NULL   -- RFC3339 (lexicographic == chronological)
+);
+CREATE INDEX IF NOT EXISTS idx_cautions_file ON cautions(file);
+
+-- (#994) knowledge — operator-AUTHORED engagement context: conventions,
+-- constraints, decisions, + the reasoning behind them ("include the why").
+-- The operator-sovereign source of truth — NOT in REBUILD_TABLES, so it is
+-- preserved across rebuilds (like `meta_kv` and the allocator tables). Empty
+-- until the authoring slice (capture verb / bootstrap skill / hand-edit)
+-- populates it; scaffolded here so the schema bump covers it. `file` is an
+-- OPTIONAL area scope (NULL = engagement-level).
+CREATE TABLE IF NOT EXISTS knowledge (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    file        TEXT,
+    title       TEXT NOT NULL,
+    body        TEXT NOT NULL,
+    source      TEXT,
+    created_ts  INTEGER NOT NULL,
+    updated_ts  INTEGER NOT NULL
+);
 "#;
 
-/// Tables (and only tables) that `rebuild()` clears + repopulates from manifests.
-/// Allocator tables (allocations / outcomes / unmatched_terms) and meta_kv are
-/// preserved across rebuilds — those carry runtime state, not derived data.
+/// Tables (and only tables) that `rebuild()` clears + repopulates. Most are
+/// derived from manifests; `cautions` is derived from the flow stream (#994).
+/// Allocator tables (allocations / outcomes / unmatched_terms), the
+/// operator-authored `knowledge` table (#994), and `meta_kv` are preserved
+/// across rebuilds — those carry runtime / authored state, not derived data.
 const REBUILD_TABLES: &[&str] = &[
     "source_files",
     "role_escalation_targets",
@@ -238,6 +283,7 @@ const REBUILD_TABLES: &[&str] = &[
     "crews",
     "roles",
     "skills",
+    "cautions",
 ];
 
 /// Default index path: `<paths.root>/index.db`. Resolved through the same
@@ -585,6 +631,10 @@ fn populate(conn: &mut Connection) -> Result<()> {
         }
     }
 
+    // cautions — derive from the flow stream (#994). Source of truth is the
+    // per-day JSONL; this is a queryable index of the detector firings in it.
+    derive_cautions(&tx)?;
+
     // meta_kv — capture rebuild context for status() to surface later.
     let now = now_unix();
     let darkmux_version = env!("CARGO_PKG_VERSION");
@@ -610,6 +660,113 @@ fn read_meta(conn: &Connection, key: &str) -> Result<Option<String>> {
         .query_row("SELECT value FROM meta_kv WHERE key = ?1", params![key], |r| r.get::<_, String>(0))
         .optional()?;
     Ok(v)
+}
+
+/// (#994) Whether a flow record is a detector firing — the source of a
+/// *caution*. Detector telemetry records are `category=Telemetry` with
+/// `source="detector"` (the discriminator the observability viewer keys on);
+/// the capture path emits one per detector trajectory event.
+fn is_detector_caution(rec: &darkmux_flow::FlowRecord) -> bool {
+    matches!(rec.category, darkmux_flow::Category::Telemetry)
+        && rec.source.as_deref() == Some("detector")
+}
+
+/// (#994) Pull the caution columns out of a detector record's `payload`
+/// (`{kind, severity, detail, area?}` — see `detector_telemetry_payload`).
+/// Returns `(kind, severity, detail, file, code_hash)`; `file` and `code_hash`
+/// are `None` when the firing carries no `area` (engagement-level) or no
+/// firing-time hash (until runtime slice 2). Defaults are defensive — a
+/// malformed payload still yields a storable row rather than dropping the
+/// firing.
+fn caution_fields(
+    rec: &darkmux_flow::FlowRecord,
+) -> (String, String, String, Option<String>, Option<String>) {
+    let payload = rec.payload.as_ref();
+    let str_at = |k: &str| {
+        payload
+            .and_then(|v| v.get(k))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    };
+    let kind = str_at("kind").unwrap_or_else(|| "unknown".to_string());
+    let severity = str_at("severity").unwrap_or_else(|| "warn".to_string());
+    let detail = str_at("detail").unwrap_or_default();
+
+    let area = payload.and_then(|v| v.get("area"));
+    let file = area
+        .and_then(|a| a.get("files"))
+        .and_then(|f| f.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let code_hash = area
+        .and_then(|a| a.get("code_hash"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    (kind, severity, detail, file, code_hash)
+}
+
+/// (#994) Derive the `cautions` table from the flow stream: scan the per-day
+/// JSONL files under `flows_dir()`, parse each line as a `FlowRecord`, and
+/// insert one row per detector firing — keyed (when present) to the file the
+/// firing touched. Lines that don't parse as a `FlowRecord` (the schema-header
+/// line each file opens with, a partial tail write) are skipped, matching the
+/// casual LocalFileSink reader contract (unknown/garbage lines ignored).
+///
+/// The scan is currently unbounded (every day file). Rebuilds are occasional
+/// (schema bump / manual / first read after a stale index), so this is
+/// acceptable for the MVP; bounding to recent day files is a follow-up if a
+/// large flow corpus makes the rebuild slow.
+fn derive_cautions(tx: &Connection) -> Result<()> {
+    let dir = darkmux_flow::flows_dir();
+    if !dir.exists() {
+        return Ok(());
+    }
+    let mut insert = tx.prepare(
+        "INSERT INTO cautions
+            (file, kind, severity, detail, code_hash, mission_id, sprint_id, session_id, role, model, ts)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+    )?;
+    for entry in
+        fs::read_dir(&dir).with_context(|| format!("reading flows dir {}", dir.display()))?
+    {
+        let path = match entry {
+            Ok(e) => e.path(),
+            Err(_) => continue,
+        };
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        for line in content.lines() {
+            let rec = match serde_json::from_str::<darkmux_flow::FlowRecord>(line) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            if !is_detector_caution(&rec) {
+                continue;
+            }
+            let (kind, severity, detail, file, code_hash) = caution_fields(&rec);
+            insert.execute(params![
+                file,
+                kind,
+                severity,
+                detail,
+                code_hash,
+                rec.mission_id,
+                rec.sprint_id,
+                rec.session_id,
+                rec.handle,
+                rec.model,
+                rec.ts,
+            ])?;
+        }
+    }
+    Ok(())
 }
 
 /// Internal entry point for tests + the public `rebuild()` wrapper.
@@ -673,6 +830,8 @@ struct StatusReport {
     stored_darkmux_version: Option<String>,
     stored_schema_version: Option<i32>,
     per_kind_counts: Vec<(String, i64)>,
+    caution_count: i64,   // (#994) derived detector firings in the index
+    knowledge_count: i64, // (#994) operator-authored engagement-context entries
     added: Vec<(String, String)>,    // (kind, path)
     modified: Vec<(String, String)>, // (kind, path)
     deleted: Vec<(String, String)>,  // (kind, path)
@@ -708,6 +867,14 @@ fn status_at(path: &Path) -> Result<StatusReport> {
     for row in count_rows {
         report.per_kind_counts.push(row?);
     }
+
+    // (#994) engagement-context counts — derived cautions + authored knowledge.
+    report.caution_count = conn
+        .query_row("SELECT COUNT(*) FROM cautions", [], |r| r.get(0))
+        .unwrap_or(0);
+    report.knowledge_count = conn
+        .query_row("SELECT COUNT(*) FROM knowledge", [], |r| r.get(0))
+        .unwrap_or(0);
 
     // Drift detection: compare on-disk state to source_files. Each kind's
     // directory is resolved through the loader's dual-read helpers so
@@ -807,6 +974,11 @@ pub fn status() -> Result<()> {
         }
     }
     println!();
+    // (#994) engagement context: derived cautions + operator-authored knowledge.
+    println!("engagement context:");
+    println!("  {:12} {} (derived from the flow stream)", "cautions", report.caution_count);
+    println!("  {:12} {} (operator-authored)", "knowledge", report.knowledge_count);
+    println!();
     let drift = report.added.len() + report.modified.len() + report.deleted.len();
     if drift == 0 {
         println!("drift: none");
@@ -835,35 +1007,289 @@ mod tests {
 
     /// RAII guard: point DARKMUX_CREW_DIR at a TempDir for the test's
     /// lifetime. Mirrors the loader's pattern; serialized via #[serial].
+    ///
+    /// (#994) Also isolates DARKMUX_FLOWS_DIR to an (initially absent) subdir of
+    /// the same TempDir: the `cautions` derive scans `flows_dir()` on every
+    /// rebuild, so without this a crew rebuild test would read the operator's
+    /// real `~/.darkmux/flows`. An un-seeded test thus gets an empty stream by
+    /// construction (the derive no-ops); a test that wants cautions seeds the
+    /// stream via `write_flow_day`.
     struct CrewDirGuard {
-        prev: Option<String>,
+        prev_crew: Option<String>,
+        prev_flows: Option<String>,
         tmp: TempDir,
     }
 
     impl CrewDirGuard {
         fn new() -> Self {
             let tmp = TempDir::new().unwrap();
-            let prev = env::var("DARKMUX_CREW_DIR").ok();
+            let prev_crew = env::var("DARKMUX_CREW_DIR").ok();
+            let prev_flows = env::var("DARKMUX_FLOWS_DIR").ok();
             unsafe {
                 env::set_var("DARKMUX_CREW_DIR", tmp.path());
+                env::set_var("DARKMUX_FLOWS_DIR", tmp.path().join("flows"));
             }
-            Self { prev, tmp }
+            Self { prev_crew, prev_flows, tmp }
         }
 
         fn path(&self) -> &Path {
             self.tmp.path()
+        }
+
+        /// Seed the isolated flow stream with one per-day JSONL file (#994).
+        fn write_flow_day(&self, name: &str, lines: &[String]) {
+            let dir = self.tmp.path().join("flows");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(name), lines.join("\n")).unwrap();
         }
     }
 
     impl Drop for CrewDirGuard {
         fn drop(&mut self) {
             unsafe {
-                match &self.prev {
+                match &self.prev_crew {
                     Some(v) => env::set_var("DARKMUX_CREW_DIR", v),
                     None => env::remove_var("DARKMUX_CREW_DIR"),
                 }
+                match &self.prev_flows {
+                    Some(v) => env::set_var("DARKMUX_FLOWS_DIR", v),
+                    None => env::remove_var("DARKMUX_FLOWS_DIR"),
+                }
             }
         }
+    }
+
+    /// Build one flow-stream line via the SAME constructor the runtime capture
+    /// path uses (`build_telemetry_record`), so the test fixture format can't
+    /// drift from what `derive_cautions` parses.
+    fn detector_line(source: &str, payload: serde_json::Value) -> String {
+        let rec = crate::dispatch::build_telemetry_record(
+            darkmux_flow::Level::Info,
+            "telemetry.detector",
+            source,
+            "coder",
+            "sess-1",
+            Some("test-model"),
+            Some("m1"),
+            Some("s1"),
+            payload,
+        );
+        serde_json::to_string(&rec).unwrap()
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn rebuild_derives_cautions_from_flow_stream() {
+        let crew = CrewDirGuard::new();
+        crew.write_flow_day(
+            "2026-06-22.jsonl",
+            &[
+                // The real schema-header line each flow file opens with
+                // (`_type:"schema"`, per `integrity::schema_header_line`) — it
+                // must be skipped, not error the rebuild (it doesn't
+                // deserialize as a FlowRecord).
+                r#"{"_type":"schema","version":"1.13.0","darkmux_version":"1.7.0"}"#.to_string(),
+                // A file-keyed cycle firing → caution with file=src/x.rs.
+                detector_line(
+                    "detector",
+                    serde_json::json!({
+                        "kind": "cycle", "severity": "warn", "detail": "`edit` called 3×",
+                        "area": { "files": ["src/x.rs"] }
+                    }),
+                ),
+                // An engagement-level firing (no area) → caution with NULL file.
+                detector_line(
+                    "detector",
+                    serde_json::json!({
+                        "kind": "reasoning-loop", "severity": "warn", "detail": "same reasoning 3×"
+                    }),
+                ),
+                // A non-detector telemetry record (source=runtime) → ignored.
+                detector_line(
+                    "runtime",
+                    serde_json::json!({ "kind": "context", "detail": "context fill 40%" }),
+                ),
+            ],
+        );
+
+        let idx = index_path(crew.path());
+        rebuild_at(&idx).unwrap();
+
+        let conn = open_index(&idx).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM cautions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2, "only the two detector firings become cautions");
+
+        let (file, code_hash, mission, role): (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT file, code_hash, mission_id, role FROM cautions WHERE kind='cycle'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(file.as_deref(), Some("src/x.rs"));
+        assert_eq!(code_hash, None, "code_hash is NULL until runtime slice 2");
+        assert_eq!(mission.as_deref(), Some("m1"), "mission threaded through");
+        assert_eq!(role.as_deref(), Some("coder"), "handle stored as role");
+
+        let engagement_level: Option<String> = conn
+            .query_row(
+                "SELECT file FROM cautions WHERE kind='reasoning-loop'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(engagement_level, None, "engagement-level firing → NULL file");
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn knowledge_preserved_but_cautions_rederived_across_rebuild() {
+        let crew = CrewDirGuard::new();
+        crew.write_flow_day(
+            "2026-06-22.jsonl",
+            &[detector_line(
+                "detector",
+                serde_json::json!({
+                    "kind": "cycle", "severity": "warn", "detail": "x",
+                    "area": { "files": ["a.rs"] }
+                }),
+            )],
+        );
+        let idx = index_path(crew.path());
+        rebuild_at(&idx).unwrap();
+
+        // Author a knowledge row (the authoring slice will do this via a verb).
+        {
+            let conn = open_index(&idx).unwrap();
+            conn.execute(
+                "INSERT INTO knowledge (file, title, body, source, created_ts, updated_ts)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    "a.rs",
+                    "bound the retries",
+                    "we cap retries because the loop entrenches its first answer",
+                    "operator",
+                    1_700_000_000_i64,
+                    1_700_000_000_i64
+                ],
+            )
+            .unwrap();
+        }
+
+        // Rebuild again: cautions are dropped + re-derived; knowledge survives.
+        rebuild_at(&idx).unwrap();
+        let conn = open_index(&idx).unwrap();
+        let knowledge: i64 = conn
+            .query_row("SELECT COUNT(*) FROM knowledge", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            knowledge, 1,
+            "authored knowledge is preserved across rebuild (not in REBUILD_TABLES)"
+        );
+        let title: String = conn
+            .query_row("SELECT title FROM knowledge", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(title, "bound the retries");
+        let cautions: i64 = conn
+            .query_row("SELECT COUNT(*) FROM cautions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cautions, 1, "cautions re-derived from the flow stream on rebuild");
+    }
+
+    #[test]
+    fn caution_fields_extracts_area_and_defaults() {
+        let with_area = crate::dispatch::build_telemetry_record(
+            darkmux_flow::Level::Info,
+            "telemetry.detector",
+            "detector",
+            "coder",
+            "s",
+            None,
+            None,
+            None,
+            serde_json::json!({
+                "kind": "cycle", "severity": "warn", "detail": "d",
+                "area": { "files": ["f.rs"], "code_hash": "abc" }
+            }),
+        );
+        let (kind, sev, detail, file, code_hash) = caution_fields(&with_area);
+        assert_eq!((kind.as_str(), sev.as_str(), detail.as_str()), ("cycle", "warn", "d"));
+        assert_eq!(file.as_deref(), Some("f.rs"));
+        assert_eq!(code_hash.as_deref(), Some("abc"));
+
+        let no_area = crate::dispatch::build_telemetry_record(
+            darkmux_flow::Level::Info,
+            "telemetry.detector",
+            "detector",
+            "coder",
+            "s",
+            None,
+            None,
+            None,
+            serde_json::json!({ "kind": "reasoning-loop", "severity": "warn", "detail": "d2" }),
+        );
+        let (_, _, _, file2, hash2) = caution_fields(&no_area);
+        assert_eq!(file2, None);
+        assert_eq!(hash2, None);
+
+        // Malformed payload (no kind/severity/detail) → defaults, never panics.
+        let malformed = crate::dispatch::build_telemetry_record(
+            darkmux_flow::Level::Info,
+            "telemetry.detector",
+            "detector",
+            "coder",
+            "s",
+            None,
+            None,
+            None,
+            serde_json::json!({ "unexpected": true }),
+        );
+        let (k3, s3, d3, _, _) = caution_fields(&malformed);
+        assert_eq!((k3.as_str(), s3.as_str(), d3.as_str()), ("unknown", "warn", ""));
+    }
+
+    #[test]
+    fn is_detector_caution_keys_on_category_and_source() {
+        let detector = crate::dispatch::build_telemetry_record(
+            darkmux_flow::Level::Info,
+            "telemetry.detector",
+            "detector",
+            "coder",
+            "s",
+            None,
+            None,
+            None,
+            serde_json::json!({}),
+        );
+        assert!(is_detector_caution(&detector));
+
+        let runtime = crate::dispatch::build_telemetry_record(
+            darkmux_flow::Level::Info,
+            "telemetry.runtime",
+            "runtime",
+            "coder",
+            "s",
+            None,
+            None,
+            None,
+            serde_json::json!({}),
+        );
+        assert!(!is_detector_caution(&runtime), "non-detector telemetry is not a caution");
+
+        // A non-telemetry record, even with source=detector, is not a caution
+        // (the category gate). Deserialized from the minimal required fields.
+        let work: darkmux_flow::FlowRecord = serde_json::from_str(
+            r#"{"ts":"2026-06-22T00:00:00Z","level":"info","category":"work","tier":"local","stage":"dispatch","action":"x","handle":"coder","source":"detector"}"#,
+        )
+        .unwrap();
+        assert!(!is_detector_caution(&work), "non-telemetry category is not a caution");
     }
 
     fn write_role(
@@ -1505,6 +1931,23 @@ mod tests {
                     "status",
                 ],
             ),
+            (
+                "cautions",
+                &[
+                    "code_hash",
+                    "detail",
+                    "file",
+                    "id",
+                    "kind",
+                    "mission_id",
+                    "model",
+                    "role",
+                    "session_id",
+                    "severity",
+                    "sprint_id",
+                    "ts",
+                ],
+            ),
         ];
 
         for (table, cols) in expected {
@@ -1515,6 +1958,21 @@ mod tests {
                 "column-set drift in `{table}` — update this snapshot AND bump SCHEMA_VERSION (#914 CONSIDER-2)"
             );
         }
+
+        // (#994) Guard the guard: the snapshot must cover EXACTLY the derived
+        // tables (`REBUILD_TABLES`), so adding a rebuild table without a
+        // snapshot row fails HERE rather than silently passing. That per-table-
+        // only gap is how `cautions` slipped through this guard once — the very
+        // drift the #914 CONSIDER-2 guard exists to catch.
+        let snapshot_tables: std::collections::BTreeSet<&str> =
+            expected.iter().map(|(t, _)| *t).collect();
+        let rebuild_tables: std::collections::BTreeSet<&str> =
+            REBUILD_TABLES.iter().copied().collect();
+        assert_eq!(
+            snapshot_tables, rebuild_tables,
+            "snapshot must list EXACTLY the REBUILD_TABLES — add the new table's \
+             column row above AND bump SCHEMA_VERSION (#914 CONSIDER-2 / #994)"
+        );
     }
 
     /// (#914) The literal crash path: a pre-#95 `missions` table plus a
