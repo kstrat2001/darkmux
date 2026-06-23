@@ -1021,6 +1021,69 @@ enum LessonsCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Edit a recorded lesson in place by its id (from `lessons list --json`).
+    /// Only the flags you pass change; `created_ts` is preserved.
+    Edit {
+        /// The lesson's rowid (ids are per-tier — pass `--global` to target the
+        /// user-global store's ids).
+        id: i64,
+        /// New rule statement.
+        #[arg(long)]
+        title: Option<String>,
+        /// New detail / why.
+        #[arg(long)]
+        body: Option<String>,
+        /// Re-scope to a file.
+        #[arg(long, conflicts_with = "clear_file")]
+        file: Option<String>,
+        /// Clear the file scope back to engagement-level (applies everywhere).
+        #[arg(long)]
+        clear_file: bool,
+        /// Target the user-global store instead of this repo's.
+        #[arg(long)]
+        global: bool,
+    },
+    /// Remove a recorded lesson by its id (from `lessons list --json`).
+    Remove {
+        /// The lesson's rowid (per-tier — pass `--global` for the global store).
+        id: i64,
+        /// Target the user-global store instead of this repo's.
+        #[arg(long)]
+        global: bool,
+    },
+    /// Export a tier's lessons to a self-describing JSON envelope on stdout —
+    /// for a hand-edit / git-commit / restore roundtrip.
+    Export {
+        /// Export the user-global store instead of this repo's.
+        #[arg(long)]
+        global: bool,
+    },
+    /// Import a previously-exported (or hand-authored) JSON envelope into a
+    /// tier. Upserts by id (idempotent re-import; new entries append); never
+    /// deletes. Reads stdin when `--file` is omitted.
+    Import {
+        /// Path to the JSON envelope (omit to read stdin).
+        #[arg(long)]
+        file: Option<std::path::PathBuf>,
+        /// Import into the user-global store instead of this repo's.
+        #[arg(long)]
+        global: bool,
+    },
+    /// Read-only recall: search recorded lessons (both tiers) by a
+    /// case-insensitive term and/or an exact file scope. Results span both
+    /// tiers; ids are tier-local, so to edit/remove a hit, target its tier
+    /// (`--global` for global-store ids).
+    Recall {
+        /// Case-insensitive substring matched against title OR body.
+        #[arg(long)]
+        term: Option<String>,
+        /// Exact file scope to filter on.
+        #[arg(long)]
+        file: Option<String>,
+        /// Emit machine-readable JSON instead of styled text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1339,6 +1402,154 @@ fn cmd_lessons(sub: LessonsCmd) -> Result<i32> {
             print_lessons_tier("global (all engagements)", &global);
             Ok(0)
         }
+        LessonsCmd::Edit {
+            id,
+            title,
+            body,
+            file,
+            clear_file,
+            global,
+        } => {
+            let (path, tier) = lessons_tier(global);
+            // tri-state: --clear-file wins (Some(None)); else --file (Some(Some));
+            // else leave unchanged (None).
+            let file_update: Option<Option<&str>> = if clear_file {
+                Some(None)
+            } else {
+                file.as_deref().map(Some)
+            };
+            if title.is_none() && body.is_none() && file_update.is_none() {
+                eprintln!(
+                    "{}",
+                    darkmux_types::style::error(
+                        "nothing to edit — pass at least one of --title / --body / --file / --clear-file"
+                    )
+                );
+                return Ok(2);
+            }
+            let conn = lessons::open_at(&path)?;
+            let changed = lessons::edit(
+                &conn,
+                id,
+                title.as_deref(),
+                body.as_deref(),
+                file_update,
+                None,
+            )?;
+            if changed {
+                println!(
+                    "{}",
+                    darkmux_types::style::success(&format!("edited lesson #{id} ({tier})"))
+                );
+                Ok(0)
+            } else {
+                eprintln!(
+                    "{}",
+                    darkmux_types::style::error(&format!(
+                        "no lesson #{id} in the {tier} store (ids are per-tier — try --global?)"
+                    ))
+                );
+                Ok(1)
+            }
+        }
+        LessonsCmd::Remove { id, global } => {
+            let (path, tier) = lessons_tier(global);
+            let conn = lessons::open_at(&path)?;
+            if lessons::remove(&conn, id)? {
+                println!(
+                    "{}",
+                    darkmux_types::style::success(&format!("removed lesson #{id} ({tier})"))
+                );
+                Ok(0)
+            } else {
+                eprintln!(
+                    "{}",
+                    darkmux_types::style::error(&format!(
+                        "no lesson #{id} in the {tier} store (ids are per-tier — try --global?)"
+                    ))
+                );
+                Ok(1)
+            }
+        }
+        LessonsCmd::Export { global } => {
+            let (path, _) = lessons_tier(global);
+            // export reads the store; if absent, emit an empty envelope rather
+            // than creating the db (a read must not write). Build the envelope
+            // through `LessonsExport` so the wire shape is single-sourced with
+            // `import_json` — the two can't drift.
+            let env = lessons::LessonsExport {
+                schema_version: lessons::LESSONS_SCHEMA_VERSION,
+                lessons: lessons::load_entries_best_effort(&path),
+            };
+            println!("{}", serde_json::to_string_pretty(&env)?);
+            Ok(0)
+        }
+        LessonsCmd::Import { file, global } => {
+            let (path, tier) = lessons_tier(global);
+            let data = match file {
+                Some(p) => std::fs::read_to_string(&p)
+                    .with_context(|| format!("reading {}", p.display()))?,
+                None => {
+                    use std::io::Read;
+                    let mut buf = String::new();
+                    std::io::stdin()
+                        .read_to_string(&mut buf)
+                        .context("reading lessons import from stdin")?;
+                    buf
+                }
+            };
+            let mut conn = lessons::open_at(&path)?;
+            let stats = lessons::import_json(&mut conn, &data)?;
+            println!(
+                "{}",
+                darkmux_types::style::success(&format!(
+                    "imported into {tier}: {} inserted, {} updated",
+                    stats.inserted, stats.updated
+                ))
+            );
+            Ok(0)
+        }
+        LessonsCmd::Recall { term, file, json } => {
+            let repo_path = lessons::repo_db_path();
+            let global_path = lessons::global_db_path();
+            let recall_tier = |path: &std::path::Path| -> Vec<lessons::Lesson> {
+                if !path.exists() {
+                    return Vec::new();
+                }
+                lessons::open_at(path)
+                    .and_then(|conn| lessons::recall(&conn, term.as_deref(), file.as_deref()))
+                    .unwrap_or_default()
+            };
+            let repo = recall_tier(&repo_path);
+            let global = if global_path == repo_path {
+                Vec::new()
+            } else {
+                recall_tier(&global_path)
+            };
+            if json {
+                let out = serde_json::json!({ "repo": repo, "global": global });
+                println!("{}", serde_json::to_string_pretty(&out)?);
+                return Ok(0);
+            }
+            if repo.is_empty() && global.is_empty() {
+                println!("{}", darkmux_types::style::dim("no lessons match"));
+                return Ok(0);
+            }
+            print_lessons_tier("repo (this engagement)", &repo);
+            print_lessons_tier("global (all engagements)", &global);
+            Ok(0)
+        }
+    }
+}
+
+/// Resolve the `(db path, label)` for a lessons tier — repo (this engagement)
+/// by default, user-global when `--global`. Shared by the mutating verbs.
+fn lessons_tier(global: bool) -> (std::path::PathBuf, &'static str) {
+    use darkmux_crew::lessons;
+    if global {
+        (lessons::global_db_path(), "global")
+    } else {
+        (lessons::repo_db_path(), "repo")
     }
 }
 
