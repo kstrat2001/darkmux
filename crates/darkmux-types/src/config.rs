@@ -139,6 +139,12 @@ pub struct RuntimeBehaviorConfig {
     // token `DARKMUX_SERVE_TOKEN` needs no gate). Visible `false` so the
     // security toggle is discoverable; the token itself is NEVER a config field.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub daemon_auth_enabled: Option<bool>,
+    // (#1011) Fraction (0–1) of the dispatch model's context window budgeted for
+    // the injected-context blocks (detector cautions + authored lessons + prior
+    // corrections) in the coder brief. A fraction auto-scales across profiles
+    // from one value — a large-window profile gets proportionally more room.
+    // `env(DARKMUX_INJECTED_CONTEXT_FRACTION) > this > 0.15`.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub injected_context_fraction: Option<f64>,
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -201,6 +207,7 @@ impl DarkmuxConfig {
                 check_updates: Some(true),
                 daemon_cors_origins: None,
                 daemon_auth_enabled: Some(false),
+                injected_context_fraction: Some(0.15),
                 extras: Default::default(),
             }),
             extras: Default::default(),

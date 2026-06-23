@@ -239,6 +239,23 @@ pub fn daemon_cors_origins() -> Option<String> {
 pub fn serve_auth_config_enabled() -> bool {
     config().runtime.as_ref().and_then(|r| r.daemon_auth_enabled).unwrap_or(false)
 }
+/// (#1011) Fraction (0–1) of the dispatch model's context window budgeted for
+/// the coder brief's injected-context blocks (cautions + lessons + corrections).
+/// Precedence: `env(DARKMUX_INJECTED_CONTEXT_FRACTION)`, then
+/// `config.runtime.injected_context_fraction`, then the `0.15` default. Clamped
+/// to `[0.0, 1.0]` so a fat-fingered config/env can't budget a negative or
+/// over-100%-of-window block.
+pub fn injected_context_fraction() -> f64 {
+    let cfg = config().runtime.as_ref().and_then(|r| r.injected_context_fraction);
+    let v = pick_parsed("DARKMUX_INJECTED_CONTEXT_FRACTION", cfg, Some(0.15)).unwrap();
+    // A non-finite value (`NaN`/`inf` — `clamp` would pass `NaN` through) falls
+    // back to the default rather than silently degrading the budget to its floor.
+    if v.is_finite() {
+        v.clamp(0.0, 1.0)
+    } else {
+        0.15
+    }
+}
 /// Strict model-selection (hard-fail on profile-vs-loaded mismatch).
 /// `env(DARKMUX_STRICT_SELECTION)` truthy (`1`/`true`/`yes`/`on`, case-
 /// insensitive) > `config.runtime.strict_selection` > `false`. The env layer is
@@ -761,6 +778,30 @@ mod tests {
             match prev {
                 Some(v) => std::env::set_var("DARKMUX_CHECK_UPDATES", v),
                 None => std::env::remove_var("DARKMUX_CHECK_UPDATES"),
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn injected_context_fraction_env_then_default_and_clamped() {
+        let prev = std::env::var("DARKMUX_INJECTED_CONTEXT_FRACTION").ok();
+        unsafe { std::env::remove_var("DARKMUX_INJECTED_CONTEXT_FRACTION"); }
+        assert!((injected_context_fraction() - 0.15).abs() < 1e-9, "unset → default 0.15");
+        unsafe { std::env::set_var("DARKMUX_INJECTED_CONTEXT_FRACTION", "0.30"); }
+        assert!((injected_context_fraction() - 0.30).abs() < 1e-9, "env wins");
+        // Out-of-range values are clamped to [0,1].
+        unsafe { std::env::set_var("DARKMUX_INJECTED_CONTEXT_FRACTION", "5.0"); }
+        assert!((injected_context_fraction() - 1.0).abs() < 1e-9, ">1 clamps to 1.0");
+        unsafe { std::env::set_var("DARKMUX_INJECTED_CONTEXT_FRACTION", "-2.0"); }
+        assert!(injected_context_fraction() == 0.0, "<0 clamps to 0.0");
+        // A non-finite value falls back to the default (clamp would pass NaN).
+        unsafe { std::env::set_var("DARKMUX_INJECTED_CONTEXT_FRACTION", "NaN"); }
+        assert!((injected_context_fraction() - 0.15).abs() < 1e-9, "NaN → default, not floor");
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_INJECTED_CONTEXT_FRACTION", v),
+                None => std::env::remove_var("DARKMUX_INJECTED_CONTEXT_FRACTION"),
             }
         }
     }

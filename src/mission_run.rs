@@ -492,7 +492,32 @@ pub fn run(
         .filter(|s| s.mission_id.as_str() == mission_id)
         .map(|s| format!("mission-run-{}-{}", mission_id, s.id))
         .collect();
-    let prior_corrections = mission_adjudication_notes(&mission_session_ids);
+    // (#1002) Files this dispatch is about to work on (from the sprint
+    // description) — used to rank file-in-play cautions + lessons above
+    // engagement-level ones, and to staleness-check cautions against the
+    // worktree's current content.
+    let intent = intent_files(&sprint.description);
+
+    // (#994 retrieve+inject) The three injected-context sources, each fully
+    // ranked but UNCAPPED here — the proportional budget (#1011) decides how
+    // much of each lands, so a large-window profile uses its headroom and a
+    // small one isn't over-fed. Authority order: corrections (operator/reviewer
+    // overrides) > lessons (authored) > cautions (auto-derived, flood-prone).
+    let corrections = mission_adjudication_notes(&mission_session_ids);
+    let cautions = mission_cautions(&mission_session_ids, &intent, &wt_path);
+    let authored = engagement_lessons(&intent);
+
+    // (#1011) Distribute a single budget — a fraction of THIS dispatch model's
+    // context window — across the blocks with per-authority floors (no category
+    // starves another), priority-ordered remainder, and a cautions cap.
+    let budget = injected_budget_chars(
+        crew::dispatch_internal::resolve_context_window_internal(None, None),
+    );
+    let (prior_corrections, detected_cautions, lessons) =
+        allocate_injected_context(corrections, cautions, authored, budget);
+
+    // Surface what's injected — provenance, not a silent rule (#44). Counts
+    // reflect the post-budget selection.
     if !prior_corrections.is_empty() {
         println!(
             "{}",
@@ -507,16 +532,6 @@ pub fn run(
             println!("{}", style::dim(&format!("    • {first}")));
         }
     }
-    // (#994 retrieve+inject) Carry forward the loop pathologies darkmux's
-    // detectors flagged on earlier dispatches in this mission (the auto-derived
-    // doom-loop signal — sibling to the operator-authored corrections above).
-    // Same provenance discipline: surface what's injected (#44).
-    // (#1002) Files this dispatch is about to work on (from the sprint
-    // description) — used to rank file-in-play cautions + lessons above
-    // engagement-level ones, and to staleness-check cautions against the
-    // worktree's current content.
-    let intent = intent_files(&sprint.description);
-    let detected_cautions = mission_cautions(&mission_session_ids, &intent, &wt_path);
     if !detected_cautions.is_empty() {
         println!(
             "{}",
@@ -531,10 +546,6 @@ pub fn run(
             println!("{}", style::dim(&format!("    • {first}")));
         }
     }
-    // (#994) Carry forward the operator-authored lessons for this engagement
-    // — the authored + FOLLOW-framed sibling of the detected cautions.
-    // Surface what's injected (provenance, #44).
-    let lessons = engagement_lessons(&intent);
     if !lessons.is_empty() {
         println!(
             "{}",
@@ -1102,12 +1113,12 @@ fn coder_brief(
 /// not sprint-scoped, by design — a correction like "don't rename that field"
 /// applies mission-wide. Best-effort: any IO/parse problem reads as "no
 /// corrections" (the loop just doesn't get the carry-forward, never errors).
-/// Bounded: the most-recent `ADJUDICATION_LOOKBACK_DAYS` day-files, capped at
-/// `MAX_INJECTED_CORRECTIONS` most-recent unique notes so the brief stays
-/// focused and the scan cost stays flat. Mirrors `session_has_orchestrator_note`.
+/// Bounded: the most-recent `ADJUDICATION_LOOKBACK_DAYS` day-files. Returned
+/// **newest-first** and NOT count-capped (#1011) — corrections are the highest-
+/// authority block, so the proportional budget keeps the freshest from the front.
+/// Mirrors `session_has_orchestrator_note`.
 fn mission_adjudication_notes(mission_session_ids: &std::collections::HashSet<String>) -> Vec<String> {
     const ADJUDICATION_LOOKBACK_DAYS: usize = 7;
-    const MAX_INJECTED_CORRECTIONS: usize = 10;
     if mission_session_ids.is_empty() {
         return Vec::new();
     }
@@ -1155,9 +1166,11 @@ fn mission_adjudication_notes(mission_session_ids: &std::collections::HashSet<St
             }
         }
     }
-    if notes.len() > MAX_INJECTED_CORRECTIONS {
-        notes = notes.split_off(notes.len() - MAX_INJECTED_CORRECTIONS);
-    }
+    // Newest-first so the budget's front-take keeps the freshest corrections
+    // (notes were collected oldest→newest across the day-files). Dedup keeps the
+    // FIRST occurrence, so "newest" here means newest-first-seen — a re-stated
+    // correction keeps its original position, not the restatement's.
+    notes.reverse();
     notes
 }
 
@@ -1226,6 +1239,101 @@ fn current_file_blake3(workspace_root: &Path, file: &str) -> Option<String> {
     Some(blake3::hash(&bytes).to_hex().to_string())
 }
 
+/// (#1011) Char budget for the coder brief's injected-context blocks — a
+/// fraction (operator-tunable, default 15%) of the dispatch model's context
+/// window, in chars (≈ tokens × 4, so no tokenizer dependency). A fraction
+/// auto-scales across profiles from one value: a large-window profile gets
+/// proportionally more room than a small one, so the cap neither wastes a
+/// `deep` profile's headroom nor over-feeds a `fast` one. Falls back to a
+/// default window when the profile can't resolve, and floors at a minimum so a
+/// pathologically small window still leaves the per-category floors meaningful.
+fn injected_budget_chars(n_ctx: Option<u32>) -> usize {
+    budget_chars_for(n_ctx, darkmux_types::config_access::injected_context_fraction())
+}
+
+/// Pure budget math (split out from [`injected_budget_chars`] so it's testable
+/// without touching the config/env tier).
+fn budget_chars_for(n_ctx: Option<u32>, frac: f64) -> usize {
+    const DEFAULT_N_CTX: u32 = 32_768; // only when the profile can't resolve
+    const CHARS_PER_TOKEN: usize = 4;
+    const MIN_BUDGET_CHARS: usize = 2_000;
+    let window = n_ctx.unwrap_or(DEFAULT_N_CTX) as f64;
+    ((window * frac) as usize * CHARS_PER_TOKEN).max(MIN_BUDGET_CHARS)
+}
+
+/// (#1011, #994 decision #5) Distribute `budget` chars across the three
+/// already-ranked injected-context blocks — replacing the old per-block hard
+/// counts (the real constraint is the small model's window, not a flat number).
+/// Three rules, each closing one failure mode. (1) Per-category floor: a
+/// non-empty category is guaranteed a minimum slice before anything else fills,
+/// so none starves (the doom-loop's named failure is a correction evaporating);
+/// an empty category's floor returns to the pool. (2) Priority-ordered
+/// remainder: leftover fills by authority (corrections, then lessons, then
+/// cautions) — bulk to the highest authority, but only after every floor is
+/// honored. (3) Cautions cap: the cheap, high-volume auto-source gets a ceiling
+/// so a flood of firings can't dominate even the remainder.
+/// Each list is returned truncated in rank order to its allowance. The
+/// fractions are empirical starting points (tuned from real dispatches via the
+/// loop lab #1004) — the mechanism is what ships; the exact numbers will move.
+fn allocate_injected_context(
+    corrections: Vec<String>,
+    cautions: Vec<String>,
+    lessons: Vec<String>,
+    budget: usize,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    const FLOOR_CORR: f64 = 0.40; // highest authority — strongest floor
+    const FLOOR_LESS: f64 = 0.30;
+    const FLOOR_CAUT: f64 = 0.15;
+    const CAP_CAUT: f64 = 0.35; // ceiling on the high-volume auto-source
+
+    // A block's char cost = its bullets joined by newlines.
+    let demand = |v: &[String]| -> usize {
+        if v.is_empty() {
+            0
+        } else {
+            v.iter().map(String::len).sum::<usize>() + v.len() - 1
+        }
+    };
+    let frac = |f: f64| ((budget as f64) * f) as usize;
+    let (dc, dl, dca) = (demand(&corrections), demand(&lessons), demand(&cautions));
+
+    // Floor only for a non-empty category (an empty one's slice returns to the
+    // pool), and never reserve more than the category can actually use.
+    let fc = if dc == 0 { 0 } else { dc.min(frac(FLOOR_CORR)) };
+    let fl = if dl == 0 { 0 } else { dl.min(frac(FLOOR_LESS)) };
+    let fca = if dca == 0 { 0 } else { dca.min(frac(FLOOR_CAUT)) };
+
+    // Remainder by authority: corrections, then lessons, then cautions (capped).
+    let mut pool = budget.saturating_sub(fc + fl + fca);
+    let ec = (dc - fc).min(pool);
+    pool -= ec;
+    let el = (dl - fl).min(pool);
+    pool -= el;
+    let caut_ceiling = frac(CAP_CAUT).saturating_sub(fca);
+    let eca = (dca - fca).min(pool).min(caut_ceiling);
+
+    // Take bullets in rank order while they fit the allowance (stop at the first
+    // that doesn't — preserve rank, don't skip ahead to a smaller later one).
+    let take = |v: Vec<String>, allow: usize| -> Vec<String> {
+        let mut used = 0usize;
+        let mut out = Vec::new();
+        for item in v {
+            let add = if out.is_empty() { item.len() } else { item.len() + 1 };
+            if used + add > allow {
+                break;
+            }
+            used += add;
+            out.push(item);
+        }
+        out
+    };
+    (
+        take(corrections, fc + ec),
+        take(cautions, fca + eca),
+        take(lessons, fl + el),
+    )
+}
+
 /// (#994 retrieve+inject) The loop pathologies darkmux's detectors flagged
 /// across this mission's earlier dispatches, for injection into the next coder
 /// brief — the doom-loop fix's AUTO-DERIVED half (sibling to the operator-
@@ -1241,8 +1349,9 @@ fn current_file_blake3(workspace_root: &Path, file: &str) -> Option<String> {
 /// status surface; this hot per-dispatch path mirrors the corrections
 /// collector). Scoped to the mission's EXACT dispatch session ids (exact-set,
 /// not a `mission-run-<id>-` prefix — same sibling-bleed guard as #849), deduped,
-/// capped at `MAX_INJECTED_CAUTIONS` over the most-recent `CAUTION_LOOKBACK_DAYS`
-/// day-files. (#1002) Ranked **file-in-play first** (a caution about a file this
+/// over the most-recent `CAUTION_LOOKBACK_DAYS` day-files. Fully ranked but NOT
+/// count-capped (#1011 — the proportional budget governs how many land).
+/// (#1002) Ranked **file-in-play first** (a caution about a file this
 /// dispatch will touch — per `intent` — outranks an engagement-level one), then
 /// **fresh over stale** (a caution whose firing-time `code_hash` (#1001) no
 /// longer matches the file's current content under `workspace_root` is
@@ -1263,7 +1372,6 @@ fn mission_cautions(
     workspace_root: &Path,
 ) -> Vec<String> {
     const CAUTION_LOOKBACK_DAYS: usize = 7;
-    const MAX_INJECTED_CAUTIONS: usize = 10;
     if mission_session_ids.is_empty() {
         return Vec::new();
     }
@@ -1361,14 +1469,14 @@ fn mission_cautions(
             .then_with(|| b.2.cmp(&a.2))
             .then_with(|| b.3.cmp(&a.3))
     });
+    // (#1011) Deduped + fully ranked, but NOT count-capped here — the
+    // proportional budget (`allocate_injected_context`) governs how many land,
+    // so a large-window dispatch can carry more than the old flat 10.
     let mut seen = std::collections::HashSet::new();
     let mut out: Vec<String> = Vec::new();
     for (_, _, _, _, bullet) in found {
         if seen.insert(bullet.clone()) {
             out.push(bullet);
-            if out.len() >= MAX_INJECTED_CAUTIONS {
-                break;
-            }
         }
     }
     out
@@ -1385,11 +1493,11 @@ fn mission_cautions(
 /// durable lessons), so reads must tolerate concurrent writes — SQLite +
 /// best-effort does: a missing/locked/unreadable store reads as "no
 /// lessons" and never errors the dispatch (mirrors the cautions +
-/// corrections collectors). Capped; formatted as bullets (the "why" rides in
-/// the body).
+/// corrections collectors). Fully ranked (file-in-play first), NOT count-capped
+/// — the proportional budget (#1011) governs how many land; formatted as bullets
+/// (the "why" rides in the body).
 fn engagement_lessons(intent: &std::collections::HashSet<String>) -> Vec<String> {
     use crew::lessons;
-    const MAX_INJECTED_LESSONS: usize = 12;
     let repo_path = lessons::repo_db_path();
     let global_path = lessons::global_db_path();
     let mut entries = lessons::load_entries_best_effort(&repo_path);
@@ -1399,7 +1507,7 @@ fn engagement_lessons(intent: &std::collections::HashSet<String>) -> Vec<String>
     }
     // (#1002) File-in-play boost: a lesson scoped to a file this dispatch will
     // touch (normalized-path match against `intent`) sorts ahead of
-    // engagement-level ones, so the cap keeps the most relevant. Stable sort
+    // engagement-level ones, so the budget keeps the most relevant. Stable sort
     // preserves the store's updated_ts-DESC order within each group. Lessons
     // carry no firing-time hash, so there's no staleness dimension here.
     entries.sort_by_key(|e| {
@@ -1411,9 +1519,10 @@ fn engagement_lessons(intent: &std::collections::HashSet<String>) -> Vec<String>
         // `false` < `true`, so negate to put matches first under ascending sort.
         !in_play
     });
+    // (#1011) Fully ranked, NOT count-capped — the proportional budget governs
+    // how many land.
     entries
         .into_iter()
-        .take(MAX_INJECTED_LESSONS)
         .map(|e| {
             let scope = e
                 .file
@@ -1494,6 +1603,10 @@ struct DebriefReport {
 /// and a non-coding mission simply has no coding activity.
 fn gather_debrief(mission_id: &str) -> Result<DebriefReport> {
     use crew::loader::{load_missions, load_sprints};
+    // (#1011) How many cautions/corrections the retrospective summary shows
+    // (the collectors are uncapped now; the dispatch path budgets, the debrief
+    // just truncates for readability).
+    const DEBRIEF_DISPLAY: usize = 10;
     fleet::validate_identifier("mission_id", mission_id)?;
 
     let missions = load_missions()?;
@@ -1535,12 +1648,21 @@ fn gather_debrief(mission_id: &str) -> Result<DebriefReport> {
         // files-in-play (empty `intent`); the operator's cwd is the natural
         // "current content" root for the staleness check (a caution whose file
         // has since changed sorts down, which reads fine in a summary too).
+        // (#1011) The collectors are no longer self-capped (the dispatch path's
+        // budget governs there); a debrief is a readable summary, so cap the
+        // display here at the most-relevant `DEBRIEF_DISPLAY` of each.
         cautions: mission_cautions(
             &mission_session_ids,
             &std::collections::HashSet::new(),
             &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-        ),
-        corrections: mission_adjudication_notes(&mission_session_ids),
+        )
+        .into_iter()
+        .take(DEBRIEF_DISPLAY)
+        .collect(),
+        corrections: mission_adjudication_notes(&mission_session_ids)
+            .into_iter()
+            .take(DEBRIEF_DISPLAY)
+            .collect(),
     })
 }
 
@@ -2950,6 +3072,78 @@ mod tests {
             cautions[0].contains("fresh one"),
             "fresh caution outranks the newer-but-stale one: {cautions:?}"
         );
+    }
+
+    // ─── (#1011) proportional injected-context budget + distribution ─────
+
+    #[test]
+    fn budget_chars_scales_with_window_and_floors_at_min() {
+        // fraction × window × 4 chars/token.
+        assert_eq!(budget_chars_for(Some(100_000), 0.15), (100_000f64 * 0.15) as usize * 4);
+        // A bigger window → a bigger budget (auto-scaling from one fraction).
+        assert!(budget_chars_for(Some(100_000), 0.15) > budget_chars_for(Some(8_000), 0.15));
+        // A pathologically small window still floors at the minimum.
+        assert_eq!(budget_chars_for(Some(10), 0.15), 2_000);
+        // Unresolved window → the default fallback (non-zero, above the floor).
+        assert!(budget_chars_for(None, 0.15) > 2_000);
+    }
+
+    fn bullets(prefix: &str, n: usize, len: usize) -> Vec<String> {
+        // Each bullet is exactly `len` chars (prefix + padding) for predictable
+        // budget math.
+        (0..n)
+            .map(|i| {
+                let head = format!("{prefix}{i}:");
+                format!("{head}{}", "x".repeat(len.saturating_sub(head.len())))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn allocate_gives_each_nonempty_category_its_floor() {
+        // Generous budget: everything fits, nothing is dropped.
+        let corr = bullets("c", 3, 50);
+        let caut = bullets("a", 3, 50);
+        let less = bullets("l", 3, 50);
+        let (rc, rca, rl) =
+            allocate_injected_context(corr.clone(), caut.clone(), less.clone(), 100_000);
+        assert_eq!((rc.len(), rca.len(), rl.len()), (3, 3, 3), "all fit under a big budget");
+    }
+
+    #[test]
+    fn allocate_caps_cautions_so_they_cannot_flood() {
+        // Only cautions have content, and a LOT of it. The cautions cap (35% of
+        // budget) bounds them even though the whole pool is otherwise free.
+        let caut = bullets("a", 100, 100); // 100 bullets × 100 chars ≈ 10 100 chars demand
+        let budget = 10_000;
+        let (_, rca, _) = allocate_injected_context(Vec::new(), caut, Vec::new(), budget);
+        let used: usize = rca.iter().map(|s| s.len() + 1).sum::<usize>().saturating_sub(1);
+        // ≤ 35% of budget (+ one bullet's slack for the boundary item).
+        assert!(used <= (budget * 35 / 100) + 101, "cautions capped near 35%: used={used}");
+        assert!(!rca.is_empty(), "but still get their floor");
+    }
+
+    #[test]
+    fn allocate_reallocates_empty_floors_and_prioritizes_corrections() {
+        // No lessons, no cautions → their floors return to the pool, so the
+        // high-authority corrections can use the whole budget.
+        let corr = bullets("c", 50, 100); // 50 × 100 ≈ 5 049 chars demand
+        let budget = 6_000;
+        let (rc, rca, rl) =
+            allocate_injected_context(corr, Vec::new(), Vec::new(), budget);
+        assert!(rca.is_empty() && rl.is_empty());
+        assert!(rc.len() >= 40, "corrections claim the freed pool: got {}", rc.len());
+    }
+
+    #[test]
+    fn allocate_floor_protects_corrections_from_a_caution_flood() {
+        // Cautions demand far exceeds budget, but corrections' floor guarantees
+        // it lands regardless (the doom-loop's named failure: a correction
+        // evaporating under a flood).
+        let corr = bullets("c", 2, 100);
+        let caut = bullets("a", 200, 100);
+        let (rc, _, _) = allocate_injected_context(corr, caut, Vec::new(), 8_000);
+        assert_eq!(rc.len(), 2, "both corrections survive the caution flood");
     }
 
     /// (#849 half 1) The brief-injection reader: collects adjudication notes

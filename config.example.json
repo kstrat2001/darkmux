@@ -19,6 +19,7 @@
     "inactivity_timeout_seconds": 600,
     "strict_selection": false,
     "check_updates": true,
-    "daemon_auth_enabled": false
+    "daemon_auth_enabled": false,
+    "injected_context_fraction": 0.15
   }
 }
