@@ -787,10 +787,15 @@ pub fn run(
                              only; no behavior change.",
                             tool_name, count, window_size
                         );
+                        // (#1001) Capture the target file's content hash at
+                        // firing time so the caution can be ranked down as
+                        // stale once that file changes.
+                        let code_hash = detector_code_hash(&canonical_args);
                         trajectory.append_cycle_suspected(
                             turns,
                             &tool_name,
                             &canonical_args,
+                            code_hash.as_deref(),
                             count,
                             window_size,
                         );
@@ -913,9 +918,16 @@ pub fn run(
                              Operator-visible only; no behavior change.",
                             tool_name, failure_count
                         );
+                        // (#1001) Carry the failing tool's args so the host can
+                        // derive the file the cascade is on, plus the file's
+                        // firing-time hash for staleness. A non-file tool
+                        // (e.g. `bash`) yields no path / no hash downstream.
+                        let code_hash = detector_code_hash(&call.function.arguments);
                         trajectory.append_tool_repeated_failure(
                             turns,
                             &tool_name,
+                            &call.function.arguments,
+                            code_hash.as_deref(),
                             failure_count,
                         );
                         // Step 1 of feedback injection — see cycle-
@@ -1448,6 +1460,41 @@ fn normalize_path_lexical(p: &str) -> String {
         }
     }
     out.to_string_lossy().into_owned()
+}
+
+/// (#1001) BLAKE3 hex of a tool's target file at detector-firing time, so a
+/// caution keyed to a file can later be ranked DOWN as stale when that file's
+/// content has since changed (the staleness check in #1002 recomputes with the
+/// same algorithm). Derives the file from the tool's `path` arg; best-effort —
+/// a non-file tool (no `path`), an absent/unreadable file, or a file past the
+/// size guard yields `None` (no hash, never a misleading one). The guard bounds
+/// the read so a pathological file can't stall the loop. BLAKE3 (not std
+/// `DefaultHasher`) because this hash is persisted and compared across
+/// dispatches/versions — it must be stable forever.
+fn detector_code_hash(canonical_args: &str) -> Option<String> {
+    /// 10 MiB — far above any source file a coder dispatch edits; a larger
+    /// "file" is almost certainly not code, so skip rather than read it all.
+    const MAX_HASH_BYTES: u64 = 10 * 1024 * 1024;
+    // The model's `path` is resolved by the file tools against the container
+    // workspace root (`/workspace`, the Dockerfile `WORKDIR`). This bare
+    // `std::fs` read resolves a relative path against the process cwd — which
+    // is that same `/workspace` because of the `WORKDIR`. The coupling is
+    // implicit: a relative path lands on the right file ONLY while cwd ==
+    // `/workspace`. If a future change adds a configurable workspace root, this
+    // must resolve against it too. Failing that, the worst case is a `None`
+    // hash (a missed staleness signal), never a wrong-file hash for a path that
+    // doesn't resolve — best-effort by design.
+    let path = serde_json::from_str::<serde_json::Value>(canonical_args)
+        .ok()?
+        .get("path")?
+        .as_str()?
+        .to_owned();
+    let meta = std::fs::metadata(&path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_HASH_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(&path).ok()?;
+    Some(blake3::hash(&bytes).to_hex().to_string())
 }
 
 fn measure_request_context(messages: &[Message]) -> (usize, usize) {
@@ -3767,6 +3814,36 @@ mod tests {
     fn normalize_path_lexical_preserves_leading_parent_dir() {
         // No preceding component to fold against — keep the `..`.
         assert_eq!(normalize_path_lexical("../foo.rs"), "../foo.rs");
+    }
+
+    // ─── (#1001) detector_code_hash ──────────────────────────────────
+    #[test]
+    fn detector_code_hash_hashes_an_existing_file_and_tracks_content() {
+        use std::io::Write;
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("a.rs");
+        std::fs::File::create(&file)
+            .unwrap()
+            .write_all(b"fn main() {}")
+            .unwrap();
+        let args = serde_json::json!({ "path": file.to_str().unwrap() }).to_string();
+        let h1 = detector_code_hash(&args).expect("hashes an existing file");
+        // BLAKE3 hex is 64 chars and stable for the same bytes.
+        assert_eq!(h1.len(), 64);
+        assert_eq!(detector_code_hash(&args).as_deref(), Some(h1.as_str()));
+        // Content change → different hash (the staleness signal).
+        std::fs::write(&file, b"fn main() { changed }").unwrap();
+        assert_ne!(detector_code_hash(&args).as_deref(), Some(h1.as_str()));
+    }
+
+    #[test]
+    fn detector_code_hash_is_none_for_non_file_or_missing() {
+        // No `path` arg (e.g. a `bash` cycle) → None.
+        assert!(detector_code_hash(r#"{"command":"ls"}"#).is_none());
+        // Malformed args → None.
+        assert!(detector_code_hash("not json").is_none());
+        // A `path` that doesn't exist → None (best-effort, never a fake hash).
+        assert!(detector_code_hash(r#"{"path":"/no/such/file.rs"}"#).is_none());
     }
 
     // ─── (#465/#472) cadence_drift_step state machine ────────────────
