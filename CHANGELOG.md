@@ -11,6 +11,44 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-06-23
+
+The dispatch-to-PR loop's engagement-context cure goes from foundation to
+finale: the loop can now key cautions to the code they fired on, rank what's
+relevant to the dispatch, budget what it injects, and **measure** whether the
+injected memory changed behavior. Plus dispatch ergonomics for substantial briefs.
+
+### Added
+- **Lessons sovereignty verbs — `darkmux lessons edit/remove/export/import/recall`
+  (#1003).** Full operator curation of the engagement-context lessons store
+  (`add`/`list` shipped in 1.8.0): in-place edit, delete, a self-describing JSON
+  export/import roundtrip (idempotent, order-independent), and read-only recall.
+- **Loop-lab engagement-context A/B — `darkmux lab loop --ab` (#1004).** Run the
+  same workload twice, once with the injected lessons/cautions and once without,
+  and report the verdict shift — the empirical proof of whether institutional
+  memory changes loop behavior. `--inject-from-mission <id>` scopes the cautions.
+- **`crew dispatch --message-from-file <path>` (#386).** Pass a substantial brief
+  from a file instead of the command line. The message now flows to the runtime
+  via a bind-mounted file rather than `docker run` argv, so a large brief can't
+  hit ARG_MAX or show up in `ps`.
+- **Proportional injected-context budget (#1011).** The coder brief's injected
+  context (cautions + lessons + corrections) is budgeted as a fraction of the
+  model's context window with per-authority floors, replacing three flat counts.
+  Tunable via `runtime.injected_context_fraction` / `DARKMUX_INJECTED_CONTEXT_FRACTION`.
+
+### Changed
+- **Staleness-aware cautions (#1001 + #1002).** Detector firings now capture a
+  BLAKE3 hash of the file they fired on; at retrieval, a caution about a file
+  whose content has since changed is ranked **down** as stale. Cautions and
+  lessons about a file the dispatch will touch rank **above** engagement-level
+  ones (file-in-play precision).
+- **Prior-sprint output is capped in the brief (#146).** Each dependent sprint's
+  injected upstream output is bounded (default ~8000 chars, `DARKMUX_SPRINT_CONTEXT_MAX_CHARS`)
+  so a long parent reply can't crowd a small model's window.
+
+### Internal
+- Test coverage for the fleet routing completion-matching path (#842).
+
 ## [1.8.0] - 2026-06-23
 
 The dispatch-to-PR loop learns from its own failures, gains a closing ceremony,
@@ -395,6 +433,7 @@ cluster of crew-index correctness repairs.
   idle machine's bar no longer stretches to the playhead; adds the first
   viewer-lifecycle e2e regression gate.
 
+[1.9.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.9.0
 [1.8.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.8.0
 [1.7.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.7.0
 [1.6.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.6.0
