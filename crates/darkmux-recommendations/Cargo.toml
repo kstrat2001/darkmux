@@ -1,6 +1,6 @@
 [package]
 name = "darkmux-recommendations"
-version = "1.8.0"
+version = "1.9.0"
 edition = "2021"
 description = "darkmux tier-aware recommendation registry (per-hardware-tier model picks)"
 license = "MIT"
