@@ -511,7 +511,12 @@ pub fn run(
     // detectors flagged on earlier dispatches in this mission (the auto-derived
     // doom-loop signal — sibling to the operator-authored corrections above).
     // Same provenance discipline: surface what's injected (#44).
-    let detected_cautions = mission_cautions(&mission_session_ids);
+    // (#1002) Files this dispatch is about to work on (from the sprint
+    // description) — used to rank file-in-play cautions + lessons above
+    // engagement-level ones, and to staleness-check cautions against the
+    // worktree's current content.
+    let intent = intent_files(&sprint.description);
+    let detected_cautions = mission_cautions(&mission_session_ids, &intent, &wt_path);
     if !detected_cautions.is_empty() {
         println!(
             "{}",
@@ -529,7 +534,7 @@ pub fn run(
     // (#994) Carry forward the operator-authored lessons for this engagement
     // — the authored + FOLLOW-framed sibling of the detected cautions.
     // Surface what's injected (provenance, #44).
-    let lessons = engagement_lessons();
+    let lessons = engagement_lessons(&intent);
     if !lessons.is_empty() {
         println!(
             "{}",
@@ -1156,6 +1161,71 @@ fn mission_adjudication_notes(mission_session_ids: &std::collections::HashSet<St
     notes
 }
 
+/// (#1002, ported from `runtime/src/loop_runner.rs` #471 per the no-cross-
+/// workspace-dep convention) Lexically clean a path — drop `.` components, fold
+/// `..` against the preceding normal component, drop trailing separators —
+/// without touching the filesystem. Applied to BOTH the stored caution/lesson
+/// `file` keys AND the dispatch-intent files at match time, so `./src/x`,
+/// `src/x/`, and `src/../src/x` all compare equal.
+fn normalize_path_lexical(p: &str) -> String {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in Path::new(p).components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else {
+                    out.push("..");
+                }
+            }
+            Component::RootDir => out.push(std::path::MAIN_SEPARATOR.to_string()),
+            Component::Prefix(pre) => out.push(pre.as_os_str()),
+            Component::Normal(seg) => out.push(seg),
+        }
+    }
+    out.to_string_lossy().into_owned()
+}
+
+/// (#1002) The files a dispatch is about to work on, derived from the sprint
+/// description — the source knowable at brief-assembly time (a git diff is empty
+/// here; precise files-in-play is the deferred #219-fed Half B). Conservative
+/// tokenizer (no `regex` dep): a token is a candidate path when, after stripping
+/// surrounding punctuation/backticks, it is made only of path-safe characters
+/// AND either contains a `/` or ends in a known code extension — so `src/foo.rs`
+/// and `Cargo.toml` match but prose like `e.g.` or `American.` does not. Returns
+/// the NORMALIZED set for direct comparison against normalized stored keys.
+fn intent_files(description: &str) -> std::collections::HashSet<String> {
+    const CODE_EXTS: &[&str] = &[
+        ".rs", ".toml", ".json", ".md", ".ts", ".js", ".py", ".html", ".css", ".sh", ".yaml",
+        ".yml", ".sql", ".txt",
+    ];
+    let path_safe = |s: &str| {
+        !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
+    };
+    description
+        .split(|c: char| c.is_whitespace() || matches!(c, '`' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':' | '<' | '>'))
+        .map(|t| t.trim_matches(|c: char| matches!(c, '.' | '/' | '-')))
+        .filter(|t| {
+            path_safe(t)
+                && (t.contains('/') || CODE_EXTS.iter().any(|e| t.to_ascii_lowercase().ends_with(e)))
+        })
+        .map(normalize_path_lexical)
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+/// (#1002) BLAKE3 hex of `file` under `workspace_root` right now, for the
+/// staleness check against a caution's firing-time `code_hash` (#1001). Same
+/// algorithm + raw-bytes framing as the runtime captured with, so an unchanged
+/// file matches. Best-effort: a missing/unreadable file → `None` (treated as
+/// "unknown freshness", never stale — we don't bury what we can't verify).
+fn current_file_blake3(workspace_root: &Path, file: &str) -> Option<String> {
+    let bytes = std::fs::read(workspace_root.join(file)).ok()?;
+    Some(blake3::hash(&bytes).to_hex().to_string())
+}
+
 /// (#994 retrieve+inject) The loop pathologies darkmux's detectors flagged
 /// across this mission's earlier dispatches, for injection into the next coder
 /// brief — the doom-loop fix's AUTO-DERIVED half (sibling to the operator-
@@ -1170,15 +1240,28 @@ fn mission_adjudication_notes(mission_session_ids: &std::collections::HashSet<St
 /// index's derive-on-rebuild freshness (the index serves the query/recall +
 /// status surface; this hot per-dispatch path mirrors the corrections
 /// collector). Scoped to the mission's EXACT dispatch session ids (exact-set,
-/// not a `mission-run-<id>-` prefix — same sibling-bleed guard as #849). Ranked
-/// severity-then-recency, deduped, capped at `MAX_INJECTED_CAUTIONS` over the
-/// most-recent `CAUTION_LOOKBACK_DAYS` day-files — the same focus + flat-scan-
-/// cost discipline as the corrections, but ranked SEVERITY-first where the
-/// corrections collector is recency-only (a high-severity older cycle should
-/// outrank a low-severity recent stall — deliberate divergence, don't "fix" it
-/// to match the sibling). Best-effort: any IO/parse problem reads as "no
-/// cautions" (the loop just doesn't get the carry-forward, never errors).
-fn mission_cautions(mission_session_ids: &std::collections::HashSet<String>) -> Vec<String> {
+/// not a `mission-run-<id>-` prefix — same sibling-bleed guard as #849), deduped,
+/// capped at `MAX_INJECTED_CAUTIONS` over the most-recent `CAUTION_LOOKBACK_DAYS`
+/// day-files. (#1002) Ranked **file-in-play first** (a caution about a file this
+/// dispatch will touch — per `intent` — outranks an engagement-level one), then
+/// **fresh over stale** (a caution whose firing-time `code_hash` (#1001) no
+/// longer matches the file's current content under `workspace_root` is
+/// de-prioritized — the pathology may not survive the change), then
+/// **severity** (a high-severity older cycle outranks a low-severity recent
+/// stall — deliberate divergence from the recency-only corrections sibling),
+/// then **recency**. Best-effort: any IO/parse problem reads as "no cautions"
+/// (the loop just doesn't get the carry-forward, never errors).
+///
+/// (#994 QA / #1002) The `category=telemetry` + `source=detector` predicate
+/// below is the Value-based twin of the typed `is_detector_caution` in
+/// `darkmux_crew::index` — they classify the same records from different
+/// representations. Keep them in sync: a change to `source`/`category` semantics
+/// must update BOTH.
+fn mission_cautions(
+    mission_session_ids: &std::collections::HashSet<String>,
+    intent: &std::collections::HashSet<String>,
+    workspace_root: &Path,
+) -> Vec<String> {
     const CAUTION_LOOKBACK_DAYS: usize = 7;
     const MAX_INJECTED_CAUTIONS: usize = 10;
     if mission_session_ids.is_empty() {
@@ -1201,9 +1284,10 @@ fn mission_cautions(mission_session_ids: &std::collections::HashSet<String>) -> 
         .cloned()
         .collect();
 
-    // (severity_rank, ts, bullet) — sorted severity-then-recency below, then
-    // deduped (a pathology that recurred verbatim shouldn't repeat) and capped.
-    let mut found: Vec<(u8, String, String)> = Vec::new();
+    // (match, fresh, severity_rank, ts, bullet) — sorted file-in-play-first,
+    // then fresh-over-stale, then severity, then recency below; deduped (a
+    // pathology that recurred verbatim shouldn't repeat) and capped.
+    let mut found: Vec<(u8, u8, u8, String, String)> = Vec::new();
     for day in &recent {
         let Ok(raw) = std::fs::read_to_string(day) else {
             continue;
@@ -1234,30 +1318,52 @@ fn mission_cautions(mission_session_ids: &std::collections::HashSet<String>) -> 
             }
             let kind = pstr("kind").unwrap_or("caution");
             let severity = pstr("severity").unwrap_or("warn");
-            let file = payload
-                .and_then(|p| p.get("area"))
+            let area = payload.and_then(|p| p.get("area"));
+            let file = area
                 .and_then(|a| a.get("files"))
                 .and_then(|f| f.as_array())
                 .and_then(|arr| arr.first())
                 .and_then(|v| v.as_str());
+            let code_hash = area.and_then(|a| a.get("code_hash")).and_then(|v| v.as_str());
             let ts = r.get("ts").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let bullet = match file {
                 Some(f) => format!("- [{kind}] {detail} (in `{f}`)"),
                 None => format!("- [{kind}] {detail}"),
             };
+            // (#1002) File-in-play boost: a caution about a file this dispatch
+            // will touch (normalized-path match against `intent`) outranks an
+            // engagement-level one.
+            let norm = file.map(normalize_path_lexical);
+            let is_match = norm.as_deref().is_some_and(|f| intent.contains(f)) as u8;
+            // (#1002 + #1001) Freshness: stale only when the firing-time hash is
+            // present AND the file is readable now AND the content differs.
+            // "Unknown freshness" (no hash / unreadable) stays fresh — never
+            // bury what we can't verify (exact-string compare, see #1002 note).
+            let fresh = match (code_hash, norm.as_deref()) {
+                (Some(h), Some(f)) => match current_file_blake3(workspace_root, f) {
+                    Some(cur) => (cur == h) as u8,
+                    None => 1,
+                },
+                _ => 1,
+            };
             // `warn` outranks `info`; any other value (incl. a future severity
             // above `warn`) floors to 0 — today only `warn`/`info` are emitted,
             // so revisit this line if a higher severity is ever introduced.
             let rank = if severity == "warn" { 1u8 } else { 0u8 };
-            found.push((rank, ts, bullet));
+            found.push((is_match, fresh, rank, ts, bullet));
         }
     }
-    // Highest severity first, then most recent (ts is RFC3339 — lexicographic
-    // == chronological).
-    found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    // File-in-play first, then fresh-over-stale, then severity, then most recent
+    // (ts is RFC3339 — lexicographic == chronological).
+    found.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| b.3.cmp(&a.3))
+    });
     let mut seen = std::collections::HashSet::new();
     let mut out: Vec<String> = Vec::new();
-    for (_, _, bullet) in found {
+    for (_, _, _, _, bullet) in found {
         if seen.insert(bullet.clone()) {
             out.push(bullet);
             if out.len() >= MAX_INJECTED_CAUTIONS {
@@ -1281,7 +1387,7 @@ fn mission_cautions(mission_session_ids: &std::collections::HashSet<String>) -> 
 /// lessons" and never errors the dispatch (mirrors the cautions +
 /// corrections collectors). Capped; formatted as bullets (the "why" rides in
 /// the body).
-fn engagement_lessons() -> Vec<String> {
+fn engagement_lessons(intent: &std::collections::HashSet<String>) -> Vec<String> {
     use crew::lessons;
     const MAX_INJECTED_LESSONS: usize = 12;
     let repo_path = lessons::repo_db_path();
@@ -1291,6 +1397,20 @@ fn engagement_lessons() -> Vec<String> {
     if global_path != repo_path {
         entries.extend(lessons::load_entries_best_effort(&global_path));
     }
+    // (#1002) File-in-play boost: a lesson scoped to a file this dispatch will
+    // touch (normalized-path match against `intent`) sorts ahead of
+    // engagement-level ones, so the cap keeps the most relevant. Stable sort
+    // preserves the store's updated_ts-DESC order within each group. Lessons
+    // carry no firing-time hash, so there's no staleness dimension here.
+    entries.sort_by_key(|e| {
+        let in_play = e
+            .file
+            .as_deref()
+            .map(normalize_path_lexical)
+            .is_some_and(|f| intent.contains(&f));
+        // `false` < `true`, so negate to put matches first under ascending sort.
+        !in_play
+    });
     entries
         .into_iter()
         .take(MAX_INJECTED_LESSONS)
@@ -1411,7 +1531,15 @@ fn gather_debrief(mission_id: &str) -> Result<DebriefReport> {
                 )
             })
             .collect(),
-        cautions: mission_cautions(&mission_session_ids),
+        // (#1002) A debrief is retrospective — no active dispatch, so no
+        // files-in-play (empty `intent`); the operator's cwd is the natural
+        // "current content" root for the staleness check (a caution whose file
+        // has since changed sorts down, which reads fine in a summary too).
+        cautions: mission_cautions(
+            &mission_session_ids,
+            &std::collections::HashSet::new(),
+            &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        ),
         corrections: mission_adjudication_notes(&mission_session_ids),
     })
 }
@@ -2583,7 +2711,7 @@ mod tests {
             )
             .unwrap();
         }
-        let conv = engagement_lessons();
+        let conv = engagement_lessons(&std::collections::HashSet::new());
 
         unsafe {
             match prev {
@@ -2600,6 +2728,40 @@ mod tests {
         assert!(
             conv.iter().any(|c| c.contains("Bound retries") && c.contains("(in `loop.rs`)")),
             "file scope rendered as the 'where': {conv:?}"
+        );
+    }
+
+    /// (#1002) A lesson scoped to a file this dispatch will touch sorts ahead of
+    /// an engagement-level one, even when the engagement-level lesson is newer
+    /// (so the boost — not mere recency — is what flips the order). `#[serial]`
+    /// — mutates DARKMUX_HOME.
+    #[test]
+    #[serial_test::serial]
+    fn engagement_lessons_boosts_file_in_play() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
+        {
+            let conn = crew::lessons::open_at(&crew::lessons::repo_db_path()).unwrap();
+            // file-scoped lesson added FIRST (older updated_ts)...
+            crew::lessons::add(&conn, "Target rule", "why", Some("./src/target.rs"), None).unwrap();
+            // ...engagement-level lesson added SECOND (newer) — by recency this
+            // would come first; the file-in-play boost must put the target first.
+            crew::lessons::add(&conn, "House style", "applies everywhere", None, None).unwrap();
+        }
+        let intent: std::collections::HashSet<String> =
+            ["src/target.rs"].iter().map(|s| s.to_string()).collect();
+        let got = engagement_lessons(&intent);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        assert_eq!(got.len(), 2);
+        assert!(
+            got[0].contains("Target rule"),
+            "file-in-play lesson ranks first despite being older: {got:?}"
         );
     }
 
@@ -2640,8 +2802,12 @@ mod tests {
                 .iter()
                 .map(|s| s.to_string())
                 .collect();
-        let cautions = mission_cautions(&auth_ids);
-        let unknown = mission_cautions(&std::collections::HashSet::new());
+        // Empty intent + a root with no matching files: no file-in-play boost
+        // and (no code_hash on these records) no staleness reorder, so this
+        // exercises the severity-then-recency fallthrough unchanged.
+        let no_intent = std::collections::HashSet::new();
+        let cautions = mission_cautions(&auth_ids, &no_intent, tmp.path());
+        let unknown = mission_cautions(&std::collections::HashSet::new(), &no_intent, tmp.path());
 
         unsafe {
             match prev {
@@ -2670,6 +2836,120 @@ mod tests {
             "non-telemetry category excluded: {cautions:?}"
         );
         assert!(unknown.is_empty(), "an empty session-id set reads as none");
+    }
+
+    // ─── (#1002) intent extraction + file-in-play / staleness ranking ────
+
+    #[test]
+    fn intent_files_extracts_path_like_tokens() {
+        let got = intent_files(
+            "Refactor the parser in `crates/darkmux-crew/src/lessons.rs` and bump Cargo.toml; \
+             e.g. tidy up. Touch ./src/main.rs too.",
+        );
+        assert!(got.contains("crates/darkmux-crew/src/lessons.rs"));
+        assert!(got.contains("Cargo.toml"));
+        assert!(got.contains("src/main.rs"), "normalized ./src/main.rs: {got:?}");
+        // Prose with a trailing dot is not a path.
+        assert!(!got.iter().any(|f| f == "e.g" || f == "g"));
+    }
+
+    #[test]
+    fn normalize_path_lexical_folds_equivalent_paths() {
+        assert_eq!(normalize_path_lexical("./src/x.rs"), "src/x.rs");
+        assert_eq!(normalize_path_lexical("src/../src/x.rs"), "src/x.rs");
+        assert_eq!(normalize_path_lexical("src/x.rs/"), "src/x.rs");
+    }
+
+    /// (#1002) A caution about a file this dispatch will touch (intent match)
+    /// outranks an engagement-level / other-file one, even when the other is
+    /// newer. `#[serial]` — mutates the shared DARKMUX_FLOWS_DIR.
+    #[test]
+    #[serial_test::serial]
+    fn mission_cautions_ranks_file_in_play_first() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("2026-06-22.jsonl"),
+            concat!(
+                // older caution on the file in play (normalized match for `./src/target.rs`)
+                r#"{"ts":"2026-06-22T10:00:00Z","category":"telemetry","source":"detector","session_id":"mission-run-m-s1","payload":{"kind":"cycle","severity":"warn","detail":"on the target","area":{"files":["src/target.rs"]}}}"#, "\n",
+                // NEWER, same-severity caution on an unrelated file
+                r#"{"ts":"2026-06-22T12:00:00Z","category":"telemetry","source":"detector","session_id":"mission-run-m-s1","payload":{"kind":"cycle","severity":"warn","detail":"on something else","area":{"files":["src/other.rs"]}}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path()) };
+
+        let ids: std::collections::HashSet<String> =
+            ["mission-run-m-s1"].iter().map(|s| s.to_string()).collect();
+        let intent: std::collections::HashSet<String> =
+            ["src/target.rs"].iter().map(|s| s.to_string()).collect();
+        // workspace_root has no such files → no code_hash on records anyway → no
+        // staleness reorder; this isolates the file-in-play boost.
+        let cautions = mission_cautions(&ids, &intent, tmp.path());
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+        assert_eq!(cautions.len(), 2);
+        assert!(
+            cautions[0].contains("on the target"),
+            "file-in-play caution ranks first despite being older: {cautions:?}"
+        );
+    }
+
+    /// (#1002 + #1001) A caution whose firing-time `code_hash` no longer matches
+    /// the file's current content (stale) is de-prioritized below a fresh one.
+    /// `#[serial]` — mutates the shared DARKMUX_FLOWS_DIR.
+    #[test]
+    #[serial_test::serial]
+    fn mission_cautions_ranks_fresh_over_stale() {
+        let ws = tempfile::TempDir::new().unwrap();
+        // The "fresh" file: its current content hashes to what we'll record.
+        std::fs::write(ws.path().join("fresh.rs"), b"fn fresh() {}").unwrap();
+        let fresh_hash = blake3::hash(b"fn fresh() {}").to_hex().to_string();
+        // The "stale" file exists but its content differs from the recorded hash.
+        std::fs::write(ws.path().join("stale.rs"), b"fn changed() {}").unwrap();
+        let stale_recorded_hash = blake3::hash(b"fn ORIGINAL() {}").to_hex().to_string();
+
+        let flows = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            flows.path().join("2026-06-22.jsonl"),
+            format!(
+                concat!(
+                    // stale caution (recorded hash != current content), NEWER
+                    r#"{{"ts":"2026-06-22T12:00:00Z","category":"telemetry","source":"detector","session_id":"mission-run-m-s1","payload":{{"kind":"cycle","severity":"warn","detail":"stale one","area":{{"files":["stale.rs"],"code_hash":"{stale}"}}}}}}"#, "\n",
+                    // fresh caution (recorded hash == current content), older
+                    r#"{{"ts":"2026-06-22T10:00:00Z","category":"telemetry","source":"detector","session_id":"mission-run-m-s1","payload":{{"kind":"cycle","severity":"warn","detail":"fresh one","area":{{"files":["fresh.rs"],"code_hash":"{fresh}"}}}}}}"#, "\n",
+                ),
+                stale = stale_recorded_hash,
+                fresh = fresh_hash,
+            ),
+        )
+        .unwrap();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", flows.path()) };
+
+        let ids: std::collections::HashSet<String> =
+            ["mission-run-m-s1"].iter().map(|s| s.to_string()).collect();
+        // No intent match for either (neither file is in play) so the only
+        // discriminator is freshness.
+        let cautions = mission_cautions(&ids, &std::collections::HashSet::new(), ws.path());
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+        assert_eq!(cautions.len(), 2);
+        assert!(
+            cautions[0].contains("fresh one"),
+            "fresh caution outranks the newer-but-stale one: {cautions:?}"
+        );
     }
 
     /// (#849 half 1) The brief-injection reader: collects adjudication notes
