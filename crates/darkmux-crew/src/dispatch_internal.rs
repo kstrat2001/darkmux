@@ -2595,7 +2595,12 @@ fn resolve_utility_model_internal(config_path: Option<&str>) -> Option<String> {
 /// default-model → `n_ctx` rule has a single source of truth. Returns
 /// `None` only when the registry/profile can't be resolved — the same edge
 /// cases that send model selection to `probe_loaded_model()`.
-fn resolve_context_window_internal(
+// `pub` so the mission-run brief path can size its proportional injected-context
+// budget (#1011) from the SAME profile resolver the runtime uses for its
+// compaction window. They share the resolver; a profile that declares no
+// `context_window` falls back independently on each side (the budget to its own
+// default), so they agree whenever the profile actually declares a window.
+pub fn resolve_context_window_internal(
     profile_override: Option<&str>,
     config_path: Option<&str>,
 ) -> Option<u32> {
