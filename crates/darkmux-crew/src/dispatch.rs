@@ -743,11 +743,39 @@ fn sprint_output_path(mission_id: &str, sprint_id: &str) -> PathBuf {
     crate::lifecycle::sprints_dir(mission_id).join(format!("{sprint_id}-output.txt"))
 }
 
+/// (#146 residual) Default per-parent cap, in chars, on injected prior-sprint
+/// output. A parent's recorded reply can be long; without a bound, a dependent
+/// dispatch's brief grows with every upstream hop and can crowd a small model's
+/// window. ~8000 chars ≈ 2000 tokens — generous for a sprint summary. Operator-
+/// tunable per dispatch via `DARKMUX_SPRINT_CONTEXT_MAX_CHARS`.
+const DEFAULT_SPRINT_CONTEXT_MAX_CHARS: usize = 8000;
+
+/// The per-parent prior-sprint-output cap: `env(DARKMUX_SPRINT_CONTEXT_MAX_CHARS)`
+/// when set + parseable, else the default. `0` disables the cap (inject in full).
+fn sprint_context_max_chars() -> usize {
+    std::env::var("DARKMUX_SPRINT_CONTEXT_MAX_CHARS")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_SPRINT_CONTEXT_MAX_CHARS)
+}
+
+/// Truncate a parent's output to `max` chars (char-safe, never mid-UTF-8),
+/// appending a marker that names the full source so the agent knows it's seeing
+/// a head. `max == 0` means "no cap" (return as-is). Pure, for testability.
+fn cap_parent_output(content: &str, max: usize) -> String {
+    if max == 0 || content.chars().count() <= max {
+        return content.to_string();
+    }
+    let head: String = content.chars().take(max).collect();
+    format!("{head}\n\n[… output truncated at {max} chars; full text in the sprint's output file]")
+}
+
 /// Resolve the dispatch message: when `sprint_id` is `Some(id)`, look
 /// up the sprint's `depends_on` parents and prepend each parent's
-/// recorded output as a "Prior sprint outputs" context block. Returns
-/// the augmented message (or the original message unchanged if there
-/// are no parents, no recorded outputs, or no sprint_id at all).
+/// recorded output (capped per [`sprint_context_max_chars`]) as a "Prior
+/// sprint outputs" context block. Returns the augmented message (or the
+/// original message unchanged if there are no parents, no recorded outputs,
+/// or no sprint_id at all).
 ///
 /// One-hop only — transitive ancestors are NOT walked. Stage 1 scope
 /// per #146. The two-hop / DAG / context-budget refinements are Stage 2.
@@ -800,13 +828,17 @@ fn augment_message_with_sprint_context(
     // Per-mission layout (#148): parent sprints are assumed to live in the
     // same mission as the child sprint. Output files are co-located with
     // sprint manifests under `missions/<mission_id>/sprints/`.
+    let max_chars = sprint_context_max_chars();
     let mut parent_blocks: Vec<String> = Vec::new();
     let mut missing_parents: Vec<String> = Vec::new();
     for parent_id in &sprint.depends_on {
         let path = sprint_output_path(&sprint.mission_id, parent_id);
         match fs::read_to_string(&path) {
             Ok(content) if !content.trim().is_empty() => {
-                parent_blocks.push(format!("### {parent_id}\n\n{}\n", content.trim_end()));
+                // (#146 residual) Bound each parent's output so a long upstream
+                // reply can't blow the dependent dispatch's brief.
+                let capped = cap_parent_output(content.trim_end(), max_chars);
+                parent_blocks.push(format!("### {parent_id}\n\n{capped}\n"));
             }
             _ => {
                 missing_parents.push(parent_id.clone());
@@ -2463,6 +2495,92 @@ mod tests {
             match prev {
                 Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
                 None => std::env::remove_var("DARKMUX_CREW_DIR"),
+            }
+        }
+    }
+
+    /// (#146 residual) `sprint_context_max_chars` precedence: env (parseable) >
+    /// default; unparseable/absent → default; `0` honored (disables the cap).
+    #[test]
+    #[serial_test::serial]
+    fn sprint_context_max_chars_env_precedence() {
+        let prev = std::env::var("DARKMUX_SPRINT_CONTEXT_MAX_CHARS").ok();
+        unsafe { std::env::remove_var("DARKMUX_SPRINT_CONTEXT_MAX_CHARS") };
+        assert_eq!(sprint_context_max_chars(), DEFAULT_SPRINT_CONTEXT_MAX_CHARS, "absent → default");
+        unsafe { std::env::set_var("DARKMUX_SPRINT_CONTEXT_MAX_CHARS", " 1234 ") };
+        assert_eq!(sprint_context_max_chars(), 1234, "env (trimmed) wins");
+        unsafe { std::env::set_var("DARKMUX_SPRINT_CONTEXT_MAX_CHARS", "0") };
+        assert_eq!(sprint_context_max_chars(), 0, "0 honored (disables cap)");
+        unsafe { std::env::set_var("DARKMUX_SPRINT_CONTEXT_MAX_CHARS", "not-a-number") };
+        assert_eq!(sprint_context_max_chars(), DEFAULT_SPRINT_CONTEXT_MAX_CHARS, "unparseable → default");
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_SPRINT_CONTEXT_MAX_CHARS", v),
+                None => std::env::remove_var("DARKMUX_SPRINT_CONTEXT_MAX_CHARS"),
+            }
+        }
+    }
+
+    /// (#146 residual) The per-parent output cap: under the cap → unchanged;
+    /// over → char-safe head + marker; `0` → no cap.
+    #[test]
+    fn cap_parent_output_truncates_and_marks() {
+        assert_eq!(cap_parent_output("short", 100), "short", "under cap → unchanged");
+        let long = "x".repeat(500);
+        let capped = cap_parent_output(&long, 100);
+        assert!(capped.starts_with(&"x".repeat(100)), "keeps the head");
+        assert!(capped.contains("truncated at 100 chars"), "marks the truncation: {capped}");
+        assert!(capped.chars().count() < 500, "actually shorter than the input");
+        assert_eq!(cap_parent_output(&long, 0), long, "0 disables the cap");
+        // Char-safe: a multi-byte boundary must not panic / corrupt.
+        let multi = "🦀".repeat(50);
+        let c = cap_parent_output(&multi, 10);
+        assert!(c.starts_with(&"🦀".repeat(10)) && !c.contains('\u{FFFD}'), "no mid-codepoint split");
+    }
+
+    /// (#146 residual) End-to-end: a long parent output is truncated in the
+    /// augmented brief, honoring `DARKMUX_SPRINT_CONTEXT_MAX_CHARS`. `#[serial]`
+    /// — mutates DARKMUX_CREW_DIR + the cap env.
+    #[test]
+    #[serial_test::serial]
+    fn augment_message_caps_long_parent_output() {
+        let tmp = TempDir::new().unwrap();
+        let prev_crew = std::env::var("DARKMUX_CREW_DIR").ok();
+        let prev_cap = std::env::var("DARKMUX_SPRINT_CONTEXT_MAX_CHARS").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
+            std::env::set_var("DARKMUX_SPRINT_CONTEXT_MAX_CHARS", "50");
+        }
+        let sprints_dir = tmp.path().join("missions").join("m").join("sprints");
+        fs::create_dir_all(&sprints_dir).unwrap();
+        fs::write(
+            sprints_dir.join("parent.json"),
+            r#"{"id":"parent","mission_id":"m","description":"d","status":"done","depends_on":[],"created_ts":0}"#,
+        ).unwrap();
+        fs::write(
+            sprints_dir.join("child.json"),
+            r#"{"id":"child","mission_id":"m","description":"d","status":"planned","depends_on":["parent"],"created_ts":0}"#,
+        ).unwrap();
+        let unique_tail = "TAIL_MARKER_THAT_MUST_NOT_SURVIVE";
+        fs::write(
+            sprints_dir.join("parent-output.txt"),
+            format!("{}{unique_tail}", "h".repeat(200)),
+        )
+        .unwrap();
+
+        let result = augment_message_with_sprint_context(Some("child"), "task body").unwrap();
+        assert!(result.contains("truncated at 50 chars"), "cap marker present: {result}");
+        assert!(!result.contains(unique_tail), "the over-cap tail must be dropped: {result}");
+        assert!(result.contains("task body"), "the task still rides along");
+
+        unsafe {
+            match prev_crew {
+                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
+                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+            }
+            match prev_cap {
+                Some(v) => std::env::set_var("DARKMUX_SPRINT_CONTEXT_MAX_CHARS", v),
+                None => std::env::remove_var("DARKMUX_SPRINT_CONTEXT_MAX_CHARS"),
             }
         }
     }
