@@ -1001,8 +1001,21 @@ fn coder_brief(
         ),
         _ => sprint.description.clone(),
     };
-    let mut out = base;
+    append_injected_blocks(base, lessons, prior_corrections, cautions)
+}
 
+/// (#994 / #1004) Append the three injected-context blocks — authored lessons
+/// (FOLLOW), prior adjudication corrections (verify-then-apply), and detected
+/// cautions (avoid-the-dead-end) — to `out`, each independent (any/all/none
+/// appear). Extracted from [`coder_brief`] so the loop-lab A/B (#1004) can build
+/// the SAME blocks, with the SAME wrapper framing, that a real dispatch injects
+/// — one source of truth, so the bench measures the real thing.
+fn append_injected_blocks(
+    mut out: String,
+    lessons: &[String],
+    prior_corrections: &[String],
+    cautions: &[String],
+) -> String {
     // (#994) Operator-AUTHORED engagement lessons — the lessons store's read
     // side, the authored sibling of the auto-detected cautions below. FOLLOW
     // framing, not verify: these are the rules the team actually follows + the
@@ -1100,6 +1113,53 @@ fn coder_brief(
     }
 
     out
+}
+
+/// (#1004) Build the engagement-context blocks the loop-lab A/B injects — the
+/// SAME `<lessons>` / `<prior-adjudication-corrections>` / `<detected-cautions>`
+/// blocks a real coder dispatch gets, run through the SAME #1011 budget, so the
+/// bench measures the real thing. With a `mission_id`, corrections + cautions
+/// scope to that mission's sessions; without one, only the repo's authored
+/// lessons inject. `workspace_root` is the tree the staleness check reads.
+/// Returns the blocks alone (no task), empty when nothing applies. `profile` +
+/// `profiles_file` size the #1011 budget against the SAME profile window the
+/// dispatch will use (so the A/B truncates context the way the shipped config
+/// would), matching the lab's `--profile` / `--profiles-file`.
+pub(crate) fn injected_context_for_lab(
+    mission_id: Option<&str>,
+    workspace_root: &Path,
+    profile: Option<&str>,
+    profiles_file: Option<&str>,
+) -> String {
+    use crew::loader::load_sprints;
+    // No sprint at lab time → no files-in-play; lessons/cautions still inject at
+    // engagement scope.
+    let intent = std::collections::HashSet::new();
+    let (corrections, cautions) = match mission_id {
+        Some(mid) => {
+            let ids: std::collections::HashSet<String> = load_sprints()
+                .unwrap_or_default()
+                .iter()
+                .filter(|s| s.mission_id.as_str() == mid)
+                .map(|s| format!("mission-run-{}-{}", mid, s.id))
+                .collect();
+            (
+                mission_adjudication_notes(&ids),
+                mission_cautions(&ids, &intent, workspace_root),
+            )
+        }
+        None => (Vec::new(), Vec::new()),
+    };
+    let lessons = engagement_lessons(&intent);
+    let budget = injected_budget_chars(
+        crew::dispatch_internal::resolve_context_window_internal(profile, profiles_file),
+    );
+    let (c, ca, l) = allocate_injected_context(corrections, cautions, lessons, budget);
+    // append_injected_blocks prefixes each block with "\n\n"; drop the leading
+    // blank lines so the result is a clean prepend for the lab prompt.
+    append_injected_blocks(String::new(), &l, &c, &ca)
+        .trim_start()
+        .to_string()
 }
 
 /// (#849 half 1) The adjudication corrections recorded across this mission's
@@ -2885,6 +2945,33 @@ mod tests {
             got[0].contains("Target rule"),
             "file-in-play lesson ranks first despite being older: {got:?}"
         );
+    }
+
+    /// (#1004) The loop-lab A/B context builder wraps the repo's authored
+    /// lessons in the real `<lessons>` block (no mission → no cautions). The
+    /// block is the same one a coder dispatch would inject (shared
+    /// `append_injected_blocks`). `#[serial]` — mutates DARKMUX_HOME.
+    #[test]
+    #[serial_test::serial]
+    fn injected_context_for_lab_builds_the_lessons_block() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
+        {
+            let conn = crew::lessons::open_at(&crew::lessons::repo_db_path()).unwrap();
+            crew::lessons::add(&conn, "American English", "house style across all work", None, None)
+                .unwrap();
+        }
+        let ctx = injected_context_for_lab(None, tmp.path(), None, None);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        assert!(ctx.starts_with("<lessons>"), "real lessons block, no leading blanks: {ctx:?}");
+        assert!(ctx.contains("American English") && ctx.contains("house style"), "{ctx:?}");
+        assert!(!ctx.contains("<detected-cautions>"), "no mission → no cautions block: {ctx:?}");
     }
 
     /// (#994 retrieve+inject) The caution reader: collects detector telemetry

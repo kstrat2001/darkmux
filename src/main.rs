@@ -1190,6 +1190,19 @@ enum LabCmd {
         /// Context window (tokens) the compaction formula trigger uses.
         #[arg(long = "context-window")]
         context_window: Option<u32>,
+        // ── (#1004) engagement-context A/B ──────────────────────────
+        /// Run the workload TWICE — once WITH the engagement-context blocks
+        /// (lessons + detected cautions) injected into the prompt, once
+        /// WITHOUT — and report the verdict shift. Validates the doom-loop
+        /// cure: does injected institutional memory change loop behavior?
+        #[arg(long)]
+        ab: bool,
+        /// Scope the injected cautions + corrections to this mission's
+        /// dispatches (its `mission-run-<id>-<sprint>` sessions). Without it,
+        /// only the repo's authored lessons inject. Requires `--ab` (clap
+        /// errors otherwise, so the flag is never a silent no-op).
+        #[arg(long = "inject-from-mission", requires = "ab")]
+        inject_from_mission: Option<String>,
         /// Emit the loop report as JSON instead of the human table.
         #[arg(long)]
         json: bool,
@@ -3566,6 +3579,7 @@ fn cmd_lab(sub: LabCmd) -> Result<i32> {
                 runtime: runtime_flag,
                 runtime_cmd,
                 loop_override: None,
+                inject_context: None,
             })?;
             if !quiet {
                 println!("\n{} run(s) complete:", outcomes.len());
@@ -3587,6 +3601,8 @@ fn cmd_lab(sub: LabCmd) -> Result<i32> {
             compact_strategy,
             bail_after_compactions,
             context_window,
+            ab,
+            inject_from_mission,
             json,
         } => cmd_lab_loop(LabLoopArgs {
             workload,
@@ -3600,6 +3616,8 @@ fn cmd_lab(sub: LabCmd) -> Result<i32> {
             compact_strategy,
             bail_after_compactions,
             context_window,
+            ab,
+            inject_from_mission,
             json,
         }),
         LabCmd::Runs { limit, all } => {
@@ -3758,6 +3776,8 @@ struct LabLoopArgs {
     compact_strategy: Option<String>,
     bail_after_compactions: Option<u32>,
     context_window: Option<u32>,
+    ab: bool,
+    inject_from_mission: Option<String>,
     json: bool,
 }
 
@@ -3859,56 +3879,141 @@ fn cmd_lab_loop(args: LabLoopArgs) -> Result<i32> {
         std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", n.to_string());
     }
 
-    // ── run the single dispatch ──────────────────────────────────────
-    // quiet in --json mode so stdout stays pure JSON; otherwise show the
-    // dispatch progress before the verdict.
-    let outcomes = darkmux_lab::lab::run::lab_run(darkmux_lab::lab::run::RunOpts {
-        workload_id: args.workload,
-        profile_name: args.profile,
-        runs: 1,
-        config_path: args.profiles,
-        quiet: args.json,
-        runtime: crew::dispatch::Runtime::Internal,
-        runtime_cmd: "openclaw".to_string(),
-        // When no compaction flag was set, pass `None` so the dispatch takes
-        // the exact `lab run` compaction path (caps still apply via env). The
-        // overlay only engages when there's something to override.
-        loop_override: if loop_override.is_empty() {
-            None
+    // ── run one arm of the bench (single dispatch + classify) ────────
+    // Cloned inputs so the A/B path (#1004) can call it twice with only the
+    // injected context varying. `inject` carries the engagement-context for the
+    // "with" arm; `None` is the baseline. quiet in --json mode so stdout stays
+    // pure JSON.
+    use darkmux_lab::lab::loop_report::Verdict;
+    let run_arm = |inject: Option<String>| -> Result<darkmux_lab::lab::loop_report::LoopReport> {
+        let outcomes = darkmux_lab::lab::run::lab_run(darkmux_lab::lab::run::RunOpts {
+            workload_id: args.workload.clone(),
+            profile_name: args.profile.clone(),
+            runs: 1,
+            config_path: args.profiles.clone(),
+            quiet: args.json,
+            runtime: crew::dispatch::Runtime::Internal,
+            runtime_cmd: "openclaw".to_string(),
+            // When no compaction flag was set, pass `None` so the dispatch takes
+            // the exact `lab run` compaction path (caps still apply via env).
+            loop_override: if loop_override.is_empty() {
+                None
+            } else {
+                Some(loop_override.clone())
+            },
+            inject_context: inject,
+        })?;
+        let outcome = outcomes
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("loop lab produced no run outcome"))?;
+        analyze_run(
+            &outcome.run_dir,
+            &outcome.run_id,
+            outcome.ok,
+            outcome.verify_passed,
+            outcome.duration_ms,
+            loop_config.clone(),
+        )
+    };
+
+    // Exit 0 when the loop achieved the task (productive or struggled-through);
+    // non-zero when it failed or — critically — falsely passed while inert.
+    let verdict_exit = |v: Verdict| match v {
+        Verdict::Productive | Verdict::Struggled => 0,
+        Verdict::InertFalsePass | Verdict::Failed => 1,
+    };
+
+    // ── (#1004) engagement-context A/B ───────────────────────────────
+    if args.ab {
+        let ws = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let ctx = crate::mission_run::injected_context_for_lab(
+            args.inject_from_mission.as_deref(),
+            &ws,
+            args.profile.as_deref(),
+            args.profiles.as_deref(),
+        );
+        if ctx.trim().is_empty() {
+            anyhow::bail!(
+                "--ab: nothing to inject — no authored lessons for this repo{}. \
+                 Record a lesson (`darkmux lessons add`){}, then retry.",
+                args.inject_from_mission
+                    .as_deref()
+                    .map(|m| format!(" and no detected cautions for mission `{m}`"))
+                    .unwrap_or_default(),
+                if args.inject_from_mission.is_some() {
+                    ""
+                } else {
+                    " or pass --inject-from-mission <id> to add a mission's cautions"
+                }
+            );
+        }
+        let ctx_chars = ctx.len();
+        if !args.json {
+            eprintln!("… A/B: baseline run (WITHOUT engagement-context)");
+        }
+        let without = run_arm(None)?;
+        if !args.json {
+            eprintln!("… A/B: treatment run (WITH {ctx_chars} chars of engagement-context)");
+        }
+        let with = run_arm(Some(ctx))?;
+
+        // Run ids are second-stamped; the two arms are sequential with a
+        // multi-second dispatch between, so they normally differ. Guard the
+        // (improbable) same-second collision — a shared run dir would merge
+        // trajectories and confound the very comparison this feature makes —
+        // so a confounded A/B is surfaced, never silently trusted (#44).
+        if with.run_id == without.run_id {
+            anyhow::bail!(
+                "A/B run-id collision (`{}`): both arms wrote the same run dir, so the \
+                 comparison would mix trajectories. Re-run `--ab` (the arms are sequential; \
+                 a second-boundary collision won't recur).",
+                with.run_id
+            );
+        }
+
+        // Rank the verdicts so the shift is a single signed comparison.
+        let rank = |v: Verdict| match v {
+            Verdict::Productive => 3,
+            Verdict::Struggled => 2,
+            Verdict::InertFalsePass => 1,
+            Verdict::Failed => 0,
+        };
+        let shift = match rank(with.verdict).cmp(&rank(without.verdict)) {
+            std::cmp::Ordering::Greater => "improved",
+            std::cmp::Ordering::Less => "regressed",
+            std::cmp::Ordering::Equal => "no-change",
+        };
+
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ab": true,
+                    "injected_context_chars": ctx_chars,
+                    "verdict_shift": shift,
+                    "without": without,
+                    "with": with,
+                }))?
+            );
         } else {
-            Some(loop_override)
-        },
-    })?;
+            println!("\n── engagement-context A/B (#1004) ──");
+            println!("  without context: {}", without.verdict.as_str());
+            println!("  with context:    {} ({ctx_chars} chars injected)", with.verdict.as_str());
+            println!("  verdict shift:   {shift}");
+        }
+        // The "with" arm is the configuration the operator would ship.
+        return Ok(verdict_exit(with.verdict));
+    }
 
-    let outcome = outcomes
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("loop lab produced no run outcome"))?;
-
-    // ── classify ─────────────────────────────────────────────────────
-    let report = analyze_run(
-        &outcome.run_dir,
-        &outcome.run_id,
-        outcome.ok,
-        outcome.verify_passed,
-        outcome.duration_ms,
-        loop_config,
-    )?;
-
+    // ── single run (default) ─────────────────────────────────────────
+    let report = run_arm(None)?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         darkmux_lab::lab::loop_report::print_report(&report);
     }
-
-    // Exit 0 when the loop achieved the task (productive or struggled-through);
-    // non-zero when it failed or — critically — falsely passed while inert, so
-    // a scripted bench surfaces those.
-    use darkmux_lab::lab::loop_report::Verdict;
-    Ok(match report.verdict {
-        Verdict::Productive | Verdict::Struggled => 0,
-        Verdict::InertFalsePass | Verdict::Failed => 1,
-    })
+    Ok(verdict_exit(report.verdict))
 }
 
 #[cfg(test)]
