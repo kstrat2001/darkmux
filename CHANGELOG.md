@@ -11,6 +11,58 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-06-23
+
+The dispatch-to-PR loop learns from its own failures, gains a closing ceremony,
+and the live observability viewer stops asserting state it can't see and starts
+showing what it actually observes.
+
+> **Cross-machine schema note.** `FLOW_SCHEMA` bumped **1.13.0 → 1.14.0**: the
+> dispatch lifecycle now emits a `Stage::Debrief` value (the NASA-vocabulary
+> rename of the old `retrospect` stage). A single machine is unaffected. In a
+> **mixed-version fleet**, upgrade every machine together — an older binary does
+> not recognize the `debrief` stage value in records written by a 1.8.0 peer.
+
+### Added
+- **Engagement-context layer — the doom-loop cure (#994).** The dispatch-to-PR
+  loop now closes the detect → distill → inject → don't-repeat loop. Detector
+  firings capture the engagement-context files they touched (#995); the index
+  derives **cautions** from the flow stream (#996); those cautions surface in
+  the next coder brief so a known failure is not silently re-walked (#997); and
+  a durable SQLite **lessons** store backs operator-authored conventions —
+  `darkmux lessons add/list` — which inject into the brief alongside the
+  auto-derived cautions (#998). Two tiers: per-repo and global.
+- **Mission debrief ceremony — `darkmux mission debrief <id>` (#1000).** A
+  closing read on a finished mission: sprint/mission status, the diffs and flow
+  history it produced, and a distiller skill (`darkmux-mission-debrief`) that
+  turns the run into reusable lessons. `mission close` now nudges toward it.
+
+### Changed
+- **NASA vocabulary, end to end (#999).** The engagement-context store and verb
+  are now **lessons** (was `knowledge`); the dispatch lifecycle's closing stage
+  is **`Debrief`** (was `Retrospect`), bumping `FLOW_SCHEMA` to 1.14.0 (see the
+  cross-machine note above). A vestigial index table was dropped.
+
+### Fixed
+- **Viewer derives liveness from the flow stream when Redis presence is down
+  (#1007).** With the presence substrate unreachable, running/ended state now
+  falls back to recent flow activity instead of showing an empty fleet.
+- **Per-dispatch drill-down scopes to the latest attempt (#1013).** A re-run no
+  longer blends the prior attempt's subsystem trace into the current one.
+- **Operator-state resolves to the user scope, not a project `Auto`-scope
+  (#1012).** `lessons add` in a repo no longer silently creates a project-local
+  `.darkmux/` that shadows the user's missions and lessons.
+- **doctor tags eureka rules by declared runtime, not a substring match (#1010).**
+  OpenClaw-only rules are suppressed without `--openclaw` by a `RuleKind::runtime()`
+  classification rather than matching the string "openclaw".
+- **Observability viewer shows observed state, not asserted fiction.** The
+  session CPU chart is relabeled **container CPU** — tool work, not the
+  inference that runs off-container in LMStudio (#814); the utility card and
+  machine spec line render the model's **observed** residency
+  (resident / registered-not-loaded / not-configured / not-reported) instead of
+  a hardcoded "resident" (#1008); and the spec line reports RAM in GiB so a
+  128 GB machine reads **128 GB**, not 137 (#1020).
+
 ## [1.7.0] - 2026-06-22
 
 Loop-engineering tooling and correctness: a bench for measuring how a dispatch
@@ -343,6 +395,7 @@ cluster of crew-index correctness repairs.
   idle machine's bar no longer stretches to the playhead; adds the first
   viewer-lifecycle e2e regression gate.
 
+[1.8.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.8.0
 [1.7.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.7.0
 [1.6.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.6.0
 [1.5.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.5.0
