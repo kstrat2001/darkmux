@@ -366,9 +366,22 @@ enum CrewCmd {
         /// `templates/builtin/roles/<id>.json` (or under
         /// `~/.darkmux/roles/`) AND a sibling `.md` prompt file.
         role: String,
-        /// Message body for the dispatch.
-        #[arg(long, short = 'm')]
-        message: String,
+        /// Message body for the dispatch. Mutually exclusive with
+        /// `--message-from-file`; exactly one of the two is required.
+        #[arg(
+            long,
+            short = 'm',
+            required_unless_present = "message_from_file",
+            conflicts_with = "message_from_file"
+        )]
+        message: Option<String>,
+        /// (#386) Read the message body from a file instead of the command
+        /// line — for substantial briefs that would exceed the shell's
+        /// ARG_MAX or clutter `ps`/shell history. Mutually exclusive with
+        /// `--message`. The brief is passed to the runtime via a bind-mounted
+        /// file, so it never lands on the `docker run` argv either.
+        #[arg(long = "message-from-file", value_name = "PATH")]
+        message_from_file: Option<std::path::PathBuf>,
         /// Optional delivery target in `<channel>:<target>` form
         /// (e.g. `discord:1500166601909993503`). When set, openclaw's
         /// reply is delivered to that channel in addition to being
@@ -2780,6 +2793,7 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
         CrewCmd::Dispatch {
             role,
             message,
+            message_from_file,
             deliver,
             session_id,
             timeout,
@@ -2794,6 +2808,20 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
             no_wait,
             image,
         } => {
+            // (#386) Resolve the message: exactly one of --message /
+            // --message-from-file is present (clap enforces the xor). Read the
+            // file when given so a substantial brief never has to fit on the
+            // command line.
+            let message = match (message, message_from_file) {
+                (Some(m), _) => m,
+                (None, Some(path)) => std::fs::read_to_string(&path)
+                    .with_context(|| format!("reading --message-from-file {}", path.display()))?,
+                (None, None) => {
+                    // Unreachable in practice (clap's required_unless_present),
+                    // but fail loud rather than dispatch an empty brief.
+                    anyhow::bail!("a message is required: pass --message or --message-from-file");
+                }
+            };
             // CLI default: if the operator didn't supply --watch, watch the
             // role's openclaw workspace dir. Library callers (e.g.
             // sprint_cli) pass an empty Vec directly to opt out.

@@ -1133,3 +1133,56 @@ fn crew_sync_refuses_to_write_without_yes() {
         "--dry-run must not write"
     );
 }
+
+/// (#386) `crew dispatch` accepts the message via `--message-from-file` and
+/// enforces the xor with `--message`. These fail before any container work, so
+/// they don't need docker / a model.
+#[test]
+fn crew_dispatch_message_from_file_flag_contract() {
+    // Mutual exclusion: --message AND --message-from-file → clap rejects.
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .args([
+            "crew",
+            "dispatch",
+            "code-reviewer",
+            "-m",
+            "inline",
+            "--message-from-file",
+            "/tmp/whatever",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+
+    // Neither → clap requires one (the error names --message as the required arg).
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .args(["crew", "dispatch", "code-reviewer"])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("required arguments were not provided")
+                .and(predicate::str::contains("--message")),
+        );
+
+    // Missing file → resolved early, fails loud BEFORE any dispatch setup
+    // (the message is resolved at the top of the handler, ahead of out-dir
+    // creation / container spawn).
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .args([
+            "crew",
+            "dispatch",
+            "code-reviewer",
+            "--message-from-file",
+            "/nonexistent/darkmux-386/brief.md",
+        ])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("message-from-file")
+                .and(predicate::str::contains("out-dir").not())
+                .and(predicate::str::contains("spawning").not()),
+        );
+}
