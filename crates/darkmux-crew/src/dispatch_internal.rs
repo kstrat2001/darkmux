@@ -2182,13 +2182,14 @@ fn detector_telemetry_payload(
         "detail": detail,
     });
 
-    // (#994 engagement-context capture, slice 1) Key the firing to the file it
-    // happened in, so this *caution* can later be retrieved for the same file
-    // and fed into the next dispatch's brief. Host-side we can derive
-    // `area.files` from the detector's own args; today only
-    // `dispatch.cycle.suspected` carries them (`canonical_args`). `code_hash` +
-    // `symbols` + tool-repeated-failure coverage need firing-time file access
-    // inside the container and are a runtime-side follow-up (slice 2).
+    // (#994 engagement-context capture) Key the firing to the file it happened
+    // in, so this *caution* can later be retrieved for the same file and fed
+    // into the next dispatch's brief. We derive `area.files` from the
+    // detector's own args. Slice 1 covered `dispatch.cycle.suspected`; #1001
+    // extended it to `dispatch.tool.repeated_failure` (now carries
+    // `canonical_args`) and added the firing-time `code_hash` (computed inside
+    // the container) for staleness ranking. (`symbols` remains a later
+    // refinement — the load-bearing staleness signal is the hash.)
     if let Some(area) = detector_area(event_type, event) {
         payload["area"] = area;
     }
@@ -2215,13 +2216,14 @@ fn detector_telemetry_payload(
 /// Returns `None` when no file path is derivable.
 fn detector_area(event_type: &str, event: &serde_json::Value) -> Option<serde_json::Value> {
     let path = match event_type {
-        "dispatch.cycle.suspected" => {
-            // Allowlist the file-editing tools: their canonical `path` is a
-            // target file. `search`'s `path` is a directory and `bash` carries
-            // a `command`, so a cycle in either is engagement-level, not
-            // file-scoped. Unknown tools (raw, unfiltered canonical args) fall
-            // through too. Clean-by-construction beats storing a directory in a
-            // field named `files`.
+        // (#1001) Both the cycle detector and the tool-failure-cascade detector
+        // carry the tool's `canonical_args`. Allowlist the file-editing tools:
+        // their canonical `path` is a target file. `search`'s `path` is a
+        // directory and `bash` carries a `command`, so a firing in either is
+        // engagement-level, not file-scoped. Unknown tools (raw, unfiltered
+        // canonical args) fall through too. Clean-by-construction beats storing
+        // a directory in a field named `files`.
+        "dispatch.cycle.suspected" | "dispatch.tool.repeated_failure" => {
             let tool = event.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
             if !matches!(tool, "read" | "edit" | "write") {
                 return None;
@@ -2235,7 +2237,14 @@ fn detector_area(event_type: &str, event: &serde_json::Value) -> Option<serde_js
     // way the detector `detail` is bounded (#237) — a pathologically long path
     // can't bloat the telemetry record.
     let path = cap_str(&path, MAX_TRAJ_FIELD_BYTES);
-    Some(serde_json::json!({ "files": [path] }))
+    let mut area = serde_json::json!({ "files": [path] });
+    // (#1001) Forward the runtime's firing-time content hash when present, so
+    // retrieval can rank this caution down once the file has changed
+    // (staleness). Bounded like the path; absent for a non-file tool.
+    if let Some(h) = event.get("code_hash").and_then(|v| v.as_str()) {
+        area["code_hash"] = serde_json::Value::String(cap_str(h, MAX_TRAJ_FIELD_BYTES));
+    }
+    Some(area)
 }
 
 /// (#994) Parse the target file path from a tool call's canonicalized JSON
@@ -5488,6 +5497,67 @@ mod tests {
         let file = payload["area"]["files"][0].as_str().expect("file string");
         assert!(file.len() <= MAX_TRAJ_FIELD_BYTES + 100, "path bounded near the cap");
         assert!(file.contains("[truncated"), "carries the marker");
+    }
+
+    /// (#1001) The firing-time `code_hash` the runtime captures is forwarded
+    /// into `area.code_hash` (for staleness ranking), alongside the file.
+    #[test]
+    fn detector_area_forwards_code_hash() {
+        let event = serde_json::json!({
+            "type": "dispatch.cycle.suspected",
+            "tool_name": "edit",
+            "canonical_args": r#"{"path":"src/a.rs"}"#,
+            "code_hash": "deadbeef",
+            "count": 3,
+            "window_size": 10,
+        });
+        let area = detector_area("dispatch.cycle.suspected", &event).expect("has area");
+        assert_eq!(area["files"][0], "src/a.rs");
+        assert_eq!(area["code_hash"], "deadbeef");
+    }
+
+    /// (#1001) A cycle on a file tool with no captured hash (non-code target)
+    /// still yields the file area, just without `code_hash`.
+    #[test]
+    fn detector_area_omits_code_hash_when_absent() {
+        let event = serde_json::json!({
+            "type": "dispatch.cycle.suspected",
+            "tool_name": "read",
+            "canonical_args": r#"{"path":"src/a.rs"}"#,
+            "count": 3,
+            "window_size": 10,
+        });
+        let area = detector_area("dispatch.cycle.suspected", &event).expect("has area");
+        assert_eq!(area["files"][0], "src/a.rs");
+        assert!(area.get("code_hash").is_none(), "no code_hash key when uncaptured");
+    }
+
+    /// (#1001) The tool-failure-cascade detector now carries `canonical_args`,
+    /// so a failure on a file-editing tool keys to its file + code_hash like a
+    /// cycle does; a failure on a non-file tool (`bash`) is engagement-level.
+    #[test]
+    fn detector_area_maps_tool_repeated_failure() {
+        let edit_fail = serde_json::json!({
+            "type": "dispatch.tool.repeated_failure",
+            "tool_name": "edit",
+            "canonical_args": r#"{"path":"src/b.rs"}"#,
+            "code_hash": "cafe",
+            "failure_count": 3,
+        });
+        let area = detector_area("dispatch.tool.repeated_failure", &edit_fail).expect("file area");
+        assert_eq!(area["files"][0], "src/b.rs");
+        assert_eq!(area["code_hash"], "cafe");
+
+        let bash_fail = serde_json::json!({
+            "type": "dispatch.tool.repeated_failure",
+            "tool_name": "bash",
+            "canonical_args": r#"{"command":"ls"}"#,
+            "failure_count": 3,
+        });
+        assert!(
+            detector_area("dispatch.tool.repeated_failure", &bash_fail).is_none(),
+            "a bash failure is engagement-level, not file-scoped"
+        );
     }
 
     /// `extract_tool_target_path` mirrors the runtime parser: pulls a string

@@ -218,15 +218,25 @@ impl Trajectory {
         &mut self,
         seq: u32,
         tool_name: &str,
+        // (#1001) The failing tool's args (so the host can derive the file the
+        // cascade is on) + the file's firing-time content hash for staleness.
+        // `code_hash` is omitted when the tool has no file target.
+        canonical_args: &str,
+        code_hash: Option<&str>,
         failure_count: u32,
     ) {
-        self.write_event(&serde_json::json!({
+        let mut event = serde_json::json!({
             "type": "dispatch.tool.repeated_failure",
             "seq": seq,
             "ts": unix_ms(),
             "tool_name": tool_name,
+            "canonical_args": canonical_args,
             "failure_count": failure_count,
-        }));
+        });
+        if let Some(h) = code_hash {
+            event["code_hash"] = serde_json::Value::String(h.to_string());
+        }
+        self.write_event(&event);
     }
 
     /// dispatch.cycle.suspected — fires (edge-triggered) when the
@@ -280,10 +290,13 @@ impl Trajectory {
         seq: u32,
         tool_name: &str,
         canonical_args: &str,
+        // (#1001) Firing-time content hash of the tool's target file, for
+        // staleness ranking. Omitted when the tool has no file target.
+        code_hash: Option<&str>,
         count: usize,
         window_size: usize,
     ) {
-        self.write_event(&serde_json::json!({
+        let mut event = serde_json::json!({
             "type": "dispatch.cycle.suspected",
             "seq": seq,
             "ts": unix_ms(),
@@ -291,7 +304,11 @@ impl Trajectory {
             "canonical_args": canonical_args,
             "count": count,
             "window_size": window_size,
-        }));
+        });
+        if let Some(h) = code_hash {
+            event["code_hash"] = serde_json::Value::String(h.to_string());
+        }
+        self.write_event(&event);
     }
 
     /// dispatch.per_turn_cap.salvaged — fires when the runtime
