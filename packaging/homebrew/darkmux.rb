@@ -5,7 +5,7 @@
 #
 # Operator-facing install path:
 #   brew tap kstrat2001/darkmux
-#   brew install darkmux                # stable release (v1.8.0)
+#   brew install darkmux                # stable release (v1.9.0)
 #   brew install --HEAD darkmux         # build from main instead
 #
 # For local development / smoke testing:
@@ -17,13 +17,14 @@
 class Darkmux < Formula
   desc "Profile multiplexer + lab for local LLM stacks (LMStudio, Ollama)"
   homepage "https://darkmux.com"
-  # Stable release: v1.8.0 (doom-loop lessons + mission debrief + the
-  # observability-trust sweep — #994/#1000/#999 + #1007/#1013/#1008).
+  # Stable release: v1.9.0 (the engagement-context finale — staleness-aware
+  # cautions + proportional budget + lessons verbs + the loop-lab A/B —
+  # #1001/#1002/#1011/#1003/#1004, plus #386 --message-from-file).
   # `brew install darkmux` builds from this source tarball; `brew install
   # --HEAD darkmux` builds from main instead. The sha256 is of the
   # GitHub-generated source tarball for the tag (`shasum -a 256`).
-  url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v1.8.0.tar.gz"
-  sha256 "10545cc5b70425b4b5646596c80a9f77441f679ad479c04027baaa28c5453ec3"
+  url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v1.9.0.tar.gz"
+  sha256 "729a07f84de80d6c50f0741c0129f94e91af15076d64780a4fc053f41521a5aa"
   license "MIT"
   head "https://github.com/kstrat2001/darkmux.git", branch: "main"
 
