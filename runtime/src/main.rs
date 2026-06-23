@@ -220,6 +220,29 @@ fn run_dispatch(args: &[String]) -> ExitCode {
                     return ExitCode::from(2);
                 }
             }
+            // (#386) Read the user prompt from a mounted file instead of argv,
+            // so a substantial brief never lands on the `docker run` command
+            // line (where it would hit ARG_MAX and show up in `ps`). The host
+            // writes the message into a per-dispatch mount; this reads it back.
+            "--prompt-file" => {
+                if prompt.is_some() {
+                    eprintln!("--prompt and --prompt-file are mutually exclusive");
+                    return ExitCode::from(2);
+                }
+                if let Some(v) = args.get(i + 1) {
+                    match std::fs::read_to_string(v) {
+                        Ok(contents) => prompt = Some(contents),
+                        Err(e) => {
+                            eprintln!("--prompt-file {v}: {e}");
+                            return ExitCode::from(2);
+                        }
+                    }
+                    i += 2;
+                } else {
+                    eprintln!("--prompt-file requires a value");
+                    return ExitCode::from(2);
+                }
+            }
             "--system" => {
                 if let Some(v) = args.get(i + 1) {
                     system = Some(v.clone());

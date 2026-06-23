@@ -146,6 +146,15 @@ pub(crate) fn apply_volume_mounts(args: &mut Vec<String>, workspace: &Path, host
     args.push(format!("{}:/darkmux-out", host_out.display()));
 }
 
+/// (#386) Filename the host writes the user message into (under `host_out`), and
+/// the matching container path the runtime reads it from via `--prompt-file`.
+/// Keeps a substantial brief off the `docker run` argv (ARG_MAX + `ps`).
+/// NOTE: `PROMPT_FILE_CONTAINER_PATH` embeds the `/darkmux-out` mount literal
+/// from `apply_volume_mounts` above — if that mount point ever changes, this
+/// (and the `RUNTIME_OUT_BASE` sync the mount comment names) must change too.
+pub(crate) const PROMPT_FILE_NAME: &str = ".prompt.txt";
+const PROMPT_FILE_CONTAINER_PATH: &str = "/darkmux-out/.prompt.txt";
+
 /// (#703) Inject the host-cached static runtime binary into an operator
 /// image: bind-mount it read-only at `/darkmux-runtime` and override the
 /// container entrypoint to it. Used when dispatching into an image OTHER
@@ -473,8 +482,11 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
     args.push(config.model.clone());
     args.push("--system".to_string());
     args.push(config.system_prompt.clone());
-    args.push("--prompt".to_string());
-    args.push(config.message.clone());
+    // (#386) The message goes via the out-dir mount (`--prompt-file`), NOT argv,
+    // so a substantial brief can't hit ARG_MAX or show up in `ps`. The host
+    // wrote it to `<host_out>/.prompt.txt` before this runs.
+    args.push("--prompt-file".to_string());
+    args.push(PROMPT_FILE_CONTAINER_PATH.to_string());
 
     if config.json {
         args.push("--json".to_string());
@@ -888,6 +900,14 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         "darkmux crew dispatch: out-dir={} (runtime bookkeeping → /darkmux-out)",
         host_out.display()
     );
+
+    // (#386) Write the user message to a file in the (already-mounted) out-dir
+    // and hand the runtime `--prompt-file` instead of `--prompt <text>`, so a
+    // substantial brief never lands on the `docker run` command line — where it
+    // would both hit ARG_MAX (the very case `--message-from-file` exists for)
+    // and be visible in `ps`. The container reads it back from the bind mount.
+    fs::write(host_out.join(PROMPT_FILE_NAME), &opts.message)
+        .with_context(|| format!("writing dispatch prompt file under {}", host_out.display()))?;
 
     // 5. Emit dispatch.start flow record with runtime metadata in payload
     //    (#204). Pairs with dispatch.complete below via session_id, same
@@ -3259,8 +3279,14 @@ mod tests {
         assert_eq!(argv[29], "llama3-8b");
         assert_eq!(argv[30], "--system");
         assert_eq!(argv[31], "You are a coding assistant.");
-        assert_eq!(argv[32], "--prompt");
-        assert_eq!(argv[33], "Fix the bug in main.rs");
+        // (#386) The message goes via the out-dir mount, not argv — argv carries
+        // the constant `--prompt-file <container path>`, never the brief itself.
+        assert_eq!(argv[32], "--prompt-file");
+        assert_eq!(argv[33], "/darkmux-out/.prompt.txt");
+        assert!(
+            !argv.iter().any(|a| a == "Fix the bug in main.rs"),
+            "the message must NOT appear anywhere in the docker argv (#386): {argv:?}"
+        );
 
         // 8. Verify json flag
         assert_eq!(argv[34], "--json");
