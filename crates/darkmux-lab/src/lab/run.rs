@@ -35,6 +35,13 @@ pub struct RunOpts {
     /// `characterize` / `tune` paths) leaves the profile intact, so those
     /// paths behave byte-identically to before.
     pub loop_override: Option<crate::lab::loop_report::LoopCompactionOverride>,
+    /// (#1004) Engagement-context to PREPEND to the workload prompt before
+    /// dispatch — the loop-lab A/B's "with-context" arm. `None` (every other
+    /// path) leaves the prompt untouched. The caller (mission-run side) builds
+    /// the real injected blocks; the lab just splices them in front of the
+    /// workload's own prompt so the dispatch carries the same context a real
+    /// coder brief would.
+    pub inject_context: Option<String>,
 }
 
 /// `run_dir` is the canonical path to the run's output directory.
@@ -56,6 +63,37 @@ pub struct RunOutcome {
     pub notes: Vec<String>,
 }
 
+/// (#1004) Loop-lab A/B "with-context" arm: splice the caller-built
+/// engagement-context blocks in FRONT of the workload's own prompt, so the
+/// dispatch carries the same context a real coder brief would. Resolves the
+/// workload's effective prompt (inline or from `promptFile`) first, then inlines
+/// the combined text into `prompt` (clearing `prompt_file`) — both providers read
+/// `manifest.workload.prompt` via `resolve_prompt`, so this one splice covers
+/// prompt + coding-task workloads with no provider change. A `None`/blank context
+/// (every non-A/B path, and the baseline arm) leaves the workload untouched.
+fn apply_inject_context(
+    loaded: &mut crate::workloads::types::LoadedWorkload,
+    ctx: Option<&str>,
+) {
+    let Some(ctx) = ctx.filter(|c| !c.trim().is_empty()) else {
+        return;
+    };
+    // Resolve the effective prompt with shared borrows (clone / file read produce
+    // owned Strings), THEN mutate — no overlapping mut+shared borrow.
+    let base = loaded.manifest.workload.prompt.clone().or_else(|| {
+        loaded
+            .manifest
+            .workload
+            .prompt_file
+            .as_ref()
+            .and_then(|rel| std::fs::read_to_string(loaded.base_dir.join(rel)).ok())
+    });
+    if let Some(base) = base {
+        loaded.manifest.workload.prompt = Some(format!("{ctx}\n\n{base}"));
+        loaded.manifest.workload.prompt_file = None;
+    }
+}
+
 pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
     let paths = paths::resolve(ResolveScope::Auto);
     paths::ensure(&paths)?;
@@ -65,7 +103,16 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
     } else {
         None
     };
-    let loaded_workload = load(&opts.workload_id, user_dir)?;
+    let mut loaded_workload = load(&opts.workload_id, user_dir)?;
+
+    // (#1004) Loop-lab A/B "with-context" arm: splice the caller-built
+    // engagement-context blocks in FRONT of the workload's own prompt, so the
+    // dispatch carries the same context a real coder brief would. Resolve the
+    // workload's effective prompt (inline or from promptFile) first, then
+    // inline the combined text into `prompt` (clearing `prompt_file`) — both
+    // providers read `manifest.workload.prompt` via `resolve_prompt`, so this
+    // one splice covers prompt + coding-task workloads with no provider change.
+    apply_inject_context(&mut loaded_workload, opts.inject_context.as_deref());
 
     let registry_loaded = load_registry(opts.config_path.as_deref())?;
     let profile_name = opts
@@ -947,9 +994,59 @@ mod tests {
             runtime: darkmux_crew::dispatch::Runtime::Internal,
             runtime_cmd: "openclaw".to_string(),
             loop_override: None,
+            inject_context: None,
         })
         .unwrap_err();
         std::env::set_current_dir(prev).unwrap();
         assert!(err.to_string().contains("default_profile"));
+    }
+
+    /// (#1004) `apply_inject_context` prepends the engagement-context in front
+    /// of the workload's own prompt (the A/B "with" arm), and is a no-op for a
+    /// `None`/blank context (every other path, and the baseline arm).
+    #[test]
+    fn apply_inject_context_prepends_or_noops() {
+        use crate::workloads::types::{
+            LoadedWorkload, WorkloadManifest, WorkloadSource, WorkloadSpec,
+        };
+        use std::collections::BTreeMap;
+        let tmp = TempDir::new().unwrap();
+        let mk = || LoadedWorkload {
+            manifest: WorkloadManifest {
+                workload: WorkloadSpec {
+                    id: "demo".into(),
+                    provider: "prompt".into(),
+                    description: None,
+                    role: None,
+                    prompt: Some("Do the task.".into()),
+                    prompt_file: None,
+                    sandbox_seed: None,
+                    setup_content: BTreeMap::new(),
+                    requires_external_sandbox: false,
+                    requires_fixture: None,
+                    verify: None,
+                    expected: None,
+                    image: None,
+                    extras: BTreeMap::new(),
+                },
+            },
+            manifest_path: tmp.path().join("w.json"),
+            base_dir: tmp.path().to_path_buf(),
+            source: WorkloadSource::Builtin,
+        };
+
+        // With context → prepended ahead of the original prompt.
+        let mut w = mk();
+        apply_inject_context(&mut w, Some("<lessons>\n- rule\n</lessons>"));
+        let p = w.manifest.workload.prompt.as_deref().unwrap();
+        assert!(p.starts_with("<lessons>"), "context goes first: {p:?}");
+        assert!(p.ends_with("Do the task."), "original prompt preserved: {p:?}");
+
+        // None / blank → untouched (baseline arm + every non-A/B path).
+        let mut w2 = mk();
+        apply_inject_context(&mut w2, None);
+        assert_eq!(w2.manifest.workload.prompt.as_deref(), Some("Do the task."));
+        apply_inject_context(&mut w2, Some("   "));
+        assert_eq!(w2.manifest.workload.prompt.as_deref(), Some("Do the task."));
     }
 }

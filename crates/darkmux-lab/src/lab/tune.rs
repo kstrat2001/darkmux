@@ -65,6 +65,7 @@ pub fn tune(opts: &TuneOpts) -> Result<TuneReport> {
         runtime_cmd: "openclaw".to_string(),
         // tune() varies model behavior across N runs, not loop config (#986).
         loop_override: None,
+        inject_context: None, // tune() never injects engagement-context (#1004)
     })?;
     let stats = compute_stats(&outcomes);
     Ok(TuneReport {
