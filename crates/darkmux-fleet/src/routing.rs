@@ -577,5 +577,74 @@ mod tests {
             "stamp {stamped} must fall within the call window [{before}, {after}]"
         );
     }
+
+    // (#842) `match_completion` is the no-redispatch invariant: a waiting client
+    // resolves when (and only when) its OWN session's terminal record lands.
+    // Matching the wrong session (false-complete on a sibling) or missing the
+    // canonical action shape (hang forever / re-dispatch) both corrupt fleet
+    // routing and pass green CI without these.
+
+    #[test]
+    fn match_completion_matches_target_session_canonical_action() {
+        let line = r#"{"action":"dispatch complete","session_id":"s-1","payload":{"result_class":"ok","wall_ms":1234,"exit_code":0}}"#;
+        let c = match_completion(line, "s-1").expect("matches the canonical 'dispatch complete'");
+        assert_eq!(c.session_id, "s-1");
+        assert_eq!(c.result_class, "ok");
+        assert_eq!(c.wall_ms, Some(1234));
+    }
+
+    #[test]
+    fn match_completion_accepts_dotted_action_forwardcompat() {
+        let line = r#"{"action":"dispatch.complete","session_id":"s-1","payload":{"result_class":"error"}}"#;
+        let c = match_completion(line, "s-1").expect("dotted form accepted (forward-compat)");
+        assert_eq!(c.result_class, "error");
+        assert_eq!(c.wall_ms, None, "absent wall_ms → None");
+    }
+
+    #[test]
+    fn match_completion_ignores_other_sessions_and_non_completions() {
+        let complete = r#"{"action":"dispatch complete","session_id":"OTHER","payload":{}}"#;
+        assert!(match_completion(complete, "s-1").is_none(), "a sibling session must NOT false-complete us");
+        let turn = r#"{"action":"dispatch.turn","session_id":"s-1","payload":{}}"#;
+        assert!(match_completion(turn, "s-1").is_none(), "a non-completion action is not a completion");
+        assert!(match_completion("not json", "s-1").is_none(), "malformed line → None, never panic");
+        let no_class = r#"{"action":"dispatch complete","session_id":"s-1"}"#;
+        assert_eq!(
+            match_completion(no_class, "s-1").unwrap().result_class,
+            "unknown",
+            "missing result_class defaults to 'unknown'"
+        );
+    }
+
+    #[test]
+    fn completion_to_dispatch_result_maps_exit_code_and_defaults() {
+        // exit_code taken from payload when present.
+        let c = CompletionResult {
+            session_id: "s-1".into(),
+            result_class: "error".into(),
+            wall_ms: Some(9),
+            payload: Some(serde_json::json!({"exit_code": 137})),
+        };
+        let r = completion_to_dispatch_result(c);
+        assert_eq!(r.exit_code, 137, "payload exit_code wins");
+        assert!(r.stdout.contains("result_class=error") && r.stdout.contains("session=s-1"));
+        assert!(r.watched_state.is_empty() && r.out_dir.is_none(), "remote path: no local bookkeeping");
+
+        // No payload exit_code → derived from result_class (ok→0, else→1).
+        let ok = CompletionResult {
+            session_id: "s-2".into(),
+            result_class: "ok".into(),
+            wall_ms: None,
+            payload: None,
+        };
+        assert_eq!(completion_to_dispatch_result(ok).exit_code, 0, "ok → 0");
+        let bad = CompletionResult {
+            session_id: "s-3".into(),
+            result_class: "error".into(),
+            wall_ms: None,
+            payload: None,
+        };
+        assert_eq!(completion_to_dispatch_result(bad).exit_code, 1, "non-ok → 1");
+    }
 }
 
