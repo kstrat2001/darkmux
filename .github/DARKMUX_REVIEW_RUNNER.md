@@ -40,17 +40,22 @@ comment launches it — still maintainer-only.
    - `darkmux` on PATH (`cargo install --path .` from this repo, or `brew install darkmux`).
    - The `darkmux-runtime` Docker image present (Docker running; `darkmux` pulls/uses
      `darkmux-runtime:latest`).
-   - LMStudio reachable at the default endpoint with **`qwen3.6-35b-a3b-turboquant-mlx`**
-     available (loaded, or JIT-loadable). To pin it, the workflow sets
-     `DARKMUX_PROFILES` to `.github/darkmux-review-profile.json` — change the model
-     id there if you want a different review model.
+   - LMStudio reachable at the default endpoint with **`qwen/qwen3-8b`** available
+     (loaded, or JIT-loadable). To pin it, the workflow sets `DARKMUX_PROFILES` to
+     `.github/darkmux-review-profile.json` — change the model id there if you want
+     a different review model. NOTE: qwen3_5-family models (e.g.
+     `qwen3.6-35b-a3b`) route their answer to `reasoning_content` and leave the
+     message content empty under the current LMStudio reasoning-parser config,
+     which yields **empty reviews** — qwen3-8b emits content and is the working
+     default until that config is sorted.
    - `python3` + `gh` on PATH (GitHub's runner image bundles `gh`).
 
 ## Notes
 
-- The review is **advisory** (no merge gate) and runs a local 8B–35B-class model:
+- The review is **advisory** (no merge gate) and runs a local 8B-class model:
   strong on obvious/security/test-coverage issues, shallower on deep semantic /
   cross-file bugs — pair it with a human/frontier pass on substantive PRs.
-- The model choice is operator-tunable in `.github/darkmux-review-profile.json`;
-  the laptop (128 GB) comfortably runs the 35B. On a RAM-constrained runner, drop
-  to a smaller model (e.g. `qwen3-8b`).
+- The model choice is operator-tunable in `.github/darkmux-review-profile.json`.
+  Pick a model that emits its answer in the message **content** (not only
+  `reasoning_content`) — qwen3-8b does; the qwen3_5-family thinking models
+  currently don't (see the prerequisite note above).
