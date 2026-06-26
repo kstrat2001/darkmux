@@ -75,6 +75,14 @@ pub struct Role {
     pub skills: Vec<String>, // skill ids
     pub tool_palette: ToolPalette,
     pub escalation_contract: EscalationContract,
+    /// (#1038) Optional JSON Schema for the role's final output. When set, the
+    /// dispatcher passes it to the runtime (`--response-schema`), which sends it
+    /// to LMStudio as `response_format: json_schema` so the model is
+    /// grammar-constrained to emit exactly this shape — the structural cure for
+    /// local-model JSON malformation (vs post-hoc repair). Absent ⇒ free-form
+    /// output (today's default). Schema-compatible: older manifests omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<serde_json::Value>,
     /// Path to the sibling `<role-id>.md` prompt file if present. The loader
     /// resolves this from the same directory as the role's JSON manifest; it
     /// does NOT read the prompt content — just stores the resolvable path.
@@ -339,6 +347,7 @@ mod tests {
 
     fn make_role(id: &str, skill_ids: &[&str]) -> Role {
         Role {
+            output_schema: None,
             id: id.into(),
             description: format!("test role {id}"),
             skills: skill_ids.iter().map(|s| s.to_string()).collect(),

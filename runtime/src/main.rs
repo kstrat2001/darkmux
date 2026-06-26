@@ -130,6 +130,9 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     let mut model: Option<String> = None;
     let mut prompt: Option<String> = None;
     let mut system: Option<String> = None;
+    // (#1038) Raw JSON-schema string for the role's output, wrapped into an
+    // LMStudio json_schema response_format before the loop. None ⇒ free-form.
+    let mut response_schema: Option<String> = None;
     let mut base_url: Option<String> = None;
     // Streaming is on by default (#205). Operators / tests pass
     // `--no-stream` to fall back to the Phase 2 single-shot path —
@@ -249,6 +252,15 @@ fn run_dispatch(args: &[String]) -> ExitCode {
                     i += 2;
                 } else {
                     eprintln!("--system requires a value");
+                    return ExitCode::from(2);
+                }
+            }
+            "--response-schema" => {
+                if let Some(v) = args.get(i + 1) {
+                    response_schema = Some(v.clone());
+                    i += 2;
+                } else {
+                    eprintln!("--response-schema requires a value");
                     return ExitCode::from(2);
                 }
             }
@@ -581,6 +593,17 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         bail_after_compactions,
         compactor_custom_instructions,
     );
+    // (#1038) Wrap the role's output schema (--response-schema) into an LMStudio
+    // json_schema response_format so every model turn is grammar-constrained to
+    // that shape. Invalid/absent schema ⇒ None ⇒ free-form (today's behavior).
+    let response_format = response_schema.as_deref().and_then(|s| {
+        serde_json::from_str::<serde_json::Value>(s).ok()
+    }).map(|schema| {
+        serde_json::json!({
+            "type": "json_schema",
+            "json_schema": { "name": "role_output", "strict": true, "schema": schema }
+        })
+    });
     let run_result = loop_runner::run(
         &client,
         &model,
@@ -592,6 +615,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         max_turns,
         max_tokens,
         feedback_templates,
+        response_format,
     );
 
     let outcome = match run_result {

@@ -16,5 +16,30 @@
       "update_plan"
     ]
   },
-  "escalation_contract": "bail-with-explanation"
+  "escalation_contract": "bail-with-explanation",
+  "output_schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "summary": { "type": "string" },
+      "verdict": { "type": "string", "enum": ["pass", "flag"] },
+      "findings": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "path": { "type": "string" },
+            "line": { "type": "integer" },
+            "severity": { "type": "string", "enum": ["high", "medium", "low"] },
+            "title": { "type": "string" },
+            "detail": { "type": "string" },
+            "suggestion": { "type": ["string", "null"] }
+          },
+          "required": ["path", "line", "severity", "title", "detail", "suggestion"]
+        }
+      }
+    },
+    "required": ["summary", "verdict", "findings"]
+  }
 }
