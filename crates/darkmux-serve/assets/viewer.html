@@ -1840,7 +1840,12 @@ async function toggleCatalog(){
 //  - event-specific data lives under `payload` (schema 1.6+) → exposed as `fields`
 //  - category defaults to telemetry when a `source` is present, else work
 function flowToRenderModel(records){
-  const out=records.map(r=>{
+  // Drop non-record meta lines before bucketing. Every flow file leads with a
+  // schema header `{"_type":"schema","darkmux_version":...,"version":...}` — it
+  // has no machine_uid, so it would otherwise fall into an "unknown" machine
+  // card (and inflate record counts) one per file. Real flow records carry no
+  // `_type`, so `!r._type` keeps records and drops the header + any future meta.
+  const out=records.filter(r=>r&&!r._type).map(r=>{
     const o={...r};
     o._uid = r._uid;
     if(o.action==="dispatch start")o.action="dispatch.start";
