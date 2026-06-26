@@ -1,7 +1,7 @@
 {
   "id": "pr-reviewer",
   "role_family": "specialist",
-  "description": "Tool-less PR code reviewer for CI: reads a unified diff provided inline and emits a structured, cite-the-line JSON review (path + line + severity + detail + optional one-click suggestion) that a workflow posts back as native inline pull-request comments. No repo, no shell, no tools — pure reasoning over the given diff.",
+  "description": "Tool-less PR code reviewer for CI: reads a unified diff provided inline and emits a structured, cite-the-line JSON review (path + line + severity + detail + how-to-fix advice + optional one-click suggestion) that a workflow posts back as native inline pull-request comments. No repo, no shell, no tools — pure reasoning over the given diff.",
   "skills": [
     "code-reviewing"
   ],
@@ -34,9 +34,10 @@
             "severity": { "type": "string", "enum": ["high", "medium", "low"] },
             "title": { "type": "string" },
             "detail": { "type": "string" },
+            "advice": { "type": "string" },
             "suggestion": { "anyOf": [{ "type": "string" }, { "type": "null" }] }
           },
-          "required": ["path", "line", "severity", "title", "detail", "suggestion"]
+          "required": ["path", "line", "severity", "title", "detail", "advice", "suggestion"]
         }
       }
     },

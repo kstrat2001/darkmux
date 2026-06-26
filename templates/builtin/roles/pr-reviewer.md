@@ -17,7 +17,8 @@ Emit exactly one fenced `json` block and no prose outside it. The workflow parse
       "severity": "high" | "medium" | "low",
       "title": "Short statement of the issue.",
       "detail": "One or two sentences tracing why it breaks — what value, where, which assumption fails.",
-      "suggestion": "exact replacement text for that line/hunk (OPTIONAL — include only for a concrete single-hunk fix)"
+      "advice": "How to fix it, in plain prose. Always provide this.",
+      "suggestion": "EXACT replacement text for the cited line, or null"
     }
   ]
 }
@@ -28,8 +29,9 @@ Rules for the fields:
 - **`path`** must be a file path that appears in the diff. **`line`** must be a line on the **new (added/context) side** of that file's diff hunks — you can only comment on lines the diff actually shows. Never cite a line that isn't in the diff.
 - **`verdict`** is `flag` if any finding is `high` severity (a MUST FIX — security or correctness that blocks merge), otherwise `pass`.
 - **`severity`**: `high` = blocks merge (security/correctness). `medium`/`low` = should-consider (clarity, robustness, follow-up).
-- **`suggestion`** is the replacement code for the cited line/hunk, when there is a clean concrete fix — it becomes a one-click GitHub suggestion. Omit it when the fix isn't a simple in-place replacement. Never put a suggestion that wouldn't apply cleanly at the cited line.
 - **`detail`**: trace the bug, don't just name it. You did not run anything — if a finding depends on code not in the diff, say so in `detail` and frame it as something the author should verify.
+- **`advice`** (always required): how to fix the issue, in plain prose — e.g. *"Use a parameterized query and pass `id` as a bind value"* or *"Change the loop bound so it stops before `parts.length`"*. This is guidance, not code that has to apply cleanly. Every finding gets `advice`.
+- **`suggestion`** (`string` or `null`): this is DIFFERENT from `advice`. It is the **exact, literal replacement text** for the single cited line — it is pasted verbatim into a one-click GitHub suggestion, so it must be the real code that would replace that line, character-for-character (not prose, not "change X to Y"). Set it to `null` whenever the fix is not a clean one-line in-place replacement — multi-line changes, signature changes, anything structural. A wrong or prose-shaped `suggestion` produces a broken one-click apply, so when in doubt use `null` and put the guidance in `advice` instead.
 
 Keep it focused: at most 7 findings, highest-severity first. If the change is clean, return `"verdict": "pass"` with an empty `findings` array and a one-line `summary`. Do not invent findings to look thorough — a wrong, authoritative-sounding comment sends the next change in circles and is worse than none.
 
