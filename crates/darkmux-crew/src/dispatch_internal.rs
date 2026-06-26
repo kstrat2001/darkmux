@@ -2460,10 +2460,14 @@ fn preflight_result_for(status: DockerRuntimeStatus) -> Result<()> {
 /// dispatch should target for the given role.
 ///
 /// Selection chain:
-/// 1. Load the profile registry. Get the active profile name from
-///    `profile_override` (the CLI `--profile` override, #549) when set,
-///    else `registry.default_profile`. When neither is present, fall
-///    back to `probe_loaded_model()`.
+/// 1. Load the profile registry, then resolve the active profile via
+///    `ProfileRegistry::resolve_active(profile_override)` (#1054): the CLI
+///    `--profile` override when it names a profile defined here, else
+///    `registry.default_profile`. An override that ISN'T defined on this
+///    machine falls back to `default_profile` (logged) rather than failing —
+///    a machine-agnostic caller names the profile it wants and each machine
+///    maps it to a lab-validated model. When nothing resolves, fall back to
+///    `probe_loaded_model()`.
 /// 2. Look up the profile + call `select_model(role, profile, skill_lookup)`,
 ///    which capability-scores the role against the profile's models (#590),
 ///    falling back to the profile's default model when no vectors
@@ -2484,7 +2488,7 @@ fn resolve_dispatch_model_internal(
     config_path: Option<&str>,
 ) -> Result<String> {
     use crate::select::select_model;
-    use darkmux_profiles::profiles::{get_profile, load_registry};
+    use darkmux_profiles::profiles::load_registry;
 
     let loaded = match load_registry(config_path) {
         Ok(loaded) => loaded,
@@ -2498,29 +2502,35 @@ fn resolve_dispatch_model_internal(
         }
     };
 
-    // (#549) Resolve the active profile name: the CLI `--profile` override
-    // takes precedence; otherwise fall back to the registry's
-    // `default_profile`. When BOTH are absent, fall back to
-    // `probe_loaded_model()`.
-    let active_name = match profile_override.or(loaded.registry.default_profile.as_deref()) {
-        Some(name) => name,
+    // (#1054) Resolve the active profile: the CLI `--profile` override is
+    // tried first, then the registry's `default_profile`. A `--profile` that
+    // names a profile NOT defined on this machine falls back to
+    // `default_profile` (the machine-agnostic-caller contract — a workflow
+    // names the profile it wants; each machine maps it to a lab-validated
+    // model or degrades to its default). When nothing resolves, probe.
+    let (active_name, profile) = match loaded.registry.resolve_active(profile_override) {
+        Some(pair) => {
+            // Surface the fallback so the operator isn't surprised which model
+            // ran: an explicit `--profile X` that resolved to a different name
+            // means X wasn't defined here.
+            if let Some(req) = profile_override {
+                if req != pair.0 {
+                    eprintln!(
+                        "darkmux crew dispatch: requested profile `{req}` is not defined \
+                         on this machine; using default_profile `{}` instead. Define \
+                         `{req}` in ~/.darkmux/profiles.json to select a profile-specific \
+                         model. (#1054)",
+                        pair.0
+                    );
+                }
+            }
+            pair
+        }
         None => {
             eprintln!(
-                "darkmux crew dispatch: profile registry has no default_profile set; \
-                 falling back to probe_loaded_model() — deprecated, set \
-                 default_profile in ~/.darkmux/profiles.json. (#450 refactor 1b)"
-            );
-            return probe_loaded_model();
-        }
-    };
-
-    let profile = match get_profile(&loaded.registry, active_name) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!(
-                "darkmux crew dispatch: default_profile `{active_name}` not in \
-                 registry ({e}); falling back to probe_loaded_model() — \
-                 deprecated. (#450 refactor 1b)"
+                "darkmux crew dispatch: no usable profile (no --profile match and no \
+                 default_profile set/defined); falling back to probe_loaded_model() — \
+                 deprecated, set default_profile in ~/.darkmux/profiles.json. (#450 refactor 1b)"
             );
             return probe_loaded_model();
         }
@@ -2638,8 +2648,10 @@ pub fn resolve_context_window_internal(
     config_path: Option<&str>,
 ) -> Option<u32> {
     let loaded = darkmux_profiles::profiles::load_registry(config_path).ok()?;
-    let active_name = profile_override.or(loaded.registry.default_profile.as_deref())?;
-    let profile = darkmux_profiles::profiles::get_profile(&loaded.registry, active_name).ok()?;
+    // (#1054) Same graceful resolution as model selection — a requested profile
+    // undefined here falls back to default_profile, so the context window comes
+    // from the SAME profile the model does.
+    let (_active_name, profile) = loaded.registry.resolve_active(profile_override)?;
     crate::dispatch::CompactionDispatchArgs::from_profile(profile).context_window
 }
 

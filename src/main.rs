@@ -382,6 +382,15 @@ enum CrewCmd {
         /// file, so it never lands on the `docker run` argv either.
         #[arg(long = "message-from-file", value_name = "PATH")]
         message_from_file: Option<std::path::PathBuf>,
+        /// (#1054) Select a named profile from the machine's registry for this
+        /// dispatch's model + context-window resolution, instead of the
+        /// registry's `default_profile`. When the named profile isn't defined
+        /// on this machine, the dispatch falls back to `default_profile` (with
+        /// a note). Lets a machine-agnostic caller (e.g. the self-review CI
+        /// workflow) NAME the profile it wants while each machine owns which
+        /// lab-validated model that profile maps to.
+        #[arg(long)]
+        profile: Option<String>,
         /// Optional delivery target in `<channel>:<target>` form
         /// (e.g. `discord:1500166601909993503`). When set, openclaw's
         /// reply is delivered to that channel in addition to being
@@ -2794,6 +2803,7 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
             role,
             message,
             message_from_file,
+            profile,
             deliver,
             session_id,
             timeout,
@@ -2868,10 +2878,12 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
                 // so a `default()` is safe. Lab + sprint paths derive the
                 // full compaction config from the profile up front.
                 compaction: crew::dispatch::CompactionDispatchArgs::default(),
-                // (#549) Bare `crew dispatch` has no `--profile` override;
-                // model selection falls back to the registry's
-                // `default_profile`. The lab path passes the resolved name.
-                profile_name: None,
+                // (#1054) `--profile <name>` selects a named profile from the
+                // machine's registry; when omitted (None) or undefined on this
+                // machine, model + context-window resolution fall back to the
+                // registry's `default_profile`. The lab path passes its own
+                // resolved name.
+                profile_name: profile,
                 // (#984) No --profiles-file here; dispatch resolves env > default.
                 config_path: None,
                 // (#703) operator-selected dispatch image; darkmux injects
