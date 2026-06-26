@@ -81,6 +81,11 @@ pub struct Role {
     /// grammar-constrained to emit exactly this shape — the structural cure for
     /// local-model JSON malformation (vs post-hoc repair). Absent ⇒ free-form
     /// output (today's default). Schema-compatible: older manifests omit it.
+    ///
+    /// Intended for **tool-less terminal-output roles** (empty `tool_palette`):
+    /// the model emits one final object and stops. Pairing it with a non-empty
+    /// tool palette is unsupported — a grammar lock to a fixed shape structurally
+    /// precludes emitting `tool_calls`, so mid-loop tool turns can't happen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_schema: Option<serde_json::Value>,
     /// Path to the sibling `<role-id>.md` prompt file if present. The loader

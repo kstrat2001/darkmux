@@ -596,6 +596,13 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // (#1038) Wrap the role's output schema (--response-schema) into an LMStudio
     // json_schema response_format so every model turn is grammar-constrained to
     // that shape. Invalid/absent schema ⇒ None ⇒ free-form (today's behavior).
+    // `strict: true` is deliberate and DIFFERS from the compactor's
+    // `structured_output_response_format_schema()` (strict: false, which keeps
+    // forward-compat tolerance for unknown fields): a role's output feeds a
+    // downstream parser that wants a hard contract, so the schema is authored
+    // strict-safe (every property in `required`, `additionalProperties: false`,
+    // optionals as nullable unions). Don't "unify" the two — the divergence is
+    // by use case.
     let response_format = response_schema.as_deref().and_then(|s| {
         serde_json::from_str::<serde_json::Value>(s).ok()
     }).map(|schema| {

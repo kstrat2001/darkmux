@@ -652,6 +652,55 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// (#1038) Every builtin role's `output_schema`, if present, must be
+    /// LMStudio-`strict`-safe — the runtime sends it with `strict: true`, and a
+    /// non-strict-safe schema makes LMStudio reject the request on the FIRST
+    /// real dispatch (a 400 that no other test catches because nothing else
+    /// loads + validates these manifests). The strict rules: every object schema
+    /// sets `additionalProperties: false` and lists EVERY declared property in
+    /// `required` (optionals are nullable unions but still required). Walks all
+    /// nested objects + array items so a future schema edit can't silently drop
+    /// the invariant.
+    #[test]
+    fn builtin_role_output_schemas_are_strict_safe() {
+        fn assert_strict_safe(schema: &serde_json::Value, role: &str, path: &str) {
+            let Some(obj) = schema.as_object() else { return };
+            // Recurse into array items first (they may themselves be objects).
+            if let Some(items) = obj.get("items") {
+                assert_strict_safe(items, role, &format!("{path}[]"));
+            }
+            // Only object-typed schemas carry the properties/required contract.
+            let Some(props) = obj.get("properties").and_then(|p| p.as_object()) else {
+                return;
+            };
+            assert_eq!(
+                obj.get("additionalProperties"),
+                Some(&serde_json::Value::Bool(false)),
+                "role `{role}` schema at `{path}`: object must set additionalProperties:false for strict:true",
+            );
+            let required: Vec<&str> = obj
+                .get("required")
+                .and_then(|r| r.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            for key in props.keys() {
+                assert!(
+                    required.contains(&key.as_str()),
+                    "role `{role}` schema at `{path}`: property `{key}` must be in `required` for strict:true (optionals stay required as nullable unions)",
+                );
+                assert_strict_safe(&props[key], role, &format!("{path}.{key}"));
+            }
+        }
+
+        for (id, json) in BUILTIN_ROLES {
+            let role: Role = serde_json::from_str(json)
+                .unwrap_or_else(|e| panic!("builtin role `{id}` must parse: {e}"));
+            if let Some(schema) = &role.output_schema {
+                assert_strict_safe(schema, id, "$");
+            }
+        }
+    }
+
     /// RAII guard that points `DARKMUX_CREW_DIR` at a TempDir for the test's
     /// duration, then restores the previous value (or unsets it) on drop.
     /// Uses the existing env-var hook in `load_roles` rather than mutating

@@ -3399,6 +3399,57 @@ mod tests {
         let dash_idx = argv.iter().position(|a| *a == "--").unwrap();
         assert_eq!(argv[dash_idx + 1], "darkmux-runtime:latest");
         assert_eq!(argv[dash_idx + 2], "run");
+
+        // (#1038) No output_schema ⇒ no --response-schema flag.
+        assert!(
+            !argv.iter().any(|a| a == "--response-schema"),
+            "absent output_schema must NOT emit --response-schema"
+        );
+    }
+
+    #[test]
+    fn build_docker_run_argv_output_schema_emits_response_schema_flag() {
+        // (#1038) The grammar-constrained-output branch: a Some(output_schema)
+        // must serialize to a `--response-schema <json>` flag pair in the argv.
+        // The whole feature rides on this flag reaching the runtime — exercise
+        // the live branch, not just the absent case (the #975 lesson: assert
+        // the real construction, not only the omit path).
+        let schema = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": { "verdict": { "type": "string" } },
+            "required": ["verdict"]
+        });
+        let config = DockerRunConfig {
+            output_schema: Some(schema.clone()),
+            container_name: "darkmux-dispatch-schema".to_string(),
+            workspace: PathBuf::from("/tmp/ws"),
+            host_out: PathBuf::from("/tmp/out"),
+            inject: false,
+            runtime_binary: None,
+            image: "darkmux-runtime:latest".to_string(),
+            model: "default-model".to_string(),
+            system_prompt: "Tool-less reviewer.".to_string(),
+            message: "Review this.".to_string(),
+            json: true,
+            allowed_tools: None,
+            compaction: crate::dispatch::CompactionDispatchArgs::default(),
+            feedback_templates: serde_json::Value::Null,
+            cache_dir: PathBuf::from("/tmp/cache"),
+        };
+
+        let argv = build_docker_run_argv(&config);
+
+        let idx = argv
+            .iter()
+            .position(|a| a == "--response-schema")
+            .expect("Some(output_schema) must emit --response-schema");
+        // The flag's value is the schema serialized as a single JSON string,
+        // and it must round-trip back to the exact schema (no corruption).
+        let value = &argv[idx + 1];
+        let parsed: serde_json::Value =
+            serde_json::from_str(value).expect("--response-schema value must be valid JSON");
+        assert_eq!(parsed, schema, "schema must round-trip through argv intact");
     }
 
     // ─── #842 edge cases the complete-vector test doesn't exercise ──────
