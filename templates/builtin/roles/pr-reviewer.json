@@ -34,7 +34,7 @@
             "severity": { "type": "string", "enum": ["high", "medium", "low"] },
             "title": { "type": "string" },
             "detail": { "type": "string" },
-            "suggestion": { "type": ["string", "null"] }
+            "suggestion": { "anyOf": [{ "type": "string" }, { "type": "null" }] }
           },
           "required": ["path", "line", "severity", "title", "detail", "suggestion"]
         }
