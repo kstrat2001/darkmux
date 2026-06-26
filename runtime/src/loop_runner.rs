@@ -574,8 +574,14 @@ pub fn run(
         // (Promotion-from-reasoning path also clears reasoning_content
         // inside `apply_promotion`, so this is idempotent on that
         // path.)
+        //
+        // (#1050) ...and on a terminal (no-tool-call) turn whose content is
+        // empty, promote the reasoning into content FIRST — the qwen3_5-family
+        // thinking models put their whole answer there. promote_terminal_reasoning
+        // does the promotion (terminal turns only) and then performs the #406
+        // strip, so the invariant above still holds for tool-call turns.
         if let Some(choice) = response.choices.first_mut() {
-            choice.message.reasoning_content = None;
+            promote_terminal_reasoning(&mut choice.message);
         }
 
         // (#414 PR A) Capture this turn's completion-token count BEFORE
@@ -1328,6 +1334,33 @@ fn run_streaming_turn(
 /// before being truncated on a subsequent reasoning run-on). Partial
 /// JSON args are NOT salvageable — dispatching with broken args would
 /// produce noise. The existing bail handles that case.
+/// (#1050) Reasoning-channel fallback for thinking models. On a TERMINAL turn
+/// (no tool calls) with empty content, the qwen3_5-family models route their
+/// entire answer into `reasoning_content` and leave `content` empty — so
+/// `final_assistant` would come back empty (every dispatch to them yields
+/// nothing). Promote the reasoning into `content` so the answer (e.g. the
+/// pr-reviewer's grammar-constrained JSON, which lands there) isn't lost.
+///
+/// Then ALWAYS strip `reasoning_content` — it must never enter the conversation
+/// history that's replayed to LMStudio on later turns (#406: reasoning-in-
+/// history caused a recursive-feedback regression). The promotion is safe under
+/// that invariant precisely because a no-tool-call turn is *terminal*: this
+/// message is the final answer and is never sent back on a subsequent request.
+/// A tool-call turn is left untouched (reasoning is just thinking; the tool call
+/// is the action) and its reasoning is stripped as before.
+fn promote_terminal_reasoning(msg: &mut Message) {
+    let has_tools = msg.tool_calls.as_ref().is_some_and(|t| !t.is_empty());
+    let content_empty = msg.content.as_deref().map_or(true, |c| c.trim().is_empty());
+    if !has_tools && content_empty {
+        if let Some(reasoning) = msg.reasoning_content.as_deref() {
+            if !reasoning.trim().is_empty() {
+                msg.content = Some(reasoning.to_string());
+            }
+        }
+    }
+    msg.reasoning_content = None;
+}
+
 fn assistant_message_has_well_formed_tool_calls(msg: &Message) -> bool {
     msg.tool_calls
         .as_ref()
@@ -1745,6 +1778,70 @@ mod tests {
             prompt,
             "read".len() + r#"{"path":"/workspace/file.py"}"#.len()
         );
+    }
+
+    #[test]
+    fn promote_terminal_reasoning_lifts_reasoning_on_terminal_turn() {
+        // (#1050) Thinking model: empty content, no tool calls, answer in reasoning.
+        let mut msg = Message {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            reasoning_content: Some(r#"{"verdict":"flag","findings":[]}"#.into()),
+        };
+        promote_terminal_reasoning(&mut msg);
+        assert_eq!(
+            msg.content.as_deref(),
+            Some(r#"{"verdict":"flag","findings":[]}"#),
+            "reasoning must promote to content on a terminal turn",
+        );
+        assert_eq!(
+            msg.reasoning_content, None,
+            "reasoning_content must be stripped so it never enters history (#406)",
+        );
+    }
+
+    #[test]
+    fn promote_terminal_reasoning_skips_when_tool_calls_present() {
+        // Tool-call turn: reasoning is just thinking — do NOT promote.
+        let mut msg = Message {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".into(),
+                kind: "function".into(),
+                function: FunctionCall {
+                    name: "read".into(),
+                    arguments: "{}".into(),
+                },
+            }]),
+            tool_call_id: None,
+            name: None,
+            reasoning_content: Some("thinking which tool to use".into()),
+        };
+        promote_terminal_reasoning(&mut msg);
+        assert_eq!(
+            msg.content, None,
+            "reasoning must NOT be promoted on a tool-call turn",
+        );
+        assert_eq!(msg.reasoning_content, None, "reasoning still stripped (#406)");
+    }
+
+    #[test]
+    fn promote_terminal_reasoning_leaves_real_content_untouched() {
+        let mut msg = Message {
+            role: "assistant".into(),
+            content: Some("the real answer".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            reasoning_content: Some("some thinking".into()),
+        };
+        promote_terminal_reasoning(&mut msg);
+        assert_eq!(msg.content.as_deref(), Some("the real answer"));
+        assert_eq!(msg.reasoning_content, None);
     }
 
     #[test]
