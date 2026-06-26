@@ -18,7 +18,7 @@ Emit exactly one fenced `json` block and no prose outside it. The workflow parse
       "title": "Short statement of the issue.",
       "detail": "One or two sentences tracing why it breaks — what value, where, which assumption fails.",
       "advice": "How to fix it, in plain prose. Always provide this.",
-      "suggestion": "EXACT replacement text for the cited line, or null"
+      "suggestion": "    for (let i = 0; i < parts.length; i++) {"
     }
   ]
 }
