@@ -11,6 +11,42 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-06-26
+
+A local model can now run as an automated **PR reviewer**: a tool-less role
+reviews a diff and emits a structured, cite-the-line JSON review that CI posts
+back as native inline pull-request comments — and the runtime can now
+grammar-constrain any role's output to a declared schema, so a small local
+model cannot emit malformed JSON.
+
+### Added
+- **Tool-less `pr-reviewer` role (#1037).** Reviews a unified diff provided
+  inline and emits a structured, cite-the-line JSON review (path + line +
+  severity + detail + how-to-fix advice + optional one-click suggestion),
+  designed for CI to post as inline PR comments. No repo, no shell, no tools —
+  pure reasoning over the given diff.
+- **Grammar-constrained structured output — `output_schema` on a role (#1039).**
+  A role manifest can declare an `output_schema` (JSON Schema); the internal
+  runtime passes it to LMStudio as `response_format: json_schema` (strict), so
+  the model is grammar-constrained to emit exactly that shape — the structural
+  cure for local-model JSON malformation, vs post-hoc repair. Backward-compatible:
+  roles without `output_schema` behave exactly as before.
+- **`pr-reviewer` findings carry `advice` + `suggestion` (#1044).** Each finding
+  has `advice` (prose how-to-fix, always present) and `suggestion` (the exact
+  literal replacement line for a clean one-line fix, or `null` — rendered as a
+  one-click GitHub suggestion). Keeps fix-guidance on every finding while
+  reserving the one-click path for fixes that actually apply cleanly.
+
+### Fixed
+- **`output_schema` nullable fields use `anyOf`, not a type union (#1040).**
+  LMStudio's grammar compiler rejects `"type": ["string","null"]` (`ValueError:
+  'type' must be a string`); nullable fields are now expressed as
+  `anyOf: [{"type":"string"},{"type":"null"}]`. A builtin-role strict-safety
+  test now guards the rule. Caught dogfooding the live `pr-reviewer` dispatch.
+- **Capability-aware verification boundary for `code-reviewer` + `test-designer`
+  (#1035, #400).** The post-dispatch verification rule no longer holds these
+  roles to a code-mutation check they aren't expected to satisfy.
+
 ## [1.9.0] - 2026-06-23
 
 The dispatch-to-PR loop's engagement-context cure goes from foundation to
@@ -433,6 +469,7 @@ cluster of crew-index correctness repairs.
   idle machine's bar no longer stretches to the playhead; adds the first
   viewer-lifecycle e2e regression gate.
 
+[1.10.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.10.0
 [1.9.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.9.0
 [1.8.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.8.0
 [1.7.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.7.0
