@@ -652,6 +652,55 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// (#1038) Every builtin role's `output_schema`, if present, must be
+    /// LMStudio-`strict`-safe — the runtime sends it with `strict: true`, and a
+    /// non-strict-safe schema makes LMStudio reject the request on the FIRST
+    /// real dispatch (a 400 that no other test catches because nothing else
+    /// loads + validates these manifests). The strict rules: every object schema
+    /// sets `additionalProperties: false` and lists EVERY declared property in
+    /// `required` (optionals are nullable unions but still required). Walks all
+    /// nested objects + array items so a future schema edit can't silently drop
+    /// the invariant.
+    #[test]
+    fn builtin_role_output_schemas_are_strict_safe() {
+        fn assert_strict_safe(schema: &serde_json::Value, role: &str, path: &str) {
+            let Some(obj) = schema.as_object() else { return };
+            // Recurse into array items first (they may themselves be objects).
+            if let Some(items) = obj.get("items") {
+                assert_strict_safe(items, role, &format!("{path}[]"));
+            }
+            // Only object-typed schemas carry the properties/required contract.
+            let Some(props) = obj.get("properties").and_then(|p| p.as_object()) else {
+                return;
+            };
+            assert_eq!(
+                obj.get("additionalProperties"),
+                Some(&serde_json::Value::Bool(false)),
+                "role `{role}` schema at `{path}`: object must set additionalProperties:false for strict:true",
+            );
+            let required: Vec<&str> = obj
+                .get("required")
+                .and_then(|r| r.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            for key in props.keys() {
+                assert!(
+                    required.contains(&key.as_str()),
+                    "role `{role}` schema at `{path}`: property `{key}` must be in `required` for strict:true (optionals stay required as nullable unions)",
+                );
+                assert_strict_safe(&props[key], role, &format!("{path}.{key}"));
+            }
+        }
+
+        for (id, json) in BUILTIN_ROLES {
+            let role: Role = serde_json::from_str(json)
+                .unwrap_or_else(|e| panic!("builtin role `{id}` must parse: {e}"));
+            if let Some(schema) = &role.output_schema {
+                assert_strict_safe(schema, id, "$");
+            }
+        }
+    }
+
     /// RAII guard that points `DARKMUX_CREW_DIR` at a TempDir for the test's
     /// duration, then restores the previous value (or unsets it) on drop.
     /// Uses the existing env-var hook in `load_roles` rather than mutating
@@ -690,6 +739,7 @@ mod tests {
     #[test]
     fn roles_round_trip() {
         let role = Role {
+            output_schema: None,
             id: "test".into(),
             description: "A test role".into(),
             skills: vec![String::from("coding")],
@@ -1227,6 +1277,7 @@ mod load_per_mission_tests {
         // (preventive: better to prepend an unneeded preamble than to
         // miss prepending a needed one).
         let role = Role {
+            output_schema: None,
             id: "test-role".into(),
             description: "A test role".into(),
             skills: vec![],
@@ -1244,6 +1295,7 @@ mod load_per_mission_tests {
     #[test]
     fn role_family_utility_opts_out_of_specialist() {
         let role = Role {
+            output_schema: None,
             id: "test-role".into(),
             description: "A test role".into(),
             skills: vec![],
@@ -1267,6 +1319,7 @@ mod load_per_mission_tests {
     #[test]
     fn legacy_admin_value_is_silently_specialist_at_matcher_layer() {
         let role = Role {
+            output_schema: None,
             id: "test-role".into(),
             description: "A test role".into(),
             skills: vec![],
@@ -1288,6 +1341,7 @@ mod load_per_mission_tests {
     #[test]
     fn role_family_explicit_specialist_matches_default() {
         let role = Role {
+            output_schema: None,
             id: "test-role".into(),
             description: "A test role".into(),
             skills: vec![],
@@ -1365,6 +1419,7 @@ mod load_per_mission_tests {
     #[test]
     fn validate_rejects_legacy_admin_role_family_user_source() {
         let legacy_role = Role {
+            output_schema: None,
             id: "legacy-role".into(),
             description: "A role using the pre-rename admin value".into(),
             skills: vec![],
@@ -1393,6 +1448,7 @@ mod load_per_mission_tests {
     #[test]
     fn validate_rejects_legacy_admin_role_family_builtin_source() {
         let legacy_role = Role {
+            output_schema: None,
             id: "broken-builtin".into(),
             description: "Simulates a builtin manifest that drifted back to admin".into(),
             skills: vec![],
@@ -1415,6 +1471,7 @@ mod load_per_mission_tests {
     #[test]
     fn validate_accepts_utility_specialist_and_none() {
         let mut r = Role {
+            output_schema: None,
             id: "test-role".into(),
             description: "A test role".into(),
             skills: vec![],
@@ -1441,6 +1498,7 @@ mod load_per_mission_tests {
     #[test]
     fn validate_rejects_unknown_role_family() {
         let r = Role {
+            output_schema: None,
             id: "test-role".into(),
             description: "A role with a typo'd family".into(),
             skills: vec![],

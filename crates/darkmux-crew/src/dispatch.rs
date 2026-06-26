@@ -2129,6 +2129,7 @@ mod tests {
 
     fn sample_role() -> Role {
         Role {
+            output_schema: None,
             id: "code-reviewer".to_string(),
             description: "test".to_string(),
             skills: vec!["code-reviewing".to_string()],

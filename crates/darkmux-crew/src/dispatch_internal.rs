@@ -414,6 +414,10 @@ pub struct DockerRunConfig {
     pub model: String,
     /// Full system prompt (preamble + role prompt, specialist roles only).
     pub system_prompt: String,
+    /// (#1038) The role's output JSON Schema, if it declares one. Passed to the
+    /// runtime as `--response-schema` → LMStudio `response_format: json_schema`
+    /// so the model is grammar-constrained. None ⇒ free-form output.
+    pub output_schema: Option<serde_json::Value>,
     /// The operator's user message.
     pub message: String,
     /// Whether to request JSON envelope output from the runtime.
@@ -482,6 +486,14 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
     args.push(config.model.clone());
     args.push("--system".to_string());
     args.push(config.system_prompt.clone());
+    // (#1038) Role-declared output schema → runtime `--response-schema` →
+    // LMStudio json_schema response_format (grammar-constrained output).
+    if let Some(schema) = &config.output_schema {
+        if let Ok(s) = serde_json::to_string(schema) {
+            args.push("--response-schema".to_string());
+            args.push(s);
+        }
+    }
     // (#386) The message goes via the out-dir mount (`--prompt-file`), NOT argv,
     // so a substantial brief can't hit ARG_MAX or show up in `ps`. The host
     // wrote it to `<host_out>/.prompt.txt` before this runs.
@@ -1032,6 +1044,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         image: image.clone(),
         model: model.clone(),
         system_prompt: system_prompt.clone(),
+        output_schema: role.output_schema.clone(),
         message: opts.message.clone(),
         json: opts.json,
         allowed_tools: allowed_tools.clone(),
@@ -3180,6 +3193,7 @@ mod tests {
         // with compaction, allowed tools, and json mode. Asserts the
         // COMPLETE argv vector including all hardening flags (#839).
         let config = DockerRunConfig {
+            output_schema: None,
             container_name: "darkmux-dispatch-test-123".to_string(),
             workspace: PathBuf::from("/host/workspace"),
             host_out: PathBuf::from("/host/out"),
@@ -3328,6 +3342,7 @@ mod tests {
         // compaction, no allowed tools, no json — asserts that optional
         // flags are omitted when not set.
         let config = DockerRunConfig {
+            output_schema: None,
             container_name: "darkmux-dispatch-min".to_string(),
             workspace: PathBuf::from("/tmp/ws"),
             host_out: PathBuf::from("/tmp/out"),
@@ -3384,6 +3399,57 @@ mod tests {
         let dash_idx = argv.iter().position(|a| *a == "--").unwrap();
         assert_eq!(argv[dash_idx + 1], "darkmux-runtime:latest");
         assert_eq!(argv[dash_idx + 2], "run");
+
+        // (#1038) No output_schema ⇒ no --response-schema flag.
+        assert!(
+            !argv.iter().any(|a| a == "--response-schema"),
+            "absent output_schema must NOT emit --response-schema"
+        );
+    }
+
+    #[test]
+    fn build_docker_run_argv_output_schema_emits_response_schema_flag() {
+        // (#1038) The grammar-constrained-output branch: a Some(output_schema)
+        // must serialize to a `--response-schema <json>` flag pair in the argv.
+        // The whole feature rides on this flag reaching the runtime — exercise
+        // the live branch, not just the absent case (the #975 lesson: assert
+        // the real construction, not only the omit path).
+        let schema = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": { "verdict": { "type": "string" } },
+            "required": ["verdict"]
+        });
+        let config = DockerRunConfig {
+            output_schema: Some(schema.clone()),
+            container_name: "darkmux-dispatch-schema".to_string(),
+            workspace: PathBuf::from("/tmp/ws"),
+            host_out: PathBuf::from("/tmp/out"),
+            inject: false,
+            runtime_binary: None,
+            image: "darkmux-runtime:latest".to_string(),
+            model: "default-model".to_string(),
+            system_prompt: "Tool-less reviewer.".to_string(),
+            message: "Review this.".to_string(),
+            json: true,
+            allowed_tools: None,
+            compaction: crate::dispatch::CompactionDispatchArgs::default(),
+            feedback_templates: serde_json::Value::Null,
+            cache_dir: PathBuf::from("/tmp/cache"),
+        };
+
+        let argv = build_docker_run_argv(&config);
+
+        let idx = argv
+            .iter()
+            .position(|a| a == "--response-schema")
+            .expect("Some(output_schema) must emit --response-schema");
+        // The flag's value is the schema serialized as a single JSON string,
+        // and it must round-trip back to the exact schema (no corruption).
+        let value = &argv[idx + 1];
+        let parsed: serde_json::Value =
+            serde_json::from_str(value).expect("--response-schema value must be valid JSON");
+        assert_eq!(parsed, schema, "schema must round-trip through argv intact");
     }
 
     // ─── #842 edge cases the complete-vector test doesn't exercise ──────
@@ -3397,6 +3463,7 @@ mod tests {
     /// exactly one field so the assertion isolates that branch.
     fn base_argv_config() -> DockerRunConfig {
         DockerRunConfig {
+            output_schema: None,
             container_name: "darkmux-edge".to_string(),
             workspace: PathBuf::from("/tmp/ws"),
             host_out: PathBuf::from("/tmp/out"),
@@ -3494,6 +3561,7 @@ mod tests {
         // inspects the REAL Command the dispatch executes, not just
         // build_docker_run_argv's output vector (which the other tests cover).
         let config = DockerRunConfig {
+            output_schema: None,
             container_name: "darkmux-dispatch-reg".to_string(),
             workspace: PathBuf::from("/tmp/ws"),
             host_out: PathBuf::from("/tmp/out"),
@@ -3829,6 +3897,7 @@ mod tests {
             ..Default::default()
         };
         let role = Role {
+            output_schema: None,
             id: "coder".into(),
             description: "test".into(),
             skills: vec![],
@@ -3858,6 +3927,7 @@ mod tests {
             ..Default::default()
         };
         let role = Role {
+            output_schema: None,
             id: "coder".into(),
             description: "test".into(),
             skills: vec![],

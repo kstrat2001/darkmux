@@ -144,6 +144,7 @@ mod tests {
 
     fn make_role(id: &str, skill_ids: &[&str]) -> Role {
         Role {
+            output_schema: None,
             id: id.into(),
             description: format!("test role {id}"),
             skills: skill_ids.iter().map(|s| s.to_string()).collect(),
