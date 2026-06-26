@@ -366,6 +366,31 @@ impl ProfileRegistry {
             .map(str::trim)
             .filter(|s| !s.is_empty())
     }
+
+    /// (#1054) Resolve which profile a dispatch should use, given an optional
+    /// explicit `--profile <name>` request.
+    ///
+    /// Resolution order:
+    ///   1. the requested name, if it names a profile defined here;
+    ///   2. else `default_profile`, if set and defined;
+    ///   3. else `None` (the caller falls back to probing the loaded model).
+    ///
+    /// A requested name that ISN'T defined here falls through to
+    /// `default_profile` rather than erroring — so a machine-agnostic caller
+    /// (e.g. a CI workflow) can NAME the profile it wants (`review`) while each
+    /// machine decides whether it has defined that profile or degrades to its
+    /// default. The returned name lets the caller detect a fallback (resolved
+    /// name != requested name) and surface it.
+    pub fn resolve_active<'a>(&'a self, requested: Option<&str>) -> Option<(&'a str, &'a Profile)> {
+        if let Some(name) = requested {
+            if let Some((k, p)) = self.profiles.get_key_value(name) {
+                return Some((k.as_str(), p));
+            }
+        }
+        let default_name = self.default_profile.as_deref()?;
+        let profile = self.profiles.get(default_name)?;
+        Some((default_name, profile))
+    }
 }
 
 // `Serialize` so `darkmux serve`'s `/model/status` endpoint (#87) can
@@ -439,6 +464,61 @@ mod compaction_strategy_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // (#1054) ProfileRegistry::resolve_active — per-dispatch profile selection
+    // with graceful fallback. Profiles are empty here since resolve_active only
+    // inspects the registry's keys + default_profile.
+    fn reg(profiles: &[&str], default: Option<&str>) -> ProfileRegistry {
+        let mut map = std::collections::BTreeMap::new();
+        for name in profiles {
+            map.insert((*name).to_string(), Profile::default());
+        }
+        ProfileRegistry {
+            profiles: map,
+            default_profile: default.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resolve_active_prefers_requested_when_defined() {
+        let r = reg(&["review", "deep"], Some("deep"));
+        let (name, _) = r.resolve_active(Some("review")).expect("review is defined");
+        assert_eq!(name, "review");
+    }
+
+    #[test]
+    fn resolve_active_falls_back_to_default_when_requested_undefined() {
+        // The machine-agnostic-caller case: a workflow asks for `review`, this
+        // machine hasn't defined it → degrade to default_profile, not an error.
+        let r = reg(&["deep"], Some("deep"));
+        let (name, _) = r.resolve_active(Some("review")).expect("falls back to default");
+        assert_eq!(name, "deep");
+    }
+
+    #[test]
+    fn resolve_active_uses_default_when_no_request() {
+        let r = reg(&["deep"], Some("deep"));
+        let (name, _) = r.resolve_active(None).expect("default resolves");
+        assert_eq!(name, "deep");
+    }
+
+    #[test]
+    fn resolve_active_none_when_undefined_request_and_no_default() {
+        let r = reg(&["deep"], None);
+        assert!(r.resolve_active(Some("review")).is_none());
+        assert!(r.resolve_active(None).is_none());
+    }
+
+    #[test]
+    fn resolve_active_none_when_default_points_at_undefined_profile() {
+        // A dangling default_profile resolves to nothing (caller probes)...
+        let r = reg(&["deep"], Some("ghost"));
+        assert!(r.resolve_active(None).is_none());
+        // ...but a defined request still wins over the dangling default.
+        let (name, _) = r.resolve_active(Some("deep")).expect("defined request wins");
+        assert_eq!(name, "deep");
+    }
 
     #[test]
     fn profile_model_round_trips() {
