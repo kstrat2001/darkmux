@@ -601,8 +601,9 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // forward-compat tolerance for unknown fields): a role's output feeds a
     // downstream parser that wants a hard contract, so the schema is authored
     // strict-safe (every property in `required`, `additionalProperties: false`,
-    // optionals as nullable unions). Don't "unify" the two — the divergence is
-    // by use case.
+    // optionals nullable via `anyOf` — NOT the `"type":["string","null"]` union,
+    // which LMStudio's grammar compiler rejects with "'type' must be a string").
+    // Don't "unify" the two paths — the divergence is by use case.
     let response_format = response_schema.as_deref().and_then(|s| {
         serde_json::from_str::<serde_json::Value>(s).ok()
     }).map(|schema| {

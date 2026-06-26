@@ -653,21 +653,40 @@ mod tests {
     use tempfile::TempDir;
 
     /// (#1038) Every builtin role's `output_schema`, if present, must be
-    /// LMStudio-`strict`-safe — the runtime sends it with `strict: true`, and a
-    /// non-strict-safe schema makes LMStudio reject the request on the FIRST
-    /// real dispatch (a 400 that no other test catches because nothing else
-    /// loads + validates these manifests). The strict rules: every object schema
-    /// sets `additionalProperties: false` and lists EVERY declared property in
-    /// `required` (optionals are nullable unions but still required). Walks all
-    /// nested objects + array items so a future schema edit can't silently drop
-    /// the invariant.
+    /// LMStudio-grammar-safe — the runtime sends it with `strict: true`, and a
+    /// non-conforming schema makes LMStudio reject the request on the FIRST real
+    /// dispatch (a backend error that no unit test catches because nothing else
+    /// loads these manifests AND calls LMStudio — only a live dogfood does).
+    /// Two rules, learned the hard way. First, the OpenAI strict contract: every
+    /// object schema sets `additionalProperties: false` and lists EVERY declared
+    /// property in `required`. Second, `type` is ALWAYS a single string, never an
+    /// array — LMStudio's grammar compiler rejects the union form
+    /// `"type": ["string","null"]` with `ValueError: 'type' must be a string`
+    /// (the regression that shipped in #1039 and broke every dispatch; nullable
+    /// goes through `anyOf: [{type:string},{type:null}]` instead). Walks nested
+    /// objects, array items, and anyOf/oneOf/allOf branches so a future schema
+    /// edit can't silently drop either invariant.
     #[test]
     fn builtin_role_output_schemas_are_strict_safe() {
         fn assert_strict_safe(schema: &serde_json::Value, role: &str, path: &str) {
             let Some(obj) = schema.as_object() else { return };
-            // Recurse into array items first (they may themselves be objects).
+            // Rule 2: `type` must be a single string, never an array (LMStudio).
+            if let Some(ty) = obj.get("type") {
+                assert!(
+                    ty.is_string(),
+                    "role `{role}` schema at `{path}`: `type` must be a single string, not {ty} — LMStudio rejects the union form (use anyOf for nullable)",
+                );
+            }
+            // Recurse into array items + schema-composition branches.
             if let Some(items) = obj.get("items") {
                 assert_strict_safe(items, role, &format!("{path}[]"));
+            }
+            for kw in ["anyOf", "oneOf", "allOf"] {
+                if let Some(branches) = obj.get(kw).and_then(|b| b.as_array()) {
+                    for (i, branch) in branches.iter().enumerate() {
+                        assert_strict_safe(branch, role, &format!("{path}.{kw}[{i}]"));
+                    }
+                }
             }
             // Only object-typed schemas carry the properties/required contract.
             let Some(props) = obj.get("properties").and_then(|p| p.as_object()) else {
@@ -686,7 +705,7 @@ mod tests {
             for key in props.keys() {
                 assert!(
                     required.contains(&key.as_str()),
-                    "role `{role}` schema at `{path}`: property `{key}` must be in `required` for strict:true (optionals stay required as nullable unions)",
+                    "role `{role}` schema at `{path}`: property `{key}` must be in `required` for strict:true (optionals stay required, nullable via anyOf)",
                 );
                 assert_strict_safe(&props[key], role, &format!("{path}.{key}"));
             }
