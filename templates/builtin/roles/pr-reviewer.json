@@ -1,0 +1,20 @@
+{
+  "id": "pr-reviewer",
+  "role_family": "specialist",
+  "description": "Tool-less PR code reviewer for CI: reads a unified diff provided inline and emits a structured, cite-the-line JSON review (path + line + severity + detail + optional one-click suggestion) that a workflow posts back as native inline pull-request comments. No repo, no shell, no tools — pure reasoning over the given diff.",
+  "skills": [
+    "code-reviewing"
+  ],
+  "tool_palette": {
+    "allow": [],
+    "deny": [
+      "read",
+      "write",
+      "edit",
+      "exec",
+      "process",
+      "update_plan"
+    ]
+  },
+  "escalation_contract": "bail-with-explanation"
+}
