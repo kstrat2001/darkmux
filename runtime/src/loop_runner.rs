@@ -581,7 +581,8 @@ pub fn run(
         // does the promotion (terminal turns only) and then performs the #406
         // strip, so the invariant above still holds for tool-call turns.
         if let Some(choice) = response.choices.first_mut() {
-            promote_terminal_reasoning(&mut choice.message);
+            let finish = choice.finish_reason.clone();
+            promote_terminal_reasoning(&mut choice.message, &finish);
         }
 
         // (#414 PR A) Capture this turn's completion-token count BEFORE
@@ -1348,10 +1349,17 @@ fn run_streaming_turn(
 /// message is the final answer and is never sent back on a subsequent request.
 /// A tool-call turn is left untouched (reasoning is just thinking; the tool call
 /// is the action) and its reasoning is stripped as before.
-fn promote_terminal_reasoning(msg: &mut Message) {
+///
+/// Also skips promotion on a `finish_reason == "length"` turn: that
+/// empty-content, reasoning-dump shape is the per-call-cap runaway the #414
+/// stall-recovery handles (pop, nudge, retry). Promoting there would lift a
+/// *truncated* dump into the answer AND make the content look non-empty,
+/// disabling that recovery. The reported bug is empty content on *successful*
+/// (`stop`) terminal turns.
+fn promote_terminal_reasoning(msg: &mut Message, finish_reason: &str) {
     let has_tools = msg.tool_calls.as_ref().is_some_and(|t| !t.is_empty());
     let content_empty = msg.content.as_deref().map_or(true, |c| c.trim().is_empty());
-    if !has_tools && content_empty {
+    if !has_tools && content_empty && finish_reason != "length" {
         if let Some(reasoning) = msg.reasoning_content.as_deref() {
             if !reasoning.trim().is_empty() {
                 msg.content = Some(reasoning.to_string());
@@ -1791,7 +1799,7 @@ mod tests {
             name: None,
             reasoning_content: Some(r#"{"verdict":"flag","findings":[]}"#.into()),
         };
-        promote_terminal_reasoning(&mut msg);
+        promote_terminal_reasoning(&mut msg, "stop");
         assert_eq!(
             msg.content.as_deref(),
             Some(r#"{"verdict":"flag","findings":[]}"#),
@@ -1821,10 +1829,31 @@ mod tests {
             name: None,
             reasoning_content: Some("thinking which tool to use".into()),
         };
-        promote_terminal_reasoning(&mut msg);
+        promote_terminal_reasoning(&mut msg, "stop");
         assert_eq!(
             msg.content, None,
             "reasoning must NOT be promoted on a tool-call turn",
+        );
+        assert_eq!(msg.reasoning_content, None, "reasoning still stripped (#406)");
+    }
+
+    #[test]
+    fn promote_terminal_reasoning_skips_on_length_truncation() {
+        // (#1050 QA) A length-capped runaway (empty content + reasoning dump, no
+        // tool calls) is the #414 stall-recovery shape — do NOT promote, so the
+        // pop+nudge+retry path stays reachable. Reasoning is still stripped.
+        let mut msg = Message {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            reasoning_content: Some("truncated runaway reasoning...".into()),
+        };
+        promote_terminal_reasoning(&mut msg, "length");
+        assert_eq!(
+            msg.content, None,
+            "must NOT promote on a length-truncated turn (preserves stall recovery)",
         );
         assert_eq!(msg.reasoning_content, None, "reasoning still stripped (#406)");
     }
@@ -1839,7 +1868,7 @@ mod tests {
             name: None,
             reasoning_content: Some("some thinking".into()),
         };
-        promote_terminal_reasoning(&mut msg);
+        promote_terminal_reasoning(&mut msg, "stop");
         assert_eq!(msg.content.as_deref(), Some("the real answer"));
         assert_eq!(msg.reasoning_content, None);
     }
