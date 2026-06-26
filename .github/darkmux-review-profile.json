@@ -1,0 +1,16 @@
+{
+  "_comment": "Dedicated profile for the darkmux self-review CI workflow (.github/workflows/darkmux-review.yml). Pinned via DARKMUX_PROFILES so the review dispatch always uses qwen3.6-35b-a3b regardless of the laptop's active profile — no global state change. The model must be available in the runner's LMStudio (see .github/DARKMUX_REVIEW_RUNNER.md).",
+  "default_profile": "darkmux-review",
+  "profiles": {
+    "darkmux-review": {
+      "description": "darkmux self-review CI — qwen3.6-35b-a3b on the laptop runner",
+      "models": [
+        { "id": "qwen3.6-35b-a3b-turboquant-mlx", "n_ctx": 40000, "role": "primary" }
+      ],
+      "runtime": {
+        "contextTokens": 40000,
+        "compaction": { "mode": "default" }
+      }
+    }
+  }
+}

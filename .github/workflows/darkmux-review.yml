@@ -1,0 +1,110 @@
+# darkmux self-review — darkmux reviews its own PRs, in public, on a local model.
+#
+# darkmux dogfooding itself: a PR diff is dispatched to darkmux's own tool-less
+# `pr-reviewer` role running on a LOCAL LMStudio model (no cloud API), on a
+# self-hosted runner, and the findings post back as native inline PR comments.
+# The work product of darkmux's local-AI review is visible right on the PR.
+#
+# SECURITY (public repo + self-hosted runner): the trigger is **workflow_dispatch
+# only** — it never fires on a `pull_request` event, so a stranger's PR (or a
+# fork) can NOT auto-run anything on the runner. Only someone with write access
+# launches it (`gh workflow run darkmux-review.yml -f pr=<n>`), and even then the
+# job NEVER checks out the reviewed PR's code: it reads only the PR *diff* via
+# the API (data, not executed) and feeds it to the sandboxed, network-isolated
+# internal runtime. The repo checkout below is of trusted `main` (the review
+# tooling), not the PR. Runner registration + prerequisites: see
+# .github/DARKMUX_REVIEW_RUNNER.md.
+name: darkmux self-review
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "PR number to review"
+        required: true
+        type: string
+
+concurrency:
+  group: darkmux-review-${{ inputs.pr }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    runs-on: [self-hosted, darkmux-review]
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR: ${{ inputs.pr }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Checkout review tooling (trusted main — NOT the reviewed PR)
+        uses: actions/checkout@v4
+        # Brings the review script + profile from this repo at the dispatch ref
+        # (main). The reviewed PR's code is never checked out — only its diff is
+        # read via the API below — so untrusted PR code never lands on the runner.
+
+      - name: Fetch PR diff (API only — no PR checkout, no code execution)
+        id: diff
+        run: |
+          set -euo pipefail
+          # Defense-in-depth: the `pr` input is maintainer-supplied, but pin it to
+          # digits so only a valid PR number ever reaches the gh/API calls below.
+          case "$PR" in ''|*[!0-9]*) echo "pr input must be a number"; exit 1 ;; esac
+          mkdir -p "$RUNNER_TEMP/qa"
+          gh pr diff "$PR" --repo "$REPO" > "$RUNNER_TEMP/qa/pr.diff"
+          # Capped copy for the model's context; the full diff is kept for
+          # line-anchor validation when posting inline comments.
+          head -c 80000 "$RUNNER_TEMP/qa/pr.diff" > "$RUNNER_TEMP/qa/pr.capped.diff"
+          if [ -s "$RUNNER_TEMP/qa/pr.capped.diff" ]; then
+            echo "has_diff=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_diff=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build the review prompt (thin — the rubric lives in the role)
+        if: steps.diff.outputs.has_diff == 'true'
+        run: |
+          set -euo pipefail
+          PRTITLE=$(gh pr view "$PR" --repo "$REPO" --json title --jq .title)
+          {
+            echo "Review this pull request diff. Repo ${REPO}, PR #${PR}: ${PRTITLE}"
+            echo "Respond per your role contract (the single JSON object). The full"
+            echo "diff is below; you have only this diff."
+            echo
+            echo '```diff'
+            cat "$RUNNER_TEMP/qa/pr.capped.diff"
+            echo '```'
+          } > "$RUNNER_TEMP/qa/prompt.txt"
+
+      - name: darkmux pr-reviewer dispatch (local model — no LLM API)
+        if: steps.diff.outputs.has_diff == 'true'
+        env:
+          # Pin the review model (qwen3.6-35b-a3b) via a dedicated profile so the
+          # dispatch is deterministic regardless of the laptop's active profile.
+          DARKMUX_PROFILES: ${{ github.workspace }}/.github/darkmux-review-profile.json
+        run: |
+          # Resilient: a hiccup leaves no/empty envelope and the posting script
+          # falls back to a summary note rather than red-X'ing the PR.
+          darkmux crew dispatch pr-reviewer \
+            --json \
+            --timeout 900 \
+            --session-id "darkmux-review-pr${PR}" \
+            --message-from-file "$RUNNER_TEMP/qa/prompt.txt" \
+            > "$RUNNER_TEMP/qa/envelope.json" 2> "$RUNNER_TEMP/qa/err.log" || true
+
+      - name: Post the review (inline comments, or summary fallback)
+        if: steps.diff.outputs.has_diff == 'true'
+        run: |
+          set -euo pipefail
+          # The script is from the trusted-main checkout (not the reviewed PR).
+          MODE=$(python3 "$GITHUB_WORKSPACE/.github/scripts/pr-review-post.py" | sed -n 's/^mode=//p')
+          case "$MODE" in
+            review)
+              gh api "repos/$REPO/pulls/$PR/reviews" --input "$RUNNER_TEMP/qa/review.json" ;;
+            *)
+              gh pr comment "$PR" --repo "$REPO" --body-file "$RUNNER_TEMP/qa/comment.md" ;;
+          esac
