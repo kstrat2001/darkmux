@@ -31,20 +31,21 @@ test('activity lane brackets a session.end-only session as ended, not in-flight'
   await expect(
     page.locator('.sbar[title*="sess-ended-via-sessionend"]')
   ).toHaveCount(1);
-  // ...and is NOT marked in-flight (class "a"). THE regression: pre-fix it was.
+  // ...and is NOT marked running (class "run"; #1071 renamed the in-flight
+  // class from "a"). THE regression: pre-fix it was in-flight.
   await expect(
-    page.locator('.sbar.a[title*="sess-ended-via-sessionend"]')
+    page.locator('.sbar.run[title*="sess-ended-via-sessionend"]')
   ).toHaveCount(0);
 
   // Control: a clean dispatch.complete is also not in-flight.
   await expect(
-    page.locator('.sbar.a[title*="sess-clean-complete"]')
+    page.locator('.sbar.run[title*="sess-clean-complete"]')
   ).toHaveCount(0);
 
   // Control: a genuinely open session (dispatch.start, NO terminal at all)
   // DOES render in-flight — the fix must not over-close legitimate running work.
   await expect(
-    page.locator('.sbar.a[title*="sess-in-flight"]')
+    page.locator('.sbar.run[title*="sess-in-flight"]')
   ).toHaveCount(1);
 
   // Drilling into the session.end-only session must NOT throw. The detail panel
