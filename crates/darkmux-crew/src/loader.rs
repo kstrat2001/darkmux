@@ -652,6 +652,30 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// (#1053) The pr-reviewer prompt must carry the intent-assessment
+    /// directive — the cross-tier-validated lever against "restate-the-fix"
+    /// false positives (a reviewer flagging the very bug a PR fixes). The
+    /// self-review workflow supplies the PR title + description; this directive
+    /// is what tells the model to judge the diff against that stated intent. A
+    /// future edit that dropped it would silently regress the behavior the
+    /// bench A/B (8B and 122B, with-intent → clean pass) proved.
+    #[test]
+    fn pr_reviewer_prompt_carries_intent_directive() {
+        let prompt = BUILTIN_ROLE_PROMPTS
+            .iter()
+            .find(|(id, _)| *id == "pr-reviewer")
+            .map(|(_, c)| *c)
+            .expect("pr-reviewer prompt must be embedded");
+        assert!(
+            prompt.contains("stated intent"),
+            "pr-reviewer.md must instruct assessing against the change's stated intent (#1053)"
+        );
+        assert!(
+            prompt.contains("achieves its stated purpose"),
+            "pr-reviewer.md must frame a correct change as one that achieves its stated purpose (#1053)"
+        );
+    }
+
     /// (#1038) Every builtin role's `output_schema`, if present, must be
     /// LMStudio-grammar-safe — the runtime sends it with `strict: true`, and a
     /// non-conforming schema makes LMStudio reject the request on the FIRST real

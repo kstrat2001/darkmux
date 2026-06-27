@@ -15,9 +15,12 @@ gh workflow run darkmux-review.yml -f pr=<PR_NUMBER>
 ```
 
 (or the **Run workflow** button under Actions → *darkmux self-review*). The job
-then reads only the PR **diff** via the GitHub API — it never checks out or runs
-the reviewed PR's code — and dispatches it to darkmux's tool-less `pr-reviewer`
-role in the sandboxed, network-isolated internal runtime. The findings post back
+reads only the PR **diff** plus its **title and description** via the GitHub API
+— all data, never checked out or executed — and dispatches them to darkmux's
+tool-less `pr-reviewer` role in the sandboxed, network-isolated internal runtime.
+(The title + description give the reviewer the change's stated intent, so it
+assesses the diff against its purpose instead of flagging the bug a fix removes —
+#1053.) The findings post back
 as native inline review comments. The only checkout is of trusted `main` (the
 review tooling), not the PR.
 
@@ -40,14 +43,21 @@ comment launches it — still maintainer-only.
    - `darkmux` on PATH (`cargo install --path .` from this repo, or `brew install darkmux`).
    - The `darkmux-runtime` Docker image present (Docker running; `darkmux` pulls/uses
      `darkmux-runtime:latest`).
-   - LMStudio reachable at the default endpoint with **`qwen/qwen3-8b`** available
-     (loaded, or JIT-loadable). To pin it, the workflow sets `DARKMUX_PROFILES` to
-     `.github/darkmux-review-profile.json` — change the model id there if you want
-     a different review model. NOTE: qwen3_5-family models (e.g.
-     `qwen3.6-35b-a3b`) route their answer to `reasoning_content` and leave the
-     message content empty under the current LMStudio reasoning-parser config,
-     which yields **empty reviews** — qwen3-8b emits content and is the working
-     default until that config is sorted.
+   - A **`review` profile** in the runner's `~/.darkmux/profiles.json`, pointing
+     at a lab-validated review model. The workflow dispatches with `--profile
+     review` (#1054) — it NAMES the profile and lets *this machine* map it to a
+     model, instead of pinning a model id in the public repo. If you haven't
+     defined `review`, the dispatch falls back to your `default_profile`. Pick a
+     model that emits its answer in the message **content**: `qwen/qwen3-8b` does;
+     the qwen3_5-family thinking models (e.g. `qwen3.6-35b-a3b`) route their answer
+     to `reasoning_content` and leave content empty under the current LMStudio
+     reasoning-parser config, yielding **empty reviews**. The model must be
+     available in LMStudio (loaded or JIT-loadable). Add a `review` entry to the
+     `profiles` object of your existing `~/.darkmux/profiles.json` (this is a
+     fragment to insert, not a whole file):
+     ```json
+     "review": { "models": [{ "id": "qwen/qwen3-8b", "n_ctx": 32000, "role": "primary" }] }
+     ```
    - `python3` + `gh` on PATH (GitHub's runner image bundles `gh`).
 
 ## Notes
@@ -55,7 +65,8 @@ comment launches it — still maintainer-only.
 - The review is **advisory** (no merge gate) and runs a local 8B-class model:
   strong on obvious/security/test-coverage issues, shallower on deep semantic /
   cross-file bugs — pair it with a human/frontier pass on substantive PRs.
-- The model choice is operator-tunable in `.github/darkmux-review-profile.json`.
-  Pick a model that emits its answer in the message **content** (not only
-  `reasoning_content`) — qwen3-8b does; the qwen3_5-family thinking models
-  currently don't (see the prerequisite note above).
+- The model choice is operator-tunable **on the runner**: edit the `review`
+  profile in `~/.darkmux/profiles.json` (the workflow names `--profile review`;
+  it never pins a model id in the repo). Pick a model that emits its answer in the
+  message **content** (not only `reasoning_content`) — qwen3-8b does; the
+  qwen3_5-family thinking models currently don't (see the prerequisite note above).

@@ -43,7 +43,7 @@ jobs:
     steps:
       - name: Checkout review tooling (trusted main — NOT the reviewed PR)
         uses: actions/checkout@v4
-        # Brings the review script + profile from this repo at the dispatch ref
+        # Brings the review/posting script from this repo at the dispatch ref
         # (main). The reviewed PR's code is never checked out — only its diff is
         # read via the API below — so untrusted PR code never lands on the runner.
 
@@ -65,15 +65,36 @@ jobs:
             echo "has_diff=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Build the review prompt (thin — the rubric lives in the role)
+      - name: Build the review prompt (intent + diff — the rubric lives in the role)
         if: steps.diff.outputs.has_diff == 'true'
         run: |
           set -euo pipefail
+          # #1053: a reviewer that doesn't know the change's INTENT flags the very
+          # bug the PR fixes (the "restate-the-fix" false positive). Supply the
+          # author's own title + description so the role can assess the diff against
+          # its stated purpose. This is procedural (a `gh` fetch) — NO AI in the
+          # loop, so it stays within the runner's no-LLM-API constraint. The body
+          # is the author's data (not executed) and is capped for the model's
+          # context budget; an empty body is fine (the role infers from title+diff).
           PRTITLE=$(gh pr view "$PR" --repo "$REPO" --json title --jq .title)
+          PRBODY=$(gh pr view "$PR" --repo "$REPO" --json body --jq '.body // ""')
+          # Cap for the model's context budget via a bash substring, NOT `| head`:
+          # under `set -o pipefail`, head closing the pipe early would SIGPIPE gh
+          # (141) and abort the step on any body over the cap.
+          PRBODY="${PRBODY:0:8000}"
           {
-            echo "Review this pull request diff. Repo ${REPO}, PR #${PR}: ${PRTITLE}"
-            echo "Respond per your role contract (the single JSON object). The full"
-            echo "diff is below; you have only this diff."
+            printf 'PR #%s in %s: %s\n' "$PR" "$REPO" "$PRTITLE"
+            echo
+            echo "Description (the author's stated intent for this change):"
+            if [ -n "$PRBODY" ]; then
+              printf '%s\n' "$PRBODY"
+            else
+              echo "(no description provided)"
+            fi
+            echo
+            echo "Respond per your role contract (the single JSON object). Assess the"
+            echo "diff against the stated intent above. The full diff is below; you"
+            echo "have only this diff."
             echo
             echo '```diff'
             cat "$RUNNER_TEMP/qa/pr.capped.diff"
@@ -82,14 +103,22 @@ jobs:
 
       - name: darkmux pr-reviewer dispatch (local model — no LLM API)
         if: steps.diff.outputs.has_diff == 'true'
-        env:
-          # Pin the review model (qwen3.6-35b-a3b) via a dedicated profile so the
-          # dispatch is deterministic regardless of the laptop's active profile.
-          DARKMUX_PROFILES: ${{ github.workspace }}/.github/darkmux-review-profile.json
         run: |
+          # Model selection lives on the MACHINE, not in this public workflow
+          # (#1054): `--profile review` NAMES the profile this dispatch wants; the
+          # runner defines a `review` profile in its ~/.darkmux/profiles.json
+          # pointing at a lab-validated model. The workflow can't know which
+          # machine it lands on, so it names an intent and lets the machine map it
+          # to a model that worked in its lab — one that emits its answer in the
+          # message content (qwen3-8b does; qwen3_5-family thinking models route to
+          # reasoning_content and yield empty reviews). A runner that hasn't defined
+          # `review` falls back to its default_profile. See
+          # .github/DARKMUX_REVIEW_RUNNER.md.
+          #
           # Resilient: a hiccup leaves no/empty envelope and the posting script
           # falls back to a summary note rather than red-X'ing the PR.
           darkmux crew dispatch pr-reviewer \
+            --profile review \
             --json \
             --timeout 900 \
             --session-id "darkmux-review-pr${PR}" \
