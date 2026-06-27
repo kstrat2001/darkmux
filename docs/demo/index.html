@@ -1698,7 +1698,7 @@ function followLatest(){ state.follow=true; state.t=tMax; render(); }
 // selected (follow off) regardless of where the playhead sits.
 window.selectRec=id=>{state.selected=id;state.follow=false;render();};
 $("follow").onclick=()=>{ if(state.follow){state.follow=false;render();} else followLatest(); };
-$("back").onclick=()=>{ if(state.level==="subsystem")drillMachine(state.machine); else if(state.level==="machine")goFleet(); else if(state.level==="mission")goMissions(); else if(state.level==="missions")goFleet(); };
+$("back").onclick=()=>{ if(state.level==="subsystem")drillMachine(state.machine); else if(state.level==="loose")drillMachine(state.machine); else if(state.level==="machine")goFleet(); else if(state.level==="mission")goMissions(); else if(state.level==="missions")goFleet(); };
 // Scrubbing moves the playhead and (RE-)ENGAGES following — render()'s follow
 // branch reselects the newest VISIBLE record at the new state.t, so the
 // selection tracks the playhead (never strands one record ahead of it) and the
