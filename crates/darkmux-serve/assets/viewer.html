@@ -23,7 +23,7 @@
   :root{
     --bg:#0a0a0b; --bg2:#131316; --panel:#1c1c22; --line:#1f1f24;
     --text:#e8e6e3; --muted:#8a8a92; --amber:#6df1ff; --amber-dim:#2a8a96;
-    --good:#5af0a3; --warn:#ffb86b; --bad:#ff6b85;
+    --good:#5af0a3; --warn:#ffb86b; --bad:#ff6b85; --run:#ffd166;
   }
   *{box-sizing:border-box}
   html,body{margin:0;height:100vh;background:var(--bg);color:var(--text);font:14px/1.4 'Inter',-apple-system,system-ui,sans-serif;overflow:hidden}
@@ -46,10 +46,12 @@
   .catrow.live .cd{color:var(--amber)}
   .catempty{color:var(--muted);font:12px/1.4 Inter,sans-serif;padding:8px 9px}
   @keyframes lpulse{0%,100%{opacity:1}50%{opacity:.5}}
-  .pb.live{color:#4ade80;border-color:#4ade80;animation:lpulse 1.6s ease-in-out infinite}
+  /* (#1071) live-MODE badge is cyan, not green — green now means a SUCCESSFUL
+     run (status convention). The badge is a viewing-mode cue, not a verdict. */
+  .pb.live{color:var(--amber);border-color:var(--amber);animation:lpulse 1.6s ease-in-out infinite}
   /* (#238) Respect prefers-reduced-motion: drop the infinite live-badge pulse
      (and shorten transitions) for vestibular accessibility. Live state stays
-     distinguishable WITHOUT motion — the badge keeps its green color, the "●"
+     distinguishable WITHOUT motion — the badge keeps its cyan color, the "●"
      glyph, and the word "live" (vs "▣ playback"); recents stay dimmed + labeled.
 
      The universal `*` reset is the canonical reduced-motion pattern, chosen
@@ -147,8 +149,12 @@
   .lane{display:flex;align-items:center;gap:12px;margin-bottom:7px}
   .lname{width:var(--lname-w,150px);flex:none;font:12px 'JetBrains Mono',monospace;color:var(--text);text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .tltrack{position:relative;flex:1;height:28px;background:var(--panel);border:1px solid var(--line);border-radius:4px;overflow:hidden}
-  .sbar{position:absolute;top:5px;height:18px;background:var(--amber-dim);border-radius:3px;min-width:2px}
-  .sbar.a{background:var(--amber);box-shadow:0 0 6px var(--amber)}
+  /* (#1071) activity-timeline bars share the status convention: running=yellow
+     (pulse), complete=green, canceled=orange, failed=red. */
+  .sbar{position:absolute;top:5px;height:18px;background:var(--muted);border-radius:3px;min-width:2px}
+  .sbar.run{background:var(--run);box-shadow:0 0 6px var(--run);animation:lpulse 1.6s ease-in-out infinite}
+  .sbar.done{background:var(--good)}
+  .sbar.canceled{background:var(--warn)}
   .sbar.err{background:var(--bad)}
   .tltrack .ph{position:absolute;top:0;bottom:0;width:2px;background:var(--text);opacity:.32}
   .tlaxis{margin-left:calc(var(--lname-w,150px) + 12px);display:flex;justify-content:space-between;font:9px 'JetBrains Mono',monospace;color:var(--muted);margin-top:7px}
@@ -171,8 +177,12 @@
   .node .s{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin-top:4px}
   .node .s.tsline{color:var(--amber-dim);margin-top:6px}
   .pill{display:inline-block;font:600 10px 'JetBrains Mono',monospace;padding:2px 7px;border-radius:10px;margin-top:8px}
-  .pill.run{background:#16261d;color:var(--good)}.pill.done{background:#1c1c22;color:var(--muted)}.pill.util{background:var(--bg2);color:var(--amber-dim);border:1px solid var(--line)}
-  .pill.ended{background:#241a12;color:var(--amber-dim)}
+  /* (#1071) status convention — running=yellow(pulse), complete=green,
+     canceled=orange, failed=red, anomaly=cyan. */
+  .pill.run{background:#2a2410;color:var(--run);animation:lpulse 1.6s ease-in-out infinite}.pill.done{background:#16261d;color:var(--good)}.pill.util{background:var(--bg2);color:var(--amber-dim);border:1px solid var(--line)}
+  .pill.canceled{background:#241a12;color:var(--warn)}
+  .pill.muted{background:#1c1c22;color:var(--muted)} /* neutral (e.g. utility-model residency states), not a dispatch verdict */
+  .pill.warn{background:var(--bg2);color:var(--amber);border:1px solid var(--amber)}
   .pill.err{background:#2a1416;color:var(--bad)}
   .wallerr{color:var(--bad);font-weight:600}
   .node.util{cursor:default;border-left:3px solid var(--amber-dim)}.node.util:hover{border-color:var(--line)}
@@ -231,7 +241,7 @@
   .finding .ff{display:block;font-size:11px;color:var(--muted);margin-top:5px}
   .misslink{cursor:pointer;color:var(--amber);text-decoration:none}.misslink:hover{text-decoration:underline}
   /* (#789) activity-driven headline: running = live-green subject; idle = muted status (not a link) */
-  #meta .run{color:#4ade80}
+  #meta .run{color:var(--run)}
   #meta .idle{color:var(--muted);cursor:default}
   #meta .metahint{color:var(--muted);font:11px 'JetBrains Mono',monospace}
   /* (#803) hybrid note — the encouraging line inside the savings card */
@@ -614,6 +624,18 @@ const dispatch=(sid,act)=>DATA.find(r=>r.session_id===sid&&r.action==="dispatch.
 const dispatchEnd=sid=>dispatch(sid,"complete")||dispatch(sid,"error");
 const dispatchErrored=rec=>!!rec&&rec.action==="dispatch.error";
 const dispatchKilled=rec=>dispatchErrored(rec)&&((rec.payload&&rec.payload.exit_code)===137);
+// (#1071) Single source of the status COLOR/LABEL vocabulary so the crew cards,
+// recent-runs rows, and fleet activity-timeline bars can't drift apart. Each
+// surface detects its own state (it answers a slightly different question about
+// an OPEN session) and hands the booleans here; this maps them to the shared
+// convention: running=yellow(pulse), complete=green, canceled=orange,
+// failed=red. Killed (watchdog timeout) is a failure → red, same as errored.
+function statusVisual({open, errored, killed, clean}){
+  if(open) return {cls:"run", lbl:"running"};
+  if(errored) return {cls:"err", lbl:killed?"killed":"errored"};
+  if(clean) return {cls:"done", lbl:"complete"};
+  return {cls:"canceled", lbl:"canceled"};
+}
 // (#647) The reconciler-emitted `session.end` close-edge for an ABANDONED
 // session (crash/kill/timeout — no clean dispatch.complete). Lets playback
 // bracket the running interval where there's no complete to close it.
@@ -949,7 +971,9 @@ function renderFleet(){
     const bars=sessionsOn(m).map(sid=>{
       const s=dispatch(sid,"start"); if(!s||T(s.ts)>state.t)return"";
       const term=dispatchEnd(sid), close=sessionCloseEdge(sid), done=close&&T(close.ts)<=state.t;
-      const err=done&&dispatchErrored(term);
+      // (#1071) open bar (not closed at the scrubber) = still running → yellow;
+      // closed maps to complete/canceled/failed via the shared convention.
+      const {cls,lbl}=statusVisual({open:!done, errored:done&&dispatchErrored(term), killed:dispatchKilled(term), clean:done&&!!term&&!dispatchErrored(term)});
       const end=done?T(close.ts):state.t;
       const W=Math.max(0.6,pct(end)-pct(T(s.ts)));
       // Clamp so a bar at/near "now" (left≈100%) + its min-width can't spill
@@ -957,7 +981,7 @@ function renderFleet(){
       // Shift left so left+width never exceeds 100%.
       const L=Math.max(0,Math.min(pct(T(s.ts)),100-W));
       const role=(s.handle||"").replace(/^darkmux\//,"");
-      return `<div class="sbar ${done?(err?'err':''):'a'}" style="left:${L}%;width:${W}%" title="${esc(role)} · ${esc(sid)}${done?(err?(dispatchKilled(term)?' · killed (timeout)':' · errored'):''):' · in flight'}"></div>`;
+      return `<div class="sbar ${cls}" style="left:${L}%;width:${W}%" title="${esc(role)} · ${esc(sid)} · ${esc(lbl)}"></div>`;
     }).join("");
     return `<div class="lane"><div class="lname" title="${escN(m)}">${escN(m)}</div><div class="tltrack">${bars}<div class="ph" style="left:${pct(state.t)}%"></div></div></div>`;
   }).join("");
@@ -1026,10 +1050,12 @@ function renderMachine(){
   const isLocalMach = MACHINE_SPECS && nameOf(m)===MACHINE_SPECS.machine_id;
   const um = isLocalMach ? MACHINE_SPECS.utility_model : undefined; // {id,loaded} | null | undefined
   let utilState, utilPill;
-  if(um===undefined){ utilState='utility tier'; utilPill='<span class="pill done">not reported</span>'; }
-  else if(um===null){ utilState='utility tier · not configured'; utilPill='<span class="pill done">not configured</span>'; }
-  else if(um.loaded){ utilState=`utility tier · ${esc(um.id)}`; utilPill='<span class="pill run">resident</span>'; }
-  else { utilState=`utility tier · ${esc(um.id)}`; utilPill='<span class="pill ended">registered · not loaded</span>'; }
+  // (#1071) utility-model residency is NOT a dispatch verdict — use neutral
+  // (muted) for unknown/not-configured/not-loaded, green only for resident (ready).
+  if(um===undefined){ utilState='utility tier'; utilPill='<span class="pill muted">not reported</span>'; }
+  else if(um===null){ utilState='utility tier · not configured'; utilPill='<span class="pill muted">not configured</span>'; }
+  else if(um.loaded){ utilState=`utility tier · ${esc(um.id)}`; utilPill='<span class="pill done">resident</span>'; }
+  else { utilState=`utility tier · ${esc(um.id)}`; utilPill='<span class="pill muted">registered · not loaded</span>'; }
   const util=`<div class="node util"><div class="h">darkmux/utility</div>
     <div class="s">${utilState}</div>
     <div class="s">compaction · mission-compile · estimate · scribe</div>
@@ -1076,14 +1102,13 @@ function renderMachine(){
     // emitter's stop() pre-claims session-end on the normal return path
     // regardless of exit code. Only leaks on a Redis-outage-spans-TTL window.
     const liveNow=liveSet.has(sid);
-    let cls,lbl;
-    if(closedBy){
-      if(errClose){ cls='err'; lbl=dispatchKilled(c)?'killed':'errored'; }
-      else { cls=cleanClose?'done':'ended'; lbl=cleanClose?'complete':'ended'; }
-    }
-    else if(!machAbsent&&liveNow){ cls='run'; lbl='running'; }
-    else if(!machAbsent&&closeTs!=null){ cls='run'; lbl='running'; }
-    else { cls='ended'; lbl='ended'; }
+    // (#1071) map this card's detected state to the shared status convention.
+    // open = running now (live beat) or running at the scrubber (close is later);
+    // an absent machine can't be running. errored/killed → failed (red); a clean
+    // complete → green; anything else terminal → canceled (orange).
+    const {cls,lbl}=statusVisual({
+      open:!closedBy&&!machAbsent&&(liveNow||closeTs!=null),
+      errored:closedBy&&errClose, killed:dispatchKilled(c), clean:closedBy&&cleanClose });
     // (#691) Card timestamp line so recent runs are dated + identifiable at a
     // glance: completed cards show the close time, running cards show start time.
     const startTs=s?T(s.ts):null;
