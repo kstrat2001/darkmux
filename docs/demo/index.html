@@ -69,7 +69,6 @@
     *,*::before,*::after{animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.001ms!important}
   }
   .crumbbar{height:40px;display:flex;align-items:center;gap:12px;padding:0 16px;border-bottom:1px solid var(--line);background:#131316}
-  .backbtn{background:var(--bg);border:1px solid var(--line);color:var(--text);padding:5px 11px;border-radius:4px;cursor:pointer;font:600 12px 'JetBrains Mono',monospace}
   .crumb{font:600 13px 'JetBrains Mono',monospace;color:var(--muted)}
   .crumb a{color:var(--amber);cursor:pointer;text-decoration:none}.crumb a:hover{text-decoration:underline}
   /* (#827) missions index rows */
@@ -423,11 +422,11 @@
     .meta { flex: 1 1 100%; margin-left: 0; text-align: left; font-size: 10px; }
 
     /* (#1087) Touch-size the icon-only chrome buttons on phones. #1067 stripped
-       the text labels that gave .fbtn/.follow/.catbtn/.backbtn their height,
+       the text labels that gave .fbtn/.follow/.catbtn their height,
        collapsing them below the WCAG 2.5.8 24px target floor; the mobile block
        had sized only .scrub button. Square ~44px targets, glyph optically
        centered. Icon-only design + title/aria-label unchanged. */
-    .fbtn, .follow, .catbtn, .backbtn {
+    .fbtn, .follow, .catbtn {
       min-width: 44px; min-height: 44px;
       display: inline-flex; align-items: center; justify-content: center;
       padding: 0 10px; font-size: 15px; line-height: 1;
@@ -473,7 +472,6 @@
 </div>
 <div class="catpanel" id="catpanel" hidden></div>
 <div class="crumbbar">
-  <button class="backbtn" id="back" title="back" aria-label="back" hidden>‹</button>
   <span class="lenstabs"><a class="lens" id="lens-fleet" data-act="fleet">fleet</a><a class="lens" id="lens-missions" data-act="missions">missions</a></span>
   <span class="crumb" id="crumb"></span>
   <span class="meta" id="meta"></span>
@@ -1545,15 +1543,17 @@ function renderCrumb(){
   if(inMissions){
     let mc=`<a data-act="missions">missions</a>`;
     if(state.level==="mission") mc+=`<span class="sep">›</span>◆ ${esc(state.missionId||primaryMission()||"—")}`;
-    $("crumb").innerHTML=mc; $("back").hidden=false; return;
+    $("crumb").innerHTML=mc; return;
   }
   const pm=primaryMission();
   const hasMission=pm!=null;
   let c=hasMission?`<a class="misslink" data-act="mission">◆ ${esc(pm)}</a>`:``;
   c+=(hasMission?`<span class="sep">›</span>`:``)+`<a data-act="fleet">fleet</a>`;
-  if(state.level==="machine"||state.level==="subsystem") c+=`<span class="sep">›</span><a data-act="machine" data-arg="${esc(state.machine)}">${escN(state.machine)}</a>`;
+  // (#1094) loose included so the crumb carries the machine link there too —
+  // it's the up-nav now that the back button is gone (loose drills from a machine).
+  if(state.level==="machine"||state.level==="subsystem"||state.level==="loose") c+=`<span class="sep">›</span><a data-act="machine" data-arg="${esc(state.machine)}">${escN(state.machine)}</a>`;
   if(state.level==="subsystem") c+=`<span class="sep">›</span>${esc(state.session)}`;
-  $("crumb").innerHTML=c; $("back").hidden=(state.level==="fleet");
+  $("crumb").innerHTML=c;
 }
 function filtersActive(){return state.filters.cat.size<FCATS.length||state.filters.tier.size<FTIERS.length||state.filters.src.size<FSRC.length||!!state.filters.q;}
 function updateFbtn(){const a=filtersActive();const b=$("fbtn");b.className="fbtn"+(a?" on":"");b.textContent=a?"⚙ •":"⚙";b.title=a?"filters (active)":"filters";b.setAttribute("aria-label",b.title);}
@@ -1774,7 +1774,6 @@ function followLatest(){ state.follow=true; state.t=tMax; render(); }
 // selected (follow off) regardless of where the playhead sits.
 window.selectRec=id=>{state.selected=id;state.follow=false;render();};
 $("follow").onclick=()=>{ if(state.follow){state.follow=false;render();} else followLatest(); };
-$("back").onclick=()=>{ if(state.level==="subsystem")drillMachine(state.machine); else if(state.level==="loose")drillMachine(state.machine); else if(state.level==="machine")goFleet(); else if(state.level==="mission")goMissions(); else if(state.level==="missions")goFleet(); };
 // Scrubbing moves the playhead and (RE-)ENGAGES following — render()'s follow
 // branch reselects the newest VISIBLE record at the new state.t, so the
 // selection tracks the playhead (never strands one record ahead of it) and the
