@@ -229,11 +229,11 @@
   .met .mv{font:600 17px 'JetBrains Mono',monospace;color:var(--text)}
   .met .ml{font:10px 'JetBrains Mono',monospace;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-top:3px}
   .tokbar{height:4px;background:var(--line);border-radius:2px;margin-top:7px;overflow:hidden}.tokbar span{display:block;height:100%;background:var(--amber)}
-  .cpuchart{display:flex;gap:8px;align-items:flex-end}
+  .cpuchart{display:flex;gap:8px;align-items:flex-end;overflow-x:auto}
   .yax{display:flex;flex-direction:column;justify-content:space-between;height:80px;font:9px 'JetBrains Mono',monospace;color:var(--muted);text-align:right}
   .bars{display:flex;align-items:flex-end;gap:6px;height:80px;border-bottom:1px solid var(--line)}.bar{width:24px;background:var(--amber-dim);border-radius:2px 2px 0 0}
   .xvals{display:flex;gap:6px;margin-top:4px}.xvals span{width:24px;text-align:center;font:9px 'JetBrains Mono',monospace;color:var(--muted)}
-  .ctxchart{width:440px;height:74px;display:block;border-bottom:1px solid var(--line)}
+  .ctxchart{width:100%;max-width:440px;height:74px;display:block;border-bottom:1px solid var(--line)}
   .finding{border:1px solid var(--line);border-left:3px solid var(--line);border-radius:5px;padding:9px 12px;margin-bottom:7px;background:var(--panel)}
   .finding.warn{border-left-color:var(--warn)}.finding.ok{border-left-color:var(--good)}
   .finding .fk{display:block;font:600 12px 'JetBrains Mono',monospace;color:var(--warn)}.finding.ok .fk{color:var(--good)}
@@ -293,7 +293,7 @@
   .sps.running{background:#16261d;color:var(--good)}.sps.planned{background:var(--bg2);color:var(--amber-dim);border:1px solid var(--line)}
   .sps.abandoned{background:#241a1a;color:var(--muted)}
   .cycstrip{display:inline-flex;align-items:center;gap:3px;flex:0 0 auto}
-  .cyc{font:600 9px/1 'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.06em;padding:3px 6px;border-radius:3px;background:var(--bg2);color:var(--muted);border:1px solid var(--line)}
+  .cyc{font:600 10px/1 'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.06em;padding:3px 6px;border-radius:3px;background:var(--bg2);color:var(--muted);border:1px solid var(--line)}
   .cyc.on{background:var(--amber-dim);color:#0a0f17;border-color:var(--amber-dim)}
   .cyc.abort{background:#2a1416;color:var(--bad);border-color:var(--bad)}
   .cyc.block{background:#241f12;color:var(--warn);border-color:var(--warn)}
@@ -323,7 +323,7 @@
 
   /* filter modal */
   .modalbg{position:fixed;inset:0;background:rgba(0,0,0,0.65);z-index:100;display:none;align-items:center;justify-content:center}
-  .modal{width:380px;background:var(--bg2);border:1px solid var(--amber-dim);border-radius:8px;padding:18px 20px}
+  .modal{width:380px;max-width:92vw;background:var(--bg2);border:1px solid var(--amber-dim);border-radius:8px;padding:18px 20px}
   .mhd{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;font:600 13px 'JetBrains Mono',monospace;letter-spacing:.08em;text-transform:uppercase;color:var(--amber)}
   .mx{background:none;border:none;color:var(--muted);font-size:16px;cursor:pointer}
   .fgroup{margin-bottom:14px}
@@ -431,6 +431,21 @@
     /* .sclear sits absolutely inside the search input; a 44px box would overflow
        the field, so keep the 18px circle and expand only the tap area. */
     .sclear::after { content: ""; position: absolute; inset: -13px; }
+
+    /* (#1089) Mobile layout hardening — elements that were fixed-width or didn't
+       reflow on a phone. */
+    /* crew cards: fixed 260px inline-block → full-width stacked */
+    .node { display: block; width: 100%; margin: 0 0 12px 0; }
+    /* log detail pane: the JS sets a fixed 200px height (split drag is hidden on
+       mobile), which squeezed the event list — let it size to content, capped. */
+    .detail { height: auto !important; max-height: 38vh; }
+    /* mission index rows: reflow, meta drops to its own line */
+    .mirow { flex-wrap: wrap; }
+    .mimeta { flex: 1 1 100%; }
+    /* sprint rows: reflow; the 190px-min run-target column would overflow */
+    .sprow { flex-wrap: wrap; }
+    .spa { min-width: 0; text-align: left; }
+    .sprun { flex: 1 1 100%; text-align: left; }
   }
 </style>
 </head>
