@@ -11,6 +11,55 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-06-27
+
+darkmux's local **PR reviewer** got materially better and self-contained. It now
+reads each change against its **stated intent** (the PR title + description), so it
+stops flagging the very bug a fix removes; it anchors findings by **quoting the
+line** and resolving that quote to a coordinate in the harness (local models name
+the construct reliably but guess line numbers badly); and the whole review-render
+step now lives **in the binary** (`darkmux pr-review render`), versioned with the
+role schema, instead of a copied script every repo had to keep in sync. darkmux
+also reviews **its own PRs** in public, on a local model, via a self-hosted runner.
+
+No schema change (`FLOW_SCHEMA` stays `1.14.0`) — a clean `brew upgrade`. The
+`runtime/` image is rebuilt for the reasoning-content fix below, so a fleet on the
+internal runtime pulls the new `darkmux-runtime` image.
+
+### Added
+- **`darkmux crew dispatch --profile <name>` (#1054).** Select a named profile
+  from the machine's registry for a dispatch's model + context-window resolution;
+  a name not defined on this machine falls back to `default_profile` (with a
+  note). Lets a machine-agnostic caller (a CI workflow) name the profile it wants
+  while each machine owns which lab-validated model that maps to.
+- **Intent-aware PR review (#1053).** The `pr-reviewer` role now assesses the diff
+  against the PR's stated purpose (title + description, fetched procedurally — no
+  AI), flagging only where the change *fails* its intent, not the problem it's
+  solving. Validated head-to-head: an 8B and a 122B both stopped false-flagging a
+  correct fix once given the intent — input-shaping over raw model size.
+- **Quote-the-line anchoring for review findings (#1053).** Findings carry an
+  `anchor` (a verbatim quote of the line) instead of a line number; the harness
+  resolves it to the exact new-side line. Mis-located inline comments go away;
+  file-level findings post as general comments instead of onto a guessed line.
+- **`darkmux pr-review render` (#1060).** Binary-owned generation of the GitHub
+  review payload from a dispatch envelope + diff (resolve anchors → inline
+  comments + summary). Replaces the per-repo `pr-review-post.py` copy, so the
+  render versions *with* the role's output schema and never silently drifts; the
+  workflow keeps the `gh` post, and `--emit` writes the payload for full control.
+- **darkmux self-review workflow (#1047) + overridable `role`/`profile` inputs
+  (#1057).** darkmux reviews its own PRs on a local model (no cloud API), on a
+  self-hosted runner, posting native inline comments — `workflow_dispatch`-only
+  for public-repo safety. `-f role=` / `-f profile=` override the dispatch per run.
+
+### Fixed
+- **Thinking models no longer return empty reviews (#1050).** qwen3_5-family
+  models routed their whole answer to `reasoning_content`, leaving message
+  `content` empty; the runtime now promotes terminal reasoning to content (guarded
+  so it never disables the length-runaway stall recovery).
+- **Viewer phantom "unknown" machine card (#1048).** The flow stream's
+  schema-header line was bucketed as a machine in the topology view; it's now
+  skipped.
+
 ## [1.10.0] - 2026-06-26
 
 A local model can now run as an automated **PR reviewer**: a tool-less role
@@ -469,6 +518,7 @@ cluster of crew-index correctness repairs.
   idle machine's bar no longer stretches to the playhead; adds the first
   viewer-lifecycle e2e regression gate.
 
+[1.11.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.11.0
 [1.10.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.10.0
 [1.9.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.9.0
 [1.8.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.8.0
