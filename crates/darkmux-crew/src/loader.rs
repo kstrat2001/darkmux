@@ -676,6 +676,40 @@ mod tests {
         );
     }
 
+    /// (#1053 quote-resolve) The pr-reviewer prompt must instruct the model to
+    /// quote the line (`anchor`) rather than emit a line number — the workflow
+    /// resolves the quote to a coordinate deterministically. The n=5 A/B showed
+    /// model-emitted line numbers mis-localize (the construct it names is right,
+    /// the integer is ~20 lines off); a regression back to line-numbers would
+    /// silently bring that back. The output schema (`pr-reviewer.json`) must
+    /// agree — it carries `anchor`, not `line`.
+    #[test]
+    fn pr_reviewer_prompt_and_schema_use_quote_anchor() {
+        let prompt = BUILTIN_ROLE_PROMPTS
+            .iter()
+            .find(|(id, _)| *id == "pr-reviewer")
+            .map(|(_, c)| *c)
+            .expect("pr-reviewer prompt must be embedded");
+        assert!(
+            prompt.contains("anchor"),
+            "pr-reviewer.md must describe the `anchor` (quote-the-line) field (#1053)"
+        );
+        assert!(
+            prompt.contains("do not output a line number"),
+            "pr-reviewer.md must tell the model NOT to emit a line number (#1053)"
+        );
+        let role_json = BUILTIN_ROLES
+            .iter()
+            .find(|(id, _)| *id == "pr-reviewer")
+            .map(|(_, c)| *c)
+            .expect("pr-reviewer manifest must be embedded");
+        let role: Role = serde_json::from_str(role_json).expect("pr-reviewer manifest parses");
+        let schema = role.output_schema.expect("pr-reviewer has an output_schema");
+        let props = &schema["properties"]["findings"]["items"]["properties"];
+        assert!(props.get("anchor").is_some(), "finding schema must carry `anchor` (#1053)");
+        assert!(props.get("line").is_none(), "finding schema must NOT carry `line` (replaced by anchor, #1053)");
+    }
+
     /// (#1038) Every builtin role's `output_schema`, if present, must be
     /// LMStudio-grammar-safe — the runtime sends it with `strict: true`, and a
     /// non-conforming schema makes LMStudio reject the request on the FIRST real

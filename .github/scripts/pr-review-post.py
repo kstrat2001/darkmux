@@ -7,9 +7,13 @@ API with native inline comments. Robust by design:
 
   * Tolerant JSON extraction (the model may wrap the block in ```json fences
     or add stray prose) — local models malform output, so we never hard-fail.
-  * Each finding's line is validated against the diff's new-side hunks, because
-    GitHub rejects an inline comment on a line it can't see. Out-of-range
-    findings are folded into the summary body instead of being dropped.
+  * Each finding carries an `anchor` — a verbatim quote of the line it's about,
+    not a line number (local models identify the construct reliably but guess
+    its coordinate badly). We resolve that quote to a new-side line by matching
+    it against the diff, because GitHub rejects an inline comment on a line it
+    can't see. Findings whose anchor is null (file-level) or can't be matched to
+    exactly one shown line are folded into the summary body, never guessed onto a
+    line.
   * If the block won't parse at all, we fall back to posting the raw review as
     a single summary comment.
 
@@ -20,7 +24,6 @@ Outputs to $RUNNER_TEMP/qa/:
 import json
 import os
 import re
-import sys
 
 TEMP = os.path.join(os.environ["RUNNER_TEMP"], "qa")
 ENVELOPE = os.path.join(TEMP, "envelope.json")
@@ -54,14 +57,27 @@ def extract_findings(text):
         return None
 
 
-def valid_lines(diff_text):
-    """Map path -> set of new-side line numbers that are valid comment anchors.
+def norm_path(p):
+    """Strip a leading a/ b/ ./ so a model-cited path matches the diff's path."""
+    if isinstance(p, str):
+        for pre in ("a/", "b/", "./"):
+            if p.startswith(pre):
+                return p[len(pre):]
+    return p
 
-    `+++ ` is only treated as a file header in the pre-hunk header section
-    (gated by `in_hunk`, reset at each `diff --git`). That way an *added
-    content line* whose text starts with `++ ` — full diff line `+++ ...`,
-    e.g. a markdown rule or a diff snippet in docs — is never misread as a
-    header, which would otherwise silently drop the rest of the hunk's anchors.
+
+def new_side_index(diff_text):
+    """Map path -> {trimmed new-side line content: [line numbers]}.
+
+    The reviewer cites a finding's location by quoting the line verbatim
+    (`anchor`), not by emitting a line number — local models identify the
+    construct reliably but guess its coordinate badly, so we do the coordinate
+    half deterministically here: index every new-side (added/context) line's
+    content so an anchor can be resolved to its line.
+
+    `+++ ` is only treated as a file header before the first hunk (gated by
+    `in_hunk`, reset at each `diff --git`), so an added content line whose text
+    is itself `+++ ...` (a diff snippet in docs) is never misread as a header.
     """
     out, path, newln, in_hunk = {}, None, None, False
     for line in diff_text.splitlines():
@@ -71,18 +87,52 @@ def valid_lines(diff_text):
             p = line[4:].strip()
             path = p[2:] if p.startswith("b/") else (None if p == "/dev/null" else p)
             if path:
-                out.setdefault(path, set())
+                out.setdefault(path, {})
         elif line.startswith("@@"):
             m = re.search(r"\+(\d+)", line)
             newln = int(m.group(1)) if m else None
             in_hunk = True
         elif in_hunk and path and newln is not None:
             if line.startswith("+") or line.startswith(" "):
-                out[path].add(newln)
+                content = line[1:].strip()
+                if content:
+                    out[path].setdefault(content, []).append(newln)
                 newln += 1
             elif line.startswith("-") or line.startswith("\\"):
                 pass  # removed / "No newline" — no new-side position
     return out
+
+
+def resolve_anchor(path, anchor, index):
+    """Resolve a finding's verbatim `anchor` to a new-side line number.
+
+    Returns an int line, or None when the finding is file-level (`anchor` null)
+    or its quote can't be matched to exactly one shown new-side line — those
+    post as a general comment, never on a guessed line. Takes the first
+    non-empty line of a multi-line quote and matches on trimmed text so minor
+    whitespace differences in the quote don't block the match.
+
+    The quote is tried **as-is first**, then with one leading `+`/`-`/space
+    stripped. `new_side_index` already stored content with the diff marker
+    removed, so a line whose *content* legitimately begins with `-`/`+` (a
+    markdown bullet, a `+++ ...` diff snippet in docs — common in darkmux's own
+    docs) matches as-is; the strip is the fallback for a model that left the
+    diff marker on the quote. As-is first avoids double-stripping the content.
+    """
+    if not isinstance(anchor, str) or not anchor.strip():
+        return None
+    first = next((ln for ln in anchor.splitlines() if ln.strip()), "")
+    table = index.get(norm_path(path), {})
+    candidates = [first.strip()]
+    if first[:1] in ("+", "-", " "):
+        candidates.append(first[1:].strip())
+    for key in candidates:
+        if not key:
+            continue
+        hits = table.get(key, [])
+        if len(hits) == 1:
+            return hits[0]
+    return None
 
 
 def comment_body(f):
@@ -122,7 +172,7 @@ def main():
         return
 
     diff_text = open(DIFF).read() if os.path.exists(DIFF) else ""
-    anchors = valid_lines(diff_text)
+    index = new_side_index(diff_text)
     summary = str(data.get("summary", "")).strip()
     verdict = str(data.get("verdict", "")).strip().lower()
     findings = data.get("findings") or []
@@ -131,9 +181,9 @@ def main():
     for f in findings:
         if not isinstance(f, dict):
             continue
-        path, line = f.get("path"), f.get("line")
-        if path in anchors and isinstance(line, int) and line in anchors[path]:
-            inline.append({"path": path, "line": line, "side": "RIGHT", "body": comment_body(f)})
+        line = resolve_anchor(f.get("path"), f.get("anchor"), index)
+        if line is not None:
+            inline.append({"path": norm_path(f.get("path")), "line": line, "side": "RIGHT", "body": comment_body(f)})
         else:
             deferred.append(f)
 
@@ -145,7 +195,7 @@ def main():
         body += ["", "**Findings not anchored to a diff line:**"]
         for f in deferred:
             sev = SEV.get(str(f.get("severity", "")).lower(), "NOTE")
-            loc = f"`{f.get('path', '?')}:{f.get('line', '?')}`"
+            loc = f"`{norm_path(f.get('path', '?'))}`"
             line = f"- {sev} {loc} — {f.get('title', '').strip()}: {f.get('detail', '').strip()}"
             advice = f.get("advice")
             if isinstance(advice, str) and advice.strip():
