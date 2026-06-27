@@ -23,6 +23,11 @@ on:
         description: "PR number to review"
         required: true
         type: string
+      profile:
+        description: "darkmux profile to dispatch with (default: review). Must be defined on the runner; falls back to default_profile if not (#1057)."
+        required: false
+        default: "review"
+        type: string
 
 concurrency:
   group: darkmux-review-${{ inputs.pr }}
@@ -40,6 +45,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       PR: ${{ inputs.pr }}
       REPO: ${{ github.repository }}
+      REVIEW_PROFILE: ${{ inputs.profile }}
     steps:
       - name: Checkout review tooling (trusted main — NOT the reviewed PR)
         uses: actions/checkout@v4
@@ -104,21 +110,26 @@ jobs:
       - name: darkmux pr-reviewer dispatch (local model — no LLM API)
         if: steps.diff.outputs.has_diff == 'true'
         run: |
+          # Defense-in-depth: the `profile` input is maintainer-supplied
+          # (workflow_dispatch is maintainer-only), but constrain it to a sane
+          # profile-name charset before it reaches the dispatch arg.
+          case "$REVIEW_PROFILE" in ''|*[!a-zA-Z0-9_.-]*) echo "profile input must match [a-zA-Z0-9_.-]"; exit 1 ;; esac
           # Model selection lives on the MACHINE, not in this public workflow
-          # (#1054): `--profile review` NAMES the profile this dispatch wants; the
-          # runner defines a `review` profile in its ~/.darkmux/profiles.json
-          # pointing at a lab-validated model. The workflow can't know which
-          # machine it lands on, so it names an intent and lets the machine map it
-          # to a model that worked in its lab — one that emits its answer in the
-          # message content (qwen3-8b does; qwen3_5-family thinking models route to
-          # reasoning_content and yield empty reviews). A runner that hasn't defined
-          # `review` falls back to its default_profile. See
-          # .github/DARKMUX_REVIEW_RUNNER.md.
+          # (#1054): `--profile <name>` NAMES the profile this dispatch wants
+          # (default `review`, overridable via the `profile` workflow input — #1057
+          # — to test other profiles/models). The runner defines that profile in
+          # its ~/.darkmux/profiles.json pointing at a lab-validated model. The
+          # workflow can't know which machine it lands on, so it names an intent and
+          # lets the machine map it to a model that worked in its lab — one that
+          # emits its answer in the message content (qwen3-8b does; qwen3_5-family
+          # thinking models route to reasoning_content and yield empty reviews). A
+          # runner that hasn't defined the named profile falls back to its
+          # default_profile. See .github/DARKMUX_REVIEW_RUNNER.md.
           #
           # Resilient: a hiccup leaves no/empty envelope and the posting script
           # falls back to a summary note rather than red-X'ing the PR.
           darkmux crew dispatch pr-reviewer \
-            --profile review \
+            --profile "$REVIEW_PROFILE" \
             --json \
             --timeout 900 \
             --session-id "darkmux-review-pr${PR}" \
