@@ -41,6 +41,7 @@ mod mission_status;
 mod mission_run;
 mod notebook;
 mod optimize;
+mod pr_review;
 pub use darkmux_lab::providers;
 // #515 — recommendation registry extracted (deps hardware/heuristics/types,
 // all crates). Re-export keeps crate::recommendations::* resolving for doctor.
@@ -207,6 +208,16 @@ enum Cmd {
         #[command(subcommand)]
         sub: CrewCmd,
     },
+    /// Render a darkmux pr-reviewer dispatch into a GitHub PR-review payload
+    /// (#1060). Reads the dispatch `--json` envelope + the PR diff and emits
+    /// `{mode, review, comment}`. The binary-owned replacement for the per-repo
+    /// `pr-review-post.py` copy — the schema-coupled render lives here, versioned
+    /// with the `pr-reviewer` role; the thin workflow YAML keeps the model/
+    /// profile/trigger and the `gh` post.
+    PrReview {
+        #[command(subcommand)]
+        sub: PrReviewCmd,
+    },
     /// Engagement-context lessons — operator-authored conventions,
     /// constraints, and decisions (with the reasoning behind them) that surface
     /// to coder dispatches as a `<lessons>` block. Stored in a durable,
@@ -345,6 +356,25 @@ enum RecommendationsCmd {
 // variant would require pattern-match adjustments throughout the
 // dispatch handler; the variant is constructed once per CLI invocation
 // so the stack-size hit doesn't matter at runtime.
+#[derive(Subcommand)]
+enum PrReviewCmd {
+    /// Render a dispatch envelope + diff into a GitHub PR-review payload:
+    /// resolve each finding's quoted `anchor` to a new-side line, build the
+    /// inline comments + summary, and emit `{mode, review, comment}` JSON to
+    /// stdout (or to `--emit <path>`). The thin workflow YAML posts it.
+    Render {
+        /// Path to the darkmux `--json` dispatch envelope.
+        #[arg(long)]
+        envelope: std::path::PathBuf,
+        /// Path to the PR unified diff.
+        #[arg(long)]
+        diff: std::path::PathBuf,
+        /// Write the payload JSON to this file instead of stdout.
+        #[arg(long)]
+        emit: Option<std::path::PathBuf>,
+    },
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum CrewCmd {
@@ -1355,6 +1385,7 @@ fn run(cmd: Cmd) -> Result<i32> {
         Cmd::Model { sub } => cmd_model(sub),
         Cmd::Fleet { sub } => cmd_fleet(sub),
         Cmd::Crew { sub } => cmd_crew(sub),
+        Cmd::PrReview { sub } => cmd_pr_review(sub),
         Cmd::Lessons { sub } => cmd_lessons(sub),
         Cmd::Role { sub } => cmd_role(sub),
         Cmd::Sprint { sub } => cmd_sprint(sub),
@@ -2793,6 +2824,14 @@ fn fetch_machine_specs(address: &str, token: Option<&str>) -> SpecsProbe {
 fn human_gb(bytes: u64) -> String {
     let gb = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
     format!("{:.0} GB", gb.round())
+}
+
+fn cmd_pr_review(sub: PrReviewCmd) -> Result<i32> {
+    match sub {
+        PrReviewCmd::Render { envelope, diff, emit } => {
+            pr_review::cmd_render(&envelope, &diff, emit.as_ref())
+        }
+    }
 }
 
 fn cmd_crew(sub: CrewCmd) -> Result<i32> {
