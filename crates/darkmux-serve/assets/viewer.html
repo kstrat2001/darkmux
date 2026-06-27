@@ -524,10 +524,16 @@ const ICON={
 // until /machine/specs/<id> wiring lands (follow-up to #624).
 const MACH_ICON={};
 const T=s=>Date.parse(s);
-const iso=t=>new Date(t).toISOString();
 const fmt=ms=>{ms=Math.max(0,ms);return Math.floor(ms/60000)+":"+String(Math.floor(ms/1000)%60).padStart(2,"0");};
-// (#691) Wall-clock HH:MM:SS (UTC) for a card timestamp line.
-const clk=t=>iso(t).slice(11,19)+"Z";
+// (#1069) Time-of-day rendered in the browser's LOCAL timezone (was UTC+"Z",
+// which read as "machine world" to anyone outside UTC). Storage + comparisons
+// stay UTC (T = Date.parse); only display is localized.
+//   clk   = HH:MM:SS local        clkhm = HH:MM local
+//   lday  = local date            ldt   = full local datetime (title hovers)
+const clk=t=>new Date(t).toLocaleTimeString([],{hour12:false});
+const clkhm=t=>new Date(t).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",hour12:false});
+const lday=t=>new Date(t).toLocaleDateString();
+const ldt=t=>new Date(t).toLocaleString([],{hour12:false});
 // (#691) Coarse relative-time vs the scrubber `state.t` so recent-run cards read
 // "12m ago" without a live ticking clock. Past only (recent runs are completed).
 const relAgo=t=>{const d=state.t-t;if(d<0)return"";const s=Math.floor(d/1000);
@@ -728,8 +734,8 @@ function renderMeta(){
   } else {
     head=`<a class="misslink" data-act="mission">◆ ${esc(missionLabel())}</a>`;
   }
-  $("meta").innerHTML=`${head} · <b>${esc(DATA_SOURCE)}</b> · ${iso(tMin).slice(0,10)} `+
-    `${iso(tMin).slice(11,19)}–${iso(tMax).slice(11,19)}Z<br>${DATA.length} records · ${machines().length} machines`;
+  $("meta").innerHTML=`${head} · <b>${esc(DATA_SOURCE)}</b> · ${lday(tMin)} `+
+    `${clk(tMin)}–${clk(tMax)}<br>${DATA.length} records · ${machines().length} machines`;
 }
 function machActive(m){
   const v=visible();
@@ -955,14 +961,14 @@ function renderFleet(){
     }).join("");
     return `<div class="lane"><div class="lname" title="${escN(m)}">${escN(m)}</div><div class="tltrack">${bars}<div class="ph" style="left:${pct(state.t)}%"></div></div></div>`;
   }).join("");
-  const ax=`<div class="tlaxis"><span>${iso(tMin).slice(11,16)}</span><span>${iso(tMin+span/2).slice(11,16)}</span><span>${iso(tMax).slice(11,16)}Z</span></div>`;
+  const ax=`<div class="tlaxis"><span>${clkhm(tMin)}</span><span>${clkhm(tMin+span/2)}</span><span>${clkhm(tMax)}</span></div>`;
   // Size the lane-label column to the actual machine names so short names
   // ("studio") don't leave a fixed-150px gap before the bars. CSS var consumed
   // on desktop; mobile stacks the lanes (.lname width:auto) and ignores it.
   const maxLen=ms.length?Math.max(...ms.map(m=>nameOf(m).length)):8;
   const labelW=Math.round(Math.min(170,Math.max(54,maxLen*7.4+10)));
   const tl = ms.length
-    ? `<div class="fleettl" style="--lname-w:${labelW}px"><div class="tlhdr">${liveMode?'recent activity':'activity'} · ${iso(tMin).slice(11,19)}–${iso(tMax).slice(11,19)}Z</div>${lanes}${ax}</div>`
+    ? `<div class="fleettl" style="--lname-w:${labelW}px"><div class="tlhdr">${liveMode?'recent activity':'activity'} · ${clk(tMin)}–${clk(tMax)}</div>${lanes}${ax}</div>`
     : `<div class="fleettl"><div class="tlempty">waiting for the first flow record…</div></div>`;
   $("stage").innerHTML=savingsHero()+`<div class="fleet">${cards}</div>`+tl;
 }
@@ -1428,7 +1434,7 @@ function renderLog(){
     qc.classList.toggle("zero",q&&all.length===0);
   }
   $("logbody").innerHTML=recs.length?recs.map(r=>{
-    const tt=iso(T(r.ts)).slice(11,19);
+    const tt=clk(T(r.ts));
     const tag=r.category==="telemetry"?(r.source==="lms"?`lms:${r.fields.event}`:r.source==="process"?`cpu ${r.fields.cpu}%`:r.source==="detector"?`detect:${r.fields.kind}`:r.source==="runtime"?`run:${r.fields.turns}t`:r.source):(r.action||r.stage);
     let detail="";
     const f=r.fields||r.payload;
@@ -1444,7 +1450,7 @@ function renderLog(){
       detail=` · <span class="preview-text">start (prompt: ${esc(f?f.prompt_chars:0)}ch)</span>`;
     }
     return `<div class="rec ${esc(r.category)} ${r._id===state.selected?'sel':''}" data-act="rec" data-arg="${r._id}">
-      <span class="t">${tt}</span> <span class="tag">${esc(tag)}</span> ${esc(r.machine_id||'')}${r.session_id?(' · '+esc(r.session_id)):''}${detail}</div>`;
+      <span class="t" title="${ldt(T(r.ts))}">${tt}</span> <span class="tag">${esc(tag)}</span> ${esc(r.machine_id||'')}${r.session_id?(' · '+esc(r.session_id)):''}${detail}</div>`;
   }).join(""):`<div class="empty">${state.filters.q?'no events match your search':'no events match the current filters'}</div>`;
 }
 function renderCrumb(){
