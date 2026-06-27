@@ -33,10 +33,12 @@
   .topnav a{color:var(--muted);text-decoration:none;font:600 12px 'JetBrains Mono',monospace;letter-spacing:.04em}
   .topnav a:hover{color:var(--amber)}
   .badge{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.12em;text-transform:uppercase;color:#0a0a0b;background:var(--amber);padding:5px 9px;border-radius:3px}
+  /* (#1098) the source/date badge ("today") doubles as the history trigger when
+     a daemon is behind it — looks like a button, opens the catalog (the old ▤
+     button read as a "stop" glyph). */
+  .badge.srcbtn{cursor:pointer}
+  .badge.srcbtn:hover{box-shadow:0 0 0 2px var(--amber-dim)}
   .pb{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.12em;text-transform:uppercase;color:var(--amber);border:1px solid var(--amber-dim);padding:4px 9px;border-radius:3px}
-  /* (#691) playback catalog day-picker */
-  .catbtn{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.12em;text-transform:uppercase;color:var(--amber);border:1px solid var(--amber-dim);background:none;padding:4px 9px;border-radius:3px;cursor:pointer}
-  .catbtn:hover{background:var(--amber-dim)}
   .catpanel{position:absolute;top:48px;left:16px;z-index:60;background:var(--bg2);border:1px solid var(--line);border-radius:6px;padding:5px;min-width:300px;max-width:min(420px,92vw);max-height:60vh;overflow:auto;box-shadow:0 10px 30px rgba(0,0,0,.55)}
   .catpanel .cathdr{font:600 10px/1 'JetBrains Mono',monospace;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);padding:7px 8px 4px}
   .catrow{display:block;width:100%;text-align:left;background:none;border:0;color:var(--text);padding:7px 9px;border-radius:4px;cursor:pointer}
@@ -99,8 +101,13 @@
   .split:hover{background:var(--amber-dim)}
   .dh{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
   .dt{font:600 11px 'JetBrains Mono',monospace;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
-  .follow{font:600 10px 'JetBrains Mono',monospace;letter-spacing:.06em;padding:4px 9px;border-radius:11px;cursor:pointer;border:1px solid var(--line);color:var(--muted);background:none}
-  .follow.on{background:var(--amber);color:#0a0a0b;border-color:var(--amber)}
+  /* (#1098) filter (funnel) + follow (clock) are grouped icon buttons in the log header */
+  .logbtns{display:inline-flex;align-items:center;gap:6px;flex:none}
+  .follow{display:inline-flex;align-items:center;justify-content:center;padding:5px;border-radius:6px;cursor:pointer;border:1px solid var(--line);color:var(--muted);background:none}
+  .follow:hover{border-color:var(--amber-dim);color:var(--amber)}
+  .follow.on{color:var(--amber);border-color:var(--amber-dim)}
+  .fbtn svg,.follow svg{width:16px;height:16px;display:block}
+  .fdot{color:var(--amber);font-size:11px;line-height:1;margin-left:1px}
   .detail pre{margin:0;padding:10px 12px;background:var(--bg);border:1px solid var(--line);border-radius:5px;color:var(--text);white-space:pre-wrap;font:11px/1.55 'JetBrains Mono',monospace}
   .detail pre .k{color:var(--muted)}
   .detail .none{color:var(--muted);font:11px 'JetBrains Mono',monospace;padding:10px 0}
@@ -125,7 +132,7 @@
   .qcount.show{opacity:1}
   .qcount.zero{color:var(--bad);border-color:rgba(255,107,133,.35)}
   #logbody{flex:1;overflow:auto;padding:8px 14px 10px}
-  .fbtn{background:none;border:1px solid var(--line);color:var(--muted);font:600 10px 'JetBrains Mono',monospace;letter-spacing:.06em;padding:4px 9px;border-radius:11px;cursor:pointer;text-transform:none}
+  .fbtn{display:inline-flex;align-items:center;justify-content:center;gap:1px;background:none;border:1px solid var(--line);color:var(--muted);padding:5px;border-radius:6px;cursor:pointer}
   .fbtn:hover{border-color:var(--amber-dim);color:var(--amber)}
   .fbtn.on{border-color:var(--amber);color:var(--amber)}
   .rec{font:11px/1.5 'JetBrains Mono',monospace;color:var(--muted);padding:5px 6px;border-bottom:1px solid var(--line);cursor:pointer;border-left:2px solid transparent}
@@ -418,11 +425,11 @@
     .meta { flex: 1 1 100%; margin-left: 0; text-align: left; font-size: 10px; }
 
     /* (#1087) Touch-size the icon-only chrome buttons on phones. #1067 stripped
-       the text labels that gave .fbtn/.follow/.catbtn their height,
+       the text labels that gave .fbtn/.follow their height,
        collapsing them below the WCAG 2.5.8 24px target floor; the mobile block
        had sized only .scrub button. Square ~44px targets, glyph optically
        centered. Icon-only design + title/aria-label unchanged. */
-    .fbtn, .follow, .catbtn {
+    .fbtn, .follow {
       min-width: 44px; min-height: 44px;
       display: inline-flex; align-items: center; justify-content: center;
       padding: 0 10px; font-size: 15px; line-height: 1;
@@ -458,7 +465,6 @@
   <span class="brand"><a href="https://darkmux.com/" target="_blank" rel="noopener"><b>darkmux</b></a> · observability</span>
   <span class="badge" id="srcbadge">Loading…</span>
   <span class="pb" id="modebadge">▣ playback</span>
-  <button class="catbtn" id="catbtn" data-act="catalog" title="history" aria-label="history" hidden>▤</button>
   <nav class="topnav">
     <a href="https://darkmux.com/" target="_blank" rel="noopener">home</a>
     <a href="https://darkmux.com/guide/" target="_blank" rel="noopener">guide</a>
@@ -475,14 +481,13 @@
 <div class="wrap">
   <div class="stage" id="stage"></div>
   <div class="log">
-    <div class="detail" id="detail"><div class="dh"><span class="dt">selected event</span>
-      <button class="follow on" id="follow" title="following the latest events" aria-label="following the latest events">☑</button></div>
+    <div class="detail" id="detail"><div class="dh"><span class="dt">selected event</span></div>
       <div id="detailbody"></div></div>
     <div class="split" id="split" title="drag to resize"></div>
     <div class="loglist">
       <div class="loghead">
         <h3><span>event log · <span id="logscope">fleet</span></span>
-            <button class="fbtn" id="fbtn" data-act="filters" title="filters" aria-label="filters">⚙</button></h3>
+            <span class="logbtns"><button class="follow on" id="follow" title="following the latest events" aria-label="following the latest events"></button><button class="fbtn" id="fbtn" data-act="filters" title="filters" aria-label="filters"></button></span></h3>
         <div class="logsearch">
           <div class="searchbox">
             <span class="sicon" aria-hidden="true">⌕</span>
@@ -573,7 +578,11 @@ const ICON={
   machine:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="7" width="10" height="10" rx="1.5"/><path d="M10 7V4.5M14 7V4.5M10 19.5V17M14 19.5V17M7 10H4.5M7 14H4.5M19.5 10H17M19.5 14H17"/></svg>',
   // (#565 default) person/avatar — the default icon for a crew ROLE card; a
   // role may later override it with a semantic key (#565).
-  worker:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="3.5"/><path d="M5.5 20a6.5 6.5 0 0 1 13 0"/></svg>'};
+  worker:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="3.5"/><path d="M5.5 20a6.5 6.5 0 0 1 13 0"/></svg>',
+  // (#1098) funnel = filter (the gear read as "settings"); clock = follow-the-
+  // live-tail (real-time).
+  filter:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16l-6 7.5V19l-4-2v-4.5z"/></svg>',
+  clock:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8"/><path d="M12 8v4.2l2.6 2.1"/></svg>'};
 // Live viewer — machine form-factor lookup empty; real machines render with no icon
 // until /machine/specs/<id> wiring lands (follow-up to #624).
 const MACH_ICON={};
@@ -1440,8 +1449,9 @@ function pretty(r){
 function renderDetail(){
   const r=DATA.find(x=>x._id===state.selected);
   $("follow").className="follow"+(state.follow?" on":"");
-  // (#1067) icon-only toggle; state in the glyph, meaning in title/aria-label
-  {const f=$("follow"),on=state.follow;f.textContent=on?"☑":"☐";f.title=on?"following the latest events":"click to follow latest";f.setAttribute("aria-label",f.title);}
+  // (#1098) follow = a clock (real-time); .on (set above) colors it when
+  // following, title/aria carry the state.
+  {const f=$("follow"),on=state.follow;f.innerHTML=ICON.clock;f.title=on?"following the latest events":"click to follow latest";f.setAttribute("aria-label",f.title);}
   if(!r){
     $("detailbody").innerHTML=scopedFiltered().length?`<div class="none">select an event from the log to inspect it</div>`
       :`<div class="none">no event at this point in the timeline</div>`;
@@ -1555,7 +1565,7 @@ function renderCrumb(){
   $("crumb").innerHTML=c;
 }
 function filtersActive(){return state.filters.cat.size<FCATS.length||state.filters.tier.size<FTIERS.length||state.filters.src.size<FSRC.length||!!state.filters.q;}
-function updateFbtn(){const a=filtersActive();const b=$("fbtn");b.className="fbtn"+(a?" on":"");b.textContent=a?"⚙ •":"⚙";b.title=a?"filters (active)":"filters";b.setAttribute("aria-label",b.title);}
+function updateFbtn(){const a=filtersActive();const b=$("fbtn");b.className="fbtn"+(a?" on":"");b.innerHTML=ICON.filter+(a?'<span class="fdot">•</span>':'');b.title=a?"filters (active)":"filters";b.setAttribute("aria-label",b.title);}
 function syncTransport(){
   $("range").value=Math.round((state.t-tMin)/(tMax-tMin)*100);
   $("clock").textContent=fmt(state.t-tMin)+" / "+fmt(tMax-tMin)+"  ·  "+visible().length+"/"+DATA.length+" rec";
@@ -2299,10 +2309,12 @@ async function boot(){
   // Tag the body with the daemon-injected mode so CSS and dev tools can
   // distinguish live-route vs playback-route loads at a glance.
   document.body.classList.add("daemon-mode-"+(injectedMode||(flowSrc?"play":"unset")));
-  // (#691) The catalog day-picker needs the daemon's /flow-days endpoint, which
-  // the static demo (flowSrc, no daemon) and the no-daemon state don't have —
-  // show the button only when there's a daemon behind us.
-  if(!flowSrc && mode!=="no-daemon"){ const cb=$("catbtn"); if(cb) cb.hidden=false; }
+  // (#691/#1098) The catalog day-picker needs the daemon's /flow-days endpoint,
+  // which the static demo (flowSrc, no daemon) and the no-daemon state don't
+  // have — so the source/date badge ("today") only becomes the history trigger
+  // when a daemon is behind us. (set once at boot; setBadges only updates its
+  // text, so the data-act/class/title persist.)
+  if(!flowSrc && mode!=="no-daemon"){ const sb=$("srcbadge"); if(sb){ sb.dataset.act="catalog"; sb.classList.add("srcbtn"); sb.title="browse history"; sb.setAttribute("role","button"); } }
   // (#827 Slice A/C) Pull the durable mission/sprint plan. Live: the daemon's
   // /missions + /sprints endpoints. Static demo: the committed fixture files
   // injected as metas (no daemon). Best-effort either way — absent → the

@@ -31,10 +31,11 @@ test('catalog picker renders days + missions inertly and wires navigation', asyn
 
   await page.goto('/index-daemon.html');
 
-  // The button un-hides once boot() resolves the daemon mode.
-  await page.waitForSelector('#catbtn:not([hidden])', { timeout: 15_000 });
+  // (#1098) The source/date badge becomes the history trigger (.srcbtn) once
+  // boot() resolves the daemon mode — the separate ▤ button was removed.
+  await page.waitForSelector('#srcbadge.srcbtn', { timeout: 15_000 });
 
-  await page.click('#catbtn');
+  await page.click('#srcbadge');
   await page.waitForSelector('#catpanel:not([hidden]) .catrow');
 
   // Live row + two day rows.
