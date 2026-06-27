@@ -417,6 +417,25 @@
     .crumbbar { height: auto; flex-wrap: wrap; padding: 8px 12px; gap: 6px 8px; }
     .crumb { flex: 1 1 auto; min-width: 0; overflow-x: auto; white-space: nowrap; -webkit-overflow-scrolling: touch; }
     .meta { flex: 1 1 100%; margin-left: 0; text-align: left; font-size: 10px; }
+
+    /* (#1087) Touch-size the icon-only chrome buttons on phones. #1067 stripped
+       the text labels that gave .fbtn/.follow/.catbtn/.backbtn their height,
+       collapsing them below the WCAG 2.5.8 24px target floor; the mobile block
+       had sized only .scrub button. Square ~44px targets, glyph optically
+       centered. Icon-only design + title/aria-label unchanged. */
+    .fbtn, .follow, .catbtn, .backbtn {
+      min-width: 44px; min-height: 44px;
+      display: inline-flex; align-items: center; justify-content: center;
+      padding: 0 10px; font-size: 15px; line-height: 1;
+    }
+    .mx {
+      min-width: 44px; min-height: 44px;
+      display: inline-flex; align-items: center; justify-content: center;
+      padding: 0; font-size: 20px;
+    }
+    /* .sclear sits absolutely inside the search input; a 44px box would overflow
+       the field, so keep the 18px circle and expand only the tap area. */
+    .sclear::after { content: ""; position: absolute; inset: -13px; }
   }
 </style>
 </head>
