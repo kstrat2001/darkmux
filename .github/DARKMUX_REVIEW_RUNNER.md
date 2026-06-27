@@ -62,7 +62,9 @@ comment launches it — still maintainer-only.
      ```json
      "review": { "models": [{ "id": "qwen/qwen3-8b", "n_ctx": 32000, "role": "primary" }] }
      ```
-   - `python3` + `gh` on PATH (GitHub's runner image bundles `gh`).
+   - `jq` + `gh` on PATH (GitHub's runner image bundles both). The review
+     payload is rendered by `darkmux pr-review render` (#1060) — no `python3`
+     needed; `jq` just splits the rendered `{mode, review, comment}` for `gh`.
 
 ## Notes
 
