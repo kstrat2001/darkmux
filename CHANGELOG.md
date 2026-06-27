@@ -11,6 +11,53 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 
 ## [Unreleased]
 
+## [1.11.1] - 2026-06-28
+
+A focused **viewer + UX pass**, mostly mobile, plus one local-PR-reviewer
+reliability fix. The dashboard reads cleaner on a phone, the status colors mean
+one thing everywhere, and the chrome is icon-first instead of word-cluttered.
+
+No schema change (`FLOW_SCHEMA` stays `1.14.0`) and the `runtime/` image is
+unchanged from `1.11.0` — a pure `brew upgrade`, no image pull.
+
+### Changed
+- **Unified status-color convention (#1071).** Cards, recent-runs rows, and the
+  activity timeline now share one enum: green = success/complete, yellow + pulse
+  = running, orange = canceled, red = failed/killed. A watchdog kill reads as
+  red, not as a disabled-gray "complete".
+- **Icon-first chrome (#1067).** The filters/history/follow/back/play controls
+  are now compact icons; the filter is a funnel (not a settings gear) and follow
+  is a clock to read as real-time (#1098). History opens from the "today" badge,
+  retiring the button that looked like a stop control.
+- **Local-timezone timestamps (#1069).** Absolute times render in the browser's
+  zone instead of the record's machine zone.
+- **Fleet machine cards redesigned (#1095).** Uniform size, a default machine
+  icon, and a tighter stat line with state on its own row.
+- **Savings hero on the missions tab, full-width (#1096).** It now shows on
+  missions (not just fleet) and spans the column with no dead right gutter,
+  aligning with the timelines below it.
+- **Default avatar on crew role cards (#565).** A person icon stands in until a
+  role-specific avatar is set.
+- **Dropped the redundant "Live" word from the source badge (#1065)** and
+  consolidated the savings-hero green onto the `--good` token (#1083).
+
+### Fixed
+- **Mobile log pane (#1100, regression from #1089).** The event list gets room
+  again instead of being squeezed to two or three visible events.
+- **Mobile responsive hardening (#1089).** Fixed-width elements no longer
+  overflow the viewport on phones; icon-only controls meet touch-target size
+  (#1087).
+- **Back button shows only when there's somewhere to go (#1072/#1074)** and is
+  otherwise removed — the breadcrumb and lens tabs already cover navigation
+  (#1094).
+- **Empty-state placement (#1070).** The "no activity" hint drops below the crew
+  cards instead of crowding beside them, and a spurious stray label is gone.
+- **Accessibility:** an `aria-label` on the rewind glyph button (#1080).
+- **PR reviewer no longer copies its own example (#1084).** The role prompt's
+  worked-example finding was being emitted verbatim by small models as a real
+  (false-positive) finding; the response grammar already enforces output shape,
+  so the copyable example is gone.
+
 ## [1.11.0] - 2026-06-27
 
 darkmux's local **PR reviewer** got materially better and self-contained. It now
@@ -518,6 +565,7 @@ cluster of crew-index correctness repairs.
   idle machine's bar no longer stretches to the playhead; adds the first
   viewer-lifecycle e2e regression gate.
 
+[1.11.1]: https://github.com/kstrat2001/darkmux/releases/tag/v1.11.1
 [1.11.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.11.0
 [1.10.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.10.0
 [1.9.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.9.0
