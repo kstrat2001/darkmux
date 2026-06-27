@@ -143,7 +143,7 @@
   body.live-mode .wrap{height:calc(100vh - 46px - 40px)}
   input[type=range]{flex:1;accent-color:var(--amber)}
   .clock{font:12px 'JetBrains Mono',monospace;color:var(--muted);min-width:160px;text-align:right}
-  .fleet{display:flex;gap:36px;flex-wrap:wrap;align-items:flex-start}
+  .fleet{display:flex;gap:16px;flex-wrap:wrap;align-items:stretch}
   .fleettl{margin-top:30px;border-top:1px solid var(--line);padding-top:18px}
   .tlhdr{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin-bottom:14px}
   .lane{display:flex;align-items:center;gap:12px;margin-bottom:7px}
@@ -159,13 +159,15 @@
   .tltrack .ph{position:absolute;top:0;bottom:0;width:2px;background:var(--text);opacity:.32}
   .tlaxis{margin-left:calc(var(--lname-w,150px) + 12px);display:flex;justify-content:space-between;font:9px 'JetBrains Mono',monospace;color:var(--muted);margin-top:7px}
   .tlempty{font:11px 'JetBrains Mono',monospace;color:var(--muted)}
-  .mach{width:230px;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px;cursor:pointer;transition:border-color .15s}
+  .mach{width:248px;display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px;cursor:pointer;transition:border-color .15s}
   .mach:hover{border-color:var(--amber-dim)}.mach.active{border-color:var(--amber);box-shadow:0 0 0 1px var(--amber-dim)}
   .mach .name{font:600 15px 'JetBrains Mono',monospace;color:var(--text);display:flex;align-items:center;gap:8px}
   .mico{display:inline-flex;color:var(--amber-dim)}.mico svg{width:19px;height:19px;display:block}
   .mach.active .mico{color:var(--amber)}
   .mach .spec{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin-top:3px}
+  .mach .specdim{opacity:.5;font-style:italic}
   .mach .stat{margin-top:12px;font:12px 'JetBrains Mono',monospace}
+  .mach .runs{margin-top:5px;font:12px 'JetBrains Mono',monospace;color:var(--text)}
   .mach .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--amber-dim);margin-right:7px;vertical-align:middle}
   .mach.active .dot{background:var(--amber);box-shadow:0 0 8px var(--amber)}
   .mach.absent{opacity:.45}.mach.absent .dot{background:var(--muted);box-shadow:none}
@@ -563,7 +565,11 @@ const MACH_SPEC={};
 const ICON={
   laptop:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="5" width="16" height="11" rx="1.5"/><path d="M2 19h20l-1.2-3H3.2z"/></svg>',
   desktop:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="6" width="16" height="12" rx="2"/><circle cx="8" cy="12" r="1.1"/></svg>',
-  mini:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="9" width="18" height="7" rx="2"/><circle cx="7" cy="12.5" r="1"/></svg>'};
+  mini:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="9" width="18" height="7" rx="2"/><circle cx="7" cy="12.5" r="1"/></svg>',
+  // (#564 default) generic processor/chip — shown when a machine's form factor
+  // isn't known (cross-machine hardware probe not wired), so every machine card
+  // still reads as a machine.
+  machine:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="7" width="10" height="10" rx="1.5"/><path d="M10 7V4.5M14 7V4.5M10 19.5V17M14 19.5V17M7 10H4.5M7 14H4.5M19.5 10H17M19.5 14H17"/></svg>'};
 // Live viewer — machine form-factor lookup empty; real machines render with no icon
 // until /machine/specs/<id> wiring lands (follow-up to #624).
 const MACH_ICON={};
@@ -993,9 +999,11 @@ function renderFleet(){
     // keep the prior idle/active behavior.
     const absent=machPresent(m)===false;
     const stat=absent?'offline':(act?'dispatch in flight':'idle');
-    return `<div class="mach ${act&&!absent?'active':''} ${absent?'absent':''}" data-act="machine" data-arg="${esc(m)}"><div class="name"><span class="mico">${ICON[MACH_ICON[nameOf(m)]]||""}</span>${escN(m)}</div>
-      <div class="spec">${esc(specOf(m))}</div><div class="stat"><span class="dot"></span>${stat} · ${runs} ${liveMode?'running':'specialist'+(runs===1?'':'s')} + utility</div>
-      <div class="hint">click to drill in →</div></div>`;}).join("");
+    const spec=specOf(m);
+    return `<div class="mach ${act&&!absent?'active':''} ${absent?'absent':''}" data-act="machine" data-arg="${esc(m)}"><div class="name"><span class="mico">${ICON[MACH_ICON[nameOf(m)]]||ICON.machine}</span>${escN(m)}</div>
+      <div class="spec">${spec?esc(spec):'<span class="specdim">hardware not reported</span>'}</div>
+      <div class="stat"><span class="dot"></span>${stat}</div>
+      <div class="runs">${runs} ${liveMode?'running':'specialist'+(runs===1?'':'s')}</div></div>`;}).join("");
   // Activity timeline — one lane per machine; each dispatch session is a bar
   // positioned across the recorded window, revealed up to the playhead (an
   // in-flight session grows to the playhead). Fills the fleet view with a
