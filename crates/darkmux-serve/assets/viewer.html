@@ -174,7 +174,8 @@
   .stagehdr{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin-bottom:14px}
   .stagehdr a{color:var(--amber);cursor:pointer;text-decoration:none}.stagehdr a:hover{text-decoration:underline}
   .node{display:inline-block;width:260px;vertical-align:top;margin:0 24px 24px 0;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px;cursor:pointer}
-  .node:hover{border-color:var(--amber-dim)}.node .h{font:600 13px 'JetBrains Mono',monospace}
+  .node:hover{border-color:var(--amber-dim)}.node .h{font:600 13px 'JetBrains Mono',monospace;display:flex;align-items:center;gap:8px}
+  .nico{display:inline-flex;color:var(--amber-dim);flex:none}.nico svg{width:17px;height:17px;display:block}
   .node .s{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin-top:4px}
   .node .s.tsline{color:var(--amber-dim);margin-top:6px}
   .pill{display:inline-block;font:600 10px 'JetBrains Mono',monospace;padding:2px 7px;border-radius:10px;margin-top:8px}
@@ -569,7 +570,10 @@ const ICON={
   // (#564 default) generic processor/chip — shown when a machine's form factor
   // isn't known (cross-machine hardware probe not wired), so every machine card
   // still reads as a machine.
-  machine:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="7" width="10" height="10" rx="1.5"/><path d="M10 7V4.5M14 7V4.5M10 19.5V17M14 19.5V17M7 10H4.5M7 14H4.5M19.5 10H17M19.5 14H17"/></svg>'};
+  machine:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="7" width="10" height="10" rx="1.5"/><path d="M10 7V4.5M14 7V4.5M10 19.5V17M14 19.5V17M7 10H4.5M7 14H4.5M19.5 10H17M19.5 14H17"/></svg>',
+  // (#565 default) person/avatar — the default icon for a crew ROLE card; a
+  // role may later override it with a semantic key (#565).
+  worker:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="3.5"/><path d="M5.5 20a6.5 6.5 0 0 1 13 0"/></svg>'};
 // Live viewer — machine form-factor lookup empty; real machines render with no icon
 // until /machine/specs/<id> wiring lands (follow-up to #624).
 const MACH_ICON={};
@@ -1098,7 +1102,7 @@ function renderMachine(){
   else if(um===null){ utilState='utility tier · not configured'; utilPill='<span class="pill muted">not configured</span>'; }
   else if(um.loaded){ utilState=`utility tier · ${esc(um.id)}`; utilPill='<span class="pill done">resident</span>'; }
   else { utilState=`utility tier · ${esc(um.id)}`; utilPill='<span class="pill muted">registered · not loaded</span>'; }
-  const util=`<div class="node util"><div class="h">darkmux/utility</div>
+  const util=`<div class="node util"><div class="h"><span class="nico">${ICON.worker}</span>darkmux/utility</div>
     <div class="s">${utilState}</div>
     <div class="s">compaction · mission-compile · estimate · scribe</div>
     ${utilPill}</div>`;
@@ -1167,7 +1171,7 @@ function renderMachine(){
       return {cls, lbl, pill:cls, closeTs, startTs, sid, handle:s.handle, model:s.model||'?',
         mission:s.mission_id||null, sprint:s.sprint_id||null,
         startPayload:s.payload||null, donePayload, errored, killed, hasStart:true,
-        html:`<div class="node" data-act="session" data-arg="${esc(sid)}"><div class="h">${esc(s.handle)}</div>
+        html:`<div class="node" data-act="session" data-arg="${esc(sid)}"><div class="h"><span class="nico">${ICON.worker}</span>${esc(s.handle)}</div>
         <div class="s">specialist role · ${esc(s.model||'?')}</div>
         <div class="s">session ${esc(sid)} · mission ${esc(s.mission_id)}</div>
         ${tsLine}<span class="pill ${cls}">${lbl}</span></div>`};
@@ -1184,7 +1188,7 @@ function renderMachine(){
     return {cls:'ended', lbl:'no start', pill:'warn', closeTs, startTs:first.ts?T(first.ts):null,
       sid, handle, model, mission:first.mission_id||null, sprint:null,
       startPayload:null, donePayload, errored, killed, hasStart:false,
-      html:`<div class="node" data-act="session" data-arg="${esc(sid)}"><div class="h">${esc(handle)}</div>
+      html:`<div class="node" data-act="session" data-arg="${esc(sid)}"><div class="h"><span class="nico">${ICON.worker}</span>${esc(handle)}</div>
       <div class="s">role · ${esc(model)}</div>
       <div class="s">session ${esc(sid)} · ${esc(mission)}</div>
       ${fbLine}<span class="pill warn">no dispatch.start</span></div>`};
