@@ -63,7 +63,6 @@
   }
   .crumbbar{height:40px;display:flex;align-items:center;gap:12px;padding:0 16px;border-bottom:1px solid var(--line);background:#131316}
   .backbtn{background:var(--bg);border:1px solid var(--line);color:var(--text);padding:5px 11px;border-radius:4px;cursor:pointer;font:600 12px 'JetBrains Mono',monospace}
-  .backbtn[disabled]{opacity:.35;cursor:default}
   .crumb{font:600 13px 'JetBrains Mono',monospace;color:var(--muted)}
   .crumb a{color:var(--amber);cursor:pointer;text-decoration:none}.crumb a:hover{text-decoration:underline}
   /* (#827) missions index rows */
@@ -421,7 +420,7 @@
 </div>
 <div class="catpanel" id="catpanel" hidden></div>
 <div class="crumbbar">
-  <button class="backbtn" id="back">‹ back</button>
+  <button class="backbtn" id="back" hidden>‹ back</button>
   <span class="lenstabs"><a class="lens" id="lens-fleet" data-act="fleet">fleet</a><a class="lens" id="lens-missions" data-act="missions">missions</a></span>
   <span class="crumb" id="crumb"></span>
   <span class="meta" id="meta"></span>
@@ -1465,7 +1464,7 @@ function renderCrumb(){
   if(inMissions){
     let mc=`<a data-act="missions">missions</a>`;
     if(state.level==="mission") mc+=`<span class="sep">›</span>◆ ${esc(state.missionId||primaryMission()||"—")}`;
-    $("crumb").innerHTML=mc; $("back").disabled=false; return;
+    $("crumb").innerHTML=mc; $("back").hidden=false; return;
   }
   const pm=primaryMission();
   const hasMission=pm!=null;
@@ -1473,7 +1472,7 @@ function renderCrumb(){
   c+=(hasMission?`<span class="sep">›</span>`:``)+`<a data-act="fleet">fleet</a>`;
   if(state.level==="machine"||state.level==="subsystem") c+=`<span class="sep">›</span><a data-act="machine" data-arg="${esc(state.machine)}">${escN(state.machine)}</a>`;
   if(state.level==="subsystem") c+=`<span class="sep">›</span>${esc(state.session)}`;
-  $("crumb").innerHTML=c; $("back").disabled=(state.level==="fleet");
+  $("crumb").innerHTML=c; $("back").hidden=(state.level==="fleet");
 }
 function filtersActive(){return state.filters.cat.size<FCATS.length||state.filters.tier.size<FTIERS.length||state.filters.src.size<FSRC.length||!!state.filters.q;}
 function updateFbtn(){const a=filtersActive();$("fbtn").className="fbtn"+(a?" on":"");$("fbtn").textContent=a?"⚙ filters •":"⚙ filters";}
