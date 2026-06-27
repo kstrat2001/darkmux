@@ -276,14 +276,16 @@
   /* (#803 layout) Horizontal hero: the big number leads on the left, the
      token-class stat blocks fill the width to its right (the breakdown now
      earns the space the old 560px cap was guarding), the hybrid note + hint
-     span below. Wraps gracefully as the viewport narrows; ~980px cap keeps
-     it a deliberate card on ultra-wide rather than a stretched bar. */
-  .savings{margin:0 0 18px;padding:16px 22px;border:1px solid var(--line);border-radius:10px;background:linear-gradient(180deg,rgba(74,222,128,.06),rgba(74,222,128,.01));max-width:980px}
+     span below. Wraps gracefully as the viewport narrows; spans the full
+     content width to align with the recent-activity timeline below it (no
+     width cap), and the stat blocks justify right so the breakdown fills the
+     space rather than leaving a black gutter (#1095). */
+  .savings{margin:0 0 18px;padding:16px 22px;border:1px solid var(--line);border-radius:10px;background:linear-gradient(180deg,rgba(74,222,128,.06),rgba(74,222,128,.01))}
   .savrow{display:flex;align-items:center;gap:14px 40px;flex-wrap:wrap}
   .savlead{flex:0 0 auto}
   .savnum{font:700 48px/1 'JetBrains Mono',monospace;color:var(--good);letter-spacing:.01em}
   .savlbl{font:600 12px/1 'JetBrains Mono',monospace;color:var(--text);margin-top:7px;text-transform:uppercase;letter-spacing:.12em}
-  .savclasses{display:flex;gap:10px 30px;flex-wrap:wrap;align-items:center;flex:1 1 auto}
+  .savclasses{display:flex;gap:10px 30px;flex-wrap:wrap;align-items:center;justify-content:flex-end;flex:1 1 auto}
   .savc .scv{font:600 23px/1.1 'JetBrains Mono',monospace;color:var(--text)}
   .savc.gen .scv{color:var(--good)}
   .savc.uncls .scv{color:var(--muted)}
@@ -1644,7 +1646,7 @@ function renderMissionsIndex(){
       ${prog}
       <span class="mimeta">${mach}${tok}</span></div>`;
   }).join(""):`<div class="none">no missions yet — propose one with <code>darkmux mission propose</code></div>`;
-  $("stage").innerHTML=`<div><div class="stagehdr">missions · ${rows.length} total</div>
+  $("stage").innerHTML=savingsHero()+`<div><div class="stagehdr">missions · ${rows.length} total</div>
     <div class="milist">${body}</div></div>`;
 }
 // (#827 Slice B) The furthest cycle stage a sprint reached, from its
