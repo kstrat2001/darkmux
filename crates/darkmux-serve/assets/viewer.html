@@ -410,7 +410,7 @@
   <span class="brand"><a href="https://darkmux.com/" target="_blank" rel="noopener"><b>darkmux</b></a> · observability</span>
   <span class="badge" id="srcbadge">Loading…</span>
   <span class="pb" id="modebadge">▣ playback</span>
-  <button class="catbtn" id="catbtn" data-act="catalog" hidden>▤ history</button>
+  <button class="catbtn" id="catbtn" data-act="catalog" title="history" aria-label="history" hidden>▤</button>
   <nav class="topnav">
     <a href="https://darkmux.com/" target="_blank" rel="noopener">home</a>
     <a href="https://darkmux.com/guide/" target="_blank" rel="noopener">guide</a>
@@ -420,7 +420,7 @@
 </div>
 <div class="catpanel" id="catpanel" hidden></div>
 <div class="crumbbar">
-  <button class="backbtn" id="back" hidden>‹ back</button>
+  <button class="backbtn" id="back" title="back" aria-label="back" hidden>‹</button>
   <span class="lenstabs"><a class="lens" id="lens-fleet" data-act="fleet">fleet</a><a class="lens" id="lens-missions" data-act="missions">missions</a></span>
   <span class="crumb" id="crumb"></span>
   <span class="meta" id="meta"></span>
@@ -429,13 +429,13 @@
   <div class="stage" id="stage"></div>
   <div class="log">
     <div class="detail" id="detail"><div class="dh"><span class="dt">selected event</span>
-      <button class="follow on" id="follow">☑ following</button></div>
+      <button class="follow on" id="follow" title="following the latest events" aria-label="following the latest events">☑</button></div>
       <div id="detailbody"></div></div>
     <div class="split" id="split" title="drag to resize"></div>
     <div class="loglist">
       <div class="loghead">
         <h3><span>event log · <span id="logscope">fleet</span></span>
-            <button class="fbtn" id="fbtn" data-act="filters">⚙ filters</button></h3>
+            <button class="fbtn" id="fbtn" data-act="filters" title="filters" aria-label="filters">⚙</button></h3>
         <div class="logsearch">
           <div class="searchbox">
             <span class="sicon" aria-hidden="true">⌕</span>
@@ -451,7 +451,7 @@
 </div>
 <div class="scrub">
   <button id="rewind" title="jump to start">⏮</button>
-  <button id="play" class="primary">▶ play</button>
+  <button id="play" class="primary" title="play" aria-label="play">▶</button>
   <input type="range" id="range" min="0" max="100" value="100">
   <button id="speed" title="playback speed">1×</button>
   <span class="clock" id="clock"></span>
@@ -1369,7 +1369,8 @@ function pretty(r){
 function renderDetail(){
   const r=DATA.find(x=>x._id===state.selected);
   $("follow").className="follow"+(state.follow?" on":"");
-  $("follow").innerHTML=state.follow?"☑ following":"☐ follow latest";
+  // (#1067) icon-only toggle; state in the glyph, meaning in title/aria-label
+  {const f=$("follow"),on=state.follow;f.textContent=on?"☑":"☐";f.title=on?"following the latest events":"click to follow latest";f.setAttribute("aria-label",f.title);}
   if(!r){
     $("detailbody").innerHTML=scopedFiltered().length?`<div class="none">select an event from the log to inspect it</div>`
       :`<div class="none">no event at this point in the timeline</div>`;
@@ -1481,7 +1482,7 @@ function renderCrumb(){
   $("crumb").innerHTML=c; $("back").hidden=(state.level==="fleet");
 }
 function filtersActive(){return state.filters.cat.size<FCATS.length||state.filters.tier.size<FTIERS.length||state.filters.src.size<FSRC.length||!!state.filters.q;}
-function updateFbtn(){const a=filtersActive();$("fbtn").className="fbtn"+(a?" on":"");$("fbtn").textContent=a?"⚙ filters •":"⚙ filters";}
+function updateFbtn(){const a=filtersActive();const b=$("fbtn");b.className="fbtn"+(a?" on":"");b.textContent=a?"⚙ •":"⚙";b.title=a?"filters (active)":"filters";b.setAttribute("aria-label",b.title);}
 function syncTransport(){
   $("range").value=Math.round((state.t-tMin)/(tMax-tMin)*100);
   $("clock").textContent=fmt(state.t-tMin)+" / "+fmt(tMax-tMin)+"  ·  "+visible().length+"/"+DATA.length+" rec";
@@ -1709,14 +1710,16 @@ $("back").onclick=()=>{ if(state.level==="subsystem")drillMachine(state.machine)
 $("range").oninput=e=>{state.follow=true;state.t=tMin+(tMax-tMin)*e.target.value/100;render();};
 $("rewind").onclick=()=>{state.t=tMin;state.follow=true;render();};
 $("speed").onclick=()=>{const s=[0.5,1,2,4];state.speed=s[(s.indexOf(state.speed)+1)%s.length];$("speed").textContent=state.speed+"×";};
+// (#1067) icon-only play/pause; glyph carries state, title/aria carry meaning
+const setPlayLabel=p=>{const b=$("play");b.textContent=p?"⏸":"▶";b.title=p?"pause":"play";b.setAttribute("aria-label",b.title);};
 $("play").onclick=()=>{
-  if(state.playing){clearInterval(state.timer);state.playing=false;$("play").textContent="▶ play";return;}
+  if(state.playing){clearInterval(state.timer);state.playing=false;setPlayLabel(false);return;}
   if(state.t>=tMax)state.t=tMin;
-  state.follow=true; state.playing=true;$("play").textContent="⏸ pause"; render();
+  state.follow=true; state.playing=true;setPlayLabel(true); render();
   let lastCount=visible().length;
   state.timer=setInterval(()=>{ state.t+=(tMax-tMin)/120*state.speed;
     let cap=false;
-    if(state.t>=tMax){state.t=tMax;clearInterval(state.timer);state.playing=false;$("play").textContent="▶ play";cap=true;}
+    if(state.t>=tMax){state.t=tMax;clearInterval(state.timer);state.playing=false;setPlayLabel(false);cap=true;}
     const c=visible().length;
     // Only full-render when a record crosses the playhead; between crossings just advance the
     // readouts, so the cards aren't destroyed mid-click (the bug — same fix the live tool needs).
