@@ -12,9 +12,10 @@ write access launches it:
 
 ```bash
 gh workflow run darkmux-review.yml -f pr=<PR_NUMBER>
-# optional: add -f profile=<name> to dispatch with a different profile
-# (default: review) — handy for testing the reviewer against another model
-# defined on the runner. Falls back to default_profile if undefined. (#1057)
+# optional overrides (#1057), for testing the reviewer against another setup:
+#   -f role=<name>     crew role to dispatch (default: pr-reviewer)
+#   -f profile=<name>  profile/model to dispatch with (default: review;
+#                      falls back to default_profile if undefined on the runner)
 ```
 
 (or the **Run workflow** button under Actions → *darkmux self-review*). The job

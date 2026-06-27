@@ -23,6 +23,11 @@ on:
         description: "PR number to review"
         required: true
         type: string
+      role:
+        description: "darkmux crew role to dispatch (default: pr-reviewer). Override to test another reviewer role (#1057)."
+        required: false
+        default: "pr-reviewer"
+        type: string
       profile:
         description: "darkmux profile to dispatch with (default: review). Must be defined on the runner; falls back to default_profile if not (#1057)."
         required: false
@@ -45,6 +50,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       PR: ${{ inputs.pr }}
       REPO: ${{ github.repository }}
+      REVIEW_ROLE: ${{ inputs.role }}
       REVIEW_PROFILE: ${{ inputs.profile }}
     steps:
       - name: Checkout review tooling (trusted main — NOT the reviewed PR)
@@ -107,13 +113,16 @@ jobs:
             echo '```'
           } > "$RUNNER_TEMP/qa/prompt.txt"
 
-      - name: darkmux pr-reviewer dispatch (local model — no LLM API)
+      - name: darkmux reviewer dispatch (local model — no LLM API)
         if: steps.diff.outputs.has_diff == 'true'
         run: |
-          # Defense-in-depth: the `profile` input is maintainer-supplied
-          # (workflow_dispatch is maintainer-only), but constrain it to a sane
-          # profile-name charset before it reaches the dispatch arg.
+          # Defense-in-depth: the `role` + `profile` inputs are maintainer-supplied
+          # (workflow_dispatch is maintainer-only), but constrain them to a sane
+          # charset before they reach the dispatch args.
+          case "$REVIEW_ROLE" in ''|*[!a-zA-Z0-9_.-]*) echo "role input must match [a-zA-Z0-9_.-]"; exit 1 ;; esac
           case "$REVIEW_PROFILE" in ''|*[!a-zA-Z0-9_.-]*) echo "profile input must match [a-zA-Z0-9_.-]"; exit 1 ;; esac
+          # The dispatched role defaults to `pr-reviewer`, overridable via the
+          # `role` workflow input (#1057) to test another reviewer role.
           # Model selection lives on the MACHINE, not in this public workflow
           # (#1054): `--profile <name>` NAMES the profile this dispatch wants
           # (default `review`, overridable via the `profile` workflow input — #1057
@@ -128,7 +137,7 @@ jobs:
           #
           # Resilient: a hiccup leaves no/empty envelope and the posting script
           # falls back to a summary note rather than red-X'ing the PR.
-          darkmux crew dispatch pr-reviewer \
+          darkmux crew dispatch "$REVIEW_ROLE" \
             --profile "$REVIEW_PROFILE" \
             --json \
             --timeout 900 \
