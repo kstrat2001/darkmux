@@ -362,7 +362,7 @@
     .wrap { display: block; height: auto; }
     body.live-mode .wrap { height: auto; } /* override the desktop live-mode calc on mobile */
     .stage { padding: 16px; min-height: 50vh; overflow: visible; }
-    .log { width: auto; border-left: none; border-top: 1px solid var(--line); max-height: 60vh; }
+    .log { width: auto; border-left: none; border-top: 1px solid var(--line); max-height: 82vh; }
     .detail { padding: 12px 14px 0; }
     .split { display: none; } /* the row-resize handle isn't useful when stacked */
     .fleet { gap: 16px; }
@@ -447,9 +447,11 @@
        reflow on a phone. */
     /* crew cards: fixed 260px inline-block → full-width stacked */
     .node { display: block; width: 100%; margin: 0 0 12px 0; }
-    /* log detail pane: the JS sets a fixed 200px height (split drag is hidden on
-       mobile), which squeezed the event list — let it size to content, capped. */
-    .detail { height: auto !important; max-height: 38vh; }
+    /* log detail pane: cap it small so the EVENT LIST is the priority on mobile
+       (the split-resize is hidden when stacked). #detailbody scrolls inside, so
+       a big selected-event JSON scrolls within this cap instead of squeezing the
+       list down to 2-3 rows. A collapse toggle is deferred (right-panel rework). */
+    .detail { height: auto !important; max-height: 24vh; }
     /* mission index rows: reflow, meta drops to its own line */
     .mirow { flex-wrap: wrap; }
     .mimeta { flex: 1 1 100%; }
