@@ -1968,7 +1968,11 @@ function setBadges(mode,date){
   // gone — that mode belongs to docs/demo/ only.)
   DATA_SOURCE = mode==="live" ? ("live · "+dl) : mode==="play" ? ("flow · "+date) : mode==="empty" ? ("no records · "+date) : mode==="no-daemon" ? "daemon not reachable" : "no records yet";
   const sb=$("srcbadge");
-  if(sb) sb.textContent = mode==="live" ? ("Live · "+dl) : mode==="play" ? ("Flow · "+date) : mode==="empty" ? ("No records · "+date) : mode==="no-daemon" ? "No daemon" : "No records yet";
+  // (#1065) Live mode: show just the source/date — the adjacent modebadge
+  // ("● live") already carries liveness, so a leading "Live ·" here was the
+  // same word twice in one glance. Other modes keep their distinct labels
+  // ("Flow"/"playback" aren't redundant).
+  if(sb) sb.textContent = mode==="live" ? dl : mode==="play" ? ("Flow · "+date) : mode==="empty" ? ("No records · "+date) : mode==="no-daemon" ? "No daemon" : "No records yet";
   const mb=$("modebadge");
   if(mb){ const live=mode==="live"; mb.textContent=live?"● live":"▣ playback"; mb.classList.toggle("live",live); }
   // Live mode hides the playback scrub bar (CSS keys off this class) — replay is /play/<date>.
