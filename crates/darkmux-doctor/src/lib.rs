@@ -82,8 +82,27 @@ impl DoctorReport {
     }
 }
 
+/// (#1129) Identity line — WHICH build is running + the flow-schema version it
+/// renders. `build_version()` carries the git short SHA (the package version
+/// alone doesn't change between releases, so it can't tell an operator whether
+/// a daemon has their latest code). Always Pass — informational, leads the
+/// report so the answer to "which version is this?" is the first thing shown.
+fn check_build_info() -> Check {
+    Check {
+        name: "build".into(),
+        status: Status::Pass,
+        message: format!(
+            "darkmux {} · flow schema {}",
+            darkmux_types::build_version(),
+            darkmux_flow::FLOW_SCHEMA_VERSION,
+        ),
+        hint: None,
+    }
+}
+
 pub fn run(include_openclaw: bool) -> DoctorReport {
     let mut checks = vec![
+        check_build_info(),
         check_profile_registry(),
         check_lms_binary(),
         check_docker_runtime(),
@@ -2906,8 +2925,8 @@ mod tests {
     #[test]
     fn run_returns_static_plus_eureka_checks() {
         let r = run(true);
-        // 31 static checks via run(true) (27 always-on + 4 openclaw), incl.
-        // docker-runtime [#680] + runtime version + load projection +
+        // 32 static checks via run(true) (28 always-on + 4 openclaw), incl.
+        // build-identity [#1129] + docker-runtime [#680] + runtime version + load projection +
         // daemon reachable + darkmux-version-vs-latest-release [#13] +
         // crew-role-prompt-coverage [#141] + flow-sink-health [#170] +
         // machine_id + orchestrator [#167] + openai-base-url-conflict [#5] +
@@ -2920,7 +2939,7 @@ mod tests {
         // [#881]) + one per active eureka rule. Every check should appear
         // regardless of environment — even if the underlying probe couldn't
         // read state.
-        let expected = 31 + darkmux_eureka::all_rules().len();
+        let expected = 32 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

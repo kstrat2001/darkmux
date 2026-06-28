@@ -39,6 +39,13 @@ class Darkmux < Formula
   # don't run.
 
   def install
+    # (#1129) Stamp a stable (tarball) build as a release so `darkmux --version`,
+    # `darkmux doctor`, and the viewer header read `<version> (release)`. The
+    # tarball has no `.git`, so without this stamp the build would be
+    # indistinguishable from a bare source build. A `--HEAD` build has a git
+    # checkout and bakes its short SHA instead, so leave it unstamped.
+    ENV["DARKMUX_RELEASE"] = "1" unless build.head?
+
     # Workspace-aware install. The root [[bin]] target in Cargo.toml is the
     # only thing that needs to land in bin/. The std_cargo_args helper sets
     # --locked + --root + --path so the result lands at #{bin}/darkmux.
