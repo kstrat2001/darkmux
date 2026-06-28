@@ -257,6 +257,10 @@
   /* (#789) activity-driven headline: running = live-green subject; idle = muted status (not a link) */
   #meta .run{color:var(--run)}
   #meta .idle{color:var(--muted);cursor:default}
+  /* (#1103) the idle headline stays muted, but the status dot carries meaning:
+     green = fleet healthy/ready (matches the #1071 status convention) */
+  #meta .idle .rdot{font-weight:700}
+  #meta .idle .rdot.ok{color:var(--good)}
   #meta .metahint{color:var(--muted);font:11px 'JetBrains Mono',monospace}
   /* (#803) hybrid note — the encouraging line inside the savings card */
   .hybnote{margin-top:9px;padding-top:8px;border-top:1px solid var(--line);font:12px 'JetBrains Mono',monospace;color:var(--good)}
@@ -604,11 +608,14 @@ const clk=t=>new Date(t).toLocaleTimeString([],{hour12:false});
 const clkhm=t=>new Date(t).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",hour12:false});
 const lday=t=>new Date(t).toLocaleDateString();
 const ldt=t=>new Date(t).toLocaleString([],{hour12:false});
-// (#691) Coarse relative-time vs the scrubber `state.t` so recent-run cards read
-// "12m ago" without a live ticking clock. Past only (recent runs are completed).
-const relAgo=t=>{const d=state.t-t;if(d<0)return"";const s=Math.floor(d/1000);
-  if(s<60)return"just now";const m=Math.floor(s/60);if(m<60)return m+"m ago";
+// (#691) Coarse relative-time. Past only (recent runs are completed).
+// (#1103) Reference is explicit: playback cards measure vs the scrubber `state.t`;
+// the live idle headline passes `Date.now()` so "last run" is real wall-clock
+// elapsed, not time-since-newest-record (state.t=tMax in live → a stuck "just now").
+const relAgoFrom=(ref,t)=>{const d=ref-t;if(d<0)return"";const s=Math.floor(d/1000);
+  if(s<60)return s<5?"just now":s+"s ago";const m=Math.floor(s/60);if(m<60)return m+"m ago";
   const h=Math.floor(m/60);if(h<24)return h+"h ago";return Math.floor(h/24)+"d ago";};
+const relAgo=t=>relAgoFrom(state.t,t);
 // (#691) "<clock> · <rel ago>", dropping the separator when rel is empty (a
 // running card scrubbed to before its start in playback yields no relative).
 const stamp=(verb,t)=>{const r=relAgo(t);return `${verb} ${clk(t)}${r?' · '+r:''}`;};
@@ -792,12 +799,19 @@ function liveSubject(){
 const IDLE_LAST_RUN_RECENT_MS=60*60*1000; // 1h
 function idleStatus(){
   const n=LIVE_MACHINES.size;
-  if(!n) return '○ waiting for fleet';
+  if(!n) return '<span class="rdot">○</span> waiting for fleet';
   const closes=DATA.filter(r=>r.action==="dispatch.complete"||r.action==="dispatch.error");
   const last=closes.length?Math.max(...closes.map(r=>T(r.ts))):null;
-  const recent=last!=null&&(state.t-last)>=0&&(state.t-last)<=IDLE_LAST_RUN_RECENT_MS;
-  const ago=recent?relAgo(last):'';
-  return `● fleet ready · ${n} machine${n===1?'':'s'}${ago?` · last run ${ago}`:''}`;
+  // (#1103) "last run" measured from real wall-clock now, NOT state.t (=tMax, the
+  // newest record): an idle fleet's playhead sits on its last record, so the old
+  // reference made every idle headline read "just now". Machine count here is
+  // PRESENCE (LIVE_MACHINES) → labeled "online", and kept off the records line so
+  // record volume isn't conflated with who's merely up. Returns HTML (colored
+  // dot); renderMeta inserts it without esc() — inputs are counts + safe strings.
+  const now=Date.now();
+  const recent=last!=null&&(now-last)>=0&&(now-last)<=IDLE_LAST_RUN_RECENT_MS;
+  const ago=recent?relAgoFrom(now,last):'';
+  return `<span class="rdot ok">●</span> fleet ready · ${n} machine${n===1?'':'s'} online${ago?` · last run ${ago}`:''}`;
 }
 function renderMeta(){
   // (#789) Activity-driven headline. Running → the live subject (mission-scoped
@@ -812,12 +826,22 @@ function renderMeta(){
       ? `<a class="misslink run" data-act="mission">◆ ${subj.label}</a>${more}`
       : `<span class="run">◆ ${subj.label}</span>${more}`;
   } else if(document.body.classList.contains('live-mode')){
-    head=`<span class="idle">${esc(idleStatus())}</span>`; // status, NOT a link
+    head=`<span class="idle">${idleStatus()}</span>`; // status (HTML w/ colored dot), NOT a link
   } else {
     head=`<a class="misslink" data-act="mission">◆ ${esc(missionLabel())}</a>`;
   }
-  $("meta").innerHTML=`${head} · <b>${esc(DATA_SOURCE)}</b> · ${lday(tMin)} `+
-    `${clk(tMin)}–${clk(tMax)}<br>${DATA.length} records · ${machines().length} machines`;
+  // (#1103) Live is a rolling LIVE_WINDOW_MS window, so the census line names the
+  // SCOPE ("last 24h") rather than raw clock endpoints (which read as a backwards
+  // range past local midnight). "live"/"today" already live in the badges, and
+  // machine presence is on the headline — so records stand alone here. Playback is
+  // a specific day: its date + span are meaningful when scrubbing, so keep them.
+  if(document.body.classList.contains('live-mode')){
+    const hrs=Math.round(LIVE_WINDOW_MS/3600000);
+    $("meta").innerHTML=`${head}<br>${DATA.length} records · last ${hrs}h`;
+  } else {
+    $("meta").innerHTML=`${head} · <b>${esc(DATA_SOURCE)}</b> · ${lday(tMin)} `+
+      `${clk(tMin)}–${clk(tMax)}<br>${DATA.length} records · ${machines().length} machines`;
+  }
 }
 function machActive(m){
   const v=visible();
