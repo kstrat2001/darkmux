@@ -33,6 +33,9 @@ pub struct Label {
     #[serde(default)]
     pub bug_class: Option<String>,
     /// Substring the correct finding's anchor should contain (bug cases).
+    /// NOTE: a `bug` case with no `anchor_contains` is only scored as recalled
+    /// when the model emits a HIGH-severity finding — set this unless the
+    /// planted defect is genuinely high-severity, or the case is uncatchable.
     #[serde(default)]
     pub anchor_contains: Option<String>,
     #[serde(default)]
@@ -148,6 +151,17 @@ fn load_cases(dir: &Path) -> Result<Vec<Case>> {
         let id = fname.trim_end_matches(".label.json").to_string();
         let label: Label = serde_json::from_str(&fs::read_to_string(&label_path)?)
             .with_context(|| format!("parsing label {}", label_path.display()))?;
+        // (#1119 QA) Fail loud on an unknown `kind` — `score` treats anything
+        // not "bug" as clean, while `print_summary` buckets on exact "clean"/"bug",
+        // so a typo ("Bug", trailing space) would silently miscount + drop the
+        // case from the totals. Operator-sovereignty: never a number you can't trace.
+        if label.kind != "clean" && label.kind != "bug" {
+            return Err(anyhow!(
+                "case \"{id}\": label.kind must be \"clean\" or \"bug\", got {:?} ({})",
+                label.kind,
+                label_path.display()
+            ));
+        }
         let diff_path = dir.join(format!("{id}.diff"));
         let diff = fs::read_to_string(&diff_path)
             .with_context(|| format!("reading diff {}", diff_path.display()))?;
@@ -454,5 +468,38 @@ mod tests {
         let s = score(&lbl("clean", None), &Review::default());
         assert!(s.degenerate);
         assert!(!s.correct);
+    }
+
+    #[test]
+    fn load_cases_rejects_unknown_kind() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let d = tmp.path();
+        fs::write(
+            d.join("x.label.json"),
+            r#"{"kind":"Regression","intent_title":"t","expect_verdict":"flag"}"#,
+        )
+        .unwrap();
+        fs::write(d.join("x.diff"), "diff --git a b\n").unwrap();
+        let err = load_cases(d).unwrap_err();
+        assert!(
+            err.to_string().contains(r#"must be "clean" or "bug""#),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_cases_loads_a_good_pair() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let d = tmp.path();
+        fs::write(
+            d.join("c.label.json"),
+            r#"{"kind":"clean","intent_title":"t","expect_verdict":"pass"}"#,
+        )
+        .unwrap();
+        fs::write(d.join("c.diff"), "diff --git a b\n").unwrap();
+        let cases = load_cases(d).unwrap();
+        assert_eq!(cases.len(), 1);
+        assert_eq!(cases[0].id, "c");
+        assert_eq!(cases[0].label.kind, "clean");
     }
 }
