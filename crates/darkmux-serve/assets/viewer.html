@@ -2038,6 +2038,24 @@ async function toggleCatalog(){
 //  - event-specific data lives under `payload` (schema 1.6+) → exposed as `fields`
 //  - category defaults to telemetry when a `source` is present, else work
 function flowToRenderModel(records){
+  // (#1122) A compaction emits TWO records at the same ts: the dispatch-stage
+  // WORK record (action=dispatch.compaction, source=crew_dispatch; message
+  // counts) AND — since #557 — a dedicated TOKEN-telemetry record
+  // (action=telemetry.compaction, source=compaction; token from/to for the
+  // sawtooth). The telemetry record is the canonical compaction signal. The
+  // legacy conversion below re-tagged dispatch.compaction as source=compaction
+  // too, so the subsystem card's `tel.filter(source==="compaction")` counted
+  // BOTH and reported 2× (the markers overlap at the shared ts, so the chart
+  // looked right while the meter doubled). Keep the conversion only as a
+  // FALLBACK — when no telemetry.compaction covers the same (session_id, ts) —
+  // so current dual-emit data counts each compaction once AND pre-#557 history
+  // (which has only dispatch.compaction) still renders its compactions.
+  const compTelemetryKeys=new Set();
+  for(const r of records){
+    if(r&&r.action==="telemetry.compaction"){
+      compTelemetryKeys.add((r.session_id||"")+"\x1f"+(r.ts||""));
+    }
+  }
   // Drop non-record meta lines before bucketing. Every flow file leads with a
   // schema header `{"_type":"schema","darkmux_version":...,"version":...}` — it
   // has no machine_uid, so it would otherwise fall into an "unknown" machine
@@ -2056,10 +2074,13 @@ function flowToRenderModel(records){
     if(o.tier)o.tier=String(o.tier).toLowerCase();
     if(o.source&&o.source.startsWith("frontier-"))o.source="frontier";
     if(o.payload&&!o.fields)o.fields=o.payload;
-    // dispatch.compaction → a compaction telemetry record (the subsystem's
-    // compaction count). from/to are message counts here, not the byte
-    // sawtooth the sample draws (per-turn context bytes need #557).
-    if(o.action==="dispatch.compaction"){
+    // (#1122) dispatch.compaction → a compaction telemetry record (message
+    // counts), but ONLY when no dedicated #557 telemetry.compaction record
+    // covers the same (session_id, ts). With a telemetry sibling present this
+    // record stays a plain source=crew_dispatch work event, so the compaction
+    // is counted once (by the canonical token-telemetry record).
+    if(o.action==="dispatch.compaction"
+       && !compTelemetryKeys.has((o.session_id||"")+"\x1f"+(o.ts||""))){
       const p=o.payload||{};
       o.category="telemetry"; o.source="compaction";
       o.fields={from:p.before_messages||0,to:p.after_messages||0};
