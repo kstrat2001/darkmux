@@ -133,6 +133,10 @@
   .sclear:hover{color:var(--text);background:var(--panel)}
   .sclear:focus-visible{outline:none;color:var(--amber);box-shadow:0 0 0 2px var(--amber-dim)}
   .sclear[hidden]{display:none}
+  /* (#1090) visible keyboard-focus ring for the delegated drill-nav cards
+     (role=button + tabindex added at runtime). :focus-visible = keyboard only,
+     so mouse clicks don't draw a ring. */
+  [data-act]:focus-visible{outline:2px solid var(--amber);outline-offset:2px;border-radius:4px}
   .qcount{flex:none;font:600 10px/1 'JetBrains Mono',monospace;letter-spacing:.04em;color:var(--amber-dim);white-space:nowrap;padding:3px 7px;border:1px solid var(--line);border-radius:10px;opacity:0;transition:opacity .15s}
   .qcount.show{opacity:1}
   .qcount.zero{color:var(--bad);border-color:rgba(255,107,133,.35)}
@@ -1928,6 +1932,14 @@ const ACTIONS={
   goday:d=>{ location.href="/play/"+encodeURIComponent(d); },
   golive:()=>{ location.href="/"; },
 };
+// (#1090) Shared dispatch for the delegated drill-nav — invoked by BOTH the
+// click handler and the keyboard handler below, so cards are mouse- AND
+// keyboard-activatable through one code path.
+function dispatchAct(el){
+  if(el.dataset.act==="filter"){toggleFilter(el.dataset.k,el.dataset.arg);return;}
+  const fn=ACTIONS[el.dataset.act];
+  if(fn)fn(el.dataset.arg);
+}
 document.addEventListener("click",e=>{
   const el=e.target.closest("[data-act]");
   // (#691) Click outside the open catalog panel (and not on its toggle) closes it.
@@ -1936,11 +1948,40 @@ document.addEventListener("click",e=>{
     if(panel && !panel.hidden && !e.target.closest("#catpanel")) panel.hidden=true;
   }
   if(!el)return;
-  if(el.dataset.act==="filter"){toggleFilter(el.dataset.k,el.dataset.arg);return;}
-  const fn=ACTIONS[el.dataset.act];
-  if(fn)fn(el.dataset.arg);
+  dispatchAct(el);
 });
-document.addEventListener("keydown",e=>{ if(e.key==="Escape"){const p=$("catpanel"); if(p) p.hidden=true;} });
+// (#1090) Keyboard activation. Enter or Space on a focused non-native [data-act]
+// element fires the same action as a click; native controls (button/link/input)
+// keep their own key handling, so no double-dispatch. Space is prevent-defaulted
+// only when it lands on a card (else the page would scroll), never elsewhere.
+document.addEventListener("keydown",e=>{
+  if(e.key==="Escape"){const p=$("catpanel"); if(p) p.hidden=true; return;}
+  if(e.key!=="Enter"&&e.key!==" "&&e.key!=="Spacebar")return;
+  const el=e.target.closest("[data-act]");
+  if(!el||el.matches("button,a[href],input,textarea,select"))return;
+  e.preventDefault();
+  dispatchAct(el);
+});
+// (#1090) Make the delegated drill-nav keyboard-REACHABLE: every clickable
+// [data-act] element that isn't already a native control gets role=button +
+// tabindex=0 so it can be tab-focused and activated by the handler above. A
+// MutationObserver covers every render path (full render(), the live-tail
+// partial update, and any future one) without per-template edits. We observe
+// childList only — setting role/tabindex are attribute writes we don't watch, so
+// no feedback loop.
+function enrichActionable(root){
+  const els=(root.matches&&root.matches("[data-act]"))?[root]:[];
+  if(root.querySelectorAll)els.push(...root.querySelectorAll("[data-act]"));
+  for(const el of els){
+    if(el.matches("button,a[href],input,textarea,select"))continue; // natively focusable + keyed
+    if(!el.hasAttribute("tabindex"))el.tabIndex=0;
+    if(!el.hasAttribute("role"))el.setAttribute("role","button");
+  }
+}
+new MutationObserver(muts=>{
+  for(const mu of muts)for(const n of mu.addedNodes)if(n.nodeType===1)enrichActionable(n);
+}).observe(document.body,{childList:true,subtree:true});
+enrichActionable(document.body); // initial pass for anything already in the DOM
 // `toggle` doesn't bubble — a capture-phase listener stands in for the old
 // inline ontoggle on the raw-JSON <details> (tagged data-raw; the recent-runs
 // <details class="rr"> rows don't carry it and are untracked by design).
