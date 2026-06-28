@@ -1,0 +1,6 @@
+{ "kind": "bug", "bug_class": "sql-injection",
+  "intent_title": "feat(db): add find_by_name user lookup",
+  "intent_body": "Adds UserStore::find_by_name so callers can look up a user by login name, alongside find_by_id.",
+  "expect_verdict": "flag",
+  "anchor_contains": "format!(\"SELECT id, name, email FROM users WHERE name = '{}'\", name)",
+  "notes": "Synthetic. SQL built by string interpolation while find_by_id uses a bound ?1 — a competent reviewer MUST flag HIGH. Recall + anchor test." }

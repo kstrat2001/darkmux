@@ -1,0 +1,64 @@
+diff --git a/src/conventions.rs b/src/conventions.rs
+index 635abcf..87a0461 100644
+--- a/src/conventions.rs
++++ b/src/conventions.rs
+@@ -155,6 +155,17 @@ pub fn valid_branch(name: &str) -> bool {
+             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '.' | '-'))
+ }
+ 
++/// Validate a `gh pr create --label` value before it reaches the subprocess:
++/// non-empty and **not starting with `-`**. A leading dash would be parsed by
++/// `gh` as a flag (e.g. a `--config` label → argument injection into the
++/// `gh pr create` invocation). GitHub labels otherwise permit spaces and most
++/// punctuation ("help wanted"), so — unlike [`valid_branch`] — this stays
++/// permissive beyond the leading-dash guard; the dash is the only injection
++/// vector since `gh` is invoked with explicit argv (no shell). (#1111)
++pub fn valid_label(name: &str) -> bool {
++    !name.is_empty() && !name.starts_with('-')
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -194,6 +205,18 @@ mod tests {
+         assert!(!valid_branch("has space"));
+     }
+ 
++    #[test]
++    fn valid_label_blocks_flag_injection_but_allows_real_labels() {
++        // real GitHub labels — including spaces — pass
++        assert!(valid_label("agent-work"));
++        assert!(valid_label("help wanted"));
++        assert!(valid_label("good first issue"));
++        // the injection vector + empties are rejected
++        assert!(!valid_label("-foo")); // would parse as a gh flag
++        assert!(!valid_label("--config")); // the classic arg-injection case
++        assert!(!valid_label(""));
++    }
++
+     #[test]
+     fn load_handles_absent_and_malformed() {
+         let tmp = tempfile::TempDir::new().unwrap();
+diff --git a/src/mission_run.rs b/src/mission_run.rs
+index 624218a..3344125 100644
+--- a/src/mission_run.rs
++++ b/src/mission_run.rs
+@@ -2380,6 +2380,18 @@ pub fn ship(
+                 .map(|c| c.pr_labels.iter().map(String::as_str).collect())
+                 .unwrap_or_default();
+             for l in &labels {
++                // (#1111) Argument-injection guard on the gh subprocess: a label
++                // that's empty or starts with `-` would be parsed by gh as a flag
++                // (e.g. `--label --config` injecting a gh option). Branch names are
++                // already validated; labels were the gap. Skip + warn rather than
++                // fail the whole dispatch over a bad label.
++                if !crate::conventions::valid_label(l) {
++                    eprintln!(
++                        "darkmux mission run: skipping unsafe pr label {l:?} \
++                         (empty or starts with `-` — would parse as a gh flag)"
++                    );
++                    continue;
++                }
+                 args.push("--label");
+                 args.push(l);
+             }

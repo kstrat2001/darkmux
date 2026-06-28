@@ -1,0 +1,176 @@
+diff --git a/crates/darkmux-serve/assets/viewer.html b/crates/darkmux-serve/assets/viewer.html
+index 46be48e..66762cb 100644
+--- a/crates/darkmux-serve/assets/viewer.html
++++ b/crates/darkmux-serve/assets/viewer.html
+@@ -721,6 +721,22 @@ <h3><span>event log · <span id="logscope">fleet</span></span>
+   if(c&&e)return T(c.ts)<=T(e.ts)?c:e;
+   return c||e;
+ };
++// (#857) THE single source of truth for "is this session in flight?". Every
++// "active / in-flight / running" derivation routes through here so the
++// running-forever bug class can't be fixed at one site and linger at another.
++// Live mode keys on PRESENCE (liveSessionSet — TTL-self-healing: an orphaned
++// session with NO close-edge ages out of the live set on its own), per the
++// presence-as-truth doctrine. Playback keys on the durable close-edge relative
++// to the playhead (the session was running iff nothing has closed it yet).
++function sessionRunning(sid){
++  if(document.body.classList.contains('live-mode')) return liveSessionSet().has(sid);
++  const close=sessionCloseEdge(sid);
++  return !(close && T(close.ts)<=state.t);
++}
++// (#857) A session's last recorded activity — where an orphan's timeline bar
++// ends when it aged out of presence with no close-edge (so the bar stops at its
++// last sign of life, not at "now").
++const lastTs=sid=>{ let m=0; for(const r of DATA){ if(r.session_id===sid){ const t=T(r.ts); if(t>m)m=t; } } return m; };
+ 
+ // (#691) The mission label for the meta bar. Joining EVERY mission_id in the
+ // window produced an ever-growing title (`◆ japan-trip, test-mission-e11, m1,
+@@ -847,16 +863,12 @@ <h3><span>event log · <span id="logscope">fleet</span></span>
+   }
+ }
+ function machActive(m){
+-  const v=visible();
+-  const starts=v.filter(r=>uidOf(r)===m&&r.action==="dispatch.start").map(r=>r.session_id);
+-  // (#720) A run is done when it reached EITHER terminal — without counting
+-  // `dispatch.error`, a killed run keeps its machine "active" forever.
+-  // (#856) A SIGKILL is uncatchable, so the Drop-based bookend guard (#717)
+-  // can't emit `dispatch.error` on a hard kill — the reconciler's `session.end`
+-  // (#647) is the compensating close-edge. Count it too, else a hard-killed
+-  // dispatch shows "in flight" forever even after the session is gone.
+-  const dones=v.filter(r=>uidOf(r)===m&&(r.action==="dispatch.complete"||r.action==="dispatch.error"||r.action==="session.end")).map(r=>r.session_id);
+-  return starts.some(s=>!dones.includes(s));
++  // (#857) A machine is in flight iff one of its started sessions is still
++  // running — routed through the shared sessionRunning() (live = presence,
++  // playback = close-edge at the playhead). A hard-killed/orphaned dispatch no
++  // longer pins the machine "active" forever: it ages out of presence in live
++  // mode, and is bracketed by its close-edge (incl. session.end) in playback.
++  return visible().some(r=>uidOf(r)===m&&r.action==="dispatch.start"&&sessionRunning(r.session_id));
+ }
+ // (#638 Slice 3) Is machine `m` PRESENT at the scrubber time `state.t`?
+ //   true  = present · false = absent (offline) · null = unknown (no evidence)
+@@ -1059,11 +1071,16 @@ <h3><span>event log · <span id="logscope">fleet</span></span>
+   const lanes=ms.map(m=>{
+     const bars=sessionsOn(m).map(sid=>{
+       const s=dispatch(sid,"start"); if(!s||T(s.ts)>state.t)return"";
+-      const term=dispatchEnd(sid), close=sessionCloseEdge(sid), done=close&&T(close.ts)<=state.t;
+-      // (#1071) open bar (not closed at the scrubber) = still running → yellow;
+-      // closed maps to complete/canceled/failed via the shared convention.
++      const term=dispatchEnd(sid), close=sessionCloseEdge(sid);
++      // (#857) open = still running via the shared sessionRunning() (live=presence,
++      // playback=close-edge at the scrubber). A live orphan that aged out of
++      // presence with no close-edge reads as done — and its bar ends at its last
++      // recorded activity, NOT at "now" (which would draw it growing forever).
++      const done=!sessionRunning(sid);
++      // (#1071) open bar = still running → yellow; closed maps to
++      // complete/canceled/failed via the shared convention.
+       const {cls,lbl}=statusVisual({open:!done, errored:done&&dispatchErrored(term), killed:dispatchKilled(term), clean:done&&!!term&&!dispatchErrored(term)});
+-      const end=done?T(close.ts):state.t;
++      const end=!done?state.t:(close?T(close.ts):(lastTs(sid)||state.t));
+       const W=Math.max(0.6,pct(end)-pct(T(s.ts)));
+       // Clamp so a bar at/near "now" (left≈100%) + its min-width can't spill
+       // past the track's right edge (the rightmost bar was clipping ~3px).
+@@ -1795,7 +1812,15 @@ <h3>tier decision: ${esc(r.handle)}</h3>
+   const sessions=Object.keys(starts).map(sid=>{
+     const st=starts[sid], cp=dispatchEnd(sid), close=sessionCloseEdge(sid);
+     const started=T(st.ts)<=state.t, ended=close&&T(close.ts)<=state.t;
+-    const status=!started?"backlog":(ended?(dispatchErrored(cp)?"errored":"complete"):"active");
++    // (#857) "in flight" routes through the shared sessionRunning() (live=presence,
++    // playback=close-edge), so an orphaned dispatch no longer inflates the
++    // "+N in flight" count. A live session that aged out of presence with no
++    // close-edge reads "abandoned" — never a phantom "active" or "complete".
++    let status;
++    if(!started) status="backlog";
++    else if(sessionRunning(sid)) status="active";
++    else if(ended) status=dispatchErrored(cp)?"errored":"complete";
++    else status="abandoned";
+     return {sid,role:(st.handle||"").replace(/^darkmux\//,""), machine:nameOf(uidOf(st)),
+             model:st.model||"?", status, ts:T(st.ts)};
+   }).sort((a,b)=>a.ts-b.ts);
+diff --git a/docs/demo/index.html b/docs/demo/index.html
+index 12a5496..bb28363 100644
+--- a/docs/demo/index.html
++++ b/docs/demo/index.html
+@@ -726,6 +726,22 @@ <h3><span>event log · <span id="logscope">fleet</span></span>
+   if(c&&e)return T(c.ts)<=T(e.ts)?c:e;
+   return c||e;
+ };
++// (#857) THE single source of truth for "is this session in flight?". Every
++// "active / in-flight / running" derivation routes through here so the
++// running-forever bug class can't be fixed at one site and linger at another.
++// Live mode keys on PRESENCE (liveSessionSet — TTL-self-healing: an orphaned
++// session with NO close-edge ages out of the live set on its own), per the
++// presence-as-truth doctrine. Playback keys on the durable close-edge relative
++// to the playhead (the session was running iff nothing has closed it yet).
++function sessionRunning(sid){
++  if(document.body.classList.contains('live-mode')) return liveSessionSet().has(sid);
++  const close=sessionCloseEdge(sid);
++  return !(close && T(close.ts)<=state.t);
++}
++// (#857) A session's last recorded activity — where an orphan's timeline bar
++// ends when it aged out of presence with no close-edge (so the bar stops at its
++// last sign of life, not at "now").
++const lastTs=sid=>{ let m=0; for(const r of DATA){ if(r.session_id===sid){ const t=T(r.ts); if(t>m)m=t; } } return m; };
+ 
+ // (#691) The mission label for the meta bar. Joining EVERY mission_id in the
+ // window produced an ever-growing title (`◆ japan-trip, test-mission-e11, m1,
+@@ -852,16 +868,12 @@ <h3><span>event log · <span id="logscope">fleet</span></span>
+   }
+ }
+ function machActive(m){
+-  const v=visible();
+-  const starts=v.filter(r=>uidOf(r)===m&&r.action==="dispatch.start").map(r=>r.session_id);
+-  // (#720) A run is done when it reached EITHER terminal — without counting
+-  // `dispatch.error`, a killed run keeps its machine "active" forever.
+-  // (#856) A SIGKILL is uncatchable, so the Drop-based bookend guard (#717)
+-  // can't emit `dispatch.error` on a hard kill — the reconciler's `session.end`
+-  // (#647) is the compensating close-edge. Count it too, else a hard-killed
+-  // dispatch shows "in flight" forever even after the session is gone.
+-  const dones=v.filter(r=>uidOf(r)===m&&(r.action==="dispatch.complete"||r.action==="dispatch.error"||r.action==="session.end")).map(r=>r.session_id);
+-  return starts.some(s=>!dones.includes(s));
++  // (#857) A machine is in flight iff one of its started sessions is still
++  // running — routed through the shared sessionRunning() (live = presence,
++  // playback = close-edge at the playhead). A hard-killed/orphaned dispatch no
++  // longer pins the machine "active" forever: it ages out of presence in live
++  // mode, and is bracketed by its close-edge (incl. session.end) in playback.
++  return visible().some(r=>uidOf(r)===m&&r.action==="dispatch.start"&&sessionRunning(r.session_id));
+ }
+ // (#638 Slice 3) Is machine `m` PRESENT at the scrubber time `state.t`?
+ //   true  = present · false = absent (offline) · null = unknown (no evidence)
+@@ -1064,11 +1076,16 @@ <h3><span>event log · <span id="logscope">fleet</span></span>
+   const lanes=ms.map(m=>{
+     const bars=sessionsOn(m).map(sid=>{
+       const s=dispatch(sid,"start"); if(!s||T(s.ts)>state.t)return"";
+-      const term=dispatchEnd(sid), close=sessionCloseEdge(sid), done=close&&T(close.ts)<=state.t;
+-      // (#1071) open bar (not closed at the scrubber) = still running → yellow;
+-      // closed maps to complete/canceled/failed via the shared convention.
++      const term=dispatchEnd(sid), close=sessionCloseEdge(sid);
++      // (#857) open = still running via the shared sessionRunning() (live=presence,
++      // playback=close-edge at the scrubber). A live orphan that aged out of
++      // presence with no close-edge reads as done — and its bar ends at its last
++      // recorded activity, NOT at "now" (which would draw it growing forever).
++      const done=!sessionRunning(sid);
++      // (#1071) open bar = still running → yellow; closed maps to
++      // complete/canceled/failed via the shared convention.
+       const {cls,lbl}=statusVisual({open:!done, errored:done&&dispatchErrored(term), killed:dispatchKilled(term), clean:done&&!!term&&!dispatchErrored(term)});
+-      const end=done?T(close.ts):state.t;
++      const end=!done?state.t:(close?T(close.ts):(lastTs(sid)||state.t));
+       const W=Math.max(0.6,pct(end)-pct(T(s.ts)));
+       // Clamp so a bar at/near "now" (left≈100%) + its min-width can't spill
+       // past the track's right edge (the rightmost bar was clipping ~3px).
+@@ -1800,7 +1817,15 @@ <h3>tier decision: ${esc(r.handle)}</h3>
+   const sessions=Object.keys(starts).map(sid=>{
+     const st=starts[sid], cp=dispatchEnd(sid), close=sessionCloseEdge(sid);
+     const started=T(st.ts)<=state.t, ended=close&&T(close.ts)<=state.t;
+-    const status=!started?"backlog":(ended?(dispatchErrored(cp)?"errored":"complete"):"active");
++    // (#857) "in flight" routes through the shared sessionRunning() (live=presence,
++    // playback=close-edge), so an orphaned dispatch no longer inflates the
++    // "+N in flight" count. A live session that aged out of presence with no
++    // close-edge reads "abandoned" — never a phantom "active" or "complete".
++    let status;
++    if(!started) status="backlog";
++    else if(sessionRunning(sid)) status="active";
++    else if(ended) status=dispatchErrored(cp)?"errored":"complete";
++    else status="abandoned";
+     return {sid,role:(st.handle||"").replace(/^darkmux\//,""), machine:nameOf(uidOf(st)),
+             model:st.model||"?", status, ts:T(st.ts)};
+   }).sort((a,b)=>a.ts-b.ts);

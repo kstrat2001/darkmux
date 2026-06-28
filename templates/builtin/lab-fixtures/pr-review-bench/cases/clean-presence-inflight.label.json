@@ -1,0 +1,4 @@
+{ "kind": "clean", "intent_title": "fix(viewer): #857 derive in-flight from presence (live)",
+  "intent_body": "Route fleet card / timeline / burn-down through one sessionRunning() helper so an orphaned dispatch stops reading 'running' forever; playback keeps close-edges.",
+  "expect_verdict": "pass",
+  "notes": "Merged PR #1107, frontier-verified clean. qwen3-8b/9b over-flagged; coder-next/devstral passed." }
