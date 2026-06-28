@@ -28,11 +28,29 @@ pub fn pull(gh: Option<&str>, url: Option<&str>, stdin: bool) -> Result<()> {
     }
 }
 
+/// Reject a `darkmux external pull` target that a subprocess would parse as a
+/// flag: empty, or starting with `-` (e.g. `--config` → curl/gh flag injection).
+/// Shared by the gh + url plugins. The url plugin ALSO requires an http(s)
+/// scheme (which already excludes a leading dash); this keeps the gh path safe
+/// and the intent explicit. gh/curl run with explicit argv (no shell), so the
+/// leading dash is the only injection vector. (#1112)
+fn valid_external_target(s: &str) -> bool {
+    !s.is_empty() && !s.starts_with('-')
+}
+
 /// Wrap `gh issue view <url> --comments` or `gh pr view <url> --comments`.
 /// Heuristic: paths containing `/pull/` route to `pr view`; everything
 /// else routes to `issue view` and lets `gh` emit the upstream error
 /// when the URL is something else entirely.
 fn pull_gh(target: &str) -> Result<()> {
+    // (#1112) Argument-injection guard: a target starting with `-` would be
+    // parsed by gh as a flag (e.g. `--gh --version`).
+    if !valid_external_target(target) {
+        return Err(anyhow!(
+            "external pull --gh target is empty or starts with `-` \
+             (would parse as a gh flag): `{target}`"
+        ));
+    }
     let kind = if target.contains("/pull/") { "pr" } else { "issue" };
     let output = Command::new("gh")
         .args([kind, "view", target, "--comments"])
@@ -59,6 +77,14 @@ fn pull_gh(target: &str) -> Result<()> {
 /// URL responds with — HTML, JSON, markdown all valid. Downstream
 /// AI-structuring (Sprint 3 `mission propose`) handles the lowering.
 fn pull_url(target: &str) -> Result<()> {
+    // (#1112) Argument-injection guard (shared with the gh path). The http(s)
+    // scheme check below already excludes a leading `-`; the explicit guard
+    // keeps the two plugins symmetric and the intent obvious.
+    if !valid_external_target(target) {
+        return Err(anyhow!(
+            "external pull --url target is empty or starts with `-`: `{target}`"
+        ));
+    }
     // (#907) Restrict to http(s) — defense-in-depth. Today the operator
     // types the URL by hand, but allowlisting the scheme blocks `file://`,
     // `gopher://`, etc. (an SSRF/local-read shape) should this path ever be
@@ -72,6 +98,12 @@ fn pull_url(target: &str) -> Result<()> {
             "external pull URL must start with http:// or https:// (got: `{target}`)"
         ));
     }
+    // (#1112) SSRF note — DEFERRED by design, not an oversight. `-L` follows
+    // redirects with no private-IP / IMDS / loopback allowlist, so a hostile or
+    // automation-derived URL could be redirected at an internal endpoint. The
+    // threat model today is operator-typed URLs (self-inflicted, LOW). If this
+    // path is ever wired to less-trusted input, add a resolve-then-allowlist
+    // SSRF guard and drop `-L`.
     let output = Command::new("curl")
         .args(["-s", "-L", "--max-time", "30", target])
         .output()
@@ -127,5 +159,27 @@ mod tests {
     fn pull_rejects_url_plus_stdin() {
         let err = pull(None, Some("foo"), true).expect_err("url + stdin should error");
         assert!(err.to_string().contains("exactly one of"));
+    }
+
+    // (#1112) argument-injection guard
+    #[test]
+    fn valid_external_target_blocks_flags_and_empty() {
+        assert!(valid_external_target("https://github.com/o/r/issues/1"));
+        assert!(valid_external_target("o/r#5"));
+        assert!(!valid_external_target("-foo")); // would parse as a gh/curl flag
+        assert!(!valid_external_target("--config"));
+        assert!(!valid_external_target(""));
+    }
+
+    #[test]
+    fn pull_gh_rejects_leading_dash_target() {
+        let err = pull(Some("--version"), None, false).expect_err("leading-dash gh target should error");
+        assert!(err.to_string().contains("starts with `-`"));
+    }
+
+    #[test]
+    fn pull_url_rejects_leading_dash_target() {
+        let err = pull(None, Some("-O/etc/passwd"), false).expect_err("leading-dash url target should error");
+        assert!(err.to_string().contains("starts with `-`"));
     }
 }
