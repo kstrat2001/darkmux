@@ -69,10 +69,19 @@ pub use darkmux_types as types;
 pub use darkmux_types::workdir;
 pub use darkmux_lab::workloads;
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// (#1129) `darkmux --version` shows the full build identifier (version + git
+/// SHA, or `release`) — the same string the viewer header + `darkmux doctor`
+/// render, so the first place anyone checks a version agrees with the rest.
+/// A `OnceLock` hands clap the `&'static str` its `version =` needs from the
+/// runtime `build_version()`.
+fn build_version_static() -> &'static str {
+    use std::sync::OnceLock;
+    static V: OnceLock<String> = OnceLock::new();
+    V.get_or_init(darkmux_types::build_version)
+}
 
 #[derive(Parser)]
-#[command(name = "darkmux", version = VERSION, about = "Lab and multiplexer for local LLM configurations")]
+#[command(name = "darkmux", version = build_version_static(), about = "Lab and multiplexer for local LLM configurations")]
 struct Cli {
     #[command(subcommand)]
     command: Cmd,

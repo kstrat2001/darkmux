@@ -86,12 +86,25 @@ const VIEWER_HTML: &str = include_str!("../assets/viewer.html");
 /// viewer's `boot()` can read it before any data-fetching logic runs.
 /// Optionally injects a `<meta name="darkmux-date">` to pin playback to a
 /// specific UTC date independent of the browser's URL.
+///
+/// (#1129) Always injects the build identifier (`darkmux-version` =
+/// `build_version()`, with the git SHA) and the flow-schema version
+/// (`darkmux-flow-schema`) so the viewer header can show WHICH build is
+/// running + the data contract it renders. Values are darkmux-controlled
+/// (`x.y.z (sha✱)` / `x.y.z`) — no quote/angle chars — so no escaping needed.
 fn inject_mode_meta(html: &str, mode: &str, date: Option<&str>) -> String {
     let mut meta = format!(r#"<meta name="darkmux-mode" content="{}">"#, mode);
     if let Some(d) = date {
         meta.push_str(&format!(r#"
 <meta name="darkmux-date" content="{}">"#, d));
     }
+    meta.push_str(&format!(
+        r#"
+<meta name="darkmux-version" content="{}">
+<meta name="darkmux-flow-schema" content="{}">"#,
+        darkmux_types::build_version(),
+        darkmux_flow::FLOW_SCHEMA_VERSION,
+    ));
     // <head> appears exactly once; the replacement is unambiguous.
     html.replacen("<head>", &format!("<head>\n{}", meta), 1)
 }

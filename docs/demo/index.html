@@ -34,6 +34,8 @@
   html,body{margin:0;height:100vh;background:var(--bg);color:var(--text);font:14px/1.4 'Inter',-apple-system,system-ui,sans-serif;overflow:hidden}
   .top{height:46px;display:flex;align-items:center;gap:14px;padding:0 16px;border-bottom:1px solid var(--line);background:var(--bg2)}
   .brand{font-weight:700;letter-spacing:.04em}.brand b{color:var(--amber)}.brand a{color:inherit;text-decoration:none}.brand a:hover b{text-decoration:underline}
+  /* (#1129) Build identifier — version (+ git SHA) and flow-schema the daemon injects; empty on the static demo. */
+  .ver{font:11px/1 'JetBrains Mono',monospace;color:var(--muted);letter-spacing:.02em}
   .topnav{margin-left:auto;display:flex;gap:18px;align-items:center}
   .topnav a{color:var(--muted);text-decoration:none;font:600 12px 'JetBrains Mono',monospace;letter-spacing:.04em}
   .topnav a:hover{color:var(--amber)}
@@ -490,6 +492,7 @@
 <body>
 <div class="top">
   <span class="brand"><a href="https://darkmux.com/" target="_blank" rel="noopener"><b>darkmux</b></a> · observability</span>
+  <span class="ver" id="verbadge"></span>
   <span class="badge" id="srcbadge">Loading…</span>
   <span class="pb" id="modebadge">▣ playback</span>
   <nav class="topnav">
@@ -2428,6 +2431,14 @@ function injectedMeta(name){
 async function boot(){
   const injectedMode=injectedMeta("darkmux-mode");
   const injectedDate=injectedMeta("darkmux-date");
+  // (#1129) Build identifier in the header — which build is serving this page.
+  // The daemon injects darkmux-version (version + git SHA) + darkmux-flow-schema;
+  // the static demo has neither, so the chip stays empty (no daemon to name).
+  const verMeta=injectedMeta("darkmux-version"), schemaMeta=injectedMeta("darkmux-flow-schema");
+  {const vb=$("verbadge"); if(vb&&verMeta){
+    vb.textContent="v"+verMeta+(schemaMeta?" · schema "+schemaMeta:"");
+    vb.title="darkmux "+verMeta+(schemaMeta?" · flow schema "+schemaMeta:"");
+  }}
   // Static-playback source (darkmux.com/demo): a committed .jsonl loaded
   // directly — exactly the on-disk flow file the daemon would read for
   // /flow/<date>. No daemon, identical render path. Forces playback.

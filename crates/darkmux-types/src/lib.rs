@@ -14,6 +14,24 @@ pub mod workdir;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// (#1129) The running build's identifier — single source of truth for the
+/// viewer header, `darkmux doctor`, and anywhere the live build needs naming.
+/// The bare package version can't distinguish a packaged release from a
+/// main-dev build, so `build.rs` bakes a tag (`DARKMUX_BUILD_TAG`):
+///
+///   * `"<version> (release)"` — a packaged release (Homebrew stable stamps
+///     `DARKMUX_RELEASE`).
+///   * `"<version> (a1b2c3d✱)"` — a git build (dev / `brew install --HEAD`);
+///     short SHA, `✱` when the tree was dirty.
+///   * `"<version>"` — a source tarball build (no release flag, no git).
+pub fn build_version() -> String {
+    let v = env!("CARGO_PKG_VERSION");
+    match option_env!("DARKMUX_BUILD_TAG") {
+        Some(tag) if !tag.is_empty() => format!("{v} ({tag})"),
+        _ => v.to_string(),
+    }
+}
+
 /// AI-industry-conventional model capabilities — orthogonal optimization
 /// dimensions that map to how Anthropic, OpenAI, HuggingFace, Google,
 /// Cohere, Mistral, and Meta describe their models. A *role* requests
