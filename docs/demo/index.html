@@ -167,10 +167,14 @@
   /* (#1071) activity-timeline bars share the status convention: running=yellow
      (pulse), complete=green, canceled=orange, failed=red. */
   .sbar{position:absolute;top:5px;height:18px;background:var(--muted);border-radius:3px;min-width:2px}
-  .sbar.run{background:var(--run);box-shadow:0 0 6px var(--run);animation:lpulse 1.6s ease-in-out infinite}
-  .sbar.done{background:var(--good)}
-  .sbar.canceled{background:var(--warn)}
-  .sbar.err{background:var(--bad)}
+  /* (#1092) status cue is color + PATTERN, not color alone — distinguishable
+     without hue, and the patterns are static so they survive
+     prefers-reduced-motion (which drops the run pulse): run = diagonal stripes ·
+     done = solid · canceled = vertical stripes · err = cross-hatch. */
+  .sbar.run{background-color:var(--run);box-shadow:0 0 6px var(--run);animation:lpulse 1.6s ease-in-out infinite;background-image:repeating-linear-gradient(45deg,rgba(0,0,0,.34) 0 2px,transparent 2px 5px)}
+  .sbar.done{background-color:var(--good)}
+  .sbar.canceled{background-color:var(--warn);background-image:repeating-linear-gradient(90deg,rgba(0,0,0,.34) 0 2px,transparent 2px 5px)}
+  .sbar.err{background-color:var(--bad);background-image:repeating-linear-gradient(45deg,rgba(0,0,0,.36) 0 1.5px,transparent 1.5px 4px),repeating-linear-gradient(135deg,rgba(0,0,0,.36) 0 1.5px,transparent 1.5px 4px)}
   .tltrack .ph{position:absolute;top:0;bottom:0;width:2px;background:var(--text);opacity:.32}
   .tlaxis{margin-left:calc(var(--lname-w,150px) + 12px);display:flex;justify-content:space-between;font:9px 'JetBrains Mono',monospace;color:var(--muted);margin-top:7px}
   .tlempty{font:11px 'JetBrains Mono',monospace;color:var(--muted)}
@@ -325,6 +329,10 @@
   .cyc.on{background:var(--amber-dim);color:#0a0f17;border-color:var(--amber-dim)}
   .cyc.abort{background:#2a1416;color:var(--bad);border-color:var(--bad)}
   .cyc.block{background:#241f12;color:var(--warn);border-color:var(--warn)}
+  /* (#1092) the active cycle stage was amber-vs-muted = color-only; a leading
+     dot marks "current" without relying on hue (abort/block already carry the
+     words "aborted"/"blocked"). */
+  .cyc.on::before{content:"\25CF ";font-size:8px;vertical-align:1px}
   .sprun{flex:1;text-align:right;font:11px 'JetBrains Mono',monospace}
   .splink{color:var(--amber);cursor:pointer;text-decoration:none}.splink:hover{text-decoration:underline}
   .sprow[data-act]{cursor:pointer}.sprow[data-act]:hover{border-color:var(--amber-dim)}
