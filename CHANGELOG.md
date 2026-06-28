@@ -11,6 +11,48 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 
 ## [Unreleased]
 
+## [1.11.2] - 2026-06-28
+
+A bug-fix + accessibility + security patch from a board triage. No schema change
+(`FLOW_SCHEMA` stays `1.14.0`) and the `runtime/` image is unchanged from
+`1.11.0` — a pure `brew upgrade`, no image pull.
+
+### Fixed
+- **Live "in flight" derives from presence, not flow records (#857).** A
+  hard-killed or orphaned dispatch could read "running" / "dispatch in flight"
+  forever. All live-mode activity derivations (fleet card, timeline bars,
+  burn-down "+N in flight") now key on presence via one `sessionRunning()` helper
+  — an orphan ages out on its own (TTL); playback still uses the durable
+  close-edges.
+- **Truthful, de-duplicated live status line (#1103).** Dropped the "live"/"today"
+  that the badges already show; "last run" now measures real wall-clock elapsed
+  (it was stuck on "just now"); the backwards-looking clock range became the
+  window scope ("last 24h"); machine presence is decoupled from the record count.
+- **Consolidated live headline (#1105).** Dropped the "fleet" wording (wrong for a
+  solo local machine) and folded the machine count into a chip glyph.
+- **Dispatch-error records carry the stderr text (#1042).** The openclaw-path
+  error record had `stderr_chars` (a count) but not the text, so you couldn't see
+  *why* a dispatch failed; it now carries a bounded stderr tail excerpt
+  (null on success).
+
+### Accessibility
+- **Keyboard navigation for the drill cards (#1090).** Fleet → machine → session
+  cards were mouse/touch-only; they're now focusable (`role=button` + tabindex via
+  a delegated observer), Enter/Space-activatable, with a visible focus ring.
+- **Non-color status cue (#1092).** Timeline bars now carry a per-state pattern
+  (diagonal/solid/vertical/cross-hatch) and the active cycle stage a dot — state
+  is no longer color-only, including under `prefers-reduced-motion`.
+
+### Security
+- **`pr_labels` flag-injection guard (#1111).** A repo-declared PR label starting
+  with `-` (e.g. `--config`) was passed unvalidated to `gh pr create --label` and
+  parsed as a flag; labels are now validated (non-empty, no leading dash) like
+  branch names already were.
+- **`external pull` argument-injection guard (#1112).** A `--gh`/`--url` target
+  starting with `-` was passed unvalidated to the `gh`/`curl` subprocess; targets
+  are now rejected before spawn. (The SSRF hardening of `curl -L` remains tracked
+  + deferred for the operator-typed threat model.)
+
 ## [1.11.1] - 2026-06-28
 
 A focused **viewer + UX pass**, mostly mobile, plus one local-PR-reviewer
@@ -565,6 +607,7 @@ cluster of crew-index correctness repairs.
   idle machine's bar no longer stretches to the playhead; adds the first
   viewer-lifecycle e2e regression gate.
 
+[1.11.2]: https://github.com/kstrat2001/darkmux/releases/tag/v1.11.2
 [1.11.1]: https://github.com/kstrat2001/darkmux/releases/tag/v1.11.1
 [1.11.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.11.0
 [1.10.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.10.0
