@@ -1192,6 +1192,27 @@ enum LabCmd {
         #[arg(long = "runtime-cmd", value_name = "PATH", default_value = "openclaw")]
         runtime_cmd: String,
     },
+    /// PR-reviewer eval (#1119) — run the `pr-reviewer` role over a labeled
+    /// diff corpus and score precision / recall / verdict / anchor against the
+    /// ground-truth labels. Run across profiles (`--profile` / `--profiles-file`)
+    /// to compare models reproducibly — the rows are the bake-off matrix.
+    ReviewBench {
+        /// Directory of labeled cases (`<id>.diff` + `<id>.label.json`).
+        #[arg(
+            long = "cases-dir",
+            default_value = "templates/builtin/lab-fixtures/pr-review-bench/cases"
+        )]
+        cases_dir: String,
+        /// Profile (the model axis) — defaults to the registry's default_profile.
+        #[arg(long, short = 'p')]
+        profile: Option<String>,
+        /// Profiles-registry path (profiles.json). Overrides DARKMUX_PROFILES.
+        #[arg(long = "profiles-file")]
+        profiles: Option<String>,
+        /// Per-case dispatch timeout in seconds.
+        #[arg(long, default_value = "600")]
+        timeout: u32,
+    },
     /// Loop lab (#986) — run ONE dispatch under a chosen harness config and
     /// classify how the loop behaved: productive / struggled / inert-false-pass
     /// / failed. The loop-engineering bench — vary the HARNESS (turn/token
@@ -3667,6 +3688,20 @@ fn cmd_lab(sub: LabCmd) -> Result<i32> {
                 }
             }
             Ok(if outcomes.iter().all(|o| o.ok) { 0 } else { 1 })
+        }
+        LabCmd::ReviewBench {
+            cases_dir,
+            profile,
+            profiles,
+            timeout,
+        } => {
+            lab::review_bench::run_review_bench(lab::review_bench::ReviewBenchOpts {
+                cases_dir: std::path::PathBuf::from(cases_dir),
+                profile_name: profile,
+                config_path: profiles,
+                timeout_seconds: timeout,
+            })?;
+            Ok(0)
         }
         LabCmd::Loop {
             workload,

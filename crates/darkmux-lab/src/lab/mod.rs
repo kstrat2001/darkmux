@@ -14,6 +14,7 @@ pub mod profile_check;
 // re-export keeps all existing `crate::lab::paths::*` paths resolving unchanged.
 pub use darkmux_types::paths;
 pub mod registry;
+pub mod review_bench;
 pub mod run;
 pub mod sandbox_hash;
 pub mod tune;
