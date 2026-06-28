@@ -770,6 +770,23 @@ fn cap_parent_output(content: &str, max: usize) -> String {
     format!("{head}\n\n[… output truncated at {max} chars; full text in the sprint's output file]")
 }
 
+/// Max chars of stderr carried in the dispatch-error flow record (#1042).
+const STDERR_EXCERPT_MAX: usize = 4000;
+
+/// TAIL excerpt of `content` to `max` chars (char-safe, never mid-UTF-8), with a
+/// leading marker when truncated. Unlike [`cap_parent_output`] (a head), this
+/// keeps the END — a failing process's actual error almost always lands at the
+/// tail of stderr. `max == 0` means "no cap". Pure, for testability. (#1042)
+fn tail_excerpt(content: &str, max: usize) -> String {
+    let trimmed = content.trim_end();
+    let n = trimmed.chars().count();
+    if max == 0 || n <= max {
+        return trimmed.to_string();
+    }
+    let tail: String = trimmed.chars().skip(n - max).collect();
+    format!("[… stderr truncated, showing last {max} of {n} chars]\n{tail}")
+}
+
 /// Resolve the dispatch message: when `sprint_id` is `Some(id)`, look
 /// up the sprint's `depends_on` parents and prepend each parent's
 /// recorded output (capped per [`sprint_context_max_chars`]) as a "Prior
@@ -1249,9 +1266,25 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         Ok(o) if o.status.success() => ("dispatch complete", darkmux_flow::Level::Info),
         _ => ("dispatch error", darkmux_flow::Level::Error),
     };
-    let (stdout_chars, stderr_chars, exit_code) = match &output_result {
-        Ok(o) => (o.stdout.len(), o.stderr.len(), o.status.code()),
-        Err(_) => (0, 0, None),
+    // (#1042) On the error path, capture a bounded stderr excerpt at
+    // record-build time — the `stderr_text` below is computed only after the
+    // `?` on the success path, so the error record previously carried the char
+    // COUNT but never the text (you couldn't see WHY a dispatch failed).
+    let (stdout_chars, stderr_chars, exit_code, stderr_excerpt) = match &output_result {
+        Ok(o) => {
+            let excerpt = if o.status.success() {
+                None
+            } else {
+                Some(tail_excerpt(
+                    &String::from_utf8_lossy(&o.stderr),
+                    STDERR_EXCERPT_MAX,
+                ))
+            };
+            (o.stdout.len(), o.stderr.len(), o.status.code(), excerpt)
+        }
+        // A spawn failure has no process stderr; surface the spawn error itself
+        // so the record still explains why nothing ran.
+        Err(e) => (0, 0, None, Some(format!("dispatch failed to spawn: {e:#}"))),
     };
     let dispatch_complete_payload = serde_json::json!({
         "runtime": "openclaw",
@@ -1264,6 +1297,9 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         } else {
             "error"
         },
+        // (#1042) bounded stderr tail on the error path; null on success so
+        // clean records aren't bloated. Payload-additive — no FLOW_SCHEMA bump.
+        "stderr_excerpt": stderr_excerpt,
     });
     let _ = darkmux_flow::record(build_dispatch_record_with_payload(
         level,
@@ -1939,6 +1975,43 @@ mod tests {
     use super::*;
     use crate::types::{EscalationContract, Role, ToolPalette};
     use tempfile::TempDir;
+
+    // ─── #1042 stderr tail excerpt for the dispatch-error record ───────
+    #[test]
+    fn tail_excerpt_keeps_the_tail_with_marker_when_truncated() {
+        let s: String = ('a'..='z').cycle().take(100).collect(); // 100 ASCII chars
+        let out = tail_excerpt(&s, 10);
+        assert!(
+            out.starts_with("[… stderr truncated, showing last 10 of 100 chars]\n"),
+            "expected truncation marker, got: {out}"
+        );
+        assert!(out.ends_with(&s[s.len() - 10..]), "expected the last 10 chars");
+    }
+
+    #[test]
+    fn tail_excerpt_returns_full_trimmed_when_under_cap() {
+        // trailing whitespace trimmed; no marker when within the cap.
+        assert_eq!(tail_excerpt("boom: exit 2\n\n", 4000), "boom: exit 2");
+    }
+
+    #[test]
+    fn tail_excerpt_zero_means_no_cap() {
+        assert_eq!(tail_excerpt("x\n", 0), "x");
+    }
+
+    #[test]
+    fn tail_excerpt_is_char_safe_on_multibyte() {
+        // The tail must fall on a char boundary — never panic / split a UTF-8
+        // scalar. "héllo wörld 日本語" is 15 chars; last 3 = 日本語.
+        let out = tail_excerpt("héllo wörld 日本語", 3);
+        assert!(out.starts_with("[… stderr truncated, showing last 3 of 15 chars]\n"));
+        assert!(out.ends_with("日本語"));
+    }
+
+    #[test]
+    fn tail_excerpt_no_marker_at_exact_cap() {
+        assert_eq!(tail_excerpt("abcde", 5), "abcde"); // n == max → no truncation
+    }
 
     // ─── #590 apply_utility_model overlay ─────────────────────────────
 
