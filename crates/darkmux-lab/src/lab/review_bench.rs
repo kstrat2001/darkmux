@@ -104,10 +104,7 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
         opts.profile_name.as_deref().unwrap_or("(default)"),
         opts.config_path.as_deref().unwrap_or("(registry)"),
     );
-    println!(
-        "{:<34}{:<7}{:<7}{:<4}{}",
-        "case", "kind", "verd", "f", "outcome"
-    );
+    println!("{:<34}{:<7}{:<7}{:<4}outcome", "case", "kind", "verd", "f");
     let mut scored: Vec<(&Case, CaseScore)> = Vec::new();
     for c in &cases {
         let prompt = build_prompt(c);
