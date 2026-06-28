@@ -1415,13 +1415,41 @@ function renderSubsystem(){
     ? `<span class="wallerr"> · ${dispatchKilled(c)?'killed (timeout)':'errored'+((c.payload&&c.payload.exit_code!=null)?' (exit '+esc(c.payload.exit_code)+')':'')}</span>`
     : '';
   const wall=wallBase+wallLoud;
-  // (#711) The ctx metric leads with CURRENT usage (ctxNow) — headline number AND
-  // bar fill both track "now" so they read coherently; peak is carried in the
-  // label text. (Deliberate shift from the old peak-led bar; the high-water mark
-  // lives in the label + the chart's polyline, not the bar.)
+  // (#1125) Run identity + brief. statusVisual() gives the same pill vocabulary
+  // the machine cards use; role strips the `darkmux/` prefix like the rail does.
+  // The brief surfaces the dispatch's own context (runtime/model/workspace/
+  // prompt-chars/mission/timing) on the page dedicated to it — all from data
+  // that already exists (start payload + terminal payload + .model). The prompt
+  // TEXT is not emitted today (only prompt_chars) — see #1127.
+  const role=String(handle||"").replace(/^darkmux\//,"");
+  const sv=statusVisual({open:!done, errored:!!c&&dispatchErrored(c), killed:!!c&&dispatchKilled(c), clean:done&&!!c&&!dispatchErrored(c)});
+  const sp=(d&&d.payload)||{}, dp=(c&&c.payload)||{};
+  const model=d&&d.model?d.model:(distinct[0]||null);
+  const tokIn=dp.prompt_tokens, tokOut=dp.completion_tokens;
+  const kv=(k,v)=>v!=null&&v!==''?`<div class="kv"><b>${k}</b><span>${v}</span></div>`:'';
+  const briefTiming=`${clk(startTs)}${done?' → '+clk(T(close.ts))+' ('+fmt(T(close.ts)-startTs)+')':' · running'}`;
+  const briefRows=[
+    kv('runtime', sp.runtime?esc(sp.runtime):''),
+    kv('model', model?esc(model):''),
+    kv('workspace', sp.workspace?esc(sp.workspace):''),
+    kv('prompt', sp.prompt_chars!=null?esc(sp.prompt_chars)+' chars':''),
+    (d&&d.mission_id)?kv('mission', esc(d.mission_id)+(d.sprint_id?' · sprint '+esc(d.sprint_id):'')):'',
+    kv('timing', briefTiming),
+  ].filter(Boolean).join('');
+  const brief=briefRows?`<div class="track"><div class="lbl">run</div><div class="rrdetail">${briefRows}</div></div>`:'';
+  // (#1125) The ctx tile is done-aware, mirroring the wall clock (line ~1408).
+  // A finished/failed run leads with PEAK — the last sample read as "now" on a
+  // terminal run falsely implies the model is still holding that context. Live
+  // keeps the current reading; the bar fill tracks whichever headline shows.
+  const ctxHeadline=done?ctxPeak:ctxNow;
+  const ctxLabel=!nctx?"context":(done
+    ? `ctx peak ${(ctxPeak/1000).toFixed(0)}k / ${(nctx/1000)}k window`
+    : `ctx now · peak ${(ctxPeak/1000).toFixed(0)}k / ${(nctx/1000)}k window`);
   const met=`<div class="metrics">
     <div class="met"><div class="mv">${esc(turns)}</div><div class="ml">turns</div></div>
-    <div class="met"><div class="mv">${nctx?(ctxNow/1000).toFixed(0)+"k":"—"}</div><div class="ml">ctx now${nctx?` · peak ${(ctxPeak/1000).toFixed(0)}k / ${(nctx/1000)}k window`:""}</div><div class="tokbar"><span style="width:${nctx?Math.round(ctxNow/nctx*100):0}%"></span></div></div>
+    <div class="met"><div class="mv">${tokIn!=null?fmtC(tokIn):"—"}</div><div class="ml">tokens in</div></div>
+    <div class="met"><div class="mv">${tokOut!=null?fmtC(tokOut):"—"}</div><div class="ml">tokens out</div></div>
+    <div class="met"><div class="mv">${nctx?(ctxHeadline/1000).toFixed(0)+"k":"—"}</div><div class="ml">${ctxLabel}</div><div class="tokbar"><span style="width:${nctx?Math.round(ctxHeadline/nctx*100):0}%"></span></div></div>
     <div class="met"><div class="mv">${comps.length}</div><div class="ml">compactions</div></div>
     <div class="met"><div class="mv">${wall}</div><div class="ml">wall clock</div></div></div>`;
   const segs=loads.map((r,i)=>`<span class="seg ${i>0?'b':''}">${esc(r.fields.model)} · ${esc(r.fields.gb||'?')}GB</span>`).join("");
@@ -1456,7 +1484,8 @@ function renderSubsystem(){
   // restored. paintDiff is also the poll's repaint target, so a content change
   // touches only the diff, never the whole stage.
   const _dw=document.querySelector('.diffwrap'); if(_dw)DIFF._scroll=_dw.scrollTop;
-  $("stage").innerHTML=`<div class="sub"><h2>subsystem · ${esc(handle)} <span style="color:var(--muted);text-transform:none;font-weight:400">(${esc(sid)} on <a data-act="machine" data-arg="${esc(m)}">${escN(m)}</a>)</span></h2>
+  $("stage").innerHTML=`<div class="sub"><h2><span class="pill ${sv.cls}" style="margin-top:0;vertical-align:middle">${sv.lbl}</span> run · ${esc(role)} <span style="color:var(--muted);text-transform:none;font-weight:400">(${esc(sid)} on <a data-act="machine" data-arg="${esc(m)}">${escN(m)}</a>)</span></h2>
+    ${brief}
     ${met}
     <div class="track"><div class="lbl">model (lms)</div>${segs||'<span class="hint">no telemetry yet</span>'}</div>
     ${cpu}
