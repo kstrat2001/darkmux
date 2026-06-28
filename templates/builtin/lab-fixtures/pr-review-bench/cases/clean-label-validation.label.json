@@ -1,0 +1,4 @@
+{ "kind": "clean", "intent_title": "fix(crew): #1111 validate pr_labels — reject leading-dash",
+  "intent_body": "Add valid_label (non-empty, no leading dash) so a label can't be parsed by gh as a flag; skip+warn on the bad one.",
+  "expect_verdict": "pass",
+  "notes": "Merged PR #1115, frontier-verified clean. The 8b raised a (false) HIGH claiming the present check was missing." }

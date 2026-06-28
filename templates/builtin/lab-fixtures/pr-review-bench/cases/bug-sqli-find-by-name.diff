@@ -1,0 +1,15 @@
+diff --git a/src/db/users.rs b/src/db/users.rs
+index 1111111..2222222 100644
+--- a/src/db/users.rs
++++ b/src/db/users.rs
+@@ -8,6 +8,11 @@ impl UserStore {
+     pub fn find_by_id(&self, id: i64) -> Result<User> {
+         self.query_one("SELECT id, name, email FROM users WHERE id = ?1", &[&id])
+     }
++
++    /// Look up a user by their login name.
++    pub fn find_by_name(&self, name: &str) -> Result<User> {
++        let sql = format!("SELECT id, name, email FROM users WHERE name = '{}'", name);
++        self.query_raw(&sql)
++    }
+ }

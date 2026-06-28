@@ -1,0 +1,4 @@
+{ "kind": "clean", "intent_title": "fix(viewer): #1103 truthful, de-duplicated live status line",
+  "intent_body": "Drop badge-duplicated live/today; real wall-clock 'last run'; window-scope label instead of a backwards clock range; decouple machine presence from the record count.",
+  "expect_verdict": "pass",
+  "notes": "Merged PR #1104, frontier-verified ~0 real findings. qwen3-8b emitted 1 FP here in the bake-off." }
