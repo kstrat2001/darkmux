@@ -2380,6 +2380,18 @@ pub fn ship(
                 .map(|c| c.pr_labels.iter().map(String::as_str).collect())
                 .unwrap_or_default();
             for l in &labels {
+                // (#1111) Argument-injection guard on the gh subprocess: a label
+                // that's empty or starts with `-` would be parsed by gh as a flag
+                // (e.g. `--label --config` injecting a gh option). Branch names are
+                // already validated; labels were the gap. Skip + warn rather than
+                // fail the whole dispatch over a bad label.
+                if !crate::conventions::valid_label(l) {
+                    eprintln!(
+                        "darkmux mission run: skipping unsafe pr label {l:?} \
+                         (empty or starts with `-` — would parse as a gh flag)"
+                    );
+                    continue;
+                }
                 args.push("--label");
                 args.push(l);
             }

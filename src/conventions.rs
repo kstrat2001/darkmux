@@ -155,6 +155,17 @@ pub fn valid_branch(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '.' | '-'))
 }
 
+/// Validate a `gh pr create --label` value before it reaches the subprocess:
+/// non-empty and **not starting with `-`**. A leading dash would be parsed by
+/// `gh` as a flag (e.g. a `--config` label → argument injection into the
+/// `gh pr create` invocation). GitHub labels otherwise permit spaces and most
+/// punctuation ("help wanted"), so — unlike [`valid_branch`] — this stays
+/// permissive beyond the leading-dash guard; the dash is the only injection
+/// vector since `gh` is invoked with explicit argv (no shell). (#1111)
+pub fn valid_label(name: &str) -> bool {
+    !name.is_empty() && !name.starts_with('-')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,6 +203,18 @@ mod tests {
         assert!(!valid_branch("/abs"));
         assert!(!valid_branch("a..b"));
         assert!(!valid_branch("has space"));
+    }
+
+    #[test]
+    fn valid_label_blocks_flag_injection_but_allows_real_labels() {
+        // real GitHub labels — including spaces — pass
+        assert!(valid_label("agent-work"));
+        assert!(valid_label("help wanted"));
+        assert!(valid_label("good first issue"));
+        // the injection vector + empties are rejected
+        assert!(!valid_label("-foo")); // would parse as a gh flag
+        assert!(!valid_label("--config")); // the classic arg-injection case
+        assert!(!valid_label(""));
     }
 
     #[test]
