@@ -1999,6 +1999,20 @@ mod tests {
         assert_eq!(tail_excerpt("x\n", 0), "x");
     }
 
+    #[test]
+    fn tail_excerpt_is_char_safe_on_multibyte() {
+        // The tail must fall on a char boundary — never panic / split a UTF-8
+        // scalar. "héllo wörld 日本語" is 15 chars; last 3 = 日本語.
+        let out = tail_excerpt("héllo wörld 日本語", 3);
+        assert!(out.starts_with("[… stderr truncated, showing last 3 of 15 chars]\n"));
+        assert!(out.ends_with("日本語"));
+    }
+
+    #[test]
+    fn tail_excerpt_no_marker_at_exact_cap() {
+        assert_eq!(tail_excerpt("abcde", 5), "abcde"); // n == max → no truncation
+    }
+
     // ─── #590 apply_utility_model overlay ─────────────────────────────
 
     #[test]
