@@ -405,7 +405,11 @@
     /* (#803 layout) Stat blocks compress on phones: smaller values, tighter
        gaps; the flex wrap stacks them under the headline number naturally. */
     .savrow { gap: 10px 18px; }
-    .savclasses { gap: 8px 16px; }
+    /* (#1151) When the breakdown wraps BELOW the total on phones, left-align it
+       so it lines up under the left-pinned total instead of hugging the right
+       edge (the desktop flex-end balances total-left / breakdown-right, which
+       reads disconnected once stacked). */
+    .savclasses { gap: 8px 16px; justify-content: flex-start; }
     .savc .scv { font-size: 15px; }
     /* (#803) Recent-runs rows wrap to multiple lines on phones so the per-run
        crits (turns · tools · tokens · compactions) stay visible instead of
