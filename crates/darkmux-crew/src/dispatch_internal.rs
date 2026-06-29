@@ -2557,6 +2557,16 @@ fn resolve_dispatch_model_internal(
             .collect();
     match select_model(role, profile, |id| skill_index.get(id)) {
         Ok(id) => {
+            // (#1135) Load the selected model at the profile's DECLARED n_ctx
+            // before dispatch — and before the #408 cross-check below, which
+            // then finds it resident. Pre-#1135 the dispatch only resolved the
+            // model *id* and let LMStudio JIT-load it at the MODEL default
+            // (e.g. 4096 on devstral), silently truncating large inputs (a
+            // pr-review diff overflows 4096 → garbage review, no error). The
+            // profile *declares* the context; honor it.
+            if let Some(pm) = profile.models.iter().find(|m| m.id == id) {
+                ensure_model_loaded_at_ctx(pm)?;
+            }
             // (#450 review note / #408) Cross-check against actual
             // LMStudio loaded models. `darkmux swap <name>` loads a
             // profile's models in LMStudio but does NOT update
@@ -2733,6 +2743,58 @@ fn strict_selection_enabled() -> bool {
 /// returns BOTH modelKey and identifier so a profile that names
 /// either form (`qwen3.6-35b-a3b-turboquant-mlx` OR
 /// `darkmux:qwen3.6-35b-a3b-turboquant-mlx`) can match correctly.
+/// (#1135) Ensure the dispatch's selected profile model is resident in
+/// LMStudio AT the profile's declared `n_ctx` before the dispatch runs.
+///
+/// Pre-#1135 the dispatch sent chat-completions to a model id and let LMStudio
+/// JIT-load it at the MODEL default context (e.g. 4096 on devstral) — silently
+/// truncating large inputs (a pr-review diff overflows 4096 → garbage review,
+/// with no error; a tiny smoke message fits 4096 so the defect hides). Here
+/// darkmux loads it at the declared context:
+///   - already resident at `>= n_ctx` → reuse (no churn, even if user-loaded);
+///   - resident at a SMALLER context → unload + reload at `n_ctx` (standing
+///     unload/load authority for dispatch correctness, #408 / the
+///     model-unload-load-authority operator note);
+///   - not resident → load at `n_ctx` under the `darkmux:<id>` namespace.
+///
+/// A load failure (insufficient RAM / LMStudio load timeout) returns a clear,
+/// operator-actionable error rather than degrading silently to the default —
+/// the early-detection half of #1139 (the fallback/eviction half is #1139/#1140).
+fn ensure_model_loaded_at_ctx(pm: &darkmux_types::ProfileModel) -> Result<()> {
+    use darkmux_profiles::{lms, swap};
+    let loaded = lms::list_loaded().unwrap_or_default();
+    match loaded.iter().find(|m| m.model == pm.id) {
+        Some(m) if m.context >= u64::from(pm.n_ctx) => return Ok(()),
+        Some(m) => {
+            eprintln!(
+                "darkmux crew dispatch: `{}` is resident at context {} but the profile \
+                 declares n_ctx={}; reloading at {} so the dispatch gets the declared \
+                 context. (#1135)",
+                pm.id, m.context, pm.n_ctx, pm.n_ctx
+            );
+            lms::unload(&m.identifier).with_context(|| {
+                format!("unloading `{}` to reload at n_ctx={}", m.identifier, pm.n_ctx)
+            })?;
+        }
+        None => {
+            eprintln!(
+                "darkmux crew dispatch: loading `{}` at n_ctx={} (the profile's declared \
+                 context) before dispatch. (#1135)",
+                pm.id, pm.n_ctx
+            );
+        }
+    }
+    let identifier = swap::namespaced_identifier(pm);
+    lms::load_with_identifier(&pm.id, pm.n_ctx, &identifier, true).with_context(|| {
+        format!(
+            "loading `{}` at n_ctx={} failed — likely insufficient RAM (free resources, \
+             lower the profile's n_ctx, or evict a resident model), or LMStudio could not \
+             load it. (#1135; load-failure detection/fallback is #1139)",
+            pm.id, pm.n_ctx
+        )
+    })
+}
+
 fn probe_loaded_model_list() -> Result<Vec<String>> {
     let output = Command::new("lms")
         .args(["ps", "--json"])
