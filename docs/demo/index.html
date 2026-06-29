@@ -1433,6 +1433,7 @@ function renderSubsystem(){
   const briefTiming=`${clk(startTs)}${done?' → '+clk(T(close.ts))+' ('+fmt(T(close.ts)-startTs)+')':' · running'}`;
   const briefRows=[
     kv('runtime', sp.runtime?esc(sp.runtime):''),
+    kv('image', sp.image?esc(sp.image):''),
     kv('model', model?esc(model):''),
     kv('workspace', sp.workspace?esc(sp.workspace):''),
     kv('prompt', sp.prompt_chars!=null?esc(sp.prompt_chars)+' chars':''),
