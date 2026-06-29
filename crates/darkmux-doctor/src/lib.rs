@@ -87,9 +87,14 @@ impl DoctorReport {
 /// alone doesn't change between releases, so it can't tell an operator whether
 /// a daemon has their latest code). Always Pass — informational, leads the
 /// report so the answer to "which version is this?" is the first thing shown.
+/// (#1129/#1130) Name of the build identity check — the one Pass row that
+/// always prints (it answers "which version is this?", not a health question),
+/// so it bypasses the issues-only consolidation in `print_report`.
+const BUILD_CHECK_NAME: &str = "build";
+
 fn check_build_info() -> Check {
     Check {
-        name: "build".into(),
+        name: BUILD_CHECK_NAME.into(),
         status: Status::Pass,
         message: format!(
             "darkmux {} · flow schema {}",
@@ -2582,20 +2587,58 @@ fn fix_ctx_window_mismatch() -> Result<FixOutcome> {
 
 // ─── Result rendering ───────────────────────────────────────────────────
 
-pub fn print_report(r: &DoctorReport) -> Result<()> {
+/// Print one check line + its hint lines. Shared by the verbose and
+/// issues-only render paths so they format identically.
+fn print_check_line(c: &Check) {
+    let marker = match c.status {
+        Status::Pass => darkmux_types::style::success("✓"),
+        Status::Warn => darkmux_types::style::warn("⚠"),
+        Status::Fail => darkmux_types::style::error("✗"),
+    };
+    println!("  {} {:<22} {}", marker, c.name, c.message);
+    if let Some(hint) = c.hint.as_ref() {
+        for line in hint.lines() {
+            println!("        → {}", darkmux_types::style::dim(line));
+        }
+    }
+}
+
+/// Render the doctor report.
+///
+/// (#1130) Default (`verbose=false`) is **issues-only**: the build identity
+/// line + every Warn/Fail (with hints), and the passing checks collapsed to a
+/// count — in most runs the operator only cares about problems. `verbose=true`
+/// (`darkmux doctor -v`) prints every check, the old behavior.
+pub fn print_report(r: &DoctorReport, verbose: bool) -> Result<()> {
     println!("{}", darkmux_types::style::header(&format!("darkmux doctor — {} checks", r.checks.len())));
     println!();
-    for c in &r.checks {
-        let marker = match c.status {
-            Status::Pass => darkmux_types::style::success("✓"),
-            Status::Warn => darkmux_types::style::warn("⚠"),
-            Status::Fail => darkmux_types::style::error("✗"),
-        };
-        println!("  {} {:<22} {}", marker, c.name, c.message);
-        if let Some(hint) = c.hint.as_ref() {
-            for line in hint.lines() {
-                println!("        → {}", darkmux_types::style::dim(line));
-            }
+    if verbose {
+        for c in &r.checks {
+            print_check_line(c);
+        }
+    } else {
+        // The build identity line always shows (it answers "which version?",
+        // not a health question) — it bypasses pass-consolidation.
+        for c in r.checks.iter().filter(|c| c.name == BUILD_CHECK_NAME) {
+            print_check_line(c);
+        }
+        // The passing checks collapse to a count — `-v` for the full list.
+        let collapsed = r
+            .checks
+            .iter()
+            .filter(|c| c.status == Status::Pass && c.name != BUILD_CHECK_NAME)
+            .count();
+        if collapsed > 0 {
+            println!(
+                "  {} {}",
+                darkmux_types::style::success("✓"),
+                darkmux_types::style::dim(&format!("{collapsed} more checks passed — `-v` for detail")),
+            );
+        }
+        // Warnings + failures in full — the part the operator acts on, placed
+        // last so they sit right above the summary line.
+        for c in r.checks.iter().filter(|c| c.status != Status::Pass) {
+            print_check_line(c);
         }
     }
     println!();

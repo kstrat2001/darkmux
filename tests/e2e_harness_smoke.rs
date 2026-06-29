@@ -69,10 +69,12 @@ fn dual_node_harness_boots_cleanly() {
     // daemon's env vars wired through to the doctor subprocess. Doctor may
     // exit non-zero in the isolated test env (missing real LMStudio
     // models, etc.); the assertion is on the echoed value, not the exit
-    // code.
+    // code. (#1130) `-v`: the machine_id check is a Pass, which the default
+    // issues-only output collapses to a count — verbose surfaces its line.
     let mut cmd = node_a.cmd();
     let output = cmd
         .arg("doctor")
+        .arg("-v")
         .output()
         .expect("running darkmux doctor on node-a");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -83,6 +85,7 @@ fn dual_node_harness_boots_cleanly() {
     let output_b = node_b
         .cmd()
         .arg("doctor")
+        .arg("-v")
         .output()
         .expect("running darkmux doctor on node-b");
     let stdout_b = String::from_utf8_lossy(&output_b.stdout);
