@@ -993,19 +993,20 @@ fn check_orchestrator_declared() -> Check {
 fn check_fleet_mode() -> Check {
     use darkmux_types::config::{DarkmuxConfig, FleetMode};
     let name = "fleet.mode";
+    // Provenance is presence-only (env-set / config-set / neither); the displayed
+    // token comes from `raw`. (#934 will centralize this env/config/default
+    // attribution into a config_access helper so every finding shares it.)
     let env_set = std::env::var("DARKMUX_FLEET_MODE")
         .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+        .is_some_and(|s| !s.trim().is_empty());
     let cfg_set = DarkmuxConfig::load_resolved()
         .fleet
         .and_then(|f| f.mode)
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+        .is_some_and(|s| !s.trim().is_empty());
     let raw = darkmux_types::config_access::fleet_mode_raw();
-    let provenance = if env_set.is_some() {
+    let provenance = if env_set {
         "from DARKMUX_FLEET_MODE env"
-    } else if cfg_set.is_some() {
+    } else if cfg_set {
         "from config.json"
     } else {
         "default"
