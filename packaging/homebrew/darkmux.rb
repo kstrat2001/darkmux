@@ -5,7 +5,7 @@
 #
 # Operator-facing install path:
 #   brew tap kstrat2001/darkmux
-#   brew install darkmux                # stable release (v1.11.2)
+#   brew install darkmux                # stable release (v1.12.0)
 #   brew install --HEAD darkmux         # build from main instead
 #
 # For local development / smoke testing:
@@ -17,10 +17,11 @@
 class Darkmux < Formula
   desc "Profile multiplexer + lab for local LLM stacks (LMStudio, Ollama)"
   homepage "https://darkmux.com"
-  # Stable release: v1.11.2 (bug-fix + a11y + security patch — presence-based
-  # in-flight, truthful status line, stderr text on error records, keyboard nav +
-  # non-color status cue, and gh/external-pull arg-injection guards —
-  # #857/#1103/#1042/#1090/#1092/#1111/#1112).
+  # Stable release: v1.12.0 (build-visibility + run-observability + production
+  # hardening — build version in --version/doctor/viewer with a Homebrew
+  # `(release)` tag, run-page clarity + prompt/image/tokens, doctor issues-only,
+  # the runtime recovers from empty tool_calls, and crew-dispatch now loads the
+  # model at the profile's n_ctx — #1129/#1125/#1130/#1135/#1123/#1042).
   # `brew install darkmux` builds from this source tarball; `brew install
   # --HEAD darkmux` builds from main instead. The sha256 is of the
   # GitHub-generated source tarball for the tag (`shasum -a 256`).

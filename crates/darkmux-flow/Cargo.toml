@@ -1,6 +1,6 @@
 [package]
 name = "darkmux-flow"
-version = "1.11.2"
+version = "1.12.0"
 edition = "2021"
 description = "darkmux flow observability — structured JSONL records + sinks (LocalFile/Audit/Redis)"
 license = "MIT"
