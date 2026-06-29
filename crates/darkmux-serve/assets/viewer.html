@@ -159,7 +159,14 @@
   .clock{font:12px 'JetBrains Mono',monospace;color:var(--muted);min-width:160px;text-align:right}
   .fleet{display:flex;gap:16px;flex-wrap:wrap;align-items:stretch}
   .fleettl{margin-top:30px;border-top:1px solid var(--line);padding-top:18px}
-  .tlhdr{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin-bottom:14px}
+  .tlhdr{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin-bottom:14px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  /* (#1151) activity-timeline window presets — a mini segmented control,
+     mirroring the .lens lens-tabs vocabulary at a smaller scale. */
+  .twin{display:inline-flex;border:1px solid var(--line);border-radius:5px;overflow:hidden}
+  .twinb{font:600 10px/1 'JetBrains Mono',monospace;letter-spacing:.06em;color:var(--muted);padding:4px 8px;cursor:pointer;background:none;border:0;text-transform:uppercase}
+  .twinb+.twinb{border-left:1px solid var(--line)}
+  .twinb:hover{color:var(--text)}
+  .twinb.on{background:var(--amber-dim);color:#0a0f17}
   .lane{display:flex;align-items:center;gap:12px;margin-bottom:7px}
   .lname{width:var(--lname-w,150px);flex:none;font:12px 'JetBrains Mono',monospace;color:var(--text);text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .tltrack{position:relative;flex:1;height:28px;background:var(--panel);border:1px solid var(--line);border-radius:4px;overflow:hidden}
@@ -678,7 +685,7 @@ recompute();
 // (#691) Default cap on the recent-runs list (newest-first); show-all toggle
 // via state.recentAll. Keeps a busy machine's panel from scrolling unbounded.
 const RECENT_CAP=20;
-let state={level:"fleet",machine:null,session:null,missionId:null,t:tMax,playing:false,timer:null,selected:null,follow:true,speed:1,recentAll:false,
+let state={level:"fleet",machine:null,session:null,missionId:null,t:tMax,playing:false,timer:null,selected:null,follow:true,speed:1,recentAll:false,activityWindowH:24,
   filters:{cat:new Set(FCATS),tier:new Set(FTIERS),src:new Set(FSRC),q:""},
   rawOpen:false,
   // (#expand) Open-state of `<details data-expand="<key>">` blocks, keyed so it
@@ -1142,7 +1149,14 @@ function renderFleet(){
   // positioned across the recorded window, revealed up to the playhead (an
   // in-flight session grows to the playhead). Fills the fleet view with a
   // "what ran when, where" overview instead of empty canvas.
-  const span=Math.max(1,tMax-tMin), pct=t=>(t-tMin)/span*100;
+  // (#1151) In live mode the timeline shows a FIXED, operator-selected window
+  // anchored at the latest record (≈now): tlMin = tMax − activityWindowH, so
+  // "24h" draws a TRUE 24h axis instead of the data-min..data-max span (which
+  // made a sparse day read as e.g. an 18h range, not a clock period). Playback
+  // keeps the full-day span (tMin..tMax) and shows no control.
+  const winMs=state.activityWindowH*3600000;
+  const tlMax=tMax, tlMin=liveMode?(tMax-winMs):tMin;
+  const span=Math.max(1,tlMax-tlMin), pct=t=>(t-tlMin)/span*100;
   const lanes=ms.map(m=>{
     const bars=sessionsOn(m).map(sid=>{
       const s=dispatch(sid,"start"); if(!s||T(s.ts)>state.t)return"";
@@ -1156,24 +1170,31 @@ function renderFleet(){
       // complete/canceled/failed via the shared convention.
       const {cls,lbl}=statusVisual({open:!done, errored:done&&dispatchErrored(term), killed:dispatchKilled(term), clean:done&&!!term&&!dispatchErrored(term)});
       const end=!done?state.t:(close?T(close.ts):(lastTs(sid)||state.t));
-      const W=Math.max(0.6,pct(end)-pct(T(s.ts)));
+      // (#1151) Drop a session that ended entirely before the window; clip a
+      // still-open or window-straddling bar's start to the window's left edge.
+      if(end<tlMin)return"";
+      const cst=Math.max(T(s.ts),tlMin);
+      const W=Math.max(0.6,pct(end)-pct(cst));
       // Clamp so a bar at/near "now" (left≈100%) + its min-width can't spill
       // past the track's right edge (the rightmost bar was clipping ~3px).
       // Shift left so left+width never exceeds 100%.
-      const L=Math.max(0,Math.min(pct(T(s.ts)),100-W));
+      const L=Math.max(0,Math.min(pct(cst),100-W));
       const role=(s.handle||"").replace(/^darkmux\//,"");
       return `<div class="sbar ${cls}" style="left:${L}%;width:${W}%" title="${esc(role)} · ${esc(sid)} · ${esc(lbl)}"></div>`;
     }).join("");
     return `<div class="lane"><div class="lname" title="${escN(m)}">${escN(m)}</div><div class="tltrack">${bars}<div class="ph" style="left:${pct(state.t)}%"></div></div></div>`;
   }).join("");
-  const ax=`<div class="tlaxis"><span>${clkhm(tMin)}</span><span>${clkhm(tMin+span/2)}</span><span>${clkhm(tMax)}</span></div>`;
+  const ax=`<div class="tlaxis"><span>${clkhm(tlMin)}</span><span>${clkhm(tlMin+span/2)}</span><span>${clkhm(tlMax)}</span></div>`;
   // Size the lane-label column to the actual machine names so short names
   // ("studio") don't leave a fixed-150px gap before the bars. CSS var consumed
   // on desktop; mobile stacks the lanes (.lname width:auto) and ignores it.
   const maxLen=ms.length?Math.max(...ms.map(m=>nameOf(m).length)):8;
   const labelW=Math.round(Math.min(170,Math.max(54,maxLen*7.4+10)));
+  // (#1151) Live-only window presets (1h/4h/24h). Playback shows the full day,
+  // so no control there. data-act routes through ACTIONS.actwin → re-render.
+  const winCtl=liveMode?`<span class="twin">${[1,4,24].map(h=>`<button class="twinb${state.activityWindowH===h?' on':''}" data-act="actwin" data-arg="${h}">${h}h</button>`).join('')}</span>`:'';
   const tl = ms.length
-    ? `<div class="fleettl" style="--lname-w:${labelW}px"><div class="tlhdr">${liveMode?'recent activity':'activity'} · ${clk(tMin)}–${clk(tMax)}</div>${lanes}${ax}</div>`
+    ? `<div class="fleettl" style="--lname-w:${labelW}px"><div class="tlhdr"><span>${liveMode?'recent activity':'activity'} · ${clk(tlMin)}–${clk(tlMax)}</span>${winCtl}</div>${lanes}${ax}</div>`
     : `<div class="fleettl"><div class="tlempty">waiting for the first flow record…</div></div>`;
   $("stage").innerHTML=savingsHero()+`<div class="fleet">${cards}</div>`+tl;
 }
@@ -1776,6 +1797,9 @@ function render(){
 window.drillMachine=m=>{state.level="machine";state.machine=m;state.session=null;state.follow=true;state.recentAll=false;render();};
 // (#691) Expand/collapse the recent-runs list past RECENT_CAP.
 window.toggleRecentAll=()=>{state.recentAll=!state.recentAll;render();};
+// (#1151) Activity-timeline window preset (1h/4h/24h). Live-only control; clamps
+// the timeline axis to a true anchored period instead of the data-span range.
+window.setActivityWindow=h=>{state.activityWindowH=h;render();};
 window.drillSession=s=>{state.level="subsystem";state.session=s;state.follow=true;render();};
 window.goFleet=()=>{state.level="fleet";state.machine=null;state.session=null;state.follow=true;render();};
 window.goMission=()=>{ if(!missions.length)return goFleet(); state.level="mission";state.machine=null;state.session=null;state.missionId=primaryMission();state.follow=true;render();};
@@ -2061,6 +2085,7 @@ const ACTIONS={
   missiondrill:a=>drillMission(a),
   mission:()=>goMission(),
   recentall:()=>toggleRecentAll(),
+  actwin:a=>setActivityWindow(Number(a)),
   filters:()=>openFilters(),
   closefilters:()=>closeFilters(),
   clearfilters:()=>clearFilters(),
