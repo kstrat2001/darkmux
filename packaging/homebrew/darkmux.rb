@@ -25,8 +25,8 @@ class Darkmux < Formula
   # `brew install darkmux` builds from this source tarball; `brew install
   # --HEAD darkmux` builds from main instead. The sha256 is of the
   # GitHub-generated source tarball for the tag (`shasum -a 256`).
-  url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v1.11.2.tar.gz"
-  sha256 "cea3ae10c9c7635e01ead0e1df52c983170201b5aa3961e0fc9d7934e3ee73db"
+  url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v1.12.0.tar.gz"
+  sha256 "b530dda906253ba90c4732c371fa1ad6fa7df604045fb4d0cfbc2cf78a18a02d"
   license "MIT"
   head "https://github.com/kstrat2001/darkmux.git", branch: "main"
 
