@@ -11,6 +11,60 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 
 ## [Unreleased]
 
+## [1.12.0] - 2026-06-29
+
+A build-visibility + run-observability release, plus the production-hardening
+fixes surfaced by darkmux's first brew-stable production user. **No `FLOW_SCHEMA`
+change** (stays `1.14.0`), so cross-machine flow stays compatible — but the
+`runtime/` image **is** rebuilt this release (the empty-`tool_calls` recovery),
+so a `brew upgrade` pulls a new `darkmux-runtime` image.
+
+### Added
+- **Build identity in three places (#1129).** `darkmux --version`, the lead
+  `build` line of `darkmux doctor`, and a chip in the observability viewer header
+  all show `<version> (<git-sha>)` — or `<version> (release)` on a Homebrew build
+  — plus the `flow_schema` version. The package version alone doesn't change
+  between releases, so it couldn't tell you whether a running daemon had your
+  latest code; the git SHA does.
+- **Run drill-down page clarity (#1125).** The per-run page now leads with a
+  status pill + `run · <role>` (not "subsystem"), a run brief (runtime / model /
+  workspace / mission / timing), **tokens in / out** tiles, and a done-aware
+  context tile (a finished run shows peak, not a misleading "now").
+- **About modal (#1132).** The header build chip opens an "about · darkmux" modal
+  consolidating build / flow-schema / connection / mode / machine / hardware +
+  links.
+- **The dispatch prompt + runtime image in the run brief (#1127 / #1126).** The
+  run page shows the dispatch's prompt (collapsed) and the container image it ran
+  in — both previously absent or a dead reference.
+- **`darkmux doctor` is issues-only by default (#1130).** It shows the build line
+  + any warnings/failures and collapses the passing checks to a count;
+  `darkmux doctor -v` prints the full list.
+- **`darkmux lab review-bench` (#1119).** A reproducible PR-reviewer eval — a
+  labeled diff-mix fixture + a scoring provider — so model bake-offs for the
+  review role are repeatable, not one-off.
+
+### Fixed
+- **`crew dispatch` honors the profile's `n_ctx` (#1135).** The dispatch resolved
+  the model id but let LMStudio JIT-load it at the **model default** (e.g. 4096),
+  silently truncating large inputs (a pr-review diff overflowed → garbage review,
+  no error). darkmux now loads the selected model at the profile's declared
+  context before dispatching (reusing a sufficient resident load, reloading a
+  too-small one), and surfaces a clear RAM-hinting error if the load fails. Also
+  fixes a latent `lms load` quiet-flag bug that leaked the load spinner into a
+  `--json` envelope (and into `darkmux swap --json`).
+- **Compaction meter no longer double-counts (#1122).** Each compaction emits two
+  flow records (a work event + a token-telemetry record); the viewer folded both
+  into the compaction count, reporting 2×. The token-telemetry record is now
+  canonical.
+- **The runtime recovers from an empty `finish_reason=tool_calls` (#1123).** A
+  model returning a wholly empty completion under a `tool_calls` finish reason
+  hard-killed the dispatch; it now routes through the same intra-turn stall
+  recovery (nudge + retry, bounded) as the empty-`length` case.
+- **Internal-path dispatch errors carry the stderr text (#1042).** The internal
+  runtime (the default) emitted only `stderr_chars`; it now carries a bounded
+  stderr tail excerpt on error, like the openclaw path — so a failed dispatch is
+  diagnosable from the flow stream alone.
+
 ## [1.11.2] - 2026-06-28
 
 A bug-fix + accessibility + security patch from a board triage. No schema change
@@ -607,6 +661,7 @@ cluster of crew-index correctness repairs.
   idle machine's bar no longer stretches to the playhead; adds the first
   viewer-lifecycle e2e regression gate.
 
+[1.12.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.12.0
 [1.11.2]: https://github.com/kstrat2001/darkmux/releases/tag/v1.11.2
 [1.11.1]: https://github.com/kstrat2001/darkmux/releases/tag/v1.11.1
 [1.11.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.11.0
