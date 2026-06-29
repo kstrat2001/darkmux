@@ -242,8 +242,16 @@ pub fn load_with_identifier(
         "--identifier",
         identifier,
     ]);
-    if !quiet {
-        // inherit stdio so user sees the loading spinner
+    if quiet {
+        // (#1135) `quiet` must actually SUPPRESS. `Command` inherits the
+        // parent's stdio by default, so merely *not* setting it left the
+        // `lms load` progress spinner leaking to stdout — which corrupts a
+        // `--json` dispatch envelope when the load runs mid-dispatch. Null
+        // stdout; keep stderr inherited so a load failure is still visible.
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::inherit());
+    } else {
+        // inherit stdio so the user sees the loading spinner
         cmd.stdout(std::process::Stdio::inherit());
         cmd.stderr(std::process::Stdio::inherit());
     }
