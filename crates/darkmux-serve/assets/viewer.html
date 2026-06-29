@@ -1105,9 +1105,9 @@ function savingsHero(){
       <div class="savclasses">
         ${sc(fmtC(t.completion),'generated','gen')}
         ${sc(fmtC(t.fresh),'fresh input','')}
-        ${sc(fmtC(t.reread),'re-read input','')}
+        ${sc(fmtC(t.reread),'re-read','')}
         ${t.uncls?sc(fmtC(t.uncls),'unclassified','uncls'):''}
-        ${sc(t.runs,`dispatch${t.runs===1?'':'es'} run locally`,'')}
+        ${sc(t.runs,`dispatch${t.runs===1?'':'es'}`,'')}
       </div>
     </div>
     ${hybridNote(t)}
