@@ -233,6 +233,11 @@
   .rrdetail .kv{display:flex;gap:10px;margin-top:4px}
   .rrdetail .kv b{color:var(--text);font-weight:600;min-width:92px;flex-shrink:0}
   .rrdetail .kv span{min-width:0;word-break:break-all}
+  /* (#1127) Collapsed prompt block in the run brief. */
+  .rrdetail .promptdet{border-bottom:none;margin-top:6px}
+  .rrdetail .promptdet>summary{list-style:none;cursor:pointer;color:var(--amber)}
+  .rrdetail .promptdet>summary::-webkit-details-marker{display:none}
+  .promptbody{margin:6px 0 2px;padding:8px;background:var(--bg);border:1px solid var(--line);border-radius:4px;max-height:240px;overflow:auto;white-space:pre-wrap;word-break:break-word;font:11px/1.45 'JetBrains Mono',monospace;color:var(--text)}
   .rrdetail a{color:var(--amber);cursor:pointer}.rrdetail a:hover{text-decoration:underline}
   /* (#691) unscoped-records composition breakdown */
   .lbreakdown{max-width:560px;margin-top:2px}
@@ -1482,11 +1487,20 @@ function renderSubsystem(){
     kv('image', sp.image?esc(sp.image):''),
     kv('model', model?esc(model):''),
     kv('workspace', sp.workspace?esc(sp.workspace):''),
-    kv('prompt', sp.prompt_chars!=null?esc(sp.prompt_chars)+' chars':''),
     (d&&d.mission_id)?kv('mission', esc(d.mission_id)+(d.sprint_id?' · sprint '+esc(d.sprint_id):'')):'',
     kv('timing', briefTiming),
   ].filter(Boolean).join('');
-  const brief=briefRows?`<div class="track"><div class="lbl">run</div><div class="rrdetail">${briefRows}</div></div>`:'';
+  // (#1127) The prompt is rendered as a collapsed <details> (it can be KB-long)
+  // rather than a one-line kv. `sp.prompt` is the capped text the dispatch
+  // emitted; `prompt_chars` is the full length, so a stored text shorter than
+  // that reads "(truncated)". Falls back to the char-count row when only the
+  // count is present (pre-#1127 records / openclaw runs that didn't emit text).
+  // Open state resets on the ~1/sec live rebuild (the prompt matters most on a
+  // finished run, which doesn't re-render) — an accepted v1 tradeoff.
+  const promptBlock = sp.prompt
+    ? `<details class="rr promptdet"><summary>prompt · ${esc(sp.prompt_chars!=null?sp.prompt_chars:sp.prompt.length)} chars${(sp.prompt_chars!=null&&sp.prompt.length<sp.prompt_chars)?' · truncated':''}</summary><pre class="promptbody">${esc(sp.prompt)}</pre></details>`
+    : (sp.prompt_chars!=null?`<div class="kv"><b>prompt</b><span>${esc(sp.prompt_chars)} chars</span></div>`:'');
+  const brief=(briefRows||promptBlock)?`<div class="track"><div class="lbl">run</div><div class="rrdetail">${briefRows}${promptBlock}</div></div>`:'';
   // (#1125) The ctx tile is done-aware, mirroring the wall clock (line ~1408).
   // A finished/failed run leads with PEAK — the last sample read as "now" on a
   // terminal run falsely implies the model is still holding that context. Live

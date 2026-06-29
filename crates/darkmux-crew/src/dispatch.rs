@@ -1225,6 +1225,9 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     let dispatch_start_payload = serde_json::json!({
         "runtime": "openclaw",
         "prompt_chars": augmented_message.chars().count(),
+        // (#1127) The dispatch prompt text (capped) — run context the viewer
+        // renders collapsed. prompt_chars carries the full length.
+        "prompt": capped_prompt(&augmented_message),
         "agent_id": agent_id,
     });
     let _ = darkmux_flow::record(build_dispatch_record_with_payload(
@@ -1514,6 +1517,20 @@ pub fn build_dispatch_record(
     model: Option<&str>,
 ) -> darkmux_flow::FlowRecord {
     build_dispatch_record_with_payload(level, action, role_id, session_id, model, None, None, None)
+}
+
+/// (#1127) Max prompt-text length stamped on a `dispatch.start` record. The
+/// full prompt is operator-useful run context (the viewer renders it as a
+/// collapsed block), but an unbounded paste would bloat the per-day JSONL +
+/// the Redis stream — so cap the EMITTED text. The cost is one capped string
+/// per dispatch (start is one record per dispatch, not per turn). `prompt_chars`
+/// always carries the FULL length, so the viewer detects truncation by
+/// comparing it against the stored text's length.
+pub(crate) const MAX_PROMPT_PAYLOAD_CHARS: usize = 16_000;
+
+/// Char-safe truncation of a prompt for the `dispatch.start` payload.
+pub(crate) fn capped_prompt(s: &str) -> String {
+    s.chars().take(MAX_PROMPT_PAYLOAD_CHARS).collect()
 }
 
 /// Same as `build_dispatch_record` but with an explicit `payload` for
