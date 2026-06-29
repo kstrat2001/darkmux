@@ -933,6 +933,9 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // have no container image, so that path omits the field honestly.
         "image": image.clone(),
         "prompt_chars": opts.message.chars().count(),
+        // (#1127) The dispatch prompt text (capped) — run context the viewer
+        // renders collapsed. prompt_chars carries the full length.
+        "prompt": crate::dispatch::capped_prompt(&opts.message),
         "system_chars": system_prompt.chars().count(),
         "workspace": workspace.display().to_string(),
     });
