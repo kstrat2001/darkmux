@@ -75,14 +75,15 @@ darkmux's canonical config surface is **`~/.darkmux/config.json`** (#661), writt
 
 ```json
 {
-  "schema_version": "1.0",
+  "schema_version": "1.1",
   "machine_id": "studio",
   "orchestrator": "",
   "lms_bin": "lms",
   "lmstudio_url": "http://localhost:1234",
   "redis":   { "enabled": false, "host": "127.0.0.1", "port": 6379, "stream": "darkmux:flow", "maxlen": 10000 },
   "audit":   { "enabled": false, "dir": "~/.darkmux/audit" },
-  "runtime": { "inactivity_timeout_seconds": 600, "strict_selection": false, "feedback_injection": true, "check_updates": true }
+  "runtime": { "inactivity_timeout_seconds": 600, "strict_selection": false, "feedback_injection": true, "check_updates": true },
+  "fleet":   { "mode": "standalone" }
 }
 ```
 
@@ -105,6 +106,7 @@ Every `DARKMUX_*` var below is the **top tier** of `env > config.json > built-in
 |---|---|---|
 | `DARKMUX_MACHINE_ID` | hostname | Logical fleet name **stamped at record-write time** on every new flow record. Operator-named (`studio`, `mini-1`) reads better in the topology view than DNS-style hostnames. Pre-1.4.0 records lack the field (which the viewer renders as `unknown`). |
 | `DARKMUX_ORCHESTRATOR` | unset → field omitted | Frontier orchestrator driving this session (e.g. `claude-code`, `antigravity`, `cursor`), **stamped at record-write time**. **Operator-explicit by design** — there's no reliable way to auto-detect the frontier model from inside darkmux. Doctor warns when unset. |
+| `DARKMUX_FLEET_MODE` | `standalone` | The machine's declared fleet position — `standalone` (single machine), `hub` (the always-on coordinator; supervises its own Redis per #936), or `peer` (points at a hub). Operator-**declared** under `config.fleet.mode`; detection is only a doctor cross-check (declared ≠ observed), never the source of truth. `darkmux doctor` shows it with provenance and flags an unrecognized value (treated as `standalone`). Downstream fleet features key on it (#933). |
 | `DARKMUX_FLOWS_DIR` | `~/.darkmux/flows` | Where the per-day JSONL files live (LocalFileSink — casual write target). |
 | `DARKMUX_AUDIT_DIR` | unset → AuditFileSink off | When set, flow records ALSO write to a hash-chained tamper-evident per-day JSONL under this directory (AuditFileSink, #163). **POSIX-only** (Linux/macOS — Windows is unsupported; the env var is recognized but the sink is skipped). Cross-process safe via `flock(2)`. `darkmux flow integrity-check` walks the chain and **exits with status 2 on any chain break** so cron/CI can flag tampering. `darkmux doctor` rolls up the same result. Compliance-strength substrate (ISO 27001, AI Act, HIPAA-as-covered-entity). |
 | `DARKMUX_REDIS_URL` | unset → Redis off | When set, flow records also XADD to the Redis stream (coordination substrate; not the audit substrate). Combined with `DARKMUX_AUDIT_DIR` produces the canonical compliant composition: `TeeSink([LocalFile, Audit, Redis])`. See [#162](https://github.com/kstrat2001/darkmux/issues/162) Phase 3. |
@@ -119,6 +121,7 @@ Every `DARKMUX_*` var below is the **top tier** of `env > config.json > built-in
 |---|---|
 | `DARKMUX_MACHINE_ID` | `machine_id` |
 | `DARKMUX_ORCHESTRATOR` | `orchestrator` |
+| `DARKMUX_FLEET_MODE` | `fleet.mode` |
 | `DARKMUX_LMS_BIN` / `DARKMUX_LMSTUDIO_URL` | `lms_bin` / `lmstudio_url` (base URL; callers append `/v1/...`) |
 | `DARKMUX_FLOWS_DIR` / `DARKMUX_NOTEBOOK_DIR` / `DARKMUX_CREW_DIR` / … | `dirs.flows` / `dirs.notebook` / `dirs.crew` / … |
 | `DARKMUX_AUDIT_DIR` | `audit.dir` (gated by `audit.enabled`) |
