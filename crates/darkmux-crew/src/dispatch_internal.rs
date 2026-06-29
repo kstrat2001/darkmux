@@ -926,6 +926,12 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     //    as the openclaw path does.
     let dispatch_start_payload = serde_json::json!({
         "runtime": "internal",
+        // (#1126) The resolved runtime image (operator `--image` or the default
+        // darkmux image, line ~711) — the environment the coder ran in. The
+        // viewer's run brief + recent-runs rail read `payload.image`; it was a
+        // dead reference until now (no path emitted it). openclaw dispatches
+        // have no container image, so that path omits the field honestly.
+        "image": image.clone(),
         "prompt_chars": opts.message.chars().count(),
         "system_chars": system_prompt.chars().count(),
         "workspace": workspace.display().to_string(),
