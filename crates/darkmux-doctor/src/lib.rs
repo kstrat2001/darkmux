@@ -123,6 +123,7 @@ pub fn run(include_openclaw: bool) -> DoctorReport {
         check_flow_sink_health(),
         check_machine_id_resolution(),
         check_orchestrator_declared(),
+        check_fleet_mode(),
         check_openai_base_url_conflict(),
         check_redis_config(),
         check_audit_integrity(),
@@ -979,6 +980,49 @@ fn check_orchestrator_declared() -> Check {
             message: "not declared — flow records won't carry orchestrator provenance".into(),
             hint: Some(
                 "Export DARKMUX_ORCHESTRATOR=<harness-name> in the shell driving darkmux (e.g. `claude-code`, `antigravity`, `cursor`). Operator-explicit by design (#49 cultivation discipline).".into(),
+            ),
+        },
+    }
+}
+
+/// Surface the machine's declared fleet position (#933) with provenance, and
+/// flag an unrecognized `fleet.mode`. `standalone` (default), `hub`, and `peer`
+/// are Pass; a typo is a Warn that names the bad token + the valid set (treated
+/// as `standalone` until corrected). Local-machine only — cross-machine fleet
+/// coherence (two-hub split-brain etc.) is `doctor --fleet` (#935).
+fn check_fleet_mode() -> Check {
+    use darkmux_types::config::{DarkmuxConfig, FleetMode};
+    let name = "fleet.mode";
+    let env_set = std::env::var("DARKMUX_FLEET_MODE")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let cfg_set = DarkmuxConfig::load_resolved()
+        .fleet
+        .and_then(|f| f.mode)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let raw = darkmux_types::config_access::fleet_mode_raw();
+    let provenance = if env_set.is_some() {
+        "from DARKMUX_FLEET_MODE env"
+    } else if cfg_set.is_some() {
+        "from config.json"
+    } else {
+        "default"
+    };
+    match FleetMode::parse(&raw) {
+        Some(_) => Check {
+            name: name.into(),
+            status: Status::Pass,
+            message: format!("`{raw}` ({provenance})"),
+            hint: None,
+        },
+        None => Check {
+            name: name.into(),
+            status: Status::Warn,
+            message: format!("`{raw}` ({provenance}) is not a recognized fleet.mode — treated as `standalone`"),
+            hint: Some(
+                "Valid values: `standalone` (single machine), `hub` (always-on coordinator), `peer` (points at a hub). Set `fleet.mode` in ~/.darkmux/config.json, or export DARKMUX_FLEET_MODE.".into(),
             ),
         },
     }
@@ -2979,10 +3023,10 @@ mod tests {
         // + beat-33-crew-dir [Beat 33 directory flatten] + role-tool-vocab
         // [#340] + legacy-compaction-extras [#380] + redis-config [#661] +
         // docker-runtime [#680] + audit-write-drops [#877] + serve-daemon-auth
-        // [#881]) + one per active eureka rule. Every check should appear
-        // regardless of environment — even if the underlying probe couldn't
-        // read state.
-        let expected = 32 + darkmux_eureka::all_rules().len();
+        // [#881] + fleet.mode [#933]) + one per active eureka rule. Every check
+        // should appear regardless of environment — even if the underlying
+        // probe couldn't read state.
+        let expected = 33 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

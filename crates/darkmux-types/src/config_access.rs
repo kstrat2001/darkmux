@@ -124,6 +124,24 @@ pub fn orchestrator() -> Option<String> {
     pick_string("DARKMUX_ORCHESTRATOR", config().orchestrator.as_deref(), None)
 }
 
+// ── Fleet position (#933) ──
+/// The machine's declared fleet position as the RAW operator token, resolving
+/// `env(DARKMUX_FLEET_MODE) > config.fleet.mode > "standalone"`. An
+/// unrecognized value passes through unchanged so `darkmux doctor` can validate
+/// it against what the operator actually wrote (#934); typed callers use
+/// `fleet_mode()`.
+pub fn fleet_mode_raw() -> String {
+    let cfg = config().fleet.as_ref().and_then(|f| f.mode.as_deref());
+    pick_string("DARKMUX_FLEET_MODE", cfg, Some("standalone")).unwrap()
+}
+
+/// The machine's declared fleet position, typed. An unrecognized token resolves
+/// to `Standalone` (the safe default — a single machine that coordinates
+/// nothing); `darkmux doctor` surfaces the raw typo separately (#934).
+pub fn fleet_mode() -> crate::config::FleetMode {
+    crate::config::FleetMode::parse(&fleet_mode_raw()).unwrap_or_default()
+}
+
 // ── External tooling ──
 pub fn lms_bin() -> String {
     pick_string("DARKMUX_LMS_BIN", config().lms_bin.as_deref(), Some("lms")).unwrap()
@@ -526,6 +544,28 @@ mod tests {
         assert_eq!(env_str(k).as_deref(), Some("/padded/path"), "surrounding whitespace trimmed");
         unsafe { std::env::set_var(k, "   "); }
         assert_eq!(env_str(k), None, "whitespace-only → None");
+        unsafe { std::env::remove_var(k); }
+    }
+
+    // ── fleet_mode (#933): env > config > standalone default ──
+    #[serial_test::serial]
+    #[test]
+    fn fleet_mode_env_overrides_and_defaults_standalone() {
+        use crate::config::FleetMode;
+        let k = "DARKMUX_FLEET_MODE";
+        unsafe { std::env::remove_var(k); }
+        // No env + EMPTY test config → standalone default.
+        assert_eq!(fleet_mode_raw(), "standalone");
+        assert_eq!(fleet_mode(), FleetMode::Standalone);
+        // Env override wins, case-insensitive; the raw token is preserved.
+        unsafe { std::env::set_var(k, "HUB"); }
+        assert_eq!(fleet_mode_raw(), "HUB");
+        assert_eq!(fleet_mode(), FleetMode::Hub);
+        // An unrecognized token passes through raw but resolves typed→standalone
+        // (doctor flags the raw typo separately, #934).
+        unsafe { std::env::set_var(k, "hubb"); }
+        assert_eq!(fleet_mode_raw(), "hubb");
+        assert_eq!(fleet_mode(), FleetMode::Standalone);
         unsafe { std::env::remove_var(k); }
     }
 

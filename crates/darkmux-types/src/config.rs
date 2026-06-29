@@ -28,7 +28,10 @@ use std::path::Path;
 /// **minor** bump (older binaries safely ignore unknown keys via `extras`);
 /// renaming/retyping a field is **major**. Mirrors the `FLOW_SCHEMA_VERSION`
 /// discipline (`crates/darkmux-flow/src/schema.rs`).
-pub const CONFIG_SCHEMA_VERSION: &str = "1.0";
+// 1.1 (#933): additive `fleet{}` block (fleet.mode). Minor bump — an older
+// binary tolerates it (all-Option + `extras` overflow), per the lenient-read
+// doctrine.
+pub const CONFIG_SCHEMA_VERSION: &str = "1.1";
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
 /// `None`, so a fresh/empty config serializes to `{}` and any field absent
@@ -59,6 +62,8 @@ pub struct DarkmuxConfig {
     pub audit: Option<AuditConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<RuntimeBehaviorConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fleet: Option<FleetConfig>,
 
     /// Forward-compat overflow — unknown top-level keys land here and
     /// re-serialize flat (a newer config read by an older binary).
@@ -148,6 +153,63 @@ pub struct RuntimeBehaviorConfig {
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
+/// Fleet position (#933) — the machine's declared place in a multi-node fleet,
+/// a `fleet{}` block beside `redis{}`/`audit{}`/`runtime{}`. The operator
+/// **declares** `mode`; detection (a machine running Redis + the always-on
+/// daemon looks like a hub) is only a `darkmux doctor` cross-check that flags
+/// declared ≠ observed — never the source of truth (operator sovereignty).
+/// Downstream work keys on it: the turnkey hub supervises its own Redis when
+/// `mode: hub` (#936); `doctor --fleet` uses it for two-hub split-brain
+/// detection (#935). `darkmux init` writes `mode: "standalone"` visible, so the
+/// fleet surface is discoverable and one edit from `hub`/`peer`.
+///
+/// `mode` is stored as a **string, not a typed enum**, deliberately: the
+/// lenient-read doctrine says a typo'd value must never fail the whole-config
+/// parse (which would brick every setting). The raw token is kept so `darkmux
+/// doctor` can flag it against what the operator actually wrote (#934);
+/// `FleetMode::parse` does the typed interpretation at the accessor.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FleetConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub mode: Option<String>,
+    #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
+/// A machine's declared fleet position. `Standalone` (default) = a
+/// single-machine install with no fleet; `Hub` = the always-on coordinator
+/// (and, per #936, supervises its own Redis); `Peer` = points at a hub.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FleetMode {
+    #[default]
+    Standalone,
+    Hub,
+    Peer,
+}
+
+impl FleetMode {
+    /// The canonical lowercase token — the `config.json` value and the
+    /// `DARKMUX_FLEET_MODE` env token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FleetMode::Standalone => "standalone",
+            FleetMode::Hub => "hub",
+            FleetMode::Peer => "peer",
+        }
+    }
+
+    /// Parse an operator-declared token (trimmed, case-insensitive). Returns
+    /// `None` for an unrecognized value — kept distinct from "standalone" so a
+    /// caller (e.g. `darkmux doctor`, #934) can flag a typo against the raw
+    /// string rather than this silently coercing it.
+    pub fn parse(s: &str) -> Option<FleetMode> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "standalone" => Some(FleetMode::Standalone),
+            "hub" => Some(FleetMode::Hub),
+            "peer" => Some(FleetMode::Peer),
+            _ => None,
+        }
+    }
+}
+
 impl DarkmuxConfig {
     /// The full, self-documenting default config that `darkmux init` writes —
     /// every common knob present and visible, so the operator tunes the *file*,
@@ -210,6 +272,10 @@ impl DarkmuxConfig {
                 injected_context_fraction: Some(0.15),
                 extras: Default::default(),
             }),
+            fleet: Some(FleetConfig {
+                mode: Some("standalone".to_string()),
+                extras: Default::default(),
+            }),
             extras: Default::default(),
         }
     }
@@ -267,10 +333,42 @@ mod tests {
             json.find("\"enabled\"").unwrap() < json.find("\"host\"").unwrap(),
             "enabled must precede the connection knobs"
         );
+        // (#933) The fleet block is written visible at the standalone default,
+        // so the fleet surface is discoverable + one edit from hub/peer.
+        assert_eq!(cfg.fleet.as_ref().unwrap().mode.as_deref(), Some("standalone"));
         // Lossless round-trip.
         let back: DarkmuxConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.redis.as_ref().unwrap().enabled, Some(false));
         assert_eq!(back.audit.as_ref().unwrap().dir.as_deref(), Some("~/.darkmux/audit"));
+        assert_eq!(back.fleet.as_ref().unwrap().mode.as_deref(), Some("standalone"));
+    }
+
+    /// (#933) `FleetMode::parse` is lenient (trim + case-insensitive) and
+    /// returns `None` for an unrecognized token so doctor can flag the typo
+    /// rather than silently coercing it; `as_str` round-trips the canonical
+    /// lowercase token.
+    #[test]
+    fn fleet_mode_parse_and_roundtrip() {
+        assert_eq!(FleetMode::parse("hub"), Some(FleetMode::Hub));
+        assert_eq!(FleetMode::parse("  PEER "), Some(FleetMode::Peer));
+        assert_eq!(FleetMode::parse("standalone"), Some(FleetMode::Standalone));
+        assert_eq!(FleetMode::parse("hubb"), None, "typo → None, not silently standalone");
+        assert_eq!(FleetMode::default(), FleetMode::Standalone);
+        for m in [FleetMode::Standalone, FleetMode::Hub, FleetMode::Peer] {
+            assert_eq!(FleetMode::parse(m.as_str()), Some(m));
+        }
+    }
+
+    /// (#933) A typo'd `fleet.mode` must NOT fail the whole-config parse (the
+    /// lenient-read doctrine) — it lands as a plain string the accessor/doctor
+    /// interpret, never bricking the other settings.
+    #[test]
+    fn bad_fleet_mode_does_not_brick_config() {
+        let json = r#"{ "machine_id": "x", "fleet": { "mode": "hubb" } }"#;
+        let cfg: DarkmuxConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.machine_id.as_deref(), Some("x"), "other fields still parse");
+        assert_eq!(cfg.fleet.as_ref().unwrap().mode.as_deref(), Some("hubb"), "raw token preserved for doctor");
+        assert_eq!(FleetMode::parse(cfg.fleet.unwrap().mode.as_deref().unwrap()), None);
     }
 
     /// Default serializes to `{}` and round-trips empty — the forward-compat

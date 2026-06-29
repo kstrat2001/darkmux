@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.0",
+  "schema_version": "1.1",
   "machine_id": "my-machine",
   "orchestrator": "",
   "lms_bin": "lms",
@@ -21,5 +21,8 @@
     "check_updates": true,
     "daemon_auth_enabled": false,
     "injected_context_fraction": 0.15
+  },
+  "fleet": {
+    "mode": "standalone"
   }
 }
