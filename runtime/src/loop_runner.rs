@@ -769,9 +769,52 @@ pub fn run(
                     .unwrap_or_default();
 
                 if calls.is_empty() {
-                    return Err(anyhow!(
-                        "finish_reason=tool_calls but assistant message had no tool_calls"
-                    ));
+                    // (#1123) finish_reason=tool_calls but no tool_calls — an
+                    // empty/useless completion (observed: a degraded run on
+                    // devstral-24b returned a wholly empty message under this
+                    // finish_reason — no content, no reasoning, no calls).
+                    // Pre-#1123 this hard-killed the dispatch. It's the SAME
+                    // useless-stall shape the length-arm recovers (#414,
+                    // ~line 1150); route it through the same recovery — drop
+                    // the useless turn + nudge + retry, bounded by the stall
+                    // budget, escalating to the frontier when exhausted —
+                    // instead of aborting on the first occurrence.
+                    if stall_recoveries_used >= MAX_STALL_RECOVERIES {
+                        eprintln!(
+                            "darkmux-runtime: escalation_triggered — finish_reason=\
+                             tool_calls with no tool_calls, and the intra-turn stall \
+                             recovery budget ({MAX_STALL_RECOVERIES}) is exhausted; \
+                             {stall_recoveries_used} prior recoveries didn't break the \
+                             pattern. Emitting EscalationTriggered for frontier handoff."
+                        );
+                        return Ok(LoopOutcome {
+                            terminal_reason: TerminalReason::EscalationTriggered(
+                                EscalationReason::IntraTurnStallExhausted,
+                            ),
+                            messages,
+                            turns,
+                            total_prompt_tokens,
+                            total_completion_tokens,
+                            compactions,
+                            failed_to_run: failed_to_run.clone(),
+                        });
+                    }
+                    messages.pop();
+                    stall_recoveries_used = stall_recoveries_used.saturating_add(1);
+                    trajectory.append_intra_turn_stall_recovered(
+                        turns,
+                        this_turn_completion_tokens,
+                        stall_recoveries_used,
+                        MAX_STALL_RECOVERIES,
+                    );
+                    messages.push(Message::system(STALL_NUDGE_MESSAGE));
+                    eprintln!(
+                        "darkmux-runtime: ⏸ intra-turn stall recovered — turn {turns} \
+                         returned finish_reason=tool_calls with no tool_calls (empty \
+                         completion). Dropped the useless turn, injected a nudge; \
+                         budget {stall_recoveries_used}/{MAX_STALL_RECOVERIES} used. (#1123)"
+                    );
+                    continue;
                 }
 
                 // Dispatch each call; append a `tool` message per
@@ -3809,6 +3852,46 @@ mod tests {
             MAX_STALL_RECOVERIES + 1,
             outcome.turns
         );
+    }
+
+    /// (#1123) `finish_reason=tool_calls` with NO tool_calls (an empty
+    /// completion — the shape a degraded devstral-24b run produced) must
+    /// recover like the length-arm stall (#414), NOT hard-`Err` on the first
+    /// occurrence. Every call returns the empty-tool_calls shape, so the loop
+    /// recovers `MAX_STALL_RECOVERIES` times then escalates — same bounded
+    /// behavior as the length-stall, proving the pre-#1123 hard-fail is gone.
+    #[test]
+    #[serial_test::serial]
+    fn loop_recovers_from_empty_tool_calls_then_escalates() {
+        let server = MockServer::start();
+        let _stall = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_json(
+                None, // no content
+                None, // no tool_calls → finish_reason=tool_calls + empty array
+                "tool_calls",
+                100,
+                50,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("empty-toolcalls").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("ask")];
+        let tools = [Tool::Read];
+
+        let cfg = compaction::CompactionConfig::never_compact();
+        let outcome = run(&client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new(), None)
+            .expect("empty finish_reason=tool_calls must recover+escalate, not Err");
+
+        assert_eq!(
+            outcome.terminal_reason,
+            TerminalReason::EscalationTriggered(EscalationReason::IntraTurnStallExhausted),
+            "empty finish_reason=tool_calls should route to the stall recovery + escalate; got {:?}",
+            outcome.terminal_reason
+        );
+        assert_eq!(outcome.turns, MAX_STALL_RECOVERIES + 1);
     }
 
     /// (#414 PR A) The stall-recovery trajectory event must fire each
