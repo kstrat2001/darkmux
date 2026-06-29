@@ -126,6 +126,8 @@ pub fn run(include_openclaw: bool) -> DoctorReport {
         check_fleet_mode(),
         check_openai_base_url_conflict(),
         check_redis_config(),
+        check_env_masks_config(),
+        check_binary_split_brain(),
         check_audit_integrity(),
         check_audit_write_drops(),
         check_daemon_auth(),
@@ -1114,6 +1116,148 @@ fn check_redis_config() -> Check {
             message: format!("config Redis enabled → {host}, but no password (Keychain item `darkmux-redis` absent, no DARKMUX_REDIS_URL) — connecting password-less"),
             hint: Some("If your Redis requires auth, store the password: `security add-generic-password -a $USER -s darkmux-redis -w` (URL-safe). Password-less is fine for a local/Tailnet-trusted Redis.".into()),
         },
+    }
+}
+
+/// (#934) Cross-setting coherence: a `DARKMUX_*` env var set in the shell wins
+/// LIVE over the matching `config.json` field (the `env > config > default`
+/// precedence), so a stale export silently shadows what the operator wrote in
+/// the file. The per-setting checks each report the *resolved* value, never the
+/// masking — so this is the rule that catches "config.json is being ignored."
+/// Both fix branches are offered because the precedence can't infer intent.
+fn check_env_masks_config() -> Check {
+    env_masks_config_check(&darkmux_types::config::DarkmuxConfig::load_resolved())
+}
+
+/// Testable core: the env tier is read live (`set`), the config tier is the
+/// passed `cfg` — so a serial test drives it with `set_var` + a constructed cfg.
+fn env_masks_config_check(cfg: &darkmux_types::config::DarkmuxConfig) -> Check {
+    let name = "env vs config";
+    let set = |k: &str| {
+        std::env::var(k)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .is_some_and(|s| !s.is_empty())
+    };
+    let mut masked: Vec<&str> = Vec::new();
+    // DARKMUX_REDIS_URL (full URL) shadows the entire config.redis block — the
+    // painful #932 case.
+    if set("DARKMUX_REDIS_URL")
+        && cfg
+            .redis
+            .as_ref()
+            .is_some_and(|r| r.enabled == Some(true) || r.host.is_some())
+    {
+        masked.push("DARKMUX_REDIS_URL shadows config.redis (the config Redis block is ignored)");
+    }
+    if set("DARKMUX_FLEET_MODE") && cfg.fleet.as_ref().and_then(|f| f.mode.as_ref()).is_some() {
+        masked.push("DARKMUX_FLEET_MODE shadows config.fleet.mode");
+    }
+    if set("DARKMUX_MACHINE_ID") && cfg.machine_id.is_some() {
+        masked.push("DARKMUX_MACHINE_ID shadows config.machine_id");
+    }
+    if set("DARKMUX_LMSTUDIO_URL") && cfg.lmstudio_url.is_some() {
+        masked.push("DARKMUX_LMSTUDIO_URL shadows config.lmstudio_url");
+    }
+    if set("DARKMUX_ORCHESTRATOR")
+        && cfg
+            .orchestrator
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+    {
+        masked.push("DARKMUX_ORCHESTRATOR shadows config.orchestrator");
+    }
+    if masked.is_empty() {
+        Check {
+            name: name.into(),
+            status: Status::Pass,
+            message: "no env var is shadowing a config.json setting".into(),
+            hint: None,
+        }
+    } else {
+        Check {
+            name: name.into(),
+            status: Status::Warn,
+            message: format!(
+                "{} env override(s) shadow config.json (env wins live): {}",
+                masked.len(),
+                masked.join("; ")
+            ),
+            hint: Some(
+                "The shell env tier wins over config.json at every access, so the config value is silently inert. Fix EITHER way (darkmux can't infer intent): unset the env var to use config.json, OR move the value into config.json (`darkmux config set <key> <value>`) and unset the env var so it's durable. `darkmux doctor -v` shows each resolved value.".into(),
+            ),
+        }
+    }
+}
+
+/// (#934) Cross-setting coherence: `which -a darkmux` resolving to more than one
+/// binary at DIFFERENT versions is the brew/cargo split-brain — an interactive
+/// shell may run `~/.cargo/bin/darkmux` while a launchd daemon runs
+/// `/opt/homebrew/bin/darkmux`, so the daemon serves a different (often older)
+/// flow-schema than the CLI. Compares the semver token only (a same-version,
+/// different-SHA pair is not a schema split). Best-effort: a probe failure is a
+/// Pass (skipped), never a false alarm.
+fn check_binary_split_brain() -> Check {
+    let name = "darkmux binary";
+    let pass = |msg: String| Check {
+        name: name.into(),
+        status: Status::Pass,
+        message: msg,
+        hint: None,
+    };
+    let Ok(out) = std::process::Command::new("which").arg("-a").arg("darkmux").output() else {
+        return pass("could not enumerate darkmux on PATH (skipped)".into());
+    };
+    let mut uniq: Vec<String> = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let p = line.trim().to_string();
+        if !p.is_empty() && !uniq.contains(&p) {
+            uniq.push(p);
+        }
+    }
+    if uniq.len() < 2 {
+        return pass(format!(
+            "single darkmux on PATH{}",
+            uniq.first().map(|p| format!(" ({p})")).unwrap_or_default()
+        ));
+    }
+    // Probe each binary's semver (the `X.Y.Z` token of `darkmux --version`).
+    let semver = |p: &str| -> String {
+        std::process::Command::new(p)
+            .arg("--version")
+            .output()
+            .ok()
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("?")
+                    .to_string()
+            })
+            .unwrap_or_else(|| "?".into())
+    };
+    let versions: Vec<(String, String)> = uniq.iter().map(|p| (p.clone(), semver(p))).collect();
+    let distinct: std::collections::HashSet<&str> =
+        versions.iter().map(|(_, v)| v.as_str()).collect();
+    if distinct.len() <= 1 {
+        return pass(format!("{} darkmux binaries on PATH, same version", uniq.len()));
+    }
+    let listing = versions
+        .iter()
+        .map(|(p, v)| format!("{p} = {v}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Check {
+        name: name.into(),
+        status: Status::Warn,
+        message: format!(
+            "brew/cargo split-brain — {} darkmux binaries at different versions: {}",
+            uniq.len(),
+            listing
+        ),
+        hint: Some(
+            "An interactive shell and a launchd/service daemon can resolve different darkmux binaries (PATH order differs), so the daemon may serve an older flow-schema than the CLI. Align them: reinstall the stale one (`cargo install --path .` or `brew upgrade darkmux`), or remove the duplicate so one version is on PATH.".into(),
+        ),
     }
 }
 
@@ -2648,6 +2792,29 @@ fn print_check_line(c: &Check) {
     }
 }
 
+/// (#934) The at-a-glance verdict banner: maps `worst_status()` → a
+/// plain-language headline (`ok` / `needs attention` / `broken`) so the operator
+/// reads one line instead of scanning ~35 rows. The headline names the
+/// highest-severity finding — the first Fail, else the first Warn — i.e. the
+/// thing to act on. (Tie-break by blast radius is a future refinement; first-of-
+/// severity is the shippable L1.) Plain-language verdict words by operator lean
+/// (#932 Q1); the per-check markers stay ✓/⚠/✗.
+fn verdict_banner(r: &DoctorReport) -> String {
+    let headline =
+        |s: Status| r.checks.iter().find(|c| c.status == s).map(|c| format!("{}: {}", c.name, c.message));
+    match r.worst_status() {
+        Status::Pass => darkmux_types::style::success("● ok — every check passed"),
+        Status::Warn => darkmux_types::style::warn(&format!(
+            "● needs attention — {}",
+            headline(Status::Warn).unwrap_or_else(|| "see the warnings below".into())
+        )),
+        Status::Fail => darkmux_types::style::error(&format!(
+            "● broken — {}",
+            headline(Status::Fail).unwrap_or_else(|| "see the failures below".into())
+        )),
+    }
+}
+
 /// Render the doctor report.
 ///
 /// (#1130) Default (`verbose=false`) is **issues-only**: the build identity
@@ -2656,6 +2823,10 @@ fn print_check_line(c: &Check) {
 /// (`darkmux doctor -v`) prints every check, the old behavior.
 pub fn print_report(r: &DoctorReport, verbose: bool) -> Result<()> {
     println!("{}", darkmux_types::style::header(&format!("darkmux doctor — {} checks", r.checks.len())));
+    println!();
+    // (#934) Lead with the verdict so the operator gets the answer before the
+    // detail — the L1 "isn't drowned in flat checks" goal.
+    println!("{}", verdict_banner(r));
     println!();
     if verbose {
         for c in &r.checks {
@@ -3024,11 +3195,53 @@ mod tests {
         // + beat-33-crew-dir [Beat 33 directory flatten] + role-tool-vocab
         // [#340] + legacy-compaction-extras [#380] + redis-config [#661] +
         // docker-runtime [#680] + audit-write-drops [#877] + serve-daemon-auth
-        // [#881] + fleet.mode [#933]) + one per active eureka rule. Every check
-        // should appear regardless of environment — even if the underlying
-        // probe couldn't read state.
-        let expected = 33 + darkmux_eureka::all_rules().len();
+        // [#881] + fleet.mode [#933] + env-masks-config [#934] + binary-split-
+        // brain [#934]) + one per active eureka rule. Every check should appear
+        // regardless of environment — even if the underlying probe couldn't
+        // read state.
+        let expected = 35 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
+    }
+
+    // ─── #934 doctor L1 ───────────────────────────────────────────────
+    #[serial_test::serial]
+    #[test]
+    fn env_masks_config_flags_only_when_both_set() {
+        use darkmux_types::config::{DarkmuxConfig, FleetConfig, RedisConfig};
+        // A config with redis.host + fleet.mode declared.
+        let cfg = DarkmuxConfig {
+            redis: Some(RedisConfig { host: Some("h".into()), ..Default::default() }),
+            fleet: Some(FleetConfig { mode: Some("hub".into()), ..Default::default() }),
+            ..Default::default()
+        };
+        for k in ["DARKMUX_REDIS_URL", "DARKMUX_FLEET_MODE", "DARKMUX_MACHINE_ID"] {
+            unsafe { std::env::remove_var(k) };
+        }
+        // No env set → nothing masked, Pass.
+        assert_eq!(env_masks_config_check(&cfg).status, Status::Pass);
+        // A stale env that ALSO has a config value → Warn naming the masked field.
+        unsafe { std::env::set_var("DARKMUX_REDIS_URL", "redis://x:6379") };
+        let c = env_masks_config_check(&cfg);
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.message.contains("config.redis"), "{}", c.message);
+        // An env whose config side is UNSET does not flag (no masking).
+        unsafe { std::env::remove_var("DARKMUX_REDIS_URL") };
+        unsafe { std::env::set_var("DARKMUX_MACHINE_ID", "studio") };
+        assert_eq!(env_masks_config_check(&cfg).status, Status::Pass, "machine_id unset in cfg → not masked");
+        unsafe { std::env::remove_var("DARKMUX_MACHINE_ID") };
+    }
+
+    #[test]
+    fn verdict_banner_maps_severity_and_names_the_finding() {
+        let mk = |name: &str, s: Status| Check { name: name.into(), status: s, message: format!("{name}-msg"), hint: None };
+        let ok = DoctorReport { checks: vec![mk("a", Status::Pass)] };
+        assert!(verdict_banner(&ok).contains("ok"));
+        let warn = DoctorReport { checks: vec![mk("a", Status::Pass), mk("redis", Status::Warn)] };
+        let b = verdict_banner(&warn);
+        assert!(b.contains("needs attention") && b.contains("redis"), "{b}");
+        let fail = DoctorReport { checks: vec![mk("redis", Status::Warn), mk("daemon", Status::Fail)] };
+        let b = verdict_banner(&fail);
+        assert!(b.contains("broken") && b.contains("daemon"), "highest severity wins: {b}");
     }
 
     // ─── check_daemon_auth (#881) ─────────────────────────────────────
