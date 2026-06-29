@@ -159,7 +159,14 @@
   .clock{font:12px 'JetBrains Mono',monospace;color:var(--muted);min-width:160px;text-align:right}
   .fleet{display:flex;gap:16px;flex-wrap:wrap;align-items:stretch}
   .fleettl{margin-top:30px;border-top:1px solid var(--line);padding-top:18px}
-  .tlhdr{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin-bottom:14px}
+  .tlhdr{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin-bottom:14px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  /* (#1151) activity-timeline window presets — a mini segmented control,
+     mirroring the .lens lens-tabs vocabulary at a smaller scale. */
+  .twin{display:inline-flex;border:1px solid var(--line);border-radius:5px;overflow:hidden}
+  .twinb{font:600 10px/1 'JetBrains Mono',monospace;letter-spacing:.06em;color:var(--muted);padding:4px 8px;cursor:pointer;background:none;border:0;text-transform:uppercase}
+  .twinb+.twinb{border-left:1px solid var(--line)}
+  .twinb:hover{color:var(--text)}
+  .twinb.on{background:var(--amber-dim);color:#0a0f17}
   .lane{display:flex;align-items:center;gap:12px;margin-bottom:7px}
   .lname{width:var(--lname-w,150px);flex:none;font:12px 'JetBrains Mono',monospace;color:var(--text);text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .tltrack{position:relative;flex:1;height:28px;background:var(--panel);border:1px solid var(--line);border-radius:4px;overflow:hidden}
@@ -405,7 +412,11 @@
     /* (#803 layout) Stat blocks compress on phones: smaller values, tighter
        gaps; the flex wrap stacks them under the headline number naturally. */
     .savrow { gap: 10px 18px; }
-    .savclasses { gap: 8px 16px; }
+    /* (#1151) When the breakdown wraps BELOW the total on phones, left-align it
+       so it lines up under the left-pinned total instead of hugging the right
+       edge (the desktop flex-end balances total-left / breakdown-right, which
+       reads disconnected once stacked). */
+    .savclasses { gap: 8px 16px; justify-content: flex-start; }
     .savc .scv { font-size: 15px; }
     /* (#803) Recent-runs rows wrap to multiple lines on phones so the per-run
        crits (turns · tools · tokens · compactions) stay visible instead of
@@ -440,10 +451,17 @@
        on mobile .wrap is already height:auto (set above), so the taller bars
        don't need a calc adjustment. */
     .top { height: auto; flex-wrap: wrap; padding: 9px 12px; gap: 8px 10px; row-gap: 8px; }
-    .brand { flex: 1 1 100%; font-size: 13px; }
+    /* (#1151) Vertical space is tight on phones, so pack row 1 = brand + status
+       badges (source + LIVE). The LIVE pulse rides beside the brand rather than
+       taking its own row: .brand grows (auto, not 100%) so the two short badges
+       sit at the right edge of the same row. Row 2 is the longer #1129
+       version+schema chip on its own line (it caused the orphan-wrap when left on
+       the badge row); row 3 is the nav. Four header rows → three. */
+    .brand { flex: 1 1 auto; font-size: 13px; }
     #srcbadge, #modebadge { order: 2; }
+    #verbadge { flex: 1 1 100%; order: 3; }
     .badge, .pb { padding: 4px 8px; font-size: 10px; }
-    .topnav { order: 3; margin-left: 0; flex: 1 1 100%; gap: 16px; justify-content: flex-start; padding-top: 2px; border-top: 1px solid var(--line); }
+    .topnav { order: 4; margin-left: 0; flex: 1 1 100%; gap: 16px; justify-content: flex-start; padding-top: 2px; border-top: 1px solid var(--line); }
     .topnav a { font-size: 11px; }
 
     /* Crumbbar: keep the back button + crumb on one scrollable row, but let
@@ -674,7 +692,7 @@ recompute();
 // (#691) Default cap on the recent-runs list (newest-first); show-all toggle
 // via state.recentAll. Keeps a busy machine's panel from scrolling unbounded.
 const RECENT_CAP=20;
-let state={level:"fleet",machine:null,session:null,missionId:null,t:tMax,playing:false,timer:null,selected:null,follow:true,speed:1,recentAll:false,
+let state={level:"fleet",machine:null,session:null,missionId:null,t:tMax,playing:false,timer:null,selected:null,follow:true,speed:1,recentAll:false,activityWindowMin:1440,
   filters:{cat:new Set(FCATS),tier:new Set(FTIERS),src:new Set(FSRC),q:""},
   rawOpen:false,
   // (#expand) Open-state of `<details data-expand="<key>">` blocks, keyed so it
@@ -1105,9 +1123,9 @@ function savingsHero(){
       <div class="savclasses">
         ${sc(fmtC(t.completion),'generated','gen')}
         ${sc(fmtC(t.fresh),'fresh input','')}
-        ${sc(fmtC(t.reread),'re-read input','')}
+        ${sc(fmtC(t.reread),'re-read','')}
         ${t.uncls?sc(fmtC(t.uncls),'unclassified','uncls'):''}
-        ${sc(t.runs,`dispatch${t.runs===1?'':'es'} run locally`,'')}
+        ${sc(t.runs,`dispatch${t.runs===1?'':'es'}`,'')}
       </div>
     </div>
     ${hybridNote(t)}
@@ -1138,7 +1156,16 @@ function renderFleet(){
   // positioned across the recorded window, revealed up to the playhead (an
   // in-flight session grows to the playhead). Fills the fleet view with a
   // "what ran when, where" overview instead of empty canvas.
-  const span=Math.max(1,tMax-tMin), pct=t=>(t-tMin)/span*100;
+  // (#1151) In live mode the timeline shows a FIXED, operator-selected window
+  // anchored at NOW (not the latest record): tlMax = now, tlMin = now − window.
+  // Anchoring at `now` keeps the right-edge label honest — after a run ends tMax
+  // stops advancing while the clock doesn't, so a tMax anchor would read e.g.
+  // 16:00 at 16:04. So "24h" draws a TRUE 24h axis ending at the current minute
+  // instead of the data-min..data-max span. Playback keeps the full-day span
+  // (tMin..tMax) and shows no control.
+  const winMs=state.activityWindowMin*60000;
+  const tlMax=liveMode?Math.max(tMax,Date.now()):tMax, tlMin=liveMode?(tlMax-winMs):tMin;
+  const span=Math.max(1,tlMax-tlMin), pct=t=>(t-tlMin)/span*100;
   const lanes=ms.map(m=>{
     const bars=sessionsOn(m).map(sid=>{
       const s=dispatch(sid,"start"); if(!s||T(s.ts)>state.t)return"";
@@ -1152,24 +1179,31 @@ function renderFleet(){
       // complete/canceled/failed via the shared convention.
       const {cls,lbl}=statusVisual({open:!done, errored:done&&dispatchErrored(term), killed:dispatchKilled(term), clean:done&&!!term&&!dispatchErrored(term)});
       const end=!done?state.t:(close?T(close.ts):(lastTs(sid)||state.t));
-      const W=Math.max(0.6,pct(end)-pct(T(s.ts)));
+      // (#1151) Drop a session that ended entirely before the window; clip a
+      // still-open or window-straddling bar's start to the window's left edge.
+      if(end<tlMin)return"";
+      const cst=Math.max(T(s.ts),tlMin);
+      const W=Math.max(0.6,pct(end)-pct(cst));
       // Clamp so a bar at/near "now" (left≈100%) + its min-width can't spill
       // past the track's right edge (the rightmost bar was clipping ~3px).
       // Shift left so left+width never exceeds 100%.
-      const L=Math.max(0,Math.min(pct(T(s.ts)),100-W));
+      const L=Math.max(0,Math.min(pct(cst),100-W));
       const role=(s.handle||"").replace(/^darkmux\//,"");
       return `<div class="sbar ${cls}" style="left:${L}%;width:${W}%" title="${esc(role)} · ${esc(sid)} · ${esc(lbl)}"></div>`;
     }).join("");
     return `<div class="lane"><div class="lname" title="${escN(m)}">${escN(m)}</div><div class="tltrack">${bars}<div class="ph" style="left:${pct(state.t)}%"></div></div></div>`;
   }).join("");
-  const ax=`<div class="tlaxis"><span>${clkhm(tMin)}</span><span>${clkhm(tMin+span/2)}</span><span>${clkhm(tMax)}</span></div>`;
+  const ax=`<div class="tlaxis"><span>${clkhm(tlMin)}</span><span>${clkhm(tlMin+span/2)}</span><span>${clkhm(tlMax)}</span></div>`;
   // Size the lane-label column to the actual machine names so short names
   // ("studio") don't leave a fixed-150px gap before the bars. CSS var consumed
   // on desktop; mobile stacks the lanes (.lname width:auto) and ignores it.
   const maxLen=ms.length?Math.max(...ms.map(m=>nameOf(m).length)):8;
   const labelW=Math.round(Math.min(170,Math.max(54,maxLen*7.4+10)));
+  // (#1151) Live-only window presets (10m/1h/4h/24h, in minutes). Playback shows
+  // the full day, so no control there. data-act routes through ACTIONS.actwin.
+  const winCtl=liveMode?`<span class="twin">${[{l:'10m',m:10},{l:'1h',m:60},{l:'4h',m:240},{l:'24h',m:1440}].map(p=>`<button class="twinb${state.activityWindowMin===p.m?' on':''}" data-act="actwin" data-arg="${p.m}">${p.l}</button>`).join('')}</span>`:'';
   const tl = ms.length
-    ? `<div class="fleettl" style="--lname-w:${labelW}px"><div class="tlhdr">${liveMode?'recent activity':'activity'} · ${clk(tMin)}–${clk(tMax)}</div>${lanes}${ax}</div>`
+    ? `<div class="fleettl" style="--lname-w:${labelW}px"><div class="tlhdr"><span>${liveMode?'recent activity':'activity'} · ${clk(tlMin)}–${clk(tlMax)}</span>${winCtl}</div>${lanes}${ax}</div>`
     : `<div class="fleettl"><div class="tlempty">waiting for the first flow record…</div></div>`;
   $("stage").innerHTML=savingsHero()+`<div class="fleet">${cards}</div>`+tl;
 }
@@ -1483,7 +1517,16 @@ function runRegions(){
   const sv=statusVisual({open:!done, errored:!!c&&dispatchErrored(c), killed:!!c&&dispatchKilled(c), clean:done&&!!c&&!dispatchErrored(c)});
   const sp=(d&&d.payload)||{}, dp=(c&&c.payload)||{};
   const model=d&&d.model?d.model:(distinct[0]||null);
-  const tokIn=dp.prompt_tokens, tokOut=dp.completion_tokens;
+  // (#1151) tokens in/out accumulate LIVE from the per-turn telemetry.tokens
+  // records (source="tokens"), whose running sum equals the terminal
+  // dispatch.complete totals EXACTLY (verified) — so the tiles grow turn-by-turn
+  // during a live run instead of reading "—" until the terminal lands, and they
+  // stay scrubber-consistent in playback (tel is visible()-bounded, like ctx).
+  // Fall back to the terminal cumulative payload for any path that emits only the
+  // terminal token counts (e.g. openclaw) with no per-turn telemetry.
+  const toks=tel.filter(r=>r.source==="tokens");
+  const tokIn=toks.length?toks.reduce((a,r)=>a+(r.fields.prompt_tokens||0),0):(dp.prompt_tokens!=null?dp.prompt_tokens:null);
+  const tokOut=toks.length?toks.reduce((a,r)=>a+(r.fields.completion_tokens||0),0):(dp.completion_tokens!=null?dp.completion_tokens:null);
   const kv=(k,v)=>v!=null&&v!==''?`<div class="kv"><b>${k}</b><span>${v}</span></div>`:'';
   const briefTiming=`${clk(startTs)}${done?' → '+clk(T(close.ts))+' ('+fmt(T(close.ts)-startTs)+')':' · running'}`;
   const briefRows=[
@@ -1763,6 +1806,10 @@ function render(){
 window.drillMachine=m=>{state.level="machine";state.machine=m;state.session=null;state.follow=true;state.recentAll=false;render();};
 // (#691) Expand/collapse the recent-runs list past RECENT_CAP.
 window.toggleRecentAll=()=>{state.recentAll=!state.recentAll;render();};
+// (#1151) Activity-timeline window preset in MINUTES (10m/1h/4h/24h). Live-only
+// control; clamps the timeline axis to a true now-anchored period instead of the
+// data-span range.
+window.setActivityWindow=min=>{state.activityWindowMin=min;render();};
 window.drillSession=s=>{state.level="subsystem";state.session=s;state.follow=true;render();};
 window.goFleet=()=>{state.level="fleet";state.machine=null;state.session=null;state.follow=true;render();};
 window.goMission=()=>{ if(!missions.length)return goFleet(); state.level="mission";state.machine=null;state.session=null;state.missionId=primaryMission();state.follow=true;render();};
@@ -2048,6 +2095,7 @@ const ACTIONS={
   missiondrill:a=>drillMission(a),
   mission:()=>goMission(),
   recentall:()=>toggleRecentAll(),
+  actwin:a=>setActivityWindow(Number(a)),
   filters:()=>openFilters(),
   closefilters:()=>closeFilters(),
   clearfilters:()=>clearFilters(),
@@ -2508,9 +2556,38 @@ async function pollMachineSpecs(){
     applyLive();
   }catch(_){/* best-effort */}
 }
+// (#1151) SSE safety-net. The live tail (/flow/:date/stream) is tail-from-now:
+// on a Redis hiccup it can hit MAX_CONSECUTIVE_XREAD_FAILURES, close the stream,
+// and the browser EventSource reconnects with a FRESH watermark — silently
+// dropping any record XADD'd during the reconnect gap (e.g. a new run's
+// dispatch.start, so the run never surfaces until the operator manually
+// refreshes). This periodic reconcile re-pulls the bounded live window and
+// MERGES anything the tail missed, deduped through SEEN_KEYS exactly like the
+// SSE append — so a missed run self-heals on the next tick instead of needing a
+// refresh. SSE stays the low-latency path; this is the backstop. Live only
+// (started from startLivePoll, which playback/demo never call).
+async function reconcileLiveWindow(){
+  const today=LIVE_ES_DATE||todayUTC();
+  const cut=Date.now()-LIVE_WINDOW_MS;
+  let added=0;
+  for(const d of [prevDateUTC(today),today]){
+    let res; try{res=await fetch("/flow/"+d,{headers:{accept:"application/json"}});}catch(_){continue;}
+    if(!res.ok)continue;
+    let body; try{body=await res.json();}catch(_){continue;}
+    const recs=Array.isArray(body)?body:(body.records||body.flow||[]);
+    for(const r of recs){
+      if(!r||!r.ts||T(r.ts)<cut)continue;
+      const k=recKey(r);
+      if(SEEN_KEYS.has(k))continue;
+      SEEN_KEYS.add(k); r._uid=nextRecordUid++; RAW.push(r); added++;
+    }
+  }
+  if(added)applyLive();   // re-renders only if the merged records changed the stage signature
+}
 function startLivePoll(){
   if(LIVE_SESS_TIMER)return;
   pollLiveSessions(); pollLiveMachines(); pollMachineSpecs();
+  let tick=0;
   LIVE_SESS_TIMER=setInterval(async()=>{
     // UTC date-rollover detection: if we're in live mode and the day
     // changed since the SSE stream was opened, close it, reload the
@@ -2524,6 +2601,10 @@ function startLivePoll(){
       recompute(); render();
     }
     pollLiveSessions();pollLiveMachines();pollMachineSpecs();
+    // (#1151) Backstop the SSE every ~20s (every 4th 5s tick). Presence polling
+    // above already gives a 5s "something's live" signal; this catches the run
+    // DATA up if the tail dropped records in a reconnect gap.
+    if((++tick%4)===0)reconcileLiveWindow();
   },5000);
   window.addEventListener("beforeunload",()=>{if(LIVE_SESS_TIMER)clearInterval(LIVE_SESS_TIMER);});
 }

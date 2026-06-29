@@ -2507,7 +2507,7 @@ mod tests {
     #[test]
     fn savings_hero_breakdown_is_classed_and_currency_free() {
         let html = include_str!("../assets/viewer.html");
-        for needle in ["generated", "fresh input", "re-read input", "unclassified"] {
+        for needle in ["generated", "fresh input", "re-read", "unclassified"] {
             assert!(
                 html.contains(needle),
                 "savings hero lost the `{needle}` token-class label (#803)"
