@@ -159,7 +159,14 @@ fn set_at(path: &Path, key: &str, value: &str) -> Result<String> {
 
 /// Print a key's stored value, or note it's unset (falls through to env/default).
 fn get_at(path: &Path, key: &str) -> Result<String> {
-    if key_type(key).is_none() && !SECRET_KEYS.iter().any(|(k, _)| *k == key) {
+    if let Some((_, item)) = SECRET_KEYS.iter().find(|(k, _)| *k == key) {
+        // Consistent with `set`: a secret is never in config.json — point at the
+        // Keychain rather than reporting "(unset)".
+        return Ok(format!(
+            "`{key}` is a Keychain secret (item `{item}`), not a config value — darkmux never stores it in config.json"
+        ));
+    }
+    if key_type(key).is_none() {
         bail!("unknown config key `{key}`{}", suggestion(key));
     }
     let root = load_object(path)?;
@@ -400,6 +407,50 @@ mod tests {
             }
             _ => out.push(prefix),
         }
+    }
+
+    /// Reverse drift guard: a typo IN the registry (a key that isn't a real
+    /// typed field) would land in `extras` on parse and pass silently — the
+    /// re-parse gate is lenient about unknown keys. Assert each KEYS key, when
+    /// set, leaves EVERY extras map empty, i.e. it resolves to a typed field.
+    #[test]
+    fn every_keys_entry_resolves_to_a_typed_field() {
+        for (key, ty) in KEYS {
+            let sentinel = match ty {
+                Ty::Bool => Value::Bool(true),
+                Ty::Uint => serde_json::json!(1),
+                Ty::Float => serde_json::json!(0.5),
+                // a valid FleetMode token doubles as the generic string sentinel
+                Ty::Str | Ty::FleetMode => Value::String("standalone".into()),
+            };
+            let mut root = Value::Object(Default::default());
+            set_path(&mut root, key, sentinel);
+            let cfg: DarkmuxConfig = serde_json::from_value(root).unwrap();
+            assert_eq!(
+                total_extras(&cfg),
+                0,
+                "KEYS key `{key}` is not a real typed field — it overflowed into `extras` (registry typo)"
+            );
+        }
+    }
+
+    /// Sum of every `extras` overflow map in a parsed config — non-zero means an
+    /// unknown key landed in forward-compat overflow rather than a typed field.
+    fn total_extras(c: &DarkmuxConfig) -> usize {
+        c.extras.len()
+            + c.dirs.as_ref().map_or(0, |x| x.extras.len())
+            + c.redis.as_ref().map_or(0, |x| x.extras.len())
+            + c.audit.as_ref().map_or(0, |x| x.extras.len())
+            + c.runtime.as_ref().map_or(0, |x| x.extras.len())
+            + c.fleet.as_ref().map_or(0, |x| x.extras.len())
+    }
+
+    #[test]
+    fn get_on_a_secret_key_points_at_the_keychain() {
+        let f = tmp();
+        let out = get_at(f.path(), "redis.password").unwrap();
+        assert!(out.contains("Keychain secret"), "{out}");
+        assert!(out.contains("darkmux-redis"), "names the item: {out}");
     }
 
     #[test]
