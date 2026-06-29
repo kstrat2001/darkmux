@@ -1331,6 +1331,18 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         "wall_ms": wall_ms,
         "stdout_chars": stdout.chars().count(),
         "stderr_chars": stderr.chars().count(),
+        // (#1042) On the error path, carry a bounded stderr TAIL so a failed
+        // dispatch is diagnosable from the flow stream alone (the internal
+        // path previously emitted only the char count — you couldn't see WHY
+        // it failed without shelling into the runner). null on success so
+        // clean records aren't bloated. Payload-additive — no FLOW_SCHEMA bump.
+        // (The openclaw path already does this; this brings the DEFAULT path
+        // to parity.)
+        "stderr_excerpt": if exit_code == 0 {
+            None
+        } else {
+            Some(crate::dispatch::tail_excerpt(&stderr, crate::dispatch::STDERR_EXCERPT_MAX))
+        },
         "exit_code": exit_code,
         "result_class": if exit_code == 0 { "ok" } else { "error" },
         "total_turns": trajectory_summary.turns,
