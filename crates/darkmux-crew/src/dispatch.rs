@@ -771,13 +771,15 @@ fn cap_parent_output(content: &str, max: usize) -> String {
 }
 
 /// Max chars of stderr carried in the dispatch-error flow record (#1042).
-const STDERR_EXCERPT_MAX: usize = 4000;
+/// `pub(crate)` so the internal-runtime path reuses the same bound.
+pub(crate) const STDERR_EXCERPT_MAX: usize = 4000;
 
 /// TAIL excerpt of `content` to `max` chars (char-safe, never mid-UTF-8), with a
 /// leading marker when truncated. Unlike [`cap_parent_output`] (a head), this
 /// keeps the END — a failing process's actual error almost always lands at the
 /// tail of stderr. `max == 0` means "no cap". Pure, for testability. (#1042)
-fn tail_excerpt(content: &str, max: usize) -> String {
+/// `pub(crate)` so the internal-runtime path emits the same bounded excerpt.
+pub(crate) fn tail_excerpt(content: &str, max: usize) -> String {
     let trimmed = content.trim_end();
     let n = trimmed.chars().count();
     if max == 0 || n <= max {
