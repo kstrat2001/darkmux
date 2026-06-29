@@ -1120,71 +1120,51 @@ fn check_redis_config() -> Check {
 }
 
 /// (#934) Cross-setting coherence: a `DARKMUX_*` env var set in the shell wins
-/// LIVE over the matching `config.json` field (the `env > config > default`
-/// precedence), so a stale export silently shadows what the operator wrote in
-/// the file. The per-setting checks each report the *resolved* value, never the
-/// masking — so this is the rule that catches "config.json is being ignored."
-/// Both fix branches are offered because the precedence can't infer intent.
+/// LIVE over the matching `config.json` field, so a stale export can silently
+/// shadow what the operator configured. We flag ONLY the case with a clean
+/// "the operator intentionally configured this" signal — `DARKMUX_REDIS_URL`
+/// shadowing an **enabled** `config.redis` block (the #932 trap) — to avoid
+/// crying wolf on the common setup (see the rationale on the core below).
 fn check_env_masks_config() -> Check {
     env_masks_config_check(&darkmux_types::config::DarkmuxConfig::load_resolved())
 }
 
-/// Testable core: the env tier is read live (`set`), the config tier is the
-/// passed `cfg` — so a serial test drives it with `set_var` + a constructed cfg.
+/// Testable core: the env tier is read live, the config tier is the passed
+/// `cfg` — so a serial test drives it with `set_var` + a constructed cfg.
+///
+/// **Why only Redis** (and not machine_id / orchestrator / lmstudio_url /
+/// fleet.mode): a useful masking warning needs a signal that the operator
+/// *intentionally* configured the field, else it fires on every post-`init`
+/// machine (init writes a default for nearly every field, so "config has a
+/// value" is always true). `config.redis.enabled == Some(true)` is that signal —
+/// the operator turned the block ON — and it matches `redis_url()`'s Tier-2
+/// condition exactly (the default `init` config is `enabled:false` + a default
+/// host → assembles NO config Redis → not masked). The other fields lack such a
+/// signal: machine_id / orchestrator are env-PRIMARY by design (the docs
+/// recommend setting them via env — env-over-config is intended, not a trap),
+/// and lmstudio_url / fleet.mode would need default-comparison to tell an
+/// operator value from the init default (a later refinement).
 fn env_masks_config_check(cfg: &darkmux_types::config::DarkmuxConfig) -> Check {
     let name = "env vs config";
-    let set = |k: &str| {
-        std::env::var(k)
-            .ok()
-            .map(|s| s.trim().to_string())
-            .is_some_and(|s| !s.is_empty())
-    };
-    let mut masked: Vec<&str> = Vec::new();
-    // DARKMUX_REDIS_URL (full URL) shadows the entire config.redis block — the
-    // painful #932 case.
-    if set("DARKMUX_REDIS_URL")
-        && cfg
-            .redis
-            .as_ref()
-            .is_some_and(|r| r.enabled == Some(true) || r.host.is_some())
-    {
-        masked.push("DARKMUX_REDIS_URL shadows config.redis (the config Redis block is ignored)");
-    }
-    if set("DARKMUX_FLEET_MODE") && cfg.fleet.as_ref().and_then(|f| f.mode.as_ref()).is_some() {
-        masked.push("DARKMUX_FLEET_MODE shadows config.fleet.mode");
-    }
-    if set("DARKMUX_MACHINE_ID") && cfg.machine_id.is_some() {
-        masked.push("DARKMUX_MACHINE_ID shadows config.machine_id");
-    }
-    if set("DARKMUX_LMSTUDIO_URL") && cfg.lmstudio_url.is_some() {
-        masked.push("DARKMUX_LMSTUDIO_URL shadows config.lmstudio_url");
-    }
-    if set("DARKMUX_ORCHESTRATOR")
-        && cfg
-            .orchestrator
-            .as_deref()
-            .is_some_and(|s| !s.trim().is_empty())
-    {
-        masked.push("DARKMUX_ORCHESTRATOR shadows config.orchestrator");
-    }
-    if masked.is_empty() {
+    let env_set = std::env::var("DARKMUX_REDIS_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .is_some_and(|s| !s.is_empty());
+    let masked = env_set && cfg.redis.as_ref().is_some_and(|r| r.enabled == Some(true));
+    if !masked {
         Check {
             name: name.into(),
             status: Status::Pass,
-            message: "no env var is shadowing a config.json setting".into(),
+            message: "no env var is shadowing an enabled config.json block".into(),
             hint: None,
         }
     } else {
         Check {
             name: name.into(),
             status: Status::Warn,
-            message: format!(
-                "{} env override(s) shadow config.json (env wins live): {}",
-                masked.len(),
-                masked.join("; ")
-            ),
+            message: "DARKMUX_REDIS_URL shadows your enabled config.redis block (env wins live — the config Redis settings are silently ignored)".into(),
             hint: Some(
-                "The shell env tier wins over config.json at every access, so the config value is silently inert. Fix EITHER way (darkmux can't infer intent): unset the env var to use config.json, OR move the value into config.json (`darkmux config set <key> <value>`) and unset the env var so it's durable. `darkmux doctor -v` shows each resolved value.".into(),
+                "The shell DARKMUX_REDIS_URL wins over config.redis at every access, so your config Redis block is inert. Fix EITHER way (darkmux can't infer intent): unset DARKMUX_REDIS_URL to use config.redis, OR set config.redis.enabled=false and rely on the env URL. `darkmux doctor -v` shows the resolved Redis source.".into(),
             ),
         }
     }
@@ -3206,29 +3186,34 @@ mod tests {
     // ─── #934 doctor L1 ───────────────────────────────────────────────
     #[serial_test::serial]
     #[test]
-    fn env_masks_config_flags_only_when_both_set() {
-        use darkmux_types::config::{DarkmuxConfig, FleetConfig, RedisConfig};
-        // A config with redis.host + fleet.mode declared.
-        let cfg = DarkmuxConfig {
-            redis: Some(RedisConfig { host: Some("h".into()), ..Default::default() }),
-            fleet: Some(FleetConfig { mode: Some("hub".into()), ..Default::default() }),
+    fn env_masks_config_flags_redis_url_over_enabled_block() {
+        use darkmux_types::config::{DarkmuxConfig, RedisConfig};
+        unsafe { std::env::remove_var("DARKMUX_REDIS_URL") };
+        // An ENABLED config.redis block — the operator intentionally turned it on.
+        let enabled = DarkmuxConfig {
+            redis: Some(RedisConfig { enabled: Some(true), host: Some("h".into()), ..Default::default() }),
             ..Default::default()
         };
-        for k in ["DARKMUX_REDIS_URL", "DARKMUX_FLEET_MODE", "DARKMUX_MACHINE_ID"] {
-            unsafe { std::env::remove_var(k) };
-        }
-        // No env set → nothing masked, Pass.
-        assert_eq!(env_masks_config_check(&cfg).status, Status::Pass);
-        // A stale env that ALSO has a config value → Warn naming the masked field.
-        unsafe { std::env::set_var("DARKMUX_REDIS_URL", "redis://x:6379") };
-        let c = env_masks_config_check(&cfg);
+        // No env → nothing masked.
+        assert_eq!(env_masks_config_check(&enabled).status, Status::Pass);
+        // A stale DARKMUX_REDIS_URL over the enabled block → Warn naming config.redis.
+        unsafe { std::env::set_var("DARKMUX_REDIS_URL", "redis://other:6379") };
+        let c = env_masks_config_check(&enabled);
         assert_eq!(c.status, Status::Warn);
         assert!(c.message.contains("config.redis"), "{}", c.message);
-        // An env whose config side is UNSET does not flag (no masking).
+        // The DEFAULT init shape (enabled:false + a host) must NOT warn even with
+        // the env set — it assembles no config Redis, so nothing is masked. This
+        // pins the false-positive-on-fresh-install regression out.
+        let init_default = DarkmuxConfig {
+            redis: Some(RedisConfig { enabled: Some(false), host: Some("127.0.0.1".into()), ..Default::default() }),
+            ..Default::default()
+        };
+        assert_eq!(
+            env_masks_config_check(&init_default).status,
+            Status::Pass,
+            "default init config (enabled:false) is not masked"
+        );
         unsafe { std::env::remove_var("DARKMUX_REDIS_URL") };
-        unsafe { std::env::set_var("DARKMUX_MACHINE_ID", "studio") };
-        assert_eq!(env_masks_config_check(&cfg).status, Status::Pass, "machine_id unset in cfg → not masked");
-        unsafe { std::env::remove_var("DARKMUX_MACHINE_ID") };
     }
 
     #[test]
