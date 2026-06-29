@@ -681,7 +681,12 @@ recompute();
 const RECENT_CAP=20;
 let state={level:"fleet",machine:null,session:null,missionId:null,t:tMax,playing:false,timer:null,selected:null,follow:true,speed:1,recentAll:false,
   filters:{cat:new Set(FCATS),tier:new Set(FTIERS),src:new Set(FSRC),q:""},
-  rawOpen:false};
+  rawOpen:false,
+  // (#expand) Open-state of `<details data-expand="<key>">` blocks, keyed so it
+  // survives the ~1/sec live `$("stage").innerHTML=` rebuild (which otherwise
+  // collapses native <details> within a second or two). The toggle listener
+  // below maintains this; each tracked <details> renders `open` from it.
+  expanded:new Set()};
 
 const $=id=>document.getElementById(id);
 const visible=()=>DATA.filter(r=>T(r.ts)<=state.t);
@@ -1210,7 +1215,7 @@ function recentRow(n){
     toks!=null?kv('tokens',`${fmtN(toks)} total · ${fmtN(dp.prompt_tokens||0)} read · ${fmtN(dp.completion_tokens||0)} generated`):'',
     kv('timing',timing),
   ].filter(Boolean).join("");
-  return `<details class="rr"><summary><span class="pill ${n.pill}">${n.lbl}</span>`
+  return `<details class="rr" data-expand="recent:${esc(n.sid)}"${state.expanded.has("recent:"+n.sid)?" open":""}><summary><span class="pill ${n.pill}">${n.lbl}</span>`
     +`<span class="rrmain">${esc(n.handle)} · ${esc(n.model)}${miss}</span>`
     +`${metaBits?`<span class="rrmeta">${metaBits}</span>`:''}`
     +`<span class="rrtime">${when}${dur?' · '+dur:''}</span></summary>`
@@ -1495,10 +1500,10 @@ function renderSubsystem(){
   // emitted; `prompt_chars` is the full length, so a stored text shorter than
   // that reads "(truncated)". Falls back to the char-count row when only the
   // count is present (pre-#1127 records / openclaw runs that didn't emit text).
-  // Open state resets on the ~1/sec live rebuild (the prompt matters most on a
-  // finished run, which doesn't re-render) — an accepted v1 tradeoff.
+  // Open state survives the ~1/sec live rebuild via state.expanded (the
+  // data-expand="prompt:<sid>" key), so it no longer collapses mid-view (#1146).
   const promptBlock = sp.prompt
-    ? `<details class="rr promptdet"><summary>prompt · ${esc(sp.prompt_chars!=null?sp.prompt_chars:sp.prompt.length)} chars${(sp.prompt_chars!=null&&sp.prompt.length<sp.prompt_chars)?' · truncated':''}</summary><pre class="promptbody">${esc(sp.prompt)}</pre></details>`
+    ? `<details class="rr promptdet" data-expand="prompt:${esc(sid)}"${state.expanded.has("prompt:"+sid)?" open":""}><summary>prompt · ${esc(sp.prompt_chars!=null?sp.prompt_chars:sp.prompt.length)} chars${(sp.prompt_chars!=null&&sp.prompt.length<sp.prompt_chars)?' · truncated':''}</summary><pre class="promptbody">${esc(sp.prompt)}</pre></details>`
     : (sp.prompt_chars!=null?`<div class="kv"><b>prompt</b><span>${esc(sp.prompt_chars)} chars</span></div>`:'');
   const brief=(briefRows||promptBlock)?`<div class="track"><div class="lbl">run</div><div class="rrdetail">${briefRows}${promptBlock}</div></div>`:'';
   // (#1125) The ctx tile is done-aware, mirroring the wall clock (line ~1408).
@@ -2086,11 +2091,18 @@ new MutationObserver(muts=>{
   for(const mu of muts)for(const n of mu.addedNodes)if(n.nodeType===1)enrichActionable(n);
 }).observe(document.body,{childList:true,subtree:true});
 enrichActionable(document.body); // initial pass for anything already in the DOM
-// `toggle` doesn't bubble — a capture-phase listener stands in for the old
-// inline ontoggle on the raw-JSON <details> (tagged data-raw; the recent-runs
-// <details class="rr"> rows don't carry it and are untracked by design).
+// `toggle` doesn't bubble — a capture-phase listener stands in for an inline
+// ontoggle. The raw-JSON <details> tracks via state.rawOpen; every other
+// stateful <details> carries `data-expand="<key>"` and is tracked in
+// state.expanded, so its open state survives the ~1/sec stage rebuild.
 document.addEventListener("toggle",e=>{
-  if(e.target&&e.target.matches&&e.target.matches("details[data-raw]"))state.rawOpen=e.target.open;
+  const t=e.target;
+  if(!t||!t.matches)return;
+  if(t.matches("details[data-raw]"))state.rawOpen=t.open;
+  else if(t.matches("details[data-expand]")){
+    const k=t.dataset.expand;
+    if(t.open)state.expanded.add(k); else state.expanded.delete(k);
+  }
 },true);
 // (#691) Playback catalog day-picker. Toggling fetches /flow-days (the
 // disk-backed catalog — every day with a flow file, summarized) and renders a
