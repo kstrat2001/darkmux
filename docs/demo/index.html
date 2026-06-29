@@ -1500,8 +1500,8 @@ function renderSubsystem(){
   // emitted; `prompt_chars` is the full length, so a stored text shorter than
   // that reads "(truncated)". Falls back to the char-count row when only the
   // count is present (pre-#1127 records / openclaw runs that didn't emit text).
-  // Open state resets on the ~1/sec live rebuild (the prompt matters most on a
-  // finished run, which doesn't re-render) — an accepted v1 tradeoff.
+  // Open state survives the ~1/sec live rebuild via state.expanded (the
+  // data-expand="prompt:<sid>" key), so it no longer collapses mid-view (#1146).
   const promptBlock = sp.prompt
     ? `<details class="rr promptdet" data-expand="prompt:${esc(sid)}"${state.expanded.has("prompt:"+sid)?" open":""}><summary>prompt · ${esc(sp.prompt_chars!=null?sp.prompt_chars:sp.prompt.length)} chars${(sp.prompt_chars!=null&&sp.prompt.length<sp.prompt_chars)?' · truncated':''}</summary><pre class="promptbody">${esc(sp.prompt)}</pre></details>`
     : (sp.prompt_chars!=null?`<div class="kv"><b>prompt</b><span>${esc(sp.prompt_chars)} chars</span></div>`:'');
