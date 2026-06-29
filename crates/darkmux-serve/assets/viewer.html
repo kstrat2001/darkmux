@@ -1483,7 +1483,16 @@ function runRegions(){
   const sv=statusVisual({open:!done, errored:!!c&&dispatchErrored(c), killed:!!c&&dispatchKilled(c), clean:done&&!!c&&!dispatchErrored(c)});
   const sp=(d&&d.payload)||{}, dp=(c&&c.payload)||{};
   const model=d&&d.model?d.model:(distinct[0]||null);
-  const tokIn=dp.prompt_tokens, tokOut=dp.completion_tokens;
+  // (#1151) tokens in/out accumulate LIVE from the per-turn telemetry.tokens
+  // records (source="tokens"), whose running sum equals the terminal
+  // dispatch.complete totals EXACTLY (verified) — so the tiles grow turn-by-turn
+  // during a live run instead of reading "—" until the terminal lands, and they
+  // stay scrubber-consistent in playback (tel is visible()-bounded, like ctx).
+  // Fall back to the terminal cumulative payload for any path that emits only the
+  // terminal token counts (e.g. openclaw) with no per-turn telemetry.
+  const toks=tel.filter(r=>r.source==="tokens");
+  const tokIn=toks.length?toks.reduce((a,r)=>a+(r.fields.prompt_tokens||0),0):(dp.prompt_tokens!=null?dp.prompt_tokens:null);
+  const tokOut=toks.length?toks.reduce((a,r)=>a+(r.fields.completion_tokens||0),0):(dp.completion_tokens!=null?dp.completion_tokens:null);
   const kv=(k,v)=>v!=null&&v!==''?`<div class="kv"><b>${k}</b><span>${v}</span></div>`:'';
   const briefTiming=`${clk(startTs)}${done?' → '+clk(T(close.ts))+' ('+fmt(T(close.ts)-startTs)+')':' · running'}`;
   const briefRows=[
@@ -2508,9 +2517,38 @@ async function pollMachineSpecs(){
     applyLive();
   }catch(_){/* best-effort */}
 }
+// (#1151) SSE safety-net. The live tail (/flow/:date/stream) is tail-from-now:
+// on a Redis hiccup it can hit MAX_CONSECUTIVE_XREAD_FAILURES, close the stream,
+// and the browser EventSource reconnects with a FRESH watermark — silently
+// dropping any record XADD'd during the reconnect gap (e.g. a new run's
+// dispatch.start, so the run never surfaces until the operator manually
+// refreshes). This periodic reconcile re-pulls the bounded live window and
+// MERGES anything the tail missed, deduped through SEEN_KEYS exactly like the
+// SSE append — so a missed run self-heals on the next tick instead of needing a
+// refresh. SSE stays the low-latency path; this is the backstop. Live only
+// (started from startLivePoll, which playback/demo never call).
+async function reconcileLiveWindow(){
+  const today=LIVE_ES_DATE||todayUTC();
+  const cut=Date.now()-LIVE_WINDOW_MS;
+  let added=0;
+  for(const d of [prevDateUTC(today),today]){
+    let res; try{res=await fetch("/flow/"+d,{headers:{accept:"application/json"}});}catch(_){continue;}
+    if(!res.ok)continue;
+    let body; try{body=await res.json();}catch(_){continue;}
+    const recs=Array.isArray(body)?body:(body.records||body.flow||[]);
+    for(const r of recs){
+      if(!r||!r.ts||T(r.ts)<cut)continue;
+      const k=recKey(r);
+      if(SEEN_KEYS.has(k))continue;
+      SEEN_KEYS.add(k); r._uid=nextRecordUid++; RAW.push(r); added++;
+    }
+  }
+  if(added)applyLive();   // re-renders only if the merged records changed the stage signature
+}
 function startLivePoll(){
   if(LIVE_SESS_TIMER)return;
   pollLiveSessions(); pollLiveMachines(); pollMachineSpecs();
+  let tick=0;
   LIVE_SESS_TIMER=setInterval(async()=>{
     // UTC date-rollover detection: if we're in live mode and the day
     // changed since the SSE stream was opened, close it, reload the
@@ -2524,6 +2562,10 @@ function startLivePoll(){
       recompute(); render();
     }
     pollLiveSessions();pollLiveMachines();pollMachineSpecs();
+    // (#1151) Backstop the SSE every ~20s (every 4th 5s tick). Presence polling
+    // above already gives a 5s "something's live" signal; this catches the run
+    // DATA up if the tail dropped records in a reconnect gap.
+    if((++tick%4)===0)reconcileLiveWindow();
   },5000);
   window.addEventListener("beforeunload",()=>{if(LIVE_SESS_TIMER)clearInterval(LIVE_SESS_TIMER);});
 }
