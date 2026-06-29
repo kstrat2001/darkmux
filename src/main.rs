@@ -35,6 +35,7 @@ mod init;
 // crate::{lab,workloads,providers}::* resolving for main + notebook.
 pub use darkmux_lab::lab;
 mod migrate;
+mod config_cmd;
 mod conventions;
 mod mission_propose;
 mod mission_status;
@@ -274,6 +275,13 @@ enum Cmd {
     Flow {
         #[command(subcommand)]
         sub: flow_cli::FlowCmd,
+    },
+    /// Read/write `~/.darkmux/config.json` settings (#937). `set` validates the
+    /// key + coerces the value; secrets stay in the Keychain. Distinct from
+    /// `profile` (the swap-profiles registry).
+    Config {
+        #[command(subcommand)]
+        sub: config_cmd::ConfigCmd,
     },
     /// Start an HTTP daemon for flow record retrieval.
     Serve {
@@ -1428,6 +1436,10 @@ fn run(cmd: Cmd) -> Result<i32> {
         Cmd::Recommendations { sub } => cmd_recommendations(sub),
         Cmd::Flow { sub } => {
             flow_cli::run(sub)?;
+            Ok(0)
+        }
+        Cmd::Config { sub } => {
+            config_cmd::run(sub)?;
             Ok(0)
         }
         Cmd::Init {
