@@ -1415,7 +1415,11 @@ function drillLoose(m){
   state.level="loose"; state.machine=m; state.session=null;
   render();
 }
-function renderSubsystem(){
+// (#1148) Run-view data + region HTML, shared by renderSubsystem (the
+// structural render) and refreshSubsystem (the per-tick volatile update), so a
+// metric tick updates only the volatile regions and never rebuilds the stable
+// header/brief — the prompt's scroll + open state survives the ~1/sec cadence.
+function runRegions(){
   const sid=state.session, m=state.machine; $("logscope").textContent=sid;
   // (#1013) A sprint re-run REUSES the deterministic session id
   // (mission-run-<mission>-<sprint>), so DATA for `sid` can hold MULTIPLE
@@ -1539,24 +1543,43 @@ function renderSubsystem(){
   const detections=finds.length
     ? `<div class="track"><div class="lbl">detections (${finds.length})</div>`+finds.map(f=>`<div class="finding ${esc(f.s)}"><span class="fk">⚠ ${esc(f.k)}</span><span class="fm">${esc(f.d)}</span>${f.f?`<span class="ff">fix: ${esc(f.f)}</span>`:""}</div>`).join("")+`</div>`
     : `<div class="track"><div class="lbl">detections</div><div class="finding ok"><span class="fk">✓ clean</span><span class="fm">no behavioral flags (cycle, tool-failure, reasoning-loop, edit-drift)</span></div></div>`;
-  // (#756 flicker fix) The diff lives in a stable mount painted independently
-  // of this full-stage rebuild. A live run re-renders the subsystem ~once per
-  // turn (metrics change), and inlining the diff here destroyed + recreated
-  // its DOM every time — the flash + scroll-reset the operator saw. Capture
-  // the current diff scroll before the wipe, mount an empty #difftrack, then
-  // repaint it from cache synchronously (pre-paint, so no flicker) with scroll
-  // restored. paintDiff is also the poll's repaint target, so a content change
-  // touches only the diff, never the whole stage.
+  return {m, sid, brief, met, cpu, ctxChart, detections,
+    header:`<h2><span class="pill ${sv.cls}" style="margin-top:0;vertical-align:middle">${sv.lbl}</span> run · ${esc(role)} <span style="color:var(--muted);text-transform:none;font-weight:400">(${esc(sid)} on <a data-act="machine" data-arg="${esc(m)}">${escN(m)}</a>)</span></h2>`,
+    modelTrack:`<div class="track"><div class="lbl">model (lms)</div>${segs||'<span class="hint">no telemetry yet</span>'}</div>`};
+}
+
+// (#1148) Structural render of the run view: the STABLE shell (header + brief,
+// which holds the prompt) + stable-id mounts for the volatile regions. Called
+// only when the stage signature changes (entering the view, a new attempt, the
+// run completing). refreshSubsystem updates the volatile regions in place on
+// every other live tick, so the prompt's scroll + open survive.
+function renderSubsystem(){
+  const r=runRegions();
+  // (#756) Capture the diff scroll before the full-stage wipe; paintDiff
+  // restores it into the stable #difftrack mount.
   const _dw=document.querySelector('.diffwrap'); if(_dw)DIFF._scroll=_dw.scrollTop;
-  $("stage").innerHTML=`<div class="sub"><h2><span class="pill ${sv.cls}" style="margin-top:0;vertical-align:middle">${sv.lbl}</span> run · ${esc(role)} <span style="color:var(--muted);text-transform:none;font-weight:400">(${esc(sid)} on <a data-act="machine" data-arg="${esc(m)}">${escN(m)}</a>)</span></h2>
-    ${brief}
-    ${met}
-    <div class="track"><div class="lbl">model (lms)</div>${segs||'<span class="hint">no telemetry yet</span>'}</div>
-    ${cpu}
-    ${ctxChart}
-    ${detections}
+  $("stage").innerHTML=`<div class="sub">${r.header}
+    ${r.brief}
+    <div id="sub-met">${r.met}</div>
+    <div id="sub-model">${r.modelTrack}</div>
+    <div id="sub-cpu">${r.cpu}</div>
+    <div id="sub-ctx">${r.ctxChart}</div>
+    <div id="sub-det">${r.detections}</div>
     <div id="difftrack"></div></div>`;
-  paintDiff(sid);
+  paintDiff(r.sid);
+}
+
+// (#1148) Per-tick volatile refresh: update only the metric / model / cpu / ctx
+// / detection regions IN PLACE. The header + brief (and the prompt's scroll +
+// open inside it) are never touched — killing the ~1/sec state loss as a class
+// and giving each volatile value a stable DOM node to animate later. The diff
+// is repainted into its own stable #difftrack mount.
+function refreshSubsystem(){
+  const r=runRegions();
+  const set=(id,html)=>{const e=$(id); if(e&&e.innerHTML!==html)e.innerHTML=html;};
+  set("sub-met",r.met); set("sub-model",r.modelTrack); set("sub-cpu",r.cpu);
+  set("sub-ctx",r.ctxChart); set("sub-det",r.detections);
+  paintDiff(r.sid);
 }
 // (#756) Live-diff panel for the session view — the agent's code changes
 // forming in real time. Renders only in live mode (the static demo and
@@ -2328,7 +2351,17 @@ function stageSig(){
   const ms=MACHINE_SPECS?((um?(um.loaded?'1':'0')+':'+um.id:'null'))+'|'+(MACHINE_SPECS.cpu_brand?'s':''):'na';
   if(state.level==="fleet")return "f|"+machines().join(",")+"|"+dis+"|"+ls+"|"+ps+"|"+ms;
   if(state.level==="machine")return "m|"+state.machine+"|"+sessionsOn(state.machine).join(",")+"|"+dis+"|"+ls+"|"+ps+"|"+ms;
-  if(state.level==="subsystem"||state.level==="loose")return null;  // (#691) live log/metrics views: full-render each tick
+  // (#1148) The run view gets a STRUCTURAL signature (machine + session + count
+  // of this session's lifecycle records — start/complete/error/end). It changes
+  // only on entering the view, a new attempt, or the run completing — NOT on a
+  // metric tick. So a tick refreshes the volatile regions in place
+  // (refreshSubsystem) instead of a full rebuild that would reset the prompt's
+  // scroll/open. `loose` (the unscoped records list) stays full-render.
+  if(state.level==="subsystem"){
+    const sd=visible().filter(r=>r.session_id===state.session&&(r.action==="dispatch.start"||r.action==="dispatch.complete"||r.action==="dispatch.error"||r.action==="session.end")).length;
+    return "s|"+state.machine+"|"+state.session+"|"+sd;
+  }
+  if(state.level==="loose")return null;  // (#691) live records list: full-render each tick
   return "mission";
 }
 // (#691) Fetch yesterday + today's flow records and keep only the last
@@ -2367,7 +2400,11 @@ function applyLive(){
   if(state.follow)state.t=tMax;
   const sig=stageSig();
   if(sig===null||sig!==lastStageSig){ lastStageSig=sig; render(); return; }
-  // Cards unchanged — refresh only the live readouts (selected event, log, meta, transport).
+  // Stage structure unchanged — don't rebuild it. (#1148) For the run view,
+  // update only the volatile metric/chart/detection regions IN PLACE so the
+  // header + brief (and the prompt's scroll/open) survive. Then refresh the
+  // side readouts (selected event, log, meta, transport).
+  if(state.level==="subsystem")refreshSubsystem();
   if(state.follow){ const n=newest(scopedFiltered()); state.selected=n?n._id:null; }
   renderDetail();renderLog();renderMeta();syncTransport();
 }
