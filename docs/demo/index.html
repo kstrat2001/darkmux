@@ -35,7 +35,9 @@
   .top{height:46px;display:flex;align-items:center;gap:14px;padding:0 16px;border-bottom:1px solid var(--line);background:var(--bg2)}
   .brand{font-weight:700;letter-spacing:.04em}.brand b{color:var(--amber)}.brand a{color:inherit;text-decoration:none}.brand a:hover b{text-decoration:underline}
   /* (#1129) Build identifier — version (+ git SHA) and flow-schema the daemon injects; empty on the static demo. */
+  /* (#1132) When populated (daemon-served) it's the trigger for the about modal. */
   .ver{font:11px/1 'JetBrains Mono',monospace;color:var(--muted);letter-spacing:.02em}
+  .ver[data-act]{cursor:pointer}.ver[data-act]:hover{color:var(--text)}
   .topnav{margin-left:auto;display:flex;gap:18px;align-items:center}
   .topnav a{color:var(--muted);text-decoration:none;font:600 12px 'JetBrains Mono',monospace;letter-spacing:.04em}
   .topnav a:hover{color:var(--amber)}
@@ -551,6 +553,14 @@
     <div id="notesbody"></div>
   </div>
 </div>
+<!-- (#1132) About modal — build/status snapshot. Body-level sibling of #stage so
+     the ~1/sec live rebuild never touches it (same guarantee as the modals above). -->
+<div class="modalbg" id="imodalbg">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="ihdr">
+    <div class="mhd"><span id="ihdr">about · darkmux</span><button class="mx" data-act="closeinfo" aria-label="close">✕</button></div>
+    <div class="rrdetail" id="infobody"></div>
+  </div>
+</div>
 
 <script>
 // Live viewer — no embedded sample data.
@@ -574,6 +584,9 @@ let DATA = [];
 let MISSIONS = [];
 let SPRINTS = [];
 let DATA_SOURCE = "no records yet";
+// (#1132) Last mode/date seen by setBadges — the about modal reads these for
+// its mode row (they're otherwise function-locals in boot/setBadges).
+let STATUS = {mode:null, date:null};
 let nextRecordUid = 1;
 const runtimeUids = new Map();
 function getRuntimeUid(sid) {
@@ -1030,6 +1043,39 @@ function openNotes(){
   $("notesbody").innerHTML=rows;$("nmodalbg").style.display="flex";
 }
 function closeNotes(){$("nmodalbg").style.display="none";}
+// (#1132) About modal — build + status snapshot. Rendered once on open (a
+// point-in-time snapshot, like the notes/filter modals); it lives at body
+// level so the ~1/sec live rebuild can't reset it. Values are darkmux-owned
+// (injected metas, MACHINE_SPECS, DATA_SOURCE) but esc()'d anyway.
+function openInfo(){
+  const kv=(k,v)=>v!=null&&v!==''?`<div class="kv"><b>${k}</b><span>${esc(v)}</span></div>`:'';
+  const ver=injectedMeta("darkmux-version"), sch=injectedMeta("darkmux-flow-schema");
+  const live=document.body.classList.contains("live-mode");
+  // machine + hardware are local-daemon, live-only (MACHINE_SPECS is null in
+  // playback/demo and until the first /machine/specs poll) — omit when absent.
+  const machine=(live&&MACHINE_SPECS&&MACHINE_SPECS.machine_id)?MACHINE_SPECS.machine_id:'';
+  const hw=(live&&MACHINE_SPECS&&MACHINE_SPECS.cpu_brand)
+    ? MACHINE_SPECS.cpu_brand+(MACHINE_SPECS.ram_total_bytes?` · ${Math.round(MACHINE_SPECS.ram_total_bytes/1073741824)} GB`:'')
+    : '';
+  const modeLbl=STATUS.mode==="live"?"live":STATUS.mode==="play"?("playback · "+(STATUS.date||"")):(STATUS.mode||'');
+  const rows=[
+    kv('build', ver),
+    kv('flow schema', sch),
+    kv('connection', DATA_SOURCE),
+    kv('mode', modeLbl),
+    kv('machine', machine),
+    kv('hardware', hw),
+  ].filter(Boolean).join('');
+  const links=`<div class="kv"><b>links</b><span>`
+    +`<a href="https://github.com/kstrat2001/darkmux" target="_blank" rel="noopener">github</a> · `
+    +`<a href="https://darkmux.com/guide/" target="_blank" rel="noopener">guide</a> · `
+    +`<a href="https://darklyenergized.substack.com" target="_blank" rel="noopener">articles</a> · `
+    +`<a href="https://darkmux.com/" target="_blank" rel="noopener">home</a></span></div>`;
+  $("infobody").innerHTML=rows+`<div style="border-top:1px solid var(--line);margin:10px 0"></div>`+links;
+  $("imodalbg").style.display="flex";
+  const x=$("imodalbg").querySelector(".mx"); if(x)x.focus();
+}
+function closeInfo(){const m=$("imodalbg"); if(m&&m.style.display!=="none"){m.style.display="none"; const vb=$("verbadge"); if(vb)vb.focus();}}
 function savingsHero(){
   const t=tokensOffMeter();
   // Always render — even at zero (playback start, or a fresh fleet with no
@@ -1946,6 +1992,7 @@ $("logq").oninput=e=>setQuery(e.target.value);
 $("sclear").onclick=()=>{setQuery("");const lq=$("logq");if(lq)lq.focus();};
 $("modalbg").onclick=e=>{if(e.target===$("modalbg"))closeFilters();};
 $("nmodalbg").onclick=e=>{if(e.target===$("nmodalbg"))closeNotes();};
+$("imodalbg").onclick=e=>{if(e.target===$("imodalbg"))closeInfo();}; // (#1132) click-outside
 // ── Delegated event handling (viewer output-encoding hardening) ────────────
 // Rendered templates carry NO inline event-handler attributes: record-derived
 // values ride in data-* attributes and come back as plain strings via
@@ -1969,6 +2016,8 @@ const ACTIONS={
   clearfilters:()=>clearFilters(),
   notes:()=>openNotes(),
   closenotes:()=>closeNotes(),
+  info:()=>openInfo(),
+  closeinfo:()=>closeInfo(),
   catalog:()=>toggleCatalog(),
   goday:d=>{ location.href="/play/"+encodeURIComponent(d); },
   golive:()=>{ location.href="/"; },
@@ -1996,7 +2045,7 @@ document.addEventListener("click",e=>{
 // keep their own key handling, so no double-dispatch. Space is prevent-defaulted
 // only when it lands on a card (else the page would scroll), never elsewhere.
 document.addEventListener("keydown",e=>{
-  if(e.key==="Escape"){const p=$("catpanel"); if(p) p.hidden=true; return;}
+  if(e.key==="Escape"){closeInfo(); const p=$("catpanel"); if(p) p.hidden=true; return;} // (#1132) Escape closes the about modal (no-op if hidden)
   if(e.key!=="Enter"&&e.key!==" "&&e.key!=="Spacebar")return;
   const el=e.target.closest("[data-act]");
   if(!el||el.matches("button,a[href],input,textarea,select"))return;
@@ -2209,6 +2258,7 @@ function absorbNewFilterValues(){
 }
 
 function setBadges(mode,date){
+  STATUS.mode=mode; STATUS.date=date; // (#1132) snapshot for the about modal's mode row
   const dl = date===todayUTC() ? "today" : date;
   // Live viewer never enters "sample" mode — the fallback is "no daemon" or
   // "no records yet", both honest empty states. (Demo "sample data" badge is
@@ -2437,8 +2487,11 @@ async function boot(){
   // the static demo has neither, so the chip stays empty (no daemon to name).
   const verMeta=injectedMeta("darkmux-version"), schemaMeta=injectedMeta("darkmux-flow-schema");
   {const vb=$("verbadge"); if(vb&&verMeta){
-    vb.textContent="v"+verMeta+(schemaMeta?" · schema "+schemaMeta:"");
-    vb.title="darkmux "+verMeta+(schemaMeta?" · flow schema "+schemaMeta:"");
+    // (#1132) Populated chip = the about-modal trigger (ⓘ). Wire the data-act
+    // + a11y here (not in static HTML) so the empty no-daemon chip is inert.
+    vb.textContent="v"+verMeta+(schemaMeta?" · schema "+schemaMeta:"")+"  ⓘ";
+    vb.title="darkmux "+verMeta+(schemaMeta?" · flow schema "+schemaMeta:"")+" — about";
+    vb.dataset.act="info"; vb.setAttribute("role","button"); vb.tabIndex=0; vb.setAttribute("aria-haspopup","dialog");
   }}
   // Static-playback source (darkmux.com/demo): a committed .jsonl loaded
   // directly — exactly the on-disk flow file the daemon would read for
