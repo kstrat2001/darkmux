@@ -177,6 +177,11 @@ enum Cmd {
         /// owns its own config".
         #[arg(long)]
         include_openclaw: bool,
+        /// (#1130) Print every check. Default output is issues-only — the
+        /// build identity line + any warnings/failures, with the passing
+        /// checks collapsed to a count. Use `-v` to see the full list.
+        #[arg(long, short = 'v')]
+        verbose: bool,
     },
     /// Scan the LMStudio model catalog for downloaded models that aren't yet
     /// covered by any profile. For each uncovered model, suggests a task class
@@ -1409,7 +1414,7 @@ fn run(cmd: Cmd) -> Result<i32> {
         Cmd::Lab { sub } => cmd_lab(sub),
         Cmd::Skills { sub } => cmd_skills(sub),
         Cmd::Notebook { sub } => cmd_notebook(sub),
-        Cmd::Doctor { fix, include_openclaw } => cmd_doctor(fix, include_openclaw),
+        Cmd::Doctor { fix, include_openclaw, verbose } => cmd_doctor(fix, include_openclaw, verbose),
         Cmd::Scan { profiles } => cmd_scan(profiles.as_deref()),
         Cmd::Profile { sub } => cmd_profile(sub),
         Cmd::Model { sub } => cmd_model(sub),
@@ -1745,9 +1750,9 @@ fn cmd_notebook(sub: NotebookCmd) -> Result<i32> {
     }
 }
 
-fn cmd_doctor(fix: bool, include_openclaw: bool) -> Result<i32> {
+fn cmd_doctor(fix: bool, include_openclaw: bool, verbose: bool) -> Result<i32> {
     let report = doctor::run(include_openclaw);
-    doctor::print_report(&report)?;
+    doctor::print_report(&report, verbose)?;
 
     // --fix path: attempt known-safe auto-fixes for failing/warning rules,
     // then re-run the full check set so the operator sees the post-fix
@@ -1769,7 +1774,7 @@ fn cmd_doctor(fix: bool, include_openclaw: bool) -> Result<i32> {
             println!("Re-running doctor…");
             println!();
             let report2 = doctor::run(include_openclaw);
-            doctor::print_report(&report2)?;
+            doctor::print_report(&report2, verbose)?;
             report2
         }
     } else {
