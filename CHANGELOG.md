@@ -11,6 +11,55 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 
 ## [Unreleased]
 
+## [1.13.0] - 2026-06-30
+
+The fleet-foundation + self-diagnosing-doctor release: declare a machine's fleet
+position, set config without hand-editing JSON, and let `darkmux doctor` catch
+the cross-setting traps + tell you where to open the viewer — plus a live-view
+UX pass. **No `FLOW_SCHEMA` change** (stays `1.14.0`), so cross-machine flow
+stays compatible with a v1.12.0 peer/hub. **`CONFIG_SCHEMA` 1.0 → 1.1** (additive
+`fleet{}` block; lenient-read, so an older binary tolerates a newer config).
+
+### Added
+- **`fleet.mode` — hub | peer | standalone (#933).** A machine's declared place
+  in a multi-node fleet, a `fleet{}` block in `config.json`. The operator
+  declares it; `darkmux doctor` shows it with provenance. Downstream fleet
+  tooling keys on it.
+- **`darkmux config set/get/list` (#937).** Read/write `config.json` from the CLI
+  (`darkmux config set redis.host <addr>`, `… fleet.mode peer`) — the key is
+  validated against a registry (a typo is surfaced with a suggestion, never
+  silently written) and the value coerced to the field's type. Secrets are
+  refused with a pointer to the Keychain `security` form.
+- **`darkmux doctor` L1 — cross-setting coherence + a verdict banner (#934).**
+  New rules catch traps no single check sees: a stale `DARKMUX_*` env var
+  shadowing an enabled `config.json` block, and a brew/cargo binary split-brain
+  (a daemon serving an older schema than the CLI). Doctor now leads with an
+  `● ok / needs attention / broken` verdict naming the highest-severity finding,
+  not a flat list.
+- **Doctor surfaces the viewer URL (#1155).** The `daemon reachable` line shows
+  where to open the viewer — the loopback URL plus, when `tailscale serve` is
+  proxying to the daemon, the tailnet/phone URL.
+- **Live token tiles + activity-timeline presets (#1151).** The run view's
+  tokens-in/out accumulate live (per-turn telemetry) instead of dashing until the
+  run ends; the fleet activity timeline gains `10m/1h/4h/24h` presets with a
+  now-anchored axis.
+
+### Fixed
+- **New runs surface without a manual refresh (#1151).** An SSE backstop re-pulls
+  the bounded live window so a run dropped during a Redis reconnect-gap
+  self-heals, instead of needing a page refresh.
+- **Viewer state survives the live rebuild (#1147 / #1149).** Expanded
+  `<details>` no longer snap shut, and the run view's scroll + open state
+  survives the ~1/sec live update (render-once + targeted-update).
+- **Mobile viewer layout (#1151).** Shortened savings-hero labels, left-aligned
+  the breakdown when it wraps, and packed the LIVE badge onto the brand row so
+  both machine timelines fit on a phone.
+
+### Changed
+- **darkmux self-review profile default → `diff-review` (#1150).** The
+  `darkmux-review.yml` workflow now dispatches with the `diff-review` profile by
+  default (was `review`).
+
 ## [1.12.0] - 2026-06-29
 
 A build-visibility + run-observability release, plus the production-hardening
@@ -661,6 +710,7 @@ cluster of crew-index correctness repairs.
   idle machine's bar no longer stretches to the playhead; adds the first
   viewer-lifecycle e2e regression gate.
 
+[1.13.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.13.0
 [1.12.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.12.0
 [1.11.2]: https://github.com/kstrat2001/darkmux/releases/tag/v1.11.2
 [1.11.1]: https://github.com/kstrat2001/darkmux/releases/tag/v1.11.1
