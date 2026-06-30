@@ -5,7 +5,7 @@
 #
 # Operator-facing install path:
 #   brew tap kstrat2001/darkmux
-#   brew install darkmux                # stable release (v1.12.0)
+#   brew install darkmux                # stable release (v1.13.0)
 #   brew install --HEAD darkmux         # build from main instead
 #
 # For local development / smoke testing:
@@ -17,16 +17,16 @@
 class Darkmux < Formula
   desc "Profile multiplexer + lab for local LLM stacks (LMStudio, Ollama)"
   homepage "https://darkmux.com"
-  # Stable release: v1.12.0 (build-visibility + run-observability + production
-  # hardening — build version in --version/doctor/viewer with a Homebrew
-  # `(release)` tag, run-page clarity + prompt/image/tokens, doctor issues-only,
-  # the runtime recovers from empty tool_calls, and crew-dispatch now loads the
-  # model at the profile's n_ctx — #1129/#1125/#1130/#1135/#1123/#1042).
+  # Stable release: v1.13.0 (fleet foundation + self-diagnosing doctor —
+  # fleet.mode hub/peer/standalone, `darkmux config set/get/list`, doctor L1
+  # cross-setting coherence + a verdict banner + viewer-URL surfacing, and a
+  # live-view UX pass — #933/#937/#934/#1155/#1151. CONFIG_SCHEMA 1.0→1.1,
+  # FLOW_SCHEMA unchanged 1.14.0 — cross-machine compatible with a v1.12.0 peer).
   # `brew install darkmux` builds from this source tarball; `brew install
   # --HEAD darkmux` builds from main instead. The sha256 is of the
   # GitHub-generated source tarball for the tag (`shasum -a 256`).
-  url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v1.12.0.tar.gz"
-  sha256 "b530dda906253ba90c4732c371fa1ad6fa7df604045fb4d0cfbc2cf78a18a02d"
+  url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v1.13.0.tar.gz"
+  sha256 "f9d3e6bbb323c6d73349075dc2f2bb0d4246413c7f322f2a20d6c02de2741834"
   license "MIT"
   head "https://github.com/kstrat2001/darkmux.git", branch: "main"
 
