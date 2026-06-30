@@ -79,7 +79,7 @@ The observability viewer is hosted by `darkmux serve` itself, not by the public 
 | `http://localhost:8765/` | Your own daemon, live | Single-machine fleet, or local-only ops view on a multi-machine fleet |
 | `https://<hub>.<your-tailnet>.ts.net/` | Hub's daemon via Tailscale Serve | Multi-machine fleet: load the hub's fleet view from any peer on your tailnet |
 
-The third one is opt-in (the daemon binds localhost by default for safety). To expose it across your tailnet, see the [always-on hub guide → upgrading to substrate + viewer](https://darkmux.com/guide/always-on-hub.html#upgrade-viewer). Tailscale Serve is the recommended path (HTTPS termination at the tailnet node, daemon stays bound to localhost). Raw `--bind 0.0.0.0` on the tailnet IP is the lower-overhead alternative if you don't have Tailscale.
+The third one is opt-in (the daemon binds localhost by default for safety). To expose it across your tailnet, see the [secure hub guide → the cross-tailnet viewer](https://darkmux.com/guide/always-on-hub.html#viewer). Tailscale Serve is the recommended path: it terminates HTTPS at the tailnet node and proxies to the daemon, which stays bound to localhost (so darkmux's remote-auth gate doesn't block a browser page-load). Never bind the daemon to `0.0.0.0`: keep it on loopback and let the tailnet do the reaching.
 
 ## Quick start
 

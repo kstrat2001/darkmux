@@ -36,9 +36,9 @@
     <h2>Before you start: about consistency</h2>
     <div class="callout warn">
       <strong>Results will vary based on your frontier configuration.</strong>
-      <p style="margin: 8px 0 0;">The frontier model you use as the orchestrator (Claude Code is the proven path today; other frontiers tracked in <a href="https://github.com/kstrat2001/darkmux/issues/179">#179</a>) needs proper guidance to make the most out of darkmux. This guide is a starting reference, not doctrine to enforce. Contradictory statements between this guide, your project's <code>CLAUDE.md</code>, and other frontier configs will cause more harm than good. Configure to your own strategy and goals; treat what's below as inspiration, not commandments.</p>
+      <p style="margin: 8px 0 0;">The frontier model you use as the orchestrator (Claude Code is the proven path; other frontiers can drive it with their own guidance) needs proper guidance to make the most out of darkmux. This guide is a starting reference, not doctrine to enforce. Contradictory statements between this guide, your project's <code>CLAUDE.md</code>, and other frontier configs will cause more harm than good. Configure to your own strategy and goals; treat what's below as inspiration, not commandments.</p>
     </div>
-    <p>darkmux deliberately leaves the operator in control of how their environment is shaped. The same command (<code>darkmux crew dispatch</code>, say) can feel different from one machine to another because the <em>frontier</em> driving it reads different doctrine. That's by design; see the <a href="https://github.com/kstrat2001/darkmux/issues/112">operator-sovereignty thread</a> for the architectural reasoning. The trade-off: don't expect identical experiences across operators. Expect <em>consistent foundations</em> (the CLI, the records, the viewer) and operator-shaped behavior on top.</p>
+    <p>darkmux deliberately leaves the operator in control of how their environment is shaped. The same command (<code>darkmux crew dispatch</code>, say) can feel different from one machine to another because the <em>frontier</em> driving it reads different doctrine. That's by design. The trade-off: don't expect identical experiences across operators. Expect <em>consistent foundations</em> (the CLI, the records, the viewer) and operator-shaped behavior on top.</p>
   </div>
 </section>
 
@@ -66,19 +66,19 @@
         <div class="title">Missions, sprints, crew dispatch</div>
         <div class="desc">Structured agentic work: dispatch local-AI roles, track multi-step plans as missions and sprints.</div>
       </a>
-      <a href="fleet.html">
-        <span class="label">05 · Multi-machine</span>
-        <div class="title">Many machines become one</div>
-        <div class="desc">Set up a fleet across a few Macs on a tailnet. Tier-aware dispatch, fleet status with specs, decentralized flow UI, graceful-degradation behavior.</div>
-      </a>
       <a href="always-on-hub.html">
-        <span class="label">06 · Operations</span>
-        <div class="title">Always-on hub operations</div>
-        <div class="desc">Deep walkthrough for hardening the one machine other peers depend on: Redis AOF + launchd, daemon under KeepAlive, audit substrate, log rotation, daily integrity checks.</div>
+        <span class="label">05 · Machine setup</span>
+        <div class="title">Set up a secure hub</div>
+        <div class="desc">Turn one always-on machine into the fleet's coordinator. Copy/paste, brew-only: password-less Redis bound to your tailnet (never the public internet), the daemon under launchd, audit substrate, log rotation, daily integrity checks.</div>
+      </a>
+      <a href="fleet.html">
+        <span class="label">06 · Machine setup</span>
+        <div class="title">Join a worker peer</div>
+        <div class="desc">Connect another machine to an existing hub. Start as an observability peer you dispatch to directly; graduate to a full fleet worker for distributed loads when the hardware's ready.</div>
       </a>
     </div>
-    <p class="muted">No troubleshooting page yet. That comes after the first round of operator feedback shapes which failure modes are worth dedicating a page to. For now, <code>darkmux doctor</code>'s output is the canonical troubleshooting surface.</p>
-    <p class="muted" style="margin-top: 14px;">Want the precise model rather than a walkthrough: role families, the mission/sprint schema, telemetry, the flow record, and what's shipped vs. planned? See the <a href="https://github.com/kstrat2001/darkmux/blob/main/docs/architecture/CONCEPTS.md">concepts reference</a>, the canonical reference for what darkmux is made of.</p>
+    <p class="muted"><code>darkmux doctor</code>'s output is the canonical troubleshooting surface.</p>
+    <p class="muted" style="margin-top: 14px;">Want the precise model rather than a walkthrough: role families, the mission/sprint schema, telemetry, the flow record? See the <a href="https://github.com/kstrat2001/darkmux/blob/main/docs/architecture/CONCEPTS.md">concepts reference</a>, the canonical reference for what darkmux is made of.</p>
   </div>
 </section>
 
@@ -86,7 +86,7 @@
   <div class="wrap">
     <h2>How darkmux is meant to be used</h2>
     <h3>A complement to your frontier orchestrator, not a replacement.</h3>
-    <p>darkmux is an AI-first local-AI orchestrator: a CLI that manages local LLM stacks on your machine and dispatches utility-agent models internally for bounded structuring tasks (compaction, sprint estimation, mission proposal; see <a href="https://github.com/kstrat2001/darkmux/issues/115">#115</a>). The strategic reasoning loop lives in your <em>frontier orchestrator</em>: Claude Code today, with other frontiers (Gemini, Codex, Copilot) tracked in <a href="https://github.com/kstrat2001/darkmux/issues/179">#179</a>. The utility agent absorbs the routine bounded work; the orchestrator stays on strategy.</p>
+    <p>darkmux is an AI-first local-AI orchestrator: a CLI that manages local LLM stacks on your machine and dispatches utility-agent models internally for bounded structuring tasks (compaction, sprint estimation, mission proposal). The strategic reasoning loop lives in your <em>frontier orchestrator</em>: Claude Code is the proven path, and other frontiers like Gemini, Codex, and Copilot can drive it with their own guidance. The utility agent absorbs the routine bounded work; the orchestrator stays on strategy.</p>
     <p>The intended division of labor:</p>
     <ul>
       <li><strong>Frontier orchestrator</strong>: design decisions, complex reasoning, code review, multi-step debugging, narrative for what's being built.</li>

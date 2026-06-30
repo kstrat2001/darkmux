@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Getting started — darkmux user guide</title>
+<title>Getting started · darkmux user guide</title>
 <meta name="description" content="Install darkmux, run doctor, configure your first profile, swap to it. The on-ramp guide for new operators.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -37,6 +37,11 @@
     <table>
       <tr><th>Required</th><th>Why</th><th>Install</th></tr>
       <tr>
+        <td><a href="https://brew.sh">Homebrew</a></td>
+        <td>How darkmux installs (the tap + formula below).</td>
+        <td>One-line install at <a href="https://brew.sh">brew.sh</a>.</td>
+      </tr>
+      <tr>
         <td><a href="https://lmstudio.ai/">LMStudio</a></td>
         <td>darkmux drives LMStudio via the <code>lms</code> CLI for load/unload.</td>
         <td>macOS / Windows / Linux installer.</td>
@@ -47,7 +52,7 @@
         <td>Download via the LMStudio UI; verify with <code>lms ls</code>.</td>
       </tr>
     </table>
-    <p class="muted"><code>brew install</code> needs no toolchain. Homebrew handles the build, and bottled binaries (once published) ship precompiled. The <strong>Rust toolchain</strong> is needed only for the from-source path below, which documents <code>rustup</code> at its first step.</p>
+    <p class="muted"><code>brew install</code> needs no toolchain: Homebrew handles the build, and bottled binaries (once published) ship precompiled.</p>
     <p class="muted">darkmux is developed and tested on Apple Silicon. Linux should work; Intel Mac is untested.</p>
 
     <h3>For the dispatch + lab path</h3>
@@ -56,7 +61,7 @@
       <tr><th>Tool</th><th>When you need it</th></tr>
       <tr>
         <td><a href="https://www.docker.com/products/docker-desktop">Docker</a></td>
-        <td><strong>Required for <code>darkmux crew dispatch</code> / <code>lab run</code></strong> (the default internal runtime). The dispatch runs in a per-invocation <code>darkmux-runtime</code> container; build the image once with <code>docker build -t darkmux-runtime:latest runtime/</code>. Skip only if you opt out via <code>--runtime openclaw</code>.</td>
+        <td><strong>Required for <code>darkmux crew dispatch</code> / <code>lab run</code></strong> (the default internal runtime). The dispatch runs in a per-invocation <code>darkmux-runtime</code> container; the image is pulled from GHCR on first use, so you just need Docker running. Skip only if you opt out via <code>--runtime openclaw</code>.</td>
       </tr>
       <tr>
         <td>An agent runtime (e.g. <a href="https://github.com/openclaw/openclaw">OpenClaw</a>, Aider, Cline)</td>
@@ -74,8 +79,7 @@
   <div class="wrap">
     <h2>Install + bootstrap</h2>
 
-    <h3>Recommended path: via Homebrew tap</h3>
-    <p>Works from a fresh macOS machine that has LMStudio installed:</p>
+    <p>From a fresh macOS machine that has LMStudio installed:</p>
     <pre><code><span class="comment"># 1. Tap + install</span>
 brew tap kstrat2001/darkmux
 brew install darkmux                <span class="comment"># stable release (or --HEAD for latest main)</span>
@@ -83,29 +87,9 @@ brew install darkmux                <span class="comment"># stable release (or -
 <span class="comment"># 2. Bootstrap config + agent skills</span>
 darkmux init</code></pre>
     <div class="callout">If <code>brew install</code> refuses with an <strong>"untrusted tap"</strong> error, newer Homebrew gates third-party taps behind a one-time trust step: run <code>brew trust kstrat2001/darkmux</code>, then re-run the install. (Older Homebrew won't prompt for this.)</div>
-    <p>The tap is at <a href="https://github.com/kstrat2001/homebrew-darkmux">kstrat2001/homebrew-darkmux</a>. The formula installs the <code>darkmux</code> CLI + <code>serve</code> daemon + the keychain-aware wrapper script. For the production-grade always-on hub setup (Redis hardening, audit substrate, log rotation, daily integrity checks), see the <a href="always-on-hub.html">always-on hub guide</a>.</p>
-    <p><strong>Updating</strong> later is then <code>brew upgrade darkmux</code> (+ <code>brew services restart darkmux</code> if you have the daemon running).</p>
-
-    <h3>From-source path: for contributors</h3>
-    <p>You don't need this to dispatch: the <code>darkmux-runtime</code> Docker image (used by <code>darkmux crew dispatch</code> and <code>darkmux lab run</code>) is pulled from GHCR on demand on the first dispatch (<a href="https://github.com/kstrat2001/darkmux/issues/759">#759</a>), so a brew install is complete. Use this path if you're contributing to darkmux, or want to build the runtime image offline instead of pulling it:</p>
-    <pre><code><span class="comment"># 1. Install Rust toolchain (skip if `cargo --version` already works)</span>
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
-
-<span class="comment"># 2. Clone + build darkmux</span>
-git clone https://github.com/kstrat2001/darkmux
-cd darkmux
-cargo install --path .
-
-<span class="comment"># 3. Optional: build the runtime image locally instead of pulling it from GHCR</span>
-docker build -t darkmux-runtime:latest runtime/
-
-<span class="comment"># 4. Bootstrap config + agent skills</span>
-darkmux init</code></pre>
-    <div class="callout">
-      <strong>Heads up.</strong>
-      <p style="margin: 6px 0 0;">The <code>source "$HOME/.cargo/env"</code> line is the one people miss most. Without it, a fresh <code>cargo install</code> fails with <code>command not found: cargo</code> in the same shell that just ran the rustup installer.</p>
-    </div>
+    <p>The tap is at <a href="https://github.com/kstrat2001/homebrew-darkmux">kstrat2001/homebrew-darkmux</a>. The formula installs the <code>darkmux</code> CLI, the <code>serve</code> daemon, and the bundled agent skills. <strong>Updating</strong> later is <code>brew upgrade darkmux</code> (plus <code>brew services restart darkmux</code> to pick up the new daemon).</p>
+    <p>That's the whole install. Local dispatch works too: the <code>darkmux-runtime</code> Docker image is pulled from GHCR on first use, so you just need Docker running.</p>
+    <p class="muted">Contributing to darkmux, or building from source? See <a href="https://github.com/kstrat2001/darkmux/blob/main/CONTRIBUTING.md">CONTRIBUTING.md</a> on GitHub.</p>
   </div>
 </section>
 
@@ -124,7 +108,7 @@ darkmux init</code></pre>
 
     <p><strong>Claude Code</strong> gets a head start: open a session in your working directory and run the guided setup skill (installed by <code>darkmux init</code>):</p>
     <pre><code>/darkmux-bootstrap</code></pre>
-    <p>It walks the whole setup interactively: detecting your hardware tier, downloading the recommended models, registering profiles, declaring the orchestrator for flow-record provenance, and validating the end state with <code>darkmux doctor</code>. The skill <strong>reads and proposes; you run the commands</strong>, so you stay in the loop with provenance on every step. On any other frontier, point the session at the docs above and ask it to do the same; the steps below are exactly what it follows. (First-class bootstrap skills for Gemini / Codex / Copilot are on the roadmap: <a href="https://github.com/kstrat2001/darkmux/issues/179">#179</a>.)</p>
+    <p>It walks the whole setup interactively: detecting your hardware tier, downloading the recommended models, registering profiles, declaring the orchestrator for flow-record provenance, and validating the end state with <code>darkmux doctor</code>. The skill <strong>reads and proposes; you run the commands</strong>, so you stay in the loop with provenance on every step. On any other frontier, point the session at the docs above and ask it to do the same; the steps below are exactly what it follows.</p>
 
     <div class="callout good">
       <strong>Why orchestrator-first?</strong>
@@ -144,7 +128,7 @@ darkmux init</code></pre>
 
     <p>Common first-run warnings:</p>
     <ul>
-      <li><strong><code>daemon: reachable</code> Warn</strong>: you haven't started <code>darkmux serve</code> yet. That's fine for now; you start it in the <a href="observability.html">Observability</a> section.</li>
+      <li><strong><code>daemon: reachable</code> Warn</strong>: the daemon isn't running yet. That's fine; you start it in <a href="#see-it-work">See it work</a> below (one command on Homebrew). Non-fatal: it only affects live viewing.</li>
       <li><strong><code>profile match</code> Warn</strong>: your <code>~/.darkmux/profiles.json</code> doesn't yet reference what's loaded in LMStudio. That's also fine, we fix it next.</li>
       <li><strong><code>runtime version</code> Warn</strong>: your installed agent runtime is older than darkmux's validated minimum. If you're not running an orchestrator, you can ignore this for now.</li>
     </ul>
@@ -176,14 +160,14 @@ ${EDITOR:-vim} ~/.darkmux/profiles.json</code></pre>
       <li><code>id</code>: the LMStudio model id from <code>lms ls</code> output (e.g. <code>qwen3.6-35b-a3b</code>).</li>
       <li><code>n_ctx</code>: context length to load at. Defaults are usually fine; <code>32768</code> is a safe starter for any model.</li>
     </ul>
-    <p>Profile models are <strong>worker</strong> models. There's no per-model <code>role</code> field (it was removed in <a href="https://github.com/kstrat2001/darkmux/issues/590">#590</a>). The standing utility/compactor model is declared once for the machine in the top-level <code>internal.utility</code> binding, not per profile. If a profile lists more than one worker, an optional <code>default_model</code> names which one is the default.</p>
+    <p>Profile models are <strong>worker</strong> models; there's no per-model <code>role</code> field. The standing utility/compactor model is declared once for the machine in the top-level <code>internal.utility</code> binding, not per profile. If a profile lists more than one worker, an optional <code>default_model</code> names which one is the default.</p>
 
     <h3>Verify the edits</h3>
     <pre><code>darkmux profiles                  <span class="comment"># the profile should now list your model</span>
 darkmux doctor                    <span class="comment"># confirm "profile match" is green or close</span></code></pre>
 
     <h3>The opinionated path: <code>swap recommended</code></h3>
-    <p>If you'd rather not author profile JSON by hand on a fresh install, darkmux ships a curated per-hardware-tier recommendation registry (per <a href="https://github.com/kstrat2001/darkmux/issues/159">#159</a>) with the bake-off-validated models for your machine class:</p>
+    <p>If you'd rather not author profile JSON by hand on a fresh install, darkmux ships a curated per-hardware-tier recommendation registry with the bake-off-validated models for your machine class:</p>
     <pre><code>darkmux swap recommended --dry-run    <span class="comment"># resolves your tier → validated profile → pre-flight checks</span>
 darkmux model pull-recommended        <span class="comment"># downloads any missing models via `lms get`</span>
 darkmux swap recommended              <span class="comment"># load them for real</span></code></pre>
@@ -209,7 +193,20 @@ darkmux status                    <span class="comment"># confirm: should show "
     <h3>The smoke test</h3>
     <pre><code>darkmux lab run quick-q           <span class="comment"># single-turn smoke prompt against the active profile</span>
 darkmux lab inspect &lt;run-id&gt;      <span class="comment"># quick look at what happened</span></code></pre>
-    <p>This runs through darkmux's default internal Docker-bounded runtime. Build the <code>darkmux-runtime</code> image once (see the <a href="lab.html">lab</a> section) and it works with no external runtime. To dispatch through openclaw instead, pass <code>--runtime openclaw</code>. If you have neither Docker nor openclaw set up yet, skip this step and come back after reading the lab section.</p>
+    <p>This runs through darkmux's default internal Docker-bounded runtime. The runtime image is pulled from GHCR on first use, so you just need Docker running. To dispatch through openclaw instead, pass <code>--runtime openclaw</code>. No Docker yet? Skip this step and come back after the <a href="lab.html">lab</a> section.</p>
+  </div>
+</section>
+
+<section id="see-it-work">
+  <div class="wrap">
+    <h2>See it work: start the daemon</h2>
+    <p>darkmux records everything it does as flow records, and the daemon serves them to a live viewer in your browser. Starting it is one command.</p>
+    <p>The daemon runs as a managed background service. It starts now, and again at every login:</p>
+    <pre><code>brew services start darkmux</code></pre>
+    <p>Open the viewer at the daemon's own address:</p>
+    <pre><code>open http://127.0.0.1:8765/        <span class="comment"># or just visit it in any browser</span></code></pre>
+    <p>The page is served by your local daemon, so it loads your own records directly: no account, nothing uploaded. It's empty until darkmux does some work; if you ran the smoke test above with the daemon up, that dispatch is already on the timeline. Want to see the shape before installing anything? The <a href="../demo/">playback demo at darkmux.com/demo</a> renders a recorded session.</p>
+    <p>That's the whole live-viewer setup. The <a href="observability.html">next section</a> is the deeper tour: how to read the timeline, manage the daemon, and the HTTP endpoints it exposes.</p>
   </div>
 </section>
 
@@ -218,7 +215,7 @@ darkmux lab inspect &lt;run-id&gt;      <span class="comment"># quick look at wh
     <h2>What's next</h2>
     <p>If you set up via <a href="#orchestrator"><code>/darkmux-bootstrap</code></a> (or had your orchestrator follow the steps above), your profiles, models, and orchestrator declaration are already in place. Pick a direction:</p>
     <ul>
-      <li>If you want to see darkmux operate visually as you work: <a href="observability.html">Observability: daemon + viewer</a>.</li>
+      <li>For the deeper tour of the live viewer (reading the timeline, managing the daemon, the HTTP endpoints): <a href="observability.html">Observability: daemon + viewer</a>.</li>
       <li>If you want to benchmark / characterize your hardware against a workload: <a href="lab.html">The lab harness</a>.</li>
       <li>If you're integrating with an orchestrator for agentic work: <a href="missions.html">Missions, sprints, and crew dispatch</a>.</li>
     </ul>

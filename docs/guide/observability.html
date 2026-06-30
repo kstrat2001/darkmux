@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Observability: daemon + viewer | darkmux user guide</title>
-<meta name="description" content="Start the darkmux daemon, point the /flow viewer at it, watch darkmux operate. Covers doctor's daemon check and the pre-dispatch nudge too.">
+<meta name="description" content="The deeper tour of the darkmux daemon and live viewer: reading the timeline, managing the brew-managed service, doctor's daemon check, and the HTTP endpoints it exposes.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -28,7 +28,7 @@
   <div class="wrap">
     <div class="label">02 <span class="dot">·</span> see it work</div>
     <h1>Observability: daemon + viewer</h1>
-    <p class="lede">darkmux emits flow records as it works: what was dispatched, when, to which model, with what verdict. The daemon serves those records over HTTP; the <code>/flow</code> viewer renders them as a live timeline you can watch while darkmux operates.</p>
+    <p class="lede">You already started the daemon and opened the viewer at the end of <a href="getting-started.html#see-it-work">getting started</a>. This page is the deeper tour: what the records mean, how to read the live timeline, how to manage the daemon as a service, and the HTTP endpoints it exposes.</p>
   </div>
 </header>
 
@@ -37,51 +37,28 @@
     <h2>The big picture</h2>
     <p>Three pieces work together:</p>
     <ul>
-      <li><strong>Flow records on disk</strong>: every dispatch, every sprint transition, every QA verdict appends a JSON line to <code>~/.darkmux/flows/&lt;date&gt;.jsonl</code> via the <code>LocalFileSink</code>. Each record carries provenance fields (<code>machine_id</code>, <code>orchestrator</code>) auto-populated at write time from <code>DARKMUX_MACHINE_ID</code> / <code>DARKMUX_ORCHESTRATOR</code> env vars. The CLI writes these; no daemon required. Two opt-in sinks compose alongside via <code>TeeSink</code>: <code>AuditFileSink</code> (BLAKE3 hash-chained log; edits are detectable via <code>darkmux flow integrity-check</code> walking the chain &mdash; which is un-anchored, so it detects edits absent a full re-chain, not an OS append-only guarantee; enable via <code>DARKMUX_AUDIT_DIR</code>) and <code>RedisSink</code> (cross-machine coordination stream; enable via <code>DARKMUX_REDIS_URL</code>).</li>
-      <li><strong><code>darkmux serve</code> daemon</strong>: a small HTTP server (default <code>127.0.0.1:8765</code>) that reads those JSONL files and exposes them via REST endpoints + SSE tail, plus a <code>/flow-status</code> endpoint that introspects the sink composition + Redis health + schema drift.</li>
-      <li><strong>Web viewers</strong>: three pages share a chrome (<code>/flow</code> = live timeline + filters, <code>/lab</code> = redirects to the demo viewer, which renders live flow records from the daemon, <code>/topology</code> = upcoming fleet diagram per <a href="https://github.com/kstrat2001/darkmux/issues/169">#169</a>). All static: JS fetches from your local daemon, nothing uploaded.</li>
+      <li><strong>Flow records on disk.</strong> Every dispatch, every sprint transition, every QA verdict appends a JSON line to <code>~/.darkmux/flows/&lt;date&gt;.jsonl</code> via the <code>LocalFileSink</code>. Each record carries provenance fields (<code>machine_id</code>, <code>orchestrator</code>) auto-populated at write time. The CLI writes these; no daemon required. Two opt-in sinks compose alongside via <code>TeeSink</code>: <code>AuditFileSink</code> (a BLAKE3 hash-chained log whose edits <code>darkmux flow integrity-check</code> surfaces by walking the chain, which is un-anchored, so it detects edits absent a full re-chain rather than giving an OS append-only guarantee; enable via <code>DARKMUX_AUDIT_DIR</code>) and <code>RedisSink</code> (the cross-machine coordination stream; enable via <code>DARKMUX_REDIS_URL</code> or <code>config.redis</code>).</li>
+      <li><strong>The <code>darkmux serve</code> daemon.</strong> A small HTTP server (default <code>127.0.0.1:8765</code>) that reads those JSONL files and exposes them via REST endpoints plus an SSE tail, plus a <code>/flow-status</code> endpoint that introspects the sink composition, Redis health, and schema drift.</li>
+      <li><strong>The web viewer.</strong> The daemon serves a single drillable viewer at its own root, <code>http://127.0.0.1:8765/</code>: live timeline, filters, run drill-down. It is a static page whose JavaScript fetches from your local daemon. Nothing is uploaded. (<a href="../demo/">darkmux.com/demo</a> is the same viewer in playback mode over a recorded session, which is why it works with no daemon.)</li>
     </ul>
-    <p>The daemon and viewer are decoupled: records keep landing on disk whether or not the daemon is running. The daemon being up is only required for <em>live viewing</em>.</p>
-  </div>
-</section>
-
-<section>
-  <div class="wrap">
-    <h2>Start the daemon</h2>
-    <p>Open a second terminal tab: the daemon is a foreground process that blocks until you Ctrl-C.</p>
-    <pre><code>darkmux serve</code></pre>
-    <p>Default bind: <code>127.0.0.1:8765</code>. Override with <code>--port</code> or <code>--bind</code> if you need to:</p>
-    <pre><code>darkmux serve --port 9000 --bind 127.0.0.1</code></pre>
-    <div class="callout warn">
-      <strong>Don't bind to 0.0.0.0 unless you know what you're doing.</strong>
-      <p style="margin: 6px 0 0;">The daemon currently has no authentication. Binding to <code>0.0.0.0</code> exposes your flow records — and the mission/sprint state of whatever you're working on — to anyone on your network. Stick with the loopback default for solo dev work.</p>
-    </div>
-
-    <h3>Verify it's up</h3>
-    <pre><code>curl -s http://127.0.0.1:8765/health
-<span class="comment"># {"darkmux_version":"1.13.0","flow_schema_version":"1.14.0"}</span></code></pre>
-    <p>Or just run <code>darkmux doctor</code>: the <code>daemon: reachable</code> check will report Pass.</p>
+    <p>The daemon and viewer are decoupled from the records: records keep landing on disk whether or not the daemon is running. The daemon being up is only required for <em>live viewing</em>.</p>
   </div>
 </section>
 
 <section>
   <div class="wrap">
     <h2>Open the viewer</h2>
-    <p>The viewer lives at <a href="../flow/">darkmux.com/flow/</a>. It's a static page: no backend, just JS that fetches from your local daemon.</p>
-    <ol>
-      <li>Open <a href="../flow/">darkmux.com/flow/</a> in your browser.</li>
-      <li>The header shows a "daemon" pill. If the daemon is up, it's green. If not, it's gray with a "daemon offline" label.</li>
-      <li>Click <strong>Connect</strong> to fetch today's records and start tailing for new ones.</li>
-    </ol>
-    <p>Open <a href="../flow/" target="_blank" rel="noopener">the viewer in a new tab</a> while your daemon is running to see the live shape. This guide intentionally ships without static screenshots: the viewer is iterating fast in this phase.</p>
-
-    <p>The viewer renders records as cards in a stepper. Each card shows:</p>
+    <p>Point any browser at the daemon's own address:</p>
+    <pre><code>http://127.0.0.1:8765/</code></pre>
+    <p>Because the page is served by your local daemon, it is same-origin with the data it reads: it loads your records directly, with no "connect" step, no account, and nothing uploaded. (The <code>darkmux.com/flow</code> URL from older docs now redirects to the playback <a href="../demo/">demo</a>; for your <em>live</em> data, use the daemon's own address above. Loading a remote page like <code>darkmux.com</code> against your local daemon would be blocked by the daemon's default CORS policy anyway, which is the safe default.)</p>
+    <p>This guide intentionally ships without static screenshots: the viewer is iterating fast in this phase. Open it next to a real dispatch to see the live shape. Each card shows:</p>
     <ul>
-      <li><strong>Tier stripe</strong>: colored bar on the left. Cyan = operator (manual mission/sprint actions), violet = frontier (orchestrator narrative), green = local (model work).</li>
+      <li><strong>Tier stripe</strong>: the colored bar on the left. Cyan = operator (manual mission/sprint actions), violet = frontier (orchestrator narrative), green = local (model work).</li>
       <li><strong>Action + handle</strong>: what happened ("dispatch start", "sprint complete", "verdict: clean") and which entity it acted on (the role id, sprint id, or mission id).</li>
-      <li><strong>Meta pills</strong>: category, tier, stage, source, model (if known), sprint, session id. The <code>model</code> pill on dispatch cards shows which LMStudio model handled the work: your map from event-to-model.</li>
-      <li><strong>Wall-clock graphic</strong>: for dispatch records, an SVG ring shows the duration. Sweeping if the dispatch is mid-flight; frozen at the final duration if complete.</li>
+      <li><strong>Meta pills</strong>: category, tier, stage, source, model (if known), sprint, session id. The <code>model</code> pill on dispatch cards shows which LMStudio model handled the work.</li>
+      <li><strong>Wall-clock graphic</strong>: for dispatch records, an SVG ring shows the duration, sweeping while the dispatch is mid-flight and frozen at the final duration once complete.</li>
     </ul>
+    <p>A <strong>source pill</strong> in the toolbar tells you the truth about the data path: <code>live</code> (reading your daemon, Redis-aggregated if configured), <code>no daemon</code> (can't reach the daemon), or <code>replay</code> (a static fixture, as on the demo).</p>
   </div>
 </section>
 
@@ -94,7 +71,7 @@ darkmux sprint start &lt;your-sprint-id&gt;      <span class="comment"># cyan: s
 darkmux crew dispatch coder --message "..."<span class="comment"># green: dispatch start + (later) dispatch complete</span>
 darkmux sprint complete &lt;your-sprint-id&gt;   <span class="comment"># cyan: sprint complete + duration arc</span></code></pre>
 
-    <p>If you keep <a href="../flow/" target="_blank" rel="noopener">the viewer</a> open as you run those commands, the records appear in order: two cyan operator-tier records bracketing a green local-tier dispatch pair (with the model pill visible on each green card), followed by the cyan sprint-complete with its duration arc.</p>
+    <p>With the viewer open as you run those commands, the records appear in order: two cyan operator-tier records bracketing a green local-tier dispatch pair (with the model pill visible on each green card), followed by the cyan sprint-complete with its duration arc.</p>
 
     <p>The records pair via <code>session_id</code>: dispatch start and dispatch complete share the same session id, which is how the wall-clock graphic computes duration. The viewer joins them automatically.</p>
   </div>
@@ -102,12 +79,43 @@ darkmux sprint complete &lt;your-sprint-id&gt;   <span class="comment"># cyan: s
 
 <section>
   <div class="wrap">
+    <h2>Managing the daemon</h2>
+    <p>You started the daemon in getting started. How you operate it depends on how you installed darkmux.</p>
+
+    <h3>Homebrew install (managed service)</h3>
+    <p>The daemon runs under <code>brew services</code>: it starts at login and respawns on crash. You rarely touch it.</p>
+    <pre><code>brew services start darkmux       <span class="comment"># start now + at every login</span>
+brew services restart darkmux     <span class="comment"># after `brew upgrade darkmux`</span>
+brew services stop darkmux        <span class="comment"># stop + unregister from login</span>
+brew services info darkmux        <span class="comment"># is it running? where are the logs?</span></code></pre>
+    <p>The brew service binds <code>127.0.0.1:8765</code> and resolves its Redis connection (if any) from <code>config.redis</code> plus the Keychain. For the production-grade always-on setup (Redis hardening, audit substrate, log rotation, daily integrity checks), see the <a href="always-on-hub.html">secure hub guide</a>.</p>
+
+    <h3>From source (manual)</h3>
+    <p>A <code>cargo install</code> build has no brew service, so you run the daemon yourself. It is a foreground process that blocks until you Ctrl-C, so give it its own terminal tab:</p>
+    <pre><code>darkmux serve                     <span class="comment"># foreground; Ctrl-C to stop</span>
+darkmux serve --port 9000 --bind 127.0.0.1   <span class="comment"># override the defaults</span></code></pre>
+    <p>To restart after upgrading: Ctrl-C, <code>cargo install --path . --force</code>, then re-run <code>darkmux serve</code>. The viewer auto-reconnects on the next interaction; no need to refresh.</p>
+
+    <div class="callout warn">
+      <strong>Keep the bind on loopback.</strong>
+      <p style="margin: 6px 0 0;">The daemon's data surface (flow records + the mission/sprint state of whatever you're working on) is fleet-wide. Don't bind it to <code>0.0.0.0</code>. To reach the viewer from another device on your tailnet, keep the daemon on <code>127.0.0.1</code> and put Tailscale Serve in front of it (HTTPS terminated at the tailnet node, daemon untouched): see the <a href="always-on-hub.html#viewer">secure hub guide</a>. A non-loopback bind also trips darkmux's remote-auth gate, which a browser page-load can't satisfy.</p>
+    </div>
+
+    <h3>Verify it's up</h3>
+    <pre><code>curl -s http://127.0.0.1:8765/health
+<span class="comment"># {"darkmux_version":"1.13.0","flow_schema_version":"1.14.0"}</span></code></pre>
+    <p>Or run <code>darkmux doctor</code>: the <code>daemon: reachable</code> check reports Pass, and shows the viewer URL.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
     <h2>What the doctor's daemon check does</h2>
-    <p><code>darkmux doctor</code> includes a <code>daemon: reachable</code> check that probes <code>127.0.0.1:8765/health</code> with a 500ms timeout. Three outcomes:</p>
+    <p><code>darkmux doctor</code> includes a <code>daemon: reachable</code> check that probes <code>127.0.0.1:8765/health</code> with a short timeout. Three outcomes:</p>
     <ul>
-      <li><strong>Pass</strong>: daemon is up and returning 200 OK. Live viewing works.</li>
-      <li><strong>Warn (connection refused)</strong>: daemon isn't running. The hint reminds you to run <code>darkmux serve</code> in another tab. Non-fatal: you can still do work; you just won't see it live.</li>
-      <li><strong>Warn (port held)</strong>: something is on 8765 but isn't responding HTTP 200. Hint: check whether another process is using the port.</li>
+      <li><strong>Pass</strong>: daemon is up and returning 200 OK. Live viewing works, and the line shows the viewer URL.</li>
+      <li><strong>Warn (connection refused)</strong>: the daemon isn't running. On Homebrew, start it with <code>brew services start darkmux</code>; from source, run <code>darkmux serve</code>. Non-fatal: you can still do work, you just won't see it live.</li>
+      <li><strong>Warn (port held)</strong>: something is on 8765 but isn't responding HTTP 200. Check whether another process is using the port.</li>
     </ul>
     <p>The check is <strong>Warn</strong>, not Fail: the daemon being off doesn't break anything end-to-end. It only disables live viewing.</p>
   </div>
@@ -116,12 +124,9 @@ darkmux sprint complete &lt;your-sprint-id&gt;   <span class="comment"># cyan: s
 <section>
   <div class="wrap">
     <h2>The pre-dispatch nudge</h2>
-    <p>When you run <code>darkmux crew dispatch</code> or <code>darkmux sprint review</code> while the daemon is off, you'll see a one-line stderr nudge:</p>
-    <pre><code>[!] darkmux serve isn't reachable on 127.0.0.1:8765 — `crew dispatch` will
-    write flow records to disk but you won't see them live. To enable live
-    viewing, run `darkmux serve` in another tab.</code></pre>
+    <p>When you run <code>darkmux crew dispatch</code> or <code>darkmux sprint review</code> while the daemon is off, darkmux prints a one-line stderr nudge: the daemon isn't reachable, your flow records still write to disk, and you won't see them live until you start it (<code>brew services start darkmux</code> on Homebrew, or <code>darkmux serve</code> from source).</p>
     <p>The dispatch proceeds either way: this is situational awareness, not consent-gating. You won't commit to a multi-minute dispatch only to realize the viewer would have been empty.</p>
-    <p>If you started the daemon mid-dispatch, the records that landed before you started it are still visible. The viewer's <strong>Connect</strong> button fetches the whole day's file first, then opens an SSE stream for new records. No data lost.</p>
+    <p>If you started the daemon mid-dispatch, the records that landed before you started it are still visible. The viewer fetches the whole day's file first, then opens an SSE stream for new records. No data lost.</p>
   </div>
 </section>
 
@@ -159,17 +164,6 @@ darkmux sprint complete &lt;your-sprint-id&gt;   <span class="comment"># cyan: s
         <td>Diagnostic snapshot of the flow substrate (active sinks, Redis health, disk health, schema drift). Same JSON shape as <code>darkmux flow status --json</code>; consumed by the store-status pill in the shared shell.</td>
       </tr>
     </table>
-  </div>
-</section>
-
-<section>
-  <div class="wrap">
-    <h2>Stopping + restarting</h2>
-    <p>Ctrl-C the daemon's terminal tab to stop. To restart after upgrading darkmux:</p>
-    <pre><code>brew upgrade darkmux              <span class="comment"># or `cargo install --path . --force` from source</span>
-<span class="comment"># Then in the daemon tab, Ctrl-C and re-run:</span>
-darkmux serve</code></pre>
-    <p>The viewer auto-reconnects on the next interaction; no need to refresh.</p>
   </div>
 </section>
 

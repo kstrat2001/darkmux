@@ -19,7 +19,7 @@
     <div class="links">
       <a href="lab.html">‹ Prev</a>
       <a href="index.html">Guide home</a>
-      <a href="fleet.html">Next ›</a>
+      <a href="always-on-hub.html">Next ›</a>
     </div>
   </div>
 </nav>
@@ -51,7 +51,7 @@
     <h2>Crew: roles + dispatch</h2>
     <p>A <strong>role</strong> is a named local-AI capability: a manifest under <code>templates/builtin/roles/&lt;id&gt;.json</code> (or <code>~/.darkmux/roles/&lt;id&gt;.json</code> for operator overrides) paired with a system prompt at the same path with a <code>.md</code> extension. The manifest declares:</p>
     <ul>
-      <li><code>id</code>, <code>description</code>, <code>skills</code>: the <code>skills</code> list names work-shape descriptors the role is good at (renamed from <code>capabilities</code> in <a href="https://github.com/kstrat2001/darkmux/issues/448">#448</a>; existing manifests must use the new key). Each skill in turn declares an intrinsic capability profile (<code>code</code>, <code>reasoning</code>, <code>instruction_following</code>, <code>agentic_tool_use</code>) that role-to-model selection will score against.</li>
+      <li><code>id</code>, <code>description</code>, <code>skills</code>: the <code>skills</code> list names work-shape descriptors the role is good at. Each skill in turn declares an intrinsic capability profile (<code>code</code>, <code>reasoning</code>, <code>instruction_following</code>, <code>agentic_tool_use</code>) that role-to-model selection scores against.</li>
       <li><code>tool_palette</code>: <code>allow</code> and <code>deny</code> lists of tools (read, exec, edit, etc.)</li>
       <li><code>escalation_contract</code>: what the role does when it can't solve the task (bail, retry-with-hint, hand-off-to)</li>
       <li><code>role_family</code> (optional): <code>specialist</code> (default) or <code>utility</code>; specialist roles get the autonomous-dispatch preamble injected ahead of their prompt (they can't ask questions mid-dispatch, so they escalate with a <code>BLOCKED:</code> line instead).</li>
@@ -74,7 +74,7 @@ darkmux role show coder          <span class="comment"># full details for one ro
     </ol>
     <div class="callout">
       <strong>Verification boundary.</strong>
-      <p style="margin: 8px 0 0;">The dispatch container is intentionally minimal: no project toolchains. The <code>coder</code>, <code>code-reviewer</code>, and <code>test-designer</code> roles are instructed (<a href="https://github.com/kstrat2001/darkmux/issues/398">#398</a>) <em>not</em> to install toolchains or run build/test/lint inside the container: their job ends at "the edit is in place + the tests are written," and they name the verification commands the frontier should run on the host afterward. So a role's report won't claim "tests passed" for commands it never ran. Verification is the frontier orchestrator's step, by design.</p>
+      <p style="margin: 8px 0 0;">The dispatch container is intentionally minimal: no project toolchains. The <code>coder</code>, <code>code-reviewer</code>, and <code>test-designer</code> roles are instructed <em>not</em> to install toolchains or run build/test/lint inside the container: their job ends at "the edit is in place + the tests are written," and they name the verification commands the frontier should run on the host afterward. So a role's report won't claim "tests passed" for commands it never ran. Verification is the frontier orchestrator's step, by design.</p>
     </div>
 
     <h4>Opting into openclaw</h4>
@@ -111,7 +111,7 @@ pbpaste | darkmux mission propose --from-stdin
     Draft a blog post on local-AI bounded-task patterns.
 
   Sprints (2):
-    1. draft-blog-post-s1-outline (depends_on: —)
+    1. draft-blog-post-s1-outline (depends_on: none)
        Write a one-page outline: thesis, three supporting sections.
     2. draft-blog-post-s2-draft (depends_on: draft-blog-post-s1-outline)
        Flesh out the outline into a full first draft.
@@ -145,7 +145,7 @@ next: <code>darkmux mission start draft-blog-post</code> to begin (or pass <code
       </tr>
       <tr>
         <td>Decomposed plan</td>
-        <td>Mission + N sprints. Pre-plan or grow via <a href="https://github.com/kstrat2001/darkmux/issues/107"><code>mission add-sprint</code></a>.</td>
+        <td>Mission + N sprints. Pre-plan or grow via <code>mission add-sprint</code>.</td>
         <td>Multi-step work where the wall-clock arcs per sprint matter, dependencies between sprints matter, or you want the viewer's timeline as an explicit feedback surface.</td>
       </tr>
     </table>
@@ -227,10 +227,10 @@ darkmux mission close draft-blog-post
 }</code></pre>
     <p>Then just <code>darkmux mission start japan-trip-2026-05</code> when the trip begins and <code>darkmux mission close japan-trip-2026-05</code> when it ends. The viewer will show the wall-clock duration.</p>
 
-    <p>You can also <a href="https://github.com/kstrat2001/darkmux/issues/107"><code>mission add-sprint</code></a> later if structure emerges mid-trip. The empty-sprint mission grows into a decomposed one as needed.</p>
+    <p>You can also <code>mission add-sprint</code> later if structure emerges mid-trip. The empty-sprint mission grows into a decomposed one as needed.</p>
 
     <h3>Growing the plan: the multi-sprint shape</h3>
-    <p>For mission-shaped work with clear decomposition — a campaign, a deploy, a multi-week research arc — the natural pattern is one mission JSON + one sprint JSON per planned step. Same shape as the minimum-viable example, just more sprint files.</p>
+    <p>For mission-shaped work with clear decomposition (a campaign, a deploy, a multi-week research arc), the natural pattern is one mission JSON + one sprint JSON per planned step. Same shape as the minimum-viable example, just more sprint files.</p>
     <p>For example, a marketing-campaign mission might have three sprints: positioning research, messaging draft, launch checklist. Each sprint JSON references the mission via <code>mission_id</code>, declares <code>depends_on</code> if it must follow another sprint, and the mission's <code>sprint_ids</code> array lists them all.</p>
     <p>The depends_on edges encode <em>"must complete first"</em>, not display order. Display order in the viewer follows the mission's <code>sprint_ids</code> array.</p>
 
@@ -264,7 +264,7 @@ darkmux mission add-sprint &lt;mission-id&gt; \
   --description "..." \
   [--depends-on &lt;other-sprint-id&gt;]
 
-<span class="comment"># Insert in the middle — immediately after an existing sprint</span>
+<span class="comment"># Insert in the middle, immediately after an existing sprint</span>
 darkmux mission add-sprint &lt;mission-id&gt; \
   --sprint-id &lt;new-id&gt; \
   --description "..." \
@@ -315,7 +315,7 @@ darkmux sprint review --require-clean          <span class="comment"># exit 1 if
 <section>
   <div class="wrap">
     <h2>Operator sovereignty (a note)</h2>
-    <p>darkmux's mission/sprint/crew model is intentionally <em>operator-owned</em>: missions and sprints are JSON files you write; the CLI manages state transitions but never auto-creates or auto-abandons. The orchestrator is expected to propose structure — <em>"this looks like 3 sprints; want me to scaffold them?"</em> — but you accept or modify before files land.</p>
+    <p>darkmux's mission/sprint/crew model is intentionally <em>operator-owned</em>: missions and sprints are JSON files you write; the CLI manages state transitions but never auto-creates or auto-abandons. The orchestrator is expected to propose structure (<em>"this looks like 3 sprints; want me to scaffold them?"</em>), but you accept or modify before files land.</p>
     <p>If a sprint sits in <code>Running</code> status for hours, that's not a bug in darkmux; it's the operator deciding to leave it open. The viewer's wall-clock graphic shows an unbounded sweep on stale running sprints: clearly-wrong-looking signal that the operator forgot to close one. By design.</p>
   </div>
 </section>
@@ -325,9 +325,9 @@ darkmux sprint review --require-clean          <span class="comment"># exit 1 if
     <span class="dir">‹ Previous</span>
     <span class="title">The lab harness</span>
   </a>
-  <a href="fleet.html" class="next">
+  <a href="always-on-hub.html" class="next">
     <span class="dir">Next ›</span>
-    <span class="title">Many machines become one</span>
+    <span class="title">Set up a secure hub</span>
   </a>
 </nav>
 

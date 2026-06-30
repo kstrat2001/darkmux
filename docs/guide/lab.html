@@ -135,12 +135,12 @@ darkmux lab runs --limit 50</code></pre>
 <section>
   <div class="wrap">
     <h2>Reproducible sandboxes: fixtures</h2>
-    <p>A single number isn't a measurement; a number you can <em>reproduce</em> is. The fixture system (landed across <a href="https://github.com/kstrat2001/darkmux/issues/487">#487</a>, phases 1–5) makes every <code>coding-task</code> run start from a known state and end with a verifiable one, so "this profile is faster" becomes a claim you can re-run on demand.</p>
+    <p>A single number isn't a measurement; a number you can <em>reproduce</em> is. The fixture system makes every <code>coding-task</code> run start from a known state and end with a verifiable one, so "this profile is faster" becomes a claim you can re-run on demand.</p>
 
     <h3>Per-run copy-on-write isolation</h3>
     <p>Every <code>darkmux lab run</code> works in its own sandbox, a copy-on-write clone of the source, not the source itself. The source fixture directory is <strong>never touched</strong>; cross-run contamination is eliminated by construction. The clone is near-instant where the filesystem supports it (<code>clonefile</code> on APFS, <code>--reflink</code> on btrfs/xfs/zfs) and falls back to a deep copy everywhere else.</p>
     <pre><code>~/.darkmux/runs/&lt;run-id&gt;/
-<span class="comment">  sandbox/          # this run's isolated COW clone — the model works here
+<span class="comment">  sandbox/          # this run's isolated COW clone, where the model works
   manifest.json     # now carries baseline_hash + final_hash (schema_version 4)
   trajectory.jsonl  # per-turn detail</span></code></pre>
     <p>The manifest gained two content hashes (BLAKE3, formatted <code>blake3:&lt;hex&gt;</code>):</p>
@@ -152,7 +152,7 @@ darkmux lab runs --limit 50</code></pre>
     <h3>The fixture manifest</h3>
     <p>A fixture is a self-contained directory with a <code>.fixture.json</code> manifest at its root. Only <code>name</code> is required:</p>
     <pre><code>{
-  <span class="comment">"name"</span>: "demo-tiny-py",          <span class="comment">// registry key — no path separators</span>
+  <span class="comment">"name"</span>: "demo-tiny-py",          <span class="comment">// registry key, no path separators</span>
   <span class="comment">"version"</span>: "1.0",
   <span class="comment">"satisfies"</span>: "tiny-python-suite@1.0", <span class="comment">// what abstract requirement this fills</span>
   <span class="comment">"language"</span>: "python",
@@ -176,7 +176,7 @@ darkmux lab doctor                           <span class="comment"># offline int
     <p>A cheap, offline check that catches a broken fixture <em>before</em> you waste a dispatch on it. For every registered fixture it verifies the path still exists, the manifest still loads, the <code>required_files</code> are present, and the content hash + manifest version haven't drifted since registration. If there's no registry at all, it points you at <code>scripts/lab-init.sh</code>.</p>
 
     <h3>Bootstrap the built-ins</h3>
-    <p>A built-in <code>demo-tiny-py</code> fixture (a trivial Python module + a 5-test suite) ships in the repo under <code>templates/builtin/lab-fixtures/</code>. Populate your registry with it — and any future built-ins — via the standalone init script (idempotent; safe to re-run after a <code>git pull</code>):</p>
+    <p>A built-in <code>demo-tiny-py</code> fixture (a trivial Python module + a 5-test suite) ships in the repo under <code>templates/builtin/lab-fixtures/</code>. Populate your registry with it (and any future built-ins) via the standalone init script (idempotent; safe to re-run after a <code>git pull</code>):</p>
     <pre><code>scripts/lab-init.sh          <span class="comment"># register all built-ins</span>
 scripts/lab-init.sh --dry    <span class="comment"># print what would be registered; no writes</span>
 scripts/lab-init.sh --force  <span class="comment"># re-register, accepting upstream drift</span></code></pre>
