@@ -92,6 +92,14 @@ impl DoctorReport {
 /// so it bypasses the issues-only consolidation in `print_report`.
 const BUILD_CHECK_NAME: &str = "build";
 
+/// Name of the daemon-reachability check. Like the build line, a PASSING
+/// daemon-reachable row bypasses the issues-only consolidation — its message
+/// is the viewer's locator (loopback + tailnet URLs), which the operator runs
+/// `doctor` to find; collapsing it into "N more checks passed" would hide the
+/// one thing they came for. A Warn/Fail (daemon down) prints via the normal
+/// problem path regardless.
+const DAEMON_CHECK_NAME: &str = "daemon reachable";
+
 fn check_build_info() -> Check {
     Check {
         name: BUILD_CHECK_NAME.into(),
@@ -1414,6 +1422,61 @@ fn eureka_checks(include_openclaw: bool) -> Vec<Check> {
 
 // ─── Individual checks ──────────────────────────────────────────────────
 
+/// Parse `tailscale serve status --json` for the tailnet URL that proxies to
+/// the local daemon on `port` — i.e. where the viewer is reachable from a phone
+/// or other tailnet device. Pure (the JSON is fetched by the caller) so it's
+/// unit-tested against a captured fixture. Returns `None` when nothing on the
+/// tailnet proxies to our port (tailscale not serving, or serving something
+/// else). The serve-status JSON shape: `.Web["<host>:<port>"].Handlers["/"]
+/// .Proxy == "http://127.0.0.1:<our-port>"`; the served port picks the scheme
+/// (443 → https, else http).
+fn parse_tailnet_viewer_url(json: &str, port: u16) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let web = v.get("Web")?.as_object()?;
+    let want_loopback = format!("http://127.0.0.1:{port}");
+    let want_localhost = format!("http://localhost:{port}");
+    for (hostport, cfg) in web {
+        let proxies_to_us = cfg
+            .get("Handlers")
+            .and_then(|h| h.as_object())
+            .map(|handlers| {
+                handlers.values().any(|h| {
+                    h.get("Proxy")
+                        .and_then(|p| p.as_str())
+                        .map(|p| p == want_loopback || p == want_localhost)
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        if proxies_to_us {
+            // `hostport` is like "macbook-pro.taild82cbb.ts.net:80" — split the
+            // trailing port to pick the scheme; default to the bare host on no
+            // colon (shouldn't happen, but stay total).
+            let (host, served_port) = hostport
+                .rsplit_once(':')
+                .unwrap_or((hostport.as_str(), "80"));
+            let scheme = if served_port == "443" { "https" } else { "http" };
+            return Some(format!("{scheme}://{host}/"));
+        }
+    }
+    None
+}
+
+/// Best-effort: run `tailscale serve status --json` and parse for the tailnet
+/// URL proxying to the local daemon on `port`. `None` on any failure (tailscale
+/// absent, not serving, or a non-zero/garbage response) — a missing tailnet URL
+/// is never an error, just an absent line in the doctor message.
+fn tailnet_viewer_url(port: u16) -> Option<String> {
+    let out = std::process::Command::new("tailscale")
+        .args(["serve", "status", "--json"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_tailnet_viewer_url(&String::from_utf8_lossy(&out.stdout), port)
+}
+
 fn check_daemon_reachable() -> Check {
     // Check if the darkmux daemon is reachable at 127.0.0.1:8765/health.
     // Pass when reachable, Warn otherwise (daemon being off doesn't break
@@ -1430,7 +1493,7 @@ fn check_daemon_reachable_impl(host: &str, port: u16) -> Check {
         Ok(a) => a,
         Err(_) => {
             return Check {
-                name: "daemon reachable".into(),
+                name: DAEMON_CHECK_NAME.into(),
                 status: Status::Warn,
                 message: format!("invalid address {}", addr),
                 hint: None,
@@ -1445,7 +1508,7 @@ fn check_daemon_reachable_impl(host: &str, port: u16) -> Check {
         Ok(s) => s,
         Err(_e) => {
             return Check {
-                name: "daemon reachable".into(),
+                name: DAEMON_CHECK_NAME.into(),
                 status: Status::Warn,
                 message: format!("daemon not reachable at {} (connection refused)", addr),
                 hint: Some(
@@ -1463,7 +1526,7 @@ fn check_daemon_reachable_impl(host: &str, port: u16) -> Check {
     let to = std::time::Duration::from_millis(1000);
     if stream.set_read_timeout(Some(to)).is_err() || stream.set_write_timeout(Some(to)).is_err() {
         return Check {
-            name: "daemon reachable".into(),
+            name: DAEMON_CHECK_NAME.into(),
             status: Status::Warn,
             message: format!(
                 "daemon at {} answered TCP but the probe couldn't set socket timeouts — skipping read to avoid hang",
@@ -1491,7 +1554,7 @@ fn check_daemon_reachable_impl(host: &str, port: u16) -> Check {
     let response = String::from_utf8_lossy(&buf[..n]);
     if n == 0 {
         return Check {
-            name: "daemon reachable".into(),
+            name: DAEMON_CHECK_NAME.into(),
             status: Status::Warn,
             message: format!("daemon at {} not responding to HTTP", addr),
             hint: Some("run `darkmux serve` to start the daemon for live viewing features".into()),
@@ -1499,17 +1562,24 @@ fn check_daemon_reachable_impl(host: &str, port: u16) -> Check {
     }
 
     if response.starts_with("HTTP/1.1 200") {
+        // Surface WHERE to open the viewer, not just that the daemon answers:
+        // the loopback URL (this machine) + the tailnet URL (phone / other
+        // tailnet device) when `tailscale serve` is proxying to this daemon.
+        let mut message = format!("reachable · viewer http://{addr}/");
+        if let Some(tn) = tailnet_viewer_url(port) {
+            message.push_str(&format!(" · phone {tn}"));
+        }
         Check {
-            name: "daemon reachable".into(),
+            name: DAEMON_CHECK_NAME.into(),
             status: Status::Pass,
-            message: format!("daemon reachable at {} (health check OK)", addr),
+            message,
             hint: None,
         }
     } else {
         // Port is open but not darkmux (or wrong endpoint).
         let first_line = response.lines().next().unwrap_or("");
         Check {
-            name: "daemon reachable".into(),
+            name: DAEMON_CHECK_NAME.into(),
             status: Status::Warn,
             message: format!(
                 "daemon not responding correctly at {}: {}",
@@ -2814,15 +2884,21 @@ pub fn print_report(r: &DoctorReport, verbose: bool) -> Result<()> {
         }
     } else {
         // The build identity line always shows (it answers "which version?",
-        // not a health question) — it bypasses pass-consolidation.
-        for c in r.checks.iter().filter(|c| c.name == BUILD_CHECK_NAME) {
+        // not a health question), and a PASSING daemon-reachable row always
+        // shows too (its message is the viewer's locator URLs — the thing the
+        // operator ran `doctor` to find). Both bypass pass-consolidation. A
+        // daemon that's down is a Warn and prints via the problem path below.
+        let always_show = |c: &&Check| {
+            c.name == BUILD_CHECK_NAME || (c.name == DAEMON_CHECK_NAME && c.status == Status::Pass)
+        };
+        for c in r.checks.iter().filter(always_show) {
             print_check_line(c);
         }
-        // The passing checks collapse to a count — `-v` for the full list.
+        // The remaining passing checks collapse to a count — `-v` for the full list.
         let collapsed = r
             .checks
             .iter()
-            .filter(|c| c.status == Status::Pass && c.name != BUILD_CHECK_NAME)
+            .filter(|c| c.status == Status::Pass && !always_show(c))
             .count();
         if collapsed > 0 {
             println!(
@@ -3229,6 +3305,28 @@ mod tests {
         assert!(b.contains("broken") && b.contains("daemon"), "highest severity wins: {b}");
     }
 
+    // ─── tailnet viewer URL (doctor surfaces where to open the viewer) ───
+    #[test]
+    fn parse_tailnet_viewer_url_matches_the_proxy_to_our_port() {
+        // The real `tailscale serve status --json` shape (captured live).
+        let json = r#"{"TCP":{"80":{"HTTP":true}},"Web":{"macbook-pro.taild82cbb.ts.net:80":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:8765"}}}}}"#;
+        assert_eq!(
+            parse_tailnet_viewer_url(json, 8765).as_deref(),
+            Some("http://macbook-pro.taild82cbb.ts.net/")
+        );
+        // A different daemon port → not our proxy → None.
+        assert_eq!(parse_tailnet_viewer_url(json, 9000), None);
+        // Served on 443 → https scheme.
+        let j443 = r#"{"Web":{"host.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:8765"}}}}}"#;
+        assert_eq!(parse_tailnet_viewer_url(j443, 8765).as_deref(), Some("https://host.ts.net/"));
+        // localhost proxy target is accepted too.
+        let jlocal = r#"{"Web":{"h.ts.net:80":{"Handlers":{"/":{"Proxy":"http://localhost:8765"}}}}}"#;
+        assert_eq!(parse_tailnet_viewer_url(jlocal, 8765).as_deref(), Some("http://h.ts.net/"));
+        // Not serving / empty / garbage → None (best-effort, never an error).
+        assert_eq!(parse_tailnet_viewer_url("{}", 8765), None);
+        assert_eq!(parse_tailnet_viewer_url("not json", 8765), None);
+    }
+
     // ─── check_daemon_auth (#881) ─────────────────────────────────────
     #[test]
     fn daemon_auth_status_arms() {
@@ -3438,7 +3536,14 @@ mod tests {
             "daemon reachable check should pass when health returns 200. Got message: {}",
             check.message
         );
-        assert!(check.message.contains("health check OK"));
+        // (viewer-url) Pass message now surfaces the loopback viewer URL; the
+        // tailnet/phone URL is absent here (nothing proxies to this random test
+        // port).
+        assert!(
+            check.message.contains(&format!("viewer http://127.0.0.1:{port}/")),
+            "Pass message should surface the loopback viewer URL. Got: {}",
+            check.message
+        );
 
         // Shutdown the server by dropping the listener (via a separate scope)
         drop(server_handle);
