@@ -949,13 +949,42 @@ pub fn compute_git_diff(
     worktree: &StdPath,
     base: &str,
 ) -> Result<(String, Vec<DiffFile>, Vec<String>, bool), String> {
-    // 1) unified diff text
-    let diff_out = Command::new("git")
+    // Hard cap on the returned diff text. Applied by STREAMING git's stdout
+    // (below) so a pathological diff never fully materializes in RAM, then
+    // again as a char-boundary truncation on the returned string.
+    const DIFF_TEXT_CAP: usize = 262_144;
+
+    // 1) unified diff text — stream stdout with the cap instead of buffering
+    //    all of it (a stray node_modules / regenerated lockfile / huge binary
+    //    change would otherwise buffer git's entire output before the cap
+    //    discards it). Read at most DIFF_TEXT_CAP+1 bytes; the +1 detects
+    //    that there was more, so the result is marked truncated.
+    let mut child = Command::new("git")
         .current_dir(worktree)
         .args(["diff", "--no-color", base])
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .map_err(|_| "git error".to_string())?;
-    let diff_text = String::from_utf8_lossy(&diff_out.stdout).to_string();
+    let mut diff_bytes: Vec<u8> = Vec::new();
+    let read_result = if let Some(mut out) = child.stdout.take() {
+        use std::io::Read;
+        out.by_ref()
+            .take(DIFF_TEXT_CAP as u64 + 1)
+            .read_to_end(&mut diff_bytes)
+            .map(|_| ())
+            .map_err(|_| "git error".to_string())
+    } else {
+        Ok(())
+    };
+    // Stop + reap git BEFORE propagating a read error, so an I/O failure never
+    // leaks the child. If the diff exceeded the cap we stopped reading, so git
+    // may still be writing into a now-full pipe; `git diff` is read-only (no
+    // index lock), so killing it is safe.
+    let _ = child.kill();
+    let _ = child.wait();
+    read_result?;
+    let diff_text = String::from_utf8_lossy(&diff_bytes).to_string();
 
     // 2) numstat (additions/deletions per file)
     let numstat_out = Command::new("git")
@@ -995,11 +1024,11 @@ pub fn compute_git_diff(
         });
     }
 
-    // Cap diff text at 262144 bytes (char boundary).
+    // Cap diff text at DIFF_TEXT_CAP bytes (char boundary).
     let mut truncated = false;
-    let diff_text = if diff_text.len() > 262144 {
+    let diff_text = if diff_text.len() > DIFF_TEXT_CAP {
         // Truncate at a char boundary.
-        let mut end = 262144;
+        let mut end = DIFF_TEXT_CAP;
         while end > 0 && !diff_text.is_char_boundary(end) {
             end -= 1;
         }
@@ -1066,7 +1095,17 @@ pub(crate) async fn diff_handler(
     // 1. Resolve session from flow records.
     let flows_dir = state.flows_dir.clone();
     let worktrees_base = state.worktrees_base.clone();
-    let (worktree, base, branch) = match resolve_session(&session_id, &flows_dir) {
+    // Offload the blocking session resolution (fs read_dir + line scans) to
+    // the blocking pool so it never occupies an async worker thread.
+    let resolved = tokio::task::spawn_blocking({
+        let session_id = session_id.clone();
+        let flows_dir = flows_dir.clone();
+        move || resolve_session(&session_id, &flows_dir)
+    })
+    .await
+    .ok()
+    .flatten();
+    let (worktree, base, branch) = match resolved {
         Some((wt, b, br)) => (wt, b, br),
         None => {
             return axum::Json(DiffResponse {
@@ -1116,8 +1155,16 @@ pub(crate) async fn diff_handler(
         .into_response();
     }
 
-    // 4. Compute diff.
-    let (diff_text, files, untracked, truncated) = match compute_git_diff(StdPath::new(&worktree), &base) {
+    // 4. Compute diff — three git subprocesses + file scans, offloaded to the
+    // blocking pool so a slow/hung git can't starve the async runtime.
+    let diff_result = tokio::task::spawn_blocking({
+        let worktree = worktree.clone();
+        let base = base.clone();
+        move || compute_git_diff(StdPath::new(&worktree), &base)
+    })
+    .await
+    .unwrap_or_else(|_| Err("diff task panicked".to_string()));
+    let (diff_text, files, untracked, truncated) = match diff_result {
         Ok(r) => r,
         Err(reason) => {
             return axum::Json(DiffResponse {
@@ -4636,6 +4683,96 @@ mod tests {
 
         let result = resolve_session("unknown", tmp.path());
         assert!(result.is_none(), "expected no match for unknown session");
+    }
+
+    /// A diff larger than the 256KB cap must come back truncated and bounded.
+    /// This exercises the streaming read path in `compute_git_diff` (which caps
+    /// git's stdout as it reads instead of buffering the whole diff first) and
+    /// asserts the returned text never exceeds the cap.
+    #[test]
+    fn compute_git_diff_caps_a_huge_diff() {
+        let wt = TempDir::new().unwrap();
+        let dir = wt.path();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .expect("git command");
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "t@t.com"]);
+        git(&["config", "user.name", "T"]);
+        fs::write(dir.join("seed.txt"), "seed\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "base"]);
+        let base = String::from_utf8(
+            Command::new("git")
+                .current_dir(dir)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        // Commit a file far larger than the 256KB cap, then diff HEAD vs base.
+        fs::write(dir.join("big.txt"), "x".repeat(600 * 1024)).unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "add big"]);
+
+        let (diff_text, _files, _untracked, truncated) =
+            compute_git_diff(dir, &base).expect("compute_git_diff");
+
+        assert!(truncated, "a >256KB diff must be marked truncated");
+        assert!(
+            diff_text.len() <= 262_144,
+            "diff text must be capped at 256KB, was {} bytes",
+            diff_text.len()
+        );
+    }
+
+    /// The other half of the cap contract: a normal sub-cap diff comes back with
+    /// the FULL text and `truncated == false` (guards against a cap-logic change
+    /// silently flipping small diffs to truncated).
+    #[test]
+    fn compute_git_diff_small_diff_not_truncated() {
+        let wt = TempDir::new().unwrap();
+        let dir = wt.path();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .expect("git command");
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "t@t.com"]);
+        git(&["config", "user.name", "T"]);
+        fs::write(dir.join("f.txt"), "one\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "base"]);
+        let base = String::from_utf8(
+            Command::new("git")
+                .current_dir(dir)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        fs::write(dir.join("f.txt"), "two\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "change"]);
+
+        let (diff_text, _files, _untracked, truncated) =
+            compute_git_diff(dir, &base).expect("compute_git_diff");
+        assert!(!truncated, "a small diff must not be truncated");
+        assert!(diff_text.contains("two"), "diff must carry the full change");
     }
 
     #[tokio::test]
