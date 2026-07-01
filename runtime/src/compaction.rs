@@ -387,6 +387,55 @@ fn conversation_long_enough_to_compact(message_count: usize) -> bool {
     message_count >= PRESERVE_HEAD + 1 + PRESERVE_TAIL
 }
 
+/// Snap the middle-replace boundaries off any tool-call/tool-result group
+/// they would otherwise split, growing the summarized middle outward on
+/// either side as needed.
+///
+/// The default boundaries (`PRESERVE_HEAD` head, `PRESERVE_TAIL` tail) are
+/// raw indices with no knowledge of tool-call grouping. Two ways they can
+/// split a group and produce a sequence the chat API rejects with HTTP 400
+/// on the next request:
+///
+/// - **Tail begins on a tool-result** whose parent assistant is in the
+///   replaced middle: after the splice the preserved tail leads with a
+///   `role:"tool"` message that has no preceding assistant `tool_calls`
+///   (an orphaned tool-result). Absorb those leading tool-results into the
+///   middle so they get summarized alongside their parent.
+/// - **Head ends on an assistant carrying `tool_calls`** whose results are
+///   in the replaced middle: the preserved head then ends with a dangling
+///   tool-call and no following tool responses. Absorb that assistant into
+///   the middle too.
+///
+/// Both adjustments only ever GROW the middle (start can decrease, end can
+/// increase), so the middle stays non-empty given the length pre-flight.
+/// In the edge case where the recent tail is entirely tool-results (an
+/// assistant made >= PRESERVE_TAIL parallel calls sitting at the tail), the
+/// tail loop can extend `end` to `n`, folding the whole tail into the summary:
+/// graceful degradation (the summary preserves what tools returned) and the
+/// only correct alternative to the 400.
+/// A conversation with clean boundaries is unchanged (the loops are no-ops).
+fn snap_boundaries_off_tool_groups(
+    messages: &[Message],
+    mut start: usize,
+    mut end: usize,
+) -> (usize, usize) {
+    let n = messages.len();
+    // Tail side: pull leading tool-results into the summarized middle.
+    while end < n && messages[end].role == "tool" {
+        end += 1;
+    }
+    // Head side: pull a trailing assistant-with-tool_calls into the middle.
+    while start > 0
+        && messages[start - 1]
+            .tool_calls
+            .as_ref()
+            .is_some_and(|calls| !calls.is_empty())
+    {
+        start -= 1;
+    }
+    (start, end)
+}
+
 /// Apply middle-replace compaction in-place on `messages`.
 ///
 /// Sends `messages[PRESERVE_HEAD .. n - PRESERVE_TAIL]` to the
@@ -410,8 +459,11 @@ pub fn compact(
         ));
     }
 
-    let middle_start = PRESERVE_HEAD;
-    let middle_end = n - PRESERVE_TAIL;
+    // Snap the raw head/tail boundaries off any tool-call group they'd
+    // split, so the preserved tail never leads with an orphaned tool-result
+    // (which the next chat() request rejects with HTTP 400).
+    let (middle_start, middle_end) =
+        snap_boundaries_off_tool_groups(messages, PRESERVE_HEAD, n - PRESERVE_TAIL);
     let middle_count = middle_end - middle_start;
 
     let middle_messages: Vec<Message> = messages[middle_start..middle_end].to_vec();
@@ -521,8 +573,11 @@ pub fn structured_compact(
         ));
     }
 
-    let middle_start = PRESERVE_HEAD;
-    let middle_end = n - PRESERVE_TAIL;
+    // Snap the raw head/tail boundaries off any tool-call group they'd
+    // split, so the preserved tail never leads with an orphaned tool-result
+    // (which the next chat() request rejects with HTTP 400).
+    let (middle_start, middle_end) =
+        snap_boundaries_off_tool_groups(messages, PRESERVE_HEAD, n - PRESERVE_TAIL);
     let middle_count = middle_end - middle_start;
 
     let middle_messages: Vec<Message> = messages[middle_start..middle_end].to_vec();
@@ -1358,6 +1413,95 @@ mod tests {
         // ACTUAL length, not a guess at a fixed index — it must equal the
         // spliced message's content length.
         assert_eq!(summary_chars, content.len());
+    }
+
+    /// Compaction must not orphan a tool-result at the preserved-tail
+    /// boundary. The head/tail slices are FIXED counts (PRESERVE_HEAD /
+    /// PRESERVE_TAIL); without boundary-snapping, a tail that begins on a
+    /// `role:"tool"` result whose parent assistant is in the replaced middle
+    /// leaves an orphaned tool message, and the next chat() request 400s.
+    /// `snap_boundaries_off_tool_groups` absorbs such leading tool-results
+    /// (and a trailing assistant-with-tool_calls on the head side) into the
+    /// summarized middle. This regression test drives the exact orphaning
+    /// layout and asserts the no-orphan invariant holds after compaction.
+    #[test]
+    #[serial_test::serial]
+    fn compact_tail_boundary_orphans_tool_result() {
+        let server = MockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200)
+                .json_body(chat_response_with_json_content("summary of the middle"));
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+
+        // n = 8. Raw middle = [2..4]; raw tail = [4,5,6,7].
+        // index 3: assistant WITH tool_calls id="call_A" (raw middle).
+        // index 4: tool-result for "call_A" (raw tail[0]) -> would be orphaned
+        // if the boundary weren't snapped outward to absorb it.
+        let assistant_with_call = Message {
+            role: "assistant".into(),
+            content: Some("calling read".into()),
+            tool_calls: Some(vec![crate::lmstudio::ToolCall {
+                id: "call_A".into(),
+                kind: "function".into(),
+                function: crate::lmstudio::FunctionCall {
+                    name: "read".into(),
+                    arguments: "{}".into(),
+                },
+            }]),
+            tool_call_id: None,
+            name: None,
+            reasoning_content: None,
+        };
+        let tool_result = Message {
+            role: "tool".into(),
+            content: Some("file contents".into()),
+            tool_calls: None,
+            tool_call_id: Some("call_A".into()),
+            name: None,
+            reasoning_content: None,
+        };
+        let mut messages = vec![
+            Message::system("sys"),          // 0 head
+            Message::user("task"),           // 1 head
+            Message::user("middle step"),    // 2 middle
+            assistant_with_call,             // 3 middle — parent
+            tool_result,                     // 4 raw tail[0] — must not orphan
+            Message::assistant("more work"), // 5 tail
+            Message::user("next"),           // 6 tail
+            Message::assistant("done"),      // 7 tail
+        ];
+
+        compact(&client, &mut messages, 1, &CompactionConfig::never_compact())
+            .expect("compaction succeeds");
+
+        // Invariant: every tool-result is immediately preceded by an
+        // assistant whose tool_calls include its tool_call_id.
+        let orphans: Vec<usize> = messages
+            .iter()
+            .enumerate()
+            .filter(|(i, m)| {
+                m.role == "tool" && {
+                    let tcid = m.tool_call_id.as_deref();
+                    let parent_ok = *i > 0
+                        && messages[i - 1].role == "assistant"
+                        && messages[i - 1]
+                            .tool_calls
+                            .as_ref()
+                            .is_some_and(|calls| calls.iter().any(|c| Some(c.id.as_str()) == tcid));
+                    !parent_ok
+                }
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        assert!(
+            orphans.is_empty(),
+            "compaction left orphaned tool-result message(s) at {:?}; roles = {:?}",
+            orphans,
+            messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>()
+        );
     }
 
     /// (#885) The narrative `compact` path is the DEFAULT strategy, so its
