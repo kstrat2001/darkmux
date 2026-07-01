@@ -344,6 +344,15 @@ pub fn publish_job(client: &redis::Client, job: &WorkJob) -> Result<String> {
     // claim budget on it. (#246 PR-C.2)
     job.validate()
         .context("validating WorkJob before publish")?;
+    // Ensure the consumer group exists BEFORE the XADD. The group is created
+    // at `$` (new-messages-only); if this job were XADD'd before any runner
+    // had ever created the group, the group's cursor would start AFTER it and
+    // the job would never be delivered — silent lost work (publish reports
+    // success, but `--wait` times out and no runner ever sees it). Creating
+    // the group here first guarantees its cursor precedes this message.
+    // Idempotent: an already-existing group returns BUSYGROUP, treated as ok.
+    init_consumer_group(client, crate::runner::RUNNER_CONSUMER_GROUP)
+        .context("ensuring the consumer group exists before publish")?;
     let mut conn = client
         .get_connection()
         .context("opening Redis connection to publish work job")?;
@@ -607,6 +616,56 @@ mod tests {
             published_by_orchestrator: None,
             attempt: 1,
         }
+    }
+
+    /// Regression: a job published BEFORE any runner ever created the consumer
+    /// group must still be delivered. `publish_job` creates the group (at `$`)
+    /// before the XADD, so the group's cursor precedes the message. Without
+    /// that, a later runner's `XGROUP CREATE ... $` sets the cursor AFTER the
+    /// already-published message and it is never delivered (silent lost work).
+    ///
+    /// Live-Redis test: gated on `DARKMUX_TEST_REDIS_URL` (skips when unset, so
+    /// CI without a Redis passes). Run locally with e.g.
+    /// `DARKMUX_TEST_REDIS_URL=redis://127.0.0.1:6379 cargo test -p darkmux-fleet`.
+    #[test]
+    fn publish_ensures_group_so_a_job_published_first_is_delivered() {
+        let Ok(url) = std::env::var("DARKMUX_TEST_REDIS_URL") else {
+            eprintln!("skipping publish_ensures_group_*: DARKMUX_TEST_REDIS_URL unset");
+            return;
+        };
+        let group = crate::runner::RUNNER_CONSUMER_GROUP;
+        let client = redis::Client::open(url).expect("open test redis");
+        let mut conn = client.get_connection().expect("test redis connection");
+
+        // Fresh-Redis scenario: no stream, no group yet.
+        let _: () = redis::cmd("DEL").arg(WORK_STREAM).query(&mut conn).unwrap();
+
+        // Publish BEFORE any runner exists. With the fix this creates the group
+        // first, then XADDs, so the message lands after the group cursor.
+        let id = publish_job(&client, &make_valid_job()).expect("publish");
+
+        // A runner starts now: init_consumer_group is idempotent (BUSYGROUP),
+        // and reading new messages with `>` must include the earlier publish.
+        init_consumer_group(&client, group).expect("runner init group");
+        let reply: redis::Value = redis::cmd("XREADGROUP")
+            .arg("GROUP")
+            .arg(group)
+            .arg("test-consumer")
+            .arg("COUNT")
+            .arg(10)
+            .arg("STREAMS")
+            .arg(WORK_STREAM)
+            .arg(">")
+            .query(&mut conn)
+            .expect("XREADGROUP");
+
+        // Clean up before asserting so a failure doesn't leak stream state.
+        let _: () = redis::cmd("DEL").arg(WORK_STREAM).query(&mut conn).unwrap();
+
+        assert!(
+            !matches!(reply, redis::Value::Nil),
+            "job {id} published before the group existed was not delivered (lost work)"
+        );
     }
 
     // ---- validate_identifier tests ----
