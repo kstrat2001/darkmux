@@ -2106,6 +2106,8 @@ const ACTIONS={
   catalog:()=>toggleCatalog(),
   goday:d=>{ location.href="/play/"+encodeURIComponent(d); },
   golive:()=>{ location.href="/"; },
+  gomission:id=>{ location.href="/?mission="+encodeURIComponent(id); },
+  gosession:id=>{ location.href="/?session="+encodeURIComponent(id); },
 };
 // (#1090) Shared dispatch for the delegated drill-nav — invoked by BOTH the
 // click handler and the keyboard handler below, so cards are mouse- AND
@@ -2182,11 +2184,15 @@ async function toggleCatalog(){
   if(!panel.hidden){ panel.hidden=true; return; }
   panel.innerHTML=`<div class="cathdr">loading…</div>`;
   panel.hidden=false;
-  let days=[];
-  try{
-    const r=await fetch("/flow-days",{headers:{accept:"application/json"}});
-    if(r.ok){ const b=await r.json(); days=Array.isArray(b.days)?b.days:[]; }
-  }catch(_){ /* render the empty/error state below */ }
+  let days=[], missions=[];
+  // Days-index + the cross-day mission catalog, in parallel (#691). allSettled,
+  // not all, so a /flow-missions failure doesn't also drop the days list.
+  const [rd,rm]=await Promise.allSettled([
+    fetch("/flow-days",{headers:{accept:"application/json"}}),
+    fetch("/flow-missions",{headers:{accept:"application/json"}}),
+  ]);
+  try{ if(rd.status==="fulfilled"&&rd.value.ok){ const b=await rd.value.json(); days=Array.isArray(b.days)?b.days:[]; } }catch(_){}
+  try{ if(rm.status==="fulfilled"&&rm.value.ok){ const b=await rm.value.json(); missions=Array.isArray(b.missions)?b.missions:[]; } }catch(_){}
   const today=todayUTC();
   const liveRow=`<button class="catrow live" data-act="golive"><div class="cd">● live · today</div><div class="cs">now-ish on present machines</div></button>`;
   const dayRows=days.map(d=>{
@@ -2198,8 +2204,22 @@ async function toggleCatalog(){
     const summary=`${disp} dispatch${disp===1?'':'es'} · ${recs} record${recs===1?'':'s'}${missTxt}`;
     return `<button class="catrow" data-act="goday" data-arg="${date}"><div class="cd">${date}${isToday?' · today':''}</div><div class="cs">${summary}</div></button>`;
   }).join("");
-  panel.innerHTML=`<div class="cathdr">playback catalog</div>${liveRow}`
-    +(days.length?dayRows:`<div class="catempty">no recorded days yet — dispatches you run will appear here.</div>`);
+  // (#691) Missions section — the cross-day catalog. Selecting a mission replays
+  // it by query (?mission=), stitching its records across every day it ran.
+  const missRows=missions.slice(0,50).map(m=>{
+    const id=esc(m.mission_id||"");
+    const disp=Number(m.dispatches)||0, recs=Number(m.records)||0;
+    const span=(m.first_date&&m.first_date!==m.last_date)
+      ? `${esc(m.first_date)}–${esc(m.last_date)}`
+      : esc(m.last_date||m.first_date||"");
+    const summary=`${disp} dispatch${disp===1?'':'es'} · ${recs} record${recs===1?'':'s'}${span?` · ${span}`:''}`;
+    return `<button class="catrow" data-act="gomission" data-arg="${id}"><div class="cd">▣ ${id}</div><div class="cs">${summary}</div></button>`;
+  }).join("");
+  const missSection=missions.length?`<div class="cathdr">missions</div>${missRows}`:"";
+  const daysSection=days.length
+    ? `<div class="cathdr">days</div>${dayRows}`
+    : `<div class="catempty">no recorded days yet — dispatches you run will appear here.</div>`;
+  panel.innerHTML=`<div class="cathdr">playback catalog</div>${liveRow}${missSection}${daysSection}`;
 }
 
 // resizable detail/log split — fixed default height stops the jumpiness; drag the divider to grow it
@@ -2296,6 +2316,19 @@ function targetDate(){
   const q=new URLSearchParams(location.search).get("date");
   if(q&&/^\d{4}-\d{2}-\d{2}$/.test(q))return q;
   return new Date().toISOString().slice(0,10);
+}
+// (#691) Replay-by-query: ?mission=<id> / ?session=<id> (or #mission=… / #session=…).
+// When present, boot loads that thing's records across ALL day files (the daemon
+// stitches them chronologically) and plays them back — the playback UNIT is the
+// mission/dispatch, not a calendar day. Returns null when no query is present.
+function catalogQuery(){
+  const p=new URLSearchParams(location.search);
+  const h=new URLSearchParams((location.hash||"").replace(/^#/,""));
+  const mission=(p.get("mission")||h.get("mission")||"").trim();
+  if(mission)return {kind:"mission", id:mission};
+  const session=(p.get("session")||h.get("session")||"").trim();
+  if(session)return {kind:"session", id:session};
+  return null;
 }
 
 function todayUTC(){return new Date().toISOString().slice(0,10);}
@@ -2645,13 +2678,31 @@ async function boot(){
   // directly — exactly the on-disk flow file the daemon would read for
   // /flow/<date>. No daemon, identical render path. Forces playback.
   const flowSrc=injectedMeta("darkmux-flow-src");
+  // (#691) Replay-by-query applies only against a daemon (the static demo has no
+  // catalog endpoints). A mission/session query forces playback of that thing.
+  const cq = flowSrc ? null : catalogQuery();
   let date=injectedDate||targetDate();
   // Playback mode is daemon-controlled (or static-flow-src driven): it forces
   // "play" regardless of whether the date happens to be today, and SSE is
   // never started. Live mode follows the original today=tail / past=replay.
-  const wantsPlayback = injectedMode==="play" || !!flowSrc;
+  const wantsPlayback = injectedMode==="play" || !!flowSrc || !!cq;
   let mode="empty";
-  if(flowSrc){
+  if(cq){
+    // (#691) Fetch the mission/dispatch's records across ALL day files — the
+    // daemon returns them chronologically — and play them back as one view.
+    // Degrades to empty on an older daemon without the catalog endpoints (404).
+    try{
+      const url = cq.kind==="mission" ? "/flow-mission/"+encodeURIComponent(cq.id)
+                                      : "/flow-session/"+encodeURIComponent(cq.id);
+      const res=await fetch(url,{headers:{accept:"application/json"}});
+      if(res.ok){ const body=await res.json(); RAW=Array.isArray(body.records)?body.records:[]; }
+      else RAW=[];
+    }catch(e){ RAW=[]; }
+    assignUids(RAW);
+    DATA=flowToRenderModel(RAW);
+    if(RAW.length)date=String(RAW[RAW.length-1].ts||RAW[0].ts||"").slice(0,10)||date;
+    mode = RAW.length?"play":"empty";
+  } else if(flowSrc){
     // Parse the flow file line-by-line, the way the daemon parses the on-disk
     // .jsonl — then it's the standard playback render path, nothing demo-specific.
     try{
@@ -2704,6 +2755,8 @@ async function boot(){
   state.t=tMax;
   state.filters={cat:new Set(FCATS),tier:new Set(FTIERS),src:new Set(FSRC),q:""};
   absorbNewFilterValues();
+  // (#691) A mission query scopes the view to that mission (reuses the drill).
+  if(cq&&cq.kind==="mission"&&RAW.length){ state.level="mission"; state.machine=null; state.session=null; state.missionId=cq.id; state.follow=true; }
   render();
   if(mode==="live"){ startLiveTail(date); startLivePoll(); }
 }
