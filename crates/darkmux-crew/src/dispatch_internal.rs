@@ -1127,15 +1127,20 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // absolute `threshold_tokens` > `threshold_ratio × window` > the 0.5×window
     // default (matching the runtime's DEFAULT_THRESHOLD_RATIO). Forwarded on
     // context telemetry so the viewer draws the trigger line.
-    let compaction_threshold = compaction
-        .threshold_tokens
-        .or_else(|| {
-            compaction
-                .threshold_ratio
-                .zip(compaction.context_window)
-                .map(|(r, w)| (w as f32 * r) as u32)
-        })
-        .or_else(|| compaction.context_window.map(|w| (w as f32 * 0.5) as u32));
+    // Both triggers can be set; the runtime's needs_compaction fires at whichever
+    // trips FIRST (min), so draw the effective earliest trigger — not just the
+    // absolute one. Fall back to ratio×window, then the 0.5×window default.
+    let abs_threshold = compaction.threshold_tokens;
+    let formula_threshold = compaction
+        .threshold_ratio
+        .zip(compaction.context_window)
+        .map(|(r, w)| (w as f32 * r) as u32);
+    let compaction_threshold = match (abs_threshold, formula_threshold) {
+        (Some(a), Some(f)) => Some(a.min(f)),
+        (a, f) => a
+            .or(f)
+            .or_else(|| compaction.context_window.map(|w| (w as f32 * 0.5) as u32)),
+    };
     let tailer_handle = {
         let stop = Arc::clone(&stop_flag);
         // (#out-of-band) The trajectory now lands in the out-dir, not the
