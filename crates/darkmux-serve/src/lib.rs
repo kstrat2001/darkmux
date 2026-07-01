@@ -210,6 +210,9 @@ pub(crate) fn build_router_with_worktrees_base(
         .route("/health", get(health))
         .route("/flow/:date", get(flow_handler))
         .route("/flow-days", get(flow_days_handler))
+        .route("/flow-missions", get(flow_missions_handler))
+        .route("/flow-mission/:id", get(flow_mission_handler))
+        .route("/flow-session/:id", get(flow_session_handler))
         .route("/flow-status", get(flow_status_handler))
         .route("/model/status", get(model_status_handler))
         .route("/machine/specs", get(machine_specs_handler))
@@ -1664,6 +1667,248 @@ fn scan_flow_days(flows_dir: &std::path::Path) -> Vec<serde_json::Value> {
             .cmp(a["date"].as_str().unwrap_or(""))
     });
     days
+}
+
+// ── #691: cross-day mission/dispatch catalog ──────────────────────────────────
+// `/flow-days` lists days; the catalog lists the units users actually think in —
+// missions and dispatch sessions — by scanning ACROSS day files. A mission that
+// spans midnight is one filtered view, not two unrelated day rows. Deliberately
+// DISK-backed (the durable per-day files), the same source seam as scan_flow_days
+// and distinct from the live view's Redis-fed rolling window. A mission_id /
+// session_id index is the scale path (not built here); streaming day files is
+// fine at per-operator scale.
+
+/// Max records returned by a single by-mission / by-session catalog fetch. A
+/// mission spanning many days could otherwise return an unbounded array; the cap
+/// matches the per-day file cap, and `truncated` flags when it's hit.
+const MAX_CATALOG_RECORDS: usize = 10_000;
+
+/// Validate a catalog id path param (mission_id / session_id). These are FILTER
+/// values compared to record fields, never filesystem paths — but bound the
+/// length + charset so a hostile client can't smuggle control bytes into a
+/// response or force a pathological scan.
+fn is_valid_catalog_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+}
+
+/// Visit every flow record across all `YYYY-MM-DD.jsonl` day files in
+/// `flows_dir`, OLDEST day first (so visitors see chronological order). Streams
+/// each file line-by-line (never whole-file), skipping blank + schema-header
+/// lines. Best-effort: unreadable/malformed files + lines are skipped. The
+/// visitor returns `ControlFlow::Break` to stop early (e.g. once a fetch hits its
+/// record cap). Shared cross-day scan primitive the catalog endpoints filter over
+/// (#691) — factored from the same read_dir + line-parse loop as scan_flow_days.
+fn for_each_flow_record_across_days(
+    flows_dir: &std::path::Path,
+    mut visit: impl FnMut(&str, &serde_json::Value) -> std::ops::ControlFlow<()>,
+) {
+    use std::io::BufRead;
+    let Ok(entries) = std::fs::read_dir(flows_dir) else {
+        return;
+    };
+    let mut day_files: Vec<(String, std::path::PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        let Some(date) = name.strip_suffix(".jsonl") else {
+            continue;
+        };
+        if is_valid_date(date).is_none() {
+            continue;
+        }
+        day_files.push((date.to_string(), entry.path()));
+    }
+    // Oldest-first → the visitor sees records in chronological order across days.
+    day_files.sort_by(|a, b| a.0.cmp(&b.0));
+    for (date, path) in day_files {
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        for line in std::io::BufReader::new(file).lines() {
+            let Ok(line) = line else { break };
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if v.get("_type").and_then(|t| t.as_str()) == Some("schema") {
+                continue;
+            }
+            if visit(&date, &v).is_break() {
+                return;
+            }
+        }
+    }
+}
+
+/// `GET /flow-missions` → the cross-day mission catalog: every `mission_id` seen
+/// across all day files, with a rollup (records, dispatch count, date span, ts
+/// span, machines), newest-activity first. The viewer lists these so you can
+/// "replay the mission" instead of hunting through days (#691). Disk-backed.
+async fn flow_missions_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let dir = state.flows_dir.clone();
+    let missions = tokio::task::spawn_blocking(move || scan_flow_missions(&dir))
+        .await
+        .unwrap_or_default();
+    axum::Json(serde_json::json!({
+        "missions": missions,
+        "generated_at_ms": current_millis(),
+    }))
+}
+
+fn scan_flow_missions(flows_dir: &std::path::Path) -> Vec<serde_json::Value> {
+    use std::collections::{BTreeSet, HashMap};
+    struct Agg {
+        records: u64,
+        dispatches: BTreeSet<String>,
+        machines: BTreeSet<String>,
+        first_ts: String,
+        last_ts: String,
+        first_date: String,
+        last_date: String,
+    }
+    let mut by_mission: HashMap<String, Agg> = HashMap::new();
+    for_each_flow_record_across_days(flows_dir, |date, v| {
+        let Some(mid) = v.get("mission_id").and_then(|m| m.as_str()) else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        if mid.is_empty() {
+            return std::ops::ControlFlow::Continue(());
+        }
+        let ts = v.get("ts").and_then(|t| t.as_str()).unwrap_or("");
+        let e = by_mission.entry(mid.to_string()).or_insert_with(|| Agg {
+            records: 0,
+            dispatches: BTreeSet::new(),
+            machines: BTreeSet::new(),
+            first_ts: ts.to_string(),
+            last_ts: ts.to_string(),
+            first_date: date.to_string(),
+            last_date: date.to_string(),
+        });
+        e.records += 1;
+        if !ts.is_empty() {
+            if e.first_ts.is_empty() || ts < e.first_ts.as_str() {
+                e.first_ts = ts.to_string();
+            }
+            if ts > e.last_ts.as_str() {
+                e.last_ts = ts.to_string();
+            }
+        }
+        if e.first_date.is_empty() || date < e.first_date.as_str() {
+            e.first_date = date.to_string();
+        }
+        if date > e.last_date.as_str() {
+            e.last_date = date.to_string();
+        }
+        let action = v.get("action").and_then(|a| a.as_str()).unwrap_or("");
+        if action == "dispatch.start" || action == "dispatch start" {
+            if let Some(s) = v.get("session_id").and_then(|s| s.as_str()) {
+                e.dispatches.insert(s.to_string());
+            }
+        }
+        if let Some(mach) = v.get("machine_id").and_then(|m| m.as_str()) {
+            if !mach.is_empty() {
+                e.machines.insert(mach.to_string());
+            }
+        }
+        std::ops::ControlFlow::Continue(())
+    });
+    let mut out: Vec<serde_json::Value> = by_mission
+        .into_iter()
+        .map(|(mid, a)| {
+            serde_json::json!({
+                "mission_id": mid,
+                "records": a.records,
+                "dispatches": a.dispatches.len(),
+                "machines": a.machines.into_iter().collect::<Vec<_>>(),
+                "first_ts": a.first_ts,
+                "last_ts": a.last_ts,
+                "first_date": a.first_date,
+                "last_date": a.last_date,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b["last_ts"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(a["last_ts"].as_str().unwrap_or(""))
+    });
+    out
+}
+
+/// `GET /flow-mission/:id` → the flow records for one mission, across days, in
+/// chronological order (the "replay this mission" payload the viewer loads).
+async fn flow_mission_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    catalog_records_response(state, "mission_id", id).await
+}
+
+/// `GET /flow-session/:id` → the flow records for one dispatch session, across
+/// days (the "replay this dispatch" payload).
+async fn flow_session_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    catalog_records_response(state, "session_id", id).await
+}
+
+async fn catalog_records_response(
+    state: AppState,
+    field: &'static str,
+    id: String,
+) -> axum::response::Response {
+    if !is_valid_catalog_id(&id) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            "invalid id (alphanumeric + -_.: , <=128 chars)",
+        )
+            .into_response();
+    }
+    let dir = state.flows_dir.clone();
+    let (records, truncated) =
+        tokio::task::spawn_blocking(move || collect_records_by_field(&dir, field, &id))
+            .await
+            .unwrap_or_else(|_| (Vec::new(), false));
+    axum::Json(serde_json::json!({
+        "records": records,
+        "count": records.len(),
+        "truncated": truncated,
+        "generated_at_ms": current_millis(),
+    }))
+    .into_response()
+}
+
+/// Collect every record whose top-level string `field` equals `id`, across all
+/// day files in chronological order, bounded at MAX_CATALOG_RECORDS. Returns the
+/// records + whether the cap truncated the result. Stops scanning once the cap is
+/// hit (ControlFlow::Break) rather than reading the rest of history.
+fn collect_records_by_field(
+    flows_dir: &std::path::Path,
+    field: &str,
+    id: &str,
+) -> (Vec<serde_json::Value>, bool) {
+    let mut records: Vec<serde_json::Value> = Vec::new();
+    let mut truncated = false;
+    for_each_flow_record_across_days(flows_dir, |_date, v| {
+        if v.get(field).and_then(|f| f.as_str()) == Some(id) {
+            if records.len() >= MAX_CATALOG_RECORDS {
+                truncated = true;
+                return std::ops::ControlFlow::Break(());
+            }
+            records.push(v.clone());
+        }
+        std::ops::ControlFlow::Continue(())
+    });
+    (records, truncated)
 }
 
 /// Aggregate the day's flow records — Redis-when-available, file-otherwise.
@@ -3191,6 +3436,111 @@ mod tests {
         let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["days"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn flow_missions_rolls_up_a_mission_across_days() {
+        // #691: a mission spanning two day files is ONE catalog entry, not two.
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("2026-05-12.jsonl"),
+            "{\"_type\":\"schema\",\"version\":\"1.0.0\"}\n\
+             {\"action\":\"dispatch.start\",\"session_id\":\"S1\",\"mission_id\":\"m1\",\"machine_id\":\"studio\",\"ts\":\"2026-05-12T10:00:00Z\"}\n\
+             {\"action\":\"dispatch.turn\",\"session_id\":\"S1\",\"mission_id\":\"m1\",\"machine_id\":\"studio\",\"ts\":\"2026-05-12T10:01:00Z\"}\n",
+        ).unwrap();
+        fs::write(
+            tmp.path().join("2026-05-14.jsonl"),
+            "{\"action\":\"dispatch.start\",\"session_id\":\"S2\",\"mission_id\":\"m1\",\"machine_id\":\"laptop\",\"ts\":\"2026-05-14T09:00:00Z\"}\n\
+             {\"action\":\"dispatch.turn\",\"session_id\":\"S2\",\"mission_id\":\"m1\",\"machine_id\":\"laptop\",\"ts\":\"2026-05-14T09:01:00Z\"}\n\
+             {\"action\":\"dispatch.start\",\"session_id\":\"S3\",\"mission_id\":\"m2\",\"machine_id\":\"studio\",\"ts\":\"2026-05-14T09:05:00Z\"}\n",
+        ).unwrap();
+
+        let app = build_router(tmp.path().to_path_buf());
+        let response = app
+            .oneshot(Request::builder().uri("/flow-missions").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 8192).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let missions = json["missions"].as_array().expect("missions array");
+        assert_eq!(missions.len(), 2, "two distinct missions");
+        let m1 = missions.iter().find(|m| m["mission_id"] == "m1").expect("m1 present");
+        assert_eq!(m1["records"], 4, "m1's records span BOTH day files");
+        assert_eq!(m1["dispatches"], 2, "S1 + S2");
+        assert_eq!(m1["first_date"], "2026-05-12");
+        assert_eq!(m1["last_date"], "2026-05-14");
+        assert_eq!(m1["first_ts"], "2026-05-12T10:00:00Z");
+        assert_eq!(m1["last_ts"], "2026-05-14T09:01:00Z");
+        assert_eq!(m1["machines"], serde_json::json!(["laptop", "studio"]));
+        // Newest activity first: m2's last dispatch (09:05) is newer than m1's (09:01).
+        assert_eq!(missions[0]["mission_id"], "m2");
+    }
+
+    #[tokio::test]
+    async fn flow_mission_returns_records_across_days_chronologically() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("2026-05-12.jsonl"),
+            "{\"session_id\":\"S1\",\"mission_id\":\"m1\",\"ts\":\"2026-05-12T10:00:00Z\"}\n",
+        ).unwrap();
+        fs::write(
+            tmp.path().join("2026-05-14.jsonl"),
+            "{\"session_id\":\"S2\",\"mission_id\":\"m1\",\"ts\":\"2026-05-14T09:00:00Z\"}\n\
+             {\"session_id\":\"S3\",\"mission_id\":\"m2\",\"ts\":\"2026-05-14T09:05:00Z\"}\n",
+        ).unwrap();
+        let app = build_router(tmp.path().to_path_buf());
+        let response = app
+            .oneshot(Request::builder().uri("/flow-mission/m1").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 8192).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let records = json["records"].as_array().expect("records array");
+        assert_eq!(records.len(), 2, "both m1 records across days; m2 excluded");
+        assert_eq!(json["truncated"], false);
+        // Chronological: the 05-12 record precedes the 05-14 record.
+        assert_eq!(records[0]["ts"], "2026-05-12T10:00:00Z");
+        assert_eq!(records[1]["ts"], "2026-05-14T09:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn flow_session_returns_only_that_sessions_records() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("2026-05-12.jsonl"),
+            "{\"session_id\":\"S1\",\"mission_id\":\"m1\",\"ts\":\"2026-05-12T10:00:00Z\"}\n\
+             {\"session_id\":\"S2\",\"mission_id\":\"m1\",\"ts\":\"2026-05-12T10:05:00Z\"}\n",
+        ).unwrap();
+        let app = build_router(tmp.path().to_path_buf());
+        let response = app
+            .oneshot(Request::builder().uri("/flow-session/S1").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 8192).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let records = json["records"].as_array().expect("records array");
+        assert_eq!(records.len(), 1, "only S1 (S2 excluded)");
+        assert_eq!(records[0]["session_id"], "S1");
+    }
+
+    #[tokio::test]
+    async fn flow_catalog_rejects_invalid_id() {
+        let tmp = TempDir::new().unwrap();
+        let app = build_router(tmp.path().to_path_buf());
+        let long = "a".repeat(200); // > 128-char cap → invalid
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/flow-mission/{long}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
