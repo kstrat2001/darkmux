@@ -140,8 +140,16 @@ fn runner_main() {
                 if !run_with_panic_guard(&work_id, || handle_claimed_job(&client, *claimed)) {
                     // The handler panicked before its own ack — release the
                     // lease so the entry doesn't sit pending forever. A second
-                    // XACK on an already-acked id is a harmless no-op.
-                    let _ = ack_job(&client, RUNNER_CONSUMER_GROUP, &work_id);
+                    // XACK on an already-acked id is a harmless no-op. Log on
+                    // failure to match the normal-path ack's discipline.
+                    if let Err(e) = ack_job(&client, RUNNER_CONSUMER_GROUP, &work_id) {
+                        eprintln!(
+                            "{}",
+                            darkmux_types::style::warn(&format!(
+                                "darkmux-runner: fallback XACK after panic failed for {work_id}: {e:#}"
+                            ))
+                        );
+                    }
                 }
             }
             Ok(ClaimOutcome::Malformed { work_id, reason }) => {
