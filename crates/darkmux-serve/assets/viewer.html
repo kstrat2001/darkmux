@@ -2441,7 +2441,16 @@ function applyLive(){
   // (#794) Rebuild SEEN_KEYS after an age-out so it tracks exactly what's in
   // RAW — keeps the dedup set bounded and lets a record legitimately re-enter
   // if it ever ages out and is re-sent.
-  if(RAW.length&&T(RAW[0].ts)<cut){RAW=RAW.filter(r=>T(r.ts)>=cut);rebuildSeen();}
+  if(RAW.length&&T(RAW[0].ts)<cut){
+    RAW=RAW.filter(r=>T(r.ts)>=cut);rebuildSeen();
+    // Prune runtimeUids for sessions that aged out of RAW. It's the one
+    // per-session structure the age-out doesn't otherwise reclaim (SEEN_KEYS is
+    // rebuilt above, LIVE_SESSIONS/LIVE_MACHINES are cleared+rebuilt), so a
+    // long-lived live tab would grow it unbounded — one entry per distinct
+    // session_id ever seen. Deleting during Map iteration is safe.
+    const liveSids=new Set(); for(const r of RAW)if(r.session_id)liveSids.add(r.session_id);
+    for(const sid of runtimeUids.keys())if(!liveSids.has(sid))runtimeUids.delete(sid);
+  }
   DATA=flowToRenderModel(RAW);
   recompute();
   absorbNewFilterValues();
