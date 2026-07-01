@@ -11,6 +11,22 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 
 ## [Unreleased]
 
+## [1.13.1] - 2026-07-01
+
+A stability patch from a review-swarm audit of the recently-shipped code: five
+bug fixes across the runtime, fleet queue, serve daemon, and viewer, plus two
+message/comment cleanups. No schema changes (`FLOW_SCHEMA` stays `1.14.0`,
+`CONFIG_SCHEMA` `1.1`), so it stays fully compatible with a v1.13.0 peer/hub.
+
+### Fixed
+
+- **Compaction no longer orphans a tool-result at the tail boundary** (runtime, #1158). Compaction preserved a fixed head + tail using raw indices; when the preserved tail began on a `tool` result whose parent assistant was in the summarized middle, the next model request failed with HTTP 400 — hard-failing an otherwise-productive dispatch (an opaque "LMStudio returned 400", non-deterministic so it read as flaky). Boundaries now snap off tool-call groups.
+- **A dispatch panic no longer silently kills the fleet runner** (fleet, #1159). A panic (not an `Err`) in the dispatch path unwound the runner thread; the daemon kept serving and the presence heartbeat kept emitting, so it looked healthy while the machine stopped claiming work forever. The claim loop now catches the panic, releases the queue lease, and continues.
+- **No more silently-lost jobs published before a runner exists** (fleet, #1160). A `--machine` dispatch to a target whose daemon had never run (or a fresh Redis) was dropped, because `XGROUP CREATE … $` parks the group cursor after the message. `publish_job` now ensures the consumer group exists before the `XADD`.
+- **`/diff` no longer blocks the async runtime or over-allocates** (serve, #1161). The handler ran three `git` subprocesses inline on an async worker (executor-starvation risk) and buffered git's entire stdout before truncating to 256KB. It now offloads to the blocking pool and streams stdout under the cap.
+- **The live viewer no longer leaks per-session ids on a long-lived tab** (viewer, #1162). `runtimeUids` escaped the rolling-window age-out and grew unbounded on an always-on tab (phone dashboard / hub viewer); it's now pruned alongside the window trim.
+- The daemon-unreachable nudge is brew-aware ("start the daemon: `brew services start darkmux`" instead of "run `darkmux serve` in another tab"), and the serve-wrapper header comment no longer describes pre-#661 Redis behavior (#1163).
+
 ## [1.13.0] - 2026-06-30
 
 The fleet-foundation + self-diagnosing-doctor release: declare a machine's fleet
@@ -710,6 +726,7 @@ cluster of crew-index correctness repairs.
   idle machine's bar no longer stretches to the playhead; adds the first
   viewer-lifecycle e2e regression gate.
 
+[1.13.1]: https://github.com/kstrat2001/darkmux/releases/tag/v1.13.1
 [1.13.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.13.0
 [1.12.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.12.0
 [1.11.2]: https://github.com/kstrat2001/darkmux/releases/tag/v1.11.2
