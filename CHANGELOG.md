@@ -11,6 +11,18 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 
 ## [Unreleased]
 
+## [1.14.0] - 2026-07-02
+
+Cross-day playback discoverability + a run-detail telemetry-panel overhaul. Drop-in over 1.13.1 — no `FLOW_SCHEMA` / `RULES_SCHEMA` / `CONFIG_SCHEMA` change.
+
+### Added
+- **Cross-day mission/dispatch catalog** (#691) — playback is now navigable by the *thing that ran*, not just by calendar day. Disk-backed endpoints `GET /flow-missions` (a rollup across every day file), `GET /flow-mission/:id`, and `GET /flow-session/:id` (#1166), plus a viewer catalog with a missions section and `?mission=`/`?session=` replay-by-query that stitches a mission's records across every day it touched (#1167).
+
+### Fixed
+- **Run-detail telemetry panel** overhaul (#1169): CPU and context charts now share one wall-clock time axis (they were on different scales); context is a step-area with a marker at every turn — visible even when a turn's token delta is sub-pixel — left-anchored at t=0, with a green→amber→red fullness gradient and a labeled window ceiling; CPU is shown in **cores busy** (docker's per-core % scales past 100% on many-core machines, so a 100% floor was useless); a dashed line marks the compaction-trigger level; the `model (lms)` panel populates on the dispatch's first sample instead of reading "no telemetry yet"; and long session ids in crew cards wrap instead of overflowing.
+
+Note: cargo `1.14.0` numerically coincides with `FLOW_SCHEMA` `1.14.0` — these are independent version lines (the binary vs. the flow-record data shape), not coupled.
+
 ## [1.13.1] - 2026-07-01
 
 A stability patch from a review-swarm audit of the recently-shipped code: five
@@ -726,6 +738,7 @@ cluster of crew-index correctness repairs.
   idle machine's bar no longer stretches to the playhead; adds the first
   viewer-lifecycle e2e regression gate.
 
+[1.14.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.14.0
 [1.13.1]: https://github.com/kstrat2001/darkmux/releases/tag/v1.13.1
 [1.13.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.13.0
 [1.12.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.12.0
