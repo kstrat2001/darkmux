@@ -1,6 +1,6 @@
 [package]
 name = "darkmux-types"
-version = "1.13.1"
+version = "1.14.0"
 edition = "2021"
 description = "darkmux foundation crate — Profile schema + workspace-path resolver"
 license = "MIT"
