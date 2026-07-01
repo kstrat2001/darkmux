@@ -1680,8 +1680,9 @@ fn scan_flow_days(flows_dir: &std::path::Path) -> Vec<serde_json::Value> {
 
 /// Max records returned by a single by-mission / by-session catalog fetch. A
 /// mission spanning many days could otherwise return an unbounded array; the cap
-/// matches the per-day file cap, and `truncated` flags when it's hit.
-const MAX_CATALOG_RECORDS: usize = 10_000;
+/// is tied structurally to the per-day file cap (`MAX_FLOW_FILE_RECORDS`) so the
+/// two can't drift, and `truncated` flags when it's hit.
+const MAX_CATALOG_RECORDS: usize = MAX_FLOW_FILE_RECORDS;
 
 /// Validate a catalog id path param (mission_id / session_id). These are FILTER
 /// values compared to record fields, never filesystem paths — but bound the
