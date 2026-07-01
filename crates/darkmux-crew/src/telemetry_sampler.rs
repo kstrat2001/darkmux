@@ -156,6 +156,21 @@ mod tests {
     }
 
     #[test]
+    fn lms_diff_from_empty_emits_every_resident_model_as_a_baseline_load() {
+        // The dispatch's first sample diffs the resident stack against an empty
+        // prev (the "no telemetry yet" fix): every resident model — the selected
+        // primary AND the compactor — surfaces as a baseline load so the model
+        // section reflects what's serving the run.
+        let cur = vec![loaded("primary", "18.00 GB"), loaded("compactor", "2.00 GB")];
+        let diff = lms_diff(&[], &cur);
+        assert_eq!(diff.len(), 2, "both resident models emit as loads; got {diff:?}");
+        assert!(diff.iter().all(|p| p["event"] == "load"));
+        let models: std::collections::HashSet<&str> =
+            diff.iter().map(|p| p["model"].as_str().unwrap()).collect();
+        assert!(models.contains("primary") && models.contains("compactor"));
+    }
+
+    #[test]
     fn parse_cpu_percent_handles_values_and_garbage() {
         assert_eq!(parse_cpu_percent("38.00%"), Some(38));
         assert_eq!(parse_cpu_percent("0.00%"), Some(0));
