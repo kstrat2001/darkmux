@@ -14,8 +14,9 @@
 #      the wrapper points the daemon at 127.0.0.1 for the local connection
 #      (peers point at the hub's tailnet address in THEIR rc files, not
 #      through this wrapper).
-#   2. If the Keychain item does NOT exist, skip the URL — the daemon falls
-#      back to LocalFile-only sink composition (single-machine mode).
+#   2. If the Keychain item does NOT exist, skip the URL. `darkmux serve` then
+#      resolves Redis from config.redis (enabled + host) if the operator set it
+#      (password-less on a trusted tailnet), else runs LocalFile-only.
 #   3. exec darkmux serve with localhost bind (CORS posture stays
 #      localhost-only by default; cross-network viewer access is an opt-in
 #      env var per the always-on hub guide).
