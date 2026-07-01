@@ -65,8 +65,9 @@ pub fn nudge_if_daemon_unreachable(verb_hint: &str) {
         return;
     }
     eprintln!(
-        "[!] darkmux serve isn't reachable on {} — `{}` will write flow records to disk \
-         but you won't see them live. To enable live viewing, run `darkmux serve` in another tab.",
+        "[!] darkmux serve isn't reachable on {}. `{}` will write flow records to disk \
+         but you won't see them live. To enable live viewing, start the daemon: \
+         `brew services start darkmux` (or `darkmux serve` from source).",
         DEFAULT_DAEMON_ADDR, verb_hint
     );
 }
