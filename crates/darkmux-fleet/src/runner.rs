@@ -50,6 +50,34 @@ pub fn spawn_runner_thread() -> std::thread::JoinHandle<()> {
         .expect("spawn darkmux-runner thread")
 }
 
+/// Run one claimed-job handler with panic isolation.
+///
+/// The dispatch path (`dispatch()` → docker / openclaw shell-out + downstream
+/// libs) can PANIC, not just return `Err`. Without a guard the panic unwinds
+/// this spawned thread and kills it: the daemon keeps serving every endpoint
+/// (and the presence heartbeat keeps emitting, so it looks healthy) while the
+/// machine silently stops claiming work forever. Catch the unwind so a single
+/// bad dispatch can't take the runner down.
+///
+/// Returns `true` if the handler completed (normally or with a handled `Err`),
+/// `false` if it panicked — the caller then XACKs to release the queue lease,
+/// since a panic aborts before the handler's own ack.
+fn run_with_panic_guard<F: FnOnce()>(work_id: &str, f: F) -> bool {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(()) => true,
+        Err(_) => {
+            eprintln!(
+                "{}",
+                darkmux_types::style::error(&format!(
+                    "darkmux-runner: dispatch PANICKED for work_id={work_id}; runner surviving. \
+                     XACK-ing to release the queue lease (the panic aborted before the normal ack)."
+                ))
+            );
+            false
+        }
+    }
+}
+
 /// Entry point for the runner thread. Reads env config, opens Redis,
 /// initializes the consumer group, then loops on claim/dispatch/ack.
 fn runner_main() {
@@ -106,7 +134,15 @@ fn runner_main() {
                 continue;
             }
             Ok(ClaimOutcome::Job(claimed)) => {
-                handle_claimed_job(&client, *claimed);
+                // Isolate the dispatch: a panic here would otherwise unwind
+                // and kill this thread, silently ending queue participation.
+                let work_id = claimed.work_id.clone();
+                if !run_with_panic_guard(&work_id, || handle_claimed_job(&client, *claimed)) {
+                    // The handler panicked before its own ack — release the
+                    // lease so the entry doesn't sit pending forever. A second
+                    // XACK on an already-acked id is a harmless no-op.
+                    let _ = ack_job(&client, RUNNER_CONSUMER_GROUP, &work_id);
+                }
             }
             Ok(ClaimOutcome::Malformed { work_id, reason }) => {
                 // (#903) A poison entry: claimed into this consumer's PEL but
@@ -308,6 +344,29 @@ impl WorkJob {
             // `None` → the runner's default slim image.
             image: self.image,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run_with_panic_guard;
+
+    #[test]
+    fn panic_guard_catches_panic_and_reports_false() {
+        // A panicking dispatch must be CAUGHT (returns false), not propagated:
+        // propagation unwinds the runner thread and permanently ends queue
+        // participation. (The default panic hook prints the simulated panic
+        // below; that stderr line is expected test noise.)
+        let completed = run_with_panic_guard("w-panic", || panic!("simulated dispatch panic"));
+        assert!(!completed, "a panicking dispatch must be caught, not propagated");
+    }
+
+    #[test]
+    fn panic_guard_runs_and_reports_normal_completion() {
+        let mut ran = false;
+        let completed = run_with_panic_guard("w-ok", || ran = true);
+        assert!(completed, "a normal handler reports completion");
+        assert!(ran, "the handler closure must actually run");
     }
 }
 
