@@ -967,18 +967,23 @@ pub fn compute_git_diff(
         .spawn()
         .map_err(|_| "git error".to_string())?;
     let mut diff_bytes: Vec<u8> = Vec::new();
-    if let Some(mut out) = child.stdout.take() {
+    let read_result = if let Some(mut out) = child.stdout.take() {
         use std::io::Read;
         out.by_ref()
             .take(DIFF_TEXT_CAP as u64 + 1)
             .read_to_end(&mut diff_bytes)
-            .map_err(|_| "git error".to_string())?;
-    }
-    // Stop + reap git. If the diff exceeded the cap we stopped reading, so git
+            .map(|_| ())
+            .map_err(|_| "git error".to_string())
+    } else {
+        Ok(())
+    };
+    // Stop + reap git BEFORE propagating a read error, so an I/O failure never
+    // leaks the child. If the diff exceeded the cap we stopped reading, so git
     // may still be writing into a now-full pipe; `git diff` is read-only (no
     // index lock), so killing it is safe.
     let _ = child.kill();
     let _ = child.wait();
+    read_result?;
     let diff_text = String::from_utf8_lossy(&diff_bytes).to_string();
 
     // 2) numstat (additions/deletions per file)
@@ -4727,6 +4732,47 @@ mod tests {
             "diff text must be capped at 256KB, was {} bytes",
             diff_text.len()
         );
+    }
+
+    /// The other half of the cap contract: a normal sub-cap diff comes back with
+    /// the FULL text and `truncated == false` (guards against a cap-logic change
+    /// silently flipping small diffs to truncated).
+    #[test]
+    fn compute_git_diff_small_diff_not_truncated() {
+        let wt = TempDir::new().unwrap();
+        let dir = wt.path();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .expect("git command");
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "t@t.com"]);
+        git(&["config", "user.name", "T"]);
+        fs::write(dir.join("f.txt"), "one\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "base"]);
+        let base = String::from_utf8(
+            Command::new("git")
+                .current_dir(dir)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        fs::write(dir.join("f.txt"), "two\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "change"]);
+
+        let (diff_text, _files, _untracked, truncated) =
+            compute_git_diff(dir, &base).expect("compute_git_diff");
+        assert!(!truncated, "a small diff must not be truncated");
+        assert!(diff_text.contains("two"), "diff must carry the full change");
     }
 
     #[tokio::test]
