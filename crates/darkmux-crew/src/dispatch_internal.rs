@@ -1123,6 +1123,24 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     ));
 
     let stop_flag = Arc::new(AtomicBool::new(false));
+    // (#threshold) Effective compaction threshold the runtime triggers at:
+    // absolute `threshold_tokens` > `threshold_ratio × window` > the 0.5×window
+    // default (matching the runtime's DEFAULT_THRESHOLD_RATIO). Forwarded on
+    // context telemetry so the viewer draws the trigger line.
+    // Both triggers can be set; the runtime's needs_compaction fires at whichever
+    // trips FIRST (min), so draw the effective earliest trigger — not just the
+    // absolute one. Fall back to ratio×window, then the 0.5×window default.
+    let abs_threshold = compaction.threshold_tokens;
+    let formula_threshold = compaction
+        .threshold_ratio
+        .zip(compaction.context_window)
+        .map(|(r, w)| (w as f32 * r) as u32);
+    let compaction_threshold = match (abs_threshold, formula_threshold) {
+        (Some(a), Some(f)) => Some(a.min(f)),
+        (a, f) => a
+            .or(f)
+            .or_else(|| compaction.context_window.map(|w| (w as f32 * 0.5) as u32)),
+    };
     let tailer_handle = {
         let stop = Arc::clone(&stop_flag);
         // (#out-of-band) The trajectory now lands in the out-dir, not the
@@ -1145,6 +1163,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
                 stop,
                 inactivity_deadline,
                 inactivity_secs,
+                compaction_threshold,
             )
         })
     };
@@ -1554,6 +1573,7 @@ fn run_tailer(
     stop_flag: Arc<AtomicBool>,
     inactivity_deadline: Arc<Mutex<Instant>>,
     inactivity_secs: u64,
+    compaction_threshold: Option<u32>,
 ) -> TrajectorySummary {
     let trajectory_path = out_dir
         .join(".darkmux-runtime")
@@ -1566,7 +1586,8 @@ fn run_tailer(
         inactivity_deadline,
         inactivity_secs,
     )
-    .with_mission(mission_id, sprint_id);
+    .with_mission(mission_id, sprint_id)
+    .with_compaction_threshold(compaction_threshold);
 
     loop {
         state.poll_and_emit();
@@ -1593,15 +1614,16 @@ fn run_tailer(
 /// previous tick's via `telemetry_sampler::lms_diff`; only CHANGES emit
 /// (`{event:"load"|"unload", model, gb?}`).
 ///
-/// **`prev` seeding choice**: `prev` is seeded with the FIRST sample
-/// (`prev = Vec::new()` initially, but the first iteration computes a diff
-/// against an empty `prev` ONLY when we want the initial set as loads).
-/// We chose to **seed `prev` on the first iteration and emit nothing** —
-/// the models already resident when the dispatch starts are pre-existing
-/// state, not a load this dispatch caused, so emitting them as "load"
-/// events would be spurious. Only loads/unloads that happen DURING the
-/// dispatch surface. Implemented via the `seeded` flag: first tick sets
-/// `prev = cur` and skips the diff; subsequent ticks diff normally.
+/// **`prev` seeding choice**: the first successful sample emits a BASELINE
+/// "load" for every resident model (diffs `cur` against an empty `prev`),
+/// then seeds `prev = cur`; subsequent ticks diff normally. The dispatch's
+/// model is loaded/selected just BEFORE this sampler thread starts, so the
+/// earlier "seed silently, emit nothing" choice meant the run's own model
+/// never surfaced and the viewer's model section read "no telemetry yet".
+/// Showing the resident set that's serving the dispatch (which is what the
+/// `model (lms)` panel is for) beats emitting nothing; any unrelated user
+/// models that happen to be resident are minor, informative noise.
+/// Implemented via the `seeded` flag.
 ///
 /// **process (`source=process`)**: `docker stats <container> --no-stream
 /// --format "{{.CPUPerc}}"` → `parse_cpu_percent` → `{cpu:<N>}`. This is
@@ -1650,9 +1672,16 @@ fn run_telemetry_sampler(
         // transient lms hiccup doesn't emit a flurry of spurious unloads.
         if let Ok(cur) = darkmux_profiles::lms::list_loaded() {
             if !seeded {
-                // First successful sample: seed `prev`, emit nothing. The
-                // already-resident models are pre-existing state, not a
-                // load this dispatch caused.
+                // First successful sample: emit a baseline "load" for every
+                // resident model (diff against empty) so the viewer's model
+                // section shows what's actually serving THIS dispatch. darkmux
+                // loads/selects the model just BEFORE the sampler thread starts,
+                // so treating the resident set as "pre-existing, emit nothing"
+                // meant the dispatch's own model never appeared — the panel read
+                // "no telemetry yet" for a run that clearly had a model loaded.
+                for payload in crate::telemetry_sampler::lms_diff(&[], &cur) {
+                    emit("lms", "telemetry.lms", payload);
+                }
                 prev = cur;
                 seeded = true;
             } else {
@@ -1765,6 +1794,11 @@ struct TailerState {
     /// reset path.
     inactivity_deadline: Option<Arc<Mutex<Instant>>>,
     inactivity_secs: u64,
+    /// (#threshold) Effective compaction threshold — the prompt-token level the
+    /// runtime triggers compaction at — forwarded on every context telemetry
+    /// record so the viewer can draw the trigger line. `None` in tests / when
+    /// no window is configured.
+    compaction_threshold: Option<u32>,
 }
 
 impl TailerState {
@@ -1789,6 +1823,7 @@ impl TailerState {
             summary: TrajectorySummary::default(),
             inactivity_deadline: Some(inactivity_deadline),
             inactivity_secs,
+            compaction_threshold: None,
         }
     }
 
@@ -1799,6 +1834,15 @@ impl TailerState {
     fn with_mission(mut self, mission_id: Option<String>, sprint_id: Option<String>) -> Self {
         self.mission_id = mission_id;
         self.sprint_id = sprint_id;
+        self
+    }
+
+    /// (#threshold) Forward the effective compaction threshold so context
+    /// telemetry carries it and the viewer can draw the trigger line.
+    /// Builder-style; only production `run_tailer` opts in (new/test callers
+    /// keep the `None` default).
+    fn with_compaction_threshold(mut self, threshold: Option<u32>) -> Self {
+        self.compaction_threshold = threshold;
         self
     }
 
@@ -1825,6 +1869,7 @@ impl TailerState {
             summary: TrajectorySummary::default(),
             inactivity_deadline: None,
             inactivity_secs: 600,
+            compaction_threshold: None,
         }
     }
 
@@ -2066,6 +2111,7 @@ impl TailerState {
                 self.emit_telemetry("context", "telemetry.context", serde_json::json!({
                     "used": event.get("used"),
                     "max": event.get("max"),
+                    "threshold": self.compaction_threshold,
                 }));
             }
             _ => {

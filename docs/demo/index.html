@@ -207,7 +207,7 @@
   .node{display:inline-block;width:260px;vertical-align:top;margin:0 24px 24px 0;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px;cursor:pointer}
   .node:hover{border-color:var(--amber-dim)}.node .h{font:600 13px 'JetBrains Mono',monospace;display:flex;align-items:center;gap:8px}
   .nico{display:inline-flex;color:var(--amber-dim);flex:none}.nico svg{width:17px;height:17px;display:block}
-  .node .s{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin-top:4px}
+  .node .s{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin-top:4px;overflow-wrap:anywhere}
   .node .s.tsline{color:var(--amber-dim);margin-top:6px}
   .pill{display:inline-block;font:600 10px 'JetBrains Mono',monospace;padding:2px 7px;border-radius:10px;margin-top:8px}
   /* (#1071) status convention — running=yellow(pulse), complete=green,
@@ -271,7 +271,8 @@
   .yax{display:flex;flex-direction:column;justify-content:space-between;height:80px;font:9px 'JetBrains Mono',monospace;color:var(--muted);text-align:right}
   .bars{display:flex;align-items:flex-end;gap:6px;height:80px;border-bottom:1px solid var(--line)}.bar{width:24px;background:var(--amber-dim);border-radius:2px 2px 0 0}
   .xvals{display:flex;gap:6px;margin-top:4px}.xvals span{width:24px;text-align:center;font:9px 'JetBrains Mono',monospace;color:var(--muted)}
-  .ctxchart{width:100%;max-width:440px;height:74px;display:block;border-bottom:1px solid var(--line)}
+  .ctxchart{width:100%;height:74px;display:block;border-bottom:1px solid var(--line)}
+  .cpusvg{width:100%;height:80px;display:block;border-bottom:1px solid var(--line)}
   .finding{border:1px solid var(--line);border-left:3px solid var(--line);border-radius:5px;padding:9px 12px;margin-bottom:7px;background:var(--panel)}
   .finding.warn{border-left-color:var(--warn)}.finding.ok{border-left-color:var(--good)}
   .finding .fk{display:block;font:600 12px 'JetBrains Mono',monospace;color:var(--warn)}.finding.ok .fk{color:var(--good)}
@@ -1569,21 +1570,63 @@ function runRegions(){
     <div class="met"><div class="mv">${comps.length}</div><div class="ml">compactions</div></div>
     <div class="met"><div class="mv">${wall}</div><div class="ml">wall clock</div></div></div>`;
   const segs=loads.map((r,i)=>`<span class="seg ${i>0?'b':''}">${esc(r.fields.model)} · ${esc(r.fields.gb||'?')}GB</span>`).join("");
-  const bars=procs.map(r=>`<div class="bar" style="height:${Math.max(3,r.fields.cpu/100*78)}px" title="cpu ${esc(r.fields.cpu)}%"></div>`).join("");
-  const xvals=procs.map(r=>`<span>${esc(r.fields.cpu)}</span>`).join("");
-  const cpu=procs.length?`<div class="track"><div class="lbl">container cpu — % busy <span style="color:var(--muted);text-transform:none;font-weight:400">(tool work — inference runs in LMStudio, off-container)</span></div>
-    <div class="cpuchart"><div class="yax"><span>100</span><span>50</span><span>0</span></div>
-      <div><div class="bars">${bars}</div><div class="xvals">${xvals}</div></div></div></div>`:"";
+  // Shared wall-clock time axis for the telemetry tracks (CPU bars, context
+  // step-area, compaction marks): every element is placed by timestamp on the
+  // same [t0,t1] domain + width, so a vertical slice is ONE instant across all
+  // three. Previously CPU was index-spaced + full-width while the context chart
+  // was time-based + capped at 440px, so the timelines never lined up.
+  const AX_W=1000, t0=startTs, t1=done?T(close.ts):state.t, span=Math.max(1,t1-t0);
+  const tx=ts=>Math.max(0,Math.min(AX_W,(T(ts)-t0)/span*AX_W));
+  // container CPU — % busy: one bar per sample, positioned by TIME (not index).
+  const Hc=78,BW=5;
+  // docker stats reports CPU% where 100% = ONE core, so on a many-core box it
+  // scales to N×100% (1500%+) and a 100% (one-core) reference line is a useless
+  // floor. Express it in CORES instead (raw% / 100), auto-scaled to the peak —
+  // reads intuitively ("14.9 cores were working") without needing the host's
+  // core count. Exact % is on hover.
+  const cpuMaxPct=procs.reduce((m,r)=>Math.max(m,+r.fields.cpu||0),0);
+  const peakCores=cpuMaxPct/100, topCores=Math.max(0.5,peakCores);
+  const cpuBars=procs.map(r=>{
+    const x=tx(r.ts),c=+r.fields.cpu||0,cores=c/100,h=Math.max(1.5,cores/topCores*Hc);
+    return `<rect x="${(x-BW/2).toFixed(1)}" y="${(Hc-h).toFixed(1)}" width="${BW}" height="${h.toFixed(1)}" rx="1" fill="var(--amber-dim)"><title>${cores.toFixed(1)} cores (${esc(Math.round(c))}%)</title></rect>`;
+  }).join("");
+  const cpuTopLbl=`<text x="2" y="9" fill="var(--muted)" font-size="8" opacity="0.7">${peakCores.toFixed(1)} cores</text>`;
+  const cpu=procs.length?`<div class="track"><div class="lbl">container cpu — cores busy <span style="color:var(--muted);text-transform:none;font-weight:400">(tool work — inference runs in LMStudio, off-container)</span></div>
+    <svg class="cpusvg" viewBox="0 0 ${AX_W} ${Hc+2}" preserveAspectRatio="none">${cpuTopLbl}${cpuBars}</svg></div>`:"";
   let ctxChart="";
   if(cx.length && nctx){
-    const W=440,H=72,t0=startTs,t1=done?T(close.ts):state.t,span=Math.max(1,t1-t0);
-    const xy=cx.map(r=>[Math.max(0,Math.min(W,(T(r.ts)-t0)/span*W)),H-(nctx?(r.fields.used/nctx)*H:0)]);
-    const line=xy.map(p=>p[0].toFixed(0)+","+p[1].toFixed(0)).join(" ");
-    const area="M"+xy[0][0].toFixed(0)+","+H+" "+xy.map(p=>"L"+p[0].toFixed(0)+","+p[1].toFixed(0)).join(" ")+" L"+xy[xy.length-1][0].toFixed(0)+","+H+" Z";
-    const marks=comps.map(r=>{const x=Math.max(0,Math.min(W,(T(r.ts)-t0)/span*W)).toFixed(0);return `<line x1="${x}" y1="0" x2="${x}" y2="${H}" stroke="var(--warn)" stroke-width="1" stroke-dasharray="2 3"/><text x="${x}" y="9" fill="var(--warn)" font-size="9" text-anchor="middle">⚡</text>`;}).join("");
+    const H=72;
+    const xy=cx.map(r=>[tx(r.ts),H-(nctx?(r.fields.used/nctx)*H:0)]);
+    // Context is a per-turn LEVEL that holds flat then jumps — draw it as a STEP
+    // (not a diagonal interpolation that implies smooth growth: the step height
+    // IS the per-turn token delta). Left-anchor at x=0: the first dispatch.context
+    // event lands a few seconds after dispatch.start (container spawn + first
+    // prompt assembly), so hold the first observed level from the origin instead
+    // of letting the line float in from that timestamp. Forward-fill the last
+    // level to t1 so a live stall/runaway reads as a flat plateau to "now".
+    const step=[[0,xy[0][1]]];
+    xy.forEach(p=>{step.push([p[0],step[step.length-1][1]]);step.push(p);});
+    step.push([AX_W,xy[xy.length-1][1]]);
+    const linePts=step.map(p=>p[0].toFixed(0)+","+p[1].toFixed(0)).join(" ");
+    // A dot per turn on the step — marks every turn boundary, including turns
+    // whose context delta is too small to render as a visible step (a ~200-token
+    // turn is ~0.15px on a 100K window). Makes turns countable + time-locatable,
+    // and lines up with the CPU bars + compaction marks on the shared time axis.
+    const dots=xy.map((p,i)=>`<circle cx="${p[0].toFixed(0)}" cy="${p[1].toFixed(1)}" r="2.4" fill="var(--bg)" stroke="var(--amber)" stroke-width="1.4" vector-effect="non-scaling-stroke"><title>turn ${i+1} · ${(cx[i].fields.used/1000).toFixed(1)}k ctx</title></circle>`).join("");
+    const area="M0,"+H+" L"+step.map(p=>p[0].toFixed(0)+","+p[1].toFixed(0)).join(" L")+" L"+AX_W+","+H+" Z";
+    const marks=comps.map(r=>{const x=tx(r.ts).toFixed(0);return `<line x1="${x}" y1="0" x2="${x}" y2="${H}" stroke="var(--warn)" stroke-width="1" stroke-dasharray="2 3"/><text x="${x}" y="9" fill="var(--warn)" font-size="9" text-anchor="middle">⚡</text>`;}).join("");
     // (#711) Native hover tooltip on the chart — now / peak / window at a glance.
     const tip=`now ${(ctxNow/1000).toFixed(0)}k · peak ${(ctxPeak/1000).toFixed(0)}k · window ${(nctx/1000)}k · ${comps.length} compaction${comps.length===1?'':'s'}`;
-    ctxChart=`<div class="track"><div class="lbl">context window — ${(nctx/1000)}K · ⚡ = compaction (${comps.length})</div><svg class="ctxchart" viewBox="0 0 ${W} ${H+2}" preserveAspectRatio="none"><title>${esc(tip)}</title><path d="${area}" fill="var(--amber-dim)" opacity="0.22"/><polyline points="${line}" fill="none" stroke="var(--amber)" stroke-width="1.5"/>${marks}</svg></div>`;
+    // (#threshold) Dashed line at the compaction TRIGGER level (the token threshold
+    // the runtime compacts at, emitted on the context telemetry) — shows WHY the ⚡
+    // marks fire: the level crosses this line.
+    const thr=cx.reduce((t,r)=>r.fields.threshold!=null?+r.fields.threshold:t,null);
+    const thrLine=(thr&&nctx&&thr<nctx)?(()=>{const ty=+(H-thr/nctx*H).toFixed(1);return `<line x1="0" y1="${ty}" x2="${AX_W}" y2="${ty}" stroke="var(--warn)" stroke-dasharray="4 3" stroke-width="0.8" opacity="0.65" vector-effect="non-scaling-stroke"/><text x="${AX_W-3}" y="${(ty-2).toFixed(1)}" fill="var(--warn)" font-size="8" text-anchor="end" opacity="0.85">compact ${(thr/1000).toFixed(0)}k</text>`;})():"";
+    // Fill gradient by fullness: green (headroom) low → amber → red as the level
+    // approaches the window ceiling (y=0 = nctx). The top-left label names that
+    // ceiling so "how full toward the max" reads at a glance (the operator asked
+    // to see the max + a danger cue without an exact threshold line).
+    ctxChart=`<div class="track"><div class="lbl">context window — ${(nctx/1000)}K · ⚡ = compaction (${comps.length})</div><svg class="ctxchart" viewBox="0 0 ${AX_W} ${H+2}" preserveAspectRatio="none"><title>${esc(tip)}</title><defs><linearGradient id="ctxgrad" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="0" y2="${H}"><stop offset="0" stop-color="#ff6b6b"/><stop offset="0.5" stop-color="var(--warn)"/><stop offset="1" stop-color="var(--good)"/></linearGradient></defs><path d="${area}" fill="url(#ctxgrad)" opacity="0.28"/><polyline points="${linePts}" fill="none" stroke="var(--amber)" stroke-width="1.5"/>${thrLine}<text x="2" y="9" fill="var(--muted)" font-size="8" opacity="0.5">${(nctx/1000)}K</text>${marks}${dots}</svg></div>`;
   }
   const finds=[];
   if(distinct.length>1)finds.push({s:"warn",k:"jit-model-swap",d:`${distinct.length} models loaded in one run (${distinct.join(" → ")}) — mid-run swap stalls the dispatch while the new model loads.`,f:"pin one model for the run, or pre-warm the swap target."});
