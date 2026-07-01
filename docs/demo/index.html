@@ -2190,15 +2190,14 @@ async function toggleCatalog(){
   panel.innerHTML=`<div class="cathdr">loading…</div>`;
   panel.hidden=false;
   let days=[], missions=[];
-  try{
-    // Days-index + the cross-day mission catalog, in parallel (#691).
-    const [rd,rm]=await Promise.all([
-      fetch("/flow-days",{headers:{accept:"application/json"}}),
-      fetch("/flow-missions",{headers:{accept:"application/json"}}),
-    ]);
-    if(rd.ok){ const b=await rd.json(); days=Array.isArray(b.days)?b.days:[]; }
-    if(rm.ok){ const b=await rm.json(); missions=Array.isArray(b.missions)?b.missions:[]; }
-  }catch(_){ /* render the empty/error state below */ }
+  // Days-index + the cross-day mission catalog, in parallel (#691). allSettled,
+  // not all, so a /flow-missions failure doesn't also drop the days list.
+  const [rd,rm]=await Promise.allSettled([
+    fetch("/flow-days",{headers:{accept:"application/json"}}),
+    fetch("/flow-missions",{headers:{accept:"application/json"}}),
+  ]);
+  try{ if(rd.status==="fulfilled"&&rd.value.ok){ const b=await rd.value.json(); days=Array.isArray(b.days)?b.days:[]; } }catch(_){}
+  try{ if(rm.status==="fulfilled"&&rm.value.ok){ const b=await rm.value.json(); missions=Array.isArray(b.missions)?b.missions:[]; } }catch(_){}
   const today=todayUTC();
   const liveRow=`<button class="catrow live" data-act="golive"><div class="cd">● live · today</div><div class="cs">now-ish on present machines</div></button>`;
   const dayRows=days.map(d=>{
@@ -2330,10 +2329,10 @@ function targetDate(){
 function catalogQuery(){
   const p=new URLSearchParams(location.search);
   const h=new URLSearchParams((location.hash||"").replace(/^#/,""));
-  const mission=p.get("mission")||h.get("mission");
-  if(mission)return {kind:"mission", id:mission.trim()};
-  const session=p.get("session")||h.get("session");
-  if(session)return {kind:"session", id:session.trim()};
+  const mission=(p.get("mission")||h.get("mission")||"").trim();
+  if(mission)return {kind:"mission", id:mission};
+  const session=(p.get("session")||h.get("session")||"").trim();
+  if(session)return {kind:"session", id:session};
   return null;
 }
 
