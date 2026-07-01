@@ -408,6 +408,11 @@ fn conversation_long_enough_to_compact(message_count: usize) -> bool {
 ///
 /// Both adjustments only ever GROW the middle (start can decrease, end can
 /// increase), so the middle stays non-empty given the length pre-flight.
+/// In the edge case where the recent tail is entirely tool-results (an
+/// assistant made >= PRESERVE_TAIL parallel calls sitting at the tail), the
+/// tail loop can extend `end` to `n`, folding the whole tail into the summary:
+/// graceful degradation (the summary preserves what tools returned) and the
+/// only correct alternative to the 400.
 /// A conversation with clean boundaries is unchanged (the loops are no-ops).
 fn snap_boundaries_off_tool_groups(
     messages: &[Message],
