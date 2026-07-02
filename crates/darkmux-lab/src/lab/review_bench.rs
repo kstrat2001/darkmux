@@ -265,6 +265,16 @@ fn load_cases(dir: &Path) -> Result<Vec<Case>> {
                 label_path.display()
             ));
         }
+        if label.kind == "bug"
+            && !label.expected.is_empty()
+            && !label.expected.iter().any(|e| e.required)
+        {
+            return Err(anyhow!(
+                "case \"{id}\": a \"bug\" case with expected[] needs at least one required \
+                 finding (else it contributes nothing to recall) ({})",
+                label_path.display()
+            ));
+        }
         let diff_path = dir.join(format!("{id}.diff"));
         let diff = fs::read_to_string(&diff_path)
             .with_context(|| format!("reading diff {}", diff_path.display()))?;
@@ -451,37 +461,27 @@ fn score_multi(label: &Label, r: &Review, mut s: CaseScore) -> CaseScore {
     s.expected_access = expected.iter().filter(|e| e.required && e.access_gap).count();
     s.expected_diff = expected.iter().filter(|e| e.required && !e.access_gap).count();
 
-    // Adjacency: which expected each finding can satisfy → maximum matching.
-    let adj: Vec<Vec<usize>> = r
-        .findings
-        .iter()
-        .map(|f| {
-            expected
-                .iter()
-                .enumerate()
-                .filter(|(_, e)| finding_matches_expected(f, e))
-                .map(|(ei, _)| ei)
-                .collect()
-        })
-        .collect();
-    // matched_by[ei] = Some(fi) when expected ei is matched to finding fi.
-    let mut matched_by: Vec<Option<usize>> = vec![None; expected.len()];
-    for fi in 0..r.findings.len() {
-        let mut seen = vec![false; expected.len()];
-        augment(fi, &adj, &mut matched_by, &mut seen);
-    }
-    let matched_findings = matched_by.iter().filter(|x| x.is_some()).count();
-    s.tp = matched_findings;
-    s.fp = r.findings.len() - matched_findings;
+    // PRECISION: maximum matching over ALL expected — a finding matching any
+    // expected (required OR optional) is a true positive; the rest are FPs.
+    let matched_all = max_match(&r.findings, expected, |_| true);
+    s.tp = matched_all.iter().filter(|x| x.is_some()).count();
+    s.fp = r.findings.len() - s.tp;
 
-    // Recall credits a REQUIRED bug only under a `flag` verdict (a `pass` that
-    // happens to carry a matching finding is a self-contradiction, not a catch).
+    // RECALL: a SEPARATE maximum matching over the REQUIRED expected ONLY (frontier
+    // QA #1). Max-cardinality over the *full* set is blind to the required/optional
+    // priority — an optional nit sharing a match key could win the contended
+    // finding and starve the required bug, under-reporting recall for the very
+    // (under-emitting) models we benchmark, order-dependently. A required-only
+    // matching provably maximizes required coverage and is order-independent.
+    // Credit only under a `flag` verdict (a `pass` carrying a matching finding is
+    // a self-contradiction, not a catch).
     let flagged = r.verdict == "flag";
+    let matched_req = max_match(&r.findings, expected, |e| e.required);
     for (ei, e) in expected.iter().enumerate() {
         if !e.required {
             continue;
         }
-        if let (true, Some(fi)) = (flagged, matched_by[ei]) {
+        if let (true, Some(fi)) = (flagged, matched_req[ei]) {
             s.bugs_caught += 1;
             if e.access_gap {
                 s.caught_access += 1;
@@ -511,6 +511,36 @@ fn score_multi(label: &Label, r: &Review, mut s: CaseScore) -> CaseScore {
         s.correct = s.fp == 0;
     }
     s
+}
+
+/// Maximum bipartite matching (Kuhn's) between model findings and the subset of
+/// expected selected by `include`. Returns `matched_by[ei] = Some(fi)` for each
+/// matched expected. Run once over all expected (precision) and once over the
+/// required-only subset (recall), so an optional finding can never starve a
+/// required bug. The matching SIZE is order-independent, so the recall/precision
+/// counts derived from it are too.
+fn max_match(
+    findings: &[Finding],
+    expected: &[ExpectedFinding],
+    include: impl Fn(&ExpectedFinding) -> bool,
+) -> Vec<Option<usize>> {
+    let adj: Vec<Vec<usize>> = findings
+        .iter()
+        .map(|f| {
+            expected
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| include(e) && finding_matches_expected(f, e))
+                .map(|(ei, _)| ei)
+                .collect()
+        })
+        .collect();
+    let mut matched_by: Vec<Option<usize>> = vec![None; expected.len()];
+    for fi in 0..findings.len() {
+        let mut seen = vec![false; expected.len()];
+        augment(fi, &adj, &mut matched_by, &mut seen);
+    }
+    matched_by
 }
 
 /// Kuhn's augmenting-path step for maximum bipartite matching: try to match
@@ -1043,5 +1073,38 @@ mod tests {
         fs::write(d.join("x.diff"), "diff --git a b\n").unwrap();
         let err = load_cases(d).unwrap_err();
         assert!(err.to_string().contains("must not carry a required"), "got: {err}");
+    }
+
+    #[test]
+    fn multi_optional_does_not_steal_recall_from_required() {
+        // Frontier QA (2nd pass) #1: a required + an optional expected share an
+        // overlapping match key, and the model emits ONE finding that IS the
+        // required bug. Max-cardinality over the full set could spend it on the
+        // optional; the required-only matching must not. Recall must be TRUE
+        // regardless of expected[] order.
+        let req = ef("calc.ts:40", false); // required (default)
+        let opt = ef_opt("calc.ts"); // optional, subsuming match key
+        let f = finding("high", "calc.ts:40", "the required bug");
+        for order in [vec![opt.clone(), req.clone()], vec![req.clone(), opt.clone()]] {
+            let s = score(&multi_lbl("bug", order), &flagged(vec![f.clone()]));
+            assert_eq!(s.expected_bugs, 1);
+            assert!(s.recall, "required bug caught regardless of expected[] order");
+            assert_eq!(s.bugs_caught, 1);
+            assert_eq!(s.tp, 1, "the one finding is a true positive");
+        }
+    }
+
+    #[test]
+    fn load_cases_rejects_bug_with_no_required() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let d = tmp.path();
+        fs::write(
+            d.join("x.label.json"),
+            r#"{"kind":"bug","intent_title":"t","expected":[{"anchor_contains":"a:1","required":false}]}"#,
+        )
+        .unwrap();
+        fs::write(d.join("x.diff"), "diff --git a b\n").unwrap();
+        let err = load_cases(d).unwrap_err();
+        assert!(err.to_string().contains("at least one required"), "got: {err}");
     }
 }
