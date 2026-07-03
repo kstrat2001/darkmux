@@ -978,7 +978,24 @@ function flowLiveSessions(){
 // The effective live-session set: Redis presence when it has ANY beat
 // (authoritative, short-TTL), else the flow-derived fallback above. Every
 // "is this session running NOW" decision routes through here.
-function liveSessionSet(){ return LIVE_SESSIONS.size ? LIVE_SESSIONS : flowLiveSessions(); }
+// (#1173) `flowLiveSessions()` — the fallback used when Redis presence is empty —
+// is O(sessions × records): it scans DATA AND calls sessionCloseEdge() per started
+// session. The fleet timeline + crew cards call liveSessionSet() per session AND
+// per machine, so a busy day recomputed it HUNDREDS of times per render (measured
+// ~2.5s at 160 sessions × 4.8k records — the click/reload lag). Memoize the
+// fallback, keyed on DATA identity (DATA is reassigned on every data change) + a 2s
+// wall-clock bucket (the fallback's TTL is Date.now()-based, so refresh within a
+// couple seconds). The hundreds of within-render calls collapse to one; a click
+// that doesn't change the data reuses it. The presence path returns the live Set
+// directly (O(1), always fresh) and is never memoized.
+let _liveSetMemo=null,_liveSetMemoData=null,_liveSetMemoBucket=-1;
+function liveSessionSet(){
+  if(LIVE_SESSIONS.size) return LIVE_SESSIONS;
+  const bucket=Math.floor(Date.now()/2000);
+  if(_liveSetMemo&&_liveSetMemoData===DATA&&_liveSetMemoBucket===bucket) return _liveSetMemo;
+  _liveSetMemo=flowLiveSessions(); _liveSetMemoData=DATA; _liveSetMemoBucket=bucket;
+  return _liveSetMemo;
+}
 // (#783) Tokens kept off the (frontier) meter — the savings hero. Sums ONLY
 // `telemetry.tokens` records (category=telemetry, source=tokens). Since #795
 // the runtime tailer emits one record PER TURN (so the odometer climbs DURING
@@ -2385,6 +2402,10 @@ function todayUTC(){return new Date().toISOString().slice(0,10);}
 // though they're hours old. Storage stays per-day files; the live VIEW queries
 // the last LIVE_WINDOW_MS across day files.
 const LIVE_WINDOW_MS=24*60*60*1000;
+// (#1173) The reconcile backstop fetches only records newer than (newest held −
+// this overlap) rather than the whole day — a safety margin over the SSE cadence
+// so a brief reconnect gap is still caught while the response stays a small tail.
+const RECONCILE_OVERLAP_MS=30*60*1000;
 function prevDateUTC(d){const dt=new Date(d+"T00:00:00Z");dt.setUTCDate(dt.getUTCDate()-1);return dt.toISOString().slice(0,10);}
 
 let RAW=[];            // raw FlowRecords (pre-adapt); the live tail appends here
@@ -2659,9 +2680,16 @@ async function pollMachineSpecs(){
 async function reconcileLiveWindow(){
   const today=LIVE_ES_DATE||todayUTC();
   const cut=Date.now()-LIVE_WINDOW_MS;
+  // (#1173) Incremental: ask each day file only for records at/after the newest
+  // ts we already hold (minus RECONCILE_OVERLAP_MS), server-filtered via
+  // `?since=`. The response is the recent tail, not the multi-MB day — so the
+  // reconcile parse cost no longer grows with the day (the long-tab-lag cause).
+  const newest=RAW.reduce((m,r)=>{const t=T(r.ts);return t>m?t:m;},0);
+  const sinceMs=newest?Math.max(cut,newest-RECONCILE_OVERLAP_MS):cut;
+  const q="?since="+encodeURIComponent(new Date(sinceMs).toISOString().replace(/\.\d+Z$/,"Z"));
   let added=0;
   for(const d of [prevDateUTC(today),today]){
-    let res; try{res=await fetch("/flow/"+d,{headers:{accept:"application/json"}});}catch(_){continue;}
+    let res; try{res=await fetch("/flow/"+d+q,{headers:{accept:"application/json"}});}catch(_){continue;}
     if(!res.ok)continue;
     let body; try{body=await res.json();}catch(_){continue;}
     const recs=Array.isArray(body)?body:(body.records||body.flow||[]);
