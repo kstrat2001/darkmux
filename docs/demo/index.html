@@ -1555,8 +1555,21 @@ function runRegions(){
   const tokOut=toks.length?toks.reduce((a,r)=>a+(r.fields.completion_tokens||0),0):(dp.completion_tokens!=null?dp.completion_tokens:null);
   const kv=(k,v)=>v!=null&&v!==''?`<div class="kv"><b>${k}</b><span>${v}</span></div>`:'';
   const briefTiming=`${clk(startTs)}${done?' → '+clk(T(close.ts))+' ('+fmt(T(close.ts)-startTs)+')':' · running'}`;
+  // (#1177) Dispatch legibility. `sp.endpoint` (e.g. "azure:host/gpt-4o") means the
+  // model ran OFF-FLEET on a remote OpenAI-compatible endpoint; absent ⇒ local
+  // LMStudio. The `runtime` value is a bare mechanism marker (internal / direct /
+  // openclaw) — render it in words so a hosted "direct" isn't cryptic. Route +
+  // runtime are separate axes: WHERE the model was served vs HOW darkmux drove it.
+  const rtLabel={internal:'internal container',direct:'direct client (hosted · no container)',openclaw:'openclaw shell-out'}[sp.runtime]||sp.runtime;
+  const ep=sp.endpoint;
+  const route=ep
+    ? (()=>{const i=String(ep).indexOf(':');const kind=i>=0?ep.slice(0,i):'';const rest=i>=0?ep.slice(i+1):ep;
+        const label=kind==='azure'?'Azure OpenAI':kind==='openai'?'OpenAI':esc(kind||'remote');
+        return `${label} <span style="color:var(--muted)">· ${esc(rest)} · off-fleet</span>`;})()
+    : `LMStudio <span style="color:var(--muted)">· local · this machine</span>`;
   const briefRows=[
-    kv('runtime', sp.runtime?esc(sp.runtime):''),
+    kv('route', route),
+    kv('runtime', sp.runtime?esc(rtLabel):''),
     kv('image', sp.image?esc(sp.image):''),
     kv('model', model?esc(model):''),
     kv('workspace', sp.workspace?esc(sp.workspace):''),

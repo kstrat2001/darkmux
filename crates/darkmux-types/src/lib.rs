@@ -85,10 +85,116 @@ pub struct ProfileModel {
     /// nothing scores against it until that slice lands.
     #[serde(default)]
     pub capabilities: CapabilityProfile,
+    /// The OpenAI-compatible endpoint this model is served from. Absent ⇒
+    /// LMStudio local (`config_access::lmstudio_url()`). A remote model
+    /// (Azure OpenAI, OpenAI, a LiteLLM proxy) names its URL + auth here.
+    /// When set, `n_ctx` is a *declared* window (darkmux can't load-set a
+    /// remote model's context — it asserts the ceiling for overflow
+    /// avoidance + compaction-threshold placement) rather than a load
+    /// parameter. This is the "interface to the model" the run's dispatch
+    /// section surfaces; LMStudio is simply the default value here, not a
+    /// hardwired identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<ModelEndpoint>,
     /// Forward-compat overflow — unknown keys land here and
     /// re-serialize flat (a newer config read by an older binary).
     #[serde(flatten)]
     pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
+/// The OpenAI-compatible endpoint a model is served from. Absent on a
+/// [`ProfileModel`] ⇒ the LMStudio local default. Every hosted provider
+/// darkmux targets (Azure OpenAI, OpenAI, OpenRouter, a LiteLLM proxy)
+/// speaks OpenAI chat-completions, so one endpoint type covers all of them —
+/// LMStudio included, as the zero-config local default.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModelEndpoint {
+    /// Base URL of the OpenAI-compatible server. Absent ⇒ the LMStudio
+    /// local default (`config_access::lmstudio_url()`, honoring
+    /// `DARKMUX_LMSTUDIO_URL` > `config.lmstudio_url` > `http://localhost:1234`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// API-version query parameter (Azure OpenAI requires one, e.g.
+    /// `"2025-01-01-preview"`). Absent for LMStudio / OpenAI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_version: Option<String>,
+    /// Auth mechanics. Absent ⇒ no auth header (LMStudio local needs none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<EndpointAuth>,
+    /// Forward-compat overflow.
+    #[serde(flatten)]
+    pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
+impl ModelEndpoint {
+    /// Effective base URL: the declared [`url`](Self::url), else the LMStudio
+    /// local default (env `DARKMUX_LMSTUDIO_URL` > `config.lmstudio_url` >
+    /// `http://localhost:1234`).
+    pub fn base_url(&self) -> String {
+        self.url
+            .clone()
+            .unwrap_or_else(crate::config_access::lmstudio_url)
+    }
+
+    /// Whether this is a declared *remote* server (a URL is set) vs the
+    /// implicit LMStudio local default. Drives the run's `endpoint` dimension
+    /// and the set-vs-declared `n_ctx` semantics.
+    pub fn is_remote(&self) -> bool {
+        self.url.is_some()
+    }
+
+    /// Coherence check intended for the #1177 `darkmux doctor` credential slice /
+    /// profile load — NOT yet wired into either, so today it's exercised only by
+    /// unit tests. Presence-only on auth: does NOT verify the key is correct
+    /// (that's the opt-in live probe, #1177). Returns a human-readable reason.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(u) = &self.url {
+            if !(u.starts_with("http://") || u.starts_with("https://")) {
+                return Err(format!(
+                    "endpoint.url must start with http:// or https:// (got {u:?})"
+                ));
+            }
+        }
+        if let Some(auth) = &self.auth {
+            if auth.auth_type.is_some() && auth.keychain.as_deref().unwrap_or("").is_empty() {
+                return Err("endpoint.auth.type is set but endpoint.auth.keychain \
+                     (the Keychain item name holding the secret) is missing"
+                    .to_string());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Auth for a remote endpoint. The secret is **never** stored here — only the
+/// macOS Keychain item *name*; the secret is read at runtime via
+/// `security find-generic-password` (the same carve-out as the Redis password
+/// and serve token). The machine holding the referenced item is the keymaster
+/// for the endpoint — see doctor's credential-presence check.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct EndpointAuth {
+    /// Header mechanics: `api-key` (Azure OpenAI) or `bearer` (OpenAI).
+    /// Absent ⇒ no auth header emitted.
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub auth_type: Option<EndpointAuthType>,
+    /// macOS Keychain item name holding the secret (machine-local by
+    /// darkmux's per-machine provisioning convention). Read at runtime;
+    /// never logged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keychain: Option<String>,
+    /// Forward-compat overflow.
+    #[serde(flatten)]
+    pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
+/// The header mechanics for a remote endpoint's auth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EndpointAuthType {
+    /// Azure OpenAI — `api-key: <secret>`.
+    ApiKey,
+    /// OpenAI / OpenRouter / most proxies — `Authorization: Bearer <secret>`.
+    Bearer,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -541,6 +647,7 @@ mod tests {
     #[test]
     fn profile_model_round_trips() {
         let m = ProfileModel {
+            endpoint: None,
             id: "x".to_string(),
             n_ctx: 32_000,
             capabilities: Default::default(),
@@ -557,6 +664,7 @@ mod tests {
     #[test]
     fn profile_model_omits_none_identifier() {
         let m = ProfileModel {
+            endpoint: None,
             id: "x".to_string(),
             n_ctx: 1024,
             capabilities: Default::default(),
@@ -581,6 +689,91 @@ mod tests {
         let back: ProfileModel =
             serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
         assert_eq!(back.capabilities, m.capabilities);
+    }
+
+    #[test]
+    fn profile_model_endpoint_round_trips() {
+        // A remote model names its endpoint URL + auth. The Keychain item
+        // NAME is stored — never the secret.
+        let json = r#"{
+            "id": "gpt-5.1",
+            "n_ctx": 200000,
+            "endpoint": {
+                "url": "https://finherogpt.cognitiveservices.azure.com/openai/deployments/gpt-4o",
+                "api_version": "2025-01-01-preview",
+                "auth": { "type": "api-key", "keychain": "darkmux-azure-finherogpt" }
+            }
+        }"#;
+        let m: ProfileModel = serde_json::from_str(json).unwrap();
+        let ep = m.endpoint.as_ref().expect("endpoint parsed");
+        assert!(ep.is_remote());
+        assert_eq!(
+            ep.base_url(),
+            "https://finherogpt.cognitiveservices.azure.com/openai/deployments/gpt-4o"
+        );
+        assert_eq!(ep.api_version.as_deref(), Some("2025-01-01-preview"));
+        let auth = ep.auth.as_ref().expect("auth parsed");
+        assert_eq!(auth.auth_type, Some(EndpointAuthType::ApiKey));
+        assert_eq!(auth.keychain.as_deref(), Some("darkmux-azure-finherogpt"));
+        // full round-trip preserves the endpoint
+        let back: ProfileModel =
+            serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(back.endpoint, m.endpoint);
+    }
+
+    #[test]
+    fn profile_model_absent_endpoint_is_local_and_omitted() {
+        // Backward-compat: an existing profile with no endpoint parses fine,
+        // endpoint is None (⇒ LMStudio local), and re-serializes without the key.
+        let m: ProfileModel = serde_json::from_str(r#"{"id":"qwen","n_ctx":32000}"#).unwrap();
+        assert!(m.endpoint.is_none());
+        assert!(!serde_json::to_string(&m).unwrap().contains("endpoint"));
+    }
+
+    #[test]
+    fn endpoint_default_is_local_not_remote() {
+        // No url ⇒ not remote; base_url resolves to the LMStudio default (a URL).
+        let ep = ModelEndpoint::default();
+        assert!(!ep.is_remote());
+        assert!(
+            ep.base_url().contains("://"),
+            "base_url should be a URL, got {:?}",
+            ep.base_url()
+        );
+        assert!(ep.validate().is_ok());
+    }
+
+    #[test]
+    fn endpoint_validate_catches_bad_url_and_authless_keychain() {
+        // A URL without a scheme is rejected.
+        let bad = ModelEndpoint {
+            url: Some("finherogpt.azure.com".into()),
+            ..Default::default()
+        };
+        assert!(bad.validate().is_err());
+        // Auth type set but no Keychain item name → the "forgot to say where
+        // the secret lives" error.
+        let no_key = ModelEndpoint {
+            url: Some("https://x/".into()),
+            auth: Some(EndpointAuth {
+                auth_type: Some(EndpointAuthType::ApiKey),
+                keychain: None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(no_key.validate().is_err());
+        // A coherent remote endpoint validates.
+        let ok = ModelEndpoint {
+            url: Some("https://x/".into()),
+            auth: Some(EndpointAuth {
+                auth_type: Some(EndpointAuthType::Bearer),
+                keychain: Some("darkmux-openai".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(ok.validate().is_ok());
     }
 
     #[test]
