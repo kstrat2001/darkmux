@@ -5,7 +5,7 @@
 #
 # Operator-facing install path:
 #   brew tap kstrat2001/darkmux
-#   brew install darkmux                # stable release (v1.14.0)
+#   brew install darkmux                # stable release (v1.14.1)
 #   brew install --HEAD darkmux         # build from main instead
 #
 # For local development / smoke testing:
@@ -17,18 +17,16 @@
 class Darkmux < Formula
   desc "Profile multiplexer + lab for local LLM stacks (LMStudio, Ollama)"
   homepage "https://darkmux.com"
-  # Stable release: v1.14.0 (cross-day playback discoverability + a run-detail
-  # telemetry-panel overhaul — the #691 mission/dispatch catalog + replay-by-query
-  # so you replay by the thing that ran, not by calendar day (#1166/#1167), plus
-  # CPU+context on one wall-clock axis, a context step-area with per-turn markers +
-  # a fullness gradient + a compaction-threshold line, CPU shown in cores-busy, and
-  # the model (lms) telemetry section fixed (#1169). No schema change (FLOW_SCHEMA
-  # 1.14.0, CONFIG_SCHEMA 1.1) — drop-in over v1.13.1).
+  # Stable release: v1.14.1 (viewer performance hotfix — the live observability
+  # tab degraded over a long-open day: liveSessionSet() memoized so render() drops
+  # from ~2.5s to ~20ms, plus an incremental `?since=` reconcile that stops
+  # re-parsing full day files on every 20s tick (#1173)). No schema change
+  # (FLOW_SCHEMA 1.14.0, CONFIG_SCHEMA 1.1) — drop-in over v1.14.0.
   # `brew install darkmux` builds from this source tarball; `brew install
   # --HEAD darkmux` builds from main instead. The sha256 is of the
   # GitHub-generated source tarball for the tag (`shasum -a 256`).
-  url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v1.14.0.tar.gz"
-  sha256 "a51ebe4fca68fec71d3a659ca0d757c808cdcf2b413a300caded074e1c9022e4"
+  url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v1.14.1.tar.gz"
+  sha256 "081914875e999c01eba41f812c37576b17e10310f8e0d5b8531888d7fe2a2c1b"
   license "MIT"
   head "https://github.com/kstrat2001/darkmux.git", branch: "main"
 
