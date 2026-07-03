@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.14.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.15.0";
 // Version history:
 //   1.2.0 — added optional `model` (#106)
 //   1.3.0 — added optional `reasoning` + `mission_id`; new Stage::TierDecision (#136)
@@ -93,6 +93,15 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.14.0";
 //           writes it. Treated as minor since nothing on-the-wire carried the
 //           old value; the bump signals the value-set change for that future
 //           consumer.
+//   1.15.0 — `telemetry.process` (source=process) now samples the HOST system,
+//           not the per-dispatch container. Payload gains `mem` + `gpu` (host
+//           RAM-used% + GPU-utilization%) alongside `cpu`, and `cpu`'s meaning
+//           changes from container-CPU% — which read ~0 because inference runs
+//           in LMStudio, off-container (#814/#1064) — to host system-CPU%. Same
+//           action + source; additive payload fields (the wire key `cpu` is
+//           unchanged, only its source). Older readers ignore `mem`/`gpu`; new
+//           records only, so prior AuditFileSink chains survive without rotation.
+//           (#1064)
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]

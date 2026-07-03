@@ -1,31 +1,35 @@
-//! (#557 slice 4) Always-on lms + container-CPU telemetry sampler.
+//! (#557 slice 4 · #1064) Always-on lms + host-load telemetry sampler.
 //!
-//! While an internal-runtime dispatch's container runs, a background
-//! thread (spawned in `dispatch_internal::dispatch`, alongside the
-//! trajectory tailer) samples two host-side surfaces on a fixed cadence
-//! and forwards each observation into the one flow stream as a
-//! `category=telemetry` record the observability viewer renders:
+//! While an internal-runtime dispatch runs, a background thread (spawned
+//! in `dispatch_internal::dispatch`, alongside the trajectory tailer)
+//! samples two surfaces on a fixed cadence and forwards each observation
+//! into the one flow stream as a `category=telemetry` record the
+//! observability viewer renders:
 //!
 //! - `source="lms"` → model load/unload deltas, derived from
 //!   `darkmux_profiles::lms::list_loaded()` (the lms-ps source). Wire
 //!   payload shapes the served demo viewer consumes:
 //!   `{event:"load", model:<id>, gb:<N>}` (load) /
 //!   `{event:"unload", model:<id>}` (unload — no `gb`).
-//! - `source="process"` → the per-dispatch `darkmux-runtime` container's
-//!   CPU%, via `docker stats <name> --no-stream`. Wire payload:
-//!   `{cpu:<N>}` (integer percent).
+//! - `source="process"` → the HOST system load: CPU% (`top`), RAM used%
+//!   (`vm_stat` + `sysctl -n hw.memsize`), GPU util% (`ioreg`
+//!   IOAccelerator `"Device Utilization %"`). Wire payload:
+//!   `{cpu, mem, gpu}` (integer %, each best-effort / omitted-on-failure).
+//!   The per-dispatch container is NOT sampled — inference runs in
+//!   LMStudio off-container, so container CPU reads ~0 (#814/#1064).
 //!
 //! ALWAYS-ON: cross-layer telemetry is captured automatically, never
-//! behind a flag. The `source:process` CPU signal is sourced from the
-//! per-dispatch container. (It originally replaced an OpenClaw-gateway CPU
-//! sampler that returned `None` on internal-runtime dispatches; the
-//! lab-side `instrument.rs` sidecar and the `--instrument` flag it lived
-//! behind were retired in #557.)
+//! behind a flag. (The `source:process` signal originally sampled the
+//! per-dispatch container's CPU via `docker stats`; #1064 moved it to the
+//! host system because container CPU answered the wrong question. Further
+//! back it replaced an OpenClaw-gateway CPU sampler; the lab-side
+//! `instrument.rs` sidecar + `--instrument` flag were retired in #557.)
 //!
-//! This module holds the two PURE, unit-testable helpers (`lms_diff`,
-//! `parse_cpu_percent`). The live sampler thread (which calls
-//! `list_loaded` + shells out to `docker stats`) lives in
-//! `dispatch_internal.rs` next to the tailer + watchdog it mirrors.
+//! This module holds the PURE, unit-testable parse helpers (`lms_diff`,
+//! `host_cpu_percent_from_top`, `mem_percent_from_vm_stat`,
+//! `gpu_percent_from_ioreg`). The live sampler thread (which calls
+//! `list_loaded` + shells out to `top`/`vm_stat`/`sysctl`/`ioreg`) lives
+//! in `dispatch_internal.rs` next to the tailer + watchdog it mirrors.
 
 use darkmux_types::LoadedModel;
 
@@ -84,17 +88,79 @@ fn gb_from_size_string(size: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// Parse a `docker stats --format "{{.CPUPerc}}"` value into an integer
-/// CPU percent. `"38.00%"` → `Some(38)`, `"0.00%"` → `Some(0)`,
-/// `"71.6%"` → `Some(72)` (rounded). `"--"` (docker's placeholder for a
-/// just-started / exited container), the empty string, and any other
-/// garbage → `None`. Pure — unit-testable without a real container.
-pub(crate) fn parse_cpu_percent(s: &str) -> Option<u64> {
-    let trimmed = s.trim().trim_end_matches('%').trim();
-    if trimmed.is_empty() {
+/// Parse host **system CPU%** out of `top -l 1 -n 0` output. The header line
+/// `CPU usage: 3.82% user, 7.30% sys, 89.13% idle` → `100 - round(idle)` = 11.
+/// Locates the `idle` token and reads the percent immediately before it, so
+/// format shuffles (user/sys order) don't matter. `None` if the line or the
+/// idle token is absent. Pure — unit-testable without shelling `top`. (#1064)
+pub(crate) fn host_cpu_percent_from_top(top: &str) -> Option<u64> {
+    let line = top.lines().find(|l| l.contains("CPU usage:"))?;
+    let toks: Vec<&str> = line.split_whitespace().collect();
+    let idle_pos = toks.iter().position(|t| t.eq_ignore_ascii_case("idle"))?;
+    let num = toks.get(idle_pos.checked_sub(1)?)?.trim_end_matches('%');
+    let idle = num.parse::<f64>().ok()?;
+    Some((100.0 - idle).clamp(0.0, 100.0).round() as u64)
+}
+
+/// Parse host **RAM used%** out of `vm_stat` output plus the machine's total
+/// bytes (from `sysctl -n hw.memsize`). Available ≈ (`Pages free` +
+/// `Pages inactive` + `Pages speculative`) × page-size — inactive + speculative
+/// (read-ahead cache) pages are reclaimable on macOS, so counting them as
+/// available yields the memory-*pressure* number the operator wants (not an
+/// inflated "used" that folds in reclaimable cache). `Pages speculative` is
+/// optional (absent on some builds → treated as 0).
+/// `used% = 100 * (total - avail) / total`. The page size is read from
+/// vm_stat's own header (`page size of N bytes`), defaulting to 16384 on
+/// Apple Silicon. `None` if total is 0 or the page fields are missing. Pure.
+/// (#1064)
+pub(crate) fn mem_percent_from_vm_stat(vm_stat: &str, total_bytes: u64) -> Option<u64> {
+    if total_bytes == 0 {
         return None;
     }
-    trimmed.parse::<f64>().ok().map(|v| v.round() as u64)
+    let page = vm_stat
+        .lines()
+        .next()
+        .and_then(|l| l.split("page size of").nth(1))
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(16384);
+    let field = |name: &str| -> Option<u64> {
+        vm_stat
+            .lines()
+            .find(|l| l.trim_start().starts_with(name))
+            .and_then(|l| l.rsplit(':').next())
+            .and_then(|v| v.trim().trim_end_matches('.').parse::<u64>().ok())
+    };
+    // `Pages speculative` (read-ahead cache) are also reclaimable, so count them
+    // as available when present — tracks the real pressure number closer than
+    // free+inactive alone. Optional: `unwrap_or(0)` if the line is absent.
+    let avail = field("Pages free")?
+        .saturating_add(field("Pages inactive")?)
+        .saturating_add(field("Pages speculative").unwrap_or(0))
+        .saturating_mul(page);
+    let used = total_bytes.saturating_sub(avail);
+    Some(((used as f64 / total_bytes as f64) * 100.0).clamp(0.0, 100.0).round() as u64)
+}
+
+/// Parse host **GPU utilization%** out of `ioreg -r -d 1 -c IOAccelerator`
+/// output. The `PerformanceStatistics` dict carries `"Device Utilization %"=N`;
+/// a machine can expose more than one accelerator node, so take the MAX across
+/// all of them. `None` when the field is absent (non-Apple-Silicon, or the key
+/// isn't present). Unprivileged — no `sudo`/`powermetrics` (that deeper path is
+/// #2). Pure — unit-testable without shelling `ioreg`. (#1064)
+pub(crate) fn gpu_percent_from_ioreg(ioreg: &str) -> Option<u64> {
+    let mut best: Option<u64> = None;
+    for chunk in ioreg.split("\"Device Utilization %\"=").skip(1) {
+        let digits: String = chunk
+            .trim_start()
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if let Ok(v) = digits.parse::<u64>() {
+            best = Some(best.map_or(v, |b| b.max(v)));
+        }
+    }
+    best.map(|v| v.min(100))
 }
 
 #[cfg(test)]
@@ -171,11 +237,87 @@ mod tests {
     }
 
     #[test]
-    fn parse_cpu_percent_handles_values_and_garbage() {
-        assert_eq!(parse_cpu_percent("38.00%"), Some(38));
-        assert_eq!(parse_cpu_percent("0.00%"), Some(0));
-        assert_eq!(parse_cpu_percent("71.6%"), Some(72), "rounds to nearest");
-        assert_eq!(parse_cpu_percent("--"), None);
-        assert_eq!(parse_cpu_percent(""), None);
+    fn host_cpu_percent_from_top_reads_idle() {
+        let top = "Processes: 700 total\n\
+                   2026/07/03 10:00:00\nLoad Avg: 3.2, 3.0, 2.9\n\
+                   CPU usage: 3.82% user, 7.30% sys, 89.13% idle\n\
+                   SharedLibs: 500M resident\n";
+        assert_eq!(host_cpu_percent_from_top(top), Some(11), "100 - 89.13 = 10.87 → 11");
+    }
+
+    #[test]
+    fn host_cpu_percent_from_top_handles_missing_and_saturated() {
+        assert_eq!(host_cpu_percent_from_top("no cpu line here"), None);
+        // 0% idle → fully busy; clamps at 100.
+        assert_eq!(
+            host_cpu_percent_from_top("CPU usage: 60.00% user, 40.00% sys, 0.00% idle"),
+            Some(100)
+        );
+        // 100% idle → nothing busy.
+        assert_eq!(
+            host_cpu_percent_from_top("CPU usage: 0.00% user, 0.00% sys, 100.00% idle"),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn mem_percent_from_vm_stat_computes_pressure() {
+        // page size 16384; total = 137_438_953_472 (128 GiB).
+        // free=2_000_000 + inactive=2_500_000 = 4_500_000 pages avail
+        //   × 16384 = 73_728_000_000 bytes avail
+        // used = 137_438_953_472 - 73_728_000_000 = 63_710_953_472
+        // used% = 46.35 → 46
+        let vm = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n\
+                  Pages free:                             2000000.\n\
+                  Pages active:                           3000000.\n\
+                  Pages inactive:                         2500000.\n\
+                  Pages wired down:                        500000.\n";
+        assert_eq!(mem_percent_from_vm_stat(vm, 137_438_953_472), Some(46));
+    }
+
+    #[test]
+    fn mem_percent_from_vm_stat_counts_speculative_as_available() {
+        // Same totals as above + 1_000_000 speculative (read-ahead cache) pages,
+        // which are reclaimable and should reduce the pressure number:
+        // avail = (2_000_000 + 2_500_000 + 1_000_000) × 16384 = 90_112_000_000
+        // used = 137_438_953_472 - 90_112_000_000 = 47_326_953_472 → 34.4% → 34
+        let vm = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n\
+                  Pages free:                             2000000.\n\
+                  Pages active:                           3000000.\n\
+                  Pages speculative:                      1000000.\n\
+                  Pages inactive:                         2500000.\n\
+                  Pages wired down:                        500000.\n";
+        assert_eq!(
+            mem_percent_from_vm_stat(vm, 137_438_953_472),
+            Some(34),
+            "speculative counts as available → lower used% than free+inactive alone"
+        );
+    }
+
+    #[test]
+    fn mem_percent_from_vm_stat_handles_zero_total_and_missing_fields() {
+        let vm = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n\
+                  Pages free:                             2000000.\n\
+                  Pages inactive:                         2500000.\n";
+        assert_eq!(mem_percent_from_vm_stat(vm, 0), None, "zero total → None");
+        assert_eq!(
+            mem_percent_from_vm_stat("Pages free: 100.\n", 1_000_000),
+            None,
+            "no inactive line → None"
+        );
+    }
+
+    #[test]
+    fn gpu_percent_from_ioreg_takes_max_across_nodes() {
+        let ioreg = "  | \"PerformanceStatistics\" = {\"Tiler Utilization %\"=3,\"Device Utilization %\"=4,\"SplitSceneCount\"=0}\n\
+                      +-o AGXAccelerator\n\
+                      | \"PerformanceStatistics\" = {\"Device Utilization %\"=87,\"recoveryCount\"=0}\n";
+        assert_eq!(gpu_percent_from_ioreg(ioreg), Some(87), "max of 4 and 87");
+    }
+
+    #[test]
+    fn gpu_percent_from_ioreg_absent_is_none() {
+        assert_eq!(gpu_percent_from_ioreg("no accelerator stats here"), None);
+        assert_eq!(gpu_percent_from_ioreg("\"Device Utilization %\"=0"), Some(0));
     }
 }

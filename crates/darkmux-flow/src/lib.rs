@@ -2128,7 +2128,7 @@ mod tests {
     }
 
     #[test]
-    fn flow_schema_version_is_1_13_0() {
+    fn flow_schema_version_is_1_15_0() {
         // Pin the schema version so an accidental rename can't ship silently;
         // any bump beyond this should be a deliberate code change paired with
         // an update to this assertion (and corresponding viewer EXPECTED_*
@@ -2186,7 +2186,11 @@ mod tests {
         //           The variant was an unemitted placeholder — no record carried
         //           the old value — so only the enum's value-set changes; chains
         //           survive without rotation. Unemitted until #1000.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.14.0");
+        //   1.15.0 — telemetry.process now samples the HOST system, not the
+        //           container: payload gains `mem` + `gpu` (host RAM/GPU util%)
+        //           and `cpu` shifts container→host (#814/#1064). Minor +
+        //           additive — older readers ignore mem/gpu; chains survive.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.15.0");
     }
 
     #[test]

@@ -272,7 +272,10 @@
   .bars{display:flex;align-items:flex-end;gap:6px;height:80px;border-bottom:1px solid var(--line)}.bar{width:24px;background:var(--amber-dim);border-radius:2px 2px 0 0}
   .xvals{display:flex;gap:6px;margin-top:4px}.xvals span{width:24px;text-align:center;font:9px 'JetBrains Mono',monospace;color:var(--muted)}
   .ctxchart{width:100%;height:74px;display:block;border-bottom:1px solid var(--line)}
-  .cpusvg{width:100%;height:80px;display:block;border-bottom:1px solid var(--line)}
+  .loadsvg{width:100%;height:40px;display:block;border-bottom:1px solid var(--line)}
+  .loadrow{margin-top:6px}
+  .loadlbl{font:10px 'JetBrains Mono',monospace;letter-spacing:.05em;text-transform:uppercase;color:var(--muted);margin-bottom:2px}
+  .loadpeak{color:var(--muted);margin-left:6px;opacity:.75}
   .finding{border:1px solid var(--line);border-left:3px solid var(--line);border-radius:5px;padding:9px 12px;margin-bottom:7px;background:var(--panel)}
   .finding.warn{border-left-color:var(--warn)}.finding.ok{border-left-color:var(--good)}
   .finding .fk{display:block;font:600 12px 'JetBrains Mono',monospace;color:var(--warn)}.finding.ok .fk{color:var(--good)}
@@ -1594,22 +1597,27 @@ function runRegions(){
   // was time-based + capped at 440px, so the timelines never lined up.
   const AX_W=1000, t0=startTs, t1=done?T(close.ts):state.t, span=Math.max(1,t1-t0);
   const tx=ts=>Math.max(0,Math.min(AX_W,(T(ts)-t0)/span*AX_W));
-  // container CPU — % busy: one bar per sample, positioned by TIME (not index).
-  const Hc=78,BW=5;
-  // docker stats reports CPU% where 100% = ONE core, so on a many-core box it
-  // scales to N×100% (1500%+) and a 100% (one-core) reference line is a useless
-  // floor. Express it in CORES instead (raw% / 100), auto-scaled to the peak —
-  // reads intuitively ("14.9 cores were working") without needing the host's
-  // core count. Exact % is on hover.
-  const cpuMaxPct=procs.reduce((m,r)=>Math.max(m,+r.fields.cpu||0),0);
-  const peakCores=cpuMaxPct/100, topCores=Math.max(0.5,peakCores);
-  const cpuBars=procs.map(r=>{
-    const x=tx(r.ts),c=+r.fields.cpu||0,cores=c/100,h=Math.max(1.5,cores/topCores*Hc);
-    return `<rect x="${(x-BW/2).toFixed(1)}" y="${(Hc-h).toFixed(1)}" width="${BW}" height="${h.toFixed(1)}" rx="1" fill="var(--amber-dim)"><title>${cores.toFixed(1)} cores (${esc(Math.round(c))}%)</title></rect>`;
-  }).join("");
-  const cpuTopLbl=`<text x="2" y="9" fill="var(--muted)" font-size="8" opacity="0.7">${peakCores.toFixed(1)} cores</text>`;
-  const cpu=procs.length?`<div class="track"><div class="lbl">container cpu — cores busy <span style="color:var(--muted);text-transform:none;font-weight:400">(tool work — inference runs in LMStudio, off-container)</span></div>
-    <svg class="cpusvg" viewBox="0 0 ${AX_W} ${Hc+2}" preserveAspectRatio="none">${cpuTopLbl}${cpuBars}</svg></div>`:"";
+  // Host system load — CPU / RAM / GPU utilization %, one color-coded bar per
+  // sample on the shared time axis. Inference runs in LMStudio (off-container),
+  // so these are HOST-wide %s, not the runtime container's (which reads ~0 and
+  // answers the wrong question — #814/#1064). All three share ONE 0–100 scale
+  // and a green→amber→red pressure coloring, stacked as three compact rows so a
+  // vertical slice reads cpu/ram/gpu at one instant. Exact % on hover.
+  const Hc=40,BW=5;
+  const pctColor=p=>p<60?'var(--good)':p<85?'var(--warn)':'var(--bad)';
+  const loadRow=(key,label)=>{
+    const s=procs.filter(r=>r.fields[key]!=null);
+    if(!s.length)return "";
+    const bars=s.map(r=>{
+      const x=tx(r.ts),p=Math.max(0,Math.min(100,+r.fields[key]||0)),h=Math.max(1.5,p/100*Hc);
+      return `<rect x="${(x-BW/2).toFixed(1)}" y="${(Hc-h).toFixed(1)}" width="${BW}" height="${h.toFixed(1)}" rx="1" fill="${pctColor(p)}"><title>${label} ${Math.round(p)}%</title></rect>`;
+    }).join("");
+    const peak=s.reduce((m,r)=>Math.max(m,Math.min(100,+r.fields[key]||0)),0);
+    return `<div class="loadrow"><div class="loadlbl">${label} <span class="loadpeak">peak ${Math.round(peak)}%</span></div>
+      <svg class="loadsvg" viewBox="0 0 ${AX_W} ${Hc+2}" preserveAspectRatio="none">${bars}</svg></div>`;
+  };
+  const loadRows=[loadRow('cpu','cpu'),loadRow('mem','ram'),loadRow('gpu','gpu')].join("");
+  const cpu=procs.length&&loadRows?`<div class="track"><div class="lbl">host load <span style="color:var(--muted);text-transform:none;font-weight:400">(system-wide — cpu · ram · gpu, % of capacity)</span></div>${loadRows}</div>`:"";
   let ctxChart="";
   if(cx.length && nctx){
     const H=72;
@@ -1809,7 +1817,7 @@ function renderLog(){
   }
   $("logbody").innerHTML=recs.length?recs.map(r=>{
     const tt=clk(T(r.ts));
-    const tag=r.category==="telemetry"?(r.source==="lms"?`lms:${r.fields.event}`:r.source==="process"?`cpu ${r.fields.cpu}%`:r.source==="detector"?`detect:${r.fields.kind}`:r.source==="runtime"?`run:${r.fields.turns}t`:r.source):(r.action||r.stage);
+    const tag=r.category==="telemetry"?(r.source==="lms"?`lms:${r.fields.event}`:r.source==="process"?`host ${r.fields.cpu??'–'}·${r.fields.mem??'–'}·${r.fields.gpu??'–'}%`:r.source==="detector"?`detect:${r.fields.kind}`:r.source==="runtime"?`run:${r.fields.turns}t`:r.source):(r.action||r.stage);
     let detail="";
     const f=r.fields||r.payload;
     if(r.action==="dispatch.reasoning"&&f&&f.reasoning_text){

@@ -1224,20 +1224,21 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         })
     };
 
-    // (#557 slice 4) Always-on lms + container-CPU telemetry sampler.
+    // (#557 slice 4 · #1064) Always-on lms + host-load telemetry sampler.
     // Mirrors the tailer/watchdog lifecycle: a background thread that
     // loops until `sampler_stop` is set (after `wait_with_output()`
     // returns) + a best-effort `.join()`. Per `TELEMETRY_SAMPLE_INTERVAL`
-    // it samples two host-side surfaces and forwards each into the one
-    // flow stream as a `category=telemetry` record:
+    // it samples two surfaces and forwards each into the one flow stream
+    // as a `category=telemetry` record:
     //   - `source=lms`     → load/unload deltas of the LMStudio loaded set
-    //   - `source=process` → the per-dispatch container's CPU%
-    // ALWAYS-ON (not `--instrument`-gated). Replaces the OC-gateway CPU
-    // sampler vestige for the crew path — CPU is sourced from `docker
-    // stats <container>`, never from a gateway process / OPENCLAW_GATEWAY_PORT.
-    // Best-effort throughout: a failed `list_loaded` / `docker stats` /
-    // record never panics or aborts the dispatch — it's additive
-    // observability, so starting/stopping it is non-load-bearing.
+    //   - `source=process` → HOST system load: CPU% (top), RAM used%
+    //                        (vm_stat + hw.memsize), GPU util% (ioreg). The
+    //                        container is NOT sampled — inference runs in
+    //                        LMStudio, off-container, so container CPU read ~0
+    //                        and answered the wrong question (#814/#1064).
+    // ALWAYS-ON (not `--instrument`-gated). Best-effort throughout: a failed
+    // `list_loaded` / host read / record never panics or aborts the dispatch —
+    // it's additive observability, so starting/stopping it is non-load-bearing.
     let sampler_stop = Arc::new(AtomicBool::new(false));
     let sampler_handle = {
         let sampler_stop = Arc::clone(&sampler_stop);
@@ -1246,7 +1247,6 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         let model = model.clone();
         let mission_id = mission_id.clone();
         let sprint_id = sprint_id.clone();
-        let container_name = container_name.clone();
         thread::spawn(move || {
             run_telemetry_sampler(
                 sampler_stop,
@@ -1255,7 +1255,6 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
                 model,
                 mission_id,
                 sprint_id,
-                container_name,
             )
         })
     };
@@ -1603,11 +1602,22 @@ fn run_tailer(
     state.summary
 }
 
-/// (#557 slice 4) Run the always-on lms + container-CPU telemetry
+/// Run a command, returning its stdout as a `String` only if it spawned and
+/// exited successfully. Any failure (binary missing, non-zero exit) → `None`.
+/// Keeps the host-load sampler's three best-effort reads terse. (#1064)
+fn run_ok(cmd: &mut Command) -> Option<String> {
+    let out = cmd.output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// (#557 slice 4 · #1064) Run the always-on lms + host-load telemetry
 /// sampler to completion. Loops until `stop_flag` is set (the main thread
-/// sets it after `wait_with_output()` returns), sampling two host-side
-/// surfaces each `TELEMETRY_SAMPLE_INTERVAL` and forwarding each
-/// observation into the one flow stream as a `category=telemetry` record.
+/// sets it after `wait_with_output()` returns), sampling the loaded-model
+/// set and the host system load each `TELEMETRY_SAMPLE_INTERVAL` and
+/// forwarding each observation into the one flow stream as a
+/// `category=telemetry` record.
 ///
 /// **lms (`source=lms`)**: `darkmux_profiles::lms::list_loaded()` is the
 /// lms-ps source. Each tick diffs the current loaded set against the
@@ -1625,10 +1635,13 @@ fn run_tailer(
 /// models that happen to be resident are minor, informative noise.
 /// Implemented via the `seeded` flag.
 ///
-/// **process (`source=process`)**: `docker stats <container> --no-stream
-/// --format "{{.CPUPerc}}"` → `parse_cpu_percent` → `{cpu:<N>}`. This is
-/// the OC-gateway-sampler replacement: CPU comes from the per-dispatch
-/// container, never from a gateway process.
+/// **process (`source=process`)**: host **system** load — CPU% (`top`),
+/// RAM used% (`vm_stat` + `sysctl -n hw.memsize`), GPU util% (`ioreg`
+/// IOAccelerator `"Device Utilization %"`) → `{cpu, mem, gpu}`, all host
+/// integer %, each best-effort (a field is omitted for the tick it fails).
+/// The container is deliberately NOT sampled: inference runs in LMStudio
+/// off-container, so container CPU reads ~0 and answers the wrong question
+/// (#814/#1064). Unprivileged — the deeper powermetrics path (sudo) is #2.
 ///
 /// Best-effort throughout — a failed `list_loaded`, a failed `docker
 /// stats`, or a failed record never panics or aborts; the worst case is
@@ -1643,7 +1656,6 @@ fn run_telemetry_sampler(
     model: String,
     mission_id: Option<String>,
     sprint_id: Option<String>,
-    container_name: String,
 ) {
     let emit = |source: &str, action: &str, payload: serde_json::Value| {
         let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
@@ -1692,30 +1704,38 @@ fn run_telemetry_sampler(
             }
         }
 
-        // Container CPU%. `docker stats --no-stream` is a single-shot
-        // sample of THIS dispatch's container. Best-effort: any failure
-        // (docker gone, container already exited, unparseable output) just
-        // skips the CPU sample for this tick.
-        if let Ok(out) = Command::new("docker")
-            .args([
-                "stats",
-                &container_name,
-                "--no-stream",
-                "--format",
-                "{{.CPUPerc}}",
-            ])
-            .output()
-        {
-            if out.status.success() {
-                let raw = String::from_utf8_lossy(&out.stdout);
-                if let Some(cpu) = crate::telemetry_sampler::parse_cpu_percent(&raw) {
-                    emit(
-                        "process",
-                        "telemetry.process",
-                        serde_json::json!({ "cpu": cpu }),
-                    );
-                }
+        // Host system load — CPU / RAM / GPU utilization%. Inference runs in
+        // LMStudio (off-container), so the load worth watching is the HOST's,
+        // not the runtime container's (which idles waiting on the model and
+        // reads ~0 — the wrong-question problem, #814/#1064). Each read is
+        // best-effort and unprivileged; a tick emits whichever of the three
+        // succeed (a failed field is simply omitted from the payload).
+        let host_cpu = run_ok(Command::new("top").args(["-l", "1", "-n", "0"]))
+            .and_then(|s| crate::telemetry_sampler::host_cpu_percent_from_top(&s));
+        let host_mem = run_ok(Command::new("sysctl").args(["-n", "hw.memsize"]))
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .and_then(|total| {
+                run_ok(&mut Command::new("vm_stat"))
+                    .and_then(|s| crate::telemetry_sampler::mem_percent_from_vm_stat(&s, total))
+            });
+        let host_gpu = run_ok(Command::new("ioreg").args(["-r", "-d", "1", "-c", "IOAccelerator"]))
+            .and_then(|s| crate::telemetry_sampler::gpu_percent_from_ioreg(&s));
+        if host_cpu.is_some() || host_mem.is_some() || host_gpu.is_some() {
+            let mut payload = serde_json::Map::new();
+            if let Some(c) = host_cpu {
+                payload.insert("cpu".into(), c.into());
             }
+            if let Some(m) = host_mem {
+                payload.insert("mem".into(), m.into());
+            }
+            if let Some(g) = host_gpu {
+                payload.insert("gpu".into(), g.into());
+            }
+            emit(
+                "process",
+                "telemetry.process",
+                serde_json::Value::Object(payload),
+            );
         }
 
         // Wait out the sample interval, but poll the stop flag every
