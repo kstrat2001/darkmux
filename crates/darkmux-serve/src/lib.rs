@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use axum::{
-    extract::{ConnectInfo, Path, Request, State},
+    extract::{ConnectInfo, Path, Query, Request, State},
     http::StatusCode,
     middleware::{from_fn, Next},
     response::{IntoResponse, Response, sse::{Event, KeepAlive, Sse}},
@@ -1569,12 +1569,34 @@ async fn flow_stream_handler(
 async fn flow_handler(
     State(state): State<AppState>,
     Path(segment): Path<String>,
+    Query(params): Query<FlowQuery>,
 ) -> impl IntoResponse {
     let Some(date) = is_valid_date(&segment) else {
         return (StatusCode::BAD_REQUEST, "bad date format").into_response();
     };
-    let records = aggregate_flow_records_for_date(date, &state.flows_dir).await;
+    let mut records = aggregate_flow_records_for_date(date, &state.flows_dir).await;
+    // (#1173) Optional `?since=<iso-ts>` incremental filter. The live viewer's
+    // 20s reconcile backstop passes the newest ts it already holds, so the
+    // response is just the recent tail rather than the whole (multi-MB) day —
+    // the client stops re-parsing the full day file every tick. Flow ts are
+    // uniform second-precision UTC (...Z), so a lexical `>=` sorts
+    // chronologically; a record missing `ts` is kept (never silently dropped).
+    if let Some(since) = params.since.as_deref().filter(|s| !s.is_empty()) {
+        records.retain(|r| match r.get("ts").and_then(|v| v.as_str()) {
+            Some(ts) => ts >= since,
+            None => true,
+        });
+    }
     axum::Json(records).into_response()
+}
+
+/// Query params for `GET /flow/:date`. `?since=<iso-ts>` bounds the response to
+/// records at or after that timestamp — the #1173 incremental-reconcile
+/// backstop. Absent = the whole day, unchanged.
+#[derive(serde::Deserialize)]
+struct FlowQuery {
+    #[serde(default)]
+    since: Option<String>,
 }
 
 /// `GET /flow-days` → the playback **catalog**: every day with a flow file on
@@ -3368,6 +3390,65 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
         assert_eq!(bytes.as_ref(), b"[]");
+    }
+
+    #[tokio::test]
+    async fn flow_since_filters_records_inclusively() {
+        // (#1173) The live viewer's incremental reconcile passes `?since=<iso-ts>`
+        // so a long-open tab stops re-parsing the whole day. Flow ts are uniform
+        // second-precision UTC, so the filter is a plain lexical `>=` (inclusive).
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("2026-07-03.jsonl"),
+            "{\"ts\":\"2026-07-03T00:00:10Z\",\"action\":\"a\",\"session_id\":\"S\"}\n\
+             {\"ts\":\"2026-07-03T00:00:20Z\",\"action\":\"b\",\"session_id\":\"S\"}\n\
+             {\"ts\":\"2026-07-03T00:00:30Z\",\"action\":\"c\",\"session_id\":\"S\"}\n",
+        )
+        .unwrap();
+        let app = build_router(tmp.path().to_path_buf());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/flow/2026-07-03?since=2026-07-03T00:00:20Z")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        let recs: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        let actions: Vec<&str> = recs.iter().filter_map(|r| r["action"].as_str()).collect();
+        assert_eq!(actions, vec!["b", "c"], "since is inclusive; the earlier record drops");
+    }
+
+    #[tokio::test]
+    async fn flow_without_since_returns_all_records() {
+        // No `?since=` → the whole day, unchanged (backward-compatible).
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("2026-07-03.jsonl"),
+            "{\"ts\":\"2026-07-03T00:00:10Z\",\"action\":\"a\"}\n\
+             {\"ts\":\"2026-07-03T00:00:20Z\",\"action\":\"b\"}\n",
+        )
+        .unwrap();
+        let app = build_router(tmp.path().to_path_buf());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/flow/2026-07-03")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        let recs: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(recs.len(), 2, "no since → all records returned");
     }
 
     #[tokio::test]
