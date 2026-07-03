@@ -11,6 +11,14 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 
 ## [Unreleased]
 
+## [1.14.1] - 2026-07-03
+
+A viewer performance hotfix — the live observability tab degraded over a long-open day (multi-second loads, laggy clicks). Drop-in over 1.14.0; no `FLOW_SCHEMA` / `RULES_SCHEMA` / `CONFIG_SCHEMA` change.
+
+### Fixed
+
+- **The live viewer no longer degrades over a long-open day** (serve + viewer, #1173). Two independent costs, both profiled on a real daemon (160 sessions, ~4.8k records): (1) every click and the initial paint paid a ~2.5s `render()` because `liveSessionSet()` fell back to an O(sessions×records) scan (`flowLiveSessions`) when Redis presence was empty, and the fleet timeline + crew cards called it hundreds of times per render — it's now memoized per render (keyed on the data snapshot + a 2s wall-clock bucket) → ~20ms (123×); (2) the 20s SSE-backstop reconcile re-fetched and re-parsed both full day files (multi-MB) on the main thread every tick — `GET /flow/:date` now accepts an optional `?since=<ts>` and the reconcile requests only the recent tail, so the parse cost no longer grows with the day.
+
 ## [1.14.0] - 2026-07-02
 
 Cross-day playback discoverability + a run-detail telemetry-panel overhaul. Drop-in over 1.13.1 — no `FLOW_SCHEMA` / `RULES_SCHEMA` / `CONFIG_SCHEMA` change.
@@ -738,6 +746,7 @@ cluster of crew-index correctness repairs.
   idle machine's bar no longer stretches to the playhead; adds the first
   viewer-lifecycle e2e regression gate.
 
+[1.14.1]: https://github.com/kstrat2001/darkmux/releases/tag/v1.14.1
 [1.14.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.14.0
 [1.13.1]: https://github.com/kstrat2001/darkmux/releases/tag/v1.13.1
 [1.13.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.13.0
