@@ -2380,6 +2380,10 @@ function todayUTC(){return new Date().toISOString().slice(0,10);}
 // though they're hours old. Storage stays per-day files; the live VIEW queries
 // the last LIVE_WINDOW_MS across day files.
 const LIVE_WINDOW_MS=24*60*60*1000;
+// (#1173) The reconcile backstop fetches only records newer than (newest held −
+// this overlap) rather than the whole day — a safety margin over the SSE cadence
+// so a brief reconnect gap is still caught while the response stays a small tail.
+const RECONCILE_OVERLAP_MS=30*60*1000;
 function prevDateUTC(d){const dt=new Date(d+"T00:00:00Z");dt.setUTCDate(dt.getUTCDate()-1);return dt.toISOString().slice(0,10);}
 
 let RAW=[];            // raw FlowRecords (pre-adapt); the live tail appends here
@@ -2654,9 +2658,16 @@ async function pollMachineSpecs(){
 async function reconcileLiveWindow(){
   const today=LIVE_ES_DATE||todayUTC();
   const cut=Date.now()-LIVE_WINDOW_MS;
+  // (#1173) Incremental: ask each day file only for records at/after the newest
+  // ts we already hold (minus RECONCILE_OVERLAP_MS), server-filtered via
+  // `?since=`. The response is the recent tail, not the multi-MB day — so the
+  // reconcile parse cost no longer grows with the day (the long-tab-lag cause).
+  const newest=RAW.reduce((m,r)=>{const t=T(r.ts);return t>m?t:m;},0);
+  const sinceMs=newest?Math.max(cut,newest-RECONCILE_OVERLAP_MS):cut;
+  const q="?since="+encodeURIComponent(new Date(sinceMs).toISOString().replace(/\.\d+Z$/,"Z"));
   let added=0;
   for(const d of [prevDateUTC(today),today]){
-    let res; try{res=await fetch("/flow/"+d,{headers:{accept:"application/json"}});}catch(_){continue;}
+    let res; try{res=await fetch("/flow/"+d+q,{headers:{accept:"application/json"}});}catch(_){continue;}
     if(!res.ok)continue;
     let body; try{body=await res.json();}catch(_){continue;}
     const recs=Array.isArray(body)?body:(body.records||body.flow||[]);
