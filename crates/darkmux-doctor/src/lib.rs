@@ -1265,7 +1265,8 @@ pub fn probe_remote_endpoints() -> Vec<Check> {
     };
 
     let mut checks = Vec::new();
-    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<(String, String, String, String)> =
+        std::collections::HashSet::new();
 
     for (profile_name, profile) in &registry.registry.profiles {
         for model in &profile.models {
@@ -1275,9 +1276,21 @@ pub fn probe_remote_endpoints() -> Vec<Check> {
             if !ep.is_remote() {
                 continue;
             }
-            let key = (ep.url.clone().unwrap_or_default(), model.id.clone());
+            // Dedup on EVERYTHING that changes what a probe would verify:
+            // url + model + api_version + keychain item. Two profiles hitting
+            // the same deployment with DIFFERENT credentials must both probe —
+            // credential validity is the feature's whole point.
+            let key = (
+                ep.url.clone().unwrap_or_default(),
+                model.id.clone(),
+                ep.api_version.clone().unwrap_or_default(),
+                ep.auth
+                    .as_ref()
+                    .and_then(|a| a.keychain.clone())
+                    .unwrap_or_default(),
+            );
             if !seen.insert(key) {
-                continue; // same endpoint+model already probed this run
+                continue; // identical endpoint declaration already probed this run
             }
             let name = format!("probe: {profile_name}/{}", model.id);
             match darkmux_crew::dispatch_internal::probe_remote_endpoint(
