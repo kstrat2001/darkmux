@@ -1259,6 +1259,12 @@ enum LabCmd {
         /// `review-bench-<ts>/scores.json` under the runs dir).
         #[arg(long = "scores-out")]
         scores_out: Option<std::path::PathBuf>,
+        /// Dispatch the free-form `pr-reviewer-freeform` role (ordinary prose,
+        /// `MUST FIX:`/`CONSIDER:` marker lines, no JSON grammar lock) instead
+        /// of the shipped grammar-constrained `pr-reviewer` — to measure
+        /// whether the JSON contract itself suppresses recall.
+        #[arg(long)]
+        freeform: bool,
     },
     /// Loop lab (#986) — run ONE dispatch under a chosen harness config and
     /// classify how the loop behaved: productive / struggled / inert-false-pass
@@ -3769,6 +3775,7 @@ fn cmd_lab(sub: LabCmd) -> Result<i32> {
             profiles,
             timeout,
             scores_out,
+            freeform,
         } => {
             lab::review_bench::run_review_bench(lab::review_bench::ReviewBenchOpts {
                 cases_dir: std::path::PathBuf::from(cases_dir),
@@ -3776,6 +3783,11 @@ fn cmd_lab(sub: LabCmd) -> Result<i32> {
                 config_path: profiles,
                 timeout_seconds: timeout,
                 scores_out,
+                mode: if freeform {
+                    lab::review_bench::BenchMode::FreeForm
+                } else {
+                    lab::review_bench::BenchMode::Strict
+                },
             })?;
             Ok(0)
         }
