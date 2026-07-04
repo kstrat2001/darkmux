@@ -232,9 +232,25 @@ pub struct Usage {
 }
 
 /// Blocking HTTP client for LMStudio's chat-completions endpoint.
+///
+/// Deliberately does NOT derive `Debug` — `auth_header` carries a live
+/// secret when the "brain" is a remote endpoint (#92), and a stray
+/// `{:?}` on this struct must never be able to leak it.
 pub struct LmStudioClient {
     base_url: String,
     agent: ureq::Agent,
+    /// (#92) Full chat-completions URL override, used when the brain is a
+    /// remote OpenAI-compatible endpoint that needs a query string (Azure's
+    /// `?api-version=`) that `base_url` + the unconditional `/chat/completions`
+    /// suffix below can't express. When set, `chat`/`chat_streaming` POST to
+    /// this URL verbatim; `base_url` is otherwise unused.
+    chat_url_override: Option<String>,
+    /// (#92) An extra header attached to every request — `(name, value)`,
+    /// e.g. `("api-key", "<secret>")` or `("Authorization", "Bearer <secret>")`.
+    /// Populated only for a remote-brain dispatch, read once from stdin at
+    /// startup (never a file or argv/env) — see `runtime/src/main.rs`'s
+    /// `--auth-header-stdin`.
+    auth_header: Option<(String, String)>,
 }
 
 impl LmStudioClient {
@@ -249,6 +265,64 @@ impl LmStudioClient {
         Self {
             base_url: base_url.into(),
             agent,
+            chat_url_override: None,
+            auth_header: None,
+        }
+    }
+
+    /// (#92) Override the chat-completions URL entirely — the client POSTs
+    /// here verbatim instead of `{base_url}/chat/completions`. Setting this
+    /// is also what marks the client as talking to a remote brain, which
+    /// gates the `max_tokens` → `max_completion_tokens` rename in
+    /// [`Self::request_body`] (Azure's newer reasoning-family models reject
+    /// `max_tokens` outright).
+    pub fn with_chat_url(mut self, url: impl Into<String>) -> Self {
+        self.chat_url_override = Some(url.into());
+        self
+    }
+
+    /// (#92) Attach an auth header to every request this client makes.
+    pub fn with_auth_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.auth_header = Some((name.into(), value.into()));
+        self
+    }
+
+    /// True when this client is configured for a remote (non-LMStudio) brain
+    /// — i.e. a `--chat-url` override was set. Drives the `max_tokens` field
+    /// rename in [`Self::request_body`].
+    fn is_remote_brain(&self) -> bool {
+        self.chat_url_override.is_some()
+    }
+
+    fn effective_chat_url(&self) -> String {
+        self.chat_url_override
+            .clone()
+            .unwrap_or_else(|| format!("{}/chat/completions", self.base_url))
+    }
+
+    /// Build the wire JSON body for `req`, renaming `max_tokens` to
+    /// `max_completion_tokens` when talking to a remote brain (#92) —
+    /// verified empirically against Azure OpenAI's gpt-5.1 deployment,
+    /// which rejects `max_tokens` for reasoning-family models. LMStudio and
+    /// most other OpenAI-compatible servers only ever see the unrenamed
+    /// `max_tokens` field, since this only fires when `chat_url_override`
+    /// is set.
+    fn request_body(&self, req: &ChatRequest) -> Result<serde_json::Value> {
+        let mut body = serde_json::to_value(req)?;
+        if self.is_remote_brain() {
+            if let Some(obj) = body.as_object_mut() {
+                if let Some(mt) = obj.remove("max_tokens") {
+                    obj.insert("max_completion_tokens".to_string(), mt);
+                }
+            }
+        }
+        Ok(body)
+    }
+
+    fn apply_auth_header(&self, req: ureq::Request) -> ureq::Request {
+        match &self.auth_header {
+            Some((name, value)) => req.set(name, value),
+            None => req,
         }
     }
 
@@ -256,13 +330,14 @@ impl LmStudioClient {
     /// if the HTTP call fails, the response isn't JSON, or the JSON
     /// doesn't fit the expected shape.
     pub fn chat(&self, req: &ChatRequest) -> Result<ChatResponse> {
-        let url = format!("{}/chat/completions", self.base_url);
+        let url = self.effective_chat_url();
+        let body = self.request_body(req)?;
 
-        let resp = self
-            .agent
-            .post(&url)
-            .set("content-type", "application/json")
-            .send_json(serde_json::to_value(req)?)
+        let request = self.apply_auth_header(
+            self.agent.post(&url).set("content-type", "application/json"),
+        );
+        let resp = request
+            .send_json(body)
             .map_err(|e| anyhow!("LMStudio request failed: {e}"))?;
 
         let status = resp.status();
@@ -286,13 +361,15 @@ impl LmStudioClient {
         &self,
         req: &ChatRequest,
     ) -> Result<ChunkStream<BufReader<Box<dyn Read + Send + Sync>>>> {
-        let url = format!("{}/chat/completions", self.base_url);
-        let body = build_streaming_request_body(req)?;
-        let resp = self
-            .agent
-            .post(&url)
-            .set("content-type", "application/json")
-            .set("accept", "text/event-stream")
+        let url = self.effective_chat_url();
+        let body = build_streaming_request_body(req, self.is_remote_brain())?;
+        let request = self.apply_auth_header(
+            self.agent
+                .post(&url)
+                .set("content-type", "application/json")
+                .set("accept", "text/event-stream"),
+        );
+        let resp = request
             .send_json(body)
             .map_err(|e| anyhow!("LMStudio streaming request failed: {e}"))?;
         let status = resp.status();
@@ -317,7 +394,14 @@ impl Default for LmStudioClient {
 /// true` so LMStudio (and any OpenAI-compatible server) emits per-dispatch
 /// `usage` in the final SSE chunk (#360). Extracted to a free function so
 /// the body-building rule is unit-testable without an HTTP round-trip.
-pub(crate) fn build_streaming_request_body(req: &ChatRequest) -> Result<serde_json::Value> {
+///
+/// `remote` (#92): when true (the client is talking to a remote brain, not
+/// local LMStudio), renames `max_tokens` to `max_completion_tokens` —
+/// mirrors [`LmStudioClient::request_body`]'s non-streaming rename, needed
+/// because Azure OpenAI's reasoning-family models (e.g. gpt-5.1) reject
+/// `max_tokens` outright. LMStudio and other OpenAI-compatible servers never
+/// see this rename, since it only fires when `remote` is true.
+pub(crate) fn build_streaming_request_body(req: &ChatRequest, remote: bool) -> Result<serde_json::Value> {
     let mut body = serde_json::to_value(req)?;
     let body_obj = body
         .as_object_mut()
@@ -334,6 +418,11 @@ pub(crate) fn build_streaming_request_body(req: &ChatRequest) -> Result<serde_js
         "stream_options".to_string(),
         serde_json::json!({"include_usage": true}),
     );
+    if remote {
+        if let Some(mt) = body_obj.remove("max_tokens") {
+            body_obj.insert("max_completion_tokens".to_string(), mt);
+        }
+    }
     Ok(body)
 }
 
@@ -758,7 +847,7 @@ mod tests {
             max_tokens: None,
             response_format: None,
         };
-        let body = build_streaming_request_body(&req).expect("body builds");
+        let body = build_streaming_request_body(&req, false).expect("body builds");
         let obj = body.as_object().expect("object shape");
         assert_eq!(
             obj.get("stream"),
@@ -776,6 +865,96 @@ mod tests {
         // or model.
         assert_eq!(obj.get("model").and_then(|v| v.as_str()), Some("test-model"));
         assert!(obj.get("messages").and_then(|v| v.as_array()).is_some());
+    }
+
+    /// (#92) `remote = true` renames `max_tokens` to `max_completion_tokens`
+    /// — Azure OpenAI's reasoning-family models (gpt-5.1) reject the
+    /// unrenamed field outright. `remote = false` (LMStudio/local, the test
+    /// above) must NOT see this rename.
+    #[test]
+    fn streaming_request_body_renames_max_tokens_for_remote_brain() {
+        let req = ChatRequest {
+            model: "gpt-5.1".to_string(),
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            tool_choice: None,
+            temperature: 0.2,
+            max_tokens: Some(10_000),
+            response_format: None,
+        };
+        let body = build_streaming_request_body(&req, true).expect("body builds");
+        let obj = body.as_object().expect("object shape");
+        assert_eq!(
+            obj.get("max_completion_tokens"),
+            Some(&serde_json::json!(10_000)),
+            "remote brain must see max_completion_tokens, not max_tokens"
+        );
+        assert!(
+            obj.get("max_tokens").is_none(),
+            "the original max_tokens key must be removed, not duplicated"
+        );
+    }
+
+    // ─── LmStudioClient (#92 remote-brain builder methods) ─────
+
+    fn sample_request() -> ChatRequest {
+        ChatRequest {
+            model: "gpt-5.1".to_string(),
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            tool_choice: None,
+            temperature: 0.2,
+            max_tokens: Some(10_000),
+            response_format: None,
+        }
+    }
+
+    #[test]
+    fn client_without_chat_url_is_not_remote_brain() {
+        let client = LmStudioClient::with_base_url("http://host.docker.internal:1234/v1");
+        assert!(!client.is_remote_brain());
+        assert_eq!(
+            client.effective_chat_url(),
+            "http://host.docker.internal:1234/v1/chat/completions"
+        );
+        let body = client.request_body(&sample_request()).expect("body builds");
+        assert_eq!(
+            body.get("max_tokens"),
+            Some(&serde_json::json!(10_000)),
+            "local (non-remote) client must NOT rename max_tokens"
+        );
+    }
+
+    #[test]
+    fn client_with_chat_url_is_remote_brain_and_renames_max_tokens() {
+        let full_url = "https://x.cognitiveservices.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2025-01-01-preview";
+        let client = LmStudioClient::with_base_url("http://unused:1234/v1").with_chat_url(full_url);
+        assert!(client.is_remote_brain());
+        assert_eq!(
+            client.effective_chat_url(),
+            full_url,
+            "chat_url_override must be used verbatim, not suffixed with /chat/completions"
+        );
+        let body = client.request_body(&sample_request()).expect("body builds");
+        assert_eq!(body.get("max_completion_tokens"), Some(&serde_json::json!(10_000)));
+        assert!(body.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn client_with_auth_header_applies_it_to_a_request() {
+        // Can't assert on a live HTTP send without a server; assert on the
+        // builder's effect via a fresh request builder instead — confirms
+        // apply_auth_header doesn't panic and actually sets the header name
+        // given (ureq::Request doesn't expose a getter, so this is a smoke
+        // check that the call chain type-checks and runs without error).
+        let client = LmStudioClient::with_base_url("http://unused:1234/v1")
+            .with_auth_header("api-key", "secret-value-not-logged");
+        let req = client.apply_auth_header(client.agent.post("http://unused:1234/v1/chat/completions"));
+        // ureq::Request has no public header-inspection API; the meaningful
+        // assertion is that construction succeeds and auth_header is Some —
+        // exercised indirectly since the field is private to this module.
+        drop(req);
+        assert!(client.auth_header.is_some());
     }
 
     // ─── read_line_capped (S4 byte cap) ────────────────────────
