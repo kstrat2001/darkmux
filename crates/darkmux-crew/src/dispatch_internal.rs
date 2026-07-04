@@ -155,6 +155,7 @@ pub(crate) fn apply_volume_mounts(args: &mut Vec<String>, workspace: &Path, host
 pub(crate) const PROMPT_FILE_NAME: &str = ".prompt.txt";
 const PROMPT_FILE_CONTAINER_PATH: &str = "/darkmux-out/.prompt.txt";
 
+
 /// (#703) Inject the host-cached static runtime binary into an operator
 /// image: bind-mount it read-only at `/darkmux-runtime` and override the
 /// container entrypoint to it. Used when dispatching into an image OTHER
@@ -432,6 +433,22 @@ pub struct DockerRunConfig {
     /// cache). Resolved + created at the call site so the inner verify loop
     /// reuses downloaded deps across dispatches (#703 Slice 3).
     pub cache_dir: std::path::PathBuf,
+    /// (#92) When Some, this dispatch's "brain" is a remote OpenAI-compatible
+    /// endpoint rather than local LMStudio — passed to the container as
+    /// `--chat-url`. Only ever set for a role whose tool_palette grants at
+    /// least one tool (a tool-less role stays on the light single-shot
+    /// `dispatch_remote` path instead, never reaching this struct). The URL
+    /// itself never carries a credential (auth travels in a header, not the
+    /// URL — see `remote_needs_auth`), so it's safe to include in this
+    /// `Debug`-derived, test-asserted struct.
+    pub remote_chat_url: Option<String>,
+    /// (#92) Whether the resolved remote endpoint declares an auth mechanism.
+    /// When true, `build_docker_run_argv` adds `-i` (keep stdin open) and
+    /// `--auth-header-stdin`, and the caller pipes the actual secret over the
+    /// container's stdin immediately after spawn (see
+    /// `write_remote_auth_header_stdin`) — never via a file or env var. This
+    /// flag carries no secret material itself.
+    pub remote_needs_auth: bool,
 }
 
 /// (#842) Build the complete `docker` command from a prepared config: the
@@ -459,6 +476,13 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
     args.push(format!("--security-opt={}", DOCKER_SECURITY_OPT));
     args.push(format!("--pids-limit={}", DOCKER_PIDS_LIMIT));
     args.push(format!("--memory={}", DOCKER_MEMORY));
+
+    // (#92) Keep stdin open ONLY when the container needs its remote auth
+    // secret piped in — every other dispatch (local, or a remote endpoint
+    // with no auth) has no stdin use and omits this flag.
+    if config.remote_needs_auth {
+        args.push("-i".to_string());
+    }
 
     // Workspace + out-dir volume mounts
     apply_volume_mounts(&mut args, &config.workspace, &config.host_out);
@@ -507,6 +531,18 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
     if let Some(allowed) = config.allowed_tools.as_ref() {
         args.push("--allowed-tools".to_string());
         args.push(allowed.join(","));
+    }
+
+    // (#92) Agentic-remote: this dispatch's brain is a remote OpenAI-compat
+    // endpoint, not local LMStudio. The URL carries no secret (auth travels
+    // in a header — see `remote_needs_auth` below), so it's fine directly on
+    // argv/`ps`, same as `--model`.
+    if let Some(url) = &config.remote_chat_url {
+        args.push("--chat-url".to_string());
+        args.push(url.clone());
+        if config.remote_needs_auth {
+            args.push("--auth-header-stdin".to_string());
+        }
     }
 
     // Compaction flags (#368) — delegated to `apply_compaction_flags`, the
@@ -682,7 +718,478 @@ impl Drop for AutoWorkspaceCleanup {
     }
 }
 
+/// (#92) Write the remote endpoint's auth header to the container's stdin as
+/// `{"header": "...", "value": "..."}` and close the pipe (EOF), so
+/// `runtime`'s startup read sees exactly one blob and returns — no file, no
+/// env var, no FILESYSTEM artifact for a `bash`-capable model to find at any
+/// point during the container's run (the secret still lives in the
+/// runtime process's memory for the dispatch's duration — this closes the
+/// file-based exposure, not every exposure vector; see the residual-risk
+/// note in `runtime/src/main.rs` on `auth_header_stdin`). Call this
+/// immediately after spawning a container built with `-i` (stdin piped);
+/// the container blocks reading stdin until this returns or the pipe closes.
+fn write_remote_auth_header_stdin(
+    stdin: &mut std::process::ChildStdin,
+    header_name: &str,
+    header_value: &str,
+) -> Result<()> {
+    use std::io::Write;
+    let body = serde_json::json!({ "header": header_name, "value": header_value }).to_string();
+    stdin
+        .write_all(body.as_bytes())
+        .context("writing remote auth header to container stdin")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// (#1177) Light single-shot hosted-dispatch path.
+//
+// When a dispatch's resolved model names a REMOTE OpenAI-compatible endpoint
+// (Azure OpenAI, OpenAI, a LiteLLM proxy), darkmux does NOT start the container
+// runtime. It makes ONE OpenAI chat-completions call — via `curl`, the same
+// convention `probe_loaded_model` uses, so no Rust HTTP-client dep is dragged
+// in — and emits the same flow records the container path does, so the run
+// lands in the fleet viewer identically, distinguished only by its `endpoint`
+// (and by having no host-load, since the model computes off-fleet). The tier is
+// NOT inferred from remoteness: a dispatched model is a worker wherever it runs,
+// and a remote endpoint may serve a frontier model OR an OSS service (opencode,
+// a remote vLLM) — capability is never derived from location. Single-shot only
+// — no tools, no multi-turn, no compaction. The machine holding the endpoint's
+// Keychain credential is the keymaster.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Resolve the selected model's `ProfileModel` (with its endpoint) WITHOUT
+/// loading anything in LMStudio — so `dispatch` can branch to the hosted path
+/// before the container/load machinery. `None` ⇒ no profile model resolves
+/// (the local path's `probe_loaded_model` fallback + container path).
+fn resolve_selected_profile_model(
+    role: &crate::types::Role,
+    profile_override: Option<&str>,
+    config_path: Option<&str>,
+) -> Option<darkmux_types::ProfileModel> {
+    use crate::select::select_model;
+    use darkmux_profiles::profiles::load_registry;
+    let loaded = load_registry(config_path).ok()?;
+    let (_name, profile) = loaded.registry.resolve_active(profile_override)?;
+    let skill_index: std::collections::HashMap<String, crate::types::Skill> =
+        crate::loader::load_skills()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| (s.id.clone(), s))
+            .collect();
+    let id = select_model(role, profile, |id| skill_index.get(id)).ok()?;
+    profile.models.iter().find(|m| m.id == id).cloned()
+}
+
+/// (#92) True when a role's tool palette grants at least one tool — the
+/// dividing line between the light single-shot remote path and the
+/// agentic-remote container path. A tool-less role (empty `allow`) has no
+/// use for a tool-calling loop regardless of backend, so it stays on the
+/// cheap path; a role with `allow` entries is expected to actually explore,
+/// which only the container's `loop_runner` can drive.
+fn role_wants_agentic_remote(role: &crate::types::Role) -> bool {
+    !role.tool_palette.allow.is_empty()
+}
+
+/// If this dispatch's resolved model is REMOTE, return the pieces the hosted
+/// path needs (role, system prompt, model). `Ok(None)` ⇒ local — the caller
+/// falls through to the unchanged container path (which re-loads the role;
+/// role load is cheap embedded-string work).
+fn try_resolve_remote_target(
+    opts: &DispatchOpts,
+) -> Result<Option<(crate::types::Role, String, darkmux_types::ProfileModel)>> {
+    let roles = load_roles().context("loading crew roles for internal dispatch")?;
+    let role = match roles.iter().find(|r| r.id == opts.role_id) {
+        Some(r) => r.clone(),
+        None => return Ok(None), // let the main path raise the canonical "role not found"
+    };
+    let pm = match resolve_selected_profile_model(
+        &role,
+        opts.profile_name.as_deref(),
+        opts.config_path.as_deref(),
+    ) {
+        Some(pm) if pm.endpoint.as_ref().is_some_and(|e| e.is_remote()) => pm,
+        _ => return Ok(None), // local ⇒ container path
+    };
+    let role_prompt = load_role_prompt(&opts.role_id).ok_or_else(|| {
+        anyhow!(
+            "role '{}' has no .md system prompt — hosted dispatch requires one",
+            opts.role_id
+        )
+    })?;
+    let system_prompt = if role.is_specialist() {
+        format!(
+            "{}\n\n{}",
+            load_autonomous_dispatch_preamble().trim_end(),
+            role_prompt
+        )
+    } else {
+        role_prompt
+    };
+    Ok(Some((role, system_prompt, pm)))
+}
+
+/// The chat-completions URL: `{base}/chat/completions` (+ `?api-version=` for
+/// Azure). The operator's `endpoint.url` is the base up to `/chat/completions`
+/// (an Azure deployment URL, or e.g. `https://api.openai.com/v1`).
+fn remote_chat_url(ep: &darkmux_types::ModelEndpoint) -> String {
+    let base = ep.base_url();
+    let base = base.trim_end_matches('/');
+    match ep.api_version.as_deref() {
+        Some(v) => format!("{base}/chat/completions?api-version={v}"),
+        None => format!("{base}/chat/completions"),
+    }
+}
+
+/// A short human label for the endpoint, for the flow record payload
+/// (e.g. `azure:finherogpt.cognitiveservices.azure.com/gpt-4o`). Host + the
+/// model — never the full URL, never any auth.
+fn remote_endpoint_label(ep: &darkmux_types::ModelEndpoint, model_id: &str) -> String {
+    let url = ep.base_url();
+    let host = url
+        .split("://")
+        .nth(1)
+        .and_then(|s| s.split('/').next())
+        .unwrap_or("remote");
+    let kind = if url.contains("azure") { "azure" } else { "openai" };
+    format!("{kind}:{host}/{model_id}")
+}
+
+/// Read the endpoint's auth secret from the Keychain and build the header
+/// `(name, value)`. Read via `security find-generic-password`; NEVER logged or
+/// placed on any argv. `None` ⇒ no auth (valid for an unauthenticated proxy).
+fn remote_auth_header(ep: &darkmux_types::ModelEndpoint) -> Result<Option<(String, String)>> {
+    let Some(auth) = &ep.auth else {
+        return Ok(None);
+    };
+    let Some(kind) = auth.auth_type else {
+        return Ok(None);
+    };
+    let keychain = auth.keychain.as_deref().unwrap_or("");
+    if keychain.is_empty() {
+        bail!(
+            "endpoint auth type is set but no Keychain item name is configured \
+             (endpoint.auth.keychain). Run `darkmux doctor` to see the gap."
+        );
+    }
+    let out = Command::new("security")
+        .args(["find-generic-password", "-s", keychain, "-w"])
+        .output()
+        .context("reading endpoint credential from the macOS Keychain")?;
+    if !out.status.success() {
+        bail!(
+            "Keychain item `{keychain}` not found on this machine (this machine is \
+             the keymaster for the endpoint). Add it with:\n  \
+             security add-generic-password -s {keychain} -a <account> -w"
+        );
+    }
+    let secret = String::from_utf8_lossy(&out.stdout)
+        .trim_end_matches('\n')
+        .to_string();
+    let header = match kind {
+        darkmux_types::EndpointAuthType::ApiKey => ("api-key".to_string(), secret),
+        darkmux_types::EndpointAuthType::Bearer => {
+            ("Authorization".to_string(), format!("Bearer {secret}"))
+        }
+    };
+    Ok(Some(header))
+}
+
+/// POST the chat-completions request via `curl`, keeping the auth secret OFF
+/// the process argv (a `ps` leak vector): url + headers + body go into a 0600
+/// curl config file (`-K`), removed immediately after the call.
+/// Process-local counter so concurrent same-process hosted dispatches never
+/// share the secret-bearing curl config filename.
+static REMOTE_CFG_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn remote_chat_completion(
+    url: &str,
+    auth_header: Option<&(String, String)>,
+    body: &serde_json::Value,
+    timeout_seconds: u32,
+) -> Result<serde_json::Value> {
+    use std::io::Write;
+    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    // (#1177) pid + a process-local counter — a unique name per call, so
+    // parallel same-process dispatches (e.g. the review-bench) can't race the
+    // same secret-bearing file.
+    let n = REMOTE_CFG_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let cfg_path =
+        std::env::temp_dir().join(format!("darkmux-remote-{}-{}.curl", std::process::id(), n));
+    let mut cfg = String::new();
+    cfg.push_str(&format!("url = \"{}\"\n", esc(url)));
+    cfg.push_str("request = \"POST\"\n");
+    cfg.push_str("header = \"Content-Type: application/json\"\n");
+    if let Some((h, v)) = auth_header {
+        cfg.push_str(&format!("header = \"{}: {}\"\n", esc(h), esc(v)));
+    }
+    cfg.push_str(&format!("data = \"{}\"\n", esc(&body.to_string())));
+    // (#1177) Create the config 0600 ATOMICALLY (no world-readable window),
+    // write the secret-bearing body, run curl — then ALWAYS remove the file,
+    // even if the create/write/curl fails partway (a partial secret file must
+    // never linger).
+    let run = || -> Result<std::process::Output> {
+        #[cfg(unix)]
+        let mut f = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&cfg_path)
+                .context("creating curl config for hosted dispatch")?
+        };
+        #[cfg(not(unix))]
+        let mut f =
+            std::fs::File::create(&cfg_path).context("creating curl config for hosted dispatch")?;
+        f.write_all(cfg.as_bytes())
+            .context("writing curl config body")?;
+        drop(f);
+        Command::new("curl")
+            .args([
+                "-sS",
+                "-m",
+                &timeout_seconds.to_string(),
+                "-K",
+                &cfg_path.to_string_lossy(),
+            ])
+            .output()
+            .context("running curl for hosted dispatch")
+    };
+    let result = run();
+    let _ = std::fs::remove_file(&cfg_path); // ALWAYS remove the secret-bearing file
+    let out = result?;
+    if !out.status.success() {
+        bail!(
+            "hosted dispatch curl failed (exit {}): {}",
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let resp: serde_json::Value = serde_json::from_slice(&out.stdout).with_context(|| {
+        format!(
+            "parsing hosted endpoint response as JSON (first 200 bytes: {:?})",
+            String::from_utf8_lossy(&out.stdout)
+                .chars()
+                .take(200)
+                .collect::<String>()
+        )
+    })?;
+    // (#1177) curl (no --fail) exits 0 on HTTP 4xx/5xx — the endpoint
+    // returns the error as an `{"error": {...}}` body. Without this check a 401 /
+    // 429 / 400 (auth, rate-limit, prompt-overflow) would parse cleanly and read
+    // as an EMPTY successful review — the #1135 "healthy while broken" trap. Also
+    // catches an HTTP-200-with-error-object proxy. Fail loud.
+    if let Some(err) = resp.get("error") {
+        let msg = err
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("(no message)");
+        bail!("hosted endpoint returned an error: {msg}");
+    }
+    if resp.pointer("/choices/0/message/content").is_none() {
+        bail!(
+            "hosted endpoint response missing choices[0].message.content (unexpected shape) \
+             — first 200 bytes: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+                .chars()
+                .take(200)
+                .collect::<String>()
+        );
+    }
+    Ok(resp)
+}
+
+/// Emit a dispatch flow record for a hosted call. Same builder + tier as the
+/// container path — a dispatched model is a WORKER regardless of where it runs,
+/// so the tier is NOT changed. A remote endpoint may serve a frontier model OR
+/// an OSS service (opencode, a remote vLLM); darkmux never infers a capability
+/// tier from remoteness. The only remote signal is the `endpoint` in the
+/// payload — location + service live on the endpoint axis, never in the tier.
+fn emit_remote_record(
+    role_id: &str,
+    session_id: &str,
+    model: &str,
+    sprint_id: Option<&str>,
+    action: &str,
+    payload: serde_json::Value,
+) {
+    let rec = crate::dispatch::build_dispatch_record_with_payload(
+        darkmux_flow::Level::Info,
+        action,
+        role_id,
+        session_id,
+        Some(model),
+        None, // (#1177) mission_id — resolved from sprint in a follow-up
+        sprint_id,
+        Some(payload),
+    );
+    let _ = darkmux_flow::record(rec);
+}
+
+/// The hosted single-shot dispatch (#1177). Precondition: `pm.endpoint` is remote.
+fn dispatch_remote(
+    opts: &DispatchOpts,
+    _role: &crate::types::Role,
+    system_prompt: &str,
+    pm: &darkmux_types::ProfileModel,
+) -> Result<DispatchResult> {
+    let ep = pm
+        .endpoint
+        .as_ref()
+        .expect("dispatch_remote requires a remote endpoint");
+    let session_id = opts
+        .session_id
+        .clone()
+        .unwrap_or_else(|| crate::dispatch::fresh_session_id(&opts.role_id));
+    let label = remote_endpoint_label(ep, &pm.id);
+    eprintln!(
+        "darkmux crew dispatch: runtime=direct (hosted) — endpoint: {label} — model={}",
+        pm.id
+    );
+
+    // (#1177) Resolve the URL + auth BEFORE emitting `dispatch start` — an auth
+    // failure (missing Keychain item) then bails WITHOUT leaving an orphaned
+    // in-flight session in the viewer.
+    let url = remote_chat_url(ep);
+    let auth = remote_auth_header(ep)?;
+    let sprint = opts.sprint_id.as_deref();
+
+    // (#1177) Cap the prompt in the record (a brief can be KB-long) — capped
+    // text + full `prompt_chars`, matching the container path.
+    emit_remote_record(
+        &opts.role_id,
+        &session_id,
+        &pm.id,
+        sprint,
+        "dispatch start",
+        serde_json::json!({
+            "runtime": "direct",
+            "endpoint": label,
+            "prompt": crate::dispatch::capped_prompt(&opts.message),
+            "prompt_chars": opts.message.chars().count(),
+        }),
+    );
+
+    let req_body = serde_json::json!({
+        "model": pm.id,
+        "messages": [
+            { "role": "system", "content": system_prompt },
+            { "role": "user", "content": opts.message },
+        ],
+        // (#1177) `max_completion_tokens` is the Azure/OpenAI form (the primary
+        // targets); an OpenAI-compat server that only accepts `max_tokens` would
+        // reject it — a per-endpoint knob is a follow-up if that comes up.
+        "max_completion_tokens": 4096,
+    });
+
+    let t0 = SystemTime::now();
+    let resp = remote_chat_completion(&url, auth.as_ref(), &req_body, opts.timeout_seconds);
+    let wall_ms = t0.elapsed().map(|d| d.as_millis() as u64).unwrap_or(0);
+
+    let resp = match resp {
+        Ok(r) => r,
+        Err(e) => {
+            emit_remote_record(
+                &opts.role_id,
+                &session_id,
+                &pm.id,
+                sprint,
+                "dispatch error",
+                serde_json::json!({ "runtime": "direct", "endpoint": label, "wall_ms": wall_ms, "error": e.to_string() }),
+            );
+            return Err(e);
+        }
+    };
+
+    let content = resp
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+    let usage = resp.get("usage").cloned().unwrap_or(serde_json::Value::Null);
+    let ptok = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    let ctok = usage
+        .get("completion_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let ttok = usage
+        .get("total_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(ptok + ctok);
+
+    emit_remote_record(
+        &opts.role_id,
+        &session_id,
+        &pm.id,
+        sprint,
+        "dispatch complete",
+        serde_json::json!({
+            "result_class": "ok",
+            "exit_code": 0,
+            "runtime": "direct",
+            "endpoint": label,
+            "prompt_tokens": ptok,
+            "completion_tokens": ctok,
+            "total_tokens": ttok,
+            "total_turns": 1,
+            "total_tools": 0,
+            "total_compactions": 0,
+            "wall_ms": wall_ms,
+            "stdout_chars": content.len(),
+        }),
+    );
+
+    let stdout = if opts.json {
+        serde_json::to_string(&serde_json::json!({
+            "result": "stop",
+            "final_assistant": content,
+            "metrics": {
+                "model": pm.id, "endpoint": label, "runtime": "direct",
+                "wall_ms": wall_ms, "turns": 1,
+                "prompt_tokens": ptok, "completion_tokens": ctok, "total_tokens": ttok,
+            },
+        }))
+        .unwrap_or_else(|_| content.clone())
+    } else {
+        content
+    };
+
+    Ok(DispatchResult {
+        exit_code: 0,
+        stdout,
+        stderr: String::new(),
+        session_id,
+        watched_state: Vec::new(),
+        out_dir: None,
+    })
+}
+
 pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
+    // (#1177 / #92) A resolved model naming a remote OpenAI-compatible
+    // endpoint forks two ways, decided by whether the ROLE grants any tools:
+    //
+    //   - Tool-less role (e.g. `pr-reviewer`, empty `tool_palette.allow`) →
+    //     the light single-shot `dispatch_remote` path: one chat-completions
+    //     call, no Docker, no container. Structurally can't use tools
+    //     anyway, so the heavier container path would add cost for nothing.
+    //   - Tool-granting role (e.g. `code-reviewer`) → falls through to the
+    //     SAME container path local dispatches use, just with the remote
+    //     endpoint's URL + auth threaded into the container as its "brain"
+    //     instead of local LMStudio (#92 — agentic-remote). `agentic_pm`
+    //     carries the resolved remote model forward past this point.
+    let remote_target = try_resolve_remote_target(&opts)?;
+    let mut agentic_pm: Option<darkmux_types::ProfileModel> = None;
+    if let Some((role, system_prompt, pm)) = remote_target {
+        if role_wants_agentic_remote(&role) {
+            agentic_pm = Some(pm);
+        } else {
+            return dispatch_remote(&opts, &role, &system_prompt, &pm);
+        }
+    }
+
     // (#703) `inject` is true only when the operator named a NON-darkmux image
     // (e.g. `rust:slim`) — then darkmux's static runtime binary is injected
     // into it (bind-mount + entrypoint override) so the coder runs in the
@@ -801,18 +1308,35 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     //    NOT the long-form probe-then-pin path documented in #408 —
     //    that's phase 2+ scope when the recommendation registry
     //    activates per-hardware tuple selection.
-    let model = resolve_dispatch_model_internal(
-        role,
-        opts.profile_name.as_deref(),
-        opts.config_path.as_deref(),
-    )
-    .context(
-        "model selection failed. Ensure `~/.darkmux/profiles.json` has \
-         a profile with at least one model (the default model is \
-         `default_model` or the first model in `models`), or load a model in \
-         LMStudio (darkmux swap <profile>) as the deprecated fallback."
-    )?;
-    eprintln!("darkmux crew dispatch: model={model}");
+    // (#92) An agentic-remote dispatch already has its model resolved (via
+    // `try_resolve_remote_target`'s profile-based lookup, done up front so
+    // the routing decision could be made before any container work) —
+    // skip the local-probe/pin resolution entirely; there's no LMStudio
+    // instance to probe when the brain is remote.
+    let model = if let Some(pm) = &agentic_pm {
+        pm.id.clone()
+    } else {
+        resolve_dispatch_model_internal(
+            role,
+            opts.profile_name.as_deref(),
+            opts.config_path.as_deref(),
+        )
+        .context(
+            "model selection failed. Ensure `~/.darkmux/profiles.json` has \
+             a profile with at least one model (the default model is \
+             `default_model` or the first model in `models`), or load a model in \
+             LMStudio (darkmux swap <profile>) as the deprecated fallback."
+        )?
+    };
+    let remote_brain_label = agentic_pm.as_ref().and_then(|pm| {
+        pm.endpoint
+            .as_ref()
+            .map(|ep| format!(" — brain: {}", remote_endpoint_label(ep, &pm.id)))
+    });
+    eprintln!(
+        "darkmux crew dispatch: model={model}{}",
+        remote_brain_label.as_deref().unwrap_or_default()
+    );
 
     // 3. Resolve session id — same shape as the openclaw path so
     //    callers that compare sessions across runtimes have a stable
@@ -920,6 +1444,25 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // and be visible in `ps`. The container reads it back from the bind mount.
     fs::write(host_out.join(PROMPT_FILE_NAME), &opts.message)
         .with_context(|| format!("writing dispatch prompt file under {}", host_out.display()))?;
+
+    // (#92) Agentic-remote: resolve the auth header from Keychain (host-side,
+    // same `remote_auth_header` the light single-shot path uses). Deliberately
+    // held ONLY in this local variable, never written to any file or env var
+    // — `bash` has no `/workspace`-escape check (unlike `read`/`write`/`edit`;
+    // it's the deliberate general-purpose escape hatch), so a mounted
+    // secret-bearing file is reachable by a model-issued `cat`, and an env var
+    // is reachable even more trivially (`env`, visible to every process, no
+    // permission gate at all). Instead, once the container spawns below, the
+    // secret is piped over its STDIN — a channel the container reads exactly
+    // once at startup, before the agent loop (and any chance of a tool call)
+    // exists, and which leaves no artifact on any filesystem afterward.
+    let mut remote_auth: Option<(String, String)> = None;
+    if let Some(pm) = &agentic_pm {
+        if let Some(ep) = pm.endpoint.as_ref() {
+            remote_auth = remote_auth_header(ep)?;
+        }
+    }
+    let remote_needs_auth = remote_auth.is_some();
 
     // 5. Emit dispatch.start flow record with runtime metadata in payload
     //    (#204). Pairs with dispatch.complete below via session_id, same
@@ -1060,6 +1603,11 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         compaction: compaction.clone(),
         feedback_templates: feedback_json,
         cache_dir: cache_dir.clone(),
+        remote_chat_url: agentic_pm
+            .as_ref()
+            .and_then(|pm| pm.endpoint.as_ref())
+            .map(remote_chat_url),
+        remote_needs_auth,
     };
 
     // (#907) Validate the image ref before it reaches docker as a positional
@@ -1089,8 +1637,31 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     apply_runtime_limit_flags(&mut cmd);
 
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    if remote_needs_auth {
+        cmd.stdin(Stdio::piped());
+    }
 
-    let child = cmd.spawn().context("spawning darkmux-runtime container")?;
+    let mut child = cmd.spawn().context("spawning darkmux-runtime container")?;
+
+    // (#92) Pipe the remote auth secret over stdin IMMEDIATELY after spawn —
+    // before the trajectory tailer starts, before anything else runs. The
+    // container's startup code blocks reading stdin until this write (and
+    // the subsequent drop, which closes the pipe / sends EOF) completes, so
+    // this must happen promptly; it never touches a file or env var, so
+    // there's no FILESYSTEM artifact left anywhere for a `bash`-capable
+    // model to find — the whole file-based exposure the earlier design
+    // (superseded within this same change) had. This does not eliminate
+    // every exposure vector: the secret still lives in the runtime
+    // process's memory for the dispatch's duration (see the residual-risk
+    // note on `auth_header_stdin` in `runtime/src/main.rs`).
+    if let Some((header_name, header_value)) = remote_auth.take() {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("container spawned with -i but stdin handle is missing"))?;
+        write_remote_auth_header_stdin(&mut stdin, &header_name, &header_value)?;
+        drop(stdin); // close the pipe — sends EOF, unblocking the container's read
+    }
 
     // 7. Live trajectory tailer (#231). Background thread polls
     //    `<host_out>/.darkmux-runtime/trajectory.jsonl` every 250ms while
@@ -3052,6 +3623,83 @@ mod tests {
     use std::io::Write;
     use tempfile::TempDir;
 
+    // ─── #1177: hosted-dispatch helpers ─────────────────────────────────
+
+    #[test]
+    fn remote_chat_url_builds_azure_and_openai_forms() {
+        // Azure deployment base + api_version query.
+        let az = darkmux_types::ModelEndpoint {
+            url: Some(
+                "https://x.cognitiveservices.azure.com/openai/deployments/gpt-4o".into(),
+            ),
+            api_version: Some("2025-01-01-preview".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            remote_chat_url(&az),
+            "https://x.cognitiveservices.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2025-01-01-preview"
+        );
+        // OpenAI-style base, no api_version, trailing slash trimmed (not doubled).
+        let oai = darkmux_types::ModelEndpoint {
+            url: Some("https://api.openai.com/v1/".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            remote_chat_url(&oai),
+            "https://api.openai.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn remote_endpoint_label_names_kind_host_and_model() {
+        let az = darkmux_types::ModelEndpoint {
+            url: Some(
+                "https://finherogpt.cognitiveservices.azure.com/openai/deployments/gpt-4o".into(),
+            ),
+            ..Default::default()
+        };
+        assert_eq!(
+            remote_endpoint_label(&az, "gpt-4o"),
+            "azure:finherogpt.cognitiveservices.azure.com/gpt-4o"
+        );
+        // Non-azure host ⇒ openai kind; label carries host + model, never the path or auth.
+        let oai = darkmux_types::ModelEndpoint {
+            url: Some("https://api.openai.com/v1".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            remote_endpoint_label(&oai, "gpt-4.1"),
+            "openai:api.openai.com/gpt-4.1"
+        );
+    }
+
+    #[test]
+    fn remote_routing_predicate_local_vs_remote() {
+        // The fork's routing predicate: a model with no endpoint (or a
+        // url-less endpoint) is LOCAL ⇒ container path; a url'd endpoint is
+        // REMOTE ⇒ dispatch_remote. This is the guard that keeps local
+        // dispatches out of the hosted fork.
+        let local_no_ep = darkmux_types::ProfileModel {
+            id: "qwen".into(),
+            n_ctx: 40960,
+            ..Default::default()
+        };
+        assert!(!local_no_ep
+            .endpoint
+            .as_ref()
+            .is_some_and(|e| e.is_remote()));
+        let remote = darkmux_types::ProfileModel {
+            id: "gpt-4o".into(),
+            n_ctx: 200000,
+            endpoint: Some(darkmux_types::ModelEndpoint {
+                url: Some("https://x.azure.com/openai/deployments/gpt-4o".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(remote.endpoint.as_ref().is_some_and(|e| e.is_remote()));
+    }
+
     // ─── #888: auto-workspace cleanup guard ───────────────────────────
 
     #[test]
@@ -3385,6 +4033,8 @@ mod tests {
                 "error": "An error occurred."
             }),
             cache_dir: PathBuf::from("/home/op/.darkmux/cache"),
+            remote_chat_url: None,
+            remote_needs_auth: false,
         };
 
         let argv = build_docker_run_argv(&config);
@@ -3518,6 +4168,8 @@ mod tests {
             compaction: crate::dispatch::CompactionDispatchArgs::default(),
             feedback_templates: serde_json::Value::Null,
             cache_dir: PathBuf::from("/tmp/cache"),
+            remote_chat_url: None,
+            remote_needs_auth: false,
         };
 
         let argv = build_docker_run_argv(&config);
@@ -3597,6 +4249,8 @@ mod tests {
             compaction: crate::dispatch::CompactionDispatchArgs::default(),
             feedback_templates: serde_json::Value::Null,
             cache_dir: PathBuf::from("/tmp/cache"),
+            remote_chat_url: None,
+            remote_needs_auth: false,
         };
 
         let argv = build_docker_run_argv(&config);
@@ -3639,7 +4293,142 @@ mod tests {
             compaction: crate::dispatch::CompactionDispatchArgs::default(),
             feedback_templates: serde_json::Value::Null,
             cache_dir: PathBuf::from("/tmp/cache"),
+            remote_chat_url: None,
+            remote_needs_auth: false,
         }
+    }
+
+    // ─── #92: agentic-remote argv emission ─────────────────────
+
+    #[test]
+    fn build_docker_run_argv_omits_remote_flags_when_not_remote() {
+        let argv = build_docker_run_argv(&base_argv_config());
+        assert!(
+            !argv
+                .iter()
+                .any(|a| a == "--chat-url" || a == "--auth-header-stdin" || a == "-i"),
+            "a local dispatch must not emit any remote-brain flags: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn build_docker_run_argv_emits_chat_url_without_stdin_flags_when_no_auth() {
+        let mut config = base_argv_config();
+        config.remote_chat_url = Some("https://api.openai.com/v1/chat/completions".to_string());
+        config.remote_needs_auth = false;
+        let argv = build_docker_run_argv(&config);
+        assert!(
+            argv.windows(2).any(|w| w[0] == "--chat-url"
+                && w[1] == "https://api.openai.com/v1/chat/completions"),
+            "expected --chat-url with the exact URL: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a == "--auth-header-stdin" || a == "-i"),
+            "no auth needed ⇒ no stdin-piping flags: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn build_docker_run_argv_emits_stdin_flags_when_auth_needed() {
+        let mut config = base_argv_config();
+        config.remote_chat_url = Some(
+            "https://x.cognitiveservices.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2025-01-01-preview"
+                .to_string(),
+        );
+        config.remote_needs_auth = true;
+        let argv = build_docker_run_argv(&config);
+        assert!(
+            argv.iter().any(|a| a == "-i"),
+            "expected -i (keep stdin open) so the container can receive the auth header: {argv:?}"
+        );
+        assert!(
+            argv.iter().any(|a| a == "--auth-header-stdin"),
+            "expected --auth-header-stdin (no value — never a file path): {argv:?}"
+        );
+        // The secret NEVER appears on argv at all — it's piped over stdin
+        // post-spawn, not passed as a flag value of any kind.
+        assert!(
+            !argv.iter().any(|a| a.contains("api-key") || a.contains("Bearer") || a.contains(".auth-header")),
+            "argv must never carry the auth header name/value or a file path: {argv:?}"
+        );
+    }
+
+    // ─── #92: role_wants_agentic_remote routing ────────────────
+
+    #[test]
+    fn role_wants_agentic_remote_true_for_nonempty_allow() {
+        use crate::types::{EscalationContract, Role, ToolPalette};
+        let role = Role {
+            output_schema: None,
+            id: "code-reviewer".into(),
+            description: "test".into(),
+            skills: vec![],
+            tool_palette: ToolPalette {
+                allow: vec!["read".into(), "exec".into()],
+                deny: vec![],
+            },
+            escalation_contract: EscalationContract::BailWithExplanation,
+            prompt_path: None,
+            bail_after_compactions: None,
+            escalation_posture: None,
+            role_family: None,
+            feedback_templates: None,
+        };
+        assert!(role_wants_agentic_remote(&role));
+    }
+
+    #[test]
+    fn role_wants_agentic_remote_false_for_empty_allow() {
+        use crate::types::{EscalationContract, Role, ToolPalette};
+        let role = Role {
+            output_schema: None,
+            id: "pr-reviewer".into(),
+            description: "test".into(),
+            skills: vec![],
+            tool_palette: ToolPalette::default(), // empty allow — the pr-reviewer shape
+            escalation_contract: EscalationContract::BailWithExplanation,
+            prompt_path: None,
+            bail_after_compactions: None,
+            escalation_posture: None,
+            role_family: None,
+            feedback_templates: None,
+        };
+        assert!(
+            !role_wants_agentic_remote(&role),
+            "a tool-less role must stay on the light single-shot remote path"
+        );
+    }
+
+    // ─── #92: remote auth-header stdin write ───────────────────
+
+    /// (#92) The stdin design's whole point is that NOTHING lands on any
+    /// filesystem — verify by writing to an in-memory pipe (not a temp file)
+    /// and reading the other end back, confirming the exact JSON shape a
+    /// `bash`-capable model would never be able to intercept because it
+    /// never exists as a file.
+    #[test]
+    fn write_remote_auth_header_stdin_sends_expected_json_over_the_pipe() {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+        // `cat` echoes stdin to stdout — a stand-in for the container
+        // reading its own stdin at startup, without needing a real
+        // darkmux-runtime binary in this unit test.
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawning cat");
+        let mut stdin = child.stdin.take().expect("stdin piped");
+        write_remote_auth_header_stdin(&mut stdin, "api-key", "super-secret-do-not-log").unwrap();
+        drop(stdin); // EOF — cat exits once its input closes
+
+        let mut out = String::new();
+        child.stdout.take().unwrap().read_to_string(&mut out).unwrap();
+        child.wait().unwrap();
+
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["header"], "api-key");
+        assert_eq!(v["value"], "super-secret-do-not-log");
     }
 
     #[test]
@@ -3737,6 +4526,8 @@ mod tests {
             compaction: crate::dispatch::CompactionDispatchArgs::default(),
             feedback_templates: serde_json::Value::Null,
             cache_dir: PathBuf::from("/tmp/cache"),
+            remote_chat_url: None,
+            remote_needs_auth: false,
         };
         let argv = build_docker_run_argv(&config);
         let cmd = docker_command_from_argv(&argv);
@@ -3974,6 +4765,7 @@ mod tests {
             description: None,
             default_model: None,
             models: vec![ProfileModel {
+                endpoint: None,
                 extras: Default::default(),
                 id: "primary".into(),
                 n_ctx: 100_000,
@@ -4016,6 +4808,7 @@ mod tests {
             description: None,
             default_model: None,
             models: vec![ProfileModel {
+                endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
                 n_ctx: 100_000,
@@ -4118,6 +4911,7 @@ mod tests {
             description: None,
             default_model: None,
             models: vec![ProfileModel {
+                endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
                 n_ctx: 100_000,
@@ -4154,6 +4948,7 @@ mod tests {
             description: None,
             default_model: None,
             models: vec![ProfileModel {
+                endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
                 n_ctx: 100_000,
@@ -4203,6 +4998,7 @@ mod tests {
             description: None,
             default_model: None,
             models: vec![ProfileModel {
+                endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
                 n_ctx: 101_000,
@@ -4256,6 +5052,7 @@ mod tests {
             description: None,
             default_model: None,
             models: vec![ProfileModel {
+                endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
                 n_ctx: 100_000,
@@ -4298,6 +5095,7 @@ mod tests {
             description: None,
             default_model: None,
             models: vec![ProfileModel {
+                endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
                 n_ctx: 100_000,
@@ -4354,6 +5152,7 @@ mod tests {
             description: None,
             default_model: None,
             models: vec![ProfileModel {
+                endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
                 n_ctx: 100_000,
@@ -4391,6 +5190,7 @@ mod tests {
             description: None,
             default_model: None,
             models: vec![ProfileModel {
+                endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
                 n_ctx: 50_000,

@@ -318,6 +318,7 @@ mod tests {
             extras: Default::default(),
             description: Some(desc.to_string()),
             models: vec![ProfileModel {
+                endpoint: None,
                 extras: Default::default(),
                 id: "m".into(),
                 n_ctx: 1000,
@@ -333,6 +334,7 @@ mod tests {
     #[test]
     fn namespaced_identifier_uses_prefix_when_no_override() {
         let m = ProfileModel {
+            endpoint: None,
             extras: Default::default(),
             id: "qwen3.6-35b-a3b".into(),
             n_ctx: 100_000,
@@ -345,6 +347,7 @@ mod tests {
     #[test]
     fn namespaced_identifier_passes_through_explicit_id() {
         let m = ProfileModel {
+            endpoint: None,
             extras: Default::default(),
             id: "qwen3.6-35b-a3b".into(),
             n_ctx: 100_000,
@@ -443,6 +446,7 @@ mod tests {
             extras: Default::default(),
             description: None,
             models: vec![ProfileModel {
+                endpoint: None,
                 extras: Default::default(),
                 id: "worker-35b".into(),
                 n_ctx: 100_000,

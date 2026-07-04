@@ -53,6 +53,7 @@ mod tests {
 
     fn pm(id: &str, ident: Option<&str>) -> ProfileModel {
         ProfileModel {
+            endpoint: None,
             extras: Default::default(),
             id: id.to_string(),
             n_ctx: 262000,

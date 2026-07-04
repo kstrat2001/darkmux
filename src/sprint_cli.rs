@@ -1004,6 +1004,7 @@ mod tests {
                 description: None,
                 default_model: None,
                 models: vec![ProfileModel {
+                    endpoint: None,
                     extras: Default::default(),
                     id: "primary".into(),
                     n_ctx: 32000,
@@ -1022,6 +1023,7 @@ mod tests {
                 default_model: None,
                 models: vec![
                     ProfileModel {
+                        endpoint: None,
                         extras: Default::default(),
                         id: "primary".into(),
                         n_ctx: 101000,
@@ -1029,6 +1031,7 @@ mod tests {
                         identifier: None,
                     },
                     ProfileModel {
+                        endpoint: None,
                         extras: Default::default(),
                         id: "compactor".into(),
                         n_ctx: 68000,
@@ -1048,6 +1051,7 @@ mod tests {
                 default_model: None,
                 models: vec![
                     ProfileModel {
+                        endpoint: None,
                         extras: Default::default(),
                         id: "primary".into(),
                         n_ctx: 262144,
@@ -1055,6 +1059,7 @@ mod tests {
                         identifier: None,
                     },
                     ProfileModel {
+                        endpoint: None,
                         extras: Default::default(),
                         id: "compactor".into(),
                         n_ctx: 120000,

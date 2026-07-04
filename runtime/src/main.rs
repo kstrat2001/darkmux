@@ -134,6 +134,30 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // LMStudio json_schema response_format before the loop. None ⇒ free-form.
     let mut response_schema: Option<String> = None;
     let mut base_url: Option<String> = None;
+    // (#92) Agentic-remote dispatch: when the "brain" is a remote OpenAI-
+    // compatible endpoint (Azure OpenAI, OpenAI, ...) instead of local
+    // LMStudio, the host passes the FULL chat-completions URL here (Azure
+    // needs a `?api-version=` query string that `base_url` + the client's
+    // unconditional `/chat/completions` suffix can't express). When set,
+    // this overrides `base_url` for request routing.
+    let mut chat_url: Option<String> = None;
+    // (#92) When true, read the remote endpoint's auth header as JSON
+    // (`{"header": "...", "value": "..."}`) from stdin ONCE at startup — the
+    // host pipes it in immediately after spawning this container (with `-i`)
+    // and closes the pipe. Deliberately NOT a mounted file: `bash` has no
+    // `/workspace`-escape check (it's the general-purpose escape hatch), so
+    // a secret-bearing file anywhere the container can see is reachable by
+    // a model-issued `cat` at any point during the run. Stdin is read
+    // exactly once, before the agent loop (and any tool call) exists, and
+    // leaves no FILESYSTEM artifact afterward (host or container). This
+    // closes the file-based exposure entirely, but is not a complete
+    // isolation boundary: the secret still lives in this process's memory
+    // for the dispatch's duration, and a same-uid `bash` process could in
+    // principle attempt `/proc/1/mem` inspection depending on the host's
+    // `kernel.yama.ptrace_scope` — a residual risk `--cap-drop=ALL` doesn't
+    // close (it blocks `ptrace()`, not a same-uid `/proc/<pid>/mem` read).
+    // False when the remote endpoint declares no auth (or no remote brain).
+    let mut auth_header_stdin: bool = false;
     // Streaming is on by default (#205). Operators / tests pass
     // `--no-stream` to fall back to the Phase 2 single-shot path —
     // useful for deterministic benchmarks or when a runtime regression
@@ -272,6 +296,19 @@ fn run_dispatch(args: &[String]) -> ExitCode {
                     eprintln!("--base-url requires a value");
                     return ExitCode::from(2);
                 }
+            }
+            "--chat-url" => {
+                if let Some(v) = args.get(i + 1) {
+                    chat_url = Some(v.clone());
+                    i += 2;
+                } else {
+                    eprintln!("--chat-url requires a value");
+                    return ExitCode::from(2);
+                }
+            }
+            "--auth-header-stdin" => {
+                auth_header_stdin = true;
+                i += 1;
             }
             "--no-stream" => {
                 streaming = false;
@@ -518,10 +555,49 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         Message::user(prompt),
     ];
 
-    let client = match base_url {
+    // (#92 audit finding) Build the compactor's client from `base_url`
+    // BEFORE it's consumed below, and NEVER apply `--chat-url`/
+    // `--auth-header-stdin` to it — the compactor always talks to local
+    // LMStudio, even on a remote-brain dispatch. See the doc comment on
+    // `loop_runner::run`'s `compactor_client` parameter for why routing
+    // the compactor through a remote-configured client is wrong, not just
+    // different (it silently burns the wrong model's budget on Azure, or
+    // 404s and fails the whole dispatch on OpenAI-style endpoints).
+    let compactor_client = match base_url.as_deref() {
         Some(url) => LmStudioClient::with_base_url(url),
         None => LmStudioClient::new(),
     };
+
+    let mut client = match base_url {
+        Some(url) => LmStudioClient::with_base_url(url),
+        None => LmStudioClient::new(),
+    };
+    if let Some(url) = chat_url {
+        client = client.with_chat_url(url);
+    }
+    // (#92) Read the auth header from stdin ONCE at startup — never a CLI
+    // arg (ps-visible), never an env var (visible to every process, no
+    // permission gate), never a file (bash has no `/workspace`-escape check,
+    // so any secret-bearing file the container can see is reachable by a
+    // model-issued `cat` at any point during the run — stdin leaves no such
+    // FILESYSTEM artifact, since nothing is ever written to disk; see the
+    // longer note on `auth_header_stdin`'s declaration for the residual
+    // in-memory exposure this does NOT close). A parse/read failure is
+    // fatal (exit 2): a remote-brain dispatch with a broken auth pipe would
+    // otherwise proceed unauthenticated and fail confusingly on the FIRST
+    // model call instead of loudly at startup.
+    if auth_header_stdin {
+        match read_auth_header_from_stdin() {
+            Ok((h, val)) => {
+                client = client.with_auth_header(h, val);
+            }
+            Err(e) => {
+                eprintln!("--auth-header-stdin: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let client = client;
 
     // Tool order matters — LLMs have positional bias when picking between
     // plausible candidates. Order reflects the workflow we want the model
@@ -614,6 +690,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     });
     let run_result = loop_runner::run(
         &client,
+        &compactor_client,
         &model,
         initial_messages,
         &tools,
@@ -840,6 +917,41 @@ fn build_json_envelope(
     })
 }
 
+/// (#92) Read the auth-header JSON from stdin ONCE and parse it. Reads to
+/// EOF — the host writes exactly one JSON blob and closes the pipe
+/// immediately after spawning this container, so `read_to_string` returns
+/// as soon as that write completes. Nothing is ever written to any
+/// filesystem: unlike a mounted file, there is no FILESYSTEM artifact for a
+/// `bash`-capable model to find at any point during the run — `bash` has no
+/// `/workspace`-escape check (it's the deliberate general-purpose escape
+/// hatch), so any secret-bearing FILE the container can see would be
+/// reachable via a plain `cat`. Stdin has no such window (this doesn't
+/// close every exposure vector — see the residual-risk note on
+/// `auth_header_stdin`'s declaration above). Returns `(header_name,
+/// header_value)` on success.
+fn read_auth_header_from_stdin() -> Result<(String, String), String> {
+    use std::io::Read;
+    let mut contents = String::new();
+    std::io::stdin()
+        .read_to_string(&mut contents)
+        .map_err(|e| e.to_string())?;
+    parse_auth_header_json(&contents)
+}
+
+/// Pure JSON-validation half of [`read_auth_header_from_stdin`], split out
+/// so the parsing/validation logic is unit-testable without touching the
+/// process's real stdin.
+fn parse_auth_header_json(contents: &str) -> Result<(String, String), String> {
+    let v: serde_json::Value =
+        serde_json::from_str(contents).map_err(|e| format!("invalid JSON: {e}"))?;
+    let header = v.get("header").and_then(|h| h.as_str());
+    let value = v.get("value").and_then(|h| h.as_str());
+    match (header, value) {
+        (Some(h), Some(val)) => Ok((h.to_string(), val.to_string())),
+        _ => Err("expected {\"header\": \"...\", \"value\": \"...\"}".to_string()),
+    }
+}
+
 /// Filter the runtime's tool catalog by an allow-list of tool names
 /// (the role's tool_palette.allow minus tool_palette.deny, computed
 /// dispatcher-side and passed via `--allowed-tools`).
@@ -927,6 +1039,27 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert!(matches!(result[0], Tool::Read));
         assert!(matches!(result[1], Tool::Bash));
+    }
+
+    // ─── parse_auth_header_json (#92 stdin auth) ───────────────────
+
+    #[test]
+    fn auth_header_json_happy_path_returns_header_and_value() {
+        let (h, v) = parse_auth_header_json(r#"{"header": "api-key", "value": "super-secret"}"#).unwrap();
+        assert_eq!(h, "api-key");
+        assert_eq!(v, "super-secret");
+    }
+
+    #[test]
+    fn auth_header_json_rejects_malformed_json() {
+        let err = parse_auth_header_json("not json at all").unwrap_err();
+        assert!(err.contains("invalid JSON"), "got: {err}");
+    }
+
+    #[test]
+    fn auth_header_json_rejects_missing_keys() {
+        let err = parse_auth_header_json(r#"{"wrong_key": "value"}"#).unwrap_err();
+        assert!(err.contains("header") && err.contains("value"), "got: {err}");
     }
 
     #[test]

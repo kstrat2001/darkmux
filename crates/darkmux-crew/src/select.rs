@@ -161,6 +161,7 @@ mod tests {
     fn profile_with_primary(model_id: &str) -> Profile {
         Profile {
             models: vec![ProfileModel {
+                endpoint: None,
                 extras: Default::default(),
                 id: model_id.into(),
                 n_ctx: 100_000,
@@ -188,6 +189,7 @@ mod tests {
 
     fn model_with(id: &str, caps: &[(Capability, f32)]) -> ProfileModel {
         ProfileModel {
+            endpoint: None,
             extras: Default::default(),
             id: id.into(),
             n_ctx: 100_000,

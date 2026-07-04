@@ -795,6 +795,7 @@ mod tests {
             None,
             vec![
                 ProfileModel {
+                    endpoint: None,
                     extras: Default::default(),
                     id: "primary-id".into(),
                     n_ctx: 262144,
@@ -802,6 +803,7 @@ mod tests {
                     identifier: None,
                 },
                 ProfileModel {
+                    endpoint: None,
                     extras: Default::default(),
                     id: "compactor-id".into(),
                     n_ctx: 120000,
@@ -838,6 +840,7 @@ mod tests {
             Some(250000),
             None,
             vec![ProfileModel {
+                endpoint: None,
                 extras: Default::default(),
                 id: "any".into(),
                 n_ctx: 1000,
@@ -881,6 +884,7 @@ mod tests {
             None,
             None,
             vec![ProfileModel {
+                endpoint: None,
                 extras: Default::default(),
                 id: "qwen3.6-35b-a3b".into(),
                 n_ctx: 100000,
@@ -919,6 +923,7 @@ mod tests {
             None,
             None,
             vec![ProfileModel {
+                endpoint: None,
                 extras: Default::default(),
                 id: "qwen3-4b-instruct-2507".into(),
                 n_ctx: 120000,
@@ -955,6 +960,7 @@ mod tests {
             None,
             None,
             vec![ProfileModel {
+                endpoint: None,
                 extras: Default::default(),
                 id: "foo".into(),
                 n_ctx: 1000,
@@ -984,6 +990,7 @@ mod tests {
             None,
             None,
             vec![ProfileModel {
+                endpoint: None,
                 extras: Default::default(),
                 id: "foo".into(),
                 n_ctx: 1000,
@@ -1014,6 +1021,7 @@ mod tests {
             None,
             None,
             vec![ProfileModel {
+                endpoint: None,
                 extras: Default::default(),
                 id: "foo".into(),
                 n_ctx: 1000,
@@ -1067,6 +1075,7 @@ mod tests {
             None,
             None,
             vec![ProfileModel {
+                endpoint: None,
                 extras: Default::default(),
                 id: "qwen3.6-35b-a3b".into(),
                 n_ctx: 101000,
@@ -1116,6 +1125,7 @@ mod tests {
             None,
             None,
             vec![ProfileModel {
+                endpoint: None,
                 extras: Default::default(),
                 id: "unknown-model-id".into(),
                 n_ctx: 64000,
@@ -1161,6 +1171,7 @@ mod tests {
             None,
             None,
             vec![ProfileModel {
+                endpoint: None,
                 extras: Default::default(),
                 id: "foo".into(),
                 n_ctx: 50000,
@@ -1219,6 +1230,7 @@ mod tests {
             None,
             None,
             vec![ProfileModel {
+                endpoint: None,
                 extras: Default::default(),
                 id: "foo".into(),
                 n_ctx: 80000,
@@ -1263,6 +1275,7 @@ mod tests {
             None,
             None,
             vec![ProfileModel {
+                endpoint: None,
                 extras: Default::default(),
                 id: "foo".into(),
                 n_ctx: 50000,
@@ -1296,6 +1309,7 @@ mod tests {
             None,
             None,
             vec![ProfileModel {
+                endpoint: None,
                 extras: Default::default(),
                 id: "google/gemini-2.5".into(),
                 n_ctx: 1000,
@@ -1357,6 +1371,7 @@ mod tests {
             }"#,
         );
         let profile = profile_without_runtime(vec![ProfileModel {
+            endpoint: None,
             extras: Default::default(),
             id: "openai/gpt-oss-20b".into(),
             n_ctx: 100000,
@@ -1410,6 +1425,7 @@ mod tests {
             }"#,
         );
         let profile = profile_without_runtime(vec![ProfileModel {
+            endpoint: None,
             extras: Default::default(),
             id: "new-model".into(),
             n_ctx: 100000,
@@ -1452,6 +1468,7 @@ mod tests {
         );
         let profile = profile_without_runtime(vec![
             ProfileModel {
+                endpoint: None,
                 extras: Default::default(),
                 id: "new-primary".into(),
                 n_ctx: 100000,
@@ -1459,6 +1476,7 @@ mod tests {
                 identifier: None,
             },
             ProfileModel {
+                endpoint: None,
                 extras: Default::default(),
                 id: "second-worker".into(),
                 n_ctx: 32000,
@@ -1501,6 +1519,7 @@ mod tests {
         );
         let mut profile = profile_without_runtime(vec![
             ProfileModel {
+                endpoint: None,
                 extras: Default::default(),
                 id: "first".into(),
                 n_ctx: 100000,
@@ -1508,6 +1527,7 @@ mod tests {
                 identifier: None,
             },
             ProfileModel {
+                endpoint: None,
                 extras: Default::default(),
                 id: "the-default".into(),
                 n_ctx: 100000,
@@ -1541,6 +1561,7 @@ mod tests {
         // Minimal config — no `agents` block at all.
         let p = write_config(&tmp, "{}");
         let profile = profile_without_runtime(vec![ProfileModel {
+            endpoint: None,
             extras: Default::default(),
             id: "the-model".into(),
             n_ctx: 100000,
@@ -1568,6 +1589,7 @@ mod tests {
     fn sync_default_model_pins_uses_explicit_identifier_when_profile_opts_out() {
         let mut config = serde_json::json!({});
         let profile = profile_without_runtime(vec![ProfileModel {
+            endpoint: None,
             extras: Default::default(),
             id: "the-model".into(),
             n_ctx: 100000,
@@ -1590,6 +1612,7 @@ mod tests {
     fn sync_default_model_pins_is_idempotent() {
         let mut config = serde_json::json!({});
         let profile = profile_without_runtime(vec![ProfileModel {
+            endpoint: None,
             extras: Default::default(),
             id: "the-model".into(),
             n_ctx: 100000,
@@ -1612,6 +1635,7 @@ mod tests {
             "agents": { "defaults": { "model": { "primary": "stale-bare-id" } } }
         });
         let profile = profile_without_runtime(vec![ProfileModel {
+            endpoint: None,
             extras: Default::default(),
             id: "new-model".into(),
             n_ctx: 100000,
@@ -1641,6 +1665,7 @@ mod tests {
                 "agents": { "defaults": { "model": { "primary": stale_pin } } }
             });
             let profile = profile_without_runtime(vec![ProfileModel {
+                endpoint: None,
                 extras: Default::default(),
                 id: "lmstudio-side-model".into(),
                 n_ctx: 100000,
