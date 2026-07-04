@@ -134,6 +134,7 @@ pub fn run(include_openclaw: bool) -> DoctorReport {
         check_fleet_mode(),
         check_openai_base_url_conflict(),
         check_redis_config(),
+        check_remote_endpoint_credentials(),
         check_env_masks_config(),
         check_binary_split_brain(),
         check_audit_integrity(),
@@ -1125,6 +1126,116 @@ fn check_redis_config() -> Check {
             hint: Some("If your Redis requires auth, store the password: `security add-generic-password -a $USER -s darkmux-redis -w` (URL-safe). Password-less is fine for a local/Tailnet-trusted Redis.".into()),
         },
     }
+}
+
+/// (#85/#91) Surface profile models declaring a remote endpoint
+/// (`ModelEndpoint`, #92/#1177) whose auth credential isn't actually
+/// resolvable. Without this check, a missing or misconfigured Keychain item
+/// only surfaces at runtime — the FIRST dispatch using that profile model
+/// bails loud (see `remote_auth_header` in darkmux-crew), which is correct
+/// but late; a new-user setup mistake sits invisible until they happen to
+/// dispatch against it. Read-only: never touches the secret VALUE, only
+/// whether the named Keychain item exists (mirrors `remote_auth_header`'s
+/// own `security find-generic-password -s <keychain>` invocation exactly,
+/// so this validates the SAME lookup the real dispatch path performs, not
+/// an approximation of it — no `-a $USER`, no `-w`).
+fn check_remote_endpoint_credentials() -> Check {
+    let name = "remote endpoint credentials";
+    let registry = match profiles::load_registry(None) {
+        Ok(r) => r,
+        Err(e) => {
+            return Check {
+                name: name.into(),
+                status: Status::Warn,
+                message: format!(
+                    "can't check remote endpoint credentials (profile registry load failed: {e})"
+                ),
+                hint: None,
+            };
+        }
+    };
+
+    let mut problems: Vec<String> = Vec::new();
+    let mut checked = 0usize;
+
+    for (profile_name, profile) in &registry.registry.profiles {
+        for model in &profile.models {
+            let Some(ep) = model.endpoint.as_ref() else {
+                continue;
+            };
+            let Some(auth) = ep.auth.as_ref() else {
+                continue;
+            };
+            if auth.auth_type.is_none() {
+                continue;
+            }
+            checked += 1;
+            match auth.keychain.as_deref() {
+                None | Some("") => {
+                    problems.push(format!(
+                        "profile `{profile_name}` model `{}`: endpoint.auth.type is set \
+                         but endpoint.auth.keychain is missing",
+                        model.id
+                    ));
+                }
+                Some(keychain) if !keychain_item_present(keychain) => {
+                    problems.push(format!(
+                        "profile `{profile_name}` model `{}`: Keychain item `{keychain}` \
+                         not found on this machine",
+                        model.id
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+    }
+
+    if checked == 0 {
+        return Check {
+            name: name.into(),
+            status: Status::Pass,
+            message: "no profile models declare a remote endpoint with auth".into(),
+            hint: None,
+        };
+    }
+
+    if problems.is_empty() {
+        Check {
+            name: name.into(),
+            status: Status::Pass,
+            message: format!(
+                "{checked} remote-endpoint model(s) checked — all Keychain credentials present"
+            ),
+            hint: None,
+        }
+    } else {
+        Check {
+            name: name.into(),
+            status: Status::Warn,
+            message: problems.join("; "),
+            hint: Some(
+                "Add the missing credential: `security add-generic-password -s <keychain-item-name> -w` \
+                 (paste the API key/secret when prompted, matching the item name in endpoint.auth.keychain). \
+                 Without it, the FIRST dispatch using that profile model bails loud rather than \
+                 failing silently — this check just surfaces it sooner."
+                    .into(),
+            ),
+        }
+    }
+}
+
+/// Read-only Keychain presence check — never reads the secret VALUE (no
+/// `-w`), only whether the named item exists. Deliberately matches
+/// `remote_auth_header`'s exact invocation shape (no `-a $USER`) rather
+/// than the different `-a $USER -s ...` pattern used elsewhere (e.g. the
+/// Redis password check) — this validates what the real dispatch path
+/// will actually find, not a differently-scoped lookup.
+fn keychain_item_present(name: &str) -> bool {
+    Command::new("security")
+        .args(["find-generic-password", "-s", name])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// (#934) Cross-setting coherence: a `DARKMUX_*` env var set in the shell wins
@@ -3250,12 +3361,12 @@ mod tests {
         // [#590] + role-model-pin-drift [#160] + legacy-mission-layout [#148]
         // + beat-33-crew-dir [Beat 33 directory flatten] + role-tool-vocab
         // [#340] + legacy-compaction-extras [#380] + redis-config [#661] +
-        // docker-runtime [#680] + audit-write-drops [#877] + serve-daemon-auth
-        // [#881] + fleet.mode [#933] + env-masks-config [#934] + binary-split-
-        // brain [#934]) + one per active eureka rule. Every check should appear
-        // regardless of environment — even if the underlying probe couldn't
-        // read state.
-        let expected = 35 + darkmux_eureka::all_rules().len();
+        // remote-endpoint-credentials [#85/#91] + docker-runtime [#680] +
+        // audit-write-drops [#877] + serve-daemon-auth [#881] + fleet.mode
+        // [#933] + env-masks-config [#934] + binary-split-brain [#934]) +
+        // one per active eureka rule. Every check should appear regardless
+        // of environment — even if the underlying probe couldn't read state.
+        let expected = 36 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
@@ -3914,6 +4025,115 @@ mod tests {
 
         let check = check_legacy_compaction_extras();
         assert_eq!(check.status, Status::Pass);
+    }
+
+    // ─── #85/#91: check_remote_endpoint_credentials tests ───────
+
+    #[serial_test::serial]
+    #[test]
+    fn check_remote_endpoint_credentials_passes_when_no_endpoint_declared() {
+        let (_guard, config_path) = ConfigPathGuard::at_tempfile("profiles.json");
+        let registry_json = r#"{
+            "profiles": {
+                "local-profile": {
+                    "models": [{"id": "primary-x", "n_ctx": 100000}]
+                }
+            }
+        }"#;
+        std::fs::write(&config_path, registry_json).unwrap();
+
+        let check = check_remote_endpoint_credentials();
+        assert_eq!(check.status, Status::Pass);
+        assert!(check.message.contains("no profile models declare a remote endpoint"));
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_remote_endpoint_credentials_passes_when_endpoint_has_no_auth() {
+        // A remote endpoint with no auth block at all (e.g. an
+        // unauthenticated proxy) is valid and must not be flagged —
+        // `auth_type.is_none()` skips it entirely (not even counted).
+        let (_guard, config_path) = ConfigPathGuard::at_tempfile("profiles.json");
+        let registry_json = r#"{
+            "profiles": {
+                "proxy-profile": {
+                    "models": [{
+                        "id": "proxy-model",
+                        "n_ctx": 32768,
+                        "endpoint": { "url": "http://localhost:8080/v1" }
+                    }]
+                }
+            }
+        }"#;
+        std::fs::write(&config_path, registry_json).unwrap();
+
+        let check = check_remote_endpoint_credentials();
+        assert_eq!(check.status, Status::Pass);
+        assert!(check.message.contains("no profile models declare a remote endpoint"));
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_remote_endpoint_credentials_warns_when_keychain_field_missing() {
+        let (_guard, config_path) = ConfigPathGuard::at_tempfile("profiles.json");
+        let registry_json = r#"{
+            "profiles": {
+                "azure-profile": {
+                    "models": [{
+                        "id": "gpt-4o",
+                        "n_ctx": 128000,
+                        "endpoint": {
+                            "url": "https://x.cognitiveservices.azure.com/openai/deployments/gpt-4o",
+                            "auth": { "type": "api-key" }
+                        }
+                    }]
+                }
+            }
+        }"#;
+        std::fs::write(&config_path, registry_json).unwrap();
+
+        let check = check_remote_endpoint_credentials();
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.message.contains("azure-profile"));
+        assert!(check.message.contains("gpt-4o"));
+        assert!(check.message.contains("endpoint.auth.keychain is missing"));
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_remote_endpoint_credentials_warns_when_keychain_item_absent() {
+        let (_guard, config_path) = ConfigPathGuard::at_tempfile("profiles.json");
+        let registry_json = r#"{
+            "profiles": {
+                "azure-profile": {
+                    "models": [{
+                        "id": "gpt-4o",
+                        "n_ctx": 128000,
+                        "endpoint": {
+                            "url": "https://x.cognitiveservices.azure.com/openai/deployments/gpt-4o",
+                            "auth": {
+                                "type": "api-key",
+                                "keychain": "darkmux-doctor-test-definitely-nonexistent-item-xyz123"
+                            }
+                        }
+                    }]
+                }
+            }
+        }"#;
+        std::fs::write(&config_path, registry_json).unwrap();
+
+        let check = check_remote_endpoint_credentials();
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.message.contains("not found on this machine"));
+        let hint = check.hint.as_deref().unwrap_or("");
+        assert!(hint.contains("security add-generic-password"));
+    }
+
+    #[test]
+    fn keychain_item_present_returns_false_for_nonexistent_item() {
+        assert!(!keychain_item_present(
+            "darkmux-doctor-test-definitely-nonexistent-item-xyz123"
+        ));
     }
 
     // ─── #332: doctor OC-config probe normalization ─────────────────
