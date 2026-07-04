@@ -1328,14 +1328,24 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
              LMStudio (darkmux swap <profile>) as the deprecated fallback."
         )?
     };
-    let remote_brain_label = agentic_pm.as_ref().and_then(|pm| {
-        pm.endpoint
-            .as_ref()
-            .map(|ep| format!(" — brain: {}", remote_endpoint_label(ep, &pm.id)))
-    });
+    // (#92 follow-up) Raw label (no eprintln prefix) — this is also the value
+    // that must land in `dispatch_start_payload`'s `endpoint` field below, the
+    // SAME field the light single-shot `dispatch_remote` path already sets
+    // (see its `label` var). Missing this was a real gap: the viewer's route
+    // display (`sp.endpoint` in viewer.html) falls back to rendering
+    // "LMStudio · local · this machine" whenever `endpoint` is absent — so an
+    // agentic-remote dispatch that correctly ran on Azure would still show up
+    // in the viewer as a local dispatch, an operator-sovereignty violation
+    // (the operator has no way to tell where the model actually ran).
+    let remote_endpoint_raw_label = agentic_pm
+        .as_ref()
+        .and_then(|pm| pm.endpoint.as_ref().map(|ep| remote_endpoint_label(ep, &pm.id)));
     eprintln!(
         "darkmux crew dispatch: model={model}{}",
-        remote_brain_label.as_deref().unwrap_or_default()
+        remote_endpoint_raw_label
+            .as_deref()
+            .map(|l| format!(" — brain: {l}"))
+            .unwrap_or_default()
     );
 
     // 3. Resolve session id — same shape as the openclaw path so
@@ -1467,7 +1477,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // 5. Emit dispatch.start flow record with runtime metadata in payload
     //    (#204). Pairs with dispatch.complete below via session_id, same
     //    as the openclaw path does.
-    let dispatch_start_payload = serde_json::json!({
+    let mut dispatch_start_payload = serde_json::json!({
         "runtime": "internal",
         // (#1126) The resolved runtime image (operator `--image` or the default
         // darkmux image, line ~711) — the environment the coder ran in. The
@@ -1482,6 +1492,13 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         "system_chars": system_prompt.chars().count(),
         "workspace": workspace.display().to_string(),
     });
+    // (#92 follow-up) Mirror `dispatch_remote`'s `"endpoint": label` field —
+    // its absence, not just its presence, is meaningful to the viewer (no
+    // field ⇒ rendered as local LMStudio), so this must be set whenever the
+    // container's brain is actually remote.
+    if let Some(label) = &remote_endpoint_raw_label {
+        dispatch_start_payload["endpoint"] = serde_json::json!(label);
+    }
     let _ = darkmux_flow::record(crate::dispatch::build_dispatch_record_with_payload(
         darkmux_flow::Level::Info,
         "dispatch start",
@@ -1915,7 +1932,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     let tokens = read_token_totals(&host_out);
 
     // 8. Emit dispatch.complete flow record with summary metadata.
-    let dispatch_complete_payload = serde_json::json!({
+    let mut dispatch_complete_payload = serde_json::json!({
         "runtime": "internal",
         "wall_ms": wall_ms,
         "stdout_chars": stdout.chars().count(),
@@ -1941,6 +1958,13 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         "completion_tokens": tokens.completion,
         "total_tokens": tokens.total(),
     });
+    // (#92 follow-up) Same field, same reason as `dispatch_start_payload` —
+    // parity with `dispatch_remote`'s completion record, and needed by any
+    // future by-endpoint consumer (#90) that reads the terminal record
+    // rather than the start record.
+    if let Some(label) = &remote_endpoint_raw_label {
+        dispatch_complete_payload["endpoint"] = serde_json::json!(label);
+    }
     let (action, level) = if exit_code == 0 {
         ("dispatch complete", darkmux_flow::Level::Info)
     } else {
