@@ -183,6 +183,15 @@ enum Cmd {
         /// checks collapsed to a count. Use `-v` to see the full list.
         #[arg(long, short = 'v')]
         verbose: bool,
+        /// (#1177) Live-probe each profile model's remote endpoint with ONE
+        /// minimal chat completion through the same URL/auth path a real
+        /// dispatch uses — verifies the credential actually WORKS (the
+        /// default doctor only checks the Keychain item exists). Opt-in
+        /// because each probe is a real API call: a paid endpoint bills a
+        /// few tokens per probe (the probe's own token cost is shown in
+        /// its result line).
+        #[arg(long)]
+        probe: bool,
     },
     /// Scan the LMStudio model catalog for downloaded models that aren't yet
     /// covered by any profile. For each uncovered model, suggests a task class
@@ -1422,7 +1431,9 @@ fn run(cmd: Cmd) -> Result<i32> {
         Cmd::Lab { sub } => cmd_lab(sub),
         Cmd::Skills { sub } => cmd_skills(sub),
         Cmd::Notebook { sub } => cmd_notebook(sub),
-        Cmd::Doctor { fix, include_openclaw, verbose } => cmd_doctor(fix, include_openclaw, verbose),
+        Cmd::Doctor { fix, include_openclaw, verbose, probe } => {
+            cmd_doctor(fix, include_openclaw, verbose, probe)
+        }
         Cmd::Scan { profiles } => cmd_scan(profiles.as_deref()),
         Cmd::Profile { sub } => cmd_profile(sub),
         Cmd::Model { sub } => cmd_model(sub),
@@ -1762,8 +1773,19 @@ fn cmd_notebook(sub: NotebookCmd) -> Result<i32> {
     }
 }
 
-fn cmd_doctor(fix: bool, include_openclaw: bool, verbose: bool) -> Result<i32> {
-    let report = doctor::run(include_openclaw);
+fn cmd_doctor(fix: bool, include_openclaw: bool, verbose: bool, probe: bool) -> Result<i32> {
+    let mut report = doctor::run(include_openclaw);
+    // (#1177) Opt-in live endpoint probes append to the same report so they
+    // share the verdict/exit-code path — a failed probe exits 1 like any
+    // failed check. Probed ONCE per invocation: the --fix re-evaluation
+    // below reuses these results rather than re-billing a paid endpoint
+    // (no auto-fix can change a credential anyway).
+    let probe_checks = if probe {
+        doctor::probe_remote_endpoints()
+    } else {
+        Vec::new()
+    };
+    report.checks.extend(probe_checks.iter().cloned());
     doctor::print_report(&report, verbose)?;
 
     // --fix path: attempt known-safe auto-fixes for failing/warning rules,
@@ -1785,7 +1807,11 @@ fn cmd_doctor(fix: bool, include_openclaw: bool, verbose: bool) -> Result<i32> {
             println!();
             println!("Re-running doctor…");
             println!();
-            let report2 = doctor::run(include_openclaw);
+            let mut report2 = doctor::run(include_openclaw);
+            // Carry the ORIGINAL probe results into the re-evaluated report —
+            // not re-probed (cost), but a probe failure must still fail the
+            // final exit code.
+            report2.checks.extend(probe_checks);
             doctor::print_report(&report2, verbose)?;
             report2
         }

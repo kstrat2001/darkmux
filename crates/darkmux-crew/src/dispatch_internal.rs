@@ -894,6 +894,66 @@ fn remote_auth_header(ep: &darkmux_types::ModelEndpoint) -> Result<Option<(Strin
     Ok(Some(header))
 }
 
+/// (#1177 `doctor --probe`) Outcome of a live endpoint probe — everything the
+/// operator needs to trust the endpoint, nothing secret.
+#[derive(Debug)]
+pub struct ProbeReport {
+    /// The endpoint label (`azure:host/model-id` form — host + model, no auth).
+    pub label: String,
+    /// Round-trip wall time.
+    pub wall_ms: u64,
+    /// The model identifier the ENDPOINT says served the request
+    /// (`response.model`). May differ from the profile's model id — Azure
+    /// routes by deployment name, so this names what actually answered
+    /// (the #1135 "healthy while broken" class of check).
+    pub served_model: Option<String>,
+    /// What the probe itself cost (`usage.total_tokens`) — tokens only,
+    /// never a currency figure; surfaced so the opt-in cost is visible.
+    pub total_tokens: Option<u64>,
+}
+
+/// (#1177 `doctor --probe`) Live credential/routing probe: ONE minimal chat
+/// completion through the EXACT same URL/auth/POST path a real hosted
+/// dispatch uses (`remote_chat_url` + `remote_auth_header` +
+/// `remote_chat_completion`). Verifies the whole chain — DNS, TLS,
+/// credential validity, deployment routing, api-version — not just Keychain
+/// presence (which `darkmux doctor` checks offline for free). Costs a few
+/// real tokens on a paid endpoint, which is why it only runs under the
+/// opt-in `doctor --probe`, never by default.
+pub fn probe_remote_endpoint(
+    ep: &darkmux_types::ModelEndpoint,
+    model_id: &str,
+    timeout_seconds: u32,
+) -> Result<ProbeReport> {
+    let label = remote_endpoint_label(ep, model_id);
+    let url = remote_chat_url(ep);
+    let auth = remote_auth_header(ep)?;
+    let req_body = serde_json::json!({
+        "model": model_id,
+        "messages": [
+            { "role": "user",
+              "content": "Connectivity probe from `darkmux doctor --probe`. Reply with the single word: ok" },
+        ],
+        // Mirrors dispatch_remote's parameter form (#1177). Small cap — the
+        // probe verifies the ROUND-TRIP, not the content: a reasoning model
+        // may spend the whole budget thinking and return empty content, and
+        // the response shape still proves credential + routing.
+        "max_completion_tokens": 64,
+    });
+    let t0 = SystemTime::now();
+    let resp = remote_chat_completion(&url, auth.as_ref(), &req_body, timeout_seconds)?;
+    let wall_ms = t0.elapsed().map(|d| d.as_millis() as u64).unwrap_or(0);
+    Ok(ProbeReport {
+        label,
+        wall_ms,
+        served_model: resp
+            .get("model")
+            .and_then(|m| m.as_str())
+            .map(str::to_string),
+        total_tokens: resp.pointer("/usage/total_tokens").and_then(|v| v.as_u64()),
+    })
+}
+
 /// POST the chat-completions request via `curl`, keeping the auth secret OFF
 /// the process argv (a `ps` leak vector): url + headers + body go into a 0600
 /// curl config file (`-K`), removed immediately after the call.
@@ -3722,6 +3782,106 @@ mod tests {
             ..Default::default()
         };
         assert!(remote.endpoint.as_ref().is_some_and(|e| e.is_remote()));
+    }
+
+    // ─── #1177: doctor --probe (probe_remote_endpoint) ─────────────────
+
+    /// One-shot HTTP mock on a real loopback socket: accepts a single
+    /// connection, reads the full request (head + Content-Length body),
+    /// responds with `body_json`, and hands the captured request back
+    /// through the returned channel. No HTTP-mock dep — the probe path
+    /// shells out to real `curl`, so a real socket is the honest test.
+    fn one_shot_http_mock(
+        body_json: &'static str,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write as IoWrite};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            // Read head, then exactly Content-Length body bytes.
+            let (head_end, content_len) = loop {
+                let n = stream.read(&mut chunk).unwrap();
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&buf[..pos]).to_string();
+                    let cl = head
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                        })
+                        .unwrap_or(0);
+                    break (pos + 4, cl);
+                }
+            };
+            while buf.len() < head_end + content_len {
+                let n = stream.read(&mut chunk).unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body_json.len(),
+                body_json
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            let _ = tx.send(String::from_utf8_lossy(&buf).to_string());
+        });
+        (format!("http://127.0.0.1:{port}/v1"), rx)
+    }
+
+    #[test]
+    fn probe_remote_endpoint_round_trips_and_reports_served_model_and_cost() {
+        let (base_url, rx) = one_shot_http_mock(
+            r#"{"model":"mock-model-v1","usage":{"total_tokens":7},"choices":[{"message":{"content":"ok"}}]}"#,
+        );
+        let ep = darkmux_types::ModelEndpoint {
+            url: Some(base_url),
+            ..Default::default() // no auth ⇒ Keychain untouched (CI-safe)
+        };
+        let report = probe_remote_endpoint(&ep, "probe-model-x", 15).unwrap();
+        assert_eq!(report.served_model.as_deref(), Some("mock-model-v1"));
+        assert_eq!(report.total_tokens, Some(7));
+        // Host segment keeps the port (host:port form); model id closes the label.
+        assert!(
+            report.label.contains("127.0.0.1") && report.label.ends_with("/probe-model-x"),
+            "label carries host + model: {}",
+            report.label
+        );
+        // The probe mirrors dispatch_remote's request form — same parameter
+        // name, the caller's model id, and the POST landing on the same
+        // chat-completions path a real dispatch uses.
+        let request = rx.recv().unwrap();
+        assert!(request.contains("POST /v1/chat/completions"), "{request}");
+        assert!(request.contains("\"max_completion_tokens\":64"), "{request}");
+        assert!(request.contains("\"model\":\"probe-model-x\""), "{request}");
+    }
+
+    #[test]
+    fn probe_remote_endpoint_surfaces_the_endpoint_error_verbatim() {
+        // An HTTP-200-with-error-object body (curl without --fail also maps
+        // real 4xx bodies through this same path) — the endpoint's own
+        // message is the operator's diagnosis, so it must survive verbatim.
+        let (base_url, _rx) = one_shot_http_mock(
+            r#"{"error":{"message":"Access denied due to invalid subscription key"}}"#,
+        );
+        let ep = darkmux_types::ModelEndpoint {
+            url: Some(base_url),
+            ..Default::default()
+        };
+        let err = probe_remote_endpoint(&ep, "probe-model-x", 15).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Access denied due to invalid subscription key"),
+            "endpoint error must surface verbatim: {err:#}"
+        );
     }
 
     // ─── #888: auto-workspace cleanup guard ───────────────────────────
