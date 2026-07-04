@@ -319,9 +319,14 @@
      width cap), and the stat blocks justify right so the breakdown fills the
      space rather than leaving a black gutter (#1095). */
   .savings{margin:0 0 18px;padding:16px 22px;border:1px solid var(--line);border-radius:10px;background:linear-gradient(180deg,rgba(74,222,128,.06),rgba(74,222,128,.01))}
+  /* (#1186) "by your fleet" eyebrow frames the local + cloud numbers as one
+     hybrid workforce; the cloud lead takes the brand accent (legitimate tier,
+     never a warning color). */
+  .saveyebrow{font:600 10px/1 'JetBrains Mono',monospace;color:var(--muted);text-transform:uppercase;letter-spacing:.18em;margin-bottom:12px}
   .savrow{display:flex;align-items:center;gap:14px 40px;flex-wrap:wrap}
   .savlead{flex:0 0 auto}
   .savnum{font:700 48px/1 'JetBrains Mono',monospace;color:var(--good);letter-spacing:.01em}
+  .savlead.cloud .savnum{color:var(--amber)}
   .savlbl{font:600 12px/1 'JetBrains Mono',monospace;color:var(--text);margin-top:7px;text-transform:uppercase;letter-spacing:.12em}
   .savclasses{display:flex;gap:10px 30px;flex-wrap:wrap;align-items:center;justify-content:flex-end;flex:1 1 auto}
   .savc .scv{font:600 23px/1.1 'JetBrains Mono',monospace;color:var(--text)}
@@ -1005,7 +1010,15 @@ function liveSessionSet(){
 // (ts<=state.t) so the odometer accumulates as playback scrubs; in live follow
 // state.t=tMax → the whole window. TOKENS ONLY — never a currency figure (the
 // operator multiplies by their own per-token rate; darkmux supplies no rate
-// and makes no $ claim).
+// and makes no $ claim — on EITHER tier; cloud usage is a token count too).
+// (#1186) Local/cloud split — agentic-remote dispatch (#1187, v1.15.0) means a
+// session's brain may be a remote PAID endpoint; those tokens are NOT "off the
+// meter" and must not inflate that number. `telemetry.tokens` records carry no
+// endpoint field (FLOW_SCHEMA 1.12–1.15), so each session's tier is resolved
+// by joining on session_id to its dispatch.start record's payload.endpoint —
+// the same lookup the run-detail view already does per session, applied
+// window-wide. endpoint present → cloud; absent (every local dispatch, and
+// every pre-1.15 record) → local. local + cloud = total, always.
 // (#803) Token-CLASS decomposition — the educational layer. An agent loop
 // re-reads its whole context every turn and generates a little, so the raw
 // total hides the economics. Per session (turn_seq-ordered per-turn records,
@@ -1016,11 +1029,28 @@ function liveSessionSet(){
 // era records (pre-#795, no turn_seq) can't decompose → `unclassified`,
 // shown only when nonzero and gone once old records age out of the window.
 function tokensOffMeter(){
-  let total=0,prompt=0,completion=0;const sess=new Map();
+  // (#1186) session_id → endpoint, from dispatch.start records under the same
+  // playhead gate as the token scan (so playback scrubbing splits consistently).
+  // The single-shot hosted path (runtime=direct, #1177) emits NO telemetry.tokens
+  // family — its only token counts ride the dispatch.complete payload (which also
+  // carries endpoint). Collect those completes so tool-less remote dispatches
+  // still show in "via cloud" (fallback below); endpoint-bearing records are
+  // intrinsically remote, so this map never captures local work.
+  const epBySid=new Map(),dcTok=new Map();
+  for(const r of DATA){
+    if(T(r.ts)>state.t||!r.session_id||!r.payload||!r.payload.endpoint)continue;
+    if(r.action==="dispatch.start")epBySid.set(r.session_id,String(r.payload.endpoint));
+    if(r.action==="dispatch.complete"&&(r.payload.total_tokens||r.payload.prompt_tokens||r.payload.completion_tokens)){
+      dcTok.set(r.session_id,r.payload);
+      epBySid.set(r.session_id,String(r.payload.endpoint));
+    }
+  }
+  let total=0,prompt=0,completion=0,cloud=0;const sess=new Map();
   for(const r of DATA){
     if(r.category==="telemetry"&&r.source==="tokens"&&T(r.ts)<=state.t){
       const p=r.payload||{};
       total+=p.total_tokens||0; prompt+=p.prompt_tokens||0; completion+=p.completion_tokens||0;
+      if(r.session_id&&epBySid.has(r.session_id))cloud+=p.total_tokens||0;
       // Composite fallback key: two sessionless records sharing a ts must
       // not merge into one pseudo-session (it would corrupt the turn_seq
       // decomposition below). session_id is the norm; this is defensive.
@@ -1029,8 +1059,12 @@ function tokensOffMeter(){
       sess.get(k).push(p);
     }
   }
-  let fresh=0,reread=0,uncls=0;
-  for(const recs of sess.values()){
+  // The class decomposition (fresh/re-read/generated) stays COMBINED across
+  // tiers — the chip row describes the fleet's total shape (#1091 density:
+  // one breakdown, not one per tier). Only the headline split is per-tier.
+  let fresh=0,reread=0,uncls=0,cloudRuns=0;
+  for(const [k,recs] of sess){
+    if(epBySid.has(k))cloudRuns++;
     const sp=recs.reduce((a,p)=>a+(p.prompt_tokens||0),0);
     if(recs.every(p=>p.turn_seq!=null)){
       const turns=recs.slice().sort((a,b)=>a.turn_seq-b.turn_seq);
@@ -1039,7 +1073,20 @@ function tokensOffMeter(){
       reread+=rr; fresh+=sp-rr;
     }else uncls+=sp;
   }
-  return {total,prompt,completion,fresh,reread,uncls,runs:sess.size};
+  // (#1186) Single-shot fallback — endpoint sessions with no telemetry family
+  // count their completion-record totals as cloud. Sessions WITH telemetry are
+  // already summed; the sess guard preserves the telemetry-exclusive rule that
+  // prevents double-counting. One turn means the whole prompt is first-read,
+  // so fresh += prompt is exact here, not an approximation.
+  let directRuns=0;
+  for(const [sid,p] of dcTok){
+    if(sess.has(sid))continue;
+    const tt=p.total_tokens||((p.prompt_tokens||0)+(p.completion_tokens||0));
+    total+=tt; cloud+=tt; prompt+=p.prompt_tokens||0; completion+=p.completion_tokens||0;
+    fresh+=p.prompt_tokens||0;
+    directRuns++; cloudRuns++;
+  }
+  return {total,local:total-cloud,cloud,prompt,completion,fresh,reread,uncls,runs:sess.size+directRuns,cloudRuns};
 }
 // Thousands-separated integer (locale-free, deterministic for tests).
 const fmtN=n=>Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g,',');
@@ -1075,7 +1122,15 @@ function hybridNote(t){
   const mr=DATA.filter(r=>r.action&&r.action.indexOf("mission.run")===0&&r.mission_id&&T(r.ts)<=state.t)
                .sort((a,b)=>T(a.ts)-T(b.ts)).pop();
   if(mr)return `<div class="hybnote">${pre}${esc(mr.mission_id)} ran through the local loop — the fleet lifted, the frontier judged. that's hybrid. keep going.${hist}</div>`;
-  if(t.runs)return `<div class="hybnote">${pre}${t.runs} dispatch${t.runs===1?'':'es'} off the meter — the hybrid loop is humming. keep it up.${hist}</div>`;
+  // (#1186) Tier-aware fallback — local work is named local, cloud work is
+  // named cloud, same upbeat voice ("local"/"cloud" over metering jargon,
+  // matching the hero labels).
+  if(t.runs){
+    const lr=t.runs-t.cloudRuns, d=n=>`dispatch${n===1?'':'es'}`;
+    if(!t.cloudRuns)return `<div class="hybnote">${pre}${t.runs} local ${d(t.runs)} — the hybrid loop is humming. keep it up.${hist}</div>`;
+    if(!lr)return `<div class="hybnote">${pre}${t.runs} ${d(t.runs)} via cloud — the right brain for the job. keep it up.${hist}</div>`;
+    return `<div class="hybnote">${pre}${lr} ${d(lr)} local + ${t.cloudRuns} via cloud — the hybrid loop is humming. keep it up.${hist}</div>`;
+  }
   return `<div class="hybnote">${pre}going hybrid takes nerve. the fleet is ready when you are.${hist}</div>`;
 }
 // (#807) Notes-history modal — every orchestrator note in the current window
@@ -1135,11 +1190,23 @@ function savingsHero(){
   // card). The operator prices each class at their own provider's rates.
   const win=document.body.classList.contains('live-mode')?` · last ${Math.round(LIVE_WINDOW_MS/3600000)}h`:'';
   const sc=(v,l,cls)=>`<div class="savc${cls?' '+cls:''}"><div class="scv">${v}</div><div class="scl">${l}</div></div>`;
+  // (#1186) Two co-equal numbers under one fleet frame: local (green) +
+  // cloud (brand cyan — a legitimate tier, not a warning). Labels are the
+  // parallel pair "local tokens" / "cloud tokens" — self-explanatory with no
+  // metering concept to already know (operator call on #1186). Cloud renders
+  // even at zero (same always-render rationale as the hero itself, and
+  // passive discovery that the capability exists). The window suffix lives
+  // on the eyebrow once, not repeated per label.
   return `<div class="savings">
+    <div class="saveyebrow">by your fleet${win}</div>
     <div class="savrow">
       <div class="savlead">
-        <div class="savnum">${fmtN(t.total)}</div>
-        <div class="savlbl">tokens off the meter${win}</div>
+        <div class="savnum">${fmtN(t.local)}</div>
+        <div class="savlbl">local tokens</div>
+      </div>
+      <div class="savlead cloud">
+        <div class="savnum">${fmtN(t.cloud)}</div>
+        <div class="savlbl">cloud tokens</div>
       </div>
       <div class="savclasses">
         ${sc(fmtC(t.completion),'generated','gen')}
