@@ -1238,6 +1238,100 @@ fn keychain_item_present(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// (#1177) Live endpoint probes — NOT part of [`run`]'s offline check set.
+/// Opt-in via `darkmux doctor --probe` because each probe is a real API
+/// call: a paid endpoint bills a few tokens per probe. The offline
+/// `remote endpoint credentials` check proves the Keychain item EXISTS;
+/// this proves the whole chain WORKS — DNS, TLS, credential validity,
+/// deployment routing, api-version — by driving one minimal chat
+/// completion through the exact URL/auth/POST path a real hosted
+/// dispatch uses. One probe per distinct (url, model) pair: profiles
+/// that share an endpoint declaration are probed once, not billed once
+/// per profile.
+pub fn probe_remote_endpoints() -> Vec<Check> {
+    const PROBE_TIMEOUT_SECONDS: u32 = 30;
+    let registry = match profiles::load_registry(None) {
+        Ok(r) => r,
+        Err(e) => {
+            return vec![Check {
+                name: "probe: remote endpoints".into(),
+                status: Status::Warn,
+                message: format!(
+                    "can't probe remote endpoints (profile registry load failed: {e})"
+                ),
+                hint: None,
+            }];
+        }
+    };
+
+    let mut checks = Vec::new();
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+
+    for (profile_name, profile) in &registry.registry.profiles {
+        for model in &profile.models {
+            let Some(ep) = model.endpoint.as_ref() else {
+                continue;
+            };
+            if !ep.is_remote() {
+                continue;
+            }
+            let key = (ep.url.clone().unwrap_or_default(), model.id.clone());
+            if !seen.insert(key) {
+                continue; // same endpoint+model already probed this run
+            }
+            let name = format!("probe: {profile_name}/{}", model.id);
+            match darkmux_crew::dispatch_internal::probe_remote_endpoint(
+                ep,
+                &model.id,
+                PROBE_TIMEOUT_SECONDS,
+            ) {
+                Ok(r) => {
+                    let served = r
+                        .served_model
+                        .map(|m| format!(" · served by `{m}`"))
+                        .unwrap_or_default();
+                    let cost = r
+                        .total_tokens
+                        .map(|t| format!(" · probe cost {t} tokens"))
+                        .unwrap_or_default();
+                    checks.push(Check {
+                        name,
+                        status: Status::Pass,
+                        message: format!(
+                            "{} — round-trip ok in {}ms{served}{cost}",
+                            r.label, r.wall_ms
+                        ),
+                        hint: None,
+                    });
+                }
+                Err(e) => checks.push(Check {
+                    name,
+                    status: Status::Fail,
+                    message: format!("probe failed: {e:#}"),
+                    hint: Some(
+                        "The endpoint's own error above is the diagnosis: an auth message means \
+                         the Keychain credential is wrong or rotated (re-add with \
+                         `security add-generic-password -s <item> -w`); a not-found means the \
+                         URL / deployment / api-version is off; a timeout means network. Fix \
+                         and re-run `darkmux doctor --probe`."
+                            .into(),
+                    ),
+                }),
+            }
+        }
+    }
+
+    if checks.is_empty() {
+        checks.push(Check {
+            name: "probe: remote endpoints".into(),
+            status: Status::Pass,
+            message: "no profile models declare a remote endpoint — nothing to probe".into(),
+            hint: None,
+        });
+    }
+    checks
+}
+
 /// (#934) Cross-setting coherence: a `DARKMUX_*` env var set in the shell wins
 /// LIVE over the matching `config.json` field, so a stale export can silently
 /// shadow what the operator configured. We flag ONLY the case with a clean
@@ -4134,6 +4228,91 @@ mod tests {
         assert!(!keychain_item_present(
             "darkmux-doctor-test-definitely-nonexistent-item-xyz123"
         ));
+    }
+
+    // ─── #1177: doctor --probe (probe_remote_endpoints) ─────────────
+
+    #[serial_test::serial]
+    #[test]
+    fn probe_remote_endpoints_reports_nothing_to_probe() {
+        let (_guard, config_path) = ConfigPathGuard::at_tempfile("profiles.json");
+        let registry_json = r#"{
+            "profiles": {
+                "local-profile": {
+                    "models": [{"id": "primary-x", "n_ctx": 100000}]
+                }
+            }
+        }"#;
+        std::fs::write(&config_path, registry_json).unwrap();
+
+        let checks = probe_remote_endpoints();
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, Status::Pass);
+        assert!(checks[0].message.contains("nothing to probe"));
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn probe_remote_endpoints_probes_once_per_distinct_endpoint_and_reports_cost() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // Mock accepting up to 2 connections, counting them — if the dedup
+        // ever regresses, the second profile's identical declaration would
+        // land a SECOND billed call; the counter catches it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_srv = hits.clone();
+        std::thread::spawn(move || {
+            let body = r#"{"model":"served-y","usage":{"total_tokens":9},"choices":[{"message":{"content":"ok"}}]}"#;
+            for stream in listener.incoming().take(2) {
+                let Ok(mut stream) = stream else { break };
+                hits_srv.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf); // request fits one read for this body size
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+
+        let (_guard, config_path) = ConfigPathGuard::at_tempfile("profiles.json");
+        // TWO profiles declaring the SAME endpoint + model (no auth ⇒
+        // Keychain untouched; the probe still exercises URL + round-trip).
+        let registry_json = format!(
+            r#"{{
+            "profiles": {{
+                "review-a": {{
+                    "models": [{{
+                        "id": "gpt-probe",
+                        "n_ctx": 128000,
+                        "endpoint": {{ "url": "http://127.0.0.1:{port}/v1" }}
+                    }}]
+                }},
+                "review-b": {{
+                    "models": [{{
+                        "id": "gpt-probe",
+                        "n_ctx": 128000,
+                        "endpoint": {{ "url": "http://127.0.0.1:{port}/v1" }}
+                    }}]
+                }}
+            }}
+        }}"#
+        );
+        std::fs::write(&config_path, registry_json).unwrap();
+
+        let checks = probe_remote_endpoints();
+        assert_eq!(checks.len(), 1, "shared endpoint+model probes exactly once");
+        assert_eq!(checks[0].status, Status::Pass);
+        assert!(checks[0].message.contains("round-trip ok"), "{}", checks[0].message);
+        assert!(checks[0].message.contains("served by `served-y`"), "{}", checks[0].message);
+        assert!(checks[0].message.contains("probe cost 9 tokens"), "{}", checks[0].message);
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "exactly one billed call");
     }
 
     // ─── #332: doctor OC-config probe normalization ─────────────────
