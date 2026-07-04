@@ -20,7 +20,7 @@ class Darkmux < Formula
   # Stable release: v1.15.0 (agentic-remote dispatch — a tool-granting role
   # can now be driven by a remote OpenAI-compatible endpoint (Azure OpenAI,
   # OpenAI, ...) as its "brain," running the same real tool-calling loop
-  # local models get via the internal container runtime, #92). FLOW_SCHEMA
+  # local models get via the internal container runtime, #1187). FLOW_SCHEMA
   # 1.14.0 -> 1.15.0 (additive host-load telemetry fields; older binaries
   # tolerate it, no breaking change). CONFIG_SCHEMA unchanged at 1.1 —
   # drop-in over v1.14.1.

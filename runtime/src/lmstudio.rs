@@ -234,18 +234,18 @@ pub struct Usage {
 /// Blocking HTTP client for LMStudio's chat-completions endpoint.
 ///
 /// Deliberately does NOT derive `Debug` — `auth_header` carries a live
-/// secret when the "brain" is a remote endpoint (#92), and a stray
+/// secret when the "brain" is a remote endpoint (#1187), and a stray
 /// `{:?}` on this struct must never be able to leak it.
 pub struct LmStudioClient {
     base_url: String,
     agent: ureq::Agent,
-    /// (#92) Full chat-completions URL override, used when the brain is a
+    /// (#1187) Full chat-completions URL override, used when the brain is a
     /// remote OpenAI-compatible endpoint that needs a query string (Azure's
     /// `?api-version=`) that `base_url` + the unconditional `/chat/completions`
     /// suffix below can't express. When set, `chat`/`chat_streaming` POST to
     /// this URL verbatim; `base_url` is otherwise unused.
     chat_url_override: Option<String>,
-    /// (#92) An extra header attached to every request — `(name, value)`,
+    /// (#1187) An extra header attached to every request — `(name, value)`,
     /// e.g. `("api-key", "<secret>")` or `("Authorization", "Bearer <secret>")`.
     /// Populated only for a remote-brain dispatch, read once from stdin at
     /// startup (never a file or argv/env) — see `runtime/src/main.rs`'s
@@ -270,7 +270,7 @@ impl LmStudioClient {
         }
     }
 
-    /// (#92) Override the chat-completions URL entirely — the client POSTs
+    /// (#1187) Override the chat-completions URL entirely — the client POSTs
     /// here verbatim instead of `{base_url}/chat/completions`. Setting this
     /// is also what marks the client as talking to a remote brain, which
     /// gates the `max_tokens` → `max_completion_tokens` rename in
@@ -281,7 +281,7 @@ impl LmStudioClient {
         self
     }
 
-    /// (#92) Attach an auth header to every request this client makes.
+    /// (#1187) Attach an auth header to every request this client makes.
     pub fn with_auth_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.auth_header = Some((name.into(), value.into()));
         self
@@ -301,7 +301,7 @@ impl LmStudioClient {
     }
 
     /// Build the wire JSON body for `req`, renaming `max_tokens` to
-    /// `max_completion_tokens` when talking to a remote brain (#92) —
+    /// `max_completion_tokens` when talking to a remote brain (#1187) —
     /// verified empirically against Azure OpenAI's gpt-5.1 deployment,
     /// which rejects `max_tokens` for reasoning-family models. LMStudio and
     /// most other OpenAI-compatible servers only ever see the unrenamed
@@ -395,7 +395,7 @@ impl Default for LmStudioClient {
 /// `usage` in the final SSE chunk (#360). Extracted to a free function so
 /// the body-building rule is unit-testable without an HTTP round-trip.
 ///
-/// `remote` (#92): when true (the client is talking to a remote brain, not
+/// `remote` (#1187): when true (the client is talking to a remote brain, not
 /// local LMStudio), renames `max_tokens` to `max_completion_tokens` —
 /// mirrors [`LmStudioClient::request_body`]'s non-streaming rename, needed
 /// because Azure OpenAI's reasoning-family models (e.g. gpt-5.1) reject
@@ -867,7 +867,7 @@ mod tests {
         assert!(obj.get("messages").and_then(|v| v.as_array()).is_some());
     }
 
-    /// (#92) `remote = true` renames `max_tokens` to `max_completion_tokens`
+    /// (#1187) `remote = true` renames `max_tokens` to `max_completion_tokens`
     /// — Azure OpenAI's reasoning-family models (gpt-5.1) reject the
     /// unrenamed field outright. `remote = false` (LMStudio/local, the test
     /// above) must NOT see this rename.
@@ -895,7 +895,7 @@ mod tests {
         );
     }
 
-    // ─── LmStudioClient (#92 remote-brain builder methods) ─────
+    // ─── LmStudioClient (#1187 remote-brain builder methods) ─────
 
     fn sample_request() -> ChatRequest {
         ChatRequest {

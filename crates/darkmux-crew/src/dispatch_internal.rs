@@ -433,7 +433,7 @@ pub struct DockerRunConfig {
     /// cache). Resolved + created at the call site so the inner verify loop
     /// reuses downloaded deps across dispatches (#703 Slice 3).
     pub cache_dir: std::path::PathBuf,
-    /// (#92) When Some, this dispatch's "brain" is a remote OpenAI-compatible
+    /// (#1187) When Some, this dispatch's "brain" is a remote OpenAI-compatible
     /// endpoint rather than local LMStudio — passed to the container as
     /// `--chat-url`. Only ever set for a role whose tool_palette grants at
     /// least one tool (a tool-less role stays on the light single-shot
@@ -442,7 +442,7 @@ pub struct DockerRunConfig {
     /// URL — see `remote_needs_auth`), so it's safe to include in this
     /// `Debug`-derived, test-asserted struct.
     pub remote_chat_url: Option<String>,
-    /// (#92) Whether the resolved remote endpoint declares an auth mechanism.
+    /// (#1187) Whether the resolved remote endpoint declares an auth mechanism.
     /// When true, `build_docker_run_argv` adds `-i` (keep stdin open) and
     /// `--auth-header-stdin`, and the caller pipes the actual secret over the
     /// container's stdin immediately after spawn (see
@@ -477,7 +477,7 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
     args.push(format!("--pids-limit={}", DOCKER_PIDS_LIMIT));
     args.push(format!("--memory={}", DOCKER_MEMORY));
 
-    // (#92) Keep stdin open ONLY when the container needs its remote auth
+    // (#1187) Keep stdin open ONLY when the container needs its remote auth
     // secret piped in — every other dispatch (local, or a remote endpoint
     // with no auth) has no stdin use and omits this flag.
     if config.remote_needs_auth {
@@ -533,7 +533,7 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
         args.push(allowed.join(","));
     }
 
-    // (#92) Agentic-remote: this dispatch's brain is a remote OpenAI-compat
+    // (#1187) Agentic-remote: this dispatch's brain is a remote OpenAI-compat
     // endpoint, not local LMStudio. The URL carries no secret (auth travels
     // in a header — see `remote_needs_auth` below), so it's fine directly on
     // argv/`ps`, same as `--model`.
@@ -718,7 +718,7 @@ impl Drop for AutoWorkspaceCleanup {
     }
 }
 
-/// (#92) Write the remote endpoint's auth header to the container's stdin as
+/// (#1187) Write the remote endpoint's auth header to the container's stdin as
 /// `{"header": "...", "value": "..."}` and close the pipe (EOF), so
 /// `runtime`'s startup read sees exactly one blob and returns — no file, no
 /// env var, no FILESYSTEM artifact for a `bash`-capable model to find at any
@@ -780,7 +780,7 @@ fn resolve_selected_profile_model(
     profile.models.iter().find(|m| m.id == id).cloned()
 }
 
-/// (#92) True when a role's tool palette grants at least one tool — the
+/// (#1187) True when a role's tool palette grants at least one tool — the
 /// dividing line between the light single-shot remote path and the
 /// agentic-remote container path. A tool-less role (empty `allow`) has no
 /// use for a tool-calling loop regardless of backend, so it stays on the
@@ -1168,7 +1168,7 @@ fn dispatch_remote(
 }
 
 pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
-    // (#1177 / #92) A resolved model naming a remote OpenAI-compatible
+    // (#1177 / #1187) A resolved model naming a remote OpenAI-compatible
     // endpoint forks two ways, decided by whether the ROLE grants any tools:
     //
     //   - Tool-less role (e.g. `pr-reviewer`, empty `tool_palette.allow`) →
@@ -1178,7 +1178,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     //   - Tool-granting role (e.g. `code-reviewer`) → falls through to the
     //     SAME container path local dispatches use, just with the remote
     //     endpoint's URL + auth threaded into the container as its "brain"
-    //     instead of local LMStudio (#92 — agentic-remote). `agentic_pm`
+    //     instead of local LMStudio (#1187 — agentic-remote). `agentic_pm`
     //     carries the resolved remote model forward past this point.
     let remote_target = try_resolve_remote_target(&opts)?;
     let mut agentic_pm: Option<darkmux_types::ProfileModel> = None;
@@ -1308,7 +1308,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     //    NOT the long-form probe-then-pin path documented in #408 —
     //    that's phase 2+ scope when the recommendation registry
     //    activates per-hardware tuple selection.
-    // (#92) An agentic-remote dispatch already has its model resolved (via
+    // (#1187) An agentic-remote dispatch already has its model resolved (via
     // `try_resolve_remote_target`'s profile-based lookup, done up front so
     // the routing decision could be made before any container work) —
     // skip the local-probe/pin resolution entirely; there's no LMStudio
@@ -1328,7 +1328,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
              LMStudio (darkmux swap <profile>) as the deprecated fallback."
         )?
     };
-    // (#92 follow-up) Raw label (no eprintln prefix) — this is also the value
+    // (#1187 follow-up) Raw label (no eprintln prefix) — this is also the value
     // that must land in `dispatch_start_payload`'s `endpoint` field below, the
     // SAME field the light single-shot `dispatch_remote` path already sets
     // (see its `label` var). Missing this was a real gap: the viewer's route
@@ -1455,7 +1455,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     fs::write(host_out.join(PROMPT_FILE_NAME), &opts.message)
         .with_context(|| format!("writing dispatch prompt file under {}", host_out.display()))?;
 
-    // (#92) Agentic-remote: resolve the auth header from Keychain (host-side,
+    // (#1187) Agentic-remote: resolve the auth header from Keychain (host-side,
     // same `remote_auth_header` the light single-shot path uses). Deliberately
     // held ONLY in this local variable, never written to any file or env var
     // — `bash` has no `/workspace`-escape check (unlike `read`/`write`/`edit`;
@@ -1492,7 +1492,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         "system_chars": system_prompt.chars().count(),
         "workspace": workspace.display().to_string(),
     });
-    // (#92 follow-up) Mirror `dispatch_remote`'s `"endpoint": label` field —
+    // (#1187 follow-up) Mirror `dispatch_remote`'s `"endpoint": label` field —
     // its absence, not just its presence, is meaningful to the viewer (no
     // field ⇒ rendered as local LMStudio), so this must be set whenever the
     // container's brain is actually remote.
@@ -1660,7 +1660,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
 
     let mut child = cmd.spawn().context("spawning darkmux-runtime container")?;
 
-    // (#92) Pipe the remote auth secret over stdin IMMEDIATELY after spawn —
+    // (#1187) Pipe the remote auth secret over stdin IMMEDIATELY after spawn —
     // before the trajectory tailer starts, before anything else runs. The
     // container's startup code blocks reading stdin until this write (and
     // the subsequent drop, which closes the pipe / sends EOF) completes, so
@@ -1958,9 +1958,9 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         "completion_tokens": tokens.completion,
         "total_tokens": tokens.total(),
     });
-    // (#92 follow-up) Same field, same reason as `dispatch_start_payload` —
+    // (#1187 follow-up) Same field, same reason as `dispatch_start_payload` —
     // parity with `dispatch_remote`'s completion record, and needed by any
-    // future by-endpoint consumer (#90) that reads the terminal record
+    // future by-endpoint consumer (#1186) that reads the terminal record
     // rather than the start record.
     if let Some(label) = &remote_endpoint_raw_label {
         dispatch_complete_payload["endpoint"] = serde_json::json!(label);
@@ -4322,7 +4322,7 @@ mod tests {
         }
     }
 
-    // ─── #92: agentic-remote argv emission ─────────────────────
+    // ─── #1187: agentic-remote argv emission ─────────────────────
 
     #[test]
     fn build_docker_run_argv_omits_remote_flags_when_not_remote() {
@@ -4377,7 +4377,7 @@ mod tests {
         );
     }
 
-    // ─── #92: role_wants_agentic_remote routing ────────────────
+    // ─── #1187: role_wants_agentic_remote routing ────────────────
 
     #[test]
     fn role_wants_agentic_remote_true_for_nonempty_allow() {
@@ -4423,9 +4423,9 @@ mod tests {
         );
     }
 
-    // ─── #92: remote auth-header stdin write ───────────────────
+    // ─── #1187: remote auth-header stdin write ───────────────────
 
-    /// (#92) The stdin design's whole point is that NOTHING lands on any
+    /// (#1187) The stdin design's whole point is that NOTHING lands on any
     /// filesystem — verify by writing to an in-memory pipe (not a temp file)
     /// and reading the other end back, confirming the exact JSON shape a
     /// `bash`-capable model would never be able to intercept because it

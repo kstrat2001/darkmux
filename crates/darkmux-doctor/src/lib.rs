@@ -1129,7 +1129,7 @@ fn check_redis_config() -> Check {
 }
 
 /// (#85/#91) Surface profile models declaring a remote endpoint
-/// (`ModelEndpoint`, #92/#1177) whose auth credential isn't actually
+/// (`ModelEndpoint`, #1187/#1177) whose auth credential isn't actually
 /// resolvable. Without this check, a missing or misconfigured Keychain item
 /// only surfaces at runtime — the FIRST dispatch using that profile model
 /// bails loud (see `remote_auth_header` in darkmux-crew), which is correct
