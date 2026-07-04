@@ -5,7 +5,7 @@
 #
 # Operator-facing install path:
 #   brew tap kstrat2001/darkmux
-#   brew install darkmux                # stable release (v1.14.1)
+#   brew install darkmux                # stable release (v1.15.0)
 #   brew install --HEAD darkmux         # build from main instead
 #
 # For local development / smoke testing:
@@ -17,16 +17,18 @@
 class Darkmux < Formula
   desc "Profile multiplexer + lab for local LLM stacks (LMStudio, Ollama)"
   homepage "https://darkmux.com"
-  # Stable release: v1.14.1 (viewer performance hotfix — the live observability
-  # tab degraded over a long-open day: liveSessionSet() memoized so render() drops
-  # from ~2.5s to ~20ms, plus an incremental `?since=` reconcile that stops
-  # re-parsing full day files on every 20s tick (#1173)). No schema change
-  # (FLOW_SCHEMA 1.14.0, CONFIG_SCHEMA 1.1) — drop-in over v1.14.0.
+  # Stable release: v1.15.0 (agentic-remote dispatch — a tool-granting role
+  # can now be driven by a remote OpenAI-compatible endpoint (Azure OpenAI,
+  # OpenAI, ...) as its "brain," running the same real tool-calling loop
+  # local models get via the internal container runtime, #92). FLOW_SCHEMA
+  # 1.14.0 -> 1.15.0 (additive host-load telemetry fields; older binaries
+  # tolerate it, no breaking change). CONFIG_SCHEMA unchanged at 1.1 —
+  # drop-in over v1.14.1.
   # `brew install darkmux` builds from this source tarball; `brew install
   # --HEAD darkmux` builds from main instead. The sha256 is of the
   # GitHub-generated source tarball for the tag (`shasum -a 256`).
-  url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v1.14.1.tar.gz"
-  sha256 "081914875e999c01eba41f812c37576b17e10310f8e0d5b8531888d7fe2a2c1b"
+  url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v1.15.0.tar.gz"
+  sha256 "126af27067251de8b2901f451b855ac2769d154815aeb3d9e413f7bd441d4ddb"
   license "MIT"
   head "https://github.com/kstrat2001/darkmux.git", branch: "main"
 
