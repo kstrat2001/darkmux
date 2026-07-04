@@ -1127,13 +1127,14 @@ function hybridNote(t){
   const mr=DATA.filter(r=>r.action&&r.action.indexOf("mission.run")===0&&r.mission_id&&T(r.ts)<=state.t)
                .sort((a,b)=>T(a.ts)-T(b.ts)).pop();
   if(mr)return `<div class="hybnote">${pre}${esc(mr.mission_id)} ran through the local loop — the fleet lifted, the frontier judged. that's hybrid. keep going.${hist}</div>`;
-  // (#1186) Tier-aware fallback — "off the meter" only when it's true of the
-  // window's dispatches; cloud work gets named as cloud, same upbeat voice.
+  // (#1186) Tier-aware fallback — local work is named local, cloud work is
+  // named cloud, same upbeat voice ("local"/"cloud" over metering jargon,
+  // matching the hero labels).
   if(t.runs){
     const lr=t.runs-t.cloudRuns, d=n=>`dispatch${n===1?'':'es'}`;
-    if(!t.cloudRuns)return `<div class="hybnote">${pre}${t.runs} ${d(t.runs)} off the meter — the hybrid loop is humming. keep it up.${hist}</div>`;
+    if(!t.cloudRuns)return `<div class="hybnote">${pre}${t.runs} local ${d(t.runs)} — the hybrid loop is humming. keep it up.${hist}</div>`;
     if(!lr)return `<div class="hybnote">${pre}${t.runs} ${d(t.runs)} via cloud — the right brain for the job. keep it up.${hist}</div>`;
-    return `<div class="hybnote">${pre}${lr} ${d(lr)} off the meter + ${t.cloudRuns} via cloud — the hybrid loop is humming. keep it up.${hist}</div>`;
+    return `<div class="hybnote">${pre}${lr} ${d(lr)} local + ${t.cloudRuns} via cloud — the hybrid loop is humming. keep it up.${hist}</div>`;
   }
   return `<div class="hybnote">${pre}going hybrid takes nerve. the fleet is ready when you are.${hist}</div>`;
 }
@@ -1194,21 +1195,23 @@ function savingsHero(){
   // card). The operator prices each class at their own provider's rates.
   const win=document.body.classList.contains('live-mode')?` · last ${Math.round(LIVE_WINDOW_MS/3600000)}h`:'';
   const sc=(v,l,cls)=>`<div class="savc${cls?' '+cls:''}"><div class="scv">${v}</div><div class="scl">${l}</div></div>`;
-  // (#1186) Two co-equal numbers under one fleet frame: local (green, the
-  // honest "off the meter" claim) + cloud (brand cyan — a legitimate tier,
-  // not a warning). Cloud renders even at zero (same always-render rationale
-  // as the hero itself, and passive discovery that the capability exists).
-  // The window suffix lives on the eyebrow once, not repeated per label.
+  // (#1186) Two co-equal numbers under one fleet frame: local (green) +
+  // cloud (brand cyan — a legitimate tier, not a warning). Labels are the
+  // parallel pair "local tokens" / "cloud tokens" — self-explanatory with no
+  // metering concept to already know (operator call on #1186). Cloud renders
+  // even at zero (same always-render rationale as the hero itself, and
+  // passive discovery that the capability exists). The window suffix lives
+  // on the eyebrow once, not repeated per label.
   return `<div class="savings">
     <div class="saveyebrow">by your fleet${win}</div>
     <div class="savrow">
       <div class="savlead">
         <div class="savnum">${fmtN(t.local)}</div>
-        <div class="savlbl">tokens off the meter</div>
+        <div class="savlbl">local tokens</div>
       </div>
       <div class="savlead cloud">
         <div class="savnum">${fmtN(t.cloud)}</div>
-        <div class="savlbl">tokens via cloud</div>
+        <div class="savlbl">cloud tokens</div>
       </div>
       <div class="savclasses">
         ${sc(fmtC(t.completion),'generated','gen')}
