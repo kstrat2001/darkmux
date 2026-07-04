@@ -11,6 +11,22 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 
 ## [Unreleased]
 
+## [1.15.0] - 2026-07-04
+
+**Agentic-remote dispatch** — a tool-granting role (e.g. `code-reviewer`) can now be driven by a remote OpenAI-compatible endpoint (Azure OpenAI, OpenAI, …) as its "brain," running the SAME real tool-calling loop (multi-turn `tool_calls`, `bash`/`read`/`write`/`edit`/`search`) local models get via the internal container runtime — not just a single-shot chat completion. Tool-less roles (e.g. `pr-reviewer`) are unaffected; they stay on the existing light single-shot `dispatch_remote` path from 1.13. Also carries forward #1172 (deferred from 1.14.1) and a viewer host-load meter. `FLOW_SCHEMA` **1.14.0 → 1.15.0** (additive — new CPU/RAM/GPU host-load telemetry fields; an older binary tolerates the newer schema, no breaking change). `RULES_SCHEMA` / `CONFIG_SCHEMA` unchanged.
+
+### Added
+
+- **Agentic-remote dispatch** (#92, #1180) — the remote endpoint's auth credential is piped over the container's stdin once at spawn, immediately consumed, never written to any file or env var: a mounted secret-bearing file would be reachable by the container's `bash` tool (no `/workspace`-escape check on `bash`, unlike `read`/`write`/`edit`), so stdin closes that exposure entirely. Live-verified against a real Azure endpoint: a genuine multi-turn `tool_calls` round-trip, and confirmed no auth artifact exists on host or container at any point (including the model's own attempted `cat` of the old file path failing outright).
+- **`darkmux doctor` — remote endpoint credential presence check** (#85, #91) — surfaces a profile model that declares a remote endpoint whose Keychain credential is missing or absent, before the first real dispatch bails on it. Read-only; never touches the secret value.
+- **Host-load meter** (#1064, #1176) — CPU, RAM, and GPU utilization in the run view, sampled alongside existing telemetry.
+- **`pr-review-bench` multi-finding parity scoring** (#1119, #1172) — corpus-wide recall/precision against a labeled corpus, not just single-anchor pass/fail.
+
+### Fixed
+
+- **Agentic-remote dispatches were missing the `endpoint` flow-record field** (#1181). The light single-shot `dispatch_remote` path already recorded which remote endpoint served a dispatch; the new agentic-remote container path didn't, so the viewer rendered every agentic-remote dispatch as a local LMStudio run regardless of where the model actually ran. Caught live, watching the viewer during the first real agentic-remote dispatches.
+- **Compaction now always uses a local-only client, never the dispatch's remote brain.** An agentic-remote dispatch was routing its compaction requests through the SAME client as its primary loop — silently mis-billing the remote deployment (Azure ignores the request body's `model` field; the deployment is in the URL) or hard-failing the whole dispatch outright (OpenAI-style endpoints validate `model` server-side) the moment compaction fired, which is exactly the long, tool-heavy dispatch this feature exists for. Found by an independent security audit; regression-locked with a two-mock-server test, and live-verified with a real forced-compaction dispatch against Azure (confirmed via a differential test: unloading the local compactor model makes the dispatch fail with an error naming the local LMStudio URL, not Azure).
+
 ## [1.14.1] - 2026-07-03
 
 A viewer performance hotfix — the live observability tab degraded over a long-open day (multi-second loads, laggy clicks). Released as a clean patch off `v1.14.0` (this entry lands on `main` for continuity; the tag itself was cut from the 1.14.0 line, excluding the concurrently-merged #1172 which rides the next minor). Drop-in; no `FLOW_SCHEMA` / `RULES_SCHEMA` / `CONFIG_SCHEMA` change.
