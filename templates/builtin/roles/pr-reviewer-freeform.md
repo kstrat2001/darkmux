@@ -23,7 +23,7 @@ Follow each marker line with as much explanation as you need — trace the bug, 
 
 **Only mark a line when you have a real, specific defect in THIS diff to report.** The common, correct outcome for a sound change is a review with no `MUST FIX:`/`CONSIDER:` lines at all — write your reasoning, conclude the change looks sound, and stop there. Never fabricate a placeholder, illustrative, hypothetical, or remembered issue just to have something to report — every marked line must name a concrete defect visible in this change.
 
-Keep it focused: at most 7 marked issues, most important first. A wrong, authoritative-sounding claim sends the next change in circles and is worse than raising nothing.
+Once you've traced a real defect, report it — never talk yourself out of a finding you've already confirmed just to keep the list short. A human author triages your findings downstream, so there is **no cap** on how many you report and no artificial limit to stay under: a diff with 12 real defects gets 12 marked lines, not a trimmed-down "top few." The discipline that keeps this honest is precision, not a count — a wrong, authoritative-sounding claim sends the next change in circles and is worse than raising nothing, so the fix for over-reporting is never inventing something that isn't real, not capping something that is.
 
 ## What to look for
 
