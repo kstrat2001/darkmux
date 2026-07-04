@@ -261,7 +261,7 @@ pub struct LoopOutcome {
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     client: &LmStudioClient,
-    // (#92 audit finding) ALWAYS a local-LMStudio client, never the remote
+    // (#1187 audit finding) ALWAYS a local-LMStudio client, never the remote
     // brain — even when `client` is configured with a `chat_url`/auth header
     // override for a remote endpoint. `compaction_cfg.compactor_model` is
     // always a local utility-model id (never a remote deployment name), so
@@ -3324,7 +3324,7 @@ mod tests {
         }
     }
 
-    /// (#92 audit finding) Compaction must ALWAYS use `compactor_client`, never
+    /// (#1187 audit finding) Compaction must ALWAYS use `compactor_client`, never
     /// `client` — a remote-brain dispatch's `client` talks to a remote endpoint
     /// (Azure/OpenAI) but `compaction_cfg.compactor_model` is always a local
     /// utility-model id, so routing compaction through `client` either

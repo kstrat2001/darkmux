@@ -134,14 +134,14 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // LMStudio json_schema response_format before the loop. None ⇒ free-form.
     let mut response_schema: Option<String> = None;
     let mut base_url: Option<String> = None;
-    // (#92) Agentic-remote dispatch: when the "brain" is a remote OpenAI-
+    // (#1187) Agentic-remote dispatch: when the "brain" is a remote OpenAI-
     // compatible endpoint (Azure OpenAI, OpenAI, ...) instead of local
     // LMStudio, the host passes the FULL chat-completions URL here (Azure
     // needs a `?api-version=` query string that `base_url` + the client's
     // unconditional `/chat/completions` suffix can't express). When set,
     // this overrides `base_url` for request routing.
     let mut chat_url: Option<String> = None;
-    // (#92) When true, read the remote endpoint's auth header as JSON
+    // (#1187) When true, read the remote endpoint's auth header as JSON
     // (`{"header": "...", "value": "..."}`) from stdin ONCE at startup — the
     // host pipes it in immediately after spawning this container (with `-i`)
     // and closes the pipe. Deliberately NOT a mounted file: `bash` has no
@@ -555,7 +555,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         Message::user(prompt),
     ];
 
-    // (#92 audit finding) Build the compactor's client from `base_url`
+    // (#1187 audit finding) Build the compactor's client from `base_url`
     // BEFORE it's consumed below, and NEVER apply `--chat-url`/
     // `--auth-header-stdin` to it — the compactor always talks to local
     // LMStudio, even on a remote-brain dispatch. See the doc comment on
@@ -575,7 +575,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     if let Some(url) = chat_url {
         client = client.with_chat_url(url);
     }
-    // (#92) Read the auth header from stdin ONCE at startup — never a CLI
+    // (#1187) Read the auth header from stdin ONCE at startup — never a CLI
     // arg (ps-visible), never an env var (visible to every process, no
     // permission gate), never a file (bash has no `/workspace`-escape check,
     // so any secret-bearing file the container can see is reachable by a
@@ -917,7 +917,7 @@ fn build_json_envelope(
     })
 }
 
-/// (#92) Read the auth-header JSON from stdin ONCE and parse it. Reads to
+/// (#1187) Read the auth-header JSON from stdin ONCE and parse it. Reads to
 /// EOF — the host writes exactly one JSON blob and closes the pipe
 /// immediately after spawning this container, so `read_to_string` returns
 /// as soon as that write completes. Nothing is ever written to any
@@ -1041,7 +1041,7 @@ mod tests {
         assert!(matches!(result[1], Tool::Bash));
     }
 
-    // ─── parse_auth_header_json (#92 stdin auth) ───────────────────
+    // ─── parse_auth_header_json (#1187 stdin auth) ───────────────────
 
     #[test]
     fn auth_header_json_happy_path_returns_header_and_value() {
