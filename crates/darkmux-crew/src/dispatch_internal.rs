@@ -1002,12 +1002,54 @@ pub fn probe_remote_endpoint(
 /// share the secret-bearing curl config filename.
 static REMOTE_CFG_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Hosted-call failure, split so the retry wrapper can tell a rate limit
+/// (retryable: the endpoint SAYS try later) from everything else (fail loud
+/// immediately — retrying an auth error or a malformed body just burns time).
+enum HostedCallError {
+    RateLimited(String),
+    Other(anyhow::Error),
+}
+
+/// Backoff ladder for endpoint rate limits (free tiers especially: Gemini's
+/// free tier 429s under normal sequential bench load, 2026-07-05). Attempt,
+/// then retry after each delay — bounded, loud on every wait, and only for
+/// 429-shaped errors.
+const RATE_LIMIT_BACKOFF_SECONDS: [u64; 3] = [30, 60, 120];
+
 fn remote_chat_completion(
     url: &str,
     auth_header: Option<&(String, String)>,
     body: &serde_json::Value,
     timeout_seconds: u32,
 ) -> Result<serde_json::Value> {
+    let attempts = RATE_LIMIT_BACKOFF_SECONDS.len() + 1;
+    let mut last = String::new();
+    for (i, delay) in std::iter::once(0u64)
+        .chain(RATE_LIMIT_BACKOFF_SECONDS.iter().copied())
+        .enumerate()
+    {
+        if delay > 0 {
+            eprintln!(
+                "darkmux: hosted endpoint rate-limited (429) — retry {i}/{} in {delay}s",
+                attempts - 1
+            );
+            std::thread::sleep(std::time::Duration::from_secs(delay));
+        }
+        match remote_chat_attempt(url, auth_header, body, timeout_seconds) {
+            Ok(v) => return Ok(v),
+            Err(HostedCallError::RateLimited(msg)) => last = msg,
+            Err(HostedCallError::Other(e)) => return Err(e),
+        }
+    }
+    bail!("hosted endpoint rate-limited (429) after {attempts} attempts: {last}")
+}
+
+fn remote_chat_attempt(
+    url: &str,
+    auth_header: Option<&(String, String)>,
+    body: &serde_json::Value,
+    timeout_seconds: u32,
+) -> std::result::Result<serde_json::Value, HostedCallError> {
     use std::io::Write;
     let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
     // (#1177) pid + a process-local counter — a unique name per call, so
@@ -1058,44 +1100,68 @@ fn remote_chat_completion(
     };
     let result = run();
     let _ = std::fs::remove_file(&cfg_path); // ALWAYS remove the secret-bearing file
-    let out = result?;
+    let out = result.map_err(HostedCallError::Other)?;
     if !out.status.success() {
-        bail!(
+        return Err(HostedCallError::Other(anyhow!(
             "hosted dispatch curl failed (exit {}): {}",
             out.status.code().unwrap_or(-1),
             String::from_utf8_lossy(&out.stderr).trim()
-        );
+        )));
     }
-    let resp: serde_json::Value = serde_json::from_slice(&out.stdout).with_context(|| {
-        format!(
-            "parsing hosted endpoint response as JSON (first 200 bytes: {:?})",
-            String::from_utf8_lossy(&out.stdout)
-                .chars()
-                .take(200)
-                .collect::<String>()
-        )
+    parse_hosted_response(&out.stdout)
+}
+
+/// Classify a hosted endpoint's response body. Pure — unit-testable.
+///
+/// (#1177) curl (no --fail) exits 0 on HTTP 4xx/5xx — the endpoint returns
+/// the error IN the body. Without this check a 401 / 429 / 400 (auth,
+/// rate-limit, prompt-overflow) would parse cleanly and read as an EMPTY
+/// successful review — the #1135 "healthy while broken" trap. The error may
+/// be a top-level `{"error": {...}}` object (Azure/OpenAI) OR the first
+/// element of an ARRAY (`[{"error": {...}}]` — Google's OpenAI-compat layer,
+/// observed live 2026-07-05; the array shape previously fell through to the
+/// confusing "missing choices" message). A 429 / RESOURCE_EXHAUSTED
+/// classifies as retryable; every other error fails loud immediately.
+fn parse_hosted_response(
+    stdout: &[u8],
+) -> std::result::Result<serde_json::Value, HostedCallError> {
+    let head = || {
+        String::from_utf8_lossy(stdout)
+            .chars()
+            .take(200)
+            .collect::<String>()
+    };
+    let resp: serde_json::Value = serde_json::from_slice(stdout).map_err(|e| {
+        HostedCallError::Other(anyhow!(
+            "parsing hosted endpoint response as JSON: {e} (first 200 bytes: {:?})",
+            head()
+        ))
     })?;
-    // (#1177) curl (no --fail) exits 0 on HTTP 4xx/5xx — the endpoint
-    // returns the error as an `{"error": {...}}` body. Without this check a 401 /
-    // 429 / 400 (auth, rate-limit, prompt-overflow) would parse cleanly and read
-    // as an EMPTY successful review — the #1135 "healthy while broken" trap. Also
-    // catches an HTTP-200-with-error-object proxy. Fail loud.
-    if let Some(err) = resp.get("error") {
+    let err_obj = resp.get("error").or_else(|| {
+        resp.as_array()
+            .and_then(|a| a.first())
+            .and_then(|f| f.get("error"))
+    });
+    if let Some(err) = err_obj {
+        let code = err.get("code").and_then(|c| c.as_u64());
+        let status = err.get("status").and_then(|s| s.as_str()).unwrap_or("");
         let msg = err
             .get("message")
             .and_then(|m| m.as_str())
             .unwrap_or("(no message)");
-        bail!("hosted endpoint returned an error: {msg}");
+        if code == Some(429) || status == "RESOURCE_EXHAUSTED" {
+            return Err(HostedCallError::RateLimited(msg.to_string()));
+        }
+        return Err(HostedCallError::Other(anyhow!(
+            "hosted endpoint returned an error: {msg}"
+        )));
     }
     if resp.pointer("/choices/0/message/content").is_none() {
-        bail!(
+        return Err(HostedCallError::Other(anyhow!(
             "hosted endpoint response missing choices[0].message.content (unexpected shape) \
              — first 200 bytes: {:?}",
-            String::from_utf8_lossy(&out.stdout)
-                .chars()
-                .take(200)
-                .collect::<String>()
-        );
+            head()
+        )));
     }
     Ok(resp)
 }
@@ -3877,6 +3943,50 @@ mod tests {
         let both = single_shot_body("m", "sys", "msg", Some(8000), Some("low"));
         assert_eq!(both["reasoning_effort"], "low");
         assert_eq!(both["max_completion_tokens"], 8000, "an explicit cap wins");
+    }
+
+    /// Hosted-response classification (pure): the happy path passes through;
+    /// object-shaped errors (Azure/OpenAI) and ARRAY-shaped errors (Google's
+    /// OpenAI-compat layer, observed live 2026-07-05) both surface their
+    /// message; 429 / RESOURCE_EXHAUSTED classifies as retryable while every
+    /// other error is terminal; a contentless non-error body stays loud
+    /// (#1135 healthy-while-broken).
+    #[test]
+    fn parse_hosted_response_classifies_errors_and_rate_limits() {
+        let ok = parse_hosted_response(
+            br#"{"choices":[{"message":{"content":"hi"}}]}"#,
+        );
+        assert!(ok.is_ok());
+
+        match parse_hosted_response(br#"{"error":{"code":401,"message":"bad key"}}"#) {
+            Err(HostedCallError::Other(e)) => assert!(e.to_string().contains("bad key")),
+            _ => panic!("object-shaped non-429 error must be terminal"),
+        }
+        match parse_hosted_response(br#"{"error":{"code":429,"message":"quota"}}"#) {
+            Err(HostedCallError::RateLimited(m)) => assert!(m.contains("quota")),
+            _ => panic!("object-shaped 429 must classify retryable"),
+        }
+        // Google's array shape — previously fell through to "missing choices".
+        match parse_hosted_response(
+            br#"[{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"You exceeded your current quota"}}]"#,
+        ) {
+            Err(HostedCallError::RateLimited(m)) => assert!(m.contains("exceeded")),
+            _ => panic!("array-shaped 429 must classify retryable"),
+        }
+        match parse_hosted_response(br#"[{"error":{"code":400,"message":"bad request"}}]"#) {
+            Err(HostedCallError::Other(e)) => assert!(e.to_string().contains("bad request")),
+            _ => panic!("array-shaped non-429 must be terminal"),
+        }
+        match parse_hosted_response(br#"{"id":"x"}"#) {
+            Err(HostedCallError::Other(e)) => {
+                assert!(e.to_string().contains("missing choices[0].message.content"))
+            }
+            _ => panic!("contentless body must fail loud"),
+        }
+        match parse_hosted_response(b"not json") {
+            Err(HostedCallError::Other(e)) => assert!(e.to_string().contains("parsing")),
+            _ => panic!("non-JSON must fail loud"),
+        }
     }
 
     /// The endpoint field round-trips (a hand-written profiles file is the
