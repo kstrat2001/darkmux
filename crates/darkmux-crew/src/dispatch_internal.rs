@@ -1149,7 +1149,18 @@ fn parse_hosted_response(
             .get("message")
             .and_then(|m| m.as_str())
             .unwrap_or("(no message)");
-        if code == Some(429) || status == "RESOURCE_EXHAUSTED" {
+        // Retryable = the endpoint SAYS try later: rate limits (429 /
+        // RESOURCE_EXHAUSTED) and transient capacity shedding (503 /
+        // UNAVAILABLE / "high demand ... try again later" — Google sheds
+        // load with that message in a 200-status body, observed live
+        // 2026-07-05 on the paid tier; it killed whole bench runs that a
+        // 30s wait survives).
+        let transient = code == Some(429)
+            || code == Some(503)
+            || status == "RESOURCE_EXHAUSTED"
+            || status == "UNAVAILABLE"
+            || (msg.contains("high demand") && msg.contains("try again"));
+        if transient {
             return Err(HostedCallError::RateLimited(msg.to_string()));
         }
         return Err(HostedCallError::Other(anyhow!(
@@ -3976,6 +3987,25 @@ mod tests {
         match parse_hosted_response(br#"[{"error":{"code":400,"message":"bad request"}}]"#) {
             Err(HostedCallError::Other(e)) => assert!(e.to_string().contains("bad request")),
             _ => panic!("array-shaped non-429 must be terminal"),
+        }
+        // Capacity shedding is retryable in all three observed shapes:
+        // 503 code, UNAVAILABLE status, and Google's "high demand" message
+        // inside an HTTP-200 body (observed live 2026-07-05).
+        match parse_hosted_response(br#"{"error":{"code":503,"message":"overloaded"}}"#) {
+            Err(HostedCallError::RateLimited(_)) => {}
+            _ => panic!("503 must classify retryable"),
+        }
+        match parse_hosted_response(
+            br#"[{"error":{"status":"UNAVAILABLE","message":"The service is currently unavailable."}}]"#,
+        ) {
+            Err(HostedCallError::RateLimited(_)) => {}
+            _ => panic!("UNAVAILABLE must classify retryable"),
+        }
+        match parse_hosted_response(
+            br#"{"error":{"message":"This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later."}}"#,
+        ) {
+            Err(HostedCallError::RateLimited(m)) => assert!(m.contains("high demand")),
+            _ => panic!("high-demand shedding must classify retryable"),
         }
         match parse_hosted_response(br#"{"id":"x"}"#) {
             Err(HostedCallError::Other(e)) => {
