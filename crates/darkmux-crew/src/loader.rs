@@ -26,6 +26,11 @@ const BUILTIN_ROLES: &[(&str, &str)] = &[
     // combined with tools makes the model skip tool-calling and fabricate).
     // `darkmux pr-review render` parses the markers into inline comments.
     ("pr-reviewer-agentic", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/pr-reviewer-agentic.json"))),
+    // Sibling of pr-reviewer with the JSON grammar contract (output_schema)
+    // dropped — free-form prose review, MUST FIX:/CONSIDER: marked. Exists to
+    // measure whether the JSON contract itself suppresses recall vs framing
+    // (#1119 review-bench free-form mode); not wired into the CI workflow.
+    ("pr-reviewer-freeform", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/pr-reviewer-freeform.json"))),
     // (#1196) Tool-call bench harness role: the full runtime belt via an
     // EXPLICIT allow-list (empty palette = whole catalog, silently — the
     // #1197 bench-role rule) and NO output_schema (schema+tools makes the
@@ -74,6 +79,7 @@ pub(crate) const BUILTIN_ROLE_PROMPTS: &[(&str, &str)] = &[
     ("code-reviewer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/code-reviewer.md"))),
     ("pr-reviewer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/pr-reviewer.md"))),
     ("pr-reviewer-agentic", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/pr-reviewer-agentic.md"))),
+    ("pr-reviewer-freeform", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/pr-reviewer-freeform.md"))),
     ("tool-bench", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/tool-bench.md"))),
     ("mission-compiler", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/mission-compiler.md"))),
     ("analyst", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/analyst.md"))),
@@ -828,6 +834,50 @@ mod tests {
         let props = &schema["properties"]["findings"]["items"]["properties"];
         assert!(props.get("anchor").is_some(), "finding schema must carry `anchor` (#1053)");
         assert!(props.get("line").is_none(), "finding schema must NOT carry `line` (replaced by anchor, #1053)");
+    }
+
+    /// (#1119 free-form mode) `pr-reviewer-freeform` must NOT carry an
+    /// `output_schema` — the whole point of the sibling role is no grammar
+    /// lock on the output. A future edit that added one back would silently
+    /// reintroduce the JSON muzzle this role exists to avoid.
+    #[test]
+    fn pr_reviewer_freeform_has_no_output_schema() {
+        let role_json = BUILTIN_ROLES
+            .iter()
+            .find(|(id, _)| *id == "pr-reviewer-freeform")
+            .map(|(_, c)| *c)
+            .expect("pr-reviewer-freeform manifest must be embedded");
+        let role: Role = serde_json::from_str(role_json).expect("pr-reviewer-freeform manifest parses");
+        assert!(
+            role.output_schema.is_none(),
+            "pr-reviewer-freeform must stay grammar-unlocked (no output_schema) — that's the axis it exists to test"
+        );
+    }
+
+    /// (2026-07-04 aggressive redesign) `pr-reviewer-freeform`'s prompt must
+    /// instruct the model NEVER to downgrade a self-noticed defect to unmarked
+    /// commentary. Live-dispatch evidence (gpt-5.1 on the pr-review-bench
+    /// corpus, #1119): under the earlier "achieves its stated intent = correct"
+    /// framing the model traced the EXACT labeled bug in its reasoning, then
+    /// wrote "not a must-fix" and left it unmarked — a self-downgrade, not a
+    /// detection failure. This directive is the fix; a future edit that
+    /// softened it back would silently reintroduce the calibration failure.
+    #[test]
+    fn pr_reviewer_freeform_prompt_forbids_self_downgrade() {
+        let prompt = BUILTIN_ROLE_PROMPTS
+            .iter()
+            .find(|(id, _)| *id == "pr-reviewer-freeform")
+            .map(|(_, c)| *c)
+            .expect("pr-reviewer-freeform prompt must be embedded");
+        assert!(
+            prompt.to_lowercase().contains("never talk yourself out"),
+            "pr-reviewer-freeform.md must forbid self-downgrading a noticed defect"
+        );
+        assert!(
+            prompt.contains("no cap") || prompt.contains("no artificial limit") || prompt.contains("**no cap**"),
+            "pr-reviewer-freeform.md must not artificially cap the number of findings \
+             (a human author triages downstream, per #1119)"
+        );
     }
 
     /// (#1038) Every builtin role's `output_schema`, if present, must be

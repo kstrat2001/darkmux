@@ -1,0 +1,20 @@
+{
+  "id": "pr-reviewer-freeform",
+  "role_family": "specialist",
+  "description": "Tool-less PR code reviewer, aggressive stance: reads a unified diff provided inline and writes a thorough, adversarial prose code review — no forced JSON shape, no grammar lock, no cap on findings, and no 'achieves its stated intent, therefore correct' auto-pass. Marks each real issue with a `MUST FIX:` (blocks merge) or `CONSIDER:` (non-blocking) line so the finding is still machine-locatable, but the model reasons and explains freely in its own words, and is explicitly instructed never to downgrade a self-noticed defect to unmarked commentary. Assumes a human author triages the output downstream, so recall is prioritized over precision. No repo, no shell, no tools — pure reasoning over the given diff.",
+  "skills": [
+    "code-reviewing"
+  ],
+  "tool_palette": {
+    "allow": [],
+    "deny": [
+      "read",
+      "write",
+      "edit",
+      "exec",
+      "process",
+      "update_plan"
+    ]
+  },
+  "escalation_contract": "bail-with-explanation"
+}

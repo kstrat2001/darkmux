@@ -164,6 +164,33 @@ pub struct CaseScore {
     pub anchors_ok: usize,
 }
 
+/// Output contract the reviewer dispatches under (#1119 free-form mode).
+/// `Strict` is the shipped `pr-reviewer` role — grammar-locked to a JSON
+/// schema via `output_schema` (LMStudio `response_format: json_schema`).
+/// `FreeForm` dispatches the sibling `pr-reviewer-freeform` role instead —
+/// no grammar lock, ordinary prose with `MUST FIX:`/`CONSIDER:` marker
+/// lines — to measure whether the JSON contract itself suppresses recall
+/// (a real model returned `verdict: pass, findings: []` under Strict on a
+/// diff it caught 5/5 free-form in an ad-hoc probe; this mode makes that
+/// comparison reproducible). Scoring is identical either way: both modes
+/// reduce to the same `Review { verdict, findings }` shape and go through
+/// the same `score()`/`score_multi()` matcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BenchMode {
+    #[default]
+    Strict,
+    FreeForm,
+}
+
+impl BenchMode {
+    fn role_id(self) -> &'static str {
+        match self {
+            BenchMode::Strict => "pr-reviewer",
+            BenchMode::FreeForm => "pr-reviewer-freeform",
+        }
+    }
+}
+
 pub struct ReviewBenchOpts {
     pub cases_dir: PathBuf,
     pub profile_name: Option<String>,
@@ -172,6 +199,7 @@ pub struct ReviewBenchOpts {
     /// (#1198) Where to write the scores.json artifact. `None` = the default
     /// location under the runs dir (`review-bench-<unix-ts>/scores.json`).
     pub scores_out: Option<PathBuf>,
+    pub mode: BenchMode,
 }
 
 pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
@@ -183,20 +211,25 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
         ));
     }
     eprintln!(
-        "pr-review-bench: {} cases · profile={} · profiles-file={}",
+        "pr-review-bench: {} cases · profile={} · profiles-file={} · mode={}",
         cases.len(),
         opts.profile_name.as_deref().unwrap_or("(default)"),
         opts.config_path.as_deref().unwrap_or("(registry)"),
+        if opts.mode == BenchMode::FreeForm { "freeform" } else { "strict" },
     );
     println!("{:<34}{:<7}{:<7}{:<4}outcome", "case", "kind", "verd", "f");
     let mut scored: Vec<(&Case, CaseScore)> = Vec::new();
     let mut meta: Vec<EnvelopeMeta> = Vec::new();
     for c in &cases {
-        let prompt = build_prompt(c);
+        let prompt = build_prompt(c, opts.mode);
         let stdout = dispatch_case(&prompt, &c.id, &opts)
             .with_context(|| format!("dispatching case {}", c.id))?;
         meta.push(envelope_meta(&stdout));
-        let review = parse_review(&extract_reply_text(&stdout));
+        let reply = extract_reply_text(&stdout);
+        let review = match opts.mode {
+            BenchMode::Strict => parse_review(&reply),
+            BenchMode::FreeForm => parse_freeform_review(&reply),
+        };
         let s = score(&c.label, &review);
         println!(
             "{:<34}{:<7}{:<7}{:<4}{}",
@@ -296,27 +329,37 @@ fn load_cases(dir: &Path) -> Result<Vec<Case>> {
 }
 
 /// Build the pr-reviewer prompt — same shape as the `darkmux-review.yml`
-/// workflow: the author's intent (title + description) then the diff.
-fn build_prompt(c: &Case) -> String {
+/// workflow: the author's intent (title + description) then the diff. The
+/// role-contract line differs by mode: Strict points at the JSON object the
+/// grammar-locked role emits; FreeForm points at nothing (the contract —
+/// `MUST FIX:`/`CONSIDER:` marker lines in prose — lives entirely in the
+/// `pr-reviewer-freeform` system prompt, not restated here).
+fn build_prompt(c: &Case, mode: BenchMode) -> String {
     let body = if c.label.intent_body.trim().is_empty() {
         "(no description provided)"
     } else {
         c.label.intent_body.trim()
     };
+    let instruction = match mode {
+        BenchMode::Strict => "Respond per your role contract (the single JSON object).",
+        BenchMode::FreeForm => "Write your review per your role contract.",
+    };
     format!(
         "PR review request: {title}\n\n\
          Description (the author's stated intent for this change):\n{body}\n\n\
-         Respond per your role contract (the single JSON object). Assess the diff \
+         {instruction} Assess the diff \
          against the stated intent above. The full diff is below; you have only this diff.\n\n\
          ```diff\n{diff}\n```\n",
         title = c.label.intent_title,
         body = body,
+        instruction = instruction,
         diff = c.diff,
     )
 }
 
-/// Dispatch one case through the `pr-reviewer` role on the internal runtime,
-/// returning the raw `--json` envelope stdout (parsed by `extract_reply_text`).
+/// Dispatch one case through the mode's role (`pr-reviewer` or
+/// `pr-reviewer-freeform`) on the internal runtime, returning the raw
+/// `--json` envelope stdout (parsed by `extract_reply_text`).
 fn dispatch_case(prompt: &str, case_id: &str, opts: &ReviewBenchOpts) -> Result<String> {
     use darkmux_crew::dispatch::{dispatch, CompactionDispatchArgs, DispatchOpts, Runtime};
     let session_id = format!(
@@ -328,7 +371,7 @@ fn dispatch_case(prompt: &str, case_id: &str, opts: &ReviewBenchOpts) -> Result<
             .unwrap_or(0)
     );
     let d = DispatchOpts {
-        role_id: "pr-reviewer".to_string(),
+        role_id: opts.mode.role_id().to_string(),
         message: prompt.to_string(),
         deliver: None,
         session_id: Some(session_id),
@@ -420,6 +463,80 @@ fn json_candidates(text: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// Parse a `pr-reviewer-freeform` reply (ordinary prose, no JSON) into the
+/// same `Review` shape `parse_review` produces, so scoring is identical
+/// either way. Scans for `MUST FIX:` (⇒ severity high, contributes to
+/// `verdict: flag`) and `CONSIDER:` (⇒ severity medium, non-blocking) marker
+/// lines — tolerating a leading bullet (`-`, `*`, `•`) and markdown bold
+/// (`**MUST FIX:**`). Text following a marker, up to the next marker or a
+/// blank line, is folded into that finding's `anchor`/`title` (both set to
+/// the same text — the free-form finding has no separate quote-the-line
+/// field, so `finding_matches_expected`'s anchor-or-title haystack search
+/// still works unchanged). A review with no marker lines and no other real
+/// content is `parsed: false` (degenerate, e.g. a genuinely empty reply) —
+/// non-empty prose with zero markers is a real, scoreable "no issues" pass.
+pub fn parse_freeform_review(text: &str) -> Review {
+    let mut findings: Vec<Finding> = Vec::new();
+    let mut current: Option<(String, String)> = None; // (severity, accumulated text)
+    let flush = |current: &mut Option<(String, String)>, findings: &mut Vec<Finding>| {
+        if let Some((severity, body)) = current.take() {
+            let body = body.trim().to_string();
+            if !body.is_empty() {
+                findings.push(Finding {
+                    severity,
+                    anchor: body.clone(),
+                    title: body,
+                });
+            }
+        }
+    };
+    for raw in text.lines() {
+        let line = raw.trim();
+        if let Some(rest) = strip_marker(line, "MUST FIX") {
+            flush(&mut current, &mut findings);
+            current = Some(("high".to_string(), rest));
+        } else if let Some(rest) = strip_marker(line, "CONSIDER") {
+            flush(&mut current, &mut findings);
+            current = Some(("medium".to_string(), rest));
+        } else if line.is_empty() {
+            flush(&mut current, &mut findings);
+        } else if let Some((_, body)) = current.as_mut() {
+            body.push(' ');
+            body.push_str(line);
+        }
+    }
+    flush(&mut current, &mut findings);
+    let verdict = if findings.iter().any(|f| f.severity == "high") {
+        "flag"
+    } else {
+        "pass"
+    };
+    Review {
+        verdict: verdict.to_string(),
+        findings,
+        parsed: !text.trim().is_empty(),
+    }
+}
+
+/// If `line` (after stripping leading bullet/markdown-bold decoration) starts
+/// with `marker` case-insensitively, return the remainder — decoration and an
+/// optional `:` separator stripped, trimmed. Else `None`. Uses `str::get`
+/// (not direct byte slicing) so arbitrary UTF-8 prose that happens not to
+/// start with the marker can never panic on a non-char-boundary index.
+fn strip_marker(line: &str, marker: &str) -> Option<String> {
+    let is_deco = |c: char| matches!(c, '-' | '*' | '•' | '_') || c.is_whitespace();
+    let s = line.trim_start_matches(is_deco);
+    let prefix = s.get(..marker.len())?;
+    if !prefix.eq_ignore_ascii_case(marker) {
+        return None;
+    }
+    let rest = s[marker.len()..]
+        .trim_start_matches(is_deco)
+        .trim_start_matches(':')
+        .trim_start_matches(is_deco);
+    Some(rest.trim().to_string())
 }
 
 /// Score one review against its label. Pure — the unit-tested core.
@@ -891,7 +1008,7 @@ fn write_scores_artifact(
         .unwrap_or(0);
     let machine_id = darkmux_types::config_access::machine_id()
         .unwrap_or_else(|| "(unknown)".to_string());
-    let doc = scores::ScoresDoc::new(
+    let mut doc = scores::ScoresDoc::new(
         scores::RunProvenance {
             run_id: format!("review-bench-{ts_ms}"),
             ts: darkmux_flow::ts_utc_now(),
@@ -900,6 +1017,16 @@ fn write_scores_artifact(
             ..Default::default()
         },
         rows,
+    );
+    // The contract is a HARNESS variable (#1119 free-form mode): a freeform
+    // row and a strict row of the same artifact are different cells and must
+    // never aggregate together. Recorded doc-level — every row in one run
+    // shares one mode.
+    doc.extras.insert(
+        "mode".to_string(),
+        serde_json::Value::String(
+            if opts.mode == BenchMode::FreeForm { "freeform" } else { "strict" }.to_string(),
+        ),
     );
     let path = match &opts.scores_out {
         Some(p) => p.clone(),
@@ -1007,6 +1134,117 @@ mod tests {
         assert!(!parse_review("").parsed);
         assert!(!parse_review("just some reasoning, no json").parsed);
         assert!(!parse_review(r#"{"summary":"thought about it"}"#).parsed);
+    }
+
+    // ── free-form parsing (#1119 free-form mode) ──
+
+    #[test]
+    fn freeform_no_markers_is_a_real_pass_not_degenerate() {
+        let r = parse_freeform_review(
+            "I traced the changed function end to end. The guard correctly \
+             handles the null case the PR description mentions. This looks sound.",
+        );
+        assert!(r.parsed, "non-empty prose with no markers is a real pass, not degenerate");
+        assert_eq!(r.verdict, "pass");
+        assert!(r.findings.is_empty());
+    }
+
+    #[test]
+    fn freeform_empty_text_is_degenerate() {
+        assert!(!parse_freeform_review("").parsed);
+        assert!(!parse_freeform_review("   \n  ").parsed);
+    }
+
+    #[test]
+    fn freeform_must_fix_line_is_high_and_flags() {
+        let r = parse_freeform_review(
+            "I looked through the diff.\n\n\
+             MUST FIX: the call to .startOf('day') is not applied to both sides of \
+             the range comparison in calc.ts:40, so results are undercounted near a \
+             day boundary.\n\n\
+             The rest of the change looks fine.",
+        );
+        assert_eq!(r.verdict, "flag");
+        assert_eq!(r.findings.len(), 1);
+        assert_eq!(r.findings[0].severity, "high");
+        assert!(r.findings[0].title.contains("startOf('day')"));
+        assert!(r.findings[0].title.contains("calc.ts:40"));
+    }
+
+    #[test]
+    fn freeform_consider_line_is_medium_and_does_not_flag() {
+        let r = parse_freeform_review("CONSIDER: adding a test for the empty-array case.");
+        assert_eq!(r.verdict, "pass", "CONSIDER alone must not flag (mirrors severity=medium)");
+        assert_eq!(r.findings.len(), 1);
+        assert_eq!(r.findings[0].severity, "medium");
+    }
+
+    #[test]
+    fn freeform_multiple_markers_each_become_a_finding() {
+        let r = parse_freeform_review(
+            "MUST FIX: bug one in foo.rs:1.\n\
+             CONSIDER: a style nit in foo.rs:9.\n\
+             MUST FIX: bug two in bar.rs:5.",
+        );
+        assert_eq!(r.verdict, "flag");
+        assert_eq!(r.findings.len(), 3);
+        assert_eq!(r.findings.iter().filter(|f| f.severity == "high").count(), 2);
+        assert_eq!(r.findings.iter().filter(|f| f.severity == "medium").count(), 1);
+    }
+
+    #[test]
+    fn freeform_tolerates_bullets_and_bold_markdown() {
+        let cases = [
+            "- MUST FIX: a bug",
+            "* MUST FIX: a bug",
+            "**MUST FIX:** a bug",
+            "- **MUST FIX:** a bug",
+        ];
+        for c in cases {
+            let r = parse_freeform_review(c);
+            assert_eq!(r.findings.len(), 1, "failed on {c:?}");
+            assert_eq!(r.findings[0].severity, "high", "failed on {c:?}");
+            assert!(r.findings[0].title.contains("a bug"), "failed on {c:?}: {:?}", r.findings[0].title);
+        }
+    }
+
+    #[test]
+    fn freeform_continuation_lines_fold_into_the_finding() {
+        let r = parse_freeform_review(
+            "MUST FIX: the totals are wrong.\n\
+             This is because dailyComplexCharges is never summed alongside\n\
+             sumComplexCharges, so the dashboard undercounts.\n\n\
+             CONSIDER: a follow-up test.",
+        );
+        assert_eq!(r.findings.len(), 2);
+        assert!(r.findings[0].title.contains("dailyComplexCharges"));
+        assert!(r.findings[0].title.contains("sumComplexCharges"));
+    }
+
+    #[test]
+    fn freeform_non_ascii_prose_near_a_would_be_marker_does_not_panic() {
+        // A line starting with multi-byte UTF-8 must never panic strip_marker's
+        // byte slicing (str::get, not direct indexing) even when it's short or
+        // lands mid-character relative to the marker's byte length.
+        let r = parse_freeform_review("😀 the diff looks fine, no MUST FIX here.\n中文 CONSIDER test\n短");
+        assert!(r.parsed);
+        assert!(r.findings.is_empty(), "marker mid-line without a line-start match must not register");
+    }
+
+    #[test]
+    fn freeform_scores_through_the_same_multi_finding_matcher() {
+        // Proves the free-form path is a drop-in for the existing scorer: the
+        // same expected-finding schema, matched via anchor/title substring.
+        let label = multi_lbl("bug", vec![ef("calc.ts:40", false)]);
+        let r = parse_freeform_review(
+            "MUST FIX: calc.ts:40 undercounts near a day boundary because the \
+             range comparison isn't day-aligned.",
+        );
+        let s = score(&label, &r);
+        assert!(s.recall);
+        assert_eq!(s.bugs_caught, 1);
+        assert_eq!(s.tp, 1);
+        assert_eq!(s.fp, 0);
     }
 
     #[test]
