@@ -729,9 +729,11 @@ pub(crate) struct EnvelopeMeta {
     pub total_tokens: Option<u64>,
 }
 
-/// Parse the dispatch envelope (the last JSON object on stdout — matching
-/// `extract_reply_text`'s tolerance for pull-progress noise ahead of it)
-/// for `metrics.model` + token totals.
+/// Parse the dispatch envelope (the last stdout line starting with `{` —
+/// tolerant of pull-progress noise ahead of it, unlike `extract_reply_text`
+/// which parses the whole stdout as one JSON value) for `metrics.model` +
+/// token totals. The envelope is compact single-line JSON, so a reply-
+/// internal brace can never appear as its own stdout line.
 pub(crate) fn envelope_meta(stdout: &str) -> EnvelopeMeta {
     let candidate = stdout
         .lines()
@@ -814,15 +816,19 @@ pub(crate) fn build_score_rows(
         .map(|(_, s)| s)
         .collect();
     let clean_pass = clean.iter().filter(|s| s.correct).count();
+    // Clean-only fp here so this row's detail agrees with the printed
+    // "clean: X/Y pass · Z false positives" line (review-QA on #1200);
+    // corpus-wide fp lives on the `precision` row.
+    let clean_fp: usize = clean.iter().map(|s| s.fp).sum();
     let fp_total: usize = scored.iter().map(|(_, s)| s.fp).sum();
     let frac = |num: usize, den: usize| -> Option<f64> {
         (den > 0).then(|| num as f64 / den as f64)
     };
     rows.push(row(
         "clean_pass_rate",
-        Outcome::Pass,
+        Outcome::NotApplicable,
         frac(clean_pass, clean.len()),
-        serde_json::json!({ "passed": clean_pass, "clean_cases": clean.len(), "false_positives": fp_total }),
+        serde_json::json!({ "passed": clean_pass, "clean_cases": clean.len(), "false_positives": clean_fp }),
     ));
 
     if scored.iter().any(|(c, _)| c.label.uses_multi()) {
@@ -833,19 +839,19 @@ pub(crate) fn build_score_rows(
         let anchors_ok: usize = scored.iter().map(|(_, s)| s.anchors_ok).sum();
         rows.push(row(
             "recall",
-            Outcome::Pass,
+            Outcome::NotApplicable,
             frac(bugs_caught, expected_bugs),
             serde_json::json!({ "caught": bugs_caught, "expected": expected_bugs }),
         ));
         rows.push(row(
             "precision",
-            Outcome::Pass,
+            Outcome::NotApplicable,
             frac(tp, total_findings),
             serde_json::json!({ "tp": tp, "findings": total_findings }),
         ));
         rows.push(row(
             "anchor_rate",
-            Outcome::Pass,
+            Outcome::NotApplicable,
             frac(anchors_ok, bugs_caught),
             serde_json::json!({ "anchored": anchors_ok, "caught": bugs_caught }),
         ));
@@ -873,16 +879,19 @@ fn write_scores_artifact(
         n_ctx: None,
     };
     let rows = build_score_rows(scored, meta, &artifact);
-    let ts_unix = SystemTime::now()
+    // Millis granularity so two runs in the same second can't collide on
+    // the run id / default dir (review-QA on #1200); ts is RFC3339 per the
+    // schema's contract.
+    let ts_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_millis())
         .unwrap_or(0);
     let machine_id = darkmux_types::config_access::machine_id()
         .unwrap_or_else(|| "(unknown)".to_string());
     let doc = scores::ScoresDoc::new(
         scores::RunProvenance {
-            run_id: format!("review-bench-{ts_unix}"),
-            ts: ts_unix.to_string(),
+            run_id: format!("review-bench-{ts_ms}"),
+            ts: darkmux_flow::ts_utc_now(),
             machine: scores::MachineFingerprint::detect(&machine_id),
             profile: opts.profile_name.clone(),
             ..Default::default()
@@ -893,7 +902,7 @@ fn write_scores_artifact(
         Some(p) => p.clone(),
         None => super::paths::resolve(super::paths::ResolveScope::Auto)
             .runs
-            .join(format!("review-bench-{ts_unix}"))
+            .join(format!("review-bench-{ts_ms}"))
             .join("scores.json"),
     };
     scores::write_scores(&path, &doc)?;

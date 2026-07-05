@@ -478,6 +478,7 @@ dependencies = [
  "blake3",
  "darkmux-crew",
  "darkmux-eureka",
+ "darkmux-flow",
  "darkmux-hardware",
  "darkmux-profiles",
  "darkmux-types",

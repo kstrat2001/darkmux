@@ -58,6 +58,10 @@ pub enum Outcome {
     /// The harness failed the model: watchdog kill, timeout, load failure,
     /// endpoint unreachable. Excluded from capability aggregation.
     InfraFail,
+    /// The row is not a pass/fail observation (an aggregate rate row) — a
+    /// naive `count(outcome == pass)` must not be polluted by aggregates
+    /// (review-QA finding on #1200).
+    NotApplicable,
 }
 
 /// What capability scores attach to. `backend` is part of the key — an MLX
@@ -214,6 +218,12 @@ pub struct ScoreRow {
 }
 
 /// The per-run document: one `scores.json`.
+///
+/// Lenient-read holds at EVERY level (serde ignores unknown fields by
+/// default; no `deny_unknown_fields` anywhere), but forward-compat
+/// PRESERVATION on a read-modify-write cycle is top-level only (`extras`) —
+/// unknown NESTED fields are dropped on rewrite. The artifact is
+/// write-once today; a future rewriting consumer must account for this.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScoresDoc {
     pub schema_version: String,
@@ -330,6 +340,32 @@ mod tests {
         let doc = read_scores(&path).unwrap();
         assert_eq!(doc.schema_version, "1.5.0");
         assert!(doc.extras.contains_key("future_top_level"));
+    }
+
+    #[test]
+    fn lenient_read_tolerates_nested_unknown_fields() {
+        // Unknown fields INSIDE provenance/machine/rows must not brick the
+        // read either (they are ignored, not preserved — documented).
+        let json = r#"{
+            "schema_version": "1.5.0",
+            "provenance": {
+                "run_id": "r", "ts": "t", "future_prov_field": true,
+                "machine": {"machine_id": "m", "future_hw_field": 9}
+            },
+            "rows": [{
+                "bench": "b", "bench_version": "1", "source": "native",
+                "family": "capability", "axis": "case",
+                "artifact": {"model": "m", "future_key_part": "x"},
+                "outcome": "pass", "trial": 0, "k": 1,
+                "future_row_field": [1, 2]
+            }]
+        }"#;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("scores.json");
+        std::fs::write(&path, json).unwrap();
+        let doc = read_scores(&path).unwrap();
+        assert_eq!(doc.rows.len(), 1);
+        assert_eq!(doc.rows[0].artifact.model, "m");
     }
 
     #[test]
