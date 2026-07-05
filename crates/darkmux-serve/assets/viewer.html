@@ -230,6 +230,22 @@
   .rr .rrtime{flex-shrink:0;color:var(--amber-dim)}
   .rrmore{max-width:920px;text-align:center;padding:8px;cursor:pointer;font:11px 'JetBrains Mono',monospace;color:var(--amber);border-bottom:1px solid var(--line)}
   .rrmore:hover{background:var(--bg2)}
+  /* New-run affordances: a row's first render slides in with a settle flash
+     (one tick only — the live stage rebuilds ~1/sec, so the class is applied
+     ONLY on the render where the run first appears; later rebuilds recreate
+     the element without it and the animation can't replay). A dimmer accent
+     bar marks rows younger than a minute so "what just landed" survives past
+     the animation. Growing per-day ordinal (#N) gives every row a stable,
+     scannable identity — newest = highest, numbers don't shift as new runs
+     prepend. */
+  .rr .rrord{flex-shrink:0;color:var(--muted);min-width:38px;text-align:right}
+  .rr.rrfresh>summary{box-shadow:inset 3px 0 0 var(--green,#4ade80)}
+  .rr.rrfresh .rrord{color:var(--green,#4ade80)}
+  @keyframes rrslide{from{opacity:0;transform:translateY(-7px)}to{opacity:1;transform:none}}
+  @keyframes rrflash{from{background:rgba(74,222,128,.16)}to{background:transparent}}
+  .rr.rrnew{animation:rrslide .45s ease-out}
+  .rr.rrnew>summary{animation:rrflash 1.4s ease-out}
+  @media (prefers-reduced-motion: reduce){.rr.rrnew,.rr.rrnew>summary{animation:none}}
   .rr>summary .pill{margin-top:0;flex-shrink:0;min-width:62px;text-align:center}
   .rrdetail{padding:4px 10px 12px 22px;font:11px 'JetBrains Mono',monospace;color:var(--muted)}
   .rrdetail .kv{display:flex;gap:10px;margin-top:4px}
@@ -1295,13 +1311,34 @@ function renderFleet(){
     : `<div class="fleettl"><div class="tlempty">waiting for the first flow record…</div></div>`;
   $("stage").innerHTML=savingsHero()+`<div class="fleet">${cards}</div>`+tl;
 }
-// (#691) One expandable row in the recent-runs LIST. Collapsed: status · role ·
-// model · mission · completed-time/duration · turns/tools — scannable, so the
-// operator can tell runs apart. Expanded (<details>, no JS state, survives
-// re-render): the full dispatch info — the start "brief" (runtime/image/prompt/
-// workspace), the terminal result (loud on kill/error), counts, timing, and a
-// drill link. Built from the rich fields the nodeObjs map attached.
-function recentRow(n){
+// New-run tracking for the recent-runs list. Keyed per machine so switching
+// machines starts a fresh baseline; the FIRST paint of a machine marks every
+// existing row as already-seen (ts 0 → no animation, no accent) so entering
+// the view doesn't fire a wall of slide-ins. A run's first-seen timestamp
+// drives two affordances with different lifetimes: the slide-in class (only
+// the single render tick where the run first appears — the wholesale ~1/sec
+// stage rebuild would otherwise replay the animation forever) and the fresh
+// accent bar (any render within 60s of first sight).
+const RECENT_SEEN=new Map(); let RECENT_SEEN_KEY=null;
+function recentFreshCls(sid,firstPaint){
+  const now=Date.now();
+  let ts=RECENT_SEEN.get(sid);
+  const isNew=ts===undefined;
+  if(isNew){ts=firstPaint?0:now;RECENT_SEEN.set(sid,ts);}
+  if(!ts)return '';
+  const age=now-ts;
+  return (isNew?' rrnew':'')+(age<60000?' rrfresh':'');
+}
+// (#691) One expandable row in the recent-runs LIST. Collapsed: ordinal ·
+// status · role · model · mission · completed-time/duration · turns/tools —
+// scannable, so the operator can tell runs apart. `ord` is the run's per-day
+// ordinal (newest = highest, matching the "N today" count; stable as new runs
+// prepend). `freshCls` carries the new-run animation/accent classes. Expanded
+// (<details>, no JS state, survives re-render): the full dispatch info — the
+// start "brief" (runtime/image/prompt/workspace), the terminal result (loud
+// on kill/error), counts, timing, and a drill link. Built from the rich
+// fields the nodeObjs map attached.
+function recentRow(n,ord,freshCls){
   const dur=(n.closeTs!=null&&n.startTs!=null)?fmt(n.closeTs-n.startTs):null;
   const dp=n.donePayload||{}, sp=n.startPayload||{};
   const turns=dp.total_turns, tools=dp.total_tools, comps=dp.total_compactions;
@@ -1332,7 +1369,7 @@ function recentRow(n){
     toks!=null?kv('tokens',`${fmtN(toks)} total · ${fmtN(dp.prompt_tokens||0)} read · ${fmtN(dp.completion_tokens||0)} generated`):'',
     kv('timing',timing),
   ].filter(Boolean).join("");
-  return `<details class="rr" data-expand="recent:${esc(n.sid)}"${state.expanded.has("recent:"+n.sid)?" open":""}><summary><span class="pill ${n.pill}">${n.lbl}</span>`
+  return `<details class="rr${freshCls||''}" data-expand="recent:${esc(n.sid)}"${state.expanded.has("recent:"+n.sid)?" open":""}><summary>${ord!=null?`<span class="rrord">#${esc(ord)}</span>`:''}<span class="pill ${n.pill}">${n.lbl}</span>`
     +`<span class="rrmain">${esc(n.handle)} · ${esc(n.model)}${miss}</span>`
     +`${metaBits?`<span class="rrmeta">${metaBits}</span>`:''}`
     +`<span class="rrtime">${when}${dur?' · '+dur:''}</span></summary>`
@@ -1465,12 +1502,20 @@ function renderMachine(){
     const running=nodeObjs.filter(n=>n.cls==='run').map(n=>n.html).join("");
     const recentObjs=nodeObjs.filter(n=>n.cls!=='run').sort(byRecent);
     const recentCount=recentObjs.length;
+    // New-run baseline: first paint of a machine seeds the seen-set silently
+    // (no wall of slide-ins on entry); runs appearing on LATER renders are
+    // genuinely new and animate in.
+    const seenKey=nameOf(m);
+    const firstPaint=RECENT_SEEN_KEY!==seenKey;
+    if(firstPaint){RECENT_SEEN.clear();RECENT_SEEN_KEY=seenKey;}
     // (#691) Cap the list — a busy machine accumulates unbounded completed runs,
     // so show the newest RECENT_CAP by default with a show-all/fewer toggle
     // rather than an ever-growing scroll. state.recentAll persists across live
     // re-renders; reset on machine entry (drillMachine).
     const shown=state.recentAll?recentObjs:recentObjs.slice(0,RECENT_CAP);
-    const recent=shown.map(recentRow).join("");
+    // Per-day ordinal: newest-first list, so row i is run #(count - i) of the
+    // day — the growing identifier that keeps visually-identical rows apart.
+    const recent=shown.map((n,i)=>recentRow(n,recentCount-i,recentFreshCls(n.sid,firstPaint))).join("");
     const more=recentCount>RECENT_CAP
       ? `<div class="rrmore" data-act="recentall">${state.recentAll?'show fewer':`show all ${recentCount} →`}</div>`
       : '';
