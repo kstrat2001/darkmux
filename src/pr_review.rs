@@ -241,19 +241,34 @@ fn extract_freeform_review(reply: &str) -> Option<ReviewDoc> {
         s = s.trim_start_matches('#').trim_start();
         s.trim_start_matches("**").trim_start()
     }
+    // A marker keyword must end at a word boundary — "CONSIDERED
+    // alternatives…" as a body line must not phantom-split a finding
+    // (review-QA finding on this PR).
+    fn strip_keyword<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
+        let rest = s.strip_prefix(kw)?;
+        match rest.chars().next() {
+            Some(c) if c.is_ascii_alphanumeric() => None,
+            _ => Some(rest),
+        }
+    }
     fn marker_severity(line: &str) -> Option<(&'static str, &str)> {
         let s = undress(line);
-        if let Some(rest) = s.strip_prefix("MUST FIX") {
+        if let Some(rest) = strip_keyword(s, "MUST FIX") {
             return Some(("high", rest));
         }
-        if let Some(rest) = s.strip_prefix("CONSIDER") {
+        if let Some(rest) = strip_keyword(s, "CONSIDER") {
             return Some(("medium", rest));
         }
         None
     }
     fn verdict_of(line: &str) -> Option<String> {
         let s = undress(line);
-        let rest = s.strip_prefix("VERDICT")?;
+        // Case-insensitive keyword ("Verdict: pass" is common English title
+        // case); the first 7 bytes are only sliced when they are ASCII.
+        let rest = match s.as_bytes().get(..7) {
+            Some(head) if head.eq_ignore_ascii_case(b"VERDICT") => &s[7..],
+            _ => return None,
+        };
         let rest = rest.trim_start_matches("**");
         let rest = rest.trim_start_matches(':').trim().to_ascii_lowercase();
         if rest.starts_with("flag") {
@@ -264,25 +279,37 @@ fn extract_freeform_review(reply: &str) -> Option<ReviewDoc> {
             None
         }
     }
-    // Marker-line remainder → ([path], `anchor`) — both optional.
-    fn path_and_anchor(rest: &str) -> (Option<String>, Option<String>) {
+    // Marker-line remainder → ([path], `anchor`, leftover prose). The
+    // leftover seeds the finding body so an inline-colon style
+    // ("MUST FIX: reason on the same line") keeps its substance instead of
+    // discarding it (review-QA finding on this PR).
+    fn path_and_anchor(rest: &str) -> (Option<String>, Option<String>, String) {
         let path = rest.find('[').and_then(|s| {
             rest[s + 1..]
                 .find(']')
                 .map(|e| rest[s + 1..s + 1 + e].trim().to_string())
         });
-        let after_bracket = match rest.find(']') {
-            Some(e) if rest.find('[').is_some_and(|s| s < e) => &rest[e + 1..],
-            _ => rest,
+        let (pre_bracket, after_bracket) = match (rest.find('['), rest.find(']')) {
+            (Some(s), Some(e)) if s < e => (&rest[..s], &rest[e + 1..]),
+            _ => ("", rest),
         };
-        let anchor = after_bracket.find('`').and_then(|s| {
-            after_bracket[s + 1..]
-                .find('`')
-                .map(|e| after_bracket[s + 1..s + 1 + e].to_string())
-        });
+        let (anchor, post_anchor) = match after_bracket.find('`') {
+            Some(s) => match after_bracket[s + 1..].find('`') {
+                Some(e) => (
+                    Some(after_bracket[s + 1..s + 1 + e].to_string()),
+                    format!("{}{}", &after_bracket[..s], &after_bracket[s + 2 + e..]),
+                ),
+                None => (None, after_bracket.to_string()),
+            },
+            None => (None, after_bracket.to_string()),
+        };
+        let leftover = format!("{pre_bracket}{post_anchor}")
+            .trim_matches([':', '—', '-', '*', ' '])
+            .to_string();
         (
             path.filter(|p| !p.is_empty()),
             anchor.filter(|a| !a.trim().is_empty()),
+            leftover,
         )
     }
 
@@ -320,8 +347,12 @@ fn extract_freeform_review(reply: &str) -> Option<ReviewDoc> {
             verdict = Some(v);
         } else if let Some((sev, rest)) = marker_severity(line) {
             flush(&mut current, &mut findings);
-            let (path, anchor) = path_and_anchor(rest);
-            current = Some((sev.to_string(), path, anchor, Vec::new()));
+            let (path, anchor, leftover) = path_and_anchor(rest);
+            let mut body = Vec::new();
+            if !leftover.is_empty() {
+                body.push(leftover);
+            }
+            current = Some((sev.to_string(), path, anchor, body));
         } else if let Some((_, _, _, body)) = current.as_mut() {
             body.push(line.to_string());
         } else if !line.trim().is_empty() {
@@ -938,6 +969,47 @@ mod tests {
         let rv = r.review.unwrap();
         assert_eq!(rv["comments"].as_array().unwrap().len(), 1);
         assert!(rv["body"].as_str().unwrap().contains("Verdict: flag"));
+    }
+
+    #[test]
+    fn freeform_inline_colon_marker_keeps_its_body() {
+        // "MARKER: reason on the same line" is a common natural style; the
+        // reason must survive as the finding body, not be discarded.
+        let reply = "MUST FIX: this shadows the config default on the fallback path\n\nVERDICT: flag\n";
+        let r = render(&env(reply), DIFF);
+        let body = r.review.unwrap()["body"].as_str().unwrap().to_string();
+        assert!(
+            body.contains("shadows the config default"),
+            "inline reason must survive: {body}"
+        );
+    }
+
+    #[test]
+    fn freeform_verdict_is_case_insensitive() {
+        let r = render(&env("Looks good overall.\n\nVerdict: pass\n"), DIFF);
+        assert_eq!(r.mode, "review", "title-case Verdict must still claim the reply");
+        assert!(r.review.unwrap()["body"]
+            .as_str()
+            .unwrap()
+            .contains("Verdict: pass"));
+    }
+
+    #[test]
+    fn freeform_marker_keyword_needs_a_word_boundary() {
+        // A body line starting "CONSIDERED…" must not phantom-split the
+        // finding, and "MUST FIXES…" at line start is not a marker.
+        let reply = "MUST FIX [src/x.ts] `const b = 2;`\n\
+            CONSIDERED alternatives were rejected because the default is load-bearing.\n\
+            MUST FIXES of this class usually hide in the fallback path.\n\
+            \n\
+            VERDICT: flag\n";
+        let r = render(&env(reply), DIFF);
+        let rv = r.review.unwrap();
+        let comments = rv["comments"].as_array().unwrap();
+        assert_eq!(comments.len(), 1, "exactly one finding, not phantom-split");
+        let body = comments[0]["body"].as_str().unwrap();
+        assert!(body.contains("CONSIDERED alternatives"), "{body}");
+        assert!(body.contains("MUST FIXES of this class"), "{body}");
     }
 
     // ─── #1113: footer attribution ─────────────────────────────────────
