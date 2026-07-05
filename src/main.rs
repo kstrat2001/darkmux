@@ -403,6 +403,12 @@ enum PrReviewCmd {
         /// Write the payload JSON to this file instead of stdout.
         #[arg(long)]
         emit: Option<std::path::PathBuf>,
+        /// (#1113) Attribution text for the posted footer. The default claims
+        /// "running on a local model (no cloud API)" — pass the truthful line
+        /// when the dispatch routed elsewhere (e.g. a remote paid endpoint).
+        /// The workflow knows where the model ran; darkmux doesn't guess.
+        #[arg(long)]
+        attribution: Option<String>,
     },
 }
 
@@ -2901,8 +2907,8 @@ fn human_gb(bytes: u64) -> String {
 
 fn cmd_pr_review(sub: PrReviewCmd) -> Result<i32> {
     match sub {
-        PrReviewCmd::Render { envelope, diff, emit } => {
-            pr_review::cmd_render(&envelope, &diff, emit.as_ref())
+        PrReviewCmd::Render { envelope, diff, emit, attribution } => {
+            pr_review::cmd_render(&envelope, &diff, emit.as_ref(), attribution.as_deref())
         }
     }
 }
