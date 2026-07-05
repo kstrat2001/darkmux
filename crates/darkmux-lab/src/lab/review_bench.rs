@@ -129,7 +129,7 @@ pub struct Finding {
     pub title: String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize)]
 pub struct CaseScore {
     pub verdict: String,
     pub findings: usize,
@@ -169,6 +169,9 @@ pub struct ReviewBenchOpts {
     pub profile_name: Option<String>,
     pub config_path: Option<String>,
     pub timeout_seconds: u32,
+    /// (#1198) Where to write the scores.json artifact. `None` = the default
+    /// location under the runs dir (`review-bench-<unix-ts>/scores.json`).
+    pub scores_out: Option<PathBuf>,
 }
 
 pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
@@ -187,10 +190,12 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
     );
     println!("{:<34}{:<7}{:<7}{:<4}outcome", "case", "kind", "verd", "f");
     let mut scored: Vec<(&Case, CaseScore)> = Vec::new();
+    let mut meta: Vec<EnvelopeMeta> = Vec::new();
     for c in &cases {
         let prompt = build_prompt(c);
         let stdout = dispatch_case(&prompt, &c.id, &opts)
             .with_context(|| format!("dispatching case {}", c.id))?;
+        meta.push(envelope_meta(&stdout));
         let review = parse_review(&extract_reply_text(&stdout));
         let s = score(&c.label, &review);
         println!(
@@ -204,6 +209,13 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
         scored.push((c, s));
     }
     print_summary(&scored, &opts);
+    // (#1198) Persist the run as a scores.json artifact — the bench suite's
+    // dual-key score substrate (#1197). Failure to persist is a WARNING, not
+    // a bench failure: the operator already has the stdout report.
+    match write_scores_artifact(&scored, &meta, &opts) {
+        Ok(path) => eprintln!("scores: {}", path.display()),
+        Err(e) => eprintln!("scores: WARNING — artifact not written: {e:#}"),
+    }
     Ok(())
 }
 
@@ -707,6 +719,196 @@ fn print_summary(scored: &[(&Case, CaseScore)], opts: &ReviewBenchOpts) {
     }
 }
 
+// ─── #1198: scores.json emission ────────────────────────────────────────
+
+/// Per-dispatch metadata pulled from the `--json` envelope (best-effort —
+/// the score math never depends on it, only the artifact's provenance).
+#[derive(Debug, Default, Clone)]
+pub(crate) struct EnvelopeMeta {
+    pub model: Option<String>,
+    pub total_tokens: Option<u64>,
+}
+
+/// Parse the dispatch envelope (the last stdout line starting with `{` —
+/// tolerant of pull-progress noise ahead of it, unlike `extract_reply_text`
+/// which parses the whole stdout as one JSON value) for `metrics.model` +
+/// token totals. The envelope is compact single-line JSON, so a reply-
+/// internal brace can never appear as its own stdout line.
+pub(crate) fn envelope_meta(stdout: &str) -> EnvelopeMeta {
+    let candidate = stdout
+        .lines()
+        .rev()
+        .find(|l| l.trim_start().starts_with('{'))
+        .unwrap_or(stdout);
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(candidate.trim()) else {
+        return EnvelopeMeta::default();
+    };
+    let m = v.get("metrics").cloned().unwrap_or(serde_json::Value::Null);
+    let total = m
+        .get("total_tokens")
+        .and_then(|t| t.as_u64())
+        .or_else(|| {
+            let p = m.get("prompt_tokens").and_then(|t| t.as_u64());
+            let c = m.get("completion_tokens").and_then(|t| t.as_u64());
+            match (p, c) {
+                (Some(p), Some(c)) => Some(p + c),
+                _ => None,
+            }
+        });
+    EnvelopeMeta {
+        model: m.get("model").and_then(|s| s.as_str()).map(str::to_string),
+        total_tokens: total,
+    }
+}
+
+/// Build the run's score rows: one capability row per case, plus the
+/// corpus-wide aggregates the summary prints (recall / precision / anchor
+/// rate on the multi-finding schema; clean-pass + legacy recall otherwise).
+/// Pure — unit-testable without dispatching.
+pub(crate) fn build_score_rows(
+    scored: &[(&Case, CaseScore)],
+    meta: &[EnvelopeMeta],
+    artifact: &super::scores::ArtifactKey,
+) -> Vec<super::scores::ScoreRow> {
+    use super::scores::{Outcome, ScoreFamily, ScoreRow};
+    let row = |axis: &str, outcome: Outcome, value: Option<f64>, detail: serde_json::Value| ScoreRow {
+        bench: "review-bench".into(),
+        bench_version: "1".into(),
+        source: "native".into(),
+        family: ScoreFamily::Capability,
+        axis: axis.to_string(),
+        artifact: artifact.clone(),
+        outcome,
+        value,
+        trial: 0,
+        k: 1,
+        tokens_to_solution: None,
+        seconds_per_token: None,
+        budget_turns: None,
+        budget_tokens: None,
+        detail,
+    };
+
+    let mut rows = Vec::new();
+    for (i, (c, s)) in scored.iter().enumerate() {
+        // A degenerate review (empty/unparseable) is a CAPABILITY failure —
+        // the dispatch ran; the model failed the contract. (A dispatch that
+        // never ran bails the bench before scoring, so no infra rows here
+        // yet — per-case infra tolerance is #1199-adjacent follow-up.)
+        let outcome = if s.degenerate || !s.correct {
+            Outcome::CapabilityFail
+        } else {
+            Outcome::Pass
+        };
+        let mut r = row(
+            "case",
+            outcome,
+            Some(if s.correct { 1.0 } else { 0.0 }),
+            serde_json::json!({ "case": c.id, "kind": c.label.kind, "score": s }),
+        );
+        r.tokens_to_solution = meta.get(i).and_then(|m| m.total_tokens);
+        rows.push(r);
+    }
+
+    let clean: Vec<&CaseScore> = scored
+        .iter()
+        .filter(|(c, _)| c.label.kind == "clean")
+        .map(|(_, s)| s)
+        .collect();
+    let clean_pass = clean.iter().filter(|s| s.correct).count();
+    // Clean-only fp here so this row's detail agrees with the printed
+    // "clean: X/Y pass · Z false positives" line (review-QA on #1200);
+    // corpus-wide fp lives on the `precision` row.
+    let clean_fp: usize = clean.iter().map(|s| s.fp).sum();
+    let fp_total: usize = scored.iter().map(|(_, s)| s.fp).sum();
+    let frac = |num: usize, den: usize| -> Option<f64> {
+        (den > 0).then(|| num as f64 / den as f64)
+    };
+    rows.push(row(
+        "clean_pass_rate",
+        Outcome::NotApplicable,
+        frac(clean_pass, clean.len()),
+        serde_json::json!({ "passed": clean_pass, "clean_cases": clean.len(), "false_positives": clean_fp }),
+    ));
+
+    if scored.iter().any(|(c, _)| c.label.uses_multi()) {
+        let expected_bugs: usize = scored.iter().map(|(_, s)| s.expected_bugs).sum();
+        let bugs_caught: usize = scored.iter().map(|(_, s)| s.bugs_caught).sum();
+        let tp: usize = scored.iter().map(|(_, s)| s.tp).sum();
+        let total_findings = tp + fp_total;
+        let anchors_ok: usize = scored.iter().map(|(_, s)| s.anchors_ok).sum();
+        rows.push(row(
+            "recall",
+            Outcome::NotApplicable,
+            frac(bugs_caught, expected_bugs),
+            serde_json::json!({ "caught": bugs_caught, "expected": expected_bugs }),
+        ));
+        rows.push(row(
+            "precision",
+            Outcome::NotApplicable,
+            frac(tp, total_findings),
+            serde_json::json!({ "tp": tp, "findings": total_findings }),
+        ));
+        rows.push(row(
+            "anchor_rate",
+            Outcome::NotApplicable,
+            frac(anchors_ok, bugs_caught),
+            serde_json::json!({ "anchored": anchors_ok, "caught": bugs_caught }),
+        ));
+    }
+    rows
+}
+
+/// Assemble + write the artifact; returns the written path.
+fn write_scores_artifact(
+    scored: &[(&Case, CaseScore)],
+    meta: &[EnvelopeMeta],
+    opts: &ReviewBenchOpts,
+) -> Result<PathBuf> {
+    use super::scores;
+    // The artifact key's model: what the envelopes reported (all cases share
+    // one dispatch config; take the first reported value).
+    let model = meta
+        .iter()
+        .find_map(|m| m.model.clone())
+        .unwrap_or_else(|| "(unknown)".to_string());
+    let artifact = scores::ArtifactKey {
+        model,
+        quant: None,
+        backend: None,
+        n_ctx: None,
+    };
+    let rows = build_score_rows(scored, meta, &artifact);
+    // Millis granularity so two runs in the same second can't collide on
+    // the run id / default dir (review-QA on #1200); ts is RFC3339 per the
+    // schema's contract.
+    let ts_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let machine_id = darkmux_types::config_access::machine_id()
+        .unwrap_or_else(|| "(unknown)".to_string());
+    let doc = scores::ScoresDoc::new(
+        scores::RunProvenance {
+            run_id: format!("review-bench-{ts_ms}"),
+            ts: darkmux_flow::ts_utc_now(),
+            machine: scores::MachineFingerprint::detect(&machine_id),
+            profile: opts.profile_name.clone(),
+            ..Default::default()
+        },
+        rows,
+    );
+    let path = match &opts.scores_out {
+        Some(p) => p.clone(),
+        None => super::paths::resolve(super::paths::ResolveScope::Auto)
+            .runs
+            .join(format!("review-bench-{ts_ms}"))
+            .join("scores.json"),
+    };
+    scores::write_scores(&path, &doc)?;
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1106,5 +1308,123 @@ mod tests {
         fs::write(d.join("x.diff"), "diff --git a b\n").unwrap();
         let err = load_cases(d).unwrap_err();
         assert!(err.to_string().contains("at least one required"), "got: {err}");
+    }
+
+    // ─── #1198: scores.json emission ────────────────────────────────
+
+    #[test]
+    fn envelope_meta_extracts_model_and_tokens() {
+        let stdout = "pulling image...\n{\"result\":\"stop\",\"metrics\":{\"model\":\"m-x\",\"prompt_tokens\":100,\"completion_tokens\":25}}";
+        let m = envelope_meta(stdout);
+        assert_eq!(m.model.as_deref(), Some("m-x"));
+        assert_eq!(m.total_tokens, Some(125));
+        // Garbage stdout degrades to None, never errors.
+        let g = envelope_meta("not json at all");
+        assert!(g.model.is_none() && g.total_tokens.is_none());
+    }
+
+    #[test]
+    fn build_score_rows_maps_outcomes_and_aggregates() {
+        use crate::lab::scores::{ArtifactKey, Outcome};
+        let mk_case = |id: &str, kind: &str| Case {
+            id: id.into(),
+            label: Label {
+                kind: kind.into(),
+                intent_title: "t".into(),
+                intent_body: String::new(),
+                expect_verdict: String::new(),
+                bug_class: None,
+                anchor_contains: None,
+                expected: vec![],
+                notes: None,
+            },
+            diff: String::new(),
+        };
+        let clean_case = mk_case("c1", "clean");
+        let bug_case = mk_case("b1", "bug");
+        let clean_pass = CaseScore {
+            correct: true,
+            verdict: "pass".into(),
+            ..Default::default()
+        };
+        let bug_degenerate = CaseScore {
+            degenerate: true,
+            ..Default::default()
+        };
+        let scored: Vec<(&Case, CaseScore)> =
+            vec![(&clean_case, clean_pass), (&bug_case, bug_degenerate)];
+        let meta = vec![
+            EnvelopeMeta {
+                model: Some("m-x".into()),
+                total_tokens: Some(500),
+            },
+            EnvelopeMeta::default(),
+        ];
+        let artifact = ArtifactKey {
+            model: "m-x".into(),
+            ..Default::default()
+        };
+        let rows = build_score_rows(&scored, &meta, &artifact);
+
+        // Two per-case rows + the clean_pass_rate aggregate (no multi schema).
+        let case_rows: Vec<_> = rows.iter().filter(|r| r.axis == "case").collect();
+        assert_eq!(case_rows.len(), 2);
+        assert_eq!(case_rows[0].outcome, Outcome::Pass);
+        assert_eq!(case_rows[0].tokens_to_solution, Some(500));
+        // A degenerate review is a CAPABILITY failure (the dispatch ran).
+        assert_eq!(case_rows[1].outcome, Outcome::CapabilityFail);
+        let agg = rows.iter().find(|r| r.axis == "clean_pass_rate").unwrap();
+        assert_eq!(agg.value, Some(1.0));
+        assert!(
+            !rows.iter().any(|r| r.axis == "recall"),
+            "multi-schema aggregates only appear when the corpus uses them"
+        );
+        // Every row carries the artifact key + native source.
+        assert!(rows.iter().all(|r| r.artifact.model == "m-x" && r.source == "native"));
+    }
+
+    #[test]
+    fn build_score_rows_emits_multi_schema_aggregates() {
+        use crate::lab::scores::ArtifactKey;
+        let bug_case = Case {
+            id: "b1".into(),
+            label: Label {
+                kind: "bug".into(),
+                intent_title: "t".into(),
+                intent_body: String::new(),
+                expect_verdict: String::new(),
+                bug_class: None,
+                anchor_contains: None,
+                expected: vec![serde_json::from_str::<ExpectedFinding>(
+                    r#"{"anchor_contains":"x"}"#,
+                )
+                .unwrap()],
+                notes: None,
+            },
+            diff: String::new(),
+        };
+        let s = CaseScore {
+            expected_bugs: 2,
+            bugs_caught: 1,
+            tp: 1,
+            fp: 1,
+            anchors_ok: 1,
+            ..Default::default()
+        };
+        let scored: Vec<(&Case, CaseScore)> = vec![(&bug_case, s)];
+        let rows = build_score_rows(
+            &scored,
+            &[EnvelopeMeta::default()],
+            &ArtifactKey {
+                model: "m".into(),
+                ..Default::default()
+            },
+        );
+        let recall = rows.iter().find(|r| r.axis == "recall").unwrap();
+        assert_eq!(recall.value, Some(0.5));
+        let precision = rows.iter().find(|r| r.axis == "precision").unwrap();
+        assert_eq!(precision.value, Some(0.5)); // 1 tp / (1 tp + 1 fp)
+        let anchor = rows.iter().find(|r| r.axis == "anchor_rate").unwrap();
+        assert_eq!(anchor.value, Some(1.0));
     }
 }

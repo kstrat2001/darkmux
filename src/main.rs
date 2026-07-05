@@ -1249,6 +1249,10 @@ enum LabCmd {
         /// Per-case dispatch timeout in seconds.
         #[arg(long, default_value = "600")]
         timeout: u32,
+        /// (#1198) Where to write the scores.json artifact (default: a
+        /// `review-bench-<ts>/scores.json` under the runs dir).
+        #[arg(long = "scores-out")]
+        scores_out: Option<std::path::PathBuf>,
     },
     /// Loop lab (#986) — run ONE dispatch under a chosen harness config and
     /// classify how the loop behaved: productive / struggled / inert-false-pass
@@ -3752,12 +3756,14 @@ fn cmd_lab(sub: LabCmd) -> Result<i32> {
             profile,
             profiles,
             timeout,
+            scores_out,
         } => {
             lab::review_bench::run_review_bench(lab::review_bench::ReviewBenchOpts {
                 cases_dir: std::path::PathBuf::from(cases_dir),
                 profile_name: profile,
                 config_path: profiles,
                 timeout_seconds: timeout,
+                scores_out,
             })?;
             Ok(0)
         }

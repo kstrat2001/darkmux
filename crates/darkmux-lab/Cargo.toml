@@ -13,6 +13,9 @@ rust-version = "1.80"
 darkmux-types = { path = "../darkmux-types" }
 darkmux-crew = { path = "../darkmux-crew" }
 darkmux-eureka = { path = "../darkmux-eureka" }
+# (#1198) machine fingerprint for the scores.json fit key + RFC3339 ts.
+darkmux-flow = { path = "../darkmux-flow" }
+darkmux-hardware = { path = "../darkmux-hardware" }
 darkmux-profiles = { path = "../darkmux-profiles" }
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
