@@ -121,6 +121,18 @@ pub struct ModelEndpoint {
     /// Auth mechanics. Absent ⇒ no auth header (LMStudio local needs none).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<EndpointAuth>,
+    /// Reasoning effort requested from the endpoint (`"low"`/`"medium"`/
+    /// `"high"` — passed through verbatim as the OpenAI-form
+    /// `reasoning_effort`). Absent ⇒ the parameter is omitted and the
+    /// endpoint's own default applies. This is ARTIFACT configuration, not a
+    /// tuning nicety: gpt-5.1-class models default reasoning OFF, so a
+    /// judgment bench that omits it measures the model's reflexive mode
+    /// (first observed 2026-07-05: 64-completion-token rubber-stamp reviews).
+    /// Reasoning tokens bill INSIDE `max_completion_tokens`, so setting this
+    /// also raises the single-shot completion-cap default (4096 → 16384) —
+    /// an explicit cap still wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     /// Forward-compat overflow.
     #[serde(flatten)]
     pub extras: serde_json::Map<String, serde_json::Value>,

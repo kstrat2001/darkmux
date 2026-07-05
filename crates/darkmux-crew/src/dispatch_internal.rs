@@ -800,14 +800,21 @@ fn container_path_required(role: &crate::types::Role, force_container: bool) -> 
 }
 
 /// (#1199) The single-shot hosted request body — pure so the cap contract
-/// is unit-testable. `cap = None` keeps the historical 4096 default.
+/// is unit-testable. `cap = None` keeps the historical 4096 default —
+/// UNLESS `reasoning_effort` is set: reasoning tokens bill inside
+/// `max_completion_tokens` (Azure/OpenAI), so a 4096 cap under high effort
+/// gets consumed by invisible reasoning and returns empty content. Effort
+/// without an explicit cap therefore defaults to 16384; an explicit cap
+/// always wins (the operator may know their task is short).
 fn single_shot_body(
     model_id: &str,
     system_prompt: &str,
     message: &str,
     cap: Option<u32>,
+    reasoning_effort: Option<&str>,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let default_cap = if reasoning_effort.is_some() { 16384 } else { 4096 };
+    let mut body = serde_json::json!({
         "model": model_id,
         "messages": [
             { "role": "system", "content": system_prompt },
@@ -816,8 +823,12 @@ fn single_shot_body(
         // (#1177) `max_completion_tokens` is the Azure/OpenAI form (the primary
         // targets); an OpenAI-compat server that only accepts `max_tokens` would
         // reject it — a per-endpoint knob is a follow-up if that comes up.
-        "max_completion_tokens": cap.unwrap_or(4096),
-    })
+        "max_completion_tokens": cap.unwrap_or(default_cap),
+    });
+    if let Some(effort) = reasoning_effort {
+        body["reasoning_effort"] = serde_json::Value::String(effort.to_string());
+    }
+    body
 }
 
 /// If this dispatch's resolved model is REMOTE, return the pieces the hosted
@@ -1160,7 +1171,15 @@ fn dispatch_remote(
         }),
     );
 
-    let req_body = single_shot_body(&pm.id, system_prompt, &opts.message, opts.max_completion_tokens);
+    let req_body = single_shot_body(
+        &pm.id,
+        system_prompt,
+        &opts.message,
+        opts.max_completion_tokens,
+        pm.endpoint
+            .as_ref()
+            .and_then(|e| e.reasoning_effort.as_deref()),
+    );
 
     let t0 = SystemTime::now();
     let resp = remote_chat_completion(&url, auth.as_ref(), &req_body, opts.timeout_seconds);
@@ -3828,12 +3847,50 @@ mod tests {
 
     #[test]
     fn single_shot_body_cap_defaults_and_overrides() {
-        let default_body = single_shot_body("m", "sys", "msg", None);
+        let default_body = single_shot_body("m", "sys", "msg", None, None);
         assert_eq!(default_body["max_completion_tokens"], 4096);
-        let capped = single_shot_body("m", "sys", "msg", Some(16000));
+        let capped = single_shot_body("m", "sys", "msg", Some(16000), None);
         assert_eq!(capped["max_completion_tokens"], 16000);
         assert_eq!(capped["model"], "m");
         assert_eq!(capped["messages"][1]["content"], "msg");
+    }
+
+    /// Reasoning-effort contract: the parameter passes through verbatim, is
+    /// OMITTED entirely when unset (the endpoint's own default must apply —
+    /// sending an explicit value would pin what should float), and raises the
+    /// completion-cap default to 16384 because reasoning tokens bill inside
+    /// `max_completion_tokens` (a 4096 cap under high effort returns empty
+    /// content). An explicit cap still wins over the effort-raised default.
+    #[test]
+    fn single_shot_body_reasoning_effort_contract() {
+        let plain = single_shot_body("m", "sys", "msg", None, None);
+        assert!(
+            plain.get("reasoning_effort").is_none(),
+            "unset effort must OMIT the parameter, not send a default"
+        );
+        let effort = single_shot_body("m", "sys", "msg", None, Some("high"));
+        assert_eq!(effort["reasoning_effort"], "high");
+        assert_eq!(
+            effort["max_completion_tokens"], 16384,
+            "effort without an explicit cap must raise the default (reasoning bills inside the cap)"
+        );
+        let both = single_shot_body("m", "sys", "msg", Some(8000), Some("low"));
+        assert_eq!(both["reasoning_effort"], "low");
+        assert_eq!(both["max_completion_tokens"], 8000, "an explicit cap wins");
+    }
+
+    /// The endpoint field round-trips (a hand-written profiles file is the
+    /// operator surface for this knob).
+    #[test]
+    fn model_endpoint_reasoning_effort_round_trips() {
+        let e: darkmux_types::ModelEndpoint = serde_json::from_str(
+            r#"{"url":"https://x/v1","reasoning_effort":"high"}"#,
+        )
+        .unwrap();
+        assert_eq!(e.reasoning_effort.as_deref(), Some("high"));
+        let none: darkmux_types::ModelEndpoint =
+            serde_json::from_str(r#"{"url":"https://x/v1"}"#).unwrap();
+        assert!(none.reasoning_effort.is_none());
     }
 
     // ─── #1177: doctor --probe (probe_remote_endpoint) ─────────────────
