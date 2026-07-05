@@ -113,7 +113,7 @@ pub struct MachineFingerprint {
 
 impl MachineFingerprint {
     /// Best-effort detection: hardware via `darkmux-hardware`, OS version via
-    /// `sw_vers` (macOS), engine version via `lms version`. Every probe that
+    /// `sw_vers` (macOS), engine version via `lms --version`. Every probe that
     /// fails leaves `None` rather than erroring — a bench must never die on
     /// fingerprinting.
     pub fn detect(machine_id: &str) -> Self {
@@ -125,13 +125,15 @@ impl MachineFingerprint {
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .filter(|s| !s.is_empty());
+        // `lms --version` emits one plain line (`CLI commit: efce996`);
+        // bare `lms version` emits a multi-line ANSI-art banner, which the
+        // first tool-bench live run stored verbatim as the fingerprint.
         let engine_version = std::process::Command::new("lms")
-            .arg("version")
+            .arg("--version")
             .output()
             .ok()
             .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .filter(|s| !s.is_empty());
+            .and_then(|o| clean_engine_version(&String::from_utf8_lossy(&o.stdout)));
         Self {
             machine_id: machine_id.to_string(),
             machine_uid: darkmux_hardware::machine_uid().map(str::to_string),
@@ -144,6 +146,19 @@ impl MachineFingerprint {
             engine_version,
         }
     }
+}
+
+/// Reduce a version-command's stdout to a fingerprint-worthy string: the
+/// first non-empty line, trimmed — rejected outright if it carries ANSI
+/// escapes or is banner-length (a version string is short and plain; a
+/// styled banner means the probe hit the wrong output shape and storing it
+/// would pollute every row's provenance).
+fn clean_engine_version(raw: &str) -> Option<String> {
+    let line = raw.lines().map(str::trim).find(|l| !l.is_empty())?;
+    if line.contains('\u{1b}') || line.len() > 80 {
+        return None;
+    }
+    Some(line.to_string())
 }
 
 /// Per-run provenance shared by every row in a document.
@@ -271,6 +286,29 @@ pub fn read_scores(path: &Path) -> Result<ScoresDoc> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clean_engine_version_accepts_a_plain_line_and_rejects_banners() {
+        // The real `lms --version` shape.
+        assert_eq!(
+            clean_engine_version("CLI commit: efce996\n"),
+            Some("CLI commit: efce996".to_string())
+        );
+        // Leading blank lines tolerated.
+        assert_eq!(
+            clean_engine_version("\n  1.2.3  \n"),
+            Some("1.2.3".to_string())
+        );
+        // The `lms version` ANSI-art banner (what the first live tool-bench
+        // run stored verbatim) must be rejected, not truncated into noise.
+        assert_eq!(
+            clean_engine_version("\u{1b}[38;5;166m   __   __  ___\u{1b}[0m\nlms is LM Studio's CLI"),
+            None
+        );
+        // Banner-length plain text is still not a version string.
+        assert_eq!(clean_engine_version(&"x".repeat(120)), None);
+        assert_eq!(clean_engine_version("   \n\n"), None);
+    }
 
     fn sample_row() -> ScoreRow {
         ScoreRow {
