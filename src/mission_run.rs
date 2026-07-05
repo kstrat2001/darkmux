@@ -580,6 +580,9 @@ pub fn run(
         profile_name: None,
         // (#984) mission run uses the default registry — no --profiles-file.
         config_path: None,
+        // (#1199) Bench-only knobs; defaults preserve existing behavior.
+        force_container: false,
+        max_completion_tokens: None,
         image: image.map(String::from),
     };
     let result = fleet::dispatch_routed(opts)?;

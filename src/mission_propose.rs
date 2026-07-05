@@ -230,6 +230,9 @@ fn dispatch_compiler(input: &str, hint: Option<&str>) -> Result<String> {
         // (#984) No --profiles-file here; dispatch resolves from env > default.
         config_path: None,
         // (#703) default image.
+        // (#1199) Bench-only knobs; defaults preserve existing behavior.
+        force_container: false,
+        max_completion_tokens: None,
         image: None,
     };
     let dispatch_result = crate::fleet::dispatch_routed(opts);

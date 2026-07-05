@@ -565,6 +565,12 @@ enum CrewCmd {
         /// `--runtime openclaw` and on cross-machine `--machine` dispatch.
         #[arg(long, value_name = "TAG")]
         image: Option<String>,
+        /// (#1199) Cap the completion tokens of a single-shot hosted dispatch
+        /// (a tool-less role on a remote endpoint). Default 4096. Raise it
+        /// when a long output (e.g. a many-finding review) would truncate.
+        /// No effect on container-path dispatches (local or agentic-remote).
+        #[arg(long, value_name = "N")]
+        max_completion_tokens: Option<u32>,
     },
     /// Reconcile openclaw's `agents.list[]` with the crew role manifests.
     /// For every role with both a JSON manifest and a `.md` prompt, ensures
@@ -2939,6 +2945,7 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
             machine,
             no_wait,
             image,
+            max_completion_tokens,
         } => {
             // (#386) Resolve the message: exactly one of --message /
             // --message-from-file is present (clap enforces the xor). Read the
@@ -3008,6 +3015,11 @@ fn cmd_crew(sub: CrewCmd) -> Result<i32> {
                 profile_name: profile,
                 // (#984) No --profiles-file here; dispatch resolves env > default.
                 config_path: None,
+                // (#1199) force_container stays programmatic (bench-only);
+                // the completion cap is operator-facing for long single-shot
+                // outputs (e.g. many-finding hosted reviews).
+                force_container: false,
+                max_completion_tokens,
                 // (#703) operator-selected dispatch image; darkmux injects
                 // its runtime binary into it when it's not the default.
                 image,
