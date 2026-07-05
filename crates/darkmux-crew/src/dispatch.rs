@@ -341,6 +341,18 @@ pub struct DispatchOpts {
     /// registry's model. Set by the lab providers; `None` everywhere else
     /// preserves today's behavior (`env > default`).
     pub config_path: Option<String>,
+    /// (#1199) Force the container/agentic path even for a tool-less role
+    /// whose profile model is remote. The single-shot hosted path is a
+    /// host-side curl — no container, no trajectory, no per-turn telemetry —
+    /// so a bench comparing a local CONTAINERIZED run against a remote curl
+    /// compares different substrates. Benches set this for the consistency
+    /// guarantee; `false` everywhere else preserves the cheap path.
+    pub force_container: bool,
+    /// (#1199) Cap on the single-shot hosted path's completion tokens.
+    /// `None` → the historical 4096 default. Length-axis bench tasks would
+    /// silently truncate on remote but not local without this knob — a
+    /// fairness bug masquerading as a capability gap.
+    pub max_completion_tokens: Option<u32>,
     /// (#703) Override the Docker image the internal runtime dispatches
     /// into. `None` → the default `darkmux-runtime:latest` (slim base, the
     /// binary baked in). Set to ANY Linux image (e.g. `rust:slim`, the

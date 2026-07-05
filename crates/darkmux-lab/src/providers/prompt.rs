@@ -70,6 +70,7 @@ impl WorkloadProvider for PromptProvider {
                     &session_id,
                     loaded.manifest.workload.image.as_deref(),
                     config_path,
+                    profile_name,
                 )?
             }
             darkmux_crew::dispatch::Runtime::Openclaw => {
@@ -180,6 +181,7 @@ fn dispatch_via_internal(
     session_id: &str,
     image: Option<&str>,
     config_path: Option<&str>,
+    profile_name: &str,
 ) -> Result<(String, String, bool)> {
     use darkmux_crew::dispatch::{dispatch, DispatchOpts, Runtime};
     let opts = DispatchOpts {
@@ -202,13 +204,18 @@ fn dispatch_via_internal(
         // defaults is fine. If future prompt workloads grow multi-
         // turn, derive from profile like coding_task does.
         compaction: darkmux_crew::dispatch::CompactionDispatchArgs::default(),
-        // (#549) No `--profile` override threaded here — fall back to the
-        // registry's `default_profile` for model selection.
-        profile_name: None,
+        // (#549/#1199) Thread the RESOLVED profile name — the profile is part
+        // of the run's reproducibility key (and the scores.json artifact key),
+        // so the dispatch must name it explicitly rather than re-resolving the
+        // default. Matches coding_task's behavior.
+        profile_name: Some(profile_name.to_string()),
         // (#984) Propagate the lab `--profiles-file` so the dispatch's
         // default-profile model resolution loads from it.
         config_path: config_path.map(str::to_string),
         // (#703 Slice 4) the workload's declared image, if any.
+        // (#1199) Bench-only knobs; defaults preserve existing behavior.
+        force_container: false,
+        max_completion_tokens: None,
         image: image.map(str::to_string),
     };
     let result = dispatch(opts).context("internal-runtime dispatch via lab harness")?;

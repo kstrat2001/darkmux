@@ -790,6 +790,35 @@ fn role_wants_agentic_remote(role: &crate::types::Role) -> bool {
     !role.tool_palette.allow.is_empty()
 }
 
+/// (#1199) The container-path routing decision for a remote-brained
+/// dispatch: tools require it (#1187), and `force_container` opts in even a
+/// tool-less role so benches get ONE consistent substrate (trajectory +
+/// per-turn telemetry) regardless of where the brain runs.
+fn container_path_required(role: &crate::types::Role, force_container: bool) -> bool {
+    role_wants_agentic_remote(role) || force_container
+}
+
+/// (#1199) The single-shot hosted request body — pure so the cap contract
+/// is unit-testable. `cap = None` keeps the historical 4096 default.
+fn single_shot_body(
+    model_id: &str,
+    system_prompt: &str,
+    message: &str,
+    cap: Option<u32>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "model": model_id,
+        "messages": [
+            { "role": "system", "content": system_prompt },
+            { "role": "user", "content": message },
+        ],
+        // (#1177) `max_completion_tokens` is the Azure/OpenAI form (the primary
+        // targets); an OpenAI-compat server that only accepts `max_tokens` would
+        // reject it — a per-endpoint knob is a follow-up if that comes up.
+        "max_completion_tokens": cap.unwrap_or(4096),
+    })
+}
+
 /// If this dispatch's resolved model is REMOTE, return the pieces the hosted
 /// path needs (role, system prompt, model). `Ok(None)` ⇒ local — the caller
 /// falls through to the unchanged container path (which re-loads the role;
@@ -1130,17 +1159,7 @@ fn dispatch_remote(
         }),
     );
 
-    let req_body = serde_json::json!({
-        "model": pm.id,
-        "messages": [
-            { "role": "system", "content": system_prompt },
-            { "role": "user", "content": opts.message },
-        ],
-        // (#1177) `max_completion_tokens` is the Azure/OpenAI form (the primary
-        // targets); an OpenAI-compat server that only accepts `max_tokens` would
-        // reject it — a per-endpoint knob is a follow-up if that comes up.
-        "max_completion_tokens": 4096,
-    });
+    let req_body = single_shot_body(&pm.id, system_prompt, &opts.message, opts.max_completion_tokens);
 
     let t0 = SystemTime::now();
     let resp = remote_chat_completion(&url, auth.as_ref(), &req_body, opts.timeout_seconds);
@@ -1243,7 +1262,10 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     let remote_target = try_resolve_remote_target(&opts)?;
     let mut agentic_pm: Option<darkmux_types::ProfileModel> = None;
     if let Some((role, system_prompt, pm)) = remote_target {
-        if role_wants_agentic_remote(&role) {
+        // (#1199) `force_container` routes even a tool-less role through the
+        // container/agentic path so benches get one consistent substrate
+        // (trajectory + per-turn telemetry) regardless of where the brain is.
+        if container_path_required(&role, opts.force_container) {
             agentic_pm = Some(pm);
         } else {
             return dispatch_remote(&opts, &role, &system_prompt, &pm);
@@ -3782,6 +3804,35 @@ mod tests {
             ..Default::default()
         };
         assert!(remote.endpoint.as_ref().is_some_and(|e| e.is_remote()));
+    }
+
+    // ─── #1199: container-path routing + single-shot cap ───────────────
+
+    #[test]
+    fn container_path_required_honors_tools_and_force() {
+        // Construct via serde — Role has no Default (loader tests' pattern).
+        let tool_less: crate::types::Role = serde_json::from_str(
+            r#"{"id":"r","description":"d","tool_palette":{"allow":[],"deny":[]},"escalation_contract":"bail-with-explanation"}"#,
+        )
+        .unwrap();
+        assert!(!container_path_required(&tool_less, false));
+        assert!(
+            container_path_required(&tool_less, true),
+            "force_container routes a tool-less role through the container"
+        );
+        let mut tooled = tool_less.clone();
+        tooled.tool_palette.allow = vec!["read".into()];
+        assert!(container_path_required(&tooled, false));
+    }
+
+    #[test]
+    fn single_shot_body_cap_defaults_and_overrides() {
+        let default_body = single_shot_body("m", "sys", "msg", None);
+        assert_eq!(default_body["max_completion_tokens"], 4096);
+        let capped = single_shot_body("m", "sys", "msg", Some(16000));
+        assert_eq!(capped["max_completion_tokens"], 16000);
+        assert_eq!(capped["model"], "m");
+        assert_eq!(capped["messages"][1]["content"], "msg");
     }
 
     // ─── #1177: doctor --probe (probe_remote_endpoint) ─────────────────

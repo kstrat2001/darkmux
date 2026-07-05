@@ -851,6 +851,9 @@ fn dispatch_via_internal(
         config_path: config_path.map(str::to_string),
         // (#703 Slice 4) the workload's declared image (manifest
         // `workload.image`), injected so the agent can build/test in-sandbox.
+        // (#1199) Bench-only knobs; defaults preserve existing behavior.
+        force_container: false,
+        max_completion_tokens: None,
         image: image.map(str::to_string),
     };
     let result = dispatch(opts).context("internal-runtime dispatch via lab harness")?;

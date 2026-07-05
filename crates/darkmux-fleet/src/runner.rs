@@ -347,6 +347,9 @@ impl WorkJob {
             // (#984) Fleet-deserialized jobs don't carry a profiles-file
             // either — the runner resolves against its local registry.
             config_path: None,
+            // (#1199) Bench-only knobs; defaults preserve existing behavior.
+            force_container: false,
+            max_completion_tokens: None,
             // (#703 Slice 4) Honor the image the publisher requested (carried
             // on the WorkJob); the runner injects darkmux's binary into it.
             // `None` → the runner's default slim image.

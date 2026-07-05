@@ -346,6 +346,9 @@ fn dispatch_case(prompt: &str, case_id: &str, opts: &ReviewBenchOpts) -> Result<
         compaction: CompactionDispatchArgs::default(),
         profile_name: opts.profile_name.clone(),
         config_path: opts.config_path.clone(),
+        // (#1199) Bench-only knobs; defaults preserve existing behavior.
+        force_container: false,
+        max_completion_tokens: None,
         image: None,
     };
     let r = dispatch(d).context("pr-review-bench internal-runtime dispatch")?;
