@@ -1,0 +1,11 @@
+{
+  "workload": {
+    "id": "tool-bench",
+    "provider": "tool-bench",
+    "description": "Tool-call bench (#1196): per-axis, provenance-scored measurement of a model's ability to use its belt. The provider generates the sandbox fresh per run with run-unique DMX- tokens, dispatches one containerized task per axis (selection, arguments, chaining at several depths, recovery, termination honesty), and scores mechanically from the final answer + the trajectory. Emits scores.json (#1198). Knobs (override by copying this manifest into your workloads dir): trials = dispatches per task (pass^k substrate), chainDepths = the chaining ladder, taskTimeoutSeconds = per-dispatch cap, seed = fix the fixture for reproduction (omitted = fresh nonces every run).",
+    "role": "tool-bench",
+    "trials": 1,
+    "chainDepths": [2, 4, 6],
+    "taskTimeoutSeconds": 600
+  }
+}

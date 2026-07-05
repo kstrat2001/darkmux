@@ -26,6 +26,12 @@ const BUILTIN_ROLES: &[(&str, &str)] = &[
     // combined with tools makes the model skip tool-calling and fabricate).
     // `darkmux pr-review render` parses the markers into inline comments.
     ("pr-reviewer-agentic", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/pr-reviewer-agentic.json"))),
+    // (#1196) Tool-call bench harness role: the full runtime belt via an
+    // EXPLICIT allow-list (empty palette = whole catalog, silently — the
+    // #1197 bench-role rule) and NO output_schema (schema+tools makes the
+    // model fabricate instead of calling tools; fabrication under the
+    // freeform ANSWER:/BLOCKED: contract is what the bench measures).
+    ("tool-bench", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/tool-bench.json"))),
     ("analyst", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/analyst.json"))),
     ("voice-editor", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/voice-editor.json"))),
     ("design-reviewer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/design-reviewer.json"))),
@@ -68,6 +74,7 @@ pub(crate) const BUILTIN_ROLE_PROMPTS: &[(&str, &str)] = &[
     ("code-reviewer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/code-reviewer.md"))),
     ("pr-reviewer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/pr-reviewer.md"))),
     ("pr-reviewer-agentic", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/pr-reviewer-agentic.md"))),
+    ("tool-bench", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/tool-bench.md"))),
     ("mission-compiler", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/mission-compiler.md"))),
     ("analyst", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/analyst.md"))),
     ("design-reviewer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/design-reviewer.md"))),
@@ -726,6 +733,65 @@ mod tests {
             assert!(
                 prompt.contains(needle),
                 "pr-reviewer-agentic.md must contain {needle:?} (#1113 contract)"
+            );
+        }
+    }
+
+    /// (#1196) The tool-bench harness role's contract, pinned:
+    /// - An EXPLICIT non-empty tool allow-list. An empty palette makes the
+    ///   dispatch path expose the runtime's FULL catalog silently
+    ///   (`compute_runtime_allowed_tools` returns `None`) — a bench role must
+    ///   never rely on that, per the #1197 bench-role rule. The list must
+    ///   cover the whole belt the bench measures (read brings search; exec
+    ///   brings bash).
+    /// - NO `output_schema` — schema+tools makes the model skip tool-calling
+    ///   and fabricate; the ANSWER:/BLOCKED: line contract replaces it, and
+    ///   fabrication under it is exactly what the bench scores.
+    /// - SPECIALIST family — the autonomous-dispatch preamble carries the
+    ///   `BLOCKED:` escalation convention the termination axis scores
+    ///   against; a utility role would skip the preamble.
+    /// - The prompt must carry the ANSWER/BLOCKED contract, the provenance
+    ///   rule (only report tokens observed in tool results), and the
+    ///   DMX- token definition the provider's scoring parses against.
+    #[test]
+    fn tool_bench_role_contract() {
+        let role = load_roles()
+            .expect("builtin roles load")
+            .into_iter()
+            .find(|r| r.id == "tool-bench")
+            .expect("tool-bench must be embedded");
+        assert!(
+            role.output_schema.is_none(),
+            "tool-bench must NOT declare an output_schema — schema+tools makes the \
+             model fabricate instead of calling tools (#1196)"
+        );
+        for tool in ["read", "write", "edit", "exec"] {
+            assert!(
+                role.tool_palette.allow.iter().any(|t| t == tool),
+                "tool-bench palette must EXPLICITLY allow {tool:?} — the full belt, \
+                 never the empty-palette full-catalog fallback (#1197 bench-role rule)"
+            );
+        }
+        assert!(
+            role.is_specialist(),
+            "tool-bench must be a specialist role so the autonomous-dispatch preamble \
+             (the BLOCKED: escalation convention) is injected (#1196 termination axis)"
+        );
+        let prompt = BUILTIN_ROLE_PROMPTS
+            .iter()
+            .find(|(id, _)| *id == "tool-bench")
+            .map(|(_, c)| *c)
+            .expect("tool-bench prompt must be embedded");
+        for needle in [
+            "ANSWER:",
+            "BLOCKED:",
+            "DMX-",
+            "actually observed in a tool result",
+            "Never construct, guess",
+        ] {
+            assert!(
+                prompt.contains(needle),
+                "tool-bench.md must contain {needle:?} (#1196 contract)"
             );
         }
     }
