@@ -1263,8 +1263,17 @@ enum LabCmd {
         /// `MUST FIX:`/`CONSIDER:` marker lines, no JSON grammar lock) instead
         /// of the shipped grammar-constrained `pr-reviewer` — to measure
         /// whether the JSON contract itself suppresses recall.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "agentic")]
         freeform: bool,
+        /// Dispatch the `pr-reviewer-agentic` role with each case's repository
+        /// tree (at the reviewed commit) mounted as the workdir — the
+        /// production agentic condition (#1197). Requires --workdirs.
+        #[arg(long)]
+        agentic: bool,
+        /// Agentic evidence root: one subdirectory per case id holding that
+        /// case's repo tree (`git archive <commit> | tar -x -C <root>/<id>`).
+        #[arg(long, requires = "agentic")]
+        workdirs: Option<std::path::PathBuf>,
     },
     /// Loop lab (#986) — run ONE dispatch under a chosen harness config and
     /// classify how the loop behaved: productive / struggled / inert-false-pass
@@ -3776,6 +3785,8 @@ fn cmd_lab(sub: LabCmd) -> Result<i32> {
             timeout,
             scores_out,
             freeform,
+            agentic,
+            workdirs,
         } => {
             lab::review_bench::run_review_bench(lab::review_bench::ReviewBenchOpts {
                 cases_dir: std::path::PathBuf::from(cases_dir),
@@ -3783,11 +3794,14 @@ fn cmd_lab(sub: LabCmd) -> Result<i32> {
                 config_path: profiles,
                 timeout_seconds: timeout,
                 scores_out,
-                mode: if freeform {
+                mode: if agentic {
+                    lab::review_bench::BenchMode::Agentic
+                } else if freeform {
                     lab::review_bench::BenchMode::FreeForm
                 } else {
                     lab::review_bench::BenchMode::Strict
                 },
+                workdirs,
             })?;
             Ok(0)
         }

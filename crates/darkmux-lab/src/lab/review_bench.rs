@@ -180,6 +180,14 @@ pub enum BenchMode {
     #[default]
     Strict,
     FreeForm,
+    /// The production agentic condition (#1197 anchor experiment): dispatches
+    /// `pr-reviewer-agentic` — tools + the repository checked out at the
+    /// reviewed commit (per-case tree under `ReviewBenchOpts::workdirs`,
+    /// mounted as the dispatch workdir). Same freeform marker dialect, same
+    /// parser, same scorer — the ONLY variable added over `FreeForm` is
+    /// evidence access. Diff-only cells measured 0–2/18 recall across both
+    /// tiers (2026-07-05); this mode measures whether access is the lever.
+    Agentic,
 }
 
 impl BenchMode {
@@ -187,6 +195,15 @@ impl BenchMode {
         match self {
             BenchMode::Strict => "pr-reviewer",
             BenchMode::FreeForm => "pr-reviewer-freeform",
+            BenchMode::Agentic => "pr-reviewer-agentic",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            BenchMode::Strict => "strict",
+            BenchMode::FreeForm => "freeform",
+            BenchMode::Agentic => "agentic",
         }
     }
 }
@@ -200,6 +217,13 @@ pub struct ReviewBenchOpts {
     /// location under the runs dir (`review-bench-<unix-ts>/scores.json`).
     pub scores_out: Option<PathBuf>,
     pub mode: BenchMode,
+    /// Agentic mode's evidence root: a directory holding one subdirectory PER
+    /// CASE ID — the repository tree at that case's reviewed commit (built by
+    /// the operator, e.g. `git archive <commit> | tar -x`; the bench never
+    /// touches the source repos). Each case's tree mounts as the dispatch
+    /// workdir. Required when `mode == Agentic`; a case with no tree bails
+    /// the bench loudly — a half-agentic run would corrupt comparability.
+    pub workdirs: Option<PathBuf>,
 }
 
 pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
@@ -210,25 +234,51 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
             opts.cases_dir.display()
         ));
     }
+    // Agentic mode's preflight: every case must have its evidence tree BEFORE
+    // any dispatch spends tokens — a half-agentic run corrupts comparability.
+    let workdir_for = |case_id: &str| -> Option<PathBuf> {
+        opts.workdirs.as_ref().map(|root| root.join(case_id))
+    };
+    if opts.mode == BenchMode::Agentic {
+        let root = opts.workdirs.as_ref().ok_or_else(|| {
+            anyhow!("--agentic requires --workdirs <root> (one repo tree per case id)")
+        })?;
+        let missing: Vec<&str> = cases
+            .iter()
+            .filter(|c| !root.join(&c.id).is_dir())
+            .map(|c| c.id.as_str())
+            .collect();
+        if !missing.is_empty() {
+            return Err(anyhow!(
+                "agentic mode: no repo tree under {} for case(s): {} — build each with \
+                 `git archive <reviewed-commit> | tar -x -C <root>/<case-id>`",
+                root.display(),
+                missing.join(", ")
+            ));
+        }
+    }
     eprintln!(
         "pr-review-bench: {} cases · profile={} · profiles-file={} · mode={}",
         cases.len(),
         opts.profile_name.as_deref().unwrap_or("(default)"),
         opts.config_path.as_deref().unwrap_or("(registry)"),
-        if opts.mode == BenchMode::FreeForm { "freeform" } else { "strict" },
+        opts.mode.label(),
     );
     println!("{:<34}{:<7}{:<7}{:<4}outcome", "case", "kind", "verd", "f");
     let mut scored: Vec<(&Case, CaseScore)> = Vec::new();
     let mut meta: Vec<EnvelopeMeta> = Vec::new();
     for c in &cases {
         let prompt = build_prompt(c, opts.mode);
-        let stdout = dispatch_case(&prompt, &c.id, &opts)
+        let workdir = (opts.mode == BenchMode::Agentic)
+            .then(|| workdir_for(&c.id))
+            .flatten();
+        let stdout = dispatch_case(&prompt, &c.id, workdir, &opts)
             .with_context(|| format!("dispatching case {}", c.id))?;
         meta.push(envelope_meta(&stdout));
         let reply = extract_reply_text(&stdout);
         let review = match opts.mode {
             BenchMode::Strict => parse_review(&reply),
-            BenchMode::FreeForm => parse_freeform_review(&reply),
+            BenchMode::FreeForm | BenchMode::Agentic => parse_freeform_review(&reply),
         };
         let s = score(&c.label, &review);
         println!(
@@ -342,17 +392,33 @@ fn build_prompt(c: &Case, mode: BenchMode) -> String {
     };
     let instruction = match mode {
         BenchMode::Strict => "Respond per your role contract (the single JSON object).",
-        BenchMode::FreeForm => "Write your review per your role contract.",
+        BenchMode::FreeForm | BenchMode::Agentic => "Write your review per your role contract.",
+    };
+    // The evidence sentence is the mode's load-bearing difference: the
+    // diff-only modes must SAY the diff is all there is (an honest reviewer
+    // hedges unverifiable hypotheses), and the agentic mode must say the
+    // opposite — telling a tool-wearing model it "has only this diff" would
+    // fight its role's explore-before-concluding directives.
+    let evidence = match mode {
+        BenchMode::Strict | BenchMode::FreeForm => {
+            "The full diff is below; you have only this diff."
+        }
+        BenchMode::Agentic => {
+            "The full diff is below, and the repository at the reviewed commit is \
+             checked out in your working directory — read the surrounding code to \
+             verify your hypotheses before concluding."
+        }
     };
     format!(
         "PR review request: {title}\n\n\
          Description (the author's stated intent for this change):\n{body}\n\n\
          {instruction} Assess the diff \
-         against the stated intent above. The full diff is below; you have only this diff.\n\n\
+         against the stated intent above. {evidence}\n\n\
          ```diff\n{diff}\n```\n",
         title = c.label.intent_title,
         body = body,
         instruction = instruction,
+        evidence = evidence,
         diff = c.diff,
     )
 }
@@ -360,7 +426,12 @@ fn build_prompt(c: &Case, mode: BenchMode) -> String {
 /// Dispatch one case through the mode's role (`pr-reviewer` or
 /// `pr-reviewer-freeform`) on the internal runtime, returning the raw
 /// `--json` envelope stdout (parsed by `extract_reply_text`).
-fn dispatch_case(prompt: &str, case_id: &str, opts: &ReviewBenchOpts) -> Result<String> {
+fn dispatch_case(
+    prompt: &str,
+    case_id: &str,
+    workdir: Option<PathBuf>,
+    opts: &ReviewBenchOpts,
+) -> Result<String> {
     use darkmux_crew::dispatch::{dispatch, CompactionDispatchArgs, DispatchOpts, Runtime};
     let session_id = format!(
         "pr-review-bench-{}-{}",
@@ -379,7 +450,9 @@ fn dispatch_case(prompt: &str, case_id: &str, opts: &ReviewBenchOpts) -> Result<
         skip_preflight: false,
         json: true,
         watch_paths: Vec::new(),
-        workdir: None,
+        // Agentic mode mounts the case's repo tree at /workspace; diff-only
+        // modes dispatch with no workdir (a fresh tempdir).
+        workdir,
         sprint_id: None,
         runtime: Runtime::Internal,
         runtime_cmd: "openclaw".to_string(),
@@ -1024,9 +1097,7 @@ fn write_scores_artifact(
     // shares one mode.
     doc.extras.insert(
         "mode".to_string(),
-        serde_json::Value::String(
-            if opts.mode == BenchMode::FreeForm { "freeform" } else { "strict" }.to_string(),
-        ),
+        serde_json::Value::String(opts.mode.label().to_string()),
     );
     let path = match &opts.scores_out {
         Some(p) => p.clone(),
@@ -1134,6 +1205,74 @@ mod tests {
         assert!(!parse_review("").parsed);
         assert!(!parse_review("just some reasoning, no json").parsed);
         assert!(!parse_review(r#"{"summary":"thought about it"}"#).parsed);
+    }
+
+    // ── agentic mode (#1197 anchor experiment) ──
+
+    fn tiny_case() -> Case {
+        Case {
+            id: "c1".into(),
+            label: Label {
+                kind: "bug".into(),
+                intent_title: "t".into(),
+                intent_body: String::new(),
+                expect_verdict: "flag".into(),
+                bug_class: None,
+                anchor_contains: None,
+                expected: Vec::new(),
+                notes: None,
+            },
+            diff: "+ x".into(),
+        }
+    }
+
+    /// The evidence sentence is mode-load-bearing: diff-only modes must SAY
+    /// the diff is all there is; agentic mode must say the repo is checked
+    /// out (telling a tool-wearing model it "has only this diff" would fight
+    /// its explore-before-concluding role directives — and the reverse claim
+    /// on a tool-less model invites fabricated "I read the file" prose).
+    #[test]
+    fn build_prompt_evidence_sentence_matches_mode() {
+        let c = tiny_case();
+        for mode in [BenchMode::Strict, BenchMode::FreeForm] {
+            let p = build_prompt(&c, mode);
+            assert!(
+                p.contains("you have only this diff"),
+                "{mode:?} must declare diff-only evidence"
+            );
+            assert!(!p.contains("checked out in your working directory"));
+        }
+        let p = build_prompt(&c, BenchMode::Agentic);
+        assert!(p.contains("checked out in your working directory"));
+        assert!(
+            !p.contains("you have only this diff"),
+            "agentic prompt must not contradict the mounted repo"
+        );
+    }
+
+    #[test]
+    fn bench_mode_role_and_label_mapping() {
+        assert_eq!(BenchMode::Strict.role_id(), "pr-reviewer");
+        assert_eq!(BenchMode::FreeForm.role_id(), "pr-reviewer-freeform");
+        assert_eq!(BenchMode::Agentic.role_id(), "pr-reviewer-agentic");
+        assert_eq!(BenchMode::Agentic.label(), "agentic");
+    }
+
+    /// The agentic role's marker dialect (`MUST FIX [path] `anchor``) parses
+    /// through the same freeform parser — the bracket form has no colon, and
+    /// `strip_marker` tolerates that. Pins the dialect compatibility the
+    /// agentic mode depends on.
+    #[test]
+    fn freeform_parser_accepts_agentic_bracket_dialect() {
+        let r = parse_freeform_review(
+            "Traced the change.\n\n\
+             MUST FIX [app/models/billing.ts] `billingEndAt.plus({ days: 1 })`\n\
+             The boundary is off by one on the last day of the cycle.\n\n\
+             VERDICT: flag",
+        );
+        assert_eq!(r.verdict, "flag");
+        assert_eq!(r.findings.len(), 1);
+        assert!(r.findings[0].anchor.contains("billingEndAt.plus"));
     }
 
     // ── free-form parsing (#1119 free-form mode) ──
