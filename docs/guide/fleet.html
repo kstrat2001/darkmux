@@ -134,8 +134,8 @@ darkmux fleet status</code></pre>
     </ul>
     <pre><code>darkmux fleet status --deep</code></pre>
     <pre><code>MACHINE        ADDRESS                PROBE      RAM-FREE    OS              VERSION  MODELS
-laptop         100.64.1.5:8765        ✓ 23ms     78 GB       macos aarch64   1.15.0   darkmux:qwen3.6-35b-a3b-mlx
-studio         100.64.2.1:8765        ✓ 45ms     12 GB       macos aarch64   1.15.0   darkmux:qwen3-4b-instruct</code></pre>
+laptop         100.64.1.5:8765        ✓ 23ms     78 GB       macos aarch64   1.16.0   darkmux:qwen3.6-35b-a3b-mlx
+studio         100.64.2.1:8765        ✓ 45ms     12 GB       macos aarch64   1.16.0   darkmux:qwen3-4b-instruct</code></pre>
     <p>Bounded at ~1s per peer on <code>--deep</code>; degraded peers render with <code>specs?</code> rather than failing the whole command. (Only machines running a daemon, meaning Part 2 workers or the hub, appear here; Part 1 observability peers show their records in the viewer but not in this live probe.)</p>
 
     <div class="callout warn">
