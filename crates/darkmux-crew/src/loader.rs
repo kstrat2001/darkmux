@@ -21,6 +21,11 @@ const BUILTIN_ROLES: &[(&str, &str)] = &[
     // Tool-less PR reviewer for CI: reads a diff, emits cite-the-line JSON a
     // workflow posts as inline PR comments. Empty tool palette by design.
     ("pr-reviewer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/pr-reviewer.json"))),
+    // (#1113) Agentic PR reviewer: repo checked out, read/exec tools, FREEFORM
+    // marker-block output (deliberately no output_schema — a grammar lock
+    // combined with tools makes the model skip tool-calling and fabricate).
+    // `darkmux pr-review render` parses the markers into inline comments.
+    ("pr-reviewer-agentic", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/pr-reviewer-agentic.json"))),
     ("analyst", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/analyst.json"))),
     ("voice-editor", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/voice-editor.json"))),
     ("design-reviewer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/design-reviewer.json"))),
@@ -62,6 +67,7 @@ pub(crate) const BUILTIN_ROLE_PROMPTS: &[(&str, &str)] = &[
     ("scribe", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/scribe.md"))),
     ("code-reviewer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/code-reviewer.md"))),
     ("pr-reviewer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/pr-reviewer.md"))),
+    ("pr-reviewer-agentic", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/pr-reviewer-agentic.md"))),
     ("mission-compiler", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/mission-compiler.md"))),
     ("analyst", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/analyst.md"))),
     ("design-reviewer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/design-reviewer.md"))),
@@ -674,6 +680,54 @@ mod tests {
             prompt.contains("achieves its stated purpose"),
             "pr-reviewer.md must frame a correct change as one that achieves its stated purpose (#1053)"
         );
+    }
+
+    /// (#1113) The agentic PR reviewer's contract, pinned:
+    /// - NO `output_schema` on the manifest — a grammar-constrained output
+    ///   combined with tools makes the model skip tool-calling entirely and
+    ///   fabricate plausible output (verified empirically 2026-07-04). The
+    ///   freeform marker contract exists BECAUSE of that; a future edit that
+    ///   "helpfully" adds a schema back would break the role silently.
+    /// - The prompt must carry the marker + verdict-line contract the render
+    ///   verb parses, the explore-before-concluding directive (the 2-turn
+    ///   near-miss vs 5-turn access-gap-catch finding), the no-cap and
+    ///   no-self-downgrade language, and the intent-assessment directive
+    ///   (#1053, same lever as the tool-less reviewer).
+    #[test]
+    fn pr_reviewer_agentic_contract() {
+        let role = load_roles()
+            .expect("builtin roles load")
+            .into_iter()
+            .find(|r| r.id == "pr-reviewer-agentic")
+            .expect("pr-reviewer-agentic must be embedded");
+        assert!(
+            role.output_schema.is_none(),
+            "pr-reviewer-agentic must NOT declare an output_schema — schema+tools \
+             makes the model fabricate instead of exploring (#1113)"
+        );
+        assert!(
+            !role.tool_palette.allow.is_empty(),
+            "pr-reviewer-agentic must grant tools — exploration is its whole point"
+        );
+        let prompt = BUILTIN_ROLE_PROMPTS
+            .iter()
+            .find(|(id, _)| *id == "pr-reviewer-agentic")
+            .map(|(_, c)| *c)
+            .expect("pr-reviewer-agentic prompt must be embedded");
+        for needle in [
+            "MUST FIX",
+            "CONSIDER",
+            "VERDICT:",
+            "stated intent",
+            "no cap on findings",
+            "Never talk yourself out of a finding",
+            "Explore before concluding",
+        ] {
+            assert!(
+                prompt.contains(needle),
+                "pr-reviewer-agentic.md must contain {needle:?} (#1113 contract)"
+            );
+        }
     }
 
     /// (#1053 quote-resolve) The pr-reviewer prompt must instruct the model to
