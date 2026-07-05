@@ -491,10 +491,15 @@ pub fn render_with_attribution(
     // proves nothing was reviewed — degrade loudly instead of rendering a
     // green-looking clean pass. A flagging doc or any real finding is real
     // signal and never degrades.
+    // Pass-ish = anything that is not the contract's explicit "flag" token
+    // (including absent and off-contract synonyms like "passed"/"lgtm") — a
+    // zero-content review only escapes the gate by deliberately flagging
+    // (review-QA finding on this PR: matching "pass" literally let a
+    // pass-synonym verdict read as a green review with no content).
     let passish = doc
         .verdict
         .as_deref()
-        .map(|v| v.trim().eq_ignore_ascii_case("pass"))
+        .map(|v| !v.trim().eq_ignore_ascii_case("flag"))
         .unwrap_or(true);
     // (MSRV 1.80: map_or, not the 1.82 is_none_or)
     let no_summary = doc.summary.as_deref().map(str::trim).map_or(true, str::is_empty);
@@ -924,6 +929,9 @@ mod tests {
             "{\"verdict\":\"pass\",\"findings\":[]}",
             "{\"findings\":[]}",
             "{\"summary\":\"  \",\"verdict\":\"pass\",\"findings\":[]}",
+            // Off-contract pass synonyms must not slip through the gate.
+            "{\"verdict\":\"passed\",\"findings\":[]}",
+            "{\"verdict\":\"LGTM\",\"findings\":[]}",
         ] {
             let r = render(&env(reply), DIFF);
             assert_eq!(r.mode, "degraded", "must degrade: {reply}");
