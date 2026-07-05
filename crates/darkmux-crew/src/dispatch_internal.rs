@@ -435,12 +435,13 @@ pub struct DockerRunConfig {
     pub cache_dir: std::path::PathBuf,
     /// (#1187) When Some, this dispatch's "brain" is a remote OpenAI-compatible
     /// endpoint rather than local LMStudio — passed to the container as
-    /// `--chat-url`. Only ever set for a role whose tool_palette grants at
-    /// least one tool (a tool-less role stays on the light single-shot
-    /// `dispatch_remote` path instead, never reaching this struct). The URL
-    /// itself never carries a credential (auth travels in a header, not the
-    /// URL — see `remote_needs_auth`), so it's safe to include in this
-    /// `Debug`-derived, test-asserted struct.
+    /// `--chat-url`. Set for a role whose tool_palette grants at least one
+    /// tool, OR for any role when `force_container` (#1199) opts a tool-less
+    /// dispatch into the container path for bench-substrate consistency (a
+    /// tool-less role otherwise stays on the light single-shot
+    /// `dispatch_remote` path). The URL itself never carries a credential
+    /// (auth travels in a header, not the URL — see `remote_needs_auth`), so
+    /// it's safe to include in this `Debug`-derived, test-asserted struct.
     pub remote_chat_url: Option<String>,
     /// (#1187) Whether the resolved remote endpoint declares an auth mechanism.
     /// When true, `build_docker_run_argv` adds `-i` (keep stdin open) and
