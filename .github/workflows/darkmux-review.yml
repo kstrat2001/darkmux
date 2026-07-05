@@ -163,6 +163,14 @@ jobs:
             review)
               jq .review "$RUNNER_TEMP/qa/rendered.json" > "$RUNNER_TEMP/qa/review.json"
               gh api "repos/$REPO/pulls/$PR/reviews" --input "$RUNNER_TEMP/qa/review.json" ;;
+            degraded)
+              # (#1113) NO review signal (dead dispatch / empty reply /
+              # vacuous pass). Post the honest note, then FAIL this run —
+              # a produced-nothing review must never read as a green check.
+              jq -r .comment "$RUNNER_TEMP/qa/rendered.json" > "$RUNNER_TEMP/qa/comment.md"
+              gh pr comment "$PR" --repo "$REPO" --body-file "$RUNNER_TEMP/qa/comment.md"
+              echo "::error::review dispatch produced no usable review (mode=degraded)"
+              exit 1 ;;
             *)
               jq -r .comment "$RUNNER_TEMP/qa/rendered.json" > "$RUNNER_TEMP/qa/comment.md"
               gh pr comment "$PR" --repo "$REPO" --body-file "$RUNNER_TEMP/qa/comment.md" ;;

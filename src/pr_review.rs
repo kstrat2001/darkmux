@@ -11,10 +11,13 @@
 //!
 //! `darkmux pr-review render --envelope <e> --diff <d>` reads the dispatch
 //! `--json` envelope + the PR diff and emits one JSON object on stdout:
-//! `{ "mode": "review"|"comment", "review": <gh-review-payload>|null,
+//! `{ "mode": "review"|"comment"|"degraded", "review": <gh-review-payload>|null,
 //!    "comment": <markdown>|null }`. The thin workflow YAML posts it (so the
 //! operator keeps control of the model/profile, trigger, and the `gh` call);
 //! `--emit <path>` writes the object to a file instead (the escape hatch).
+//! `mode: "degraded"` (#1113) means NO review signal was produced (missing
+//! envelope, empty reply, vacuous pass) — the workflow posts the comment AND
+//! marks its check failed/neutral, never green.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer};
@@ -79,7 +82,7 @@ fn null_to_empty<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Finding>, D::Err
 
 /// What the verb emits: the posting mode + the payload for it.
 pub struct Rendered {
-    pub mode: &'static str, // "review" | "comment"
+    pub mode: &'static str, // "review" | "comment" | "degraded" (#1113: no review signal)
     pub review: Option<Value>,
     pub comment: Option<String>,
 }
@@ -423,16 +426,37 @@ fn comment_body(f: &Finding) -> String {
 
 fn comment_fallback(reply: &str, attribution: Option<&str>) -> Rendered {
     let text = reply.trim();
-    let body = if text.is_empty() {
-        "_The reviewer returned no parseable output._"
-    } else {
-        text
-    };
+    if text.is_empty() {
+        return degraded_fallback("The reviewer returned no output.", attribution);
+    }
     Rendered {
         mode: "comment",
         review: None,
         comment: Some(format!(
-            "### 🤖 darkmux PR review\n\n{body}{}",
+            "### 🤖 darkmux PR review\n\n{text}{}",
+            footer_for(attribution)
+        )),
+    }
+}
+
+/// (#1113) NO review signal — distinct from both a clean pass and a prose
+/// comment. A hard-killed dispatch (exit 137, zero tokens) used to render the
+/// same way as "clean review, no findings": a green gate that proved nothing,
+/// on a repo whose main deploys to production. `mode: "degraded"` is the
+/// machine-readable half (the workflow marks its check failed/neutral instead
+/// of green); the posted comment is the human-readable half. Cases: missing/
+/// empty envelope, an empty reply, and a vacuous structured pass (verdict
+/// pass + zero findings + no summary — the contract mandates a summary, so
+/// its absence means nothing was actually reviewed).
+fn degraded_fallback(note: &str, attribution: Option<&str>) -> Rendered {
+    Rendered {
+        mode: "degraded",
+        review: None,
+        comment: Some(format!(
+            "### 🤖 darkmux PR review — ⚠️ no review signal\n\n{note} \
+             **This is not a clean pass** — the automated reviewer produced \
+             no usable review, so this pull request has had no automated \
+             review. Human review (or a re-run) required.{}",
             footer_for(attribution)
         )),
     }
@@ -460,6 +484,31 @@ pub fn render_with_attribution(
         Some(d) => d,
         None => return comment_fallback(&reply, attribution),
     };
+
+    // (#1113) Vacuous pass: pass-shaped (or verdict-less) doc with zero
+    // findings AND no summary. The contract mandates a 1–2 sentence summary
+    // on every review, so a "pass" carrying neither findings nor summary
+    // proves nothing was reviewed — degrade loudly instead of rendering a
+    // green-looking clean pass. A flagging doc or any real finding is real
+    // signal and never degrades.
+    // Pass-ish = anything that is not the contract's explicit "flag" token
+    // (including absent and off-contract synonyms like "passed"/"lgtm") — a
+    // zero-content review only escapes the gate by deliberately flagging
+    // (review-QA finding on this PR: matching "pass" literally let a
+    // pass-synonym verdict read as a green review with no content).
+    let passish = doc
+        .verdict
+        .as_deref()
+        .map(|v| !v.trim().eq_ignore_ascii_case("flag"))
+        .unwrap_or(true);
+    // (MSRV 1.80: map_or, not the 1.82 is_none_or)
+    let no_summary = doc.summary.as_deref().map(str::trim).map_or(true, str::is_empty);
+    if doc.findings.is_empty() && passish && no_summary {
+        return degraded_fallback(
+            "The reviewer emitted an empty pass: no findings and no summary.",
+            attribution,
+        );
+    }
 
     let index = new_side_index(diff);
     let mut inline: Vec<Value> = vec![];
@@ -543,7 +592,7 @@ pub fn cmd_render(
     let envelope_text = std::fs::read_to_string(envelope).unwrap_or_default();
     let diff_text = std::fs::read_to_string(diff).unwrap_or_default();
     let rendered = if envelope_text.trim().is_empty() {
-        comment_fallback("_The review dispatch produced no envelope._", attribution)
+        degraded_fallback("The review dispatch produced no envelope.", attribution)
     } else {
         render_with_attribution(&envelope_text, &diff_text, attribution)
     };
@@ -749,17 +798,17 @@ mod tests {
 
     #[test]
     fn render_raw_json_no_fence() {
-        assert_eq!(render(&env("{\"verdict\":\"pass\",\"findings\":[]}"), DIFF).mode, "review");
+        assert_eq!(render(&env("{\"summary\":\"s\",\"verdict\":\"pass\",\"findings\":[]}"), DIFF).mode, "review");
     }
 
     #[test]
     fn render_fence_without_json_tag() {
-        assert_eq!(render(&env("```\n{\"verdict\":\"pass\",\"findings\":[]}\n```"), DIFF).mode, "review");
+        assert_eq!(render(&env("```\n{\"summary\":\"s\",\"verdict\":\"pass\",\"findings\":[]}\n```"), DIFF).mode, "review");
     }
 
     #[test]
     fn render_prose_around_json() {
-        let r = render(&env("Here is my review:\n{\"verdict\":\"pass\",\"findings\":[]}\nThanks!"), DIFF);
+        let r = render(&env("Here is my review:\n{\"summary\":\"s\",\"verdict\":\"pass\",\"findings\":[]}\nThanks!"), DIFF);
         assert_eq!(r.mode, "review");
     }
 
@@ -777,7 +826,7 @@ mod tests {
 
     #[test]
     fn render_empty_findings_is_pass_review() {
-        let rv = render(&env("{\"verdict\":\"pass\",\"findings\":[]}"), DIFF).review.unwrap();
+        let rv = render(&env("{\"summary\":\"s\",\"verdict\":\"pass\",\"findings\":[]}"), DIFF).review.unwrap();
         assert_eq!(rv["comments"].as_array().unwrap().len(), 0);
         assert!(rv["body"].as_str().unwrap().contains("0 inline, 0 general"));
     }
@@ -813,7 +862,7 @@ mod tests {
 
     #[test]
     fn render_missing_verdict_is_na_and_has_footer() {
-        let body = render(&env("{\"findings\":[]}"), DIFF).review.unwrap()["body"].as_str().unwrap().to_string();
+        let body = render(&env("{\"summary\":\"s\",\"findings\":[]}"), DIFF).review.unwrap()["body"].as_str().unwrap().to_string();
         assert!(body.contains("Verdict: n/a"));
         assert!(body.contains("dogfooding itself in public")); // FOOTER
     }
@@ -828,7 +877,9 @@ mod tests {
         std::fs::write(&diff, DIFF).unwrap();
         cmd_render(&dir.path().join("nope.json"), &diff, Some(&out), None).unwrap();
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
-        assert_eq!(v["mode"], "comment");
+        // (#1113) A missing envelope is NO review signal — degraded, not a
+        // comment a workflow could mistake for benign.
+        assert_eq!(v["mode"], "degraded");
         assert!(v["comment"].as_str().unwrap().contains("no envelope"));
     }
 
@@ -838,7 +889,7 @@ mod tests {
         let out = dir.path().join("out.json");
         let envf = dir.path().join("env.json");
         let difff = dir.path().join("d.diff");
-        std::fs::write(&envf, env("{\"verdict\":\"pass\",\"findings\":[]}")).unwrap();
+        std::fs::write(&envf, env("{\"summary\":\"s\",\"verdict\":\"pass\",\"findings\":[]}")).unwrap();
         std::fs::write(&difff, DIFF).unwrap();
         cmd_render(&envf, &difff, Some(&out), None).unwrap();
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
@@ -851,7 +902,7 @@ mod tests {
         // Some local models emit `findings: null`; coerce to [] (a clean
         // review/pass), matching the Python reference — NOT a raw-JSON comment
         // fallback. (Regression caught by the port differential QA.)
-        let r = render(&env("{\"verdict\":\"pass\",\"findings\":null}"), DIFF);
+        let r = render(&env("{\"summary\":\"s\",\"verdict\":\"pass\",\"findings\":null}"), DIFF);
         assert_eq!(r.mode, "review");
         let rv = r.review.unwrap();
         assert_eq!(rv["comments"].as_array().unwrap().len(), 0);
@@ -859,10 +910,51 @@ mod tests {
     }
 
     #[test]
-    fn render_empty_reply_is_comment_with_no_output_note() {
+    fn render_empty_reply_is_degraded_not_a_pass() {
+        // (#1113) An empty reply is NO review signal — it must not be
+        // indistinguishable from a clean review.
         let r = render(&env(""), DIFF);
-        assert_eq!(r.mode, "comment");
-        assert!(r.comment.unwrap().contains("no parseable output"));
+        assert_eq!(r.mode, "degraded");
+        let c = r.comment.unwrap();
+        assert!(c.contains("no review signal"), "{c}");
+        assert!(c.contains("not a clean pass"), "{c}");
+    }
+
+    // ─── #1113: vacuous-pass gate ──────────────────────────────────────
+
+    #[test]
+    fn vacuous_structured_pass_degrades() {
+        // pass + zero findings + no summary proves nothing was reviewed.
+        for reply in [
+            "{\"verdict\":\"pass\",\"findings\":[]}",
+            "{\"findings\":[]}",
+            "{\"summary\":\"  \",\"verdict\":\"pass\",\"findings\":[]}",
+            // Off-contract pass synonyms must not slip through the gate.
+            "{\"verdict\":\"passed\",\"findings\":[]}",
+            "{\"verdict\":\"LGTM\",\"findings\":[]}",
+        ] {
+            let r = render(&env(reply), DIFF);
+            assert_eq!(r.mode, "degraded", "must degrade: {reply}");
+            assert!(r.comment.unwrap().contains("empty pass"));
+        }
+    }
+
+    #[test]
+    fn clean_pass_with_summary_is_a_real_review() {
+        let r = render(
+            &env("{\"summary\":\"Change achieves its purpose.\",\"verdict\":\"pass\",\"findings\":[]}"),
+            DIFF,
+        );
+        assert_eq!(r.mode, "review", "a summarized clean pass is real signal");
+    }
+
+    #[test]
+    fn flag_with_findings_but_no_summary_never_degrades() {
+        // Real findings are real signal regardless of the missing summary.
+        let reply = "{\"verdict\":\"flag\",\"findings\":[{\"path\":\"src/x.ts\",\"anchor\":\"const b = 2;\",\"severity\":\"high\",\"title\":\"t\",\"detail\":\"d\",\"advice\":\"a\",\"suggestion\":null}]}";
+        let r = render(&env(reply), DIFF);
+        assert_eq!(r.mode, "review");
+        assert_eq!(r.review.unwrap()["comments"].as_array().unwrap().len(), 1);
     }
 
     // ─── #1113: freeform marker contract (pr-reviewer-agentic) ────────
@@ -1019,7 +1111,7 @@ mod tests {
         let att = "Reviewed by gpt-5.1 via Azure OpenAI on the repo's runner.";
         // Review mode.
         let r = render_with_attribution(
-            &env("{\"verdict\":\"pass\",\"findings\":[]}"),
+            &env("{\"summary\":\"s\",\"verdict\":\"pass\",\"findings\":[]}"),
             DIFF,
             Some(att),
         );
@@ -1032,7 +1124,7 @@ mod tests {
         assert!(comment.contains(att));
         assert!(!comment.contains("no cloud API"));
         // Default unchanged when no attribution given.
-        let d = render(&env("{\"verdict\":\"pass\",\"findings\":[]}"), DIFF);
+        let d = render(&env("{\"summary\":\"s\",\"verdict\":\"pass\",\"findings\":[]}"), DIFF);
         assert!(d.review.unwrap()["body"]
             .as_str()
             .unwrap()
