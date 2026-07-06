@@ -748,11 +748,14 @@ pub fn run(
             // stall-arm's pop reason: anchoring + prompt-token bloat.
             assistant_message.content = None;
         }
-        let effective_finish_reason = if salvaged_per_turn_cap {
-            "tool_calls"
-        } else {
-            finish_reason.as_str()
-        };
+        let effective_finish_reason = resolve_finish_reason(
+            finish_reason.as_str(),
+            assistant_message
+                .tool_calls
+                .as_ref()
+                .is_some_and(|t| !t.is_empty()),
+            salvaged_per_turn_cap,
+        );
 
         // Append the assistant's message to the conversation before we
         // process its tool calls — that's the order the next request
@@ -1410,6 +1413,25 @@ fn run_streaming_turn(
 /// *truncated* dump into the answer AND make the content look non-empty,
 /// disabling that recovery. The reported bug is empty content on *successful*
 /// (`stop`) terminal turns.
+/// Resolve the finish reason the loop ACTS on. Presence of tool calls is
+/// ground truth; the wire's `finish_reason` is advisory: Google's
+/// OpenAI-compat layer finishes tool-calling turns with `"stop"` (observed
+/// live 2026-07-06 on gemini-3.1-pro — the turn carried a complete tool
+/// call, the stop arm ended the dispatch at turn 1 with empty content and
+/// the tool never ran). A salvaged per-turn-cap turn (#479) also acts as
+/// tool_calls, as before.
+fn resolve_finish_reason(
+    finish_reason: &str,
+    has_tool_calls: bool,
+    salvaged_per_turn_cap: bool,
+) -> &str {
+    if salvaged_per_turn_cap || (finish_reason == "stop" && has_tool_calls) {
+        "tool_calls"
+    } else {
+        finish_reason
+    }
+}
+
 fn promote_terminal_reasoning(msg: &mut Message, finish_reason: &str) {
     let has_tools = msg.tool_calls.as_ref().is_some_and(|t| !t.is_empty());
     let content_empty = msg.content.as_deref().map_or(true, |c| c.trim().is_empty());
@@ -1692,6 +1714,24 @@ fn extract_think_blocks(content: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::lmstudio::{FunctionCall, ToolCall};
+
+    /// Google's compat layer finishes tool-calling turns with `"stop"` —
+    /// tool-call presence must override it or the tool never runs and the
+    /// dispatch ends at turn 1 with empty content (observed live 2026-07-06,
+    /// gemini-3.1-pro). A genuine stop (no tool calls) stays stop; other
+    /// reasons pass through; salvage still forces tool_calls.
+    #[test]
+    fn resolve_finish_reason_tool_presence_beats_stop() {
+        assert_eq!(resolve_finish_reason("stop", true, false), "tool_calls");
+        assert_eq!(resolve_finish_reason("stop", false, false), "stop");
+        assert_eq!(resolve_finish_reason("tool_calls", true, false), "tool_calls");
+        assert_eq!(resolve_finish_reason("length", false, false), "length");
+        // Salvage (#479) still forces tool_calls regardless.
+        assert_eq!(resolve_finish_reason("length", true, true), "tool_calls");
+        // A non-stop reason with tool calls present is NOT rewritten —
+        // the length arm's stall recovery owns that shape.
+        assert_eq!(resolve_finish_reason("length", true, false), "length");
+    }
 
     // ─── #372 T2-C: persist_structured_compaction_output ──────────
 
