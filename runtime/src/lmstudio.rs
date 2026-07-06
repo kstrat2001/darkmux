@@ -140,6 +140,17 @@ pub struct ToolCall {
     pub kind: String, // always "function" today
 
     pub function: FunctionCall,
+
+    /// Opaque vendor overflow that MUST round-trip back on the next request.
+    /// Google's thinking models attach `extra_content.google.thought_signature`
+    /// to each tool call and REJECT the follow-up turn (HTTP 400
+    /// INVALID_ARGUMENT) if it's not echoed verbatim on the assistant message
+    /// (observed live 2026-07-06, gemini-3.1-pro). Captured off the streaming
+    /// delta, stored opaquely, re-serialized unchanged. `None` (LMStudio,
+    /// Azure/OpenAI, any endpoint that doesn't use it) skips the field
+    /// entirely, so nothing else sees it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_content: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -336,17 +347,7 @@ impl LmStudioClient {
         let request = self.apply_auth_header(
             self.agent.post(&url).set("content-type", "application/json"),
         );
-        let resp = request
-            .send_json(body)
-            .map_err(|e| anyhow!("LMStudio request failed: {e}"))?;
-
-        let status = resp.status();
-        if !(200..300).contains(&status) {
-            let body = resp.into_string().unwrap_or_default();
-            return Err(anyhow!(
-                "LMStudio returned HTTP {status}: {body}"
-            ));
-        }
+        let resp = send_capturing_error(request.send_json(body), "chat")?;
 
         resp.into_json::<ChatResponse>()
             .context("parsing LMStudio chat response as JSON")
@@ -369,16 +370,7 @@ impl LmStudioClient {
                 .set("content-type", "application/json")
                 .set("accept", "text/event-stream"),
         );
-        let resp = request
-            .send_json(body)
-            .map_err(|e| anyhow!("LMStudio streaming request failed: {e}"))?;
-        let status = resp.status();
-        if !(200..300).contains(&status) {
-            let body = resp.into_string().unwrap_or_default();
-            return Err(anyhow!(
-                "LMStudio returned HTTP {status} on streaming request: {body}"
-            ));
-        }
+        let resp = send_capturing_error(request.send_json(body), "streaming")?;
         Ok(ChunkStream::new(BufReader::new(resp.into_reader())))
     }
 }
@@ -386,6 +378,30 @@ impl LmStudioClient {
 impl Default for LmStudioClient {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Turn a `ureq::send_json` result into `Result<Response>` that PRESERVES the
+/// error-response body. ureq errors on any non-2xx by default, and its
+/// `Error::Status(code, resp)` carries the body — but the `Display` shows only
+/// `"<url>: status code <n>"`, so a `.map_err(|e| ...{e})` swallows exactly the
+/// JSON detail an endpoint puts in a 400/422 (which field it rejected). Google's
+/// OpenAI-compat layer is verbose there; capturing it turned an opaque
+/// "status code 400" into an actionable message (2026-07-06). `phase` labels
+/// which call failed (chat vs streaming).
+fn send_capturing_error(
+    result: std::result::Result<ureq::Response, ureq::Error>,
+    phase: &str,
+) -> Result<ureq::Response> {
+    match result {
+        Ok(resp) => Ok(resp),
+        Err(ureq::Error::Status(code, resp)) => {
+            let body = resp.into_string().unwrap_or_default();
+            Err(anyhow!(
+                "endpoint returned HTTP {code} on {phase} request: {body}"
+            ))
+        }
+        Err(e) => Err(anyhow!("{phase} request transport failure: {e}")),
     }
 }
 
@@ -505,6 +521,11 @@ pub struct ToolCallDelta {
     pub kind: Option<String>,
     #[serde(default)]
     pub function: Option<FunctionCallDelta>,
+    /// Vendor overflow (Google's `extra_content.google.thought_signature`).
+    /// Carried on the first fragment of a call; the accumulator copies it to
+    /// the slot so it round-trips. See [`ToolCall::extra_content`].
+    #[serde(default)]
+    pub extra_content: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -588,6 +609,7 @@ impl ChunkAccumulator {
                                 name: String::new(),
                                 arguments: String::new(),
                             },
+                            extra_content: None,
                         });
                     }
                     let slot = &mut self.tool_call_slots[slot_idx];
@@ -596,6 +618,12 @@ impl ChunkAccumulator {
                     }
                     if let Some(k) = &td.kind {
                         slot.kind = k.clone();
+                    }
+                    // Opaque vendor signature (Google thought_signature) — set
+                    // once, from whichever fragment carries it; never clobber a
+                    // captured value with a later `None`.
+                    if td.extra_content.is_some() {
+                        slot.extra_content = td.extra_content.clone();
                     }
                     if let Some(f) = &td.function {
                         if let Some(n) = &f.name {
@@ -1205,6 +1233,7 @@ mod tests {
                             name: name.map(String::from),
                             arguments: args.map(String::from),
                         }),
+                        extra_content: None,
                     }]),
                     reasoning_content: None,
                 },
@@ -1212,6 +1241,51 @@ mod tests {
             }],
             usage: None,
         }
+    }
+
+    /// Google thinking-model round-trip (#1197): a streamed tool call carries
+    /// `extra_content.google.thought_signature`; the accumulator must capture
+    /// it and `into_response()` must preserve it, so re-serializing the
+    /// assistant message echoes the signature back — Google 400s the next turn
+    /// without it (observed live 2026-07-06). Endpoints that don't use it emit
+    /// no `extra_content` key at all.
+    #[test]
+    fn accumulator_preserves_and_reserializes_thought_signature() {
+        let raw = r#"{"choices":[{"delta":{"role":"assistant","tool_calls":[{"extra_content":{"google":{"thought_signature":"SIG_ABC"}},"function":{"arguments":"{\"path\":\"x.ts\"}","name":"read"},"id":"g1","type":"function"}]},"index":0}],"id":"W","object":"chat.completion.chunk"}"#;
+        let chunk: ChatChunk = serde_json::from_str(raw).unwrap();
+        let mut acc = ChunkAccumulator::new();
+        acc.ingest(&chunk);
+        let resp = acc.into_response();
+        let tc = &resp.choices[0].message.tool_calls.as_ref().unwrap()[0];
+        assert_eq!(
+            tc.extra_content
+                .as_ref()
+                .and_then(|v| v.pointer("/google/thought_signature"))
+                .and_then(|v| v.as_str()),
+            Some("SIG_ABC"),
+            "thought_signature captured onto the assembled ToolCall"
+        );
+        // Re-serializing the assistant message must echo it back.
+        let msg = &resp.choices[0].message;
+        let json = serde_json::to_value(msg).unwrap();
+        assert_eq!(
+            json.pointer("/tool_calls/0/extra_content/google/thought_signature")
+                .and_then(|v| v.as_str()),
+            Some("SIG_ABC"),
+            "signature round-trips into the outgoing request shape"
+        );
+
+        // An ordinary (LMStudio/Azure) tool call has no extra_content — the
+        // field must be ABSENT from the serialized form, not null.
+        let plain: ToolCall = serde_json::from_str(
+            r#"{"id":"c","type":"function","function":{"name":"read","arguments":"{}"}}"#,
+        )
+        .unwrap();
+        let pj = serde_json::to_value(&plain).unwrap();
+        assert!(
+            pj.get("extra_content").is_none(),
+            "no extra_content key when the endpoint doesn't use one"
+        );
     }
 
     #[test]

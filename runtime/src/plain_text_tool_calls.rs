@@ -207,6 +207,10 @@ fn apply_promotion(
                 name: block.name,
                 arguments: serde_json::Value::Object(block.arguments).to_string(),
             },
+            // A promoted plain-text call has no vendor signature — the model
+            // emitted it as text precisely because it bypassed the structured
+            // tool-call channel that would carry one.
+            extra_content: None,
         })
         .collect();
     message.tool_calls = Some(tool_calls);
@@ -978,6 +982,7 @@ mod tests {
                 name: "read".to_string(),
                 arguments: r#"{"path":"/x"}"#.to_string(),
             },
+            extra_content: None,
         }];
         let mut m = msg(
             Some("<tool_call><function=bash><parameter=command>ls</parameter></function></tool_call>"),
