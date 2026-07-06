@@ -488,8 +488,16 @@ pub struct Delta {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ToolCallDelta {
     /// Stable across all fragments of the same tool call. Use this to
-    /// route fragments into the right accumulator slot.
-    pub index: u32,
+    /// route fragments into the right accumulator slot. OPTIONAL:
+    /// OpenAI-spec streams carry it, but Google's OpenAI-compat layer
+    /// omits it entirely (each chunk delivers a complete tool call with
+    /// an `id` — observed live 2026-07-06 on gemini-3.1-pro; the
+    /// required field made every tool-calling turn from a Gemini
+    /// endpoint fail at parse, killing agentic dispatches at turn 0).
+    /// When absent, the accumulator routes by `id`, appending a new
+    /// slot for an unseen id.
+    #[serde(default)]
+    pub index: Option<u32>,
     /// Set on the first fragment for this index; absent on continuation.
     #[serde(default)]
     pub id: Option<String>,
@@ -557,7 +565,21 @@ impl ChunkAccumulator {
             }
             if let Some(tcs) = &choice.delta.tool_calls {
                 for td in tcs {
-                    let slot_idx = td.index as usize;
+                    // Slot routing: explicit `index` when the stream carries
+                    // it (OpenAI spec); else by `id` (Google's compat layer
+                    // omits index — an unseen id appends a new slot); else a
+                    // bare continuation fragment goes to the last open slot.
+                    let slot_idx = match td.index {
+                        Some(i) => i as usize,
+                        None => match &td.id {
+                            Some(id) => self
+                                .tool_call_slots
+                                .iter()
+                                .position(|s| &s.id == id)
+                                .unwrap_or(self.tool_call_slots.len()),
+                            None => self.tool_call_slots.len().saturating_sub(1),
+                        },
+                    };
                     while self.tool_call_slots.len() <= slot_idx {
                         self.tool_call_slots.push(ToolCall {
                             id: String::new(),
@@ -1157,6 +1179,17 @@ mod tests {
         name: Option<&str>,
         args: Option<&str>,
     ) -> ChatChunk {
+        tool_call_fragment_idx(Some(index), id, name, args)
+    }
+
+    /// Like `tool_call_fragment` but with an OPTIONAL index — Google's
+    /// OpenAI-compat layer omits the field entirely.
+    fn tool_call_fragment_idx(
+        index: Option<u32>,
+        id: Option<&str>,
+        name: Option<&str>,
+        args: Option<&str>,
+    ) -> ChatChunk {
         ChatChunk {
             id: "t".to_string(),
             choices: vec![ChoiceDelta {
@@ -1210,6 +1243,54 @@ mod tests {
         assert_eq!(tcs[0].id, "call_1");
         assert_eq!(tcs[0].function.name, "read");
         assert_eq!(tcs[0].function.arguments, r#"{"path":"foo"}"#);
+    }
+
+    /// Google's OpenAI-compat stream shape (observed live 2026-07-06 on
+    /// gemini-3.1-pro): tool_call deltas carry NO `index` — each chunk is a
+    /// complete call with an `id`. Route by id: unseen id → new slot; a
+    /// repeated id (defensive) → the same slot; an index-less, id-less
+    /// continuation → the last open slot. Pre-fix, the required `index`
+    /// made every Gemini tool-calling turn fail at SSE parse (dispatch
+    /// dead at turn 0).
+    #[test]
+    fn accumulator_routes_indexless_google_style_deltas_by_id() {
+        let mut acc = ChunkAccumulator::new();
+        acc.ingest(&tool_call_fragment_idx(
+            None,
+            Some("g1"),
+            Some("read"),
+            Some(r#"{"path":"a.ts"}"#),
+        ));
+        acc.ingest(&tool_call_fragment_idx(
+            None,
+            Some("g2"),
+            Some("search"),
+            Some(r#"{"pattern":"x"}"#),
+        ));
+        // id-less continuation appends to the LAST slot.
+        acc.ingest(&tool_call_fragment_idx(None, None, None, Some(" ")));
+        let resp = acc.into_response();
+        let tcs = resp.choices[0].message.tool_calls.as_ref().unwrap();
+        assert_eq!(tcs.len(), 2);
+        assert_eq!(tcs[0].id, "g1");
+        assert_eq!(tcs[0].function.name, "read");
+        assert_eq!(tcs[1].id, "g2");
+        assert_eq!(tcs[1].function.arguments, r#"{"pattern":"x"} "#);
+    }
+
+    /// The raw Google chunk JSON (with its `extra_content` overflow and no
+    /// `index`) deserializes — the exact wire shape that failed pre-fix.
+    #[test]
+    fn google_style_chunk_json_parses_without_index() {
+        let raw = r#"{"choices":[{"delta":{"role":"assistant","tool_calls":[{"extra_content":{"google":{"thought_signature":"abc"}},"function":{"arguments":"{\"path\":\"x.ts\"}","name":"read"},"id":"e5az","type":"function"}]},"index":0}],"created":1,"id":"W","model":"gemini-3.1-pro-preview","object":"chat.completion.chunk"}"#;
+        let chunk: ChatChunk = serde_json::from_str(raw).expect("Google-shaped chunk parses");
+        let tds = chunk.choices[0].delta.tool_calls.as_ref().unwrap();
+        assert_eq!(tds[0].index, None);
+        assert_eq!(tds[0].id.as_deref(), Some("e5az"));
+        assert_eq!(
+            tds[0].function.as_ref().unwrap().name.as_deref(),
+            Some("read")
+        );
     }
 
     #[test]
