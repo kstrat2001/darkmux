@@ -385,6 +385,16 @@
   .mscope{font:11px 'JetBrains Mono',monospace;color:var(--muted);margin:-8px 0 16px}
   .preview-text{color:var(--muted);font-style:italic}
   .rec.sel .preview-text{color:rgba(232,230,227,0.7)}
+  /* Per-activity glyph on each log line — scannable "what's the model doing". */
+  .aico{display:inline-flex;vertical-align:-2px;width:13px;height:13px;margin-right:2px;color:var(--muted)}
+  .aico svg{width:13px;height:13px}
+  .aico.act-tool-call{color:var(--amber)}
+  .aico.act-reasoning{color:#8ab4f8}
+  .aico.act-dispatch-start{color:#4ade80}
+  .aico.act-dispatch-end{color:#4ade80}
+  .aico.act-compaction{color:#c084fc}
+  .aico.act-routing{color:#8ab4f8}
+  .aico.act-note{color:var(--amber)}
   .detail-card{padding:14px;background:var(--bg);border:1px solid var(--line);border-radius:6px;margin-bottom:12px;font:12px/1.55 'JetBrains Mono',monospace}
   .detail-card h3{margin:0 0 10px;font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--amber)}
   .detail-card.reasoning{border-left:3px solid var(--amber)}
@@ -592,7 +602,7 @@
   <div class="modal">
     <div class="mhd"><span>filter events</span><button class="mx" data-act="closefilters">✕</button></div>
     <div id="filterbody"></div>
-    <div class="mft"><input id="fsearch" placeholder="search text…"><button class="clr" data-act="clearfilters">clear all</button></div>
+    <div class="mft"><input id="fsearch" placeholder="search text…"><button class="clr" data-act="onlymodel" title="show only reasoning, tool calls, and turns">model only</button><button class="clr" data-act="clearfilters">clear all</button></div>
   </div>
 </div>
 <div class="modalbg" id="nmodalbg">
@@ -673,7 +683,29 @@ const ICON={
   // (#1098) funnel = filter (the gear read as "settings"); clock = follow-the-
   // live-tail (real-time).
   filter:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16l-6 7.5V19l-4-2v-4.5z"/></svg>',
-  clock:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8"/><path d="M12 8v4.2l2.6 2.1"/></svg>'};
+  clock:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8"/><path d="M12 8v4.2l2.6 2.1"/></svg>',
+  // Per-activity glyphs shown inline on log lines so the operator can scan
+  // "what is the model doing" at a glance (mapped via ACT_ICON below).
+  // Wrench = tool call (the model reaching for its belt).
+  tool:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a4 4 0 0 0-5 5L4 17v3h3l5.7-5.7a4 4 0 0 0 5-5l-2.6 2.6-2.1-.5-.5-2.1z"/></svg>',
+  // Brain = reasoning (the model thinking).
+  brain:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 4A2.5 2.5 0 0 0 7 6.5 2.5 2.5 0 0 0 5 9a2.5 2.5 0 0 0 .5 4.9A2.5 2.5 0 0 0 8 18a2 2 0 0 0 4 0V4.5A2 2 0 0 0 9.5 4z"/><path d="M14.5 4A2.5 2.5 0 0 1 17 6.5 2.5 2.5 0 0 1 19 9a2.5 2.5 0 0 1-.5 4.9A2.5 2.5 0 0 1 16 18a2 2 0 0 1-4 0"/></svg>',
+  // Refresh/loop = a turn boundary.
+  turn:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 0 0-14-4.5L4 8M4 4v4h4M4 13a8 8 0 0 0 14 4.5L20 16M20 20v-4h-4"/></svg>',
+  // Play = dispatch start.
+  play:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M7 5l12 7-12 7z"/></svg>',
+  // Flag = dispatch end.
+  flag:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 21V4M5 4h11l-2 4 2 4H5"/></svg>',
+  // Compress = compaction.
+  compress:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 4v4H4M16 4v4h4M8 20v-4H4M16 20v-4h4"/></svg>',
+  // Split = a routing/tier decision.
+  route:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="19" r="2"/><circle cx="18" cy="5" r="2"/><circle cx="6" cy="5" r="2"/><path d="M6 7v4a4 4 0 0 0 4 4h6M6 17V7"/></svg>',
+  // Speech bubble = an orchestrator note.
+  note:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 15a2 2 0 0 1-2 2H8l-4 4V6a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2z"/></svg>',
+  // Pulse = telemetry (host/lms/runtime/tokens/detector).
+  pulse:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l2-6 4 12 2-6h6"/></svg>'};
+// Activity label → ICON key. Anything unmapped renders no glyph (a plain row).
+const ACT_ICON={"reasoning":"brain","tool call":"tool","turn":"turn","dispatch start":"play","dispatch end":"flag","routing":"route","compaction":"compress","note":"note","detector":"pulse","runtime":"pulse","tokens":"pulse","lms":"pulse","host telemetry":"pulse","telemetry":"pulse"};
 // Live viewer — machine form-factor lookup empty; real machines render with no icon
 // until /machine/specs/<id> wiring lands (follow-up to #624).
 const MACH_ICON={};
@@ -707,7 +739,34 @@ const escBr=s=>esc(s).replace(/\n/g,"<br>");
 // values also feed non-HTML logic (MACH_ICON key lookup, label-width math,
 // equality checks).
 const escN=m=>esc(nameOf(m));
-let tMin, tMax, missions, FCATS, FTIERS, FSRC;
+let tMin, tMax, missions, FCATS, FTIERS, FSRC, FACTS;
+// Map a record to an ACTIVITY label — a compact "what is happening" vocabulary
+// so the operator can filter the log down to just what the model is DOING
+// (reasoning / tool call / turn) vs the surrounding telemetry. Coarser than
+// the raw `action` (too many, too noisy) and cross-cuts category/source.
+function activityOf(r){
+  const a=r.action||"";
+  if(a==="dispatch.reasoning")return "reasoning";
+  if(a==="dispatch.tool")return "tool call";
+  if(a==="dispatch.turn")return "turn";
+  if(a==="dispatch.start"||a==="dispatch start")return "dispatch start";
+  if(a==="dispatch.complete"||a==="dispatch complete")return "dispatch end";
+  if(a==="tier-decision")return "routing";
+  if(a==="dispatch.compaction"||r.source==="compaction")return "compaction";
+  if(a==="flow.note"||r.source==="orchestrator"||r.source==="adjudication")return "note";
+  if(r.category==="telemetry"){
+    if(r.source==="detector")return "detector";
+    if(r.source==="tokens")return "tokens";
+    if(r.source==="process")return "host telemetry";
+    if(r.source==="lms")return "lms";
+    if(r.source==="runtime")return "runtime";
+    return "telemetry";
+  }
+  return a||"other";
+}
+// Preferred display order for the activity facet — model-doing activities
+// first (the common "what's the model up to" read), telemetry after.
+const ACT_ORDER=["reasoning","tool call","turn","dispatch start","dispatch end","routing","compaction","note","detector","runtime","tokens","lms","host telemetry","telemetry","other"];
 function recompute(){
   DATA.forEach(r=>r._id=r._uid);
   const ts=DATA.map(r=>T(r.ts)).filter(n=>!isNaN(n));
@@ -717,13 +776,15 @@ function recompute(){
   FCATS=[...new Set(DATA.map(r=>r.category))];
   FTIERS=[...new Set(DATA.map(r=>r.tier).filter(Boolean))];
   FSRC=[...new Set(DATA.map(r=>r.source).filter(Boolean))];
+  const acts=new Set(DATA.map(activityOf));
+  FACTS=ACT_ORDER.filter(a=>acts.has(a)).concat([...acts].filter(a=>!ACT_ORDER.includes(a)));
 }
 recompute();
 // (#691) Default cap on the recent-runs list (newest-first); show-all toggle
 // via state.recentAll. Keeps a busy machine's panel from scrolling unbounded.
 const RECENT_CAP=20;
 let state={level:"fleet",machine:null,session:null,missionId:null,t:tMax,playing:false,timer:null,selected:null,follow:true,speed:1,recentAll:false,activityWindowMin:1440,
-  filters:{cat:new Set(FCATS),tier:new Set(FTIERS),src:new Set(FSRC),q:""},
+  filters:{cat:new Set(FCATS),tier:new Set(FTIERS),src:new Set(FSRC),act:new Set(FACTS),q:""},
   rawOpen:false,
   // (#expand) Open-state of `<details data-expand="<key>">` blocks, keyed so it
   // survives the ~1/sec live `$("stage").innerHTML=` rebuild (which otherwise
@@ -738,6 +799,10 @@ function passesFilter(r){
   if(!state.filters.cat.has(r.category))return false;
   if(r.tier&&!state.filters.tier.has(r.tier))return false;
   if(r.source&&!state.filters.src.has(r.source))return false;
+  // Activity facet: filter by WHAT the model/runtime is doing (reasoning /
+  // tool call / turn / …). activityOf always returns a label in FACTS, so the
+  // default (all checked) passes everything.
+  if(state.filters.act&&!state.filters.act.has(activityOf(r)))return false;
   if(state.filters.q&&!JSON.stringify(r).toLowerCase().includes(state.filters.q.toLowerCase()))return false;
   return true;
 }
@@ -1956,8 +2021,10 @@ function renderLog(){
     }else if(r.action==="dispatch.start"||r.action==="dispatch start"){
       detail=` · <span class="preview-text">start (prompt: ${esc(f?f.prompt_chars:0)}ch)</span>`;
     }
+    const act=activityOf(r), ik=ACT_ICON[act];
+    const aico=ik?`<span class="aico act-${act.replace(/ /g,'-')}" title="${esc(act)}">${ICON[ik]}</span>`:'';
     return `<div class="rec ${esc(r.category)} ${r._id===state.selected?'sel':''}" data-act="rec" data-arg="${r._id}">
-      <span class="t" title="${ldt(T(r.ts))}">${tt}</span> <span class="tag">${esc(tag)}</span> ${esc(r.machine_id||'')}${r.session_id?(' · '+esc(r.session_id)):''}${detail}</div>`;
+      <span class="t" title="${ldt(T(r.ts))}">${tt}</span> ${aico}<span class="tag">${esc(tag)}</span> ${esc(r.machine_id||'')}${r.session_id?(' · '+esc(r.session_id)):''}${detail}</div>`;
   }).join(""):`<div class="empty">${state.filters.q?'no events match your search':'no events match the current filters'}</div>`;
 }
 function renderCrumb(){
@@ -1989,7 +2056,7 @@ function renderCrumb(){
   if(state.level==="subsystem") c+=`<span class="sep">›</span>${esc(state.session)}`;
   $("crumb").innerHTML=c;
 }
-function filtersActive(){return state.filters.cat.size<FCATS.length||state.filters.tier.size<FTIERS.length||state.filters.src.size<FSRC.length||!!state.filters.q;}
+function filtersActive(){return state.filters.cat.size<FCATS.length||state.filters.tier.size<FTIERS.length||state.filters.src.size<FSRC.length||state.filters.act.size<FACTS.length||!!state.filters.q;}
 function updateFbtn(){const a=filtersActive();const b=$("fbtn");b.className="fbtn"+(a?" on":"");b.innerHTML=ICON.filter+(a?'<span class="fdot">•</span>':'');b.title=a?"filters (active)":"filters";b.setAttribute("aria-label",b.title);}
 function syncTransport(){
   $("range").value=Math.round((state.t-tMin)/(tMax-tMin)*100);
@@ -2249,12 +2316,19 @@ $("play").onclick=()=>{
 function renderFilters(){
   const grp=(title,vals,k)=>`<div class="fgroup"><h4>${title}</h4>`+vals.map(v=>
     `<label><input type="checkbox" ${state.filters[k].has(v)?'checked':''} data-act="filter" data-k="${esc(k)}" data-arg="${esc(v)}"> ${esc(v)}</label>`).join("")+`</div>`;
-  $("filterbody").innerHTML=grp('category',FCATS,'cat')+grp('tier',FTIERS,'tier')+grp('telemetry source',FSRC,'src');
+  $("filterbody").innerHTML=grp('activity',FACTS,'act')+grp('category',FCATS,'cat')+grp('tier',FTIERS,'tier')+grp('telemetry source',FSRC,'src');
 }
+// Quick-set the activity facet to ONLY the model-doing events (reasoning +
+// tool calls + turns) — the "just show me what the model is doing" shortcut.
+window.onlyModelActivity=()=>{
+  const keep=new Set(["reasoning","tool call","turn"]);
+  state.filters.act=new Set(FACTS.filter(a=>keep.has(a)));
+  renderFilters();render();
+};
 window.toggleFilter=(k,v)=>{const s=state.filters[k];s.has(v)?s.delete(v):s.add(v);render();};
 window.openFilters=()=>{renderFilters();$("fsearch").value=state.filters.q;$("modalbg").style.display="flex";};
 window.closeFilters=()=>{$("modalbg").style.display="none";};
-window.clearFilters=()=>{state.filters={cat:new Set(FCATS),tier:new Set(FTIERS),src:new Set(FSRC),q:""};setQuery("");renderFilters();};
+window.clearFilters=()=>{state.filters={cat:new Set(FCATS),tier:new Set(FTIERS),src:new Set(FSRC),act:new Set(FACTS),q:""};setQuery("");renderFilters();};
 // One query, two inputs: the first-class pane search (#logq) and the modal
 // search (#fsearch) stay in sync through setQuery so either entry point filters
 // the same `state.filters.q` (full-text over each record — model, action, id…).
@@ -2297,6 +2371,7 @@ const ACTIONS={
   filters:()=>openFilters(),
   closefilters:()=>closeFilters(),
   clearfilters:()=>clearFilters(),
+  onlymodel:()=>onlyModelActivity(),
   notes:()=>openNotes(),
   closenotes:()=>closeNotes(),
   info:()=>openInfo(),
@@ -2572,7 +2647,7 @@ const LIVE_MACHINES=new Map();
 // hardcoded "resident". null until first fetched / in playback.
 let MACHINE_SPECS=null;
 let lastStageSig=null; // skip stage re-renders that would destroy clickable cards
-const SEEN={cat:new Set(),tier:new Set(),src:new Set()};  // filter values ever observed
+const SEEN={cat:new Set(),tier:new Set(),src:new Set(),act:new Set()};  // filter values ever observed
 
 // When live records introduce a category/tier/source not seen before, include it
 // in the active filter set (new = visible by default). Values the operator
@@ -2582,6 +2657,7 @@ function absorbNewFilterValues(){
   add(FCATS,SEEN.cat,state.filters.cat);
   add(FTIERS,SEEN.tier,state.filters.tier);
   add(FSRC,SEEN.src,state.filters.src);
+  add(FACTS,SEEN.act,state.filters.act);
 }
 
 function setBadges(mode,date){
@@ -2962,7 +3038,7 @@ async function boot(){
   setBadges(mode,date);
   recompute();
   state.t=tMax;
-  state.filters={cat:new Set(FCATS),tier:new Set(FTIERS),src:new Set(FSRC),q:""};
+  state.filters={cat:new Set(FCATS),tier:new Set(FTIERS),src:new Set(FSRC),act:new Set(FACTS),q:""};
   absorbNewFilterValues();
   // (#691) A mission query scopes the view to that mission (reuses the drill).
   if(cq&&cq.kind==="mission"&&RAW.length){ state.level="mission"; state.machine=null; state.session=null; state.missionId=cq.id; state.follow=true; }
