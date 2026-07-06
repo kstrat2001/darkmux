@@ -42,6 +42,22 @@ const TRAJECTORY_SUBDIR: &str = ".darkmux-runtime";
 const TRAJECTORY_FILE: &str = "trajectory.jsonl";
 const METRICS_FILE: &str = "metrics.json";
 
+/// Cap on the recorded tool-argument string. A search pattern, file path, or
+/// shell command is far under this; only a `write`/`edit` file-content arg
+/// exceeds it, and a truncated head is enough to recall what was attempted.
+const MAX_TOOL_ARGS_CHARS: usize = 512;
+
+/// Truncate to at most `max` chars on a char boundary, appending an ellipsis
+/// marker when truncation happened. Never splits a multi-byte char.
+fn cap_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
 /// The runtime's bookkeeping directory: `<RUNTIME_OUT_BASE>/<TRAJECTORY_SUBDIR>`.
 /// Both runtime write sites (trajectory/metrics in `main.rs`, structured
 /// compaction output in `loop_runner.rs`) consume this so the two can't
@@ -434,15 +450,19 @@ impl Trajectory {
         }));
     }
 
-    /// tool.completed — one per executed tool call. Records the
-    /// tool name + arg/result sizes (not the content — that can be
-    /// large; the trajectory is for shape, not for full payload).
+    /// tool.completed — one per executed tool call. Records the tool name,
+    /// the ARGUMENTS (capped — a search pattern / file path / command, so the
+    /// operator can recall WHAT the model did, not just that it did something),
+    /// and arg/result SIZES. Arguments are the small, high-value input (bounded
+    /// by `MAX_TOOL_ARGS_CHARS`); the result is kept as a size only — a file
+    /// read is large and re-derivable, so persisting it would bloat the
+    /// trajectory for no recall value.
     pub fn append_tool_completed(
         &mut self,
         seq: u32,
         tool_seq: u32,
         tool_name: &str,
-        args_chars: usize,
+        args: &str,
         result_chars: usize,
         ok: bool,
     ) {
@@ -451,11 +471,16 @@ impl Trajectory {
         // missing `ok` as success. The host-side watchdog reads it so a
         // model fast-failing with varying tool calls can't keep the
         // inactivity deadline alive with a stream of failed calls.
+        let args_chars = args.chars().count();
         self.write_event(&serde_json::json!({
             "type": "tool.completed",
             "seq": seq,
             "tool_seq": tool_seq,
             "tool_name": tool_name,
+            // The actual arguments, char-boundary-safe truncation to keep a
+            // pathological write/edit payload from bloating the trajectory
+            // (search/read/exec args are tiny; only file-content args hit this).
+            "args": cap_chars(args, MAX_TOOL_ARGS_CHARS),
             "args_chars": args_chars,
             "result_chars": result_chars,
             "ok": ok,
@@ -690,8 +715,8 @@ mod tests {
         // deadline) from a failed one (does not).
         let ws = tempfile::Builder::new().prefix("traj-test-ok").tempdir().unwrap();
         let mut t = Trajectory::open(ws.path());
-        t.append_tool_completed(1, 0, "bash", 40, 1000, true);
-        t.append_tool_completed(2, 1, "bash", 40, 80, false);
+        t.append_tool_completed(1, 0, "bash", "{\"command\":\"ls\"}", 1000, true);
+        t.append_tool_completed(2, 1, "bash", "{\"command\":\"cat x\"}", 80, false);
         drop(t);
 
         let body = fs::read_to_string(
@@ -706,6 +731,35 @@ mod tests {
         assert_eq!(lines[0]["type"], "tool.completed");
         assert_eq!(lines[0]["ok"], serde_json::json!(true));
         assert_eq!(lines[1]["ok"], serde_json::json!(false));
+        // (args capture) the actual arguments are recorded so the operator can
+        // recall WHAT the tool did, plus the char count.
+        assert_eq!(lines[0]["args"], "{\"command\":\"ls\"}");
+        assert_eq!(lines[0]["args_chars"], 16);
+    }
+
+    #[test]
+    fn tool_completed_caps_oversized_args() {
+        // A pathological write/edit file-content arg is truncated to the cap +
+        // an ellipsis marker; search/read/exec args are far under the cap and
+        // pass through whole.
+        let ws = tempfile::Builder::new().prefix("traj-test-cap").tempdir().unwrap();
+        let mut t = Trajectory::open(ws.path());
+        let big = "x".repeat(MAX_TOOL_ARGS_CHARS + 200);
+        t.append_tool_completed(1, 0, "write", &big, 0, true);
+        drop(t);
+        let line: serde_json::Value = serde_json::from_str(
+            fs::read_to_string(ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE))
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        let recorded = line["args"].as_str().unwrap();
+        assert_eq!(recorded.chars().count(), MAX_TOOL_ARGS_CHARS + 1); // cap + '…'
+        assert!(recorded.ends_with('…'));
+        // args_chars reflects the TRUE length, not the truncated one.
+        assert_eq!(line["args_chars"], (MAX_TOOL_ARGS_CHARS + 200) as u64);
     }
 
     #[test]

@@ -2782,6 +2782,11 @@ impl TailerState {
                 let payload = serde_json::json!({
                     "tool_seq": event.get("tool_seq"),
                     "tool_name": cap_json_str(event.get("tool_name"), MAX_TRAJ_FIELD_BYTES),
+                    // The actual arguments (search pattern / path / command) so the
+                    // viewer can show WHAT the model did, not just that it acted.
+                    // Already capped in the runtime (MAX_TOOL_ARGS_CHARS); re-bound
+                    // here defensively against MAX_TRAJ_FIELD_BYTES for the flow record.
+                    "args": cap_json_str(event.get("args"), MAX_TRAJ_FIELD_BYTES),
                     "args_chars": event.get("args_chars"),
                     "result_chars": event.get("result_chars"),
                     "ok": tool_ok,

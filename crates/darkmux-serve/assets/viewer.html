@@ -2000,6 +2000,25 @@ function renderDetail(){
     $("detailbody").innerHTML=`<pre>${pretty(r)}</pre>`;
   }
 }
+// Render a tool call's args (a JSON string like `{"path":"x.ts"}` or
+// `{"pattern":"foo","path":"data"}`) as a compact, readable inline form —
+// `path=x.ts` / `pattern="foo" path=data` — so the log reads like a command
+// history. Non-JSON or unparseable args fall back to the raw (viewer-escaped,
+// bounded). The runtime already capped the string; this only reshapes it.
+function prettyArgs(args){
+  if(typeof args!=="string")return "";
+  let o; try{o=JSON.parse(args);}catch{ return esc(args.length>80?args.slice(0,80)+"…":args); }
+  if(o&&typeof o==="object"&&!Array.isArray(o)){
+    const parts=Object.entries(o).map(([k,v])=>{
+      let s=typeof v==="string"?v:JSON.stringify(v);
+      if(s.length>60)s=s.slice(0,60)+"…";
+      return `${esc(k)}=${esc(s)}`;
+    });
+    return parts.join(" ");
+  }
+  const s=esc(String(args));
+  return s.length>80?s.slice(0,80)+"…":s;
+}
 function renderLog(){
   const all=scopedFiltered();
   const recs=all.slice(-50).reverse();
@@ -2018,7 +2037,11 @@ function renderLog(){
     if(r.action==="dispatch.reasoning"&&f&&f.reasoning_text){
       detail=` · <span class="preview-text">"${esc(f.reasoning_text.slice(0,60).replace(/\n/g," "))}..."</span>`;
     }else if(r.action==="dispatch.tool"&&f){
-      detail=` · <span class="preview-text">${esc(f.tool_name)} (${esc(f.args_chars||0)}ch → ${esc(f.result_chars||0)}ch)${f.ok!==false?'':' ❌'}</span>`;
+      // Show the actual args (FLOW_SCHEMA 1.16 — search pattern / path /
+      // command) so the operator can read WHAT the call did; fall back to the
+      // size for pre-1.16 records that carry no `args`.
+      const argstr=f.args!=null?prettyArgs(f.args):`${esc(f.args_chars||0)}ch`;
+      detail=` · <span class="preview-text">${esc(f.tool_name)} ${argstr} → ${esc(f.result_chars||0)}ch${f.ok!==false?'':' ❌'}</span>`;
     }else if(r.action==="dispatch.turn"&&f){
       detail=` · <span class="preview-text">turn ${esc(f.turn_seq||0)} (${esc(f.finish_reason)})</span>`;
     }else if(r.action==="tier-decision"&&r.reasoning){
