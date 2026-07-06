@@ -2128,7 +2128,7 @@ mod tests {
     }
 
     #[test]
-    fn flow_schema_version_is_1_15_0() {
+    fn flow_schema_version_is_1_16_0() {
         // Pin the schema version so an accidental rename can't ship silently;
         // any bump beyond this should be a deliberate code change paired with
         // an update to this assertion (and corresponding viewer EXPECTED_*
@@ -2190,7 +2190,10 @@ mod tests {
         //           container: payload gains `mem` + `gpu` (host RAM/GPU util%)
         //           and `cpu` shifts container→host (#814/#1064). Minor +
         //           additive — older readers ignore mem/gpu; chains survive.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.15.0");
+        //   1.16.0 — dispatch.tool payload gains `args` (the actual tool
+        //           arguments, capped) so the operator can recall what each
+        //           call did. Minor + additive — older readers ignore it.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.16.0");
     }
 
     #[test]

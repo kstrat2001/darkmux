@@ -912,7 +912,7 @@ pub fn run(
                         turns,
                         tool_seq as u32,
                         &call.function.name,
-                        call.function.arguments.len(),
+                        &call.function.arguments,
                         result.len(),
                         tool_ok,
                     );

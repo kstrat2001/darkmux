@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.15.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.16.0";
 // Version history:
 //   1.2.0 — added optional `model` (#106)
 //   1.3.0 — added optional `reasoning` + `mission_id`; new Stage::TierDecision (#136)
@@ -102,6 +102,12 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.15.0";
 //           unchanged, only its source). Older readers ignore `mem`/`gpu`; new
 //           records only, so prior AuditFileSink chains survive without rotation.
 //           (#1064)
+//   1.16.0 — `dispatch.tool` payload gains `args` — the ACTUAL tool arguments
+//           (search pattern / file path / shell command), capped at 512 chars
+//           in the runtime, so the operator can recall WHAT each tool call did,
+//           not just its size. Results stay size-only (large + re-derivable).
+//           Additive payload field; older readers ignore `args`; new records
+//           only, so prior AuditFileSink chains survive without rotation.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
