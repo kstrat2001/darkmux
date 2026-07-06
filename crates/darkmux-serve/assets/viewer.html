@@ -390,6 +390,9 @@
   .aico.act-compaction{color:#c084fc}
   .aico.act-routing{color:#8ab4f8}
   .aico.act-note{color:var(--amber)}
+  .aico.act-dispatch-error{color:var(--warn,#f87171)}
+  .aico.act-feedback{color:#8ab4f8}
+  .aico.act-machine-online,.aico.act-machine-offline{color:var(--muted)}
   .detail-card{padding:14px;background:var(--bg);border:1px solid var(--line);border-radius:6px;margin-bottom:12px;font:12px/1.55 'JetBrains Mono',monospace}
   .detail-card h3{margin:0 0 10px;font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--amber)}
   .detail-card.reasoning{border-left:3px solid var(--amber)}
@@ -700,7 +703,7 @@ const ICON={
   // Pulse = telemetry (host/lms/runtime/tokens/detector).
   pulse:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l2-6 4 12 2-6h6"/></svg>'};
 // Activity label → ICON key. Anything unmapped renders no glyph (a plain row).
-const ACT_ICON={"reasoning":"brain","tool call":"tool","turn":"turn","dispatch start":"play","dispatch end":"flag","routing":"route","compaction":"compress","note":"note","detector":"pulse","runtime":"pulse","tokens":"pulse","lms":"pulse","host telemetry":"pulse","telemetry":"pulse"};
+const ACT_ICON={"reasoning":"brain","tool call":"tool","turn":"turn","heartbeat":"turn","dispatch start":"play","dispatch end":"flag","dispatch error":"flag","feedback":"note","routing":"route","compaction":"compress","note":"note","machine online":"machine","machine offline":"machine","detector":"pulse","runtime":"pulse","tokens":"pulse","lms":"pulse","host telemetry":"pulse","telemetry":"pulse"};
 // Live viewer — machine form-factor lookup empty; real machines render with no icon
 // until /machine/specs/<id> wiring lands (follow-up to #624).
 const MACH_ICON={};
@@ -744,11 +747,17 @@ function activityOf(r){
   if(a==="dispatch.reasoning")return "reasoning";
   if(a==="dispatch.tool")return "tool call";
   if(a==="dispatch.turn")return "turn";
+  if(a==="dispatch.turn.heartbeat")return "heartbeat";
   if(a==="dispatch.start"||a==="dispatch start")return "dispatch start";
   if(a==="dispatch.complete"||a==="dispatch complete")return "dispatch end";
+  if(a==="dispatch.error"||a==="dispatch error")return "dispatch error";
+  if(a==="dispatch.feedback.injected")return "feedback";
   if(a==="tier-decision")return "routing";
   if(a==="dispatch.compaction"||r.source==="compaction")return "compaction";
-  if(a==="flow.note"||r.source==="orchestrator"||r.source==="adjudication")return "note";
+  if(a==="flow.note"||a==="note"||r.source==="orchestrator"||r.source==="adjudication")return "note";
+  if(a==="machine.online"||a==="machine online")return "machine online";
+  if(a==="machine.offline"||a==="machine offline")return "machine offline";
+  if(a==="session.end")return "session end";
   if(r.category==="telemetry"){
     if(r.source==="detector")return "detector";
     if(r.source==="tokens")return "tokens";
@@ -760,8 +769,9 @@ function activityOf(r){
   return a||"other";
 }
 // Preferred display order for the activity facet — model-doing activities
-// first (the common "what's the model up to" read), telemetry after.
-const ACT_ORDER=["reasoning","tool call","turn","dispatch start","dispatch end","routing","compaction","note","detector","runtime","tokens","lms","host telemetry","telemetry","other"];
+// first (the common "what's the model up to" read), then dispatch lifecycle,
+// then fleet lifecycle, then telemetry.
+const ACT_ORDER=["reasoning","tool call","turn","heartbeat","dispatch start","dispatch end","dispatch error","feedback","routing","compaction","note","machine online","machine offline","session end","detector","runtime","tokens","lms","host telemetry","telemetry","other"];
 function recompute(){
   DATA.forEach(r=>r._id=r._uid);
   const ts=DATA.map(r=>T(r.ts)).filter(n=>!isNaN(n));
