@@ -2,6 +2,9 @@ pub mod artifact_dirs;
 pub mod characterize;
 pub mod compare;
 pub mod cow_clone;
+// (#1222) Dialectic (adversarial) review orchestration — review-bench's
+// prosecutor → defender → judge mode.
+pub mod dialectic;
 pub mod doctor;
 pub mod fixture;
 pub mod fixture_cli;
