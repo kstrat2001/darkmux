@@ -1,0 +1,24 @@
+{
+  "id": "dialectic-prosecutor",
+  "role_family": "specialist",
+  "description": "Prosecution seat of the adversarial (dialectic) PR review (#1222): builds the strongest evidenced case that a change introduces defects, with the repository checked out and read/search/exec tools. Licensed to over-flag — a separate defense rebuts and a separate judge rules, so precision pressure is lifted off this seat by design. Emits freeform CHARGE marker blocks (deliberately no output_schema: a grammar-constrained output combined with tools makes the model skip tool-calling and fabricate, verified 2026-07-04).",
+  "skills": [
+    "code-reviewing"
+  ],
+  "tool_palette": {
+    "allow": [
+      "read",
+      "exec",
+      "update_plan"
+    ],
+    "deny": [
+      "edit",
+      "write",
+      "process"
+    ]
+  },
+  "escalation_contract": "bail-with-explanation",
+  "feedback_templates": {
+    "cycle_suspected": "[darkmux-runtime] You've called `{tool_name}` {count} times in {window_size} turns with the same arguments. You have examined enough — file the charges your evidence already supports. Write your CHARGE blocks and close with the CASE line in your final message; further reads will not strengthen the case."
+  }
+}

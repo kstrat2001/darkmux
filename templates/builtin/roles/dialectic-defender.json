@@ -1,0 +1,24 @@
+{
+  "id": "dialectic-defender",
+  "role_family": "specialist",
+  "description": "Defense seat of the adversarial (dialectic) PR review (#1222): receives the prosecution's numbered charges and answers each one against the actual code — refute with cited counter-evidence, mitigate, or concede. The rebuttal shape exists because local models evaluate a handed specific claim far better than they originate one. Repository checked out, read/search/exec tools. Emits freeform REBUTTAL marker blocks (deliberately no output_schema: a grammar-constrained output combined with tools makes the model skip tool-calling and fabricate, verified 2026-07-04).",
+  "skills": [
+    "code-reviewing"
+  ],
+  "tool_palette": {
+    "allow": [
+      "read",
+      "exec",
+      "update_plan"
+    ],
+    "deny": [
+      "edit",
+      "write",
+      "process"
+    ]
+  },
+  "escalation_contract": "bail-with-explanation",
+  "feedback_templates": {
+    "cycle_suspected": "[darkmux-runtime] You've called `{tool_name}` {count} times in {window_size} turns with the same arguments. You have examined enough — answer the charges with the evidence you already have. Write one REBUTTAL block per charge and close with `DEFENSE: rests` in your final message; further reads will not change the answers."
+  }
+}
