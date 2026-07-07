@@ -461,6 +461,18 @@ fn diff_line_content(line: &str) -> &str {
     line.strip_prefix(['+', '-', ' ']).unwrap_or(line)
 }
 
+/// Normalize a model-quoted anchor for matching. Models sometimes keep the
+/// diff's leading `+`/`-` marker despite the "line content only" contract —
+/// strip one, exactly like `diff_line_content` does on the diff side, so a
+/// verbatim-with-marker quote never false-strikes a real charge (frontier QA
+/// MUST-FIX on the P1 PR: an asymmetric match struck the charge, and a fully
+/// struck bug case scored as a clean pass). Used by every anchor/quote
+/// matcher so the strike decision, the excerpt window, and the quote check
+/// stay consistent.
+fn normalize_anchor(a: &str) -> &str {
+    diff_line_content(a.trim()).trim()
+}
+
 /// Strike every charge whose anchor is not a line in the diff — fabricated
 /// (or mistyped) evidence never reaches the defense or the judge. Returns
 /// the struck count.
@@ -470,7 +482,7 @@ pub fn validate_charge_anchors(charges: &mut [Charge], diff: &str) -> usize {
         let Some(anchor) = c.anchor.as_deref() else {
             continue; // general charge — nothing to verify mechanically
         };
-        let a = anchor.trim();
+        let a = normalize_anchor(anchor);
         let found = diff.lines().any(|l| diff_line_content(l).contains(a));
         if !found {
             c.struck = true;
@@ -522,7 +534,7 @@ pub fn validate_rebuttal_quotes(
             paths.push(c.path.clone());
         }
         let all_found = spans.iter().all(|span| {
-            let s = span.trim();
+            let s = normalize_anchor(span);
             diff.lines().any(|l| diff_line_content(l).contains(s))
                 || paths
                     .iter()
@@ -589,7 +601,7 @@ pub fn charged_excerpts(diff: &str, charges: &[Charge]) -> String {
         let Some(anchor) = c.anchor.as_deref() else {
             continue;
         };
-        let a = anchor.trim();
+        let a = normalize_anchor(anchor);
         if let Some(idx) = lines.iter().position(|l| diff_line_content(l).contains(a)) {
             let start = idx.saturating_sub(EXCERPT_CONTEXT_LINES);
             let end = (idx + EXCERPT_CONTEXT_LINES).min(lines.len().saturating_sub(1));
@@ -1105,6 +1117,36 @@ mod tests {
         assert!(!charges[0].struck);
         assert!(charges[1].struck);
         assert!(!charges[2].struck);
+    }
+
+    /// Frontier QA MUST-FIX on the P1 PR: a model quoting the diff line
+    /// VERBATIM WITH its leading `+`/`-` marker (the most common LLM
+    /// diff-quoting slip) must not be false-struck — a fully struck bug case
+    /// would silently score as a clean pass. The same normalization must
+    /// keep the excerpt window locatable.
+    #[test]
+    fn anchor_keeping_diff_marker_is_not_struck_and_still_excerpts() {
+        let mut charges = vec![Charge {
+            number: 1,
+            model_number: 1,
+            path: "billing.ts".into(),
+            anchor: Some("+const end = start.plus(30)".into()),
+            body: "kept the + marker".into(),
+            struck: false,
+        }];
+        assert_eq!(validate_charge_anchors(&mut charges, DIFF), 0);
+        assert!(!charges[0].struck);
+        let mut long = String::from("--- a/f.ts\n+++ b/f.ts\n");
+        for i in 0..120 {
+            long.push_str(&format!(" context {i}\n"));
+        }
+        long.push_str("+const end = start.plus(30)\n");
+        for i in 0..120 {
+            long.push_str(&format!(" tail {i}\n"));
+        }
+        let ex = charged_excerpts(&long, &charges);
+        assert!(ex.contains("diff excerpt (charge 1)"));
+        assert!(ex.contains("const end = start.plus(30)"));
     }
 
     #[test]

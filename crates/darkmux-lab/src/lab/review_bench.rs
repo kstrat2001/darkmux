@@ -400,22 +400,8 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
     // (#1198) Persist the run as a scores.json artifact — the bench suite's
     // dual-key score substrate (#1197). Failure to persist is a WARNING, not
     // a bench failure: the operator already has the stdout report.
-    match write_scores_artifact(&scored, &meta, &opts) {
-        Ok(path) => {
-            eprintln!("scores: {}", path.display());
-            // (#1222) The debate envelopes land beside scores.json — the
-            // audit artifact: every sustained finding's evidence chain.
-            if !debates.is_empty() {
-                let dpath = path.with_file_name("debates.json");
-                let write = serde_json::to_vec_pretty(&debates)
-                    .map_err(anyhow::Error::from)
-                    .and_then(|b| std::fs::write(&dpath, b).map_err(anyhow::Error::from));
-                match write {
-                    Ok(()) => eprintln!("debates: {}", dpath.display()),
-                    Err(e) => eprintln!("debates: WARNING — artifact not written: {e:#}"),
-                }
-            }
-        }
+    match write_scores_artifact(&scored, &meta, &debates, &opts) {
+        Ok(path) => eprintln!("scores: {}", path.display()),
         Err(e) => eprintln!("scores: WARNING — artifact not written: {e:#}"),
     }
     Ok(())
@@ -1180,10 +1166,15 @@ pub(crate) fn build_score_rows(
     rows
 }
 
-/// Assemble + write the artifact; returns the written path.
+/// Assemble + write the artifact; returns the written path. Dialectic mode's
+/// debate envelopes (#1222) are written FIRST, beside scores.json, and
+/// independently of the scores write succeeding — the debate record is the
+/// higher-value audit artifact (every sustained finding's evidence chain)
+/// and must never be dropped because the scores serialization failed.
 fn write_scores_artifact(
     scored: &[(&Case, CaseScore)],
     meta: &[EnvelopeMeta],
+    debates: &[super::dialectic::DebateEnvelope],
     opts: &ReviewBenchOpts,
 ) -> Result<PathBuf> {
     use super::scores;
@@ -1234,6 +1225,21 @@ fn write_scores_artifact(
             .join(format!("review-bench-{ts_ms}"))
             .join("scores.json"),
     };
+    if !debates.is_empty() {
+        let dpath = path.with_file_name("debates.json");
+        let write = serde_json::to_vec_pretty(debates)
+            .map_err(anyhow::Error::from)
+            .and_then(|b| {
+                if let Some(parent) = dpath.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&dpath, b).map_err(anyhow::Error::from)
+            });
+        match write {
+            Ok(()) => eprintln!("debates: {}", dpath.display()),
+            Err(e) => eprintln!("debates: WARNING — artifact not written: {e:#}"),
+        }
+    }
     scores::write_scores(&path, &doc)?;
     Ok(path)
 }
