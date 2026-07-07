@@ -72,6 +72,15 @@ use crate::trajectory::Trajectory;
 /// reasoning hang per Beat 47 run 3). Roughly 22% above openclaw's
 /// `SELF_HOSTED_DEFAULT_MAX_TOKENS = 8192` — same defensive shape,
 /// slightly more headroom for thoughtful turns. (#415)
+///
+/// (#1221) This is now the DEFAULT, overridable per dispatch via the
+/// `--max-tokens-per-call` runtime flag (host tier:
+/// `DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL` env > `runtime.max_tokens_per_call`
+/// config). The 10000 was calibrated on NON-reasoning models; on
+/// thinking-family models it truncates PRODUCTIVE reasoning (a capped turn's
+/// reasoning is discarded entirely), so reasoning-heavy dispatches raise it
+/// explicitly. No fixed number wins both ways — content-based stopping is
+/// the tracked real fix; this knob is the near-term control.
 const MAX_TOKENS_PER_CALL: u32 = 10000;
 
 // (#457) Per-dispatch cumulative-completion-tokens cap — REMOVED as
@@ -280,6 +289,8 @@ pub fn run(
     compaction_cfg: &compaction::CompactionConfig,
     max_turns: Option<u32>,
     max_cumulative_tokens: Option<u32>,
+    // (#1221) Per-call completion-token cap; None = MAX_TOKENS_PER_CALL.
+    max_tokens_per_call: Option<u32>,
     feedback_templates: std::collections::BTreeMap<String, String>,
     // (#1038) Optional `response_format` envelope (the role's output_schema,
     // wrapped as json_schema). When set, every model turn is grammar-constrained
@@ -287,6 +298,10 @@ pub fn run(
     response_format: Option<serde_json::Value>,
 ) -> Result<LoopOutcome> {
     let mut messages = initial_messages;
+    // (#1221) Resolve the per-call cap once; every use below (the request's
+    // max_tokens, cap-salvage detection, the budget snapshot, the length-arm
+    // diagnostics) reads this so an override stays consistent end-to-end.
+    let per_call_cap: u32 = max_tokens_per_call.unwrap_or(MAX_TOKENS_PER_CALL);
     let tool_defs: Vec<_> = tools.iter().map(|t| t.to_tool_def()).collect();
     // Set of tool names the model is allowed to call. Drives the
     // plain-text-tool-call promoter (#406): any tool name in the
@@ -521,7 +536,7 @@ pub fn run(
             tools: tool_defs.clone(),
             tool_choice: Some("auto".into()),
             temperature: 0.2,
-            max_tokens: Some(MAX_TOKENS_PER_CALL),
+            max_tokens: Some(per_call_cap),
             response_format: response_format.clone(),
         };
 
@@ -725,25 +740,25 @@ pub fn run(
         // in history would anchor the model on the failed pattern
         // AND inflate prompt_tokens on every subsequent turn.
         let salvaged_per_turn_cap = finish_reason == "length"
-            && this_turn_completion_tokens == Some(MAX_TOKENS_PER_CALL)
+            && this_turn_completion_tokens == Some(per_call_cap)
             && assistant_message_has_well_formed_tool_calls(&assistant_message);
         if salvaged_per_turn_cap {
             let salvaged_count = count_well_formed_tool_calls(&assistant_message);
-            let observed_tokens = this_turn_completion_tokens.unwrap_or(MAX_TOKENS_PER_CALL);
+            let observed_tokens = this_turn_completion_tokens.unwrap_or(per_call_cap);
             eprintln!(
                 "darkmux-runtime: ⚡ per-turn-cap salvage — completion_tokens=\
                  {} hit cap {}; dispatching {} well-formed tool call(s) and \
                  nudging the model to reduce per-call reasoning.",
-                observed_tokens, MAX_TOKENS_PER_CALL, salvaged_count
+                observed_tokens, per_call_cap, salvaged_count
             );
             trajectory.append_per_turn_cap_salvaged(
                 turns,
                 observed_tokens,
-                MAX_TOKENS_PER_CALL,
+                per_call_cap,
                 salvaged_count,
             );
             feedback_injector
-                .queue_per_turn_cap_approach(observed_tokens, MAX_TOKENS_PER_CALL);
+                .queue_per_turn_cap_approach(observed_tokens, per_call_cap);
             // Clear truncated content — keep tool_calls. Mirrors the
             // stall-arm's pop reason: anchoring + prompt-token bloat.
             assistant_message.content = None;
@@ -1091,7 +1106,7 @@ pub fn run(
                                 max_turns,
                                 cumulative_completion_tokens_used: total_completion_tokens,
                                 max_cumulative_completion_tokens: max_cumulative_tokens,
-                                max_tokens_per_call: MAX_TOKENS_PER_CALL,
+                                max_tokens_per_call: per_call_cap,
                             };
                             let (parsed, summary_chars) = compaction::structured_compact(
                                 compactor_client,
@@ -1235,13 +1250,13 @@ pub fn run(
                          content or partial tool_calls — the response was \
                          cut off mid-generation but salvage isn't safe. \
                          Two causes are possible: \
-                         (1) per-call cap fired (MAX_TOKENS_PER_CALL = {MAX_TOKENS_PER_CALL}); \
+                         (1) per-call cap fired (max_tokens_per_call = {per_call_cap}); \
                          the model emitted that many tokens (content + reasoning) \
                          in this single turn. \
                          (2) context overflow; prompt_tokens crossed the model's \
                          loaded context window. Check `usage.completion_tokens` in \
                          the trajectory's model.completed event: if it equals \
-                         {MAX_TOKENS_PER_CALL}, cause (1); otherwise cause (2). \
+                         {per_call_cap}, cause (1); otherwise cause (2). \
                          If (2), compaction may need a smaller threshold or a larger n_ctx."
                     ));
                 }
@@ -2181,7 +2196,7 @@ mod tests {
         // unbounded against a mock that returns infinite identical
         // length-finish responses. 250000 matches the prior hardcoded
         // default value the test was originally written against.
-        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), Some(250_000), std::collections::BTreeMap::new(), None)
+        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), Some(250_000), None, std::collections::BTreeMap::new(), None)
             .expect("cumulative-budget escalation returns Ok(outcome)");
 
         assert_eq!(
@@ -2233,7 +2248,7 @@ mod tests {
         // (#457) Counter-test to the cap-fire path. Set Some(250_000)
         // for parity with the cap-fire test; the mock returns a stop
         // turn quickly so we never approach it.
-        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), Some(250_000), std::collections::BTreeMap::new(), None)
+        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), Some(250_000), None, std::collections::BTreeMap::new(), None)
             .expect("healthy stop should not bail");
 
         assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
@@ -2279,7 +2294,7 @@ mod tests {
         let cfg = compaction::CompactionConfig::never_compact();
         // (#457) Test exercises the MaxTurns terminal — needs Some(N)
         // for the cap to fire. 100 matches the prior hardcoded default.
-        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new(), None)
+        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None)
             .expect("MAX_TURNS path returns Ok(outcome), not Err");
 
         assert_eq!(
@@ -2337,7 +2352,7 @@ mod tests {
         let cfg = compaction::CompactionConfig::never_compact();
         // (#457) Test relies on MaxTurns to terminate the loop — needs
         // Some(100) explicitly now that the cap is operator-opt-in.
-        let _outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new(), None)
+        let _outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None)
             .expect("loop completes (MaxTurns)");
 
         // Read the trajectory and find the failure-cascade event.
@@ -2405,7 +2420,7 @@ mod tests {
         // before. (#457) Cap is operator-opt-in now; pass Some(100)
         // explicitly so the loop terminates at the same point this
         // test was originally written against.
-        let _outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new(), None)
+        let _outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None)
             .expect("loop completes (MaxTurns)");
 
         // Read the trajectory and count cycle.suspected events.
@@ -2478,7 +2493,7 @@ mod tests {
         let cfg = compaction::CompactionConfig::never_compact();
         // (#457) Same MaxTurns-relying pattern as the cycle/cascade
         // tests above; needs Some(100) now that the cap is opt-in.
-        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new(), None)
+        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None)
             .expect("loop completes (MaxTurns)");
 
         // (1) Trajectory contains feedback.injected events — proves
@@ -2588,7 +2603,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::never_compact();
-        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new(), None)
+        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None)
             .expect("promoted XML tool call should drive the loop, not error");
 
         assert!(
@@ -2717,6 +2732,7 @@ mod tests {
             &cfg,
             Some(3),
             None,
+            None,
             std::collections::BTreeMap::new(),
             None,
         )
@@ -2741,6 +2757,76 @@ mod tests {
         assert!(
             salvaged_seen,
             "trajectory must record dispatch.per_turn_cap.salvaged when salvage fires"
+        );
+    }
+
+    /// (#1221) The per-call cap override reaches the whole loop: with
+    /// `max_tokens_per_call = Some(5000)`, a length-finish at exactly 5000
+    /// completion tokens is detected as a cap hit and salvaged. Under the
+    /// built-in default (10000) this same response would MISS salvage
+    /// detection and the length arm would bail with an error — so this test
+    /// passing proves the override, not the default, drove the decision.
+    #[test]
+    #[serial_test::serial]
+    fn per_call_cap_override_moves_the_salvage_threshold() {
+        let server = MockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_json(
+                Some("partial truncated content"),
+                Some(serde_json::json!([{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "arguments": "{\"path\":\"/workspace/x.txt\",\"offset\":1,\"limit\":50}",
+                    },
+                }])),
+                "length",
+                100,
+                5000,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new()
+            .prefix("per-call-cap-override")
+            .tempdir()
+            .unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("read x.txt")];
+        let tools = [Tool::Read];
+
+        let cfg = compaction::CompactionConfig::never_compact();
+        let outcome = run(
+            &client,
+            &client,
+            "test-model",
+            initial,
+            &tools,
+            &mut traj,
+            false,
+            &cfg,
+            Some(3),
+            None,
+            Some(5000),
+            std::collections::BTreeMap::new(),
+            None,
+        )
+        .expect(
+            "a length-finish at the OVERRIDDEN cap must salvage — an Err here \
+             means the override never reached salvage detection (#1221)",
+        );
+        assert!(outcome.turns >= 1);
+        let traj_path = tmp.path().join(".darkmux-runtime/trajectory.jsonl");
+        let raw = std::fs::read_to_string(&traj_path).expect("trajectory file exists");
+        assert!(
+            raw.lines().any(|line| {
+                let v: serde_json::Value = serde_json::from_str(line).unwrap_or_default();
+                v.get("type").and_then(|t| t.as_str())
+                    == Some("dispatch.per_turn_cap.salvaged")
+            }),
+            "salvage at the overridden cap must be recorded in the trajectory"
         );
     }
 
@@ -2787,6 +2873,7 @@ mod tests {
             false,
             &cfg,
             Some(3),
+            None,
             None,
             std::collections::BTreeMap::new(),
             None,
@@ -2860,6 +2947,7 @@ mod tests {
             &cfg,
             Some(2),
             None,
+            None,
             std::collections::BTreeMap::new(),
             None,
         )
@@ -2928,6 +3016,7 @@ mod tests {
             &cfg,
             Some(3),
             None,
+            None,
             std::collections::BTreeMap::new(),
             None,
         );
@@ -2973,7 +3062,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::never_compact();
-        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new(), None)
+        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None)
             .expect("recovered call from length-truncated response should drive the loop");
 
         assert!(
@@ -3028,7 +3117,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::never_compact();
-        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new(), None)
+        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None)
             .expect("promoted XML tool call from reasoning_content should drive the loop");
 
         assert!(
@@ -3111,7 +3200,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::never_compact();
-        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new(), None)
+        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None)
             .expect("clean two-turn dispatch");
 
         // The first assistant message in the conversation must have
@@ -3174,7 +3263,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::never_compact();
-        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new(), None)
+        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None)
             .expect("clean single-turn dispatch");
 
         captured.assert();
@@ -3213,7 +3302,7 @@ mod tests {
         let tools = [Tool::Read, Tool::Edit, Tool::Bash];
 
         let cfg = compaction::CompactionConfig::never_compact();
-        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new(), None)
+        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None)
             .expect("loop should terminate cleanly on first-turn stop");
 
         stop_mock.assert();
@@ -3335,7 +3424,7 @@ mod tests {
         // tool_calls; will hit MAX_TURNS); we don't care about the
         // outcome's Ok/Err — just whether the compactor was invoked
         // along the way. The result IS the side-effect assertion below.
-        let outcome = run(&client, &client, "test-primary", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new(), None);
+        let outcome = run(&client, &client, "test-primary", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None);
 
         // Core assertion: compactor was invoked at least once. This is
         // the layer-boundary signal — the runtime's loop translated
@@ -3447,6 +3536,7 @@ mod tests {
             &cfg,
             Some(100),
             None,
+            None,
             std::collections::BTreeMap::new(),
             None,
         );
@@ -3537,7 +3627,7 @@ mod tests {
         // max_turns=6 bounds it to a SINGLE stale episode: the frozen counter
         // climbs 0→1→2→3 across turns 1-4, fires + compacts + resets at turn 4,
         // and the two remaining turns can't reach 3 again.
-        let _outcome = run(&client, &client, "test-primary", initial, &tools, &mut traj, false, &cfg, Some(6), None, std::collections::BTreeMap::new(), None);
+        let _outcome = run(&client, &client, "test-primary", initial, &tools, &mut traj, false, &cfg, Some(6), None, None, std::collections::BTreeMap::new(), None);
 
         // (1) The fix fired a compaction even though the reported count never
         // crossed the threshold — the #854 regression-lock.
@@ -3638,7 +3728,7 @@ mod tests {
         }
         let tools = [Tool::Read];
 
-        let outcome = run(&client, &client, "test-primary", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new(), None)
+        let outcome = run(&client, &client, "test-primary", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None)
             .expect("bail should produce Ok with EscalationTriggered, not Err");
 
         assert_eq!(
@@ -3727,7 +3817,7 @@ mod tests {
         // Loop hits MAX_TURNS (mock loops forever). The key
         // assertion: terminal_reason must be MaxTurns, NOT
         // EscalationTriggered, even though compactions fired.
-        let outcome = run(&client, &client, "test-primary", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new(), None)
+        let outcome = run(&client, &client, "test-primary", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None)
             .expect("loop should hit MAX_TURNS, not error");
 
         assert_eq!(
@@ -3793,7 +3883,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::never_compact();
-        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new(), None)
+        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None)
             .expect("stall recovery should drive the loop to Stop, not Err");
 
         assert_eq!(
@@ -3860,7 +3950,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::never_compact();
-        let result = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new(), None);
+        let result = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None);
 
         assert!(
             result.is_err(),
@@ -3897,7 +3987,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::never_compact();
-        let result = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new(), None);
+        let result = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None);
 
         assert!(
             result.is_err(),
@@ -3948,7 +4038,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::never_compact();
-        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new(), None)
+        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None)
             .expect("recovery should drive the loop to Stop");
 
         assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
@@ -3985,7 +4075,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::never_compact();
-        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new(), None)
+        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None)
             .expect("budget exhaustion returns Ok(EscalationTriggered)");
 
         assert_eq!(
@@ -4033,7 +4123,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::never_compact();
-        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new(), None)
+        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None)
             .expect("empty finish_reason=tool_calls must recover+escalate, not Err");
 
         assert_eq!(
@@ -4090,7 +4180,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::never_compact();
-        let _outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, std::collections::BTreeMap::new(), None)
+        let _outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None)
             .expect("recovery succeeds");
 
         // Read the trajectory JSONL and assert the event landed.

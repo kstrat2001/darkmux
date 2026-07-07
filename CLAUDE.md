@@ -129,6 +129,7 @@ Every `DARKMUX_*` var below is the **top tier** of `env > config.json > built-in
 | `DARKMUX_REDIS_STREAM` / `DARKMUX_REDIS_MAXLEN` | `redis.stream` / `redis.maxlen` |
 | `DARKMUX_INACTIVITY_TIMEOUT_SECONDS` | `runtime.inactivity_timeout_seconds` |
 | `DARKMUX_RUNTIME_MAX_TURNS` / `DARKMUX_RUNTIME_MAX_TOKENS` | `runtime.max_turns` / `runtime.max_tokens` |
+| `DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL` (#1221 — per-CALL completion cap, reasoning + content of one turn; unset = the runtime's built-in 10000, which truncates productive reasoning on thinking-family models) | `runtime.max_tokens_per_call` |
 | `DARKMUX_STRICT_SELECTION` / `DARKMUX_CHECK_UPDATES` | `runtime.strict_selection` / `runtime.check_updates` |
 | `DARKMUX_FEEDBACK_INJECTION` | `runtime.feedback_injection` exists, but is read **directly in the runtime container** (`runtime/src/feedback.rs`), NOT through `config_access` — so it does NOT yet honor the `config.json` tier (the runtime crate can't depend on `config_access`; wiring it needs a flag-plumb, deliberately deferred in #661). |
 | `DARKMUX_DEFAULT_ROLE` / `DARKMUX_DAEMON_CORS_ORIGINS` | `runtime.default_role` / `runtime.daemon_cors_origins` |

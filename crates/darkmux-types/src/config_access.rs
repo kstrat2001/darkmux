@@ -239,6 +239,12 @@ pub fn max_tokens() -> Option<u32> {
     let cfg = config().runtime.as_ref().and_then(|r| r.max_tokens);
     pick_parsed("DARKMUX_RUNTIME_MAX_TOKENS", cfg, None)
 }
+/// (#1221) Per-call completion-token cap override. `None` = the runtime's
+/// built-in default (`MAX_TOKENS_PER_CALL` = 10000).
+pub fn max_tokens_per_call() -> Option<u32> {
+    let cfg = config().runtime.as_ref().and_then(|r| r.max_tokens_per_call);
+    pick_parsed("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL", cfg, None)
+}
 pub fn default_role() -> Option<String> {
     let cfg = config().runtime.as_ref().and_then(|r| r.default_role.as_deref());
     pick_string("DARKMUX_DEFAULT_ROLE", cfg, None)
