@@ -218,6 +218,10 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // the inactivity timeout (#458) catches the genuine-stuck case.
     let mut max_turns: Option<u32> = None;
     let mut max_tokens: Option<u32> = None;
+    // (#1221) Per-call completion-token cap override. Host derives from
+    // `DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL`. None = the built-in default
+    // (`loop_runner::MAX_TOKENS_PER_CALL` = 10000).
+    let mut max_tokens_per_call: Option<u32> = None;
 
     // (#457 Step 2) Per-role feedback-template overrides. Dispatcher
     // serializes Role.feedback_templates to JSON; runtime parses into
@@ -468,6 +472,25 @@ fn run_dispatch(args: &[String]) -> ExitCode {
                     return ExitCode::from(2);
                 }
             }
+            "--max-tokens-per-call" => {
+                if let Some(v) = args.get(i + 1) {
+                    match v.parse::<u32>() {
+                        Ok(n) => {
+                            max_tokens_per_call = Some(n);
+                            i += 2;
+                        }
+                        Err(_) => {
+                            eprintln!(
+                                "--max-tokens-per-call requires a positive integer (got: {v})"
+                            );
+                            return ExitCode::from(2);
+                        }
+                    }
+                } else {
+                    eprintln!("--max-tokens-per-call requires a value");
+                    return ExitCode::from(2);
+                }
+            }
             "--max-tokens" => {
                 if let Some(v) = args.get(i + 1) {
                     match v.parse::<u32>() {
@@ -699,6 +722,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         &compaction_cfg,
         max_turns,
         max_tokens,
+        max_tokens_per_call,
         feedback_templates,
         response_format,
     );

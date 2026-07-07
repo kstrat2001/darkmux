@@ -73,6 +73,7 @@ const KEYS: &[(&str, Ty)] = &[
     ("runtime.inactivity_timeout_seconds", Ty::Uint),
     ("runtime.max_turns", Ty::Uint),
     ("runtime.max_tokens", Ty::Uint),
+    ("runtime.max_tokens_per_call", Ty::Uint),
     ("runtime.strict_selection", Ty::Bool),
     ("runtime.feedback_injection", Ty::Bool),
     ("runtime.default_role", Ty::Str),

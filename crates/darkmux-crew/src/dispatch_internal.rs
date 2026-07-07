@@ -384,11 +384,17 @@ fn apply_runtime_limit_flags(cmd: &mut Command) {
     // falls it through to the config / unset tier.
     warn_if_unparseable_u32("DARKMUX_RUNTIME_MAX_TURNS");
     warn_if_unparseable_u32("DARKMUX_RUNTIME_MAX_TOKENS");
+    warn_if_unparseable_u32("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL");
     if let Some(n) = darkmux_types::config_access::max_turns() {
         cmd.arg("--max-turns").arg(n.to_string());
     }
     if let Some(n) = darkmux_types::config_access::max_tokens() {
         cmd.arg("--max-tokens").arg(n.to_string());
+    }
+    // (#1221) Per-call cap override — E19: the built-in 10000 truncates
+    // productive reasoning on thinking-family models; benches raise it.
+    if let Some(n) = darkmux_types::config_access::max_tokens_per_call() {
+        cmd.arg("--max-tokens-per-call").arg(n.to_string());
     }
 }
 

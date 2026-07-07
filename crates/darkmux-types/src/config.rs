@@ -135,6 +135,11 @@ pub struct RuntimeBehaviorConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub inactivity_timeout_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub max_turns: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub max_tokens: Option<u32>,
+    /// (#1221) Per-CALL completion-token cap (reasoning + content of one
+    /// model turn). Absent = the runtime's built-in default (10000) — which
+    /// E19 measured truncating PRODUCTIVE reasoning on thinking-family
+    /// models, so benches raise it explicitly per run.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub max_tokens_per_call: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub strict_selection: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub feedback_injection: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub default_role: Option<String>,
@@ -223,8 +228,9 @@ impl DarkmuxConfig {
     /// - `dirs` — defaults are derived from the root (`<root>/flows`); there is
     ///   no fixed literal to write without freezing the derivation. The
     ///   discovery surface is `darkmux doctor` (resolved path, overridable).
-    /// - caps (`max_turns`/`max_tokens`), `default_role`, `daemon_cors_origins`
-    ///   — absent is a real behavior (uncapped / none), not a value to default.
+    /// - caps (`max_turns`/`max_tokens`/`max_tokens_per_call`), `default_role`,
+    ///   `daemon_cors_origins` — absent is a real behavior (uncapped / the
+    ///   runtime's built-in per-call default), not a value to default.
     /// - `feedback_injection` — read in-container directly from
     ///   `DARKMUX_FEEDBACK_INJECTION` (the runtime crate can't depend on
     ///   `config_access`), so it does NOT yet honor the `config.json` tier
@@ -263,6 +269,7 @@ impl DarkmuxConfig {
                 inactivity_timeout_seconds: Some(600),
                 max_turns: None,
                 max_tokens: None,
+                max_tokens_per_call: None,
                 strict_selection: Some(false),
                 feedback_injection: None,
                 default_role: None,
