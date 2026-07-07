@@ -153,6 +153,15 @@ emitted reasoning tokens up to the per-call cap without producing a tool \
 call or a final answer. Please either invoke a tool to make progress, or \
 provide a direct final answer.";
 
+/// (#1221) Nudge for the cap-cliff shape: finish_reason=length with PARTIAL
+/// content at the per-call cap. The truncated turn was discarded (leaving it
+/// would anchor the failed pattern); the model is told to spend fewer tokens
+/// this turn. Shares the empty-stall recovery budget.
+const CAP_CLIFF_NUDGE_MESSAGE: &str = "[darkmux-runtime] Your previous response \
+hit the per-call token cap mid-generation and was discarded. Reduce your \
+output this turn: reason briefly, then either invoke one tool call or write \
+your final answer.";
+
 /// How the loop terminated. Distinguishes "model said stop" from
 /// "loop hit the safety cap and gave up" — semantically different
 /// outcomes for downstream consumers (a max_turns hit means the
@@ -1244,20 +1253,29 @@ pub fn run(
                     .unwrap_or(true);
                 let is_useless_stall = content_empty && no_tool_calls;
 
-                if !is_useless_stall {
+                // (#1221) The cap-cliff: length-finish WITH partial content
+                // (or malformed tool calls) at exactly the per-call cap.
+                // Pre-fix this was a hard error that killed the WHOLE
+                // dispatch — dialectic shakedown-2 (#1222): a prosecutor
+                // burned the entire raised budget in one runaway turn and
+                // the dispatch died, discarding seven prior productive
+                // turns. A cap hit is recoverable exactly like the empty
+                // stall: the truncated turn is noise — drop it, nudge, and
+                // spend the same bounded recovery budget. Only a length-
+                // finish BELOW the cap (context overflow: prompt_tokens
+                // crossed the loaded window) stays a hard error, because
+                // that's a config problem recovery cannot fix.
+                let cap_cliff = this_turn_completion_tokens == Some(per_call_cap);
+                if !is_useless_stall && !cap_cliff {
                     return Err(anyhow!(
-                        "model returned finish_reason=length with partial \
-                         content or partial tool_calls — the response was \
-                         cut off mid-generation but salvage isn't safe. \
-                         Two causes are possible: \
-                         (1) per-call cap fired (max_tokens_per_call = {per_call_cap}); \
-                         the model emitted that many tokens (content + reasoning) \
-                         in this single turn. \
-                         (2) context overflow; prompt_tokens crossed the model's \
-                         loaded context window. Check `usage.completion_tokens` in \
-                         the trajectory's model.completed event: if it equals \
-                         {per_call_cap}, cause (1); otherwise cause (2). \
-                         If (2), compaction may need a smaller threshold or a larger n_ctx."
+                        "model returned finish_reason=length with partial content \
+                         BELOW the per-call cap (completion_tokens {} < \
+                         max_tokens_per_call {per_call_cap}) — context overflow: \
+                         prompt_tokens crossed the model's loaded context window. \
+                         Compaction may need a smaller threshold or a larger n_ctx.",
+                        this_turn_completion_tokens
+                            .map(|n| n.to_string())
+                            .unwrap_or_else(|| "<unknown>".to_string())
                     ));
                 }
 
@@ -1300,15 +1318,22 @@ pub fn run(
                     stall_recoveries_used,
                     MAX_STALL_RECOVERIES,
                 );
-                messages.push(Message::system(STALL_NUDGE_MESSAGE));
+                // (#1221) Shape-specific nudge: a partial-content cap hit
+                // gets told to spend fewer tokens; the empty runaway keeps
+                // the original tool-or-answer nudge.
+                let (nudge, shape) = if is_useless_stall {
+                    (STALL_NUDGE_MESSAGE, "no content and no tool calls (runaway-reasoning shape)")
+                } else {
+                    (CAP_CLIFF_NUDGE_MESSAGE, "partial content truncated at the per-call cap (#1221 cap-cliff shape)")
+                };
+                messages.push(Message::system(nudge));
                 let tokens_str = this_turn_completion_tokens
                     .map(|n| n.to_string())
                     .unwrap_or_else(|| "<unknown>".to_string());
                 eprintln!(
                     "darkmux-runtime: ⏸ intra-turn stall recovered — turn {turns} \
-                     emitted {tokens_str} completion tokens with no \
-                     content and no tool calls (runaway-reasoning shape). Dropped \
-                     the useless turn, injected a nudge; budget {stall_recoveries_used}/{MAX_STALL_RECOVERIES} used. (#414)"
+                     emitted {tokens_str} completion tokens: {shape}. Dropped \
+                     the turn, injected a nudge; budget {stall_recoveries_used}/{MAX_STALL_RECOVERIES} used. (#414)"
                 );
                 continue;
             }
@@ -2830,6 +2855,108 @@ mod tests {
         );
     }
 
+    /// (#1221) The cap-cliff: length-finish with PARTIAL content at exactly
+    /// the per-call cap must NOT kill the dispatch (pre-fix it returned Err,
+    /// discarding every prior productive turn — dialectic shakedown-2's
+    /// failure mode). It routes through the stall recovery: drop + nudge +
+    /// bounded budget, ending in a clean EscalationTriggered outcome when
+    /// the mock repeats the shape past the budget.
+    #[test]
+    #[serial_test::serial]
+    fn cap_cliff_partial_content_recovers_instead_of_killing_the_dispatch() {
+        let server = MockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_json(
+                Some("partial reasoning spill that got truncated mid-"),
+                None,
+                "length",
+                100,
+                MAX_TOKENS_PER_CALL,
+            ));
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("cap-cliff").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("go")];
+        let tools = [Tool::Read];
+        let cfg = compaction::CompactionConfig::never_compact();
+        let outcome = run(
+            &client,
+            &client,
+            "test-model",
+            initial,
+            &tools,
+            &mut traj,
+            false,
+            &cfg,
+            Some(10),
+            None,
+            None,
+            std::collections::BTreeMap::new(),
+            None,
+        )
+        .expect(
+            "a partial-content cap hit must recover (drop + nudge + budget), \
+             not return Err — an Err here is the shakedown-2 dispatch-killing \
+             cliff (#1221)",
+        );
+        assert!(
+            matches!(
+                outcome.terminal_reason,
+                TerminalReason::EscalationTriggered(EscalationReason::IntraTurnStallExhausted)
+            ),
+            "repeating the cap-cliff past the recovery budget must end in a \
+             clean escalation, got {:?}",
+            outcome.terminal_reason
+        );
+    }
+
+    /// (#1221) A length-finish with partial content BELOW the cap is context
+    /// overflow — a config problem recovery cannot fix. It must stay a hard
+    /// error (and name overflow, not the cap).
+    #[test]
+    #[serial_test::serial]
+    fn below_cap_length_is_still_a_context_overflow_hard_error() {
+        let server = MockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_json(
+                Some("partial content"),
+                None,
+                "length",
+                100,
+                4000,
+            ));
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("ctx-overflow").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("go")];
+        let tools = [Tool::Read];
+        let cfg = compaction::CompactionConfig::never_compact();
+        let err = run(
+            &client,
+            &client,
+            "test-model",
+            initial,
+            &tools,
+            &mut traj,
+            false,
+            &cfg,
+            Some(10),
+            None,
+            None,
+            std::collections::BTreeMap::new(),
+            None,
+        )
+        .expect_err("below-cap partial-content length must stay a hard error");
+        assert!(
+            err.to_string().contains("context overflow"),
+            "the error must name context overflow, got: {err:#}"
+        );
+    }
+
     /// Salvage must still dispatch the tool call even when feedback
     /// injection is disabled. The nudge is a no-op but the salvage
     /// path itself stays active — separating queueing from routing.
@@ -3021,9 +3148,26 @@ mod tests {
             None,
         );
 
+        // (#1221 re-target) Malformed args must still never be DISPATCHED
+        // (no salvage), but an at-cap malformed turn now recovers via
+        // drop + nudge instead of killing the dispatch. The mock repeats,
+        // so the run ends in a clean escalation — and the trajectory must
+        // contain no tool.completed event (nothing was ever dispatched).
+        let outcome = result.expect(
+            "malformed args at the cap must recover (drop + nudge), not bail (#1221)",
+        );
+        assert!(matches!(
+            outcome.terminal_reason,
+            TerminalReason::EscalationTriggered(EscalationReason::IntraTurnStallExhausted)
+        ));
+        let traj_path = tmp.path().join(".darkmux-runtime/trajectory.jsonl");
+        let raw = std::fs::read_to_string(&traj_path).expect("trajectory file exists");
         assert!(
-            result.is_err(),
-            "malformed JSON args must fall through to the existing bail; got Ok(...)"
+            !raw.lines().any(|line| {
+                let v: serde_json::Value = serde_json::from_str(line).unwrap_or_default();
+                v.get("type").and_then(|t| t.as_str()) == Some("tool.completed")
+            }),
+            "a malformed tool call must never be dispatched, even under recovery"
         );
     }
 
@@ -3923,14 +4067,17 @@ mod tests {
         assert!(nudge_present, "nudge system message must be present in final conversation");
     }
 
-    /// (#414 PR A) Negative case — the OTHER length shape: model
-    /// returned content (a partial answer) along with
-    /// `finish_reason=length`. This is genuine truncation, NOT a
-    /// runaway-reasoning stall; salvage isn't safe (the partial reply
-    /// may mislead). The loop must still bail in this case.
+    /// (#414 PR A → #1221) The OTHER length shape: content (a partial
+    /// answer) with `finish_reason=length` AT the per-call cap. Pre-#1221
+    /// this bailed ("the partial reply may mislead") — but the bail killed
+    /// the whole dispatch and discarded every prior productive turn
+    /// (dialectic shakedown-2's failure mode), and the mislead concern is
+    /// handled by DROPPING the truncated turn instead. Now recovers via the
+    /// stall path; the mock repeating the shape past the budget ends in a
+    /// clean escalation, and the partial content never survives in history.
     #[test]
     #[serial_test::serial]
-    fn loop_bails_on_length_when_content_is_present() {
+    fn length_with_content_at_cap_recovers_by_dropping_the_turn() {
         let server = MockServer::start();
         let _truncated = server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions");
@@ -3950,24 +4097,57 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::never_compact();
-        let result = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None);
+        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None)
+            .expect("an at-cap truncation must recover, not kill the dispatch (#1221)");
 
         assert!(
-            result.is_err(),
-            "finish_reason=length with content present must bail (truncated answer, not stall)"
+            matches!(
+                outcome.terminal_reason,
+                TerminalReason::EscalationTriggered(EscalationReason::IntraTurnStallExhausted)
+            ),
+            "budget exhaustion on a repeating cap-cliff must escalate cleanly, got {:?}",
+            outcome.terminal_reason
         );
+        // The two RECOVERED turns were dropped; only the final turn (the one
+        // that exhausted the budget and triggered escalation) remains in
+        // history — pre-existing #414 escalation semantics: the last stall
+        // turn is handoff evidence, the budget check runs before the pop.
+        let kept = outcome
+            .messages
+            .iter()
+            .filter(|m| {
+                m.content
+                    .as_deref()
+                    .map(|c| c.contains("half my answer"))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(
+            kept, 1,
+            "recovered truncated turns must be dropped; only the escalation \
+             turn remains as handoff evidence (got {kept} kept)"
+        );
+        let nudges = outcome
+            .messages
+            .iter()
+            .filter(|m| {
+                m.role == "system"
+                    && m.content
+                        .as_deref()
+                        .map(|c| c.contains("hit the per-call token cap"))
+                        .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(nudges, 2, "each recovery must inject the cap-cliff nudge");
     }
 
-    /// (#414 PR A) Coverage for the `tool_calls: []` empty-array
-    /// shape (distinct from `tool_calls: null`/absent). Some OpenAI-
-    /// compatible servers serialize the absent case as an empty
-    /// array; the recovery detection should treat both identically.
-    /// Also pins that content-PRESENT + tool_calls-EMPTY-ARRAY still
-    /// routes to the hard-error branch (it's truncated content, not
-    /// a stall).
+    /// (#414 PR A → #1221) Coverage for the `tool_calls: []` empty-array
+    /// shape (distinct from `tool_calls: null`/absent) WITH content at the
+    /// cap. Same #1221 re-target as the content-present case: recovers via
+    /// drop + nudge instead of killing the dispatch.
     #[test]
     #[serial_test::serial]
-    fn loop_bails_on_length_with_content_and_empty_tool_calls_array() {
+    fn length_with_content_and_empty_tool_calls_array_recovers_at_cap() {
         let server = MockServer::start();
         let _truncated = server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions");
@@ -3987,12 +4167,12 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::never_compact();
-        let result = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None);
-
-        assert!(
-            result.is_err(),
-            "length + content + empty-array tool_calls must bail (truncated answer shape)"
-        );
+        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None)
+            .expect("length + content + empty-array tool_calls at cap must recover (#1221)");
+        assert!(matches!(
+            outcome.terminal_reason,
+            TerminalReason::EscalationTriggered(EscalationReason::IntraTurnStallExhausted)
+        ));
     }
 
     /// (#414 PR A) Coverage for the `tool_calls: []` empty-array
