@@ -1,0 +1,20 @@
+{
+  "id": "dialectic-judge",
+  "role_family": "specialist",
+  "description": "Judge seat of the adversarial (dialectic) PR review (#1222): rules charge-by-charge on the presented record — the change's stated intent, code excerpts, the prosecution's charges, and the defense's answers. Deliberately tool-less (advocates gather evidence; the judge weighs what is presented — keeps the potentially expensive seat cheap, bounded, and auditable) and deliberately no output_schema (the contract is reason-freely-then-one-fenced-JSON-block, so reasoning-capable models keep their reasoning room; a JSON-only grammar suppresses it).",
+  "skills": [
+    "code-reviewing"
+  ],
+  "tool_palette": {
+    "allow": [],
+    "deny": [
+      "read",
+      "write",
+      "edit",
+      "exec",
+      "process",
+      "update_plan"
+    ]
+  },
+  "escalation_contract": "bail-with-explanation"
+}

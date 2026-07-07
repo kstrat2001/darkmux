@@ -37,6 +37,15 @@ const BUILTIN_ROLES: &[(&str, &str)] = &[
     // model fabricate instead of calling tools; fabrication under the
     // freeform ANSWER:/BLOCKED: contract is what the bench measures).
     ("tool-bench", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/tool-bench.json"))),
+    // (#1222) Dialectic (adversarial) PR-review seats: prosecution builds the
+    // evidenced case against the change, defense answers each charge, judge
+    // rules on the presented record. Advocates are agentic (read/exec) with
+    // freeform marker contracts (no output_schema — grammar + tools makes the
+    // model fabricate); the judge is deliberately tool-less (rules on the
+    // record) with a reason-then-fenced-JSON contract.
+    ("dialectic-prosecutor", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/dialectic-prosecutor.json"))),
+    ("dialectic-defender", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/dialectic-defender.json"))),
+    ("dialectic-judge", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/dialectic-judge.json"))),
     ("analyst", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/analyst.json"))),
     ("voice-editor", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/voice-editor.json"))),
     ("design-reviewer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/design-reviewer.json"))),
@@ -81,6 +90,10 @@ pub(crate) const BUILTIN_ROLE_PROMPTS: &[(&str, &str)] = &[
     ("pr-reviewer-agentic", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/pr-reviewer-agentic.md"))),
     ("pr-reviewer-freeform", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/pr-reviewer-freeform.md"))),
     ("tool-bench", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/tool-bench.md"))),
+    // (#1222) Dialectic PR-review seat prompts. Order mirrors BUILTIN_ROLES.
+    ("dialectic-prosecutor", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/dialectic-prosecutor.md"))),
+    ("dialectic-defender", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/dialectic-defender.md"))),
+    ("dialectic-judge", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/dialectic-judge.md"))),
     ("mission-compiler", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/mission-compiler.md"))),
     ("analyst", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/analyst.md"))),
     ("design-reviewer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/design-reviewer.md"))),
@@ -739,6 +752,109 @@ mod tests {
             assert!(
                 prompt.contains(needle),
                 "pr-reviewer-agentic.md must contain {needle:?} (#1113 contract)"
+            );
+        }
+    }
+
+    /// (#1222) The dialectic PR-review seats' contracts, pinned:
+    /// - Advocates (prosecutor, defender) are agentic: tools granted, NO
+    ///   output_schema (grammar + tools makes the model fabricate — the same
+    ///   verified finding the agentic reviewer's contract pins), freeform
+    ///   marker output (`CHARGE <n>` / `REBUTTAL <n>: <stance>`) with a
+    ///   literal closing line. Charge numbering is EXPLICIT in the marker —
+    ///   positional numbering derived at parse time would let one misparsed
+    ///   body line shift every downstream number and desync
+    ///   rebuttals ↔ verdicts (frontier QA finding on the P0 PR).
+    /// - The judge is deliberately tool-less (rules on the presented record;
+    ///   explicit deny list per the #1197 empty-palette rule) and has NO
+    ///   output_schema (reason-freely-then-one-fenced-JSON keeps reasoning
+    ///   room open — a JSON-only grammar suppresses it).
+    #[test]
+    fn dialectic_seats_contract() {
+        let roles = load_roles().expect("builtin roles load");
+        for seat in ["dialectic-prosecutor", "dialectic-defender"] {
+            let role = roles
+                .iter()
+                .find(|r| r.id == seat)
+                .unwrap_or_else(|| panic!("{seat} must be embedded"));
+            assert!(
+                role.output_schema.is_none(),
+                "{seat} must NOT declare an output_schema — schema+tools makes \
+                 the model fabricate instead of exploring (#1222)"
+            );
+            assert!(
+                !role.tool_palette.allow.is_empty(),
+                "{seat} must grant tools — evidence-gathering is its whole point"
+            );
+            for denied in ["edit", "write"] {
+                assert!(
+                    role.tool_palette.deny.iter().any(|t| t == denied),
+                    "{seat} must deny {denied:?} — advocates are read-only"
+                );
+            }
+        }
+        let judge = roles
+            .iter()
+            .find(|r| r.id == "dialectic-judge")
+            .expect("dialectic-judge must be embedded");
+        assert!(
+            judge.output_schema.is_none(),
+            "dialectic-judge must NOT declare an output_schema — the contract \
+             is reason-then-fenced-JSON so reasoning models keep their room (#1222)"
+        );
+        assert!(
+            judge.tool_palette.allow.is_empty(),
+            "dialectic-judge is tool-less by design — it rules on the record"
+        );
+        for denied in ["read", "write", "edit", "exec", "process"] {
+            assert!(
+                judge.tool_palette.deny.iter().any(|t| t == denied),
+                "dialectic-judge must EXPLICITLY deny {denied:?} — an empty \
+                 palette silently grants the full catalog (#1197 bench-role rule)"
+            );
+        }
+        let prompt_for = |id: &str| {
+            BUILTIN_ROLE_PROMPTS
+                .iter()
+                .find(|(pid, _)| *pid == id)
+                .map(|(_, c)| *c)
+                .unwrap_or_else(|| panic!("{id} prompt must be embedded"))
+        };
+        let prosecutor = prompt_for("dialectic-prosecutor");
+        for needle in [
+            "CHARGE 1 [",
+            "CHARGE 2 [",
+            "CHARGE <n>",
+            "CASE: rested",
+            "CASE: no-charges",
+            "you are bad at those",
+            "no cap on charges",
+            "problem it is fixing",
+        ] {
+            assert!(
+                prosecutor.contains(needle),
+                "dialectic-prosecutor.md must contain {needle:?} (#1222 contract)"
+            );
+        }
+        let defender = prompt_for("dialectic-defender");
+        for needle in ["REBUTTAL", "DEFENSE: rests", "refute", "mitigate", "concede"] {
+            assert!(
+                defender.contains(needle),
+                "dialectic-defender.md must contain {needle:?} (#1222 contract)"
+            );
+        }
+        let judge_prompt = prompt_for("dialectic-judge");
+        for needle in [
+            "sustained",
+            "dismissed",
+            "decisive_evidence",
+            "fenced JSON block",
+            "no tools, by design",
+            "every charge number presented",
+        ] {
+            assert!(
+                judge_prompt.contains(needle),
+                "dialectic-judge.md must contain {needle:?} (#1222 contract)"
             );
         }
     }
