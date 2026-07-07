@@ -473,17 +473,45 @@ fn normalize_anchor(a: &str) -> &str {
     diff_line_content(a.trim()).trim()
 }
 
+/// Whitespace runs collapsed to single spaces — the form both sides of a
+/// wrapped-line match are reduced to.
+fn collapse_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The diff's CONTENT (markers stripped) joined into one whitespace-collapsed
+/// string. The fallback haystack for quotes of a LOGICAL line the diff wraps
+/// across physical lines. Shakedown-1 (#1222): the prosecutor quoted
+/// `const gapStart = lastRecord ? lastRecord.billingEndAt.plus({` — a direct
+/// hit on the case's labeled bug — but the diff breaks that expression after
+/// `lastRecord`, so per-line containment struck the charge and the case
+/// scored as a clean pass. Wrapped quotes are legitimate verbatim evidence;
+/// only per-PHYSICAL-line matching says otherwise.
+fn collapsed_diff_content(diff: &str) -> String {
+    collapse_ws(
+        &diff
+            .lines()
+            .map(diff_line_content)
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
 /// Strike every charge whose anchor is not a line in the diff — fabricated
 /// (or mistyped) evidence never reaches the defense or the judge. Returns
 /// the struck count.
 pub fn validate_charge_anchors(charges: &mut [Charge], diff: &str) -> usize {
+    let collapsed = collapsed_diff_content(diff);
     let mut struck = 0usize;
     for c in charges.iter_mut() {
         let Some(anchor) = c.anchor.as_deref() else {
             continue; // general charge — nothing to verify mechanically
         };
         let a = normalize_anchor(anchor);
-        let found = diff.lines().any(|l| diff_line_content(l).contains(a));
+        // Per-physical-line first; the collapsed haystack catches verbatim
+        // quotes of a logical line the diff wraps (shakedown-1 false strike).
+        let found = diff.lines().any(|l| diff_line_content(l).contains(a))
+            || collapsed.contains(&collapse_ws(a));
         if !found {
             c.struck = true;
             struck += 1;
@@ -518,6 +546,7 @@ pub fn validate_rebuttal_quotes(
             .or_insert_with(|| std::fs::read_to_string(root.join(rel)).ok())
             .clone()
     };
+    let collapsed = collapsed_diff_content(diff);
     let mut voided = 0usize;
     for r in rebuttals.iter_mut() {
         let spans: Vec<String> = backtick_spans(&r.body)
@@ -536,9 +565,12 @@ pub fn validate_rebuttal_quotes(
         let all_found = spans.iter().all(|span| {
             let s = normalize_anchor(span);
             diff.lines().any(|l| diff_line_content(l).contains(s))
-                || paths
-                    .iter()
-                    .any(|p| read(root, p).is_some_and(|body| body.contains(s)))
+                || collapsed.contains(&collapse_ws(s))
+                || paths.iter().any(|p| {
+                    read(root, p).is_some_and(|body| {
+                        body.contains(s) || collapse_ws(&body).contains(&collapse_ws(s))
+                    })
+                })
         });
         if !all_found {
             r.voided = true;
@@ -548,18 +580,46 @@ pub fn validate_rebuttal_quotes(
     voided
 }
 
-/// Every backtick-quoted span in `s`.
+/// Every SINGLE-backtick inline span in `s`, skipping fenced regions.
+/// Rebuttal bodies carry ```-fenced code blocks (the marker parser folds
+/// them inline), and a naive pairwise scanner treats fence backticks as
+/// span delimiters — producing garbage "spans" that can never validate.
+/// Shakedown-1 (#1222): that voided 8 of 9 honest rebuttals, telling the
+/// judge to distrust defenses that were quoting the diff verbatim. Runs of
+/// 2+ backticks toggle fence state and cancel any open inline span; only
+/// single-backtick pairs outside a fence produce spans. An unclosed fence
+/// swallows the remainder (fewer spans → skip-validation, never a void).
 fn backtick_spans(s: &str) -> Vec<String> {
+    let chars: Vec<char> = s.chars().collect();
     let mut out = Vec::new();
-    let mut rest = s;
-    while let Some(open) = rest.find('`') {
-        let after = &rest[open + 1..];
-        let Some(close) = after.find('`') else { break };
-        let inner = after[..close].trim();
-        if !inner.is_empty() {
-            out.push(inner.to_string());
+    let mut in_fence = false;
+    let mut span_start: Option<usize> = None;
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '`' {
+            i += 1;
+            continue;
         }
-        rest = &after[close + 1..];
+        let mut j = i;
+        while j < chars.len() && chars[j] == '`' {
+            j += 1;
+        }
+        if j - i >= 2 {
+            in_fence = !in_fence;
+            span_start = None;
+        } else if !in_fence {
+            match span_start.take() {
+                None => span_start = Some(j),
+                Some(start) => {
+                    let inner: String = chars[start..i].iter().collect();
+                    let inner = inner.trim();
+                    if !inner.is_empty() {
+                        out.push(inner.to_string());
+                    }
+                }
+            }
+        }
+        i = j;
     }
     out
 }
@@ -602,7 +662,21 @@ pub fn charged_excerpts(diff: &str, charges: &[Charge]) -> String {
             continue;
         };
         let a = normalize_anchor(anchor);
-        if let Some(idx) = lines.iter().position(|l| diff_line_content(l).contains(a)) {
+        // Per-line locate first; wrapped logical-line quotes fall back to the
+        // first physical line whose content opens the quote (same class as
+        // the validate_charge_anchors fallback — the window just needs to
+        // land in the right neighborhood, ±context covers the rest).
+        let idx = lines
+            .iter()
+            .position(|l| diff_line_content(l).contains(a))
+            .or_else(|| {
+                let ca = collapse_ws(a);
+                lines.iter().position(|l| {
+                    let cl = collapse_ws(diff_line_content(l));
+                    cl.len() >= 4 && ca.starts_with(&cl)
+                })
+            });
+        if let Some(idx) = idx {
             let start = idx.saturating_sub(EXCERPT_CONTEXT_LINES);
             let end = (idx + EXCERPT_CONTEXT_LINES).min(lines.len().saturating_sub(1));
             ranges.push((start, end, vec![c.number]));
@@ -1230,6 +1304,104 @@ mod tests {
             struck: false,
         }];
         assert_eq!(charged_excerpts(DIFF, &general), DIFF);
+    }
+
+    /// Shakedown-1 regression (#1222): the prosecutor quoted the LOGICAL line
+    /// `const gapStart = lastRecord ? lastRecord.billingEndAt.plus({` — a
+    /// direct hit on the case's labeled bug — but the diff wraps that
+    /// expression across two physical lines, so per-line matching struck the
+    /// charge and the bug case scored as a clean pass. Wrapped verbatim
+    /// quotes must survive validation AND still locate an excerpt window.
+    #[test]
+    fn wrapped_logical_line_anchor_survives_and_excerpts() {
+        let mut wrapped = String::from("--- a/charges.ts\n+++ b/charges.ts\n");
+        for i in 0..80 {
+            wrapped.push_str(&format!(" ctx {i}\n"));
+        }
+        wrapped.push_str("+      const gapStart = lastRecord\n");
+        wrapped.push_str("+        ? lastRecord.billingEndAt.plus({\n");
+        wrapped.push_str("+            days: 1,\n");
+        for i in 0..80 {
+            wrapped.push_str(&format!(" tail {i}\n"));
+        }
+        let mut charges = vec![Charge {
+            number: 1,
+            model_number: 1,
+            path: "charges.ts".into(),
+            anchor: Some(
+                "const gapStart = lastRecord ? lastRecord.billingEndAt.plus({".into(),
+            ),
+            body: "boundary double-count".into(),
+            struck: false,
+        }];
+        assert_eq!(
+            validate_charge_anchors(&mut charges, &wrapped),
+            0,
+            "a verbatim quote of a wrapped logical line must not be struck"
+        );
+        assert!(!charges[0].struck);
+        let ex = charged_excerpts(&wrapped, &charges);
+        assert!(ex.contains("diff excerpt (charge 1)"));
+        assert!(ex.contains("const gapStart = lastRecord"));
+        // A genuinely fabricated wrapped-style quote still strikes.
+        let mut fake = vec![Charge {
+            number: 1,
+            model_number: 1,
+            path: "charges.ts".into(),
+            anchor: Some("const gapStart = firstRecord ? something.else.entirely({".into()),
+            body: "fabricated".into(),
+            struck: false,
+        }];
+        assert_eq!(validate_charge_anchors(&mut fake, &wrapped), 1);
+    }
+
+    /// Shakedown-1 regression (#1222): rebuttal bodies carry ```-fenced code
+    /// blocks (folded inline by the marker parser); the naive backtick
+    /// scanner turned fence backticks into span delimiters, producing
+    /// garbage spans that voided 8 of 9 honest rebuttals. Fenced content
+    /// must be ignored; real inline citations still validate; fabricated
+    /// inline citations still void.
+    #[test]
+    fn fenced_code_block_does_not_void_honest_rebuttal() {
+        let charges = vec![Charge {
+            number: 1,
+            model_number: 1,
+            path: "billing.ts".into(),
+            anchor: None,
+            body: "b".into(),
+            struck: false,
+        }];
+        let root = std::env::temp_dir().join(format!("dmx-fence-test-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        // Honest: one real inline span (verbatim from the diff) + a folded
+        // fenced block whose content is NOT a verbatim line anywhere.
+        let mut rebuttals = vec![
+            Rebuttal {
+                charge: 1,
+                stance: Stance::Concede,
+                raw_stance: "concede".into(),
+                body: "The charge holds — `const total = base * rate` mixes units. \
+                       ```typescript const paraphrased = whatIRemember(of, it) ``` \
+                       shows the shape."
+                    .into(),
+                voided: false,
+            },
+            Rebuttal {
+                charge: 1,
+                stance: Stance::Refute,
+                raw_stance: "refute".into(),
+                body: "Guarded by `a_line_that_exists_nowhere_at_all()` upstream.".into(),
+                voided: false,
+            },
+        ];
+        let voided = validate_rebuttal_quotes(&mut rebuttals, &charges, DIFF, Some(&root));
+        assert_eq!(voided, 1, "only the fabricated inline citation voids");
+        assert!(
+            !rebuttals[0].voided,
+            "fence content must not manufacture unverifiable spans"
+        );
+        assert!(rebuttals[1].voided);
+        std::fs::remove_dir_all(&root).ok();
     }
 
     // ── synthesis + the full chain ────────────────────────────────────
