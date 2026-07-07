@@ -1270,10 +1270,30 @@ enum LabCmd {
         /// production agentic condition (#1197). Requires --workdirs.
         #[arg(long)]
         agentic: bool,
-        /// Agentic evidence root: one subdirectory per case id holding that
-        /// case's repo tree (`git archive <commit> | tar -x -C <root>/<id>`).
-        #[arg(long, requires = "agentic")]
+        /// (#1222) Dispatch the dialectic (adversarial) pipeline instead of a
+        /// single reviewer: prosecutor → defender → judge as three chained
+        /// dispatches; the judge's sustained charges are the review, and each
+        /// case's debate envelope lands beside scores.json. The advocates run
+        /// agentic, so this requires --workdirs.
+        #[arg(long, conflicts_with_all = ["freeform", "agentic"])]
+        dialectic: bool,
+        /// Evidence root for --agentic / --dialectic: one subdirectory per
+        /// case id holding that case's repo tree
+        /// (`git archive <commit> | tar -x -C <root>/<id>`).
+        #[arg(long)]
         workdirs: Option<std::path::PathBuf>,
+        /// (#1222) Per-seat profile override (dialectic); falls back to
+        /// --profile. Debug phase: leave unset — one profile, all seats.
+        #[arg(long = "prosecutor-profile", requires = "dialectic")]
+        prosecutor_profile: Option<String>,
+        /// (#1222) Per-seat profile override (dialectic); falls back to --profile.
+        #[arg(long = "defender-profile", requires = "dialectic")]
+        defender_profile: Option<String>,
+        /// (#1222) Per-seat profile override (dialectic); falls back to
+        /// --profile. The later single-variable escalation: point this at a
+        /// denser local or remote-endpoint profile while the advocates stay.
+        #[arg(long = "judge-profile", requires = "dialectic")]
+        judge_profile: Option<String>,
     },
     /// Loop lab (#986) — run ONE dispatch under a chosen harness config and
     /// classify how the loop behaved: productive / struggled / inert-false-pass
@@ -3786,7 +3806,11 @@ fn cmd_lab(sub: LabCmd) -> Result<i32> {
             scores_out,
             freeform,
             agentic,
+            dialectic,
             workdirs,
+            prosecutor_profile,
+            defender_profile,
+            judge_profile,
         } => {
             lab::review_bench::run_review_bench(lab::review_bench::ReviewBenchOpts {
                 cases_dir: std::path::PathBuf::from(cases_dir),
@@ -3794,7 +3818,9 @@ fn cmd_lab(sub: LabCmd) -> Result<i32> {
                 config_path: profiles,
                 timeout_seconds: timeout,
                 scores_out,
-                mode: if agentic {
+                mode: if dialectic {
+                    lab::review_bench::BenchMode::Dialectic
+                } else if agentic {
                     lab::review_bench::BenchMode::Agentic
                 } else if freeform {
                     lab::review_bench::BenchMode::FreeForm
@@ -3802,6 +3828,9 @@ fn cmd_lab(sub: LabCmd) -> Result<i32> {
                     lab::review_bench::BenchMode::Strict
                 },
                 workdirs,
+                prosecutor_profile,
+                defender_profile,
+                judge_profile,
             })?;
             Ok(0)
         }

@@ -188,6 +188,13 @@ pub enum BenchMode {
     /// evidence access. Diff-only cells measured 0–2/18 recall across both
     /// tiers (2026-07-05); this mode measures whether access is the lever.
     Agentic,
+    /// (#1222) The dialectic (adversarial) condition: prosecutor → defender
+    /// → judge as three chained per-seat dispatches (`lab::dialectic`).
+    /// Advocates run agentic (per-case repo tree mounted, like `Agentic`);
+    /// the judge is tool-less and rules on the record. The judge's sustained
+    /// charges become the review, scored by the same matcher as every other
+    /// mode — the dialectic is entirely upstream of scoring.
+    Dialectic,
 }
 
 impl BenchMode {
@@ -196,6 +203,10 @@ impl BenchMode {
             BenchMode::Strict => "pr-reviewer",
             BenchMode::FreeForm => "pr-reviewer-freeform",
             BenchMode::Agentic => "pr-reviewer-agentic",
+            // The dialectic mode dispatches three per-seat roles; the
+            // per-case loop branches to `run_debate` before ever asking the
+            // mode for a single role id.
+            BenchMode::Dialectic => unreachable!("dialectic dispatches per-seat roles"),
         }
     }
 
@@ -204,6 +215,7 @@ impl BenchMode {
             BenchMode::Strict => "strict",
             BenchMode::FreeForm => "freeform",
             BenchMode::Agentic => "agentic",
+            BenchMode::Dialectic => "dialectic",
         }
     }
 }
@@ -221,9 +233,17 @@ pub struct ReviewBenchOpts {
     /// CASE ID — the repository tree at that case's reviewed commit (built by
     /// the operator, e.g. `git archive <commit> | tar -x`; the bench never
     /// touches the source repos). Each case's tree mounts as the dispatch
-    /// workdir. Required when `mode == Agentic`; a case with no tree bails
-    /// the bench loudly — a half-agentic run would corrupt comparability.
+    /// workdir. Required when `mode == Agentic` (and `Dialectic`, whose
+    /// advocates run agentic); a case with no tree bails the bench loudly —
+    /// a half-agentic run would corrupt comparability.
     pub workdirs: Option<PathBuf>,
+    /// (#1222) Per-seat profile overrides for `Dialectic`; each seat falls
+    /// back to `profile_name`. Debug phase runs ONE local profile in all
+    /// three seats — same weights everywhere, so any delta vs the solo
+    /// baseline is attributable purely to the structure.
+    pub prosecutor_profile: Option<String>,
+    pub defender_profile: Option<String>,
+    pub judge_profile: Option<String>,
 }
 
 pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
@@ -239,9 +259,12 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
     let workdir_for = |case_id: &str| -> Option<PathBuf> {
         opts.workdirs.as_ref().map(|root| root.join(case_id))
     };
-    if opts.mode == BenchMode::Agentic {
+    if matches!(opts.mode, BenchMode::Agentic | BenchMode::Dialectic) {
         let root = opts.workdirs.as_ref().ok_or_else(|| {
-            anyhow!("--agentic requires --workdirs <root> (one repo tree per case id)")
+            anyhow!(
+                "--{} requires --workdirs <root> (one repo tree per case id)",
+                opts.mode.label()
+            )
         })?;
         let missing: Vec<&str> = cases
             .iter()
@@ -250,12 +273,18 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
             .collect();
         if !missing.is_empty() {
             return Err(anyhow!(
-                "agentic mode: no repo tree under {} for case(s): {} — build each with \
+                "{} mode: no repo tree under {} for case(s): {} — build each with \
                  `git archive <reviewed-commit> | tar -x -C <root>/<case-id>`",
+                opts.mode.label(),
                 root.display(),
                 missing.join(", ")
             ));
         }
+    } else if opts.workdirs.is_some() {
+        return Err(anyhow!(
+            "--workdirs only applies to --agentic / --dialectic (diff-only modes \
+             never read a repo tree; passing one would silently measure nothing)"
+        ));
     }
     eprintln!(
         "pr-review-bench: {} cases · profile={} · profiles-file={} · mode={}",
@@ -267,18 +296,78 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
     println!("{:<34}{:<7}{:<7}{:<4}outcome", "case", "kind", "verd", "f");
     let mut scored: Vec<(&Case, CaseScore)> = Vec::new();
     let mut meta: Vec<EnvelopeMeta> = Vec::new();
+    // (#1222) Dialectic mode's composite artifacts: one debate envelope per
+    // case, written beside scores.json — the dispatches stay atomic; the
+    // debate exists as an artifact, not a flow shape.
+    let mut debates: Vec<super::dialectic::DebateEnvelope> = Vec::new();
     for c in &cases {
-        let prompt = build_prompt(c, opts.mode);
-        let workdir = (opts.mode == BenchMode::Agentic)
-            .then(|| workdir_for(&c.id))
-            .flatten();
-        let stdout = dispatch_case(&prompt, &c.id, workdir, &opts)
+        let review = if opts.mode == BenchMode::Dialectic {
+            use super::dialectic::Seat;
+            let workdir = workdir_for(&c.id);
+            let (review, debate) =
+                super::dialectic::run_debate(c, workdir.as_deref(), |seat, prompt| {
+                    let profile = match seat {
+                        Seat::Prosecutor => opts.prosecutor_profile.as_deref(),
+                        Seat::Defender => opts.defender_profile.as_deref(),
+                        Seat::Judge => opts.judge_profile.as_deref(),
+                    };
+                    // The judge is tool-less by design — no tree mounted; it
+                    // rules on the record the prompt carries.
+                    let wd = if seat == Seat::Judge {
+                        None
+                    } else {
+                        workdir.clone()
+                    };
+                    dispatch_case(
+                        prompt,
+                        &format!("{}-{}", c.id, seat.label()),
+                        wd,
+                        seat.role_id(),
+                        profile,
+                        &opts,
+                    )
+                })
+                .with_context(|| format!("debating case {}", c.id))?;
+            // One meta row per case: the prosecutor's model (debug phase: all
+            // seats share it) + the debate's TOTAL token cost across seats —
+            // tokens_to_solution stays the honest full price of the review.
+            let seat_tokens = |r: &Option<super::dialectic::SeatRecord>| {
+                r.as_ref().and_then(|s| s.total_tokens)
+            };
+            let mut total = debate.prosecutor.total_tokens;
+            for t in [seat_tokens(&debate.defender), seat_tokens(&debate.judge)] {
+                total = match (total, t) {
+                    (Some(a), Some(b)) => Some(a + b),
+                    (a, None) => a,
+                    (None, b) => b,
+                };
+            }
+            meta.push(EnvelopeMeta {
+                model: debate.prosecutor.model.clone(),
+                total_tokens: total,
+            });
+            debates.push(debate);
+            review
+        } else {
+            let prompt = build_prompt(c, opts.mode);
+            let workdir = (opts.mode == BenchMode::Agentic)
+                .then(|| workdir_for(&c.id))
+                .flatten();
+            let stdout = dispatch_case(
+                &prompt,
+                &c.id,
+                workdir,
+                opts.mode.role_id(),
+                None,
+                &opts,
+            )
             .with_context(|| format!("dispatching case {}", c.id))?;
-        meta.push(envelope_meta(&stdout));
-        let reply = extract_reply_text(&stdout);
-        let review = match opts.mode {
-            BenchMode::Strict => parse_review(&reply),
-            BenchMode::FreeForm | BenchMode::Agentic => parse_freeform_review(&reply),
+            meta.push(envelope_meta(&stdout));
+            let reply = extract_reply_text(&stdout);
+            match opts.mode {
+                BenchMode::Strict => parse_review(&reply),
+                _ => parse_freeform_review(&reply),
+            }
         };
         let s = score(&c.label, &review);
         println!(
@@ -289,6 +378,22 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
             s.findings,
             describe(&c.label, &s),
         );
+        if let (BenchMode::Dialectic, Some(d)) = (opts.mode, debates.last()) {
+            println!(
+                "{:<34}↳ charges {} (struck {}) · answers {} (voided {}) · sustained {}{}",
+                "",
+                d.charges.len(),
+                d.struck_charges,
+                d.rebuttals.len(),
+                d.voided_rebuttals,
+                d.sustained,
+                if d.defense_degenerate {
+                    " · DEFENSE DEGENERATE"
+                } else {
+                    ""
+                },
+            );
+        }
         scored.push((c, s));
     }
     print_summary(&scored, &opts);
@@ -296,7 +401,21 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
     // dual-key score substrate (#1197). Failure to persist is a WARNING, not
     // a bench failure: the operator already has the stdout report.
     match write_scores_artifact(&scored, &meta, &opts) {
-        Ok(path) => eprintln!("scores: {}", path.display()),
+        Ok(path) => {
+            eprintln!("scores: {}", path.display());
+            // (#1222) The debate envelopes land beside scores.json — the
+            // audit artifact: every sustained finding's evidence chain.
+            if !debates.is_empty() {
+                let dpath = path.with_file_name("debates.json");
+                let write = serde_json::to_vec_pretty(&debates)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|b| std::fs::write(&dpath, b).map_err(anyhow::Error::from));
+                match write {
+                    Ok(()) => eprintln!("debates: {}", dpath.display()),
+                    Err(e) => eprintln!("debates: WARNING — artifact not written: {e:#}"),
+                }
+            }
+        }
         Err(e) => eprintln!("scores: WARNING — artifact not written: {e:#}"),
     }
     Ok(())
@@ -393,6 +512,9 @@ fn build_prompt(c: &Case, mode: BenchMode) -> String {
     let instruction = match mode {
         BenchMode::Strict => "Respond per your role contract (the single JSON object).",
         BenchMode::FreeForm | BenchMode::Agentic => "Write your review per your role contract.",
+        // Dialectic never reaches build_prompt — the per-case loop hands the
+        // case to `lab::dialectic::run_debate`, which builds per-seat prompts.
+        BenchMode::Dialectic => unreachable!("dialectic builds per-seat prompts"),
     };
     // The evidence sentence is the mode's load-bearing difference: the
     // diff-only modes must SAY the diff is all there is (an honest reviewer
@@ -408,6 +530,7 @@ fn build_prompt(c: &Case, mode: BenchMode) -> String {
              checked out in your working directory — read the surrounding code to \
              verify your hypotheses before concluding."
         }
+        BenchMode::Dialectic => unreachable!("dialectic builds per-seat prompts"),
     };
     format!(
         "PR review request: {title}\n\n\
@@ -423,13 +546,16 @@ fn build_prompt(c: &Case, mode: BenchMode) -> String {
     )
 }
 
-/// Dispatch one case through the mode's role (`pr-reviewer` or
-/// `pr-reviewer-freeform`) on the internal runtime, returning the raw
-/// `--json` envelope stdout (parsed by `extract_reply_text`).
+/// Dispatch one case (or one dialectic seat) through `role_id` on the
+/// internal runtime, returning the raw `--json` envelope stdout (parsed by
+/// `extract_reply_text`). `profile` overrides `opts.profile_name` for this
+/// dispatch — the per-seat profile hook (#1222).
 fn dispatch_case(
     prompt: &str,
     case_id: &str,
     workdir: Option<PathBuf>,
+    role_id: &str,
+    profile: Option<&str>,
     opts: &ReviewBenchOpts,
 ) -> Result<String> {
     use darkmux_crew::dispatch::{dispatch, CompactionDispatchArgs, DispatchOpts, Runtime};
@@ -442,7 +568,7 @@ fn dispatch_case(
             .unwrap_or(0)
     );
     let d = DispatchOpts {
-        role_id: opts.mode.role_id().to_string(),
+        role_id: role_id.to_string(),
         message: prompt.to_string(),
         deliver: None,
         session_id: Some(session_id),
@@ -460,7 +586,9 @@ fn dispatch_case(
         wait: true,
         // pr-review is single-turn; no compaction to override.
         compaction: CompactionDispatchArgs::default(),
-        profile_name: opts.profile_name.clone(),
+        profile_name: profile
+            .map(str::to_string)
+            .or_else(|| opts.profile_name.clone()),
         config_path: opts.config_path.clone(),
         // (#1199) Bench-only knobs; defaults preserve existing behavior.
         force_container: false,
