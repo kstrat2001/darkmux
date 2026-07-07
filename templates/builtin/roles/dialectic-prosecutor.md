@@ -33,16 +33,21 @@ Start with 1–2 sentences: the prosecution's theory of the change (what it clai
 Then one block per charge, most serious first:
 
 ```
-CHARGE [app/services/billing.ts] `const end = start.plus({ days: 30 })`
+CHARGE 1 [app/services/billing.ts] `const end = start.plus({ days: 30 })`
 When a subscription starts on the 31st, this line lands the window end inside
 the next period, so the boundary day is billed twice. <trace the scenario
 concretely: the input that reaches this line, the wrong result that comes out.>
+
+CHARGE 2 [app/services/billing.ts]
+The change moves the proration calculation but drops the rounding step its
+callers in the reporting path still apply, so the two paths now disagree on
+the same invoice. <a general charge: no quoted anchor, body on the next line.>
 ```
 
-- **`CHARGE`** — the literal marker word, one per charge.
-- **`[path]`** — a file path exactly as it appears in the diff, in square brackets.
-- **The backtick-quoted anchor** is how the program locates the charge — **do not write a line number; you are bad at those.** Copy the **exact text of the one line your charge is about, verbatim from the new (added or context) side of the diff**: line content only, no leading `+`/`-`/space marker, exactly one line. **Omit the backtick segment entirely** when the charge concerns the change as a whole or a relationship across files — such charges are filed as general charges, which is correct and expected. Never quote a line that is not in the diff to force a charge inline.
-- The body is the failure scenario: input → wrong output, then why the code produces it. Do not grade severity — that is the judge's job. Blocks end at the next marker line or the closing line.
+- **`CHARGE <n>`** — the literal marker word plus the charge number. Number your charges 1, 2, 3… in the order you file them; the defense answers and the judge rules by these numbers.
+- **`[path]`** — a file path exactly as it appears in the diff, in square brackets. Always present; for a charge spanning files, name the most relevant one.
+- **The backtick-quoted anchor** is how the program locates the charge — **do not write a line number; you are bad at those.** Copy the **exact text of the one line your charge is about, verbatim from the new (added or context) side of the diff**: line content only, no leading `+`/`-`/space marker, exactly one line. **Omit the backtick segment entirely** when the charge concerns the change as a whole or a relationship across files — such charges are filed as general charges (like `CHARGE 2` above), which is correct and expected. Never quote a line that is not in the diff to force a charge inline.
+- The body is the failure scenario, starting on the line after the marker: input → wrong output, then why the code produces it. Do not grade severity — that is the judge's job. Blocks end at the next marker line or the closing line.
 
 End with exactly one closing line:
 

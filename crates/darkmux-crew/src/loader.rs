@@ -760,8 +760,11 @@ mod tests {
     /// - Advocates (prosecutor, defender) are agentic: tools granted, NO
     ///   output_schema (grammar + tools makes the model fabricate — the same
     ///   verified finding the agentic reviewer's contract pins), freeform
-    ///   marker output (`CHARGE` / `REBUTTAL n: <stance>`) with a literal
-    ///   closing line.
+    ///   marker output (`CHARGE <n>` / `REBUTTAL <n>: <stance>`) with a
+    ///   literal closing line. Charge numbering is EXPLICIT in the marker —
+    ///   positional numbering derived at parse time would let one misparsed
+    ///   body line shift every downstream number and desync
+    ///   rebuttals ↔ verdicts (frontier QA finding on the P0 PR).
     /// - The judge is deliberately tool-less (rules on the presented record;
     ///   explicit deny list per the #1197 empty-palette rule) and has NO
     ///   output_schema (reason-freely-then-one-fenced-JSON keeps reasoning
@@ -819,7 +822,9 @@ mod tests {
         };
         let prosecutor = prompt_for("dialectic-prosecutor");
         for needle in [
-            "CHARGE",
+            "CHARGE 1 [",
+            "CHARGE 2 [",
+            "CHARGE <n>",
             "CASE: rested",
             "CASE: no-charges",
             "you are bad at those",
