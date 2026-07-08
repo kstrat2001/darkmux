@@ -748,8 +748,16 @@ pub fn run(
         // stall-arm's `messages.pop()` rationale: leaving the noise
         // in history would anchor the model on the failed pattern
         // AND inflate prompt_tokens on every subsequent turn.
+        // "At the cap" is tolerance-matched, not equality-matched: LMStudio
+        // reports cap-1 live (observed across four #1222 shakedowns:
+        // 9999 @ cap 10000, 29999 @ cap 30000 — it stops before the token
+        // that would exceed). An exact `== per_call_cap` never matches in
+        // production, which silently killed both this salvage AND the
+        // #1221 cliff recovery below on real dispatches.
+        let at_cap = this_turn_completion_tokens
+            .is_some_and(|t| t.saturating_add(1) >= per_call_cap);
         let salvaged_per_turn_cap = finish_reason == "length"
-            && this_turn_completion_tokens == Some(per_call_cap)
+            && at_cap
             && assistant_message_has_well_formed_tool_calls(&assistant_message);
         if salvaged_per_turn_cap {
             let salvaged_count = count_well_formed_tool_calls(&assistant_message);
@@ -1265,7 +1273,12 @@ pub fn run(
                 // finish BELOW the cap (context overflow: prompt_tokens
                 // crossed the loaded window) stays a hard error, because
                 // that's a config problem recovery cannot fix.
-                let cap_cliff = this_turn_completion_tokens == Some(per_call_cap);
+                // Tolerance-matched like the salvage arm: LMStudio reports
+                // cap-1 live, so equality misses by one token and misroutes
+                // a cap hit to the overflow hard error (run-4 killed a
+                // 14-turn prosecution at 29999/30000 exactly this way).
+                let cap_cliff = this_turn_completion_tokens
+                    .is_some_and(|t| t.saturating_add(1) >= per_call_cap);
                 if !is_useless_stall && !cap_cliff {
                     return Err(anyhow!(
                         "model returned finish_reason=length with partial content \
@@ -2872,7 +2885,10 @@ mod tests {
                 None,
                 "length",
                 100,
-                MAX_TOKENS_PER_CALL,
+                // cap-1: the LIVE-observed shape (LMStudio stops before the
+                // token that would exceed the cap) — pins the tolerance
+                // match, since exact equality never occurs in production.
+                MAX_TOKENS_PER_CALL - 1,
             ));
         });
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
