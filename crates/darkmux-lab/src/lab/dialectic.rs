@@ -552,6 +552,13 @@ pub fn validate_rebuttal_quotes(
         let spans: Vec<String> = backtick_spans(&r.body)
             .into_iter()
             .filter(|s| s.trim().len() >= MIN_EVIDENCE_SPAN)
+            // A backticked `[path]` is a FILE REFERENCE, not an evidence
+            // quote — defenders habitually write `[app/x.ts]` with the
+            // brackets inside the backticks. Shakedown-1+3 (#1222): that
+            // single span failed lookup in 9 of 9 voided rebuttals and
+            // discredited every honest defense. (The path itself is still
+            // harvested by bracket_paths below — it scans the whole body.)
+            .filter(|s| !is_bracketed_path(s))
             .collect();
         if spans.is_empty() {
             continue;
@@ -622,6 +629,14 @@ fn backtick_spans(s: &str) -> Vec<String> {
         i = j;
     }
     out
+}
+
+/// True when the span is exactly one `[bracketed]` path-looking reference —
+/// the shape defenders emit as `` `[app/x.ts]` `` (a citation of WHERE, not
+/// WHAT; never validated as an evidence quote).
+fn is_bracketed_path(s: &str) -> bool {
+    let t = s.trim();
+    t.starts_with('[') && t.ends_with(']') && bracket_paths(t).len() == 1
 }
 
 /// `[bracketed]` spans that look like file paths (contain `/` or `.`).
@@ -1401,6 +1416,42 @@ mod tests {
             "fence content must not manufacture unverifiable spans"
         );
         assert!(rebuttals[1].voided);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Shakedown-1+3 regression (#1222): defenders write the file reference
+    /// with the brackets INSIDE the backticks — `` `[app/x.ts]` `` — and
+    /// that span (a WHERE, not a WHAT) failed evidence lookup in 9 of 9
+    /// voided rebuttals, discrediting every honest defense. Path-shaped
+    /// spans are file references, never validated as quotes.
+    #[test]
+    fn backticked_path_reference_is_not_an_evidence_span() {
+        let charges = vec![Charge {
+            number: 1,
+            model_number: 1,
+            path: "billing.ts".into(),
+            anchor: None,
+            body: "b".into(),
+            struck: false,
+        }];
+        let root = std::env::temp_dir().join(format!("dmx-path-span-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut rebuttals = vec![Rebuttal {
+            charge: 1,
+            stance: Stance::Refute,
+            raw_stance: "refute".into(),
+            body: "The wrapper in `[inertia/pages/admin/Show.tsx]` uses \
+                   `const total = base * rate` which the diff shows."
+                .into(),
+            voided: false,
+        }];
+        let voided = validate_rebuttal_quotes(&mut rebuttals, &charges, DIFF, Some(&root));
+        assert_eq!(
+            voided, 0,
+            "a backticked [path] reference must not void a rebuttal whose \
+             real citation validates"
+        );
+        assert!(!rebuttals[0].voided);
         std::fs::remove_dir_all(&root).ok();
     }
 

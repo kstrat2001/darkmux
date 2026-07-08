@@ -2879,6 +2879,25 @@ impl TailerState {
                 if should_emit {
                     self.last_heartbeat_at = Some(now);
                     self.summary.heartbeats += 1;
+                    // (#1222 shakedown-3) Streamed chunks are the third
+                    // proof-of-work signal. A model.partial event only fires
+                    // when the model actually delivered tokens — transport-
+                    // level liveness, exactly what the watchdog exists to
+                    // check (a wedged server/network/container delivers no
+                    // chunks, so true hangs still die). Two dispatches were
+                    // killed mid-generation at 8+ minutes of LEGITIMATE
+                    // reasoning under a raised per-call cap because only
+                    // tool.completed/compaction reset the deadline.
+                    // Boundedness is not this guard's job (per-mole-hole,
+                    // #464): the per-call cap ends every turn, the stall
+                    // budget bounds repeated runaways, the detectors catch
+                    // patterns, max_turns/max_tokens bound totals. Reset
+                    // rides the heartbeat rate-limit gate, so it costs one
+                    // mutex write per HEARTBEAT_MIN_INTERVAL, not per chunk.
+                    if let Some(deadline) = &self.inactivity_deadline {
+                        *lock_deadline(deadline) =
+                            Instant::now() + Duration::from_secs(self.inactivity_secs);
+                    }
                     let payload = serde_json::json!({
                         "runtime": "internal",
                         "turn_seq": event.get("seq"),
@@ -6052,6 +6071,54 @@ mod tests {
         assert!(
             new_deadline >= expected_min,
             "deadline must reflect the latest reset, not stale to an earlier event"
+        );
+    }
+
+    /// (#1222 shakedown-3) Streamed chunks are the THIRD proof-of-work
+    /// signal: a `model.partial` event proves the model delivered tokens
+    /// (transport-level liveness), so it must reset the inactivity deadline.
+    /// Two dispatches were watchdog-killed 8+ minutes into legitimate
+    /// reasoning under a raised per-call cap because only tool.completed /
+    /// compaction reset it. A wedged server delivers no chunks → no events
+    /// → true hangs still die.
+    #[test]
+    fn tailer_model_partial_resets_the_inactivity_deadline() {
+        use std::io::Write;
+
+        let tmp = TempDir::new().unwrap();
+        let traj_path = tmp.path().join("trajectory.jsonl");
+
+        let inactivity_secs = 600u64;
+        let original_deadline = Instant::now() - Duration::from_secs(3600);
+        let shared = Arc::new(Mutex::new(original_deadline));
+
+        let mut state = TailerState::new(
+            traj_path.clone(),
+            "test-session".into(),
+            "test-role".into(),
+            "test-model".into(),
+            Arc::clone(&shared),
+            inactivity_secs,
+        );
+
+        let mut f = std::fs::File::create(&traj_path).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"model.partial","seq":4,"partial_index":120,"cumulative_chars":40960}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        let before_reset = Instant::now();
+        state.poll_and_emit();
+
+        let new_deadline = *shared.lock().unwrap();
+        let expected_min =
+            before_reset + Duration::from_secs(inactivity_secs) - Duration::from_millis(50);
+        assert!(
+            new_deadline >= expected_min,
+            "a streamed chunk (model.partial) must reset the inactivity \
+             deadline — an actively generating model is not a hung dispatch"
         );
     }
 
