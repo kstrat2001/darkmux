@@ -927,17 +927,15 @@ fn run_funnel_case(
         .collect::<Result<_>>()
         .with_context(|| format!("slicing bundle code for case {}", c.id))?;
 
-    let body = if c.label.intent_body.trim().is_empty() {
-        "(no description provided)"
-    } else {
-        c.label.intent_body.trim()
-    };
-    let intent = format!("{}\n\n{}", c.label.intent_title, body);
-
     let inputs = funnel::FunnelInputs {
         case_id: c.id.clone(),
         crew: &ctx.crew,
-        intent: &intent,
+        // Passed through raw — `judge_prompt` does the per-field
+        // default/strip itself now (byte-matching judge-runner.py's
+        // `judge_one`, #1256), so this caller no longer pre-joins
+        // title+body or pre-defaults the body.
+        intent_title: &c.label.intent_title,
+        intent_body: &c.label.intent_body,
         diff: &c.diff,
         mode: ctx.exec_mode,
         probe_system: &ctx.probe_system,

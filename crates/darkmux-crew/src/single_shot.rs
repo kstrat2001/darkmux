@@ -48,6 +48,14 @@ pub struct SingleShotReply {
 /// LOCAL dialect: `"max_tokens"` (not the hosted `"max_completion_tokens"`
 /// form built by `dispatch_internal::single_shot_body`), `"temperature"`,
 /// and `"stream": false` (this primitive is single-shot, not streamed).
+///
+/// `system` empty (after trimming) omits the system message ENTIRELY —
+/// `"messages"` carries only the user turn, matching the Phase A probe
+/// protocol byte-for-byte (`probe-runner.py`'s `call_model` sends
+/// `messages: [{"role": "user", ...}]`, no system role at all; the darkmux
+/// review-probe seat, #1256, is this primitive's first caller with a
+/// genuinely empty system). A non-empty `system` (e.g. the judge seat's
+/// PERSONA) still gets its own leading system message, unchanged.
 pub fn local_chat_body(
     model: &str,
     system: &str,
@@ -55,12 +63,17 @@ pub fn local_chat_body(
     temperature: f32,
     max_tokens: u32,
 ) -> serde_json::Value {
-    serde_json::json!({
-        "model": model,
-        "messages": [
+    let messages = if system.trim().is_empty() {
+        serde_json::json!([{ "role": "user", "content": user }])
+    } else {
+        serde_json::json!([
             { "role": "system", "content": system },
             { "role": "user", "content": user },
-        ],
+        ])
+    };
+    serde_json::json!({
+        "model": model,
+        "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
         "stream": false,
@@ -155,6 +168,108 @@ mod tests {
         assert_eq!(body["messages"][0]["content"], "sys");
         assert_eq!(body["messages"][1]["role"], "user");
         assert_eq!(body["messages"][1]["content"], "user msg");
+    }
+
+    #[test]
+    fn local_chat_body_omits_system_message_when_system_is_empty() {
+        // The Phase A probe parity fix (#1256): an empty system means NO
+        // system message on the wire at all — a single user-role message,
+        // matching probe-runner.py's `call_model` exactly. A blank/
+        // whitespace-only system is treated the same as fully empty.
+        let body = local_chat_body("m", "", "user msg", 0.2, 512);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1, "empty system -> exactly one message, the user turn");
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "user msg");
+
+        let whitespace_only = local_chat_body("m", "   \n", "user msg", 0.2, 512);
+        assert_eq!(whitespace_only["messages"].as_array().unwrap().len(), 1);
+    }
+
+    // ─── Phase A request-BODY parity (#1256 scope extension) ────────────
+    //
+    // Prompt-string parity (`darkmux-lab`'s funnel golden tests) proves the
+    // TEXT matches; these prove the FULL serialized request shape matches
+    // too — field set, message-array structure, and every non-content
+    // value — so a stray field (a `tools` array, a `top_p`, an accidental
+    // extra message) fails CI the same as prompt-text drift would. Golden
+    // field sets below are transcribed from the exact python dicts
+    // `probe-runner.py`'s `call_model` and `judge-runner.py`'s
+    // `call_judge` build (both read 2026-07 for #1256) — `json.dumps({...})`
+    // over those literal dicts round-trips to exactly the `serde_json::json!`
+    // literals asserted against here (verified by hand during development;
+    // see funnel.rs's golden-harness comment for the sibling prompt-text
+    // provenance note).
+
+    /// `body`'s `"temperature"` compared within tolerance (the f32->f64
+    /// widening every other test in this module already documents — 0.2f32
+    /// as f64 != 0.2f64 exactly), every other top-level field compared for
+    /// exact equality, AND the top-level field COUNT asserted so a stray
+    /// extra field (a `tools` array, a `top_p`) fails loudly even though
+    /// it'd otherwise be invisible to a "contains these fields" check.
+    fn assert_body_matches_golden_shape(body: &serde_json::Value, expected_temperature: f64, mut expected: serde_json::Value) {
+        expected.as_object_mut().expect("golden fixture is an object").remove("temperature");
+        let mut body_sans_temp = body.clone();
+        body_sans_temp.as_object_mut().unwrap().remove("temperature");
+        assert_eq!(
+            body_sans_temp, expected,
+            "every field but temperature must match Phase A's shape exactly"
+        );
+        assert!(
+            (body["temperature"].as_f64().unwrap() - expected_temperature).abs() < 1e-6,
+            "temperature: got {:?}, want ~{expected_temperature}",
+            body["temperature"]
+        );
+        assert_eq!(
+            body.as_object().unwrap().len(),
+            5,
+            "exactly 5 top-level fields (model, messages, temperature, max_tokens, stream) — \
+             no extra field (tools, top_p, ...) beyond Phase A's shape"
+        );
+    }
+
+    #[test]
+    fn local_chat_body_matches_phase_a_probe_golden_request_body() {
+        // probe-runner.py's `call_model`, MODELS["devstral"]: {"id":
+        // "mistralai/devstral-small-2-2512", "max_tokens": 3000}, TEMP=0.2,
+        // messages=[{"role": "user", "content": prompt}] — no system
+        // message, no "tools"/"top_p"/any other field.
+        let body = local_chat_body("mistralai/devstral-small-2-2512", "", "PROMPT_PLACEHOLDER", 0.2, 3000);
+        let expected = serde_json::json!({
+            "model": "mistralai/devstral-small-2-2512",
+            "messages": [
+                { "role": "user", "content": "PROMPT_PLACEHOLDER" },
+            ],
+            "temperature": 0.2,
+            "max_tokens": 3000,
+            "stream": false,
+        });
+        assert_body_matches_golden_shape(&body, 0.2, expected);
+    }
+
+    #[test]
+    fn local_chat_body_matches_phase_a_judge_golden_request_body() {
+        // judge-runner.py's `call_judge`: MODEL="qwen3.6-35b-a3b-turboquant-mlx",
+        // messages=[{"role": "system", "content": PERSONA}, {"role": "user",
+        // "content": user}], temperature=0.2, max_tokens=20000, stream=False.
+        let body = local_chat_body(
+            "qwen3.6-35b-a3b-turboquant-mlx",
+            "PERSONA_PLACEHOLDER",
+            "USER_PLACEHOLDER",
+            0.2,
+            20_000,
+        );
+        let expected = serde_json::json!({
+            "model": "qwen3.6-35b-a3b-turboquant-mlx",
+            "messages": [
+                { "role": "system", "content": "PERSONA_PLACEHOLDER" },
+                { "role": "user", "content": "USER_PLACEHOLDER" },
+            ],
+            "temperature": 0.2,
+            "max_tokens": 20000,
+            "stream": false,
+        });
+        assert_body_matches_golden_shape(&body, 0.2, expected);
     }
 
     #[test]

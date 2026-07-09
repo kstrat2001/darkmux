@@ -643,9 +643,13 @@ pub struct RunOpts {
     /// to `github`/`head_sha`.
     pub worktree: Option<PathBuf>,
     pub diff: PathBuf,
-    /// The author's stated intent for the change, fed into probe/judge
-    /// prompts. `None` -> "(no description provided)" (matches
-    /// `funnel::judge_prompt`'s own fallback).
+    /// The author's stated intent for the change, fed into the JUDGE prompt
+    /// ONLY — Phase A never showed the probe seat the intent, so
+    /// `funnel::probe_user_message` never reads it either (#1256). This CLI
+    /// carries one blob (no separate title field), passed through as
+    /// `FunnelInputs::intent_body` with `intent_title` empty; an absent or
+    /// empty file -> "(no description provided)" (matches
+    /// `funnel::judge_prompt`'s own per-field fallback).
     pub intent_file: Option<PathBuf>,
     /// Crew name from `profiles.json`'s `"crews"` map, staffing the
     /// `review-probe`/`review-judge` seats. Required unless `from_envelope`
@@ -904,7 +908,12 @@ fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<FunnelEnvelope> {
     let inputs = FunnelInputs {
         case_id,
         crew: &crew,
-        intent: &intent,
+        // No separate title on this CLI surface (`--intent-file` is one
+        // blob) — the whole file becomes the body; `judge_prompt` renders
+        // an empty title as a blank line, same as Phase A's own
+        // title-absent case. See `RunOpts::intent_file`'s doc comment.
+        intent_title: "",
+        intent_body: &intent,
         diff: diff_text,
         mode,
         probe_system: &probe_system,
