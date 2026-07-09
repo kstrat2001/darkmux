@@ -1434,4 +1434,130 @@ mod crew_tests {
         let parts: Vec<&str> = PROFILES_SCHEMA_VERSION.split('.').collect();
         assert_eq!(parts.len(), 2, "expected MAJOR.MINOR, got {PROFILES_SCHEMA_VERSION}");
     }
+
+    // ─── coverage additions (#1222 Phase B — packet-1 gap sweep) ────
+
+    /// JSON technically permits duplicate object keys. Deserializing into a
+    /// `BTreeMap` (via `MapAccess`) inserts each pair in stream order, so a
+    /// later duplicate key silently OVERWRITES the earlier one rather than
+    /// merging the two `Vec<SeatStaffing>` lists or erroring. Documents the
+    /// actual (default-serde) behavior so a future change is a deliberate
+    /// decision, not a surprise.
+    #[test]
+    fn crew_seats_duplicate_json_key_last_one_wins() {
+        let json = r#"{"seats":{
+            "review-probe":[{"profile":"fast"}],
+            "review-probe":[{"profile":"deep","k":5}]
+        }}"#;
+        let crew: Crew = serde_json::from_str(json).unwrap();
+        assert_eq!(crew.seats.len(), 1, "duplicate key collapses to one entry, not merged");
+        let staffings = crew.seats.get("review-probe").unwrap();
+        assert_eq!(staffings.len(), 1);
+        assert_eq!(staffings[0].profile, "deep");
+        assert_eq!(staffings[0].k, 5);
+    }
+
+    /// `fact_families` absent, or explicitly `[]`, both default to an empty
+    /// `Vec` and are elided on re-serialize (`skip_serializing_if =
+    /// "Vec::is_empty"`); `max_bundles` survives independently.
+    #[test]
+    fn bundle_selector_empty_fact_families_with_max_bundles_round_trips() {
+        let json = r#"{"max_bundles":5}"#;
+        let sel: BundleSelector = serde_json::from_str(json).unwrap();
+        assert!(sel.fact_families.is_empty());
+        assert_eq!(sel.max_bundles, Some(5));
+        let out: serde_json::Value = serde_json::to_value(&sel).unwrap();
+        let obj = out.as_object().unwrap();
+        assert!(!obj.contains_key("fact_families"), "empty Vec is elided on write");
+        assert_eq!(obj.get("max_bundles").and_then(|v| v.as_u64()), Some(5));
+
+        // Explicit `[]` parses identically to the field being absent.
+        let json2 = r#"{"fact_families":[],"max_bundles":5}"#;
+        let sel2: BundleSelector = serde_json::from_str(json2).unwrap();
+        assert!(sel2.fact_families.is_empty());
+        assert_eq!(sel2.max_bundles, Some(5));
+    }
+
+    /// `"crews":{}` present in the input is value-equivalent to the key
+    /// being absent (`crews.is_empty()` either way), but is NOT
+    /// byte-identical on re-serialize — `skip_serializing_if =
+    /// "BTreeMap::is_empty"` elides the key entirely on write. Distinct
+    /// from `old_shape_registry_without_crews_round_trips_value_identical`
+    /// above, which starts from an input with no `crews` key at all.
+    #[test]
+    fn registry_crews_key_present_but_empty_elides_on_reserialize() {
+        let json = r#"{"profiles":{},"crews":{}}"#;
+        let reg: ProfileRegistry = serde_json::from_str(json).unwrap();
+        assert!(reg.crews.is_empty());
+        let out = serde_json::to_string(&reg).unwrap();
+        assert_eq!(out, r#"{"profiles":{}}"#);
+        assert_ne!(
+            out, json,
+            "explicit empty crews key is elided on write, not preserved verbatim"
+        );
+    }
+
+    /// Unicode (incl. non-Latin scripts + emoji) in `Crew::description` and
+    /// a `seats` key round-trips untouched — the schema has no ASCII
+    /// assumption baked in anywhere.
+    #[test]
+    fn crew_unicode_description_and_seat_id_round_trips() {
+        let json = r#"{
+            "description": "レビュー・チーム 🔎",
+            "seats": {
+                "審査-probe": [{"profile":"fast"}]
+            }
+        }"#;
+        let crew: Crew = serde_json::from_str(json).unwrap();
+        assert!(crew.description.as_deref().unwrap().contains("チーム"));
+        assert!(crew.seats.contains_key("審査-probe"));
+        let back: Crew = serde_json::from_str(&serde_json::to_string(&crew).unwrap()).unwrap();
+        assert_eq!(back.description, crew.description);
+        assert!(back.seats.contains_key("審査-probe"));
+    }
+
+    /// `max_tokens` is an unconstrained `u32` at the schema layer — no
+    /// validation clamps it (`resolve_staffing` in `darkmux-profiles::crews`
+    /// only checks `k`). Both extremes round-trip verbatim.
+    #[test]
+    fn seat_staffing_max_tokens_extremes_round_trip() {
+        let json_zero = r#"{"profile":"fast","max_tokens":0}"#;
+        let s0: SeatStaffing = serde_json::from_str(json_zero).unwrap();
+        assert_eq!(s0.max_tokens, Some(0));
+
+        let json_max = format!(r#"{{"profile":"fast","max_tokens":{}}}"#, u32::MAX);
+        let smax: SeatStaffing = serde_json::from_str(&json_max).unwrap();
+        assert_eq!(smax.max_tokens, Some(u32::MAX));
+        let out: serde_json::Value = serde_json::to_value(&smax).unwrap();
+        assert_eq!(out["max_tokens"].as_u64(), Some(u64::from(u32::MAX)));
+    }
+
+    /// KNOWN GAP found while writing this coverage sweep — NOT fixed here
+    /// per the coverage-only mandate (#1222 Phase B packet-1 coverage PR).
+    ///
+    /// `Crew` and `SeatStaffing` both carry `#[serde(flatten)] extras` for
+    /// forward-compat overflow (see `crew_unknown_keys_land_in_extras` and
+    /// `seat_staffing_unknown_keys_land_in_extras` above, and the doc
+    /// comments on both types) — matching the project's stated "lenient on
+    /// read, all-Option + flatten-extras overflow" schema doctrine
+    /// (CLAUDE.md, "Configuration (config.json)"). `BundleSelector` does
+    /// NOT have an `extras` field. An unknown key nested inside
+    /// `bundle_selector` is silently DROPPED on parse (default serde
+    /// behavior for unrecognized fields with no `deny_unknown_fields`)
+    /// instead of being preserved and re-emitted on write. This test
+    /// documents the expected-per-doctrine behavior and is `#[ignore]`d
+    /// because it currently fails against the real type.
+    #[test]
+    #[ignore = "BUG (found 2026-07-09, not fixed — coverage PR only): BundleSelector has \
+                no forward-compat `extras` field, unlike sibling Crew/SeatStaffing; an \
+                unknown key inside bundle_selector is silently dropped, not preserved"]
+    fn bundle_selector_unknown_keys_are_preserved_like_its_siblings() {
+        let json = r#"{"fact_families":["auth"],"max_bundles":2,"future_knob":"x"}"#;
+        let sel: BundleSelector = serde_json::from_str(json).unwrap();
+        let out: serde_json::Value = serde_json::to_value(&sel).unwrap();
+        assert!(
+            out.as_object().unwrap().contains_key("future_knob"),
+            "future_knob was dropped — BundleSelector has no extras/flatten field"
+        );
+    }
 }
