@@ -1011,7 +1011,12 @@ static REMOTE_CFG_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 /// Hosted-call failure, split so the retry wrapper can tell a rate limit
 /// (retryable: the endpoint SAYS try later) from everything else (fail loud
 /// immediately — retrying an auth error or a malformed body just burns time).
-enum HostedCallError {
+///
+/// `pub(crate)` (#1222 Phase B packet 2) — `single_shot.rs` reuses the
+/// classification directly in its own tests rather than duplicating the
+/// error-shape corpus.
+#[derive(Debug)]
+pub(crate) enum HostedCallError {
     RateLimited(String),
     Other(anyhow::Error),
 }
@@ -1022,7 +1027,10 @@ enum HostedCallError {
 /// 429-shaped errors.
 const RATE_LIMIT_BACKOFF_SECONDS: [u64; 3] = [30, 60, 120];
 
-fn remote_chat_completion(
+/// `pub(crate)` (#1222 Phase B packet 2) — `single_shot.rs` reuses this
+/// hardened curl machinery (0600 secret-bearing config file, 429 backoff)
+/// for the local single-shot chat primitive.
+pub(crate) fn remote_chat_completion(
     url: &str,
     auth_header: Option<&(String, String)>,
     body: &serde_json::Value,
@@ -1128,7 +1136,10 @@ fn remote_chat_attempt(
 /// observed live 2026-07-05; the array shape previously fell through to the
 /// confusing "missing choices" message). A 429 / RESOURCE_EXHAUSTED
 /// classifies as retryable; every other error fails loud immediately.
-fn parse_hosted_response(
+/// `pub(crate)` (#1222 Phase B packet 2) — `single_shot.rs`'s tests reuse
+/// this classification directly rather than re-deriving the error-shape
+/// corpus (401/429/503/array-shaped/malformed/contentless).
+pub(crate) fn parse_hosted_response(
     stdout: &[u8],
 ) -> std::result::Result<serde_json::Value, HostedCallError> {
     let head = || {
