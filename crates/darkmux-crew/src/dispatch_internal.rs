@@ -1011,7 +1011,12 @@ static REMOTE_CFG_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 /// Hosted-call failure, split so the retry wrapper can tell a rate limit
 /// (retryable: the endpoint SAYS try later) from everything else (fail loud
 /// immediately — retrying an auth error or a malformed body just burns time).
-enum HostedCallError {
+///
+/// `pub(crate)` (#1222 Phase B packet 2) — `single_shot.rs` reuses the
+/// classification directly in its own tests rather than duplicating the
+/// error-shape corpus.
+#[derive(Debug)]
+pub(crate) enum HostedCallError {
     RateLimited(String),
     Other(anyhow::Error),
 }
@@ -1022,7 +1027,10 @@ enum HostedCallError {
 /// 429-shaped errors.
 const RATE_LIMIT_BACKOFF_SECONDS: [u64; 3] = [30, 60, 120];
 
-fn remote_chat_completion(
+/// `pub(crate)` (#1222 Phase B packet 2) — `single_shot.rs` reuses this
+/// hardened curl machinery (0600 secret-bearing config file, 429 backoff)
+/// for the local single-shot chat primitive.
+pub(crate) fn remote_chat_completion(
     url: &str,
     auth_header: Option<&(String, String)>,
     body: &serde_json::Value,
@@ -1128,7 +1136,10 @@ fn remote_chat_attempt(
 /// observed live 2026-07-05; the array shape previously fell through to the
 /// confusing "missing choices" message). A 429 / RESOURCE_EXHAUSTED
 /// classifies as retryable; every other error fails loud immediately.
-fn parse_hosted_response(
+/// `pub(crate)` (#1222 Phase B packet 2) — `single_shot.rs`'s tests reuse
+/// this classification directly rather than re-deriving the error-shape
+/// corpus (401/429/503/array-shaped/malformed/contentless).
+pub(crate) fn parse_hosted_response(
     stdout: &[u8],
 ) -> std::result::Result<serde_json::Value, HostedCallError> {
     let head = || {
@@ -1173,9 +1184,16 @@ fn parse_hosted_response(
             "hosted endpoint returned an error: {msg}"
         )));
     }
-    if resp.pointer("/choices/0/message/content").is_none() {
+    // Require the MESSAGE object, not the content field (#1222 packet 2):
+    // some OpenAI-compat reasoning backends omit `content` entirely on
+    // length-truncation, and both consumers already treat missing content
+    // as "" (`dispatch_remote`'s `.unwrap_or("")` extraction; the probe's
+    // documented empty-content-still-proves-routing contract). The #1135
+    // healthy-while-broken guard stays: a body with no choices at all
+    // (an error page, an unexpected shape) is still loud.
+    if resp.pointer("/choices/0/message").is_none() {
         return Err(HostedCallError::Other(anyhow!(
-            "hosted endpoint response missing choices[0].message.content (unexpected shape) \
+            "hosted endpoint response missing choices[0].message (unexpected shape) \
              — first 200 bytes: {:?}",
             head()
         )));
@@ -3990,8 +4008,9 @@ mod tests {
     /// object-shaped errors (Azure/OpenAI) and ARRAY-shaped errors (Google's
     /// OpenAI-compat layer, observed live 2026-07-05) both surface their
     /// message; 429 / RESOURCE_EXHAUSTED classifies as retryable while every
-    /// other error is terminal; a contentless non-error body stays loud
-    /// (#1135 healthy-while-broken).
+    /// other error is terminal; a choices-less non-error body stays loud
+    /// (#1135 healthy-while-broken) — but a message object with an ABSENT
+    /// content field is Ok (#1222 packet 2; extraction reads it as "").
     #[test]
     fn parse_hosted_response_classifies_errors_and_rate_limits() {
         let ok = parse_hosted_response(
@@ -4039,10 +4058,17 @@ mod tests {
         }
         match parse_hosted_response(br#"{"id":"x"}"#) {
             Err(HostedCallError::Other(e)) => {
-                assert!(e.to_string().contains("missing choices[0].message.content"))
+                assert!(e.to_string().contains("missing choices[0].message"))
             }
-            _ => panic!("contentless body must fail loud"),
+            _ => panic!("choices-less body must fail loud"),
         }
+        // Absent `content` under a PRESENT message object is Ok (#1222
+        // packet 2) — some OpenAI-compat reasoning backends omit content
+        // entirely on length-truncation; both consumers extract it as "".
+        assert!(
+            parse_hosted_response(br#"{"choices":[{"message":{"role":"assistant"},"finish_reason":"length"}]}"#).is_ok(),
+            "message object without a content field must classify as Ok"
+        );
         match parse_hosted_response(b"not json") {
             Err(HostedCallError::Other(e)) => assert!(e.to_string().contains("parsing")),
             _ => panic!("non-JSON must fail loud"),
