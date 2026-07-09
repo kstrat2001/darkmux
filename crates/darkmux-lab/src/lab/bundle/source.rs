@@ -457,6 +457,41 @@ mod tests {
     }
 
     #[test]
+    fn parse_relative_imports_skips_empty_specifier() {
+        // A malformed `import from '';` (empty quoted specifier) must be
+        // parsed without panicking and must NOT surface as a relative
+        // import candidate — an empty string starts with neither `./`
+        // nor `../`, so `extract_from_specifier`'s best-effort quote scan
+        // finding `""` is filtered out by the normal relative-prefix
+        // check, same as any other non-relative specifier.
+        let src = "import from '';\n";
+        let specs = parse_relative_imports(src);
+        assert!(specs.is_empty(), "empty specifier must not be treated as a relative import: {specs:?}");
+    }
+
+    #[test]
+    fn parse_relative_imports_on_dynamic_import_call() {
+        // `import('./foo')` is a DYNAMIC import expression, not a static
+        // `import ... from` declaration — but this parser's greedy
+        // quote-scan (there's no real tokenizer here, see module docs:
+        // "best-effort... never correctness-bearing") happens to pick up
+        // the parenthesized specifier anyway, because the line still
+        // starts with the literal text "import" and the fallback path
+        // (no "from" keyword found) scans for the first quote after
+        // stripping the "import" prefix. Documented here as CURRENT
+        // behavior, not a contract violation — the manifest this feeds
+        // is advisory, and following a dynamic import's target is a
+        // reasonable (if accidental) outcome, not a wrong one.
+        let src = "import('./foo');\n";
+        let specs = parse_relative_imports(src);
+        assert_eq!(
+            specs,
+            vec!["./foo".to_string()],
+            "dynamic import() calls are currently swept up by the same best-effort scan as static imports"
+        );
+    }
+
+    #[test]
     fn github_candidate_files_hard_caps_at_max_api_files() {
         // 35 changed TS files -> exactly MAX_API_FILES candidates + the
         // truncation signal. Network-free by construction: the changed

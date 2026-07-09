@@ -1239,4 +1239,126 @@ mod tests {
         assert!(toks.contains("now"));
         assert!(toks.contains("parse"));
     }
+
+    #[test]
+    fn function_at_eof_without_trailing_newline_is_found() {
+        // `content.lines()` on a file with no trailing `\n` yields the same
+        // Vec<String> as one WITH a trailing `\n` (Rust's `str::lines()`
+        // doesn't distinguish), and `find_all_functions_in_text` rejoins
+        // with `\n` (no trailing newline added) — so the real edge here is
+        // whether the closing-brace scan correctly terminates when the
+        // last `}` is the final byte of the joined text, with nothing
+        // after it (no walk-off-the-end panic, correct end0).
+        let content = "function foo(a) {\n  return a;\n}"; // no trailing \n
+        let lines: Vec<String> = content.lines().map(String::from).collect();
+        let fns = find_all_functions_in_text(&lines);
+        assert_eq!(fns.len(), 1);
+        assert_eq!(fns[0].name, "foo");
+        assert_eq!(fns[0].start0, 0);
+        assert_eq!(fns[0].end0, 2, "closing brace on the final line (no trailing newline) must still resolve to the last line index");
+    }
+
+    #[test]
+    fn nested_switch_only_splits_outer_branches() {
+        // A switch nested inside a `case` block of an outer switch must
+        // NOT contribute its own case/default labels to the outer split —
+        // `split_switch_branches` only ever tracks the FIRST top-level
+        // switch it finds; the inner switch's braces are just ordinary
+        // depth-tracked content within the outer `a` branch.
+        let body: Vec<String> = vec![
+            "switch (outer) {",
+            "  case 'a': {",
+            "    switch (inner) {",
+            "      case 'x':",
+            "        doX();",
+            "        break;",
+            "      case 'y':",
+            "        doY();",
+            "        break;",
+            "    }",
+            "    break;",
+            "  }",
+            "  case 'b': {",
+            "    doB();",
+            "    break;",
+            "  }",
+            "}",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let branches = split_switch_branches(&body);
+        let labels: Vec<&Vec<String>> = branches.iter().map(|(names, _)| names).collect();
+        assert_eq!(
+            labels,
+            vec![&vec!["a".to_string()], &vec!["b".to_string()]],
+            "inner switch's case 'x'/'y' must not leak into the outer branch list, got: {branches:?}"
+        );
+        // The 'a' branch's own body must still carry the ENTIRE inner
+        // switch block (its content is preserved, just not split).
+        let (_, a_lines) = &branches[0];
+        let a_text = a_lines.join("\n");
+        assert!(a_text.contains("doX();"));
+        assert!(a_text.contains("doY();"));
+    }
+
+    #[test]
+    fn template_literal_with_balanced_braces_does_not_break_function_bounds() {
+        // A template-literal interpolation (`${...}`) is exactly the case
+        // the module docstring calls out (`Promise<{ totalRevenue: number
+        // }>`-style nested braces) — but this scanner has no string/
+        // template-literal awareness at all, so ANY `{`/`}` byte inside a
+        // template literal (interpolated or literal text) participates in
+        // the naive brace-depth count. When the literal's own braces are
+        // BALANCED (equal `{` and `}` count), the net depth delta is zero
+        // and the function's real closing brace is still found correctly
+        // — this is the common case and must keep working.
+        let lines: Vec<String> = vec![
+            "function greet(name) {",
+            "  const s = `hi ${name} {literal brace pair}`;",
+            "  return s;",
+            "}",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let fns = find_all_functions_in_text(&lines);
+        assert_eq!(fns.len(), 1);
+        assert_eq!(fns[0].name, "greet");
+        assert_eq!(fns[0].start0, 0);
+        assert_eq!(fns[0].end0, 3);
+    }
+
+    #[test]
+    fn unicode_cjk_and_emoji_in_source_does_not_panic_scanner() {
+        // Byte/char-boundary stress: every delimiter this scanner tests
+        // for is single-byte ASCII, but multi-byte UTF-8 (CJK ideographs,
+        // emoji) is free to appear inside string literals, identifiers'
+        // surrounding text, and comments. The scanner must never panic on
+        // a byte-offset landing mid-codepoint, and must still locate the
+        // ASCII-named function correctly around the unicode content.
+        let lines: Vec<String> = vec![
+            "// 説明: emits a 挨拶 🎉 greeting".to_string(),
+            "function 挨拶(name) {".to_string(),
+            "  const msg = `こんにちは、${name}さん 🎉！`;".to_string(),
+            "  helper(msg);".to_string(),
+            "  return msg;".to_string(),
+            "}".to_string(),
+        ];
+        // Must not panic across the whole scan surface this module
+        // exposes over arbitrary source text.
+        let fns = find_all_functions_in_text(&lines);
+        let calls = extract_calls(&lines.join("\n"));
+        let _ = stem_tokens("挨拶");
+        let _ = count_refs(&lines.join("\n"), "msg");
+        // The ASCII-identifier `helper(msg)` call must still be found
+        // even with multi-byte UTF-8 immediately surrounding it on the
+        // same line and in sibling lines.
+        assert!(calls.iter().any(|(bare, _, _)| bare == "helper"));
+        // A unicode function NAME isn't `is_ident_start_byte`-recognized
+        // (ASCII-only identifier classification, documented at the top of
+        // this module) — so no FnDef is expected for a non-ASCII-named
+        // function, but the scan must still complete without panicking.
+        assert!(fns.is_empty() || fns.iter().all(|f| f.name.is_ascii()));
+    }
 }
