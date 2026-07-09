@@ -1,9 +1,11 @@
-# darkmux self-review — darkmux reviews its own PRs, in public, on a local model.
+# darkmux self-review — darkmux reviews its own PRs, in public, on a local
+# crew of models.
 #
-# darkmux dogfooding itself: a PR diff is dispatched to darkmux's own tool-less
-# `pr-reviewer` role running on a LOCAL LMStudio model (no cloud API), on a
-# self-hosted runner, and the findings post back as native inline PR comments.
-# The work product of darkmux's local-AI review is visible right on the PR.
+# darkmux dogfooding itself: a PR diff is dispatched to a **review funnel**
+# (#1222 Phase B) — a saved crew of local LMStudio models, staffed per
+# `~/.darkmux/profiles.json`, that probes the diff and hands its findings to
+# a judge seat — running on a self-hosted runner. No cloud API is involved.
+# The findings post back as native inline PR comments.
 #
 # SECURITY (public repo + self-hosted runner): the trigger is **workflow_dispatch
 # only** — it never fires on a `pull_request` event, so a stranger's PR (or a
@@ -11,9 +13,12 @@
 # launches it (`gh workflow run darkmux-review.yml -f pr=<n>`), and even then the
 # job NEVER checks out the reviewed PR's code: it reads only the PR *diff* via
 # the API (data, not executed) and feeds it to the sandboxed, network-isolated
-# internal runtime. The repo checkout below is of trusted `main` (the review
-# tooling), not the PR. Runner registration + prerequisites: see
-# .github/DARKMUX_REVIEW_RUNNER.md.
+# internal runtime. The funnel's `--github` file source (inside the `darkmux
+# pr-review run` dispatch below) fetches changed-file + one-hop-import
+# CONTENTS via the same GitHub API — also read as data and never executed,
+# the same trust class as the diff. The repo checkout below is of trusted
+# `main` (the review tooling), not the PR. Runner registration + prerequisites:
+# see .github/DARKMUX_REVIEW_RUNNER.md.
 name: darkmux self-review
 
 on:
@@ -23,15 +28,24 @@ on:
         description: "PR number to review"
         required: true
         type: string
-      role:
-        description: "darkmux crew role to dispatch (default: pr-reviewer). Override to test another reviewer role (#1057)."
+      crew:
+        description: >-
+          darkmux review crew to dispatch (default: the repo variable
+          DARKMUX_REVIEW_CREW, falling back to "review-deep"). A crew's seats
+          and which models staff them are defined in the runner's
+          ~/.darkmux/profiles.json (#1054) — never in this file.
         required: false
-        default: "pr-reviewer"
+        default: ""
         type: string
-      profile:
-        description: "darkmux profile to dispatch with (default: diff-review). Must be defined on the runner; falls back to default_profile if not (#1057)."
+      mode:
+        description: "Funnel dispatch mode: sequential (one seat model loaded at a time — the 32GB-tier default), parallel (multiple seat models resident at once), or auto (darkmux picks)."
         required: false
-        default: "diff-review"
+        default: "auto"
+        type: string
+      k:
+        description: "Override draws-per-seat (k) for every staffing in the crew. Leave blank to use each staffing's own k from profiles.json."
+        required: false
+        default: ""
         type: string
 
 concurrency:
@@ -45,21 +59,23 @@ permissions:
 jobs:
   review:
     runs-on: [self-hosted, darkmux-review]
-    timeout-minutes: 20
+    timeout-minutes: 90
     env:
       GH_TOKEN: ${{ github.token }}
       PR: ${{ inputs.pr }}
       REPO: ${{ github.repository }}
-      REVIEW_ROLE: ${{ inputs.role }}
-      REVIEW_PROFILE: ${{ inputs.profile }}
+      CREW: ${{ inputs.crew || vars.DARKMUX_REVIEW_CREW || 'review-deep' }}
+      MODE: ${{ inputs.mode }}
+      K: ${{ inputs.k }}
     steps:
       - name: Checkout review tooling (trusted main — NOT the reviewed PR)
         uses: actions/checkout@v4
         # Brings the review/posting script from this repo at the dispatch ref
-        # (main). The reviewed PR's code is never checked out — only its diff is
-        # read via the API below — so untrusted PR code never lands on the runner.
+        # (main). The reviewed PR's code is never checked out — only its diff
+        # (and, inside the funnel dispatch, individual file contents via the
+        # API) are read — so untrusted PR code never lands on the runner.
 
-      - name: Fetch PR diff (API only — no PR checkout, no code execution)
+      - name: Fetch PR diff + head SHA (API only — no PR checkout, no code execution)
         id: diff
         run: |
           set -euo pipefail
@@ -67,27 +83,33 @@ jobs:
           # digits so only a valid PR number ever reaches the gh/API calls below.
           case "$PR" in ''|*[!0-9]*) echo "pr input must be a number"; exit 1 ;; esac
           mkdir -p "$RUNNER_TEMP/qa"
+          # The funnel dispatch (below) reads this FULL diff directly — it caps
+          # what it sends to each seat's model internally (the same 80KB model
+          # budget the old single-reviewer prompt used) while keeping the full
+          # diff on disk for anchor-line resolution when rendering the review.
           gh pr diff "$PR" --repo "$REPO" > "$RUNNER_TEMP/qa/pr.diff"
-          # Capped copy for the model's context; the full diff is kept for
-          # line-anchor validation when posting inline comments.
-          head -c 80000 "$RUNNER_TEMP/qa/pr.diff" > "$RUNNER_TEMP/qa/pr.capped.diff"
-          if [ -s "$RUNNER_TEMP/qa/pr.capped.diff" ]; then
+          if [ -s "$RUNNER_TEMP/qa/pr.diff" ]; then
             echo "has_diff=true" >> "$GITHUB_OUTPUT"
           else
             echo "has_diff=false" >> "$GITHUB_OUTPUT"
           fi
+          HEAD_SHA=$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid)
+          if ! printf '%s' "$HEAD_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "head SHA from gh pr view did not match ^[0-9a-f]{40}\$: $HEAD_SHA"
+            exit 1
+          fi
+          echo "HEAD_SHA=$HEAD_SHA" >> "$GITHUB_ENV"
 
-      - name: Build the review prompt (intent + diff — the rubric lives in the role)
+      - name: Write PR intent (title + description — prompt assembly lives in the binary)
         if: steps.diff.outputs.has_diff == 'true'
         run: |
           set -euo pipefail
-          # #1053: a reviewer that doesn't know the change's INTENT flags the very
-          # bug the PR fixes (the "restate-the-fix" false positive). Supply the
-          # author's own title + description so the role can assess the diff against
-          # its stated purpose. This is procedural (a `gh` fetch) — NO AI in the
-          # loop, so it stays within the runner's no-LLM-API constraint. The body
-          # is the author's data (not executed) and is capped for the model's
-          # context budget; an empty body is fine (the role infers from title+diff).
+          # #1053: a reviewer that doesn't know the change's INTENT flags the
+          # very bug the PR fixes (the "restate-the-fix" false positive). The
+          # funnel binary now assembles each seat's prompt itself (rubric +
+          # intent + diff); this step's only job is handing it the author's
+          # stated intent as plain data — NO AI in the loop here, just a `gh`
+          # fetch, so it stays within the runner's no-LLM-API constraint.
           PRTITLE=$(gh pr view "$PR" --repo "$REPO" --json title --jq .title)
           PRBODY=$(gh pr view "$PR" --repo "$REPO" --json body --jq '.body // ""')
           # Cap for the model's context budget via a bash substring, NOT `| head`:
@@ -95,71 +117,64 @@ jobs:
           # (141) and abort the step on any body over the cap.
           PRBODY="${PRBODY:0:8000}"
           {
-            printf 'PR #%s in %s: %s\n' "$PR" "$REPO" "$PRTITLE"
+            printf '%s\n' "$PRTITLE"
             echo
-            echo "Description (the author's stated intent for this change):"
             if [ -n "$PRBODY" ]; then
               printf '%s\n' "$PRBODY"
             else
               echo "(no description provided)"
             fi
-            echo
-            echo "Respond per your role contract (the single JSON object). Assess the"
-            echo "diff against the stated intent above. The full diff is below; you"
-            echo "have only this diff."
-            echo
-            echo '```diff'
-            cat "$RUNNER_TEMP/qa/pr.capped.diff"
-            echo '```'
-          } > "$RUNNER_TEMP/qa/prompt.txt"
+          } > "$RUNNER_TEMP/qa/intent.txt"
 
-      - name: darkmux reviewer dispatch (local model — no LLM API)
+      - name: darkmux review funnel dispatch (local crew — no LLM API)
         if: steps.diff.outputs.has_diff == 'true'
         run: |
-          # Defense-in-depth: the `role` + `profile` inputs are maintainer-supplied
-          # (workflow_dispatch is maintainer-only), but constrain them to a sane
-          # charset before they reach the dispatch args.
-          case "$REVIEW_ROLE" in ''|*[!a-zA-Z0-9_.-]*) echo "role input must match [a-zA-Z0-9_.-]"; exit 1 ;; esac
-          case "$REVIEW_PROFILE" in ''|*[!a-zA-Z0-9_.-]*) echo "profile input must match [a-zA-Z0-9_.-]"; exit 1 ;; esac
-          # The dispatched role defaults to `pr-reviewer`, overridable via the
-          # `role` workflow input (#1057) to test another reviewer role.
+          set -euo pipefail
+          # Defense-in-depth: `crew`/`mode`/`k` are maintainer-supplied
+          # (workflow_dispatch is maintainer-only), but constrain them to a
+          # sane charset/enum before they reach the dispatch args.
+          case "$CREW" in ''|*[!a-zA-Z0-9_.-]*) echo "crew input must match [a-zA-Z0-9_.-]"; exit 1 ;; esac
+          case "$MODE" in sequential|parallel|auto) ;; *) echo "mode input must be one of: sequential, parallel, auto"; exit 1 ;; esac
+          if [ -n "$K" ]; then
+            case "$K" in *[!0-9]*) echo "k input must be digits only"; exit 1 ;; esac
+          fi
           # Model selection lives on the MACHINE, not in this public workflow
-          # (#1054): `--profile <name>` NAMES the profile this dispatch wants
-          # (default `diff-review`, overridable via the `profile` workflow input — #1057
-          # — to test other profiles/models). The runner defines that profile in
-          # its ~/.darkmux/profiles.json pointing at a lab-validated model. The
-          # workflow can't know which machine it lands on, so it names an intent and
-          # lets the machine map it to a model that worked in its lab — one that
-          # emits its answer in the message content (qwen3-8b does; qwen3_5-family
-          # thinking models route to reasoning_content and yield empty reviews). A
-          # runner that hasn't defined the named profile falls back to its
-          # default_profile. See .github/DARKMUX_REVIEW_RUNNER.md.
+          # (#1054): `--crew` NAMES a crew (default review-deep, overridable via
+          # the `crew` workflow input, or without editing this file via the
+          # DARKMUX_REVIEW_CREW repo/environment variable) whose seats and
+          # staffing profiles/models are defined in the runner's
+          # ~/.darkmux/profiles.json. This workflow never names a model.
           #
-          # Resilient: a hiccup leaves no/empty envelope and the posting script
-          # falls back to a summary note rather than red-X'ing the PR.
-          darkmux crew dispatch "$REVIEW_ROLE" \
-            --profile "$REVIEW_PROFILE" \
-            --json \
-            --timeout 900 \
-            --session-id "darkmux-review-pr${PR}" \
-            --message-from-file "$RUNNER_TEMP/qa/prompt.txt" \
-            > "$RUNNER_TEMP/qa/envelope.json" 2> "$RUNNER_TEMP/qa/err.log" || true
+          # Resilient: a hiccup leaves no/empty envelope; the funnel's own
+          # degraded-mode handling (below) turns that into a loud comment plus
+          # a failed run rather than a silent green check.
+          darkmux pr-review run \
+            --github "$REPO" \
+            --head-sha "$HEAD_SHA" \
+            --diff "$RUNNER_TEMP/qa/pr.diff" \
+            --intent-file "$RUNNER_TEMP/qa/intent.txt" \
+            --crew "$CREW" \
+            --mode "$MODE" \
+            ${K:+--k "$K"} \
+            --envelope-out "$RUNNER_TEMP/qa/funnel.json" \
+            --emit "$RUNNER_TEMP/qa/rendered.json" \
+            --timeout 3600 || true
 
       - name: Post the review (inline comments, or summary fallback)
         if: steps.diff.outputs.has_diff == 'true'
         run: |
           set -euo pipefail
-          # Render with darkmux's binary-owned renderer (#1060): resolve each
-          # finding's quoted anchor to a line and build the review payload. The
-          # render is versioned WITH the pr-reviewer role schema (no copied
-          # script to drift); this workflow keeps the gh post, so the operator
-          # still controls the trigger + how findings land.
-          darkmux pr-review render \
-            --envelope "$RUNNER_TEMP/qa/envelope.json" \
-            --diff "$RUNNER_TEMP/qa/pr.diff" \
-            --emit "$RUNNER_TEMP/qa/rendered.json"
-          MODE=$(jq -r .mode "$RUNNER_TEMP/qa/rendered.json")
-          case "$MODE" in
+          if [ ! -s "$RUNNER_TEMP/qa/rendered.json" ]; then
+            # The dispatch above never wrote a rendered payload at all (e.g. it
+            # crashed before its own degraded-mode fallback could run). Same
+            # "never read as a green check" contract as mode=degraded (#1113).
+            gh pr comment "$PR" --repo "$REPO" --body \
+              ":warning: darkmux review funnel produced no output (crew=\`$CREW\` mode=\`$MODE\`) — see workflow logs."
+            echo "::error::review funnel dispatch produced no rendered payload"
+            exit 1
+          fi
+          MODE_RESULT=$(jq -r .mode "$RUNNER_TEMP/qa/rendered.json")
+          case "$MODE_RESULT" in
             review)
               jq .review "$RUNNER_TEMP/qa/rendered.json" > "$RUNNER_TEMP/qa/review.json"
               gh api "repos/$REPO/pulls/$PR/reviews" --input "$RUNNER_TEMP/qa/review.json" ;;
@@ -175,3 +190,12 @@ jobs:
               jq -r .comment "$RUNNER_TEMP/qa/rendered.json" > "$RUNNER_TEMP/qa/comment.md"
               gh pr comment "$PR" --repo "$REPO" --body-file "$RUNNER_TEMP/qa/comment.md" ;;
           esac
+
+      - name: Upload funnel envelope (debugging + audit)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: review-funnel-envelope
+          path: ${{ runner.temp }}/qa/funnel.json
+          if-no-files-found: ignore
+          retention-days: 14
