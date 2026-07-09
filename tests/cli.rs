@@ -1518,3 +1518,87 @@ fn review_bench_funnel_requires_crew() {
     .failure()
     .stderr(predicate::str::contains("--funnel requires --crew"));
 }
+
+#[test]
+fn review_bench_funnel_k_zero_rejected_at_cli_layer() {
+    // --k 0 would otherwise slip past resolve_crew's k>=1 guard via the
+    // post-resolution override (resolve_funnel_ctx overwrites every
+    // review-probe staffing's k AFTER resolve_crew validated the crew's OWN
+    // k), guaranteeing a degenerate run (zero probe draws). The clap
+    // `value_parser` range rejects it before the command handler ever runs.
+    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    cmd.args([
+        "lab",
+        "review-bench",
+        "--funnel",
+        "--crew",
+        "review-funnel",
+        "--k",
+        "0",
+    ])
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("not in 1.."));
+}
+
+#[test]
+fn review_bench_funnel_preflight_validates_seat_requirements_before_dispatch() {
+    // A crew that resolves fine at the schema layer (resolve_crew doesn't
+    // know about funnel-specific seat names) but is missing "review-judge"
+    // must fail at PREFLIGHT (resolve_funnel_ctx calling
+    // funnel::validate_funnel_crew), not at the first case's dispatch — the
+    // per-case table header must never print.
+    let tmp = TempDir::new().unwrap();
+    let cases_dir = tmp.path().join("cases");
+    fs::create_dir_all(&cases_dir).unwrap();
+    fs::write(
+        cases_dir.join("c1.label.json"),
+        r#"{"kind":"clean","intent_title":"t","expect_verdict":"pass"}"#,
+    )
+    .unwrap();
+    fs::write(cases_dir.join("c1.diff"), "diff --git a b\n").unwrap();
+    let workdirs = tmp.path().join("workdirs");
+    fs::create_dir_all(workdirs.join("c1")).unwrap();
+
+    let profiles_path = tmp.path().join("profiles.json");
+    fs::write(
+        &profiles_path,
+        r#"{
+            "profiles": {
+                "fast": {
+                    "description": "test",
+                    "models": [{"id": "model-a", "n_ctx": 32000, "role": "primary"}]
+                }
+            },
+            "default_profile": "fast",
+            "crews": {
+                "no-judge": {
+                    "seats": {
+                        "review-probe": [{"profile": "fast", "k": 2}]
+                    }
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .args([
+            "lab",
+            "review-bench",
+            "--cases-dir",
+            cases_dir.to_str().unwrap(),
+            "--funnel",
+            "--workdirs",
+            workdirs.to_str().unwrap(),
+            "--crew",
+            "no-judge",
+            "--profiles-file",
+            profiles_path.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("review-judge"))
+        .stdout(predicate::str::contains("outcome").not());
+}

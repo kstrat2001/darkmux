@@ -458,7 +458,7 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
         }
         if let (BenchMode::Funnel, Some(env)) = (opts.mode, funnels.last()) {
             println!(
-                "{:<34}↳ bundles {} · flags {}→{} · confirmed {} · needs_check {} · killed {}",
+                "{:<34}↳ bundles {} · flags {}→{} · confirmed {} · needs_check {} · archived {}",
                 "",
                 env.bundles,
                 env.raw_flags,
@@ -693,11 +693,15 @@ fn parse_exec_mode(s: Option<&str>) -> Result<super::funnel::ExecMode> {
 
 /// Resolve `opts` into a [`FunnelCtx`]: load the profile registry, resolve
 /// `--crew` against it (`darkmux_profiles::crews::resolve_crew` — the same
-/// validation `crew dispatch` would apply), apply `--k` as an override on
-/// every `review-probe` staffing's draw count, parse `--exec-mode`, and
-/// resolve the `review-probe`/`review-judge` seat system prompts. Every
-/// failure here is loud and happens BEFORE any dispatch — a misconfigured
-/// crew or a missing seat prompt must never silently corrupt a bench run.
+/// validation `crew dispatch` would apply), validate it carries the
+/// funnel's own seat requirements (`funnel::validate_funnel_crew` — the
+/// SAME check `run_funnel` runs internally, called here too so a
+/// misconfigured crew fails at bench START, not at the first case's
+/// dispatch), apply `--k` as an override on every `review-probe` staffing's
+/// draw count, parse `--exec-mode`, and resolve the `review-probe`/
+/// `review-judge` seat system prompts. Every failure here is loud and
+/// happens BEFORE any dispatch — a misconfigured crew or a missing seat
+/// prompt must never silently corrupt a bench run.
 fn resolve_funnel_ctx(opts: &ReviewBenchOpts) -> Result<FunnelCtx> {
     let crew_name = opts.crew.as_deref().ok_or_else(|| {
         anyhow!(
@@ -709,6 +713,8 @@ fn resolve_funnel_ctx(opts: &ReviewBenchOpts) -> Result<FunnelCtx> {
         .context("loading profile registry for --funnel")?;
     let mut crew = darkmux_profiles::crews::resolve_crew(&loaded.registry, crew_name)
         .with_context(|| format!("resolving crew \"{crew_name}\" for --funnel"))?;
+    super::funnel::validate_funnel_crew(&crew)
+        .with_context(|| format!("crew \"{crew_name}\" for --funnel"))?;
     if let Some(k) = opts.k_override {
         if let Some(staffings) = crew.seats.get_mut("review-probe") {
             for s in staffings.iter_mut() {

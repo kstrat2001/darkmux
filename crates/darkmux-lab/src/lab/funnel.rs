@@ -318,7 +318,13 @@ fn resolve_mode(mode: ExecMode, probes: &[ResolvedSeatStaffing], judge: &Resolve
 /// pipeline-specific seat requirements — that's this function's job, and
 /// it runs at funnel start so a misconfigured crew fails loud before any
 /// dispatch spends a token.
-fn validate_funnel_crew(crew: &ResolvedCrew) -> Result<(&Vec<ResolvedSeatStaffing>, &ResolvedSeatStaffing)> {
+///
+/// `pub` (not private) since #1222 Phase B packet 7 review round: the
+/// `review-bench --funnel` preflight (`darkmux_lab::lab::review_bench::
+/// resolve_funnel_ctx`) calls this directly, ahead of `run_funnel`'s own
+/// internal call, so a misconfigured crew fails at bench START (before the
+/// per-case loop even begins) rather than at the first case's dispatch.
+pub fn validate_funnel_crew(crew: &ResolvedCrew) -> Result<(&Vec<ResolvedSeatStaffing>, &ResolvedSeatStaffing)> {
     let probes = crew
         .seats
         .get("review-probe")

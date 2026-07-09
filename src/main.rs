@@ -1391,8 +1391,10 @@ enum LabCmd {
         exec_mode: Option<String>,
         /// (#1222) Override every review-probe staffing's draw count `k` for
         /// this run (the crew registry's per-staffing `k` otherwise applies
-        /// unchanged).
-        #[arg(long, requires = "funnel")]
+        /// unchanged). Must be >= 1 — a 0 draw count guarantees a degenerate
+        /// run (zero probe flags), same floor `resolve_crew` enforces on a
+        /// crew's own `k`.
+        #[arg(long, requires = "funnel", value_parser = clap::value_parser!(u32).range(1..))]
         k: Option<u32>,
         /// (#1222) Run an external bundler
         /// (`<cmd> --worktree <dir> --diff <file>`) per case instead of the
