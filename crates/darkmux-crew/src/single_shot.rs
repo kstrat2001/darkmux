@@ -33,9 +33,11 @@ pub struct SingleShotRequest<'a> {
     pub timeout_seconds: u32,
 }
 
-/// The extracted reply. `content` is `""` on an empty-but-successful
-/// response — degeneracy (e.g. a reasoning model that spent its whole
-/// budget thinking) is the CALLER's judgment call, not this primitive's.
+/// The extracted reply. `content` is `""` when the response's content is
+/// empty OR the field is absent entirely (some OpenAI-compat reasoning
+/// backends omit it on length-truncation) — degeneracy (e.g. a reasoning
+/// model that spent its whole budget thinking) is the CALLER's judgment
+/// call, not this primitive's.
 pub struct SingleShotReply {
     pub content: String,
     pub total_tokens: Option<u64>,
@@ -68,21 +70,30 @@ pub fn local_chat_body(
 /// The chat-completions URL for a local LMStudio base:
 /// `{base}/v1/chat/completions`. `base` already has any trailing slash
 /// trimmed by `config_access::lmstudio_url()`; an explicit `base_url`
-/// override is trimmed the same way so `/v1/...` can't double up.
+/// override is trimmed the same way so `/v1/...` can't double up. A base
+/// that already ends in `/v1` (operators carrying the pre-#661 full-URL
+/// habit) is tolerated too — the suffix is trimmed before this appends
+/// its own.
 fn local_chat_url(base_url: Option<&str>) -> String {
     let base = base_url
         .map(str::to_string)
         .unwrap_or_else(darkmux_types::config_access::lmstudio_url);
-    let base = base.trim_end_matches('/');
+    let base = base.trim_end_matches('/').trim_end_matches("/v1");
     format!("{base}/v1/chat/completions")
 }
 
 /// Container-free single-shot chat call against a local LMStudio endpoint.
 /// Builds the local-dialect body, POSTs via the same hardened curl path
 /// `dispatch_remote` uses (0600 secret-bearing config file — moot here
-/// since local calls carry no auth header, but it's the SAME machinery,
-/// so the 429-backoff ladder applies uniformly), and extracts
-/// `choices[0].message.content` + `usage.total_tokens` + `model`.
+/// since local calls carry no auth header, but it's the SAME machinery),
+/// and extracts `choices[0].message.content` + `usage.total_tokens` +
+/// `model`.
+///
+/// Blocking-behavior note for callers: this inherits the shared 429
+/// backoff ladder — a rate-limited endpoint is retried after 30s, 60s,
+/// then 120s before failing, so a single call can block for up to ~3.5
+/// minutes plus timeouts in the worst case (unlikely against a local
+/// LMStudio, which doesn't rate-limit, but true of the shared path).
 pub fn single_shot_chat(req: &SingleShotRequest) -> Result<SingleShotReply> {
     let url = local_chat_url(req.base_url);
     let body = local_chat_body(
@@ -123,6 +134,7 @@ fn extract_reply(resp: &serde_json::Value) -> SingleShotReply {
 mod tests {
     use super::*;
     use crate::dispatch_internal::{parse_hosted_response, HostedCallError};
+    use serial_test::serial;
 
     // ─── local_chat_body: LOCAL dialect shape ───────────────────────────
 
@@ -156,10 +168,22 @@ mod tests {
             local_chat_url(Some("http://localhost:1234/")),
             "http://localhost:1234/v1/chat/completions"
         );
+        // A base already carrying `/v1` (pre-#661 full-URL habit) doesn't
+        // double it either — with or without the trailing slash.
+        assert_eq!(
+            local_chat_url(Some("http://localhost:1234/v1")),
+            "http://localhost:1234/v1/chat/completions"
+        );
+        assert_eq!(
+            local_chat_url(Some("http://localhost:1234/v1/")),
+            "http://localhost:1234/v1/chat/completions"
+        );
     }
 
     #[test]
+    #[serial]
     fn local_chat_url_defaults_to_config_access_lmstudio_url() {
+        // SAFETY: serialized via `#[serial]`; restored below.
         let prev = std::env::var("DARKMUX_LMSTUDIO_URL").ok();
         unsafe {
             std::env::set_var("DARKMUX_LMSTUDIO_URL", "http://192.168.1.5:1234");
@@ -194,8 +218,7 @@ mod tests {
     #[test]
     fn extract_reply_empty_content_is_ok_empty_string() {
         // A well-formed body whose content is the empty string still
-        // classifies as Ok by parse_hosted_response (it only rejects a
-        // MISSING content pointer, not an empty one) — extraction then
+        // classifies as Ok by parse_hosted_response — extraction then
         // hands the caller "" rather than failing. Degeneracy judgment
         // is the caller's, not this primitive's.
         let resp = parse_hosted_response(br#"{"choices":[{"message":{"content":""}}]}"#)
@@ -204,6 +227,23 @@ mod tests {
         assert_eq!(reply.content, "");
         assert_eq!(reply.total_tokens, None);
         assert_eq!(reply.model, None);
+    }
+
+    #[test]
+    fn extract_reply_absent_content_is_ok_empty_string() {
+        // Some OpenAI-compat reasoning backends omit `content` ENTIRELY on
+        // length-truncation (the message object carries only the role).
+        // The shared classification accepts a present message object, and
+        // extraction reads absent content as "" — same contract as empty
+        // content: the caller owns degeneracy.
+        let resp = parse_hosted_response(
+            br#"{"model":"m","choices":[{"message":{"role":"assistant"},"finish_reason":"length"}],"usage":{"total_tokens":128}}"#,
+        )
+        .expect("message object without a content field classifies as Ok");
+        let reply = extract_reply(&resp);
+        assert_eq!(reply.content, "");
+        assert_eq!(reply.total_tokens, Some(128));
+        assert_eq!(reply.model.as_deref(), Some("m"));
     }
 
     #[test]
