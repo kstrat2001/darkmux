@@ -158,6 +158,64 @@ mod tests {
     }
 
     #[test]
+    fn local_chat_body_round_trips_extreme_values() {
+        // Pure value construction — no range validation happens here (the
+        // caller / model server owns rejecting out-of-range values). Confirm
+        // serde_json carries extreme f32/u32 inputs through unchanged rather
+        // than silently clamping or losing precision.
+        let zero = local_chat_body("m", "sys", "user", 0.0, 0);
+        assert_eq!(zero["temperature"].as_f64().unwrap(), 0.0);
+        assert_eq!(zero["max_tokens"], 0);
+
+        let negative_temp = local_chat_body("m", "sys", "user", -1.0, 1);
+        assert_eq!(negative_temp["temperature"].as_f64().unwrap(), -1.0);
+
+        let large_temp = local_chat_body("m", "sys", "user", 100.0, 1);
+        assert_eq!(large_temp["temperature"].as_f64().unwrap(), 100.0);
+
+        let max_tokens = local_chat_body("m", "sys", "user", 1.0, u32::MAX);
+        assert_eq!(max_tokens["max_tokens"], u32::MAX);
+
+        // f32::NAN serializes to `null` under serde_json's default (non-
+        // `arbitrary_precision`) float handling — characterize rather than
+        // assume, since a NaN temperature silently becoming `null` is a
+        // surprising wire shape a caller could hit via a bad upstream calc.
+        let nan_temp = local_chat_body("m", "sys", "user", f32::NAN, 1);
+        assert!(
+            nan_temp["temperature"].is_null(),
+            "NaN temperature serializes to JSON null (serde_json has no NaN literal), got: {:?}",
+            nan_temp["temperature"]
+        );
+    }
+
+    #[test]
+    fn local_chat_body_round_trips_json_breaking_content() {
+        // serde_json handles escaping internally — this asserts the
+        // round-trip actually holds for content that would break naive
+        // string concatenation: embedded quotes, backslashes, newlines,
+        // and non-ASCII (CJK + emoji, astral-plane).
+        let system = "sys with \"quotes\", a \\backslash\\, and\nnewlines";
+        let user = "user says 你好 🎉 and \"nested 'quotes'\"";
+        let body = local_chat_body("m", system, user, 0.5, 10);
+
+        // Round-trip through a full serialize/parse cycle, not just the
+        // in-memory Value — proves the wire format (what curl actually
+        // sends) preserves the content, not just the Value tree.
+        let wire = serde_json::to_string(&body).expect("body must serialize");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&wire).expect("serialized body must re-parse");
+        assert_eq!(parsed["messages"][0]["content"], system);
+        assert_eq!(parsed["messages"][1]["content"], user);
+        // Sanity: the raw wire bytes actually escaped the dangerous
+        // characters (a naive `format!` build would have produced invalid
+        // JSON here) — the round-trip above already proves this, but assert
+        // the wire string itself contains an escaped quote and newline as a
+        // second signal.
+        assert!(wire.contains("\\\""), "embedded quote must be escaped on the wire");
+        assert!(wire.contains("\\n"), "embedded newline must be escaped on the wire");
+    }
+
+    #[test]
     fn local_chat_url_joins_base_and_v1_without_doubling() {
         assert_eq!(
             local_chat_url(Some("http://localhost:1234")),
@@ -198,6 +256,37 @@ mod tests {
                 None => std::env::remove_var("DARKMUX_LMSTUDIO_URL"),
             }
         }
+    }
+
+    #[test]
+    fn local_chat_url_full_chat_completions_base_is_a_documented_operator_error() {
+        // A base that ALREADY carries the full `/v1/chat/completions` path
+        // (a plausible operator mistake — pasting the endpoint instead of
+        // the base URL) is NOT covered by the `/v1`-suffix trim: the trim
+        // only strips a LITERAL trailing "/v1", and this string ends in
+        // "chat/completions", not "/v1". Characterize the actual result
+        // (a doubled path) rather than assume — this is a documented
+        // operator-error shape, not a claim that the doubling is desired.
+        assert_eq!(
+            local_chat_url(Some("http://localhost:1234/v1/chat/completions")),
+            "http://localhost:1234/v1/chat/completions/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn local_chat_url_preserves_https_scheme() {
+        assert_eq!(
+            local_chat_url(Some("https://models.example.com:8443")),
+            "https://models.example.com:8443/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn local_chat_url_handles_portless_base() {
+        assert_eq!(
+            local_chat_url(Some("https://models.example.com")),
+            "https://models.example.com/v1/chat/completions"
+        );
     }
 
     // ─── extract_reply: over the SAME error-shape corpus parse_hosted_response
@@ -256,6 +345,78 @@ mod tests {
         assert_eq!(reply.model, None);
     }
 
+    #[test]
+    fn extract_reply_empty_choices_array_does_not_panic() {
+        // `extract_reply` only ever runs on a body `parse_hosted_response`
+        // already classified Ok (which rejects a choices-less body), so an
+        // empty `choices: []` array should never reach it in practice. But
+        // `extract_reply` itself is called directly here (bypassing the
+        // classifier) to characterize its OWN defensiveness: `.pointer()`
+        // on an out-of-bounds array index returns None, not a panic, so
+        // extraction degrades to the same "" contract as absent content.
+        let resp = serde_json::json!({ "choices": [] });
+        let reply = extract_reply(&resp);
+        assert_eq!(reply.content, "");
+        assert_eq!(reply.total_tokens, None);
+        assert_eq!(reply.model, None);
+    }
+
+    #[test]
+    fn extract_reply_total_tokens_float_shape_is_none() {
+        // serde_json's `Number::as_u64()` returns None for a value parsed
+        // as a float (JSON `42.0` carries a decimal point, so it's stored
+        // as an f64 internally) regardless of whether the value would fit
+        // in a u64 — characterize this rather than assume total_tokens
+        // survives a backend that emits a float-shaped usage count.
+        let resp = parse_hosted_response(
+            br#"{"choices":[{"message":{"content":"hi"}}],"usage":{"total_tokens":42.0}}"#,
+        )
+        .expect("well-formed body with a float usage count still classifies as Ok");
+        let reply = extract_reply(&resp);
+        assert_eq!(
+            reply.total_tokens, None,
+            "a float-shaped total_tokens does not extract as a u64"
+        );
+    }
+
+    #[test]
+    fn extract_reply_total_tokens_string_shape_is_none() {
+        // Same characterization for a string-shaped usage count (a backend
+        // quoting the number) — `.as_u64()` only matches the Number variant.
+        let resp = parse_hosted_response(
+            br#"{"choices":[{"message":{"content":"hi"}}],"usage":{"total_tokens":"42"}}"#,
+        )
+        .expect("well-formed body with a string usage count still classifies as Ok");
+        let reply = extract_reply(&resp);
+        assert_eq!(
+            reply.total_tokens, None,
+            "a string-shaped total_tokens does not extract as a u64"
+        );
+    }
+
+    #[test]
+    fn extract_reply_model_reflects_the_response_not_the_request() {
+        // A caller's SingleShotRequest.model names the identifier they
+        // ASKED for (e.g. a darkmux-namespaced loaded identifier); the
+        // reply's `model` field is whatever the SERVER reports it actually
+        // served, which can legitimately differ (a router/proxy resolving
+        // an alias, or a backend that echoes its own internal name). This
+        // primitive does no reconciliation — it just reports what the
+        // response body said.
+        let requested_model = "darkmux:qwen3.6-35b-a3b";
+        let resp = parse_hosted_response(
+            br#"{"model":"actual-served-model-v2","choices":[{"message":{"content":"hi"}}]}"#,
+        )
+        .expect("well-formed body classifies as Ok");
+        let reply = extract_reply(&resp);
+        assert_eq!(reply.model.as_deref(), Some("actual-served-model-v2"));
+        assert_ne!(
+            reply.model.as_deref(),
+            Some(requested_model),
+            "reply.model reports the server's actual value, not an echo of the request"
+        );
+    }
+
     // ─── parse_hosted_response reuse: confirm the error-in-body shapes this
     // primitive inherits (via remote_chat_completion) are still classified
     // the same way — no local-dialect drift on the shared error path ─────
@@ -271,6 +432,28 @@ mod tests {
         match parse_hosted_response(br#"{"error":{"code":429,"message":"quota"}}"#) {
             Err(HostedCallError::RateLimited(msg)) => assert_eq!(msg, "quota"),
             _ => panic!("expected a retryable RateLimited error"),
+        }
+        // 5xx (503, transient capacity shedding) still classifies retryable
+        // through this primitive's shared reuse path, same as dispatch_internal's
+        // own corpus — confirmed here rather than assumed, since the
+        // #1222 packet-2 relaxation touched the SAME function's final
+        // guard and a regression there would silently widen or narrow
+        // what single_shot_chat's callers see as retryable.
+        match parse_hosted_response(br#"{"error":{"code":503,"message":"overloaded"}}"#) {
+            Err(HostedCallError::RateLimited(msg)) => assert_eq!(msg, "overloaded"),
+            _ => panic!("expected a retryable RateLimited error for 503"),
+        }
+        // Array-shaped errors (Google's OpenAI-compat layer) classify the
+        // same way through the shared function — not re-derived, reused.
+        match parse_hosted_response(
+            br#"[{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"quota exceeded"}}]"#,
+        ) {
+            Err(HostedCallError::RateLimited(msg)) => assert!(msg.contains("quota exceeded")),
+            _ => panic!("expected a retryable RateLimited error for an array-shaped 429"),
+        }
+        match parse_hosted_response(br#"[{"error":{"code":400,"message":"bad request"}}]"#) {
+            Err(HostedCallError::Other(e)) => assert!(e.to_string().contains("bad request")),
+            _ => panic!("expected a terminal Other error for an array-shaped non-429"),
         }
     }
 }
