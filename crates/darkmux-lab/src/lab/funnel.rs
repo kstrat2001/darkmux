@@ -2018,4 +2018,554 @@ mod tests {
         assert_eq!(bundles[0].id, "billing.ts");
         assert!(bundles[0].code.contains("const end = start.plus(30)"));
     }
+
+    // ═══════════════════════════════════════════════════════════════
+    // Phase B coverage packet (#1222) — protocol/dedup/telemetry edges
+    // ═══════════════════════════════════════════════════════════════
+
+    // ── judge ruling parser: multi-fence, extras, null values ─────────
+
+    /// A judge reply can carry more than one fenced JSON block (e.g. a
+    /// judge that reasons out loud, states a tentative verdict, then
+    /// revises it). `judge_json_candidates` tries fences LAST-to-FIRST, so
+    /// the LAST fenced block in the text must win — an earlier, superseded
+    /// verdict must never leak through.
+    #[test]
+    fn parse_judge_ruling_multiple_valid_fences_last_wins() {
+        let text = "```json\n{\"ruling\": \"confirmed\", \"decisive_evidence\": \"first pass\", \"note_for_author\": \"n1\"}\n```\nOn reflection, revising the verdict:\n```json\n{\"ruling\": \"false_positive\", \"decisive_evidence\": \"second pass\", \"note_for_author\": \"n2\"}\n```";
+        let (ruling, evidence, note) = parse_judge_ruling(text).expect("parses");
+        assert_eq!(ruling, FunnelRuling::FalsePositive, "the LAST fenced JSON wins, not the first");
+        assert_eq!(evidence, "second pass", "the first fence's evidence must be ignored");
+        assert_eq!(note, "n2");
+    }
+
+    /// `RawJudgeRuling` has no `deny_unknown_fields` — extra keys a judge
+    /// bolts onto its ruling (confidence scores, nested detail) must not
+    /// break parsing.
+    #[test]
+    fn parse_judge_ruling_tolerates_unknown_extra_fields() {
+        let text = "```json\n{\"ruling\": \"confirmed\", \"decisive_evidence\": \"e\", \"note_for_author\": \"n\", \"confidence\": 0.87, \"extra\": {\"nested\": true}}\n```";
+        let (ruling, evidence, note) = parse_judge_ruling(text).expect("unknown fields must not break parsing");
+        assert_eq!(ruling, FunnelRuling::Confirmed);
+        assert_eq!(evidence, "e");
+        assert_eq!(note, "n");
+    }
+
+    /// `decisive_evidence`/`note_for_author` are `String`, not
+    /// `Option<String>`, and `ruling` is a plain `String` matched against a
+    /// closed set. A JSON `null` on any of these is a TYPE mismatch for
+    /// serde (not a missing-field default), so every candidate in
+    /// `judge_json_candidates` fails to deserialize and the whole reply
+    /// falls through to `None` (Unparsed) rather than null silently
+    /// standing in for an empty string or a bogus ruling.
+    #[test]
+    fn parse_judge_ruling_null_values_fail_to_parse_not_treated_as_empty() {
+        let evidence_null = "```json\n{\"ruling\": \"confirmed\", \"decisive_evidence\": null, \"note_for_author\": \"n\"}\n```";
+        assert!(
+            parse_judge_ruling(evidence_null).is_none(),
+            "null decisive_evidence must not silently parse as an empty string"
+        );
+
+        let ruling_null = "```json\n{\"ruling\": null, \"decisive_evidence\": \"e\", \"note_for_author\": \"n\"}\n```";
+        assert!(
+            parse_judge_ruling(ruling_null).is_none(),
+            "a null ruling value must not silently match a variant"
+        );
+    }
+
+    // ── dedup: whitespace-only anchor variance ─────────────────────────
+
+    /// `extract_new_side_anchor` NORMALIZES (marker-strip + whitespace
+    /// collapse) only to decide whether a quoted span is a legitimate
+    /// anchor — the stored/returned anchor is the model's VERBATIM quote.
+    /// Two flags whose backtick-quoted anchors are semantically identical
+    /// but differ in internal whitespace both validate against the diff
+    /// (via the collapsed fallback), yet the raw strings differ, so the
+    /// dedup key `(bundle_id, anchor, family)` differs and they do NOT
+    /// collapse. Characterizes current behavior — not asserted as a bug,
+    /// since `dedup_flags`'s doc makes no whitespace-insensitivity promise
+    /// on the key itself.
+    #[test]
+    fn dedup_anchors_differing_only_by_internal_whitespace_do_not_collapse() {
+        let flags = vec![
+            flag("b1", "member-a", 0, "The `const end = start.plus(30)` double counts."),
+            flag("b1", "member-b", 0, "The `const  end = start.plus(30)` double counts."),
+        ];
+        let (deduped, stats) = dedup_flags(flags, DIFF);
+        assert_eq!(
+            stats.deduped, 2,
+            "whitespace-differing anchors both validate against the diff but do not share a dedup key"
+        );
+        assert_eq!(deduped[0].anchor.as_deref(), Some("const end = start.plus(30)"));
+        assert_eq!(
+            deduped[1].anchor.as_deref(),
+            Some("const  end = start.plus(30)"),
+            "the stored anchor is the model's verbatim quote, not the normalized/collapsed form"
+        );
+    }
+
+    // ── mechanism_family word-boundary regression suite (expanded) ─────
+
+    /// Expands the substring-vs-token regression beyond the "tenant" case
+    /// already covered: every table keyword must match as a whole token
+    /// and must NOT fire on a longer/different word that merely contains
+    /// it as a substring.
+    #[test]
+    fn mechanism_family_word_boundary_regression_suite() {
+        // Real keywords match as standalone tokens.
+        assert_eq!(mechanism_family("This has an async issue."), "async/await");
+        assert_eq!(mechanism_family("Watch the dst transition."), "timezone/ambient-time");
+        assert_eq!(mechanism_family("Provenance information is missing."), "provenance/sibling");
+        assert_eq!(mechanism_family("Check the arg count."), "arity/param");
+
+        // Longer/different words that merely CONTAIN a keyword as a
+        // substring must not false-match — word-boundary, never substring.
+        assert_eq!(
+            mechanism_family("The function is asynchronous by design."),
+            "other",
+            "'asynchronous' must not token-match 'async'"
+        );
+        assert_eq!(
+            mechanism_family("A windstorm knocked out power."),
+            "other",
+            "'windstorm' must not token-match 'dst'"
+        );
+        assert_eq!(
+            mechanism_family("This proves the claim is unproven."),
+            "other",
+            "'proves'/'unproven' must not token-match 'provenance'"
+        );
+        assert_eq!(
+            mechanism_family("The margarine recipe changed."),
+            "other",
+            "'margarine' must not token-match 'arg'"
+        );
+    }
+
+    // ── double-confirm: pass-2 unparsed ─────────────────────────────────
+
+    /// A `confirmed` pass-1 followed by a pass-2 that stays `Unparsed`
+    /// (even after its own retry) is still ANY-other-than-confirmed —
+    /// `judge_one_flag`'s doc is explicit this must demote, never silently
+    /// promote to `Confirmed` on a garbled second call.
+    #[test]
+    fn double_confirm_confirm_then_pass2_unparsed_demotes_to_needs_check() {
+        let mut chat = scripted_chat(RefCell::new(vec![CONFIRM_JSON, "no verdict here", "still nothing"]));
+        let o = judge_one_flag("prompt", "judge-model", "sys", 1000, &mut chat);
+        assert_eq!(o.pass1.ruling, FunnelRuling::Confirmed);
+        assert_eq!(o.pass2.as_ref().unwrap().ruling, FunnelRuling::Unparsed);
+        assert_eq!(o.tier, Tier::NeedsCheck, "an unparsed pass-2 must demote, never silently confirm");
+        assert!(o.demoted_by_pass2);
+        assert_eq!(o.calls, 3, "pass-1 (1 call) + pass-2 attempt + pass-2's own unparsed-retry (2 calls)");
+    }
+
+    // ── ModelCycler load-failure propagation ────────────────────────────
+
+    /// Recording [`ModelCycler`] mock that fails `ensure_loaded` for one
+    /// named model id, so cycling order AND the abort point are both
+    /// assertable.
+    struct FailingLoadCycler {
+        fail_on: String,
+        log: Vec<String>,
+    }
+    impl FailingLoadCycler {
+        fn new(fail_on: &str) -> Self {
+            Self { fail_on: fail_on.to_string(), log: Vec::new() }
+        }
+    }
+    impl ModelCycler for FailingLoadCycler {
+        fn ensure_loaded(&mut self, pm: &ProfileModel) -> Result<()> {
+            self.log.push(format!("load:{}", pm.id));
+            if pm.id == self.fail_on {
+                bail!("simulated load failure for {}", pm.id);
+            }
+            Ok(())
+        }
+        fn release(&mut self, pm: &ProfileModel) -> Result<()> {
+            self.log.push(format!("release:{}", pm.id));
+            Ok(())
+        }
+    }
+
+    /// Sequential mode loads/dispatches/releases one member fully before
+    /// moving to the next. A load failure on the SECOND member aborts the
+    /// whole probe phase via `?` — the first member's already-gathered
+    /// flags are discarded (never surfaced, since `run_funnel` returns
+    /// `Err` and the partially-built envelope is dropped), the failed
+    /// member is never released, and the judge never loads at all.
+    #[test]
+    fn probe_phase_sequential_load_failure_aborts_remaining_members_and_drops_prior_flags() {
+        let crew = crew_with(vec![
+            (
+                "review-probe",
+                vec![staffing("fast", "member-a", 1), staffing("fast", "member-b", 1)],
+            ),
+            ("review-judge", vec![staffing("fast", "judge-model", 1)]),
+        ]);
+        let inputs = FunnelInputs {
+            case_id: "c1".to_string(),
+            crew: &crew,
+            intent: "add a feature",
+            diff: DIFF,
+            mode: ExecMode::Sequential,
+            probe_system: "probe sys",
+            judge_system: "judge sys",
+            bundles: None,
+        };
+        let mut cycler = FailingLoadCycler::new("member-b");
+        let mut chat = |_call: &ChatCall| Ok(reply("a real defect `const end = start.plus(30)`"));
+        let err = run_funnel(&inputs, &mut chat, &mut cycler).unwrap_err();
+        assert!(
+            err.to_string().contains("probe phase"),
+            "run_funnel wraps the propagated load error with phase context"
+        );
+        assert_eq!(
+            cycler.log,
+            vec!["load:member-a", "release:member-a", "load:member-b"],
+            "member-a fully cycled before member-b's load failure aborts — no release for member-b, no judge load at all"
+        );
+    }
+
+    /// Parallel mode loads EVERY member up front, before dispatching any of
+    /// them. A load failure partway through that up-front loop aborts
+    /// before a single dispatch happens — member-a's draw never runs even
+    /// though its own load succeeded.
+    #[test]
+    fn probe_phase_parallel_load_failure_aborts_before_any_dispatch() {
+        let crew = crew_with(vec![
+            (
+                "review-probe",
+                vec![staffing("fast", "member-a", 1), staffing("fast", "member-b", 1)],
+            ),
+            ("review-judge", vec![staffing("fast", "judge-model", 1)]),
+        ]);
+        let inputs = FunnelInputs {
+            case_id: "c1".to_string(),
+            crew: &crew,
+            intent: "add a feature",
+            diff: DIFF,
+            mode: ExecMode::Parallel,
+            probe_system: "probe sys",
+            judge_system: "judge sys",
+            bundles: None,
+        };
+        let mut cycler = FailingLoadCycler::new("member-b");
+        let mut dispatch_count = 0u32;
+        let mut chat = |_call: &ChatCall| {
+            dispatch_count += 1;
+            Ok(reply("a real defect `const end = start.plus(30)`"))
+        };
+        let err = run_funnel(&inputs, &mut chat, &mut cycler).unwrap_err();
+        assert!(err.to_string().contains("probe phase"));
+        assert_eq!(
+            dispatch_count, 0,
+            "parallel mode loads every member before dispatching any — the failure aborts before member-a's draw ever runs"
+        );
+        assert_eq!(cycler.log, vec!["load:member-a", "load:member-b"]);
+    }
+
+    // ── selector edge cases ──────────────────────────────────────────
+
+    /// `max_bundles` is taken literally — `0` means the staffing gets ZERO
+    /// bundles (a degenerate, silent no-op selection), not "unlimited".
+    #[test]
+    fn selector_max_bundles_zero_selects_nothing() {
+        let bundles = vec![
+            BundleInput { id: "a".into(), fact_family: "other".into(), code: String::new(), facts: vec![], manifest: vec![] },
+            BundleInput { id: "b".into(), fact_family: "param-flow".into(), code: String::new(), facts: vec![], manifest: vec![] },
+        ];
+        let sel = BundleSelector { fact_families: vec![], max_bundles: Some(0), ..Default::default() };
+        let selected = select_bundles_for_staffing(&bundles, Some(&sel));
+        assert!(selected.is_empty(), "max_bundles: 0 must select nothing, not \"unlimited\"");
+    }
+
+    /// A `fact_families` restriction naming a family no bundle carries
+    /// degrades to an empty selection (zero bundles for that staffing),
+    /// never falls back to "no restriction matches everything."
+    #[test]
+    fn selector_fact_families_naming_unknown_family_selects_nothing() {
+        let bundles = vec![
+            BundleInput { id: "a".into(), fact_family: "auth".into(), code: String::new(), facts: vec![], manifest: vec![] },
+            BundleInput { id: "b".into(), fact_family: "billing".into(), code: String::new(), facts: vec![], manifest: vec![] },
+        ];
+        let sel = BundleSelector {
+            fact_families: vec!["nonexistent-family".to_string()],
+            max_bundles: None,
+            ..Default::default()
+        };
+        let selected = select_bundles_for_staffing(&bundles, Some(&sel));
+        assert!(
+            selected.is_empty(),
+            "an unmatched fact_families restriction must select zero bundles, not fall back to 'no restriction'"
+        );
+    }
+
+    // ── step telemetry consistency ───────────────────────────────────
+
+    /// The `probe` step's wall_ms wraps the ENTIRE `probe_phase` call
+    /// (cycler load/release overhead + every member's dispatch time), so it
+    /// must be >= the sum of the probe seats' own `MemberRecord.wall_ms`
+    /// (which excludes cycler overhead). A small real sleep in the mocked
+    /// `chat` makes the timing comparison meaningful instead of two zeros.
+    #[test]
+    fn step_telemetry_probe_wall_ms_encompasses_member_wall_ms() {
+        let crew = valid_crew();
+        let inputs = FunnelInputs {
+            case_id: "c1".to_string(),
+            crew: &crew,
+            intent: "add a feature",
+            diff: DIFF,
+            mode: ExecMode::Sequential,
+            probe_system: "probe sys",
+            judge_system: "judge sys",
+            bundles: None,
+        };
+        let mut cycler = RecordingCycler::new();
+        let mut call_n = 0u32;
+        let mut chat = |_call: &ChatCall| {
+            call_n += 1;
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            if call_n <= 2 {
+                Ok(reply("a real defect `const end = start.plus(30)`"))
+            } else {
+                Ok(reply(CONFIRM_JSON))
+            }
+        };
+        let env = run_funnel(&inputs, &mut chat, &mut cycler).expect("funnel runs");
+        let probe_step = env.steps.iter().find(|s| s.step_id == "probe").expect("probe step recorded");
+        let probe_member_ms: u64 = env
+            .members
+            .iter()
+            .filter(|m| m.seat == "review-probe")
+            .map(|m| m.wall_ms)
+            .sum();
+        assert!(
+            probe_step.wall_ms >= probe_member_ms,
+            "probe step ({}) must wrap at least as much wall time as its members' dispatch time ({})",
+            probe_step.wall_ms,
+            probe_member_ms
+        );
+    }
+
+    /// The judge's `MemberRecord.wall_ms` is set to EXACTLY `pass1_ms +
+    /// pass2_ms` (`finish_funnel`), and the `judge-pass1`/`judge-pass2`
+    /// step rows carry those same two values — so their sum must equal the
+    /// judge member's wall_ms EXACTLY, not just approximately (both are
+    /// derived from the same accumulator variables, so this holds
+    /// regardless of real elapsed time).
+    #[test]
+    fn step_telemetry_judge_steps_sum_equals_judge_member_wall_ms() {
+        let crew = valid_crew();
+        let inputs = FunnelInputs {
+            case_id: "c1".to_string(),
+            crew: &crew,
+            intent: "add a feature",
+            diff: DIFF,
+            mode: ExecMode::Sequential,
+            probe_system: "probe sys",
+            judge_system: "judge sys",
+            bundles: None,
+        };
+        let mut cycler = RecordingCycler::new();
+        let mut call_n = 0u32;
+        let mut chat = |_call: &ChatCall| {
+            call_n += 1;
+            if call_n <= 2 {
+                Ok(reply("a real defect `const end = start.plus(30)`"))
+            } else {
+                // Both judge passes confirm, so both judge-pass1 and
+                // judge-pass2 step rows get recorded.
+                Ok(reply(CONFIRM_JSON))
+            }
+        };
+        let env = run_funnel(&inputs, &mut chat, &mut cycler).expect("funnel runs");
+        let judge_member = env
+            .members
+            .iter()
+            .find(|m| m.seat == "review-judge")
+            .expect("judge member recorded");
+        let step_sum: u64 = env
+            .steps
+            .iter()
+            .filter(|s| s.step_id.starts_with("judge-"))
+            .map(|s| s.wall_ms)
+            .sum();
+        assert_eq!(
+            step_sum, judge_member.wall_ms,
+            "judge-pass1 + judge-pass2 step wall_ms must sum EXACTLY to the judge MemberRecord's wall_ms"
+        );
+    }
+
+    // ── envelope serde round trip through a file ─────────────────────
+
+    /// `FunnelEnvelope` derives `Serialize` only (no `Deserialize`), so a
+    /// literal `FunnelEnvelope -> FunnelEnvelope` round trip isn't
+    /// expressible. This writes a fully-populated envelope (covering all
+    /// three `Tier` variants) to a real file, reads it back, and checks
+    /// value-level equality through `serde_json::Value` — the strongest
+    /// round-trip check available against the current shape.
+    #[test]
+    fn envelope_serde_round_trips_through_a_file_with_all_tier_variants() {
+        use std::io::Write;
+
+        let flag_confirmed = flag("b1", "member-a", 0, "confirmed charge");
+        let flag_needs_check = flag("b1", "member-a", 1, "needs-check charge");
+        let flag_archived = flag("b1", "member-a", 2, "archived charge");
+
+        let judged = vec![
+            JudgedFlag {
+                flag: flag_confirmed.clone(),
+                pass1: JudgeRecord {
+                    ruling: FunnelRuling::Confirmed,
+                    decisive_evidence: "e1".into(),
+                    note_for_author: "n1".into(),
+                    pass: 1,
+                    seconds: 0.5,
+                },
+                pass2: Some(JudgeRecord {
+                    ruling: FunnelRuling::Confirmed,
+                    decisive_evidence: "e1b".into(),
+                    note_for_author: "n1b".into(),
+                    pass: 2,
+                    seconds: 0.4,
+                }),
+                tier: Tier::Confirmed,
+                demoted_by_pass2: false,
+            },
+            JudgedFlag {
+                flag: flag_needs_check.clone(),
+                pass1: JudgeRecord {
+                    ruling: FunnelRuling::Confirmed,
+                    decisive_evidence: "e2".into(),
+                    note_for_author: "n2".into(),
+                    pass: 1,
+                    seconds: 0.3,
+                },
+                pass2: Some(JudgeRecord {
+                    ruling: FunnelRuling::FalsePositive,
+                    decisive_evidence: "e2b".into(),
+                    note_for_author: "n2b".into(),
+                    pass: 2,
+                    seconds: 0.2,
+                }),
+                tier: Tier::NeedsCheck,
+                demoted_by_pass2: true,
+            },
+            JudgedFlag {
+                flag: flag_archived.clone(),
+                pass1: JudgeRecord {
+                    ruling: FunnelRuling::FalsePositive,
+                    decisive_evidence: "e3".into(),
+                    note_for_author: "n3".into(),
+                    pass: 1,
+                    seconds: 0.1,
+                },
+                pass2: None,
+                tier: Tier::Archived,
+                demoted_by_pass2: false,
+            },
+        ];
+
+        let env = FunnelEnvelope {
+            case_id: "case-42".to_string(),
+            crew: "test-crew".to_string(),
+            mode: "sequential".to_string(),
+            members: vec![
+                MemberRecord {
+                    model: "darkmux:probe-model".to_string(),
+                    seat: "review-probe".to_string(),
+                    draws: 3,
+                    wall_ms: 1200,
+                    total_tokens: 900,
+                },
+                MemberRecord {
+                    model: "darkmux:judge-model".to_string(),
+                    seat: "review-judge".to_string(),
+                    draws: 5,
+                    wall_ms: 800,
+                    total_tokens: 600,
+                },
+            ],
+            steps: vec![
+                StepRecord { step_id: "bundle".to_string(), kind: "procedural".to_string(), items_in: 1, items_out: 1, wall_ms: 2 },
+                StepRecord { step_id: "probe".to_string(), kind: "dispatch".to_string(), items_in: 1, items_out: 3, wall_ms: 1200 },
+                StepRecord { step_id: "dedup".to_string(), kind: "procedural".to_string(), items_in: 3, items_out: 3, wall_ms: 1 },
+                StepRecord { step_id: "judge-pass1".to_string(), kind: "dispatch".to_string(), items_in: 3, items_out: 3, wall_ms: 500 },
+                StepRecord { step_id: "judge-pass2".to_string(), kind: "dispatch".to_string(), items_in: 2, items_out: 2, wall_ms: 300 },
+            ],
+            bundles: 1,
+            raw_flags: 3,
+            deduped_flags: 3,
+            flags: vec![flag_confirmed, flag_needs_check, flag_archived],
+            judged,
+            confirmed: 1,
+            needs_check: 1,
+            archived: 1,
+            degenerate: None,
+            fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
+        };
+
+        let json = serde_json::to_string_pretty(&env).expect("serialize");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("envelope.json");
+        {
+            let mut f = std::fs::File::create(&path).expect("create");
+            f.write_all(json.as_bytes()).expect("write");
+        }
+        let read_back = std::fs::read_to_string(&path).expect("read");
+        let value: serde_json::Value = serde_json::from_str(&read_back).expect("valid json");
+
+        assert_eq!(value["case_id"], "case-42");
+        assert_eq!(value["crew"], "test-crew");
+        assert_eq!(value["mode"], "sequential");
+        assert_eq!(value["bundles"], 1);
+        assert_eq!(value["raw_flags"], 3);
+        assert_eq!(value["deduped_flags"], 3);
+        assert_eq!(value["confirmed"], 1);
+        assert_eq!(value["needs_check"], 1);
+        assert_eq!(value["archived"], 1);
+        assert!(value.get("degenerate").is_none(), "a None degenerate must be omitted, not written as null");
+        assert_eq!(value["fingerprint"]["protocol"], "double-confirm-v1");
+
+        let tiers: Vec<String> = value["judged"]
+            .as_array()
+            .expect("judged array")
+            .iter()
+            .map(|j| j["tier"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            tiers,
+            vec!["confirmed", "needs_check", "archived"],
+            "all three Tier variants must survive the file round trip verbatim"
+        );
+
+        assert_eq!(value["members"].as_array().unwrap().len(), 2);
+        assert_eq!(value["steps"].as_array().unwrap().len(), 5);
+        assert_eq!(value["judged"][1]["demoted_by_pass2"], true);
+        assert!(value["judged"][2]["pass2"].is_null(), "no pass-2 dispatch serializes pass2 as null, not omitted");
+    }
+
+    // ── judge_prompt: independent section gating ──────────────────────
+
+    /// Facts and manifest sections are gated INDEPENDENTLY — a bundle with
+    /// a manifest but no fact sheet must show the manifest section and
+    /// omit the fact-sheet section (the existing "all present" / "all
+    /// absent" tests don't isolate this mixed case).
+    #[test]
+    fn judge_prompt_manifest_present_facts_absent() {
+        let p = judge_prompt("intent", "code", &[], &["helperFn".to_string()], "charge");
+        assert!(!p.contains("Fact sheet:"), "no facts supplied -> no fact-sheet section");
+        assert!(p.contains("Symbols referenced but not defined in the provided code:"));
+        assert!(p.contains("helperFn"));
+    }
+
+    /// The mirror case: facts present, manifest absent.
+    #[test]
+    fn judge_prompt_facts_present_manifest_absent() {
+        let p = judge_prompt("intent", "code", &["fact one".to_string()], &[], "charge");
+        assert!(p.contains("Fact sheet:"));
+        assert!(p.contains("fact one"));
+        assert!(!p.contains("Symbols referenced but not defined"), "no manifest supplied -> no manifest section");
+    }
 }
