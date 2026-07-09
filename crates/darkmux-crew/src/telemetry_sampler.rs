@@ -218,6 +218,31 @@ pub fn sample_host() -> HostSample {
 mod tests {
     use super::*;
 
+    /// The one test that exercises the REAL `sample_host()` shell-outs —
+    /// macOS-gated because every command it runs (`top -l`, `vm_stat`,
+    /// `sysctl hw.memsize`, `ioreg`) is macOS-only; on Linux the shells
+    /// all fail and every field is `None`, which would make this assert
+    /// meaningless there. Consumers that need `sample_host` in a
+    /// cross-platform test (e.g. `darkmux-lab`'s funnel telemetry tests)
+    /// inject a fake sampling function instead — this test is where the
+    /// real path keeps its coverage. Costs one real `top -l 1` call
+    /// (~600-900ms); kept to a single invocation for that reason.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn sample_host_reads_at_least_one_field_on_macos() {
+        let s = sample_host();
+        assert!(
+            s.cpu.is_some() || s.mem.is_some() || s.gpu.is_some(),
+            "on macOS at least one of cpu/mem/gpu must read successfully; got {s:?}"
+        );
+        // Parsed values are percentages — each present field must be in
+        // range (the parsers clamp, so a violation means a parser change
+        // broke the clamp).
+        for v in [s.cpu, s.mem, s.gpu].into_iter().flatten() {
+            assert!(v <= 100, "percent field out of range: {v}");
+        }
+    }
+
     fn loaded(model: &str, size: &str) -> LoadedModel {
         LoadedModel {
             identifier: format!("darkmux:{model}"),
