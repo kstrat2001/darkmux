@@ -1849,6 +1849,7 @@ mod tests {
             mode: ExecMode::Parallel,
             probe_system: "probe sys",
             judge_system: "judge sys",
+            bundles: None,
         };
         let flags = vec![flag("billing.ts", "member-a", 0, "`const end = start.plus(30)` off by one")];
         let mut cycler = RecordingCycler::new();
