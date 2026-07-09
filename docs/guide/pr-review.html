@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PR review: the local review funnel · darkmux user guide</title>
+<meta name="description" content="Run darkmux's local PR-review funnel: several probe models investigate a diff under k independent draws, a judge double-confirms each flag, and confirmed findings land as merge-blocking inline comments — all on local models.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <div class="wrap">
+    <a href="../" class="brand">darkmux</a>
+    <span class="crumbs"><a href="index.html">guide</a> <span>/</span> PR review</span>
+    <div class="links">
+      <a href="missions.html">‹ Prev</a>
+      <a href="index.html">Guide home</a>
+      <a href="always-on-hub.html">Next ›</a>
+    </div>
+  </div>
+</nav>
+
+<header class="page-head">
+  <div class="wrap">
+    <div class="label">05 <span class="dot">·</span> advanced</div>
+    <h1>PR review: the local review funnel</h1>
+    <p class="lede">A local review pipeline that splits the reviewing job across several small dispatches instead of asking one model "any issues?" and hoping. Several probe models each investigate small code bundles under a strong prior, a judge model rules on every flag with a double-confirmation pass, and only what survives becomes a merge-blocking comment — all on local models, no cloud API.</p>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <h2>Why a funnel, not a single reviewer</h2>
+    <p>A single local reviewer model asked an open-ended "review this diff" question tends toward shallow output: it restates what the diff obviously does, or flags the bug a fix is removing, or says nothing is wrong because nothing obviously jumped out in one pass. The review funnel restructures the same underlying capability into a pipeline that plays to what small dispatches are actually good at: bounded investigation over a strong prior, not open-ended judgment over an entire diff.</p>
+    <p>The shape:</p>
+    <ol>
+      <li><strong>Bundle</strong> the diff into small, focused code slices — one changed function plus its resolved callees, siblings, and a mechanically-extracted fact sheet (param flow, differentials, sibling comparisons).</li>
+      <li><strong>Probe</strong> each bundle with one or more models, each drawing <em>k</em> independent investigations under the prior "this bundle has been established to contain a defect — find it." A strong prior turns an open-ended search into a bounded one.</li>
+      <li><strong>Dedup</strong> the raw flags: independent draws that land on the same defect collapse into one flag before anyone judges it.</li>
+      <li><strong>Judge, twice.</strong> Every deduped flag gets a first ruling: confirmed, needs a closer look, or false positive. Only a first-pass "confirmed" gets a second, independent judge call over the identical prompt — agreement promotes the flag; disagreement demotes it. A flag never ships as a defect report on the strength of one judge's opinion.</li>
+      <li><strong>Synthesize</strong> the three tiers into a review: confirmed findings become inline, merge-blocking comments; uncertain ones land in a non-blocking "worth a double check" note; everything else is archived in the run's own artifact, never surfaced.</li>
+    </ol>
+    <div class="callout">
+      <strong>Confirmed still isn't the final word.</strong>
+      <p style="margin: 8px 0 0;">Every confirmed finding the funnel posts carries a fixed marker: <em>needs frontier verification — confirmed by a local judge, not yet frontier-verified</em>. A local judge's double-confirm is real signal — cross-context re-thinking, at judge scale — but it isn't the same as a frontier orchestrator's own review. The funnel narrows what the frontier has to look at; it doesn't replace the frontier's judgment on anything that matters.</p>
+    </div>
+    <p>The funnel never reports a silent "looks fine." A run that confirms nothing still says how much it investigated (how many flags, how many bundles, which models ran it) so a clean result reads as "checked and found nothing," not "didn't check." And a run that produces no usable signal at all — a dead dispatch, an empty reply, a docket that never got off the ground — is marked <strong>degraded</strong>, never posted as a quiet pass.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Crews: who staffs the funnel</h2>
+    <p>A <strong>crew</strong> is a saved seat assignment in <code>~/.darkmux/profiles.json</code>: a top-level sibling of <code>profiles</code>, keyed by crew name, naming which profile (and optionally which explicit model within it) staffs each seat the pipeline needs. The review funnel needs exactly two seat kinds:</p>
+    <ul>
+      <li><strong><code>review-probe</code></strong>: one or more staffings, each drawing <em>k</em> independent investigations per bundle. A staffing can optionally carry a <code>bundle_selector</code> that scopes it to specific fact families (e.g. only <code>security</code>/<code>correctness</code> bundles) instead of the full set — useful for pairing a wide, cheap probe against everything with a narrower, more expensive one against the bundles that matter most.</li>
+      <li><strong><code>review-judge</code></strong>: exactly one staffing. It rules on every deduped flag, twice for anything it confirms on the first pass.</li>
+    </ul>
+    <p>The shipped example crew, from <code>profiles.example.json</code>:</p>
+    <pre><code>{
+  "profiles": {
+    "balanced": {
+      "description": "Mid-range tasks. Predictable behavior across mixed workloads.",
+      "models": [{ "id": "&lt;your-worker-model-id&gt;", "n_ctx": 100000 }]
+    },
+    "deep": {
+      "description": "Long agentic tasks. Maximum worker context for fewer compactions.",
+      "models": [{ "id": "&lt;your-worker-model-id&gt;", "n_ctx": 200000 }]
+    }
+  },
+
+  "crews": {
+    "review-deep": {
+      "description": "Deep review lineup: two probe staffings (one plain, one bundle-scoped) plus a single judge staffing.",
+      "seats": {
+        "review-probe": [
+          { "profile": "balanced" },
+          { "profile": "deep", "k": 1, "bundle_selector": { "fact_families": ["security", "correctness"] } }
+        ],
+        "review-judge": [
+          { "profile": "deep" }
+        ]
+      }
+    }
+  }
+}</code></pre>
+    <p>Here <code>balanced</code> staffs a wide instruct probe (draws over every bundle, default <code>k</code>) and <code>deep</code> staffs a second, bundle-scoped probe (a single deep-reasoning draw restricted to the security/correctness fact families) — plus the same <code>deep</code> profile staffs the judge seat. Replace the model ids with what you have downloaded (<code>lms ls</code>). <a href="https://github.com/kstrat2001/darkmux/blob/main/.github/DARKMUX_REVIEW_RUNNER.md">The self-review runner doc</a> has a fuller worked example naming real model ids for a three-model, 32GB-tier crew.</p>
+
+    <h3>The seat law</h3>
+    <p>The judge seat takes the call volume: every deduped flag gets a pass-1 judge call, and every confirmed pass-1 gets a second, independent pass-2 call. On a busy diff that can be a lot of judge dispatches from a small number of probe flags. <strong>Staff the judge seat with a fast, high-throughput model</strong> — an MoE-class model with a small active-parameter count reads well here, since it needs to rule quickly and repeatedly, not reason exhaustively over a whole diff. Slow, deep reasoners belong in <strong>probe</strong> seats, where a <code>bundle_selector</code> keeps their few, expensive draws scoped to the fact families that benefit most from careful reasoning, instead of running them over every bundle in the diff.</p>
+
+    <h3>Inspect a crew</h3>
+    <p>There's no dedicated inspection verb for the <code>crews</code> map yet (<code>darkmux crew list</code> is a different thing — it lists <em>roles</em>, the crew-dispatch abstraction covered in <a href="missions.html">missions, sprints, and crew dispatch</a>). Read the registry directly:</p>
+    <pre><code>jq '.crews' ~/.darkmux/profiles.json</code></pre>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Run it locally</h2>
+    <p><code>darkmux pr-review run</code> drives the funnel end-to-end: bundle the diff, dispatch the probe/judge seats, and emit the same <code>{mode, review, comment}</code> payload the older single-reviewer <code>pr-review render</code> path produces.</p>
+    <pre><code>darkmux pr-review run \
+  --worktree /path/to/local/checkout \
+  --diff pr.diff \
+  --crew review-deep \
+  --mode auto \
+  --envelope-out funnel.json \
+  --emit rendered.json</code></pre>
+    <p>Source the bundler's file content from either a local checkout (<code>--worktree &lt;dir&gt;</code>) or the GitHub API with no checkout at all (<code>--github &lt;owner/repo&gt; --head-sha &lt;sha&gt;</code>) — the two are mutually exclusive. <code>--intent-file</code> optionally feeds the diff author's stated intent (title + description) into every probe/judge prompt, so the funnel assesses the diff against its stated purpose instead of flagging the bug a fix is removing.</p>
+
+    <h3>What comes back</h3>
+    <p>The rendered payload's <code>mode</code> field is one of three:</p>
+    <ul>
+      <li><strong><code>review</code></strong>: at least one confirmed finding. Posted as <code>REQUEST_CHANGES</code> with inline comments anchored to diff lines (or a general body item when a finding's quoted anchor can't be resolved to exactly one line — never a guessed line number). Each confirmed comment carries the <em>needs frontier verification</em> marker. Any <code>needs_check</code> flags ride along as a non-blocking "worth a double check" section in the same body.</li>
+      <li><strong><code>comment</code></strong>: zero confirmed findings on a healthy run. An honest summary — how many flags were investigated, across how many bundles, by which models — plus any <code>needs_check</code> flags as non-blocking notes. Never a silent pass with no signal attached.</li>
+      <li><strong><code>degraded</code></strong>: the run produced no usable signal at all (a dead dispatch, an empty reply, a docket that never got off the ground). Posted as a loud warning, never a green check.</li>
+    </ul>
+
+    <h3>The envelope artifact</h3>
+    <p><code>--envelope-out &lt;path&gt;</code> writes the full run record: every probe flag, every judge ruling (pass-1 and, where it ran, pass-2), the tier each flag landed in, per-model wall-clock and token telemetry, and a fingerprint (judge model + temperature + protocol version) two envelopes need to share before their tiers are comparable. It's the audit trail behind the rendered comment — keep it if you want to inspect what got archived, or replay synthesis later without redispatching (see <code>--from-envelope</code> below).</p>
+
+    <h3>Exec modes: sequential, parallel, auto</h3>
+    <p>The <code>--mode</code> flag governs LMStudio residency across the funnel's dispatches, not concurrent network calls (dispatches within a mode still run one at a time):</p>
+    <ul>
+      <li><strong><code>sequential</code></strong>: loads one seat's model, runs every draw for it, releases it, then moves to the next. Fits machines that can't hold every distinct model in the crew resident at once.</li>
+      <li><strong><code>parallel</code></strong>: loads every distinct model in the crew up front and keeps them all resident for the whole run. Needs enough RAM headroom to hold the crew's full model set simultaneously.</li>
+      <li><strong><code>auto</code></strong> (default): resolves to one of the above, once, up front, from the machine's detected hardware tier and how many <em>distinct</em> models the crew needs resident (a probe and the judge sharing the same profile/model count once, not twice). The resolved choice is recorded in the envelope's <code>mode</code> field, so you never have to wonder which one actually ran.</li>
+    </ul>
+    <p><code>--k</code> overrides every <code>review-probe</code> staffing's draw count for this run, without editing the crew. <code>--bundler &lt;cmd&gt;</code> swaps in an external bundler (any executable implementing <code>&lt;cmd&gt; --worktree &lt;dir&gt; --diff &lt;file&gt;</code> and emitting the same frozen bundle JSON) in place of the built-in one. <code>--from-envelope &lt;path&gt;</code> re-runs synthesis only against a previously written envelope — zero model calls, zero bundling — the escape hatch for re-rendering a payload without redispatching.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>CI recipe</h2>
+    <p>darkmux reviews its own PRs this way: <code>.github/workflows/darkmux-review.yml</code> on a self-hosted runner, dogfooding the funnel in public. The pattern generalizes to any repo with a self-hosted runner and a local model stack.</p>
+    <pre><code>gh workflow run darkmux-review.yml -f pr=&lt;PR_NUMBER&gt;
+<span class="comment"># optional overrides:
+#   -f crew=&lt;name&gt;   which crew to dispatch (default: a repo variable, falling back to "review-deep")
+#   -f mode=&lt;mode&gt;   sequential | parallel | auto
+#   -f k=&lt;n&gt;         override draws-per-seat for every staffing in the crew</span></code></pre>
+    <p>Three things worth knowing about how the workflow is built:</p>
+    <ul>
+      <li><strong>Inputs are <code>pr</code>, <code>crew</code>, <code>mode</code>, <code>k</code>.</strong> The crew — and therefore which models actually run the review — lives entirely in the runner's own <code>~/.darkmux/profiles.json</code>, never in the workflow file. The public YAML never names a model.</li>
+      <li><strong>No PR checkout.</strong> The job reads only the PR's diff, title, and description via the GitHub API — data, never executed — and passes <code>--github &lt;owner/repo&gt; --head-sha &lt;sha&gt;</code> so the funnel's own file source fetches any additional file content it needs the same way. The only checkout is of the repo's trusted default branch (the review tooling itself), never the reviewed PR's code.</li>
+      <li><strong>The envelope uploads as an artifact.</strong> Whatever <code>--envelope-out</code> wrote goes up via <code>actions/upload-artifact</code> regardless of outcome (<code>if: always()</code>), so a degraded or oddly-scored run is still inspectable after the fact.</li>
+    </ul>
+    <p>Trigger is deliberately <code>workflow_dispatch</code>-only: it never fires on a bare <code>pull_request</code> event, so a stranger's PR (or a fork) can't launch anything on the runner. Only someone with write access runs it. See <a href="https://github.com/kstrat2001/darkmux/blob/main/.github/DARKMUX_REVIEW_RUNNER.md">DARKMUX_REVIEW_RUNNER.md</a> for the full runner setup (registering the self-hosted runner, prerequisites, and a copy-pasteable crew migration example).</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Validate your crew before trusting it</h2>
+    <p>A crew is a claim about model behavior: "these probe models plus this judge produce trustworthy confirmed findings." Don't take that on faith. <code>darkmux lab review-bench --funnel</code> runs the same funnel machinery over a labeled case corpus and scores it — precision, recall, verdict, and anchor accuracy — exactly the way every other review mode in the bench is scored.</p>
+    <pre><code>darkmux lab review-bench \
+  --funnel \
+  --crew review-deep \
+  --workdirs /path/to/case-workdirs \
+  --cases-dir templates/builtin/lab-fixtures/pr-review-bench/cases</code></pre>
+    <p><code>--workdirs</code> points at an evidence root with one subdirectory per case id holding that case's repository tree at the reviewed commit (the probe/judge seats read real code, the same way they would against a live PR). <code>--exec-mode</code> (the bench's name for <code>pr-review run</code>'s <code>--mode</code>) and <code>--k</code> let you bench the exact exec-mode/draw-count combination you intend to run in CI. Run this whenever you change a crew's staffing — a new probe model, a different judge, a changed <code>bundle_selector</code> — before pointing production PRs at it.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Hardware sizing</h2>
+    <p>The funnel's RAM footprint under <code>parallel</code> is the sum of every <em>distinct</em> model the crew needs resident; under <code>sequential</code> it's just the largest single model, since only one is ever loaded at a time. Distinct means distinct model id — two staffings pointing at the same profile's default model count once, not twice. Two illustrative examples for a crew staffing three genuinely distinct models (two differently-modeled probe staffings plus a separately-modeled judge, the shape the self-review runner's example crew uses):</p>
+    <table>
+      <tr><th>Machine</th><th>What <code>auto</code> resolves to</th><th>What happens</th></tr>
+      <tr>
+        <td>32 GB</td>
+        <td><code>sequential</code></td>
+        <td>One probe model loads (say, roughly 14 GB for a dense model in the 20-30B class at 4-bit quantization), runs its draws, releases. The second probe staffing's model loads, runs, releases. The judge's model loads last, rules on every deduped flag (twice for anything it confirms), releases. Never more than one model resident.</td>
+      </tr>
+      <tr>
+        <td>128 GB</td>
+        <td><code>parallel</code></td>
+        <td>All three distinct models — both probe staffings' models and the judge's — load up front and stay resident for the whole run. No load/release churn between seats; dispatches still run one at a time, but there's no reload cost between them.</td>
+      </tr>
+    </table>
+    <p><code>auto</code> makes this call from a coarse RAM-tier budget against the crew's distinct-model count: machines up to 32 GB get a budget of one resident model, the 33-64 GB tier gets two, and above 64 GB gets three. A crew needing more distinct models than the budget allows falls back to <code>sequential</code> regardless of tier. Pass <code>--mode sequential</code> explicitly if you want the conservative, one-at-a-time behavior on a machine that could technically fit more — useful when the funnel is sharing the box with something else that also wants RAM.</p>
+  </div>
+</section>
+
+<nav class="page-nav wrap">
+  <a href="missions.html" class="prev">
+    <span class="dir">‹ Previous</span>
+    <span class="title">Missions, sprints, and crew dispatch</span>
+  </a>
+  <a href="always-on-hub.html" class="next">
+    <span class="dir">Next ›</span>
+    <span class="title">Set up a secure hub</span>
+  </a>
+</nav>
+
+<footer>
+  <div class="wrap">
+    <div>
+      <a href="https://github.com/kstrat2001/darkmux">GitHub</a> ·
+      <a href="https://github.com/kstrat2001/darkmux/blob/main/DISCLAIMER.md">Disclaimer</a> ·
+      <a href="https://github.com/kstrat2001/darkmux/blob/main/LICENSE">MIT</a>
+    </div>
+    <div>
+      © Kain Osterholt · <a href="https://substack.com/@DarklyEnergized">Darkly Energized LLC</a>
+    </div>
+  </div>
+</footer>
+
+<script src="copy.js" defer></script>
+</body>
+</html>
