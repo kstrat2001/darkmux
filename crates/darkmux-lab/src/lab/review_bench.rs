@@ -195,6 +195,16 @@ pub enum BenchMode {
     /// charges become the review, scored by the same matcher as every other
     /// mode — the dialectic is entirely upstream of scoring.
     Dialectic,
+    /// (#1222 Phase B packet 7) The review funnel as a bench condition — the
+    /// release-guard validation mode: bundles → probe seats ×k draws → dedup
+    /// → double-confirm judge (`lab::funnel::run_funnel`, fed real bundles
+    /// via `FunnelInputs::bundles`), over the SAME labeled corpus every
+    /// other mode scores against. `Confirmed`
+    /// tier flags become the review's findings (`NeedsCheck`/`Archived`
+    /// don't count toward recall/precision, but are recorded in the
+    /// per-case `funnels.json` artifact) — scoring is entirely downstream of
+    /// the funnel, same discipline as `Dialectic`.
+    Funnel,
 }
 
 impl BenchMode {
@@ -207,6 +217,11 @@ impl BenchMode {
             // per-case loop branches to `run_debate` before ever asking the
             // mode for a single role id.
             BenchMode::Dialectic => unreachable!("dialectic dispatches per-seat roles"),
+            // The funnel dispatches `review-probe`/`review-judge` seats
+            // directly via `single_shot_chat` (no container dispatch, no
+            // single role id) — the per-case loop branches to
+            // `run_funnel_case` before ever asking the mode for one.
+            BenchMode::Funnel => unreachable!("funnel dispatches review-probe/review-judge seats"),
         }
     }
 
@@ -216,6 +231,7 @@ impl BenchMode {
             BenchMode::FreeForm => "freeform",
             BenchMode::Agentic => "agentic",
             BenchMode::Dialectic => "dialectic",
+            BenchMode::Funnel => "funnel",
         }
     }
 }
@@ -244,6 +260,24 @@ pub struct ReviewBenchOpts {
     pub prosecutor_profile: Option<String>,
     pub defender_profile: Option<String>,
     pub judge_profile: Option<String>,
+    /// (#1222 Phase B packet 7) `Funnel` mode's crew name — `crews.<name>`
+    /// in the profile registry, naming the `review-probe`/`review-judge`
+    /// seat staffing `lab::funnel::validate_funnel_crew` requires. Required
+    /// when `mode == Funnel` (checked at bench start, before any dispatch).
+    pub crew: Option<String>,
+    /// (#1222) `Funnel` mode's model-cycling mode override —
+    /// `"sequential"` | `"parallel"` | `"auto"` (default: `auto`, resolved
+    /// once against the local hardware tier — see `funnel::resolve_mode`).
+    pub exec_mode: Option<String>,
+    /// (#1222) `Funnel` mode's override for every `review-probe` staffing's
+    /// draw count `k` — the crew registry's per-staffing `k` applies
+    /// unchanged when `None`.
+    pub k_override: Option<u32>,
+    /// (#1222) `Funnel` mode's external bundler command
+    /// (`<cmd> --worktree <dir> --diff <file>`, `lab::bundle::external_bundles`'s
+    /// contract) — the built-in Rust bundler (`lab::bundle::build_bundles`)
+    /// runs when `None`.
+    pub bundler_cmd: Option<String>,
 }
 
 pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
@@ -259,7 +293,7 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
     let workdir_for = |case_id: &str| -> Option<PathBuf> {
         opts.workdirs.as_ref().map(|root| root.join(case_id))
     };
-    if matches!(opts.mode, BenchMode::Agentic | BenchMode::Dialectic) {
+    if matches!(opts.mode, BenchMode::Agentic | BenchMode::Dialectic | BenchMode::Funnel) {
         let root = opts.workdirs.as_ref().ok_or_else(|| {
             anyhow!(
                 "--{} requires --workdirs <root> (one repo tree per case id)",
@@ -282,10 +316,19 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
         }
     } else if opts.workdirs.is_some() {
         return Err(anyhow!(
-            "--workdirs only applies to --agentic / --dialectic (diff-only modes \
-             never read a repo tree; passing one would silently measure nothing)"
+            "--workdirs only applies to --agentic / --dialectic / --funnel (diff-only \
+             modes never read a repo tree; passing one would silently measure nothing)"
         ));
     }
+    // (#1222 Phase B packet 7) Funnel mode's preflight: resolve the crew +
+    // seat prompts + exec mode ONCE, before any dispatch spends a token —
+    // same "fail loud before spending tokens" discipline as the workdirs
+    // check above.
+    let funnel_ctx: Option<FunnelCtx> = if opts.mode == BenchMode::Funnel {
+        Some(resolve_funnel_ctx(&opts)?)
+    } else {
+        None
+    };
     eprintln!(
         "pr-review-bench: {} cases · profile={} · profiles-file={} · mode={}",
         cases.len(),
@@ -300,6 +343,10 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
     // case, written beside scores.json — the dispatches stay atomic; the
     // debate exists as an artifact, not a flow shape.
     let mut debates: Vec<super::dialectic::DebateEnvelope> = Vec::new();
+    // (#1222 Phase B packet 7) Funnel mode's composite artifacts: one
+    // envelope per case, written beside scores.json — same discipline as
+    // `debates` above.
+    let mut funnels: Vec<super::funnel::FunnelEnvelope> = Vec::new();
     for c in &cases {
         let review = if opts.mode == BenchMode::Dialectic {
             use super::dialectic::Seat;
@@ -348,6 +395,21 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
             });
             debates.push(debate);
             review
+        } else if opts.mode == BenchMode::Funnel {
+            let ctx = funnel_ctx
+                .as_ref()
+                .expect("preflight resolves the funnel context before the loop");
+            let workdir = workdir_for(&c.id)
+                .expect("--funnel preflight requires --workdirs and validates every case's tree");
+            let (review, env) = run_funnel_case(c, &workdir, ctx, opts.timeout_seconds)
+                .with_context(|| format!("funneling case {}", c.id))?;
+            let total_tokens: u64 = env.members.iter().map(|m| m.total_tokens).sum();
+            meta.push(EnvelopeMeta {
+                model: env.members.first().map(|m| m.model.clone()),
+                total_tokens: Some(total_tokens),
+            });
+            funnels.push(env);
+            review
         } else {
             let prompt = build_prompt(c, opts.mode);
             let workdir = (opts.mode == BenchMode::Agentic)
@@ -394,13 +456,25 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
                 },
             );
         }
+        if let (BenchMode::Funnel, Some(env)) = (opts.mode, funnels.last()) {
+            println!(
+                "{:<34}↳ bundles {} · flags {}→{} · confirmed {} · needs_check {} · archived {}",
+                "",
+                env.bundles,
+                env.raw_flags,
+                env.deduped_flags,
+                env.confirmed,
+                env.needs_check,
+                env.archived,
+            );
+        }
         scored.push((c, s));
     }
     print_summary(&scored, &opts);
     // (#1198) Persist the run as a scores.json artifact — the bench suite's
     // dual-key score substrate (#1197). Failure to persist is a WARNING, not
     // a bench failure: the operator already has the stdout report.
-    match write_scores_artifact(&scored, &meta, &debates, &opts) {
+    match write_scores_artifact(&scored, &meta, &debates, &funnels, &opts) {
         Ok(path) => eprintln!("scores: {}", path.display()),
         Err(e) => eprintln!("scores: WARNING — artifact not written: {e:#}"),
     }
@@ -501,6 +575,9 @@ fn build_prompt(c: &Case, mode: BenchMode) -> String {
         // Dialectic never reaches build_prompt — the per-case loop hands the
         // case to `lab::dialectic::run_debate`, which builds per-seat prompts.
         BenchMode::Dialectic => unreachable!("dialectic builds per-seat prompts"),
+        // Funnel never reaches build_prompt either — the per-case loop hands
+        // the case to `run_funnel_case`, which builds the probe/judge prompts.
+        BenchMode::Funnel => unreachable!("funnel builds probe/judge prompts"),
     };
     // The evidence sentence is the mode's load-bearing difference: the
     // diff-only modes must SAY the diff is all there is (an honest reviewer
@@ -517,6 +594,7 @@ fn build_prompt(c: &Case, mode: BenchMode) -> String {
              verify your hypotheses before concluding."
         }
         BenchMode::Dialectic => unreachable!("dialectic builds per-seat prompts"),
+        BenchMode::Funnel => unreachable!("funnel builds probe/judge prompts"),
     };
     format!(
         "PR review request: {title}\n\n\
@@ -583,6 +661,221 @@ fn dispatch_case(
     };
     let r = dispatch(d).context("pr-review-bench internal-runtime dispatch")?;
     Ok(r.stdout)
+}
+
+// ─── funnel mode (#1222 Phase B packet 7) ──────────────────────────────
+
+/// `Funnel` mode's resolved, per-run context — computed ONCE in
+/// [`resolve_funnel_ctx`] before the per-case loop (fail loud before any
+/// dispatch spends a token, same discipline as the `--workdirs` preflight).
+struct FunnelCtx {
+    crew: darkmux_profiles::crews::ResolvedCrew,
+    exec_mode: super::funnel::ExecMode,
+    probe_system: String,
+    judge_system: String,
+    bundler_cmd: Option<String>,
+}
+
+/// Parse `--exec-mode`'s string value into `funnel::ExecMode`. `None` (the
+/// flag omitted) and the literal `"auto"` both resolve to `Auto` — the
+/// funnel's own `resolve_mode` then decides `Sequential` vs `Parallel`
+/// against the local hardware tier at run time.
+fn parse_exec_mode(s: Option<&str>) -> Result<super::funnel::ExecMode> {
+    match s.map(str::to_ascii_lowercase).as_deref() {
+        None | Some("auto") => Ok(super::funnel::ExecMode::Auto),
+        Some("sequential") => Ok(super::funnel::ExecMode::Sequential),
+        Some("parallel") => Ok(super::funnel::ExecMode::Parallel),
+        Some(other) => Err(anyhow!(
+            "--exec-mode must be \"sequential\", \"parallel\", or \"auto\" (got \"{other}\")"
+        )),
+    }
+}
+
+/// Resolve `opts` into a [`FunnelCtx`]: load the profile registry, resolve
+/// `--crew` against it (`darkmux_profiles::crews::resolve_crew` — the same
+/// validation `crew dispatch` would apply), validate it carries the
+/// funnel's own seat requirements (`funnel::validate_funnel_crew` — the
+/// SAME check `run_funnel` runs internally, called here too so a
+/// misconfigured crew fails at bench START, not at the first case's
+/// dispatch), apply `--k` as an override on every `review-probe` staffing's
+/// draw count, parse `--exec-mode`, and resolve the `review-probe`/
+/// `review-judge` seat system prompts. Every failure here is loud and
+/// happens BEFORE any dispatch — a misconfigured crew or a missing seat
+/// prompt must never silently corrupt a bench run.
+fn resolve_funnel_ctx(opts: &ReviewBenchOpts) -> Result<FunnelCtx> {
+    let crew_name = opts.crew.as_deref().ok_or_else(|| {
+        anyhow!(
+            "--funnel requires --crew <name> (the crews.<name> entry naming the \
+             review-probe/review-judge seat staffing)"
+        )
+    })?;
+    let loaded = darkmux_profiles::profiles::load_registry(opts.config_path.as_deref())
+        .context("loading profile registry for --funnel")?;
+    let mut crew = darkmux_profiles::crews::resolve_crew(&loaded.registry, crew_name)
+        .with_context(|| format!("resolving crew \"{crew_name}\" for --funnel"))?;
+    super::funnel::validate_funnel_crew(&crew)
+        .with_context(|| format!("crew \"{crew_name}\" for --funnel"))?;
+    if let Some(k) = opts.k_override {
+        if let Some(staffings) = crew.seats.get_mut("review-probe") {
+            for s in staffings.iter_mut() {
+                s.k = k;
+            }
+        }
+    }
+    let exec_mode = parse_exec_mode(opts.exec_mode.as_deref())?;
+    let probe_system = darkmux_crew::loader::role_prompt("review-probe").ok_or_else(|| {
+        anyhow!("darkmux: role \"review-probe\" has no system prompt (missing review-probe.md)")
+    })?;
+    let judge_system = darkmux_crew::loader::role_prompt("review-judge").ok_or_else(|| {
+        anyhow!("darkmux: role \"review-judge\" has no system prompt (missing review-judge.md)")
+    })?;
+    Ok(FunnelCtx {
+        crew,
+        exec_mode,
+        probe_system,
+        judge_system,
+        bundler_cmd: opts.bundler_cmd.clone(),
+    })
+}
+
+/// Write `diff` to a uniquely-named temp file — `bundle::external_bundles`
+/// needs a diff FILE path (its `<cmd> --worktree <dir> --diff <file>`
+/// contract), not diff text. Best-effort; a leftover file on an early
+/// return is harmless scratch, not user state.
+fn write_temp_diff(case_id: &str, diff: &str) -> Result<PathBuf> {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!(
+        "darkmux-review-bench-{case_id}-{}-{ts}.diff",
+        std::process::id()
+    ));
+    fs::write(&path, diff).with_context(|| format!("writing temp diff for case {case_id}"))?;
+    Ok(path)
+}
+
+/// Map a funnel envelope's judged flags into the SAME `Review{verdict,
+/// findings}` shape every other mode scores through, so `score()` /
+/// `finding_matches_expected` applies UNCHANGED. Only `Tier::Confirmed`
+/// flags become findings — `NeedsCheck` is the non-blocking tier (recorded
+/// in the envelope artifact, never counted toward recall/precision) and
+/// `Archived` is a ruled-out flag. `anchor` is the flag's own anchor (empty
+/// when dedup found none); `title` folds the judge's `note_for_author`
+/// (author-facing) and `decisive_evidence` (the cited code/claim) together
+/// so both are available to the anchor/title substring matcher. A
+/// degenerate envelope (zero bundles or zero raw flags) maps to
+/// `parsed: false` — scored distinctly from a real pass, same as every
+/// other mode's degenerate case.
+fn review_from_funnel(env: &super::funnel::FunnelEnvelope) -> Review {
+    let findings: Vec<Finding> = env
+        .judged
+        .iter()
+        .filter(|j| j.tier == super::funnel::Tier::Confirmed)
+        .map(|j| {
+            let note = j.pass1.note_for_author.trim();
+            let evidence = j.pass1.decisive_evidence.trim();
+            let title = match (note.is_empty(), evidence.is_empty()) {
+                (false, false) => format!("{note} — {evidence}"),
+                (false, true) => note.to_string(),
+                (true, false) => evidence.to_string(),
+                (true, true) => String::new(),
+            };
+            Finding {
+                severity: "high".to_string(),
+                anchor: j.flag.anchor.clone().unwrap_or_default(),
+                title,
+            }
+        })
+        .collect();
+    Review {
+        verdict: if findings.is_empty() { "pass".to_string() } else { "flag".to_string() },
+        parsed: env.degenerate.is_none(),
+        findings,
+    }
+}
+
+/// Run the review funnel for one case: build bundles (the built-in Rust
+/// bundler, or `--bundler <cmd>` when set) over the case's mounted repo
+/// tree, feed them into `funnel::run_funnel` via the `FunnelInputs::bundles`
+/// injection seam (#1222 Phase B packet 5 reconciliation), wired to
+/// `darkmux_crew::single_shot::single_shot_chat` + [`funnel::LmsCycler`],
+/// and map the resulting envelope into a scoreable `Review`. Mirrors
+/// `super::dialectic::run_debate`'s split: this function owns dispatch +
+/// mapping; the caller owns console output + artifact bookkeeping.
+fn run_funnel_case(
+    c: &Case,
+    workdir: &Path,
+    ctx: &FunnelCtx,
+    timeout_seconds: u32,
+) -> Result<(Review, super::funnel::FunnelEnvelope)> {
+    use super::bundle;
+    use super::funnel;
+
+    let source = bundle::FileSource::worktree(workdir);
+    let set = match ctx.bundler_cmd.as_deref() {
+        Some(cmd) => {
+            let diff_path = write_temp_diff(&c.id, &c.diff)?;
+            let result = bundle::external_bundles(cmd, Some(workdir), &diff_path);
+            let _ = fs::remove_file(&diff_path);
+            result.with_context(|| format!("external bundler for case {}", c.id))?
+        }
+        None => bundle::build_bundles(&source, &c.diff)
+            .with_context(|| format!("building bundles for case {}", c.id))?,
+    };
+    let bundles: Vec<funnel::BundleInput> = set
+        .bundles
+        .iter()
+        .map(|b| -> Result<funnel::BundleInput> {
+            Ok(funnel::BundleInput {
+                id: b.id.clone(),
+                fact_family: b.fact_family.clone(),
+                code: bundle::slice_code(&source, &b.code)?,
+                facts: b.facts.clone(),
+                manifest: b.manifest.clone(),
+            })
+        })
+        .collect::<Result<_>>()
+        .with_context(|| format!("slicing bundle code for case {}", c.id))?;
+
+    let body = if c.label.intent_body.trim().is_empty() {
+        "(no description provided)"
+    } else {
+        c.label.intent_body.trim()
+    };
+    let intent = format!("{}\n\n{}", c.label.intent_title, body);
+
+    let inputs = funnel::FunnelInputs {
+        case_id: c.id.clone(),
+        crew: &ctx.crew,
+        intent: &intent,
+        diff: &c.diff,
+        mode: ctx.exec_mode,
+        probe_system: &ctx.probe_system,
+        judge_system: &ctx.judge_system,
+        // (#1222 Phase B packet 5 reconciliation) The real bundler's output,
+        // via the injection seam `FunnelInputs::bundles` — `run_funnel`
+        // never falls back to the provisional `bundles_from_diff` when this
+        // is `Some`.
+        bundles: Some(bundles),
+    };
+
+    let chat = |call: &funnel::ChatCall| -> Result<darkmux_crew::single_shot::SingleShotReply> {
+        darkmux_crew::single_shot::single_shot_chat(&darkmux_crew::single_shot::SingleShotRequest {
+            base_url: None,
+            model: call.model,
+            system: call.system,
+            user: call.user,
+            temperature: call.temperature,
+            max_tokens: call.max_tokens,
+            timeout_seconds,
+        })
+    };
+    let mut cycler = funnel::LmsCycler;
+    let env = funnel::run_funnel(&inputs, chat, &mut cycler)
+        .with_context(|| format!("running review funnel for case {}", c.id))?;
+    let review = review_from_funnel(&env);
+    Ok((review, env))
 }
 
 /// Extract the model's review JSON (verdict + findings) from `final_assistant`
@@ -1175,6 +1468,7 @@ fn write_scores_artifact(
     scored: &[(&Case, CaseScore)],
     meta: &[EnvelopeMeta],
     debates: &[super::dialectic::DebateEnvelope],
+    funnels: &[super::funnel::FunnelEnvelope],
     opts: &ReviewBenchOpts,
 ) -> Result<PathBuf> {
     use super::scores;
@@ -1218,6 +1512,27 @@ fn write_scores_artifact(
         "mode".to_string(),
         serde_json::Value::String(opts.mode.label().to_string()),
     );
+    // (#1222 Phase B packet 7) Funnel-mode provenance: crew name + resolved
+    // exec mode + k override — the cell-identity fields a future comparison
+    // needs to know two funnel runs are the same condition.
+    if opts.mode == BenchMode::Funnel {
+        doc.extras.insert(
+            "crew".to_string(),
+            serde_json::Value::String(opts.crew.clone().unwrap_or_default()),
+        );
+        let exec_mode_label = funnels
+            .first()
+            .map(|e| e.mode.clone())
+            .unwrap_or_else(|| opts.exec_mode.clone().unwrap_or_else(|| "auto".to_string()));
+        doc.extras.insert("exec_mode".to_string(), serde_json::Value::String(exec_mode_label));
+        doc.extras.insert(
+            "k".to_string(),
+            match opts.k_override {
+                Some(k) => serde_json::Value::Number(k.into()),
+                None => serde_json::Value::String("(profile default)".to_string()),
+            },
+        );
+    }
     let path = match &opts.scores_out {
         Some(p) => p.clone(),
         None => super::paths::resolve(super::paths::ResolveScope::Auto)
@@ -1238,6 +1553,26 @@ fn write_scores_artifact(
         match write {
             Ok(()) => eprintln!("debates: {}", dpath.display()),
             Err(e) => eprintln!("debates: WARNING — artifact not written: {e:#}"),
+        }
+    }
+    // (#1222 Phase B packet 7) Funnel envelopes — written FIRST, beside
+    // scores.json, and independently of the scores write succeeding, same
+    // discipline as `debates` above: the per-flag judge evidence chain is
+    // the higher-value audit artifact and must never be dropped because the
+    // scores serialization failed.
+    if !funnels.is_empty() {
+        let fpath = path.with_file_name("funnels.json");
+        let write = serde_json::to_vec_pretty(funnels)
+            .map_err(anyhow::Error::from)
+            .and_then(|b| {
+                if let Some(parent) = fpath.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&fpath, b).map_err(anyhow::Error::from)
+            });
+        match write {
+            Ok(()) => eprintln!("funnels: {}", fpath.display()),
+            Err(e) => eprintln!("funnels: WARNING — artifact not written: {e:#}"),
         }
     }
     scores::write_scores(&path, &doc)?;
@@ -1390,6 +1725,16 @@ mod tests {
         assert_eq!(BenchMode::FreeForm.role_id(), "pr-reviewer-freeform");
         assert_eq!(BenchMode::Agentic.role_id(), "pr-reviewer-agentic");
         assert_eq!(BenchMode::Agentic.label(), "agentic");
+        assert_eq!(BenchMode::Funnel.label(), "funnel");
+    }
+
+    #[test]
+    #[should_panic(expected = "funnel dispatches")]
+    fn bench_mode_funnel_role_id_is_unreachable() {
+        // Funnel dispatches review-probe/review-judge seats directly — the
+        // per-case loop branches to `run_funnel_case` before ever calling
+        // `role_id()` on the mode. Pins that the panic message names why.
+        let _ = BenchMode::Funnel.role_id();
     }
 
     /// The agentic role's marker dialect (`MUST FIX [path] `anchor``) parses
@@ -1940,5 +2285,649 @@ mod tests {
         assert_eq!(precision.value, Some(0.5)); // 1 tp / (1 tp + 1 fp)
         let anchor = rows.iter().find(|r| r.axis == "anchor_rate").unwrap();
         assert_eq!(anchor.value, Some(1.0));
+    }
+
+    // ── funnel mode (#1222 Phase B packet 7) ──────────────────────────
+
+    fn probe_flag(anchor: Option<&str>) -> super::super::funnel::ProbeFlag {
+        super::super::funnel::ProbeFlag {
+            bundle_id: "billing.ts".into(),
+            fact_family: "unscoped".into(),
+            member: "darkmux:probe-model".into(),
+            draw: 0,
+            charge_text: "the clamp is bypassed".into(),
+            anchor: anchor.map(str::to_string),
+        }
+    }
+
+    fn judge_record(ruling: super::super::funnel::FunnelRuling, note: &str, evidence: &str) -> super::super::funnel::JudgeRecord {
+        super::super::funnel::JudgeRecord {
+            ruling,
+            decisive_evidence: evidence.to_string(),
+            note_for_author: note.to_string(),
+            pass: 1,
+            seconds: 0.1,
+        }
+    }
+
+    fn judged_flag(
+        anchor: Option<&str>,
+        tier: super::super::funnel::Tier,
+        note: &str,
+        evidence: &str,
+    ) -> super::super::funnel::JudgedFlag {
+        use super::super::funnel::FunnelRuling;
+        let ruling = match tier {
+            super::super::funnel::Tier::Confirmed => FunnelRuling::Confirmed,
+            super::super::funnel::Tier::NeedsCheck => FunnelRuling::NeedsCheck,
+            super::super::funnel::Tier::Archived => FunnelRuling::FalsePositive,
+        };
+        super::super::funnel::JudgedFlag {
+            flag: probe_flag(anchor),
+            pass1: judge_record(ruling, note, evidence),
+            pass2: None,
+            tier,
+            demoted_by_pass2: false,
+        }
+    }
+
+    fn funnel_env(judged: Vec<super::super::funnel::JudgedFlag>, degenerate: Option<&str>) -> super::super::funnel::FunnelEnvelope {
+        use super::super::funnel::Tier;
+        let confirmed = judged.iter().filter(|j| j.tier == Tier::Confirmed).count();
+        let needs_check = judged.iter().filter(|j| j.tier == Tier::NeedsCheck).count();
+        let archived = judged.iter().filter(|j| j.tier == Tier::Archived).count();
+        super::super::funnel::FunnelEnvelope {
+            case_id: "c1".into(),
+            crew: "test-crew".into(),
+            mode: "sequential".into(),
+            bundles: 1,
+            raw_flags: judged.len(),
+            deduped_flags: judged.len(),
+            confirmed,
+            needs_check,
+            archived,
+            judged,
+            degenerate: degenerate.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn review_from_funnel_confirmed_with_anchor_becomes_a_finding() {
+        use super::super::funnel::Tier;
+        let env = funnel_env(
+            vec![judged_flag(
+                Some("const end = start.plus(30)"),
+                Tier::Confirmed,
+                "the clamp is bypassed",
+                "start.plus(30) skips the cap",
+            )],
+            None,
+        );
+        let r = review_from_funnel(&env);
+        assert!(r.parsed);
+        assert_eq!(r.verdict, "flag");
+        assert_eq!(r.findings.len(), 1);
+        assert_eq!(r.findings[0].anchor, "const end = start.plus(30)");
+        assert!(r.findings[0].title.contains("the clamp is bypassed"));
+        assert!(r.findings[0].title.contains("start.plus(30) skips the cap"));
+        assert_eq!(r.findings[0].severity, "high");
+    }
+
+    #[test]
+    fn review_from_funnel_confirmed_without_anchor_still_becomes_a_finding_with_empty_anchor() {
+        use super::super::funnel::Tier;
+        let env = funnel_env(
+            vec![judged_flag(None, Tier::Confirmed, "real bug", "evidence")],
+            None,
+        );
+        let r = review_from_funnel(&env);
+        assert_eq!(r.verdict, "flag");
+        assert_eq!(r.findings.len(), 1);
+        assert_eq!(r.findings[0].anchor, "", "no dedup anchor ⇒ empty anchor, never dropped");
+    }
+
+    #[test]
+    fn review_from_funnel_needs_check_and_archived_are_excluded_from_findings() {
+        use super::super::funnel::Tier;
+        let env = funnel_env(
+            vec![
+                judged_flag(Some("a"), Tier::NeedsCheck, "unsure", "ambiguous"),
+                judged_flag(Some("b"), Tier::Archived, "false alarm", "ruled out"),
+            ],
+            None,
+        );
+        let r = review_from_funnel(&env);
+        assert_eq!(r.verdict, "pass", "no confirmed flags ⇒ pass");
+        assert!(r.findings.is_empty(), "needs_check/archived never become findings");
+        assert!(r.parsed);
+    }
+
+    #[test]
+    fn review_from_funnel_degenerate_envelope_is_not_parsed() {
+        let env = funnel_env(vec![], Some("zero flags from all probe draws — never a silent pass"));
+        let r = review_from_funnel(&env);
+        assert!(!r.parsed, "a degenerate funnel run must score distinctly from a real pass");
+    }
+
+    #[test]
+    fn review_from_funnel_scores_through_the_multi_finding_matcher() {
+        use super::super::funnel::Tier;
+        let label = multi_lbl("bug", vec![ef("const end = start.plus(30)", false)]);
+        let env = funnel_env(
+            vec![judged_flag(
+                Some("const end = start.plus(30)"),
+                Tier::Confirmed,
+                "boundary bug",
+                "off by one",
+            )],
+            None,
+        );
+        let r = review_from_funnel(&env);
+        let s = score(&label, &r);
+        assert!(s.recall);
+        assert_eq!(s.bugs_caught, 1);
+        assert_eq!(s.fp, 0);
+    }
+
+    // ── parse_exec_mode ─────────────────────────────────────────────
+
+    #[test]
+    fn parse_exec_mode_defaults_and_values() {
+        use super::super::funnel::ExecMode;
+        assert_eq!(parse_exec_mode(None).unwrap(), ExecMode::Auto);
+        assert_eq!(parse_exec_mode(Some("auto")).unwrap(), ExecMode::Auto);
+        assert_eq!(parse_exec_mode(Some("Sequential")).unwrap(), ExecMode::Sequential);
+        assert_eq!(parse_exec_mode(Some("PARALLEL")).unwrap(), ExecMode::Parallel);
+        assert!(parse_exec_mode(Some("bogus")).is_err());
+    }
+
+    // ── funnel coverage gap review (#1222 Phase B packet 7) ────────────
+    //
+    // Everything below characterizes wiring the packet's own unit tests
+    // (above) didn't reach: score()'s treatment of a Confirmed flag with NO
+    // dedup anchor, `write_scores_artifact`'s funnel-specific artifact
+    // discipline (previously untested even for `debates.json` — no test in
+    // this module ever constructed a full `ReviewBenchOpts`), the real
+    // `run_funnel_case` pipeline's degenerate-envelope + `--bundler`
+    // plumbing (both reachable offline because a zero-bundle/failed-bundle
+    // run short-circuits BEFORE any chat dispatch), and `resolve_funnel_ctx`'s
+    // crew-not-found + `--k`/`--exec-mode` plumbing.
+
+    fn dummy_pm(id: &str) -> darkmux_types::ProfileModel {
+        darkmux_types::ProfileModel {
+            id: id.to_string(),
+            n_ctx: 32_000,
+            ..Default::default()
+        }
+    }
+
+    fn funnel_case() -> Case {
+        Case {
+            id: "c1".into(),
+            label: multi_lbl("bug", vec![ef("start.plus(30)", false)]),
+            diff: "+ const end = start.plus(30)".into(),
+        }
+    }
+
+    fn funnel_opts(scores_out: PathBuf, with_exec_mode_and_k: bool) -> ReviewBenchOpts {
+        ReviewBenchOpts {
+            cases_dir: PathBuf::from("."),
+            profile_name: Some("test-profile".into()),
+            config_path: None,
+            timeout_seconds: 60,
+            scores_out: Some(scores_out),
+            mode: BenchMode::Funnel,
+            workdirs: None,
+            prosecutor_profile: None,
+            defender_profile: None,
+            judge_profile: None,
+            crew: Some("test-crew".into()),
+            exec_mode: if with_exec_mode_and_k { Some("sequential".into()) } else { None },
+            k_override: if with_exec_mode_and_k { Some(5) } else { None },
+            bundler_cmd: None,
+        }
+    }
+
+    // ── score() on a no-anchor Confirmed flag ("does score() treat it right?") ──
+
+    #[test]
+    fn score_of_funnel_review_empty_anchor_confirmed_flag_never_matches_anchor_only_expected() {
+        use super::super::funnel::Tier;
+        // A Confirmed flag with NO dedup anchor (`extract_new_side_anchor`
+        // found no backtick-quoted span matching the diff) maps to
+        // `Finding { anchor: "" }` (review_from_funnel's documented
+        // behavior). When the label's expected finding relies on
+        // `anchor_contains` alone (no `match_contains`),
+        // `finding_matches_expected` falls back to `f.anchor.contains(...)`
+        // — an empty anchor can never contain a non-empty substring, so this
+        // confirmed flag scores as a pure false positive, never a catch.
+        let label = multi_lbl("bug", vec![ef("start.plus(30)", false)]);
+        let env = funnel_env(
+            vec![judged_flag(None, Tier::Confirmed, "the clamp is bypassed", "start.plus(30) skips the cap")],
+            None,
+        );
+        let r = review_from_funnel(&env);
+        let s = score(&label, &r);
+        assert!(!s.recall, "an anchor-only expected can never match an empty-anchor finding");
+        assert_eq!(s.bugs_caught, 0);
+        assert_eq!(s.fp, 1, "the unmatched confirmed flag is a false positive, not silently dropped");
+    }
+
+    #[test]
+    fn score_of_funnel_review_empty_anchor_confirmed_flag_matches_via_match_contains_title() {
+        use super::super::funnel::Tier;
+        // Same no-anchor confirmed flag, but the label supplies
+        // `match_contains` — `finding_matches_expected` then checks
+        // `anchor + title` instead, so the flag's `note_for_author`/
+        // `decisive_evidence`-derived title recovers the match even with an
+        // empty anchor. Completes the "does score() treat it right?"
+        // question: only when the label is written to allow it.
+        let label = multi_lbl(
+            "bug",
+            vec![ExpectedFinding {
+                match_contains: Some("clamp is bypassed".into()),
+                ..ef("start.plus(30)", false)
+            }],
+        );
+        let env = funnel_env(
+            vec![judged_flag(None, Tier::Confirmed, "the clamp is bypassed", "start.plus(30) skips the cap")],
+            None,
+        );
+        let r = review_from_funnel(&env);
+        let s = score(&label, &r);
+        assert!(s.recall, "match_contains recovers the catch even with no dedup anchor");
+        assert_eq!(s.bugs_caught, 1);
+        assert_eq!(s.fp, 0);
+    }
+
+    // ── write_scores_artifact: funnels.json artifact discipline ────────
+    //
+    // No test in this module previously constructed a full `ReviewBenchOpts`
+    // — `write_scores_artifact` (and its `debates.json`-first discipline)
+    // had zero direct coverage. These tests exercise it for `funnels.json`.
+
+    #[test]
+    fn write_scores_artifact_funnel_needs_check_and_archived_survive_into_funnels_json_though_excluded_from_score_rows() {
+        use super::super::funnel::Tier;
+        let env = funnel_env(
+            vec![
+                judged_flag(Some("start.plus(30)"), Tier::Confirmed, "the clamp is bypassed", "evidence"),
+                judged_flag(Some("other.ts"), Tier::NeedsCheck, "unsure", "ambiguous"),
+                judged_flag(Some("third.ts"), Tier::Archived, "false alarm", "ruled out"),
+            ],
+            None,
+        );
+        let label = multi_lbl("bug", vec![ef("start.plus(30)", false)]);
+        let r = review_from_funnel(&env);
+        let s = score(&label, &r);
+        // Only the Confirmed flag ever reaches the scoring surface.
+        assert_eq!(s.findings, 1, "needs_check/archived never inflate the score row's finding count");
+
+        let case = funnel_case();
+        let scored: Vec<(&Case, CaseScore)> = vec![(&case, s)];
+        let meta = vec![EnvelopeMeta { model: Some("darkmux:probe-model".into()), total_tokens: Some(100) }];
+        let debates: Vec<super::super::dialectic::DebateEnvelope> = Vec::new();
+        let funnels = vec![env];
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let scores_out = tmp.path().join("scores.json");
+        let opts = funnel_opts(scores_out, true);
+
+        let path = write_scores_artifact(&scored, &meta, &debates, &funnels, &opts).unwrap();
+        let fpath = path.with_file_name("funnels.json");
+        let content = fs::read_to_string(&fpath).unwrap();
+        let parsed: Vec<super::super::funnel::FunnelEnvelope> = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].judged.len(), 3, "all three tiers survive into the artifact");
+        let tiers: Vec<Tier> = parsed[0].judged.iter().map(|j| j.tier).collect();
+        assert!(tiers.contains(&Tier::NeedsCheck), "needs_check preserved even though it never became a finding");
+        assert!(tiers.contains(&Tier::Archived), "archived preserved too — the full judge trail is the point");
+    }
+
+    #[test]
+    fn write_scores_artifact_funnel_writes_funnels_json_even_when_scores_json_write_fails() {
+        use super::super::funnel::Tier;
+        let env = funnel_env(
+            vec![judged_flag(Some("start.plus(30)"), Tier::Confirmed, "note", "evidence")],
+            None,
+        );
+        let label = multi_lbl("bug", vec![ef("start.plus(30)", false)]);
+        let r = review_from_funnel(&env);
+        let s = score(&label, &r);
+        let case = funnel_case();
+        let scored: Vec<(&Case, CaseScore)> = vec![(&case, s)];
+        let meta = vec![EnvelopeMeta::default()];
+        let debates: Vec<super::super::dialectic::DebateEnvelope> = Vec::new();
+        let funnels = vec![env];
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let scores_out = tmp.path().join("scores.json");
+        // Force `scores::write_scores`'s atomic temp-write to fail: it
+        // writes to `scores.json.tmp` before renaming into place —
+        // pre-creating that exact path AS A DIRECTORY makes `std::fs::write`
+        // fail with "Is a directory", without touching the funnels.json
+        // sibling path at all.
+        fs::create_dir_all(scores_out.with_extension("json.tmp")).unwrap();
+        let opts = funnel_opts(scores_out.clone(), false);
+
+        let err = write_scores_artifact(&scored, &meta, &debates, &funnels, &opts).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("scores.json.tmp"), "expected the forced write failure to surface, got: {msg}");
+
+        // funnels.json must still be on disk — written FIRST, independently
+        // of the scores.json write succeeding, same discipline as
+        // debates.json (#1222 packet 7's own doc comment on this function).
+        let fpath = scores_out.with_file_name("funnels.json");
+        assert!(fpath.is_file(), "funnels.json must survive a scores.json write failure");
+        let content = fs::read_to_string(&fpath).unwrap();
+        let parsed: Vec<super::super::funnel::FunnelEnvelope> = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].judged.len(), 1);
+    }
+
+    #[test]
+    fn write_scores_artifact_funnel_extras_record_crew_and_k_and_the_envelopes_resolved_exec_mode() {
+        use super::super::funnel::Tier;
+        let mut env = funnel_env(
+            vec![judged_flag(Some("start.plus(30)"), Tier::Confirmed, "note", "evidence")],
+            None,
+        );
+        // The envelope's OWN resolved mode ("parallel") is what the extras
+        // field should report — not the raw `--exec-mode` string, which may
+        // be absent/"auto" when the crew resolved it dynamically.
+        env.mode = "parallel".to_string();
+        let label = multi_lbl("bug", vec![ef("start.plus(30)", false)]);
+        let r = review_from_funnel(&env);
+        let s = score(&label, &r);
+        let case = funnel_case();
+        let scored: Vec<(&Case, CaseScore)> = vec![(&case, s)];
+        let meta = vec![EnvelopeMeta::default()];
+        let debates: Vec<super::super::dialectic::DebateEnvelope> = Vec::new();
+        let funnels = vec![env];
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let scores_out = tmp.path().join("scores.json");
+        let mut opts = funnel_opts(scores_out, false);
+        opts.crew = Some("review-funnel".into());
+        opts.k_override = Some(9);
+
+        let path = write_scores_artifact(&scored, &meta, &debates, &funnels, &opts).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(doc["crew"], serde_json::json!("review-funnel"));
+        assert_eq!(
+            doc["exec_mode"],
+            serde_json::json!("parallel"),
+            "reports the envelope's resolved mode, not the raw --exec-mode flag"
+        );
+        assert_eq!(doc["k"], serde_json::json!(9));
+    }
+
+    #[test]
+    fn write_scores_artifact_funnel_extras_k_defaults_to_profile_default_label_when_unset() {
+        use super::super::funnel::Tier;
+        let env = funnel_env(
+            vec![judged_flag(Some("start.plus(30)"), Tier::Confirmed, "note", "evidence")],
+            None,
+        );
+        let label = multi_lbl("bug", vec![ef("start.plus(30)", false)]);
+        let r = review_from_funnel(&env);
+        let s = score(&label, &r);
+        let case = funnel_case();
+        let scored: Vec<(&Case, CaseScore)> = vec![(&case, s)];
+        let meta = vec![EnvelopeMeta::default()];
+        let debates: Vec<super::super::dialectic::DebateEnvelope> = Vec::new();
+        let funnels = vec![env];
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let scores_out = tmp.path().join("scores.json");
+        let opts = funnel_opts(scores_out, false); // k_override left None
+
+        let path = write_scores_artifact(&scored, &meta, &debates, &funnels, &opts).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(doc["k"], serde_json::json!("(profile default)"));
+    }
+
+    // ── run_funnel_case: the real pipeline, offline-testable ───────────
+    //
+    // `run_funnel_case`'s `chat` closure is hardcoded to the real
+    // `single_shot_chat` (a live LMStudio call) — but a zero-bundle or
+    // failed-bundle run short-circuits BEFORE `funnel::run_funnel` ever
+    // reaches the probe phase, so both the degenerate-envelope path and the
+    // `--bundler` wiring are reachable without any network dispatch.
+
+    fn valid_funnel_crew() -> darkmux_profiles::crews::ResolvedCrew {
+        use darkmux_profiles::crews::ResolvedSeatStaffing;
+        use std::collections::BTreeMap;
+        let mut seats = BTreeMap::new();
+        seats.insert(
+            "review-probe".to_string(),
+            vec![ResolvedSeatStaffing {
+                name: "fast".into(),
+                pm: dummy_pm("probe-model"),
+                k: 3,
+                max_tokens: None,
+                selector: None,
+            }],
+        );
+        seats.insert(
+            "review-judge".to_string(),
+            vec![ResolvedSeatStaffing {
+                name: "fast".into(),
+                pm: dummy_pm("judge-model"),
+                k: 1,
+                max_tokens: None,
+                selector: None,
+            }],
+        );
+        darkmux_profiles::crews::ResolvedCrew { name: "test-crew".into(), seats }
+    }
+
+    fn test_funnel_ctx(bundler_cmd: Option<String>, exec_mode: super::super::funnel::ExecMode) -> FunnelCtx {
+        FunnelCtx {
+            crew: valid_funnel_crew(),
+            exec_mode,
+            probe_system: "probe system prompt".into(),
+            judge_system: "judge system prompt".into(),
+            bundler_cmd,
+        }
+    }
+
+    #[test]
+    fn run_funnel_case_zero_bundles_from_non_ts_diff_yields_a_degenerate_envelope_with_no_dispatch() {
+        let case = Case {
+            id: "c-docs".into(),
+            label: lbl("clean", None),
+            diff: "diff --git a/README.md b/README.md\n\
+                   index 0000000..1111111 100644\n\
+                   --- a/README.md\n\
+                   +++ b/README.md\n\
+                   @@ -1 +1,2 @@\n\
+                    # Title\n\
+                   +New line\n"
+                .into(),
+        };
+        let workdir = tempfile::TempDir::new().unwrap();
+        let ctx = test_funnel_ctx(None, super::super::funnel::ExecMode::Sequential);
+        let (review, env) = run_funnel_case(&case, workdir.path(), &ctx, 30).unwrap();
+
+        assert_eq!(env.bundles, 0, "README.md isn't a TS/TSX file — build_bundles finds nothing");
+        assert!(env.degenerate.is_some(), "a zero-bundle run must be LOUD, never a silent pass");
+        assert_eq!(
+            env.mode, "sequential",
+            "opts.exec_mode threads through FunnelCtx -> FunnelInputs -> the resolved envelope"
+        );
+        assert!(!review.parsed, "the mapped Review must not read as a real pass");
+
+        let s = score(&case.label, &review);
+        assert!(s.degenerate, "score() must classify a degenerate funnel run as degenerate, never clean-pass");
+        assert!(!s.correct, "a degenerate funnel run can never score as correct");
+    }
+
+    #[cfg(unix)]
+    fn write_stub_bundler_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "#!/bin/sh").unwrap();
+        f.write_all(body.as_bytes()).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_funnel_case_external_bundler_flows_through_bundle_external_bundles_and_names_the_case_on_failure() {
+        // Mirrors `bundle::external::tests::write_stub_script` — an external
+        // `--bundler` that produces an EMPTY bundle set is rejected loudly
+        // by `bundle::external_bundles`'s own contract check. This proves
+        // `run_funnel_case` actually reaches that real function (not a stub)
+        // when `ctx.bundler_cmd` is set, and wraps the failure with the case
+        // id — all offline, since the bundling failure short-circuits before
+        // the crew/chat machinery is ever touched.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let script = write_stub_bundler_script(tmp.path(), "empty-bundler.sh", "echo '{\"bundles\":[]}'\n");
+        let case = Case {
+            id: "c-ext".into(),
+            label: lbl("clean", None),
+            diff: "diff --git a/x.ts b/x.ts\n--- a/x.ts\n+++ b/x.ts\n@@ -1 +1,2 @@\n foo\n+bar\n".into(),
+        };
+        let workdir = tempfile::TempDir::new().unwrap();
+        let ctx = test_funnel_ctx(
+            Some(script.to_str().unwrap().to_string()),
+            super::super::funnel::ExecMode::Sequential,
+        );
+        let err = run_funnel_case(&case, workdir.path(), &ctx, 30).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("external bundler for case c-ext"), "got: {msg}");
+        assert!(msg.contains("empty bundle set"), "the underlying named error must survive the wrap: {msg}");
+    }
+
+    // ── resolve_funnel_ctx: crew lookup + --k / --exec-mode plumbing ───
+
+    fn write_test_registry(dir: &Path, crews: Vec<(&str, darkmux_types::Crew)>) -> PathBuf {
+        use std::collections::BTreeMap;
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "fast".to_string(),
+            darkmux_types::Profile {
+                models: vec![dummy_pm("probe-model"), dummy_pm("judge-model")],
+                ..Default::default()
+            },
+        );
+        let mut crew_map = BTreeMap::new();
+        for (name, crew) in crews {
+            crew_map.insert(name.to_string(), crew);
+        }
+        let registry = darkmux_types::ProfileRegistry {
+            profiles,
+            crews: crew_map,
+            ..Default::default()
+        };
+        let path = dir.join("profiles.json");
+        fs::write(&path, serde_json::to_string_pretty(&registry).unwrap()).unwrap();
+        path
+    }
+
+    fn funnel_ctx_opts(config_path: PathBuf, crew: &str, exec_mode: Option<&str>, k_override: Option<u32>) -> ReviewBenchOpts {
+        ReviewBenchOpts {
+            cases_dir: PathBuf::from("."),
+            profile_name: None,
+            config_path: Some(config_path.to_str().unwrap().to_string()),
+            timeout_seconds: 30,
+            scores_out: None,
+            mode: BenchMode::Funnel,
+            workdirs: None,
+            prosecutor_profile: None,
+            defender_profile: None,
+            judge_profile: None,
+            crew: Some(crew.to_string()),
+            exec_mode: exec_mode.map(str::to_string),
+            k_override,
+            bundler_cmd: None,
+        }
+    }
+
+    #[test]
+    fn resolve_funnel_ctx_crew_not_found_lists_available_crews() {
+        use darkmux_types::{Crew, SeatStaffing};
+        use std::collections::BTreeMap;
+        let tmp = tempfile::TempDir::new().unwrap();
+        // `load_registry` validates every crew at LOAD time (`validate_crew`),
+        // so "review-deep" needs real seats — an empty `Crew::default()`
+        // would fail registry load before `resolve_crew` is ever reached.
+        let mut seats = BTreeMap::new();
+        seats.insert("review-probe".to_string(), vec![SeatStaffing { profile: "fast".into(), k: 3, ..Default::default() }]);
+        seats.insert("review-judge".to_string(), vec![SeatStaffing { profile: "fast".into(), k: 1, ..Default::default() }]);
+        let path = write_test_registry(tmp.path(), vec![("review-deep", Crew { seats, ..Default::default() })]);
+        let opts = funnel_ctx_opts(path, "ghost", None, None);
+
+        // `Result::unwrap_err` requires `T: Debug`; `FunnelCtx` intentionally
+        // isn't (it holds a `ResolvedCrew`, not a debug/display type) — `.err().unwrap()`
+        // extracts the error without that bound.
+        let err = resolve_funnel_ctx(&opts).err().unwrap();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("resolving crew \"ghost\" for --funnel"), "got: {msg}");
+        assert!(msg.contains("not found"), "got: {msg}");
+        assert!(msg.contains("review-deep"), "the available crew names must be listed: {msg}");
+    }
+
+    #[test]
+    fn resolve_funnel_ctx_k_override_applies_only_to_review_probe_staffings_and_exec_mode_parses() {
+        use darkmux_types::{Crew, SeatStaffing};
+        use std::collections::BTreeMap;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut seats = BTreeMap::new();
+        seats.insert(
+            "review-probe".to_string(),
+            vec![
+                SeatStaffing { profile: "fast".into(), k: 3, ..Default::default() },
+                SeatStaffing { profile: "fast".into(), k: 3, ..Default::default() },
+            ],
+        );
+        seats.insert(
+            "review-judge".to_string(),
+            vec![SeatStaffing { profile: "fast".into(), k: 5, ..Default::default() }],
+        );
+        let path = write_test_registry(tmp.path(), vec![("review-funnel", Crew { seats, ..Default::default() })]);
+        let opts = funnel_ctx_opts(path, "review-funnel", Some("parallel"), Some(9));
+
+        let ctx = resolve_funnel_ctx(&opts).unwrap();
+        let probes = ctx.crew.seats.get("review-probe").unwrap();
+        assert!(probes.iter().all(|s| s.k == 9), "every review-probe staffing's k is overridden");
+        let judges = ctx.crew.seats.get("review-judge").unwrap();
+        assert_eq!(judges[0].k, 5, "k_override targets review-probe only — review-judge's registry k is untouched");
+        assert_eq!(
+            ctx.exec_mode,
+            super::super::funnel::ExecMode::Parallel,
+            "--exec-mode threads through into FunnelCtx"
+        );
+        assert!(!ctx.probe_system.is_empty(), "review-probe.md resolves via the embedded role loader");
+        assert!(!ctx.judge_system.is_empty(), "review-judge.md resolves via the embedded role loader");
+    }
+
+    #[test]
+    fn resolve_funnel_ctx_no_k_override_leaves_registry_k_unchanged_and_exec_mode_defaults_to_auto() {
+        use darkmux_types::{Crew, SeatStaffing};
+        use std::collections::BTreeMap;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut seats = BTreeMap::new();
+        seats.insert("review-probe".to_string(), vec![SeatStaffing { profile: "fast".into(), k: 4, ..Default::default() }]);
+        seats.insert("review-judge".to_string(), vec![SeatStaffing { profile: "fast".into(), k: 1, ..Default::default() }]);
+        let path = write_test_registry(tmp.path(), vec![("review-funnel", Crew { seats, ..Default::default() })]);
+        let opts = funnel_ctx_opts(path, "review-funnel", None, None);
+
+        let ctx = resolve_funnel_ctx(&opts).unwrap();
+        assert_eq!(ctx.crew.seats.get("review-probe").unwrap()[0].k, 4, "no override ⇒ the registry's own k survives");
+        assert_eq!(
+            ctx.exec_mode,
+            super::super::funnel::ExecMode::Auto,
+            "no --exec-mode ⇒ Auto, resolved later against local hardware"
+        );
     }
 }
