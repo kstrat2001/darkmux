@@ -886,10 +886,9 @@ fn match_case_label(stripped: &str) -> Option<String> {
             CaseOrDefault::Case(trimmed[..colon_pos].trim().to_string()),
             &trimmed[colon_pos..],
         )
-    } else if let Some(after_default) = stripped.strip_prefix("default") {
-        (CaseOrDefault::Default, after_default)
     } else {
-        return None;
+        let after_default = stripped.strip_prefix("default")?;
+        (CaseOrDefault::Default, after_default)
     };
     let ws_then_colon = after_group.trim_start_matches(char::is_whitespace);
     let after_colon = ws_then_colon.strip_prefix(':')?;
