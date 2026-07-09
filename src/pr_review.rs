@@ -36,8 +36,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use darkmux_crew::single_shot::{single_shot_chat, SingleShotReply, SingleShotRequest};
 use darkmux_lab::lab::bundle::{build_bundles, external_bundles, slice_code, BundleSet, FileSource};
 use darkmux_lab::lab::funnel::{
-    run_funnel, run_judge_only, BundleInput, ChatCall, ExecMode, FunnelEnvelope, FunnelInputs,
-    JudgeRecord, LmsCycler, ProbeFlag, Tier,
+    run_funnel, run_judge_only, BundleInput, ChatCall, ExecMode, FunnelEmitter, FunnelEnvelope,
+    FunnelInputs, JudgeRecord, LmsCycler, ProbeFlag, Tier,
 };
 use darkmux_profiles::crews::resolve_crew;
 use darkmux_profiles::profiles::load_registry;
@@ -807,6 +807,27 @@ fn path_from_bundle_id(bundle_id: &str) -> &str {
     bundle_id.split_once('@').map(|(_, p)| p).unwrap_or(bundle_id)
 }
 
+/// (#1247 Part 1) Production wiring of `funnel::FunnelEmitter` — writes
+/// through the real darkmux-flow machinery (`darkmux_flow::record`), the
+/// same engagement-scoped stream `crew dispatch`/`sprint review` write
+/// through (env/config-resolved sink, `machine_id`/`orchestrator`
+/// auto-stamped at write time). This is the FLEET sink: `darkmux pr-review
+/// run` drives ONE case per invocation (a real PR review), so its run/step/
+/// ruling records belong on the operator's real engagement stream. Contrast
+/// `darkmux lab review-bench --funnel`'s per-run-local JSONL sink
+/// (`LocalJsonlEmitter` in `darkmux_lab::lab::review_bench`) — a bench run
+/// dispatches many cases in one process and must never spam that volume
+/// into the fleet stream (lab-vs-fleet scope boundary). Failure to record
+/// is swallowed (`let _ =`) — same discipline as every other flow emit site
+/// in the codebase; a flow-record write failure must never abort a review.
+struct FleetFlowEmitter;
+
+impl FunnelEmitter for FleetFlowEmitter {
+    fn emit(&mut self, record: darkmux_flow::FlowRecord) {
+        let _ = darkmux_flow::record(record);
+    }
+}
+
 /// Everything but `--from-envelope`: resolve the source + crew, build real
 /// bundles, and dispatch either `run_funnel` (the full pipeline) or
 /// `run_judge_only` (`--charges-file` — re-judge a saved flag list without
@@ -904,15 +925,16 @@ fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<FunnelEnvelope> {
         })
     };
     let mut cycler = LmsCycler;
+    let mut emitter = FleetFlowEmitter;
 
     if let Some(charges_path) = &opts.charges_file {
         let raw = std::fs::read_to_string(charges_path)
             .with_context(|| format!("reading --charges-file {}", charges_path.display()))?;
         let flags: Vec<ProbeFlag> = serde_json::from_str(&raw)
             .with_context(|| format!("parsing --charges-file {} as a flag list", charges_path.display()))?;
-        run_judge_only(flags, &inputs, &mut chat, &mut cycler)
+        run_judge_only(flags, &inputs, &mut chat, &mut cycler, &mut emitter)
     } else {
-        run_funnel(&inputs, &mut chat, &mut cycler)
+        run_funnel(&inputs, &mut chat, &mut cycler, &mut emitter)
     }
 }
 

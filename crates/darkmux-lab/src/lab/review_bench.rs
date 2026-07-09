@@ -329,6 +329,23 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
     } else {
         None
     };
+    // (#1198 + #1247 Part 2) Resolve the scores artifact's path + the run's
+    // ts_ms ONCE, up front — both the per-case incremental funnels.json
+    // snapshots below AND the end-of-run `write_scores_artifact` write to
+    // the SAME path, and `RunProvenance::run_id` shares the same ts_ms, so
+    // resolving early (rather than recomputing at end-of-run, the prior
+    // behavior) keeps that coupling intact while additionally letting the
+    // run_id reflect when the run STARTED, not when it finished.
+    let ts_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+    let scores_path = opts.scores_out.clone().unwrap_or_else(|| {
+        super::paths::resolve(super::paths::ResolveScope::Auto)
+            .runs
+            .join(format!("review-bench-{ts_ms}"))
+            .join("scores.json")
+    });
+    // (#1247 Part 1) Funnel mode's per-run-local flow-event sink — see
+    // `LocalJsonlEmitter`'s doc for why this is NOT the fleet flow stream.
+    let mut funnel_emitter = LocalJsonlEmitter::new(scores_path.with_file_name("funnel-events.jsonl"));
     eprintln!(
         "pr-review-bench: {} cases · profile={} · profiles-file={} · mode={}",
         cases.len(),
@@ -401,14 +418,24 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
                 .expect("preflight resolves the funnel context before the loop");
             let workdir = workdir_for(&c.id)
                 .expect("--funnel preflight requires --workdirs and validates every case's tree");
-            let (review, env) = run_funnel_case(c, &workdir, ctx, opts.timeout_seconds)
-                .with_context(|| format!("funneling case {}", c.id))?;
+            let (review, env) =
+                run_funnel_case(c, &workdir, ctx, opts.timeout_seconds, &mut funnel_emitter)
+                    .with_context(|| format!("funneling case {}", c.id))?;
             let total_tokens: u64 = env.members.iter().map(|m| m.total_tokens).sum();
             meta.push(EnvelopeMeta {
                 model: env.members.first().map(|m| m.model.clone()),
                 total_tokens: Some(total_tokens),
             });
             funnels.push(env);
+            // (#1247 Part 2) Stream funnels.json to disk AS THIS CASE
+            // COMPLETES — a killed run (crash, timeout, ctrl-C) keeps every
+            // completed case's envelope, not just whatever the last write
+            // captured. Best-effort: a snapshot failure is a warning, never
+            // a bench failure — the operator still gets the console report
+            // and (if the process survives to the end) the final write.
+            if let Err(e) = write_funnels_snapshot(&scores_path, &funnels) {
+                eprintln!("funnels: WARNING — incremental snapshot not written: {e:#}");
+            }
             review
         } else {
             let prompt = build_prompt(c, opts.mode);
@@ -474,7 +501,7 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
     // (#1198) Persist the run as a scores.json artifact — the bench suite's
     // dual-key score substrate (#1197). Failure to persist is a WARNING, not
     // a bench failure: the operator already has the stdout report.
-    match write_scores_artifact(&scored, &meta, &debates, &funnels, &opts) {
+    match write_scores_artifact(&scored, &meta, &debates, &funnels, &opts, &scores_path, ts_ms) {
         Ok(path) => eprintln!("scores: {}", path.display()),
         Err(e) => eprintln!("scores: WARNING — artifact not written: {e:#}"),
     }
@@ -795,6 +822,67 @@ fn review_from_funnel(env: &super::funnel::FunnelEnvelope) -> Review {
     }
 }
 
+/// (#1247 Part 1, lab-vs-fleet scope boundary) Per-run-local JSONL sink for
+/// the funnel driver's observability records — `review-bench --funnel`'s
+/// wiring of `funnel::FunnelEmitter`. Deliberately NOT `darkmux_flow::record`
+/// (the real, engagement-scoped flow stream `darkmux pr-review run` writes
+/// through): a bench run dispatches many cases in one process and can emit
+/// hundreds of per-flag ruling records, and that volume must never spam an
+/// operator's real engagement flow stream — see the "lab vs fleet scope
+/// boundary" project memory. `path` is `funnel-events.jsonl`, written beside
+/// `funnels.json`/`scores.json`; a future "lab observer view" tails it
+/// directly. Every record is the SAME [`darkmux_flow::FlowRecord`] shape the
+/// fleet sink writes, so a future consumer renders identical vocabulary
+/// regardless of which sink produced it.
+///
+/// Appends one JSON line per record, holding the file handle open for the
+/// emitter's lifetime — the parent dir is created and the file opened ONCE,
+/// on the first emit (lazily, not at construction: `run_review_bench`
+/// constructs the emitter for every mode but only Funnel mode ever emits,
+/// and a strict/freeform run must not leave an empty `funnel-events.jsonl`
+/// behind), then each record is one `write` + `flush` — enough for a live
+/// `tail -f` to see progress in real time, without the per-record
+/// mkdir/open/fsync churn of reopening (~hundreds of records per case;
+/// review-round item on the #1247 PR). Best-effort throughout: an open or
+/// write failure (disk full, a permissions problem) is swallowed rather
+/// than aborting the bench — flow observability must never be the reason a
+/// bench run fails. A failed open is not retried (`opened` latches), so a
+/// persistently-broken path costs one attempt total, not one per record.
+struct LocalJsonlEmitter {
+    path: PathBuf,
+    file: Option<fs::File>,
+    /// Latched after the first emit's open attempt — success or failure.
+    opened: bool,
+}
+
+impl LocalJsonlEmitter {
+    fn new(path: PathBuf) -> Self {
+        Self { path, file: None, opened: false }
+    }
+}
+
+impl super::funnel::FunnelEmitter for LocalJsonlEmitter {
+    fn emit(&mut self, record: darkmux_flow::FlowRecord) {
+        use std::io::Write;
+        if !self.opened {
+            self.opened = true;
+            if let Some(parent) = self.path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            self.file = fs::OpenOptions::new().create(true).append(true).open(&self.path).ok();
+        }
+        let Some(f) = self.file.as_mut() else {
+            return;
+        };
+        let Ok(line) = serde_json::to_string(&record) else {
+            return;
+        };
+        if writeln!(f, "{line}").is_ok() {
+            let _ = f.flush();
+        }
+    }
+}
+
 /// Run the review funnel for one case: build bundles (the built-in Rust
 /// bundler, or `--bundler <cmd>` when set) over the case's mounted repo
 /// tree, feed them into `funnel::run_funnel` via the `FunnelInputs::bundles`
@@ -808,6 +896,7 @@ fn run_funnel_case(
     workdir: &Path,
     ctx: &FunnelCtx,
     timeout_seconds: u32,
+    emitter: &mut dyn super::funnel::FunnelEmitter,
 ) -> Result<(Review, super::funnel::FunnelEnvelope)> {
     use super::bundle;
     use super::funnel;
@@ -872,7 +961,7 @@ fn run_funnel_case(
         })
     };
     let mut cycler = funnel::LmsCycler;
-    let env = funnel::run_funnel(&inputs, chat, &mut cycler)
+    let env = funnel::run_funnel(&inputs, chat, &mut cycler, emitter)
         .with_context(|| format!("running review funnel for case {}", c.id))?;
     let review = review_from_funnel(&env);
     Ok((review, env))
@@ -1470,6 +1559,8 @@ fn write_scores_artifact(
     debates: &[super::dialectic::DebateEnvelope],
     funnels: &[super::funnel::FunnelEnvelope],
     opts: &ReviewBenchOpts,
+    scores_path: &Path,
+    ts_ms: u128,
 ) -> Result<PathBuf> {
     use super::scores;
     // The artifact key's model: what the envelopes reported (all cases share
@@ -1485,13 +1576,10 @@ fn write_scores_artifact(
         n_ctx: None,
     };
     let rows = build_score_rows(scored, meta, &artifact);
-    // Millis granularity so two runs in the same second can't collide on
-    // the run id / default dir (review-QA on #1200); ts is RFC3339 per the
-    // schema's contract.
-    let ts_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
+    // ts_ms / scores_path are resolved ONCE by the caller, up front (before
+    // the per-case loop) — see `run_review_bench`'s comment — so the run_id
+    // below and the incremental funnels.json snapshots share the same
+    // identity/location this final write uses.
     let machine_id = darkmux_types::config_access::machine_id()
         .unwrap_or_else(|| "(unknown)".to_string());
     let mut doc = scores::ScoresDoc::new(
@@ -1533,13 +1621,7 @@ fn write_scores_artifact(
             },
         );
     }
-    let path = match &opts.scores_out {
-        Some(p) => p.clone(),
-        None => super::paths::resolve(super::paths::ResolveScope::Auto)
-            .runs
-            .join(format!("review-bench-{ts_ms}"))
-            .join("scores.json"),
-    };
+    let path = scores_path.to_path_buf();
     if !debates.is_empty() {
         let dpath = path.with_file_name("debates.json");
         let write = serde_json::to_vec_pretty(debates)
@@ -1555,28 +1637,45 @@ fn write_scores_artifact(
             Err(e) => eprintln!("debates: WARNING — artifact not written: {e:#}"),
         }
     }
-    // (#1222 Phase B packet 7) Funnel envelopes — written FIRST, beside
-    // scores.json, and independently of the scores write succeeding, same
-    // discipline as `debates` above: the per-flag judge evidence chain is
-    // the higher-value audit artifact and must never be dropped because the
-    // scores serialization failed.
+    // (#1222 Phase B packet 7 / #1247 Part 2) Funnel envelopes — written
+    // FIRST, beside scores.json, and independently of the scores write
+    // succeeding, same discipline as `debates` above: the per-flag judge
+    // evidence chain is the higher-value audit artifact and must never be
+    // dropped because the scores serialization failed. This is the
+    // idempotent FINAL state — `run_review_bench`'s per-case loop already
+    // streamed every completed case's envelope here via the same
+    // `write_funnels_snapshot` helper as each case finished, so a healthy
+    // run's last incremental write and this one are identical.
     if !funnels.is_empty() {
-        let fpath = path.with_file_name("funnels.json");
-        let write = serde_json::to_vec_pretty(funnels)
-            .map_err(anyhow::Error::from)
-            .and_then(|b| {
-                if let Some(parent) = fpath.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::fs::write(&fpath, b).map_err(anyhow::Error::from)
-            });
-        match write {
-            Ok(()) => eprintln!("funnels: {}", fpath.display()),
+        match write_funnels_snapshot(&path, funnels) {
+            Ok(()) => eprintln!("funnels: {}", path.with_file_name("funnels.json").display()),
             Err(e) => eprintln!("funnels: WARNING — artifact not written: {e:#}"),
         }
     }
     scores::write_scores(&path, &doc)?;
     Ok(path)
+}
+
+/// (#1247 Part 2) Write `funnels.json` beside `scores_path`, ATOMICALLY —
+/// serialize to a sibling `.tmp` file, then `rename` it into place. A
+/// rename replacing an existing destination is atomic on POSIX, so a
+/// concurrent reader (a live `darkmux lab inspect`, a tailing viewer) never
+/// observes a partially-written file. Called after EVERY completed
+/// Funnel-mode case (not just at end-of-run) so a killed bench — crash,
+/// `--timeout`, ctrl-C — keeps every completed case's envelope on disk, not
+/// just whatever the last successful write captured.
+fn write_funnels_snapshot(scores_path: &Path, funnels: &[super::funnel::FunnelEnvelope]) -> Result<()> {
+    let fpath = scores_path.with_file_name("funnels.json");
+    if let Some(parent) = fpath.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {} for the funnels snapshot", parent.display()))?;
+    }
+    let tmp = fpath.with_extension("json.tmp");
+    let bytes = serde_json::to_vec_pretty(funnels).context("serializing funnels snapshot")?;
+    std::fs::write(&tmp, &bytes).with_context(|| format!("writing temp snapshot {}", tmp.display()))?;
+    std::fs::rename(&tmp, &fpath)
+        .with_context(|| format!("renaming snapshot into place at {}", fpath.display()))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2541,6 +2640,135 @@ mod tests {
         assert_eq!(s.fp, 0);
     }
 
+    // ── LocalJsonlEmitter: file mechanics (#1247 review round) ──────────
+
+    #[test]
+    fn local_jsonl_emitter_appends_one_parseable_line_per_record() {
+        use super::super::funnel::FunnelEmitter;
+
+        fn rec(action: &str) -> darkmux_flow::FlowRecord {
+            darkmux_flow::FlowRecord {
+                ts: darkmux_flow::ts_utc_now(),
+                level: darkmux_flow::Level::Info,
+                category: darkmux_flow::Category::Work,
+                tier: darkmux_flow::Tier::Local,
+                stage: darkmux_flow::Stage::Dispatch,
+                action: action.to_string(),
+                handle: "test-crew".to_string(),
+                sprint_id: None,
+                session_id: Some("c1".to_string()),
+                source: Some("funnel".to_string()),
+                model: None,
+                reasoning: None,
+                mission_id: None,
+                machine_id: None,
+                machine_uid: None,
+                orchestrator: None,
+                prev_hash: None,
+                hash: None,
+                payload: Some(serde_json::json!({"status": "started"})),
+                work_id: None,
+                attempt: None,
+            }
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        // A nested, not-yet-existing parent proves the lazy create_dir_all.
+        let path = tmp.path().join("run-dir").join("funnel-events.jsonl");
+        let mut emitter = LocalJsonlEmitter::new(path.clone());
+
+        // Construction alone must not touch the filesystem — a bench run in
+        // a non-funnel mode constructs the emitter but never emits, and must
+        // not leave an empty funnel-events.jsonl (or its dir) behind.
+        assert!(!path.exists(), "no file before the first emit");
+        assert!(!path.parent().unwrap().exists(), "no dir before the first emit");
+
+        emitter.emit(rec("funnel.task"));
+        assert!(path.is_file(), "the first emit creates dir + file");
+        emitter.emit(rec("funnel.step"));
+
+        let content = fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2, "one JSONL line per emitted record");
+        let first: darkmux_flow::FlowRecord = serde_json::from_str(lines[0]).expect("line 1 is a valid FlowRecord");
+        let second: darkmux_flow::FlowRecord = serde_json::from_str(lines[1]).expect("line 2 is a valid FlowRecord");
+        assert_eq!(first.action, "funnel.task");
+        assert_eq!(second.action, "funnel.step");
+        assert_eq!(first.session_id.as_deref(), Some("c1"));
+    }
+
+    // ── write_funnels_snapshot: per-case envelope streaming (#1247 Part 2) ──
+    //
+    // A killed 6-case bench must keep every COMPLETED case's envelope —
+    // `run_review_bench`'s per-case loop calls `write_funnels_snapshot`
+    // after every Funnel-mode case, not just at end-of-run. This exercises
+    // the durability contract directly: case 1's snapshot must survive on
+    // disk even when case 2 never gets a chance to write (simulating a
+    // crash/timeout/error between the two cases).
+
+    #[test]
+    fn write_funnels_snapshot_survives_a_later_case_never_completing() {
+        use super::super::funnel::Tier;
+        let env1 = funnel_env(
+            vec![judged_flag(Some("start.plus(30)"), Tier::Confirmed, "note1", "evidence1")],
+            None,
+        );
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let scores_path = tmp.path().join("scores.json");
+
+        // Case 1 completes -> the driver loop streams its envelope.
+        write_funnels_snapshot(&scores_path, std::slice::from_ref(&env1)).unwrap();
+        let fpath = scores_path.with_file_name("funnels.json");
+        assert!(fpath.is_file(), "case 1's snapshot must be on disk immediately");
+        let after_case1: Vec<super::super::funnel::FunnelEnvelope> =
+            serde_json::from_str(&fs::read_to_string(&fpath).unwrap()).unwrap();
+        assert_eq!(after_case1.len(), 1, "only case 1 has completed so far");
+        assert_eq!(after_case1[0].case_id, env1.case_id);
+
+        // Case 2 "fails" — errors before it ever calls `write_funnels_snapshot`
+        // again. The bench loop would propagate the error and stop (or, in
+        // a real run, the process could be killed outright); either way, no
+        // second snapshot write happens. funnels.json must still hold
+        // exactly what case 1 wrote — never truncated, never corrupted.
+        let after_case2_would_be_failure: Vec<super::super::funnel::FunnelEnvelope> =
+            serde_json::from_str(&fs::read_to_string(&fpath).unwrap()).unwrap();
+        assert_eq!(
+            after_case2_would_be_failure.len(),
+            1,
+            "case 1's envelope survives a later case never completing"
+        );
+        assert_eq!(after_case2_would_be_failure[0].judged.len(), 1);
+        assert_eq!(after_case2_would_be_failure[0].judged[0].tier, Tier::Confirmed);
+    }
+
+    #[test]
+    fn write_funnels_snapshot_second_case_appends_atomically_via_temp_then_rename() {
+        use super::super::funnel::Tier;
+        let env1 = funnel_env(
+            vec![judged_flag(Some("start.plus(30)"), Tier::Confirmed, "note1", "evidence1")],
+            None,
+        );
+        let mut env2 = funnel_env(
+            vec![judged_flag(Some("other.ts"), Tier::Archived, "note2", "evidence2")],
+            None,
+        );
+        env2.case_id = "case-2".to_string();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let scores_path = tmp.path().join("scores.json");
+        write_funnels_snapshot(&scores_path, std::slice::from_ref(&env1)).unwrap();
+        write_funnels_snapshot(&scores_path, &[env1, env2]).unwrap();
+
+        let fpath = scores_path.with_file_name("funnels.json");
+        // No leftover .tmp sibling after a successful rename.
+        assert!(!fpath.with_extension("json.tmp").is_file(), "temp file must be renamed away, not left behind");
+        let both: Vec<super::super::funnel::FunnelEnvelope> =
+            serde_json::from_str(&fs::read_to_string(&fpath).unwrap()).unwrap();
+        assert_eq!(both.len(), 2, "the second snapshot supersedes the first with BOTH cases");
+        assert_eq!(both[1].case_id, "case-2");
+    }
+
     // ── write_scores_artifact: funnels.json artifact discipline ────────
     //
     // No test in this module previously constructed a full `ReviewBenchOpts`
@@ -2572,9 +2800,9 @@ mod tests {
 
         let tmp = tempfile::TempDir::new().unwrap();
         let scores_out = tmp.path().join("scores.json");
-        let opts = funnel_opts(scores_out, true);
+        let opts = funnel_opts(scores_out.clone(), true);
 
-        let path = write_scores_artifact(&scored, &meta, &debates, &funnels, &opts).unwrap();
+        let path = write_scores_artifact(&scored, &meta, &debates, &funnels, &opts, &scores_out, 0).unwrap();
         let fpath = path.with_file_name("funnels.json");
         let content = fs::read_to_string(&fpath).unwrap();
         let parsed: Vec<super::super::funnel::FunnelEnvelope> = serde_json::from_str(&content).unwrap();
@@ -2611,7 +2839,7 @@ mod tests {
         fs::create_dir_all(scores_out.with_extension("json.tmp")).unwrap();
         let opts = funnel_opts(scores_out.clone(), false);
 
-        let err = write_scores_artifact(&scored, &meta, &debates, &funnels, &opts).unwrap_err();
+        let err = write_scores_artifact(&scored, &meta, &debates, &funnels, &opts, &scores_out, 0).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("scores.json.tmp"), "expected the forced write failure to surface, got: {msg}");
 
@@ -2648,11 +2876,11 @@ mod tests {
 
         let tmp = tempfile::TempDir::new().unwrap();
         let scores_out = tmp.path().join("scores.json");
-        let mut opts = funnel_opts(scores_out, false);
+        let mut opts = funnel_opts(scores_out.clone(), false);
         opts.crew = Some("review-funnel".into());
         opts.k_override = Some(9);
 
-        let path = write_scores_artifact(&scored, &meta, &debates, &funnels, &opts).unwrap();
+        let path = write_scores_artifact(&scored, &meta, &debates, &funnels, &opts, &scores_out, 0).unwrap();
         let content = fs::read_to_string(&path).unwrap();
         let doc: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(doc["crew"], serde_json::json!("review-funnel"));
@@ -2682,9 +2910,9 @@ mod tests {
 
         let tmp = tempfile::TempDir::new().unwrap();
         let scores_out = tmp.path().join("scores.json");
-        let opts = funnel_opts(scores_out, false); // k_override left None
+        let opts = funnel_opts(scores_out.clone(), false); // k_override left None
 
-        let path = write_scores_artifact(&scored, &meta, &debates, &funnels, &opts).unwrap();
+        let path = write_scores_artifact(&scored, &meta, &debates, &funnels, &opts, &scores_out, 0).unwrap();
         let content = fs::read_to_string(&path).unwrap();
         let doc: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(doc["k"], serde_json::json!("(profile default)"));
@@ -2751,7 +2979,7 @@ mod tests {
         };
         let workdir = tempfile::TempDir::new().unwrap();
         let ctx = test_funnel_ctx(None, super::super::funnel::ExecMode::Sequential);
-        let (review, env) = run_funnel_case(&case, workdir.path(), &ctx, 30).unwrap();
+        let (review, env) = run_funnel_case(&case, workdir.path(), &ctx, 30, &mut super::super::funnel::NullEmitter).unwrap();
 
         assert_eq!(env.bundles, 0, "README.md isn't a TS/TSX file — build_bundles finds nothing");
         assert!(env.degenerate.is_some(), "a zero-bundle run must be LOUD, never a silent pass");
@@ -2802,7 +3030,7 @@ mod tests {
             Some(script.to_str().unwrap().to_string()),
             super::super::funnel::ExecMode::Sequential,
         );
-        let err = run_funnel_case(&case, workdir.path(), &ctx, 30).unwrap_err();
+        let err = run_funnel_case(&case, workdir.path(), &ctx, 30, &mut super::super::funnel::NullEmitter).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("external bundler for case c-ext"), "got: {msg}");
         assert!(msg.contains("empty bundle set"), "the underlying named error must survive the wrap: {msg}");
