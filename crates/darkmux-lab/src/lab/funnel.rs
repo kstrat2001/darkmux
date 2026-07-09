@@ -351,48 +351,110 @@ fn validate_funnel_crew(crew: &ResolvedCrew) -> Result<(&Vec<ResolvedSeatStaffin
 
 // ─── mechanism-family keyword table (for dedup) ──────────────────────────
 
+/// Lowercased alphanumeric word tokens of `text` — the unit
+/// [`mechanism_family`] matches on. Splitting on every non-alphanumeric
+/// char means `Date.now()` tokenizes as `["date", "now"]` and `copy-paste`
+/// as `["copy", "paste"]`, so punctuation variants match without any
+/// substring tricks.
+fn word_tokens(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// True when `seq` appears in `tokens` as CONSECUTIVE whole tokens.
+fn contains_token_seq(tokens: &[String], seq: &[&str]) -> bool {
+    !seq.is_empty()
+        && tokens.len() >= seq.len()
+        && tokens
+            .windows(seq.len())
+            .any(|w| w.iter().zip(seq).all(|(a, b)| a == b))
+}
+
 /// Classify a charge's prose into a coarse mechanism family for dedup —
 /// deliberately coarse (a keyword table, not a classifier): dedup only
 /// needs "these two flags are probably the same finding," not a precise
 /// taxonomy.
+///
+/// Matching is WHOLE-TOKEN (word-boundary), never substring — the naive
+/// `.contains()` form classified "tenant", "covenant", and "finance" as
+/// `null/nan` (all contain "nan"), so two DISTINCT unanchored charges on a
+/// billing corpus collapsed in dedup and a real defect was silently
+/// dropped (frontier QA should-fix on this packet's PR). Plural/variant
+/// forms are listed explicitly rather than stemmed — transparent beats
+/// clever for a table this small.
 fn mechanism_family(charge_text: &str) -> &'static str {
-    const TABLE: &[(&str, &[&str])] = &[
+    const TABLE: &[(&str, &[&[&str]])] = &[
         (
             "timezone/ambient-time",
             &[
-                "timezone", "time zone", "utc", "date.now", "new date(", "ambient time",
-                "local time", "dst", "daylight saving",
+                &["timezone"],
+                &["timezones"],
+                &["time", "zone"],
+                &["time", "zones"],
+                &["utc"],
+                &["date", "now"],
+                &["new", "date"],
+                &["ambient", "time"],
+                &["local", "time"],
+                &["dst"],
+                &["daylight", "saving"],
+                &["daylight", "savings"],
             ],
         ),
         (
             "arity/param",
             &[
-                "argument", "parameter", "arity", "too many arg", "too few arg",
-                "missing param", "extra param", "wrong number of",
+                &["argument"],
+                &["arguments"],
+                &["arg"],
+                &["args"],
+                &["parameter"],
+                &["parameters"],
+                &["param"],
+                &["params"],
+                &["arity"],
+                &["wrong", "number", "of"],
             ],
         ),
         (
             "null/nan",
-            &["null", "undefined", "nan", "none", " nil "],
+            &[&["null"], &["undefined"], &["nan"], &["none"], &["nil"]],
         ),
         (
             "async/await",
             &[
-                "async", "await", "promise", "race condition", "event loop", "callback",
-                "unhandled rejection",
+                &["async"],
+                &["await"],
+                &["promise"],
+                &["promises"],
+                &["race", "condition"],
+                &["event", "loop"],
+                &["callback"],
+                &["callbacks"],
+                &["unhandled", "rejection"],
             ],
         ),
         (
             "provenance/sibling",
             &[
-                "sibling", "duplicate logic", "other implementation", "diverge",
-                "copy-paste", "copy paste", "provenance",
+                &["sibling"],
+                &["siblings"],
+                &["duplicate", "logic"],
+                &["other", "implementation"],
+                &["diverge"],
+                &["diverges"],
+                &["diverged"],
+                &["copy", "paste"],
+                &["provenance"],
             ],
         ),
     ];
-    let t = charge_text.to_lowercase();
-    for (family, keywords) in TABLE {
-        if keywords.iter().any(|k| t.contains(k)) {
+    let tokens = word_tokens(charge_text);
+    for (family, keyword_seqs) in TABLE {
+        if keyword_seqs.iter().any(|seq| contains_token_seq(&tokens, seq)) {
             return family;
         }
     }
@@ -406,9 +468,13 @@ fn mechanism_family(charge_text: &str) -> &'static str {
 /// point at code that still exists). Reuses `super::dialectic`'s
 /// normalization (leading `+`/`-` strip, whitespace-collapse fallback for
 /// a diff-wrapped logical line) so both matchers share ONE discipline
-/// rather than re-deriving the wrapped-line/marker-strip fixes twice.
+/// rather than re-deriving the wrapped-line/marker-strip fixes twice —
+/// including its [`dialectic::MIN_EVIDENCE_SPAN`] floor, so a trivial
+/// span (`0`, `}`) is inline code styling, never an anchor / dedup key.
 fn extract_new_side_anchor(charge_text: &str, diff: &str) -> Option<String> {
-    use super::dialectic::{backtick_spans, collapse_ws, diff_line_content, normalize_anchor};
+    use super::dialectic::{
+        backtick_spans, collapse_ws, diff_line_content, normalize_anchor, MIN_EVIDENCE_SPAN,
+    };
     let new_side_lines: Vec<&str> = diff.lines().filter(|l| !l.starts_with('-')).collect();
     let collapsed = collapse_ws(
         &new_side_lines
@@ -419,7 +485,7 @@ fn extract_new_side_anchor(charge_text: &str, diff: &str) -> Option<String> {
     );
     for span in backtick_spans(charge_text) {
         let a = normalize_anchor(&span);
-        if a.trim().is_empty() {
+        if a.trim().len() < MIN_EVIDENCE_SPAN {
             continue;
         }
         let found = new_side_lines.iter().any(|l| diff_line_content(l).contains(a))
@@ -872,12 +938,24 @@ fn run_judge_pass(
     }
 }
 
+/// One judge pass's resource accounting alongside its surviving record:
+/// tokens spent, wall time, and the number of ACTUAL dispatches made
+/// (2 when the unparsed-retry fired, else 1) — the member/step telemetry
+/// counts real calls, not logical passes (frontier QA minor on this
+/// packet's PR).
+struct PassOutcome {
+    record: JudgeRecord,
+    tokens: u64,
+    wall_ms: u64,
+    calls: u32,
+}
+
 /// One judge pass, retried ONCE if the reply was [`FunnelRuling::Unparsed`]
 /// (the retry keeps the same `pass` number — a retried pass-1 is still
 /// pass-1, just a second attempt at it). Still unparsed after the retry:
 /// the retry's record survives (the first attempt's record is discarded,
 /// not hidden — it added no information a clean retry didn't already
-/// supersede).
+/// supersede). Tokens/wall/calls account for BOTH attempts.
 fn judge_pass_with_retry(
     pass: u8,
     model: &str,
@@ -885,14 +963,42 @@ fn judge_pass_with_retry(
     prompt: &str,
     max_tokens: u32,
     chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
-) -> (JudgeRecord, u64) {
+) -> PassOutcome {
+    let t0 = Instant::now();
     let (r1, t1) = run_judge_pass(pass, model, system, prompt, max_tokens, chat);
     if r1.ruling == FunnelRuling::Unparsed {
         let (r2, t2) = run_judge_pass(pass, model, system, prompt, max_tokens, chat);
-        (r2, t1 + t2)
+        PassOutcome {
+            record: r2,
+            tokens: t1 + t2,
+            wall_ms: t0.elapsed().as_millis() as u64,
+            calls: 2,
+        }
     } else {
-        (r1, t1)
+        PassOutcome {
+            record: r1,
+            tokens: t1,
+            wall_ms: t0.elapsed().as_millis() as u64,
+            calls: 1,
+        }
     }
+}
+
+/// One flag's full double-confirm outcome, with per-pass resource
+/// accounting so the envelope's `judge-pass1` / `judge-pass2` step rows
+/// carry HONEST per-pass wall times (an all-confirm docket previously
+/// booked its whole elapsed under pass-2, reading as pass-1 = 0ms).
+struct JudgeOutcome {
+    pass1: JudgeRecord,
+    pass2: Option<JudgeRecord>,
+    tier: Tier,
+    demoted_by_pass2: bool,
+    tokens: u64,
+    pass1_ms: u64,
+    pass2_ms: u64,
+    /// Actual dispatches made across both passes, unparsed retries
+    /// included.
+    calls: u32,
 }
 
 /// The double-confirm state machine for one flag: pass-1 (with the
@@ -910,21 +1016,47 @@ fn judge_one_flag(
     system: &str,
     max_tokens: u32,
     chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
-) -> (JudgeRecord, Option<JudgeRecord>, Tier, bool, u64) {
-    let (pass1, t1) = judge_pass_with_retry(1, model, system, prompt, max_tokens, chat);
-    match pass1.ruling {
+) -> JudgeOutcome {
+    let p1 = judge_pass_with_retry(1, model, system, prompt, max_tokens, chat);
+    match p1.record.ruling {
         FunnelRuling::Confirmed => {
-            let (pass2, t2) = judge_pass_with_retry(2, model, system, prompt, max_tokens, chat);
-            if pass2.ruling == FunnelRuling::Confirmed {
-                (pass1, Some(pass2), Tier::Confirmed, false, t1 + t2)
+            let p2 = judge_pass_with_retry(2, model, system, prompt, max_tokens, chat);
+            let (tier, demoted) = if p2.record.ruling == FunnelRuling::Confirmed {
+                (Tier::Confirmed, false)
             } else {
-                (pass1, Some(pass2), Tier::NeedsCheck, true, t1 + t2)
+                (Tier::NeedsCheck, true)
+            };
+            JudgeOutcome {
+                pass1: p1.record,
+                pass2: Some(p2.record),
+                tier,
+                demoted_by_pass2: demoted,
+                tokens: p1.tokens + p2.tokens,
+                pass1_ms: p1.wall_ms,
+                pass2_ms: p2.wall_ms,
+                calls: p1.calls + p2.calls,
             }
         }
-        FunnelRuling::NeedsCheck => (pass1, None, Tier::NeedsCheck, false, t1),
-        FunnelRuling::FalsePositive | FunnelRuling::Unparsed | FunnelRuling::Error => {
-            (pass1, None, Tier::Archived, false, t1)
-        }
+        FunnelRuling::NeedsCheck => JudgeOutcome {
+            tier: Tier::NeedsCheck,
+            demoted_by_pass2: false,
+            tokens: p1.tokens,
+            pass1_ms: p1.wall_ms,
+            pass2_ms: 0,
+            calls: p1.calls,
+            pass1: p1.record,
+            pass2: None,
+        },
+        FunnelRuling::FalsePositive | FunnelRuling::Unparsed | FunnelRuling::Error => JudgeOutcome {
+            tier: Tier::Archived,
+            demoted_by_pass2: false,
+            tokens: p1.tokens,
+            pass1_ms: p1.wall_ms,
+            pass2_ms: 0,
+            calls: p1.calls,
+            pass1: p1.record,
+            pass2: None,
+        },
     }
 }
 
@@ -954,13 +1086,13 @@ fn finish_funnel(
 
     let judge_identifier = swap::namespaced_identifier(&judge.pm);
     let judge_max_tokens = judge.max_tokens.unwrap_or(DEFAULT_JUDGE_MAX_TOKENS);
-    env.fingerprint = fingerprint(&judge_identifier, inputs.judge_system);
 
     cycler.ensure_loaded(&judge.pm)?;
     let mut judged = Vec::with_capacity(deduped.len());
     let mut pass1_ms = 0u64;
     let mut pass2_ms = 0u64;
-    let mut pass2_calls = 0usize;
+    let mut pass2_flags = 0usize;
+    let mut judge_calls = 0u32;
     let mut judge_tokens = 0u64;
     for flag in &deduped {
         let bundle = bundles.iter().find(|b| b.id == flag.bundle_id);
@@ -968,29 +1100,21 @@ fn finish_funnel(
         let facts: &[String] = bundle.map(|b| b.facts.as_slice()).unwrap_or_default();
         let manifest: &[String] = bundle.map(|b| b.manifest.as_slice()).unwrap_or_default();
         let prompt = judge_prompt(inputs.intent, code, facts, manifest, &flag.charge_text);
-        let t0 = Instant::now();
-        let (pass1, pass2, tier, demoted, tokens) =
+        let outcome =
             judge_one_flag(&prompt, &judge_identifier, inputs.judge_system, judge_max_tokens, chat);
-        judge_tokens += tokens;
-        if pass2.is_some() {
-            pass2_calls += 1;
-            // Best-effort split: attribute the whole call's wall time to
-            // pass1 bucket unless we can tell the passes apart — we track
-            // ONLY total per-flag wall here and fold it into pass1_ms/
-            // pass2_ms proportionally isn't worth the complexity; both
-            // step rows share the SAME total wall-clock elapsed, which is
-            // the honest number an operator wants (dispatch time, not an
-            // arbitrary split).
-            pass2_ms += t0.elapsed().as_millis() as u64;
-        } else {
-            pass1_ms += t0.elapsed().as_millis() as u64;
+        judge_tokens += outcome.tokens;
+        judge_calls += outcome.calls;
+        pass1_ms += outcome.pass1_ms;
+        pass2_ms += outcome.pass2_ms;
+        if outcome.pass2.is_some() {
+            pass2_flags += 1;
         }
         judged.push(JudgedFlag {
             flag: flag.clone(),
-            pass1,
-            pass2,
-            tier,
-            demoted_by_pass2: demoted,
+            pass1: outcome.pass1,
+            pass2: outcome.pass2,
+            tier: outcome.tier,
+            demoted_by_pass2: outcome.demoted_by_pass2,
         });
     }
     cycler.release(&judge.pm)?;
@@ -998,7 +1122,9 @@ fn finish_funnel(
     env.members.push(MemberRecord {
         model: judge_identifier,
         seat: "review-judge".to_string(),
-        draws: (deduped.len() + pass2_calls) as u32,
+        // Actual dispatches, unparsed retries included — never fewer calls
+        // than the operator paid for.
+        draws: judge_calls,
         wall_ms: pass1_ms + pass2_ms,
         total_tokens: judge_tokens,
     });
@@ -1009,12 +1135,12 @@ fn finish_funnel(
         items_out: deduped.len(),
         wall_ms: pass1_ms,
     });
-    if pass2_calls > 0 {
+    if pass2_flags > 0 {
         env.steps.push(StepRecord {
             step_id: "judge-pass2".to_string(),
             kind: "dispatch".to_string(),
-            items_in: pass2_calls,
-            items_out: pass2_calls,
+            items_in: pass2_flags,
+            items_out: pass2_flags,
             wall_ms: pass2_ms,
         });
     }
@@ -1053,6 +1179,11 @@ pub fn run_funnel(
         crew: inputs.crew.name.clone(),
         mode: mode_label(mode).to_string(),
         bundles: bundles.len(),
+        // Stamped up front so DEGENERATE envelopes (zero bundles / zero
+        // flags) carry the same comparability key as a full run — a
+        // Null fingerprint on an early return would make the degenerate
+        // record untraceable to its judge config.
+        fingerprint: fingerprint(&swap::namespaced_identifier(&judge.pm), inputs.judge_system),
         ..Default::default()
     };
     env.steps.push(StepRecord {
@@ -1097,7 +1228,12 @@ pub fn run_judge_only(
     mut chat: impl FnMut(&ChatCall) -> Result<SingleShotReply>,
     cycler: &mut dyn ModelCycler,
 ) -> Result<FunnelEnvelope> {
-    let (_, judge) = validate_funnel_crew(inputs.crew)?;
+    let (probes, judge) = validate_funnel_crew(inputs.crew)?;
+    // Judge-only runs one model, so the mode is telemetry, not behavior —
+    // but the envelope still records the CALLER's resolved mode rather
+    // than a hardcoded label, so a judge-only re-run of a parallel funnel
+    // doesn't misreport its provenance.
+    let mode = resolve_mode(inputs.mode, probes, judge);
 
     let t_bundle = Instant::now();
     let bundles = resolve_bundles(inputs);
@@ -1106,8 +1242,11 @@ pub fn run_judge_only(
     let mut env = FunnelEnvelope {
         case_id: inputs.case_id.clone(),
         crew: inputs.crew.name.clone(),
-        mode: mode_label(ExecMode::Sequential).to_string(),
+        mode: mode_label(mode).to_string(),
         bundles: bundles.len(),
+        // Same up-front stamp as `run_funnel` — degenerate (zero-flag)
+        // envelopes carry the comparability key too.
+        fingerprint: fingerprint(&swap::namespaced_identifier(&judge.pm), inputs.judge_system),
         ..Default::default()
     };
     env.steps.push(StepRecord {
@@ -1289,6 +1428,51 @@ mod tests {
         assert_eq!(stats.deduped, 2, "different bundle_id never collapses");
     }
 
+    /// Frontier QA should-fix on this packet's PR: substring matching
+    /// classified "tenant", "covenant", and "finance" as `null/nan` (all
+    /// contain "nan"), so two DISTINCT unanchored charges on a billing
+    /// corpus keyed identically and one real defect was silently dropped
+    /// in dedup. Word-boundary matching must not fire on those words.
+    #[test]
+    fn mechanism_family_does_not_substring_match_inside_words() {
+        assert_eq!(
+            mechanism_family("The tenant covenant check is skipped for finance accounts."),
+            "other",
+            "'tenant'/'covenant'/'finance' must not classify as null/nan"
+        );
+        // The real keywords still classify as whole tokens.
+        assert_eq!(mechanism_family("A null value reaches this branch."), "null/nan");
+        assert_eq!(mechanism_family("NaN propagates into the total."), "null/nan");
+        assert_eq!(mechanism_family("None is returned on the error path."), "null/nan");
+        // Punctuation-adjacent tokens still match (tokenizer strips it).
+        assert_eq!(mechanism_family("Uses `Date.now()` for the cutoff."), "timezone/ambient-time");
+        // "nonexistent" must not token-match "none".
+        assert_eq!(mechanism_family("References a nonexistent column."), "other");
+    }
+
+    /// Two unanchored flags on the SAME bundle whose charges describe
+    /// genuinely different mechanisms must both survive dedup — the
+    /// substring bug collapsed them (both misclassified `null/nan`) and
+    /// silently dropped a real defect.
+    #[test]
+    fn dedup_distinct_mechanisms_same_bundle_both_survive() {
+        let flags = vec![
+            flag(
+                "b1",
+                "member-a",
+                0,
+                "The tenant covenant check is skipped when the finance flag is set.",
+            ),
+            flag("b1", "member-b", 0, "A null value reaches the accumulator unguarded."),
+        ];
+        let (deduped, stats) = dedup_flags(flags, DIFF);
+        assert_eq!(
+            stats.deduped, 2,
+            "genuinely different mechanisms in one bundle must both survive"
+        );
+        assert_eq!(deduped.len(), 2);
+    }
+
     // ── double-confirm state machine ────────────────────────────────
 
     fn scripted_chat(
@@ -1310,65 +1494,66 @@ mod tests {
     #[test]
     fn double_confirm_confirm_then_confirm_is_confirmed_tier() {
         let mut chat = scripted_chat(RefCell::new(vec![CONFIRM_JSON, CONFIRM_JSON]));
-        let (pass1, pass2, tier, demoted, _) =
-            judge_one_flag("prompt", "judge-model", "sys", 1000, &mut chat);
-        assert_eq!(pass1.ruling, FunnelRuling::Confirmed);
-        assert_eq!(pass2.unwrap().ruling, FunnelRuling::Confirmed);
-        assert_eq!(tier, Tier::Confirmed);
-        assert!(!demoted);
+        let o = judge_one_flag("prompt", "judge-model", "sys", 1000, &mut chat);
+        assert_eq!(o.pass1.ruling, FunnelRuling::Confirmed);
+        assert_eq!(o.pass2.unwrap().ruling, FunnelRuling::Confirmed);
+        assert_eq!(o.tier, Tier::Confirmed);
+        assert!(!o.demoted_by_pass2);
+        assert_eq!(o.calls, 2, "one clean dispatch per pass");
     }
 
     #[test]
     fn double_confirm_confirm_then_false_positive_demotes_to_needs_check() {
         let mut chat = scripted_chat(RefCell::new(vec![CONFIRM_JSON, FP_JSON]));
-        let (pass1, pass2, tier, demoted, _) =
-            judge_one_flag("prompt", "judge-model", "sys", 1000, &mut chat);
-        assert_eq!(pass1.ruling, FunnelRuling::Confirmed);
-        assert_eq!(pass2.unwrap().ruling, FunnelRuling::FalsePositive);
-        assert_eq!(tier, Tier::NeedsCheck, "disagreement demotes, never ships as confirmed");
-        assert!(demoted);
+        let o = judge_one_flag("prompt", "judge-model", "sys", 1000, &mut chat);
+        assert_eq!(o.pass1.ruling, FunnelRuling::Confirmed);
+        assert_eq!(o.pass2.unwrap().ruling, FunnelRuling::FalsePositive);
+        assert_eq!(o.tier, Tier::NeedsCheck, "disagreement demotes, never ships as confirmed");
+        assert!(o.demoted_by_pass2);
     }
 
     #[test]
     fn double_confirm_pass1_needs_check_skips_pass2() {
         let mut chat = scripted_chat(RefCell::new(vec![NEEDS_CHECK_JSON]));
-        let (pass1, pass2, tier, demoted, _) =
-            judge_one_flag("prompt", "judge-model", "sys", 1000, &mut chat);
-        assert_eq!(pass1.ruling, FunnelRuling::NeedsCheck);
-        assert!(pass2.is_none());
-        assert_eq!(tier, Tier::NeedsCheck);
-        assert!(!demoted);
+        let o = judge_one_flag("prompt", "judge-model", "sys", 1000, &mut chat);
+        assert_eq!(o.pass1.ruling, FunnelRuling::NeedsCheck);
+        assert!(o.pass2.is_none());
+        assert_eq!(o.tier, Tier::NeedsCheck);
+        assert!(!o.demoted_by_pass2);
+        assert_eq!(o.calls, 1);
+        assert_eq!(o.pass2_ms, 0, "no pass-2 dispatch, no pass-2 wall time");
     }
 
     #[test]
     fn double_confirm_pass1_false_positive_archives_without_pass2() {
         let mut chat = scripted_chat(RefCell::new(vec![FP_JSON]));
-        let (pass1, pass2, tier, ..) = judge_one_flag("prompt", "judge-model", "sys", 1000, &mut chat);
-        assert_eq!(pass1.ruling, FunnelRuling::FalsePositive);
-        assert!(pass2.is_none());
-        assert_eq!(tier, Tier::Archived);
+        let o = judge_one_flag("prompt", "judge-model", "sys", 1000, &mut chat);
+        assert_eq!(o.pass1.ruling, FunnelRuling::FalsePositive);
+        assert!(o.pass2.is_none());
+        assert_eq!(o.tier, Tier::Archived);
     }
 
     #[test]
     fn double_confirm_unparsed_retries_then_archives() {
         // Two garbage replies: pass-1 attempt, retry — still unparsed.
         let mut chat = scripted_chat(RefCell::new(vec!["no verdict here", "still nothing"]));
-        let (pass1, pass2, tier, demoted, _) =
-            judge_one_flag("prompt", "judge-model", "sys", 1000, &mut chat);
-        assert_eq!(pass1.ruling, FunnelRuling::Unparsed);
-        assert!(pass2.is_none());
-        assert_eq!(tier, Tier::Archived);
-        assert!(!demoted);
+        let o = judge_one_flag("prompt", "judge-model", "sys", 1000, &mut chat);
+        assert_eq!(o.pass1.ruling, FunnelRuling::Unparsed);
+        assert!(o.pass2.is_none());
+        assert_eq!(o.tier, Tier::Archived);
+        assert!(!o.demoted_by_pass2);
+        assert_eq!(o.calls, 2, "the unparsed retry is a real dispatch and is counted");
     }
 
     #[test]
     fn double_confirm_unparsed_retry_recovers() {
         // First attempt garbage, retry succeeds — the retry's ruling wins.
         let mut chat = scripted_chat(RefCell::new(vec!["garbage", CONFIRM_JSON, CONFIRM_JSON]));
-        let (pass1, pass2, tier, ..) = judge_one_flag("prompt", "judge-model", "sys", 1000, &mut chat);
-        assert_eq!(pass1.ruling, FunnelRuling::Confirmed, "the retry's clean ruling survives");
-        assert_eq!(pass2.unwrap().ruling, FunnelRuling::Confirmed);
-        assert_eq!(tier, Tier::Confirmed);
+        let o = judge_one_flag("prompt", "judge-model", "sys", 1000, &mut chat);
+        assert_eq!(o.pass1.ruling, FunnelRuling::Confirmed, "the retry's clean ruling survives");
+        assert_eq!(o.pass2.unwrap().ruling, FunnelRuling::Confirmed);
+        assert_eq!(o.tier, Tier::Confirmed);
+        assert_eq!(o.calls, 3, "pass-1 attempt + retry + pass-2 = three real dispatches");
     }
 
     // ── empty probe draw ─────────────────────────────────────────────
@@ -1593,6 +1778,10 @@ mod tests {
         assert_eq!(env.confirmed, 0);
         assert_eq!(env.needs_check, 0);
         assert_eq!(env.archived, 0);
+        assert!(
+            env.fingerprint.get("protocol").is_some(),
+            "a degenerate envelope still carries the comparability fingerprint"
+        );
     }
 
     #[test]
@@ -1615,6 +1804,10 @@ mod tests {
         assert!(env.degenerate.is_some());
         assert_eq!(env.raw_flags, 0);
         assert_eq!(env.judged.len(), 0);
+        assert!(
+            env.fingerprint.get("protocol").is_some(),
+            "a zero-flag envelope still carries the comparability fingerprint"
+        );
     }
 
     // ── run_judge_only ────────────────────────────────────────────────
@@ -1639,6 +1832,29 @@ mod tests {
         assert_eq!(env.raw_flags, 1);
         assert_eq!(env.judged.len(), 1);
         assert!(!cycler.log.iter().any(|s| s.contains("probe-model")), "probe never dispatched");
+        assert_eq!(
+            env.mode, "sequential",
+            "the envelope records the caller's resolved mode, not a hardcoded label"
+        );
+    }
+
+    #[test]
+    fn run_judge_only_records_the_callers_parallel_mode() {
+        let crew = valid_crew();
+        let inputs = FunnelInputs {
+            case_id: "c1".to_string(),
+            crew: &crew,
+            intent: "add a feature",
+            diff: DIFF,
+            mode: ExecMode::Parallel,
+            probe_system: "probe sys",
+            judge_system: "judge sys",
+        };
+        let flags = vec![flag("billing.ts", "member-a", 0, "`const end = start.plus(30)` off by one")];
+        let mut cycler = RecordingCycler::new();
+        let mut chat = |_call: &ChatCall| Ok(reply(FP_JSON));
+        let env = run_judge_only(flags, &inputs, &mut chat, &mut cycler).expect("runs");
+        assert_eq!(env.mode, "parallel", "a judge-only re-run of a parallel funnel keeps its provenance");
     }
 
     // ── ExecMode auto-resolution ──────────────────────────────────────

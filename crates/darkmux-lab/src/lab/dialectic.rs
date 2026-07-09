@@ -527,7 +527,9 @@ pub fn validate_charge_anchors(charges: &mut [Charge], diff: &str) -> usize {
 
 /// Minimum length for a quoted span to be treated as verifiable evidence —
 /// shorter spans (`x`, `?？`, `}`) are inline code styling, not citations.
-const MIN_EVIDENCE_SPAN: usize = 8;
+/// `pub(crate)`: `super::funnel`'s anchor extraction applies the same floor
+/// so a trivial span (`0`, `}`) can never become an anchor / dedup key.
+pub(crate) const MIN_EVIDENCE_SPAN: usize = 8;
 
 /// Verify each rebuttal's quoted counter-evidence against the diff and the
 /// repo tree (paths named in the rebuttal body + the charged file). A span
