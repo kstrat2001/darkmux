@@ -16,6 +16,20 @@ fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bundle")
 }
 
+// Ref-count note (frontier QA on #1236): the `placeOrder` bundles carry 8
+// code refs where naive enumeration expects 7 — the "extra"
+// `legacy/placeOrder.ts` full-body ref is INTENDED, a faithful
+// reproduction of two reference quirks: (1) `resolve_callees` scans the
+// whole function INCLUDING its declaration line, so `export function
+// placeOrder(` self-matches as a call site and resolves (other-path
+// preferred) to the legacy def as an inlined "callee"; (2) the caller
+// grep's name-followed-by-`(` pattern matches the legacy file's own
+// DECLARATION line, yielding a second legacy ref as a "caller excerpt".
+// Both behaviors exist verbatim in the Python reference (its
+// `resolve_callees(fn_lines, ...)` call site and caller-grep loop); the
+// port preserves them. So: 1 self + 4 callees (applyDiscount,
+// computeTotal, logOrder, self-resolved placeOrder) + 1 caller + 2
+// sibling header refs = 8.
 #[test]
 fn golden_bundle_set_matches_fixture() {
     let dir = fixture_dir();

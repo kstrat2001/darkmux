@@ -9,7 +9,16 @@
 //! - **`GithubApi`**: bounded, no checkout. `candidate_files` starts from the
 //!   diff's changed files and does ONE hop of relative-import resolution
 //!   (`import ... from './x'` -> `x.ts` / `x.tsx` / `x/index.ts` /
-//!   `x/index.tsx`), capped at `MAX_API_FILES` total fetches. A symbol this
+//!   `x/index.tsx`). `MAX_API_FILES` is a HARD bound on total candidate
+//!   files: changed files fill the budget first; import-hop resolutions
+//!   fill whatever remains. When the diff's changed files alone exceed the
+//!   cap, the list is truncated — a loud stderr line names the overflow,
+//!   [`FileSource::unscanned_file_count`] reports it, and `build_bundles`
+//!   stamps every bundle's manifest with a `"file budget exceeded: N files
+//!   not scanned"` line so the incomplete-index condition is visible on the
+//!   artifact itself, not just in a log. (Speculative import-resolution
+//!   probes are additionally bounded by their own fetch budget, so total
+//!   `gh api` calls stay bounded even when every probe 404s.) A symbol this
 //!   source can't resolve lands in the bundle's `manifest` instead of being
 //!   silently dropped or wrongly assumed absent.
 //!
@@ -26,9 +35,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Bound on total GitHub API content fetches `GithubApi::candidate_files`
-/// will perform for one bundling run (the diff's own changed files plus
-/// one hop of resolved relative imports).
+/// HARD bound on total candidate files `GithubApi::candidate_files` will
+/// return for one bundling run — the diff's own changed files first,
+/// import-hop resolutions filling the remainder. Changed files beyond
+/// the cap are truncated (loudly; see `unscanned_file_count`), never
+/// silently fetched over budget.
 pub const MAX_API_FILES: usize = 30;
 
 pub enum FileSource {
@@ -40,6 +51,11 @@ pub enum FileSource {
         /// `None` for a confirmed-missing path (a 404 is cached too, so a
         /// re-probed import candidate doesn't re-fetch).
         cache: RefCell<HashMap<String, Option<String>>>,
+        /// Changed files the last `candidate_files` call dropped over the
+        /// `MAX_API_FILES` hard cap — surfaced via `unscanned_file_count`
+        /// so `build_bundles` can stamp the truncation into every
+        /// bundle's manifest.
+        unscanned: RefCell<usize>,
     },
 }
 
@@ -53,6 +69,17 @@ impl FileSource {
             repo: repo.into(),
             head_sha: head_sha.into(),
             cache: RefCell::new(HashMap::new()),
+            unscanned: RefCell::new(0),
+        }
+    }
+
+    /// How many of the diff's changed files the last `candidate_files`
+    /// call dropped over the `MAX_API_FILES` hard cap. Always 0 for
+    /// `Worktree` (full-fidelity tree walk — no budget).
+    pub fn unscanned_file_count(&self) -> usize {
+        match self {
+            FileSource::Worktree(_) => 0,
+            FileSource::GithubApi { unscanned, .. } => *unscanned.borrow(),
         }
     }
 
@@ -63,7 +90,7 @@ impl FileSource {
     pub fn read_file(&self, path: &str) -> Result<Option<String>> {
         match self {
             FileSource::Worktree(root) => Ok(read_worktree_file(root, path)),
-            FileSource::GithubApi { repo, head_sha, cache } => {
+            FileSource::GithubApi { repo, head_sha, cache, .. } => {
                 if let Some(hit) = cache.borrow().get(path) {
                     return Ok(hit.clone());
                 }
@@ -84,52 +111,77 @@ impl FileSource {
     }
 
     fn github_candidate_files(&self, diff_text: &str) -> Result<Vec<String>> {
+        let FileSource::GithubApi { unscanned, .. } = self else {
+            unreachable!("github_candidate_files is only dispatched on GithubApi");
+        };
         let mut result: Vec<String> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
-        let mut fetch_budget = MAX_API_FILES;
 
-        let changed = changed_files_from_diff(diff_text);
-        let mut frontier: Vec<String> = Vec::new();
-        for path in changed {
-            if seen.insert(path.clone()) {
-                result.push(path.clone());
-                frontier.push(path);
+        // Changed files fill the hard MAX_API_FILES budget first. Anything
+        // beyond it is TRUNCATED — loudly here, durably via
+        // `unscanned_file_count` (which `build_bundles` stamps into every
+        // bundle's manifest), never silently fetched over budget.
+        let mut dropped = 0usize;
+        for path in changed_files_from_diff(diff_text) {
+            if seen.contains(&path) {
+                continue;
             }
+            if result.len() >= MAX_API_FILES {
+                dropped += 1;
+                continue;
+            }
+            seen.insert(path.clone());
+            result.push(path);
+        }
+        *unscanned.borrow_mut() = dropped;
+        if dropped > 0 {
+            eprintln!(
+                "bundle: GithubApi file budget exceeded — {dropped} changed file(s) beyond \
+                 the MAX_API_FILES={MAX_API_FILES} cap will not be scanned (bundles carry a \
+                 manifest line naming the truncation)"
+            );
         }
 
-        // One hop: for each changed file (that we can still afford to
-        // fetch), read its content, extract relative import specifiers,
-        // resolve each to candidate paths, and confirm existence with a
-        // bounded probe fetch.
-        for from_path in frontier {
-            if fetch_budget == 0 {
-                break;
-            }
-            let Some(content) = self.read_file(&from_path)? else {
-                fetch_budget = fetch_budget.saturating_sub(1);
-                continue;
-            };
-            fetch_budget = fetch_budget.saturating_sub(1);
-            for spec in parse_relative_imports(&content) {
-                if fetch_budget == 0 {
+        // One hop of relative-import resolution fills whatever candidate
+        // budget remains. Skipped entirely when the changed files alone
+        // consumed the cap (also keeps the truncation test network-free).
+        // `fetch_budget` bounds the SPECULATIVE probe fetches (mostly
+        // 404s on extension/index variants) so total `gh api` calls stay
+        // bounded independent of the candidate cap.
+        if result.len() < MAX_API_FILES {
+            let frontier = result.clone();
+            let mut fetch_budget = MAX_API_FILES;
+            'hop: for from_path in frontier {
+                if result.len() >= MAX_API_FILES || fetch_budget == 0 {
                     break;
                 }
-                for candidate in resolve_relative_import_candidates(&from_path, &spec) {
+                let Some(content) = self.read_file(&from_path)? else {
+                    continue;
+                };
+                for spec in parse_relative_imports(&content) {
+                    if result.len() >= MAX_API_FILES {
+                        break 'hop;
+                    }
                     if fetch_budget == 0 {
-                        break;
+                        break 'hop;
                     }
-                    if seen.contains(&candidate) {
-                        continue;
-                    }
-                    let found = self.read_file(&candidate)?;
-                    fetch_budget = fetch_budget.saturating_sub(1);
-                    if found.is_some() {
-                        seen.insert(candidate.clone());
-                        result.push(candidate);
-                        // A relative specifier resolves to exactly one
-                        // real file — stop trying the remaining
-                        // extension/index variants once one hits.
-                        break;
+                    for candidate in resolve_relative_import_candidates(&from_path, &spec) {
+                        if fetch_budget == 0 {
+                            break 'hop;
+                        }
+                        if seen.contains(&candidate) {
+                            continue;
+                        }
+                        let found = self.read_file(&candidate)?;
+                        fetch_budget -= 1;
+                        if found.is_some() {
+                            seen.insert(candidate.clone());
+                            result.push(candidate);
+                            // A relative specifier resolves to exactly one
+                            // real file — stop trying the remaining
+                            // extension/index variants once one hits.
+                            break;
+                        }
                     }
                 }
             }
@@ -217,13 +269,21 @@ pub fn parse_relative_imports(text: &str) -> Vec<String> {
 /// Find a quoted string literal following the last `from` keyword on the
 /// line, or (for a bare `import '<spec>';`) the first quoted string
 /// right after `import`. Hand-rolled — no regex crate available.
+///
+/// Known rare edge (documented, not handled): `rfind("from")` is a
+/// substring search, so a module path whose LAST `from` occurrence is
+/// inside the specifier itself (e.g. a directory or module literally
+/// named `from`, as in `import x from './from'`) anchors the quote scan
+/// after that inner occurrence. The quote scan still lands on the same
+/// closing quote for the common single-specifier-per-line shape, so this
+/// only misbehaves on pathological multi-quote lines — accepted as
+/// best-effort (the manifest's provenance is advisory, never
+/// correctness-bearing).
 fn extract_from_specifier(line: &str) -> Option<String> {
     let search_from = if let Some(idx) = line.rfind("from") {
         &line[idx + 4..]
-    } else if let Some(rest) = line.strip_prefix("import") {
-        rest
     } else {
-        return None;
+        line.strip_prefix("import")?
     };
     let bytes = search_from.as_bytes();
     for (i, &b) in bytes.iter().enumerate() {
@@ -394,5 +454,47 @@ mod tests {
     fn resolve_relative_import_candidates_handles_parent_dir() {
         let cands = resolve_relative_import_candidates("src/services/order.ts", "../lib/bar");
         assert_eq!(cands[0], "src/lib/bar.ts");
+    }
+
+    #[test]
+    fn github_candidate_files_hard_caps_at_max_api_files() {
+        // 35 changed TS files -> exactly MAX_API_FILES candidates + the
+        // truncation signal. Network-free by construction: the changed
+        // files alone exhaust the candidate budget, so the import-hop
+        // stage (the only fetch site inside candidate_files) is skipped
+        // entirely and `gh api` is never invoked.
+        let mut diff = String::new();
+        for i in 0..35 {
+            diff.push_str(&format!("+++ b/src/f{i}.ts\n@@ -1,1 +1,1 @@\n+x\n"));
+        }
+        let source = FileSource::github_api("owner/repo", "deadbeef");
+        let files = source.candidate_files(&diff).unwrap();
+        assert_eq!(files.len(), MAX_API_FILES, "hard cap must bound total candidates");
+        assert_eq!(
+            source.unscanned_file_count(),
+            5,
+            "the 5 changed files over the cap must be reported as unscanned"
+        );
+        // Changed files fill the budget FIRST, in diff order.
+        assert_eq!(files[0], "src/f0.ts");
+        assert_eq!(files[MAX_API_FILES - 1], format!("src/f{}.ts", MAX_API_FILES - 1));
+    }
+
+    #[test]
+    fn github_candidate_files_reports_zero_unscanned_under_cap() {
+        // Under-cap diffs report no truncation. Single changed file whose
+        // content fetch will fail (gh api on a bogus repo returns
+        // non-success -> read_file yields Ok(None)) — the hop simply
+        // finds no imports to resolve; candidate derivation is unaffected.
+        let diff = "+++ b/src/only.ts\n@@ -1,1 +1,1 @@\n+x\n";
+        let source = FileSource::github_api("invalid/invalid", "0000000");
+        // Pre-seed the cache so even this single changed-file content read
+        // never leaves the process.
+        if let FileSource::GithubApi { cache, .. } = &source {
+            cache.borrow_mut().insert("src/only.ts".to_string(), None);
+        }
+        let files = source.candidate_files(diff).unwrap();
+        assert_eq!(files, vec!["src/only.ts".to_string()]);
+        assert_eq!(source.unscanned_file_count(), 0);
     }
 }

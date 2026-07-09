@@ -102,12 +102,17 @@ pub fn build_repo_index(source: &FileSource, candidate_files: &[String]) -> Resu
 
 /// Port of `resolve_callees`: for each distinct call name in
 /// `fn_body_lines`, the best-match repo def (prefer one NOT in
-/// `own_path`, else the same-path one).
+/// `own_path`, else the same-path one). Returned in FIRST-CALL-APPEARANCE
+/// order — the Python reference builds its `out` dict in `names` order
+/// (first appearance in the body text) and iterates it in insertion
+/// order, so downstream callee code-ref emission matches the reference
+/// exactly. Callers needing name lookup build a `HashMap` view over the
+/// pairs (the `callee_index`); this Vec is the ordering-bearing surface.
 pub fn resolve_callees<'a>(
     fn_body_lines: &[String],
     repo_index: &'a RepoIndex,
     own_path: &str,
-) -> HashMap<String, &'a FnRecord> {
+) -> Vec<(String, &'a FnRecord)> {
     let body_text = fn_body_lines.join("\n");
     let calls = scan::extract_calls(&body_text);
     let mut seen: HashSet<String> = HashSet::new();
@@ -117,14 +122,14 @@ pub fn resolve_callees<'a>(
             names.push(name);
         }
     }
-    let mut out = HashMap::new();
+    let mut out = Vec::new();
     for name in names {
         let Some(defs) = repo_index.get(&name) else {
             continue;
         };
         let chosen = defs.iter().find(|d| d.path != own_path).or_else(|| defs.first());
         if let Some(c) = chosen {
-            out.insert(name, c);
+            out.push((name, c));
         }
     }
     out
@@ -173,7 +178,7 @@ pub fn find_siblings(fn_name: &str, own_path: &str, repo_index: &RepoIndex) -> V
                 }
             }
         }
-        scored.sort_by(|a, b| b.0.cmp(&a.0)); // stable descending sort
+        scored.sort_by_key(|t| std::cmp::Reverse(t.0)); // stable descending sort
     }
     let remaining = MAX_SIBLINGS - out.len();
     for (_, other_name, d) in scored.into_iter().take(remaining) {
@@ -578,6 +583,21 @@ mod tests {
         idx.push("helper".to_string(), rec("src/b.ts", 0, 2, &[], "function helper() {}"));
         let body = vec!["  helper();".to_string()];
         let callees = resolve_callees(&body, &idx, "src/a.ts");
-        assert_eq!(callees.get("helper").unwrap().path, "src/b.ts");
+        let helper = callees.iter().find(|(n, _)| n == "helper").unwrap();
+        assert_eq!(helper.1.path, "src/b.ts");
+    }
+
+    #[test]
+    fn resolve_callees_preserves_first_call_appearance_order() {
+        // The reference's dict insertion order = first appearance in the
+        // body text; the ported Vec must match (zebra called first even
+        // though alpha sorts first).
+        let mut idx = RepoIndex::default();
+        idx.push("zebra".to_string(), rec("src/z.ts", 0, 2, &[], "function zebra() {}"));
+        idx.push("alpha".to_string(), rec("src/a.ts", 0, 2, &[], "function alpha() {}"));
+        let body = vec!["  zebra(); alpha();".to_string()];
+        let callees = resolve_callees(&body, &idx, "src/own.ts");
+        let names: Vec<&str> = callees.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["zebra", "alpha"]);
     }
 }

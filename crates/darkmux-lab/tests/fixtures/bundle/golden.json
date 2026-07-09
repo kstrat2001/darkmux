@@ -9,6 +9,11 @@
           "end": 25
         },
         {
+          "path": "src/orders/legacy/placeOrder.ts",
+          "start": 1,
+          "end": 3
+        },
+        {
           "path": "src/orders/pricing.ts",
           "start": 5,
           "end": 10
@@ -22,11 +27,6 @@
           "path": "src/orders/order.ts",
           "start": 27,
           "end": 29
-        },
-        {
-          "path": "src/orders/legacy/placeOrder.ts",
-          "start": 1,
-          "end": 3
         },
         {
           "path": "src/orders/legacy/placeOrder.ts",
@@ -80,6 +80,11 @@
           "end": 25
         },
         {
+          "path": "src/orders/legacy/placeOrder.ts",
+          "start": 1,
+          "end": 3
+        },
+        {
           "path": "src/orders/pricing.ts",
           "start": 5,
           "end": 10
@@ -93,11 +98,6 @@
           "path": "src/orders/order.ts",
           "start": 27,
           "end": 29
-        },
-        {
-          "path": "src/orders/legacy/placeOrder.ts",
-          "start": 1,
-          "end": 3
         },
         {
           "path": "src/orders/legacy/placeOrder.ts",
@@ -133,6 +133,11 @@
           "end": 25
         },
         {
+          "path": "src/orders/legacy/placeOrder.ts",
+          "start": 1,
+          "end": 3
+        },
+        {
           "path": "src/orders/pricing.ts",
           "start": 5,
           "end": 10
@@ -146,11 +151,6 @@
           "path": "src/orders/order.ts",
           "start": 27,
           "end": 29
-        },
-        {
-          "path": "src/orders/legacy/placeOrder.ts",
-          "start": 1,
-          "end": 3
         },
         {
           "path": "src/orders/legacy/placeOrder.ts",

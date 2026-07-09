@@ -356,13 +356,12 @@ pub fn build_bundles(source: &FileSource, diff_text: &str) -> Result<BundleSet> 
                 end: end0 as u32 + 1,
             }];
 
+            // Callee code refs emit in FIRST-CALL-APPEARANCE order —
+            // `resolve_callees` returns the same insertion order the
+            // Python reference's dict iterates in, so ref ordering
+            // matches the reference (and is deterministic).
             let callees = facts::resolve_callees(&fn_lines, &repo_index, rel);
-            // Deterministic emission order for reproducible golden output
-            // (a `HashMap`'s iteration order isn't).
-            let mut callee_names: Vec<&String> = callees.keys().collect();
-            callee_names.sort();
-            for cname in &callee_names {
-                let cdef = callees[cname.as_str()];
+            for (_cname, cdef) in &callees {
                 let clen = cdef.end0 - cdef.start0 + 1;
                 if clen <= facts::MAX_CALLEE_BODY_LINES {
                     code_refs.push(BundleRef {
@@ -391,7 +390,13 @@ pub fn build_bundles(source: &FileSource, diff_text: &str) -> Result<BundleSet> 
                 });
             }
 
-            let pf_facts = facts::build_param_flow_facts(&fn_lines, &params, &default_params, &callees);
+            // Name-keyed lookup view over the ordered callee pairs — the
+            // fact builder only ever looks up by name; ordering lives in
+            // the Vec above.
+            let callee_index: std::collections::HashMap<String, &facts::FnRecord> =
+                callees.iter().map(|(n, d)| (n.clone(), *d)).collect();
+            let pf_facts =
+                facts::build_param_flow_facts(&fn_lines, &params, &default_params, &callee_index);
 
             let mut fn_old_block: Option<&Vec<String>> = None;
             for h in hunks {
@@ -409,7 +414,16 @@ pub fn build_bundles(source: &FileSource, diff_text: &str) -> Result<BundleSet> 
             let sib_facts = facts::build_siblings_facts(&siblings);
 
             let own_file_content = lines.join("\n");
-            let manifest = build_manifest(source, &code_refs, &repo_index, &own_file_content)?;
+            let mut manifest = build_manifest(source, &code_refs, &repo_index, &own_file_content)?;
+            // A GithubApi source that hit the MAX_API_FILES hard cap has
+            // an INCOMPLETE repo index — every bundle built against it
+            // carries the truncation on the artifact itself, not just in
+            // the stderr log (an unresolvable symbol might have resolved
+            // in one of the unscanned files).
+            let unscanned = source.unscanned_file_count();
+            if unscanned > 0 {
+                manifest.push(format!("file budget exceeded: {unscanned} files not scanned"));
+            }
             let mut truncated = false;
             for r in &code_refs {
                 if truncated_extent(source, r)?.is_some() {
