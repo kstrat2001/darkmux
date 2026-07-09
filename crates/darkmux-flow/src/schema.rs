@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.16.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.17.0";
 // Version history:
 //   1.2.0 — added optional `model` (#106)
 //   1.3.0 — added optional `reasoning` + `mission_id`; new Stage::TierDecision (#136)
@@ -108,6 +108,20 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.16.0";
 //           not just its size. Results stay size-only (large + re-derivable).
 //           Additive payload field; older readers ignore `args`; new records
 //           only, so prior AuditFileSink chains survive without rotation.
+//   1.17.0 — new action values for the review-funnel driver's run
+//           observability (#1247 Part 1, `darkmux_lab::lab::funnel`):
+//           `funnel.task` (one run's started/finished bookends), `funnel.step`
+//           (a step transition — bundle/probe/probe:<seat>/dedup/judge-pass1/
+//           judge-pass2 — payload shape `{step_id, kind, items_in, items_out,
+//           status, wall_ms}` per #1230's named substrate), and `funnel.ruling`
+//           (the per-judge-ruling live ticker). No struct/field change — same
+//           `payload` blob every other richer action already uses. Additive:
+//           older readers ignore the unknown actions. Emitted through TWO
+//           sinks depending on caller (lab-vs-fleet scope boundary): `darkmux
+//           pr-review run` writes to the real flow stream via this crate;
+//           `darkmux lab review-bench --funnel` writes to a per-run-local
+//           `funnel-events.jsonl` file instead, never this stream — so
+//           existing AuditFileSink chains are unaffected either way.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
