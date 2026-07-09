@@ -343,6 +343,7 @@ mod tests {
                             bundle_selector: Some(BundleSelector {
                                 fact_families: vec!["auth".to_string()],
                                 max_bundles: Some(2),
+                                ..Default::default()
                             }),
                             ..Default::default()
                         }],
