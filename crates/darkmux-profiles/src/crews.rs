@@ -517,4 +517,129 @@ mod tests {
             "error explains the mismatch: {msg}"
         );
     }
+
+    // ── coverage additions (#1222 Phase B — packet-1 gap sweep) ────
+
+    /// A staffing whose `profile` ref resolves fine but whose `models[]` is
+    /// completely EMPTY (not just a dangling `default_model`, which
+    /// `resolve_crew_dangling_default_model_errors_no_panic` already
+    /// covers) hits the *other* `None` arm of `default_model_id()` — no
+    /// `default_model` set AND no first model to fall back to. Normally
+    /// unreachable via `load_registry` (`validate_profile` rejects empty
+    /// `models[]` first), but `resolve_crew` is called directly here the
+    /// same way that sibling test does, so this defensive branch needs its
+    /// own coverage too.
+    #[test]
+    fn resolve_crew_empty_models_profile_rejected() {
+        let reg = registry(
+            vec![(
+                "empty-profile",
+                Profile {
+                    models: vec![],
+                    ..Default::default()
+                },
+            )],
+            vec![(
+                "c",
+                Crew {
+                    seats: seats(vec![("review-probe", vec![staffing("empty-profile")])]),
+                    ..Default::default()
+                },
+            )],
+        );
+        let err = resolve_crew(&reg, "c").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no default model"), "got: {msg}");
+        assert!(msg.contains("empty models"), "got: {msg}");
+    }
+
+    /// `k`'s lower boundary, explicit: `k == 1` is the smallest ACCEPTED
+    /// value (mirrors `resolve_crew_k_zero_rejected`'s rejected boundary at
+    /// `k == 0`, one below).
+    #[test]
+    fn resolve_crew_k_one_accepted() {
+        let reg = registry(
+            vec![("fast", profile(vec![model("a", 1000)]))],
+            vec![(
+                "c",
+                Crew {
+                    seats: seats(vec![(
+                        "review-probe",
+                        vec![SeatStaffing {
+                            profile: "fast".to_string(),
+                            k: 1,
+                            ..Default::default()
+                        }],
+                    )]),
+                    ..Default::default()
+                },
+            )],
+        );
+        let resolved = resolve_crew(&reg, "c").unwrap();
+        assert_eq!(resolved.seats.get("review-probe").unwrap()[0].k, 1);
+    }
+
+    /// `max_tokens` has no validation in `resolve_staffing` — only `k` is
+    /// checked. Both extremes (0 and `u32::MAX`) pass straight through to
+    /// the resolved staffing unchanged.
+    #[test]
+    fn resolve_crew_max_tokens_extremes_pass_through_unvalidated() {
+        let reg = registry(
+            vec![("fast", profile(vec![model("a", 1000)]))],
+            vec![(
+                "c",
+                Crew {
+                    seats: seats(vec![(
+                        "s1",
+                        vec![
+                            SeatStaffing {
+                                profile: "fast".to_string(),
+                                k: 1,
+                                max_tokens: Some(0),
+                                ..Default::default()
+                            },
+                            SeatStaffing {
+                                profile: "fast".to_string(),
+                                k: 1,
+                                max_tokens: Some(u32::MAX),
+                                ..Default::default()
+                            },
+                        ],
+                    )]),
+                    ..Default::default()
+                },
+            )],
+        );
+        let resolved = resolve_crew(&reg, "c").unwrap();
+        let staffs = resolved.seats.get("s1").unwrap();
+        assert_eq!(staffs[0].max_tokens, Some(0));
+        assert_eq!(staffs[1].max_tokens, Some(u32::MAX));
+    }
+
+    /// Crew names and seat ids aren't restricted to ASCII — a name with
+    /// non-Latin script + emoji resolves and error-messages the same as any
+    /// other string.
+    #[test]
+    fn resolve_crew_unicode_crew_and_seat_names() {
+        let reg = registry(
+            vec![("fast", profile(vec![model("a", 1000)]))],
+            vec![(
+                "レビュー-深い",
+                Crew {
+                    seats: seats(vec![("審査-probe 🔎", vec![staffing("fast")])]),
+                    ..Default::default()
+                },
+            )],
+        );
+        let resolved = resolve_crew(&reg, "レビュー-深い").unwrap();
+        assert_eq!(resolved.name, "レビュー-深い");
+        assert!(resolved.seats.contains_key("審査-probe 🔎"));
+
+        // Missing-crew error names the unicode crew id verbatim, same as
+        // `resolve_crew_missing_crew_names_available` does for ASCII names.
+        let err = resolve_crew(&reg, "ghost-名前").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("ghost-名前"));
+        assert!(msg.contains("レビュー-深い"), "lists the available crew: {msg}");
+    }
 }
