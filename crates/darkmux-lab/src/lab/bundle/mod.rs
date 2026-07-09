@@ -573,4 +573,160 @@ mod tests {
             "expected a truncation marker in slice_code output:\n{code_text}"
         );
     }
+
+    #[test]
+    fn build_bundles_on_empty_diff_returns_empty_bundle_set() {
+        let dir = TempDir::new().unwrap();
+        let source = FileSource::worktree(dir.path());
+        let set = build_bundles(&source, "").unwrap();
+        assert!(set.bundles.is_empty(), "an empty diff must yield an empty (not error, not null) bundle set");
+    }
+
+    #[test]
+    fn build_bundles_ignores_non_ts_file_changes() {
+        // A diff touching only a non-`.ts`/`.tsx` file (`scan::ts_file`
+        // filters it) must produce zero bundles — the file is skipped
+        // entirely, not treated as an unreadable/errored input.
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "src/config.json", "{\"a\": 1}\n");
+        let diff = "+++ b/src/config.json\n\
+@@ -1,1 +1,1 @@\n\
++{\"a\": 2}\n";
+        let source = FileSource::worktree(dir.path());
+        let set = build_bundles(&source, diff).unwrap();
+        assert!(set.bundles.is_empty(), "a non-TS-file-only diff must yield zero bundles, got: {:?}", set.bundles);
+    }
+
+    #[test]
+    fn build_bundles_skips_wholly_removed_function_no_context() {
+        // A hunk with ONLY removed lines and no surviving context/added
+        // line carries no `new_lines` at all —
+        // `changed_new_lines.is_empty()` short-circuits the whole file —
+        // so a function deleted in its entirety (pre-image only, no
+        // post-image counterpart anywhere in the hunk) never produces a
+        // bundle for itself OR for anything else in the file.
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "src/legacy.ts", "function foo(a) {\n  return a;\n}\n");
+        let diff = "+++ b/src/legacy.ts\n\
+@@ -4,4 +3,0 @@\n\
+-\n\
+-function bar(b) {\n\
+-  return b;\n\
+-}\n";
+        let source = FileSource::worktree(dir.path());
+        let set = build_bundles(&source, diff).unwrap();
+        assert!(
+            set.bundles.is_empty(),
+            "a hunk with only removed lines (no context/added line) must yield zero bundles, got: {:?}",
+            set.bundles
+        );
+    }
+
+    #[test]
+    fn differential_family_absent_for_brand_new_file() {
+        // A whole new file (`@@ -0,0 +1,N @@`, every line added) has no
+        // pre-image at all — `Hunk::old_block` stays empty for it, and
+        // `build_differential_facts` short-circuits on an empty
+        // `fn_old_block` — so a brand-new file must never emit a
+        // "differential" family bundle, even though it can (and here
+        // does) emit a "param-flow" bundle for the same function.
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "src/newfile.ts", "function greet(name) {\n  return name;\n}\n");
+        let diff = "+++ b/src/newfile.ts\n\
+@@ -0,0 +1,3 @@\n\
++function greet(name) {\n\
++  return name;\n\
++}\n";
+        let source = FileSource::worktree(dir.path());
+        let set = build_bundles(&source, diff).unwrap();
+        assert!(!set.bundles.is_empty(), "expected at least one bundle for the new function");
+        assert!(
+            !set.bundles.iter().any(|b| b.fact_family == "differential"),
+            "a brand-new file (no pre-image) must never produce a differential-family bundle, got: {:?}",
+            set.bundles
+        );
+    }
+
+    #[test]
+    fn manifest_empty_when_every_symbol_resolves() {
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "src/order.ts",
+            "import { computeTotal } from './pricing';\n\
+             \n\
+             function placeOrder(items) {\n\
+             \u{20}\u{20}const total = computeTotal(items);\n\
+             \u{20}\u{20}return total;\n\
+             }\n",
+        );
+        write(
+            dir.path(),
+            "src/pricing.ts",
+            "export function computeTotal(items) {\n  return items.length;\n}\n",
+        );
+        let diff = "+++ b/src/order.ts\n\
+@@ -0,0 +1,6 @@\n\
++import { computeTotal } from './pricing';\n\
++\n\
++function placeOrder(items) {\n\
++  const total = computeTotal(items);\n\
++  return total;\n\
++}\n";
+        let source = FileSource::worktree(dir.path());
+        let set = build_bundles(&source, diff).unwrap();
+        assert!(!set.bundles.is_empty(), "expected at least one bundle for placeOrder");
+        for b in &set.bundles {
+            assert!(
+                b.manifest.is_empty(),
+                "expected an empty manifest when every referenced symbol resolves, got: {:?}",
+                b.manifest
+            );
+        }
+        // `#[serde(default, skip_serializing_if = "Vec::is_empty")]` on
+        // `Bundle::manifest` — an empty manifest must not even appear as
+        // a literal `"manifest": []` key in the serialized JSON.
+        let json = serde_json::to_string(&set).unwrap();
+        assert!(
+            !json.contains("\"manifest\""),
+            "an empty manifest field must be omitted from serialized JSON entirely, got: {json}"
+        );
+    }
+
+    #[test]
+    fn slice_code_full_file_and_out_of_bounds_end_are_characterized() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "src/tiny.ts", "function foo(a) {\n  return a;\n}\n");
+        let source = FileSource::worktree(dir.path());
+
+        // Ref A: start=1, end=3 — the FULL file, exactly matching the
+        // function's real extent. No truncation marker expected.
+        let full_ref = BundleRef { path: "src/tiny.ts".to_string(), start: 1, end: 3 };
+        let full_text = slice_code(&source, std::slice::from_ref(&full_ref)).unwrap();
+        assert!(full_text.contains("function foo(a) {"));
+        assert!(full_text.contains("(lines 1-3)"));
+        assert!(!full_text.contains("excerpt truncated"));
+
+        // Ref B: end=100, far beyond the file's 3 lines. `slice_code`
+        // must clamp the SLICE it actually renders (`end_idx =
+        // r.end.min(lines.len())`, no panic on an out-of-bounds index),
+        // but the `// <path> (lines a-b)` HEADER line it prints is not
+        // clamped — it echoes the ref's own out-of-range numbers
+        // verbatim. Characterized as current behavior (documentation of
+        // the requested span vs. the actually-available content), not
+        // asserted as a defect.
+        let oob_ref = BundleRef { path: "src/tiny.ts".to_string(), start: 1, end: 100 };
+        let oob_text = slice_code(&source, std::slice::from_ref(&oob_ref)).unwrap();
+        assert!(
+            oob_text.contains("(lines 1-100)"),
+            "header echoes the ref's own out-of-range end verbatim, got: {oob_text}"
+        );
+        assert!(!oob_text.contains("excerpt truncated"));
+        let rendered_source_lines =
+            oob_text.lines().filter(|l| !l.starts_with("//") && !l.trim().is_empty()).count();
+        assert_eq!(
+            rendered_source_lines, 3,
+            "only the file's 3 real lines may render despite end=100 (no fabricated/panicking OOB read), got:\n{oob_text}"
+        );
+    }
 }

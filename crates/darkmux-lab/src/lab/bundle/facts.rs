@@ -588,6 +588,20 @@ mod tests {
     }
 
     #[test]
+    fn zero_params_zero_calls_produces_no_facts() {
+        // A changed function with an empty param list and a body that
+        // makes no calls at all (no branches, no callees, no defaults)
+        // must produce an EMPTY fact list — not a spurious "0 references"
+        // line (there are no params to count references for) and not a
+        // panic on the empty ranked-calls path in `call_facts_for`.
+        let fn_lines: Vec<String> =
+            vec!["function noop() {".to_string(), "  // does nothing".to_string(), "}".to_string()];
+        let callee_index: HashMap<String, &FnRecord> = HashMap::new();
+        let facts = build_param_flow_facts(&fn_lines, &[], &[], &callee_index);
+        assert!(facts.is_empty(), "expected no facts for a zero-param, zero-call function, got: {facts:?}");
+    }
+
+    #[test]
     fn resolve_callees_preserves_first_call_appearance_order() {
         // The reference's dict insertion order = first appearance in the
         // body text; the ported Vec must match (zebra called first even
