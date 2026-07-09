@@ -988,7 +988,17 @@ pub fn parse_judge_ruling(text: &str) -> Option<(FunnelRuling, String, String)> 
 pub struct BundleInput {
     pub id: String,
     pub fact_family: String,
+    /// The JUDGE seat's code rendering — `bundle::slice_code`'s
+    /// `// path (lines a-b)` raw-text format, matching `judge-runner.py`'s
+    /// own `slice_code` (#1256).
     pub code: String,
+    /// The PROBE seat's code rendering — `bundle::slice_code_probe`'s
+    /// ``### `path` (lines a-b)`` + ```` ```typescript ````-fenced blocks,
+    /// matching `probe-runner.py`'s `read_code_excerpt` (#1256 correction
+    /// round). Phase A formatted the two seats' code DIFFERENTLY; per-seat
+    /// parity means carrying both renderings, not unifying them.
+    /// [`probe_user_message`] reads this; [`judge_prompt`] reads `code`.
+    pub probe_code: String,
     pub facts: Vec<String>,
     /// Symbols referenced but not defined in `code` — a Rust-only addition
     /// Phase A never had (`bundler.py`'s bundles carry no such field). Per
@@ -1021,10 +1031,15 @@ fn bundles_from_diff(diff: &str) -> Vec<BundleInput> {
     let flush = |path: &mut Option<String>, lines: &mut Vec<&str>, out: &mut Vec<BundleInput>| {
         if let Some(p) = path.take() {
             if !lines.is_empty() {
+                let code = lines.join("\n");
                 out.push(BundleInput {
                     id: p,
                     fact_family: "unscoped".to_string(),
-                    code: lines.join("\n"),
+                    // Test-only fallback (no repo tree to re-slice from):
+                    // both seats see the same hunk text. Production callers
+                    // always render `probe_code` via `slice_code_probe`.
+                    probe_code: code.clone(),
+                    code,
                     facts: Vec::new(),
                     manifest: Vec::new(),
                 });
@@ -1152,19 +1167,19 @@ fn fingerprint(judge_identifier: &str, judge_system: &str) -> serde_json::Value 
 /// `build_prompt`, given the same inputs (#1256): `prior` (the seat's
 /// review-probe.md text, standing in for Python's hardcoded `STRONG_PRIOR`
 /// — see the golden test's provenance comment for how the two relate)
-/// first, a blank line, `Code:`, a blank line, the code (no wrapping fence
-/// — `bundle.code` already carries its own `// path (lines a-b)` headers
-/// per-ref, the shared format `judge_prompt` also consumes; Python's own
-/// `read_code_excerpt` per-block ```` ```typescript ```` fencing has no
-/// Rust equivalent and is not being ported, per #1256 point 2), then IF
-/// facts: a blank line, the fact-sheet header, a blank line, `- fact`
+/// first, a blank line, `Code:`, a blank line, the code section
+/// (`bundle.probe_code` — `read_code_excerpt`-format blocks:
+/// ``### `path` (lines a-b)`` + ```` ```typescript ```` fences, joined by
+/// blank lines, rendered by `bundle::slice_code_probe`; the PROBE format,
+/// distinct from the judge's `// path` raw format in `bundle.code`), then
+/// IF facts: a blank line, the fact-sheet header, a blank line, `- fact`
 /// lines. Deliberately NO intent anywhere in this prompt — Phase A's
 /// `build_prompt` never saw one; `FunnelInputs::intent_title`/
 /// `intent_body` are dropped here on purpose (kept for [`judge_prompt`]
 /// only), not silently threaded through.
 fn probe_user_message(prior: &str, bundle: &BundleInput) -> String {
     let mut parts: Vec<String> =
-        vec![prior.to_string(), String::new(), "Code:".to_string(), String::new(), bundle.code.clone()];
+        vec![prior.to_string(), String::new(), "Code:".to_string(), String::new(), bundle.probe_code.clone()];
     if !bundle.facts.is_empty() {
         parts.push(String::new());
         parts.push("Computed facts about this code (mechanically extracted, not interpreted):".to_string());
@@ -2168,8 +2183,8 @@ mod tests {
     #[test]
     fn selector_filters_by_fact_family() {
         let bundles = vec![
-            BundleInput { id: "a".into(), fact_family: "auth".into(), code: String::new(), facts: vec![], manifest: vec![] },
-            BundleInput { id: "b".into(), fact_family: "billing".into(), code: String::new(), facts: vec![], manifest: vec![] },
+            BundleInput { id: "a".into(), fact_family: "auth".into(), code: String::new(), probe_code: String::new(), facts: vec![], manifest: vec![] },
+            BundleInput { id: "b".into(), fact_family: "billing".into(), code: String::new(), probe_code: String::new(), facts: vec![], manifest: vec![] },
         ];
         let sel =
             BundleSelector { fact_families: vec!["auth".to_string()], ..Default::default() };
@@ -2181,8 +2196,8 @@ mod tests {
     #[test]
     fn selector_no_selector_runs_every_bundle() {
         let bundles = vec![
-            BundleInput { id: "a".into(), fact_family: "auth".into(), code: String::new(), facts: vec![], manifest: vec![] },
-            BundleInput { id: "b".into(), fact_family: "billing".into(), code: String::new(), facts: vec![], manifest: vec![] },
+            BundleInput { id: "a".into(), fact_family: "auth".into(), code: String::new(), probe_code: String::new(), facts: vec![], manifest: vec![] },
+            BundleInput { id: "b".into(), fact_family: "billing".into(), code: String::new(), probe_code: String::new(), facts: vec![], manifest: vec![] },
         ];
         assert_eq!(select_bundles_for_staffing(&bundles, None).len(), 2);
     }
@@ -2190,9 +2205,9 @@ mod tests {
     #[test]
     fn selector_prioritizes_param_flow_and_respects_max_bundles() {
         let bundles = vec![
-            BundleInput { id: "a".into(), fact_family: "other".into(), code: String::new(), facts: vec![], manifest: vec![] },
-            BundleInput { id: "b".into(), fact_family: "param-flow".into(), code: String::new(), facts: vec![], manifest: vec![] },
-            BundleInput { id: "c".into(), fact_family: "other".into(), code: String::new(), facts: vec![], manifest: vec![] },
+            BundleInput { id: "a".into(), fact_family: "other".into(), code: String::new(), probe_code: String::new(), facts: vec![], manifest: vec![] },
+            BundleInput { id: "b".into(), fact_family: "param-flow".into(), code: String::new(), probe_code: String::new(), facts: vec![], manifest: vec![] },
+            BundleInput { id: "c".into(), fact_family: "other".into(), code: String::new(), probe_code: String::new(), facts: vec![], manifest: vec![] },
         ];
         let sel = BundleSelector { max_bundles: Some(2), ..Default::default() };
         let selected = select_bundles_for_staffing(&bundles, Some(&sel));
@@ -2968,14 +2983,15 @@ mod tests {
     // Provenance: every golden constant below was captured by RUNNING the
     // Phase A python reference (NOT hand-transcribed) against a synthetic,
     // non-corpus fixture during development of this PR:
-    //   - probe-runner.py's own `build_prompt()` (its outer STRONG_PRIOR/
-    //     Code:/facts assembly, unmodified) — `read_code_excerpt` was
-    //     monkeypatched to return a `// path (lines a-b)` raw-text block
-    //     (the shared format `bundle::slice_code` already produces for
-    //     BOTH probe and judge in production; see `probe_user_message`'s
-    //     doc comment for why probe-runner's OWN separate fenced-###
-    //     excerpt format is not being ported, per #1256 point 2).
-    //   - judge-runner.py's real `slice_code()` against a synthetic
+    //   - probe-runner.py's own `build_prompt()` + `read_code_excerpt()`,
+    //     both real and unmodified, over a synthetic worktree containing
+    //     the two-function `src/example.ts` fixture — so the probe goldens
+    //     carry Phase A's OWN probe code format (``### `path` (lines
+    //     a-b)`` + a ```` ```typescript ```` fence per block), which
+    //     `bundle::slice_code_probe` ports and `BundleInput::probe_code`
+    //     carries (per-seat formats — the judge's `// path` raw format
+    //     lives in `BundleInput::code`).
+    //   - judge-runner.py's real `slice_code()` against the same synthetic
     //     worktree, then `judge_one`'s exact `user` f-string template
     //     (copy-pasted verbatim, not paraphrased) fed with synthetic
     //     probe/bundle/label dicts — `judge_one` itself fires a live
@@ -2985,18 +3001,26 @@ mod tests {
     // maintainer's machine) — this comment plus the fixture text below is
     // the durable record of how each golden was produced.
 
-    /// The fixture code slice — matches what `bundle::slice_code` (#1249's
-    /// shared bundler) emits for a single-ref bundle: one `// path (lines
-    /// a-b)` header, raw source lines, no fence. Synthetic, non-corpus.
+    /// The JUDGE-format fixture code slice — what `bundle::slice_code`
+    /// emits for a single-ref bundle (`// path (lines a-b)` header, raw
+    /// source lines, no fence), matching judge-runner.py's own
+    /// `slice_code`. Synthetic, non-corpus.
     const GOLDEN_CODE: &str = "// src/example.ts (lines 1-4)\nexport function clampRetryDelay(attempt: number, base: number): number {\n  const delay = base * Math.pow(2, attempt);\n  return Math.min(delay, 30000);\n}";
+
+    /// The PROBE-format fixture code slice — `read_code_excerpt`'s output
+    /// for the same ref, captured verbatim from running the python
+    /// reference (``### `path` (lines a-b)`` + ```` ```typescript ````
+    /// fence); what `bundle::slice_code_probe` emits into
+    /// `BundleInput::probe_code`.
+    const GOLDEN_PROBE_CODE: &str = "### `src/example.ts` (lines 1-4)\n```typescript\nexport function clampRetryDelay(attempt: number, base: number): number {\n  const delay = base * Math.pow(2, attempt);\n  return Math.min(delay, 30000);\n}\n```";
 
     /// `probe-runner.py`'s hardcoded `STRONG_PRIOR` constant, copied
     /// verbatim — used ONLY as this golden test's `prior` argument, to
     /// prove `probe_user_message`'s ASSEMBLY is byte-identical to
     /// `build_prompt`'s. Production wiring passes `review-probe.md`'s text
     /// instead (close in spirit, not necessarily byte-identical wording —
-    /// a persona-CONTENT question, not an assembly one, and out of this
-    /// issue's scope).
+    /// a persona-CONTENT question handled at the measurement layer, out of
+    /// this issue's scope).
     const GOLDEN_STRONG_PRIOR: &str = "A thorough code review established that this code contains at least one real defect. Identify the most serious defect in the code below. Name the mechanism precisely, quote the exact line(s) responsible using backticks, and give a concrete example scenario: a specific input and what the code actually does versus what it should do.";
 
     fn golden_bundle(facts: Vec<String>) -> BundleInput {
@@ -3004,6 +3028,7 @@ mod tests {
             id: "src/example.ts".to_string(),
             fact_family: "unscoped".to_string(),
             code: GOLDEN_CODE.to_string(),
+            probe_code: GOLDEN_PROBE_CODE.to_string(),
             facts,
             manifest: vec![],
         }
@@ -3011,14 +3036,18 @@ mod tests {
 
     #[test]
     fn probe_prompt_matches_phase_a_golden_bare() {
-        let golden = "A thorough code review established that this code contains at least one real defect. Identify the most serious defect in the code below. Name the mechanism precisely, quote the exact line(s) responsible using backticks, and give a concrete example scenario: a specific input and what the code actually does versus what it should do.\n\nCode:\n\n// src/example.ts (lines 1-4)\nexport function clampRetryDelay(attempt: number, base: number): number {\n  const delay = base * Math.pow(2, attempt);\n  return Math.min(delay, 30000);\n}";
+        // Captured from probe-runner.py's real build_prompt(worktree,
+        // [{path: "src/example.ts", start: 1, end: 4}], []) — including
+        // read_code_excerpt's own fenced block format.
+        let golden = "A thorough code review established that this code contains at least one real defect. Identify the most serious defect in the code below. Name the mechanism precisely, quote the exact line(s) responsible using backticks, and give a concrete example scenario: a specific input and what the code actually does versus what it should do.\n\nCode:\n\n### `src/example.ts` (lines 1-4)\n```typescript\nexport function clampRetryDelay(attempt: number, base: number): number {\n  const delay = base * Math.pow(2, attempt);\n  return Math.min(delay, 30000);\n}\n```";
         let bundle = golden_bundle(vec![]);
         assert_eq!(probe_user_message(GOLDEN_STRONG_PRIOR, &bundle), golden);
     }
 
     #[test]
     fn probe_prompt_matches_phase_a_golden_with_facts() {
-        let golden = "A thorough code review established that this code contains at least one real defect. Identify the most serious defect in the code below. Name the mechanism precisely, quote the exact line(s) responsible using backticks, and give a concrete example scenario: a specific input and what the code actually does versus what it should do.\n\nCode:\n\n// src/example.ts (lines 1-4)\nexport function clampRetryDelay(attempt: number, base: number): number {\n  const delay = base * Math.pow(2, attempt);\n  return Math.min(delay, 30000);\n}\n\nComputed facts about this code (mechanically extracted, not interpreted):\n\n- `attempt` is caller-controlled and unbounded\n- `base` defaults to 1000 in all call sites";
+        // Same build_prompt run with the two facts supplied.
+        let golden = "A thorough code review established that this code contains at least one real defect. Identify the most serious defect in the code below. Name the mechanism precisely, quote the exact line(s) responsible using backticks, and give a concrete example scenario: a specific input and what the code actually does versus what it should do.\n\nCode:\n\n### `src/example.ts` (lines 1-4)\n```typescript\nexport function clampRetryDelay(attempt: number, base: number): number {\n  const delay = base * Math.pow(2, attempt);\n  return Math.min(delay, 30000);\n}\n```\n\nComputed facts about this code (mechanically extracted, not interpreted):\n\n- `attempt` is caller-controlled and unbounded\n- `base` defaults to 1000 in all call sites";
         let bundle = golden_bundle(vec![
             "`attempt` is caller-controlled and unbounded".to_string(),
             "`base` defaults to 1000 in all call sites".to_string(),
@@ -3319,8 +3348,8 @@ mod tests {
     #[test]
     fn selector_max_bundles_zero_selects_nothing() {
         let bundles = vec![
-            BundleInput { id: "a".into(), fact_family: "other".into(), code: String::new(), facts: vec![], manifest: vec![] },
-            BundleInput { id: "b".into(), fact_family: "param-flow".into(), code: String::new(), facts: vec![], manifest: vec![] },
+            BundleInput { id: "a".into(), fact_family: "other".into(), code: String::new(), probe_code: String::new(), facts: vec![], manifest: vec![] },
+            BundleInput { id: "b".into(), fact_family: "param-flow".into(), code: String::new(), probe_code: String::new(), facts: vec![], manifest: vec![] },
         ];
         let sel = BundleSelector { fact_families: vec![], max_bundles: Some(0), ..Default::default() };
         let selected = select_bundles_for_staffing(&bundles, Some(&sel));
@@ -3333,8 +3362,8 @@ mod tests {
     #[test]
     fn selector_fact_families_naming_unknown_family_selects_nothing() {
         let bundles = vec![
-            BundleInput { id: "a".into(), fact_family: "auth".into(), code: String::new(), facts: vec![], manifest: vec![] },
-            BundleInput { id: "b".into(), fact_family: "billing".into(), code: String::new(), facts: vec![], manifest: vec![] },
+            BundleInput { id: "a".into(), fact_family: "auth".into(), code: String::new(), probe_code: String::new(), facts: vec![], manifest: vec![] },
+            BundleInput { id: "b".into(), fact_family: "billing".into(), code: String::new(), probe_code: String::new(), facts: vec![], manifest: vec![] },
         ];
         let sel = BundleSelector {
             fact_families: vec!["nonexistent-family".to_string()],
@@ -3617,6 +3646,7 @@ mod tests {
             id: "billing.ts".to_string(),
             fact_family: "unscoped".to_string(),
             code: "const end = start.plus(30)".to_string(),
+            probe_code: "const end = start.plus(30)".to_string(),
             facts: vec![],
             manifest: vec!["helperFn".to_string()],
         }];

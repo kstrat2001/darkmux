@@ -919,7 +919,11 @@ fn run_funnel_case(
             Ok(funnel::BundleInput {
                 id: b.id.clone(),
                 fact_family: b.fact_family.clone(),
+                // Per-seat code formats (#1256): the judge reads
+                // slice_code's `// path` raw format; the probe reads
+                // slice_code_probe's Phase A fenced format.
                 code: bundle::slice_code(&source, &b.code)?,
+                probe_code: bundle::slice_code_probe(&source, &b.code)?,
                 facts: b.facts.clone(),
                 manifest: b.manifest.clone(),
             })

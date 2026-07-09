@@ -34,7 +34,9 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use darkmux_crew::single_shot::{single_shot_chat, SingleShotReply, SingleShotRequest};
-use darkmux_lab::lab::bundle::{build_bundles, external_bundles, slice_code, BundleSet, FileSource};
+use darkmux_lab::lab::bundle::{
+    build_bundles, external_bundles, slice_code, slice_code_probe, BundleSet, FileSource,
+};
 use darkmux_lab::lab::funnel::{
     run_funnel, run_judge_only, BundleInput, ChatCall, ExecMode, FunnelEmitter, FunnelEnvelope,
     FunnelInputs, JudgeRecord, LmsCycler, ProbeFlag, Tier,
@@ -781,19 +783,24 @@ fn parse_exec_mode(mode: &str) -> Result<ExecMode> {
 
 /// `Bundle` (packet 3's `darkmux_lab::lab::bundle`) -> `BundleInput`
 /// (packet 4's `darkmux_lab::lab::funnel` shape) — the reconciliation the
-/// funnel module's own doc names as this packet's job. `slice_code` turns
-/// each bundle's line-span pointers into the actual code text the probe/
-/// judge prompts embed.
+/// funnel module's own doc names as this packet's job. Each bundle's
+/// line-span pointers are rendered PER SEAT (#1256): `slice_code` (the
+/// judge's `// path` raw format) into `code`, `slice_code_probe` (the
+/// probe's Phase A ``### `path`` + ```` ```typescript ```` fenced format)
+/// into `probe_code`.
 fn bundle_inputs_from_set(set: &BundleSet, source: &FileSource) -> Result<Vec<BundleInput>> {
     set.bundles
         .iter()
         .map(|b| {
             let code = slice_code(source, &b.code)
                 .with_context(|| format!("slicing code for bundle \"{}\"", b.id))?;
+            let probe_code = slice_code_probe(source, &b.code)
+                .with_context(|| format!("probe-slicing code for bundle \"{}\"", b.id))?;
             Ok(BundleInput {
                 id: b.id.clone(),
                 fact_family: b.fact_family.clone(),
                 code,
+                probe_code,
                 facts: b.facts.clone(),
                 manifest: b.manifest.clone(),
             })
