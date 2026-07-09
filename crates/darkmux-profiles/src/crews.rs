@@ -483,4 +483,38 @@ mod tests {
         assert!(msg.contains("remote endpoint"));
         assert!(msg.contains("local-only"));
     }
+
+    #[test]
+    fn resolve_crew_dangling_default_model_errors_no_panic() {
+        // Panic-safety for the defensive branch in `resolve_model`: a
+        // hand-built registry (bypassing `validate_profile`, which catches
+        // this at load time) whose profile's `default_model` names a model
+        // NOT in its `models[]`. `resolve_crew` must return a named error —
+        // never panic — since nothing guarantees every registry it sees
+        // came through `load_registry`.
+        let reg = registry(
+            vec![(
+                "broken",
+                Profile {
+                    models: vec![model("real", 1000)],
+                    default_model: Some("ghost-default".to_string()),
+                    ..Default::default()
+                },
+            )],
+            vec![(
+                "c",
+                Crew {
+                    seats: seats(vec![("review-probe", vec![staffing("broken")])]),
+                    ..Default::default()
+                },
+            )],
+        );
+        let err = resolve_crew(&reg, "c").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("ghost-default"), "error names the dangling id: {msg}");
+        assert!(
+            msg.contains("not one of its models"),
+            "error explains the mismatch: {msg}"
+        );
+    }
 }

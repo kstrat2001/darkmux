@@ -469,6 +469,12 @@ impl Profile {
 /// [`ProfileRegistry`] predates it as free-text, operator-set text; no
 /// prior value was ever asserted in code, so this constant's baseline is
 /// where the discipline starts, not a bump off a previously-enforced "1.0").
+///
+/// Stamped into the registry `darkmux init` writes (via the embedded
+/// `profiles.example.json`, drift-guarded by an init test) per the
+/// visible-defaults philosophy. Loading stays **lenient**: an absent or
+/// older `schema_version` never gates a read — loud validation belongs to
+/// `darkmux doctor`, not the hot load path.
 // 1.1 (#1222 Phase B packet 1): additive top-level `crews{}` section (saved
 // crew assignments — seat staffing). Minor bump — an older binary tolerates
 // it (all-Option + `extras` overflow on `ProfileRegistry`), per the
@@ -1281,7 +1287,7 @@ mod crew_tests {
     //! refs resolve, k >= 1, remote-endpoint rejection) live in
     //! `darkmux-profiles::crews` — this module gates serde shape only:
     //! round-trips, `k` defaulting, extras tolerance, and the
-    //! byte-identical old-shape (no `crews` key) invariant.
+    //! value-identical old-shape (no `crews` key) invariant.
     use super::*;
 
     #[test]
@@ -1350,6 +1356,20 @@ mod crew_tests {
     }
 
     #[test]
+    fn crew_unknown_keys_land_in_extras() {
+        // Mirrors `seat_staffing_unknown_keys_land_in_extras` one level up:
+        // a Crew-level unknown key survives the round-trip flat (a newer
+        // config read by an older binary).
+        let json = r#"{"seats":{"review-probe":[{"profile":"fast"}]},"future_knob":"x"}"#;
+        let crew: Crew = serde_json::from_str(json).unwrap();
+        assert_eq!(crew.extras.get("future_knob").and_then(|v| v.as_str()), Some("x"));
+        let out: serde_json::Value = serde_json::to_value(&crew).unwrap();
+        let obj = out.as_object().unwrap();
+        assert!(obj.contains_key("future_knob"));
+        assert!(!obj.contains_key("extras"), "extras must flatten, not nest");
+    }
+
+    #[test]
     fn crew_empty_seats_parses_fine_at_schema_layer() {
         // Schema-layer only permits this; `darkmux-profiles::crews::resolve_crew`
         // rejects an empty `seats` map at validation time.
@@ -1392,10 +1412,11 @@ mod crew_tests {
     }
 
     /// The hard-line invariant: an old-shape registry with NO `crews` key
-    /// parses and re-serializes byte-identical (as JSON `Value`) — adding
-    /// the `crews` field must not disturb any pre-existing profiles.json.
+    /// parses and re-serializes structurally identical (compared as
+    /// `serde_json::Value` — key order and whitespace aside) — adding the
+    /// `crews` field must not disturb any pre-existing profiles.json.
     #[test]
-    fn old_shape_registry_without_crews_round_trips_byte_identical() {
+    fn old_shape_registry_without_crews_round_trips_value_identical() {
         // `models: []` (rather than a populated model) sidesteps the
         // pre-existing, unrelated `ProfileModel.capabilities` always-present
         // quirk (`{}` reserializes even when absent on read) — this test's
