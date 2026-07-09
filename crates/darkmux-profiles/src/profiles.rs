@@ -80,6 +80,9 @@ fn validate_registry(reg: &ProfileRegistry, path: &Path) -> Result<()> {
     for (name, profile) in &reg.profiles {
         validate_profile(name, profile, path)?;
     }
+    for name in reg.crews.keys() {
+        validate_crew(reg, name, path)?;
+    }
     Ok(())
 }
 
@@ -106,6 +109,18 @@ fn validate_profile(name: &str, profile: &Profile, path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Validate a `crews[name]` entry at registry-load time by resolving it —
+/// `crate::crews::resolve_crew` is the single place crew validity is
+/// decided (non-empty seats, non-empty staffing lists, real profile refs,
+/// real model ids, `k >= 1`, no remote-endpoint staffing). A failure here
+/// just re-attributes that error to this registry's file path, matching
+/// `validate_profile`'s loud-and-located style.
+fn validate_crew(reg: &ProfileRegistry, name: &str, path: &Path) -> Result<()> {
+    crate::crews::resolve_crew(reg, name)
+        .map(|_| ())
+        .map_err(|e| anyhow!("{}: {}", path.display(), e))
 }
 
 pub fn get_profile<'a>(reg: &'a ProfileRegistry, name: &str) -> Result<&'a Profile> {
@@ -266,6 +281,116 @@ mod tests {
         );
         let err = load_registry(Some(p.to_str().unwrap())).unwrap_err();
         assert!(err.to_string().contains("not one of its models"));
+    }
+
+    // ── crews (#1222 Phase B packet 1) — validate_crew wired into
+    // load_registry's validate_registry pass. Resolution-semantics detail
+    // (default-model fallback, remote-endpoint rejection, etc.) is covered
+    // exhaustively in `crate::crews::tests`; these tests confirm a bad crew
+    // fails registry LOAD, with the file path attached, the same way a bad
+    // profile does. ──────────────────────────────────────────────
+
+    #[test]
+    fn validates_crew_happy_path_loads_fine() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("profiles.json");
+        write(
+            &p,
+            r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":1000}]}},
+                "crews":{"review-deep":{"seats":{
+                    "review-probe":[{"profile":"fast"}],
+                    "review-judge":[{"profile":"fast"}]
+                }}}}"#,
+        );
+        let reg = load_registry(Some(p.to_str().unwrap())).unwrap().registry;
+        assert_eq!(reg.crews.len(), 1);
+        let crew = reg.crews.get("review-deep").unwrap();
+        assert_eq!(crew.seats.len(), 2);
+    }
+
+    #[test]
+    fn validates_crew_missing_profile_ref_fails_load() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("profiles.json");
+        write(
+            &p,
+            r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":1000}]}},
+                "crews":{"bad":{"seats":{"review-probe":[{"profile":"ghost"}]}}}}"#,
+        );
+        let err = load_registry(Some(p.to_str().unwrap())).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains(p.to_str().unwrap()) || msg.contains("profiles.json"));
+        assert!(msg.contains("ghost") || msg.contains("not found"));
+    }
+
+    #[test]
+    fn validates_crew_k_zero_fails_load() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("profiles.json");
+        write(
+            &p,
+            r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":1000}]}},
+                "crews":{"bad":{"seats":{"review-probe":[{"profile":"fast","k":0}]}}}}"#,
+        );
+        let err = load_registry(Some(p.to_str().unwrap())).unwrap_err();
+        assert!(err.to_string().contains("k must be >= 1"));
+    }
+
+    #[test]
+    fn validates_crew_bad_model_id_fails_load() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("profiles.json");
+        write(
+            &p,
+            r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":1000}]}},
+                "crews":{"bad":{"seats":{"review-probe":[
+                    {"profile":"fast","model":"nonexistent"}
+                ]}}}}"#,
+        );
+        let err = load_registry(Some(p.to_str().unwrap())).unwrap_err();
+        assert!(err.to_string().contains("not found in profile"));
+    }
+
+    #[test]
+    fn validates_crew_remote_endpoint_staffing_fails_load() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("profiles.json");
+        write(
+            &p,
+            r#"{"profiles":{"cloud":{"models":[
+                    {"id":"gpt-remote","n_ctx":100000,
+                     "endpoint":{"url":"https://example.azure.com/openai"}}
+                ]}},
+                "crews":{"bad":{"seats":{"review-probe":[{"profile":"cloud"}]}}}}"#,
+        );
+        let err = load_registry(Some(p.to_str().unwrap())).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("remote endpoint"));
+        assert!(msg.contains("local-only"));
+    }
+
+    #[test]
+    fn validates_crew_empty_seats_fails_load() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("profiles.json");
+        write(
+            &p,
+            r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":1000}]}},
+                "crews":{"empty":{"seats":{}}}}"#,
+        );
+        let err = load_registry(Some(p.to_str().unwrap())).unwrap_err();
+        assert!(err.to_string().contains("no seats"));
+    }
+
+    #[test]
+    fn registry_with_no_crews_key_loads_unaffected() {
+        // Old-shape profiles.json (no `crews` key at all) — unaffected by
+        // the new validation pass.
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("profiles.json");
+        write(&p, minimal_json());
+        let reg = load_registry(Some(p.to_str().unwrap())).unwrap().registry;
+        assert!(reg.crews.is_empty());
     }
 
     #[test]

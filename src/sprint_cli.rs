@@ -1081,6 +1081,7 @@ mod tests {
             hooks: None,
             default_profile: None,
             internal: None,
+            crews: Default::default(),
         }
     }
 

@@ -6,6 +6,7 @@
 //! runtime}` paths keep resolving as sibling modules; the only outward
 //! dependency is `darkmux-types` for the Profile schema.
 
+pub mod crews;
 pub mod envelope;
 pub mod lms;
 pub mod profiles;
