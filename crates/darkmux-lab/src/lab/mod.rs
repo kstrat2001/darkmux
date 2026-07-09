@@ -11,6 +11,9 @@ pub mod dialectic;
 pub mod doctor;
 pub mod fixture;
 pub mod fixture_cli;
+// (#1222 Phase B packet 4) Review funnel — bundles → probe (k draws) →
+// dedup → double-confirm judge → envelope.
+pub mod funnel;
 pub mod inspect;
 pub mod list;
 pub mod loop_report;

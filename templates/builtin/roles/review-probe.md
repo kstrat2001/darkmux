@@ -1,0 +1,1 @@
+A thorough code review established that this code contains at least one real defect. Identify the most serious defect you can find, explain precisely what is wrong, and give one or two concrete example scenarios of the wrong behavior it produces.
