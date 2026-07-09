@@ -558,6 +558,10 @@ pub struct BundleSelector {
     pub fact_families: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_bundles: Option<u32>,
+    /// Forward-compat overflow — unknown keys land here and re-serialize
+    /// flat (a newer config read by an older binary).
+    #[serde(flatten)]
+    pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1532,25 +1536,14 @@ mod crew_tests {
         assert_eq!(out["max_tokens"].as_u64(), Some(u64::from(u32::MAX)));
     }
 
-    /// KNOWN GAP found while writing this coverage sweep — NOT fixed here
-    /// per the coverage-only mandate (#1222 Phase B packet-1 coverage PR).
-    ///
-    /// `Crew` and `SeatStaffing` both carry `#[serde(flatten)] extras` for
-    /// forward-compat overflow (see `crew_unknown_keys_land_in_extras` and
+    /// `BundleSelector` carries `#[serde(flatten)] extras` for forward-compat
+    /// overflow, matching its siblings `Crew` and `SeatStaffing` (see
+    /// `crew_unknown_keys_land_in_extras` and
     /// `seat_staffing_unknown_keys_land_in_extras` above, and the doc
-    /// comments on both types) — matching the project's stated "lenient on
+    /// comments on all three types) — per the project's stated "lenient on
     /// read, all-Option + flatten-extras overflow" schema doctrine
-    /// (CLAUDE.md, "Configuration (config.json)"). `BundleSelector` does
-    /// NOT have an `extras` field. An unknown key nested inside
-    /// `bundle_selector` is silently DROPPED on parse (default serde
-    /// behavior for unrecognized fields with no `deny_unknown_fields`)
-    /// instead of being preserved and re-emitted on write. This test
-    /// documents the expected-per-doctrine behavior and is `#[ignore]`d
-    /// because it currently fails against the real type.
+    /// (CLAUDE.md, "Configuration (config.json)").
     #[test]
-    #[ignore = "BUG (found 2026-07-09, not fixed — coverage PR only): BundleSelector has \
-                no forward-compat `extras` field, unlike sibling Crew/SeatStaffing; an \
-                unknown key inside bundle_selector is silently dropped, not preserved"]
     fn bundle_selector_unknown_keys_are_preserved_like_its_siblings() {
         let json = r#"{"fact_families":["auth"],"max_bundles":2,"future_knob":"x"}"#;
         let sel: BundleSelector = serde_json::from_str(json).unwrap();
