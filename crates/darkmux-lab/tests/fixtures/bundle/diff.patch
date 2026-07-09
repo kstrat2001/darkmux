@@ -1,0 +1,17 @@
+diff --git a/src/orders/order.ts b/src/orders/order.ts
+index 0000000..0000000 100644
+--- a/src/orders/order.ts
++++ b/src/orders/order.ts
+@@ -22,3 +22,3 @@
+   }
+-  auditOrder(customerId);
++  logOrder(customerId, total);
+   return total;
+ }
+@@ -26,3 +27,3 @@
+-function auditOrder(customerId: string) {
+-  console.warn('audit', customerId);
+-}
++function logOrder(customerId: string, total: number) {
++  console.log(customerId, total);
++}
