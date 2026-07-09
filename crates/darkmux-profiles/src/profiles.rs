@@ -456,4 +456,129 @@ mod tests {
             locs
         );
     }
+
+    // ── coverage additions (#1222 Phase B — packet-1 gap sweep) ────
+    //
+    // The `--profiles-file` / `DARKMUX_PROFILES` precedence chain itself is
+    // already covered above (`darkmux_config_env_var_*`,
+    // `default_locations_does_not_include_env`) for generic registry
+    // loading; these confirm the SAME precedence + validation wiring holds
+    // when a `crews{}` section is in play — a bad crew loaded via the env
+    // var must fail exactly like a bad crew loaded via `--profiles-file`
+    // does in `validates_crew_missing_profile_ref_fails_load` above.
+
+    #[serial_test::serial]
+    #[test]
+    fn darkmux_profiles_env_var_validates_crews_happy_path() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("env-crews.json");
+        write(
+            &p,
+            r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":1000}]}},
+                "crews":{"review-deep":{"seats":{"review-probe":[{"profile":"fast"}]}}}}"#,
+        );
+        unsafe { env::set_var("DARKMUX_PROFILES", p.to_str().unwrap()) };
+        let result = load_registry(None);
+        unsafe { env::remove_var("DARKMUX_PROFILES") };
+        let reg = result.unwrap().registry;
+        assert_eq!(reg.crews.len(), 1);
+        assert!(reg.crews.contains_key("review-deep"));
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn darkmux_profiles_env_var_crew_validation_failure_fails_load() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("env-bad-crews.json");
+        write(
+            &p,
+            r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":1000}]}},
+                "crews":{"bad":{"seats":{"review-probe":[{"profile":"ghost"}]}}}}"#,
+        );
+        unsafe { env::set_var("DARKMUX_PROFILES", p.to_str().unwrap()) };
+        let err = load_registry(None).unwrap_err();
+        unsafe { env::remove_var("DARKMUX_PROFILES") };
+        let msg = err.to_string();
+        assert!(msg.contains("ghost") || msg.contains("not found"), "got: {msg}");
+    }
+
+    /// An explicit `--profiles-file` (the `Some(path)` arg to
+    /// `load_registry`) wins over `DARKMUX_PROFILES` even when BOTH point at
+    /// files with a `crews{}` section — the loaded crews are the explicit
+    /// file's, never the env var's.
+    #[serial_test::serial]
+    #[test]
+    fn explicit_profiles_flag_wins_over_env_var_for_crews() {
+        let tmp = TempDir::new().unwrap();
+        let explicit_path = tmp.path().join("explicit.json");
+        let env_path = tmp.path().join("env.json");
+        write(
+            &explicit_path,
+            r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":1000}]}},
+                "crews":{"from-explicit":{"seats":{"s":[{"profile":"fast"}]}}}}"#,
+        );
+        write(
+            &env_path,
+            r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":1000}]}},
+                "crews":{"from-env":{"seats":{"s":[{"profile":"fast"}]}}}}"#,
+        );
+        unsafe { env::set_var("DARKMUX_PROFILES", env_path.to_str().unwrap()) };
+        let result = load_registry(Some(explicit_path.to_str().unwrap()));
+        unsafe { env::remove_var("DARKMUX_PROFILES") };
+        let reg = result.unwrap().registry;
+        assert!(reg.crews.contains_key("from-explicit"));
+        assert!(!reg.crews.contains_key("from-env"));
+    }
+
+    /// Forward-compat `extras` on BOTH `Crew` and nested `SeatStaffing`
+    /// survive a FULL save/load cycle through real file I/O (not just an
+    /// in-memory `serde_json::from_str`/`to_string` round trip, which the
+    /// schema-layer tests in `darkmux-types` already cover): parse from
+    /// disk via `load_registry`, re-serialize, write to a SECOND file, and
+    /// `load_registry` that one too — extras must still be there after both
+    /// hops.
+    #[test]
+    fn crew_extras_preserved_through_full_file_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("profiles.json");
+        write(
+            &p,
+            r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":1000}]}},
+                "crews":{"review-deep":{
+                    "description":"deep lineup",
+                    "future_crew_field":"kept",
+                    "seats":{"review-probe":[
+                        {"profile":"fast","future_staffing_field":42}
+                    ]}
+                }}}"#,
+        );
+        let loaded = load_registry(Some(p.to_str().unwrap())).unwrap();
+        let crew = loaded.registry.crews.get("review-deep").unwrap();
+        assert_eq!(
+            crew.extras.get("future_crew_field").and_then(|v| v.as_str()),
+            Some("kept")
+        );
+        let staffing = &crew.seats.get("review-probe").unwrap()[0];
+        assert_eq!(
+            staffing.extras.get("future_staffing_field").and_then(|v| v.as_u64()),
+            Some(42)
+        );
+
+        // Second hop: re-serialize, write to a fresh file, reload.
+        let round_path = tmp.path().join("profiles-round.json");
+        write(&round_path, &serde_json::to_string(&loaded.registry).unwrap());
+        let reloaded = load_registry(Some(round_path.to_str().unwrap())).unwrap();
+        let crew2 = reloaded.registry.crews.get("review-deep").unwrap();
+        assert_eq!(
+            crew2.extras.get("future_crew_field").and_then(|v| v.as_str()),
+            Some("kept")
+        );
+        assert_eq!(
+            crew2.seats.get("review-probe").unwrap()[0]
+                .extras
+                .get("future_staffing_field")
+                .and_then(|v| v.as_u64()),
+            Some(42)
+        );
+    }
 }
