@@ -1409,3 +1409,196 @@ fn pr_review_run_missing_crew_errors_loudly() {
         .failure()
         .stderr(predicate::str::contains("--crew is required"));
 }
+
+// ─── review-bench --funnel flag plumbing (#1222 Phase B packet 7) ─────────
+//
+// The funnel condition's real dispatch path needs a live LMStudio + a real
+// crew registry, so these tests stay at the clap-plumbing layer: the flag
+// conflicts and `requires` relationships fail loud BEFORE any dispatch is
+// attempted. A live corpus run is maintainer-executed (see the doc comment
+// on `run_funnel_case` in `crates/darkmux-lab/src/lab/review_bench.rs`).
+
+#[test]
+fn review_bench_funnel_conflicts_with_dialectic() {
+    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    cmd.args(["lab", "review-bench", "--funnel", "--dialectic"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+#[test]
+fn review_bench_funnel_conflicts_with_agentic_and_freeform() {
+    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    cmd.args(["lab", "review-bench", "--funnel", "--agentic"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+
+    let mut cmd2 = Command::cargo_bin("darkmux").unwrap();
+    cmd2.args(["lab", "review-bench", "--funnel", "--freeform"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+#[test]
+fn review_bench_crew_requires_funnel() {
+    // --crew named without --funnel: clap's `requires = "funnel"` fires
+    // before the command handler ever runs (no dispatch, no cases loaded).
+    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    cmd.args(["lab", "review-bench", "--crew", "review-funnel"])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("required arguments were not provided")
+                .and(predicate::str::contains("--funnel")),
+        );
+}
+
+#[test]
+fn review_bench_exec_mode_k_and_bundler_each_require_funnel() {
+    for (flag, value) in [
+        ("--exec-mode", "sequential"),
+        ("--k", "3"),
+        ("--bundler", "some-bundler"),
+    ] {
+        let mut cmd = Command::cargo_bin("darkmux").unwrap();
+        cmd.args(["lab", "review-bench", flag, value])
+            .assert()
+            .failure()
+            .stderr(
+                predicate::str::contains("required arguments were not provided")
+                    .and(predicate::str::contains("--funnel")),
+            );
+    }
+}
+
+#[test]
+fn review_bench_funnel_requires_workdirs() {
+    // --funnel alone (no --workdirs): reuses the same preflight
+    // --agentic/--dialectic already run, extended to include --funnel.
+    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    cmd.args(["lab", "review-bench", "--funnel", "--crew", "review-funnel"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--funnel requires --workdirs"));
+}
+
+#[test]
+fn review_bench_funnel_requires_crew() {
+    // --funnel + --workdirs (with a satisfied repo-tree preflight) but no
+    // --crew: the funnel-context preflight (resolve_funnel_ctx) fails loud
+    // before any dispatch spends a token. Uses a minimal one-case fixture so
+    // the --workdirs tree-existence check (which runs first) passes and the
+    // funnel-context check is the one under test.
+    let tmp = TempDir::new().unwrap();
+    let cases_dir = tmp.path().join("cases");
+    fs::create_dir_all(&cases_dir).unwrap();
+    fs::write(
+        cases_dir.join("c1.label.json"),
+        r#"{"kind":"clean","intent_title":"t","expect_verdict":"pass"}"#,
+    )
+    .unwrap();
+    fs::write(cases_dir.join("c1.diff"), "diff --git a b\n").unwrap();
+    let workdirs = tmp.path().join("workdirs");
+    fs::create_dir_all(workdirs.join("c1")).unwrap();
+
+    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    cmd.args([
+        "lab",
+        "review-bench",
+        "--cases-dir",
+        cases_dir.to_str().unwrap(),
+        "--funnel",
+        "--workdirs",
+        workdirs.to_str().unwrap(),
+    ])
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("--funnel requires --crew"));
+}
+
+#[test]
+fn review_bench_funnel_k_zero_rejected_at_cli_layer() {
+    // --k 0 would otherwise slip past resolve_crew's k>=1 guard via the
+    // post-resolution override (resolve_funnel_ctx overwrites every
+    // review-probe staffing's k AFTER resolve_crew validated the crew's OWN
+    // k), guaranteeing a degenerate run (zero probe draws). The clap
+    // `value_parser` range rejects it before the command handler ever runs.
+    let mut cmd = Command::cargo_bin("darkmux").unwrap();
+    cmd.args([
+        "lab",
+        "review-bench",
+        "--funnel",
+        "--crew",
+        "review-funnel",
+        "--k",
+        "0",
+    ])
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("not in 1.."));
+}
+
+#[test]
+fn review_bench_funnel_preflight_validates_seat_requirements_before_dispatch() {
+    // A crew that resolves fine at the schema layer (resolve_crew doesn't
+    // know about funnel-specific seat names) but is missing "review-judge"
+    // must fail at PREFLIGHT (resolve_funnel_ctx calling
+    // funnel::validate_funnel_crew), not at the first case's dispatch — the
+    // per-case table header must never print.
+    let tmp = TempDir::new().unwrap();
+    let cases_dir = tmp.path().join("cases");
+    fs::create_dir_all(&cases_dir).unwrap();
+    fs::write(
+        cases_dir.join("c1.label.json"),
+        r#"{"kind":"clean","intent_title":"t","expect_verdict":"pass"}"#,
+    )
+    .unwrap();
+    fs::write(cases_dir.join("c1.diff"), "diff --git a b\n").unwrap();
+    let workdirs = tmp.path().join("workdirs");
+    fs::create_dir_all(workdirs.join("c1")).unwrap();
+
+    let profiles_path = tmp.path().join("profiles.json");
+    fs::write(
+        &profiles_path,
+        r#"{
+            "profiles": {
+                "fast": {
+                    "description": "test",
+                    "models": [{"id": "model-a", "n_ctx": 32000, "role": "primary"}]
+                }
+            },
+            "default_profile": "fast",
+            "crews": {
+                "no-judge": {
+                    "seats": {
+                        "review-probe": [{"profile": "fast", "k": 2}]
+                    }
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .args([
+            "lab",
+            "review-bench",
+            "--cases-dir",
+            cases_dir.to_str().unwrap(),
+            "--funnel",
+            "--workdirs",
+            workdirs.to_str().unwrap(),
+            "--crew",
+            "no-judge",
+            "--profiles-file",
+            profiles_path.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("review-judge"))
+        .stdout(predicate::str::contains("outcome").not());
+}
