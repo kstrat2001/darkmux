@@ -1983,72 +1983,14 @@ fn pr_review_run_malformed_charges_file_errors_loudly() {
     assert!(stderr.contains("flag list"), "{stderr}");
 }
 
-/// (finding, not fixed here — tests-only mandate; see the PR body) `cmd_run`'s
-/// `--from-envelope` ignored-flag warning (src/pr_review.rs) only checks
-/// `--crew`/`--worktree`/`--github`, even though `--bundler` and `--k` are
-/// exactly as dispatch-shaping (both only matter inside `run_dispatch`,
-/// which `--from-envelope` never calls). This test characterizes CURRENT
-/// behavior: no warning is printed and the run still succeeds. The
-/// INTENDED behavior is encoded as an `#[ignore]`d test right below.
+/// `cmd_run`'s `--from-envelope` ignored-flag warning (src/pr_review.rs)
+/// now surfaces `--bundler` as a dispatch-shaping flag with nothing to
+/// shape when synthesis-only (`--k` follows the same `ignored` Vec and
+/// warning path) — operator sovereignty: surface, never silently ignore.
+/// Fixed in the #1222 Phase B follow-up (formerly an `#[ignore]`d
+/// intended-behavior test pinned against a bug found during the packet-5
+/// coverage sweep).
 #[test]
-fn pr_review_run_bundler_and_k_silently_unused_with_from_envelope() {
-    let tmp = TempDir::new().unwrap();
-    let diff_path = tmp.path().join("pr.diff");
-    fs::write(&diff_path, pr_review_run_diff()).unwrap();
-    let envelope_path = tmp.path().join("funnel.json");
-    fs::write(&envelope_path, pr_review_run_envelope()).unwrap();
-
-    let output = Command::cargo_bin("darkmux")
-        .unwrap()
-        .args([
-            "pr-review",
-            "run",
-            "--from-envelope",
-            envelope_path.to_str().unwrap(),
-            "--diff",
-            diff_path.to_str().unwrap(),
-            "--bundler",
-            "/nonexistent-bundler-binary",
-            "--k",
-            "7",
-            "--emit",
-            "-",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !stderr.contains("--bundler"),
-        "current behavior: --bundler is NOT in the ignored-warning list: {stderr}"
-    );
-    assert!(
-        !stderr.contains("--k"),
-        "current behavior: --k is NOT in the ignored-warning list: {stderr}"
-    );
-}
-
-/// BUG (found during #1222 Phase B packet-5 coverage sweep; NOT fixed here
-/// per the tests-only mandate). `cmd_run`'s doc comment for the
-/// `--from-envelope` ignored-flag warning says "dispatch-shaping flags
-/// have nothing to shape" and "surface, never silently ignore" — but the
-/// `ignored` Vec (src/pr_review.rs, `cmd_run`) only checks
-/// `--crew`/`--worktree`/`--github`. `--bundler` is EXACTLY as
-/// dispatch-shaping (it's the alternate bundle source `run_dispatch`
-/// would otherwise have used) but is missing from that list, so a
-/// copy-pasted full command silently drops it with zero surfaced signal —
-/// the exact operator-sovereignty violation the existing warning exists to
-/// prevent. This test encodes the INTENDED behavior; it fails against
-/// current code.
-#[test]
-#[ignore = "bug: --bundler is dispatch-shaping but missing from cmd_run's \
-            --from-envelope ignored-warning list (src/pr_review.rs cmd_run); \
-            see PR body for the #1222 Phase B packet-5 coverage finding"]
 fn pr_review_run_bundler_should_warn_ignored_with_from_envelope() {
     let tmp = TempDir::new().unwrap();
     let diff_path = tmp.path().join("pr.diff");
