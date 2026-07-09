@@ -11,6 +11,10 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 
 ## [Unreleased]
 
+### Added
+
+- **`darkmux-review.yml` dispatches the review funnel instead of a single reviewer** (#1222 Phase B, packet 6) — the self-hosted PR-review workflow now runs `darkmux pr-review run`, which drives a saved **crew** (`~/.darkmux/profiles.json` `crews`, Phase B packet 1) through a `review-probe` seat that argues the diff and a `review-judge` seat that weighs the probes' findings, replacing the old single tool-less `pr-reviewer` dispatch outright (pre-1.0, no compat shim). Workflow inputs move from `role`/`profile` to `crew`/`mode`/`k`; model selection stays entirely on the runner (#1054) — the workflow file never names a model, only a crew. `.github/DARKMUX_REVIEW_RUNNER.md` documents the new flow plus a Studio migration checklist (a copy-pasteable `review-deep` crew for a 32GB tier) and the `DARKMUX_REVIEW_CREW` repo-variable override. **Release gate: no version tags this until the labeled-corpus recall/precision validation (#1119) shows the funnel at parity with or ahead of the single-reviewer baseline it replaces** — the dispatch path is complete but not yet measured against the review arc's own bake-off discipline.
+
 ## [1.16.0] - 2026-07-05
 
 **The production-review release** — everything the self-hosted QA pipeline needs to run agentic, cloud-backed PR review honestly: a freeform review contract that works WITH tools (a grammar-constrained `output_schema` combined with tools makes a model skip tool-calling and fabricate — verified empirically), a `pr-reviewer-agentic` role that explores the checked-out repo before concluding, a `doctor --probe` that live-verifies a remote credential actually works, and a render pipeline that can no longer present a produced-nothing review as a clean pass. Plus the live viewer stops counting paid cloud tokens as "off the meter." `FLOW_SCHEMA` / `RULES_SCHEMA` / `CONFIG_SCHEMA` unchanged.
