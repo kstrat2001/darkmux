@@ -298,6 +298,19 @@ pub(crate) fn load_role_prompt(role_id: &str) -> Option<String> {
     None
 }
 
+/// Public accessor for [`load_role_prompt`] (#1222 Phase B packet 5
+/// reconciliation). `darkmux pr-review run` (the `darkmux` binary crate,
+/// `src/pr_review.rs`) dispatches `review-probe`/`review-judge` through
+/// `darkmux_crew::single_shot::single_shot_chat`, not
+/// `darkmux_crew::dispatch`/`dispatch_internal` — so it needs the raw
+/// system-prompt text itself rather than a full role dispatch, and
+/// `load_role_prompt` is `pub(crate)`, invisible outside this crate.
+/// Same search order: user override (`<crew_root>/roles/<id>.md`), then
+/// the embedded `BUILTIN_ROLE_PROMPTS`.
+pub fn role_prompt(role_id: &str) -> Option<String> {
+    load_role_prompt(role_id)
+}
+
 /// (#906) Defense-in-depth cap on a single manifest file. Role / mission /
 /// sprint / crew manifests are small (a few KB); a multi-MB file is either
 /// corrupt or hostile, and an unbounded `read_to_string` + `from_str` is a

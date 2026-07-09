@@ -33,10 +33,18 @@
 //! external_bundles, FileSource}` (Phase B packet 3), which had not landed
 //! on `main` when this packet was written. [`bundles_from_diff`] is the
 //! PROVISIONAL bundler standing in for the real one — see its doc comment
-//! for the exact reconciliation seam. Every other piece of this module
-//! (probe/dedup/judge/envelope) is written entirely against `BundleInput`
-//! and needs no changes once the real bundler lands; only
-//! `bundles_from_diff`'s body is replaced.
+//! for what it stands in for. Every other piece of this module (probe/
+//! dedup/judge/envelope) is written entirely against `BundleInput` and
+//! needed no changes once the real bundler landed.
+//!
+//! **Reconciled in packet 5** (`darkmux pr-review run`, `src/pr_review.rs`
+//! in the binary crate): rather than editing `bundles_from_diff`'s body
+//! in place, [`FunnelInputs::bundles`] is the injection seam — packet 5
+//! builds real bundles via `build_bundles`/`external_bundles` + `slice_code`
+//! and passes `Some(..)`; [`run_funnel`]/[`run_judge_only`] use those
+//! directly and never call the provisional bundler. `bundles_from_diff`
+//! survives only as the `None` fallback this module's own pre-packet-3
+//! tests still rely on — no production caller uses it.
 //!
 //! Parsers and the dedup/double-confirm state machine are pure and
 //! unit-tested; dispatching goes through caller-provided closures/traits so
@@ -133,7 +141,7 @@ pub enum FunnelRuling {
 /// records internally but only the retry's outcome survives into a
 /// [`JudgedFlag`] (the first, unparsed attempt is discarded, not hidden —
 /// see `judge_pass_with_retry`'s doc for why that's honest).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JudgeRecord {
     pub ruling: FunnelRuling,
     pub decisive_evidence: String,
@@ -143,7 +151,7 @@ pub struct JudgeRecord {
 }
 
 /// The three-tier envelope outcome for one flag.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Tier {
     Confirmed,
@@ -153,7 +161,7 @@ pub enum Tier {
 
 /// One flag's full judge record: pass-1 always present, pass-2 present iff
 /// pass-1 was `confirmed`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JudgedFlag {
     pub flag: ProbeFlag,
     pub pass1: JudgeRecord,
@@ -170,7 +178,7 @@ pub struct JudgedFlag {
 
 /// Per-model resource accounting — one row per probe staffing plus one for
 /// the judge seat.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MemberRecord {
     pub model: String,
     pub seat: String,
@@ -182,7 +190,7 @@ pub struct MemberRecord {
 /// One pipeline step's in/out counts + wall time — the issue #1230 bridge:
 /// a future flow-record consumer can render the funnel as a step timeline
 /// without re-deriving it from the envelope's nested arrays.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepRecord {
     /// `bundle` | `probe` | `dedup` | `judge-pass1` | `judge-pass2`.
     pub step_id: String,
@@ -196,7 +204,7 @@ pub struct StepRecord {
 
 // ─── the envelope ─────────────────────────────────────────────────────────
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct FunnelEnvelope {
     pub case_id: String,
     pub crew: String,
@@ -667,6 +675,16 @@ fn bundles_from_diff(diff: &str) -> Vec<BundleInput> {
     out
 }
 
+/// (#1222 Phase B packet 5 reconciliation) `inputs.bundles` when the caller
+/// supplied real ones (production), else the provisional [`bundles_from_diff`]
+/// (this module's own pre-packet-3 tests only — see [`FunnelInputs::bundles`]).
+fn resolve_bundles(inputs: &FunnelInputs) -> Vec<BundleInput> {
+    match &inputs.bundles {
+        Some(b) => b.clone(),
+        None => bundles_from_diff(inputs.diff),
+    }
+}
+
 /// A staffing with a `bundle_selector` runs only on bundles whose
 /// `fact_family` is named in `fact_families` (empty `fact_families` = no
 /// restriction), capped at `max_bundles`, prioritizing `"param-flow"`
@@ -721,6 +739,15 @@ pub struct FunnelInputs<'a> {
     pub mode: ExecMode,
     pub probe_system: &'a str,
     pub judge_system: &'a str,
+    /// (#1222 Phase B packet 5 reconciliation) Caller-supplied bundles from
+    /// the REAL bundler (`darkmux_lab::lab::bundle::build_bundles`/
+    /// `external_bundles`, packet 3), already mapped `Bundle` ->
+    /// [`BundleInput`] (via `slice_code` for the code text). `None` falls
+    /// back to the provisional [`bundles_from_diff`] — kept ONLY so this
+    /// module's own tests (written before packet 3 landed) keep working
+    /// unchanged. Production callers (`darkmux pr-review run`, packet 5)
+    /// always pass `Some` and never invoke the provisional bundler.
+    pub bundles: Option<Vec<BundleInput>>,
 }
 
 fn fingerprint(judge_identifier: &str, judge_system: &str) -> serde_json::Value {
@@ -1121,6 +1148,33 @@ fn finish_funnel(
     env.confirmed = judged.iter().filter(|j| j.tier == Tier::Confirmed).count();
     env.needs_check = judged.iter().filter(|j| j.tier == Tier::NeedsCheck).count();
     env.archived = judged.iter().filter(|j| j.tier == Tier::Archived).count();
+
+    // The judge-dead honesty gate (#1222 packet 5 review): per-flag judge
+    // failures are deliberately swallowed to `Error`/`Unparsed` →
+    // `Tier::Archived` (one bad call must not abort the docket), but when
+    // NO flag got a usable pass-1 ruling the whole judge phase produced no
+    // signal — confirmed=0/needs_check=0 would render downstream as an
+    // honest-looking "none confirmed" green comment while the judge was
+    // dead or off-contract the entire run. Mark the envelope degenerate so
+    // synthesis routes it to "degraded" (the workflow's exit-1 path). A
+    // genuine all-false-positive docket has usable rulings and keeps the
+    // honest comment.
+    let usable = judged
+        .iter()
+        .filter(|j| {
+            matches!(
+                j.pass1.ruling,
+                FunnelRuling::Confirmed | FunnelRuling::NeedsCheck | FunnelRuling::FalsePositive
+            )
+        })
+        .count();
+    if !judged.is_empty() && usable == 0 {
+        env.degenerate = Some(format!(
+            "judge produced no usable ruling on any of {} flags (all errored/unparsed)",
+            judged.len()
+        ));
+    }
+
     env.flags = deduped;
     env.judged = judged;
     Ok(env)
@@ -1144,7 +1198,7 @@ pub fn run_funnel(
     let mode = resolve_mode(inputs.mode, probes, judge);
 
     let t_bundle = Instant::now();
-    let bundles = bundles_from_diff(inputs.diff);
+    let bundles = resolve_bundles(inputs);
     let bundle_ms = t_bundle.elapsed().as_millis() as u64;
 
     let mut env = FunnelEnvelope {
@@ -1209,7 +1263,7 @@ pub fn run_judge_only(
     let mode = resolve_mode(inputs.mode, probes, judge);
 
     let t_bundle = Instant::now();
-    let bundles = bundles_from_diff(inputs.diff);
+    let bundles = resolve_bundles(inputs);
     let bundle_ms = t_bundle.elapsed().as_millis() as u64;
 
     let mut env = FunnelEnvelope {
@@ -1574,11 +1628,8 @@ mod tests {
             BundleInput { id: "a".into(), fact_family: "auth".into(), code: String::new(), facts: vec![], manifest: vec![] },
             BundleInput { id: "b".into(), fact_family: "billing".into(), code: String::new(), facts: vec![], manifest: vec![] },
         ];
-        let sel = BundleSelector {
-            fact_families: vec!["auth".to_string()],
-            max_bundles: None,
-            ..Default::default()
-        };
+        let sel =
+            BundleSelector { fact_families: vec!["auth".to_string()], ..Default::default() };
         let selected = select_bundles_for_staffing(&bundles, Some(&sel));
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].id, "a");
@@ -1600,11 +1651,7 @@ mod tests {
             BundleInput { id: "b".into(), fact_family: "param-flow".into(), code: String::new(), facts: vec![], manifest: vec![] },
             BundleInput { id: "c".into(), fact_family: "other".into(), code: String::new(), facts: vec![], manifest: vec![] },
         ];
-        let sel = BundleSelector {
-            fact_families: vec![],
-            max_bundles: Some(2),
-            ..Default::default()
-        };
+        let sel = BundleSelector { max_bundles: Some(2), ..Default::default() };
         let selected = select_bundles_for_staffing(&bundles, Some(&sel));
         assert_eq!(selected.len(), 2);
         assert_eq!(selected[0].id, "b", "param-flow bundle is prioritized first");
@@ -1673,6 +1720,7 @@ mod tests {
             mode: ExecMode::Sequential,
             probe_system: "probe sys",
             judge_system: "judge sys",
+            bundles: None,
         };
         let mut cycler = RecordingCycler::new();
         let mut chat = |_call: &ChatCall| Ok(reply("a real defect `const end = start.plus(30)`"));
@@ -1703,6 +1751,7 @@ mod tests {
             mode: ExecMode::Sequential,
             probe_system: "probe sys",
             judge_system: "judge sys",
+            bundles: None,
         };
         let mut cycler = RecordingCycler::new();
         let mut call_n = 0u32;
@@ -1747,6 +1796,7 @@ mod tests {
             mode: ExecMode::Sequential,
             probe_system: "probe sys",
             judge_system: "judge sys",
+            bundles: None,
         };
         let mut cycler = RecordingCycler::new();
         let mut chat = |_call: &ChatCall| Ok(reply("unused"));
@@ -1773,6 +1823,7 @@ mod tests {
             mode: ExecMode::Sequential,
             probe_system: "probe sys",
             judge_system: "judge sys",
+            bundles: None,
         };
         let mut cycler = RecordingCycler::new();
         // Every probe draw comes back empty — retried, then skipped.
@@ -1784,6 +1835,79 @@ mod tests {
         assert!(
             env.fingerprint.get("protocol").is_some(),
             "a zero-flag envelope still carries the comparability fingerprint"
+        );
+    }
+
+    #[test]
+    fn degenerate_all_unparsed_judge_never_renders_as_a_clean_pass() {
+        // The judge-dead honesty gate (#1222 packet 5 review): per-flag
+        // judge failures are swallowed to Unparsed/Error -> Archived, so a
+        // dead or off-contract judge used to produce confirmed=0 /
+        // needs_check=0 / degenerate=None — indistinguishable downstream
+        // from a genuinely clean "none confirmed" run. Flags judged but
+        // ZERO usable pass-1 rulings must mark the envelope degenerate.
+        let crew = valid_crew();
+        let inputs = FunnelInputs {
+            case_id: "c1".to_string(),
+            crew: &crew,
+            intent: "add a feature",
+            diff: DIFF,
+            mode: ExecMode::Sequential,
+            probe_system: "probe sys",
+            judge_system: "judge sys",
+            bundles: None,
+        };
+        let mut cycler = RecordingCycler::new();
+        let mut chat = |call: &ChatCall| {
+            if call.model.contains("probe-model") {
+                Ok(reply("a real defect `const end = start.plus(30)`"))
+            } else {
+                // Every judge call (pass-1 AND its unparsed-retry) is
+                // off-contract prose — no fenced JSON ruling.
+                Ok(reply("I could not reach a verdict on this."))
+            }
+        };
+        let env = run_funnel(&inputs, &mut chat, &mut cycler).expect("funnel runs");
+        assert_eq!(env.judged.len(), 1, "the flag WAS judged (archived), not dropped");
+        assert_eq!(env.confirmed, 0);
+        assert_eq!(env.needs_check, 0);
+        assert_eq!(env.archived, 1);
+        let note = env.degenerate.expect("all-unparsed judge must mark the envelope degenerate");
+        assert!(note.contains("no usable ruling"), "{note}");
+        assert!(note.contains("1 flags"), "names how many flags got nothing: {note}");
+    }
+
+    #[test]
+    fn genuine_all_false_positive_docket_is_not_degenerate() {
+        // The counterpart: a judge that RULED (false_positive) on every
+        // flag produced real signal — zero confirms is then an honest
+        // outcome, not a degenerate one.
+        let crew = valid_crew();
+        let inputs = FunnelInputs {
+            case_id: "c1".to_string(),
+            crew: &crew,
+            intent: "add a feature",
+            diff: DIFF,
+            mode: ExecMode::Sequential,
+            probe_system: "probe sys",
+            judge_system: "judge sys",
+            bundles: None,
+        };
+        let mut cycler = RecordingCycler::new();
+        let mut chat = |call: &ChatCall| {
+            if call.model.contains("probe-model") {
+                Ok(reply("a real defect `const end = start.plus(30)`"))
+            } else {
+                Ok(reply(FP_JSON))
+            }
+        };
+        let env = run_funnel(&inputs, &mut chat, &mut cycler).expect("funnel runs");
+        assert_eq!(env.confirmed, 0);
+        assert_eq!(env.archived, 1);
+        assert!(
+            env.degenerate.is_none(),
+            "a ruled-on docket is honest signal, never degenerate: {:?}",
+            env.degenerate
         );
     }
 
@@ -1800,6 +1924,7 @@ mod tests {
             mode: ExecMode::Sequential,
             probe_system: "probe sys",
             judge_system: "judge sys",
+            bundles: None,
         };
         let flags = vec![flag("billing.ts", "member-a", 0, "`const end = start.plus(30)` double-counts")];
         let mut cycler = RecordingCycler::new();
@@ -1825,6 +1950,7 @@ mod tests {
             mode: ExecMode::Parallel,
             probe_system: "probe sys",
             judge_system: "judge sys",
+            bundles: None,
         };
         let flags = vec![flag("billing.ts", "member-a", 0, "`const end = start.plus(30)` off by one")];
         let mut cycler = RecordingCycler::new();
