@@ -1,6 +1,8 @@
 {
   "_comment": "darkmux profile registry — example. Four reference profiles in increasing capacity order: fast → balanced → deep → gpt-oss. A profile's `models[]` are WORKER models (no `role` field — #590); the machine's standing utility/compactor model lives once in the top-level `internal.utility` binding, not per-profile. `default_model` (optional) names a profile's default worker when it lists more than one; with a single model it's implicit. Replace the model ids with what you have downloaded in LMStudio (run `lms ls`).",
 
+  "schema_version": "1.1",
+
   "profiles": {
     "fast": {
       "description": "Single-turn tasks. Slim worker — fastest dispatch, lowest RAM.",
@@ -35,5 +37,21 @@
 
   "internal": {
     "utility": "qwen/qwen3-4b-instruct-2507"
+  },
+
+  "_crews_comment": "crews[] (#1222) — saved crew assignments: which models staff which crew-role seats, for multi-seat pipelines (e.g. a review funnel's probe + judge seats). `seats` is keyed by crew role id (crates/darkmux-crew's role vocabulary). Each seat's value is a list of staffings — a profile + optional explicit model id (absent = that profile's default model), draws-per-item `k` (default 3), and an optional bundle_selector scoping which fact families a staffing draws from. Local-only in v1: a staffing naming a model with a remote endpoint fails validation.",
+  "crews": {
+    "review-deep": {
+      "description": "Deep review lineup: two probe staffings (one plain, one bundle-scoped) plus a single judge staffing.",
+      "seats": {
+        "review-probe": [
+          { "profile": "balanced" },
+          { "profile": "deep", "k": 1, "bundle_selector": { "fact_families": ["security", "correctness"] } }
+        ],
+        "review-judge": [
+          { "profile": "deep" }
+        ]
+      }
+    }
   }
 }
