@@ -1148,6 +1148,33 @@ fn finish_funnel(
     env.confirmed = judged.iter().filter(|j| j.tier == Tier::Confirmed).count();
     env.needs_check = judged.iter().filter(|j| j.tier == Tier::NeedsCheck).count();
     env.archived = judged.iter().filter(|j| j.tier == Tier::Archived).count();
+
+    // The judge-dead honesty gate (#1222 packet 5 review): per-flag judge
+    // failures are deliberately swallowed to `Error`/`Unparsed` →
+    // `Tier::Archived` (one bad call must not abort the docket), but when
+    // NO flag got a usable pass-1 ruling the whole judge phase produced no
+    // signal — confirmed=0/needs_check=0 would render downstream as an
+    // honest-looking "none confirmed" green comment while the judge was
+    // dead or off-contract the entire run. Mark the envelope degenerate so
+    // synthesis routes it to "degraded" (the workflow's exit-1 path). A
+    // genuine all-false-positive docket has usable rulings and keeps the
+    // honest comment.
+    let usable = judged
+        .iter()
+        .filter(|j| {
+            matches!(
+                j.pass1.ruling,
+                FunnelRuling::Confirmed | FunnelRuling::NeedsCheck | FunnelRuling::FalsePositive
+            )
+        })
+        .count();
+    if !judged.is_empty() && usable == 0 {
+        env.degenerate = Some(format!(
+            "judge produced no usable ruling on any of {} flags (all errored/unparsed)",
+            judged.len()
+        ));
+    }
+
     env.flags = deduped;
     env.judged = judged;
     Ok(env)
@@ -1601,7 +1628,8 @@ mod tests {
             BundleInput { id: "a".into(), fact_family: "auth".into(), code: String::new(), facts: vec![], manifest: vec![] },
             BundleInput { id: "b".into(), fact_family: "billing".into(), code: String::new(), facts: vec![], manifest: vec![] },
         ];
-        let sel = BundleSelector { fact_families: vec!["auth".to_string()], max_bundles: None };
+        let sel =
+            BundleSelector { fact_families: vec!["auth".to_string()], ..Default::default() };
         let selected = select_bundles_for_staffing(&bundles, Some(&sel));
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].id, "a");
@@ -1623,7 +1651,7 @@ mod tests {
             BundleInput { id: "b".into(), fact_family: "param-flow".into(), code: String::new(), facts: vec![], manifest: vec![] },
             BundleInput { id: "c".into(), fact_family: "other".into(), code: String::new(), facts: vec![], manifest: vec![] },
         ];
-        let sel = BundleSelector { fact_families: vec![], max_bundles: Some(2) };
+        let sel = BundleSelector { max_bundles: Some(2), ..Default::default() };
         let selected = select_bundles_for_staffing(&bundles, Some(&sel));
         assert_eq!(selected.len(), 2);
         assert_eq!(selected[0].id, "b", "param-flow bundle is prioritized first");
@@ -1807,6 +1835,79 @@ mod tests {
         assert!(
             env.fingerprint.get("protocol").is_some(),
             "a zero-flag envelope still carries the comparability fingerprint"
+        );
+    }
+
+    #[test]
+    fn degenerate_all_unparsed_judge_never_renders_as_a_clean_pass() {
+        // The judge-dead honesty gate (#1222 packet 5 review): per-flag
+        // judge failures are swallowed to Unparsed/Error -> Archived, so a
+        // dead or off-contract judge used to produce confirmed=0 /
+        // needs_check=0 / degenerate=None — indistinguishable downstream
+        // from a genuinely clean "none confirmed" run. Flags judged but
+        // ZERO usable pass-1 rulings must mark the envelope degenerate.
+        let crew = valid_crew();
+        let inputs = FunnelInputs {
+            case_id: "c1".to_string(),
+            crew: &crew,
+            intent: "add a feature",
+            diff: DIFF,
+            mode: ExecMode::Sequential,
+            probe_system: "probe sys",
+            judge_system: "judge sys",
+            bundles: None,
+        };
+        let mut cycler = RecordingCycler::new();
+        let mut chat = |call: &ChatCall| {
+            if call.model.contains("probe-model") {
+                Ok(reply("a real defect `const end = start.plus(30)`"))
+            } else {
+                // Every judge call (pass-1 AND its unparsed-retry) is
+                // off-contract prose — no fenced JSON ruling.
+                Ok(reply("I could not reach a verdict on this."))
+            }
+        };
+        let env = run_funnel(&inputs, &mut chat, &mut cycler).expect("funnel runs");
+        assert_eq!(env.judged.len(), 1, "the flag WAS judged (archived), not dropped");
+        assert_eq!(env.confirmed, 0);
+        assert_eq!(env.needs_check, 0);
+        assert_eq!(env.archived, 1);
+        let note = env.degenerate.expect("all-unparsed judge must mark the envelope degenerate");
+        assert!(note.contains("no usable ruling"), "{note}");
+        assert!(note.contains("1 flags"), "names how many flags got nothing: {note}");
+    }
+
+    #[test]
+    fn genuine_all_false_positive_docket_is_not_degenerate() {
+        // The counterpart: a judge that RULED (false_positive) on every
+        // flag produced real signal — zero confirms is then an honest
+        // outcome, not a degenerate one.
+        let crew = valid_crew();
+        let inputs = FunnelInputs {
+            case_id: "c1".to_string(),
+            crew: &crew,
+            intent: "add a feature",
+            diff: DIFF,
+            mode: ExecMode::Sequential,
+            probe_system: "probe sys",
+            judge_system: "judge sys",
+            bundles: None,
+        };
+        let mut cycler = RecordingCycler::new();
+        let mut chat = |call: &ChatCall| {
+            if call.model.contains("probe-model") {
+                Ok(reply("a real defect `const end = start.plus(30)`"))
+            } else {
+                Ok(reply(FP_JSON))
+            }
+        };
+        let env = run_funnel(&inputs, &mut chat, &mut cycler).expect("funnel runs");
+        assert_eq!(env.confirmed, 0);
+        assert_eq!(env.archived, 1);
+        assert!(
+            env.degenerate.is_none(),
+            "a ruled-on docket is honest signal, never degenerate: {:?}",
+            env.degenerate
         );
     }
 

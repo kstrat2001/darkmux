@@ -686,6 +686,25 @@ pub fn cmd_run(opts: RunOpts) -> Result<i32> {
         .with_context(|| format!("reading --diff {}", opts.diff.display()))?;
 
     let env: FunnelEnvelope = if let Some(path) = &opts.from_envelope {
+        // Synthesis-only: dispatch-shaping flags have nothing to shape.
+        // Warn (don't error) so a copy-pasted full command still runs —
+        // operator sovereignty: surface, never silently ignore.
+        let mut ignored: Vec<&str> = Vec::new();
+        if opts.crew.is_some() {
+            ignored.push("--crew");
+        }
+        if opts.worktree.is_some() {
+            ignored.push("--worktree");
+        }
+        if opts.github.is_some() {
+            ignored.push("--github/--head-sha");
+        }
+        if !ignored.is_empty() {
+            eprintln!(
+                "darkmux pr-review run: {} ignored with --from-envelope (synthesis-only, no dispatch)",
+                ignored.join(", ")
+            );
+        }
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("reading --from-envelope {}", path.display()))?;
         serde_json::from_str(&raw)
@@ -774,11 +793,12 @@ fn bundle_inputs_from_set(set: &BundleSet, source: &FileSource) -> Result<Vec<Bu
 
 /// Real `Bundle.id`s are `"<fn>@<path>"` (packet 3's `build_bundles`); the
 /// provisional funnel-internal bundler used `id == path` with no `@`.
-/// `rsplit_once('@')` handles both — and any external `--bundler` that
-/// follows the same `<fn>@<path>` convention — falling back to the whole
-/// id when there's no `@` to split on.
+/// `split_once('@')` — the FIRST `@` — handles both: function names never
+/// contain `@`, but paths can (an npm `@scope/pkg` vendored path), so
+/// splitting on the LAST `@` would mangle them. Falls back to the whole id
+/// when there's no `@` to split on.
 fn path_from_bundle_id(bundle_id: &str) -> &str {
-    bundle_id.rsplit_once('@').map(|(_, p)| p).unwrap_or(bundle_id)
+    bundle_id.split_once('@').map(|(_, p)| p).unwrap_or(bundle_id)
 }
 
 /// Everything but `--from-envelope`: resolve the source + crew, build real
@@ -1868,6 +1888,41 @@ mod tests {
         let c = r.comment.unwrap();
         assert!(c.contains("no signal"), "{c}");
         assert!(c.contains("zero flags from all probe draws"), "{c}");
+    }
+
+    #[test]
+    fn path_from_bundle_id_splits_on_first_at_preserving_scoped_paths() {
+        // <fn>@<path> — fn names never contain '@', paths can (npm @scope).
+        assert_eq!(path_from_bundle_id("computeEnd@src/x.ts"), "src/x.ts");
+        assert_eq!(
+            path_from_bundle_id("helper@vendor/@scope/pkg/index.ts"),
+            "vendor/@scope/pkg/index.ts"
+        );
+        assert_eq!(path_from_bundle_id("plain-path.ts"), "plain-path.ts"); // no '@'
+    }
+
+    #[test]
+    fn synthesize_judge_dead_envelope_is_degraded_not_honest_comment() {
+        // The judge-dead honesty gate's synthesis half (#1222 packet 5
+        // review): the envelope finish_funnel now produces when every judge
+        // ruling was Unparsed/Error — judged flags all Archived, zero
+        // confirms/needs-check, degenerate SET — must route to "degraded",
+        // never to the honest "N flags investigated, none confirmed"
+        // comment.
+        let mut env = healthy_envelope(vec![JudgedFlag {
+            flag: probe_flag("computeEnd@src/x.ts", None),
+            pass1: judge_record(FunnelRuling::Unparsed, "", ""),
+            pass2: None,
+            tier: Tier::Archived,
+            demoted_by_pass2: false,
+        }]);
+        env.degenerate =
+            Some("judge produced no usable ruling on any of 1 flags (all errored/unparsed)".to_string());
+        let r = synthesize_funnel(&env, DIFF, None);
+        assert_eq!(r.mode, "degraded", "a dead judge must never render green");
+        let c = r.comment.unwrap();
+        assert!(c.contains("no usable ruling"), "{c}");
+        assert!(!c.contains("none confirmed"), "must not read like an honest pass: {c}");
     }
 
     #[test]
