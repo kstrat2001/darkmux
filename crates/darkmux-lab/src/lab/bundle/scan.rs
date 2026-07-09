@@ -29,9 +29,17 @@ fn is_ident_cont_byte(b: u8) -> bool {
 }
 
 /// `\w` scope used by the reference's `\b` boundary checks — ASCII
-/// alnum + underscore (Python's default `\w` is unicode-aware, but TS
-/// source identifiers we care about are ASCII; `$` is deliberately
-/// EXCLUDED here to match `\w` exactly, same as the reference).
+/// alnum + underscore. Two documented rare edges (accepted for golden
+/// stability — fidelity on the common path beats chasing them):
+///
+/// - Python's default `\w` is unicode-aware; this is ASCII-only, so a
+///   NON-ASCII identifier character adjacent to a match reads as a word
+///   boundary here where Python's would not. TS identifiers in the
+///   validated corpus are ASCII throughout.
+/// - `$` is EXCLUDED, exactly matching Python's `\w` — so `count_refs`
+///   on param `x` counts the `x` inside `$x` as a boundary-satisfying
+///   hit in BOTH implementations. The `$`-prefixed-identifier boundary
+///   is a shared quirk inherited from the reference, not a port delta.
 fn is_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
@@ -988,6 +996,16 @@ pub fn split_switch_branches(body_lines: &[String]) -> Vec<(Vec<String>, Vec<Str
 /// e.g. `"parseURLNow"` -> `["parse", "URL", "Now"]`). No `regex` crate
 /// available, so this is a direct manual re-implementation rather than a
 /// literal port — behavior verified to match on typical identifiers.
+///
+/// Known rare edges (documented, not chased — golden stability):
+/// ASCII-only classification, so non-ASCII identifier characters are
+/// skipped (Python's regex would also skip them, since its pattern names
+/// ASCII classes explicitly — but a unicode letter BETWEEN ASCII runs
+/// splits tokens identically in both, so parity holds except for exotic
+/// mixed-script names); digit-PREFIXED segments group with the lowercase
+/// run they open (`[a-z0-9]+` treats digits and lowercase as one class
+/// in both implementations, so `v2Parser` -> `v2` + `Parser` matches the
+/// reference).
 fn camel_tokens(name: &str) -> Vec<String> {
     let chars: Vec<char> = name.chars().collect();
     let n = chars.len();
