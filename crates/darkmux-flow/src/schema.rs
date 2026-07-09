@@ -114,14 +114,19 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.17.0";
 //           (a step transition — bundle/probe/probe:<seat>/dedup/judge-pass1/
 //           judge-pass2 — payload shape `{step_id, kind, items_in, items_out,
 //           status, wall_ms}` per #1230's named substrate), and `funnel.ruling`
-//           (the per-judge-ruling live ticker). No struct/field change — same
-//           `payload` blob every other richer action already uses. Additive:
-//           older readers ignore the unknown actions. Emitted through TWO
-//           sinks depending on caller (lab-vs-fleet scope boundary): `darkmux
-//           pr-review run` writes to the real flow stream via this crate;
-//           `darkmux lab review-bench --funnel` writes to a per-run-local
-//           `funnel-events.jsonl` file instead, never this stream — so
-//           existing AuditFileSink chains are unaffected either way.
+//           (the per-judge-ruling live ticker). `status` on both task and step
+//           is `started` | `finished` | `error` — `error` is the abort-path
+//           terminal value the funnel's bookend guard emits on early return /
+//           panic (same guarantee #717's DispatchBookendGuard gives
+//           `dispatch.start`), so no consumer ever sees an orphaned `started`.
+//           No struct/field change — same `payload` blob every other richer
+//           action already uses. Additive: older readers ignore the unknown
+//           actions. Emitted through TWO sinks depending on caller
+//           (lab-vs-fleet scope boundary): `darkmux pr-review run` writes to
+//           the real flow stream via this crate; `darkmux lab review-bench
+//           --funnel` writes to a per-run-local `funnel-events.jsonl` file
+//           instead, never this stream — so existing AuditFileSink chains are
+//           unaffected either way.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]

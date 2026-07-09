@@ -69,12 +69,19 @@
 //! the generic mission-flow graph view unchanged:
 //!
 //! - `funnel.task` — one funnel RUN's bookends (`payload.status` = `started`
-//!   | `finished`): case id, crew, exec mode, bundle count on start;
-//!   confirmed/needs_check/archived counts + `degenerate` reason (when set)
-//!   on finish.
+//!   | `finished` | `error`): case id, crew, exec mode, bundle count on
+//!   start; confirmed/needs_check/archived counts + `degenerate` reason
+//!   (when set) on finish. `error` is the [`FunnelBookendGuard`]'s Drop-path
+//!   terminal record — emitted when the driver `?`-returns or panics after
+//!   `started`, so no consumer ever sees an orphaned, perpetually-in-flight
+//!   run (the same guarantee `darkmux-crew`'s `DispatchBookendGuard`, #717,
+//!   gives `dispatch.start`).
 //! - `funnel.step` — a step transition, payload shape matching #1230's
 //!   named substrate exactly: `{step_id, kind: "procedural"|"dispatch",
-//!   items_in, items_out, status: "started"|"finished", wall_ms}`.
+//!   items_in, items_out, status: "started"|"finished", wall_ms}` (plus
+//!   `status: "error"` from the guard's Drop path, closing any step still
+//!   open at an abort — innermost-first, so start/terminal pairing holds on
+//!   every path).
 //!   `step_id` is `bundle` | `probe` | `probe:<staffing-name>` (one per
 //!   probe seat — a future graph engine renders these as PARALLEL sibling
 //!   steps under `probe`, #1230's parallel-step vision) | `dedup` |
@@ -336,6 +343,142 @@ fn task_finished_record(env: &FunnelEnvelope) -> darkmux_flow::FlowRecord {
     }
     let level = if env.degenerate.is_some() { darkmux_flow::Level::Warn } else { darkmux_flow::Level::Info };
     funnel_flow_record(&env.case_id, &env.crew, FUNNEL_TASK_ACTION, level, payload)
+}
+
+/// (#1247 review round) Bookend guard for the funnel's flow-record
+/// lifecycle — same class of problem `darkmux-crew`'s
+/// `DispatchBookendGuard` (#717) solves for `dispatch.start`: once
+/// `funnel.task started` is emitted, the driver can still `?`-return before
+/// the clean `finished` bookend (a probe dispatch error, a cycler
+/// load/release failure) — or panic. Without a terminal record that leaves
+/// an orphaned task (rendering as perpetually in-flight to any consumer)
+/// plus whatever step-`started` records were open at the abort point.
+///
+/// All driver emission routes THROUGH this guard so it can track the task
+/// bookend and the stack of currently-open steps: on `Drop` while still
+/// armed, it closes each open step innermost-first with a `funnel.step`
+/// record carrying `status: "error"`, then emits a terminal `funnel.task`
+/// record with `status: "error"` — every `started` gets a matching terminal
+/// event, on every path. The clean finish (`task_finished`, which every
+/// success/degenerate return point calls) disarms it, so a run that reached
+/// its own terminal record is never double-counted.
+///
+/// Emission on `Drop` is best-effort by construction — [`FunnelEmitter`]
+/// impls are already infallible (`emit` returns nothing), so a sink problem
+/// can't mask the original error propagating out.
+struct FunnelBookendGuard<'a> {
+    emitter: &'a mut dyn FunnelEmitter,
+    case_id: String,
+    crew: String,
+    armed: bool,
+    /// `(step_id, kind)` of every step with a `started` record and no
+    /// `finished` yet — a stack, since seat-level `probe:<name>` steps nest
+    /// inside the phase-level `probe` step.
+    open_steps: Vec<(String, String)>,
+}
+
+impl<'a> FunnelBookendGuard<'a> {
+    fn new(emitter: &'a mut dyn FunnelEmitter, case_id: &str, crew: &str) -> Self {
+        Self {
+            emitter,
+            case_id: case_id.to_string(),
+            crew: crew.to_string(),
+            armed: false,
+            open_steps: Vec::new(),
+        }
+    }
+
+    /// Emit the `funnel.task started` bookend and ARM the guard — from here
+    /// until `task_finished`, an early return or panic fires the Drop path.
+    fn task_started(&mut self, payload: serde_json::Value) {
+        self.armed = true;
+        self.emitter.emit(funnel_flow_record(
+            &self.case_id,
+            &self.crew,
+            FUNNEL_TASK_ACTION,
+            darkmux_flow::Level::Info,
+            payload,
+        ));
+    }
+
+    /// Emit a `funnel.step` `status: "started"` record and track the step
+    /// as open until [`Self::step_finished`] closes it.
+    fn step_started(&mut self, step_id: &str, kind: &str, payload: serde_json::Value) {
+        self.open_steps.push((step_id.to_string(), kind.to_string()));
+        self.emitter.emit(funnel_flow_record(
+            &self.case_id,
+            &self.crew,
+            FUNNEL_STEP_ACTION,
+            darkmux_flow::Level::Info,
+            payload,
+        ));
+    }
+
+    /// Emit a `funnel.step` `status: "finished"` record and close the step.
+    /// Also the entry point for one-shot steps that emit `finished` with no
+    /// prior `started` (`bundle`, `dedup` — instantaneous procedural steps);
+    /// the close is then a no-op on the open-step stack.
+    fn step_finished(&mut self, step_id: &str, payload: serde_json::Value) {
+        self.open_steps.retain(|(id, _)| id != step_id);
+        self.emitter.emit(funnel_flow_record(
+            &self.case_id,
+            &self.crew,
+            FUNNEL_STEP_ACTION,
+            darkmux_flow::Level::Info,
+            payload,
+        ));
+    }
+
+    /// Emit a `funnel.ruling` ticker record (no open/close semantics).
+    fn ruling(&mut self, payload: serde_json::Value) {
+        self.emitter.emit(funnel_flow_record(
+            &self.case_id,
+            &self.crew,
+            FUNNEL_RULING_ACTION,
+            darkmux_flow::Level::Info,
+            payload,
+        ));
+    }
+
+    /// Emit the terminal `funnel.task` record for `env` (finished, or
+    /// degenerate-finished — see [`task_finished_record`]) and DISARM the
+    /// guard: this run reached its own terminal record.
+    fn task_finished(&mut self, env: &FunnelEnvelope) {
+        self.armed = false;
+        self.open_steps.clear();
+        self.emitter.emit(task_finished_record(env));
+    }
+}
+
+impl Drop for FunnelBookendGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Close every still-open step, innermost-first, so the stream's
+        // start/terminal pairing stays consistent even on the abort path.
+        while let Some((step_id, kind)) = self.open_steps.pop() {
+            self.emitter.emit(funnel_flow_record(
+                &self.case_id,
+                &self.crew,
+                FUNNEL_STEP_ACTION,
+                darkmux_flow::Level::Error,
+                json!({ "step_id": step_id, "kind": kind, "status": "error" }),
+            ));
+        }
+        self.emitter.emit(funnel_flow_record(
+            &self.case_id,
+            &self.crew,
+            FUNNEL_TASK_ACTION,
+            darkmux_flow::Level::Error,
+            json!({
+                "status": "error",
+                "case_id": self.case_id,
+                "crew": self.crew,
+                "error": "funnel terminated before completion (early return or panic)",
+            }),
+        ));
+    }
 }
 
 // ─── the envelope ─────────────────────────────────────────────────────────
@@ -1012,24 +1155,22 @@ fn dispatch_probe_staffing(
     inputs: &FunnelInputs,
     chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
     flags: &mut Vec<ProbeFlag>,
-    emitter: &mut dyn FunnelEmitter,
+    guard: &mut FunnelBookendGuard<'_>,
 ) -> Result<MemberRecord> {
     let identifier = swap::namespaced_identifier(&s.pm);
     let max_tokens = s.max_tokens.unwrap_or(DEFAULT_PROBE_MAX_TOKENS);
     let selected = select_bundles_for_staffing(bundles, s.selector.as_ref());
     let step_id = format!("probe:{}", s.name);
     let draws_total = selected.len() as u32 * s.k;
-    emitter.emit(funnel_flow_record(
-        &inputs.case_id,
-        &inputs.crew.name,
-        FUNNEL_STEP_ACTION,
-        darkmux_flow::Level::Info,
+    guard.step_started(
+        &step_id,
+        "dispatch",
         json!({
             "step_id": step_id, "kind": "dispatch", "status": "started",
             "items_in": selected.len(), "items_out": 0, "wall_ms": 0,
             "model": identifier, "draws_done": 0, "draws_total": draws_total,
         }),
-    ));
+    );
     let t0 = Instant::now();
     let mut draws = 0u32;
     let mut tokens = 0u64;
@@ -1055,17 +1196,14 @@ fn dispatch_probe_staffing(
     }
     let wall_ms = t0.elapsed().as_millis() as u64;
     let flags_produced = flags.len() - flags_before;
-    emitter.emit(funnel_flow_record(
-        &inputs.case_id,
-        &inputs.crew.name,
-        FUNNEL_STEP_ACTION,
-        darkmux_flow::Level::Info,
+    guard.step_finished(
+        &step_id,
         json!({
             "step_id": step_id, "kind": "dispatch", "status": "finished",
             "items_in": selected.len(), "items_out": flags_produced, "wall_ms": wall_ms,
             "model": identifier, "draws_done": draws, "draws_total": draws_total, "tokens": tokens,
         }),
-    ));
+    );
     Ok(MemberRecord {
         model: identifier,
         seat: "review-probe".to_string(),
@@ -1084,7 +1222,7 @@ fn probe_phase(
     cycler: &mut dyn ModelCycler,
     members: &mut Vec<MemberRecord>,
     mode: ExecMode,
-    emitter: &mut dyn FunnelEmitter,
+    guard: &mut FunnelBookendGuard<'_>,
 ) -> Result<Vec<ProbeFlag>> {
     let mut flags = Vec::new();
     if mode == ExecMode::Parallel {
@@ -1092,7 +1230,7 @@ fn probe_phase(
             cycler.ensure_loaded(&s.pm)?;
         }
         for s in probes {
-            members.push(dispatch_probe_staffing(s, bundles, inputs, chat, &mut flags, emitter)?);
+            members.push(dispatch_probe_staffing(s, bundles, inputs, chat, &mut flags, guard)?);
         }
         for s in probes {
             cycler.release(&s.pm)?;
@@ -1103,7 +1241,7 @@ fn probe_phase(
         // its draws → release → next.
         for s in probes {
             cycler.ensure_loaded(&s.pm)?;
-            members.push(dispatch_probe_staffing(s, bundles, inputs, chat, &mut flags, emitter)?);
+            members.push(dispatch_probe_staffing(s, bundles, inputs, chat, &mut flags, guard)?);
             cycler.release(&s.pm)?;
         }
     }
@@ -1298,7 +1436,7 @@ fn finish_funnel(
     judge: &ResolvedSeatStaffing,
     chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
     cycler: &mut dyn ModelCycler,
-    emitter: &mut dyn FunnelEmitter,
+    guard: &mut FunnelBookendGuard<'_>,
 ) -> Result<FunnelEnvelope> {
     env.raw_flags = raw_flags.len();
 
@@ -1312,32 +1450,27 @@ fn finish_funnel(
         items_out: deduped.len(),
         wall_ms: dedup_ms,
     });
-    emitter.emit(funnel_flow_record(
-        &inputs.case_id,
-        &inputs.crew.name,
-        FUNNEL_STEP_ACTION,
-        darkmux_flow::Level::Info,
+    guard.step_finished(
+        "dedup",
         json!({
             "step_id": "dedup", "kind": "procedural", "status": "finished",
             "items_in": env.raw_flags, "items_out": deduped.len(), "wall_ms": dedup_ms,
         }),
-    ));
+    );
     env.deduped_flags = deduped.len();
 
     let judge_identifier = swap::namespaced_identifier(&judge.pm);
     let judge_max_tokens = judge.max_tokens.unwrap_or(DEFAULT_JUDGE_MAX_TOKENS);
 
     cycler.ensure_loaded(&judge.pm)?;
-    emitter.emit(funnel_flow_record(
-        &inputs.case_id,
-        &inputs.crew.name,
-        FUNNEL_STEP_ACTION,
-        darkmux_flow::Level::Info,
+    guard.step_started(
+        "judge-pass1",
+        "dispatch",
         json!({
             "step_id": "judge-pass1", "kind": "dispatch", "status": "started",
             "items_in": deduped.len(), "items_out": 0, "wall_ms": 0,
         }),
-    ));
+    );
     let mut judged = Vec::with_capacity(deduped.len());
     let mut pass1_ms = 0u64;
     let mut pass2_ms = 0u64;
@@ -1359,28 +1492,16 @@ fn finish_funnel(
         // The per-ruling ticker (#1247 Part 1) — one record per judge
         // dispatch outcome, emitted BEFORE `outcome`'s fields move into the
         // `JudgedFlag` below.
-        emitter.emit(funnel_flow_record(
-            &inputs.case_id,
-            &inputs.crew.name,
-            FUNNEL_RULING_ACTION,
-            darkmux_flow::Level::Info,
-            json!({
-                "bundle_id": flag.bundle_id, "pass": 1,
-                "ruling": outcome.pass1.ruling, "seconds": outcome.pass1.seconds,
-            }),
-        ));
+        guard.ruling(json!({
+            "bundle_id": flag.bundle_id, "pass": 1,
+            "ruling": outcome.pass1.ruling, "seconds": outcome.pass1.seconds,
+        }));
         if let Some(p2) = &outcome.pass2 {
             pass2_flags += 1;
-            emitter.emit(funnel_flow_record(
-                &inputs.case_id,
-                &inputs.crew.name,
-                FUNNEL_RULING_ACTION,
-                darkmux_flow::Level::Info,
-                json!({
-                    "bundle_id": flag.bundle_id, "pass": 2,
-                    "ruling": p2.ruling, "seconds": p2.seconds,
-                }),
-            ));
+            guard.ruling(json!({
+                "bundle_id": flag.bundle_id, "pass": 2,
+                "ruling": p2.ruling, "seconds": p2.seconds,
+            }));
         }
         judged.push(JudgedFlag {
             flag: flag.clone(),
@@ -1408,16 +1529,13 @@ fn finish_funnel(
         items_out: deduped.len(),
         wall_ms: pass1_ms,
     });
-    emitter.emit(funnel_flow_record(
-        &inputs.case_id,
-        &inputs.crew.name,
-        FUNNEL_STEP_ACTION,
-        darkmux_flow::Level::Info,
+    guard.step_finished(
+        "judge-pass1",
         json!({
             "step_id": "judge-pass1", "kind": "dispatch", "status": "finished",
             "items_in": deduped.len(), "items_out": deduped.len(), "wall_ms": pass1_ms,
         }),
-    ));
+    );
     if pass2_flags > 0 {
         env.steps.push(StepRecord {
             step_id: "judge-pass2".to_string(),
@@ -1431,26 +1549,21 @@ fn finish_funnel(
         // land back-to-back here, both carrying the real elapsed `wall_ms`,
         // rather than a `started` record with a foreknown-but-false docket
         // size.
-        emitter.emit(funnel_flow_record(
-            &inputs.case_id,
-            &inputs.crew.name,
-            FUNNEL_STEP_ACTION,
-            darkmux_flow::Level::Info,
+        guard.step_started(
+            "judge-pass2",
+            "dispatch",
             json!({
                 "step_id": "judge-pass2", "kind": "dispatch", "status": "started",
                 "items_in": pass2_flags, "items_out": 0, "wall_ms": 0,
             }),
-        ));
-        emitter.emit(funnel_flow_record(
-            &inputs.case_id,
-            &inputs.crew.name,
-            FUNNEL_STEP_ACTION,
-            darkmux_flow::Level::Info,
+        );
+        guard.step_finished(
+            "judge-pass2",
             json!({
                 "step_id": "judge-pass2", "kind": "dispatch", "status": "finished",
                 "items_in": pass2_flags, "items_out": pass2_flags, "wall_ms": pass2_ms,
             }),
-        ));
+        );
     }
 
     env.confirmed = judged.iter().filter(|j| j.tier == Tier::Confirmed).count();
@@ -1485,7 +1598,7 @@ fn finish_funnel(
 
     env.flags = deduped;
     env.judged = judged;
-    emitter.emit(task_finished_record(&env));
+    guard.task_finished(&env);
     Ok(env)
 }
 
@@ -1527,17 +1640,16 @@ pub fn run_funnel(
         ..Default::default()
     };
     // `funnel.task` started (#1247 Part 1) — run started: case id, crew
-    // name, exec mode, bundle count.
-    emitter.emit(funnel_flow_record(
-        &inputs.case_id,
-        &inputs.crew.name,
-        FUNNEL_TASK_ACTION,
-        darkmux_flow::Level::Info,
-        json!({
-            "status": "started", "case_id": inputs.case_id, "crew": inputs.crew.name,
-            "exec_mode": mode_label(mode), "bundles": bundles.len(),
-        }),
-    ));
+    // name, exec mode, bundle count. From here every emission routes
+    // through the bookend guard, which ARMS on this record: an early
+    // `?`-return or panic below fires its Drop path (open steps closed with
+    // `status: "error"`, then a terminal error task record) so no consumer
+    // ever sees an orphaned `started`.
+    let mut guard = FunnelBookendGuard::new(emitter, &inputs.case_id, &inputs.crew.name);
+    guard.task_started(json!({
+        "status": "started", "case_id": inputs.case_id, "crew": inputs.crew.name,
+        "exec_mode": mode_label(mode), "bundles": bundles.len(),
+    }));
     env.steps.push(StepRecord {
         step_id: "bundle".to_string(),
         kind: "procedural".to_string(),
@@ -1545,35 +1657,30 @@ pub fn run_funnel(
         items_out: bundles.len(),
         wall_ms: bundle_ms,
     });
-    emitter.emit(funnel_flow_record(
-        &inputs.case_id,
-        &inputs.crew.name,
-        FUNNEL_STEP_ACTION,
-        darkmux_flow::Level::Info,
+    guard.step_finished(
+        "bundle",
         json!({
             "step_id": "bundle", "kind": "procedural", "status": "finished",
             "items_in": 1, "items_out": bundles.len(), "wall_ms": bundle_ms,
         }),
-    ));
+    );
     if bundles.is_empty() {
         env.degenerate = Some("no bundles produced from the diff".to_string());
-        emitter.emit(task_finished_record(&env));
+        guard.task_finished(&env);
         return Ok(env);
     }
 
     let t_probe = Instant::now();
-    emitter.emit(funnel_flow_record(
-        &inputs.case_id,
-        &inputs.crew.name,
-        FUNNEL_STEP_ACTION,
-        darkmux_flow::Level::Info,
+    guard.step_started(
+        "probe",
+        "dispatch",
         json!({
             "step_id": "probe", "kind": "dispatch", "status": "started",
             "items_in": bundles.len(), "items_out": 0, "wall_ms": 0,
         }),
-    ));
+    );
     let raw_flags =
-        probe_phase(&bundles, probes, inputs, &mut chat, cycler, &mut env.members, mode, emitter)
+        probe_phase(&bundles, probes, inputs, &mut chat, cycler, &mut env.members, mode, &mut guard)
             .context("review funnel: probe phase")?;
     let probe_ms = t_probe.elapsed().as_millis() as u64;
     env.steps.push(StepRecord {
@@ -1583,24 +1690,21 @@ pub fn run_funnel(
         items_out: raw_flags.len(),
         wall_ms: probe_ms,
     });
-    emitter.emit(funnel_flow_record(
-        &inputs.case_id,
-        &inputs.crew.name,
-        FUNNEL_STEP_ACTION,
-        darkmux_flow::Level::Info,
+    guard.step_finished(
+        "probe",
         json!({
             "step_id": "probe", "kind": "dispatch", "status": "finished",
             "items_in": bundles.len(), "items_out": raw_flags.len(), "wall_ms": probe_ms,
         }),
-    ));
+    );
     if raw_flags.is_empty() {
         env.raw_flags = 0;
         env.degenerate = Some("zero flags from all probe draws — never a silent pass".to_string());
-        emitter.emit(task_finished_record(&env));
+        guard.task_finished(&env);
         return Ok(env);
     }
 
-    finish_funnel(env, raw_flags, &bundles, inputs, judge, &mut chat, cycler, emitter)
+    finish_funnel(env, raw_flags, &bundles, inputs, judge, &mut chat, cycler, &mut guard)
 }
 
 /// Re-judge a previously-recorded flag list without re-running the probe
@@ -1639,16 +1743,13 @@ pub fn run_judge_only(
         staffing: Some(staffing_snapshot(probes, judge)),
         ..Default::default()
     };
-    emitter.emit(funnel_flow_record(
-        &inputs.case_id,
-        &inputs.crew.name,
-        FUNNEL_TASK_ACTION,
-        darkmux_flow::Level::Info,
-        json!({
-            "status": "started", "case_id": inputs.case_id, "crew": inputs.crew.name,
-            "exec_mode": mode_label(mode), "bundles": bundles.len(),
-        }),
-    ));
+    // Same guard discipline as `run_funnel` — see its comment at the
+    // matching site.
+    let mut guard = FunnelBookendGuard::new(emitter, &inputs.case_id, &inputs.crew.name);
+    guard.task_started(json!({
+        "status": "started", "case_id": inputs.case_id, "crew": inputs.crew.name,
+        "exec_mode": mode_label(mode), "bundles": bundles.len(),
+    }));
     env.steps.push(StepRecord {
         step_id: "bundle".to_string(),
         kind: "procedural".to_string(),
@@ -1656,23 +1757,20 @@ pub fn run_judge_only(
         items_out: bundles.len(),
         wall_ms: bundle_ms,
     });
-    emitter.emit(funnel_flow_record(
-        &inputs.case_id,
-        &inputs.crew.name,
-        FUNNEL_STEP_ACTION,
-        darkmux_flow::Level::Info,
+    guard.step_finished(
+        "bundle",
         json!({
             "step_id": "bundle", "kind": "procedural", "status": "finished",
             "items_in": 1, "items_out": bundles.len(), "wall_ms": bundle_ms,
         }),
-    ));
+    );
     if flags.is_empty() {
         env.degenerate = Some("--charges-file carried zero flags".to_string());
-        emitter.emit(task_finished_record(&env));
+        guard.task_finished(&env);
         return Ok(env);
     }
 
-    finish_funnel(env, flags, &bundles, inputs, judge, &mut chat, cycler, emitter)
+    finish_funnel(env, flags, &bundles, inputs, judge, &mut chat, cycler, &mut guard)
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -2301,6 +2399,189 @@ mod tests {
             "a degenerate run's task-finished record is Warn, not Info"
         );
         assert_eq!(finished.payload.as_ref().unwrap()["degenerate"].as_str().unwrap(), env.degenerate.unwrap());
+    }
+
+    // ── bookend guard (#1247 review round) — no orphaned started records ──
+
+    /// A probe dispatch error propagates out of `run_funnel` via `?` AFTER
+    /// `funnel.task started`, `probe started`, and `probe:<seat> started`
+    /// were emitted. Without the guard those three would dangle forever;
+    /// with it, the Drop path must close each open step (innermost-first,
+    /// `status: "error"`) and emit a terminal error task record — every
+    /// `started` gets a matching terminal event even on the abort path.
+    #[test]
+    fn bookend_guard_probe_dispatch_error_closes_open_steps_and_emits_terminal_task_record() {
+        let crew = valid_crew();
+        let inputs = FunnelInputs {
+            case_id: "c1".to_string(),
+            crew: &crew,
+            intent: "add a feature",
+            diff: DIFF,
+            mode: ExecMode::Sequential,
+            probe_system: "probe sys",
+            judge_system: "judge sys",
+            bundles: None,
+        };
+        let mut cycler = RecordingCycler::new();
+        let mut emitter = RecordingEmitter::new();
+        let mut chat =
+            |_call: &ChatCall| -> Result<SingleShotReply> { Err(anyhow!("network down")) };
+        let err = run_funnel(&inputs, &mut chat, &mut cycler, &mut emitter).unwrap_err();
+        assert!(err.to_string().contains("probe phase"), "the original error still propagates: {err:#}");
+
+        // The record stream stays pair-consistent: the seat step closes
+        // first (innermost), then the probe phase step, then the task.
+        let tail: Vec<(String, String)> = emitter
+            .records
+            .iter()
+            .rev()
+            .take(3)
+            .map(|r| {
+                let p = r.payload.as_ref().unwrap();
+                (
+                    r.action.clone(),
+                    p["step_id"].as_str().unwrap_or_else(|| p["status"].as_str().unwrap()).to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            tail,
+            vec![
+                ("funnel.task".to_string(), "error".to_string()),
+                ("funnel.step".to_string(), "probe".to_string()),
+                ("funnel.step".to_string(), "probe:fast".to_string()),
+            ],
+            "reading backwards: terminal task record last, preceded by probe then probe:<seat> error-closes"
+        );
+        for r in emitter.records.iter().rev().take(3) {
+            assert!(matches!(r.level, darkmux_flow::Level::Error), "abort-path records are Level::Error");
+            let status = r.payload.as_ref().unwrap()["status"].as_str().unwrap();
+            assert_eq!(status, "error");
+        }
+        // Exactly one terminal task record — the guard fired once, and the
+        // clean-path task_finished never ran.
+        let task_terminals = emitter
+            .records
+            .iter()
+            .filter(|r| {
+                r.action == "funnel.task"
+                    && r.payload.as_ref().unwrap()["status"].as_str() != Some("started")
+            })
+            .count();
+        assert_eq!(task_terminals, 1);
+    }
+
+    /// The reviewer-named scenario: a chat closure that errors mid-JUDGE-
+    /// docket. Judge dispatch errors are deliberately swallowed per-flag
+    /// (`FunnelRuling::Error` → `Tier::Archived` — one bad call must not
+    /// abort the docket), so the run COMPLETES and the terminal task record
+    /// is the ordinary `finished` one (degenerate-marked by the judge-dead
+    /// honesty gate, since NO flag got a usable ruling). Either way the
+    /// invariant under test holds: a terminal task record exists — no
+    /// orphaned `started`.
+    #[test]
+    fn bookend_guard_chat_error_mid_judge_docket_still_yields_terminal_task_record() {
+        let crew = valid_crew();
+        let inputs = FunnelInputs {
+            case_id: "c1".to_string(),
+            crew: &crew,
+            intent: "add a feature",
+            diff: DIFF,
+            mode: ExecMode::Sequential,
+            probe_system: "probe sys",
+            judge_system: "judge sys",
+            bundles: None,
+        };
+        let mut cycler = RecordingCycler::new();
+        let mut emitter = RecordingEmitter::new();
+        let mut chat = |call: &ChatCall| -> Result<SingleShotReply> {
+            if call.model.contains("probe-model") {
+                Ok(reply("a real defect `const end = start.plus(30)`"))
+            } else {
+                // Every judge call errors — mid-docket dispatch failure.
+                Err(anyhow!("judge endpoint down"))
+            }
+        };
+        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut emitter)
+            .expect("judge dispatch errors are swallowed per-flag, never abort the run");
+        assert!(env.degenerate.is_some(), "the judge-dead honesty gate marks the envelope");
+
+        let last = emitter.records.last().unwrap();
+        assert_eq!(last.action, "funnel.task");
+        assert_eq!(
+            last.payload.as_ref().unwrap()["status"].as_str(),
+            Some("finished"),
+            "the run completed cleanly, so the terminal record is finished (degenerate), not the guard's error"
+        );
+        assert!(last.payload.as_ref().unwrap()["degenerate"].is_string());
+        // The judge-pass1 step still closed normally.
+        assert!(emitter.records.iter().any(|r| {
+            r.action == "funnel.step"
+                && r.payload.as_ref().unwrap()["step_id"].as_str() == Some("judge-pass1")
+                && r.payload.as_ref().unwrap()["status"].as_str() == Some("finished")
+        }));
+    }
+
+    /// The genuine mid-docket abort vector: the judge's `cycler.release`
+    /// failing AFTER `judge-pass1 started` was emitted and the docket ran.
+    /// The guard must close `judge-pass1` with `status: "error"` and emit
+    /// the terminal error task record.
+    #[test]
+    fn bookend_guard_judge_release_failure_closes_judge_pass1_and_task() {
+        /// Cycler whose `release` fails for one named model id.
+        struct FailingReleaseCycler {
+            fail_on: String,
+        }
+        impl ModelCycler for FailingReleaseCycler {
+            fn ensure_loaded(&mut self, _pm: &ProfileModel) -> Result<()> {
+                Ok(())
+            }
+            fn release(&mut self, pm: &ProfileModel) -> Result<()> {
+                if pm.id == self.fail_on {
+                    bail!("simulated release failure for {}", pm.id);
+                }
+                Ok(())
+            }
+        }
+        let crew = valid_crew();
+        let inputs = FunnelInputs {
+            case_id: "c1".to_string(),
+            crew: &crew,
+            intent: "add a feature",
+            diff: DIFF,
+            mode: ExecMode::Sequential,
+            probe_system: "probe sys",
+            judge_system: "judge sys",
+            bundles: None,
+        };
+        let mut cycler = FailingReleaseCycler { fail_on: "judge-model".to_string() };
+        let mut emitter = RecordingEmitter::new();
+        let mut call_n = 0u32;
+        let mut chat = |_call: &ChatCall| {
+            call_n += 1;
+            if call_n <= 2 {
+                Ok(reply("a real defect `const end = start.plus(30)`"))
+            } else {
+                Ok(reply(CONFIRM_JSON))
+            }
+        };
+        let err = run_funnel(&inputs, &mut chat, &mut cycler, &mut emitter).unwrap_err();
+        assert!(err.to_string().contains("release failure"), "{err:#}");
+
+        let last = emitter.records.last().unwrap();
+        assert_eq!(last.action, "funnel.task");
+        assert_eq!(last.payload.as_ref().unwrap()["status"].as_str(), Some("error"));
+        let second_to_last = &emitter.records[emitter.records.len() - 2];
+        assert_eq!(second_to_last.action, "funnel.step");
+        assert_eq!(
+            second_to_last.payload.as_ref().unwrap()["step_id"].as_str(),
+            Some("judge-pass1"),
+            "judge-pass1 was the open step at the release failure"
+        );
+        assert_eq!(second_to_last.payload.as_ref().unwrap()["status"].as_str(), Some("error"));
+        // The rulings the docket DID produce before the abort are on the
+        // stream — partial progress is preserved, not retconned.
+        assert!(emitter.records.iter().any(|r| r.action == "funnel.ruling"));
     }
 
     // ── staffing snapshot (#1247 lab-view addition) ────────────────────

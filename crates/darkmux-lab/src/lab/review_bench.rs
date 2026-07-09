@@ -835,34 +835,50 @@ fn review_from_funnel(env: &super::funnel::FunnelEnvelope) -> Review {
 /// fleet sink writes, so a future consumer renders identical vocabulary
 /// regardless of which sink produced it.
 ///
-/// Appends one JSON line per record and syncs the file after every write —
-/// a live `tail -f` sees progress in real time, and a killed run loses
-/// nothing already emitted. Best-effort: an emit failure (disk full, a
-/// permissions problem) is swallowed rather than aborting the bench — flow
-/// observability must never be the reason a bench run fails.
+/// Appends one JSON line per record, holding the file handle open for the
+/// emitter's lifetime — the parent dir is created and the file opened ONCE,
+/// on the first emit (lazily, not at construction: `run_review_bench`
+/// constructs the emitter for every mode but only Funnel mode ever emits,
+/// and a strict/freeform run must not leave an empty `funnel-events.jsonl`
+/// behind), then each record is one `write` + `flush` — enough for a live
+/// `tail -f` to see progress in real time, without the per-record
+/// mkdir/open/fsync churn of reopening (~hundreds of records per case;
+/// review-round item on the #1247 PR). Best-effort throughout: an open or
+/// write failure (disk full, a permissions problem) is swallowed rather
+/// than aborting the bench — flow observability must never be the reason a
+/// bench run fails. A failed open is not retried (`opened` latches), so a
+/// persistently-broken path costs one attempt total, not one per record.
 struct LocalJsonlEmitter {
     path: PathBuf,
+    file: Option<fs::File>,
+    /// Latched after the first emit's open attempt — success or failure.
+    opened: bool,
 }
 
 impl LocalJsonlEmitter {
     fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self { path, file: None, opened: false }
     }
 }
 
 impl super::funnel::FunnelEmitter for LocalJsonlEmitter {
     fn emit(&mut self, record: darkmux_flow::FlowRecord) {
         use std::io::Write;
+        if !self.opened {
+            self.opened = true;
+            if let Some(parent) = self.path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            self.file = fs::OpenOptions::new().create(true).append(true).open(&self.path).ok();
+        }
+        let Some(f) = self.file.as_mut() else {
+            return;
+        };
         let Ok(line) = serde_json::to_string(&record) else {
             return;
         };
-        if let Some(parent) = self.path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&self.path) {
-            if writeln!(f, "{line}").is_ok() {
-                let _ = f.sync_all();
-            }
+        if writeln!(f, "{line}").is_ok() {
+            let _ = f.flush();
         }
     }
 }
@@ -2622,6 +2638,63 @@ mod tests {
         assert!(s.recall, "match_contains recovers the catch even with no dedup anchor");
         assert_eq!(s.bugs_caught, 1);
         assert_eq!(s.fp, 0);
+    }
+
+    // ── LocalJsonlEmitter: file mechanics (#1247 review round) ──────────
+
+    #[test]
+    fn local_jsonl_emitter_appends_one_parseable_line_per_record() {
+        use super::super::funnel::FunnelEmitter;
+
+        fn rec(action: &str) -> darkmux_flow::FlowRecord {
+            darkmux_flow::FlowRecord {
+                ts: darkmux_flow::ts_utc_now(),
+                level: darkmux_flow::Level::Info,
+                category: darkmux_flow::Category::Work,
+                tier: darkmux_flow::Tier::Local,
+                stage: darkmux_flow::Stage::Dispatch,
+                action: action.to_string(),
+                handle: "test-crew".to_string(),
+                sprint_id: None,
+                session_id: Some("c1".to_string()),
+                source: Some("funnel".to_string()),
+                model: None,
+                reasoning: None,
+                mission_id: None,
+                machine_id: None,
+                machine_uid: None,
+                orchestrator: None,
+                prev_hash: None,
+                hash: None,
+                payload: Some(serde_json::json!({"status": "started"})),
+                work_id: None,
+                attempt: None,
+            }
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        // A nested, not-yet-existing parent proves the lazy create_dir_all.
+        let path = tmp.path().join("run-dir").join("funnel-events.jsonl");
+        let mut emitter = LocalJsonlEmitter::new(path.clone());
+
+        // Construction alone must not touch the filesystem — a bench run in
+        // a non-funnel mode constructs the emitter but never emits, and must
+        // not leave an empty funnel-events.jsonl (or its dir) behind.
+        assert!(!path.exists(), "no file before the first emit");
+        assert!(!path.parent().unwrap().exists(), "no dir before the first emit");
+
+        emitter.emit(rec("funnel.task"));
+        assert!(path.is_file(), "the first emit creates dir + file");
+        emitter.emit(rec("funnel.step"));
+
+        let content = fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2, "one JSONL line per emitted record");
+        let first: darkmux_flow::FlowRecord = serde_json::from_str(lines[0]).expect("line 1 is a valid FlowRecord");
+        let second: darkmux_flow::FlowRecord = serde_json::from_str(lines[1]).expect("line 2 is a valid FlowRecord");
+        assert_eq!(first.action, "funnel.task");
+        assert_eq!(second.action, "funnel.step");
+        assert_eq!(first.session_id.as_deref(), Some("c1"));
     }
 
     // ── write_funnels_snapshot: per-case envelope streaming (#1247 Part 2) ──
