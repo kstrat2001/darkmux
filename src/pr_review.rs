@@ -699,6 +699,12 @@ pub fn cmd_run(opts: RunOpts) -> Result<i32> {
         if opts.github.is_some() {
             ignored.push("--github/--head-sha");
         }
+        if opts.bundler.is_some() {
+            ignored.push("--bundler");
+        }
+        if opts.k.is_some() {
+            ignored.push("--k");
+        }
         if !ignored.is_empty() {
             eprintln!(
                 "darkmux pr-review run: {} ignored with --from-envelope (synthesis-only, no dispatch)",
