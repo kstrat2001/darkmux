@@ -457,7 +457,12 @@ fn judge_json_candidates(text: &str) -> Vec<String> {
 // ─── citation validation (harness-side, mechanical) ─────────────────────
 
 /// The content of a unified-diff line: one leading `+`/`-`/space stripped.
-fn diff_line_content(line: &str) -> &str {
+///
+/// `pub(crate)`: reused by `super::funnel`'s anchor extraction (#1222 Phase
+/// B packet 4) so both charge-anchor matchers share ONE normalization
+/// discipline rather than re-deriving the same wrapped-line / marker-strip
+/// fixes twice.
+pub(crate) fn diff_line_content(line: &str) -> &str {
     line.strip_prefix(['+', '-', ' ']).unwrap_or(line)
 }
 
@@ -469,13 +474,13 @@ fn diff_line_content(line: &str) -> &str {
 /// struck bug case scored as a clean pass). Used by every anchor/quote
 /// matcher so the strike decision, the excerpt window, and the quote check
 /// stay consistent.
-fn normalize_anchor(a: &str) -> &str {
+pub(crate) fn normalize_anchor(a: &str) -> &str {
     diff_line_content(a.trim()).trim()
 }
 
 /// Whitespace runs collapsed to single spaces — the form both sides of a
 /// wrapped-line match are reduced to.
-fn collapse_ws(s: &str) -> String {
+pub(crate) fn collapse_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -487,7 +492,7 @@ fn collapse_ws(s: &str) -> String {
 /// `lastRecord`, so per-line containment struck the charge and the case
 /// scored as a clean pass. Wrapped quotes are legitimate verbatim evidence;
 /// only per-PHYSICAL-line matching says otherwise.
-fn collapsed_diff_content(diff: &str) -> String {
+pub(crate) fn collapsed_diff_content(diff: &str) -> String {
     collapse_ws(
         &diff
             .lines()
@@ -596,7 +601,7 @@ pub fn validate_rebuttal_quotes(
 /// 2+ backticks toggle fence state and cancel any open inline span; only
 /// single-backtick pairs outside a fence produce spans. An unclosed fence
 /// swallows the remainder (fewer spans → skip-validation, never a void).
-fn backtick_spans(s: &str) -> Vec<String> {
+pub(crate) fn backtick_spans(s: &str) -> Vec<String> {
     let chars: Vec<char> = s.chars().collect();
     let mut out = Vec::new();
     let mut in_fence = false;
