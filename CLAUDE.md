@@ -67,6 +67,23 @@ Codified policy (not orchestrator discretion):
 - The escalation **raises the review tier; it never lowers the gate** (operator sovereignty #44). Hygiene-only diffs may stay at the local tier.
 - Pairs with #799 (terminate on a verifiable mechanical check, never self-assessment) and the persisted-corrections brief injection (#849 half 1 — a correction made once is carried into the next brief, not re-derived).
 
+## No blind runs — instrument before you measure (operator mandate, 2026-07-09)
+
+**darkmux exists to observe local-AI work. A darkmux run that cannot be observed refutes the product.** This is the recursive success criterion applied to the project's own development: if operating darkmux means watching `tail -f` and `lms ps`, the observability claim is failing at home — and every gap felt while operating darkmux is a P0 feature request, not an inconvenience to work around.
+
+**The rule: no measurement-grade run launches until its observability surfaces exist.** A run whose only yield is a verdict line is a wasted run — the DATA is the product. Before any multi-hour or decision-bearing run, verify:
+
+1. **Per-event records stream to durable per-run-local files as they happen** — never end-of-run-only writes. A killed run keeps everything completed so far (per-case envelope streaming + `funnel-events.jsonl`, #1248).
+2. **Host telemetry samples alongside the work** (cpu/ram/load at ~2s cadence) so "when did it slow down and what else was the machine doing" is answerable from the artifact, not reconstructed from another tool's server logs (#1247).
+3. **The knob config is snapshotted into the artifact** (resolved staffing/model/k/max_tokens — `FunnelEnvelope.staffing`), so every run is self-describing for later series comparison.
+4. **A live observing surface is available** (the lab view when it lands; at minimum a live-tailing event file) — the operator must be able to SEE the run, not infer it.
+
+If a surface on this list doesn't exist for a new run type, **building it comes before the run**. Observability work precedes measurement work in priority; it is not polish.
+
+**Origin (2026-07-09, Phase B validation day):** a full day of funnel validation ran blind — a heavy corpus run was killed after case 1 and lost its entire envelope (end-of-run-only artifact writes); a ~10–15% inference slowdown from concurrent builds was invisible until reconstructed forensically from LMStudio's own server logs; overnight runs were nearly launched whose total observable yield would have been seven console lines. Operator: *"darkmux is fully designed to observe everything and we aren't... No data, no ability to pinpoint when things got slow because of another process. Make it doctrine or this whole project won't work."*
+
+Composes with: single-run-full-picture-first (verify a system with ONE complete instrumented run before corpus sweeps), smoke-before-long-runs, quiesced-machine for canon runs (until host sampling ships, measurement runs get no concurrent builds), and the lab-vs-fleet boundary (bench records stay per-run-local; engagement records ride the flow stream).
+
 ## Configuration (`config.json`)
 
 darkmux's canonical config surface is **`~/.darkmux/config.json`** (#661), written by `darkmux init`. Every setting resolves with one precedence — **`env(DARKMUX_*) > config.json > built-in default`** — and that precedence lives in exactly ONE place: `darkmux_types::config_access` (the env tier is read **live per-access**, so a `set_var` in a test or a power-user export still wins). A reader never has to wonder where a setting came from; `darkmux doctor` surfaces the resolved value + source.
