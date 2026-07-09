@@ -136,6 +136,57 @@ pub fn slice_code(source: &FileSource, refs: &[BundleRef]) -> Result<String> {
     Ok(out)
 }
 
+/// Render `refs` in the PROBE seat's Phase A format — a byte-for-byte
+/// Rust port of `probe-runner.py`'s `read_code_excerpt` + `dedupe_refs` +
+/// the `"\n\n".join(blocks)` in its `build_prompt` (#1256 parity): refs
+/// deduped by `(path, start, end)` in first-seen order, then per ref one
+/// block
+///
+/// ````text
+/// ### `<path>` (lines <s>-<e>)
+/// ```typescript
+/// <raw source lines s..=e>
+/// ```
+/// ````
+///
+/// with `s = max(1, start)` and `e = min(file_lines, end)` — the header
+/// echoes the CLAMPED span (unlike [`slice_code`], whose header echoes
+/// the ref verbatim). A ref whose file is unreadable, or whose clamped
+/// start exceeds the file's line count, is SKIPPED entirely (Python
+/// returns `None` and `build_prompt` drops it) — no `(unreadable: ...)`
+/// placeholder, no truncation marker, and no trailing newline after the
+/// last block. This is deliberately a SEPARATE renderer from
+/// [`slice_code`] (the judge seat's format, matching `judge-runner.py`'s
+/// own `slice_code`): Phase A formatted the two seats' code differently,
+/// and per-seat parity means porting both formats, not unifying them.
+pub fn slice_code_probe(source: &FileSource, refs: &[BundleRef]) -> Result<String> {
+    let mut seen: HashSet<(String, u32, u32)> = HashSet::new();
+    let mut blocks: Vec<String> = Vec::new();
+    for r in refs {
+        if !seen.insert((r.path.clone(), r.start, r.end)) {
+            continue;
+        }
+        let Some(content) = source.read_file(&r.path)? else {
+            continue;
+        };
+        let lines: Vec<&str> = content.lines().collect();
+        let s = r.start.max(1) as usize;
+        let e = (r.end as usize).min(lines.len());
+        if s > lines.len() {
+            continue;
+        }
+        // Python's `lines[s-1:e]` yields [] when e < s (a degenerate ref);
+        // the block is still emitted, with an empty snippet — mirror that
+        // rather than panicking on a backwards range.
+        let snippet = if e >= s { lines[s - 1..e].join("\n") } else { String::new() };
+        blocks.push(format!(
+            "### `{}` (lines {}-{})\n```typescript\n{}\n```",
+            r.path, s, e, snippet
+        ));
+    }
+    Ok(blocks.join("\n\n"))
+}
+
 /// Just the raw source lines `refs` point at, concatenated — no `//
 /// <path> (lines a-b)` header, no truncation marker. Used where callers
 /// need to scan CODE (identifier extraction), as opposed to
@@ -492,6 +543,80 @@ mod tests {
             fs::create_dir_all(parent).unwrap();
         }
         fs::write(full, content).unwrap();
+    }
+
+    // ── slice_code_probe: Phase A probe-format parity (#1256) ─────────
+    //
+    // Golden provenance: every expected string below was captured by
+    // RUNNING probe-runner.py's real `read_code_excerpt` (and, for the
+    // multi-ref join/dedupe cases, its `build_prompt`'s ref handling) on
+    // this exact synthetic two-function fixture during the #1256
+    // correction round — not hand-transcribed from a reading of the
+    // Python.
+
+    /// The synthetic fixture file — identical to the worktree file the
+    /// python reference was run against.
+    const PROBE_FIXTURE_TS: &str = "export function clampRetryDelay(attempt: number, base: number): number {\n  const delay = base * Math.pow(2, attempt);\n  return Math.min(delay, 30000);\n}\n\nexport function shouldRetry(attempt: number, maxAttempts: number): boolean {\n  return attempt < maxAttempts;\n}\n";
+
+    fn probe_fixture_source() -> (TempDir, FileSource) {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "src/example.ts", PROBE_FIXTURE_TS);
+        let source = FileSource::worktree(dir.path());
+        (dir, source)
+    }
+
+    #[test]
+    fn slice_code_probe_single_ref_matches_read_code_excerpt_golden() {
+        let (_dir, source) = probe_fixture_source();
+        let refs = [BundleRef { path: "src/example.ts".to_string(), start: 1, end: 4 }];
+        // read_code_excerpt golden, verbatim.
+        let golden = "### `src/example.ts` (lines 1-4)\n```typescript\nexport function clampRetryDelay(attempt: number, base: number): number {\n  const delay = base * Math.pow(2, attempt);\n  return Math.min(delay, 30000);\n}\n```";
+        assert_eq!(slice_code_probe(&source, &refs).unwrap(), golden);
+    }
+
+    #[test]
+    fn slice_code_probe_dedupes_refs_and_joins_blocks_with_a_blank_line() {
+        let (_dir, source) = probe_fixture_source();
+        let refs = [
+            BundleRef { path: "src/example.ts".to_string(), start: 1, end: 4 },
+            // Exact duplicate — dedupe_refs drops it (first-seen wins).
+            BundleRef { path: "src/example.ts".to_string(), start: 1, end: 4 },
+            BundleRef { path: "src/example.ts".to_string(), start: 6, end: 8 },
+        ];
+        // build_prompt's code_section golden for the same three refs.
+        let golden = "### `src/example.ts` (lines 1-4)\n```typescript\nexport function clampRetryDelay(attempt: number, base: number): number {\n  const delay = base * Math.pow(2, attempt);\n  return Math.min(delay, 30000);\n}\n```\n\n### `src/example.ts` (lines 6-8)\n```typescript\nexport function shouldRetry(attempt: number, maxAttempts: number): boolean {\n  return attempt < maxAttempts;\n}\n```";
+        assert_eq!(slice_code_probe(&source, &refs).unwrap(), golden);
+    }
+
+    #[test]
+    fn slice_code_probe_clamps_the_header_to_the_files_real_extent() {
+        // Unlike slice_code (judge format), whose header echoes the ref's
+        // own out-of-range end verbatim, read_code_excerpt clamps BOTH the
+        // slice and the header: end=100 on an 8-line file renders as
+        // `(lines 1-8)`. Golden from running read_code_excerpt on this ref.
+        let (_dir, source) = probe_fixture_source();
+        let refs = [BundleRef { path: "src/example.ts".to_string(), start: 1, end: 100 }];
+        let golden = "### `src/example.ts` (lines 1-8)\n```typescript\nexport function clampRetryDelay(attempt: number, base: number): number {\n  const delay = base * Math.pow(2, attempt);\n  return Math.min(delay, 30000);\n}\n\nexport function shouldRetry(attempt: number, maxAttempts: number): boolean {\n  return attempt < maxAttempts;\n}\n```";
+        assert_eq!(slice_code_probe(&source, &refs).unwrap(), golden);
+    }
+
+    #[test]
+    fn slice_code_probe_skips_unreadable_and_past_eof_refs_entirely() {
+        // Python returns None for an unreadable file OR a start past EOF,
+        // and build_prompt drops the block — no placeholder, no header.
+        let (_dir, source) = probe_fixture_source();
+        let refs = [
+            BundleRef { path: "src/missing.ts".to_string(), start: 1, end: 3 },
+            BundleRef { path: "src/example.ts".to_string(), start: 99, end: 120 },
+            BundleRef { path: "src/example.ts".to_string(), start: 6, end: 8 },
+        ];
+        let out = slice_code_probe(&source, &refs).unwrap();
+        assert!(
+            out.starts_with("### `src/example.ts` (lines 6-8)"),
+            "skipped refs leave no trace — the surviving block is the whole output: {out}"
+        );
+        assert!(!out.contains("missing.ts"));
+        assert!(!out.contains("unreadable"));
     }
 
     #[test]

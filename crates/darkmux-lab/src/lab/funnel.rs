@@ -529,6 +529,15 @@ pub struct StaffingSnapshot {
     /// [`MemberRecord::model`] records, so the two line up at a glance.
     pub model: String,
     pub k: u32,
+    /// The resolved `ProfileModel`'s DECLARED context length — settings
+    /// provenance per run, so "what context was this model loaded at" is
+    /// never a forensic question (a sibling concern to the config-vs-
+    /// measured-context mismatch class of bug #1135 shipped). `#[serde(default)]`
+    /// so a pre-#1256 snapshot (staffing existed, this field didn't)
+    /// deserializes as `0` rather than a hard parse failure — the same
+    /// schema-lenience discipline every field in this module follows.
+    #[serde(default)]
+    pub n_ctx: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -549,6 +558,7 @@ fn staffing_snapshot(probes: &[ResolvedSeatStaffing], judge: &ResolvedSeatStaffi
             name: s.name.clone(),
             model: swap::namespaced_identifier(&s.pm),
             k: s.k,
+            n_ctx: s.pm.n_ctx,
             max_tokens: s.max_tokens,
             selector: s.selector.clone(),
         }
@@ -861,35 +871,54 @@ pub fn dedup_flags(flags: Vec<ProbeFlag>, diff: &str) -> (Vec<ProbeFlag>, DedupS
 
 // ─── judge prompt + ruling parser ────────────────────────────────────────
 
-const JUDGE_TAIL_INSTRUCTION: &str = "Investigate the flagged item against the code above. End your reply with exactly one fenced JSON block:\n\n```json\n{\"ruling\": \"confirmed\" | \"needs_check\" | \"false_positive\", \"decisive_evidence\": \"<the specific code line or checked claim that decided it>\", \"note_for_author\": \"<one or two sentences the author reads>\"}\n```\n";
+/// The frozen one-fenced-JSON instruction tail — byte-identical to
+/// `judge-runner.py`'s `judge_one` f-string tail (Phase A parity, #1256).
+/// No leading blank line of its own; callers that need one add it (see
+/// [`judge_prompt`]'s assembly, which needs a bare `\n` before this, not
+/// `\n\n`).
+const JUDGE_TAIL_INSTRUCTION: &str = "Investigate the flagged item against the code above. End your reply with exactly one fenced JSON block:\n```json\n{\"ruling\": \"confirmed\" | \"needs_check\" | \"false_positive\", \"decisive_evidence\": \"<the specific code line or checked claim that decided it>\", \"note_for_author\": \"<one or two sentences the author reads>\"}\n```";
 
-/// Build the judge's prompt: the author's stated case, the code under
-/// review, the fact sheet (when non-empty), a MANIFEST of symbols
-/// referenced but not defined in the provided code (when non-empty), the
-/// flagged item, then the frozen one-fenced-JSON instruction tail.
-pub fn judge_prompt(intent: &str, code: &str, facts: &[String], manifest: &[String], charge: &str) -> String {
+/// Build the judge's prompt — byte-identical to `judge-runner.py`'s
+/// `judge_one`'s `user` f-string assembly, given the same inputs (#1256):
+/// the author's stated case (title + description, each independently
+/// defaulted/stripped exactly as Python does — see below), the code under
+/// review (fenced ```` ```typescript ````, matching the Python template
+/// literally), the fact sheet (when non-empty, header + raw `- `-free
+/// lines — Phase A's fact sheet has NO bullet prefix, unlike the probe's),
+/// the flagged item, then the frozen fenced-JSON instruction tail.
+///
+/// Phase A has no MANIFEST section (`bundler.py`'s bundles carry no such
+/// field and `judge_one` never renders one) — the Rust funnel's `manifest`
+/// input is Rust-only and, per the "match Phase A exactly" operator
+/// decision (#1256), is DROPPED from this prompt entirely, not silently
+/// kept. `BundleInput.manifest` still exists (available to a future
+/// synthesis/reporting consumer) — it just never reaches this prompt.
+///
+/// `intent_title`/`intent_body` mirror `judge_one`'s two SEPARATE inputs
+/// (`lab.get('intent_title', '')` / `lab.get('intent_body') or default,
+/// .strip()`-ed) rather than one pre-joined string — this is what lets a
+/// title-present-body-absent case byte-match Python exactly (title still
+/// renders, only the body line defaults), a case a single combined field
+/// can't distinguish from "everything blank".
+pub fn judge_prompt(intent_title: &str, intent_body: &str, code: &str, facts: &[String], charge: &str) -> String {
+    let body = intent_body.trim();
+    let body = if body.is_empty() { "(no description provided)" } else { body };
     let mut out = String::new();
-    let intent = intent.trim();
-    out.push_str(&format!(
-        "Author's stated case for this change:\n{}\n\n",
-        if intent.is_empty() { "(no description provided)" } else { intent }
-    ));
-    out.push_str(&format!("The code under review:\n```\n{code}\n```\n\n"));
+    out.push_str("## The author's stated case (the pull request description)\n");
+    out.push_str(intent_title);
+    out.push('\n');
+    out.push_str(body);
+    out.push_str("\n\n## The code under review\n```typescript\n");
+    out.push_str(code);
+    out.push_str("\n```\n");
     if !facts.is_empty() {
-        out.push_str("Fact sheet:\n");
-        for f in facts {
-            out.push_str(&format!("- {f}\n"));
-        }
+        out.push_str("\n## Fact sheet given to the flagging reviewer\n");
+        out.push_str(&facts.join("\n"));
         out.push('\n');
     }
-    if !manifest.is_empty() {
-        out.push_str("Symbols referenced but not defined in the provided code:\n");
-        for m in manifest {
-            out.push_str(&format!("- {m}\n"));
-        }
-        out.push('\n');
-    }
-    out.push_str(&format!("The flagged item:\n{charge}\n\n"));
+    out.push_str("\n## The flagged item to investigate\n");
+    out.push_str(charge);
+    out.push_str("\n\n");
     out.push_str(JUDGE_TAIL_INSTRUCTION);
     out
 }
@@ -959,8 +988,24 @@ pub fn parse_judge_ruling(text: &str) -> Option<(FunnelRuling, String, String)> 
 pub struct BundleInput {
     pub id: String,
     pub fact_family: String,
+    /// The JUDGE seat's code rendering — `bundle::slice_code`'s
+    /// `// path (lines a-b)` raw-text format, matching `judge-runner.py`'s
+    /// own `slice_code` (#1256).
     pub code: String,
+    /// The PROBE seat's code rendering — `bundle::slice_code_probe`'s
+    /// ``### `path` (lines a-b)`` + ```` ```typescript ````-fenced blocks,
+    /// matching `probe-runner.py`'s `read_code_excerpt` (#1256 correction
+    /// round). Phase A formatted the two seats' code DIFFERENTLY; per-seat
+    /// parity means carrying both renderings, not unifying them.
+    /// [`probe_user_message`] reads this; [`judge_prompt`] reads `code`.
+    pub probe_code: String,
     pub facts: Vec<String>,
+    /// Symbols referenced but not defined in `code` — a Rust-only addition
+    /// Phase A never had (`bundler.py`'s bundles carry no such field). Per
+    /// the "match Phase A exactly" operator decision (#1256), [`judge_prompt`]
+    /// no longer reads this field — it's dropped from the prompt, not
+    /// silently threaded through. Still populated by the real bundler and
+    /// kept here for a future synthesis/reporting consumer.
     pub manifest: Vec<String>,
 }
 
@@ -986,10 +1031,15 @@ fn bundles_from_diff(diff: &str) -> Vec<BundleInput> {
     let flush = |path: &mut Option<String>, lines: &mut Vec<&str>, out: &mut Vec<BundleInput>| {
         if let Some(p) = path.take() {
             if !lines.is_empty() {
+                let code = lines.join("\n");
                 out.push(BundleInput {
                     id: p,
                     fact_family: "unscoped".to_string(),
-                    code: lines.join("\n"),
+                    // Test-only fallback (no repo tree to re-slice from):
+                    // both seats see the same hunk text. Production callers
+                    // always render `probe_code` via `slice_code_probe`.
+                    probe_code: code.clone(),
+                    code,
                     facts: Vec::new(),
                     manifest: Vec::new(),
                 });
@@ -1070,10 +1120,26 @@ pub struct ChatCall<'a> {
 pub struct FunnelInputs<'a> {
     pub case_id: String,
     pub crew: &'a ResolvedCrew,
-    pub intent: &'a str,
+    /// The author's stated case (PR title). Fed into [`judge_prompt`] only
+    /// — Phase A never showed the probe seat the intent (#1256), so
+    /// [`probe_user_message`] never reads this field.
+    pub intent_title: &'a str,
+    /// The author's stated case (PR description). Same [`judge_prompt`]-
+    /// only scope as `intent_title` — see its doc comment.
+    pub intent_body: &'a str,
     pub diff: &'a str,
     pub mode: ExecMode,
+    /// The probe seat's PRIOR text (`review-probe.md`) — injected as the
+    /// FIRST line of the probe's user message (#1256's `probe_user_message`
+    /// assembly), never as a system-role message: Phase A's probe protocol
+    /// (`probe-runner.py`'s `call_model`) sends ONE user-role message with
+    /// no system message at all, and [`dispatch_probe_staffing`] now sends
+    /// an empty `ChatCall::system` for probe calls to match (which
+    /// `darkmux_crew::single_shot::local_chat_body` then omits from the
+    /// wire entirely).
     pub probe_system: &'a str,
+    /// The judge seat's PERSONA — still sent as a genuine system-role
+    /// message (`judge-runner.py`'s `call_judge` does the same).
     pub judge_system: &'a str,
     /// (#1222 Phase B packet 5 reconciliation) Caller-supplied bundles from
     /// the REAL bundler (`darkmux_lab::lab::bundle::build_bundles`/
@@ -1097,23 +1163,30 @@ fn fingerprint(judge_identifier: &str, judge_system: &str) -> serde_json::Value 
 
 // ─── probe phase ──────────────────────────────────────────────────────────
 
-fn probe_user_message(intent: &str, bundle: &BundleInput) -> String {
-    let mut out = String::new();
-    let intent = intent.trim();
-    if !intent.is_empty() {
-        out.push_str(&format!("Change intent: {intent}\n\n"));
-    }
+/// Build the probe's user message — byte-identical to `probe-runner.py`'s
+/// `build_prompt`, given the same inputs (#1256): `prior` (the seat's
+/// review-probe.md text, standing in for Python's hardcoded `STRONG_PRIOR`
+/// — see the golden test's provenance comment for how the two relate)
+/// first, a blank line, `Code:`, a blank line, the code section
+/// (`bundle.probe_code` — `read_code_excerpt`-format blocks:
+/// ``### `path` (lines a-b)`` + ```` ```typescript ```` fences, joined by
+/// blank lines, rendered by `bundle::slice_code_probe`; the PROBE format,
+/// distinct from the judge's `// path` raw format in `bundle.code`), then
+/// IF facts: a blank line, the fact-sheet header, a blank line, `- fact`
+/// lines. Deliberately NO intent anywhere in this prompt — Phase A's
+/// `build_prompt` never saw one; `FunnelInputs::intent_title`/
+/// `intent_body` are dropped here on purpose (kept for [`judge_prompt`]
+/// only), not silently threaded through.
+fn probe_user_message(prior: &str, bundle: &BundleInput) -> String {
+    let mut parts: Vec<String> =
+        vec![prior.to_string(), String::new(), "Code:".to_string(), String::new(), bundle.probe_code.clone()];
     if !bundle.facts.is_empty() {
-        out.push_str("Fact sheet:\n");
-        for f in &bundle.facts {
-            out.push_str(&format!("- {f}\n"));
-        }
-        out.push('\n');
+        parts.push(String::new());
+        parts.push("Computed facts about this code (mechanically extracted, not interpreted):".to_string());
+        parts.push(String::new());
+        parts.push(bundle.facts.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n"));
     }
-    out.push_str("Code:\n```\n");
-    out.push_str(&bundle.code);
-    out.push_str("\n```\n");
-    out
+    parts.join("\n")
 }
 
 /// One probe draw, retried once on empty content, then skipped (`Ok(None)`)
@@ -1176,12 +1249,16 @@ fn dispatch_probe_staffing(
     let mut tokens = 0u64;
     let flags_before = flags.len();
     for bundle in &selected {
-        let user = probe_user_message(inputs.intent, bundle);
+        let user = probe_user_message(inputs.probe_system, bundle);
         for draw in 0..s.k {
             draws += 1;
-            if let Some((text, tok)) =
-                probe_one_draw(chat, &identifier, inputs.probe_system, &user, max_tokens)?
-            {
+            // Empty system — Phase A parity (#1256): probe-runner.py's
+            // `call_model` sends ONE user-role message, no system message
+            // at all. `single_shot::local_chat_body` omits the system
+            // entry entirely when it's empty, so this is the wire-level
+            // no-system-message behavior, not a system message with blank
+            // content.
+            if let Some((text, tok)) = probe_one_draw(chat, &identifier, "", &user, max_tokens)? {
                 tokens += tok;
                 flags.push(ProbeFlag {
                     bundle_id: bundle.id.clone(),
@@ -1481,8 +1558,7 @@ fn finish_funnel(
         let bundle = bundles.iter().find(|b| b.id == flag.bundle_id);
         let code = bundle.map(|b| b.code.as_str()).unwrap_or_default();
         let facts: &[String] = bundle.map(|b| b.facts.as_slice()).unwrap_or_default();
-        let manifest: &[String] = bundle.map(|b| b.manifest.as_slice()).unwrap_or_default();
-        let prompt = judge_prompt(inputs.intent, code, facts, manifest, &flag.charge_text);
+        let prompt = judge_prompt(inputs.intent_title, inputs.intent_body, code, facts, &flag.charge_text);
         let outcome =
             judge_one_flag(&prompt, &judge_identifier, inputs.judge_system, judge_max_tokens, chat);
         judge_tokens += outcome.tokens;
@@ -2107,8 +2183,8 @@ mod tests {
     #[test]
     fn selector_filters_by_fact_family() {
         let bundles = vec![
-            BundleInput { id: "a".into(), fact_family: "auth".into(), code: String::new(), facts: vec![], manifest: vec![] },
-            BundleInput { id: "b".into(), fact_family: "billing".into(), code: String::new(), facts: vec![], manifest: vec![] },
+            BundleInput { id: "a".into(), fact_family: "auth".into(), code: String::new(), probe_code: String::new(), facts: vec![], manifest: vec![] },
+            BundleInput { id: "b".into(), fact_family: "billing".into(), code: String::new(), probe_code: String::new(), facts: vec![], manifest: vec![] },
         ];
         let sel =
             BundleSelector { fact_families: vec!["auth".to_string()], ..Default::default() };
@@ -2120,8 +2196,8 @@ mod tests {
     #[test]
     fn selector_no_selector_runs_every_bundle() {
         let bundles = vec![
-            BundleInput { id: "a".into(), fact_family: "auth".into(), code: String::new(), facts: vec![], manifest: vec![] },
-            BundleInput { id: "b".into(), fact_family: "billing".into(), code: String::new(), facts: vec![], manifest: vec![] },
+            BundleInput { id: "a".into(), fact_family: "auth".into(), code: String::new(), probe_code: String::new(), facts: vec![], manifest: vec![] },
+            BundleInput { id: "b".into(), fact_family: "billing".into(), code: String::new(), probe_code: String::new(), facts: vec![], manifest: vec![] },
         ];
         assert_eq!(select_bundles_for_staffing(&bundles, None).len(), 2);
     }
@@ -2129,9 +2205,9 @@ mod tests {
     #[test]
     fn selector_prioritizes_param_flow_and_respects_max_bundles() {
         let bundles = vec![
-            BundleInput { id: "a".into(), fact_family: "other".into(), code: String::new(), facts: vec![], manifest: vec![] },
-            BundleInput { id: "b".into(), fact_family: "param-flow".into(), code: String::new(), facts: vec![], manifest: vec![] },
-            BundleInput { id: "c".into(), fact_family: "other".into(), code: String::new(), facts: vec![], manifest: vec![] },
+            BundleInput { id: "a".into(), fact_family: "other".into(), code: String::new(), probe_code: String::new(), facts: vec![], manifest: vec![] },
+            BundleInput { id: "b".into(), fact_family: "param-flow".into(), code: String::new(), probe_code: String::new(), facts: vec![], manifest: vec![] },
+            BundleInput { id: "c".into(), fact_family: "other".into(), code: String::new(), probe_code: String::new(), facts: vec![], manifest: vec![] },
         ];
         let sel = BundleSelector { max_bundles: Some(2), ..Default::default() };
         let selected = select_bundles_for_staffing(&bundles, Some(&sel));
@@ -2197,7 +2273,8 @@ mod tests {
         let inputs = FunnelInputs {
             case_id: "c1".to_string(),
             crew: &crew,
-            intent: "add a feature",
+            intent_title: "add a feature",
+            intent_body: "",
             diff: DIFF,
             mode: ExecMode::Sequential,
             probe_system: "probe sys",
@@ -2228,7 +2305,8 @@ mod tests {
         let inputs = FunnelInputs {
             case_id: "c1".to_string(),
             crew: &crew,
-            intent: "add a feature",
+            intent_title: "add a feature",
+            intent_body: "",
             diff: DIFF,
             mode: ExecMode::Sequential,
             probe_system: "probe sys",
@@ -2295,7 +2373,8 @@ mod tests {
         let inputs = FunnelInputs {
             case_id: "c1".to_string(),
             crew: &crew,
-            intent: "add a feature",
+            intent_title: "add a feature",
+            intent_body: "",
             diff: DIFF,
             mode: ExecMode::Sequential,
             probe_system: "probe sys",
@@ -2376,7 +2455,8 @@ mod tests {
         let inputs = FunnelInputs {
             case_id: "c1".to_string(),
             crew: &crew,
-            intent: "",
+            intent_title: "",
+            intent_body: "",
             diff: "",
             mode: ExecMode::Sequential,
             probe_system: "probe sys",
@@ -2415,7 +2495,8 @@ mod tests {
         let inputs = FunnelInputs {
             case_id: "c1".to_string(),
             crew: &crew,
-            intent: "add a feature",
+            intent_title: "add a feature",
+            intent_body: "",
             diff: DIFF,
             mode: ExecMode::Sequential,
             probe_system: "probe sys",
@@ -2485,7 +2566,8 @@ mod tests {
         let inputs = FunnelInputs {
             case_id: "c1".to_string(),
             crew: &crew,
-            intent: "add a feature",
+            intent_title: "add a feature",
+            intent_body: "",
             diff: DIFF,
             mode: ExecMode::Sequential,
             probe_system: "probe sys",
@@ -2547,7 +2629,8 @@ mod tests {
         let inputs = FunnelInputs {
             case_id: "c1".to_string(),
             crew: &crew,
-            intent: "add a feature",
+            intent_title: "add a feature",
+            intent_body: "",
             diff: DIFF,
             mode: ExecMode::Sequential,
             probe_system: "probe sys",
@@ -2599,7 +2682,8 @@ mod tests {
         let inputs = FunnelInputs {
             case_id: "c1".to_string(),
             crew: &crew,
-            intent: "add a feature",
+            intent_title: "add a feature",
+            intent_body: "",
             diff: DIFF,
             mode: ExecMode::Sequential,
             probe_system: "probe sys",
@@ -2618,6 +2702,12 @@ mod tests {
         let judge = snapshot.judge.as_ref().expect("exactly one judge staffing");
         assert_eq!(judge.model, "darkmux:judge-model");
         assert_eq!(judge.k, 1);
+        // Settings provenance (scope extension on #1256): the resolved
+        // ProfileModel's declared context length, so "what context was this
+        // model loaded at" is never a forensic question. `pm()` fixtures
+        // n_ctx=32_000 for every model.
+        assert_eq!(snapshot.probes[0].n_ctx, 32_000);
+        assert_eq!(judge.n_ctx, 32_000);
 
         // The shape `funnels.json` persists — a JSON round trip must
         // preserve the snapshot exactly, same discipline as the envelope's
@@ -2626,7 +2716,9 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&json).expect("envelope parses back");
         assert_eq!(value["staffing"]["probes"][0]["k"], json!(9));
         assert_eq!(value["staffing"]["probes"][0]["model"], json!("darkmux:probe-model"));
+        assert_eq!(value["staffing"]["probes"][0]["n_ctx"], json!(32_000));
         assert_eq!(value["staffing"]["judge"]["model"], json!("darkmux:judge-model"));
+        assert_eq!(value["staffing"]["judge"]["n_ctx"], json!(32_000));
     }
 
     #[test]
@@ -2652,7 +2744,8 @@ mod tests {
         let inputs = FunnelInputs {
             case_id: "c1".to_string(),
             crew: &crew,
-            intent: "",
+            intent_title: "",
+            intent_body: "",
             diff: "",
             mode: ExecMode::Sequential,
             probe_system: "probe sys",
@@ -2679,7 +2772,8 @@ mod tests {
         let inputs = FunnelInputs {
             case_id: "c1".to_string(),
             crew: &crew,
-            intent: "add a feature",
+            intent_title: "add a feature",
+            intent_body: "",
             diff: DIFF,
             mode: ExecMode::Sequential,
             probe_system: "probe sys",
@@ -2711,7 +2805,8 @@ mod tests {
         let inputs = FunnelInputs {
             case_id: "c1".to_string(),
             crew: &crew,
-            intent: "add a feature",
+            intent_title: "add a feature",
+            intent_body: "",
             diff: DIFF,
             mode: ExecMode::Sequential,
             probe_system: "probe sys",
@@ -2747,7 +2842,8 @@ mod tests {
         let inputs = FunnelInputs {
             case_id: "c1".to_string(),
             crew: &crew,
-            intent: "add a feature",
+            intent_title: "add a feature",
+            intent_body: "",
             diff: DIFF,
             mode: ExecMode::Sequential,
             probe_system: "probe sys",
@@ -2780,7 +2876,8 @@ mod tests {
         let inputs = FunnelInputs {
             case_id: "c1".to_string(),
             crew: &crew,
-            intent: "add a feature",
+            intent_title: "add a feature",
+            intent_body: "",
             diff: DIFF,
             mode: ExecMode::Sequential,
             probe_system: "probe sys",
@@ -2806,7 +2903,8 @@ mod tests {
         let inputs = FunnelInputs {
             case_id: "c1".to_string(),
             crew: &crew,
-            intent: "add a feature",
+            intent_title: "add a feature",
+            intent_body: "",
             diff: DIFF,
             mode: ExecMode::Parallel,
             probe_system: "probe sys",
@@ -2846,17 +2944,16 @@ mod tests {
     fn judge_prompt_includes_all_sections_when_present() {
         let p = judge_prompt(
             "Add billing window",
+            "extends the retention window",
             "const end = start.plus(30)",
             &["fact one".to_string()],
-            &["helperFn".to_string()],
             "the boundary is double-counted",
         );
         assert!(p.contains("Add billing window"));
+        assert!(p.contains("extends the retention window"));
         assert!(p.contains("const end = start.plus(30)"));
-        assert!(p.contains("Fact sheet:"));
+        assert!(p.contains("## Fact sheet given to the flagging reviewer"));
         assert!(p.contains("fact one"));
-        assert!(p.contains("Symbols referenced but not defined in the provided code:"));
-        assert!(p.contains("helperFn"));
         assert!(p.contains("the boundary is double-counted"));
         assert!(p.contains("```json"));
         assert!(p.contains("\"ruling\""));
@@ -2864,10 +2961,127 @@ mod tests {
 
     #[test]
     fn judge_prompt_omits_bare_sections() {
-        let p = judge_prompt("", "code", &[], &[], "charge");
+        let p = judge_prompt("", "", "code", &[], "charge");
         assert!(p.contains("(no description provided)"));
-        assert!(!p.contains("Fact sheet:"));
-        assert!(!p.contains("Symbols referenced but not defined"));
+        assert!(!p.contains("## Fact sheet given to the flagging reviewer"));
+    }
+
+    /// Phase A parity (#1256): a title present but an ABSENT body defaults
+    /// only the body line — the title still renders. A single combined
+    /// `intent: &str` field couldn't distinguish this from "everything
+    /// blank"; separate `intent_title`/`intent_body` params can (and do,
+    /// matching `judge-runner.py`'s `judge_one` per-field defaulting).
+    #[test]
+    fn judge_prompt_title_present_body_absent_still_renders_the_title() {
+        let p = judge_prompt("Add billing window", "", "code", &[], "charge");
+        assert!(p.contains("Add billing window"));
+        assert!(p.contains("(no description provided)"));
+    }
+
+    // ── Phase A prompt-parity golden harness (#1256) ───────────────────
+    //
+    // Provenance: every golden constant below was captured by RUNNING the
+    // Phase A python reference (NOT hand-transcribed) against a synthetic,
+    // non-corpus fixture during development of this PR:
+    //   - probe-runner.py's own `build_prompt()` + `read_code_excerpt()`,
+    //     both real and unmodified, over a synthetic worktree containing
+    //     the two-function `src/example.ts` fixture — so the probe goldens
+    //     carry Phase A's OWN probe code format (``### `path` (lines
+    //     a-b)`` + a ```` ```typescript ```` fence per block), which
+    //     `bundle::slice_code_probe` ports and `BundleInput::probe_code`
+    //     carries (per-seat formats — the judge's `// path` raw format
+    //     lives in `BundleInput::code`).
+    //   - judge-runner.py's real `slice_code()` against the same synthetic
+    //     worktree, then `judge_one`'s exact `user` f-string template
+    //     (copy-pasted verbatim, not paraphrased) fed with synthetic
+    //     probe/bundle/label dicts — `judge_one` itself fires a live
+    //     LMStudio call and can't be invoked directly.
+    // The generating scripts are NOT checked into this repo (scratch,
+    // depend on the private `pr-review-corpus` fixture tree on the
+    // maintainer's machine) — this comment plus the fixture text below is
+    // the durable record of how each golden was produced.
+
+    /// The JUDGE-format fixture code slice — what `bundle::slice_code`
+    /// emits for a single-ref bundle (`// path (lines a-b)` header, raw
+    /// source lines, no fence), matching judge-runner.py's own
+    /// `slice_code`. Synthetic, non-corpus.
+    const GOLDEN_CODE: &str = "// src/example.ts (lines 1-4)\nexport function clampRetryDelay(attempt: number, base: number): number {\n  const delay = base * Math.pow(2, attempt);\n  return Math.min(delay, 30000);\n}";
+
+    /// The PROBE-format fixture code slice — `read_code_excerpt`'s output
+    /// for the same ref, captured verbatim from running the python
+    /// reference (``### `path` (lines a-b)`` + ```` ```typescript ````
+    /// fence); what `bundle::slice_code_probe` emits into
+    /// `BundleInput::probe_code`.
+    const GOLDEN_PROBE_CODE: &str = "### `src/example.ts` (lines 1-4)\n```typescript\nexport function clampRetryDelay(attempt: number, base: number): number {\n  const delay = base * Math.pow(2, attempt);\n  return Math.min(delay, 30000);\n}\n```";
+
+    /// `probe-runner.py`'s hardcoded `STRONG_PRIOR` constant, copied
+    /// verbatim — used ONLY as this golden test's `prior` argument, to
+    /// prove `probe_user_message`'s ASSEMBLY is byte-identical to
+    /// `build_prompt`'s. Production wiring passes `review-probe.md`'s text
+    /// instead (close in spirit, not necessarily byte-identical wording —
+    /// a persona-CONTENT question handled at the measurement layer, out of
+    /// this issue's scope).
+    const GOLDEN_STRONG_PRIOR: &str = "A thorough code review established that this code contains at least one real defect. Identify the most serious defect in the code below. Name the mechanism precisely, quote the exact line(s) responsible using backticks, and give a concrete example scenario: a specific input and what the code actually does versus what it should do.";
+
+    fn golden_bundle(facts: Vec<String>) -> BundleInput {
+        BundleInput {
+            id: "src/example.ts".to_string(),
+            fact_family: "unscoped".to_string(),
+            code: GOLDEN_CODE.to_string(),
+            probe_code: GOLDEN_PROBE_CODE.to_string(),
+            facts,
+            manifest: vec![],
+        }
+    }
+
+    #[test]
+    fn probe_prompt_matches_phase_a_golden_bare() {
+        // Captured from probe-runner.py's real build_prompt(worktree,
+        // [{path: "src/example.ts", start: 1, end: 4}], []) — including
+        // read_code_excerpt's own fenced block format.
+        let golden = "A thorough code review established that this code contains at least one real defect. Identify the most serious defect in the code below. Name the mechanism precisely, quote the exact line(s) responsible using backticks, and give a concrete example scenario: a specific input and what the code actually does versus what it should do.\n\nCode:\n\n### `src/example.ts` (lines 1-4)\n```typescript\nexport function clampRetryDelay(attempt: number, base: number): number {\n  const delay = base * Math.pow(2, attempt);\n  return Math.min(delay, 30000);\n}\n```";
+        let bundle = golden_bundle(vec![]);
+        assert_eq!(probe_user_message(GOLDEN_STRONG_PRIOR, &bundle), golden);
+    }
+
+    #[test]
+    fn probe_prompt_matches_phase_a_golden_with_facts() {
+        // Same build_prompt run with the two facts supplied.
+        let golden = "A thorough code review established that this code contains at least one real defect. Identify the most serious defect in the code below. Name the mechanism precisely, quote the exact line(s) responsible using backticks, and give a concrete example scenario: a specific input and what the code actually does versus what it should do.\n\nCode:\n\n### `src/example.ts` (lines 1-4)\n```typescript\nexport function clampRetryDelay(attempt: number, base: number): number {\n  const delay = base * Math.pow(2, attempt);\n  return Math.min(delay, 30000);\n}\n```\n\nComputed facts about this code (mechanically extracted, not interpreted):\n\n- `attempt` is caller-controlled and unbounded\n- `base` defaults to 1000 in all call sites";
+        let bundle = golden_bundle(vec![
+            "`attempt` is caller-controlled and unbounded".to_string(),
+            "`base` defaults to 1000 in all call sites".to_string(),
+        ]);
+        assert_eq!(probe_user_message(GOLDEN_STRONG_PRIOR, &bundle), golden);
+    }
+
+    #[test]
+    fn judge_prompt_matches_phase_a_golden_with_facts_and_intent() {
+        let golden = "## The author's stated case (the pull request description)\nBound retry backoff to a sane ceiling\nCaps the exponential backoff delay so a large attempt count cannot stall retries indefinitely.\n\n## The code under review\n```typescript\n// src/example.ts (lines 1-4)\nexport function clampRetryDelay(attempt: number, base: number): number {\n  const delay = base * Math.pow(2, attempt);\n  return Math.min(delay, 30000);\n}\n```\n\n## Fact sheet given to the flagging reviewer\n`attempt` is caller-controlled and unbounded\n`base` defaults to 1000 in all call sites\n\n## The flagged item to investigate\nThe delay calculation in `clampRetryDelay` never verifies `attempt` is non-negative — a negative attempt shrinks the delay below the intended floor.\n\nInvestigate the flagged item against the code above. End your reply with exactly one fenced JSON block:\n```json\n{\"ruling\": \"confirmed\" | \"needs_check\" | \"false_positive\", \"decisive_evidence\": \"<the specific code line or checked claim that decided it>\", \"note_for_author\": \"<one or two sentences the author reads>\"}\n```";
+        let p = judge_prompt(
+            "Bound retry backoff to a sane ceiling",
+            "Caps the exponential backoff delay so a large attempt count cannot stall retries indefinitely.",
+            GOLDEN_CODE,
+            &[
+                "`attempt` is caller-controlled and unbounded".to_string(),
+                "`base` defaults to 1000 in all call sites".to_string(),
+            ],
+            "The delay calculation in `clampRetryDelay` never verifies `attempt` is non-negative — a negative attempt shrinks the delay below the intended floor.",
+        );
+        assert_eq!(p, golden);
+    }
+
+    #[test]
+    fn judge_prompt_matches_phase_a_golden_bare_no_facts_no_intent() {
+        let golden = "## The author's stated case (the pull request description)\n\n(no description provided)\n\n## The code under review\n```typescript\n// src/example.ts (lines 1-4)\nexport function clampRetryDelay(attempt: number, base: number): number {\n  const delay = base * Math.pow(2, attempt);\n  return Math.min(delay, 30000);\n}\n```\n\n## The flagged item to investigate\nThe delay calculation in `clampRetryDelay` never verifies `attempt` is non-negative — a negative attempt shrinks the delay below the intended floor.\n\nInvestigate the flagged item against the code above. End your reply with exactly one fenced JSON block:\n```json\n{\"ruling\": \"confirmed\" | \"needs_check\" | \"false_positive\", \"decisive_evidence\": \"<the specific code line or checked claim that decided it>\", \"note_for_author\": \"<one or two sentences the author reads>\"}\n```";
+        let p = judge_prompt(
+            "",
+            "",
+            GOLDEN_CODE,
+            &[],
+            "The delay calculation in `clampRetryDelay` never verifies `attempt` is non-negative — a negative attempt shrinks the delay below the intended floor.",
+        );
+        assert_eq!(p, golden);
     }
 
     // ── bundles_from_diff (provisional bundler) ────────────────────────
@@ -3066,7 +3280,8 @@ mod tests {
         let inputs = FunnelInputs {
             case_id: "c1".to_string(),
             crew: &crew,
-            intent: "add a feature",
+            intent_title: "add a feature",
+            intent_body: "",
             diff: DIFF,
             mode: ExecMode::Sequential,
             probe_system: "probe sys",
@@ -3103,7 +3318,8 @@ mod tests {
         let inputs = FunnelInputs {
             case_id: "c1".to_string(),
             crew: &crew,
-            intent: "add a feature",
+            intent_title: "add a feature",
+            intent_body: "",
             diff: DIFF,
             mode: ExecMode::Parallel,
             probe_system: "probe sys",
@@ -3132,8 +3348,8 @@ mod tests {
     #[test]
     fn selector_max_bundles_zero_selects_nothing() {
         let bundles = vec![
-            BundleInput { id: "a".into(), fact_family: "other".into(), code: String::new(), facts: vec![], manifest: vec![] },
-            BundleInput { id: "b".into(), fact_family: "param-flow".into(), code: String::new(), facts: vec![], manifest: vec![] },
+            BundleInput { id: "a".into(), fact_family: "other".into(), code: String::new(), probe_code: String::new(), facts: vec![], manifest: vec![] },
+            BundleInput { id: "b".into(), fact_family: "param-flow".into(), code: String::new(), probe_code: String::new(), facts: vec![], manifest: vec![] },
         ];
         let sel = BundleSelector { fact_families: vec![], max_bundles: Some(0), ..Default::default() };
         let selected = select_bundles_for_staffing(&bundles, Some(&sel));
@@ -3146,8 +3362,8 @@ mod tests {
     #[test]
     fn selector_fact_families_naming_unknown_family_selects_nothing() {
         let bundles = vec![
-            BundleInput { id: "a".into(), fact_family: "auth".into(), code: String::new(), facts: vec![], manifest: vec![] },
-            BundleInput { id: "b".into(), fact_family: "billing".into(), code: String::new(), facts: vec![], manifest: vec![] },
+            BundleInput { id: "a".into(), fact_family: "auth".into(), code: String::new(), probe_code: String::new(), facts: vec![], manifest: vec![] },
+            BundleInput { id: "b".into(), fact_family: "billing".into(), code: String::new(), probe_code: String::new(), facts: vec![], manifest: vec![] },
         ];
         let sel = BundleSelector {
             fact_families: vec!["nonexistent-family".to_string()],
@@ -3174,7 +3390,8 @@ mod tests {
         let inputs = FunnelInputs {
             case_id: "c1".to_string(),
             crew: &crew,
-            intent: "add a feature",
+            intent_title: "add a feature",
+            intent_body: "",
             diff: DIFF,
             mode: ExecMode::Sequential,
             probe_system: "probe sys",
@@ -3220,7 +3437,8 @@ mod tests {
         let inputs = FunnelInputs {
             case_id: "c1".to_string(),
             crew: &crew,
-            intent: "add a feature",
+            intent_title: "add a feature",
+            intent_body: "",
             diff: DIFF,
             mode: ExecMode::Sequential,
             probe_system: "probe sys",
@@ -3408,26 +3626,62 @@ mod tests {
         assert!(value["judged"][2]["pass2"].is_null(), "no pass-2 dispatch serializes pass2 as null, not omitted");
     }
 
-    // ── judge_prompt: independent section gating ──────────────────────
+    // ── manifest is dropped from the judge prompt (#1256) ──────────────
 
-    /// Facts and manifest sections are gated INDEPENDENTLY — a bundle with
-    /// a manifest but no fact sheet must show the manifest section and
-    /// omit the fact-sheet section (the existing "all present" / "all
-    /// absent" tests don't isolate this mixed case).
+    /// `judge-runner.py`'s `judge_one` has no MANIFEST section at all —
+    /// `bundler.py`'s bundles carry no such field. The Rust funnel's
+    /// `BundleInput.manifest` is a Rust-only addition; per the "match
+    /// Phase A exactly" operator decision it's dropped from the judge
+    /// prompt entirely (not silently threaded through) even though the
+    /// field itself still exists on `BundleInput` for a future consumer.
+    /// Regression-tested at the `run_judge_only` integration level, not a
+    /// `judge_prompt` unit test — the function no longer TAKES a manifest
+    /// param, so there's nothing left to unit-test at that level; what's
+    /// worth guarding is that a populated `BundleInput.manifest` never
+    /// leaks into the dispatched prompt.
     #[test]
-    fn judge_prompt_manifest_present_facts_absent() {
-        let p = judge_prompt("intent", "code", &[], &["helperFn".to_string()], "charge");
-        assert!(!p.contains("Fact sheet:"), "no facts supplied -> no fact-sheet section");
-        assert!(p.contains("Symbols referenced but not defined in the provided code:"));
-        assert!(p.contains("helperFn"));
-    }
-
-    /// The mirror case: facts present, manifest absent.
-    #[test]
-    fn judge_prompt_facts_present_manifest_absent() {
-        let p = judge_prompt("intent", "code", &["fact one".to_string()], &[], "charge");
-        assert!(p.contains("Fact sheet:"));
-        assert!(p.contains("fact one"));
-        assert!(!p.contains("Symbols referenced but not defined"), "no manifest supplied -> no manifest section");
+    fn manifest_never_reaches_the_dispatched_judge_prompt() {
+        let crew = valid_crew();
+        let bundles = vec![BundleInput {
+            id: "billing.ts".to_string(),
+            fact_family: "unscoped".to_string(),
+            code: "const end = start.plus(30)".to_string(),
+            probe_code: "const end = start.plus(30)".to_string(),
+            facts: vec![],
+            manifest: vec!["helperFn".to_string()],
+        }];
+        let inputs = FunnelInputs {
+            case_id: "c1".to_string(),
+            crew: &crew,
+            intent_title: "add a feature",
+            intent_body: "",
+            diff: DIFF,
+            mode: ExecMode::Sequential,
+            probe_system: "probe sys",
+            judge_system: "judge sys",
+            bundles: Some(bundles),
+        };
+        let flags = vec![flag("billing.ts", "member-a", 0, "`const end = start.plus(30)` double-counts")];
+        let mut cycler = RecordingCycler::new();
+        let seen_prompts = RefCell::new(Vec::new());
+        let mut chat = |call: &ChatCall| {
+            seen_prompts.borrow_mut().push(call.user.to_string());
+            Ok(reply(CONFIRM_JSON))
+        };
+        let env = run_judge_only(flags, &inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+        assert_eq!(env.judged.len(), 1);
+        let prompts = seen_prompts.borrow();
+        // A `confirmed` pass-1 (CONFIRM_JSON) earns a pass-2 (double-confirm
+        // judge, module doc) — TWO dispatches over the SAME prompt text, not
+        // one. Assert every dispatched prompt, not just the first.
+        assert_eq!(prompts.len(), 2, "pass-1 confirmed -> pass-2 also dispatches");
+        assert!(
+            prompts.iter().all(|p| !p.contains("helperFn")),
+            "the bundle's manifest entry must never reach the dispatched judge prompt: {prompts:?}"
+        );
+        assert!(
+            prompts.iter().all(|p| !p.to_lowercase().contains("manifest") && !p.contains("Symbols referenced")),
+            "no manifest section header at all, matching judge-runner.py: {prompts:?}"
+        );
     }
 }

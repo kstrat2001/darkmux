@@ -34,7 +34,9 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use darkmux_crew::single_shot::{single_shot_chat, SingleShotReply, SingleShotRequest};
-use darkmux_lab::lab::bundle::{build_bundles, external_bundles, slice_code, BundleSet, FileSource};
+use darkmux_lab::lab::bundle::{
+    build_bundles, external_bundles, slice_code, slice_code_probe, BundleSet, FileSource,
+};
 use darkmux_lab::lab::funnel::{
     run_funnel, run_judge_only, BundleInput, ChatCall, ExecMode, FunnelEmitter, FunnelEnvelope,
     FunnelInputs, JudgeRecord, LmsCycler, ProbeFlag, Tier,
@@ -643,9 +645,13 @@ pub struct RunOpts {
     /// to `github`/`head_sha`.
     pub worktree: Option<PathBuf>,
     pub diff: PathBuf,
-    /// The author's stated intent for the change, fed into probe/judge
-    /// prompts. `None` -> "(no description provided)" (matches
-    /// `funnel::judge_prompt`'s own fallback).
+    /// The author's stated intent for the change, fed into the JUDGE prompt
+    /// ONLY — Phase A never showed the probe seat the intent, so
+    /// `funnel::probe_user_message` never reads it either (#1256). This CLI
+    /// carries one blob (no separate title field), passed through as
+    /// `FunnelInputs::intent_body` with `intent_title` empty; an absent or
+    /// empty file -> "(no description provided)" (matches
+    /// `funnel::judge_prompt`'s own per-field fallback).
     pub intent_file: Option<PathBuf>,
     /// Crew name from `profiles.json`'s `"crews"` map, staffing the
     /// `review-probe`/`review-judge` seats. Required unless `from_envelope`
@@ -777,19 +783,24 @@ fn parse_exec_mode(mode: &str) -> Result<ExecMode> {
 
 /// `Bundle` (packet 3's `darkmux_lab::lab::bundle`) -> `BundleInput`
 /// (packet 4's `darkmux_lab::lab::funnel` shape) — the reconciliation the
-/// funnel module's own doc names as this packet's job. `slice_code` turns
-/// each bundle's line-span pointers into the actual code text the probe/
-/// judge prompts embed.
+/// funnel module's own doc names as this packet's job. Each bundle's
+/// line-span pointers are rendered PER SEAT (#1256): `slice_code` (the
+/// judge's `// path` raw format) into `code`, `slice_code_probe` (the
+/// probe's Phase A ``### `path`` + ```` ```typescript ```` fenced format)
+/// into `probe_code`.
 fn bundle_inputs_from_set(set: &BundleSet, source: &FileSource) -> Result<Vec<BundleInput>> {
     set.bundles
         .iter()
         .map(|b| {
             let code = slice_code(source, &b.code)
                 .with_context(|| format!("slicing code for bundle \"{}\"", b.id))?;
+            let probe_code = slice_code_probe(source, &b.code)
+                .with_context(|| format!("probe-slicing code for bundle \"{}\"", b.id))?;
             Ok(BundleInput {
                 id: b.id.clone(),
                 fact_family: b.fact_family.clone(),
                 code,
+                probe_code,
                 facts: b.facts.clone(),
                 manifest: b.manifest.clone(),
             })
@@ -904,7 +915,12 @@ fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<FunnelEnvelope> {
     let inputs = FunnelInputs {
         case_id,
         crew: &crew,
-        intent: &intent,
+        // No separate title on this CLI surface (`--intent-file` is one
+        // blob) — the whole file becomes the body; `judge_prompt` renders
+        // an empty title as a blank line, same as Phase A's own
+        // title-absent case. See `RunOpts::intent_file`'s doc comment.
+        intent_title: "",
+        intent_body: &intent,
         diff: diff_text,
         mode,
         probe_system: &probe_system,
