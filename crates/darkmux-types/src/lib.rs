@@ -461,6 +461,99 @@ impl Profile {
     }
 }
 
+/// Semver of the `profiles.json` registry shape. Additive field/section adds
+/// are a **minor** bump (older binaries safely ignore unknown keys via
+/// `extras`); renaming/retyping a field is **major**. Mirrors the
+/// `CONFIG_SCHEMA_VERSION` discipline (`darkmux_types::config`) — this is
+/// the registry's first formalized constant (the `schema_version` field on
+/// [`ProfileRegistry`] predates it as free-text, operator-set text; no
+/// prior value was ever asserted in code, so this constant's baseline is
+/// where the discipline starts, not a bump off a previously-enforced "1.0").
+// 1.1 (#1222 Phase B packet 1): additive top-level `crews{}` section (saved
+// crew assignments — seat staffing). Minor bump — an older binary tolerates
+// it (all-Option + `extras` overflow on `ProfileRegistry`), per the
+// lenient-read doctrine.
+pub const PROFILES_SCHEMA_VERSION: &str = "1.1";
+
+/// A **saved crew assignment**: which models staff which crew-role seats,
+/// for multi-seat pipelines (e.g. a review funnel's probe + judge seats).
+/// Machine-side because staffing is a hardware-fit decision, not an
+/// engagement-shaping one. **Selection is still per-dispatch** (operator
+/// sovereignty, #44) — a `Crew` is a reusable lineup an operator can point a
+/// dispatch at, not imposed membership a dispatch is forced into.
+///
+/// `seats` is keyed by **crew role id** (e.g. `"review-probe"`,
+/// `"review-judge"`) — the same role-id vocabulary
+/// `crates/darkmux-crew` already uses for `crew dispatch <role-id>`, so a
+/// crew assignment slots directly onto existing roles rather than inventing
+/// a parallel naming scheme. **This packet does not validate role ids
+/// against the role manifest registry** — a pipeline's specific seat
+/// requirements (e.g. "review-probe needs at least one staffing") are
+/// consumer-side validation for a later packet; this schema is generic
+/// across any future multi-seat pipeline, not just review.
+///
+/// Pure data + resolution today — nothing consumes a `Crew` yet; this
+/// schema lands ahead of the dispatch machinery a later Phase B packet
+/// adds (#1222 Phase B packet 1).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Crew {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Role id → the model(s) staffing that seat. A `Vec` because a seat can
+    /// be staffed by more than one model (e.g. two probe staffings drawing
+    /// independently); order within the `Vec` is the staffing's declared
+    /// order but carries no dispatch-sequence meaning by itself — that's a
+    /// consumer-side concern.
+    pub seats: BTreeMap<String, Vec<SeatStaffing>>,
+    /// Forward-compat overflow — unknown keys land here and re-serialize
+    /// flat (a newer config read by an older binary).
+    #[serde(flatten)]
+    pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
+/// One model staffing a [`Crew`] seat — a [`Profile`] + model binding plus
+/// its draw shape. `k` (draws per work item) defaults to 3, matching the
+/// config.json visible-defaults doctrine: the knob is a real, documented
+/// default, not a hidden code constant, so an operator reading a resolved
+/// crew sees what actually ran.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SeatStaffing {
+    /// The registry [`Profile`] name this staffing dispatches through.
+    pub profile: String,
+    /// Model id within that profile. `None` ⇒ the profile's
+    /// [`Profile::default_model_id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Draws per work item. Default 3.
+    #[serde(default = "default_k")]
+    pub k: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    /// Bundle-selection scope. Valid on any staffing — this schema doesn't
+    /// gate it on a draw-shape enum; a consumer decides what it means for
+    /// its own seat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_selector: Option<BundleSelector>,
+    /// Forward-compat overflow — unknown keys land here and re-serialize
+    /// flat (a newer config read by an older binary).
+    #[serde(flatten)]
+    pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
+fn default_k() -> u32 {
+    3
+}
+
+/// Scopes a [`SeatStaffing`]'s draws to a subset of fact families, and
+/// optionally caps how many bundles it considers.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BundleSelector {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fact_families: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bundles: Option<u32>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProfileRegistry {
     pub profiles: BTreeMap<String, Profile>,
@@ -478,6 +571,12 @@ pub struct ProfileRegistry {
     /// standing infrastructure. (#590)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub internal: Option<RegistryInternal>,
+    /// Named [`Crew`] definitions — saved seat-staffing assignments,
+    /// sibling to `profiles`/`internal`. Empty by default; a crew names
+    /// `Profile`s declared in `profiles` above, it doesn't replace them.
+    /// (#1222 Phase B packet 1)
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub crews: BTreeMap<String, Crew>,
     /// Forward-compat overflow — unknown top-level keys land here and
     /// re-serialize flat (a newer config read by an older binary).
     #[serde(flatten)]
@@ -1128,6 +1227,7 @@ mod tests {
         assert!(back.hooks.is_none());
         assert!(back.default_profile.is_none());
         assert!(back.internal.is_none());
+        assert!(back.crews.is_empty());
         assert!(back.extras.is_empty());
     }
 
@@ -1171,5 +1271,146 @@ mod tests {
         assert_eq!(back.default_profile, reg.default_profile);
         assert_eq!(back.internal.as_ref().unwrap().utility, reg.internal.as_ref().unwrap().utility);
         assert!(back.extras.contains_key("future_field"));
+    }
+}
+
+#[cfg(test)]
+mod crew_tests {
+    //! (#1222 Phase B packet 1) Schema-layer coverage for `Crew` and its
+    //! nested types. Validation semantics (seat/staffing non-empty, profile
+    //! refs resolve, k >= 1, remote-endpoint rejection) live in
+    //! `darkmux-profiles::crews` — this module gates serde shape only:
+    //! round-trips, `k` defaulting, extras tolerance, and the
+    //! byte-identical old-shape (no `crews` key) invariant.
+    use super::*;
+
+    #[test]
+    fn seat_staffing_k_defaults_to_three_when_absent() {
+        let json = r#"{"profile":"deep"}"#;
+        let s: SeatStaffing = serde_json::from_str(json).unwrap();
+        assert_eq!(s.k, 3);
+        assert!(s.model.is_none());
+        assert!(s.max_tokens.is_none());
+        assert!(s.bundle_selector.is_none());
+    }
+
+    #[test]
+    fn seat_staffing_explicit_k_overrides_default() {
+        let json = r#"{"profile":"deep","k":7,"max_tokens":2048,
+            "bundle_selector":{"fact_families":["auth","billing"],"max_bundles":5}}"#;
+        let s: SeatStaffing = serde_json::from_str(json).unwrap();
+        assert_eq!(s.k, 7);
+        assert_eq!(s.max_tokens, Some(2048));
+        let sel = s.bundle_selector.as_ref().unwrap();
+        assert_eq!(sel.fact_families, vec!["auth".to_string(), "billing".to_string()]);
+        assert_eq!(sel.max_bundles, Some(5));
+    }
+
+    #[test]
+    fn seat_staffing_unknown_keys_land_in_extras() {
+        let json = r#"{"profile":"deep","future_knob":"x"}"#;
+        let s: SeatStaffing = serde_json::from_str(json).unwrap();
+        assert_eq!(s.extras.get("future_knob").and_then(|v| v.as_str()), Some("x"));
+        let out: serde_json::Value = serde_json::to_value(&s).unwrap();
+        let obj = out.as_object().unwrap();
+        assert!(obj.contains_key("future_knob"));
+        assert!(!obj.contains_key("extras"), "extras must flatten, not nest");
+    }
+
+    #[test]
+    fn crew_round_trips_full_shape() {
+        let json = r#"{
+            "description": "deep review lineup",
+            "seats": {
+                "review-probe": [
+                    {"profile": "fast", "k": 1, "bundle_selector": {"fact_families": ["security"]}},
+                    {"profile": "deep", "model": "reserve-model"}
+                ],
+                "review-judge": [
+                    {"profile": "balanced", "max_tokens": 4096}
+                ]
+            }
+        }"#;
+        let crew: Crew = serde_json::from_str(json).unwrap();
+        assert_eq!(crew.description.as_deref(), Some("deep review lineup"));
+        assert_eq!(crew.seats.len(), 2);
+        let probe = crew.seats.get("review-probe").unwrap();
+        assert_eq!(probe.len(), 2);
+        assert_eq!(probe[0].profile, "fast");
+        assert_eq!(probe[0].k, 1);
+        assert_eq!(probe[1].model.as_deref(), Some("reserve-model"));
+        let judge = crew.seats.get("review-judge").unwrap();
+        assert_eq!(judge.len(), 1);
+        assert_eq!(judge[0].max_tokens, Some(4096));
+
+        let back: Crew = serde_json::from_str(&serde_json::to_string(&crew).unwrap()).unwrap();
+        assert_eq!(back.seats.len(), 2);
+        assert_eq!(back.seats.get("review-probe").unwrap().len(), 2);
+        assert_eq!(back.seats.get("review-judge").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn crew_empty_seats_parses_fine_at_schema_layer() {
+        // Schema-layer only permits this; `darkmux-profiles::crews::resolve_crew`
+        // rejects an empty `seats` map at validation time.
+        let json = r#"{"seats": {}}"#;
+        let crew: Crew = serde_json::from_str(json).unwrap();
+        assert!(crew.seats.is_empty());
+    }
+
+    #[test]
+    fn registry_parses_crews_section() {
+        let json = r#"{
+            "profiles": {
+                "fast": {"models": [{"id": "a", "n_ctx": 1000}]},
+                "deep": {"models": [{"id": "b", "n_ctx": 2000}]}
+            },
+            "crews": {
+                "review-deep": {
+                    "seats": {
+                        "review-probe": [
+                            {"profile": "fast"},
+                            {"profile": "deep", "k": 1, "bundle_selector": {"fact_families": ["auth"]}}
+                        ],
+                        "review-judge": [
+                            {"profile": "fast"}
+                        ]
+                    }
+                }
+            }
+        }"#;
+        let reg: ProfileRegistry = serde_json::from_str(json).unwrap();
+        assert_eq!(reg.crews.len(), 1);
+        let c = reg.crews.get("review-deep").unwrap();
+        assert_eq!(c.seats.get("review-probe").unwrap().len(), 2);
+        assert_eq!(c.seats.get("review-judge").unwrap().len(), 1);
+
+        // Round-trips.
+        let back: ProfileRegistry =
+            serde_json::from_str(&serde_json::to_string(&reg).unwrap()).unwrap();
+        assert_eq!(back.crews.len(), 1);
+    }
+
+    /// The hard-line invariant: an old-shape registry with NO `crews` key
+    /// parses and re-serializes byte-identical (as JSON `Value`) — adding
+    /// the `crews` field must not disturb any pre-existing profiles.json.
+    #[test]
+    fn old_shape_registry_without_crews_round_trips_byte_identical() {
+        // `models: []` (rather than a populated model) sidesteps the
+        // pre-existing, unrelated `ProfileModel.capabilities` always-present
+        // quirk (`{}` reserializes even when absent on read) — this test's
+        // scope is the `crews` field's omission, not that quirk.
+        let old_shape = r#"{"profiles":{"fast":{"models":[]}},"default_profile":"fast"}"#;
+        let reg: ProfileRegistry = serde_json::from_str(old_shape).unwrap();
+        assert!(reg.crews.is_empty());
+        let original: serde_json::Value = serde_json::from_str(old_shape).unwrap();
+        let reserialized: serde_json::Value = serde_json::to_value(&reg).unwrap();
+        assert_eq!(original, reserialized);
+    }
+
+    #[test]
+    fn profiles_schema_version_constant_is_minor_bump_shaped() {
+        let parts: Vec<&str> = PROFILES_SCHEMA_VERSION.split('.').collect();
+        assert_eq!(parts.len(), 2, "expected MAJOR.MINOR, got {PROFILES_SCHEMA_VERSION}");
     }
 }

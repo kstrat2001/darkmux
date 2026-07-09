@@ -601,6 +601,21 @@ mod tests {
         assert!(parsed.get("profiles").is_some(), "missing 'profiles' field");
     }
 
+    /// `darkmux init` writes `EXAMPLE_PROFILES_JSON` VERBATIM to
+    /// `~/.darkmux/profiles.json` — the next `darkmux` invocation that reads
+    /// the registry runs it through `load_registry`'s full validation pass
+    /// (including `validate_crew`, #1222 Phase B packet 1). A fresh `darkmux
+    /// init` must never hand the operator a registry that fails that pass.
+    #[test]
+    fn embedded_example_profiles_passes_full_registry_validation() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("profiles.json");
+        fs::write(&p, EXAMPLE_PROFILES_JSON).unwrap();
+        let loaded = darkmux_profiles::profiles::load_registry(Some(p.to_str().unwrap()))
+            .expect("embedded example registry must pass load_registry's validation");
+        assert!(loaded.registry.crews.contains_key("review-deep"));
+    }
+
     #[test]
     fn ensure_session_start_hook_preserves_existing_settings() {
         let tmp = TempDir::new().unwrap();
