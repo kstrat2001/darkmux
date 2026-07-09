@@ -387,6 +387,12 @@ enum RecommendationsCmd {
 // variant would require pattern-match adjustments throughout the
 // dispatch handler; the variant is constructed once per CLI invocation
 // so the stack-size hit doesn't matter at runtime.
+// `Run`'s field count (source + crew + funnel knobs + I/O paths) crosses
+// clippy's large-enum-variant threshold relative to the much smaller
+// `Render` variant — same rationale as `CrewCmd::Dispatch` below; boxing
+// would ripple through every match arm for a per-invocation, not hot-path,
+// cost.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum PrReviewCmd {
     /// Render a dispatch envelope + diff into a GitHub PR-review payload:
@@ -409,6 +415,76 @@ enum PrReviewCmd {
         /// The workflow knows where the model ran; darkmux doesn't guess.
         #[arg(long)]
         attribution: Option<String>,
+    },
+    /// (#1222 Phase B packet 5) The review-FUNNEL verb: bundle -> probe(k
+    /// draws) -> dedup -> double-confirm judge -> three-tier synthesis,
+    /// emitting the same `{mode, review, comment}` payload `render` does.
+    /// Source the bundler from either a local checkout (`--worktree`) or
+    /// the GitHub API (`--github` + `--head-sha`) — mutually exclusive.
+    Run {
+        /// GitHub source `owner/repo` — bundles via the GitHub API, no
+        /// local checkout. Requires --head-sha. Mutually exclusive with
+        /// --worktree.
+        #[arg(long, requires = "head_sha", conflicts_with = "worktree")]
+        github: Option<String>,
+        /// Commit SHA to read file content at (GitHub source only).
+        #[arg(long = "head-sha", requires = "github")]
+        head_sha: Option<String>,
+        /// Local worktree directory — bundles via a real checkout.
+        /// Alternative to --github/--head-sha.
+        #[arg(long)]
+        worktree: Option<std::path::PathBuf>,
+        /// Path to the PR unified diff.
+        #[arg(long)]
+        diff: std::path::PathBuf,
+        /// File carrying the author's stated intent for the change, fed
+        /// into probe/judge prompts. Omitted -> "(no description
+        /// provided)".
+        #[arg(long = "intent-file")]
+        intent_file: Option<std::path::PathBuf>,
+        /// Crew name (from profiles.json's "crews" map) staffing the
+        /// review-probe / review-judge seats. Required unless
+        /// --from-envelope.
+        #[arg(long)]
+        crew: Option<String>,
+        /// Model-cycling mode: sequential | parallel | auto (auto resolves
+        /// per hardware tier).
+        #[arg(long, default_value = "auto")]
+        mode: String,
+        /// Override every review-probe staffing's draw count (k).
+        #[arg(long)]
+        k: Option<u32>,
+        /// Write the full funnel envelope (pretty JSON) here.
+        #[arg(long = "envelope-out")]
+        envelope_out: Option<std::path::PathBuf>,
+        /// Write the rendered `{mode, review, comment}` payload here. `-`
+        /// (or omitted) writes to stdout.
+        #[arg(long)]
+        emit: Option<std::path::PathBuf>,
+        /// Per-dispatch timeout in seconds.
+        #[arg(long, default_value = "3600")]
+        timeout: u32,
+        /// Profiles-registry path (profiles.json). Overrides
+        /// DARKMUX_PROFILES.
+        #[arg(long = "profiles-file")]
+        profiles: Option<String>,
+        /// (#1113) Attribution text for the posted footer.
+        #[arg(long)]
+        attribution: Option<String>,
+        /// External bundler command (`<cmd> --worktree <dir> --diff
+        /// <file>`) standing in for the built-in bundler.
+        #[arg(long)]
+        bundler: Option<String>,
+        /// Re-judge a previously-recorded flag list without re-running the
+        /// probe (skips prosecution — the bundler still runs, since the
+        /// judge needs the code each flag's bundle_id refers to).
+        #[arg(long = "charges-file")]
+        charges_file: Option<std::path::PathBuf>,
+        /// Synthesis-only: read a previously-written --envelope-out and
+        /// emit the rendered payload — zero model calls, zero bundling.
+        /// The CI-testable path.
+        #[arg(long = "from-envelope")]
+        from_envelope: Option<std::path::PathBuf>,
     },
 }
 
@@ -2955,6 +3031,41 @@ fn cmd_pr_review(sub: PrReviewCmd) -> Result<i32> {
         PrReviewCmd::Render { envelope, diff, emit, attribution } => {
             pr_review::cmd_render(&envelope, &diff, emit.as_ref(), attribution.as_deref())
         }
+        PrReviewCmd::Run {
+            github,
+            head_sha,
+            worktree,
+            diff,
+            intent_file,
+            crew,
+            mode,
+            k,
+            envelope_out,
+            emit,
+            timeout,
+            profiles,
+            attribution,
+            bundler,
+            charges_file,
+            from_envelope,
+        } => pr_review::cmd_run(pr_review::RunOpts {
+            github,
+            head_sha,
+            worktree,
+            diff,
+            intent_file,
+            crew,
+            mode,
+            k,
+            envelope_out,
+            emit,
+            timeout,
+            profiles,
+            attribution,
+            bundler,
+            charges_file,
+            from_envelope,
+        }),
     }
 }
 

@@ -1186,3 +1186,226 @@ fn crew_dispatch_message_from_file_flag_contract() {
                 .and(predicate::str::contains("spawning").not()),
         );
 }
+
+// ── pr-review run integration tests (#1222 Phase B packet 5) ──────────────
+
+/// A small diff whose one added line ("const b = 2;") lands at new-side
+/// line 2 of src/x.ts — the anchor the canned envelope's confirmed flag
+/// resolves against.
+fn pr_review_run_diff() -> &'static str {
+    // A single-line literal with explicit `\n` escapes (NOT a backslash-
+    // continued multi-line literal) — Rust's line-continuation trims
+    // leading whitespace on the next physical line, which would silently
+    // eat the single-space context-line marker unified diffs rely on.
+    "diff --git a/src/x.ts b/src/x.ts\n--- a/src/x.ts\n+++ b/src/x.ts\n@@ -1,2 +1,3 @@\n const a = 1;\n+const b = 2;\n const c = 3;\n"
+}
+
+/// A canned `FunnelEnvelope` (see `darkmux_lab::lab::funnel::FunnelEnvelope`)
+/// with one double-confirmed flag anchored to the diff above — the
+/// `--from-envelope` synthesis-only path's fixture. Deliberately hand-built
+/// JSON (not produced by a real dispatch) so this test needs zero model
+/// calls and zero bundling, matching the CLI's own "CI-testable path"
+/// framing for `--from-envelope`.
+fn pr_review_run_envelope() -> &'static str {
+    r#"{
+        "case_id": "test-case",
+        "crew": "test-crew",
+        "mode": "sequential",
+        "members": [
+            {"model": "darkmux:probe-model", "seat": "review-probe", "draws": 2, "wall_ms": 10, "total_tokens": 100},
+            {"model": "darkmux:judge-model", "seat": "review-judge", "draws": 2, "wall_ms": 5, "total_tokens": 50}
+        ],
+        "steps": [],
+        "bundles": 1,
+        "raw_flags": 2,
+        "deduped_flags": 1,
+        "flags": [],
+        "judged": [
+            {
+                "flag": {
+                    "bundle_id": "computeB@src/x.ts",
+                    "fact_family": "unscoped",
+                    "member": "darkmux:probe-model",
+                    "draw": 0,
+                    "charge_text": "the added constant shadows the config default",
+                    "anchor": "const b = 2;"
+                },
+                "pass1": {"ruling": "confirmed", "decisive_evidence": "the clamp is bypassed", "note_for_author": "shadows the config default", "pass": 1, "seconds": 0.2},
+                "pass2": {"ruling": "confirmed", "decisive_evidence": "confirmed on recheck", "note_for_author": "shadows the config default", "pass": 2, "seconds": 0.2},
+                "tier": "confirmed",
+                "demoted_by_pass2": false
+            }
+        ],
+        "confirmed": 1,
+        "needs_check": 0,
+        "archived": 0,
+        "fingerprint": {"judge_model": "darkmux:judge-model", "judge_temperature": 0.2, "judge_persona_blake3": "abc123", "protocol": "double-confirm-v1"}
+    }"#
+}
+
+/// `--from-envelope` + `--diff` + `--emit -` synthesizes the canned
+/// envelope's confirmed flag into an inline, merge-blocking review comment
+/// — zero model calls, zero bundling (the CI-testable path the packet
+/// brief names).
+#[test]
+fn pr_review_run_from_envelope_synthesizes_confirmed_review_to_stdout() {
+    let tmp = TempDir::new().unwrap();
+    let diff_path = tmp.path().join("pr.diff");
+    fs::write(&diff_path, pr_review_run_diff()).unwrap();
+    let envelope_path = tmp.path().join("funnel.json");
+    fs::write(&envelope_path, pr_review_run_envelope()).unwrap();
+
+    let output = Command::cargo_bin("darkmux")
+        .unwrap()
+        .args([
+            "pr-review",
+            "run",
+            "--from-envelope",
+            envelope_path.to_str().unwrap(),
+            "--diff",
+            diff_path.to_str().unwrap(),
+            "--emit",
+            "-",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {stdout}"));
+    assert_eq!(v["mode"], "review");
+    assert_eq!(v["review"]["event"], "REQUEST_CHANGES");
+    let comments = v["review"]["comments"].as_array().unwrap();
+    assert_eq!(comments.len(), 1);
+    assert_eq!(comments[0]["path"], "src/x.ts");
+    assert_eq!(comments[0]["line"], 2);
+    let body = comments[0]["body"].as_str().unwrap();
+    assert!(body.contains("shadows the config default"), "{body}");
+    assert!(
+        body.contains("needs frontier verification"),
+        "confirmed comments carry the local-judge marker: {body}"
+    );
+}
+
+/// `--from-envelope` also honors `--envelope-out` (a round-trip re-write of
+/// the same envelope, pretty-printed) alongside the rendered `--emit`.
+#[test]
+fn pr_review_run_from_envelope_also_writes_envelope_out() {
+    let tmp = TempDir::new().unwrap();
+    let diff_path = tmp.path().join("pr.diff");
+    fs::write(&diff_path, pr_review_run_diff()).unwrap();
+    let envelope_path = tmp.path().join("funnel.json");
+    fs::write(&envelope_path, pr_review_run_envelope()).unwrap();
+    let out_path = tmp.path().join("out-envelope.json");
+    let emit_path = tmp.path().join("rendered.json");
+
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .args([
+            "pr-review",
+            "run",
+            "--from-envelope",
+            envelope_path.to_str().unwrap(),
+            "--diff",
+            diff_path.to_str().unwrap(),
+            "--envelope-out",
+            out_path.to_str().unwrap(),
+            "--emit",
+            emit_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let rewritten = fs::read_to_string(&out_path).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&rewritten).unwrap();
+    assert_eq!(v["confirmed"], 1);
+    assert_eq!(v["case_id"], "test-case");
+
+    let rendered = fs::read_to_string(&emit_path).unwrap();
+    let r: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+    assert_eq!(r["mode"], "review");
+}
+
+/// `--worktree` and `--github` are mutually exclusive — clap catches it
+/// before any handler code runs (no live LMStudio / bundler needed).
+#[test]
+fn pr_review_run_worktree_and_github_conflict() {
+    let tmp = TempDir::new().unwrap();
+    let diff_path = tmp.path().join("pr.diff");
+    fs::write(&diff_path, pr_review_run_diff()).unwrap();
+
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .args([
+            "pr-review",
+            "run",
+            "--worktree",
+            tmp.path().to_str().unwrap(),
+            "--github",
+            "kstrat2001/darkmux",
+            "--head-sha",
+            "deadbeef",
+            "--diff",
+            diff_path.to_str().unwrap(),
+            "--crew",
+            "whatever",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+/// `--github` without `--head-sha` is also rejected by clap (`requires`).
+#[test]
+fn pr_review_run_github_without_head_sha_rejected() {
+    let tmp = TempDir::new().unwrap();
+    let diff_path = tmp.path().join("pr.diff");
+    fs::write(&diff_path, pr_review_run_diff()).unwrap();
+
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .args([
+            "pr-review",
+            "run",
+            "--github",
+            "kstrat2001/darkmux",
+            "--diff",
+            diff_path.to_str().unwrap(),
+            "--crew",
+            "whatever",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("head-sha").or(predicate::str::contains("head_sha")));
+}
+
+/// A real (non `--from-envelope`) run with no `--crew` fails loud, naming
+/// the requirement, before any bundling/dispatch happens.
+#[test]
+fn pr_review_run_missing_crew_errors_loudly() {
+    let tmp = TempDir::new().unwrap();
+    let diff_path = tmp.path().join("pr.diff");
+    fs::write(&diff_path, pr_review_run_diff()).unwrap();
+    let missing_profiles = tmp.path().join("no-such-profiles.json");
+
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .args([
+            "pr-review",
+            "run",
+            "--worktree",
+            tmp.path().to_str().unwrap(),
+            "--diff",
+            diff_path.to_str().unwrap(),
+            "--profiles-file",
+            missing_profiles.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--crew is required"));
+}

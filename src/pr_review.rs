@@ -18,12 +18,33 @@
 //! `mode: "degraded"` (#1113) means NO review signal was produced (missing
 //! envelope, empty reply, vacuous pass) — the workflow posts the comment AND
 //! marks its check failed/neutral, never green.
+//!
+//! `darkmux pr-review run` (#1222 Phase B packet 5) is the review-FUNNEL
+//! verb: it drives `darkmux_lab::lab::funnel::{run_funnel, run_judge_only}`
+//! (packet 4 — bundle → probe(k draws) → dedup → double-confirm judge) using
+//! the REAL bundler (`darkmux_lab::lab::bundle::{build_bundles,
+//! external_bundles, slice_code}`, packet 3) and emits the same
+//! `{mode, review, comment}` payload [`render_with_attribution`] does, via
+//! [`synthesize_funnel`]'s three-tier synthesis: a `Tier::Confirmed` flag
+//! becomes an inline, merge-blocking comment (or a general body item when
+//! its anchor can't be resolved to a diff line); a `Tier::NeedsCheck` flag
+//! (including a pass-2 demotion) becomes a non-blocking "worth a double
+//! check" note; a `Tier::Archived` flag never renders — it stays in the
+//! envelope only.
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use darkmux_crew::single_shot::{single_shot_chat, SingleShotReply, SingleShotRequest};
+use darkmux_lab::lab::bundle::{build_bundles, external_bundles, slice_code, BundleSet, FileSource};
+use darkmux_lab::lab::funnel::{
+    run_funnel, run_judge_only, BundleInput, ChatCall, ExecMode, FunnelEnvelope, FunnelInputs,
+    JudgeRecord, LmsCycler, ProbeFlag, Tier,
+};
+use darkmux_profiles::crews::resolve_crew;
+use darkmux_profiles::profiles::load_registry;
 use serde::{Deserialize, Deserializer};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const FOOTER: &str = "\n\n---\n<sub>Automated review by darkmux's own `pr-reviewer` \
 role, running on a local model (no cloud API) via a self-hosted runner — darkmux \
@@ -604,9 +625,464 @@ pub fn cmd_render(
     Ok(0)
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// `darkmux pr-review run` — the review funnel verb (#1222 Phase B packet 5)
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Parsed `darkmux pr-review run` CLI surface. Mirrors the clap variant's
+/// field names 1:1 so `main.rs`'s dispatch arm is a plain struct-literal
+/// shorthand (see `PrReviewCmd::Render` -> `cmd_render` for the same
+/// pattern one level down).
+pub struct RunOpts {
+    /// GitHub source `owner/repo` — bundles via the GitHub API, no local
+    /// checkout. Requires `head_sha`; mutually exclusive with `worktree`
+    /// (clap enforces both).
+    pub github: Option<String>,
+    pub head_sha: Option<String>,
+    /// Local worktree directory — bundles via a real checkout. Alternative
+    /// to `github`/`head_sha`.
+    pub worktree: Option<PathBuf>,
+    pub diff: PathBuf,
+    /// The author's stated intent for the change, fed into probe/judge
+    /// prompts. `None` -> "(no description provided)" (matches
+    /// `funnel::judge_prompt`'s own fallback).
+    pub intent_file: Option<PathBuf>,
+    /// Crew name from `profiles.json`'s `"crews"` map, staffing the
+    /// `review-probe`/`review-judge` seats. Required unless `from_envelope`
+    /// is set (synthesis-only needs no crew).
+    pub crew: Option<String>,
+    /// `"sequential"` | `"parallel"` | `"auto"`.
+    pub mode: String,
+    /// Overrides every `review-probe` staffing's draw count (`k`).
+    pub k: Option<u32>,
+    /// Write the full funnel envelope (pretty JSON) here.
+    pub envelope_out: Option<PathBuf>,
+    /// Write the rendered `{mode, review, comment}` payload here. `None`,
+    /// or the literal path `-`, writes to stdout (mirrors `cmd_render`'s
+    /// `None` == stdout convention, plus the explicit `-` spelling the CI
+    /// path uses).
+    pub emit: Option<PathBuf>,
+    pub timeout: u32,
+    pub profiles: Option<String>,
+    pub attribution: Option<String>,
+    /// External bundler command (`<cmd> --worktree <dir> --diff <file>`),
+    /// standing in for the built-in `build_bundles`.
+    pub bundler: Option<String>,
+    /// Re-judge a previously-recorded flag list without re-running the
+    /// probe (`run_judge_only` — the bundler still runs, since the judge
+    /// needs the code each flag's `bundle_id` refers to).
+    pub charges_file: Option<PathBuf>,
+    /// Synthesis-only: read a previously-written `--envelope-out` and emit
+    /// the rendered payload — zero model calls, zero bundling. The
+    /// CI-testable path.
+    pub from_envelope: Option<PathBuf>,
+}
+
+/// `darkmux pr-review run` handler: drive the review funnel end-to-end (or
+/// synthesis-only, via `--from-envelope`) and emit the same
+/// `{mode, review, comment}` payload `render`/`cmd_render` do.
+pub fn cmd_run(opts: RunOpts) -> Result<i32> {
+    let diff_text = std::fs::read_to_string(&opts.diff)
+        .with_context(|| format!("reading --diff {}", opts.diff.display()))?;
+
+    let env: FunnelEnvelope = if let Some(path) = &opts.from_envelope {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("reading --from-envelope {}", path.display()))?;
+        serde_json::from_str(&raw)
+            .with_context(|| format!("parsing --from-envelope {} as a funnel envelope", path.display()))?
+    } else {
+        run_dispatch(&opts, &diff_text)?
+    };
+
+    if let Some(path) = &opts.envelope_out {
+        let pretty = serde_json::to_string_pretty(&env).context("serializing the funnel envelope")?;
+        std::fs::write(path, pretty)
+            .with_context(|| format!("writing --envelope-out {}", path.display()))?;
+    }
+
+    let rendered = synthesize_funnel(&env, &diff_text, opts.attribution.as_deref());
+    emit_rendered(&rendered, opts.emit.as_deref())
+}
+
+/// `--emit <path>` writes the rendered payload to a file; `--emit -` or a
+/// bare omitted `--emit` writes to stdout (the `-` spelling is what makes
+/// the CI-testable `--from-envelope ... --emit -` path assertable without
+/// a scratch file).
+fn emit_rendered(rendered: &Rendered, emit: Option<&Path>) -> Result<i32> {
+    let out = serde_json::to_string(&rendered.to_value())?;
+    match emit {
+        Some(p) if p == Path::new("-") => println!("{out}"),
+        Some(p) => std::fs::write(p, &out).with_context(|| format!("writing {}", p.display()))?,
+        None => println!("{out}"),
+    }
+    Ok(0)
+}
+
+/// The worktree/GithubApi source, or a loud named error — never a silent
+/// "which source?" guess. The clap `conflicts_with`/`requires` pairing on
+/// `RunOpts`'s CLI surface already rules out both-set and github-without-
+/// head-sha; the arms here are defense-in-depth for any caller that builds
+/// `RunOpts` directly (e.g. a future library consumer bypassing clap).
+fn resolve_source(opts: &RunOpts) -> Result<FileSource> {
+    match (&opts.worktree, &opts.github, &opts.head_sha) {
+        (Some(w), None, _) => Ok(FileSource::worktree(w)),
+        (None, Some(repo), Some(sha)) => Ok(FileSource::github_api(repo.clone(), sha.clone())),
+        (None, Some(_), None) => bail!("darkmux pr-review run: --github requires --head-sha"),
+        (None, None, _) => bail!(
+            "darkmux pr-review run: pass either --worktree <dir> or --github <owner/repo> \
+             --head-sha <sha> to source the bundler (or --from-envelope for synthesis-only, \
+             which needs neither)"
+        ),
+        (Some(_), Some(_), _) => {
+            bail!("darkmux pr-review run: --worktree and --github are mutually exclusive")
+        }
+    }
+}
+
+fn parse_exec_mode(mode: &str) -> Result<ExecMode> {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "sequential" => Ok(ExecMode::Sequential),
+        "parallel" => Ok(ExecMode::Parallel),
+        "auto" => Ok(ExecMode::Auto),
+        other => bail!(
+            "darkmux pr-review run: --mode must be one of sequential|parallel|auto (got \"{other}\")"
+        ),
+    }
+}
+
+/// `Bundle` (packet 3's `darkmux_lab::lab::bundle`) -> `BundleInput`
+/// (packet 4's `darkmux_lab::lab::funnel` shape) — the reconciliation the
+/// funnel module's own doc names as this packet's job. `slice_code` turns
+/// each bundle's line-span pointers into the actual code text the probe/
+/// judge prompts embed.
+fn bundle_inputs_from_set(set: &BundleSet, source: &FileSource) -> Result<Vec<BundleInput>> {
+    set.bundles
+        .iter()
+        .map(|b| {
+            let code = slice_code(source, &b.code)
+                .with_context(|| format!("slicing code for bundle \"{}\"", b.id))?;
+            Ok(BundleInput {
+                id: b.id.clone(),
+                fact_family: b.fact_family.clone(),
+                code,
+                facts: b.facts.clone(),
+                manifest: b.manifest.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Real `Bundle.id`s are `"<fn>@<path>"` (packet 3's `build_bundles`); the
+/// provisional funnel-internal bundler used `id == path` with no `@`.
+/// `rsplit_once('@')` handles both — and any external `--bundler` that
+/// follows the same `<fn>@<path>` convention — falling back to the whole
+/// id when there's no `@` to split on.
+fn path_from_bundle_id(bundle_id: &str) -> &str {
+    bundle_id.rsplit_once('@').map(|(_, p)| p).unwrap_or(bundle_id)
+}
+
+/// Everything but `--from-envelope`: resolve the source + crew, build real
+/// bundles, and dispatch either `run_funnel` (the full pipeline) or
+/// `run_judge_only` (`--charges-file` — re-judge a saved flag list without
+/// re-running the probe; the bundler still runs since the judge needs the
+/// code each flag's `bundle_id` refers to).
+fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<FunnelEnvelope> {
+    let crew_name = match opts.crew.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(c) => c.to_string(),
+        None => {
+            let available = load_registry(opts.profiles.as_deref())
+                .map(|l| {
+                    l.registry
+                        .crews
+                        .keys()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            bail!(
+                "darkmux pr-review run: --crew is required (unless --from-envelope) — name a \
+                 crew from your profiles.json's \"crews\" map. Available: {}",
+                if available.is_empty() { "(none)".to_string() } else { available }
+            );
+        }
+    };
+
+    let source = resolve_source(opts)?;
+    let loaded = load_registry(opts.profiles.as_deref())?;
+    let mut crew = resolve_crew(&loaded.registry, &crew_name)?;
+    if let Some(k) = opts.k {
+        if let Some(staffings) = crew.seats.get_mut("review-probe") {
+            for s in staffings.iter_mut() {
+                s.k = k;
+            }
+        }
+    }
+
+    let bundle_set = match &opts.bundler {
+        Some(cmd) => external_bundles(cmd, opts.worktree.as_deref(), &opts.diff)?,
+        None => build_bundles(&source, diff_text)?,
+    };
+    let bundles = bundle_inputs_from_set(&bundle_set, &source)?;
+
+    let intent = match &opts.intent_file {
+        Some(p) => std::fs::read_to_string(p)
+            .with_context(|| format!("reading --intent-file {}", p.display()))?,
+        None => String::new(),
+    };
+
+    let mode = parse_exec_mode(&opts.mode)?;
+    let probe_system = darkmux_crew::loader::role_prompt("review-probe").ok_or_else(|| {
+        anyhow!(
+            "darkmux: role \"review-probe\" has no system prompt — reinstall darkmux or check \
+             <crew_root>/roles/review-probe.md"
+        )
+    })?;
+    let judge_system = darkmux_crew::loader::role_prompt("review-judge").ok_or_else(|| {
+        anyhow!(
+            "darkmux: role \"review-judge\" has no system prompt — reinstall darkmux or check \
+             <crew_root>/roles/review-judge.md"
+        )
+    })?;
+
+    let case_id = match (&opts.github, &opts.head_sha) {
+        (Some(repo), Some(sha)) => format!("{repo}@{sha}"),
+        _ => opts
+            .worktree
+            .as_ref()
+            .map(|w| w.display().to_string())
+            .unwrap_or_else(|| "local".to_string()),
+    };
+
+    let inputs = FunnelInputs {
+        case_id,
+        crew: &crew,
+        intent: &intent,
+        diff: diff_text,
+        mode,
+        probe_system: &probe_system,
+        judge_system: &judge_system,
+        bundles: Some(bundles),
+    };
+
+    let timeout = opts.timeout;
+    let mut chat = move |call: &ChatCall| -> Result<SingleShotReply> {
+        single_shot_chat(&SingleShotRequest {
+            base_url: None,
+            model: call.model,
+            system: call.system,
+            user: call.user,
+            temperature: call.temperature,
+            max_tokens: call.max_tokens,
+            timeout_seconds: timeout,
+        })
+    };
+    let mut cycler = LmsCycler;
+
+    if let Some(charges_path) = &opts.charges_file {
+        let raw = std::fs::read_to_string(charges_path)
+            .with_context(|| format!("reading --charges-file {}", charges_path.display()))?;
+        let flags: Vec<ProbeFlag> = serde_json::from_str(&raw)
+            .with_context(|| format!("parsing --charges-file {} as a flag list", charges_path.display()))?;
+        run_judge_only(flags, &inputs, &mut chat, &mut cycler)
+    } else {
+        run_funnel(&inputs, &mut chat, &mut cycler)
+    }
+}
+
+/// (#1222 Phase B packet 5) The fixed marker every `Tier::Confirmed`
+/// finding carries. A local judge's double-confirm is real signal (the
+/// CLAUDE.md "recheck vs rethink" doctrine's cross-context re-thinking, at
+/// judge scale) — but it is not the frontier review the same doctrine
+/// reserves for invariant/security-bearing diffs. The marker keeps that
+/// distinction visible to whoever reads the posted comment.
+const CONFIRMED_MARKER: &str =
+    "⚠ needs frontier verification — confirmed by a local judge, not yet frontier-verified";
+
+/// Three-tier synthesis of a [`FunnelEnvelope`] into the [`Rendered`]
+/// `{mode, review, comment}` contract:
+///
+/// - [`Tier::Confirmed`] -> an inline review comment (anchor resolved via
+///   [`new_side_index`]/[`resolve_anchor`] against `diff` — the same
+///   discipline [`render_with_attribution`] uses) or, when the anchor can't
+///   be resolved to exactly one diff line, a general body item — never a
+///   guessed line. Any confirmed finding makes the review `REQUEST_CHANGES`
+///   (merge-blocking).
+/// - [`Tier::NeedsCheck`] (a pass-2 demotion already folds into this tier —
+///   `judge_one_flag` never leaves a demoted flag `Confirmed`) -> one
+///   non-blocking bullet in a "worth a double check" section: in the
+///   review body when there's also a confirmed finding, or in the comment
+///   when there isn't.
+/// - [`Tier::Archived`] -> never rendered; stays in the envelope only.
+/// - Zero confirmed AND zero needs-check on a healthy (non-degenerate)
+///   funnel -> an honest `"comment"` summary naming how much was
+///   investigated plus which models ran it — never a silent green pass.
+/// - A degenerate envelope (`env.degenerate.is_some()`) -> `"degraded"`,
+///   the same contract [`degraded_fallback`] (#1113) uses elsewhere in
+///   this module — no review signal was produced.
+pub fn synthesize_funnel(env: &FunnelEnvelope, diff: &str, attribution: Option<&str>) -> Rendered {
+    if let Some(note) = &env.degenerate {
+        return degraded_fallback(&format!("The review funnel produced no signal: {note}."), attribution);
+    }
+
+    let index = new_side_index(diff);
+    let mut inline: Vec<Value> = Vec::new();
+    let mut confirmed_general: Vec<String> = Vec::new();
+    let mut needs_check_lines: Vec<String> = Vec::new();
+
+    for j in &env.judged {
+        let path = path_from_bundle_id(&j.flag.bundle_id);
+        match j.tier {
+            Tier::Confirmed => {
+                let record = j.pass2.as_ref().unwrap_or(&j.pass1);
+                match resolve_anchor(Some(path), j.flag.anchor.as_deref(), &index) {
+                    Some(line) => inline.push(json!({
+                        "path": norm_path(path),
+                        "line": line,
+                        "side": "RIGHT",
+                        "body": confirmed_comment_body(record),
+                    })),
+                    None => confirmed_general.push(confirmed_general_bullet(path, record)),
+                }
+            }
+            Tier::NeedsCheck => {
+                let record = j.pass2.as_ref().unwrap_or(&j.pass1);
+                needs_check_lines.push(needs_check_bullet(path, j.flag.anchor.as_deref(), record));
+            }
+            Tier::Archived => {}
+        }
+    }
+
+    let confirmed_total = inline.len() + confirmed_general.len();
+
+    if confirmed_total == 0 {
+        let mut lines = vec!["### 🤖 darkmux PR review".to_string(), String::new()];
+        if needs_check_lines.is_empty() {
+            lines.push(format!(
+                "review funnel ran: {} flags investigated across {} bundles, none confirmed. _{}_",
+                env.deduped_flags,
+                env.bundles,
+                member_summary(env)
+            ));
+        } else {
+            lines.push(format!(
+                "review funnel ran: {} flags investigated across {} bundles, none confirmed — \
+                 {} worth a double check (not merge-blocking). _{}_",
+                env.deduped_flags,
+                env.bundles,
+                needs_check_lines.len(),
+                member_summary(env)
+            ));
+            lines.push(String::new());
+            lines.push("**Worth a double check:**".to_string());
+            lines.extend(needs_check_lines);
+        }
+        return Rendered {
+            mode: "comment",
+            review: None,
+            comment: Some(format!("{}{}", lines.join("\n"), footer_for(attribution))),
+        };
+    }
+
+    let mut body = vec!["### 🤖 darkmux PR review".to_string(), String::new()];
+    body.push(format!(
+        "**Verdict: flag** · {} confirmed ({} inline, {} general)",
+        confirmed_total,
+        inline.len(),
+        confirmed_general.len()
+    ));
+    if !confirmed_general.is_empty() {
+        body.push(String::new());
+        body.push("**Confirmed findings not anchored to a diff line:**".to_string());
+        body.extend(confirmed_general);
+    }
+    if !needs_check_lines.is_empty() {
+        body.push(String::new());
+        body.push("**Worth a double check** (not merge-blocking):".to_string());
+        body.extend(needs_check_lines);
+    }
+
+    Rendered {
+        mode: "review",
+        review: Some(json!({
+            "event": "REQUEST_CHANGES",
+            "body": format!("{}{}", body.join("\n"), footer_for(attribution)),
+            "comments": inline,
+        })),
+        comment: None,
+    }
+}
+
+fn confirmed_comment_body(record: &JudgeRecord) -> String {
+    let mut lines = Vec::new();
+    let note = record.note_for_author.trim();
+    lines.push(if note.is_empty() { "(no note from the judge)".to_string() } else { note.to_string() });
+    let evidence = record.decisive_evidence.trim();
+    if !evidence.is_empty() {
+        lines.push(format!("Evidence: {evidence}"));
+    }
+    lines.push(CONFIRMED_MARKER.to_string());
+    lines.join("\n\n")
+}
+
+fn confirmed_general_bullet(path: &str, record: &JudgeRecord) -> String {
+    let note = record.note_for_author.trim();
+    let mut line = format!(
+        "- `{path}` — {}",
+        if note.is_empty() { "(no note from the judge)" } else { note }
+    );
+    let evidence = record.decisive_evidence.trim();
+    if !evidence.is_empty() {
+        line.push_str(&format!(" _Evidence: {evidence}_"));
+    }
+    line.push_str(&format!(" ({CONFIRMED_MARKER})"));
+    line
+}
+
+fn needs_check_bullet(path: &str, anchor: Option<&str>, record: &JudgeRecord) -> String {
+    let anchor_bit = anchor
+        .and_then(|a| a.lines().find(|l| !l.trim().is_empty()))
+        .map(|l| format!(" (`{}`)", l.trim()))
+        .unwrap_or_default();
+    let note = record.note_for_author.trim();
+    format!(
+        "- `{path}`{anchor_bit} — {}",
+        if note.is_empty() { "(no note from the judge)" } else { note }
+    )
+}
+
+/// "probed by <models>; judged by <model>" — the "member/model attribution"
+/// half of the zero-confirms-healthy comment, distinct from the operator-
+/// supplied `attribution` CLI flag (which governs the posted footer via
+/// [`footer_for`]). Names WHICH local models ran the funnel, not WHERE it
+/// ran.
+fn member_summary(env: &FunnelEnvelope) -> String {
+    let probes: Vec<&str> = env
+        .members
+        .iter()
+        .filter(|m| m.seat == "review-probe")
+        .map(|m| m.model.as_str())
+        .collect();
+    let judge = env
+        .members
+        .iter()
+        .find(|m| m.seat == "review-judge")
+        .map(|m| m.model.as_str())
+        .unwrap_or("unknown");
+    format!(
+        "probed by {}; judged by {judge}",
+        if probes.is_empty() { "unknown".to_string() } else { probes.join(", ") }
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Test-only: these funnel types aren't referenced by this module's
+    // production code (only inferred through `env.judged`/`env.members`
+    // iteration), so importing them at file scope would warn "unused" on a
+    // plain (non-test) `cargo build`.
+    use darkmux_lab::lab::funnel::{FunnelRuling, JudgedFlag, MemberRecord};
 
     const DIFF: &str = "diff --git a/src/x.ts b/src/x.ts\n--- a/src/x.ts\n+++ b/src/x.ts\n@@ -1,3 +1,4 @@\n const a = 1;\n+const b = 2;\n const c = 3;\n-const d = 4;\n+const d = 5;\n";
 
@@ -1129,5 +1605,279 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("no cloud API"));
+    }
+
+    // ─── synthesize_funnel: three-tier synthesis (#1222 Phase B packet 5) ──
+
+    fn judge_record(ruling: FunnelRuling, evidence: &str, note: &str) -> JudgeRecord {
+        JudgeRecord {
+            ruling,
+            decisive_evidence: evidence.to_string(),
+            note_for_author: note.to_string(),
+            pass: 1,
+            seconds: 0.1,
+        }
+    }
+
+    fn probe_flag(bundle_id: &str, anchor: Option<&str>) -> ProbeFlag {
+        ProbeFlag {
+            bundle_id: bundle_id.to_string(),
+            fact_family: "unscoped".to_string(),
+            member: "darkmux:probe-model".to_string(),
+            draw: 0,
+            charge_text: "a flagged concern".to_string(),
+            anchor: anchor.map(str::to_string),
+        }
+    }
+
+    /// A double-confirmed flag: pass-1 AND pass-2 both `confirmed` — the
+    /// only way `judge_one_flag` (funnel.rs) ever produces `Tier::Confirmed`.
+    fn confirmed_flag(bundle_id: &str, anchor: Option<&str>, note: &str, evidence: &str) -> JudgedFlag {
+        let record = judge_record(FunnelRuling::Confirmed, evidence, note);
+        JudgedFlag {
+            flag: probe_flag(bundle_id, anchor),
+            pass1: record.clone(),
+            pass2: Some(record),
+            tier: Tier::Confirmed,
+            demoted_by_pass2: false,
+        }
+    }
+
+    /// `demoted = true` mirrors a pass-1 `confirmed` that pass-2 disagreed
+    /// with (`demoted_by_pass2 = true`, per `judge_one_flag`'s state
+    /// machine); `demoted = false` is a plain pass-1 `needs_check` with no
+    /// pass-2 at all. Either way `tier` is `NeedsCheck` — `synthesize_funnel`
+    /// doesn't special-case `demoted_by_pass2` itself, it just reads `tier`.
+    fn needs_check_flag(bundle_id: &str, anchor: Option<&str>, note: &str, demoted: bool) -> JudgedFlag {
+        if demoted {
+            JudgedFlag {
+                flag: probe_flag(bundle_id, anchor),
+                pass1: judge_record(FunnelRuling::Confirmed, "pass-1 evidence", "pass-1 note"),
+                pass2: Some(judge_record(FunnelRuling::FalsePositive, "pass-2 evidence", note)),
+                tier: Tier::NeedsCheck,
+                demoted_by_pass2: true,
+            }
+        } else {
+            JudgedFlag {
+                flag: probe_flag(bundle_id, anchor),
+                pass1: judge_record(FunnelRuling::NeedsCheck, "pass-1 evidence", note),
+                pass2: None,
+                tier: Tier::NeedsCheck,
+                demoted_by_pass2: false,
+            }
+        }
+    }
+
+    fn archived_flag(bundle_id: &str) -> JudgedFlag {
+        JudgedFlag {
+            flag: probe_flag(bundle_id, None),
+            pass1: judge_record(FunnelRuling::FalsePositive, "not a real issue", "no action needed"),
+            pass2: None,
+            tier: Tier::Archived,
+            demoted_by_pass2: false,
+        }
+    }
+
+    fn healthy_envelope(judged: Vec<JudgedFlag>) -> FunnelEnvelope {
+        let distinct_bundles: std::collections::HashSet<&str> =
+            judged.iter().map(|j| j.flag.bundle_id.as_str()).collect();
+        FunnelEnvelope {
+            deduped_flags: judged.len(),
+            bundles: distinct_bundles.len().max(1),
+            judged,
+            members: vec![
+                MemberRecord { model: "darkmux:probe-model".into(), seat: "review-probe".into(), draws: 2, ..Default::default() },
+                MemberRecord { model: "darkmux:judge-model".into(), seat: "review-judge".into(), draws: 2, ..Default::default() },
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn synthesize_confirmed_resolves_inline_with_marker_and_request_changes() {
+        let j = confirmed_flag(
+            "computeEnd@src/x.ts",
+            Some("const b = 2;"),
+            "shadows the config default",
+            "the clamp is bypassed",
+        );
+        let env = healthy_envelope(vec![j]);
+        let r = synthesize_funnel(&env, DIFF, None);
+        assert_eq!(r.mode, "review");
+        let review = r.review.unwrap();
+        assert_eq!(review["event"], "REQUEST_CHANGES", "a confirmed finding merge-blocks");
+        let comments = review["comments"].as_array().unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0]["path"], "src/x.ts", "bundle_id's fn@path is split on the last @");
+        assert_eq!(comments[0]["line"], 2);
+        let body = comments[0]["body"].as_str().unwrap();
+        assert!(body.contains("shadows the config default"), "{body}");
+        assert!(body.contains("the clamp is bypassed"), "{body}");
+        assert!(body.contains(CONFIRMED_MARKER), "{body}");
+        // note_for_author must precede decisive_evidence must precede the marker.
+        let note_at = body.find("shadows the config default").unwrap();
+        let evidence_at = body.find("the clamp is bypassed").unwrap();
+        let marker_at = body.find(CONFIRMED_MARKER).unwrap();
+        assert!(note_at < evidence_at && evidence_at < marker_at, "{body}");
+    }
+
+    #[test]
+    fn synthesize_confirmed_unresolvable_anchor_lands_in_body_not_inline() {
+        let j = confirmed_flag(
+            "computeEnd@src/x.ts",
+            Some("this text never appears in the diff"),
+            "a note the judge left",
+            "some evidence",
+        );
+        let env = healthy_envelope(vec![j]);
+        let r = synthesize_funnel(&env, DIFF, None);
+        assert_eq!(r.mode, "review");
+        let review = r.review.unwrap();
+        assert_eq!(
+            review["comments"].as_array().unwrap().len(),
+            0,
+            "an unresolvable anchor must never guess a line"
+        );
+        let body = review["body"].as_str().unwrap();
+        assert!(body.contains("not anchored to a diff line"), "{body}");
+        assert!(body.contains("a note the judge left"), "{body}");
+        assert!(body.contains(CONFIRMED_MARKER), "{body}");
+    }
+
+    #[test]
+    fn synthesize_confirmed_file_level_anchor_also_lands_in_body() {
+        // `anchor: None` (a file-level charge) is equally unresolvable —
+        // `resolve_anchor` returns `None` for a `None` anchor.
+        let j = confirmed_flag("computeEnd@src/x.ts", None, "file-level concern", "evidence");
+        let env = healthy_envelope(vec![j]);
+        let r = synthesize_funnel(&env, DIFF, None);
+        let review = r.review.unwrap();
+        assert_eq!(review["comments"].as_array().unwrap().len(), 0);
+        assert!(review["body"].as_str().unwrap().contains("file-level concern"));
+    }
+
+    #[test]
+    fn synthesize_demoted_flag_lands_in_needs_check_not_confirmed() {
+        let confirmed =
+            confirmed_flag("computeEnd@src/x.ts", Some("const b = 2;"), "real bug", "evidence");
+        let demoted = needs_check_flag(
+            "otherFn@src/y.ts",
+            None,
+            "the judge flip-flopped on this one",
+            true,
+        );
+        let env = healthy_envelope(vec![confirmed, demoted]);
+        let r = synthesize_funnel(&env, DIFF, None);
+        assert_eq!(r.mode, "review");
+        let body = r.review.unwrap()["body"].as_str().unwrap().to_string();
+        assert!(body.contains("1 confirmed (1 inline, 0 general)"), "{body}");
+        assert!(body.contains("Worth a double check"), "{body}");
+        assert!(body.contains("the judge flip-flopped on this one"), "{body}");
+    }
+
+    #[test]
+    fn synthesize_plain_needs_check_without_demotion_also_lands_in_section() {
+        let nc = needs_check_flag(
+            "computeEnd@src/x.ts",
+            Some("const c = 3;"),
+            "worth a second look",
+            false,
+        );
+        let confirmed =
+            confirmed_flag("otherFn@src/y.ts", Some("const b = 2;"), "real bug", "evidence");
+        let env = healthy_envelope(vec![confirmed, nc]);
+        let r = synthesize_funnel(&env, DIFF, None);
+        let body = r.review.unwrap()["body"].as_str().unwrap().to_string();
+        assert!(body.contains("worth a second look"), "{body}");
+        assert!(body.contains("const c = 3;"), "anchor is named in the bullet: {body}");
+    }
+
+    #[test]
+    fn synthesize_zero_confirms_with_needs_check_stays_comment_mode() {
+        // "the comment when there are zero confirms" — needs_check items
+        // never open a REQUEST_CHANGES review on their own.
+        let nc = needs_check_flag(
+            "computeEnd@src/x.ts",
+            Some("const b = 2;"),
+            "double check this one",
+            false,
+        );
+        let env = healthy_envelope(vec![nc]);
+        let r = synthesize_funnel(&env, DIFF, None);
+        assert_eq!(r.mode, "comment", "zero confirms never opens a review");
+        let c = r.comment.unwrap();
+        assert!(c.contains("worth a double check"), "{c}");
+        assert!(c.contains("double check this one"), "{c}");
+    }
+
+    #[test]
+    fn synthesize_zero_confirms_zero_needs_check_healthy_is_honest_comment() {
+        let env = FunnelEnvelope {
+            deduped_flags: 3,
+            bundles: 2,
+            judged: vec![archived_flag("computeEnd@src/x.ts"), archived_flag("otherFn@src/y.ts")],
+            members: vec![
+                MemberRecord { model: "darkmux:probe-a".into(), seat: "review-probe".into(), ..Default::default() },
+                MemberRecord { model: "darkmux:judge-b".into(), seat: "review-judge".into(), ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let r = synthesize_funnel(&env, DIFF, None);
+        assert_eq!(r.mode, "comment");
+        let c = r.comment.unwrap();
+        assert!(
+            c.contains("review funnel ran: 3 flags investigated across 2 bundles, none confirmed"),
+            "{c}"
+        );
+        assert!(c.contains("darkmux:probe-a"), "member attribution: {c}");
+        assert!(c.contains("darkmux:judge-b"), "member attribution: {c}");
+    }
+
+    #[test]
+    fn synthesize_archived_never_appears_in_rendered_output() {
+        let confirmed = confirmed_flag(
+            "computeEnd@src/x.ts",
+            Some("const b = 2;"),
+            "a note that should survive",
+            "evidence",
+        );
+        let archived = archived_flag("suspicious-archived-bundle-id@src/y.ts");
+        let env = healthy_envelope(vec![confirmed, archived]);
+        let r = synthesize_funnel(&env, DIFF, None);
+        let review = r.review.unwrap();
+        let body = review["body"].as_str().unwrap().to_string();
+        assert!(
+            !body.contains("suspicious-archived-bundle-id"),
+            "an archived flag must never render: {body}"
+        );
+        // The confirmed flag's anchor resolves, so its note lands in the
+        // inline comment body, not the review's summary body.
+        let comments = review["comments"].as_array().unwrap();
+        assert_eq!(comments.len(), 1);
+        assert!(comments[0]["body"].as_str().unwrap().contains("a note that should survive"));
+    }
+
+    #[test]
+    fn synthesize_degenerate_envelope_is_degraded() {
+        let env = FunnelEnvelope {
+            degenerate: Some("zero flags from all probe draws — never a silent pass".to_string()),
+            ..Default::default()
+        };
+        let r = synthesize_funnel(&env, DIFF, None);
+        assert_eq!(r.mode, "degraded");
+        let c = r.comment.unwrap();
+        assert!(c.contains("no signal"), "{c}");
+        assert!(c.contains("zero flags from all probe draws"), "{c}");
+    }
+
+    #[test]
+    fn synthesize_attribution_flows_into_footer() {
+        let confirmed =
+            confirmed_flag("computeEnd@src/x.ts", Some("const b = 2;"), "n", "e");
+        let att = "Reviewed by the review funnel on the repo's self-hosted runner.";
+        let env = healthy_envelope(vec![confirmed]);
+        let r = synthesize_funnel(&env, DIFF, Some(att));
+        let body = r.review.unwrap()["body"].as_str().unwrap().to_string();
+        assert!(body.contains(att), "{body}");
     }
 }
