@@ -102,6 +102,18 @@
 //! `judge_prompt`, etc.) or the per-flag dispatch helper `judge_one_flag`
 //! (its [`JudgeOutcome`] is emitted from by the caller in `finish_funnel`'s
 //! loop, after the call returns).
+//!
+//! ## Host telemetry sampling (#1247 doctrine surface — "No blind runs")
+//!
+//! `run_funnel`/`run_judge_only` also start a background host cpu/ram/gpu
+//! sampler for the run's whole lifetime — see [`FunnelBookendGuard`] and
+//! [`HostTelemetrySampler`]. Samples emit as `telemetry.process` records
+//! through the SAME injected [`FunnelEmitter`] the `funnel.*` action family
+//! above uses (so a bench run's samples stay per-run-local and a
+//! `pr-review run`'s samples ride the fleet stream, same split), with the
+//! identical field shape `darkmux_crew::dispatch_internal`'s always-on
+//! sampler already produces — the run-monitor/viewer code that renders
+//! `telemetry.process` today applies unchanged.
 
 use anyhow::{anyhow, bail, Context, Result};
 use darkmux_crew::single_shot::SingleShotReply;
@@ -110,7 +122,11 @@ use darkmux_profiles::{lms, swap};
 use darkmux_types::{BundleSelector, ProfileModel};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver};
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 // ─── execution mode ───────────────────────────────────────────────────────
 
@@ -345,6 +361,145 @@ fn task_finished_record(env: &FunnelEnvelope) -> darkmux_flow::FlowRecord {
     funnel_flow_record(&env.case_id, &env.crew, FUNNEL_TASK_ACTION, level, payload)
 }
 
+// ─── host telemetry sampling (#1247 doctrine surface) ────────────────────
+
+/// Production sample cadence — identical to `dispatch_internal`'s always-on
+/// sampler (`TELEMETRY_SAMPLE_INTERVAL`/`SAMPLER_POLL_INTERVAL`). `interval`
+/// is the time between samples; `poll` is how often the sampler thread
+/// re-checks the stop flag while sleeping out `interval`, so teardown is
+/// prompt (≤`poll`) instead of blocking for a full tick.
+const FUNNEL_TELEMETRY_INTERVAL: Duration = Duration::from_millis(2000);
+const FUNNEL_TELEMETRY_POLL: Duration = Duration::from_millis(500);
+
+/// (#1247 doctrine surface — "No blind runs") Best-effort host cpu/ram/gpu
+/// sampler for the funnel driver. The container dispatch path
+/// (`darkmux_crew::dispatch_internal`) has always sampled host load at
+/// ~2s cadence; the funnel path bypasses `dispatch_internal` entirely
+/// (it dispatches through the container-free single-shot primitive) and
+/// so, until now, produced zero host telemetry — a funnel envelope
+/// recorded per-step wall-clock with no visibility into concurrent
+/// machine load. Measured motivation (#1247 host-telemetry comment): a
+/// 35B judge's tok/s dropped ~12–15% exactly when concurrent
+/// `cargo test`/build bursts began on the same machine, invisible in the
+/// envelope.
+///
+/// Reuses the EXACT host-reading mechanism `dispatch_internal` uses
+/// (`darkmux_crew::telemetry_sampler::sample_host` — shells out to
+/// `top`/`vm_stat`+`sysctl`/`ioreg`, extracted there for this reuse) and
+/// the exact record shape (`darkmux_crew::dispatch::build_telemetry_record`,
+/// `category=telemetry, source="process", action="telemetry.process"`,
+/// payload `{cpu, mem, gpu}`), so the run-monitor/viewer code that already
+/// renders `telemetry.process` records applies unchanged. `handle`/
+/// `session_id` carry the crew name / case id — the same identity fields
+/// `funnel_flow_record` stamps on the `funnel.*` action family, so a
+/// telemetry record for this run groups with its other records under the
+/// same `session_id`.
+///
+/// Samples land on an `mpsc` channel rather than being emitted directly
+/// from the background thread: the funnel driver's [`FunnelEmitter`] is a
+/// caller-injected `&mut dyn` trait object — not thread-safe, and
+/// deliberately not wrapped in a `Mutex` (that would force every
+/// `FunnelEmitter` impl and every existing emission call site in this file
+/// through lock-guarded access for a feature this narrow). Instead,
+/// [`FunnelBookendGuard`] drains the channel immediately before every
+/// record it already emits (`funnel.task`/`funnel.step`/`funnel.ruling`)
+/// and once more in its own `Drop`, so telemetry interleaves with the
+/// run's other records close to when it was sampled — never batched at
+/// end-of-run, which is exactly the failure the doctrine calls out
+/// ("per-event records stream durably as they happen").
+struct HostTelemetrySampler {
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+    rx: Receiver<darkmux_flow::FlowRecord>,
+}
+
+impl HostTelemetrySampler {
+    /// Spawn the sampler thread. Uses `Builder::spawn` (which returns
+    /// `io::Result`, unlike the panicking `thread::spawn`) so an OS-level
+    /// spawn failure degrades to "no samples" — sampling must never affect
+    /// the funnel run it's observing.
+    fn start(case_id: String, crew: String, interval: Duration, poll: Duration) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let stop_thread = Arc::clone(&stop);
+        let handle = thread::Builder::new()
+            .name("funnel-telemetry".to_string())
+            .spawn(move || loop {
+                // Sleep out `interval` FIRST, THEN sample — deliberately
+                // NOT sample-then-sleep. A funnel run's own dispatches
+                // (bundling, probe draws, judge passes) are real LMStudio
+                // round trips that take real wall-clock, so a run genuinely
+                // running past one `interval` gets its first sample right
+                // on schedule. The load-bearing side effect: at the
+                // PRODUCTION cadence ([`FUNNEL_TELEMETRY_INTERVAL`], 2s),
+                // this makes it structurally impossible for a synchronous,
+                // sub-millisecond MOCKED test run (of which this file has
+                // 20+) to race a sample into its `RecordingEmitter` — the
+                // thread can't reach the sample point before `stop()` +
+                // `join()` in `HostTelemetrySampler::drop` already won.
+                // Only a run whose OWN cadence deliberately shortens
+                // `interval` (this module's telemetry tests) or a real
+                // dispatch that outlives 2s ever observes one.
+                let mut slept = Duration::ZERO;
+                while slept < interval {
+                    if stop_thread.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let nap = poll.min(interval - slept);
+                    thread::sleep(nap);
+                    slept += nap;
+                }
+                let sample = darkmux_crew::telemetry_sampler::sample_host();
+                if sample.cpu.is_some() || sample.mem.is_some() || sample.gpu.is_some() {
+                    let mut payload = serde_json::Map::new();
+                    if let Some(c) = sample.cpu {
+                        payload.insert("cpu".into(), c.into());
+                    }
+                    if let Some(m) = sample.mem {
+                        payload.insert("mem".into(), m.into());
+                    }
+                    if let Some(g) = sample.gpu {
+                        payload.insert("gpu".into(), g.into());
+                    }
+                    let record = darkmux_crew::dispatch::build_telemetry_record(
+                        darkmux_flow::Level::Info,
+                        "telemetry.process",
+                        "process",
+                        &crew,
+                        &case_id,
+                        None,
+                        None,
+                        None,
+                        serde_json::Value::Object(payload),
+                    );
+                    // A disconnected receiver (the guard already tore
+                    // down) just means this sample is lost — best-effort,
+                    // never a reason to abort the loop.
+                    let _ = tx.send(record);
+                }
+            })
+            .ok();
+        Self { stop, handle, rx }
+    }
+
+    /// Signal the stop flag and join the thread. Called from `Drop` — the
+    /// RAII tie-in that guarantees no orphaned sampler thread outlives a
+    /// [`FunnelBookendGuard`], on every exit path (clean finish, early
+    /// `?`-return, or panic).
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for HostTelemetrySampler {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 /// (#1247 review round) Bookend guard for the funnel's flow-record
 /// lifecycle — same class of problem `darkmux-crew`'s
 /// `DispatchBookendGuard` (#717) solves for `dispatch.start`: once
@@ -366,6 +521,13 @@ fn task_finished_record(env: &FunnelEnvelope) -> darkmux_flow::FlowRecord {
 /// Emission on `Drop` is best-effort by construction — [`FunnelEmitter`]
 /// impls are already infallible (`emit` returns nothing), so a sink problem
 /// can't mask the original error propagating out.
+///
+/// Also owns the run's [`HostTelemetrySampler`] (#1247 doctrine surface):
+/// started in [`Self::new`]/[`Self::new_with_telemetry_interval`] and
+/// stopped by its own `Drop` — which Rust runs automatically as a field of
+/// this struct, right after `FunnelBookendGuard`'s own `Drop::drop` body
+/// returns, so the sampler thread never outlives the guard on any exit
+/// path.
 struct FunnelBookendGuard<'a> {
     emitter: &'a mut dyn FunnelEmitter,
     case_id: String,
@@ -375,11 +537,32 @@ struct FunnelBookendGuard<'a> {
     /// `finished` yet — a stack, since seat-level `probe:<name>` steps nest
     /// inside the phase-level `probe` step.
     open_steps: Vec<(String, String)>,
+    telemetry: HostTelemetrySampler,
 }
 
 impl<'a> FunnelBookendGuard<'a> {
     fn new(emitter: &'a mut dyn FunnelEmitter, case_id: &str, crew: &str) -> Self {
+        Self::new_with_telemetry_interval(emitter, case_id, crew, FUNNEL_TELEMETRY_INTERVAL, FUNNEL_TELEMETRY_POLL)
+    }
+
+    /// Same as [`Self::new`] but with a caller-chosen telemetry cadence —
+    /// the test-only seam a scripted run uses to observe a sample without
+    /// a multi-second sleep (production always goes through `new`, which
+    /// fixes the cadence at [`FUNNEL_TELEMETRY_INTERVAL`]).
+    fn new_with_telemetry_interval(
+        emitter: &'a mut dyn FunnelEmitter,
+        case_id: &str,
+        crew: &str,
+        telemetry_interval: Duration,
+        telemetry_poll: Duration,
+    ) -> Self {
         Self {
+            telemetry: HostTelemetrySampler::start(
+                case_id.to_string(),
+                crew.to_string(),
+                telemetry_interval,
+                telemetry_poll,
+            ),
             emitter,
             case_id: case_id.to_string(),
             crew: crew.to_string(),
@@ -388,11 +571,33 @@ impl<'a> FunnelBookendGuard<'a> {
         }
     }
 
+    /// Drain every telemetry sample buffered since the last drain and emit
+    /// each through the same [`FunnelEmitter`] the driver's own records go
+    /// through — called immediately before every record this guard emits
+    /// (see [`Self::emit_now`]) so telemetry streams alongside the run
+    /// rather than batching at the end.
+    fn drain_telemetry(&mut self) {
+        let records: Vec<darkmux_flow::FlowRecord> = self.telemetry.rx.try_iter().collect();
+        for record in records {
+            self.emitter.emit(record);
+        }
+    }
+
+    /// Drain pending telemetry, then emit `record`. Every direct emission
+    /// in this guard routes through here (instead of calling
+    /// `self.emitter.emit` directly) so telemetry ordering stays close to
+    /// wall-clock without needing the sampler thread to touch the emitter
+    /// itself.
+    fn emit_now(&mut self, record: darkmux_flow::FlowRecord) {
+        self.drain_telemetry();
+        self.emitter.emit(record);
+    }
+
     /// Emit the `funnel.task started` bookend and ARM the guard — from here
     /// until `task_finished`, an early return or panic fires the Drop path.
     fn task_started(&mut self, payload: serde_json::Value) {
         self.armed = true;
-        self.emitter.emit(funnel_flow_record(
+        self.emit_now(funnel_flow_record(
             &self.case_id,
             &self.crew,
             FUNNEL_TASK_ACTION,
@@ -405,7 +610,7 @@ impl<'a> FunnelBookendGuard<'a> {
     /// as open until [`Self::step_finished`] closes it.
     fn step_started(&mut self, step_id: &str, kind: &str, payload: serde_json::Value) {
         self.open_steps.push((step_id.to_string(), kind.to_string()));
-        self.emitter.emit(funnel_flow_record(
+        self.emit_now(funnel_flow_record(
             &self.case_id,
             &self.crew,
             FUNNEL_STEP_ACTION,
@@ -420,7 +625,7 @@ impl<'a> FunnelBookendGuard<'a> {
     /// the close is then a no-op on the open-step stack.
     fn step_finished(&mut self, step_id: &str, payload: serde_json::Value) {
         self.open_steps.retain(|(id, _)| id != step_id);
-        self.emitter.emit(funnel_flow_record(
+        self.emit_now(funnel_flow_record(
             &self.case_id,
             &self.crew,
             FUNNEL_STEP_ACTION,
@@ -431,7 +636,7 @@ impl<'a> FunnelBookendGuard<'a> {
 
     /// Emit a `funnel.ruling` ticker record (no open/close semantics).
     fn ruling(&mut self, payload: serde_json::Value) {
-        self.emitter.emit(funnel_flow_record(
+        self.emit_now(funnel_flow_record(
             &self.case_id,
             &self.crew,
             FUNNEL_RULING_ACTION,
@@ -446,19 +651,26 @@ impl<'a> FunnelBookendGuard<'a> {
     fn task_finished(&mut self, env: &FunnelEnvelope) {
         self.armed = false;
         self.open_steps.clear();
-        self.emitter.emit(task_finished_record(env));
+        self.emit_now(task_finished_record(env));
     }
 }
 
 impl Drop for FunnelBookendGuard<'_> {
     fn drop(&mut self) {
+        // Flush any sample the sampler produced since the last drain —
+        // even on the clean-finish path (`task_finished` already disarmed
+        // `self.armed`), a sample can land in the brief window between
+        // that drain and this `Drop` running. The sampler thread itself
+        // stops right after, via `HostTelemetrySampler`'s own `Drop`
+        // (a field of this struct, torn down once this function returns).
+        self.drain_telemetry();
         if !self.armed {
             return;
         }
         // Close every still-open step, innermost-first, so the stream's
         // start/terminal pairing stays consistent even on the abort path.
         while let Some((step_id, kind)) = self.open_steps.pop() {
-            self.emitter.emit(funnel_flow_record(
+            self.emit_now(funnel_flow_record(
                 &self.case_id,
                 &self.crew,
                 FUNNEL_STEP_ACTION,
@@ -466,7 +678,7 @@ impl Drop for FunnelBookendGuard<'_> {
                 json!({ "step_id": step_id, "kind": kind, "status": "error" }),
             ));
         }
-        self.emitter.emit(funnel_flow_record(
+        self.emit_now(funnel_flow_record(
             &self.case_id,
             &self.crew,
             FUNNEL_TASK_ACTION,
@@ -1611,11 +1823,44 @@ fn finish_funnel(
 /// `darkmux_crew::single_shot::single_shot_chat`). `cycler` loads/releases
 /// models around the dispatches (production: [`LmsCycler`]; tests: a
 /// recording mock).
+///
+/// Also starts the run's host telemetry sampler (#1247 doctrine surface) —
+/// see [`FunnelBookendGuard`]/[`HostTelemetrySampler`] — at the production
+/// cadence ([`FUNNEL_TELEMETRY_INTERVAL`]). [`run_funnel_with_telemetry_interval`]
+/// is the test-only seam for a faster cadence.
 pub fn run_funnel(
     inputs: &FunnelInputs,
     mut chat: impl FnMut(&ChatCall) -> Result<SingleShotReply>,
     cycler: &mut dyn ModelCycler,
     emitter: &mut dyn FunnelEmitter,
+) -> Result<FunnelEnvelope> {
+    run_funnel_impl(inputs, &mut chat, cycler, emitter, FUNNEL_TELEMETRY_INTERVAL, FUNNEL_TELEMETRY_POLL)
+}
+
+/// Test-only seam: identical pipeline to [`run_funnel`], but with a
+/// caller-chosen telemetry cadence so a scripted test can observe a
+/// host-telemetry sample without a multi-second sleep. No production
+/// caller uses this — `run_funnel` always fixes the cadence at
+/// [`FUNNEL_TELEMETRY_INTERVAL`].
+#[cfg(test)]
+fn run_funnel_with_telemetry_interval(
+    inputs: &FunnelInputs,
+    chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
+    cycler: &mut dyn ModelCycler,
+    emitter: &mut dyn FunnelEmitter,
+    telemetry_interval: Duration,
+    telemetry_poll: Duration,
+) -> Result<FunnelEnvelope> {
+    run_funnel_impl(inputs, chat, cycler, emitter, telemetry_interval, telemetry_poll)
+}
+
+fn run_funnel_impl(
+    inputs: &FunnelInputs,
+    chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
+    cycler: &mut dyn ModelCycler,
+    emitter: &mut dyn FunnelEmitter,
+    telemetry_interval: Duration,
+    telemetry_poll: Duration,
 ) -> Result<FunnelEnvelope> {
     let (probes, judge) = validate_funnel_crew(inputs.crew)?;
     let mode = resolve_mode(inputs.mode, probes, judge);
@@ -1645,7 +1890,13 @@ pub fn run_funnel(
     // `?`-return or panic below fires its Drop path (open steps closed with
     // `status: "error"`, then a terminal error task record) so no consumer
     // ever sees an orphaned `started`.
-    let mut guard = FunnelBookendGuard::new(emitter, &inputs.case_id, &inputs.crew.name);
+    let mut guard = FunnelBookendGuard::new_with_telemetry_interval(
+        emitter,
+        &inputs.case_id,
+        &inputs.crew.name,
+        telemetry_interval,
+        telemetry_poll,
+    );
     guard.task_started(json!({
         "status": "started", "case_id": inputs.case_id, "crew": inputs.crew.name,
         "exec_mode": mode_label(mode), "bundles": bundles.len(),
@@ -1679,9 +1930,8 @@ pub fn run_funnel(
             "items_in": bundles.len(), "items_out": 0, "wall_ms": 0,
         }),
     );
-    let raw_flags =
-        probe_phase(&bundles, probes, inputs, &mut chat, cycler, &mut env.members, mode, &mut guard)
-            .context("review funnel: probe phase")?;
+    let raw_flags = probe_phase(&bundles, probes, inputs, chat, cycler, &mut env.members, mode, &mut guard)
+        .context("review funnel: probe phase")?;
     let probe_ms = t_probe.elapsed().as_millis() as u64;
     env.steps.push(StepRecord {
         step_id: "probe".to_string(),
@@ -1704,7 +1954,7 @@ pub fn run_funnel(
         return Ok(env);
     }
 
-    finish_funnel(env, raw_flags, &bundles, inputs, judge, &mut chat, cycler, &mut guard)
+    finish_funnel(env, raw_flags, &bundles, inputs, judge, chat, cycler, &mut guard)
 }
 
 /// Re-judge a previously-recorded flag list without re-running the probe
@@ -2582,6 +2832,182 @@ mod tests {
         // The rulings the docket DID produce before the abort are on the
         // stream — partial progress is preserved, not retconned.
         assert!(emitter.records.iter().any(|r| r.action == "funnel.ruling"));
+    }
+
+    // ── host telemetry sampler (#1247 doctrine surface) ─────────────────
+
+    /// `HostTelemetrySampler` on its own, outside any guard: `drop` alone
+    /// must stop and join the background thread. The join itself runs on
+    /// a SPAWNED thread (not the test thread) and the test asserts via
+    /// `recv_timeout` — a regression that makes the sampler ignore its
+    /// stop flag then fails LOUD with a bounded timeout instead of
+    /// wedging the whole `cargo test` run.
+    #[test]
+    fn host_telemetry_sampler_stops_and_joins_promptly_on_drop() {
+        let sampler = HostTelemetrySampler::start(
+            "case".to_string(),
+            "crew".to_string(),
+            Duration::from_millis(5),
+            Duration::from_millis(2),
+        );
+        // Let at least one interval tick elapse so the thread is inside
+        // its live sample-or-sleep loop, not still spinning up.
+        thread::sleep(Duration::from_millis(20));
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::spawn(move || {
+            drop(sampler); // `HostTelemetrySampler::drop` -> stop() -> join()
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("sampler thread did not stop within 5s — thread leak");
+    }
+
+    /// `FunnelBookendGuard` owns the sampler's whole-run lifecycle (see its
+    /// doc). Clean finish: `task_started` -> `task_finished` -> the guard
+    /// drops — the sampler thread must already be stopped by the time that
+    /// drop returns. Same bounded-timeout discipline as the sampler-only
+    /// test above (drop runs on a spawned thread; the test thread asserts
+    /// via `recv_timeout` so a hang fails loud instead of wedging the run).
+    #[test]
+    fn bookend_guard_clean_finish_stops_telemetry_sampler_thread() {
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut emitter = RecordingEmitter::new();
+            let mut guard = FunnelBookendGuard::new_with_telemetry_interval(
+                &mut emitter,
+                "case-1",
+                "crew-1",
+                Duration::from_millis(5),
+                Duration::from_millis(2),
+            );
+            guard.task_started(json!({"status": "started"}));
+            let env = FunnelEnvelope {
+                case_id: "case-1".to_string(),
+                crew: "crew-1".to_string(),
+                ..Default::default()
+            };
+            guard.task_finished(&env);
+            drop(guard); // blocks until the sampler thread stops + joins
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("guard drop (clean finish) did not stop the telemetry sampler thread within 5s — thread leak");
+    }
+
+    /// The error-path mirror: `task_started` with no matching
+    /// `task_finished` (an early `?`-return / panic unwind) — the guard's
+    /// Drop path (still ARMED) closes open steps + emits a terminal error
+    /// record AND must still stop the sampler thread, exactly like the
+    /// clean-finish path above.
+    #[test]
+    fn bookend_guard_error_path_drop_stops_telemetry_sampler_thread() {
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut emitter = RecordingEmitter::new();
+            {
+                let mut guard = FunnelBookendGuard::new_with_telemetry_interval(
+                    &mut emitter,
+                    "case-2",
+                    "crew-2",
+                    Duration::from_millis(5),
+                    Duration::from_millis(2),
+                );
+                guard.task_started(json!({"status": "started"}));
+                // No `task_finished` call — the guard drops here still
+                // ARMED, exercising the error path.
+            }
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("guard drop (error path) did not stop the telemetry sampler thread within 5s — thread leak");
+    }
+
+    /// End-to-end: a scripted `run_funnel` (via the test-only
+    /// `run_funnel_with_telemetry_interval` seam) with a fast sampler
+    /// cadence and a small sleep per scripted dispatch (so the run's own
+    /// wall-clock comfortably exceeds several sample intervals) must show
+    /// at least one `telemetry.process` record on the `RecordingEmitter`,
+    /// with the same field shape `dispatch_internal`'s sampler already
+    /// produces (`category=telemetry, source="process"`) plus this run's
+    /// own identity (`session_id=case_id`, `handle=crew name`) — the
+    /// convention `funnel_flow_record` already uses for the `funnel.*`
+    /// action family, so a telemetry record groups with a run's other
+    /// records under the same `session_id`.
+    #[test]
+    fn flow_emission_includes_host_telemetry_when_sampler_cadence_is_fast() {
+        let crew = valid_crew();
+        let inputs = FunnelInputs {
+            case_id: "c-telemetry".to_string(),
+            crew: &crew,
+            intent: "add a feature",
+            diff: DIFF,
+            mode: ExecMode::Sequential,
+            probe_system: "probe sys",
+            judge_system: "judge sys",
+            bundles: None,
+        };
+        let mut cycler = RecordingCycler::new();
+        let mut emitter = RecordingEmitter::new();
+        let mut call_n = 0u32;
+        // Same scripted scenario as `flow_emission_records_the_expected_
+        // action_sequence_for_a_healthy_run` (probe k=2 both find the same
+        // defect, judge confirms both passes -> 4 dispatch calls total).
+        // `sample_host`'s real cost is dominated by `top -l 1 -n 0`, which
+        // measured 600-650ms per call on dev hardware — NOT the 5ms
+        // `interval` (that only paces the sleep-then-sample loop; a single
+        // `sample_host()` call still takes as long as it takes). So the
+        // scripted run needs a guaranteed minimum wall-clock comfortably
+        // past one interval PLUS one full `sample_host()` call: 400ms per
+        // dispatch call x 4 calls = 1.6s, versus a ~750ms worst-case first
+        // sample (100ms interval + ~650ms `top`) — ~2x margin against CI
+        // jitter or contention from parallel test threads.
+        let mut chat = |_call: &ChatCall| {
+            thread::sleep(Duration::from_millis(400));
+            call_n += 1;
+            if call_n <= 2 {
+                Ok(reply("a real defect `const end = start.plus(30)`"))
+            } else {
+                Ok(reply(CONFIRM_JSON))
+            }
+        };
+        let env = run_funnel_with_telemetry_interval(
+            &inputs,
+            &mut chat,
+            &mut cycler,
+            &mut emitter,
+            Duration::from_millis(100),
+            Duration::from_millis(20),
+        )
+        .expect("funnel runs");
+        assert!(env.degenerate.is_none());
+
+        let telemetry: Vec<&darkmux_flow::FlowRecord> =
+            emitter.records.iter().filter(|r| r.action == "telemetry.process").collect();
+        assert!(
+            !telemetry.is_empty(),
+            "expected at least one telemetry.process record with a fast sampler cadence"
+        );
+        for r in &telemetry {
+            assert!(
+                matches!(r.category, darkmux_flow::Category::Telemetry),
+                "telemetry record must carry category=telemetry"
+            );
+            assert_eq!(r.source.as_deref(), Some("process"));
+            assert_eq!(
+                r.session_id.as_deref(),
+                Some("c-telemetry"),
+                "session_id must match the funnel's case_id — same convention funnel_flow_record uses"
+            );
+            assert_eq!(r.handle, crew.name);
+            let payload = r.payload.as_ref().expect("telemetry record carries a payload");
+            assert!(
+                payload.get("cpu").is_some() || payload.get("mem").is_some() || payload.get("gpu").is_some(),
+                "payload must carry at least one of cpu/mem/gpu: {payload:?}"
+            );
+        }
     }
 
     // ── staffing snapshot (#1247 lab-view addition) ────────────────────

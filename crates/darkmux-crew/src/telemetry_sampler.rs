@@ -27,11 +27,21 @@
 //!
 //! This module holds the PURE, unit-testable parse helpers (`lms_diff`,
 //! `host_cpu_percent_from_top`, `mem_percent_from_vm_stat`,
-//! `gpu_percent_from_ioreg`). The live sampler thread (which calls
-//! `list_loaded` + shells out to `top`/`vm_stat`/`sysctl`/`ioreg`) lives
-//! in `dispatch_internal.rs` next to the tailer + watchdog it mirrors.
+//! `gpu_percent_from_ioreg`) plus [`sample_host`], the one IMPURE entry
+//! point that actually shells out to `top`/`vm_stat`/`sysctl`/`ioreg` and
+//! feeds their output through the parsers above. `sample_host` is `pub`
+//! (not `pub(crate)`) so a second sampler thread outside this crate can
+//! reuse the exact host-reading mechanism instead of re-deriving it —
+//! `darkmux-lab`'s funnel driver does this (#1247 doctrine surface) to
+//! sample host load during review-funnel runs, which bypass
+//! `dispatch_internal` entirely and previously had no host telemetry at
+//! all. The live lms + host sampler THREAD (which additionally diffs
+//! `list_loaded()` snapshots and owns the stop-flag/poll loop) still lives
+//! in `dispatch_internal.rs` next to the tailer + watchdog it mirrors;
+//! only the host-reading mechanism is shared here.
 
 use darkmux_types::LoadedModel;
+use std::process::Command;
 
 /// Compare two loaded-model snapshots and emit one telemetry payload per
 /// change. Comparison key is `LoadedModel::model` — the bare LMStudio
@@ -161,6 +171,47 @@ pub(crate) fn gpu_percent_from_ioreg(ioreg: &str) -> Option<u64> {
         }
     }
     best.map(|v| v.min(100))
+}
+
+/// Run `cmd`, returning its stdout as a lossy UTF-8 string on a zero exit,
+/// `None` on any spawn/exit failure. Keeps the host-load sampler's three
+/// best-effort reads terse. (#1064; moved from `dispatch_internal.rs` when
+/// [`sample_host`] was extracted so both sampler call sites — the
+/// dispatch-internal thread and `darkmux-lab`'s funnel driver — share one
+/// copy of the shell-out mechanism.)
+fn run_ok(cmd: &mut Command) -> Option<String> {
+    let out = cmd.output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// One host-load reading — CPU/RAM/GPU utilization%, each best-effort and
+/// independently `None` on failure. See [`sample_host`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HostSample {
+    pub cpu: Option<u64>,
+    pub mem: Option<u64>,
+    pub gpu: Option<u64>,
+}
+
+/// Shell out to `top`/`sysctl`+`vm_stat`/`ioreg` and parse one host-load
+/// reading. Unprivileged, best-effort per field (a failed read yields
+/// `None` for that field only, never an `Err` — see the individual parse
+/// helpers' docs for the exact commands and formats). Extracted out of
+/// `dispatch_internal::run_telemetry_sampler` (#1064's original site) so
+/// the funnel driver's sampler (#1247 doctrine surface) reads host load
+/// through the exact same mechanism rather than re-deriving it — the two
+/// sampler THREADS differ (poll cadence, stop-flag ownership, sink), but
+/// "what a host sample looks like" is one function.
+pub fn sample_host() -> HostSample {
+    let cpu = run_ok(Command::new("top").args(["-l", "1", "-n", "0"])).and_then(|s| host_cpu_percent_from_top(&s));
+    let mem = run_ok(Command::new("sysctl").args(["-n", "hw.memsize"]))
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .and_then(|total| run_ok(&mut Command::new("vm_stat")).and_then(|s| mem_percent_from_vm_stat(&s, total)));
+    let gpu = run_ok(Command::new("ioreg").args(["-r", "-d", "1", "-c", "IOAccelerator"]))
+        .and_then(|s| gpu_percent_from_ioreg(&s));
+    HostSample { cpu, mem, gpu }
 }
 
 #[cfg(test)]
