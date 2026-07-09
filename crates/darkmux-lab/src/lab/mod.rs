@@ -1,4 +1,7 @@
 pub mod artifact_dirs;
+// (#1222 Phase B packet 3) Built-in review bundler — diff -> per-changed-
+// function code bundles + mechanical facts + manifest.
+pub mod bundle;
 pub mod characterize;
 pub mod compare;
 pub mod cow_clone;

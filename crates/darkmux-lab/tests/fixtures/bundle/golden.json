@@ -1,0 +1,284 @@
+{
+  "bundles": [
+    {
+      "id": "placeOrder@src/orders/order.ts",
+      "code": [
+        {
+          "path": "src/orders/order.ts",
+          "start": 3,
+          "end": 25
+        },
+        {
+          "path": "src/orders/pricing.ts",
+          "start": 5,
+          "end": 10
+        },
+        {
+          "path": "src/orders/pricing.ts",
+          "start": 1,
+          "end": 3
+        },
+        {
+          "path": "src/orders/order.ts",
+          "start": 27,
+          "end": 29
+        },
+        {
+          "path": "src/orders/legacy/placeOrder.ts",
+          "start": 1,
+          "end": 3
+        },
+        {
+          "path": "src/orders/legacy/placeOrder.ts",
+          "start": 1,
+          "end": 3
+        },
+        {
+          "path": "src/orders/legacy/placeOrder.ts",
+          "start": 1,
+          "end": 1
+        },
+        {
+          "path": "src/orders/order.ts",
+          "start": 27,
+          "end": 27
+        }
+      ],
+      "facts": [
+        "default parameter(s): opts = { rush: false }",
+        "gold/silver branch: 0 references to `customerId`",
+        "gold/silver branch: 1 references to `items`",
+        "gold/silver branch: 1 references to `opts`",
+        "bronze branch: 0 references to `customerId`",
+        "bronze branch: 1 references to `items`",
+        "bronze branch: 0 references to `opts`",
+        "default branch: 0 references to `customerId`",
+        "default branch: 1 references to `items`",
+        "default branch: 0 references to `opts`",
+        "whole function: 2 references to `customerId`",
+        "whole function: 4 references to `items`",
+        "whole function: 3 references to `opts`",
+        "[gold/silver] call `applyDiscount(...)`: 2 arg(s)",
+        "[gold/silver] callee `applyDiscount` signature expects 2 param(s): total, tier",
+        "[bronze] call `computeTotal(...)`: 1 arg(s)",
+        "[bronze] callee `computeTotal` signature expects 1 param(s): items",
+        "[default] call `computeTotal(...)`: 1 arg(s)",
+        "[default] callee `computeTotal` signature expects 1 param(s): items"
+      ],
+      "fact_family": "param-flow",
+      "manifest": [
+        "referenced but not defined in bundle: log <- unknown"
+      ],
+      "truncated": true
+    },
+    {
+      "id": "placeOrder@src/orders/order.ts",
+      "code": [
+        {
+          "path": "src/orders/order.ts",
+          "start": 3,
+          "end": 25
+        },
+        {
+          "path": "src/orders/pricing.ts",
+          "start": 5,
+          "end": 10
+        },
+        {
+          "path": "src/orders/pricing.ts",
+          "start": 1,
+          "end": 3
+        },
+        {
+          "path": "src/orders/order.ts",
+          "start": 27,
+          "end": 29
+        },
+        {
+          "path": "src/orders/legacy/placeOrder.ts",
+          "start": 1,
+          "end": 3
+        },
+        {
+          "path": "src/orders/legacy/placeOrder.ts",
+          "start": 1,
+          "end": 3
+        },
+        {
+          "path": "src/orders/legacy/placeOrder.ts",
+          "start": 1,
+          "end": 1
+        },
+        {
+          "path": "src/orders/order.ts",
+          "start": 27,
+          "end": 27
+        }
+      ],
+      "facts": [
+        "call `auditOrder(...)` present in the pre-image of this function, absent from all additions in this diff"
+      ],
+      "fact_family": "differential",
+      "manifest": [
+        "referenced but not defined in bundle: log <- unknown"
+      ],
+      "truncated": true
+    },
+    {
+      "id": "placeOrder@src/orders/order.ts",
+      "code": [
+        {
+          "path": "src/orders/order.ts",
+          "start": 3,
+          "end": 25
+        },
+        {
+          "path": "src/orders/pricing.ts",
+          "start": 5,
+          "end": 10
+        },
+        {
+          "path": "src/orders/pricing.ts",
+          "start": 1,
+          "end": 3
+        },
+        {
+          "path": "src/orders/order.ts",
+          "start": 27,
+          "end": 29
+        },
+        {
+          "path": "src/orders/legacy/placeOrder.ts",
+          "start": 1,
+          "end": 3
+        },
+        {
+          "path": "src/orders/legacy/placeOrder.ts",
+          "start": 1,
+          "end": 3
+        },
+        {
+          "path": "src/orders/legacy/placeOrder.ts",
+          "start": 1,
+          "end": 1
+        },
+        {
+          "path": "src/orders/order.ts",
+          "start": 27,
+          "end": 27
+        }
+      ],
+      "facts": [
+        "sibling (same name, different path): `placeOrder` in `src/orders/legacy/placeOrder.ts` — params: id",
+        "sibling (shared identifier stem): `logOrder` in `src/orders/order.ts` — params: customerId, total"
+      ],
+      "fact_family": "siblings",
+      "manifest": [
+        "referenced but not defined in bundle: log <- unknown"
+      ],
+      "truncated": true
+    },
+    {
+      "id": "logOrder@src/orders/order.ts",
+      "code": [
+        {
+          "path": "src/orders/order.ts",
+          "start": 27,
+          "end": 29
+        },
+        {
+          "path": "src/orders/order.ts",
+          "start": 27,
+          "end": 29
+        },
+        {
+          "path": "src/orders/order.ts",
+          "start": 20,
+          "end": 26
+        },
+        {
+          "path": "src/orders/legacy/placeOrder.ts",
+          "start": 1,
+          "end": 1
+        }
+      ],
+      "facts": [
+        "whole function: 1 references to `customerId`",
+        "whole function: 1 references to `total`",
+        "call `console.log(...)`: 2 arg(s)"
+      ],
+      "fact_family": "param-flow",
+      "manifest": [
+        "referenced but not defined in bundle: log <- unknown"
+      ],
+      "truncated": true
+    },
+    {
+      "id": "logOrder@src/orders/order.ts",
+      "code": [
+        {
+          "path": "src/orders/order.ts",
+          "start": 27,
+          "end": 29
+        },
+        {
+          "path": "src/orders/order.ts",
+          "start": 27,
+          "end": 29
+        },
+        {
+          "path": "src/orders/order.ts",
+          "start": 20,
+          "end": 26
+        },
+        {
+          "path": "src/orders/legacy/placeOrder.ts",
+          "start": 1,
+          "end": 1
+        }
+      ],
+      "facts": [
+        "call `auditOrder(...)` present in the pre-image of this function, absent from all additions in this diff",
+        "call `warn(...)` present in the pre-image of this function, absent from all additions in this diff"
+      ],
+      "fact_family": "differential",
+      "manifest": [
+        "referenced but not defined in bundle: log <- unknown"
+      ],
+      "truncated": true
+    },
+    {
+      "id": "logOrder@src/orders/order.ts",
+      "code": [
+        {
+          "path": "src/orders/order.ts",
+          "start": 27,
+          "end": 29
+        },
+        {
+          "path": "src/orders/order.ts",
+          "start": 27,
+          "end": 29
+        },
+        {
+          "path": "src/orders/order.ts",
+          "start": 20,
+          "end": 26
+        },
+        {
+          "path": "src/orders/legacy/placeOrder.ts",
+          "start": 1,
+          "end": 1
+        }
+      ],
+      "facts": [
+        "sibling (shared identifier stem): `placeOrder` in `src/orders/legacy/placeOrder.ts` — params: id"
+      ],
+      "fact_family": "siblings",
+      "manifest": [
+        "referenced but not defined in bundle: log <- unknown"
+      ],
+      "truncated": true
+    }
+  ]
+}
