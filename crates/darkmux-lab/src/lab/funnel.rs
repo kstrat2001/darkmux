@@ -1574,7 +1574,11 @@ mod tests {
             BundleInput { id: "a".into(), fact_family: "auth".into(), code: String::new(), facts: vec![], manifest: vec![] },
             BundleInput { id: "b".into(), fact_family: "billing".into(), code: String::new(), facts: vec![], manifest: vec![] },
         ];
-        let sel = BundleSelector { fact_families: vec!["auth".to_string()], max_bundles: None };
+        let sel = BundleSelector {
+            fact_families: vec!["auth".to_string()],
+            max_bundles: None,
+            ..Default::default()
+        };
         let selected = select_bundles_for_staffing(&bundles, Some(&sel));
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].id, "a");
@@ -1596,7 +1600,11 @@ mod tests {
             BundleInput { id: "b".into(), fact_family: "param-flow".into(), code: String::new(), facts: vec![], manifest: vec![] },
             BundleInput { id: "c".into(), fact_family: "other".into(), code: String::new(), facts: vec![], manifest: vec![] },
         ];
-        let sel = BundleSelector { fact_families: vec![], max_bundles: Some(2) };
+        let sel = BundleSelector {
+            fact_families: vec![],
+            max_bundles: Some(2),
+            ..Default::default()
+        };
         let selected = select_bundles_for_staffing(&bundles, Some(&sel));
         assert_eq!(selected.len(), 2);
         assert_eq!(selected[0].id, "b", "param-flow bundle is prioritized first");
