@@ -94,10 +94,10 @@ jobs:
             echo "has_diff=false" >> "$GITHUB_OUTPUT"
           fi
           HEAD_SHA=$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid)
-          if ! printf '%s' "$HEAD_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
-            echo "head SHA from gh pr view did not match ^[0-9a-f]{40}\$: $HEAD_SHA"
-            exit 1
-          fi
+          # Whole-string bash match, NOT line-anchored grep: grep -Eq '^...$'
+          # matches per LINE, so a multiline value with one valid-looking line
+          # would slip through; [[ =~ ]] anchors against the entire value.
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::bad head sha from gh pr view"; exit 1; }
           echo "HEAD_SHA=$HEAD_SHA" >> "$GITHUB_ENV"
 
       - name: Write PR intent (title + description — prompt assembly lives in the binary)
