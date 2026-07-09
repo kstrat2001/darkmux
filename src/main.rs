@@ -1353,8 +1353,17 @@ enum LabCmd {
         /// agentic, so this requires --workdirs.
         #[arg(long, conflicts_with_all = ["freeform", "agentic"])]
         dialectic: bool,
-        /// Evidence root for --agentic / --dialectic: one subdirectory per
-        /// case id holding that case's repo tree
+        /// (#1222 Phase B packet 7) Dispatch the review funnel (bundles →
+        /// probe seats ×k draws → dedup → double-confirm judge) instead of a
+        /// single reviewer or the dialectic pipeline — the release-guard
+        /// validation mode: recall/precision scored EXACTLY like every other
+        /// mode. Requires --workdirs (the probe/judge seats read the case's
+        /// repo tree, like --agentic/--dialectic) and --crew (the resolved
+        /// review-probe/review-judge seat staffing).
+        #[arg(long, conflicts_with_all = ["freeform", "agentic", "dialectic"])]
+        funnel: bool,
+        /// Evidence root for --agentic / --dialectic / --funnel: one
+        /// subdirectory per case id holding that case's repo tree
         /// (`git archive <commit> | tar -x -C <root>/<id>`).
         #[arg(long)]
         workdirs: Option<std::path::PathBuf>,
@@ -1370,6 +1379,26 @@ enum LabCmd {
         /// denser local or remote-endpoint profile while the advocates stay.
         #[arg(long = "judge-profile", requires = "dialectic")]
         judge_profile: Option<String>,
+        /// (#1222 Phase B packet 7) Crew name (`crews.<name>` in the profile
+        /// registry) naming the review-probe/review-judge seat staffing.
+        /// Required with --funnel.
+        #[arg(long, requires = "funnel")]
+        crew: Option<String>,
+        /// (#1222) Funnel model-cycling mode: "sequential" | "parallel" |
+        /// "auto" (default: auto — resolved once per run against the local
+        /// hardware tier).
+        #[arg(long = "exec-mode", requires = "funnel")]
+        exec_mode: Option<String>,
+        /// (#1222) Override every review-probe staffing's draw count `k` for
+        /// this run (the crew registry's per-staffing `k` otherwise applies
+        /// unchanged).
+        #[arg(long, requires = "funnel")]
+        k: Option<u32>,
+        /// (#1222) Run an external bundler
+        /// (`<cmd> --worktree <dir> --diff <file>`) per case instead of the
+        /// built-in Rust bundler.
+        #[arg(long, requires = "funnel")]
+        bundler: Option<String>,
     },
     /// Loop lab (#986) — run ONE dispatch under a chosen harness config and
     /// classify how the loop behaved: productive / struggled / inert-false-pass
@@ -3918,10 +3947,15 @@ fn cmd_lab(sub: LabCmd) -> Result<i32> {
             freeform,
             agentic,
             dialectic,
+            funnel,
             workdirs,
             prosecutor_profile,
             defender_profile,
             judge_profile,
+            crew,
+            exec_mode,
+            k,
+            bundler,
         } => {
             lab::review_bench::run_review_bench(lab::review_bench::ReviewBenchOpts {
                 cases_dir: std::path::PathBuf::from(cases_dir),
@@ -3929,7 +3963,9 @@ fn cmd_lab(sub: LabCmd) -> Result<i32> {
                 config_path: profiles,
                 timeout_seconds: timeout,
                 scores_out,
-                mode: if dialectic {
+                mode: if funnel {
+                    lab::review_bench::BenchMode::Funnel
+                } else if dialectic {
                     lab::review_bench::BenchMode::Dialectic
                 } else if agentic {
                     lab::review_bench::BenchMode::Agentic
@@ -3942,6 +3978,10 @@ fn cmd_lab(sub: LabCmd) -> Result<i32> {
                 prosecutor_profile,
                 defender_profile,
                 judge_profile,
+                crew,
+                exec_mode,
+                k_override: k,
+                bundler_cmd: bundler,
             })?;
             Ok(0)
         }
