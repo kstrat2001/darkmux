@@ -1935,4 +1935,169 @@ mod tests {
         let body = r.review.unwrap()["body"].as_str().unwrap().to_string();
         assert!(body.contains(att), "{body}");
     }
+
+    // ─── synthesize_funnel: coverage sweep (#1222 Phase B packet 5 QA) ────
+
+    #[test]
+    fn synthesize_confirmed_ambiguous_anchor_falls_to_general() {
+        // The `hits.len() == 1` discipline (`resolve_anchor`) must hold at
+        // the synthesize_funnel level too: a confirmed flag whose anchor
+        // matches TWO diff lines must never guess — it lands in the general
+        // body list, same as an unresolvable anchor. Mirrors
+        // `resolve_ambiguous_duplicate_is_general` (render()-level) one
+        // layer up.
+        let dup_diff = "diff --git a/y.ts b/y.ts\n+++ b/y.ts\n@@ -1,0 +1,2 @@\n+  return;\n+  return;\n";
+        let j = confirmed_flag("fn@y.ts", Some("return;"), "ambiguous note", "ambiguous evidence");
+        let env = healthy_envelope(vec![j]);
+        let r = synthesize_funnel(&env, dup_diff, None);
+        assert_eq!(r.mode, "review");
+        let review = r.review.unwrap();
+        assert_eq!(
+            review["comments"].as_array().unwrap().len(),
+            0,
+            "an ambiguous (multi-hit) anchor must never guess a line"
+        );
+        let body = review["body"].as_str().unwrap();
+        assert!(body.contains("not anchored to a diff line"), "{body}");
+        assert!(body.contains("ambiguous note"), "{body}");
+    }
+
+    #[test]
+    fn confirmed_comment_body_empty_note_and_evidence_uses_fallback_text() {
+        let record = judge_record(FunnelRuling::Confirmed, "", "");
+        let body = confirmed_comment_body(&record);
+        assert!(body.contains("(no note from the judge)"), "{body}");
+        assert!(!body.contains("Evidence:"), "empty evidence must not render a line: {body}");
+        assert!(body.contains(CONFIRMED_MARKER), "{body}");
+    }
+
+    #[test]
+    fn confirmed_general_bullet_empty_note_and_evidence_uses_fallback_text() {
+        let record = judge_record(FunnelRuling::Confirmed, "", "");
+        let line = confirmed_general_bullet("src/x.ts", &record);
+        assert!(line.contains("(no note from the judge)"), "{line}");
+        assert!(!line.contains("_Evidence:"), "empty evidence must not render a line: {line}");
+        assert!(line.contains(CONFIRMED_MARKER), "{line}");
+    }
+
+    #[test]
+    fn needs_check_bullet_empty_note_uses_fallback_text() {
+        let record = judge_record(FunnelRuling::NeedsCheck, "some evidence", "");
+        let line = needs_check_bullet("src/x.ts", Some("const b = 2;"), &record);
+        assert!(line.contains("(no note from the judge)"), "{line}");
+        assert!(line.contains("const b = 2;"), "the anchor is still named: {line}");
+    }
+
+    #[test]
+    fn synthesize_confirmed_empty_note_and_evidence_renders_fallback_inline() {
+        // End-to-end companion to the two direct-fn tests above: an
+        // anchor-resolved confirmed finding with empty judge fields must
+        // still render, with the fallback text, not blank lines.
+        let j = confirmed_flag("computeEnd@src/x.ts", Some("const b = 2;"), "", "");
+        let env = healthy_envelope(vec![j]);
+        let r = synthesize_funnel(&env, DIFF, None);
+        let review = r.review.unwrap();
+        let comments = review["comments"].as_array().unwrap();
+        assert_eq!(comments.len(), 1);
+        let body = comments[0]["body"].as_str().unwrap();
+        assert!(body.contains("(no note from the judge)"), "{body}");
+        assert!(!body.contains("Evidence:"), "{body}");
+        assert!(body.contains(CONFIRMED_MARKER), "{body}");
+    }
+
+    #[test]
+    fn synthesize_npm_scoped_path_end_to_end_resolves_inline() {
+        // (#1222 packet 5 review) the bundle_id `<fn>@<path>` split-on-
+        // first-`@` fix must hold end-to-end through synthesize_funnel — a
+        // path that itself contains `@` (an npm `@scope/pkg` vendored
+        // path) must resolve to an inline comment on the RIGHT path, not
+        // just at `path_from_bundle_id`'s own unit level.
+        let scoped_diff = "diff --git a/vendor/@scope/pkg/index.ts b/vendor/@scope/pkg/index.ts\n+++ b/vendor/@scope/pkg/index.ts\n@@ -1,1 +1,2 @@\n const existing = 1;\n+const scoped = 2;\n";
+        let j = confirmed_flag(
+            "helper@vendor/@scope/pkg/index.ts",
+            Some("const scoped = 2;"),
+            "scoped-path note",
+            "scoped-path evidence",
+        );
+        let env = healthy_envelope(vec![j]);
+        let r = synthesize_funnel(&env, scoped_diff, None);
+        assert_eq!(r.mode, "review");
+        let review = r.review.unwrap();
+        let comments = review["comments"].as_array().unwrap();
+        assert_eq!(comments.len(), 1, "the scoped path must resolve inline, not defer to general");
+        assert_eq!(comments[0]["path"], "vendor/@scope/pkg/index.ts");
+        assert_eq!(comments[0]["line"], 2);
+    }
+
+    #[test]
+    fn synthesize_only_needs_check_never_opens_a_review_object() {
+        // Explicit companion to
+        // `synthesize_zero_confirms_with_needs_check_stays_comment_mode`:
+        // confirms `review` is truly `None` (not merely that `mode ==
+        // "comment"`), so a REQUEST_CHANGES event can never leak through
+        // this path even indirectly.
+        let nc = needs_check_flag(
+            "computeEnd@src/x.ts",
+            Some("const b = 2;"),
+            "double check this",
+            false,
+        );
+        let env = healthy_envelope(vec![nc]);
+        let r = synthesize_funnel(&env, DIFF, None);
+        assert!(r.review.is_none(), "needs-check-only must never populate `review`");
+        assert!(r.comment.is_some());
+    }
+
+    #[test]
+    fn synthesize_zero_confirms_with_needs_check_also_names_members() {
+        // The "N flags investigated ... worth a double check" branch calls
+        // `member_summary` too (not only the pure-honest-zero branch) — its
+        // attribution must name the actual models, not be silently
+        // dropped.
+        let nc = needs_check_flag(
+            "computeEnd@src/x.ts",
+            Some("const b = 2;"),
+            "double check",
+            false,
+        );
+        let env = healthy_envelope(vec![nc]); // darkmux:probe-model / darkmux:judge-model
+        let r = synthesize_funnel(&env, DIFF, None);
+        let c = r.comment.unwrap();
+        assert!(c.contains("darkmux:probe-model"), "{c}");
+        assert!(c.contains("darkmux:judge-model"), "{c}");
+    }
+
+    #[test]
+    fn synthesize_honest_zero_comment_names_multiple_probe_models() {
+        let env = FunnelEnvelope {
+            deduped_flags: 4,
+            bundles: 2,
+            judged: vec![archived_flag("a@f1.ts"), archived_flag("b@f2.ts")],
+            members: vec![
+                MemberRecord { model: "darkmux:probe-a".into(), seat: "review-probe".into(), ..Default::default() },
+                MemberRecord { model: "darkmux:probe-b".into(), seat: "review-probe".into(), ..Default::default() },
+                MemberRecord { model: "darkmux:judge-c".into(), seat: "review-judge".into(), ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let r = synthesize_funnel(&env, DIFF, None);
+        let c = r.comment.unwrap();
+        assert!(c.contains("probed by darkmux:probe-a, darkmux:probe-b"), "{c}");
+        assert!(c.contains("judged by darkmux:judge-c"), "{c}");
+    }
+
+    #[test]
+    fn synthesize_honest_zero_comment_falls_back_to_unknown_with_no_members() {
+        let env = FunnelEnvelope {
+            deduped_flags: 1,
+            bundles: 1,
+            judged: vec![archived_flag("a@f1.ts")],
+            members: vec![],
+            ..Default::default()
+        };
+        let r = synthesize_funnel(&env, DIFF, None);
+        let c = r.comment.unwrap();
+        assert!(c.contains("probed by unknown"), "{c}");
+        assert!(c.contains("judged by unknown"), "{c}");
+    }
 }

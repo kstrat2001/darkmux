@@ -1409,3 +1409,271 @@ fn pr_review_run_missing_crew_errors_loudly() {
         .failure()
         .stderr(predicate::str::contains("--crew is required"));
 }
+
+/// `--envelope-out` pointed at a path whose parent directory doesn't exist
+/// must fail loudly (`std::fs::write` errors, wrapped by `.with_context`)
+/// — not silently swallow the write. `fn main() -> Result<()>` propagating
+/// an `Err` up through `anyhow` prints the error chain to stderr and exits
+/// **1** (characterized here, not previously asserted anywhere).
+#[test]
+fn pr_review_run_envelope_out_unwritable_dir_fails_loudly() {
+    let tmp = TempDir::new().unwrap();
+    let diff_path = tmp.path().join("pr.diff");
+    fs::write(&diff_path, pr_review_run_diff()).unwrap();
+    let envelope_path = tmp.path().join("funnel.json");
+    fs::write(&envelope_path, pr_review_run_envelope()).unwrap();
+    let bad_out = tmp.path().join("no-such-dir").join("out.json");
+
+    let output = Command::cargo_bin("darkmux")
+        .unwrap()
+        .args([
+            "pr-review",
+            "run",
+            "--from-envelope",
+            envelope_path.to_str().unwrap(),
+            "--diff",
+            diff_path.to_str().unwrap(),
+            "--envelope-out",
+            bad_out.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "an unwritable --envelope-out dir must exit 1, stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("writing --envelope-out"), "{stderr}");
+}
+
+/// A degenerate envelope routed through `--from-envelope` still exits
+/// **0** — `synthesize_funnel`'s `mode: "degraded"` is carried in the JSON
+/// payload, not surfaced as a process failure (that distinction is the
+/// posting workflow's job to read, not the CLI's job to signal via exit
+/// code). Characterizes the previously-unasserted exit-code half of the
+/// degraded contract.
+#[test]
+fn pr_review_run_from_envelope_degenerate_exits_zero_with_degraded_mode() {
+    let tmp = TempDir::new().unwrap();
+    let diff_path = tmp.path().join("pr.diff");
+    fs::write(&diff_path, pr_review_run_diff()).unwrap();
+    let envelope_path = tmp.path().join("degenerate.json");
+    fs::write(
+        &envelope_path,
+        r#"{
+            "case_id": "test-case", "crew": "test-crew", "mode": "sequential",
+            "members": [], "steps": [], "bundles": 0, "raw_flags": 0, "deduped_flags": 0,
+            "flags": [], "judged": [], "confirmed": 0, "needs_check": 0, "archived": 0,
+            "degenerate": "zero flags from all probe draws",
+            "fingerprint": {}
+        }"#,
+    )
+    .unwrap();
+
+    let output = Command::cargo_bin("darkmux")
+        .unwrap()
+        .args([
+            "pr-review",
+            "run",
+            "--from-envelope",
+            envelope_path.to_str().unwrap(),
+            "--diff",
+            diff_path.to_str().unwrap(),
+            "--emit",
+            "-",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "a degraded outcome is still a successful *run* — stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(v["mode"], "degraded");
+}
+
+/// A malformed `--charges-file` (re-judge without re-probing) must fail
+/// loudly, named, BEFORE any model dispatch — the parse happens right
+/// after bundling and before the judge's `chat` closure is ever called, so
+/// this is exercisable with a stub `--bundler` and no live LMStudio.
+#[cfg(unix)]
+#[test]
+fn pr_review_run_malformed_charges_file_errors_loudly() {
+    let tmp = TempDir::new().unwrap();
+    let diff_path = tmp.path().join("pr.diff");
+    fs::write(&diff_path, pr_review_run_diff()).unwrap();
+
+    let profiles_path = tmp.path().join("profiles.json");
+    fs::write(
+        &profiles_path,
+        r#"{
+            "profiles": { "fast": { "models": [{"id": "test-model", "n_ctx": 8000}] } },
+            "crews": {
+                "test-crew": {
+                    "seats": {
+                        "review-probe": [{"profile": "fast", "k": 1}],
+                        "review-judge": [{"profile": "fast", "k": 1}]
+                    }
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+
+    // A stub external bundler emitting exactly one valid `Bundle` — cheap
+    // to satisfy `parse_bundle_set`'s non-empty-set requirement without
+    // needing a real checkout matching the diff (`slice_code` tolerates an
+    // unreadable/missing path; it just marks the excerpt unreadable).
+    let bundler_path = tmp.path().join("fake-bundler.sh");
+    fs::write(
+        &bundler_path,
+        "#!/bin/sh\necho '{\"bundles\":[{\"id\":\"computeEnd@src/x.ts\",\"code\":[{\"path\":\"src/x.ts\",\"start\":1,\"end\":2}],\"facts\":[],\"fact_family\":\"unscoped\"}]}'\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&bundler_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&bundler_path, perms).unwrap();
+    }
+
+    let charges_path = tmp.path().join("charges.json");
+    fs::write(&charges_path, "not valid json{{{").unwrap();
+
+    let worktree_dir = tmp.path().join("wt");
+    fs::create_dir(&worktree_dir).unwrap();
+
+    let output = Command::cargo_bin("darkmux")
+        .unwrap()
+        .args([
+            "pr-review",
+            "run",
+            "--worktree",
+            worktree_dir.to_str().unwrap(),
+            "--diff",
+            diff_path.to_str().unwrap(),
+            "--crew",
+            "test-crew",
+            "--profiles-file",
+            profiles_path.to_str().unwrap(),
+            "--bundler",
+            bundler_path.to_str().unwrap(),
+            "--charges-file",
+            charges_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "malformed --charges-file must exit loud, stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("charges-file"), "{stderr}");
+    assert!(stderr.contains("flag list"), "{stderr}");
+}
+
+/// (finding, not fixed here — tests-only mandate; see the PR body) `cmd_run`'s
+/// `--from-envelope` ignored-flag warning (src/pr_review.rs) only checks
+/// `--crew`/`--worktree`/`--github`, even though `--bundler` and `--k` are
+/// exactly as dispatch-shaping (both only matter inside `run_dispatch`,
+/// which `--from-envelope` never calls). This test characterizes CURRENT
+/// behavior: no warning is printed and the run still succeeds. The
+/// INTENDED behavior is encoded as an `#[ignore]`d test right below.
+#[test]
+fn pr_review_run_bundler_and_k_silently_unused_with_from_envelope() {
+    let tmp = TempDir::new().unwrap();
+    let diff_path = tmp.path().join("pr.diff");
+    fs::write(&diff_path, pr_review_run_diff()).unwrap();
+    let envelope_path = tmp.path().join("funnel.json");
+    fs::write(&envelope_path, pr_review_run_envelope()).unwrap();
+
+    let output = Command::cargo_bin("darkmux")
+        .unwrap()
+        .args([
+            "pr-review",
+            "run",
+            "--from-envelope",
+            envelope_path.to_str().unwrap(),
+            "--diff",
+            diff_path.to_str().unwrap(),
+            "--bundler",
+            "/nonexistent-bundler-binary",
+            "--k",
+            "7",
+            "--emit",
+            "-",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("--bundler"),
+        "current behavior: --bundler is NOT in the ignored-warning list: {stderr}"
+    );
+    assert!(
+        !stderr.contains("--k"),
+        "current behavior: --k is NOT in the ignored-warning list: {stderr}"
+    );
+}
+
+/// BUG (found during #1222 Phase B packet-5 coverage sweep; NOT fixed here
+/// per the tests-only mandate). `cmd_run`'s doc comment for the
+/// `--from-envelope` ignored-flag warning says "dispatch-shaping flags
+/// have nothing to shape" and "surface, never silently ignore" — but the
+/// `ignored` Vec (src/pr_review.rs, `cmd_run`) only checks
+/// `--crew`/`--worktree`/`--github`. `--bundler` is EXACTLY as
+/// dispatch-shaping (it's the alternate bundle source `run_dispatch`
+/// would otherwise have used) but is missing from that list, so a
+/// copy-pasted full command silently drops it with zero surfaced signal —
+/// the exact operator-sovereignty violation the existing warning exists to
+/// prevent. This test encodes the INTENDED behavior; it fails against
+/// current code.
+#[test]
+#[ignore = "bug: --bundler is dispatch-shaping but missing from cmd_run's \
+            --from-envelope ignored-warning list (src/pr_review.rs cmd_run); \
+            see PR body for the #1222 Phase B packet-5 coverage finding"]
+fn pr_review_run_bundler_should_warn_ignored_with_from_envelope() {
+    let tmp = TempDir::new().unwrap();
+    let diff_path = tmp.path().join("pr.diff");
+    fs::write(&diff_path, pr_review_run_diff()).unwrap();
+    let envelope_path = tmp.path().join("funnel.json");
+    fs::write(&envelope_path, pr_review_run_envelope()).unwrap();
+
+    let output = Command::cargo_bin("darkmux")
+        .unwrap()
+        .args([
+            "pr-review",
+            "run",
+            "--from-envelope",
+            envelope_path.to_str().unwrap(),
+            "--diff",
+            diff_path.to_str().unwrap(),
+            "--bundler",
+            "/nonexistent-bundler-binary",
+            "--emit",
+            "-",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--bundler"),
+        "expected an ignored-flag warning naming --bundler: {stderr}"
+    );
+}
