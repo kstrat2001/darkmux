@@ -7,12 +7,15 @@
 //! and resolution land ahead of the dispatch machinery a later Phase B
 //! packet adds.
 //!
-//! `resolve_crew` is the single place a crew's validity is decided —
-//! `darkmux-profiles::profiles::validate_crew` (registry-load time) and any
-//! future dispatch-time consumer both call through here, so there is
-//! exactly one definition of "a crew is valid." This mirrors `get_profile`'s
-//! loud-named-error style: every failure names the crew, the seat, the
-//! staffing position, and the specific problem.
+//! `resolve_crew` is the single place a crew's validity is decided (#1269:
+//! registry LOAD is deliberately lenient on crew content — one bad crew
+//! must not fail the whole registry and take unrelated `--profile`
+//! dispatch down with it). Every consumer that needs a specific crew calls
+//! through here directly: `crew dispatch`, the funnel preflight
+//! (`resolve_funnel_ctx`), `pr_review`, and `darkmux doctor`'s per-crew
+//! validation check. This mirrors `get_profile`'s loud-named-error style:
+//! every failure names the crew, the seat, the staffing position, and the
+//! specific problem.
 //!
 //! **What this packet does NOT validate**: role ids (the `seats` map's
 //! keys) against `crates/darkmux-crew`'s role manifest registry, or any

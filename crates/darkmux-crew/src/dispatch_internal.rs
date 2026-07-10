@@ -3364,16 +3364,22 @@ fn preflight_result_for(status: DockerRuntimeStatus) -> Result<()> {
 ///    which capability-scores the role against the profile's models (#590),
 ///    falling back to the profile's default model when no vectors
 ///    are populated (ModelRole removed in #601).
-/// 3. On any failure (no registry, no default, no profile, no model),
-///    log a deprecation warning + fall back to `probe_loaded_model()`.
-///    Back-compat for pre-refactor-1b configurations; the warning
-///    points the operator at the migration.
+/// 3. On no-default / no-model failures (a registry that LOADED fine but has
+///    nothing usable), log a deprecation warning + fall back to
+///    `probe_loaded_model()`. Back-compat for pre-refactor-1b
+///    configurations; the warning points the operator at the migration.
 ///
-/// The fallback is intentional but loud. Per memory note
-/// `feedback_model_unload_load_authority`, silent reliance on "whatever
-/// LMStudio happens to have loaded" is the contaminating-dispatch
+/// The fallback is intentional but loud for those two cases. Per memory
+/// note `feedback_model_unload_load_authority`, silent reliance on
+/// "whatever LMStudio happens to have loaded" is the contaminating-dispatch
 /// anti-pattern. The deprecation warning makes the misconfiguration
 /// operator-visible while keeping pre-refactor-1b setups working.
+///
+/// (#1269) A registry-LOAD failure (step 1 itself erroring — malformed
+/// JSON, a bad profile) is a DIFFERENT failure class and does NOT fall
+/// through to `probe_loaded_model()`: routing a broken config file into an
+/// unrelated LMStudio probe just produces a second, more confusing error on
+/// top of the first. One config mistake gets ONE clear, named error.
 fn resolve_dispatch_model_internal(
     role: &crate::types::Role,
     profile_override: Option<&str>,
@@ -3382,17 +3388,14 @@ fn resolve_dispatch_model_internal(
     use crate::select::select_model;
     use darkmux_profiles::profiles::load_registry;
 
-    let loaded = match load_registry(config_path) {
-        Ok(loaded) => loaded,
-        Err(e) => {
-            eprintln!(
-                "darkmux crew dispatch: profile registry not loadable ({e}); \
-                 falling back to probe_loaded_model() — deprecated, configure \
-                 ~/.darkmux/profiles.json. (#450 refactor 1b)"
-            );
-            return probe_loaded_model();
-        }
-    };
+    let loaded = load_registry(config_path).map_err(|e| {
+        anyhow!(
+            "darkmux crew dispatch: profile registry not loadable ({e}). \
+             Fix the registry file named above — this is a hard stop, not a \
+             fallback to whatever LMStudio has loaded, since a broken config \
+             can't tell us what you intended to dispatch to. (#1269)"
+        )
+    })?;
 
     // (#1054) Resolve the active profile: the CLI `--profile` override is
     // tried first, then the registry's `default_profile`. A `--profile` that
@@ -4389,6 +4392,83 @@ mod tests {
             Some(12345),
             "config_path (lab --profiles-file) must reach the dispatch resolver, \
              not fall through to env/default (#984)"
+        );
+    }
+
+    // ─── #1269: registry-load blast radius ──────────────────────────
+
+    #[test]
+    fn resolve_dispatch_model_internal_hard_fails_on_malformed_registry_no_probe_fallback() {
+        // A genuine registry-LOAD failure (malformed JSON, not a bad crew)
+        // must produce ONE clear, named hard error and never fall through to
+        // the deprecated `probe_loaded_model()` — routing a broken config
+        // file into an unrelated LMStudio probe just compounds the error.
+        // If this test somehow DID fall through to probe_loaded_model(), it
+        // would shell out to `curl`/LMStudio and either hang or fail in a
+        // way unrelated to the assertion below — the error text alone
+        // proves which path was taken.
+        let tmp = TempDir::new().unwrap();
+        let pf = tmp.path().join("profiles.json");
+        std::fs::write(&pf, "this is not valid json at all").unwrap();
+
+        let role: crate::types::Role = serde_json::from_str(
+            r#"{"id":"r","description":"d","tool_palette":{"allow":[],"deny":[]},"escalation_contract":"bail-with-explanation"}"#,
+        )
+        .unwrap();
+
+        let err = resolve_dispatch_model_internal(&role, None, pf.to_str()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not loadable"),
+            "expected the hard-stop registry-load error, got: {msg}"
+        );
+        assert!(
+            !msg.contains("falling back") && !msg.contains("probe_loaded_model()"),
+            "must NOT mention the deprecated probe fallback for a load failure: {msg}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_context_window_internal_unaffected_by_invalid_sibling_crew() {
+        // (#1269) A registry with one invalid crew (a remote-endpoint seat,
+        // rejected only at `resolve_crew` time) must not budge dispatch-side
+        // resolution of an UNRELATED profile — the exact blast-radius the
+        // Studio hit in production. `resolve_context_window_internal` is the
+        // LMStudio-free half of dispatch resolution (mirrors
+        // `config_path_reaches_dispatch_resolvers_not_just_env` above);
+        // model selection additionally touches `lms` to load the model,
+        // which isn't safe to exercise in a unit test.
+        let tmp = TempDir::new().unwrap();
+        let pf = tmp.path().join("profiles.json");
+        std::fs::write(
+            &pf,
+            r#"{"profiles":{
+                    "fast":{"models":[{"id":"model-a","n_ctx":32000}]},
+                    "cloud":{"models":[
+                        {"id":"gpt-remote","n_ctx":100000,
+                         "endpoint":{"url":"https://example.azure.com/openai"}}
+                    ]}
+                },
+                "default_profile":"fast",
+                "crews":{"bad":{"seats":{"review-probe":[{"profile":"cloud"}]}}}}"#,
+        )
+        .unwrap();
+        let prev = std::env::var("DARKMUX_PROFILES").ok();
+        // SAFETY: serialized via #[serial]; restored below.
+        unsafe { std::env::remove_var("DARKMUX_PROFILES") };
+        let window = resolve_context_window_internal(None, pf.to_str());
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_PROFILES", v),
+                None => std::env::remove_var("DARKMUX_PROFILES"),
+            }
+        }
+        assert_eq!(
+            window,
+            Some(32000),
+            "an invalid crew elsewhere in the registry must not affect \
+             resolution of the sibling default profile (#1269)"
         );
     }
 

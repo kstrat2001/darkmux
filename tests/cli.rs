@@ -1603,6 +1603,77 @@ fn review_bench_funnel_preflight_validates_seat_requirements_before_dispatch() {
         .stdout(predicate::str::contains("outcome").not());
 }
 
+#[test]
+fn review_bench_funnel_preflight_fails_loud_on_crew_own_resolve_crew_error() {
+    // (#1269) The registry LOADS fine (a bad crew no longer fails load), but
+    // this specific crew fails at `resolve_crew` itself (a remote-endpoint
+    // seat, rejected only at resolution — not a funnel-specific seat-shape
+    // gap like the sibling test above). The funnel preflight must still
+    // fail loud, BEFORE the per-case table header prints, naming the
+    // specific resolve_crew error.
+    let tmp = TempDir::new().unwrap();
+    let cases_dir = tmp.path().join("cases");
+    fs::create_dir_all(&cases_dir).unwrap();
+    fs::write(
+        cases_dir.join("c1.label.json"),
+        r#"{"kind":"clean","intent_title":"t","expect_verdict":"pass"}"#,
+    )
+    .unwrap();
+    fs::write(cases_dir.join("c1.diff"), "diff --git a b\n").unwrap();
+    let workdirs = tmp.path().join("workdirs");
+    fs::create_dir_all(workdirs.join("c1")).unwrap();
+
+    let profiles_path = tmp.path().join("profiles.json");
+    fs::write(
+        &profiles_path,
+        r#"{
+            "profiles": {
+                "fast": {
+                    "models": [{"id": "model-a", "n_ctx": 32000}]
+                },
+                "cloud": {
+                    "models": [
+                        {"id": "gpt-remote", "n_ctx": 100000,
+                         "endpoint": {"url": "https://example.azure.com/openai"}}
+                    ]
+                }
+            },
+            "default_profile": "fast",
+            "crews": {
+                "remote-crew": {
+                    "seats": {
+                        "review-probe": [{"profile": "cloud", "k": 2}],
+                        "review-judge": [{"profile": "cloud"}]
+                    }
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .args([
+            "lab",
+            "review-bench",
+            "--cases-dir",
+            cases_dir.to_str().unwrap(),
+            "--funnel",
+            "--workdirs",
+            workdirs.to_str().unwrap(),
+            "--crew",
+            "remote-crew",
+            "--profiles-file",
+            profiles_path.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("remote endpoint").and(predicate::str::contains("local-only")),
+        )
+        .stdout(predicate::str::contains("outcome").not());
+}
+
 // ─── review-bench --funnel end-to-end, offline (#1222 Phase B coverage) ───
 //
 // A funnel run whose bundler produces ZERO bundles short-circuits to a
@@ -1615,8 +1686,9 @@ fn review_bench_funnel_preflight_validates_seat_requirements_before_dispatch() {
 
 /// A profiles registry carrying a crews block that satisfies
 /// `validate_funnel_crew` (>= 1 review-probe staffing, exactly 1
-/// review-judge staffing). Registry-load-time `validate_crew` resolves
-/// every staffing against `profiles` — no LMStudio involved.
+/// review-judge staffing). `resolve_funnel_ctx`'s own preflight call to
+/// `resolve_crew` resolves every staffing against `profiles` — no LMStudio
+/// involved.
 fn funnel_registry_json() -> &'static str {
     r#"{
         "profiles": {

@@ -117,6 +117,7 @@ pub fn run(include_openclaw: bool) -> DoctorReport {
     let mut checks = vec![
         check_build_info(),
         check_profile_registry(),
+        check_crew_validation(),
         check_lms_binary(),
         check_docker_runtime(),
         check_models_loaded(),
@@ -1836,6 +1837,67 @@ fn check_profile_registry() -> Check {
     }
 }
 
+/// (#1269) The loud surface for crew content darkmux deliberately stopped
+/// validating at registry-LOAD time (`darkmux-profiles::profiles`'s
+/// `load_registry` is now lenient on crew content — one bad crew must not
+/// fail the whole registry, since that took down unrelated `--profile`
+/// dispatch with it). `crate::crews::resolve_crew` remains the single place
+/// a crew's semantic validity is decided; this check runs it for every crew
+/// in the registry and surfaces failures so a bad crew edit is visible
+/// without breaking anything.
+fn check_crew_validation() -> Check {
+    let registry = match profiles::load_registry(None) {
+        Ok(r) => r,
+        Err(e) => {
+            return Check {
+                name: "crew validation".into(),
+                status: Status::Warn,
+                message: format!("can't validate crews (profile registry load failed: {e})"),
+                hint: None,
+            };
+        }
+    };
+
+    if registry.registry.crews.is_empty() {
+        return Check {
+            name: "crew validation".into(),
+            status: Status::Pass,
+            message: "no crews defined".into(),
+            hint: None,
+        };
+    }
+
+    let mut offending: Vec<String> = Vec::new();
+    let mut n_ok = 0usize;
+    for name in registry.registry.crews.keys() {
+        match darkmux_profiles::crews::resolve_crew(&registry.registry, name) {
+            Ok(_) => n_ok += 1,
+            Err(e) => offending.push(format!("crew \"{name}\": {e}")),
+        }
+    }
+
+    if offending.is_empty() {
+        Check {
+            name: "crew validation".into(),
+            status: Status::Pass,
+            message: format!("{n_ok} crew(s) resolve cleanly"),
+            hint: None,
+        }
+    } else {
+        Check {
+            name: "crew validation".into(),
+            status: Status::Warn,
+            message: offending.join("; "),
+            hint: Some(
+                "fix the named crew(s) in ~/.darkmux/profiles.json — the crew's OWN dispatch \
+                 (`crew dispatch`, review-bench `--crew`) will fail loud with the same error; \
+                 unaffected profiles and crews continue to work in the meantime."
+                    .into(),
+            ),
+        }
+    }
+}
+
 fn check_lms_binary() -> Check {
     let bin = env::var("DARKMUX_LMS_BIN").unwrap_or_else(|_| "lms".to_string());
     if which(&bin).is_some() {
@@ -3470,10 +3532,11 @@ mod tests {
         // [#340] + legacy-compaction-extras [#380] + redis-config [#661] +
         // remote-endpoint-credentials [#85/#91] + docker-runtime [#680] +
         // audit-write-drops [#877] + serve-daemon-auth [#881] + fleet.mode
-        // [#933] + env-masks-config [#934] + binary-split-brain [#934]) +
-        // one per active eureka rule. Every check should appear regardless
-        // of environment — even if the underlying probe couldn't read state.
-        let expected = 36 + darkmux_eureka::all_rules().len();
+        // [#933] + env-masks-config [#934] + binary-split-brain [#934] +
+        // crew-validation [#1269]) + one per active eureka rule. Every check
+        // should appear regardless of environment — even if the underlying
+        // probe couldn't read state.
+        let expected = 37 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
@@ -4132,6 +4195,87 @@ mod tests {
 
         let check = check_legacy_compaction_extras();
         assert_eq!(check.status, Status::Pass);
+    }
+
+    // ─── #1269: check_crew_validation tests ─────────────────────
+
+    #[serial_test::serial]
+    #[test]
+    fn check_crew_validation_passes_when_no_crews() {
+        let (_guard, config_path) = ConfigPathGuard::at_tempfile("profiles.json");
+        std::fs::write(
+            &config_path,
+            r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":1000}]}}}"#,
+        )
+        .unwrap();
+
+        let check = check_crew_validation();
+        assert_eq!(check.status, Status::Pass);
+        assert!(check.message.contains("no crews"));
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_crew_validation_passes_when_all_crews_resolve() {
+        let (_guard, config_path) = ConfigPathGuard::at_tempfile("profiles.json");
+        std::fs::write(
+            &config_path,
+            r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":1000}]}},
+                "crews":{"review-deep":{"seats":{"review-probe":[{"profile":"fast"}]}}}}"#,
+        )
+        .unwrap();
+
+        let check = check_crew_validation();
+        assert_eq!(check.status, Status::Pass);
+        assert!(check.message.contains("1 crew"));
+    }
+
+    /// The exact #1269 scenario: one invalid crew (a remote-endpoint seat,
+    /// rejected only at resolve time) must surface as a WARN naming the
+    /// crew and the specific error, and must NOT prevent the check from
+    /// running at all (registry load itself succeeds).
+    #[serial_test::serial]
+    #[test]
+    fn check_crew_validation_warns_on_invalid_crew_names_it() {
+        let (_guard, config_path) = ConfigPathGuard::at_tempfile("profiles.json");
+        std::fs::write(
+            &config_path,
+            r#"{"profiles":{
+                    "fast":{"models":[{"id":"a","n_ctx":1000}]},
+                    "cloud":{"models":[
+                        {"id":"gpt-remote","n_ctx":100000,
+                         "endpoint":{"url":"https://example.azure.com/openai"}}
+                    ]}
+                },
+                "crews":{"bad-crew":{"seats":{"review-probe":[{"profile":"cloud"}]}}}}"#,
+        )
+        .unwrap();
+
+        let check = check_crew_validation();
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.message.contains("crew \"bad-crew\""));
+        assert!(check.message.contains("remote endpoint"));
+        assert!(check.hint.is_some());
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_crew_validation_reports_only_the_bad_crew_when_mixed() {
+        let (_guard, config_path) = ConfigPathGuard::at_tempfile("profiles.json");
+        std::fs::write(
+            &config_path,
+            r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":1000}]}},
+                "crews":{
+                    "good-crew":{"seats":{"review-probe":[{"profile":"fast"}]}},
+                    "bad-crew":{"seats":{"review-probe":[{"profile":"ghost"}]}}
+                }}"#,
+        )
+        .unwrap();
+
+        let check = check_crew_validation();
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.message.contains("bad-crew"));
+        assert!(!check.message.contains("good-crew"));
     }
 
     // ─── #85/#91: check_remote_endpoint_credentials tests ───────

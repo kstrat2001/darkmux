@@ -603,9 +603,13 @@ mod tests {
 
     /// `darkmux init` writes `EXAMPLE_PROFILES_JSON` VERBATIM to
     /// `~/.darkmux/profiles.json` — the next `darkmux` invocation that reads
-    /// the registry runs it through `load_registry`'s full validation pass
-    /// (including `validate_crew`, #1222 Phase B packet 1). A fresh `darkmux
-    /// init` must never hand the operator a registry that fails that pass.
+    /// the registry runs it through `load_registry`'s validation pass
+    /// (profile-level only since #1269: crew content is no longer validated
+    /// at load time). A fresh `darkmux init` must never hand the operator a
+    /// registry that fails that pass, AND its bundled `review-deep` crew
+    /// must still resolve cleanly via `resolve_crew` — the example is meant
+    /// to be a working starting point for `crew dispatch` /
+    /// `review-bench --funnel`, not just load-valid.
     ///
     /// Also drift-guards the example's stamped `schema_version` against
     /// `PROFILES_SCHEMA_VERSION` (the same committed-reference-vs-code
@@ -620,6 +624,8 @@ mod tests {
         let loaded = darkmux_profiles::profiles::load_registry(Some(p.to_str().unwrap()))
             .expect("embedded example registry must pass load_registry's validation");
         assert!(loaded.registry.crews.contains_key("review-deep"));
+        darkmux_profiles::crews::resolve_crew(&loaded.registry, "review-deep")
+            .expect("embedded example's review-deep crew must resolve cleanly (#1269)");
         assert_eq!(
             loaded.registry.schema_version.as_deref(),
             Some(darkmux_types::PROFILES_SCHEMA_VERSION),

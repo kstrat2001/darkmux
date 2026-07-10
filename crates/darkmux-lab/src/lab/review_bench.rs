@@ -3088,9 +3088,11 @@ mod tests {
         use darkmux_types::{Crew, SeatStaffing};
         use std::collections::BTreeMap;
         let tmp = tempfile::TempDir::new().unwrap();
-        // `load_registry` validates every crew at LOAD time (`validate_crew`),
-        // so "review-deep" needs real seats — an empty `Crew::default()`
-        // would fail registry load before `resolve_crew` is ever reached.
+        // (#1269) `load_registry` no longer validates crew CONTENT at load
+        // time — an empty `Crew::default()` would load fine now. Give
+        // "review-deep" real seats anyway so this test stays scoped to what
+        // it's actually checking: the "ghost" crew name isn't found and the
+        // error lists the crews that DO exist.
         let mut seats = BTreeMap::new();
         seats.insert("review-probe".to_string(), vec![SeatStaffing { profile: "fast".into(), k: 3, ..Default::default() }]);
         seats.insert("review-judge".to_string(), vec![SeatStaffing { profile: "fast".into(), k: 1, ..Default::default() }]);
