@@ -85,13 +85,17 @@ pub enum QuarantineReason {
 /// entries come back quarantined with a named reason; valid local entries
 /// become [`Placement`]s, identifiers resolved here, once.
 ///
-/// Collision rule (swap's desired_loads dedup, kept byte-semantically):
-/// entries are deduped by resolved identifier and the FIRST (declared) entry
-/// wins the slot, keeping its model key and ctx — callers list declared
-/// profile models before appended standing seats (e.g. the utility model)
-/// so a duplicate utility never overrides a declared model's context, and a
-/// colliding explicit alias never produces two competing loads of the same
-/// identifier.
+/// Collision rule (swap's utility-append dedup, GENERALIZED to all
+/// entries): entries are deduped by resolved identifier and the FIRST entry
+/// wins the slot, keeping its model key and ctx. swap's `desired_loads`
+/// only ever dedups the appended standing utility model against the
+/// declared list; this dedup also collapses two DECLARED entries resolving
+/// to the same identifier — a deliberate divergence (swap would emit both
+/// as competing loads of one identifier), not a byte-semantic port. Callers
+/// list declared profile models before appended standing seats (e.g. the
+/// utility model) so a duplicate utility never overrides a declared model's
+/// context, and a colliding explicit alias never produces two competing
+/// loads of the same identifier.
 pub fn ingest(entries: &[DesiredEntry]) -> (Vec<Placement>, Vec<Quarantined>) {
     let mut placements: Vec<Placement> = Vec::new();
     let mut quarantined: Vec<Quarantined> = Vec::new();

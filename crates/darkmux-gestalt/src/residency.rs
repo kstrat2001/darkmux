@@ -1,10 +1,17 @@
 //! The four-way residency split — the validated miniature the gestalt core
 //! generalizes (#1274).
 //!
-//! Absorbed byte-semantically from the review funnel's `decide_residency`
-//! (darkmux-lab funnel.rs, PR #1275), now `pub` and fact-typed. The
-//! root-crate `tests/gestalt_parity.rs` proves arm-for-arm agreement against
-//! the funnel's own test fixtures — the absorption is proven, not asserted.
+//! Absorbed from the review funnel's `decide_residency` (darkmux-lab
+//! funnel.rs, PR #1275). The Reuse / Reconcile / LoadFresh arms are
+//! byte-semantic ports; the funnel's Blocked-on-foreign arm is DELIBERATELY
+//! DIVERGED under the absolute-ownership decision (operator-approved
+//! 2026-07-10, #1274): a foreign resident sharing the weights is now a
+//! [`ResidencyDecision::ForeignDuplicate`] fact — respected as pool
+//! consumption, never a reuse candidate — and the planner decides
+//! load-alongside vs Block-on-capacity. The root-crate
+//! `tests/gestalt_parity.rs` proves arm-for-arm agreement against the
+//! funnel's own test fixtures for the arms that still match, and annotates
+//! the diverged vectors as named behavior changes.
 
 use crate::desired::Placement;
 use crate::facts::ResidentFact;
@@ -27,10 +34,14 @@ pub enum ResidencyDecision {
     /// option; attempting a second concurrent load of the same weights is
     /// the #1271 bug class (OOM) and isn't either.
     Reconcile { stale_identifier: String, stale_ctx: u64 },
-    /// A resident shares the modelKey but is NOT one darkmux may manage —
-    /// operator state the plan must never touch. Fail loud before spending
-    /// a load attempt the host's own guardrail would refuse anyway.
-    Blocked { resident_identifier: String },
+    /// A foreign (user/operator) resident shares the modelKey and NO
+    /// darkmux-owned/alias resident does. Under absolute ownership
+    /// (operator decision 2026-07-10, #1274) this is a FACT, not a verdict:
+    /// the duplicate's load config is unknown (the #1135 ghost) so it is
+    /// never a reuse candidate, and it is user state so it is never a
+    /// mutation target — the planner loads darkmux's own namespaced copy
+    /// alongside when capacity fits, else Blocks naming this instance.
+    ForeignDuplicate { foreign_identifier: String },
 }
 
 /// Inspect `residents` for one sharing `p`'s modelKey and decide what
@@ -44,32 +55,39 @@ pub enum ResidencyDecision {
 /// A resident counts as darkmux's own when its identifier is in the
 /// `darkmux:` namespace OR equals the exact identifier THIS placement loads
 /// under — the second arm covers an explicit alias, the documented namespace
-/// opt-out, whose resident must not misclassify as foreign user state and
-/// get Blocked against darkmux's own load.
+/// opt-out, whose resident must not misclassify as foreign user state.
 ///
-/// Multiple residents sharing the modelKey: the FIRST match (in host-reported
-/// order) decides. A first-match user-owned resident blocks even when a
-/// darkmux-owned instance also sits further down the list — the operator's
-/// copy of the weights is resident either way, and any load attempt in that
-/// state still risks the double-footprint the host's guardrail refuses.
+/// Ownership partitions BEFORE matching (absolute ownership, 2026-07-10,
+/// #1274): the first darkmux-owned/alias resident sharing the modelKey (in
+/// host-reported order) decides Reuse vs Reconcile; foreign residents are
+/// never candidates, only facts. A foreign copy listed AHEAD of a darkmux
+/// copy therefore no longer shadows it (the funnel's first-match-across-
+/// ownership rule Blocked there — a named cutover behavior change; see the
+/// crate docs). Only when no owned resident shares the modelKey does a
+/// foreign one surface, as [`ResidencyDecision::ForeignDuplicate`].
 pub fn decide_residency(residents: &[ResidentFact], p: &Placement) -> ResidencyDecision {
-    let Some(found) = residents.iter().find(|r| r.model_key == p.model_key) else {
-        return ResidencyDecision::LoadFresh;
-    };
-    let ours = is_darkmux_owned(&found.identifier) || found.identifier == p.identifier;
-    if !ours {
-        return ResidencyDecision::Blocked { resident_identifier: found.identifier.clone() };
+    let owned = residents.iter().find(|r| {
+        r.model_key == p.model_key
+            && (is_darkmux_owned(&r.identifier) || r.identifier == p.identifier)
+    });
+    if let Some(found) = owned {
+        return if ctx_sufficient(found.ctx, p.min_ctx) {
+            ResidencyDecision::Reuse {
+                identifier: found.identifier.clone(),
+                resident_ctx: found.ctx,
+            }
+        } else {
+            ResidencyDecision::Reconcile {
+                stale_identifier: found.identifier.clone(),
+                stale_ctx: found.ctx,
+            }
+        };
     }
-    if ctx_sufficient(found.ctx, p.min_ctx) {
-        ResidencyDecision::Reuse {
-            identifier: found.identifier.clone(),
-            resident_ctx: found.ctx,
+    match residents.iter().find(|r| r.model_key == p.model_key) {
+        Some(foreign) => {
+            ResidencyDecision::ForeignDuplicate { foreign_identifier: foreign.identifier.clone() }
         }
-    } else {
-        ResidencyDecision::Reconcile {
-            stale_identifier: found.identifier.clone(),
-            stale_ctx: found.ctx,
-        }
+        None => ResidencyDecision::LoadFresh,
     }
 }
 
@@ -134,14 +152,18 @@ mod tests {
     }
 
     #[test]
-    fn blocked_when_foreign_shares_model_key() {
-        // Funnel fixture (c): devstral-manual is operator state — blocked,
-        // never touched, regardless of its ctx.
+    fn foreign_duplicate_when_foreign_shares_model_key() {
+        // Funnel fixture (c), UPDATED: named divergence, absolute-ownership
+        // decision, operator-approved 2026-07-10, #1274. devstral-manual is
+        // operator state — never touched, never reused (even at sufficient
+        // ctx: its load config is the #1135 ghost); surfaced as a
+        // ForeignDuplicate fact for the planner's load-alongside-or-Block
+        // call. The funnel Blocked outright here.
         let residents = vec![resident("devstral-manual", "devstral", 40_960)];
         let p = placement("devstral", 32_768, None);
         assert_eq!(
             decide_residency(&residents, &p),
-            ResidencyDecision::Blocked { resident_identifier: "devstral-manual".into() }
+            ResidencyDecision::ForeignDuplicate { foreign_identifier: "devstral-manual".into() }
         );
     }
 
@@ -169,10 +191,13 @@ mod tests {
     }
 
     #[test]
-    fn first_match_foreign_blocks_despite_later_darkmux() {
-        // Funnel multi-resident fixture: user-owned listed ahead of a
-        // darkmux-stale instance → Blocked; order-dependence is asserted
-        // behavior, not an implementation detail.
+    fn foreign_first_no_longer_shadows_darkmux_copy() {
+        // Funnel multi-resident fixture, UPDATED: named divergence,
+        // absolute-ownership decision, operator-approved 2026-07-10, #1274.
+        // Ownership partitions before matching: a user-owned copy listed
+        // ahead of a darkmux-stale instance no longer shadows it — OUR copy
+        // reconciles (ours to fix), the user copy stays untouched pool
+        // consumption. The funnel Blocked on the first-match foreign here.
         let residents = vec![
             resident("devstral-manual", "devstral", 40_960),
             resident("darkmux:devstral", "devstral", 20_000),
@@ -180,7 +205,26 @@ mod tests {
         let p = placement("devstral", 32_768, None);
         assert_eq!(
             decide_residency(&residents, &p),
-            ResidencyDecision::Blocked { resident_identifier: "devstral-manual".into() }
+            ResidencyDecision::Reconcile {
+                stale_identifier: "darkmux:devstral".into(),
+                stale_ctx: 20_000,
+            }
+        );
+    }
+
+    #[test]
+    fn foreign_duplicate_only_when_no_owned_resident() {
+        // The partition boundary from the other side: an owned SUFFICIENT
+        // copy behind a foreign one reuses — ForeignDuplicate surfaces only
+        // when no owned/alias resident shares the modelKey at all.
+        let residents = vec![
+            resident("devstral-manual", "devstral", 20_000),
+            resident("darkmux:devstral", "devstral", 40_960),
+        ];
+        let p = placement("devstral", 32_768, None);
+        assert_eq!(
+            decide_residency(&residents, &p),
+            ResidencyDecision::Reuse { identifier: "darkmux:devstral".into(), resident_ctx: 40_960 }
         );
     }
 

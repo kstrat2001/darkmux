@@ -31,6 +31,16 @@
 //! ownership helpers under golden parity tests (the root-crate
 //! `tests/gestalt_parity.rs` guards the duplication window until packet 3
 //! re-points swap.rs at this crate — the #1271 one-definition discipline).
+//!
+//! Namespace ownership is ABSOLUTE (operator decision, 2026-07-10, #1274):
+//! every planned load/unload/reconcile targets only `darkmux:*` instances
+//! (plus a placement's own explicit alias), measurement counts only the
+//! namespaced subset, and non-namespaced residents are user state — visible
+//! to the planner as pool consumption only, structurally unnameable in plan
+//! actions ([`plan::OwnedTarget`] has no foreign constructor). This
+//! supersedes the #408-derived preflight behavior of reusing/unloading
+//! foreign residents; the named per-path behavior changes are documented in
+//! the planner module docs ("Cutover behavior changes").
 
 pub mod desired;
 pub mod estimator;
@@ -50,6 +60,6 @@ pub use plan::{
     Action, EvictionOrder, ExecHint, ForeignTargetError, OwnedTarget, Plan, PlannedAction,
     Precondition, Reason, Warning,
 };
-pub use planner::{plan_acquire, plan_release, AcquireOpts, AcquireScope, ForeignPolicy};
+pub use planner::{plan_acquire, plan_release, AcquireOpts, AcquireScope};
 pub use ports::{Deadline, HostError, LoadReport, ModelHost, ProbeError, ResourceProbe};
 pub use residency::{decide_residency, ResidencyDecision};

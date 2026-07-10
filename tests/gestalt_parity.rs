@@ -10,6 +10,12 @@
 //! swap.rs's own tests use, plus the funnel's residency fixtures copied
 //! verbatim (the funnel's function is private by design — the vectors are
 //! lifted, not the symbol), so the two cannot drift apart silently.
+//!
+//! Parity is arm-by-arm EXCEPT where the absolute-ownership decision
+//! (operator-approved 2026-07-10, #1274) deliberately diverges: the
+//! funnel's Blocked-on-foreign vectors below carry the NEW expected
+//! decisions with a named-divergence annotation each — those arms cut over
+//! to the gestalt semantic in packet 3; they do not track the funnel.
 
 use darkmux_gestalt::{decide_residency, Placement, ResidencyDecision, ResidentFact};
 use darkmux_profiles::swap;
@@ -34,7 +40,11 @@ fn gestalt_namespaced(pm: &ProfileModel) -> String {
 
 #[test]
 fn ownership_parity_namespaced_identifier() {
-    // The exact vectors from swap.rs's own tests.
+    // The exact vectors from swap.rs's own tests. (Gestalt additionally
+    // tolerates a PRE-namespaced model key without double-prefixing — the
+    // guard swap.rs applies one layer up in utility_load_target; asserted
+    // in-crate, not here, because swap's &ProfileModel form never sees that
+    // input shape on these vectors.)
     let bare = profile_model("qwen3.6-35b-a3b", 100_000, None);
     assert_eq!(swap::namespaced_identifier(&bare), gestalt_namespaced(&bare));
     assert_eq!(gestalt_namespaced(&bare), "darkmux:qwen3.6-35b-a3b");
@@ -131,10 +141,15 @@ fn decide_residency_funnel_arm_parity() {
         ResidencyDecision::Reuse { identifier: "darkmux:devstral".into(), resident_ctx: 40_960 }
     );
 
-    // (c) foreign resident shares the modelKey → Blocked, naming it.
+    // (c) foreign resident shares the modelKey → ForeignDuplicate, naming
+    // it. NAMED DIVERGENCE (absolute-ownership decision, operator-approved
+    // 2026-07-10, #1274): the funnel Blocks here; gestalt surfaces the
+    // duplicate as a fact and the planner loads darkmux's own copy
+    // alongside when capacity fits (never reusing the user copy — its load
+    // config is the #1135 ghost), else Blocks naming the instance.
     assert_eq!(
         decide_residency(&[resident("devstral-manual", "devstral", 40_960)], &placement_for(&pm)),
-        ResidencyDecision::Blocked { resident_identifier: "devstral-manual".into() }
+        ResidencyDecision::ForeignDuplicate { foreign_identifier: "devstral-manual".into() }
     );
 
     // (d) no resident shares the modelKey → LoadFresh.
@@ -153,8 +168,12 @@ fn decide_residency_funnel_arm_parity() {
         ResidencyDecision::Reconcile { stale_identifier: "custom".into(), stale_ctx: 20_000 }
     );
 
-    // Multi-resident, user-owned FIRST → Blocked (first match decides even
-    // with a darkmux instance later in host order).
+    // Multi-resident, user-owned FIRST → Reconcile of the darkmux copy.
+    // NAMED DIVERGENCE (absolute-ownership decision, operator-approved
+    // 2026-07-10, #1274): the funnel's first-match-across-ownership rule
+    // Blocked here; gestalt partitions by ownership BEFORE matching, so a
+    // user copy listed ahead never shadows darkmux's own stale instance —
+    // ours reconciles, the user copy stays untouched pool consumption.
     assert_eq!(
         decide_residency(
             &[
@@ -163,7 +182,10 @@ fn decide_residency_funnel_arm_parity() {
             ],
             &placement_for(&pm)
         ),
-        ResidencyDecision::Blocked { resident_identifier: "devstral-manual".into() }
+        ResidencyDecision::Reconcile {
+            stale_identifier: "darkmux:devstral".into(),
+            stale_ctx: 20_000,
+        }
     );
 
     // Mirror ordering: darkmux-stale first → Reconcile touching ONLY the

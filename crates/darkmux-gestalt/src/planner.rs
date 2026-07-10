@@ -4,29 +4,61 @@
 //! Zero I/O, zero clock reads, zero env reads. Composes
 //! [`decide_residency`] per placement, then the #1243 budget pass and the
 //! #1140 pool-headroom pass, then orders actions per the [`Plan`] ordering
-//! contract. Every placement — primary, utility, probe, judge — goes through
-//! the SAME path (#1280: no seat is exempt).
+//! contract: a two-phase free-then-load shape — EVERY Unload (Exclusive
+//! pass-1, reconcile unload-halves, budget/headroom evictions) precedes
+//! EVERY Load, the `swap::swap` RAM-headroom discipline. Every placement —
+//! primary, utility, probe, judge — goes through the SAME path (#1280: no
+//! seat is exempt).
+//!
+//! # Cutover behavior changes (absolute ownership — operator, 2026-07-10, #1274)
+//!
+//! Named divergences from the two production paths this crate absorbs; each
+//! cuts over to the unified semantic when packet 3 re-points them here:
+//!
+//! - **Review funnel** (darkmux-lab funnel.rs): a foreign resident sharing
+//!   the desired weights no longer hard-Blocks the placement. The planner
+//!   loads darkmux's own namespaced copy ALONGSIDE when the #1243 budget and
+//!   pool headroom fit (surfaced via [`Warning::ForeignDuplicateResident`]),
+//!   and Blocks naming the foreign instance — with an eject-or-load-via-
+//!   darkmux suggestion — only when the pool cannot hold both
+//!   ([`Reason::ForeignDuplicateNoCapacity`]). A foreign copy listed ahead
+//!   of a darkmux copy also no longer shadows it (ownership partitions
+//!   before matching — see [`decide_residency`]).
+//! - **Dispatch preflight** (crew dispatch path): the #408-derived behavior
+//!   of adopting a foreign resident — reusing it when sufficient, unloading
+//!   and reloading it when undersized — is REMOVED, superseded by the
+//!   operator decision. A user-loaded copy of the right model has unknown
+//!   load config (the #1135 ghost) and is never reused; user state is
+//!   structurally unnameable as a mutation target ([`OwnedTarget`] has no
+//!   foreign constructor). darkmux dispatches only TO `darkmux:*` instances.
+//!
+//! Capacity honesty within the new semantic: a budget refusal names the
+//! budget (the #1243 cap counts only darkmux-owned bytes, so the foreign
+//! copy is never its blocker), while a pool-headroom refusal names the
+//! foreign instance (its bytes ARE the pool pressure darkmux may not free).
+//! With no budget and no pool facts there is no known constraint: the load
+//! proceeds and the executor's #1139 insufficient-resources fast-fail
+//! backstops, as everywhere else.
 
 use crate::desired::Placement;
 use crate::estimator::FootprintEstimator;
 use crate::facts::{CallerIntent, CatalogFact, Facts};
-use crate::ownership::{ctx_sufficient, is_darkmux_owned};
+use crate::ownership::is_darkmux_owned;
 use crate::plan::{
     Action, EvictionOrder, ExecHint, OwnedTarget, Plan, PlannedAction, Precondition, Reason,
     Warning,
 };
 use crate::residency::{decide_residency, ResidencyDecision};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Acquisition options. Deliberately NO `Default` impl: every caller chooses
-/// its intent, scope, and foreign policy explicitly — a defaulted foreign
-/// policy would silently pick one of two existing production behaviors
-/// (see [`ForeignPolicy`]).
+/// its intent and scope explicitly — a defaulted intent would silently pick
+/// which side of the #1243 budget behavior (evict vs warn-and-proceed) a
+/// call site gets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AcquireOpts {
     pub intent: CallerIntent,
     pub scope: AcquireScope,
-    pub foreign_policy: ForeignPolicy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,30 +72,21 @@ pub enum AcquireScope {
     Additive,
 }
 
-/// What to do when a FOREIGN resident holds the desired weights. Both
-/// variants preserve an existing production behavior — the cutover map's
-/// verified finding is that the funnel Blocks on foreign while the crew
-/// dispatch path adopts (reuses any sufficient resident and reconciles even
-/// a foreign undersized one, under the #408 standing operator authority).
-/// Each call site keeps its current semantics at cutover; neither is a
-/// silent default.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ForeignPolicy {
-    /// Fail loud before spending a doomed load attempt (funnel semantics,
-    /// #1271) — the foreign resident is never touched.
-    Block,
-    /// Adopt the foreign resident (#408): reuse it when its ctx is
-    /// sufficient; reconcile it when undersized. Every adoption is surfaced
-    /// via [`Warning::ForeignResidentAdopted`] — surface, don't ask, never
-    /// silent.
-    AdoptPer408,
-}
-
 /// Per-load budget/headroom bookkeeping.
 struct Pending {
     decision_idx: usize,
     model_key: String,
     est: Option<u64>,
+}
+
+/// A reconcile's free-phase half, held back until every refusal pass has
+/// run: a refused reconcile must not unload its stale (the resident stays,
+/// and stays counted as occupying) — with the halves split across phases,
+/// deferring the commit is what keeps refusal non-destructive.
+struct ReconcileFree {
+    decision_idx: usize,
+    resident_idx: usize,
+    unload: PlannedAction,
 }
 
 /// THE pure acquisition planner. See module docs; the per-arm behavior is
@@ -82,10 +105,13 @@ pub fn plan_acquire(
     // unloaded, never eviction candidates (a claimed resident is targeted
     // at most once).
     let mut claimed: BTreeSet<String> = BTreeSet::new();
-    // Foreign residents an AdoptPer408 decision uses (reuse) or mutates
-    // (reconcile) — excluded from user_state_respected (used, not merely
-    // respected).
-    let mut adopted: BTreeSet<String> = BTreeSet::new();
+    // Reconcile unload-halves, committed after the refusal passes (see
+    // ReconcileFree).
+    let mut reconcile_frees: Vec<ReconcileFree> = Vec::new();
+    // Decision index → the foreign duplicate behind a load-alongside Load
+    // (identifier, pool cost) — the pool arm Blocks these, naming the
+    // instance, when the copy cannot fit alongside.
+    let mut foreign_dups: BTreeMap<usize, (String, Option<u64>)> = BTreeMap::new();
 
     for p in desired {
         match decide_residency(&facts.residents, p) {
@@ -129,72 +155,67 @@ pub fn plan_acquire(
                 claimed.insert(stale_identifier.clone());
                 let stale = OwnedTarget::claim(&stale_identifier, Some(&p.identifier))
                     .expect("decide_residency only reconciles darkmux-owned or exact-alias residents");
+                let resident_idx = facts
+                    .residents
+                    .iter()
+                    .position(|r| r.identifier == stale_identifier)
+                    .expect("reconcile stale is a reported resident");
+                reconcile_frees.push(ReconcileFree {
+                    decision_idx: decisions.len(),
+                    resident_idx,
+                    unload: PlannedAction {
+                        action: Action::Unload { target: stale },
+                        reason: Reason::InsufficientCtx,
+                        precondition: Precondition::ResidentPresent {
+                            identifier: stale_identifier,
+                            at_ctx: Some(stale_ctx),
+                        },
+                    },
+                });
                 decisions.push(PlannedAction {
-                    action: Action::Reconcile {
-                        stale,
-                        stale_ctx,
+                    action: Action::Load {
                         model_key: p.model_key.clone(),
                         identifier: p.identifier.clone(),
                         min_ctx: p.min_ctx,
                     },
                     reason: Reason::InsufficientCtx,
-                    precondition: Precondition::ResidentPresent {
-                        identifier: stale_identifier,
-                        at_ctx: Some(stale_ctx),
+                    precondition: Precondition::NoOwnedResidentForModelKey {
+                        model_key: p.model_key.clone(),
+                        identifier: p.identifier.clone(),
                     },
                 });
             }
-            ResidencyDecision::Blocked { resident_identifier } => match opts.foreign_policy {
-                ForeignPolicy::Block => {
-                    decisions.push(PlannedAction {
-                        action: Action::Block {
-                            model_key: p.model_key.clone(),
-                            resident_identifier: Some(resident_identifier),
-                        },
-                        reason: Reason::ForeignResident,
-                        precondition: Precondition::None,
-                    });
-                }
-                ForeignPolicy::AdoptPer408 => {
-                    // The blocking resident is the FIRST modelKey match —
-                    // decide_residency's own first-match rule.
-                    let r = facts
-                        .residents
-                        .iter()
-                        .find(|r| r.model_key == p.model_key)
-                        .expect("Blocked implies a resident sharing the modelKey");
-                    warnings.push(Warning::ForeignResidentAdopted {
-                        identifier: r.identifier.clone(),
+            ResidencyDecision::ForeignDuplicate { foreign_identifier } => {
+                // Absolute ownership (operator, 2026-07-10, #1274): the
+                // user-loaded duplicate has unknown load config (the #1135
+                // ghost) — never reused, never touched. darkmux plans its
+                // own namespaced copy alongside; the budget/pool arms below
+                // Block it (naming the foreign instance in the pool case)
+                // when it cannot fit. No #1276 catalog check here: the
+                // resident duplicate is existence proof for the weights.
+                let foreign_bytes = facts
+                    .residents
+                    .iter()
+                    .find(|r| r.identifier == foreign_identifier)
+                    .and_then(|r| r.est_bytes);
+                warnings.push(Warning::ForeignDuplicateResident {
+                    foreign_identifier: foreign_identifier.clone(),
+                    est_bytes: foreign_bytes,
+                });
+                foreign_dups.insert(decisions.len(), (foreign_identifier.clone(), foreign_bytes));
+                decisions.push(PlannedAction {
+                    action: Action::Load {
                         model_key: p.model_key.clone(),
-                    });
-                    adopted.insert(r.identifier.clone());
-                    if ctx_sufficient(r.ctx, p.min_ctx) {
-                        push_reuse(
-                            &mut decisions,
-                            &mut warnings,
-                            r.identifier.clone(),
-                            r.ctx,
-                            p.min_ctx,
-                        );
-                    } else {
-                        claimed.insert(r.identifier.clone());
-                        decisions.push(PlannedAction {
-                            action: Action::Reconcile {
-                                stale: OwnedTarget::claim_foreign_per_408(&r.identifier),
-                                stale_ctx: r.ctx,
-                                model_key: p.model_key.clone(),
-                                identifier: p.identifier.clone(),
-                                min_ctx: p.min_ctx,
-                            },
-                            reason: Reason::InsufficientCtx,
-                            precondition: Precondition::ResidentPresent {
-                                identifier: r.identifier.clone(),
-                                at_ctx: Some(r.ctx),
-                            },
-                        });
-                    }
-                }
-            },
+                        identifier: p.identifier.clone(),
+                        min_ctx: p.min_ctx,
+                    },
+                    reason: Reason::ForeignDuplicateLoadAlongside { foreign_identifier },
+                    precondition: Precondition::NoOwnedResidentForModelKey {
+                        model_key: p.model_key.clone(),
+                        identifier: p.identifier.clone(),
+                    },
+                });
+            }
         }
     }
 
@@ -211,10 +232,10 @@ pub fn plan_acquire(
     if opts.scope == AcquireScope::Exclusive {
         for (idx, r) in facts.residents.iter().enumerate() {
             if !is_darkmux_owned(&r.identifier) {
-                // Foreign — never touched. Listed as respected unless a
-                // decision uses it (own-alias claim or a #408 adoption).
+                // Foreign — never touched (a load-alongside duplicate
+                // included). Listed as respected unless a decision claims it
+                // as this call's own explicit alias.
                 let used = claimed.contains(&r.identifier)
-                    || adopted.contains(&r.identifier)
                     || desired_idents.contains(r.identifier.as_str());
                 if !used {
                     user_state_respected.push(r.identifier.clone());
@@ -222,14 +243,12 @@ pub fn plan_acquire(
                 continue;
             }
             if desired_idents.contains(r.identifier.as_str()) || claimed.contains(&r.identifier) {
-                continue; // wanted (or already targeted by a Reconcile)
+                continue; // wanted (or already targeted by a reconcile)
             }
             // (#1280 guard) Evicting the standing utility binding is legal
             // but never silent — a swap-shaped caller that forgot the
             // utility seat would otherwise evict the compactor quietly.
-            if facts.utility_binding.as_deref() == Some(r.identifier.as_str()) {
-                warnings.push(Warning::UtilityBindingEvicted { identifier: r.identifier.clone() });
-            }
+            warn_if_utility_binding(&mut warnings, facts, &r.identifier);
             let target = OwnedTarget::claim(&r.identifier, None)
                 .expect("namespaced residents always claim");
             unloads.push((
@@ -253,16 +272,12 @@ pub fn plan_acquire(
     let mut pendings: Vec<Pending> = Vec::new();
     if budget_active || pool_arm_active {
         for (i, d) in decisions.iter().enumerate() {
-            let (model_key, min_ctx) = match &d.action {
-                Action::Load { model_key, min_ctx, .. } => (model_key.clone(), *min_ctx),
-                Action::Reconcile { model_key, min_ctx, .. } => (model_key.clone(), *min_ctx),
-                _ => continue,
-            };
-            let e = est.estimate_bytes(&model_key, min_ctx, facts.catalog.as_deref());
+            let Action::Load { model_key, min_ctx, .. } = &d.action else { continue };
+            let e = est.estimate_bytes(model_key, *min_ctx, facts.catalog.as_deref());
             if e.is_none() {
                 warnings.push(Warning::LoadEstimateUnknown { model_key: model_key.clone() });
             }
-            pendings.push(Pending { decision_idx: i, model_key, est: e });
+            pendings.push(Pending { decision_idx: i, model_key: model_key.clone(), est: e });
         }
     }
 
@@ -278,7 +293,10 @@ pub fn plan_acquire(
             }
         }
         // A load whose estimate alone exceeds the whole budget is refused
-        // for BOTH intents — no eviction sequence can ever satisfy it.
+        // for BOTH intents — no eviction sequence can ever satisfy it. The
+        // refusal names the BUDGET even behind a foreign duplicate: the cap
+        // counts only darkmux-owned bytes, so ejecting the user copy could
+        // never make this fit (capacity honesty — see module docs).
         for pend in &pendings {
             if pend.est.is_some_and(|e| e > budget) {
                 decisions[pend.decision_idx] = PlannedAction {
@@ -297,15 +315,12 @@ pub fn plan_acquire(
     }
 
     // Reconcile stales leave residency too (freed before their reload).
-    // Computed AFTER the refusal pass: a refused Reconcile no longer
-    // unloads its stale, so that resident stays counted as occupying.
-    for d in &decisions {
-        if let Action::Reconcile { stale, .. } = &d.action {
-            if let Some(idx) =
-                facts.residents.iter().position(|r| r.identifier == stale.identifier())
-            {
-                removed.insert(idx);
-            }
+    // Accounted AFTER the refusal pass: a refused reconcile no longer
+    // unloads its stale, so that resident stays counted as occupying. (The
+    // unload ACTION commits later still — after every refusal opportunity.)
+    for rf in &reconcile_frees {
+        if is_load_like(&decisions[rf.decision_idx].action) {
+            removed.insert(rf.resident_idx);
         }
     }
 
@@ -344,6 +359,7 @@ pub fn plan_acquire(
                             continue;
                         }
                         let Some(freeing) = r.est_bytes else { continue };
+                        warn_if_utility_binding(&mut warnings, facts, &r.identifier);
                         unloads.push((
                             idx,
                             PlannedAction {
@@ -401,10 +417,13 @@ pub fn plan_acquire(
 
     // ── #1140 pool-headroom arm (Auto only; single-pool v1 rule) ─────────
     // Pool facts are advisory headroom, not an operator contract: the arm
-    // evicts to make room and serializes when it can't, but never refuses —
-    // the executor's #1139 insufficient-resources fast-fail is the
-    // enforcement backstop. With zero or multiple pools the arm is skipped
-    // (a placement→pool mapping fact arrives with a second ResourceProbe).
+    // evicts to make room and serializes when it can't, and refuses ONLY a
+    // load-alongside behind a foreign duplicate (whose bytes darkmux may not
+    // free — the one shortfall with a nameable, un-evictable cause). Every
+    // other shortfall falls through to the executor's #1139
+    // insufficient-resources fast-fail backstop. With zero or multiple pools
+    // the arm is skipped (a placement→pool mapping fact arrives with a
+    // second ResourceProbe).
     if pool_arm_active {
         if let Some(pool) = facts.pools.values().next() {
             let snapshot_available = pool.available_bytes;
@@ -429,6 +448,7 @@ pub fn plan_acquire(
                         continue;
                     }
                     let Some(freeing) = r.est_bytes else { continue };
+                    warn_if_utility_binding(&mut warnings, facts, &r.identifier);
                     unloads.push((
                         idx,
                         PlannedAction {
@@ -452,23 +472,59 @@ pub fn plan_acquire(
                     effective += freeing;
                 }
                 if need > effective {
-                    let load_count = pendings
-                        .iter()
-                        .filter(|p| is_load_like(&decisions[p.decision_idx].action))
-                        .count();
-                    let all_fit_alone = pendings
-                        .iter()
-                        .filter(|p| is_load_like(&decisions[p.decision_idx].action))
-                        .all(|p| p.est.unwrap_or(0) <= effective);
-                    if load_count > 1 && all_fit_alone {
-                        exec_hint = ExecHint::Sequential;
+                    // A load-alongside that cannot fit even alone Blocks,
+                    // naming the foreign duplicate whose bytes darkmux may
+                    // not free (absolute ownership, 2026-07-10, #1274).
+                    for pend in &pendings {
+                        if !is_load_like(&decisions[pend.decision_idx].action) {
+                            continue;
+                        }
+                        let Some((fid, fbytes)) = foreign_dups.get(&pend.decision_idx) else {
+                            continue;
+                        };
+                        let e = pend.est.unwrap_or(0);
+                        if e > effective {
+                            decisions[pend.decision_idx] = PlannedAction {
+                                action: Action::Block {
+                                    model_key: pend.model_key.clone(),
+                                    resident_identifier: Some(fid.clone()),
+                                },
+                                reason: Reason::ForeignDuplicateNoCapacity {
+                                    foreign_identifier: fid.clone(),
+                                    foreign_bytes: *fbytes,
+                                    est_bytes: e,
+                                    limit_bytes: effective,
+                                },
+                                precondition: Precondition::None,
+                            };
+                        }
+                    }
+                    if pending_sum(&decisions, &pendings) > effective {
+                        let load_count = pendings
+                            .iter()
+                            .filter(|p| is_load_like(&decisions[p.decision_idx].action))
+                            .count();
+                        let all_fit_alone = pendings
+                            .iter()
+                            .filter(|p| is_load_like(&decisions[p.decision_idx].action))
+                            .all(|p| p.est.unwrap_or(0) <= effective);
+                        if load_count > 1 && all_fit_alone {
+                            exec_hint = ExecHint::Sequential;
+                        }
                     }
                 }
             }
         }
     }
 
-    // ── assembly: unloads in host-reported order, then decisions ─────────
+    // ── commit reconcile unload-halves (post-refusal — see ReconcileFree) ─
+    for rf in reconcile_frees {
+        if is_load_like(&decisions[rf.decision_idx].action) {
+            unloads.push((rf.resident_idx, rf.unload));
+        }
+    }
+
+    // ── assembly: the free phase in host-reported order, then decisions ──
     unloads.sort_by_key(|(idx, _)| *idx);
     let mut actions: Vec<PlannedAction> = unloads.into_iter().map(|(_, a)| a).collect();
     actions.extend(decisions);
@@ -562,8 +618,18 @@ fn push_reuse(
     });
 }
 
+/// (#1280 guard, all eviction paths) Evicting the standing utility binding
+/// is legal but never silent — pass-1, the #1243 budget arm, and the pool-
+/// pressure arm all attach the utility-specific warning, so the compactor
+/// never leaves residency quietly whichever arm chose it.
+fn warn_if_utility_binding(warnings: &mut Vec<Warning>, facts: &Facts, identifier: &str) {
+    if facts.utility_binding.as_deref() == Some(identifier) {
+        warnings.push(Warning::UtilityBindingEvicted { identifier: identifier.to_string() });
+    }
+}
+
 fn is_load_like(action: &Action) -> bool {
-    matches!(action, Action::Load { .. } | Action::Reconcile { .. })
+    matches!(action, Action::Load { .. })
 }
 
 /// Sum of darkmux-owned resident bytes that remain after the indexes in
@@ -573,13 +639,15 @@ fn resident_base(facts: &Facts, removed: &BTreeSet<usize>) -> u64 {
         .residents
         .iter()
         .enumerate()
-        .filter(|(idx, r)| !removed.contains(idx) && is_darkmux_owned(&r.identifier))
+        .filter(|(idx, r)| {
+            !removed.contains(idx) && is_darkmux_owned(&r.identifier)
+        })
         .map(|(_, r)| r.est_bytes.unwrap_or(0))
         .sum()
 }
 
-/// Sum of estimates for pendings whose decision is still a Load/Reconcile
-/// (refused ones drop out). Unknown estimates count 0 (warned at estimation).
+/// Sum of estimates for pendings whose decision is still a Load (refused
+/// ones drop out). Unknown estimates count 0 (warned at estimation).
 fn pending_sum(decisions: &[PlannedAction], pendings: &[Pending]) -> u64 {
     pendings
         .iter()
@@ -661,7 +729,7 @@ mod tests {
     }
 
     fn opts(intent: CallerIntent, scope: AcquireScope) -> AcquireOpts {
-        AcquireOpts { intent, scope, foreign_policy: ForeignPolicy::Block }
+        AcquireOpts { intent, scope }
     }
 
     fn additive_auto() -> AcquireOpts {
@@ -685,6 +753,35 @@ mod tests {
             },
             reason: Reason::NoResident,
             precondition: Precondition::NoResidentForModelKey { model_key: model_key.to_string() },
+        }
+    }
+
+    /// The load-phase half of a reconcile: same shape as a fresh load but
+    /// carrying the reconcile pair's reason + owned-scope precondition.
+    fn reconcile_load_action(model_key: &str, min_ctx: u32) -> PlannedAction {
+        PlannedAction {
+            action: Action::Load {
+                model_key: model_key.to_string(),
+                identifier: format!("darkmux:{model_key}"),
+                min_ctx,
+            },
+            reason: Reason::InsufficientCtx,
+            precondition: Precondition::NoOwnedResidentForModelKey {
+                model_key: model_key.to_string(),
+                identifier: format!("darkmux:{model_key}"),
+            },
+        }
+    }
+
+    /// The free-phase half of a reconcile: the stale instance's Unload.
+    fn reconcile_unload_action(identifier: &str, stale_ctx: u64) -> PlannedAction {
+        PlannedAction {
+            action: Action::Unload { target: OwnedTarget::claim(identifier, None).unwrap() },
+            reason: Reason::InsufficientCtx,
+            precondition: Precondition::ResidentPresent {
+                identifier: identifier.to_string(),
+                at_ctx: Some(stale_ctx),
+            },
         }
     }
 
@@ -751,25 +848,53 @@ mod tests {
     #[test]
     fn reconcile_undersized() {
         // The #1135 class as one row: a 4096 default-ctx resident wanted at
-        // 32k reconciles (one unload-then-load action).
+        // 32k reconciles — an unload-then-load PAIR, the Unload in the free
+        // phase and the Load in the load phase, both carrying
+        // InsufficientCtx.
         let f = facts(vec![resident("darkmux:m", "m", 4_096, None)]);
         let plan = plan_acquire(&[placement("m", 32_000)], &f, additive_auto(), &no_est());
         assert_eq!(
             plan,
             Plan {
+                actions: vec![
+                    reconcile_unload_action("darkmux:m", 4_096),
+                    reconcile_load_action("m", 32_000),
+                ],
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn foreign_duplicate_loads_alongside() {
+        // Named divergence, absolute-ownership decision, operator-approved
+        // 2026-07-10, #1274: a foreign resident sharing the modelKey no
+        // longer Blocks (the pre-cutover funnel semantic) — its load config
+        // is the #1135 ghost, so it is never reused (its 16k ctx would have
+        // satisfied the 8k request); darkmux loads its own namespaced copy
+        // alongside, and the duplicate + its pool cost are surfaced.
+        let f = facts(vec![resident("m-manual", "m", 16_000, Some(9 * GB))]);
+        let plan = plan_acquire(&[placement("m", 8_000)], &f, additive_auto(), &no_est());
+        assert_eq!(
+            plan,
+            Plan {
                 actions: vec![PlannedAction {
-                    action: Action::Reconcile {
-                        stale: OwnedTarget::claim("darkmux:m", None).unwrap(),
-                        stale_ctx: 4_096,
+                    action: Action::Load {
                         model_key: "m".into(),
                         identifier: "darkmux:m".into(),
-                        min_ctx: 32_000,
+                        min_ctx: 8_000,
                     },
-                    reason: Reason::InsufficientCtx,
-                    precondition: Precondition::ResidentPresent {
+                    reason: Reason::ForeignDuplicateLoadAlongside {
+                        foreign_identifier: "m-manual".into(),
+                    },
+                    precondition: Precondition::NoOwnedResidentForModelKey {
+                        model_key: "m".into(),
                         identifier: "darkmux:m".into(),
-                        at_ctx: Some(4_096),
                     },
+                }],
+                warnings: vec![Warning::ForeignDuplicateResident {
+                    foreign_identifier: "m-manual".into(),
+                    est_bytes: Some(9 * GB),
                 }],
                 ..Default::default()
             }
@@ -777,21 +902,42 @@ mod tests {
     }
 
     #[test]
-    fn blocked_foreign_resident() {
-        // (#1271) Never spend a doomed load: a foreign resident sharing the
-        // modelKey blocks, and NO Load is emitted.
-        let f = facts(vec![resident("m", "m", 16_000, None)]);
-        let plan = plan_acquire(&[placement("m", 8_000)], &f, additive_auto(), &no_est());
+    fn foreign_duplicate_blocks_on_pool_capacity() {
+        // The other half of the absolute-ownership semantic (operator,
+        // 2026-07-10, #1274): the duplicate's bytes are pool pressure
+        // darkmux may not free, so when the namespaced copy cannot fit
+        // alongside it the placement Blocks — naming the foreign instance
+        // and carrying the eject-or-load-via-darkmux suggestion.
+        let pools: Pools = BTreeMap::from([(
+            PoolId("unified".into()),
+            PoolFact { capacity_bytes: 32 * GB, available_bytes: 10 * GB },
+        )]);
+        let f = Facts {
+            residents: vec![resident("m-manual", "m", 16_000, Some(30 * GB))],
+            pools,
+            ..Default::default()
+        };
+        let plan =
+            plan_acquire(&[placement("m", 8_000)], &f, additive_auto(), &est_map(&[("m", 15 * GB)]));
         assert_eq!(
             plan,
             Plan {
                 actions: vec![PlannedAction {
                     action: Action::Block {
                         model_key: "m".into(),
-                        resident_identifier: Some("m".into()),
+                        resident_identifier: Some("m-manual".into()),
                     },
-                    reason: Reason::ForeignResident,
+                    reason: Reason::ForeignDuplicateNoCapacity {
+                        foreign_identifier: "m-manual".into(),
+                        foreign_bytes: Some(30 * GB),
+                        est_bytes: 15 * GB,
+                        limit_bytes: 10 * GB,
+                    },
                     precondition: Precondition::None,
+                }],
+                warnings: vec![Warning::ForeignDuplicateResident {
+                    foreign_identifier: "m-manual".into(),
+                    est_bytes: Some(30 * GB),
                 }],
                 ..Default::default()
             }
@@ -799,9 +945,43 @@ mod tests {
     }
 
     #[test]
-    fn first_match_wins_order_determinism() {
-        // Host-reported order is decision-bearing: user copy first → Block;
-        // darkmux copy first → Reuse. Same input order, same output, always.
+    fn foreign_duplicate_budget_refusal_names_budget() {
+        // Capacity honesty: the #1243 cap counts only darkmux-owned bytes,
+        // so a budget refusal behind a foreign duplicate names the BUDGET —
+        // ejecting the user copy could never make the load fit the cap.
+        let f = Facts {
+            residents: vec![resident("m-manual", "m", 16_000, Some(30 * GB))],
+            budget: Budget { max_darkmux_bytes: Some(8 * GB) },
+            ..Default::default()
+        };
+        let plan =
+            plan_acquire(&[placement("m", 8_000)], &f, additive_auto(), &est_map(&[("m", 22 * GB)]));
+        assert_eq!(
+            plan.actions,
+            vec![PlannedAction {
+                action: Action::Block { model_key: "m".into(), resident_identifier: None },
+                reason: Reason::BudgetRefuse { est_bytes: 22 * GB, budget_bytes: 8 * GB },
+                precondition: Precondition::None,
+            }]
+        );
+        // The duplicate is still surfaced with its pool cost.
+        assert_eq!(
+            plan.warnings,
+            vec![Warning::ForeignDuplicateResident {
+                foreign_identifier: "m-manual".into(),
+                est_bytes: Some(30 * GB),
+            }]
+        );
+    }
+
+    #[test]
+    fn ownership_partition_determinism() {
+        // Named divergence, absolute-ownership decision, operator-approved
+        // 2026-07-10, #1274: ownership partitions BEFORE matching, so a
+        // user copy listed ahead of a darkmux copy no longer shadows it —
+        // both host orders now Reuse the darkmux instance (the pre-cutover
+        // first-match-across-ownership rule Blocked on the user-first
+        // order). Same input order ⇒ same output, always.
         let user_first = facts(vec![
             resident("m-manual", "m", 16_000, None),
             resident("darkmux:m", "m", 16_000, None),
@@ -809,7 +989,7 @@ mod tests {
         let plan = plan_acquire(&[placement("m", 8_000)], &user_first, additive_auto(), &no_est());
         assert!(matches!(
             &plan.actions[0],
-            PlannedAction { reason: Reason::ForeignResident, .. }
+            PlannedAction { reason: Reason::SufficientCtxResident, .. }
         ));
 
         let darkmux_first = facts(vec![
@@ -827,7 +1007,7 @@ mod tests {
     #[test]
     fn explicit_alias_is_ours() {
         // The namespace opt-out: a resident under the placement's own
-        // explicit identifier reuses, never Blocked.
+        // explicit identifier reuses, never treated as a foreign duplicate.
         let f = facts(vec![resident("my-alias", "m", 8_000, None)]);
         let plan =
             plan_acquire(&[aliased("m", 8_000, "my-alias")], &f, additive_auto(), &no_est());
@@ -908,28 +1088,20 @@ mod tests {
     #[test]
     fn utility_reconcile_jit_default_ctx() {
         // The #1135 class closed for the compactor too: a stale 4096
-        // default-ctx utility load reconciles to the 68k the seat needs.
+        // default-ctx utility load reconciles to the 68k the seat needs —
+        // its free rides the free phase, AHEAD of the primary's fresh load
+        // (the two-pass ordering contract).
         let f = facts(vec![resident("darkmux:util", "util", 4_096, None)]);
         let desired =
             vec![placement_seat("primary", 32_000, "primary"), placement_seat("util", 68_000, "utility")];
         let plan = plan_acquire(&desired, &f, additive_auto(), &no_est());
-        assert_eq!(plan.actions[0], load_action("primary", 32_000));
         assert_eq!(
-            plan.actions[1],
-            PlannedAction {
-                action: Action::Reconcile {
-                    stale: OwnedTarget::claim("darkmux:util", None).unwrap(),
-                    stale_ctx: 4_096,
-                    model_key: "util".into(),
-                    identifier: "darkmux:util".into(),
-                    min_ctx: 68_000,
-                },
-                reason: Reason::InsufficientCtx,
-                precondition: Precondition::ResidentPresent {
-                    identifier: "darkmux:util".into(),
-                    at_ctx: Some(4_096),
-                },
-            }
+            plan.actions,
+            vec![
+                reconcile_unload_action("darkmux:util", 4_096),
+                load_action("primary", 32_000),
+                reconcile_load_action("util", 68_000),
+            ]
         );
     }
 
@@ -1012,83 +1184,52 @@ mod tests {
         ));
     }
 
-    // ── #408 foreign-policy rows ─────────────────────────────────────────
-
     #[test]
-    fn adopt_per_408_reuses_foreign_sufficient() {
-        // The dispatch-path behavior preserved: a sufficient foreign
-        // resident is adopted (reused), surfaced via warning — never silent.
-        let f = facts(vec![resident("m-manual", "m", 100_000, None)]);
-        let o = AcquireOpts {
-            intent: CallerIntent::Auto,
-            scope: AcquireScope::Additive,
-            foreign_policy: ForeignPolicy::AdoptPer408,
+    fn budget_eviction_of_utility_binding_warns() {
+        // (#1280 guard, budget arm) The #1243 eviction path attaches the
+        // utility-specific warning too — the compactor never leaves
+        // residency quietly, whichever arm evicts it.
+        let f = Facts {
+            residents: vec![resident("darkmux:util-4b", "util-4b", 68_000, Some(20 * GB))],
+            budget: Budget { max_darkmux_bytes: Some(30 * GB) },
+            utility_binding: Some("darkmux:util-4b".into()),
+            ..Default::default()
         };
-        let plan = plan_acquire(&[placement("m", 8_000)], &f, o, &no_est());
-        assert_eq!(
-            plan.actions,
-            vec![PlannedAction {
-                action: Action::Reuse {
-                    identifier: "m-manual".into(),
-                    resident_ctx: 100_000,
-                    min_ctx: 8_000,
-                },
-                reason: Reason::SufficientCtxResident,
-                precondition: Precondition::None,
-            }]
-        );
+        let plan =
+            plan_acquire(&[placement("m", 8_000)], &f, additive_auto(), &est_map(&[("m", 15 * GB)]));
         assert_eq!(
             plan.warnings,
-            vec![
-                Warning::ForeignResidentAdopted {
-                    identifier: "m-manual".into(),
-                    model_key: "m".into(),
-                },
-                Warning::CtxDivergence {
-                    identifier: "m-manual".into(),
-                    requested: 8_000,
-                    resident: 100_000,
-                },
-            ]
+            vec![Warning::UtilityBindingEvicted { identifier: "darkmux:util-4b".into() }]
         );
+        assert!(matches!(
+            &plan.actions[0],
+            PlannedAction { reason: Reason::BudgetEvict { .. }, .. }
+        ));
     }
 
     #[test]
-    fn adopt_per_408_reconciles_foreign_undersized() {
-        // The #408 standing authority: an undersized foreign resident is
-        // reconciled (unloaded, reloaded under the darkmux namespace),
-        // through the explicitly-named claim path, surfaced via warning.
-        let f = facts(vec![resident("m-manual", "m", 4_096, None)]);
-        let o = AcquireOpts {
-            intent: CallerIntent::Auto,
-            scope: AcquireScope::Additive,
-            foreign_policy: ForeignPolicy::AdoptPer408,
+    fn pool_eviction_of_utility_binding_warns() {
+        // (#1280 guard, pool arm) Same guard on the #1140 headroom path.
+        let pools: Pools = BTreeMap::from([(
+            PoolId("unified".into()),
+            PoolFact { capacity_bytes: 32 * GB, available_bytes: 10 * GB },
+        )]);
+        let f = Facts {
+            residents: vec![resident("darkmux:util-4b", "util-4b", 68_000, Some(12 * GB))],
+            pools,
+            utility_binding: Some("darkmux:util-4b".into()),
+            ..Default::default()
         };
-        let plan = plan_acquire(&[placement("m", 32_000)], &f, o, &no_est());
-        assert_eq!(
-            plan.actions,
-            vec![PlannedAction {
-                action: Action::Reconcile {
-                    stale: OwnedTarget::claim_foreign_per_408("m-manual"),
-                    stale_ctx: 4_096,
-                    model_key: "m".into(),
-                    identifier: "darkmux:m".into(),
-                    min_ctx: 32_000,
-                },
-                reason: Reason::InsufficientCtx,
-                precondition: Precondition::ResidentPresent {
-                    identifier: "m-manual".into(),
-                    at_ctx: Some(4_096),
-                },
-            }]
-        );
+        let plan =
+            plan_acquire(&[placement("m", 8_000)], &f, additive_auto(), &est_map(&[("m", 15 * GB)]));
         assert_eq!(
             plan.warnings,
-            vec![Warning::ForeignResidentAdopted {
-                identifier: "m-manual".into(),
-                model_key: "m".into(),
-            }]
+            vec![Warning::UtilityBindingEvicted { identifier: "darkmux:util-4b".into() }]
         );
+        assert!(matches!(
+            &plan.actions[0],
+            PlannedAction { reason: Reason::BudgetEvict { .. }, .. }
+        ));
     }
 
     // ── #1243 budget rows ────────────────────────────────────────────────
@@ -1181,6 +1322,29 @@ mod tests {
             );
             assert_eq!(plan, expected, "refused under {intent:?}");
         }
+    }
+
+    #[test]
+    fn budget_refused_reconcile_keeps_stale_resident() {
+        // With the reconcile pair split across phases, refusal must stay
+        // non-destructive: a reconcile whose reload is budget-refused emits
+        // NO unload — the stale resident stays, and stays counted.
+        let f = Facts {
+            residents: vec![resident("darkmux:m", "m", 4_096, Some(6 * GB))],
+            budget: Budget { max_darkmux_bytes: Some(8 * GB) },
+            ..Default::default()
+        };
+        let plan =
+            plan_acquire(&[placement("m", 32_000)], &f, additive_auto(), &est_map(&[("m", 22 * GB)]));
+        assert_eq!(
+            plan.actions,
+            vec![PlannedAction {
+                action: Action::Block { model_key: "m".into(), resident_identifier: None },
+                reason: Reason::BudgetRefuse { est_bytes: 22 * GB, budget_bytes: 8 * GB },
+                precondition: Precondition::None,
+            }],
+            "no Unload may accompany a refused reconcile"
+        );
     }
 
     #[test]
@@ -1286,6 +1450,43 @@ mod tests {
         );
     }
 
+    // ── two-pass ordering rows ───────────────────────────────────────────
+
+    #[test]
+    fn reconcile_free_precedes_fresh_load() {
+        // The review's concrete regression, as a table row: desired = a
+        // fresh Load A (est 20GB) + a reconcile of B (stale 30GB resident
+        // at the wrong ctx). B's free MUST precede A's load — the
+        // free-then-load RAM-headroom shape of swap::swap. The pre-fix
+        // draft emitted [Load A, Reconcile B], loading 20GB before the
+        // 30GB free.
+        let pools: Pools = BTreeMap::from([(
+            PoolId("unified".into()),
+            PoolFact { capacity_bytes: 64 * GB, available_bytes: 25 * GB },
+        )]);
+        let f = Facts {
+            residents: vec![resident("darkmux:b", "b", 4_096, Some(30 * GB))],
+            pools,
+            ..Default::default()
+        };
+        let desired = vec![placement("a", 8_000), placement("b", 32_000)];
+        let plan = plan_acquire(
+            &desired,
+            &f,
+            additive_auto(),
+            &est_map(&[("a", 20 * GB), ("b", 30 * GB)]),
+        );
+        assert_eq!(
+            plan.actions,
+            vec![
+                reconcile_unload_action("darkmux:b", 4_096),
+                load_action("a", 8_000),
+                reconcile_load_action("b", 32_000),
+            ],
+            "every free precedes every load"
+        );
+    }
+
     // ── #1279 release rows ───────────────────────────────────────────────
 
     #[test]
@@ -1371,13 +1572,38 @@ mod tests {
     }
 
     #[test]
+    fn frees_always_precede_loads() {
+        // The two-pass ordering contract as a global invariant, asserted
+        // across the same battery the precondition invariant uses: in every
+        // produced plan, no Unload appears after any Load.
+        let assert_two_pass = |plan: &Plan, label: &str| {
+            let first_load = plan.actions.iter().position(|a| matches!(a.action, Action::Load { .. }));
+            let last_unload =
+                plan.actions.iter().rposition(|a| matches!(a.action, Action::Unload { .. }));
+            if let (Some(load), Some(unload)) = (first_load, last_unload) {
+                assert!(
+                    unload < load,
+                    "{label}: an Unload follows a Load — the free phase leaked into the load phase"
+                );
+            }
+        };
+        for (plan, label) in &battery() {
+            assert_two_pass(plan, label);
+        }
+    }
+
+    #[test]
     fn mutating_actions_always_carry_preconditions() {
         // The global executor contract: every mutating action in ANY
         // produced plan carries a non-None precondition to re-verify —
         // asserted across a battery of fixture plans covering fresh loads,
-        // reconciles, pass-1 unloads, budget evictions, adoption, and
-        // release.
-        let assert_invariant = |plan: &Plan, label: &str| {
+        // reconcile pairs, pass-1 unloads, budget evictions, load-alongside,
+        // and release.
+        for (plan, label) in &battery() {
+            assert!(
+                plan.actions.iter().any(|a| a.action.is_mutating()),
+                "{label}: fixture must actually produce a mutating action"
+            );
             for pa in &plan.actions {
                 if pa.action.is_mutating() {
                     assert_ne!(
@@ -1387,9 +1613,12 @@ mod tests {
                     );
                 }
             }
-        };
+        }
+    }
 
-        let battery: Vec<(Plan, &str)> = vec![
+    /// Shared fixture battery for the global invariants above.
+    fn battery() -> Vec<(Plan, &'static str)> {
+        vec![
             (
                 plan_acquire(
                     &[placement("m", 8_000)],
@@ -1406,7 +1635,16 @@ mod tests {
                     additive_auto(),
                     &no_est(),
                 ),
-                "reconcile",
+                "reconcile pair",
+            ),
+            (
+                plan_acquire(
+                    &[placement("a", 8_000), placement("b", 32_000)],
+                    &facts(vec![resident("darkmux:b", "b", 4_096, None)]),
+                    additive_auto(),
+                    &no_est(),
+                ),
+                "fresh load + reconcile pair",
             ),
             (
                 plan_acquire(
@@ -1434,14 +1672,10 @@ mod tests {
                 plan_acquire(
                     &[placement("m", 32_000)],
                     &facts(vec![resident("m-manual", "m", 4_096, None)]),
-                    AcquireOpts {
-                        intent: CallerIntent::Auto,
-                        scope: AcquireScope::Additive,
-                        foreign_policy: ForeignPolicy::AdoptPer408,
-                    },
+                    additive_auto(),
                     &no_est(),
                 ),
-                "adopt-per-408 reconcile",
+                "foreign-duplicate load-alongside",
             ),
             (
                 plan_release(
@@ -1451,13 +1685,6 @@ mod tests {
                 ),
                 "release",
             ),
-        ];
-        for (plan, label) in &battery {
-            assert!(
-                plan.actions.iter().any(|a| a.action.is_mutating()),
-                "{label}: fixture must actually produce a mutating action"
-            );
-            assert_invariant(plan, label);
-        }
+        ]
     }
 }

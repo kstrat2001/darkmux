@@ -10,13 +10,16 @@ use std::fmt;
 /// Proof-carrying mutation target — the #1284 namespace contract made
 /// structural rather than reviewed-for.
 ///
-/// Every Unload / Reconcile-stale target holds an `OwnedTarget`, and
+/// Every Unload target holds an `OwnedTarget`, and
 /// [`crate::ports::ModelHost::unload`] accepts nothing else. The field is
-/// private and the only constructors are the claim gates below, so a plan
-/// that mutates a foreign resident is unrepresentable except through the
-/// explicitly-named #408 authority path. `Serialize`-only (no `Deserialize`):
-/// serialized plans are artifacts for humans and run records, and cannot be
-/// deserialized back into executable form.
+/// private and the only constructor is the claim gate below, so a plan that
+/// mutates a foreign resident is UNREPRESENTABLE — absolute namespace
+/// ownership (operator decision 2026-07-10, #1274): user state is
+/// structurally unnameable in plan actions, with no exception path (the
+/// former #408 adoption constructor is deleted, superseded by that
+/// decision). `Serialize`-only (no `Deserialize`): serialized plans are
+/// artifacts for humans and run records, and cannot be deserialized back
+/// into executable form.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OwnedTarget {
     identifier: String,
@@ -56,19 +59,6 @@ impl OwnedTarget {
         }
     }
 
-    /// The ONE deliberate exception to the claim gate: #408 standing
-    /// operator authority ("standing permission to unload/load when the
-    /// resident would poison the dispatch — surface, don't ask"). Exists
-    /// solely for [`crate::planner::ForeignPolicy::AdoptPer408`], which
-    /// preserves the pre-gestalt dispatch path's behavior of reconciling
-    /// even a foreign undersized resident; every use is paired with
-    /// [`Warning::ForeignResidentAdopted`] so the adoption is surfaced,
-    /// never silent. A call site invoking this constructor is naming the
-    /// authority it acts under.
-    pub fn claim_foreign_per_408(identifier: &str) -> Self {
-        Self { identifier: identifier.to_string() }
-    }
-
     pub fn identifier(&self) -> &str {
         &self.identifier
     }
@@ -81,10 +71,16 @@ impl OwnedTarget {
 /// action's shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Precondition {
-    /// No resident shares this modelKey (guards a Load — a resident
+    /// No resident shares this modelKey (guards a fresh Load — a resident
     /// appearing since plan time means the plan is stale).
     NoResidentForModelKey { model_key: String },
-    /// The named resident is still present (guards an Unload / Reconcile);
+    /// No darkmux-owned resident — nor one under `identifier`, the exact
+    /// alias this load uses — shares this modelKey (guards a reconcile
+    /// reload after its free-phase unload, and a load-alongside Load whose
+    /// foreign duplicate is EXPECTED to remain resident; an OWNED copy
+    /// appearing since plan time means the plan is stale).
+    NoOwnedResidentForModelKey { model_key: String, identifier: String },
+    /// The named resident is still present (guards an Unload);
     /// `at_ctx` pins the observed ctx when known.
     ResidentPresent { identifier: String, at_ctx: Option<u64> },
     /// No precondition — only ever carried by non-mutating actions
@@ -94,20 +90,15 @@ pub enum Precondition {
 }
 
 /// The #1274 action vocabulary — decide_residency's shape (PR #1275) plus
-/// batch-level Unload. Reconcile is ONE action (an unload-then-load pair)
-/// so one desired placement ⇒ at most one action ⇒ one-row assertions.
+/// batch-level Unload. A reconcile is TWO actions — its Unload half rides
+/// the free phase and its Load half the load phase (both carrying
+/// [`Reason::InsufficientCtx`]) — so ALL frees precede ALL loads, the
+/// `swap::swap` RAM-headroom shape (see the [`Plan`] ordering contract).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum Action {
     Load { model_key: String, identifier: String, min_ctx: u32 },
     Unload { target: OwnedTarget },
     Reuse { identifier: String, resident_ctx: u64, min_ctx: u32 },
-    Reconcile {
-        stale: OwnedTarget,
-        stale_ctx: u64,
-        model_key: String,
-        identifier: String,
-        min_ctx: u32,
-    },
     Block { model_key: String, resident_identifier: Option<String> },
 }
 
@@ -116,7 +107,7 @@ impl Action {
     /// carry a non-[`Precondition::None`] precondition (asserted globally in
     /// the planner tests) — the executor's re-verify contract keys on this.
     pub fn is_mutating(&self) -> bool {
-        matches!(self, Action::Load { .. } | Action::Unload { .. } | Action::Reconcile { .. })
+        matches!(self, Action::Load { .. } | Action::Unload { .. })
     }
 }
 
@@ -140,12 +131,29 @@ pub enum Reason {
     /// Reuse: darkmux-owned/alias resident with ctx >= minimum (never
     /// reload down — #600 n_ctx-as-minimum).
     SufficientCtxResident,
-    /// Reconcile: resident undersized — the #1135 class; a second concurrent
-    /// load of the same weights is the #1271 OOM class, so unload-then-load.
+    /// Reconcile pair: resident undersized — the #1135 class; a second
+    /// concurrent load of the same weights is the #1271 OOM class, so
+    /// unload-then-load. Carried by BOTH halves: the free-phase Unload of
+    /// the stale and the load-phase reload at the required ctx.
     InsufficientCtx,
-    /// Block: a foreign (user/operator) resident shares the weights — never
-    /// touched.
-    ForeignResident,
+    /// Load (alongside): a foreign (user/operator) resident shares the
+    /// weights, but its load configuration is unknown (the #1135 ghost) —
+    /// never reused, never touched; darkmux loads its own namespaced copy
+    /// beside it (absolute ownership, operator decision 2026-07-10, #1274).
+    /// Always paired with [`Warning::ForeignDuplicateResident`].
+    ForeignDuplicateLoadAlongside { foreign_identifier: String },
+    /// Block: the pool cannot hold darkmux's own copy of the weights
+    /// alongside the user-loaded duplicate, and that duplicate is user state
+    /// darkmux may not free (absolute ownership, #1274). `limit_bytes` is
+    /// the effective pool headroom after every planned free. Names the
+    /// blocking instance and carries the eject-or-load-via-darkmux
+    /// suggestion in its Display.
+    ForeignDuplicateNoCapacity {
+        foreign_identifier: String,
+        foreign_bytes: Option<u64>,
+        est_bytes: u64,
+        limit_bytes: u64,
+    },
     /// Block: model key absent from the host catalog — the #1276 fast-fail
     /// before any load attempt can hang. `nearest` = closest catalog keys
     /// for the fix hint.
@@ -174,6 +182,12 @@ pub enum Reason {
     BudgetRefuse { est_bytes: u64, budget_bytes: u64 },
 }
 
+/// Display-only GB rendering for the operator-facing suggestion strings
+/// (the plan data itself stays exact bytes — floats never enter `Eq` types).
+fn gb(bytes: u64) -> String {
+    format!("{:.1} GB", bytes as f64 / 1e9)
+}
+
 impl fmt::Display for Reason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -186,12 +200,36 @@ impl fmt::Display for Reason {
             ),
             Reason::InsufficientCtx => write!(
                 f,
-                "the resident context is below the required minimum — unloading it and reloading at the required context (silently reusing the wrong context is the #1135 bug class)"
+                "the resident context is below the required minimum — the stale instance is unloaded in the free phase and reloaded at the required context in the load phase (silently reusing the wrong context is the #1135 bug class)"
             ),
-            Reason::ForeignResident => write!(
+            Reason::ForeignDuplicateLoadAlongside { foreign_identifier } => write!(
                 f,
-                "a resident sharing these weights is not darkmux-owned (user/operator state) — blocked, never touched; free it yourself (`darkmux model eject` if it is stale darkmux state under a legacy identifier, or `lms unload <identifier>`), then re-plan"
+                "user-loaded instance \"{foreign_identifier}\" of the needed model is resident, but its load configuration is unknown (the #1135 ghost) — never reused; loading darkmux's own namespaced copy alongside it (absolute namespace ownership, #1274)"
             ),
+            Reason::ForeignDuplicateNoCapacity {
+                foreign_identifier,
+                foreign_bytes,
+                est_bytes,
+                limit_bytes,
+            } => {
+                match foreign_bytes {
+                    Some(b) => write!(
+                        f,
+                        "user-loaded instance \"{foreign_identifier}\" of the needed model occupies {}",
+                        gb(*b)
+                    )?,
+                    None => write!(
+                        f,
+                        "user-loaded instance \"{foreign_identifier}\" of the needed model occupies an unknown amount of memory"
+                    )?,
+                }
+                write!(
+                    f,
+                    "; eject it (`lms unload \"{foreign_identifier}\"`) or load it via darkmux — darkmux never touches user state (absolute namespace ownership, #1274), and its own estimated {} copy cannot fit alongside within the {} of pool headroom left after every planned free",
+                    gb(*est_bytes),
+                    gb(*limit_bytes)
+                )
+            }
             Reason::UnknownModelKey { nearest } => {
                 write!(
                     f,
@@ -257,10 +295,11 @@ pub enum Warning {
     /// include the utility seat in the desired set, or genuinely means to
     /// evict the compactor — either way, loudly.
     UtilityBindingEvicted { identifier: String },
-    /// A foreign resident was adopted under
-    /// [`crate::planner::ForeignPolicy::AdoptPer408`] (#408 standing
-    /// authority) — surfaced, never silent.
-    ForeignResidentAdopted { identifier: String, model_key: String },
+    /// A user-loaded duplicate of a desired model is resident (absolute
+    /// ownership, #1274): respected as pool consumption, never reused —
+    /// darkmux plans its own namespaced copy alongside. Names the duplicate
+    /// and its pool cost (`None` = the adapter could not size it).
+    ForeignDuplicateResident { foreign_identifier: String, est_bytes: Option<u64> },
     /// The estimator could not price a pending load (missing catalog size)
     /// — budget/headroom math counts it as 0 (documented degradation).
     LoadEstimateUnknown { model_key: String },
@@ -277,13 +316,18 @@ pub enum ExecHint {
 
 /// TOTAL-EQUALITY, DETERMINISTIC-ORDER plan. Ordering contract (tested):
 ///
-/// 1. all Unload actions (Exclusive pass-1 + budget/headroom evictions), in
+/// 1. FREE phase: every Unload — Exclusive pass-1 unloads, the unload
+///    halves of reconciles, and budget/headroom evictions — in
 ///    host-reported resident order
-/// 2. per-desired decisions (Load/Reuse/Reconcile/Block), in desired-input
-///    order
+/// 2. LOAD phase: per-desired decisions (Load/Reuse/Block), in
+///    desired-input order
 ///
-/// Unloads-before-loads preserves the RAM-headroom two-pass shape of
-/// `swap::swap`. Same input ⇒ identical Plan, always.
+/// ALL frees precede ALL loads — the RAM-headroom two-pass shape of
+/// `swap::swap` (free-then-load). An earlier draft claimed this parity while
+/// carrying each reconcile's unload inside the load phase, interleaving a
+/// free after other loads; the reconcile split into a free-phase Unload +
+/// load-phase Load is the review MUST_FIX that restored the shape. Same
+/// input ⇒ identical Plan, always.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
 pub struct Plan {
     pub actions: Vec<PlannedAction>,
@@ -321,20 +365,14 @@ mod tests {
 
     #[test]
     fn owned_target_refuses_foreign() {
-        // The structural half of the #1284 namespace contract: user state
-        // cannot become a mutation target through the normal gate.
+        // The structural half of the #1284 namespace contract, absolute
+        // under the 2026-07-10 operator decision (#1274): user state cannot
+        // become a mutation target — the claim gate is the ONLY constructor
+        // (the former #408 adoption bypass is deleted).
         let err = OwnedTarget::claim("their-model", None).unwrap_err();
         assert_eq!(err.identifier, "their-model");
         // A DIFFERENT alias is not this call's own alias — still foreign.
         assert!(OwnedTarget::claim("their-model", Some("custom")).is_err());
-    }
-
-    #[test]
-    fn owned_target_per_408_claim_is_explicit() {
-        // The named authority path exists and produces a working target —
-        // its use is gated by ForeignPolicy::AdoptPer408 at the call site.
-        let t = OwnedTarget::claim_foreign_per_408("their-model");
-        assert_eq!(t.identifier(), "their-model");
     }
 
     #[test]
@@ -360,7 +398,19 @@ mod tests {
             Reason::NoResident,
             Reason::SufficientCtxResident,
             Reason::InsufficientCtx,
-            Reason::ForeignResident,
+            Reason::ForeignDuplicateLoadAlongside { foreign_identifier: "m-manual".into() },
+            Reason::ForeignDuplicateNoCapacity {
+                foreign_identifier: "m-manual".into(),
+                foreign_bytes: Some(30_000_000_000),
+                est_bytes: 15_000_000_000,
+                limit_bytes: 10_000_000_000,
+            },
+            Reason::ForeignDuplicateNoCapacity {
+                foreign_identifier: "m-manual".into(),
+                foreign_bytes: None,
+                est_bytes: 15_000_000_000,
+                limit_bytes: 10_000_000_000,
+            },
             Reason::UnknownModelKey { nearest: vec!["qwen3-4b".into()] },
             Reason::NoLongerDesired,
             Reason::LastWanterReleased { seats: vec!["a".into(), "b".into()] },
@@ -375,7 +425,25 @@ mod tests {
         for r in &all {
             assert!(!r.to_string().is_empty(), "{r:?} renders");
         }
-        assert!(Reason::ForeignResident.to_string().contains("lms unload"));
+        // The capacity Block names the foreign instance, its pool cost, and
+        // the eject-or-load-via-darkmux suggestion (operator decision
+        // 2026-07-10, #1274).
+        let s = Reason::ForeignDuplicateNoCapacity {
+            foreign_identifier: "m-manual".into(),
+            foreign_bytes: Some(30_000_000_000),
+            est_bytes: 15_000_000_000,
+            limit_bytes: 10_000_000_000,
+        }
+        .to_string();
+        assert!(s.contains("\"m-manual\""), "{s}");
+        assert!(s.contains("occupies 30.0 GB"), "{s}");
+        assert!(s.contains("lms unload"), "{s}");
+        assert!(s.contains("load it via darkmux"), "{s}");
+        assert!(
+            Reason::ForeignDuplicateLoadAlongside { foreign_identifier: "m-manual".into() }
+                .to_string()
+                .contains("never reused")
+        );
         assert!(
             Reason::UnknownModelKey { nearest: vec!["qwen3-4b".into()] }
                 .to_string()

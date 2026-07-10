@@ -108,6 +108,15 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    stream carries engagement work only. No crossings in either direction.
 4. **Namespace convention** — darkmux-owned state in shared systems carries the darkmux
    namespace; operations manage only the namespaced subset (see the namespace section).
+   Formalized as ABSOLUTE for model lifecycle (operator, 2026-07-10, #1274): every darkmux
+   load/unload/reconcile targets only `darkmux:*` instances, darkmux dispatches only TO
+   `darkmux:*` instances (a user-loaded copy of the right model has unknown load config —
+   the #1135 ghost — and is never reused), and measurement (budget accounting #1243,
+   dispatch provenance) counts only the namespaced subset. Non-namespaced models are user
+   state: visible to the planner as pool consumption only, structurally unnameable in plan
+   actions (`OwnedTarget`). When user state blocks a need, darkmux surfaces a reason naming
+   the blocking instance and suggests; it never touches. This supersedes the #408-derived
+   preflight behavior of reusing/unloading foreign residents.
 5. **Schema versioning** — flow/rules/config/profiles data shapes change only through their
    documented semver rules; consumers are lenient-on-read, loud in doctor.
 6. **Frozen model-facing text** — measured prompts/personas live in ONE artifact with golden
