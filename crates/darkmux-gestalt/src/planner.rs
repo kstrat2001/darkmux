@@ -84,8 +84,7 @@ struct Pending {
 /// and stays counted as occupying) — with the halves split across phases,
 /// deferring the commit is what keeps refusal non-destructive.
 struct ReconcileFree {
-    decision_idx: usize,
-    resident_idx: usize,
+    stale: ReconcileStale,
     unload: PlannedAction,
 }
 
@@ -153,18 +152,12 @@ pub fn plan_acquire(
             }
             ResidencyDecision::Reconcile { stale_identifier, stale_ctx } => {
                 claimed.insert(stale_identifier.clone());
-                let stale = OwnedTarget::claim(&stale_identifier, Some(&p.identifier))
+                let stale_target = OwnedTarget::claim(&stale_identifier, Some(&p.identifier))
                     .expect("decide_residency only reconciles darkmux-owned or exact-alias residents");
-                let resident_idx = facts
-                    .residents
-                    .iter()
-                    .position(|r| r.identifier == stale_identifier)
-                    .expect("reconcile stale is a reported resident");
                 reconcile_frees.push(ReconcileFree {
-                    decision_idx: decisions.len(),
-                    resident_idx,
+                    stale: ReconcileStale::locate(facts, &stale_identifier, decisions.len()),
                     unload: PlannedAction {
-                        action: Action::Unload { target: stale },
+                        action: Action::Unload { target: stale_target },
                         reason: Reason::InsufficientCtx,
                         precondition: Precondition::ResidentPresent {
                             identifier: stale_identifier,
@@ -308,15 +301,14 @@ pub fn plan_acquire(
         }
     }
 
-    // Reconcile stales leave residency too (freed before their reload).
-    // Accounted AFTER the refusal pass: a refused reconcile no longer
-    // unloads its stale, so that resident stays counted as occupying. (The
-    // unload ACTION commits later still — after every refusal opportunity.)
-    for rf in &reconcile_frees {
-        if is_load_like(&decisions[rf.decision_idx].action) {
-            removed.insert(rf.resident_idx);
-        }
-    }
+    // Reconcile stales leave residency too (freed before their reload) —
+    // committed via the SHARED removal-timing helper, AFTER the refusal
+    // pass: a refused reconcile no longer unloads its stale, so that
+    // resident stays counted as occupying. (The unload ACTION commits later
+    // still — after every refusal opportunity.)
+    commit_surviving_stales(reconcile_frees.iter().map(|rf| &rf.stale), &mut removed, |i| {
+        is_load_like(&decisions[i].action)
+    });
 
     // ── #1243 budget arm, fit half ───────────────────────────────────────
     if let Some(budget) = facts.budget.max_darkmux_bytes {
@@ -421,13 +413,10 @@ pub fn plan_acquire(
     if pool_arm_active {
         if let Some(pool) = facts.pools.values().next() {
             let snapshot_available = pool.available_bytes;
-            // Every planned unload (pass 1, budget evictions, reconcile
-            // stales) frees its bytes before the loads run.
-            let freed: u64 = removed
-                .iter()
-                .map(|&idx| facts.residents[idx].est_bytes.unwrap_or(0))
-                .sum();
-            let mut effective = snapshot_available + freed;
+            // Snapshot plus every planned free (pass 1, budget evictions,
+            // surviving reconcile stales) — the shared #1140 accounting.
+            let mut effective = single_pool_headroom(facts, &removed)
+                .expect("pool_arm_active implies exactly one pool");
             let need = pending_sum(&decisions, &pendings);
             if need > effective {
                 for (idx, r) in facts.residents.iter().enumerate() {
@@ -513,8 +502,8 @@ pub fn plan_acquire(
 
     // ── commit reconcile unload-halves (post-refusal — see ReconcileFree) ─
     for rf in reconcile_frees {
-        if is_load_like(&decisions[rf.decision_idx].action) {
-            unloads.push((rf.resident_idx, rf.unload));
+        if is_load_like(&decisions[rf.stale.decision_idx].action) {
+            unloads.push((rf.stale.resident_idx, rf.unload));
         }
     }
 
@@ -635,6 +624,71 @@ pub(crate) fn warn_unknown_owned_resident_bytes(warnings: &mut Vec<Warning>, fac
             warnings.push(Warning::ResidentBytesUnknown { identifier: r.identifier.clone() });
         }
     }
+}
+
+/// A reconcile's stale-instance bookkeeping handle: which per-placement
+/// decision the reconcile is (caller-side index) and which reported
+/// resident its stale is. The unit of the #1243/#1140 removal-timing
+/// accounting shared by `plan_acquire` and the #1285 wave scheduler.
+pub(crate) struct ReconcileStale {
+    /// Index into the caller's per-placement decision list.
+    pub(crate) decision_idx: usize,
+    /// Index into `Facts::residents` of the stale instance.
+    pub(crate) resident_idx: usize,
+}
+
+impl ReconcileStale {
+    /// Locate the stale instance among the reported residents. The expect is
+    /// safe by construction: [`crate::residency::decide_residency`] only
+    /// names identifiers it found in `facts.residents`.
+    pub(crate) fn locate(facts: &Facts, stale_identifier: &str, decision_idx: usize) -> Self {
+        let resident_idx = facts
+            .residents
+            .iter()
+            .position(|r| r.identifier == stale_identifier)
+            .expect("reconcile stale is a reported resident");
+        ReconcileStale { decision_idx, resident_idx }
+    }
+}
+
+/// THE removal-timing rule of the #1243/#1140 accounting, shared between
+/// `plan_acquire` and the #1285 wave scheduler (one implementation, not
+/// two): a reconcile's stale leaves the budget base and joins the pool's
+/// freeable headroom ONLY once the reconcile has survived every refusal
+/// pass — `survives(decision_idx)`. Committing the credit during
+/// classification is the phantom-headroom bug class: a refused reconcile
+/// keeps its stale loaded, so scheduling later work against its "freed"
+/// bytes plans into headroom that does not physically exist. Both consumers
+/// follow the same ordering: flat refusals first (against the un-credited
+/// accounting), then this commit, then fit/packing against the updated
+/// base.
+pub(crate) fn commit_surviving_stales<'a>(
+    stales: impl IntoIterator<Item = &'a ReconcileStale>,
+    removed: &mut BTreeSet<usize>,
+    survives: impl Fn(usize) -> bool,
+) {
+    for s in stales {
+        if survives(s.decision_idx) {
+            removed.insert(s.resident_idx);
+        }
+    }
+}
+
+/// Single-pool headroom after every planned free (the #1140 arm's
+/// accounting, shared with the #1285 wave scheduler): the pool's
+/// `available_bytes` snapshot plus the bytes of every resident in `removed`
+/// (unknown sizes free 0 — the same degradation as the base). `None` when
+/// the single-pool v1 rule does not apply (zero or multiple pools — a
+/// placement→pool mapping fact arrives with a second ResourceProbe).
+pub(crate) fn single_pool_headroom(facts: &Facts, removed: &BTreeSet<usize>) -> Option<u64> {
+    if facts.pools.len() != 1 {
+        return None;
+    }
+    let freed: u64 = removed
+        .iter()
+        .map(|&idx| facts.residents[idx].est_bytes.unwrap_or(0))
+        .sum();
+    facts.pools.values().next().map(|pool| pool.available_bytes + freed)
 }
 
 /// Sum of darkmux-owned resident bytes that remain after the indexes in

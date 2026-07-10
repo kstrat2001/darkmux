@@ -2,6 +2,16 @@
 //! source, so it can later be refined from observed post-load residency
 //! (#1257 load-provenance records) without changing the core's decision
 //! logic.
+//!
+//! # v1 concurrency assumption — streams = 1 (named, deliberate)
+//!
+//! The #1286 potential formula carries a concurrent-streams multiplier on
+//! the KV term (k parallel streams hold k KV caches). Every estimator here
+//! fixes it at `streams = 1`: today's dispatch paths serialize calls per
+//! loaded instance, so one KV cache per model is the honest present-tense
+//! number. Pricing k-parallel serving (and the multiplier knob) is deferred
+//! to the judge-sharding work (#1266) — when it lands, the multiplier
+//! becomes an explicit estimator input, never a silent constant bump.
 
 use crate::facts::CatalogFact;
 use serde::{Deserialize, Serialize};
@@ -94,6 +104,11 @@ impl ArchFacts {
 /// `catalog size_bytes + kv_per_token(arch) × min_ctx +
 /// transient_margin_bytes` — the potential-commitment number the memory
 /// ledger charts and the #1285 wave scheduler packs against.
+///
+/// Assumes `streams = 1` — ONE KV cache per loaded model (the module-docs
+/// v1 concurrency assumption): the #1286 formula's concurrent-streams
+/// multiplier on the KV term is deferred to the judge-sharding work
+/// (#1266), where it arrives as an explicit input.
 ///
 /// A model with no arch facts (or no catalog size) estimates as `None` —
 /// unknowable, deliberately NOT a [`V1Estimator`]-style fallback: silently

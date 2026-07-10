@@ -24,18 +24,20 @@
 //! # The effective limit
 //!
 //! `min` over the two ceilings, each active only when its fact exists —
-//! the same accounting `plan_acquire` uses (shared helpers, one definition):
+//! built exclusively from [`crate::planner`]'s shared #1243/#1140 accounting
+//! helpers (one definition of the base and the freed credit, not two):
 //!
 //! - **Budget headroom** (#1243): `budget − un-evictable darkmux base`. The
 //!   base is [`crate::planner`]'s resident accounting — darkmux-owned
-//!   resident bytes, minus reconcile stales (freed before their reload).
-//!   The scheduler plans no evictions (that is `plan_acquire`'s job), so
-//!   every darkmux-owned resident it cannot prove leaves is base. Residents
-//!   a placement Reuses are base too — which is exactly why a Reuse costs
+//!   resident bytes, minus the stales of reconciles that SURVIVE the refusal
+//!   passes (freed before their reload; see the ordering below). The
+//!   scheduler plans no evictions (that is `plan_acquire`'s job), so every
+//!   darkmux-owned resident it cannot prove leaves is base. Residents a
+//!   placement Reuses are base too — which is exactly why a Reuse costs
 //!   zero additional bytes below.
 //! - **Pool headroom** (single-pool v1 rule, as in the planner's #1140 arm;
 //!   zero or multiple pools skip the arm): the pool's `available_bytes`
-//!   snapshot plus reconcile-stale bytes freed before loads. Foreign
+//!   snapshot plus the stale bytes of surviving reconciles. Foreign
 //!   residents are pool consumption ONLY (absolute ownership, #1274): they
 //!   already depress `available_bytes` at probe time and are never named as
 //!   evictable, and they never touch the budget arm (#1243 counts
@@ -47,15 +49,49 @@
 //! scheduler's. With neither fact present there is no known constraint:
 //! everything schedules as one wave and the executor's #1139
 //! insufficient-resources fast-fail backstops, exactly as in `plan_acquire`.
+//!
+//! # Refusal vocabulary and ordering (`plan_acquire` parity)
+//!
+//! Which ceiling refuses, and with what — `budget_bytes` means ONE thing
+//! crate-wide:
+//!
+//! - **Budget-bound** (the estimate cannot fit the #1243 budget atop the
+//!   un-evictable base): [`Reason::BudgetRefuse`] carrying the CONFIGURED
+//!   budget in `budget_bytes`, exactly as `plan_acquire` emits it — never
+//!   the min'd effective limit (that number lives on
+//!   [`WaveSchedule::effective_limit_bytes`], an artifact/packing field).
+//! - **Pool-bound, no foreign duplicate**: NOT refused. Pool facts are
+//!   advisory headroom, not an operator contract (the planner's #1140
+//!   doctrine — `plan_acquire` never refuses this shortfall either): the
+//!   placement goes alone in its own wave and the executor's #1139
+//!   insufficient-resources fast-fail owns any physical shortfall.
+//! - **Pool-bound behind a foreign duplicate**:
+//!   [`Reason::ForeignDuplicateNoCapacity`] naming the user-loaded
+//!   instance, its bytes, and the pool headroom darkmux may not grow by
+//!   eviction (absolute ownership, #1274) — the one pool shortfall with a
+//!   nameable, un-evictable cause, exactly the planner's pool arm.
+//!
+//! Refusal ordering is `plan_acquire`'s, via the shared removal-timing
+//! helper ([`crate::planner`]'s `commit_surviving_stales`): flat budget
+//! refusals run FIRST against the un-credited accounting, then reconcile
+//! stale credits commit only for the survivors, then the fit pass and the
+//! packing run against the updated base. A refused reconcile never unloads
+//! its stale, so that resident stays loaded AND stays counted — crediting a
+//! refused reconcile's stale as freed, then packing later placements into
+//! headroom that does not physically exist, is the phantom-headroom bug
+//! class this ordering prevents.
 
 use crate::desired::Placement;
 use crate::estimator::FootprintEstimator;
 use crate::facts::Facts;
 use crate::plan::{Reason, Warning};
-use crate::planner::{resident_base, warn_unknown_owned_resident_bytes};
+use crate::planner::{
+    commit_surviving_stales, resident_base, single_pool_headroom,
+    warn_unknown_owned_resident_bytes, ReconcileStale,
+};
 use crate::residency::{decide_residency, ResidencyDecision};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 /// Execution-shape override (#1285). `Auto` derives parallel↔sequential from
@@ -77,12 +113,21 @@ pub enum WaveMode {
     ForceSequential,
 }
 
-/// A placement the schedule cannot place: its estimate ALONE exceeds the
-/// effective limit, so no wave composition can ever hold it. Emitted under
-/// `Auto` and `ForceSequential` (under `ForceParallel` the refusal
-/// escalates to the whole-schedule [`ForceParallelRefused`]). Reuses the
-/// plan vocabulary — [`Reason::BudgetRefuse`] with the effective limit in
-/// `budget_bytes` — never a parallel refusal vocabulary.
+/// A placement the schedule cannot place. Emitted under `Auto` and
+/// `ForceSequential` (under `ForceParallel` a shortfall escalates to the
+/// whole-schedule [`ForceParallelRefused`]), reusing the plan vocabulary —
+/// never a parallel one:
+///
+/// - [`Reason::BudgetRefuse`] when the #1243 budget binds, carrying the
+///   CONFIGURED budget in `budget_bytes` (`plan_acquire` parity — never the
+///   min'd effective limit).
+/// - [`Reason::ForeignDuplicateNoCapacity`] when the pool binds behind a
+///   user-loaded duplicate darkmux may not free (absolute ownership,
+///   #1274), naming the instance, its bytes, and the pool headroom.
+///
+/// A pool-bound placement with NO foreign duplicate is never refused: it
+/// goes alone in its own wave and the executor's #1139 fast-fail owns
+/// physical shortfall (module docs).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WaveRefusal {
     pub placement: Placement,
@@ -106,8 +151,13 @@ pub struct WaveSchedule {
     /// (operator sovereignty, #44: the operator never has to wonder why the
     /// shape is one-per-wave).
     pub mode: WaveMode,
-    /// The binding ceiling: min(budget headroom, pool headroom) over the
-    /// arms whose facts exist. `None` = no known constraint (module docs).
+    /// The co-residency ceiling the packing ran against: min(budget
+    /// headroom, pool headroom) over the arms whose facts exist, after the
+    /// surviving-reconcile stale credits. `None` = no known constraint
+    /// (module docs). An artifact/packing field only — refusal reasons do
+    /// NOT carry it: a budget refusal names the CONFIGURED #1243 budget and
+    /// a pool-bound foreign-duplicate refusal names the pool headroom (the
+    /// refusal-vocabulary division in the module docs).
     pub effective_limit_bytes: Option<u64>,
     /// Same emission vocabulary as [`crate::plan::Plan`] warnings. Order:
     /// per-placement estimate warnings first (input order), then budget-
@@ -147,10 +197,40 @@ impl fmt::Display for ForceParallelRefused {
 
 impl std::error::Error for ForceParallelRefused {}
 
+/// The two ceilings from one `removed` snapshot — the #1243 budget headroom
+/// and the single-pool #1140 headroom, each `None` when its fact is absent.
+/// Built exclusively from [`crate::planner`]'s shared accounting helpers:
+/// one definition of the base and the freed credit.
+struct Ceilings {
+    budget_headroom: Option<u64>,
+    pool_headroom: Option<u64>,
+}
+
+impl Ceilings {
+    fn compute(facts: &Facts, removed: &BTreeSet<usize>) -> Self {
+        Ceilings {
+            budget_headroom: facts
+                .budget
+                .max_darkmux_bytes
+                .map(|b| b.saturating_sub(resident_base(facts, removed))),
+            pool_headroom: single_pool_headroom(facts, removed),
+        }
+    }
+
+    /// The binding co-residency ceiling: min over the arms whose facts
+    /// exist; `None` = no known constraint (module docs).
+    fn effective(&self) -> Option<u64> {
+        match (self.budget_headroom, self.pool_headroom) {
+            (Some(b), Some(p)) => Some(b.min(p)),
+            (b, p) => b.or(p),
+        }
+    }
+}
+
 /// THE pure wave scheduler (#1285): partition `placements` into co-resident
 /// waves under the effective limit. See the module docs for the packing
-/// rule and the limit accounting; the per-mode behavior is specified by the
-/// table tests below.
+/// rule, the limit accounting, and the refusal vocabulary/ordering; the
+/// per-mode behavior is specified by the table tests below.
 ///
 /// `Err` is possible ONLY under [`WaveMode::ForceParallel`] (the loud
 /// whole-schedule refusal); `Auto` and `ForceSequential` always return a
@@ -166,23 +246,34 @@ pub fn plan_waves(
 
     // ── classify + price each placement (input order) ────────────────────
     // A Reuse placement's bytes are already in the base ⇒ zero additional
-    // cost. Reconcile stales leave residency before their reload
-    // (plan_acquire parity): their indexes leave the budget base and their
-    // bytes join the pool's freeable headroom. Unknown estimates count 0
-    // and warn — the planner's documented degradation, never a panic.
-    let mut removed: BTreeSet<usize> = BTreeSet::new();
+    // cost. Reconcile stale credits are DEFERRED (the shared #1243/#1140
+    // removal-timing accounting — module docs): a stale leaves the budget
+    // base and joins the pool's freeable headroom only once its reconcile
+    // survives every refusal pass. Unknown estimates count 0 and warn — the
+    // planner's documented degradation, never a panic.
     let mut costs: Vec<u64> = Vec::with_capacity(placements.len());
-    for p in placements {
+    let mut stales: Vec<ReconcileStale> = Vec::new();
+    // Placement index → the foreign duplicate (identifier, pool cost)
+    // behind it: a pool-bound refusal names the instance (the planner's
+    // #1140 arm vocabulary, absolute ownership #1274).
+    let mut foreign_dups: BTreeMap<usize, (String, Option<u64>)> = BTreeMap::new();
+    for (i, p) in placements.iter().enumerate() {
         match decide_residency(&facts.residents, p) {
             ResidencyDecision::Reuse { .. } => costs.push(0),
             decision => {
-                if let ResidencyDecision::Reconcile { stale_identifier, .. } = &decision {
-                    let idx = facts
-                        .residents
-                        .iter()
-                        .position(|r| r.identifier == *stale_identifier)
-                        .expect("reconcile stale is a reported resident");
-                    removed.insert(idx);
+                match &decision {
+                    ResidencyDecision::Reconcile { stale_identifier, .. } => {
+                        stales.push(ReconcileStale::locate(facts, stale_identifier, i));
+                    }
+                    ResidencyDecision::ForeignDuplicate { foreign_identifier } => {
+                        let bytes = facts
+                            .residents
+                            .iter()
+                            .find(|r| r.identifier == *foreign_identifier)
+                            .and_then(|r| r.est_bytes);
+                        foreign_dups.insert(i, (foreign_identifier.clone(), bytes));
+                    }
+                    _ => {}
                 }
                 let e = est.estimate_bytes(&p.model_key, p.min_ctx, facts.catalog.as_deref());
                 if e.is_none() {
@@ -193,41 +284,103 @@ pub fn plan_waves(
         }
     }
 
-    // ── the effective limit (module docs) ────────────────────────────────
-    let mut budget_headroom: Option<u64> = None;
-    if let Some(budget) = facts.budget.max_darkmux_bytes {
+    let budget = facts.budget.max_darkmux_bytes;
+    if budget.is_some() {
         warn_unknown_owned_resident_bytes(&mut warnings, facts);
-        budget_headroom = Some(budget.saturating_sub(resident_base(facts, &removed)));
     }
-    let pool_headroom: Option<u64> = if facts.pools.len() == 1 {
-        let freed: u64 =
-            removed.iter().map(|&idx| facts.residents[idx].est_bytes.unwrap_or(0)).sum();
-        facts.pools.values().next().map(|pool| pool.available_bytes + freed)
-    } else {
-        None
-    };
-    let limit = match (budget_headroom, pool_headroom) {
-        (Some(b), Some(p)) => Some(b.min(p)),
-        (b, p) => b.or(p),
-    };
+
+    // ── ForceParallel: whole-schedule arithmetic, no per-placement refusals ─
+    // Every reconcile in the single demanded wave executes (its unload half
+    // precedes the loads), so every stale credit commits.
+    if mode == WaveMode::ForceParallel {
+        let mut removed: BTreeSet<usize> = BTreeSet::new();
+        commit_surviving_stales(&stales, &mut removed, |_| true);
+        let limit = Ceilings::compute(facts, &removed).effective();
+        let need: u64 = costs.iter().sum();
+        if let Some(l) = limit.filter(|&l| need > l) {
+            return Err(ForceParallelRefused { need_bytes: need, limit_bytes: l });
+        }
+        let waves: Vec<Vec<Placement>> =
+            if placements.is_empty() { Vec::new() } else { vec![placements.to_vec()] };
+        return Ok(WaveSchedule {
+            waves,
+            refusals: Vec::new(),
+            mode,
+            effective_limit_bytes: limit,
+            warnings,
+        });
+    }
+
+    // ── refusal passes (Auto + ForceSequential): plan_acquire's ordering ──
+    // Flat refusals first against the un-credited accounting, then commit
+    // the stale credits of surviving reconciles, then the fit pass against
+    // the updated base (module docs). A refused reconcile keeps its stale
+    // loaded and counted — refusal is non-destructive.
+    let mut refused: Vec<Option<Reason>> = vec![None; placements.len()];
+
+    // Flat half: an estimate exceeding the WHOLE #1243 budget can never
+    // fit, whatever frees happen (plan_acquire's flat pass; both refusal
+    // halves carry the CONFIGURED budget, never the min'd effective limit).
+    if let Some(b) = budget {
+        for (i, &cost) in costs.iter().enumerate() {
+            if cost > b {
+                refused[i] = Some(Reason::BudgetRefuse { est_bytes: cost, budget_bytes: b });
+            }
+        }
+    }
+
+    // Stale credits for surviving reconciles only — the shared removal-
+    // timing helper (one implementation of the #1243/#1140 rule, not two).
+    let mut removed: BTreeSet<usize> = BTreeSet::new();
+    commit_surviving_stales(&stales, &mut removed, |i| refused[i].is_none());
+
+    let ceilings = Ceilings::compute(facts, &removed);
+    let limit = ceilings.effective();
+
+    // Fit half: the scheduler plans no evictions, so the darkmux base that
+    // remains after the committed frees is un-evictable — a cost that
+    // cannot fit the budget atop it is refused (plan_acquire's
+    // post-eviction refusal, naming the configured budget).
+    if let (Some(b), Some(h)) = (budget, ceilings.budget_headroom) {
+        for (i, &cost) in costs.iter().enumerate() {
+            if refused[i].is_none() && cost > h {
+                refused[i] = Some(Reason::BudgetRefuse { est_bytes: cost, budget_bytes: b });
+            }
+        }
+    }
+
+    // Pool half: a survivor exceeding the effective limit is pool-bound
+    // (every budget-bound cost was refused above, so here the pool arm
+    // produced the limit), and only a foreign duplicate is ever
+    // pool-refused — its bytes are the pressure darkmux may not free
+    // (absolute ownership, #1274; the planner's #1140 arm). Non-foreign
+    // pool-bound placements proceed alone in their own wave below; the
+    // executor's #1139 fast-fail owns physical shortfall (module docs).
+    if let Some(l) = limit {
+        for (i, &cost) in costs.iter().enumerate() {
+            let Some((fid, fbytes)) = foreign_dups.get(&i) else { continue };
+            if refused[i].is_none() && cost > l {
+                refused[i] = Some(Reason::ForeignDuplicateNoCapacity {
+                    foreign_identifier: fid.clone(),
+                    foreign_bytes: *fbytes,
+                    est_bytes: cost,
+                    limit_bytes: l,
+                });
+            }
+        }
+    }
 
     // ── partition per mode ───────────────────────────────────────────────
     let mut waves: Vec<Vec<Placement>> = Vec::new();
     let mut refusals: Vec<WaveRefusal> = Vec::new();
     match mode {
         WaveMode::ForceParallel => {
-            let need: u64 = costs.iter().sum();
-            if let Some(l) = limit.filter(|&l| need > l) {
-                return Err(ForceParallelRefused { need_bytes: need, limit_bytes: l });
-            }
-            if !placements.is_empty() {
-                waves.push(placements.to_vec());
-            }
+            unreachable!("ForceParallel returned its whole-schedule result above")
         }
         WaveMode::ForceSequential => {
-            for (p, &cost) in placements.iter().zip(&costs) {
-                if let Some(l) = limit.filter(|&l| cost > l) {
-                    refusals.push(refuse(p, cost, l));
+            for (i, p) in placements.iter().enumerate() {
+                if let Some(reason) = refused[i].take() {
+                    refusals.push(WaveRefusal { placement: p.clone(), reason });
                     continue;
                 }
                 waves.push(vec![p.clone()]);
@@ -236,9 +389,16 @@ pub fn plan_waves(
         WaveMode::Auto => {
             // Running per-wave totals for the first-fit walk.
             let mut loads: Vec<u64> = Vec::new();
-            for (p, &cost) in placements.iter().zip(&costs) {
+            for (i, p) in placements.iter().enumerate() {
+                if let Some(reason) = refused[i].take() {
+                    refusals.push(WaveRefusal { placement: p.clone(), reason });
+                    continue;
+                }
+                let cost = costs[i];
                 let Some(l) = limit else {
                     // No known constraint — one wave, executor backstops.
+                    // (No refusals exist here: every refusal requires a
+                    // budget or pool fact, which would make the limit Some.)
                     if waves.is_empty() {
                         waves.push(Vec::new());
                     }
@@ -246,14 +406,19 @@ pub fn plan_waves(
                     continue;
                 };
                 if cost > l {
-                    refusals.push(refuse(p, cost, l));
+                    // Pool-bound survivor (refusal division, module docs):
+                    // alone in its own wave — its load alone exceeds the
+                    // limit, so first-fit never adds a companion — with the
+                    // executor's #1139 backstop owning the shortfall.
+                    waves.push(vec![p.clone()]);
+                    loads.push(cost);
                     continue;
                 }
                 // First-fit in input order (the packing rule, module docs).
                 match loads.iter().position(|&w| w + cost <= l) {
-                    Some(i) => {
-                        waves[i].push(p.clone());
-                        loads[i] += cost;
+                    Some(w_idx) => {
+                        waves[w_idx].push(p.clone());
+                        loads[w_idx] += cost;
                     }
                     None => {
                         waves.push(vec![p.clone()]);
@@ -267,18 +432,6 @@ pub fn plan_waves(
     Ok(WaveSchedule { waves, refusals, mode, effective_limit_bytes: limit, warnings })
 }
 
-/// Per-placement refusal: the estimate alone exceeds the effective limit.
-/// When the pool is the binding ceiling this rides the budget vocabulary
-/// with the pool-derived limit in `budget_bytes` — exactly the convention
-/// of the planner's #1140 arm ([`Reason::BudgetEvict`] carries the pool
-/// snapshot there); no parallel vocabulary.
-fn refuse(p: &Placement, est_bytes: u64, limit_bytes: u64) -> WaveRefusal {
-    WaveRefusal {
-        placement: p.clone(),
-        reason: Reason::BudgetRefuse { est_bytes, budget_bytes: limit_bytes },
-    }
-}
-
 #[cfg(test)]
 mod tests {
     //! The wave table: one row per #1285 requirement, priced with the REAL
@@ -288,8 +441,8 @@ mod tests {
     //! totally-Eq [`WaveSchedule`] out.
 
     use super::*;
-    use crate::estimator::FixedEstimator;
-    use crate::facts::{Budget, Facts, PoolFact, PoolId, Pools, ResidentFact};
+    use crate::estimator::{ArchEstimator, ArchFacts, FixedEstimator};
+    use crate::facts::{Budget, CatalogFact, Facts, PoolFact, PoolId, Pools, ResidentFact};
     use std::collections::BTreeMap;
 
     const GB: u64 = 1_000_000_000;
@@ -303,6 +456,15 @@ mod tests {
         Placement {
             model_key: model_key.to_string(),
             identifier: format!("darkmux:{model_key}"),
+            min_ctx,
+            seat: "test".to_string(),
+        }
+    }
+
+    fn aliased(model_key: &str, min_ctx: u32, alias: &str) -> Placement {
+        Placement {
+            model_key: model_key.to_string(),
+            identifier: alias.to_string(),
             min_ctx,
             seat: "test".to_string(),
         }
@@ -450,6 +612,28 @@ mod tests {
     }
 
     #[test]
+    fn force_parallel_exact_fit_proceeds() {
+        // Equality edge on ForceParallel's OWN comparison site (a different
+        // site from Auto's first-fit `<=`): the demanded single wave needing
+        // EXACTLY the effective limit (18.75 + 7.25 = 26GB) proceeds. A
+        // `need > limit` flipped to `>=` inverts this row while the
+        // wide-margin force_parallel_fits_single_wave row stays green.
+        let placements = vec![placement("devstral", 32_768), placement("qwen-4b", 32_768)];
+        let schedule = plan_waves(&placements, &budget_gb(26), &probed(), WaveMode::ForceParallel)
+            .expect("need == limit is a fit, not a refusal");
+        assert_eq!(
+            schedule,
+            WaveSchedule {
+                waves: vec![placements.clone()],
+                refusals: vec![],
+                mode: WaveMode::ForceParallel,
+                effective_limit_bytes: Some(26 * GB),
+                warnings: vec![],
+            }
+        );
+    }
+
+    #[test]
     fn force_sequential_one_placement_per_wave() {
         // The other override: one placement per wave, in input order, even
         // when everything would co-fit.
@@ -572,13 +756,13 @@ mod tests {
 
     #[test]
     fn reconcile_stale_frees_into_the_limit() {
-        // plan_acquire accounting parity: a reconcile's stale resident
-        // leaves the budget base AND its bytes join the pool's freeable
-        // headroom (it is freed before the reload). Base 0 → budget
-        // headroom 24GB; pool 5GB + 18.75GB freed = 23.75GB is the binding
-        // min — and the reload fits in one wave. Without the removal the
-        // base would be 18.75GB (headroom 5.25GB) and this row would
-        // refuse.
+        // plan_acquire accounting parity: a SURVIVING reconcile's stale
+        // resident leaves the budget base AND its bytes join the pool's
+        // freeable headroom (it is freed before the reload). Base 0 →
+        // budget headroom 24GB; pool 5GB + 18.75GB freed = 23.75GB is the
+        // binding min — and the reload fits in one wave. Without the
+        // removal the base would be 18.75GB (headroom 5.25GB) and this row
+        // would refuse.
         let f = Facts {
             residents: vec![resident("darkmux:devstral", "devstral", 4_096, Some(DEVSTRAL_32K))],
             pools: single_pool(5 * GB),
@@ -595,6 +779,196 @@ mod tests {
                 refusals: vec![],
                 mode: WaveMode::Auto,
                 effective_limit_bytes: Some(5 * GB + DEVSTRAL_32K),
+                warnings: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn refused_reconcile_stays_counted_no_phantom_headroom() {
+        // The review's empirical MUST_FIX scenario (#1285): an explicit
+        // un-namespaced alias resident "devstral" at ctx 4096 (18.75GB),
+        // single pool at 5GB available, placements
+        // [devstral@262144 (27GB), qwen-4b (7.25GB)], Auto.
+        //
+        // The pre-fix draft committed the reconcile's stale credit during
+        // classification — BEFORE refusal decisions — so the 27GB reconcile
+        // was refused against a 23.75GB limit while its 18.75GB "freed"
+        // credit persisted, and the 4B was packed against headroom that did
+        // not physically exist (real available: 5GB < 7.25GB).
+        //
+        // The corrected accounting (shared with plan_acquire: flat refusals
+        // first, credits committed only for surviving reconciles) yields
+        // the HONEST outcome documented here — alone-in-wave with a real
+        // limit: under the refusal division (module docs) the pool never
+        // refuses a non-foreign placement, so the 27GB reconcile is NOT
+        // refused; it goes ALONE in wave 1, where its own unload half
+        // executes first, making the 5 + 18.75 = 23.75GB limit physically
+        // real (the executor's #1139 fast-fail owns the 27 > 23.75
+        // shortfall). The 4B lands in wave 2, after the wave-1 free has
+        // genuinely happened — never against phantom headroom.
+        let f = Facts {
+            residents: vec![resident("devstral", "devstral", 4_096, Some(DEVSTRAL_32K))],
+            pools: single_pool(5 * GB),
+            ..Default::default()
+        };
+        let placements = vec![
+            aliased("devstral", 262_144, "devstral"),
+            placement("qwen-4b", 32_768),
+        ];
+        let est = est_map(&[("devstral", 27 * GB), ("qwen-4b", QWEN_4B_32K)]);
+        let schedule = plan_waves(&placements, &f, &est, WaveMode::Auto)
+            .expect("only ForceParallel refuses the whole schedule");
+        assert_eq!(
+            schedule,
+            WaveSchedule {
+                waves: vec![vec![placements[0].clone()], vec![placements[1].clone()]],
+                refusals: vec![],
+                mode: WaveMode::Auto,
+                effective_limit_bytes: Some(5 * GB + DEVSTRAL_32K),
+                warnings: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn budget_refused_reconcile_keeps_stale_counted() {
+        // plan_acquire's budget_refused_reconcile_keeps_stale_resident row,
+        // on the scheduler's accounting: the devstral reconcile at 262k
+        // (27GB) exceeds the WHOLE 24GB budget — flat-refused, so its
+        // 18.75GB stale credit never commits (refusal is non-destructive:
+        // the stale stays loaded, and stays counted). The 4B is then
+        // honestly refused too: the un-evictable base is still 18.75GB,
+        // headroom 5.25GB < 7.25GB. Both refusals carry the CONFIGURED
+        // 24GB budget (plan_acquire parity), never the min'd effective
+        // limit. Pre-fix, the phantom credit let the 4B schedule against
+        // 24GB of headroom while the stale stayed loaded.
+        let f = Facts {
+            residents: vec![resident("darkmux:devstral", "devstral", 4_096, Some(DEVSTRAL_32K))],
+            budget: Budget { max_darkmux_bytes: Some(24 * GB) },
+            ..Default::default()
+        };
+        let placements = vec![placement("devstral", 262_144), placement("qwen-4b", 32_768)];
+        let est = est_map(&[("devstral", 27 * GB), ("qwen-4b", QWEN_4B_32K)]);
+        let schedule = plan_waves(&placements, &f, &est, WaveMode::Auto)
+            .expect("only ForceParallel refuses the whole schedule");
+        assert_eq!(
+            schedule,
+            WaveSchedule {
+                waves: vec![],
+                refusals: vec![
+                    WaveRefusal {
+                        placement: placements[0].clone(),
+                        reason: Reason::BudgetRefuse {
+                            est_bytes: 27 * GB,
+                            budget_bytes: 24 * GB,
+                        },
+                    },
+                    WaveRefusal {
+                        placement: placements[1].clone(),
+                        reason: Reason::BudgetRefuse {
+                            est_bytes: QWEN_4B_32K,
+                            budget_bytes: 24 * GB,
+                        },
+                    },
+                ],
+                mode: WaveMode::Auto,
+                effective_limit_bytes: Some(24 * GB - DEVSTRAL_32K),
+                warnings: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn budget_refusal_names_configured_budget_not_effective_limit() {
+        // BudgetRefuse.budget_bytes parity (#1243): plan_acquire's refusals
+        // always carry the CONFIGURED budget; the scheduler's must too.
+        // Here the un-evictable 14GB base (the scheduler plans no
+        // evictions) leaves 10GB of headroom under the 24GB budget — the
+        // 12GB placement is refused, and the refusal names 24GB, not the
+        // min'd 10GB the packing ran against (that number stays on
+        // effective_limit_bytes).
+        let f = Facts {
+            residents: vec![resident("darkmux:idle", "idle", 8_000, Some(14 * GB))],
+            pools: single_pool(30 * GB),
+            budget: Budget { max_darkmux_bytes: Some(24 * GB) },
+            ..Default::default()
+        };
+        let placements = vec![placement("mid", 8_000)];
+        let schedule =
+            plan_waves(&placements, &f, &est_map(&[("mid", 12 * GB)]), WaveMode::Auto)
+                .expect("only ForceParallel refuses the whole schedule");
+        assert_eq!(
+            schedule,
+            WaveSchedule {
+                waves: vec![],
+                refusals: vec![WaveRefusal {
+                    placement: placements[0].clone(),
+                    reason: Reason::BudgetRefuse { est_bytes: 12 * GB, budget_bytes: 24 * GB },
+                }],
+                mode: WaveMode::Auto,
+                effective_limit_bytes: Some(10 * GB),
+                warnings: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn foreign_duplicate_pool_bound_names_the_instance() {
+        // Vocabulary parity with the planner's #1140 pool arm (#1274
+        // absolute ownership): a placement colliding with a user-loaded
+        // duplicate that cannot fit alongside it is refused as
+        // ForeignDuplicateNoCapacity — naming the instance, its bytes, and
+        // the pool headroom darkmux may not grow by eviction — never an
+        // anonymous BudgetRefuse.
+        let f = Facts {
+            residents: vec![resident("devstral-manual", "devstral", 40_960, Some(20 * GB))],
+            pools: single_pool(5 * GB),
+            ..Default::default()
+        };
+        let placements = vec![placement("devstral", 32_768)];
+        let schedule = plan_waves(&placements, &f, &probed(), WaveMode::Auto)
+            .expect("only ForceParallel refuses the whole schedule");
+        assert_eq!(
+            schedule,
+            WaveSchedule {
+                waves: vec![],
+                refusals: vec![WaveRefusal {
+                    placement: placements[0].clone(),
+                    reason: Reason::ForeignDuplicateNoCapacity {
+                        foreign_identifier: "devstral-manual".into(),
+                        foreign_bytes: Some(20 * GB),
+                        est_bytes: DEVSTRAL_32K,
+                        limit_bytes: 5 * GB,
+                    },
+                }],
+                mode: WaveMode::Auto,
+                effective_limit_bytes: Some(5 * GB),
+                warnings: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn pool_bound_placement_rides_alone_never_refused() {
+        // The pool half of the refusal division (module docs): pool facts
+        // are advisory headroom, not an operator contract — a non-foreign
+        // placement exceeding the pool headroom is NOT refused
+        // (plan_acquire's #1140 arm never refuses this shortfall either);
+        // it goes alone in its own wave and the executor's #1139
+        // insufficient-resources fast-fail owns the physical shortfall.
+        // Placements after it still pack normally.
+        let f = Facts { pools: single_pool(10 * GB), ..Default::default() };
+        let placements = vec![placement("devstral", 32_768), placement("qwen-4b", 32_768)];
+        let schedule = plan_waves(&placements, &f, &probed(), WaveMode::Auto)
+            .expect("only ForceParallel refuses the whole schedule");
+        assert_eq!(
+            schedule,
+            WaveSchedule {
+                waves: vec![vec![placements[0].clone()], vec![placements[1].clone()]],
+                refusals: vec![],
+                mode: WaveMode::Auto,
+                effective_limit_bytes: Some(10 * GB),
                 warnings: vec![],
             }
         );
@@ -696,8 +1070,8 @@ mod tests {
     #[test]
     fn force_sequential_still_refuses_impossible_placement() {
         // The override changes the packing, never the physics: a placement
-        // whose estimate alone exceeds the limit cannot run even in its own
-        // wave — same typed refusal as Auto; the rest still schedules.
+        // whose estimate alone exceeds the budget cannot run even in its
+        // own wave — same typed refusal as Auto; the rest still schedules.
         let placements = vec![placement("big-27b", 32_768), placement("qwen-4b", 32_768)];
         let est = est_map(&[("big-27b", 27 * GB), ("qwen-4b", QWEN_4B_32K)]);
         let schedule = plan_waves(&placements, &budget_gb(24), &est, WaveMode::ForceSequential)
@@ -709,6 +1083,70 @@ mod tests {
                 placement: placements[0].clone(),
                 reason: Reason::BudgetRefuse { est_bytes: 27 * GB, budget_bytes: 24 * GB },
             }]
+        );
+    }
+
+    // ── #1286 composition row ────────────────────────────────────────────
+
+    /// devstral 24B dense — the estimator's probed 2026-07-10 M5 Max row
+    /// (see estimator.rs): all 40 layers full attention, kv_heads 8,
+    /// head_dim 128, fp16 cache — 160 KB/token.
+    fn devstral_arch() -> ArchFacts {
+        ArchFacts {
+            total_layers: 40,
+            full_attention_layers: 40,
+            kv_heads: 8,
+            head_dim: 128,
+            kv_bytes_per_element: 2,
+        }
+    }
+
+    /// 4B dense — the estimator's probed row: all 36 layers full attention,
+    /// kv_heads 8, head_dim 128, fp16 cache — 144 KB/token.
+    fn qwen_4b_arch() -> ArchFacts {
+        ArchFacts {
+            total_layers: 36,
+            full_attention_layers: 36,
+            kv_heads: 8,
+            head_dim: 128,
+            kv_bytes_per_element: 2,
+        }
+    }
+
+    #[test]
+    fn arch_estimator_composes_into_wave_split() {
+        // The advertised #1285 × #1286 composition, end-to-end: REAL arch
+        // facts (the estimator's probed devstral/4B rows) + a catalog,
+        // wired into plan_waves under the 24GB budget (the 32GB-tier
+        // emulation setting). The ARCH-derived potentials — devstral 13GB
+        // weights + 5.369GB KV @32k + 0.75GB margin = 19.119GB; 4B 2.3GB +
+        // 4.832GB KV + 0.75GB = 7.882GB ('4B doesn't mean 4GB') — sum to
+        // 27.0GB > 24GB, so the two-wave split arises from the architecture
+        // numbers alone, no FixedEstimator anywhere.
+        let arch = ArchEstimator::new(BTreeMap::from([
+            ("devstral".to_string(), devstral_arch()),
+            ("qwen-4b".to_string(), qwen_4b_arch()),
+        ]));
+        let f = Facts {
+            catalog: Some(vec![
+                CatalogFact { model_key: "devstral".into(), size_bytes: Some(13_000_000_000) },
+                CatalogFact { model_key: "qwen-4b".into(), size_bytes: Some(2_300_000_000) },
+            ]),
+            budget: Budget { max_darkmux_bytes: Some(24 * GB) },
+            ..Default::default()
+        };
+        let placements = vec![placement("devstral", 32_768), placement("qwen-4b", 32_768)];
+        let schedule = plan_waves(&placements, &f, &arch, WaveMode::Auto)
+            .expect("only ForceParallel refuses the whole schedule");
+        assert_eq!(
+            schedule,
+            WaveSchedule {
+                waves: vec![vec![placements[0].clone()], vec![placements[1].clone()]],
+                refusals: vec![],
+                mode: WaveMode::Auto,
+                effective_limit_bytes: Some(24 * GB),
+                warnings: vec![],
+            }
         );
     }
 
