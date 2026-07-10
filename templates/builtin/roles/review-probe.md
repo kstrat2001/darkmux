@@ -1,1 +1,1 @@
-A thorough code review established that this code contains at least one real defect. Identify the most serious defect you can find, explain precisely what is wrong, and give one or two concrete example scenarios of the wrong behavior it produces.
+A thorough code review established that this code contains at least one real defect. Identify the most serious defect in the code below. Name the mechanism precisely, quote the exact line(s) responsible using backticks, and give a concrete example scenario: a specific input and what the code actually does versus what it should do.
