@@ -93,6 +93,66 @@
   .mimeta{font:11px 'JetBrains Mono',monospace;color:var(--muted);flex:0 0 auto}
   .midim{font:11px 'JetBrains Mono',monospace;color:var(--muted)}
   .mitag{font:600 10px 'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.06em;padding:3px 7px;border-radius:3px;color:var(--muted);background:var(--bg2);border:1px dashed var(--line);flex:0 0 auto}
+
+  /* (#1247 Part 3) Lab observer lens — machine-local room, distinct from the
+     fleet/missions lenses' flow-record chrome. MOBILE-FIRST throughout: every
+     rule below is single-column / stacking by default (flex-wrap, no fixed
+     widths beyond small badges); the `.wrap` reflow to full-width `.stage`
+     happens via `.lab-mode` below, and `@media(max-width:768px)` only adds
+     touch-target sizing on top, matching the rest of this file's convention. */
+  body.lab-mode .log,body.lab-mode .split,body.lab-mode .scrub{display:none}
+  body.lab-mode .wrap{display:block;height:auto}
+  body.lab-mode .stage{padding:16px 16px 32px}
+  .lablist{display:flex;flex-direction:column;gap:14px;margin-top:10px}
+  .labtaskcard{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 14px}
+  .labtaskhdr{font:600 13px 'JetBrains Mono',monospace;color:var(--amber);display:flex;flex-wrap:wrap;align-items:baseline;gap:8px;margin-bottom:8px}
+  .labtaskcount{font:600 10px 'JetBrains Mono',monospace;color:var(--muted);letter-spacing:.06em;text-transform:uppercase}
+  .labrunrow{display:flex;flex-direction:column;gap:4px;padding:10px 11px;border:1px solid var(--line);border-radius:6px;background:var(--bg2);cursor:pointer;margin-bottom:6px}
+  .labrunrow:last-child{margin-bottom:0}
+  .labrunrow:hover{border-color:var(--amber-dim)}
+  .labrunrow:focus-visible{outline:2px solid var(--amber);outline-offset:1px}
+  .labrunmain{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+  .labruncrew{font:600 12px 'JetBrains Mono',monospace;color:var(--text)}
+  .labrundir{font:11px 'JetBrains Mono',monospace;color:var(--muted);overflow-wrap:anywhere}
+  .labrunmeta{font:11px/1.4 'JetBrains Mono',monospace;color:var(--text);overflow-wrap:anywhere}
+  .labrunmeta.dim{color:var(--muted)}
+  .labdegenerate{color:var(--bad);font-weight:600}
+  .labdiffline{font:11px/1.4 'JetBrains Mono',monospace;color:var(--good);padding:2px 0 8px 6px;border-left:2px solid var(--good);margin:-2px 0 6px 4px;overflow-wrap:anywhere}
+  .labdiffline.warn{color:var(--warn);border-left-color:var(--warn)}
+  .labdiffline.dim{color:var(--muted);border-left-color:var(--line)}
+  .labbadge{display:inline-block;font:600 10px/1 'JetBrains Mono',monospace;letter-spacing:.06em;text-transform:uppercase;padding:3px 7px;border-radius:3px;border:1px solid var(--line);flex:0 0 auto}
+  .labbadge.finished{color:var(--good);border-color:var(--good)}
+  .labbadge.live{color:var(--amber);border-color:var(--amber);animation:lpulse 1.6s ease-in-out infinite}
+  /* Pipeline strip — a VERTICAL stage list always (not just on mobile): a
+     stacked list reads cleanly at any width and keeps this lens's CSS
+     surface small; see the PR notes for the deliberate no-horizontal-strip
+     simplification. */
+  .labpipe{display:flex;flex-direction:column;gap:6px;margin:14px 0}
+  .labstage{display:flex;flex-wrap:wrap;align-items:baseline;gap:8px;padding:9px 11px;border:1px solid var(--line);border-radius:6px;background:var(--panel)}
+  .labstage.pending{opacity:.55}
+  .labstage.started{border-color:var(--run)}
+  .labstage.finished{border-color:var(--good)}
+  .labstage.error{border-color:var(--bad)}
+  .labstage.synth{border-style:dashed}
+  .labstagename{font:600 11px 'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.06em;color:var(--amber);min-width:90px}
+  .labstagemeta{font:11px 'JetBrains Mono',monospace;color:var(--muted);overflow-wrap:anywhere}
+  .labcli{display:flex;flex-direction:column;gap:4px;padding:10px 12px;border:1px dashed var(--line);border-radius:6px;background:var(--bg2);margin-bottom:14px}
+  .labclilbl{font:600 10px 'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}
+  .labcli code{font:12px/1.5 'JetBrains Mono',monospace;color:var(--text);overflow-wrap:anywhere;user-select:all}
+  .labfeedhdr{font:600 12px 'JetBrains Mono',monospace;color:var(--muted);margin-bottom:6px}
+  .labfeed{display:flex;flex-direction:column;gap:2px;max-height:none}
+  .labfeedrow{display:flex;flex-wrap:wrap;gap:8px;padding:5px 8px;border-radius:4px;font:11px/1.4 'JetBrains Mono',monospace}
+  .labfeedrow:nth-child(odd){background:var(--panel)}
+  .labfeedts{color:var(--muted);flex:0 0 auto}
+  .labfeedtag{color:var(--amber-dim);flex:0 0 auto;text-transform:uppercase;font-weight:600}
+  .labfeedtext{color:var(--text);overflow-wrap:anywhere}
+  .labfeedrow.host{color:var(--muted)}
+  .labfeedrow.host .labfeedtext{color:var(--muted)}
+  .labfeedrow.ruling.confirmed .labfeedtext{color:var(--good)}
+  .labfeedrow.ruling.needs_check .labfeedtext{color:var(--warn)}
+  .labfeedrow.ruling.false_positive .labfeedtext,.labfeedrow.ruling.error .labfeedtext{color:var(--bad)}
+  .labfeedrow.task{font-weight:600}
+
   /* (#827) fleet | missions lens toggle — two co-equal views of the fleet */
   .lenstabs{display:inline-flex;border:1px solid var(--line);border-radius:5px;overflow:hidden}
   .lens{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);padding:5px 11px;cursor:pointer;text-decoration:none;background:none}
@@ -549,6 +609,14 @@
     .sprow { flex-wrap: wrap; }
     .spa { min-width: 0; text-align: left; }
     .sprun { flex: 1 1 100%; text-align: left; }
+    /* (#1247 Part 3) Lab lens on phones: touch-size the run rows (already
+       stacking by default — see the base rules above), and drop the fixed
+       stage-name column so a long stage/status line wraps under it instead
+       of squeezing both onto one line. */
+    .labrunrow { min-height: 44px; justify-content: center; }
+    .labstage { flex-direction: column; align-items: flex-start; gap: 2px; }
+    .labstagename { min-width: 0; }
+    .labcli code { font-size: 11px; }
   }
 </style>
 </head>
@@ -567,7 +635,7 @@
 </div>
 <div class="catpanel" id="catpanel" hidden></div>
 <div class="crumbbar">
-  <span class="lenstabs"><a class="lens" id="lens-fleet" data-act="fleet">fleet</a><a class="lens" id="lens-missions" data-act="missions">missions</a></span>
+  <span class="lenstabs"><a class="lens" id="lens-fleet" data-act="fleet">fleet</a><a class="lens" id="lens-missions" data-act="missions">missions</a><a class="lens" id="lens-lab" data-act="lab">lab</a></span>
   <span class="crumb" id="crumb"></span>
   <span class="meta" id="meta"></span>
 </div>
@@ -793,7 +861,7 @@ recompute();
 // (#691) Default cap on the recent-runs list (newest-first); show-all toggle
 // via state.recentAll. Keeps a busy machine's panel from scrolling unbounded.
 const RECENT_CAP=20;
-let state={level:"fleet",machine:null,session:null,missionId:null,t:tMax,playing:false,timer:null,selected:null,follow:true,speed:1,recentAll:false,activityWindowMin:1440,
+let state={level:"fleet",machine:null,session:null,missionId:null,labRunDir:null,t:tMax,playing:false,timer:null,selected:null,follow:true,speed:1,recentAll:false,activityWindowMin:1440,
   filters:{cat:new Set(FCATS),tier:new Set(FTIERS),src:new Set(FSRC),act:new Set(FACTS),q:""},
   rawOpen:false,
   // (#expand) Open-state of `<details data-expand="<key>">` blocks, keyed so it
@@ -2068,11 +2136,25 @@ function renderCrumb(){
   // with nothing running, primaryMission() is null and the crumb drops the
   // mission link (no stale "◆ m6"). Playback: primaryMission()=missions[0].
   // (#827) Light the active lens. The missions lens covers the index + a
-  // mission detail; everything else is the fleet lens.
+  // mission detail; the lab lens (#1247 Part 3) covers the run list + a run
+  // detail; everything else is the fleet lens.
   const inMissions = state.level==="missions"||state.level==="mission";
-  const lf=$("lens-fleet"), lm=$("lens-missions");
-  if(lf)lf.className="lens"+(inMissions?"":" on");
+  const inLab = state.level==="lab"||state.level==="lab-run";
+  const lf=$("lens-fleet"), lm=$("lens-missions"), ll=$("lens-lab");
+  if(lf)lf.className="lens"+((inMissions||inLab)?"":" on");
   if(lm)lm.className="lens"+(inMissions?" on":"");
+  if(ll)ll.className="lens"+(inLab?" on":"");
+  // (#1247 Part 3) The lab lens is a SEPARATE machine-local room, not a rung
+  // of the fleet drill ladder ("two doors, one viewer, distinct questions" —
+  // operator direction) — it has no time-scrubbing story, so the flow-record
+  // chrome (event log, detail pane, playback scrub bar) is irrelevant and
+  // hidden via this class (see the `.lab-mode` CSS block).
+  document.body.classList.toggle("lab-mode", inLab);
+  if(inLab){
+    let lc=`<a data-act="lab">lab</a>`;
+    if(state.level==="lab-run") lc+=`<span class="sep">›</span>${esc(state.labRunDir||"—")}`;
+    $("crumb").innerHTML=lc; return;
+  }
   // Missions-lens crumb: index → mission detail.
   if(inMissions){
     let mc=`<a data-act="missions">missions</a>`;
@@ -2096,6 +2178,17 @@ function syncTransport(){
   $("clock").textContent=fmt(state.t-tMin)+" / "+fmt(tMax-tMin)+"  ·  "+visible().length+"/"+DATA.length+" rec";
 }
 function render(){
+  // (#1247 Part 3) The lab lens is machine-local run data, not flow records —
+  // it has no time axis, no filters, no event-log pane, so it skips every
+  // flow-scoped call below (renderDetail/renderLog/renderMeta/syncTransport)
+  // that assumes `DATA`/`state.t`/the scrub window. renderCrumb() still runs
+  // first (it lights the lens tab + sets the `.lab-mode` body class the CSS
+  // keys off).
+  if(state.level==="lab"||state.level==="lab-run"){
+    renderCrumb();
+    renderLab();
+    return;
+  }
   if(state.level==="missions")renderMissionsIndex(); else if(state.level==="mission")renderMission(); else if(state.level==="fleet")renderFleet(); else if(state.level==="machine")renderMachine(); else if(state.level==="loose")renderLoose(); else renderSubsystem();
   if(state.follow){ const n=newest(scopedFiltered()); state.selected=n?n._id:null; }
   renderDetail();renderLog();renderCrumb();renderMeta();updateFbtn();
@@ -2414,6 +2507,9 @@ const ACTIONS={
   golive:()=>{ location.href="/"; },
   gomission:id=>{ location.href="/?mission="+encodeURIComponent(id); },
   gosession:id=>{ location.href="/?session="+encodeURIComponent(id); },
+  // (#1247 Part 3) The lab observer lens.
+  lab:()=>goLab(),
+  labrun:a=>drillLabRun(a),
 };
 // (#1090) Shared dispatch for the delegated drill-nav — invoked by BOTH the
 // click handler and the keyboard handler below, so cards are mouse- AND
@@ -3078,6 +3174,324 @@ async function boot(){
   render();
   if(mode==="live"){ startLiveTail(date); startLivePoll(); }
 }
+// ── Lab observer lens (#1247 Part 3) ────────────────────────────────────
+//
+// "I want my lab to be the data accumulated on my machine... Where the
+// fleet drill-down is focused on 'is the work getting done?', the lab view
+// will answer 'does this model do a better job than another for this
+// task?'" (operator direction, #1247). Machine-local by construction: fed
+// entirely by THIS daemon's `/lab/*` endpoints, never the flow stream —
+// "two doors, one viewer, distinct questions". The organizing object is the
+// experiment SERIES (a task/case-set + its sequence of runs with varied
+// knobs), not the individual run; the run detail view is the drill-down
+// leaf, not the headline.
+//
+// State lives in its own globals (LAB_*) rather than DATA/RAW — the lab
+// lens has no time axis to scrub and no flow-record filters, so it doesn't
+// share the fleet/missions lenses' render machinery (see `render()`'s
+// early-return above and the `.lab-mode` CSS block that hides the event
+// log / detail pane / scrub bar while this lens is active).
+let LAB_CONFIGURED = null; // null = not yet fetched
+let LAB_RUNS = [];
+let LAB_DETAIL = null; // {dir, funnels, scores} for the open run
+let LAB_EVENTS = []; // accumulated funnel-events.jsonl records for the open run
+let LAB_EVENTS_OFFSET = 0;
+const LAB_POLL_STEADY_MS = 3000; // cadence once caught up (issue: "every few seconds")
+const LAB_POLL_BACKFILL_MS = 150; // rapid re-poll while draining a backlog (a big historical run's playback)
+
+async function loadLabRuns(){
+  // Static-playback override (the darkmux.com/demo + e2e-harness pattern
+  // already used by `loadMissionsSprints`): a committed fixture stands in
+  // for the daemon's `/lab/runs` when no daemon is behind the page.
+  const src = injectedMeta("darkmux-lab-runs-src") || "/lab/runs";
+  try{
+    const res = await fetch(src, {headers:{accept:"application/json"}});
+    const body = res.ok ? await res.json() : {configured:false, runs:[]};
+    LAB_CONFIGURED = body.configured !== false;
+    LAB_RUNS = Array.isArray(body.runs) ? body.runs : [];
+  }catch(_){ LAB_CONFIGURED=false; LAB_RUNS=[]; }
+}
+async function loadLabRunDetail(dir){
+  try{
+    const res = await fetch("/lab/run/detail?dir="+encodeURIComponent(dir), {headers:{accept:"application/json"}});
+    LAB_DETAIL = res.ok ? await res.json() : null;
+  }catch(_){ LAB_DETAIL=null; }
+}
+// Poll-based tail (NEVER SSE — issue #1227 found a stuck long-lived stream
+// over a tailscale hop drops silently with no client-visible signal; a poll
+// loop self-heals on its own next tick). Self-rescheduling: each call checks
+// it's still the CURRENT run before fetching and before scheduling the next
+// tick, so navigating away (or drilling into a different run) cleanly stops
+// the loop rather than requiring a separate cancel path.
+async function pollLabEvents(dir){
+  if(!(state.level==="lab-run" && state.labRunDir===dir)) return;
+  let body=null;
+  try{
+    const res = await fetch("/lab/run/events?dir="+encodeURIComponent(dir)+"&offset="+LAB_EVENTS_OFFSET, {headers:{accept:"application/json"}});
+    if(res.ok) body = await res.json();
+  }catch(_){ /* transient — retry next tick */ }
+  if(!(state.level==="lab-run" && state.labRunDir===dir)) return; // navigated away mid-fetch
+  let gotLines=0;
+  if(body){
+    if(Array.isArray(body.lines) && body.lines.length){
+      LAB_EVENTS = LAB_EVENTS.concat(body.lines);
+      gotLines = body.lines.length;
+    }
+    if(typeof body.next_offset==="number") LAB_EVENTS_OFFSET = body.next_offset;
+    if(gotLines) renderLabRun(); // in-place refresh of the pipeline + feed
+    if(body.finished && gotLines===0) return; // fully drained a finished run — stop polling
+  }
+  setTimeout(()=>pollLabEvents(dir), gotLines ? LAB_POLL_BACKFILL_MS : LAB_POLL_STEADY_MS);
+}
+window.goLab=async()=>{
+  state.level="lab"; state.labRunDir=null;
+  render(); // paint "loading…" immediately
+  await loadLabRuns();
+  if(state.level==="lab") render();
+};
+window.drillLabRun=async(dir)=>{
+  state.level="lab-run"; state.labRunDir=dir;
+  LAB_DETAIL=null; LAB_EVENTS=[]; LAB_EVENTS_OFFSET=0;
+  render();
+  await loadLabRunDetail(dir);
+  if(!(state.level==="lab-run" && state.labRunDir===dir)) return;
+  render();
+  pollLabEvents(dir);
+};
+
+function shortModel(m){ return String(m||"").replace(/^darkmux:/,""); }
+function labFieldVal(v){ return v==null ? "—" : (typeof v==="string" && v.startsWith("darkmux:") ? shortModel(v) : v); }
+// The series key: sorted case ids joined, so every run over the same corpus
+// groups together regardless of the order darkmux ran them in. A run whose
+// first case hasn't completed yet (case ids not known server-side) falls
+// into its own "(case pending)" bucket rather than silently merging into an
+// unrelated series.
+function labTaskKey(run){
+  return (run.case_ids && run.case_ids.length) ? run.case_ids.slice().sort().join(", ") : "(case pending)";
+}
+function groupLabRunsByTask(runs){
+  const byKey=new Map();
+  runs.forEach(r=>{ const k=labTaskKey(r); if(!byKey.has(k)) byKey.set(k,[]); byKey.get(k).push(r); });
+  const groups=[...byKey.entries()].map(([key,rs])=>({key, runs:rs.slice().sort((a,b)=>b.mtime_ms-a.mtime_ms)}));
+  groups.sort((a,b)=>b.runs[0].mtime_ms-a.runs[0].mtime_ms);
+  return groups;
+}
+function labKnobSummary(run){
+  const st=run.staffing;
+  // Two DISTINCT reasons the snapshot can be absent (verified live against a
+  // real corpus): a run still in flight (no case has completed yet, so no
+  // envelope carries a `staffing` snapshot) vs. a FINISHED run whose
+  // envelope simply predates the field (#1247 Part 1 added it; older
+  // artifacts deserialize `staffing: None`, not "still running").
+  if(!st) return run.finished ? "staffing not recorded (older artifact)" : "staffing pending — first case hasn't completed yet";
+  const probes=st.probes||[];
+  const pbit = probes.length
+    ? probes.length+" probe"+(probes.length===1?"":"s")+" (k="+probes.map(p=>p.k).join(",")+")"
+    : "no probes";
+  const j=st.judge;
+  const jbit = j ? "judge "+shortModel(j.model)+" k="+j.k+" · "+Math.round((j.n_ctx||0)/1000)+"K ctx" : "";
+  return [pbit, jbit].filter(Boolean).join(" · ");
+}
+// The "what changed" line (operator direction, #1247): a run-over-run diff
+// of the RECORDED staffing snapshot — model/k/max_tokens/n_ctx per seat,
+// matched by seat name so a renamed/added/removed seat reads clearly rather
+// than as a positional diff. Computed CLIENT-SIDE from the already-fetched
+// `/lab/runs` staffing snapshots (no new endpoint). A single-variable change
+// renders as a plain diff line; TWO OR MORE changes render as a warning —
+// making the lab-and-the-loop discipline (baseline → single-variable change
+// → re-measure) visible by RENDERING rather than by memory.
+function labKnobDiff(prev, curr){
+  if(!prev || !curr) return null;
+  const changes=[];
+  if((prev.crew||null)!==(curr.crew||null)) changes.push("crew "+labFieldVal(prev.crew)+"→"+labFieldVal(curr.crew));
+  if((prev.exec_mode||null)!==(curr.exec_mode||null)) changes.push("exec_mode "+labFieldVal(prev.exec_mode)+"→"+labFieldVal(curr.exec_mode));
+  const ps=prev.staffing, cs=curr.staffing;
+  if(ps && cs){
+    const byName=arr=>{ const m={}; (arr||[]).forEach(p=>{ m[p.name]=p; }); return m; };
+    const pn=byName(ps.probes), cn=byName(cs.probes);
+    const names=[...new Set([...Object.keys(pn), ...Object.keys(cn)])].sort();
+    names.forEach(n=>{
+      const a=pn[n], b=cn[n];
+      if(a && b){
+        ["model","k","max_tokens","n_ctx"].forEach(f=>{
+          if(a[f]!==b[f]) changes.push(n+"."+f+" "+labFieldVal(a[f])+"→"+labFieldVal(b[f]));
+        });
+      } else if(!a && b){ changes.push("+probe "+n+" ("+shortModel(b.model)+")"); }
+      else if(a && !b){ changes.push("-probe "+n); }
+    });
+    const aj=ps.judge, bj=cs.judge;
+    if(aj && bj){
+      ["model","k","max_tokens","n_ctx"].forEach(f=>{
+        if(aj[f]!==bj[f]) changes.push("judge."+f+" "+labFieldVal(aj[f])+"→"+labFieldVal(bj[f]));
+      });
+    }
+  } else if(ps !== cs){
+    changes.push("staffing snapshot became available");
+  }
+  return changes;
+}
+function labBadge(run){
+  return run.finished
+    ? `<span class="labbadge finished">finished</span>`
+    : `<span class="labbadge live">● live</span>`;
+}
+function labCounts(run){
+  return `bundles ${run.bundles} · flags ${run.raw_flags}→${run.deduped_flags} · confirmed ${run.confirmed} · needs_check ${run.needs_check} · archived ${run.archived}`
+    + (run.degenerate ? ` · <span class="labdegenerate">⚠ degenerate</span>` : "");
+}
+function renderLabRunRow(run){
+  return `<div class="labrunrow" data-act="labrun" data-arg="${esc(run.dir)}" tabindex="0" role="button">
+    <div class="labrunmain">${labBadge(run)}<span class="labruncrew">${esc(run.crew||"(crew unknown)")}</span><span class="labrundir">${esc(run.dir)}</span></div>
+    <div class="labrunmeta">${esc(labKnobSummary(run))}</div>
+    <div class="labrunmeta dim">${labCounts(run)}</div>
+  </div>`;
+}
+function renderLabTaskCard(group){
+  const rows = group.runs.map((r,i)=>{
+    const prev = group.runs[i+1]; // newest-first list; i+1 = the next OLDER run
+    let diffLine="";
+    if(prev){
+      const diff = labKnobDiff(prev, r);
+      if(diff && diff.length){
+        const warn = diff.length > 1;
+        diffLine = `<div class="labdiffline${warn?" warn":""}">${warn?"⚠ multi-variable change: ":"changed vs previous run: "}${esc(diff.join(" · "))}</div>`;
+      } else {
+        diffLine = `<div class="labdiffline dim">no knob change vs previous run</div>`;
+      }
+    }
+    return renderLabRunRow(r) + diffLine;
+  }).join("");
+  return `<div class="labtaskcard">
+    <div class="labtaskhdr">${esc(group.key)} <span class="labtaskcount">${group.runs.length} run${group.runs.length===1?"":"s"}</span></div>
+    ${rows}
+  </div>`;
+}
+function renderLabRunsList(){
+  $("logscope").textContent="lab";
+  if(LAB_CONFIGURED===null){
+    $("stage").innerHTML = `<div class="stagehdr">lab observer</div><div class="none">loading…</div>`;
+    return;
+  }
+  if(LAB_CONFIGURED===false){
+    $("stage").innerHTML = `<div class="stagehdr">lab observer</div>
+      <div class="none">not configured — restart <code>darkmux serve</code> with <code>--lab-dir &lt;path&gt;</code> (or set <code>DARKMUX_LAB_DIR</code>) to scan this machine's lab run history. Machine-local by design — never a remote path.</div>`;
+    return;
+  }
+  const groups = groupLabRunsByTask(LAB_RUNS);
+  const body = groups.length
+    ? groups.map(renderLabTaskCard).join("")
+    : `<div class="none">no lab runs found under the configured lab dir yet — run <code>darkmux lab review-bench --funnel …</code> to produce one.</div>`;
+  $("stage").innerHTML = `<div class="stagehdr">lab observer · ${LAB_RUNS.length} run${LAB_RUNS.length===1?"":"s"} · ${groups.length} task${groups.length===1?"":"s"}</div>
+    <div class="lablist">${body}</div>`;
+}
+
+// ── run detail: pipeline strip + live/playback event feed ──────────────
+
+/// Fold `funnel.step`/`funnel.ruling`/`funnel.task` records (in arrival
+/// order — the SAME code path serves a live-polling run and a finished
+/// run's full backfilled history, so there is exactly one pipeline-
+/// computation function for both) into per-step latest-state + a running
+/// judge-ruling tally. `env` (the completed envelope, when the run has one)
+/// supplies the AUTHORITATIVE confirmed/needs_check/archived totals; before
+/// any case completes, the synthesis row shows a clearly-labeled provisional
+/// tally derived from ruling records instead.
+function computeLabPipeline(events){
+  const steps={};
+  const rulingTally={1:{}, 2:{}};
+  let taskFinished=false;
+  events.forEach(r=>{
+    if(r.action==="funnel.task" && r.payload && r.payload.status==="finished") taskFinished=true;
+    if(r.action==="funnel.step" && r.payload && r.payload.step_id) steps[r.payload.step_id]=r.payload;
+    if(r.action==="funnel.ruling" && r.payload){
+      const p=r.payload.pass, rul=r.payload.ruling;
+      if((p===1||p===2) && rul) rulingTally[p][rul]=(rulingTally[p][rul]||0)+1;
+    }
+  });
+  return {steps, rulingTally, taskFinished};
+}
+function labStageMeta(payload){
+  if(!payload) return "not started";
+  const bits=[payload.status||"—"];
+  if(payload.draws_total!=null) bits.push(`${payload.draws_done||0}/${payload.draws_total} draws${payload.model?" · "+shortModel(payload.model):""}`);
+  else if(payload.items_in!=null || payload.items_out!=null) bits.push(`${payload.items_in??"—"} → ${payload.items_out??"—"}`);
+  return bits.join(" · ");
+}
+function labStageRow(label, payload){
+  const status = payload && payload.status ? payload.status : "pending";
+  return `<div class="labstage ${esc(status)}"><span class="labstagename">${esc(label)}</span><span class="labstagemeta">${esc(labStageMeta(payload))}</span></div>`;
+}
+function renderLabPipeline(pipe, env){
+  const rows=[labStageRow("bundle", pipe.steps["bundle"])];
+  const probeKeys = Object.keys(pipe.steps).filter(k=>k==="probe"||k.indexOf("probe:")===0).sort();
+  if(probeKeys.length) probeKeys.forEach(k=>rows.push(labStageRow(k, pipe.steps[k])));
+  else rows.push(labStageRow("probe", null));
+  rows.push(labStageRow("dedup", pipe.steps["dedup"]));
+  rows.push(labStageRow("judge-pass1", pipe.steps["judge-pass1"]));
+  rows.push(labStageRow("judge-pass2", pipe.steps["judge-pass2"]));
+  const tallyStr=t=>Object.entries(t).map(([k,v])=>k+":"+v).join(" ")||"—";
+  const synthMeta = env
+    ? `confirmed ${env.confirmed} · needs_check ${env.needs_check} · archived ${env.archived}`
+    : `(provisional, from rulings so far) pass1 ${tallyStr(pipe.rulingTally[1])} · pass2 ${tallyStr(pipe.rulingTally[2])}`;
+  rows.push(`<div class="labstage synth"><span class="labstagename">synthesis</span><span class="labstagemeta">${esc(synthMeta)}</span></div>`);
+  return rows.join("");
+}
+function labShortId(id){ const s=String(id||""); return s.length>18 ? s.slice(0,18)+"…" : s; }
+function labFeedTs(ts){ return esc(String(ts||"").replace("T"," ").replace("Z","")); }
+function labFeedRow(r){
+  const tt=labFeedTs(r.ts);
+  const f=r.payload||{};
+  if(r.category==="telemetry" && r.source==="process"){
+    return `<div class="labfeedrow host"><span class="labfeedts">${tt}</span><span class="labfeedtag">host</span><span class="labfeedtext">cpu ${esc(f.cpu??"–")}% · mem ${esc(f.mem??"–")}% · gpu ${esc(f.gpu??"–")}%</span></div>`;
+  }
+  if(r.action==="funnel.ruling"){
+    return `<div class="labfeedrow ruling ${esc(f.ruling||"")}"><span class="labfeedts">${tt}</span><span class="labfeedtag">ruling</span><span class="labfeedtext">${esc(labShortId(f.bundle_id))} pass${esc(f.pass)} → ${esc(f.ruling)}${f.seconds!=null?" ("+Number(f.seconds).toFixed(1)+"s)":""}</span></div>`;
+  }
+  if(r.action==="funnel.step"){
+    return `<div class="labfeedrow step ${esc(f.status||"")}"><span class="labfeedts">${tt}</span><span class="labfeedtag">${esc(f.step_id||"step")}</span><span class="labfeedtext">${esc(labStageMeta(f))}</span></div>`;
+  }
+  if(r.action==="funnel.task"){
+    return `<div class="labfeedrow task ${esc(f.status||"")}"><span class="labfeedts">${tt}</span><span class="labfeedtag">task</span><span class="labfeedtext">${esc(f.status||"")}${f.case_id?" · "+esc(f.case_id):""}</span></div>`;
+  }
+  return `<div class="labfeedrow"><span class="labfeedts">${tt}</span><span class="labfeedtext">${esc(r.action||"")}</span></div>`;
+}
+function renderLabFeed(events){
+  if(!events.length) return `<div class="none">no events yet.</div>`;
+  // Newest at top (issue #1247's "watch it think" narrative).
+  return events.slice().reverse().slice(0,500).map(labFeedRow).join("");
+}
+// The copy-pasteable CLI hint (#915 convention). `--workdirs`/the cases dir
+// aren't recorded in the artifact today (a known gap — the harness doesn't
+// snapshot its own invocation paths), so those two stay explicit
+// placeholders rather than a guess dressed up as fact.
+function labCliHint(env, scores){
+  const crew = (env && env.crew) || (scores && scores.crew) || "<crew>";
+  const mode = (env && env.mode) || (scores && scores.exec_mode) || "auto";
+  return `darkmux lab review-bench --funnel --crew ${crew} --exec-mode ${mode} --workdirs <workdirs-root> <cases-dir>`;
+}
+function renderLabRun(){
+  const dir = state.labRunDir;
+  $("logscope").textContent="lab run";
+  if(!LAB_DETAIL){
+    $("stage").innerHTML = `<div class="stagehdr"><a data-act="lab">‹ lab</a> · ${esc(dir)}</div><div class="none">loading…</div>`;
+    return;
+  }
+  const env = (LAB_DETAIL.funnels && LAB_DETAIL.funnels[0]) || null;
+  const scores = LAB_DETAIL.scores || null;
+  const pipe = computeLabPipeline(LAB_EVENTS);
+  const finished = !!env || pipe.taskFinished || (scores!=null);
+  $("stage").innerHTML = `
+    <div class="stagehdr"><a data-act="lab">‹ lab</a> · ${esc(dir)} ${finished?labBadge({finished:true}):labBadge({finished:false})}</div>
+    <div class="labpipe">${renderLabPipeline(pipe, env)}</div>
+    <div class="labcli"><span class="labclilbl">try it yourself</span><code>${esc(labCliHint(env, scores))}</code></div>
+    <div class="labfeedwrap">
+      <div class="labfeedhdr">event feed${finished?" (playback)":" — live, polling"} · ${LAB_EVENTS.length} record${LAB_EVENTS.length===1?"":"s"}</div>
+      <div class="labfeed">${renderLabFeed(LAB_EVENTS)}</div>
+    </div>`;
+}
+function renderLab(){
+  if(state.level==="lab-run") renderLabRun(); else renderLabRunsList();
+}
+
 boot();
 </script>
 </body>

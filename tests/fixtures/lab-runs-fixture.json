@@ -1,0 +1,72 @@
+{
+  "configured": true,
+  "runs": [
+    {
+      "dir": "demo-case/run2",
+      "mtime_ms": 1893456000000,
+      "case_ids": ["demo-case-a"],
+      "crew": "demo-crew",
+      "exec_mode": "sequential",
+      "profile": "demo-profile",
+      "staffing": {
+        "probes": [
+          {"name": "demo-probe", "model": "darkmux:demo-probe-model", "k": 2, "n_ctx": 32768, "max_tokens": 3000}
+        ],
+        "judge": {"name": "demo-judge", "model": "darkmux:demo-judge-model", "k": 3, "n_ctx": 65536, "max_tokens": 20000}
+      },
+      "bundles": 12,
+      "raw_flags": 18,
+      "deduped_flags": 14,
+      "confirmed": 5,
+      "needs_check": 2,
+      "archived": 7,
+      "degenerate": false,
+      "finished": true,
+      "has_funnels": true,
+      "has_events": true
+    },
+    {
+      "dir": "demo-case/run1",
+      "mtime_ms": 1893452400000,
+      "case_ids": ["demo-case-a"],
+      "crew": "demo-crew",
+      "exec_mode": "sequential",
+      "profile": "demo-profile",
+      "staffing": {
+        "probes": [
+          {"name": "demo-probe", "model": "darkmux:demo-probe-model", "k": 1, "n_ctx": 32768, "max_tokens": 3000}
+        ],
+        "judge": {"name": "demo-judge", "model": "darkmux:demo-judge-model", "k": 3, "n_ctx": 65536, "max_tokens": 20000}
+      },
+      "bundles": 12,
+      "raw_flags": 15,
+      "deduped_flags": 11,
+      "confirmed": 4,
+      "needs_check": 1,
+      "archived": 6,
+      "degenerate": false,
+      "finished": true,
+      "has_funnels": true,
+      "has_events": true
+    },
+    {
+      "dir": "demo-live/gate",
+      "mtime_ms": 1893456500000,
+      "case_ids": ["demo-case-b"],
+      "crew": "demo-gate-crew",
+      "exec_mode": "parallel",
+      "profile": null,
+      "staffing": null,
+      "bundles": 9,
+      "raw_flags": 0,
+      "deduped_flags": 0,
+      "confirmed": 0,
+      "needs_check": 0,
+      "archived": 0,
+      "degenerate": false,
+      "finished": false,
+      "has_funnels": false,
+      "has_events": true
+    }
+  ]
+}

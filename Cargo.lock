@@ -525,6 +525,7 @@ dependencies = [
  "darkmux-eureka",
  "darkmux-fleet",
  "darkmux-flow",
+ "darkmux-lab",
  "darkmux-profiles",
  "darkmux-types",
  "futures",

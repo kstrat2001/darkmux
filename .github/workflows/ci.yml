@@ -170,6 +170,7 @@ jobs:
               - 'docs/demo/**'
               - 'tests/fixtures/xss-flow.jsonl'
               - 'tests/fixtures/lifecycle-flow.jsonl'
+              - 'tests/fixtures/lab-runs-fixture.json'
               - 'tests/e2e/**'
               - '.github/workflows/ci.yml'
 

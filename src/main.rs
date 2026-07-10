@@ -303,6 +303,15 @@ enum Cmd {
         /// Directory to serve flow records from (default: ~/.darkmux/flows/).
         #[arg(long = "flows-dir")]
         flows_dir: Option<std::path::PathBuf>,
+        /// (#1247 Part 3) Root directory the lab observer lens scans for run
+        /// clusters (any dir containing funnels.json / funnel-events.jsonl /
+        /// scores.json). Falls back to `DARKMUX_LAB_DIR` when unset; unset
+        /// entirely by default — no default scanning of arbitrary paths, the
+        /// lab lens stays "not configured" until named. Machine-local by
+        /// design: this daemon only ever reads ITS OWN machine's runs, never
+        /// a remote path.
+        #[arg(long = "lab-dir")]
+        lab_dir: Option<std::path::PathBuf>,
     },
     /// Optimize for your workload — guided wizard (Phase 1 scaffold).
     /// Composes scan, lab characterize/tune, heuristics, and eureka rules
@@ -1622,9 +1631,15 @@ fn run(cmd: Cmd) -> Result<i32> {
             port,
             bind,
             flows_dir,
+            lab_dir,
         } => {
             let flows_dir = flows_dir.unwrap_or_else(crate::flow::flows_dir);
-            serve::run(port, bind, flows_dir)?;
+            // (#1247 Part 3) `--lab-dir` > `DARKMUX_LAB_DIR` > unset. No
+            // config.json tier and no built-in default — see the flag's doc
+            // comment: the lab lens only ever reads a directory the operator
+            // explicitly named.
+            let lab_dir = lab_dir.or_else(|| std::env::var("DARKMUX_LAB_DIR").ok().map(std::path::PathBuf::from));
+            serve::run(port, bind, flows_dir, lab_dir)?;
             Ok(0)
         }
         Cmd::Optimize => optimize::run(),
