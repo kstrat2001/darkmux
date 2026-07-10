@@ -16,6 +16,27 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 - **`darkmux-review.yml` dispatches the review funnel instead of a single reviewer** (#1222 Phase B, packet 6) — the self-hosted PR-review workflow now runs `darkmux pr-review run`, which drives a saved **crew** (`~/.darkmux/profiles.json` `crews`, Phase B packet 1) through a `review-probe` seat that argues the diff and a `review-judge` seat that weighs the probes' findings, replacing the old single tool-less `pr-reviewer` dispatch outright (pre-1.0, no compat shim). Workflow inputs move from `role`/`profile` to `crew`/`mode`/`k`; model selection stays entirely on the runner (#1054) — the workflow file never names a model, only a crew. `.github/DARKMUX_REVIEW_RUNNER.md` documents the new flow plus a Studio migration checklist (a copy-pasteable `review-deep` crew for a 32GB tier) and the `DARKMUX_REVIEW_CREW` repo-variable override. **Release gate: no version tags this until the labeled-corpus recall/precision validation (#1119) shows the funnel at parity with or ahead of the single-reviewer baseline it replaces** — the dispatch path is complete but not yet measured against the review arc's own bake-off discipline.
 - **Host telemetry sampling during funnel runs** (#1247 doctrine surface — "No blind runs") — `darkmux pr-review run` and `lab review-bench --funnel` now sample host cpu/ram/gpu at ~2s cadence for the whole funnel run's lifetime, same mechanism and record shape (`category=telemetry, source="process", action="telemetry.process"`) the container dispatch path's always-on sampler already produces (#1064), so the run-monitor/viewer renders it unchanged. Samples stream through the SAME injected sink each caller already wires — per-run-local `funnel-events.jsonl` for a bench run, the fleet flow stream for a real `pr-review run` — so a contention-tainted funnel run (e.g. a concurrent `cargo test` build eating inference bandwidth) is now visible in the artifact instead of only reconstructible from LMStudio's own server logs. Lifecycle is RAII-tied to `FunnelBookendGuard`: the sampler starts when the guard is built and stops on every exit path (clean finish, early `?`-return, or panic) — no orphaned sampler thread.
 
+## [1.17.1] - 2026-07-10
+
+The canary-day patch: three production findings from the Studio's first hours running the
+funnel, fixed same-day.
+
+### Fixed
+- One invalid crew in `profiles.json` no longer fails the ENTIRE registry load — crew
+  validation moved to resolve time (its doctrinal home); `darkmux doctor` gains a per-crew
+  validation check; a genuine registry parse failure is one clear hard error instead of the
+  deprecated probe fallback (#1269, #1270).
+- The funnel's sequential cycler reconciles a same-model resident loaded at a different
+  context (darkmux-owned: unload + reload at the required ctx; user-owned: an actionable
+  error naming the instance) instead of attempting a doomed second load that LMStudio's
+  guardrail refuses on 32 GB machines; explicit-alias residents reuse correctly; reuse at a
+  larger ctx leaves a log breadcrumb (#1271, #1275).
+- Production funnel runs now emit `dispatch.start`/terminal bookends (RAII-guaranteed on all
+  exit paths, `source: "funnel"`) so a live PR review is visible as a running dispatch in the
+  viewer's fleet and machine views (#1272, #1277).
+
+[1.17.1]: https://github.com/kstrat2001/darkmux/releases/tag/v1.17.1
+
 ## [1.17.0] - 2026-07-10
 
 The review-funnel release: PR review graduates from a single reviewer dispatch to a measured
