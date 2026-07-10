@@ -86,13 +86,16 @@
 //!   probe seat — a future graph engine renders these as PARALLEL sibling
 //!   steps under `probe`, #1230's parallel-step vision) | `dedup` |
 //!   `judge-pass1` | `judge-pass2`. Seat-level (`probe:*`) records carry
-//!   extra `model`/`draws_done`/`draws_total`/`tokens` fields. Pass-2's
-//!   docket size is only known once the interleaved per-flag judge loop
-//!   finishes (a `confirmed` pass-1 gets a pass-2, decided per-flag, not in
-//!   a separate batch) — its `started` and `finished` records are therefore
-//!   emitted back-to-back at that point, both carrying the real elapsed
-//!   `wall_ms`, rather than a `started` record with a foreknown-but-false
-//!   docket size.
+//!   extra `model`/`draws_done`/`draws_total`/`tokens` fields. A `confirmed`
+//!   pass-1 gets its pass-2 ruling immediately, interleaved within the SAME
+//!   per-flag judge loop as pass-1 — so `judge-pass2`'s `started` record
+//!   opens the moment the FIRST pass-2 ruling actually fires (`items_in` is
+//!   the running count at that point, not the final docket size), rather
+//!   than waiting for the whole loop to finish. Opening it late let a live
+//!   observer see `funnel.ruling{pass:2}` records stream in while the
+//!   `judge-pass2` step still read "not started" — a real contradiction
+//!   caught live in the lab lens. `finished` closes once the loop
+//!   completes, carrying the real final docket size and elapsed `wall_ms`.
 //! - `funnel.ruling` — the live ticker: one record per judge ruling (every
 //!   pass-1, plus pass-2 when it ran) with `bundle_id`/`pass`/`ruling`/
 //!   `seconds`.
@@ -1822,6 +1825,27 @@ fn finish_funnel(
         }));
         if let Some(p2) = &outcome.pass2 {
             pass2_flags += 1;
+            if pass2_flags == 1 {
+                // A `confirmed` pass-1 gets its pass-2 ruling immediately,
+                // interleaved within THIS per-flag loop (see the module
+                // doc) — so the `judge-pass2` step must open the moment the
+                // FIRST pass-2 ruling actually fires, not once the whole
+                // docket is known. Opening it only after the loop finishes
+                // (the prior behavior) let `funnel.ruling{pass:2}` records
+                // stream to a live observer while the `judge-pass2` step
+                // still read "not started" — a contradiction observed live
+                // in the lab lens. `items_in` here is the running count (1
+                // so far); `step_finished` below reports the real final
+                // docket size.
+                guard.step_started(
+                    "judge-pass2",
+                    "dispatch",
+                    json!({
+                        "step_id": "judge-pass2", "kind": "dispatch", "status": "started",
+                        "items_in": pass2_flags, "items_out": 0, "wall_ms": 0,
+                    }),
+                );
+            }
             guard.ruling(json!({
                 "bundle_id": flag.bundle_id, "pass": 2,
                 "ruling": p2.ruling, "seconds": p2.seconds,
@@ -1868,19 +1892,10 @@ fn finish_funnel(
             items_out: pass2_flags,
             wall_ms: pass2_ms,
         });
-        // Pass-2's docket size is only known once the interleaved per-flag
-        // loop above finishes (see the module doc) — `started`/`finished`
-        // land back-to-back here, both carrying the real elapsed `wall_ms`,
-        // rather than a `started` record with a foreknown-but-false docket
-        // size.
-        guard.step_started(
-            "judge-pass2",
-            "dispatch",
-            json!({
-                "step_id": "judge-pass2", "kind": "dispatch", "status": "started",
-                "items_in": pass2_flags, "items_out": 0, "wall_ms": 0,
-            }),
-        );
+        // `started` was already emitted above, in the per-flag loop, the
+        // moment the first pass-2 ruling fired — this only closes it, now
+        // that the loop has finished and the real final docket size +
+        // elapsed `wall_ms` are known.
         guard.step_finished(
             "judge-pass2",
             json!({
@@ -2743,6 +2758,31 @@ mod tests {
         assert!(passes.contains(&1));
         assert!(passes.contains(&2));
 
+        // Truthful ordering (the bug this test guards): `judge-pass2`'s
+        // `started` step record must be emitted AT OR BEFORE the first
+        // `pass:2` ruling — never after. A pass-2 ruling streaming to a live
+        // observer while the `judge-pass2` step still reads "not started"
+        // is exactly the contradiction fixed here.
+        let pass2_started_idx = emitter
+            .records
+            .iter()
+            .position(|r| {
+                r.action == "funnel.step"
+                    && r.payload.as_ref().unwrap()["step_id"] == json!("judge-pass2")
+                    && r.payload.as_ref().unwrap()["status"] == json!("started")
+            })
+            .expect("judge-pass2 started record emitted");
+        let first_pass2_ruling_idx = emitter
+            .records
+            .iter()
+            .position(|r| r.action == "funnel.ruling" && r.payload.as_ref().unwrap()["pass"] == json!(2))
+            .expect("a pass-2 ruling record emitted");
+        assert!(
+            pass2_started_idx < first_pass2_ruling_idx,
+            "judge-pass2 started (record {pass2_started_idx}) must precede the first pass-2 ruling \
+             (record {first_pass2_ruling_idx}) — a pass-2 ruling must never precede judge-pass2 started"
+        );
+
         // Provenance: every record carries the case id as session_id and
         // the crew name as handle, matching `crew dispatch`'s own
         // handle=role_id / session_id=dispatch-identity convention.
@@ -2908,8 +2948,12 @@ mod tests {
 
     /// The genuine mid-docket abort vector: the judge's `cycler.release`
     /// failing AFTER `judge-pass1 started` was emitted and the docket ran.
-    /// The guard must close `judge-pass1` with `status: "error"` and emit
-    /// the terminal error task record.
+    /// This scenario's flag confirms on both passes, so `judge-pass2 started`
+    /// also fired mid-loop (the fix under test) and is STILL open at the
+    /// release failure (its `finished` only emits after `cycler.release`
+    /// returns). The guard must close both, innermost-first — `judge-pass2`
+    /// (opened last) before `judge-pass1` — with `status: "error"`, then
+    /// emit the terminal error task record.
     #[test]
     fn bookend_guard_judge_release_failure_closes_judge_pass1_and_task() {
         /// Cycler whose `release` fails for one named model id.
@@ -2956,14 +3000,25 @@ mod tests {
         let last = emitter.records.last().unwrap();
         assert_eq!(last.action, "funnel.task");
         assert_eq!(last.payload.as_ref().unwrap()["status"].as_str(), Some("error"));
+        // Innermost-first: `judge-pass2` (opened last, mid-loop, once its
+        // first pass-2 ruling fired) closes before `judge-pass1` (opened
+        // first, before the loop).
         let second_to_last = &emitter.records[emitter.records.len() - 2];
         assert_eq!(second_to_last.action, "funnel.step");
         assert_eq!(
             second_to_last.payload.as_ref().unwrap()["step_id"].as_str(),
             Some("judge-pass1"),
-            "judge-pass1 was the open step at the release failure"
+            "judge-pass1 was the outermost open step at the release failure"
         );
         assert_eq!(second_to_last.payload.as_ref().unwrap()["status"].as_str(), Some("error"));
+        let third_to_last = &emitter.records[emitter.records.len() - 3];
+        assert_eq!(third_to_last.action, "funnel.step");
+        assert_eq!(
+            third_to_last.payload.as_ref().unwrap()["step_id"].as_str(),
+            Some("judge-pass2"),
+            "judge-pass2 was ALSO open (its ruling already fired mid-loop) and closes first, innermost"
+        );
+        assert_eq!(third_to_last.payload.as_ref().unwrap()["status"].as_str(), Some("error"));
         // The rulings the docket DID produce before the abort are on the
         // stream — partial progress is preserved, not retconned.
         assert!(emitter.records.iter().any(|r| r.action == "funnel.ruling"));
