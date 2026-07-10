@@ -253,6 +253,18 @@ pub fn max_tokens_per_call() -> Option<u32> {
     let cfg = config().runtime.as_ref().and_then(|r| r.max_tokens_per_call);
     pick_parsed("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL", cfg, None)
 }
+
+// ── Remote (hosted-endpoint) dispatch (#1260/#1177) ──
+/// The per-EXECUTION remote token allowance — an execution is one pipeline
+/// stage (the funnel's probe pass, each judge pass, the verify pass; a bare
+/// crew dispatch is one execution). Only REMOTE (endpoint-staffed) calls
+/// draw from it. Resolves `env(DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION) >
+/// config.remote.max_tokens_per_execution > 500000` (operator decision on
+/// #1260 — tokens only, never currency).
+pub fn remote_max_tokens_per_execution() -> u64 {
+    let cfg = config().remote.as_ref().and_then(|r| r.max_tokens_per_execution);
+    pick_parsed("DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION", cfg, Some(500_000)).unwrap()
+}
 pub fn default_role() -> Option<String> {
     let cfg = config().runtime.as_ref().and_then(|r| r.default_role.as_deref());
     pick_string("DARKMUX_DEFAULT_ROLE", cfg, None)
@@ -879,6 +891,28 @@ mod tests {
             match prev {
                 Some(v) => std::env::set_var("DARKMUX_INJECTED_CONTEXT_FRACTION", v),
                 None => std::env::remove_var("DARKMUX_INJECTED_CONTEXT_FRACTION"),
+            }
+        }
+    }
+
+    // ── remote_max_tokens_per_execution (#1260): env > config > 500000 ──
+    #[serial_test::serial]
+    #[test]
+    fn remote_max_tokens_per_execution_env_then_default() {
+        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION";
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::remove_var(k); }
+        // No env + the empty test config (#811) → the built-in 500K default.
+        assert_eq!(remote_max_tokens_per_execution(), 500_000);
+        unsafe { std::env::set_var(k, "25000"); }
+        assert_eq!(remote_max_tokens_per_execution(), 25_000, "env tier wins live");
+        // An unparseable env value falls through to the default, never panics.
+        unsafe { std::env::set_var(k, "half-a-million"); }
+        assert_eq!(remote_max_tokens_per_execution(), 500_000);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
             }
         }
     }

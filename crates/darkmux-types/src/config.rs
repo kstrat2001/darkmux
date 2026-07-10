@@ -31,7 +31,10 @@ use std::path::Path;
 // 1.1 (#933): additive `fleet{}` block (fleet.mode). Minor bump — an older
 // binary tolerates it (all-Option + `extras` overflow), per the lenient-read
 // doctrine.
-pub const CONFIG_SCHEMA_VERSION: &str = "1.1";
+// 1.2 (#1260/#1177): additive `remote{}` block (remote.max_tokens_per_execution
+// — the per-pipeline-stage remote token allowance for endpoint-staffed crew
+// seats). Minor bump, same lenient-read reasoning.
+pub const CONFIG_SCHEMA_VERSION: &str = "1.2";
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
 /// `None`, so a fresh/empty config serializes to `{}` and any field absent
@@ -64,6 +67,8 @@ pub struct DarkmuxConfig {
     pub runtime: Option<RuntimeBehaviorConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fleet: Option<FleetConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteConfig>,
 
     /// Forward-compat overflow — unknown top-level keys land here and
     /// re-serialize flat (a newer config read by an older binary).
@@ -184,6 +189,30 @@ pub struct FleetConfig {
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
+/// (#1260/#1177) Remote (hosted-endpoint) dispatch knobs — the config home
+/// for the per-execution token bucket the review funnel enforces on
+/// endpoint-staffed seats. Unlike `redis{}`/`audit{}` there is NO `enabled`
+/// gate: remote staffing is enabled by the profile itself (endpoint present
+/// on the staffing's model — contract 1, profile uniformity), so the block
+/// carries only the allowance knob. `darkmux init` writes it visible with
+/// the default populated, per the visible-defaults doctrine.
+///
+/// **What an "execution" is (operator decision, 2026-07-10 design chat):**
+/// one pipeline stage — the funnel's probe pass, each judge pass, the
+/// verify pass; a bare `crew dispatch` is one execution. Each stage's
+/// REMOTE calls draw from their own allowance, so a runaway stage is caught
+/// at the cap without starving later stages. Tokens only — never currency.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RemoteConfig {
+    /// Max remote `total_tokens` one pipeline stage may spend (default
+    /// 500000). When a stage exhausts it, that stage's remaining remote
+    /// calls stop with the reason named in the run's envelope: a
+    /// load-bearing stage (judge/verify) exhausting is an honest degraded
+    /// run; probe exhaustion is a reduced-coverage warning.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub max_tokens_per_execution: Option<u64>,
+    #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
 /// A machine's declared fleet position. `Standalone` (default) = a
 /// single-machine install with no fleet; `Hub` = the always-on coordinator
 /// (and, per #936, supervises its own Redis); `Peer` = points at a hub.
@@ -289,6 +318,10 @@ impl DarkmuxConfig {
                 mode: Some("standalone".to_string()),
                 extras: Default::default(),
             }),
+            remote: Some(RemoteConfig {
+                max_tokens_per_execution: Some(500_000),
+                extras: Default::default(),
+            }),
             extras: Default::default(),
         }
     }
@@ -349,11 +382,16 @@ mod tests {
         // (#933) The fleet block is written visible at the standalone default,
         // so the fleet surface is discoverable + one edit from hub/peer.
         assert_eq!(cfg.fleet.as_ref().unwrap().mode.as_deref(), Some("standalone"));
+        // (#1260) The remote block is written visible with the per-execution
+        // token allowance populated — no `enabled` gate, since remote staffing
+        // is enabled by the profile's own endpoint declaration (contract 1).
+        assert_eq!(cfg.remote.as_ref().unwrap().max_tokens_per_execution, Some(500_000));
         // Lossless round-trip.
         let back: DarkmuxConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.redis.as_ref().unwrap().enabled, Some(false));
         assert_eq!(back.audit.as_ref().unwrap().dir.as_deref(), Some("~/.darkmux/audit"));
         assert_eq!(back.fleet.as_ref().unwrap().mode.as_deref(), Some("standalone"));
+        assert_eq!(back.remote.as_ref().unwrap().max_tokens_per_execution, Some(500_000));
     }
 
     /// (#933) `FleetMode::parse` is lenient (trim + case-insensitive) and

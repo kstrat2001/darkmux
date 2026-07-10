@@ -1606,11 +1606,12 @@ fn review_bench_funnel_preflight_validates_seat_requirements_before_dispatch() {
 #[test]
 fn review_bench_funnel_preflight_fails_loud_on_crew_own_resolve_crew_error() {
     // (#1269) The registry LOADS fine (a bad crew no longer fails load), but
-    // this specific crew fails at `resolve_crew` itself (a remote-endpoint
-    // seat, rejected only at resolution — not a funnel-specific seat-shape
-    // gap like the sibling test above). The funnel preflight must still
-    // fail loud, BEFORE the per-case table header prints, naming the
-    // specific resolve_crew error.
+    // this specific crew fails at `resolve_crew` itself (a LOCAL staffing
+    // whose model omits `n_ctx`, #1282 — not a funnel-specific seat-shape
+    // gap like the sibling test above; the original remote-endpoint fixture
+    // became a LEGAL crew when #1260 lifted the local-only fence). The
+    // funnel preflight must still fail loud, BEFORE the per-case table
+    // header prints, naming the specific resolve_crew error.
     let tmp = TempDir::new().unwrap();
     let cases_dir = tmp.path().join("cases");
     fs::create_dir_all(&cases_dir).unwrap();
@@ -1631,19 +1632,16 @@ fn review_bench_funnel_preflight_fails_loud_on_crew_own_resolve_crew_error() {
                 "fast": {
                     "models": [{"id": "model-a", "n_ctx": 32000}]
                 },
-                "cloud": {
-                    "models": [
-                        {"id": "gpt-remote", "n_ctx": 100000,
-                         "endpoint": {"url": "https://example.azure.com/openai"}}
-                    ]
+                "ctxless": {
+                    "models": [{"id": "local-b"}]
                 }
             },
             "default_profile": "fast",
             "crews": {
-                "remote-crew": {
+                "broken-crew": {
                     "seats": {
-                        "review-probe": [{"profile": "cloud", "k": 2}],
-                        "review-judge": [{"profile": "cloud"}]
+                        "review-probe": [{"profile": "ctxless", "k": 2}],
+                        "review-judge": [{"profile": "fast"}]
                     }
                 }
             }
@@ -1662,15 +1660,13 @@ fn review_bench_funnel_preflight_fails_loud_on_crew_own_resolve_crew_error() {
             "--workdirs",
             workdirs.to_str().unwrap(),
             "--crew",
-            "remote-crew",
+            "broken-crew",
             "--profiles-file",
             profiles_path.to_str().unwrap(),
         ])
         .assert()
         .failure()
-        .stderr(
-            predicate::str::contains("remote endpoint").and(predicate::str::contains("local-only")),
-        )
+        .stderr(predicate::str::contains("n_ctx").and(predicate::str::contains("review-probe")))
         .stdout(predicate::str::contains("outcome").not());
 }
 

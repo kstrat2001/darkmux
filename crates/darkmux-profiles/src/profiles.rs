@@ -385,10 +385,13 @@ mod tests {
         assert_eq!(crew.seats.len(), 2);
     }
 
-    /// The #1269 regression: one crew with a remote-endpoint seat (rejected
-    /// only at RESOLUTION time, not schema time) must not fail registry
-    /// load, and a sibling profile must be fully usable via `get_profile`
-    /// while `resolve_crew` on the bad crew fails with the named error.
+    /// The #1269 regression: one crew that fails RESOLUTION (not schema
+    /// parsing — here a LOCAL staffing whose model omits `n_ctx`, #1282)
+    /// must not fail registry load, and a sibling profile must be fully
+    /// usable via `get_profile` while `resolve_crew` on the bad crew fails
+    /// with the named error. (The original fixture used a remote-endpoint
+    /// seat, which #1260 made legal — the isolation property under test is
+    /// unchanged.)
     #[test]
     fn invalid_crew_does_not_fail_registry_load_sibling_profile_still_works() {
         let tmp = TempDir::new().unwrap();
@@ -397,13 +400,10 @@ mod tests {
             &p,
             r#"{"profiles":{
                     "fast":{"models":[{"id":"a","n_ctx":1000}]},
-                    "cloud":{"models":[
-                        {"id":"gpt-remote","n_ctx":100000,
-                         "endpoint":{"url":"https://example.azure.com/openai"}}
-                    ]}
+                    "ctxless":{"models":[{"id":"local-b"}]}
                 },
                 "default_profile":"fast",
-                "crews":{"bad":{"seats":{"review-probe":[{"profile":"cloud"}]}}}}"#,
+                "crews":{"bad":{"seats":{"review-probe":[{"profile":"ctxless"}]}}}}"#,
         );
         let loaded = load_registry(Some(p.to_str().unwrap())).unwrap();
         assert!(loaded.registry.crews.contains_key("bad"));
@@ -412,12 +412,12 @@ mod tests {
         let fast = get_profile(&loaded.registry, "fast").unwrap();
         assert_eq!(fast.models.len(), 1);
 
-        // resolve_crew on the bad crew still fails, with the same specific
-        // error `validate_crew` used to raise at load time.
+        // resolve_crew on the bad crew still fails, with the crew/seat and
+        // the missing field named.
         let err = crate::crews::resolve_crew(&loaded.registry, "bad").unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("remote endpoint"));
-        assert!(msg.contains("local-only"));
+        assert!(msg.contains("n_ctx"), "names the missing field: {msg}");
+        assert!(msg.contains("review-probe"), "names the seat: {msg}");
     }
 
     #[test]
@@ -466,23 +466,25 @@ mod tests {
         assert!(err.to_string().contains("not found in profile"));
     }
 
+    /// (#1260, contract 1) A remote-endpoint staffing loads AND resolves —
+    /// the v1 local-only fence is gone; the profile's endpoint declaration
+    /// is the routing signal, not a crew-side legality question.
     #[test]
-    fn validates_crew_remote_endpoint_staffing_does_not_fail_load() {
+    fn remote_endpoint_staffing_loads_and_resolves() {
         let tmp = TempDir::new().unwrap();
         let p = tmp.path().join("profiles.json");
         write(
             &p,
             r#"{"profiles":{"cloud":{"models":[
-                    {"id":"gpt-remote","n_ctx":100000,
+                    {"id":"gpt-remote",
                      "endpoint":{"url":"https://example.azure.com/openai"}}
                 ]}},
-                "crews":{"bad":{"seats":{"review-probe":[{"profile":"cloud"}]}}}}"#,
+                "crews":{"hosted":{"seats":{"review-judge":[{"profile":"cloud"}]}}}}"#,
         );
         let loaded = load_registry(Some(p.to_str().unwrap())).unwrap();
-        let err = crate::crews::resolve_crew(&loaded.registry, "bad").unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("remote endpoint"));
-        assert!(msg.contains("local-only"));
+        let crew = crate::crews::resolve_crew(&loaded.registry, "hosted")
+            .expect("remote staffing resolves (#1260)");
+        assert!(crew.seats.get("review-judge").unwrap()[0].pm.is_remote());
     }
 
     #[test]

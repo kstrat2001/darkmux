@@ -34,7 +34,10 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use darkmux_crew::dispatch::build_dispatch_record_with_payload;
-use darkmux_crew::single_shot::{single_shot_chat, SingleShotReply, SingleShotRequest};
+use darkmux_crew::single_shot::{
+    single_shot_chat, single_shot_chat_hosted, HostedSingleShotRequest, SingleShotReply,
+    SingleShotRequest,
+};
 use darkmux_lab::lab::bundle::{
     build_bundles, external_bundles, slice_code, slice_code_probe, BundleSet, FileSource,
 };
@@ -852,8 +855,21 @@ impl FunnelEmitter for FleetFlowEmitter {
 /// staffed seats at all (a case `run_dispatch`'s own validation already
 /// rejects before this ever runs).
 fn crew_model_summary(crew: &ResolvedCrew) -> Option<String> {
-    let mut ids: Vec<String> =
-        crew.seats.values().flatten().map(|s| swap::namespaced_identifier(&s.pm)).collect();
+    // (#1260) Remote seats keep the profile's bare model id — nothing is
+    // loaded in LMStudio, so no darkmux-namespaced identifier exists for
+    // them; local seats keep the namespaced form.
+    let mut ids: Vec<String> = crew
+        .seats
+        .values()
+        .flatten()
+        .map(|s| {
+            if s.pm.is_remote() {
+                s.pm.id.clone()
+            } else {
+                swap::namespaced_identifier(&s.pm)
+            }
+        })
+        .collect();
     ids.sort();
     ids.dedup();
     if ids.is_empty() {
@@ -984,13 +1000,22 @@ fn with_dispatch_bookends(
     guard.armed = false;
     match result {
         Ok(env) => {
+            let mut payload = json!({ "runtime": "funnel", "result_class": "ok" });
+            // (#1260/#1186) Remote-seat tokens ride the dispatch bookend too,
+            // so downstream token-accounting surfaces can EXCLUDE cloud
+            // tokens from local-savings math without opening the envelope.
+            if env.members.iter().any(|m| m.remote) {
+                let remote_tokens: u64 =
+                    env.members.iter().filter(|m| m.remote).map(|m| m.total_tokens).sum();
+                payload["remote_tokens"] = remote_tokens.into();
+            }
             guard.emitter.emit(funnel_bookend_record(
                 darkmux_flow::Level::Info,
                 "dispatch complete",
                 crew_name,
                 case_id,
                 model,
-                json!({ "runtime": "funnel", "result_class": "ok" }),
+                payload,
             ));
             Ok(env)
         }
@@ -1099,6 +1124,11 @@ fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<FunnelEnvelope> {
         probe_system: &probe_system,
         judge_system: &judge_system,
         bundles: Some(bundles),
+        // (#1260) The per-execution remote token allowance, resolved through
+        // the one precedence home (`env > config.remote.* > 500000`) — only
+        // endpoint-staffed seats draw from it.
+        remote_max_tokens_per_execution:
+            darkmux_types::config_access::remote_max_tokens_per_execution(),
     };
 
     // (#1272) Bookend identity, captured before `inputs`/`crew` are moved
@@ -1111,16 +1141,31 @@ fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<FunnelEnvelope> {
     let model_for_bookends = crew_model_summary(&crew);
 
     let timeout = opts.timeout;
+    // (#1260) Route on what the seat's profile declares (contract 1): an
+    // endpoint-bearing call goes through the hosted dialect (Azure
+    // api-version + Keychain auth + max_completion_tokens — the transport
+    // `dispatch_remote` proved); a local call goes through LMStudio. The
+    // system/user texts are identical either way (contract 6).
     let mut chat = move |call: &ChatCall| -> Result<SingleShotReply> {
-        single_shot_chat(&SingleShotRequest {
-            base_url: None,
-            model: call.model,
-            system: call.system,
-            user: call.user,
-            temperature: call.temperature,
-            max_tokens: call.max_tokens,
-            timeout_seconds: timeout,
-        })
+        match call.endpoint {
+            Some(endpoint) => single_shot_chat_hosted(&HostedSingleShotRequest {
+                endpoint,
+                model: call.model,
+                system: call.system,
+                user: call.user,
+                max_tokens: call.max_tokens,
+                timeout_seconds: timeout,
+            }),
+            None => single_shot_chat(&SingleShotRequest {
+                base_url: None,
+                model: call.model,
+                system: call.system,
+                user: call.user,
+                temperature: call.temperature,
+                max_tokens: call.max_tokens,
+                timeout_seconds: timeout,
+            }),
+        }
     };
     let mut cycler = LmsCycler;
     let mut emitter = FleetFlowEmitter;

@@ -907,7 +907,9 @@ fn try_resolve_remote_target(
 /// The chat-completions URL: `{base}/chat/completions` (+ `?api-version=` for
 /// Azure). The operator's `endpoint.url` is the base up to `/chat/completions`
 /// (an Azure deployment URL, or e.g. `https://api.openai.com/v1`).
-fn remote_chat_url(ep: &darkmux_types::ModelEndpoint) -> String {
+/// `pub(crate)` (#1260) — `single_shot.rs`'s hosted single-shot path reuses
+/// the exact URL/auth/POST chain rather than re-deriving the Azure dialect.
+pub(crate) fn remote_chat_url(ep: &darkmux_types::ModelEndpoint) -> String {
     let base = ep.base_url();
     let base = base.trim_end_matches('/');
     match ep.api_version.as_deref() {
@@ -933,7 +935,10 @@ fn remote_endpoint_label(ep: &darkmux_types::ModelEndpoint, model_id: &str) -> S
 /// Read the endpoint's auth secret from the Keychain and build the header
 /// `(name, value)`. Read via `security find-generic-password`; NEVER logged or
 /// placed on any argv. `None` ⇒ no auth (valid for an unauthenticated proxy).
-fn remote_auth_header(ep: &darkmux_types::ModelEndpoint) -> Result<Option<(String, String)>> {
+/// `pub(crate)` (#1260) — reused by `single_shot.rs`'s hosted single-shot
+/// path, same secret-handling discipline (Keychain read at call time, 0600
+/// curl config, never on argv, never logged).
+pub(crate) fn remote_auth_header(ep: &darkmux_types::ModelEndpoint) -> Result<Option<(String, String)>> {
     let Some(auth) = &ep.auth else {
         return Ok(None);
     };

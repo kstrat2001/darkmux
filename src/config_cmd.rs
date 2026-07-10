@@ -83,6 +83,9 @@ const KEYS: &[(&str, Ty)] = &[
     ("runtime.daemon_auth_enabled", Ty::Bool),
     ("runtime.injected_context_fraction", Ty::Float),
     ("fleet.mode", Ty::FleetMode),
+    // (#1260) The per-execution remote token allowance for endpoint-staffed
+    // crew seats (one pipeline stage = one execution). Tokens, never currency.
+    ("remote.max_tokens_per_execution", Ty::Uint),
     ("dirs.flows", Ty::Str),
     ("dirs.audit", Ty::Str),
     ("dirs.notebook", Ty::Str),

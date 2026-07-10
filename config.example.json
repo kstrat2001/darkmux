@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.1",
+  "schema_version": "1.2",
   "machine_id": "my-machine",
   "orchestrator": "",
   "lms_bin": "lms",
@@ -25,5 +25,8 @@
   },
   "fleet": {
     "mode": "standalone"
+  },
+  "remote": {
+    "max_tokens_per_execution": 500000
   }
 }

@@ -949,18 +949,39 @@ fn run_funnel_case(
         // never falls back to the provisional `bundles_from_diff` when this
         // is `Some`.
         bundles: Some(bundles),
+        // (#1260) Per-execution remote token allowance, resolved through the
+        // one precedence home (`env > config.remote.* > 500000`).
+        remote_max_tokens_per_execution:
+            darkmux_types::config_access::remote_max_tokens_per_execution(),
     };
 
+    // (#1260) Same seat routing as `darkmux pr-review run`: an
+    // endpoint-bearing call goes through the hosted dialect; a local call
+    // through LMStudio. Texts identical either way (contract 6).
     let chat = |call: &funnel::ChatCall| -> Result<darkmux_crew::single_shot::SingleShotReply> {
-        darkmux_crew::single_shot::single_shot_chat(&darkmux_crew::single_shot::SingleShotRequest {
-            base_url: None,
-            model: call.model,
-            system: call.system,
-            user: call.user,
-            temperature: call.temperature,
-            max_tokens: call.max_tokens,
-            timeout_seconds,
-        })
+        match call.endpoint {
+            Some(endpoint) => darkmux_crew::single_shot::single_shot_chat_hosted(
+                &darkmux_crew::single_shot::HostedSingleShotRequest {
+                    endpoint,
+                    model: call.model,
+                    system: call.system,
+                    user: call.user,
+                    max_tokens: call.max_tokens,
+                    timeout_seconds,
+                },
+            ),
+            None => darkmux_crew::single_shot::single_shot_chat(
+                &darkmux_crew::single_shot::SingleShotRequest {
+                    base_url: None,
+                    model: call.model,
+                    system: call.system,
+                    user: call.user,
+                    temperature: call.temperature,
+                    max_tokens: call.max_tokens,
+                    timeout_seconds,
+                },
+            ),
+        }
     };
     let mut cycler = funnel::LmsCycler;
     let env = funnel::run_funnel(&inputs, chat, &mut cycler, emitter)
