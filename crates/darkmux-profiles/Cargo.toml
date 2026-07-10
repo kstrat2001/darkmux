@@ -11,6 +11,9 @@ rust-version = "1.80"
 
 [dependencies]
 darkmux-types = { path = "../darkmux-types" }
+# (#1274 packet 2b) The gestalt port traits + fact types the `gestalt_host`
+# adapters implement. No cycle: darkmux-gestalt depends only on darkmux-types.
+darkmux-gestalt = { path = "../darkmux-gestalt" }
 anyhow = "1.0"
 serde_json = "1.0"
 dirs = "5.0"

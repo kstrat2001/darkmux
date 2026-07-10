@@ -17,6 +17,7 @@
   },
   "runtime": {
     "inactivity_timeout_seconds": 600,
+    "model_load_timeout_seconds": 600,
     "strict_selection": false,
     "check_updates": true,
     "daemon_auth_enabled": false,

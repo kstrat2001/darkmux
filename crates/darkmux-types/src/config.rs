@@ -133,6 +133,11 @@ pub struct AuditConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RuntimeBehaviorConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub inactivity_timeout_seconds: Option<u64>,
+    /// (#1276) Bounded model-load/unload phase for gestalt host-port calls:
+    /// the `LmsHost` adapter hard-kills the `lms load`/`lms unload` child at
+    /// expiry and surfaces a typed timeout naming the phase — a wrong model
+    /// id can no longer hang a dispatch until the workflow's outer kill.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub model_load_timeout_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub max_turns: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub max_tokens: Option<u32>,
     /// (#1221) Per-CALL completion-token cap (reasoning + content of one
@@ -267,6 +272,7 @@ impl DarkmuxConfig {
             }),
             runtime: Some(RuntimeBehaviorConfig {
                 inactivity_timeout_seconds: Some(600),
+                model_load_timeout_seconds: Some(600),
                 max_turns: None,
                 max_tokens: None,
                 max_tokens_per_call: None,
