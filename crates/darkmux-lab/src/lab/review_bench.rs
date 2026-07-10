@@ -2996,18 +2996,20 @@ mod tests {
         assert!(!s.correct, "a degenerate funnel run can never score as correct");
     }
 
-    /// (#1272) The lab/fleet sink boundary, proven from the bench side: a
-    /// bench run's `funnel.*` records go to the per-run-local
-    /// `LocalJsonlEmitter` — never the fleet stream — and (this is the new
-    /// assertion) never carry `pr-review run`'s production-only `dispatch
-    /// start`/`dispatch complete`/`dispatch error` bookends either.
-    /// `run_funnel_case`/`run_review_bench` never call `pr_review.rs`'s
-    /// `with_dispatch_bookends` wrapper (that wiring lives entirely in the
-    /// binary's `pr_review` module, not here), so this is a regression
-    /// guard: if a future change ever routed bench dispatches through that
-    /// wrapper, this test would catch the leak before a bench run started
-    /// spamming the fleet-liveness surfaces with thousands of synthetic
-    /// "running dispatch" entries.
+    /// (#1272) The lab/fleet sink boundary, characterized from the bench
+    /// side: a bench run's `funnel.*` records go to the per-run-local
+    /// `LocalJsonlEmitter` — never the fleet stream — and (the new
+    /// assertion) carry no `dispatch start`/`dispatch complete`/`dispatch
+    /// error` bookends. Honest scope note: the REAL enforcement is the
+    /// crate graph — `pr-review run`'s `with_dispatch_bookends` wrapper
+    /// lives in the binary's `pr_review` module, which this crate cannot
+    /// depend on, so `run_funnel_case` structurally cannot reach it and
+    /// this test cannot fail from that wrapper specifically being wired
+    /// in. What it DOES pin is the observable contract that the bench
+    /// emitter's stream stays pure funnel vocabulary: a future bookend
+    /// emission added anywhere on the bench path IN THIS CRATE would be
+    /// caught before a corpus run started spamming synthetic "running
+    /// dispatch" entries into the fleet-liveness surfaces.
     #[test]
     fn run_funnel_case_through_local_jsonl_emitter_emits_no_dispatch_bookends() {
         let case = Case {

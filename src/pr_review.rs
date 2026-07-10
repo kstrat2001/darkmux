@@ -863,6 +863,37 @@ fn crew_model_summary(crew: &ResolvedCrew) -> Option<String> {
     }
 }
 
+/// (#1272) One funnel-run dispatch bookend record. Same builder + field
+/// shape `crew dispatch` uses (`build_dispatch_record_with_payload`), with
+/// ONE deliberate difference: `source` is overridden from the builder's
+/// hardcoded `"crew_dispatch"` to `"funnel"` — the SAME provenance tag
+/// every sibling `funnel.task/step/ruling` record in this session carries
+/// (`funnel_flow_record` in `darkmux_lab::lab::funnel`). One session, one
+/// source: without the override, the viewer's Source facet would split a
+/// single production review's records across two contradictory provenance
+/// tags, and the mislabel would persist durably in the flow/audit files.
+fn funnel_bookend_record(
+    level: darkmux_flow::Level,
+    action: &str,
+    crew_name: &str,
+    case_id: &str,
+    model: Option<&str>,
+    payload: serde_json::Value,
+) -> darkmux_flow::FlowRecord {
+    let mut record = build_dispatch_record_with_payload(
+        level,
+        action,
+        crew_name,
+        case_id,
+        model,
+        None,
+        None,
+        Some(payload),
+    );
+    record.source = Some("funnel".to_string());
+    record
+}
+
 /// (#1272) Panic/early-return backstop for [`with_dispatch_bookends`] —
 /// same RAII shape as `darkmux-crew`'s `DispatchBookendGuard` (#717): once
 /// armed, a `Drop` while still armed means the wrapped call unwound (a
@@ -883,19 +914,17 @@ impl Drop for FunnelDispatchBookendGuard<'_> {
         if !self.armed {
             return;
         }
-        self.emitter.emit(build_dispatch_record_with_payload(
+        self.emitter.emit(funnel_bookend_record(
             darkmux_flow::Level::Error,
             "dispatch error",
             &self.crew_name,
             &self.case_id,
             self.model.as_deref(),
-            None,
-            None,
-            Some(json!({
+            json!({
                 "runtime": "funnel",
                 "result_class": "error",
                 "error": "funnel dispatch terminated before completion (early return or panic)",
-            })),
+            }),
         ));
     }
 }
@@ -903,13 +932,13 @@ impl Drop for FunnelDispatchBookendGuard<'_> {
 /// (#1272) Emit `dispatch start`, run `f`, then emit the matching terminal
 /// record — `dispatch complete` on `Ok`, `dispatch error` (carrying the
 /// real error text) on `Err`. Same shape `crew dispatch` emits around every
-/// dispatch (`darkmux_crew::dispatch::build_dispatch_record_with_payload`,
-/// action = `"dispatch start"`/`"dispatch complete"`/`"dispatch error"` —
-/// no new action vocabulary), so a production `pr-review run` opens/closes
-/// the SAME liveness edge the viewer's fleet/machine surfaces already key
-/// on (#857 — a session's open edge is its `dispatch.start` record, per
-/// `darkmux-flow`'s `presence_reconciler`) that `crew dispatch` opens
-/// today. Before this fix, the funnel's OWN `funnel.task/step/ruling`
+/// dispatch ([`funnel_bookend_record`] — the `crew dispatch` builder with
+/// only `source` re-tagged `"funnel"`; action = `"dispatch start"`/
+/// `"dispatch complete"`/`"dispatch error"`, no new action vocabulary), so
+/// a production `pr-review run` opens/closes the SAME liveness edge the
+/// viewer's fleet/machine surfaces already key on (#857 — a session's open
+/// edge is its `dispatch.start` record, per `darkmux-flow`'s
+/// `presence_reconciler`) that `crew dispatch` opens today. Before this fix, the funnel's OWN `funnel.task/step/ruling`
 /// vocabulary (#1247/#1248) was the only thing a production `pr-review
 /// run` ever emitted, so a real production review never showed up as a
 /// running dispatch anywhere in the viewer (#1272).
@@ -932,15 +961,13 @@ fn with_dispatch_bookends(
     model: Option<&str>,
     f: impl FnOnce(&mut dyn FunnelEmitter) -> Result<FunnelEnvelope>,
 ) -> Result<FunnelEnvelope> {
-    emitter.emit(build_dispatch_record_with_payload(
+    emitter.emit(funnel_bookend_record(
         darkmux_flow::Level::Info,
         "dispatch start",
         crew_name,
         case_id,
         model,
-        None,
-        None,
-        Some(json!({ "runtime": "funnel" })),
+        json!({ "runtime": "funnel" }),
     ));
     let mut guard = FunnelDispatchBookendGuard {
         armed: true,
@@ -957,32 +984,28 @@ fn with_dispatch_bookends(
     guard.armed = false;
     match result {
         Ok(env) => {
-            guard.emitter.emit(build_dispatch_record_with_payload(
+            guard.emitter.emit(funnel_bookend_record(
                 darkmux_flow::Level::Info,
                 "dispatch complete",
                 crew_name,
                 case_id,
                 model,
-                None,
-                None,
-                Some(json!({ "runtime": "funnel", "result_class": "ok" })),
+                json!({ "runtime": "funnel", "result_class": "ok" }),
             ));
             Ok(env)
         }
         Err(e) => {
-            guard.emitter.emit(build_dispatch_record_with_payload(
+            guard.emitter.emit(funnel_bookend_record(
                 darkmux_flow::Level::Error,
                 "dispatch error",
                 crew_name,
                 case_id,
                 model,
-                None,
-                None,
-                Some(json!({
+                json!({
                     "runtime": "funnel",
                     "result_class": "error",
                     "error": e.to_string(),
-                })),
+                }),
             ));
             Err(e)
         }
@@ -2392,10 +2415,16 @@ mod tests {
         assert_eq!(start.handle, "test-crew");
         assert_eq!(start.model.as_deref(), Some("darkmux:judge-model"));
         assert!(matches!(start.level, darkmux_flow::Level::Info));
+        // Provenance: the bookends must carry the SAME source tag as the
+        // funnel.* records they bracket — never the builder's hardcoded
+        // "crew_dispatch" (which would split one session across two
+        // contradictory Source facets in the viewer).
+        assert_eq!(start.source.as_deref(), Some("funnel"));
 
         let terminal = emitter.records.last().unwrap();
         assert_eq!(terminal.action, "dispatch complete");
         assert!(matches!(terminal.level, darkmux_flow::Level::Info));
+        assert_eq!(terminal.source.as_deref(), Some("funnel"));
         assert_eq!(terminal.payload.as_ref().unwrap()["result_class"], "ok");
     }
 
@@ -2417,6 +2446,7 @@ mod tests {
         let terminal = emitter.records.last().unwrap();
         assert_eq!(terminal.action, "dispatch error");
         assert!(matches!(terminal.level, darkmux_flow::Level::Error));
+        assert_eq!(terminal.source.as_deref(), Some("funnel"), "error terminal carries funnel provenance");
         let payload = terminal.payload.as_ref().unwrap();
         assert_eq!(payload["result_class"], "error");
         assert!(
@@ -2446,6 +2476,7 @@ mod tests {
         assert_eq!(actions, vec!["dispatch start", "dispatch error"]);
         let terminal = emitter.records.last().unwrap();
         assert!(matches!(terminal.level, darkmux_flow::Level::Error));
+        assert_eq!(terminal.source.as_deref(), Some("funnel"), "guard's Drop terminal carries funnel provenance");
         assert!(terminal.payload.as_ref().unwrap()["error"]
             .as_str()
             .unwrap()
