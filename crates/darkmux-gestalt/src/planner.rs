@@ -1617,6 +1617,75 @@ mod tests {
     }
 
     /// Shared fixture battery for the global invariants above.
+    #[test]
+    fn exact_fit_boundaries_proceed() {
+        // Equality edges on the strict capacity comparisons: an estimate
+        // exactly equal to the pool headroom or the #1243 allowance
+        // proceeds. A `>` flipped to `>=` inverts these rows while every
+        // wide-margin fixture stays green.
+        let pools: Pools = BTreeMap::from([(
+            PoolId("unified".into()),
+            PoolFact { capacity_bytes: 32 * GB, available_bytes: 10 * GB },
+        )]);
+        let f = Facts {
+            residents: vec![resident("m-manual", "m", 16_000, Some(22 * GB))],
+            pools,
+            ..Default::default()
+        };
+        let plan =
+            plan_acquire(&[placement("m", 8_000)], &f, additive_auto(), &est_map(&[("m", 10 * GB)]));
+        assert!(
+            matches!(plan.actions[0].action, Action::Load { .. }),
+            "exact pool fit behind a foreign duplicate must load alongside, got {:?}",
+            plan.actions[0]
+        );
+
+        let f = Facts {
+            budget: Budget { max_darkmux_bytes: Some(15 * GB) },
+            ..Default::default()
+        };
+        let plan =
+            plan_acquire(&[placement("m", 8_000)], &f, additive_auto(), &est_map(&[("m", 15 * GB)]));
+        assert!(
+            matches!(plan.actions[0].action, Action::Load { .. }),
+            "estimate exactly equal to the budget must load, got {:?}",
+            plan.actions[0]
+        );
+    }
+
+    #[test]
+    fn budget_post_eviction_refuse_with_unevictable_base() {
+        // The post-eviction refusal arm of #1243 auto-never-breaches: a
+        // fresh load that fits the flat cap alone still cannot fit atop an
+        // un-evictable darkmux base (a desired resident being reused) and
+        // nothing is evictable — the load Blocks naming the budget while
+        // the Reuse survives.
+        let f = Facts {
+            residents: vec![resident("darkmux:pinned", "pinned", 16_000, Some(20 * GB))],
+            budget: Budget { max_darkmux_bytes: Some(30 * GB) },
+            ..Default::default()
+        };
+        let plan = plan_acquire(
+            &[placement("pinned", 8_000), placement("fresh", 8_000)],
+            &f,
+            additive_auto(),
+            &est_map(&[("fresh", 15 * GB)]),
+        );
+        assert!(
+            matches!(plan.actions[0].action, Action::Reuse { .. }),
+            "pinned reuse must survive the refusal, got {:?}",
+            plan.actions[0]
+        );
+        assert_eq!(
+            plan.actions[1],
+            PlannedAction {
+                action: Action::Block { model_key: "fresh".into(), resident_identifier: None },
+                reason: Reason::BudgetRefuse { est_bytes: 15 * GB, budget_bytes: 30 * GB },
+                precondition: Precondition::None,
+            }
+        );
+    }
+
     fn battery() -> Vec<(Plan, &'static str)> {
         vec![
             (
