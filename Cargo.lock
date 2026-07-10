@@ -508,6 +508,7 @@ dependencies = [
  "darkmux-gestalt",
  "darkmux-types",
  "dirs",
+ "serde",
  "serde_json",
  "serial_test",
  "tempfile",

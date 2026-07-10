@@ -284,22 +284,26 @@ fn relist_bound(deadline: Deadline, load_elapsed: Duration, list_bound: Duration
 /// corrupts a `--json` dispatch envelope); the `--json` list calls capture
 /// it — through the same drain mechanics as stderr, never an unbounded
 /// `Command::output()`.
-enum StdoutMode {
+///
+/// `pub(crate)`: the #1286 memory-ledger gather reuses the same bounded-run
+/// mechanism for its kernel-counter + lms-metadata probes (the ledger's
+/// observer-effect constraint forbids unbounded child runs too).
+pub(crate) enum StdoutMode {
     Null,
     Capture,
 }
 
 /// Outcome of a bounded child run that finished before the deadline.
-struct BoundedRun {
-    status: std::process::ExitStatus,
+pub(crate) struct BoundedRun {
+    pub(crate) status: std::process::ExitStatus,
     /// Empty under [`StdoutMode::Null`].
-    stdout: String,
-    stderr: String,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
 }
 
 impl BoundedRun {
     /// The generic failure detail: exit status + trimmed stderr.
-    fn exit_detail(&self) -> String {
+    pub(crate) fn exit_detail(&self) -> String {
         format!("exited with {}: {}", self.status, self.stderr.trim())
     }
 }
@@ -389,7 +393,7 @@ fn collect_within(rx: &std::sync::mpsc::Receiver<String>, cap: Duration) -> Stri
 /// load-bearing: a chatty child that fills the OS pipe buffer would
 /// otherwise block forever and read as a timeout. Post-exit collection is
 /// total-bounded per stream by [`PIPE_GRACE`] ([`collect_within`]).
-fn run_bounded(
+pub(crate) fn run_bounded(
     mut cmd: Command,
     phase: &'static str,
     deadline: Deadline,
@@ -401,9 +405,13 @@ fn run_bounded(
         StdoutMode::Capture => Stdio::piped(),
     });
     cmd.stderr(Stdio::piped());
+    // Name the actual program in the spawn error: the #1286 ledger reuses this
+    // runner for non-`lms` probes (vm_stat / sysctl / ps), so a hardcoded
+    // "lms" prefix would mislabel those failures.
+    let program = cmd.get_program().to_string_lossy().into_owned();
     let mut child = cmd
         .spawn()
-        .map_err(|e| HostError::CommandFailed { detail: format!("spawning `lms {phase}`: {e}") })?;
+        .map_err(|e| HostError::CommandFailed { detail: format!("spawning `{program}` ({phase}): {e}") })?;
     let stdout_rx = spawn_drain(child.stdout.take());
     let stderr_rx = spawn_drain(child.stderr.take());
     let start = Instant::now();
