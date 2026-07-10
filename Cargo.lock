@@ -337,6 +337,7 @@ dependencies = [
  "darkmux-eureka",
  "darkmux-fleet",
  "darkmux-flow",
+ "darkmux-gestalt",
  "darkmux-hardware",
  "darkmux-heuristics",
  "darkmux-lab",
@@ -451,6 +452,15 @@ dependencies = [
  "serde_json",
  "serial_test",
  "tempfile",
+]
+
+[[package]]
+name = "darkmux-gestalt"
+version = "1.17.1"
+dependencies = [
+ "darkmux-types",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
