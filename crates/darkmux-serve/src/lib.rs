@@ -1877,6 +1877,24 @@ const MACHINE_MEMORY_CACHE_TTL: Duration = Duration::from_secs(2);
 static MACHINE_MEMORY_CACHE: std::sync::Mutex<Option<(std::time::Instant, serde_json::Value)>> =
     std::sync::Mutex::new(None);
 
+/// Single-flight gate for the machine-memory gather (#1286): concurrent
+/// cold-cache requests serialize on this async lock so a phone-viewer poll
+/// burst costs exactly ONE gather, not one per request (the shell-out gather
+/// is the observer-cost the ledger is built to keep negligible). See the
+/// double-checked flow in [`machine_memory_handler`].
+fn machine_memory_gather_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// Fresh cached machine-memory payload, or `None` when absent/stale. The std
+/// mutex is held only for the clone — never across an `.await`.
+fn machine_memory_cached_fresh() -> Option<serde_json::Value> {
+    let guard = MACHINE_MEMORY_CACHE.lock().ok()?;
+    let (at, v) = guard.as_ref()?;
+    (at.elapsed() < MACHINE_MEMORY_CACHE_TTL).then(|| v.clone())
+}
+
 /// GET /machine/memory (#1286) — the live machine-scope memory ledger:
 /// resident models with potential-vs-current + color state, pool/limit
 /// lines, and the unified-memory pressure rows (swap / compressor /
@@ -1895,12 +1913,17 @@ static MACHINE_MEMORY_CACHE: std::sync::Mutex<Option<(std::time::Instant, serde_
 /// contract like /machine/specs: probe failures degrade to `warnings` in
 /// the payload, never a 500.
 async fn machine_memory_handler() -> axum::Json<serde_json::Value> {
-    if let Ok(guard) = MACHINE_MEMORY_CACHE.lock() {
-        if let Some((at, v)) = guard.as_ref() {
-            if at.elapsed() < MACHINE_MEMORY_CACHE_TTL {
-                return axum::Json(v.clone());
-            }
-        }
+    // Fast path: a fresh cache serves without touching the gather lock.
+    if let Some(v) = machine_memory_cached_fresh() {
+        return axum::Json(v);
+    }
+    // Single-flight (#1286): serialize cold-cache refreshers on the gather
+    // lock, then RE-CHECK the cache under it — a request that waited behind an
+    // in-flight gather returns that gather's fresh result instead of launching
+    // a second one, so a poll burst costs one gather.
+    let _permit = machine_memory_gather_lock().lock().await;
+    if let Some(v) = machine_memory_cached_fresh() {
+        return axum::Json(v);
     }
     let result = tokio::task::spawn_blocking(darkmux_profiles::model_ledger::gather).await;
     let mut value = match result {

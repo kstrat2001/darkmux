@@ -385,7 +385,7 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
         Some(limit) if current_total.is_some_and(|c| c > limit) => LedgerState::Red,
         Some(limit) if sum_potential <= limit && unpriced_models == 0 => LedgerState::Green,
         Some(limit) if sum_potential > limit => {
-            machine_shrink = Some(shrink_hint(&rows, sum_potential, limit));
+            machine_shrink = Some(shrink_hint(&rows, sum_potential, limit, unpriced_models));
             LedgerState::Amber
         }
         // Under the limit on the KNOWN sum but with unpriceable residents:
@@ -580,38 +580,52 @@ fn hint_target_key(rows: &[ModelRow], sum_potential: u64, limit: u64) -> Option<
 /// The amber "config shrink to green" hint (#1286): names the model + the
 /// reloaded ctx that brings Σ potential under the limit at load time, or
 /// says honestly that no single-model ctx cut reaches green.
-fn shrink_hint(rows: &[ModelRow], sum_potential: u64, limit: u64) -> String {
+///
+/// When `unpriced_models > 0` the promised fit is NOT green — green requires
+/// zero unpriceable residents (their commitment is uncounted), so applying
+/// the shrink lands the machine total at Unknown, not Green. The hint carries
+/// that caveat rather than over-promising green (#1286 honesty).
+fn shrink_hint(rows: &[ModelRow], sum_potential: u64, limit: u64, unpriced_models: u32) -> String {
     let overshoot = sum_potential.saturating_sub(limit);
-    let Some(key) = hint_target_key(rows, sum_potential, limit) else {
-        return format!(
+    let base = match hint_target_key(rows, sum_potential, limit) {
+        None => format!(
             "over the limit by {} with no shrinkable context — unload a resident or load a smaller quant to reach green at load time",
             fmt_bytes(overshoot)
-        );
+        ),
+        Some(key) => {
+            let row = rows.iter().find(|r| r.model_key == key).expect("target from rows");
+            let kv = row.kv_per_token_bytes.unwrap_or(0).max(1);
+            let max_saving = kv * (row.loaded_ctx - SHRINK_CTX_FLOOR);
+            if max_saving >= overshoot {
+                let cut_tokens = overshoot.div_ceil(kv);
+                // Round the suggested ctx DOWN to a 4 K multiple (still ≥ the
+                // floor) so the hint reads as a real load config.
+                let new_ctx = ((row.loaded_ctx - cut_tokens) / SHRINK_CTX_FLOOR * SHRINK_CTX_FLOOR)
+                    .max(SHRINK_CTX_FLOOR);
+                let saved = kv * (row.loaded_ctx - new_ctx);
+                format!(
+                    "reload {} at ctx {} (now {}) — cuts {} of KV commitment; Σ potential then fits the limit at load time",
+                    row.model_key,
+                    new_ctx,
+                    row.loaded_ctx,
+                    fmt_bytes(saved)
+                )
+            } else {
+                format!(
+                    "no single ctx reduction reaches green — largest single saving is {} at ctx {} ({}); shrink several contexts, unload a resident, or load a smaller quant",
+                    row.model_key,
+                    SHRINK_CTX_FLOOR,
+                    fmt_bytes(max_saving)
+                )
+            }
+        }
     };
-    let row = rows.iter().find(|r| r.model_key == key).expect("target from rows");
-    let kv = row.kv_per_token_bytes.unwrap_or(0).max(1);
-    let max_saving = kv * (row.loaded_ctx - SHRINK_CTX_FLOOR);
-    if max_saving >= overshoot {
-        let cut_tokens = overshoot.div_ceil(kv);
-        // Round the suggested ctx DOWN to a 4 K multiple (still ≥ the floor)
-        // so the hint reads as a real load config.
-        let new_ctx =
-            ((row.loaded_ctx - cut_tokens) / SHRINK_CTX_FLOOR * SHRINK_CTX_FLOOR).max(SHRINK_CTX_FLOOR);
-        let saved = kv * (row.loaded_ctx - new_ctx);
+    if unpriced_models > 0 {
         format!(
-            "reload {} at ctx {} (now {}) — cuts {} of KV commitment; Σ potential then fits the limit at load time",
-            row.model_key,
-            new_ctx,
-            row.loaded_ctx,
-            fmt_bytes(saved)
+            "{base} — note: {unpriced_models} unpriceable resident(s) are uncounted, so even this shrink leaves the machine total UNKNOWN, not green (no fit guarantee)"
         )
     } else {
-        format!(
-            "no single ctx reduction reaches green — largest single saving is {} at ctx {} ({}); shrink several contexts, unload a resident, or load a smaller quant",
-            row.model_key,
-            SHRINK_CTX_FLOOR,
-            fmt_bytes(max_saving)
-        )
+        base
     }
 }
 
@@ -785,17 +799,32 @@ fn bounded_stdout(
 ) -> Option<String> {
     let mut cmd = Command::new(bin);
     cmd.args(args);
+    // Warnings ride /machine/memory to remote viewers, so they carry the
+    // binary's BASENAME, never a full configured path — a `DARKMUX_LMS_BIN`
+    // under a home dir must not leak off-machine (#1286 observer/privacy).
+    // The runner's own error text (which repeats the full path) is likewise
+    // reduced to the label before it lands in the payload.
+    let label = bin_label(bin);
     match run_bounded(cmd, phase, Deadline(bound), StdoutMode::Capture) {
         Ok(run) if run.status.success() => Some(run.stdout),
         Ok(run) => {
-            warnings.push(format!("`{bin} {}` {}", args.join(" "), run.exit_detail()));
+            let detail = run.exit_detail().replace(bin, label);
+            warnings.push(format!("`{label} {}` {detail}", args.join(" ")));
             None
         }
         Err(e) => {
-            warnings.push(format!("`{bin} {}` failed: {e}", args.join(" ")));
+            let detail = e.to_string().replace(bin, label);
+            warnings.push(format!("`{label} {}` failed: {detail}", args.join(" ")));
             None
         }
     }
+}
+
+/// Basename of a probe binary — the stable, path-free label used in served
+/// warnings (#1286). A bare command (`ps`, `vm_stat`) is returned unchanged;
+/// a configured absolute path (`/Users/…/lms`) collapses to its file name.
+fn bin_label(bin: &str) -> &str {
+    bin.rsplit(['/', '\\']).next().unwrap_or(bin)
 }
 
 /// `lms <args>` bounded → parsed JSON array rows (empty + warning on any
@@ -858,13 +887,18 @@ fn parse_swapusage_used_bytes(s: &str) -> Option<u64> {
 }
 
 /// LMStudio inference workers out of `ps -axo pid=,rss=,command=` output:
-/// rows whose command mentions `llmworker` (the LM Studio node inference
-/// worker, live-verified on the M5 Max probes behind #1286). ps reports RSS
+/// rows that match the actual worker SIGNATURE — `llmworker.js` run under a
+/// JS runtime (the `LM Studio.app` electron bundle or a `node`/`electron`
+/// binary), live-verified on the M5 Max probes behind #1286. Requiring the
+/// runtime prefix (not a bare `llmworker` substring) rejects the phantom-
+/// worker false positives — an editor/pager/grep that merely NAMES the file
+/// (`vim llmworker.js`, `grep llmworker`, `tail …/llmworker.js`) is not an
+/// inference process and must not be counted as inference RAM. ps reports RSS
 /// in KiB.
 fn parse_worker_rss(ps_out: &str) -> Vec<WorkerProc> {
     ps_out
         .lines()
-        .filter(|l| l.contains("llmworker"))
+        .filter(|l| is_lmstudio_worker_cmd(l))
         .filter_map(|l| {
             let mut it = l.split_whitespace();
             let pid: i64 = it.next()?.parse().ok()?;
@@ -872,6 +906,21 @@ fn parse_worker_rss(ps_out: &str) -> Vec<WorkerProc> {
             Some(WorkerProc { pid, rss_bytes: rss_kib * 1024 })
         })
         .collect()
+}
+
+/// True when a `ps` command line is an LMStudio inference worker: it runs the
+/// `llmworker.js` script AND the text before that script names a JS runtime
+/// (`node`, the `LM Studio.app` electron bundle, or an `electron` binary).
+/// The runtime requirement is what kills the phantom class (#1286) — an
+/// editor/pager/grep line reaches `llmworker.js` without any runtime prefix.
+fn is_lmstudio_worker_cmd(line: &str) -> bool {
+    let Some(idx) = line.find("llmworker.js") else {
+        return false;
+    };
+    let prefix = &line[..idx];
+    prefix.contains("node")
+        || prefix.contains("LM Studio.app")
+        || prefix.to_ascii_lowercase().contains("electron")
 }
 
 // ── human rendering (the CLI table; tested here, printed by main.rs) ─────
@@ -894,6 +943,24 @@ fn fmt_opt(b: Option<u64>) -> String {
     b.map(fmt_bytes).unwrap_or_else(|| "—".to_string())
 }
 
+/// Truncate an identifier to at most `max` CHARACTERS on a char boundary,
+/// appending an ellipsis when cut. Identifiers are operator-controllable and
+/// legal LMStudio state can be CJK / accented, so a raw byte slice
+/// (`&s[..46]`) panics when the byte offset lands mid-codepoint — the module
+/// contract is "degrades loud, never errors" (#1286). Char-count truncation
+/// keeps the SAME measure the `{:<46}` column padding uses, so alignment
+/// stays sane.
+fn truncate_ident(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        // Reserve one char for the ellipsis so the result is ≤ `max` chars.
+        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
+}
+
 /// The `darkmux model ledger` table + machine rows + gather-cost line.
 pub fn render_human(ledger: &ModelLedger) -> String {
     let mut out = String::new();
@@ -906,7 +973,7 @@ pub fn render_human(ledger: &ModelLedger) -> String {
         out.push_str("  (no models loaded)\n");
     }
     for m in &ledger.models {
-        let ident = if m.identifier.len() > 46 { &m.identifier[..46] } else { &m.identifier };
+        let ident = truncate_ident(&m.identifier, 46);
         out.push_str(&format!(
             "{:<46} {:<8} {:>8} {:>10} {:>10} {:>10} {:>10}  {}\n",
             ident,
@@ -1306,6 +1373,28 @@ mod tests {
     }
 
     #[test]
+    fn worker_rss_rejects_phantom_llmworker_lines() {
+        // The phantom class: an editor/pager/grep that merely NAMES the file
+        // must not be counted as an inference worker (#1286). Only the real
+        // runtime-prefixed rows (735 / 990) survive.
+        let ps = "  735  18432000 /Applications/LM Studio.app/Contents/Resources/app/.webpack/main/llmworker.js --stdio\n\
+             990    512000 node /opt/lmstudio/llmworker.js\n\
+             111      4096 vim llmworker.js\n\
+             222      8192 grep -r llmworker src/\n\
+             333      2048 tail -f /opt/lmstudio/logs/llmworker.js\n";
+        let workers = parse_worker_rss(ps);
+        assert_eq!(workers.len(), 2, "only the two real workers match, not vim/grep/tail");
+        assert_eq!(workers[0].pid, 735);
+        assert_eq!(workers[1].pid, 990);
+        // Direct assertions on the matcher.
+        assert!(is_lmstudio_worker_cmd(
+            "  990 512000 node /opt/lmstudio/llmworker.js"
+        ));
+        assert!(!is_lmstudio_worker_cmd("  111 4096 vim llmworker.js"));
+        assert!(!is_lmstudio_worker_cmd("  222 8192 grep -r llmworker src/"));
+    }
+
+    #[test]
     fn fmt_bytes_matches_the_lms_decimal_convention() {
         assert_eq!(fmt_bytes(17_180_000_000), "17.18 GB");
         assert_eq!(fmt_bytes(512_000_000), "512 MB");
@@ -1357,5 +1446,179 @@ mod tests {
         // gather_ms is stamped (may legitimately be 0 ms on a fast box, so
         // just assert the render path carries it).
         assert!(render_human(&ledger).contains("gather:"));
+    }
+
+    #[test]
+    fn render_human_truncates_multibyte_identifiers_without_panic() {
+        // Byte 46 falls mid-codepoint for both ids — the old `&s[..46]` byte
+        // slice panicked; char-boundary truncation degrades loud (#1286).
+        let accented = format!("{}é", "a".repeat(45)); // 46 chars, 47 bytes
+        let cjk = "模型".repeat(30); // 60 CJK chars, 180 bytes
+        let inputs = LedgerInputs {
+            residents: vec![resident(&accented, "m1", 4096), resident(&cjk, "m2", 4096)],
+            pool: base_inputs().pool,
+            workers: Some(Vec::new()),
+            ..Default::default()
+        };
+        let ledger = compute_ledger(inputs, 1);
+        let text = render_human(&ledger); // must not panic
+        // 46-char id fits untruncated; the 60-char CJK id is ellipsis-cut.
+        assert!(text.contains(&accented), "46-char id renders whole: {text}");
+        assert!(text.contains('…'), "over-long CJK id is ellipsis-truncated");
+        // Every rendered identifier stays within the 46-char column.
+        assert_eq!(truncate_ident(&accented, 46).chars().count(), 46);
+        assert_eq!(truncate_ident(&cjk, 46).chars().count(), 46);
+        assert!(truncate_ident("short", 46).chars().count() <= 46);
+    }
+
+    #[test]
+    fn probe_warnings_use_basename_not_home_path() {
+        // A configured absolute lms path must not leak off-machine through the
+        // served warnings (#1286): only the basename is embedded.
+        let mut warnings = Vec::new();
+        let got = bounded_stdout(
+            "/Users/someone/private/bin/lms-does-not-exist",
+            &["ps", "--json"],
+            "ps",
+            SYS_PROBE_BOUND,
+            &mut warnings,
+        );
+        assert!(got.is_none());
+        assert_eq!(warnings.len(), 1);
+        let w = &warnings[0];
+        assert!(!w.contains("/Users/"), "no home path in the served warning: {w}");
+        assert!(w.contains("lms-does-not-exist"), "basename still names the binary: {w}");
+        assert_eq!(bin_label("/Users/x/lms"), "lms");
+        assert_eq!(bin_label("vm_stat"), "vm_stat");
+    }
+
+    #[test]
+    fn sum_potential_equal_to_limit_is_green_inclusive() {
+        // Σ potential == limit: the green arm's `≤` is inclusive at equality.
+        let mut inputs = base_inputs();
+        inputs.budget_bytes = Some(JUDGE_POTENTIAL + DEVSTRAL_POTENTIAL);
+        let ledger = compute_ledger(inputs, 1);
+        assert_eq!(ledger.machine.state, LedgerState::Green);
+        assert!(ledger.machine.shrink_hint.is_none());
+    }
+
+    #[test]
+    fn swap_used_exactly_at_threshold_is_not_red() {
+        // swap_used == SWAP_USED_RED_BYTES: the test is strict `>`, so equality
+        // is NOT red.
+        let mut inputs = base_inputs();
+        inputs.swap_used_bytes = Some(SWAP_USED_RED_BYTES);
+        let ledger = compute_ledger(inputs, 1);
+        assert!(!ledger.pressure.red);
+        assert_eq!(ledger.machine.state, LedgerState::Green);
+    }
+
+    #[test]
+    fn memory_free_exactly_at_threshold_is_not_red() {
+        // memory_free_percent == 15: the test is strict `<`, so equality is
+        // NOT red.
+        let mut inputs = base_inputs();
+        inputs.memory_free_percent = Some(MEMORY_FREE_PERCENT_RED);
+        let ledger = compute_ledger(inputs, 1);
+        assert!(!ledger.pressure.red);
+        assert_eq!(ledger.machine.state, LedgerState::Green);
+    }
+
+    #[test]
+    fn per_model_current_equal_to_potential_is_materialized_green() {
+        // cur == pot exactly: the row-tint `cur >= pot` is inclusive → the
+        // commitment is materialized, so the row is green under machine amber.
+        let mut inputs = base_inputs();
+        inputs.budget_bytes = Some(35_000_000_000); // machine amber
+        inputs.workers = Some(vec![
+            WorkerProc { pid: 1, rss_bytes: JUDGE_POTENTIAL }, // cur == pot
+            WorkerProc { pid: 2, rss_bytes: 10_000_000_000 },
+        ]);
+        let ledger = compute_ledger(inputs, 1);
+        assert_eq!(ledger.machine.state, LedgerState::Amber);
+        let judge = ledger.models.iter().find(|m| m.model_key == "judge").unwrap();
+        assert_eq!(judge.current_bytes, Some(JUDGE_POTENTIAL));
+        assert_eq!(judge.state, LedgerState::Green, "materialized commitment is paid");
+    }
+
+    #[test]
+    fn rank_match_tie_preserves_lms_ps_order() {
+        // Two residents with IDENTICAL potential: the potential sort is stable
+        // (`sort_by_key`), so they keep lms ps order and the first-listed
+        // resident pairs with the largest worker.
+        let inputs = LedgerInputs {
+            residents: vec![
+                resident("darkmux:a", "twin", 32_768),
+                resident("darkmux:b", "twin", 32_768),
+            ],
+            catalog: vec![CatalogFact {
+                model_key: "twin".into(),
+                size_bytes: Some(10_000_000_000),
+            }],
+            arch: BTreeMap::from([("twin".to_string(), judge_arch())]),
+            pool: base_inputs().pool,
+            workers: Some(vec![
+                WorkerProc { pid: 1, rss_bytes: 12_000_000_000 },
+                WorkerProc { pid: 2, rss_bytes: 8_000_000_000 },
+            ]),
+            ..Default::default()
+        };
+        let ledger = compute_ledger(inputs, 1);
+        assert_eq!(ledger.attribution, Attribution::PerProcess);
+        assert_eq!(ledger.models[0].identifier, "darkmux:a");
+        assert_eq!(ledger.models[0].current_bytes, Some(12_000_000_000));
+        assert_eq!(ledger.models[1].current_bytes, Some(8_000_000_000));
+    }
+
+    /// Parse the suggested ctx out of a "reload … at ctx <N> (now …)" hint.
+    fn parse_hint_ctx(hint: &str) -> Option<u64> {
+        hint.split("at ctx ").nth(1)?.split_whitespace().next()?.parse().ok()
+    }
+
+    #[test]
+    fn shrink_hint_ctx_actually_reaches_green_when_applied() {
+        // Property: derive the hinted ctx, reload the target at it, and the
+        // recomputed ledger must be Green. Pins the floor-rounding DIRECTION —
+        // a future ceil-flip that shipped a hint landing just shy of green
+        // would fail here.
+        let mut inputs = base_inputs();
+        inputs.budget_bytes = Some(35_000_000_000);
+        let ledger = compute_ledger(inputs, 1);
+        assert_eq!(ledger.machine.state, LedgerState::Amber);
+        let hint = ledger.machine.shrink_hint.as_deref().expect("amber names a shrink");
+        let new_ctx = parse_hint_ctx(hint).expect("covering hint names a ctx");
+
+        let mut applied = base_inputs();
+        applied.budget_bytes = Some(35_000_000_000);
+        for r in &mut applied.residents {
+            if r.model_key == "devstral" {
+                r.loaded_ctx = new_ctx;
+            }
+        }
+        let regreen = compute_ledger(applied, 1);
+        assert_eq!(
+            regreen.machine.state,
+            LedgerState::Green,
+            "the hint's ctx must reach green, not land just shy of it"
+        );
+    }
+
+    #[test]
+    fn amber_hint_flags_undercount_when_unpriceable_residents_exist() {
+        // Amber WITH an unpriceable resident: the promised fit would land
+        // Unknown (green needs unpriced == 0), so the hint carries the
+        // undercount caveat instead of over-promising green (#1286).
+        let mut inputs = base_inputs();
+        inputs.budget_bytes = Some(35_000_000_000); // < Σ priceable potential ⇒ amber
+        inputs.residents.push(resident("mystery", "mystery-model", 8_192));
+        let ledger = compute_ledger(inputs, 1);
+        assert_eq!(ledger.machine.state, LedgerState::Amber);
+        assert_eq!(ledger.machine.unpriced_models, 1);
+        let hint = ledger.machine.shrink_hint.as_deref().unwrap();
+        let lower = hint.to_lowercase();
+        assert!(
+            lower.contains("unpriceable") && lower.contains("unknown"),
+            "hint carries the undercount caveat: {hint}"
+        );
     }
 }

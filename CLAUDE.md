@@ -84,6 +84,15 @@ If a surface on this list doesn't exist for a new run type, **building it comes 
 
 Composes with: single-run-full-picture-first (verify a system with ONE complete instrumented run before corpus sweeps), smoke-before-long-runs, quiesced-machine for canon runs (until host sampling ships, measurement runs get no concurrent builds), and the lab-vs-fleet boundary (bench records stay per-run-local; engagement records ride the flow stream).
 
+### The observer must not join the observed (operator lesson, 2026-07-10, #1286)
+
+Observing local-AI work must not perturb it. The prior art is the AMD/OpenGL stats-render paradox: on-screen debug charts could only be drawn by the very graphics engine being measured, so *rendering the stats made the stats worse* — one line of provenance for a system-design requirement, not an optimization. Getting the numbers, and displaying them, has to happen OUTSIDE the measured system. Four binding constraints on every darkmux observability path (the memory ledger + `#lens=machine` are the first consumers):
+
+1. **Observability paths contain ZERO model dispatches.** A measurement path reads kernel counters (`vm_stat`, `sysctl`, `ps`) and `lms` metadata only — zero tokens, zero Metal work. Using the LLM to observe the LLM (e.g. a utility agent summarizing stats mid-run) is the forbidden pattern; it is the modern form of rendering charts with the measured engine.
+2. **The display renders off-machine by design.** The serve daemon emits JSON; chart-rendering cost lands on the CLIENT — the phone over the tailnet, another machine, any browser that isn't the measured host. Watching a canon run from the measured host's own browser is the anti-pattern (a Chrome tab is a real RAM/CPU consumer); the quiesced-machine doctrine extends to *watch measurement-grade runs off-box*.
+3. **Samplers/gatherers stamp their own cost into the artifact/payload.** The gather records its own wall-clock (`gather_ms`); a host-telemetry sampler records its own CPU time alongside the samples — so "the observer was negligible" is a VERIFIABLE claim in the data, not an assumption. We already measured this failure class from the other side: concurrent cargo builds taxed judge throughput 10–15%, invisible until reconstructed forensically. The observer must be provably not that.
+4. **Cadence is a recorded knob, never adaptive-silent.** The sampling interval / cache TTL is written into the payload (`cache_ttl_ms`) at its default (~2s); if someone tightens it for a debug session, the artifact says so.
+
 ## Cross-system contracts — alignment is mandatory (operator finding, 2026-07-10)
 
 darkmux has contracts that span subsystems. They are binding on EVERY producer and consumer —
