@@ -51,29 +51,44 @@ pub(crate) fn envelope_warnings(
     // load-bearing for the measurement envelope.
     let default_id = profile.default_model_id();
     for pm in &profile.models {
+        // (#1282) Endpoint-bearing models are served remotely — there is no
+        // local LMStudio envelope to validate for them.
+        if pm.is_remote() {
+            continue;
+        }
         match loaded.iter().find(|lm| loaded_matches(lm, pm)) {
             None => {
                 // A missing non-default model is common and not worth the noise.
                 if Some(pm.id.as_str()) == default_id {
+                    let declared = pm
+                        .n_ctx
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "unset".to_string());
                     out.push(format!(
-                        "requested profile `{profile_name}` declares default model `{}` (ctx {}) \
+                        "requested profile `{profile_name}` declares default model `{}` (ctx {declared}) \
                          but it is not among the currently loaded models — the dispatch will use \
                          whatever LMStudio has loaded, so this run's `profile={profile_name}` tag \
                          may not reflect the real runtime envelope. Run `darkmux swap {profile_name}` \
                          or pass `--profile <loaded-profile>` to align them.",
-                        pm.id, pm.n_ctx,
+                        pm.id,
                     ));
                 }
             }
-            Some(lm) if ctx_diverges(pm.n_ctx as u64, lm.context) => {
-                out.push(format!(
-                    "requested profile `{profile_name}` declares model `{}` at {} ctx but the \
-                     loaded instance is at {} ctx — proceeding, but this run's `profile={profile_name}` \
-                     tag may not reflect the real runtime envelope (loaded != requested).",
-                    pm.id, pm.n_ctx, lm.context,
-                ));
+            Some(lm) => {
+                // (#1282) No declared window (an Option now) ⇒ nothing to
+                // compare — divergence is only meaningful against a declared
+                // value.
+                if let Some(declared) = pm.n_ctx {
+                    if ctx_diverges(declared as u64, lm.context) {
+                        out.push(format!(
+                            "requested profile `{profile_name}` declares model `{}` at {} ctx but the \
+                             loaded instance is at {} ctx — proceeding, but this run's `profile={profile_name}` \
+                             tag may not reflect the real runtime envelope (loaded != requested).",
+                            pm.id, declared, lm.context,
+                        ));
+                    }
+                }
             }
-            Some(_) => {}
         }
     }
     out
@@ -89,7 +104,7 @@ mod tests {
             endpoint: None,
             extras: Default::default(),
             id: id.to_string(),
-            n_ctx,
+            n_ctx: Some(n_ctx),
             capabilities: Default::default(),
             identifier: None,
         }
@@ -180,5 +195,21 @@ mod tests {
     fn empty_loaded_set_yields_no_warnings() {
         let p = profile(vec![pm("qwen-35b", 262000)]);
         assert!(envelope_warnings(&p, "deep", &[]).is_empty());
+    }
+
+    /// (#1282) An endpoint-bearing model (no `n_ctx`, served remotely) has no
+    /// local envelope to validate — no warning even though it will never be
+    /// among the loaded models.
+    #[test]
+    fn remote_endpoint_model_is_skipped() {
+        let mut remote = pm("gpt-4o", 0);
+        remote.n_ctx = None;
+        remote.endpoint = Some(darkmux_types::ModelEndpoint {
+            url: Some("https://example.azure.com/openai".into()),
+            ..Default::default()
+        });
+        let p = profile(vec![remote]);
+        let loaded = vec![lm("darkmux:other-model", "other-model", 32000)];
+        assert!(envelope_warnings(&p, "azure", &loaded).is_empty());
     }
 }

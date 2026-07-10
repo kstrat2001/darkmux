@@ -3648,35 +3648,39 @@ fn strict_selection_enabled() -> bool {
 /// the early-detection half of #1139 (the fallback/eviction half is #1139/#1140).
 fn ensure_model_loaded_at_ctx(pm: &darkmux_types::ProfileModel) -> Result<()> {
     use darkmux_profiles::{lms, swap};
+    // (#1282) This is a LOCAL load path (remote-brained dispatches skip it) —
+    // a model without a declared `n_ctx` is a resolution error here, with the
+    // uniform require_n_ctx message, never a parse-stage failure.
+    let n_ctx = pm.require_n_ctx()?;
     let loaded = lms::list_loaded().unwrap_or_default();
     match loaded.iter().find(|m| m.model == pm.id) {
-        Some(m) if m.context >= u64::from(pm.n_ctx) => return Ok(()),
+        Some(m) if m.context >= u64::from(n_ctx) => return Ok(()),
         Some(m) => {
             eprintln!(
                 "darkmux crew dispatch: `{}` is resident at context {} but the profile \
                  declares n_ctx={}; reloading at {} so the dispatch gets the declared \
                  context. (#1135)",
-                pm.id, m.context, pm.n_ctx, pm.n_ctx
+                pm.id, m.context, n_ctx, n_ctx
             );
             lms::unload(&m.identifier).with_context(|| {
-                format!("unloading `{}` to reload at n_ctx={}", m.identifier, pm.n_ctx)
+                format!("unloading `{}` to reload at n_ctx={}", m.identifier, n_ctx)
             })?;
         }
         None => {
             eprintln!(
                 "darkmux crew dispatch: loading `{}` at n_ctx={} (the profile's declared \
                  context) before dispatch. (#1135)",
-                pm.id, pm.n_ctx
+                pm.id, n_ctx
             );
         }
     }
     let identifier = swap::namespaced_identifier(pm);
-    lms::load_with_identifier(&pm.id, pm.n_ctx, &identifier, true).with_context(|| {
+    lms::load_with_identifier(&pm.id, n_ctx, &identifier, true).with_context(|| {
         format!(
             "loading `{}` at n_ctx={} failed — likely insufficient RAM (free resources, \
              lower the profile's n_ctx, or evict a resident model), or LMStudio could not \
              load it. (#1135; load-failure detection/fallback is #1139)",
-            pm.id, pm.n_ctx
+            pm.id, n_ctx
         )
     })
 }
@@ -3918,7 +3922,7 @@ mod tests {
         // dispatches out of the hosted fork.
         let local_no_ep = darkmux_types::ProfileModel {
             id: "qwen".into(),
-            n_ctx: 40960,
+            n_ctx: Some(40960),
             ..Default::default()
         };
         assert!(!local_no_ep
@@ -3927,7 +3931,7 @@ mod tests {
             .is_some_and(|e| e.is_remote()));
         let remote = darkmux_types::ProfileModel {
             id: "gpt-4o".into(),
-            n_ctx: 200000,
+            n_ctx: Some(200000),
             endpoint: Some(darkmux_types::ModelEndpoint {
                 url: Some("https://x.azure.com/openai/deployments/gpt-4o".into()),
                 ..Default::default()
@@ -5320,7 +5324,7 @@ mod tests {
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary".into(),
-                n_ctx: 100_000,
+                n_ctx: Some(100_000),
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -5363,7 +5367,7 @@ mod tests {
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
-                n_ctx: 100_000,
+                n_ctx: Some(100_000),
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -5466,7 +5470,7 @@ mod tests {
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
-                n_ctx: 100_000,
+                n_ctx: Some(100_000),
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -5503,7 +5507,7 @@ mod tests {
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
-                n_ctx: 100_000,
+                n_ctx: Some(100_000),
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -5553,7 +5557,7 @@ mod tests {
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
-                n_ctx: 101_000,
+                n_ctx: Some(101_000),
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -5607,7 +5611,7 @@ mod tests {
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
-                n_ctx: 100_000,
+                n_ctx: Some(100_000),
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -5650,7 +5654,7 @@ mod tests {
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
-                n_ctx: 100_000,
+                n_ctx: Some(100_000),
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -5707,7 +5711,7 @@ mod tests {
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
-                n_ctx: 100_000,
+                n_ctx: Some(100_000),
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -5745,7 +5749,7 @@ mod tests {
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
-                n_ctx: 50_000,
+                n_ctx: Some(50_000),
                 capabilities: Default::default(),
                 identifier: None,
             }],

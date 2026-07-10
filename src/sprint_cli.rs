@@ -194,6 +194,9 @@ fn collect_profile_capacities(
             let primary = profile
                 .default_model_id()
                 .and_then(|id| profile.models.iter().find(|m| m.id == id))?;
+            // (#1282) No declared `n_ctx` (an endpoint-bearing default model)
+            // ⇒ no local context to budget against — skip, like empty profiles.
+            let primary_ctx = primary.n_ctx?;
             // (#590) The compactor signal is the machine-level internal.utility
             // binding now, not a role in the profile's models[].
             let has_compactor = reg.utility_model_id().is_some();
@@ -212,7 +215,7 @@ fn collect_profile_capacities(
             Some((
                 name.clone(),
                 ProfileCapacity {
-                    primary_context: primary.n_ctx as u64,
+                    primary_context: primary_ctx as u64,
                     has_compactor,
                     compaction_max_history_share: max_history_share,
                 },
@@ -1010,7 +1013,7 @@ mod tests {
                     endpoint: None,
                     extras: Default::default(),
                     id: "primary".into(),
-                    n_ctx: 32000,
+                    n_ctx: Some(32000),
                     capabilities: Default::default(),
                     identifier: None,
                 }],
@@ -1029,7 +1032,7 @@ mod tests {
                         endpoint: None,
                         extras: Default::default(),
                         id: "primary".into(),
-                        n_ctx: 101000,
+                        n_ctx: Some(101000),
                         capabilities: Default::default(),
                         identifier: None,
                     },
@@ -1037,7 +1040,7 @@ mod tests {
                         endpoint: None,
                         extras: Default::default(),
                         id: "compactor".into(),
-                        n_ctx: 68000,
+                        n_ctx: Some(68000),
                         capabilities: Default::default(),
                         identifier: None,
                     },
@@ -1057,7 +1060,7 @@ mod tests {
                         endpoint: None,
                         extras: Default::default(),
                         id: "primary".into(),
-                        n_ctx: 262144,
+                        n_ctx: Some(262144),
                         capabilities: Default::default(),
                         identifier: None,
                     },
@@ -1065,7 +1068,7 @@ mod tests {
                         endpoint: None,
                         extras: Default::default(),
                         id: "compactor".into(),
-                        n_ctx: 120000,
+                        n_ctx: Some(120000),
                         capabilities: Default::default(),
                         identifier: None,
                     },
@@ -1082,6 +1085,7 @@ mod tests {
             default_profile: None,
             internal: None,
             crews: Default::default(),
+            quarantined: Default::default(),
         }
     }
 

@@ -783,12 +783,15 @@ pub struct StaffingSnapshot {
     /// The resolved `ProfileModel`'s DECLARED context length — settings
     /// provenance per run, so "what context was this model loaded at" is
     /// never a forensic question (a sibling concern to the config-vs-
-    /// measured-context mismatch class of bug #1135 shipped). `#[serde(default)]`
-    /// so a pre-#1256 snapshot (staffing existed, this field didn't)
-    /// deserializes as `0` rather than a hard parse failure — the same
-    /// schema-lenience discipline every field in this module follows.
-    #[serde(default)]
-    pub n_ctx: u32,
+    /// measured-context mismatch class of bug #1135 shipped). `Option` +
+    /// `#[serde(default)]` so a pre-#1256 snapshot (staffing existed, this
+    /// field didn't) deserializes as `None` rather than a hard parse failure
+    /// — the same schema-lenience discipline every field in this module
+    /// follows. (#1282: `n_ctx` is optional on `ProfileModel` itself now;
+    /// crew seats are local-only and resolution requires it, so a funnel
+    /// snapshot in practice always carries a value.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_ctx: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -886,7 +889,15 @@ enum ResidencyDecision {
 /// darkmux-owned instance also sits further down the list — the operator's
 /// copy of the weights is resident either way, and any load attempt in that
 /// state still risks the double-footprint LMStudio's guardrail refuses.
-fn decide_residency(loaded: &[darkmux_types::LoadedModel], pm: &ProfileModel) -> ResidencyDecision {
+/// (#1282) `n_ctx` is the seat's REQUIRED context — resolved by the caller
+/// via `ProfileModel::require_n_ctx` (crew seats are local-only, so a seat
+/// without a declared window is a resolution error before any residency
+/// decision is made).
+fn decide_residency(
+    loaded: &[darkmux_types::LoadedModel],
+    pm: &ProfileModel,
+    n_ctx: u32,
+) -> ResidencyDecision {
     let Some(found) = loaded.iter().find(|l| l.model == pm.id) else {
         return ResidencyDecision::LoadFresh;
     };
@@ -895,7 +906,7 @@ fn decide_residency(loaded: &[darkmux_types::LoadedModel], pm: &ProfileModel) ->
     if !ours {
         return ResidencyDecision::Blocked { resident_identifier: found.identifier.clone() };
     }
-    if swap::ctx_sufficient(found.context, pm.n_ctx) {
+    if swap::ctx_sufficient(found.context, n_ctx) {
         ResidencyDecision::Reuse {
             identifier: found.identifier.clone(),
             resident_ctx: found.context,
@@ -910,33 +921,33 @@ fn decide_residency(loaded: &[darkmux_types::LoadedModel], pm: &ProfileModel) ->
 
 impl ModelCycler for LmsCycler {
     fn ensure_loaded(&mut self, pm: &ProfileModel) -> Result<()> {
+        let n_ctx = pm.require_n_ctx()?;
         let identifier = swap::namespaced_identifier(pm);
         let loaded = lms::list_loaded()?;
-        match decide_residency(&loaded, pm) {
+        match decide_residency(&loaded, pm, n_ctx) {
             ResidencyDecision::Reuse { identifier: resident, resident_ctx } => {
-                if resident_ctx > u64::from(pm.n_ctx) {
+                if resident_ctx > u64::from(n_ctx) {
                     // (#1271 review round) Declared-vs-actual ctx divergence
                     // now happens ACROSS profiles (a bigger load from another
                     // profile satisfies this seat's minimum) — leave a trace
                     // until #1257's full load-config provenance lands.
                     println!(
-                        "cycler: reusing {resident} at ctx={resident_ctx} (declared {})",
-                        pm.n_ctx
+                        "cycler: reusing {resident} at ctx={resident_ctx} (declared {n_ctx})"
                     );
                 }
                 Ok(())
             }
-            ResidencyDecision::LoadFresh => lms::load_with_identifier(&pm.id, pm.n_ctx, &identifier, true),
+            ResidencyDecision::LoadFresh => lms::load_with_identifier(&pm.id, n_ctx, &identifier, true),
             ResidencyDecision::Reconcile { stale_identifier, stale_ctx } => {
                 // (#1271) Reconcile rather than attempt a doomed second load:
                 // unload the stale-ctx darkmux instance first, matching the
                 // style of `swap::swap`'s own unload-then-load logging.
                 println!(
-                    "cycler: unload {stale_identifier} (was ctx={stale_ctx}) — reconciling to ctx={} for {}",
-                    pm.n_ctx, pm.id
+                    "cycler: unload {stale_identifier} (was ctx={stale_ctx}) — reconciling to ctx={n_ctx} for {}",
+                    pm.id
                 );
                 lms::unload(&stale_identifier)?;
-                lms::load_with_identifier(&pm.id, pm.n_ctx, &identifier, true)
+                lms::load_with_identifier(&pm.id, n_ctx, &identifier, true)
             }
             ResidencyDecision::Blocked { resident_identifier } => bail!(
                 "darkmux: model \"{}\" is already resident under \"{}\", which is NOT darkmux-owned \
@@ -2280,7 +2291,7 @@ mod tests {
     const DIFF: &str = "--- a/billing.ts\n+++ b/billing.ts\n@@ -1,3 +1,4 @@\n context line\n+const end = start.plus(30)\n+const total = base * rate\n more context\n";
 
     fn pm(id: &str) -> ProfileModel {
-        ProfileModel { id: id.to_string(), n_ctx: 32_000, ..Default::default() }
+        ProfileModel { id: id.to_string(), n_ctx: Some(32_000), ..Default::default() }
     }
 
     fn staffing(profile: &str, model: &str, k: u32) -> ResolvedSeatStaffing {
@@ -3351,8 +3362,8 @@ mod tests {
         // ProfileModel's declared context length, so "what context was this
         // model loaded at" is never a forensic question. `pm()` fixtures
         // n_ctx=32_000 for every model.
-        assert_eq!(snapshot.probes[0].n_ctx, 32_000);
-        assert_eq!(judge.n_ctx, 32_000);
+        assert_eq!(snapshot.probes[0].n_ctx, Some(32_000));
+        assert_eq!(judge.n_ctx, Some(32_000));
 
         // The shape `funnels.json` persists — a JSON round trip must
         // preserve the snapshot exactly, same discipline as the envelope's
@@ -4070,7 +4081,7 @@ mod tests {
             r#"[{"identifier":"darkmux:devstral","modelKey":"devstral","status":"loaded","sizeBytes":14000000000,"contextLength":20000}]"#,
         );
         let mut cycler = LmsCycler;
-        let model = ProfileModel { id: "devstral".to_string(), n_ctx: 32768, ..Default::default() };
+        let model = ProfileModel { id: "devstral".to_string(), n_ctx: Some(32768), ..Default::default() };
         cycler.ensure_loaded(&model).expect("reconcile succeeds");
         let log = env.log();
         assert!(log.contains("unload darkmux:devstral"), "unload runs: {log}");
@@ -4094,7 +4105,7 @@ mod tests {
             r#"[{"identifier":"darkmux:devstral","modelKey":"devstral","status":"loaded","sizeBytes":14000000000,"contextLength":40960}]"#,
         );
         let mut cycler = LmsCycler;
-        let model = ProfileModel { id: "devstral".to_string(), n_ctx: 32768, ..Default::default() };
+        let model = ProfileModel { id: "devstral".to_string(), n_ctx: Some(32768), ..Default::default() };
         cycler.ensure_loaded(&model).expect("reuse succeeds");
         assert_eq!(env.log(), "", "sufficient ctx already resident — no load/unload issued");
     }
@@ -4111,7 +4122,7 @@ mod tests {
             r#"[{"identifier":"devstral-manual","modelKey":"devstral","status":"loaded","sizeBytes":14000000000,"contextLength":40960}]"#,
         );
         let mut cycler = LmsCycler;
-        let model = ProfileModel { id: "devstral".to_string(), n_ctx: 32768, ..Default::default() };
+        let model = ProfileModel { id: "devstral".to_string(), n_ctx: Some(32768), ..Default::default() };
         let err = cycler.ensure_loaded(&model).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("devstral-manual"), "error names the resident instance: {msg}");
@@ -4129,7 +4140,7 @@ mod tests {
     fn lms_cycler_no_resident_loads_plain() {
         let env = LmsStubEnv::new("[]");
         let mut cycler = LmsCycler;
-        let model = ProfileModel { id: "devstral".to_string(), n_ctx: 32768, ..Default::default() };
+        let model = ProfileModel { id: "devstral".to_string(), n_ctx: Some(32768), ..Default::default() };
         cycler.ensure_loaded(&model).expect("plain load succeeds");
         let log = env.log();
         assert!(
@@ -4154,7 +4165,7 @@ mod tests {
         let mut cycler = LmsCycler;
         let model = ProfileModel {
             id: "devstral".to_string(),
-            n_ctx: 32768,
+            n_ctx: Some(32768),
             identifier: Some("custom".to_string()),
             ..Default::default()
         };
@@ -4175,7 +4186,7 @@ mod tests {
         let mut cycler = LmsCycler;
         let model = ProfileModel {
             id: "devstral".to_string(),
-            n_ctx: 32768,
+            n_ctx: Some(32768),
             identifier: Some("custom".to_string()),
             ..Default::default()
         };
@@ -4206,7 +4217,7 @@ mod tests {
             ]"#,
         );
         let mut cycler = LmsCycler;
-        let model = ProfileModel { id: "devstral".to_string(), n_ctx: 32768, ..Default::default() };
+        let model = ProfileModel { id: "devstral".to_string(), n_ctx: Some(32768), ..Default::default() };
         let err = cycler.ensure_loaded(&model).unwrap_err();
         assert!(
             err.to_string().contains("devstral-manual"),
@@ -4229,7 +4240,7 @@ mod tests {
             ]"#,
         );
         let mut cycler = LmsCycler;
-        let model = ProfileModel { id: "devstral".to_string(), n_ctx: 32768, ..Default::default() };
+        let model = ProfileModel { id: "devstral".to_string(), n_ctx: Some(32768), ..Default::default() };
         cycler.ensure_loaded(&model).expect("reconcile succeeds with a user-owned resident present");
         let log = env.log();
         assert!(log.contains("unload darkmux:devstral"), "darkmux instance reconciles: {log}");

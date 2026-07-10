@@ -232,9 +232,11 @@ fn sync_context_windows(config: &mut Value, models: &[ProfileModel]) -> bool {
                 continue;
             };
             let id = id.to_string();
+            // (#1282) A model without a declared `n_ctx` (an endpoint-bearing
+            // entry) has no local context to sync — leave the entry alone.
             let want = models.iter().find_map(|pm| {
                 if pm.id == id || namespaced_identifier(pm) == id {
-                    Some(pm.n_ctx as u64)
+                    pm.n_ctx.map(u64::from)
                 } else {
                     None
                 }
@@ -271,6 +273,11 @@ fn ensure_namespaced_entries(config: &mut Value, models: &[ProfileModel]) -> boo
         if pm.identifier.is_some() {
             continue; // operator opted out of the namespace for this load
         }
+        // (#1282) No declared `n_ctx` (an endpoint-bearing entry) ⇒ no local
+        // LMStudio load happens, so no namespaced registry entry is needed.
+        let Some(n_ctx) = pm.n_ctx else {
+            continue;
+        };
         let ns_ident = namespaced_identifier(pm);
         if ns_ident == pm.id {
             continue; // no rewrite happened; no namespaced entry needed
@@ -288,7 +295,7 @@ fn ensure_namespaced_entries(config: &mut Value, models: &[ProfileModel]) -> boo
         let mut entry = template.unwrap_or_else(|| {
             serde_json::json!({
                 "id": ns_ident,
-                "contextWindow": pm.n_ctx as u64,
+                "contextWindow": u64::from(n_ctx),
                 "input": ["text"],
                 "maxTokens": 8192,
                 "cost": {"cacheRead": 0, "cacheWrite": 0, "input": 0, "output": 0},
@@ -300,7 +307,7 @@ fn ensure_namespaced_entries(config: &mut Value, models: &[ProfileModel]) -> boo
             obj.insert("id".to_string(), Value::String(ns_ident.clone()));
             obj.insert(
                 "contextWindow".to_string(),
-                Value::Number((pm.n_ctx as u64).into()),
+                Value::Number(u64::from(n_ctx).into()),
             );
         }
         lmstudio_models.push(entry);
@@ -798,7 +805,7 @@ mod tests {
                     endpoint: None,
                     extras: Default::default(),
                     id: "primary-id".into(),
-                    n_ctx: 262144,
+                    n_ctx: Some(262144),
                     capabilities: Default::default(),
                     identifier: None,
                 },
@@ -806,7 +813,7 @@ mod tests {
                     endpoint: None,
                     extras: Default::default(),
                     id: "compactor-id".into(),
-                    n_ctx: 120000,
+                    n_ctx: Some(120000),
                     capabilities: Default::default(),
                     identifier: None,
                 },
@@ -843,7 +850,7 @@ mod tests {
                 endpoint: None,
                 extras: Default::default(),
                 id: "any".into(),
-                n_ctx: 1000,
+                n_ctx: Some(1000),
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -887,7 +894,7 @@ mod tests {
                 endpoint: None,
                 extras: Default::default(),
                 id: "qwen3.6-35b-a3b".into(),
-                n_ctx: 100000,
+                n_ctx: Some(100000),
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -926,7 +933,7 @@ mod tests {
                 endpoint: None,
                 extras: Default::default(),
                 id: "qwen3-4b-instruct-2507".into(),
-                n_ctx: 120000,
+                n_ctx: Some(120000),
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -963,7 +970,7 @@ mod tests {
                 endpoint: None,
                 extras: Default::default(),
                 id: "foo".into(),
-                n_ctx: 1000,
+                n_ctx: Some(1000),
                 capabilities: Default::default(),
                 identifier: Some("my-explicit-alias".into()),
             }],
@@ -993,7 +1000,7 @@ mod tests {
                 endpoint: None,
                 extras: Default::default(),
                 id: "foo".into(),
-                n_ctx: 1000,
+                n_ctx: Some(1000),
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -1024,7 +1031,7 @@ mod tests {
                 endpoint: None,
                 extras: Default::default(),
                 id: "foo".into(),
-                n_ctx: 1000,
+                n_ctx: Some(1000),
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -1078,7 +1085,7 @@ mod tests {
                 endpoint: None,
                 extras: Default::default(),
                 id: "qwen3.6-35b-a3b".into(),
-                n_ctx: 101000,
+                n_ctx: Some(101000),
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -1128,7 +1135,7 @@ mod tests {
                 endpoint: None,
                 extras: Default::default(),
                 id: "unknown-model-id".into(),
-                n_ctx: 64000,
+                n_ctx: Some(64000),
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -1174,7 +1181,7 @@ mod tests {
                 endpoint: None,
                 extras: Default::default(),
                 id: "foo".into(),
-                n_ctx: 50000,
+                n_ctx: Some(50000),
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -1233,7 +1240,7 @@ mod tests {
                 endpoint: None,
                 extras: Default::default(),
                 id: "foo".into(),
-                n_ctx: 80000,
+                n_ctx: Some(80000),
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -1278,7 +1285,7 @@ mod tests {
                 endpoint: None,
                 extras: Default::default(),
                 id: "foo".into(),
-                n_ctx: 50000,
+                n_ctx: Some(50000),
                 capabilities: Default::default(),
                 identifier: Some("my-alias".into()),
             }],
@@ -1312,7 +1319,7 @@ mod tests {
                 endpoint: None,
                 extras: Default::default(),
                 id: "google/gemini-2.5".into(),
-                n_ctx: 1000,
+                n_ctx: Some(1000),
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -1374,7 +1381,7 @@ mod tests {
             endpoint: None,
             extras: Default::default(),
             id: "openai/gpt-oss-20b".into(),
-            n_ctx: 100000,
+            n_ctx: Some(100000),
             capabilities: Default::default(),
             identifier: None,
         }]);
@@ -1428,7 +1435,7 @@ mod tests {
             endpoint: None,
             extras: Default::default(),
             id: "new-model".into(),
-            n_ctx: 100000,
+            n_ctx: Some(100000),
             capabilities: Default::default(),
             identifier: None,
         }]);
@@ -1471,7 +1478,7 @@ mod tests {
                 endpoint: None,
                 extras: Default::default(),
                 id: "new-primary".into(),
-                n_ctx: 100000,
+                n_ctx: Some(100000),
                 capabilities: Default::default(),
                 identifier: None,
             },
@@ -1479,7 +1486,7 @@ mod tests {
                 endpoint: None,
                 extras: Default::default(),
                 id: "second-worker".into(),
-                n_ctx: 32000,
+                n_ctx: Some(32000),
                 capabilities: Default::default(),
                 identifier: None,
             },
@@ -1522,7 +1529,7 @@ mod tests {
                 endpoint: None,
                 extras: Default::default(),
                 id: "first".into(),
-                n_ctx: 100000,
+                n_ctx: Some(100000),
                 capabilities: Default::default(),
                 identifier: None,
             },
@@ -1530,7 +1537,7 @@ mod tests {
                 endpoint: None,
                 extras: Default::default(),
                 id: "the-default".into(),
-                n_ctx: 100000,
+                n_ctx: Some(100000),
                 capabilities: Default::default(),
                 identifier: None,
             },
@@ -1564,7 +1571,7 @@ mod tests {
             endpoint: None,
             extras: Default::default(),
             id: "the-model".into(),
-            n_ctx: 100000,
+            n_ctx: Some(100000),
             capabilities: Default::default(),
             identifier: None,
         }]);
@@ -1592,7 +1599,7 @@ mod tests {
             endpoint: None,
             extras: Default::default(),
             id: "the-model".into(),
-            n_ctx: 100000,
+            n_ctx: Some(100000),
             capabilities: Default::default(),
             identifier: Some("my-custom-alias".into()),
         }]);
@@ -1615,7 +1622,7 @@ mod tests {
             endpoint: None,
             extras: Default::default(),
             id: "the-model".into(),
-            n_ctx: 100000,
+            n_ctx: Some(100000),
             capabilities: Default::default(),
             identifier: None,
         }]);
@@ -1638,7 +1645,7 @@ mod tests {
             endpoint: None,
             extras: Default::default(),
             id: "new-model".into(),
-            n_ctx: 100000,
+            n_ctx: Some(100000),
             capabilities: Default::default(),
             identifier: None,
         }]);
@@ -1668,7 +1675,7 @@ mod tests {
                 endpoint: None,
                 extras: Default::default(),
                 id: "lmstudio-side-model".into(),
-                n_ctx: 100000,
+                n_ctx: Some(100000),
                 capabilities: Default::default(),
                 identifier: None,
             }]);

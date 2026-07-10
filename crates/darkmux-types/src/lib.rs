@@ -71,7 +71,18 @@ pub type CapabilityProfile = BTreeMap<Capability, f32>;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProfileModel {
     pub id: String,
-    pub n_ctx: u32,
+    /// Context window. For a LOCAL model this is the load parameter (a
+    /// minimum — see `swap::ctx_sufficient`) and is REQUIRED at resolution
+    /// time (`require_n_ctx`); for an endpoint-bearing model it is an
+    /// optional *declared* ceiling (the provider owns the real window, so
+    /// operators aren't forced to invent a number — #1282, needed by the
+    /// #1260 remote seats). Optional at the SCHEMA layer either way: the
+    /// local-requires-n_ctx rule is enforced where the value is consumed
+    /// (dispatch load, swap, crew resolution) and surfaced by
+    /// `darkmux doctor`, never on the hot load path (config-leniency
+    /// contract, #1269).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_ctx: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identifier: Option<String>,
     /// Capability vector — what kinds of work this model is good at, and
@@ -100,6 +111,34 @@ pub struct ProfileModel {
     /// re-serialize flat (a newer config read by an older binary).
     #[serde(flatten)]
     pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
+impl ProfileModel {
+    /// Whether this model is served from a declared REMOTE endpoint (an
+    /// `endpoint` block with a `url`). Absent endpoint ⇒ LMStudio local.
+    pub fn is_remote(&self) -> bool {
+        self.endpoint.as_ref().is_some_and(|e| e.is_remote())
+    }
+
+    /// (#1282) The declared context window a LOCAL load requires.
+    ///
+    /// `n_ctx` is optional at the schema layer (endpoint-bearing models have
+    /// no local context to declare), so every path that LOADS the model
+    /// locally — dispatch preload, swap, the funnel cycler — resolves the
+    /// window through this helper and gets ONE uniform, named error when a
+    /// local model omits it. Endpoint paths must not call this (they don't
+    /// read `n_ctx` at all).
+    pub fn require_n_ctx(&self) -> anyhow::Result<u32> {
+        self.n_ctx.ok_or_else(|| {
+            anyhow::anyhow!(
+                "darkmux: model \"{}\" is local (no remote endpoint) but declares no `n_ctx` — \
+                 a local load needs a context window. Add `n_ctx` to the model's registry \
+                 entry (or an `endpoint` block if it's actually hosted); `darkmux doctor` \
+                 lists affected entries. (#1282)",
+                self.id
+            )
+        })
+    }
 }
 
 /// The OpenAI-compatible endpoint a model is served from. Absent on a
@@ -479,7 +518,14 @@ impl Profile {
 // crew assignments — seat staffing). Minor bump — an older binary tolerates
 // it (all-Option + `extras` overflow on `ProfileRegistry`), per the
 // lenient-read doctrine.
-pub const PROFILES_SCHEMA_VERSION: &str = "1.1";
+// 1.2 (#1282): `ProfileModel.n_ctx` is optional (endpoint-bearing models
+// have no local context to declare; the local-requires-n_ctx rule moved to
+// resolution time + doctor). Minor bump: every 1.1 registry parses
+// unchanged under 1.2. Caveat for the reverse direction: a 1.2 registry
+// that actually OMITS `n_ctx` fails an entry-level parse on a pre-1.2
+// binary — the per-entry quarantine (also #1282) scopes that to the one
+// entry on binaries that have it.
+pub const PROFILES_SCHEMA_VERSION: &str = "1.2";
 
 /// A **saved crew assignment**: which models staff which crew-role seats,
 /// for multi-seat pipelines (e.g. a review funnel's probe + judge seats).
@@ -564,6 +610,37 @@ pub struct BundleSelector {
     pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
+/// (#1282) One registry entry that failed its per-entry typed parse and was
+/// quarantined instead of failing the whole registry load (config-leniency
+/// contract #1269, one layer down). Runtime-only — populated by the
+/// `darkmux-profiles` loader, never serialized. `error` preserves serde's
+/// field-level message verbatim (e.g. ``missing field `id```) so the
+/// operator can fix the entry in one look; `darkmux doctor` lists each.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuarantinedEntry {
+    pub kind: QuarantinedEntryKind,
+    /// The entry's registry key (profile or crew name).
+    pub name: String,
+    /// serde's entry-level parse error, verbatim.
+    pub error: String,
+}
+
+/// Which registry section a [`QuarantinedEntry`] came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuarantinedEntryKind {
+    Profile,
+    Crew,
+}
+
+impl std::fmt::Display for QuarantinedEntryKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QuarantinedEntryKind::Profile => write!(f, "profile"),
+            QuarantinedEntryKind::Crew => write!(f, "crew"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProfileRegistry {
     pub profiles: BTreeMap<String, Profile>,
@@ -587,6 +664,12 @@ pub struct ProfileRegistry {
     /// (#1222 Phase B packet 1)
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub crews: BTreeMap<String, Crew>,
+    /// (#1282) Entries whose per-entry typed parse failed — quarantined by
+    /// the `darkmux-profiles` loader instead of blasting the whole file.
+    /// Runtime-only state (never serialized): a quarantined name is absent
+    /// from `profiles`/`crews`; lookups on it surface the parse error here.
+    #[serde(skip)]
+    pub quarantined: Vec<QuarantinedEntry>,
     /// Forward-compat overflow — unknown top-level keys land here and
     /// re-serialize flat (a newer config read by an older binary).
     #[serde(flatten)]
@@ -770,7 +853,7 @@ mod tests {
         let m = ProfileModel {
             endpoint: None,
             id: "x".to_string(),
-            n_ctx: 32_000,
+            n_ctx: Some(32_000),
             capabilities: Default::default(),
             identifier: Some("alias".to_string()),
             extras: Default::default(),
@@ -778,7 +861,7 @@ mod tests {
         let json = serde_json::to_string(&m).unwrap();
         let back: ProfileModel = serde_json::from_str(&json).unwrap();
         assert_eq!(back.id, "x");
-        assert_eq!(back.n_ctx, 32_000);
+        assert_eq!(back.n_ctx, Some(32_000));
         assert_eq!(back.identifier.as_deref(), Some("alias"));
     }
 
@@ -787,13 +870,45 @@ mod tests {
         let m = ProfileModel {
             endpoint: None,
             id: "x".to_string(),
-            n_ctx: 1024,
+            n_ctx: Some(1024),
             capabilities: Default::default(),
             identifier: None,
             extras: Default::default(),
         };
         let json = serde_json::to_string(&m).unwrap();
         assert!(!json.contains("identifier"));
+    }
+
+    /// (#1282) `n_ctx` is optional at the schema layer: an endpoint-bearing
+    /// model parses without one, round-trips with the key ABSENT (not
+    /// `null`/`0`), and `require_n_ctx` — the local-load resolution gate —
+    /// errors with the model named.
+    #[test]
+    fn profile_model_n_ctx_absent_parses_and_round_trips_absent() {
+        let json = r#"{
+            "id": "gpt-4o",
+            "endpoint": { "url": "https://example.azure.com/openai" }
+        }"#;
+        let m: ProfileModel = serde_json::from_str(json).unwrap();
+        assert_eq!(m.n_ctx, None);
+        assert!(m.is_remote());
+        let out = serde_json::to_string(&m).unwrap();
+        assert!(!out.contains("n_ctx"), "absent n_ctx must stay absent: {out}");
+        let back: ProfileModel = serde_json::from_str(&out).unwrap();
+        assert_eq!(back.n_ctx, None);
+    }
+
+    #[test]
+    fn require_n_ctx_errors_on_local_model_without_one() {
+        let m: ProfileModel = serde_json::from_str(r#"{"id":"qwen"}"#).unwrap();
+        assert!(!m.is_remote());
+        let err = m.require_n_ctx().unwrap_err().to_string();
+        assert!(err.contains("qwen"), "error names the model: {err}");
+        assert!(err.contains("n_ctx"), "error names the field: {err}");
+        // A declared window resolves cleanly.
+        let ok: ProfileModel =
+            serde_json::from_str(r#"{"id":"qwen","n_ctx":32000}"#).unwrap();
+        assert_eq!(ok.require_n_ctx().unwrap(), 32_000);
     }
 
     #[test]
@@ -919,7 +1034,7 @@ mod tests {
         let reg: ProfileRegistry = serde_json::from_str(json).unwrap();
         assert_eq!(reg.profiles.len(), 1);
         let p = reg.profiles.get("fast").unwrap();
-        assert_eq!(p.models[0].n_ctx, 32_000);
+        assert_eq!(p.models[0].n_ctx, Some(32_000));
         assert_eq!(p.default_model_id(), Some("model-a"));
         // No `internal` block ⇒ no machine utility model registered.
         assert_eq!(reg.utility_model_id(), None);

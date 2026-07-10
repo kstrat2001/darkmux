@@ -2558,7 +2558,7 @@ mod tests {
     fn dummy_pm(id: &str) -> darkmux_types::ProfileModel {
         darkmux_types::ProfileModel {
             id: id.to_string(),
-            n_ctx: 32_000,
+            n_ctx: Some(32_000),
             ..Default::default()
         }
     }

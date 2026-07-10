@@ -164,7 +164,7 @@ mod tests {
                 endpoint: None,
                 extras: Default::default(),
                 id: model_id.into(),
-                n_ctx: 100_000,
+                n_ctx: Some(100_000),
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -192,7 +192,7 @@ mod tests {
             endpoint: None,
             extras: Default::default(),
             id: id.into(),
-            n_ctx: 100_000,
+            n_ctx: Some(100_000),
             capabilities: caps.iter().cloned().collect(),
             identifier: None,
         }

@@ -3796,7 +3796,9 @@ fn profile_matches(profile: &types::Profile, loaded: &[types::LoadedModel]) -> b
         let Some(cur) = loaded.iter().find(|x| x.identifier == ident) else {
             return false;
         };
-        if cur.context as u32 != m.n_ctx {
+        // (#1282) A model with no declared `n_ctx` (endpoint-bearing) has no
+        // exact local context to match — it can never match a loaded state.
+        if m.n_ctx != Some(cur.context as u32) {
             return false;
         }
     }
@@ -3835,7 +3837,14 @@ fn cmd_profiles(config: Option<&str>, json: bool) -> Result<i32> {
             } else {
                 ""
             };
-            println!("  - {} {} @ ctx {}", darkmux_types::style::dim(&format!("{:<10}", marker)), m.id, m.n_ctx);
+            // (#1282) `n_ctx` is optional (endpoint-bearing models have no
+            // local context to declare) — show what the entry actually says.
+            let ctx = match m.n_ctx {
+                Some(n) => format!("ctx {n}"),
+                None if m.is_remote() => "endpoint".to_string(),
+                None => "ctx unset".to_string(),
+            };
+            println!("  - {} {} @ {}", darkmux_types::style::dim(&format!("{:<10}", marker)), m.id, ctx);
         }
     }
     Ok(0)

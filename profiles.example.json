@@ -1,7 +1,7 @@
 {
-  "_comment": "darkmux profile registry — example. Four general-purpose reference profiles in increasing capacity order: fast → balanced → deep → gpt-oss, plus three review-funnel-dedicated profiles (devstral, qwen3.6-27b-review, judge-35b-moe — see `_crews_comment` below) that staff the `review-deep` crew. A profile's `models[]` are WORKER models (no `role` field — #590); the machine's standing utility/compactor model lives once in the top-level `internal.utility` binding, not per-profile. `default_model` (optional) names a profile's default worker when it lists more than one; with a single model it's implicit. Replace the model ids with what you have downloaded in LMStudio (run `lms ls`).",
+  "_comment": "darkmux profile registry — example. Four general-purpose reference profiles in increasing capacity order: fast → balanced → deep → gpt-oss, plus three review-funnel-dedicated profiles (devstral, qwen3.6-27b-review, judge-35b-moe — see `_crews_comment` below) that staff the `review-deep` crew, plus one hosted endpoint example (hosted-frontier). A profile's `models[]` are WORKER models (no `role` field — #590); the machine's standing utility/compactor model lives once in the top-level `internal.utility` binding, not per-profile. `default_model` (optional) names a profile's default worker when it lists more than one; with a single model it's implicit. `n_ctx` is required for LOCAL models (it is the load parameter) and omitted for endpoint-bearing models (#1282). Replace the model ids with what you have downloaded in LMStudio (run `lms ls`).",
 
-  "schema_version": "1.1",
+  "schema_version": "1.2",
 
   "profiles": {
     "fast": {
@@ -50,6 +50,20 @@
       "description": "Review funnel — judge seat. MoE reasoner weighing the probe seat's findings; deliberately its own profile/model so it never doubles as a probe.",
       "models": [
         { "id": "qwen/qwen3.6-35b-a3b", "n_ctx": 32000 }
+      ]
+    },
+
+    "hosted-frontier": {
+      "description": "Hosted (endpoint-bearing) model — declares NO n_ctx: the provider owns the context window, so there is no local load parameter to invent (#1282). `auth.keychain` names a macOS Keychain ITEM, never the secret itself. Replace the URL/deployment with your own, or delete this profile if you only run local models.",
+      "models": [
+        {
+          "id": "gpt-5.1",
+          "endpoint": {
+            "url": "https://<your-resource>.cognitiveservices.azure.com/openai/deployments/<your-deployment>",
+            "api_version": "2025-01-01-preview",
+            "auth": { "type": "api-key", "keychain": "darkmux-azure-<your-resource>" }
+          }
+        }
       ]
     }
   },

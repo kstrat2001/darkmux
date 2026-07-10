@@ -25,7 +25,9 @@
 //! pipeline.
 
 use anyhow::{Result, anyhow, bail};
-use darkmux_types::{BundleSelector, ProfileModel, ProfileRegistry, SeatStaffing};
+use darkmux_types::{
+    BundleSelector, ProfileModel, ProfileRegistry, QuarantinedEntryKind, SeatStaffing,
+};
 use std::collections::BTreeMap;
 
 use crate::profiles::get_profile;
@@ -66,6 +68,20 @@ pub struct ResolvedCrew {
 ///   model.
 pub fn resolve_crew(reg: &ProfileRegistry, name: &str) -> Result<ResolvedCrew> {
     let crew = reg.crews.get(name).ok_or_else(|| {
+        // (#1282) A quarantined name gets the entry's own parse error, not a
+        // misleading "not found" — the crew IS in the file, it's broken.
+        if let Some(q) = reg
+            .quarantined
+            .iter()
+            .find(|q| q.kind == QuarantinedEntryKind::Crew && q.name == name)
+        {
+            return anyhow!(
+                "darkmux: crew \"{}\" is quarantined — its registry entry failed to \
+                 parse: {}. Fix the entry, then verify with `darkmux doctor`. (#1282)",
+                name,
+                q.error
+            );
+        }
         let available: Vec<&String> = reg.crews.keys().collect();
         let listed = available.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
         anyhow!(
@@ -186,6 +202,13 @@ fn resolve_model(
         }
     }
 
+    // (#1282) Crews are local-only (above), and a local seat gets LOADED at
+    // its declared context — so a missing `n_ctx` is a resolution error
+    // here, with the crew/seat named, never a parse error.
+    if let Err(e) = pm.require_n_ctx() {
+        bail!("darkmux: crew \"{}\" {}: {}", crew_name, label, e);
+    }
+
     Ok(pm.clone())
 }
 
@@ -205,15 +228,16 @@ mod tests {
     fn model(id: &str, n_ctx: u32) -> ProfileModel {
         ProfileModel {
             id: id.to_string(),
-            n_ctx,
+            n_ctx: Some(n_ctx),
             ..Default::default()
         }
     }
 
     fn remote_model(id: &str) -> ProfileModel {
+        // No `n_ctx` — the #1282 schema rule: endpoint-bearing models have
+        // no local context to declare.
         ProfileModel {
             id: id.to_string(),
-            n_ctx: 100_000,
             endpoint: Some(ModelEndpoint {
                 url: Some("https://example.azure.com/openai".to_string()),
                 ..Default::default()
@@ -468,6 +492,35 @@ mod tests {
         );
         let err = resolve_crew(&reg, "bad").unwrap_err();
         assert!(err.to_string().contains("not found in profile"));
+    }
+
+    /// (#1282) A LOCAL staffing whose model omits `n_ctx` parses fine (the
+    /// field is optional at the schema layer) but fails HERE, at resolution,
+    /// with the crew/seat and the model named — a local seat gets loaded at
+    /// its declared context, so there must be one.
+    #[test]
+    fn resolve_crew_local_staffing_without_n_ctx_fails_at_resolution() {
+        let reg = registry(
+            vec![(
+                "ctxless",
+                profile(vec![ProfileModel {
+                    id: "local-a".to_string(),
+                    ..Default::default()
+                }]),
+            )],
+            vec![(
+                "bad",
+                Crew {
+                    seats: seats(vec![("review-probe", vec![staffing("ctxless")])]),
+                    ..Default::default()
+                },
+            )],
+        );
+        let err = resolve_crew(&reg, "bad").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("local-a"), "names the model: {msg}");
+        assert!(msg.contains("n_ctx"), "names the field: {msg}");
+        assert!(msg.contains("review-probe"), "names the seat: {msg}");
     }
 
     #[test]
