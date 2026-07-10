@@ -16,6 +16,60 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 - **`darkmux-review.yml` dispatches the review funnel instead of a single reviewer** (#1222 Phase B, packet 6) — the self-hosted PR-review workflow now runs `darkmux pr-review run`, which drives a saved **crew** (`~/.darkmux/profiles.json` `crews`, Phase B packet 1) through a `review-probe` seat that argues the diff and a `review-judge` seat that weighs the probes' findings, replacing the old single tool-less `pr-reviewer` dispatch outright (pre-1.0, no compat shim). Workflow inputs move from `role`/`profile` to `crew`/`mode`/`k`; model selection stays entirely on the runner (#1054) — the workflow file never names a model, only a crew. `.github/DARKMUX_REVIEW_RUNNER.md` documents the new flow plus a Studio migration checklist (a copy-pasteable `review-deep` crew for a 32GB tier) and the `DARKMUX_REVIEW_CREW` repo-variable override. **Release gate: no version tags this until the labeled-corpus recall/precision validation (#1119) shows the funnel at parity with or ahead of the single-reviewer baseline it replaces** — the dispatch path is complete but not yet measured against the review arc's own bake-off discipline.
 - **Host telemetry sampling during funnel runs** (#1247 doctrine surface — "No blind runs") — `darkmux pr-review run` and `lab review-bench --funnel` now sample host cpu/ram/gpu at ~2s cadence for the whole funnel run's lifetime, same mechanism and record shape (`category=telemetry, source="process", action="telemetry.process"`) the container dispatch path's always-on sampler already produces (#1064), so the run-monitor/viewer renders it unchanged. Samples stream through the SAME injected sink each caller already wires — per-run-local `funnel-events.jsonl` for a bench run, the fleet flow stream for a real `pr-review run` — so a contention-tainted funnel run (e.g. a concurrent `cargo test` build eating inference bandwidth) is now visible in the artifact instead of only reconstructible from LMStudio's own server logs. Lifecycle is RAII-tied to `FunnelBookendGuard`: the sampler starts when the guard is built and stops on every exit path (clean finish, early `?`-return, or panic) — no orphaned sampler thread.
 
+## [1.17.0] - 2026-07-10
+
+The review-funnel release: PR review graduates from a single reviewer dispatch to a measured
+prosecution-and-judgment pipeline, with the lab observability to watch and tune it.
+
+### Added
+- **The review funnel** (#1222 Phase B): `darkmux pr-review run` — procedural bundling
+  (built-in Rust bundler with callee/sibling bodies, param-flow facts, external-symbol
+  manifests; `--bundler <cmd>` plug-in contract) → strong-prior probe seats with k draws →
+  mechanism-family dedup → double-confirm judge → three-tier synthesis (double-confirmed
+  inline REQUEST_CHANGES comments carrying a "needs frontier verification" marker;
+  needs_check as a non-blocking section; everything archived in the envelope artifact).
+  Sources: local `--worktree` or `--github` + `--head-sha` (GitHub API, no checkout).
+  (#1229, #1231, #1235, #1236, #1239, #1250)
+- **Crews registry** (#1231): `crews` in `profiles.json` — saved seat assignments
+  (`review-probe`/`review-judge`) staffed per profile/model with `k`, `max_tokens`, and
+  `bundle_selector`; profiles schema 1.1.
+- **Funnel review workflow** (#1232): `darkmux-review.yml` replaced with the funnel form —
+  inputs `pr`/`crew`/`mode`/`k`, one `pr-review run` invocation, envelope uploaded as an
+  artifact, crash-before-emit guard; Studio migration checklist in the runner docs (#1261).
+- **`review-bench --funnel`** (#1238): the release-guard validation mode — corpus scoring
+  unchanged, per-case funnel console line, `funnels.json` artifact.
+- **Lab run observability** (#1247): funnel flow-record emission through a sink-agnostic
+  emitter (production → flow stream; bench → per-run-local `funnel-events.jsonl`),
+  per-case atomic envelope streaming, staffing snapshots (incl. `n_ctx`) for series
+  comparison, crash-safe step bookends, host telemetry sampling during funnel runs
+  (#1248, #1253, #1264). Flow schema 1.17.0.
+- **The lab observer lens** (#1262): third viewer lens, machine-local — run list grouped
+  by case with knob-diff provenance between runs (two-variable changes warn), live run
+  detail (pipeline stages + ruling feed + host load), `#lens=lab` deep links, served from
+  `darkmux serve --lab-dir <path>`.
+- **Dialectic review-bench mode** (#1223, #1224): the P→D→J three-seat chain.
+- **Agentic + free-form review-bench modes** (#1206, #1179); hosted single-shot dispatch
+  gains `reasoning_effort` (#1204), 429/capacity-shed retry classification (#1207, #1211),
+  and Google-compat fixes (index-less streaming deltas, stop-turn tool calls,
+  thought_signature round-trip) (#1212, #1213, #1214).
+- **Runtime**: per-call token cap override `DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL` (#1225);
+  tool-call arguments recorded in trajectory + flow and surfaced in the viewer (#1220).
+- **Viewer**: activity filter facet + per-activity icons (#1215, #1218), new-run
+  affordances on the machine view (#1208).
+
+### Fixed
+- Funnel prompt assembly byte-matches the measured Phase A prompts (per-seat code-slice
+  formats, prior in the user message, intent-free probes), enforced by golden tests
+  generated from the reference implementation; role texts re-frozen on the measured
+  versions (#1258, #1263).
+- `--bundler`/`--k` warn when ignored with `--from-envelope`; example crew staffs three
+  distinct models (#1250).
+- Judge pass-2 step records open when pass-2 rulings actually begin (#1264); shakedown
+  fixes for wrapped-line anchors, fence-aware quote spans, cliff recovery, watchdog
+  streaming (#1226, #1228); clippy 1.97 toolchain lints (#1259).
+
+[1.17.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.17.0
+
 ## [1.16.0] - 2026-07-05
 
 **The production-review release** — everything the self-hosted QA pipeline needs to run agentic, cloud-backed PR review honestly: a freeform review contract that works WITH tools (a grammar-constrained `output_schema` combined with tools makes a model skip tool-calling and fabricate — verified empirically), a `pr-reviewer-agentic` role that explores the checked-out repo before concluding, a `doctor --probe` that live-verifies a remote credential actually works, and a render pipeline that can no longer present a produced-nothing review as a clean pass. Plus the live viewer stops counting paid cloud tokens as "off the meter." `FLOW_SCHEMA` / `RULES_SCHEMA` / `CONFIG_SCHEMA` unchanged.
