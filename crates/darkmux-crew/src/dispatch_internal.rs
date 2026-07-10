@@ -2400,16 +2400,6 @@ fn run_tailer(
     state.summary
 }
 
-/// Run a command, returning its stdout as a `String` only if it spawned and
-/// exited successfully. Any failure (binary missing, non-zero exit) → `None`.
-/// Keeps the host-load sampler's three best-effort reads terse. (#1064)
-fn run_ok(cmd: &mut Command) -> Option<String> {
-    let out = cmd.output().ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
 /// (#557 slice 4 · #1064) Run the always-on lms + host-load telemetry
 /// sampler to completion. Loops until `stop_flag` is set (the main thread
 /// sets it after `wait_with_output()` returns), sampling the loaded-model
@@ -2508,25 +2498,18 @@ fn run_telemetry_sampler(
         // reads ~0 — the wrong-question problem, #814/#1064). Each read is
         // best-effort and unprivileged; a tick emits whichever of the three
         // succeed (a failed field is simply omitted from the payload).
-        let host_cpu = run_ok(Command::new("top").args(["-l", "1", "-n", "0"]))
-            .and_then(|s| crate::telemetry_sampler::host_cpu_percent_from_top(&s));
-        let host_mem = run_ok(Command::new("sysctl").args(["-n", "hw.memsize"]))
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .and_then(|total| {
-                run_ok(&mut Command::new("vm_stat"))
-                    .and_then(|s| crate::telemetry_sampler::mem_percent_from_vm_stat(&s, total))
-            });
-        let host_gpu = run_ok(Command::new("ioreg").args(["-r", "-d", "1", "-c", "IOAccelerator"]))
-            .and_then(|s| crate::telemetry_sampler::gpu_percent_from_ioreg(&s));
-        if host_cpu.is_some() || host_mem.is_some() || host_gpu.is_some() {
+        // `sample_host` is the shared mechanism (#1247 doctrine surface) —
+        // `darkmux-lab`'s funnel driver samples through the same function.
+        let sample = crate::telemetry_sampler::sample_host();
+        if sample.cpu.is_some() || sample.mem.is_some() || sample.gpu.is_some() {
             let mut payload = serde_json::Map::new();
-            if let Some(c) = host_cpu {
+            if let Some(c) = sample.cpu {
                 payload.insert("cpu".into(), c.into());
             }
-            if let Some(m) = host_mem {
+            if let Some(m) = sample.mem {
                 payload.insert("mem".into(), m.into());
             }
-            if let Some(g) = host_gpu {
+            if let Some(g) = sample.gpu {
                 payload.insert("gpu".into(), g.into());
             }
             emit(
