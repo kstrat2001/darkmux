@@ -52,6 +52,23 @@ const PORT = 47823;
     path.join(SERVED, 'lifecycle-flow.jsonl'),
     fs.readFileSync(path.join(repo, 'tests', 'fixtures', 'lifecycle-flow.jsonl'), 'utf8')
   );
+
+  // (#1247 Part 3) Lab observer lens smoke harness: the static XSS harness
+  // above has no daemon behind it, so `/lab/runs` would 404 — this variant
+  // injects `darkmux-lab-runs-src` (the same static-fixture-override pattern
+  // `darkmux-missions-src`/`darkmux-sprints-src` already use) pointing at a
+  // committed fixture, so `viewer-lab.spec.js` can drive the real lens
+  // end-to-end without a live daemon. Same render path as a real
+  // `/lab/runs` response; no viewer fork.
+  const lab = viewer.replace(
+    '<head>',
+    '<head>\n<meta name="darkmux-mode" content="play">\n<meta name="darkmux-flow-src" content="./xss-flow.jsonl">\n<meta name="darkmux-lab-runs-src" content="./lab-runs-fixture.json">'
+  );
+  fs.writeFileSync(path.join(SERVED, 'index-lab.html'), lab);
+  fs.writeFileSync(
+    path.join(SERVED, 'lab-runs-fixture.json'),
+    fs.readFileSync(path.join(repo, 'tests', 'fixtures', 'lab-runs-fixture.json'), 'utf8')
+  );
 })();
 
 // Serve over HTTP (not file://) so the viewer's boot() fetch('./xss-flow.jsonl')

@@ -42,6 +42,13 @@ pub(crate) struct AppState {
     /// gates new streams on `MAX_CONCURRENT_SSE` and an `SseSlot` guard
     /// decrements this on disconnect.
     sse_open: Arc<AtomicUsize>,
+    /// (#1247 Part 3) The lab observer lens's scan root — `--lab-dir` /
+    /// `DARKMUX_LAB_DIR`. `None` when the daemon started without it: the
+    /// `/lab/*` routes then answer `configured: false` / 404 rather than
+    /// scanning anything. Deliberately NO default scan path — machine-local
+    /// lab data is only read when the operator names the directory (operator
+    /// sovereignty; see the lab-vs-fleet scope boundary project memory).
+    lab_dir: Option<PathBuf>,
 }
 
 /// (#925) RAII slot for one open SSE stream: decrements `AppState::sse_open`
@@ -158,15 +165,31 @@ async fn play_html(Path(date): Path<String>) -> impl IntoResponse {
     }
 }
 
-/// Build the HTTP router with a configurable flows directory. The daemon's
-/// `run` entry point and the integration tests both go through here.
+/// Build the HTTP router with a configurable flows directory. Test-only
+/// convenience wrapper (production's `run()` calls `build_router_full`
+/// directly so it can thread `lab_dir`) — no lab observer root
+/// (`lab_dir: None`); tests that need `/lab/*` go through `build_router_full`.
+#[cfg(test)]
 pub(crate) fn build_router(flows_dir: PathBuf) -> Router {
     build_router_with_worktrees_base(flows_dir, worktrees_base_dir())
 }
 
-/// Like `build_router` but accepts a custom worktrees base directory. This is
-/// the SINGLE place routes are registered (#881 collapsed the prior duplicate
-/// builder), so the auth layers below land in exactly one place.
+/// Like `build_router` but accepts a custom worktrees base directory.
+/// Delegates to `build_router_full` with `lab_dir: None`. Test-only, same
+/// reason as `build_router` above.
+#[cfg(test)]
+pub(crate) fn build_router_with_worktrees_base(
+    flows_dir: PathBuf,
+    worktrees_base: PathBuf,
+) -> Router {
+    build_router_full(flows_dir, worktrees_base, None)
+}
+
+/// Full router builder — flows dir + worktrees base + the lab observer's
+/// scan root. This is the SINGLE place routes are registered (#881 collapsed
+/// the prior duplicate builder; #1247 Part 3 added the `/lab/*` group here
+/// rather than a parallel builder), so the auth layers below land in exactly
+/// one place.
 ///
 /// **Auth wiring (#881):** when a bearer token is configured
 /// (`darkmux_flow::serve_token_present()`), two gates are added — otherwise the
@@ -180,14 +203,22 @@ pub(crate) fn build_router(flows_dir: PathBuf) -> Router {
 ///     non-loopback peers must present the token. `/health` is always exempt
 ///     (doctor's reachability probe). Layered INNER of CORS so preflight is
 ///     handled by the CORS layer first.
-pub(crate) fn build_router_with_worktrees_base(
+///
+/// **`/lab/*` auth (#1247 Part 3):** the lab routes ride the SAME remote-only
+/// gate as everything but `/diff` — read-only local-run artifacts are no more
+/// sensitive than flow records, and the lab lens is machine-local by design
+/// (never federated), so there's no reason to single them out for the
+/// always-on `/diff`-style gate.
+pub(crate) fn build_router_full(
     flows_dir: PathBuf,
     worktrees_base: PathBuf,
+    lab_dir: Option<PathBuf>,
 ) -> Router {
     let state = AppState {
         flows_dir,
         worktrees_base,
         sse_open: Arc::new(AtomicUsize::new(0)),
+        lab_dir,
     };
     let auth_on = darkmux_flow::serve_token_present();
 
@@ -220,6 +251,9 @@ pub(crate) fn build_router_with_worktrees_base(
         .route("/sprints", get(sprints_handler))
         .route("/fleet/sessions/live", get(fleet_sessions_live_handler))
         .route("/fleet/machines/live", get(fleet_machines_live_handler))
+        .route("/lab/runs", get(lab_runs_handler))
+        .route("/lab/run/detail", get(lab_run_detail_handler))
+        .route("/lab/run/events", get(lab_run_events_handler))
         .route("/diff/:session_id", diff_route)
         .layer(tower_http::timeout::TimeoutLayer::new(Duration::from_secs(
             REQUEST_TIMEOUT_SECS,
@@ -569,6 +603,7 @@ fn build_startup_banner(
     sprints_dir_exists: bool,
     mission_count: usize,
     sprint_count: usize,
+    lab_dir: Option<&std::path::Path>,
 ) -> Vec<String> {
     let mut lines = Vec::new();
     let version = env!("CARGO_PKG_VERSION");
@@ -661,6 +696,21 @@ fn build_startup_banner(
         )));
     }
 
+    // (#1247 Part 3) Lab observer scan root — absent by design (no default
+    // scanning of arbitrary paths; the operator names it via `--lab-dir` /
+    // `DARKMUX_LAB_DIR`), so surface whichever state is true rather than
+    // silently leaving the lab lens unexplained.
+    match lab_dir {
+        Some(dir) => lines.push(format!(
+            "  lab dir:        {}",
+            darkmux_types::style::dim(&dir.display().to_string())
+        )),
+        None => lines.push(
+            "  lab dir:        none (pass --lab-dir <path> to enable the lab observer lens)"
+                .to_string(),
+        ),
+    }
+
     lines.push(darkmux_types::style::success("  ready — Ctrl-C to stop"));
     lines
 }
@@ -670,13 +720,13 @@ fn build_startup_banner(
 /// axum gets `SHUTDOWN_GRACE_SECS` to drain in-flight connections
 /// before the process force-exits — SSE streams to the viewer would
 /// otherwise keep the daemon alive forever.
-pub fn run(port: u16, bind: String, flows_dir: PathBuf) -> Result<()> {
+pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>) -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
 
     rt.block_on(async move {
-        let app = build_router(flows_dir.clone());
+        let app = build_router_full(flows_dir.clone(), worktrees_base_dir(), lab_dir.clone());
         let addr: std::net::SocketAddr = format!("{bind}:{port}").parse()?;
         // (#881) Refuse a non-loopback bind without a configured token BEFORE we
         // bind the socket — exposing the read surface unauthenticated is the
@@ -723,6 +773,7 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf) -> Result<()> {
             sprints_dir_exists,
             mission_count,
             sprint_count,
+            lab_dir.as_deref(),
         ) {
             println!("{line}");
         }
@@ -1250,6 +1301,533 @@ fn current_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+// ─── Lab observer lens (#1247 Part 3) ──────────────────────────────────────
+//
+// "Two doors, one viewer, distinct questions" (operator direction, #1247):
+// these routes read ONLY `AppState::lab_dir` — the operator-named scan root
+// passed via `--lab-dir` / `DARKMUX_LAB_DIR` — and never touch the flow
+// stream, Redis, or any other machine's data. Machine-local by construction;
+// no federation, ever. A "run" is any directory directly containing
+// `funnels.json`, `funnel-events.jsonl`, or `scores.json` (the artifacts
+// `review-bench --funnel` writes per-run-local, #1247 Parts 1-2, plus
+// `scores.json` from any other bench mode). The scan is depth-bounded, and a
+// matched run's own `cases/`/`worktrees/` subtrees (full repo checkouts) are
+// never walked into (`LAB_SCAN_SKIP_DIRS` below) — but a match does NOT stop
+// the scan from continuing into a matched dir's OTHER subdirectories, so a
+// stray marker file left at any level (e.g. an ad-hoc `--scores-out`) can
+// never swallow the runs nested beneath it.
+
+/// Bounded recursion depth for the `/lab/runs` scan, counted from `lab_dir`
+/// itself (depth 0).
+const LAB_SCAN_MAX_DEPTH: usize = 4;
+
+/// Subdirectory names never recursed into, even within the depth budget — a
+/// bench run's own artifacts (`worktrees/<case>` is a full git checkout;
+/// `cases/` holds diff/label fixtures) rather than further run clusters,
+/// plus common tooling noise that can sit beside a corpus directory. Belt
+/// and suspenders alongside the depth cap: a checked-out repo tree can be
+/// deep and wide even within 4 levels.
+const LAB_SCAN_SKIP_DIRS: &[&str] =
+    &["worktrees", "cases", ".git", "node_modules", "__pycache__", "target"];
+
+/// Max bytes read from `funnel-events.jsonl` in one `/lab/run/events` poll —
+/// bounds a first-poll backfill against a huge historical run. The endpoint's
+/// contract is explicit backfill via `offset` (never a full-file read in one
+/// response); the client re-polls for the remainder.
+const MAX_LAB_EVENTS_READ_BYTES: usize = 2 << 20; // 2 MiB
+
+/// Resolve + SECURITY-CHECK a `dir` query param against `lab_dir`. Returns
+/// the joined, containment-verified path when `dir` resolves strictly inside
+/// (or IS exactly) `lab_dir` — no absolute override, no `..` component, no
+/// symlink escape; `None` otherwise. Every `/lab/*` endpoint that takes a
+/// `dir` param MUST go through this before touching the filesystem — a
+/// read-only route is still a path-traversal surface if unchecked.
+///
+/// `dir == ""` resolves to `lab_dir` ITSELF, not a rejection: a matched run
+/// at `lab_dir`'s own root (an operator pointing `--lab-dir` directly at one
+/// run's folder, or a stray marker file left there — see
+/// `scan_lab_runs_a_stray_marker_at_lab_dir_root_does_not_hide_nested_runs`)
+/// gets `""` as its `dir` from `build_lab_run_summary`'s `strip_prefix`, and
+/// that identifier has to round-trip back through here or that run is
+/// listed but permanently un-drillable (QA finding, #1247 PR review round).
+///
+/// The string-shape checks (absolute path, `..` component) are defense in
+/// depth and give a cheap, explicit rejection; the REAL boundary is
+/// `worktree_contained`'s canonicalize + prefix check below, which is what
+/// catches a symlink inside `lab_dir` pointing outside it (a pure string
+/// check can't — canonicalize resolves the link to its real target before
+/// the prefix comparison). `lab_dir.join("")` is `lab_dir` unchanged, so an
+/// empty `dir` still passes through the SAME containment check as any other
+/// value (`worktree_contained` trivially holds for a path against itself) —
+/// no separate code path, no separate risk surface.
+fn resolve_lab_run_dir(lab_dir: &StdPath, dir: &str) -> Option<PathBuf> {
+    if StdPath::new(dir).is_absolute() {
+        return None;
+    }
+    if StdPath::new(dir)
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    let candidate = lab_dir.join(dir);
+    worktree_contained(&candidate, lab_dir).then_some(candidate)
+}
+
+/// One run cluster's summary row for `GET /lab/runs`.
+#[derive(Debug, serde::Serialize)]
+struct LabRunSummary {
+    /// POSIX-style path relative to `lab_dir` — the identifier every other
+    /// `/lab/*` endpoint's `dir` query param takes.
+    dir: String,
+    /// Newest mtime among the run's marker artifacts, epoch milliseconds.
+    mtime_ms: u64,
+    case_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    crew: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exec_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile: Option<String>,
+    /// The resolved per-seat staffing (model/k/max_tokens/n_ctx) this run
+    /// actually used — `None` only for a brand-new live run whose first case
+    /// hasn't completed yet (no `funnels.json` snapshot exists).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    staffing: Option<darkmux_lab::lab::funnel::CrewStaffingSnapshot>,
+    bundles: usize,
+    raw_flags: usize,
+    deduped_flags: usize,
+    confirmed: usize,
+    needs_check: usize,
+    archived: usize,
+    degenerate: bool,
+    /// `scores.json` exists — the run reached its terminal artifact write.
+    /// The viewer's live/finished badge keys on this.
+    finished: bool,
+    has_funnels: bool,
+    has_events: bool,
+}
+
+/// GET /lab/runs — every run cluster under the lab observer's scan root,
+/// newest-first. `configured: false` (empty `runs`) when the daemon started
+/// without `--lab-dir` — never a 404/500, so the viewer renders a clean
+/// "not configured" state instead of an error.
+async fn lab_runs_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let Some(lab_dir) = state.lab_dir.clone() else {
+        return axum::Json(serde_json::json!({ "configured": false, "runs": [] }))
+            .into_response();
+    };
+    let runs = tokio::task::spawn_blocking(move || scan_lab_runs(&lab_dir))
+        .await
+        .unwrap_or_default();
+    axum::Json(serde_json::json!({ "configured": true, "runs": runs })).into_response()
+}
+
+fn scan_lab_runs(lab_dir: &StdPath) -> Vec<LabRunSummary> {
+    let mut out = Vec::new();
+    scan_lab_dir_rec(lab_dir, lab_dir, 0, &mut out);
+    // Newest-first — the series/history view wants the latest run of each
+    // task up top; sorting here (not client-side) keeps the contract simple
+    // for any other consumer of this endpoint.
+    // sort_by_key + Reverse rather than a comparator closure — clippy 1.97
+    // (CI's toolchain; local 1.94 doesn't flag it) lints the closure form,
+    // same toolchain-skew class as the #1259 fix.
+    out.sort_by_key(|r| std::cmp::Reverse(r.mtime_ms));
+    out
+}
+
+fn scan_lab_dir_rec(dir: &StdPath, lab_dir: &StdPath, depth: usize, out: &mut Vec<LabRunSummary>) {
+    if depth > LAB_SCAN_MAX_DEPTH {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let has_funnels = dir.join("funnels.json").is_file();
+    let has_events = dir.join("funnel-events.jsonl").is_file();
+    let has_scores = dir.join("scores.json").is_file();
+    if has_funnels || has_events || has_scores {
+        if let Some(summary) = build_lab_run_summary(dir, lab_dir, has_funnels, has_events, has_scores) {
+            out.push(summary);
+        }
+        // Deliberately DOES NOT `return` here — a match does not stop the
+        // scan from continuing into this dir's OTHER subdirectories (see
+        // below). Verified live against a real corpus (#1247 manual
+        // verification): a stray top-level `funnels.json` sitting directly
+        // in `--lab-dir` (leftover from an earlier ad-hoc run) would
+        // otherwise swallow the ENTIRE tree — every nested run under it
+        // silently disappears from `/lab/runs`. The property this guards
+        // against (never walking INTO a matched run's own `worktrees/`/
+        // `cases/` checkout looking for decoy runs) is already enforced
+        // unconditionally by `LAB_SCAN_SKIP_DIRS` below, independent of
+        // whether the current dir itself matched — so skipping the `return`
+        // loses nothing on that front while fixing the swallow bug.
+    }
+    let mut subdirs = Vec::new();
+    for entry in entries.flatten() {
+        // `DirEntry::file_type()` reports the entry's OWN type (does not
+        // follow a symlink) — a symlinked directory is skipped here rather
+        // than walked, matching the containment guard's symlink-escape
+        // stance for the scan side too.
+        let Ok(ft) = entry.file_type() else { continue };
+        if !ft.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        if LAB_SCAN_SKIP_DIRS.contains(&name.to_string_lossy().as_ref()) {
+            continue;
+        }
+        subdirs.push(entry.path());
+    }
+    for sub in subdirs {
+        scan_lab_dir_rec(&sub, lab_dir, depth + 1, out);
+    }
+}
+
+fn build_lab_run_summary(
+    dir: &StdPath,
+    lab_dir: &StdPath,
+    has_funnels: bool,
+    has_events: bool,
+    has_scores: bool,
+) -> Option<LabRunSummary> {
+    let rel = dir
+        .strip_prefix(lab_dir)
+        .ok()?
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    let mut mtime_ms = 0u64;
+    for name in ["scores.json", "funnels.json", "funnel-events.jsonl"] {
+        if let Ok(ms) = mtime_ms_of(&dir.join(name)) {
+            mtime_ms = mtime_ms.max(ms);
+        }
+    }
+
+    let mut case_ids: Vec<String> = Vec::new();
+    let mut crew: Option<String> = None;
+    let mut exec_mode: Option<String> = None;
+    let mut staffing = None;
+    let mut bundles = 0usize;
+    let mut raw_flags = 0usize;
+    let mut deduped_flags = 0usize;
+    let mut confirmed = 0usize;
+    let mut needs_check = 0usize;
+    let mut archived = 0usize;
+    let mut degenerate = false;
+
+    if has_funnels {
+        if let Ok(text) = std::fs::read_to_string(dir.join("funnels.json")) {
+            if let Ok(envs) = serde_json::from_str::<Vec<darkmux_lab::lab::funnel::FunnelEnvelope>>(&text) {
+                for e in &envs {
+                    if !case_ids.contains(&e.case_id) {
+                        case_ids.push(e.case_id.clone());
+                    }
+                    if crew.is_none() {
+                        crew = Some(e.crew.clone());
+                    }
+                    if exec_mode.is_none() {
+                        exec_mode = Some(e.mode.clone());
+                    }
+                    if staffing.is_none() {
+                        staffing = e.staffing.clone();
+                    }
+                    bundles += e.bundles;
+                    raw_flags += e.raw_flags;
+                    deduped_flags += e.deduped_flags;
+                    confirmed += e.confirmed;
+                    needs_check += e.needs_check;
+                    archived += e.archived;
+                    degenerate = degenerate || e.degenerate.is_some();
+                }
+            }
+        }
+    }
+
+    let mut profile: Option<String> = None;
+    if has_scores {
+        if let Ok(doc) = darkmux_lab::lab::scores::read_scores(&dir.join("scores.json")) {
+            profile = doc.provenance.profile.clone();
+            // A NON-funnel bench (scores.json but no funnels.json — Strict/
+            // FreeForm/Agentic/Dialectic mode) has its case ids + crew/mode
+            // only in the score rows' `detail`/`extras`, never an envelope.
+            if !has_funnels {
+                for r in &doc.rows {
+                    if r.axis == "case" {
+                        if let Some(cid) = r.detail.get("case").and_then(|v| v.as_str()) {
+                            if !case_ids.contains(&cid.to_string()) {
+                                case_ids.push(cid.to_string());
+                            }
+                        }
+                    }
+                }
+                if crew.is_none() {
+                    crew = doc.extras.get("crew").and_then(|v| v.as_str()).map(str::to_string);
+                }
+                if exec_mode.is_none() {
+                    exec_mode =
+                        doc.extras.get("exec_mode").and_then(|v| v.as_str()).map(str::to_string);
+                }
+            }
+        }
+    }
+
+    // A brand-new live funnel run (no case has completed yet, so
+    // `funnels.json` doesn't exist) has ONLY the events file — best-effort
+    // case_id/crew/exec_mode from its `funnel.task` "started" records so the
+    // run card isn't blank before the first case lands.
+    if case_ids.is_empty() && has_events {
+        scan_events_prefix_for_task_meta(&dir.join("funnel-events.jsonl"), &mut case_ids, &mut crew, &mut exec_mode);
+    }
+
+    case_ids.sort();
+
+    Some(LabRunSummary {
+        dir: rel,
+        mtime_ms,
+        case_ids,
+        crew,
+        exec_mode,
+        profile,
+        staffing,
+        bundles,
+        raw_flags,
+        deduped_flags,
+        confirmed,
+        needs_check,
+        archived,
+        degenerate,
+        finished: has_scores,
+        has_funnels,
+        has_events,
+    })
+}
+
+fn mtime_ms_of(path: &StdPath) -> std::io::Result<u64> {
+    let meta = std::fs::metadata(path)?;
+    let modified = meta.modified()?;
+    Ok(modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0))
+}
+
+/// Best-effort case_id/crew/exec_mode extraction from a LIVE run's
+/// `funnel-events.jsonl` before any case has completed — reads only the
+/// first `PREFIX_SCAN_LINES` lines (a `funnel.task` "started" record for
+/// each case lands near where that case's block of events begins) rather
+/// than the whole file, so a long-running live file doesn't make the run
+/// LIST endpoint expensive.
+fn scan_events_prefix_for_task_meta(
+    path: &StdPath,
+    case_ids: &mut Vec<String>,
+    crew: &mut Option<String>,
+    exec_mode: &mut Option<String>,
+) {
+    const PREFIX_SCAN_LINES: usize = 200;
+    let Ok(file) = std::fs::File::open(path) else {
+        return;
+    };
+    let reader = std::io::BufReader::new(file);
+    for line in reader.lines().take(PREFIX_SCAN_LINES) {
+        let Ok(line) = line else { break };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(rec) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if rec.get("action").and_then(|a| a.as_str()) != Some("funnel.task") {
+            continue;
+        }
+        let Some(payload) = rec.get("payload") else {
+            continue;
+        };
+        if payload.get("status").and_then(|s| s.as_str()) != Some("started") {
+            continue;
+        }
+        if let Some(cid) = payload.get("case_id").and_then(|v| v.as_str()) {
+            if !case_ids.contains(&cid.to_string()) {
+                case_ids.push(cid.to_string());
+            }
+        }
+        if crew.is_none() {
+            *crew = payload.get("crew").and_then(|v| v.as_str()).map(str::to_string);
+        }
+        if exec_mode.is_none() {
+            *exec_mode = payload.get("exec_mode").and_then(|v| v.as_str()).map(str::to_string);
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct LabDirQuery {
+    dir: String,
+}
+
+#[derive(serde::Serialize, Default)]
+struct LabRunDetailResponse {
+    dir: String,
+    funnels: Vec<darkmux_lab::lab::funnel::FunnelEnvelope>,
+    scores: Option<darkmux_lab::lab::scores::ScoresDoc>,
+}
+
+/// GET /lab/run/detail?dir=<rel> — the envelope(s) + scores content for one
+/// run. `funnels` is `[]` (never an error) when `funnels.json` is absent or
+/// unparseable — a live run before its first case completes, or a non-funnel
+/// bench mode. `scores` is `null` the same way.
+///
+/// DELIBERATELY no byte cap on the two file reads (unlike the events
+/// route's `MAX_LAB_EVENTS_READ_BYTES`): `funnels.json` / `scores.json` are
+/// bounded-by-construction artifacts darkmux itself wrote (one envelope per
+/// case; a heavy real-world run measures single-digit MB), read from a dir
+/// the operator explicitly named on their own machine — not an unbounded
+/// append stream and not attacker-supplied. The events route caps because a
+/// LIVE `funnel-events.jsonl` grows without bound during a run; these don't.
+/// If a cap ever becomes warranted (e.g. a future artifact kind), mirror the
+/// events route's explicit-backfill spirit rather than truncating JSON.
+async fn lab_run_detail_handler(
+    State(state): State<AppState>,
+    Query(q): Query<LabDirQuery>,
+) -> impl IntoResponse {
+    let Some(lab_dir) = state.lab_dir.clone() else {
+        return lab_not_configured();
+    };
+    let Some(run_dir) = resolve_lab_run_dir(&lab_dir, &q.dir) else {
+        return lab_bad_dir();
+    };
+    let dir_label = q.dir.clone();
+    let (funnels, scores) = tokio::task::spawn_blocking(move || {
+        let funnels: Vec<darkmux_lab::lab::funnel::FunnelEnvelope> =
+            std::fs::read_to_string(run_dir.join("funnels.json"))
+                .ok()
+                .and_then(|t| serde_json::from_str(&t).ok())
+                .unwrap_or_default();
+        let scores = darkmux_lab::lab::scores::read_scores(&run_dir.join("scores.json")).ok();
+        (funnels, scores)
+    })
+    .await
+    .unwrap_or_default();
+    axum::Json(LabRunDetailResponse { dir: dir_label, funnels, scores }).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct LabEventsQuery {
+    dir: String,
+    #[serde(default)]
+    offset: u64,
+}
+
+#[derive(Debug, PartialEq, serde::Serialize)]
+struct LabRunEventsResponse {
+    lines: Vec<serde_json::Value>,
+    next_offset: u64,
+    /// `scores.json` exists — the run reached its terminal artifact write,
+    /// so this file has stopped growing. The client stops polling once it
+    /// sees this true (after draining any remaining backlog).
+    finished: bool,
+}
+
+/// GET /lab/run/events?dir=<rel>&offset=<byte> — POLL-based tail of
+/// `funnel-events.jsonl` from a byte offset, returning new complete lines +
+/// the next offset. Deliberately NOT SSE: issue #1227 found a stuck
+/// long-lived stream over a tailscale hop silently drops without a
+/// client-visible signal; a poll loop self-heals on the next tick — the
+/// client re-polls every few seconds with the returned `next_offset`
+/// (explicit backfill, the same shape `/flow/:date?since=` uses).
+async fn lab_run_events_handler(
+    State(state): State<AppState>,
+    Query(q): Query<LabEventsQuery>,
+) -> impl IntoResponse {
+    let Some(lab_dir) = state.lab_dir.clone() else {
+        return lab_not_configured();
+    };
+    let Some(run_dir) = resolve_lab_run_dir(&lab_dir, &q.dir) else {
+        return lab_bad_dir();
+    };
+    let offset = q.offset;
+    match tokio::task::spawn_blocking(move || tail_lab_events(&run_dir, offset)).await {
+        Ok(resp) => axum::Json(resp).into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "darkmux serve: lab events read failed\n",
+        )
+            .into_response(),
+    }
+}
+
+fn lab_not_configured() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        "darkmux serve: lab observer not configured — restart with --lab-dir <path>\n",
+    )
+        .into_response()
+}
+
+fn lab_bad_dir() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        "darkmux serve: bad or out-of-bounds lab run dir\n",
+    )
+        .into_response()
+}
+
+/// Read `funnel-events.jsonl` from `offset`, capped at
+/// `MAX_LAB_EVENTS_READ_BYTES` per call. Only consumes up to the LAST
+/// complete line in the chunk it read — a torn trailing write (a concurrent
+/// writer mid-flush) or hitting the read cap mid-line is left for the next
+/// poll rather than dropped or mis-parsed, so `next_offset` always lands on
+/// a line boundary.
+fn tail_lab_events(dir: &StdPath, offset: u64) -> LabRunEventsResponse {
+    let path = dir.join("funnel-events.jsonl");
+    let finished = dir.join("scores.json").is_file();
+    let empty = |next_offset: u64| LabRunEventsResponse { lines: Vec::new(), next_offset, finished };
+
+    let Ok(mut file) = std::fs::File::open(&path) else {
+        return empty(offset);
+    };
+    let Ok(meta) = file.metadata() else {
+        return empty(offset);
+    };
+    let len = meta.len();
+    if offset >= len {
+        // Nothing new — or a stale offset from a rotated/truncated file;
+        // clamp back to 0 rather than erroring so a client holding a
+        // now-invalid offset recovers on its next poll instead of wedging.
+        return empty(if offset > len { 0 } else { offset });
+    }
+
+    use std::io::{Read, Seek, SeekFrom};
+    if file.seek(SeekFrom::Start(offset)).is_err() {
+        return empty(offset);
+    }
+    let cap = (len - offset).min(MAX_LAB_EVENTS_READ_BYTES as u64) as usize;
+    let mut buf = vec![0u8; cap];
+    let Ok(n) = file.read(&mut buf) else {
+        return empty(offset);
+    };
+    buf.truncate(n);
+
+    let Some(last_nl) = buf.iter().rposition(|&b| b == b'\n') else {
+        // No complete line in this chunk yet (a very long line, or the
+        // writer hasn't flushed a newline) — report no progress; the client
+        // retries with the same offset.
+        return empty(offset);
+    };
+    let consumed = &buf[..=last_nl];
+    let mut lines = Vec::new();
+    for line in consumed.split(|&b| b == b'\n') {
+        if line.is_empty() || line.len() > MAX_FLOW_LINE_BYTES {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) {
+            lines.push(v);
+        }
+    }
+    LabRunEventsResponse { lines, next_offset: offset + last_nl as u64 + 1, finished }
 }
 
 /// GET /flow-status — diagnostic snapshot of the flow substrate. Same
@@ -3899,6 +4477,22 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
+    /// (#1247 Part 3 / #1262 review round) The lab routes must ride the SAME
+    /// remote-only bearer gate as the rest of the read surface — guards
+    /// against a future refactor special-casing `/lab/*` out of `auth_mw`
+    /// (they serve local run artifacts, no less sensitive than flow records).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn lab_runs_requires_token_from_remote_peer() {
+        unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN); }
+        let app = build_router(PathBuf::new());
+        let mut req = Request::builder().uri("/lab/runs").body(Body::empty()).unwrap();
+        req.extensions_mut().insert(remote_peer());
+        let resp = app.oneshot(req).await.unwrap();
+        unsafe { std::env::remove_var("DARKMUX_SERVE_TOKEN"); }
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn flow_accepts_remote_peer_with_token() {
@@ -4397,7 +4991,7 @@ mod tests {
         let missions = PathBuf::from("/tmp/darkmux-missions-banner-test");
         let sprints = PathBuf::from("/tmp/darkmux-sprints-banner-test");
         let lines = build_startup_banner(
-            &sample_addr(), &flows, true, &missions, true, &sprints, true, 3, 9,
+            &sample_addr(), &flows, true, &missions, true, &sprints, true, 3, 9, None,
         );
 
         // Title carries the binary version that operators bump via cargo install.
@@ -4423,7 +5017,7 @@ mod tests {
         let missions = PathBuf::from("/tmp/darkmux-banner-present-missions");
         let sprints = PathBuf::from("/tmp/darkmux-banner-present-sprints");
         let lines = build_startup_banner(
-            &sample_addr(), &flows, false, &missions, true, &sprints, true, 0, 0,
+            &sample_addr(), &flows, false, &missions, true, &sprints, true, 0, 0, None,
         );
         let joined = lines.join("\n");
         assert!(
@@ -4446,7 +5040,7 @@ mod tests {
         let missions = PathBuf::from("/tmp/darkmux-banner-missing-missions");
         let sprints = PathBuf::from("/tmp/darkmux-banner-present-sprints");
         let lines = build_startup_banner(
-            &sample_addr(), &flows, true, &missions, false, &sprints, true, 0, 0,
+            &sample_addr(), &flows, true, &missions, false, &sprints, true, 0, 0, None,
         );
         let joined = lines.join("\n");
         assert!(
@@ -4469,7 +5063,7 @@ mod tests {
         let missions = PathBuf::from("/tmp/darkmux-banner-present-missions");
         let sprints = PathBuf::from("/tmp/darkmux-banner-missing-sprints");
         let lines = build_startup_banner(
-            &sample_addr(), &flows, true, &missions, true, &sprints, false, 0, 0,
+            &sample_addr(), &flows, true, &missions, true, &sprints, false, 0, 0, None,
         );
         let joined = lines.join("\n");
         assert!(
@@ -4488,12 +5082,40 @@ mod tests {
         let missions = PathBuf::from("/some/missions");
         let sprints = PathBuf::from("/some/sprints");
         let lines = build_startup_banner(
-            &sample_addr(), &flows, true, &missions, true, &sprints, true, 1, 4,
+            &sample_addr(), &flows, true, &missions, true, &sprints, true, 1, 4, None,
         );
         let joined = lines.join("\n");
         assert!(!joined.contains("doesn't exist yet"), "no flows warning");
         assert!(!joined.contains("missions dir not found"), "no missions warning");
         assert!(!joined.contains("sprints dir not found"), "no sprints warning");
+    }
+
+    /// (#1247 Part 3) The banner names whichever lab-dir state is true —
+    /// configured (shows the path) or unconfigured (shows the enable hint) —
+    /// so the operator never has to wonder why the lab lens is empty.
+    #[test]
+    fn startup_banner_reports_lab_dir_state() {
+        let flows = PathBuf::from("/some/flows");
+        let missions = PathBuf::from("/some/missions");
+        let sprints = PathBuf::from("/some/sprints");
+        let unconfigured = build_startup_banner(
+            &sample_addr(), &flows, true, &missions, true, &sprints, true, 0, 0, None,
+        )
+        .join("\n");
+        assert!(
+            unconfigured.contains("lab dir:") && unconfigured.contains("--lab-dir"),
+            "expected the enable hint when unconfigured: {unconfigured}"
+        );
+
+        let lab = PathBuf::from("/some/lab-runs");
+        let configured = build_startup_banner(
+            &sample_addr(), &flows, true, &missions, true, &sprints, true, 0, 0, Some(&lab),
+        )
+        .join("\n");
+        assert!(
+            configured.contains("/some/lab-runs"),
+            "expected the configured lab dir path: {configured}"
+        );
     }
 
     // ─── #270 Redis aggregation tests ─────────────────────────────────
@@ -5355,5 +5977,575 @@ mod tests {
         let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON body");
         assert!(!json["available"].as_bool().unwrap_or(false));
+    }
+
+    // ─── #1247 Part 3: lab observer lens ───────────────────────────────────
+    //
+    // Every fixture below is SYNTHETIC — fabricated field-for-field to match
+    // the real `FunnelEnvelope` / `FlowRecord` / `ScoresDoc` shapes (verified
+    // against the actual types via `darkmux_lab::lab::{funnel,scores}`), but
+    // with invented model names / case ids / crew names. No content from any
+    // private corpus.
+
+    /// Write a "finished" synthetic funnel run at `dir`: `funnels.json` (one
+    /// envelope), `funnel-events.jsonl` (a couple of records), and
+    /// `scores.json` (minimal valid doc). `mtime_offset_secs` lets a test
+    /// stagger two runs' mtimes deterministically (rather than racing on
+    /// filesystem timestamp resolution) — 0 for "now", a larger value for
+    /// "older" by touching the file's mtime backward via `filetime`-free
+    /// manual `set_file_mtime` (std has no stable API pre-1.75 filetime
+    /// crate; sidestepped by writing older runs FIRST in test bodies instead
+    /// — see the callers).
+    fn write_synthetic_funnel_run(dir: &StdPath, case_id: &str, crew: &str) {
+        fs::create_dir_all(dir).unwrap();
+        let funnels = serde_json::json!([{
+            "case_id": case_id,
+            "crew": crew,
+            "mode": "sequential",
+            "members": [],
+            "steps": [],
+            "bundles": 5,
+            "raw_flags": 8,
+            "deduped_flags": 6,
+            "flags": [],
+            "judged": [],
+            "confirmed": 2,
+            "needs_check": 1,
+            "archived": 3,
+            "fingerprint": {},
+            "staffing": {
+                "probes": [
+                    {"name": "demo-probe", "model": "darkmux:demo-probe-model", "k": 1, "n_ctx": 32768, "max_tokens": 3000}
+                ],
+                "judge": {"name": "demo-judge", "model": "darkmux:demo-judge-model", "k": 3, "n_ctx": 65536, "max_tokens": 20000}
+            }
+        }]);
+        fs::write(dir.join("funnels.json"), serde_json::to_vec_pretty(&funnels).unwrap()).unwrap();
+
+        let events = format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "ts": "2026-01-01T00:00:00Z", "level": "info", "category": "work",
+                "tier": "local", "stage": "dispatch", "action": "funnel.task",
+                "handle": crew, "session_id": case_id, "source": "funnel",
+                "payload": {"case_id": case_id, "crew": crew, "exec_mode": "sequential", "status": "started", "bundles": 5}
+            }),
+            serde_json::json!({
+                "ts": "2026-01-01T00:05:00Z", "level": "info", "category": "work",
+                "tier": "local", "stage": "dispatch", "action": "funnel.task",
+                "handle": crew, "session_id": case_id, "source": "funnel",
+                "payload": {"status": "finished", "confirmed": 2, "needs_check": 1, "archived": 3}
+            }),
+        );
+        fs::write(dir.join("funnel-events.jsonl"), events).unwrap();
+
+        let scores = serde_json::json!({
+            "schema_version": "1.0.0",
+            "provenance": {
+                "run_id": format!("demo-run-{case_id}"),
+                "ts": "2026-01-01T00:05:00Z",
+                "machine": {"machine_id": "test-machine"},
+                "profile": "demo-profile",
+                "loaded_drift": false
+            },
+            "rows": [],
+            "crew": crew,
+            "exec_mode": "sequential",
+            "mode": "funnel",
+            "k": "(profile default)"
+        });
+        fs::write(dir.join("scores.json"), serde_json::to_vec_pretty(&scores).unwrap()).unwrap();
+    }
+
+    /// Write a LIVE synthetic run at `dir`: only `funnel-events.jsonl` with a
+    /// single "started" `funnel.task` record — no `funnels.json`/
+    /// `scores.json` yet, matching a run whose first case hasn't completed.
+    fn write_synthetic_live_run(dir: &StdPath, case_id: &str, crew: &str) {
+        fs::create_dir_all(dir).unwrap();
+        let record = serde_json::json!({
+            "ts": "2026-01-01T00:00:00Z", "level": "info", "category": "work",
+            "tier": "local", "stage": "dispatch", "action": "funnel.task",
+            "handle": crew, "session_id": case_id, "source": "funnel",
+            "payload": {"case_id": case_id, "crew": crew, "exec_mode": "parallel", "status": "started", "bundles": 12}
+        });
+        fs::write(dir.join("funnel-events.jsonl"), format!("{record}\n")).unwrap();
+    }
+
+    #[test]
+    fn resolve_lab_run_dir_accepts_valid_relative_subdir() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("case-a/run1")).unwrap();
+        let resolved = resolve_lab_run_dir(tmp.path(), "case-a/run1");
+        assert_eq!(resolved, Some(tmp.path().join("case-a/run1")));
+    }
+
+    #[test]
+    fn resolve_lab_run_dir_rejects_absolute_path() {
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(resolve_lab_run_dir(tmp.path(), "/etc/passwd"), None);
+    }
+
+    #[test]
+    fn resolve_lab_run_dir_rejects_parent_dir_traversal() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("case-a")).unwrap();
+        assert_eq!(resolve_lab_run_dir(tmp.path(), "case-a/../../etc"), None);
+        assert_eq!(resolve_lab_run_dir(tmp.path(), "../outside"), None);
+    }
+
+    #[test]
+    fn resolve_lab_run_dir_empty_resolves_to_lab_dir_itself() {
+        // QA finding (#1247 PR review round): a run matched AT `lab_dir`'s
+        // own root gets `""` as its `dir` — that identifier must round-trip
+        // back to `lab_dir`, or such a run is listed but permanently
+        // un-drillable (a 400 on every detail/events request).
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(resolve_lab_run_dir(tmp.path(), ""), Some(tmp.path().to_path_buf()));
+    }
+
+    #[test]
+    fn resolve_lab_run_dir_rejects_nonexistent_subdir() {
+        // worktree_contained canonicalizes both sides; a dir that was never
+        // created can't resolve — the endpoint would 400 rather than 500 on
+        // a typo'd `dir` param.
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(resolve_lab_run_dir(tmp.path(), "does-not-exist"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_lab_run_dir_rejects_symlink_escape() {
+        // A symlink INSIDE lab_dir pointing OUTSIDE it must be rejected —
+        // the string-shape checks (`..`, absolute) can't catch this; only
+        // the canonicalize + prefix check in `worktree_contained` can, since
+        // canonicalize resolves the link to its real (outside) target before
+        // the prefix comparison runs.
+        let lab = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::create_dir_all(outside.path().join("secret")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), lab.path().join("escape")).unwrap();
+        assert_eq!(resolve_lab_run_dir(lab.path(), "escape"), None);
+    }
+
+    #[test]
+    fn scan_lab_runs_finds_a_finished_run_and_computes_headline_counts() {
+        let tmp = TempDir::new().unwrap();
+        write_synthetic_funnel_run(&tmp.path().join("case-a/run1"), "demo-case-a", "demo-crew");
+        let runs = scan_lab_runs(tmp.path());
+        assert_eq!(runs.len(), 1, "expected exactly one run cluster: {runs:?}");
+        let r = &runs[0];
+        assert_eq!(r.dir, "case-a/run1");
+        assert_eq!(r.case_ids, vec!["demo-case-a".to_string()]);
+        assert_eq!(r.crew.as_deref(), Some("demo-crew"));
+        assert_eq!(r.exec_mode.as_deref(), Some("sequential"));
+        assert_eq!(r.bundles, 5);
+        assert_eq!(r.raw_flags, 8);
+        assert_eq!(r.deduped_flags, 6);
+        assert_eq!(r.confirmed, 2);
+        assert_eq!(r.needs_check, 1);
+        assert_eq!(r.archived, 3);
+        assert!(!r.degenerate);
+        assert!(r.finished, "scores.json present => finished");
+        assert!(r.has_funnels);
+        assert!(r.has_events);
+        let staffing = r.staffing.as_ref().expect("staffing snapshot present");
+        assert_eq!(staffing.probes.len(), 1);
+        assert_eq!(staffing.probes[0].model, "darkmux:demo-probe-model");
+        assert_eq!(staffing.judge.as_ref().unwrap().model, "darkmux:demo-judge-model");
+    }
+
+    #[test]
+    fn scan_lab_runs_finds_a_live_run_via_events_prefix_scan() {
+        let tmp = TempDir::new().unwrap();
+        write_synthetic_live_run(&tmp.path().join("case-b/gate-1"), "demo-case-b", "demo-gate-crew");
+        let runs = scan_lab_runs(tmp.path());
+        assert_eq!(runs.len(), 1);
+        let r = &runs[0];
+        assert_eq!(r.dir, "case-b/gate-1");
+        assert_eq!(r.case_ids, vec!["demo-case-b".to_string()]);
+        assert_eq!(r.crew.as_deref(), Some("demo-gate-crew"));
+        assert_eq!(r.exec_mode.as_deref(), Some("parallel"));
+        assert!(!r.finished, "no scores.json yet => not finished");
+        assert!(!r.has_funnels, "no case has completed yet");
+        assert!(r.has_events);
+        assert!(r.staffing.is_none(), "no envelope snapshot exists yet");
+    }
+
+    #[test]
+    fn scan_lab_runs_does_not_descend_into_a_matched_runs_worktrees() {
+        // A matched run dir's own `worktrees/<case>` subtree is a full repo
+        // checkout that could itself contain marker-file-shaped noise (e.g.
+        // a nested fixture) — `LAB_SCAN_SKIP_DIRS` must keep the scan from
+        // ever walking into it looking for more runs, unconditionally
+        // (independent of whether the parent itself matched — see the next
+        // test for why "stop entirely on match" is NOT the mechanism this
+        // relies on).
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("probe-27b-527");
+        write_synthetic_funnel_run(&run_dir, "demo-case-c", "demo-crew");
+        // Plant a decoy inside the run's own worktrees/ subtree that WOULD
+        // match the run-cluster criterion if the scanner ever walked there.
+        let decoy = run_dir.join("worktrees/demo-case-c/nested");
+        fs::create_dir_all(&decoy).unwrap();
+        fs::write(decoy.join("scores.json"), "{}").unwrap();
+
+        let runs = scan_lab_runs(tmp.path());
+        assert_eq!(runs.len(), 1, "the decoy under worktrees/ must not surface as a second run: {runs:?}");
+        assert_eq!(runs[0].dir, "probe-27b-527");
+    }
+
+    /// Regression (caught live against a real corpus during #1247 manual
+    /// verification, NOT in unit tests originally): a stray marker file
+    /// left directly at `lab_dir` — e.g. a leftover `funnels.json` from an
+    /// earlier ad-hoc `--scores-out` pointed at the corpus root — must not
+    /// swallow every run nested beneath it. An earlier version of this scan
+    /// returned early the instant ANY directory matched, which made
+    /// `lab_dir` itself matching hide the entire tree below it.
+    #[test]
+    fn scan_lab_runs_a_stray_marker_at_lab_dir_root_does_not_hide_nested_runs() {
+        let tmp = TempDir::new().unwrap();
+        // A stray funnels.json sitting directly at the scan root — matches
+        // the run-cluster criterion on its own, with no sibling scores.json
+        // or funnel-events.jsonl (exactly the leftover-artifact shape).
+        fs::write(tmp.path().join("funnels.json"), "[]").unwrap();
+        write_synthetic_funnel_run(&tmp.path().join("case-a/run1"), "demo-case-a", "demo-crew");
+        write_synthetic_funnel_run(&tmp.path().join("case-b/run1"), "demo-case-b", "demo-crew");
+
+        let runs = scan_lab_runs(tmp.path());
+        let dirs: Vec<&str> = runs.iter().map(|r| r.dir.as_str()).collect();
+        assert!(dirs.contains(&""), "the root's own stray marker still surfaces as a run: {dirs:?}");
+        assert!(dirs.contains(&"case-a/run1"), "nested runs must survive a matching root: {dirs:?}");
+        assert!(dirs.contains(&"case-b/run1"), "nested runs must survive a matching root: {dirs:?}");
+        assert_eq!(runs.len(), 3, "{runs:?}");
+    }
+
+    #[test]
+    fn scan_lab_runs_respects_max_depth() {
+        let tmp = TempDir::new().unwrap();
+        // 6 levels deep — past LAB_SCAN_MAX_DEPTH (4) from lab_dir.
+        let deep = tmp
+            .path()
+            .join("a/b/c/d/e/f");
+        write_synthetic_funnel_run(&deep, "too-deep", "demo-crew");
+        let runs = scan_lab_runs(tmp.path());
+        assert!(runs.is_empty(), "a run past the depth cap must not surface: {runs:?}");
+    }
+
+    #[test]
+    fn scan_lab_runs_multiple_case_dirs_sorted_newest_first() {
+        let tmp = TempDir::new().unwrap();
+        write_synthetic_funnel_run(&tmp.path().join("older/run1"), "case-older", "crew-x");
+        // Force a deterministic newer mtime on the second run's marker files
+        // rather than racing filesystem timestamp resolution.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write_synthetic_funnel_run(&tmp.path().join("newer/run1"), "case-newer", "crew-x");
+
+        let runs = scan_lab_runs(tmp.path());
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].dir, "newer/run1", "newest run sorts first: {runs:?}");
+        assert_eq!(runs[1].dir, "older/run1");
+    }
+
+    #[test]
+    fn tail_lab_events_backfills_from_zero_then_returns_only_new_lines() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        fs::write(dir.join("funnel-events.jsonl"), "{\"a\":1}\n{\"a\":2}\n").unwrap();
+
+        let first = tail_lab_events(dir, 0);
+        assert_eq!(first.lines.len(), 2);
+        assert!(!first.finished);
+        assert!(first.next_offset > 0);
+
+        // Nothing new yet — same offset, empty backfill.
+        let stale = tail_lab_events(dir, first.next_offset);
+        assert!(stale.lines.is_empty());
+        assert_eq!(stale.next_offset, first.next_offset);
+
+        // Append a third record and re-poll from the returned offset.
+        use std::io::Write;
+        let mut f = fs::OpenOptions::new().append(true).open(dir.join("funnel-events.jsonl")).unwrap();
+        writeln!(f, "{{\"a\":3}}").unwrap();
+        drop(f);
+
+        let second = tail_lab_events(dir, first.next_offset);
+        assert_eq!(second.lines.len(), 1, "only the newly-appended line: {second:?}");
+        assert_eq!(second.lines[0]["a"], 3);
+    }
+
+    #[test]
+    fn tail_lab_events_leaves_a_torn_trailing_line_for_the_next_poll() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        // A complete line followed by a partial one with NO trailing
+        // newline — simulates reading mid-flush.
+        fs::write(dir.join("funnel-events.jsonl"), "{\"a\":1}\n{\"a\":2").unwrap();
+
+        let resp = tail_lab_events(dir, 0);
+        assert_eq!(resp.lines.len(), 1, "the torn line must not be parsed yet: {resp:?}");
+        assert_eq!(resp.lines[0]["a"], 1);
+        // next_offset must land exactly after the complete line's newline,
+        // not past the torn trailing bytes.
+        assert_eq!(resp.next_offset, "{\"a\":1}\n".len() as u64);
+    }
+
+    #[test]
+    fn tail_lab_events_reports_finished_once_scores_json_exists() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        fs::write(dir.join("funnel-events.jsonl"), "{\"a\":1}\n").unwrap();
+        assert!(!tail_lab_events(dir, 0).finished);
+        fs::write(dir.join("scores.json"), "{}").unwrap();
+        assert!(tail_lab_events(dir, 0).finished);
+    }
+
+    #[test]
+    fn tail_lab_events_missing_file_returns_empty_not_error() {
+        let tmp = TempDir::new().unwrap();
+        let resp = tail_lab_events(tmp.path(), 0);
+        assert!(resp.lines.is_empty());
+        assert_eq!(resp.next_offset, 0);
+        assert!(!resp.finished);
+    }
+
+    #[tokio::test]
+    async fn lab_runs_handler_reports_unconfigured_when_no_lab_dir() {
+        let flows = TempDir::new().unwrap();
+        let app = build_router_full(flows.path().to_path_buf(), worktrees_base_dir(), None);
+        let response = app
+            .oneshot(Request::builder().uri("/lab/runs").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["configured"], false);
+        assert_eq!(json["runs"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn lab_runs_handler_lists_a_configured_runs_directory() {
+        let flows = TempDir::new().unwrap();
+        let lab = TempDir::new().unwrap();
+        write_synthetic_funnel_run(&lab.path().join("case-a/run1"), "demo-case-a", "demo-crew");
+        let app = build_router_full(
+            flows.path().to_path_buf(),
+            worktrees_base_dir(),
+            Some(lab.path().to_path_buf()),
+        );
+        let response = app
+            .oneshot(Request::builder().uri("/lab/runs").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["configured"], true);
+        let runs = json["runs"].as_array().unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["dir"], "case-a/run1");
+        assert_eq!(runs[0]["crew"], "demo-crew");
+    }
+
+    #[tokio::test]
+    async fn lab_run_detail_handler_returns_funnels_and_scores() {
+        let flows = TempDir::new().unwrap();
+        let lab = TempDir::new().unwrap();
+        write_synthetic_funnel_run(&lab.path().join("case-a/run1"), "demo-case-a", "demo-crew");
+        let app = build_router_full(
+            flows.path().to_path_buf(),
+            worktrees_base_dir(),
+            Some(lab.path().to_path_buf()),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/lab/run/detail?dir=case-a%2Frun1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["dir"], "case-a/run1");
+        let funnels = json["funnels"].as_array().unwrap();
+        assert_eq!(funnels.len(), 1);
+        assert_eq!(funnels[0]["case_id"], "demo-case-a");
+        assert_eq!(json["scores"]["provenance"]["profile"], "demo-profile");
+    }
+
+    #[tokio::test]
+    async fn lab_run_detail_handler_resolves_a_run_matched_at_lab_dir_root() {
+        // QA finding (#1247 PR review round): `lab_dir` ITSELF matching the
+        // run-cluster criteria (an operator pointing `--lab-dir` at one
+        // run's folder, or a stray marker left at the root) gets `dir: ""`
+        // from `/lab/runs` — that identifier must actually be drillable, not
+        // a permanent 400.
+        let flows = TempDir::new().unwrap();
+        let lab = TempDir::new().unwrap();
+        write_synthetic_funnel_run(lab.path(), "demo-case-root", "demo-crew");
+        let app = build_router_full(
+            flows.path().to_path_buf(),
+            worktrees_base_dir(),
+            Some(lab.path().to_path_buf()),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/lab/run/detail?dir=")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["funnels"].as_array().unwrap()[0]["case_id"], "demo-case-root");
+    }
+
+    #[tokio::test]
+    async fn lab_run_detail_handler_rejects_traversal_dir() {
+        let flows = TempDir::new().unwrap();
+        let lab = TempDir::new().unwrap();
+        write_synthetic_funnel_run(&lab.path().join("case-a/run1"), "demo-case-a", "demo-crew");
+        let app = build_router_full(
+            flows.path().to_path_buf(),
+            worktrees_base_dir(),
+            Some(lab.path().to_path_buf()),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/lab/run/detail?dir=..%2F..%2Fetc")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn lab_run_detail_handler_404s_when_not_configured() {
+        let flows = TempDir::new().unwrap();
+        let app = build_router_full(flows.path().to_path_buf(), worktrees_base_dir(), None);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/lab/run/detail?dir=case-a%2Frun1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn lab_run_events_handler_backfills_then_deltas_across_two_polls() {
+        let flows = TempDir::new().unwrap();
+        let lab = TempDir::new().unwrap();
+        let run_dir = lab.path().join("live/gate-1");
+        write_synthetic_live_run(&run_dir, "demo-case-b", "demo-gate-crew");
+        let app = build_router_full(
+            flows.path().to_path_buf(),
+            worktrees_base_dir(),
+            Some(lab.path().to_path_buf()),
+        );
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/lab/run/events?dir=live%2Fgate-1&offset=0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let bytes = to_bytes(first.into_body(), 65536).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["lines"].as_array().unwrap().len(), 1);
+        assert!(!json["finished"].as_bool().unwrap());
+        let next_offset = json["next_offset"].as_u64().unwrap();
+        assert!(next_offset > 0);
+
+        // Append a second record directly (simulating the driver emitting
+        // another step) and re-poll from next_offset.
+        use std::io::Write;
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .open(run_dir.join("funnel-events.jsonl"))
+            .unwrap();
+        writeln!(
+            f,
+            "{}",
+            serde_json::json!({
+                "ts": "2026-01-01T00:01:00Z", "level": "info", "category": "work",
+                "tier": "local", "stage": "dispatch", "action": "funnel.step",
+                "handle": "demo-gate-crew", "session_id": "demo-case-b", "source": "funnel",
+                "payload": {"step_id": "bundle", "kind": "procedural", "status": "finished", "items_in": 1, "items_out": 12, "wall_ms": 0}
+            })
+        )
+        .unwrap();
+        drop(f);
+
+        let second = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/lab/run/events?dir=live%2Fgate-1&offset={next_offset}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let bytes = to_bytes(second.into_body(), 65536).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let lines = json["lines"].as_array().unwrap();
+        assert_eq!(lines.len(), 1, "only the newly-appended record: {lines:?}");
+        assert_eq!(lines[0]["action"], "funnel.step");
+    }
+
+    #[tokio::test]
+    async fn lab_run_events_handler_rejects_traversal_dir() {
+        let flows = TempDir::new().unwrap();
+        let lab = TempDir::new().unwrap();
+        write_synthetic_live_run(&lab.path().join("live/gate-1"), "demo-case-b", "demo-gate-crew");
+        let app = build_router_full(
+            flows.path().to_path_buf(),
+            worktrees_base_dir(),
+            Some(lab.path().to_path_buf()),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/lab/run/events?dir=%2Fetc%2Fpasswd&offset=0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn lab_run_events_handler_404s_when_not_configured() {
+        let flows = TempDir::new().unwrap();
+        let app = build_router_full(flows.path().to_path_buf(), worktrees_base_dir(), None);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/lab/run/events?dir=live%2Fgate-1&offset=0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }

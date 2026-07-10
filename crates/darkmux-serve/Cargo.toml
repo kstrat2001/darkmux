@@ -17,6 +17,11 @@ darkmux-crew = { path = "../darkmux-crew" }
 darkmux-eureka = { path = "../darkmux-eureka" }
 darkmux-fleet = { path = "../darkmux-fleet" }
 darkmux-doctor = { path = "../darkmux-doctor" }
+# (#1247 Part 3) Lab observer lens — reuses `lab::funnel::FunnelEnvelope` +
+# `lab::scores::{ScoresDoc, read_scores}` so the daemon parses the SAME
+# artifact shapes `review-bench --funnel` writes instead of re-deriving a
+# parallel schema. No cycle: darkmux-lab has no dependency back on darkmux-serve.
+darkmux-lab = { path = "../darkmux-lab" }
 anyhow = "1.0"
 axum = "0.7"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "fs", "io-util"] }
