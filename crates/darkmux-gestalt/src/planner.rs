@@ -285,13 +285,7 @@ pub fn plan_acquire(
 
     // ── #1243 budget arm, refusal half ───────────────────────────────────
     if let Some(budget) = facts.budget.max_darkmux_bytes {
-        // Accounting degradation is loud: unknown-size darkmux residents
-        // count as 0 against the cap, and say so (host order).
-        for r in &facts.residents {
-            if is_darkmux_owned(&r.identifier) && r.est_bytes.is_none() {
-                warnings.push(Warning::ResidentBytesUnknown { identifier: r.identifier.clone() });
-            }
-        }
+        warn_unknown_owned_resident_bytes(&mut warnings, facts);
         // A load whose estimate alone exceeds the whole budget is refused
         // for BOTH intents — no eviction sequence can ever satisfy it. The
         // refusal names the BUDGET even behind a foreign duplicate: the cap
@@ -632,9 +626,22 @@ fn is_load_like(action: &Action) -> bool {
     matches!(action, Action::Load { .. })
 }
 
+/// (#1243 accounting degradation, loud) Unknown-size darkmux-owned residents
+/// count 0 against the cap and say so, in host-reported order. Shared with
+/// the #1285 wave scheduler — one emission of the degradation, not two.
+pub(crate) fn warn_unknown_owned_resident_bytes(warnings: &mut Vec<Warning>, facts: &Facts) {
+    for r in &facts.residents {
+        if is_darkmux_owned(&r.identifier) && r.est_bytes.is_none() {
+            warnings.push(Warning::ResidentBytesUnknown { identifier: r.identifier.clone() });
+        }
+    }
+}
+
 /// Sum of darkmux-owned resident bytes that remain after the indexes in
 /// `removed` leave residency. Unknown sizes count 0 (warned separately).
-fn resident_base(facts: &Facts, removed: &BTreeSet<usize>) -> u64 {
+/// Shared with the #1285 wave scheduler — one definition of the #1243
+/// budget base.
+pub(crate) fn resident_base(facts: &Facts, removed: &BTreeSet<usize>) -> u64 {
     facts
         .residents
         .iter()

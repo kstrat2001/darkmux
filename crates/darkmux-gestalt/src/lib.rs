@@ -9,6 +9,11 @@
 //! [`plan::Reason`] (so "why did darkmux unload X?" always has an answer) and
 //! a machine-checkable [`plan::Precondition`] the executor re-verifies
 //! immediately before executing (facts are snapshots; drift aborts-and-replans).
+//! Packet 2a adds two more pure surfaces on the same facts: the co-residency
+//! wave scheduler ([`waves`], #1285 — budget-driven parallel↔sequential
+//! realignment, the #1243 budget doubling as a hardware-tier emulator) and
+//! the architecture-aware footprint estimator ([`estimator::ArchEstimator`],
+//! #1286 — '4B doesn't mean 4GB').
 //!
 //! Crate rules (enforced by review, honored by construction):
 //!
@@ -51,9 +56,13 @@ pub mod plan;
 pub mod planner;
 pub mod ports;
 pub mod residency;
+pub mod waves;
 
 pub use desired::{ingest, DesiredEntry, Placement, Quarantined, QuarantineReason};
-pub use estimator::{FixedEstimator, FootprintEstimator, V1Estimator};
+pub use estimator::{
+    ArchEstimator, ArchFacts, FixedEstimator, FootprintEstimator, V1Estimator,
+    DEFAULT_TRANSIENT_MARGIN_BYTES,
+};
 pub use facts::{Budget, CallerIntent, CatalogFact, Facts, PoolFact, PoolId, Pools, ResidentFact};
 pub use ownership::{ctx_sufficient, is_darkmux_owned, namespaced_identifier, DARKMUX_NAMESPACE};
 pub use plan::{
@@ -63,3 +72,4 @@ pub use plan::{
 pub use planner::{plan_acquire, plan_release, AcquireOpts, AcquireScope};
 pub use ports::{Deadline, HostError, LoadReport, ModelHost, ProbeError, ResourceProbe};
 pub use residency::{decide_residency, ResidencyDecision};
+pub use waves::{plan_waves, ForceParallelRefused, WaveMode, WaveRefusal, WaveSchedule};
