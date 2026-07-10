@@ -2,7 +2,9 @@ use darkmux_types::LoadedModel;
 use anyhow::{Context, Result, bail};
 use std::process::Command;
 
-fn lms_bin() -> String {
+// pub(crate): the gestalt host adapter (`gestalt_host::LmsHost`, #1274
+// packet 2b) resolves its binary through the same single precedence home.
+pub(crate) fn lms_bin() -> String {
     // env(DARKMUX_LMS_BIN) > config.lms_bin > "lms" (#661 Slice 4).
     darkmux_types::config_access::lms_bin()
 }

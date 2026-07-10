@@ -71,6 +71,7 @@ const KEYS: &[(&str, Ty)] = &[
     ("audit.enabled", Ty::Bool),
     ("audit.dir", Ty::Str),
     ("runtime.inactivity_timeout_seconds", Ty::Uint),
+    ("runtime.model_load_timeout_seconds", Ty::Uint),
     ("runtime.max_turns", Ty::Uint),
     ("runtime.max_tokens", Ty::Uint),
     ("runtime.max_tokens_per_call", Ty::Uint),

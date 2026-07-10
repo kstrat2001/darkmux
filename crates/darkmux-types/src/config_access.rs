@@ -231,6 +231,14 @@ pub fn inactivity_timeout_seconds() -> u64 {
     let cfg = config().runtime.as_ref().and_then(|r| r.inactivity_timeout_seconds);
     pick_parsed("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", cfg, Some(600)).unwrap()
 }
+/// (#1276) Bounded model-load/unload phase for gestalt host-port calls —
+/// consumed by `darkmux_profiles::gestalt_host::resolved_load_deadline`,
+/// which wraps it into the mandatory `Deadline` every `ModelHost` mutation
+/// takes. Mirrors `inactivity_timeout_seconds`' wiring exactly.
+pub fn model_load_timeout_seconds() -> u64 {
+    let cfg = config().runtime.as_ref().and_then(|r| r.model_load_timeout_seconds);
+    pick_parsed("DARKMUX_MODEL_LOAD_TIMEOUT_SECONDS", cfg, Some(600)).unwrap()
+}
 pub fn max_turns() -> Option<u32> {
     let cfg = config().runtime.as_ref().and_then(|r| r.max_turns);
     pick_parsed("DARKMUX_RUNTIME_MAX_TURNS", cfg, None)
@@ -627,6 +635,29 @@ mod tests {
             match prev {
                 Some(v) => std::env::set_var("DARKMUX_REDIS_STREAM", v),
                 None => std::env::remove_var("DARKMUX_REDIS_STREAM"),
+            }
+        }
+    }
+
+    // ── model_load_timeout_seconds (#1276): env > config > 600 default,
+    //    mirroring inactivity_timeout_seconds' resolution exactly ──
+    #[serial_test::serial]
+    #[test]
+    fn model_load_timeout_env_overrides_then_default() {
+        let k = "DARKMUX_MODEL_LOAD_TIMEOUT_SECONDS";
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::remove_var(k) };
+        // No env + the empty test config (#811) → the built-in 600 default.
+        assert_eq!(model_load_timeout_seconds(), 600);
+        unsafe { std::env::set_var(k, "45") };
+        assert_eq!(model_load_timeout_seconds(), 45, "env wins live");
+        // An unparseable env value falls through (here, to the default).
+        unsafe { std::env::set_var(k, "not-a-number") };
+        assert_eq!(model_load_timeout_seconds(), 600);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
             }
         }
     }

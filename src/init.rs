@@ -449,6 +449,11 @@ mod tests {
             cfg.runtime.as_ref().and_then(|r| r.inactivity_timeout_seconds),
             Some(600)
         );
+        // (#1276) The bounded model-load phase ships visible, same pattern.
+        assert_eq!(
+            cfg.runtime.as_ref().and_then(|r| r.model_load_timeout_seconds),
+            Some(600)
+        );
         // The written config personalizes machine_id away from the placeholder.
         assert_ne!(cfg.machine_id.as_deref(), Some("my-machine"));
         // Derived/advanced fields stay absent (dirs derived; caps = uncapped).

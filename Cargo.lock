@@ -505,6 +505,7 @@ name = "darkmux-profiles"
 version = "1.17.1"
 dependencies = [
  "anyhow",
+ "darkmux-gestalt",
  "darkmux-types",
  "dirs",
  "serde_json",
