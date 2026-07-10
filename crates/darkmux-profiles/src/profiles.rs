@@ -194,17 +194,10 @@ pub fn get_profile<'a>(reg: &'a ProfileRegistry, name: &str) -> Result<&'a Profi
     reg.profiles.get(name).ok_or_else(|| {
         // (#1282) A quarantined name gets the entry's own parse error, not a
         // misleading "not found" — the profile IS in the file, it's broken.
-        if let Some(q) = reg
-            .quarantined
-            .iter()
-            .find(|q| q.kind == QuarantinedEntryKind::Profile && q.name == name)
-        {
-            return anyhow!(
-                "darkmux: profile \"{}\" is quarantined — its registry entry failed to \
-                 parse: {}. Fix the entry, then verify with `darkmux doctor`. (#1282)",
-                name,
-                q.error
-            );
+        // Shared message shape: `ProfileRegistry::quarantine_error_for`, the
+        // same text the dispatch resolvers raise.
+        if let Some(msg) = reg.quarantine_error_for(name) {
+            return anyhow!(msg);
         }
         let available: Vec<&String> = reg.profiles.keys().collect();
         let listed = available
@@ -606,6 +599,35 @@ mod tests {
             .to_string();
         assert!(err.contains("quarantined"), "got: {err}");
         assert!(err.contains("darkmux doctor"), "got: {err}");
+    }
+
+    /// (#1282) A HEALTHY crew whose seat staffing names a QUARANTINED
+    /// profile: the crew entry itself parses fine, so the failure surfaces at
+    /// resolve time — and it must carry the profile's own quarantine error
+    /// (wrapped with the crew/seat label), never a misleading "not found".
+    #[test]
+    fn crew_staffing_referencing_quarantined_profile_surfaces_quarantine_error() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("profiles.json");
+        write(
+            &p,
+            r#"{"profiles":{
+                    "fast":{"models":[{"id":"a","n_ctx":1000}]},
+                    "broken":{"models":[{"n_ctx":32000}]}
+                },
+                "crews":{"review":{"seats":{"review-probe":[{"profile":"broken"}]}}}}"#,
+        );
+        let loaded = load_registry(Some(p.to_str().unwrap())).unwrap();
+        assert!(loaded.registry.crews.contains_key("review"));
+        let err = crate::crews::resolve_crew(&loaded.registry, "review")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("crew \"review\""), "got: {err}");
+        assert!(err.contains("review-probe"), "got: {err}");
+        assert!(err.contains("quarantined"), "got: {err}");
+        assert!(err.contains("missing field `id`"), "got: {err}");
+        assert!(err.contains("darkmux doctor"), "got: {err}");
+        assert!(!err.contains("not found"), "got: {err}");
     }
 
     #[test]

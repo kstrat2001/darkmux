@@ -719,6 +719,30 @@ impl ProfileRegistry {
         let profile = self.profiles.get(default_name)?;
         Some((default_name, profile))
     }
+
+    /// (#1282) The full, operator-facing error message for `name` when that
+    /// PROFILE was quarantined at load (its per-entry typed parse failed).
+    /// `None` ⇒ `name` is not a quarantined profile.
+    ///
+    /// Shared by every profile-resolution surface (`get_profile`, the
+    /// dispatch resolvers around `resolve_active`) so a quarantined profile
+    /// fails everywhere with ONE message shape — the entry's own parse error
+    /// plus a `darkmux doctor` pointer — instead of a misleading "not
+    /// found", a silent #1054 fallback to a different profile, or a probe of
+    /// whatever LMStudio happens to have loaded. Quarantined CREWS have
+    /// their own surface (`resolve_crew` names a crew, not a profile).
+    pub fn quarantine_error_for(&self, name: &str) -> Option<String> {
+        self.quarantined
+            .iter()
+            .find(|q| q.kind == QuarantinedEntryKind::Profile && q.name == name)
+            .map(|q| {
+                format!(
+                    "darkmux: profile \"{}\" is quarantined — its registry entry failed to \
+                     parse: {}. Fix the entry, then verify with `darkmux doctor`. (#1282)",
+                    name, q.error
+                )
+            })
+    }
 }
 
 // `Serialize` so `darkmux serve`'s `/model/status` endpoint (#87) can
@@ -846,6 +870,33 @@ mod tests {
         // ...but a defined request still wins over the dangling default.
         let (name, _) = r.resolve_active(Some("deep")).expect("defined request wins");
         assert_eq!(name, "deep");
+    }
+
+    /// (#1282) `quarantine_error_for` — the shared message every
+    /// profile-resolution surface raises on a quarantined name: carries the
+    /// entry's own parse error + the `darkmux doctor` pointer, matches only
+    /// PROFILE-kind quarantine entries, and is `None` for healthy names.
+    #[test]
+    fn quarantine_error_for_names_error_and_doctor_for_profiles_only() {
+        let mut r = reg(&["fast"], Some("fast"));
+        r.quarantined.push(QuarantinedEntry {
+            kind: QuarantinedEntryKind::Profile,
+            name: "broken".to_string(),
+            error: "missing field `id`".to_string(),
+        });
+        r.quarantined.push(QuarantinedEntry {
+            kind: QuarantinedEntryKind::Crew,
+            name: "mangled".to_string(),
+            error: "invalid type".to_string(),
+        });
+        let msg = r.quarantine_error_for("broken").expect("quarantined profile has a message");
+        assert!(msg.contains("\"broken\""), "got: {msg}");
+        assert!(msg.contains("missing field `id`"), "got: {msg}");
+        assert!(msg.contains("darkmux doctor"), "got: {msg}");
+        // Healthy profile ⇒ no message; a quarantined CREW name is not a
+        // profile quarantine (crews have their own resolve_crew surface).
+        assert_eq!(r.quarantine_error_for("fast"), None);
+        assert_eq!(r.quarantine_error_for("mangled"), None);
     }
 
     #[test]

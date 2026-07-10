@@ -3788,16 +3788,29 @@ fn cmd_status(config: Option<&str>, json: bool) -> Result<i32> {
 }
 
 fn profile_matches(profile: &types::Profile, loaded: &[types::LoadedModel]) -> bool {
-    if profile.models.len() != loaded.len() {
+    // (#1282) Endpoint-bearing (remote) models are served by their provider —
+    // they never appear in `lms ps` — so the comparison covers LOCAL models
+    // only, mirroring `swap::desired_loads`' skip. A hybrid profile (local +
+    // endpoint) that swap just loaded therefore matches on its local half.
+    //
+    // Pure-endpoint semantics: zero local models required ⇒ the profile
+    // matches exactly when NOTHING is loaded locally. That's what a swap to
+    // it produces (everything darkmux-owned unloaded), so `darkmux status`
+    // reports that state as the profile it is rather than "matches no
+    // registered profile". Any local load means the state isn't this
+    // profile's.
+    let local: Vec<&types::ProfileModel> =
+        profile.models.iter().filter(|m| !m.is_remote()).collect();
+    if local.len() != loaded.len() {
         return false;
     }
-    for m in &profile.models {
+    for m in local {
         let ident = m.identifier.clone().unwrap_or_else(|| m.id.clone());
         let Some(cur) = loaded.iter().find(|x| x.identifier == ident) else {
             return false;
         };
-        // (#1282) A model with no declared `n_ctx` (endpoint-bearing) has no
-        // exact local context to match — it can never match a loaded state.
+        // A LOCAL model with no declared `n_ctx` (a resolution error surfaced
+        // by swap/dispatch/doctor) can never assert a matching loaded context.
         if m.n_ctx != Some(cur.context as u32) {
             return false;
         }
@@ -4441,6 +4454,87 @@ fn cmd_lab_loop(args: LabLoopArgs) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── profile_matches (#1282) ─────────────────────────────────────
+
+    fn local_model(id: &str, n_ctx: u32) -> types::ProfileModel {
+        types::ProfileModel {
+            id: id.to_string(),
+            n_ctx: Some(n_ctx),
+            ..Default::default()
+        }
+    }
+
+    fn remote_model(id: &str, n_ctx: Option<u32>) -> types::ProfileModel {
+        types::ProfileModel {
+            id: id.to_string(),
+            n_ctx,
+            endpoint: Some(types::ModelEndpoint {
+                url: Some("https://example.azure.com/openai".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn profile_of(models: Vec<types::ProfileModel>) -> types::Profile {
+        types::Profile {
+            models,
+            ..Default::default()
+        }
+    }
+
+    fn loaded_model(identifier: &str, context: u64) -> types::LoadedModel {
+        types::LoadedModel {
+            identifier: identifier.to_string(),
+            model: identifier.to_string(),
+            status: "loaded".to_string(),
+            size: "1 GB".to_string(),
+            context,
+        }
+    }
+
+    #[test]
+    fn profile_matches_skips_endpoint_models_in_hybrid_profile() {
+        // (#1282) A hybrid profile (one local + one endpoint model) that swap
+        // just loaded: only the local half appears in `lms ps`, and that must
+        // count as a match — pre-fix the length check demanded BOTH.
+        let profile = profile_of(vec![
+            local_model("worker", 32000),
+            remote_model("gpt-remote", None),
+        ]);
+        let loaded = vec![loaded_model("worker", 32000)];
+        assert!(profile_matches(&profile, &loaded));
+        // A remote model with a DECLARED n_ctx ceiling is still skipped —
+        // it's never locally loaded regardless.
+        let profile = profile_of(vec![
+            local_model("worker", 32000),
+            remote_model("gpt-remote", Some(100000)),
+        ]);
+        assert!(profile_matches(&profile, &loaded));
+    }
+
+    #[test]
+    fn profile_matches_pure_endpoint_profile_matches_empty_loaded_state() {
+        // (#1282) Zero local models required ⇒ match exactly when nothing is
+        // loaded locally (what a swap to this profile produces); any local
+        // load means the state isn't this profile's.
+        let profile = profile_of(vec![remote_model("gpt-remote", None)]);
+        assert!(profile_matches(&profile, &[]));
+        assert!(!profile_matches(&profile, &[loaded_model("worker", 32000)]));
+    }
+
+    #[test]
+    fn profile_matches_still_requires_local_models_present_at_declared_ctx() {
+        let profile = profile_of(vec![
+            local_model("worker", 32000),
+            remote_model("gpt-remote", None),
+        ]);
+        // Local model absent → no match.
+        assert!(!profile_matches(&profile, &[]));
+        // Local model loaded at the wrong context → no match.
+        assert!(!profile_matches(&profile, &[loaded_model("worker", 4096)]));
+    }
 
     // ─── worst_case_wait_banner (Wave-E.9 #255) ──────────────────────
 

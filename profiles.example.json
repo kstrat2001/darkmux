@@ -54,14 +54,13 @@
     },
 
     "hosted-frontier": {
-      "description": "Hosted (endpoint-bearing) model — declares NO n_ctx: the provider owns the context window, so there is no local load parameter to invent (#1282). `auth.keychain` names a macOS Keychain ITEM, never the secret itself. Replace the URL/deployment with your own, or delete this profile if you only run local models.",
+      "description": "Hosted (endpoint-bearing) model — declares NO n_ctx: the provider owns the context window, so there is no local load parameter to invent (#1282). No `auth` block here either: a placeholder Keychain item name would make a fresh `darkmux init` fail doctor's credentials check spuriously. When your endpoint needs credentials, add `\"auth\": { \"type\": \"api-key\", \"keychain\": \"<item-name>\" }` to the endpoint — `keychain` names a macOS Keychain ITEM, never the secret itself. Replace the URL/deployment with your own, or delete this profile if you only run local models.",
       "models": [
         {
           "id": "gpt-5.1",
           "endpoint": {
             "url": "https://<your-resource>.cognitiveservices.azure.com/openai/deployments/<your-deployment>",
-            "api_version": "2025-01-01-preview",
-            "auth": { "type": "api-key", "keychain": "darkmux-azure-<your-resource>" }
+            "api_version": "2025-01-01-preview"
           }
         }
       ]

@@ -511,7 +511,9 @@ pub fn run(
     // context window — across the blocks with per-authority floors (no category
     // starves another), priority-ordered remainder, and a cautions cap.
     let budget = injected_budget_chars(
-        crew::dispatch_internal::resolve_context_window_internal(None, None),
+        // (#1282) `Err` = the default profile is quarantined; the coder
+        // dispatch below would hard-fail with the same error, so fail early.
+        crew::dispatch_internal::resolve_context_window_internal(None, None)?,
     );
     let (prior_corrections, detected_cautions, lessons) =
         allocate_injected_context(corrections, cautions, authored, budget);
@@ -1155,7 +1157,15 @@ pub(crate) fn injected_context_for_lab(
     };
     let lessons = engagement_lessons(&intent);
     let budget = injected_budget_chars(
-        crew::dispatch_internal::resolve_context_window_internal(profile, profiles_file),
+        // (#1282) `Err` = the named/default profile is quarantined. The lab
+        // dispatch itself hard-fails with this same error; here (bench-brief
+        // sizing, a String-returning helper) degrade loudly to the
+        // no-window budget default instead.
+        crew::dispatch_internal::resolve_context_window_internal(profile, profiles_file)
+            .unwrap_or_else(|e| {
+                eprintln!("{e:#}");
+                None
+            }),
     );
     let (c, ca, l) = allocate_injected_context(corrections, cautions, lessons, budget);
     // append_injected_blocks prefixes each block with "\n\n"; drop the leading

@@ -232,9 +232,15 @@ fn sync_context_windows(config: &mut Value, models: &[ProfileModel]) -> bool {
                 continue;
             };
             let id = id.to_string();
-            // (#1282) A model without a declared `n_ctx` (an endpoint-bearing
-            // entry) has no local context to sync — leave the entry alone.
+            // (#1282) Two skip reasons, distinguished: a REMOTE model is never
+            // locally loaded, so even a *declared* `n_ctx` ceiling must not be
+            // synced into openclaw's local model entries; a LOCAL model
+            // missing `n_ctx` is a resolution error surfaced elsewhere
+            // (swap/dispatch/doctor) — there is no value to sync either way.
             let want = models.iter().find_map(|pm| {
+                if pm.is_remote() || pm.n_ctx.is_none() {
+                    return None;
+                }
                 if pm.id == id || namespaced_identifier(pm) == id {
                     pm.n_ctx.map(u64::from)
                 } else {
@@ -273,8 +279,14 @@ fn ensure_namespaced_entries(config: &mut Value, models: &[ProfileModel]) -> boo
         if pm.identifier.is_some() {
             continue; // operator opted out of the namespace for this load
         }
-        // (#1282) No declared `n_ctx` (an endpoint-bearing entry) ⇒ no local
-        // LMStudio load happens, so no namespaced registry entry is needed.
+        // (#1282) Two skip reasons, distinguished: a REMOTE model never gets
+        // a local LMStudio load, so no namespaced openclaw entry is needed
+        // even when it *declares* an `n_ctx` ceiling; a LOCAL model missing
+        // `n_ctx` is a resolution error surfaced elsewhere (swap/dispatch/
+        // doctor) — and has no context to write into an entry here anyway.
+        if pm.is_remote() {
+            continue;
+        }
         let Some(n_ctx) = pm.n_ctx else {
             continue;
         };
@@ -1152,6 +1164,70 @@ mod tests {
         assert_eq!(entry["contextWindow"], 64000);
         assert!(entry["maxTokens"].is_number());
         assert!(entry["input"].is_array());
+    }
+
+    /// (#1282) A REMOTE model with a *declared* `n_ctx` ceiling is still
+    /// skipped by the namespaced-load sync: it never gets a local LMStudio
+    /// load, so no namespaced openclaw entry is added and its bare entry's
+    /// `contextWindow` is not rewritten to the declared ceiling. (Skipping
+    /// on a missing `n_ctx` alone would wrongly include this model.)
+    #[test]
+    fn remote_model_with_declared_n_ctx_gets_no_openclaw_entry_or_ctx_sync() {
+        use darkmux_types::ModelEndpoint;
+        let tmp = TempDir::new().unwrap();
+        // The pin is pre-set to the namespaced ref so the default-model pin
+        // sync is a no-op — this test isolates the model-registry sections.
+        let p = write_config(
+            &tmp,
+            r#"{
+                "agents": {
+                    "defaults": {
+                        "model": {"primary": "lmstudio/darkmux:gpt-remote"}
+                    }
+                },
+                "models": {
+                    "providers": {
+                        "lmstudio": {
+                            "models": [
+                                {"id": "gpt-remote", "contextWindow": 10000}
+                            ]
+                        }
+                    }
+                }
+            }"#,
+        );
+        let profile = profile_with_runtime(
+            p.to_str().unwrap(),
+            None,
+            None,
+            vec![ProfileModel {
+                endpoint: Some(ModelEndpoint {
+                    url: Some("https://example.azure.com/openai".into()),
+                    ..Default::default()
+                }),
+                extras: Default::default(),
+                id: "gpt-remote".into(),
+                // A declared ceiling (overflow avoidance), NOT a load param.
+                n_ctx: Some(100_000),
+                capabilities: Default::default(),
+                identifier: None,
+            }],
+        );
+        assert!(
+            !apply_runtime(&profile).unwrap(),
+            "a remote-only profile has nothing to sync into openclaw's local registry"
+        );
+        let after: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+        let arr = after["models"]["providers"]["lmstudio"]["models"]
+            .as_array()
+            .unwrap();
+        assert_eq!(arr.len(), 1, "no namespaced entry added for a remote model");
+        assert_eq!(arr[0]["id"], "gpt-remote");
+        assert_eq!(
+            arr[0]["contextWindow"], 10000,
+            "declared remote n_ctx ceiling must not be synced into a local entry"
+        );
     }
 
     #[test]

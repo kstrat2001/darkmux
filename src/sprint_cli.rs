@@ -1250,6 +1250,43 @@ mod tests {
         assert_eq!(names, vec!["fast", "balanced", "deep"]);
     }
 
+    /// (#1282) A profile whose DEFAULT model is endpoint-bearing (no declared
+    /// `n_ctx`) has no local context to budget against — skipped like an
+    /// empty profile; local siblings still rank.
+    #[test]
+    fn collect_profile_capacities_skips_endpoint_default_profile() {
+        let mut reg = fixture_registry();
+        reg.profiles.insert(
+            "hosted".to_string(),
+            Profile {
+                extras: Default::default(),
+                description: None,
+                default_model: None,
+                models: vec![ProfileModel {
+                    endpoint: Some(crate::types::ModelEndpoint {
+                        url: Some("https://example.azure.com/openai".into()),
+                        ..Default::default()
+                    }),
+                    extras: Default::default(),
+                    id: "gpt-remote".into(),
+                    n_ctx: None,
+                    capabilities: Default::default(),
+                    identifier: None,
+                }],
+                runtime: None,
+                use_when: None,
+            },
+        );
+        let caps = collect_profile_capacities(&reg);
+        assert!(
+            caps.iter().all(|(n, _)| n != "hosted"),
+            "endpoint-default profile must be skipped: {caps:?}"
+        );
+        // Local siblings unaffected.
+        let names: Vec<&str> = caps.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["fast", "balanced", "deep"]);
+    }
+
     #[test]
     fn tiny_workload_returns_high_confidence_not_medium() {
         // Regression test for QA Flag 2 — fixture-04-style "stay on
