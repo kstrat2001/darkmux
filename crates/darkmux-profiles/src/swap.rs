@@ -77,7 +77,11 @@ fn should_patch_openclaw(opts: &SwapOpts) -> bool {
 /// load just to shrink it — the operator who loaded it bigger has the RAM for
 /// it (operator sovereignty over loaded state). Only an *insufficient* load
 /// (smaller than the minimum) triggers a reload.
-fn ctx_sufficient(loaded_ctx: u64, wanted_n_ctx: u32) -> bool {
+///
+/// `pub` since #1271: the review funnel's `LmsCycler` residency
+/// reconciliation makes the same keep-or-reload call and shares this ONE
+/// definition of "sufficient" rather than re-deriving the `>=` inline.
+pub fn ctx_sufficient(loaded_ctx: u64, wanted_n_ctx: u32) -> bool {
     // (#906) Compare in u64 — `LoadedModel.context` is u64; truncating it to
     // u32 before the check could (in principle) wrap a very large loaded
     // context down below the wanted minimum and trigger a needless reload.

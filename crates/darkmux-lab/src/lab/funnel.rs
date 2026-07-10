@@ -838,17 +838,116 @@ pub trait ModelCycler {
 /// needless reload-down).
 pub struct LmsCycler;
 
+/// (#1271) What [`LmsCycler::ensure_loaded`] should do about a seat's model,
+/// given the CURRENT `lms ps` residents. Factored out as a pure function so
+/// the reconciliation logic is unit-testable without shelling to a real
+/// `lms` binary — same "pure decision, impure execution" split the rest of
+/// this module favors (`resolve_mode`, `dedup_flags`, etc.).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResidencyDecision {
+    /// No resident shares this model's modelKey — load fresh.
+    LoadFresh,
+    /// A resident darkmux may manage already satisfies the ctx requirement —
+    /// nothing to load. Carries the resident's identity + actual ctx so the
+    /// caller can leave a declared-vs-actual breadcrumb when they diverge
+    /// (interim provenance until #1257 lands).
+    Reuse { identifier: String, resident_ctx: u64 },
+    /// A resident darkmux may manage shares the modelKey but is loaded at an
+    /// insufficient ctx — unload it, then load fresh at the required ctx.
+    /// Silently reusing the wrong ctx is the #1135 bug class and is not an
+    /// option; attempting a second concurrent `lms load` of the same
+    /// weights is the #1271 bug class (OOM) and isn't either.
+    Reconcile { stale_identifier: String, stale_ctx: u64 },
+    /// A resident shares the modelKey but is NOT one darkmux may manage —
+    /// operator state the cycler must never touch. Fail loud before
+    /// spending a load attempt LMStudio's own guardrail would refuse anyway.
+    Blocked { resident_identifier: String },
+}
+
+/// Inspect `loaded` for a resident sharing `pm`'s modelKey (`LoadedModel::model`,
+/// the `lms ps` field derived from `modelKey`/`model`/`id` — see
+/// `lms::model_from_json`) and decide what `ensure_loaded` should do.
+/// Matching on modelKey rather than the darkmux-namespaced identifier is the
+/// point: two different profiles/crews can reference the SAME catalog model
+/// under different identifiers (or different `n_ctx`), and LMStudio can't
+/// hold two full concurrent loads of the same weights on a RAM-constrained
+/// machine — the identifier-only check missed that collision and let a
+/// doomed second `lms load` reach LMStudio's own OOM guardrail (#1271).
+///
+/// A resident counts as darkmux's own when its identifier is in the
+/// `darkmux:` namespace OR equals the exact identifier THIS call would load
+/// under — the second arm covers a `ProfileModel.identifier` explicit alias,
+/// the documented namespace opt-out (`swap::namespaced_identifier` passes it
+/// through verbatim), whose resident must not misclassify as foreign user
+/// state and get Blocked against darkmux's own load.
+///
+/// Multiple residents sharing the modelKey: the FIRST match (in `lms ps`
+/// order) decides. A first-match user-owned resident blocks even when a
+/// darkmux-owned instance also sits further down the list — the operator's
+/// copy of the weights is resident either way, and any load attempt in that
+/// state still risks the double-footprint LMStudio's guardrail refuses.
+fn decide_residency(loaded: &[darkmux_types::LoadedModel], pm: &ProfileModel) -> ResidencyDecision {
+    let Some(found) = loaded.iter().find(|l| l.model == pm.id) else {
+        return ResidencyDecision::LoadFresh;
+    };
+    let own_identifier = swap::namespaced_identifier(pm);
+    let ours = swap::is_darkmux_owned(&found.identifier) || found.identifier == own_identifier;
+    if !ours {
+        return ResidencyDecision::Blocked { resident_identifier: found.identifier.clone() };
+    }
+    if swap::ctx_sufficient(found.context, pm.n_ctx) {
+        ResidencyDecision::Reuse {
+            identifier: found.identifier.clone(),
+            resident_ctx: found.context,
+        }
+    } else {
+        ResidencyDecision::Reconcile {
+            stale_identifier: found.identifier.clone(),
+            stale_ctx: found.context,
+        }
+    }
+}
+
 impl ModelCycler for LmsCycler {
     fn ensure_loaded(&mut self, pm: &ProfileModel) -> Result<()> {
         let identifier = swap::namespaced_identifier(pm);
         let loaded = lms::list_loaded()?;
-        if loaded
-            .iter()
-            .any(|l| l.identifier == identifier && l.context >= u64::from(pm.n_ctx))
-        {
-            return Ok(());
+        match decide_residency(&loaded, pm) {
+            ResidencyDecision::Reuse { identifier: resident, resident_ctx } => {
+                if resident_ctx > u64::from(pm.n_ctx) {
+                    // (#1271 review round) Declared-vs-actual ctx divergence
+                    // now happens ACROSS profiles (a bigger load from another
+                    // profile satisfies this seat's minimum) — leave a trace
+                    // until #1257's full load-config provenance lands.
+                    println!(
+                        "cycler: reusing {resident} at ctx={resident_ctx} (declared {})",
+                        pm.n_ctx
+                    );
+                }
+                Ok(())
+            }
+            ResidencyDecision::LoadFresh => lms::load_with_identifier(&pm.id, pm.n_ctx, &identifier, true),
+            ResidencyDecision::Reconcile { stale_identifier, stale_ctx } => {
+                // (#1271) Reconcile rather than attempt a doomed second load:
+                // unload the stale-ctx darkmux instance first, matching the
+                // style of `swap::swap`'s own unload-then-load logging.
+                println!(
+                    "cycler: unload {stale_identifier} (was ctx={stale_ctx}) — reconciling to ctx={} for {}",
+                    pm.n_ctx, pm.id
+                );
+                lms::unload(&stale_identifier)?;
+                lms::load_with_identifier(&pm.id, pm.n_ctx, &identifier, true)
+            }
+            ResidencyDecision::Blocked { resident_identifier } => bail!(
+                "darkmux: model \"{}\" is already resident under \"{}\", which is NOT darkmux-owned \
+                 (user/operator state) — darkmux won't unload it. Free it yourself first: \
+                 `darkmux model eject` (if it's actually stale darkmux state under a legacy \
+                 identifier) or `lms unload {}`, then re-run.",
+                pm.id,
+                resident_identifier,
+                resident_identifier
+            ),
         }
-        lms::load_with_identifier(&pm.id, pm.n_ctx, &identifier, true)
     }
 
     fn release(&mut self, pm: &ProfileModel) -> Result<()> {
@@ -3885,6 +3984,263 @@ mod tests {
             "parallel mode loads every member before dispatching any — the failure aborts before member-a's draw ever runs"
         );
         assert_eq!(cycler.log, vec!["load:member-a", "load:member-b"]);
+    }
+
+    // ── LmsCycler residency reconciliation (#1271) ──────────────────────
+
+    /// Write an executable shell stub standing in for `lms`, dispatching on
+    /// `$1` the same subcommands `LmsCycler` issues: `ps --json` echoes the
+    /// canned resident list from `$STUB_LMS_PS_JSON`; anything else (`load`,
+    /// `unload`) appends its FULL argv to `$STUB_LMS_LOG` so cycling ORDER
+    /// is assertable. Mirrors the `write_stub_script` pattern already used
+    /// for the external-bundler subprocess seam (`lab::bundle::external`).
+    #[cfg(unix)]
+    fn write_stub_lms(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("lms-stub.sh");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "#!/bin/sh").unwrap();
+        writeln!(f, "case \"$1\" in").unwrap();
+        writeln!(f, "  ps) cat \"$STUB_LMS_PS_JSON\" ;;").unwrap();
+        writeln!(f, "  *) echo \"$*\" >> \"$STUB_LMS_LOG\" ;;").unwrap();
+        writeln!(f, "esac").unwrap();
+        writeln!(f, "exit 0").unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    /// Stands up the stub + points `DARKMUX_LMS_BIN` (and its two auxiliary
+    /// env vars) at it for the lifetime of one test. Env mutation means
+    /// every test using this needs `#[serial_test::serial]`; `Drop` cleans
+    /// the vars back up so a later, non-serial test never inherits a stale
+    /// `DARKMUX_LMS_BIN`.
+    #[cfg(unix)]
+    struct LmsStubEnv {
+        _dir: tempfile::TempDir,
+        log_path: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl LmsStubEnv {
+        fn new(residents_json: &str) -> Self {
+            let dir = tempfile::TempDir::new().unwrap();
+            let script = write_stub_lms(dir.path());
+            let ps_json_path = dir.path().join("ps.json");
+            std::fs::write(&ps_json_path, residents_json).unwrap();
+            let log_path = dir.path().join("log.txt");
+            std::fs::write(&log_path, "").unwrap();
+            unsafe {
+                std::env::set_var("DARKMUX_LMS_BIN", &script);
+                std::env::set_var("STUB_LMS_PS_JSON", &ps_json_path);
+                std::env::set_var("STUB_LMS_LOG", &log_path);
+            }
+            Self { _dir: dir, log_path }
+        }
+
+        fn log(&self) -> String {
+            std::fs::read_to_string(&self.log_path).unwrap()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for LmsStubEnv {
+        fn drop(&mut self) {
+            unsafe {
+                std::env::remove_var("DARKMUX_LMS_BIN");
+                std::env::remove_var("STUB_LMS_PS_JSON");
+                std::env::remove_var("STUB_LMS_LOG");
+            }
+        }
+    }
+
+    /// (a) darkmux-owned resident sharing the modelKey but at an
+    /// INSUFFICIENT ctx — reconcile: unload the stale instance, then load
+    /// fresh at the required ctx. This is the exact #1271 repro shape
+    /// (a resident from a DIFFERENT profile/crew, same underlying model,
+    /// smaller ctx than this seat needs) — the old identifier-only check
+    /// missed the collision and attempted a doomed second `lms load`.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn lms_cycler_darkmux_owned_wrong_ctx_reconciles_unload_then_reload() {
+        let env = LmsStubEnv::new(
+            r#"[{"identifier":"darkmux:devstral","modelKey":"devstral","status":"loaded","sizeBytes":14000000000,"contextLength":20000}]"#,
+        );
+        let mut cycler = LmsCycler;
+        let model = ProfileModel { id: "devstral".to_string(), n_ctx: 32768, ..Default::default() };
+        cycler.ensure_loaded(&model).expect("reconcile succeeds");
+        let log = env.log();
+        assert!(log.contains("unload darkmux:devstral"), "unload runs: {log}");
+        assert!(
+            log.contains("load devstral --context-length 32768 --identifier darkmux:devstral"),
+            "reload runs at the required ctx: {log}"
+        );
+        let unload_pos = log.find("unload darkmux:devstral").unwrap();
+        let load_pos = log.find("load devstral").unwrap();
+        assert!(unload_pos < load_pos, "unload must precede the reload: {log}");
+    }
+
+    /// (b) darkmux-owned resident sharing the modelKey, ALREADY at a
+    /// sufficient ctx — reuse, no load or unload issued. The pre-#1271
+    /// "current skip-if-loaded behavior" this preserves.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn lms_cycler_darkmux_owned_right_ctx_skips_reload() {
+        let env = LmsStubEnv::new(
+            r#"[{"identifier":"darkmux:devstral","modelKey":"devstral","status":"loaded","sizeBytes":14000000000,"contextLength":40960}]"#,
+        );
+        let mut cycler = LmsCycler;
+        let model = ProfileModel { id: "devstral".to_string(), n_ctx: 32768, ..Default::default() };
+        cycler.ensure_loaded(&model).expect("reuse succeeds");
+        assert_eq!(env.log(), "", "sufficient ctx already resident — no load/unload issued");
+    }
+
+    /// (c) a resident sharing the modelKey that is NOT darkmux-owned (no
+    /// `darkmux:` prefix) — operator state. The cycler must fail BEFORE
+    /// attempting any load, naming the colliding resident instance and a
+    /// fix command, never unload it itself (operator sovereignty).
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn lms_cycler_user_owned_same_model_key_blocks_before_any_load() {
+        let env = LmsStubEnv::new(
+            r#"[{"identifier":"devstral-manual","modelKey":"devstral","status":"loaded","sizeBytes":14000000000,"contextLength":40960}]"#,
+        );
+        let mut cycler = LmsCycler;
+        let model = ProfileModel { id: "devstral".to_string(), n_ctx: 32768, ..Default::default() };
+        let err = cycler.ensure_loaded(&model).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("devstral-manual"), "error names the resident instance: {msg}");
+        assert!(
+            msg.contains("darkmux model eject") && msg.contains("lms unload devstral-manual"),
+            "error names both fix commands: {msg}"
+        );
+        assert_eq!(env.log(), "", "no load or unload attempted against user state");
+    }
+
+    /// (d) no resident shares the modelKey — plain load, unchanged.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn lms_cycler_no_resident_loads_plain() {
+        let env = LmsStubEnv::new("[]");
+        let mut cycler = LmsCycler;
+        let model = ProfileModel { id: "devstral".to_string(), n_ctx: 32768, ..Default::default() };
+        cycler.ensure_loaded(&model).expect("plain load succeeds");
+        let log = env.log();
+        assert!(
+            log.contains("load devstral --context-length 32768 --identifier darkmux:devstral"),
+            "{log}"
+        );
+        assert!(!log.contains("unload"), "no unload without a resident: {log}");
+    }
+
+    /// (#1271 review round, REQUIRED fix) A resident under an EXPLICIT
+    /// operator alias (`ProfileModel.identifier = Some(..)`, the documented
+    /// namespace opt-out — `swap::namespaced_identifier` passes it through
+    /// verbatim) is darkmux's OWN load for this profile and must classify as
+    /// ours: sufficient ctx → Reuse, never Blocked.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn lms_cycler_explicit_alias_resident_right_ctx_reuses_not_blocked() {
+        let env = LmsStubEnv::new(
+            r#"[{"identifier":"custom","modelKey":"devstral","status":"loaded","sizeBytes":14000000000,"contextLength":32768}]"#,
+        );
+        let mut cycler = LmsCycler;
+        let model = ProfileModel {
+            id: "devstral".to_string(),
+            n_ctx: 32768,
+            identifier: Some("custom".to_string()),
+            ..Default::default()
+        };
+        cycler.ensure_loaded(&model).expect("explicit-alias resident reuses, never Blocked");
+        assert_eq!(env.log(), "", "no load or unload issued on reuse");
+    }
+
+    /// Explicit-alias resident at an INSUFFICIENT ctx — same reconcile path
+    /// as the namespaced case: unload the alias instance, reload under the
+    /// same alias at the required ctx.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn lms_cycler_explicit_alias_resident_wrong_ctx_reconciles() {
+        let env = LmsStubEnv::new(
+            r#"[{"identifier":"custom","modelKey":"devstral","status":"loaded","sizeBytes":14000000000,"contextLength":20000}]"#,
+        );
+        let mut cycler = LmsCycler;
+        let model = ProfileModel {
+            id: "devstral".to_string(),
+            n_ctx: 32768,
+            identifier: Some("custom".to_string()),
+            ..Default::default()
+        };
+        cycler.ensure_loaded(&model).expect("explicit-alias reconcile succeeds");
+        let log = env.log();
+        assert!(log.contains("unload custom"), "stale alias instance unloads: {log}");
+        assert!(
+            log.contains("load devstral --context-length 32768 --identifier custom"),
+            "reload keeps the operator's alias: {log}"
+        );
+        let unload_pos = log.find("unload custom").unwrap();
+        let load_pos = log.find("load devstral").unwrap();
+        assert!(unload_pos < load_pos, "unload precedes the reload: {log}");
+    }
+
+    /// (#1271 review round) Multi-resident, FIRST match decides: user-owned
+    /// listed ahead of a darkmux-stale instance → Blocked, and neither
+    /// instance is touched. Pins the `.find()` order-dependence as asserted
+    /// behavior rather than an implicit implementation detail.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn lms_cycler_multi_resident_user_owned_first_blocks() {
+        let env = LmsStubEnv::new(
+            r#"[
+                {"identifier":"devstral-manual","modelKey":"devstral","status":"loaded","sizeBytes":14000000000,"contextLength":40960},
+                {"identifier":"darkmux:devstral","modelKey":"devstral","status":"loaded","sizeBytes":14000000000,"contextLength":20000}
+            ]"#,
+        );
+        let mut cycler = LmsCycler;
+        let model = ProfileModel { id: "devstral".to_string(), n_ctx: 32768, ..Default::default() };
+        let err = cycler.ensure_loaded(&model).unwrap_err();
+        assert!(
+            err.to_string().contains("devstral-manual"),
+            "error names the first-match user-owned resident: {err}"
+        );
+        assert_eq!(env.log(), "", "no load or unload issued when a user-owned resident is first");
+    }
+
+    /// Multi-resident, mirror ordering: darkmux-stale listed ahead of a
+    /// user-owned instance → Reconcile, touching ONLY the darkmux instance —
+    /// the user-owned one is never unloaded.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn lms_cycler_multi_resident_darkmux_stale_first_reconciles_only_darkmux_instance() {
+        let env = LmsStubEnv::new(
+            r#"[
+                {"identifier":"darkmux:devstral","modelKey":"devstral","status":"loaded","sizeBytes":14000000000,"contextLength":20000},
+                {"identifier":"devstral-manual","modelKey":"devstral","status":"loaded","sizeBytes":14000000000,"contextLength":40960}
+            ]"#,
+        );
+        let mut cycler = LmsCycler;
+        let model = ProfileModel { id: "devstral".to_string(), n_ctx: 32768, ..Default::default() };
+        cycler.ensure_loaded(&model).expect("reconcile succeeds with a user-owned resident present");
+        let log = env.log();
+        assert!(log.contains("unload darkmux:devstral"), "darkmux instance reconciles: {log}");
+        assert!(
+            !log.contains("unload devstral-manual"),
+            "user-owned instance is never touched: {log}"
+        );
+        assert!(
+            log.contains("load devstral --context-length 32768 --identifier darkmux:devstral"),
+            "{log}"
+        );
     }
 
     // ── selector edge cases ──────────────────────────────────────────
