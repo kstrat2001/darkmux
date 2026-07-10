@@ -449,11 +449,13 @@ impl CompactionDispatchArgs {
         // map across the semantic boundary.
         let threshold_ratio = comp.and_then(|c| c.threshold_ratio).map(|f| f as f32);
         // (#590) Context window for the compaction trigger comes from the
-        // profile's default model (default_model, or first model).
+        // profile's default model (default_model, or first model). (#1282)
+        // A model with no declared `n_ctx` (endpoint-bearing) yields `None` —
+        // the formula trigger is disabled, same as any window-less profile.
         let context_window = profile
             .default_model_id()
             .and_then(|id| profile.models.iter().find(|m| m.id == id))
-            .map(|m| m.n_ctx);
+            .and_then(|m| m.n_ctx);
         // (#372 T2-A/T2-C) Strategy is a typed field on the schema;
         // read directly. When operator hasn't set it, runtime falls
         // back to Narrative default.

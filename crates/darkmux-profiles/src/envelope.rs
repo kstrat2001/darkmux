@@ -56,7 +56,7 @@ mod tests {
             endpoint: None,
             extras: Default::default(),
             id: id.to_string(),
-            n_ctx: 262000,
+            n_ctx: Some(262000),
             capabilities: Default::default(),
             identifier: ident.map(|s| s.to_string()),
         }

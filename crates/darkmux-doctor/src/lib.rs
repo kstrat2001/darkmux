@@ -1816,11 +1816,54 @@ fn check_profile_registry() -> Check {
     match profiles::load_registry(None) {
         Ok(loaded) => {
             let n = loaded.registry.profiles.len();
-            Check {
-                name: "profile registry".into(),
-                status: Status::Pass,
-                message: format!("{} profile(s) at {}", n, loaded.path.display()),
-                hint: None,
+
+            // (#1282) The loud surface for what the lenient loader tolerated:
+            //   1. entries quarantined at parse (structurally broken — each
+            //      with serde's exact field-level error), and
+            //   2. LOCAL models missing `n_ctx` (legal at parse; a resolution
+            //      error the moment anything tries to load them).
+            let mut findings: Vec<String> = loaded
+                .registry
+                .quarantined
+                .iter()
+                .map(|q| format!("quarantined {} \"{}\": {}", q.kind, q.name, q.error))
+                .collect();
+            for (pname, profile) in &loaded.registry.profiles {
+                for m in &profile.models {
+                    if !m.is_remote() && m.n_ctx.is_none() {
+                        findings.push(format!(
+                            "profile \"{pname}\" model \"{}\" is local (no endpoint) but \
+                             declares no n_ctx — swap/dispatch on it will fail at resolution",
+                            m.id
+                        ));
+                    }
+                }
+            }
+
+            if findings.is_empty() {
+                Check {
+                    name: "profile registry".into(),
+                    status: Status::Pass,
+                    message: format!("{} profile(s) at {}", n, loaded.path.display()),
+                    hint: None,
+                }
+            } else {
+                Check {
+                    name: "profile registry".into(),
+                    status: Status::Warn,
+                    message: format!(
+                        "{} profile(s) at {}; {}",
+                        n,
+                        loaded.path.display(),
+                        findings.join("; ")
+                    ),
+                    hint: Some(
+                        "fix the named entries in the registry file — healthy entries keep \
+                         working; a quarantined or n_ctx-less local entry fails at use with \
+                         the same error (#1282)"
+                            .into(),
+                    ),
+                }
             }
         }
         Err(e) => Check {
@@ -4276,6 +4319,69 @@ mod tests {
         assert_eq!(check.status, Status::Warn);
         assert!(check.message.contains("bad-crew"));
         assert!(!check.message.contains("good-crew"));
+    }
+
+    // ─── #1282: check_profile_registry quarantine + n_ctx surface ───
+
+    /// The exact #1282 scenario: one profile entry missing a required field
+    /// (`id`) is quarantined at parse — doctor names the entry and serde's
+    /// field-level error while the sibling profile stays healthy.
+    #[serial_test::serial]
+    #[test]
+    fn check_profile_registry_warns_and_names_quarantined_entry() {
+        let (_guard, config_path) = ConfigPathGuard::at_tempfile("profiles.json");
+        std::fs::write(
+            &config_path,
+            r#"{"profiles":{
+                    "fast":{"models":[{"id":"a","n_ctx":1000}]},
+                    "broken":{"models":[{"n_ctx":32000}]}
+                }}"#,
+        )
+        .unwrap();
+
+        let check = check_profile_registry();
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.message.contains("quarantined profile \"broken\""), "{}", check.message);
+        assert!(check.message.contains("missing field `id`"), "{}", check.message);
+        assert!(!check.message.contains("quarantined profile \"fast\""));
+        assert!(check.hint.is_some());
+    }
+
+    /// (#1282) A LOCAL model without `n_ctx` parses (lenient) but doctor
+    /// flags it — the resolution error waiting to happen, surfaced loud.
+    #[serial_test::serial]
+    #[test]
+    fn check_profile_registry_warns_on_local_model_without_n_ctx() {
+        let (_guard, config_path) = ConfigPathGuard::at_tempfile("profiles.json");
+        std::fs::write(
+            &config_path,
+            r#"{"profiles":{"ctxless":{"models":[{"id":"local-a"}]}}}"#,
+        )
+        .unwrap();
+
+        let check = check_profile_registry();
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.message.contains("ctxless"), "{}", check.message);
+        assert!(check.message.contains("local-a"), "{}", check.message);
+        assert!(check.message.contains("n_ctx"), "{}", check.message);
+    }
+
+    /// (#1282) An endpoint-bearing model without `n_ctx` is fully valid —
+    /// no warning: hosted models have no local context to declare.
+    #[serial_test::serial]
+    #[test]
+    fn check_profile_registry_passes_on_endpoint_model_without_n_ctx() {
+        let (_guard, config_path) = ConfigPathGuard::at_tempfile("profiles.json");
+        std::fs::write(
+            &config_path,
+            r#"{"profiles":{"cloud":{"models":[
+                    {"id":"gpt-4o","endpoint":{"url":"https://example.azure.com/openai"}}
+                ]}}}"#,
+        )
+        .unwrap();
+
+        let check = check_profile_registry();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
     }
 
     // ─── #85/#91: check_remote_endpoint_credentials tests ───────

@@ -103,6 +103,7 @@ const DEFAULT_UTILITY_N_CTX: u32 = 68_000;
 
 /// One model swap intends to have resident: the LMStudio model key to load,
 /// the darkmux-namespaced identifier to load it under, and the minimum context.
+#[derive(Debug)]
 struct DesiredLoad {
     /// Bare LMStudio model key passed to `lms load` (the catalog id).
     model_key: String,
@@ -138,16 +139,23 @@ fn utility_load_target(util_id: &str) -> (String, String) {
 /// every profile swap. A utility model that happens to duplicate a
 /// declared model is loaded once (the declared entry wins, keeping its declared
 /// context). Pure: the caller owns the `lms ps` / load I/O.
-fn desired_loads(profile: &Profile, registry: &ProfileRegistry) -> Vec<DesiredLoad> {
-    let mut loads: Vec<DesiredLoad> = profile
-        .models
-        .iter()
-        .map(|m| DesiredLoad {
+///
+/// (#1282) Remote endpoint-bearing models are skipped — there is nothing to
+/// load locally for them (the provider owns the serving). A LOCAL model
+/// without a declared `n_ctx` is a resolution error here (via
+/// `require_n_ctx`), never a parse error.
+fn desired_loads(profile: &Profile, registry: &ProfileRegistry) -> Result<Vec<DesiredLoad>> {
+    let mut loads: Vec<DesiredLoad> = Vec::with_capacity(profile.models.len());
+    for m in &profile.models {
+        if m.is_remote() {
+            continue; // hosted — no local load to perform
+        }
+        loads.push(DesiredLoad {
             model_key: m.id.clone(),
             identifier: namespaced_identifier(m),
-            n_ctx: m.n_ctx,
-        })
-        .collect();
+            n_ctx: m.require_n_ctx()?,
+        });
+    }
     if let Some(util_id) = registry.utility_model_id() {
         let (model_key, identifier) = utility_load_target(util_id);
         // Don't load twice if the utility model is also a declared model —
@@ -156,7 +164,7 @@ fn desired_loads(profile: &Profile, registry: &ProfileRegistry) -> Vec<DesiredLo
             loads.push(DesiredLoad { model_key, identifier, n_ctx: DEFAULT_UTILITY_N_CTX });
         }
     }
-    loads
+    Ok(loads)
 }
 
 pub fn swap(profile: &Profile, registry: &ProfileRegistry, opts: SwapOpts) -> Result<SwapResult> {
@@ -174,7 +182,7 @@ pub fn swap(profile: &Profile, registry: &ProfileRegistry, opts: SwapOpts) -> Re
     // machine's standing utility model (#590). Map of namespaced identifier →
     // desired (minimum) context length, used to drive the Pass-1 unload
     // decision below.
-    let desired = desired_loads(profile, registry);
+    let desired = desired_loads(profile, registry)?;
     let mut want: HashMap<String, u32> = HashMap::new();
     for d in &desired {
         want.insert(d.identifier.clone(), d.n_ctx);
@@ -325,7 +333,7 @@ mod tests {
                 endpoint: None,
                 extras: Default::default(),
                 id: "m".into(),
-                n_ctx: 1000,
+                n_ctx: Some(1000),
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -341,7 +349,7 @@ mod tests {
             endpoint: None,
             extras: Default::default(),
             id: "qwen3.6-35b-a3b".into(),
-            n_ctx: 100_000,
+            n_ctx: Some(100_000),
             capabilities: Default::default(),
             identifier: None,
         };
@@ -354,7 +362,7 @@ mod tests {
             endpoint: None,
             extras: Default::default(),
             id: "qwen3.6-35b-a3b".into(),
-            n_ctx: 100_000,
+            n_ctx: Some(100_000),
             capabilities: Default::default(),
             identifier: Some("my-custom-alias".into()),
         };
@@ -409,7 +417,7 @@ mod tests {
         // Model "m" (ctx 1000) + a registered utility model "util-4b".
         let profile = profile_with("p", None);
         let registry = registry_with_utility(Some("util-4b"));
-        let loads = desired_loads(&profile, &registry);
+        let loads = desired_loads(&profile, &registry).unwrap();
         assert_eq!(loads.len(), 2);
         assert!(loads.iter().any(|l| l.identifier == "darkmux:m" && l.n_ctx == 1000));
         let util = loads.iter().find(|l| l.identifier == "darkmux:util-4b").unwrap();
@@ -421,7 +429,7 @@ mod tests {
     #[test]
     fn desired_loads_without_a_utility_binding_is_workers_only() {
         let profile = profile_with("p", None);
-        let loads = desired_loads(&profile, &registry_with_utility(None));
+        let loads = desired_loads(&profile, &registry_with_utility(None)).unwrap();
         assert_eq!(loads.len(), 1);
         assert_eq!(loads[0].identifier, "darkmux:m");
     }
@@ -432,7 +440,7 @@ mod tests {
         // utility model — load it once, keeping the model's declared context
         // (not the utility default).
         let profile = profile_with("p", None); // model id "m" @ ctx 1000
-        let loads = desired_loads(&profile, &registry_with_utility(Some("m")));
+        let loads = desired_loads(&profile, &registry_with_utility(Some("m"))).unwrap();
         assert_eq!(loads.len(), 1, "duplicate utility/model isn't loaded twice");
         assert_eq!(loads[0].n_ctx, 1000, "the model's declared context wins over the utility default");
     }
@@ -453,7 +461,7 @@ mod tests {
                 endpoint: None,
                 extras: Default::default(),
                 id: "worker-35b".into(),
-                n_ctx: 100_000,
+                n_ctx: Some(100_000),
                 capabilities: Default::default(),
                 identifier: Some("darkmux:util-4b".into()),
             }],
@@ -461,10 +469,54 @@ mod tests {
             runtime: None,
             use_when: None,
         };
-        let loads = desired_loads(&profile, &registry_with_utility(Some("util-4b")));
+        let loads = desired_loads(&profile, &registry_with_utility(Some("util-4b"))).unwrap();
         assert_eq!(loads.len(), 1, "collision must dedup to a single load");
         assert_eq!(loads[0].identifier, "darkmux:util-4b");
         assert_eq!(loads[0].model_key, "worker-35b", "the model entry wins the identifier slot");
+    }
+
+    /// (#1282) A remote endpoint-bearing model (no `n_ctx`) contributes no
+    /// local load — swap skips it and only loads the local models.
+    #[test]
+    fn desired_loads_skips_remote_endpoint_models() {
+        let profile = Profile {
+            models: vec![
+                ProfileModel {
+                    id: "local-m".into(),
+                    n_ctx: Some(1000),
+                    ..Default::default()
+                },
+                ProfileModel {
+                    id: "gpt-4o".into(),
+                    endpoint: Some(darkmux_types::ModelEndpoint {
+                        url: Some("https://example.azure.com/openai".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let loads = desired_loads(&profile, &registry_with_utility(None)).unwrap();
+        assert_eq!(loads.len(), 1, "the remote model must not be loaded locally");
+        assert_eq!(loads[0].identifier, "darkmux:local-m");
+    }
+
+    /// (#1282) A LOCAL model without `n_ctx` is a swap-time (resolution)
+    /// error naming the model and the field — never a parse-stage failure.
+    #[test]
+    fn desired_loads_errors_on_local_model_without_n_ctx() {
+        let profile = Profile {
+            models: vec![ProfileModel {
+                id: "ctxless".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let err = desired_loads(&profile, &registry_with_utility(None)).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("ctxless"), "names the model: {msg}");
+        assert!(msg.contains("n_ctx"), "names the field: {msg}");
     }
 
     #[test]

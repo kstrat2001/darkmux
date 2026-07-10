@@ -844,7 +844,7 @@ impl WorkloadProvider for ToolBenchProvider {
             n_ctx: profile
                 .default_model_id()
                 .and_then(|id| profile.models.iter().find(|m| m.id == id))
-                .map(|m| u64::from(m.n_ctx)),
+                .and_then(|m| m.n_ctx.map(u64::from)),
         };
         let rows = build_rows(&trial_refs, trials_per_task, &artifact);
         let machine_id = darkmux_types::config_access::machine_id()

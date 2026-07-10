@@ -1,4 +1,4 @@
-use darkmux_types::{Profile, ProfileRegistry};
+use darkmux_types::{Crew, Profile, ProfileRegistry, QuarantinedEntry, QuarantinedEntryKind};
 use anyhow::{Context, Result, anyhow, bail};
 use std::env;
 use std::fs;
@@ -67,14 +67,86 @@ fn load_from(path: PathBuf, source: &str) -> Result<LoadedRegistry> {
     }
     let raw = fs::read_to_string(&path)
         .with_context(|| format!("reading registry at {}", path.display()))?;
-    let registry: ProfileRegistry = serde_json::from_str(&raw)
+    let registry = parse_registry_lenient(&raw)
         .with_context(|| format!("parsing JSON at {}", path.display()))?;
+    if !registry.quarantined.is_empty() {
+        // One warning line per load (matching the loud-but-brief style of
+        // this crate's other operator warnings); full per-entry detail lives
+        // in `darkmux doctor`.
+        let listed = registry
+            .quarantined
+            .iter()
+            .map(|q| format!("{} \"{}\" ({})", q.kind, q.name, q.error))
+            .collect::<Vec<_>>()
+            .join("; ");
+        eprintln!(
+            "darkmux: warning: {} registry entr{} quarantined at {} — {} — \
+             other entries are unaffected; run `darkmux doctor` for details. (#1282)",
+            registry.quarantined.len(),
+            if registry.quarantined.len() == 1 { "y" } else { "ies" },
+            path.display(),
+            listed
+        );
+    }
     validate_registry(&registry, &path)?;
     Ok(LoadedRegistry { registry, path })
 }
 
+/// (#1282) Two-stage registry parse — the per-entry quarantine that keeps one
+/// structurally-broken profile/crew entry from blasting the whole file
+/// (config-leniency contract #1269, applied one layer down):
+///
+/// 1. **Whole-file JSON syntax** — a syntax error can't be scoped to one
+///    entry, so it still fails the file (with serde_json's line/column).
+/// 2. **Per-entry typed conversion** — each `profiles{}` / `crews{}` entry is
+///    converted to its typed form individually; a failure quarantines THAT
+///    entry (name + serde's field-level message, e.g. ``missing field `id```)
+///    and is removed from the raw tree.
+/// 3. **Shell parse** — the remaining tree (registry shell + healthy entries)
+///    goes through the normal typed parse. A failure here is shell-level
+///    breakage (e.g. `profiles` isn't an object) and fails the file.
+fn parse_registry_lenient(raw: &str) -> Result<ProfileRegistry> {
+    let mut root: serde_json::Value = serde_json::from_str(raw)?;
+
+    let mut quarantined: Vec<QuarantinedEntry> = Vec::new();
+    for (key, kind) in [
+        ("profiles", QuarantinedEntryKind::Profile),
+        ("crews", QuarantinedEntryKind::Crew),
+    ] {
+        let Some(map) = root.get_mut(key).and_then(|v| v.as_object_mut()) else {
+            continue;
+        };
+        for (name, entry) in map.iter() {
+            let error = match kind {
+                QuarantinedEntryKind::Profile => {
+                    serde_json::from_value::<Profile>(entry.clone()).err()
+                }
+                QuarantinedEntryKind::Crew => serde_json::from_value::<Crew>(entry.clone()).err(),
+            };
+            if let Some(e) = error {
+                quarantined.push(QuarantinedEntry {
+                    kind,
+                    name: name.clone(),
+                    error: e.to_string(),
+                });
+            }
+        }
+        for q in quarantined.iter().filter(|q| q.kind == kind) {
+            map.remove(&q.name);
+        }
+    }
+
+    let mut registry: ProfileRegistry = serde_json::from_value(root)?;
+    registry.quarantined = quarantined;
+    Ok(registry)
+}
+
 fn validate_registry(reg: &ProfileRegistry, path: &Path) -> Result<()> {
-    if reg.profiles.is_empty() {
+    // (#1282) A registry whose only profiles are quarantined still LOADS
+    // (empty healthy set) — failing here would restore the whole-file blast
+    // the quarantine exists to prevent, and would hide the per-entry errors
+    // from `darkmux doctor`.
+    if reg.profiles.is_empty() && reg.quarantined.is_empty() {
         bail!("{}: registry has no profiles", path.display());
     }
     for (name, profile) in &reg.profiles {
@@ -120,6 +192,13 @@ fn validate_profile(name: &str, profile: &Profile, path: &Path) -> Result<()> {
 
 pub fn get_profile<'a>(reg: &'a ProfileRegistry, name: &str) -> Result<&'a Profile> {
     reg.profiles.get(name).ok_or_else(|| {
+        // (#1282) A quarantined name gets the entry's own parse error, not a
+        // misleading "not found" — the profile IS in the file, it's broken.
+        // Shared message shape: `ProfileRegistry::quarantine_error_for`, the
+        // same text the dispatch resolvers raise.
+        if let Some(msg) = reg.quarantine_error_for(name) {
+            return anyhow!(msg);
+        }
         let available: Vec<&String> = reg.profiles.keys().collect();
         let listed = available
             .iter()
@@ -447,6 +526,167 @@ mod tests {
         write(&p, "this is not: valid: json: at all\n");
         let err = load_registry(Some(p.to_str().unwrap())).unwrap_err();
         assert!(err.to_string().contains("parsing JSON") || err.to_string().contains("JSON"));
+    }
+
+    // ── per-entry quarantine at parse (#1282) ──────────────────────
+    // One structurally-broken entry must never blast the whole registry:
+    // the entry is quarantined (name + serde's field-level error), siblings
+    // load and work, and lookups on the quarantined name surface the parse
+    // error + a doctor pointer instead of a misleading "not found".
+
+    #[test]
+    fn quarantined_profile_keeps_siblings_healthy_and_names_the_field() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("profiles.json");
+        // "broken" omits the required `id` on its model — an entry-level
+        // structural failure (the #1282 blast-radius class).
+        write(
+            &p,
+            r#"{"profiles":{
+                    "fast":{"models":[{"id":"a","n_ctx":1000}]},
+                    "broken":{"models":[{"n_ctx":32000}]}
+                },
+                "default_profile":"fast"}"#,
+        );
+        let loaded = load_registry(Some(p.to_str().unwrap())).unwrap();
+
+        // Sibling fully usable.
+        let fast = get_profile(&loaded.registry, "fast").unwrap();
+        assert_eq!(fast.models.len(), 1);
+
+        // The broken entry is quarantined with name + serde's field error.
+        assert_eq!(loaded.registry.quarantined.len(), 1);
+        let q = &loaded.registry.quarantined[0];
+        assert_eq!(q.kind, darkmux_types::QuarantinedEntryKind::Profile);
+        assert_eq!(q.name, "broken");
+        assert!(q.error.contains("missing field `id`"), "got: {}", q.error);
+        assert!(!loaded.registry.profiles.contains_key("broken"));
+
+        // Lookup on the quarantined name carries the reason + doctor pointer.
+        let err = get_profile(&loaded.registry, "broken").unwrap_err().to_string();
+        assert!(err.contains("quarantined"), "got: {err}");
+        assert!(err.contains("missing field `id`"), "got: {err}");
+        assert!(err.contains("darkmux doctor"), "got: {err}");
+    }
+
+    #[test]
+    fn quarantined_crew_keeps_registry_loading_and_resolve_names_the_error() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("profiles.json");
+        // "mangled" has a wrong-typed `seats` — a crew-entry structural
+        // failure that pre-#1282 killed the whole file.
+        write(
+            &p,
+            r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":1000}]}},
+                "crews":{
+                    "good":{"seats":{"review-probe":[{"profile":"fast"}]}},
+                    "mangled":{"seats":"not-a-map"}
+                }}"#,
+        );
+        let loaded = load_registry(Some(p.to_str().unwrap())).unwrap();
+        assert!(loaded.registry.crews.contains_key("good"));
+        assert!(!loaded.registry.crews.contains_key("mangled"));
+        assert_eq!(loaded.registry.quarantined.len(), 1);
+        assert_eq!(
+            loaded.registry.quarantined[0].kind,
+            darkmux_types::QuarantinedEntryKind::Crew
+        );
+
+        // The healthy crew resolves; the quarantined one errors with reason.
+        crate::crews::resolve_crew(&loaded.registry, "good").unwrap();
+        let err = crate::crews::resolve_crew(&loaded.registry, "mangled")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("quarantined"), "got: {err}");
+        assert!(err.contains("darkmux doctor"), "got: {err}");
+    }
+
+    /// (#1282) A HEALTHY crew whose seat staffing names a QUARANTINED
+    /// profile: the crew entry itself parses fine, so the failure surfaces at
+    /// resolve time — and it must carry the profile's own quarantine error
+    /// (wrapped with the crew/seat label), never a misleading "not found".
+    #[test]
+    fn crew_staffing_referencing_quarantined_profile_surfaces_quarantine_error() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("profiles.json");
+        write(
+            &p,
+            r#"{"profiles":{
+                    "fast":{"models":[{"id":"a","n_ctx":1000}]},
+                    "broken":{"models":[{"n_ctx":32000}]}
+                },
+                "crews":{"review":{"seats":{"review-probe":[{"profile":"broken"}]}}}}"#,
+        );
+        let loaded = load_registry(Some(p.to_str().unwrap())).unwrap();
+        assert!(loaded.registry.crews.contains_key("review"));
+        let err = crate::crews::resolve_crew(&loaded.registry, "review")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("crew \"review\""), "got: {err}");
+        assert!(err.contains("review-probe"), "got: {err}");
+        assert!(err.contains("quarantined"), "got: {err}");
+        assert!(err.contains("missing field `id`"), "got: {err}");
+        assert!(err.contains("darkmux doctor"), "got: {err}");
+        assert!(!err.contains("not found"), "got: {err}");
+    }
+
+    #[test]
+    fn registry_whose_only_profile_is_quarantined_still_loads() {
+        // Failing the load here would restore the whole-file blast the
+        // quarantine exists to prevent (and hide the error from doctor).
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("profiles.json");
+        write(&p, r#"{"profiles":{"broken":{"models":[{"n_ctx":1}]}}}"#);
+        let loaded = load_registry(Some(p.to_str().unwrap())).unwrap();
+        assert!(loaded.registry.profiles.is_empty());
+        assert_eq!(loaded.registry.quarantined.len(), 1);
+        assert_eq!(loaded.registry.quarantined[0].name, "broken");
+    }
+
+    /// The #1282 issue's exact repro — an endpoint-bearing model with NO
+    /// `n_ctx` — is now simply VALID: it loads, it isn't quarantined, and
+    /// the absent `n_ctx` survives a full file round-trip (absent, not
+    /// null/0). The local-requires-n_ctx rule lives at resolution time.
+    #[test]
+    fn endpoint_profile_without_n_ctx_loads_and_round_trips() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("profiles.json");
+        write(
+            &p,
+            r#"{"profiles":{"azure-x":{"models":[
+                    {"id":"gpt-4o","endpoint":{"url":"https://example.azure.com/openai"}}
+                ]}}}"#,
+        );
+        let loaded = load_registry(Some(p.to_str().unwrap())).unwrap();
+        assert!(loaded.registry.quarantined.is_empty());
+        let prof = get_profile(&loaded.registry, "azure-x").unwrap();
+        assert_eq!(prof.models[0].n_ctx, None);
+        assert!(prof.models[0].is_remote());
+
+        // Round-trip through real file I/O: the absent field stays absent.
+        let round = tmp.path().join("profiles-round.json");
+        write(&round, &serde_json::to_string(&loaded.registry).unwrap());
+        let reloaded = load_registry(Some(round.to_str().unwrap())).unwrap();
+        let prof2 = get_profile(&reloaded.registry, "azure-x").unwrap();
+        assert_eq!(prof2.models[0].n_ctx, None);
+        assert!(!fs::read_to_string(&round).unwrap().contains("n_ctx"));
+    }
+
+    /// A LOCAL model without `n_ctx` is also legal AT PARSE (lenient-on-read
+    /// contract #1269) — the error belongs to resolution-time consumers
+    /// (swap, dispatch, crew resolution), each of which raises the uniform
+    /// `require_n_ctx` error, and to `darkmux doctor`.
+    #[test]
+    fn local_profile_without_n_ctx_loads_at_parse() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("profiles.json");
+        write(&p, r#"{"profiles":{"ctxless":{"models":[{"id":"local-a"}]}}}"#);
+        let loaded = load_registry(Some(p.to_str().unwrap())).unwrap();
+        assert!(loaded.registry.quarantined.is_empty());
+        let prof = get_profile(&loaded.registry, "ctxless").unwrap();
+        assert_eq!(prof.models[0].n_ctx, None);
+        let err = prof.models[0].require_n_ctx().unwrap_err().to_string();
+        assert!(err.contains("local-a") && err.contains("n_ctx"), "got: {err}");
     }
 
     #[test]

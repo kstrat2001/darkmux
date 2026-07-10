@@ -766,25 +766,54 @@ fn write_remote_auth_header_stdin(
 
 /// Resolve the selected model's `ProfileModel` (with its endpoint) WITHOUT
 /// loading anything in LMStudio — so `dispatch` can branch to the hosted path
-/// before the container/load machinery. `None` ⇒ no profile model resolves
+/// before the container/load machinery. `Ok(None)` ⇒ no profile model resolves
 /// (the local path's `probe_loaded_model` fallback + container path).
+/// `Err` ⇒ the requested (or default) profile is QUARANTINED (#1282) — a hard
+/// stop: falling through here would re-resolve against a DIFFERENT profile
+/// (possibly routing a dispatch to the wrong remote endpoint) before the
+/// container path ever gets to raise the same error.
 fn resolve_selected_profile_model(
     role: &crate::types::Role,
     profile_override: Option<&str>,
     config_path: Option<&str>,
-) -> Option<darkmux_types::ProfileModel> {
+) -> Result<Option<darkmux_types::ProfileModel>> {
     use crate::select::select_model;
     use darkmux_profiles::profiles::load_registry;
-    let loaded = load_registry(config_path).ok()?;
-    let (_name, profile) = loaded.registry.resolve_active(profile_override)?;
+    // A registry-LOAD failure stays `Ok(None)`: the container path's
+    // `resolve_dispatch_model_internal` raises the loud #1269 hard stop for
+    // it, with the file named.
+    let Ok(loaded) = load_registry(config_path) else {
+        return Ok(None);
+    };
+    // (#1282) A quarantined REQUESTED profile must hard-fail with the
+    // entry's own parse error, not fall into the #1054 default fallback.
+    if let Some(req) = profile_override {
+        if let Some(msg) = loaded.registry.quarantine_error_for(req) {
+            bail!(msg);
+        }
+    }
+    let Some((_name, profile)) = loaded.registry.resolve_active(profile_override) else {
+        // (#1282) Same for a quarantined `default_profile` — without this,
+        // the dispatch falls through to the container path's
+        // `probe_loaded_model()` and runs against whatever LMStudio has
+        // loaded instead of surfacing the broken entry.
+        if let Some(default_name) = loaded.registry.default_profile.as_deref() {
+            if let Some(msg) = loaded.registry.quarantine_error_for(default_name) {
+                bail!(msg);
+            }
+        }
+        return Ok(None);
+    };
     let skill_index: std::collections::HashMap<String, crate::types::Skill> =
         crate::loader::load_skills()
             .unwrap_or_default()
             .into_iter()
             .map(|s| (s.id.clone(), s))
             .collect();
-    let id = select_model(role, profile, |id| skill_index.get(id)).ok()?;
-    profile.models.iter().find(|m| m.id == id).cloned()
+    let Ok(id) = select_model(role, profile, |id| skill_index.get(id)) else {
+        return Ok(None);
+    };
+    Ok(profile.models.iter().find(|m| m.id == id).cloned())
 }
 
 /// (#1187) True when a role's tool palette grants at least one tool — the
@@ -853,7 +882,7 @@ fn try_resolve_remote_target(
         &role,
         opts.profile_name.as_deref(),
         opts.config_path.as_deref(),
-    ) {
+    )? {
         Some(pm) if pm.endpoint.as_ref().is_some_and(|e| e.is_remote()) => pm,
         _ => return Ok(None), // local ⇒ container path
     };
@@ -1782,7 +1811,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     compaction.apply_utility_model(utility_model.as_deref());
     ensure_context_window(
         &mut compaction,
-        resolve_context_window_internal(opts.profile_name.as_deref(), opts.config_path.as_deref()),
+        resolve_context_window_internal(opts.profile_name.as_deref(), opts.config_path.as_deref())?,
     );
 
     // (#590) Pre-compaction loaded-check: warn (don't abort) if the resolved
@@ -3397,6 +3426,16 @@ fn resolve_dispatch_model_internal(
         )
     })?;
 
+    // (#1282) A REQUESTED profile that was quarantined at load is a hard
+    // stop with the entry's own parse error — letting it reach the #1054
+    // "not defined" fallback below would silently dispatch the default
+    // profile's model instead of the one the operator named.
+    if let Some(req) = profile_override {
+        if let Some(msg) = loaded.registry.quarantine_error_for(req) {
+            bail!(msg);
+        }
+    }
+
     // (#1054) Resolve the active profile: the CLI `--profile` override is
     // tried first, then the registry's `default_profile`. A `--profile` that
     // names a profile NOT defined on this machine falls back to
@@ -3422,6 +3461,16 @@ fn resolve_dispatch_model_internal(
             pair
         }
         None => {
+            // (#1282) A quarantined `default_profile` is a hard stop with
+            // the entry's own parse error — falling through to
+            // `probe_loaded_model()` would dispatch against whatever
+            // LMStudio happens to have loaded, exactly the contamination
+            // the #1269 registry-load hard stop above exists to prevent.
+            if let Some(default_name) = loaded.registry.default_profile.as_deref() {
+                if let Some(msg) = loaded.registry.quarantine_error_for(default_name) {
+                    bail!(msg);
+                }
+            }
             eprintln!(
                 "darkmux crew dispatch: no usable profile (no --profile match and no \
                  default_profile set/defined); falling back to probe_loaded_model() — \
@@ -3541,8 +3590,11 @@ fn resolve_utility_model_internal(config_path: Option<&str>) -> Option<String> {
 /// `--profile` override > registry `default_profile`) and delegates the
 /// derivation to `CompactionDispatchArgs::from_profile` so the
 /// default-model → `n_ctx` rule has a single source of truth. Returns
-/// `None` only when the registry/profile can't be resolved — the same edge
-/// cases that send model selection to `probe_loaded_model()`.
+/// `Ok(None)` when the registry/profile can't be resolved — the same edge
+/// cases that send model selection to `probe_loaded_model()` — and `Err`
+/// when the requested (or default) profile is QUARANTINED (#1282): the
+/// window must never silently come from a DIFFERENT profile than the one
+/// the dispatch names.
 // `pub` so the mission-run brief path can size its proportional injected-context
 // budget (#1011) from the SAME profile resolver the runtime uses for its
 // compaction window. They share the resolver; a profile that declares no
@@ -3551,13 +3603,32 @@ fn resolve_utility_model_internal(config_path: Option<&str>) -> Option<String> {
 pub fn resolve_context_window_internal(
     profile_override: Option<&str>,
     config_path: Option<&str>,
-) -> Option<u32> {
-    let loaded = darkmux_profiles::profiles::load_registry(config_path).ok()?;
+) -> Result<Option<u32>> {
+    let Ok(loaded) = darkmux_profiles::profiles::load_registry(config_path) else {
+        return Ok(None);
+    };
+    // (#1282) Quarantine-aware, mirroring `resolve_dispatch_model_internal`:
+    // a quarantined requested profile hard-fails instead of taking the
+    // #1054 default fallback below.
+    if let Some(req) = profile_override {
+        if let Some(msg) = loaded.registry.quarantine_error_for(req) {
+            bail!(msg);
+        }
+    }
     // (#1054) Same graceful resolution as model selection — a requested profile
     // undefined here falls back to default_profile, so the context window comes
     // from the SAME profile the model does.
-    let (_active_name, profile) = loaded.registry.resolve_active(profile_override)?;
-    crate::dispatch::CompactionDispatchArgs::from_profile(profile).context_window
+    let Some((_active_name, profile)) = loaded.registry.resolve_active(profile_override) else {
+        // (#1282) A quarantined `default_profile` hard-fails rather than
+        // reporting "no window" for a profile that IS in the file, broken.
+        if let Some(default_name) = loaded.registry.default_profile.as_deref() {
+            if let Some(msg) = loaded.registry.quarantine_error_for(default_name) {
+                bail!(msg);
+            }
+        }
+        return Ok(None);
+    };
+    Ok(crate::dispatch::CompactionDispatchArgs::from_profile(profile).context_window)
 }
 
 /// (#632) Guard that the runtime always receives a context window. Some
@@ -3648,35 +3719,39 @@ fn strict_selection_enabled() -> bool {
 /// the early-detection half of #1139 (the fallback/eviction half is #1139/#1140).
 fn ensure_model_loaded_at_ctx(pm: &darkmux_types::ProfileModel) -> Result<()> {
     use darkmux_profiles::{lms, swap};
+    // (#1282) This is a LOCAL load path (remote-brained dispatches skip it) —
+    // a model without a declared `n_ctx` is a resolution error here, with the
+    // uniform require_n_ctx message, never a parse-stage failure.
+    let n_ctx = pm.require_n_ctx()?;
     let loaded = lms::list_loaded().unwrap_or_default();
     match loaded.iter().find(|m| m.model == pm.id) {
-        Some(m) if m.context >= u64::from(pm.n_ctx) => return Ok(()),
+        Some(m) if m.context >= u64::from(n_ctx) => return Ok(()),
         Some(m) => {
             eprintln!(
                 "darkmux crew dispatch: `{}` is resident at context {} but the profile \
                  declares n_ctx={}; reloading at {} so the dispatch gets the declared \
                  context. (#1135)",
-                pm.id, m.context, pm.n_ctx, pm.n_ctx
+                pm.id, m.context, n_ctx, n_ctx
             );
             lms::unload(&m.identifier).with_context(|| {
-                format!("unloading `{}` to reload at n_ctx={}", m.identifier, pm.n_ctx)
+                format!("unloading `{}` to reload at n_ctx={}", m.identifier, n_ctx)
             })?;
         }
         None => {
             eprintln!(
                 "darkmux crew dispatch: loading `{}` at n_ctx={} (the profile's declared \
                  context) before dispatch. (#1135)",
-                pm.id, pm.n_ctx
+                pm.id, n_ctx
             );
         }
     }
     let identifier = swap::namespaced_identifier(pm);
-    lms::load_with_identifier(&pm.id, pm.n_ctx, &identifier, true).with_context(|| {
+    lms::load_with_identifier(&pm.id, n_ctx, &identifier, true).with_context(|| {
         format!(
             "loading `{}` at n_ctx={} failed — likely insufficient RAM (free resources, \
              lower the profile's n_ctx, or evict a resident model), or LMStudio could not \
              load it. (#1135; load-failure detection/fallback is #1139)",
-            pm.id, pm.n_ctx
+            pm.id, n_ctx
         )
     })
 }
@@ -3918,7 +3993,7 @@ mod tests {
         // dispatches out of the hosted fork.
         let local_no_ep = darkmux_types::ProfileModel {
             id: "qwen".into(),
-            n_ctx: 40960,
+            n_ctx: Some(40960),
             ..Default::default()
         };
         assert!(!local_no_ep
@@ -3927,7 +4002,7 @@ mod tests {
             .is_some_and(|e| e.is_remote()));
         let remote = darkmux_types::ProfileModel {
             id: "gpt-4o".into(),
-            n_ctx: 200000,
+            n_ctx: Some(200000),
             endpoint: Some(darkmux_types::ModelEndpoint {
                 url: Some("https://x.azure.com/openai/deployments/gpt-4o".into()),
                 ..Default::default()
@@ -4380,7 +4455,7 @@ mod tests {
         let prev = std::env::var("DARKMUX_PROFILES").ok();
         // SAFETY: serialized via #[serial]; restored below.
         unsafe { std::env::remove_var("DARKMUX_PROFILES") };
-        let from_flag = resolve_context_window_internal(None, pf.to_str());
+        let from_flag = resolve_context_window_internal(None, pf.to_str()).unwrap();
         unsafe {
             match prev {
                 Some(v) => std::env::set_var("DARKMUX_PROFILES", v),
@@ -4457,7 +4532,7 @@ mod tests {
         let prev = std::env::var("DARKMUX_PROFILES").ok();
         // SAFETY: serialized via #[serial]; restored below.
         unsafe { std::env::remove_var("DARKMUX_PROFILES") };
-        let window = resolve_context_window_internal(None, pf.to_str());
+        let window = resolve_context_window_internal(None, pf.to_str()).unwrap();
         unsafe {
             match prev {
                 Some(v) => std::env::set_var("DARKMUX_PROFILES", v),
@@ -4470,6 +4545,104 @@ mod tests {
             "an invalid crew elsewhere in the registry must not affect \
              resolution of the sibling default profile (#1269)"
         );
+    }
+
+    // ─── #1282: quarantine-aware dispatch resolution ────────────────
+
+    fn quarantine_test_role() -> crate::types::Role {
+        serde_json::from_str(
+            r#"{"id":"r","description":"d","tool_palette":{"allow":[],"deny":[]},"escalation_contract":"bail-with-explanation"}"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn resolve_dispatch_model_internal_bails_on_quarantined_requested_profile() {
+        // (#1282) A REQUESTED profile whose registry entry was quarantined at
+        // load must hard-fail with the entry's own parse error — pre-fix it
+        // fell into the #1054 "not defined" fallback and dispatched the
+        // default profile's model instead. If this test somehow DID take the
+        // fallback, resolution would proceed toward LMStudio (`lms` load /
+        // probe) and fail in a way unrelated to the assertions below — the
+        // error text alone proves which path was taken.
+        let tmp = TempDir::new().unwrap();
+        let pf = tmp.path().join("profiles.json");
+        std::fs::write(
+            &pf,
+            r#"{"profiles":{
+                    "fast":{"models":[{"id":"model-a","n_ctx":32000}]},
+                    "review":{"models":[{"n_ctx":32000}]}
+                },
+                "default_profile":"fast"}"#,
+        )
+        .unwrap();
+
+        let err =
+            resolve_dispatch_model_internal(&quarantine_test_role(), Some("review"), pf.to_str())
+                .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("quarantined"), "got: {msg}");
+        assert!(msg.contains("\"review\""), "got: {msg}");
+        assert!(msg.contains("missing field `id`"), "got: {msg}");
+        assert!(msg.contains("darkmux doctor"), "got: {msg}");
+    }
+
+    #[test]
+    fn resolve_dispatch_model_internal_bails_on_quarantined_default_profile_no_probe() {
+        // (#1282) A quarantined `default_profile` must hard-fail — pre-fix,
+        // `resolve_active` returned None and the code fell through to the
+        // deprecated `probe_loaded_model()`, dispatching against whatever
+        // LMStudio happened to have loaded. Same caveat as the malformed-
+        // registry test above: on regression this would shell out toward
+        // LMStudio; the error text proves the path.
+        let tmp = TempDir::new().unwrap();
+        let pf = tmp.path().join("profiles.json");
+        std::fs::write(
+            &pf,
+            r#"{"profiles":{
+                    "fast":{"models":[{"id":"model-a","n_ctx":32000}]},
+                    "broken":{"models":[{"n_ctx":32000}]}
+                },
+                "default_profile":"broken"}"#,
+        )
+        .unwrap();
+
+        let err = resolve_dispatch_model_internal(&quarantine_test_role(), None, pf.to_str())
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("quarantined"), "got: {msg}");
+        assert!(msg.contains("\"broken\""), "got: {msg}");
+        assert!(msg.contains("darkmux doctor"), "got: {msg}");
+        assert!(
+            !msg.contains("falling back") && !msg.contains("probe_loaded_model()"),
+            "must NOT take the deprecated probe fallback for a quarantined default: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_context_window_internal_bails_on_quarantined_profile() {
+        // (#1282) The context-window resolver mirrors model selection: a
+        // quarantined requested profile errs instead of silently sizing the
+        // window from the default profile; a quarantined default errs
+        // instead of reporting "no window" for an entry that IS in the file.
+        let tmp = TempDir::new().unwrap();
+        let pf = tmp.path().join("profiles.json");
+        std::fs::write(
+            &pf,
+            r#"{"profiles":{
+                    "fast":{"models":[{"id":"model-a","n_ctx":32000}]},
+                    "review":{"models":[{"n_ctx":32000}]}
+                },
+                "default_profile":"fast"}"#,
+        )
+        .unwrap();
+        let err = resolve_context_window_internal(Some("review"), pf.to_str()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("quarantined") && msg.contains("\"review\""), "got: {msg}");
+
+        // A healthy requested profile on the same registry still resolves.
+        let window = resolve_context_window_internal(Some("fast"), pf.to_str()).unwrap();
+        assert_eq!(window, Some(32000));
     }
 
     #[test]
@@ -5320,7 +5493,7 @@ mod tests {
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary".into(),
-                n_ctx: 100_000,
+                n_ctx: Some(100_000),
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -5363,7 +5536,7 @@ mod tests {
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
-                n_ctx: 100_000,
+                n_ctx: Some(100_000),
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -5388,6 +5561,34 @@ mod tests {
         };
         let args = crate::dispatch::CompactionDispatchArgs::from_profile(&profile);
         assert_eq!(args.bail_after_compactions, Some(3));
+    }
+
+    /// (#1282) A default model with NO declared `n_ctx` (endpoint-bearing —
+    /// the provider owns the real window) derives `context_window: None`,
+    /// which keeps the formula trigger OFF rather than inventing a window.
+    #[test]
+    fn from_profile_endpoint_default_model_without_n_ctx_yields_no_context_window() {
+        use darkmux_types::{ModelEndpoint, Profile, ProfileModel};
+        let profile = Profile {
+            extras: Default::default(),
+            description: None,
+            default_model: None,
+            models: vec![ProfileModel {
+                endpoint: Some(ModelEndpoint {
+                    url: Some("https://example.azure.com/openai".into()),
+                    ..Default::default()
+                }),
+                extras: Default::default(),
+                id: "gpt-remote".into(),
+                n_ctx: None,
+                capabilities: Default::default(),
+                identifier: None,
+            }],
+            runtime: None,
+            use_when: None,
+        };
+        let args = crate::dispatch::CompactionDispatchArgs::from_profile(&profile);
+        assert_eq!(args.context_window, None, "no declared n_ctx ⇒ no window");
     }
 
     /// (#377) Per-role override wins over profile fallback. Operator
@@ -5466,7 +5667,7 @@ mod tests {
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
-                n_ctx: 100_000,
+                n_ctx: Some(100_000),
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -5503,7 +5704,7 @@ mod tests {
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
-                n_ctx: 100_000,
+                n_ctx: Some(100_000),
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -5553,7 +5754,7 @@ mod tests {
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
-                n_ctx: 101_000,
+                n_ctx: Some(101_000),
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -5607,7 +5808,7 @@ mod tests {
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
-                n_ctx: 100_000,
+                n_ctx: Some(100_000),
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -5650,7 +5851,7 @@ mod tests {
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
-                n_ctx: 100_000,
+                n_ctx: Some(100_000),
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -5707,7 +5908,7 @@ mod tests {
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
-                n_ctx: 100_000,
+                n_ctx: Some(100_000),
                 capabilities: Default::default(),
                 identifier: None,
             }],
@@ -5745,7 +5946,7 @@ mod tests {
                 endpoint: None,
                 extras: Default::default(),
                 id: "primary-x".into(),
-                n_ctx: 50_000,
+                n_ctx: Some(50_000),
                 capabilities: Default::default(),
                 identifier: None,
             }],
