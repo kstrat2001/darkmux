@@ -90,9 +90,9 @@ a whole file:
       "description": "Probe seat, plain draws — devstral at 32K.",
       "models": [{ "id": "mistralai/devstral-small-2507", "n_ctx": 32000 }]
     },
-    "qwen3.6-27b-review": {
-      "description": "Probe seat, bundle-scoped draws — qwen3.6-27b at 32K.",
-      "models": [{ "id": "qwen/qwen3.6-27b", "n_ctx": 32000 }]
+    "qwen4b": {
+      "description": "Probe seat, second voice — a fast 4B instruct at 32K.",
+      "models": [{ "id": "qwen3-4b-instruct-2507", "n_ctx": 32000 }]
     },
     "judge-35b-moe": {
       "description": "Judge seat — the 35B MoE weighing the probes' findings.",
@@ -102,16 +102,11 @@ a whole file:
 
   "crews": {
     "review-deep": {
-      "description": "32GB-tier review funnel: two probe staffings (one plain, one bundle-scoped) plus a single judge staffing.",
+      "description": "32GB-tier review funnel: a wide instruct pair on the probe seat plus a fast MoE judge — the measured reference configuration.",
       "seats": {
         "review-probe": [
-          { "profile": "devstral", "k": 3 },
-          {
-            "profile": "qwen3.6-27b-review",
-            "k": 1,
-            "max_tokens": 24000,
-            "bundle_selector": { "fact_families": ["param-flow"], "max_bundles": 8 }
-          }
+          { "profile": "devstral", "k": 3, "max_tokens": 3000 },
+          { "profile": "qwen4b", "k": 2, "max_tokens": 4000 }
         ],
         "review-judge": [
           { "profile": "judge-35b-moe", "max_tokens": 20000 }
@@ -126,7 +121,7 @@ a whole file:
 
 ```bash
 lms get mistralai/devstral-small-2507
-lms get qwen/qwen3.6-27b
+lms get qwen3-4b-instruct-2507
 # skip if the judge model is already on the box (it likely is — same family
 # darkmux's other roles use)
 lms get qwen/qwen3.6-35b-a3b
@@ -139,6 +134,17 @@ between seats. `parallel` is for machines with enough headroom to keep the
 whole crew loaded simultaneously; `auto` lets darkmux decide from the runner's
 observed RAM. Set it per dispatch with `-f mode=sequential` (or leave the
 workflow's `auto` default — it should reach the same conclusion on a 32GB box).
+
+**A note on deep-reasoner probe seats (do NOT add one on a 32GB M1-class box).**
+High-memory machines (64GB+, current-generation Max/Ultra bandwidth) can add a
+third probe staffing — a dense ~27B reasoner with a `bundle_selector` scoping it
+to a few high-value bundles — which measurably reaches a bug class the wide
+pair cannot (deep relational/temporal mechanisms). The cost is real: one deep
+draw is a 20-30K-token reasoning pass, roughly 7-9 minutes on an M5-class Max
+and 30-60+ minutes per draw on an M1 Max — hours per PR. On bandwidth-limited
+32GB machines, skip the deep seat (the wide-pair crew above is the validated
+reference configuration) and treat deep prosecution as a higher-tier machine's
+job or, in a future release, a remote-staffed seat.
 
 **(e) Verify.**
 
