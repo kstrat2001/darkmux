@@ -2,10 +2,28 @@
 //!
 //! The memory ledger's "potential" number (weights + KV-cache commitment at
 //! the loaded ctx) needs per-model architecture facts, and they are readable
-//! today with no LMStudio API: every downloaded model carries its own
-//! `config.json` under the LMStudio models root. This reader locates
-//! `<root>/<publisher>/<model-dir>/config.json` for a catalog model key and
-//! extracts the KV-arithmetic inputs:
+//! today with no LMStudio API: every sideloaded model carries its own
+//! `config.json` under the LMStudio models root.
+//!
+//! **Path resolution (live-verified against `lms ls --json`):** the catalog
+//! `modelKey` is NOT the on-disk directory for most real models — e.g.
+//! modelKey `qwen3.6-35b-a3b-turboquant-mlx` lives at
+//! `<root>/majentik/Qwen3.6-35B-A3B-TurboQuant-MLX-MXFP4`. The authoritative
+//! location comes from the model's own ls entry: its `path` field (falling
+//! back to `indexedModelIdentifier`) is the directory relative to the models
+//! root. The reader therefore takes the parsed ls entries at construction
+//! and resolves `<root>/<entry-path>/config.json` first, then falls back to
+//! trying the modelKey as a directory, else `None`.
+//!
+//! **Named limitation:** catalog-alias models (e.g. `qwen/qwen3.6-27b`
+//! downloaded through LMStudio's own model catalog) carry an ls `path` that
+//! matches no directory under the models root — their weights live in a
+//! separate store with no readable `config.json`. They resolve to `None`
+//! (the estimator's unknowable path); `darkmux doctor` can surface the gap
+//! later.
+//!
+//! From the located `config.json` the reader extracts the KV-arithmetic
+//! inputs:
 //!
 //! - `num_hidden_layers`, `num_key_value_heads`, `head_dim` — top-level OR
 //!   under `text_config` (both shapes exist in the wild: plain top-level on
@@ -24,6 +42,7 @@
 //! the reader can't price degrades to the documented
 //! `LoadEstimateUnknown`-style warnings downstream; it never fails a plan.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Architecture facts for one catalog model, as read from its `config.json`.
@@ -42,42 +61,81 @@ pub struct ArchFactsRaw {
     pub quantization_bits: u64,
 }
 
-/// Reads per-model architecture facts from the LMStudio models root.
+/// Reads per-model architecture facts from the LMStudio models root, using
+/// the models' `lms ls --json` entries to locate each on-disk directory
+/// (see the module docs — modelKey is NOT the directory for most models).
 #[derive(Debug, Clone)]
 pub struct ArchFactsReader {
     models_root: PathBuf,
-}
-
-impl Default for ArchFactsReader {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// modelKey → on-disk directory relative to `models_root`, built from
+    /// the ls entries' `path` (falling back to `indexedModelIdentifier`).
+    key_paths: BTreeMap<String, String>,
 }
 
 impl ArchFactsReader {
-    /// The real LMStudio models root (`~/.lmstudio/models`).
-    pub fn new() -> Self {
+    /// The production constructor: the real LMStudio models root
+    /// (`~/.lmstudio/models`) plus the parsed `lms ls --json` entries whose
+    /// `path`/`indexedModelIdentifier` fields locate each model on disk.
+    pub fn from_ls_entries(entries: &[serde_json::Value]) -> Self {
         let root = dirs::home_dir()
             .map(|h| h.join(".lmstudio").join("models"))
             .unwrap_or_else(|| PathBuf::from(".lmstudio/models"));
-        Self { models_root: root }
+        Self::with_root_and_entries(root, entries)
     }
 
-    /// An explicit root — the test seam (tests point at fixture trees and
-    /// NEVER read the operator's real `~/.lmstudio`), and the override for
-    /// a relocated LMStudio home.
+    /// Explicit root + ls entries — the test seam for the entry-path
+    /// resolution (tests point at fixture trees and NEVER read the
+    /// operator's real `~/.lmstudio`), and the override for a relocated
+    /// LMStudio home.
+    pub fn with_root_and_entries(root: impl Into<PathBuf>, entries: &[serde_json::Value]) -> Self {
+        Self { models_root: root.into(), key_paths: key_paths_from_entries(entries) }
+    }
+
+    /// Explicit root with NO entry map: resolution has only the
+    /// modelKey-as-dir fallback, so most real models miss (see the module
+    /// docs). Prefer [`ArchFactsReader::from_ls_entries`] whenever ls output
+    /// is in hand.
     pub fn with_root(root: impl Into<PathBuf>) -> Self {
-        Self { models_root: root.into() }
+        Self { models_root: root.into(), key_paths: BTreeMap::new() }
     }
 
-    /// Facts for `model_key` (the `lms ls` catalog key, conventionally
-    /// `<publisher>/<model-dir>`), joined verbatim under the models root.
-    /// `None` on any miss — absent directory, unreadable file, malformed
-    /// JSON, or a missing required field (see module docs).
+    /// Facts for `model_key` (the `lms ls` catalog key). Resolution order:
+    ///
+    /// 1. The model's ls-entry path under the models root — the
+    ///    authoritative on-disk location.
+    /// 2. The modelKey itself as a directory under the root (the layouts
+    ///    where key and directory coincide, e.g. `darkmux-distill/...`).
+    /// 3. `None` — absent directory (the named catalog-alias limitation),
+    ///    unreadable file, malformed JSON, or a missing required field.
     pub fn read(&self, model_key: &str) -> Option<ArchFactsRaw> {
-        let path = self.models_root.join(model_key).join("config.json");
-        read_config_file(&path)
+        if let Some(rel) = self.key_paths.get(model_key) {
+            if let Some(facts) =
+                read_config_file(&self.models_root.join(rel).join("config.json"))
+            {
+                return Some(facts);
+            }
+        }
+        read_config_file(&self.models_root.join(model_key).join("config.json"))
     }
+}
+
+/// modelKey → relative on-disk path, from the parsed `lms ls --json` rows.
+/// `path` is the field the live CLI populates with the directory relative to
+/// the models root; `indexedModelIdentifier` mirrors it and serves as the
+/// fallback. Rows missing both (or missing `modelKey`) are skipped — those
+/// models simply stay on the modelKey-as-dir fallback.
+fn key_paths_from_entries(entries: &[serde_json::Value]) -> BTreeMap<String, String> {
+    entries
+        .iter()
+        .filter_map(|e| {
+            let key = e.get("modelKey").and_then(|v| v.as_str())?;
+            let path = e
+                .get("path")
+                .or_else(|| e.get("indexedModelIdentifier"))
+                .and_then(|v| v.as_str())?;
+            Some((key.to_string(), path.to_string()))
+        })
+        .collect()
 }
 
 fn read_config_file(path: &Path) -> Option<ArchFactsRaw> {
@@ -129,11 +187,68 @@ mod tests {
     /// The fixture models root under this crate's tests dir — real-shape
     /// `config.json` files written for these tests. The operator's real
     /// `~/.lmstudio` is never read.
+    const FIXTURE_ROOT: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/lmstudio-models");
+
+    /// Map-less reader: exercises the modelKey-as-dir fallback (the fixture
+    /// keys ARE their directories).
     fn fixture_reader() -> ArchFactsReader {
-        ArchFactsReader::with_root(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/lmstudio-models"
-        ))
+        ArchFactsReader::with_root(FIXTURE_ROOT)
+    }
+
+    #[test]
+    fn read_resolves_dir_from_ls_entry_path_not_model_key() {
+        // The live-verified shape (#1286): modelKey is NOT the on-disk
+        // directory — the ls entry's `path` is. A key with no directory of
+        // its own resolves through the entry map.
+        let entries = [json!({
+            "modelKey": "hybrid-35b-turboquant-mlx",
+            "path": "test-pub/hybrid-35b",
+            "indexedModelIdentifier": "test-pub/hybrid-35b",
+        })];
+        let reader = ArchFactsReader::with_root_and_entries(FIXTURE_ROOT, &entries);
+        let facts = reader.read("hybrid-35b-turboquant-mlx").expect("resolved via entry path");
+        assert_eq!(facts.num_hidden_layers, 40);
+        // And the same key without the map is unresolvable — the old
+        // modelKey-join behavior this fix replaces.
+        assert_eq!(fixture_reader().read("hybrid-35b-turboquant-mlx"), None);
+    }
+
+    #[test]
+    fn read_uses_indexed_model_identifier_when_path_absent() {
+        let entries = [json!({
+            "modelKey": "plain-4b-alias",
+            "indexedModelIdentifier": "test-pub/plain-4b",
+        })];
+        let reader = ArchFactsReader::with_root_and_entries(FIXTURE_ROOT, &entries);
+        assert_eq!(reader.read("plain-4b-alias").expect("resolved").num_hidden_layers, 36);
+    }
+
+    #[test]
+    fn read_falls_back_to_model_key_as_dir_when_entry_path_misses() {
+        // An entry whose path matches nothing on disk (or a key with no
+        // entry at all) still gets the modelKey-as-dir try before None.
+        let entries = [json!({
+            "modelKey": "test-pub/plain-4b",
+            "path": "elsewhere/not-on-disk",
+        })];
+        let reader = ArchFactsReader::with_root_and_entries(FIXTURE_ROOT, &entries);
+        assert_eq!(reader.read("test-pub/plain-4b").expect("fallback").num_hidden_layers, 36);
+    }
+
+    #[test]
+    fn catalog_alias_with_no_matching_dir_is_none() {
+        // The NAMED LIMITATION (module docs): catalog-alias models carry an
+        // ls path that matches no directory under the models root — their
+        // weights live in a separate store. Unknowable, never an error;
+        // doctor can surface the gap later.
+        let entries = [json!({
+            "modelKey": "qwen/qwen3.6-27b",
+            "path": "qwen/qwen3.6-27b",
+            "indexedModelIdentifier": "qwen/qwen3.6-27b",
+        })];
+        let reader = ArchFactsReader::with_root_and_entries(FIXTURE_ROOT, &entries);
+        assert_eq!(reader.read("qwen/qwen3.6-27b"), None);
     }
 
     #[test]

@@ -17,7 +17,11 @@
 //! - [`ArchFactsReader`] — the #1286 architecture-facts source: reads a
 //!   catalog model's own `config.json` under the LMStudio models root
 //!   (layers / kv heads / head_dim / layer_types / quantization bits), the
-//!   inputs to the KV-cache "potential" arithmetic.
+//!   inputs to the KV-cache "potential" arithmetic. On-disk location is
+//!   resolved from the model's `lms ls --json` entry (`path` /
+//!   `indexedModelIdentifier`) — the modelKey is NOT the directory for most
+//!   real models; catalog-alias models with no matching directory are a
+//!   named `None` limitation (see the module docs).
 //!
 //! These adapters are NEW surface: `swap.rs` / `lms.rs` call paths are
 //! untouched (cutover is packet 3). Nothing here mutates host state except

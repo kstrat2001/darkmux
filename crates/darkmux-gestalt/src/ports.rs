@@ -35,6 +35,14 @@ impl Deadline {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostError {
     /// The #1276 hang, surfaced loud with the phase named.
+    ///
+    /// **Orphan-load contract:** expiry kills the CLIENT process only (the
+    /// spawned CLI call) — the host server may still complete the action
+    /// after the kill and leave a `darkmux:*` resident behind. That orphan
+    /// is reconciled, not leaked: the executor re-verifies preconditions
+    /// from fresh facts at the next plan, observes the resident, and —
+    /// absolute ownership over the darkmux namespace (#1274 contract) — it
+    /// is darkmux's to unload or reuse like any other owned instance.
     Timeout { phase: &'static str, waited: Duration },
     UnknownModel { model_key: String },
     /// The #1139 fast-fail shape (insufficient host resources), structured.

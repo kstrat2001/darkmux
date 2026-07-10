@@ -4,12 +4,16 @@
 //! keep serving `swap.rs` untouched until the packet-3 cutover. This adapter
 //! differs from them in exactly the ways the gestalt ports require:
 //!
-//! - **Enforced deadline on every mutating call (#1276).** The current
+//! - **Enforced deadline on EVERY call (#1276).** The current
 //!   `lms::load_with_identifier` blocks indefinitely via `Command::status()`
 //!   — a wrong model id hangs the dispatch until the workflow's outer kill.
-//!   Here every `lms load`/`lms unload` child is spawned, polled with
-//!   `try_wait`, and hard-killed at deadline expiry, returning a typed
-//!   [`HostError::Timeout`] naming the phase.
+//!   Here every `lms` child — load, unload, and the read-only ps/ls — is
+//!   spawned, polled with `try_wait`, and hard-killed at expiry, returning a
+//!   typed [`HostError::Timeout`] naming the phase. Mutating calls run under
+//!   the caller's [`Deadline`]; the list calls (whose port signatures carry
+//!   no deadline — a packet-3 contract question) run under an adapter-level
+//!   bound ([`DEFAULT_LIST_BOUND`]), and the post-load provenance re-list
+//!   under the load deadline's remaining budget.
 //! - **Raw `sizeBytes` (#1243 budget accounting).** `LoadedModel.size` is a
 //!   display string; [`ResidentFact::est_bytes`] wants bytes. The JSON is
 //!   parsed directly — never reformatted-and-reparsed.
@@ -28,6 +32,14 @@ use std::time::{Duration, Instant};
 /// long enough to be free at the real 600 s default.
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
+/// Adapter-level fixed bound on the read-only list calls (`lms ps`/`lms ls`).
+/// The gestalt port reads take no `Deadline` today — whether they should is a
+/// packet-3 contract question (see the [`ModelHost`] impl note) — so the
+/// adapter supplies a generous bound of its own: a wedged `lms ps` must not
+/// hang plan assembly any more than a wedged `lms load` may hang execution
+/// (#1276).
+const DEFAULT_LIST_BOUND: Duration = Duration::from_secs(30);
+
 /// The `lms`-CLI implementation of the gestalt [`ModelHost`] port.
 ///
 /// Holds the resolved binary path at construction: [`LmsHost::new`] resolves
@@ -38,6 +50,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 #[derive(Debug, Clone)]
 pub struct LmsHost {
     bin: String,
+    /// Bound applied to the read-only list calls (see [`DEFAULT_LIST_BOUND`]);
+    /// also caps the post-load provenance re-list inside [`ModelHost::load`].
+    list_bound: Duration,
 }
 
 impl Default for LmsHost {
@@ -48,11 +63,57 @@ impl Default for LmsHost {
 
 impl LmsHost {
     pub fn new() -> Self {
-        Self { bin: lms_bin() }
+        Self { bin: lms_bin(), list_bound: DEFAULT_LIST_BOUND }
     }
 
     pub fn with_bin(bin: impl Into<String>) -> Self {
-        Self { bin: bin.into() }
+        Self { bin: bin.into(), list_bound: DEFAULT_LIST_BOUND }
+    }
+
+    /// Override the adapter-level list-call bound (defaults to
+    /// [`DEFAULT_LIST_BOUND`]). The test seam for the wedged-`lms ps` cases;
+    /// also available to callers with a tighter latency budget.
+    pub fn with_list_bound(mut self, bound: Duration) -> Self {
+        self.list_bound = bound;
+        self
+    }
+
+    /// `lms ps --json` under an explicit deadline — shared by the port's
+    /// [`ModelHost::list_resident`] (adapter bound) and the post-load
+    /// provenance re-list (remaining load budget, #1276).
+    fn ps_bounded(&self, deadline: Deadline) -> Result<Vec<ResidentFact>, HostError> {
+        let rows = self.run_json_list(&["ps", "--json"], "ps", deadline)?;
+        Ok(rows.iter().map(resident_fact_from_json).collect())
+    }
+
+    /// Run `lms <args>` under `deadline` and parse a JSON array off stdout —
+    /// the shared body of both list calls. Same polling mechanics as the
+    /// mutating calls ([`run_bounded`]); stdout is captured instead of nulled.
+    fn run_json_list(
+        &self,
+        args: &[&str],
+        phase: &'static str,
+        deadline: Deadline,
+    ) -> Result<Vec<serde_json::Value>, HostError> {
+        let mut cmd = Command::new(&self.bin);
+        cmd.args(args);
+        let run = run_bounded(cmd, phase, deadline, StdoutMode::Capture)?;
+        if !run.status.success() {
+            return Err(HostError::CommandFailed {
+                detail: format!("`lms {phase} --json` {}", run.exit_detail()),
+            });
+        }
+        let parsed: serde_json::Value = serde_json::from_str(&run.stdout).map_err(|e| {
+            HostError::CommandFailed {
+                detail: format!("`lms {phase} --json` output is not JSON: {e}"),
+            }
+        })?;
+        match parsed {
+            serde_json::Value::Array(rows) => Ok(rows),
+            _ => Err(HostError::CommandFailed {
+                detail: format!("`lms {phase} --json` output is not a JSON array"),
+            }),
+        }
     }
 }
 
@@ -61,59 +122,24 @@ impl ModelHost for LmsHost {
     /// decision-bearing (first-match-wins residency + deterministic budget
     /// eviction walk; see the `ResidentFact` docs). Adapters MUST NOT sort,
     /// and this one doesn't.
+    ///
+    /// Bounded at the ADAPTER level by `list_bound` ([`DEFAULT_LIST_BOUND`],
+    /// same polling mechanics as the mutating calls): the [`ModelHost`] read
+    /// signatures take no `Deadline` today, and whether they should is a
+    /// packet-3 contract question — until that's settled the adapter refuses
+    /// to run any `lms` child unbounded (#1276).
     fn list_resident(&mut self) -> Result<Vec<ResidentFact>, HostError> {
-        let out = Command::new(&self.bin)
-            .args(["ps", "--json"])
-            .output()
-            .map_err(|e| HostError::CommandFailed { detail: format!("spawning `lms ps --json`: {e}") })?;
-        if !out.status.success() {
-            return Err(HostError::CommandFailed {
-                detail: format!(
-                    "`lms ps --json` exited with {}: {}",
-                    out.status,
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ),
-            });
-        }
-        let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|e| {
-            HostError::CommandFailed { detail: format!("`lms ps --json` output is not JSON: {e}") }
-        })?;
-        let Some(arr) = parsed.as_array() else {
-            return Err(HostError::CommandFailed {
-                detail: "`lms ps --json` output is not a JSON array".to_string(),
-            });
-        };
-        Ok(arr.iter().map(resident_fact_from_json).collect())
+        self.ps_bounded(Deadline(self.list_bound))
     }
 
     /// `lms ls --json` → catalog facts (the #1276 existence fast-fail input +
     /// the estimator's base term). A failure is a typed error here; the
     /// LENIENCY (catalog unavailable ⇒ `Facts.catalog = None`, fast-fail
     /// skipped not failed) belongs to the facts-assembling caller, per the
-    /// `Facts::catalog` contract.
+    /// `Facts::catalog` contract. Adapter-bounded like `list_resident`.
     fn list_catalog(&mut self) -> Result<Vec<CatalogFact>, HostError> {
-        let out = Command::new(&self.bin)
-            .args(["ls", "--json"])
-            .output()
-            .map_err(|e| HostError::CommandFailed { detail: format!("spawning `lms ls --json`: {e}") })?;
-        if !out.status.success() {
-            return Err(HostError::CommandFailed {
-                detail: format!(
-                    "`lms ls --json` exited with {}: {}",
-                    out.status,
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ),
-            });
-        }
-        let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|e| {
-            HostError::CommandFailed { detail: format!("`lms ls --json` output is not JSON: {e}") }
-        })?;
-        let Some(arr) = parsed.as_array() else {
-            return Err(HostError::CommandFailed {
-                detail: "`lms ls --json` output is not a JSON array".to_string(),
-            });
-        };
-        Ok(arr.iter().filter_map(catalog_fact_from_json).collect())
+        let rows = self.run_json_list(&["ls", "--json"], "ls", Deadline(self.list_bound))?;
+        Ok(rows.iter().filter_map(catalog_fact_from_json).collect())
     }
 
     /// `lms load <key> --context-length <ctx> --identifier <id> -y` under the
@@ -126,6 +152,14 @@ impl ModelHost for LmsHost {
     /// spinner leaking to stdout corrupts a `--json` dispatch envelope).
     /// stderr is captured rather than inherited — it feeds the typed error
     /// classification, and failures re-surface it in the error detail.
+    ///
+    /// **Orphan-load contract (#1276):** deadline expiry kills the CLIENT
+    /// `lms` process only — the LMStudio server may still complete the load
+    /// after the kill and leave a `darkmux:*` resident behind. That orphan is
+    /// reconciled, not leaked: the gestalt executor re-verifies preconditions
+    /// from a fresh `list_resident` at the next plan, observes the resident,
+    /// and — absolute ownership over the darkmux namespace (#1274 contract) —
+    /// treats it as darkmux's to unload or reuse.
     fn load(
         &mut self,
         model_key: &str,
@@ -143,15 +177,22 @@ impl ModelHost for LmsHost {
             identifier,
             "-y",
         ]);
-        let run = run_bounded(cmd, "load", deadline)?;
+        let started = Instant::now();
+        let run = run_bounded(cmd, "load", deadline, StdoutMode::Null)?;
         if !run.status.success() {
             return Err(classify_load_failure(&run.stderr, model_key, run.exit_detail()));
         }
         // Best-effort post-load provenance (the #1257 interim): re-list
-        // residents and report the ctx the host actually resolved. A re-list
-        // failure degrades to an empty report, never fails the load.
+        // residents and report the ctx the host actually resolved. The
+        // re-list is part of `load()`'s observable wall clock, so it runs
+        // under what's LEFT of the deadline (capped at the adapter list
+        // bound) — an unbounded re-list here let a wedged `lms ps` hang a
+        // SUCCESSFUL load forever despite the #1276 mechanics on the load
+        // child itself. Any re-list failure, timeout included, degrades to
+        // `resolved_ctx: None`: the load succeeded and is never failed for
+        // provenance.
         let resolved_ctx = self
-            .list_resident()
+            .ps_bounded(relist_bound(deadline, started.elapsed(), self.list_bound))
             .ok()
             .and_then(|residents| {
                 residents.iter().find(|r| r.identifier == identifier).map(|r| r.ctx)
@@ -162,16 +203,29 @@ impl ModelHost for LmsHost {
 
     /// `lms unload <identifier>` under the same deadline mechanics. Only a
     /// claim-checked [`OwnedTarget`] can reach this call — the namespace
-    /// contract is structural at the port seam. A not-resident stderr maps to
-    /// the typed [`HostError::NotResident`] (the #1279 double-release shape).
+    /// contract is structural at the port seam.
+    ///
+    /// Outcome classification is EXIT-CODE-BLIND for the not-resident shape:
+    /// the real `lms unload` of a non-resident identifier EXITS 0 with the
+    /// error on stderr only ("Model Not Found / Cannot find a model with the
+    /// identifier …", live-verified), so a bare `!status.success()` gate made
+    /// [`HostError::NotResident`] unreachable and the #1279 double-release
+    /// invisible — the executor would believe bytes were freed. Error-shaped
+    /// stderr on a 0-exit unload is a failure; see
+    /// [`classify_unload_outcome`].
     fn unload(&mut self, target: &OwnedTarget, deadline: Deadline) -> Result<(), HostError> {
         let mut cmd = Command::new(&self.bin);
         cmd.args(["unload", target.identifier()]);
-        let run = run_bounded(cmd, "unload", deadline)?;
-        if !run.status.success() {
-            return Err(classify_unload_failure(&run.stderr, target.identifier(), run.exit_detail()));
+        let run = run_bounded(cmd, "unload", deadline, StdoutMode::Null)?;
+        match classify_unload_outcome(
+            run.status.success(),
+            &run.stderr,
+            target.identifier(),
+            &run.exit_detail(),
+        ) {
+            Some(err) => Err(err),
+            None => Ok(()),
         }
-        Ok(())
     }
 }
 
@@ -214,11 +268,32 @@ fn catalog_fact_from_json(v: &serde_json::Value) -> Option<CatalogFact> {
     Some(CatalogFact { model_key, size_bytes })
 }
 
+/// The bound for the post-load provenance re-list (#1276): what's LEFT of
+/// the load deadline after the load child ran, capped at the adapter list
+/// bound. Zero remaining ⇒ an immediately-expiring deadline — the re-list is
+/// skipped-by-timeout, never run unbounded. Pure so both terms of the `min`
+/// are table-testable without a clock.
+fn relist_bound(deadline: Deadline, load_elapsed: Duration, list_bound: Duration) -> Deadline {
+    Deadline(deadline.0.saturating_sub(load_elapsed).min(list_bound))
+}
+
 // ── Deadline mechanics (#1276) ──
+
+/// Whether the child's stdout is discarded or captured. Mutating calls null
+/// it (the #1135 envelope-safety lesson: the load spinner leaking to stdout
+/// corrupts a `--json` dispatch envelope); the `--json` list calls capture
+/// it — through the same drain mechanics as stderr, never an unbounded
+/// `Command::output()`.
+enum StdoutMode {
+    Null,
+    Capture,
+}
 
 /// Outcome of a bounded child run that finished before the deadline.
 struct BoundedRun {
     status: std::process::ExitStatus,
+    /// Empty under [`StdoutMode::Null`].
+    stdout: String,
     stderr: String,
 }
 
@@ -229,47 +304,38 @@ impl BoundedRun {
     }
 }
 
-/// How long, after the child has EXITED, to keep collecting stderr chunks
-/// from the drain thread. The exited child's writes are already complete
-/// (either read by the drain thread or sitting in the OS pipe buffer, which
-/// the drain thread reads promptly), so one quiet interval means everything
-/// arrived. Bounded so an inherited pipe held open by a grandchild can never
-/// stall the success path (see [`run_bounded`]).
-const STDERR_GRACE: Duration = Duration::from_millis(200);
+/// TOTAL bound on collecting a pipe's chunks from its drain thread after the
+/// child has EXITED. The exited child's writes are already complete (either
+/// read by the drain thread or sitting in the OS pipe buffer, which the
+/// drain thread reads promptly), so one short window collects everything.
+///
+/// The bound is TOTAL, deliberately not per-chunk quiet-interval: a surviving
+/// grandchild that inherited the pipe and keeps writing at a sub-interval
+/// cadence resets a quiet-interval timer for its whole LIFETIME
+/// (demonstrated — a 100 ms-cadence writer held the old grace open for 30 s),
+/// while against a hard cap it can only pad the buffer that gets drained
+/// before moving on. See [`collect_within`].
+const PIPE_GRACE: Duration = Duration::from_millis(200);
 
-/// Spawn `cmd` and wait for it under `deadline` — the #1276 fix as a
-/// mechanism: `spawn` + `try_wait` polling (std-only; no wait-timeout crate),
-/// and on expiry `kill()` + `wait()` (reaped, no zombie) + a typed
-/// [`HostError::Timeout`] naming the phase.
+/// Drain `pipe` on a detached thread, streaming chunks over a channel.
 ///
-/// stdin is nulled (a host call is never interactive), stdout is nulled
-/// (#1135 envelope safety), stderr is piped and drained on a dedicated
-/// thread — draining concurrently is load-bearing: a chatty child that fills
-/// the OS pipe buffer would otherwise block forever and read as a timeout.
-///
-/// The drain thread is NEVER joined, and stderr chunks flow back over a
-/// channel instead of the thread's return value. This is load-bearing, found
-/// by the deadline test itself: killing the direct child does not close the
-/// stderr pipe when a grandchild inherited its write end (the shell-wrapping
-/// stub's `sleep`; any tool that leaves a background process behind), so a
-/// join would block until the GRANDCHILD exits — the exact #1276 hang this
-/// function exists to remove, re-entering through the drain. The detached
-/// thread ends on its own when the pipe finally closes; collection after
-/// child exit is bounded by [`STDERR_GRACE`].
-fn run_bounded(mut cmd: Command, phase: &'static str, deadline: Deadline) -> Result<BoundedRun, HostError> {
-    cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::null());
-    cmd.stderr(Stdio::piped());
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| HostError::CommandFailed { detail: format!("spawning `lms {phase}`: {e}") })?;
-    let stderr_pipe = child.stderr.take();
+/// The thread is NEVER joined, and chunks flow back over the channel instead
+/// of the thread's return value. This is load-bearing, found by the deadline
+/// test itself: killing the direct child does not close the pipe when a
+/// grandchild inherited its write end (the shell-wrapping stub's `sleep`;
+/// any tool that leaves a background process behind), so a join would block
+/// until the GRANDCHILD exits — the exact #1276 hang this machinery exists
+/// to remove, re-entering through the drain. The detached thread ends on its
+/// own when the pipe finally closes or the receiver is dropped; collection
+/// after child exit is bounded by [`PIPE_GRACE`]. A `None` pipe yields an
+/// immediately-disconnected channel (no thread spawned).
+fn spawn_drain<R>(pipe: Option<R>) -> std::sync::mpsc::Receiver<String>
+where
+    R: std::io::Read + Send + 'static,
+{
     let (tx, rx) = std::sync::mpsc::channel::<String>();
-    // Detached by design — see the function docs. Dropping the JoinHandle
-    // detaches; the thread ends when the pipe closes.
+    let Some(mut pipe) = pipe else { return rx }; // tx drops → disconnected
     std::thread::spawn(move || {
-        use std::io::Read;
-        let Some(mut pipe) = stderr_pipe else { return };
         let mut buf = [0u8; 4096];
         loop {
             match pipe.read(&mut buf) {
@@ -282,19 +348,71 @@ fn run_bounded(mut cmd: Command, phase: &'static str, deadline: Deadline) -> Res
             }
         }
     });
+    rx
+}
+
+/// Collect whatever a drain thread delivers within a TOTAL `cap` window.
+/// Returns as soon as the channel disconnects (pipe EOF — everything
+/// arrived); a pipe held open by a grandchild costs at most `cap`, however
+/// chattily the grandchild writes (#1276 — the grace is total-bounded, not
+/// quiet-interval-bounded).
+fn collect_within(rx: &std::sync::mpsc::Receiver<String>, cap: Duration) -> String {
+    let mut out = String::new();
+    let hard_stop = Instant::now() + cap;
+    loop {
+        let now = Instant::now();
+        if now >= hard_stop {
+            break;
+        }
+        match rx.recv_timeout(hard_stop - now) {
+            Ok(chunk) => out.push_str(&chunk),
+            // Disconnected (EOF) or the cap expired — either way, stop
+            // waiting.
+            Err(_) => break,
+        }
+    }
+    // Drain what already arrived without blocking, then move on.
+    while let Ok(chunk) = rx.try_recv() {
+        out.push_str(&chunk);
+    }
+    out
+}
+
+/// Spawn `cmd` and wait for it under `deadline` — the #1276 fix as a
+/// mechanism: `spawn` + `try_wait` polling (std-only; no wait-timeout crate),
+/// and on expiry `kill()` + `wait()` (reaped, no zombie) + a typed
+/// [`HostError::Timeout`] naming the phase.
+///
+/// stdin is nulled (a host call is never interactive); stdout follows
+/// `stdout_mode`; stderr is always piped. Piped streams are drained on
+/// dedicated threads ([`spawn_drain`]) — draining concurrently is
+/// load-bearing: a chatty child that fills the OS pipe buffer would
+/// otherwise block forever and read as a timeout. Post-exit collection is
+/// total-bounded per stream by [`PIPE_GRACE`] ([`collect_within`]).
+fn run_bounded(
+    mut cmd: Command,
+    phase: &'static str,
+    deadline: Deadline,
+    stdout_mode: StdoutMode,
+) -> Result<BoundedRun, HostError> {
+    cmd.stdin(Stdio::null());
+    cmd.stdout(match stdout_mode {
+        StdoutMode::Null => Stdio::null(),
+        StdoutMode::Capture => Stdio::piped(),
+    });
+    cmd.stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| HostError::CommandFailed { detail: format!("spawning `lms {phase}`: {e}") })?;
+    let stdout_rx = spawn_drain(child.stdout.take());
+    let stderr_rx = spawn_drain(child.stderr.take());
     let start = Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                // Collect stderr with a bounded quiet-interval wait: in the
-                // normal case the drain thread hits EOF and disconnects the
-                // channel immediately after the last chunk; in the held-open
-                // pipe case we pay at most one STDERR_GRACE.
-                let mut stderr = String::new();
-                while let Ok(chunk) = rx.recv_timeout(STDERR_GRACE) {
-                    stderr.push_str(&chunk);
-                }
-                return Ok(BoundedRun { status, stderr });
+                let stdout = collect_within(&stdout_rx, PIPE_GRACE);
+                let stderr = collect_within(&stderr_rx, PIPE_GRACE);
+                return Ok(BoundedRun { status, stdout, stderr });
             }
             Ok(None) => {
                 let waited = start.elapsed();
@@ -327,28 +445,57 @@ fn classify_load_failure(stderr: &str, model_key: &str, detail: String) -> HostE
     let lower = stderr.to_ascii_lowercase();
     const UNKNOWN_MODEL: &[&str] =
         &["cannot find a model", "no model found", "model not found", "no models found"];
-    const INSUFFICIENT: &[&str] =
-        &["insufficient", "not enough memory", "out of memory", "requires more memory"];
+    // Memory-context wordings ONLY: a bare "insufficient" substring swept
+    // "insufficient permissions" / "insufficient disk space" into the memory
+    // fast-fail shape (#1139), which the planner treats as a capacity fact.
+    // Non-memory wordings fall through to CommandFailed with the full detail
+    // preserved — an unmatched real OOM wording degrades loudly, never
+    // misclassifies silently.
+    const INSUFFICIENT_MEMORY: &[&str] =
+        &["insufficient memory", "not enough memory", "out of memory", "requires more memory"];
     if UNKNOWN_MODEL.iter().any(|p| lower.contains(p)) {
         return HostError::UnknownModel { model_key: model_key.to_string() };
     }
-    if INSUFFICIENT.iter().any(|p| lower.contains(p)) {
+    if INSUFFICIENT_MEMORY.iter().any(|p| lower.contains(p)) {
         return HostError::InsufficientResources { detail: stderr.trim().to_string() };
     }
     HostError::CommandFailed { detail: format!("`lms load` {detail}") }
 }
 
-/// Classify a failed `lms unload`'s stderr. "Not found"-shaped wordings map
-/// to [`HostError::NotResident`] — for an unload the only referent is the
-/// identifier, so the broader match is safe here (unlike load, where "not
-/// found" could name other things).
-fn classify_unload_failure(stderr: &str, identifier: &str, detail: String) -> HostError {
+/// Classify an `lms unload` outcome: `None` = success, `Some` = the typed
+/// failure.
+///
+/// "Not found"-shaped stderr maps to [`HostError::NotResident`] REGARDLESS
+/// of exit code: the real CLI exits 0 for a non-resident identifier with the
+/// error on stderr only (live-verified — "Model Not Found / Cannot find a
+/// model with the identifier …"), and a `!success` gate alone made the #1279
+/// double-release invisible. For an unload the only referent is the
+/// identifier, so the broad match is safe here (unlike load, where "not
+/// found" could name other things). Beyond that: a nonzero exit is a failure
+/// whatever stderr says, and error-shaped stderr on a 0 exit is a failure
+/// too — never a silent success. Non-error stderr noise (progress remnants)
+/// on a 0 exit passes.
+fn classify_unload_outcome(
+    success: bool,
+    stderr: &str,
+    identifier: &str,
+    exit_detail: &str,
+) -> Option<HostError> {
     let lower = stderr.to_ascii_lowercase();
-    const NOT_RESIDENT: &[&str] = &["no model", "not loaded", "not found", "no such model"];
+    const NOT_RESIDENT: &[&str] =
+        &["no model", "not loaded", "not found", "no such model", "cannot find a model"];
     if NOT_RESIDENT.iter().any(|p| lower.contains(p)) {
-        return HostError::NotResident { identifier: identifier.to_string() };
+        return Some(HostError::NotResident { identifier: identifier.to_string() });
     }
-    HostError::CommandFailed { detail: format!("`lms unload` {detail}") }
+    if !success {
+        return Some(HostError::CommandFailed { detail: format!("`lms unload` {exit_detail}") });
+    }
+    if lower.contains("error") {
+        return Some(HostError::CommandFailed {
+            detail: format!("`lms unload` exited 0 with error output: {}", stderr.trim()),
+        });
+    }
+    None
 }
 
 #[cfg(test)]
@@ -452,14 +599,41 @@ mod tests {
     }
 
     #[test]
-    fn load_stderr_insufficient_resources_shapes() {
+    fn load_stderr_insufficient_memory_shapes() {
         for stderr in [
-            "Error: Insufficient system resources to load this model",
+            "Error: insufficient memory to load this model",
             "error: not enough memory to load model at this context length",
+            "Error: out of memory while allocating KV cache",
+            "Error: this model requires more memory than is available",
         ] {
             let err = classify_load_failure(stderr, "m", "exited with 1".into());
             assert!(
                 matches!(err, HostError::InsufficientResources { ref detail } if detail.contains(stderr.trim())),
+                "stderr: {stderr} → {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn load_stderr_insufficient_without_memory_context_is_command_failed() {
+        // Classifier precision: a bare "insufficient" substring mapped
+        // permission and disk failures to InsufficientResources — a capacity
+        // fact to the planner (#1139). Only memory-context wordings classify;
+        // everything else keeps its full detail in CommandFailed. That
+        // includes generic "insufficient system resources" wordings — an
+        // unmatched shape degrades loud, not misclassified.
+        for stderr in [
+            "Error: insufficient permissions to access the model directory",
+            "Error: insufficient disk space to download this model",
+            "Error: Insufficient system resources to load this model",
+        ] {
+            let err = classify_load_failure(
+                stderr,
+                "m",
+                format!("exited with exit status: 1: {stderr}"),
+            );
+            assert!(
+                matches!(err, HostError::CommandFailed { ref detail } if detail.contains(stderr)),
                 "stderr: {stderr} → {err:?}"
             );
         }
@@ -481,25 +655,75 @@ mod tests {
         }
     }
 
+    /// The exact stderr the live `lms unload` emits for a non-resident
+    /// identifier — WITH exit 0 (verified live 2026-07-10, #1279).
+    const LIVE_NOT_FOUND_STDERR: &str = "Model Not Found\n\nCannot find a model with the identifier \"darkmux:m\".\n\nTo see a list of loaded models, run:\n\n    lms ps\n";
+
     #[test]
-    fn unload_stderr_not_resident_shapes() {
+    fn unload_exit_zero_with_live_not_found_stderr_is_not_resident() {
+        // THE #1279 visibility fix: the real CLI exits 0 here, so an
+        // exit-code-only gate never fired and the executor believed bytes
+        // were freed on a double release.
+        assert_eq!(
+            classify_unload_outcome(true, LIVE_NOT_FOUND_STDERR, "darkmux:m", "exited with exit status: 0"),
+            Some(HostError::NotResident { identifier: "darkmux:m".into() })
+        );
+    }
+
+    #[test]
+    fn unload_stderr_not_resident_shapes_regardless_of_exit_code() {
         for stderr in [
             "Error: No model found with identifier \"darkmux:m\"",
             "error: darkmux:m is not loaded",
             "Model \"darkmux:m\" not found",
+            "Cannot find a model with the identifier \"darkmux:m\".",
         ] {
-            assert_eq!(
-                classify_unload_failure(stderr, "darkmux:m", "exited with 1".into()),
-                HostError::NotResident { identifier: "darkmux:m".into() },
-                "stderr: {stderr}"
-            );
+            for success in [true, false] {
+                assert_eq!(
+                    classify_unload_outcome(success, stderr, "darkmux:m", "exited"),
+                    Some(HostError::NotResident { identifier: "darkmux:m".into() }),
+                    "stderr: {stderr}, success: {success}"
+                );
+            }
         }
     }
 
     #[test]
-    fn unload_stderr_unmatched_falls_through_to_command_failed() {
-        let err = classify_unload_failure("kaboom", "darkmux:m", "exited with exit status: 1: kaboom".into());
-        assert!(matches!(err, HostError::CommandFailed { .. }), "{err:?}");
+    fn unload_exit_zero_clean_or_noise_stderr_is_success() {
+        // A quiet 0-exit unload is the success shape; non-error stderr noise
+        // (progress remnants) doesn't fail it.
+        assert_eq!(classify_unload_outcome(true, "", "darkmux:m", "exited with exit status: 0"), None);
+        assert_eq!(
+            classify_unload_outcome(true, "Unloading darkmux:m...", "darkmux:m", "exited with exit status: 0"),
+            None
+        );
+    }
+
+    #[test]
+    fn unload_exit_zero_with_error_shaped_stderr_is_command_failed() {
+        // Error-shaped stderr on a 0 exit = failure, never a silent success
+        // (the same trust-stderr-over-exit-code lesson as NotResident).
+        let err = classify_unload_outcome(
+            true,
+            "Error: something novel exploded",
+            "darkmux:m",
+            "exited with exit status: 0",
+        );
+        assert!(
+            matches!(err, Some(HostError::CommandFailed { ref detail }) if detail.contains("something novel exploded")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn unload_stderr_unmatched_nonzero_exit_falls_through_to_command_failed() {
+        let err = classify_unload_outcome(
+            false,
+            "kaboom",
+            "darkmux:m",
+            "exited with exit status: 1: kaboom",
+        );
+        assert!(matches!(err, Some(HostError::CommandFailed { .. })), "{err:?}");
     }
 
     // ── deadline enforcement against a stub lms binary (#1276) ──
@@ -598,7 +822,25 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn unload_not_resident_stderr_maps_through_real_spawn_path() {
+    fn unload_not_resident_exit_zero_stderr_maps_through_real_spawn_path() {
+        // The LIVE CLI shape (#1279): the not-found error arrives on stderr
+        // with EXIT 0. The old `!status.success()` gate returned Ok here —
+        // NotResident never fired and the double-release was invisible.
+        let dir = tempfile::TempDir::new().unwrap();
+        let stub = write_stub(
+            dir.path(),
+            "echo 'Model Not Found' >&2\necho >&2\necho 'Cannot find a model with the identifier \"darkmux:m\".' >&2\nexit 0",
+        );
+        let mut host = LmsHost::with_bin(stub.to_string_lossy());
+        let err = host.unload(&owned("darkmux:m"), Deadline(Duration::from_secs(10))).unwrap_err();
+        assert_eq!(err, HostError::NotResident { identifier: "darkmux:m".into() });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unload_not_resident_nonzero_exit_still_classified() {
+        // Older/other CLI behavior: same wording family with a nonzero exit
+        // stays classified — the stderr shape is the signal either way.
         let dir = tempfile::TempDir::new().unwrap();
         let stub = write_stub(
             dir.path(),
@@ -612,15 +854,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn exit_returns_promptly_even_when_grandchild_holds_stderr_open() {
-        // The drain-thread subtlety: the child exits 1 immediately, but a
-        // backgrounded grandchild inherited its stderr write end and lives
-        // on for 30 s — the pipe never hits EOF. The call must still return
-        // within the bounded STDERR_GRACE with the stderr the child DID
-        // write (classified), not block on pipe close.
+        // The drain-thread subtlety: the child exits 0 immediately (the live
+        // CLI shape), but a backgrounded grandchild inherited its stderr
+        // write end and lives on for 30 s — the pipe never hits EOF. The
+        // call must still return within the bounded PIPE_GRACE with the
+        // stderr the child DID write (classified), not block on pipe close.
         let dir = tempfile::TempDir::new().unwrap();
         let stub = write_stub(
             dir.path(),
-            "sleep 30 &\necho 'Error: No model found with identifier \"darkmux:m\"' >&2\nexit 1",
+            "sleep 30 &\necho 'Cannot find a model with the identifier \"darkmux:m\".' >&2\nexit 0",
         );
         let mut host = LmsHost::with_bin(stub.to_string_lossy());
         let started = Instant::now();
@@ -628,7 +870,31 @@ mod tests {
         assert_eq!(err, HostError::NotResident { identifier: "darkmux:m".into() });
         assert!(
             started.elapsed() < Duration::from_secs(5),
-            "returned within the stderr grace, not on grandchild exit ({:?})",
+            "returned within the pipe grace, not on grandchild exit ({:?})",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stderr_grace_is_total_bounded_under_chatty_grandchild() {
+        // A grandchild writing at a sub-cap cadence must not extend the wait
+        // for its lifetime: the old quiet-interval collection reset its
+        // 200 ms timer on EVERY chunk, so a 100 ms-cadence writer held the
+        // "grace" open for its whole 30 s life (demonstrated). The total
+        // bound drains what arrived and moves on (#1276).
+        let dir = tempfile::TempDir::new().unwrap();
+        let stub = write_stub(
+            dir.path(),
+            "( i=0; while [ $i -lt 300 ]; do echo tick >&2; sleep 0.1; i=$((i+1)); done ) &\necho 'Cannot find a model with the identifier \"darkmux:m\".' >&2\nexit 0",
+        );
+        let mut host = LmsHost::with_bin(stub.to_string_lossy());
+        let started = Instant::now();
+        let err = host.unload(&owned("darkmux:m"), Deadline(Duration::from_secs(10))).unwrap_err();
+        assert_eq!(err, HostError::NotResident { identifier: "darkmux:m".into() });
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "total-bounded grace, not per-chunk quiet interval ({:?})",
             started.elapsed()
         );
     }
@@ -651,6 +917,92 @@ esac"#,
             .load("qwen/qwen3-4b-2507", "darkmux:qwen3-4b", 32768, Deadline(Duration::from_secs(10)))
             .expect("stub load succeeds");
         assert_eq!(report.resolved_ctx, Some(32768));
+    }
+
+    #[test]
+    fn relist_bound_takes_remaining_budget_capped_at_list_bound() {
+        // The pure half of the wedged-re-list fix (#1276): both terms of the
+        // min are pinned without a clock. The generous list bound binds
+        // early in the load window; the REMAINING deadline budget binds late;
+        // a fully-spent deadline yields an immediately-expiring re-list —
+        // never an unbounded one.
+        let deadline = Deadline(Duration::from_secs(600));
+        let list_bound = Duration::from_secs(30);
+        assert_eq!(
+            relist_bound(deadline, Duration::from_secs(10), list_bound),
+            Deadline(Duration::from_secs(30)),
+            "early in the window the adapter list bound binds"
+        );
+        assert_eq!(
+            relist_bound(deadline, Duration::from_secs(590), list_bound),
+            Deadline(Duration::from_secs(10)),
+            "late in the window the remaining deadline budget binds"
+        );
+        assert_eq!(
+            relist_bound(deadline, Duration::from_secs(700), list_bound),
+            Deadline(Duration::ZERO),
+            "a spent deadline expires the re-list immediately, never unbounded"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_succeeds_with_unknown_ctx_when_relist_wedges() {
+        // The runtime half of the wedged-re-list fix (#1276): the provenance
+        // re-list previously ran via an UNBOUNDED `Command::output()` OUTSIDE
+        // the deadline — a wedged `lms ps` hung a SUCCESSFUL load() forever
+        // despite the #1276 mechanics on the load child itself
+        // (demonstrated). Now it runs under `relist_bound` (the pure table
+        // test above pins which term binds when), and its timeout degrades
+        // to `resolved_ctx: None` — the load itself succeeded and is never
+        // failed for provenance. Timing here is deliberately slack (a tight
+        // load deadline flaked under parallel-suite CPU contention): the
+        // list bound is the small term, the load deadline stays generous.
+        let dir = tempfile::TempDir::new().unwrap();
+        let stub = write_stub(
+            dir.path(),
+            "case \"$1\" in\n  ps) sleep 30 ;;\n  load) exit 0 ;;\nesac",
+        );
+        let mut host = LmsHost::with_bin(stub.to_string_lossy())
+            .with_list_bound(Duration::from_millis(300));
+        let started = Instant::now();
+        let report = host
+            .load("qwen/qwen3-4b-2507", "darkmux:qwen3-4b", 32768, Deadline(Duration::from_secs(30)))
+            .expect("the load succeeded; only provenance degraded");
+        assert_eq!(report.resolved_ctx, None, "re-list timeout → unknown ctx, not a failure");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the re-list was killed at its bound, not waited out ({:?})",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_resident_wedged_ps_returns_typed_timeout_at_adapter_bound() {
+        // The read-only calls carry no port-level Deadline (packet-3 contract
+        // question) but must still be bounded: a wedged `lms ps` returns a
+        // typed Timeout at the adapter-level list bound instead of hanging
+        // plan assembly (#1276).
+        let dir = tempfile::TempDir::new().unwrap();
+        let stub = write_stub(dir.path(), "sleep 30");
+        let mut host =
+            LmsHost::with_bin(stub.to_string_lossy()).with_list_bound(Duration::from_millis(200));
+        let started = Instant::now();
+        let err = host.list_resident().unwrap_err();
+        assert!(matches!(err, HostError::Timeout { phase: "ps", .. }), "{err:?}");
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_catalog_wedged_ls_returns_typed_timeout_at_adapter_bound() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let stub = write_stub(dir.path(), "sleep 30");
+        let mut host =
+            LmsHost::with_bin(stub.to_string_lossy()).with_list_bound(Duration::from_millis(200));
+        let err = host.list_catalog().unwrap_err();
+        assert!(matches!(err, HostError::Timeout { phase: "ls", .. }), "{err:?}");
     }
 
     #[cfg(unix)]
