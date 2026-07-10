@@ -866,6 +866,31 @@ fn single_shot_body(
     body
 }
 
+/// (#1260) Gate a bare remote `crew dispatch` against the per-EXECUTION
+/// remote token bucket. Per the operator's scope split, a bare crew dispatch
+/// IS one execution (config doc: `RemoteConfig`), so its single hosted call
+/// draws from a fresh per-execution allowance. A single call only "exhausts"
+/// a fresh bucket when the operator has set the allowance to zero — a hard
+/// opt-out — in which case the call is refused with a typed error NAMING the
+/// bucket rather than dispatching off the meter; any positive allowance
+/// admits the one call (the spend is then accounted in the `dispatch.complete`
+/// record's `total_tokens`, spend-after). The AGENTIC-remote container path
+/// (#1187 — a tool-granting role on an endpoint profile, multi-call loop) is
+/// NOT metered in 1.18.0; only this single-shot path and the review funnel's
+/// seats are — see the module scope note / issue #1260 follow-up.
+fn admit_remote_execution(budget: u64) -> Result<()> {
+    if budget == 0 {
+        bail!(
+            "remote token budget exhausted: the per-execution allowance \
+             (config.remote.max_tokens_per_execution / \
+             DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION) is 0 — this hosted crew dispatch is \
+             refused rather than run off the meter. Raise the allowance above 0 to dispatch \
+             to a remote endpoint."
+        );
+    }
+    Ok(())
+}
+
 /// If this dispatch's resolved model is REMOTE, return the pieces the hosted
 /// path needs (role, system prompt, model). `Ok(None)` ⇒ local — the caller
 /// falls through to the unchanged container path (which re-loads the role;
@@ -1273,6 +1298,10 @@ fn dispatch_remote(
         .endpoint
         .as_ref()
         .expect("dispatch_remote requires a remote endpoint");
+    // (#1260) Meter this bare crew dispatch as one execution BEFORE any record
+    // is emitted — a zero allowance refuses the call cleanly, without leaving
+    // an orphaned in-flight session in the viewer.
+    admit_remote_execution(darkmux_types::config_access::remote_max_tokens_per_execution())?;
     let session_id = opts
         .session_id
         .clone()
@@ -4068,6 +4097,19 @@ mod tests {
         let both = single_shot_body("m", "sys", "msg", Some(8000), Some("low"));
         assert_eq!(both["reasoning_effort"], "low");
         assert_eq!(both["max_completion_tokens"], 8000, "an explicit cap wins");
+    }
+
+    /// (#1260, FIX 2) A bare remote `crew dispatch` is metered as ONE
+    /// execution: any positive per-execution allowance admits the single
+    /// hosted call; a zero allowance (a hard operator opt-out) refuses it
+    /// with a typed error NAMING the bucket, never dispatching off the meter.
+    #[test]
+    fn admit_remote_execution_gates_on_the_per_execution_budget() {
+        assert!(admit_remote_execution(500_000).is_ok(), "a positive allowance admits the one call");
+        assert!(admit_remote_execution(1).is_ok(), "even a tiny positive allowance admits a single call");
+        let err = admit_remote_execution(0).unwrap_err().to_string();
+        assert!(err.contains("remote token budget exhausted"), "{err}");
+        assert!(err.contains("max_tokens_per_execution"), "the error names the bucket: {err}");
     }
 
     /// Hosted-response classification (pure): the happy path passes through;

@@ -1295,6 +1295,7 @@ pub fn synthesize_funnel(env: &FunnelEnvelope, diff: &str, attribution: Option<&
             lines.push("**Worth a double check:**".to_string());
             lines.extend(needs_check_lines);
         }
+        lines.extend(run_warnings_block(env));
         return Rendered {
             mode: "comment",
             review: None,
@@ -1319,6 +1320,7 @@ pub fn synthesize_funnel(env: &FunnelEnvelope, diff: &str, attribution: Option<&
         body.push("**Worth a double check** (not merge-blocking):".to_string());
         body.extend(needs_check_lines);
     }
+    body.extend(run_warnings_block(env));
 
     Rendered {
         mode: "review",
@@ -1329,6 +1331,21 @@ pub fn synthesize_funnel(env: &FunnelEnvelope, diff: &str, attribution: Option<&
         })),
         comment: None,
     }
+}
+
+/// (#1260) The loud run-warnings block appended to a posted review/comment —
+/// non-fatal findings the operator must SEE on the PR, not just in the
+/// envelope: a verify budget exhausting mid-stage (some confirmed findings
+/// keep the manual-verification marker), or a remote probe seat failing
+/// (reduced coverage). Empty (and byte-identical to pre-#1260 output) when
+/// the run produced no warnings — a crew without remote seats never does.
+fn run_warnings_block(env: &FunnelEnvelope) -> Vec<String> {
+    if env.warnings.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![String::new(), "**⚠ Run warnings**".to_string()];
+    lines.extend(env.warnings.iter().map(|w| format!("- {w}")));
+    lines
 }
 
 /// (#1260) The frontier-verified line a `verified` adjudication earns —
@@ -2348,6 +2365,46 @@ mod tests {
         let b = without_seat.review.unwrap();
         assert_eq!(a, b, "an uncertain adjudication renders byte-identically to no seat at all");
         assert!(a["comments"][0]["body"].as_str().unwrap().contains(CONFIRMED_MARKER));
+    }
+
+    /// (FIX 3 / #1260, ruling applied) A verify budget that exhausts
+    /// MID-STAGE degrades the STAGE, not the run: verified findings still post
+    /// as frontier-verified, each skipped adjudication (recorded per-flag as
+    /// `VerifyRuling::Error`, tier still Confirmed) keeps the
+    /// manual-verification marker, and the posted review carries the loud
+    /// "verify budget exhausted after N of M adjudications" warning. The
+    /// envelope is NOT degenerate — never routed to "produced no signal".
+    #[test]
+    fn synthesize_verify_exhaustion_posts_verified_plus_markered_plus_warning() {
+        let mut verified = confirmed_flag("a@src/x.ts", Some("const b = 2;"), "verified note", "e");
+        verified.verify = Some(verify_record(VerifyRuling::Verified));
+        // A skipped adjudication: recorded per-flag as Error, stays Confirmed
+        // — synthesize must keep its manual-verification marker.
+        let mut skipped = confirmed_flag("b@src/x.ts", Some("const d = 5;"), "skipped note", "e");
+        skipped.verify = Some(VerifyRecord {
+            ruling: VerifyRuling::Error,
+            decisive_evidence: String::new(),
+            note_for_author: "remote token budget exhausted for this stage — call skipped".to_string(),
+            seconds: 0.0,
+            model: "gpt-5.1".to_string(),
+        });
+        let mut env = healthy_envelope(vec![verified, skipped]);
+        env.warnings = vec![
+            "verify budget exhausted after 1 of 2 adjudications — the remaining 1 confirmed \
+             finding(s) keep the manual-verification marker (the per-execution allowance of 100 \
+             tokens ran out)"
+                .to_string(),
+        ];
+
+        let r = synthesize_funnel(&env, DIFF, None);
+        assert_eq!(r.mode, "review", "confirmed findings still merge-block; never degraded");
+        let review = r.review.unwrap();
+        let comments = serde_json::to_string(&review["comments"]).unwrap();
+        assert!(comments.contains("verified by gpt-5.1 adjudication"), "the verified one posts verified: {comments}");
+        assert!(comments.contains(CONFIRMED_MARKER), "the skipped adjudication keeps the marker: {comments}");
+        let body = review["body"].as_str().unwrap();
+        assert!(body.contains("Run warnings"), "the warnings block renders on the review: {body}");
+        assert!(body.contains("verify budget exhausted after 1 of 2 adjudications"), "{body}");
     }
 
     /// (#1260) A REFUTED finding arrives already demoted (tier = Archived,

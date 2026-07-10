@@ -202,6 +202,15 @@ pub struct FleetConfig {
 /// verify pass; a bare `crew dispatch` is one execution. Each stage's
 /// REMOTE calls draw from their own allowance, so a runaway stage is caught
 /// at the cap without starving later stages. Tokens only — never currency.
+///
+/// **Which paths this meters (1.18.0 scope — be precise):** the review
+/// funnel's remote seats (probe / judge-pass1 / judge-pass2 / verify) AND the
+/// tool-less single-shot remote `crew dispatch` path (`dispatch_remote`). The
+/// AGENTIC-remote container path (#1187 — a tool-granting role on an endpoint
+/// profile, driven by the multi-call container loop) is NOT metered by this
+/// bucket in 1.18.0; metering that loop is tracked as a follow-up. A path
+/// this bucket does not yet meter is documented as such, never silently
+/// counted "off the meter".
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RemoteConfig {
     /// Max remote `total_tokens` one pipeline stage may spend (default

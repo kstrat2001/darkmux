@@ -41,6 +41,11 @@ pub struct ResolvedSeatStaffing {
     pub name: String,
     pub pm: ProfileModel,
     pub k: u32,
+    /// Completion-token cap for this seat's calls. An explicit value wins
+    /// verbatim; when absent, a LOCAL seat uses its local-tuned default and a
+    /// REMOTE seat floors at a reasoning-aware minimum (#1260 — hosted
+    /// reasoning bills its thinking inside the completion cap, so a low local
+    /// default returns empty content). See `SeatStaffing::max_tokens`.
     pub max_tokens: Option<u32>,
     pub selector: Option<BundleSelector>,
 }
@@ -75,6 +80,13 @@ pub struct ResolvedCrew {
 /// declares: endpoint present ⇒ hosted dialect, no cycling, remote token
 /// accounting. Remote models carry no `n_ctx` (#1282 — nothing is loaded
 /// locally), so the `require_n_ctx` gate applies to local staffing only.
+///
+/// **Data boundary (operator-explicit, #1260):** a REMOTE seat sends the code
+/// under review (diff + surrounding source + extracted facts) to its endpoint.
+/// The endpoint must be cleared for that code — an org-approved deployment
+/// (e.g. private code → the org's own cloud tenant only). Nothing auto-routes:
+/// a profile names its own endpoint, and `resolve_crew` routes on what the
+/// profile declares; it never picks a remote endpoint for the operator.
 pub fn resolve_crew(reg: &ProfileRegistry, name: &str) -> Result<ResolvedCrew> {
     let crew = reg.crews.get(name).ok_or_else(|| {
         // (#1282) A quarantined name gets the entry's own parse error, not a

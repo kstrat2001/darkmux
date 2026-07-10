@@ -1193,7 +1193,31 @@ const PROBE_TEMPERATURE: f32 = 0.2;
 const JUDGE_TEMPERATURE: f32 = 0.2;
 const DEFAULT_PROBE_MAX_TOKENS: u32 = 4_000;
 const DEFAULT_JUDGE_MAX_TOKENS: u32 = 20_000;
+/// (#1260) Reasoning-aware completion FLOOR for REMOTE seats. Local-tuned
+/// defaults (probe's 4000 especially) are the reasoning-guillotine class on
+/// hosted reasoning models — reasoning tokens bill inside
+/// `max_completion_tokens`, so a low cap gets consumed by invisible thinking
+/// and the seat returns empty content (the exact lesson `dispatch_internal`
+/// already learned: its single-shot default rises to 16384 when a hosted
+/// endpoint declares `reasoning_effort`). A remote seat with NO explicit
+/// staffing `max_tokens` therefore never dips below this floor; an explicit
+/// staffing `max_tokens` always wins verbatim (operator sovereignty — the
+/// operator may know their task is short). Local seats are unaffected.
+const REMOTE_REASONING_MAX_TOKENS_FLOOR: u32 = 16_384;
 const FUNNEL_PROTOCOL: &str = "double-confirm-v1";
+
+/// (#1260) Resolve one seat's completion cap: an explicit staffing
+/// `max_tokens` always wins verbatim; otherwise a REMOTE seat floors at
+/// [`REMOTE_REASONING_MAX_TOKENS_FLOOR`] (never lowering an already-higher
+/// local default — a floor, not a clamp), while a LOCAL seat keeps its
+/// local-tuned default. Applies uniformly to probe, judge, and verify seats.
+fn resolve_seat_max_tokens(s: &ResolvedSeatStaffing, local_default: u32) -> u32 {
+    match s.max_tokens {
+        Some(explicit) => explicit,
+        None if s.pm.is_remote() => local_default.max(REMOTE_REASONING_MAX_TOKENS_FLOOR),
+        None => local_default,
+    }
+}
 
 /// A hardware-tier concurrency budget for [`resolve_auto`]: the review
 /// funnel is a light, occasional dispatch (not throughput-critical
@@ -1871,11 +1895,19 @@ fn probe_user_message(prior: &str, bundle: &BundleInput) -> String {
     parts.join("\n")
 }
 
-/// One probe draw, retried once on empty content, then skipped (`Ok(None)`)
-/// — never recorded as a flag. A dispatch-level `Err` propagates
-/// immediately (the shared single-shot primitive already carries its own
-/// backoff/retry — a second-guessing retry here would be redundant AND
-/// would hide a real infra problem behind a "skipped" label).
+/// One probe draw, retried once on empty content, then skipped (empty
+/// `content` in the return) — never recorded as a flag. A dispatch-level
+/// `Err` propagates immediately (the shared single-shot primitive already
+/// carries its own backoff/retry — a second-guessing retry here would be
+/// redundant AND would hide a real infra problem behind a "skipped" label).
+///
+/// (#1260) The `u64` is the tokens billed across EVERY attempt this draw
+/// made, returned regardless of whether the content came back empty. Hosted
+/// reasoning models legitimately burn the full completion budget thinking
+/// and return empty content (see `dispatch_internal`'s reasoning-guillotine
+/// lesson) — that spend is REAL and billed, so the caller must bill it into
+/// the remote bucket + member accounting even on the empty (`None`) outcome,
+/// exactly as the judge/verify retry paths bill both attempts (`t1 + t2`).
 fn probe_one_draw(
     chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
     model: &str,
@@ -1883,7 +1915,8 @@ fn probe_one_draw(
     user: &str,
     max_tokens: u32,
     endpoint: Option<&ModelEndpoint>,
-) -> Result<Option<(String, u64)>> {
+) -> Result<(Option<String>, u64)> {
+    let mut tokens = 0u64;
     for _ in 0..2 {
         let call = ChatCall {
             model,
@@ -1894,12 +1927,13 @@ fn probe_one_draw(
             endpoint,
         };
         let reply = chat(&call)?;
+        tokens += reply.total_tokens.unwrap_or(0);
         let trimmed = reply.content.trim();
         if !trimmed.is_empty() {
-            return Ok(Some((trimmed.to_string(), reply.total_tokens.unwrap_or(0))));
+            return Ok((Some(trimmed.to_string()), tokens));
         }
     }
-    Ok(None)
+    Ok((None, tokens))
 }
 
 /// One probe seat's dispatch — a `funnel.step` pair (`step_id =
@@ -1931,7 +1965,7 @@ fn dispatch_probe_staffing(
     let identifier = seat_identifier(&s.pm);
     let endpoint = seat_endpoint(&s.pm);
     let endpoint_host = seat_endpoint_host(&s.pm);
-    let max_tokens = s.max_tokens.unwrap_or(DEFAULT_PROBE_MAX_TOKENS);
+    let max_tokens = resolve_seat_max_tokens(s, DEFAULT_PROBE_MAX_TOKENS);
     let selected = select_bundles_for_staffing(bundles, s.selector.as_ref());
     let step_id = format!("probe:{}", s.name);
     let draws_total = selected.len() as u32 * s.k;
@@ -1965,21 +1999,28 @@ fn dispatch_probe_staffing(
             // no-system-message behavior, not a system message with blank
             // content.
             match probe_one_draw(chat, &identifier, "", &user, max_tokens, endpoint) {
-                Ok(Some((text, tok))) => {
+                // (#1260) EVERY attempt's tokens are billed — including a draw
+                // that came back empty after the retry. Hosted reasoning burns
+                // the full budget thinking and returns empty; that spend is
+                // real, so it lands in the member total AND the remote bucket
+                // whether or not a flag was produced. Only a non-empty content
+                // becomes a flag.
+                Ok((content, tok)) => {
                     tokens += tok;
                     if endpoint.is_some() {
                         bucket.spend(tok, 1);
                     }
-                    flags.push(ProbeFlag {
-                        bundle_id: bundle.id.clone(),
-                        fact_family: bundle.fact_family.clone(),
-                        member: identifier.clone(),
-                        draw,
-                        charge_text: text,
-                        anchor: None,
-                    });
+                    if let Some(text) = content {
+                        flags.push(ProbeFlag {
+                            bundle_id: bundle.id.clone(),
+                            fact_family: bundle.fact_family.clone(),
+                            member: identifier.clone(),
+                            draw,
+                            charge_text: text,
+                            anchor: None,
+                        });
+                    }
                 }
-                Ok(None) => {}
                 // (#1260) A remote seat's dispatch failure — AFTER the
                 // shared transport's bounded 429 retries — degrades to a
                 // named warning + reduced coverage; each failed call has
@@ -2139,6 +2180,12 @@ struct PassOutcome {
     tokens: u64,
     wall_ms: u64,
     calls: u32,
+    /// (#1260) `true` iff this pass's surviving record came from a
+    /// dispatch-level `Err` (a chat failure surviving the transport's bounded
+    /// retries), NOT from a parse failure or a budget denial. A REMOTE judge
+    /// with any such failure marks the run degraded (honest-fail — the
+    /// affected flag carries no real adjudication); see `finish_funnel`.
+    dispatch_error: bool,
 }
 
 /// One judge pass, retried ONCE if the reply was [`FunnelRuling::Unparsed`]
@@ -2161,18 +2208,26 @@ fn judge_pass_with_retry(
     let (r1, t1) = run_judge_pass(pass, model, system, prompt, max_tokens, endpoint, chat);
     if r1.ruling == FunnelRuling::Unparsed {
         let (r2, t2) = run_judge_pass(pass, model, system, prompt, max_tokens, endpoint, chat);
+        // `run_judge_pass` only ever yields `FunnelRuling::Error` from its
+        // dispatch-`Err` arm (a parse miss is `Unparsed`, and the budget-denied
+        // record is built by the caller, never here) — so the surviving
+        // ruling being `Error` is exactly the dispatch-failure signal (#1260).
+        let dispatch_error = r2.ruling == FunnelRuling::Error;
         PassOutcome {
             record: r2,
             tokens: t1 + t2,
             wall_ms: t0.elapsed().as_millis() as u64,
             calls: 2,
+            dispatch_error,
         }
     } else {
+        let dispatch_error = r1.ruling == FunnelRuling::Error;
         PassOutcome {
             record: r1,
             tokens: t1,
             wall_ms: t0.elapsed().as_millis() as u64,
             calls: 1,
+            dispatch_error,
         }
     }
 }
@@ -2192,6 +2247,9 @@ struct JudgeOutcome {
     /// Actual dispatches made across both passes, unparsed retries
     /// included.
     calls: u32,
+    /// (#1260) `true` iff either pass hit a dispatch-level `Err` (see
+    /// [`PassOutcome::dispatch_error`]) — a REMOTE judge's honest-fail signal.
+    dispatch_error: bool,
 }
 
 /// (#1260) The judge phase's two remote token buckets — pass-1 and pass-2
@@ -2249,6 +2307,9 @@ fn judge_one_flag(
             tokens: 0,
             wall_ms: 0,
             calls: 0,
+            // A budget denial is NOT a dispatch failure — it's metered
+            // separately (the judge-budget degeneracy in `finish_funnel`).
+            dispatch_error: false,
         }
     } else {
         let o = judge_pass_with_retry(1, model, system, prompt, max_tokens, endpoint, chat);
@@ -2266,6 +2327,7 @@ fn judge_one_flag(
                     tokens: 0,
                     wall_ms: 0,
                     calls: 0,
+                    dispatch_error: false,
                 }
             } else {
                 let o = judge_pass_with_retry(2, model, system, prompt, max_tokens, endpoint, chat);
@@ -2288,6 +2350,7 @@ fn judge_one_flag(
                 pass1_ms: p1.wall_ms,
                 pass2_ms: p2.wall_ms,
                 calls: p1.calls + p2.calls,
+                dispatch_error: p1.dispatch_error || p2.dispatch_error,
             }
         }
         FunnelRuling::NeedsCheck => JudgeOutcome {
@@ -2297,6 +2360,7 @@ fn judge_one_flag(
             pass1_ms: p1.wall_ms,
             pass2_ms: 0,
             calls: p1.calls,
+            dispatch_error: p1.dispatch_error,
             pass1: p1.record,
             pass2: None,
         },
@@ -2307,6 +2371,7 @@ fn judge_one_flag(
             pass1_ms: p1.wall_ms,
             pass2_ms: 0,
             calls: p1.calls,
+            dispatch_error: p1.dispatch_error,
             pass1: p1.record,
             pass2: None,
         },
@@ -2427,7 +2492,7 @@ fn run_verify_stage(
     let identifier = seat_identifier(&vstaff.pm);
     let endpoint = seat_endpoint(&vstaff.pm);
     let endpoint_host = seat_endpoint_host(&vstaff.pm);
-    let max_tokens = vstaff.max_tokens.unwrap_or(DEFAULT_JUDGE_MAX_TOKENS);
+    let max_tokens = resolve_seat_max_tokens(vstaff, DEFAULT_JUDGE_MAX_TOKENS);
     let mut bucket = RemoteBucket::new("verify", inputs.remote_max_tokens_per_execution);
 
     if !vstaff.pm.is_remote() {
@@ -2528,12 +2593,23 @@ fn run_verify_stage(
 
     if let Some(rec) = bucket.record() {
         if rec.skipped_calls > 0 {
-            // Verify is LOAD-BEARING (operator decision): its bucket
-            // exhausting is an honest degraded run, never a silent pass.
-            env.degenerate = Some(format!(
-                "remote verify token budget exhausted — {} adjudication call(s) skipped after \
-                 the per-execution allowance ({} tokens) ran out; degraded run, never a silent \
-                 pass",
+            // (#1260, ruling applied) Verify-bucket exhaustion degrades the
+            // STAGE, not the run: findings already adjudicated `verified`
+            // still post as frontier-verified, and each flag whose
+            // adjudication was SKIPPED keeps its `Confirmed` tier WITH the
+            // manual-verification marker (recorded per-flag as `Error` in the
+            // loop above, honored by `synthesize_funnel`). The posted review +
+            // envelope carry a loud warning naming the exhaustion. It NEVER
+            // sets run-level `degenerate` — routing the whole run to
+            // "degraded" would discard findings already verified and read as
+            // "produced no signal", which is factually false. This matches the
+            // sibling verify-dispatch-error path (an inconclusive adjudication
+            // keeps the marker, never a silent pass).
+            let adjudicated = docket.saturating_sub(rec.skipped_calls as usize);
+            env.warnings.push(format!(
+                "verify budget exhausted after {adjudicated} of {docket} adjudications — the \
+                 remaining {} confirmed finding(s) keep the manual-verification marker (the \
+                 per-execution allowance of {} tokens ran out)",
                 rec.skipped_calls, rec.max_tokens
             ));
         }
@@ -2579,7 +2655,7 @@ fn finish_funnel(
 
     let judge_identifier = seat_identifier(&judge.pm);
     let judge_endpoint = seat_endpoint(&judge.pm);
-    let judge_max_tokens = judge.max_tokens.unwrap_or(DEFAULT_JUDGE_MAX_TOKENS);
+    let judge_max_tokens = resolve_seat_max_tokens(judge, DEFAULT_JUDGE_MAX_TOKENS);
     // (#1260) A remote judge draws from its own per-pass token buckets
     // (pass-1 and pass-2 are separate executions — operator decision) and
     // skips the cycler entirely (nothing to load off-box).
@@ -2605,6 +2681,10 @@ fn finish_funnel(
     let mut pass2_flags = 0usize;
     let mut judge_calls = 0u32;
     let mut judge_tokens = 0u64;
+    // (#1260) Flags whose ruling came from a dispatch-level failure (chat
+    // `Err` surviving bounded retries) — the honest-fail count a REMOTE
+    // judge degrades the run on.
+    let mut judge_dispatch_errors = 0usize;
     for flag in &deduped {
         let bundle = bundles.iter().find(|b| b.id == flag.bundle_id);
         let code = bundle.map(|b| b.code.as_str()).unwrap_or_default();
@@ -2621,6 +2701,9 @@ fn finish_funnel(
         );
         judge_tokens += outcome.tokens;
         judge_calls += outcome.calls;
+        if outcome.dispatch_error {
+            judge_dispatch_errors += 1;
+        }
         pass1_ms += outcome.pass1_ms;
         pass2_ms += outcome.pass2_ms;
         // The per-ruling ticker (#1247 Part 1) — one record per judge
@@ -2718,12 +2801,87 @@ fn finish_funnel(
         );
     }
 
+    // (#1260) Judge-stage degeneracy is decided BEFORE the optional verify
+    // stage so a run the judge already doomed never spends frontier money on
+    // verify (CONSIDER g). Up to three writers can fire; their reasons are
+    // COMBINED, never clobbered (CONSIDER f), so the envelope names every
+    // load-bearing failure that hit the judge:
+    //
+    //  1. (FIX 4 / binding design) a REMOTE judge whose dispatch FAILED on
+    //     one or more flags after bounded retries — honest-fail: the run goes
+    //     degraded red and the affected flags carry no real adjudication (the
+    //     degenerate route discards the docket, so they never render as
+    //     archived-adjudicated). LOCAL judge failures keep today's behavior —
+    //     the bad call is swallowed to `Archived` and the run stays green
+    //     unless the judge-dead gate fires; a local judge is never in the
+    //     remote design's scope.
+    //  2. a REMOTE judge whose per-pass token bucket EXHAUSTED (a load-bearing
+    //     stage — operator decision).
+    //  3. the judge-dead honesty gate: NO flag produced a usable pass-1
+    //     ruling, so the whole judge phase produced no signal. Only added
+    //     when nothing more specific already explained the failure
+    //     (exhaustion / dispatch failure IS why the rulings were unusable).
+    //
+    // The judge-budget RECORDS are pushed regardless — accounting is never
+    // gated on degeneracy.
+    let mut degen_reasons: Vec<String> = Vec::new();
+
+    if judge.pm.is_remote() && judge_dispatch_errors > 0 {
+        degen_reasons.push(format!(
+            "remote judge dispatch failed on {judge_dispatch_errors} of {} flag(s) after bounded \
+             retries — degraded run, the affected flag(s) carry no adjudication",
+            judged.len()
+        ));
+    }
+
+    if let Some(b) = &judge_budgets {
+        if let Some(rec) = b.pass1.record() {
+            env.remote_budgets.push(rec);
+        }
+        if let Some(rec) = b.pass2.record() {
+            env.remote_budgets.push(rec);
+        }
+        let skipped = b.pass1.skipped + b.pass2.skipped;
+        if skipped > 0 {
+            degen_reasons.push(format!(
+                "remote judge token budget exhausted — {skipped} judge call(s) skipped after the \
+                 per-execution allowance ({} tokens per stage) ran out; degraded run, never a \
+                 silent pass",
+                inputs.remote_max_tokens_per_execution
+            ));
+        }
+    }
+
+    let usable = judged
+        .iter()
+        .filter(|j| {
+            matches!(
+                j.pass1.ruling,
+                FunnelRuling::Confirmed | FunnelRuling::NeedsCheck | FunnelRuling::FalsePositive
+            )
+        })
+        .count();
+    if degen_reasons.is_empty() && !judged.is_empty() && usable == 0 {
+        degen_reasons.push(format!(
+            "judge produced no usable ruling on any of {} flags (all errored/unparsed)",
+            judged.len()
+        ));
+    }
+
+    if !degen_reasons.is_empty() {
+        env.degenerate = Some(degen_reasons.join("; "));
+    }
+
     // (#1260) The optional verify stage — one adjudication per confirmed
     // flag, AFTER the double-confirm judge and BEFORE the tier counts so a
-    // refutation's demotion lands in the totals. Crews without the seat
-    // skip this entirely (byte-identical behavior to today).
+    // refutation's demotion lands in the totals. Crews without the seat skip
+    // this entirely (byte-identical behavior to today); a run the judge
+    // already marked degenerate skips it too (CONSIDER g — no frontier spend
+    // on a doomed run).
     if let Some(vstaff) = verify {
-        run_verify_stage(&mut env, &mut judged, bundles, inputs, vstaff, chat, cycler, guard)?;
+        if env.degenerate.is_none() {
+            run_verify_stage(&mut env, &mut judged, bundles, inputs, vstaff, chat, cycler, guard)?;
+        }
     }
 
     env.confirmed = judged.iter().filter(|j| j.tier == Tier::Confirmed).count();
@@ -2734,55 +2892,6 @@ fn finish_funnel(
         .filter(|j| matches!(&j.verify, Some(v) if v.ruling == VerifyRuling::Verified))
         .count();
     env.refuted = judged.iter().filter(|j| j.demoted_by_verify).count();
-
-    // The judge-dead honesty gate (#1222 packet 5 review): per-flag judge
-    // failures are deliberately swallowed to `Error`/`Unparsed` →
-    // `Tier::Archived` (one bad call must not abort the docket), but when
-    // NO flag got a usable pass-1 ruling the whole judge phase produced no
-    // signal — confirmed=0/needs_check=0 would render downstream as an
-    // honest-looking "none confirmed" green comment while the judge was
-    // dead or off-contract the entire run. Mark the envelope degenerate so
-    // synthesis routes it to "degraded" (the workflow's exit-1 path). A
-    // genuine all-false-positive docket has usable rulings and keeps the
-    // honest comment.
-    let usable = judged
-        .iter()
-        .filter(|j| {
-            matches!(
-                j.pass1.ruling,
-                FunnelRuling::Confirmed | FunnelRuling::NeedsCheck | FunnelRuling::FalsePositive
-            )
-        })
-        .count();
-    if !judged.is_empty() && usable == 0 {
-        env.degenerate = Some(format!(
-            "judge produced no usable ruling on any of {} flags (all errored/unparsed)",
-            judged.len()
-        ));
-    }
-
-    // (#1260) Remote-judge budget accounting. The judge is a LOAD-BEARING
-    // stage (operator decision): its bucket exhausting is an honest
-    // DEGRADED run — the more specific reason wins over the generic
-    // judge-dead message when both fired (exhaustion IS why the rulings
-    // were unusable).
-    if let Some(b) = &judge_budgets {
-        if let Some(rec) = b.pass1.record() {
-            env.remote_budgets.push(rec);
-        }
-        if let Some(rec) = b.pass2.record() {
-            env.remote_budgets.push(rec);
-        }
-        let skipped = b.pass1.skipped + b.pass2.skipped;
-        if skipped > 0 {
-            env.degenerate = Some(format!(
-                "remote judge token budget exhausted — {skipped} judge call(s) skipped after the \
-                 per-execution allowance ({} tokens per stage) ran out; degraded run, never a \
-                 silent pass",
-                inputs.remote_max_tokens_per_execution
-            ));
-        }
-    }
 
     env.flags = deduped;
     env.judged = judged;
@@ -3346,9 +3455,14 @@ mod tests {
             calls += 1;
             Ok(reply(""))
         };
-        let out = probe_one_draw(&mut chat, "m", "sys", "user", 100, None).expect("no dispatch error");
-        assert!(out.is_none(), "still empty after retry -> skipped, not a flag");
+        let (content, tokens) =
+            probe_one_draw(&mut chat, "m", "sys", "user", 100, None).expect("no dispatch error");
+        assert!(content.is_none(), "still empty after retry -> skipped, not a flag");
         assert_eq!(calls, 2, "exactly one retry (two total attempts)");
+        // (#1260) BOTH empty attempts are billed — a hosted reasoning model
+        // that burns its budget thinking and returns empty still spent real
+        // tokens the caller must account.
+        assert_eq!(tokens, 20, "empty-empty bills both attempts (10 + 10)");
     }
 
     #[test]
@@ -3362,9 +3476,12 @@ mod tests {
                 Ok(reply("a real defect description"))
             }
         };
-        let out = probe_one_draw(&mut chat, "m", "sys", "user", 100, None).unwrap();
-        assert_eq!(out.unwrap().0, "a real defect description");
+        let (content, tokens) = probe_one_draw(&mut chat, "m", "sys", "user", 100, None).unwrap();
+        assert_eq!(content.unwrap(), "a real defect description");
         assert_eq!(calls, 2);
+        // (#1260) The discarded empty attempt is still billed alongside the
+        // recovering one.
+        assert_eq!(tokens, 20, "empty-then-recover bills both attempts (10 + 10)");
     }
 
     #[test]
@@ -5870,11 +5987,15 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     }
 
     /// A REMOTE verify seat draws from its own execution bucket, and
-    /// exhausting it is LOAD-BEARING: honest degraded run, never a silent
-    /// pass — the skipped flags keep their marker via an Error record with
-    /// the reason named.
+    /// (#1260, ruling applied) A REMOTE verify seat exhausting its execution
+    /// bucket degrades the STAGE, not the run: the run is NEVER marked
+    /// degenerate (findings already verified would be discarded as "no
+    /// signal" — factually false). Instead the skipped flag keeps its
+    /// `Confirmed` tier + manual-verification marker (recorded per-flag as
+    /// Error), a verified flag posts as verified, and the envelope carries a
+    /// loud "verify budget exhausted after N of M adjudications" warning.
     #[test]
-    fn remote_verify_budget_exhaustion_is_an_honest_degraded_run() {
+    fn remote_verify_budget_exhaustion_degrades_the_stage_not_the_run() {
         let crew = crew_with(vec![
             ("review-probe", vec![staffing("fast", "probe-model", 1)]),
             ("review-judge", vec![staffing("fast", "judge-model", 1)]),
@@ -5897,13 +6018,20 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             }
         };
         let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
-        let reason = env.degenerate.as_deref().expect("verify exhaustion degrades the run");
-        assert!(reason.contains("remote verify token budget exhausted"), "got: {reason}");
+        assert!(env.degenerate.is_none(), "verify exhaustion NEVER degrades the whole run");
+        let warning = env
+            .warnings
+            .iter()
+            .find(|w| w.contains("verify budget exhausted"))
+            .expect("the exhaustion is named as a loud warning");
+        // "after N of M adjudications" — one landed, one skipped, of two.
+        assert!(warning.contains("after 1 of 2 adjudications"), "got: {warning}");
         let rec = env.remote_budgets.iter().find(|r| r.stage == "verify").expect("verify budget row");
         assert!(rec.exhausted);
         assert_eq!(rec.skipped_calls, 1);
-        // The skipped flag stayed Confirmed (marker downstream) with the
-        // reason named per-flag.
+        // The first flag adjudicated `verified`; the second was skipped and
+        // stays Confirmed (marker downstream) with the reason named per-flag.
+        assert_eq!(env.verified, 1, "the pre-exhaustion adjudication still counts");
         let skipped = env
             .judged
             .iter()
@@ -5969,5 +6097,301 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         for s in value["staffing"]["probes"].as_array().unwrap() {
             assert!(s.get("remote").is_none());
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // Review-round fixes (#1260) — bill every attempt, stage-scoped verify
+    // degradation, remote-judge honest-fail, reasoning-aware floor
+    // ═══════════════════════════════════════════════════════════════
+
+    /// (FIX 1) A REMOTE probe seat whose draw comes back EMPTY after the
+    /// retry still bills BOTH attempts — to the member record, the probe
+    /// bucket, and the envelope's separated `remote_tokens`. Hosted reasoning
+    /// legitimately burns the whole budget thinking and returns empty; that
+    /// spend must never be invisible to the meter.
+    #[test]
+    fn remote_probe_empty_draw_still_bills_both_attempts() {
+        let crew = crew_with(vec![
+            ("review-probe", vec![remote_staffing("cloud", "gpt-remote", 1)]),
+            ("review-judge", vec![staffing("fast", "judge-model", 1)]),
+        ]);
+        let inputs = inputs_for(&crew, 500_000);
+        let mut cycler = RecordingCycler::new();
+        // Every remote call is empty content but bills 600 tokens — the draw
+        // retries once, so two 600-token attempts.
+        let mut chat = |call: &ChatCall| {
+            if call.endpoint.is_some() {
+                Ok(SingleShotReply { content: String::new(), total_tokens: Some(600), model: None })
+            } else {
+                Ok(reply(CONFIRM_JSON))
+            }
+        };
+        let mut emitter = RecordingEmitter::new();
+        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut emitter).expect("runs");
+
+        // Zero content ⇒ zero flags ⇒ the run is a degenerate zero-flag run,
+        // but the SPEND is still fully accounted.
+        assert!(env.degenerate.is_some(), "no flags landed, so the run is degenerate");
+        let member = env.members.iter().find(|m| m.model == "gpt-remote").expect("remote member");
+        assert!(member.remote);
+        assert_eq!(member.total_tokens, 1200, "both empty attempts billed to the member (600 + 600)");
+        let rec = env.remote_budgets.iter().find(|r| r.stage == "probe").expect("probe budget row");
+        assert_eq!(rec.used_tokens, 1200, "both empty attempts billed to the bucket");
+        let finished = emitter
+            .records
+            .iter()
+            .filter(|r| r.action == "funnel.task")
+            .filter_map(|r| r.payload.as_ref())
+            .find(|p| p["status"] == "finished")
+            .expect("terminal task record");
+        assert_eq!(finished["remote_tokens"], 1200, "the envelope's separated remote figure bills both");
+    }
+
+    /// (FIX 4 / binding design) A REMOTE judge whose dispatch FAILS on a flag
+    /// (after the transport's bounded retries) marks the run degraded with a
+    /// reason naming the failed-flag count — never a silent fake adjudication
+    /// that archives the flag and leaves the run green.
+    #[test]
+    fn remote_judge_dispatch_failure_degrades_the_run() {
+        let crew = crew_with(vec![
+            ("review-probe", vec![staffing("fast", "probe-model", 1)]),
+            ("review-judge", vec![remote_staffing("cloud", "gpt-judge", 1)]),
+        ]);
+        let inputs = inputs_for(&crew, 500_000);
+        let mut cycler = RecordingCycler::new();
+        let mut chat = |call: &ChatCall| {
+            if call.endpoint.is_some() {
+                Err(anyhow!("endpoint 503"))
+            } else {
+                Ok(reply("a real defect"))
+            }
+        };
+        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+        let reason = env.degenerate.as_deref().expect("remote judge dispatch failure degrades the run");
+        assert!(reason.contains("remote judge dispatch failed on 1 of 1 flag"), "got: {reason}");
+    }
+
+    /// (FIX 4) The LOCAL judge dispatch-failure path is UNCHANGED — a bad
+    /// LOCAL judge call is swallowed to `Archived` and the run only degrades
+    /// via the pre-existing judge-dead honesty gate (all rulings unusable),
+    /// never via the new remote honest-fail reason.
+    #[test]
+    fn local_judge_dispatch_failure_keeps_today_behavior() {
+        let crew = crew_with(vec![
+            ("review-probe", vec![staffing("fast", "probe-model", 1)]),
+            ("review-judge", vec![staffing("fast", "judge-model", 1)]),
+        ]);
+        let inputs = inputs_for(&crew, 500_000);
+        let mut cycler = RecordingCycler::new();
+        let mut chat = |call: &ChatCall| {
+            if call.model == "darkmux:judge-model" {
+                Err(anyhow!("lmstudio down"))
+            } else {
+                Ok(reply("a real defect"))
+            }
+        };
+        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+        // Degenerate via the JUDGE-DEAD gate (all rulings unusable), NOT the
+        // remote honest-fail reason — local semantics are untouched.
+        let reason = env.degenerate.as_deref().expect("a fully-dead local judge is degenerate (judge-dead gate)");
+        assert!(reason.contains("no usable ruling"), "local path uses the judge-dead gate: {reason}");
+        assert!(!reason.contains("remote judge dispatch failed"), "the remote reason must not fire for a local judge");
+    }
+
+    /// (CONSIDER g) When the JUDGE bucket is already exhausted (run destined
+    /// for degraded), the verify stage is SKIPPED entirely — no frontier
+    /// spend on a doomed run. The scripted verify closure would panic if
+    /// called.
+    #[test]
+    fn verify_stage_skipped_when_judge_already_degraded() {
+        let crew = crew_with(vec![
+            ("review-probe", vec![staffing("fast", "probe-model", 1)]),
+            ("review-judge", vec![remote_staffing("cloud", "gpt-judge", 1)]),
+            ("review-verify", vec![staffing("frontier", "verify-model", 1)]),
+        ]);
+        let mut inputs = inputs_for(&crew, 100); // one 600-token ruling exhausts a pass bucket
+        inputs.bundles = Some(vec![bundle_input("a.ts"), bundle_input("b.ts")]);
+        let mut cycler = RecordingCycler::new();
+        let mut chat = |call: &ChatCall| {
+            assert_ne!(call.model, "darkmux:verify-model", "a judge-doomed run must not spend on verify");
+            if call.endpoint.is_some() {
+                Ok(SingleShotReply { content: CONFIRM_JSON.to_string(), total_tokens: Some(600), model: None })
+            } else {
+                Ok(reply("a real defect"))
+            }
+        };
+        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+        assert!(env.degenerate.as_deref().unwrap().contains("remote judge token budget exhausted"));
+        assert!(!env.steps.iter().any(|s| s.step_id == "verify"), "no verify step on a doomed run");
+        assert!(!env.members.iter().any(|m| m.seat == "review-verify"), "no verify member on a doomed run");
+    }
+
+    /// (FIX 5) Reasoning-aware completion floor: a REMOTE seat with NO
+    /// explicit staffing `max_tokens` floors at 16384 (never the local-tuned
+    /// probe default of 4000 — the reasoning-guillotine class); an explicit
+    /// staffing `max_tokens` always wins verbatim; the floor never LOWERS an
+    /// already-higher local default; LOCAL seats are unaffected.
+    #[test]
+    fn resolve_seat_max_tokens_remote_reasoning_floor() {
+        let local = staffing("fast", "m", 1);
+        assert_eq!(resolve_seat_max_tokens(&local, DEFAULT_PROBE_MAX_TOKENS), DEFAULT_PROBE_MAX_TOKENS);
+
+        let remote = remote_staffing("cloud", "gpt", 1); // max_tokens: None
+        assert_eq!(
+            resolve_seat_max_tokens(&remote, DEFAULT_PROBE_MAX_TOKENS),
+            REMOTE_REASONING_MAX_TOKENS_FLOOR,
+            "a remote probe seat floors at 16384, not the 4000 local default"
+        );
+        assert_eq!(
+            resolve_seat_max_tokens(&remote, DEFAULT_JUDGE_MAX_TOKENS),
+            DEFAULT_JUDGE_MAX_TOKENS,
+            "the floor never lowers an already-higher local default (a floor, not a clamp)"
+        );
+
+        let mut remote_explicit = remote_staffing("cloud", "gpt", 1);
+        remote_explicit.max_tokens = Some(500);
+        assert_eq!(
+            resolve_seat_max_tokens(&remote_explicit, DEFAULT_PROBE_MAX_TOKENS),
+            500,
+            "an explicit staffing max_tokens always wins verbatim (operator sovereignty)"
+        );
+    }
+
+    /// (FIX 5, live) A REMOTE probe seat with no explicit staffing max_tokens
+    /// sends `max_completion_tokens = 16384` on the wire, not 4000.
+    #[test]
+    fn remote_probe_seat_sends_reasoning_floor_on_the_wire() {
+        let crew = crew_with(vec![
+            ("review-probe", vec![remote_staffing("cloud", "gpt-remote", 1)]),
+            ("review-judge", vec![staffing("fast", "judge-model", 1)]),
+        ]);
+        let inputs = inputs_for(&crew, 500_000);
+        let mut cycler = RecordingCycler::new();
+        let seen_cap = RefCell::new(0u32);
+        let mut chat = |call: &ChatCall| {
+            if call.endpoint.is_some() {
+                *seen_cap.borrow_mut() = call.max_tokens;
+                Ok(reply("a real defect"))
+            } else {
+                Ok(reply(CONFIRM_JSON))
+            }
+        };
+        let _ = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+        assert_eq!(*seen_cap.borrow(), REMOTE_REASONING_MAX_TOKENS_FLOOR);
+    }
+
+    /// (CONSIDER d) The verify seat's inconclusive paths — a dispatch `Err`
+    /// and an unparsed reply (real chat outcomes, not the synthetic budget
+    /// record) — each keep the flag `Confirmed` WITH the manual-verification
+    /// marker, never promote, and never degrade the run.
+    #[test]
+    fn verify_dispatch_error_and_unparsed_keep_confirmed_with_marker() {
+        let crew = crew_with(vec![
+            ("review-probe", vec![staffing("fast", "probe-model", 1)]),
+            ("review-judge", vec![staffing("fast", "judge-model", 1)]),
+            ("review-verify", vec![staffing("frontier", "verify-model", 1)]),
+        ]);
+        let mut inputs = inputs_for(&crew, 500_000);
+        inputs.bundles = Some(vec![bundle_input("a.ts"), bundle_input("b.ts")]);
+        let mut cycler = RecordingCycler::new();
+        // Flag a: the verify call errors. Flag b: garbage both attempts (the
+        // unparsed retry fires, then stays Unparsed).
+        let verify_calls = RefCell::new(0u32);
+        let mut chat = |call: &ChatCall| {
+            if call.model == "darkmux:verify-model" {
+                let mut n = verify_calls.borrow_mut();
+                *n += 1;
+                match *n {
+                    1 => Err(anyhow!("verify endpoint down")),
+                    _ => Ok(reply("no verdict here")),
+                }
+            } else if call.model == "darkmux:judge-model" {
+                Ok(reply(CONFIRM_JSON))
+            } else {
+                Ok(reply("a real defect"))
+            }
+        };
+        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+        assert!(env.degenerate.is_none(), "an inconclusive verify never degrades the run");
+        assert_eq!(env.confirmed, 2, "both stay confirmed (marker downstream)");
+        assert_eq!(env.verified, 0, "an inconclusive adjudication never promotes");
+        let errored = env
+            .judged
+            .iter()
+            .find(|j| matches!(&j.verify, Some(v) if v.ruling == VerifyRuling::Error))
+            .expect("dispatch-error adjudication recorded as Error");
+        assert_eq!(errored.tier, Tier::Confirmed);
+        let unparsed = env
+            .judged
+            .iter()
+            .find(|j| matches!(&j.verify, Some(v) if v.ruling == VerifyRuling::Unparsed))
+            .expect("garbage adjudication recorded as Unparsed after the retry");
+        assert_eq!(unparsed.tier, Tier::Confirmed);
+    }
+
+    /// (CONSIDER c) `RemoteBucket::exhausted()` boundary: under < at == over.
+    /// A mutation of `>=` to `>` must fail this table (the `at` row).
+    #[test]
+    fn remote_bucket_exhausted_boundary_table() {
+        let mut under = RemoteBucket::new("s", 100);
+        under.spend(99, 1);
+        assert!(!under.exhausted(), "under budget: 99 < 100");
+
+        let mut at = RemoteBucket::new("s", 100);
+        at.spend(100, 1);
+        assert!(at.exhausted(), "at budget: 100 >= 100 (a `>` mutation breaks here)");
+
+        let mut over = RemoteBucket::new("s", 100);
+        over.spend(101, 1);
+        assert!(over.exhausted(), "over budget: 101 >= 100");
+    }
+
+    /// (CONSIDER e) The terminal `funnel.task` record carries `remote_tokens`
+    /// when a seat dispatched remotely, and OMITS it entirely on a local-only
+    /// run — the separated cloud figure never counts as savings (#1186).
+    #[test]
+    fn remote_tokens_bookend_present_when_remote_absent_when_local() {
+        // Local-only: field absent.
+        let local_crew = valid_crew();
+        let local_inputs = inputs_for(&local_crew, 500_000);
+        let mut cyc1 = RecordingCycler::new();
+        let mut chat1 = |call: &ChatCall| {
+            if call.model == "darkmux:judge-model" { Ok(reply(CONFIRM_JSON)) } else { Ok(reply("a real defect")) }
+        };
+        let mut em1 = RecordingEmitter::new();
+        let _ = run_funnel(&local_inputs, &mut chat1, &mut cyc1, &mut em1).expect("runs");
+        let local_finished = em1
+            .records
+            .iter()
+            .filter(|r| r.action == "funnel.task")
+            .filter_map(|r| r.payload.as_ref())
+            .find(|p| p["status"] == "finished")
+            .expect("terminal record");
+        assert!(local_finished.get("remote_tokens").is_none(), "local-only omits remote_tokens");
+
+        // Remote judge: field present.
+        let remote_crew = crew_with(vec![
+            ("review-probe", vec![staffing("fast", "probe-model", 1)]),
+            ("review-judge", vec![remote_staffing("cloud", "gpt-judge", 1)]),
+        ]);
+        let remote_inputs = inputs_for(&remote_crew, 500_000);
+        let mut cyc2 = RecordingCycler::new();
+        let mut chat2 = |call: &ChatCall| {
+            if call.endpoint.is_some() {
+                Ok(SingleShotReply { content: CONFIRM_JSON.to_string(), total_tokens: Some(42), model: None })
+            } else {
+                Ok(reply("a real defect"))
+            }
+        };
+        let mut em2 = RecordingEmitter::new();
+        let _ = run_funnel(&remote_inputs, &mut chat2, &mut cyc2, &mut em2).expect("runs");
+        let remote_finished = em2
+            .records
+            .iter()
+            .filter(|r| r.action == "funnel.task")
+            .filter_map(|r| r.payload.as_ref())
+            .find(|p| p["status"] == "finished")
+            .expect("terminal record");
+        assert!(remote_finished.get("remote_tokens").is_some(), "a remote seat stamps remote_tokens");
     }
 }
