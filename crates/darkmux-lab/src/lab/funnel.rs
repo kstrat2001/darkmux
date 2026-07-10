@@ -232,6 +232,39 @@ pub enum Tier {
     Archived,
 }
 
+/// (#1260/#1177) The verify (adjudication) seat's ruling vocabulary — the
+/// optional fourth funnel stage, run once per double-confirmed finding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifyRuling {
+    /// The finding's mechanism holds against the provided evidence — posted
+    /// WITHOUT the manual-verification marker.
+    Verified,
+    /// A claim the finding depends on does not hold — demoted to
+    /// [`Tier::Archived`] with the demotion recorded.
+    Refuted,
+    /// The deciding fact lies outside the provided evidence — stays
+    /// confirmed WITH the existing marker.
+    Uncertain,
+    /// No recognizable fenced JSON ruling (after one retry).
+    Unparsed,
+    /// The dispatch itself failed (or the stage's remote token budget was
+    /// exhausted — the note names which).
+    Error,
+}
+
+/// (#1260) One verify-seat adjudication outcome for a confirmed finding.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifyRecord {
+    pub ruling: VerifyRuling,
+    pub decisive_evidence: String,
+    pub note_for_author: String,
+    pub seconds: f64,
+    /// The adjudicating model — rendered in the posted review's
+    /// "verified by <model> adjudication" line.
+    pub model: String,
+}
+
 /// One flag's full judge record: pass-1 always present, pass-2 present iff
 /// pass-1 was `confirmed`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -245,6 +278,17 @@ pub struct JudgedFlag {
     /// envelope wants to find first (a flag the judge itself wasn't sure
     /// about, not one the harness is guessing on).
     pub demoted_by_pass2: bool,
+    /// (#1260) The verify seat's adjudication — present iff the crew
+    /// declares a `review-verify` seat AND this flag reached it (tier was
+    /// `Confirmed` after the double-confirm judge). Absent (and never
+    /// serialized) on crews without the seat, so their envelopes stay
+    /// byte-identical to today's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify: Option<VerifyRecord>,
+    /// (#1260) `true` iff the verify seat REFUTED this confirmed finding —
+    /// the tier is then `Archived`, with this flag recording why.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub demoted_by_verify: bool,
 }
 
 // ─── telemetry ────────────────────────────────────────────────────────────
@@ -771,6 +815,15 @@ pub struct FunnelEnvelope {
     pub confirmed: usize,
     pub needs_check: usize,
     pub archived: usize,
+    /// (#1260) Confirmed findings the verify seat ruled `verified` —
+    /// posted WITHOUT the manual-verification marker. Zero (and never
+    /// serialized) on crews without the seat.
+    #[serde(default, skip_serializing_if = "usize_is_zero")]
+    pub verified: usize,
+    /// (#1260) Confirmed findings the verify seat REFUTED — demoted to the
+    /// archived tier with the demotion recorded on the flag.
+    #[serde(default, skip_serializing_if = "usize_is_zero")]
+    pub refuted: usize,
     /// Set (never silently left empty) when the docket produced zero raw
     /// flags (every probe drew nothing usable) — a degenerate run is a
     /// LOUD, scoreable outcome, never a silent pass. `None` on a normal run.
@@ -802,6 +855,12 @@ pub struct FunnelEnvelope {
     /// least one REMOTE call. Empty (and unserialized) on local-only runs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub remote_budgets: Vec<RemoteBudgetRecord>,
+}
+
+/// Serde helper for the skip-if-zero count fields — keeps envelopes from
+/// crews without the verify seat byte-identical to pre-#1260 ones.
+fn usize_is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// (#1260) One pipeline stage's remote token-bucket outcome — see
@@ -944,14 +1003,24 @@ pub struct StaffingSnapshot {
 }
 
 /// Per-seat resolved staffing snapshot — `review-probe` (one or more
-/// staffings) + `review-judge` (exactly one). See [`FunnelEnvelope::staffing`].
+/// staffings) + `review-judge` (exactly one) + the optional `review-verify`
+/// seat (#1260). See [`FunnelEnvelope::staffing`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CrewStaffingSnapshot {
     pub probes: Vec<StaffingSnapshot>,
     pub judge: Option<StaffingSnapshot>,
+    /// (#1260) Present iff the crew declares the `review-verify` seat —
+    /// absent (and never serialized) otherwise, so pre-#1260 snapshots
+    /// round-trip unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify: Option<StaffingSnapshot>,
 }
 
-fn staffing_snapshot(probes: &[ResolvedSeatStaffing], judge: &ResolvedSeatStaffing) -> CrewStaffingSnapshot {
+fn staffing_snapshot(
+    probes: &[ResolvedSeatStaffing],
+    judge: &ResolvedSeatStaffing,
+    verify: Option<&ResolvedSeatStaffing>,
+) -> CrewStaffingSnapshot {
     fn one(s: &ResolvedSeatStaffing) -> StaffingSnapshot {
         StaffingSnapshot {
             name: s.name.clone(),
@@ -967,6 +1036,7 @@ fn staffing_snapshot(probes: &[ResolvedSeatStaffing], judge: &ResolvedSeatStaffi
     CrewStaffingSnapshot {
         probes: probes.iter().map(one).collect(),
         judge: Some(one(judge)),
+        verify: verify.map(one),
     }
 }
 
@@ -1168,8 +1238,22 @@ fn resolve_mode(mode: ExecMode, probes: &[ResolvedSeatStaffing], judge: &Resolve
 
 // ─── crew validation (funnel-owned seat requirements) ───────────────────
 
+/// The funnel's validated seat set — what [`validate_funnel_crew`] hands
+/// back. `verify` is the OPTIONAL fourth seat (#1260): when a crew declares
+/// `review-verify` (exactly one staffing, like the judge), every
+/// double-confirmed finding gets one adjudication call after pass-2; a crew
+/// without it behaves byte-identically to today.
+#[derive(Debug)]
+pub struct FunnelSeats<'a> {
+    pub probes: &'a Vec<ResolvedSeatStaffing>,
+    pub judge: &'a ResolvedSeatStaffing,
+    pub verify: Option<&'a ResolvedSeatStaffing>,
+}
+
 /// Validate `crew` carries what the funnel needs: seat `"review-probe"`
-/// with >= 1 staffing, seat `"review-judge"` with EXACTLY 1 staffing.
+/// with >= 1 staffing, seat `"review-judge"` with EXACTLY 1 staffing, and
+/// — when declared — seat `"review-verify"` with EXACTLY 1 staffing
+/// (#1260; the seat is optional, its shape is not).
 /// `resolve_crew` (packet 1) validates the crew schema is well-formed and
 /// every model resolvable; it deliberately does NOT know about
 /// pipeline-specific seat requirements — that's this function's job, and
@@ -1181,7 +1265,7 @@ fn resolve_mode(mode: ExecMode, probes: &[ResolvedSeatStaffing], judge: &Resolve
 /// resolve_funnel_ctx`) calls this directly, ahead of `run_funnel`'s own
 /// internal call, so a misconfigured crew fails at bench START (before the
 /// per-case loop even begins) rather than at the first case's dispatch.
-pub fn validate_funnel_crew(crew: &ResolvedCrew) -> Result<(&Vec<ResolvedSeatStaffing>, &ResolvedSeatStaffing)> {
+pub fn validate_funnel_crew(crew: &ResolvedCrew) -> Result<FunnelSeats<'_>> {
     let probes = crew
         .seats
         .get("review-probe")
@@ -1209,7 +1293,18 @@ pub fn validate_funnel_crew(crew: &ResolvedCrew) -> Result<(&Vec<ResolvedSeatSta
             judges.len()
         );
     }
-    Ok((probes, &judges[0]))
+    let verify = match crew.seats.get("review-verify") {
+        None => None,
+        Some(v) if v.len() == 1 => Some(&v[0]),
+        Some(v) => bail!(
+            "darkmux: crew \"{}\" seat \"review-verify\" must have EXACTLY 1 staffing \
+             when declared (got {}) — the adjudication seat is single, like \"review-judge\" \
+             (#1260)",
+            crew.name,
+            v.len()
+        ),
+    };
+    Ok(FunnelSeats { probes, judge: &judges[0], verify })
 }
 
 // ─── mechanism-family keyword table (for dedup) ──────────────────────────
@@ -1418,6 +1513,36 @@ const JUDGE_TAIL_INSTRUCTION: &str = "Investigate the flagged item against the c
 /// renders, only the body line defaults), a case a single combined field
 /// can't distinguish from "everything blank".
 pub fn judge_prompt(intent_title: &str, intent_body: &str, code: &str, facts: &[String], charge: &str) -> String {
+    review_prompt_with_tail(intent_title, intent_body, code, facts, charge, JUDGE_TAIL_INSTRUCTION)
+}
+
+/// (#1260) The frozen fenced-JSON instruction tail for the VERIFY seat —
+/// identical structure to [`JUDGE_TAIL_INSTRUCTION`], with the adjudication
+/// ruling vocabulary ({verified, refuted, uncertain}). Byte-locked by
+/// `verify_prompt_matches_frozen_golden` (contract 6).
+const VERIFY_TAIL_INSTRUCTION: &str = "Adjudicate the confirmed finding against the code above. End your reply with exactly one fenced JSON block:\n```json\n{\"ruling\": \"verified\" | \"refuted\" | \"uncertain\", \"decisive_evidence\": \"<the specific code line or checked claim that decided it>\", \"note_for_author\": \"<one or two sentences the author reads>\"}\n```";
+
+/// (#1260) Build the verify seat's prompt — the SAME evidence assembly the
+/// judge sees (`review_prompt_with_tail`; the adjudication is scoped to the
+/// same record), with the verify tail instruction. One shared assembly, two
+/// frozen tails — the two prompts structurally cannot drift apart.
+pub fn verify_prompt(intent_title: &str, intent_body: &str, code: &str, facts: &[String], charge: &str) -> String {
+    review_prompt_with_tail(intent_title, intent_body, code, facts, charge, VERIFY_TAIL_INSTRUCTION)
+}
+
+/// The shared judge/verify evidence assembly (see [`judge_prompt`]'s doc
+/// for the Phase A provenance of every section) — extracted for the verify
+/// seat (#1260) WITHOUT changing a byte of the judge's output: only the
+/// tail differs per seat, and the judge's Phase A goldens pin that this
+/// refactor is assembly-neutral.
+fn review_prompt_with_tail(
+    intent_title: &str,
+    intent_body: &str,
+    code: &str,
+    facts: &[String],
+    charge: &str,
+    tail: &str,
+) -> String {
     let body = intent_body.trim();
     let body = if body.is_empty() { "(no description provided)" } else { body };
     let mut out = String::new();
@@ -1436,7 +1561,7 @@ pub fn judge_prompt(intent_title: &str, intent_body: &str, code: &str, facts: &[
     out.push_str("\n## The flagged item to investigate\n");
     out.push_str(charge);
     out.push_str("\n\n");
-    out.push_str(JUDGE_TAIL_INSTRUCTION);
+    out.push_str(tail);
     out
 }
 
@@ -1487,6 +1612,26 @@ pub fn parse_judge_ruling(text: &str) -> Option<(FunnelRuling, String, String)> 
                 "confirmed" => FunnelRuling::Confirmed,
                 "needs_check" => FunnelRuling::NeedsCheck,
                 "false_positive" => FunnelRuling::FalsePositive,
+                _ => continue,
+            };
+            return Some((ruling, raw.decisive_evidence, raw.note_for_author));
+        }
+    }
+    None
+}
+
+/// (#1260) Parse a verify-seat reply into `(ruling, decisive_evidence,
+/// note_for_author)` — same fence-aware candidate discipline as
+/// [`parse_judge_ruling`], matched against the adjudication vocabulary.
+/// `None` when no candidate carries a recognized ruling — the caller
+/// treats that as [`VerifyRuling::Unparsed`].
+pub fn parse_verify_ruling(text: &str) -> Option<(VerifyRuling, String, String)> {
+    for cand in judge_json_candidates(text) {
+        if let Ok(raw) = serde_json::from_str::<RawJudgeRuling>(&cand) {
+            let ruling = match raw.ruling.trim().to_ascii_lowercase().as_str() {
+                "verified" => VerifyRuling::Verified,
+                "refuted" => VerifyRuling::Refuted,
+                "uncertain" => VerifyRuling::Uncertain,
                 _ => continue,
             };
             return Some((ruling, raw.decisive_evidence, raw.note_for_author));
@@ -1665,6 +1810,11 @@ pub struct FunnelInputs<'a> {
     /// The judge seat's PERSONA — still sent as a genuine system-role
     /// message (`judge-runner.py`'s `call_judge` does the same).
     pub judge_system: &'a str,
+    /// (#1260) The verify seat's PERSONA (`review-verify.md`), sent as a
+    /// system-role message like the judge's. Read only when the crew
+    /// declares a `review-verify` seat — callers without one may pass the
+    /// embedded text anyway (it is simply never dispatched).
+    pub verify_system: &'a str,
     /// (#1222 Phase B packet 5 reconciliation) Caller-supplied bundles from
     /// the REAL bundler (`darkmux_lab::lab::bundle::build_bundles`/
     /// `external_bundles`, packet 3), already mapped `Bundle` ->
@@ -2163,6 +2313,235 @@ fn judge_one_flag(
     }
 }
 
+// ─── verify stage (#1260/#1177) — optional adjudication of confirms ──────
+
+/// One verify-seat dispatch — mirrors [`run_judge_pass`]'s shape: a chat
+/// failure is recorded as [`VerifyRuling::Error`] with the reason in the
+/// note, never propagated (one bad adjudication must not abort the run;
+/// the flag then keeps its manual-verification marker downstream).
+fn run_verify_pass(
+    model: &str,
+    system: &str,
+    prompt: &str,
+    max_tokens: u32,
+    endpoint: Option<&ModelEndpoint>,
+    chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
+) -> (VerifyRecord, u64) {
+    let t0 = Instant::now();
+    let call = ChatCall {
+        model,
+        system,
+        user: prompt,
+        temperature: JUDGE_TEMPERATURE,
+        max_tokens,
+        endpoint,
+    };
+    match chat(&call) {
+        Ok(reply) => {
+            let seconds = t0.elapsed().as_secs_f64();
+            let tokens = reply.total_tokens.unwrap_or(0);
+            match parse_verify_ruling(&reply.content) {
+                Some((ruling, decisive_evidence, note_for_author)) => (
+                    VerifyRecord { ruling, decisive_evidence, note_for_author, seconds, model: model.to_string() },
+                    tokens,
+                ),
+                None => (
+                    VerifyRecord {
+                        ruling: VerifyRuling::Unparsed,
+                        decisive_evidence: String::new(),
+                        note_for_author: String::new(),
+                        seconds,
+                        model: model.to_string(),
+                    },
+                    tokens,
+                ),
+            }
+        }
+        Err(e) => (
+            VerifyRecord {
+                ruling: VerifyRuling::Error,
+                decisive_evidence: String::new(),
+                note_for_author: format!("verify dispatch failed: {e}"),
+                seconds: t0.elapsed().as_secs_f64(),
+                model: model.to_string(),
+            },
+            0,
+        ),
+    }
+}
+
+/// One verify adjudication, retried ONCE on [`VerifyRuling::Unparsed`] —
+/// the same retry discipline as [`judge_pass_with_retry`]. Returns the
+/// surviving record plus token/call accounting for BOTH attempts.
+fn verify_pass_with_retry(
+    model: &str,
+    system: &str,
+    prompt: &str,
+    max_tokens: u32,
+    endpoint: Option<&ModelEndpoint>,
+    chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
+) -> (VerifyRecord, u64, u32) {
+    let (r1, t1) = run_verify_pass(model, system, prompt, max_tokens, endpoint, chat);
+    if r1.ruling == VerifyRuling::Unparsed {
+        let (r2, t2) = run_verify_pass(model, system, prompt, max_tokens, endpoint, chat);
+        (r2, t1 + t2, 2)
+    } else {
+        (r1, t1, 1)
+    }
+}
+
+/// (#1260) The optional verify stage: ONE adjudication call per
+/// double-confirmed flag, after pass-2. State machine per the settled
+/// design:
+///
+/// - `verified` — tier stays `Confirmed`; the posted review drops the
+///   manual-verification marker for a "verified by <model> adjudication"
+///   line (rendering lives in `synthesize_funnel`).
+/// - `refuted` — demoted to [`Tier::Archived`], `demoted_by_verify` set,
+///   the refutation recorded on the flag.
+/// - `uncertain` (and `unparsed`/`error` — an inconclusive adjudication
+///   never promotes) — tier stays `Confirmed` WITH the existing marker.
+///
+/// A crew without the seat never reaches here — byte-identical behavior
+/// to today. Zero confirms ⇒ no stage at all (no dispatch, no records).
+/// The stage is its own EXECUTION for the remote token bucket; exhausting
+/// it is load-bearing (degraded run — see the caller in `finish_funnel`).
+/// Emits its own `funnel.step`/`funnel.ruling` records under `step_id =
+/// "verify"` through the same bookend guard (contract 2 — the stage runs
+/// inside the run's existing liveness envelope).
+#[allow(clippy::too_many_arguments)]
+fn run_verify_stage(
+    env: &mut FunnelEnvelope,
+    judged: &mut [JudgedFlag],
+    bundles: &[BundleInput],
+    inputs: &FunnelInputs,
+    vstaff: &ResolvedSeatStaffing,
+    chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
+    cycler: &mut dyn ModelCycler,
+    guard: &mut FunnelBookendGuard<'_>,
+) -> Result<()> {
+    let docket = judged.iter().filter(|j| j.tier == Tier::Confirmed).count();
+    if docket == 0 {
+        return Ok(());
+    }
+    let identifier = seat_identifier(&vstaff.pm);
+    let endpoint = seat_endpoint(&vstaff.pm);
+    let endpoint_host = seat_endpoint_host(&vstaff.pm);
+    let max_tokens = vstaff.max_tokens.unwrap_or(DEFAULT_JUDGE_MAX_TOKENS);
+    let mut bucket = RemoteBucket::new("verify", inputs.remote_max_tokens_per_execution);
+
+    if !vstaff.pm.is_remote() {
+        cycler.ensure_loaded(&vstaff.pm)?;
+    }
+    let mut started = json!({
+        "step_id": "verify", "kind": "dispatch", "status": "started",
+        "items_in": docket, "items_out": 0, "wall_ms": 0, "model": identifier,
+    });
+    if let Some(host) = &endpoint_host {
+        started["remote"] = true.into();
+        started["endpoint"] = host.clone().into();
+    }
+    guard.step_started("verify", "dispatch", started);
+
+    let t0 = Instant::now();
+    let mut calls = 0u32;
+    let mut tokens = 0u64;
+    for j in judged.iter_mut().filter(|j| j.tier == Tier::Confirmed) {
+        // Remote gate BEFORE dispatch — a skipped adjudication is recorded
+        // per-flag (ruling Error, reason named); the whole run then goes
+        // degraded below (verify is load-bearing, operator decision).
+        let (record, spent, made) = if endpoint.is_some() && !bucket.admit() {
+            (
+                VerifyRecord {
+                    ruling: VerifyRuling::Error,
+                    decisive_evidence: String::new(),
+                    note_for_author:
+                        "remote token budget exhausted for this stage — call skipped".to_string(),
+                    seconds: 0.0,
+                    model: identifier.clone(),
+                },
+                0u64,
+                0u32,
+            )
+        } else {
+            let bundle = bundles.iter().find(|b| b.id == j.flag.bundle_id);
+            let code = bundle.map(|b| b.code.as_str()).unwrap_or_default();
+            let facts: &[String] = bundle.map(|b| b.facts.as_slice()).unwrap_or_default();
+            let prompt =
+                verify_prompt(inputs.intent_title, inputs.intent_body, code, facts, &j.flag.charge_text);
+            let out = verify_pass_with_retry(
+                &identifier,
+                inputs.verify_system,
+                &prompt,
+                max_tokens,
+                endpoint,
+                chat,
+            );
+            if endpoint.is_some() {
+                bucket.spend(out.1, out.2);
+            }
+            out
+        };
+        tokens += spent;
+        calls += made;
+        guard.ruling(json!({
+            "bundle_id": j.flag.bundle_id, "stage": "verify",
+            "ruling": record.ruling, "seconds": record.seconds,
+        }));
+        if record.ruling == VerifyRuling::Refuted {
+            j.tier = Tier::Archived;
+            j.demoted_by_verify = true;
+        }
+        j.verify = Some(record);
+    }
+    let wall_ms = t0.elapsed().as_millis() as u64;
+    if !vstaff.pm.is_remote() {
+        cycler.release(&vstaff.pm)?;
+    }
+
+    env.members.push(MemberRecord {
+        model: identifier.clone(),
+        seat: "review-verify".to_string(),
+        draws: calls,
+        wall_ms,
+        total_tokens: tokens,
+        remote: endpoint.is_some(),
+        endpoint: endpoint_host.clone(),
+    });
+    env.steps.push(StepRecord {
+        step_id: "verify".to_string(),
+        kind: "dispatch".to_string(),
+        items_in: docket,
+        items_out: docket,
+        wall_ms,
+    });
+    let mut finished = json!({
+        "step_id": "verify", "kind": "dispatch", "status": "finished",
+        "items_in": docket, "items_out": docket, "wall_ms": wall_ms,
+        "model": identifier, "tokens": tokens,
+    });
+    if let Some(host) = &endpoint_host {
+        finished["remote"] = true.into();
+        finished["endpoint"] = host.clone().into();
+    }
+    guard.step_finished("verify", finished);
+
+    if let Some(rec) = bucket.record() {
+        if rec.skipped_calls > 0 {
+            // Verify is LOAD-BEARING (operator decision): its bucket
+            // exhausting is an honest degraded run, never a silent pass.
+            env.degenerate = Some(format!(
+                "remote verify token budget exhausted — {} adjudication call(s) skipped after \
+                 the per-execution allowance ({} tokens) ran out; degraded run, never a silent \
+                 pass",
+                rec.skipped_calls, rec.max_tokens
+            ));
+        }
+        env.remote_budgets.push(rec);
+    }
+    Ok(())
+}
+
 // ─── shared finish (probe→dedup→judge→envelope), reused by run_judge_only ─
 
 #[allow(clippy::too_many_arguments)]
@@ -2172,6 +2551,7 @@ fn finish_funnel(
     bundles: &[BundleInput],
     inputs: &FunnelInputs,
     judge: &ResolvedSeatStaffing,
+    verify: Option<&ResolvedSeatStaffing>,
     chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
     cycler: &mut dyn ModelCycler,
     guard: &mut FunnelBookendGuard<'_>,
@@ -2284,6 +2664,8 @@ fn finish_funnel(
             pass2: outcome.pass2,
             tier: outcome.tier,
             demoted_by_pass2: outcome.demoted_by_pass2,
+            verify: None,
+            demoted_by_verify: false,
         });
     }
     if !judge.pm.is_remote() {
@@ -2336,9 +2718,22 @@ fn finish_funnel(
         );
     }
 
+    // (#1260) The optional verify stage — one adjudication per confirmed
+    // flag, AFTER the double-confirm judge and BEFORE the tier counts so a
+    // refutation's demotion lands in the totals. Crews without the seat
+    // skip this entirely (byte-identical behavior to today).
+    if let Some(vstaff) = verify {
+        run_verify_stage(&mut env, &mut judged, bundles, inputs, vstaff, chat, cycler, guard)?;
+    }
+
     env.confirmed = judged.iter().filter(|j| j.tier == Tier::Confirmed).count();
     env.needs_check = judged.iter().filter(|j| j.tier == Tier::NeedsCheck).count();
     env.archived = judged.iter().filter(|j| j.tier == Tier::Archived).count();
+    env.verified = judged
+        .iter()
+        .filter(|j| matches!(&j.verify, Some(v) if v.ruling == VerifyRuling::Verified))
+        .count();
+    env.refuted = judged.iter().filter(|j| j.demoted_by_verify).count();
 
     // The judge-dead honesty gate (#1222 packet 5 review): per-flag judge
     // failures are deliberately swallowed to `Error`/`Unparsed` →
@@ -2458,7 +2853,7 @@ fn run_funnel_impl(
     telemetry_poll: Duration,
     sample_fn: fn() -> HostSample,
 ) -> Result<FunnelEnvelope> {
-    let (probes, judge) = validate_funnel_crew(inputs.crew)?;
+    let FunnelSeats { probes, judge, verify } = validate_funnel_crew(inputs.crew)?;
     let mode = resolve_mode(inputs.mode, probes, judge);
 
     let t_bundle = Instant::now();
@@ -2477,7 +2872,7 @@ fn run_funnel_impl(
         fingerprint: fingerprint(&seat_identifier(&judge.pm), inputs.judge_system),
         // (#1247) The resolved staffing this run actually used, post any
         // caller-applied `--k` override — see `FunnelEnvelope::staffing`.
-        staffing: Some(staffing_snapshot(probes, judge)),
+        staffing: Some(staffing_snapshot(probes, judge, verify)),
         ..Default::default()
     };
     // `funnel.task` started (#1247 Part 1) — run started: case id, crew
@@ -2581,7 +2976,7 @@ fn run_funnel_impl(
         return Ok(env);
     }
 
-    finish_funnel(env, raw_flags, &bundles, inputs, judge, chat, cycler, &mut guard)
+    finish_funnel(env, raw_flags, &bundles, inputs, judge, verify, chat, cycler, &mut guard)
 }
 
 /// Re-judge a previously-recorded flag list without re-running the probe
@@ -2596,7 +2991,7 @@ pub fn run_judge_only(
     cycler: &mut dyn ModelCycler,
     emitter: &mut dyn FunnelEmitter,
 ) -> Result<FunnelEnvelope> {
-    let (probes, judge) = validate_funnel_crew(inputs.crew)?;
+    let FunnelSeats { probes, judge, verify } = validate_funnel_crew(inputs.crew)?;
     // Judge-only runs one model, so the mode is telemetry, not behavior —
     // but the envelope still records the CALLER's resolved mode rather
     // than a hardcoded label, so a judge-only re-run of a parallel funnel
@@ -2617,7 +3012,7 @@ pub fn run_judge_only(
         fingerprint: fingerprint(&seat_identifier(&judge.pm), inputs.judge_system),
         // (#1247) The resolved staffing this run actually used, post any
         // caller-applied `--k` override — see `FunnelEnvelope::staffing`.
-        staffing: Some(staffing_snapshot(probes, judge)),
+        staffing: Some(staffing_snapshot(probes, judge, verify)),
         ..Default::default()
     };
     // Same guard discipline as `run_funnel` — see its comment at the
@@ -2647,7 +3042,7 @@ pub fn run_judge_only(
         return Ok(env);
     }
 
-    finish_funnel(env, flags, &bundles, inputs, judge, &mut chat, cycler, &mut guard)
+    finish_funnel(env, flags, &bundles, inputs, judge, verify, &mut chat, cycler, &mut guard)
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -3021,7 +3416,7 @@ mod tests {
     #[test]
     fn validate_funnel_crew_happy_path() {
         let crew = valid_crew();
-        let (probes, judge) = validate_funnel_crew(&crew).expect("valid");
+        let FunnelSeats { probes, judge, verify: _ } = validate_funnel_crew(&crew).expect("valid");
         assert_eq!(probes.len(), 1);
         assert_eq!(judge.pm.id, "judge-model");
     }
@@ -3080,6 +3475,7 @@ mod tests {
             mode: ExecMode::Sequential,
             probe_system: "probe sys",
             judge_system: "judge sys",
+            verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
             bundles: None,
         };
@@ -3113,6 +3509,7 @@ mod tests {
             mode: ExecMode::Sequential,
             probe_system: "probe sys",
             judge_system: "judge sys",
+            verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
             bundles: None,
         };
@@ -3182,6 +3579,7 @@ mod tests {
             mode: ExecMode::Sequential,
             probe_system: "probe sys",
             judge_system: "judge sys",
+            verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
             bundles: None,
         };
@@ -3290,6 +3688,7 @@ mod tests {
             mode: ExecMode::Sequential,
             probe_system: "probe sys",
             judge_system: "judge sys",
+            verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
             bundles: None,
         };
@@ -3331,6 +3730,7 @@ mod tests {
             mode: ExecMode::Sequential,
             probe_system: "probe sys",
             judge_system: "judge sys",
+            verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
             bundles: None,
         };
@@ -3403,6 +3803,7 @@ mod tests {
             mode: ExecMode::Sequential,
             probe_system: "probe sys",
             judge_system: "judge sys",
+            verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
             bundles: None,
         };
@@ -3471,6 +3872,7 @@ mod tests {
             mode: ExecMode::Sequential,
             probe_system: "probe sys",
             judge_system: "judge sys",
+            verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
             bundles: None,
         };
@@ -3643,6 +4045,7 @@ mod tests {
             mode: ExecMode::Sequential,
             probe_system: "probe sys",
             judge_system: "judge sys",
+            verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
             bundles: None,
         };
@@ -3726,6 +4129,7 @@ mod tests {
             mode: ExecMode::Sequential,
             probe_system: "probe sys",
             judge_system: "judge sys",
+            verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
             bundles: None,
         };
@@ -3789,6 +4193,7 @@ mod tests {
             mode: ExecMode::Sequential,
             probe_system: "probe sys",
             judge_system: "judge sys",
+            verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
             bundles: None,
         };
@@ -3818,6 +4223,7 @@ mod tests {
             mode: ExecMode::Sequential,
             probe_system: "probe sys",
             judge_system: "judge sys",
+            verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
             bundles: None,
         };
@@ -3852,6 +4258,7 @@ mod tests {
             mode: ExecMode::Sequential,
             probe_system: "probe sys",
             judge_system: "judge sys",
+            verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
             bundles: None,
         };
@@ -3890,6 +4297,7 @@ mod tests {
             mode: ExecMode::Sequential,
             probe_system: "probe sys",
             judge_system: "judge sys",
+            verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
             bundles: None,
         };
@@ -3925,6 +4333,7 @@ mod tests {
             mode: ExecMode::Sequential,
             probe_system: "probe sys",
             judge_system: "judge sys",
+            verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
             bundles: None,
         };
@@ -3953,6 +4362,7 @@ mod tests {
             mode: ExecMode::Parallel,
             probe_system: "probe sys",
             judge_system: "judge sys",
+            verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
             bundles: None,
         };
@@ -4331,6 +4741,7 @@ mod tests {
             mode: ExecMode::Sequential,
             probe_system: "probe sys",
             judge_system: "judge sys",
+            verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
             bundles: None,
         };
@@ -4370,6 +4781,7 @@ mod tests {
             mode: ExecMode::Parallel,
             probe_system: "probe sys",
             judge_system: "judge sys",
+            verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
             bundles: None,
         };
@@ -4700,6 +5112,7 @@ mod tests {
             mode: ExecMode::Sequential,
             probe_system: "probe sys",
             judge_system: "judge sys",
+            verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
             bundles: None,
         };
@@ -4748,6 +5161,7 @@ mod tests {
             mode: ExecMode::Sequential,
             probe_system: "probe sys",
             judge_system: "judge sys",
+            verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
             bundles: None,
         };
@@ -4816,6 +5230,8 @@ mod tests {
                 }),
                 tier: Tier::Confirmed,
                 demoted_by_pass2: false,
+                verify: None,
+                demoted_by_verify: false,
             },
             JudgedFlag {
                 flag: flag_needs_check.clone(),
@@ -4835,6 +5251,8 @@ mod tests {
                 }),
                 tier: Tier::NeedsCheck,
                 demoted_by_pass2: true,
+                verify: None,
+                demoted_by_verify: false,
             },
             JudgedFlag {
                 flag: flag_archived.clone(),
@@ -4848,6 +5266,8 @@ mod tests {
                 pass2: None,
                 tier: Tier::Archived,
                 demoted_by_pass2: false,
+                verify: None,
+                demoted_by_verify: false,
             },
         ];
 
@@ -4891,7 +5311,9 @@ mod tests {
             needs_check: 1,
             archived: 1,
             degenerate: None,
-            fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
+                        verified: 0,
+            refuted: 0,
+fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             staffing: None,
             warnings: Vec::new(),
             remote_budgets: Vec::new(),
@@ -4971,6 +5393,7 @@ mod tests {
             mode: ExecMode::Sequential,
             probe_system: "probe sys",
             judge_system: "judge sys",
+            verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
             bundles: Some(bundles),
         };
@@ -5052,6 +5475,7 @@ mod tests {
             mode: ExecMode::Sequential,
             probe_system: "probe sys",
             judge_system: "judge sys",
+            verify_system: "verify sys",
             bundles: None,
             remote_max_tokens_per_execution: budget,
         }
@@ -5275,6 +5699,249 @@ mod tests {
         let remote = env.members.iter().find(|m| m.model == "gpt-remote").expect("remote member row");
         assert!(remote.remote);
         assert_eq!(remote.total_tokens, 0, "a failed seat billed nothing");
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // The review-verify seat (#1260/#1177) — optional adjudication stage
+    // ═══════════════════════════════════════════════════════════════
+
+    const VERIFIED_JSON: &str = "```json\n{\"ruling\": \"verified\", \"decisive_evidence\": \"ve\", \"note_for_author\": \"vn\"}\n```";
+    const REFUTED_JSON: &str = "```json\n{\"ruling\": \"refuted\", \"decisive_evidence\": \"re\", \"note_for_author\": \"rn\"}\n```";
+    const UNCERTAIN_JSON: &str = "```json\n{\"ruling\": \"uncertain\", \"decisive_evidence\": \"ue\", \"note_for_author\": \"un\"}\n```";
+
+    /// (contract 6) Byte-lock for the verify prompt — the full assembled
+    /// string, mirroring `judge_prompt_matches_phase_a_golden_*`. The
+    /// evidence sections are the judge's exact assembly (one shared
+    /// implementation, `review_prompt_with_tail`); only the frozen tail
+    /// differs, and this golden pins every byte of it.
+    #[test]
+    fn verify_prompt_matches_frozen_golden() {
+        let golden = "## The author's stated case (the pull request description)\nBound retry backoff to a sane ceiling\nCaps the exponential backoff delay so a large attempt count cannot stall retries indefinitely.\n\n## The code under review\n```typescript\n// src/example.ts (lines 1-4)\nexport function clampRetryDelay(attempt: number, base: number): number {\n  const delay = base * Math.pow(2, attempt);\n  return Math.min(delay, 30000);\n}\n```\n\n## Fact sheet given to the flagging reviewer\n`attempt` is caller-controlled and unbounded\n\n## The flagged item to investigate\nThe delay calculation in `clampRetryDelay` never verifies `attempt` is non-negative — a negative attempt shrinks the delay below the intended floor.\n\nAdjudicate the confirmed finding against the code above. End your reply with exactly one fenced JSON block:\n```json\n{\"ruling\": \"verified\" | \"refuted\" | \"uncertain\", \"decisive_evidence\": \"<the specific code line or checked claim that decided it>\", \"note_for_author\": \"<one or two sentences the author reads>\"}\n```";
+        let p = verify_prompt(
+            "Bound retry backoff to a sane ceiling",
+            "Caps the exponential backoff delay so a large attempt count cannot stall retries indefinitely.",
+            GOLDEN_CODE,
+            &["`attempt` is caller-controlled and unbounded".to_string()],
+            "The delay calculation in `clampRetryDelay` never verifies `attempt` is non-negative — a negative attempt shrinks the delay below the intended floor.",
+        );
+        assert_eq!(p, golden);
+    }
+
+    #[test]
+    fn parse_verify_ruling_vocabulary_and_rejections() {
+        let (r, e, n) = parse_verify_ruling(VERIFIED_JSON).expect("parses");
+        assert_eq!(r, VerifyRuling::Verified);
+        assert_eq!((e.as_str(), n.as_str()), ("ve", "vn"));
+        assert_eq!(parse_verify_ruling(REFUTED_JSON).unwrap().0, VerifyRuling::Refuted);
+        assert_eq!(parse_verify_ruling(UNCERTAIN_JSON).unwrap().0, VerifyRuling::Uncertain);
+        // Case-insensitive + trimmed, same as the judge parser.
+        let upper = "```json\n{\"ruling\": \" VERIFIED \", \"decisive_evidence\": \"e\", \"note_for_author\": \"n\"}\n```";
+        assert_eq!(parse_verify_ruling(upper).unwrap().0, VerifyRuling::Verified);
+        // The JUDGE vocabulary is NOT the verify vocabulary — a verify seat
+        // answering "confirmed" is off-contract and must read as Unparsed.
+        assert!(parse_verify_ruling(CONFIRM_JSON).is_none());
+        assert!(parse_verify_ruling("no verdict here").is_none());
+    }
+
+    /// The whole verify state machine in one run: three double-confirmed
+    /// flags adjudicated `verified` / `refuted` / `uncertain`. Also pins
+    /// the residency ordering (a LOCAL verify seat loads after the judge
+    /// releases) and the envelope's verify accounting.
+    #[test]
+    fn verify_stage_verified_refuted_uncertain_state_machine() {
+        let crew = crew_with(vec![
+            ("review-probe", vec![staffing("fast", "probe-model", 1)]),
+            ("review-judge", vec![staffing("fast", "judge-model", 1)]),
+            ("review-verify", vec![staffing("frontier", "verify-model", 1)]),
+        ]);
+        let mut inputs = inputs_for(&crew, 500_000);
+        inputs.bundles = Some(vec![bundle_input("a.ts"), bundle_input("b.ts"), bundle_input("c.ts")]);
+        let mut cycler = RecordingCycler::new();
+        let verify_replies = RefCell::new(vec![VERIFIED_JSON, REFUTED_JSON, UNCERTAIN_JSON]);
+        let mut chat = |call: &ChatCall| {
+            if call.model == "darkmux:verify-model" {
+                assert_eq!(call.system, "verify sys", "the verify seat gets its own persona");
+                Ok(reply(verify_replies.borrow_mut().remove(0)))
+            } else if call.model == "darkmux:judge-model" {
+                Ok(reply(CONFIRM_JSON))
+            } else {
+                Ok(reply("a real defect"))
+            }
+        };
+        let mut emitter = RecordingEmitter::new();
+        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut emitter).expect("runs");
+
+        assert_eq!(env.judged.len(), 3);
+        // verified: stays confirmed, record present.
+        let v = &env.judged[0];
+        assert_eq!(v.tier, Tier::Confirmed);
+        assert_eq!(v.verify.as_ref().unwrap().ruling, VerifyRuling::Verified);
+        assert_eq!(v.verify.as_ref().unwrap().model, "darkmux:verify-model");
+        assert!(!v.demoted_by_verify);
+        // refuted: demoted to archived, demotion recorded.
+        let r = &env.judged[1];
+        assert_eq!(r.tier, Tier::Archived);
+        assert!(r.demoted_by_verify);
+        assert_eq!(r.verify.as_ref().unwrap().ruling, VerifyRuling::Refuted);
+        assert_eq!(r.verify.as_ref().unwrap().note_for_author, "rn");
+        // uncertain: stays confirmed (keeps the marker downstream).
+        let u = &env.judged[2];
+        assert_eq!(u.tier, Tier::Confirmed);
+        assert_eq!(u.verify.as_ref().unwrap().ruling, VerifyRuling::Uncertain);
+        assert!(!u.demoted_by_verify);
+        // Envelope accounting.
+        assert_eq!(env.confirmed, 2);
+        assert_eq!(env.archived, 1);
+        assert_eq!(env.verified, 1);
+        assert_eq!(env.refuted, 1);
+        let member = env.members.iter().find(|m| m.seat == "review-verify").expect("verify member");
+        assert_eq!(member.draws, 3, "one adjudication per confirmed flag");
+        assert!(!member.remote);
+        assert!(env.steps.iter().any(|s| s.step_id == "verify" && s.items_in == 3));
+        assert!(env.staffing.as_ref().unwrap().verify.is_some(), "snapshot carries the verify seat");
+        // Residency: the local verify seat loads AFTER the judge releases.
+        let judge_release = cycler.log.iter().position(|e| e == "release:judge-model").unwrap();
+        let verify_load = cycler.log.iter().position(|e| e == "load:verify-model").unwrap();
+        let verify_release = cycler.log.iter().position(|e| e == "release:verify-model").unwrap();
+        assert!(judge_release < verify_load && verify_load < verify_release);
+        // Emission: the verify stage brackets itself with step records and
+        // emits one ruling per adjudication, inside the run's existing
+        // bookend guard (contract 2).
+        let payloads: Vec<&serde_json::Value> =
+            emitter.records.iter().filter_map(|r| r.payload.as_ref()).collect();
+        assert!(payloads.iter().any(|p| p["step_id"] == "verify" && p["status"] == "started"));
+        assert!(payloads.iter().any(|p| p["step_id"] == "verify" && p["status"] == "finished"));
+        assert_eq!(payloads.iter().filter(|p| p["stage"] == "verify").count(), 3);
+    }
+
+    /// A crew WITHOUT the seat is byte-identical to today: no verify step,
+    /// no verify records, and the serialized envelope carries none of the
+    /// verify fields.
+    #[test]
+    fn crew_without_verify_seat_is_unchanged() {
+        let crew = valid_crew();
+        let inputs = inputs_for(&crew, 500_000);
+        let mut cycler = RecordingCycler::new();
+        let mut chat = |call: &ChatCall| {
+            if call.model == "darkmux:judge-model" {
+                Ok(reply(CONFIRM_JSON))
+            } else {
+                Ok(reply("a real defect `const end = start.plus(30)`"))
+            }
+        };
+        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+        assert!(env.judged.iter().all(|j| j.verify.is_none()));
+        assert!(!env.steps.iter().any(|s| s.step_id == "verify"));
+        assert!(!env.members.iter().any(|m| m.seat == "review-verify"));
+        let value = serde_json::to_value(&env).unwrap();
+        assert!(value.get("verified").is_none(), "zero verified never serializes");
+        assert!(value.get("refuted").is_none());
+        assert!(value["staffing"].get("verify").is_none());
+        for j in value["judged"].as_array().unwrap() {
+            assert!(j.get("verify").is_none());
+            assert!(j.get("demoted_by_verify").is_none());
+        }
+    }
+
+    /// Zero confirms ⇒ the verify stage never dispatches at all — no step,
+    /// no member row, no call (the scripted closure would panic on one).
+    #[test]
+    fn verify_stage_skips_entirely_on_zero_confirms() {
+        let crew = crew_with(vec![
+            ("review-probe", vec![staffing("fast", "probe-model", 1)]),
+            ("review-judge", vec![staffing("fast", "judge-model", 1)]),
+            ("review-verify", vec![staffing("frontier", "verify-model", 1)]),
+        ]);
+        let inputs = inputs_for(&crew, 500_000);
+        let mut cycler = RecordingCycler::new();
+        let mut chat = |call: &ChatCall| {
+            assert_ne!(call.model, "darkmux:verify-model", "no confirms ⇒ no verify dispatch");
+            if call.model == "darkmux:judge-model" {
+                Ok(reply(FP_JSON))
+            } else {
+                Ok(reply("a real defect"))
+            }
+        };
+        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+        assert_eq!(env.confirmed, 0);
+        assert!(!env.steps.iter().any(|s| s.step_id == "verify"));
+        assert!(!env.members.iter().any(|m| m.seat == "review-verify"));
+        assert!(!cycler.log.iter().any(|e| e.contains("verify-model")));
+    }
+
+    /// A REMOTE verify seat draws from its own execution bucket, and
+    /// exhausting it is LOAD-BEARING: honest degraded run, never a silent
+    /// pass — the skipped flags keep their marker via an Error record with
+    /// the reason named.
+    #[test]
+    fn remote_verify_budget_exhaustion_is_an_honest_degraded_run() {
+        let crew = crew_with(vec![
+            ("review-probe", vec![staffing("fast", "probe-model", 1)]),
+            ("review-judge", vec![staffing("fast", "judge-model", 1)]),
+            ("review-verify", vec![remote_staffing("frontier", "gpt-verify", 1)]),
+        ]);
+        let mut inputs = inputs_for(&crew, 100); // one 600-token adjudication exhausts it
+        inputs.bundles = Some(vec![bundle_input("a.ts"), bundle_input("b.ts")]);
+        let mut cycler = RecordingCycler::new();
+        let mut chat = |call: &ChatCall| {
+            if call.endpoint.is_some() {
+                Ok(SingleShotReply {
+                    content: VERIFIED_JSON.to_string(),
+                    total_tokens: Some(600),
+                    model: None,
+                })
+            } else if call.model == "darkmux:judge-model" {
+                Ok(reply(CONFIRM_JSON))
+            } else {
+                Ok(reply("a real defect"))
+            }
+        };
+        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+        let reason = env.degenerate.as_deref().expect("verify exhaustion degrades the run");
+        assert!(reason.contains("remote verify token budget exhausted"), "got: {reason}");
+        let rec = env.remote_budgets.iter().find(|r| r.stage == "verify").expect("verify budget row");
+        assert!(rec.exhausted);
+        assert_eq!(rec.skipped_calls, 1);
+        // The skipped flag stayed Confirmed (marker downstream) with the
+        // reason named per-flag.
+        let skipped = env
+            .judged
+            .iter()
+            .find(|j| matches!(&j.verify, Some(v) if v.ruling == VerifyRuling::Error))
+            .expect("skipped adjudication recorded as Error");
+        assert_eq!(skipped.tier, Tier::Confirmed);
+        assert!(skipped.verify.as_ref().unwrap().note_for_author.contains("remote token budget exhausted"));
+        // The verify member is marked remote with the bare model id.
+        let member = env.members.iter().find(|m| m.seat == "review-verify").unwrap();
+        assert!(member.remote);
+        assert_eq!(member.model, "gpt-verify");
+        // No cycler traffic for a remote verify seat.
+        assert!(!cycler.log.iter().any(|e| e.contains("gpt-verify")));
+    }
+
+    /// The verify seat's staffing shape is validated like the judge's:
+    /// exactly one staffing when declared; absent is fine (optional seat).
+    #[test]
+    fn validate_funnel_crew_verify_seat_shape() {
+        let ok = crew_with(vec![
+            ("review-probe", vec![staffing("fast", "a", 1)]),
+            ("review-judge", vec![staffing("fast", "b", 1)]),
+            ("review-verify", vec![staffing("frontier", "c", 1)]),
+        ]);
+        let seats = validate_funnel_crew(&ok).expect("verify seat accepted");
+        assert!(seats.verify.is_some());
+
+        let absent = valid_crew();
+        assert!(validate_funnel_crew(&absent).expect("optional").verify.is_none());
+
+        let two = crew_with(vec![
+            ("review-probe", vec![staffing("fast", "a", 1)]),
+            ("review-judge", vec![staffing("fast", "b", 1)]),
+            ("review-verify", vec![staffing("frontier", "c", 1), staffing("frontier", "d", 1)]),
+        ]);
+        let err = validate_funnel_crew(&two).unwrap_err().to_string();
+        assert!(err.contains("review-verify"), "{err}");
+        assert!(err.contains("EXACTLY 1"), "{err}");
     }
 
     /// Local-only runs serialize with none of the #1260 fields — the

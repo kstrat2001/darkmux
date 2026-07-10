@@ -53,6 +53,11 @@ const BUILTIN_ROLES: &[(&str, &str)] = &[
     // container-free single-shot chat primitive, never the agent loop.
     ("review-probe", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/review-probe.json"))),
     ("review-judge", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/review-judge.json"))),
+    // (#1260/#1177) Optional fourth funnel seat: one adjudication call per
+    // double-confirmed finding (in practice staffed by a frontier endpoint).
+    // Same tool-less, no-output_schema, bail-with-explanation shape as
+    // review-judge — dispatched through the single-shot chat primitive.
+    ("review-verify", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/review-verify.json"))),
     ("analyst", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/analyst.json"))),
     ("voice-editor", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/voice-editor.json"))),
     ("design-reviewer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/design-reviewer.json"))),
@@ -105,6 +110,10 @@ pub(crate) const BUILTIN_ROLE_PROMPTS: &[(&str, &str)] = &[
     // (see the role JSON descriptions above for provenance).
     ("review-probe", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/review-probe.md"))),
     ("review-judge", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/review-judge.md"))),
+    // (#1260) The verify seat's persona — frozen text (contract 6): the
+    // byte-lock golden lives beside the other funnel-seat goldens in
+    // `darkmux-lab`'s funnel tests (`verify_prompt_matches_frozen_golden`).
+    ("review-verify", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/review-verify.md"))),
     ("mission-compiler", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/mission-compiler.md"))),
     ("analyst", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/analyst.md"))),
     ("design-reviewer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/design-reviewer.md"))),
@@ -879,6 +888,61 @@ mod tests {
             assert!(
                 judge_prompt.contains(needle),
                 "dialectic-judge.md must contain {needle:?} (#1222 contract)"
+            );
+        }
+    }
+
+    /// (#1260/#1177) The review-verify seat's contract, pinned — following
+    /// review-judge's pattern exactly:
+    /// - deliberately TOOL-LESS with an EXPLICIT deny list (an empty
+    ///   palette silently grants the full catalog — the #1197 bench-role
+    ///   rule); verification is scoped to the provided bundle evidence.
+    /// - NO output_schema (reason-freely-then-one-fenced-JSON keeps
+    ///   reasoning room open — a JSON-only grammar suppresses it).
+    /// - The prompt must carry the three-word ruling vocabulary
+    ///   ({verified, refuted, uncertain}), the evidence-scope directive,
+    ///   the refute-first posture, and the fenced-JSON contract's keys.
+    #[test]
+    fn review_verify_seat_contract() {
+        let role = load_roles()
+            .expect("builtin roles load")
+            .into_iter()
+            .find(|r| r.id == "review-verify")
+            .expect("review-verify must be embedded");
+        assert!(
+            role.output_schema.is_none(),
+            "review-verify must NOT declare an output_schema — the contract is \
+             reason-then-fenced-JSON so reasoning models keep their room (#1260)"
+        );
+        assert!(
+            role.tool_palette.allow.is_empty(),
+            "review-verify is tool-less by design — it rules on the provided evidence"
+        );
+        for denied in ["read", "write", "edit", "exec", "process", "update_plan"] {
+            assert!(
+                role.tool_palette.deny.iter().any(|t| t == denied),
+                "review-verify must EXPLICITLY deny {denied:?} — an empty palette \
+                 silently grants the full catalog (#1197 bench-role rule)"
+            );
+        }
+        let prompt = BUILTIN_ROLE_PROMPTS
+            .iter()
+            .find(|(id, _)| *id == "review-verify")
+            .map(|(_, c)| *c)
+            .expect("review-verify prompt must be embedded");
+        for needle in [
+            "\"verified\"",
+            "\"refuted\"",
+            "\"uncertain\"",
+            "Verify ONLY what the provided evidence proves",
+            "refute the finding first",
+            "decisive_evidence",
+            "note_for_author",
+            "exactly one fenced JSON block",
+        ] {
+            assert!(
+                prompt.contains(needle),
+                "review-verify.md must contain {needle:?} (#1260 contract)"
             );
         }
     }

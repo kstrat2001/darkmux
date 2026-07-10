@@ -700,6 +700,9 @@ struct FunnelCtx {
     exec_mode: super::funnel::ExecMode,
     probe_system: String,
     judge_system: String,
+    /// (#1260) The verify seat's persona — resolved unconditionally (the
+    /// role is embedded); only dispatched when the crew declares the seat.
+    verify_system: String,
     bundler_cmd: Option<String>,
 }
 
@@ -756,11 +759,15 @@ fn resolve_funnel_ctx(opts: &ReviewBenchOpts) -> Result<FunnelCtx> {
     let judge_system = darkmux_crew::loader::role_prompt("review-judge").ok_or_else(|| {
         anyhow!("darkmux: role \"review-judge\" has no system prompt (missing review-judge.md)")
     })?;
+    let verify_system = darkmux_crew::loader::role_prompt("review-verify").ok_or_else(|| {
+        anyhow!("darkmux: role \"review-verify\" has no system prompt (missing review-verify.md)")
+    })?;
     Ok(FunnelCtx {
         crew,
         exec_mode,
         probe_system,
         judge_system,
+        verify_system,
         bundler_cmd: opts.bundler_cmd.clone(),
     })
 }
@@ -944,6 +951,7 @@ fn run_funnel_case(
         mode: ctx.exec_mode,
         probe_system: &ctx.probe_system,
         judge_system: &ctx.judge_system,
+        verify_system: &ctx.verify_system,
         // (#1222 Phase B packet 5 reconciliation) The real bundler's output,
         // via the injection seam `FunnelInputs::bundles` — `run_funnel`
         // never falls back to the provisional `bundles_from_diff` when this
@@ -2450,6 +2458,8 @@ mod tests {
             pass2: None,
             tier,
             demoted_by_pass2: false,
+            verify: None,
+            demoted_by_verify: false,
         }
     }
 
@@ -2982,6 +2992,7 @@ mod tests {
             exec_mode,
             probe_system: "probe system prompt".into(),
             judge_system: "judge system prompt".into(),
+            verify_system: "verify system prompt".into(),
             bundler_cmd,
         }
     }
