@@ -1340,19 +1340,30 @@ const MAX_LAB_EVENTS_READ_BYTES: usize = 2 << 20; // 2 MiB
 
 /// Resolve + SECURITY-CHECK a `dir` query param against `lab_dir`. Returns
 /// the joined, containment-verified path when `dir` resolves strictly inside
-/// `lab_dir` (no absolute override, no `..` component, no symlink escape);
-/// `None` otherwise. Every `/lab/*` endpoint that takes a `dir` param MUST
-/// go through this before touching the filesystem — a read-only route is
-/// still a path-traversal surface if unchecked.
+/// (or IS exactly) `lab_dir` — no absolute override, no `..` component, no
+/// symlink escape; `None` otherwise. Every `/lab/*` endpoint that takes a
+/// `dir` param MUST go through this before touching the filesystem — a
+/// read-only route is still a path-traversal surface if unchecked.
+///
+/// `dir == ""` resolves to `lab_dir` ITSELF, not a rejection: a matched run
+/// at `lab_dir`'s own root (an operator pointing `--lab-dir` directly at one
+/// run's folder, or a stray marker file left there — see
+/// `scan_lab_runs_a_stray_marker_at_lab_dir_root_does_not_hide_nested_runs`)
+/// gets `""` as its `dir` from `build_lab_run_summary`'s `strip_prefix`, and
+/// that identifier has to round-trip back through here or that run is
+/// listed but permanently un-drillable (QA finding, #1247 PR review round).
 ///
 /// The string-shape checks (absolute path, `..` component) are defense in
 /// depth and give a cheap, explicit rejection; the REAL boundary is
 /// `worktree_contained`'s canonicalize + prefix check below, which is what
 /// catches a symlink inside `lab_dir` pointing outside it (a pure string
 /// check can't — canonicalize resolves the link to its real target before
-/// the prefix comparison).
+/// the prefix comparison). `lab_dir.join("")` is `lab_dir` unchanged, so an
+/// empty `dir` still passes through the SAME containment check as any other
+/// value (`worktree_contained` trivially holds for a path against itself) —
+/// no separate code path, no separate risk surface.
 fn resolve_lab_run_dir(lab_dir: &StdPath, dir: &str) -> Option<PathBuf> {
-    if dir.is_empty() || StdPath::new(dir).is_absolute() {
+    if StdPath::new(dir).is_absolute() {
         return None;
     }
     if StdPath::new(dir)
@@ -6054,9 +6065,13 @@ mod tests {
     }
 
     #[test]
-    fn resolve_lab_run_dir_rejects_empty() {
+    fn resolve_lab_run_dir_empty_resolves_to_lab_dir_itself() {
+        // QA finding (#1247 PR review round): a run matched AT `lab_dir`'s
+        // own root gets `""` as its `dir` — that identifier must round-trip
+        // back to `lab_dir`, or such a run is listed but permanently
+        // un-drillable (a 400 on every detail/events request).
         let tmp = TempDir::new().unwrap();
-        assert_eq!(resolve_lab_run_dir(tmp.path(), ""), None);
+        assert_eq!(resolve_lab_run_dir(tmp.path(), ""), Some(tmp.path().to_path_buf()));
     }
 
     #[test]
@@ -6330,6 +6345,36 @@ mod tests {
         assert_eq!(funnels.len(), 1);
         assert_eq!(funnels[0]["case_id"], "demo-case-a");
         assert_eq!(json["scores"]["provenance"]["profile"], "demo-profile");
+    }
+
+    #[tokio::test]
+    async fn lab_run_detail_handler_resolves_a_run_matched_at_lab_dir_root() {
+        // QA finding (#1247 PR review round): `lab_dir` ITSELF matching the
+        // run-cluster criteria (an operator pointing `--lab-dir` at one
+        // run's folder, or a stray marker left at the root) gets `dir: ""`
+        // from `/lab/runs` — that identifier must actually be drillable, not
+        // a permanent 400.
+        let flows = TempDir::new().unwrap();
+        let lab = TempDir::new().unwrap();
+        write_synthetic_funnel_run(lab.path(), "demo-case-root", "demo-crew");
+        let app = build_router_full(
+            flows.path().to_path_buf(),
+            worktrees_base_dir(),
+            Some(lab.path().to_path_buf()),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/lab/run/detail?dir=")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["funnels"].as_array().unwrap()[0]["case_id"], "demo-case-root");
     }
 
     #[tokio::test]
