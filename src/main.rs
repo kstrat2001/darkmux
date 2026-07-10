@@ -1051,6 +1051,22 @@ enum ModelCmd {
     /// validated recommendation (pending-bake-off or no-recommendation
     /// status). (#159)
     PullRecommended,
+    /// Global memory ledger (#1286): per resident model, POTENTIAL (the
+    /// commitment — weights + KV cache at the loaded ctx + transient
+    /// margin) vs CURRENT (observed inference-worker footprint), color-
+    /// stated green / amber ("made it by luck" — under the limit only
+    /// because lazy allocation hasn't materialized; names the config
+    /// shrink to reach green) / red (over the limit or memory pressure
+    /// active), plus machine pressure rows (swap, compressor,
+    /// memory-pressure free%). Read-only: kernel counters + lms metadata
+    /// calls only — zero model dispatches; the output stamps the gather's
+    /// own cost. The same data serves live at the daemon's
+    /// GET /machine/memory (the viewer's machine lens).
+    Ledger {
+        /// Emit machine-readable JSON instead of the table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3327,7 +3343,22 @@ fn cmd_model(sub: ModelCmd) -> Result<i32> {
         ModelCmd::Status { json } => cmd_model_status(json),
         ModelCmd::Eject { dry_run } => cmd_model_eject(dry_run),
         ModelCmd::PullRecommended => cmd_model_pull_recommended(),
+        ModelCmd::Ledger { json } => cmd_model_ledger(json),
     }
+}
+
+/// `darkmux model ledger` (#1286) — the no-viewer twin of the machine lens:
+/// one bounded gather (lms metadata + kernel counters, zero model
+/// dispatches), rendered as a table or emitted as the same JSON shape the
+/// serve daemon's /machine/memory returns.
+fn cmd_model_ledger(json: bool) -> Result<i32> {
+    let ledger = darkmux_profiles::model_ledger::gather();
+    if json {
+        println!("{}", serde_json::to_string_pretty(&ledger)?);
+    } else {
+        print!("{}", darkmux_profiles::model_ledger::render_human(&ledger));
+    }
+    Ok(0)
 }
 
 fn cmd_model_status(json: bool) -> Result<i32> {

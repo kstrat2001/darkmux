@@ -154,6 +154,46 @@
   .labfeedrow.ruling.false_positive .labfeedtext,.labfeedrow.ruling.error .labfeedtext{color:var(--bad)}
   .labfeedrow.task{font-weight:600}
 
+  /* (#1286) Machine memory lens — the live potential-vs-current ledger.
+     MOBILE-FIRST like the lab lens: single column, full-width bars, no fixed
+     widths (the operator watches from a phone over the tailnet); the media
+     query below only adds touch-target sizing. Shares the lab lens's
+     full-width no-flow-chrome reflow via its own body class. */
+  body.machine-mode .log,body.machine-mode .split,body.machine-mode .scrub{display:none}
+  body.machine-mode .wrap{display:block;height:auto}
+  body.machine-mode .stage{padding:16px 16px 32px}
+  .memwrap{display:flex;flex-direction:column;gap:12px;margin-top:10px;max-width:760px}
+  .memcard{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 14px}
+  .memcard.green{border-color:var(--good)}
+  .memcard.amber{border-color:var(--warn)}
+  .memcard.red{border-color:var(--bad)}
+  .memhdr{display:flex;flex-wrap:wrap;align-items:baseline;gap:8px;margin-bottom:4px}
+  .memname{font:600 12px 'JetBrains Mono',monospace;color:var(--text);overflow-wrap:anywhere}
+  .memowner{font:600 9px 'JetBrains Mono',monospace;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);border:1px solid var(--line);border-radius:3px;padding:2px 5px;flex:0 0 auto}
+  .memstate{font:600 10px 'JetBrains Mono',monospace;letter-spacing:.06em;text-transform:uppercase;padding:2px 7px;border-radius:3px;border:1px solid var(--line);color:var(--muted);margin-left:auto;flex:0 0 auto}
+  .memstate.green{color:var(--good);border-color:var(--good)}
+  .memstate.amber{color:var(--warn);border-color:var(--warn)}
+  .memstate.red{color:var(--bad);border-color:var(--bad)}
+  /* current fill INSIDE the potential outline (#1286 chart shape) */
+  .membar{position:relative;height:26px;border:1px solid var(--line);border-radius:5px;background:var(--bg2);overflow:hidden;margin:6px 0 4px}
+  .membar .pot{position:absolute;left:0;top:0;bottom:0;background:rgba(255,255,255,.05);border-right:2px dashed var(--muted)}
+  .membar .cur{position:absolute;left:0;top:0;bottom:0;opacity:.55}
+  .membar .cur.green{background:var(--good)}
+  .membar .cur.amber{background:var(--warn)}
+  .membar .cur.red{background:var(--bad);opacity:.65}
+  .membar .cur.unknown{background:var(--muted);opacity:.3}
+  .membar .lim{position:absolute;top:0;bottom:0;width:2px;background:var(--amber)}
+  .membar .poolline{position:absolute;top:0;bottom:0;width:2px;background:var(--muted);opacity:.7}
+  .memmeta{font:11px/1.5 'JetBrains Mono',monospace;color:var(--muted);overflow-wrap:anywhere}
+  .memhint{font:11px/1.4 'JetBrains Mono',monospace;color:var(--warn);border-left:2px solid var(--warn);padding:2px 0 2px 8px;margin-top:6px;overflow-wrap:anywhere}
+  .memrow{display:flex;flex-wrap:wrap;gap:8px;font:11px/1.6 'JetBrains Mono',monospace}
+  .memrow .k{color:var(--muted);min-width:118px}
+  .memrow .v{color:var(--text);overflow-wrap:anywhere}
+  .memrow .v.bad{color:var(--bad);font-weight:600}
+  .memfoot{font:10px/1.6 'JetBrains Mono',monospace;color:var(--muted);overflow-wrap:anywhere}
+  .memwarn{font:11px/1.5 'JetBrains Mono',monospace;color:var(--warn);overflow-wrap:anywhere}
+  @media(max-width:768px){.membar{height:34px}}
+
   /* (#827) fleet | missions lens toggle — two co-equal views of the fleet */
   .lenstabs{display:inline-flex;border:1px solid var(--line);border-radius:5px;overflow:hidden}
   .lens{font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);padding:5px 11px;cursor:pointer;text-decoration:none;background:none}
@@ -636,7 +676,7 @@
 </div>
 <div class="catpanel" id="catpanel" hidden></div>
 <div class="crumbbar">
-  <span class="lenstabs"><a class="lens" id="lens-fleet" data-act="fleet">fleet</a><a class="lens" id="lens-missions" data-act="missions">missions</a><a class="lens" id="lens-lab" data-act="lab">lab</a></span>
+  <span class="lenstabs"><a class="lens" id="lens-fleet" data-act="fleet">fleet</a><a class="lens" id="lens-missions" data-act="missions">missions</a><a class="lens" id="lens-lab" data-act="lab">lab</a><a class="lens" id="lens-machine" data-act="machinemem">machine</a></span>
   <span class="crumb" id="crumb"></span>
   <span class="meta" id="meta"></span>
 </div>
@@ -2141,19 +2181,29 @@ function renderCrumb(){
   // detail; everything else is the fleet lens.
   const inMissions = state.level==="missions"||state.level==="mission";
   const inLab = state.level==="lab"||state.level==="lab-run";
-  const lf=$("lens-fleet"), lm=$("lens-missions"), ll=$("lens-lab");
-  if(lf)lf.className="lens"+((inMissions||inLab)?"":" on");
+  // (#1286) The machine memory lens — live probes (kernel counters + lms
+  // metadata via /machine/memory), a third source class distinct from run
+  // artifacts (lab) and flow records (fleet/missions).
+  const inMachineMem = state.level==="machinemem";
+  const lf=$("lens-fleet"), lm=$("lens-missions"), ll=$("lens-lab"), lmm=$("lens-machine");
+  if(lf)lf.className="lens"+((inMissions||inLab||inMachineMem)?"":" on");
   if(lm)lm.className="lens"+(inMissions?" on":"");
   if(ll)ll.className="lens"+(inLab?" on":"");
+  if(lmm)lmm.className="lens"+(inMachineMem?" on":"");
   // (#1247 Part 3) The lab lens is a SEPARATE machine-local room, not a rung
   // of the fleet drill ladder ("two doors, one viewer, distinct questions" —
   // operator direction) — it has no time-scrubbing story, so the flow-record
   // chrome (event log, detail pane, playback scrub bar) is irrelevant and
   // hidden via this class (see the `.lab-mode` CSS block).
   document.body.classList.toggle("lab-mode", inLab);
+  // (#1286) Same reflow for the machine lens — its own class, same rules.
+  document.body.classList.toggle("machine-mode", inMachineMem);
   // (#1247 deep-link) Every navigation path lands here, so this is the ONE
-  // place the address bar is kept in sync with the lab view.
-  syncLabHash(inLab);
+  // place the address bar is kept in sync with the lab/machine view.
+  syncLabHash(inLab, inMachineMem);
+  if(inMachineMem){
+    $("crumb").innerHTML=`<a data-act="machinemem">machine</a>`; return;
+  }
   if(inLab){
     let lc=`<a data-act="lab">lab</a>`;
     if(state.level==="lab-run") lc+=`<span class="sep">›</span>${esc(state.labRunDir||"—")}`;
@@ -2191,6 +2241,13 @@ function render(){
   if(state.level==="lab"||state.level==="lab-run"){
     renderCrumb();
     renderLab();
+    return;
+  }
+  // (#1286) The machine memory lens skips the flow-scoped machinery the
+  // same way — probe-fed, no time axis, no filters.
+  if(state.level==="machinemem"){
+    renderCrumb();
+    renderMachineMem();
     return;
   }
   if(state.level==="missions")renderMissionsIndex(); else if(state.level==="mission")renderMission(); else if(state.level==="fleet")renderFleet(); else if(state.level==="machine")renderMachine(); else if(state.level==="loose")renderLoose(); else renderSubsystem();
@@ -2514,6 +2571,8 @@ const ACTIONS={
   // (#1247 Part 3) The lab observer lens.
   lab:()=>goLab(),
   labrun:a=>drillLabRun(a),
+  // (#1286) The machine memory lens.
+  machinemem:()=>goMachineMem(),
 };
 // (#1090) Shared dispatch for the delegated drill-nav — invoked by BOTH the
 // click handler and the keyboard handler below, so cards are mouse- AND
@@ -2772,13 +2831,15 @@ function labQuery(){
 // untouched; a bare `#<date>` hash (not key=value shaped — URLSearchParams
 // would mangle it to `<date>=`) is dropped rather than corrupted, per the
 // boot-only-input note on labQuery.
-function syncLabHash(inLab){
+// (#1286) `inMachineMem` rides the same chokepoint: the machine lens writes
+// `lens=machine` (no `run` param) so the phone view is bookmarkable too.
+function syncLabHash(inLab, inMachineMem){
   const raw=(location.hash||"").replace(/^#/,"");
   const isBareDate=/^\d{4}-\d{2}-\d{2}$/.test(raw);
-  if(!inLab){
-    // Outside the lab lens, only touch the hash when it carries lab params
-    // to REMOVE — a bare-date or #mission=/#session= hash the operator
-    // arrived with stays put (renderCrumb repaints every view; an
+  if(!inLab&&!inMachineMem){
+    // Outside the lab/machine lenses, only touch the hash when it carries
+    // lens params to REMOVE — a bare-date or #mission=/#session= hash the
+    // operator arrived with stays put (renderCrumb repaints every view; an
     // unconditional rewrite here would clear #<date> on the first fleet
     // render after boot).
     if(!raw||isBareDate)return;
@@ -2790,12 +2851,26 @@ function syncLabHash(inLab){
     return;
   }
   const p=isBareDate?new URLSearchParams():new URLSearchParams(raw);
-  p.set("lens","lab");
-  if(state.level==="lab-run"&&state.labRunDir!=null)p.set("run",state.labRunDir);
-  else p.delete("run");
+  if(inMachineMem){
+    p.set("lens","machine");p.delete("run");
+  }else{
+    p.set("lens","lab");
+    if(state.level==="lab-run"&&state.labRunDir!=null)p.set("run",state.labRunDir);
+    else p.delete("run");
+  }
   const next=p.toString();
   if(next===raw)return;
   history.replaceState(null,"","#"+next);
+}
+// (#1286 deep-link) `#lens=machine` (or `?lens=machine`) boots straight into
+// the machine memory lens — same URLSearchParams-over-hash parsing as
+// labQuery. `lens` is a single value, so lab/machine can't conflict; a
+// `#mission=`/`#session=` replay query alongside is contradictory and the
+// lens half is honored (same precedence rule as the lab lens).
+function machineQuery(){
+  const p=new URLSearchParams(location.search);
+  const h=new URLSearchParams((location.hash||"").replace(/^#/,""));
+  return (p.get("lens")||h.get("lens")||"").trim()==="machine";
 }
 
 function todayUTC(){return new Date().toISOString().slice(0,10);}
@@ -2915,6 +2990,10 @@ function stageSig(){
     return "s|"+state.machine+"|"+state.session+"|"+sd;
   }
   if(state.level==="loose")return null;  // (#691) live records list: full-render each tick
+  // (#1286) The machine lens is probe-fed on its own 5s poll — flow-record
+  // ticks must never rebuild it (its own poll gates re-renders on a
+  // structural signature; see pollMachineMem).
+  if(state.level==="machinemem")return "machinemem";
   return "mission";
 }
 // (#691) Fetch yesterday + today's flow records and keep only the last
@@ -3162,9 +3241,12 @@ async function boot(){
   // (the two are contradictory boot intents; the lab half is honored, so cq
   // is skipped and the normal live/playback flow load proceeds underneath).
   const lq = labQuery();
+  // (#1286 deep-link) `#lens=machine` — same separate-room precedence as the
+  // lab lens (`lens` is single-valued, so lab and machine can't both match).
+  const mq = machineQuery();
   // (#691) Replay-by-query applies only against a daemon (the static demo has no
   // catalog endpoints). A mission/session query forces playback of that thing.
-  const cq = (flowSrc||lq) ? null : catalogQuery();
+  const cq = (flowSrc||lq||mq) ? null : catalogQuery();
   let date=injectedDate||targetDate();
   // Playback mode is daemon-controlled (or static-flow-src driven): it forces
   // "play" regardless of whether the date happens to be today, and SSE is
@@ -3250,6 +3332,8 @@ async function boot(){
   // that run's detail; an unresolvable run falls back to the run list with a
   // notice inside drillLabRun.
   if(lq){ if(lq.run!=null) drillLabRun(lq.run); else goLab(); }
+  // (#1286 deep-link) Boot straight into the machine memory lens.
+  else if(mq){ goMachineMem(); }
 }
 // ── Lab observer lens (#1247 Part 3) ────────────────────────────────────
 //
@@ -3594,6 +3678,169 @@ function renderLabRun(){
 }
 function renderLab(){
   if(state.level==="lab-run") renderLabRun(); else renderLabRunsList();
+}
+
+// ── Machine memory lens (#1286) ─────────────────────────────────────────
+//
+// The live machine-scope answer to "what is the machine doing NOW": every
+// resident model with its ledger pair — POTENTIAL (weights + KV commitment
+// at the loaded ctx + margin: what the config CAN grow to) vs CURRENT
+// (observed inference-worker footprint) — color-coded green / amber ("made
+// it by luck") / red, plus the unified-memory pressure rows.
+//
+// Data-source class (#1286 boundary hygiene): fed by THIS daemon's
+// /machine/memory — live probes (kernel counters + lms metadata), a third
+// source class distinct from run artifacts (lab lens) and the flow stream
+// (fleet lenses). Read-only; never flow records. The observer-effect
+// constraints hold structurally here: the daemon's gather costs zero model
+// dispatches and stamps its own cost (`gather_ms`, rendered below), and the
+// chart renders on THIS client — off the measured machine when the operator
+// watches from a phone over the tailnet, which is the designed posture.
+let MACHINE_MEM=null;        // last /machine/memory payload
+let MACHINE_MEM_ERR=false;   // daemon unreachable / non-200
+let MACHINE_MEM_SIG=null;    // structural signature — the re-render gate
+let MACHINE_MEM_POLLING=false;
+const MACHINE_MEM_POLL_MS=5000; // client cadence (server caches ~2s; both recorded)
+
+window.goMachineMem=()=>{
+  state.level="machinemem"; state.machine=null; state.session=null;
+  MACHINE_MEM_SIG=null; // force the first paint of this visit
+  render();
+  if(!MACHINE_MEM_POLLING) pollMachineMem();
+};
+// Poll-based (NEVER SSE — the #1227 stuck-stream lesson), self-rescheduling
+// like pollLabEvents: each tick checks it's still the current lens before
+// fetching and before scheduling, so navigating away cleanly stops the loop.
+async function pollMachineMem(){
+  if(state.level!=="machinemem"){ MACHINE_MEM_POLLING=false; return; }
+  MACHINE_MEM_POLLING=true;
+  try{
+    const r=await fetch("/machine/memory",{headers:{accept:"application/json"}});
+    if(r.ok){ MACHINE_MEM=await r.json(); MACHINE_MEM_ERR=false; }
+    else MACHINE_MEM_ERR=true;
+  }catch(_){ MACHINE_MEM_ERR=true; }
+  if(state.level!=="machinemem"){ MACHINE_MEM_POLLING=false; return; } // navigated away mid-fetch
+  // The stageSig()/re-render-gap discipline: the structural signature
+  // EXCLUDES the always-changing stamps (generated_at_ms / gather_ms), so a
+  // poll that changes nothing rebuilds nothing — the volatile stamp line
+  // refreshes in place instead. MACHINE_MEM_ERR is IN the signature: a
+  // daemon going unreachable (or coming back) with a cached payload on
+  // screen must repaint so the stale banner appears/clears — a silently
+  // frozen gauge is the observability failure this lens exists to prevent.
+  const b=MACHINE_MEM||{};
+  const sig=MACHINE_MEM_ERR&&!MACHINE_MEM ? "err"
+    : JSON.stringify([MACHINE_MEM_ERR,b.models,b.machine,b.pressure,b.pool,b.limit_bytes,b.limit_source,b.attribution,b.attribution_note,b.warnings]);
+  if(sig!==MACHINE_MEM_SIG){ MACHINE_MEM_SIG=sig; renderMachineMem(); }
+  else refreshMachineMemStamp();
+  setTimeout(pollMachineMem, MACHINE_MEM_POLL_MS);
+}
+function memBytes(b){
+  if(b==null) return "—";
+  b=Number(b);
+  if(!isFinite(b)) return "—";
+  if(b>=1e9) return (b/1e9).toFixed(2)+" GB";
+  if(b>=1e6) return Math.round(b/1e6)+" MB";
+  if(b>=1e3) return Math.round(b/1e3)+" KB";
+  return b+" B";
+}
+function memPct(part, scale){
+  if(part==null||!scale) return 0;
+  return Math.max(0, Math.min(100, (Number(part)/scale)*100));
+}
+function memStateCls(s){ return (s==="green"||s==="amber"||s==="red") ? s : "unknown"; }
+// One bar: current fill INSIDE the potential outline, optional limit tick
+// (#1243 budget / pool fallback) + physical-pool tick when it differs from
+// the limit (i.e. once a budget is configured below the pool).
+function memBar(cur, pot, scale, stateCls, limit, poolCap){
+  const potW=memPct(pot, scale), curW=memPct(cur, scale);
+  const lim=(limit!=null&&scale)?`<span class="lim" style="left:${memPct(limit,scale).toFixed(2)}%"></span>`:"";
+  const pl=(poolCap!=null&&scale&&poolCap!==limit)?`<span class="poolline" style="left:${memPct(poolCap,scale).toFixed(2)}%"></span>`:"";
+  return `<div class="membar">`
+    + (pot!=null?`<span class="pot" style="width:${potW.toFixed(2)}%"></span>`:"")
+    + (cur!=null?`<span class="cur ${memStateCls(stateCls)}" style="width:${curW.toFixed(2)}%"></span>`:"")
+    + lim + pl + `</div>`;
+}
+function memStampText(b){
+  return `gather ${b.gather_ms!=null?Number(b.gather_ms):"—"} ms (zero model dispatches) · server cache ${b.cache_ttl_ms!=null?Number(b.cache_ttl_ms):"—"} ms · polled every ${MACHINE_MEM_POLL_MS/1000}s`;
+}
+// In-place refresh of the volatile observer-cost line (no DOM rebuild).
+function refreshMachineMemStamp(){
+  const el=$("memstamp");
+  if(el&&MACHINE_MEM) el.textContent=memStampText(MACHINE_MEM);
+}
+function renderMachineMemModel(m, scale, limit){
+  const st=memStateCls(m.state);
+  const kv=m.kv_bytes_at_ctx!=null?`kv@ctx ${memBytes(m.kv_bytes_at_ctx)}`:"kv unknown (no arch facts)";
+  const hint=m.shrink_hint?`<div class="memhint">↳ ${esc(m.shrink_hint)}</div>`:"";
+  return `<div class="memcard ${st}">
+    <div class="memhdr"><span class="memname">${esc(m.identifier||m.model_key)}</span><span class="memowner">${esc(m.owner||"")}</span><span class="memstate ${st}">${esc(m.state||"unknown")}</span></div>
+    ${memBar(m.current_bytes, m.potential_bytes, scale, st, limit)}
+    <div class="memmeta">ctx ${esc(m.loaded_ctx)} · weights ${memBytes(m.weights_bytes)} · ${esc(kv)} · potential ${memBytes(m.potential_bytes)} · current ${memBytes(m.current_bytes)}</div>
+    ${hint}
+  </div>`;
+}
+function renderMachineMem(){
+  $("logscope").textContent="machine";
+  const hdr=`<div class="stagehdr">machine memory · potential vs current</div>`;
+  const b=MACHINE_MEM;
+  if(MACHINE_MEM_ERR&&!b){
+    $("stage").innerHTML=hdr+`<div class="none">daemon not reachable — the machine lens reads live probes via <code>/machine/memory</code> (CLI twin: <code>darkmux model ledger</code>).</div>`;
+    return;
+  }
+  if(!b){
+    $("stage").innerHTML=hdr+`<div class="none">loading…</div>`;
+    return;
+  }
+  // Cached payload but the daemon stopped answering: keep showing the last
+  // snapshot, but SAY it's stale — a silently frozen gauge would be the
+  // exact observability failure this lens exists to prevent.
+  const stale=MACHINE_MEM_ERR?`<div class="memwarn">⚠ daemon unreachable — showing the last snapshot; the figures below are stale</div>`:"";
+  const models=Array.isArray(b.models)?b.models:[];
+  const machine=b.machine||{};
+  const pressure=b.pressure||{};
+  const pool=b.pool||null;
+  const limit=b.limit_bytes!=null?Number(b.limit_bytes):null;
+  const poolCap=pool&&pool.capacity_bytes!=null?Number(pool.capacity_bytes):null;
+  // Per-model bars scale to the largest per-model figure so small models
+  // stay readable; the machine bar scales to the full physical pool (or the
+  // limit when the pool is unreadable) so BOTH the #1243 budget line and the
+  // pool line mean something and headroom is visible at a glance.
+  const perScale=Math.max(1,...models.map(m=>Math.max(Number(m.potential_bytes)||0, Number(m.current_bytes)||0)));
+  const mPot=machine.potential_bytes!=null?Number(machine.potential_bytes):null;
+  const mCur=machine.current_bytes!=null?Number(machine.current_bytes):null;
+  const mScale=Math.max(limit||0, poolCap||0, mPot||0, mCur||0, 1);
+  const mState=memStateCls(machine.state);
+  const limitDesc=b.limit_source==="budget"?"#1243 budget":b.limit_source==="physical_pool"?"physical pool (no budget configured)":"no limit readable";
+  const unpriced=Number(machine.unpriced_models)||0;
+  const machineCard=`<div class="memcard ${mState}">
+    <div class="memhdr"><span class="memname">machine total</span><span class="memstate ${mState}">${esc(machine.state||"unknown")}</span></div>
+    ${memBar(mCur, mPot, mScale, mState, limit, poolCap)}
+    <div class="memmeta">Σ potential ${memBytes(mPot)}${unpriced?` (+${unpriced} unpriced)`:""} · Σ current ${memBytes(mCur)} · limit ${memBytes(limit)} (${esc(limitDesc)})${pool?` · pool ${memBytes(pool.capacity_bytes)} / free ${memBytes(pool.available_bytes)}`:""}</div>
+    ${machine.shrink_hint?`<div class="memhint">↳ ${esc(machine.shrink_hint)}</div>`:""}
+  </div>`;
+  const modelCards=models.length
+    ? models.map(m=>renderMachineMemModel(m, perScale, null)).join("")
+    : `<div class="none">no models loaded.</div>`;
+  const freePct=pressure.memory_free_percent!=null?`${Number(pressure.memory_free_percent)}%`:"—";
+  const pressureCard=`<div class="memcard${pressure.red?" red":""}">
+    <div class="memhdr"><span class="memname">pressure</span>${pressure.red?`<span class="memstate red">red</span>`:""}</div>
+    <div class="memrow"><span class="k">swap used</span><span class="v${pressure.red?" bad":""}">${memBytes(pressure.swap_used_bytes)}</span></div>
+    <div class="memrow"><span class="k">compressor</span><span class="v">${memBytes(pressure.compressor_bytes)}</span></div>
+    <div class="memrow"><span class="k">memory free</span><span class="v${pressure.red?" bad":""}">${esc(freePct)}</span></div>
+  </div>`;
+  const warns=Array.isArray(b.warnings)&&b.warnings.length
+    ? `<div class="memcard"><div class="memhdr"><span class="memname">warnings</span></div>${b.warnings.map(w=>`<div class="memwarn">⚠ ${esc(w)}</div>`).join("")}</div>`
+    : "";
+  const attribution=`attribution: ${b.attribution_note||b.attribution||"—"}`;
+  $("stage").innerHTML=hdr+`<div class="memwrap">
+    ${stale}
+    ${machineCard}
+    ${modelCards}
+    ${pressureCard}
+    ${warns}
+    <div class="memfoot">${esc(attribution)}</div>
+    <div class="memfoot" id="memstamp">${esc(memStampText(b))}</div>
+  </div>`;
 }
 
 boot();

@@ -30,7 +30,9 @@
 //! structural at the adapter layer too.
 
 mod arch_facts;
-mod lms_host;
+// pub(crate): the #1286 memory ledger (`crate::model_ledger`) reuses the
+// bounded-run mechanics (`run_bounded`/`StdoutMode`) for its own probes.
+pub(crate) mod lms_host;
 mod mac_probe;
 
 pub use arch_facts::{ArchFactsRaw, ArchFactsReader};

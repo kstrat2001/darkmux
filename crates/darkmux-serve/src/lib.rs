@@ -247,6 +247,7 @@ pub(crate) fn build_router_full(
         .route("/flow-status", get(flow_status_handler))
         .route("/model/status", get(model_status_handler))
         .route("/machine/specs", get(machine_specs_handler))
+        .route("/machine/memory", get(machine_memory_handler))
         .route("/missions", get(missions_handler))
         .route("/sprints", get(sprints_handler))
         .route("/fleet/sessions/live", get(fleet_sessions_live_handler))
@@ -1866,6 +1867,84 @@ async fn model_status_handler() -> axum::Json<serde_json::Value> {
         "lms_unreachable": unreachable,
         "generated_at_ms": generated_at_ms,
     }))
+}
+
+/// (#1286) GET /machine/memory cache TTL. Computed on request with a short
+/// in-process cache so a phone-viewer poll burst costs ONE gather; the TTL
+/// is recorded in the payload (`cache_ttl_ms`) per the observer-effect
+/// constraint — cadence is a visible knob, never adaptive-silent.
+const MACHINE_MEMORY_CACHE_TTL: Duration = Duration::from_secs(2);
+static MACHINE_MEMORY_CACHE: std::sync::Mutex<Option<(std::time::Instant, serde_json::Value)>> =
+    std::sync::Mutex::new(None);
+
+/// Single-flight gate for the machine-memory gather (#1286): concurrent
+/// cold-cache requests serialize on this async lock so a phone-viewer poll
+/// burst costs exactly ONE gather, not one per request (the shell-out gather
+/// is the observer-cost the ledger is built to keep negligible). See the
+/// double-checked flow in [`machine_memory_handler`].
+fn machine_memory_gather_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// Fresh cached machine-memory payload, or `None` when absent/stale. The std
+/// mutex is held only for the clone — never across an `.await`.
+fn machine_memory_cached_fresh() -> Option<serde_json::Value> {
+    let guard = MACHINE_MEMORY_CACHE.lock().ok()?;
+    let (at, v) = guard.as_ref()?;
+    (at.elapsed() < MACHINE_MEMORY_CACHE_TTL).then(|| v.clone())
+}
+
+/// GET /machine/memory (#1286) — the live machine-scope memory ledger:
+/// resident models with potential-vs-current + color state, pool/limit
+/// lines, and the unified-memory pressure rows (swap / compressor /
+/// memory-pressure free%). Exactly `darkmux model ledger --json`, served —
+/// ONE implementation (`darkmux_profiles::model_ledger`) feeds both.
+///
+/// Data-source class note (#1286 boundary hygiene): this reads LIVE PROBES
+/// (lms metadata + kernel counters) — a third source class, distinct from
+/// run artifacts (lab lens) and the flow stream (fleet lenses). Read-only,
+/// zero model dispatches; the gather stamps its own cost (`gather_ms`)
+/// into the payload. Auth: rides the same remote-only bearer gate as every
+/// other route (loopback open, remote requires the token) — nothing extra
+/// here.
+///
+/// The gather shells out (bounded) — runs on the blocking pool. Best-effort
+/// contract like /machine/specs: probe failures degrade to `warnings` in
+/// the payload, never a 500.
+async fn machine_memory_handler() -> axum::Json<serde_json::Value> {
+    // Fast path: a fresh cache serves without touching the gather lock.
+    if let Some(v) = machine_memory_cached_fresh() {
+        return axum::Json(v);
+    }
+    // Single-flight (#1286): serialize cold-cache refreshers on the gather
+    // lock, then RE-CHECK the cache under it — a request that waited behind an
+    // in-flight gather returns that gather's fresh result instead of launching
+    // a second one, so a poll burst costs one gather.
+    let _permit = machine_memory_gather_lock().lock().await;
+    if let Some(v) = machine_memory_cached_fresh() {
+        return axum::Json(v);
+    }
+    let result = tokio::task::spawn_blocking(darkmux_profiles::model_ledger::gather).await;
+    let mut value = match result {
+        Ok(ledger) => serde_json::to_value(&ledger)
+            .unwrap_or_else(|_| serde_json::json!({"error": "ledger serialization failed"})),
+        Err(_) => serde_json::json!({
+            "error": "memory-ledger gather panicked",
+            "generated_at_ms": current_millis(),
+        }),
+    };
+    if let Some(obj) = value.as_object_mut() {
+        // Recorded cadence knob (#1286 observer constraint 4).
+        obj.insert(
+            "cache_ttl_ms".to_string(),
+            serde_json::json!(MACHINE_MEMORY_CACHE_TTL.as_millis() as u64),
+        );
+    }
+    if let Ok(mut guard) = MACHINE_MEMORY_CACHE.lock() {
+        *guard = Some((std::time::Instant::now(), value.clone()));
+    }
+    axum::Json(value)
 }
 
 /// GET /machine/specs — local-machine spec sheet for `darkmux fleet
@@ -3866,6 +3945,71 @@ mod tests {
         );
         // `loaded_models` is an array even when lms is unreachable.
         assert!(json["loaded_models"].is_array());
+    }
+
+    // ─── #1286: /machine/memory endpoint (the memory-ledger lens feed) ───
+
+    /// GET /machine/memory returns the memory ledger with the fields the
+    /// machine lens reads, plus the recorded cadence knob (`cache_ttl_ms`)
+    /// and the observer-cost stamp (`gather_ms`) — the #1286 observer-effect
+    /// constraints made visible in the payload. `lms` is pointed at a
+    /// nonexistent binary so the test NEVER calls the operator's real
+    /// LMStudio (and with no ls entries the arch reader opens no files);
+    /// probe failures must degrade to `warnings`, never a 500.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn machine_memory_endpoint_returns_ledger_with_observer_stamps() {
+        let prev = std::env::var("DARKMUX_LMS_BIN").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_LMS_BIN", "/nonexistent/darkmux-serve-test-lms");
+        }
+        let app = build_router(PathBuf::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/machine/memory")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),
+                None => std::env::remove_var("DARKMUX_LMS_BIN"),
+            }
+        }
+        assert_eq!(response.status(), StatusCode::OK, "expected 200 from /machine/memory");
+        let bytes = to_bytes(response.into_body(), 256 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON body");
+        for key in [
+            "schema_version",
+            "generated_at_ms",
+            "gather_ms",
+            "limit_bytes",
+            "limit_source",
+            "pool",
+            "pressure",
+            "models",
+            "machine",
+            "attribution",
+            "attribution_note",
+            "warnings",
+            "cache_ttl_ms",
+        ] {
+            assert!(
+                json.get(key).is_some(),
+                "/machine/memory response missing key `{key}`: {json}"
+            );
+        }
+        assert!(json["models"].is_array());
+        assert!(json["machine"]["state"].is_string());
+        // The nonexistent lms degrades loud — the payload documents it.
+        assert!(
+            json["warnings"].as_array().is_some_and(|w| !w.is_empty()),
+            "missing-lms probes must surface as warnings: {json}"
+        );
+        assert_eq!(json["cache_ttl_ms"].as_u64(), Some(2_000));
     }
 
     /// /machine/specs MUST redact the Redis URL's password. Wide-open
