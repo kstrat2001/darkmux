@@ -3091,7 +3091,8 @@ mod tests {
         let inputs = FunnelInputs {
             case_id: "c-telemetry".to_string(),
             crew: &crew,
-            intent: "add a feature",
+            intent_title: "add a feature",
+            intent_body: "",
             diff: DIFF,
             mode: ExecMode::Sequential,
             probe_system: "probe sys",
