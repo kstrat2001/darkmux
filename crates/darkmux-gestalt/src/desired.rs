@@ -5,21 +5,21 @@
 //! come back quarantined with a named reason; valid local entries become
 //! [`Placement`]s the planner reasons about.
 //!
-//! Scope honesty (#1282): this leniency does NOT close #1282. Today
-//! `ProfileModel.n_ctx` is a required serde field with no default, so a
-//! missing `n_ctx` blasts the whole registry at parse time — BEFORE any
-//! gestalt type exists. Closing #1282 requires a separate registry-parse
-//! leniency change at the darkmux-types/profiles layer (per-entry quarantine
-//! at raw-JSON parse, or an `n_ctx` schema change). This module is the
-//! gestalt-side contract that leniency flows into once that lands.
+//! Scope (#1282): the registry layer is now lenient too —
+//! `ProfileModel.n_ctx` is `Option<u32>` (endpoint-bearing models declare
+//! none) and a structurally-broken registry entry is quarantined per-entry
+//! at parse instead of blasting the whole file. So the Option on
+//! [`DesiredEntry::n_ctx`] flows straight through from `ProfileModel`: a
+//! local entry that lacks `n_ctx` reaches THIS layer and [`ingest`]
+//! quarantines it with a named reason ([`QuarantineReason::MissingNCtx`])
+//! unless the entry is remote.
 
 use crate::ownership::namespaced_identifier;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-/// Lenient pre-ingestion desired-state entry. Mirrors the ProfileModel
-/// leniency direction without requiring the registry schema to change first
-/// (see module docs).
+/// Lenient pre-ingestion desired-state entry. Mirrors `ProfileModel`'s
+/// lenient schema (#1282 — see module docs).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DesiredEntry {
     pub model_key: String,
@@ -39,15 +39,19 @@ pub struct DesiredEntry {
 }
 
 impl DesiredEntry {
-    /// `darkmux_types::ProfileModel` → lenient entry. `n_ctx` is always
-    /// present on today's ProfileModel (required serde field); the Option
-    /// exists for the ingestion sources #1282's fix will add.
+    /// `darkmux_types::ProfileModel` → lenient entry. Since #1282 the
+    /// registry schema itself is lenient — `ProfileModel.n_ctx` is
+    /// `Option<u32>` (endpoint-bearing models declare none) — so the Option
+    /// flows straight through; [`ingest`] quarantines a LOCAL entry that
+    /// lacks one. `remote` delegates to `ProfileModel::is_remote()` (the
+    /// same declared-url test the dispatch path routes on) so gestalt and
+    /// dispatch can never disagree about what counts as remote.
     pub fn from_profile_model(pm: &darkmux_types::ProfileModel, seat: &str) -> Self {
         DesiredEntry {
             model_key: pm.id.clone(),
-            n_ctx: Some(pm.n_ctx),
+            n_ctx: pm.n_ctx,
             identifier: pm.identifier.clone(),
-            remote: pm.endpoint.as_ref().is_some_and(|e| e.is_remote()),
+            remote: pm.is_remote(),
             seat: seat.to_string(),
         }
     }
@@ -222,7 +226,7 @@ mod tests {
     fn from_profile_model_maps_fields() {
         let pm = darkmux_types::ProfileModel {
             id: "qwen3.6-35b-a3b".into(),
-            n_ctx: 100_000,
+            n_ctx: Some(100_000),
             identifier: Some("my-alias".into()),
             capabilities: Default::default(),
             endpoint: None,
@@ -236,11 +240,33 @@ mod tests {
         assert_eq!(e.seat, "primary");
     }
 
+    /// (#1282) `ProfileModel.n_ctx` is `Option<u32>` at the schema layer now;
+    /// a local model missing it flows through as `None` and lands in the
+    /// MissingNCtx quarantine at ingest — the batch survives.
+    #[test]
+    fn from_profile_model_passes_missing_n_ctx_through_to_ingest_quarantine() {
+        let pm = darkmux_types::ProfileModel {
+            id: "ctxless-local".into(),
+            n_ctx: None,
+            identifier: None,
+            capabilities: Default::default(),
+            endpoint: None,
+            extras: Default::default(),
+        };
+        let e = DesiredEntry::from_profile_model(&pm, "primary");
+        assert_eq!(e.n_ctx, None);
+        assert!(!e.remote);
+        let (placements, quarantined) = ingest(&[e]);
+        assert!(placements.is_empty());
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(quarantined[0].reason, QuarantineReason::MissingNCtx);
+    }
+
     #[test]
     fn from_profile_model_detects_remote_endpoint() {
         let pm = darkmux_types::ProfileModel {
             id: "gpt-4o".into(),
-            n_ctx: 128_000,
+            n_ctx: Some(128_000),
             identifier: None,
             capabilities: Default::default(),
             endpoint: Some(darkmux_types::ModelEndpoint {

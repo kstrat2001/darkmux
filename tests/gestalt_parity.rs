@@ -24,7 +24,9 @@ use darkmux_types::ProfileModel;
 fn profile_model(id: &str, n_ctx: u32, identifier: Option<&str>) -> ProfileModel {
     ProfileModel {
         id: id.to_string(),
-        n_ctx,
+        // (#1282) `n_ctx` is Option at the schema layer now; every parity
+        // fixture here is a LOCAL model, which always declares one.
+        n_ctx: Some(n_ctx),
         identifier: identifier.map(str::to_string),
         capabilities: Default::default(),
         endpoint: None,
@@ -116,7 +118,9 @@ fn placement_for(pm: &ProfileModel) -> Placement {
     Placement {
         model_key: pm.id.clone(),
         identifier: swap::namespaced_identifier(pm),
-        min_ctx: pm.n_ctx,
+        // (#1282) A Placement is a validated LOCAL load, so the declared
+        // window is required here — same rule `ingest` enforces.
+        min_ctx: pm.n_ctx.expect("parity fixtures are local models with a declared n_ctx"),
         seat: "parity".to_string(),
     }
 }
