@@ -2996,6 +2996,55 @@ mod tests {
         assert!(!s.correct, "a degenerate funnel run can never score as correct");
     }
 
+    /// (#1272) The lab/fleet sink boundary, proven from the bench side: a
+    /// bench run's `funnel.*` records go to the per-run-local
+    /// `LocalJsonlEmitter` — never the fleet stream — and (this is the new
+    /// assertion) never carry `pr-review run`'s production-only `dispatch
+    /// start`/`dispatch complete`/`dispatch error` bookends either.
+    /// `run_funnel_case`/`run_review_bench` never call `pr_review.rs`'s
+    /// `with_dispatch_bookends` wrapper (that wiring lives entirely in the
+    /// binary's `pr_review` module, not here), so this is a regression
+    /// guard: if a future change ever routed bench dispatches through that
+    /// wrapper, this test would catch the leak before a bench run started
+    /// spamming the fleet-liveness surfaces with thousands of synthetic
+    /// "running dispatch" entries.
+    #[test]
+    fn run_funnel_case_through_local_jsonl_emitter_emits_no_dispatch_bookends() {
+        let case = Case {
+            id: "c-docs-2".into(),
+            label: lbl("clean", None),
+            diff: "diff --git a/README.md b/README.md\n\
+                   index 0000000..1111111 100644\n\
+                   --- a/README.md\n\
+                   +++ b/README.md\n\
+                   @@ -1 +1,2 @@\n\
+                    # Title\n\
+                   +Another line\n"
+                .into(),
+        };
+        let workdir = tempfile::TempDir::new().unwrap();
+        let ctx = test_funnel_ctx(None, super::super::funnel::ExecMode::Sequential);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let events_path = tmp.path().join("funnel-events.jsonl");
+        let mut emitter = LocalJsonlEmitter::new(events_path.clone());
+
+        let (_, env) = run_funnel_case(&case, workdir.path(), &ctx, 30, &mut emitter).unwrap();
+        assert!(env.degenerate.is_some(), "zero-bundle case still emits a funnel.task terminal record");
+
+        let content = fs::read_to_string(&events_path).expect("the degenerate run still emits funnel.task");
+        let actions: Vec<String> = content
+            .lines()
+            .filter_map(|l| serde_json::from_str::<darkmux_flow::FlowRecord>(l).ok())
+            .map(|r| r.action)
+            .collect();
+        assert!(!actions.is_empty(), "the bench path must still emit its own funnel.* records");
+        assert!(
+            actions.iter().all(|a| !a.starts_with("dispatch")),
+            "the bench-path LocalJsonlEmitter must never see a dispatch.*/\"dispatch \" bookend \
+             (lab-vs-fleet sink boundary): got {actions:?}"
+        );
+    }
+
     #[cfg(unix)]
     fn write_stub_bundler_script(dir: &Path, name: &str, body: &str) -> PathBuf {
         use std::io::Write;

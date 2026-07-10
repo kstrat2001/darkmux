@@ -33,6 +33,7 @@
 //! envelope only.
 
 use anyhow::{anyhow, bail, Context, Result};
+use darkmux_crew::dispatch::build_dispatch_record_with_payload;
 use darkmux_crew::single_shot::{single_shot_chat, SingleShotReply, SingleShotRequest};
 use darkmux_lab::lab::bundle::{
     build_bundles, external_bundles, slice_code, slice_code_probe, BundleSet, FileSource,
@@ -41,8 +42,9 @@ use darkmux_lab::lab::funnel::{
     run_funnel, run_judge_only, BundleInput, ChatCall, ExecMode, FunnelEmitter, FunnelEnvelope,
     FunnelInputs, JudgeRecord, LmsCycler, ProbeFlag, Tier,
 };
-use darkmux_profiles::crews::resolve_crew;
+use darkmux_profiles::crews::{resolve_crew, ResolvedCrew};
 use darkmux_profiles::profiles::load_registry;
+use darkmux_profiles::swap;
 use serde::{Deserialize, Deserializer};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -839,6 +841,154 @@ impl FunnelEmitter for FleetFlowEmitter {
     }
 }
 
+/// (#1272) Every distinct model this crew's resolved seats will dispatch,
+/// darkmux-namespaced (`swap::namespaced_identifier` — the same form
+/// `FunnelEnvelope::staffing` records) and deduped/sorted for a stable
+/// display string. A funnel run is inherently multi-model (>=1 probe seat
+/// plus the judge seat) — unlike a single-model `crew dispatch`, there's no
+/// one "the model" for the dispatch bookend's `model` field, so this is the
+/// closest honest equivalent: every model actually in play, comma-joined,
+/// rather than a single representative pick. `None` only if the crew has no
+/// staffed seats at all (a case `run_dispatch`'s own validation already
+/// rejects before this ever runs).
+fn crew_model_summary(crew: &ResolvedCrew) -> Option<String> {
+    let mut ids: Vec<String> =
+        crew.seats.values().flatten().map(|s| swap::namespaced_identifier(&s.pm)).collect();
+    ids.sort();
+    ids.dedup();
+    if ids.is_empty() {
+        None
+    } else {
+        Some(ids.join(", "))
+    }
+}
+
+/// (#1272) Panic/early-return backstop for [`with_dispatch_bookends`] —
+/// same RAII shape as `darkmux-crew`'s `DispatchBookendGuard` (#717): once
+/// armed, a `Drop` while still armed means the wrapped call unwound (a
+/// panic) before either terminal branch in `with_dispatch_bookends` ran, so
+/// this fires a `dispatch error` terminal itself. The normal Ok/Err paths
+/// disarm before emitting their own terminal record, so a clean run is
+/// never double-counted — matching `DispatchBookendGuard`'s own discipline.
+struct FunnelDispatchBookendGuard<'a> {
+    armed: bool,
+    emitter: &'a mut dyn FunnelEmitter,
+    case_id: String,
+    crew_name: String,
+    model: Option<String>,
+}
+
+impl Drop for FunnelDispatchBookendGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.emitter.emit(build_dispatch_record_with_payload(
+            darkmux_flow::Level::Error,
+            "dispatch error",
+            &self.crew_name,
+            &self.case_id,
+            self.model.as_deref(),
+            None,
+            None,
+            Some(json!({
+                "runtime": "funnel",
+                "result_class": "error",
+                "error": "funnel dispatch terminated before completion (early return or panic)",
+            })),
+        ));
+    }
+}
+
+/// (#1272) Emit `dispatch start`, run `f`, then emit the matching terminal
+/// record — `dispatch complete` on `Ok`, `dispatch error` (carrying the
+/// real error text) on `Err`. Same shape `crew dispatch` emits around every
+/// dispatch (`darkmux_crew::dispatch::build_dispatch_record_with_payload`,
+/// action = `"dispatch start"`/`"dispatch complete"`/`"dispatch error"` —
+/// no new action vocabulary), so a production `pr-review run` opens/closes
+/// the SAME liveness edge the viewer's fleet/machine surfaces already key
+/// on (#857 — a session's open edge is its `dispatch.start` record, per
+/// `darkmux-flow`'s `presence_reconciler`) that `crew dispatch` opens
+/// today. Before this fix, the funnel's OWN `funnel.task/step/ruling`
+/// vocabulary (#1247/#1248) was the only thing a production `pr-review
+/// run` ever emitted, so a real production review never showed up as a
+/// running dispatch anywhere in the viewer (#1272).
+///
+/// `f` (the funnel dispatch itself — `run_funnel` or `run_judge_only`) is
+/// injected so a test can drive a scripted stand-in instead of a real crew
+/// and LMStudio round trip, and receives the SAME [`FunnelEmitter`] the
+/// bookend records go through (production: [`FleetFlowEmitter`]) — one
+/// sink for the whole `pr-review run` invocation, so `dispatch start`
+/// always precedes every `funnel.*` record and the terminal record always
+/// follows them, in the SAME emitter's observed sequence.
+///
+/// Terminal-on-all-paths: see [`FunnelDispatchBookendGuard`] for the
+/// panic backstop; the `?`-return case is simply `f` returning `Err`,
+/// handled by the `Err` arm below like any other early exit.
+fn with_dispatch_bookends(
+    emitter: &mut dyn FunnelEmitter,
+    case_id: &str,
+    crew_name: &str,
+    model: Option<&str>,
+    f: impl FnOnce(&mut dyn FunnelEmitter) -> Result<FunnelEnvelope>,
+) -> Result<FunnelEnvelope> {
+    emitter.emit(build_dispatch_record_with_payload(
+        darkmux_flow::Level::Info,
+        "dispatch start",
+        crew_name,
+        case_id,
+        model,
+        None,
+        None,
+        Some(json!({ "runtime": "funnel" })),
+    ));
+    let mut guard = FunnelDispatchBookendGuard {
+        armed: true,
+        emitter,
+        case_id: case_id.to_string(),
+        crew_name: crew_name.to_string(),
+        model: model.map(str::to_string),
+    };
+    let result = f(&mut *guard.emitter);
+    // The wrapped call returned (rather than unwinding) — disarm the panic
+    // backstop before emitting our own terminal record below, so a clean
+    // Ok/Err return is never double-counted by `FunnelDispatchBookendGuard`'s
+    // Drop (same discipline as `DispatchBookendGuard::disarm`).
+    guard.armed = false;
+    match result {
+        Ok(env) => {
+            guard.emitter.emit(build_dispatch_record_with_payload(
+                darkmux_flow::Level::Info,
+                "dispatch complete",
+                crew_name,
+                case_id,
+                model,
+                None,
+                None,
+                Some(json!({ "runtime": "funnel", "result_class": "ok" })),
+            ));
+            Ok(env)
+        }
+        Err(e) => {
+            guard.emitter.emit(build_dispatch_record_with_payload(
+                darkmux_flow::Level::Error,
+                "dispatch error",
+                crew_name,
+                case_id,
+                model,
+                None,
+                None,
+                Some(json!({
+                    "runtime": "funnel",
+                    "result_class": "error",
+                    "error": e.to_string(),
+                })),
+            ));
+            Err(e)
+        }
+    }
+}
+
 /// Everything but `--from-envelope`: resolve the source + crew, build real
 /// bundles, and dispatch either `run_funnel` (the full pipeline) or
 /// `run_judge_only` (`--charges-file` — re-judge a saved flag list without
@@ -928,6 +1078,15 @@ fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<FunnelEnvelope> {
         bundles: Some(bundles),
     };
 
+    // (#1272) Bookend identity, captured before `inputs`/`crew` are moved
+    // into the dispatch closures below — same case_id/handle `funnel.*`
+    // records already carry (`inputs.case_id` / `crew.name`), so the
+    // dispatch bookend and the funnel's own records group under identical
+    // session_id/handle in the viewer.
+    let case_id_for_bookends = inputs.case_id.clone();
+    let crew_name_for_bookends = crew.name.clone();
+    let model_for_bookends = crew_model_summary(&crew);
+
     let timeout = opts.timeout;
     let mut chat = move |call: &ChatCall| -> Result<SingleShotReply> {
         single_shot_chat(&SingleShotRequest {
@@ -948,9 +1107,21 @@ fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<FunnelEnvelope> {
             .with_context(|| format!("reading --charges-file {}", charges_path.display()))?;
         let flags: Vec<ProbeFlag> = serde_json::from_str(&raw)
             .with_context(|| format!("parsing --charges-file {} as a flag list", charges_path.display()))?;
-        run_judge_only(flags, &inputs, &mut chat, &mut cycler, &mut emitter)
+        with_dispatch_bookends(
+            &mut emitter,
+            &case_id_for_bookends,
+            &crew_name_for_bookends,
+            model_for_bookends.as_deref(),
+            move |emitter| run_judge_only(flags, &inputs, &mut chat, &mut cycler, emitter),
+        )
     } else {
-        run_funnel(&inputs, &mut chat, &mut cycler, &mut emitter)
+        with_dispatch_bookends(
+            &mut emitter,
+            &case_id_for_bookends,
+            &crew_name_for_bookends,
+            model_for_bookends.as_deref(),
+            move |emitter| run_funnel(&inputs, &mut chat, &mut cycler, emitter),
+        )
     }
 }
 
@@ -2143,5 +2314,171 @@ mod tests {
         let c = r.comment.unwrap();
         assert!(c.contains("probed by unknown"), "{c}");
         assert!(c.contains("judged by unknown"), "{c}");
+    }
+
+    // ── #1272: dispatch.start/terminal bookends around a production funnel run ──
+
+    /// Recording [`FunnelEmitter`] mock — pushes every emitted record into a
+    /// `Vec` so a test can assert the exact action sequence, same discipline
+    /// as `darkmux-lab`'s own `funnel.rs` test-module `RecordingEmitter`
+    /// (that one is private to its crate's test module, so this is the
+    /// pr_review-layer equivalent — the "smallest injectable seam" the
+    /// live-dispatch path needed).
+    #[derive(Default)]
+    struct RecordingEmitter {
+        records: Vec<darkmux_flow::FlowRecord>,
+    }
+    impl FunnelEmitter for RecordingEmitter {
+        fn emit(&mut self, record: darkmux_flow::FlowRecord) {
+            self.records.push(record);
+        }
+    }
+
+    /// A minimal, valid `FlowRecord` standing in for whatever `run_funnel`/
+    /// `run_judge_only` would really emit through the injected `FunnelEmitter`
+    /// mid-dispatch — the bookend wrapper doesn't inspect these records, only
+    /// brackets them, so a bare action string is enough to prove ordering.
+    fn fake_funnel_record(action: &str) -> darkmux_flow::FlowRecord {
+        darkmux_flow::FlowRecord {
+            ts: darkmux_flow::ts_utc_now(),
+            level: darkmux_flow::Level::Info,
+            category: darkmux_flow::Category::Work,
+            tier: darkmux_flow::Tier::Local,
+            stage: darkmux_flow::Stage::Dispatch,
+            action: action.to_string(),
+            handle: "test-crew".to_string(),
+            sprint_id: None,
+            session_id: Some("case-1".to_string()),
+            source: Some("funnel".to_string()),
+            model: None,
+            reasoning: None,
+            mission_id: None,
+            machine_id: None,
+            machine_uid: None,
+            orchestrator: None,
+            prev_hash: None,
+            hash: None,
+            payload: None,
+            work_id: None,
+            attempt: None,
+        }
+    }
+
+    #[test]
+    fn with_dispatch_bookends_start_precedes_funnel_records_with_exactly_one_terminal_on_success() {
+        let mut emitter = RecordingEmitter::default();
+        let result = with_dispatch_bookends(&mut emitter, "case-1", "test-crew", Some("darkmux:judge-model"), |em| {
+            em.emit(fake_funnel_record("funnel.task"));
+            em.emit(fake_funnel_record("funnel.step"));
+            em.emit(fake_funnel_record("funnel.ruling"));
+            Ok(FunnelEnvelope::default())
+        });
+        assert!(result.is_ok());
+
+        let actions: Vec<&str> = emitter.records.iter().map(|r| r.action.as_str()).collect();
+        assert_eq!(actions, vec!["dispatch start", "funnel.task", "funnel.step", "funnel.ruling", "dispatch complete"]);
+
+        let start_idx = actions.iter().position(|a| *a == "dispatch start").expect("dispatch start emitted");
+        assert!(
+            actions.iter().enumerate().filter(|(_, a)| a.starts_with("funnel.")).all(|(i, _)| i > start_idx),
+            "dispatch start must precede every funnel.* record: {actions:?}"
+        );
+
+        let terminals = actions.iter().filter(|a| **a == "dispatch complete" || **a == "dispatch error").count();
+        assert_eq!(terminals, 1, "exactly one terminal dispatch record: {actions:?}");
+
+        let start = &emitter.records[0];
+        assert_eq!(start.session_id.as_deref(), Some("case-1"));
+        assert_eq!(start.handle, "test-crew");
+        assert_eq!(start.model.as_deref(), Some("darkmux:judge-model"));
+        assert!(matches!(start.level, darkmux_flow::Level::Info));
+
+        let terminal = emitter.records.last().unwrap();
+        assert_eq!(terminal.action, "dispatch complete");
+        assert!(matches!(terminal.level, darkmux_flow::Level::Info));
+        assert_eq!(terminal.payload.as_ref().unwrap()["result_class"], "ok");
+    }
+
+    #[test]
+    fn with_dispatch_bookends_error_path_emits_dispatch_error_terminal_with_the_real_message() {
+        let mut emitter = RecordingEmitter::default();
+        let result = with_dispatch_bookends(&mut emitter, "case-2", "test-crew", None, |em| {
+            em.emit(fake_funnel_record("funnel.task"));
+            Err(anyhow!("probe dispatch failed: connection refused"))
+        });
+        assert!(result.is_err());
+
+        let actions: Vec<&str> = emitter.records.iter().map(|r| r.action.as_str()).collect();
+        assert_eq!(actions, vec!["dispatch start", "funnel.task", "dispatch error"]);
+
+        let terminals = actions.iter().filter(|a| **a == "dispatch complete" || **a == "dispatch error").count();
+        assert_eq!(terminals, 1, "exactly one terminal dispatch record: {actions:?}");
+
+        let terminal = emitter.records.last().unwrap();
+        assert_eq!(terminal.action, "dispatch error");
+        assert!(matches!(terminal.level, darkmux_flow::Level::Error));
+        let payload = terminal.payload.as_ref().unwrap();
+        assert_eq!(payload["result_class"], "error");
+        assert!(
+            payload["error"].as_str().unwrap().contains("connection refused"),
+            "the real error text must survive onto the terminal record: {payload}"
+        );
+    }
+
+    #[test]
+    fn with_dispatch_bookends_panic_still_emits_a_dispatch_error_terminal_via_the_guard() {
+        // The RAII headline (mirrors darkmux-crew's `DispatchBookendGuard`
+        // #717 coverage): a panic between `dispatch start` and either normal
+        // terminal branch must still leave a matching `dispatch error` —
+        // never an orphaned start that renders as perpetually running.
+        let mut emitter = RecordingEmitter::default();
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // silence the expected panic backtrace
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_dispatch_bookends(&mut emitter, "case-3", "test-crew", None, |_em| {
+                panic!("simulated crash mid-dispatch");
+            })
+        }));
+        std::panic::set_hook(prev_hook);
+        assert!(result.is_err(), "the wrapped closure should have panicked");
+
+        let actions: Vec<&str> = emitter.records.iter().map(|r| r.action.as_str()).collect();
+        assert_eq!(actions, vec!["dispatch start", "dispatch error"]);
+        let terminal = emitter.records.last().unwrap();
+        assert!(matches!(terminal.level, darkmux_flow::Level::Error));
+        assert!(terminal.payload.as_ref().unwrap()["error"]
+            .as_str()
+            .unwrap()
+            .contains("early return or panic"));
+    }
+
+    #[test]
+    fn crew_model_summary_dedupes_and_sorts_every_seat_model() {
+        use darkmux_profiles::crews::ResolvedSeatStaffing;
+        use darkmux_types::ProfileModel;
+        use std::collections::BTreeMap;
+
+        fn staffing(model_id: &str) -> ResolvedSeatStaffing {
+            ResolvedSeatStaffing {
+                name: "fast".into(),
+                pm: ProfileModel { id: model_id.into(), ..Default::default() },
+                k: 1,
+                max_tokens: None,
+                selector: None,
+            }
+        }
+        let mut seats = BTreeMap::new();
+        seats.insert("review-probe".to_string(), vec![staffing("zzz-probe"), staffing("aaa-probe")]);
+        seats.insert("review-judge".to_string(), vec![staffing("zzz-probe")]); // same model as one probe seat
+        let crew = ResolvedCrew { name: "test-crew".into(), seats };
+
+        let summary = crew_model_summary(&crew).expect("non-empty crew has a summary");
+        assert_eq!(summary, "darkmux:aaa-probe, darkmux:zzz-probe", "sorted + deduped: {summary}");
+    }
+
+    #[test]
+    fn crew_model_summary_none_for_a_crew_with_no_staffed_seats() {
+        let crew = ResolvedCrew { name: "empty-crew".into(), seats: std::collections::BTreeMap::new() };
+        assert_eq!(crew_model_summary(&crew), None);
     }
 }
