@@ -99,6 +99,7 @@
   body.lab-mode .wrap{display:block;height:auto}
   body.lab-mode .stage{padding:16px 16px 32px}
   .lablist{display:flex;flex-direction:column;gap:14px;margin-top:10px}
+  .labnotice{font:12px/1.5 'JetBrains Mono',monospace;color:var(--warn);border:1px solid var(--warn);border-radius:6px;padding:9px 12px;margin-top:10px;overflow-wrap:anywhere}
   .labtaskcard{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 14px}
   .labtaskhdr{font:600 13px 'JetBrains Mono',monospace;color:var(--amber);display:flex;flex-wrap:wrap;align-items:baseline;gap:8px;margin-bottom:8px}
   .labtaskcount{font:600 10px 'JetBrains Mono',monospace;color:var(--muted);letter-spacing:.06em;text-transform:uppercase}
@@ -2145,6 +2146,9 @@ function renderCrumb(){
   // chrome (event log, detail pane, playback scrub bar) is irrelevant and
   // hidden via this class (see the `.lab-mode` CSS block).
   document.body.classList.toggle("lab-mode", inLab);
+  // (#1247 deep-link) Every navigation path lands here, so this is the ONE
+  // place the address bar is kept in sync with the lab view.
+  syncLabHash(inLab);
   if(inLab){
     let lc=`<a data-act="lab">lab</a>`;
     if(state.level==="lab-run") lc+=`<span class="sep">›</span>${esc(state.labRunDir||"—")}`;
@@ -2727,6 +2731,67 @@ function catalogQuery(){
   if(session)return {kind:"session", id:session};
   return null;
 }
+// (#1247 deep-link) Lab-lens deep link: `#lens=lab` boots straight into the
+// lab run list; `#lens=lab&run=<relative-dir>` boots into that run's detail
+// (the `run` value is the same URL-encoded relative path `/lab/run/detail`'s
+// `dir` param takes — an empty-but-present `run=` addresses a run matched at
+// the lab-dir root, whose dir IS ""). Same URLSearchParams-over-hash parsing
+// as catalogQuery above; `?lens=lab` in the search string works too.
+//
+// PRECEDENCE when the hash carries multiple intents: `lens=lab` wins over
+// `#mission=` / `#session=` (boot skips catalogQuery when this returns
+// non-null — the lab lens is a separate room, so a URL naming both is
+// contradictory and the lab half is honored; the mission/session params are
+// preserved in the hash untouched, so hand-deleting `lens=lab` from the bar
+// recovers the other view). A bare `#<date>` composes fine — it only picks
+// which day the flow window loads underneath (targetDate), and it is treated
+// as boot-only input: syncLabHash below does not preserve it once the
+// operator navigates lenses (the playback route carries its date in the
+// /play/<date> PATH, not the hash, so nothing durable is lost).
+function labQuery(){
+  const p=new URLSearchParams(location.search);
+  const h=new URLSearchParams((location.hash||"").replace(/^#/,""));
+  const lens=(p.get("lens")||h.get("lens")||"").trim();
+  if(lens!=="lab")return null;
+  const run=p.has("run")?p.get("run"):(h.has("run")?h.get("run"):null);
+  return {run: run==null?null:run.trim()};
+}
+// (#1247 deep-link) Reflect the current lab-lens state into location.hash so
+// the view in front of the operator is always copyable from the address bar
+// (the operator bookmarks the viewer on a phone via tailscale-serve —
+// tab-only state isn't addressable). replaceState, never pushState: lens
+// hops must not spam history. Called from renderCrumb (the one chokepoint
+// every navigation path repaints through); the no-change guard keeps live
+// mode's ~1/sec renders from touching history at all. Writes only the
+// lab-owned params (`lens`/`run`) and passes other hash params through
+// untouched; a bare `#<date>` hash (not key=value shaped — URLSearchParams
+// would mangle it to `<date>=`) is dropped rather than corrupted, per the
+// boot-only-input note on labQuery.
+function syncLabHash(inLab){
+  const raw=(location.hash||"").replace(/^#/,"");
+  const isBareDate=/^\d{4}-\d{2}-\d{2}$/.test(raw);
+  if(!inLab){
+    // Outside the lab lens, only touch the hash when it carries lab params
+    // to REMOVE — a bare-date or #mission=/#session= hash the operator
+    // arrived with stays put (renderCrumb repaints every view; an
+    // unconditional rewrite here would clear #<date> on the first fleet
+    // render after boot).
+    if(!raw||isBareDate)return;
+    const p=new URLSearchParams(raw);
+    if(!p.has("lens")&&!p.has("run"))return;
+    p.delete("lens");p.delete("run");
+    const next=p.toString();
+    history.replaceState(null,"",next?("#"+next):location.pathname+location.search);
+    return;
+  }
+  const p=isBareDate?new URLSearchParams():new URLSearchParams(raw);
+  p.set("lens","lab");
+  if(state.level==="lab-run"&&state.labRunDir!=null)p.set("run",state.labRunDir);
+  else p.delete("run");
+  const next=p.toString();
+  if(next===raw)return;
+  history.replaceState(null,"","#"+next);
+}
 
 function todayUTC(){return new Date().toISOString().slice(0,10);}
 // (#691) The live view is a rolling window, NOT just today's file — otherwise
@@ -3087,9 +3152,14 @@ async function boot(){
   // directly — exactly the on-disk flow file the daemon would read for
   // /flow/<date>. No daemon, identical render path. Forces playback.
   const flowSrc=injectedMeta("darkmux-flow-src");
+  // (#1247 deep-link) A `#lens=lab` deep link — see labQuery's precedence
+  // note: when present it wins over a `#mission=`/`#session=` replay query
+  // (the two are contradictory boot intents; the lab half is honored, so cq
+  // is skipped and the normal live/playback flow load proceeds underneath).
+  const lq = labQuery();
   // (#691) Replay-by-query applies only against a daemon (the static demo has no
   // catalog endpoints). A mission/session query forces playback of that thing.
-  const cq = flowSrc ? null : catalogQuery();
+  const cq = (flowSrc||lq) ? null : catalogQuery();
   let date=injectedDate||targetDate();
   // Playback mode is daemon-controlled (or static-flow-src driven): it forces
   // "play" regardless of whether the date happens to be today, and SSE is
@@ -3168,6 +3238,13 @@ async function boot(){
   if(cq&&cq.kind==="mission"&&RAW.length){ state.level="mission"; state.machine=null; state.session=null; state.missionId=cq.id; state.follow=true; }
   render();
   if(mode==="live"){ startLiveTail(date); startLivePoll(); }
+  // (#1247 deep-link) Boot straight into the lab lens AFTER the normal
+  // live/playback wiring above — the flow machinery keeps loading underneath
+  // so hopping back to fleet/missions works normally. `run != null` (an
+  // empty string addresses a run matched at the lab-dir root) drills into
+  // that run's detail; an unresolvable run falls back to the run list with a
+  // notice inside drillLabRun.
+  if(lq){ if(lq.run!=null) drillLabRun(lq.run); else goLab(); }
 }
 // ── Lab observer lens (#1247 Part 3) ────────────────────────────────────
 //
@@ -3191,6 +3268,11 @@ let LAB_RUNS = [];
 let LAB_DETAIL = null; // {dir, funnels, scores} for the open run
 let LAB_EVENTS = []; // accumulated funnel-events.jsonl records for the open run
 let LAB_EVENTS_OFFSET = 0;
+// (#1247 deep-link) One-shot notice rendered atop the run list — set when a
+// run drill (typically a stale/mistyped deep-link `run=` value) can't be
+// opened and the view falls back to the list instead of a broken pane.
+// Cleared on the next explicit navigation.
+let LAB_NOTICE = null;
 const LAB_POLL_STEADY_MS = 3000; // cadence once caught up (issue: "every few seconds")
 const LAB_POLL_BACKFILL_MS = 150; // rapid re-poll while draining a backlog (a big historical run's playback)
 
@@ -3239,17 +3321,30 @@ async function pollLabEvents(dir){
   setTimeout(()=>pollLabEvents(dir), gotLines ? LAB_POLL_BACKFILL_MS : LAB_POLL_STEADY_MS);
 }
 window.goLab=async()=>{
-  state.level="lab"; state.labRunDir=null;
+  state.level="lab"; state.labRunDir=null; LAB_NOTICE=null;
   render(); // paint "loading…" immediately
   await loadLabRuns();
   if(state.level==="lab") render();
 };
 window.drillLabRun=async(dir)=>{
-  state.level="lab-run"; state.labRunDir=dir;
+  state.level="lab-run"; state.labRunDir=dir; LAB_NOTICE=null;
   LAB_DETAIL=null; LAB_EVENTS=[]; LAB_EVENTS_OFFSET=0;
   render();
   await loadLabRunDetail(dir);
   if(!(state.level==="lab-run" && state.labRunDir===dir)) return;
+  // (#1247 deep-link) An unresolvable run — a stale/mistyped `run=` deep
+  // link (the daemon 400s an out-of-bounds dir), a run dir deleted since the
+  // list was fetched, or an unreachable daemon — falls back to the run LIST
+  // with a notice, never a stuck "loading…" pane with a poll loop hammering
+  // the same failing request.
+  if(!LAB_DETAIL){
+    LAB_NOTICE="couldn't open run \""+dir+"\" — it may have been removed, or the link is stale. Showing the run list.";
+    state.level="lab"; state.labRunDir=null;
+    render();
+    await loadLabRuns();
+    if(state.level==="lab") render();
+    return;
+  }
   render();
   pollLabEvents(dir);
 };
@@ -3319,7 +3414,13 @@ function labKnobDiff(prev, curr){
       ["model","k","max_tokens","n_ctx"].forEach(f=>{
         if(aj[f]!==bj[f]) changes.push("judge."+f+" "+labFieldVal(aj[f])+"→"+labFieldVal(bj[f]));
       });
-    }
+    } else if(!aj && bj){ changes.push("+judge ("+shortModel(bj.model)+")"); }
+    else if(aj && !bj){ changes.push("-judge"); }
+    // (both-null: no judge either side — nothing to diff.) A judge seat
+    // appearing or disappearing between runs is exactly the methodology
+    // drift this line exists to surface — silently diffing only when both
+    // sides have one was a false "no knob change" (frontier review round,
+    // #1262).
   } else if(ps !== cs){
     changes.push("staffing snapshot became available");
   }
@@ -3363,12 +3464,15 @@ function renderLabTaskCard(group){
 }
 function renderLabRunsList(){
   $("logscope").textContent="lab";
+  // (#1247 deep-link) The one-shot fallback notice (a stale `run=` deep
+  // link) renders atop whichever list state applies below.
+  const notice = LAB_NOTICE ? `<div class="labnotice">${esc(LAB_NOTICE)}</div>` : "";
   if(LAB_CONFIGURED===null){
-    $("stage").innerHTML = `<div class="stagehdr">lab observer</div><div class="none">loading…</div>`;
+    $("stage").innerHTML = `<div class="stagehdr">lab observer</div>${notice}<div class="none">loading…</div>`;
     return;
   }
   if(LAB_CONFIGURED===false){
-    $("stage").innerHTML = `<div class="stagehdr">lab observer</div>
+    $("stage").innerHTML = `<div class="stagehdr">lab observer</div>${notice}
       <div class="none">not configured — restart <code>darkmux serve</code> with <code>--lab-dir &lt;path&gt;</code> (or set <code>DARKMUX_LAB_DIR</code>) to scan this machine's lab run history. Machine-local by design — never a remote path.</div>`;
     return;
   }
@@ -3376,7 +3480,7 @@ function renderLabRunsList(){
   const body = groups.length
     ? groups.map(renderLabTaskCard).join("")
     : `<div class="none">no lab runs found under the configured lab dir yet — run <code>darkmux lab review-bench --funnel …</code> to produce one.</div>`;
-  $("stage").innerHTML = `<div class="stagehdr">lab observer · ${LAB_RUNS.length} run${LAB_RUNS.length===1?"":"s"} · ${groups.length} task${groups.length===1?"":"s"}</div>
+  $("stage").innerHTML = `<div class="stagehdr">lab observer · ${LAB_RUNS.length} run${LAB_RUNS.length===1?"":"s"} · ${groups.length} task${groups.length===1?"":"s"}</div>${notice}
     <div class="lablist">${body}</div>`;
 }
 

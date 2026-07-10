@@ -1431,7 +1431,10 @@ fn scan_lab_runs(lab_dir: &StdPath) -> Vec<LabRunSummary> {
     // Newest-first — the series/history view wants the latest run of each
     // task up top; sorting here (not client-side) keeps the contract simple
     // for any other consumer of this endpoint.
-    out.sort_by(|a, b| b.mtime_ms.cmp(&a.mtime_ms));
+    // sort_by_key + Reverse rather than a comparator closure — clippy 1.97
+    // (CI's toolchain; local 1.94 doesn't flag it) lints the closure form,
+    // same toolchain-skew class as the #1259 fix.
+    out.sort_by_key(|r| std::cmp::Reverse(r.mtime_ms));
     out
 }
 
@@ -1676,6 +1679,16 @@ struct LabRunDetailResponse {
 /// run. `funnels` is `[]` (never an error) when `funnels.json` is absent or
 /// unparseable — a live run before its first case completes, or a non-funnel
 /// bench mode. `scores` is `null` the same way.
+///
+/// DELIBERATELY no byte cap on the two file reads (unlike the events
+/// route's `MAX_LAB_EVENTS_READ_BYTES`): `funnels.json` / `scores.json` are
+/// bounded-by-construction artifacts darkmux itself wrote (one envelope per
+/// case; a heavy real-world run measures single-digit MB), read from a dir
+/// the operator explicitly named on their own machine — not an unbounded
+/// append stream and not attacker-supplied. The events route caps because a
+/// LIVE `funnel-events.jsonl` grows without bound during a run; these don't.
+/// If a cap ever becomes warranted (e.g. a future artifact kind), mirror the
+/// events route's explicit-backfill spirit rather than truncating JSON.
 async fn lab_run_detail_handler(
     State(state): State<AppState>,
     Query(q): Query<LabDirQuery>,
@@ -4458,6 +4471,22 @@ mod tests {
         unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN); }
         let app = build_router(PathBuf::new());
         let mut req = Request::builder().uri("/flow-days").body(Body::empty()).unwrap();
+        req.extensions_mut().insert(remote_peer());
+        let resp = app.oneshot(req).await.unwrap();
+        unsafe { std::env::remove_var("DARKMUX_SERVE_TOKEN"); }
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// (#1247 Part 3 / #1262 review round) The lab routes must ride the SAME
+    /// remote-only bearer gate as the rest of the read surface — guards
+    /// against a future refactor special-casing `/lab/*` out of `auth_mw`
+    /// (they serve local run artifacts, no less sensitive than flow records).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn lab_runs_requires_token_from_remote_peer() {
+        unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN); }
+        let app = build_router(PathBuf::new());
+        let mut req = Request::builder().uri("/lab/runs").body(Body::empty()).unwrap();
         req.extensions_mut().insert(remote_peer());
         let resp = app.oneshot(req).await.unwrap();
         unsafe { std::env::remove_var("DARKMUX_SERVE_TOKEN"); }
