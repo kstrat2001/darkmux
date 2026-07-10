@@ -84,6 +84,46 @@ If a surface on this list doesn't exist for a new run type, **building it comes 
 
 Composes with: single-run-full-picture-first (verify a system with ONE complete instrumented run before corpus sweeps), smoke-before-long-runs, quiesced-machine for canon runs (until host sampling ships, measurement runs get no concurrent builds), and the lab-vs-fleet boundary (bench records stay per-run-local; engagement records ride the flow stream).
 
+## Cross-system contracts — alignment is mandatory (operator finding, 2026-07-10)
+
+darkmux has contracts that span subsystems. They are binding on EVERY producer and consumer —
+a new feature conforms to them or extends them through their own versioning/doc mechanism;
+it never bypasses, subsets, or fences them. Two same-day production failures on cutover day
+were both contract violations that unit tests structurally cannot catch (tests exercise the
+subsystem, not its alignment): crews rejecting endpoint-bearing profiles (violated: profiles
+mean the same thing to every consumer — #1269), and the funnel emitting a new record
+vocabulary without the dispatch-liveness bookends (violated: running work is visible work —
+#1272).
+
+The contract registry (extend this list when a new cross-cutting invariant is born):
+
+1. **Profile uniformity** — a profile means the same thing to every consumer (swap, dispatch,
+   crews, benches). A consumer may not legislate which profiles are legal; it routes on what
+   the profile declares (local vs endpoint → dialect, cycling, token accounting).
+2. **Dispatch liveness** — any production code path that performs model work emits
+   `dispatch.start` and a terminal `dispatch.complete`/`dispatch.error` (RAII-guarded on all
+   exit paths), regardless of what richer vocabulary it also emits. Liveness surfaces key on
+   these bookends plus presence (#857); new vocabularies supplement, never replace.
+3. **Lab/fleet sink boundary** — lab runs write per-run-local artifacts; the fleet flow
+   stream carries engagement work only. No crossings in either direction.
+4. **Namespace convention** — darkmux-owned state in shared systems carries the darkmux
+   namespace; operations manage only the namespaced subset (see the namespace section).
+5. **Schema versioning** — flow/rules/config/profiles data shapes change only through their
+   documented semver rules; consumers are lenient-on-read, loud in doctor.
+6. **Frozen model-facing text** — measured prompts/personas live in ONE artifact with golden
+   tests generated from the reference implementation; assembly and request bodies are
+   byte-locked (#1256). "Frozen" means one hash, not one intention.
+7. **Config leniency** — registries and config files are lenient-on-read; semantic validation
+   lives at resolution/consumption time and in `darkmux doctor`, never on the hot load path
+   (#1269).
+
+Enforcement is structural, not procedural: every contract gets a conformance test where one
+is expressible (golden files, emission-sequence assertions, boundary tests), and every review
+of a new subsystem asks explicitly: **which contracts does this touch, and where is its
+conformance shown?** A deliberate scope cut that fences a contract (as crews-local-only did)
+is itself a contract change — it gets the same failure-mode scrutiny as a feature, because to
+the operator's config file, it is one.
+
 ## Configuration (`config.json`)
 
 darkmux's canonical config surface is **`~/.darkmux/config.json`** (#661), written by `darkmux init`. Every setting resolves with one precedence — **`env(DARKMUX_*) > config.json > built-in default`** — and that precedence lives in exactly ONE place: `darkmux_types::config_access` (the env tier is read **live per-access**, so a `set_var` in a test or a power-user export still wins). A reader never has to wonder where a setting came from; `darkmux doctor` surfaces the resolved value + source.
