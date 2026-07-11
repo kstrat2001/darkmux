@@ -11,10 +11,30 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 
 ## [Unreleased]
 
+## [1.18.0] - 2026-07-11
+
+The frontier-staffing release: any review-funnel seat can be staffed by a hosted model, so a
+machine that can't (or shouldn't) run local inference does PR review entirely off a cloud
+endpoint. Underneath it, a new model-lifecycle foundation — a pure planning core, a
+memory ledger, and a deadline-bounded host adapter — ships tested but not yet wired to the
+live dispatch path (that cutover lands in 1.18.1).
+
 ### Added
 
-- **`darkmux-review.yml` dispatches the review funnel instead of a single reviewer** (#1222 Phase B, packet 6) — the self-hosted PR-review workflow now runs `darkmux pr-review run`, which drives a saved **crew** (`~/.darkmux/profiles.json` `crews`, Phase B packet 1) through a `review-probe` seat that argues the diff and a `review-judge` seat that weighs the probes' findings, replacing the old single tool-less `pr-reviewer` dispatch outright (pre-1.0, no compat shim). Workflow inputs move from `role`/`profile` to `crew`/`mode`/`k`; model selection stays entirely on the runner (#1054) — the workflow file never names a model, only a crew. `.github/DARKMUX_REVIEW_RUNNER.md` documents the new flow plus a Studio migration checklist (a copy-pasteable `review-deep` crew for a 32GB tier) and the `DARKMUX_REVIEW_CREW` repo-variable override. **Release gate: no version tags this until the labeled-corpus recall/precision validation (#1119) shows the funnel at parity with or ahead of the single-reviewer baseline it replaces** — the dispatch path is complete but not yet measured against the review arc's own bake-off discipline.
-- **Host telemetry sampling during funnel runs** (#1247 doctrine surface — "No blind runs") — `darkmux pr-review run` and `lab review-bench --funnel` now sample host cpu/ram/gpu at ~2s cadence for the whole funnel run's lifetime, same mechanism and record shape (`category=telemetry, source="process", action="telemetry.process"`) the container dispatch path's always-on sampler already produces (#1064), so the run-monitor/viewer renders it unchanged. Samples stream through the SAME injected sink each caller already wires — per-run-local `funnel-events.jsonl` for a bench run, the fleet flow stream for a real `pr-review run` — so a contention-tainted funnel run (e.g. a concurrent `cargo test` build eating inference bandwidth) is now visible in the artifact instead of only reconstructible from LMStudio's own server logs. Lifecycle is RAII-tied to `FunnelBookendGuard`: the sampler starts when the guard is built and stops on every exit path (clean finish, early `?`-return, or panic) — no orphaned sampler thread.
+- **Remote (frontier) staffing for any funnel seat** (#1260, #1177) — a `crews` seat whose profile carries an `endpoint` block dispatches to that hosted model instead of a local one. No new syntax: endpoint-presence is the whole signal. Remote seats **skip model cycling entirely** — nothing is loaded or unloaded, zero LM Studio contact — so an all-remote crew runs PR review with LM Studio shut down (verified end-to-end against Azure with the `lms` binary and local URL both disabled). Message assembly is byte-identical to a local seat (only the HTTP transport differs); provenance stamps the model and endpoint **host** only, never credentials.
+- **The `review-verify` seat** (#1260) — an optional fourth funnel stage. When a crew declares it, each double-confirmed finding gets one frontier adjudication pass: `verified` posts without the "needs frontier verification" marker, `refuted` demotes to archived, `uncertain` keeps the marker. A crew without the seat behaves exactly as before.
+- **Per-execution remote token buckets** (#1260, #1186) — `remote.max_tokens_per_execution` (default 500000, written visibly by `init`) caps each pipeline stage's hosted spend; exhaustion stops that stage's remaining remote calls with a named envelope reason (a load-bearing stage degrades the run honestly, never a silent pass). Remote tokens are accounted separately so savings surfaces never count cloud spend as "off the meter." The agentic-remote container loop is not metered in this release (#1293).
+- **Memory ledger — potential vs. current** (#1286) — `darkmux model ledger [--json]`, a `/machine/memory` serve endpoint, and a mobile-first `#lens=machine` viewer lens show, per loaded model, what its config *commits* (weights + KV-cache-at-loaded-context + margin, from the model's own architecture) against what has *materialized*, color-coded green / amber ("made it by luck") / red, with a shrink hint that names the context reduction to reach green. Observability is read-only and dispatch-free by design (kernel counters + `lms` metadata only; the gather stamps its own cost) — codified in the new CLAUDE.md "the observer must not join the observed" doctrine.
+- **GestaltManager model-lifecycle core** (#1274, present but not yet wired — cutover in 1.18.1): a pure planning crate (`darkmux-gestalt`) that decides load / unload / reuse / reconcile / block from abstract facts (memory pools as data, an ownership namespace, a RAM budget) and emits an inspectable plan with a typed reason on every action; a **wave scheduler** (#1285) that partitions co-resident models into parallel-or-sequential waves under a budget (which doubles as a hardware-tier emulator); an **architecture-aware estimator** (#1286) that computes true KV-cache cost per model; and an **`LmsHost` adapter** (#1276) that makes every `lms` call deadline-bounded — the unbounded-load hang becomes structurally impossible.
+
+### Changed
+
+- **`ProfileModel.n_ctx` is now optional** (#1282, profiles schema 1.1 → 1.2, minor) — endpoint-bearing models omit it (the provider owns the context window); a local model still requires it, enforced at resolution time with a named error and surfaced by `darkmux doctor`, never on the load path.
+- **The profile registry is lenient per entry** (#1282) — one structurally-broken profile or crew entry is quarantined (with serde's exact field error) instead of failing the whole file; siblings load normally, `darkmux doctor` lists each quarantined entry, and a dispatch that names a quarantined profile hard-fails with that entry's parse error instead of silently substituting a model.
+
+### Fixed
+
+- **Endpoint-bearing profiles no longer break crew resolution** (#1269 → #1270, shipped in 1.17.1; the schema unblock here completes the story).
 
 ## [1.17.1] - 2026-07-10
 
@@ -35,6 +55,7 @@ funnel, fixed same-day.
   exit paths, `source: "funnel"`) so a live PR review is visible as a running dispatch in the
   viewer's fleet and machine views (#1272, #1277).
 
+[1.18.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.18.0
 [1.17.1]: https://github.com/kstrat2001/darkmux/releases/tag/v1.17.1
 
 ## [1.17.0] - 2026-07-10
