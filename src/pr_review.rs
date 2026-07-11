@@ -53,9 +53,21 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-const FOOTER: &str = "\n\n---\n<sub>Automated review by darkmux's own `pr-reviewer` \
-role, running on a local model (no cloud API) via a self-hosted runner — darkmux \
-dogfooding itself in public. Advisory, not a merge gate.</sub>";
+// (#1298) The single-reviewer (`pr-review render`) default footer. The funnel
+// path never uses this — it derives its footer from the envelope's member
+// provenance (see `funnel_footer`). The stale "`pr-reviewer` role" wording is
+// gone from both paths; the "no cloud API" claim survives ONLY here because
+// this path has no envelope to derive from and the workflow that knows where
+// the model ran passes the truthful `--attribution` (the funnel does derive).
+const FOOTER: &str = "\n\n---\n<sub>Automated review by darkmux, running on a \
+local model (no cloud API) via a self-hosted runner — darkmux dogfooding \
+itself in public. Advisory, not a merge gate.</sub>";
+
+/// (#1298/#1186) Default tagline for the funnel's posted footer — the
+/// operator-owned "why this comment exists" half. The operator overrides it
+/// via `--attribution`; the model / local-vs-cloud half is DERIVED from the
+/// run, never carried here (see [`dispatch_provenance`]).
+const FUNNEL_TAGLINE: &str = "darkmux dogfooding itself in public. Advisory, not a merge gate.";
 
 /// Severity → label. Unknown severity renders as a plain note.
 fn sev_label(severity: Option<&str>) -> &'static str {
@@ -477,6 +489,13 @@ fn comment_fallback(reply: &str, attribution: Option<&str>) -> Rendered {
 /// pass + zero findings + no summary — the contract mandates a summary, so
 /// its absence means nothing was actually reviewed).
 fn degraded_fallback(note: &str, attribution: Option<&str>) -> Rendered {
+    degraded_with_footer(note, &footer_for(attribution))
+}
+
+/// The degraded rendering with an explicit footer — so the funnel path can
+/// pass its envelope-derived footer (#1298) while the single-reviewer path
+/// keeps the static-default footer. Body text is identical either way.
+fn degraded_with_footer(note: &str, footer: &str) -> Rendered {
     Rendered {
         mode: "degraded",
         review: None,
@@ -484,8 +503,7 @@ fn degraded_fallback(note: &str, attribution: Option<&str>) -> Rendered {
             "### 🤖 darkmux PR review — ⚠️ no review signal\n\n{note} \
              **This is not a clean pass** — the automated reviewer produced \
              no usable review, so this pull request has had no automated \
-             review. Human review (or a re-run) required.{}",
-            footer_for(attribution)
+             review. Human review (or a re-run) required.{footer}"
         )),
     }
 }
@@ -605,6 +623,67 @@ fn footer_for(attribution: Option<&str>) -> String {
         Some(text) => format!("\n\n---\n<sub>{text}</sub>"),
         None => FOOTER.to_string(),
     }
+}
+
+/// (#1298) The funnel's posted footer, with its dispatch-provenance clause
+/// DERIVED from the envelope's member records — never a hardcoded claim that
+/// can contradict the run. The prior static footer asserted "`pr-reviewer`
+/// role, running on a local model (no cloud API)" unconditionally; on the
+/// first all-remote (Azure) funnel review that was three lies in the most
+/// visible place — a public comment saying "no cloud API" about a cloud
+/// review (#1186 "never off the meter"). The operator's `--attribution`
+/// supplies only the tagline; WHERE the models ran is computed from what
+/// actually ran.
+fn funnel_footer(env: &FunnelEnvelope, attribution: Option<&str>) -> String {
+    let tagline = attribution
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(FUNNEL_TAGLINE);
+    format!(
+        "\n\n---\n<sub>Automated review by darkmux's review funnel, {} — {tagline}</sub>",
+        dispatch_provenance(env)
+    )
+}
+
+/// (#1298) The dispatch-provenance clause: WHERE the funnel's seats actually
+/// ran, read from the envelope's member records. An audit-integrity surface —
+/// a posted review must never claim "no cloud API" about a review that
+/// dispatched to a hosted endpoint.
+///
+/// - All seats local → "on a local model, no cloud API" (the only honest home
+///   for that phrase).
+/// - Any seat remote → names the hosted model(s); never "no cloud API".
+/// - Mixed crew → names both the local and the hosted seat models.
+/// - No member records → asserts neither local nor cloud (stays honest).
+fn dispatch_provenance(env: &FunnelEnvelope) -> String {
+    let local = unique_seat_models(env, false);
+    let remote = unique_seat_models(env, true);
+    match (local.is_empty(), remote.is_empty()) {
+        (true, true) => "on a self-hosted runner".to_string(),
+        (false, true) => format!("on a local model, no cloud API ({})", local.join(", ")),
+        (true, false) => format!("via a hosted cloud endpoint ({})", remote.join(", ")),
+        (false, false) => format!(
+            "on a mixed crew (local: {}; hosted cloud endpoint: {})",
+            local.join(", "),
+            remote.join(", ")
+        ),
+    }
+}
+
+/// (#1298) Distinct seat model names filtered by remote-ness, first-seen order
+/// preserved. (#1300) The name comes from `member.model` (the dispatched model
+/// id) today; when #1300 lands — capturing the endpoint's SERVED model into
+/// the member record — prefer that field here (a one-line swap of `name`).
+fn unique_seat_models(env: &FunnelEnvelope, remote: bool) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    for m in env.members.iter().filter(|m| m.remote == remote) {
+        // (#1300) prefer the served model over `m.model` when it lands.
+        let name = m.model.as_str();
+        if !name.is_empty() && !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    out
 }
 
 /// `darkmux pr-review render` handler: read the envelope + diff, render, and
@@ -1234,7 +1313,12 @@ const CONFIRMED_MARKER: &str =
 ///   this module — no review signal was produced.
 pub fn synthesize_funnel(env: &FunnelEnvelope, diff: &str, attribution: Option<&str>) -> Rendered {
     if let Some(note) = &env.degenerate {
-        return degraded_fallback(&format!("The review funnel produced no signal: {note}."), attribution);
+        // (#1298) Even a degenerate run posts the envelope-derived footer, so a
+        // remote crew that produced no signal never claims "no cloud API".
+        return degraded_with_footer(
+            &format!("The review funnel produced no signal: {note}."),
+            &funnel_footer(env, attribution),
+        );
     }
 
     let index = new_side_index(diff);
@@ -1299,7 +1383,7 @@ pub fn synthesize_funnel(env: &FunnelEnvelope, diff: &str, attribution: Option<&
         return Rendered {
             mode: "comment",
             review: None,
-            comment: Some(format!("{}{}", lines.join("\n"), footer_for(attribution))),
+            comment: Some(format!("{}{}", lines.join("\n"), funnel_footer(env, attribution))),
         };
     }
 
@@ -1326,7 +1410,7 @@ pub fn synthesize_funnel(env: &FunnelEnvelope, diff: &str, attribution: Option<&
         mode: "review",
         review: Some(json!({
             "event": "REQUEST_CHANGES",
-            "body": format!("{}{}", body.join("\n"), footer_for(attribution)),
+            "body": format!("{}{}", body.join("\n"), funnel_footer(env, attribution)),
             "comments": inline,
         })),
         comment: None,
@@ -2273,6 +2357,65 @@ mod tests {
         let r = synthesize_funnel(&env, DIFF, Some(att));
         let body = r.review.unwrap()["body"].as_str().unwrap().to_string();
         assert!(body.contains(att), "{body}");
+    }
+
+    // ─── #1298: footer dispatch-provenance DERIVED from the envelope ──────
+
+    fn probe_member(model: &str, remote: bool) -> MemberRecord {
+        MemberRecord { model: model.into(), seat: "review-probe".into(), remote, ..Default::default() }
+    }
+    fn judge_member(model: &str, remote: bool) -> MemberRecord {
+        MemberRecord { model: model.into(), seat: "review-judge".into(), remote, ..Default::default() }
+    }
+
+    /// A review-mode envelope (one confirmed flag ⇒ a footer-bearing `body`)
+    /// staffed by exactly `members`, then its rendered review body.
+    fn footer_body_for(members: Vec<MemberRecord>) -> String {
+        let confirmed = confirmed_flag("computeEnd@src/x.ts", Some("const b = 2;"), "n", "e");
+        let env = FunnelEnvelope { members, ..healthy_envelope(vec![confirmed]) };
+        synthesize_funnel(&env, DIFF, None).review.unwrap()["body"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn footer_all_remote_says_hosted_names_model_never_no_cloud_api() {
+        let body = footer_body_for(vec![probe_member("gpt-4o", true), judge_member("gpt-4o", true)]);
+        assert!(body.contains("hosted cloud endpoint"), "{body}");
+        assert!(body.contains("gpt-4o"), "names the remote model: {body}");
+        assert!(!body.contains("no cloud API"), "never claims no cloud API on a remote run: {body}");
+    }
+
+    #[test]
+    fn footer_all_local_keeps_local_model_no_cloud_api() {
+        let body = footer_body_for(vec![
+            probe_member("darkmux:qwen-probe", false),
+            judge_member("darkmux:qwen-judge", false),
+        ]);
+        assert!(body.contains("local model, no cloud API"), "{body}");
+        assert!(body.contains("darkmux:qwen-judge"), "names a local seat model: {body}");
+    }
+
+    #[test]
+    fn footer_mixed_crew_names_both_and_never_no_cloud_api() {
+        let body = footer_body_for(vec![
+            probe_member("darkmux:qwen-probe", false),
+            judge_member("gpt-4o", true),
+        ]);
+        assert!(body.contains("darkmux:qwen-probe"), "names the local seat: {body}");
+        assert!(body.contains("gpt-4o"), "names the hosted seat: {body}");
+        assert!(!body.contains("no cloud API"), "a mixed crew must not claim no cloud API: {body}");
+    }
+
+    #[test]
+    fn footer_drops_stale_pr_reviewer_role_wording() {
+        let body = footer_body_for(vec![
+            probe_member("darkmux:qwen-probe", false),
+            judge_member("darkmux:qwen-judge", false),
+        ]);
+        assert!(!body.contains("pr-reviewer"), "the stale role name must be gone: {body}");
+        assert!(body.contains("review funnel"), "names the crew/funnel instead: {body}");
     }
 
     // ─── synthesize_funnel: coverage sweep (#1222 Phase B packet 5 QA) ────
