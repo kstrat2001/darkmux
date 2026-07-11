@@ -5,7 +5,7 @@
 #
 # Operator-facing install path:
 #   brew tap kstrat2001/darkmux
-#   brew install darkmux                # stable release (v1.17.1)
+#   brew install darkmux                # stable release (v1.18.0)
 #   brew install --HEAD darkmux         # build from main instead
 #
 # For local development / smoke testing:
