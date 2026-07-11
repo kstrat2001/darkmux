@@ -2986,7 +2986,7 @@ mod tests {
                 selector: None,
             }],
         );
-        darkmux_profiles::crews::ResolvedCrew { name: "test-crew".into(), seats }
+        darkmux_profiles::crews::ResolvedCrew { name: "test-crew".into(), seats, request_changes: false }
     }
 
     fn test_funnel_ctx(bundler_cmd: Option<String>, exec_mode: super::super::funnel::ExecMode) -> FunnelCtx {

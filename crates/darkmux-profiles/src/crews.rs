@@ -61,6 +61,12 @@ pub struct ResolvedSeatStaffing {
 pub struct ResolvedCrew {
     pub name: String,
     pub seats: BTreeMap<String, Vec<ResolvedSeatStaffing>>,
+    /// (#1302) Whether confirmed review-funnel findings render as a blocking
+    /// `REQUEST_CHANGES` review (`true`) or a non-blocking `COMMENT` review
+    /// (`false`, the default). Carried verbatim from the source
+    /// [`Crew::request_changes`](darkmux_types::Crew::request_changes) — see
+    /// that field for the audit tradeoff blocking mode entails.
+    pub request_changes: bool,
 }
 
 /// Resolve `name` in `reg.crews` to concrete, loadable models — validating
@@ -146,6 +152,10 @@ pub fn resolve_crew(reg: &ProfileRegistry, name: &str) -> Result<ResolvedCrew> {
     Ok(ResolvedCrew {
         name: name.to_string(),
         seats,
+        // (#1302) Carried verbatim — resolution doesn't legislate the review
+        // event; the funnel/render path reads it to pick COMMENT vs
+        // REQUEST_CHANGES.
+        request_changes: crew.request_changes,
     })
 }
 

@@ -530,7 +530,12 @@ impl Profile {
 // unanimous consensus). Minor bump: every 1.2 registry parses unchanged (the
 // field defaults to 2 on read via `default_judge_passes`, reproducing today's
 // double-confirm), per the lenient-read doctrine.
-pub const PROFILES_SCHEMA_VERSION: &str = "1.3";
+// 1.4 (#1302): additive `request_changes` on `Crew` (opt-in to a blocking
+// `REQUEST_CHANGES` review event for confirmed findings; default `false` =>
+// non-blocking `COMMENT` event). Minor bump: every 1.3 registry parses
+// unchanged (the field defaults to `false` on read), per the lenient-read
+// doctrine.
+pub const PROFILES_SCHEMA_VERSION: &str = "1.4";
 
 /// A **saved crew assignment**: which models staff which crew-role seats,
 /// for multi-seat pipelines (e.g. a review funnel's probe + judge seats).
@@ -562,6 +567,25 @@ pub struct Crew {
     /// order but carries no dispatch-sequence meaning by itself — that's a
     /// consumer-side concern.
     pub seats: BTreeMap<String, Vec<SeatStaffing>>,
+    /// (#1302) Opt in to a **blocking** review for confirmed findings. When
+    /// `true`, a review-funnel run staffed by this crew renders its confirmed
+    /// tier as a formal `REQUEST_CHANGES` review — a real GitHub merge gate
+    /// (`reviewDecision: CHANGES_REQUESTED`). Default `false` renders the
+    /// confirmed tier as a NON-blocking `COMMENT`-event review that still
+    /// carries the same inline findings but never sets `reviewDecision`, so it
+    /// matches the posted footer's "advisory, not a merge gate" claim.
+    ///
+    /// **Enabling this is an operator-accepted audit tradeoff.** Blocking mode
+    /// currently has NO automated resolution path: darkmux cannot supersede
+    /// its own earlier block (a clean re-run posts a plain comment, which
+    /// GitHub's `reviewDecision` ignores). Clearing a stale block requires a
+    /// manual dismissal or ruleset bypass — the kind of action a
+    /// compliance-monitored org must document. The `review-verify` seat
+    /// (#1260) plus a re-supersede-on-clean-rerun step are the prerequisites
+    /// before blocking should ever be defaulted on; until they exist, leave
+    /// this `false`.
+    #[serde(default)]
+    pub request_changes: bool,
     /// Forward-compat overflow — unknown keys land here and re-serialize
     /// flat (a newer config read by an older binary).
     #[serde(flatten)]

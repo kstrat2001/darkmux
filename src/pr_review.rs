@@ -1297,8 +1297,11 @@ const CONFIRMED_MARKER: &str =
 ///   [`new_side_index`]/[`resolve_anchor`] against `diff` — the same
 ///   discipline [`render_with_attribution`] uses) or, when the anchor can't
 ///   be resolved to exactly one diff line, a general body item — never a
-///   guessed line. Any confirmed finding makes the review `REQUEST_CHANGES`
-///   (merge-blocking).
+///   guessed line. Confirmed findings render a formal review whose event is
+///   NON-blocking `COMMENT` by default (#1302 — advisory, matching the
+///   footer's claim; the inline comments are still carried), or blocking
+///   `REQUEST_CHANGES` when the crew opts in via `request_changes: true`
+///   (read here from `env.staffing`).
 /// - [`Tier::NeedsCheck`] (a pass-2 demotion already folds into this tier —
 ///   `judge_one_flag` never leaves a demoted flag `Confirmed`) -> one
 ///   non-blocking bullet in a "worth a double check" section: in the
@@ -1432,10 +1435,26 @@ pub fn synthesize_funnel(env: &FunnelEnvelope, diff: &str, attribution: Option<&
     }
     body.extend(run_warnings_block(env));
 
+    // (#1302) Confirmed findings default to a NON-blocking `COMMENT`-event
+    // formal review: it keeps the formal-review structure and the inline
+    // `comments` on confirmed findings, but does NOT set GitHub's
+    // `reviewDecision` to `CHANGES_REQUESTED`, so it never blocks merge —
+    // matching the footer's "advisory, not a merge gate" claim. A crew opts
+    // back into blocking via `request_changes: true` (snapshotted onto the
+    // envelope's staffing), which renders `REQUEST_CHANGES`. Blocking mode
+    // has no automated resolution path yet — darkmux can't supersede its own
+    // block; #1260 (`review-verify`) + a re-supersede-on-clean-rerun step are
+    // the prerequisites before it should ever default on.
+    let event = if env.staffing.as_ref().is_some_and(|s| s.request_changes) {
+        "REQUEST_CHANGES"
+    } else {
+        "COMMENT"
+    };
+
     Rendered {
         mode: "review",
         review: Some(json!({
-            "event": "REQUEST_CHANGES",
+            "event": event,
             "body": format!("{}{}", body.join("\n"), funnel_footer(env, attribution)),
             "comments": inline,
         })),
@@ -2193,8 +2212,22 @@ mod tests {
         }
     }
 
+    /// (#1302) A healthy envelope whose staffing snapshot opts into the
+    /// blocking review event (`request_changes: true`) — the mirror of the
+    /// default (`healthy_envelope`, which leaves `staffing: None` and so
+    /// renders the non-blocking `COMMENT`).
+    fn blocking_envelope(judged: Vec<JudgedFlag>) -> FunnelEnvelope {
+        FunnelEnvelope {
+            staffing: Some(darkmux_lab::lab::funnel::CrewStaffingSnapshot {
+                request_changes: true,
+                ..Default::default()
+            }),
+            ..healthy_envelope(judged)
+        }
+    }
+
     #[test]
-    fn synthesize_confirmed_resolves_inline_with_marker_and_request_changes() {
+    fn synthesize_confirmed_resolves_inline_with_marker_and_comment_by_default() {
         let j = confirmed_flag(
             "computeEnd@src/x.ts",
             Some("const b = 2;"),
@@ -2205,9 +2238,12 @@ mod tests {
         let r = synthesize_funnel(&env, DIFF, None);
         assert_eq!(r.mode, "review");
         let review = r.review.unwrap();
-        assert_eq!(review["event"], "REQUEST_CHANGES", "a confirmed finding merge-blocks");
+        // (#1302) Default: a formal review with the NON-blocking `COMMENT`
+        // event — it never sets `reviewDecision: CHANGES_REQUESTED`, so it
+        // never blocks merge, yet still carries its inline comments.
+        assert_eq!(review["event"], "COMMENT", "a confirmed finding is advisory by default");
         let comments = review["comments"].as_array().unwrap();
-        assert_eq!(comments.len(), 1);
+        assert_eq!(comments.len(), 1, "the COMMENT-event review still carries its inline finding");
         assert_eq!(comments[0]["path"], "src/x.ts", "bundle_id's fn@path is split on the last @");
         assert_eq!(comments[0]["line"], 2);
         let body = comments[0]["body"].as_str().unwrap();
@@ -2219,6 +2255,49 @@ mod tests {
         let evidence_at = body.find("the clamp is bypassed").unwrap();
         let marker_at = body.find(CONFIRMED_MARKER).unwrap();
         assert!(note_at < evidence_at && evidence_at < marker_at, "{body}");
+    }
+
+    /// (#1302) Opt-in blocking: `request_changes: true` on the crew (carried
+    /// onto the envelope's staffing snapshot) restores the formal blocking
+    /// `REQUEST_CHANGES` event — the inline findings are unchanged.
+    #[test]
+    fn synthesize_confirmed_request_changes_opt_in_renders_blocking_event() {
+        let j = confirmed_flag(
+            "computeEnd@src/x.ts",
+            Some("const b = 2;"),
+            "shadows the config default",
+            "the clamp is bypassed",
+        );
+        let env = blocking_envelope(vec![j]);
+        let r = synthesize_funnel(&env, DIFF, None);
+        assert_eq!(r.mode, "review");
+        let review = r.review.unwrap();
+        assert_eq!(review["event"], "REQUEST_CHANGES", "request_changes:true opts back into blocking");
+        assert_eq!(
+            review["comments"].as_array().unwrap().len(),
+            1,
+            "the blocking review carries the same inline finding as the advisory default"
+        );
+    }
+
+    /// (#1302) A confirmed finding whose anchor can't resolve lands in the
+    /// review BODY — and the default event stays the non-blocking `COMMENT`
+    /// (the general-finding path picks the event the same way the inline path
+    /// does).
+    #[test]
+    fn synthesize_confirmed_general_finding_is_comment_by_default() {
+        let j = confirmed_flag(
+            "computeEnd@src/x.ts",
+            Some("this text never appears in the diff"),
+            "a note the judge left",
+            "some evidence",
+        );
+        let env = healthy_envelope(vec![j]);
+        let r = synthesize_funnel(&env, DIFF, None);
+        let review = r.review.unwrap();
+        assert_eq!(review["event"], "COMMENT", "general confirmed findings are advisory by default too");
+        assert_eq!(review["comments"].as_array().unwrap().len(), 0, "unresolvable anchor never guesses a line");
+        assert!(review["body"].as_str().unwrap().contains("not anchored to a diff line"));
     }
 
     #[test]
@@ -3023,7 +3102,7 @@ mod tests {
         let mut seats = BTreeMap::new();
         seats.insert("review-probe".to_string(), vec![staffing("zzz-probe"), staffing("aaa-probe")]);
         seats.insert("review-judge".to_string(), vec![staffing("zzz-probe")]); // same model as one probe seat
-        let crew = ResolvedCrew { name: "test-crew".into(), seats };
+        let crew = ResolvedCrew { name: "test-crew".into(), seats, request_changes: false };
 
         let summary = crew_model_summary(&crew).expect("non-empty crew has a summary");
         assert_eq!(summary, "darkmux:aaa-probe, darkmux:zzz-probe", "sorted + deduped: {summary}");
@@ -3031,7 +3110,7 @@ mod tests {
 
     #[test]
     fn crew_model_summary_none_for_a_crew_with_no_staffed_seats() {
-        let crew = ResolvedCrew { name: "empty-crew".into(), seats: std::collections::BTreeMap::new() };
+        let crew = ResolvedCrew { name: "empty-crew".into(), seats: std::collections::BTreeMap::new(), request_changes: false };
         assert_eq!(crew_model_summary(&crew), None);
     }
 }

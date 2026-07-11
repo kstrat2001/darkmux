@@ -1041,6 +1041,14 @@ pub struct CrewStaffingSnapshot {
     /// round-trip unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verify: Option<StaffingSnapshot>,
+    /// (#1302) The crew's resolved `request_changes` flag — snapshotted so the
+    /// render path reads the run's own blocking-vs-advisory choice from its
+    /// self-describing artifact, and a serialized envelope re-rendered later
+    /// picks the same review event. Defaults to `false` on read (skipped when
+    /// `false`) so pre-#1302 snapshots round-trip unchanged as the non-blocking
+    /// default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub request_changes: bool,
 }
 
 /// (#1266) Snapshot default for `StaffingSnapshot::passes` — 2 (double-
@@ -1053,6 +1061,7 @@ fn staffing_snapshot(
     probes: &[ResolvedSeatStaffing],
     judge: &ResolvedSeatStaffing,
     verify: Option<&ResolvedSeatStaffing>,
+    request_changes: bool,
 ) -> CrewStaffingSnapshot {
     fn one(s: &ResolvedSeatStaffing) -> StaffingSnapshot {
         StaffingSnapshot {
@@ -1071,6 +1080,9 @@ fn staffing_snapshot(
         probes: probes.iter().map(one).collect(),
         judge: Some(one(judge)),
         verify: verify.map(one),
+        // (#1302) The run's blocking-vs-advisory choice, snapshotted for the
+        // render path (see `CrewStaffingSnapshot::request_changes`).
+        request_changes,
     }
 }
 
@@ -3362,7 +3374,7 @@ fn run_funnel_impl(
         fingerprint: fingerprint(&seat_identifier(&judge.pm), inputs.judge_system),
         // (#1247) The resolved staffing this run actually used, post any
         // caller-applied `--k` override — see `FunnelEnvelope::staffing`.
-        staffing: Some(staffing_snapshot(probes, judge, verify)),
+        staffing: Some(staffing_snapshot(probes, judge, verify, inputs.crew.request_changes)),
         ..Default::default()
     };
     // `funnel.task` started (#1247 Part 1) — run started: case id, crew
@@ -3502,7 +3514,7 @@ pub fn run_judge_only(
         fingerprint: fingerprint(&seat_identifier(&judge.pm), inputs.judge_system),
         // (#1247) The resolved staffing this run actually used, post any
         // caller-applied `--k` override — see `FunnelEnvelope::staffing`.
-        staffing: Some(staffing_snapshot(probes, judge, verify)),
+        staffing: Some(staffing_snapshot(probes, judge, verify, inputs.crew.request_changes)),
         ..Default::default()
     };
     // Same guard discipline as `run_funnel` — see its comment at the
@@ -3571,7 +3583,7 @@ mod tests {
         for (k, v) in seats {
             m.insert(k.to_string(), v);
         }
-        ResolvedCrew { name: "test-crew".to_string(), seats: m }
+        ResolvedCrew { name: "test-crew".to_string(), seats: m, request_changes: false }
     }
 
     fn valid_crew() -> ResolvedCrew {
@@ -5156,6 +5168,60 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&json).expect("envelope parses back");
         assert_eq!(value["staffing"]["judge"]["passes"], json!(3));
         assert_eq!(value["staffing"]["probes"][0]["passes"], json!(2));
+    }
+
+    /// (#1302) The crew's `request_changes` flag is snapshotted onto the
+    /// envelope's staffing and survives the JSON round trip — so the render
+    /// path reads the run's own blocking-vs-advisory choice from its
+    /// self-describing artifact. Default `false` is skipped on serialize
+    /// (pre-#1302 round-trip), `true` is present.
+    #[test]
+    fn staffing_snapshot_carries_the_request_changes_flag() {
+        let mut crew = crew_with(vec![
+            ("review-probe", vec![staffing("fast", "probe-model", 2)]),
+            ("review-judge", vec![staffing("fast", "judge-model", 1)]),
+        ]);
+        crew.request_changes = true; // opt into the blocking review event
+        let inputs = FunnelInputs {
+            case_id: "c-rc".to_string(),
+            crew: &crew,
+            intent_title: "add a feature",
+            intent_body: "",
+            diff: DIFF,
+            mode: ExecMode::Sequential,
+            probe_system: "probe sys",
+            judge_system: "judge sys",
+            verify_system: "verify sys",
+            remote_max_tokens_per_execution: 500_000,
+            bundles: None,
+        };
+        let mut cycler = RecordingCycler::new();
+        let mut chat = |_call: &ChatCall| Ok(reply("a real defect `const end = start.plus(30)`"));
+        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("funnel runs");
+
+        let snapshot = env.staffing.as_ref().expect("staffing snapshot present on a normal run");
+        assert!(snapshot.request_changes, "the crew's request_changes flag is snapshotted");
+
+        // `true` is serialized; the default `false` is skipped (round-trips
+        // pre-#1302 snapshots unchanged).
+        let json = serde_json::to_string(&env).expect("envelope serializes");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("envelope parses back");
+        assert_eq!(value["staffing"]["request_changes"], json!(true));
+
+        let mut advisory = crew_with(vec![
+            ("review-probe", vec![staffing("fast", "probe-model", 2)]),
+            ("review-judge", vec![staffing("fast", "judge-model", 1)]),
+        ]);
+        advisory.request_changes = false; // the default — advisory
+        let inputs2 = FunnelInputs { case_id: "c-adv".to_string(), crew: &advisory, ..inputs };
+        let mut cycler2 = RecordingCycler::new();
+        let env2 = run_funnel(&inputs2, &mut chat, &mut cycler2, &mut NullEmitter).expect("funnel runs");
+        let json2 = serde_json::to_string(&env2).expect("envelope serializes");
+        let value2: serde_json::Value = serde_json::from_str(&json2).expect("envelope parses back");
+        assert!(
+            value2["staffing"].get("request_changes").is_none(),
+            "the advisory default is skipped on serialize"
+        );
     }
 
     #[test]

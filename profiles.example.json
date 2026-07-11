@@ -1,7 +1,7 @@
 {
   "_comment": "darkmux profile registry — example. Four general-purpose reference profiles in increasing capacity order: fast → balanced → deep → gpt-oss, plus three review-funnel-dedicated profiles (devstral, qwen3.6-27b-review, judge-35b-moe — see `_crews_comment` below) that staff the `review-deep` crew, plus one hosted endpoint example (hosted-frontier). A profile's `models[]` are WORKER models (no `role` field — #590); the machine's standing utility/compactor model lives once in the top-level `internal.utility` binding, not per-profile. `default_model` (optional) names a profile's default worker when it lists more than one; with a single model it's implicit. `n_ctx` is required for LOCAL models (it is the load parameter) and omitted for endpoint-bearing models (#1282). Replace the model ids with what you have downloaded in LMStudio (run `lms ls`).",
 
-  "schema_version": "1.3",
+  "schema_version": "1.4",
 
   "profiles": {
     "fast": {
