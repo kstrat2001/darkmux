@@ -325,7 +325,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux"
-version = "1.18.1"
+version = "1.18.2"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -364,7 +364,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-agent-roles"
-version = "1.18.1"
+version = "1.18.2"
 dependencies = [
  "anyhow",
  "serde",
@@ -373,7 +373,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-crew"
-version = "1.18.1"
+version = "1.18.2"
 dependencies = [
  "anyhow",
  "darkmux-flow",
@@ -389,7 +389,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-doctor"
-version = "1.18.1"
+version = "1.18.2"
 dependencies = [
  "anyhow",
  "darkmux-agent-roles",
@@ -409,7 +409,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-eureka"
-version = "1.18.1"
+version = "1.18.2"
 dependencies = [
  "anyhow",
  "darkmux-hardware",
@@ -422,7 +422,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-fleet"
-version = "1.18.1"
+version = "1.18.2"
 dependencies = [
  "anyhow",
  "darkmux-crew",
@@ -438,7 +438,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-flow"
-version = "1.18.1"
+version = "1.18.2"
 dependencies = [
  "anyhow",
  "blake3",
@@ -456,7 +456,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-gestalt"
-version = "1.18.1"
+version = "1.18.2"
 dependencies = [
  "darkmux-types",
  "serde",
@@ -465,14 +465,14 @@ dependencies = [
 
 [[package]]
 name = "darkmux-hardware"
-version = "1.18.1"
+version = "1.18.2"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "darkmux-heuristics"
-version = "1.18.1"
+version = "1.18.2"
 dependencies = [
  "darkmux-hardware",
  "darkmux-profiles",
@@ -482,7 +482,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-lab"
-version = "1.18.1"
+version = "1.18.2"
 dependencies = [
  "anyhow",
  "blake3",
@@ -502,7 +502,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-profiles"
-version = "1.18.1"
+version = "1.18.2"
 dependencies = [
  "anyhow",
  "darkmux-gestalt",
@@ -516,7 +516,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-recommendations"
-version = "1.18.1"
+version = "1.18.2"
 dependencies = [
  "anyhow",
  "darkmux-hardware",
@@ -528,7 +528,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-serve"
-version = "1.18.1"
+version = "1.18.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -554,7 +554,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-types"
-version = "1.18.1"
+version = "1.18.2"
 dependencies = [
  "anyhow",
  "dirs",

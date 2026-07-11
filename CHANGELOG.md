@@ -11,6 +11,24 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 
 ## [Unreleased]
 
+## [1.18.2] - 2026-07-11
+
+The production-hardening patch — a ledger correctness fix plus the credential-and-hang surface the Studio's first Azure-review day surfaced.
+
+### Fixed
+
+- **The memory ledger prices models whose LMStudio path metadata is wrong** (#1309) — a model whose `lms ls`/`ps` reports a directory that doesn't exist on disk (e.g. devstral: reported `mistralai/devstral-small-2-2512`, real dir `mlx-community/Devstral-...`) was unpriceable, and the machine total silently undercounted. A content-scan fallback resolves the real config dir by token-subset match, with an ambiguity guard (multiple matches → stay unpriced, never guess a wrong config). Verified live: devstral went from unpriced to a correct 20.24 GB.
+
+### Added
+
+- **A dependency-free dispatch liveness floor** (#1311) — a heartbeat file (`<home>/liveness/<pid>.log`) plus `[darkmux-liveness]` stderr markers at each dispatch phase boundary, with NO dependency on config/Redis/audit/flow. A dispatch that hangs *before* flow-sink init (the #563 incident: an Azure review that froze 19 min with zero trace) now leaves "started, last alive at phase X" instead of a black box. Phase markers carry resolved detail (sinks, crew/seat-count/endpoint hosts, keychain item names, bundle counts, elapsed) — secrets never logged. `DARKMUX_LOG=debug` adds per-call host/model/token/wall detail.
+- **`EndpointAuth.key_env`** (#1312, PROFILES_SCHEMA 1.4 → 1.5) — declare which environment variable holds an endpoint's API key (any provider). Resolution is `env(key_env) > per-dispatch cache > Keychain`; with the var set, `security` is never spawned — the standard headless-CI-secrets fix, so a self-hosted runner needn't read the macOS Keychain at all. Matches darkmux's existing `DARKMUX_REDIS_URL`/`DARKMUX_SERVE_TOKEN` env-over-Keychain pattern.
+
+### Changed
+
+- **All three Keychain reads are now bounded** (#1311) — the Redis-password read (during flow-sink init, the leading #563 freeze point), the serve-token read, and the endpoint auth spawn `security` with a 15s timeout: a locked/hung login keychain on a headless runner fails fast and actionable instead of a multi-minute freeze. The endpoint credential is also cached per-dispatch (it was read per hosted call — dozens of `security` spawns per review).
+
+
 ## [1.18.1] - 2026-07-11
 
 The review-output patch — everything a first real production Azure review (finsys-api #396/#397)
@@ -70,6 +88,7 @@ funnel, fixed same-day.
   exit paths, `source: "funnel"`) so a live PR review is visible as a running dispatch in the
   viewer's fleet and machine views (#1272, #1277).
 
+[1.18.2]: https://github.com/kstrat2001/darkmux/releases/tag/v1.18.2
 [1.18.1]: https://github.com/kstrat2001/darkmux/releases/tag/v1.18.1
 [1.18.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.18.0
 [1.17.1]: https://github.com/kstrat2001/darkmux/releases/tag/v1.17.1
