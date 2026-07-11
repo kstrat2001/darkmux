@@ -182,6 +182,16 @@ pub struct ProbeFlag {
     pub charge_text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<String>,
+    /// (#1299) Charge texts of same-site duplicate findings this flag
+    /// ABSORBED during dedup — the "aggregate, never discard" contract. On
+    /// collapse the survivor keeps its own `charge_text` and APPENDS each
+    /// absorbed finding's framing here, so a renderer can show BOTH ("also
+    /// flagged: …"). This is the safety net for the asymmetric objective: a
+    /// residual false cut degrades to "one bullet, two framings shown,"
+    /// never a vanished defect. Empty (and unserialized) when nothing was
+    /// absorbed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub also_flagged: Vec<String>,
 }
 
 /// Bookkeeping [`dedup_flags`] returns alongside the deduped list — the
@@ -1426,30 +1436,6 @@ fn mechanism_family(charge_text: &str) -> &'static str {
             ],
         ),
         (
-            // (#1299) ONE coarse null-safety/bounds family. A frontier judge
-            // words the SAME out-of-bounds/undefined defect many ways
-            // (`undefined`, `out of bounds`, `index`, `array`), and the old
-            // table split those synonyms across `null/nan` and `other`, so a
-            // bug stated five ways never shared a dedup key. Merged here so
-            // the synonyms land together — safe against over-collapse because
-            // the dedup predicate ALSO demands a shared symbol AND a shared
-            // location (see [`dedup_flags`]), never a family match alone.
-            "null/bounds",
-            &[
-                &["null"],
-                &["undefined"],
-                &["nan"],
-                &["none"],
-                &["nil"],
-                &["out", "of", "bounds"],
-                &["out", "of", "range"],
-                &["bounds"],
-                &["index"],
-                &["indices"],
-                &["array"],
-            ],
-        ),
-        (
             "async/await",
             &[
                 &["async"],
@@ -1465,13 +1451,19 @@ fn mechanism_family(charge_text: &str) -> &'static str {
         ),
         (
             // (#1299) Provenance / field-name-mismatch — the family for a
-            // value recorded under the WRONG field, or a derived value that
-            // drops its source-of-record. Kept DISTINCT from `null/bounds`
-            // above so the #396 `incorporatedDate` provenance defect (wrong
-            // field name) never shares a family with the `docFileEntry`
-            // out-of-bounds defect in the same file — the family split is one
-            // of the two guards (the other is symbol overlap) that keeps a
-            // provenance bug from merging into a bounds bug.
+            // value recorded under the WRONG field, read from the WRONG
+            // source, or a derived value that drops its source-of-record.
+            //
+            // Ordered BEFORE `null/bounds` DELIBERATELY (#1299 MUST_FIX): a
+            // provenance defect co-located with a bounds defect (same line,
+            // same symbol, same anchor) whose prose mentions `index`/`array`
+            // must land HERE, not in bounds — otherwise the two collapse and
+            // the provenance bug is lost. Specific families are checked
+            // before the coarse `null/bounds` catch-all for exactly this
+            // reason. This is one of the two guards (the other is symbol
+            // overlap) that keeps a provenance bug from merging into a bounds
+            // bug — e.g. the #396 `incorporatedDate` (wrong field) vs
+            // `docFileEntry` (out of bounds) in the same file.
             "provenance/sibling",
             &[
                 &["sibling"],
@@ -1485,10 +1477,43 @@ fn mechanism_family(charge_text: &str) -> &'static str {
                 &["provenance"],
                 &["field", "name"],
                 &["wrong", "field"],
+                &["wrong", "source"],
                 &["field", "mismatch"],
                 &["recorded", "under"],
                 &["source", "field"],
                 &["source", "mapping"],
+                &["source", "of", "record"],
+            ],
+        ),
+        (
+            // (#1299) The coarse null-safety/bounds family, checked LAST so
+            // every more-specific family above wins first. A frontier judge
+            // words the SAME undefined/out-of-bounds defect many ways, and
+            // the old table split those synonyms across `null/nan` and
+            // `other`, so a bug stated five ways never shared a dedup key.
+            //
+            // Keywords are ANCHORED PHRASES, never BARE GENERIC TOKENS
+            // (#1299 MUST_FIX): `index`/`array`/`bounds` alone co-occur
+            // across unrelated defect classes (a provenance bug can read the
+            // "wrong source at this index"), so classifying on them merged
+            // distinct bugs. Only `undefined`/`null`/`nan` and the multi-word
+            // `out of bounds`/`out of range` — signals that actually name a
+            // null-safety/bounds defect — count. This deliberately collapses
+            // FEWER restatements (a bare-`index` restatement lands in
+            // `other`); that's the right trade (duplicates beat false cuts).
+            // Safe against over-collapse anyway: the dedup predicate ALSO
+            // demands a shared symbol AND a shared location, never family
+            // alone.
+            "null/bounds",
+            &[
+                &["null"],
+                &["undefined"],
+                &["nan"],
+                &["none"],
+                &["nil"],
+                &["out", "of", "bounds"],
+                &["out", "of", "range"],
+                &["index", "out", "of"],
             ],
         ),
     ];
@@ -1656,8 +1681,19 @@ pub fn dedup_flags(flags: Vec<ProbeFlag>, diff: &str) -> (Vec<ProbeFlag>, DedupS
                 && !symbols.is_empty()
                 && !s.symbols.is_disjoint(&symbols)
         });
+        // `survivors` and `out` are pushed together, so index `i` addresses
+        // the same finding in both.
         match target {
-            Some(i) => survivors[i].symbols.extend(symbols),
+            Some(i) => {
+                survivors[i].symbols.extend(symbols);
+                // AGGREGATE, never discard (#1299 MUST_FIX): fold the
+                // absorbed finding's framing into the survivor so a rendered
+                // finding shows BOTH. The safety net — even a residual false
+                // cut degrades to "one bullet, two framings," never a
+                // vanished defect.
+                out[i].also_flagged.push(f.charge_text);
+                out[i].also_flagged.append(&mut f.also_flagged);
+            }
             None => {
                 f.anchor = anchor.clone();
                 survivors.push(Survivor {
@@ -2257,6 +2293,7 @@ fn dispatch_probe_staffing(
                             draw,
                             charge_text: text,
                             anchor: None,
+                            also_flagged: Vec::new(),
                         });
                     }
                 }
@@ -3552,6 +3589,7 @@ mod tests {
             draw,
             charge_text: charge_text.to_string(),
             anchor: None,
+            also_flagged: Vec::new(),
         }
     }
 
@@ -3876,6 +3914,71 @@ mod tests {
         let (deduped, stats) = dedup_flags(flags, diff);
         assert!(deduped.iter().all(|f| f.anchor.is_none()), "no anchor resolved");
         assert_eq!(stats.deduped, 2, "no location → no collapse (recall-safe)");
+    }
+
+    /// (#1299 MUST_FIX 2) The adversarial shape the first golden test
+    /// MISSED: a provenance / wrong-source bug and a bounds bug share a
+    /// line, a symbol, AND an anchor, and the provenance bug's prose even
+    /// mentions "array"/"index". It must NOT collapse into the bounds bug —
+    /// bare generic tokens no longer classify `null/bounds`, and the
+    /// specific `provenance/sibling` family is table-ordered first, so the
+    /// two land in different families and stay separate.
+    #[test]
+    fn dedup_provenance_worded_with_index_does_not_merge_into_bounds() {
+        let diff = "--- a/svc.ts\n+++ b/svc.ts\n@@ -1,2 +1,2 @@\n ctx\n+  const docFileEntry = sources[idx]\n";
+        let flags = vec![
+            flag("svc.ts", "m", 0, "`docFileEntry = sources[idx]` can be undefined / out of bounds when sources is empty."),
+            flag("svc.ts", "m", 1, "`docFileEntry = sources[idx]` reads the wrong source at this array index — a provenance mismatch, not a bounds error."),
+        ];
+        // Same file + same symbol + same anchor, but DIFFERENT families.
+        assert_eq!(mechanism_family(&flags[0].charge_text), "null/bounds");
+        assert_eq!(mechanism_family(&flags[1].charge_text), "provenance/sibling");
+        let (deduped, stats) = dedup_flags(flags, diff);
+        assert_eq!(
+            stats.deduped, 2,
+            "a provenance bug worded with index/array must not merge into a co-located bounds bug"
+        );
+        assert!(
+            deduped.iter().all(|f| f.also_flagged.is_empty()),
+            "no false collapse → nothing absorbed"
+        );
+    }
+
+    /// (#1299 MUST_FIX 2) Bare generic tokens (`index`/`array`/`bounds`) no
+    /// longer classify `null/bounds` — they co-occur across unrelated defect
+    /// classes. Only anchored phrases do; a provenance finding that also
+    /// mentions index/array lands in provenance.
+    #[test]
+    fn mechanism_family_bare_index_array_bounds_are_not_null_bounds() {
+        assert_eq!(mechanism_family("the loop reads the index into the array"), "other");
+        assert_eq!(mechanism_family("a bounds concern on this record"), "other");
+        assert_eq!(mechanism_family("this is out of bounds on an empty list"), "null/bounds");
+        assert_eq!(mechanism_family("the value can be undefined here"), "null/bounds");
+        assert_eq!(
+            mechanism_family("reads the wrong source at this array index"),
+            "provenance/sibling"
+        );
+    }
+
+    /// (#1299 MUST_FIX 1) Collapse AGGREGATES, never discards: when Bug A's
+    /// three same-site restatements collapse, the survivor retains its own
+    /// framing AND carries the two absorbed ones in `also_flagged`, so a
+    /// rendered finding can show every framing — a residual false cut can
+    /// never vanish a defect's description.
+    #[test]
+    fn dedup_collapse_retains_absorbed_charge_texts() {
+        let (deduped, _stats) = dedup_flags(flags_396(), DIFF_396);
+        let a = deduped
+            .iter()
+            .find(|f| f.bundle_id == SPEC_FILE)
+            .expect("Bug A survivor present");
+        assert_eq!(
+            a.also_flagged.len(),
+            2,
+            "the two absorbed Bug A restatements are retained, not dropped"
+        );
+        // The retained framings are the OTHER two, distinct from the survivor's own.
+        assert!(a.also_flagged.iter().all(|t| *t != a.charge_text));
     }
 
     #[test]

@@ -2427,6 +2427,7 @@ mod tests {
             draw: 0,
             charge_text: "the clamp is bypassed".into(),
             anchor: anchor.map(str::to_string),
+            also_flagged: Vec::new(),
         }
     }
 

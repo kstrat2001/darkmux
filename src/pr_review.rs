@@ -2060,6 +2060,7 @@ mod tests {
             draw: 0,
             charge_text: "a flagged concern".to_string(),
             anchor: anchor.map(str::to_string),
+            also_flagged: Vec::new(),
         }
     }
 
