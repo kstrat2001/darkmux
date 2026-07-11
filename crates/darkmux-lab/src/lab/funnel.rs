@@ -855,6 +855,14 @@ pub struct FunnelEnvelope {
     /// least one REMOTE call. Empty (and unserialized) on local-only runs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub remote_budgets: Vec<RemoteBudgetRecord>,
+    /// (#1299) The `needs_check` tier clustered by `(file, mechanism-family)`
+    /// when it exceeded [`NEEDS_CHECK_CLUSTER_THRESHOLD`] — a renderer emits
+    /// one "N related concerns" bullet per cluster instead of N raw ones, so
+    /// a duplicative tier can't wall-of-text. NEVER a drop: the clusters'
+    /// counts sum to `needs_check`. Empty (and unserialized) when the tier
+    /// was at or below the threshold — small sets render raw.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub needs_check_clusters: Vec<NeedsCheckCluster>,
 }
 
 /// Serde helper for the skip-if-zero count fields — keeps envelopes from
@@ -1378,8 +1386,8 @@ fn contains_token_seq(tokens: &[String], seq: &[&str]) -> bool {
 ///
 /// Matching is WHOLE-TOKEN (word-boundary), never substring — the naive
 /// `.contains()` form classified "tenant", "covenant", and "finance" as
-/// `null/nan` (all contain "nan"), so two DISTINCT unanchored charges on a
-/// billing corpus collapsed in dedup and a real defect was silently
+/// `null/bounds` (all contain "nan"), so two DISTINCT unanchored charges on
+/// a billing corpus collapsed in dedup and a real defect was silently
 /// dropped (frontier QA should-fix on this packet's PR). Plural/variant
 /// forms are listed explicitly rather than stemmed — transparent beats
 /// clever for a table this small.
@@ -1418,8 +1426,28 @@ fn mechanism_family(charge_text: &str) -> &'static str {
             ],
         ),
         (
-            "null/nan",
-            &[&["null"], &["undefined"], &["nan"], &["none"], &["nil"]],
+            // (#1299) ONE coarse null-safety/bounds family. A frontier judge
+            // words the SAME out-of-bounds/undefined defect many ways
+            // (`undefined`, `out of bounds`, `index`, `array`), and the old
+            // table split those synonyms across `null/nan` and `other`, so a
+            // bug stated five ways never shared a dedup key. Merged here so
+            // the synonyms land together — safe against over-collapse because
+            // the dedup predicate ALSO demands a shared symbol AND a shared
+            // location (see [`dedup_flags`]), never a family match alone.
+            "null/bounds",
+            &[
+                &["null"],
+                &["undefined"],
+                &["nan"],
+                &["none"],
+                &["nil"],
+                &["out", "of", "bounds"],
+                &["out", "of", "range"],
+                &["bounds"],
+                &["index"],
+                &["indices"],
+                &["array"],
+            ],
         ),
         (
             "async/await",
@@ -1436,6 +1464,14 @@ fn mechanism_family(charge_text: &str) -> &'static str {
             ],
         ),
         (
+            // (#1299) Provenance / field-name-mismatch — the family for a
+            // value recorded under the WRONG field, or a derived value that
+            // drops its source-of-record. Kept DISTINCT from `null/bounds`
+            // above so the #396 `incorporatedDate` provenance defect (wrong
+            // field name) never shares a family with the `docFileEntry`
+            // out-of-bounds defect in the same file — the family split is one
+            // of the two guards (the other is symbol overlap) that keeps a
+            // provenance bug from merging into a bounds bug.
             "provenance/sibling",
             &[
                 &["sibling"],
@@ -1447,6 +1483,12 @@ fn mechanism_family(charge_text: &str) -> &'static str {
                 &["diverged"],
                 &["copy", "paste"],
                 &["provenance"],
+                &["field", "name"],
+                &["wrong", "field"],
+                &["field", "mismatch"],
+                &["recorded", "under"],
+                &["source", "field"],
+                &["source", "mapping"],
             ],
         ),
     ];
@@ -1495,30 +1537,211 @@ fn extract_new_side_anchor(charge_text: &str, diff: &str) -> Option<String> {
     None
 }
 
+// ─── referenced-symbol extraction (a dedup-predicate signal) ─────────────
+
+/// The set of code identifiers a charge NAMES — the function/field/variable
+/// it points at (`docFileEntry`, `writeDocumentInstance`, `isInThousands`).
+/// Pure, deterministic string work — no dispatch, no similarity model
+/// (#1299). A maximal `[A-Za-z0-9_]` run counts as a SYMBOL only when it
+/// reads like code rather than prose:
+///
+///  * camelCase / PascalCase — an internal case change (`docFileEntry`,
+///    `FinancialStatement`), OR
+///  * snake_case — an interior `_` between alphanumerics (`doc_file_entry`),
+///    OR
+///  * a call site — the run is immediately followed by `(` (`record(`).
+///
+/// Plain lowercase English words are EXCLUDED even inside backticks: making
+/// `record` / `value` / `data` a symbol would let two unrelated bugs that
+/// both mention a common word false-collapse — the exact over-cut #1299's
+/// asymmetric objective ("a leaked duplicate beats a false cut") forbids. A
+/// missed specific symbol only costs a leaked duplicate; a spurious generic
+/// one risks merging two real bugs. Comparison is lowercased so
+/// `DocFileEntry` and `docFileEntry` overlap.
+fn referenced_symbols(charge_text: &str) -> std::collections::BTreeSet<String> {
+    let chars: Vec<char> = charge_text.chars().collect();
+    let mut out = std::collections::BTreeSet::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i].is_alphanumeric() || chars[i] == '_' {
+            let start = i;
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            let run: String = chars[start..i].iter().collect();
+            // An identifier starts with a letter or `_`, never a bare number.
+            let first = run.chars().next().unwrap();
+            let starts_ok = first.is_alphabetic() || first == '_';
+            // A call site: the run is IMMEDIATELY followed by `(` (no space)
+            // — catches lowercase method/function names the case rules miss.
+            let followed_by_call = i < chars.len() && chars[i] == '(';
+            if starts_ok && (is_code_identifier(&run) || followed_by_call) {
+                out.insert(run.to_lowercase());
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// True when `run` has an internal case change (camelCase / PascalCase) or
+/// an interior underscore (snake_case) — the "this is an identifier, not an
+/// English word" test. See [`referenced_symbols`].
+fn is_code_identifier(run: &str) -> bool {
+    let cs: Vec<char> = run.chars().collect();
+    // snake_case: an underscore flanked by alphanumerics on BOTH sides.
+    let snake = cs.iter().enumerate().any(|(k, &c)| {
+        c == '_' && k > 0 && k + 1 < cs.len() && cs[k - 1].is_alphanumeric() && cs[k + 1].is_alphanumeric()
+    });
+    // camelCase / PascalCase: a lowercase-or-digit immediately followed by
+    // an uppercase (`docFileEntry` → `cF`, `NaN` → `aN`).
+    let camel = cs
+        .windows(2)
+        .any(|w| (w[0].is_lowercase() || w[0].is_ascii_digit()) && w[1].is_uppercase());
+    snake || camel
+}
+
 // ─── dedup ────────────────────────────────────────────────────────────────
 
-/// Dedup raw probe flags. Key = `(bundle_id, anchor-or-none, mechanism
-/// family)` — flags from different members/draws that land on the same key
-/// collapse to ONE surviving flag (the first seen, in input order).
-/// Anchor extraction (see [`extract_new_side_anchor`]) happens HERE,
-/// populating `ProbeFlag::anchor` on the surviving flags — `diff` is why
-/// this function needs it.
+/// Dedup raw probe flags (#1299). Two flags collapse ONLY when ALL FOUR
+/// signals agree — the predicate is an AND, never an OR, and ANY missing or
+/// diverging signal keeps the two findings SEPARATE:
+///
+///  1. same `bundle_id` (same file), AND
+///  2. same [`mechanism_family`], AND
+///  3. an overlapping referenced SYMBOL ([`referenced_symbols`] — an empty
+///     set overlaps nothing, so a charge that names no identifier collapses
+///     with nothing), AND
+///  4. an overlapping LOCATION — both flags anchored, to the SAME diff site
+///     ([`extract_new_side_anchor`]). A missing anchor (the #1299 frontier
+///     case — 0/9 anchored) or two DIFFERENT anchors → separate.
+///
+/// This encodes the operator's asymmetric objective: a leaked duplicate is
+/// acceptable; a FALSE CUT (two distinct bugs merged into one) is not. So a
+/// frontier judge that words ONE defect many ways AT ONE SITE collapses,
+/// while the SAME symbol at DIFFERENT sites (`docFileEntry` across five
+/// branches) stays as separate findings — different sites can be different
+/// bugs, and every site keeps its own finding. When nothing anchors, the
+/// honest result is "fewer collapses, more duplicates," never an over-merge;
+/// the `needs_check` volume is tamed downstream by [`cluster_needs_check`].
+///
+/// Collapsing AGGREGATES, never discards: a survivor folds in each absorbed
+/// same-site finding's symbols, so a later restatement overlapping EITHER of
+/// them still collapses (transitive same-site duplicates). Because collapse
+/// requires an IDENTICAL location, no distinct site is ever hidden.
+///
+/// Anchor extraction happens HERE, populating `ProbeFlag::anchor` on the
+/// surviving flags — `diff` is why this function needs it.
 pub fn dedup_flags(flags: Vec<ProbeFlag>, diff: &str) -> (Vec<ProbeFlag>, DedupStats) {
     let raw = flags.len();
-    let mut seen: std::collections::HashSet<(String, Option<String>, &'static str)> =
-        std::collections::HashSet::new();
-    let mut out = Vec::new();
+    struct Survivor {
+        bundle_id: String,
+        family: &'static str,
+        anchor: Option<String>,
+        symbols: std::collections::BTreeSet<String>,
+    }
+    let mut survivors: Vec<Survivor> = Vec::new();
+    let mut out: Vec<ProbeFlag> = Vec::new();
     for mut f in flags {
         let anchor = extract_new_side_anchor(&f.charge_text, diff);
         let family = mechanism_family(&f.charge_text);
-        let key = (f.bundle_id.clone(), anchor.clone(), family);
-        if seen.insert(key) {
-            f.anchor = anchor;
-            out.push(f);
+        let symbols = referenced_symbols(&f.charge_text);
+        // First survivor (input order) satisfying the full AND-predicate.
+        let target = survivors.iter().position(|s| {
+            s.bundle_id == f.bundle_id
+                && s.family == family
+                && anchor.is_some()
+                && s.anchor == anchor
+                && !symbols.is_empty()
+                && !s.symbols.is_disjoint(&symbols)
+        });
+        match target {
+            Some(i) => survivors[i].symbols.extend(symbols),
+            None => {
+                f.anchor = anchor.clone();
+                survivors.push(Survivor {
+                    bundle_id: f.bundle_id.clone(),
+                    family,
+                    anchor,
+                    symbols,
+                });
+                out.push(f);
+            }
         }
     }
     let deduped = out.len();
     (out, DedupStats { raw, deduped })
+}
+
+// ─── needs_check clustering (tier-volume cap) ────────────────────────────
+
+/// Above this many `needs_check` findings, [`cluster_needs_check`] groups
+/// them by `(file, mechanism-family)` so the tier can't wall-of-text a
+/// review (#1299 — the #396 review carried ~25 heavily-duplicative
+/// `needs_check` items). At or below it, the raw findings render as-is.
+/// Named, not a magic literal, so the operator can see the knob.
+pub const NEEDS_CHECK_CLUSTER_THRESHOLD: usize = 8;
+
+/// One `(file, mechanism-family)` cluster of `needs_check` findings — a
+/// count, never a drop (#1299). Rendered as a single "N related concerns"
+/// bullet ([`NeedsCheckCluster::bullet`]) in place of N raw ones.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NeedsCheckCluster {
+    /// The bundle id (file path) the clustered findings share.
+    pub file: String,
+    /// The [`mechanism_family`] the clustered findings share.
+    pub mechanism: String,
+    /// How many `needs_check` findings this cluster stands in for. The sum
+    /// of every cluster's `count` EQUALS the total `needs_check` count —
+    /// clustering conserves concerns, it never hides one.
+    pub count: usize,
+}
+
+impl NeedsCheckCluster {
+    /// The single review bullet this cluster renders as — names the count,
+    /// the file, and the mechanism, so nothing is hidden behind the cap.
+    pub fn bullet(&self) -> String {
+        format!(
+            "{} related concern{} in {} around {}",
+            self.count,
+            if self.count == 1 { "" } else { "s" },
+            self.file,
+            self.mechanism,
+        )
+    }
+}
+
+/// Cluster the `needs_check` tier when it exceeds
+/// [`NEEDS_CHECK_CLUSTER_THRESHOLD`] (#1299). Groups the `needs_check`
+/// findings by `(bundle_id, mechanism-family)` and returns one
+/// [`NeedsCheckCluster`] per group; the sum of the clusters' counts always
+/// equals the input `needs_check` count (nothing is ever dropped — clustered
+/// findings are counted, not hidden). Returns an EMPTY vec when the tier is
+/// at or below the threshold, so small `needs_check` sets render raw. Pure
+/// and deterministic: groups are emitted sorted by `(file, mechanism)`, so
+/// the same input yields byte-identical output every run.
+pub fn cluster_needs_check(judged: &[JudgedFlag]) -> Vec<NeedsCheckCluster> {
+    let needs_check: Vec<&JudgedFlag> =
+        judged.iter().filter(|j| j.tier == Tier::NeedsCheck).collect();
+    if needs_check.len() <= NEEDS_CHECK_CLUSTER_THRESHOLD {
+        return Vec::new();
+    }
+    // BTreeMap keyed on (file, mechanism) → deterministic, already sorted.
+    let mut groups: std::collections::BTreeMap<(String, &'static str), usize> =
+        std::collections::BTreeMap::new();
+    for j in &needs_check {
+        let family = mechanism_family(&j.flag.charge_text);
+        *groups.entry((j.flag.bundle_id.clone(), family)).or_insert(0) += 1;
+    }
+    groups
+        .into_iter()
+        .map(|((file, mechanism), count)| NeedsCheckCluster {
+            file,
+            mechanism: mechanism.to_string(),
+            count,
+        })
+        .collect()
 }
 
 // ─── judge prompt + ruling parser ────────────────────────────────────────
@@ -3005,6 +3228,9 @@ fn finish_funnel(
     env.confirmed = judged.iter().filter(|j| j.tier == Tier::Confirmed).count();
     env.needs_check = judged.iter().filter(|j| j.tier == Tier::NeedsCheck).count();
     env.archived = judged.iter().filter(|j| j.tier == Tier::Archived).count();
+    // (#1299) Cluster the `needs_check` tier when it exceeds the threshold —
+    // a count-preserving cap, never a drop (see [`cluster_needs_check`]).
+    env.needs_check_clusters = cluster_needs_check(&judged);
     env.verified = judged
         .iter()
         .filter(|j| matches!(&j.verify, Some(v) if v.ruling == VerifyRuling::Verified))
@@ -3418,15 +3644,26 @@ mod tests {
         assert_eq!(deduped.len(), 2);
     }
 
+    /// (#1299 recall guard) Two unanchored flags — no resolvable location —
+    /// must NOT collapse even in the same family, because the dedup
+    /// predicate requires a shared LOCATION and a shared SYMBOL, and neither
+    /// is present. Under the asymmetric objective ("a leaked duplicate beats
+    /// a false cut") a missing location keeps findings separate. This
+    /// replaces the pre-#1299 family-only collapse, which was the over-cut
+    /// path the location/symbol rules close.
     #[test]
-    fn dedup_no_anchor_flags_dedup_by_family_only() {
+    fn dedup_no_location_no_symbol_flags_do_not_collapse() {
         let flags = vec![
             flag("b1", "member-a", 0, "This is a null pointer risk on the branch."),
-            flag("b1", "member-b", 0, "A NaN can reach this path unchecked."),
+            flag("b1", "member-b", 0, "A null value can reach this path unchecked."),
         ];
         let (deduped, stats) = dedup_flags(flags, DIFF);
-        assert_eq!(stats.deduped, 1, "no-anchor flags in the same family collapse");
+        assert_eq!(
+            stats.deduped, 2,
+            "no anchor + no symbol → no location/symbol overlap → both survive (recall-safe)"
+        );
         assert!(deduped[0].anchor.is_none());
+        assert!(deduped[1].anchor.is_none());
     }
 
     #[test]
@@ -3440,7 +3677,7 @@ mod tests {
     }
 
     /// Frontier QA should-fix on this packet's PR: substring matching
-    /// classified "tenant", "covenant", and "finance" as `null/nan` (all
+    /// classified "tenant", "covenant", and "finance" as `null/bounds` (all
     /// contain "nan"), so two DISTINCT unanchored charges on a billing
     /// corpus keyed identically and one real defect was silently dropped
     /// in dedup. Word-boundary matching must not fire on those words.
@@ -3449,12 +3686,12 @@ mod tests {
         assert_eq!(
             mechanism_family("The tenant covenant check is skipped for finance accounts."),
             "other",
-            "'tenant'/'covenant'/'finance' must not classify as null/nan"
+            "'tenant'/'covenant'/'finance' must not classify as null/bounds"
         );
         // The real keywords still classify as whole tokens.
-        assert_eq!(mechanism_family("A null value reaches this branch."), "null/nan");
-        assert_eq!(mechanism_family("NaN propagates into the total."), "null/nan");
-        assert_eq!(mechanism_family("None is returned on the error path."), "null/nan");
+        assert_eq!(mechanism_family("A null value reaches this branch."), "null/bounds");
+        assert_eq!(mechanism_family("NaN propagates into the total."), "null/bounds");
+        assert_eq!(mechanism_family("None is returned on the error path."), "null/bounds");
         // Punctuation-adjacent tokens still match (tokenizer strips it).
         assert_eq!(mechanism_family("Uses `Date.now()` for the cutoff."), "timezone/ambient-time");
         // "nonexistent" must not token-match "none".
@@ -3463,7 +3700,7 @@ mod tests {
 
     /// Two unanchored flags on the SAME bundle whose charges describe
     /// genuinely different mechanisms must both survive dedup — the
-    /// substring bug collapsed them (both misclassified `null/nan`) and
+    /// substring bug collapsed them (both misclassified `null/bounds`) and
     /// silently dropped a real defect.
     #[test]
     fn dedup_distinct_mechanisms_same_bundle_both_survive() {
@@ -3482,6 +3719,243 @@ mod tests {
             "genuinely different mechanisms in one bundle must both survive"
         );
         assert_eq!(deduped.len(), 2);
+    }
+
+    // ── #1299: symbol extraction + the #396 production case ───────────
+
+    #[test]
+    fn referenced_symbols_extracts_code_identifiers_not_prose() {
+        // camelCase, PascalCase, snake_case, and call sites are symbols;
+        // plain English words (even in backticks) are NOT.
+        let s = referenced_symbols(
+            "The `docFileEntry` from FinancialStatement uses doc_file_entry and calls record(x).",
+        );
+        assert!(s.contains("docfileentry"), "camelCase is a symbol");
+        assert!(s.contains("financialstatement"), "PascalCase is a symbol");
+        assert!(s.contains("doc_file_entry"), "snake_case is a symbol");
+        assert!(s.contains("record"), "a call site `record(` is a symbol");
+        // Plain lowercase prose words are excluded — no false symbols that
+        // could over-collapse two unrelated bugs.
+        assert!(!s.contains("the"));
+        assert!(!s.contains("from"));
+        assert!(!s.contains("uses"));
+        assert!(!s.contains("calls"));
+        // A bare lowercase word not followed by `(` is not a symbol.
+        assert!(referenced_symbols("the value is dropped").is_empty());
+    }
+
+    // The #396 diff — the new-side lines every golden charge quotes so its
+    // anchor resolves to a real site.
+    const DIFF_396: &str = "--- a/src/domain/extraction/financialStatementSpec.ts\n+++ b/src/domain/extraction/financialStatementSpec.ts\n@@ -10,2 +10,3 @@\n ctx\n+  if (isInThousands) recordDerived(value * 1000)\n--- a/src/services/ihsService.ts\n+++ b/src/services/ihsService.ts\n@@ -20,2 +20,10 @@\n ctx\n+  const docFileEntry = bankStatements[idx]\n+  const docFileEntry = invoices[idx]\n+  const docFileEntry = epfFiles[idx]\n+  const docFileEntry = payslips[idx]\n+  const docFileEntry = financialStatements[idx]\n+  writeDocumentInstance(docFileEntry)\n+  provenance.incorporatedDate = record.date\n";
+
+    const SPEC_FILE: &str = "src/domain/extraction/financialStatementSpec.ts";
+    const IHS_FILE: &str = "src/services/ihsService.ts";
+
+    /// The 9 "confirmed" #396 findings — 3 distinct bugs stated many ways.
+    fn flags_396() -> Vec<ProbeFlag> {
+        vec![
+            // Bug A — isInThousands drops the provenance source field. Three
+            // restatements, all quoting the SAME recordDerived site.
+            flag(SPEC_FILE, "gpt-4o", 0, "`recordDerived(value * 1000)` in the isInThousands branch drops the provenance source field."),
+            flag(SPEC_FILE, "gpt-4o", 1, "`recordDerived(value * 1000)` is called unconditionally, losing the source mapping — a provenance defect."),
+            flag(SPEC_FILE, "gpt-4o", 2, "`recordDerived(value * 1000)` records the derived value but omits the provenance source field."),
+            // Bug B — docFileEntry undefined / out-of-bounds before
+            // writeDocumentInstance. Five branches, five DISTINCT sites.
+            flag(IHS_FILE, "gpt-4o", 0, "`docFileEntry = bankStatements[idx]` can be undefined before writeDocumentInstance — out of bounds on an empty array."),
+            flag(IHS_FILE, "gpt-4o", 1, "`docFileEntry = invoices[idx]` may be undefined; the index can exceed the array length."),
+            flag(IHS_FILE, "gpt-4o", 2, "`docFileEntry = epfFiles[idx]` is out of bounds when epfFiles is empty; undefined reaches writeDocumentInstance."),
+            flag(IHS_FILE, "gpt-4o", 3, "`docFileEntry = payslips[idx]` — index-based selection can return undefined for the payslips branch."),
+            flag(IHS_FILE, "gpt-4o", 4, "`docFileEntry = financialStatements[idx]` can be undefined / out of bounds in the financialStatements branch before writeDocumentInstance."),
+            // Bug C — incorporatedDate recorded under the wrong field name.
+            // Same FILE as B, but a DIFFERENT bug (provenance, not bounds).
+            flag(IHS_FILE, "gpt-4o", 5, "`incorporatedDate` is recorded under the wrong field name, and there is no write-gate."),
+        ]
+    }
+
+    /// The #396 golden case. Recall guards are HARD asserts; the exact
+    /// collapse count is NOT pinned (the asymmetric objective — "a leaked
+    /// duplicate beats a false cut"), only bounded to a range.
+    #[test]
+    fn dedup_396_collapses_duplicates_but_keeps_the_three_bugs_separate() {
+        let (deduped, stats) = dedup_flags(flags_396(), DIFF_396);
+        assert_eq!(stats.raw, 9);
+
+        // HARD — Bug A's three same-site restatements collapse to ONE.
+        let a: Vec<&ProbeFlag> = deduped.iter().filter(|f| f.bundle_id == SPEC_FILE).collect();
+        assert_eq!(a.len(), 1, "Bug A (isInThousands provenance) collapses to one finding");
+        assert_eq!(mechanism_family(&a[0].charge_text), "provenance/sibling");
+
+        // HARD — every docFileEntry SITE survives (five distinct branches):
+        // same symbol at different locations is NOT collapsed (recall).
+        let b: Vec<&ProbeFlag> = deduped
+            .iter()
+            .filter(|f| {
+                f.bundle_id == IHS_FILE && referenced_symbols(&f.charge_text).contains("docfileentry")
+            })
+            .collect();
+        assert_eq!(b.len(), 5, "every docFileEntry branch keeps its own finding — no site hidden");
+        let sites: std::collections::BTreeSet<Option<String>> =
+            b.iter().map(|f| f.anchor.clone()).collect();
+        assert_eq!(sites.len(), 5, "the five docFileEntry findings anchor to five distinct sites");
+        assert!(
+            b.iter().all(|f| mechanism_family(&f.charge_text) == "null/bounds"),
+            "Bug B is the null-safety/bounds family"
+        );
+
+        // HARD (the recall guard) — Bug C is PRESENT, exactly once, and is
+        // NOT merged into Bug B: different family AND different symbol, same
+        // file notwithstanding.
+        let c: Vec<&ProbeFlag> = deduped
+            .iter()
+            .filter(|f| referenced_symbols(&f.charge_text).contains("incorporateddate"))
+            .collect();
+        assert_eq!(c.len(), 1, "Bug C (incorporatedDate provenance) is present, exactly once");
+        assert!(
+            !referenced_symbols(&c[0].charge_text).contains("docfileentry"),
+            "Bug C must not carry Bug B's symbol"
+        );
+        assert_eq!(
+            mechanism_family(&c[0].charge_text),
+            "provenance/sibling",
+            "Bug C is provenance/field-name, a DIFFERENT family than Bug B (null/bounds)"
+        );
+
+        // SOFT — some collapse happened (A's three → one) and no over-merge:
+        // a range, never a pinned count. 9 raw → 7 here (A collapses, B's
+        // five distinct sites and C survive); anything in-range is a PASS.
+        assert!(
+            (3..=7).contains(&deduped.len()),
+            "recall-safe collapse expected in 3..=7, got {}",
+            deduped.len()
+        );
+    }
+
+    /// Recall/negative guard: two GENUINELY DIFFERENT bugs in the same file
+    /// and the same mechanism-family, but naming different symbols at
+    /// different sites, must both survive — never over-collapsed.
+    #[test]
+    fn dedup_recall_same_file_family_different_symbol_stay_separate() {
+        let diff = "--- a/svc.ts\n+++ b/svc.ts\n@@ -1,2 +1,3 @@\n ctx\n+  const a = parseAmount(row)\n+  const b = docFileEntry[idx]\n";
+        let flags = vec![
+            flag("svc.ts", "m", 0, "`parseAmount(row)` can return undefined for an empty row."),
+            flag("svc.ts", "m", 1, "`docFileEntry[idx]` may be undefined / out of bounds."),
+        ];
+        let (deduped, stats) = dedup_flags(flags, diff);
+        assert_eq!(
+            stats.deduped, 2,
+            "same file + same null/bounds family but different symbols → two distinct bugs, never merged"
+        );
+        assert_eq!(deduped.len(), 2);
+    }
+
+    /// Same symbol, same family, same file — but at DIFFERENT sites (the
+    /// #396 docFileEntry shape). Location divergence keeps them separate:
+    /// different sites can be different bugs.
+    #[test]
+    fn dedup_same_symbol_different_location_stays_separate() {
+        let diff = "--- a/svc.ts\n+++ b/svc.ts\n@@ -1,2 +1,3 @@\n ctx\n+  const docFileEntry = a[idx]\n+  const docFileEntry = b[idx]\n";
+        let flags = vec![
+            flag("svc.ts", "m", 0, "`docFileEntry = a[idx]` can be undefined / out of bounds."),
+            flag("svc.ts", "m", 1, "`docFileEntry = b[idx]` can be undefined / out of bounds."),
+        ];
+        let (_deduped, stats) = dedup_flags(flags, diff);
+        assert_eq!(stats.deduped, 2, "same symbol at two different sites stays as two findings");
+    }
+
+    /// No resolvable location (the #396 frontier reality — 0/9 anchored)
+    /// means NO collapse, even for obvious same-symbol restatements. The
+    /// honest outcome is "more duplicates," never an over-merge.
+    #[test]
+    fn dedup_no_location_never_collapses_even_same_symbol() {
+        // A diff that shares NO line with the charges → anchors stay None.
+        let diff = "--- a/svc.ts\n+++ b/svc.ts\n@@ -1,1 +1,1 @@\n+ unrelated\n";
+        let flags = vec![
+            flag("svc.ts", "m", 0, "`docFileEntry` may be undefined here."),
+            flag("svc.ts", "m", 1, "`docFileEntry` may be undefined here."),
+        ];
+        let (deduped, stats) = dedup_flags(flags, diff);
+        assert!(deduped.iter().all(|f| f.anchor.is_none()), "no anchor resolved");
+        assert_eq!(stats.deduped, 2, "no location → no collapse (recall-safe)");
+    }
+
+    #[test]
+    fn dedup_396_is_deterministic() {
+        let (d1, s1) = dedup_flags(flags_396(), DIFF_396);
+        let (d2, s2) = dedup_flags(flags_396(), DIFF_396);
+        assert_eq!(s1.deduped, s2.deduped);
+        let shape = |d: &[ProbeFlag]| -> Vec<(String, String, Option<String>)> {
+            d.iter()
+                .map(|f| (f.bundle_id.clone(), f.charge_text.clone(), f.anchor.clone()))
+                .collect()
+        };
+        assert_eq!(shape(&d1), shape(&d2), "same input twice → identical dedup output");
+    }
+
+    // ── #1299: needs_check tier clustering ───────────────────────────
+
+    fn nc_flag(bundle_id: &str, charge_text: &str) -> JudgedFlag {
+        JudgedFlag {
+            flag: flag(bundle_id, "gpt-4o", 0, charge_text),
+            pass1: JudgeRecord {
+                ruling: FunnelRuling::NeedsCheck,
+                decisive_evidence: "e".into(),
+                note_for_author: "n".into(),
+                pass: 1,
+                seconds: 0.0,
+            },
+            pass2: None,
+            tier: Tier::NeedsCheck,
+            demoted_by_pass2: false,
+            verify: None,
+            demoted_by_verify: false,
+        }
+    }
+
+    #[test]
+    fn cluster_needs_check_below_threshold_returns_empty() {
+        let judged: Vec<JudgedFlag> = (0..NEEDS_CHECK_CLUSTER_THRESHOLD)
+            .map(|_| nc_flag("f.ts", "possible undefined index"))
+            .collect();
+        assert!(
+            cluster_needs_check(&judged).is_empty(),
+            "at or below the threshold, needs_check renders raw"
+        );
+    }
+
+    #[test]
+    fn cluster_needs_check_396_caps_and_conserves_every_concern() {
+        // ~25 heavily-duplicative needs_check items across files + families.
+        let mut judged: Vec<JudgedFlag> = Vec::new();
+        for _ in 0..12 {
+            judged.push(nc_flag(IHS_FILE, "the partial-update DTO may drop a field"));
+        }
+        for _ in 0..8 {
+            judged.push(nc_flag(IHS_FILE, "`incorporatedDate` recorded under the wrong field name"));
+        }
+        for _ in 0..5 {
+            judged.push(nc_flag(SPEC_FILE, "index may be undefined / out of bounds"));
+        }
+        // Confirmed flags must be ignored by the clusterer.
+        let mut confirmed = nc_flag(IHS_FILE, "a real confirmed bug");
+        confirmed.tier = Tier::Confirmed;
+        confirmed.pass1.ruling = FunnelRuling::Confirmed;
+        judged.push(confirmed);
+
+        let clusters = cluster_needs_check(&judged);
+        assert!(!clusters.is_empty(), "25 needs_check > threshold → clustered");
+
+        // NEVER a drop: the clusters' counts sum to the needs_check total.
+        let total: usize = clusters.iter().map(|c| c.count).sum();
+        assert_eq!(total, 25, "clustering conserves every concern — nothing hidden");
+
+        // Deterministic — same input, identical clusters.
+        assert_eq!(cluster_needs_check(&judged), clusters);
+
+        // The rendered bullet names the count + file + mechanism.
+        let biggest = clusters.iter().max_by_key(|c| c.count).unwrap();
+        let bullet = biggest.bullet();
+        assert!(bullet.contains("12 related concerns"), "bullet names the count: {bullet}");
+        assert!(bullet.contains(IHS_FILE), "bullet names the file: {bullet}");
     }
 
     // ── double-confirm state machine ────────────────────────────────
@@ -5734,6 +6208,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             staffing: None,
             warnings: Vec::new(),
             remote_budgets: Vec::new(),
+            needs_check_clusters: Vec::new(),
         };
 
         let json = serde_json::to_string_pretty(&env).expect("serialize");
