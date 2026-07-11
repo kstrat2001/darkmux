@@ -15,6 +15,26 @@
 //! and resolves `<root>/<entry-path>/config.json` first, then falls back to
 //! trying the modelKey as a directory, else `None`.
 //!
+//! **Content-scan fallback (#1309):** LMStudio's own path metadata can be
+//! WRONG — for `mistralai/devstral-small-2-2512` all three of `path`,
+//! `indexedModelIdentifier`, and `modelKey` report `mistralai/devstral-small-2-2512`
+//! while the weights actually live at
+//! `<root>/mlx-community/Devstral-Small-2-24B-Instruct-2512-4bit`. The #1290
+//! path-resolution fix can't help (the reported path is itself the lie), so
+//! when BOTH primary attempts miss the reader falls back to a bounded
+//! content scan: it walks the models root for directories that hold a
+//! `config.json` and whose directory-name token set is a SUPERSET of the
+//! model_key's name-token set (`{devstral,small,2,2512}` ⊆
+//! `{devstral,small,2,24b,instruct,2512,4bit}` → match; a `…-2505-…` dir is
+//! excluded because `2512` is absent, so the version disambiguates). SAFETY:
+//! a false match (wrong dir → wrong arch → wrong potential) is worse than
+//! staying unpriced (the honesty net handles unpriced gracefully), so the
+//! scan reads a dir's `config.json` ONLY when EXACTLY ONE directory matches;
+//! zero or multiple matches return `None` (a generic key like `phi-4` that
+//! subsets `phi-4`, `phi-4-mini`, and `phi-4-reasoning` MUST NOT guess). The
+//! walk is capped at `MAX_SCAN_DIRS` directories (observer-must-not-perturb):
+//! exceeding the cap degrades to `None` rather than scanning unbounded.
+//!
 //! **Named limitation:** catalog-alias models (e.g. `qwen/qwen3.6-27b`
 //! downloaded through LMStudio's own model catalog) carry an ls `path` that
 //! matches no directory under the models root — their weights live in a
@@ -42,8 +62,14 @@
 //! the reader can't price degrades to the documented
 //! `LoadEstimateUnknown`-style warnings downstream; it never fails a plan.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+
+/// Upper bound on directories the #1309 content-scan fallback will visit
+/// before it degrades to `None`. The ledger only prices LOADED models so the
+/// real candidate set is small; this cap is the observer-must-not-perturb
+/// guard against an unbounded walk of a pathological models root.
+const MAX_SCAN_DIRS: usize = 500;
 
 /// Architecture facts for one catalog model, as read from its `config.json`.
 ///
@@ -102,12 +128,20 @@ impl ArchFactsReader {
     /// Facts for `model_key` (the `lms ls` catalog key). Resolution order:
     ///
     /// 1. The model's ls-entry path under the models root — the
-    ///    authoritative on-disk location.
+    ///    authoritative on-disk location (when LMStudio's metadata is right).
     /// 2. The modelKey itself as a directory under the root (the layouts
     ///    where key and directory coincide, e.g. `darkmux-distill/...`).
-    /// 3. `None` — absent directory (the named catalog-alias limitation),
+    /// 3. The #1309 content-scan fallback — used ONLY when the reported path
+    ///    is wrong (devstral: ls/ps both report a nonexistent dir). Scans the
+    ///    root for the ONE directory whose name-token set is a superset of
+    ///    `model_key`'s; zero or multiple matches stay unpriced.
+    /// 4. `None` — absent directory (the named catalog-alias limitation),
     ///    unreadable file, malformed JSON, or a missing required field.
+    ///
+    /// Steps 1–2 are the fast path (#1290): a model whose reported path is
+    /// correct resolves there and NEVER triggers the scan.
     pub fn read(&self, model_key: &str) -> Option<ArchFactsRaw> {
+        // 1. Authoritative ls-entry path (the #1290 fast path).
         if let Some(rel) = self.key_paths.get(model_key) {
             if let Some(facts) =
                 read_config_file(&self.models_root.join(rel).join("config.json"))
@@ -115,8 +149,94 @@ impl ArchFactsReader {
                 return Some(facts);
             }
         }
-        read_config_file(&self.models_root.join(model_key).join("config.json"))
+        // 2. modelKey-as-directory.
+        if let Some(facts) =
+            read_config_file(&self.models_root.join(model_key).join("config.json"))
+        {
+            return Some(facts);
+        }
+        // 3. Content-scan fallback (#1309) — the reported path is itself wrong.
+        content_scan_match(&self.models_root, model_key, MAX_SCAN_DIRS)
     }
+}
+
+/// The #1309 content-scan fallback: locate the on-disk directory for
+/// `model_key` when LMStudio's reported path is wrong, by matching the
+/// model_key's name tokens against the config-bearing directories under
+/// `root`.
+///
+/// Returns facts ONLY when EXACTLY ONE directory matches — the ambiguity
+/// guard. A false match (wrong dir → wrong arch → wrong potential) is worse
+/// than staying unpriced, so zero or multiple matches return `None` and
+/// NEVER guess. The walk is bounded to `max_scan_dirs` directories; exceeding
+/// the cap degrades to `None` rather than scanning unbounded
+/// (observer-must-not-perturb).
+fn content_scan_match(root: &Path, model_key: &str, max_scan_dirs: usize) -> Option<ArchFactsRaw> {
+    let wanted = model_name_tokens(model_key);
+    if wanted.is_empty() {
+        return None;
+    }
+    let mut matches: Vec<PathBuf> = Vec::new();
+    let mut scanned: usize = 0;
+    // Iterative DFS so depth is bounded by the tree, not the stack.
+    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let read = match std::fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        scanned += 1;
+        if scanned > max_scan_dirs {
+            // Degrade to unpriced rather than scan unbounded (#1309). The
+            // honesty net renders an unpriced model gracefully; a runaway
+            // walk would perturb the very machine the ledger observes.
+            eprintln!(
+                "darkmux: arch content-scan exceeded {max_scan_dirs} dirs; \
+                 leaving '{model_key}' unpriced"
+            );
+            return None;
+        }
+        let mut has_config = false;
+        for entry in read.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if entry.file_name() == "config.json" {
+                has_config = true;
+            }
+        }
+        if has_config {
+            if let Some(base) = dir.file_name().and_then(|n| n.to_str()) {
+                if wanted.is_subset(&tokenize(base)) {
+                    matches.push(dir.clone());
+                }
+            }
+        }
+    }
+    // Ambiguity guard: exactly one match, or None — never guess (#1309).
+    match matches.as_slice() {
+        [only] => read_config_file(&only.join("config.json")),
+        _ => None,
+    }
+}
+
+/// Lowercase `s`, split on every non-alphanumeric run, drop empties → the
+/// token SET used for the #1309 name match.
+fn tokenize(s: &str) -> BTreeSet<String> {
+    s.to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
+        .collect()
+}
+
+/// The model-name token set for `model_key`: tokens of the portion after the
+/// last `/` (the HF/publisher prefix is dropped — the on-disk dir has its own
+/// publisher segment). e.g. `mistralai/devstral-small-2-2512` →
+/// `{devstral, small, 2, 2512}`.
+fn model_name_tokens(model_key: &str) -> BTreeSet<String> {
+    let name = model_key.rsplit('/').next().unwrap_or(model_key);
+    tokenize(name)
 }
 
 /// modelKey → relative on-disk path, from the parsed `lms ls --json` rows.
@@ -300,6 +420,103 @@ mod tests {
     #[test]
     fn absent_model_dir_is_none() {
         assert_eq!(fixture_reader().read("nobody/no-such-model"), None);
+    }
+
+    // ── #1309 content-scan fallback (LMStudio path metadata is wrong) ──
+
+    #[test]
+    fn content_scan_resolves_dir_when_reported_path_is_wrong() {
+        // The devstral case: ls/ps BOTH report a path that points nowhere
+        // (`mistralai/devstral-small-2-2512`), but the weights live at
+        // `mlx-community/Fake-Devstral-Small-2-2512-4bit`. Primary
+        // resolution (entry-path + modelKey-as-dir) misses; the fallback
+        // finds the ONE dir whose tokens superset the key's and prices it.
+        let entries = [json!({
+            "modelKey": "mistralai/devstral-small-2-2512",
+            "path": "mistralai/devstral-small-2-2512",
+            "indexedModelIdentifier": "mistralai/devstral-small-2-2512",
+        })];
+        let reader = ArchFactsReader::with_root_and_entries(FIXTURE_ROOT, &entries);
+        // Primary path really does miss (the reported dir does not exist).
+        let reported = Path::new(FIXTURE_ROOT)
+            .join("mistralai/devstral-small-2-2512")
+            .join("config.json");
+        assert!(
+            read_config_file(&reported).is_none(),
+            "reported path must not resolve — the fallback is what earns the price"
+        );
+        let facts = reader
+            .read("mistralai/devstral-small-2-2512")
+            .expect("content-scan fallback prices devstral by token-subset");
+        assert_eq!(facts.num_hidden_layers, 40);
+        assert_eq!(facts.quantization_bits, 4);
+    }
+
+    #[test]
+    fn content_scan_ambiguous_match_is_none_never_a_guess() {
+        // THE CRITICAL SAFETY TEST. `phi-4` (tokens {phi,4}) is a subset of
+        // BOTH `phi-4` and `phi-4-mini` — two candidate dirs. A false match
+        // (wrong arch → wrong potential) is worse than staying unpriced, so
+        // the ambiguity guard returns None rather than pick one.
+        assert_eq!(fixture_reader().read("phi-4"), None);
+    }
+
+    #[test]
+    fn content_scan_no_token_subset_is_none() {
+        // A key whose name tokens subset no directory on disk stays unpriced.
+        assert_eq!(fixture_reader().read("nonesuch/zzq-absent-9999"), None);
+    }
+
+    #[test]
+    fn primary_path_wins_over_content_scan() {
+        // A model whose ls path IS correct resolves via the fast path and the
+        // scan never runs. Proof: the phi dirs are AMBIGUOUS (scan → None),
+        // yet a correct entry-path pins `phi-4` to its own dir → Some(phi-4),
+        // AND to the right one (40 layers, not phi-4-mini's 20).
+        let entries = [json!({
+            "modelKey": "phi-4",
+            "path": "phi-pub/phi-4",
+        })];
+        let reader = ArchFactsReader::with_root_and_entries(FIXTURE_ROOT, &entries);
+        let facts = reader.read("phi-4").expect("fast path resolves via correct entry path");
+        assert_eq!(facts.num_hidden_layers, 40, "read phi-4, not the ambiguous phi-4-mini");
+        // Without the entry the same key is ambiguous — confirms the scan is
+        // what the correct path short-circuited.
+        assert_eq!(fixture_reader().read("phi-4"), None);
+    }
+
+    #[test]
+    fn content_scan_version_token_disambiguates() {
+        // `foo-2512` must NOT match a `Foo-Model-2505` dir: the `2512` token
+        // is absent from the dir's token set, so the version disambiguates.
+        assert_eq!(fixture_reader().read("ver-pub/foo-2512"), None);
+    }
+
+    #[test]
+    fn content_scan_respects_max_scan_dirs_cap() {
+        // Bounded walk (observer-must-not-perturb): with a cap of 1 the walk
+        // exhausts its budget before reaching devstral's config-bearing dir,
+        // so it degrades to None even though a match exists at the full cap.
+        let key = "mistralai/devstral-small-2-2512";
+        assert_eq!(
+            content_scan_match(Path::new(FIXTURE_ROOT), key, 1),
+            None,
+            "cap of 1 must degrade before finding the match"
+        );
+        assert!(
+            content_scan_match(Path::new(FIXTURE_ROOT), key, MAX_SCAN_DIRS).is_some(),
+            "the same scan at the real cap does find the match"
+        );
+    }
+
+    #[test]
+    fn model_name_tokens_drops_publisher_prefix() {
+        // Only the portion after the last `/` is tokenized — the on-disk dir
+        // carries its own publisher segment.
+        let toks = model_name_tokens("mistralai/devstral-small-2-2512");
+        let want: BTreeSet<String> =
+            ["devstral", "small", "2", "2512"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(toks, want);
     }
 
     // ── pure-extraction edges over inline values ──
