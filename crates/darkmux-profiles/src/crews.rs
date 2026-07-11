@@ -41,6 +41,11 @@ pub struct ResolvedSeatStaffing {
     pub name: String,
     pub pm: ProfileModel,
     pub k: u32,
+    /// Completion-token cap for this seat's calls. An explicit value wins
+    /// verbatim; when absent, a LOCAL seat uses its local-tuned default and a
+    /// REMOTE seat floors at a reasoning-aware minimum (#1260 — hosted
+    /// reasoning bills its thinking inside the completion cap, so a low local
+    /// default returns empty content). See `SeatStaffing::max_tokens`.
     pub max_tokens: Option<u32>,
     pub selector: Option<BundleSelector>,
 }
@@ -61,11 +66,27 @@ pub struct ResolvedCrew {
 /// - every staffing's `profile` names a real [`Profile`](darkmux_types::Profile)
 /// - every explicit `model` id exists in that profile's `models[]`
 /// - `k >= 1`
-/// - **local-only in v1**: no staffing names a model with a remote
-///   `endpoint` set. Remote-model dispatch as part of a crew isn't wired up
-///   yet — accepting one here would silently route crew traffic off-box the
-///   first time an operator names a profile that happens to carry a remote
-///   model.
+/// - a LOCAL staffing (no remote `endpoint`) declares `n_ctx` — a local
+///   seat gets loaded at its declared context, so a missing window is a
+///   resolution error here (#1282)
+///
+/// **Remote staffing is legal in ANY seat** (#1260, contract 1 — profile
+/// uniformity): endpoint presence on the staffing's resolved model IS the
+/// remoteness signal (`ProfileModel::is_remote`); no crew-side syntax, no
+/// crew-side legislation of which profiles are allowed. The v1
+/// "crews are local-only" rejection was a deadline fence around
+/// unimplemented executor branches, not a design position — the executor
+/// (the review funnel, `crew dispatch`) now routes on what the profile
+/// declares: endpoint present ⇒ hosted dialect, no cycling, remote token
+/// accounting. Remote models carry no `n_ctx` (#1282 — nothing is loaded
+/// locally), so the `require_n_ctx` gate applies to local staffing only.
+///
+/// **Data boundary (operator-explicit, #1260):** a REMOTE seat sends the code
+/// under review (diff + surrounding source + extracted facts) to its endpoint.
+/// The endpoint must be cleared for that code — an org-approved deployment
+/// (e.g. private code → the org's own cloud tenant only). Nothing auto-routes:
+/// a profile names its own endpoint, and `resolve_crew` routes on what the
+/// profile declares; it never picks a remote endpoint for the operator.
 pub fn resolve_crew(reg: &ProfileRegistry, name: &str) -> Result<ResolvedCrew> {
     let crew = reg.crews.get(name).ok_or_else(|| {
         // (#1282) A quarantined name gets the entry's own parse error, not a
@@ -189,24 +210,16 @@ fn resolve_model(
         }
     };
 
-    if let Some(ep) = &pm.endpoint {
-        if ep.is_remote() {
-            bail!(
-                "darkmux: crew \"{}\" {}: model \"{}\" (profile \"{}\") has a remote endpoint \
-                 set — crews are local-only in v1",
-                crew_name,
-                label,
-                pm.id,
-                profile_name
-            );
+    // (#1260, contract 1) A remote (endpoint-bearing) staffing is legal in
+    // any seat — the executor routes on the profile's own declaration
+    // (hosted dialect, no cycling, remote token accounting). Only a LOCAL
+    // seat gets LOADED at its declared context, so the missing-`n_ctx`
+    // resolution error (#1282) applies to local staffing only; remote
+    // models have no local context to declare.
+    if !pm.is_remote() {
+        if let Err(e) = pm.require_n_ctx() {
+            bail!("darkmux: crew \"{}\" {}: {}", crew_name, label, e);
         }
-    }
-
-    // (#1282) Crews are local-only (above), and a local seat gets LOADED at
-    // its declared context — so a missing `n_ctx` is a resolution error
-    // here, with the crew/seat named, never a parse error.
-    if let Err(e) = pm.require_n_ctx() {
-        bail!("darkmux: crew \"{}\" {}: {}", crew_name, label, e);
     }
 
     Ok(pm.clone())
@@ -523,22 +536,66 @@ mod tests {
         assert!(msg.contains("review-probe"), "names the seat: {msg}");
     }
 
+    /// (#1260, contract 1 — profile uniformity) An endpoint-bearing profile
+    /// resolves in ANY seat, with no crew-side syntax: endpoint presence on
+    /// the resolved model is the remoteness signal, and a remote model needs
+    /// no `n_ctx` (#1282 — nothing is loaded locally). This replaces the v1
+    /// "crews are local-only" rejection that #1269 surfaced as a contract
+    /// violation.
     #[test]
-    fn resolve_crew_remote_staffing_rejected() {
+    fn resolve_crew_remote_staffing_accepted_in_any_seat() {
+        let reg = registry(
+            vec![
+                ("cloud", profile(vec![remote_model("gpt-remote")])),
+                ("fast", profile(vec![model("local-a", 32000)])),
+            ],
+            vec![(
+                "mixed",
+                Crew {
+                    seats: seats(vec![
+                        ("review-probe", vec![staffing("fast"), staffing("cloud")]),
+                        ("review-judge", vec![staffing("cloud")]),
+                        ("review-verify", vec![staffing("cloud")]),
+                    ]),
+                    ..Default::default()
+                },
+            )],
+        );
+        let resolved = resolve_crew(&reg, "mixed").expect("remote staffing resolves in any seat");
+        let probe = resolved.seats.get("review-probe").unwrap();
+        assert!(!probe[0].pm.is_remote(), "local staffing stays local");
+        assert!(probe[1].pm.is_remote(), "remote staffing resolves in the probe seat");
+        assert!(probe[1].pm.n_ctx.is_none(), "remote staffing needs no n_ctx (#1282)");
+        assert!(resolved.seats.get("review-judge").unwrap()[0].pm.is_remote());
+        assert!(resolved.seats.get("review-verify").unwrap()[0].pm.is_remote());
+    }
+
+    /// (#1260) Lifting the local-only fence must NOT lift the genuinely-
+    /// broken-staffing checks: a remote staffing whose profile ref dangles
+    /// still fails with the crew/seat named — doctor's crew-validation
+    /// check (which delegates here) keeps warning on real breakage.
+    #[test]
+    fn resolve_crew_remote_staffing_with_bad_model_id_still_rejected() {
         let reg = registry(
             vec![("cloud", profile(vec![remote_model("gpt-remote")]))],
             vec![(
                 "bad",
                 Crew {
-                    seats: seats(vec![("review-probe", vec![staffing("cloud")])]),
+                    seats: seats(vec![(
+                        "review-judge",
+                        vec![SeatStaffing {
+                            profile: "cloud".to_string(),
+                            model: Some("ghost".to_string()),
+                            k: 1,
+                            ..Default::default()
+                        }],
+                    )]),
                     ..Default::default()
                 },
             )],
         );
         let err = resolve_crew(&reg, "bad").unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("remote endpoint"));
-        assert!(msg.contains("local-only"));
+        assert!(err.to_string().contains("not found in profile"));
     }
 
     #[test]

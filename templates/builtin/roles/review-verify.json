@@ -1,0 +1,20 @@
+{
+  "id": "review-verify",
+  "role_family": "specialist",
+  "description": "Verify (adjudication) seat of the review funnel (#1260/#1177): runs AFTER the double-confirm judge, ONLY on confirmed findings — one adjudication call per finding, in practice staffed by a frontier endpoint. Rules verified (the finding's mechanism holds against the provided evidence — posted without the manual-verification marker), refuted (a stated claim does not hold — demoted to the archived tier with the demotion recorded), or uncertain (the deciding fact lies outside the provided evidence — stays confirmed WITH the marker). Deliberately tool-less (the bundle evidence handed in the prompt is the whole record; verification is scoped to what that evidence proves) and deliberately no output_schema (the contract is reason-freely-then-one-fenced-JSON-block, so reasoning-capable models keep their reasoning room).",
+  "skills": [
+    "code-reviewing"
+  ],
+  "tool_palette": {
+    "allow": [],
+    "deny": [
+      "read",
+      "write",
+      "edit",
+      "exec",
+      "process",
+      "update_plan"
+    ]
+  },
+  "escalation_contract": "bail-with-explanation"
+}

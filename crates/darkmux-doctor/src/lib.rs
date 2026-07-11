@@ -4273,10 +4273,12 @@ mod tests {
         assert!(check.message.contains("1 crew"));
     }
 
-    /// The exact #1269 scenario: one invalid crew (a remote-endpoint seat,
-    /// rejected only at resolve time) must surface as a WARN naming the
-    /// crew and the specific error, and must NOT prevent the check from
-    /// running at all (registry load itself succeeds).
+    /// The exact #1269 scenario: one invalid crew (here a LOCAL staffing
+    /// whose model omits `n_ctx`, #1282 — the original remote-endpoint
+    /// fixture became LEGAL staffing when #1260 lifted the local-only
+    /// fence) must surface as a WARN naming the crew and the specific
+    /// error, and must NOT prevent the check from running at all (registry
+    /// load itself succeeds).
     #[serial_test::serial]
     #[test]
     fn check_crew_validation_warns_on_invalid_crew_names_it() {
@@ -4285,20 +4287,46 @@ mod tests {
             &config_path,
             r#"{"profiles":{
                     "fast":{"models":[{"id":"a","n_ctx":1000}]},
-                    "cloud":{"models":[
-                        {"id":"gpt-remote","n_ctx":100000,
-                         "endpoint":{"url":"https://example.azure.com/openai"}}
-                    ]}
+                    "ctxless":{"models":[{"id":"local-b"}]}
                 },
-                "crews":{"bad-crew":{"seats":{"review-probe":[{"profile":"cloud"}]}}}}"#,
+                "crews":{"bad-crew":{"seats":{"review-probe":[{"profile":"ctxless"}]}}}}"#,
         )
         .unwrap();
 
         let check = check_crew_validation();
         assert_eq!(check.status, Status::Warn);
         assert!(check.message.contains("crew \"bad-crew\""));
-        assert!(check.message.contains("remote endpoint"));
+        assert!(check.message.contains("n_ctx"));
         assert!(check.hint.is_some());
+    }
+
+    /// (#1260, contract 1) Remote staffing is LEGAL: a crew whose seats
+    /// name endpoint-bearing profiles resolves cleanly, so doctor's crew
+    /// validation passes it — the check keeps warning only on genuinely
+    /// broken staffing (the sibling tests above/below).
+    #[serial_test::serial]
+    #[test]
+    fn check_crew_validation_passes_remote_staffed_crew() {
+        let (_guard, config_path) = ConfigPathGuard::at_tempfile("profiles.json");
+        std::fs::write(
+            &config_path,
+            r#"{"profiles":{
+                    "fast":{"models":[{"id":"a","n_ctx":1000}]},
+                    "cloud":{"models":[
+                        {"id":"gpt-remote",
+                         "endpoint":{"url":"https://example.azure.com/openai"}}
+                    ]}
+                },
+                "crews":{"hosted-review":{"seats":{
+                    "review-probe":[{"profile":"fast"}],
+                    "review-judge":[{"profile":"cloud"}]
+                }}}}"#,
+        )
+        .unwrap();
+
+        let check = check_crew_validation();
+        assert_eq!(check.status, Status::Pass, "remote staffing is legal: {}", check.message);
+        assert!(check.message.contains("1 crew"));
     }
 
     #[serial_test::serial]

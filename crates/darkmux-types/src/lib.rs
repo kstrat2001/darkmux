@@ -579,6 +579,15 @@ pub struct SeatStaffing {
     /// Draws per work item. Default 3.
     #[serde(default = "default_k")]
     pub k: u32,
+    /// Completion-token cap (`max_completion_tokens`) for this seat's calls.
+    /// An explicit value always wins verbatim (operator sovereignty — the
+    /// operator may know their task is short). When ABSENT, a LOCAL seat uses
+    /// its local-tuned default, and a REMOTE (endpoint-bearing) seat floors at
+    /// a reasoning-aware minimum (#1260): hosted reasoning models bill their
+    /// thinking inside `max_completion_tokens`, so a low local default gets
+    /// consumed by invisible reasoning and the seat returns empty content —
+    /// the floor (never lowering an already-higher local default) keeps a
+    /// remote seat above that guillotine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     /// Bundle-selection scope. Valid on any staffing — this schema doesn't

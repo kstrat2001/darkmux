@@ -34,13 +34,16 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use darkmux_crew::dispatch::build_dispatch_record_with_payload;
-use darkmux_crew::single_shot::{single_shot_chat, SingleShotReply, SingleShotRequest};
+use darkmux_crew::single_shot::{
+    single_shot_chat, single_shot_chat_hosted, HostedSingleShotRequest, SingleShotReply,
+    SingleShotRequest,
+};
 use darkmux_lab::lab::bundle::{
     build_bundles, external_bundles, slice_code, slice_code_probe, BundleSet, FileSource,
 };
 use darkmux_lab::lab::funnel::{
     run_funnel, run_judge_only, BundleInput, ChatCall, ExecMode, FunnelEmitter, FunnelEnvelope,
-    FunnelInputs, JudgeRecord, LmsCycler, ProbeFlag, Tier,
+    FunnelInputs, JudgeRecord, LmsCycler, ProbeFlag, Tier, VerifyRecord, VerifyRuling,
 };
 use darkmux_profiles::crews::{resolve_crew, ResolvedCrew};
 use darkmux_profiles::profiles::load_registry;
@@ -852,8 +855,21 @@ impl FunnelEmitter for FleetFlowEmitter {
 /// staffed seats at all (a case `run_dispatch`'s own validation already
 /// rejects before this ever runs).
 fn crew_model_summary(crew: &ResolvedCrew) -> Option<String> {
-    let mut ids: Vec<String> =
-        crew.seats.values().flatten().map(|s| swap::namespaced_identifier(&s.pm)).collect();
+    // (#1260) Remote seats keep the profile's bare model id — nothing is
+    // loaded in LMStudio, so no darkmux-namespaced identifier exists for
+    // them; local seats keep the namespaced form.
+    let mut ids: Vec<String> = crew
+        .seats
+        .values()
+        .flatten()
+        .map(|s| {
+            if s.pm.is_remote() {
+                s.pm.id.clone()
+            } else {
+                swap::namespaced_identifier(&s.pm)
+            }
+        })
+        .collect();
     ids.sort();
     ids.dedup();
     if ids.is_empty() {
@@ -984,13 +1000,22 @@ fn with_dispatch_bookends(
     guard.armed = false;
     match result {
         Ok(env) => {
+            let mut payload = json!({ "runtime": "funnel", "result_class": "ok" });
+            // (#1260/#1186) Remote-seat tokens ride the dispatch bookend too,
+            // so downstream token-accounting surfaces can EXCLUDE cloud
+            // tokens from local-savings math without opening the envelope.
+            if env.members.iter().any(|m| m.remote) {
+                let remote_tokens: u64 =
+                    env.members.iter().filter(|m| m.remote).map(|m| m.total_tokens).sum();
+                payload["remote_tokens"] = remote_tokens.into();
+            }
             guard.emitter.emit(funnel_bookend_record(
                 darkmux_flow::Level::Info,
                 "dispatch complete",
                 crew_name,
                 case_id,
                 model,
-                json!({ "runtime": "funnel", "result_class": "ok" }),
+                payload,
             ));
             Ok(env)
         }
@@ -1075,6 +1100,14 @@ fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<FunnelEnvelope> {
              <crew_root>/roles/review-judge.md"
         )
     })?;
+    // (#1260) The verify seat's persona — resolved unconditionally (the
+    // role is embedded); only dispatched when the crew declares the seat.
+    let verify_system = darkmux_crew::loader::role_prompt("review-verify").ok_or_else(|| {
+        anyhow!(
+            "darkmux: role \"review-verify\" has no system prompt — reinstall darkmux or check \
+             <crew_root>/roles/review-verify.md"
+        )
+    })?;
 
     let case_id = match (&opts.github, &opts.head_sha) {
         (Some(repo), Some(sha)) => format!("{repo}@{sha}"),
@@ -1098,7 +1131,13 @@ fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<FunnelEnvelope> {
         mode,
         probe_system: &probe_system,
         judge_system: &judge_system,
+        verify_system: &verify_system,
         bundles: Some(bundles),
+        // (#1260) The per-execution remote token allowance, resolved through
+        // the one precedence home (`env > config.remote.* > 500000`) — only
+        // endpoint-staffed seats draw from it.
+        remote_max_tokens_per_execution:
+            darkmux_types::config_access::remote_max_tokens_per_execution(),
     };
 
     // (#1272) Bookend identity, captured before `inputs`/`crew` are moved
@@ -1111,16 +1150,31 @@ fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<FunnelEnvelope> {
     let model_for_bookends = crew_model_summary(&crew);
 
     let timeout = opts.timeout;
+    // (#1260) Route on what the seat's profile declares (contract 1): an
+    // endpoint-bearing call goes through the hosted dialect (Azure
+    // api-version + Keychain auth + max_completion_tokens — the transport
+    // `dispatch_remote` proved); a local call goes through LMStudio. The
+    // system/user texts are identical either way (contract 6).
     let mut chat = move |call: &ChatCall| -> Result<SingleShotReply> {
-        single_shot_chat(&SingleShotRequest {
-            base_url: None,
-            model: call.model,
-            system: call.system,
-            user: call.user,
-            temperature: call.temperature,
-            max_tokens: call.max_tokens,
-            timeout_seconds: timeout,
-        })
+        match call.endpoint {
+            Some(endpoint) => single_shot_chat_hosted(&HostedSingleShotRequest {
+                endpoint,
+                model: call.model,
+                system: call.system,
+                user: call.user,
+                max_tokens: call.max_tokens,
+                timeout_seconds: timeout,
+            }),
+            None => single_shot_chat(&SingleShotRequest {
+                base_url: None,
+                model: call.model,
+                system: call.system,
+                user: call.user,
+                temperature: call.temperature,
+                max_tokens: call.max_tokens,
+                timeout_seconds: timeout,
+            }),
+        }
     };
     let mut cycler = LmsCycler;
     let mut emitter = FleetFlowEmitter;
@@ -1193,14 +1247,20 @@ pub fn synthesize_funnel(env: &FunnelEnvelope, diff: &str, attribution: Option<&
         match j.tier {
             Tier::Confirmed => {
                 let record = j.pass2.as_ref().unwrap_or(&j.pass1);
+                // (#1260) A verify-seat `verified` ruling replaces the
+                // manual-verification marker with the adjudication line;
+                // `uncertain`/`unparsed`/`error` (or no verify seat at all)
+                // keep the marker — an inconclusive adjudication never
+                // promotes. `refuted` never reaches here (tier = Archived).
+                let verified = j.verify.as_ref().filter(|v| v.ruling == VerifyRuling::Verified);
                 match resolve_anchor(Some(path), j.flag.anchor.as_deref(), &index) {
                     Some(line) => inline.push(json!({
                         "path": norm_path(path),
                         "line": line,
                         "side": "RIGHT",
-                        "body": confirmed_comment_body(record),
+                        "body": confirmed_comment_body(record, verified),
                     })),
-                    None => confirmed_general.push(confirmed_general_bullet(path, record)),
+                    None => confirmed_general.push(confirmed_general_bullet(path, record, verified)),
                 }
             }
             Tier::NeedsCheck => {
@@ -1235,6 +1295,7 @@ pub fn synthesize_funnel(env: &FunnelEnvelope, diff: &str, attribution: Option<&
             lines.push("**Worth a double check:**".to_string());
             lines.extend(needs_check_lines);
         }
+        lines.extend(run_warnings_block(env));
         return Rendered {
             mode: "comment",
             review: None,
@@ -1259,6 +1320,7 @@ pub fn synthesize_funnel(env: &FunnelEnvelope, diff: &str, attribution: Option<&
         body.push("**Worth a double check** (not merge-blocking):".to_string());
         body.extend(needs_check_lines);
     }
+    body.extend(run_warnings_block(env));
 
     Rendered {
         mode: "review",
@@ -1271,7 +1333,30 @@ pub fn synthesize_funnel(env: &FunnelEnvelope, diff: &str, attribution: Option<&
     }
 }
 
-fn confirmed_comment_body(record: &JudgeRecord) -> String {
+/// (#1260) The loud run-warnings block appended to a posted review/comment —
+/// non-fatal findings the operator must SEE on the PR, not just in the
+/// envelope: a verify budget exhausting mid-stage (some confirmed findings
+/// keep the manual-verification marker), or a remote probe seat failing
+/// (reduced coverage). Empty (and byte-identical to pre-#1260 output) when
+/// the run produced no warnings — a crew without remote seats never does.
+fn run_warnings_block(env: &FunnelEnvelope) -> Vec<String> {
+    if env.warnings.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![String::new(), "**⚠ Run warnings**".to_string()];
+    lines.extend(env.warnings.iter().map(|w| format!("- {w}")));
+    lines
+}
+
+/// (#1260) The frontier-verified line a `verified` adjudication earns —
+/// replaces [`CONFIRMED_MARKER`] and names the adjudicating model, so the
+/// posted comment says WHERE the verification came from (operator
+/// sovereignty: the reader never wonders which tier signed off).
+fn verified_line(v: &VerifyRecord) -> String {
+    format!("✓ verified by {} adjudication", v.model)
+}
+
+fn confirmed_comment_body(record: &JudgeRecord, verified: Option<&VerifyRecord>) -> String {
     let mut lines = Vec::new();
     let note = record.note_for_author.trim();
     lines.push(if note.is_empty() { "(no note from the judge)".to_string() } else { note.to_string() });
@@ -1279,11 +1364,14 @@ fn confirmed_comment_body(record: &JudgeRecord) -> String {
     if !evidence.is_empty() {
         lines.push(format!("Evidence: {evidence}"));
     }
-    lines.push(CONFIRMED_MARKER.to_string());
+    match verified {
+        Some(v) => lines.push(verified_line(v)),
+        None => lines.push(CONFIRMED_MARKER.to_string()),
+    }
     lines.join("\n\n")
 }
 
-fn confirmed_general_bullet(path: &str, record: &JudgeRecord) -> String {
+fn confirmed_general_bullet(path: &str, record: &JudgeRecord, verified: Option<&VerifyRecord>) -> String {
     let note = record.note_for_author.trim();
     let mut line = format!(
         "- `{path}` — {}",
@@ -1293,7 +1381,10 @@ fn confirmed_general_bullet(path: &str, record: &JudgeRecord) -> String {
     if !evidence.is_empty() {
         line.push_str(&format!(" _Evidence: {evidence}_"));
     }
-    line.push_str(&format!(" ({CONFIRMED_MARKER})"));
+    match verified {
+        Some(v) => line.push_str(&format!(" ({})", verified_line(v))),
+        None => line.push_str(&format!(" ({CONFIRMED_MARKER})")),
+    }
     line
 }
 
@@ -1898,6 +1989,8 @@ mod tests {
             pass2: Some(record),
             tier: Tier::Confirmed,
             demoted_by_pass2: false,
+                verify: None,
+                demoted_by_verify: false,
         }
     }
 
@@ -1914,6 +2007,8 @@ mod tests {
                 pass2: Some(judge_record(FunnelRuling::FalsePositive, "pass-2 evidence", note)),
                 tier: Tier::NeedsCheck,
                 demoted_by_pass2: true,
+                    verify: None,
+                    demoted_by_verify: false,
             }
         } else {
             JudgedFlag {
@@ -1922,6 +2017,8 @@ mod tests {
                 pass2: None,
                 tier: Tier::NeedsCheck,
                 demoted_by_pass2: false,
+                    verify: None,
+                    demoted_by_verify: false,
             }
         }
     }
@@ -1933,6 +2030,8 @@ mod tests {
             pass2: None,
             tier: Tier::Archived,
             demoted_by_pass2: false,
+                verify: None,
+                demoted_by_verify: false,
         }
     }
 
@@ -2153,6 +2252,8 @@ mod tests {
             pass2: None,
             tier: Tier::Archived,
             demoted_by_pass2: false,
+                verify: None,
+                demoted_by_verify: false,
         }]);
         env.degenerate =
             Some("judge produced no usable ruling on any of 1 flags (all errored/unparsed)".to_string());
@@ -2203,16 +2304,131 @@ mod tests {
     #[test]
     fn confirmed_comment_body_empty_note_and_evidence_uses_fallback_text() {
         let record = judge_record(FunnelRuling::Confirmed, "", "");
-        let body = confirmed_comment_body(&record);
+        let body = confirmed_comment_body(&record, None);
         assert!(body.contains("(no note from the judge)"), "{body}");
         assert!(!body.contains("Evidence:"), "empty evidence must not render a line: {body}");
         assert!(body.contains(CONFIRMED_MARKER), "{body}");
     }
 
+    // ─── the verify seat's tier mechanics (#1260) ─────────────────────
+
+    fn verify_record(ruling: VerifyRuling) -> VerifyRecord {
+        VerifyRecord {
+            ruling,
+            decisive_evidence: "the adjudicated line".to_string(),
+            note_for_author: "adjudication note".to_string(),
+            seconds: 1.0,
+            model: "gpt-5.1".to_string(),
+        }
+    }
+
+    /// (#1260) A `verified` adjudication posts as frontier-verified: the
+    /// "⚠ needs frontier verification" marker is REPLACED by the
+    /// "verified by <model> adjudication" line — inline and general alike.
+    #[test]
+    fn synthesize_verified_finding_drops_marker_and_names_adjudicator() {
+        // Inline (anchor resolves).
+        let mut j = confirmed_flag("computeEnd@src/x.ts", Some("const b = 2;"), "note", "evidence");
+        j.verify = Some(verify_record(VerifyRuling::Verified));
+        let env = healthy_envelope(vec![j]);
+        let r = synthesize_funnel(&env, DIFF, None);
+        assert_eq!(r.mode, "review", "a verified finding is still merge-blocking");
+        let review = r.review.unwrap();
+        let body = review["comments"][0]["body"].as_str().unwrap();
+        assert!(body.contains("verified by gpt-5.1 adjudication"), "{body}");
+        assert!(!body.contains(CONFIRMED_MARKER), "the manual-verification marker must be gone: {body}");
+
+        // General (anchor unresolvable) — same replacement.
+        let mut g = confirmed_flag("ghost@src/nowhere.ts", Some("no such line"), "note", "evidence");
+        g.verify = Some(verify_record(VerifyRuling::Verified));
+        let env = healthy_envelope(vec![g]);
+        let r = synthesize_funnel(&env, DIFF, None);
+        let body = r.review.unwrap()["body"].as_str().unwrap().to_string();
+        assert!(body.contains("verified by gpt-5.1 adjudication"), "{body}");
+        assert!(!body.contains(CONFIRMED_MARKER), "{body}");
+    }
+
+    /// (#1260) An `uncertain` adjudication keeps the EXISTING marker —
+    /// inconclusive never promotes; the posted bytes match a no-seat crew.
+    #[test]
+    fn synthesize_uncertain_verify_keeps_the_marker() {
+        let mut j = confirmed_flag("computeEnd@src/x.ts", Some("const b = 2;"), "note", "evidence");
+        j.verify = Some(verify_record(VerifyRuling::Uncertain));
+        let env = healthy_envelope(vec![j]);
+        let with_uncertain = synthesize_funnel(&env, DIFF, None);
+
+        let no_seat = confirmed_flag("computeEnd@src/x.ts", Some("const b = 2;"), "note", "evidence");
+        let env2 = healthy_envelope(vec![no_seat]);
+        let without_seat = synthesize_funnel(&env2, DIFF, None);
+
+        let a = with_uncertain.review.unwrap();
+        let b = without_seat.review.unwrap();
+        assert_eq!(a, b, "an uncertain adjudication renders byte-identically to no seat at all");
+        assert!(a["comments"][0]["body"].as_str().unwrap().contains(CONFIRMED_MARKER));
+    }
+
+    /// (FIX 3 / #1260, ruling applied) A verify budget that exhausts
+    /// MID-STAGE degrades the STAGE, not the run: verified findings still post
+    /// as frontier-verified, each skipped adjudication (recorded per-flag as
+    /// `VerifyRuling::Error`, tier still Confirmed) keeps the
+    /// manual-verification marker, and the posted review carries the loud
+    /// "verify budget exhausted after N of M adjudications" warning. The
+    /// envelope is NOT degenerate — never routed to "produced no signal".
+    #[test]
+    fn synthesize_verify_exhaustion_posts_verified_plus_markered_plus_warning() {
+        let mut verified = confirmed_flag("a@src/x.ts", Some("const b = 2;"), "verified note", "e");
+        verified.verify = Some(verify_record(VerifyRuling::Verified));
+        // A skipped adjudication: recorded per-flag as Error, stays Confirmed
+        // — synthesize must keep its manual-verification marker.
+        let mut skipped = confirmed_flag("b@src/x.ts", Some("const d = 5;"), "skipped note", "e");
+        skipped.verify = Some(VerifyRecord {
+            ruling: VerifyRuling::Error,
+            decisive_evidence: String::new(),
+            note_for_author: "remote token budget exhausted for this stage — call skipped".to_string(),
+            seconds: 0.0,
+            model: "gpt-5.1".to_string(),
+        });
+        let mut env = healthy_envelope(vec![verified, skipped]);
+        env.warnings = vec![
+            "verify budget exhausted after 1 of 2 adjudications — the remaining 1 confirmed \
+             finding(s) keep the manual-verification marker (the per-execution allowance of 100 \
+             tokens ran out)"
+                .to_string(),
+        ];
+
+        let r = synthesize_funnel(&env, DIFF, None);
+        assert_eq!(r.mode, "review", "confirmed findings still merge-block; never degraded");
+        let review = r.review.unwrap();
+        let comments = serde_json::to_string(&review["comments"]).unwrap();
+        assert!(comments.contains("verified by gpt-5.1 adjudication"), "the verified one posts verified: {comments}");
+        assert!(comments.contains(CONFIRMED_MARKER), "the skipped adjudication keeps the marker: {comments}");
+        let body = review["body"].as_str().unwrap();
+        assert!(body.contains("Run warnings"), "the warnings block renders on the review: {body}");
+        assert!(body.contains("verify budget exhausted after 1 of 2 adjudications"), "{body}");
+    }
+
+    /// (#1260) A REFUTED finding arrives already demoted (tier = Archived,
+    /// `demoted_by_verify` recorded in the envelope) — it never renders.
+    #[test]
+    fn synthesize_refuted_finding_never_renders() {
+        let mut refuted = confirmed_flag("computeEnd@src/x.ts", Some("const b = 2;"), "refuted note", "e");
+        refuted.tier = Tier::Archived;
+        refuted.demoted_by_verify = true;
+        refuted.verify = Some(verify_record(VerifyRuling::Refuted));
+        let kept = confirmed_flag("other@src/x.ts", Some("const d = 5;"), "kept note", "e");
+        let env = healthy_envelope(vec![refuted, kept]);
+        let r = synthesize_funnel(&env, DIFF, None);
+        let review = r.review.unwrap();
+        let body = review["body"].as_str().unwrap();
+        let comments = serde_json::to_string(&review["comments"]).unwrap();
+        assert!(!body.contains("refuted note") && !comments.contains("refuted note"));
+        assert!(comments.contains("kept note"), "the surviving confirm still posts");
+    }
+
     #[test]
     fn confirmed_general_bullet_empty_note_and_evidence_uses_fallback_text() {
         let record = judge_record(FunnelRuling::Confirmed, "", "");
-        let line = confirmed_general_bullet("src/x.ts", &record);
+        let line = confirmed_general_bullet("src/x.ts", &record, None);
         assert!(line.contains("(no note from the judge)"), "{line}");
         assert!(!line.contains("_Evidence:"), "empty evidence must not render a line: {line}");
         assert!(line.contains(CONFIRMED_MARKER), "{line}");

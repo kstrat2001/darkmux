@@ -6,13 +6,21 @@
 //! is for callers that just need ONE chat completion, not an agentic
 //! dispatch (a review-funnel probe/judge invocation is the first consumer).
 //!
-//! **Dialect note:** this is the LOCAL LMStudio dialect — `"max_tokens"` +
-//! `"temperature"` + `"stream": false`. `dispatch_internal::single_shot_body`
-//! builds the HOSTED (Azure/OpenAI) dialect (`"max_completion_tokens"`,
-//! optional `reasoning_effort`) for `dispatch_remote`. The two are separate
-//! request shapes for separate targets — do not merge them.
+//! **Dialect note:** the LOCAL LMStudio dialect is `"max_tokens"` +
+//! `"temperature"` + `"stream": false`. The HOSTED (Azure/OpenAI) dialect
+//! (`"max_completion_tokens"`, optional `reasoning_effort`, no temperature)
+//! exists in two single-shot shapes: `dispatch_internal::single_shot_body`
+//! for `dispatch_remote` (a full role dispatch), and this module's
+//! [`hosted_chat_body`] + [`single_shot_chat_hosted`] (#1260) for
+//! endpoint-staffed crew seats (the review funnel's remote probe/judge/
+//! verify seats). Local vs hosted are separate request shapes for separate
+//! targets — do not merge them; local vs hosted here differ ONLY in the
+//! transport dialect, never in message assembly (contract 6 — frozen
+//! model-facing text: [`chat_messages`] is the single assembly both bodies
+//! share, so the frozen seat texts reach a remote endpoint byte-identical
+//! to what a local seat receives).
 
-use crate::dispatch_internal::remote_chat_completion;
+use crate::dispatch_internal::{remote_auth_header, remote_chat_completion, remote_chat_url};
 use anyhow::Result;
 
 /// One local single-shot chat request. `base_url` defaults to
@@ -63,21 +71,66 @@ pub fn local_chat_body(
     temperature: f32,
     max_tokens: u32,
 ) -> serde_json::Value {
-    let messages = if system.trim().is_empty() {
+    serde_json::json!({
+        "model": model,
+        "messages": chat_messages(system, user),
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": false,
+    })
+}
+
+/// (#1260, contract 6 — frozen model-facing text) The message-array
+/// assembly BOTH dialects share: an empty (after trimming) `system` omits
+/// the system message entirely (one user-role message — the Phase A probe
+/// protocol, see [`local_chat_body`]'s doc); a non-empty `system` leads as
+/// its own system-role message. Extracted so [`local_chat_body`] and
+/// [`hosted_chat_body`] cannot drift: a remote seat's model sees exactly
+/// the messages a local seat's model sees — only the surrounding transport
+/// dialect differs.
+fn chat_messages(system: &str, user: &str) -> serde_json::Value {
+    if system.trim().is_empty() {
         serde_json::json!([{ "role": "user", "content": user }])
     } else {
         serde_json::json!([
             { "role": "system", "content": system },
             { "role": "user", "content": user },
         ])
-    };
-    serde_json::json!({
+    }
+}
+
+/// (#1260) The HOSTED (Azure/OpenAI) chat-completions request body for an
+/// endpoint-staffed crew seat. Pure — unit-testable, with a golden
+/// field-set test mirroring the local body's. Message assembly is
+/// [`chat_messages`], byte-identical to the local dialect (contract 6);
+/// everything else is the hosted dialect `dispatch_remote` proved in the
+/// 1.17 cycle:
+///
+/// - `"max_completion_tokens"` (the Azure/OpenAI cap form), never the
+///   local `"max_tokens"`;
+/// - optional `"reasoning_effort"` when the endpoint declares one;
+/// - NO `"temperature"` — hosted reasoning models (the o-series /
+///   GPT-5-class deployments these seats target) reject non-default
+///   temperature, so the local dialect's temperature knob is deliberately
+///   not sent (same as `dispatch_internal::single_shot_body`);
+/// - NO `"stream"` — single-shot, and the hosted dialect's proven body
+///   omits it.
+pub fn hosted_chat_body(
+    model: &str,
+    system: &str,
+    user: &str,
+    max_tokens: u32,
+    reasoning_effort: Option<&str>,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
         "model": model,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "stream": false,
-    })
+        "messages": chat_messages(system, user),
+        "max_completion_tokens": max_tokens,
+    });
+    if let Some(effort) = reasoning_effort {
+        body["reasoning_effort"] = serde_json::Value::String(effort.to_string());
+    }
+    body
 }
 
 /// The chat-completions URL for a local LMStudio base:
@@ -117,6 +170,44 @@ pub fn single_shot_chat(req: &SingleShotRequest) -> Result<SingleShotReply> {
         req.max_tokens,
     );
     let resp = remote_chat_completion(&url, None, &body, req.timeout_seconds)?;
+    Ok(extract_reply(&resp))
+}
+
+/// (#1260) One HOSTED single-shot chat request — an endpoint-staffed crew
+/// seat's call. `model` is the profile's model id (the deployment name for
+/// Azure); nothing is loaded in LMStudio, so there is no darkmux-namespaced
+/// identifier to resolve.
+pub struct HostedSingleShotRequest<'a> {
+    pub endpoint: &'a darkmux_types::ModelEndpoint,
+    pub model: &'a str,
+    pub system: &'a str,
+    pub user: &'a str,
+    pub max_tokens: u32,
+    pub timeout_seconds: u32,
+}
+
+/// (#1260) Container-free single-shot chat call against a REMOTE
+/// OpenAI-compatible endpoint — the hosted twin of [`single_shot_chat`],
+/// through the EXACT URL/auth/POST chain `dispatch_remote` and
+/// `doctor --probe` use (`remote_chat_url` + `remote_auth_header` +
+/// `remote_chat_completion`): Azure `?api-version=`, Keychain-read auth
+/// header (0600 curl config, never on argv, never logged), and the shared
+/// 429/503 backoff ladder (bounded — 3 retries at 30s/60s/120s), so one
+/// call can block for minutes against a rate-limited endpoint before
+/// failing loud. Message assembly is byte-identical to the local path
+/// (contract 6 — see [`hosted_chat_body`]); only the transport dialect
+/// differs.
+pub fn single_shot_chat_hosted(req: &HostedSingleShotRequest) -> Result<SingleShotReply> {
+    let url = remote_chat_url(req.endpoint);
+    let auth = remote_auth_header(req.endpoint)?;
+    let body = hosted_chat_body(
+        req.model,
+        req.system,
+        req.user,
+        req.max_tokens,
+        req.endpoint.reasoning_effort.as_deref(),
+    );
+    let resp = remote_chat_completion(&url, auth.as_ref(), &body, req.timeout_seconds)?;
     Ok(extract_reply(&resp))
 }
 
@@ -328,6 +419,71 @@ mod tests {
         // second signal.
         assert!(wire.contains("\\\""), "embedded quote must be escaped on the wire");
         assert!(wire.contains("\\n"), "embedded newline must be escaped on the wire");
+    }
+
+    // ─── hosted_chat_body: HOSTED dialect golden shape (#1260, contract 6) ──
+
+    /// The hosted request body's EXACT field set — the golden mirror of
+    /// `local_chat_body_matches_phase_a_*`: assert exactly which fields are
+    /// present, so a stray addition (a `temperature` an Azure reasoning
+    /// deployment would reject, a `tools` array, a `stream`) fails CI the
+    /// same way prompt-text drift would.
+    #[test]
+    fn hosted_chat_body_matches_hosted_dialect_golden_shape() {
+        let body = hosted_chat_body("gpt-5.1", "PERSONA_PLACEHOLDER", "USER_PLACEHOLDER", 20_000, None);
+        let expected = serde_json::json!({
+            "model": "gpt-5.1",
+            "messages": [
+                { "role": "system", "content": "PERSONA_PLACEHOLDER" },
+                { "role": "user", "content": "USER_PLACEHOLDER" },
+            ],
+            "max_completion_tokens": 20000,
+        });
+        assert_eq!(body, expected, "hosted body must match the proven dispatch_remote dialect exactly");
+        assert_eq!(
+            body.as_object().unwrap().len(),
+            3,
+            "exactly 3 top-level fields (model, messages, max_completion_tokens) — \
+             no temperature (hosted reasoning models reject it), no stream, no local max_tokens"
+        );
+    }
+
+    #[test]
+    fn hosted_chat_body_reasoning_effort_is_the_only_optional_field() {
+        let body = hosted_chat_body("gpt-5.1", "sys", "user", 16_384, Some("high"));
+        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(
+            body.as_object().unwrap().len(),
+            4,
+            "with an endpoint-declared reasoning_effort: exactly 4 top-level fields"
+        );
+        assert!(body.get("max_tokens").is_none(), "hosted dialect never carries the local cap form");
+        assert!(body.get("temperature").is_none());
+    }
+
+    /// Contract 6 conformance: the message ARRAY a remote seat sends is
+    /// byte-identical to the local seat's — including the empty-system
+    /// omission rule (the Phase A probe protocol sends ONE user-role
+    /// message, no system message at all). Compared against the local
+    /// body's own messages so the two dialects structurally cannot drift.
+    #[test]
+    fn hosted_and_local_bodies_share_identical_message_assembly() {
+        for (system, user) in [
+            ("", "probe user message"),
+            ("   \n", "probe user message"),
+            ("PERSONA", "judge user message"),
+        ] {
+            let local = local_chat_body("m", system, user, 0.2, 3000);
+            let hosted = hosted_chat_body("m", system, user, 3000, Some("high"));
+            assert_eq!(
+                local["messages"], hosted["messages"],
+                "message assembly must be byte-identical across dialects (system={system:?})"
+            );
+        }
+        // And the empty-system case is the single-user-message wire shape.
+        let hosted = hosted_chat_body("m", "", "u", 100, None);
+        assert_eq!(hosted["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(hosted["messages"][0]["role"], "user");
     }
 
     #[test]

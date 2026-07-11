@@ -150,7 +150,7 @@ darkmux's canonical config surface is **`~/.darkmux/config.json`** (#661), writt
 
 ```json
 {
-  "schema_version": "1.1",
+  "schema_version": "1.2",
   "machine_id": "studio",
   "orchestrator": "",
   "lms_bin": "lms",
@@ -158,6 +158,7 @@ darkmux's canonical config surface is **`~/.darkmux/config.json`** (#661), writt
   "redis":   { "enabled": false, "host": "127.0.0.1", "port": 6379, "stream": "darkmux:flow", "maxlen": 10000 },
   "audit":   { "enabled": false, "dir": "~/.darkmux/audit" },
   "runtime": { "inactivity_timeout_seconds": 600, "strict_selection": false, "feedback_injection": true, "check_updates": true },
+  "remote":  { "max_tokens_per_execution": 500000 },
   "fleet":   { "mode": "standalone" }
 }
 ```
@@ -189,6 +190,7 @@ Every `DARKMUX_*` var below is the **top tier** of `env > config.json > built-in
 | `DARKMUX_REDIS_MAXLEN` | `10000` | Approximate retention cap for the Redis stream (`XADD MAXLEN ~ N`); `0` for unbounded. |
 | `DARKMUX_INACTIVITY_TIMEOUT_SECONDS` | `600` | Per-dispatch inactivity budget. The host-side watchdog **hard-kills** the container at 100% if no proof-of-work signal lands. The runtime-side detector fires a **soft warning** at 75% (model-facing nudge to wrap up gracefully or escalate via `BLOCKED:`); both reset on the same proof-of-work signals (any tool.completed, any compaction). A productive dispatch never sees either; a stuck one gets the soft chance before the hard kill. Pathological tool patterns are caught by their dedicated detectors (cycle, cascade, edit-drift, reasoning loops) — the deadline trusts activity; the detectors catch struggle. (#457 + #464 + #466; renamed from `DARKMUX_RUNTIME_DEADLINE_SECONDS`) |
 | `DARKMUX_MODEL_LOAD_TIMEOUT_SECONDS` | `600` | Bounded model-load/unload phase for gestalt host-port calls (#1276). The `LmsHost` adapter spawns `lms load`/`lms unload`, polls the child, and **hard-kills it at expiry**, returning a typed timeout naming the phase — a wrong model id (or a load waiting on anything interactive) can no longer hang a dispatch until the workflow's outer kill. Resolved into the mandatory `Deadline` every `ModelHost` mutation takes; distinct from the *inactivity* budget above (that one meters dispatch proof-of-work; this one meters a single host load/unload call). |
+| `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION` | `500000` | (#1260/#1177) Per-EXECUTION remote token allowance for endpoint-staffed crew seats, where an execution = one pipeline stage. **Metered paths (1.18.0 scope):** the review funnel's remote seats (probe pass, each judge pass, the verify pass) AND the tool-less single-shot remote `crew dispatch` path. **NOT yet metered:** the AGENTIC-remote container path (#1187 — a tool-granting role on an endpoint profile, multi-call container loop); that follow-up is tracked separately. Only REMOTE (hosted-endpoint) calls draw from it — local seats are unmetered by it. When a stage exhausts its bucket, that stage's remaining remote calls stop with the reason named in the envelope: a load-bearing JUDGE stage exhausting is an honest DEGRADED run; a VERIFY stage exhausting degrades only the STAGE (findings already verified still post; skipped confirms keep the manual-verification marker; a loud warning names it); probe exhaustion is a reduced-coverage warning and the run continues. A remote-JUDGE dispatch FAILURE (surviving bounded retries) is likewise a degraded run. Setting it to `0` refuses all remote calls with a typed error (a hard opt-out). Tokens only, never currency. |
 | `DARKMUX_SERVE_TOKEN` | unset → loopback-only | The serve daemon's bearer token (a **secret** — env override; else the macOS Keychain item `darkmux-serve-token`, gated by `runtime.daemon_auth_enabled`). When a token is set the daemon may bind non-loopback and **remote reads + `/diff` require** `Authorization: Bearer <token>` (loopback stays open so the local viewer keeps working). When **unset**, a non-loopback `--bind` is **refused** (a loopback daemon needs no token). `fleet status --deep` sends this token to peers — use the **same shared token** on every machine in the fleet. (#881) |
 
 **env → `config.json` field** (the override-tier var → its durable config home):
@@ -207,6 +209,7 @@ Every `DARKMUX_*` var below is the **top tier** of `env > config.json > built-in
 | `DARKMUX_MODEL_LOAD_TIMEOUT_SECONDS` (#1276 — bounded host load/unload phase) | `runtime.model_load_timeout_seconds` |
 | `DARKMUX_RUNTIME_MAX_TURNS` / `DARKMUX_RUNTIME_MAX_TOKENS` | `runtime.max_turns` / `runtime.max_tokens` |
 | `DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL` (#1221 — per-CALL completion cap, reasoning + content of one turn; unset = the runtime's built-in 10000, which truncates productive reasoning on thinking-family models) | `runtime.max_tokens_per_call` |
+| `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION` | `remote.max_tokens_per_execution` (#1260) |
 | `DARKMUX_STRICT_SELECTION` / `DARKMUX_CHECK_UPDATES` | `runtime.strict_selection` / `runtime.check_updates` |
 | `DARKMUX_FEEDBACK_INJECTION` | `runtime.feedback_injection` exists, but is read **directly in the runtime container** (`runtime/src/feedback.rs`), NOT through `config_access` — so it does NOT yet honor the `config.json` tier (the runtime crate can't depend on `config_access`; wiring it needs a flag-plumb, deliberately deferred in #661). |
 | `DARKMUX_DEFAULT_ROLE` / `DARKMUX_DAEMON_CORS_ORIGINS` | `runtime.default_role` / `runtime.daemon_cors_origins` |

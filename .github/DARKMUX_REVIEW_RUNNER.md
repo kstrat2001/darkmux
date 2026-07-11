@@ -178,3 +178,11 @@ every future dispatch with no PR against this repo.
   `review-deep` crew (or whichever crew you dispatch) in
   `~/.darkmux/profiles.json`. The workflow never pins a model id in the repo
   — it only ever names a crew (#1054).
+- **Data boundary — REMOTE (hosted-endpoint) seats send code off-box (#1260).**
+  A remote-staffed seat (probe / judge / verify pointed at a hosted endpoint
+  profile) transmits the diff, the surrounding code, and the extracted facts to
+  that endpoint. Only staff a remote seat whose endpoint is **cleared for the
+  code it will see** — an org-approved deployment (e.g. private/proprietary code
+  → the org's own Azure tenant only, never a personal-key third-party vendor).
+  This is operator-explicit by construction: profiles name their own endpoint
+  and nothing auto-routes; darkmux never picks a remote endpoint for you.
