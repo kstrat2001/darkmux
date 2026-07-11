@@ -525,7 +525,12 @@ impl Profile {
 // that actually OMITS `n_ctx` fails an entry-level parse on a pre-1.2
 // binary — the per-entry quarantine (also #1282) scopes that to the one
 // entry on binaries that have it.
-pub const PROFILES_SCHEMA_VERSION: &str = "1.2";
+// 1.3 (#1266): additive `passes` on `SeatStaffing` (the judge seat's
+// consensus depth — `passes: 1` single / `2` double-confirm default / `N`
+// unanimous consensus). Minor bump: every 1.2 registry parses unchanged (the
+// field defaults to 2 on read via `default_judge_passes`, reproducing today's
+// double-confirm), per the lenient-read doctrine.
+pub const PROFILES_SCHEMA_VERSION: &str = "1.3";
 
 /// A **saved crew assignment**: which models staff which crew-role seats,
 /// for multi-seat pipelines (e.g. a review funnel's probe + judge seats).
@@ -564,11 +569,23 @@ pub struct Crew {
 }
 
 /// One model staffing a [`Crew`] seat — a [`Profile`] + model binding plus
-/// its draw shape. `k` (draws per work item) defaults to 3, matching the
-/// config.json visible-defaults doctrine: the knob is a real, documented
-/// default, not a hidden code constant, so an operator reading a resolved
-/// crew sees what actually ran.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// its draw shape. `k` (draws per work item) defaults to 3 and `passes`
+/// (judge consensus depth) defaults to 2, matching the config.json
+/// visible-defaults doctrine: each knob is a real, documented default, not a
+/// hidden code constant, so an operator reading a resolved crew sees what
+/// actually ran.
+///
+/// `k` and `passes` are DISTINCT axes (#1266): `k` is the PROBE seat's
+/// draw BREADTH (a union over draws — recall), `passes` is the JUDGE seat's
+/// consensus DEPTH (agreement across independent judgments — precision).
+/// The schema is generic across seats, so both fields exist on every
+/// staffing; each consumer reads the one that applies to its seat.
+///
+/// `Default` is implemented by hand (below) rather than derived so that
+/// `..Default::default()` yields the SAME `k`/`passes` a deserialized crew
+/// gets (`default_k` / `default_judge_passes`) — a derived `Default` would
+/// give `0`, diverging from the on-read defaults.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SeatStaffing {
     /// The registry [`Profile`] name this staffing dispatches through.
     pub profile: String,
@@ -576,9 +593,22 @@ pub struct SeatStaffing {
     /// [`Profile::default_model_id`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// Draws per work item. Default 3.
+    /// Draws per work item (PROBE-seat breadth). Default 3.
     #[serde(default = "default_k")]
     pub k: u32,
+    /// (#1266) Judge-seat consensus depth: how many independent judgment
+    /// passes a flag must survive. `1` = single pass (pass-1's ruling IS the
+    /// tier — the frontier cost lever; pass-2 never runs). `2` = today's
+    /// double-confirm (DEFAULT — a `confirmed` pass-1 gets one re-judgment;
+    /// agreement keeps it Confirmed, disagreement demotes it). `N > 2` =
+    /// UNANIMOUS consensus over N passes (a flag stays Confirmed only if
+    /// EVERY pass that runs confirms it; the first non-confirm demotes it and
+    /// early-exits — so passes 2..N run only on still-confirmed survivors and
+    /// N passes never costs N×). Distinct from probe `k` (see the type doc):
+    /// `k` is breadth/union, `passes` is depth/consensus. The judge seat reads
+    /// this; other seats ignore it.
+    #[serde(default = "default_judge_passes")]
+    pub passes: u32,
     /// Completion-token cap (`max_completion_tokens`) for this seat's calls.
     /// An explicit value always wins verbatim (operator sovereignty — the
     /// operator may know their task is short). When ABSENT, a LOCAL seat uses
@@ -603,6 +633,30 @@ pub struct SeatStaffing {
 
 fn default_k() -> u32 {
     3
+}
+
+/// (#1266) Judge consensus depth default — 2 reproduces the historical
+/// hardcoded double-confirm, so a crew omitting `passes` behaves exactly as
+/// before.
+fn default_judge_passes() -> u32 {
+    2
+}
+
+impl Default for SeatStaffing {
+    fn default() -> Self {
+        // Match the serde on-read defaults for `k`/`passes` (a derived
+        // `Default` would give 0, diverging from `default_k`/
+        // `default_judge_passes`).
+        SeatStaffing {
+            profile: String::new(),
+            model: None,
+            k: default_k(),
+            passes: default_judge_passes(),
+            max_tokens: None,
+            bundle_selector: None,
+            extras: serde_json::Map::new(),
+        }
+    }
 }
 
 /// Scopes a [`SeatStaffing`]'s draws to a subset of fact families, and
@@ -1465,7 +1519,7 @@ mod crew_tests {
     //! nested types. Validation semantics (seat/staffing non-empty, profile
     //! refs resolve, k >= 1, remote-endpoint rejection) live in
     //! `darkmux-profiles::crews` — this module gates serde shape only:
-    //! round-trips, `k` defaulting, extras tolerance, and the
+    //! round-trips, `k` / `passes` defaulting, extras tolerance, and the
     //! value-identical old-shape (no `crews` key) invariant.
     use super::*;
 
@@ -1477,6 +1531,38 @@ mod crew_tests {
         assert!(s.model.is_none());
         assert!(s.max_tokens.is_none());
         assert!(s.bundle_selector.is_none());
+    }
+
+    /// (#1266) A crew omitting `passes` deserializes to 2 — reproducing the
+    /// historical hardcoded double-confirm, so every pre-1.3 registry keeps
+    /// today's judge behavior on read. `passes` is a DISTINCT axis from `k`
+    /// (probe breadth vs judge consensus depth), so a bare staffing carries
+    /// both visible defaults independently.
+    #[test]
+    fn seat_staffing_passes_defaults_to_two_when_absent() {
+        let json = r#"{"profile":"deep"}"#;
+        let s: SeatStaffing = serde_json::from_str(json).unwrap();
+        assert_eq!(s.passes, 2, "absent passes = today's double-confirm");
+        assert_eq!(s.k, 3, "k stays its own default — distinct axis");
+        // The hand-written Default matches the on-read defaults (a derived
+        // Default would give passes: 0 / k: 0).
+        assert_eq!(SeatStaffing::default().passes, 2);
+        assert_eq!(SeatStaffing::default().k, 3);
+    }
+
+    /// (#1266) An explicit `passes` wins verbatim — `1` (single) and any
+    /// `N > 2` (consensus) both round-trip, independent of `k`.
+    #[test]
+    fn seat_staffing_explicit_passes_overrides_default() {
+        let single: SeatStaffing =
+            serde_json::from_str(r#"{"profile":"fast","passes":1}"#).unwrap();
+        assert_eq!(single.passes, 1);
+        let consensus: SeatStaffing =
+            serde_json::from_str(r#"{"profile":"fast","k":5,"passes":4}"#).unwrap();
+        assert_eq!(consensus.passes, 4);
+        assert_eq!(consensus.k, 5, "k and passes are independent axes");
+        let out: serde_json::Value = serde_json::to_value(&consensus).unwrap();
+        assert_eq!(out["passes"].as_u64(), Some(4));
     }
 
     #[test]
