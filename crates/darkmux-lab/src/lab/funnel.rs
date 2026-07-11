@@ -983,6 +983,15 @@ pub struct StaffingSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
     pub k: u32,
+    /// (#1266) The judge seat's resolved consensus depth (`passes` — 1
+    /// single / 2 double-confirm / N unanimous), snapshotted so every run is
+    /// self-describing. Present on every seat's snapshot the same way `k` is
+    /// (the judge is the consumer; other seats carry it inertly). Defaults to
+    /// 2 on read so a pre-1.3 snapshot (this field didn't exist) deserializes
+    /// as today's double-confirm rather than a hard parse failure — the
+    /// module's standard schema-lenience.
+    #[serde(default = "default_snapshot_passes")]
+    pub passes: u32,
     /// The resolved `ProfileModel`'s DECLARED context length — settings
     /// provenance per run, so "what context was this model loaded at" is
     /// never a forensic question (a sibling concern to the config-vs-
@@ -1016,6 +1025,12 @@ pub struct CrewStaffingSnapshot {
     pub verify: Option<StaffingSnapshot>,
 }
 
+/// (#1266) Snapshot default for `StaffingSnapshot::passes` — 2 (double-
+/// confirm), so a pre-1.3 envelope missing the field reads as today's judge.
+fn default_snapshot_passes() -> u32 {
+    2
+}
+
 fn staffing_snapshot(
     probes: &[ResolvedSeatStaffing],
     judge: &ResolvedSeatStaffing,
@@ -1028,6 +1043,7 @@ fn staffing_snapshot(
             remote: s.pm.is_remote(),
             endpoint: seat_endpoint_host(&s.pm),
             k: s.k,
+            passes: s.passes,
             n_ctx: s.pm.n_ctx,
             max_tokens: s.max_tokens,
             selector: s.selector.clone(),
@@ -2276,22 +2292,81 @@ fn budget_exhausted_record(pass: u8) -> JudgeRecord {
     }
 }
 
-/// The double-confirm state machine for one flag: pass-1 (with the
-/// unparsed-retry above) always runs; a `confirmed` pass-1 gets a pass-2
-/// (also with the retry) — agreement → [`Tier::Confirmed`]; ANY other
-/// pass-2 outcome (needs_check, false_positive, unparsed, error) demotes
-/// to [`Tier::NeedsCheck`], never silently to `confirmed`. A non-confirmed
-/// pass-1 needs no pass-2: `needs_check` stays `NeedsCheck`; everything
-/// else (`false_positive`, `unparsed`, `error`) is `Archived` — the
-/// specific ruling is still preserved on the record (loud), just tiered
-/// out of the author-facing report.
+/// One judge pass with the [`JudgeBudgets`] gate applied (#1260): a REMOTE
+/// judge's `bucket` is consulted first — a denied `admit()` skips the
+/// dispatch entirely and yields a named `budget_exhausted_record` (Error, so
+/// it never counts as agreement); an admitted call runs (with the
+/// unparsed-retry) and `spend()`s its tokens/calls back. A LOCAL judge
+/// (`bucket == None`) always dispatches, untouched by any bucket.
+#[allow(clippy::too_many_arguments)]
+fn run_budgeted_pass(
+    pass: u8,
+    bucket: Option<&mut RemoteBucket>,
+    model: &str,
+    system: &str,
+    prompt: &str,
+    max_tokens: u32,
+    endpoint: Option<&ModelEndpoint>,
+    chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
+) -> PassOutcome {
+    match bucket {
+        Some(b) => {
+            if !b.admit() {
+                return PassOutcome {
+                    record: budget_exhausted_record(pass),
+                    tokens: 0,
+                    wall_ms: 0,
+                    calls: 0,
+                    // A budget denial is NOT a dispatch failure — it's metered
+                    // separately (the judge-budget degeneracy in
+                    // `finish_funnel`).
+                    dispatch_error: false,
+                };
+            }
+            let o = judge_pass_with_retry(pass, model, system, prompt, max_tokens, endpoint, chat);
+            b.spend(o.tokens, o.calls);
+            o
+        }
+        None => judge_pass_with_retry(pass, model, system, prompt, max_tokens, endpoint, chat),
+    }
+}
+
+/// (#1266) The judge state machine for one flag, generalized over `passes`
+/// (the judge seat's consensus depth — replaces the historical hardcoded
+/// double-confirm). Pass-1 (with the unparsed-retry) ALWAYS runs; a
+/// non-confirmed pass-1 needs no further pass REGARDLESS of `passes`
+/// (`needs_check` stays [`Tier::NeedsCheck`]; `false_positive`/`unparsed`/
+/// `error` archive — the specific ruling is still preserved on the record,
+/// just tiered out of the author-facing report). What a `confirmed` pass-1
+/// does next depends on `passes`:
 ///
-/// (#1260) A REMOTE judge's calls gate on the per-pass buckets in
-/// `budgets`: an exhausted pass-1 bucket skips the flag's whole ruling
-/// (Error → Archived, reason named); an exhausted pass-2 bucket demotes a
-/// pass-1 confirm to NeedsCheck (Error is not agreement) — in both cases
-/// the run goes degraded downstream, never a silent pass.
-fn judge_one_flag(
+/// - `passes == 1` — SINGLE pass: pass-1's confirm IS [`Tier::Confirmed`]
+///   directly; no confirmation pass runs (the frontier cost lever).
+/// - `passes == 2` — today's double-confirm (DEFAULT): one confirmation pass;
+///   agreement → `Confirmed`, ANY other outcome (needs_check, false_positive,
+///   unparsed, error) demotes to `NeedsCheck`, never silently to `confirmed`.
+/// - `passes == N > 2` — UNANIMOUS consensus: confirmation passes `2..=N` run
+///   in sequence and EVERY one must confirm for the flag to stay `Confirmed`;
+///   the FIRST non-confirm demotes it to `NeedsCheck` and EARLY-EXITS (so N
+///   passes never costs N× — later passes run only on still-confirmed
+///   survivors, the same bounded shape the double-confirm already used).
+///
+/// The `pass2` slot holds the LAST confirmation pass that ran — for
+/// `passes == 2` that is literally pass-2 (byte-identical to the historical
+/// double-confirm); for `N > 2` it is the DECISIVE later pass (the one that
+/// demoted, or the final confirm). Intermediate confirmation records fold
+/// into the token/wall/call totals but are not individually retained on the
+/// flag; full per-pass retention arrives with the sharding build (#1266).
+///
+/// (#1260) A REMOTE judge's calls gate on the per-pass buckets in `budgets`:
+/// pass-1 draws from the pass-1 bucket, every confirmation pass from the
+/// pass-2 bucket. An exhausted pass-1 bucket skips the flag's whole ruling
+/// (Error → Archived, reason named); an exhausted confirmation bucket demotes
+/// a pass-1 confirm to NeedsCheck (Error is not agreement) — in both cases the
+/// run goes degraded downstream, never a silent pass.
+#[allow(clippy::too_many_arguments)]
+fn judge_one_flag_with_passes(
+    passes: u32,
     prompt: &str,
     model: &str,
     system: &str,
@@ -2300,61 +2375,32 @@ fn judge_one_flag(
     mut budgets: Option<&mut JudgeBudgets>,
     chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
 ) -> JudgeOutcome {
-    let pass1_denied = budgets.as_deref_mut().is_some_and(|b| !b.pass1.admit());
-    let p1 = if pass1_denied {
-        PassOutcome {
-            record: budget_exhausted_record(1),
-            tokens: 0,
-            wall_ms: 0,
-            calls: 0,
-            // A budget denial is NOT a dispatch failure — it's metered
-            // separately (the judge-budget degeneracy in `finish_funnel`).
-            dispatch_error: false,
-        }
-    } else {
-        let o = judge_pass_with_retry(1, model, system, prompt, max_tokens, endpoint, chat);
-        if let Some(b) = budgets.as_deref_mut() {
-            b.pass1.spend(o.tokens, o.calls);
-        }
-        o
-    };
-    match p1.record.ruling {
-        FunnelRuling::Confirmed => {
-            let pass2_denied = budgets.as_deref_mut().is_some_and(|b| !b.pass2.admit());
-            let p2 = if pass2_denied {
-                PassOutcome {
-                    record: budget_exhausted_record(2),
-                    tokens: 0,
-                    wall_ms: 0,
-                    calls: 0,
-                    dispatch_error: false,
-                }
-            } else {
-                let o = judge_pass_with_retry(2, model, system, prompt, max_tokens, endpoint, chat);
-                if let Some(b) = budgets {
-                    b.pass2.spend(o.tokens, o.calls);
-                }
-                o
-            };
-            let (tier, demoted) = if p2.record.ruling == FunnelRuling::Confirmed {
-                (Tier::Confirmed, false)
-            } else {
-                (Tier::NeedsCheck, true)
-            };
-            JudgeOutcome {
-                pass1: p1.record,
-                pass2: Some(p2.record),
-                tier,
-                demoted_by_pass2: demoted,
-                tokens: p1.tokens + p2.tokens,
-                pass1_ms: p1.wall_ms,
-                pass2_ms: p2.wall_ms,
-                calls: p1.calls + p2.calls,
-                dispatch_error: p1.dispatch_error || p2.dispatch_error,
-            }
-        }
-        FunnelRuling::NeedsCheck => JudgeOutcome {
-            tier: Tier::NeedsCheck,
+    // `passes >= 1` is validated at crew resolution (`resolve_staffing`);
+    // clamp defensively so a hand-constructed 0 can never skip pass-1.
+    let passes = passes.max(1);
+
+    // Pass-1 — the breadth pass over every alive flag; draws from the pass-1
+    // bucket. Always runs.
+    let p1 = run_budgeted_pass(
+        1,
+        budgets.as_deref_mut().map(|b| &mut b.pass1),
+        model,
+        system,
+        prompt,
+        max_tokens,
+        endpoint,
+        chat,
+    );
+
+    // A non-confirmed pass-1 short-circuits identically for EVERY `passes`.
+    if p1.record.ruling != FunnelRuling::Confirmed {
+        let tier = match p1.record.ruling {
+            FunnelRuling::NeedsCheck => Tier::NeedsCheck,
+            // false_positive | unparsed | error
+            _ => Tier::Archived,
+        };
+        return JudgeOutcome {
+            tier,
             demoted_by_pass2: false,
             tokens: p1.tokens,
             pass1_ms: p1.wall_ms,
@@ -2363,19 +2409,87 @@ fn judge_one_flag(
             dispatch_error: p1.dispatch_error,
             pass1: p1.record,
             pass2: None,
-        },
-        FunnelRuling::FalsePositive | FunnelRuling::Unparsed | FunnelRuling::Error => JudgeOutcome {
-            tier: Tier::Archived,
-            demoted_by_pass2: false,
-            tokens: p1.tokens,
-            pass1_ms: p1.wall_ms,
-            pass2_ms: 0,
-            calls: p1.calls,
-            dispatch_error: p1.dispatch_error,
-            pass1: p1.record,
-            pass2: None,
-        },
+        };
     }
+
+    // `passes: 1` — the confirm stands alone; no confirmation pass.
+    if passes == 1 {
+        return JudgeOutcome {
+            tier: Tier::Confirmed,
+            demoted_by_pass2: false,
+            tokens: p1.tokens,
+            pass1_ms: p1.wall_ms,
+            pass2_ms: 0,
+            calls: p1.calls,
+            dispatch_error: p1.dispatch_error,
+            pass1: p1.record,
+            pass2: None,
+        };
+    }
+
+    // Unanimous consensus over confirmation passes `2..=passes`, early-exiting
+    // on the first non-confirm. Every confirmation pass draws from the pass-2
+    // bucket; totals span them all (#1260 accounting stays honest).
+    let mut tokens = p1.tokens;
+    let mut calls = p1.calls;
+    let mut later_ms = 0u64;
+    let mut dispatch_error = p1.dispatch_error;
+    let mut last: Option<JudgeRecord> = None;
+    let mut demoted = false;
+    for pass_no in 2..=passes {
+        let pn = run_budgeted_pass(
+            pass_no as u8,
+            budgets.as_deref_mut().map(|b| &mut b.pass2),
+            model,
+            system,
+            prompt,
+            max_tokens,
+            endpoint,
+            chat,
+        );
+        tokens += pn.tokens;
+        calls += pn.calls;
+        later_ms += pn.wall_ms;
+        dispatch_error |= pn.dispatch_error;
+        let confirmed = pn.record.ruling == FunnelRuling::Confirmed;
+        last = Some(pn.record);
+        if !confirmed {
+            // One disagreement breaks unanimity — demote and stop (the same
+            // early-exit the double-confirm already used at N == 2).
+            demoted = true;
+            break;
+        }
+    }
+    let tier = if demoted { Tier::NeedsCheck } else { Tier::Confirmed };
+    JudgeOutcome {
+        pass1: p1.record,
+        pass2: last,
+        tier,
+        demoted_by_pass2: demoted,
+        tokens,
+        pass1_ms: p1.wall_ms,
+        pass2_ms: later_ms,
+        calls,
+        dispatch_error,
+    }
+}
+
+/// (#1266) The historical double-confirm entry point (`passes: 2`) — retained
+/// for the `double_confirm_*` unit tests, which pin today's exact behavior.
+/// Production dispatch calls [`judge_one_flag_with_passes`] with the judge
+/// seat's resolved `passes`.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn judge_one_flag(
+    prompt: &str,
+    model: &str,
+    system: &str,
+    max_tokens: u32,
+    endpoint: Option<&ModelEndpoint>,
+    budgets: Option<&mut JudgeBudgets>,
+    chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
+) -> JudgeOutcome {
+    judge_one_flag_with_passes(2, prompt, model, system, max_tokens, endpoint, budgets, chat)
 }
 
 // ─── verify stage (#1260/#1177) — optional adjudication of confirms ──────
@@ -2690,7 +2804,8 @@ fn finish_funnel(
         let code = bundle.map(|b| b.code.as_str()).unwrap_or_default();
         let facts: &[String] = bundle.map(|b| b.facts.as_slice()).unwrap_or_default();
         let prompt = judge_prompt(inputs.intent_title, inputs.intent_body, code, facts, &flag.charge_text);
-        let outcome = judge_one_flag(
+        let outcome = judge_one_flag_with_passes(
+            judge.passes,
             &prompt,
             &judge_identifier,
             inputs.judge_system,
@@ -2736,8 +2851,11 @@ fn finish_funnel(
                     }),
                 );
             }
+            // (#1266) The decisive later pass's REAL pass number — 2 under
+            // the default double-confirm (byte-identical to before), or the
+            // demoting/final pass under an N-pass consensus judge.
             guard.ruling(json!({
-                "bundle_id": flag.bundle_id, "pass": 2,
+                "bundle_id": flag.bundle_id, "pass": p2.pass,
                 "ruling": p2.ruling, "seconds": p2.seconds,
             }));
         }
@@ -3177,6 +3295,9 @@ mod tests {
             name: profile.to_string(),
             pm: pm(model),
             k,
+            // Default double-confirm — a test needing a different judge depth
+            // sets `.passes` on the returned staffing (#1266).
+            passes: 2,
             max_tokens: None,
             selector: None,
         }
@@ -3444,6 +3565,138 @@ mod tests {
         assert_eq!(o.pass2.unwrap().ruling, FunnelRuling::Confirmed);
         assert_eq!(o.tier, Tier::Confirmed);
         assert_eq!(o.calls, 3, "pass-1 attempt + retry + pass-2 = three real dispatches");
+    }
+
+    // ── passes knob (#1266): single pass (passes: 1) ─────────────────
+    // pass-1's ruling IS the tier; no confirmation pass ever runs — the
+    // frontier cost lever.
+
+    #[test]
+    fn passes_one_confirm_is_confirmed_with_a_single_call() {
+        // A counting closure (not `scripted_chat`) so the "invoked exactly
+        // once" claim is literal, not inferred from the outcome's own count.
+        let mut calls = 0u32;
+        let mut chat = |_call: &ChatCall| {
+            calls += 1;
+            Ok(reply(CONFIRM_JSON))
+        };
+        let o =
+            judge_one_flag_with_passes(1, "prompt", "judge-model", "sys", 1000, None, None, &mut chat);
+        assert_eq!(o.pass1.ruling, FunnelRuling::Confirmed);
+        assert!(o.pass2.is_none(), "passes: 1 never runs a confirmation pass");
+        assert_eq!(o.tier, Tier::Confirmed, "the single pass IS the tier directly");
+        assert!(!o.demoted_by_pass2);
+        assert_eq!(o.calls, 1);
+        assert_eq!(o.pass2_ms, 0, "no confirmation pass, no confirmation wall time");
+        assert_eq!(calls, 1, "the judge chat closure fired exactly once for this flag");
+    }
+
+    #[test]
+    fn passes_one_needs_check_tiers_directly() {
+        let mut calls = 0u32;
+        let mut chat = |_call: &ChatCall| {
+            calls += 1;
+            Ok(reply(NEEDS_CHECK_JSON))
+        };
+        let o =
+            judge_one_flag_with_passes(1, "prompt", "judge-model", "sys", 1000, None, None, &mut chat);
+        assert_eq!(o.pass1.ruling, FunnelRuling::NeedsCheck);
+        assert_eq!(o.tier, Tier::NeedsCheck, "pass-1's needs_check IS the tier");
+        assert!(o.pass2.is_none());
+        assert_eq!(calls, 1, "a non-confirmed pass-1 earns no second call under any passes");
+    }
+
+    #[test]
+    fn passes_one_false_positive_archives_directly() {
+        let mut chat = scripted_chat(RefCell::new(vec![FP_JSON]));
+        let o =
+            judge_one_flag_with_passes(1, "prompt", "judge-model", "sys", 1000, None, None, &mut chat);
+        assert_eq!(o.pass1.ruling, FunnelRuling::FalsePositive);
+        assert_eq!(o.tier, Tier::Archived, "pass-1's false_positive tiers out directly");
+        assert!(o.pass2.is_none());
+        assert_eq!(o.calls, 1);
+    }
+
+    // ── passes knob (#1266): N-pass unanimous consensus (passes: 3) ──
+    // A flag stays Confirmed only if EVERY pass that runs confirms it; the
+    // first non-confirm demotes and early-exits (N passes is never N× cost).
+
+    #[test]
+    fn passes_three_all_confirm_is_confirmed_after_three_calls() {
+        let mut calls = 0u32;
+        let mut chat = |_call: &ChatCall| {
+            calls += 1;
+            Ok(reply(CONFIRM_JSON))
+        };
+        let o =
+            judge_one_flag_with_passes(3, "prompt", "judge-model", "sys", 1000, None, None, &mut chat);
+        assert_eq!(o.tier, Tier::Confirmed, "unanimous confirms hold the bar");
+        assert!(!o.demoted_by_pass2);
+        assert_eq!(o.pass1.ruling, FunnelRuling::Confirmed);
+        // The decisive `pass2` slot holds the LAST confirmation pass (pass-3),
+        // carrying its real pass number.
+        let last = o.pass2.as_ref().expect("a later confirmation pass survives into the slot");
+        assert_eq!(last.ruling, FunnelRuling::Confirmed);
+        assert_eq!(last.pass, 3, "the decisive slot carries the real pass number, not a hardcoded 2");
+        assert_eq!(o.calls, 3);
+        assert_eq!(calls, 3, "pass-1 + two confirmation passes");
+    }
+
+    #[test]
+    fn passes_three_final_disagreement_demotes_after_three_calls() {
+        // confirm → confirm → false_positive: unanimity breaks on the last
+        // pass, so all three ran before the demotion landed.
+        let mut calls = 0u32;
+        let mut chat = |_call: &ChatCall| {
+            calls += 1;
+            Ok(reply(if calls < 3 { CONFIRM_JSON } else { FP_JSON }))
+        };
+        let o =
+            judge_one_flag_with_passes(3, "prompt", "judge-model", "sys", 1000, None, None, &mut chat);
+        assert_eq!(o.tier, Tier::NeedsCheck, "one disagreement breaks unanimity, never ships confirmed");
+        assert!(o.demoted_by_pass2);
+        assert_eq!(o.pass2.as_ref().unwrap().ruling, FunnelRuling::FalsePositive);
+        assert_eq!(o.calls, 3);
+        assert_eq!(calls, 3, "all three passes ran before the late disagreement");
+    }
+
+    #[test]
+    fn passes_three_early_disagreement_exits_after_two_calls() {
+        // confirm → false_positive: the unanimous early-exit fires at pass-2,
+        // so pass-3 never runs — N passes is not N× cost.
+        let mut calls = 0u32;
+        let mut chat = |_call: &ChatCall| {
+            calls += 1;
+            Ok(reply(if calls < 2 { CONFIRM_JSON } else { FP_JSON }))
+        };
+        let o =
+            judge_one_flag_with_passes(3, "prompt", "judge-model", "sys", 1000, None, None, &mut chat);
+        assert_eq!(o.tier, Tier::NeedsCheck);
+        assert!(o.demoted_by_pass2);
+        assert_eq!(o.calls, 2, "early-exit — the third pass is skipped");
+        assert_eq!(calls, 2, "the unanimous rule stops at the first non-confirm");
+    }
+
+    // ── passes knob (#1266): passes: 2 IS the historical double-confirm ─
+
+    #[test]
+    fn passes_two_reproduces_double_confirm_exactly() {
+        // The explicit `passes: 2` path and the `double_confirm_*` wrapper
+        // (which delegates passes=2) must agree — confirm→confirm Confirmed,
+        // confirm→false_positive demoted.
+        let mut chat = scripted_chat(RefCell::new(vec![CONFIRM_JSON, CONFIRM_JSON]));
+        let ok =
+            judge_one_flag_with_passes(2, "prompt", "judge-model", "sys", 1000, None, None, &mut chat);
+        assert_eq!(ok.tier, Tier::Confirmed);
+        assert_eq!(ok.pass2.as_ref().unwrap().pass, 2);
+        assert_eq!(ok.calls, 2);
+
+        let mut chat = scripted_chat(RefCell::new(vec![CONFIRM_JSON, FP_JSON]));
+        let demoted =
+            judge_one_flag_with_passes(2, "prompt", "judge-model", "sys", 1000, None, None, &mut chat);
+        assert_eq!(demoted.tier, Tier::NeedsCheck);
+        assert!(demoted.demoted_by_pass2);
+        assert_eq!(demoted.calls, 2);
     }
 
     // ── empty probe draw ─────────────────────────────────────────────
@@ -4279,6 +4532,53 @@ mod tests {
         assert_eq!(value["staffing"]["probes"][0]["n_ctx"], json!(32_000));
         assert_eq!(value["staffing"]["judge"]["model"], json!("darkmux:judge-model"));
         assert_eq!(value["staffing"]["judge"]["n_ctx"], json!(32_000));
+    }
+
+    /// (#1266) The judge seat's resolved `passes` (consensus depth) rides
+    /// into the envelope's staffing snapshot, so every run is self-describing
+    /// about the knob it ran under (the knob-snapshot discipline). A probe
+    /// seat that omits `passes` carries the visible default 2.
+    #[test]
+    fn staffing_snapshot_carries_the_judge_passes_knob() {
+        let mut judge = staffing("fast", "judge-model", 1);
+        judge.passes = 3; // an N-pass consensus judge
+        let crew = crew_with(vec![
+            ("review-probe", vec![staffing("fast", "probe-model", 2)]),
+            ("review-judge", vec![judge]),
+        ]);
+        let inputs = FunnelInputs {
+            case_id: "c-passes".to_string(),
+            crew: &crew,
+            intent_title: "add a feature",
+            intent_body: "",
+            diff: DIFF,
+            mode: ExecMode::Sequential,
+            probe_system: "probe sys",
+            judge_system: "judge sys",
+            verify_system: "verify sys",
+            remote_max_tokens_per_execution: 500_000,
+            bundles: None,
+        };
+        let mut cycler = RecordingCycler::new();
+        let mut chat = |_call: &ChatCall| Ok(reply("a real defect `const end = start.plus(30)`"));
+        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("funnel runs");
+
+        let snapshot = env.staffing.as_ref().expect("staffing snapshot present on a normal run");
+        assert_eq!(
+            snapshot.judge.as_ref().unwrap().passes,
+            3,
+            "the judge's resolved consensus depth is snapshotted"
+        );
+        assert_eq!(
+            snapshot.probes[0].passes, 2,
+            "a probe seat omitting passes carries the visible default"
+        );
+
+        // Survives the JSON round trip `funnels.json` persists.
+        let json = serde_json::to_string(&env).expect("envelope serializes");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("envelope parses back");
+        assert_eq!(value["staffing"]["judge"]["passes"], json!(3));
+        assert_eq!(value["staffing"]["probes"][0]["passes"], json!(2));
     }
 
     #[test]
@@ -5566,6 +5866,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             name: profile.to_string(),
             pm: remote_pm(model),
             k,
+            passes: 2,
             max_tokens: None,
             selector: None,
         }

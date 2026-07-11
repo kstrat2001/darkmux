@@ -41,6 +41,11 @@ pub struct ResolvedSeatStaffing {
     pub name: String,
     pub pm: ProfileModel,
     pub k: u32,
+    /// (#1266) Judge-seat consensus depth (see [`SeatStaffing::passes`]) —
+    /// `1` single / `2` double-confirm (default) / `N` unanimous consensus.
+    /// A DISTINCT axis from `k` (probe breadth vs judge depth); the judge
+    /// seat reads this, other seats ignore it.
+    pub passes: u32,
     /// Completion-token cap for this seat's calls. An explicit value wins
     /// verbatim; when absent, a LOCAL seat uses its local-tuned default and a
     /// REMOTE seat floors at a reasoning-aware minimum (#1260 — hosted
@@ -66,6 +71,7 @@ pub struct ResolvedCrew {
 /// - every staffing's `profile` names a real [`Profile`](darkmux_types::Profile)
 /// - every explicit `model` id exists in that profile's `models[]`
 /// - `k >= 1`
+/// - `passes >= 1` (#1266 — the judge seat's consensus depth)
 /// - a LOCAL staffing (no remote `endpoint`) declares `n_ctx` — a local
 ///   seat gets loaded at its declared context, so a missing window is a
 ///   resolution error here (#1282)
@@ -157,11 +163,23 @@ fn resolve_staffing(
             s.k
         );
     }
+    // (#1266) `passes` is the judge seat's consensus depth; 0 is nonsensical
+    // (a flag would advance on no judgment at all). Validated at resolution
+    // time, alongside `k`, per the config-leniency contract (#1269).
+    if s.passes < 1 {
+        bail!(
+            "darkmux: crew \"{}\" {}: passes must be >= 1 (got {})",
+            crew_name,
+            label,
+            s.passes
+        );
+    }
     let pm = resolve_model(reg, crew_name, label, &s.profile, s.model.as_deref())?;
     Ok(ResolvedSeatStaffing {
         name: s.profile.clone(),
         pm,
         k: s.k,
+        passes: s.passes,
         max_tokens: s.max_tokens,
         selector: s.bundle_selector.clone(),
     })
@@ -481,6 +499,66 @@ mod tests {
         );
         let err = resolve_crew(&reg, "bad").unwrap_err();
         assert!(err.to_string().contains("k must be >= 1"));
+    }
+
+    /// (#1266) `passes: 0` is rejected at resolution (a flag advancing on
+    /// zero judgments is nonsensical) — the sibling of `k >= 1`.
+    #[test]
+    fn resolve_crew_passes_zero_rejected() {
+        let reg = registry(
+            vec![("fast", profile(vec![model("a", 1000)]))],
+            vec![(
+                "bad",
+                Crew {
+                    seats: seats(vec![(
+                        "review-judge",
+                        vec![SeatStaffing {
+                            profile: "fast".to_string(),
+                            passes: 0,
+                            ..Default::default()
+                        }],
+                    )]),
+                    ..Default::default()
+                },
+            )],
+        );
+        let err = resolve_crew(&reg, "bad").unwrap_err();
+        assert!(err.to_string().contains("passes must be >= 1"));
+    }
+
+    /// (#1266) `passes` resolves through onto `ResolvedSeatStaffing`, and an
+    /// omitted `passes` lands as the default 2 (double-confirm) — distinct
+    /// from `k`, which keeps its own default.
+    #[test]
+    fn resolve_crew_passes_threads_through_with_default_two() {
+        let reg = registry(
+            vec![("fast", profile(vec![model("a", 1000)]))],
+            vec![(
+                "review",
+                Crew {
+                    seats: seats(vec![
+                        (
+                            "review-probe",
+                            vec![SeatStaffing { profile: "fast".to_string(), k: 3, ..Default::default() }],
+                        ),
+                        (
+                            "review-judge",
+                            vec![SeatStaffing {
+                                profile: "fast".to_string(),
+                                passes: 3,
+                                ..Default::default()
+                            }],
+                        ),
+                    ]),
+                    ..Default::default()
+                },
+            )],
+        );
+        let resolved = resolve_crew(&reg, "review").unwrap();
+        // Probe omitted `passes` → default 2 (unused by probe, but resolved).
+        assert_eq!(resolved.seats.get("review-probe").unwrap()[0].passes, 2);
+        // Judge declared passes: 3 → threads through verbatim.
+        assert_eq!(resolved.seats.get("review-judge").unwrap()[0].passes, 3);
     }
 
     #[test]

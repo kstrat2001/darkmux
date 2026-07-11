@@ -2710,6 +2710,7 @@ mod tests {
                 name: "fast".into(),
                 pm: ProfileModel { id: model_id.into(), ..Default::default() },
                 k: 1,
+                passes: 2,
                 max_tokens: None,
                 selector: None,
             }
