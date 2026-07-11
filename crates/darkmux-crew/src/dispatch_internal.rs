@@ -27,8 +27,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -970,27 +971,11 @@ pub(crate) fn remote_auth_header(ep: &darkmux_types::ModelEndpoint) -> Result<Op
     let Some(kind) = auth.auth_type else {
         return Ok(None);
     };
-    let keychain = auth.keychain.as_deref().unwrap_or("");
-    if keychain.is_empty() {
-        bail!(
-            "endpoint auth type is set but no Keychain item name is configured \
-             (endpoint.auth.keychain). Run `darkmux doctor` to see the gap."
-        );
-    }
-    let out = Command::new("security")
-        .args(["find-generic-password", "-s", keychain, "-w"])
-        .output()
-        .context("reading endpoint credential from the macOS Keychain")?;
-    if !out.status.success() {
-        bail!(
-            "Keychain item `{keychain}` not found on this machine (this machine is \
-             the keymaster for the endpoint). Add it with:\n  \
-             security add-generic-password -s {keychain} -a <account> -w"
-        );
-    }
-    let secret = String::from_utf8_lossy(&out.stdout)
-        .trim_end_matches('\n')
-        .to_string();
+    // (#1312 root fix + #1311 floor) Resolve the secret via the operator-declared
+    // env var (`auth.key_env`) > per-dispatch cache > bounded Keychain read
+    // (`auth.keychain`). The env tier is the headless-runner escape hatch — when
+    // its var is present, `security` is NEVER spawned. NEVER logs the value.
+    let secret = resolve_endpoint_secret(auth)?;
     let header = match kind {
         darkmux_types::EndpointAuthType::ApiKey => ("api-key".to_string(), secret),
         darkmux_types::EndpointAuthType::Bearer => {
@@ -998,6 +983,104 @@ pub(crate) fn remote_auth_header(ep: &darkmux_types::ModelEndpoint) -> Result<Op
         }
     };
     Ok(Some(header))
+}
+
+/// (#1312 — the ROOT fix for the finhub-adonisjs#563 class) Resolve an
+/// endpoint's auth secret. Precedence, mirroring darkmux's other secrets
+/// (`redis_url`/`serve_token`): the operator-declared env var (`auth.key_env`)
+/// VERBATIM > per-dispatch in-memory cache > bounded Keychain read
+/// (`auth.keychain`, #1311, via `darkmux_flow::read_keychain_bounded`).
+///
+/// The env tier is the escape hatch a headless runner needs — the operator
+/// names WHICH variable holds the key (any provider: `OPENAI_API_KEY`,
+/// `AZURE_FINHEROGPT_KEY`, …) and the CI job exports it from its secret store;
+/// with the var present, `security` is NEVER spawned, so there is zero
+/// keychain-read hang risk. The cache collapses the per-call reads (this runs on
+/// every probe draw + judge ruling + verify) to ONE Keychain read per item per
+/// process. NEVER logs the value; the `credential-read` liveness marker records
+/// only the resolution TIER (`env:<var>` / `keychain:<item>`) + elapsed.
+fn resolve_endpoint_secret(auth: &darkmux_types::EndpointAuth) -> Result<String> {
+    // Tier 1: operator-declared env var — verbatim, no cache, no keychain. THE
+    // root fix for a runner whose env already carries the key (no `security`
+    // spawn ⇒ no hang). A declared-but-absent var falls through to the Keychain.
+    if let Some(var) = auth.key_env.as_deref().filter(|s| !s.is_empty()) {
+        if let Ok(v) = std::env::var(var) {
+            if !v.is_empty() {
+                darkmux_types::dispatch_liveness::liveness_detail(
+                    &format!("credential-read:{var}"),
+                    "endpoint-auth",
+                    &format!("resolved tier=env:{var}"),
+                );
+                return Ok(v);
+            }
+        }
+    }
+
+    // Tiers 2–3 need a Keychain item. If neither a present env var nor a keychain
+    // item is configured, there's no credential source — bail with both names.
+    let Some(keychain) = auth.keychain.as_deref().filter(|s| !s.is_empty()) else {
+        bail!(
+            "endpoint auth type is set but no credential resolved: the declared env var{} is not \
+             present in the environment, and no `endpoint.auth.keychain` (macOS Keychain item \
+             name) is configured. Set one. Run `darkmux doctor` to see the gap.",
+            auth.key_env.as_deref().map(|v| format!(" `{v}`")).unwrap_or_default()
+        );
+    };
+
+    // Tier 2: per-dispatch (process-lifetime) in-memory cache. Without it a
+    // single review spawns DOZENS of `security` subprocesses for the same item.
+    // IN-MEMORY ONLY — the secret is already in process memory during use;
+    // NEVER written to disk (that would defeat the Keychain's at-rest
+    // protection + access control).
+    static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(hit) = cache.lock().unwrap().get(keychain).cloned() {
+        return Ok(hit);
+    }
+
+    // Tier 3: bounded Keychain read (#1311). The liveness marker BEFORE the read
+    // makes a hang here visible as the last-alive phase.
+    let env_hint = auth
+        .key_env
+        .as_deref()
+        .map(|v| format!(" set + export `{v}` in the runner's env (no Keychain read needed) or"))
+        .unwrap_or_else(|| " declare `endpoint.auth.key_env` and export that var, or".to_string());
+    darkmux_types::dispatch_liveness::liveness_case(
+        &format!("credential-read:{keychain}"),
+        "endpoint-auth",
+    );
+    let start = Instant::now();
+    let outcome =
+        darkmux_flow::read_keychain_bounded(keychain, None, darkmux_flow::KEYCHAIN_READ_TIMEOUT);
+    let ms = start.elapsed().as_millis();
+    let secret = match outcome {
+        darkmux_flow::KeychainRead::Found(v) => v.trim_end_matches('\n').to_string(),
+        darkmux_flow::KeychainRead::Absent => bail!(
+            "Keychain item `{keychain}` not found on this machine (this machine is the keymaster \
+             for the endpoint). Add it with:\n  \
+             security add-generic-password -s {keychain} -a <account> -w\n\
+             Or{env_hint} provide the key that way (#1312)."
+        ),
+        darkmux_flow::KeychainRead::TimedOut => bail!(
+            "Keychain read for `{keychain}` timed out after {}s — is the login keychain locked on \
+             the runner? A keychain read should be instant; a hang here freezes the dispatch \
+             before any flow record (#1311 / finhub-adonisjs#563). Unlock it \
+             (`security unlock-keychain`), run on an interactive login session, or{env_hint} skip \
+             the Keychain entirely (#1312).",
+            darkmux_flow::KEYCHAIN_READ_TIMEOUT.as_secs()
+        ),
+        darkmux_flow::KeychainRead::Unavailable => bail!(
+            "Could not run `security find-generic-password` to read Keychain item `{keychain}` \
+             (is this macOS?). Or{env_hint} provide the key that way (#1312)."
+        ),
+    };
+    darkmux_types::dispatch_liveness::liveness_detail(
+        &format!("credential-read:{keychain}"),
+        "endpoint-auth",
+        &format!("resolved tier=keychain:{keychain} elapsed_ms={ms}"),
+    );
+    cache.lock().unwrap().insert(keychain.to_string(), secret.clone());
+    Ok(secret)
 }
 
 /// (#1177 `doctor --probe`) Outcome of a live endpoint probe — everything the
@@ -3968,6 +4051,59 @@ mod tests {
     use serial_test::serial;
     use std::io::Write;
     use tempfile::TempDir;
+
+    // ─── #1312: operator-declared key_env override (563 root fix) ────────
+
+    #[test]
+    #[serial]
+    fn resolve_endpoint_secret_prefers_key_env_over_keychain_and_never_spawns_security() {
+        // key_env names a set env var → its value is used and `security` is NEVER
+        // spawned (the headless-runner root fix — a locked keychain can't hang
+        // what isn't read). The keychain item is a clearly-fake name that no real
+        // Keychain could satisfy, so a pass proves the env tier resolved.
+        let var = "DARKMUX_TEST_ENDPOINT_KEY_1312";
+        let prev = std::env::var(var).ok();
+        unsafe { std::env::set_var(var, "env-provided-secret"); }
+
+        let auth = darkmux_types::EndpointAuth {
+            auth_type: Some(darkmux_types::EndpointAuthType::ApiKey),
+            keychain: Some("darkmux-test-nonexistent-item-1312".to_string()),
+            key_env: Some(var.to_string()),
+            extras: Default::default(),
+        };
+        let secret = resolve_endpoint_secret(&auth).expect("key_env resolves");
+        assert_eq!(secret, "env-provided-secret");
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(var, v),
+                None => std::env::remove_var(var),
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_endpoint_secret_bails_when_no_source_configured() {
+        // key_env's var absent AND no keychain → a loud "no credential" error,
+        // naming the declared var so the operator knows what to export.
+        let var = "DARKMUX_TEST_ENDPOINT_KEY_ABSENT_1312";
+        let prev = std::env::var(var).ok();
+        unsafe { std::env::remove_var(var); }
+
+        let auth = darkmux_types::EndpointAuth {
+            auth_type: Some(darkmux_types::EndpointAuthType::ApiKey),
+            keychain: None,
+            key_env: Some(var.to_string()),
+            extras: Default::default(),
+        };
+        let err = resolve_endpoint_secret(&auth).expect_err("no source → bail");
+        assert!(err.to_string().contains(var), "error should name the declared var: {err}");
+
+        if let Some(v) = prev {
+            unsafe { std::env::set_var(var, v); }
+        }
+    }
 
     // ─── #1177: hosted-dispatch helpers ─────────────────────────────────
 

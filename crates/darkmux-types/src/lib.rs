@@ -7,6 +7,7 @@
 
 pub mod config;
 pub mod config_access;
+pub mod dispatch_liveness;
 pub mod paths;
 pub mod style;
 pub mod workdir;
@@ -207,9 +208,16 @@ impl ModelEndpoint {
             }
         }
         if let Some(auth) = &self.auth {
-            if auth.auth_type.is_some() && auth.keychain.as_deref().unwrap_or("").is_empty() {
-                return Err("endpoint.auth.type is set but endpoint.auth.keychain \
-                     (the Keychain item name holding the secret) is missing"
+            // (#1312) A credential SOURCE must be declared — either the macOS
+            // Keychain item (`keychain`) or the env-var name (`key_env`). One is
+            // enough; only the "neither" case is a config error.
+            if auth.auth_type.is_some()
+                && auth.keychain.as_deref().unwrap_or("").is_empty()
+                && auth.key_env.as_deref().unwrap_or("").is_empty()
+            {
+                return Err("endpoint.auth.type is set but no credential source is declared — set \
+                     endpoint.auth.keychain (a macOS Keychain item name) or endpoint.auth.key_env \
+                     (the NAME of an env var holding the key)"
                     .to_string());
             }
         }
@@ -233,6 +241,16 @@ pub struct EndpointAuth {
     /// never logged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keychain: Option<String>,
+    /// (#1312) NAME of an environment variable holding this endpoint's API key
+    /// — the operator declares WHICH variable (any provider: `OPENAI_API_KEY`,
+    /// `AZURE_FINHEROGPT_KEY`, anything). When set AND present in the env, it is
+    /// used VERBATIM and the Keychain is NEVER read — the headless-runner escape
+    /// hatch (a CI job exports the var from its secret store; no login keychain
+    /// to lock/hang). Resolution: `env(key_env) present > Keychain(keychain)`.
+    /// Only the variable NAME lives here; the value never does, and is never
+    /// logged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_env: Option<String>,
     /// Forward-compat overflow.
     #[serde(flatten)]
     pub extras: serde_json::Map<String, serde_json::Value>,
@@ -535,7 +553,11 @@ impl Profile {
 // non-blocking `COMMENT` event). Minor bump: every 1.3 registry parses
 // unchanged (the field defaults to `false` on read), per the lenient-read
 // doctrine.
-pub const PROFILES_SCHEMA_VERSION: &str = "1.4";
+// 1.5 (#1312): additive `key_env` on `EndpointAuth` (the NAME of an env var
+// holding an endpoint's API key — the headless-runner escape hatch, resolved
+// ahead of the Keychain). Minor bump: every 1.4 registry parses unchanged (the
+// field is `Option`, absent on read), per the lenient-read doctrine.
+pub const PROFILES_SCHEMA_VERSION: &str = "1.5";
 
 /// A **saved crew assignment**: which models staff which crew-role seats,
 /// for multi-seat pipelines (e.g. a review funnel's probe + judge seats).
@@ -1148,6 +1170,18 @@ mod tests {
             ..Default::default()
         };
         assert!(ok.validate().is_ok());
+        // (#1312) `key_env` alone (no keychain) is a valid credential source.
+        let via_env = ModelEndpoint {
+            url: Some("https://x/".into()),
+            auth: Some(EndpointAuth {
+                auth_type: Some(EndpointAuthType::Bearer),
+                keychain: None,
+                key_env: Some("OPENAI_API_KEY".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(via_env.validate().is_ok(), "key_env alone should satisfy the credential source");
     }
 
     #[test]

@@ -151,6 +151,12 @@ pub struct RuntimeBehaviorConfig {
     /// models, so benches raise it explicitly per run.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub max_tokens_per_call: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub strict_selection: Option<bool>,
+    // (#1311) Verbosity for the diagnostic surfaces. `"info"` (default) emits
+    // the informative dispatch-liveness phase markers; `"debug"` additionally
+    // logs per-call detail (hosted call host/model/tokens/wall_ms). NEVER
+    // carries a secret at any level. Resolved via `config_access::log_level`
+    // (`env(DARKMUX_LOG) > this > "info"`); surfaced by `darkmux doctor`.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub log_level: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub feedback_injection: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub default_role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub check_updates: Option<bool>,
@@ -315,6 +321,7 @@ impl DarkmuxConfig {
                 max_tokens: None,
                 max_tokens_per_call: None,
                 strict_selection: Some(false),
+                log_level: Some("info".to_string()),
                 feedback_injection: None,
                 default_role: None,
                 check_updates: Some(true),
