@@ -301,31 +301,178 @@ impl std::fmt::Display for RawRedisUrl {
     }
 }
 
+/// (#1311/#1276) Hard bound on every `security find-generic-password` read.
+/// A healthy Keychain read is <100ms; the leading finhub-adonisjs#563
+/// hypothesis is a locked/hung login keychain that froze a dispatch ~19 min
+/// BEFORE any flow record — and the Redis-password read below runs during
+/// flow-sink init, exactly the phase #563 never got past. 15s is generous for a
+/// good read yet fails fast on a wedge.
+pub const KEYCHAIN_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Poll cadence for [`run_security_bounded`]'s `try_wait` loop.
+const KEYCHAIN_READ_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Outcome of a bounded Keychain read. Callers decide how to treat each: an
+/// OPTIONAL integration (Redis, serve token) degrades a timeout to a loud
+/// warning + off; a REQUIRED credential (endpoint auth) bails.
+#[derive(Debug)]
+pub enum KeychainRead {
+    /// Success — the RAW stdout (utf8-lossy); the caller trims as it needs.
+    Found(String),
+    /// The item is absent (non-zero exit).
+    Absent,
+    /// The read exceeded the bound and the child was killed.
+    TimedOut,
+    /// `security` couldn't be spawned (non-macOS, or a missing binary).
+    Unavailable,
+}
+
+/// Bounded `security find-generic-password -s <item> [-a <account>] -w` read
+/// (#1311/#1276). Shared by flow's own OPTIONAL secrets (Redis password, serve
+/// token) and by the crew endpoint-auth read — every `security` call in a
+/// dispatch goes through this one bound.
+pub fn read_keychain_bounded(
+    item: &str,
+    account: Option<&str>,
+    timeout: std::time::Duration,
+) -> KeychainRead {
+    let mut cmd = std::process::Command::new("security");
+    cmd.arg("find-generic-password");
+    if let Some(user) = account {
+        cmd.args(["-a", user]);
+    }
+    cmd.args(["-s", item, "-w"]);
+    run_security_bounded(cmd, timeout)
+}
+
+/// Core bounded runner: `spawn` + `try_wait` polling (std only, no wait-timeout
+/// crate), and on expiry `kill()` + `wait()` (reaped — no zombie). stdout
+/// carries the SECRET — drained on a detached thread (never an unbounded
+/// `Command::output()` that could deadlock on a full pipe buffer) and NEVER
+/// logged. Takes an already-built `Command` so tests can stand in a `sh -c`
+/// stub for the `security` binary.
+fn run_security_bounded(
+    mut cmd: std::process::Command,
+    timeout: std::time::Duration,
+) -> KeychainRead {
+    use std::io::Read;
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(_) => return KeychainRead::Unavailable,
+    };
+    let out_pipe = child.stdout.take();
+    let err_pipe = child.stderr.take();
+    let out_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut p) = out_pipe {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
+    // stderr captured (not inherited) so an error line can't leak to the
+    // terminal; joined + dropped, never logged.
+    let err_handle = std::thread::spawn(move || {
+        if let Some(mut p) = err_pipe {
+            let _ = p.read_to_end(&mut Vec::new());
+        }
+    });
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout = out_handle.join().unwrap_or_default();
+                let _ = err_handle.join();
+                if !status.success() {
+                    return KeychainRead::Absent;
+                }
+                return KeychainRead::Found(String::from_utf8_lossy(&stdout).into_owned());
+            }
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait(); // reap — the kill must not leave a zombie
+                    return KeychainRead::TimedOut;
+                }
+                std::thread::sleep(KEYCHAIN_READ_POLL);
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return KeychainRead::Unavailable;
+            }
+        }
+    }
+}
+
+/// (#1311) Shared read for flow's own OPTIONAL secrets (Redis password, serve
+/// token). Emits the dependency-free `credential-read:<item>` liveness marker
+/// BEFORE the read (so a hang shows the item as the last-alive phase — the
+/// leading #563 freeze point is the Redis read right here in flow-sink init),
+/// bounds the read, and records a `done` marker with the resolution tier +
+/// outcome + elapsed. On timeout it emits a LOUD actionable warning and
+/// degrades to `None`: the integration is optional, so a locked keychain must
+/// not abort the dispatch — but it must never be SILENT. `-a $USER` matches the
+/// Homebrew wrapper's item shape. NEVER logs the value.
+#[cfg(target_os = "macos")]
+fn read_optional_keychain_secret(item: &str) -> Option<String> {
+    let user = std::env::var("USER").ok()?;
+    darkmux_types::dispatch_liveness::liveness_case(
+        &format!("credential-read:{item}"),
+        "flow-sink-init",
+    );
+    let start = std::time::Instant::now();
+    let outcome = read_keychain_bounded(item, Some(&user), KEYCHAIN_READ_TIMEOUT);
+    let ms = start.elapsed().as_millis();
+    let tag = match &outcome {
+        KeychainRead::Found(_) => "found",
+        KeychainRead::Absent => "absent",
+        KeychainRead::TimedOut => "timeout",
+        KeychainRead::Unavailable => "unavailable",
+    };
+    darkmux_types::dispatch_liveness::liveness_detail(
+        &format!("credential-read:{item}"),
+        "flow-sink-init",
+        &format!("done tier=keychain outcome={tag} elapsed_ms={ms}"),
+    );
+    match outcome {
+        KeychainRead::Found(v) => {
+            let v = v.trim().to_string();
+            if v.is_empty() {
+                None
+            } else {
+                Some(v)
+            }
+        }
+        KeychainRead::Absent | KeychainRead::Unavailable => None,
+        KeychainRead::TimedOut => {
+            eprintln!(
+                "[darkmux] WARNING: Keychain read for `{item}` timed out after {}s \
+                 ({ms}ms elapsed) — is the login keychain locked on this machine? Continuing \
+                 WITHOUT it (this optional integration is disabled for this run). Unlock it \
+                 (`security unlock-keychain`) or use the env override. (#1311 / \
+                 finhub-adonisjs#563)",
+                KEYCHAIN_READ_TIMEOUT.as_secs()
+            );
+            None
+        }
+    }
+}
+
 /// Read the Redis password from the macOS Keychain — the SAME `darkmux-redis`
 /// item the Homebrew wrapper already populates (`security add-generic-password
-/// -a $USER -s darkmux-redis -w`). Shells out to `security` (no crate dep,
-/// matching the dep discipline + the wrapper), `OnceLock`-cached (the password
-/// doesn't change mid-process). `-w` writes ONLY the password to stdout (never
-/// stderr), so capturing stdout can't leak it into a log; the value flows into
-/// `assemble_redis_url` and from there only into a `RawRedisUrl` (redacted
-/// `Display`). Non-macOS → `None` — portable operators use the full-URL env
-/// path (tier-1). (#661 Slice 5)
+/// -a $USER -s darkmux-redis -w`). Bounded + liveness-bracketed via
+/// [`read_optional_keychain_secret`] (#1311), `OnceLock`-cached (the password
+/// doesn't change mid-process). `-w` writes ONLY the password to stdout, which
+/// flows into `assemble_redis_url` and from there only into a `RawRedisUrl`
+/// (redacted `Display`). Non-macOS → `None` — portable operators use the
+/// full-URL env path (tier-1). (#661 Slice 5)
 #[cfg(target_os = "macos")]
 fn keychain_redis_password() -> Option<String> {
     static PW: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    PW.get_or_init(|| {
-        let user = std::env::var("USER").ok()?;
-        let out = std::process::Command::new("security")
-            .args(["find-generic-password", "-a", &user, "-s", "darkmux-redis", "-w"])
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None; // item absent → password-less assemble (don't hard-fail)
-        }
-        let pw = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if pw.is_empty() { None } else { Some(pw) }
-    })
-    .clone()
+    PW.get_or_init(|| read_optional_keychain_secret("darkmux-redis")).clone()
 }
 #[cfg(not(target_os = "macos"))]
 fn keychain_redis_password() -> Option<String> {
@@ -459,25 +606,15 @@ impl RawServeToken {
 
 /// Read the serve-daemon token from the macOS Keychain — item
 /// `darkmux-serve-token` (`security add-generic-password -a $USER -s
-/// darkmux-serve-token -w`). Same shell-out-to-`security`, `OnceLock`-cached,
-/// `-w`-writes-only-to-stdout discipline as `keychain_redis_password`. Non-macOS
-/// → `None` (portable operators use the `DARKMUX_SERVE_TOKEN` env path). (#881)
+/// darkmux-serve-token -w`). Bounded + liveness-bracketed via
+/// [`read_optional_keychain_secret`] (#1311), `OnceLock`-cached, same
+/// `-w`-writes-only-to-stdout discipline as `keychain_redis_password`.
+/// Non-macOS → `None` (portable operators use the `DARKMUX_SERVE_TOKEN` env
+/// path). (#881)
 #[cfg(target_os = "macos")]
 fn keychain_serve_token() -> Option<String> {
     static TOK: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    TOK.get_or_init(|| {
-        let user = std::env::var("USER").ok()?;
-        let out = std::process::Command::new("security")
-            .args(["find-generic-password", "-a", &user, "-s", "darkmux-serve-token", "-w"])
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None; // item absent → no Keychain token (don't hard-fail)
-        }
-        let tok = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if tok.is_empty() { None } else { Some(tok) }
-    })
-    .clone()
+    TOK.get_or_init(|| read_optional_keychain_secret("darkmux-serve-token")).clone()
 }
 #[cfg(not(target_os = "macos"))]
 fn keychain_serve_token() -> Option<String> {
@@ -1193,6 +1330,52 @@ mod tests {
     // post-#508 submodule split (they are pub(crate), not part of the
     // crate's public re-export surface).
     use crate::schema::{epoch_to_hhmmss, epoch_to_yyyymmdd};
+
+    // ─── #1311/#1276: bounded `security` read (shared keychain helper) ──
+    //
+    // `run_security_bounded` is exercised with `sh -c` stubs standing in for
+    // the `security` binary — a sleeping stub proves the hard timeout kills the
+    // read within the bound (instead of the 19-minute pre-flow freeze #563 saw
+    // during flow-sink init), and echo/exit stubs prove the outcome mapping.
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn run_security_bounded_times_out_on_a_hung_read() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 30"]);
+        let start = Instant::now();
+        let outcome = run_security_bounded(cmd, Duration::from_millis(300));
+        assert!(matches!(outcome, KeychainRead::TimedOut), "got {outcome:?}");
+        // Failed FAST — nowhere near the 30s sleep.
+        assert!(start.elapsed() < Duration::from_secs(5), "did not fail fast: {:?}", start.elapsed());
+    }
+
+    #[test]
+    fn run_security_bounded_returns_stdout_on_success() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "printf 'super-secret-value'"]);
+        match run_security_bounded(cmd, Duration::from_secs(5)) {
+            KeychainRead::Found(v) => assert_eq!(v, "super-secret-value"),
+            other => panic!("expected Found, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_security_bounded_reports_absent_on_nonzero_exit() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "exit 1"]);
+        assert!(matches!(run_security_bounded(cmd, Duration::from_secs(5)), KeychainRead::Absent));
+    }
+
+    #[test]
+    fn run_security_bounded_reports_unavailable_when_binary_missing() {
+        let cmd = Command::new("darkmux-no-such-binary-xyz");
+        assert!(matches!(
+            run_security_bounded(cmd, Duration::from_secs(5)),
+            KeychainRead::Unavailable
+        ));
+    }
 
     // ─── (#388) RedisSink graceful-disable-on-unreachable ────────────
 

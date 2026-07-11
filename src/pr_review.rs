@@ -48,6 +48,12 @@ use darkmux_lab::lab::funnel::{
 use darkmux_profiles::crews::{resolve_crew, ResolvedCrew};
 use darkmux_profiles::profiles::load_registry;
 use darkmux_profiles::swap;
+// (#1311, part of #1278) The dependency-free liveness FLOOR — phase markers on
+// the review-dispatch entry path so a hang BEFORE flow-sink init (the
+// finhub-adonisjs#563 signature: 19 min, zero flow records) still leaves a
+// trace of the last phase reached. Emitted BEFORE the work each names; purely
+// additive (no dispatch behavior changes).
+use darkmux_types::dispatch_liveness::{liveness, liveness_case, liveness_detail};
 use serde::{Deserialize, Deserializer};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -772,6 +778,12 @@ pub struct RunOpts {
 /// synthesis-only, via `--from-envelope`) and emit the same
 /// `{mode, review, comment}` payload `render`/`cmd_render` do.
 pub fn cmd_run(opts: RunOpts) -> Result<i32> {
+    // (#1311) The floor's first marker — as early as the review-dispatch
+    // handler runs (the case id isn't known yet, so this one keys on the pid).
+    // Scoped to this handler rather than `main.rs` so ordinary CLI verbs don't
+    // each emit a marker; the pre-flow-init gap #563 froze in is entirely
+    // downstream of here (config/crew/credential resolution), not in clap.
+    liveness("process-start");
     let diff_text = std::fs::read_to_string(&opts.diff)
         .with_context(|| format!("reading --diff {}", opts.diff.display()))?;
 
@@ -815,8 +827,14 @@ pub fn cmd_run(opts: RunOpts) -> Result<i32> {
             .with_context(|| format!("writing --envelope-out {}", path.display()))?;
     }
 
+    // (#1311) Dispatch is done (or was synthesis-only); the model work — the
+    // slow, hang-prone half — is behind us. `synthesis` then `done` bracket the
+    // pure-CPU render so a wedge in the (local) synthesis code is still visible.
+    liveness("synthesis");
     let rendered = synthesize_funnel(&env, &diff_text, opts.attribution.as_deref());
-    emit_rendered(&rendered, opts.emit.as_deref())
+    let code = emit_rendered(&rendered, opts.emit.as_deref())?;
+    liveness("done");
+    Ok(code)
 }
 
 /// `--emit <path>` writes the rendered payload to a file; `--emit -` or a
@@ -1116,12 +1134,70 @@ fn with_dispatch_bookends(
     }
 }
 
+/// The dispatch case handle: `owner/repo@sha` for a GitHub-API source, else the
+/// worktree path, else `local`. Used both as the funnel's `case_id` and as the
+/// #1311 liveness case field, so the floor trail and the flow records line up.
+fn case_label(opts: &RunOpts) -> String {
+    match (&opts.github, &opts.head_sha) {
+        (Some(repo), Some(sha)) => format!("{repo}@{sha}"),
+        _ => opts
+            .worktree
+            .as_ref()
+            .map(|w| w.display().to_string())
+            .unwrap_or_else(|| "local".to_string()),
+    }
+}
+
+/// (#1311) NON-SECRET liveness detail for `config-resolved` — the resolved
+/// darkmux home, machine id, and which flow sinks are enabled. Lets a host
+/// operator see the run's environment from the heartbeat alone.
+fn config_detail() -> String {
+    let home =
+        darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto).root;
+    format!(
+        "home={} machine_id={} redis={} audit={}",
+        home.display(),
+        darkmux_types::config_access::machine_id().unwrap_or_else(|| "unknown".to_string()),
+        if darkmux_types::config_access::redis_enabled() { "on" } else { "off" },
+        if darkmux_types::config_access::audit_enabled() { "on" } else { "off" },
+    )
+}
+
+/// (#1311) NON-SECRET liveness detail for `crew-resolved` — crew name, seat
+/// count, and the distinct endpoint HOSTS of the remote seats. HOST ONLY: never
+/// the full URL (it carries `?api-version=`), never any credential.
+fn crew_detail(crew: &ResolvedCrew) -> String {
+    let seat_count: usize = crew.seats.values().map(|v| v.len()).sum();
+    let mut hosts: Vec<String> = crew
+        .seats
+        .values()
+        .flatten()
+        .filter(|s| s.pm.is_remote())
+        .filter_map(|s| s.pm.endpoint.as_ref().map(|ep| ep.base_url()))
+        .filter_map(|url| {
+            url.split("://")
+                .nth(1)
+                .and_then(|s| s.split('/').next())
+                .map(str::to_string)
+        })
+        .collect();
+    hosts.sort();
+    hosts.dedup();
+    let hosts_str = if hosts.is_empty() { "(local-only)".to_string() } else { hosts.join(",") };
+    format!("crew={} seats={seat_count} remote_hosts={hosts_str}", crew.name)
+}
+
 /// Everything but `--from-envelope`: resolve the source + crew, build real
 /// bundles, and dispatch either `run_funnel` (the full pipeline) or
 /// `run_judge_only` (`--charges-file` — re-judge a saved flag list without
 /// re-running the probe; the bundler still runs since the judge needs the
 /// code each flag's `bundle_id` refers to).
 fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<FunnelEnvelope> {
+    // (#1311) The liveness case handle, computed from the opts up front so
+    // every floor marker below carries the same handle the dispatch bookends /
+    // funnel records use (`repo@sha`, the worktree path, or `local`). Derived
+    // purely from already-parsed args — nothing here can hang.
+    let case = case_label(opts);
     let crew_name = match opts.crew.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(c) => c.to_string(),
         None => {
@@ -1144,6 +1220,11 @@ fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<FunnelEnvelope> {
     };
 
     let source = resolve_source(opts)?;
+    // (#1311) About to read the profiles registry from disk — the config-load
+    // boundary. The detail names the resolved home + machine + which flow sinks
+    // are enabled, so a host operator can see the environment at a glance. All
+    // NON-SECRET.
+    liveness_detail("config-resolved", &case, &config_detail());
     let loaded = load_registry(opts.profiles.as_deref())?;
     let mut crew = resolve_crew(&loaded.registry, &crew_name)?;
     if let Some(k) = opts.k {
@@ -1153,12 +1234,20 @@ fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<FunnelEnvelope> {
             }
         }
     }
+    // (#1311) Crew resolved — detail names the crew, seat count, and each remote
+    // seat's endpoint HOST (host only — NEVER the full URL, NEVER a credential).
+    liveness_detail("crew-resolved", &case, &crew_detail(&crew));
 
+    // (#1311) Bundling can reach OUT — an external `--bundler` subprocess, or a
+    // GitHub-API source slicing each hunk over the network — so it's bracketed:
+    // a hang between these two markers localizes to bundle construction.
+    liveness_case("bundling-start", &case);
     let bundle_set = match &opts.bundler {
         Some(cmd) => external_bundles(cmd, opts.worktree.as_deref(), &opts.diff)?,
         None => build_bundles(&source, diff_text)?,
     };
     let bundles = bundle_inputs_from_set(&bundle_set, &source)?;
+    liveness_detail("bundling-done", &case, &format!("bundles={}", bundles.len()));
 
     let intent = match &opts.intent_file {
         Some(p) => std::fs::read_to_string(p)
@@ -1188,14 +1277,9 @@ fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<FunnelEnvelope> {
         )
     })?;
 
-    let case_id = match (&opts.github, &opts.head_sha) {
-        (Some(repo), Some(sha)) => format!("{repo}@{sha}"),
-        _ => opts
-            .worktree
-            .as_ref()
-            .map(|w| w.display().to_string())
-            .unwrap_or_else(|| "local".to_string()),
-    };
+    // (#1311) Same handle the floor markers used above — one derivation, so the
+    // dispatch bookend / funnel records and the liveness trail always agree.
+    let case_id = case.clone();
 
     let inputs = FunnelInputs {
         case_id,
@@ -1257,6 +1341,24 @@ fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<FunnelEnvelope> {
     };
     let mut cycler = LmsCycler;
     let mut emitter = FleetFlowEmitter;
+
+    // (#1311) The flow machinery is now the write target — the very layer #563
+    // never reached. `with_dispatch_bookends`' first emit lazily brings the
+    // sinks up (Redis/audit), so this marker is the last one guaranteed to
+    // predate flow: a hang here or later is ALSO covered by the #1272 bookends,
+    // but the floor marker is what survives if sink init itself wedges.
+    liveness_case("flow-sinks-up", &case);
+    // (#1311) About to enter the model-dispatch loop (the remote seats' Keychain
+    // reads + endpoint calls happen inside — `credential-read:<item>` markers
+    // fire from `remote_auth_header`). Detail names the crew + the models in play.
+    liveness_detail(
+        "dispatch-start",
+        &case,
+        &format!(
+            "crew={crew_name_for_bookends} models={}",
+            model_for_bookends.as_deref().unwrap_or("(none)")
+        ),
+    );
 
     if let Some(charges_path) = &opts.charges_file {
         let raw = std::fs::read_to_string(charges_path)

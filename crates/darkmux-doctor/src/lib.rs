@@ -1171,11 +1171,31 @@ fn check_remote_endpoint_credentials() -> Check {
                 continue;
             }
             checked += 1;
+            // (#1312) A declared env var (`key_env`) that is PRESENT in this
+            // process's environment satisfies the credential — the headless
+            // runner sets it from its secret store and the dispatch never reads
+            // the Keychain. Present env var ⇒ satisfied, regardless of keychain.
+            let env_present = auth
+                .key_env
+                .as_deref()
+                .filter(|v| !v.is_empty())
+                .and_then(|v| std::env::var(v).ok())
+                .is_some_and(|v| !v.is_empty());
+            if env_present {
+                continue;
+            }
             match auth.keychain.as_deref() {
                 None | Some("") => {
+                    let via = auth
+                        .key_env
+                        .as_deref()
+                        .filter(|v| !v.is_empty())
+                        .map(|v| format!(" (declared env var `{v}` is not set in this environment)"))
+                        .unwrap_or_default();
                     problems.push(format!(
                         "profile `{profile_name}` model `{}`: endpoint.auth.type is set \
-                         but endpoint.auth.keychain is missing",
+                         but no credential source resolved — set endpoint.auth.keychain or \
+                         export endpoint.auth.key_env{via}",
                         model.id
                     ));
                 }
@@ -1205,7 +1225,8 @@ fn check_remote_endpoint_credentials() -> Check {
             name: name.into(),
             status: Status::Pass,
             message: format!(
-                "{checked} remote-endpoint model(s) checked — all Keychain credentials present"
+                "{checked} remote-endpoint model(s) checked — all credentials resolved \
+                 (Keychain item present, or a declared key_env var set)"
             ),
             hint: None,
         }
@@ -4481,7 +4502,11 @@ mod tests {
         assert_eq!(check.status, Status::Warn);
         assert!(check.message.contains("azure-profile"));
         assert!(check.message.contains("gpt-4o"));
-        assert!(check.message.contains("endpoint.auth.keychain is missing"));
+        // (#1312) The message now names BOTH credential sources (keychain OR
+        // key_env), since either satisfies the auth.
+        assert!(check.message.contains("no credential source resolved"), "{}", check.message);
+        assert!(check.message.contains("endpoint.auth.keychain"), "{}", check.message);
+        assert!(check.message.contains("key_env"), "{}", check.message);
     }
 
     #[serial_test::serial]
@@ -4512,6 +4537,49 @@ mod tests {
         assert!(check.message.contains("not found on this machine"));
         let hint = check.hint.as_deref().unwrap_or("");
         assert!(hint.contains("security add-generic-password"));
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_remote_endpoint_credentials_satisfied_by_present_key_env() {
+        // (#1312) A declared `key_env` var that is PRESENT in the environment
+        // satisfies the credential — even with a bogus/absent keychain item.
+        let var = "DARKMUX_DOCTOR_TEST_KEY_ENV_1312";
+        let prev = std::env::var(var).ok();
+        unsafe { std::env::set_var(var, "present-value"); }
+
+        let (_guard, config_path) = ConfigPathGuard::at_tempfile("profiles.json");
+        let registry_json = format!(
+            r#"{{
+            "profiles": {{
+                "azure-profile": {{
+                    "models": [{{
+                        "id": "gpt-4o",
+                        "n_ctx": 128000,
+                        "endpoint": {{
+                            "url": "https://x.cognitiveservices.azure.com/openai/deployments/gpt-4o",
+                            "auth": {{
+                                "type": "api-key",
+                                "keychain": "darkmux-doctor-test-definitely-nonexistent-item-xyz123",
+                                "key_env": "{var}"
+                            }}
+                        }}
+                    }}]
+                }}
+            }}
+        }}"#
+        );
+        std::fs::write(&config_path, registry_json).unwrap();
+
+        let check = check_remote_endpoint_credentials();
+        assert_eq!(check.status, Status::Pass, "present key_env should satisfy: {}", check.message);
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(var, v),
+                None => std::env::remove_var(var),
+            }
+        }
     }
 
     #[test]

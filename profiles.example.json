@@ -1,7 +1,7 @@
 {
   "_comment": "darkmux profile registry — example. Four general-purpose reference profiles in increasing capacity order: fast → balanced → deep → gpt-oss, plus three review-funnel-dedicated profiles (devstral, qwen3.6-27b-review, judge-35b-moe — see `_crews_comment` below) that staff the `review-deep` crew, plus one hosted endpoint example (hosted-frontier). A profile's `models[]` are WORKER models (no `role` field — #590); the machine's standing utility/compactor model lives once in the top-level `internal.utility` binding, not per-profile. `default_model` (optional) names a profile's default worker when it lists more than one; with a single model it's implicit. `n_ctx` is required for LOCAL models (it is the load parameter) and omitted for endpoint-bearing models (#1282). Replace the model ids with what you have downloaded in LMStudio (run `lms ls`).",
 
-  "schema_version": "1.4",
+  "schema_version": "1.5",
 
   "profiles": {
     "fast": {
@@ -54,7 +54,7 @@
     },
 
     "hosted-frontier": {
-      "description": "Hosted (endpoint-bearing) model — declares NO n_ctx: the provider owns the context window, so there is no local load parameter to invent (#1282). No `auth` block here either: a placeholder Keychain item name would make a fresh `darkmux init` fail doctor's credentials check spuriously. When your endpoint needs credentials, add `\"auth\": { \"type\": \"api-key\", \"keychain\": \"<item-name>\" }` to the endpoint — `keychain` names a macOS Keychain ITEM, never the secret itself. Replace the URL/deployment with your own, or delete this profile if you only run local models.",
+      "description": "Hosted (endpoint-bearing) model — declares NO n_ctx: the provider owns the context window, so there is no local load parameter to invent (#1282). No `auth` block here either: a placeholder credential source would make a fresh `darkmux init` fail doctor's credentials check spuriously. When your endpoint needs credentials, add an `auth` block naming a credential SOURCE — either `\"auth\": { \"type\": \"api-key\", \"keychain\": \"<item-name>\" }` (a macOS Keychain ITEM name, never the secret itself) or `\"auth\": { \"type\": \"api-key\", \"key_env\": \"AZURE_FINHEROGPT_KEY\" }` (#1312 — the NAME of an env var holding the key, for ANY provider: `OPENAI_API_KEY`, `AZURE_FINHEROGPT_KEY`, anything). You can declare BOTH — `\"auth\": { \"type\": \"api-key\", \"keychain\": \"darkmux-azure-finherogpt\", \"key_env\": \"AZURE_FINHEROGPT_KEY\" }` — and the env var WINS when it is present in the environment: `security` is never read, so a headless CI runner (export the var from its secret store) never touches a lockable login keychain. Neither `keychain` nor `key_env` ever holds the secret VALUE; only names. Replace the URL/deployment with your own, or delete this profile if you only run local models.",
       "models": [
         {
           "id": "gpt-5.1",

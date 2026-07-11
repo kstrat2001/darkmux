@@ -310,6 +310,27 @@ pub fn strict_selection() -> bool {
     }
     config().runtime.as_ref().and_then(|r| r.strict_selection).unwrap_or(false)
 }
+/// (#1311) Diagnostic verbosity. `env(DARKMUX_LOG)` (lower-cased) >
+/// `config.runtime.log_level` > `"info"`. `"info"` = the informative
+/// dispatch-liveness phase markers; `"debug"` additionally turns on per-call
+/// detail (hosted call host/model/tokens/wall_ms). NEVER a secret at any level.
+pub fn log_level() -> String {
+    if let Some(s) = env_str("DARKMUX_LOG") {
+        return s.to_ascii_lowercase();
+    }
+    config()
+        .runtime
+        .as_ref()
+        .and_then(|r| r.log_level.clone())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_else(|| "info".to_string())
+}
+
+/// (#1311) Whether per-call debug logging is on (`log_level() == "debug"`).
+pub fn debug_logging() -> bool {
+    log_level() == "debug"
+}
+
 /// Whether `darkmux doctor` checks for a newer release. An **opt-out**:
 /// `env(DARKMUX_CHECK_UPDATES)` falsy (`0`/`false`/`no`) disables >
 /// `config.runtime.check_updates` > `true` (default on). Env match is

@@ -1332,6 +1332,74 @@ fn pr_review_run_from_envelope_also_writes_envelope_out() {
     assert_eq!(r["mode"], "review");
 }
 
+/// (#1311, part of #1278) The dependency-free liveness FLOOR: `pr-review run`
+/// emits phase markers to BOTH stderr and a `<darkmux-home>/liveness/<pid>.log`
+/// heartbeat file, in order. Driven offline via `--from-envelope` (no model,
+/// no keychain, no network) so it exercises `cmd_run`'s early path — the
+/// markers a real hang would leave behind. `DARKMUX_HOME` points the floor's
+/// home resolution at the tempdir so the heartbeat file is inspectable.
+#[test]
+fn pr_review_run_emits_liveness_floor_markers_in_order() {
+    let tmp = TempDir::new().unwrap();
+    let diff_path = tmp.path().join("pr.diff");
+    fs::write(&diff_path, pr_review_run_diff()).unwrap();
+    let envelope_path = tmp.path().join("funnel.json");
+    fs::write(&envelope_path, pr_review_run_envelope()).unwrap();
+
+    let output = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", tmp.path())
+        .args([
+            "pr-review",
+            "run",
+            "--from-envelope",
+            envelope_path.to_str().unwrap(),
+            "--diff",
+            diff_path.to_str().unwrap(),
+            "--emit",
+            "-",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "stderr={}", String::from_utf8_lossy(&output.stderr));
+
+    // The from-envelope path fires process-start -> synthesis -> done (it skips
+    // run_dispatch's config/crew/bundling markers, which need a live dispatch).
+    let expected = ["process-start", "synthesis", "done"];
+
+    // Surface 1: stderr (the most reliable surface — all that #563 could ever
+    // have shown). Assert the markers appear in order.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_in_order(&stderr, &expected, "stderr");
+
+    // Surface 2: the heartbeat FILE — proves the best-effort append landed.
+    // Exactly one `<pid>.log` for this one child process.
+    let liveness_dir = tmp.path().join("liveness");
+    let mut logs: Vec<_> = fs::read_dir(&liveness_dir)
+        .expect("liveness dir should exist")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "log"))
+        .collect();
+    assert_eq!(logs.len(), 1, "expected one heartbeat file, got {logs:?}");
+    let file_body = fs::read_to_string(logs.pop().unwrap()).unwrap();
+    assert_in_order(&file_body, &expected, "heartbeat file");
+    // Each file line is `<ts> <phase> pid=<pid> case=<case>`.
+    assert!(file_body.contains("pid="), "line shape: {file_body}");
+    assert!(file_body.contains("case="), "line shape: {file_body}");
+}
+
+/// Assert each of `needles` appears in `haystack`, in the given order.
+fn assert_in_order(haystack: &str, needles: &[&str], label: &str) {
+    let mut from = 0;
+    for n in needles {
+        match haystack[from..].find(n) {
+            Some(idx) => from += idx + n.len(),
+            None => panic!("{label}: expected {n:?} after offset {from} in:\n{haystack}"),
+        }
+    }
+}
+
 /// `--worktree` and `--github` are mutually exclusive — clap catches it
 /// before any handler code runs (no live LMStudio / bundler needed).
 #[test]

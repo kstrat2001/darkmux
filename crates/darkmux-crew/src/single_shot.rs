@@ -207,8 +207,28 @@ pub fn single_shot_chat_hosted(req: &HostedSingleShotRequest) -> Result<SingleSh
         req.max_tokens,
         req.endpoint.reasoning_effort.as_deref(),
     );
+    let start = std::time::Instant::now();
     let resp = remote_chat_completion(&url, auth.as_ref(), &body, req.timeout_seconds)?;
-    Ok(extract_reply(&resp))
+    let reply = extract_reply(&resp);
+    // (#1311) `DARKMUX_LOG=debug` per-call detail — host + model + token budget +
+    // returned tokens + wall_ms, so "where did the wall-clock go" is answerable
+    // from the host without a live watch. HARD RULE: HOST only (never the full
+    // URL — it carries `?api-version=`), never the auth header, never content.
+    if darkmux_types::config_access::debug_logging() {
+        let host = url
+            .split("://")
+            .nth(1)
+            .and_then(|s| s.split('/').next())
+            .unwrap_or("remote");
+        eprintln!(
+            "[darkmux-debug] hosted-call host={host} model={} max_tokens={} returned_tokens={:?} wall_ms={}",
+            req.model,
+            req.max_tokens,
+            reply.total_tokens,
+            start.elapsed().as_millis()
+        );
+    }
+    Ok(reply)
 }
 
 /// Pull the caller-facing fields out of an already-classified response
