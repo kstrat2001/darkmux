@@ -11,7 +11,22 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 
 ## [Unreleased]
 
-## [1.18.0] - 2026-07-11
+## [1.18.1] - 2026-07-11
+
+The review-output patch — everything a first real production Azure review (finsys-api #396/#397)
+surfaced about how the funnel *presents* its findings. No behavior change to what it finds; four
+fixes to how it posts.
+
+### Changed
+
+- **Confirmed findings post a non-blocking `COMMENT` review by default, not `REQUEST_CHANGES`** (#1302) — the funnel was submitting a formal `REQUEST_CHANGES` (a real GitHub merge gate via branch rulesets) while its footer claimed "advisory," and darkmux could never clear its own block (a clean re-run posts a plain comment, which doesn't update `reviewDecision`), forcing manual dismissals that a compliance-monitored org must document. Confirmed findings now post the same non-blocking `COMMENT` class Gemini uses — inline comments intact, never a merge gate. A crew-level `request_changes: true` opts back into blocking (documented: no automated resolution path until #1260's verify-seat lifecycle exists). No workflow change — the YAML forwards the binary's review verbatim, so one binary upgrade fixes every consuming repo. `PROFILES_SCHEMA_VERSION` 1.3 → 1.4 (additive `request_changes`).
+- **A configurable judge `passes` count replaces the hardcoded double-confirm** (#1266) — `passes: 1` on a judge seat runs a single pass (the frontier cost lever — a stable frontier judge needs double-confirm less than the local judge it was designed for), `passes: 2` is today's double-confirm (default), `passes: N` is unanimous consensus with early-exit. `PROFILES_SCHEMA_VERSION` 1.2 → 1.3.
+
+### Fixed
+
+- **The posted-review footer no longer claims "local model (no cloud API)" on a cloud review** (#1298) — the dispatch-provenance line is now derived from the run's actual seats (`env.members`): a remote crew reads "via a hosted cloud endpoint (`<models>`)", never "no cloud API"; all-local keeps the honest local claim; mixed names both. The old hardcoded claim was an audit-integrity problem on the first all-Azure review.
+- **Frontier-worded duplicate findings collapse; the needs_check tier clusters instead of walling** (#1299) — the dedup was calibrated on local models and let a frontier judge's restatements through (9 "confirmed" that were 3 bugs; a 25-item needs_check wall). Collapse now keys on file + mechanism-family + overlapping-symbol + overlapping-location — conservatively (missing location never collapses; a collapse unions both locations and the absorbed finding's text, so a mistaken merge degrades to "one bullet, two framings" never a vanished bug), and the needs_check tier clusters by (file, mechanism) with the count conserved.
+
 
 The frontier-staffing release: any review-funnel seat can be staffed by a hosted model, so a
 machine that can't (or shouldn't) run local inference does PR review entirely off a cloud
@@ -55,6 +70,7 @@ funnel, fixed same-day.
   exit paths, `source: "funnel"`) so a live PR review is visible as a running dispatch in the
   viewer's fleet and machine views (#1272, #1277).
 
+[1.18.1]: https://github.com/kstrat2001/darkmux/releases/tag/v1.18.1
 [1.18.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.18.0
 [1.17.1]: https://github.com/kstrat2001/darkmux/releases/tag/v1.17.1
 

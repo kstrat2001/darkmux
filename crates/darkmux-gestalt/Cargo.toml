@@ -1,6 +1,6 @@
 [package]
 name = "darkmux-gestalt"
-version = "1.18.0"
+version = "1.18.1"
 edition = "2021"
 description = "darkmux gestalt — pure model-lifecycle planning core (facts in, plans out) + host ports"
 license = "MIT"
