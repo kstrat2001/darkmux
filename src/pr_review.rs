@@ -1303,7 +1303,17 @@ const CONFIRMED_MARKER: &str =
 ///   `judge_one_flag` never leaves a demoted flag `Confirmed`) -> one
 ///   non-blocking bullet in a "worth a double check" section: in the
 ///   review body when there's also a confirmed finding, or in the comment
-///   when there isn't.
+///   when there isn't. (#1299) When the tier exceeded the clustering
+///   threshold — `env.needs_check_clusters` is non-empty — the section
+///   renders ONE "N related concerns in <file> around <mechanism>" bullet
+///   per cluster instead of the raw per-finding bullets, so a duplicative
+///   tier can't wall-of-text; the total count is conserved (the clusters'
+///   counts sum to the raw needs_check total).
+/// - [`Tier::Confirmed`] findings additionally surface any same-location
+///   duplicate framings they ABSORBED at dedup (#1299 `also_flagged`) as a
+///   trailing "Also flagged (same location): …" line — the "aggregate,
+///   never discard" safety net, so a residual within-class merge can never
+///   vanish a second defect's description.
 /// - [`Tier::Archived`] -> never rendered; stays in the envelope only.
 /// - Zero confirmed AND zero needs-check on a healthy (non-degenerate)
 ///   funnel -> an honest `"comment"` summary naming how much was
@@ -1342,9 +1352,10 @@ pub fn synthesize_funnel(env: &FunnelEnvelope, diff: &str, attribution: Option<&
                         "path": norm_path(path),
                         "line": line,
                         "side": "RIGHT",
-                        "body": confirmed_comment_body(record, verified),
+                        "body": confirmed_comment_body(record, verified, &j.flag.also_flagged),
                     })),
-                    None => confirmed_general.push(confirmed_general_bullet(path, record, verified)),
+                    None => confirmed_general
+                        .push(confirmed_general_bullet(path, record, verified, &j.flag.also_flagged)),
                 }
             }
             Tier::NeedsCheck => {
@@ -1355,11 +1366,26 @@ pub fn synthesize_funnel(env: &FunnelEnvelope, diff: &str, attribution: Option<&
         }
     }
 
+    // (#1299) The "worth a double check" section. When clustering fired
+    // (needs_check exceeded the threshold — `env.needs_check_clusters`
+    // non-empty), render one "N related concerns in <file> around
+    // <mechanism>" bullet per cluster so a duplicative tier can't
+    // wall-of-text. Below the threshold, render the raw per-finding bullets
+    // as before. Either way the COUNT is conserved: `needs_check_count`
+    // (the raw total) equals the sum of the clusters' counts, so nothing is
+    // hidden — the wall just collapses to a handful of counted lines.
+    let needs_check_count = needs_check_lines.len();
+    let needs_check_section: Vec<String> = if env.needs_check_clusters.is_empty() {
+        needs_check_lines
+    } else {
+        env.needs_check_clusters.iter().map(|c| format!("- {}", c.bullet())).collect()
+    };
+
     let confirmed_total = inline.len() + confirmed_general.len();
 
     if confirmed_total == 0 {
         let mut lines = vec!["### 🤖 darkmux PR review".to_string(), String::new()];
-        if needs_check_lines.is_empty() {
+        if needs_check_count == 0 {
             lines.push(format!(
                 "review funnel ran: {} flags investigated across {} bundles, none confirmed. _{}_",
                 env.deduped_flags,
@@ -1372,12 +1398,12 @@ pub fn synthesize_funnel(env: &FunnelEnvelope, diff: &str, attribution: Option<&
                  {} worth a double check (not merge-blocking). _{}_",
                 env.deduped_flags,
                 env.bundles,
-                needs_check_lines.len(),
+                needs_check_count,
                 member_summary(env)
             ));
             lines.push(String::new());
             lines.push("**Worth a double check:**".to_string());
-            lines.extend(needs_check_lines);
+            lines.extend(needs_check_section.iter().cloned());
         }
         lines.extend(run_warnings_block(env));
         return Rendered {
@@ -1399,10 +1425,10 @@ pub fn synthesize_funnel(env: &FunnelEnvelope, diff: &str, attribution: Option<&
         body.push("**Confirmed findings not anchored to a diff line:**".to_string());
         body.extend(confirmed_general);
     }
-    if !needs_check_lines.is_empty() {
+    if needs_check_count > 0 {
         body.push(String::new());
         body.push("**Worth a double check** (not merge-blocking):".to_string());
-        body.extend(needs_check_lines);
+        body.extend(needs_check_section);
     }
     body.extend(run_warnings_block(env));
 
@@ -1440,7 +1466,11 @@ fn verified_line(v: &VerifyRecord) -> String {
     format!("✓ verified by {} adjudication", v.model)
 }
 
-fn confirmed_comment_body(record: &JudgeRecord, verified: Option<&VerifyRecord>) -> String {
+fn confirmed_comment_body(
+    record: &JudgeRecord,
+    verified: Option<&VerifyRecord>,
+    also_flagged: &[String],
+) -> String {
     let mut lines = Vec::new();
     let note = record.note_for_author.trim();
     lines.push(if note.is_empty() { "(no note from the judge)".to_string() } else { note.to_string() });
@@ -1452,10 +1482,22 @@ fn confirmed_comment_body(record: &JudgeRecord, verified: Option<&VerifyRecord>)
         Some(v) => lines.push(verified_line(v)),
         None => lines.push(CONFIRMED_MARKER.to_string()),
     }
+    // (#1299) Surface the "aggregate, never discard" safety net: any
+    // same-location duplicate framings this finding absorbed at dedup are
+    // shown verbatim, so a residual within-class merge can never vanish a
+    // second defect's description — the reviewer sees BOTH framings.
+    if let Some(also) = also_flagged_line(also_flagged) {
+        lines.push(also);
+    }
     lines.join("\n\n")
 }
 
-fn confirmed_general_bullet(path: &str, record: &JudgeRecord, verified: Option<&VerifyRecord>) -> String {
+fn confirmed_general_bullet(
+    path: &str,
+    record: &JudgeRecord,
+    verified: Option<&VerifyRecord>,
+    also_flagged: &[String],
+) -> String {
     let note = record.note_for_author.trim();
     let mut line = format!(
         "- `{path}` — {}",
@@ -1469,7 +1511,23 @@ fn confirmed_general_bullet(path: &str, record: &JudgeRecord, verified: Option<&
         Some(v) => line.push_str(&format!(" ({})", verified_line(v))),
         None => line.push_str(&format!(" ({CONFIRMED_MARKER})")),
     }
+    if let Some(also) = also_flagged_line(also_flagged) {
+        line.push_str(&format!(" _{also}_"));
+    }
     line
+}
+
+/// (#1299) The trailing "Also flagged (same location): …" line for a
+/// confirmed finding that ABSORBED one or more same-location duplicate
+/// framings during dedup. `None` when nothing was absorbed (the common
+/// case), so an un-collapsed finding renders byte-identically to before.
+fn also_flagged_line(also_flagged: &[String]) -> Option<String> {
+    let framings: Vec<&str> =
+        also_flagged.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    if framings.is_empty() {
+        return None;
+    }
+    Some(format!("Also flagged (same location): {}", framings.join("; ")))
 }
 
 fn needs_check_bullet(path: &str, anchor: Option<&str>, record: &JudgeRecord) -> String {
@@ -1515,7 +1573,7 @@ mod tests {
     // production code (only inferred through `env.judged`/`env.members`
     // iteration), so importing them at file scope would warn "unused" on a
     // plain (non-test) `cargo build`.
-    use darkmux_lab::lab::funnel::{FunnelRuling, JudgedFlag, MemberRecord};
+    use darkmux_lab::lab::funnel::{FunnelRuling, JudgedFlag, MemberRecord, NeedsCheckCluster};
 
     const DIFF: &str = "diff --git a/src/x.ts b/src/x.ts\n--- a/src/x.ts\n+++ b/src/x.ts\n@@ -1,3 +1,4 @@\n const a = 1;\n+const b = 2;\n const c = 3;\n-const d = 4;\n+const d = 5;\n";
 
@@ -2060,6 +2118,7 @@ mod tests {
             draw: 0,
             charge_text: "a flagged concern".to_string(),
             anchor: anchor.map(str::to_string),
+            also_flagged: Vec::new(),
         }
     }
 
@@ -2447,7 +2506,7 @@ mod tests {
     #[test]
     fn confirmed_comment_body_empty_note_and_evidence_uses_fallback_text() {
         let record = judge_record(FunnelRuling::Confirmed, "", "");
-        let body = confirmed_comment_body(&record, None);
+        let body = confirmed_comment_body(&record, None, &[]);
         assert!(body.contains("(no note from the judge)"), "{body}");
         assert!(!body.contains("Evidence:"), "empty evidence must not render a line: {body}");
         assert!(body.contains(CONFIRMED_MARKER), "{body}");
@@ -2571,7 +2630,7 @@ mod tests {
     #[test]
     fn confirmed_general_bullet_empty_note_and_evidence_uses_fallback_text() {
         let record = judge_record(FunnelRuling::Confirmed, "", "");
-        let line = confirmed_general_bullet("src/x.ts", &record, None);
+        let line = confirmed_general_bullet("src/x.ts", &record, None, &[]);
         assert!(line.contains("(no note from the judge)"), "{line}");
         assert!(!line.contains("_Evidence:"), "empty evidence must not render a line: {line}");
         assert!(line.contains(CONFIRMED_MARKER), "{line}");
@@ -2696,6 +2755,109 @@ mod tests {
         let c = r.comment.unwrap();
         assert!(c.contains("probed by unknown"), "{c}");
         assert!(c.contains("judged by unknown"), "{c}");
+    }
+
+    // ── #1299: needs_check clustering + also_flagged rendering ────────────
+
+    /// When clustering fired (`needs_check_clusters` non-empty), the "worth a
+    /// double check" section renders ONE bullet per cluster — the wall of raw
+    /// per-finding bullets collapses — while the total count is conserved.
+    #[test]
+    fn synthesize_needs_check_renders_clusters_when_clustering_fired() {
+        let mut judged = Vec::new();
+        for _ in 0..6 {
+            judged.push(needs_check_flag("svcA@src/a.ts", None, "a bounds concern", false));
+        }
+        for _ in 0..4 {
+            judged.push(needs_check_flag("svcB@src/b.ts", None, "a provenance concern", false));
+        }
+        let env = FunnelEnvelope {
+            deduped_flags: judged.len(),
+            bundles: 2,
+            judged,
+            needs_check_clusters: vec![
+                NeedsCheckCluster { file: "svcA@src/a.ts".into(), mechanism: "null/bounds".into(), count: 6 },
+                NeedsCheckCluster {
+                    file: "svcB@src/b.ts".into(),
+                    mechanism: "provenance/sibling".into(),
+                    count: 4,
+                },
+            ],
+            members: vec![
+                MemberRecord { model: "darkmux:probe-model".into(), seat: "review-probe".into(), draws: 2, ..Default::default() },
+                MemberRecord { model: "darkmux:judge-model".into(), seat: "review-judge".into(), draws: 2, ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let r = synthesize_funnel(&env, DIFF, None);
+        assert_eq!(r.mode, "comment", "zero confirmed → comment mode");
+        let c = r.comment.unwrap();
+        // The raw total is conserved in the summary (10, not the 2 clusters).
+        assert!(c.contains("10 worth a double check"), "{c}");
+        // Each cluster renders as one counted bullet…
+        assert!(c.contains("6 related concerns in svcA@src/a.ts around null/bounds"), "{c}");
+        assert!(c.contains("4 related concerns in svcB@src/b.ts around provenance/sibling"), "{c}");
+        // …and the section is exactly those two bullets, not ten raw ones.
+        assert_eq!(c.matches("\n- ").count(), 2, "clustered section collapsed to two bullets:\n{c}");
+        // The raw per-finding note text is NOT walled out line-by-line.
+        assert!(!c.contains("`svcA@src/a.ts` — a bounds concern"), "raw bullets suppressed:\n{c}");
+    }
+
+    /// Below the threshold (no clusters produced), the "worth a double check"
+    /// section renders the RAW per-finding bullets exactly as before — the
+    /// clustering path is inert for small tiers.
+    #[test]
+    fn synthesize_needs_check_below_threshold_renders_raw_bullets() {
+        let judged = vec![
+            needs_check_flag("svcA@src/a.ts", Some("const b = 2;"), "double check one", false),
+            needs_check_flag("svcB@src/b.ts", None, "double check two", false),
+        ];
+        // needs_check_clusters left empty (Default) — clustering did NOT fire.
+        let env = healthy_envelope(judged);
+        let r = synthesize_funnel(&env, DIFF, None);
+        let c = r.comment.unwrap();
+        assert!(c.contains("2 worth a double check"), "{c}");
+        assert!(c.contains("double check one"), "raw bullet retained:\n{c}");
+        assert!(c.contains("double check two"), "raw bullet retained:\n{c}");
+        assert!(!c.contains("related concerns"), "no cluster line when below threshold:\n{c}");
+    }
+
+    /// A confirmed finding that ABSORBED same-location duplicate framings at
+    /// dedup renders a trailing "Also flagged (same location): …" line, so
+    /// the "aggregate, never discard" safety net is VISIBLE on the PR.
+    #[test]
+    fn synthesize_confirmed_renders_absorbed_also_flagged_framings() {
+        let mut j = confirmed_flag(
+            "computeEnd@src/x.ts",
+            Some("const b = 2;"),
+            "the primary framing of the bug",
+            "evidence",
+        );
+        j.flag.also_flagged =
+            vec!["a second framing of the same defect".into(), "a third framing".into()];
+        let env = healthy_envelope(vec![j]);
+        let r = synthesize_funnel(&env, DIFF, None);
+        let body = r.review.unwrap()["comments"][0]["body"].as_str().unwrap().to_string();
+        assert!(body.contains("Also flagged (same location):"), "{body}");
+        assert!(body.contains("a second framing of the same defect"), "{body}");
+        assert!(body.contains("a third framing"), "{body}");
+    }
+
+    /// The general (unanchored) confirmed bullet ALSO surfaces absorbed
+    /// framings — the safety net holds whether the finding anchored or not.
+    #[test]
+    fn synthesize_confirmed_general_bullet_surfaces_also_flagged() {
+        let mut j = confirmed_flag(
+            "computeEnd@src/x.ts",
+            Some("this anchor never appears in the diff"),
+            "unanchored primary framing",
+            "evidence",
+        );
+        j.flag.also_flagged = vec!["absorbed alternate framing".into()];
+        let env = healthy_envelope(vec![j]);
+        let r = synthesize_funnel(&env, DIFF, None);
+        let body = r.review.unwrap()["body"].as_str().unwrap().to_string();
+        assert!(body.contains("Also flagged (same location): absorbed alternate framing"), "{body}");
     }
 
     // ── #1272: dispatch.start/terminal bookends around a production funnel run ──
