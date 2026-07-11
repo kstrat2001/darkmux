@@ -1244,9 +1244,10 @@ fn pr_review_run_envelope() -> &'static str {
 }
 
 /// `--from-envelope` + `--diff` + `--emit -` synthesizes the canned
-/// envelope's confirmed flag into an inline, merge-blocking review comment
-/// — zero model calls, zero bundling (the CI-testable path the packet
-/// brief names).
+/// envelope's confirmed flag into an inline review comment on a NON-blocking
+/// `COMMENT`-event review (#1302 — advisory by default; the canned envelope
+/// carries no `request_changes` opt-in) — zero model calls, zero bundling
+/// (the CI-testable path the packet brief names).
 #[test]
 fn pr_review_run_from_envelope_synthesizes_confirmed_review_to_stdout() {
     let tmp = TempDir::new().unwrap();
@@ -1279,7 +1280,7 @@ fn pr_review_run_from_envelope_synthesizes_confirmed_review_to_stdout() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("stdout was not JSON ({e}): {stdout}"));
     assert_eq!(v["mode"], "review");
-    assert_eq!(v["review"]["event"], "REQUEST_CHANGES");
+    assert_eq!(v["review"]["event"], "COMMENT", "advisory by default (#1302)");
     let comments = v["review"]["comments"].as_array().unwrap();
     assert_eq!(comments.len(), 1);
     assert_eq!(comments[0]["path"], "src/x.ts");
