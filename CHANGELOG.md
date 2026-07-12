@@ -11,6 +11,14 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 
 ## [Unreleased]
 
+## [1.18.3] - 2026-07-12
+
+A one-fix patch: the review funnel's confirmed findings anchor as inline comments instead of falling into the summary's general section.
+
+### Fixed
+
+- **Fragment anchors resolve to inline comments** (#1299, the mis-anchor half — the dedup half shipped in 1.18.1) — the funnel's prosecutor quotes the offending code in backticks, and `extract_new_side_anchor` stores that SPAN as the finding's anchor. A span is often a *sub-expression* of a changed line, not the whole line, so it matched the diff by **substring** at extraction time, but `resolve_anchor`'s **exact whole-line** lookup missed it — dumping the finding into the non-anchored "general" body section instead of posting inline. Frontier-staffed funnels (mechanism-level findings) hit this hardest. `resolve_anchor` gains a substring fallback symmetric with extraction: after the exact lookup fails, anchor to the new-side line whose whitespace-collapsed content *contains* the collapsed span — only when exactly one distinct line matches (never guess between candidates). An 8-char floor refuses short fragments; the fallback runs only after the exact path fails, so whole-line anchors (single-model reviews) are byte-identical to before. Offline replay against a real preserved review envelope: 0 inline / 7 general → **6 inline / 1 general**.
+
 ## [1.18.2] - 2026-07-11
 
 The production-hardening patch — a ledger correctness fix plus the credential-and-hang surface the Studio's first Azure-review day surfaced.
@@ -88,6 +96,7 @@ funnel, fixed same-day.
   exit paths, `source: "funnel"`) so a live PR review is visible as a running dispatch in the
   viewer's fleet and machine views (#1272, #1277).
 
+[1.18.3]: https://github.com/kstrat2001/darkmux/releases/tag/v1.18.3
 [1.18.2]: https://github.com/kstrat2001/darkmux/releases/tag/v1.18.2
 [1.18.1]: https://github.com/kstrat2001/darkmux/releases/tag/v1.18.1
 [1.18.0]: https://github.com/kstrat2001/darkmux/releases/tag/v1.18.0
