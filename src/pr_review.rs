@@ -66,14 +66,13 @@ use std::path::{Path, PathBuf};
 // this path has no envelope to derive from and the workflow that knows where
 // the model ran passes the truthful `--attribution` (the funnel does derive).
 const FOOTER: &str = "\n\n---\n<sub>Automated review by darkmux, running on a \
-local model (no cloud API) via a self-hosted runner — darkmux dogfooding \
-itself in public. Advisory, not a merge gate.</sub>";
+local model (no cloud API) via a self-hosted runner. Advisory, not a merge gate.</sub>";
 
 /// (#1298/#1186) Default tagline for the funnel's posted footer — the
 /// operator-owned "why this comment exists" half. The operator overrides it
 /// via `--attribution`; the model / local-vs-cloud half is DERIVED from the
 /// run, never carried here (see [`dispatch_provenance`]).
-const FUNNEL_TAGLINE: &str = "darkmux dogfooding itself in public. Advisory, not a merge gate.";
+const FUNNEL_TAGLINE: &str = "Advisory, not a merge gate.";
 
 /// Severity → label. Unknown severity renders as a plain note.
 fn sev_label(severity: Option<&str>) -> &'static str {
@@ -2011,7 +2010,7 @@ mod tests {
     fn render_missing_verdict_is_na_and_has_footer() {
         let body = render(&env("{\"summary\":\"s\",\"findings\":[]}"), DIFF).review.unwrap()["body"].as_str().unwrap().to_string();
         assert!(body.contains("Verdict: n/a"));
-        assert!(body.contains("dogfooding itself in public")); // FOOTER
+        assert!(body.contains("Advisory, not a merge gate")); // FOOTER
     }
 
     // ── cmd_render handler ────────────────────────────────────────────────
