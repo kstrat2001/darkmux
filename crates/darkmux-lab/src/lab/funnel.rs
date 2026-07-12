@@ -2226,7 +2226,12 @@ fn probe_one_draw(
         };
         let reply = chat(&call)?;
         tokens += reply.total_tokens.unwrap_or(0);
-        served = reply.model.clone();
+        // (#1300 QA follow-up) LMStudio's response ALSO carries a `model`
+        // field (it's OpenAI-compatible) — gate on `endpoint.is_some()` so a
+        // local seat's `served_model` stays `None` by construction, never by
+        // coincidence of what LMStudio happens to echo back. `lms ps` is the
+        // only ground truth for local dispatch; the response body is not.
+        served = if endpoint.is_some() { reply.model.clone() } else { None };
         let trimmed = reply.content.trim();
         if !trimmed.is_empty() {
             return Ok((Some(trimmed.to_string()), tokens, served));
@@ -2449,8 +2454,11 @@ fn run_judge_pass(
             let tokens = reply.total_tokens.unwrap_or(0);
             // (#1300) Captured regardless of parse outcome — an unparsed
             // reply still came from a real served model, and the caller
-            // needs that provenance too.
-            let served = reply.model.clone();
+            // needs that provenance too. Gated on `endpoint.is_some()`:
+            // LMStudio's response is ALSO OpenAI-compatible and carries a
+            // `model` field, so a local judge must not pick it up — `lms ps`
+            // is the only ground truth for local dispatch.
+            let served = if endpoint.is_some() { reply.model.clone() } else { None };
             match parse_judge_ruling(&reply.content) {
                 Some((ruling, decisive_evidence, note_for_author)) => (
                     JudgeRecord { ruling, decisive_evidence, note_for_author, pass, seconds },
@@ -2847,7 +2855,10 @@ fn run_verify_pass(
         Ok(reply) => {
             let seconds = t0.elapsed().as_secs_f64();
             let tokens = reply.total_tokens.unwrap_or(0);
-            let served = reply.model.clone();
+            // (#1300 QA follow-up) Gated on `endpoint.is_some()` — see
+            // `run_judge_pass`'s identical comment; LMStudio's response is
+            // also OpenAI-compatible and carries a `model` field.
+            let served = if endpoint.is_some() { reply.model.clone() } else { None };
             match parse_verify_ruling(&reply.content) {
                 Some((ruling, decisive_evidence, note_for_author)) => (
                     VerifyRecord { ruling, decisive_evidence, note_for_author, seconds, model: model.to_string() },
@@ -6731,23 +6742,27 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         let crew = crew_with(vec![
             ("review-probe", vec![remote_staffing("cloud", "gpt-4o", 1)]),
             ("review-judge", vec![remote_staffing("cloud-judge", "gpt-4o", 1)]),
+            // (#1300 QA follow-up) A verify seat too — the third of three
+            // independently-threaded capture sites; only probe/judge had
+            // coverage.
+            ("review-verify", vec![remote_staffing("cloud-verify", "gpt-4o", 1)]),
         ]);
         let inputs = inputs_for(&crew, 500_000);
         let mut cycler = RecordingCycler::new();
         let mut chat = |call: &ChatCall| {
-            if call.model == "gpt-4o" && call.system.contains("judge") {
-                Ok(SingleShotReply {
-                    content: CONFIRM_JSON.to_string(),
-                    total_tokens: Some(10),
-                    model: Some("gpt-4o-2026-08-01".to_string()),
-                })
+            let content = if call.system.contains("verify") {
+                "```json\n{\"ruling\": \"verified\", \"decisive_evidence\": \"e\", \"note_for_author\": \"n\"}\n```"
+                    .to_string()
+            } else if call.model == "gpt-4o" && call.system.contains("judge") {
+                CONFIRM_JSON.to_string()
             } else {
-                Ok(SingleShotReply {
-                    content: "a real defect".to_string(),
-                    total_tokens: Some(10),
-                    model: Some("gpt-4o-2026-08-01".to_string()),
-                })
-            }
+                "a real defect".to_string()
+            };
+            Ok(SingleShotReply {
+                content,
+                total_tokens: Some(10),
+                model: Some("gpt-4o-2026-08-01".to_string()),
+            })
         };
         let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
 
@@ -6765,29 +6780,56 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             Some("gpt-4o-2026-08-01"),
             "the judge's served model must be captured distinct from the requested id"
         );
+        let verify = env.members.iter().find(|m| m.seat == "review-verify").expect("verify member");
+        assert_eq!(verify.model, "gpt-4o");
+        assert_eq!(
+            verify.served_model.as_deref(),
+            Some("gpt-4o-2026-08-01"),
+            "the verify seat's served model must be captured distinct from the requested id too"
+        );
     }
 
     /// (#1300) A LOCAL seat's replies never carry a served model — `lms ps`
     /// is ground truth for local dispatch, not the response body.
     #[test]
     fn served_model_absent_for_local_seats() {
+        // (#1300 QA follow-up) The mock deliberately reports a served model
+        // on the LOCAL calls too — exactly what a real LMStudio response
+        // does (it's OpenAI-compatible and echoes a `model` field). This
+        // proves the gate in `probe_one_draw`/`run_judge_pass` actually
+        // filters it out; a mock that hardcoded `model: None` for local
+        // calls would pass even with the gate missing entirely.
         let crew = crew_with(vec![
             ("review-probe", vec![staffing("fast", "probe-model", 1)]),
             ("review-judge", vec![staffing("fast", "judge-model", 1)]),
+            ("review-verify", vec![staffing("fast", "verify-model", 1)]),
         ]);
         let inputs = inputs_for(&crew, 500_000);
         let mut cycler = RecordingCycler::new();
         let mut chat = |call: &ChatCall| {
-            if call.model == "darkmux:judge-model" {
-                Ok(reply(CONFIRM_JSON))
+            let content = if call.system.contains("verify") {
+                "```json\n{\"ruling\": \"verified\", \"decisive_evidence\": \"e\", \"note_for_author\": \"n\"}\n```"
+                    .to_string()
+            } else if call.model == "darkmux:judge-model" {
+                CONFIRM_JSON.to_string()
             } else {
-                Ok(reply("a real defect"))
-            }
+                "a real defect".to_string()
+            };
+            Ok(SingleShotReply {
+                content,
+                total_tokens: Some(10),
+                model: Some(call.model.to_string()),
+            })
         };
         let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
 
+        assert_eq!(env.members.len(), 3, "probe + judge + verify all dispatched");
         for m in &env.members {
-            assert!(m.served_model.is_none(), "a local seat must never report a served_model: {m:?}");
+            assert!(
+                m.served_model.is_none(),
+                "a local seat must never report a served_model, even when the response body carries \
+                 one (LMStudio's does): {m:?}"
+            );
         }
     }
 
