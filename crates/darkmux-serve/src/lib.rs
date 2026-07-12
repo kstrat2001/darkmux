@@ -250,6 +250,8 @@ pub(crate) fn build_router_full(
         .route("/machine/memory", get(machine_memory_handler))
         .route("/missions", get(missions_handler))
         .route("/sprints", get(sprints_handler))
+        .route("/tasks", get(tasks_handler))
+        .route("/steps", get(steps_handler))
         .route("/fleet/sessions/live", get(fleet_sessions_live_handler))
         .route("/fleet/machines/live", get(fleet_machines_live_handler))
         .route("/lab/runs", get(lab_runs_handler))
@@ -1295,6 +1297,96 @@ async fn sprints_handler() -> axum::Json<serde_json::Value> {
         "sprints": sprints,
         "generated_at_ms": current_millis(),
     }))
+}
+
+/// Query params shared by `/tasks` and `/steps`. `mission_id` is optional —
+/// absent means "every mission" (a debug/inspection-wide dump); present
+/// scopes the sprint fan-out to just that mission's own sprints BEFORE
+/// loading tasks/steps.
+///
+/// This scoping matters for correctness, not just payload size: `Task` and
+/// `Step` carry `sprint_id`/`task_id` but **no `mission_id` field** (checked
+/// directly against `crates/darkmux-crew/src/types.rs` — #1230 Packet 2's
+/// real schema), and sprint ids are only unique WITHIN a mission (mission-
+/// compiler-generated slugs like `"s1"` — see `mission_propose.rs`'s
+/// `Proposal` shape — have no cross-mission uniqueness guarantee). An
+/// unscoped global join of `/tasks`+`/steps` can therefore ambiguously merge
+/// two different missions' graphs if they happen to reuse a sprint id (found
+/// live authoring this endpoint's own fixture data — two demo missions both
+/// named their only sprint `"s1"`, and the naive global aggregation returned
+/// 12 steps across 3 tasks for a mission that structurally has only 4). The
+/// mission-detail viewer therefore always passes `?mission_id=`.
+#[derive(serde::Deserialize)]
+struct MissionScopedQuery {
+    #[serde(default)]
+    mission_id: Option<String>,
+}
+
+/// GET /tasks[?mission_id=<id>] — Tasks from the JSON source-of-truth
+/// (`~/.darkmux/crew/missions/<id>/tasks/<sprint-id>/`). (#1230 Packet 6)
+/// Task/Step storage is sprint-scoped (`lifecycle::load_tasks_for_sprint`)
+/// — there is no mission-wide or global loader in `darkmux-crew` yet, so
+/// this handler does the fan-out itself: load every sprint (optionally
+/// filtered to `mission_id` FIRST, so the sprint-id collision described on
+/// `MissionScopedQuery` can't merge two missions' tasks), then load each
+/// sprint's tasks. A sprint predating the Task/Step schema (#1230 Packet 2)
+/// contributes an empty Vec, not an error. Empty array on no missions/
+/// sprints/tasks or an unreachable crew root; never errors.
+async fn tasks_handler(Query(q): Query<MissionScopedQuery>) -> axum::Json<serde_json::Value> {
+    let result = tokio::task::spawn_blocking(move || load_all_tasks(q.mission_id.as_deref())).await;
+    let tasks = match result {
+        Ok(Ok(t)) => t,
+        _ => Vec::new(),
+    };
+    axum::Json(serde_json::json!({
+        "tasks": tasks,
+        "generated_at_ms": current_millis(),
+    }))
+}
+
+/// GET /steps[?mission_id=<id>] — Steps from the JSON source-of-truth
+/// (`~/.darkmux/crew/missions/<id>/steps/<sprint-id>/`), scoped the same
+/// way as `tasks_handler` (see `MissionScopedQuery` for why scoping is a
+/// correctness requirement, not an optimization). Empty array on no
+/// missions/sprints/steps or an unreachable crew root; never errors.
+async fn steps_handler(Query(q): Query<MissionScopedQuery>) -> axum::Json<serde_json::Value> {
+    let result = tokio::task::spawn_blocking(move || load_all_steps(q.mission_id.as_deref())).await;
+    let steps = match result {
+        Ok(Ok(s)) => s,
+        _ => Vec::new(),
+    };
+    axum::Json(serde_json::json!({
+        "steps": steps,
+        "generated_at_ms": current_millis(),
+    }))
+}
+
+/// Fan out over every sprint belonging to `mission_id` (or every sprint,
+/// mission-unscoped, when `None`) and collect its Tasks. Synchronous —
+/// callers run this on the blocking pool.
+fn load_all_tasks(mission_id: Option<&str>) -> anyhow::Result<Vec<darkmux_crew::types::Task>> {
+    let sprints = darkmux_crew::loader::load_sprints()?;
+    let mut all = Vec::new();
+    for sp in sprints.iter().filter(|sp| mission_id.map_or(true, |m| sp.mission_id == m)) {
+        if let Ok(tasks) = darkmux_crew::lifecycle::load_tasks_for_sprint(&sp.mission_id, &sp.id) {
+            all.extend(tasks);
+        }
+    }
+    Ok(all)
+}
+
+/// Fan out over every sprint belonging to `mission_id` (or every sprint,
+/// mission-unscoped, when `None`) and collect its Steps. Synchronous —
+/// callers run this on the blocking pool.
+fn load_all_steps(mission_id: Option<&str>) -> anyhow::Result<Vec<darkmux_crew::types::Step>> {
+    let sprints = darkmux_crew::loader::load_sprints()?;
+    let mut all = Vec::new();
+    for sp in sprints.iter().filter(|sp| mission_id.map_or(true, |m| sp.mission_id == m)) {
+        if let Ok(steps) = darkmux_crew::lifecycle::load_steps_for_sprint(&sp.mission_id, &sp.id) {
+            all.extend(steps);
+        }
+    }
+    Ok(all)
 }
 
 fn current_millis() -> u64 {

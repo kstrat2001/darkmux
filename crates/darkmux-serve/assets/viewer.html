@@ -473,6 +473,29 @@
   .sprun{flex:1;text-align:right;font:11px 'JetBrains Mono',monospace}
   .splink{color:var(--amber);cursor:pointer;text-decoration:none}.splink:hover{text-decoration:underline}
   .sprow[data-act]{cursor:pointer}.sprow[data-act]:hover{border-color:var(--amber-dim)}
+  /* (#1230 Packet 6) generic schema-agnostic Task/Step graph lens — list/graph
+     view toggle + the hand-rolled layered SVG node-link renderer. No canvas/
+     d3/dagre anywhere in this file (inline-only convention); the graph is
+     plain template-string SVG, matching .loadsvg/.ctxchart's own approach. */
+  .viewtoggle{display:inline-flex;gap:2px;margin:2px 0 10px;background:var(--bg2);border:1px solid var(--line);border-radius:5px;padding:2px}
+  .vtbtn{font:600 11px 'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);background:none;border:0;border-radius:3px;padding:5px 11px;cursor:pointer}
+  .vtbtn:hover{color:var(--text)}
+  .vtbtn.on{background:var(--amber-dim);color:#0a0f17}
+  .graphwrap{overflow:auto;border:1px solid var(--line);border-radius:6px;background:var(--bg2);max-height:60vh}
+  .dgraph{display:block}
+  .gedge path{fill:none;stroke:var(--line);stroke-width:1.6}
+  .gedge text{fill:var(--muted);font:10px 'JetBrains Mono',monospace}
+  .gnode rect{fill:var(--panel);stroke:var(--line);stroke-width:1.6}
+  .gnode text{pointer-events:none}
+  .gnode .gnlabel{fill:var(--text);font:600 12px 'JetBrains Mono',monospace}
+  .gnode .gnkind{fill:var(--muted);font:9px 'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.05em}
+  /* Status coloring — same palette the sprint-cycle pills + presence badges
+     use, so a node's color means the same thing everywhere in the viewer. */
+  .gnode[data-status="planned"] rect{stroke:var(--line)}
+  .gnode[data-status="running"] rect{stroke:var(--run);stroke-width:2.2;animation:lpulse 1.6s ease-in-out infinite}
+  .gnode[data-status="complete"] rect{stroke:var(--good)}
+  .gnode[data-status="error"] rect{stroke:var(--bad)}
+  .gnode[data-status="abandoned"] rect{stroke:var(--muted);stroke-dasharray:4 3;opacity:.55}
   .mstat{font:600 10px 'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.08em;padding:2px 8px;border-radius:3px;border:1px solid var(--line);color:var(--muted);vertical-align:middle}
   .mstat.active{color:var(--good);border-color:var(--good)}.mstat.closed{color:var(--muted)}.mstat.paused{color:var(--warn);border-color:var(--warn)}
   .spt{flex:1;font:12px 'JetBrains Mono',monospace;color:var(--text)}
@@ -748,6 +771,20 @@ let DATA = [];
 // lens so a planned-but-not-yet-run sprint still shows.
 let MISSIONS = [];
 let SPRINTS = [];
+// (#1230 Packet 6) Task/Step graph data for the CURRENTLY-VIEWED mission
+// only — lazily fetched + mission_id-scoped server-side, not eagerly joined
+// alongside MISSIONS/SPRINTS at boot. See ensureMissionGraphLoaded() below
+// for why (Task/Step carry no mission_id field, and sprint ids collide
+// across missions, so an eager global join can't disambiguate safely).
+let TASKS = [];
+let STEPS = [];
+// (#1230 Packet 6) Live overlay for Step status: step id -> {status, ts}.
+// The scheduler's "step start"/"step complete"/"step error" flow records
+// (scheduler.rs::step_lifecycle_record) carry no mission_id/sprint_id — only
+// `handle` (the step id) and a `task:<task_id>` session_id — so live matching
+// keys on `handle` against whatever step ids the currently-rendered graph
+// already knows about, rather than a mission-scoped flow filter.
+let LIVE_STEP_STATUS = {};
 let DATA_SOURCE = "no records yet";
 // (#1132) Last mode/date seen by setBadges — the about modal reads these for
 // its mode row (they're otherwise function-locals in boot/setBadges).
@@ -898,6 +935,10 @@ recompute();
 // via state.recentAll. Keeps a busy machine's panel from scrolling unbounded.
 const RECENT_CAP=20;
 let state={level:"fleet",machine:null,session:null,missionId:null,labRunDir:null,t:tMax,playing:false,timer:null,selected:null,follow:true,speed:1,recentAll:false,activityWindowMin:1440,
+  // (#1230 Packet 6) null = auto (graph when the mission has a Task/Step
+  // graph, else list) — an explicit "list"/"graph" is the operator's own
+  // toggle click, which sticks until they toggle again or leave the mission.
+  missionView:null,
   filters:{cat:new Set(FCATS),tier:new Set(FTIERS),src:new Set(FSRC),act:new Set(FACTS),q:""},
   rawOpen:false,
   // (#expand) Open-state of `<details data-expand="<key>">` blocks, keyed so it
@@ -2280,6 +2321,55 @@ async function loadMissionsSprints(mUrl, sUrl){
     SPRINTS=(s&&Array.isArray(s.sprints))?s.sprints:[];
   }catch(_){ MISSIONS=[]; SPRINTS=[]; }
 }
+// (#1230 Packet 6) Per-mission Task/Step fetch, mission_id-SCOPED server-side
+// (`?mission_id=`, resolved by tasks_handler/steps_handler in
+// crates/darkmux-serve/src/lib.rs). Deliberately NOT folded into the eager
+// boot-time Promise.all above: Task/Step JSON carries no mission_id field
+// (only sprint_id/task_id — checked directly against #1230 Packet 2's real
+// schema), and sprint ids are only unique WITHIN a mission (mission-
+// compiler-generated slugs like "s1" have no cross-mission uniqueness
+// guarantee) — an eager GLOBAL /tasks+/steps join could ambiguously merge
+// two different missions' graphs if they happened to reuse a sprint id
+// (found live authoring this endpoint's own fixture data). Scoping the
+// fetch per mission at the server avoids the ambiguity at the source
+// instead of trying to disambiguate it client-side.
+//
+// Cached per mission id for the life of the tab — repeat visits to the same
+// mission during a session don't re-fetch. Called from renderMission()
+// itself (not from drillMission) so EVERY entry point into the mission-
+// detail view (click-through, `?mission=` on boot, the `gomission` action,
+// goMission()'s "primary mission" shortcut) triggers it uniformly, with no
+// need to hunt down every call site that sets state.missionId.
+const MISSION_GRAPH_CACHE={};
+const MISSION_GRAPH_INFLIGHT=new Set();
+function ensureMissionGraphLoaded(mid){
+  if(!mid||mid==="—")return;
+  const cached=MISSION_GRAPH_CACHE[mid];
+  if(cached){ TASKS=cached.tasks; STEPS=cached.steps; return; }
+  // Not cached — this render falls back to the list view (empty TASKS/STEPS)
+  // until the fetch below lands, rather than showing whatever the
+  // previously-viewed mission's graph happened to be.
+  TASKS=[]; STEPS=[];
+  if(MISSION_GRAPH_INFLIGHT.has(mid))return;
+  MISSION_GRAPH_INFLIGHT.add(mid);
+  const q="?mission_id="+encodeURIComponent(mid);
+  Promise.all([
+    fetch("/tasks"+q,{headers:{accept:"application/json"}}).then(r=>r.ok?r.json():null).catch(()=>null),
+    fetch("/steps"+q,{headers:{accept:"application/json"}}).then(r=>r.ok?r.json():null).catch(()=>null),
+  ]).then(([t,st])=>{
+    MISSION_GRAPH_CACHE[mid]={
+      tasks:(t&&Array.isArray(t.tasks))?t.tasks:[],
+      steps:(st&&Array.isArray(st.steps))?st.steps:[],
+    };
+  }).catch(()=>{ MISSION_GRAPH_CACHE[mid]={tasks:[],steps:[]}; })
+    .finally(()=>{
+      MISSION_GRAPH_INFLIGHT.delete(mid);
+      // Only re-render if the operator is still looking at this mission —
+      // a slow response for a mission navigated away from just populates
+      // the cache quietly for next time.
+      if(state.level==="mission"&&state.missionId===mid)render();
+    });
+}
 // (#827 Slice A) The missions index — every mission, durable plan joined with
 // flow-record history. Rows union /missions structs with mission_ids seen in
 // the flow (so it works under the demo without a /missions endpoint). Each row:
@@ -2369,6 +2459,161 @@ function cycleStage(mid, sprintId){
     blocked:has("blocked"),
   };
 }
+// ─── Generic schema-agnostic graph lens (#1230 Packet 6) ──────────────────
+//
+// renderGraph(nodes, edges, opts) knows NOTHING about Sprint/Task/Step — it
+// takes GraphNode={id,label,kind,status} + GraphEdge={from,to,itemsCarried?}
+// and draws a hand-rolled layered (Sugiyama-style) node-link diagram. No
+// canvas/d3/dagre anywhere in this file (strict inline-only convention, and
+// there is genuinely zero prior graph infra to extend) — plain template-
+// string SVG, the same approach .loadsvg/.ctxchart already use for their own
+// charts. The mission-detail caller below (missionGraphData) is the ONE
+// place that knows what a Task/Step is; a later caller could feed this the
+// same function a completely different schema (e.g. a funnel-history debug
+// view) mapped the same way — nothing here assumes Mission vocabulary.
+const GRAPH_COL_W=236, GRAPH_ROW_H=84, GRAPH_PAD=36, GRAPH_NODE_W=190, GRAPH_NODE_H=52;
+// Longest-path depth per node via Kahn's-algorithm topological order (a node
+// never reached — i.e. caught in a cycle — falls back to depth 0 rather than
+// hanging; cycle *detection* is the scheduler's job at schedule time,
+// crates/darkmux-crew/src/scheduler.rs::detect_cycles — this is just a
+// renderer defending itself against malformed input). Parallel branches at
+// the same depth stack as rows within their column, which is what visually
+// shows real fan-out (e.g. a bundle step feeding N probe seats side by side).
+function graphLayout(nodes, edges){
+  const byId={}; nodes.forEach(n=>{ byId[n.id]=n; });
+  const outgoing={}, incoming={}, indeg={};
+  nodes.forEach(n=>{ outgoing[n.id]=[]; incoming[n.id]=[]; indeg[n.id]=0; });
+  edges.forEach(e=>{
+    if(!byId[e.from]||!byId[e.to])return; // dangling edge — drop defensively
+    outgoing[e.from].push(e.to);
+    incoming[e.to].push(e.from);
+    indeg[e.to]++;
+  });
+  const depth={}; nodes.forEach(n=>{ depth[n.id]=0; });
+  const queue=nodes.filter(n=>indeg[n.id]===0).map(n=>n.id);
+  const remaining=Object.assign({},indeg);
+  for(let head=0; head<queue.length; head++){
+    const id=queue[head];
+    outgoing[id].forEach(t=>{
+      depth[t]=Math.max(depth[t], depth[id]+1);
+      if(--remaining[t]===0) queue.push(t);
+    });
+  }
+  const byDepth={};
+  nodes.forEach(n=>{ const d=depth[n.id]||0; (byDepth[d]||(byDepth[d]=[])).push(n.id); });
+  const maxDepth=Math.max(0,...Object.keys(byDepth).map(Number));
+  // Row order within each column: depth 0 sorts alphabetically (a
+  // deterministic base case with no predecessors to key off). Every later
+  // column sorts by the BARYCENTER (average row) of its already-placed
+  // predecessors — a single left-to-right pass of the standard Sugiyama
+  // crossing-reduction heuristic, not the fully iterative version, but
+  // enough to pull related branches into neighboring rows instead of
+  // scattering them by id. Found live: without this, two probe seats fed by
+  // the same bundle step (their only predecessor) landed in DIFFERENT
+  // columns' unrelated row positions, and their edges crossed through the
+  // column gutter closely enough that both edges' item-count labels visually
+  // overlapped. Depth-monotonic edges (every predecessor lives at a
+  // strictly lower depth, by construction of the longest-path assignment
+  // above) mean every predecessor's row is already final by the time a
+  // later column reads it — no forward references.
+  const rowOf={};
+  function barycenter(id){
+    const rows=(incoming[id]||[]).map(p=>rowOf[p]).filter(r=>r!==undefined);
+    return rows.length ? rows.reduce((a,b)=>a+b,0)/rows.length : Number.MAX_SAFE_INTEGER;
+  }
+  const pos={};
+  for(let d=0; d<=maxDepth; d++){
+    const col=(byDepth[d]||[]).slice();
+    if(d===0) col.sort();
+    else col.sort((a,b)=>(barycenter(a)-barycenter(b))||(a<b?-1:a>b?1:0));
+    col.forEach((id,i)=>{
+      rowOf[id]=i;
+      pos[id]={x:GRAPH_PAD+GRAPH_NODE_W/2+d*GRAPH_COL_W, y:GRAPH_PAD+GRAPH_NODE_H/2+i*GRAPH_ROW_H};
+    });
+  }
+  const maxRows=Math.max(1,...Object.keys(byDepth).map(d=>byDepth[d].length));
+  return {
+    pos,
+    width:GRAPH_PAD*2+GRAPH_NODE_W+maxDepth*GRAPH_COL_W,
+    height:GRAPH_PAD*2+GRAPH_NODE_H+(maxRows-1)*GRAPH_ROW_H,
+  };
+}
+// Cubic-bezier path between two node anchors — right edge of the source to
+// left edge of the target — so multiple predecessors converging on one node
+// (a real fan-in join, e.g. `dedup` fed by every `probe:<seat>`) each draw
+// their OWN full curve into it, not a single collapsed line.
+function graphEdgePath(pos, from, to){
+  const p1=pos[from], p2=pos[to];
+  const x1=p1.x+GRAPH_NODE_W/2, y1=p1.y, x2=p2.x-GRAPH_NODE_W/2, y2=p2.y;
+  const dx=Math.max(36,(x2-x1)/2);
+  return `M${x1},${y1} C${x1+dx},${y1} ${x2-dx},${y2} ${x2},${y2}`;
+}
+function renderGraph(nodes, edges, opts){
+  opts=opts||{};
+  if(!nodes||!nodes.length) return `<div class="none">${esc(opts.emptyMessage||"no graph data")}</div>`;
+  const {pos,width,height}=graphLayout(nodes,edges);
+  const edgesHtml=(edges||[]).filter(e=>pos[e.from]&&pos[e.to]).map(e=>{
+    const d=graphEdgePath(pos,e.from,e.to);
+    const p1=pos[e.from], p2=pos[e.to];
+    const mx=(p1.x+p2.x)/2, my=(p1.y+p2.y)/2;
+    const lbl=(e.itemsCarried!=null)
+      ?`<text x="${mx}" y="${my-6}" text-anchor="middle">${esc(String(e.itemsCarried))}</text>`:'';
+    return `<g class="gedge"><path d="${d}"></path>${lbl}</g>`;
+  }).join("");
+  const nodesHtml=nodes.filter(n=>pos[n.id]).map(n=>{
+    const p=pos[n.id], x=p.x-GRAPH_NODE_W/2, y=p.y-GRAPH_NODE_H/2;
+    return `<g class="gnode" data-step-id="${esc(n.id)}" data-status="${esc(n.status||'planned')}">
+      <title>${esc(n.id)} · ${esc(n.kind||'')} · ${esc(n.status||'planned')}</title>
+      <rect x="${x}" y="${y}" width="${GRAPH_NODE_W}" height="${GRAPH_NODE_H}" rx="7"></rect>
+      <text class="gnlabel" x="${p.x}" y="${p.y-4}" text-anchor="middle">${esc(n.label||n.id)}</text>
+      <text class="gnkind" x="${p.x}" y="${p.y+14}" text-anchor="middle">${esc(n.kind||'')}</text>
+    </g>`;
+  }).join("");
+  return `<div class="graphwrap"><svg class="dgraph" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}">
+    <g class="gedges">${edgesHtml}</g><g class="gnodes">${nodesHtml}</g>
+  </svg></div>`;
+}
+// ─── Mission → generic graph mapping (#1230 Packet 6) ─────────────────────
+//
+// The ONE place that knows Task/Step vocabulary. TASKS/STEPS are already
+// server-scoped to `mid` (ensureMissionGraphLoaded fetches `?mission_id=`)
+// — the sids/tids filter below is defense-in-depth against a stale-cache
+// edge case (a fast mission-to-mission click before the previous fetch's
+// `.finally()` guard runs), not the primary correctness mechanism; see
+// ensureMissionGraphLoaded's comment for why an UNSCOPED global join isn't
+// safe (sprint ids collide across missions; Task/Step carry no mission_id).
+// One GraphNode per Step (Task is a container, not itself a DAG node —
+// Task.depends_on doesn't exist on the real schema yet, deferred per the
+// #1230 plan); GraphEdge per Step.depends_on.
+function missionGraphData(mid){
+  const sids=new Set(SPRINTS.filter(s=>s&&s.mission_id===mid).map(s=>s.id));
+  const tasks=TASKS.filter(t=>t&&sids.has(t.sprint_id));
+  const tids=new Set(tasks.map(t=>t.id));
+  const steps=STEPS.filter(s=>s&&tids.has(s.task_id));
+  const byId={}; steps.forEach(s=>{ byId[s.id]=s; });
+  const nodes=steps.map(s=>({
+    id:s.id, label:s.id, kind:String(s.kind||'').split('.')[0]||'step',
+    status:(LIVE_STEP_STATUS[s.id]&&LIVE_STEP_STATUS[s.id].status)||s.status||'planned',
+  }));
+  const edges=[];
+  steps.forEach(s=>(s.depends_on||[]).forEach(dep=>{
+    if(!byId[dep])return; // dangling dep id — scheduler's is_ready() fails it closed too
+    edges.push({from:dep, to:s.id, itemsCarried:stepItemsOut(byId[dep])});
+  }));
+  return {nodes, edges, taskCount:tasks.length, stepCount:steps.length};
+}
+// Real `Step` JSON (crates/darkmux-crew/src/types.rs) has NO items_in/
+// items_out schema field — that shape lives only in the funnel's own
+// StepRecord flow-record telemetry, never in the persisted Step. Best-effort
+// convention instead: when a step's free-text `output` happens to parse as
+// JSON carrying a numeric `items_out`, surface it as the edge label ("where
+// available", not "always" — most real steps' output is plain text and
+// render with a structural-only, unlabeled edge).
+function stepItemsOut(step){
+  if(!step||typeof step.output!=="string")return null;
+  try{ const v=JSON.parse(step.output); if(v&&typeof v.items_out==="number")return v.items_out; }catch(_){}
+  return null;
+}
 // (#827 Slice B) Mission detail — the durable SPRINT plan (window-independent)
 // joined with flow-record run history. Rendering from /sprints (not just the
 // flow) means a planned or historical mission shows its real structure +
@@ -2377,6 +2622,7 @@ function cycleStage(mid, sprintId){
 // missions with no durable sprints (demo / ad-hoc dispatches).
 function renderMission(){
   const mid=state.missionId||primaryMission()||"—";
+  ensureMissionGraphLoaded(mid); // (#1230 Packet 6) populates TASKS/STEPS for `mid`, or kicks off the fetch and re-renders when it lands
   state.stageScope=r=>r.mission_id===mid; $("logscope").textContent="mission";
   const mObj=MISSIONS.find(m=>m&&m.id===mid)||null;
   const mstat=mObj?(mObj.status||"active"):null;
@@ -2425,10 +2671,26 @@ function renderMission(){
 
   const closedWarn = mstat==="closed" && sprints.some(s=>s.status!=="complete"&&s.status!=="abandoned")
     ? `<div class="burnlbl"><span class="wallerr">⚠ mission Closed but a sprint isn't terminal — see <code>darkmux mission status</code></span></div>` : '';
+  // (#1230 Packet 6) Task/Step graph — a NEW view mode alongside the flat
+  // sprint-cycle list above, not a replacement. A pre-#1230 mission (or a
+  // sprint that hasn't been scheduled through run_step_graph yet) has no
+  // Task/Step graph under it, so the toggle only appears — and graph mode
+  // only activates — when there's real graph data to show; the list stays
+  // the permanent fallback, same pattern as renderMissionFromFlow above it.
+  const g=missionGraphData(mid);
+  const hasGraph=g.stepCount>0;
+  const mode=hasGraph?(state.missionView||"graph"):"list";
+  const toggle=hasGraph?`<div class="viewtoggle">
+      <button class="vtbtn ${mode==='list'?'on':''}" data-act="missionview" data-arg="list">list</button>
+      <button class="vtbtn ${mode==='graph'?'on':''}" data-act="missionview" data-arg="graph">graph</button>
+    </div>`:'';
+  const body=(mode==='graph')
+    ? `<div class="track"><div class="lbl">task/step graph · ${g.stepCount} step${g.stepCount===1?'':'s'} across ${g.taskCount} task${g.taskCount===1?'':'s'}</div>${renderGraph(g.nodes,g.edges,{emptyMessage:'no steps scheduled yet'})}</div>`
+    : `<div class="track"><div class="lbl">sprints · run › qa › gate › ship</div>${rows}</div>`;
   $("stage").innerHTML=`<div class="sub"><h2>mission · ${esc(mid)} ${missionBadge(mstat)}</h2>
     <div class="mgoal">${total} sprint${total===1?'':'s'} · ${done} complete</div>
     <div class="burn"><div class="burnbar"><span style="width:${pct}%"></span></div><div class="burnlbl">${done}/${total} sprints complete · ${pct}%</div>${closedWarn}</div>
-    <div class="track"><div class="lbl">sprints · run › qa › gate › ship</div>${rows}</div></div>`;
+    ${toggle}${body}</div>`;
 }
 // Legacy flow-derived view — kept for missions with no durable sprint plan
 // (the static demo's flow-only "demo" mission, ad-hoc dispatches).
@@ -2568,6 +2830,8 @@ const ACTIONS={
   labrun:a=>drillLabRun(a),
   // (#1286) The machine memory lens.
   machinemem:()=>goMachineMem(),
+  // (#1230 Packet 6) mission-detail list/graph view toggle.
+  missionview:a=>{ state.missionView=a; render(); },
 };
 // (#1090) Shared dispatch for the delegated drill-nav — invoked by BOTH the
 // click handler and the keyboard handler below, so cards are mouse- AND
@@ -3032,6 +3296,7 @@ function applyLive(){
   }
   DATA=flowToRenderModel(RAW);
   recompute();
+  updateLiveStepOverlay();
   absorbNewFilterValues();
   if(state.follow)state.t=tMax;
   const sig=stageSig();
@@ -3041,8 +3306,48 @@ function applyLive(){
   // header + brief (and the prompt's scroll/open) survive. Then refresh the
   // side readouts (selected event, log, meta, transport).
   if(state.level==="subsystem")refreshSubsystem();
+  // (#1230 Packet 6) stageSig() returns a constant "mission" string for this
+  // level (no structural signature — nothing there names Task/Step graphs
+  // yet), so a live tick always takes THIS branch for the mission graph —
+  // flip node status attributes in place rather than rebuilding the SVG
+  // (which would lose scroll position on a wide graph, same reasoning as
+  // refreshSubsystem() above).
+  if(state.level==="mission")refreshMissionGraphLive();
   if(state.follow){ const n=newest(scopedFiltered()); state.selected=n?n._id:null; }
   renderDetail();renderLog();renderMeta();syncTransport();
+}
+// (#1230 Packet 6) Scan the live window for step-lifecycle records and keep
+// the freshest status per step id. `step_lifecycle_record` (scheduler.rs)
+// stamps NO mission_id/sprint_id — only `handle` (the step id) — so this
+// overlay is a flat step-id -> status map, not mission-scoped; the mapping
+// happens on read (missionGraphData only looks up ids it already knows about).
+function actionToStepStatus(action){
+  if(action==="step start")return "running";
+  if(action==="step complete")return "complete";
+  if(action==="step error")return "error";
+  return null;
+}
+function updateLiveStepOverlay(){
+  RAW.forEach(r=>{
+    if(typeof r.action!=="string"||!r.handle)return;
+    const st=actionToStepStatus(r.action);
+    if(!st)return;
+    const ts=T(r.ts);
+    const cur=LIVE_STEP_STATUS[r.handle];
+    if(!cur||ts>=cur.ts) LIVE_STEP_STATUS[r.handle]={status:st, ts};
+  });
+}
+// Flip already-rendered graph nodes' `data-status` in place — no DOM
+// rebuild, so a long dispatch doesn't reset the operator's scroll position
+// on a wide graph every ~1s tick. A no-op when the graph isn't the current
+// view (list mode, or a mission with no Task/Step graph at all).
+function refreshMissionGraphLive(){
+  const svg=document.querySelector(".dgraph");
+  if(!svg)return;
+  Object.keys(LIVE_STEP_STATUS).forEach(id=>{
+    const el=svg.querySelector('.gnode[data-step-id="'+id.replace(/["\\]/g,'\\$&')+'"]');
+    if(el) el.setAttribute("data-status", LIVE_STEP_STATUS[id].status);
+  });
 }
 function startLiveTail(date){
   if(typeof EventSource==="undefined")return;
