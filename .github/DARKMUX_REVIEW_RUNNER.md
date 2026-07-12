@@ -51,6 +51,13 @@ comment launches it — still maintainer-only.
 
 2. **Prerequisites on the laptop** (the runner shells out to these):
    - `darkmux` on PATH (`cargo install --path .` from this repo, or `brew install darkmux`).
+   - A **Rust toolchain** (`cargo`) — the workflow builds the reference `--bundler`
+     plugin (`darkmux-bundler-rust`, #1319) from the trusted `main` checkout on
+     every run, since darkmux's own source is Rust and the built-in bundler is
+     TypeScript-only. If your runner setup only ever installed the `darkmux`
+     binary via `brew` (no local toolchain), install one (`rustup` or `brew
+     install rust`) — this is the same toolchain `cargo install --path .` above
+     already needs if you built `darkmux` from source.
    - The `darkmux-runtime` Docker image present (Docker running; `darkmux` pulls/uses
      `darkmux-runtime:latest`).
    - A **`review-deep` crew** in the runner's `~/.darkmux/profiles.json`, naming

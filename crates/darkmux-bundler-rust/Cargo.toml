@@ -1,0 +1,27 @@
+[package]
+name = "darkmux-bundler-rust"
+version = "1.18.5"
+edition = "2021"
+description = "Reference --bundler plugin: a Rust-source-aware bundler for darkmux's external bundler contract (#1319)"
+license = "MIT"
+homepage = "https://darkmux.com"
+repository = "https://github.com/kstrat2001/darkmux"
+authors = ["Kain Osterholt"]
+rust-version = "1.80"
+
+[[bin]]
+name = "darkmux-bundler-rust"
+path = "src/main.rs"
+
+[dependencies]
+# Reuses the tested, language-agnostic unified-diff parser and the frozen
+# Bundle/BundleSet JSON contract types — no reason to reimplement either.
+# Everything Rust-syntax-aware (the function scanner, the call-site
+# extractor) is this crate's own, new code.
+darkmux-lab = { path = "../darkmux-lab" }
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+tempfile = "3.10"
