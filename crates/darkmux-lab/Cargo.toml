@@ -1,6 +1,6 @@
 [package]
 name = "darkmux-lab"
-version = "1.18.4"
+version = "1.18.5"
 edition = "2021"
 description = "darkmux lab — workload harness, manifest/provider registry, built-in providers"
 license = "MIT"
