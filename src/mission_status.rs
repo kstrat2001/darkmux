@@ -288,6 +288,7 @@ mod tests {
             started_ts: None,
             completed_ts: None,
             abandoned_ts: None,
+            task_ids: Vec::new(),
         }
     }
 

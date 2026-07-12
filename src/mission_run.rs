@@ -267,13 +267,20 @@ fn conventions_branch(
 
 /// Choose which sprint to run. Explicit `--sprint` wins (validated to belong
 /// to the mission and not be terminal). Otherwise auto-select the single
-/// ready sprint (`depends_on` empty + `Planned`); 0 or >1 is ambiguous and
-/// bails with guidance rather than guessing — the operator stays in the loop.
+/// ready sprint — `Planned` AND every `depends_on` entry resolves to a
+/// `Complete` sprint (`crew::scheduler::is_ready` via the `SprintNode`
+/// adapter, #1230 Packet 2 — replaces the historical flat
+/// `depends_on.is_empty()` "is this a root" filter, which only ever
+/// auto-selected sprints with NO dependencies at all and never actually
+/// checked whether a sprint's dependencies had been satisfied). 0 or >1
+/// ready is ambiguous and bails with guidance rather than guessing — the
+/// operator stays in the loop.
 fn select_sprint(
     sprints: &[crew::types::Sprint],
     mission_id: &str,
     explicit: Option<&str>,
 ) -> Result<crew::types::Sprint> {
+    use crew::scheduler::{is_ready, SprintNode};
     use crew::types::SprintStatus;
 
     if let Some(id) = explicit {
@@ -293,10 +300,17 @@ fn select_sprint(
         return Ok(s.clone());
     }
 
+    // `by_id` covers every loaded sprint (not just this mission's) since
+    // `depends_on` cross-mission references are unusual but not invalid
+    // (see `lifecycle::add_sprint_to_mission`'s own doc comment).
+    let nodes: Vec<SprintNode> = sprints.iter().map(SprintNode).collect();
+    let by_id: std::collections::BTreeMap<String, &SprintNode> =
+        nodes.iter().map(|n| (n.0.id.clone(), n)).collect();
+
     let ready: Vec<&crew::types::Sprint> = sprints
         .iter()
-        .filter(|s| s.mission_id == mission_id && s.depends_on.is_empty())
-        .filter(|s| matches!(s.status, SprintStatus::Planned))
+        .filter(|s| s.mission_id == mission_id)
+        .filter(|s| is_ready(&SprintNode(s), &by_id))
         .collect();
 
     match ready.as_slice() {
@@ -3494,6 +3508,7 @@ mod tests {
             started_ts: None,
             completed_ts: None,
             abandoned_ts: None,
+            task_ids: Vec::new(),
         }
     }
 
@@ -3539,6 +3554,35 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("2 ready sprints"), "{msg}");
         assert!(msg.contains("--sprint"), "{msg}");
+    }
+
+    /// (#1230 Packet 2) The actual fix this packet ships for
+    /// `select_sprint`: a sprint whose sole dependency has already
+    /// completed is now auto-selected. Under the OLD flat
+    /// `depends_on.is_empty()` filter this sprint would NEVER have been
+    /// selectable except via explicit `--sprint` — it has a non-empty
+    /// `depends_on`, so the old filter excluded it unconditionally
+    /// regardless of whether that dependency was satisfied.
+    #[test]
+    fn select_sprint_auto_picks_sprint_whose_dependency_is_complete() {
+        let sprints = vec![
+            sprint("s1", "m1", &[], SprintStatus::Complete),
+            sprint("s2", "m1", &["s1"], SprintStatus::Planned),
+        ];
+        let chosen = select_sprint(&sprints, "m1", None).unwrap();
+        assert_eq!(chosen.id, "s2", "s2's only dependency (s1) is Complete — it's ready");
+    }
+
+    /// Companion negative case: same shape, but the dependency is only
+    /// `Running` (not yet `Complete`) — s2 must NOT be selected.
+    #[test]
+    fn select_sprint_auto_excludes_sprint_whose_dependency_is_still_running() {
+        let sprints = vec![
+            sprint("s1", "m1", &[], SprintStatus::Running),
+            sprint("s2", "m1", &["s1"], SprintStatus::Planned),
+        ];
+        let err = select_sprint(&sprints, "m1", None).unwrap_err();
+        assert!(err.to_string().contains("no ready sprint"), "{err}");
     }
 
     #[test]

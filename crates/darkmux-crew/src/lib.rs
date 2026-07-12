@@ -25,6 +25,13 @@ pub mod lifecycle;
 pub mod loader;
 pub mod pins;
 pub mod select;
+// (#1230 Packet 2) Generic dependency-graph scheduler over `Step`/`Sprint`
+// — see the module doc for the DependencyNode/is_ready/reachable/
+// run_step_graph shape.
+pub mod scheduler;
 pub mod single_shot;
+// (#1230 Packet 2) Step-kind registry — the execution contract
+// `scheduler::run_step_graph` dispatches through.
+pub mod step_kinds;
 pub mod telemetry_sampler;
 pub mod types;
