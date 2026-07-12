@@ -210,7 +210,10 @@ pub fn new_side_index(diff: &str) -> HashMap<String, HashMap<String, Vec<u32>>> 
 /// quote as-is first (a line whose *content* legitimately starts with `-`/`+` —
 /// a markdown bullet, a diff snippet in docs — is stored with that char intact),
 /// then with one leading `+`/`-`/space stripped (a model that left the diff
-/// marker on). First non-empty line of a multi-line quote; trimmed match.
+/// marker on). First non-empty line of a multi-line quote; trimmed match. If the
+/// exact whole-line match fails, falls back to a substring match (the funnel
+/// stores a sub-expression span, not the whole line) — but only when exactly one
+/// new-side line contains it, so it still never guesses between candidates.
 pub fn resolve_anchor(
     path: Option<&str>,
     anchor: Option<&str>,
@@ -235,6 +238,36 @@ pub fn resolve_anchor(
             if hits.len() == 1 {
                 return Some(hits[0]);
             }
+        }
+    }
+    // (#1299) Fragment fallback (the mis-anchor half; dedup half shipped 1.18.1).
+    // The review funnel stores a backtick SPAN as the anchor
+    // (`extract_new_side_anchor` in the lab crate) — frequently a sub-expression
+    // of a changed line, not the whole line — so it matched the diff by SUBSTRING
+    // at extraction time but the whole-line lookup above misses it, and the
+    // finding wrongly falls to the general section. Recover symmetrically: find
+    // the new-side line(s) whose whitespace-collapsed content CONTAINS the
+    // collapsed span; anchor only if exactly ONE distinct line matches (never
+    // guess between several). A short span is refused so a common fragment can't
+    // match broadly. This runs ONLY after the exact lookup fails: a whole-line
+    // anchor (the common single-model case) short-circuits above and never
+    // reaches here, so no existing resolution changes — only a
+    // previously-unresolvable fragment can newly resolve.
+    let needle: String = first
+        .trim()
+        .trim_start_matches(['+', '-', ' '])
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if needle.chars().count() >= 8 {
+        let mut lines: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        for (content, nums) in table {
+            if content.split_whitespace().collect::<Vec<_>>().join(" ").contains(&needle) {
+                lines.extend(nums.iter().copied());
+            }
+        }
+        if lines.len() == 1 {
+            return lines.into_iter().next();
         }
     }
     None
@@ -1871,6 +1904,32 @@ mod tests {
     #[test]
     fn resolve_multiline_skips_leading_blank_lines() {
         assert_eq!(resolve_anchor(Some("src/x.ts"), Some("\n  \nconst b = 2;"), &idx()), Some(2));
+    }
+
+    // ── #1300 fragment fallback: the funnel stores a sub-expression SPAN,
+    //    not the whole line, so the exact lookup misses. Recover via a
+    //    substring match, but only when exactly one new-side line contains it.
+
+    #[test]
+    fn resolve_span_fragment_recovers_the_unique_line() {
+        // `const b =` is a fragment of line 2's content only -> resolves to 2.
+        assert_eq!(resolve_anchor(Some("src/x.ts"), Some("const b ="), &idx()), Some(2));
+        // whole-line still resolves via the exact path (behavior unchanged).
+        assert_eq!(resolve_anchor(Some("src/x.ts"), Some("const b = 2;"), &idx()), Some(2));
+    }
+
+    #[test]
+    fn resolve_short_fragment_is_refused() {
+        // Below the 8-char floor -> no broad guessing.
+        assert_eq!(resolve_anchor(Some("src/x.ts"), Some("b = 2;"), &idx()), None);
+    }
+
+    #[test]
+    fn resolve_fragment_on_multiple_lines_stays_none() {
+        let d = "diff --git a/g.ts b/g.ts\n--- a/g.ts\n+++ b/g.ts\n@@ -1,2 +1,2 @@\n+const a = wrapValue(input);\n+const b = wrapValue(other);\n";
+        let i = new_side_index(d);
+        // `wrapValue(` is on BOTH added lines -> ambiguous -> None (never guess).
+        assert_eq!(resolve_anchor(Some("g.ts"), Some("wrapValue("), &i), None);
     }
 
     // ── extract/render: tolerant JSON extraction ──────────────────────────
