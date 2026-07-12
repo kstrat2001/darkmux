@@ -11,6 +11,15 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 
 ## [Unreleased]
 
+## [1.18.4] - 2026-07-12
+
+Two fixes surfaced by running the funnel on a private production repo.
+
+### Fixed
+
+- **config.json resolves to user scope, never a project-local shadow** (#1323) — a stray project-local `.darkmux/` (created for project-tier missions/sprints/lessons) silently flipped config resolution to Project scope under `ResolveScope::Auto`, so on a self-hosted-runner checkout **every review dispatch ran with Redis *and* the tamper-evident audit log silently disabled** — a real audit-trail hole, not a telemetry gap (diagnosed via the #1311 liveness markers: `config-resolved … redis=off audit=off`). config.json is user/machine-level (redis/audit/lms/machine_id) with no legitimate per-project variant, so both `DarkmuxConfig::load_resolved` AND the `darkmux config` CLI now `ForceUser`. A conformance test guards against regression (proven to fail under `Auto`). Same shadowing class as #1012/#1016 — the config/flow-sink resolution path they missed.
+- **The review footer no longer claims "darkmux dogfooding itself in public"** — the default tagline was posted verbatim on every review, including private repos, where it's both wrong and awkward. The default is now generic ("Advisory, not a merge gate."); darkmux's own public self-review opts the flourish back in via `--attribution`.
+
 ## [1.18.3] - 2026-07-12
 
 A one-fix patch: the review funnel's confirmed findings anchor as inline comments instead of falling into the summary's general section.
@@ -96,6 +105,7 @@ funnel, fixed same-day.
   exit paths, `source: "funnel"`) so a live PR review is visible as a running dispatch in the
   viewer's fleet and machine views (#1272, #1277).
 
+[1.18.4]: https://github.com/kstrat2001/darkmux/releases/tag/v1.18.4
 [1.18.3]: https://github.com/kstrat2001/darkmux/releases/tag/v1.18.3
 [1.18.2]: https://github.com/kstrat2001/darkmux/releases/tag/v1.18.2
 [1.18.1]: https://github.com/kstrat2001/darkmux/releases/tag/v1.18.1
