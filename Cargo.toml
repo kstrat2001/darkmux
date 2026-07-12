@@ -6,7 +6,12 @@ members = [".", "crates/darkmux-types", "crates/darkmux-flow", "crates/darkmux-p
 # darkmux-* dependencies) — the reference --bundler plugin (#1319) proves
 # the public plugin contract is sufficient on its own, which a workspace
 # member with privileged path-dependency access wouldn't actually prove.
-exclude = ["runtime", "plugins/darkmux-bundler-rust"]
+# tools/darkmux-mock-model is the same shape again: a standalone dev-only
+# tool (own [workspace] table) — a real, separately-running mock
+# chat-completions server for the mock-model dispatch harness, deliberately
+# NOT a subcommand of the main binary and NOT a path dependency of anything
+# in this workspace.
+exclude = ["runtime", "plugins/darkmux-bundler-rust", "tools/darkmux-mock-model"]
 
 [package]
 name = "darkmux"

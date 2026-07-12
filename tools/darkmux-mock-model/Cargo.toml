@@ -1,0 +1,40 @@
+# Empty [workspace] table makes this crate its own workspace root, fully
+# independent of the parent darkmux workspace — same pattern `runtime/` and
+# `plugins/darkmux-bundler-rust` already use for the same reason (see the
+# comment on those in the root Cargo.toml's `exclude` list). This is a
+# standalone dev-only tool: a real, separately-running mock chat-completions
+# server (see src/main.rs), not a subcommand of the `darkmux` binary and not
+# a path dependency of anything in the main workspace.
+[workspace]
+
+[package]
+name = "darkmux-mock-model"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+publish = false
+description = "Standalone, deterministic chat-completions mock server for exercising darkmux's real container dispatch machinery end-to-end with zero LMStudio/GPU involvement (mock-model harness, v1)."
+
+[[bin]]
+name = "darkmux-mock-model"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# Real, separately-running server + a real remote client that registers
+# mocks against it over its own HTTP admin API — httpmock's "standalone
+# mode", the same mode its own CLI binary runs (see
+# https://docs.rs/httpmock and `httpmock::standalone`). `standalone` pulls
+# in `remote` (the `MockServer::connect`/`connect_async` client), `clap`,
+# and `env_logger`. Reused, not reinvented — `runtime/`'s own test suite
+# already depends on this exact crate + version for the same "stand in for
+# LMStudio's chat-completions endpoint" purpose (in-process there; here,
+# out-of-process, on purpose — see the module doc in src/main.rs).
+httpmock = { version = "0.7", features = ["standalone"] }
+# `start_standalone_server` needs a tokio runtime (its shutdown-signal
+# handling + the warp/hyper server it wraps) — matching httpmock's own
+# feature set for its CLI binary.
+tokio = { version = "1.33", features = ["sync", "macros", "rt-multi-thread", "signal"] }

@@ -891,6 +891,7 @@ pub(crate) fn sprint_review_output_at(
         force_container: false,
         max_completion_tokens: None,
         image: None,
+        model_base_url_override: None,
     };
 
     // Emit dispatch flow record.

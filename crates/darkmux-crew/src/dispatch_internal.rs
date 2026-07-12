@@ -457,6 +457,20 @@ pub struct DockerRunConfig {
     /// `write_remote_auth_header_stdin`) — never via a file or env var. This
     /// flag carries no secret material itself.
     pub remote_needs_auth: bool,
+    /// Override the container's `--base-url` (the LMStudio-compatible
+    /// chat-completions host it dials for a LOCAL-brain dispatch — see
+    /// `runtime/src/lmstudio.rs::DEFAULT_BASE_URL`). `None` leaves the flag
+    /// omitted, so the runtime falls back to its baked-in
+    /// `http://host.docker.internal:1234/v1` default (real LMStudio on the
+    /// host). Set this to point the container at a mock chat-completions
+    /// server instead — the mock-model harness's mechanism for exercising
+    /// the real dispatch path with zero LMStudio/GPU involvement. Distinct
+    /// from `remote_chat_url`: that field marks an agentic-REMOTE (hosted
+    /// endpoint) brain and takes precedence when both are set, since
+    /// `LmStudioClient::with_chat_url` overrides request routing outright
+    /// (see `runtime/src/main.rs`'s client construction). Carries no secret
+    /// material — safe on argv/`ps`, same as `--model`.
+    pub base_url_override: Option<String>,
 }
 
 /// (#842) Build the complete `docker` command from a prepared config: the
@@ -531,6 +545,18 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
     // wrote it to `<host_out>/.prompt.txt` before this runs.
     args.push("--prompt-file".to_string());
     args.push(PROMPT_FILE_CONTAINER_PATH.to_string());
+
+    // Host-side override of the container's local-brain base URL (mock-model
+    // harness). Emitted whenever set — even alongside `remote_chat_url` below,
+    // since `--chat-url` (when present) wins request routing in the runtime's
+    // client construction (`with_chat_url` overrides `base_url` outright), so
+    // there's no ordering hazard in also passing `--base-url` for the
+    // compactor client, which never honors `--chat-url` (see
+    // `runtime/src/main.rs`'s `compactor_client` construction).
+    if let Some(url) = &config.base_url_override {
+        args.push("--base-url".to_string());
+        args.push(url.clone());
+    }
 
     if config.json {
         args.push("--json".to_string());
@@ -1757,6 +1783,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             role,
             opts.profile_name.as_deref(),
             opts.config_path.as_deref(),
+            opts.model_base_url_override.is_some(),
         )
         .context(
             "model selection failed. Ensure `~/.darkmux/profiles.json` has \
@@ -2069,6 +2096,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             .and_then(|pm| pm.endpoint.as_ref())
             .map(remote_chat_url),
         remote_needs_auth,
+        base_url_override: opts.model_base_url_override.clone(),
     };
 
     // (#907) Validate the image ref before it reaches docker as a positional
@@ -3622,10 +3650,27 @@ fn preflight_result_for(status: DockerRuntimeStatus) -> Result<()> {
 /// through to `probe_loaded_model()`: routing a broken config file into an
 /// unrelated LMStudio probe just produces a second, more confusing error on
 /// top of the first. One config mistake gets ONE clear, named error.
+///
+/// `skip_lmstudio_residency`: mock-model harness escape hatch (real Docker
+/// dispatch, fake "model" — see `crates/darkmux-crew/tests/mock_dispatch_proof.rs`
+/// and `tools/darkmux-mock-model`). When `true` (set by `dispatch()` exactly
+/// when `opts.model_base_url_override` is `Some`), this function resolves
+/// the model NAME only — it skips `ensure_model_loaded_at_ctx` (a REAL `lms
+/// load` call) and the loaded-vs-selected cross-check (a REAL `lms ps`
+/// call). Without this, a dispatch pointed at a scripted mock server still
+/// tried to load the mock's made-up model id into the operator's REAL
+/// LMStudio — `lms load <unknown-id>` fell into an interactive
+/// disambiguation picker and hung forever waiting on a TTY that a
+/// non-interactive test never provides (found empirically building the
+/// mock-model harness: `resolve_dispatch_model_internal` looked I/O-free
+/// from its name and doc, but touches real LMStudio as a side effect of
+/// "just resolving a model id"). `false` everywhere else preserves
+/// existing behavior exactly.
 fn resolve_dispatch_model_internal(
     role: &crate::types::Role,
     profile_override: Option<&str>,
     config_path: Option<&str>,
+    skip_lmstudio_residency: bool,
 ) -> Result<String> {
     use crate::select::select_model;
     use darkmux_profiles::profiles::load_registry;
@@ -3712,8 +3757,10 @@ fn resolve_dispatch_model_internal(
             // (e.g. 4096 on devstral), silently truncating large inputs (a
             // pr-review diff overflows 4096 → garbage review, no error). The
             // profile *declares* the context; honor it.
-            if let Some(pm) = profile.models.iter().find(|m| m.id == id) {
-                ensure_model_loaded_at_ctx(pm)?;
+            if !skip_lmstudio_residency {
+                if let Some(pm) = profile.models.iter().find(|m| m.id == id) {
+                    ensure_model_loaded_at_ctx(pm)?;
+                }
             }
             // (#450 review note / #408) Cross-check against actual
             // LMStudio loaded models. `darkmux swap <name>` loads a
@@ -3727,7 +3774,8 @@ fn resolve_dispatch_model_internal(
             // collides). Surfacing the mismatch here makes the
             // misconfiguration operator-visible at dispatch time, not at
             // LMStudio's cryptic "model not loaded" error.
-            if let Ok(loaded_ids) = probe_loaded_model_list() {
+            if !skip_lmstudio_residency {
+                if let Ok(loaded_ids) = probe_loaded_model_list() {
                 if !loaded_ids.is_empty() && !loaded_ids.iter().any(|m| m == &id) {
                     let loaded = loaded_ids.join(", ");
                     if strict_selection_enabled() {
@@ -3761,6 +3809,7 @@ fn resolve_dispatch_model_internal(
                          loaded. Set DARKMUX_STRICT_SELECTION=1 to make this \
                          mismatch fatal instead of a warning. (#450 review note, #408)"
                     );
+                }
                 }
             }
             eprintln!(
@@ -4770,7 +4819,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = resolve_dispatch_model_internal(&role, None, pf.to_str()).unwrap_err();
+        let err = resolve_dispatch_model_internal(&role, None, pf.to_str(), false).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("not loadable"),
@@ -4857,7 +4906,7 @@ mod tests {
         .unwrap();
 
         let err =
-            resolve_dispatch_model_internal(&quarantine_test_role(), Some("review"), pf.to_str())
+            resolve_dispatch_model_internal(&quarantine_test_role(), Some("review"), pf.to_str(), false)
                 .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("quarantined"), "got: {msg}");
@@ -4886,7 +4935,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = resolve_dispatch_model_internal(&quarantine_test_role(), None, pf.to_str())
+        let err = resolve_dispatch_model_internal(&quarantine_test_role(), None, pf.to_str(), false)
             .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("quarantined"), "got: {msg}");
@@ -5039,6 +5088,7 @@ mod tests {
             cache_dir: PathBuf::from("/home/op/.darkmux/cache"),
             remote_chat_url: None,
             remote_needs_auth: false,
+            base_url_override: None,
         };
 
         let argv = build_docker_run_argv(&config);
@@ -5174,6 +5224,7 @@ mod tests {
             cache_dir: PathBuf::from("/tmp/cache"),
             remote_chat_url: None,
             remote_needs_auth: false,
+            base_url_override: None,
         };
 
         let argv = build_docker_run_argv(&config);
@@ -5255,6 +5306,7 @@ mod tests {
             cache_dir: PathBuf::from("/tmp/cache"),
             remote_chat_url: None,
             remote_needs_auth: false,
+            base_url_override: None,
         };
 
         let argv = build_docker_run_argv(&config);
@@ -5299,6 +5351,7 @@ mod tests {
             cache_dir: PathBuf::from("/tmp/cache"),
             remote_chat_url: None,
             remote_needs_auth: false,
+            base_url_override: None,
         }
     }
 
@@ -5532,6 +5585,7 @@ mod tests {
             cache_dir: PathBuf::from("/tmp/cache"),
             remote_chat_url: None,
             remote_needs_auth: false,
+            base_url_override: None,
         };
         let argv = build_docker_run_argv(&config);
         let cmd = docker_command_from_argv(&argv);

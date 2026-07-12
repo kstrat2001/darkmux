@@ -363,6 +363,21 @@ pub struct DispatchOpts {
     /// and coreutils `timeout` (debian/ubuntu-family ship them; bare-alpine
     /// images need them added — Slice 2). Ignored on the openclaw runtime.
     pub image: Option<String>,
+    /// Mock-model harness: override the container's `--base-url` — the
+    /// LMStudio-compatible chat-completions host the runtime dials for a
+    /// LOCAL-brain dispatch. `None` (the default) leaves the runtime's
+    /// baked-in `http://host.docker.internal:1234/v1` default in place
+    /// (real LMStudio on the host). Point this at a mock chat-completions
+    /// server (e.g. `http://host.docker.internal:<port>/v1`) to run the
+    /// real container-based dispatch machinery — real `docker run`, real
+    /// agent loop, real flow records — against a scripted/deterministic
+    /// fake response instead of a real model, with zero LMStudio/GPU
+    /// involvement. Ignored on the openclaw runtime (which has no
+    /// equivalent flag). The mock server itself is the standalone
+    /// `tools/darkmux-mock-model` binary — a genuinely separate process
+    /// reached over a real socket, not a function-call fake — see its
+    /// crate doc and `crates/darkmux-crew/tests/mock_dispatch_proof.rs`.
+    pub model_base_url_override: Option<String>,
 }
 
 /// Host-side compaction config passthrough to the internal runtime

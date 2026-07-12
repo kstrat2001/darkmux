@@ -586,6 +586,7 @@ pub fn run(
         force_container: false,
         max_completion_tokens: None,
         image: image.map(String::from),
+        model_base_url_override: None,
     };
     let result = fleet::dispatch_routed(opts)?;
     eprintln!(

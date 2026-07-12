@@ -1039,6 +1039,7 @@ fn dispatch_task(
         force_container: false,
         max_completion_tokens: None,
         image: image.map(str::to_string),
+        model_base_url_override: None,
     };
     let result = dispatch(opts).context("internal-runtime dispatch via tool-bench")?;
     Ok((
