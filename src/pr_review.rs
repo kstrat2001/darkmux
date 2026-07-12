@@ -709,15 +709,24 @@ fn dispatch_provenance(env: &FunnelEnvelope) -> String {
 }
 
 /// (#1298) Distinct seat model names filtered by remote-ness, first-seen order
-/// preserved. (#1300) The name comes from `member.model` (the dispatched model
-/// id) today; when #1300 lands — capturing the endpoint's SERVED model into
-/// the member record — prefer that field here (a one-line swap of `name`).
-fn unique_seat_models(env: &FunnelEnvelope, remote: bool) -> Vec<&str> {
-    let mut out: Vec<&str> = Vec::new();
+/// preserved. (#1300) An aliased deployment (`model` = the requested/declared
+/// id) whose response reported a DIFFERENT `served_model` surfaces BOTH —
+/// "requested X, served Y" — never silently hiding the alias behind the
+/// deployment name. Agreeing or absent, `model` alone is shown (the common,
+/// unremarkable case).
+fn unique_seat_models(env: &FunnelEnvelope, remote: bool) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
     for m in env.members.iter().filter(|m| m.remote == remote) {
-        // (#1300) prefer the served model over `m.model` when it lands.
-        let name = m.model.as_str();
-        if !name.is_empty() && !out.contains(&name) {
+        if m.model.is_empty() {
+            continue;
+        }
+        let name = match m.served_model.as_deref() {
+            Some(served) if served != m.model && !served.is_empty() => {
+                format!("requested {}, served {served}", m.model)
+            }
+            _ => m.model.clone(),
+        };
+        if !out.contains(&name) {
             out.push(name);
         }
     }
@@ -2714,6 +2723,38 @@ mod tests {
         ]);
         assert!(!body.contains("pr-reviewer"), "the stale role name must be gone: {body}");
         assert!(body.contains("review funnel"), "names the crew/funnel instead: {body}");
+    }
+
+    // ─── #1300: served model surfaces an aliased deployment, never hides it ─
+
+    #[test]
+    fn footer_aliased_deployment_names_both_requested_and_served() {
+        let mut judge = judge_member("gpt-4o", true);
+        judge.served_model = Some("gpt-4o-2026-08-01".to_string());
+        let body = footer_body_for(vec![probe_member("gpt-4o", true), judge]);
+        assert!(
+            body.contains("requested gpt-4o, served gpt-4o-2026-08-01"),
+            "an aliased deployment must name both, never hide the alias: {body}"
+        );
+    }
+
+    #[test]
+    fn footer_served_model_matching_requested_shows_just_the_name() {
+        let mut judge = judge_member("gpt-4o", true);
+        judge.served_model = Some("gpt-4o".to_string());
+        let body = footer_body_for(vec![probe_member("gpt-4o", true), judge]);
+        assert!(!body.contains("requested"), "agreement is unremarkable, no aliasing callout: {body}");
+        assert!(body.contains("gpt-4o"), "{body}");
+    }
+
+    #[test]
+    fn footer_served_model_absent_shows_just_the_requested_name() {
+        // A local seat, or a remote endpoint whose response omitted `model` —
+        // absence is never treated as "matches", but it's also never treated
+        // as "differs"; just fall back to the requested id, unremarkably.
+        let body = footer_body_for(vec![probe_member("gpt-4o", true), judge_member("gpt-4o", true)]);
+        assert!(!body.contains("requested"), "no served_model captured -> no aliasing callout: {body}");
+        assert!(body.contains("gpt-4o"), "{body}");
     }
 
     // ─── synthesize_funnel: coverage sweep (#1222 Phase B packet 5 QA) ────

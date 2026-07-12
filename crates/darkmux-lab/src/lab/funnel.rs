@@ -322,6 +322,16 @@ pub struct MemberRecord {
     /// — never credentials, never the full deployment path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// (#1300) The model the endpoint's response body actually reported it
+    /// served (`SingleShotReply.model`, the OpenAI-compatible completion's
+    /// top-level `model` field) — DISTINCT from `model` above, which is the
+    /// requested/declared identifier (a deployment name can alias to a
+    /// different underlying model; for local seats `lms ps` is ground truth
+    /// and this is always `None`). `None` when the response omitted the
+    /// field, not when they match — provenance surfaces compare the two and
+    /// only call out a mismatch, never assume aliasing from absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_model: Option<String>,
 }
 
 /// One pipeline step's in/out counts + wall time — the issue #1230 bridge:
@@ -2202,8 +2212,9 @@ fn probe_one_draw(
     user: &str,
     max_tokens: u32,
     endpoint: Option<&ModelEndpoint>,
-) -> Result<(Option<String>, u64)> {
+) -> Result<(Option<String>, u64, Option<String>)> {
     let mut tokens = 0u64;
+    let mut served: Option<String> = None;
     for _ in 0..2 {
         let call = ChatCall {
             model,
@@ -2215,12 +2226,13 @@ fn probe_one_draw(
         };
         let reply = chat(&call)?;
         tokens += reply.total_tokens.unwrap_or(0);
+        served = reply.model.clone();
         let trimmed = reply.content.trim();
         if !trimmed.is_empty() {
-            return Ok((Some(trimmed.to_string()), tokens));
+            return Ok((Some(trimmed.to_string()), tokens, served));
         }
     }
-    Ok((None, tokens))
+    Ok((None, tokens, served))
 }
 
 /// One probe seat's dispatch — a `funnel.step` pair (`step_id =
@@ -2269,6 +2281,12 @@ fn dispatch_probe_staffing(
     let t0 = Instant::now();
     let mut draws = 0u32;
     let mut tokens = 0u64;
+    // (#1300) The FIRST served model reported by any draw's response —
+    // remote-only (a local seat's replies never carry `model`); one
+    // deployment aliasing to one underlying model for the whole run is the
+    // expected shape, so first-seen is representative without needing to
+    // detect drift across draws.
+    let mut served_model: Option<String> = None;
     let flags_before = flags.len();
     'staffing: for bundle in &selected {
         let user = probe_user_message(inputs.probe_system, bundle);
@@ -2292,8 +2310,11 @@ fn dispatch_probe_staffing(
                 // real, so it lands in the member total AND the remote bucket
                 // whether or not a flag was produced. Only a non-empty content
                 // becomes a flag.
-                Ok((content, tok)) => {
+                Ok((content, tok, served)) => {
                     tokens += tok;
+                    if served_model.is_none() {
+                        served_model = served;
+                    }
                     if endpoint.is_some() {
                         bucket.spend(tok, 1);
                     }
@@ -2348,6 +2369,7 @@ fn dispatch_probe_staffing(
         total_tokens: tokens,
         remote: endpoint.is_some(),
         endpoint: endpoint_host,
+        served_model,
     })
 }
 
@@ -2411,7 +2433,7 @@ fn run_judge_pass(
     max_tokens: u32,
     endpoint: Option<&ModelEndpoint>,
     chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
-) -> (JudgeRecord, u64) {
+) -> (JudgeRecord, u64, Option<String>) {
     let t0 = Instant::now();
     let call = ChatCall {
         model,
@@ -2425,10 +2447,15 @@ fn run_judge_pass(
         Ok(reply) => {
             let seconds = t0.elapsed().as_secs_f64();
             let tokens = reply.total_tokens.unwrap_or(0);
+            // (#1300) Captured regardless of parse outcome — an unparsed
+            // reply still came from a real served model, and the caller
+            // needs that provenance too.
+            let served = reply.model.clone();
             match parse_judge_ruling(&reply.content) {
                 Some((ruling, decisive_evidence, note_for_author)) => (
                     JudgeRecord { ruling, decisive_evidence, note_for_author, pass, seconds },
                     tokens,
+                    served,
                 ),
                 None => (
                     JudgeRecord {
@@ -2439,12 +2466,14 @@ fn run_judge_pass(
                         seconds,
                     },
                     tokens,
+                    served,
                 ),
             }
         }
         // A dispatch-level failure is recorded as `Error`, not propagated —
         // one bad judge call must not abort the whole docket (the funnel's
-        // job is to be loud PER-FLAG, not to be fragile).
+        // job is to be loud PER-FLAG, not to be fragile). No reply body, so
+        // no served model to report.
         Err(_) => (
             JudgeRecord {
                 ruling: FunnelRuling::Error,
@@ -2454,6 +2483,7 @@ fn run_judge_pass(
                 seconds: t0.elapsed().as_secs_f64(),
             },
             0,
+            None,
         ),
     }
 }
@@ -2474,6 +2504,10 @@ struct PassOutcome {
     /// with any such failure marks the run degraded (honest-fail — the
     /// affected flag carries no real adjudication); see `finish_funnel`.
     dispatch_error: bool,
+    /// (#1300) The served model reported by this pass's response, if any
+    /// (`None` on a dispatch error or a budget-denied call — no response
+    /// body to report).
+    served_model: Option<String>,
 }
 
 /// One judge pass, retried ONCE if the reply was [`FunnelRuling::Unparsed`]
@@ -2493,9 +2527,9 @@ fn judge_pass_with_retry(
     chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
 ) -> PassOutcome {
     let t0 = Instant::now();
-    let (r1, t1) = run_judge_pass(pass, model, system, prompt, max_tokens, endpoint, chat);
+    let (r1, t1, served1) = run_judge_pass(pass, model, system, prompt, max_tokens, endpoint, chat);
     if r1.ruling == FunnelRuling::Unparsed {
-        let (r2, t2) = run_judge_pass(pass, model, system, prompt, max_tokens, endpoint, chat);
+        let (r2, t2, served2) = run_judge_pass(pass, model, system, prompt, max_tokens, endpoint, chat);
         // `run_judge_pass` only ever yields `FunnelRuling::Error` from its
         // dispatch-`Err` arm (a parse miss is `Unparsed`, and the budget-denied
         // record is built by the caller, never here) — so the surviving
@@ -2507,6 +2541,7 @@ fn judge_pass_with_retry(
             wall_ms: t0.elapsed().as_millis() as u64,
             calls: 2,
             dispatch_error,
+            served_model: served2.or(served1),
         }
     } else {
         let dispatch_error = r1.ruling == FunnelRuling::Error;
@@ -2516,6 +2551,7 @@ fn judge_pass_with_retry(
             wall_ms: t0.elapsed().as_millis() as u64,
             calls: 1,
             dispatch_error,
+            served_model: served1,
         }
     }
 }
@@ -2538,6 +2574,10 @@ struct JudgeOutcome {
     /// (#1260) `true` iff either pass hit a dispatch-level `Err` (see
     /// [`PassOutcome::dispatch_error`]) — a REMOTE judge's honest-fail signal.
     dispatch_error: bool,
+    /// (#1300) The served model, taken from pass-1 (falling back to a later
+    /// pass if pass-1 had none) — one seat means one served identity for the
+    /// whole flag; pass-1 always runs, so it's the representative source.
+    served_model: Option<String>,
 }
 
 /// (#1260) The judge phase's two remote token buckets — pass-1 and pass-2
@@ -2564,6 +2604,21 @@ fn budget_exhausted_record(pass: u8) -> JudgeRecord {
     }
 }
 
+/// (#1300) The bucket-denial `PassOutcome` — no dispatch happened, so no
+/// served model.
+fn budget_exhausted_outcome(pass: u8) -> PassOutcome {
+    PassOutcome {
+        record: budget_exhausted_record(pass),
+        tokens: 0,
+        wall_ms: 0,
+        calls: 0,
+        // A budget denial is NOT a dispatch failure — it's metered
+        // separately (the judge-budget degeneracy in `finish_funnel`).
+        dispatch_error: false,
+        served_model: None,
+    }
+}
+
 /// One judge pass with the [`JudgeBudgets`] gate applied (#1260): a REMOTE
 /// judge's `bucket` is consulted first — a denied `admit()` skips the
 /// dispatch entirely and yields a named `budget_exhausted_record` (Error, so
@@ -2584,16 +2639,7 @@ fn run_budgeted_pass(
     match bucket {
         Some(b) => {
             if !b.admit() {
-                return PassOutcome {
-                    record: budget_exhausted_record(pass),
-                    tokens: 0,
-                    wall_ms: 0,
-                    calls: 0,
-                    // A budget denial is NOT a dispatch failure — it's metered
-                    // separately (the judge-budget degeneracy in
-                    // `finish_funnel`).
-                    dispatch_error: false,
-                };
+                return budget_exhausted_outcome(pass);
             }
             let o = judge_pass_with_retry(pass, model, system, prompt, max_tokens, endpoint, chat);
             b.spend(o.tokens, o.calls);
@@ -2663,6 +2709,10 @@ fn judge_one_flag_with_passes(
         endpoint,
         chat,
     );
+    // (#1300) Cloned rather than moved out of `p1` here — every return site
+    // below still needs `p1.record`/`p1.tokens`/etc, and the consensus-loop
+    // path may still overwrite this with a later pass's value.
+    let mut served_model = p1.served_model.clone();
 
     // A non-confirmed pass-1 short-circuits identically for EVERY `passes`.
     if p1.record.ruling != FunnelRuling::Confirmed {
@@ -2679,6 +2729,7 @@ fn judge_one_flag_with_passes(
             pass2_ms: 0,
             calls: p1.calls,
             dispatch_error: p1.dispatch_error,
+            served_model,
             pass1: p1.record,
             pass2: None,
         };
@@ -2694,6 +2745,7 @@ fn judge_one_flag_with_passes(
             pass2_ms: 0,
             calls: p1.calls,
             dispatch_error: p1.dispatch_error,
+            served_model,
             pass1: p1.record,
             pass2: None,
         };
@@ -2723,6 +2775,9 @@ fn judge_one_flag_with_passes(
         calls += pn.calls;
         later_ms += pn.wall_ms;
         dispatch_error |= pn.dispatch_error;
+        if served_model.is_none() {
+            served_model = pn.served_model.clone();
+        }
         let confirmed = pn.record.ruling == FunnelRuling::Confirmed;
         last = Some(pn.record);
         if !confirmed {
@@ -2734,6 +2789,7 @@ fn judge_one_flag_with_passes(
     }
     let tier = if demoted { Tier::NeedsCheck } else { Tier::Confirmed };
     JudgeOutcome {
+        served_model,
         pass1: p1.record,
         pass2: last,
         tier,
@@ -2777,7 +2833,7 @@ fn run_verify_pass(
     max_tokens: u32,
     endpoint: Option<&ModelEndpoint>,
     chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
-) -> (VerifyRecord, u64) {
+) -> (VerifyRecord, u64, Option<String>) {
     let t0 = Instant::now();
     let call = ChatCall {
         model,
@@ -2791,10 +2847,12 @@ fn run_verify_pass(
         Ok(reply) => {
             let seconds = t0.elapsed().as_secs_f64();
             let tokens = reply.total_tokens.unwrap_or(0);
+            let served = reply.model.clone();
             match parse_verify_ruling(&reply.content) {
                 Some((ruling, decisive_evidence, note_for_author)) => (
                     VerifyRecord { ruling, decisive_evidence, note_for_author, seconds, model: model.to_string() },
                     tokens,
+                    served,
                 ),
                 None => (
                     VerifyRecord {
@@ -2805,6 +2863,7 @@ fn run_verify_pass(
                         model: model.to_string(),
                     },
                     tokens,
+                    served,
                 ),
             }
         }
@@ -2817,13 +2876,15 @@ fn run_verify_pass(
                 model: model.to_string(),
             },
             0,
+            None,
         ),
     }
 }
 
 /// One verify adjudication, retried ONCE on [`VerifyRuling::Unparsed`] —
 /// the same retry discipline as [`judge_pass_with_retry`]. Returns the
-/// surviving record plus token/call accounting for BOTH attempts.
+/// surviving record plus token/call accounting for BOTH attempts, plus
+/// (#1300) the served model reported by whichever attempt survives.
 fn verify_pass_with_retry(
     model: &str,
     system: &str,
@@ -2831,13 +2892,13 @@ fn verify_pass_with_retry(
     max_tokens: u32,
     endpoint: Option<&ModelEndpoint>,
     chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
-) -> (VerifyRecord, u64, u32) {
-    let (r1, t1) = run_verify_pass(model, system, prompt, max_tokens, endpoint, chat);
+) -> (VerifyRecord, u64, u32, Option<String>) {
+    let (r1, t1, served1) = run_verify_pass(model, system, prompt, max_tokens, endpoint, chat);
     if r1.ruling == VerifyRuling::Unparsed {
-        let (r2, t2) = run_verify_pass(model, system, prompt, max_tokens, endpoint, chat);
-        (r2, t1 + t2, 2)
+        let (r2, t2, served2) = run_verify_pass(model, system, prompt, max_tokens, endpoint, chat);
+        (r2, t1 + t2, 2, served2.or(served1))
     } else {
-        (r1, t1, 1)
+        (r1, t1, 1, served1)
     }
 }
 
@@ -2897,11 +2958,13 @@ fn run_verify_stage(
     let t0 = Instant::now();
     let mut calls = 0u32;
     let mut tokens = 0u64;
+    // (#1300) First-seen served model across the stage's adjudications.
+    let mut served_model: Option<String> = None;
     for j in judged.iter_mut().filter(|j| j.tier == Tier::Confirmed) {
         // Remote gate BEFORE dispatch — a skipped adjudication is recorded
         // per-flag (ruling Error, reason named); the whole run then goes
         // degraded below (verify is load-bearing, operator decision).
-        let (record, spent, made) = if endpoint.is_some() && !bucket.admit() {
+        let (record, spent, made, served) = if endpoint.is_some() && !bucket.admit() {
             (
                 VerifyRecord {
                     ruling: VerifyRuling::Error,
@@ -2913,6 +2976,7 @@ fn run_verify_stage(
                 },
                 0u64,
                 0u32,
+                None,
             )
         } else {
             let bundle = bundles.iter().find(|b| b.id == j.flag.bundle_id);
@@ -2935,6 +2999,9 @@ fn run_verify_stage(
         };
         tokens += spent;
         calls += made;
+        if served_model.is_none() {
+            served_model = served;
+        }
         guard.ruling(json!({
             "bundle_id": j.flag.bundle_id, "stage": "verify",
             "ruling": record.ruling, "seconds": record.seconds,
@@ -2958,6 +3025,7 @@ fn run_verify_stage(
         total_tokens: tokens,
         remote: endpoint.is_some(),
         endpoint: endpoint_host.clone(),
+        served_model,
     });
     env.steps.push(StepRecord {
         step_id: "verify".to_string(),
@@ -3071,6 +3139,9 @@ fn finish_funnel(
     // `Err` surviving bounded retries) — the honest-fail count a REMOTE
     // judge degrades the run on.
     let mut judge_dispatch_errors = 0usize;
+    // (#1300) First-seen served model across every flag's judge outcome —
+    // one judge seat, one served identity for the whole run.
+    let mut judge_served_model: Option<String> = None;
     for flag in &deduped {
         let bundle = bundles.iter().find(|b| b.id == flag.bundle_id);
         let code = bundle.map(|b| b.code.as_str()).unwrap_or_default();
@@ -3090,6 +3161,9 @@ fn finish_funnel(
         judge_calls += outcome.calls;
         if outcome.dispatch_error {
             judge_dispatch_errors += 1;
+        }
+        if judge_served_model.is_none() {
+            judge_served_model = outcome.served_model.clone();
         }
         pass1_ms += outcome.pass1_ms;
         pass2_ms += outcome.pass2_ms;
@@ -3155,6 +3229,7 @@ fn finish_funnel(
         total_tokens: judge_tokens,
         remote: judge.pm.is_remote(),
         endpoint: seat_endpoint_host(&judge.pm),
+        served_model: judge_served_model,
     });
     env.steps.push(StepRecord {
         step_id: "judge-pass1".to_string(),
@@ -4333,7 +4408,7 @@ mod tests {
             calls += 1;
             Ok(reply(""))
         };
-        let (content, tokens) =
+        let (content, tokens, _served) =
             probe_one_draw(&mut chat, "m", "sys", "user", 100, None).expect("no dispatch error");
         assert!(content.is_none(), "still empty after retry -> skipped, not a flag");
         assert_eq!(calls, 2, "exactly one retry (two total attempts)");
@@ -4354,7 +4429,7 @@ mod tests {
                 Ok(reply("a real defect description"))
             }
         };
-        let (content, tokens) = probe_one_draw(&mut chat, "m", "sys", "user", 100, None).unwrap();
+        let (content, tokens, _served) = probe_one_draw(&mut chat, "m", "sys", "user", 100, None).unwrap();
         assert_eq!(content.unwrap(), "a real defect description");
         assert_eq!(calls, 2);
         // (#1260) The discarded empty attempt is still billed alongside the
@@ -6380,6 +6455,7 @@ mod tests {
                     total_tokens: 900,
                     remote: false,
                     endpoint: None,
+                    served_model: None,
                 },
                 MemberRecord {
                     model: "darkmux:judge-model".to_string(),
@@ -6389,6 +6465,7 @@ mod tests {
                     total_tokens: 600,
                     remote: false,
                     endpoint: None,
+                    served_model: None,
                 },
             ],
             steps: vec![
@@ -6642,6 +6719,76 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             !json.contains("/openai/deployments"),
             "the full deployment URL must never serialize into the envelope"
         );
+    }
+
+    /// (#1300) The endpoint's response `model` field — the SERVED model,
+    /// which can differ from the requested deployment name on an aliased
+    /// Azure deployment — is captured into `MemberRecord.served_model` for
+    /// BOTH the probe and judge seats, distinct from `model` (the requested
+    /// id, unchanged). A local seat's replies never carry `model` at all.
+    #[test]
+    fn served_model_captured_distinct_from_requested_on_probe_and_judge() {
+        let crew = crew_with(vec![
+            ("review-probe", vec![remote_staffing("cloud", "gpt-4o", 1)]),
+            ("review-judge", vec![remote_staffing("cloud-judge", "gpt-4o", 1)]),
+        ]);
+        let inputs = inputs_for(&crew, 500_000);
+        let mut cycler = RecordingCycler::new();
+        let mut chat = |call: &ChatCall| {
+            if call.model == "gpt-4o" && call.system.contains("judge") {
+                Ok(SingleShotReply {
+                    content: CONFIRM_JSON.to_string(),
+                    total_tokens: Some(10),
+                    model: Some("gpt-4o-2026-08-01".to_string()),
+                })
+            } else {
+                Ok(SingleShotReply {
+                    content: "a real defect".to_string(),
+                    total_tokens: Some(10),
+                    model: Some("gpt-4o-2026-08-01".to_string()),
+                })
+            }
+        };
+        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+
+        let probe = env.members.iter().find(|m| m.seat == "review-probe").expect("probe member");
+        assert_eq!(probe.model, "gpt-4o", "requested id is unchanged");
+        assert_eq!(
+            probe.served_model.as_deref(),
+            Some("gpt-4o-2026-08-01"),
+            "the probe's served model must be captured distinct from the requested id"
+        );
+        let judge = env.members.iter().find(|m| m.seat == "review-judge").expect("judge member");
+        assert_eq!(judge.model, "gpt-4o");
+        assert_eq!(
+            judge.served_model.as_deref(),
+            Some("gpt-4o-2026-08-01"),
+            "the judge's served model must be captured distinct from the requested id"
+        );
+    }
+
+    /// (#1300) A LOCAL seat's replies never carry a served model — `lms ps`
+    /// is ground truth for local dispatch, not the response body.
+    #[test]
+    fn served_model_absent_for_local_seats() {
+        let crew = crew_with(vec![
+            ("review-probe", vec![staffing("fast", "probe-model", 1)]),
+            ("review-judge", vec![staffing("fast", "judge-model", 1)]),
+        ]);
+        let inputs = inputs_for(&crew, 500_000);
+        let mut cycler = RecordingCycler::new();
+        let mut chat = |call: &ChatCall| {
+            if call.model == "darkmux:judge-model" {
+                Ok(reply(CONFIRM_JSON))
+            } else {
+                Ok(reply("a real defect"))
+            }
+        };
+        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+
+        for m in &env.members {
+            assert!(m.served_model.is_none(), "a local seat must never report a served_model: {m:?}");
+        }
     }
 
     /// Probe-stage bucket exhaustion (operator decision on #1260): the
