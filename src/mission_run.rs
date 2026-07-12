@@ -372,6 +372,361 @@ fn add_worktree(repo_root: &Path, wt_path: &Path, branch: &str, base: &str) -> R
     Ok(())
 }
 
+// ─── (#1230 Packet 3) Task/Step graph — `run()`'s old hand-written
+// worktree → coder-dispatch → mechanical-verify sequence, now expressed as
+// data (a 3-Task/3-Step graph) and executed through Packet 2's
+// `scheduler::run_step_graph` instead of a hand-written function body. The
+// GATE (blocker check, sign-off printing) and `ship()` (commit → PR →
+// merge) stay outside the graph — genuinely Sprint-level land/gate steps
+// in #1240's vocabulary, not Steps.
+//
+// Each step kind below does its OWN printing + `emit_run_record` calls
+// (rather than routing through the scheduler's generic `emit` hook) so the
+// operator's live console narration keeps its pre-migration ordering: the
+// graph is a strict linear chain (worktree → coder → verify, each
+// `depends_on` the last), so no step ever runs concurrently with another
+// in this specific graph shape, and interleaving each kind's own prints
+// inside `run` reproduces `run()`'s old inline ordering exactly.
+//
+// Rich per-step results (the full `DispatchResult`, the full
+// `SprintReviewOutput`) don't fit the generic `StepOutcome.output: String`
+// contract, so each kind stashes its structured result into a side-channel
+// `Arc<Mutex<Option<T>>>` slot the caller reads after `run_step_graph`
+// returns — `Step.output` still carries a plain-text summary for
+// consistency with every other step kind's convention.
+
+use crew::scheduler::run_step_graph;
+use crew::step_kinds::{resolve_local_placement, StepKind, StepKindRegistry, StepOutcome};
+use crew::types::{NodeStatus, Task};
+use std::sync::{Arc, Mutex};
+
+/// Build the 3-Task/3-Step graph `run()` executes: worktree → coder →
+/// verify, wired with `depends_on` so the scheduler enforces the same
+/// ordering the pre-migration hand-written sequence always had — coder
+/// only becomes ready once worktree completes; verify only becomes ready
+/// once coder completes (which `MissionCoderStepKind` makes conditional
+/// on a clean exit — see its doc). `kind` strings are step-kind registry
+/// ids the caller's `StepKindRegistry` resolves at scheduling time; this
+/// function only builds the graph SHAPE, not the registry (production vs.
+/// test registries wire different implementations behind the same ids).
+fn default_sprint_graph(sprint_id: &str, role: &str) -> (Vec<Task>, std::collections::BTreeMap<String, crew::types::Step>) {
+    let worktree_task_id = format!("{sprint_id}-worktree");
+    let coder_task_id = format!("{sprint_id}-coder");
+    let verify_task_id = format!("{sprint_id}-verify");
+    let worktree_step_id = format!("{sprint_id}-worktree-step");
+    let coder_step_id = format!("{sprint_id}-coder-step");
+    let verify_step_id = format!("{sprint_id}-verify-step");
+
+    let tasks = vec![
+        Task {
+            id: worktree_task_id.clone(),
+            sprint_id: sprint_id.to_string(),
+            description: "prepare the sprint worktree".to_string(),
+            step_ids: vec![worktree_step_id.clone()],
+        },
+        Task {
+            id: coder_task_id.clone(),
+            sprint_id: sprint_id.to_string(),
+            description: format!("dispatch `{role}` into the worktree"),
+            step_ids: vec![coder_step_id.clone()],
+        },
+        Task {
+            id: verify_task_id.clone(),
+            sprint_id: sprint_id.to_string(),
+            description: "local QA — mechanical verify (code-reviewer)".to_string(),
+            step_ids: vec![verify_step_id.clone()],
+        },
+    ];
+
+    let mut steps = std::collections::BTreeMap::new();
+    steps.insert(
+        worktree_step_id.clone(),
+        crew::types::Step {
+            id: worktree_step_id.clone(),
+            task_id: worktree_task_id,
+            kind: "mission.worktree".to_string(),
+            depends_on: Vec::new(),
+            status: NodeStatus::Planned,
+            config: serde_json::Value::Null,
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        },
+    );
+    steps.insert(
+        coder_step_id.clone(),
+        crew::types::Step {
+            id: coder_step_id.clone(),
+            task_id: coder_task_id,
+            kind: "mission.coder".to_string(),
+            depends_on: vec![worktree_step_id],
+            status: NodeStatus::Planned,
+            config: serde_json::Value::Null,
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        },
+    );
+    steps.insert(
+        verify_step_id.clone(),
+        crew::types::Step {
+            id: verify_step_id,
+            task_id: verify_task_id,
+            kind: "mission.verify".to_string(),
+            depends_on: vec![coder_step_id],
+            status: NodeStatus::Planned,
+            config: serde_json::Value::Null,
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        },
+    );
+    (tasks, steps)
+}
+
+/// Wraps the worktree-creation half of the old hand-written sequence
+/// (moved here verbatim from the pre-migration `add_worktree` free
+/// function, deleted below — this was its only caller). Printing + the
+/// `mission.run.start` flow record happen HERE, at the same point in the
+/// sequence `run()` always emitted them (right after worktree creation
+/// succeeds).
+struct MissionWorktreeStepKind {
+    repo_root: PathBuf,
+    wt_path: PathBuf,
+    branch: String,
+    base: String,
+    mission_id: String,
+    sprint_id: String,
+    session_id: String,
+    role: String,
+}
+
+impl StepKind for MissionWorktreeStepKind {
+    fn id(&self) -> &'static str {
+        "mission.worktree"
+    }
+
+    fn run(
+        &self,
+        _step: &crew::types::Step,
+        _input: &std::collections::BTreeMap<String, String>,
+    ) -> Result<StepOutcome> {
+        add_worktree(&self.repo_root, &self.wt_path, &self.branch, &self.base)?;
+
+        println!(
+            "{}",
+            style::success(&format!("✓ worktree ready at {}", self.wt_path.display()))
+        );
+        emit_run_record(
+            flow::Level::Info,
+            "mission.run.start",
+            &self.mission_id,
+            &self.sprint_id,
+            &self.session_id,
+            serde_json::json!({
+                "role": self.role,
+                "base": self.base,
+                "branch": self.branch,
+                "worktree": self.wt_path.display().to_string(),
+            }),
+        );
+
+        Ok(StepOutcome {
+            output: self.wt_path.display().to_string(),
+            flow_records: Vec::new(),
+        })
+    }
+}
+
+/// The coder-dispatch step's rich result — stashed into
+/// `MissionCoderStepKind::result_slot` since it doesn't fit the generic
+/// `StepOutcome.output: String` contract. `run()` reads it after
+/// `run_step_graph` returns to reconstruct the exact detail the
+/// pre-migration inline code had at hand.
+struct CoderStepResult {
+    failed_verifiers: Vec<FailedVerifier>,
+    tokens_total: u32,
+}
+
+/// Wraps the coder-dispatch half of the old hand-written sequence
+/// (`fleet::dispatch_routed` → token tally → exit-code branch → verifier
+/// parsing). `opts.machine` is always `None` for `mission run` (no
+/// `--machine` flag on this verb), and `fleet::dispatch_routed` with
+/// `machine: None` falls straight through to `crew::dispatch::dispatch` —
+/// so calling `dispatch::dispatch` directly here is behavior-identical and
+/// avoids a `darkmux-crew` → `darkmux-fleet` dependency cycle (fleet
+/// depends on crew, not the reverse — see `crates/darkmux-fleet/src/
+/// routing.rs`'s module doc).
+///
+/// **A non-zero exit code is a Step-level `Err`, not a `Complete`.**
+/// `dispatch::dispatch` itself returns `Ok(DispatchResult)` even when the
+/// dispatched coder exited non-cleanly (the container ran; the coder's OWN
+/// run didn't finish cleanly) — treating that as `NodeStatus::Complete`
+/// would let the scheduler mark `verify` ready even though `run()` never
+/// wanted QA to run against a failed coder dispatch. Returning `Err` here
+/// maps that onto `NodeStatus::Error`, which correctly makes `verify`
+/// unreachable (see `scheduler::reachable`) — the same "coder failed, skip
+/// QA entirely" behavior the pre-migration early-`return Ok(1)` had.
+struct MissionCoderStepKind {
+    opts: Mutex<Option<crew::dispatch::DispatchOpts>>,
+    wt_path: PathBuf,
+    mission_id: String,
+    sprint_id: String,
+    session_id: String,
+    role_id: String,
+    result_slot: Arc<Mutex<Option<CoderStepResult>>>,
+}
+
+impl StepKind for MissionCoderStepKind {
+    fn id(&self) -> &'static str {
+        "mission.coder"
+    }
+
+    fn run(
+        &self,
+        _step: &crew::types::Step,
+        _input: &std::collections::BTreeMap<String, String>,
+    ) -> Result<StepOutcome> {
+        let opts = self
+            .opts
+            .lock()
+            .expect("mission.coder opts mutex poisoned")
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("mission.coder step ran more than once"))?;
+        let result = crew::dispatch::dispatch(opts)?;
+        eprintln!(
+            "{}",
+            style::dim(&format!("darkmux mission run: session id `{}`", self.session_id))
+        );
+
+        let tokens = result
+            .out_dir
+            .as_deref()
+            .map(crew::dispatch_internal::read_token_totals)
+            .unwrap_or_default();
+
+        if result.exit_code != 0 {
+            let exit_code = result.exit_code;
+            eprintln!(
+                "{}",
+                style::error(&format!(
+                    "✗ coder dispatch exited {exit_code} — see stderr above. The sprint stays \
+                     Running and the worktree is left at {} for inspection. Re-running `darkmux \
+                     mission run` will refuse until you tear it down: `darkmux mission abort {} \
+                     --sprint {}`.",
+                    self.wt_path.display(),
+                    self.mission_id,
+                    self.sprint_id,
+                ))
+            );
+            print_token_line(&tokens);
+            emit_run_record(
+                flow::Level::Error,
+                "mission.run.error",
+                &self.mission_id,
+                &self.sprint_id,
+                &self.session_id,
+                serde_json::json!({ "exit_code": exit_code, "total_tokens": tokens.total() }),
+            );
+            *self.result_slot.lock().expect("mission.coder result mutex poisoned") = Some(CoderStepResult {
+                failed_verifiers: Vec::new(),
+                tokens_total: tokens.total(),
+            });
+            anyhow::bail!("coder dispatch exited {exit_code}");
+        }
+
+        println!("{}", style::success("✓ coder dispatch complete"));
+        print_token_line(&tokens);
+
+        let failed_verifiers = parse_failed_verifiers(&result.stdout);
+        emit_run_record(
+            if failed_verifiers.is_empty() {
+                flow::Level::Info
+            } else {
+                flow::Level::Warn
+            },
+            "mission.run.verification",
+            &self.mission_id,
+            &self.sprint_id,
+            &self.session_id,
+            serde_json::json!({ "failed": failed_verifiers, "count": failed_verifiers.len() }),
+        );
+
+        let stdout = result.stdout.clone();
+        let tokens_total = tokens.total();
+        *self.result_slot.lock().expect("mission.coder result mutex poisoned") = Some(CoderStepResult {
+            failed_verifiers,
+            tokens_total,
+        });
+
+        Ok(StepOutcome {
+            output: stdout,
+            flow_records: Vec::new(),
+        })
+    }
+
+    fn residency(&self, _step: &crew::types::Step) -> Option<crew::step_kinds::Placement> {
+        resolve_local_placement(&self.role_id, None, None, &format!("mission-coder:{}", self.sprint_id))
+    }
+}
+
+/// Wraps the mechanical-verify half of the old hand-written sequence
+/// (`sprint_cli::sprint_review_output_at` against the worktree diff). Its
+/// `run()` role is ALWAYS `"code-reviewer"` — that's hardcoded inside
+/// `sprint_review_output_at` itself (mirrors the standalone `darkmux
+/// sprint review` verb), not something `mission run` overrides.
+struct MissionVerifyStepKind {
+    wt_path: PathBuf,
+    base: String,
+    sprint_id: String,
+    result_slot: Arc<Mutex<Option<std::result::Result<crate::sprint_cli::SprintReviewOutput, String>>>>,
+}
+
+impl StepKind for MissionVerifyStepKind {
+    fn id(&self) -> &'static str {
+        "mission.verify"
+    }
+
+    fn run(
+        &self,
+        _step: &crew::types::Step,
+        _input: &std::collections::BTreeMap<String, String>,
+    ) -> Result<StepOutcome> {
+        println!(
+            "\n{}",
+            style::header("▶ local QA — dispatching `code-reviewer` against the worktree diff…")
+        );
+
+        match crate::sprint_cli::sprint_review_output_at(&self.wt_path, Some(&self.base), Some(&self.sprint_id)) {
+            Ok(review) => {
+                print_review_summary(&review);
+                let verdict = review.verdict.clone();
+                *self.result_slot.lock().expect("mission.verify result mutex poisoned") = Some(Ok(review));
+                Ok(StepOutcome {
+                    output: verdict,
+                    flow_records: Vec::new(),
+                })
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                eprintln!(
+                    "{}",
+                    style::warn(&format!(
+                        "⚠ QA could not run ({msg}). The coder's work is in the worktree — review \
+                         the diff manually before shipping."
+                    ))
+                );
+                *self.result_slot.lock().expect("mission.verify result mutex poisoned") = Some(Err(msg.clone()));
+                Err(anyhow::anyhow!(msg))
+            }
+        }
+    }
+
+    fn residency(&self, _step: &crew::types::Step) -> Option<crew::step_kinds::Placement> {
+        resolve_local_placement("code-reviewer", None, None, &format!("mission-verify:{}", self.sprint_id))
+    }
+}
+
 /// `darkmux mission run` entry. Returns the process exit code:
 /// `0` clean (coder ran, QA clean or flags-only), `1` coder dispatch error,
 /// `2` QA found blockers (operator must resolve before ship),
@@ -453,24 +808,12 @@ pub fn run(
     );
     println!();
 
-    add_worktree(&root, &wt_path, &branch, base)?;
-    println!(
-        "{}",
-        style::success(&format!("✓ worktree ready at {}", wt_path.display()))
-    );
-    emit_run_record(
-        flow::Level::Info,
-        "mission.run.start",
-        mission_id,
-        &sprint.id,
-        &session_id,
-        serde_json::json!({
-            "role": role,
-            "base": base,
-            "branch": branch,
-            "worktree": wt_path.display().to_string(),
-        }),
-    );
+    // (#1230 Packet 3) Worktree creation itself — plus the "✓ worktree
+    // ready" print and the `mission.run.start` flow record — now happens
+    // inside `MissionWorktreeStepKind::run`, the first step of the graph
+    // built + executed further down. Kept at the exact same point in the
+    // sequence (right after the header prints above), just moved behind
+    // the step-kind boundary.
 
     // 4. Flip the sprint Planned → Running (consistent with `mission
     //    dispatch`). It IS being worked on now; `mission ship` flips it to
@@ -575,6 +918,10 @@ pub fn run(
             println!("{}", style::dim(&format!("    • {first}")));
         }
     }
+    // (#1230 Packet 3) The coder's dispatch options — unchanged from the
+    // pre-migration inline construction, now captured by the coder Step
+    // kind (`MissionCoderStepKind`) instead of being dispatched directly
+    // here.
     let opts = crew::dispatch::DispatchOpts {
         role_id: role.to_string(),
         message: coder_brief(&sprint, mission, &lessons, &prior_corrections, &detected_cautions),
@@ -590,6 +937,10 @@ pub fn run(
         sprint_id: Some(sprint.id.clone()),
         runtime: crew::dispatch::Runtime::Internal,
         runtime_cmd: "openclaw".to_string(),
+        // `--machine` is not a `mission run` flag — always local. See
+        // `MissionCoderStepKind`'s doc for why that means calling
+        // `dispatch::dispatch` directly is behavior-identical to the old
+        // `fleet::dispatch_routed`.
         machine: None,
         wait: true,
         compaction: crew::dispatch::CompactionDispatchArgs::default(),
@@ -601,128 +952,170 @@ pub fn run(
         max_completion_tokens: None,
         image: image.map(String::from),
     };
-    let result = fleet::dispatch_routed(opts)?;
-    eprintln!(
-        "{}",
-        style::dim(&format!("darkmux mission run: session id `{session_id}`"))
-    );
 
-    // Token tally — the off-meter number, read from the same canonical
-    // metrics.json #782a emits into the stream. Tokens only, never currency.
-    let tokens = result
-        .out_dir
-        .as_deref()
-        .map(crew::dispatch_internal::read_token_totals)
-        .unwrap_or_default();
+    // (#1230 Packet 3) Build the data-defined Task/Step graph — worktree →
+    // coder → verify — and execute it through Packet 2's `run_step_graph`
+    // instead of the pre-migration hand-written sequence. Persist the
+    // Task/Step records (`lifecycle::save_task`/`save_step`) for future
+    // observability (the graph lens, #1230 Packet 6) — best-effort, not
+    // load-bearing for this run's own control flow, which reads the
+    // in-memory `steps` map below.
+    let (tasks, mut steps) = default_sprint_graph(&sprint.id, role);
+    for task in &tasks {
+        if let Err(e) = crew::lifecycle::save_task(mission_id, task) {
+            eprintln!(
+                "{}",
+                style::dim(&format!("darkmux mission run: task persist warning: {e:#}"))
+            );
+        }
+    }
 
-    if result.exit_code != 0 {
-        eprintln!(
+    let coder_result_slot: Arc<Mutex<Option<CoderStepResult>>> = Arc::new(Mutex::new(None));
+    let verify_result_slot: Arc<
+        Mutex<Option<std::result::Result<crate::sprint_cli::SprintReviewOutput, String>>>,
+    > = Arc::new(Mutex::new(None));
+
+    let registry = StepKindRegistry::new();
+    registry
+        .register(Arc::new(MissionWorktreeStepKind {
+            repo_root: root.clone(),
+            wt_path: wt_path.clone(),
+            branch: branch.clone(),
+            base: base.to_string(),
+            mission_id: mission_id.to_string(),
+            sprint_id: sprint.id.clone(),
+            session_id: session_id.clone(),
+            role: role.to_string(),
+        }))
+        .expect("mission.worktree registered once");
+    registry
+        .register(Arc::new(MissionCoderStepKind {
+            opts: Mutex::new(Some(opts)),
+            wt_path: wt_path.clone(),
+            mission_id: mission_id.to_string(),
+            sprint_id: sprint.id.clone(),
+            session_id: session_id.clone(),
+            role_id: role.to_string(),
+            result_slot: coder_result_slot.clone(),
+        }))
+        .expect("mission.coder registered once");
+    registry
+        .register(Arc::new(MissionVerifyStepKind {
+            wt_path: wt_path.clone(),
+            base: base.to_string(),
+            sprint_id: sprint.id.clone(),
+            result_slot: verify_result_slot.clone(),
+        }))
+        .expect("mission.verify registered once");
+
+    // Best-effort classification only (see `StepKind::residency`) — never
+    // load-bearing for correctness here: this graph is a strict linear
+    // chain (each step `depends_on` the last), so no wave ever has more
+    // than one ready step and `Local` vs `Remote` has zero effect on what
+    // actually runs, only on how the (never-contended) scheduling is
+    // classified. `Facts::default()` (no known residents/pools) + a
+    // `FixedEstimator` mirror the same "not yet meaningful" placeholder
+    // Packet 1's own production caller uses.
+    let facts = crew::step_kinds::Facts::default();
+    let est = crew::step_kinds::FixedEstimator::default();
+    run_step_graph(&mut steps, &registry, &facts, &est, 1, &mut |record| {
+        let _ = flow::record(record);
+    })?;
+
+    for step in steps.values() {
+        if let Err(e) = crew::lifecycle::save_step(mission_id, &sprint.id, step) {
+            eprintln!(
+                "{}",
+                style::dim(&format!("darkmux mission run: step persist warning: {e:#}"))
+            );
+        }
+    }
+
+    let worktree_step_id = format!("{}-worktree-step", sprint.id);
+    let coder_step_id = format!("{}-coder-step", sprint.id);
+    let verify_step_id = format!("{}-verify-step", sprint.id);
+
+    // Worktree creation failing is a hard stop — same as the pre-migration
+    // `add_worktree(...)?` propagating straight out of `run()` (an
+    // already-exists worktree, or a `git worktree add` failure). Not one
+    // of the structured `Ok(1)/(2)/(3)` gate codes.
+    if steps[&worktree_step_id].status == NodeStatus::Error {
+        anyhow::bail!(
             "{}",
-            style::error(&format!(
-                "✗ coder dispatch exited {} — see stderr above. The sprint stays Running and \
-                 the worktree is left at {} for inspection. Re-running `darkmux mission run` will \
-                 refuse until you tear it down: `darkmux mission abort {mission_id} --sprint {}`.",
-                result.exit_code,
-                wt_path.display(),
-                sprint.id,
-            ))
+            steps[&worktree_step_id]
+                .output
+                .clone()
+                .unwrap_or_else(|| "worktree step failed".to_string())
         );
-        print_token_line(&tokens);
+    }
+
+    // Coder dispatch failing (a non-zero exit — see `MissionCoderStepKind`)
+    // maps to the pre-migration early `return Ok(1)`; the step kind itself
+    // already printed the error + emitted `mission.run.error`. `verify`
+    // never ran (unreachable — see `scheduler::reachable`).
+    if steps[&coder_step_id].status == NodeStatus::Error {
+        return Ok(1);
+    }
+
+    let coder_result = coder_result_slot
+        .lock()
+        .expect("mission.coder result mutex poisoned")
+        .take();
+    let failed_verifiers = coder_result
+        .as_ref()
+        .map(|r| r.failed_verifiers.clone())
+        .unwrap_or_default();
+    let tokens_total = coder_result.map(|r| r.tokens_total).unwrap_or(0);
+
+    // QA dispatch itself failing (reviewer image pull, timeout, etc.) is
+    // NOT a coder failure — the pre-migration distinct exit 3 path. The
+    // step kind already printed the immediate warning; this reconstructs
+    // the "gate — QA unavailable" block that used to sit inline.
+    if steps[&verify_step_id].status == NodeStatus::Error {
+        let verify_err = verify_result_slot
+            .lock()
+            .expect("mission.verify result mutex poisoned")
+            .take();
+        let err_text = match verify_err {
+            Some(Err(msg)) => msg,
+            _ => "QA dispatch failed".to_string(),
+        };
         emit_run_record(
-            flow::Level::Error,
-            "mission.run.error",
+            flow::Level::Warn,
+            "mission.run.qa-unavailable",
             mission_id,
             &sprint.id,
             &session_id,
-            serde_json::json!({
-                "exit_code": result.exit_code,
-                "total_tokens": tokens.total(),
-            }),
+            serde_json::json!({ "error": err_text, "total_tokens": tokens_total }),
         );
-        return Ok(1);
+        println!("\n{}", style::header("▶ gate — QA unavailable, manual review required"));
+        print_unverified_banner(&failed_verifiers);
+        println!("  {} {}", style::dim("worktree:"), wt_path.display());
+        println!("  {} {}", style::dim("branch:  "), style::accent(&branch));
+        println!(
+            "\n{}",
+            style::warn(&format!(
+                "review the diff manually, then:  darkmux mission ship {mission_id} --sprint {} \
+                 (or abort: darkmux mission abort {mission_id} --sprint {})",
+                sprint.id, sprint.id
+            ))
+        );
+        return Ok(3);
     }
-    println!("{}", style::success("✓ coder dispatch complete"));
-    print_token_line(&tokens);
 
-    // (#799 part 2) Verifier-fabrication backstop: the runtime stamped any bash
-    // verifier commands that FAILED TO RUN (never executed) onto the dispatch
-    // envelope. Emit a per-run `mission.run.verification` record UNCONDITIONALLY
-    // (empty `failed` on an honest run) keyed by this run's deterministic
-    // session id, so `mission ship --merge` reads the LATEST run's status and
-    // HOLDs only when that run had failures. Emitting on EVERY run is what lets
-    // a clean re-run CLEAR a prior dirty run's record (the reader is latest-wins
-    // by overwrite); a conditional emit would leave a stale dirty record that
-    // the documented fix-and-retry could never clear. The gate banner reads the
-    // in-memory parse below, so an empty record adds no operator-facing noise.
-    // Soft everywhere: `run` still returns 0 at a clean gate; the operator
-    // decides (operator sovereignty #44).
-    let failed_verifiers = parse_failed_verifiers(&result.stdout);
-    emit_run_record(
-        if failed_verifiers.is_empty() {
-            flow::Level::Info
-        } else {
-            flow::Level::Warn
-        },
-        "mission.run.verification",
-        mission_id,
-        &sprint.id,
-        &session_id,
-        serde_json::json!({
-            "failed": failed_verifiers,
-            "count": failed_verifiers.len(),
-        }),
-    );
-
-    // 6. Local QA — reuse `sprint review` against the worktree diff vs base.
-    //    require_clean=false: the worktree has uncommitted changes by design
-    //    (the whole point is reviewing pre-commit work).
-    println!(
-        "\n{}",
-        style::header("▶ local QA — dispatching `code-reviewer` against the worktree diff…")
-    );
-    // A QA *dispatch* failure (reviewer image pull, timeout, etc.) is NOT a
-    // coder failure — don't propagate it as exit 1. The coder's work is in
-    // the worktree and the gate still matters; surface that QA couldn't run
-    // and let the operator/frontier review manually. Distinct exit 3.
-    let review = match crate::sprint_cli::sprint_review_output_at(
-        &wt_path,
-        Some(base),
-        Some(&sprint.id),
-    ) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!(
-                "{}",
-                style::warn(&format!(
-                    "⚠ QA could not run ({e:#}). The coder's work is in the worktree — \
-                     review the diff manually before shipping."
-                ))
-            );
-            emit_run_record(
-                flow::Level::Warn,
-                "mission.run.qa-unavailable",
-                mission_id,
-                &sprint.id,
-                &session_id,
-                serde_json::json!({ "error": format!("{e:#}"), "total_tokens": tokens.total() }),
-            );
-            println!("\n{}", style::header("▶ gate — QA unavailable, manual review required"));
-            print_unverified_banner(&failed_verifiers);
-            println!("  {} {}", style::dim("worktree:"), wt_path.display());
-            println!("  {} {}", style::dim("branch:  "), style::accent(&branch));
-            println!(
-                "\n{}",
-                style::warn(&format!(
-                    "review the diff manually, then:  darkmux mission ship {mission_id} --sprint {} \
-                     (or abort: darkmux mission abort {mission_id} --sprint {})",
-                    sprint.id, sprint.id
-                ))
-            );
-            return Ok(3);
-        }
+    let review = match verify_result_slot
+        .lock()
+        .expect("mission.verify result mutex poisoned")
+        .take()
+    {
+        Some(Ok(review)) => review,
+        // Unreachable in practice: verify is `Complete` only on the `Ok`
+        // path of `MissionVerifyStepKind::run` (which always populates
+        // this slot before returning `Ok`), and `Error` is handled above.
+        _ => anyhow::bail!(
+            "internal error: mission.verify step completed without a review result"
+        ),
     };
-
-    print_review_summary(&review);
 
     // 7. Stop at the gate. Tee up the ship step; never commit/PR/merge here.
     println!("\n{}", style::header("▶ gate — awaiting frontier/operator sign-off"));
@@ -769,7 +1162,7 @@ pub fn run(
                 "verdict": review.verdict,
                 "blockers": review.by_severity.block,
                 "flags": review.by_severity.flag,
-                "total_tokens": tokens.total(),
+                "total_tokens": tokens_total,
             }),
         );
         return Ok(2);
@@ -808,7 +1201,7 @@ pub fn run(
             "verdict": review.verdict,
             "flags": review.by_severity.flag,
             "nits": review.by_severity.nit,
-            "total_tokens": tokens.total(),
+            "total_tokens": tokens_total,
         }),
     );
     Ok(0)
@@ -3849,5 +4242,224 @@ mod tests {
         assert_eq!(session_b.len(), 1, "a dirty-only session stays held: {session_b:?}");
         assert_eq!(session_b[0].command, "pytest");
         assert!(unknown.is_empty(), "an unknown session reads as none");
+    }
+
+    // ─── (#1230 Packet 3) Task/Step graph migration ─────────────────────
+
+    #[test]
+    fn default_sprint_graph_has_the_expected_shape() {
+        let (tasks, steps) = default_sprint_graph("s1", "coder");
+
+        assert_eq!(tasks.len(), 3, "worktree, coder, verify — one Task each");
+        for t in &tasks {
+            assert_eq!(t.sprint_id, "s1");
+            assert_eq!(t.step_ids.len(), 1, "each Task holds exactly one Step");
+        }
+
+        assert_eq!(steps.len(), 3);
+        let worktree = &steps["s1-worktree-step"];
+        let coder = &steps["s1-coder-step"];
+        let verify = &steps["s1-verify-step"];
+
+        assert_eq!(worktree.kind, "mission.worktree");
+        assert_eq!(coder.kind, "mission.coder");
+        assert_eq!(verify.kind, "mission.verify");
+
+        assert!(worktree.depends_on.is_empty(), "worktree is the root");
+        assert_eq!(coder.depends_on, vec!["s1-worktree-step".to_string()]);
+        assert_eq!(verify.depends_on, vec!["s1-coder-step".to_string()]);
+
+        for s in steps.values() {
+            assert_eq!(s.status, NodeStatus::Planned);
+        }
+    }
+
+    /// `MissionWorktreeStepKind` against a REAL git repo (no LMStudio, no
+    /// Docker — pure git plumbing) — proves the migrated worktree step
+    /// reproduces `add_worktree`'s two real-world outcomes: a clean
+    /// creation, and the "already exists" bail on a second run for the
+    /// same sprint (the exact scenario a resumed/un-shipped `mission run`
+    /// hits).
+    #[test]
+    fn mission_worktree_step_kind_creates_then_rejects_duplicate() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let main_repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&main_repo).unwrap();
+        let git = |args: &[&str]| {
+            let o = Command::new("git").current_dir(&main_repo).args(args).output().unwrap();
+            assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+
+        let wt_path = tmp.path().join("worktrees").join("s1");
+        let kind = MissionWorktreeStepKind {
+            repo_root: main_repo.clone(),
+            wt_path: wt_path.clone(),
+            branch: "darkmux/s1".to_string(),
+            base: "HEAD".to_string(),
+            mission_id: "m1".to_string(),
+            sprint_id: "s1".to_string(),
+            session_id: "mission-run-m1-s1".to_string(),
+            role: "coder".to_string(),
+        };
+        let step = crew::types::Step {
+            id: "s1-worktree-step".to_string(),
+            task_id: "s1-worktree".to_string(),
+            kind: "mission.worktree".to_string(),
+            depends_on: Vec::new(),
+            status: NodeStatus::Planned,
+            config: serde_json::Value::Null,
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        };
+
+        let outcome = kind.run(&step, &std::collections::BTreeMap::new()).unwrap();
+        assert!(wt_path.is_dir(), "worktree dir must exist after a clean run");
+        assert_eq!(outcome.output, wt_path.display().to_string());
+
+        // A second run against the SAME sprint (the resumed-run case) must
+        // fail loud, not silently clobber — same contract `add_worktree`
+        // always had.
+        let err = kind.run(&step, &std::collections::BTreeMap::new()).unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+    }
+
+    /// `MissionVerifyStepKind` against a REAL git repo with an EMPTY diff
+    /// (no coder changes made yet). `sprint_review_output_at` short-
+    /// circuits an empty diff to a canned "clean" `SprintReviewOutput`
+    /// with ZERO reviewer dispatch — so this exercises the real verify
+    /// step end to end with no LMStudio/Docker involved, matching the
+    /// operator's no-live-dispatch constraint. `#[serial]` — mutates the
+    /// shared `DARKMUX_FLOWS_DIR` (the empty-diff path still emits a
+    /// "sprint review begin"/"verdict: clean" flow record pair).
+    #[test]
+    #[serial_test::serial]
+    fn mission_verify_step_kind_clean_diff_needs_no_dispatch() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let o = Command::new("git").current_dir(&repo).args(args).output().unwrap();
+            assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(&["branch", "-m", "main"]);
+
+        let flows = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        // SAFETY: serialized via #[serial]; restored below.
+        unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", flows.path()) };
+
+        let slot: Arc<Mutex<Option<std::result::Result<crate::sprint_cli::SprintReviewOutput, String>>>> =
+            Arc::new(Mutex::new(None));
+        let kind = MissionVerifyStepKind {
+            wt_path: repo.clone(),
+            base: "main".to_string(),
+            sprint_id: "s1".to_string(),
+            result_slot: slot.clone(),
+        };
+        let step = crew::types::Step {
+            id: "s1-verify-step".to_string(),
+            task_id: "s1-verify".to_string(),
+            kind: "mission.verify".to_string(),
+            depends_on: vec!["s1-coder-step".to_string()],
+            status: NodeStatus::Planned,
+            config: serde_json::Value::Null,
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        };
+        let outcome = kind.run(&step, &std::collections::BTreeMap::new());
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+
+        let outcome = outcome.unwrap();
+        assert_eq!(outcome.output, "clean");
+        let taken = slot.lock().unwrap().take();
+        match taken {
+            Some(Ok(review)) => {
+                assert_eq!(review.verdict, "clean");
+                assert_eq!(review.total_findings, 0);
+            }
+            Some(Err(e)) => panic!("expected Ok(clean review), got Err({e})"),
+            None => panic!("expected Some(Ok(clean review)), got None"),
+        }
+    }
+
+    /// `resolve_local_placement` — the best-effort role→profile→model
+    /// classification `StepKind::residency` implementations use. A local
+    /// model resolves to `Some(Placement)`; a remote (endpoint-bearing)
+    /// model, or an unresolvable role/profile, fails OPEN to `None` (never
+    /// an error — see the function's own doc). Uses an explicit
+    /// `--profiles`-equivalent temp file path, so this never touches the
+    /// real `~/.darkmux/profiles.json`.
+    #[test]
+    fn resolve_local_placement_classifies_local_vs_remote_vs_unresolvable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let profiles_path = tmp.path().join("profiles.json");
+        std::fs::write(
+            &profiles_path,
+            r#"{
+                "profiles": {
+                    "test": {
+                        "models": [
+                            {"id": "local-model", "n_ctx": 32000},
+                            {"id": "remote-model", "n_ctx": 32000, "endpoint": {"url": "https://example.com/v1"}}
+                        ],
+                        "default_model": "local-model"
+                    }
+                },
+                "default_profile": "test"
+            }"#,
+        )
+        .unwrap();
+        let path_str = profiles_path.to_str().unwrap();
+
+        // A known role ("coder" — built-in) on the default profile's
+        // default (local) model resolves to a real Placement.
+        let placement = resolve_local_placement("coder", None, Some(path_str), "test-seat");
+        let placement = placement.expect("a local default model must resolve");
+        assert_eq!(placement.model_key, "local-model");
+        assert_eq!(placement.min_ctx, 32000);
+        assert_eq!(placement.seat, "test-seat");
+        assert!(placement.identifier.starts_with("darkmux:"), "{}", placement.identifier);
+
+        // An explicit request for the remote-endpoint model — swap the
+        // default so `select_model`'s no-vectors fallback picks it — must
+        // classify `None` (Remote), never a Placement.
+        std::fs::write(
+            &profiles_path,
+            r#"{
+                "profiles": {
+                    "test": {
+                        "models": [
+                            {"id": "remote-model", "n_ctx": 32000, "endpoint": {"url": "https://example.com/v1"}}
+                        ],
+                        "default_model": "remote-model"
+                    }
+                },
+                "default_profile": "test"
+            }"#,
+        )
+        .unwrap();
+        assert!(
+            resolve_local_placement("coder", None, Some(path_str), "test-seat").is_none(),
+            "a remote-endpoint model must classify Remote (None), not a Placement"
+        );
+
+        // An unresolvable role fails open to None, not a panic/error.
+        assert!(resolve_local_placement("no-such-role-xyz", None, Some(path_str), "seat").is_none());
     }
 }
