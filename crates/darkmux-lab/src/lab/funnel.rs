@@ -3191,38 +3191,42 @@ fn finish_funnel(
         );
     }
 
-    // (#1260) Judge-stage degeneracy is decided BEFORE the optional verify
-    // stage so a run the judge already doomed never spends frontier money on
-    // verify (CONSIDER g). Up to three writers can fire; their reasons are
-    // COMBINED, never clobbered (CONSIDER f), so the envelope names every
-    // load-bearing failure that hit the judge:
+    // (#1260, revised #1329) Judge-stage degeneracy is decided BEFORE the
+    // optional verify stage so a run the judge already doomed never spends
+    // frontier money on verify (CONSIDER g). Up to three writers can fire;
+    // their reasons are COMBINED, never clobbered (CONSIDER f), so the
+    // envelope names every load-bearing failure that hit the judge:
     //
-    //  1. (FIX 4 / binding design) a REMOTE judge whose dispatch FAILED on
-    //     one or more flags after bounded retries — honest-fail: the run goes
-    //     degraded red and the affected flags carry no real adjudication (the
-    //     degenerate route discards the docket, so they never render as
-    //     archived-adjudicated). LOCAL judge failures keep today's behavior —
-    //     the bad call is swallowed to `Archived` and the run stays green
-    //     unless the judge-dead gate fires; a local judge is never in the
-    //     remote design's scope.
-    //  2. a REMOTE judge whose per-pass token bucket EXHAUSTED (a load-bearing
-    //     stage — operator decision).
-    //  3. the judge-dead honesty gate: NO flag produced a usable pass-1
-    //     ruling, so the whole judge phase produced no signal. Only added
-    //     when nothing more specific already explained the failure
-    //     (exhaustion / dispatch failure IS why the rulings were unusable).
+    //  1. a REMOTE judge whose per-pass token bucket EXHAUSTED (a
+    //     load-bearing stage — operator decision, documented in
+    //     DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION). Any exhaustion degrades
+    //     the run regardless of scale — this IS the deliberate policy.
+    //  2. the judge-dead honesty gate: `usable == 0` — NO flag produced a
+    //     usable pass-1 ruling (Confirmed/NeedsCheck/FalsePositive), so the
+    //     whole judge phase produced no signal worth rendering. This is the
+    //     ONE run-level gate for per-flag adjudication failures, and it
+    //     covers three causes uniformly: unparsed judge output surviving its
+    //     retry, a dead LOCAL judge, and (#1329) a REMOTE judge whose
+    //     dispatch failed after bounded retries.
     //
-    // The judge-budget RECORDS are pushed regardless — accounting is never
-    // gated on degeneracy.
+    // (#1329 fix) A REMOTE judge dispatch failure on a MINORITY of flags is
+    // already handled honestly at the per-flag level: a pass-1 failure
+    // archives just that flag (invisible in the report, present in the
+    // envelope); a pass-2 failure demotes just that flag to NeedsCheck
+    // (visible, flagged "(no note from the judge)") — never a silent fake
+    // confirm either way. The prior code ALSO forced the entire run
+    // degenerate on ANY dispatch_errors > 0, which is the asymmetry that
+    // produced the bug: a `Confirmed`-then-`Unparsed` pass-2 outcome (same
+    // "transient technical failure" class) was already exempt from this
+    // check (`judge_dispatch_errors` only counts `Error`, never `Unparsed`)
+    // and rendered fine; only the `Error` variant nuked the whole docket. A
+    // single flag's timeout among 37 discarded 9 confirmed + 9 needs-check
+    // real findings and false-alarmed CI on a fully successful run
+    // (darkmux#1329). Fix: dispatch errors are counted and folded into
+    // `usable` like every other per-flag outcome — the run only goes
+    // degenerate via gate 2 when NO usable signal survived, exactly as
+    // `Unparsed` already worked. This is a consistency fix, not new policy.
     let mut degen_reasons: Vec<String> = Vec::new();
-
-    if judge.pm.is_remote() && judge_dispatch_errors > 0 {
-        degen_reasons.push(format!(
-            "remote judge dispatch failed on {judge_dispatch_errors} of {} flag(s) after bounded \
-             retries — degraded run, the affected flag(s) carry no adjudication",
-            judged.len()
-        ));
-    }
 
     if let Some(b) = &judge_budgets {
         if let Some(rec) = b.pass1.record() {
@@ -3252,10 +3256,18 @@ fn finish_funnel(
         })
         .count();
     if degen_reasons.is_empty() && !judged.is_empty() && usable == 0 {
-        degen_reasons.push(format!(
-            "judge produced no usable ruling on any of {} flags (all errored/unparsed)",
-            judged.len()
-        ));
+        if judge.pm.is_remote() && judge_dispatch_errors > 0 {
+            degen_reasons.push(format!(
+                "remote judge dispatch failed on {judge_dispatch_errors} of {} flag(s) after \
+                 bounded retries — degraded run, the affected flag(s) carry no adjudication",
+                judged.len()
+            ));
+        } else {
+            degen_reasons.push(format!(
+                "judge produced no usable ruling on any of {} flags (all errored/unparsed)",
+                judged.len()
+            ));
+        }
     }
 
     if !degen_reasons.is_empty() {
@@ -7092,10 +7104,13 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         assert_eq!(finished["remote_tokens"], 1200, "the envelope's separated remote figure bills both");
     }
 
-    /// (FIX 4 / binding design) A REMOTE judge whose dispatch FAILS on a flag
-    /// (after the transport's bounded retries) marks the run degraded with a
-    /// reason naming the failed-flag count — never a silent fake adjudication
-    /// that archives the flag and leaves the run green.
+    /// (FIX 4 / binding design, revised #1329) A REMOTE judge whose dispatch
+    /// FAILS on EVERY flag (after the transport's bounded retries) marks the
+    /// run degraded with a reason naming the failed-flag count — never a
+    /// silent fake adjudication that archives the flag and leaves the run
+    /// green. This is the `usable == 0` case (total loss); see
+    /// `remote_judge_dispatch_error_on_minority_of_flags_does_not_degrade_the_run`
+    /// below for the partial-failure case, which must NOT degrade.
     #[test]
     fn remote_judge_dispatch_failure_degrades_the_run() {
         let crew = crew_with(vec![
@@ -7114,6 +7129,58 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
         let reason = env.degenerate.as_deref().expect("remote judge dispatch failure degrades the run");
         assert!(reason.contains("remote judge dispatch failed on 1 of 1 flag"), "got: {reason}");
+    }
+
+    /// (#1329) The bug: a REMOTE judge dispatch failure on ONE flag out of
+    /// many was forcing the ENTIRE run degenerate — discarding every other
+    /// flag's real, valid adjudication (9 confirmed + 9 needs-check lost on
+    /// a real 37-flag production run, darkmux#1329). The per-flag outcome
+    /// was always safe (a pass-2 dispatch error demotes just that flag to
+    /// NeedsCheck, same as any other pass-2 disagreement) — only the
+    /// run-level gate over-reacted. Three flags, pass-1 confirms all three,
+    /// pass-2 dispatch-errors on the MIDDLE flag only: the other two stay
+    /// cleanly confirmed, the middle one demotes (not lost), and the run
+    /// renders normally.
+    #[test]
+    fn remote_judge_dispatch_error_on_minority_of_flags_does_not_degrade_the_run() {
+        let crew = crew_with(vec![
+            ("review-probe", vec![staffing("fast", "probe-model", 1)]),
+            ("review-judge", vec![remote_staffing("cloud", "gpt-judge", 1)]),
+        ]);
+        let mut inputs = inputs_for(&crew, 500_000);
+        inputs.bundles = Some(vec![bundle_input("a.ts"), bundle_input("b.ts"), bundle_input("c.ts")]);
+        let mut cycler = RecordingCycler::new();
+        let judge_call_index = RefCell::new(0u32);
+        let mut chat = |call: &ChatCall| {
+            if call.endpoint.is_some() {
+                let idx = *judge_call_index.borrow();
+                *judge_call_index.borrow_mut() += 1;
+                // Calls land flag-major: f1.p1, f1.p2, f2.p1, f2.p2, f3.p1,
+                // f3.p2. Fail ONLY f2's pass-2 (call index 3) — one dispatch
+                // out of six, on a flag pass-1 already confirmed.
+                if idx == 3 {
+                    Err(anyhow!("endpoint 503"))
+                } else {
+                    Ok(reply(CONFIRM_JSON))
+                }
+            } else {
+                Ok(reply("a real defect"))
+            }
+        };
+        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+
+        assert!(
+            env.degenerate.is_none(),
+            "a minority dispatch error with real usable signal must not degrade the run: {:?}",
+            env.degenerate
+        );
+        assert_eq!(env.judged.len(), 3);
+        assert_eq!(env.confirmed, 2, "the two clean flags stay confirmed");
+        assert_eq!(env.needs_check, 1, "the dispatch-error flag demotes, it is not lost");
+        assert_eq!(env.archived, 0);
+        let demoted = &env.judged[1];
+        assert_eq!(demoted.tier, Tier::NeedsCheck);
+        assert!(demoted.demoted_by_pass2);
     }
 
     /// (FIX 4) The LOCAL judge dispatch-failure path is UNCHANGED — a bad
