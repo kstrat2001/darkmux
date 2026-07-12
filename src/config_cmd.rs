@@ -87,6 +87,9 @@ const KEYS: &[(&str, Ty)] = &[
     // (#1260) The per-execution remote token allowance for endpoint-staffed
     // crew seats (one pipeline stage = one execution). Tokens, never currency.
     ("remote.max_tokens_per_execution", Ty::Uint),
+    // (#1230 Packet 1) Max concurrent remote dispatches
+    // `darkmux_crew::concurrent_dispatch::run_bounded` runs at once.
+    ("remote.concurrent_cap", Ty::Uint),
     ("dirs.flows", Ty::Str),
     ("dirs.audit", Ty::Str),
     ("dirs.notebook", Ty::Str),

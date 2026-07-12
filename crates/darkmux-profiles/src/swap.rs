@@ -10,28 +10,43 @@ use std::time::Instant;
 /// Anything visible via `lms ps` starting with this prefix is owned by darkmux
 /// and safe to unload during swap; anything else is user state and off-limits.
 ///
+/// (#1230 Packet 1 cutover) Re-exported from `darkmux_gestalt::ownership`,
+/// which is now the canonical home for this constant — see that module's
+/// doc comment ("Packet 3 re-points swap.rs at this module"). Kept as a
+/// `pub const` alias here (not a bare re-export of a differently-named
+/// item) so every existing `swap::DARKMUX_LMS_NAMESPACE` call site keeps
+/// compiling unchanged.
+///
 /// See [issue #52](https://github.com/kstrat2001/darkmux/issues/52) for the
 /// design rationale (operator-sovereignty applied at model-state level —
 /// darkmux never touches state it didn't bring up).
-pub const DARKMUX_LMS_NAMESPACE: &str = "darkmux:";
+pub const DARKMUX_LMS_NAMESPACE: &str = darkmux_gestalt::DARKMUX_NAMESPACE;
 
 /// Compute the darkmux-namespaced LMStudio identifier for a profile model.
 ///
-/// If the profile sets an explicit `identifier`, use it as-is (allows
-/// operators to opt out of the namespace for special cases). Otherwise wrap
-/// the model id under the `darkmux:` namespace so unload-filtering can
-/// distinguish darkmux's loads from user-managed ones.
+/// (#1230 Packet 1 cutover) Thin delegating wrapper over
+/// `darkmux_gestalt::namespaced_identifier` — the `&ProfileModel` form this
+/// crate's callers use, feeding gestalt's two-explicit-parameter form (a
+/// bare `pub use` can't bridge the signature). ONE definition now backs
+/// both swap.rs and the funnel's `LmsCycler`; `tests/gestalt_parity.rs`,
+/// which existed only to guard the pre-cutover duplication window, is
+/// retired now that there is nothing left to fork.
+///
+/// If the profile sets an explicit `identifier`, it passes through as-is
+/// (the documented namespace opt-out). Otherwise the model id is wrapped
+/// under the `darkmux:` namespace so unload-filtering can distinguish
+/// darkmux's loads from user-managed ones.
 pub fn namespaced_identifier(m: &ProfileModel) -> String {
-    if let Some(explicit) = m.identifier.as_deref() {
-        return explicit.to_string();
-    }
-    format!("{}{}", DARKMUX_LMS_NAMESPACE, m.id)
+    darkmux_gestalt::namespaced_identifier(&m.id, m.identifier.as_deref())
 }
 
 /// `true` if this identifier was minted by darkmux (begins with our
 /// namespace). Used to filter `lms ps` results during swap.
+///
+/// (#1230 Packet 1 cutover) Delegates to `darkmux_gestalt::is_darkmux_owned`
+/// — see `namespaced_identifier`'s doc above.
 pub fn is_darkmux_owned(identifier: &str) -> bool {
-    identifier.starts_with(DARKMUX_LMS_NAMESPACE)
+    darkmux_gestalt::is_darkmux_owned(identifier)
 }
 
 #[derive(Debug, Default)]
@@ -81,11 +96,11 @@ fn should_patch_openclaw(opts: &SwapOpts) -> bool {
 /// `pub` since #1271: the review funnel's `LmsCycler` residency
 /// reconciliation makes the same keep-or-reload call and shares this ONE
 /// definition of "sufficient" rather than re-deriving the `>=` inline.
+///
+/// (#1230 Packet 1 cutover) Delegates to `darkmux_gestalt::ctx_sufficient` —
+/// see `namespaced_identifier`'s doc above.
 pub fn ctx_sufficient(loaded_ctx: u64, wanted_n_ctx: u32) -> bool {
-    // (#906) Compare in u64 — `LoadedModel.context` is u64; truncating it to
-    // u32 before the check could (in principle) wrap a very large loaded
-    // context down below the wanted minimum and trigger a needless reload.
-    loaded_ctx >= u64::from(wanted_n_ctx)
+    darkmux_gestalt::ctx_sufficient(loaded_ctx, wanted_n_ctx)
 }
 
 /// (#590) The context window at which swap loads the machine's standing
