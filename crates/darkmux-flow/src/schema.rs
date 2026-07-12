@@ -127,6 +127,21 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.17.0";
 //           --funnel` writes to a per-run-local `funnel-events.jsonl` file
 //           instead, never this stream — so existing AuditFileSink chains are
 //           unaffected either way.
+//   (code-internal, no FLOW_SCHEMA_VERSION bump) — a `dispatch complete`
+//           record's payload now carries `endpoint` alongside `remote_tokens`
+//           whenever the dispatch involved a remote-endpoint seat (#1230
+//           Packet 0, the new `crate::bookend::stamp_remote_classification`
+//           helper). `endpoint` already exists on `dispatch.start`/
+//           `dispatch.complete` for the container/direct paths since #1187;
+//           this only fixes `src/pr_review.rs`'s funnel→dispatch bookend
+//           bridge (`with_dispatch_bookends`), which stamped `remote_tokens`
+//           alone — the viewer's `tokensOffMeter()` reads `payload.endpoint`
+//           exclusively to classify a session as cloud vs. local, so the
+//           bridge's records previously counted 100% of a remote-seat
+//           funnel run as local savings. Purely additive payload key on an
+//           existing action; older readers ignore it, and a fully-local
+//           dispatch's payload is byte-identical to before (both fields
+//           stay absent).
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]

@@ -11,10 +11,12 @@ pub mod presence;
 pub mod presence_reconciler;
 pub mod session_presence;
 
+mod bookend;
 mod integrity;
 mod schema;
 mod status;
 
+pub use bookend::*;
 pub use integrity::*;
 pub use schema::*;
 pub use status::*;
