@@ -75,6 +75,26 @@ jobs:
         # (and, inside the funnel dispatch, individual file contents via the
         # API) are read — so untrusted PR code never lands on the runner.
 
+      - name: Build the Rust bundler plugin (#1319 reference --bundler implementation)
+        run: |
+          set -euo pipefail
+          # Built from THIS checkout of trusted main — the same tree the
+          # review tooling itself came from, not the reviewed PR. The
+          # built-in bundler only understands TypeScript; without this,
+          # darkmux reviewing its own (Rust) PRs produces 0 bundles ->
+          # degenerate on every single one (darkmux#1319, #1318 dogfood).
+          #
+          # plugins/darkmux-bundler-rust is a genuinely STANDALONE Cargo
+          # project (its own [workspace] table, its own Cargo.lock, ZERO
+          # darkmux-* dependencies) — excluded from the root workspace on
+          # purpose. Building the reference plugin from privileged access
+          # to darkmux-lab's own internals wouldn't actually prove the
+          # public --bundler contract is sufficient on its own for a real
+          # third-party author; a fully standalone build does.
+          cd plugins/darkmux-bundler-rust
+          cargo build --release --locked
+          echo "BUNDLER_RUST_BIN=$PWD/target/release/darkmux-bundler-rust" >> "$GITHUB_ENV"
+
       - name: Fetch PR diff + head SHA (API only — no PR checkout, no code execution)
         id: diff
         run: |
@@ -148,6 +168,11 @@ jobs:
           # Resilient: a hiccup leaves no/empty envelope; the funnel's own
           # degraded-mode handling (below) turns that into a loud comment plus
           # a failed run rather than a silent green check.
+          # --bundler: darkmux-public's own source is Rust, not the
+          # built-in bundler's TypeScript — without this every self-review
+          # produced 0 bundles -> degenerate (darkmux#1319). Points at the
+          # reference plugin built above, run through the SAME public
+          # --bundler seam a third-party plugin author would use.
           darkmux pr-review run \
             --github "$REPO" \
             --head-sha "$HEAD_SHA" \
@@ -155,6 +180,7 @@ jobs:
             --intent-file "$RUNNER_TEMP/qa/intent.txt" \
             --crew "$CREW" \
             --mode "$MODE" \
+            --bundler "$BUNDLER_RUST_BIN" \
             ${K:+--k "$K"} \
             --envelope-out "$RUNNER_TEMP/qa/funnel.json" \
             --emit "$RUNNER_TEMP/qa/rendered.json" \
