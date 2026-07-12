@@ -3193,9 +3193,14 @@ fn finish_funnel(
 
     // (#1260, revised #1329) Judge-stage degeneracy is decided BEFORE the
     // optional verify stage so a run the judge already doomed never spends
-    // frontier money on verify (CONSIDER g). Up to three writers can fire;
-    // their reasons are COMBINED, never clobbered (CONSIDER f), so the
-    // envelope names every load-bearing failure that hit the judge:
+    // frontier money on verify (CONSIDER g). Two writers can push a
+    // `degen_reasons` entry; `degen_reasons.is_empty()` gates the second on
+    // the first, so AT MOST ONE reason string ends up in `env.degenerate` —
+    // this is no longer a "combine every reason" accumulator (that was the
+    // pre-#1329 shape). The per-flag dispatch-error WARNING below is the
+    // channel that stays complete regardless of which (if either) gate
+    // fired, so provenance is never silently dropped even when a reason
+    // string is superseded:
     //
     //  1. a REMOTE judge whose per-pass token bucket EXHAUSTED (a
     //     load-bearing stage — operator decision, documented in
@@ -3226,7 +3231,26 @@ fn finish_funnel(
     // `usable` like every other per-flag outcome — the run only goes
     // degenerate via gate 2 when NO usable signal survived, exactly as
     // `Unparsed` already worked. This is a consistency fix, not new policy.
+    //
+    // But swinging from "always nukes the run" to "always silent when the
+    // run stays green" would trade one honesty gap for another (this repo's
+    // doctrine: "no blind runs," loud beats quiet) — the PROBE stage already
+    // sets this precedent (a remote probe seat's bounded-retry failure pushes
+    // a named `env.warnings` entry: "reduced coverage", never silent). The
+    // judge side gets the same treatment: any remote dispatch error is named
+    // in `env.warnings` UNCONDITIONALLY, whether or not it also ends up
+    // being (or contributing to) the run-level `degenerate` reason.
     let mut degen_reasons: Vec<String> = Vec::new();
+
+    if judge.pm.is_remote() && judge_dispatch_errors > 0 {
+        env.warnings.push(format!(
+            "remote judge dispatch failed on {judge_dispatch_errors} of {} flag(s) after bounded \
+             retries — each affected flag was conservatively archived (if its own pass-1 failed) \
+             or demoted to needs-check (if pass-1 confirmed but a later pass failed), never \
+             silently confirmed",
+            judged.len()
+        ));
+    }
 
     if let Some(b) = &judge_budgets {
         if let Some(rec) = b.pass1.record() {
@@ -7181,6 +7205,13 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         let demoted = &env.judged[1];
         assert_eq!(demoted.tier, Tier::NeedsCheck);
         assert!(demoted.demoted_by_pass2);
+        // A green run must still SURFACE the transient failure — never fully
+        // silent (this repo's doctrine: loud beats quiet, no blind runs).
+        assert!(
+            env.warnings.iter().any(|w| w.contains("remote judge dispatch failed on 1 of 3 flag")),
+            "a minority dispatch error must be named in env.warnings even on a healthy run: {:?}",
+            env.warnings
+        );
     }
 
     /// (FIX 4) The LOCAL judge dispatch-failure path is UNCHANGED — a bad
