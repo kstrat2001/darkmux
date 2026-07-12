@@ -353,6 +353,17 @@ pub fn check_updates() -> bool {
     config().runtime.as_ref().and_then(|r| r.check_updates).unwrap_or(true)
 }
 
+// ── Mission board (#1230 Packet 5) ──
+/// How many days an Active mission may sit with zero `Complete` sprints
+/// before `darkmux mission status`'s drift detector flags it as stale.
+/// Resolves `env(DARKMUX_MISSION_STALE_ACTIVE_DAYS) >
+/// config.mission.stale_active_days > 14` — mirrors
+/// `remote_concurrent_cap`'s wiring exactly.
+pub fn mission_stale_active_days() -> u64 {
+    let cfg = config().mission.as_ref().and_then(|m| m.stale_active_days);
+    pick_parsed("DARKMUX_MISSION_STALE_ACTIVE_DAYS", cfg, Some(14)).unwrap()
+}
+
 // ── Directories (#661 Slice 3) ──
 // Dir accessors layer `env(DARKMUX_*_DIR) > config.dirs.X > built-in default`.
 // The env tier preserves today's exact behavior; the config tier (tilde-

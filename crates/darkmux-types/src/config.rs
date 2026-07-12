@@ -34,7 +34,11 @@ use std::path::Path;
 // 1.2 (#1260/#1177): additive `remote{}` block (remote.max_tokens_per_execution
 // — the per-pipeline-stage remote token allowance for endpoint-staffed crew
 // seats). Minor bump, same lenient-read reasoning.
-pub const CONFIG_SCHEMA_VERSION: &str = "1.2";
+// 1.3 (#1230 Packet 5): additive `mission{}` block (mission.stale_active_days
+// — the staleness threshold `darkmux mission status`'s drift detector uses
+// to flag an Active mission with zero Complete sprints). Minor bump, same
+// lenient-read reasoning.
+pub const CONFIG_SCHEMA_VERSION: &str = "1.3";
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
 /// `None`, so a fresh/empty config serializes to `{}` and any field absent
@@ -69,6 +73,8 @@ pub struct DarkmuxConfig {
     pub fleet: Option<FleetConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<RemoteConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mission: Option<MissionConfig>,
 
     /// Forward-compat overflow — unknown top-level keys land here and
     /// re-serialize flat (a newer config read by an older binary).
@@ -237,6 +243,19 @@ pub struct RemoteConfig {
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
+/// (#1230 Packet 5) Mission-board drift-detection knobs — consumed by
+/// `darkmux mission status`'s `detect_drift`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MissionConfig {
+    /// How many days an Active mission may sit with zero `Complete` sprints
+    /// before `mission status` flags it as stale (default 14). The concrete
+    /// motivating case: `doom-loop-m4` sat at 0/4 sprints for ~20 days with
+    /// no drift surfaced at all, because the pre-#1230-Packet-5 detector
+    /// only checked Closed+non-terminal and Active+all-terminal.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub stale_active_days: Option<u64>,
+    #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
 /// A machine's declared fleet position. `Standalone` (default) = a
 /// single-machine install with no fleet; `Hub` = the always-on coordinator
 /// (and, per #936, supervises its own Redis); `Peer` = points at a hub.
@@ -346,6 +365,10 @@ impl DarkmuxConfig {
             remote: Some(RemoteConfig {
                 max_tokens_per_execution: Some(500_000),
                 concurrent_cap: Some(4),
+                extras: Default::default(),
+            }),
+            mission: Some(MissionConfig {
+                stale_active_days: Some(14),
                 extras: Default::default(),
             }),
             extras: Default::default(),

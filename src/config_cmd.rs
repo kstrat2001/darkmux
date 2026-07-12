@@ -90,6 +90,8 @@ const KEYS: &[(&str, Ty)] = &[
     // (#1230 Packet 1) Max concurrent remote dispatches
     // `darkmux_crew::concurrent_dispatch::run_bounded` runs at once.
     ("remote.concurrent_cap", Ty::Uint),
+    // (#1230 Packet 5) `mission status`'s stale-active drift threshold.
+    ("mission.stale_active_days", Ty::Uint),
     ("dirs.flows", Ty::Str),
     ("dirs.audit", Ty::Str),
     ("dirs.notebook", Ty::Str),
