@@ -43,7 +43,7 @@ use darkmux_lab::lab::bundle::{
 };
 use darkmux_lab::lab::funnel::{
     run_funnel, run_judge_only, BundleInput, ChatCall, ExecMode, FunnelEmitter, FunnelEnvelope,
-    FunnelInputs, JudgeRecord, LmsCycler, ProbeFlag, Tier, VerifyRecord, VerifyRuling,
+    FunnelInputs, FunnelMissionRef, JudgeRecord, LmsCycler, ProbeFlag, Tier, VerifyRecord, VerifyRuling,
 };
 use darkmux_profiles::crews::{resolve_crew, ResolvedCrew};
 use darkmux_profiles::profiles::load_registry;
@@ -1362,6 +1362,21 @@ fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<FunnelEnvelope> {
     // dispatch bookend / funnel records and the liveness trail always agree.
     let case_id = case.clone();
 
+    // (#1230 Packet 4) One ephemeral, one-off Mission+Sprint per pr-review
+    // run — the "creates or attaches to a real Mission per PR review" half
+    // of the funnel migration, so a run finally shows up in `darkmux
+    // mission status`/the mission viewer like any other work, not just the
+    // fleet/session view. Mission/Sprint LIFECYCLE (create → start →
+    // complete/abandon) is this CALLER's job, not the funnel driver's —
+    // `run_funnel`/`run_judge_only` only need to know WHERE to persist
+    // their Task/Step graph (`FunnelInputs::mission`). Best-effort: a
+    // storage failure here is a loud stderr line, never a reason to skip
+    // the actual review the operator asked for.
+    let mission_ref = create_pr_review_mission(&case_id).unwrap_or_else(|e| {
+        eprintln!("darkmux: could not create a mission for this pr-review run: {e}");
+        None
+    });
+
     let inputs = FunnelInputs {
         case_id,
         crew: &crew,
@@ -1382,6 +1397,7 @@ fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<FunnelEnvelope> {
         // endpoint-staffed seats draw from it.
         remote_max_tokens_per_execution:
             darkmux_types::config_access::remote_max_tokens_per_execution(),
+        mission: mission_ref.clone(),
     };
 
     // (#1272) Bookend identity, captured before `inputs`/`crew` are moved
@@ -1399,7 +1415,12 @@ fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<FunnelEnvelope> {
     // api-version + Keychain auth + max_completion_tokens — the transport
     // `dispatch_remote` proved); a local call goes through LMStudio. The
     // system/user texts are identical either way (contract 6).
-    let mut chat = move |call: &ChatCall| -> Result<SingleShotReply> {
+    // (#1230 Packet 4) `Fn`, not `FnMut` — the funnel now dispatches probe
+    // seats and per-flag judge/verify calls CONCURRENTLY, so `chat` must be
+    // safely callable from multiple threads at once. This closure needed
+    // no change beyond the signature: it captures nothing mutable (`timeout`
+    // is `Copy`), so it was already `Fn`-shaped.
+    let chat = move |call: &ChatCall| -> Result<SingleShotReply> {
         match call.endpoint {
             Some(endpoint) => single_shot_chat_hosted(&HostedSingleShotRequest {
                 endpoint,
@@ -1420,7 +1441,7 @@ fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<FunnelEnvelope> {
             }),
         }
     };
-    let mut cycler = LmsCycler;
+    let cycler = LmsCycler;
     let mut emitter = FleetFlowEmitter;
 
     // (#1311) The flow machinery is now the write target — the very layer #563
@@ -1441,7 +1462,7 @@ fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<FunnelEnvelope> {
         ),
     );
 
-    if let Some(charges_path) = &opts.charges_file {
+    let result = if let Some(charges_path) = &opts.charges_file {
         let raw = std::fs::read_to_string(charges_path)
             .with_context(|| format!("reading --charges-file {}", charges_path.display()))?;
         let flags: Vec<ProbeFlag> = serde_json::from_str(&raw)
@@ -1451,7 +1472,7 @@ fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<FunnelEnvelope> {
             &case_id_for_bookends,
             &crew_name_for_bookends,
             model_for_bookends.as_deref(),
-            move |emitter| run_judge_only(flags, &inputs, &mut chat, &mut cycler, emitter),
+            move |emitter| run_judge_only(flags, &inputs, chat, cycler, emitter),
         )
     } else {
         with_dispatch_bookends(
@@ -1459,8 +1480,90 @@ fn run_dispatch(opts: &RunOpts, diff_text: &str) -> Result<FunnelEnvelope> {
             &case_id_for_bookends,
             &crew_name_for_bookends,
             model_for_bookends.as_deref(),
-            move |emitter| run_funnel(&inputs, &mut chat, &mut cycler, emitter),
+            move |emitter| run_funnel(&inputs, chat, cycler, emitter),
         )
+    };
+
+    if let Some(mission) = &mission_ref {
+        finish_pr_review_mission(mission, result.is_ok());
+    }
+    result
+}
+
+/// (#1230 Packet 4) Create + start an ephemeral, one-off Mission+Sprint for
+/// one `pr-review run` invocation — read + propose is N/A here (there's no
+/// pre-existing operator-authored mission to attach to; a funnel run IS a
+/// self-contained unit of work), so this creates fresh every time rather
+/// than searching for one to reuse. `None` (never a hard failure) if the
+/// crew storage layer can't be written to — the funnel still runs
+/// in-memory-only, matching pre-#1230 behavior exactly.
+fn create_pr_review_mission(case_id: &str) -> Result<Option<FunnelMissionRef>> {
+    use darkmux_crew::lifecycle;
+    use darkmux_crew::types::{Mission, MissionStatus, Sprint, SprintStatus};
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let slug: String = case_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let id = format!("pr-review-{slug}-{now}");
+
+    let mission = Mission {
+        id: id.clone(),
+        description: format!("PR review: {case_id}"),
+        status: MissionStatus::Active,
+        sprint_ids: vec![id.clone()],
+        created_ts: now,
+        started_ts: None,
+        closed_ts: None,
+        paused_ts: None,
+        source_input: None,
+        ticket: None,
+    };
+    lifecycle::create_mission(&mission).context("creating pr-review mission")?;
+    let sprint = Sprint {
+        id: id.clone(),
+        mission_id: id.clone(),
+        description: format!("review funnel run for {case_id}"),
+        status: SprintStatus::Planned,
+        depends_on: Vec::new(),
+        created_ts: now,
+        started_ts: None,
+        completed_ts: None,
+        abandoned_ts: None,
+        task_ids: Vec::new(),
+    };
+    lifecycle::create_sprint(&id, &sprint).context("creating pr-review sprint")?;
+    lifecycle::mission_start_with_reasoning(&id, Some("pr-review run dispatched"))
+        .context("starting pr-review mission")?;
+    lifecycle::sprint_start(&id).context("starting pr-review sprint")?;
+
+    Ok(Some(FunnelMissionRef { mission_id: id.clone(), sprint_id: id }))
+}
+
+/// Close out the ephemeral pr-review mission/sprint — `sprint complete` on
+/// a successful dispatch (`Ok`, regardless of the review's OWN tier
+/// outcome — a clean degenerate run still completed its work), `sprint
+/// abandon` on a dispatch-level `Err` (the funnel itself failed to run).
+/// Best-effort: a lifecycle-transition failure is a loud stderr line, never
+/// a reason to change the dispatch's own exit code.
+fn finish_pr_review_mission(mission: &FunnelMissionRef, dispatch_ok: bool) {
+    use darkmux_crew::lifecycle;
+
+    let sprint_result = if dispatch_ok {
+        lifecycle::sprint_complete(&mission.sprint_id)
+    } else {
+        lifecycle::sprint_abandon(&mission.sprint_id)
+    };
+    if let Err(e) = sprint_result {
+        eprintln!("darkmux: could not close pr-review sprint `{}`: {e}", mission.sprint_id);
+    }
+    let reasoning = if dispatch_ok { "pr-review run completed" } else { "pr-review run failed to dispatch" };
+    if let Err(e) = lifecycle::mission_close_with_reasoning(&mission.mission_id, Some(reasoning)) {
+        eprintln!("darkmux: could not close pr-review mission `{}`: {e}", mission.mission_id);
     }
 }
 

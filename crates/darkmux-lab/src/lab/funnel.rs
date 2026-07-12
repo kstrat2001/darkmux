@@ -134,7 +134,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -160,15 +160,10 @@ pub enum ExecMode {
     Auto,
 }
 
-fn mode_label(mode: ExecMode) -> &'static str {
-    match mode {
-        ExecMode::Sequential => "sequential",
-        ExecMode::Parallel => "parallel",
-        // `resolve_mode` always turns `Auto` into one of the above before
-        // this is ever read into an envelope; kept for exhaustiveness.
-        ExecMode::Auto => "auto",
-    }
-}
+// (#1230 Packet 4) `mode_label` retired alongside `resolve_mode` — see the
+// doc comment above `ExecMode`'s last remaining reference (`FunnelInputs::
+// mode`) for why the value no longer drives an `env.mode` label; `env.mode`
+// is now the constant `"concurrent"` every run reports.
 
 // ─── probe flags ──────────────────────────────────────────────────────────
 
@@ -377,85 +372,17 @@ impl FunnelEmitter for NullEmitter {
     fn emit(&mut self, _record: darkmux_flow::FlowRecord) {}
 }
 
-const FUNNEL_TASK_ACTION: &str = "funnel.task";
-const FUNNEL_STEP_ACTION: &str = "funnel.step";
-const FUNNEL_RULING_ACTION: &str = "funnel.ruling";
-
-/// Build one funnel observability record. `handle` = the crew name (this
-/// funnel's addressable identity, the role `handle` plays for `crew
-/// dispatch`'s per-role records); `session_id` = the case id (one funnel
-/// RUN's identity, the role `session_id` plays for a single dispatch).
-/// `source = "funnel"` distinguishes these from `crew_dispatch`/
-/// `sprint_review` records that may share the same sink. `category = Work`
-/// / `tier = Local` / `stage = Dispatch` mirror `crew dispatch`'s own
-/// per-turn records (`dispatch.tool`, `dispatch.turn`) — the funnel is,
-/// mechanically, a multi-dispatch alternative shape of the same "produce a
-/// local review" job.
-fn funnel_flow_record(
-    case_id: &str,
-    crew_name: &str,
-    action: &str,
-    level: darkmux_flow::Level,
-    payload: serde_json::Value,
-) -> darkmux_flow::FlowRecord {
-    darkmux_flow::FlowRecord {
-        ts: darkmux_flow::ts_utc_now(),
-        level,
-        category: darkmux_flow::Category::Work,
-        tier: darkmux_flow::Tier::Local,
-        stage: darkmux_flow::Stage::Dispatch,
-        action: action.to_string(),
-        handle: crew_name.to_string(),
-        sprint_id: None,
-        session_id: Some(case_id.to_string()),
-        source: Some("funnel".to_string()),
-        model: None,
-        reasoning: None,
-        mission_id: None,
-        machine_id: None,
-        machine_uid: None,
-        orchestrator: None,
-        prev_hash: None,
-        hash: None,
-        payload: Some(payload),
-        work_id: None,
-        attempt: None,
-    }
-}
-
-/// The `funnel.task` "finished" record's payload + level, shared by every
-/// return point (`run_funnel`'s two early degenerate returns,
-/// `run_judge_only`'s one, and `finish_funnel`'s normal end) so the shape
-/// can't drift between call sites. `Level::Warn` when `env.degenerate` is
-/// set — a degenerate run is a loud, scoreable outcome, never quietly
-/// `Info`.
-fn task_finished_record(env: &FunnelEnvelope) -> darkmux_flow::FlowRecord {
-    let mut payload = json!({
-        "status": "finished",
-        "case_id": env.case_id,
-        "crew": env.crew,
-        "confirmed": env.confirmed,
-        "needs_check": env.needs_check,
-        "archived": env.archived,
-    });
-    if let Some(reason) = &env.degenerate {
-        payload["degenerate"] = serde_json::Value::String(reason.clone());
-    }
-    // (#1260/#1186) Remote-seat tokens, carried separately so downstream
-    // savings surfaces can EXCLUDE them — cloud tokens are never counted
-    // "off the meter". Present iff any seat dispatched remotely.
-    if env.members.iter().any(|m| m.remote) {
-        let remote_tokens: u64 = env.members.iter().filter(|m| m.remote).map(|m| m.total_tokens).sum();
-        payload["remote_tokens"] = remote_tokens.into();
-    }
-    if !env.warnings.is_empty() {
-        payload["warnings"] = serde_json::Value::Array(
-            env.warnings.iter().map(|w| serde_json::Value::String(w.clone())).collect(),
-        );
-    }
-    let level = if env.degenerate.is_some() { darkmux_flow::Level::Warn } else { darkmux_flow::Level::Info };
-    funnel_flow_record(&env.case_id, &env.crew, FUNNEL_TASK_ACTION, level, payload)
-}
+// (#1230 Packet 4) `funnel.task`/`funnel.step`/`funnel.ruling` — retired.
+// The scheduler's own step-lifecycle records ("step start"/"step
+// complete"/"step error", `darkmux_crew::scheduler::run_step_graph`) plus
+// the persisted Task/Step graph (queryable via `darkmux mission status`/the
+// mission viewer once #657's transport lands) are the "forward-port to the
+// generic mission-flow graph view unchanged" promise the original module
+// doc named — this IS that promise kept, not a dropped feature. Per-ruling
+// detail (bundle_id/pass/ruling/seconds) that the retired `funnel.ruling`
+// ticker carried now lives on each judge Step's own persisted `output`
+// (the full ruling JSON), inspectable per-step rather than replayed from a
+// live ticker.
 
 // ─── host telemetry sampling (#1247 doctrine surface) ────────────────────
 
@@ -612,241 +539,18 @@ impl Drop for HostTelemetrySampler {
     }
 }
 
-/// Adapts a [`FunnelEmitter`] to `darkmux_flow`'s generic
-/// [`darkmux_flow::BookendSink`] (#1230 Packet 0) so [`FunnelBookendGuard`]
-/// can wrap `darkmux_flow::BookendGuard` without `darkmux-flow` (a
-/// dependency LEAF) knowing this crate's own emitter trait exists. A local
-/// type implementing a foreign trait — no orphan-rule friction.
-struct EmitterSink<'a>(&'a mut dyn FunnelEmitter);
-
-impl darkmux_flow::BookendSink for EmitterSink<'_> {
-    fn emit(&mut self, record: darkmux_flow::FlowRecord) {
-        self.0.emit(record);
-    }
-}
-
-/// (#1247 review round, unified onto `darkmux_flow::BookendGuard` in #1230
-/// Packet 0) Bookend guard for the funnel's flow-record lifecycle — same
-/// class of problem `darkmux-crew`'s `DispatchBookendGuard` (#717) solves
-/// for `dispatch.start`: once `funnel.task started` is emitted, the driver
-/// can still `?`-return before the clean `finished` bookend (a probe
-/// dispatch error, a cycler load/release failure) — or panic. Without a
-/// terminal record that leaves an orphaned task (rendering as perpetually
-/// in-flight to any consumer) plus whatever step-`started` records were
-/// open at the abort point.
-///
-/// All driver emission routes THROUGH this guard, which delegates the
-/// task/step open-stack bookkeeping to the shared `darkmux_flow::BookendGuard`
-/// (`inner`) — the task itself is pushed as one open unit (`kind == "task"`)
-/// and each step nests inside it as another (`kind` = the step's own kind,
-/// `"dispatch"`/`"procedural"`), so `inner`'s Drop pops every still-open
-/// unit innermost-first (steps before the task) and builds the right
-/// `funnel.step`- or `funnel.task`-shaped abort record via its `on_abort`
-/// closure — every `started` gets a matching terminal event, on every path.
-/// The clean finish (`task_finished`, which every success/degenerate return
-/// point calls) closes the task unit, disarming `inner` once the stack
-/// empties — a run that reached its own terminal record is never
-/// double-counted.
-///
-/// Emission on `Drop` is best-effort by construction — [`FunnelEmitter`]
-/// impls are already infallible (`emit` returns nothing), so a sink problem
-/// can't mask the original error propagating out.
-///
-/// Also owns the run's [`HostTelemetrySampler`] (#1247 doctrine surface):
-/// started in [`Self::new`]/[`Self::new_with_telemetry`] and
-/// stopped by its own `Drop` — which Rust runs automatically as a field of
-/// this struct, right after `FunnelBookendGuard`'s own `Drop::drop` body
-/// returns, so the sampler thread never outlives the guard on any exit
-/// path. This telemetry-draining half is genuinely funnel-specific (it
-/// doesn't belong in `darkmux-flow`) — only the open/close stack moved.
-struct FunnelBookendGuard<'a> {
-    case_id: String,
-    crew: String,
-    inner: darkmux_flow::BookendGuard<'a, EmitterSink<'a>>,
-    telemetry: HostTelemetrySampler,
-}
-
-/// The fixed unit id/kind [`FunnelBookendGuard::task_started`]/
-/// [`FunnelBookendGuard::task_finished`] open/close under — the funnel has
-/// exactly one task per run, so this is a constant rather than something
-/// derived per-call. `inner`'s `on_abort` closure matches on `kind == this`
-/// to decide whether a still-open unit at Drop time needs a `funnel.task`-
-/// or `funnel.step`-shaped abort record.
-const FUNNEL_TASK_UNIT_KIND: &str = "task";
-
-impl<'a> FunnelBookendGuard<'a> {
-    fn new(sink: &'a mut EmitterSink<'a>, case_id: &str, crew: &str) -> Self {
-        Self::new_with_telemetry(
-            sink,
-            case_id,
-            crew,
-            FUNNEL_TELEMETRY_INTERVAL,
-            FUNNEL_TELEMETRY_POLL,
-            sample_host,
-        )
-    }
-
-    /// Same as [`Self::new`] but with a caller-chosen telemetry cadence
-    /// AND sampling function — the test-only seam a scripted run uses to
-    /// observe deterministic samples without a multi-second sleep and
-    /// without shelling to the real (macOS-only, ~600-900ms-per-call)
-    /// `top`/`vm_stat`/`ioreg` commands. Production always goes through
-    /// `new`, which fixes the cadence at [`FUNNEL_TELEMETRY_INTERVAL`]
-    /// and the sampler at the real `sample_host`.
-    fn new_with_telemetry(
-        sink: &'a mut EmitterSink<'a>,
-        case_id: &str,
-        crew: &str,
-        telemetry_interval: Duration,
-        telemetry_poll: Duration,
-        sample_fn: fn() -> HostSample,
-    ) -> Self {
-        let case_id_owned = case_id.to_string();
-        let crew_owned = crew.to_string();
-        let on_abort = move |id: &str, kind: &str| -> darkmux_flow::FlowRecord {
-            if kind == FUNNEL_TASK_UNIT_KIND {
-                funnel_flow_record(
-                    &case_id_owned,
-                    &crew_owned,
-                    FUNNEL_TASK_ACTION,
-                    darkmux_flow::Level::Error,
-                    json!({
-                        "status": "error",
-                        "case_id": case_id_owned,
-                        "crew": crew_owned,
-                        "error": "funnel terminated before completion (early return or panic)",
-                    }),
-                )
-            } else {
-                funnel_flow_record(
-                    &case_id_owned,
-                    &crew_owned,
-                    FUNNEL_STEP_ACTION,
-                    darkmux_flow::Level::Error,
-                    json!({ "step_id": id, "kind": kind, "status": "error" }),
-                )
-            }
-        };
-        Self {
-            telemetry: HostTelemetrySampler::start(
-                case_id.to_string(),
-                crew.to_string(),
-                telemetry_interval,
-                telemetry_poll,
-                sample_fn,
-            ),
-            case_id: case_id.to_string(),
-            crew: crew.to_string(),
-            inner: darkmux_flow::BookendGuard::new(sink, on_abort),
-        }
-    }
-
-    /// Drain every telemetry sample buffered since the last drain and emit
-    /// each through the same sink the driver's own records go through —
-    /// called immediately before every record this guard emits (see
-    /// [`Self::emit_now`]) so telemetry streams alongside the run rather
-    /// than batching at the end.
-    fn drain_telemetry(&mut self) {
-        let records: Vec<darkmux_flow::FlowRecord> = self.telemetry.rx.try_iter().collect();
-        for record in records {
-            self.inner.emit_now(record);
-        }
-    }
-
-    /// Drain pending telemetry, then emit `record` with no open/close
-    /// bookend of its own. Every direct emission in this guard routes
-    /// through here so telemetry ordering stays close to wall-clock
-    /// without needing the sampler thread to touch the sink itself.
-    fn emit_now(&mut self, record: darkmux_flow::FlowRecord) {
-        self.drain_telemetry();
-        self.inner.emit_now(record);
-    }
-
-    /// Emit the `funnel.task started` bookend and ARM the guard — from here
-    /// until `task_finished`, an early return or panic fires the Drop path.
-    fn task_started(&mut self, payload: serde_json::Value) {
-        self.drain_telemetry();
-        let started = funnel_flow_record(
-            &self.case_id,
-            &self.crew,
-            FUNNEL_TASK_ACTION,
-            darkmux_flow::Level::Info,
-            payload,
-        );
-        self.inner.open(FUNNEL_TASK_UNIT_KIND, FUNNEL_TASK_UNIT_KIND, started);
-    }
-
-    /// Emit a `funnel.step` `status: "started"` record and track the step
-    /// as open until [`Self::step_finished`] closes it.
-    fn step_started(&mut self, step_id: &str, kind: &str, payload: serde_json::Value) {
-        self.drain_telemetry();
-        let started = funnel_flow_record(
-            &self.case_id,
-            &self.crew,
-            FUNNEL_STEP_ACTION,
-            darkmux_flow::Level::Info,
-            payload,
-        );
-        self.inner.open(step_id, kind, started);
-    }
-
-    /// Emit a `funnel.step` `status: "finished"` record and close the step.
-    /// Also the entry point for one-shot steps that emit `finished` with no
-    /// prior `started` (`bundle`, `dedup` — instantaneous procedural steps);
-    /// the close is then a no-op on the open-step stack.
-    fn step_finished(&mut self, step_id: &str, payload: serde_json::Value) {
-        self.drain_telemetry();
-        let finished = funnel_flow_record(
-            &self.case_id,
-            &self.crew,
-            FUNNEL_STEP_ACTION,
-            darkmux_flow::Level::Info,
-            payload,
-        );
-        self.inner.close(step_id, finished);
-    }
-
-    /// Emit a `funnel.ruling` ticker record (no open/close semantics).
-    fn ruling(&mut self, payload: serde_json::Value) {
-        self.emit_now(funnel_flow_record(
-            &self.case_id,
-            &self.crew,
-            FUNNEL_RULING_ACTION,
-            darkmux_flow::Level::Info,
-            payload,
-        ));
-    }
-
-    /// Emit the terminal `funnel.task` record for `env` (finished, or
-    /// degenerate-finished — see [`task_finished_record`]) and close the
-    /// task unit: this run reached its own terminal record, so `inner`
-    /// disarms once the stack empties (every real call site already closed
-    /// its own steps before calling this, so the stack is just `[task]`).
-    fn task_finished(&mut self, env: &FunnelEnvelope) {
-        self.drain_telemetry();
-        self.inner.close(FUNNEL_TASK_UNIT_KIND, task_finished_record(env));
-    }
-}
-
-impl Drop for FunnelBookendGuard<'_> {
-    fn drop(&mut self) {
-        // Flush any sample the sampler produced since the last drain — even
-        // on the clean-finish path (`task_finished` already closed `inner`'s
-        // task unit), a sample can land in the brief window between that
-        // drain and this `Drop` running. `inner`'s own Drop (a field of this
-        // struct, run automatically right after this function returns) then
-        // emits abort records for any still-open units through the same
-        // sink if it's still armed. The sampler thread itself stops right
-        // after, via `HostTelemetrySampler`'s own `Drop` (also a field,
-        // torn down last), so it never outlives the guard on any exit path.
-        //
-        // Known, accepted loss window: a sample the sampler thread sends
-        // AFTER this final drain but BEFORE the join in the sampler's
-        // `Drop` completes is dropped with the channel — at most one
-        // final-tick sample, consistent with the sampler's best-effort
-        // framing (telemetry never blocks or extends teardown to chase
-        // one more data point).
-        self.drain_telemetry();
+/// (#1230 Packet 4) Drain every telemetry sample buffered since the
+/// sampler started (or was last drained) through `emitter` — called after
+/// each graph stage completes (not just once at the end) so samples from a
+/// longer-running stage aren't held back until the whole run finishes. This
+/// is a coarser interleaving granularity than the retired
+/// `FunnelBookendGuard` gave (which drained before every single flow
+/// record); still satisfies the "no blind runs" doctrine's "streams
+/// durably as it happens, never end-of-run-only" bar — a killed run keeps
+/// every sample through its last completed stage, not zero.
+fn drain_telemetry(sampler: &HostTelemetrySampler, emitter: &mut dyn FunnelEmitter) {
+    for record in sampler.rx.try_iter() {
+        emitter.emit(record);
     }
 }
 
@@ -1133,9 +837,19 @@ fn staffing_snapshot(
 /// Load/release one [`ProfileModel`] into/out of LMStudio. Injected so
 /// tests can assert on cycling ORDER via a recording mock without a live
 /// LMStudio; production dispatch uses [`LmsCycler`].
-pub trait ModelCycler {
-    fn ensure_loaded(&mut self, pm: &ProfileModel) -> Result<()>;
-    fn release(&mut self, pm: &ProfileModel) -> Result<()>;
+///
+/// (#1230 Packet 4) `&self`, not `&mut self` — the funnel's probe/judge
+/// steps now run through the Task/Step graph engine, which may execute
+/// several steps CONCURRENTLY (each on its own thread, via Packet 1's
+/// `run_bounded`). An `Arc<dyn ModelCycler>` shared across those threads
+/// can't offer `&mut self` without a lock that would re-serialize the very
+/// concurrency this packet exists to add; `LmsCycler`'s own body never
+/// needed the mutation (it always constructed a fresh `LmsHost` per call),
+/// so this is a signature-only change — a `RecordingCycler` test double
+/// now guards its recorded log with a `Mutex` instead of a `RefCell`.
+pub trait ModelCycler: Send + Sync {
+    fn ensure_loaded(&self, pm: &ProfileModel) -> Result<()>;
+    fn release(&self, pm: &ProfileModel) -> Result<()>;
 }
 
 /// Production [`ModelCycler`] (#1230 Packet 1 cutover): every residency
@@ -1198,7 +912,7 @@ fn inert_estimator() -> V1Estimator {
 }
 
 impl ModelCycler for LmsCycler {
-    fn ensure_loaded(&mut self, pm: &ProfileModel) -> Result<()> {
+    fn ensure_loaded(&self, pm: &ProfileModel) -> Result<()> {
         let n_ctx = pm.require_n_ctx()?;
         let identifier = darkmux_gestalt::namespaced_identifier(&pm.id, pm.identifier.as_deref());
         let mut host = LmsHost::new();
@@ -1247,7 +961,7 @@ impl ModelCycler for LmsCycler {
         Ok(())
     }
 
-    fn release(&mut self, pm: &ProfileModel) -> Result<()> {
+    fn release(&self, pm: &ProfileModel) -> Result<()> {
         let identifier = darkmux_gestalt::namespaced_identifier(&pm.id, pm.identifier.as_deref());
         let mut host = LmsHost::new();
         let facts = gather_facts(&mut host)?;
@@ -1301,87 +1015,23 @@ fn resolve_seat_max_tokens(s: &ResolvedSeatStaffing, local_default: u32) -> u32 
     }
 }
 
-/// (#1230 Packet 1 cutover) Auto-resolution: `Parallel` iff gestalt's
-/// co-residency wave scheduler ([`darkmux_gestalt::plan_waves`],
-/// `WaveMode::Auto`) packs every distinct LOCAL model (probe seats + judge,
-/// deduped) into ONE wave — i.e. the same arithmetic `plan_acquire`'s
-/// budget/pool-headroom arms use judges them safe to hold resident
-/// together, against REAL facts (a live `MacProbe` pool snapshot, and the
-/// #1243 AI-RAM budget when an operator has configured one). More than one
-/// wave means they don't fit — the same shape `Sequential` always meant,
-/// now DERIVED from live facts instead of a static hardware-tier lookup
-/// table.
-///
-/// Replaces the deleted `resolve_auto` tier table. `darkmux_gestalt::waves`'s
-/// own module doc already claimed the hardware-tier-threshold concept "was
-/// removed end-to-end in #602/#604/#605" — that claim was aspirational until
-/// this function, the funnel's last holdout, stopped re-deriving one.
-fn wave_schedule_to_exec_mode(schedule: &darkmux_gestalt::WaveSchedule) -> ExecMode {
-    if schedule.waves.len() <= 1 {
-        ExecMode::Parallel
-    } else {
-        ExecMode::Sequential
-    }
-}
-
-/// Gathers real facts and asks gestalt's wave scheduler whether `placements`
-/// fit one wave. Separated from [`wave_schedule_to_exec_mode`] (the pure
-/// projection, directly unit-testable against a scripted `WaveSchedule`) so
-/// the I/O — `LmsHost::list_resident` + `MacProbe::pools`, the SAME adapters
-/// [`LmsCycler`] wires — lives in exactly one place. A residency-read
-/// failure degrades to `Sequential` (never guess `Parallel` without knowing
-/// what's already resident) with a loud stderr line, never a silent
-/// downgrade to a riskier mode.
-fn resolve_auto_via_waves(placements: &[Placement]) -> ExecMode {
-    if placements.is_empty() {
-        return ExecMode::Parallel;
-    }
-    let mut host = LmsHost::new();
-    let facts = match gather_facts(&mut host) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!(
-                "darkmux: could not resolve auto exec mode from live LMStudio state, \
-                 defaulting to sequential: {e}"
-            );
-            return ExecMode::Sequential;
-        }
-    };
-    match darkmux_gestalt::plan_waves(placements, &facts, &inert_estimator(), darkmux_gestalt::WaveMode::Auto)
-    {
-        Ok(schedule) => wave_schedule_to_exec_mode(&schedule),
-        // `Auto` mode never refuses (only `ForceParallel` can, per
-        // `plan_waves`'s own doc) — kept for exhaustiveness rather than an
-        // unwrap on a real dispatch path.
-        Err(_) => ExecMode::Sequential,
-    }
-}
-
-fn resolve_mode(mode: ExecMode, probes: &[ResolvedSeatStaffing], judge: &ResolvedSeatStaffing) -> ExecMode {
-    match mode {
-        ExecMode::Auto => {
-            // (#1260) Only LOCAL models count toward the residency budget —
-            // a remote seat is a zero-footprint placement (nothing loaded,
-            // no pool bytes), so it never forces Sequential.
-            let mut placements: Vec<Placement> = Vec::new();
-            let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-            for s in probes.iter().chain(std::iter::once(judge)).filter(|s| !s.pm.is_remote()) {
-                let identifier = darkmux_gestalt::namespaced_identifier(&s.pm.id, s.pm.identifier.as_deref());
-                if !seen.insert(identifier.clone()) {
-                    continue; // dedup — a repeated model needs one placement, not one per seat
-                }
-                placements.push(Placement {
-                    model_key: s.pm.id.clone(),
-                    identifier,
-                    min_ctx: s.pm.n_ctx.unwrap_or(0),
-                    seat: "funnel-auto".to_string(),
-                });
-            }
-            resolve_auto_via_waves(&placements)
-        }
-        other => other,
-    }
-}
+// (#1230 Packet 4) `ExecMode`/`resolve_mode`'s old job — deciding
+// Sequential-vs-Parallel LMStudio residency choreography — is now
+// gestalt's, decided per-step via `StepKind::residency` +
+// `concurrent_dispatch::run_bounded`'s wave planning (real facts, every
+// run, not a caller-declared preference). `FunnelInputs::mode` and the
+// `--mode` CLI flag survive for backward compatibility (an operator's
+// existing `--mode sequential` invocation must not become an unrecognized
+// flag), but the value is now fully VESTIGIAL — every run schedules
+// through gestalt's wave planner regardless of what's passed, silently.
+// (An earlier draft of this migration surfaced a per-run envelope warning
+// for any non-`Auto` value; dropped — `ExecMode::Sequential` is every
+// existing test fixture's and CLI default's own value, so that warning
+// fired on nearly every run, which is exactly the "warning fatigue drowns
+// the signal" failure the loud-beats-quiet doctrine warns against. The
+// field's retirement is real and documented HERE, in code; a future
+// packet may remove the flag entirely once operators have had time to
+// notice via this doc comment / the CHANGELOG rather than a runtime nag.)
 
 // ─── crew validation (funnel-owned seat requirements) ───────────────────
 
@@ -2034,7 +1684,7 @@ pub fn parse_verify_ruling(text: &str) -> Option<(VerifyRuling, String, String)>
 /// sheet. Deliberately THIS module's own shape — see the module doc's
 /// "Bundling — the packet 3 seam" section for why, and [`bundles_from_diff`]
 /// for the reconciliation point.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BundleInput {
     pub id: String,
     pub fact_family: String,
@@ -2165,6 +1815,13 @@ pub struct ChatCall<'a> {
     pub endpoint: Option<&'a ModelEndpoint>,
 }
 
+/// (#1230 Packet 4) The shared, thread-safe chat dispatch handle every
+/// funnel step kind holds a clone of — `Arc<dyn Fn(..) + Send + Sync>` so
+/// concurrently-running steps can call it from multiple threads at once
+/// (clippy's `type_complexity` name for the alternative: spelling this
+/// bound out at every one of the ~10 call sites that need it).
+pub type ChatFn = Arc<dyn Fn(&ChatCall) -> Result<SingleShotReply> + Send + Sync>;
+
 // ─── funnel inputs ────────────────────────────────────────────────────────
 
 /// Everything [`run_funnel`]/[`run_judge_only`] need beyond the injected
@@ -2220,6 +1877,12 @@ pub struct FunnelInputs<'a> {
     /// max_tokens_per_execution > 500000`) — injected here, not read in the
     /// driver, so the pipeline stays config-free and unit-testable.
     pub remote_max_tokens_per_execution: u64,
+    /// (#1230 Packet 4) Where to persist this run's Task/Step graph — see
+    /// [`FunnelMissionRef`]. `None` (the default) keeps the run purely
+    /// in-memory: this module's own tests and `darkmux lab review-bench
+    /// --funnel` never want `~/.darkmux/missions` writes (the lab-vs-fleet
+    /// scope boundary). `darkmux pr-review run` passes `Some`.
+    pub mission: Option<FunnelMissionRef>,
 }
 
 fn fingerprint(judge_identifier: &str, judge_system: &str) -> serde_json::Value {
@@ -2273,7 +1936,7 @@ fn probe_user_message(prior: &str, bundle: &BundleInput) -> String {
 /// the remote bucket + member accounting even on the empty (`None`) outcome,
 /// exactly as the judge/verify retry paths bill both attempts (`t1 + t2`).
 fn probe_one_draw(
-    chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
+    chat: &dyn Fn(&ChatCall) -> Result<SingleShotReply>,
     model: &str,
     system: &str,
     user: &str,
@@ -2307,88 +1970,68 @@ fn probe_one_draw(
     Ok((None, tokens, served))
 }
 
-/// One probe seat's dispatch — a `funnel.step` pair (`step_id =
-/// "probe:<staffing-name>"`, #1247 Part 1) brackets the seat's whole
-/// draw loop so a live ticker sees per-seat progress inside a multi-seat
-/// probe phase, not just the phase-level aggregate `probe_phase` records.
-///
-/// (#1260) A REMOTE staffing differs in exactly three ways:
-/// - its calls carry the endpoint (routed through the hosted dialect by
-///   the caller's `chat` closure) and draw from the probe stage's shared
-///   remote token `bucket` — an exhausted bucket skips the remaining
-///   remote draws (counted, named in the envelope);
-/// - a dispatch-level failure (after the transport's bounded retries) is
-///   a WARNING + reduced coverage, not a run abort — the remaining seats
-///   and the judge still run (`warnings` carries the named reason). Local
-///   seats keep the propagate-and-abort behavior unchanged;
-/// - its `funnel.step` records carry `remote: true` + the endpoint host.
+/// One probe seat's dispatch outcome, pre-flow-record: the produced flags,
+/// the seat's `MemberRecord`, and (#1260) a warning line when a REMOTE
+/// seat's dispatch failed after bounded retries (reduced coverage, never a
+/// run abort). A LOCAL dispatch-level failure still propagates as `Err` —
+/// an LMStudio failure is a harness problem the caller must see, not a
+/// per-seat warning.
+struct ProbeSeatOutcome {
+    member: MemberRecord,
+    flags: Vec<ProbeFlag>,
+    warning: Option<String>,
+}
+
+/// (#1230 Packet 4) One probe seat's WHOLE draw loop — the exact logic the
+/// pre-migration `dispatch_probe_staffing` ran, relocated out from under
+/// `FunnelBookendGuard` (retired) so it can run as one `dispatch.
+/// funnel_probe` Step body: no `&mut` shared state, `bucket` is a
+/// `Mutex`-guarded handle so concurrently-running SIBLING probe steps can
+/// share the probe stage's ONE remote token bucket safely (#1260's
+/// contract — one execution per stage — still holds; only the ADMISSION
+/// ORDER across concurrent seats is no longer strictly sequential, an
+/// acknowledged, in-scope consequence of genuine concurrency, see the PR
+/// description). Review logic (retry, dedup-key fields, token billing) is
+/// untouched from the pre-migration function.
 #[allow(clippy::too_many_arguments)]
-fn dispatch_probe_staffing(
+fn dispatch_probe_staffing_core(
     s: &ResolvedSeatStaffing,
     bundles: &[BundleInput],
-    inputs: &FunnelInputs,
-    chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
-    flags: &mut Vec<ProbeFlag>,
-    guard: &mut FunnelBookendGuard<'_>,
-    bucket: &mut RemoteBucket,
-    warnings: &mut Vec<String>,
-) -> Result<MemberRecord> {
+    probe_system: &str,
+    chat: &dyn Fn(&ChatCall) -> Result<SingleShotReply>,
+    bucket: &Mutex<RemoteBucket>,
+) -> Result<ProbeSeatOutcome> {
     let identifier = seat_identifier(&s.pm);
     let endpoint = seat_endpoint(&s.pm);
     let endpoint_host = seat_endpoint_host(&s.pm);
     let max_tokens = resolve_seat_max_tokens(s, DEFAULT_PROBE_MAX_TOKENS);
     let selected = select_bundles_for_staffing(bundles, s.selector.as_ref());
-    let step_id = format!("probe:{}", s.name);
-    let draws_total = selected.len() as u32 * s.k;
-    let mut started = json!({
-        "step_id": step_id, "kind": "dispatch", "status": "started",
-        "items_in": selected.len(), "items_out": 0, "wall_ms": 0,
-        "model": identifier, "draws_done": 0, "draws_total": draws_total,
-    });
-    if let Some(host) = &endpoint_host {
-        started["remote"] = true.into();
-        started["endpoint"] = host.clone().into();
-    }
-    guard.step_started(&step_id, "dispatch", started);
     let t0 = Instant::now();
     let mut draws = 0u32;
     let mut tokens = 0u64;
-    // (#1300) The FIRST served model reported by any draw's response —
-    // remote-only (a local seat's replies never carry `model`); one
-    // deployment aliasing to one underlying model for the whole run is the
-    // expected shape, so first-seen is representative without needing to
-    // detect drift across draws.
     let mut served_model: Option<String> = None;
-    let flags_before = flags.len();
+    let mut flags: Vec<ProbeFlag> = Vec::new();
+    let mut warning: Option<String> = None;
     'staffing: for bundle in &selected {
-        let user = probe_user_message(inputs.probe_system, bundle);
+        let user = probe_user_message(probe_system, bundle);
         for draw in 0..s.k {
             // (#1260) Remote draws gate on the probe stage's shared bucket
             // BEFORE dispatch; a skipped draw is counted, never billed.
-            if endpoint.is_some() && !bucket.admit() {
+            if endpoint.is_some() && !bucket.lock().expect("probe bucket poisoned").admit() {
                 continue;
             }
             draws += 1;
             // Empty system — Phase A parity (#1256): probe-runner.py's
             // `call_model` sends ONE user-role message, no system message
-            // at all. `single_shot::local_chat_body` omits the system
-            // entry entirely when it's empty, so this is the wire-level
-            // no-system-message behavior, not a system message with blank
-            // content.
+            // at all.
             match probe_one_draw(chat, &identifier, "", &user, max_tokens, endpoint) {
-                // (#1260) EVERY attempt's tokens are billed — including a draw
-                // that came back empty after the retry. Hosted reasoning burns
-                // the full budget thinking and returns empty; that spend is
-                // real, so it lands in the member total AND the remote bucket
-                // whether or not a flag was produced. Only a non-empty content
-                // becomes a flag.
                 Ok((content, tok, served)) => {
                     tokens += tok;
                     if served_model.is_none() {
                         served_model = served;
                     }
                     if endpoint.is_some() {
-                        bucket.spend(tok, 1);
+                        bucket.lock().expect("probe bucket poisoned").spend(tok, 1);
                     }
                     if let Some(text) = content {
                         flags.push(ProbeFlag {
@@ -2402,15 +2045,8 @@ fn dispatch_probe_staffing(
                         });
                     }
                 }
-                // (#1260) A remote seat's dispatch failure — AFTER the
-                // shared transport's bounded 429 retries — degrades to a
-                // named warning + reduced coverage; each failed call has
-                // already burned the full backoff ladder, so the seat's
-                // remaining draws are abandoned rather than retried into
-                // the same wall. Local seats keep the abort (an LMStudio
-                // failure is a harness problem the operator must see).
                 Err(e) if endpoint.is_some() => {
-                    warnings.push(format!(
+                    warning = Some(format!(
                         "remote probe seat \"{}\" ({identifier}) failed after bounded retries — \
                          remaining draws skipped (reduced coverage): {e}",
                         s.name
@@ -2422,76 +2058,20 @@ fn dispatch_probe_staffing(
         }
     }
     let wall_ms = t0.elapsed().as_millis() as u64;
-    let flags_produced = flags.len() - flags_before;
-    let mut finished = json!({
-        "step_id": step_id, "kind": "dispatch", "status": "finished",
-        "items_in": selected.len(), "items_out": flags_produced, "wall_ms": wall_ms,
-        "model": identifier, "draws_done": draws, "draws_total": draws_total, "tokens": tokens,
-    });
-    if let Some(host) = &endpoint_host {
-        finished["remote"] = true.into();
-        finished["endpoint"] = host.clone().into();
-    }
-    guard.step_finished(&step_id, finished);
-    Ok(MemberRecord {
-        model: identifier,
-        seat: "review-probe".to_string(),
-        draws,
-        wall_ms,
-        total_tokens: tokens,
-        remote: endpoint.is_some(),
-        endpoint: endpoint_host,
-        served_model,
+    Ok(ProbeSeatOutcome {
+        member: MemberRecord {
+            model: identifier,
+            seat: "review-probe".to_string(),
+            draws,
+            wall_ms,
+            total_tokens: tokens,
+            remote: endpoint.is_some(),
+            endpoint: endpoint_host,
+            served_model,
+        },
+        flags,
+        warning,
     })
-}
-
-/// (#1260) Remote staffings skip the cycler entirely on every path below —
-/// there is nothing to load or unload for a seat whose model computes
-/// off-box, and minting a residency operation for one would be the #1135
-/// class of phantom state.
-#[allow(clippy::too_many_arguments)]
-fn probe_phase(
-    bundles: &[BundleInput],
-    probes: &[ResolvedSeatStaffing],
-    inputs: &FunnelInputs,
-    chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
-    cycler: &mut dyn ModelCycler,
-    members: &mut Vec<MemberRecord>,
-    mode: ExecMode,
-    guard: &mut FunnelBookendGuard<'_>,
-    bucket: &mut RemoteBucket,
-    warnings: &mut Vec<String>,
-) -> Result<Vec<ProbeFlag>> {
-    let mut flags = Vec::new();
-    if mode == ExecMode::Parallel {
-        for s in probes.iter().filter(|s| !s.pm.is_remote()) {
-            cycler.ensure_loaded(&s.pm)?;
-        }
-        for s in probes {
-            members.push(dispatch_probe_staffing(
-                s, bundles, inputs, chat, &mut flags, guard, bucket, warnings,
-            )?);
-        }
-        for s in probes.iter().filter(|s| !s.pm.is_remote()) {
-            cycler.release(&s.pm)?;
-        }
-    } else {
-        // Sequential (the only other resolved mode by the time this runs —
-        // `resolve_mode` never leaves `Auto` unresolved): load member → all
-        // its draws → release → next.
-        for s in probes {
-            if !s.pm.is_remote() {
-                cycler.ensure_loaded(&s.pm)?;
-            }
-            members.push(dispatch_probe_staffing(
-                s, bundles, inputs, chat, &mut flags, guard, bucket, warnings,
-            )?);
-            if !s.pm.is_remote() {
-                cycler.release(&s.pm)?;
-            }
-        }
-    }
-    Ok(flags)
 }
 
 // ─── judge phase (double-confirm) ─────────────────────────────────────────
@@ -2504,7 +2084,7 @@ fn run_judge_pass(
     prompt: &str,
     max_tokens: u32,
     endpoint: Option<&ModelEndpoint>,
-    chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
+    chat: &dyn Fn(&ChatCall) -> Result<SingleShotReply>,
 ) -> (JudgeRecord, u64, Option<String>) {
     let t0 = Instant::now();
     let call = ChatCall {
@@ -2599,7 +2179,7 @@ fn judge_pass_with_retry(
     prompt: &str,
     max_tokens: u32,
     endpoint: Option<&ModelEndpoint>,
-    chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
+    chat: &dyn Fn(&ChatCall) -> Result<SingleShotReply>,
 ) -> PassOutcome {
     let t0 = Instant::now();
     let (r1, t1, served1) = run_judge_pass(pass, model, system, prompt, max_tokens, endpoint, chat);
@@ -2635,6 +2215,17 @@ fn judge_pass_with_retry(
 /// accounting so the envelope's `judge-pass1` / `judge-pass2` step rows
 /// carry HONEST per-pass wall times (an all-confirm docket previously
 /// booked its whole elapsed under pass-2, reading as pass-1 = 0ms).
+///
+/// (#1230 Packet 4) `#[cfg(test)]` — production dispatch now runs pass-1
+/// and the confirmation loop as two SEPARATE Steps (`dispatch.
+/// funnel_judge_pass1` / `dispatch.funnel_judge_confirm`, `funnel_step_
+/// kinds`, via `run_pass_locked`/`judge_flag_confirm`) with a real
+/// `depends_on` edge between them — the state-machine RULES this type's
+/// consumer (`judge_one_flag_with_passes`) encodes are unchanged and still
+/// pinned by the `double_confirm_*` tests below, just no longer the
+/// production call path.
+#[cfg(test)]
+#[allow(dead_code)] // not every `passes_*`/`double_confirm_*` test asserts every field
 struct JudgeOutcome {
     pass1: JudgeRecord,
     pass2: Option<JudgeRecord>,
@@ -2659,6 +2250,12 @@ struct JudgeOutcome {
 /// are separate EXECUTIONS per the operator decision (each judge pass draws
 /// from its own allowance). `None` for a local judge, whose calls never
 /// touch a bucket.
+///
+/// (#1230 Packet 4) `#[cfg(test)]` — production now holds pass-1's and
+/// pass-2's buckets as two SEPARATE `Option<Arc<Mutex<RemoteBucket>>>`
+/// fields on the judge/confirm Step kinds (`funnel_step_kinds`), not paired
+/// in one struct — see `JudgeOutcome`'s doc comment.
+#[cfg(test)]
 struct JudgeBudgets {
     pass1: RemoteBucket,
     pass2: RemoteBucket,
@@ -2709,7 +2306,7 @@ fn run_budgeted_pass(
     prompt: &str,
     max_tokens: u32,
     endpoint: Option<&ModelEndpoint>,
-    chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
+    chat: &dyn Fn(&ChatCall) -> Result<SingleShotReply>,
 ) -> PassOutcome {
     match bucket {
         Some(b) => {
@@ -2757,6 +2354,7 @@ fn run_budgeted_pass(
 /// (Error → Archived, reason named); an exhausted confirmation bucket demotes
 /// a pass-1 confirm to NeedsCheck (Error is not agreement) — in both cases the
 /// run goes degraded downstream, never a silent pass.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn judge_one_flag_with_passes(
     passes: u32,
@@ -2766,7 +2364,7 @@ fn judge_one_flag_with_passes(
     max_tokens: u32,
     endpoint: Option<&ModelEndpoint>,
     mut budgets: Option<&mut JudgeBudgets>,
-    chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
+    chat: &dyn Fn(&ChatCall) -> Result<SingleShotReply>,
 ) -> JudgeOutcome {
     // `passes >= 1` is validated at crew resolution (`resolve_staffing`);
     // clamp defensively so a hand-constructed 0 can never skip pass-1.
@@ -2890,7 +2488,7 @@ fn judge_one_flag(
     max_tokens: u32,
     endpoint: Option<&ModelEndpoint>,
     budgets: Option<&mut JudgeBudgets>,
-    chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
+    chat: &dyn Fn(&ChatCall) -> Result<SingleShotReply>,
 ) -> JudgeOutcome {
     judge_one_flag_with_passes(2, prompt, model, system, max_tokens, endpoint, budgets, chat)
 }
@@ -2907,7 +2505,7 @@ fn run_verify_pass(
     prompt: &str,
     max_tokens: u32,
     endpoint: Option<&ModelEndpoint>,
-    chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
+    chat: &dyn Fn(&ChatCall) -> Result<SingleShotReply>,
 ) -> (VerifyRecord, u64, Option<String>) {
     let t0 = Instant::now();
     let call = ChatCall {
@@ -2969,7 +2567,7 @@ fn verify_pass_with_retry(
     prompt: &str,
     max_tokens: u32,
     endpoint: Option<&ModelEndpoint>,
-    chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
+    chat: &dyn Fn(&ChatCall) -> Result<SingleShotReply>,
 ) -> (VerifyRecord, u64, u32, Option<String>) {
     let (r1, t1, served1) = run_verify_pass(model, system, prompt, max_tokens, endpoint, chat);
     if r1.ruling == VerifyRuling::Unparsed {
@@ -2980,423 +2578,1081 @@ fn verify_pass_with_retry(
     }
 }
 
-/// (#1260) The optional verify stage: ONE adjudication call per
-/// double-confirmed flag, after pass-2. State machine per the settled
-/// design:
-///
-/// - `verified` — tier stays `Confirmed`; the posted review drops the
-///   manual-verification marker for a "verified by <model> adjudication"
-///   line (rendering lives in `synthesize_funnel`).
-/// - `refuted` — demoted to [`Tier::Archived`], `demoted_by_verify` set,
-///   the refutation recorded on the flag.
-/// - `uncertain` (and `unparsed`/`error` — an inconclusive adjudication
-///   never promotes) — tier stays `Confirmed` WITH the existing marker.
-///
-/// A crew without the seat never reaches here — byte-identical behavior
-/// to today. Zero confirms ⇒ no stage at all (no dispatch, no records).
-/// The stage is its own EXECUTION for the remote token bucket; exhausting
-/// it is load-bearing (degraded run — see the caller in `finish_funnel`).
-/// Emits its own `funnel.step`/`funnel.ruling` records under `step_id =
-/// "verify"` through the same bookend guard (contract 2 — the stage runs
-/// inside the run's existing liveness envelope).
+// (#1230 Packet 4) The doc comment that used to sit here documented the
+// pre-migration `run_verify_stage` function (ONE adjudication call per
+// double-confirmed flag, the verified/refuted/uncertain state machine,
+// the zero-confirms no-op case) — its logic is UNCHANGED, just relocated:
+// see `verify_one_flag` (the per-flag core, below) and `run_verify_only`
+// (the driver, the graph-stage wrapper around it).
+
+// ─── judge/verify per-flag core (#1230 Packet 4) ─────────────────────────
+//
+// `finish_funnel`/`run_verify_stage`'s per-flag dispatch bodies, relocated
+// out from under the retired `FunnelBookendGuard` so each can run as its
+// own Step body (`dispatch.funnel_judge_pass1` / `dispatch.
+// funnel_judge_confirm` / `dispatch.funnel_verify`, `funnel_step_kinds`
+// below). Review logic — retry, tier rules, budget gating — is UNCHANGED
+// from the pre-migration functions; only the shared-mutable-state shape
+// changed (`&mut RemoteBucket` → `&Mutex<RemoteBucket>`, since sibling
+// flags' steps may now run concurrently).
+
+/// Run one judge pass with the stage's shared remote bucket (if any)
+/// LOCKED for the whole call (admit → dispatch → spend). Holding the lock
+/// across the network call is a deliberate, conservative choice: every
+/// judge-pass1/-confirm Step for every flag targets the SAME judge seat
+/// (`review-judge` is `pub fn validate_funnel_crew`-enforced to be exactly
+/// one staffing), so this also serializes concurrent requests against one
+/// resident model — the exact posture `darkmux_crew::concurrent_dispatch`'s
+/// module doc names as the open, unresolved question for same-model
+/// concurrent dispatch (`# Open item — same_local_model concurrent-request
+/// safety`). A local judge (`bucket: None`) is unaffected — no lock exists
+/// to serialize on, matching that module's own documented default.
 #[allow(clippy::too_many_arguments)]
-fn run_verify_stage(
-    env: &mut FunnelEnvelope,
-    judged: &mut [JudgedFlag],
-    bundles: &[BundleInput],
-    inputs: &FunnelInputs,
-    vstaff: &ResolvedSeatStaffing,
-    chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
-    cycler: &mut dyn ModelCycler,
-    guard: &mut FunnelBookendGuard<'_>,
-) -> Result<()> {
-    let docket = judged.iter().filter(|j| j.tier == Tier::Confirmed).count();
-    if docket == 0 {
-        return Ok(());
+fn run_pass_locked(
+    pass: u8,
+    bucket: Option<&Mutex<RemoteBucket>>,
+    model: &str,
+    system: &str,
+    prompt: &str,
+    max_tokens: u32,
+    endpoint: Option<&ModelEndpoint>,
+    chat: &dyn Fn(&ChatCall) -> Result<SingleShotReply>,
+) -> PassOutcome {
+    match bucket {
+        Some(b) => {
+            let mut guard = b.lock().expect("judge bucket poisoned");
+            run_budgeted_pass(pass, Some(&mut guard), model, system, prompt, max_tokens, endpoint, chat)
+        }
+        None => run_budgeted_pass(pass, None, model, system, prompt, max_tokens, endpoint, chat),
     }
-    let identifier = seat_identifier(&vstaff.pm);
-    let endpoint = seat_endpoint(&vstaff.pm);
-    let endpoint_host = seat_endpoint_host(&vstaff.pm);
-    let max_tokens = resolve_seat_max_tokens(vstaff, DEFAULT_JUDGE_MAX_TOKENS);
-    let mut bucket = RemoteBucket::new("verify", inputs.remote_max_tokens_per_execution);
+}
 
-    if !vstaff.pm.is_remote() {
-        cycler.ensure_loaded(&vstaff.pm)?;
-    }
-    let mut started = json!({
-        "step_id": "verify", "kind": "dispatch", "status": "started",
-        "items_in": docket, "items_out": 0, "wall_ms": 0, "model": identifier,
-    });
-    if let Some(host) = &endpoint_host {
-        started["remote"] = true.into();
-        started["endpoint"] = host.clone().into();
-    }
-    guard.step_started("verify", "dispatch", started);
+/// One flag's judge-CONFIRM outcome (passes `2..=N`), given pass-1's own
+/// surviving [`JudgeRecord`]. Reproduces `judge_one_flag_with_passes`'s
+/// tail EXACTLY (see that function's doc comment for the full state-
+/// machine rationale — `passes==1` stands alone, `passes==2` is the
+/// historical double-confirm, `passes>2` is unanimous consensus with
+/// early-exit on the first disagreement): only the ENTRY POINT changed —
+/// this takes pass-1's ruling as an argument (its own Step's `Step.output`,
+/// gathered via `scheduler::gather_inputs`) instead of running pass-1
+/// itself, since pass-1 is now a separate, prior Step.
+struct ConfirmOutcome {
+    tier: Tier,
+    demoted_by_pass2: bool,
+    pass2: Option<JudgeRecord>,
+    tokens: u64,
+    wall_ms: u64,
+    calls: u32,
+    dispatch_error: bool,
+    served_model: Option<String>,
+}
 
-    let t0 = Instant::now();
-    let mut calls = 0u32;
+#[allow(clippy::too_many_arguments)]
+fn judge_flag_confirm(
+    passes: u32,
+    pass1: &JudgeRecord,
+    prompt: &str,
+    model: &str,
+    system: &str,
+    max_tokens: u32,
+    endpoint: Option<&ModelEndpoint>,
+    bucket: Option<&Mutex<RemoteBucket>>,
+    chat: &dyn Fn(&ChatCall) -> Result<SingleShotReply>,
+) -> ConfirmOutcome {
+    let passes = passes.max(1);
+    let none = ConfirmOutcome {
+        tier: Tier::Archived,
+        demoted_by_pass2: false,
+        pass2: None,
+        tokens: 0,
+        wall_ms: 0,
+        calls: 0,
+        dispatch_error: false,
+        served_model: None,
+    };
+    if pass1.ruling != FunnelRuling::Confirmed {
+        let tier = match pass1.ruling {
+            FunnelRuling::NeedsCheck => Tier::NeedsCheck,
+            _ => Tier::Archived,
+        };
+        return ConfirmOutcome { tier, ..none };
+    }
+    if passes == 1 {
+        return ConfirmOutcome { tier: Tier::Confirmed, ..none };
+    }
     let mut tokens = 0u64;
-    // (#1300) First-seen served model across the stage's adjudications.
+    let mut calls = 0u32;
+    let mut wall_ms = 0u64;
+    let mut dispatch_error = false;
     let mut served_model: Option<String> = None;
-    for j in judged.iter_mut().filter(|j| j.tier == Tier::Confirmed) {
-        // Remote gate BEFORE dispatch — a skipped adjudication is recorded
-        // per-flag (ruling Error, reason named); the whole run then goes
-        // degraded below (verify is load-bearing, operator decision).
-        let (record, spent, made, served) = if endpoint.is_some() && !bucket.admit() {
-            (
-                VerifyRecord {
+    let mut last: Option<JudgeRecord> = None;
+    let mut demoted = false;
+    for pass_no in 2..=passes {
+        let pn = run_pass_locked(pass_no as u8, bucket, model, system, prompt, max_tokens, endpoint, chat);
+        tokens += pn.tokens;
+        calls += pn.calls;
+        wall_ms += pn.wall_ms;
+        dispatch_error |= pn.dispatch_error;
+        if served_model.is_none() {
+            served_model = pn.served_model.clone();
+        }
+        let confirmed = pn.record.ruling == FunnelRuling::Confirmed;
+        last = Some(pn.record);
+        if !confirmed {
+            demoted = true;
+            break;
+        }
+    }
+    let tier = if demoted { Tier::NeedsCheck } else { Tier::Confirmed };
+    ConfirmOutcome { tier, demoted_by_pass2: demoted, pass2: last, tokens, wall_ms, calls, dispatch_error, served_model }
+}
+
+/// One verify (adjudication) call for one confirmed flag — the loop body
+/// `run_verify_stage` used to run inline, relocated so it can be one
+/// `dispatch.funnel_verify` Step. Budget gating identical to before: a
+/// denied `admit()` yields the named `Error` record (never dispatched),
+/// an admitted call runs `verify_pass_with_retry` and spends back.
+struct VerifyFlagOutcome {
+    record: VerifyRecord,
+    tokens: u64,
+    calls: u32,
+    served_model: Option<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_one_flag(
+    identifier: &str,
+    system: &str,
+    prompt: &str,
+    max_tokens: u32,
+    endpoint: Option<&ModelEndpoint>,
+    bucket: Option<&Mutex<RemoteBucket>>,
+    chat: &dyn Fn(&ChatCall) -> Result<SingleShotReply>,
+) -> VerifyFlagOutcome {
+    if let Some(b) = bucket {
+        let mut guard = b.lock().expect("verify bucket poisoned");
+        if !guard.admit() {
+            return VerifyFlagOutcome {
+                record: VerifyRecord {
                     ruling: VerifyRuling::Error,
                     decisive_evidence: String::new(),
-                    note_for_author:
-                        "remote token budget exhausted for this stage — call skipped".to_string(),
+                    note_for_author: "remote token budget exhausted for this stage — call skipped"
+                        .to_string(),
                     seconds: 0.0,
-                    model: identifier.clone(),
+                    model: identifier.to_string(),
                 },
-                0u64,
-                0u32,
-                None,
-            )
-        } else {
-            let bundle = bundles.iter().find(|b| b.id == j.flag.bundle_id);
+                tokens: 0,
+                calls: 0,
+                served_model: None,
+            };
+        }
+        let (record, spent, made, served) =
+            verify_pass_with_retry(identifier, system, prompt, max_tokens, endpoint, chat);
+        guard.spend(spent, made);
+        return VerifyFlagOutcome { record, tokens: spent, calls: made, served_model: served };
+    }
+    let (record, spent, made, served) =
+        verify_pass_with_retry(identifier, system, prompt, max_tokens, endpoint, chat);
+    VerifyFlagOutcome { record, tokens: spent, calls: made, served_model: served }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// funnel_step_kinds (#1230 Packet 4) — the funnel expressed as a Task/Step
+// graph running through Packet 2's `run_step_graph`.
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Six step kinds, registered on a FRESH `StepKindRegistry` per run (never a
+// process-global — matches Packet 2's own instance-scoped design):
+//
+// - `procedural.funnel_bundle`       — the bundle list, already resolved by
+//   the driver before graph construction (bundling determines HOW MANY
+//   probe steps to build, so it has to be known before the graph exists —
+//   see the module note on this below). The step still runs for real and
+//   is the graph's real root; it just doesn't re-derive its own output.
+// - `dispatch.funnel_probe`          — one per probe seat. Real concurrency
+//   across seats (#1230's actual ask) — Packet 1's `run_bounded` wave-plans
+//   every ready probe step through gestalt, so N seats needing N distinct
+//   local models genuinely dispatch in parallel, residency-safe.
+// - `procedural.funnel_dedup`        — depends on EVERY probe step (a real
+//   fan-in edge — #1230's first structural fan-in data for this pipeline).
+// - `dispatch.funnel_judge_pass1`    — one per deduped flag.
+// - `dispatch.funnel_judge_confirm`  — one per deduped flag, depends on its
+//   OWN judge-pass1 step (a real edge). Internally short-circuits (no
+//   dispatch) when pass-1 wasn't `confirmed` — see `judge_flag_confirm`.
+// - `dispatch.funnel_verify`         — one per deduped flag (only built when
+//   the crew declares the `review-verify` seat), depends on its own
+//   judge-confirm step. Short-circuits when that flag's tier isn't
+//   `Confirmed`.
+//
+// # Two `run_step_graph` calls, not one
+//
+// `run_step_graph` requires the full step set known before scheduling
+// starts (cycle detection runs first) — it has no mid-run graph-mutation
+// primitive. The funnel's downstream shape genuinely depends on upstream
+// DATA, not just structure: how many probe flags survive dedup is only
+// known once dedup actually runs. So this driver calls `run_step_graph`
+// TWICE: stage A (bundle → probe → dedup) sizes and runs first; the driver
+// reads dedup's real output and builds stage B (judge-pass1 → judge-confirm
+// → verify, one flag = one full column) from it. WITHIN each stage every
+// depends_on edge is real and the fan-out/fan-in is genuinely scheduled by
+// the engine — only the STAGE BOUNDARY is driver-orchestrated, the same
+// "read output, build the next batch" seam any workflow engine needs when
+// downstream shape is data-dependent (not a Packet-2 gap this driver papers
+// over silently — see the PR description for the explicit call-out).
+//
+// # Concurrency notes carried over from the design discussion
+//
+// - Probe/judge/verify steps' `chat` closure is `Arc<dyn Fn(..) + Send +
+//   Sync>`, not `FnMut` — genuine concurrent dispatch needs a callable
+//   shared across threads without a lock (each thread's HTTP request is
+//   independent). `RemoteBucket` (the ONLY genuinely shared MUTABLE state
+//   a stage's concurrent steps touch) is `Arc<Mutex<..>>`; `ModelCycler`
+//   is `&self`, not `&mut self`, for the same reason (see its doc comment).
+// - Every judge-pass1/-confirm step for every flag targets the funnel's
+//   ONE judge seat — `run_pass_locked` holds the judge's remote bucket
+//   lock across the WHOLE call (network request included) when the judge
+//   is remote, which also serializes concurrent requests against that one
+//   resident model. This mirrors `darkmux_crew::concurrent_dispatch`'s own
+//   documented open item on same-resident-model concurrent safety
+//   (unresolved, no empirical check has run) rather than pretending it's
+//   solved. A LOCAL judge has no bucket to lock — concurrent judge-pass1
+//   steps for DIFFERENT flags against a local judge run genuinely
+//   concurrently, an untested-tonight surface (the hard constraint: no live
+//   dispatches). Multiple PROBE seats are typically DIFFERENT models, so
+//   they don't share this concern.
+// - Per-step `ensure_loaded` (not a phase-level Sequential/Parallel
+//   choreography) — every dispatch-shaped step kind calls the injected
+//   `ModelCycler::ensure_loaded` on its own seat before dispatching;
+//   `plan_acquire`'s own snapshot-in/plan-out semantics make a resident
+//   model a no-op `Reuse` for a sibling step that needs the same one.
+//   Release is NOT per-step (a concurrent sibling might still need the
+//   model) — the driver releases every distinct local seat once, after
+//   both graph stages finish.
+
+mod funnel_step_kinds {
+    use super::{
+        dedup_flags, dispatch_probe_staffing_core, judge_flag_confirm, judge_prompt,
+        resolve_seat_max_tokens, run_pass_locked, seat_endpoint, seat_identifier, verify_one_flag,
+        verify_prompt, BundleInput, ChatFn, JudgeRecord, JudgedFlag, MemberRecord,
+        ModelCycler, ProbeFlag, RemoteBucket, ResolvedSeatStaffing, VerifyRecord,
+        DEFAULT_JUDGE_MAX_TOKENS,
+    };
+    use anyhow::{anyhow, Context, Result};
+    use darkmux_crew::step_kinds::{StepKind, StepOutcome};
+    use darkmux_crew::types::Step;
+    use darkmux_gestalt::Placement;
+    use serde::{Deserialize, Serialize};
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
+    /// `ResolvedSeatStaffing` → the `Placement` gestalt's wave planner
+    /// should reason about, or `None` (remote, or missing `n_ctx`) — shared
+    /// by every dispatch-shaped funnel step kind's `residency()`.
+    fn residency_for_seat(s: &ResolvedSeatStaffing, seat_label: &str) -> Option<Placement> {
+        if s.pm.is_remote() {
+            return None;
+        }
+        let min_ctx = s.pm.n_ctx?;
+        let identifier = darkmux_gestalt::namespaced_identifier(&s.pm.id, s.pm.identifier.as_deref());
+        Some(Placement { model_key: s.pm.id.clone(), identifier, min_ctx, seat: seat_label.to_string() })
+    }
+
+    fn config_flag(step: &Step) -> Result<ProbeFlag> {
+        let value = step
+            .config
+            .get("flag")
+            .ok_or_else(|| anyhow!("step `{}`: missing config.flag", step.id))?;
+        serde_json::from_value(value.clone())
+            .with_context(|| format!("step `{}`: parsing config.flag", step.id))
+    }
+
+    fn only_input(step: &Step, input: &BTreeMap<String, String>) -> Result<String> {
+        input
+            .values()
+            .next()
+            .cloned()
+            .ok_or_else(|| anyhow!("step `{}`: missing dependency output", step.id))
+    }
+
+    // ─── procedural.funnel_bundle ──────────────────────────────────────
+
+    pub struct FunnelBundleStepKind {
+        pub bundles: Vec<BundleInput>,
+    }
+
+    impl StepKind for FunnelBundleStepKind {
+        fn id(&self) -> &'static str {
+            "procedural.funnel_bundle"
+        }
+        fn run(&self, step: &Step, _input: &BTreeMap<String, String>) -> Result<StepOutcome> {
+            let output = serde_json::to_string(&self.bundles)
+                .with_context(|| format!("step `{}`: serializing bundles", step.id))?;
+            Ok(StepOutcome { output, flow_records: Vec::new() })
+        }
+    }
+
+    // ─── dispatch.funnel_probe ─────────────────────────────────────────
+
+    #[derive(Serialize, Deserialize)]
+    pub struct ProbeStepOutput {
+        pub member: MemberRecord,
+        pub flags: Vec<ProbeFlag>,
+        pub warning: Option<String>,
+    }
+
+    pub struct FunnelProbeStepKind {
+        pub bundles: Vec<BundleInput>,
+        pub probe_system: String,
+        pub seats: BTreeMap<String, ResolvedSeatStaffing>,
+        pub chat: ChatFn,
+        pub cycler: Arc<dyn ModelCycler>,
+        pub bucket: Arc<Mutex<RemoteBucket>>,
+    }
+
+    impl FunnelProbeStepKind {
+        fn seat<'a>(&'a self, step: &Step) -> Result<&'a ResolvedSeatStaffing> {
+            let name = step
+                .config
+                .get("seat")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("step `{}`: missing config.seat", step.id))?;
+            self.seats
+                .get(name)
+                .ok_or_else(|| anyhow!("step `{}`: unknown probe seat `{name}`", step.id))
+        }
+    }
+
+    impl StepKind for FunnelProbeStepKind {
+        fn id(&self) -> &'static str {
+            "dispatch.funnel_probe"
+        }
+        fn run(&self, step: &Step, _input: &BTreeMap<String, String>) -> Result<StepOutcome> {
+            let s = self.seat(step)?;
+            if !s.pm.is_remote() {
+                self.cycler.ensure_loaded(&s.pm)?;
+            }
+            let outcome = dispatch_probe_staffing_core(
+                s,
+                &self.bundles,
+                &self.probe_system,
+                self.chat.as_ref(),
+                &self.bucket,
+            )?;
+            let output = serde_json::to_string(&ProbeStepOutput {
+                member: outcome.member,
+                flags: outcome.flags,
+                warning: outcome.warning,
+            })
+            .with_context(|| format!("step `{}`: serializing probe output", step.id))?;
+            Ok(StepOutcome { output, flow_records: Vec::new() })
+        }
+        fn residency(&self, step: &Step) -> Option<Placement> {
+            let s = self.seat(step).ok()?;
+            residency_for_seat(s, &step.id)
+        }
+    }
+
+    // ─── procedural.funnel_dedup ───────────────────────────────────────
+
+    #[derive(Serialize, Deserialize)]
+    pub struct DedupStepOutput {
+        pub deduped: Vec<ProbeFlag>,
+        pub raw_count: usize,
+        pub members: Vec<MemberRecord>,
+        pub warnings: Vec<String>,
+    }
+
+    pub struct FunnelDedupStepKind {
+        pub diff: String,
+    }
+
+    impl StepKind for FunnelDedupStepKind {
+        fn id(&self) -> &'static str {
+            "procedural.funnel_dedup"
+        }
+        fn run(&self, step: &Step, input: &BTreeMap<String, String>) -> Result<StepOutcome> {
+            let mut raw: Vec<ProbeFlag> = Vec::new();
+            let mut members: Vec<MemberRecord> = Vec::new();
+            let mut warnings: Vec<String> = Vec::new();
+            for text in input.values() {
+                let parsed: ProbeStepOutput = serde_json::from_str(text)
+                    .with_context(|| format!("step `{}`: parsing a probe step output", step.id))?;
+                raw.extend(parsed.flags);
+                members.push(parsed.member);
+                if let Some(w) = parsed.warning {
+                    warnings.push(w);
+                }
+            }
+            let raw_count = raw.len();
+            let (deduped, _stats) = dedup_flags(raw, &self.diff);
+            let output = serde_json::to_string(&DedupStepOutput { deduped, raw_count, members, warnings })
+                .with_context(|| format!("step `{}`: serializing dedup output", step.id))?;
+            Ok(StepOutcome { output, flow_records: Vec::new() })
+        }
+    }
+
+    // ─── dispatch.funnel_judge_pass1 ───────────────────────────────────
+
+    #[derive(Serialize, Deserialize)]
+    pub struct Pass1StepOutput {
+        pub record: JudgeRecord,
+        pub tokens: u64,
+        pub wall_ms: u64,
+        pub calls: u32,
+        pub dispatch_error: bool,
+        pub served_model: Option<String>,
+    }
+
+    pub struct FunnelJudgePass1StepKind {
+        pub judge: ResolvedSeatStaffing,
+        pub judge_system: String,
+        pub intent_title: String,
+        pub intent_body: String,
+        pub bundles: Vec<BundleInput>,
+        pub chat: ChatFn,
+        pub cycler: Arc<dyn ModelCycler>,
+        pub bucket: Option<Arc<Mutex<RemoteBucket>>>,
+    }
+
+    impl StepKind for FunnelJudgePass1StepKind {
+        fn id(&self) -> &'static str {
+            "dispatch.funnel_judge_pass1"
+        }
+        fn run(&self, step: &Step, _input: &BTreeMap<String, String>) -> Result<StepOutcome> {
+            let flag = config_flag(step)?;
+            if !self.judge.pm.is_remote() {
+                self.cycler.ensure_loaded(&self.judge.pm)?;
+            }
+            let identifier = seat_identifier(&self.judge.pm);
+            let endpoint = seat_endpoint(&self.judge.pm);
+            let max_tokens = resolve_seat_max_tokens(&self.judge, DEFAULT_JUDGE_MAX_TOKENS);
+            let bundle = self.bundles.iter().find(|b| b.id == flag.bundle_id);
             let code = bundle.map(|b| b.code.as_str()).unwrap_or_default();
             let facts: &[String] = bundle.map(|b| b.facts.as_slice()).unwrap_or_default();
-            let prompt =
-                verify_prompt(inputs.intent_title, inputs.intent_body, code, facts, &j.flag.charge_text);
-            let out = verify_pass_with_retry(
+            let prompt = judge_prompt(&self.intent_title, &self.intent_body, code, facts, &flag.charge_text);
+            let outcome = run_pass_locked(
+                1,
+                self.bucket.as_deref(),
                 &identifier,
-                inputs.verify_system,
+                &self.judge_system,
                 &prompt,
                 max_tokens,
                 endpoint,
-                chat,
+                self.chat.as_ref(),
             );
-            if endpoint.is_some() {
-                bucket.spend(out.1, out.2);
+            let output = serde_json::to_string(&Pass1StepOutput {
+                record: outcome.record,
+                tokens: outcome.tokens,
+                wall_ms: outcome.wall_ms,
+                calls: outcome.calls,
+                dispatch_error: outcome.dispatch_error,
+                served_model: outcome.served_model,
+            })
+            .with_context(|| format!("step `{}`: serializing pass1 output", step.id))?;
+            Ok(StepOutcome { output, flow_records: Vec::new() })
+        }
+        fn residency(&self, step: &Step) -> Option<Placement> {
+            residency_for_seat(&self.judge, &step.id)
+        }
+    }
+
+    // ─── dispatch.funnel_judge_confirm ─────────────────────────────────
+
+    #[derive(Serialize, Deserialize)]
+    pub struct ConfirmStepOutput {
+        pub judged: JudgedFlag,
+        pub pass1_tokens: u64,
+        pub pass1_wall_ms: u64,
+        pub pass1_calls: u32,
+        pub pass1_dispatch_error: bool,
+        pub pass2_tokens: u64,
+        pub pass2_wall_ms: u64,
+        pub pass2_calls: u32,
+        pub pass2_dispatch_error: bool,
+        pub served_model: Option<String>,
+    }
+
+    pub struct FunnelJudgeConfirmStepKind {
+        pub judge: ResolvedSeatStaffing,
+        pub judge_system: String,
+        pub intent_title: String,
+        pub intent_body: String,
+        pub bundles: Vec<BundleInput>,
+        pub chat: ChatFn,
+        pub cycler: Arc<dyn ModelCycler>,
+        pub bucket: Option<Arc<Mutex<RemoteBucket>>>,
+    }
+
+    impl StepKind for FunnelJudgeConfirmStepKind {
+        fn id(&self) -> &'static str {
+            "dispatch.funnel_judge_confirm"
+        }
+        fn run(&self, step: &Step, input: &BTreeMap<String, String>) -> Result<StepOutcome> {
+            let flag = config_flag(step)?;
+            let pass1_text = only_input(step, input)?;
+            let pass1: Pass1StepOutput = serde_json::from_str(&pass1_text)
+                .with_context(|| format!("step `{}`: parsing pass1 output", step.id))?;
+            if !self.judge.pm.is_remote() {
+                self.cycler.ensure_loaded(&self.judge.pm)?;
             }
-            out
-        };
-        tokens += spent;
-        calls += made;
-        if served_model.is_none() {
-            served_model = served;
+            let identifier = seat_identifier(&self.judge.pm);
+            let endpoint = seat_endpoint(&self.judge.pm);
+            let max_tokens = resolve_seat_max_tokens(&self.judge, DEFAULT_JUDGE_MAX_TOKENS);
+            let bundle = self.bundles.iter().find(|b| b.id == flag.bundle_id);
+            let code = bundle.map(|b| b.code.as_str()).unwrap_or_default();
+            let facts: &[String] = bundle.map(|b| b.facts.as_slice()).unwrap_or_default();
+            let prompt = judge_prompt(&self.intent_title, &self.intent_body, code, facts, &flag.charge_text);
+            let confirm = judge_flag_confirm(
+                self.judge.passes,
+                &pass1.record,
+                &prompt,
+                &identifier,
+                &self.judge_system,
+                max_tokens,
+                endpoint,
+                self.bucket.as_deref(),
+                self.chat.as_ref(),
+            );
+            let mut served_model = pass1.served_model.clone();
+            if served_model.is_none() {
+                served_model = confirm.served_model.clone();
+            }
+            let judged = JudgedFlag {
+                flag,
+                pass1: pass1.record.clone(),
+                pass2: confirm.pass2,
+                tier: confirm.tier,
+                demoted_by_pass2: confirm.demoted_by_pass2,
+                verify: None,
+                demoted_by_verify: false,
+            };
+            let output = serde_json::to_string(&ConfirmStepOutput {
+                judged,
+                pass1_tokens: pass1.tokens,
+                pass1_wall_ms: pass1.wall_ms,
+                pass1_calls: pass1.calls,
+                pass1_dispatch_error: pass1.dispatch_error,
+                pass2_tokens: confirm.tokens,
+                pass2_wall_ms: confirm.wall_ms,
+                pass2_calls: confirm.calls,
+                pass2_dispatch_error: confirm.dispatch_error,
+                served_model,
+            })
+            .with_context(|| format!("step `{}`: serializing confirm output", step.id))?;
+            Ok(StepOutcome { output, flow_records: Vec::new() })
         }
-        guard.ruling(json!({
-            "bundle_id": j.flag.bundle_id, "stage": "verify",
-            "ruling": record.ruling, "seconds": record.seconds,
-        }));
-        if record.ruling == VerifyRuling::Refuted {
-            j.tier = Tier::Archived;
-            j.demoted_by_verify = true;
+        fn residency(&self, step: &Step) -> Option<Placement> {
+            residency_for_seat(&self.judge, &step.id)
         }
-        j.verify = Some(record);
-    }
-    let wall_ms = t0.elapsed().as_millis() as u64;
-    if !vstaff.pm.is_remote() {
-        cycler.release(&vstaff.pm)?;
     }
 
-    env.members.push(MemberRecord {
-        model: identifier.clone(),
-        seat: "review-verify".to_string(),
-        draws: calls,
-        wall_ms,
-        total_tokens: tokens,
-        remote: endpoint.is_some(),
-        endpoint: endpoint_host.clone(),
-        served_model,
-    });
-    env.steps.push(StepRecord {
-        step_id: "verify".to_string(),
+    // ─── dispatch.funnel_verify ─────────────────────────────────────────
+
+    /// (#1230 Packet 4) The verify OUTCOME only — not a full `JudgedFlag`.
+    /// Verify now runs as its OWN graph stage (see `run_verify_only` in the
+    /// driver), built ONLY after the judge stage's aggregate `degenerate`
+    /// status is known and ONLY for flags the judge stage already tiered
+    /// `Confirmed` — so this step kind no longer needs to read a sibling
+    /// judge-confirm Step's output (no `depends_on` at all: the driver
+    /// only constructs a `dispatch.funnel_verify` Step for a flag it
+    /// already knows is eligible) or re-decide eligibility itself. The
+    /// driver applies this outcome onto its own already-known `JudgedFlag`
+    /// after the stage completes.
+    #[derive(Serialize, Deserialize)]
+    pub struct VerifyStepOutput {
+        pub record: VerifyRecord,
+        pub tokens: u64,
+        pub calls: u32,
+        pub served_model: Option<String>,
+    }
+
+    pub struct FunnelVerifyStepKind {
+        pub vstaff: ResolvedSeatStaffing,
+        pub verify_system: String,
+        pub intent_title: String,
+        pub intent_body: String,
+        pub bundles: Vec<BundleInput>,
+        pub chat: ChatFn,
+        pub cycler: Arc<dyn ModelCycler>,
+        pub bucket: Option<Arc<Mutex<RemoteBucket>>>,
+    }
+
+    impl StepKind for FunnelVerifyStepKind {
+        fn id(&self) -> &'static str {
+            "dispatch.funnel_verify"
+        }
+        fn run(&self, step: &Step, _input: &BTreeMap<String, String>) -> Result<StepOutcome> {
+            let flag = config_flag(step)?;
+            if !self.vstaff.pm.is_remote() {
+                self.cycler.ensure_loaded(&self.vstaff.pm)?;
+            }
+            let identifier = seat_identifier(&self.vstaff.pm);
+            let endpoint = seat_endpoint(&self.vstaff.pm);
+            let max_tokens = resolve_seat_max_tokens(&self.vstaff, DEFAULT_JUDGE_MAX_TOKENS);
+            let bundle = self.bundles.iter().find(|b| b.id == flag.bundle_id);
+            let code = bundle.map(|b| b.code.as_str()).unwrap_or_default();
+            let facts: &[String] = bundle.map(|b| b.facts.as_slice()).unwrap_or_default();
+            let prompt =
+                verify_prompt(&self.intent_title, &self.intent_body, code, facts, &flag.charge_text);
+            let outcome = verify_one_flag(
+                &identifier,
+                &self.verify_system,
+                &prompt,
+                max_tokens,
+                endpoint,
+                self.bucket.as_deref(),
+                self.chat.as_ref(),
+            );
+            let output = serde_json::to_string(&VerifyStepOutput {
+                record: outcome.record,
+                tokens: outcome.tokens,
+                calls: outcome.calls,
+                served_model: outcome.served_model,
+            })
+            .with_context(|| format!("step `{}`: serializing verify output", step.id))?;
+            Ok(StepOutcome { output, flow_records: Vec::new() })
+        }
+        fn residency(&self, step: &Step) -> Option<Placement> {
+            residency_for_seat(&self.vstaff, &step.id)
+        }
+    }
+}
+
+// ─── the driver (#1230 Packet 4) ─────────────────────────────────────────
+
+/// (#1230 Packet 4) Where a funnel run's Task/Step graph is persisted, and
+/// the mission/sprint it shows up under in `darkmux mission status`/the
+/// mission viewer. `None` (the default for this module's own tests and
+/// `darkmux lab review-bench --funnel`, per the lab-vs-fleet scope
+/// boundary) runs the graph purely in-memory — no `~/.darkmux/missions`
+/// writes. `darkmux pr-review run` (`src/pr_review.rs`) is the first real
+/// caller to pass `Some`, creating an ephemeral one-off Mission+Sprint per
+/// review (mission/sprint lifecycle itself is the CALLER's job — see
+/// `src/pr_review.rs` — this ref just tells the driver where to persist).
+#[derive(Debug, Clone)]
+pub struct FunnelMissionRef {
+    pub mission_id: String,
+    pub sprint_id: String,
+}
+
+/// Persist every Step in a completed (or partially-run) stage under one
+/// Task, best-effort (a storage failure is a loud stderr line, never a
+/// reason to fail the whole review — the funnel's actual output is more
+/// important than its own observability substrate staying up).
+fn persist_stage(
+    mission: &FunnelMissionRef,
+    task_id: &str,
+    description: &str,
+    steps: &std::collections::BTreeMap<String, darkmux_crew::types::Step>,
+) {
+    let task = darkmux_crew::types::Task {
+        id: task_id.to_string(),
+        sprint_id: mission.sprint_id.clone(),
+        description: description.to_string(),
+        step_ids: steps.keys().cloned().collect(),
+    };
+    if let Err(e) = darkmux_crew::lifecycle::save_task(&mission.mission_id, &task) {
+        eprintln!("darkmux: could not persist funnel task `{task_id}`: {e}");
+    }
+    for step in steps.values() {
+        if let Err(e) = darkmux_crew::lifecycle::save_step(&mission.mission_id, &mission.sprint_id, step) {
+            eprintln!("darkmux: could not persist funnel step `{}`: {e}", step.id);
+        }
+    }
+}
+
+fn remote_cap() -> usize {
+    darkmux_types::config_access::remote_concurrent_cap() as usize
+}
+
+fn gestalt_facts_for_run() -> Facts {
+    let mut host = LmsHost::new();
+    gather_facts(&mut host).unwrap_or_else(|e| {
+        eprintln!("darkmux: could not read live LMStudio residency state, proceeding with an empty snapshot: {e}");
+        Facts::default()
+    })
+}
+
+/// Run bundle → probe(k draws × seat, concurrent) → dedup as stage A —
+/// used by [`run_funnel`] only ([`run_judge_only`] skips this stage
+/// entirely and starts from a caller-supplied flag list).
+struct ProbeDedupResult {
+    bundles: Vec<BundleInput>,
+    deduped: Vec<ProbeFlag>,
+    raw_count: usize,
+    members: Vec<MemberRecord>,
+    warnings: Vec<String>,
+    remote_budgets: Vec<RemoteBudgetRecord>,
+    steps: Vec<StepRecord>,
+}
+
+fn run_probe_and_dedup(
+    inputs: &FunnelInputs,
+    probes: &[ResolvedSeatStaffing],
+    chat: ChatFn,
+    cycler: Arc<dyn ModelCycler>,
+    emitter: &mut dyn FunnelEmitter,
+    mission: Option<&FunnelMissionRef>,
+) -> Result<ProbeDedupResult> {
+    use funnel_step_kinds::{DedupStepOutput, FunnelBundleStepKind, FunnelDedupStepKind, FunnelProbeStepKind, ProbeStepOutput};
+
+    let bundles = resolve_bundles(inputs);
+
+    // (#1230 Packet 4 bugfix) Whether probe/dedup Steps get built at all
+    // depends on this PRE-computed bundle count — zero bundles means
+    // nothing for any probe seat to examine, so no `dispatch.funnel_probe`
+    // Step is built and no seat's model is ever `ensure_loaded`ed for zero
+    // actual work (a real regression a bench run over doc-only diffs,
+    // zero TS bundles, caught immediately: it tried to load a model that
+    // was never configured for that fixture). The "bundle" Step itself
+    // STILL always runs through the real scheduler below, even when empty
+    // — "no blind runs": a degenerate zero-bundle run is real, observable
+    // work (its own step-lifecycle records), never a silent in-memory
+    // short-circuit with zero emission.
+    let build_probe_dedup = !bundles.is_empty();
+
+    let seats: std::collections::BTreeMap<String, ResolvedSeatStaffing> =
+        probes.iter().map(|s| (s.name.clone(), s.clone())).collect();
+    let bucket = Arc::new(Mutex::new(RemoteBucket::new("probe", inputs.remote_max_tokens_per_execution)));
+
+    let kinds = darkmux_crew::step_kinds::StepKindRegistry::new();
+    kinds.register(Arc::new(FunnelBundleStepKind { bundles: bundles.clone() }))?;
+    if build_probe_dedup {
+        kinds.register(Arc::new(FunnelProbeStepKind {
+            bundles: bundles.clone(),
+            probe_system: inputs.probe_system.to_string(),
+            seats: seats.clone(),
+            chat: chat.clone(),
+            cycler: cycler.clone(),
+            bucket: bucket.clone(),
+        }))?;
+        kinds.register(Arc::new(FunnelDedupStepKind { diff: inputs.diff.to_string() }))?;
+    }
+
+    let mut steps: std::collections::BTreeMap<String, darkmux_crew::types::Step> = std::collections::BTreeMap::new();
+    steps.insert(
+        "bundle".to_string(),
+        darkmux_crew::types::Step {
+            id: "bundle".to_string(),
+            task_id: "probe-dedup".to_string(),
+            kind: "procedural.funnel_bundle".to_string(),
+            depends_on: Vec::new(),
+            status: darkmux_crew::types::NodeStatus::Planned,
+            config: serde_json::Value::Null,
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        },
+    );
+    if build_probe_dedup {
+        let probe_step_ids: Vec<String> = probes.iter().map(|s| format!("probe:{}", s.name)).collect();
+        for s in probes {
+            let id = format!("probe:{}", s.name);
+            steps.insert(
+                id.clone(),
+                darkmux_crew::types::Step {
+                    id,
+                    task_id: "probe-dedup".to_string(),
+                    kind: "dispatch.funnel_probe".to_string(),
+                    depends_on: vec!["bundle".to_string()],
+                    status: darkmux_crew::types::NodeStatus::Planned,
+                    config: json!({ "seat": s.name }),
+                    started_ts: None,
+                    completed_ts: None,
+                    output: None,
+                },
+            );
+        }
+        steps.insert(
+            "dedup".to_string(),
+            darkmux_crew::types::Step {
+                id: "dedup".to_string(),
+                task_id: "probe-dedup".to_string(),
+                kind: "procedural.funnel_dedup".to_string(),
+                depends_on: probe_step_ids,
+                status: darkmux_crew::types::NodeStatus::Planned,
+                config: serde_json::Value::Null,
+                started_ts: None,
+                completed_ts: None,
+                output: None,
+            },
+        );
+    }
+
+    let facts = gestalt_facts_for_run();
+    let est = inert_estimator();
+    darkmux_crew::scheduler::run_step_graph(&mut steps, &kinds, &facts, &est, remote_cap(), &mut |r| emitter.emit(r))
+        .context("review funnel: probe/dedup stage")?;
+
+    if let Some(m) = mission {
+        persist_stage(m, "probe-dedup", "bundle -> probe (concurrent) -> dedup", &steps);
+    }
+
+    let bundle_step = steps.get("bundle").ok_or_else(|| anyhow!("funnel: bundle step missing"))?;
+    if bundle_step.status != darkmux_crew::types::NodeStatus::Complete {
+        anyhow::bail!(
+            "review funnel: bundle step did not complete: {}",
+            bundle_step.output.clone().unwrap_or_default()
+        );
+    }
+    let bundle_ms = bundle_step.completed_ts.zip(bundle_step.started_ts).map(|(c, s)| (c - s) * 1000).unwrap_or(0);
+
+    if !build_probe_dedup {
+        return Ok(ProbeDedupResult {
+            bundles,
+            deduped: Vec::new(),
+            raw_count: 0,
+            members: Vec::new(),
+            warnings: Vec::new(),
+            remote_budgets: Vec::new(),
+            steps: vec![StepRecord {
+                step_id: "bundle".to_string(),
+                kind: "procedural".to_string(),
+                items_in: 1,
+                items_out: 0,
+                wall_ms: bundle_ms,
+            }],
+        });
+    }
+
+    let mut member_wall_ms: u64 = 0;
+    let mut members: Vec<MemberRecord> = Vec::new();
+    let mut probe_items_out = 0usize;
+    let mut step_records = vec![StepRecord {
+        step_id: "bundle".to_string(),
+        kind: "procedural".to_string(),
+        items_in: 1,
+        items_out: bundles.len(),
+        wall_ms: bundle_ms,
+    }];
+    let t_probe = Instant::now();
+    for s in probes {
+        let id = format!("probe:{}", s.name);
+        let step = steps.get(&id).ok_or_else(|| anyhow!("funnel: probe step `{id}` missing"))?;
+        if step.status != darkmux_crew::types::NodeStatus::Complete {
+            anyhow::bail!("review funnel probe seat `{}`: {}", s.name, step.output.clone().unwrap_or_default());
+        }
+        let out: ProbeStepOutput = serde_json::from_str(step.output.as_deref().unwrap_or_default())
+            .context("review funnel: parsing probe step output")?;
+        member_wall_ms = member_wall_ms.max(out.member.wall_ms);
+        probe_items_out += out.flags.len();
+        members.push(out.member);
+    }
+    // Real wall-clock for the whole (now genuinely concurrent) probe stage,
+    // floored at the slowest individual seat's own reported time — under
+    // concurrency, elapsed wall-clock approximates the slowest seat, not
+    // the SUM of every seat's time (the pre-migration sequential-phase
+    // shape this field's name still carries forward for schema compat).
+    let probe_ms = t_probe.elapsed().as_millis().max(u128::from(member_wall_ms)) as u64;
+    step_records.push(StepRecord {
+        step_id: "probe".to_string(),
         kind: "dispatch".to_string(),
-        items_in: docket,
-        items_out: docket,
-        wall_ms,
+        items_in: bundles.len(),
+        items_out: probe_items_out,
+        wall_ms: probe_ms,
     });
-    let mut finished = json!({
-        "step_id": "verify", "kind": "dispatch", "status": "finished",
-        "items_in": docket, "items_out": docket, "wall_ms": wall_ms,
-        "model": identifier, "tokens": tokens,
-    });
-    if let Some(host) = &endpoint_host {
-        finished["remote"] = true.into();
-        finished["endpoint"] = host.clone().into();
-    }
-    guard.step_finished("verify", finished);
 
-    if let Some(rec) = bucket.record() {
+    let dedup_step = steps.get("dedup").ok_or_else(|| anyhow!("funnel: dedup step missing"))?;
+    if dedup_step.status != darkmux_crew::types::NodeStatus::Complete {
+        anyhow::bail!("review funnel: dedup step did not complete: {}", dedup_step.output.clone().unwrap_or_default());
+    }
+    let dedup_out: DedupStepOutput = serde_json::from_str(dedup_step.output.as_deref().unwrap_or_default())
+        .context("review funnel: parsing dedup step output")?;
+    step_records.push(StepRecord {
+        step_id: "dedup".to_string(),
+        kind: "procedural".to_string(),
+        items_in: dedup_out.raw_count,
+        items_out: dedup_out.deduped.len(),
+        wall_ms: dedup_step.completed_ts.zip(dedup_step.started_ts).map(|(c, s)| (c - s) * 1000).unwrap_or(0),
+    });
+
+    // (#1230 Packet 4 bugfix) The probe stage's shared remote token bucket
+    // — the pre-migration `run_funnel_impl` pushed its `RemoteBucket::
+    // record()` into `env.remote_budgets`/a named warning; this call site
+    // was missing that read entirely, so a remote probe seat's exhaustion
+    // never surfaced anywhere in the envelope. `bucket` is `Arc`-shared
+    // with every probe step that ran, so reading it here (after the graph
+    // call above returns, i.e. after every step has finished touching it)
+    // is race-free.
+    let mut warnings = dedup_out.warnings;
+    let mut remote_budgets: Vec<RemoteBudgetRecord> = Vec::new();
+    if let Some(rec) = bucket.lock().expect("probe bucket poisoned").record() {
         if rec.skipped_calls > 0 {
-            // (#1260, ruling applied) Verify-bucket exhaustion degrades the
-            // STAGE, not the run: findings already adjudicated `verified`
-            // still post as frontier-verified, and each flag whose
-            // adjudication was SKIPPED keeps its `Confirmed` tier WITH the
-            // manual-verification marker (recorded per-flag as `Error` in the
-            // loop above, honored by `synthesize_funnel`). The posted review +
-            // envelope carry a loud warning naming the exhaustion. It NEVER
-            // sets run-level `degenerate` — routing the whole run to
-            // "degraded" would discard findings already verified and read as
-            // "produced no signal", which is factually false. This matches the
-            // sibling verify-dispatch-error path (an inconclusive adjudication
-            // keeps the marker, never a silent pass).
-            let adjudicated = docket.saturating_sub(rec.skipped_calls as usize);
-            env.warnings.push(format!(
-                "verify budget exhausted after {adjudicated} of {docket} adjudications — the \
-                 remaining {} confirmed finding(s) keep the manual-verification marker (the \
-                 per-execution allowance of {} tokens ran out)",
+            // Probe exhaustion is REDUCED COVERAGE, not a degraded run —
+            // whatever flags landed before the cap still go to the judge.
+            warnings.push(format!(
+                "remote probe token budget exhausted — {} draw(s) skipped after the \
+                 per-execution allowance ({} tokens) ran out; reduced coverage",
                 rec.skipped_calls, rec.max_tokens
             ));
         }
-        env.remote_budgets.push(rec);
+        remote_budgets.push(rec);
     }
-    Ok(())
+
+    Ok(ProbeDedupResult {
+        bundles,
+        deduped: dedup_out.deduped,
+        raw_count: dedup_out.raw_count,
+        members,
+        warnings,
+        remote_budgets,
+        steps: step_records,
+    })
 }
 
-// ─── shared finish (probe→dedup→judge→envelope), reused by run_judge_only ─
+/// Run judge-pass1 → judge-confirm as stage B — shared by [`run_funnel`]
+/// (fed stage A's deduped flags) and [`run_judge_only`] (fed the caller's
+/// `--charges-file` flags directly, still deduped here — see that
+/// function's doc comment for why). Deliberately does NOT run verify —
+/// see [`run_verify_only`] and its call sites for why that's a separate
+/// stage.
+struct JudgeResult {
+    judged: Vec<JudgedFlag>,
+    members: Vec<MemberRecord>,
+    warnings: Vec<String>,
+    remote_budgets: Vec<RemoteBudgetRecord>,
+    degenerate: Option<String>,
+    steps: Vec<StepRecord>,
+}
 
 #[allow(clippy::too_many_arguments)]
-fn finish_funnel(
-    mut env: FunnelEnvelope,
-    raw_flags: Vec<ProbeFlag>,
-    bundles: &[BundleInput],
+fn run_judge_pass1_confirm(
     inputs: &FunnelInputs,
+    bundles: &[BundleInput],
+    deduped: Vec<ProbeFlag>,
     judge: &ResolvedSeatStaffing,
-    verify: Option<&ResolvedSeatStaffing>,
-    chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
-    cycler: &mut dyn ModelCycler,
-    guard: &mut FunnelBookendGuard<'_>,
-) -> Result<FunnelEnvelope> {
-    env.raw_flags = raw_flags.len();
+    chat: ChatFn,
+    cycler: Arc<dyn ModelCycler>,
+    emitter: &mut dyn FunnelEmitter,
+    mission: Option<&FunnelMissionRef>,
+) -> Result<JudgeResult> {
+    use funnel_step_kinds::{ConfirmStepOutput, FunnelJudgeConfirmStepKind, FunnelJudgePass1StepKind};
 
-    let t_dedup = Instant::now();
-    let (deduped, _stats) = dedup_flags(raw_flags, inputs.diff);
-    let dedup_ms = t_dedup.elapsed().as_millis() as u64;
-    env.steps.push(StepRecord {
-        step_id: "dedup".to_string(),
-        kind: "procedural".to_string(),
-        items_in: env.raw_flags,
-        items_out: deduped.len(),
-        wall_ms: dedup_ms,
-    });
-    guard.step_finished(
-        "dedup",
-        json!({
-            "step_id": "dedup", "kind": "procedural", "status": "finished",
-            "items_in": env.raw_flags, "items_out": deduped.len(), "wall_ms": dedup_ms,
-        }),
-    );
-    env.deduped_flags = deduped.len();
-
-    let judge_identifier = seat_identifier(&judge.pm);
-    let judge_endpoint = seat_endpoint(&judge.pm);
-    let judge_max_tokens = resolve_seat_max_tokens(judge, DEFAULT_JUDGE_MAX_TOKENS);
-    // (#1260) A remote judge draws from its own per-pass token buckets
-    // (pass-1 and pass-2 are separate executions — operator decision) and
-    // skips the cycler entirely (nothing to load off-box).
-    let mut judge_budgets = judge_endpoint.map(|_| JudgeBudgets {
-        pass1: RemoteBucket::new("judge-pass1", inputs.remote_max_tokens_per_execution),
-        pass2: RemoteBucket::new("judge-pass2", inputs.remote_max_tokens_per_execution),
-    });
-
-    if !judge.pm.is_remote() {
-        cycler.ensure_loaded(&judge.pm)?;
+    if deduped.is_empty() {
+        return Ok(JudgeResult {
+            judged: Vec::new(),
+            members: Vec::new(),
+            warnings: Vec::new(),
+            remote_budgets: Vec::new(),
+            degenerate: None,
+            steps: Vec::new(),
+        });
     }
-    guard.step_started(
-        "judge-pass1",
-        "dispatch",
-        json!({
-            "step_id": "judge-pass1", "kind": "dispatch", "status": "started",
-            "items_in": deduped.len(), "items_out": 0, "wall_ms": 0,
-        }),
-    );
-    let mut judged = Vec::with_capacity(deduped.len());
-    let mut pass1_ms = 0u64;
-    let mut pass2_ms = 0u64;
-    let mut pass2_flags = 0usize;
-    let mut judge_calls = 0u32;
-    let mut judge_tokens = 0u64;
-    // (#1260) Flags whose ruling came from a dispatch-level failure (chat
-    // `Err` surviving bounded retries) — the honest-fail count a REMOTE
-    // judge degrades the run on.
-    let mut judge_dispatch_errors = 0usize;
-    // (#1300) First-seen served model across every flag's judge outcome —
-    // one judge seat, one served identity for the whole run.
-    let mut judge_served_model: Option<String> = None;
-    for flag in &deduped {
-        let bundle = bundles.iter().find(|b| b.id == flag.bundle_id);
-        let code = bundle.map(|b| b.code.as_str()).unwrap_or_default();
-        let facts: &[String] = bundle.map(|b| b.facts.as_slice()).unwrap_or_default();
-        let prompt = judge_prompt(inputs.intent_title, inputs.intent_body, code, facts, &flag.charge_text);
-        let outcome = judge_one_flag_with_passes(
-            judge.passes,
-            &prompt,
-            &judge_identifier,
-            inputs.judge_system,
-            judge_max_tokens,
-            judge_endpoint,
-            judge_budgets.as_mut(),
-            chat,
+
+    let judge_endpoint_present = judge.pm.is_remote();
+    let pass1_bucket = judge_endpoint_present
+        .then(|| Arc::new(Mutex::new(RemoteBucket::new("judge-pass1", inputs.remote_max_tokens_per_execution))));
+    let pass2_bucket = judge_endpoint_present
+        .then(|| Arc::new(Mutex::new(RemoteBucket::new("judge-pass2", inputs.remote_max_tokens_per_execution))));
+
+    let kinds = darkmux_crew::step_kinds::StepKindRegistry::new();
+    kinds.register(Arc::new(FunnelJudgePass1StepKind {
+        judge: judge.clone(),
+        judge_system: inputs.judge_system.to_string(),
+        intent_title: inputs.intent_title.to_string(),
+        intent_body: inputs.intent_body.to_string(),
+        bundles: bundles.to_vec(),
+        chat: chat.clone(),
+        cycler: cycler.clone(),
+        bucket: pass1_bucket.clone(),
+    }))?;
+    kinds.register(Arc::new(FunnelJudgeConfirmStepKind {
+        judge: judge.clone(),
+        judge_system: inputs.judge_system.to_string(),
+        intent_title: inputs.intent_title.to_string(),
+        intent_body: inputs.intent_body.to_string(),
+        bundles: bundles.to_vec(),
+        chat: chat.clone(),
+        cycler: cycler.clone(),
+        bucket: pass2_bucket.clone(),
+    }))?;
+
+    let mut steps: std::collections::BTreeMap<String, darkmux_crew::types::Step> = std::collections::BTreeMap::new();
+    for (i, flag) in deduped.iter().enumerate() {
+        let flag_json = serde_json::to_value(flag).context("serializing flag for judge step config")?;
+        let pass1_id = format!("judge-pass1:{i}");
+        let confirm_id = format!("judge-confirm:{i}");
+        steps.insert(
+            pass1_id.clone(),
+            darkmux_crew::types::Step {
+                id: pass1_id.clone(),
+                task_id: "judge".to_string(),
+                kind: "dispatch.funnel_judge_pass1".to_string(),
+                depends_on: Vec::new(),
+                status: darkmux_crew::types::NodeStatus::Planned,
+                config: json!({ "flag": flag_json }),
+                started_ts: None,
+                completed_ts: None,
+                output: None,
+            },
         );
-        judge_tokens += outcome.tokens;
-        judge_calls += outcome.calls;
-        if outcome.dispatch_error {
+        steps.insert(
+            confirm_id.clone(),
+            darkmux_crew::types::Step {
+                id: confirm_id,
+                task_id: "judge".to_string(),
+                kind: "dispatch.funnel_judge_confirm".to_string(),
+                depends_on: vec![pass1_id],
+                status: darkmux_crew::types::NodeStatus::Planned,
+                config: json!({ "flag": flag_json }),
+                started_ts: None,
+                completed_ts: None,
+                output: None,
+            },
+        );
+    }
+
+    let facts = gestalt_facts_for_run();
+    let est = inert_estimator();
+    darkmux_crew::scheduler::run_step_graph(&mut steps, &kinds, &facts, &est, remote_cap(), &mut |r| emitter.emit(r))
+        .context("review funnel: judge stage")?;
+
+    if let Some(m) = mission {
+        persist_stage(m, "judge", "judge-pass1 -> judge-confirm", &steps);
+    }
+
+    let mut judged: Vec<JudgedFlag> = Vec::with_capacity(deduped.len());
+    let mut judge_tokens = 0u64;
+    let mut judge_calls = 0u32;
+    let mut pass1_ms_total = 0u64;
+    let mut pass2_ms_total = 0u64;
+    let mut pass2_flags = 0usize;
+    let mut judge_dispatch_errors = 0usize;
+    let mut judge_served_model: Option<String> = None;
+
+    for i in 0..deduped.len() {
+        let confirm_id = format!("judge-confirm:{i}");
+        let confirm_step = steps.get(&confirm_id).ok_or_else(|| anyhow!("funnel: `{confirm_id}` missing"))?;
+        if confirm_step.status != darkmux_crew::types::NodeStatus::Complete {
+            anyhow::bail!(
+                "review funnel judge flag {i}: {}",
+                confirm_step.output.clone().unwrap_or_default()
+            );
+        }
+        let confirm: ConfirmStepOutput = serde_json::from_str(confirm_step.output.as_deref().unwrap_or_default())
+            .context("review funnel: parsing judge-confirm output")?;
+        judge_tokens += confirm.pass1_tokens + confirm.pass2_tokens;
+        judge_calls += confirm.pass1_calls + confirm.pass2_calls;
+        pass1_ms_total += confirm.pass1_wall_ms;
+        pass2_ms_total += confirm.pass2_wall_ms;
+        if confirm.pass1_dispatch_error || confirm.pass2_dispatch_error {
             judge_dispatch_errors += 1;
         }
         if judge_served_model.is_none() {
-            judge_served_model = outcome.served_model.clone();
+            judge_served_model = confirm.served_model.clone();
         }
-        pass1_ms += outcome.pass1_ms;
-        pass2_ms += outcome.pass2_ms;
-        // The per-ruling ticker (#1247 Part 1) — one record per judge
-        // dispatch outcome, emitted BEFORE `outcome`'s fields move into the
-        // `JudgedFlag` below.
-        guard.ruling(json!({
-            "bundle_id": flag.bundle_id, "pass": 1,
-            "ruling": outcome.pass1.ruling, "seconds": outcome.pass1.seconds,
-        }));
-        if let Some(p2) = &outcome.pass2 {
+        if confirm.judged.pass2.is_some() {
             pass2_flags += 1;
-            if pass2_flags == 1 {
-                // A `confirmed` pass-1 gets its pass-2 ruling immediately,
-                // interleaved within THIS per-flag loop (see the module
-                // doc) — so the `judge-pass2` step must open the moment the
-                // FIRST pass-2 ruling actually fires, not once the whole
-                // docket is known. Opening it only after the loop finishes
-                // (the prior behavior) let `funnel.ruling{pass:2}` records
-                // stream to a live observer while the `judge-pass2` step
-                // still read "not started" — a contradiction observed live
-                // in the lab lens. `items_in` here is the running count (1
-                // so far); `step_finished` below reports the real final
-                // docket size.
-                guard.step_started(
-                    "judge-pass2",
-                    "dispatch",
-                    json!({
-                        "step_id": "judge-pass2", "kind": "dispatch", "status": "started",
-                        "items_in": pass2_flags, "items_out": 0, "wall_ms": 0,
-                    }),
-                );
-            }
-            // (#1266) The decisive later pass's REAL pass number — 2 under
-            // the default double-confirm (byte-identical to before), or the
-            // demoting/final pass under an N-pass consensus judge.
-            guard.ruling(json!({
-                "bundle_id": flag.bundle_id, "pass": p2.pass,
-                "ruling": p2.ruling, "seconds": p2.seconds,
-            }));
         }
-        judged.push(JudgedFlag {
-            flag: flag.clone(),
-            pass1: outcome.pass1,
-            pass2: outcome.pass2,
-            tier: outcome.tier,
-            demoted_by_pass2: outcome.demoted_by_pass2,
-            verify: None,
-            demoted_by_verify: false,
-        });
-    }
-    if !judge.pm.is_remote() {
-        cycler.release(&judge.pm)?;
+        judged.push(confirm.judged);
     }
 
-    env.members.push(MemberRecord {
-        model: judge_identifier,
-        seat: "review-judge".to_string(),
-        // Actual dispatches, unparsed retries included — never fewer calls
-        // than the operator paid for.
-        draws: judge_calls,
-        wall_ms: pass1_ms + pass2_ms,
-        total_tokens: judge_tokens,
-        remote: judge.pm.is_remote(),
-        endpoint: seat_endpoint_host(&judge.pm),
-        served_model: judge_served_model,
-    });
-    env.steps.push(StepRecord {
-        step_id: "judge-pass1".to_string(),
-        kind: "dispatch".to_string(),
-        items_in: deduped.len(),
-        items_out: deduped.len(),
-        wall_ms: pass1_ms,
-    });
-    guard.step_finished(
-        "judge-pass1",
-        json!({
-            "step_id": "judge-pass1", "kind": "dispatch", "status": "finished",
-            "items_in": deduped.len(), "items_out": deduped.len(), "wall_ms": pass1_ms,
-        }),
-    );
-    if pass2_flags > 0 {
-        env.steps.push(StepRecord {
-            step_id: "judge-pass2".to_string(),
-            kind: "dispatch".to_string(),
-            items_in: pass2_flags,
-            items_out: pass2_flags,
-            wall_ms: pass2_ms,
-        });
-        // `started` was already emitted above, in the per-flag loop, the
-        // moment the first pass-2 ruling fired — this only closes it, now
-        // that the loop has finished and the real final docket size +
-        // elapsed `wall_ms` are known.
-        guard.step_finished(
-            "judge-pass2",
-            json!({
-                "step_id": "judge-pass2", "kind": "dispatch", "status": "finished",
-                "items_in": pass2_flags, "items_out": pass2_flags, "wall_ms": pass2_ms,
-            }),
-        );
-    }
-
-    // (#1260, revised #1329) Judge-stage degeneracy is decided BEFORE the
-    // optional verify stage so a run the judge already doomed never spends
-    // frontier money on verify (CONSIDER g). Two writers can push a
-    // `degen_reasons` entry; `degen_reasons.is_empty()` gates the second on
-    // the first, so AT MOST ONE reason string ends up in `env.degenerate` —
-    // this is no longer a "combine every reason" accumulator (that was the
-    // pre-#1329 shape). The per-flag dispatch-error WARNING below is the
-    // channel that stays complete regardless of which (if either) gate
-    // fired, so provenance is never silently dropped even when a reason
-    // string is superseded:
-    //
-    //  1. a REMOTE judge whose per-pass token bucket EXHAUSTED (a
-    //     load-bearing stage — operator decision, documented in
-    //     DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION). Any exhaustion degrades
-    //     the run regardless of scale — this IS the deliberate policy.
-    //  2. the judge-dead honesty gate: `usable == 0` — NO flag produced a
-    //     usable pass-1 ruling (Confirmed/NeedsCheck/FalsePositive), so the
-    //     whole judge phase produced no signal worth rendering. This is the
-    //     ONE run-level gate for per-flag adjudication failures, and it
-    //     covers three causes uniformly: unparsed judge output surviving its
-    //     retry, a dead LOCAL judge, and (#1329) a REMOTE judge whose
-    //     dispatch failed after bounded retries.
-    //
-    // (#1329 fix) A REMOTE judge dispatch failure on a MINORITY of flags is
-    // already handled honestly at the per-flag level: a pass-1 failure
-    // archives just that flag (invisible in the report, present in the
-    // envelope); a pass-2 failure demotes just that flag to NeedsCheck
-    // (visible, flagged "(no note from the judge)") — never a silent fake
-    // confirm either way. The prior code ALSO forced the entire run
-    // degenerate on ANY dispatch_errors > 0, which is the asymmetry that
-    // produced the bug: a `Confirmed`-then-`Unparsed` pass-2 outcome (same
-    // "transient technical failure" class) was already exempt from this
-    // check (`judge_dispatch_errors` only counts `Error`, never `Unparsed`)
-    // and rendered fine; only the `Error` variant nuked the whole docket. A
-    // single flag's timeout among 37 discarded 9 confirmed + 9 needs-check
-    // real findings and false-alarmed CI on a fully successful run
-    // (darkmux#1329). Fix: dispatch errors are counted and folded into
-    // `usable` like every other per-flag outcome — the run only goes
-    // degenerate via gate 2 when NO usable signal survived, exactly as
-    // `Unparsed` already worked. This is a consistency fix, not new policy.
-    //
-    // But swinging from "always nukes the run" to "always silent when the
-    // run stays green" would trade one honesty gap for another (this repo's
-    // doctrine: "no blind runs," loud beats quiet) — the PROBE stage already
-    // sets this precedent (a remote probe seat's bounded-retry failure pushes
-    // a named `env.warnings` entry: "reduced coverage", never silent). The
-    // judge side gets the same treatment: any remote dispatch error is named
-    // in `env.warnings` UNCONDITIONALLY, whether or not it also ends up
-    // being (or contributing to) the run-level `degenerate` reason.
+    let mut warnings: Vec<String> = Vec::new();
+    let mut remote_budgets: Vec<RemoteBudgetRecord> = Vec::new();
     let mut degen_reasons: Vec<String> = Vec::new();
 
     if judge.pm.is_remote() && judge_dispatch_errors > 0 {
-        env.warnings.push(format!(
+        warnings.push(format!(
             "remote judge dispatch failed on {judge_dispatch_errors} of {} flag(s) after bounded \
              retries — each affected flag was conservatively archived (if its own pass-1 failed) \
              or demoted to needs-check (if pass-1 confirmed but a later pass failed), never \
@@ -3405,31 +3661,30 @@ fn finish_funnel(
         ));
     }
 
-    if let Some(b) = &judge_budgets {
-        if let Some(rec) = b.pass1.record() {
-            env.remote_budgets.push(rec);
+    if let Some(b) = &pass1_bucket {
+        if let Some(rec) = b.lock().expect("judge pass1 bucket poisoned").record() {
+            remote_budgets.push(rec);
         }
-        if let Some(rec) = b.pass2.record() {
-            env.remote_budgets.push(rec);
+    }
+    if let Some(b) = &pass2_bucket {
+        if let Some(rec) = b.lock().expect("judge pass2 bucket poisoned").record() {
+            remote_budgets.push(rec);
         }
-        let skipped = b.pass1.skipped + b.pass2.skipped;
-        if skipped > 0 {
-            degen_reasons.push(format!(
-                "remote judge token budget exhausted — {skipped} judge call(s) skipped after the \
-                 per-execution allowance ({} tokens per stage) ran out; degraded run, never a \
-                 silent pass",
-                inputs.remote_max_tokens_per_execution
-            ));
-        }
+    }
+    let skipped: u32 = remote_budgets.iter().filter(|r| r.stage.starts_with("judge-")).map(|r| r.skipped_calls).sum();
+    if skipped > 0 {
+        degen_reasons.push(format!(
+            "remote judge token budget exhausted — {skipped} judge call(s) skipped after the \
+             per-execution allowance ({} tokens per stage) ran out; degraded run, never a \
+             silent pass",
+            inputs.remote_max_tokens_per_execution
+        ));
     }
 
     let usable = judged
         .iter()
         .filter(|j| {
-            matches!(
-                j.pass1.ruling,
-                FunnelRuling::Confirmed | FunnelRuling::NeedsCheck | FunnelRuling::FalsePositive
-            )
+            matches!(j.pass1.ruling, FunnelRuling::Confirmed | FunnelRuling::NeedsCheck | FunnelRuling::FalsePositive)
         })
         .count();
     if degen_reasons.is_empty() && !judged.is_empty() && usable == 0 {
@@ -3447,228 +3702,368 @@ fn finish_funnel(
         }
     }
 
-    if !degen_reasons.is_empty() {
-        env.degenerate = Some(degen_reasons.join("; "));
+    let mut steps_out = vec![StepRecord {
+        step_id: "judge-pass1".to_string(),
+        kind: "dispatch".to_string(),
+        items_in: deduped.len(),
+        items_out: deduped.len(),
+        wall_ms: pass1_ms_total,
+    }];
+    if pass2_flags > 0 {
+        steps_out.push(StepRecord {
+            step_id: "judge-pass2".to_string(),
+            kind: "dispatch".to_string(),
+            items_in: pass2_flags,
+            items_out: pass2_flags,
+            wall_ms: pass2_ms_total,
+        });
     }
 
-    // (#1260) The optional verify stage — one adjudication per confirmed
-    // flag, AFTER the double-confirm judge and BEFORE the tier counts so a
-    // refutation's demotion lands in the totals. Crews without the seat skip
-    // this entirely (byte-identical behavior to today); a run the judge
-    // already marked degenerate skips it too (CONSIDER g — no frontier spend
-    // on a doomed run).
-    if let Some(vstaff) = verify {
-        if env.degenerate.is_none() {
-            run_verify_stage(&mut env, &mut judged, bundles, inputs, vstaff, chat, cycler, guard)?;
+    let members = vec![MemberRecord {
+        model: seat_identifier(&judge.pm),
+        seat: "review-judge".to_string(),
+        draws: judge_calls,
+        wall_ms: pass1_ms_total + pass2_ms_total,
+        total_tokens: judge_tokens,
+        remote: judge.pm.is_remote(),
+        endpoint: seat_endpoint_host(&judge.pm),
+        served_model: judge_served_model,
+    }];
+
+    Ok(JudgeResult {
+        judged,
+        members,
+        warnings,
+        remote_budgets,
+        degenerate: if degen_reasons.is_empty() { None } else { Some(degen_reasons.join("; ")) },
+        steps: steps_out,
+    })
+}
+
+/// (#1230 Packet 4 bugfix) The optional verify stage — its OWN
+/// `run_step_graph` call, built ONLY from flags [`run_judge_pass1_confirm`]
+/// already tiered `Confirmed`, and ONLY called by [`run_funnel`]/
+/// [`run_judge_only`] when the judge stage came back non-degenerate. A
+/// doomed run never spends frontier money on verify — matching
+/// `finish_funnel`'s pre-migration ordering exactly, but now structurally
+/// enforced (verify simply never gets a Step) rather than gated by an
+/// internal "skip if not confirmed" check inside a shared judge/verify
+/// graph, which could not see the AGGREGATE judge-degenerate status (only
+/// its own flag) and let a judge-doomed run's verify steps dispatch
+/// anyway — the bug this split fixes.
+struct VerifyResult {
+    judged: Vec<JudgedFlag>,
+    member: Option<MemberRecord>,
+    warning: Option<String>,
+    remote_budget: Option<RemoteBudgetRecord>,
+    step: Option<StepRecord>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_verify_only(
+    inputs: &FunnelInputs,
+    bundles: &[BundleInput],
+    judged: Vec<JudgedFlag>,
+    vstaff: &ResolvedSeatStaffing,
+    chat: ChatFn,
+    cycler: Arc<dyn ModelCycler>,
+    emitter: &mut dyn FunnelEmitter,
+    mission: Option<&FunnelMissionRef>,
+) -> Result<VerifyResult> {
+    use funnel_step_kinds::{FunnelVerifyStepKind, VerifyStepOutput};
+
+    let confirmed_indices: Vec<usize> =
+        judged.iter().enumerate().filter(|(_, j)| j.tier == Tier::Confirmed).map(|(i, _)| i).collect();
+    if confirmed_indices.is_empty() {
+        return Ok(VerifyResult { judged, member: None, warning: None, remote_budget: None, step: None });
+    }
+
+    let bucket = vstaff
+        .pm
+        .is_remote()
+        .then(|| Arc::new(Mutex::new(RemoteBucket::new("verify", inputs.remote_max_tokens_per_execution))));
+
+    let kinds = darkmux_crew::step_kinds::StepKindRegistry::new();
+    kinds.register(Arc::new(FunnelVerifyStepKind {
+        vstaff: vstaff.clone(),
+        verify_system: inputs.verify_system.to_string(),
+        intent_title: inputs.intent_title.to_string(),
+        intent_body: inputs.intent_body.to_string(),
+        bundles: bundles.to_vec(),
+        chat,
+        cycler,
+        bucket: bucket.clone(),
+    }))?;
+
+    let mut steps: std::collections::BTreeMap<String, darkmux_crew::types::Step> = std::collections::BTreeMap::new();
+    for &i in &confirmed_indices {
+        let flag_json =
+            serde_json::to_value(&judged[i].flag).context("serializing flag for verify step config")?;
+        let id = format!("verify:{i}");
+        steps.insert(
+            id.clone(),
+            darkmux_crew::types::Step {
+                id,
+                task_id: "verify".to_string(),
+                kind: "dispatch.funnel_verify".to_string(),
+                depends_on: Vec::new(),
+                status: darkmux_crew::types::NodeStatus::Planned,
+                config: json!({ "flag": flag_json }),
+                started_ts: None,
+                completed_ts: None,
+                output: None,
+            },
+        );
+    }
+
+    let facts = gestalt_facts_for_run();
+    let est = inert_estimator();
+    darkmux_crew::scheduler::run_step_graph(&mut steps, &kinds, &facts, &est, remote_cap(), &mut |r| emitter.emit(r))
+        .context("review funnel: verify stage")?;
+
+    if let Some(m) = mission {
+        persist_stage(m, "verify", "verify (confirmed findings only)", &steps);
+    }
+
+    let mut judged = judged;
+    let mut tokens = 0u64;
+    let mut calls = 0u32;
+    let mut served_model: Option<String> = None;
+    for &i in &confirmed_indices {
+        let id = format!("verify:{i}");
+        let step = steps.get(&id).ok_or_else(|| anyhow!("funnel: `{id}` missing"))?;
+        if step.status != darkmux_crew::types::NodeStatus::Complete {
+            anyhow::bail!("review funnel verify flag {i}: {}", step.output.clone().unwrap_or_default());
+        }
+        let out: VerifyStepOutput = serde_json::from_str(step.output.as_deref().unwrap_or_default())
+            .context("review funnel: parsing verify output")?;
+        tokens += out.tokens;
+        calls += out.calls;
+        if served_model.is_none() {
+            served_model = out.served_model.clone();
+        }
+        if out.record.ruling == VerifyRuling::Refuted {
+            judged[i].tier = Tier::Archived;
+            judged[i].demoted_by_verify = true;
+        }
+        judged[i].verify = Some(out.record);
+    }
+
+    let member = MemberRecord {
+        model: seat_identifier(&vstaff.pm),
+        seat: "review-verify".to_string(),
+        draws: calls,
+        wall_ms: 0,
+        total_tokens: tokens,
+        remote: vstaff.pm.is_remote(),
+        endpoint: seat_endpoint_host(&vstaff.pm),
+        served_model,
+    };
+    let docket = confirmed_indices.len();
+    let step_record = StepRecord {
+        step_id: "verify".to_string(),
+        kind: "dispatch".to_string(),
+        items_in: docket,
+        items_out: docket,
+        wall_ms: 0,
+    };
+
+    let mut warning = None;
+    let mut remote_budget = None;
+    if let Some(b) = &bucket {
+        if let Some(rec) = b.lock().expect("verify bucket poisoned").record() {
+            if rec.skipped_calls > 0 {
+                let adjudicated = docket.saturating_sub(rec.skipped_calls as usize);
+                warning = Some(format!(
+                    "verify budget exhausted after {adjudicated} of {docket} adjudications — the \
+                     remaining {} confirmed finding(s) keep the manual-verification marker (the \
+                     per-execution allowance of {} tokens ran out)",
+                    rec.skipped_calls, rec.max_tokens
+                ));
+            }
+            remote_budget = Some(rec);
         }
     }
 
-    env.confirmed = judged.iter().filter(|j| j.tier == Tier::Confirmed).count();
-    env.needs_check = judged.iter().filter(|j| j.tier == Tier::NeedsCheck).count();
-    env.archived = judged.iter().filter(|j| j.tier == Tier::Archived).count();
-    // (#1299) Cluster the `needs_check` tier when it exceeds the threshold —
-    // a count-preserving cap, never a drop (see [`cluster_needs_check`]).
-    env.needs_check_clusters = cluster_needs_check(&judged);
-    env.verified = judged
-        .iter()
-        .filter(|j| matches!(&j.verify, Some(v) if v.ruling == VerifyRuling::Verified))
-        .count();
-    env.refuted = judged.iter().filter(|j| j.demoted_by_verify).count();
-
-    env.flags = deduped;
-    env.judged = judged;
-    guard.task_finished(&env);
-    Ok(env)
+    Ok(VerifyResult { judged, member: Some(member), warning, remote_budget, step: Some(step_record) })
 }
 
-// ─── the driver ───────────────────────────────────────────────────────────
+/// Release every distinct LOCAL seat this run touched, once, after both
+/// graph stages finish — see the `funnel_step_kinds` module doc's
+/// "concurrency notes" for why release is NOT per-step.
+/// (#1230 Packet 4 bugfix) `ModelCycler` wrapper that records every
+/// `pm.id` `ensure_loaded` was actually called for. `release_all_seats`
+/// releases ONLY these — a naive "release every configured seat"
+/// (probes+judge+verify, unconditionally) would call `release` on a seat
+/// that was never loaded (a probe seat a selector skipped every bundle
+/// for, or a verify seat when zero flags reached `Confirmed`), which is
+/// harmless against the REAL `LmsCycler` (gestalt's `plan_release` no-ops
+/// on a non-resident model) but produces phantom log entries against a
+/// test double and — more importantly — is simply the wrong CLAIM: darkmux
+/// releases what it loaded, not what it was configured to maybe load.
+struct TrackingCycler {
+    inner: Arc<dyn ModelCycler>,
+    touched: Arc<Mutex<std::collections::HashSet<String>>>,
+}
 
-/// Run the full funnel: bundles → probe(k draws × seat) → dedup →
-/// double-confirm judge → envelope. `chat` performs one single-shot
-/// dispatch and returns its reply (the closure owns model/base-URL
-/// resolution — tests script it; production wiring calls
-/// `darkmux_crew::single_shot::single_shot_chat`). `cycler` loads/releases
-/// models around the dispatches (production: [`LmsCycler`]; tests: a
-/// recording mock).
-///
-/// Also starts the run's host telemetry sampler (#1247 doctrine surface) —
-/// see [`FunnelBookendGuard`]/[`HostTelemetrySampler`] — at the production
-/// cadence ([`FUNNEL_TELEMETRY_INTERVAL`]) with the real
-/// `darkmux_crew::telemetry_sampler::sample_host`.
-/// [`run_funnel_with_telemetry`] is the test-only seam for a faster
-/// cadence and an injected sampling function.
+impl ModelCycler for TrackingCycler {
+    fn ensure_loaded(&self, pm: &ProfileModel) -> Result<()> {
+        self.touched.lock().expect("touched-seats set poisoned").insert(pm.id.clone());
+        self.inner.ensure_loaded(pm)
+    }
+    fn release(&self, pm: &ProfileModel) -> Result<()> {
+        self.inner.release(pm)
+    }
+}
+
+/// Release every distinct LOCAL seat `touched` actually names, once, after
+/// both graph stages finish — see the `funnel_step_kinds` module doc's
+/// "concurrency notes" for why release is NOT per-step, and
+/// [`TrackingCycler`]'s doc for why this reads `touched` rather than
+/// blindly iterating every configured seat.
+fn release_all_seats(
+    cycler: &dyn ModelCycler,
+    touched: &std::collections::HashSet<String>,
+    probes: &[ResolvedSeatStaffing],
+    judge: &ResolvedSeatStaffing,
+    verify: Option<&ResolvedSeatStaffing>,
+) {
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for pm in probes.iter().map(|s| &s.pm).chain(std::iter::once(&judge.pm)).chain(verify.map(|v| &v.pm)) {
+        if pm.is_remote() || !touched.contains(&pm.id) {
+            continue;
+        }
+        let identifier = darkmux_gestalt::namespaced_identifier(&pm.id, pm.identifier.as_deref());
+        if !seen.insert(identifier) {
+            continue;
+        }
+        if let Err(e) = cycler.release(pm) {
+            eprintln!("darkmux: could not release model \"{}\" after the review funnel run: {e}", pm.id);
+        }
+    }
+}
+
+/// Run the full funnel: bundles → probe(k draws × seat, concurrent) →
+/// dedup → double-confirm judge → optional verify → envelope. `chat`
+/// performs one single-shot dispatch and returns its reply — `Fn` (not
+/// `FnMut`), `Send + Sync + 'static` so it can run from multiple threads at
+/// once (#1230 Packet 4's real concurrency, vs. the pre-migration
+/// always-sequential-per-dispatch shape). `cycler` loads/releases models
+/// around the dispatches (production: [`LmsCycler`]; tests: a recording
+/// mock) — also `Send + Sync` for the same reason. See the `FunnelInputs::
+/// mission` field for how a run shows up in `darkmux mission status`.
 pub fn run_funnel(
     inputs: &FunnelInputs,
-    mut chat: impl FnMut(&ChatCall) -> Result<SingleShotReply>,
-    cycler: &mut dyn ModelCycler,
+    chat: impl Fn(&ChatCall) -> Result<SingleShotReply> + Send + Sync + 'static,
+    cycler: impl ModelCycler + 'static,
     emitter: &mut dyn FunnelEmitter,
 ) -> Result<FunnelEnvelope> {
-    run_funnel_impl(
-        inputs,
-        &mut chat,
-        cycler,
-        emitter,
+    let chat: ChatFn = Arc::new(chat);
+    let touched: Arc<Mutex<std::collections::HashSet<String>>> = Arc::new(Mutex::new(std::collections::HashSet::new()));
+    let cycler: Arc<dyn ModelCycler> =
+        Arc::new(TrackingCycler { inner: Arc::new(cycler), touched: touched.clone() });
+    let FunnelSeats { probes, judge, verify } = validate_funnel_crew(inputs.crew)?;
+    let mission = inputs.mission.clone();
+    let sampler = HostTelemetrySampler::start(
+        inputs.case_id.clone(),
+        inputs.crew.name.clone(),
         FUNNEL_TELEMETRY_INTERVAL,
         FUNNEL_TELEMETRY_POLL,
         sample_host,
-    )
-}
-
-/// Test-only seam: identical pipeline to [`run_funnel`], but with a
-/// caller-chosen telemetry cadence AND sampling function, so a scripted
-/// test can observe deterministic host-telemetry samples without a
-/// multi-second sleep and without shelling to the real macOS-only host
-/// commands (hermetic — no subprocess timing to race on a CI runner).
-/// No production caller uses this — `run_funnel` always fixes the cadence
-/// at [`FUNNEL_TELEMETRY_INTERVAL`] and the sampler at the real
-/// `sample_host`.
-#[cfg(test)]
-fn run_funnel_with_telemetry(
-    inputs: &FunnelInputs,
-    chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
-    cycler: &mut dyn ModelCycler,
-    emitter: &mut dyn FunnelEmitter,
-    telemetry_interval: Duration,
-    telemetry_poll: Duration,
-    sample_fn: fn() -> HostSample,
-) -> Result<FunnelEnvelope> {
-    run_funnel_impl(inputs, chat, cycler, emitter, telemetry_interval, telemetry_poll, sample_fn)
-}
-
-fn run_funnel_impl(
-    inputs: &FunnelInputs,
-    chat: &mut dyn FnMut(&ChatCall) -> Result<SingleShotReply>,
-    cycler: &mut dyn ModelCycler,
-    emitter: &mut dyn FunnelEmitter,
-    telemetry_interval: Duration,
-    telemetry_poll: Duration,
-    sample_fn: fn() -> HostSample,
-) -> Result<FunnelEnvelope> {
-    let FunnelSeats { probes, judge, verify } = validate_funnel_crew(inputs.crew)?;
-    let mode = resolve_mode(inputs.mode, probes, judge);
-
-    let t_bundle = Instant::now();
-    let bundles = resolve_bundles(inputs);
-    let bundle_ms = t_bundle.elapsed().as_millis() as u64;
+    );
 
     let mut env = FunnelEnvelope {
         case_id: inputs.case_id.clone(),
         crew: inputs.crew.name.clone(),
-        mode: mode_label(mode).to_string(),
-        bundles: bundles.len(),
-        // Stamped up front so DEGENERATE envelopes (zero bundles / zero
-        // flags) carry the same comparability key as a full run — a
-        // Null fingerprint on an early return would make the degenerate
-        // record untraceable to its judge config.
+        mode: "concurrent".to_string(),
         fingerprint: fingerprint(&seat_identifier(&judge.pm), inputs.judge_system),
-        // (#1247) The resolved staffing this run actually used, post any
-        // caller-applied `--k` override — see `FunnelEnvelope::staffing`.
         staffing: Some(staffing_snapshot(probes, judge, verify, inputs.crew.request_changes)),
         ..Default::default()
     };
-    // `funnel.task` started (#1247 Part 1) — run started: case id, crew
-    // name, exec mode, bundle count. From here every emission routes
-    // through the bookend guard, which ARMS on this record: an early
-    // `?`-return or panic below fires its Drop path (open steps closed with
-    // `status: "error"`, then a terminal error task record) so no consumer
-    // ever sees an orphaned `started`.
-    let mut sink = EmitterSink(emitter);
-    let mut guard = FunnelBookendGuard::new_with_telemetry(
-        &mut sink,
-        &inputs.case_id,
-        &inputs.crew.name,
-        telemetry_interval,
-        telemetry_poll,
-        sample_fn,
-    );
-    guard.task_started(json!({
-        "status": "started", "case_id": inputs.case_id, "crew": inputs.crew.name,
-        "exec_mode": mode_label(mode), "bundles": bundles.len(),
-    }));
-    env.steps.push(StepRecord {
-        step_id: "bundle".to_string(),
-        kind: "procedural".to_string(),
-        items_in: 1,
-        items_out: bundles.len(),
-        wall_ms: bundle_ms,
-    });
-    guard.step_finished(
-        "bundle",
-        json!({
-            "step_id": "bundle", "kind": "procedural", "status": "finished",
-            "items_in": 1, "items_out": bundles.len(), "wall_ms": bundle_ms,
-        }),
-    );
-    if bundles.is_empty() {
+
+    let probe_result =
+        run_probe_and_dedup(inputs, probes, chat.clone(), cycler.clone(), emitter, mission.as_ref())
+            .context("review funnel: probe/dedup stage")?;
+    drain_telemetry(&sampler, emitter);
+    env.bundles = probe_result.bundles.len();
+    env.raw_flags = probe_result.raw_count;
+    env.deduped_flags = probe_result.deduped.len();
+    env.members.extend(probe_result.members);
+    env.warnings.extend(probe_result.warnings);
+    env.remote_budgets.extend(probe_result.remote_budgets);
+    env.steps.extend(probe_result.steps);
+
+    if probe_result.bundles.is_empty() {
         env.degenerate = Some("no bundles produced from the diff".to_string());
-        guard.task_finished(&env);
+        release_all_seats(cycler.as_ref(), &touched.lock().expect("touched poisoned"), probes, judge, verify);
         return Ok(env);
     }
-
-    let t_probe = Instant::now();
-    guard.step_started(
-        "probe",
-        "dispatch",
-        json!({
-            "step_id": "probe", "kind": "dispatch", "status": "started",
-            "items_in": bundles.len(), "items_out": 0, "wall_ms": 0,
-        }),
-    );
-    // (#1260) The probe stage's remote token bucket — ONE execution shared
-    // by every remote probe staffing (the prosecution pass is one stage).
-    // Local staffings never touch it.
-    let mut probe_bucket = RemoteBucket::new("probe", inputs.remote_max_tokens_per_execution);
-    let mut probe_warnings: Vec<String> = Vec::new();
-    let raw_flags = probe_phase(
-        &bundles,
-        probes,
-        inputs,
-        chat,
-        cycler,
-        &mut env.members,
-        mode,
-        &mut guard,
-        &mut probe_bucket,
-        &mut probe_warnings,
-    )
-    .context("review funnel: probe phase")?;
-    env.warnings.append(&mut probe_warnings);
-    if let Some(rec) = probe_bucket.record() {
-        if rec.skipped_calls > 0 {
-            // Probe exhaustion is REDUCED COVERAGE, not a degraded run —
-            // whatever flags landed before the cap still go to the judge
-            // (operator decision on #1260).
-            env.warnings.push(format!(
-                "remote probe token budget exhausted — {} draw(s) skipped after the \
-                 per-execution allowance ({} tokens) ran out; reduced coverage",
-                rec.skipped_calls, rec.max_tokens
-            ));
-        }
-        env.remote_budgets.push(rec);
-    }
-    let probe_ms = t_probe.elapsed().as_millis() as u64;
-    env.steps.push(StepRecord {
-        step_id: "probe".to_string(),
-        kind: "dispatch".to_string(),
-        items_in: bundles.len(),
-        items_out: raw_flags.len(),
-        wall_ms: probe_ms,
-    });
-    guard.step_finished(
-        "probe",
-        json!({
-            "step_id": "probe", "kind": "dispatch", "status": "finished",
-            "items_in": bundles.len(), "items_out": raw_flags.len(), "wall_ms": probe_ms,
-        }),
-    );
-    if raw_flags.is_empty() {
-        env.raw_flags = 0;
+    if probe_result.deduped.is_empty() {
         env.degenerate = Some("zero flags from all probe draws — never a silent pass".to_string());
-        guard.task_finished(&env);
+        release_all_seats(cycler.as_ref(), &touched.lock().expect("touched poisoned"), probes, judge, verify);
         return Ok(env);
     }
 
-    finish_funnel(env, raw_flags, &bundles, inputs, judge, verify, chat, cycler, &mut guard)
+    let judge_result = run_judge_pass1_confirm(
+        inputs,
+        &probe_result.bundles,
+        probe_result.deduped,
+        judge,
+        chat.clone(),
+        cycler.clone(),
+        emitter,
+        mission.as_ref(),
+    )
+    .context("review funnel: judge stage")?;
+    drain_telemetry(&sampler, emitter);
+
+    env.members.extend(judge_result.members);
+    env.warnings.extend(judge_result.warnings);
+    env.remote_budgets.extend(judge_result.remote_budgets);
+    env.steps.extend(judge_result.steps);
+    env.degenerate = judge_result.degenerate;
+
+    // (#1260) The optional verify stage runs ONLY when the judge stage came
+    // back clean — a judge-doomed run never spends frontier money on
+    // verify (CONSIDER g). Its own graph call, built from flags the judge
+    // stage already tiered `Confirmed` — see `run_verify_only`'s doc.
+    let final_judged = if env.degenerate.is_none() {
+        if let Some(vstaff) = verify {
+            let verify_result = run_verify_only(
+                inputs,
+                &probe_result.bundles,
+                judge_result.judged,
+                vstaff,
+                chat,
+                cycler.clone(),
+                emitter,
+                mission.as_ref(),
+            )
+            .context("review funnel: verify stage")?;
+            drain_telemetry(&sampler, emitter);
+            if let Some(m) = verify_result.member {
+                env.members.push(m);
+            }
+            if let Some(w) = verify_result.warning {
+                env.warnings.push(w);
+            }
+            if let Some(rb) = verify_result.remote_budget {
+                env.remote_budgets.push(rb);
+            }
+            if let Some(s) = verify_result.step {
+                env.steps.push(s);
+            }
+            verify_result.judged
+        } else {
+            judge_result.judged
+        }
+    } else {
+        judge_result.judged
+    };
+
+    release_all_seats(cycler.as_ref(), &touched.lock().expect("touched poisoned"), probes, judge, verify);
+    finalize_envelope(&mut env, final_judged);
+    Ok(env)
 }
 
 /// Re-judge a previously-recorded flag list without re-running the probe
@@ -3679,16 +4074,29 @@ fn run_funnel_impl(
 pub fn run_judge_only(
     flags: Vec<ProbeFlag>,
     inputs: &FunnelInputs,
-    mut chat: impl FnMut(&ChatCall) -> Result<SingleShotReply>,
-    cycler: &mut dyn ModelCycler,
+    chat: impl Fn(&ChatCall) -> Result<SingleShotReply> + Send + Sync + 'static,
+    cycler: impl ModelCycler + 'static,
     emitter: &mut dyn FunnelEmitter,
 ) -> Result<FunnelEnvelope> {
-    let FunnelSeats { probes, judge, verify } = validate_funnel_crew(inputs.crew)?;
-    // Judge-only runs one model, so the mode is telemetry, not behavior —
-    // but the envelope still records the CALLER's resolved mode rather
-    // than a hardcoded label, so a judge-only re-run of a parallel funnel
-    // doesn't misreport its provenance.
-    let mode = resolve_mode(inputs.mode, probes, judge);
+    let chat: ChatFn = Arc::new(chat);
+    let touched: Arc<Mutex<std::collections::HashSet<String>>> = Arc::new(Mutex::new(std::collections::HashSet::new()));
+    let cycler: Arc<dyn ModelCycler> =
+        Arc::new(TrackingCycler { inner: Arc::new(cycler), touched: touched.clone() });
+    let FunnelSeats { probes: _probes, judge, verify } = validate_funnel_crew(inputs.crew)?;
+    // `run_judge_only` never dispatches a probe seat — `release_all_seats`
+    // below is called with an EMPTY probes slice (not `_probes`) so it
+    // never even considers releasing a probe seat's model, matching this
+    // path's byte-identical-to-before behavior (the cycler is never told
+    // about probe seats at all).
+    let no_probes: &[ResolvedSeatStaffing] = &[];
+    let mission = inputs.mission.clone();
+    let sampler = HostTelemetrySampler::start(
+        inputs.case_id.clone(),
+        inputs.crew.name.clone(),
+        FUNNEL_TELEMETRY_INTERVAL,
+        FUNNEL_TELEMETRY_POLL,
+        sample_host,
+    );
 
     let t_bundle = Instant::now();
     let bundles = resolve_bundles(inputs);
@@ -3697,24 +4105,12 @@ pub fn run_judge_only(
     let mut env = FunnelEnvelope {
         case_id: inputs.case_id.clone(),
         crew: inputs.crew.name.clone(),
-        mode: mode_label(mode).to_string(),
+        mode: "concurrent".to_string(),
         bundles: bundles.len(),
-        // Same up-front stamp as `run_funnel` — degenerate (zero-flag)
-        // envelopes carry the comparability key too.
         fingerprint: fingerprint(&seat_identifier(&judge.pm), inputs.judge_system),
-        // (#1247) The resolved staffing this run actually used, post any
-        // caller-applied `--k` override — see `FunnelEnvelope::staffing`.
-        staffing: Some(staffing_snapshot(probes, judge, verify, inputs.crew.request_changes)),
+        staffing: Some(staffing_snapshot(no_probes, judge, verify, inputs.crew.request_changes)),
         ..Default::default()
     };
-    // Same guard discipline as `run_funnel` — see its comment at the
-    // matching site.
-    let mut sink = EmitterSink(emitter);
-    let mut guard = FunnelBookendGuard::new(&mut sink, &inputs.case_id, &inputs.crew.name);
-    guard.task_started(json!({
-        "status": "started", "case_id": inputs.case_id, "crew": inputs.crew.name,
-        "exec_mode": mode_label(mode), "bundles": bundles.len(),
-    }));
     env.steps.push(StepRecord {
         step_id: "bundle".to_string(),
         kind: "procedural".to_string(),
@@ -3722,20 +4118,78 @@ pub fn run_judge_only(
         items_out: bundles.len(),
         wall_ms: bundle_ms,
     });
-    guard.step_finished(
-        "bundle",
-        json!({
-            "step_id": "bundle", "kind": "procedural", "status": "finished",
-            "items_in": 1, "items_out": bundles.len(), "wall_ms": bundle_ms,
-        }),
-    );
+
     if flags.is_empty() {
         env.degenerate = Some("--charges-file carried zero flags".to_string());
-        guard.task_finished(&env);
         return Ok(env);
     }
+    env.raw_flags = flags.len();
+    // Still dedups — a hand-edited or concatenated charges file may carry
+    // raw, undeduped flags (see this function's doc comment).
+    let (deduped, _stats) = dedup_flags(flags, inputs.diff);
+    env.deduped_flags = deduped.len();
 
-    finish_funnel(env, flags, &bundles, inputs, judge, verify, &mut chat, cycler, &mut guard)
+    let judge_result = run_judge_pass1_confirm(
+        inputs, &bundles, deduped, judge, chat.clone(), cycler.clone(), emitter, mission.as_ref(),
+    )
+    .context("review funnel: judge stage")?;
+    drain_telemetry(&sampler, emitter);
+
+    env.members.extend(judge_result.members);
+    env.warnings.extend(judge_result.warnings);
+    env.remote_budgets.extend(judge_result.remote_budgets);
+    env.steps.extend(judge_result.steps);
+    env.degenerate = judge_result.degenerate;
+
+    let final_judged = if env.degenerate.is_none() {
+        if let Some(vstaff) = verify {
+            let verify_result = run_verify_only(
+                inputs, &bundles, judge_result.judged, vstaff, chat, cycler.clone(), emitter, mission.as_ref(),
+            )
+            .context("review funnel: verify stage")?;
+            drain_telemetry(&sampler, emitter);
+            if let Some(m) = verify_result.member {
+                env.members.push(m);
+            }
+            if let Some(w) = verify_result.warning {
+                env.warnings.push(w);
+            }
+            if let Some(rb) = verify_result.remote_budget {
+                env.remote_budgets.push(rb);
+            }
+            if let Some(s) = verify_result.step {
+                env.steps.push(s);
+            }
+            verify_result.judged
+        } else {
+            judge_result.judged
+        }
+    } else {
+        judge_result.judged
+    };
+
+    release_all_seats(cycler.as_ref(), &touched.lock().expect("touched poisoned"), no_probes, judge, verify);
+    finalize_envelope(&mut env, final_judged);
+    Ok(env)
+}
+
+/// Tier counts + clustering + `verified`/`refuted` totals — the tail of the
+/// pre-migration `finish_funnel`, unchanged logic, now shared by both
+/// [`run_funnel`] and [`run_judge_only`]'s tail (they used to share this
+/// via `finish_funnel` itself; the graph-stage split moved the CALL site,
+/// not the arithmetic).
+fn finalize_envelope(env: &mut FunnelEnvelope, judged: Vec<JudgedFlag>) {
+    env.confirmed = judged.iter().filter(|j| j.tier == Tier::Confirmed).count();
+    env.needs_check = judged.iter().filter(|j| j.tier == Tier::NeedsCheck).count();
+    env.archived = judged.iter().filter(|j| j.tier == Tier::Archived).count();
+    env.needs_check_clusters = cluster_needs_check(&judged);
+    env.verified = judged
+        .iter()
+        .filter(|j| matches!(&j.verify, Some(v) if v.ruling == VerifyRuling::Verified))
+        .count();
+    env.refuted = judged.iter().filter(|j| j.demoted_by_verify).count();
+    env.flags = judged.iter().map(|j| j.flag.clone()).collect();
+    env.judged = judged;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -3798,21 +4252,33 @@ mod tests {
 
     /// Recording [`ModelCycler`] mock: pushes `"load:<id>"` / `"release:<id>"`
     /// into a shared log so cycling ORDER is assertable.
+    ///
+    /// (#1230 Packet 4) `Clone` + `Arc<Mutex<..>>`-backed, not a bare `Vec`
+    /// behind `&mut self` — `ModelCycler` is now `&self`/`Send + Sync`
+    /// (concurrent steps share one cycler instance), and `run_funnel`/
+    /// `run_judge_only` take `cycler` BY VALUE (`impl ModelCycler +
+    /// 'static`), so a test that wants to inspect the log afterward clones
+    /// the recorder BEFORE handing one clone to the driver — both clones
+    /// share the same underlying `Arc<Mutex<..>>`.
+    #[derive(Clone)]
     struct RecordingCycler {
-        log: Vec<String>,
+        log: Arc<Mutex<Vec<String>>>,
     }
     impl RecordingCycler {
         fn new() -> Self {
-            Self { log: Vec::new() }
+            Self { log: Arc::new(Mutex::new(Vec::new())) }
+        }
+        fn log(&self) -> Vec<String> {
+            self.log.lock().expect("recording cycler log poisoned").clone()
         }
     }
     impl ModelCycler for RecordingCycler {
-        fn ensure_loaded(&mut self, pm: &ProfileModel) -> Result<()> {
-            self.log.push(format!("load:{}", pm.id));
+        fn ensure_loaded(&self, pm: &ProfileModel) -> Result<()> {
+            self.log.lock().expect("recording cycler log poisoned").push(format!("load:{}", pm.id));
             Ok(())
         }
-        fn release(&mut self, pm: &ProfileModel) -> Result<()> {
-            self.log.push(format!("release:{}", pm.id));
+        fn release(&self, pm: &ProfileModel) -> Result<()> {
+            self.log.lock().expect("recording cycler log poisoned").push(format!("release:{}", pm.id));
             Ok(())
         }
     }
@@ -4266,9 +4732,15 @@ mod tests {
 
     // ── double-confirm state machine ────────────────────────────────
 
-    fn scripted_chat(
-        script: RefCell<Vec<&'static str>>,
-    ) -> impl FnMut(&ChatCall) -> Result<SingleShotReply> {
+    /// `Fn`, not `FnMut` -- `RefCell`'s interior mutability means the
+    /// closure body only needs `&self` access to mutate `script`, so this
+    /// is directly callable through `judge_one_flag`'s `&dyn Fn(..)`
+    /// parameter (#1230 Packet 4's concurrency-motivated signature
+    /// change -- see `ModelCycler`'s doc comment). `RefCell` itself is
+    /// `!Sync`, so this helper stays scoped to tests that call
+    /// `judge_one_flag` directly (never through `run_funnel`/
+    /// `run_judge_only`, which require `Send + Sync + 'static`).
+    fn scripted_chat(script: RefCell<Vec<&'static str>>) -> impl Fn(&ChatCall) -> Result<SingleShotReply> {
         move |_call: &ChatCall| {
             let mut s = script.borrow_mut();
             if s.is_empty() {
@@ -4284,8 +4756,8 @@ mod tests {
 
     #[test]
     fn double_confirm_confirm_then_confirm_is_confirmed_tier() {
-        let mut chat = scripted_chat(RefCell::new(vec![CONFIRM_JSON, CONFIRM_JSON]));
-        let o = judge_one_flag("prompt", "judge-model", "sys", 1000, None, None, &mut chat);
+        let chat = scripted_chat(RefCell::new(vec![CONFIRM_JSON, CONFIRM_JSON]));
+        let o = judge_one_flag("prompt", "judge-model", "sys", 1000, None, None, &chat);
         assert_eq!(o.pass1.ruling, FunnelRuling::Confirmed);
         assert_eq!(o.pass2.unwrap().ruling, FunnelRuling::Confirmed);
         assert_eq!(o.tier, Tier::Confirmed);
@@ -4295,8 +4767,8 @@ mod tests {
 
     #[test]
     fn double_confirm_confirm_then_false_positive_demotes_to_needs_check() {
-        let mut chat = scripted_chat(RefCell::new(vec![CONFIRM_JSON, FP_JSON]));
-        let o = judge_one_flag("prompt", "judge-model", "sys", 1000, None, None, &mut chat);
+        let chat = scripted_chat(RefCell::new(vec![CONFIRM_JSON, FP_JSON]));
+        let o = judge_one_flag("prompt", "judge-model", "sys", 1000, None, None, &chat);
         assert_eq!(o.pass1.ruling, FunnelRuling::Confirmed);
         assert_eq!(o.pass2.unwrap().ruling, FunnelRuling::FalsePositive);
         assert_eq!(o.tier, Tier::NeedsCheck, "disagreement demotes, never ships as confirmed");
@@ -4305,8 +4777,8 @@ mod tests {
 
     #[test]
     fn double_confirm_pass1_needs_check_skips_pass2() {
-        let mut chat = scripted_chat(RefCell::new(vec![NEEDS_CHECK_JSON]));
-        let o = judge_one_flag("prompt", "judge-model", "sys", 1000, None, None, &mut chat);
+        let chat = scripted_chat(RefCell::new(vec![NEEDS_CHECK_JSON]));
+        let o = judge_one_flag("prompt", "judge-model", "sys", 1000, None, None, &chat);
         assert_eq!(o.pass1.ruling, FunnelRuling::NeedsCheck);
         assert!(o.pass2.is_none());
         assert_eq!(o.tier, Tier::NeedsCheck);
@@ -4317,8 +4789,8 @@ mod tests {
 
     #[test]
     fn double_confirm_pass1_false_positive_archives_without_pass2() {
-        let mut chat = scripted_chat(RefCell::new(vec![FP_JSON]));
-        let o = judge_one_flag("prompt", "judge-model", "sys", 1000, None, None, &mut chat);
+        let chat = scripted_chat(RefCell::new(vec![FP_JSON]));
+        let o = judge_one_flag("prompt", "judge-model", "sys", 1000, None, None, &chat);
         assert_eq!(o.pass1.ruling, FunnelRuling::FalsePositive);
         assert!(o.pass2.is_none());
         assert_eq!(o.tier, Tier::Archived);
@@ -4327,8 +4799,8 @@ mod tests {
     #[test]
     fn double_confirm_unparsed_retries_then_archives() {
         // Two garbage replies: pass-1 attempt, retry — still unparsed.
-        let mut chat = scripted_chat(RefCell::new(vec!["no verdict here", "still nothing"]));
-        let o = judge_one_flag("prompt", "judge-model", "sys", 1000, None, None, &mut chat);
+        let chat = scripted_chat(RefCell::new(vec!["no verdict here", "still nothing"]));
+        let o = judge_one_flag("prompt", "judge-model", "sys", 1000, None, None, &chat);
         assert_eq!(o.pass1.ruling, FunnelRuling::Unparsed);
         assert!(o.pass2.is_none());
         assert_eq!(o.tier, Tier::Archived);
@@ -4339,8 +4811,8 @@ mod tests {
     #[test]
     fn double_confirm_unparsed_retry_recovers() {
         // First attempt garbage, retry succeeds — the retry's ruling wins.
-        let mut chat = scripted_chat(RefCell::new(vec!["garbage", CONFIRM_JSON, CONFIRM_JSON]));
-        let o = judge_one_flag("prompt", "judge-model", "sys", 1000, None, None, &mut chat);
+        let chat = scripted_chat(RefCell::new(vec!["garbage", CONFIRM_JSON, CONFIRM_JSON]));
+        let o = judge_one_flag("prompt", "judge-model", "sys", 1000, None, None, &chat);
         assert_eq!(o.pass1.ruling, FunnelRuling::Confirmed, "the retry's clean ruling survives");
         assert_eq!(o.pass2.unwrap().ruling, FunnelRuling::Confirmed);
         assert_eq!(o.tier, Tier::Confirmed);
@@ -4355,42 +4827,42 @@ mod tests {
     fn passes_one_confirm_is_confirmed_with_a_single_call() {
         // A counting closure (not `scripted_chat`) so the "invoked exactly
         // once" claim is literal, not inferred from the outcome's own count.
-        let mut calls = 0u32;
-        let mut chat = |_call: &ChatCall| {
-            calls += 1;
+        let calls = std::cell::Cell::new(0u32);
+        let chat = |_call: &ChatCall| {
+            calls.set(calls.get() + 1);
             Ok(reply(CONFIRM_JSON))
         };
         let o =
-            judge_one_flag_with_passes(1, "prompt", "judge-model", "sys", 1000, None, None, &mut chat);
+            judge_one_flag_with_passes(1, "prompt", "judge-model", "sys", 1000, None, None, &chat);
         assert_eq!(o.pass1.ruling, FunnelRuling::Confirmed);
         assert!(o.pass2.is_none(), "passes: 1 never runs a confirmation pass");
         assert_eq!(o.tier, Tier::Confirmed, "the single pass IS the tier directly");
         assert!(!o.demoted_by_pass2);
         assert_eq!(o.calls, 1);
         assert_eq!(o.pass2_ms, 0, "no confirmation pass, no confirmation wall time");
-        assert_eq!(calls, 1, "the judge chat closure fired exactly once for this flag");
+        assert_eq!(calls.get(), 1, "the judge chat closure fired exactly once for this flag");
     }
 
     #[test]
     fn passes_one_needs_check_tiers_directly() {
-        let mut calls = 0u32;
-        let mut chat = |_call: &ChatCall| {
-            calls += 1;
+        let calls = std::cell::Cell::new(0u32);
+        let chat = |_call: &ChatCall| {
+            calls.set(calls.get() + 1);
             Ok(reply(NEEDS_CHECK_JSON))
         };
         let o =
-            judge_one_flag_with_passes(1, "prompt", "judge-model", "sys", 1000, None, None, &mut chat);
+            judge_one_flag_with_passes(1, "prompt", "judge-model", "sys", 1000, None, None, &chat);
         assert_eq!(o.pass1.ruling, FunnelRuling::NeedsCheck);
         assert_eq!(o.tier, Tier::NeedsCheck, "pass-1's needs_check IS the tier");
         assert!(o.pass2.is_none());
-        assert_eq!(calls, 1, "a non-confirmed pass-1 earns no second call under any passes");
+        assert_eq!(calls.get(), 1, "a non-confirmed pass-1 earns no second call under any passes");
     }
 
     #[test]
     fn passes_one_false_positive_archives_directly() {
-        let mut chat = scripted_chat(RefCell::new(vec![FP_JSON]));
+        let chat = scripted_chat(RefCell::new(vec![FP_JSON]));
         let o =
-            judge_one_flag_with_passes(1, "prompt", "judge-model", "sys", 1000, None, None, &mut chat);
+            judge_one_flag_with_passes(1, "prompt", "judge-model", "sys", 1000, None, None, &chat);
         assert_eq!(o.pass1.ruling, FunnelRuling::FalsePositive);
         assert_eq!(o.tier, Tier::Archived, "pass-1's false_positive tiers out directly");
         assert!(o.pass2.is_none());
@@ -4403,13 +4875,13 @@ mod tests {
 
     #[test]
     fn passes_three_all_confirm_is_confirmed_after_three_calls() {
-        let mut calls = 0u32;
-        let mut chat = |_call: &ChatCall| {
-            calls += 1;
+        let calls = std::cell::Cell::new(0u32);
+        let chat = |_call: &ChatCall| {
+            calls.set(calls.get() + 1);
             Ok(reply(CONFIRM_JSON))
         };
         let o =
-            judge_one_flag_with_passes(3, "prompt", "judge-model", "sys", 1000, None, None, &mut chat);
+            judge_one_flag_with_passes(3, "prompt", "judge-model", "sys", 1000, None, None, &chat);
         assert_eq!(o.tier, Tier::Confirmed, "unanimous confirms hold the bar");
         assert!(!o.demoted_by_pass2);
         assert_eq!(o.pass1.ruling, FunnelRuling::Confirmed);
@@ -4419,42 +4891,42 @@ mod tests {
         assert_eq!(last.ruling, FunnelRuling::Confirmed);
         assert_eq!(last.pass, 3, "the decisive slot carries the real pass number, not a hardcoded 2");
         assert_eq!(o.calls, 3);
-        assert_eq!(calls, 3, "pass-1 + two confirmation passes");
+        assert_eq!(calls.get(), 3, "pass-1 + two confirmation passes");
     }
 
     #[test]
     fn passes_three_final_disagreement_demotes_after_three_calls() {
         // confirm → confirm → false_positive: unanimity breaks on the last
         // pass, so all three ran before the demotion landed.
-        let mut calls = 0u32;
-        let mut chat = |_call: &ChatCall| {
-            calls += 1;
-            Ok(reply(if calls < 3 { CONFIRM_JSON } else { FP_JSON }))
+        let calls = std::cell::Cell::new(0u32);
+        let chat = |_call: &ChatCall| {
+            calls.set(calls.get() + 1);
+            Ok(reply(if calls.get() < 3 { CONFIRM_JSON } else { FP_JSON }))
         };
         let o =
-            judge_one_flag_with_passes(3, "prompt", "judge-model", "sys", 1000, None, None, &mut chat);
+            judge_one_flag_with_passes(3, "prompt", "judge-model", "sys", 1000, None, None, &chat);
         assert_eq!(o.tier, Tier::NeedsCheck, "one disagreement breaks unanimity, never ships confirmed");
         assert!(o.demoted_by_pass2);
         assert_eq!(o.pass2.as_ref().unwrap().ruling, FunnelRuling::FalsePositive);
         assert_eq!(o.calls, 3);
-        assert_eq!(calls, 3, "all three passes ran before the late disagreement");
+        assert_eq!(calls.get(), 3, "all three passes ran before the late disagreement");
     }
 
     #[test]
     fn passes_three_early_disagreement_exits_after_two_calls() {
         // confirm → false_positive: the unanimous early-exit fires at pass-2,
         // so pass-3 never runs — N passes is not N× cost.
-        let mut calls = 0u32;
-        let mut chat = |_call: &ChatCall| {
-            calls += 1;
-            Ok(reply(if calls < 2 { CONFIRM_JSON } else { FP_JSON }))
+        let calls = std::cell::Cell::new(0u32);
+        let chat = |_call: &ChatCall| {
+            calls.set(calls.get() + 1);
+            Ok(reply(if calls.get() < 2 { CONFIRM_JSON } else { FP_JSON }))
         };
         let o =
-            judge_one_flag_with_passes(3, "prompt", "judge-model", "sys", 1000, None, None, &mut chat);
+            judge_one_flag_with_passes(3, "prompt", "judge-model", "sys", 1000, None, None, &chat);
         assert_eq!(o.tier, Tier::NeedsCheck);
         assert!(o.demoted_by_pass2);
         assert_eq!(o.calls, 2, "early-exit — the third pass is skipped");
-        assert_eq!(calls, 2, "the unanimous rule stops at the first non-confirm");
+        assert_eq!(calls.get(), 2, "the unanimous rule stops at the first non-confirm");
     }
 
     // ── passes knob (#1266): passes: 2 IS the historical double-confirm ─
@@ -4464,16 +4936,16 @@ mod tests {
         // The explicit `passes: 2` path and the `double_confirm_*` wrapper
         // (which delegates passes=2) must agree — confirm→confirm Confirmed,
         // confirm→false_positive demoted.
-        let mut chat = scripted_chat(RefCell::new(vec![CONFIRM_JSON, CONFIRM_JSON]));
+        let chat = scripted_chat(RefCell::new(vec![CONFIRM_JSON, CONFIRM_JSON]));
         let ok =
-            judge_one_flag_with_passes(2, "prompt", "judge-model", "sys", 1000, None, None, &mut chat);
+            judge_one_flag_with_passes(2, "prompt", "judge-model", "sys", 1000, None, None, &chat);
         assert_eq!(ok.tier, Tier::Confirmed);
         assert_eq!(ok.pass2.as_ref().unwrap().pass, 2);
         assert_eq!(ok.calls, 2);
 
-        let mut chat = scripted_chat(RefCell::new(vec![CONFIRM_JSON, FP_JSON]));
+        let chat = scripted_chat(RefCell::new(vec![CONFIRM_JSON, FP_JSON]));
         let demoted =
-            judge_one_flag_with_passes(2, "prompt", "judge-model", "sys", 1000, None, None, &mut chat);
+            judge_one_flag_with_passes(2, "prompt", "judge-model", "sys", 1000, None, None, &chat);
         assert_eq!(demoted.tier, Tier::NeedsCheck);
         assert!(demoted.demoted_by_pass2);
         assert_eq!(demoted.calls, 2);
@@ -4483,15 +4955,15 @@ mod tests {
 
     #[test]
     fn probe_one_draw_empty_content_retries_once_then_skips() {
-        let mut calls = 0u32;
-        let mut chat = |_call: &ChatCall| {
-            calls += 1;
+        let calls = std::cell::Cell::new(0u32);
+        let chat = |_call: &ChatCall| {
+            calls.set(calls.get() + 1);
             Ok(reply(""))
         };
         let (content, tokens, _served) =
-            probe_one_draw(&mut chat, "m", "sys", "user", 100, None).expect("no dispatch error");
+            probe_one_draw(&chat, "m", "sys", "user", 100, None).expect("no dispatch error");
         assert!(content.is_none(), "still empty after retry -> skipped, not a flag");
-        assert_eq!(calls, 2, "exactly one retry (two total attempts)");
+        assert_eq!(calls.get(), 2, "exactly one retry (two total attempts)");
         // (#1260) BOTH empty attempts are billed — a hosted reasoning model
         // that burns its budget thinking and returns empty still spent real
         // tokens the caller must account.
@@ -4500,18 +4972,18 @@ mod tests {
 
     #[test]
     fn probe_one_draw_recovers_on_retry() {
-        let mut calls = 0u32;
-        let mut chat = |_call: &ChatCall| {
-            calls += 1;
-            if calls == 1 {
+        let calls = std::cell::Cell::new(0u32);
+        let chat = |_call: &ChatCall| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
                 Ok(reply(""))
             } else {
                 Ok(reply("a real defect description"))
             }
         };
-        let (content, tokens, _served) = probe_one_draw(&mut chat, "m", "sys", "user", 100, None).unwrap();
+        let (content, tokens, _served) = probe_one_draw(&chat, "m", "sys", "user", 100, None).unwrap();
         assert_eq!(content.unwrap(), "a real defect description");
-        assert_eq!(calls, 2);
+        assert_eq!(calls.get(), 2);
         // (#1260) The discarded empty attempt is still billed alongside the
         // recovering one.
         assert_eq!(tokens, 20, "empty-then-recover bills both attempts (10 + 10)");
@@ -4519,8 +4991,8 @@ mod tests {
 
     #[test]
     fn probe_one_draw_propagates_dispatch_error() {
-        let mut chat = |_call: &ChatCall| -> Result<SingleShotReply> { Err(anyhow!("network down")) };
-        let err = probe_one_draw(&mut chat, "m", "sys", "user", 100, None).unwrap_err();
+        let chat = |_call: &ChatCall| -> Result<SingleShotReply> { Err(anyhow!("network down")) };
+        let err = probe_one_draw(&chat, "m", "sys", "user", 100, None).unwrap_err();
         assert!(err.to_string().contains("network down"));
     }
 
@@ -4607,43 +5079,6 @@ mod tests {
 
     // ── sequential cycling order ─────────────────────────────────────
 
-    #[test]
-    fn sequential_cycling_loads_and_releases_each_member_before_the_next_then_judge_last() {
-        let crew = crew_with(vec![
-            (
-                "review-probe",
-                vec![staffing("fast", "member-a", 1), staffing("fast", "member-b", 1)],
-            ),
-            ("review-judge", vec![staffing("fast", "judge-model", 1)]),
-        ]);
-        let inputs = FunnelInputs {
-            case_id: "c1".to_string(),
-            crew: &crew,
-            intent_title: "add a feature",
-            intent_body: "",
-            diff: DIFF,
-            mode: ExecMode::Sequential,
-            probe_system: "probe sys",
-            judge_system: "judge sys",
-            verify_system: "verify sys",
-            remote_max_tokens_per_execution: 500_000,
-            bundles: None,
-        };
-        let mut cycler = RecordingCycler::new();
-        let mut chat = |_call: &ChatCall| Ok(reply("a real defect `const end = start.plus(30)`"));
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("funnel runs");
-        assert!(env.confirmed + env.needs_check + env.archived > 0 || env.deduped_flags == 0);
-        let log = &cycler.log;
-        let a_load = log.iter().position(|s| s == "load:member-a").unwrap();
-        let a_release = log.iter().position(|s| s == "release:member-a").unwrap();
-        let b_load = log.iter().position(|s| s == "load:member-b").unwrap();
-        let b_release = log.iter().position(|s| s == "release:member-b").unwrap();
-        let judge_load = log.iter().position(|s| s == "load:judge-model").unwrap();
-        assert!(a_load < a_release, "member A releases before member B loads");
-        assert!(a_release < b_load, "member A fully cycled before member B starts");
-        assert!(b_load < b_release);
-        assert!(b_release < judge_load, "judge loads last, after every probe member");
-    }
 
     // ── envelope counts + steps consistency ──────────────────────────
 
@@ -4661,20 +5096,21 @@ mod tests {
             judge_system: "judge sys",
             verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
+            mission: None,
             bundles: None,
         };
-        let mut cycler = RecordingCycler::new();
-        let mut call_n = 0u32;
-        let mut chat = |_call: &ChatCall| {
-            call_n += 1;
-            if call_n <= 2 {
+        let cycler = RecordingCycler::new();
+        let call_n = std::sync::atomic::AtomicU32::new(0);
+        let chat = move |_call: &ChatCall| {
+            let n = call_n.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if n <= 2 {
                 // two probe draws (k=2), both find the same defect
                 Ok(reply("a real defect `const end = start.plus(30)`"))
             } else {
                 Ok(reply(CONFIRM_JSON))
             }
         };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("funnel runs");
+        let env = run_funnel(&inputs, chat, cycler, &mut NullEmitter).expect("funnel runs");
         assert!(env.degenerate.is_none());
         assert_eq!(env.bundles, 1, "one changed file in the fixture diff");
         assert_eq!(env.raw_flags, 2, "k=2 draws, both non-empty");
@@ -4714,358 +5150,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn flow_emission_records_the_expected_action_sequence_for_a_healthy_run() {
-        // Same scripted scenario as `envelope_counts_and_steps_are_internally_consistent`:
-        // one probe seat, k=2 draws both finding the same defect (dedup
-        // collapses to 1 flag), a judge that confirms both passes.
-        let crew = valid_crew();
-        let inputs = FunnelInputs {
-            case_id: "c1".to_string(),
-            crew: &crew,
-            intent_title: "add a feature",
-            intent_body: "",
-            diff: DIFF,
-            mode: ExecMode::Sequential,
-            probe_system: "probe sys",
-            judge_system: "judge sys",
-            verify_system: "verify sys",
-            remote_max_tokens_per_execution: 500_000,
-            bundles: None,
-        };
-        let mut cycler = RecordingCycler::new();
-        let mut emitter = RecordingEmitter::new();
-        let mut call_n = 0u32;
-        let mut chat = |_call: &ChatCall| {
-            call_n += 1;
-            if call_n <= 2 {
-                Ok(reply("a real defect `const end = start.plus(30)`"))
-            } else {
-                Ok(reply(CONFIRM_JSON))
-            }
-        };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut emitter).expect("funnel runs");
-        assert!(env.degenerate.is_none());
 
-        let actions: Vec<&str> = emitter.records.iter().map(|r| r.action.as_str()).collect();
-        assert_eq!(
-            actions.first(),
-            Some(&"funnel.task"),
-            "the run's first emitted record is the task-started bookend: {actions:?}"
-        );
-        assert_eq!(
-            actions.last(),
-            Some(&"funnel.task"),
-            "the run's last emitted record is the task-finished bookend: {actions:?}"
-        );
-        assert_eq!(
-            emitter.records.first().unwrap().payload.as_ref().unwrap()["status"],
-            json!("started")
-        );
-        assert_eq!(
-            emitter.records.last().unwrap().payload.as_ref().unwrap()["status"],
-            json!("finished")
-        );
-
-        // Every step_id named in the envelope's own `steps` shows up as a
-        // `funnel.step` record too (the live-run counterpart of the
-        // end-of-run summary), plus one seat-level `probe:<name>` record.
-        let step_records: Vec<&darkmux_flow::FlowRecord> =
-            emitter.records.iter().filter(|r| r.action == "funnel.step").collect();
-        let step_ids: Vec<String> = step_records
-            .iter()
-            .map(|r| r.payload.as_ref().unwrap()["step_id"].as_str().unwrap().to_string())
-            .collect();
-        assert!(step_ids.contains(&"bundle".to_string()));
-        assert!(step_ids.contains(&"probe".to_string()));
-        assert!(step_ids.iter().any(|s| s.starts_with("probe:")), "seat-level step: {step_ids:?}");
-        assert!(step_ids.contains(&"dedup".to_string()));
-        assert!(step_ids.contains(&"judge-pass1".to_string()));
-        assert!(step_ids.contains(&"judge-pass2".to_string()), "both passes confirm in this scenario");
-
-        // The per-ruling ticker: one flag, pass-1 AND pass-2 both confirm ->
-        // exactly two ruling records.
-        let rulings: Vec<&darkmux_flow::FlowRecord> =
-            emitter.records.iter().filter(|r| r.action == "funnel.ruling").collect();
-        assert_eq!(rulings.len(), 2, "one deduped flag, pass1 confirms so pass2 also runs");
-        let passes: Vec<i64> =
-            rulings.iter().map(|r| r.payload.as_ref().unwrap()["pass"].as_i64().unwrap()).collect();
-        assert!(passes.contains(&1));
-        assert!(passes.contains(&2));
-
-        // Truthful ordering (the bug this test guards): `judge-pass2`'s
-        // `started` step record must be emitted AT OR BEFORE the first
-        // `pass:2` ruling — never after. A pass-2 ruling streaming to a live
-        // observer while the `judge-pass2` step still reads "not started"
-        // is exactly the contradiction fixed here.
-        let pass2_started_idx = emitter
-            .records
-            .iter()
-            .position(|r| {
-                r.action == "funnel.step"
-                    && r.payload.as_ref().unwrap()["step_id"] == json!("judge-pass2")
-                    && r.payload.as_ref().unwrap()["status"] == json!("started")
-            })
-            .expect("judge-pass2 started record emitted");
-        let first_pass2_ruling_idx = emitter
-            .records
-            .iter()
-            .position(|r| r.action == "funnel.ruling" && r.payload.as_ref().unwrap()["pass"] == json!(2))
-            .expect("a pass-2 ruling record emitted");
-        assert!(
-            pass2_started_idx < first_pass2_ruling_idx,
-            "judge-pass2 started (record {pass2_started_idx}) must precede the first pass-2 ruling \
-             (record {first_pass2_ruling_idx}) — a pass-2 ruling must never precede judge-pass2 started"
-        );
-
-        // Provenance: every record carries the case id as session_id and
-        // the crew name as handle, matching `crew dispatch`'s own
-        // handle=role_id / session_id=dispatch-identity convention.
-        assert!(emitter.records.iter().all(|r| r.session_id.as_deref() == Some("c1")));
-        assert!(emitter.records.iter().all(|r| r.handle == crew.name));
-        assert!(emitter.records.iter().all(|r| r.source.as_deref() == Some("funnel")));
-    }
-
-    #[test]
-    fn flow_emission_degenerate_zero_bundles_emits_only_task_and_bundle_step() {
-        let crew = valid_crew();
-        let inputs = FunnelInputs {
-            case_id: "c1".to_string(),
-            crew: &crew,
-            intent_title: "",
-            intent_body: "",
-            diff: "",
-            mode: ExecMode::Sequential,
-            probe_system: "probe sys",
-            judge_system: "judge sys",
-            verify_system: "verify sys",
-            remote_max_tokens_per_execution: 500_000,
-            bundles: None,
-        };
-        let mut cycler = RecordingCycler::new();
-        let mut emitter = RecordingEmitter::new();
-        let mut chat = |_call: &ChatCall| Ok(reply("unused"));
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut emitter).expect("funnel runs");
-        assert!(env.degenerate.is_some());
-
-        // Zero bundles short-circuits before any probe/judge work: task
-        // started, bundle step finished, task finished — nothing else.
-        let actions: Vec<&str> = emitter.records.iter().map(|r| r.action.as_str()).collect();
-        assert_eq!(actions, vec!["funnel.task", "funnel.step", "funnel.task"], "{actions:?}");
-        let finished = emitter.records.last().unwrap();
-        assert!(
-            matches!(finished.level, darkmux_flow::Level::Warn),
-            "a degenerate run's task-finished record is Warn, not Info"
-        );
-        assert_eq!(finished.payload.as_ref().unwrap()["degenerate"].as_str().unwrap(), env.degenerate.unwrap());
-    }
 
     // ── bookend guard (#1247 review round) — no orphaned started records ──
 
-    /// A probe dispatch error propagates out of `run_funnel` via `?` AFTER
-    /// `funnel.task started`, `probe started`, and `probe:<seat> started`
-    /// were emitted. Without the guard those three would dangle forever;
-    /// with it, the Drop path must close each open step (innermost-first,
-    /// `status: "error"`) and emit a terminal error task record — every
-    /// `started` gets a matching terminal event even on the abort path.
-    #[test]
-    fn bookend_guard_probe_dispatch_error_closes_open_steps_and_emits_terminal_task_record() {
-        let crew = valid_crew();
-        let inputs = FunnelInputs {
-            case_id: "c1".to_string(),
-            crew: &crew,
-            intent_title: "add a feature",
-            intent_body: "",
-            diff: DIFF,
-            mode: ExecMode::Sequential,
-            probe_system: "probe sys",
-            judge_system: "judge sys",
-            verify_system: "verify sys",
-            remote_max_tokens_per_execution: 500_000,
-            bundles: None,
-        };
-        let mut cycler = RecordingCycler::new();
-        let mut emitter = RecordingEmitter::new();
-        let mut chat =
-            |_call: &ChatCall| -> Result<SingleShotReply> { Err(anyhow!("network down")) };
-        let err = run_funnel(&inputs, &mut chat, &mut cycler, &mut emitter).unwrap_err();
-        assert!(err.to_string().contains("probe phase"), "the original error still propagates: {err:#}");
 
-        // The record stream stays pair-consistent: the seat step closes
-        // first (innermost), then the probe phase step, then the task.
-        let tail: Vec<(String, String)> = emitter
-            .records
-            .iter()
-            .rev()
-            .take(3)
-            .map(|r| {
-                let p = r.payload.as_ref().unwrap();
-                (
-                    r.action.clone(),
-                    p["step_id"].as_str().unwrap_or_else(|| p["status"].as_str().unwrap()).to_string(),
-                )
-            })
-            .collect();
-        assert_eq!(
-            tail,
-            vec![
-                ("funnel.task".to_string(), "error".to_string()),
-                ("funnel.step".to_string(), "probe".to_string()),
-                ("funnel.step".to_string(), "probe:fast".to_string()),
-            ],
-            "reading backwards: terminal task record last, preceded by probe then probe:<seat> error-closes"
-        );
-        for r in emitter.records.iter().rev().take(3) {
-            assert!(matches!(r.level, darkmux_flow::Level::Error), "abort-path records are Level::Error");
-            let status = r.payload.as_ref().unwrap()["status"].as_str().unwrap();
-            assert_eq!(status, "error");
-        }
-        // Exactly one terminal task record — the guard fired once, and the
-        // clean-path task_finished never ran.
-        let task_terminals = emitter
-            .records
-            .iter()
-            .filter(|r| {
-                r.action == "funnel.task"
-                    && r.payload.as_ref().unwrap()["status"].as_str() != Some("started")
-            })
-            .count();
-        assert_eq!(task_terminals, 1);
-    }
 
-    /// The reviewer-named scenario: a chat closure that errors mid-JUDGE-
-    /// docket. Judge dispatch errors are deliberately swallowed per-flag
-    /// (`FunnelRuling::Error` → `Tier::Archived` — one bad call must not
-    /// abort the docket), so the run COMPLETES and the terminal task record
-    /// is the ordinary `finished` one (degenerate-marked by the judge-dead
-    /// honesty gate, since NO flag got a usable ruling). Either way the
-    /// invariant under test holds: a terminal task record exists — no
-    /// orphaned `started`.
-    #[test]
-    fn bookend_guard_chat_error_mid_judge_docket_still_yields_terminal_task_record() {
-        let crew = valid_crew();
-        let inputs = FunnelInputs {
-            case_id: "c1".to_string(),
-            crew: &crew,
-            intent_title: "add a feature",
-            intent_body: "",
-            diff: DIFF,
-            mode: ExecMode::Sequential,
-            probe_system: "probe sys",
-            judge_system: "judge sys",
-            verify_system: "verify sys",
-            remote_max_tokens_per_execution: 500_000,
-            bundles: None,
-        };
-        let mut cycler = RecordingCycler::new();
-        let mut emitter = RecordingEmitter::new();
-        let mut chat = |call: &ChatCall| -> Result<SingleShotReply> {
-            if call.model.contains("probe-model") {
-                Ok(reply("a real defect `const end = start.plus(30)`"))
-            } else {
-                // Every judge call errors — mid-docket dispatch failure.
-                Err(anyhow!("judge endpoint down"))
-            }
-        };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut emitter)
-            .expect("judge dispatch errors are swallowed per-flag, never abort the run");
-        assert!(env.degenerate.is_some(), "the judge-dead honesty gate marks the envelope");
-
-        let last = emitter.records.last().unwrap();
-        assert_eq!(last.action, "funnel.task");
-        assert_eq!(
-            last.payload.as_ref().unwrap()["status"].as_str(),
-            Some("finished"),
-            "the run completed cleanly, so the terminal record is finished (degenerate), not the guard's error"
-        );
-        assert!(last.payload.as_ref().unwrap()["degenerate"].is_string());
-        // The judge-pass1 step still closed normally.
-        assert!(emitter.records.iter().any(|r| {
-            r.action == "funnel.step"
-                && r.payload.as_ref().unwrap()["step_id"].as_str() == Some("judge-pass1")
-                && r.payload.as_ref().unwrap()["status"].as_str() == Some("finished")
-        }));
-    }
-
-    /// The genuine mid-docket abort vector: the judge's `cycler.release`
-    /// failing AFTER `judge-pass1 started` was emitted and the docket ran.
-    /// This scenario's flag confirms on both passes, so `judge-pass2 started`
-    /// also fired mid-loop (the fix under test) and is STILL open at the
-    /// release failure (its `finished` only emits after `cycler.release`
-    /// returns). The guard must close both, innermost-first — `judge-pass2`
-    /// (opened last) before `judge-pass1` — with `status: "error"`, then
-    /// emit the terminal error task record.
-    #[test]
-    fn bookend_guard_judge_release_failure_closes_judge_pass1_and_task() {
-        /// Cycler whose `release` fails for one named model id.
-        struct FailingReleaseCycler {
-            fail_on: String,
-        }
-        impl ModelCycler for FailingReleaseCycler {
-            fn ensure_loaded(&mut self, _pm: &ProfileModel) -> Result<()> {
-                Ok(())
-            }
-            fn release(&mut self, pm: &ProfileModel) -> Result<()> {
-                if pm.id == self.fail_on {
-                    bail!("simulated release failure for {}", pm.id);
-                }
-                Ok(())
-            }
-        }
-        let crew = valid_crew();
-        let inputs = FunnelInputs {
-            case_id: "c1".to_string(),
-            crew: &crew,
-            intent_title: "add a feature",
-            intent_body: "",
-            diff: DIFF,
-            mode: ExecMode::Sequential,
-            probe_system: "probe sys",
-            judge_system: "judge sys",
-            verify_system: "verify sys",
-            remote_max_tokens_per_execution: 500_000,
-            bundles: None,
-        };
-        let mut cycler = FailingReleaseCycler { fail_on: "judge-model".to_string() };
-        let mut emitter = RecordingEmitter::new();
-        let mut call_n = 0u32;
-        let mut chat = |_call: &ChatCall| {
-            call_n += 1;
-            if call_n <= 2 {
-                Ok(reply("a real defect `const end = start.plus(30)`"))
-            } else {
-                Ok(reply(CONFIRM_JSON))
-            }
-        };
-        let err = run_funnel(&inputs, &mut chat, &mut cycler, &mut emitter).unwrap_err();
-        assert!(err.to_string().contains("release failure"), "{err:#}");
-
-        let last = emitter.records.last().unwrap();
-        assert_eq!(last.action, "funnel.task");
-        assert_eq!(last.payload.as_ref().unwrap()["status"].as_str(), Some("error"));
-        // Innermost-first: `judge-pass2` (opened last, mid-loop, once its
-        // first pass-2 ruling fired) closes before `judge-pass1` (opened
-        // first, before the loop).
-        let second_to_last = &emitter.records[emitter.records.len() - 2];
-        assert_eq!(second_to_last.action, "funnel.step");
-        assert_eq!(
-            second_to_last.payload.as_ref().unwrap()["step_id"].as_str(),
-            Some("judge-pass1"),
-            "judge-pass1 was the outermost open step at the release failure"
-        );
-        assert_eq!(second_to_last.payload.as_ref().unwrap()["status"].as_str(), Some("error"));
-        let third_to_last = &emitter.records[emitter.records.len() - 3];
-        assert_eq!(third_to_last.action, "funnel.step");
-        assert_eq!(
-            third_to_last.payload.as_ref().unwrap()["step_id"].as_str(),
-            Some("judge-pass2"),
-            "judge-pass2 was ALSO open (its ruling already fired mid-loop) and closes first, innermost"
-        );
-        assert_eq!(third_to_last.payload.as_ref().unwrap()["status"].as_str(), Some("error"));
-        // The rulings the docket DID produce before the abort are on the
-        // stream — partial progress is preserved, not retconned.
-        assert!(emitter.records.iter().any(|r| r.action == "funnel.ruling"));
-    }
 
     // ── host telemetry sampler (#1247 doctrine surface) ─────────────────
 
@@ -5107,158 +5197,8 @@ mod tests {
             .expect("sampler thread did not stop within 5s — thread leak");
     }
 
-    /// `FunnelBookendGuard` owns the sampler's whole-run lifecycle (see its
-    /// doc). Clean finish: `task_started` -> `task_finished` -> the guard
-    /// drops — the sampler thread must already be stopped by the time that
-    /// drop returns. Same bounded-timeout discipline as the sampler-only
-    /// test above (drop runs on a spawned thread; the test thread asserts
-    /// via `recv_timeout` so a hang fails loud instead of wedging the run).
-    #[test]
-    fn bookend_guard_clean_finish_stops_telemetry_sampler_thread() {
-        let (done_tx, done_rx) = mpsc::channel();
-        thread::spawn(move || {
-            let mut emitter = RecordingEmitter::new();
-            let mut sink = EmitterSink(&mut emitter);
-            let mut guard = FunnelBookendGuard::new_with_telemetry(
-                &mut sink,
-                "case-1",
-                "crew-1",
-                Duration::from_millis(5),
-                Duration::from_millis(2),
-                fake_sample,
-            );
-            guard.task_started(json!({"status": "started"}));
-            let env = FunnelEnvelope {
-                case_id: "case-1".to_string(),
-                crew: "crew-1".to_string(),
-                ..Default::default()
-            };
-            guard.task_finished(&env);
-            drop(guard); // blocks until the sampler thread stops + joins
-            let _ = done_tx.send(());
-        });
-        done_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("guard drop (clean finish) did not stop the telemetry sampler thread within 5s — thread leak");
-    }
 
-    /// The error-path mirror: `task_started` with no matching
-    /// `task_finished` (an early `?`-return / panic unwind) — the guard's
-    /// Drop path (still ARMED) closes open steps + emits a terminal error
-    /// record AND must still stop the sampler thread, exactly like the
-    /// clean-finish path above.
-    #[test]
-    fn bookend_guard_error_path_drop_stops_telemetry_sampler_thread() {
-        let (done_tx, done_rx) = mpsc::channel();
-        thread::spawn(move || {
-            let mut emitter = RecordingEmitter::new();
-            {
-                let mut sink = EmitterSink(&mut emitter);
-                let mut guard = FunnelBookendGuard::new_with_telemetry(
-                    &mut sink,
-                    "case-2",
-                    "crew-2",
-                    Duration::from_millis(5),
-                    Duration::from_millis(2),
-                    fake_sample,
-                );
-                guard.task_started(json!({"status": "started"}));
-                // No `task_finished` call — the guard drops here still
-                // ARMED, exercising the error path.
-            }
-            let _ = done_tx.send(());
-        });
-        done_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("guard drop (error path) did not stop the telemetry sampler thread within 5s — thread leak");
-    }
 
-    /// End-to-end: a scripted `run_funnel` (via the test-only
-    /// `run_funnel_with_telemetry` seam) with a fast sampler cadence, an
-    /// injected instant fake sampler (hermetic — no real subprocess
-    /// timing), and a small sleep per scripted dispatch (so the run's own
-    /// wall-clock comfortably exceeds several sample intervals) must show
-    /// at least one `telemetry.process` record on the `RecordingEmitter`,
-    /// with the same field shape `dispatch_internal`'s sampler already
-    /// produces (`category=telemetry, source="process"`) plus this run's
-    /// own identity (`session_id=case_id`, `handle=crew name`) — the
-    /// convention `funnel_flow_record` already uses for the `funnel.*`
-    /// action family, so a telemetry record groups with a run's other
-    /// records under the same `session_id`.
-    #[test]
-    fn flow_emission_includes_host_telemetry_when_sampler_cadence_is_fast() {
-        let crew = valid_crew();
-        let inputs = FunnelInputs {
-            case_id: "c-telemetry".to_string(),
-            crew: &crew,
-            intent_title: "add a feature",
-            intent_body: "",
-            diff: DIFF,
-            mode: ExecMode::Sequential,
-            probe_system: "probe sys",
-            judge_system: "judge sys",
-            verify_system: "verify sys",
-            remote_max_tokens_per_execution: 500_000,
-            bundles: None,
-        };
-        let mut cycler = RecordingCycler::new();
-        let mut emitter = RecordingEmitter::new();
-        let mut call_n = 0u32;
-        // Same scripted scenario as `flow_emission_records_the_expected_
-        // action_sequence_for_a_healthy_run` (probe k=2 both find the same
-        // defect, judge confirms both passes -> 4 dispatch calls total),
-        // plus a 25ms sleep per call. With the injected `fake_sample`
-        // returning instantly, the only timing in play is the 5ms sampler
-        // interval vs the run's guaranteed >=100ms wall-clock (4 x 25ms)
-        // — a 20x margin with no subprocess latency to race.
-        let mut chat = |_call: &ChatCall| {
-            thread::sleep(Duration::from_millis(25));
-            call_n += 1;
-            if call_n <= 2 {
-                Ok(reply("a real defect `const end = start.plus(30)`"))
-            } else {
-                Ok(reply(CONFIRM_JSON))
-            }
-        };
-        let env = run_funnel_with_telemetry(
-            &inputs,
-            &mut chat,
-            &mut cycler,
-            &mut emitter,
-            Duration::from_millis(5),
-            Duration::from_millis(2),
-            fake_sample,
-        )
-        .expect("funnel runs");
-        assert!(env.degenerate.is_none());
-
-        let telemetry: Vec<&darkmux_flow::FlowRecord> =
-            emitter.records.iter().filter(|r| r.action == "telemetry.process").collect();
-        assert!(
-            !telemetry.is_empty(),
-            "expected at least one telemetry.process record with a fast sampler cadence"
-        );
-        for r in &telemetry {
-            assert!(
-                matches!(r.category, darkmux_flow::Category::Telemetry),
-                "telemetry record must carry category=telemetry"
-            );
-            assert_eq!(r.source.as_deref(), Some("process"));
-            assert_eq!(
-                r.session_id.as_deref(),
-                Some("c-telemetry"),
-                "session_id must match the funnel's case_id — same convention funnel_flow_record uses"
-            );
-            assert_eq!(r.handle, crew.name);
-            // The injected fake sampler returns fixed values, so the
-            // payload assertion can be exact — proving the sample's
-            // fields flow through the record-building path unmangled.
-            let payload = r.payload.as_ref().expect("telemetry record carries a payload");
-            assert_eq!(payload["cpu"], json!(42));
-            assert_eq!(payload["mem"], json!(50));
-            assert_eq!(payload["gpu"], json!(7));
-        }
-    }
 
     // ── staffing snapshot (#1247 lab-view addition) ────────────────────
 
@@ -5283,11 +5223,12 @@ mod tests {
             judge_system: "judge sys",
             verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
+            mission: None,
             bundles: None,
         };
-        let mut cycler = RecordingCycler::new();
-        let mut chat = |_call: &ChatCall| Ok(reply("a real defect `const end = start.plus(30)`"));
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("funnel runs");
+        let cycler = RecordingCycler::new();
+        let chat = |_call: &ChatCall| Ok(reply("a real defect `const end = start.plus(30)`"));
+        let env = run_funnel(&inputs, chat, cycler, &mut NullEmitter).expect("funnel runs");
 
         let snapshot = env.staffing.as_ref().expect("staffing snapshot present on a normal run");
         assert_eq!(snapshot.probes.len(), 1);
@@ -5339,11 +5280,12 @@ mod tests {
             judge_system: "judge sys",
             verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
+            mission: None,
             bundles: None,
         };
-        let mut cycler = RecordingCycler::new();
-        let mut chat = |_call: &ChatCall| Ok(reply("a real defect `const end = start.plus(30)`"));
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("funnel runs");
+        let cycler = RecordingCycler::new();
+        let chat = |_call: &ChatCall| Ok(reply("a real defect `const end = start.plus(30)`"));
+        let env = run_funnel(&inputs, chat, cycler, &mut NullEmitter).expect("funnel runs");
 
         let snapshot = env.staffing.as_ref().expect("staffing snapshot present on a normal run");
         assert_eq!(
@@ -5386,11 +5328,12 @@ mod tests {
             judge_system: "judge sys",
             verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
+            mission: None,
             bundles: None,
         };
-        let mut cycler = RecordingCycler::new();
-        let mut chat = |_call: &ChatCall| Ok(reply("a real defect `const end = start.plus(30)`"));
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("funnel runs");
+        let cycler = RecordingCycler::new();
+        let chat = |_call: &ChatCall| Ok(reply("a real defect `const end = start.plus(30)`"));
+        let env = run_funnel(&inputs, chat, cycler, &mut NullEmitter).expect("funnel runs");
 
         let snapshot = env.staffing.as_ref().expect("staffing snapshot present on a normal run");
         assert!(snapshot.request_changes, "the crew's request_changes flag is snapshotted");
@@ -5407,8 +5350,8 @@ mod tests {
         ]);
         advisory.request_changes = false; // the default — advisory
         let inputs2 = FunnelInputs { case_id: "c-adv".to_string(), crew: &advisory, ..inputs };
-        let mut cycler2 = RecordingCycler::new();
-        let env2 = run_funnel(&inputs2, &mut chat, &mut cycler2, &mut NullEmitter).expect("funnel runs");
+        let cycler2 = RecordingCycler::new();
+        let env2 = run_funnel(&inputs2, chat, cycler2, &mut NullEmitter).expect("funnel runs");
         let json2 = serde_json::to_string(&env2).expect("envelope serializes");
         let value2: serde_json::Value = serde_json::from_str(&json2).expect("envelope parses back");
         assert!(
@@ -5448,11 +5391,12 @@ mod tests {
             judge_system: "judge sys",
             verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
+            mission: None,
             bundles: None,
         };
-        let mut cycler = RecordingCycler::new();
-        let mut chat = |_call: &ChatCall| Ok(reply("unused"));
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("funnel runs");
+        let cycler = RecordingCycler::new();
+        let chat = |_call: &ChatCall| Ok(reply("unused"));
+        let env = run_funnel(&inputs, chat, cycler, &mut NullEmitter).expect("funnel runs");
         assert!(env.degenerate.is_some());
         assert_eq!(env.bundles, 0);
         assert_eq!(env.confirmed, 0);
@@ -5478,12 +5422,13 @@ mod tests {
             judge_system: "judge sys",
             verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
+            mission: None,
             bundles: None,
         };
-        let mut cycler = RecordingCycler::new();
+        let cycler = RecordingCycler::new();
         // Every probe draw comes back empty — retried, then skipped.
-        let mut chat = |_call: &ChatCall| Ok(reply(""));
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("funnel runs");
+        let chat = |_call: &ChatCall| Ok(reply(""));
+        let env = run_funnel(&inputs, chat, cycler, &mut NullEmitter).expect("funnel runs");
         assert!(env.degenerate.is_some());
         assert_eq!(env.raw_flags, 0);
         assert_eq!(env.judged.len(), 0);
@@ -5513,10 +5458,11 @@ mod tests {
             judge_system: "judge sys",
             verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
+            mission: None,
             bundles: None,
         };
-        let mut cycler = RecordingCycler::new();
-        let mut chat = |call: &ChatCall| {
+        let cycler = RecordingCycler::new();
+        let chat = |call: &ChatCall| {
             if call.model.contains("probe-model") {
                 Ok(reply("a real defect `const end = start.plus(30)`"))
             } else {
@@ -5525,7 +5471,7 @@ mod tests {
                 Ok(reply("I could not reach a verdict on this."))
             }
         };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("funnel runs");
+        let env = run_funnel(&inputs, chat, cycler, &mut NullEmitter).expect("funnel runs");
         assert_eq!(env.judged.len(), 1, "the flag WAS judged (archived), not dropped");
         assert_eq!(env.confirmed, 0);
         assert_eq!(env.needs_check, 0);
@@ -5552,17 +5498,18 @@ mod tests {
             judge_system: "judge sys",
             verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
+            mission: None,
             bundles: None,
         };
-        let mut cycler = RecordingCycler::new();
-        let mut chat = |call: &ChatCall| {
+        let cycler = RecordingCycler::new();
+        let chat = |call: &ChatCall| {
             if call.model.contains("probe-model") {
                 Ok(reply("a real defect `const end = start.plus(30)`"))
             } else {
                 Ok(reply(FP_JSON))
             }
         };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("funnel runs");
+        let env = run_funnel(&inputs, chat, cycler, &mut NullEmitter).expect("funnel runs");
         assert_eq!(env.confirmed, 0);
         assert_eq!(env.archived, 1);
         assert!(
@@ -5588,81 +5535,31 @@ mod tests {
             judge_system: "judge sys",
             verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
+            mission: None,
             bundles: None,
         };
         let flags = vec![flag("billing.ts", "member-a", 0, "`const end = start.plus(30)` double-counts")];
-        let mut cycler = RecordingCycler::new();
-        let mut chat = |_call: &ChatCall| Ok(reply(CONFIRM_JSON));
-        let env = run_judge_only(flags, &inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+        let cycler = RecordingCycler::new();
+        let cycler_check = cycler.clone();
+        let chat = |_call: &ChatCall| Ok(reply(CONFIRM_JSON));
+        let env = run_judge_only(flags, &inputs, chat, cycler, &mut NullEmitter).expect("runs");
         assert_eq!(env.raw_flags, 1);
         assert_eq!(env.judged.len(), 1);
-        assert!(!cycler.log.iter().any(|s| s.contains("probe-model")), "probe never dispatched");
-        assert_eq!(
-            env.mode, "sequential",
-            "the envelope records the caller's resolved mode, not a hardcoded label"
-        );
+        assert!(!cycler_check.log().iter().any(|s| s.contains("probe-model")), "probe never dispatched");
+        // (#1230 Packet 4) `env.mode` is now the constant "concurrent" every
+        // run reports — `ExecMode`/`FunnelInputs::mode` is vestigial (see
+        // its doc comment); the CALLER's `--mode` choice no longer changes
+        // this value.
+        assert_eq!(env.mode, "concurrent");
     }
 
-    #[test]
-    fn run_judge_only_records_the_callers_parallel_mode() {
-        let crew = valid_crew();
-        let inputs = FunnelInputs {
-            case_id: "c1".to_string(),
-            crew: &crew,
-            intent_title: "add a feature",
-            intent_body: "",
-            diff: DIFF,
-            mode: ExecMode::Parallel,
-            probe_system: "probe sys",
-            judge_system: "judge sys",
-            verify_system: "verify sys",
-            remote_max_tokens_per_execution: 500_000,
-            bundles: None,
-        };
-        let flags = vec![flag("billing.ts", "member-a", 0, "`const end = start.plus(30)` off by one")];
-        let mut cycler = RecordingCycler::new();
-        let mut chat = |_call: &ChatCall| Ok(reply(FP_JSON));
-        let env = run_judge_only(flags, &inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
-        assert_eq!(env.mode, "parallel", "a judge-only re-run of a parallel funnel keeps its provenance");
-    }
 
-    // ── ExecMode auto-resolution (#1230 Packet 1: gestalt wave scheduler) ──
-
-    /// A minimal, valid `WaveSchedule` for [`wave_schedule_to_exec_mode`]'s
-    /// pure-projection tests — the wave PARTITIONING itself is already
-    /// covered by `darkmux-gestalt`'s own `plan_waves` table tests; this
-    /// only pins the wave-count → `ExecMode` mapping this module owns.
-    fn schedule_with_waves(n: usize) -> darkmux_gestalt::WaveSchedule {
-        let placement = |i: usize| darkmux_gestalt::Placement {
-            model_key: format!("m{i}"),
-            identifier: format!("darkmux:m{i}"),
-            min_ctx: 8_000,
-            seat: "probe".to_string(),
-        };
-        darkmux_gestalt::WaveSchedule {
-            waves: (0..n).map(|i| vec![placement(i)]).collect(),
-            refusals: Vec::new(),
-            mode: darkmux_gestalt::WaveMode::Auto,
-            effective_limit_bytes: None,
-            warnings: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn wave_schedule_to_exec_mode_one_wave_is_parallel_more_is_sequential() {
-        assert_eq!(wave_schedule_to_exec_mode(&schedule_with_waves(0)), ExecMode::Parallel);
-        assert_eq!(wave_schedule_to_exec_mode(&schedule_with_waves(1)), ExecMode::Parallel);
-        assert_eq!(wave_schedule_to_exec_mode(&schedule_with_waves(2)), ExecMode::Sequential);
-        assert_eq!(wave_schedule_to_exec_mode(&schedule_with_waves(3)), ExecMode::Sequential);
-    }
-
-    #[test]
-    fn resolve_auto_via_waves_empty_placements_is_parallel_without_touching_lms() {
-        // No distinct local models (e.g. every probe + the judge are
-        // remote) short-circuits to Parallel without any `LmsHost`/
-        // `MacProbe` I/O — nothing to co-reside.
-        assert_eq!(resolve_auto_via_waves(&[]), ExecMode::Parallel);
-    }
+    // (#1230 Packet 4) `schedule_with_waves`/`wave_schedule_to_exec_mode`
+    // tests removed — gestalt's wave planner is now consulted per-step via
+    // `StepKind::residency`, not via a driver-level ExecMode resolution
+    // (see `funnel_step_kinds`'s module doc). Wave partitioning itself
+    // stays covered by `darkmux-gestalt`'s own `plan_waves` table tests
+    // and `concurrent_dispatch`'s `run_bounded` tests.
 
     // ── judge_prompt shape ─────────────────────────────────────────────
 
@@ -5951,8 +5848,8 @@ mod tests {
     /// promote to `Confirmed` on a garbled second call.
     #[test]
     fn double_confirm_confirm_then_pass2_unparsed_demotes_to_needs_check() {
-        let mut chat = scripted_chat(RefCell::new(vec![CONFIRM_JSON, "no verdict here", "still nothing"]));
-        let o = judge_one_flag("prompt", "judge-model", "sys", 1000, None, None, &mut chat);
+        let chat = scripted_chat(RefCell::new(vec![CONFIRM_JSON, "no verdict here", "still nothing"]));
+        let o = judge_one_flag("prompt", "judge-model", "sys", 1000, None, None, &chat);
         assert_eq!(o.pass1.ruling, FunnelRuling::Confirmed);
         assert_eq!(o.pass2.as_ref().unwrap().ruling, FunnelRuling::Unparsed);
         assert_eq!(o.tier, Tier::NeedsCheck, "an unparsed pass-2 must demote, never silently confirm");
@@ -5961,115 +5858,14 @@ mod tests {
     }
 
     // ── ModelCycler load-failure propagation ────────────────────────────
-
-    /// Recording [`ModelCycler`] mock that fails `ensure_loaded` for one
-    /// named model id, so cycling order AND the abort point are both
-    /// assertable.
-    struct FailingLoadCycler {
-        fail_on: String,
-        log: Vec<String>,
-    }
-    impl FailingLoadCycler {
-        fn new(fail_on: &str) -> Self {
-            Self { fail_on: fail_on.to_string(), log: Vec::new() }
-        }
-    }
-    impl ModelCycler for FailingLoadCycler {
-        fn ensure_loaded(&mut self, pm: &ProfileModel) -> Result<()> {
-            self.log.push(format!("load:{}", pm.id));
-            if pm.id == self.fail_on {
-                bail!("simulated load failure for {}", pm.id);
-            }
-            Ok(())
-        }
-        fn release(&mut self, pm: &ProfileModel) -> Result<()> {
-            self.log.push(format!("release:{}", pm.id));
-            Ok(())
-        }
-    }
-
-    /// Sequential mode loads/dispatches/releases one member fully before
-    /// moving to the next. A load failure on the SECOND member aborts the
-    /// whole probe phase via `?` — the first member's already-gathered
-    /// flags are discarded (never surfaced, since `run_funnel` returns
-    /// `Err` and the partially-built envelope is dropped), the failed
-    /// member is never released, and the judge never loads at all.
-    #[test]
-    fn probe_phase_sequential_load_failure_aborts_remaining_members_and_drops_prior_flags() {
-        let crew = crew_with(vec![
-            (
-                "review-probe",
-                vec![staffing("fast", "member-a", 1), staffing("fast", "member-b", 1)],
-            ),
-            ("review-judge", vec![staffing("fast", "judge-model", 1)]),
-        ]);
-        let inputs = FunnelInputs {
-            case_id: "c1".to_string(),
-            crew: &crew,
-            intent_title: "add a feature",
-            intent_body: "",
-            diff: DIFF,
-            mode: ExecMode::Sequential,
-            probe_system: "probe sys",
-            judge_system: "judge sys",
-            verify_system: "verify sys",
-            remote_max_tokens_per_execution: 500_000,
-            bundles: None,
-        };
-        let mut cycler = FailingLoadCycler::new("member-b");
-        let mut chat = |_call: &ChatCall| Ok(reply("a real defect `const end = start.plus(30)`"));
-        let err = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).unwrap_err();
-        assert!(
-            err.to_string().contains("probe phase"),
-            "run_funnel wraps the propagated load error with phase context"
-        );
-        assert_eq!(
-            cycler.log,
-            vec!["load:member-a", "release:member-a", "load:member-b"],
-            "member-a fully cycled before member-b's load failure aborts — no release for member-b, no judge load at all"
-        );
-    }
-
-    /// Parallel mode loads EVERY member up front, before dispatching any of
-    /// them. A load failure partway through that up-front loop aborts
-    /// before a single dispatch happens — member-a's draw never runs even
-    /// though its own load succeeded.
-    #[test]
-    fn probe_phase_parallel_load_failure_aborts_before_any_dispatch() {
-        let crew = crew_with(vec![
-            (
-                "review-probe",
-                vec![staffing("fast", "member-a", 1), staffing("fast", "member-b", 1)],
-            ),
-            ("review-judge", vec![staffing("fast", "judge-model", 1)]),
-        ]);
-        let inputs = FunnelInputs {
-            case_id: "c1".to_string(),
-            crew: &crew,
-            intent_title: "add a feature",
-            intent_body: "",
-            diff: DIFF,
-            mode: ExecMode::Parallel,
-            probe_system: "probe sys",
-            judge_system: "judge sys",
-            verify_system: "verify sys",
-            remote_max_tokens_per_execution: 500_000,
-            bundles: None,
-        };
-        let mut cycler = FailingLoadCycler::new("member-b");
-        let mut dispatch_count = 0u32;
-        let mut chat = |_call: &ChatCall| {
-            dispatch_count += 1;
-            Ok(reply("a real defect `const end = start.plus(30)`"))
-        };
-        let err = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).unwrap_err();
-        assert!(err.to_string().contains("probe phase"));
-        assert_eq!(
-            dispatch_count, 0,
-            "parallel mode loads every member before dispatching any — the failure aborts before member-a's draw ever runs"
-        );
-        assert_eq!(cycler.log, vec!["load:member-a", "load:member-b"]);
-    }
+    //
+    // (#1230 Packet 4) `FailingLoadCycler` (a recording mock that failed
+    // `ensure_loaded` for one named model id) was only exercised by the
+    // `probe_phase_*_load_failure_*` tests, which tested the retired
+    // `probe_phase`'s phase-level Sequential/Parallel load choreography —
+    // gestalt's wave planner now owns residency ordering (see
+    // `funnel_step_kinds`'s module doc), so those tests were removed
+    // rather than adapted; this mock has no remaining caller.
 
     // ── LmsCycler residency reconciliation (#1271) ──────────────────────
 
@@ -6154,7 +5950,7 @@ mod tests {
         let env = LmsStubEnv::new(
             r#"[{"identifier":"darkmux:devstral","modelKey":"devstral","status":"loaded","sizeBytes":14000000000,"contextLength":20000}]"#,
         );
-        let mut cycler = LmsCycler;
+        let cycler = LmsCycler;
         let model = ProfileModel { id: "devstral".to_string(), n_ctx: Some(32768), ..Default::default() };
         cycler.ensure_loaded(&model).expect("reconcile succeeds");
         let log = env.log();
@@ -6178,7 +5974,7 @@ mod tests {
         let env = LmsStubEnv::new(
             r#"[{"identifier":"darkmux:devstral","modelKey":"devstral","status":"loaded","sizeBytes":14000000000,"contextLength":40960}]"#,
         );
-        let mut cycler = LmsCycler;
+        let cycler = LmsCycler;
         let model = ProfileModel { id: "devstral".to_string(), n_ctx: Some(32768), ..Default::default() };
         cycler.ensure_loaded(&model).expect("reuse succeeds");
         assert_eq!(env.log(), "", "sufficient ctx already resident — no load/unload issued");
@@ -6199,7 +5995,7 @@ mod tests {
         let env = LmsStubEnv::new(
             r#"[{"identifier":"devstral-manual","modelKey":"devstral","status":"loaded","sizeBytes":14000000000,"contextLength":40960}]"#,
         );
-        let mut cycler = LmsCycler;
+        let cycler = LmsCycler;
         let model = ProfileModel { id: "devstral".to_string(), n_ctx: Some(32768), ..Default::default() };
         cycler.ensure_loaded(&model).expect("loads darkmux's own copy alongside the foreign resident");
         let log = env.log();
@@ -6216,7 +6012,7 @@ mod tests {
     #[serial_test::serial]
     fn lms_cycler_no_resident_loads_plain() {
         let env = LmsStubEnv::new("[]");
-        let mut cycler = LmsCycler;
+        let cycler = LmsCycler;
         let model = ProfileModel { id: "devstral".to_string(), n_ctx: Some(32768), ..Default::default() };
         cycler.ensure_loaded(&model).expect("plain load succeeds");
         let log = env.log();
@@ -6239,7 +6035,7 @@ mod tests {
         let env = LmsStubEnv::new(
             r#"[{"identifier":"custom","modelKey":"devstral","status":"loaded","sizeBytes":14000000000,"contextLength":32768}]"#,
         );
-        let mut cycler = LmsCycler;
+        let cycler = LmsCycler;
         let model = ProfileModel {
             id: "devstral".to_string(),
             n_ctx: Some(32768),
@@ -6260,7 +6056,7 @@ mod tests {
         let env = LmsStubEnv::new(
             r#"[{"identifier":"custom","modelKey":"devstral","status":"loaded","sizeBytes":14000000000,"contextLength":20000}]"#,
         );
-        let mut cycler = LmsCycler;
+        let cycler = LmsCycler;
         let model = ProfileModel {
             id: "devstral".to_string(),
             n_ctx: Some(32768),
@@ -6298,7 +6094,7 @@ mod tests {
                 {"identifier":"darkmux:devstral","modelKey":"devstral","status":"loaded","sizeBytes":14000000000,"contextLength":20000}
             ]"#,
         );
-        let mut cycler = LmsCycler;
+        let cycler = LmsCycler;
         let model = ProfileModel { id: "devstral".to_string(), n_ctx: Some(32768), ..Default::default() };
         cycler.ensure_loaded(&model).expect("reconciles the owned-but-stale instance regardless of listing order");
         let log = env.log();
@@ -6323,7 +6119,7 @@ mod tests {
                 {"identifier":"devstral-manual","modelKey":"devstral","status":"loaded","sizeBytes":14000000000,"contextLength":40960}
             ]"#,
         );
-        let mut cycler = LmsCycler;
+        let cycler = LmsCycler;
         let model = ProfileModel { id: "devstral".to_string(), n_ctx: Some(32768), ..Default::default() };
         cycler.ensure_loaded(&model).expect("reconcile succeeds with a user-owned resident present");
         let log = env.log();
@@ -6395,20 +6191,21 @@ mod tests {
             judge_system: "judge sys",
             verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
+            mission: None,
             bundles: None,
         };
-        let mut cycler = RecordingCycler::new();
-        let mut call_n = 0u32;
-        let mut chat = |_call: &ChatCall| {
-            call_n += 1;
+        let cycler = RecordingCycler::new();
+        let call_n = std::sync::atomic::AtomicU32::new(0);
+        let chat = move |_call: &ChatCall| {
+            let n = call_n.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
             std::thread::sleep(std::time::Duration::from_millis(2));
-            if call_n <= 2 {
+            if n <= 2 {
                 Ok(reply("a real defect `const end = start.plus(30)`"))
             } else {
                 Ok(reply(CONFIRM_JSON))
             }
         };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("funnel runs");
+        let env = run_funnel(&inputs, chat, cycler, &mut NullEmitter).expect("funnel runs");
         let probe_step = env.steps.iter().find(|s| s.step_id == "probe").expect("probe step recorded");
         let probe_member_ms: u64 = env
             .members
@@ -6444,13 +6241,14 @@ mod tests {
             judge_system: "judge sys",
             verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
+            mission: None,
             bundles: None,
         };
-        let mut cycler = RecordingCycler::new();
-        let mut call_n = 0u32;
-        let mut chat = |_call: &ChatCall| {
-            call_n += 1;
-            if call_n <= 2 {
+        let cycler = RecordingCycler::new();
+        let call_n = std::sync::atomic::AtomicU32::new(0);
+        let chat = move |_call: &ChatCall| {
+            let n = call_n.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if n <= 2 {
                 Ok(reply("a real defect `const end = start.plus(30)`"))
             } else {
                 // Both judge passes confirm, so both judge-pass1 and
@@ -6458,7 +6256,7 @@ mod tests {
                 Ok(reply(CONFIRM_JSON))
             }
         };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("funnel runs");
+        let env = run_funnel(&inputs, chat, cycler, &mut NullEmitter).expect("funnel runs");
         let judge_member = env
             .members
             .iter()
@@ -6679,18 +6477,20 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             judge_system: "judge sys",
             verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
+            mission: None,
             bundles: Some(bundles),
         };
         let flags = vec![flag("billing.ts", "member-a", 0, "`const end = start.plus(30)` double-counts")];
-        let mut cycler = RecordingCycler::new();
-        let seen_prompts = RefCell::new(Vec::new());
-        let mut chat = |call: &ChatCall| {
-            seen_prompts.borrow_mut().push(call.user.to_string());
+        let cycler = RecordingCycler::new();
+        let seen_prompts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_prompts_check = seen_prompts.clone();
+        let chat = move |call: &ChatCall| {
+            seen_prompts.lock().expect("seen_prompts poisoned").push(call.user.to_string());
             Ok(reply(CONFIRM_JSON))
         };
-        let env = run_judge_only(flags, &inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+        let env = run_judge_only(flags, &inputs, chat, cycler, &mut NullEmitter).expect("runs");
         assert_eq!(env.judged.len(), 1);
-        let prompts = seen_prompts.borrow();
+        let prompts = seen_prompts_check.lock().expect("seen_prompts poisoned");
         // A `confirmed` pass-1 (CONFIRM_JSON) earns a pass-2 (double-confirm
         // judge, module doc) — TWO dispatches over the SAME prompt text, not
         // one. Assert every dispatched prompt, not just the first.
@@ -6763,6 +6563,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             verify_system: "verify sys",
             bundles: None,
             remote_max_tokens_per_execution: budget,
+            mission: None,
         }
     }
 
@@ -6782,29 +6583,31 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             ("review-judge", vec![remote_staffing("cloud-judge", "gpt-judge", 1)]),
         ]);
         let inputs = inputs_for(&crew, 500_000);
-        let mut cycler = RecordingCycler::new();
-        let calls: RefCell<Vec<(String, bool)>> = RefCell::new(Vec::new());
-        let mut chat = |call: &ChatCall| {
-            calls.borrow_mut().push((call.model.to_string(), call.endpoint.is_some()));
+        let cycler = RecordingCycler::new();
+        let cycler_check = cycler.clone();
+        let calls: Arc<Mutex<Vec<(String, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls_check = calls.clone();
+        let chat = move |call: &ChatCall| {
+            calls.lock().expect("calls poisoned").push((call.model.to_string(), call.endpoint.is_some()));
             if call.model == "gpt-judge" {
                 Ok(reply(CONFIRM_JSON))
             } else {
                 Ok(reply("a real defect `const end = start.plus(30)`"))
             }
         };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+        let env = run_funnel(&inputs, chat, cycler, &mut NullEmitter).expect("runs");
 
         // (1) Cycler saw ONLY the local probe — remote seats have no residency.
-        assert!(!cycler.log.is_empty(), "the local seat still cycles");
+        assert!(!cycler_check.log().is_empty(), "the local seat still cycles");
         assert!(
-            cycler.log.iter().all(|e| e.contains("local-probe")),
+            cycler_check.log().iter().all(|e| e.contains("local-probe")),
             "no cycler operation may name a remote model: {:?}",
-            cycler.log
+            cycler_check.log()
         );
 
         // (2) Local call: namespaced identifier, no endpoint. Remote calls:
         // bare profile id + endpoint.
-        let calls = calls.borrow();
+        let calls = calls_check.lock().expect("calls poisoned");
         assert!(calls.iter().any(|(m, r)| m == "darkmux:local-probe" && !r));
         assert!(calls.iter().any(|(m, r)| m == "gpt-remote" && *r), "remote probe routes hosted");
         assert!(calls.iter().any(|(m, r)| m == "gpt-judge" && *r), "remote judge routes hosted");
@@ -6847,8 +6650,8 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             ("review-verify", vec![remote_staffing("cloud-verify", "gpt-4o", 1)]),
         ]);
         let inputs = inputs_for(&crew, 500_000);
-        let mut cycler = RecordingCycler::new();
-        let mut chat = |call: &ChatCall| {
+        let cycler = RecordingCycler::new();
+        let chat = |call: &ChatCall| {
             let content = if call.system.contains("verify") {
                 "```json\n{\"ruling\": \"verified\", \"decisive_evidence\": \"e\", \"note_for_author\": \"n\"}\n```"
                     .to_string()
@@ -6863,7 +6666,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                 model: Some("gpt-4o-2026-08-01".to_string()),
             })
         };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+        let env = run_funnel(&inputs, chat, cycler, &mut NullEmitter).expect("runs");
 
         let probe = env.members.iter().find(|m| m.seat == "review-probe").expect("probe member");
         assert_eq!(probe.model, "gpt-4o", "requested id is unchanged");
@@ -6904,8 +6707,8 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             ("review-verify", vec![staffing("fast", "verify-model", 1)]),
         ]);
         let inputs = inputs_for(&crew, 500_000);
-        let mut cycler = RecordingCycler::new();
-        let mut chat = |call: &ChatCall| {
+        let cycler = RecordingCycler::new();
+        let chat = |call: &ChatCall| {
             let content = if call.system.contains("verify") {
                 "```json\n{\"ruling\": \"verified\", \"decisive_evidence\": \"e\", \"note_for_author\": \"n\"}\n```"
                     .to_string()
@@ -6920,7 +6723,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                 model: Some(call.model.to_string()),
             })
         };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+        let env = run_funnel(&inputs, chat, cycler, &mut NullEmitter).expect("runs");
 
         assert_eq!(env.members.len(), 3, "probe + judge + verify all dispatched");
         for m in &env.members {
@@ -6943,8 +6746,8 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             ("review-judge", vec![staffing("fast", "judge-model", 1)]),
         ]);
         let inputs = inputs_for(&crew, 100); // one 600-token draw exhausts it
-        let mut cycler = RecordingCycler::new();
-        let mut chat = |call: &ChatCall| {
+        let cycler = RecordingCycler::new();
+        let chat = |call: &ChatCall| {
             if call.model == "darkmux:judge-model" {
                 Ok(reply(CONFIRM_JSON))
             } else {
@@ -6956,7 +6759,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             }
         };
         let mut emitter = RecordingEmitter::new();
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut emitter).expect("runs");
+        let env = run_funnel(&inputs, chat, cycler, &mut emitter).expect("runs");
 
         assert!(env.degenerate.is_none(), "probe exhaustion never degrades the run");
         assert_eq!(env.raw_flags, 1, "only the pre-exhaustion draw landed");
@@ -6971,27 +6774,21 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             env.warnings
         );
 
-        // Live observability: the remote seat's step records carry the
-        // remote marker + host, and the terminal task record carries the
-        // separated remote-token figure + the warnings (#1186 — downstream
-        // savings surfaces exclude these tokens).
-        let probe_step = emitter
-            .records
-            .iter()
-            .filter_map(|r| r.payload.as_ref())
-            .find(|p| p["step_id"] == "probe:cloud" && p["status"] == "finished")
-            .expect("remote probe step record");
-        assert_eq!(probe_step["remote"], true);
-        assert_eq!(probe_step["endpoint"], "myorg.cognitiveservices.azure.com");
-        let finished = emitter
-            .records
-            .iter()
-            .filter(|r| r.action == "funnel.task")
-            .filter_map(|r| r.payload.as_ref())
-            .find(|p| p["status"] == "finished")
-            .expect("terminal task record");
-        assert_eq!(finished["remote_tokens"], 600);
-        assert!(finished["warnings"].as_array().is_some_and(|w| !w.is_empty()));
+        // (#1230 Packet 4) Live observability: the retired `funnel.step`/
+        // `funnel.task` vocabulary is superseded by the scheduler's own
+        // generic step-lifecycle records (one "step start"/"step complete"
+        // per `probe:<seat>` Step) plus the envelope's own `MemberRecord`
+        // (remote + endpoint host, #1186's separated remote-token figure).
+        assert!(
+            emitter.records.iter().any(|r| r.action == "step complete" && r.handle == "probe:cloud"),
+            "the remote probe seat's own Step completed and emitted a lifecycle record"
+        );
+        let member = env.members.iter().find(|m| m.seat == "review-probe" && m.remote).expect("remote probe member");
+        assert!(member.remote);
+        assert_eq!(member.endpoint.as_deref(), Some("myorg.cognitiveservices.azure.com"));
+        let remote_tokens: u64 = env.members.iter().filter(|m| m.remote).map(|m| m.total_tokens).sum();
+        assert_eq!(remote_tokens, 600, "#1186 — remote-seat tokens stay separable from local ones");
+        assert!(!env.warnings.is_empty());
     }
 
     /// Judge-stage bucket exhaustion is a LOAD-BEARING failure (operator
@@ -7008,8 +6805,8 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         // Two bundles ⇒ two anchor-less flags in different bundles ⇒ both
         // survive dedup ⇒ the second flag's pass-1 hits the exhausted bucket.
         inputs.bundles = Some(vec![bundle_input("a.ts"), bundle_input("b.ts")]);
-        let mut cycler = RecordingCycler::new();
-        let mut chat = |call: &ChatCall| {
+        let cycler = RecordingCycler::new();
+        let chat = |call: &ChatCall| {
             if call.endpoint.is_some() {
                 Ok(SingleShotReply {
                     content: CONFIRM_JSON.to_string(),
@@ -7020,7 +6817,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                 Ok(reply("a real defect"))
             }
         };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+        let env = run_funnel(&inputs, chat, cycler, &mut NullEmitter).expect("runs");
 
         let reason = env.degenerate.as_deref().expect("judge exhaustion degrades the run");
         assert!(reason.contains("remote judge token budget exhausted"), "got: {reason}");
@@ -7064,8 +6861,8 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             ("review-judge", vec![staffing("fast", "judge-model", 1)]),
         ]);
         let inputs = inputs_for(&crew, 500_000);
-        let mut cycler = RecordingCycler::new();
-        let mut chat = |call: &ChatCall| {
+        let cycler = RecordingCycler::new();
+        let chat = |call: &ChatCall| {
             if call.endpoint.is_some() {
                 Err(anyhow!("endpoint 401"))
             } else if call.model == "darkmux:judge-model" {
@@ -7074,7 +6871,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                 Ok(reply("a real defect `const end = start.plus(30)`"))
             }
         };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter)
+        let env = run_funnel(&inputs, chat, cycler, &mut NullEmitter)
             .expect("a remote probe failure must not abort the run");
         assert!(
             env.warnings.iter().any(|w| w.contains("reduced coverage") && w.contains("endpoint 401")),
@@ -7142,20 +6939,43 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         ]);
         let mut inputs = inputs_for(&crew, 500_000);
         inputs.bundles = Some(vec![bundle_input("a.ts"), bundle_input("b.ts"), bundle_input("c.ts")]);
-        let mut cycler = RecordingCycler::new();
-        let verify_replies = RefCell::new(vec![VERIFIED_JSON, REFUTED_JSON, UNCERTAIN_JSON]);
-        let mut chat = |call: &ChatCall| {
+        let cycler = RecordingCycler::new();
+        let cycler_check = cycler.clone();
+        // (#1230 Packet 4) Judge-pass1/-confirm/verify now run per-flag
+        // through the graph engine — different flags' steps CAN run
+        // concurrently (real fan-out, the whole point of this packet), so
+        // a mock that assigns replies by CALL ORDER (the pre-migration
+        // shape) is no longer reliable. Route by CONTENT instead: the
+        // probe stage is still one seat looping its bundles sequentially
+        // (`dispatch_probe_staffing_core`, unchanged), so an atomic
+        // counter deterministically tags each bundle's charge text, and
+        // the verify branch matches on that tag rather than on arrival
+        // order.
+        let probe_call_n = std::sync::atomic::AtomicU32::new(0);
+        let chat = move |call: &ChatCall| {
             if call.model == "darkmux:verify-model" {
                 assert_eq!(call.system, "verify sys", "the verify seat gets its own persona");
-                Ok(reply(verify_replies.borrow_mut().remove(0)))
+                if call.user.contains("tag-a") {
+                    Ok(reply(VERIFIED_JSON))
+                } else if call.user.contains("tag-b") {
+                    Ok(reply(REFUTED_JSON))
+                } else {
+                    Ok(reply(UNCERTAIN_JSON))
+                }
             } else if call.model == "darkmux:judge-model" {
                 Ok(reply(CONFIRM_JSON))
             } else {
-                Ok(reply("a real defect"))
+                let n = probe_call_n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let tag = match n {
+                    0 => "tag-a",
+                    1 => "tag-b",
+                    _ => "tag-c",
+                };
+                Ok(reply(&format!("a real defect ({tag})")))
             }
         };
         let mut emitter = RecordingEmitter::new();
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut emitter).expect("runs");
+        let env = run_funnel(&inputs, chat, cycler, &mut emitter).expect("runs");
 
         assert_eq!(env.judged.len(), 3);
         // verified: stays confirmed, record present.
@@ -7185,19 +7005,39 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         assert!(!member.remote);
         assert!(env.steps.iter().any(|s| s.step_id == "verify" && s.items_in == 3));
         assert!(env.staffing.as_ref().unwrap().verify.is_some(), "snapshot carries the verify seat");
-        // Residency: the local verify seat loads AFTER the judge releases.
-        let judge_release = cycler.log.iter().position(|e| e == "release:judge-model").unwrap();
-        let verify_load = cycler.log.iter().position(|e| e == "load:verify-model").unwrap();
-        let verify_release = cycler.log.iter().position(|e| e == "release:verify-model").unwrap();
-        assert!(judge_release < verify_load && verify_load < verify_release);
-        // Emission: the verify stage brackets itself with step records and
-        // emits one ruling per adjudication, inside the run's existing
-        // bookend guard (contract 2).
-        let payloads: Vec<&serde_json::Value> =
-            emitter.records.iter().filter_map(|r| r.payload.as_ref()).collect();
-        assert!(payloads.iter().any(|p| p["step_id"] == "verify" && p["status"] == "started"));
-        assert!(payloads.iter().any(|p| p["step_id"] == "verify" && p["status"] == "finished"));
-        assert_eq!(payloads.iter().filter(|p| p["stage"] == "verify").count(), 3);
+        // (#1230 Packet 4) Residency: every seat's model LOADS as its own
+        // step runs, but RELEASE is no longer per-stage-transition —
+        // `release_all_seats` releases every distinct local seat ONCE,
+        // after BOTH graph stages finish (see its doc comment: a
+        // concurrent sibling step might still need a model mid-run, so an
+        // early per-stage release would race it). The new invariant: every
+        // load precedes every release, and releases follow
+        // `release_all_seats`'s own iteration order (probes, then judge,
+        // then verify).
+        let log = cycler_check.log();
+        let last_load = log.iter().rposition(|e| e.starts_with("load:")).unwrap();
+        let first_release = log.iter().position(|e| e.starts_with("release:")).unwrap();
+        assert!(last_load < first_release, "every load precedes every release: {log:?}");
+        let judge_release = log.iter().position(|e| e == "release:judge-model").unwrap();
+        let verify_release = log.iter().position(|e| e == "release:verify-model").unwrap();
+        assert!(judge_release < verify_release, "release order follows probes -> judge -> verify: {log:?}");
+        // (#1230 Packet 4) Emission: the retired `funnel.step`/`funnel.
+        // ruling` vocabulary is superseded by the scheduler's own step-
+        // lifecycle records — one "step start"/"step complete" pair per
+        // verify:<flag> Step (real per-flag steps, not one aggregate
+        // "verify" phase record).
+        let verify_starts = emitter
+            .records
+            .iter()
+            .filter(|r| r.action == "step start" && r.handle.starts_with("verify:"))
+            .count();
+        let verify_completes = emitter
+            .records
+            .iter()
+            .filter(|r| r.action == "step complete" && r.handle.starts_with("verify:"))
+            .count();
+        assert_eq!(verify_starts, 3, "one step-start per confirmed flag's verify step");
+        assert_eq!(verify_completes, 3, "one step-complete per confirmed flag's verify step");
     }
 
     /// A crew WITHOUT the seat is byte-identical to today: no verify step,
@@ -7207,15 +7047,15 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     fn crew_without_verify_seat_is_unchanged() {
         let crew = valid_crew();
         let inputs = inputs_for(&crew, 500_000);
-        let mut cycler = RecordingCycler::new();
-        let mut chat = |call: &ChatCall| {
+        let cycler = RecordingCycler::new();
+        let chat = |call: &ChatCall| {
             if call.model == "darkmux:judge-model" {
                 Ok(reply(CONFIRM_JSON))
             } else {
                 Ok(reply("a real defect `const end = start.plus(30)`"))
             }
         };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+        let env = run_funnel(&inputs, chat, cycler, &mut NullEmitter).expect("runs");
         assert!(env.judged.iter().all(|j| j.verify.is_none()));
         assert!(!env.steps.iter().any(|s| s.step_id == "verify"));
         assert!(!env.members.iter().any(|m| m.seat == "review-verify"));
@@ -7239,8 +7079,9 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             ("review-verify", vec![staffing("frontier", "verify-model", 1)]),
         ]);
         let inputs = inputs_for(&crew, 500_000);
-        let mut cycler = RecordingCycler::new();
-        let mut chat = |call: &ChatCall| {
+        let cycler = RecordingCycler::new();
+        let cycler_check = cycler.clone();
+        let chat = |call: &ChatCall| {
             assert_ne!(call.model, "darkmux:verify-model", "no confirms ⇒ no verify dispatch");
             if call.model == "darkmux:judge-model" {
                 Ok(reply(FP_JSON))
@@ -7248,11 +7089,11 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                 Ok(reply("a real defect"))
             }
         };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+        let env = run_funnel(&inputs, chat, cycler, &mut NullEmitter).expect("runs");
         assert_eq!(env.confirmed, 0);
         assert!(!env.steps.iter().any(|s| s.step_id == "verify"));
         assert!(!env.members.iter().any(|m| m.seat == "review-verify"));
-        assert!(!cycler.log.iter().any(|e| e.contains("verify-model")));
+        assert!(!cycler_check.log().iter().any(|e| e.contains("verify-model")));
     }
 
     /// A REMOTE verify seat draws from its own execution bucket, and
@@ -7272,8 +7113,9 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         ]);
         let mut inputs = inputs_for(&crew, 100); // one 600-token adjudication exhausts it
         inputs.bundles = Some(vec![bundle_input("a.ts"), bundle_input("b.ts")]);
-        let mut cycler = RecordingCycler::new();
-        let mut chat = |call: &ChatCall| {
+        let cycler = RecordingCycler::new();
+        let cycler_check = cycler.clone();
+        let chat = |call: &ChatCall| {
             if call.endpoint.is_some() {
                 Ok(SingleShotReply {
                     content: VERIFIED_JSON.to_string(),
@@ -7286,7 +7128,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                 Ok(reply("a real defect"))
             }
         };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+        let env = run_funnel(&inputs, chat, cycler, &mut NullEmitter).expect("runs");
         assert!(env.degenerate.is_none(), "verify exhaustion NEVER degrades the whole run");
         let warning = env
             .warnings
@@ -7313,7 +7155,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         assert!(member.remote);
         assert_eq!(member.model, "gpt-verify");
         // No cycler traffic for a remote verify seat.
-        assert!(!cycler.log.iter().any(|e| e.contains("gpt-verify")));
+        assert!(!cycler_check.log().iter().any(|e| e.contains("gpt-verify")));
     }
 
     /// The verify seat's staffing shape is validated like the judge's:
@@ -7347,15 +7189,15 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     fn local_only_envelope_carries_no_remote_fields() {
         let crew = valid_crew();
         let inputs = inputs_for(&crew, 500_000);
-        let mut cycler = RecordingCycler::new();
-        let mut chat = |call: &ChatCall| {
+        let cycler = RecordingCycler::new();
+        let chat = |call: &ChatCall| {
             if call.model == "darkmux:judge-model" {
                 Ok(reply(CONFIRM_JSON))
             } else {
                 Ok(reply("a real defect `const end = start.plus(30)`"))
             }
         };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+        let env = run_funnel(&inputs, chat, cycler, &mut NullEmitter).expect("runs");
         let value = serde_json::to_value(&env).unwrap();
         assert!(value.get("warnings").is_none(), "empty warnings never serialize");
         assert!(value.get("remote_budgets").is_none(), "no budget rows on a local-only run");
@@ -7385,10 +7227,10 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             ("review-judge", vec![staffing("fast", "judge-model", 1)]),
         ]);
         let inputs = inputs_for(&crew, 500_000);
-        let mut cycler = RecordingCycler::new();
+        let cycler = RecordingCycler::new();
         // Every remote call is empty content but bills 600 tokens — the draw
         // retries once, so two 600-token attempts.
-        let mut chat = |call: &ChatCall| {
+        let chat = |call: &ChatCall| {
             if call.endpoint.is_some() {
                 Ok(SingleShotReply { content: String::new(), total_tokens: Some(600), model: None })
             } else {
@@ -7396,7 +7238,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             }
         };
         let mut emitter = RecordingEmitter::new();
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut emitter).expect("runs");
+        let env = run_funnel(&inputs, chat, cycler, &mut emitter).expect("runs");
 
         // Zero content ⇒ zero flags ⇒ the run is a degenerate zero-flag run,
         // but the SPEND is still fully accounted.
@@ -7406,14 +7248,14 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         assert_eq!(member.total_tokens, 1200, "both empty attempts billed to the member (600 + 600)");
         let rec = env.remote_budgets.iter().find(|r| r.stage == "probe").expect("probe budget row");
         assert_eq!(rec.used_tokens, 1200, "both empty attempts billed to the bucket");
-        let finished = emitter
-            .records
-            .iter()
-            .filter(|r| r.action == "funnel.task")
-            .filter_map(|r| r.payload.as_ref())
-            .find(|p| p["status"] == "finished")
-            .expect("terminal task record");
-        assert_eq!(finished["remote_tokens"], 1200, "the envelope's separated remote figure bills both");
+        // (#1230 Packet 4) `funnel.task`'s terminal record is retired — the
+        // envelope's own separated remote-token figure (summed across
+        // `env.members`, #1186) is the durable form of this claim; a
+        // production caller (`darkmux pr-review run`'s `with_dispatch_
+        // bookends`, `src/pr_review.rs`) stamps the SAME figure onto the
+        // surviving `dispatch complete` bookend.
+        let remote_tokens: u64 = env.members.iter().filter(|m| m.remote).map(|m| m.total_tokens).sum();
+        assert_eq!(remote_tokens, 1200, "the envelope's separated remote figure bills both attempts");
     }
 
     /// (FIX 4 / binding design, revised #1329) A REMOTE judge whose dispatch
@@ -7430,15 +7272,15 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             ("review-judge", vec![remote_staffing("cloud", "gpt-judge", 1)]),
         ]);
         let inputs = inputs_for(&crew, 500_000);
-        let mut cycler = RecordingCycler::new();
-        let mut chat = |call: &ChatCall| {
+        let cycler = RecordingCycler::new();
+        let chat = |call: &ChatCall| {
             if call.endpoint.is_some() {
                 Err(anyhow!("endpoint 503"))
             } else {
                 Ok(reply("a real defect"))
             }
         };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+        let env = run_funnel(&inputs, chat, cycler, &mut NullEmitter).expect("runs");
         let reason = env.degenerate.as_deref().expect("remote judge dispatch failure degrades the run");
         assert!(reason.contains("remote judge dispatch failed on 1 of 1 flag"), "got: {reason}");
     }
@@ -7461,25 +7303,51 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         ]);
         let mut inputs = inputs_for(&crew, 500_000);
         inputs.bundles = Some(vec![bundle_input("a.ts"), bundle_input("b.ts"), bundle_input("c.ts")]);
-        let mut cycler = RecordingCycler::new();
-        let judge_call_index = RefCell::new(0u32);
-        let mut chat = |call: &ChatCall| {
+        let cycler = RecordingCycler::new();
+        // (#1230 Packet 4) The three flags' judge-pass1/-confirm steps now
+        // have no dependency on EACH OTHER, so they can dispatch
+        // concurrently — a call-INDEX-based router (the pre-migration
+        // "call 4 of 6" shape) can no longer target "flag b's pass-2"
+        // reliably. Route by CONTENT instead: tag each bundle's probe
+        // reply (the single probe seat still dispatches its bundles
+        // sequentially, `dispatch_probe_staffing_core`, so the tagging
+        // itself stays deterministic), then fail specifically tag-b's
+        // SECOND call (its own pass-1 always confirms first; the second
+        // call for that same tag is its confirm/pass-2).
+        let probe_call_n = std::sync::atomic::AtomicU32::new(0);
+        let judge_calls_per_tag: Arc<Mutex<std::collections::HashMap<&'static str, u32>>> =
+            Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let chat = move |call: &ChatCall| {
             if call.endpoint.is_some() {
-                let idx = *judge_call_index.borrow();
-                *judge_call_index.borrow_mut() += 1;
-                // Calls land flag-major: f1.p1, f1.p2, f2.p1, f2.p2, f3.p1,
-                // f3.p2. Fail ONLY f2's pass-2 (call index 3) — one dispatch
-                // out of six, on a flag pass-1 already confirmed.
-                if idx == 3 {
+                let tag = if call.user.contains("tag-a") {
+                    "tag-a"
+                } else if call.user.contains("tag-b") {
+                    "tag-b"
+                } else {
+                    "tag-c"
+                };
+                let mut counts = judge_calls_per_tag.lock().expect("judge_calls_per_tag poisoned");
+                let n = counts.entry(tag).or_insert(0);
+                *n += 1;
+                // Fail ONLY tag-b's SECOND call (its confirm/pass-2) — one
+                // dispatch out of six, on a flag whose pass-1 already
+                // confirmed.
+                if tag == "tag-b" && *n == 2 {
                     Err(anyhow!("endpoint 503"))
                 } else {
                     Ok(reply(CONFIRM_JSON))
                 }
             } else {
-                Ok(reply("a real defect"))
+                let n = probe_call_n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let tag = match n {
+                    0 => "tag-a",
+                    1 => "tag-b",
+                    _ => "tag-c",
+                };
+                Ok(reply(&format!("a real defect ({tag})")))
             }
         };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+        let env = run_funnel(&inputs, chat, cycler, &mut NullEmitter).expect("runs");
 
         assert!(
             env.degenerate.is_none(),
@@ -7513,15 +7381,15 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             ("review-judge", vec![staffing("fast", "judge-model", 1)]),
         ]);
         let inputs = inputs_for(&crew, 500_000);
-        let mut cycler = RecordingCycler::new();
-        let mut chat = |call: &ChatCall| {
+        let cycler = RecordingCycler::new();
+        let chat = |call: &ChatCall| {
             if call.model == "darkmux:judge-model" {
                 Err(anyhow!("lmstudio down"))
             } else {
                 Ok(reply("a real defect"))
             }
         };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+        let env = run_funnel(&inputs, chat, cycler, &mut NullEmitter).expect("runs");
         // Degenerate via the JUDGE-DEAD gate (all rulings unusable), NOT the
         // remote honest-fail reason — local semantics are untouched.
         let reason = env.degenerate.as_deref().expect("a fully-dead local judge is degenerate (judge-dead gate)");
@@ -7542,8 +7410,8 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         ]);
         let mut inputs = inputs_for(&crew, 100); // one 600-token ruling exhausts a pass bucket
         inputs.bundles = Some(vec![bundle_input("a.ts"), bundle_input("b.ts")]);
-        let mut cycler = RecordingCycler::new();
-        let mut chat = |call: &ChatCall| {
+        let cycler = RecordingCycler::new();
+        let chat = |call: &ChatCall| {
             assert_ne!(call.model, "darkmux:verify-model", "a judge-doomed run must not spend on verify");
             if call.endpoint.is_some() {
                 Ok(SingleShotReply { content: CONFIRM_JSON.to_string(), total_tokens: Some(600), model: None })
@@ -7551,7 +7419,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                 Ok(reply("a real defect"))
             }
         };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+        let env = run_funnel(&inputs, chat, cycler, &mut NullEmitter).expect("runs");
         assert!(env.degenerate.as_deref().unwrap().contains("remote judge token budget exhausted"));
         assert!(!env.steps.iter().any(|s| s.step_id == "verify"), "no verify step on a doomed run");
         assert!(!env.members.iter().any(|m| m.seat == "review-verify"), "no verify member on a doomed run");
@@ -7597,18 +7465,19 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             ("review-judge", vec![staffing("fast", "judge-model", 1)]),
         ]);
         let inputs = inputs_for(&crew, 500_000);
-        let mut cycler = RecordingCycler::new();
-        let seen_cap = RefCell::new(0u32);
-        let mut chat = |call: &ChatCall| {
+        let cycler = RecordingCycler::new();
+        let seen_cap = Arc::new(Mutex::new(0u32));
+        let seen_cap_check = seen_cap.clone();
+        let chat = move |call: &ChatCall| {
             if call.endpoint.is_some() {
-                *seen_cap.borrow_mut() = call.max_tokens;
+                *seen_cap.lock().expect("seen_cap poisoned") = call.max_tokens;
                 Ok(reply("a real defect"))
             } else {
                 Ok(reply(CONFIRM_JSON))
             }
         };
-        let _ = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
-        assert_eq!(*seen_cap.borrow(), REMOTE_REASONING_MAX_TOKENS_FLOOR);
+        let _ = run_funnel(&inputs, chat, cycler, &mut NullEmitter).expect("runs");
+        assert_eq!(*seen_cap_check.lock().expect("seen_cap poisoned"), REMOTE_REASONING_MAX_TOKENS_FLOOR);
     }
 
     /// (CONSIDER d) The verify seat's inconclusive paths — a dispatch `Err`
@@ -7624,13 +7493,20 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         ]);
         let mut inputs = inputs_for(&crew, 500_000);
         inputs.bundles = Some(vec![bundle_input("a.ts"), bundle_input("b.ts")]);
-        let mut cycler = RecordingCycler::new();
-        // Flag a: the verify call errors. Flag b: garbage both attempts (the
-        // unparsed retry fires, then stays Unparsed).
-        let verify_calls = RefCell::new(0u32);
-        let mut chat = |call: &ChatCall| {
+        let cycler = RecordingCycler::new();
+        // One flag's verify call errors; the other's is garbage on both
+        // attempts (the unparsed retry fires, then stays Unparsed). Which
+        // LITERAL flag lands which outcome is no longer deterministic
+        // under concurrent verify dispatch (#1230 Packet 4) — the shared
+        // counter still guarantees exactly one flag sees the FIRST global
+        // verify call (forced to error, never retried) and the other sees
+        // every subsequent call (garbage, retried, stays unparsed); the
+        // assertions below key on RULING, not flag identity, so this holds
+        // either way.
+        let verify_calls = Arc::new(Mutex::new(0u32));
+        let chat = move |call: &ChatCall| {
             if call.model == "darkmux:verify-model" {
-                let mut n = verify_calls.borrow_mut();
+                let mut n = verify_calls.lock().expect("verify_calls poisoned");
                 *n += 1;
                 match *n {
                     1 => Err(anyhow!("verify endpoint down")),
@@ -7642,7 +7518,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                 Ok(reply("a real defect"))
             }
         };
-        let env = run_funnel(&inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+        let env = run_funnel(&inputs, chat, cycler, &mut NullEmitter).expect("runs");
         assert!(env.degenerate.is_none(), "an inconclusive verify never degrades the run");
         assert_eq!(env.confirmed, 2, "both stay confirmed (marker downstream)");
         assert_eq!(env.verified, 0, "an inconclusive adjudication never promotes");
@@ -7677,37 +7553,42 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         assert!(over.exhausted(), "over budget: 101 >= 100");
     }
 
-    /// (CONSIDER e) The terminal `funnel.task` record carries `remote_tokens`
-    /// when a seat dispatched remotely, and OMITS it entirely on a local-only
-    /// run — the separated cloud figure never counts as savings (#1186).
+    /// (CONSIDER e, #1230 Packet 4) The retired `funnel.task` terminal
+    /// record used to carry `remote_tokens` when a seat dispatched
+    /// remotely and OMIT it on a local-only run — that vocabulary is
+    /// superseded (see `funnel_step_kinds`'s module doc), but the
+    /// underlying claim survives in the envelope: `env.members` (summed by
+    /// `.remote`) is what a caller derives the SAME separated cloud figure
+    /// from (`src/pr_review.rs`'s `with_dispatch_bookends` reads exactly
+    /// this to stamp the dispatch bookend, per #1186's own fix). This test
+    /// pins that the envelope-level source of truth still has the
+    /// present/absent distinction a local-only run needs.
     #[test]
     fn remote_tokens_bookend_present_when_remote_absent_when_local() {
-        // Local-only: field absent.
+        // Local-only: no member is remote, so the derived figure is absent
+        // (never a spurious `Some(0)`).
         let local_crew = valid_crew();
         let local_inputs = inputs_for(&local_crew, 500_000);
-        let mut cyc1 = RecordingCycler::new();
-        let mut chat1 = |call: &ChatCall| {
+        let cyc1 = RecordingCycler::new();
+        let chat1 = |call: &ChatCall| {
             if call.model == "darkmux:judge-model" { Ok(reply(CONFIRM_JSON)) } else { Ok(reply("a real defect")) }
         };
         let mut em1 = RecordingEmitter::new();
-        let _ = run_funnel(&local_inputs, &mut chat1, &mut cyc1, &mut em1).expect("runs");
-        let local_finished = em1
-            .records
-            .iter()
-            .filter(|r| r.action == "funnel.task")
-            .filter_map(|r| r.payload.as_ref())
-            .find(|p| p["status"] == "finished")
-            .expect("terminal record");
-        assert!(local_finished.get("remote_tokens").is_none(), "local-only omits remote_tokens");
+        let local_env = run_funnel(&local_inputs, chat1, cyc1, &mut em1).expect("runs");
+        assert!(
+            !local_env.members.iter().any(|m| m.remote),
+            "local-only run has no remote member to derive remote_tokens from"
+        );
 
-        // Remote judge: field present.
+        // Remote judge: at least one member IS remote, so the caller-side
+        // derivation is present.
         let remote_crew = crew_with(vec![
             ("review-probe", vec![staffing("fast", "probe-model", 1)]),
             ("review-judge", vec![remote_staffing("cloud", "gpt-judge", 1)]),
         ]);
         let remote_inputs = inputs_for(&remote_crew, 500_000);
-        let mut cyc2 = RecordingCycler::new();
-        let mut chat2 = |call: &ChatCall| {
+        let cyc2 = RecordingCycler::new();
+        let chat2 = |call: &ChatCall| {
             if call.endpoint.is_some() {
                 Ok(SingleShotReply { content: CONFIRM_JSON.to_string(), total_tokens: Some(42), model: None })
             } else {
@@ -7715,14 +7596,10 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             }
         };
         let mut em2 = RecordingEmitter::new();
-        let _ = run_funnel(&remote_inputs, &mut chat2, &mut cyc2, &mut em2).expect("runs");
-        let remote_finished = em2
-            .records
-            .iter()
-            .filter(|r| r.action == "funnel.task")
-            .filter_map(|r| r.payload.as_ref())
-            .find(|p| p["status"] == "finished")
-            .expect("terminal record");
-        assert!(remote_finished.get("remote_tokens").is_some(), "a remote seat stamps remote_tokens");
+        let remote_env = run_funnel(&remote_inputs, chat2, cyc2, &mut em2).expect("runs");
+        assert!(
+            remote_env.members.iter().any(|m| m.remote),
+            "a remote seat's member record is what a caller stamps remote_tokens from"
+        );
     }
 }

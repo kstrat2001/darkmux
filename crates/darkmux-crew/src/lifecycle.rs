@@ -210,6 +210,29 @@ pub fn load_steps_for_sprint(mission_id: &str, sprint_id: &str) -> Result<Vec<cr
     load_json_dir(&steps_dir(mission_id, sprint_id))
 }
 
+/// (#1230 Packet 4) Persist a freshly-constructed `Mission` — the
+/// programmatic twin of `mission propose`'s AI-compiled creation path, for
+/// callers (e.g. `darkmux pr-review run`) that need a real, addressable
+/// mission id WITHOUT routing through the mission-compiler utility agent.
+/// Same atomic-rename `save_json` every other entity uses; does not emit
+/// a transition record (the caller typically follows this with
+/// `mission_start`, which emits its own "mission start" record — creation
+/// alone is silent, matching the module doc's "creation ≠ started"
+/// distinction).
+pub fn create_mission(mission: &Mission) -> Result<()> {
+    save_json(&mission_path(&mission.id), mission)
+}
+
+/// (#1230 Packet 4) Persist a freshly-constructed `Sprint` under its
+/// mission — the programmatic twin of `mission propose`'s sprint creation,
+/// for callers that build a Sprint directly (e.g. one ephemeral review-
+/// funnel run per PR review) rather than through the mission-compiler.
+/// Same atomic-rename `save_json` every other entity uses; does not emit
+/// a transition record — the caller typically follows with `sprint_start`.
+pub fn create_sprint(mission_id: &str, sprint: &Sprint) -> Result<()> {
+    save_json(&sprint_path(mission_id, &sprint.id), sprint)
+}
+
 /// Shared "read every `*.json` file directly in `dir`, deserialize as
 /// `T`" helper backing `load_tasks_for_sprint`/`load_steps_for_sprint`.
 /// A missing directory is NOT an error (empty `Vec`) — the normal state
