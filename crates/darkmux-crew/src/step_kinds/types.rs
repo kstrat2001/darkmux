@@ -38,4 +38,30 @@ pub struct StepOutcome {
 pub trait StepKind: Send + Sync {
     fn id(&self) -> &'static str;
     fn run(&self, step: &Step, input: &BTreeMap<String, String>) -> Result<StepOutcome>;
+
+    /// (#1230 Packet 3) Which local model, if any, this step needs
+    /// resident before it can run — feeds `run_step_graph`'s per-step
+    /// `Residency::Local(Placement)` vs `Residency::Remote` classification
+    /// (`concurrent_dispatch::run_bounded`'s wave-safety mechanism).
+    ///
+    /// `None` (the default — every kind's behavior before this hook
+    /// existed, and every step kind that isn't a local-model dispatch,
+    /// e.g. `procedural.*`) classifies the step `Residency::Remote`:
+    /// cap-bounded concurrency only, no RAM-safety wave reasoning. A
+    /// dispatch-shaped local kind overrides this to resolve a real
+    /// `Placement` from its own config/role.
+    ///
+    /// **Best-effort, fails open.** This is a SCHEDULING CLASSIFICATION
+    /// hint, not the dispatch's own model resolution — the step's `run`
+    /// method (and whatever it wraps, e.g. `dispatch::dispatch`'s own
+    /// preflight) still does its own full, strict resolution when it
+    /// actually executes. If this can't cleanly resolve a placement (no
+    /// role, unknown role, quarantined profile, remote endpoint, …) it
+    /// returns `None` rather than erroring — worst case the step is
+    /// scheduled as `Remote` (today's behavior for every kind), never a
+    /// hard failure purely from misclassification.
+    fn residency(&self, step: &Step) -> Option<darkmux_gestalt::Placement> {
+        let _ = step;
+        None
+    }
 }

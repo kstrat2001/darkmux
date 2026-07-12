@@ -43,6 +43,56 @@ fn require_config_str<'a>(step: &'a Step, kind_id: &str, key: &str) -> Result<&'
     })
 }
 
+/// (#1230 Packet 3) Best-effort role→profile→model resolution for
+/// `StepKind::residency()` implementations — NOT the dispatch's own strict
+/// preflight (that still runs in full, separately, inside `dispatch::
+/// dispatch`/`dispatch_internal::dispatch` when the step actually
+/// executes). This is purely a scheduling-classification hint: resolve
+/// `role_id` against the named (or default) profile via the same
+/// `select_model` scoring every dispatch preflight uses, and — if the
+/// winning model is local (not endpoint-bearing) — return the `Placement`
+/// gestalt's wave planner should reason about for it.
+///
+/// Fails open to `None` (→ `Residency::Remote`, today's behavior for every
+/// kind) on ANY resolution hiccup: unresolvable role, unloadable registry,
+/// no active profile, a remote-endpoint model, or a local model missing
+/// `n_ctx`. A misclassification here costs a missed RAM-safety
+/// optimization, never a hard failure — see the trait doc on `residency`.
+pub fn resolve_local_placement(
+    role_id: &str,
+    profile_name: Option<&str>,
+    config_path: Option<&str>,
+    seat: &str,
+) -> Option<darkmux_gestalt::Placement> {
+    use crate::select::select_model;
+
+    let loaded = darkmux_profiles::profiles::load_registry(config_path).ok()?;
+    let (_active_name, profile) = loaded.registry.resolve_active(profile_name)?;
+
+    let roles = crate::loader::load_roles().ok()?;
+    let role = roles.iter().find(|r| r.id == role_id)?;
+
+    let skill_index: std::collections::HashMap<String, crate::types::Skill> =
+        crate::loader::load_skills()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| (s.id.clone(), s))
+            .collect();
+    let model_id = select_model(role, profile, |id| skill_index.get(id)).ok()?;
+    let pm = profile.models.iter().find(|m| m.id == model_id)?;
+    if pm.is_remote() {
+        return None;
+    }
+    let min_ctx = pm.n_ctx?;
+    let identifier = darkmux_gestalt::namespaced_identifier(&pm.id, pm.identifier.as_deref());
+    Some(darkmux_gestalt::Placement {
+        model_key: pm.id.clone(),
+        identifier,
+        min_ctx,
+        seat: seat.to_string(),
+    })
+}
+
 /// Wraps `dispatch::dispatch(DispatchOpts)` — a full agentic dispatch
 /// through darkmux's internal Docker-bounded runtime. Required
 /// `Step.config` keys: `role_id` (string), `message` (string, the base
@@ -100,6 +150,13 @@ impl StepKind for DispatchInternalStepKind {
             output: result.stdout,
             flow_records: Vec::new(),
         })
+    }
+
+    fn residency(&self, step: &Step) -> Option<darkmux_gestalt::Placement> {
+        let role_id = config_str(step, "role_id")?;
+        let profile_name = config_str(step, "profile_name");
+        let config_path = config_str(step, "config_path");
+        resolve_local_placement(role_id, profile_name, config_path, &format!("step:{}", step.id))
     }
 }
 

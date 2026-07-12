@@ -29,8 +29,19 @@ mod registry;
 mod types;
 
 pub use builtins::{
-    DispatchInternalStepKind, DispatchSingleShotStepKind, ProceduralNoopStepKind,
-    ProceduralShellStepKind,
+    resolve_local_placement, DispatchInternalStepKind, DispatchSingleShotStepKind,
+    ProceduralNoopStepKind, ProceduralShellStepKind,
 };
 pub use registry::StepKindRegistry;
 pub use types::{StepKind, StepOutcome};
+
+/// Re-exported so callers OUTSIDE this crate (e.g. `darkmux`'s own
+/// `mission_run` — the `run_step_graph`/`StepKind::residency` caller for
+/// the mission-run migration, #1230 Packet 3) can name these types without
+/// a direct `darkmux-gestalt` dependency of their own — only DIRECT
+/// dependencies get an implicit extern-prelude entry, so a transitive user
+/// needs a path through a crate they DO depend on. `FixedEstimator` is the
+/// same "not yet meaningful" placeholder Packet 1's own production caller
+/// (`funnel::inert_estimator`) uses — `Facts::default()` (no known
+/// residents/pools) makes it structurally inert either way.
+pub use darkmux_gestalt::{Facts, FixedEstimator, FootprintEstimator, Placement};
