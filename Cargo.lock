@@ -372,17 +372,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "darkmux-bundler-rust"
-version = "1.18.5"
-dependencies = [
- "anyhow",
- "clap",
- "darkmux-lab",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
 name = "darkmux-crew"
 version = "1.18.5"
 dependencies = [

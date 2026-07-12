@@ -4,21 +4,34 @@
 //! the built-in TypeScript-only bundler when the reviewed diff touches
 //! `.rs` files.
 //!
-//! This is the dogfood: darkmux's own self-review (a public repo, a
-//! self-hosted runner, no PR checkout — `.github/workflows/darkmux-review.yml`
-//! dispatches `--github "$REPO" --head-sha "$HEAD_SHA"`, never
-//! `--worktree`) can only review its own Rust PRs through this plugin.
-//! If the plugin can't run through the SAME public `--bundler` seam a
-//! third-party plugin author would use, the extension point isn't real.
+//! This is a genuinely STANDALONE Cargo project — NOT a member of
+//! darkmux-public's own workspace, ZERO dependencies on darkmux's
+//! internal crates. That's deliberate, not an oversight: the whole
+//! point of a "reference plugin" is proving the public `--bundler`
+//! contract is sufficient on its own for a real third-party author, who
+//! has no access to darkmux's internals at all. A plugin built INSIDE
+//! the trusted workspace, reaching into darkmux-lab's own tested types,
+//! wouldn't actually prove that — it would just prove darkmux can call
+//! its own code through an extra subprocess hop. `diff.rs` and
+//! `contract.rs` are small, deliberately vendored copies of the
+//! equivalent darkmux-lab logic, not path dependencies.
+//!
+//! This is also the dogfood: darkmux's own self-review (a public repo,
+//! a self-hosted runner, no PR checkout —
+//! `.github/workflows/darkmux-review.yml` dispatches `--github "$REPO"
+//! --head-sha "$HEAD_SHA"`, never `--worktree`) can only review its own
+//! Rust PRs through this plugin.
 //!
 //! Usage: `darkmux-bundler-rust --diff <path> [--worktree <dir>]`
 //! Emits the frozen `BundleSet` JSON (`{"bundles": [...]}`) on stdout,
 //! or a clear message on stderr + non-zero exit for a genuine failure
 //! (no `.rs` files touched, an unreadable diff file, …) — the caller's
-//! `external_bundles` treats both a non-zero exit and an empty bundle
-//! array as loud errors, never a silent pass.
+//! `external_bundles` (in darkmux-lab) treats both a non-zero exit and
+//! an empty bundle array as loud errors, never a silent pass.
 
 mod bundler;
+mod contract;
+mod diff;
 mod facts;
 mod scan;
 

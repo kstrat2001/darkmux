@@ -1,9 +1,8 @@
 //! Orchestration: diff -> per-hunk `Bundle`s, in both modes the frozen
-//! `--bundler` contract has to support (see `external.rs` in
-//! `darkmux-lab`): a real worktree checkout, or diff-only (darkmux's own
-//! self-review CI — `--github`/`--head-sha`, no checkout at all — is the
-//! diff-only path, so it is the one that has to work well, not the
-//! degraded fallback).
+//! `--bundler` contract has to support: a real worktree checkout, or
+//! diff-only (darkmux's own self-review CI — `--github`/`--head-sha`,
+//! no checkout at all — is the diff-only path, so it is the one that
+//! has to work well, not the degraded fallback).
 //!
 //! Always emits ONE bundle per hunk that touches a `.rs` file's new-side
 //! lines, regardless of whether the differential fact family found
@@ -13,11 +12,11 @@
 //! Rust PR (most hunks carry no dropped-call signal) from collapsing to
 //! zero bundles -> degenerate on ordinary changes.
 
+use crate::contract::{Bundle, BundleRef, BundleSet};
+use crate::diff::{parse_diff, Hunk};
 use crate::facts;
 use crate::scan;
 use anyhow::{Context, Result};
-use darkmux_lab::lab::bundle::diff::{parse_diff, Hunk};
-use darkmux_lab::lab::bundle::{Bundle, BundleRef, BundleSet};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -227,10 +226,10 @@ mod tests {
     use super::*;
 
     // An explicit line array + join, NEVER a `\`-continued string literal
-    // (see `darkmux-lab`'s `diff.rs` test comment: line continuation
-    // strips ALL leading whitespace off the next line, silently eating
-    // the significant leading space that marks a unified-diff context
-    // line — the exact bug this helper exists to avoid re-introducing).
+    // (see `diff.rs`'s vendored source: line continuation strips ALL
+    // leading whitespace off the next line, silently eating the
+    // significant leading space that marks a unified-diff context line
+    // — the exact bug this helper exists to avoid re-introducing).
     fn diff(lines: &[&str]) -> String {
         let mut s = lines.join("\n");
         s.push('\n');

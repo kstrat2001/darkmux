@@ -1,0 +1,41 @@
+[workspace]
+# Empty table, deliberately: without this, Cargo auto-discovers this
+# crate as implicitly belonging to the darkmux-public workspace root
+# above it in the directory tree (since it's nested inside that repo).
+# This declares it as its OWN independent workspace root instead — the
+# whole point of moving it out of crates/ in the first place.
+
+[package]
+name = "darkmux-bundler-rust"
+version = "1.0.0"
+edition = "2021"
+description = "Reference --bundler plugin for darkmux (#1319): a Rust-source-aware bundler, built as a genuinely standalone project outside darkmux's own Cargo workspace"
+license = "MIT"
+publish = false
+
+# NOT a member of darkmux-public's root workspace, deliberately — see
+# src/main.rs's module doc. This crate has ZERO dependencies on any
+# darkmux-* crate; it only implements the publicly documented
+# `--bundler` JSON contract.
+#
+# Versioned independently of darkmux itself (starts at 1.0.0, not tied
+# to darkmux's own version number) — it's a standalone artifact with its
+# own release cadence, the same as any other third-party plugin would be.
+
+[[bin]]
+name = "darkmux-bundler-rust"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+tempfile = "3.10"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = "symbols"

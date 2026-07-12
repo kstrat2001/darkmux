@@ -1,8 +1,12 @@
 [workspace]
-members = [".", "crates/darkmux-types", "crates/darkmux-flow", "crates/darkmux-profiles", "crates/darkmux-crew", "crates/darkmux-hardware", "crates/darkmux-agent-roles", "crates/darkmux-heuristics", "crates/darkmux-eureka", "crates/darkmux-fleet", "crates/darkmux-recommendations", "crates/darkmux-lab", "crates/darkmux-doctor", "crates/darkmux-serve", "crates/darkmux-gestalt", "crates/darkmux-bundler-rust"]
+members = [".", "crates/darkmux-types", "crates/darkmux-flow", "crates/darkmux-profiles", "crates/darkmux-crew", "crates/darkmux-hardware", "crates/darkmux-agent-roles", "crates/darkmux-heuristics", "crates/darkmux-eureka", "crates/darkmux-fleet", "crates/darkmux-recommendations", "crates/darkmux-lab", "crates/darkmux-doctor", "crates/darkmux-serve", "crates/darkmux-gestalt"]
 # runtime/ is a separate crate with its own Cargo.lock; it stays out of the
-# workspace per #463 ("stays as-is").
-exclude = ["runtime"]
+# workspace per #463 ("stays as-is"). plugins/darkmux-bundler-rust is a
+# genuinely standalone Cargo project (its own [workspace] table, zero
+# darkmux-* dependencies) — the reference --bundler plugin (#1319) proves
+# the public plugin contract is sufficient on its own, which a workspace
+# member with privileged path-dependency access wouldn't actually prove.
+exclude = ["runtime", "plugins/darkmux-bundler-rust"]
 
 [package]
 name = "darkmux"
